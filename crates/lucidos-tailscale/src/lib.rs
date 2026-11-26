@@ -1,22 +1,3 @@
-//! What the tree knows about Tailscale: where this machine sits on a tailnet,
-//! what that node is called, its TLS certificate, and where the CLI lives.
-//!
-//! Three crates need this. `lucidos-gateway` and `lucidos-engine` offer the
-//! tailnet address as a network-bind hint; `lucidos-app` shows the full picture
-//! in **Settings -> Access**. One copy here keeps a fix from reaching only some.
-//!
-//! ADR 0014 §1 forbids the gateway any dependency on the engine. This crate is
-//! the shared surface it allows, so it stays small: `libc` and `serde_json`,
-//! never an async runtime, a database crate or an engine crate (ADR 0588).
-
-//! # Tailscale is asked, never guessed
-//!
-//! [`tailnet_state`] asks Tailscale's LocalAPI for its status, the way the
-//! Tailscale CLI does, and falls back to `tailscale status --json`. The address
-//! and the MagicDNS name come only from that answer. No interface name or
-//! address range ever produces one: other VPNs use `100.64.0.0/10` too.
-//! Every subprocess and socket read here has a hard bound.
-
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,50 +16,33 @@ pub use status::{TailnetNode, TailnetState};
 
 use discovery::{discover, Discovery, Endpoint, Platform, Probes};
 
-/// Is this address inside the `100.64.0.0/10` CGNAT range?
-///
-/// A range check only. Tailscale draws from it, and so do other VPNs and ISPs,
-/// so membership never makes an address a tailnet address.
 pub fn is_tailnet_addr(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
-/// What one way of asking Tailscale got back.
 #[derive(Debug)]
 pub(crate) enum Answer {
-    /// A `200` body, still to be parsed.
     Body(String),
-    /// The LocalAPI answered with another status. Its body says why.
     Refused { status_line: String, body: String },
-    /// Nothing answered: refused, absent, or silent until the deadline.
     Silent,
-    /// Something answered, and it was not a status.
     Garbled(String),
 }
 
-/// Ask Tailscale where this machine stands. Blocking, and bounded to a few
-/// seconds; call it off any async worker.
 pub fn tailnet_state() -> TailnetState {
     let found = discover(Platform::current(), &SystemProbes);
     settle(&found, localapi::query, cli::status_via_cli)
 }
 
-/// This machine's tailnet IPv4, when Tailscale reports one and this host can
-/// bind it. Userspace-networking mode reports an address it does not hold.
 pub fn bindable_tailnet_ipv4() -> Option<Ipv4Addr> {
     let ip = tailnet_state().node()?.ipv4;
     holds_address(ip.into()).then_some(ip)
 }
 
-/// Does this host hold exactly `ip`? A UDP bind succeeds only on a local address.
 pub fn holds_address(ip: IpAddr) -> bool {
     UdpSocket::bind((ip, 0)).is_ok()
 }
 
-/// Try each endpoint, then the CLI. The first status that parses decides.
-/// Otherwise the first thing that went wrong does: a port that refused comes
-/// before the CLI shim's prose, so a stopped app reads as not running.
 fn settle(
     found: &Discovery,
     query: impl Fn(&Endpoint) -> Answer,
@@ -115,7 +79,6 @@ fn settle(
 const LSOF: &str = "/usr/sbin/lsof";
 const LSOF_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The real filesystem, environment and `lsof`.
 struct SystemProbes;
 
 impl Probes for SystemProbes {
@@ -137,7 +100,6 @@ impl Probes for SystemProbes {
             // SAFETY: getuid has no preconditions and cannot fail.
             let uid = unsafe { libc::getuid() };
             let mut cmd = Command::new(LSOF);
-            // -b and -w keep lsof from blocking on a stuck filesystem.
             cmd.args(["-n", "-b", "-w", "-a", &format!("-u{uid}")])
                 .args(["-c", "IPNExtension", "-F", "n"]);
             process::run_bounded(cmd, LSOF_TIMEOUT)
@@ -267,8 +229,6 @@ mod tests {
 
     #[test]
     fn tailscale_missing_beside_another_cgnat_vpn_has_no_address() {
-        // Appgate holds 100.64.10.175 on a utun, but leaves no Tailscale
-        // endpoint or CLI, so nothing is reported at all.
         let found = discover(Platform::MacOs, &FakeProbes::default());
         let state = settle(&found, |_| unreachable!(), |_| None);
         assert_eq!(state, TailnetState::NotInstalled);
@@ -278,12 +238,9 @@ mod tests {
     #[test]
     fn holds_address_is_true_only_for_an_address_this_host_has() {
         assert!(holds_address(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        // TEST-NET-1 is never assigned to a host.
         assert!(!holds_address(IpAddr::V4(v4("192.0.2.1"))));
     }
 
-    /// Reads this machine's real Tailscale, read-only. Run by hand:
-    /// `cargo test -p lucidos-tailscale -- --ignored live`.
     #[test]
     #[ignore]
     fn live_tailscale_answers() {

@@ -1,12 +1,3 @@
-//! The Claude Code model picker, discovered from Claude Code itself.
-//!
-//! Claude Code answers an `initialize` control request with the models its own
-//! `/model` picker offers, for the account, provider and model pins it runs
-//! under. The engine asks it (`claude_code::probe_cc_models`) and offers its
-//! rows first. The offered curated rows of `cc_menu_options.json` follow, for a
-//! model Claude Code accepts but did not list. The curated file is also the
-//! fallback until the first probe succeeds, and the context-window overlay.
-
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -16,14 +7,11 @@ use super::coding_agent_models::{
     cc_model_base, offered_cc_model_options, AccountPin, CcMenuOption,
 };
 
-/// How long a discovered list stays fresh when nothing else says it moved.
 pub const CACHE_TTL: chrono::Duration = chrono::Duration::hours(24);
 
-/// How long a failed probe holds off the next one. Without it, every session
-/// start would spawn another cold Claude Code while the failure lasts.
 pub const RETRY_AFTER_FAILURE: chrono::Duration = chrono::Duration::hours(1);
 
-/// One row of Claude Code's model list, in Claude Code's own field names.
+/// INVARIANT: One row of Claude Code's model list, in Claude Code's own field names.
 ///
 /// Typed on purpose. The `initialize` reply also carries the signed-in account,
 /// and a struct that names only these fields cannot carry it into the cache.
@@ -43,7 +31,7 @@ pub struct DiscoveredModel {
 }
 
 impl DiscoveredModel {
-    /// The tiers this model accepts. A model that does not support effort
+    /// INVARIANT: The tiers this model accepts. A model that does not support effort
     /// offers none. `None` means it supports effort without naming tiers, so
     /// the effort table answers.
     fn reasoning_efforts(&self) -> Option<Vec<String>> {
@@ -54,20 +42,16 @@ impl DiscoveredModel {
     }
 }
 
-/// What one successful probe found, as persisted in `.lucidos/cc-models.json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CcModelCache {
-    /// `claude --version` at probe time, when it answered.
     pub cc_version: Option<String>,
-    /// The account the probe ran under. `None` in a cache written before the
-    /// engine recorded it, or when `$HOME` was unset.
     #[serde(default)]
     pub account: Option<AccountPin>,
     pub discovered_at: DateTime<Utc>,
     pub models: Vec<DiscoveredModel>,
 }
 
-/// Base model ids Claude Code substituted for one account: a session that
+/// INVARIANT: Base model ids Claude Code substituted for one account: a session that
 /// asked for one ran another. Persisted in `.lucidos/cc-refused-models.json`.
 ///
 /// Dated by the version the refusing session reported, never by the probe
@@ -77,16 +61,11 @@ pub struct CcModelRefusals {
     pub cc_version: Option<String>,
     pub account: Option<AccountPin>,
     pub models: Vec<String>,
-    /// The refused base ids an agent has already asked the owner about. A
-    /// refusal outside it still owes the owner the swap's two questions.
     #[serde(default)]
     pub told: Vec<String>,
 }
 
 impl CcModelRefusals {
-    /// Record `model` as refused by Claude Code `cc_version` on `account`,
-    /// dropping refusals of another version or account first. False when
-    /// nothing changed.
     pub fn refuse(
         &mut self,
         model: &str,
@@ -107,14 +86,11 @@ impl CcModelRefusals {
         true
     }
 
-    /// Whether Claude Code substituted `model`, in any of its forms.
     pub fn holds(&self, model: &str) -> bool {
         let base = cc_model_base(model);
         self.models.iter().any(|r| r == base)
     }
 
-    /// Forget the refusal of `model`: it served after all. False when it held
-    /// none.
     pub fn forget(&mut self, model: &str) -> bool {
         let before = self.models.len();
         let base = cc_model_base(model);
@@ -123,13 +99,10 @@ impl CcModelRefusals {
         self.models.len() != before
     }
 
-    /// Whether `model` is refused and no agent has asked the owner about it.
     pub fn untold(&self, model: &str) -> bool {
         self.holds(model) && !self.told.iter().any(|r| r == cc_model_base(model))
     }
 
-    /// Record that an agent asked the owner about the refusal of `model`.
-    /// False when nothing changed.
     pub fn tell(&mut self, model: &str) -> bool {
         if !self.untold(model) {
             return false;
@@ -138,27 +111,23 @@ impl CcModelRefusals {
         true
     }
 
-    /// Whether these refusals still hold for a probe of Claude Code
-    /// `cc_version`. An unknown version on either side never matches.
     pub fn hold_for(&self, cc_version: Option<&str>) -> bool {
         self.cc_version.is_some() && self.cc_version.as_deref() == cc_version
     }
 }
 
-/// The offered list: the cache's rows, then the curated rest. A refusal never
+/// INVARIANT: The offered list: the cache's rows, then the curated rest. A refusal never
 /// takes a row off: the owner decides whether a swapped model leaves the
 /// ladder, and an outage can be temporary.
 pub fn offered_list(cache: &CcModelCache) -> Arc<[CcMenuOption]> {
     offered_cc_model_options(Some(&menu_options(&cache.models)))
 }
 
-/// Where the picker's list came from, for the commands route to report.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Provenance {
     pub source: ModelsSource,
     pub discovered_at: Option<DateTime<Utc>>,
     pub cc_version: Option<String>,
-    /// The last probe's failure, kept until a later probe succeeds.
     pub error: Option<String>,
 }
 
@@ -169,11 +138,6 @@ pub enum ModelsSource {
     Fallback,
 }
 
-/// Read the model list out of an `initialize` reply body. Every other field,
-/// the account included, is dropped here.
-///
-/// An empty list is an error, never a picker: a reply that names no models
-/// says something went wrong, and serving it would leave nothing to pick.
 pub fn parse_initialize_models(body: &serde_json::Value) -> Result<Vec<DiscoveredModel>, String> {
     let models = body
         .get("models")
@@ -186,14 +150,6 @@ pub fn parse_initialize_models(body: &serde_json::Value) -> Result<Vec<Discovere
     Ok(models)
 }
 
-/// Whether the cache should be probed again.
-///
-/// `reported_version` is the version a session just reported. A mismatch means
-/// Claude Code updated under us, and an update is when its list moves. A cache
-/// with no recorded version has nothing to compare, so only its age counts.
-///
-/// `reported_account` is the live account that session saw. Another account
-/// offers other models, so a cache probed under another one is stale.
 pub fn needs_refresh(
     cache: Option<&CcModelCache>,
     last_failure: Option<DateTime<Utc>>,
@@ -217,7 +173,6 @@ pub fn needs_refresh(
     }
 }
 
-/// The picker rows for a discovered list, in Claude Code's order.
 pub fn menu_options(models: &[DiscoveredModel]) -> Vec<CcMenuOption> {
     models
         .iter()
@@ -239,8 +194,6 @@ pub fn cache_path(workspace_path: &Path) -> PathBuf {
     workspace_path.join(".lucidos/cc-models.json")
 }
 
-/// The cache on disk, or `None` when it is absent or unreadable. An unreadable
-/// one is logged and then treated as absent, so the next probe replaces it.
 pub fn load_cache(workspace_path: &Path) -> Option<CcModelCache> {
     let path = cache_path(workspace_path);
     let bytes = match std::fs::read(&path) {
@@ -267,8 +220,6 @@ pub fn refusals_path(workspace_path: &Path) -> PathBuf {
     workspace_path.join(".lucidos/cc-refused-models.json")
 }
 
-/// The refusals on disk. Absent or unreadable reads as none: a refused model
-/// is then an automatic pick again, and the next session refuses it again.
 pub fn load_refusals(workspace_path: &Path) -> CcModelRefusals {
     let path = refusals_path(workspace_path);
     match std::fs::read(&path) {
@@ -289,8 +240,6 @@ fn save_refusals(workspace_path: &Path, refusals: &CcModelRefusals) {
     }
 }
 
-/// This engine's discovered list. One engine serves one workspace, so a
-/// process-wide value is per workspace.
 struct Discovery {
     cache: Option<CcModelCache>,
     refusals: CcModelRefusals,
@@ -317,13 +266,10 @@ impl Discovery {
         }
     }
 
-    /// The offered list is `None`, the static curated rows, until a probe
-    /// result lands.
     fn rebuild_options(&mut self) {
         self.options = self.cache.as_ref().map(offered_list);
     }
 
-    /// Drop every refusal. False when there were none.
     fn clear_refusals(&mut self) -> bool {
         if self.refusals.models.is_empty() {
             return false;
@@ -332,8 +278,6 @@ impl Discovery {
         true
     }
 
-    /// Take a probe's result. True when that dropped refusals of another
-    /// Claude Code version, which the caller must save.
     fn install(&mut self, cache: CcModelCache) -> bool {
         let stale = !self.refusals.hold_for(cache.cc_version.as_deref());
         self.cache = Some(cache);
@@ -344,9 +288,6 @@ impl Discovery {
         cleared
     }
 
-    /// Record a refusal by a session on `session`. Only a session on the live
-    /// account counts: the probe runs under it, so it owns the picker. True
-    /// when the refusals changed.
     fn refuse(
         &mut self,
         model: &str,
@@ -357,9 +298,6 @@ impl Discovery {
         session == live && self.refusals.refuse(model, cc_version, live)
     }
 
-    /// `model` served unswapped in a session on `session`. Only a session on
-    /// the live account clears its refusal, as only one there records it.
-    /// True when the refusals changed.
     fn serve(
         &mut self,
         model: &str,
@@ -369,8 +307,6 @@ impl Discovery {
         session == live && self.refusals.forget(model)
     }
 
-    /// A session reported `live` as the live account. Refusals another account
-    /// learned go. True when they did.
     fn observe_live_account(&mut self, live: Option<&AccountPin>) -> bool {
         self.refusals.account.as_ref() != live && self.clear_refusals()
     }
@@ -378,7 +314,7 @@ impl Discovery {
 
 static DISCOVERY: RwLock<Discovery> = RwLock::new(Discovery::new());
 
-/// A poisoned lock means a writer panicked between two plain assignments. The
+/// INVARIANT: A poisoned lock means a writer panicked between two plain assignments. The
 /// value is whole either way, so carry on rather than lose the picker.
 fn read() -> std::sync::RwLockReadGuard<'static, Discovery> {
     DISCOVERY.read().unwrap_or_else(|e| e.into_inner())
@@ -388,27 +324,18 @@ fn write() -> std::sync::RwLockWriteGuard<'static, Discovery> {
     DISCOVERY.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The offered rows: Claude Code's list, then the curated rows it omitted.
-/// `None` while the static curated rows apply unchanged.
 pub fn offered_options() -> Option<Arc<[CcMenuOption]>> {
     read().options.clone()
 }
 
-/// Whether Claude Code substituted `model` for the live account, and it has
-/// not served since. An automatic pick skips such a model; the owner may
-/// still pick it by hand.
 pub fn is_refused(model: &str) -> bool {
     read().refusals.holds(model)
 }
 
-/// Whether `model` is refused for the live account and no agent has asked
-/// the owner about it yet.
 pub fn refusal_untold(model: &str) -> bool {
     read().refusals.untold(model)
 }
 
-/// Record that an agent asked the owner about the refusal of `model`, so no
-/// later swap asks again. False when nothing changed.
 pub fn record_refusal_told(workspace_path: &Path, model: &str) -> bool {
     let mut state = write();
     if !state.refusals.tell(model) {
@@ -418,7 +345,6 @@ pub fn record_refusal_told(workspace_path: &Path, model: &str) -> bool {
     true
 }
 
-/// Serve what the last run left on disk. Called once at boot.
 pub fn load(workspace_path: &Path) {
     let cache = load_cache(workspace_path);
     let refusals = load_refusals(workspace_path);
@@ -428,11 +354,9 @@ pub fn load(workspace_path: &Path) {
     state.rebuild_options();
 }
 
-// The writers below save refusals under the lock, so an older state can
+// INVARIANT: The writers below save refusals under the lock, so an older state can
 // never overwrite a newer one on disk.
 
-/// Make a probe's result the discovered half of the offered list, and clear
-/// any earlier probe error. Refusals from another Claude Code version go.
 pub fn install(workspace_path: &Path, cache: CcModelCache) {
     let mut state = write();
     if state.install(cache) {
@@ -440,9 +364,6 @@ pub fn install(workspace_path: &Path, cache: CcModelCache) {
     }
 }
 
-/// Mark `model` refused by Claude Code `cc_version` in a session on
-/// `session`. False when nothing changed: the refusal was known, or the
-/// session ran on another account than the live one.
 pub fn record_refusal(
     workspace_path: &Path,
     model: &str,
@@ -458,8 +379,6 @@ pub fn record_refusal(
     true
 }
 
-/// `model` served unswapped in a session on `session`, so a refusal of it
-/// ends. False when nothing changed.
 pub fn record_served(
     workspace_path: &Path,
     model: &str,
@@ -474,8 +393,6 @@ pub fn record_served(
     true
 }
 
-/// A session reported `live` as the live account. Drops refusals another
-/// account learned, so a switch of account picks its models freely again.
 pub fn observe_live_account(workspace_path: &Path, live: Option<&AccountPin>) {
     let mut state = write();
     if state.observe_live_account(live) {
@@ -483,8 +400,6 @@ pub fn observe_live_account(workspace_path: &Path, live: Option<&AccountPin>) {
     }
 }
 
-/// Record a failed probe. The last good list stays the picker, and the next
-/// probe waits [`RETRY_AFTER_FAILURE`].
 pub fn record_error(message: String) {
     let mut state = write();
     state.error = Some(message);
@@ -505,7 +420,7 @@ pub fn provenance() -> Provenance {
     }
 }
 
-/// Claim the one probe slot when the list needs a probe. `None` when it does
+/// INVARIANT: Claim the one probe slot when the list needs a probe. `None` when it does
 /// not, or when a probe is already running, so a burst of session starts
 /// spawns one probe, not one each. Checked and claimed under one lock.
 pub fn claim_refresh(
@@ -527,7 +442,6 @@ pub fn claim_refresh(
     Some(ProbeSlot)
 }
 
-/// Frees the probe slot when dropped, however the probe ended.
 pub struct ProbeSlot;
 
 impl Drop for ProbeSlot {

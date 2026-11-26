@@ -33,7 +33,9 @@ A sub-thread whose parent acts on its report, a `wake` or `wake-when-all-done`
 child, says `no` for a routine result such as a review verdict. The user reads
 the parent, which asks them for any approval. Say
 `yes` only for a failure, a gap the user must know about, or something only the
-user can do or decide. A child with no declared wake mode decides its own wake,
+user can do or decide. Your `no` also clears an earlier `yes` the user has not
+read yet, since your parent already has that report. So say `yes` again while
+that earlier item still needs the user. A `yes` from a turn the user opened, resumed or wrote into stays. A child with no declared wake mode decides its own wake,
 and follows the same rule for a turn that wakes its parent. A turn the user
 opens in your thread is answered as usual (ADR 0607).
 

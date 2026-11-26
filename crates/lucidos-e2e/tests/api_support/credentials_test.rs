@@ -1,24 +1,13 @@
-//! E2E coverage for credential editing: the full-field update path, the
-//! `email_password` server-settings sync into `email_accounts`, and the
-//! *credential scope* set.
-//!
-//! The first two tests deliberately POST and PUT the singular `base_url`. That
-//! is the permanent back-compat shape, so a script written before the scope
-//! became a set keeps working, and this is what proves it.
-
 use crate::support::{base_url, db_url, unique_marker, user_client};
 use serde_json::json;
 use sqlx::PgPool;
 
-/// A generic (non-email) credential can have every editable field updated, and
-/// omitting `auth_value` keeps the stored secret.
 #[tokio::test]
 async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
     let client = user_client().await;
     let api = base_url();
     let service = unique_marker("e2e-cred");
 
-    // Create.
     let resp = client
         .post(format!("{}/api/v1/credentials", api))
         .json(&json!({
@@ -36,11 +25,8 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
         true
     );
 
-    // Every verb below addresses the row by id, so resolve it once from the list.
     let id = credential_id(&client, &api, &service).await;
 
-    // Update the scope + auth_type + auth_header + secret, through the legacy
-    // singular field.
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
         .query(&[("id", &id)])
@@ -59,16 +45,13 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
         true
     );
 
-    // List reflects the new non-secret fields.
     let listed = find_credential(&client, &api, &service).await;
     assert_eq!(listed["base_urls"], json!(["https://api.new.example.com"]));
     assert_eq!(listed["auth_type"], "bearer");
     assert_eq!(listed["auth_header"], "X-Api-Key");
 
-    // credential-value reflects the new secret.
     assert_eq!(credential_value(&client, &api, &id).await, "k2");
 
-    // Update without auth_value keeps the secret but still edits other fields.
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
         .query(&[("id", &id)])
@@ -93,13 +76,9 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
         "omitting auth_value must keep the stored secret"
     );
 
-    // Cleanup.
     delete_credential(&client, &api, &id).await;
 }
 
-/// Editing an `email_password` credential must propagate the server settings to
-/// the `email_accounts` row IMAP/SMTP read from. The password lives only in the
-/// credential: `email_accounts` has no password column.
 #[tokio::test]
 async fn update_email_credential_syncs_email_accounts_row() {
     let client = user_client().await;
@@ -107,11 +86,8 @@ async fn update_email_credential_syncs_email_accounts_row() {
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
 
     let name = unique_marker("e2e-email");
-    // No `email:` prefix: `auth_type` marks it, and the name IS the
-    // `email_accounts.name` the sync resolves.
     let service = name.clone();
 
-    // Seed an email account (the row IMAP reads).
     sqlx::query(
         "INSERT INTO email_accounts (name, email_address, imap_host, imap_port, smtp_host, smtp_port, username, use_tls, require_send_confirmation) \
          VALUES ($1, $2, 'imap.old.example.com', 993, 'smtp.old.example.com', 587, $2, true, true)",
@@ -122,7 +98,6 @@ async fn update_email_credential_syncs_email_accounts_row() {
     .await
     .expect("seed email account");
 
-    // Create the paired credential via the real create path.
     let resp = client
         .post(format!("{}/api/v1/credentials", api))
         .json(&json!({
@@ -138,7 +113,6 @@ async fn update_email_credential_syncs_email_accounts_row() {
 
     let id = credential_id(&client, &api, &service).await;
 
-    // Edit: new password + new server settings.
     let new_email = format!("{}@new.example.com", name);
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
@@ -167,7 +141,6 @@ async fn update_email_credential_syncs_email_accounts_row() {
         true
     );
 
-    // The email_accounts row IMAP reads must carry the new settings.
     let row: (String, String, String, i32, bool) = sqlx::query_as(
         "SELECT email_address, imap_host, smtp_host, smtp_port, require_send_confirmation \
          FROM email_accounts WHERE name = $1",
@@ -182,12 +155,10 @@ async fn update_email_credential_syncs_email_accounts_row() {
     assert_eq!(row.3, 465);
     assert!(!row.4, "require_send_confirmation must be updated");
 
-    // The credential's base_url is derived from the SMTP host, and its secret synced.
     let listed = find_credential(&client, &api, &service).await;
     assert_eq!(listed["base_urls"], json!(["smtp://smtp.new.example.com"]));
     assert_eq!(credential_value(&client, &api, &id).await, "newpass");
 
-    // Cleanup.
     delete_credential(&client, &api, &id).await;
     sqlx::query("DELETE FROM email_accounts WHERE name = $1")
         .bind(&name)
@@ -214,8 +185,6 @@ async fn find_credential(client: &reqwest::Client, api: &str, service: &str) -> 
         .clone()
 }
 
-/// The id of the credential with this service name, for the verbs that address
-/// an existing row.
 async fn credential_id(client: &reqwest::Client, api: &str, service: &str) -> String {
     find_credential(client, api, service).await["id"]
         .as_str()
@@ -223,7 +192,6 @@ async fn credential_id(client: &reqwest::Client, api: &str, service: &str) -> St
         .to_string()
 }
 
-/// Mint a one-shot reveal token for `id`. Step one of two (ADR 0117).
 async fn reveal_token(client: &reqwest::Client, api: &str, id: &str) -> String {
     let resp = client
         .post(format!("{}/api/v1/credential-reveal-token", api))
@@ -236,9 +204,6 @@ async fn reveal_token(client: &reqwest::Client, api: &str, id: &str) -> String {
     body["token"].as_str().expect("token").to_string()
 }
 
-/// Keyed on `id`, like the endpoint. A service name no longer identifies one
-/// row: `auth_type` is the discriminator, and an `oauth_client` registration is
-/// allowed to share a name with an API key for the same provider.
 async fn credential_value(client: &reqwest::Client, api: &str, id: &str) -> String {
     let token = reveal_token(client, api, id).await;
     let body: serde_json::Value = client
@@ -263,13 +228,6 @@ async fn delete_credential(client: &reqwest::Client, api: &str, id: &str) {
     assert_eq!(resp.status(), 200);
 }
 
-/// A credential's scope is a set, over the wire and from the CLI.
-///
-/// Three things at once, because they are one flow. A create declares two
-/// hosts. `PUT /api/v1/credential-base-urls` replaces the set without naming
-/// the auth type or the auth header, which is what `lucidos credentials
-/// set-base-urls` calls. A scope that is not a URL with a host is refused where
-/// the user typed it.
 #[tokio::test]
 async fn a_credential_carries_and_edits_a_set_of_base_urls() {
     let client = user_client().await;
@@ -297,7 +255,6 @@ async fn a_credential_carries_and_edits_a_set_of_base_urls() {
     );
     let id = credential_id(&client, &api, &service).await;
 
-    // The narrow verb replaces the set and leaves everything else alone.
     let resp = client
         .put(format!("{}/api/v1/credential-base-urls", api))
         .query(&[("id", &id)])
@@ -324,7 +281,6 @@ async fn a_credential_carries_and_edits_a_set_of_base_urls() {
     );
     assert_eq!(credential_value(&client, &api, &id).await, "the-hmac-key");
 
-    // A host-less value is refused here, not silently at the proxy gate.
     let resp = client
         .put(format!("{}/api/v1/credential-base-urls", api))
         .query(&[("id", &id)])
@@ -339,9 +295,6 @@ async fn a_credential_carries_and_edits_a_set_of_base_urls() {
         "the refusal must say what is wrong: {body}"
     );
 
-    // An edit naming NO scope field keeps the stored set. Both fields are
-    // optional so the two spellings can coexist, so absence would otherwise
-    // deserialize as an empty set and refuse the credential everywhere.
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
         .query(&[("id", &id)])
@@ -361,9 +314,6 @@ async fn a_credential_carries_and_edits_a_set_of_base_urls() {
     delete_credential(&client, &api, &id).await;
 }
 
-/// A create that names no scope field is refused, rather than storing a
-/// credential the proxy can only ever refuse. An empty list is a real answer
-/// and has to be written down.
 #[tokio::test]
 async fn creating_a_credential_without_a_scope_field_is_refused() {
     let client = user_client().await;
@@ -391,7 +341,6 @@ async fn creating_a_credential_without_a_scope_field_is_refused() {
         "the refusal must name the field: {body}"
     );
 
-    // An explicit empty list IS accepted: that is what a `secret` carries.
     let resp = client
         .post(format!("{}/api/v1/credentials", api))
         .json(&json!({
@@ -414,13 +363,6 @@ async fn creating_a_credential_without_a_scope_field_is_refused() {
     delete_credential(&client, &api, &credential_id(&client, &api, &service).await).await;
 }
 
-/// Regression: the plaintext is not one bare GET away, and not reachable from
-/// an app.
-///
-/// `GET /api/v1/credential-value?id=<uuid>` returned the stored secret to any
-/// caller. App UIs are same-origin, so an installed app's JS could list the
-/// credentials and read every one. That is exactly what the credentialed proxy
-/// exists to prevent.
 #[tokio::test]
 async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
     let client = user_client().await;
@@ -441,7 +383,6 @@ async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
     assert_eq!(resp.status(), 200);
     let id = credential_id(&client, &api, &service).await;
 
-    // No token: refused, and the body carries no secret.
     let resp = client
         .get(format!("{}/api/v1/credential-value", api))
         .query(&[("id", id.as_str())])
@@ -458,7 +399,6 @@ async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
         "a refusal must never carry the value"
     );
 
-    // A minted token spends exactly once.
     let token = reveal_token(&client, &api, &id).await;
     let value_url = format!("{}/api/v1/credential-value", api);
     let first = client
@@ -485,7 +425,6 @@ async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
         "a reveal token is one-shot; a replay must be refused"
     );
 
-    // An app document is refused at both steps, token or no token.
     let app_referer = format!("{}/app/habit-tracker/", api);
     for (method, url) in [
         ("POST", format!("{}/api/v1/credential-reveal-token", api)),
@@ -510,7 +449,6 @@ async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
         );
     }
 
-    // The successful read is on the record, naming the service, never the value.
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to database");
@@ -534,9 +472,6 @@ async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
     delete_credential(&client, &api, &id).await;
 }
 
-/// `GET /api/v1/events/query` masks a stored credential in any payload. A row
-/// written before the write-time mask still holds the raw value, and both the
-/// app SDK and `lucidos events query` read through this route.
 #[tokio::test]
 async fn events_query_masks_a_stored_credential_in_an_old_row() {
     let client = user_client().await;

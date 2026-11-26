@@ -10,28 +10,18 @@ fn make_chat_img(data: &str, mime: &str) -> crate::engine::types::ChatImage {
     }
 }
 
-/// Minimal valid PNG (1×1 pixel) — passes the magic-byte sniff in
-/// `core::blobs::sniff_image_mime`. Tests that need history images write
-/// distinct PNGs so the resulting hashes differ; the helper appends a
-/// per-test discriminator byte to make each blob unique.
 fn png_with_marker(marker: u8) -> Vec<u8> {
     vec![
-        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, // signature
-        0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R', // IHDR start
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, marker,
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, marker,
     ]
 }
 
-/// Write `n` distinct image blobs into `workspace` and return their hashes
-/// in the order written. Used by build_user_content_with_images tests that
-/// need history hashes which actually resolve.
 fn write_blobs(workspace: &Path, n: u8) -> Vec<String> {
     (0..n)
         .map(|i| write_blob(workspace, &png_with_marker(i)).unwrap().hash)
         .collect()
 }
-
-// --- build_user_content_with_images tests ---
 
 #[test]
 fn no_images_returns_text_only() {
@@ -51,7 +41,6 @@ fn current_image_only() {
         build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs), &[]);
     match result {
         MessageContent::Blocks(blocks) => {
-            // Text with hint + 1 image = 2 blocks
             assert_eq!(blocks.len(), 2);
             assert!(
                 matches!(&blocks[0], ContentBlock::Text { text } if text.contains("check this"))
@@ -84,7 +73,6 @@ fn history_images_labeled_as_earlier() {
                 matches!(&blocks[0], ContentBlock::Text { text } if text.contains("what was in the image?"))
             );
             assert!(matches!(&blocks[0], ContentBlock::Text { text } if text.contains("earlier")));
-            // History image is one ContentBlock::Image with the resolved bytes
             assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
         }
         _ => panic!("expected Blocks"),
@@ -109,28 +97,22 @@ fn mixed_history_and_current_images_separated() {
     );
     match result {
         MessageContent::Blocks(blocks) => {
-            // text_hint + IMG1 + IMG2 + IMG3 + separator_text + IMG4 = 6 blocks
             assert_eq!(blocks.len(), 6);
             let img_count = blocks
                 .iter()
                 .filter(|b| matches!(b, ContentBlock::Image { .. }))
                 .count();
             assert_eq!(img_count, 4);
-            // Hint distinguishes earlier vs current
             assert!(matches!(&blocks[0], ContentBlock::Text { text } if text.contains("earlier")));
             assert!(
                 matches!(&blocks[0], ContentBlock::Text { text } if text.contains("current message"))
             );
-            // Separator text between history and current images
             let text_count = blocks
                 .iter()
                 .filter(|b| matches!(b, ContentBlock::Text { .. }))
                 .count();
             assert_eq!(text_count, 2);
-            // Last image is the current one — its data is the literal "IMG4" string
-            // because current_images already carries inline base64.
             assert!(matches!(&blocks[5], ContentBlock::Image { data, .. } if data == "IMG4"));
-            // Separator is before the last image
             assert!(
                 matches!(&blocks[4], ContentBlock::Text { text } if text.contains("current message"))
             );
@@ -141,8 +123,6 @@ fn mixed_history_and_current_images_separated() {
 
 #[test]
 fn current_vs_history_images_distinguished() {
-    // Bug: when both history and current images exist, the LLM can't tell
-    // which images are from the current message vs earlier in conversation.
     let tmp = tempfile::TempDir::new().unwrap();
     let hashes = write_blobs(tmp.path(), 2);
     let history = vec![vec![hashes[0].clone()], vec![hashes[1].clone()]];
@@ -156,7 +136,6 @@ fn current_vs_history_images_distinguished() {
     );
     match result {
         MessageContent::Blocks(blocks) => {
-            // Must contain a text separator distinguishing current images from history
             let text_blocks: Vec<&str> = blocks
                 .iter()
                 .filter_map(|b| match b {
@@ -165,7 +144,6 @@ fn current_vs_history_images_distinguished() {
                 })
                 .collect();
 
-            // There should be a separator between history and current images
             let has_current_marker = text_blocks.iter().any(|t| t.contains("current message"));
             assert!(
                 has_current_marker,
@@ -173,7 +151,6 @@ fn current_vs_history_images_distinguished() {
                 text_blocks
             );
 
-            // The hint should mention earlier images exist
             let has_earlier_marker = text_blocks.iter().any(|t| t.contains("earlier"));
             assert!(
                 has_earlier_marker,
@@ -181,7 +158,6 @@ fn current_vs_history_images_distinguished() {
                 text_blocks
             );
 
-            // All 3 images still present
             let img_count = blocks
                 .iter()
                 .filter(|b| matches!(b, ContentBlock::Image { .. }))
@@ -192,9 +168,6 @@ fn current_vs_history_images_distinguished() {
     }
 }
 
-/// Generate a noisy PNG whose base64 payload exceeds the per-image LLM target.
-/// Noise resists PNG compression so the encoded image stays large; a smooth
-/// gradient would shrink under target and never exercise the fit/compress path.
 fn oversized_noisy_png_chat_image() -> crate::engine::types::ChatImage {
     use base64::Engine as _;
     let img_buf: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
@@ -216,9 +189,6 @@ fn oversized_noisy_png_chat_image() -> crate::engine::types::ChatImage {
 
 #[test]
 fn oversized_current_image_is_fitted_to_target() {
-    // Regression: an uploaded photo larger than the provider's per-image limit
-    // must be downsampled at the LLM boundary, not sent raw (which 400s with
-    // "image exceeds 5 MB maximum").
     use base64::Engine as _;
     let tmp = tempfile::TempDir::new().unwrap();
     let img = oversized_noisy_png_chat_image();
@@ -246,7 +216,6 @@ fn oversized_current_image_is_fitted_to_target() {
                 "current image must be downsampled to fit, got {} bytes",
                 data.len()
             );
-            // fit_for_llm compresses to JPEG when it shrinks the image.
             assert_eq!(media_type, "image/jpeg");
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(data)
@@ -259,8 +228,6 @@ fn oversized_current_image_is_fitted_to_target() {
 
 #[test]
 fn oversized_history_image_is_fitted_to_target() {
-    // Same fit applies to images pulled from history on a follow-up message —
-    // otherwise a thread with a large image would 400 on every subsequent turn.
     use base64::Engine as _;
     let tmp = tempfile::TempDir::new().unwrap();
     let raw = base64::engine::general_purpose::STANDARD
@@ -290,11 +257,6 @@ fn oversized_history_image_is_fitted_to_target() {
 
 #[test]
 fn oversized_history_images_skipped() {
-    // Budget is measured on the fitted (compressed-if-over) size. The big blob
-    // is a PNG header followed by megabytes of zero padding — not a decodable
-    // image, so `fit_for_llm`/`compress` can't shrink it; it stays over the
-    // budget and is skipped. The minimal PNG fixture is ~30 bytes, far under
-    // MAX_TOTAL_IMAGE_BASE64, so the small blob always fits.
     let tmp = tempfile::TempDir::new().unwrap();
     let big_bytes = {
         let mut buf = png_with_marker(1);
@@ -316,8 +278,6 @@ fn oversized_history_images_skipped() {
         _ => panic!("expected Blocks with only small image"),
     }
 }
-
-// --- staleness warning in build_user_content_with_images ---
 
 #[test]
 fn history_images_include_staleness_warning() {
@@ -388,9 +348,6 @@ fn mixed_images_include_staleness_warning() {
     }
 }
 
-// --- current-message image handles ---
-
-/// A PNG as the HTTP body hands it over: inline base64.
 fn png_chat_img(marker: u8) -> crate::engine::types::ChatImage {
     use base64::Engine as _;
     make_chat_img(
@@ -399,7 +356,6 @@ fn png_chat_img(marker: u8) -> crate::engine::types::ChatImage {
     )
 }
 
-/// Store `imgs` as the turn's `MessageReceived` does, then read their handles.
 fn stored_handles(
     workspace: &Path,
     imgs: &[crate::engine::types::ChatImage],
@@ -408,8 +364,6 @@ fn stored_handles(
     current_image_handles(workspace, imgs)
 }
 
-/// The reported bug: the model saw a new image with no address, guessed
-/// `thread:3` in a thread of two images, and `save_thread_image` failed.
 #[test]
 fn a_current_image_is_labeled_with_its_handle() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -462,13 +416,10 @@ fn the_current_message_separator_names_the_handles_too() {
     }
 }
 
-/// An image the budget leaves out is not shown, so its handle is not named
-/// either. Otherwise "1 image attached" would sit beside two handles.
 #[test]
 fn an_image_the_budget_skips_is_not_named() {
     use base64::Engine as _;
     let tmp = tempfile::TempDir::new().unwrap();
-    // A PNG header padded past the budget: not decodable, so it cannot shrink.
     let mut big = png_with_marker(20);
     big.extend(std::iter::repeat_n(0u8, MAX_TOTAL_IMAGE_BASE64));
     let imgs = vec![
@@ -493,9 +444,6 @@ fn an_image_the_budget_skips_is_not_named() {
     assert!(!text.contains(&skipped), "{text}");
 }
 
-/// The label is only worth printing if it resolves. The handle comes from the
-/// image bytes, the stored hash from `images_to_hashes`. If the two ever
-/// disagree, the model is handed an address the resolver rejects.
 #[test]
 fn a_current_images_handle_resolves_once_its_message_is_stored() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -529,16 +477,12 @@ fn a_current_images_handle_resolves_once_its_message_is_stored() {
     assert_eq!(by_handle[0].base64, by_index[0].base64);
 }
 
-/// An image whose blob never reached the disk never reached the thread, so it
-/// gets no handle: an address that names nothing is worse than none.
 #[test]
 fn an_image_with_no_stored_blob_gets_no_handle() {
     let tmp = tempfile::TempDir::new().unwrap();
     let imgs = vec![png_chat_img(30), make_chat_img("not base64!", "image/png")];
     assert_eq!(current_image_handles(tmp.path(), &imgs), vec![None, None]);
 }
-
-// --- filter_recent_history_image_hashes tests ---
 
 fn make_user_msg(content: &str, hashes: Vec<String>) -> SessionMessage {
     SessionMessage {
@@ -618,7 +562,6 @@ fn filter_images_within_limit_keeps_all() {
 
 #[test]
 fn filter_images_drops_oldest_when_over_limit() {
-    // 5 user messages with images, limit 3 → only last 3 kept
     let msgs = vec![
         make_user_msg("old screenshot", vec!["OLD1".to_string()]),
         make_assistant_msg("response"),
@@ -636,7 +579,6 @@ fn filter_images_drops_oldest_when_over_limit() {
         3,
         "should only keep 3 most recent image messages"
     );
-    // OLD1 and OLD2 should be dropped
     assert_eq!(result[0][0], "MID");
     assert_eq!(result[1][0], "RECENT1");
     assert_eq!(result[2][0], "LATEST");
@@ -644,9 +586,6 @@ fn filter_images_drops_oldest_when_over_limit() {
 
 #[test]
 fn filter_images_counts_all_user_messages_for_recency() {
-    // 6 user messages: image "A" at position 2, image "B" at position 6.
-    // With max_messages=3, only the last 3 user messages are eligible
-    // (positions 4, 5, 6). Image "A" at position 2 is stale → dropped.
     let msgs = vec![
         make_user_msg("text only 1", vec![]),
         make_assistant_msg("response"),
@@ -674,7 +613,6 @@ fn filter_images_ignores_assistant_images() {
     let mut assistant = make_assistant_msg("here is a generated image");
     assistant.image_handles = vec!["img-0123456789abcdef".to_string()];
     assistant.user_image_hashes = vec!["SHOULD_NOT_APPEAR".to_string()];
-    // Even if assistant message has user_image_hashes set (shouldn't happen), role filter blocks it
     let msgs = vec![
         make_user_msg("user img", vec!["USER".to_string()]),
         assistant,
@@ -704,11 +642,6 @@ fn filter_images_multi_image_messages() {
 
 #[test]
 fn filter_images_drops_stale_image_in_long_thread() {
-    // Bug scenario: screenshot sent at MSG 0, followed by 8 more user
-    // messages with no images. The screenshot is stale — 8 user messages
-    // old — and should NOT be included in context (max_messages=3).
-    // The function must count ALL user messages for recency, not just
-    // image-bearing ones, otherwise a single old screenshot survives forever.
     let mut msgs = vec![
         make_user_msg(
             "here is a screenshot of the bug",
@@ -720,7 +653,6 @@ fn filter_images_drops_stale_image_in_long_thread() {
         msgs.push(make_user_msg(&format!("follow-up {}", i), vec![]));
         msgs.push(make_assistant_msg(&format!("response {}", i)));
     }
-    // 9 user messages total, only the 1st has an image.
     let result = filter_recent_history_image_hashes(&msgs, 3);
     assert!(
         result.is_empty(),

@@ -111,10 +111,6 @@ async fn a_machine_made_workspace_writes_inside_read_write_but_never_a_secret() 
     drop_role(&pool, &db_name).await;
 }
 
-/// The restore policy and the restore boundary grant or fence authority, so the
-/// handed credential must not write them (ADR 0612 decisions 8 and 9). Only a
-/// machine-made workspace writes `preferences` at all, so the guard is what
-/// refuses there.
 #[tokio::test]
 async fn a_machine_made_role_cannot_write_restore_authority_or_human_only_preferences() {
     let (pool, db_name) = setup_test_db().await;
@@ -158,7 +154,6 @@ async fn a_machine_made_role_cannot_write_restore_authority_or_human_only_prefer
         .unwrap();
     assert_eq!(value, "ask");
 
-    // An ordinary preference stays writable, and the engine role is not fenced.
     sqlx::raw_sql(
         "BEGIN READ WRITE; UPDATE preferences SET value = '2' WHERE key = 'probe'; COMMIT;",
     )
@@ -240,7 +235,6 @@ fn every_name_is_quoted_whole_into_sql() {
     }
 }
 
-/// A workspace id may hold a hyphen, so its database name does too.
 #[tokio::test]
 async fn a_hyphenated_database_gets_its_agent_role() {
     let (pool, db_name) = setup_test_db().await;
@@ -371,7 +365,6 @@ async fn new_tables_fail_closed_and_reprovision_removes_stale_write_grants() {
         .await
         .unwrap();
     let role = ident(&lucidos_pg_url::agent_role(&db_name)).unwrap();
-    // Every grant an earlier release could have left behind, and more.
     sqlx::raw_sql(&format!(
         "GRANT INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public TO {role}; \
          GRANT USAGE, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {role};"
@@ -407,7 +400,6 @@ async fn new_tables_fail_closed_and_reprovision_removes_stale_write_grants() {
     assert!(failures.is_empty(), "unexpected write grants: {failures:?}");
 }
 
-/// A grant the revoke cannot reach must stop the boot, never ride along.
 #[tokio::test]
 async fn a_write_privilege_that_survives_provisioning_fails_it() {
     let (pool, db_name) = setup_test_db().await;
@@ -425,9 +417,6 @@ async fn a_write_privilege_that_survives_provisioning_fails_it() {
     assert!(machine_made.is_ok(), "{machine_made:?}");
 }
 
-/// Where PUBLIC holds `CREATE` on the schema, as on a database made before
-/// Postgres 15, the role owns what it made. A boot must survive those
-/// relations, or an agent could stop its own workspace starting.
 #[tokio::test]
 async fn relations_the_agent_role_created_do_not_fail_the_next_boot() {
     let (pool, db_name) = setup_test_db().await;
@@ -450,7 +439,6 @@ async fn relations_the_agent_role_created_do_not_fail_the_next_boot() {
     .unwrap();
 
     let again = provision(&pool, &test_db_url(&db_name), None).await;
-    // The role owns these, so the database cannot drop while it exists.
     sqlx::raw_sql(
         "DROP MATERIALIZED VIEW agent_made_matview; DROP VIEW agent_made_view; \
          DROP TABLE agent_made;",
@@ -462,9 +450,6 @@ async fn relations_the_agent_role_created_do_not_fail_the_next_boot() {
     assert!(again.is_ok(), "{again:?}");
 }
 
-/// A database made before Postgres 15 lets PUBLIC create in the schema.
-/// Provisioning takes that away for every origin, since a role that creates a
-/// table owns it and can grant on it.
 #[tokio::test]
 async fn the_agent_role_cannot_create_in_the_schema() {
     let (pool, db_name) = setup_test_db().await;
@@ -490,7 +475,6 @@ async fn the_agent_role_cannot_create_in_the_schema() {
         }
         conn.close().await.unwrap();
     }
-    // The engine's own role still creates, as every migration does.
     sqlx::raw_sql("CREATE TABLE engine_made (value text); DROP TABLE engine_made;")
         .execute(&pool)
         .await
@@ -498,7 +482,6 @@ async fn the_agent_role_cannot_create_in_the_schema() {
     drop_role(&pool, &db_name).await;
 }
 
-/// A `CREATE` right the revoke cannot reach stops the boot and names the fix.
 #[tokio::test]
 async fn a_schema_create_right_that_survives_provisioning_fails_it() {
     let (pool, db_name) = setup_test_db().await;

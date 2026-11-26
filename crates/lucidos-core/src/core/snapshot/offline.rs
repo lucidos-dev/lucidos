@@ -1,4 +1,3 @@
-//! Gateway-bound offline command. No normal engine construction occurs here.
 use super::{service::Session, store::Store, ArchiveJobKind, ArchiveJobSlot, BoxError};
 use std::{path::PathBuf, sync::Arc};
 use uuid::Uuid;
@@ -50,13 +49,13 @@ impl Arguments {
     }
 }
 
-/// The environment supplies the same database and slug as the stopped engine.
+/// INVARIANT: The environment supplies the same database and slug as the stopped engine.
 /// The registry, not that environment, authorizes their directory binding.
 pub async fn run(args: Arguments, database_url: String) -> Result<(), BoxError> {
     run_inner(args, database_url, false).await
 }
 
-/// Gateway restart recovery never continues a partly installed forward restore.
+/// INVARIANT: Gateway restart recovery never continues a partly installed forward restore.
 pub async fn recover(args: Arguments, database_url: String) -> Result<(), BoxError> {
     run_inner(args, database_url, true).await
 }
@@ -78,7 +77,6 @@ async fn run_inner(
         )?;
         let database = crate::core::secret_store::boot::database_name(&database_url)?;
         let expected = Store::database_root(&database)?;
-        // A caller may name the store, never redirect the engine to another one.
         if args.root.canonicalize()? != expected.canonicalize()? {
             return Err::<_, BoxError>("snapshot root mismatch".into());
         }

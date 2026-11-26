@@ -1,60 +1,17 @@
-//! Terminal boot-failure reporting to the workspace gateway (ADR 0014 §11).
-//!
-//! The sibling [`crate::boot_report`] narrates boot *progress*; this module
-//! reports boot *death*. When startup fails in a way no retry can fix — most
-//! importantly a database migrated by a NEWER Lucidos than this binary, which
-//! is what an app downgrade produces — the engine exits and the gateway is left
-//! guessing. Without a reported reason it respawns us to the restart cap and
-//! then falls back to the neutral "Workspace starting…" splash, so the user
-//! stares at a spinner while the actual, actionable cause sits in a log file
-//! they will never open. (Exactly the 2026-07-29 incident: installing the 0.15.0
-//! DMG over a database the 0.16.0 RC had migrated produced
-//! `Error: VersionMissing(20260713144403)` on every spawn and a permanent
-//! splash.)
-//!
-//! Two things differ from `boot_report`, and both are load-bearing:
-//!
-//! 1. **The POST is awaited, not detached.** `boot_report` spawns a detached
-//!    task because a phase report must never delay the boot. Here the process is
-//!    about to *exit*, so a detached task would simply never run — the report has
-//!    to land before we return.
-//! 2. **Only a CLASSIFIED-terminal failure is reported**
-//!    ([`terminal_migration_message`] returns `Option`, and a wiped database
-//!    needs the migration marker's say-so). Reporting stops the
-//!    gateway respawning, so treating an unclassified error as terminal would
-//!    turn a workspace that recovers on its own — a dropped connection during
-//!    migrations, say — into a permanently dead one. When in doubt, say nothing
-//!    and let the supervisor retry.
-//!
-//! Still best-effort in every other respect: a short timeout, all transport
-//! errors swallowed, and a no-op when we were not spawned by a gateway
-//! (`LUCIDOS_GATEWAY_PORT` / `LUCIDOS_WORKSPACE_ID` unset — the
-//! `LUCIDOS_NO_GATEWAY` dev mode and the e2e direct-engine harness). Reporting
-//! must never change the exit code or invent a failure of its own.
-
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Per-process first-report guard, so a second classified-terminal site (or a
-/// retried construction) cannot overwrite the message already delivered.
 static REPORTED: AtomicBool = AtomicBool::new(false);
 
-/// How long one POST attempt may take. Bounded because we are on the exit path:
-/// two schemes × this timeout is the worst case a user waits before the process
-/// dies, and a dead gateway must not turn a fast failure into a hang.
 const REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Take the single report slot, returning `true` for the first caller only.
-///
-/// Split out (and parameterized over the flag) so the rule is unit testable
-/// without touching the process-global [`REPORTED`].
 fn claim(reported: &AtomicBool) -> bool {
     !reported.swap(true, Ordering::SeqCst)
 }
 
-/// Read the migration versions recorded in the database.
+/// INVARIANT: Read the migration versions recorded in the database.
 ///
 /// Best-effort: an unreadable `_sqlx_migrations` yields an empty list, which
 /// only costs the message its counts — never an error of its own, since we are
@@ -68,12 +25,11 @@ pub async fn applied_versions(pool: &PgPool) -> Vec<i64> {
         .unwrap_or_default()
 }
 
-/// The migration versions this binary carries.
 pub fn embedded_versions(migrator: &Migrator) -> Vec<i64> {
     migrator.iter().map(|m| m.version).collect()
 }
 
-/// Turn a **terminal** migration failure into a sentence a non-technical user can
+/// INVARIANT: Turn a **terminal** migration failure into a sentence a non-technical user can
 /// act on, or `None` when the failure is retryable.
 ///
 /// The `None` arm is load-bearing, not a fallback. Reporting a boot failure stops
@@ -101,8 +57,6 @@ pub fn terminal_migration_message(
     engine_version: &str,
 ) -> Option<String> {
     Some(match err {
-        // The downgrade case: the database records migrations this build has
-        // never heard of, so sqlx refuses to run rather than guess.
         MigrateError::VersionMissing(version) => {
             let mut unknown: Vec<i64> = applied
                 .iter()
@@ -110,8 +64,6 @@ pub fn terminal_migration_message(
                 .filter(|v| !embedded.contains(v))
                 .collect();
             unknown.sort_unstable();
-            // `unknown` is empty only if `_sqlx_migrations` was unreadable; fall
-            // back to the single version sqlx named so the message still helps.
             let (count, newest) = match unknown.last() {
                 Some(newest) => (unknown.len(), *newest),
                 None => (1, *version),
@@ -124,16 +76,11 @@ pub fn terminal_migration_message(
                  {newest}). Install a newer version of Lucidos to open this workspace."
             )
         }
-        // The migration file shipped in this build differs from the one that was
-        // actually applied — a modified database, or two builds from different
-        // lineages sharing one workspace.
         MigrateError::VersionMismatch(version) => format!(
             "Lucidos {engine_version} cannot open this workspace: migration {version} in this \
              version differs from the one already applied to its database. The database may \
              have been modified, or opened by a different build of Lucidos."
         ),
-        // Only reachable on a database without transactional DDL, but the
-        // remedy is specific enough to be worth its own wording.
         MigrateError::Dirty(version) => format!(
             "Lucidos {engine_version} cannot open this workspace: migration {version} is only \
              partially applied to its database and must be repaired by hand."
@@ -148,17 +95,16 @@ pub fn terminal_migration_message(
         MigrateError::Execute(source) => {
             return terminal_database_error_message(source, "the migration check", engine_version)
         }
-        // Everything else, such as an unreadable migration source, may well
+        // INVARIANT: Everything else, such as an unreadable migration source, may well
         // succeed on the next attempt. Staying silent leaves the supervisor's
         // respawn in charge, which recovers a workspace from a transient fault.
         _ => return None,
     })
 }
 
-/// The longest server message a report carries.
 const MAX_SERVER_MESSAGE_BYTES: usize = 300;
 
-/// Report a **deterministic** database error, or return `None`.
+/// INVARIANT: Report a **deterministic** database error, or return `None`.
 ///
 /// `None` means a retry could clear it (a dropped connection, a deadlock) or
 /// that `err` carries no SQLSTATE.
@@ -186,11 +132,6 @@ pub fn terminal_database_error_message(
     ))
 }
 
-/// The message for a database whose schema was wiped after it was migrated
-/// (ADR 0481). Terminal: migrating would boot a blank workspace.
-///
-/// Recovery comes first, then the escape hatch. The workspace's files are
-/// intact, so the restored workspace's agent can copy over what changed.
 pub fn wiped_database_message(workspace_dir: &std::path::Path) -> String {
     let marker = crate::core::migration_marker::path(workspace_dir);
     format!(
@@ -204,7 +145,7 @@ pub fn wiped_database_message(workspace_dir: &std::path::Path) -> String {
     )
 }
 
-/// Report a terminal boot failure to the gateway and WAIT for it to land.
+/// INVARIANT: Report a terminal boot failure to the gateway and WAIT for it to land.
 ///
 /// Returns once the gateway has been reached (any response — a 404 from an older
 /// gateway that lacks the endpoint counts, since retrying the other scheme would
@@ -215,20 +156,18 @@ pub async fn report(message: &str) {
     if !claim(&REPORTED) {
         return;
     }
-    // Log unconditionally: a non-gateway engine (dev / e2e) has no splash to
+    // INVARIANT: Log unconditionally: a non-gateway engine (dev / e2e) has no splash to
     // render this, and even under a gateway the log is the durable copy.
     crate::log_legacy!("[Startup] Boot failed: {}", message);
     let (Ok(port), Ok(id)) = (
         std::env::var("LUCIDOS_GATEWAY_PORT"),
         std::env::var("LUCIDOS_WORKSPACE_ID"),
     ) else {
-        return; // not gateway-spawned — the log above is the whole report
+        return;
     };
     post_failure(&port, &id, message).await;
 }
 
-/// The bare POST, split from [`report`] so it is testable against a stub server
-/// without setting process-global env vars.
 async fn post_failure(port: &str, id: &str, message: &str) {
     let Ok(client) = crate::gateway_auth::client_builder()
         .timeout(REPORT_TIMEOUT)
@@ -240,8 +179,6 @@ async fn post_failure(port: &str, id: &str, message: &str) {
         "{}/~/api/v1/control/workspaces/{id}/boot-failure",
         lucidos_local_token::client::origin(port)
     );
-    // Any status means the gateway heard it; nothing listening means nobody
-    // will. Either way the log line in `report` stays.
     let _ = client
         .post(&url)
         .json(&serde_json::json!({ "message": message }))
@@ -257,7 +194,6 @@ mod tests {
 
     const VERSION: &str = "0.15.0";
 
-    /// The 2026-07-29 incident, as a test: 159 applied vs 154 embedded.
     #[test]
     fn newer_database_message_names_the_gap_not_a_target_version() {
         let embedded: Vec<i64> = (1..=154).collect();
@@ -285,8 +221,6 @@ mod tests {
             "newest unknown version: {msg}"
         );
         assert!(msg.contains(VERSION), "names this build: {msg}");
-        // The invariant that keeps the message honest — migrations carry no
-        // app-version tag, so no upgrade target may be invented.
         assert!(!msg.contains("0.16"), "must not fabricate a target: {msg}");
     }
 
@@ -302,8 +236,6 @@ mod tests {
         assert!(msg.contains("1 migration this version"), "{msg}");
     }
 
-    /// An unreadable `_sqlx_migrations` leaves the lists empty; the message must
-    /// still name the version sqlx reported rather than claiming "0 migrations".
     #[test]
     fn unreadable_migration_table_falls_back_to_the_reported_version() {
         let msg = terminal_migration_message(
@@ -332,10 +264,6 @@ mod tests {
         assert!(dirty.contains("partially applied"), "{dirty}");
     }
 
-    /// The load-bearing negative case. Reporting stops the gateway respawning, so
-    /// a RETRYABLE migration error must stay unreported — classifying a dropped
-    /// connection as terminal would turn a workspace that recovers on its own into
-    /// a permanently dead one.
     #[test]
     fn retryable_migration_errors_are_not_reported_as_terminal() {
         assert!(
@@ -355,8 +283,6 @@ mod tests {
         );
     }
 
-    /// Reporting stops the gateway respawning, so each of these must stay
-    /// retryable, including an error that carries no SQLSTATE.
     #[test]
     fn transient_database_errors_stay_retryable() {
         for code in [
@@ -423,9 +349,6 @@ mod tests {
         assert!(msg.len() < 450, "{msg}");
     }
 
-    /// The 07:46 incident: a `CHECK` violation whose `detail` held a contributor's
-    /// email and a token prefix. The real server error must yield a message with
-    /// none of it.
     #[tokio::test]
     async fn a_check_violation_report_carries_no_row_data() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -490,8 +413,6 @@ mod tests {
 
     type Seen = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
-    /// A stand-in gateway answering `status`, recording the request it saw as
-    /// its path and body.
     fn stub_gateway(status: axum::http::StatusCode) -> (String, Seen) {
         let seen: Seen = Default::default();
         let record = seen.clone();
@@ -506,8 +427,6 @@ mod tests {
         (port.to_string(), seen)
     }
 
-    /// The report must be OBSERVED by the gateway before `post_failure` returns —
-    /// a detached send would let the process exit first and lose it entirely.
     #[tokio::test]
     async fn post_reaches_the_gateway_before_returning() {
         let (port, seen) = stub_gateway(axum::http::StatusCode::NO_CONTENT);
@@ -520,8 +439,6 @@ mod tests {
         assert!(request.contains("database is newer"), "{request}");
     }
 
-    /// An older gateway has no such route. A 404 is "reached the gateway" — we
-    /// must not error, hang, or fall through to a pointless second attempt.
     #[tokio::test]
     async fn older_gateway_404_is_tolerated() {
         let (port, seen) = stub_gateway(axum::http::StatusCode::NOT_FOUND);
@@ -530,10 +447,8 @@ mod tests {
         assert!(request.contains("boot-failure"), "{request}");
     }
 
-    /// Nothing listening: the call fails fast and still returns.
     #[tokio::test]
     async fn unreachable_gateway_returns_without_erroring() {
-        // Bind then drop, so the port is almost certainly free.
         let port = {
             let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             l.local_addr().expect("addr").port().to_string()

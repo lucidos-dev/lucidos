@@ -1,5 +1,3 @@
-//! Startup subscriber for config change notifications.
-
 use lucidos_core::log_legacy;
 use lucidos_engine::engine::config_change::{change_of, notice, CONFIG_CHANGE_EVENTS};
 use lucidos_engine::engine::event_bus::{
@@ -10,8 +8,6 @@ use sqlx::{types::Uuid, PgPool};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Post a notification for every config change somebody makes, for as long
-/// as the bus runs.
 pub fn spawn(bus: EventBus, pool: PgPool) -> tokio::task::JoinHandle<()> {
     let (mut rx, mut replay) = LagReplay::subscribe(
         &bus,
@@ -83,7 +79,6 @@ mod tests {
         }
     }
 
-    /// Sam holds two devices; Kim holds one.
     fn team() -> UserSnapshot {
         UserSnapshot {
             users: vec![

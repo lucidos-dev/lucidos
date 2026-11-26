@@ -1091,6 +1091,65 @@ async fn coding_agent_auto_answer_keeps_what_each_workspace_ran() {
     teardown_test_db(&db_name).await;
 }
 
+const RENAME_AGENT_BRAND_COLOURS_SQL: &str = include_str!(
+    // The file name carries the retired key.
+    "../../lucidos-core/migrations/20261125103854_rename_agent_brand_colours_to_agent_icon_colors.sql"
+);
+
+/// On becomes Brand and Off becomes Muted, per device. A row already under the
+/// new key on the same device wins, and no old row survives.
+#[tokio::test]
+async fn agent_icon_colors_keep_each_devices_choice() {
+    let (pool, db_name) = setup_test_db().await;
+    let old = "agent-brand-colours"; // Wire contract: the retired key, as stored.
+    let new = crate::core::prefs::AGENT_ICON_COLORS.key();
+    let rows: [(&str, Option<&str>, &str); 5] = [
+        (old, Some("dev-on"), "true"),
+        (old, Some("dev-off"), "false"),
+        (old, None, "false"),
+        (old, Some("dev-both"), "false"),
+        (new, Some("dev-both"), "theme"),
+    ];
+    for (key, device, value) in rows {
+        sqlx::query("INSERT INTO preferences (key, device_id, value) VALUES ($1, $2, $3)")
+            .bind(key)
+            .bind(device)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    sqlx::raw_sql(RENAME_AGENT_BRAND_COLOURS_SQL)
+        .execute(&pool)
+        .await
+        .expect("the migration runs");
+
+    let stored: Vec<(Option<String>, String)> = sqlx::query_as(
+        "SELECT device_id, value FROM preferences WHERE key = $1 ORDER BY device_id NULLS FIRST",
+    )
+    .bind(new)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected = [
+        (None, "muted"),
+        (Some("dev-both"), "theme"),
+        (Some("dev-off"), "muted"),
+        (Some("dev-on"), "brand"),
+    ]
+    .map(|(device, value)| (device.map(str::to_string), value.to_string()));
+    assert_eq!(stored, expected);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preferences WHERE key = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "no old row survives");
+
+    teardown_test_db(&db_name).await;
+}
+
 const RENAME_OPERATOR_AND_PEOPLE_TO_USER_SQL: &str = include_str!(
     "../../lucidos-core/migrations/20261111091917_rename_operator_and_people_to_user.sql"
 );

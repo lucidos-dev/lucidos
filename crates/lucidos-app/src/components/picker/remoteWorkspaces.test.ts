@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ListedWorkspace } from '../../api/client/control';
-import { mergeRemoteListings, remoteWorkspaceRoute, remoteWorkspaceOpenable } from './remoteWorkspaces';
+import { mergeRemoteListings, remoteWorkspaceRoute, remoteWorkspaceOpenable, shownRemoteView } from './remoteWorkspaces';
 
 const dev: ListedWorkspace = { id: 'dev', name: 'Dev', health: 'healthy' };
 const notes: ListedWorkspace = { id: 'notes', name: 'Notes', health: 'unhealthy', last_error: 'not started' };
@@ -52,5 +52,21 @@ describe('remoteWorkspaceOpenable', () => {
       [{ gateway: 'cloud', state: 'unreachable', reason: 'No answer', reason_kind }]);
     expect(rows[0].workspaces).toEqual([dev]);
     expect(remoteWorkspaceOpenable(rows[0], dev)).toBe(false);
+  });
+});
+
+describe('shownRemoteView: the picker acts on the gateway its list shows', () => {
+  const lab = { gateway: 'lab', workspaces: [dev], unreachable: null };
+
+  it('shows the picked remote once its listing has loaded', () => {
+    expect(shownRemoteView('lab', { status: 'loaded', data: [lab] })).toBe(lab);
+  });
+
+  it('shows this gateway while the remote listings are still loading', () => {
+    expect(shownRemoteView('lab', { status: 'loading' })).toBeNull();
+  });
+
+  it('shows this gateway when the picked remote is no longer listed', () => {
+    expect(shownRemoteView('gone', { status: 'loaded', data: [lab] })).toBeNull();
   });
 });

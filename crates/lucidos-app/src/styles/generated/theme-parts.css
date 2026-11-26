@@ -164,6 +164,18 @@
     initial-value: #e6edf3;
 }
 
+@property --agent-icon-theme {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #58a6ff;
+}
+
+@property --agent-icon-muted {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #6e7681;
+}
+
 @property --accent-green {
     syntax: '<color>';
     inherits: true;

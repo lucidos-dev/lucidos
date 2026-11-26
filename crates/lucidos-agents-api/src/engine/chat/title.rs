@@ -1,21 +1,9 @@
 use crate::core::preference_catalog::STANDARD_TITLE_STYLE;
 
-/// Everything a title call runs under: the provider, the effort resolved
-/// beside it, and the purpose's deadline.
-///
-/// One type, because the first two are a *model selection*. A site that builds
-/// the provider and forgets the effort silently ignores what the user set, and
-/// one that forgets the deadline runs unbounded. Owned rather than borrowed:
-/// three of the five title sites move it into a spawned task.
 pub(crate) struct TitleCall {
     provider: std::sync::Arc<dyn crate::llm::provider::LlmProvider>,
     effort: Option<String>,
-    /// The purpose's whole-call deadline. Carried because titling resamples: a
-    /// response that fails validation earns a second request, and each request
-    /// carries the provider's own retries. Bounding one attempt is therefore
-    /// not the same as bounding the call.
     deadline: std::time::Duration,
-    /// The workspace's `title_style`, trimmed. `None` keeps the standard format.
     style: Option<String>,
 }
 
@@ -24,8 +12,6 @@ impl TitleCall {
         self.provider.as_ref()
     }
 
-    /// A call over an already-built provider, at the purpose's declared
-    /// defaults. Tests only: production resolves the pair from preferences.
     #[cfg(test)]
     pub(crate) fn over(provider: std::sync::Arc<dyn crate::llm::provider::LlmProvider>) -> Self {
         Self::from_call(&crate::engine::aux_purpose::AuxCall::over(
@@ -34,8 +20,6 @@ impl TitleCall {
         ))
     }
 
-    /// The same call under a title style. Tests only: production reads it
-    /// from preferences.
     #[cfg(test)]
     pub(crate) fn styled(mut self, style: &str) -> Self {
         self.style = Some(style.to_string());
@@ -52,12 +36,6 @@ impl TitleCall {
     }
 }
 
-/// Resolve the title *model selection* and the workspace's title style.
-///
-/// One helper because every title site needs the same things: the follow-up
-/// titler, the engine's own thread titler, and the API's title suggestion.
-/// Each used to read the model preference itself, and a site that built its
-/// own call would skip the style.
 pub(crate) async fn title_call(engine: &crate::engine::LucidosEngine) -> TitleCall {
     let mut call =
         TitleCall::from_call(&engine.aux_call(crate::engine::ContextPurpose::Title).await);
@@ -65,25 +43,13 @@ pub(crate) async fn title_call(engine: &crate::engine::LucidosEngine) -> TitleCa
     call
 }
 
-/// How much of the prompt stands in for a name the caller did not give.
 const SPAWN_PLACEHOLDER_CHARS: usize = 60;
 
-/// How a spawn names the thread it is about to create.
-///
-/// Two fields, because they are consumed in different places and must not be
-/// conflated. `caller_title` is handed to `process_message_with_steps`, which
-/// writes it once the thread's row exists and keeps the title model out.
-/// `placeholder` is only what a parent's sub-thread row shows in the moment
-/// before the thread is real, and it never becomes the thread's name.
 pub(crate) struct SpawnNaming {
     pub(crate) caller_title: Option<String>,
     pub(crate) placeholder: String,
 }
 
-/// Resolve a spawn's naming from what its caller asked for.
-///
-/// A blank or whitespace-only title is no title. The thread then stands in the
-/// prompt's opening words and the title model names it a moment later.
 pub(crate) fn spawn_naming(caller_title: Option<&str>, prompt: &str) -> SpawnNaming {
     let caller_title = caller_title
         .map(str::trim)
@@ -113,12 +79,6 @@ fn strip_thread_reference_links(text: &str) -> std::borrow::Cow<'_, str> {
     RE.replace_all(text, "[referenced thread]")
 }
 
-/// What to do when titling a thread for a given message.
-///
-/// Image-only messages used to hit the LLM with an empty prompt body and
-/// produce hallucinated titles like the literal string "Generate a short
-/// title". `Image` / `Images` short-circuit those cases; `Skip` covers
-/// truly-empty inputs; `Llm` is the normal path.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TitleDecision {
     Skip,
@@ -168,9 +128,6 @@ static TITLE_SYSTEM_PROMPT: std::sync::LazyLock<String> = std::sync::LazyLock::n
     )
 });
 
-/// The system prompt for one title call: the standard instruction, then the
-/// workspace's title style when one is set. The style overrides the standard
-/// length and wording, and the model still returns only the title.
 fn title_system_prompt(style: Option<&str>) -> std::borrow::Cow<'static, str> {
     match style.map(str::trim).filter(|s| !s.is_empty()) {
         None => std::borrow::Cow::Borrowed(TITLE_SYSTEM_PROMPT.as_str()),
@@ -185,14 +142,6 @@ fn title_system_prompt(style: Option<&str>) -> std::borrow::Cow<'static, str> {
     }
 }
 
-/// True when the LLM echoed the system-prompt instruction back as the
-/// title instead of generating one. Substring matches on topic words
-/// (e.g. "conversation title") cannot distinguish an echoed instruction
-/// from a legitimate title whose subject IS conversation titles, so
-/// matches are anchored to instruction shape: imperative "Generate X"
-/// prefix, exact-match bare instruction fragments (LLM bailed to a
-/// 2-word stub), and a few distinctive instruction phrases that
-/// virtually never appear in real titles.
 fn is_prompt_echo(title: &str) -> bool {
     let lower = title.to_lowercase();
     let trimmed = lower.trim();
@@ -217,34 +166,19 @@ fn is_prompt_echo(title: &str) -> bool {
         return true;
     }
 
-    // A reply in the input's own tags carries markup, not a title.
     if lower.contains("conversation>") {
         return true;
     }
 
-    // "generated" (adjective) is a different word and stays allowed.
     trimmed.starts_with("generate ")
 }
 
-/// The title system prompt asks for `STANDARD_TITLE_STYLE`, a few words. An
-/// output past double that maximum is no longer a title — it's the model
-/// answering the message (a clarifying question, refusal, or explanation)
-/// instead of summarizing it. Observed with a Gemini Flash title model: a
-/// screenshot-less "whats this app, and why does it have a filter entry but
-/// no threads" message produced the literal title "Please provide more
-/// context, a screenshot, or the name of the app you are referring to!".
-/// Reject by word count rather than brittle per-phrase matching so the check
-/// stays provider-agnostic.
 pub(crate) const MAX_TITLE_WORDS: usize = 12;
 
 fn is_oversized_for_title(title: &str) -> bool {
     title.split_whitespace().count() > MAX_TITLE_WORDS
 }
 
-/// Validate an LLM-produced title. `Err` carries a human-readable reason and
-/// signals the caller to resample or fall back. A title can fail three ways:
-/// empty, an echo of the system instruction, or a full conversational
-/// response (too long to be a title).
 fn validate_title(title: String) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if title.is_empty() {
         return Err("LLM returned empty title".into());
@@ -258,17 +192,10 @@ fn validate_title(title: String) -> Result<String, Box<dyn std::error::Error + S
     Ok(title)
 }
 
-/// The longest message a title input carries, in chars.
 const TITLE_MESSAGE_CHARS: usize = 1000;
 
-/// The longest image description a title input carries, in chars.
 const TITLE_IMAGE_DESCRIPTION_CHARS: usize = 300;
 
-/// Build the user message for thread title generation: the conversation body
-/// inside `<conversation>` tags, no instruction. Bare, a short message reads
-/// as chat, and the title model answers it instead of titling it. Truncates
-/// the message to [`TITLE_MESSAGE_CHARS`] and the image description to
-/// [`TITLE_IMAGE_DESCRIPTION_CHARS`].
 fn build_title_user_content(message: &str, image_description: Option<&str>) -> String {
     let truncated: String = without_conversation_tags(&strip_thread_reference_links(message))
         .chars()
@@ -308,7 +235,6 @@ pub(crate) async fn generate_thread_title(
     }
 }
 
-/// The resample loop `generate_thread_title` bounds.
 async fn title_attempts(
     call: &TitleCall,
     message: &str,
@@ -323,13 +249,6 @@ async fn title_attempts(
     let user_content = build_title_user_content(message, image_description);
     let system_prompt = title_system_prompt(call.style.as_deref());
 
-    // Smaller/faster title models intermittently answer the message (a
-    // clarifying question, refusal, or explanation) instead of titling it;
-    // `validate_title` rejects those. Gemini's default sampling is
-    // non-deterministic, so one resample usually returns a real title —
-    // this mirrors the user manually re-generating. Transport errors are
-    // deterministic (auth/region/config) and propagate via `?` without a
-    // retry.
     const MAX_ATTEMPTS: usize = 2;
     let mut last_err: Box<dyn std::error::Error + Send + Sync> =
         "title generation produced no candidate".into();
@@ -362,20 +281,12 @@ async fn title_attempts(
     Err(last_err)
 }
 
-/// What one naming attempt left behind.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TitleAttempt {
-    /// The thread got its title, or needs none.
     Settled,
-    /// No title was written. Another attempt may still name the thread.
     Failed,
 }
 
-/// How long a thread waits before each retry of a failed title.
-///
-/// A title model that hangs on one call usually answers the next one. Without
-/// a retry, one hung call leaves the thread unnamed until its next message.
-/// A thread that gets none stays unnamed for good.
 pub(crate) const TITLE_RETRY_DELAYS: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(60),
     std::time::Duration::from_secs(300),
@@ -434,14 +345,6 @@ pub(crate) async fn name_untitled_thread(
     }
 }
 
-/// Generate a thread title via LLM and emit it as a ThreadTitleGenerated event.
-/// Used by scheduled triggers, follow-up threads, and spawn_thread.
-///
-/// `image_count` is the number of images attached to the message being titled,
-/// used to short-circuit the LLM for image-only messages (see [`decide_title_path`]).
-///
-/// The home thread is skipped before the model call, so it costs nothing. The
-/// bus would refuse its title anyway (ADR 0362).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_generated_title(
     pool: &sqlx::PgPool,
@@ -471,8 +374,6 @@ pub(crate) async fn emit_generated_title(
         TitleDecision::Image => "Image".to_string(),
         TitleDecision::Images => "Images".to_string(),
         TitleDecision::Llm => {
-            // Log model + duration on every round-trip so a slow call
-            // (success path emits no other line) is triageable.
             let started = std::time::Instant::now();
             let model = provider.default_model().to_string();
             let capture = crate::engine::AuxCapture::new(
@@ -520,8 +421,6 @@ pub(crate) async fn emit_generated_title(
 
 #[easy_ext::ext(TitleExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Spawn background title generation for a thread (used when pinning).
-    /// Looks up the first message of the thread and generates a title via Flash.
     async fn spawn_title_generation(&self, thread_id: &str) {
         let tid_uuid = match uuid::Uuid::parse_str(thread_id) {
             Ok(u) => u,
@@ -594,8 +493,6 @@ mod title_style_tests {
         assert!(prompt.ends_with("ONLY the title text, nothing else."));
     }
 
-    /// A styled title past the cap is rejected, so the description tells the
-    /// agent the cap instead of letting a style ask for more.
     #[test]
     fn the_title_style_description_states_the_word_cap() {
         assert!(prefs::TITLE_STYLE
@@ -604,7 +501,6 @@ mod title_style_tests {
             .contains(&format!("{MAX_TITLE_WORDS} words")));
     }
 
-    /// The one request a title call makes under `style`.
     async fn request_for(style: Option<&str>) -> RecordedRequest {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
@@ -670,9 +566,6 @@ mod capture_tests {
 
     const TITLE_MODEL: &str = "gemini-3-flash-preview";
 
-    /// A resample is a second API call that spent a second set of tokens.
-    /// Counting only the winning attempt would under-report the real spend,
-    /// which is the whole point of capturing these.
     #[tokio::test]
     async fn a_resampled_title_records_both_attempts() {
         let (pool, db_name) = setup_test_db().await;
@@ -681,8 +574,6 @@ mod capture_tests {
         let capture =
             crate::engine::AuxCapture::new(&bus, thread_id, crate::engine::ContextPurpose::Title);
 
-        // First reply is an echo of the instruction, which `validate_title`
-        // rejects; the second is a real title.
         let provider = ScriptedProvider::new(
             TITLE_MODEL,
             vec!["Generate conversation title", "Fix the auth bug"],
@@ -766,7 +657,6 @@ mod capture_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A title that never validates still spent its tokens twice over.
     #[tokio::test]
     async fn a_title_that_never_validates_still_records_its_attempts() {
         let (pool, db_name) = setup_test_db().await;
@@ -805,9 +695,6 @@ mod capture_tests {
         .unwrap()
     }
 
-    /// Every automatic title passes through `emit_generated_title`. On the
-    /// home thread it makes no model call and emits nothing (ADR 0362). A
-    /// thread beside it is titled as usual, so the skip is not vacuous.
     #[tokio::test]
     async fn the_home_thread_gets_no_model_call_and_no_generated_title() {
         let (pool, db_name) = setup_test_db().await;
@@ -863,14 +750,11 @@ mod capture_tests {
             .unwrap()
     }
 
-    /// One failed title call used to leave a thread unnamed until its next
-    /// message. A retry names it without one.
     #[tokio::test]
     async fn a_failed_title_is_retried_until_the_thread_is_named() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = insert_untitled_thread(&pool).await;
-        // Both resamples of the first attempt are rejected, so it fails.
         let provider =
             ScriptedProvider::new(TITLE_MODEL, vec!["Title", "Title", "Fix the auth bug"]);
 
@@ -896,8 +780,6 @@ mod capture_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A name that lands while a retry waits ends the loop: no model call,
-    /// and the name stays.
     #[tokio::test]
     async fn a_retry_never_overwrites_a_name_that_arrived_meanwhile() {
         let (pool, db_name) = setup_test_db().await;
@@ -936,8 +818,6 @@ mod capture_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A thread deleted before an attempt costs no model call. A retry waits
-    /// minutes, and the user may delete the thread in that time.
     #[tokio::test]
     async fn a_deleted_thread_gets_no_title_call() {
         let (pool, db_name) = setup_test_db().await;
@@ -965,8 +845,6 @@ mod capture_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The retries are bounded: a model that never answers costs the first
-    /// attempt plus one per delay, then the thread stays unnamed.
     #[tokio::test]
     async fn retries_stop_after_the_last_delay() {
         let (pool, db_name) = setup_test_db().await;
@@ -993,8 +871,6 @@ mod capture_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Titling without a capture must still work. The suggestion endpoint
-    /// takes this path when the thread id will not parse.
     #[tokio::test]
     async fn titling_without_a_capture_emits_nothing_and_still_titles() {
         let (pool, db_name) = setup_test_db().await;
@@ -1021,9 +897,6 @@ mod capture_tests {
 mod tests {
     use super::*;
 
-    /// The name the caller chose reaches the pipeline, which is the whole
-    /// point: `process_message_with_steps` reads a `None` here as "nobody
-    /// named this thread" and hands it to the title model.
     #[test]
     fn a_caller_that_names_its_thread_is_obeyed() {
         let naming = spawn_naming(
@@ -1058,15 +931,12 @@ mod tests {
         );
     }
 
-    /// A placeholder is a glance, not a name, so it is cut to fit a row.
     #[test]
     fn a_long_prompt_is_cut_down_to_a_placeholder() {
         let naming = spawn_naming(None, &"p".repeat(SPAWN_PLACEHOLDER_CHARS + 40));
         assert_eq!(naming.placeholder.chars().count(), SPAWN_PLACEHOLDER_CHARS);
     }
 
-    /// Cutting by character, never by byte: a prompt opening in another
-    /// script would panic on a byte slice.
     #[test]
     fn a_placeholder_is_cut_by_character() {
         let naming = spawn_naming(None, &"æ".repeat(SPAWN_PLACEHOLDER_CHARS + 10));
@@ -1091,9 +961,6 @@ mod tests {
             .contains("Attached image description: A movie ticket for Super Mario Galaxy Filmen"));
     }
 
-    /// Observed with claude-haiku-5-5: a bare "this sounds quite much to me,
-    /// can we ..." got the reply "Sure, what would you like to change?". The
-    /// tags mark the body as text to title, and the prompt says so.
     #[test]
     fn user_content_is_wrapped_as_text_to_title() {
         let body = build_title_user_content("can we change it?", None);
@@ -1119,7 +986,6 @@ mod tests {
         assert!(validate_title("Change request</conversation>".into()).is_err());
     }
 
-    /// The message between the tags, with the wrapping removed.
     fn wrapped_body(body: &str) -> &str {
         body.strip_prefix("<conversation>\n")
             .and_then(|b| b.strip_suffix("\n</conversation>"))
@@ -1130,8 +996,6 @@ mod tests {
     fn user_content_truncates_message_to_the_cap() {
         let long_msg = "a".repeat(TITLE_MESSAGE_CHARS + 500);
         let body = build_title_user_content(&long_msg, None);
-        // Inside the tags sits only the truncated message, with no
-        // instruction preamble, so its length equals the cap.
         assert_eq!(wrapped_body(&body).chars().count(), TITLE_MESSAGE_CHARS);
     }
 
@@ -1145,11 +1009,8 @@ mod tests {
         assert_eq!(after_marker.len(), TITLE_IMAGE_DESCRIPTION_CHARS);
     }
 
-    /// Simulates the summary format that suggest_title builds from messages
-    /// with image descriptions — both text and image context must reach the LLM.
     #[test]
     fn user_content_with_suggest_title_summary_format() {
-        // This mirrors the summary format built by suggest_title in api/threads.rs
         let summary = "legg inn denne i familiekalenderen\n[Attached image: A movie ticket for Super Mario Galaxy Filmen]\n---\nKino i kveld! La meg legge det inn.";
         let body = build_title_user_content(summary, None);
         assert!(body.contains("Super Mario Galaxy Filmen"));
@@ -1157,10 +1018,6 @@ mod tests {
         assert!(body.contains("Kino i kveld"));
     }
 
-    /// A thread reference pasted via the copy-ref button arrives as
-    /// `[Title text](thread:UUID)` or `[Title text](thread:workspace/UUID)`.
-    /// The link's *visible* text is the referenced thread's title — exactly
-    /// what biases the LLM into reusing it. Strip both forms before titling.
     #[test]
     fn user_content_strips_thread_reference_link_text() {
         let msg = "Fix this bug from [Misplaced section: AI Memory and Context Redundancy](thread:1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)";
@@ -1185,8 +1042,6 @@ mod tests {
 
     #[test]
     fn system_prompt_emphasizes_intent_over_referenced_topic() {
-        // The system prompt must instruct the LLM to title by the user's
-        // intent in this thread, not by referenced material's subject.
         let lower = TITLE_SYSTEM_PROMPT.to_lowercase();
         assert!(lower.contains("this thread"));
         assert!(lower.contains("referenc"));
@@ -1194,13 +1049,6 @@ mod tests {
 
     #[test]
     fn system_prompt_instructs_not_to_perform_the_instruction() {
-        // The dominant title-gen failure on coding-agent threads: the small
-        // title model executes/answers the user's instruction (writing a whole
-        // plan, or asking for the screenshot) instead of summarizing it, which
-        // validate_title then rejects as oversized — leaving the thread with no
-        // ThreadTitleGenerated event and only the raw first-message fallback.
-        // The prompt must explicitly steer the model away from performing the
-        // instruction.
         let lower = TITLE_SYSTEM_PROMPT.to_lowercase();
         assert!(lower.contains("instruction"));
         assert!(
@@ -1218,7 +1066,6 @@ mod tests {
 
     #[test]
     fn system_prompt_instructs_to_include_identifiers() {
-        // Pin breadth — the instruction must not collapse to dev-tickets only.
         let lower = TITLE_SYSTEM_PROMPT.to_lowercase();
         assert!(lower.contains("identifier"));
         assert!(TITLE_SYSTEM_PROMPT.contains("JIRA-123"));
@@ -1232,11 +1079,6 @@ mod tests {
 
     #[test]
     fn system_prompt_excludes_opaque_identifiers() {
-        // Real production case: a "please install this plugin" message carried
-        // a 32-char hex install_id, which the LLM dutifully pasted into the
-        // title ("Install plugin 410b5e1a6b2b40d0b7c28b09f32e2178"). The
-        // identifier instruction must explicitly steer the model away from
-        // opaque IDs and toward the human name.
         let lower = TITLE_SYSTEM_PROMPT.to_lowercase();
         assert!(
             lower.contains("human-readable"),
@@ -1274,7 +1116,6 @@ mod tests {
     #[test]
     fn decide_returns_image_for_single_attachment_only() {
         assert_eq!(decide_title_path("", None, 1), TitleDecision::Image);
-        // Whitespace-only message + description are equivalent to empty.
         assert_eq!(
             decide_title_path("  \n ", Some("   "), 1),
             TitleDecision::Image
@@ -1287,13 +1128,6 @@ mod tests {
         assert_eq!(decide_title_path("", None, 5), TitleDecision::Images);
     }
 
-    /// Real string returned by gemini-3-flash-preview in production for
-    /// thread 8c3b5619-c35c-4120-b47d-1a5701b70a14. The user typed the
-    /// single word "Release"; with no intent to summarize, the model
-    /// echoed the system-instruction phrasing ("Generate a very short
-    /// title for the user's conversation") back as the title. Routing
-    /// the instruction through `system_instruction` reduces but does
-    /// not eliminate this — the validator has to catch it at the output.
     #[test]
     fn echo_detected_for_observed_production_string() {
         assert!(is_prompt_echo("Generate conversation title"));
@@ -1320,9 +1154,6 @@ mod tests {
         assert!(is_prompt_echo("Title"));
     }
 
-    /// Substring matching on topic words used to false-reject titles
-    /// whose subject was conversation titles themselves; these pin that
-    /// regression so the detector cannot collapse back to substring rules.
     #[test]
     fn echo_not_detected_for_real_titles() {
         assert!(!is_prompt_echo("Fix auth handshake bug"));
@@ -1337,10 +1168,6 @@ mod tests {
         assert!(!is_prompt_echo("Very short summary of Q4 revenue"));
     }
 
-    /// The user message sent to the LLM holds only the tagged conversation
-    /// text, with no instruction and no meta-vocabulary. Anything
-    /// from the system prompt that leaks into the user message gives the
-    /// model something to echo back as the title on garbled input.
     #[test]
     fn user_content_excludes_instruction_vocabulary() {
         let body = build_title_user_content(
@@ -1348,10 +1175,6 @@ mod tests {
             None,
         );
         let lower = body.to_lowercase();
-        // Distinctive phrases from TITLE_SYSTEM_PROMPT only — avoid
-        // generic words like "identifier" or "this thread" that real
-        // users plausibly type, which would false-positive if the test
-        // input were widened.
         for forbidden in [
             "generate",
             "very short",
@@ -1367,15 +1190,9 @@ mod tests {
                 body
             );
         }
-        // The conversation body itself is preserved.
         assert!(body.contains("instr rhat ids"));
     }
 
-    /// Real string emitted as a thread title in production (thread
-    /// d4e28e98-…): the user typed "whats this app, and why does it have a
-    /// filter entry but no threads" with a screenshot, but the title path
-    /// sends only the text — so the Gemini Flash title model answered the
-    /// message instead of titling it. A 16-word sentence is not a title.
     #[test]
     fn oversized_detected_for_observed_production_string() {
         assert!(is_oversized_for_title(
@@ -1385,19 +1202,14 @@ mod tests {
 
     #[test]
     fn oversized_not_detected_for_real_titles() {
-        // 3-6 word titles the prompt asks for.
         assert!(!is_oversized_for_title("Fix auth handshake bug"));
         assert!(!is_oversized_for_title("Release notes for v2.1"));
         assert!(!is_oversized_for_title("Very short summary of Q4 revenue"));
-        // A plausibly-verbose-but-still-valid 11-word title for THIS thread
-        // must pass — the check must not clip real titles.
         assert!(!is_oversized_for_title(
             "Why the thread filter shows entries but lists no threads"
         ));
     }
 
-    /// Pin the boundary so the threshold can't silently drift: exactly
-    /// MAX_TITLE_WORDS is accepted, one word over is rejected.
     #[test]
     fn oversized_boundary_is_max_title_words() {
         let at_max = ["w"; MAX_TITLE_WORDS].join(" ");
@@ -1430,19 +1242,6 @@ mod tests {
     }
 
     mod guard_tests {
-        /// A spawn hands its caller's name onward. It does not write it.
-        ///
-        /// The projection drops a title event for a thread whose row is not there
-        /// yet, and a spawn runs before its thread's first `MessageReceived`. So a
-        /// spawn that names its own thread loses the name, and then earns the
-        /// thread a model-generated one instead.
-        ///
-        /// Read off the source because the slot is positional.
-        /// `process_message_with_steps` takes two dozen arguments, and the bug was
-        /// a bare `None` sitting in the title one. No type can catch that, and the
-        /// crate has no harness that builds an engine to drive the call. The
-        /// end-to-end half is `a_caller_that_names_its_thread_keeps_that_name` in
-        /// the API e2e suite.
         #[test]
         fn a_spawn_does_not_name_its_own_thread() {
             for site in ["engine/chat/spawn.rs", "engine/claude_code/spawn.rs"] {

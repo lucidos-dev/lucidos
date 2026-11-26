@@ -1,4 +1,4 @@
-//! Credentials for every `git2` clone the engine performs.
+//! INVARIANT: Credentials for every `git2` clone the engine performs.
 //!
 //! Four sites share this: the marketplace scan, the plugin install fetch, and
 //! the two `git_clone` tool routes. Without a credential callback libgit2 can
@@ -22,31 +22,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-/// One way to authenticate. Declared in the order sources are offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSource {
-    /// libgit2 wants a username on its own, which it asks for when an SSH URL
-    /// carries none. Answering opens the key round that follows.
     Username,
-    /// A key held by a running ssh-agent.
     SshAgent,
-    /// A stored secret as the HTTPS password. GitHub documents this form for
+    /// INVARIANT: A stored secret as the HTTPS password. GitHub documents this form for
     /// an installation token (`x-access-token:<token>`) and ignores the
     /// username, and a GitHub Enterprise install behaves the same.
     StoredAsPassword,
-    /// A stored secret as the HTTPS username, with an empty password. This is
-    /// the older OAuth form, kept as a fallback because a host that refuses
-    /// one of the two usually accepts the other.
     StoredAsUsername,
-    /// Whatever `git credential` answers with. This is the path that picks up
-    /// an existing `gh auth login` or an osxkeychain entry.
     Helper,
-    /// No credential at all, for a host that negotiates its own.
     Anonymous,
 }
 
 impl CredentialSource {
-    /// The bit this source occupies in the tried-mask of [`next_untried`].
     fn bit(self) -> u8 {
         match self {
             Self::Username => 1,
@@ -59,19 +48,16 @@ impl CredentialSource {
     }
 }
 
-/// What a matching stored credential can offer for one HTTPS round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredKind {
-    /// No stored credential scopes this URL.
     None,
-    /// A bare secret, with no username beside it. Both HTTPS forms apply.
     Token,
-    /// A username and password pair. Only the password form applies, because
+    /// INVARIANT: A username and password pair. Only the password form applies, because
     /// sending the password as the username would drop the username.
     UserPass,
 }
 
-/// A credential-store row, reduced to what a clone can present.
+/// INVARIANT: A credential-store row, reduced to what a clone can present.
 ///
 /// `service_name` and `base_url` are safe to print. `secret` never is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,12 +68,6 @@ pub struct StoredGitCredential {
     pub secret: String,
 }
 
-/// The username and secret a git remote could be offered, or `None` when a
-/// credential of this type carries nothing presentable. `value` is the
-/// resolved secret ([`Credential::secret`]).
-///
-/// Says nothing about the credential's scope: an unscoped one still holds a
-/// usable secret, and the caller reports the two causes apart.
 fn presentable_pair(auth_type: AuthType, value: &str) -> Option<(Option<String>, String)> {
     let (username, secret) = match auth_type {
         AuthType::Bearer | AuthType::ApiKey => (None, value.to_string()),
@@ -111,7 +91,7 @@ fn presentable_pair(auth_type: AuthType, value: &str) -> Option<(Option<String>,
 }
 
 impl StoredGitCredential {
-    /// Reduce a stored credential to one entry per base URL it declares, or an
+    /// INVARIANT: Reduce a stored credential to one entry per base URL it declares, or an
     /// empty vector if its type cannot clone.
     ///
     /// `bearer` and `api_key` hold a bare token. `basic` holds the
@@ -143,7 +123,6 @@ impl StoredGitCredential {
             .collect()
     }
 
-    /// Which HTTPS forms this credential is worth offering in.
     fn kind(&self) -> StoredKind {
         match self.username {
             Some(_) => StoredKind::UserPass,
@@ -152,31 +131,25 @@ impl StoredGitCredential {
     }
 }
 
-/// The stored credentials a clone may present, resolved before it starts.
+/// INVARIANT: The stored credentials a clone may present, resolved before it starts.
 ///
 /// This is `Send`, which the store's own types are not required to be. A
 /// caller resolves it in async code and passes it into the blocking clone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitCredentials {
-    /// Most specific `base_url` first, so the narrowest scope wins.
+    /// INVARIANT: Most specific `base_url` first, so the narrowest scope wins.
     entries: Vec<StoredGitCredential>,
 }
 
 impl GitCredentials {
-    /// No stored credential. A public clone needs nothing else.
     pub fn none() -> Self {
         Self::default()
     }
 
-    /// The credential scoping one URL, if the store holds one.
     pub async fn resolve_one(pool: &PgPool, url: &str) -> Self {
         Self::resolve_many(pool, &[url]).await
     }
 
-    /// The credentials scoping a set of URLs, deduplicated by `base_url`.
-    ///
-    /// A lookup failure is logged and skipped: the clone then fails with the
-    /// ordinary auth message, which tells the user what to store.
     pub async fn resolve_many<S: AsRef<str>>(pool: &PgPool, urls: &[S]) -> Self {
         let mut entries: Vec<StoredGitCredential> = Vec::new();
         for url in urls {
@@ -194,9 +167,6 @@ impl GitCredentials {
             };
             let Some(credential) = found else { continue };
             let service_name = credential.service_name.clone();
-            // Two causes, two messages. A bearer token with no declared host
-            // holds a perfectly good secret. Saying it holds none sends the
-            // user to re-enter a key that was never the problem.
             if credential.base_urls.is_empty() {
                 log_legacy!(
                     "[GitAuth] credential {} declares no base URL, so it is offered nowhere",
@@ -204,8 +174,6 @@ impl GitCredentials {
                 );
                 continue;
             }
-            // An unreadable secret reference logs its reason, and the clone
-            // fails with the ordinary auth message.
             let Some(value) = credential.secret_or_log(pool, "[GitAuth]").await else {
                 continue;
             };
@@ -227,7 +195,7 @@ impl GitCredentials {
         Self { entries }
     }
 
-    /// The credential whose own `base_url` scopes `url`.
+    /// INVARIANT: The credential whose own `base_url` scopes `url`.
     ///
     /// libgit2 passes the URL it is authenticating against, which a redirect
     /// can move to another host mid-clone. Re-matching on every callback is
@@ -239,10 +207,6 @@ impl GitCredentials {
     }
 }
 
-/// The sources worth offering for one credential round, in order.
-///
-/// `allowed` is what libgit2 says the remote accepts, so a source it did not
-/// ask for is never offered.
 pub fn credential_plan(allowed: CredentialType, stored: StoredKind) -> Vec<CredentialSource> {
     let mut plan = Vec::new();
     if allowed.contains(CredentialType::USERNAME) {
@@ -268,7 +232,7 @@ pub fn credential_plan(allowed: CredentialType, stored: StoredKind) -> Vec<Crede
     plan
 }
 
-/// Take the first source `tried` has not recorded yet, and record it.
+/// INVARIANT: Take the first source `tried` has not recorded yet, and record it.
 ///
 /// This is the whole retry guard, and it is why a rejected credential cannot
 /// hang a scan. libgit2 calls the credential callback again every time the
@@ -280,18 +244,16 @@ pub fn next_untried(plan: &[CredentialSource], tried: &mut u8) -> Option<Credent
     Some(next)
 }
 
-/// Whether `url` carries `scheme`. A scp-style `git@host:path` has none.
 fn has_scheme(url: &str, scheme: &str) -> bool {
     url.split_once("://")
         .is_some_and(|(s, _)| s.eq_ignore_ascii_case(scheme))
 }
 
-/// Whether `url` names a path on this machine rather than a remote.
 pub fn is_local_url(url: &str) -> bool {
     has_scheme(url, "file")
 }
 
-/// `url` with any inline HTTP credential replaced by `***@`.
+/// INVARIANT: `url` with any inline HTTP credential replaced by `***@`.
 ///
 /// An HTTPS URL may carry a token in its authority. The URL reaches the log, a
 /// failure the Plugins panel shows, and `git_clone`'s commit message and event,
@@ -308,18 +270,10 @@ pub fn redacted(url: &str) -> String {
     }
 }
 
-/// Whether `url` uses an HTTP transport, the only one that can carry a token.
-///
-/// An SSH clone never offers one, so its failure must not blame a credential
-/// the user happens to have stored.
 fn is_http_url(url: &str) -> bool {
     has_scheme(url, "https") || has_scheme(url, "http")
 }
 
-/// The Base URL to register for `url`: its scheme, host and port.
-///
-/// A credential matches on exactly those three plus a path prefix, so leaving
-/// the path off scopes it to the whole host. `None` for a URL with no scheme.
 fn credential_base_url_hint(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
@@ -334,7 +288,7 @@ fn credential_base_url_hint(url: &str) -> Option<String> {
     })
 }
 
-/// The error the callback returns once every source has been offered.
+/// INVARIANT: The error the callback returns once every source has been offered.
 ///
 /// Class and code match what libgit2 raises for a refused HTTP credential, so
 /// [`describe_clone_failure`] recognises it like any other auth failure.
@@ -346,18 +300,13 @@ fn all_credentials_spent() -> git2::Error {
     )
 }
 
-/// The error for a stored source reached with nothing stored.
-/// [`credential_plan`] offers one only when a credential matched, so this
-/// stays unused.
 fn stored_credential_missing() -> git2::Error {
     git2::Error::from_str("a stored credential source was offered without a credential")
 }
 
-/// The username sent beside a token when nothing else supplies one. GitHub
-/// ignores it and reads the password, and other hosts accept a placeholder.
 const TOKEN_USERNAME: &str = "x-access-token";
 
-/// Offer untried sources until one produces a credential.
+/// INVARIANT: Offer untried sources until one produces a credential.
 ///
 /// A source that cannot build one is skipped rather than fatal. Two cases need
 /// that: an absent ssh-agent, and a credential helper missing from the PATH of
@@ -377,7 +326,6 @@ fn first_working<T, E>(
     Err(all_credentials_spent())
 }
 
-/// Build one credential, or say why this source cannot serve `url`.
 fn build_credential(
     source: CredentialSource,
     url: &str,
@@ -407,7 +355,6 @@ fn build_credential(
     }
 }
 
-/// What to offer for `url`, and the stored credential that goes with it.
 fn plan_for<'a>(
     url: &str,
     allowed: CredentialType,
@@ -418,7 +365,7 @@ fn plan_for<'a>(
     (credential_plan(allowed, kind), stored)
 }
 
-/// Callbacks that authenticate a clone.
+/// INVARIANT: Callbacks that authenticate a clone.
 ///
 /// The plan is resolved from the URL libgit2 passes on each call, never from
 /// the URL the clone started with. Those differ when a fetch follows a
@@ -441,7 +388,6 @@ fn authenticated_callbacks(credentials: GitCredentials) -> RemoteCallbacks<'stat
     callbacks
 }
 
-/// `FetchOptions` that authenticate a clone, aborting it once `deadline` passes.
 fn authenticated_fetch_options(
     credentials: &GitCredentials,
     deadline: Option<Instant>,
@@ -456,9 +402,6 @@ fn authenticated_fetch_options(
     opts
 }
 
-/// Clone `url` into `into`, with no bound on how long the fetch takes.
-///
-/// An async caller wants [`shallow_clone_within`] instead.
 pub fn shallow_clone(
     url: &str,
     branch: Option<&str>,
@@ -468,7 +411,7 @@ pub fn shallow_clone(
     clone_repo(url, branch, into, credentials, None)
 }
 
-/// Clone like [`shallow_clone`], but on a blocking thread, giving up after `limit`.
+/// INVARIANT: Clone like [`shallow_clone`], but on a blocking thread, giving up after `limit`.
 ///
 /// A clone is a blocking network fetch, so an async caller must never run it on
 /// a tokio worker. libgit2 clones in-process, so no child exists to kill at the
@@ -487,7 +430,7 @@ pub async fn shallow_clone_within(
     limit: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + limit;
-    // Whoever sets this first decides the outcome: the clone thread by moving
+    // INVARIANT: Whoever sets this first decides the outcome: the clone thread by moving
     // the clone into place, or the caller by giving up on it.
     let settled = Arc::new(AtomicBool::new(false));
     let mut clone = {
@@ -523,15 +466,12 @@ pub async fn shallow_clone_within(
     let _give_up = GiveUpOnDrop(settled.clone());
     let joined = match tokio::time::timeout_at(deadline.into(), &mut clone).await {
         Ok(joined) => joined,
-        // The clone won the race and is moving into place, so its result stands.
         Err(_) if settled.swap(true, Ordering::SeqCst) => clone.await,
         Err(_) => return Err(clone_timed_out(url, limit)),
     };
     joined.unwrap_or_else(|e| Err(format!("git clone failed: {e}")))
 }
 
-/// Gives up on a clone once its caller stops waiting for any reason, including
-/// a cancelled tool call that drops the future mid-clone.
 struct GiveUpOnDrop(Arc<AtomicBool>);
 
 impl Drop for GiveUpOnDrop {
@@ -540,7 +480,6 @@ impl Drop for GiveUpOnDrop {
     }
 }
 
-/// A sibling of `into` that only one clone writes.
 fn staging_dir(into: &Path) -> PathBuf {
     let name = into.file_name().unwrap_or_default().to_string_lossy();
     into.with_file_name(format!(".{name}.clone-{}", uuid::Uuid::new_v4()))
@@ -555,7 +494,7 @@ fn clone_timed_out(url: &str, limit: Duration) -> String {
     )
 }
 
-/// How long a clone's socket may stay silent before libgit2 gives up on it.
+/// INVARIANT: How long a clone's socket may stay silent before libgit2 gives up on it.
 ///
 /// No progress callback fires while a socket waits, so without this a remote
 /// that stops answering blocks its cloning thread for good. A git server sends
@@ -576,7 +515,7 @@ fn bound_idle_sockets() {
     });
 }
 
-/// Every engine clone goes through here, so no site can forget the callbacks,
+/// INVARIANT: Every engine clone goes through here, so no site can forget the callbacks,
 /// the idle bound or the error mapping. The depth is 1 except for a local
 /// `file://` URL: libgit2's local transport rejects a shallow fetch, and a
 /// local clone costs no bandwidth to make deep.
@@ -603,7 +542,6 @@ fn clone_repo(
         .map_err(|e| describe_clone_failure(url, &e, offered.as_deref()))
 }
 
-/// Whether `err` says the remote refused us for want of a credential.
 fn is_auth_failure(err: &git2::Error) -> bool {
     if err.code() == git2::ErrorCode::Auth {
         return true;
@@ -612,10 +550,6 @@ fn is_auth_failure(err: &git2::Error) -> bool {
     message.contains("authentication required") || message.contains("authentication failed")
 }
 
-/// What to try when the remote refused us and nothing was stored for it.
-///
-/// The advice follows the transport, because a remedy the URL cannot use is
-/// worse than none. An SSH clone never presents a stored secret.
 fn no_credential_remedy(url: &str) -> String {
     if !is_http_url(url) {
         return "Load a key that can read this repository into ssh-agent, with `ssh-add`, \
@@ -631,7 +565,7 @@ fn no_credential_remedy(url: &str) -> String {
     )
 }
 
-/// Turn a clone failure into something the user can act on.
+/// INVARIANT: Turn a clone failure into something the user can act on.
 ///
 /// A non-auth failure keeps its own text: "repository not found" must never be
 /// reported as a credential problem. `offered` names the stored credential

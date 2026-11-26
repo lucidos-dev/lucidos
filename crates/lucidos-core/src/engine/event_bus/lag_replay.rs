@@ -1,19 +1,3 @@
-//! *Lag replay*: how a broadcast subscriber that does work per event gets
-//! back, from the events table, exactly the persisted events a
-//! `RecvError::Lagged` dropped. A subscriber that only mirrors state re-reads
-//! that state instead and needs none of this.
-//!
-//! A lag says frames were dropped, not which. So the subscriber records which
-//! sequences reached it live, and on a lag replays only the rows that did not.
-//!
-//! The position opens with the subscription, from the bus's *append tickets*.
-//! It owes exactly the rows the bus sent after that, even one that committed
-//! before. Each window's top is a committed horizon, so a row that committed
-//! out of sequence order is never skipped (ADR 0364, ADR 0453).
-//!
-//! Two read shapes share that position. [`LagReplay::read`] hands a subscriber
-//! the frames to act on. The scheduler pages through a [`ReplayWindow`] itself.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
@@ -27,11 +11,6 @@ use super::append_ticket::{AppendTickets, InFlightAppend, ReplayStart};
 use super::{committed_event_horizon, BusEvent, EmittedEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
-/// Sequences the bus wrote without broadcasting them: a bulk backfill that no
-/// subscriber was meant to see arrive. Shared by every clone of the bus.
-///
-/// Kept for the process's life. Only a one-shot backfill writes here, so the
-/// set is as large as that backfill. A restart starts every floor above it.
 #[derive(Clone, Default)]
 pub(super) struct UnbroadcastRows(Arc<Mutex<BTreeSet<i64>>>);
 
@@ -43,7 +22,7 @@ impl UnbroadcastRows {
     }
 
     fn within(&self, after: i64, through: i64) -> Vec<i64> {
-        // A poisoned lock yields none, so those rows replay: an extra offer,
+        // INVARIANT: A poisoned lock yields none, so those rows replay: an extra offer,
         // never a lost one.
         self.0
             .lock()
@@ -52,38 +31,26 @@ impl UnbroadcastRows {
     }
 }
 
-/// Which rows a replay reads.
 #[derive(Clone, Copy, Debug)]
 pub enum ReplayScope {
-    /// Every row, bounded by the workspace's committed horizon.
     Workspace,
-    /// One thread's rows. A thread's events commit in sequence order
-    /// (ADR 0360), so its `MAX(sequence)` is already a horizon and never waits.
     Thread(Uuid),
 }
 
-/// The rows a replay offers: sequences in `(after, through]`, minus `skip`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayWindow {
     pub after: i64,
     pub through: i64,
-    /// Rows already handled live, or never broadcast at all.
     skip: Vec<RangeInclusive<i64>>,
-    /// The floor this window was read at. `after` sits lower only for `owed`.
     floor: i64,
-    /// Rows at or below the floor that an append in flight at the subscription
-    /// sent afterwards, and that the subscriber never saw.
     owed: Vec<i64>,
 }
 
 impl ReplayWindow {
-    /// Whether the row at `seq` is one this replay must offer.
     pub fn includes(&self, seq: i64) -> bool {
         seq > self.after && seq <= self.through && !self.skip.iter().any(|r| r.contains(&seq))
     }
 
-    /// The part of this window up to `through`, for a replay that stopped
-    /// after offering every row up to it.
     pub fn up_to(&self, through: i64) -> Self {
         Self {
             through: through.min(self.through),
@@ -92,44 +59,25 @@ impl ReplayWindow {
     }
 }
 
-/// One subscriber's replay position, opened with [`LagReplay::subscribe`].
+/// INVARIANT: One subscriber's replay position, opened with [`LagReplay::subscribe`].
 ///
 /// **[`Self::read`] hands on only the event types it is given.** `None` means
 /// every type. The position itself records every live frame, of any type.
 pub struct LagReplay {
     scope: ReplayScope,
-    /// Archived history is never owed, even by an in-flight append ticket.
     restore_floor: i64,
     event_types: Option<Vec<&'static str>>,
     unbroadcast: UnbroadcastRows,
     tickets: AppendTickets,
-    /// Every row at or below this was handled, live or by a replay, or the bus
-    /// sent it before the subscription. `in_flight` names the exceptions.
-    /// `None` while the bus has learned no sequence: it had sent nothing, so
-    /// every row is owed, and the first lag sets the floor.
     floor: Option<i64>,
-    /// The floor the subscription opened at. A live frame at or below it can
-    /// only come from `in_flight`.
     opened_at: Option<i64>,
-    /// The appends in flight at the subscription, which may still send a row
-    /// at or below `opened_at`. Dropped once ended and fully seen.
     in_flight: Vec<InFlightAppend>,
-    /// Rows at or below `opened_at` the subscriber already handled, live or by
-    /// a replay. Only `in_flight` rows land here, so it stays a handful.
     seen_below: BTreeSet<i64>,
-    /// Sequences above the floor that arrived live, as inclusive ranges keyed
-    /// by their start. Frames arrive nearly in sequence order, so this stays a
-    /// handful of ranges.
     received: BTreeMap<i64, i64>,
-    /// The sequences replays have covered, from the first window's floor to
-    /// the last window's top. A live frame in it arrived late from the buffer,
-    /// and the subscriber skips it.
     replayed: Option<RangeInclusive<i64>>,
 }
 
 impl LagReplay {
-    /// Subscribe to the bus and open the replay position, in one step. No
-    /// read: the bus knows which rows it sent before (ADR 0453).
     pub fn subscribe(
         bus: &EventBus,
         scope: ReplayScope,
@@ -168,9 +116,6 @@ impl LagReplay {
         }
     }
 
-    /// The frames one read of the bus gives the subscriber to act on: a live
-    /// frame of its types, unless a replay already returned it, or every row a
-    /// lag dropped. `None` once the bus closes.
     pub async fn read(
         &mut self,
         received: Result<EmittedEvent, RecvError>,
@@ -190,8 +135,6 @@ impl LagReplay {
         }
     }
 
-    /// Whether to act on this live frame: one of the subscriber's types that
-    /// no replay returned. Records it either way, so a later replay skips it.
     pub fn live(&mut self, frame: &EmittedEvent) -> bool {
         let first_sight = frame.seq.is_none_or(|seq| self.first_sight(seq));
         first_sight && self.hands_on(frame)
@@ -214,8 +157,6 @@ impl LagReplay {
                 .is_none_or(|types| types.contains(&type_name))
     }
 
-    /// Whether to act on a live frame with this sequence. `false` means a
-    /// replay already returned it. Records it, so a later replay skips it.
     fn first_sight(&mut self, seq: i64) -> bool {
         if self.is_covered(Some(seq)) {
             return false;
@@ -224,8 +165,6 @@ impl LagReplay {
         true
     }
 
-    /// Record a frame that reached the subscriber live. Once every sequence
-    /// right above the floor has arrived, the floor moves up over them.
     fn received(&mut self, seq: Option<i64>) {
         let Some(seq) = seq else {
             return;
@@ -267,12 +206,8 @@ impl LagReplay {
         self.floor = Some(floor);
     }
 
-    /// The window a lag must replay, read against a fresh horizon.
-    ///
-    /// `None` when there is nothing to replay. A failed horizon read moves
-    /// nothing, so the next lag's window covers this one too.
     pub async fn window(&mut self, pool: &PgPool) -> Option<ReplayWindow> {
-        // Refuse the entire window on an unknown restore boundary. No position
+        // INVARIANT: Refuse the entire window on an unknown restore boundary. No position
         // advances, so a later successful read can recover new work.
         self.restore_floor = match crate::core::snapshot::boundary::read(pool).await {
             Ok(boundary) => boundary.map_or(0, |b| b.event_sequence),
@@ -347,7 +282,7 @@ impl LagReplay {
         })
     }
 
-    /// Set the floor of a subscription that opened before the bus learned
+    /// INVARIANT: Set the floor of a subscription that opened before the bus learned
     /// any sequence. `committed` must be a committed horizon: every row the
     /// bus appended at or below it has committed, so it was learned. A row
     /// above it may still be unlearned and lower than any learned one, so the
@@ -360,8 +295,6 @@ impl LagReplay {
         self.floor
     }
 
-    /// The `in_flight` rows sent at or below `opened_at` that the subscriber
-    /// has not seen, lowest first. Only sent rows: an unsent one arrives live.
     fn owed(&self) -> Vec<i64> {
         let Some(opened_at) = self.opened_at else {
             return Vec::new();
@@ -375,9 +308,6 @@ impl LagReplay {
         owed.into_iter().collect()
     }
 
-    /// Record that every row of `window` was offered. A replay that stopped
-    /// part way passes [`ReplayWindow::up_to`] instead, and the next lag reads
-    /// the rest.
     pub fn covered(&mut self, window: &ReplayWindow) {
         let through = window.through;
         self.seen_below
@@ -405,8 +335,6 @@ impl LagReplay {
         self.advance_floor();
     }
 
-    /// Forget the in-flight appends that ended with every row the subscriber
-    /// owed from them seen.
     fn drop_settled_appends(&mut self) {
         let Some(opened_at) = self.opened_at else {
             return;
@@ -421,9 +349,6 @@ impl LagReplay {
         });
     }
 
-    /// Whether a frame needs no action: a replay offered it, or, below the
-    /// opening floor, it already arrived live. A frame below the first window
-    /// that no replay owed was never replayed, so it is not covered.
     fn is_covered(&self, seq: Option<i64>) -> bool {
         seq.is_some_and(|seq| {
             seq <= self.restore_floor
@@ -435,7 +360,7 @@ impl LagReplay {
         })
     }
 
-    /// The rows a lag dropped that this subscriber has not seen, oldest first.
+    /// INVARIANT: The rows a lag dropped that this subscriber has not seen, oldest first.
     /// A failed read returns none and keeps the floor, so the next replay
     /// covers this window too.
     pub async fn missed(&mut self, pool: &PgPool) -> Vec<EmittedEvent> {
@@ -488,7 +413,6 @@ impl LagReplay {
     }
 }
 
-/// The ranges in `(after, floor]` that are not `owed`, which is sorted.
 fn gaps_between(after: i64, owed: &[i64], floor: i64) -> Vec<RangeInclusive<i64>> {
     let mut gaps = Vec::new();
     let mut previous = after;
@@ -526,10 +450,6 @@ struct ReplayRow {
 }
 
 impl ReplayRow {
-    /// The row as the frame its live broadcast carried, less the aggregate
-    /// snapshot, which is never stored. The stored dispatch depth stands in for
-    /// the frame's depth, so [`EmittedEvent::trigger_chain_depth`] reads as it
-    /// did live. A row that does not read back is logged and skipped.
     fn into_frame(self) -> Option<EmittedEvent> {
         let typed = match self.thread_id {
             Some(thread_id) => ThreadEvent::from_stored(&self.event_type, self.payload.clone())

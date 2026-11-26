@@ -1,10 +1,3 @@
-//! Where a plugin update or uninstall reports its *affected triggers*: the
-//! staged preview, and one notification after the confirm. The match itself
-//! is [`crate::triggers::affected::affected_triggers`], the one function both
-//! the staging and the confirm call (ADR 0494).
-//!
-//! Plan: `docs/plans/2026-10-21-warn-triggers-on-plugin-knowhow-removal.md`.
-
 use super::{PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX};
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
@@ -13,7 +6,6 @@ use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
 use crate::triggers::affected::{affected_triggers, AffectedTrigger};
 use crate::triggers::TriggerConfig;
 
-/// Every trigger the engine knows, cloned so no lock is held across a write.
 pub(crate) fn snapshot_triggers(engine: &LucidosEngine) -> Vec<TriggerConfig> {
     engine
         .trigger_configs
@@ -24,9 +16,6 @@ pub(crate) fn snapshot_triggers(engine: &LucidosEngine) -> Vec<TriggerConfig> {
         .collect()
 }
 
-/// Add `affected_triggers` to a staged install or uninstall sentinel, matched
-/// over the paths the confirm would delete. Any other string, an `Error:` line
-/// included, passes through untouched.
 pub(crate) fn annotate_staged(staged: String, triggers: &[TriggerConfig]) -> String {
     let (prefix, removed_key) = if staged.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX) {
         (PLUGIN_INSTALL_REQUEST_PREFIX, "removes")
@@ -53,14 +42,12 @@ pub(crate) fn annotate_staged(staged: String, triggers: &[TriggerConfig]) -> Str
     format!("{prefix}{}", serde_json::Value::Object(preview))
 }
 
-/// What removed the files: a version update, or the uninstall.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Removal<'a> {
     Update { version: &'a str },
     Uninstall,
 }
 
-/// The notification a confirm raises, `None` when no trigger is affected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AffectedNotice {
     pub(crate) title: String,
@@ -132,9 +119,6 @@ pub(crate) fn notice(
     })
 }
 
-/// Raise the [`notice`] for a confirm, when there is one. Never sends a web
-/// push: the user just confirmed in the panel. A failed emit is logged, since
-/// the files are already removed by now.
 pub(crate) async fn notify(
     bus: &dyn EventBusEmitter,
     plugin_name: &str,

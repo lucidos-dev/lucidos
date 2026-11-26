@@ -10,10 +10,11 @@ use super::{is_build_output_file, VENDORED_DIR_NAMES};
 /// (e.g. the post-install reload trigger) cannot silently break the auto-reload.
 pub const AUTH_MODULES_DIR: &str = "auth-modules";
 
-pub const CONTENT_DIRS: [&str; 7] = [
+pub const CONTENT_DIRS: [&str; 8] = [
     "apps",
     "knowhow",
     "triggers",
+    super::event_hooks::HOOKS_DIR,
     "scripts",
     AUTH_MODULES_DIR,
     super::themes::THEMES_DIR,
@@ -414,11 +415,14 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
 }
 
 /// Content dirs that hold one directory per item.
-const ITEM_DIRS: [&str; 3] = ["apps", "triggers", super::workspace_fonts::FONTS_DIR];
+const ITEM_DIRS: [&str; 4] = [
+    "apps",
+    "triggers",
+    super::event_hooks::HOOKS_DIR,
+    super::workspace_fonts::FONTS_DIR,
+];
 
-/// Refuse an item whose directory name [`plan_files`] skips as build output,
-/// so a real app, trigger or font is never dropped without a word. Hidden
-/// names stay out of scope: the walk skips every one of those anyway.
+/// Refuse an item whose name [`plan_files`] skips as build output.
 fn reject_items_named_like_build_output(root: &Path) -> Result<(), ValidationError> {
     for dir in ITEM_DIRS {
         let Ok(entries) = std::fs::read_dir(root.join(dir)) else {

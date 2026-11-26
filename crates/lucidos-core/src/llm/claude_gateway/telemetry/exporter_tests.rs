@@ -18,7 +18,6 @@ use crate::llm::claude_gateway::tokens::StoredGatewayAccess;
 use crate::llm::claude_gateway::GrantedTokens;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// Text a capture's section holds, which no record may carry.
 const CONTENT_MARKER: &str = "content-marker-the-prompt-said-this";
 
 struct Fixture {
@@ -59,7 +58,6 @@ impl Fixture {
         }
     }
 
-    /// An exporter in an engine whose environment opts out of telemetry.
     fn opted_out_exporter(&self) -> Exporter {
         Exporter {
             engine_env: |k| (k == "DISABLE_TELEMETRY").then(|| "1".to_string()),
@@ -67,7 +65,6 @@ impl Fixture {
         }
     }
 
-    /// Sign in to `gateway`, whose managed settings are `policy`.
     async fn sign_in(&self, gateway: &MockGateway, policy: Value) -> ClaudeGatewayAccount {
         let tokens = GrantedTokens {
             access_token: "gw-token".into(),
@@ -90,14 +87,11 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Record one model call served by `provider`, with a usage block when
-    /// `reported` and a section holding [`CONTENT_MARKER`].
     async fn capture(&self, provider: Option<ProviderKind>, reported: bool) {
         self.capture_on(Uuid::new_v4(), EventMeta::NONE, provider, reported)
             .await;
     }
 
-    /// As [`Self::capture`], on `thread_id` and under `meta`.
     async fn capture_on(
         &self,
         thread_id: Uuid,
@@ -150,7 +144,6 @@ impl Fixture {
         }
     }
 
-    /// Record one failed model call served by `provider`.
     async fn failure(&self, provider: Option<ProviderKind>) {
         self.bus
             .emit_or_log(
@@ -178,7 +171,6 @@ impl Fixture {
         self.failure(Some(ProviderKind::ClaudeGateway)).await;
     }
 
-    /// Store an origin event of `thread_id`, as a message that started a turn.
     async fn origin(&self, thread_id: Uuid) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
@@ -204,7 +196,6 @@ fn telemetry_policy() -> Value {
     json!({"env": {"CLAUDE_CODE_ENABLE_TELEMETRY": "1", "OTEL_LOGS_EXPORTER": "otlp"}})
 }
 
-/// The `event.sequence` of every record in `requests`, all protobuf.
 fn sequences(requests: &[LogsRequest]) -> Vec<String> {
     requests
         .iter()
@@ -219,7 +210,6 @@ fn sequences(requests: &[LogsRequest]) -> Vec<String> {
         .collect()
 }
 
-/// Every record in `requests` as its attribute pairs, all protobuf.
 fn records(requests: &[LogsRequest]) -> Vec<Vec<(String, String)>> {
     requests
         .iter()
@@ -235,7 +225,6 @@ fn attribute<'a>(record: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// CLI-owned calls stay out of engine telemetry, including auxiliary copy pings.
 #[tokio::test]
 async fn coding_agent_gateway_attribution_does_not_duplicate_cli_telemetry() {
     let f = Fixture::new().await;
@@ -382,8 +371,6 @@ async fn the_json_encoding_carries_no_content_either() {
     f.done().await;
 }
 
-/// Capture three, send, restart the exporter, capture one more: the gateway
-/// sees four records, none twice.
 #[tokio::test]
 async fn a_restart_neither_drops_nor_resends() {
     let f = Fixture::new().await;
@@ -405,8 +392,6 @@ async fn a_restart_neither_drops_nor_resends() {
     f.done().await;
 }
 
-/// The cursor moves only after a `2xx`. A failed batch goes again on the
-/// next pass, and a `503` is retried within the pass.
 #[tokio::test]
 async fn a_failed_send_keeps_the_cursor() {
     let f = Fixture::new().await;
@@ -431,8 +416,6 @@ async fn a_failed_send_keeps_the_cursor() {
     f.done().await;
 }
 
-/// A batch the collector refuses for good is dropped, as OTLP/HTTP says,
-/// rather than blocking every later record behind it.
 #[tokio::test]
 async fn a_refused_batch_is_dropped() {
     let f = Fixture::new().await;
@@ -454,7 +437,6 @@ async fn a_refused_batch_is_dropped() {
     f.done().await;
 }
 
-/// A `401` from the gateway renews the bearer once and sends again.
 #[tokio::test]
 async fn a_401_renews_the_bearer_and_sends_again() {
     let f = Fixture::new().await;
@@ -480,8 +462,6 @@ async fn a_401_renews_the_bearer_and_sends_again() {
     f.done().await;
 }
 
-/// A row that does not read back still counts toward a full batch. So the
-/// cursor stops at the last row fetched, and the next pass sends the rest.
 #[tokio::test]
 async fn an_unreadable_row_in_a_full_batch_skips_nothing_after_it() {
     let f = Fixture::new().await;
@@ -529,8 +509,6 @@ async fn an_unreadable_row_in_a_full_batch_skips_nothing_after_it() {
     f.done().await;
 }
 
-/// A capture whose sequence commits after a higher one is still sent: the
-/// pass reads only up to the committed horizon.
 #[tokio::test]
 async fn a_capture_that_commits_late_is_still_sent() {
     let f = Fixture::new().await;
@@ -593,8 +571,6 @@ async fn a_capture_that_commits_late_is_still_sent() {
     f.done().await;
 }
 
-/// Records from one sign-in never reach another gateway: a sign-out skips
-/// what was not sent, and the next gateway sees only its own.
 #[tokio::test]
 async fn records_never_reach_another_gateway() {
     let f = Fixture::new().await;
@@ -625,8 +601,6 @@ async fn records_never_reach_another_gateway() {
     f.done().await;
 }
 
-/// A sign-in that replaces another without a sign-out still keeps the old
-/// sign-in's unsent records away from the new gateway.
 #[tokio::test]
 async fn a_replacing_sign_in_skips_the_old_records() {
     let f = Fixture::new().await;
@@ -645,8 +619,6 @@ async fn a_replacing_sign_in_skips_the_old_records() {
     f.done().await;
 }
 
-/// A collector the policy names on another host gets the policy's headers
-/// and never the gateway bearer. The gateway gets nothing.
 #[tokio::test]
 async fn a_collector_on_another_host_never_sees_the_bearer() {
     let f = Fixture::new().await;
@@ -669,8 +641,6 @@ async fn a_collector_on_another_host_never_sees_the_bearer() {
     f.done().await;
 }
 
-/// With telemetry off, captures are skipped, and a policy that turns it on
-/// later does not send them.
 #[tokio::test]
 async fn captures_made_while_telemetry_is_off_are_never_sent() {
     let f = Fixture::new().await;
@@ -693,8 +663,6 @@ async fn captures_made_while_telemetry_is_off_are_never_sent() {
     f.done().await;
 }
 
-/// A policy that turns telemetry on before the exporter's next pass still
-/// leaves the captures made while it was off unsent.
 #[tokio::test]
 async fn telemetry_turned_on_before_a_pass_sends_nothing_older() {
     let f = Fixture::new().await;
@@ -716,8 +684,6 @@ async fn telemetry_turned_on_before_a_pass_sends_nothing_older() {
     f.done().await;
 }
 
-/// Captures an opted-out engine made after its last pass, before it stopped,
-/// stay unsent when the next engine runs without the opt-out.
 #[tokio::test]
 async fn captures_made_while_opted_out_are_never_sent_by_a_later_run() {
     let f = Fixture::new().await;
@@ -738,8 +704,6 @@ async fn captures_made_while_opted_out_are_never_sent_by_a_later_run() {
     f.done().await;
 }
 
-/// An opted-out engine that stops before its first pass still keeps its
-/// captures from the next run: the opt-out is recorded at startup.
 #[tokio::test]
 async fn an_opted_out_start_is_recorded_before_any_pass() {
     let f = Fixture::new().await;
@@ -760,8 +724,6 @@ async fn an_opted_out_start_is_recorded_before_any_pass() {
     f.done().await;
 }
 
-/// The policy that decides may still be on its way after a sign-in. The
-/// captures wait for it rather than being skipped.
 #[tokio::test]
 async fn captures_wait_for_the_first_policy() {
     let f = Fixture::new().await;
@@ -792,9 +754,6 @@ async fn captures_wait_for_the_first_policy() {
     f.done().await;
 }
 
-/// Telemetry failure never touches a turn: with the background exporter
-/// failing against an unreachable collector, a gateway call still records
-/// its capture at once.
 #[tokio::test]
 async fn an_unreachable_collector_never_delays_a_call() {
     let f = Fixture::new().await;
@@ -824,9 +783,6 @@ async fn an_unreachable_collector_never_delays_a_call() {
     f.done().await;
 }
 
-/// A failed call goes out as `api_error` and never as `api_request`, in the
-/// same batch as a capture and under its own sequence. A failure from another
-/// provider, or from no router choice, is not sent.
 #[tokio::test]
 async fn a_failed_gateway_call_is_sent_as_an_api_error_only() {
     let f = Fixture::new().await;
@@ -870,7 +826,6 @@ async fn a_failed_gateway_call_is_sent_as_an_api_error_only() {
     f.done().await;
 }
 
-/// A failure alone wakes the exporter.
 #[test]
 fn a_failed_gateway_call_wakes_the_exporter() {
     let failed = |provider: Option<ProviderKind>| BusEvent::Thread {
@@ -895,9 +850,6 @@ fn a_failed_gateway_call_wakes_the_exporter() {
     assert!(!wakes_the_exporter(&failed(None)));
 }
 
-/// A turn's row names the origin it was written under. A follow-up queued
-/// behind the turn is newer, and must not take the turn's `prompt.id`
-/// (`engine::in_flight_request_event_id`).
 #[tokio::test]
 async fn a_turn_keeps_its_own_origin_when_a_follow_up_is_newer() {
     let f = Fixture::new().await;
@@ -926,8 +878,6 @@ async fn a_turn_keeps_its_own_origin_when_a_follow_up_is_newer() {
     f.done().await;
 }
 
-/// An auxiliary call has no origin of its own, so it takes the thread's newest
-/// one before it. A call on a thread with none sends no `prompt.id`.
 #[tokio::test]
 async fn an_auxiliary_call_takes_the_newest_earlier_origin() {
     let f = Fixture::new().await;

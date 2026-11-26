@@ -7,7 +7,7 @@ type Fingers = Map<number, EventTarget | null>;
 type ReaderInput =
   | { kind: 'idle' }
   | { kind: 'touching'; cap: Timer; fingers: Fingers }
-  | { kind: 'coasting'; still: Timer; cap: Timer }
+  | { kind: 'coasting'; still: Timer }
   | { kind: 'scrollbar'; held: boolean; gutter: boolean };
 
 interface ReaderInputEntry {
@@ -37,7 +37,7 @@ const _scrollHoldReleaseListeners = new Set<(el: HTMLElement) => void>();
 
 function clearTouchTimers(input: ReaderInput) {
   if (input.kind === 'touching') clearTimeout(input.cap);
-  if (input.kind === 'coasting') { clearTimeout(input.still); clearTimeout(input.cap); }
+  if (input.kind === 'coasting') clearTimeout(input.still);
 }
 
 function holds(input: ReaderInput): boolean {
@@ -197,7 +197,7 @@ export function attachReaderInput(el: HTMLElement): () => void {
     if (entry?.input.kind !== 'touching') return;
     if (fingersStillDown(el, entry.input.fingers, e.touches)) return;
     clearTouchTimers(entry.input);
-    entry.input = { kind: 'coasting', still: stillTimer(), cap: capTimer() };
+    entry.input = { kind: 'coasting', still: stillTimer() };
   };
   let blurTimer: Timer | undefined;
   const onBlur = () => {

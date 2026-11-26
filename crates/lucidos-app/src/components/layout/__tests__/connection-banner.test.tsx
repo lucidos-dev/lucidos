@@ -6,6 +6,7 @@ import {
   shouldRenderConnectionBanner,
 } from '../ConnectionBanner';
 import { BANNER_HEIGHT_VAR } from '../BackupReminderBanner';
+import { CONNECTION_POLL_INTERVAL_MS } from '../../../store/store';
 import { connectionNotice } from '../../../utils/connectionNotice';
 import { findByClass, findByType, textOf } from './vnodeWalk';
 import type { BannerLayout } from '../appBanner';
@@ -36,7 +37,7 @@ describe('the bar speaks for exactly the states the mark recedes in', () => {
   });
 
   it('waits longer than one poll interval, so a poll has actually been tried', () => {
-    expect(CONNECTING_QUIET_MS).toBeGreaterThan(5000);
+    expect(CONNECTING_QUIET_MS).toBeGreaterThan(CONNECTION_POLL_INTERVAL_MS);
   });
 });
 

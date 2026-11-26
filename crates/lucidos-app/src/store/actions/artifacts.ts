@@ -15,7 +15,7 @@ import {
   parseRepoPath,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
-import { listArtifacts, uploadFile } from '../../api/client';
+import { listArtifacts, uploadErrorMessage, uploadFile } from '../../api/client';
 import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
@@ -127,7 +127,7 @@ export async function uploadFiles(files: FileList | File[]): Promise<void> {
       }
     } catch (error) {
       failed++;
-      errors.push(`${file.name}: ${errorDetail(error)}`);
+      errors.push(`${file.name}: ${uploadErrorMessage(error)}`);
     }
   }
 

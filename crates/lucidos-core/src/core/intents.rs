@@ -15,20 +15,12 @@ fn parse_frontmatter(text: &str) -> Option<(String, Vec<String>, String)> {
     super::parse_md_frontmatter(text, "knowhow")
 }
 
-/// Subdirectories within each app that contain intents.
 const APP_INTENT_SUBDIRS: &[&str] = &["intents", "triggers"];
 
 impl IntentStore {
-    /// Load all intents from the workspace data directory.
-    ///
-    /// Discovers intents from:
-    /// - `data/apps/*/intents/` → id: `{app}/{name}` (app intents)
-    /// - `data/apps/*/triggers/` → id: `{app}/{name}` (app trigger intents)
-    /// - `data/triggers/*/` → id: `{name}` (standalone trigger intents)
     pub fn load_all(data_dir: &Path) -> Vec<Intent> {
         let mut intents = Vec::new();
 
-        // App-scoped intents and triggers
         let apps_dir = data_dir.join("apps");
         if apps_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&apps_dir) {
@@ -44,7 +36,6 @@ impl IntentStore {
             }
         }
 
-        // Standalone triggers
         let triggers_dir = data_dir.join("triggers");
         if triggers_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&triggers_dir) {
@@ -60,24 +51,14 @@ impl IntentStore {
         intents
     }
 
-    /// Load a single intent by ID.
-    ///
-    /// For app-scoped intents (id contains '/'), searches:
-    /// - `data/apps/{app}/intents/{name}.md`
-    /// - `data/apps/{app}/triggers/{name}.md`
-    ///
-    /// For standalone intents, searches:
-    /// - `data/triggers/{id}/{id}.md`
-    /// - First `.md` in `data/triggers/{id}/`
     pub fn load(data_dir: &Path, id: &str) -> Option<Intent> {
         if crate::core::is_path_traversal(id) {
             log_legacy!("[Intents] Rejected invalid intent id: {}", id);
             return None;
         }
 
-        // App-scoped: id = "app-name/intent-name"
         if let Some((app_id, intent_name)) = id.split_once('/') {
-            // `intent_name` must also pass the path-traversal guard: an absolute
+            // INVARIANT: `intent_name` must also pass the path-traversal guard: an absolute
             // or backslash-prefixed segment would let `Path::join` replace the
             // data_dir prefix and escape to the filesystem root (e.g. `foo//bar`
             // splits to ("foo", "/bar"), and `…join("/bar.md")` becomes
@@ -102,14 +83,12 @@ impl IntentStore {
             return None;
         }
 
-        // Standalone trigger: data/triggers/{id}/{id}.md
         let trigger_dir = data_dir.join("triggers").join(id);
         if trigger_dir.is_dir() {
             let exact = trigger_dir.join(format!("{}.md", id));
             if let Some(intent) = Self::load_from_path(&exact, id) {
                 return Some(intent);
             }
-            // Fallback: first .md in the directory
             if let Ok(entries) = std::fs::read_dir(&trigger_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -125,7 +104,6 @@ impl IntentStore {
         None
     }
 
-    /// Collect .md files from a directory, prefixing IDs with app_id if non-empty.
     fn collect_md_files(dir: &Path, app_id: &str, intents: &mut Vec<Intent>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
@@ -286,17 +264,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
 
-        // App intent
         let app_intents = dir.join("apps").join("app1").join("intents");
         std::fs::create_dir_all(&app_intents).unwrap();
         std::fs::write(app_intents.join("recipe.md"), "---\nname: Recipe\n---\nDo.").unwrap();
 
-        // App trigger
         let app_triggers = dir.join("apps").join("app1").join("triggers");
         std::fs::create_dir_all(&app_triggers).unwrap();
         std::fs::write(app_triggers.join("daily.md"), "---\nname: Daily\n---\nRun.").unwrap();
 
-        // Standalone trigger
         let trigger = dir.join("triggers").join("reminder");
         std::fs::create_dir_all(&trigger).unwrap();
         std::fs::write(

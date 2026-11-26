@@ -1,6 +1,3 @@
-//! A custom folder only files a pin: `pin_folder` is set while the thread is
-//! pinned, and every path that unpins clears it.
-
 use super::super::*;
 use super::*;
 
@@ -67,8 +64,6 @@ async fn unpin_and_archive_clear_the_folder() {
     teardown_test_db(&db_name).await;
 }
 
-/// A replayed move on an unpinned thread writes nothing rather than tripping
-/// the CHECK and failing the whole emit.
 #[tokio::test]
 async fn a_move_on_an_unpinned_thread_writes_nothing() {
     let (pool, db_name) = setup_test_db().await;

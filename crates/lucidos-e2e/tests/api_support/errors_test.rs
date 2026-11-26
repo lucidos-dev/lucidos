@@ -3,10 +3,6 @@ use crate::support::{base_url, http_client};
 #[tokio::test]
 async fn unknown_route_returns_non_json() {
     let client = http_client();
-    // Unknown /api routes fall through to the engine's static `dist/` serving
-    // (ADR 0014 — there is no Vite in the serving path), returning the SPA shell
-    // HTML. Verify the response is NOT valid JSON (it's the SPA fallback, not an
-    // API response).
     let url = format!("{}/api/v1/nonexistent-endpoint", base_url());
 
     let resp = client.get(&url).send().await.expect("Request failed");
@@ -18,12 +14,6 @@ async fn unknown_route_returns_non_json() {
     );
 }
 
-/// Regression (ADR 0116): the bare `POST /api/v1/chat` is gone.
-///
-/// It reached the same mutation as `/chat/stream` while skipping the
-/// subprocess gate, the continuity lock and Thread Queue admission, and its
-/// event carried no actor. A body that `/chat/stream` would accept must find
-/// no route here, so a re-registration cannot land quietly.
 #[tokio::test]
 async fn the_legacy_bare_chat_route_is_gone() {
     let client = http_client();
@@ -45,7 +35,6 @@ async fn malformed_chat_body_returns_error() {
     let client = http_client();
     let url = format!("{}/api/v1/chat/stream", base_url());
 
-    // Send invalid JSON
     let resp = client
         .post(&url)
         .header("content-type", "application/json")
@@ -55,7 +44,6 @@ async fn malformed_chat_body_returns_error() {
         .expect("Request failed");
 
     let status = resp.status().as_u16();
-    // Should be 4xx (bad request), not 5xx (server error)
     assert!(
         (400..500).contains(&status),
         "Malformed JSON should return 4xx, got {status}"
@@ -67,7 +55,6 @@ async fn missing_content_type_for_chat_returns_error() {
     let client = http_client();
     let url = format!("{}/api/v1/chat/stream", base_url());
 
-    // Send without content-type header
     let resp = client
         .post(&url)
         .body("not json")
@@ -89,7 +76,6 @@ async fn get_on_post_only_endpoint_returns_405() {
 
     let resp = client.get(&url).send().await.expect("Request failed");
     let status = resp.status().as_u16();
-    // Should be 405 Method Not Allowed or 404
     assert!(
         status == 405 || status == 404,
         "GET on POST-only endpoint should return 405 or 404, got {status}"
@@ -106,7 +92,6 @@ async fn thread_messages_for_nonexistent_thread() {
 
     let resp = client.get(&url).send().await.expect("Request failed");
     let status = resp.status().as_u16();
-    // Should return 200 with empty array or 404, not 500
     assert!(
         status == 200 || status == 404,
         "Nonexistent thread should return 200 (empty) or 404, got {status}"

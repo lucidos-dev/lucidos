@@ -1,12 +1,3 @@
-//! List and revoke *permissions* (ADR 0664): `GET /api/v1/permissions` and
-//! `DELETE /api/v1/permissions/:permission_id`. Raise a *batch* with
-//! `POST /api/v1/permissions/batches`.
-//!
-//! Revoking only takes power away, so any identified caller may revoke. Only
-//! the owner's answer to a permission request grants one, never this route.
-//! A batch is such a request: raising one grants nothing until the owner
-//! picks Run all on it.
-
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post};
@@ -22,7 +13,6 @@ use crate::engine::permission::{self, RevokeOutcome};
 
 #[derive(Deserialize)]
 struct ListQuery {
-    /// Include ended permissions too. Live ones only by default.
     #[serde(default)]
     all: bool,
 }
@@ -45,7 +35,6 @@ async fn revoke_permission(
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
     let permission_id = Uuid::parse_str(&permission_id)
         .map_err(|_| ApiError::bad_request("Invalid permission_id"))?;
-    // Revoking a standing deny gives power back, so only the owner does it.
     let row = permission::permission_row(&state.pool, permission_id)
         .await
         .map_err(ApiError::db)?;
@@ -72,9 +61,6 @@ struct RaiseBatchBody {
     items: Vec<BatchItemRequest>,
 }
 
-/// Raise a batch on the calling agent's own thread. It carries exact picks on
-/// open cards in the sub-threads below it, grants to triggers and workspace actions. Answers
-/// `{"request_id": ...}`, for the agent to ask with on its question tool.
 async fn raise_batch_card(
     State(state): State<AppState>,
     headers: HeaderMap,

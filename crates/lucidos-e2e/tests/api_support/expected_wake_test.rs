@@ -1,13 +1,3 @@
-//! E2E for the *expected wake* route (ADR 0603): a coding agent states it
-//! through `lucidos expect-wake <duration> --reason <text>`.
-//!
-//! What it pins, against a real engine:
-//!
-//! * `POST .../expected-wake` refuses a body without `in_secs` with a 400
-//! * it refuses a span past 24 hours, and an empty reason, with a 400
-//! * a valid body records one `WakeExpected` with `source: agent`
-//! * an unknown thread gets a 404
-
 use crate::support::{base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client};
 use uuid::Uuid;
 

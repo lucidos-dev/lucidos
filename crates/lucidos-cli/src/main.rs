@@ -1,16 +1,3 @@
-//! `lucidos` — CLI for coding-agent subprocesses to talk back to the parent
-//! Lucidos workspace.
-//!
-//! ## Workspace resolution
-//!
-//! Subcommands need to know which workspace they belong to. Order:
-//!   1. `$LUCIDOS_WORKSPACE` env var (engine sets this on every spawned
-//!      subprocess and it is authoritative).
-//!   2. Walk up from `$PWD` looking for the first `.lucidos/ports` file —
-//!      fallback for terminal users who run the CLI without the env var.
-//!
-//! See `workspace::resolve` for why the order matters.
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -47,8 +34,6 @@ mod gateway_request;
 mod intelligence_ladder;
 mod routing;
 mod workspaces;
-/// Manifest-generated subcommands, one per `cli = true` capability domain,
-/// rendered by `build.rs` from `lucidos-capabilities`. Wire each enum below.
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/cli_commands.rs"));
 }
@@ -275,6 +260,11 @@ enum Command {
         /// Paired gateways turns it on or off later.
         #[arg(long, requires = "gateway")]
         manage: bool,
+        /// With `--gateway`: let devices on the other gateway create, start,
+        /// stop and restore this gateway's workspaces. Off unless asked.
+        /// Settings, Access, Paired gateways turns it on or off later.
+        #[arg(long, requires = "gateway")]
+        control: bool,
     },
     /// List or revoke the devices paired with this machine's gateway.
     ///
@@ -1085,7 +1075,7 @@ enum ThreadsCmd {
         /// Restrict to the active union: `running` OR `waiting_for_user_answer`. For "is the workspace busy?" use `--status running` instead, since a thread awaiting a user answer is blocked on the human, not working.
         #[arg(long)]
         active: bool,
-        /// Restrict to exactly these statuses (repeatable, or comma-separated): idle, running, waiting, waiting_for_user_answer, paused, failed. The precise form of `--active`, and mutually exclusive with it.
+        /// Restrict to exactly these statuses (repeatable, or comma-separated): idle, running, waiting, waiting_for_user_answer, paused, failed. A held thread never matches waiting_for_user_answer. The precise form of `--active`, and mutually exclusive with it.
         #[arg(long, conflicts_with = "active")]
         status: Vec<String>,
         /// Comma-separated source filter (`chat`, `trigger`, `coding-agent`; legacy `claude_code` also accepted).
@@ -1121,7 +1111,7 @@ enum ThreadsCmd {
         /// Restrict to the active union: `running` OR `waiting_for_user_answer`. For "is the workspace busy?" use `--status running` instead, since a thread awaiting a user answer is blocked on the human, not working.
         #[arg(long)]
         active: bool,
-        /// Restrict to exactly these statuses (repeatable, or comma-separated): idle, running, waiting, waiting_for_user_answer, paused, failed. The precise form of `--active`, and mutually exclusive with it.
+        /// Restrict to exactly these statuses (repeatable, or comma-separated): idle, running, waiting, waiting_for_user_answer, paused, failed. A held thread never matches waiting_for_user_answer. The precise form of `--active`, and mutually exclusive with it.
         #[arg(long, conflicts_with = "active")]
         status: Vec<String>,
         /// Comma-separated source filter (`chat`, `trigger`, `coding-agent`; legacy `claude_code` also accepted).
@@ -2487,8 +2477,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             match action {
                 PlannedCmd::Start { kind } => planned::cmd_start(&ws, &kind)?,
                 PlannedCmd::Mark(args) => {
-                    // clap's `conflicts_with` makes the three mutually
-                    // exclusive, so at most one arm can match.
                     let kind = if let Some(p) = args.plan.as_deref() {
                         planned::MarkKind::Plan(p)
                     } else if let Some(r) = args.simple.as_deref() {
@@ -2642,9 +2630,10 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             label,
             gateway: true,
             manage,
+            control,
             ..
         } => {
-            pair::cmd_pair_gateway(port, label.as_deref(), manage)?;
+            pair::cmd_pair_gateway(port, label.as_deref(), pair::Grants { manage, control })?;
             Ok(0)
         }
         Command::Pair {
@@ -2658,8 +2647,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             pair::cmd_pair(pair::PairArgs {
                 port,
                 label: label.as_deref(),
-                // `--host` is only useful for a QR, so asking for one is
-                // implied rather than a second flag the user must remember.
                 qr: qr || host.is_some(),
                 host: host.as_deref(),
             })?;
@@ -2720,8 +2707,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             )?;
             Ok(0)
         }
-        // No workspace is resolved here. A build slot is host state, so this
-        // must work in a plain checkout with no engine anywhere near it.
         Command::BuildSlot(args) => build_slot::run(build_slot::BuildSlotArgs {
             status: args.status,
             lease: args.lease,
@@ -2734,7 +2719,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             write_cli_surface(&out)?;
             Ok(0)
         }
-        // Like a build slot, this needs no workspace: a shim runs it.
         Command::Ps { args } => ps::run(ps::PsArgs { args }),
         Command::AskPermission {
             action,
@@ -2882,8 +2866,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                         active: if active { Some(true) } else { None },
                         status: &status,
                         source: source.as_deref(),
-                        // `count` takes no --limit: a COUNT(*) has no page to
-                        // size. Same reuse the store and HTTP layers make.
                         limit: None,
                         parent: threads::resolve_parent_filter(
                             parent,
@@ -3036,8 +3018,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         }
         Command::Recall { mut action } => {
             let ws = resolve_from_env()?;
-            // A coding agent names its own thread, so a bare id resolves there
-            // and a find files its cost there.
             if let generated::RecallCmd::Zoom { thread, .. }
             | generated::RecallCmd::Find { thread, .. }
             | generated::RecallCmd::Date { thread, .. } = &mut action
@@ -3140,7 +3120,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
 fn run_workspaces(action: WorkspacesCmd) -> Result<u8, workspace::BoxError> {
     use workspaces::BrokerCall;
     let call = match action {
-        // The review asks the gateway, so it needs no workspace.
         WorkspacesCmd::Review { port } => {
             workspaces::review(port)?;
             return Ok(0);
@@ -3350,8 +3329,6 @@ mod tests {
         }
     }
 
-    /// A session started before the rename still runs the retired spelling,
-    /// so it parses as `ask-permission` and stays out of `--help`.
     #[test]
     fn the_retired_ask_spelling_still_parses_and_is_hidden() {
         let retired = "ask-owner-approval";
@@ -3367,15 +3344,11 @@ mod tests {
         assert!(!help.contains(retired), "{help}");
     }
 
-    /// The clap tree is built at startup and panics on a malformed
-    /// definition, so asserting it builds is the cheapest coverage there is
-    /// for a newly added subcommand.
     #[test]
     fn the_command_tree_is_valid() {
         Cli::command().debug_assert();
     }
 
-    /// Images repeat in order, and the text is the one required flag.
     #[test]
     fn create_draft_keeps_image_order_and_needs_text() {
         let cli = Cli::try_parse_from([
@@ -3411,7 +3384,6 @@ mod tests {
         assert!(Cli::try_parse_from(["lucidos", "threads", "create-draft"]).is_err());
     }
 
-    /// A saved draft is named by thread, revision and epoch, never content.
     #[test]
     fn submit_draft_names_a_revision_and_takes_no_content() {
         let base = [
@@ -3654,7 +3626,6 @@ mod tests {
         }
     }
 
-    /// No restart verb: stop, then start (ADR 0671).
     #[test]
     fn there_is_no_workspace_restart_verb() {
         assert!(
@@ -3718,8 +3689,6 @@ mod tests {
             .collect()
     }
 
-    /// The default floor is for automatic runs only: an offered run leaves
-    /// the choice to the user's card.
     #[test]
     fn the_default_floor_conflicts_with_an_offered_run() {
         let offer = |extra: &[&str]| {
@@ -3732,10 +3701,6 @@ mod tests {
         assert!(offer(&["--ask", "--default-floor"]).is_err());
     }
 
-    /// `threads follow-up` must offer no way to state who the caller is. The
-    /// engine reads the calling thread off the thread-bound origin token, and
-    /// a `--from` / `--caller-thread` flag would hand back exactly the
-    /// capability that binding removes, one layer up.
     #[test]
     fn follow_up_exposes_no_caller_identity_flag() {
         let flags = subcommand_flags(&["threads", "follow-up"]);
@@ -3750,8 +3715,6 @@ mod tests {
         }
     }
 
-    /// `threads detach` states no caller either: the origin token decides
-    /// whether it may move only this thread's own children.
     #[test]
     fn detach_exposes_no_caller_identity_flag() {
         let flags = subcommand_flags(&["threads", "detach"]);
@@ -3764,8 +3727,6 @@ mod tests {
         }
     }
 
-    /// `threads archive` states no caller either: the origin token decides
-    /// whether it may archive only this thread and its own children.
     #[test]
     fn archive_exposes_no_caller_identity_flag() {
         let flags = subcommand_flags(&["threads", "archive"]);
@@ -3778,9 +3739,6 @@ mod tests {
         }
     }
 
-    /// `--status` is the precise form of `--active`, and both `list` and
-    /// `count` carry it: an idle detector calls `count`, which is the surface
-    /// the union misled on 2026-08-07.
     #[test]
     fn threads_list_and_count_both_offer_the_status_filter() {
         for path in [["threads", "list"], ["threads", "count"]] {
@@ -3796,8 +3754,6 @@ mod tests {
         }
     }
 
-    /// Two answers to one question. Left to compose, `--active --status idle`
-    /// would return nothing and read as "the workspace is quiet".
     #[test]
     fn active_and_status_cannot_be_combined() {
         for path in [["threads", "list"], ["threads", "count"]] {
@@ -3868,8 +3824,6 @@ mod tests {
         .is_err());
     }
 
-    /// `widgets fit` names the widget, and the thread is optional: a coding
-    /// agent's session fills in its own.
     #[test]
     fn widgets_fit_takes_the_widget_and_an_optional_thread() {
         let fit = |argv: &[&str]| match Cli::try_parse_from(argv).map(|cli| cli.command) {
@@ -3897,7 +3851,6 @@ mod tests {
         assert_eq!(fit(&["lucidos", "widgets", "fit"]), None);
     }
 
-    /// A repo flow keeps working: `offer` and `start` keep their flags.
     #[test]
     fn the_successor_flags_a_flow_calls_still_parse() {
         let parse = |argv: &[&str]| {
@@ -3936,8 +3889,6 @@ mod tests {
         ));
     }
 
-    /// Both spellings of one filter reach the engine, so a caller who follows
-    /// the repo's kebab-case convention is not punished for it.
     #[test]
     fn status_accepts_repeats_and_comma_separated_values() {
         let matches = Cli::command()
@@ -3964,9 +3915,6 @@ mod tests {
         );
     }
 
-    /// The child-listing filter is spelled the same at every layer: `parent`
-    /// is the HTTP query param, `my-children` mirrors the LLM tool's
-    /// `my_children`. Neither is a third synonym.
     #[test]
     fn threads_list_and_count_share_the_child_filter_spelling() {
         for path in [["threads", "list"], ["threads", "count"]] {

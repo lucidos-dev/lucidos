@@ -1,10 +1,3 @@
-//! Every file the engine generates for the frontend and the SDK.
-//!
-//! They are build outputs. `scripts/codegen.sh` is the one command that writes
-//! them, through the `lucidos-codegen` bin or the
-//! `write_generated_outputs` test below. Rust is the source of truth, so a
-//! renderer refuses rather than guesses, and a refusal fails `make test`.
-
 mod app_reach;
 
 use std::path::Path;
@@ -21,7 +14,6 @@ use lucidos_engine::codegen_inputs::{APP, DOCS, INTERNAL, SDK, STYLES};
 pub(crate) use lucidos_engine::core::codegen::quoted;
 pub use lucidos_engine::core::codegen::REGENERATE;
 
-/// One generated file: where it goes, relative to the repo root, and its bytes.
 pub struct GeneratedFile {
     pub path: String,
     pub contents: String,
@@ -34,8 +26,6 @@ fn file(dir: &str, name: &str, contents: String) -> GeneratedFile {
     }
 }
 
-/// Renders every generated file. `repo_root` is where the wire-type reader
-/// finds the engine source.
 pub fn render_all(repo_root: &Path) -> Vec<GeneratedFile> {
     use lucidos_engine::core::{
         fonts, preference_catalog, store::messages::spoken_merge, themes::parts,
@@ -113,7 +103,6 @@ pub fn render_all(repo_root: &Path) -> Vec<GeneratedFile> {
     ]
 }
 
-/// Writes `files` under `out_dir`, creating folders as needed.
 pub fn write_all(files: &[GeneratedFile], out_dir: &Path) -> std::io::Result<()> {
     for f in files {
         let path = out_dir.join(&f.path);
@@ -130,8 +119,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// `scripts/codegen.sh` runs this when no freshly built `lucidos-codegen`
-    /// is at hand, because it reuses the compile `make test` already paid for.
     #[test]
     #[ignore]
     fn write_generated_outputs() {
@@ -149,8 +136,6 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
         }
 
-        /// Every renderer runs on every `make test`, so a refusal (an unregistered
-        /// wire type, say) fails the suite rather than the next codegen run.
         #[test]
         fn every_generated_file_renders_once_into_a_generated_folder() {
             let files = render_all(&repo_root());
@@ -172,9 +157,6 @@ mod tests {
             }
         }
 
-        /// The hardcoded name list is a SECOND hand-maintained hop, and nothing guarded
-        /// it. A variant added to the enum but missed there never reaches
-        /// `EVENT_CLASSIFICATION`, so the frontend's drift guard never sees it either.
         #[test]
         fn all_persisted_event_types_matches_the_enum() {
             let parsed = lucidos_wire_codegen::persisted_event_type_names(&repo_root());
@@ -198,8 +180,6 @@ mod tests {
             );
         }
 
-        /// Serde always sends the reset key, as `null` when unset. The wire
-        /// type must say the same, or the frontend reads a required string.
         #[test]
         fn spend_cap_notice_reset_is_null_in_serde_and_in_the_wire_type() {
             let notice = lucidos_engine::llm::spend_cap::SpendCapNotice {
@@ -214,7 +194,6 @@ mod tests {
             );
         }
 
-        /// The reader names its own output path, and it must sit in `APP`.
         #[test]
         fn the_wire_file_is_in_the_app_generated_folder() {
             assert!(lucidos_wire_codegen::WIRE_FILE
@@ -222,7 +201,6 @@ mod tests {
                 .is_some_and(|name| name.starts_with('/')));
         }
 
-        /// The shell cannot read `render_all`, so a pin holds its one copy.
         #[test]
         fn codegen_sentinel_is_rendered() {
             let script = std::fs::read_to_string(repo_root().join("scripts/lib/codegen.sh"))

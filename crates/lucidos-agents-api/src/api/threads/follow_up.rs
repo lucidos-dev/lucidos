@@ -13,56 +13,26 @@ use crate::engine::chat::child_follow_up::{
     ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpReach,
 };
 
-/// Body of a follow-up request.
-///
-/// `caller_workspace` is accepted only so it can be REFUSED explicitly: a
-/// cross-workspace thread is always top-level, so it has no children, and a
-/// silently-ignored field would surface as a confusing `NotYourChild` instead
-/// of the real reason.
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct FollowUpRequest {
-    /// What to say to the child. Lands in its conversation as a message from
-    /// the parent.
     message: String,
-    /// The parent's originating event, stamped onto the child's message-route
-    /// panel so the follow-up links back to the exact tool call. Optional: the
-    /// panel resolves the parent by id either way.
     #[serde(default)]
     event_id: Option<Uuid>,
-    /// Preempt the child's in-flight turn instead of queueing behind it.
-    /// Absent means `false`, so every caller that predates the flag keeps its
-    /// behaviour. See `FollowUpUrgency`.
     #[serde(default)]
     urgent: Option<bool>,
     #[serde(default)]
     caller_workspace: Option<String>,
 }
 
-/// What the caller gets back the moment the message is on the child's
-/// timeline. Never the child's result: the child's turn is not awaited, and
-/// its outcome arrives later as an ordinary `ChildThreadCompleted` card on the
-/// parent.
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct FollowUpResponse {
     child_thread_id: Uuid,
-    /// `own-child` | `home`. Only an own child's outcome comes back as a card.
-    /// `home` is the home thread reaching a thread that is not its child.
     reach: FollowUpReach,
-    /// The child's human-meaningful handle. Callers name the child by this and
-    /// never by uuid: no screen in Lucidos is labelled with a uuid.
     child_title: String,
-    /// `running` | `interrupted` | `waiting-for-user-answer` | `held` | `revived`.
-    /// Kebab-case because it is a public API parameter value (`CLAUDE.md`).
     delivered_to: &'static str,
-    /// One sentence saying what that means, so a caller does not have to keep
-    /// its own copy of the table.
     detail: &'static str,
 }
 
-/// The wire spelling of a delivery mode. Kept beside the response rather than
-/// as a `Serialize` impl on `FollowUpDelivery` so the HTTP vocabulary
-/// (kebab-case) cannot leak into the engine type, which the LLM tool also
-/// renders and does so in prose.
 fn delivered_to_wire(delivery: FollowUpDelivery) -> &'static str {
     match delivery {
         FollowUpDelivery::Running => "running",
@@ -85,9 +55,6 @@ impl From<FollowUpAck> for FollowUpResponse {
     }
 }
 
-/// Map the engine's typed refusal onto the HTTP response. The status comes
-/// from `ChildFollowUpError::status_code`, which lives beside the taxonomy, so
-/// the mapping cannot drift from the ladder.
 fn api_error(e: ChildFollowUpError) -> ApiError {
     ApiError::with_code(e.status_code(), e.to_string())
 }
@@ -109,10 +76,6 @@ pub(in crate::api) async fn follow_up_child(
         ));
     }
 
-    // The caller is whoever the origin token says it is, and nothing else on
-    // the request can influence that. `NotSubprocess`, or a subprocess with no
-    // thread context (a scheduled script), has no thread whose children could
-    // be looked up, so both are `NoCaller`.
     let caller_thread_id = match crate::core::subprocess_origin::subprocess_origin(&headers) {
         crate::core::subprocess_origin::SubprocessOrigin::Subprocess {
             source_thread_id, ..

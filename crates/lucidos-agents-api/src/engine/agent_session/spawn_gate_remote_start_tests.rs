@@ -1,6 +1,3 @@
-//! An Ask start parks on its card before any model call, and only the owner's
-//! tap runs or ends it (invariant I5).
-
 use super::*;
 use crate::engine::agent_question::{
     answer_pending_question, resolve_pending_question_as_canceled, AnswerResult,
@@ -33,7 +30,6 @@ fn ask_origin() -> MessageOrigin {
     }
 }
 
-/// Start a new chat thread the way a routed Ask spawn does. It parks.
 async fn start(engine: &LucidosEngine) -> (Uuid, Uuid) {
     let thread_id = Uuid::new_v4();
     let error = engine
@@ -106,7 +102,6 @@ async fn wait_for(engine: &LucidosEngine, thread_id: Uuid, event_type: &str) -> 
     panic!("no {event_type} landed");
 }
 
-/// The start card's id, and the id of its option labelled `label`.
 async fn card_option(engine: &LucidosEngine, thread_id: Uuid, label: &str) -> (String, String) {
     sqlx::query_as(
         "SELECT payload->>'tool_use_id', o->>'id' FROM events, \
@@ -143,8 +138,6 @@ fn owner() -> Option<MessageOrigin> {
     })
 }
 
-/// A later turn of a refused start fails with a reason. No card is open to
-/// hold it, so a parked turn would wait forever.
 async fn assert_refused(engine: &LucidosEngine, thread_id: Uuid) {
     let later = gate_remote_start(&engine.event_bus, thread_id, EventChannel::Chat)
         .await
@@ -167,19 +160,16 @@ async fn allow_once_runs_the_parked_turn_and_nothing_before() {
     }
     assert_eq!(count(&engine, thread_id, "UserQuestionAsked").await, 1);
 
-    // A second turn before the answer parks again, with no second card.
     let parked = gate_remote_start(&engine.event_bus, thread_id, EventChannel::Chat).await;
     assert!(parked.is_err_and(|e| awaits_owner(e.as_ref())));
     assert_eq!(count(&engine, thread_id, "UserQuestionAsked").await, 1);
 
-    // Only a tap on the owner's device answers it.
     assert!(matches!(
         pick(&engine, thread_id, ALLOW_ONCE_LABEL, None).await,
         AnswerResult::Conflict(_)
     ));
     assert_eq!(count(&engine, thread_id, "ContextCaptured").await, 0);
 
-    // A message typed into the thread is no pick, so the card stays open.
     let (card_id, _) = card_option(&engine, thread_id, ALLOW_ONCE_LABEL).await;
     let typed = AnswerKind::FreeText {
         text: "what is this?".into(),
@@ -260,8 +250,6 @@ fn dont_allow_ends_a_remote_start_unstarted() {
     );
 }
 
-/// The engine stopped after the owner's Allow was recorded and before the
-/// turn began. The boot settle may already have aborted the thread.
 async fn an_allowed_start_that_never_began_begins_at_boot() {
     let (_pool, db) = setup_test_db().await;
     let (engine, _workspace) = boot_mock_engine(&db).await;
@@ -305,7 +293,6 @@ async fn an_allowed_start_that_never_began_begins_at_boot() {
         "the reply answers the parked message"
     );
 
-    // A second boot finds the turn begun and runs nothing more.
     begin_allowed_starts_on_startup(&engine).await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(count(&engine, thread_id, "ResponseGenerated").await, 1);
@@ -313,7 +300,6 @@ async fn an_allowed_start_that_never_began_begins_at_boot() {
     teardown_test_db(&db).await;
 }
 
-/// Invariant I10: Stop cancels the start card, and no turn runs then or at boot.
 async fn stop_cancels_a_parked_start() {
     let (_pool, db) = setup_test_db().await;
     let (engine, _workspace) = boot_mock_engine(&db).await;
@@ -343,8 +329,6 @@ async fn stop_cancels_a_parked_start() {
     teardown_test_db(&db).await;
 }
 
-/// A coding agent parks before its `SessionStarted`, so nothing on the
-/// thread says coding agent yet. Its Allow still resumes the coding agent.
 async fn an_allowed_coding_agent_start_resumes_the_coding_agent() {
     let (_pool, db) = setup_test_db().await;
     let (engine, _workspace) = boot_mock_engine(&db).await;

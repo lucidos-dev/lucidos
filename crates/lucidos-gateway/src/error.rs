@@ -1,16 +1,9 @@
-//! Minimal HTTP error response shape for the gateway's control API.
-//!
-//! The engine has a richer `api::error::ApiError`; the gateway duplicates a tiny
-//! version (ADR 0014 §1 — no engine dependency). It is the response shape
-//! (`status` + `{"error": msg}` body) consumed structurally by its
-//! `IntoResponse` impl, not a domain error type.
-
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -19,7 +12,6 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    /// Only the operation knows whether its refusal preceded every change.
     pub fn unchanged(mut self) -> Self {
         self.unchanged = true;
         self
@@ -32,6 +24,16 @@ impl ApiError {
     pub fn with_reason(mut self, reason: &'static str) -> Self {
         self.reason = Some(reason);
         self
+    }
+
+    /// A status no named constructor covers, such as tus's 460 or a 507.
+    pub fn with_status(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            unchanged: false,
+            reason: None,
+        }
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -52,13 +54,6 @@ impl ApiError {
         }
     }
 
-    /// 404, for a workspace slug this gateway does not have in its registry.
-    ///
-    /// Load-bearing rather than tidy. Several gateways run on one machine (the
-    /// dev one on 5251, the packaged `Lucidos.app` one on 5252), each owning a
-    /// different set of workspaces. A caller that posts to the wrong one must be
-    /// able to tell. A 202 for a slug that cannot exist tells it nothing. See
-    /// `scripts/stop.sh`, which reads this status.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -68,7 +63,6 @@ impl ApiError {
         }
     }
 
-    /// 403, for a caller that proved a credential this route does not accept.
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
@@ -78,9 +72,6 @@ impl ApiError {
         }
     }
 
-    /// 409 — used by the restore flow when the derived/requested workspace name
-    /// collides with an existing one (the picker then asks for a different name)
-    /// or when a restore is already in progress.
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -90,10 +81,6 @@ impl ApiError {
         }
     }
 
-    /// 429, for the pairing route when wrong guesses have used up their budget.
-    ///
-    /// Distinct from a 400 so a person mid-pairing is not sent hunting a typo
-    /// that is not there (`auth::Redemption::Throttled`).
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -103,8 +90,6 @@ impl ApiError {
         }
     }
 
-    /// 401, for a gateway-to-gateway call without a current pairing's
-    /// credential (ADR 0590).
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -114,7 +99,6 @@ impl ApiError {
         }
     }
 
-    /// 502, when a remote gateway did not answer or answered wrongly.
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,

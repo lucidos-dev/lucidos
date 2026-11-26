@@ -13,7 +13,6 @@ fn kind_of(continuity: &SessionContinuity) -> String {
         .to_string()
 }
 
-/// The SQL and [`SessionContinuity::opens_session`] agree on every kind.
 #[test]
 fn the_sql_names_every_kind_that_opens_a_session() {
     let every_kind = [
@@ -94,8 +93,6 @@ async fn capture(bus: &EventBus, thread_id: Uuid) {
     .await;
 }
 
-/// Every capture names its session: a resume stays in it, a handoff and a
-/// fresh session each open the next.
 #[tokio::test]
 async fn the_bus_stamps_each_capture_with_its_session() {
     let (pool, db) = setup_test_db().await;

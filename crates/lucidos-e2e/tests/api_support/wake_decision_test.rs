@@ -1,16 +1,3 @@
-//! E2E for the *wake decision* route: a coding-agent child decides through
-//! `lucidos wake-parent yes|no` whether its report wakes its parent.
-//!
-//! What it pins, against a real engine:
-//!
-//! * `POST .../wake-decision` refuses a body without `wake` with a 400
-//! * `{"wake": false}` records `ParentWakeNotRequested` and sets the child's
-//!   `parent_wake_requested` FALSE, and `{"wake": true}` sets it TRUE
-//! * a thread with no parent gets a 409, and an unknown thread a 404
-//!
-//! Rows are seeded directly, as `detach_test.rs` does, so no LLM round-trip is
-//! needed to build a family.
-
 use crate::support::{base_url, count_events_of_type, db_url, user_client};
 use uuid::Uuid;
 
@@ -113,8 +100,6 @@ async fn a_thread_without_a_parent_has_nothing_to_wake() {
     cleanup(&pool, &[top]).await;
 }
 
-/// A child whose spawn declared a wake mode records nothing: the answer is
-/// `declared`, and no `ParentWake*` event lands (ADR 0451).
 #[tokio::test]
 async fn a_declared_child_records_no_wake_decision() {
     let pool = sqlx::PgPool::connect(&db_url())

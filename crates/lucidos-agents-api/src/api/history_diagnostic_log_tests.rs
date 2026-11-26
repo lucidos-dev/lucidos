@@ -8,14 +8,12 @@ fn diagnostic_headers(pairs: &[(&'static str, String)]) -> HeaderMap {
     headers
 }
 
-/// A token this engine minted, exactly as a spawn hands it out.
 fn agent_token() -> String {
     crate::core::subprocess_origin::init_agent_origin_secret("subprocess-test-secret".to_string());
     crate::core::subprocess_origin::mint_agent_origin_token(None, 0, None)
         .expect("secret installed")
 }
 
-/// The refusal a query met, as status and reason slug.
 async fn diagnostic_refusal(
     headers: &HeaderMap,
     raw: Option<&str>,

@@ -1,16 +1,3 @@
-//! OpenAI backend for `web_search` — the `web_search` tool on the Responses
-//! API.
-//!
-//! After Anthropic in the chain because it has a per-call fee on top
-//! of tokens (OpenAI bills web search per call *and* charges for the search
-//! content pulled into context), whereas Gemini grounding is bundled into the
-//! Vertex call and Anthropic's server tool has no per-call charge.
-//!
-//! Responses-only: the `web_search` tool is a Responses API feature, so a key
-//! whose configured model does not run there errors — which is correct, since
-//! the chain then falls through rather than pretending search is unavailable
-//! everywhere.
-
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -18,14 +5,13 @@ use std::time::Duration;
 use super::{format_search_result, WebSearchProvider, WebSearchResult, SEARCH_SYSTEM_PROMPT};
 use crate::llm::metered::CallToken;
 
-/// Output ceiling for the summary written over the search results. Bounds the
+/// INVARIANT: Output ceiling for the summary written over the search results. Bounds the
 /// token half of the bill; the per-call search fee is bounded by this backend
 /// issuing exactly one request per `web_search` tool call.
 const MAX_OUTPUT_TOKENS: u32 = 2048;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Build the `/responses` body. Pure, so the shape is unit-testable.
 fn build_request(model: &str, query: &str) -> serde_json::Value {
     serde_json::json!({
         "model": model,
@@ -33,20 +19,13 @@ fn build_request(model: &str, query: &str) -> serde_json::Value {
         "input": query,
         "tools": [{ "type": "web_search" }],
         "max_output_tokens": MAX_OUTPUT_TOKENS,
-        // One-shot call with nothing to chain from, so the `store: true`
+        // INVARIANT: One-shot call with nothing to chain from, so the `store: true`
         // default would only hand OpenAI a 30-day copy of the query and answer
         // that we never read back. Opt out.
         "store": false,
     })
 }
 
-/// Flatten the Responses output into the shared shape: answer text, then a
-/// numbered `Sources:` list.
-///
-/// Sources come from `url_citation` annotations on the output text rather than
-/// from the `web_search_call` items, which carry no URLs. The same source is
-/// commonly cited several times in one answer, so URLs are de-duplicated —
-/// otherwise a three-source answer renders as ten numbered duplicates.
 pub(crate) fn parse_response(
     body: &serde_json::Value,
     max_results: usize,
@@ -88,7 +67,7 @@ pub(crate) fn parse_response(
         }
     }
 
-    // An `incomplete` response that produced nothing usable is a FAILURE, not
+    // INVARIANT: An `incomplete` response that produced nothing usable is a FAILURE, not
     // an empty search. Rendering the "no results" line would be `Ok`, which the
     // chain treats as terminal — so a run merely cut short by the output cap
     // would stop the chain and tell the user nothing was found. Reasoning
@@ -107,8 +86,6 @@ pub(crate) fn parse_response(
         .into());
     }
 
-    // Empty is a terminal success, not a failure — see the chain's fallthrough
-    // rule.
     Ok(format_search_result(&answer, &sources))
 }
 
@@ -121,7 +98,7 @@ pub struct OpenAiResponsesSearch {
 }
 
 impl OpenAiResponsesSearch {
-    /// `base_url` is the OpenAI-compatible API root; `/responses` is appended.
+    /// INVARIANT: `base_url` is the OpenAI-compatible API root; `/responses` is appended.
     ///
     /// `model` MUST be a model **OpenAI** serves on the Responses API — the
     /// caller resolves it via `provider_build::search_model_for`, which uses the
@@ -249,9 +226,6 @@ mod tests {
         assert_eq!(req["max_output_tokens"], MAX_OUTPUT_TOKENS);
     }
 
-    /// The Responses API retains response objects for at least 30 days under
-    /// its `store: true` default. This backend chains nothing, so the query and
-    /// its answer must not be left on OpenAI's servers.
     #[test]
     fn request_opts_out_of_server_side_storage() {
         let req = build_request("gpt-5.5", "rust release date");
@@ -279,8 +253,6 @@ mod tests {
         assert!(out.contains("2. Coverage"), "{out}");
     }
 
-    /// One source cited several times in the same answer must appear once —
-    /// otherwise a three-source answer renders as a list of duplicates.
     #[test]
     fn repeated_citations_are_deduplicated() {
         let body = serde_json::json!({
@@ -322,8 +294,6 @@ mod tests {
         assert!(err.to_string().contains("model not found"), "{err}");
     }
 
-    /// An `incomplete` run with nothing to show must be an ERROR so the chain
-    /// falls through, not a "no results" success that stops it.
     #[test]
     fn incomplete_with_nothing_is_an_error() {
         let body = serde_json::json!({
@@ -335,8 +305,6 @@ mod tests {
         assert!(err.to_string().contains("max_output_tokens"), "{err}");
     }
 
-    /// An `incomplete` run that still produced text keeps it — partial is
-    /// useful.
     #[test]
     fn incomplete_with_partial_output_is_kept() {
         let body = serde_json::json!({
@@ -350,8 +318,6 @@ mod tests {
         assert!(out.contains("Partial answer."), "{out}");
     }
 
-    /// Empty is a terminal success, matching the other backends and the chain's
-    /// fallthrough rule.
     #[test]
     fn genuinely_empty_result_is_ok_not_an_error() {
         let body = serde_json::json!({"output": []});

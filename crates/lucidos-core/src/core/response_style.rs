@@ -1,51 +1,17 @@
-//! The **response style**: how a chat or trigger answer comes back. It has two
-//! independent parts, rendered into one prompt section:
-//!
-//! - the **style**, the shape of an answer: how much comes back and what it is
-//!   for, from the library below;
-//! - the **technical literacy**, how technical the words are
-//!   (`core::technical_literacy`).
-//!
-//! Lucidos ships four styles and the user may edit three of them, reset any,
-//! and add as many of their own as they like. One is selected at a time, by the
-//! `response_style` preference. The rest of the library is one JSON document in
-//! `response_styles`.
-//!
-//! **Standard adds nothing, and nothing can make it add something.** It is the
-//! off switch rather than a style. A workspace on Standard with no literacy set
-//! gets the prompt it always got, byte for byte. Every degraded state resolves
-//! there too: a selected id nobody defines, a blank instruction, a document
-//! that will not parse, a failed read.
-//!
-//! The heading and [`STYLE_FLOOR`] belong to the engine, and only the
-//! instruction between them is editable. A user can ask for one-line answers.
-//! They cannot ask for an answer that drops the warning they needed.
-//!
-//! See `docs/plans/2026-09-18-response-style-control.md` and
-//! `docs/plans/2026-09-24-technical-literacy.md`.
-
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::core::prefs;
 use crate::core::technical_literacy::{self, TechnicalLiteracy};
 
-/// The off switch's id. Selected when `response_style` is unset.
 pub const STANDARD_ID: &str = "standard";
 
-/// Longest style id. It matches [`MAX_LABEL_CHARS`] only because both are short
-/// names, and one number is easier to state in the UI than two.
 pub const MAX_ID_CHARS: usize = 40;
-/// Longest label. It renders in a dropdown row beside its description.
 pub const MAX_LABEL_CHARS: usize = 40;
-/// Longest instruction, roughly 150 words. It rides in the cached system tier
-/// of every turn, so this is a cost ceiling rather than a taste one.
 pub const MAX_INSTRUCTION_CHARS: usize = 1_000;
-/// Most entries one document may hold. A preference row is not a growth
-/// surface, and 20 user styles is already more than anyone will pick between.
 pub const MAX_STYLES: usize = 20;
 
-/// The one rail an editable instruction cannot remove.
+/// INVARIANT: The one rail an editable instruction cannot remove.
 ///
 /// Appended to every rendered style, shipped or user-written, outside the text
 /// the user controls. "Answer in one line" is a reasonable thing to ask for and
@@ -54,22 +20,13 @@ const STYLE_FLOOR: &str = "- Style never overrides substance. Keep every warning
      every caveat that changes the answer, and every step the user has to take. \
      When they ask why or how, the explanation IS the answer, so give it in full.";
 
-/// A style Lucidos ships.
-///
-/// The non-empty ones are seeds. An entry in the user's document with the
-/// same id replaces the label and the instruction, and deleting that entry
-/// brings this text back.
 struct ShippedStyle {
     id: &'static str,
     label: &'static str,
-    /// The one line the picker shows under the label. A user style has no such
-    /// field and derives one from its instruction instead.
     description: &'static str,
     instruction: &'static str,
 }
 
-/// The shipped library, in picker order. Standard leads because it is the
-/// default and the way back.
 const SHIPPED: &[ShippedStyle] = &[
     ShippedStyle {
         id: STANDARD_ID,
@@ -106,7 +63,6 @@ const SHIPPED: &[ShippedStyle] = &[
     },
 ];
 
-/// One entry in the `response_styles` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StyleEntry {
     pub id: String,
@@ -114,20 +70,14 @@ pub struct StyleEntry {
     pub instruction: String,
 }
 
-/// Where a library row came from, which is what decides whether the editor
-/// offers Reset or Delete. Mirrors `ModelInfo`'s `source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StyleSource {
-    /// Shipped, and untouched.
     Builtin,
-    /// Shipped, with the user's own text on top. Reset removes the override.
     Overridden,
-    /// The user's own style. Delete removes it.
     User,
 }
 
-/// A row of the merged library, as the picker and the editor see it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Style {
     pub id: String,
@@ -135,28 +85,15 @@ pub struct Style {
     pub description: String,
     pub instruction: String,
     pub source: StyleSource,
-    /// False for Standard alone. Sent rather than derived, so the client does
-    /// not carry a second copy of the rule.
     pub editable: bool,
 }
 
-/// Whether an id is a well-formed style id: bounded, and already the kebab-case
-/// `core::slug` would produce.
-///
-/// The contract is a round trip through `slugify_kebab` rather than a charset
-/// re-listed here. `core::slug` is the shared home of that rule. A second
-/// hand-rolled copy is how two surfaces start disagreeing about a legal id.
 pub fn is_valid_style_id(id: &str) -> bool {
     !id.is_empty()
         && id.chars().count() <= MAX_ID_CHARS
         && crate::core::slug::slugify_kebab(id) == id
 }
 
-/// Parse and bounds-check a `response_styles` document.
-///
-/// The write gate calls this, so every message it returns is read by a person
-/// or handed to the agent. Nothing is truncated or dropped: a document is
-/// wholly acceptable or wholly refused.
 pub fn validate_document(raw: &str) -> Result<Vec<StyleEntry>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -188,8 +125,6 @@ pub fn validate_document(raw: &str) -> Result<Vec<StyleEntry>, String> {
                 entry.id, MAX_ID_CHARS
             ));
         }
-        // Refused rather than ignored, so the mistake is named. `merge` stays
-        // defensive anyway, for a row written before this gate existed.
         if entry.id == STANDARD_ID {
             return Err(format!(
                 "'{}' is the off switch and cannot be edited or replaced",
@@ -217,10 +152,6 @@ pub fn validate_document(raw: &str) -> Result<Vec<StyleEntry>, String> {
     Ok(entries)
 }
 
-/// Read a stored document, tolerating anything.
-///
-/// A value the gate would refuse today may already be in the table. A malformed
-/// row must cost the user their styles rather than their turn.
 fn read_document(raw: Option<&str>) -> Vec<StyleEntry> {
     let Some(raw) = raw else {
         return Vec::new();
@@ -238,11 +169,6 @@ fn read_document(raw: Option<&str>) -> Vec<StyleEntry> {
     }
 }
 
-/// Merge the shipped styles with the user's document.
-///
-/// A stored entry whose id is shipped replaces that row's label and
-/// instruction, and keeps its description; one with a fresh id is appended.
-/// Standard is skipped whatever the document says.
 pub fn merge(entries: &[StyleEntry]) -> Vec<Style> {
     let mut library: Vec<Style> = SHIPPED
         .iter()
@@ -285,11 +211,8 @@ pub fn merge(entries: &[StyleEntry]) -> Vec<Style> {
     library
 }
 
-/// Longest derived description, so a picker row stays one line.
 const MAX_DERIVED_DESCRIPTION_CHARS: usize = 80;
 
-/// The one line a user style shows under its label: its first line of
-/// instruction, without the bullet marker, clipped.
 fn derive_description(instruction: &str) -> String {
     let first = instruction
         .lines()
@@ -300,14 +223,14 @@ fn derive_description(instruction: &str) -> String {
     if first.chars().count() <= MAX_DERIVED_DESCRIPTION_CHARS {
         return first.to_string();
     }
-    // Counted in CHARACTERS, so cut in characters. `floor_char_boundary` takes
+    // INVARIANT: Counted in CHARACTERS, so cut in characters. `floor_char_boundary` takes
     // a BYTE index. Pairing it with the char count above clipped a Japanese
     // line to a third of its budget, and a Cyrillic one to half.
     let kept: String = first.chars().take(MAX_DERIVED_DESCRIPTION_CHARS).collect();
     format!("{}…", kept.trim_end())
 }
 
-/// Wrap both parts into the prompt section, floor included once, at the end.
+/// INVARIANT: Wrap both parts into the prompt section, floor included once, at the end.
 ///
 /// It LEADS with a blank line rather than being followed by one. That is what
 /// lets an empty section leave the surrounding prompt byte-identical to a build
@@ -327,11 +250,6 @@ fn render(instruction: &str, literacy: Option<TechnicalLiteracy>) -> String {
     format!("\n\nRESPONSE STYLE:\n{}\n{}", parts.join("\n"), STYLE_FLOOR)
 }
 
-/// The prompt section for `selected` and `literacy`, given a merged library.
-///
-/// An id the library does not hold resolves to Standard, which contributes
-/// nothing. That is the state left behind by deleting the style you had
-/// selected. The literacy part renders either way.
 pub fn section_for(
     library: &[Style],
     selected: &str,
@@ -350,20 +268,11 @@ pub fn section_for(
     render(instruction, literacy)
 }
 
-/// This workspace's merged style library. An unreadable row reads as no
-/// document, so the turn runs on the shipped styles rather than failing.
 pub async fn library(pool: &PgPool) -> Vec<Style> {
     let document = prefs::RESPONSE_STYLES.stored(pool).await;
     merge(&read_document(document.as_deref()))
 }
 
-/// The response-style section for this turn's system prompt, or an empty string
-/// when the workspace is on Standard with no technical literacy set.
-///
-/// Read once per turn, at prompt assembly. All three keys are workspace-global,
-/// so the result is the same for every thread and the cached system tier stays
-/// shared (ADR 0084). Every read is total: a turn that refuses to run because a
-/// style row is unreadable is strictly worse than one that runs at the default.
 pub async fn resolve(pool: &PgPool) -> String {
     let literacy = technical_literacy::read(pool).await;
     let selected = prefs::RESPONSE_STYLE.read(pool).await;
@@ -373,8 +282,6 @@ pub async fn resolve(pool: &PgPool) -> String {
     section_for(&library(pool).await, &selected, literacy)
 }
 
-/// The selected style when its text is the user's own, written or overridden.
-/// That text is *workspace prompt footprint*; a shipped style is engine text.
 pub async fn user_written_selection(pool: &PgPool) -> Option<Style> {
     let selected = prefs::RESPONSE_STYLE.read(pool).await;
     library(pool)
@@ -383,11 +290,6 @@ pub async fn user_written_selection(pool: &PgPool) -> Option<Style> {
         .find(|s| s.id == selected && s.source != StyleSource::Builtin)
 }
 
-/// The widest section the ENGINE authors, for the system prompt footprint.
-///
-/// A user's own instruction is workspace content, like `user_profile.md`, so it
-/// is not on that meter. What is billed is the widest shipped style plus the
-/// widest literacy level, the wrapper and the floor.
 pub fn widest_shipped_section() -> String {
     let widest_style = SHIPPED
         .iter()
@@ -420,8 +322,6 @@ mod tests {
             .unwrap_or_else(|| panic!("{id} must be in the library"))
     }
 
-    /// The promise the whole feature rests on: a workspace that never opens
-    /// this setting pays nothing and reads nothing new.
     #[test]
     fn standard_renders_nothing() {
         let library = merge(&[]);
@@ -429,7 +329,6 @@ mod tests {
         assert_eq!(find(&library, STANDARD_ID).instruction, "");
     }
 
-    /// Standard is the off switch, so it is the one row with no editor.
     #[test]
     fn standard_is_the_only_row_that_cannot_be_edited() {
         for style in merge(&[]) {
@@ -442,8 +341,6 @@ mod tests {
         }
     }
 
-    /// Belt and braces against the write gate. A row written before
-    /// `validate_document` existed must not make the off switch speak.
     #[test]
     fn a_stored_override_cannot_make_standard_inject_text() {
         let library = merge(&[entry(STANDARD_ID, "Loud", "- Say everything twice.")]);
@@ -461,8 +358,6 @@ mod tests {
         assert_eq!(ids, vec![STANDARD_ID, "concise", "minimal", "learning"]);
     }
 
-    /// Every style the prompt can carry ends with the rail, however it was
-    /// authored. That is what stops "answer in one line" dropping a warning.
     #[test]
     fn every_rendered_style_ends_with_the_floor() {
         let library = merge(&[
@@ -485,9 +380,6 @@ mod tests {
         }
     }
 
-    /// A shipped style keeps its own description, edited or not. The picker
-    /// marks the edit from `source`; a line lifted from the instruction read
-    /// as unrelated text.
     #[test]
     fn editing_a_shipped_style_overrides_it_and_leaves_the_rest_alone() {
         let library = merge(&[entry("minimal", "Terse", "- One sentence. Nothing else.")]);
@@ -504,8 +396,6 @@ mod tests {
         assert!(concise.instruction.contains("Lead with the answer"));
     }
 
-    /// Removing the override is the Reset button. It brings the shipped text
-    /// back rather than a blank.
     #[test]
     fn dropping_an_override_restores_the_shipped_text() {
         let edited = merge(&[entry("concise", "Mine", "- Mine.")]);
@@ -530,14 +420,11 @@ mod tests {
         assert!(section_for(&library, "board-report", None).contains("Three bullets."));
     }
 
-    /// The state left behind by deleting the style you had selected.
     #[test]
     fn a_selected_id_nobody_defines_resolves_to_standard() {
         assert_eq!(section_for(&merge(&[]), "deleted-last-week", None), "");
     }
 
-    /// Every combination of the two parts renders one heading, each chosen
-    /// part once, and the floor exactly once at the very end.
     #[test]
     fn style_and_literacy_render_independently_under_one_heading() {
         let library = merge(&[]);
@@ -563,7 +450,6 @@ mod tests {
         }
     }
 
-    /// The literacy part still renders when the selected style is gone.
     #[test]
     fn a_missing_style_keeps_the_literacy_part() {
         let section = section_for(
@@ -581,7 +467,6 @@ mod tests {
         assert_eq!(merge(&read_document(None)).len(), SHIPPED.len());
     }
 
-    /// Unparseable JSON costs the user their styles, never their turn.
     #[test]
     fn an_unreadable_document_falls_back_rather_than_failing() {
         assert_eq!(read_document(Some("{not json")), Vec::new());
@@ -657,8 +542,6 @@ mod tests {
         assert!(validate_document(&raw).unwrap_err().contains("at most"));
     }
 
-    /// The bounds count CHARACTERS, so a multi-byte instruction is not refused
-    /// for being long in bytes.
     #[test]
     fn the_bounds_count_characters_rather_than_bytes() {
         let wide = "é".repeat(MAX_INSTRUCTION_CHARS);
@@ -681,8 +564,6 @@ mod tests {
         assert!(derived.chars().count() <= MAX_DERIVED_DESCRIPTION_CHARS + 1);
     }
 
-    /// The meter bills engine-authored text, so it must see the widest SHIPPED
-    /// section and not an empty one.
     #[test]
     fn the_widest_shipped_section_is_a_real_rendered_section() {
         let widest = widest_shipped_section();
@@ -693,9 +574,6 @@ mod tests {
         }
     }
 
-    /// The link the pure tests above cannot reach: two preference rows in, one
-    /// prompt section out. It is the only part of the chain the compiler does
-    /// not check, and a key spelled two ways would pass everything else.
     #[tokio::test]
     async fn the_resolver_reads_both_keys_and_degrades_to_standard() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -708,16 +586,13 @@ mod tests {
             }
         };
 
-        // A fresh workspace has neither row, so it is on Standard.
         assert_eq!(resolve(&pool).await, "");
 
-        // A shipped style, selected. The section is the shipped text.
         seed(prefs::RESPONSE_STYLE.key(), "minimal".to_string()).await;
         let minimal = resolve(&pool).await;
         assert!(minimal.contains("Give the outcome, not the process"));
         assert!(minimal.ends_with(STYLE_FLOOR));
 
-        // Overridden, so the user's words replace the shipped ones.
         let document = serde_json::to_string(&vec![entry(
             "minimal",
             "Terse",
@@ -730,7 +605,6 @@ mod tests {
         assert!(!overridden.contains("Give the outcome, not the process"));
         assert!(overridden.ends_with(STYLE_FLOOR));
 
-        // A style of their own, selected by its id.
         let document = serde_json::to_string(&vec![entry(
             "board-report",
             "Board report",
@@ -741,40 +615,30 @@ mod tests {
         seed(prefs::RESPONSE_STYLE.key(), "board-report".to_string()).await;
         assert!(resolve(&pool).await.contains("Three bullets, no more."));
 
-        // Deleting the style you had selected. The id survives, the row does
-        // not, and the turn still runs.
         seed(prefs::RESPONSE_STYLES.key(), "[]".to_string()).await;
         assert_eq!(resolve(&pool).await, "");
 
-        // A document written before the gate existed costs the styles, not the
-        // turn: the shipped library answers and the selection still resolves.
         seed(prefs::RESPONSE_STYLES.key(), "{not json".to_string()).await;
         seed(prefs::RESPONSE_STYLE.key(), "concise".to_string()).await;
         assert!(resolve(&pool).await.contains("Lead with the answer."));
 
-        // Explicitly back to Standard, which is silent again.
         seed(prefs::RESPONSE_STYLE.key(), STANDARD_ID.to_string()).await;
         assert_eq!(resolve(&pool).await, "");
 
-        // A blank selection reads as unset rather than as a missing style.
         seed(prefs::RESPONSE_STYLE.key(), "   ".to_string()).await;
         assert_eq!(resolve(&pool).await, "");
 
-        // Technical literacy speaks on Standard too: the two parts are
-        // independent.
         seed(prefs::TECHNICAL_LITERACY.key(), "non-technical".to_string()).await;
         let literacy_only = resolve(&pool).await;
         assert!(literacy_only.contains(&TechnicalLiteracy::NonTechnical.chat_rules()));
         assert!(literacy_only.ends_with(STYLE_FLOOR));
 
-        // And beside a style, under the one heading.
         seed(prefs::RESPONSE_STYLE.key(), "minimal".to_string()).await;
         let both = resolve(&pool).await;
         assert!(both.contains("Give the outcome, not the process"));
         assert!(both.contains(&TechnicalLiteracy::NonTechnical.chat_rules()));
         assert_eq!(both.matches("RESPONSE STYLE:").count(), 1);
 
-        // An unknown level costs the level, never the turn or the style.
         seed(prefs::TECHNICAL_LITERACY.key(), "wizard".to_string()).await;
         let unknown = resolve(&pool).await;
         assert!(unknown.contains("Give the outcome, not the process"));
@@ -784,8 +648,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// What the Settings editor renders, straight from the engine, so the
-    /// shipped text has one home rather than a mirror in TypeScript.
     #[tokio::test]
     async fn the_library_reports_each_row_source_for_the_editor() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;

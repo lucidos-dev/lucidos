@@ -151,8 +151,8 @@ on:
       #     verification FOLLOWS the artifact to the GA tag.
       #
       # Setting it runs dmg-verify and NOTHING else. Every other job guards on it
-      # being empty, or a few minutes of asset checking would drag a 40-minute
-      # source install and a 90-minute tarball build along with it.
+      # being empty, or a few minutes of asset checking would also run the
+      # source install and the tarball build.
       dmg_tag:
         description: 'dmg-verify: verify the DMG on this tag, either an rc-<ver> draft or a published v<ver>. Runs dmg-verify only.'
         type: string
@@ -179,8 +179,8 @@ on:
     types: [prereleased, released, published]
   # Two crons, and each job picks EXACTLY ONE via `github.event.schedule` (the
   # cron string that fired). A schedule trigger is workflow-wide, so without that
-  # guard the daily front-door cron would also drag the 40-min source install and
-  # the 90-min tarball build in with it, seven times a week instead of once.
+  # guard the daily front-door cron would also run the source install and
+  # tarball build seven times a week instead of once.
   schedule:
     - cron: '0 4 * * 1'        # weekly Mon 04:00 UTC — catch toolchain drift (smoke, tarball-smoke)
     - cron: '0 6 * * *'        # daily 06:00 UTC — the live lucidos.dev front door (front-door)
@@ -191,13 +191,12 @@ on:
 env:
   LUCIDOS_HOME: ${{ github.workspace }}
   LUCIDOS_WORKSPACE: ${{ github.workspace }}/.smoke-ws
-  HEALTH_TIMEOUT_SECS: '2400'   # 40 min: first-run source build is slow
+  HEALTH_TIMEOUT_SECS: '5400'   # 90 min for a cold release build and engine boot
   # Rung 4's budget, and it exists because rung 2 passing does not mean the
   # frontend is there yet. run.sh starts the gateway and engine first and builds
   # the frontend after, so the engine answers health as ok while dist/index.html
   # does not exist and it correctly 404s the root. A one-shot `vite build` on a
-  # busy runner is well under a minute; ten is generous for it and still leaves
-  # most of the job's 60-minute ceiling to the 40-minute health poll above.
+  # busy runner is well under a minute, with ten minutes reserved for it here.
   FRONTEND_TIMEOUT_SECS: '600'
   # dmg-verify's readiness deadline. Nothing compiles there (the DMG is already
   # built), but a FIRST launch on a clean runner still pays Gatekeeper's
@@ -251,29 +250,43 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.os == 'macos-only') && '["ubuntu-latest"]'
           || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # 10 min for ports, 90 for engine health, 10 for the frontend, and
+    # 20 for runner setup, cache transfer, the remaining checks, and teardown.
+    timeout-minutes: 130
+    env:
+      SCCACHE_CACHE_SIZE: 3G
+      # Keep the daemon available between Cargo invocations on this runner.
+      SCCACHE_IDLE_TIMEOUT: '0'
+      SCCACHE_LOG: warn
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      # The from-source install compiles the engine, and this leg is on the RC
-      # gate's critical path, 12m07s on the last release candidate. rust-cache
-      # restores third-party dependency artifacts only: it deletes the workspace
-      # members' artifacts before saving, so install.sh still builds all of
-      # crates/** from source and the thing under test is unchanged.
+      - name: Set sccache paths
+        shell: bash
+        run: |
+          echo "SCCACHE_DIR=$RUNNER_TEMP/install-smoke-sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_ERROR_LOG=$RUNNER_TEMP/install-smoke-sccache.log" >> "$GITHUB_ENV"
+
+      # The installer creates a fresh launch tree (ADR 0693), so Cargo's build
+      # directory there cannot be restored before launch. Persist sccache's
+      # compiler artifacts outside the tree, alongside Cargo downloads.
+      # The weekly smoke on the default branch seeds this ref-independent
+      # cache key for RC branches and release tags.
       #
       # The prefix fences these caches off from the release ones. A shipped
       # binary must never be able to read something a test leg wrote, and the
       # separation is what makes that structural rather than a habit.
-      - name: Cache Rust dependencies
+      - name: Cache Cargo downloads and sccache artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
-          prefix-key: v0-rust-smoke
+          prefix-key: v1-rust-smoke
           key: source-install-${{ matrix.os }}
+          cache-targets: 'false'
+          cache-directories: ${{ env.SCCACHE_DIR }}
 
-      # The mirror must be enough on its own (ADR 0595). Wiping the ort cache and
-      # ort-sys's build artifacts after the rust-cache restore forces a real
-      # fetch, and the assert step below fails if it did not come from the mirror.
+      # A cached build-script executable still runs in the fresh Cargo target.
+      # Wipe any downloaded runtime so ort-sys must fetch it from the mirror.
       - name: Block parcel.pyke.io and clear cached ONNX Runtime state
         shell: bash
         run: ./scripts/block-ort-upstream.sh --wipe
@@ -430,6 +443,11 @@ jobs:
         shell: bash
         run: ./scripts/block-ort-upstream.sh --assert
 
+      - name: Report sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+
       - name: Tear down
         if: always()
         shell: bash
@@ -442,7 +460,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: install-log-${{ matrix.os }}
-          path: ${{ runner.temp }}/install.log
+          path: |
+            ${{ runner.temp }}/install.log
+            ${{ env.SCCACHE_ERROR_LOG }}
           if-no-files-found: ignore
           retention-days: 7
 

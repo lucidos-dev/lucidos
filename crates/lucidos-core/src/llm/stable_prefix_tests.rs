@@ -16,7 +16,6 @@ fn tools(names: &[&str]) -> Vec<ToolDefinition> {
         .collect()
 }
 
-/// A turn's request, the way the chat loop sends it.
 struct Turn {
     view: &'static str,
     request_text: &'static str,
@@ -87,7 +86,6 @@ impl Turn {
     }
 }
 
-/// Two requests with the same stable prefix hash the same, on both layouts.
 #[test]
 fn identical_prefixes_share_a_fingerprint() {
     for tree in [false, true] {
@@ -99,7 +97,6 @@ fn identical_prefixes_share_a_fingerprint() {
     }
 }
 
-/// A capability gate that adds or drops a tool changes the prefix.
 #[test]
 fn a_changed_tool_list_changes_the_fingerprint() {
     for tree in [false, true] {
@@ -115,8 +112,6 @@ fn a_changed_tool_list_changes_the_fingerprint() {
     }
 }
 
-/// The next turn rewrites the per-turn block, and the stable prefix ends
-/// before it. So two turns that differ only there share a fingerprint.
 #[test]
 fn the_per_turn_block_is_outside_the_prefix() {
     for tree in [false, true] {
@@ -132,8 +127,6 @@ fn the_per_turn_block_is_outside_the_prefix() {
     }
 }
 
-/// Round 2 spends its markers on the two newest messages and drops the
-/// system marker. The content is the same, so the fingerprint is too.
 #[test]
 fn the_markers_are_not_part_of_the_fingerprint() {
     for tree in [false, true] {
@@ -161,8 +154,6 @@ fn a_changed_memory_view_changes_the_fingerprint() {
     );
 }
 
-/// Opus 5.5 renders effort into the prefix, so a beat at another effort
-/// would read nothing the turn wrote.
 #[test]
 fn a_changed_effort_changes_the_fingerprint() {
     let medium = Turn {
@@ -184,8 +175,6 @@ fn a_changed_system_block_changes_the_fingerprint() {
     assert_ne!(Turn::default().fingerprint(false), other.fingerprint(false));
 }
 
-/// Marking a bare string rewrites it into a one-block array, so the two
-/// shapes must read as the same content.
 #[test]
 fn a_marked_string_reads_as_the_same_content_as_an_unmarked_one() {
     let text = Value::String("hello".into());

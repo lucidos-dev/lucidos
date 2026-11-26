@@ -269,8 +269,10 @@ cd "$PROJECT_DIR"
 # `lucidos` binary, and passes straight through when an outer wrapper (a `make
 # test` that already took one) marked the process tree as holding.
 SLOT="$PROJECT_DIR/scripts/with-build-slot.sh"
-# Inside the slot, so the time spent waiting for one never counts. The default
-# is about 3x the slowest full run seen on a busy host (ADR 0391).
+# Inside the slot, so the time spent waiting for one never counts. The limit
+# guards the test run only: the build above it finishes first, because compile
+# time swings 2x on a loaded runner and a hung test is what the limit names.
+# The default is about 3x the slowest full run seen on a busy host (ADR 0391).
 RUN_LIMIT_DEFAULT_SECS=2700
 LIMIT=("$PROJECT_DIR/scripts/with-run-limit.sh" "${LUCIDOS_TEST_RUN_LIMIT_SECS:-$RUN_LIMIT_DEFAULT_SECS}")
 
@@ -306,5 +308,7 @@ fi
 TEST_ARGS=(--no-fail-fast --lib)
 [ "$FULL" != 1 ] || TEST_ARGS=()
 echo "[test] cargo test --locked ${PACKAGES[*]} ${TEST_ARGS[*]-}"
+"$SLOT" --label "engine test build" -- \
+    cargo test --locked --no-run "${PACKAGES[@]}" ${TEST_ARGS[@]+"${TEST_ARGS[@]}"} ${PASSTHRU[@]+"${PASSTHRU[@]}"}
 "$SLOT" --label "engine tests" -- "${LIMIT[@]}" "engine tests" -- \
     cargo test --locked "${PACKAGES[@]}" ${TEST_ARGS[@]+"${TEST_ARGS[@]}"} ${PASSTHRU[@]+"${PASSTHRU[@]}"}

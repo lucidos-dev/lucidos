@@ -1,22 +1,9 @@
-//! The macOS backend: a seatbelt profile run through `sandbox-exec`.
-//!
-//! The profile allows by default and denies what the [`Policy`] names. When
-//! two rules match one operation, the later one wins. So each exception
-//! follows the denial it carves into.
-//!
-//! A seatbelt cannot nest under one that denies anything: the inner
-//! `sandbox_apply` fails with EPERM (Phase 0 of
-//! `docs/plans/2026-11-10-os-sandbox-for-agent-subprocesses.md`). Codex and
-//! Claude Code therefore run with their own sandboxes off inside ours.
-
 use std::path::{Path, PathBuf};
 
 use crate::Policy;
 
-/// The seatbelt launcher. It ships with every macOS release Lucidos supports.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// The profile text for `policy`, as `sandbox-exec -p` takes it.
 pub fn profile(policy: &Policy) -> String {
     let mut out = String::from("(version 1)\n(allow default)\n");
     rules(&mut out, "deny", &policy.hidden, true);
@@ -77,8 +64,6 @@ fn fixed_ancestors(policy: &Policy) -> Vec<PathBuf> {
     out
 }
 
-/// One rule per path. `whole` covers reads and unix-socket connects too, not
-/// only writes.
 fn rules(out: &mut String, verdict: &str, paths: &[PathBuf], whole: bool) {
     for path in paths {
         let subpath = format!("(subpath {})", quoted(path));
@@ -93,16 +78,11 @@ fn rules(out: &mut String, verdict: &str, paths: &[PathBuf], whole: bool) {
     }
 }
 
-/// `path` as an SBPL string literal.
 fn quoted(path: &Path) -> String {
     let text = path.to_string_lossy();
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Whether `sandbox-exec` can apply a profile that denies something here.
-///
-/// A trial, not a check for the file: inside another seatbelt, as when the
-/// engine itself runs sandboxed, the binary exists and every apply fails.
 #[cfg(target_os = "macos")]
 pub fn probe() -> crate::Availability {
     use crate::Availability;

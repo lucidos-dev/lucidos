@@ -6,16 +6,7 @@ use crate::llm::image::ImageSize;
 use base64::Engine as _;
 use std::path::Path;
 
-/// True when `prompt` looks like a request to describe/analyse an existing
-/// image instead of synthesise a new one. Anchored at the start of the
-/// prompt so phrases like "a robot describing a painting" still synthesise
-/// a picture, while "describe this image in detail" gets blocked.
-/// ASCII-case-insensitive; only inspects the first ~32 bytes so ~4 KB
-/// generation prompts don't pay for a full lowercase allocation.
 fn looks_like_description_prompt(prompt: &str) -> bool {
-    /// Prefixes that signal a vision / analysis intent. Membership is a
-    /// boolean OR over the whole set (`.any()` below), so order has no effect
-    /// on the result — a prompt is blocked if it starts with ANY of these.
     const PREFIXES: &[&[u8]] = &[
         b"describe ",
         b"analyse ",
@@ -41,40 +32,22 @@ fn looks_like_description_prompt(prompt: &str) -> bool {
 
 const IMAGE_HANDLE_PREFIX: &str = "img-";
 
-/// Whether a reference is an [`image_handle`](crate::core::events::image_handle),
-/// as opposed to a path under `data/artifacts/`.
-///
-/// The hex body is what decides, not the prefix alone. An artifact really can
-/// be called `img-cat.png`, and claiming that as a handle would answer a
-/// perfectly good file read with "handle not found". A wrong-length hex body
-/// IS claimed, so a mistyped handle says so instead of turning into a missing
-/// file.
 fn is_image_handle(reference: &str) -> bool {
     reference
         .strip_prefix(IMAGE_HANDLE_PREFIX)
         .is_some_and(|hex| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// The two shapes that name an image already in this thread, as opposed to a
-/// path under `data/artifacts/`. `img-<hex>` is the stable handle of ADR 0085
-/// Decision 11. `thread:N` is the positional form it replaces, kept working
-/// because existing threads and existing habits both still use it.
 pub(crate) fn is_thread_image_ref(reference: &str) -> bool {
     reference.starts_with("thread:") || is_image_handle(reference)
 }
 
-/// Pick out the one image a reference names. One resolver for both forms, so
-/// every tool taking an image reference accepts both.
 fn find_thread_image<'a>(
     images: &'a [crate::core::events::ThreadImage],
     reference: &str,
 ) -> Result<&'a crate::core::events::ThreadImage, String> {
     let total = images.len();
     if is_image_handle(reference) {
-        // Compared in full, never as a prefix: a truncated handle would
-        // silently resolve to whichever image happened to sort first. Case
-        // folded, because the `evt-` address the model also handles round-trips
-        // through `Uuid::parse_str`, which accepts either case.
         return images
             .iter()
             .find(|i| i.handle.eq_ignore_ascii_case(reference))
@@ -119,11 +92,6 @@ pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
     let mut result = Vec::with_capacity(refs.len());
     for reference in refs {
         let img = find_thread_image(&images, reference)?;
-        // walk_thread_images yields empty base64 when the user-image blob
-        // is missing on disk (partial backup-restore). The numbering slot
-        // exists so downstream history annotations stay stable; we
-        // surface a clear error here instead of feeding empty bytes to
-        // the LLM API.
         if img.base64.is_empty() {
             return Err(format!(
                 "Thread image '{}' is referenced but its blob is missing on disk.",
@@ -141,9 +109,6 @@ pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
 
 #[easy_ext::ext(ImageExt)]
 pub(crate) impl LucidosEngine {
-    /// Build the image provider implied by the current `image_model`
-    /// preference. Resolved per call so Settings changes take effect
-    /// without an engine restart.
     async fn current_image_provider(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::llm::ImageProvider>> {
@@ -162,20 +127,12 @@ pub(crate) impl LucidosEngine {
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = self
-            .current_image_provider()
-            .await
-            // Both keys are already-resolved chains (a stored credential, then
-            // the env var, then the Codex CLI for OpenAI; ADC and gcloud for
-            // Vertex), so naming only the env vars sends a user who configured
-            // the provider in Settings to fix the wrong thing. This one reaches
-            // the user in chat rather than the log, which is why it matters most.
-            .ok_or(concat!(
-                "No image provider configured. Add an OpenAI key under ",
-                providers_settings!(),
-                " (or set OPENAI_API_KEY), or configure Google Cloud (set \
+        let provider = self.current_image_provider().await.ok_or(concat!(
+            "No image provider configured. Add an OpenAI key under ",
+            providers_settings!(),
+            " (or set OPENAI_API_KEY), or configure Google Cloud (set \
                  VERTEX_PROJECT_ID or run `gcloud auth application-default login`).",
-            ))?;
+        ))?;
 
         let prompt = args
             .get("prompt")
@@ -211,7 +168,7 @@ pub(crate) impl LucidosEngine {
             .unwrap_or(ImageSize::Auto);
 
         let raw_save_path = args.get("save_as_artifact").and_then(|v| v.as_str());
-        // Refused before the provider call, which the user pays for. Refused
+        // INVARIANT: Refused before the provider call, which the user pays for. Refused
         // after it, the image is generated, billed and then thrown away.
         if let Some(path) = raw_save_path {
             if crate::core::is_path_traversal(path) {
@@ -224,7 +181,6 @@ pub(crate) impl LucidosEngine {
         }
         let save_as_artifact = raw_save_path.map(crate::core::artifact_relative_path);
 
-        // Resolve input images
         let input_refs: Vec<String> = args
             .get("input_images")
             .and_then(|v| v.as_array())
@@ -235,7 +191,6 @@ pub(crate) impl LucidosEngine {
             })
             .unwrap_or_default();
 
-        // Multi-image validation: error if provider doesn't support it
         if input_refs.len() > 1 && !provider.supports_multi_image() {
             return Err(format!(
                 "the current image provider ({}) only supports one input image for editing. \
@@ -247,7 +202,6 @@ pub(crate) impl LucidosEngine {
             .into());
         }
 
-        // Resolve each reference to raw bytes
         let mut input_images: Vec<Vec<u8>> = Vec::new();
         for reference in &input_refs {
             match self.resolve_image_reference(reference, thread_id).await {
@@ -272,19 +226,14 @@ pub(crate) impl LucidosEngine {
         .generate(provider.as_ref(), prompt, input_images, size)
         .await?;
 
-        // Compress the result through the same pipeline as user images
         let compressed = ChatImage {
             base64: base64::engine::general_purpose::STANDARD.encode(&result.bytes),
             mime_type: result.mime_type,
         }
         .compress();
 
-        // Save as artifact if requested
         if let Some(artifact_path) = save_as_artifact {
             let raw_bytes = base64::engine::general_purpose::STANDARD.decode(&compressed.base64)?;
-            // The store announces the write. This tool used to call the raw
-            // writer and emit nothing at all, so a generated image appeared in no
-            // artifact list until a reload and was never indexed into memory.
             self.artifact_manager
                 .write_and_commit(
                     &self.lock_workspace_repo().await,
@@ -304,8 +253,6 @@ pub(crate) impl LucidosEngine {
             crate::log_legacy!("[Image] Saved to artifact: {}", artifact_path);
         }
 
-        // Return a JSON result with the image info — the agentic loop will
-        // store the base64 in the ToolResult event's images field
         let result_text = if let Some(path) = save_as_artifact {
             format!("Image generated and saved to artifacts/{}.", path)
         } else {
@@ -365,7 +312,7 @@ pub(crate) impl LucidosEngine {
         Ok(format!("Image saved to artifacts/{}.", artifact_path))
     }
 
-    /// Re-load an image posted earlier in the thread back into the model's
+    /// INVARIANT: Re-load an image posted earlier in the thread back into the model's
     /// vision. Takes an `img-<hex>` handle or a `thread:N` reference, and
     /// returns the `[IMAGE_CONTENT:<type>]\n<base64>` sentinel. The agentic
     /// loop (`parse_image_content_marker`) lifts that into a real
@@ -401,12 +348,6 @@ pub(crate) impl LucidosEngine {
         ))
     }
 
-    /// Load one of this thread's images, by `img-<hex>` handle or `thread:N`.
-    ///
-    /// The single reader for both, so every tool taking an image reference
-    /// resolves it identically and reports the same errors. It used to be
-    /// duplicated here and in [`resolve_thread_image_refs`], with the two
-    /// copies wording their failures differently.
     async fn resolve_thread_image(
         &self,
         reference: &str,
@@ -416,18 +357,11 @@ pub(crate) impl LucidosEngine {
             .event_store
             .get_thread_events(&thread_id.to_string())
             .await?;
-        // On Ok the vec holds exactly the one requested image: the resolver
-        // validates the form, the range and the missing-blob case, and errors
-        // with a message the model can act on.
         resolve_thread_image_refs(&self.workspace_path, &events, &[reference.to_string()])?
             .pop()
             .ok_or_else(|| "internal: resolve_thread_image_refs returned no image".into())
     }
 
-    /// Resolve an image reference to raw bytes. Three shapes:
-    /// - `img-<hex>`: the stable handle of an image already in the thread
-    /// - `thread:N`: Nth image in the conversation (1-based)
-    /// - an artifact path, read from `data/artifacts/`
     async fn resolve_image_reference(
         &self,
         reference: &str,
@@ -446,7 +380,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The `generate_image` result: the agentic loop splits the base64 off the text.
 fn generated_image_result(base64: &str, text: &str) -> String {
     format!("[GENERATED_IMAGE:{base64}]\n{text}")
 }
@@ -462,28 +395,19 @@ mod tests {
     };
     use std::path::Path;
 
-    /// Minimal valid PNG with a per-test discriminator byte so each call
-    /// produces a distinct content-addressed hash.
     fn png_with_marker(marker: u8) -> Vec<u8> {
         vec![
-            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, // signature
-            0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R', // IHDR start
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, marker,
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            marker,
         ]
     }
 
-    /// Write `n` distinct image blobs into `workspace`, then return both the
-    /// hashes and a `MessageReceived` event whose payload references them
-    /// — mirrors the post-Phase-3b storage shape so the tests exercise the
-    /// real walk_thread_images + resolve_thread_image_refs path.
     fn message_event_with_blobs(workspace: &Path, n: u8) -> (Vec<String>, EventRow) {
         let markers: Vec<u8> = (0..n).collect();
         message_event_from_markers(workspace, &markers)
     }
 
-    /// Same, with the discriminators named. A repeated marker is the SAME
-    /// image under content-addressing. So a test about two distinct messages
-    /// picks disjoint markers, or it compares a picture with itself.
     fn message_event_from_markers(workspace: &Path, markers: &[u8]) -> (Vec<String>, EventRow) {
         let hashes: Vec<String> = markers
             .iter()
@@ -512,12 +436,9 @@ mod tests {
         )
         .unwrap();
 
-        // The 1st and 3rd images are returned (not the 2nd). All blobs are
-        // PNGs (sniffed by magic bytes), so each comes back with mime image/png.
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].mime_type, "image/png");
         assert_eq!(resolved[1].mime_type, "image/png");
-        // Different hashes → different bytes → different base64.
         assert_ne!(resolved[0].base64, resolved[1].base64);
     }
 
@@ -576,12 +497,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // The stable image handle (ADR 0085 Decision 11)
-    // ------------------------------------------------------------------
-
-    /// The handle resolves to the same bytes `thread:N` does, so the two are
-    /// two names for one image rather than two lookups that can disagree.
     #[test]
     fn a_handle_and_its_thread_index_name_the_same_image() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -600,9 +515,6 @@ mod tests {
         assert_eq!(by_handle[0].base64, by_index[0].base64);
     }
 
-    /// THE point of the handle. `thread:N` counts from the start of the
-    /// thread, so an image arriving earlier renumbers every later one. A
-    /// handle noted in one turn must still name its own picture after that.
     #[test]
     fn a_handle_survives_the_renumbering_that_breaks_thread_n() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -618,8 +530,6 @@ mod tests {
             resolve_thread_image_refs(tmp.path(), &events, &["thread:1".to_string()]).unwrap();
         assert_eq!(before[0].base64, before_by_index[0].base64);
 
-        // An earlier message now carries two other images, so every index
-        // shifts by two.
         let (_older_hashes, older) = message_event_from_markers(tmp.path(), &[40, 41]);
         let shifted = vec![older, events.into_iter().next().unwrap()];
 
@@ -636,9 +546,6 @@ mod tests {
         );
     }
 
-    /// A user image's handle is derived from the blob hash already in the
-    /// payload. That is what lets the history annotation print the handle
-    /// without reading a blob, and what keeps the metadata walk read-free.
     #[test]
     fn a_user_images_handle_comes_from_the_hash_the_payload_already_carries() {
         use crate::core::events::{image_handle, ImageRef};
@@ -650,14 +557,11 @@ mod tests {
         for (i, hash) in hashes.iter().enumerate() {
             assert_eq!(walked[i].handle, image_handle(ImageRef::BlobHash(hash)));
         }
-        // And the metadata-only walk agrees, so the two never diverge.
         let meta = crate::core::events::walk_thread_images_meta(tmp.path(), &events);
         assert_eq!(meta[0].handle, walked[0].handle);
         assert_eq!(meta[1].handle, walked[1].handle);
     }
 
-    /// A handle nobody minted is refused. The refusal says how many images
-    /// the thread holds, so the model can tell "wrong id" from "no images".
     #[test]
     fn an_unknown_handle_is_refused_rather_than_falling_back_to_a_position() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -672,24 +576,16 @@ mod tests {
         assert!(err.contains("2 images total"), "got: {}", err);
     }
 
-    /// An artifact really can be called `img-cat.png`. Claiming every `img-`
-    /// string as a handle would answer a perfectly good file read with
-    /// "handle not found", so the hex body is what decides.
     #[test]
     fn an_artifact_path_that_merely_starts_with_img_is_not_a_handle() {
         assert!(!is_thread_image_ref("img-cat.png"));
         assert!(!is_thread_image_ref("img-notes/screenshot.png"));
         assert!(!is_thread_image_ref("img-"));
-        // A wrong-length hex body IS a handle, so a mistyped one says so
-        // rather than turning into a missing file.
         assert!(is_thread_image_ref("img-abc"));
         assert!(is_thread_image_ref("img-0123456789abcdef"));
         assert!(is_thread_image_ref("thread:2"));
     }
 
-    /// The `evt-` address the model also handles round-trips through
-    /// `Uuid::parse_str`, which accepts either case. An image handle folds the
-    /// same way, so one habit works for both.
     #[test]
     fn a_handle_resolves_whatever_case_the_model_writes_it_in() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -699,8 +595,6 @@ mod tests {
         let handle = crate::core::events::walk_thread_images(tmp.path(), &events)[1]
             .handle
             .clone();
-        // Only the hex body: the `img-` prefix is the literal that marks the
-        // namespace, and folding it would make `IMG-` a handle too.
         let hex = handle.strip_prefix("img-").expect("handle is prefixed");
         let shouted = format!("img-{}", hex.to_uppercase());
         assert_ne!(shouted, handle, "the fixture must have hex letters in it");
@@ -711,8 +605,6 @@ mod tests {
         assert_eq!(lower[0].base64, upper[0].base64);
     }
 
-    /// A truncated handle must not resolve. Prefix matching would hand back
-    /// whichever image happened to come first, silently and wrongly.
     #[test]
     fn a_truncated_handle_does_not_resolve() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -748,8 +640,6 @@ mod tests {
         let required = tool.parameters.get("required").unwrap().as_array().unwrap();
         assert_eq!(required.len(), 1);
         assert!(required.iter().any(|v| v.as_str() == Some("image")));
-        // The description must steer the model to use it for re-viewing earlier
-        // conversation images (the whole point of the tool).
         let lower = tool.description.to_lowercase();
         assert!(
             lower.contains("view") || lower.contains("see"),
@@ -758,12 +648,6 @@ mod tests {
         );
     }
 
-    /// The exact pipeline `execute_view_image` runs (minus arg-parsing + the DB
-    /// event fetch): resolve a `thread:N` ref to a `ChatImage`, decode it, and
-    /// re-encode via `encode_image_for_read`. The result MUST be an
-    /// `[IMAGE_CONTENT:…]` sentinel that the agentic loop's
-    /// `parse_image_content_marker` lifts into a real vision block — otherwise
-    /// the model never actually sees the re-loaded image.
     #[test]
     fn view_image_pipeline_produces_a_vision_sentinel() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -829,7 +713,7 @@ mod tests {
 
     #[test]
     fn generated_image_marker_format() {
-        let b64 = "dGVzdA=="; // "test" in base64
+        let b64 = "dGVzdA==";
         let output = generated_image_result(b64, "Image generated.");
         let split = crate::engine::agentic_loop::split_tool_result(&output);
         assert_eq!(split.images, vec![b64.to_string()]);
@@ -878,8 +762,6 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("path")));
     }
 
-    /// The examples teach the data path the agent later links in chat, which
-    /// the tools resolve without nesting it under `artifacts/` twice.
     #[test]
     fn save_path_examples_are_data_paths() {
         let save_thread_image = get_save_thread_image_tool();
@@ -895,8 +777,6 @@ mod tests {
 
     #[test]
     fn looks_like_description_prompt_blocks_describe_variants() {
-        // Real prompts observed in the wild — the LLM mistaking generate_image
-        // for a vision/analysis tool.
         let blocked = [
             "describe this image in detail",
             "Describe the screenshot",
@@ -926,8 +806,6 @@ mod tests {
 
     #[test]
     fn looks_like_description_prompt_allows_real_generation_prompts() {
-        // Genuine generation prompts that happen to contain the trigger
-        // words mid-sentence — should still be allowed through.
         let allowed = [
             "a robot describing a painting in a museum",
             "a chart that summarizes Q3 revenue",
@@ -951,12 +829,6 @@ mod tests {
         use crate::llm::tools::get_image_generation_tool;
         let tool = get_image_generation_tool();
         let lower = tool.description.to_lowercase();
-        // Must contain a clear NOT-a-vision-tool warning. Asserting on a
-        // single marker substring (rather than just "describe" + "not"
-        // anywhere in the text) prevents regressions like "Generates
-        // images. Describes nothing." from passing the gate. The exact
-        // wording is part of the contract — change the marker here AND
-        // the description text together.
         const REQUIRED: &[&str] = &["not a vision", "not for"];
         assert!(
             REQUIRED.iter().any(|m| lower.contains(m)),
@@ -965,8 +837,6 @@ mod tests {
             REQUIRED,
             tool.description
         );
-        // And it must mention the alternative — "describe directly" / native
-        // vision — otherwise the LLM has nowhere to redirect the request.
         assert!(
             lower.contains("describe") && lower.contains("directly"),
             "tool description must instruct the model to describe images \

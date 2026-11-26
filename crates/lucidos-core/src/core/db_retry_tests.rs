@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use super::*;
 use crate::test_support::server_error;
 
-/// The error from the report: Postgres restarted and closed the socket.
 fn eof() -> sqlx::Error {
     sqlx::Error::Io(IoError::new(
         ErrorKind::UnexpectedEof,
@@ -26,8 +25,6 @@ fn a_lost_connection_is_transient() {
     }
 }
 
-/// 57P01 is a terminated backend, 57P02 a crash restart, 57P03 a server
-/// still recovering, and 08006 a connection failure.
 #[test]
 fn a_server_error_of_a_transient_class_is_transient() {
     for code in [
@@ -49,8 +46,6 @@ fn a_deterministic_error_is_not_transient() {
     assert!(!is_transient(&sqlx::Error::RowNotFound));
 }
 
-/// The acquire already waited its full timeout, so two more attempts would
-/// only triple how long the turn hangs before it fails.
 #[test]
 fn a_timed_out_acquire_is_not_retried() {
     assert!(!is_transient(&sqlx::Error::PoolTimedOut));
@@ -93,7 +88,6 @@ async fn a_connection_that_stays_down_fails_after_the_last_attempt() {
     .await;
     assert!(matches!(outcome, Err(sqlx::Error::Io(_))));
     assert_eq!(calls.load(Ordering::SeqCst), READ_ATTEMPTS);
-    // Each pause doubles the one before, and none follows the last attempt.
     let pauses: Duration = (0..READ_ATTEMPTS - 1)
         .map(|i| FIRST_PAUSE * 2u32.pow(i))
         .sum();

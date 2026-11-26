@@ -1,5 +1,3 @@
-//! Classified diagnostic records shared by Lucidos processes.
-
 extern crate self as lucidos_diagnostic_log;
 
 pub mod bundle;
@@ -12,16 +10,12 @@ pub mod stderr;
 mod values;
 pub mod writer;
 
-/// The desktop client output captured for diagnostic bundles.
 pub const CLIENT_LOG_DIR: &str = "client-diagnostic-log";
 
-/// The relaunch watcher output captured for diagnostic bundles.
 pub const CLIENT_RELAUNCH_LOG_DIR: &str = "client-relaunch-diagnostic-log";
 
-/// Separate live records written by the packaged desktop client.
 pub const CLIENT_LIFECYCLE_DIR: &str = "client-lifecycle-log";
 
-/// The packaged desktop service passes its app-data directory to its gateway.
 pub const DESKTOP_GATEWAY_DATA_ENV: &str = "LUCIDOS_DESKTOP_GATEWAY_DATA";
 
 pub use lucidos_diagnostic_log_macros::{line, log};
@@ -37,8 +31,6 @@ pub enum Destination {
     Owner,
 }
 
-/// Every field remains classified on disk; no cached rendered message is
-/// trusted when preparing a maintainer bundle.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "kebab-case")]
 pub enum Fragment {
@@ -94,7 +86,6 @@ impl Line {
         }
     }
 
-    /// Bound structured payloads as well as cached text before queuing them.
     pub(crate) fn bounded(self) -> Self {
         match self {
             Self::Typed {
@@ -183,13 +174,10 @@ pub fn record(label: &'static str, line: Line) {
     }
 }
 
-/// Wait at most `timeout` for records already queued. A process without a sink
-/// has nothing to flush. Used at process exit, including fatal boot failures.
 pub fn flush(timeout: std::time::Duration) -> bool {
     SINK.get().is_none_or(|sink| sink.flush(timeout))
 }
 
-/// The hook also calls the previous hook, preserving the host's panic output.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -205,14 +193,12 @@ pub fn install_panic_hook() {
         let file = location.map(|loc| loc.file()).unwrap_or("unknown");
         let row = location.map(|loc| loc.line()).unwrap_or(0);
         record("Panic", panic_line(thread_name, file, row, message));
-        // A fatal main-thread panic must not exit with its record still queued.
         flush(std::time::Duration::from_secs(1));
         previous(info);
     }));
 }
 
 fn panic_line(thread_name: &str, file: &str, row: u32, message: &str) -> Line {
-    // Thread names and locations originate in code; the payload is private.
     Line::typed(
         "panic",
         vec![

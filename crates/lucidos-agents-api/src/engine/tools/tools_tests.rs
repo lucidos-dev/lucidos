@@ -1,9 +1,3 @@
-//! Validation-path tests for `query_events_impl`, the dereference half of the
-//! event-address surface.
-//!
-//! Most handlers can be exercised with just a Postgres pool and `EventBus`.
-//! Grouped tool tests also exercise the engine's action dispatch.
-
 use super::{
     count_events_impl, merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid,
     parse_send_notification_args, parse_source_arg, parse_status_arg, pending_scope_arg,
@@ -38,8 +32,6 @@ fn parse_source_arg_collapses_blank_inputs() {
     assert_eq!(parse_source_arg(Some(&json!(42))), None);
 }
 
-/// The schema advertises an array, but a model that has just used `source`
-/// will reach for a comma-separated string. Both are the same request.
 #[test]
 fn parse_status_arg_takes_an_array_or_a_comma_separated_string() {
     let from_array = parse_status_arg(&json!({"status": ["running", "failed"]}))
@@ -60,9 +52,6 @@ fn parse_status_arg_is_absent_when_the_model_omits_it() {
         .is_empty());
 }
 
-/// A status the model invented must come back as something it can correct. A
-/// filter that silently matches nothing would have it report an empty
-/// workspace.
 #[test]
 fn parse_status_arg_refuses_a_value_the_model_invented() {
     let err =
@@ -83,8 +72,6 @@ fn parse_status_arg_refuses_a_value_the_model_invented() {
     }
 }
 
-/// Two answers to one question, so the model is told to pick one rather than
-/// being handed the intersection of them.
 #[test]
 fn parse_status_arg_refuses_status_alongside_active() {
     let err = parse_status_arg(&json!({"active": true, "status": ["running"]}))
@@ -117,10 +104,6 @@ fn status_filter_arg_prefers_explicit_statuses_and_falls_back_to_active() {
     ));
 }
 
-/// Insert a raw thread event directly into the events table, bypassing the
-/// EventBus. The keep handler queries by `(id, aggregate_id, event_type)`
-/// — that's the entire fixture surface we need to drive the validation
-/// branches.
 async fn insert_thread_event(
     pool: &PgPool,
     event_id: Uuid,
@@ -141,19 +124,10 @@ async fn insert_thread_event(
     .expect("insert thread event");
 }
 
-// ============================================================================
-// `query_events_impl`: read-by-id, the dereference half of ADR 0085
-// ============================================================================
-
-/// A caller thread for the tests that pass no `thread_id`. Only the `current`
-/// alias reads it, and these tests do not use the alias.
 fn some_caller() -> Uuid {
     Uuid::new_v4()
 }
 
-/// The three spellings of one address must all reach the same row. The `evt-`
-/// form is what a tool result states, and the two bare forms are what a
-/// `query_events` result or a log line hands back.
 #[tokio::test]
 async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
     let (pool, db) = setup_test_db().await;
@@ -161,7 +135,6 @@ async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
     let thread_id = Uuid::new_v4();
     let wanted = Uuid::new_v4();
     insert_thread_event(&pool, wanted, thread_id, "ToolResult", json!({"r": "hit"})).await;
-    // A decoy the newest-first window would otherwise return first.
     insert_thread_event(
         &pool,
         Uuid::new_v4(),
@@ -189,9 +162,6 @@ async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
     teardown_test_db(&db).await;
 }
 
-/// `query_events` hands stored payloads to the model. A task's output or a
-/// trigger summary written before the write-time mask can hold a raw
-/// credential, so the read masks it against the store.
 #[tokio::test]
 async fn query_events_masks_a_stored_credential_in_any_payload() {
     let (pool, db) = setup_test_db().await;
@@ -239,10 +209,6 @@ async fn query_events_masks_a_stored_credential_in_any_payload() {
     teardown_test_db(&db).await;
 }
 
-/// THE point of the dereference. The address a tool result states is its
-/// CALL's id, because that is the form a keep takes. What the sweep dropped is
-/// the RESULT, so reading the call must bring it back. One row of arguments
-/// would be the half the agent still remembers.
 #[tokio::test]
 async fn dereferencing_a_tool_call_brings_back_its_result() {
     let (pool, db) = setup_test_db().await;
@@ -265,8 +231,6 @@ async fn dereferencing_a_tool_call_brings_back_its_result() {
         json!({"name": "run_bash", "result": "total 4", "tool_called_event_id": call}),
     )
     .await;
-    // A second call's result, to prove the pairing is by id and not by
-    // "the next ToolResult in the thread".
     insert_thread_event(
         &pool,
         Uuid::new_v4(),
@@ -293,8 +257,6 @@ async fn dereferencing_a_tool_call_brings_back_its_result() {
     teardown_test_db(&db).await;
 }
 
-/// An orphan call has no result to add, which is an answer rather than a
-/// failure: the engine crashed mid-tool, and the call really is all there is.
 #[tokio::test]
 async fn dereferencing_an_orphan_call_returns_the_call_alone() {
     let (pool, db) = setup_test_db().await;
@@ -314,9 +276,6 @@ async fn dereferencing_an_orphan_call_returns_the_call_alone() {
     teardown_test_db(&db).await;
 }
 
-/// The pair is added only for a by-id dereference. A windowed query full of
-/// `ToolCalled` rows must return exactly what it matched, or `limit` would
-/// stop meaning what it says.
 #[tokio::test]
 async fn a_windowed_query_never_pulls_in_paired_results() {
     let (pool, db) = setup_test_db().await;
@@ -344,9 +303,6 @@ async fn a_windowed_query_never_pulls_in_paired_results() {
     teardown_test_db(&db).await;
 }
 
-/// A pointer that resolves to nothing fails loudly. An empty window would
-/// read to the agent as "the event is gone", which is a different claim and
-/// the wrong one to act on.
 #[tokio::test]
 async fn query_events_errors_when_an_address_resolves_to_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -364,8 +320,6 @@ async fn query_events_errors_when_an_address_resolves_to_nothing() {
         out
     );
 
-    // Same when a contradicting filter is what excluded it, and the message
-    // says so, because the id itself is fine in that case.
     let present = Uuid::new_v4();
     let thread_id = Uuid::new_v4();
     insert_thread_event(&pool, present, thread_id, "ToolResult", json!({})).await;
@@ -385,9 +339,6 @@ async fn query_events_errors_when_an_address_resolves_to_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// A malformed address is refused, never dropped. Ignoring it would widen a
-/// one-row lookup into the newest 50 events of every type. The agent would
-/// then read that window as the event it asked for.
 #[tokio::test]
 async fn query_events_refuses_a_malformed_address_rather_than_widening() {
     let (pool, db) = setup_test_db().await;
@@ -400,7 +351,6 @@ async fn query_events_refuses_a_malformed_address_rather_than_widening() {
             out
         );
     }
-    // A non-string must not fall down the "absent" arm either.
     let out = query_events_impl(&pool, &json!({"event_id": ["deadbeef"]}), some_caller()).await;
     assert!(
         matches!(&out, Err(msg) if msg.contains("is not an event address")),
@@ -412,9 +362,6 @@ async fn query_events_refuses_a_malformed_address_rather_than_widening() {
     teardown_test_db(&db).await;
 }
 
-/// Read-by-id inherits the byte budget. The row a pointer names is usually a
-/// `ToolResult`, which is exactly the row that runs to megabytes. Returning
-/// one unconditionally is how a dereference blows the next turn's prompt.
 #[tokio::test]
 async fn query_events_by_id_still_honours_the_byte_limit() {
     let (pool, db) = setup_test_db().await;
@@ -450,8 +397,6 @@ async fn query_events_by_id_still_honours_the_byte_limit() {
     teardown_test_db(&db).await;
 }
 
-/// An app or trigger can key a payload by a stored credential. The model reads
-/// stored rows through `query_events`, so the key must reach it masked.
 #[tokio::test]
 async fn query_events_masks_a_stored_secret_used_as_a_key() {
     let (pool, db) = setup_test_db().await;
@@ -488,9 +433,6 @@ async fn query_events_masks_a_stored_secret_used_as_a_key() {
     teardown_test_db(&db).await;
 }
 
-/// Absent `event_id`, the query behaves exactly as it always did. Every
-/// caller predating the argument passes nothing, so the filter can only
-/// narrow, never widen or reorder.
 #[tokio::test]
 async fn query_events_without_an_address_is_unchanged() {
     let (pool, db) = setup_test_db().await;
@@ -518,10 +460,6 @@ async fn query_events_without_an_address_is_unchanged() {
     teardown_test_db(&db).await;
 }
 
-/// `thread_id: "current"` cost a whole round every time the model guessed it,
-/// because reading your own thread back is the commonest reason to call this.
-/// The alias resolves from the tool-execution context, so the model cannot aim
-/// it at another conversation.
 #[tokio::test]
 async fn thread_id_current_reads_the_calling_thread() {
     let (pool, db) = setup_test_db().await;
@@ -561,9 +499,6 @@ async fn thread_id_current_reads_the_calling_thread() {
     teardown_test_db(&db).await;
 }
 
-/// The alias is the only string that is not an id. Every other guard stands:
-/// a bad uuid and a non-string are still refused, never widened to every
-/// thread. The refusal now states the alias, which is the one-step answer.
 #[tokio::test]
 async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
     let (pool, db) = setup_test_db().await;
@@ -580,8 +515,6 @@ async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
         );
     }
 
-    // A non-string must not fall down the "absent" arm, which would widen the
-    // query to every thread.
     for bad in [
         json!([caller.to_string()]),
         json!({"id": "current"}),
@@ -598,14 +531,6 @@ async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
     pool.close().await;
     teardown_test_db(&db).await;
 }
-
-// ============================================================================
-// `send_notification`: the tap's thread id
-//
-// A notification is written AND pushed. So a tap naming no real thread is a
-// dead deep link on a device that cannot ask what was meant. The reader meets
-// it as `Thread "<id>" no longer exists`, which is how the alias bug surfaced.
-// ============================================================================
 
 fn tap_thread_id(args: &serde_json::Value, caller: Uuid) -> Option<String> {
     let parsed = parse_send_notification_args(args, caller).expect("args must parse");
@@ -625,8 +550,6 @@ fn notify_args(tap_id: &str) -> serde_json::Value {
     })
 }
 
-/// The model reaches for `current` because the sibling `events` tool takes it.
-/// The slot used to store the word, so the tap pointed at no thread at all.
 #[test]
 fn a_tap_naming_the_current_thread_stores_its_uuid() {
     let caller = Uuid::new_v4();
@@ -639,9 +562,6 @@ fn a_tap_naming_the_current_thread_stores_its_uuid() {
     }
 }
 
-/// The resolved tap and the row's own `thread_id` column must be the same
-/// thread. The column drives the inbox card's "Open thread" button, so a tap
-/// resolving elsewhere would send the two buttons to different places.
 #[test]
 fn the_resolved_tap_matches_the_notification_s_own_thread() {
     let caller = Uuid::new_v4();
@@ -653,8 +573,6 @@ fn the_resolved_tap_matches_the_notification_s_own_thread() {
     );
 }
 
-/// Anything that is neither the alias nor a uuid is refused, so the model can
-/// correct it in the same turn. Storing it means the user finds out by tapping.
 #[test]
 fn a_tap_thread_id_that_names_nothing_is_refused() {
     let caller = Uuid::new_v4();
@@ -667,8 +585,6 @@ fn a_tap_thread_id_that_names_nothing_is_refused() {
     }
 }
 
-/// The unset tap derives from engine-stamped uuids, so the guard must not have
-/// made the ordinary notification refusable.
 #[test]
 fn the_derived_tap_still_passes_the_guard() {
     let caller = Uuid::new_v4();
@@ -688,8 +604,6 @@ fn the_derived_tap_still_passes_the_guard() {
     );
 }
 
-/// Only the engine writes an "Undo restore" tap. A model that could write one
-/// would put any snapshot behind the undo confirmation.
 #[test]
 fn a_restore_snapshot_tap_is_refused() {
     let args = json!({
@@ -705,15 +619,6 @@ fn a_restore_snapshot_tap_is_refused() {
         out.err()
     );
 }
-
-// ============================================================================
-// `build_query_events_response` — byte-budget + wrapper shape
-//
-// Pure synchronous fn that fans the LLM-tool result through a compact-JSON
-// budget. No DB needed — we feed `EventRow`s directly. Motivating bug: a
-// single `query_events(event_type=ToolResult, limit=300)` returned 2.3 MB
-// and blew the 1M-token prompt cap on the next turn.
-// ============================================================================
 
 mod build_query_events_response_tests {
     use crate::core::EventRow;
@@ -733,9 +638,6 @@ mod build_query_events_response_tests {
         }
     }
 
-    /// Plenty of budget → every event passes through. `truncated:false`, no
-    /// `hint`. The wrapper shape is the contract — the LLM tool description
-    /// promises it, so keep this test load-bearing.
     #[test]
     fn returns_full_set_when_under_budget() {
         let events = vec![row("Small", 10), row("Small", 10), row("Small", 10)];
@@ -748,9 +650,6 @@ mod build_query_events_response_tests {
         assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
     }
 
-    /// Stop on the first event that doesn't fit; include everything before.
-    /// `truncated:true` plus a non-empty `hint` is the LLM's signal to
-    /// narrow the next call.
     #[test]
     fn stops_mid_list_when_byte_limit_hit() {
         let events = vec![
@@ -759,7 +658,6 @@ mod build_query_events_response_tests {
             row("Huge", 50_000),
             row("Tiny", 10),
         ];
-        // Enough room for the two small events but not the 50 KB blob.
         let out = build_query_events_response(&events, 1_000, None);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
         assert_eq!(parsed["total_matching"], 4);
@@ -768,9 +666,6 @@ mod build_query_events_response_tests {
         assert!(parsed["hint"].as_str().unwrap().contains("narrow"));
     }
 
-    /// A first event larger than the entire budget must return zero events,
-    /// `truncated:true`, and a hint — never an unbounded blob, never a
-    /// silent empty array that looks like "no matching events".
     #[test]
     fn empty_events_when_first_alone_exceeds_budget() {
         let events = vec![row("Huge", 50_000)];
@@ -783,15 +678,6 @@ mod build_query_events_response_tests {
         assert!(parsed["hint"].is_string());
     }
 
-    /// The truncation hint must only name arguments `query_events` accepts.
-    ///
-    /// It used to say "Narrow by aggregate_id". `aggregate_id` is a real
-    /// column on the `events` table but NOT an argument of this tool, so a
-    /// model following the advice re-issued the same query with an ignored
-    /// parameter and got the identical truncated result. The events table's
-    /// other non-argument columns are checked too, because that is the reach
-    /// that produced the bug: someone read the schema of the storage and
-    /// mistook it for the schema of the tool.
     #[test]
     fn truncation_hint_names_only_real_query_arguments() {
         let events_domain = crate::capability_manifest::domain_for_tool("events")
@@ -825,8 +711,6 @@ mod build_query_events_response_tests {
             );
         }
 
-        // Columns of the `events` table that are NOT query arguments. Reaching
-        // for one of these in the hint is the exact mistake being guarded.
         for column in ["aggregate", "aggregate_id", "thread_id", "sequence"] {
             assert!(
                 !crate::engine::tools::QUERY_EVENTS_TRUNCATION_HINT.contains(column),
@@ -836,7 +720,6 @@ mod build_query_events_response_tests {
         }
     }
 
-    /// The widest liveness header the engine writes.
     fn widest_liveness() -> crate::engine::thread_liveness::ThreadLiveness {
         use crate::engine::thread_liveness::*;
         ThreadLiveness {
@@ -857,8 +740,6 @@ mod build_query_events_response_tests {
         }
     }
 
-    /// The header leads the result, stays within 256 bytes, and takes
-    /// nothing from the event window `byte_limit` buys.
     #[test]
     fn the_liveness_header_leads_is_small_and_costs_no_events() {
         let liveness = widest_liveness();
@@ -888,7 +769,6 @@ mod build_query_events_response_tests {
             .is_none());
     }
 
-    /// Empty store input round-trips to an empty array with no hint.
     #[test]
     fn empty_input_yields_empty_array_no_hint() {
         let out = build_query_events_response(&[], 100_000, None);
@@ -901,9 +781,6 @@ mod build_query_events_response_tests {
         assert_eq!(parsed["events"].as_array().unwrap().len(), 0);
     }
 
-    /// The whole point of the byte budget is to keep the wire small. Verify
-    /// the output is compact (no pretty-print whitespace) — the original
-    /// bug was a `to_string_pretty` call that inflated every result ~30%.
     #[test]
     fn output_is_compact_json_not_pretty_printed() {
         let events = vec![row("Tiny", 10)];
@@ -915,13 +792,6 @@ mod build_query_events_response_tests {
         );
     }
 
-    /// Pin the per-call caps that gate `query_events`. The May 25
-    /// workspace-learning trigger sent 1.54 M tokens to a 1 M-cap Opus
-    /// API after chaining 8 calls at the prior (looser) defaults
-    /// (`limit: 300/500`, `byte_limit: 256 KB`). The tightened bounds
-    /// must not silently regress in a future "let me bump this for
-    /// flexibility" refactor — the LLM cannot enforce its own
-    /// discipline if the schema lets it bypass.
     #[test]
     fn query_events_caps_match_workspace_learning_recipe() {
         use crate::engine::tools::{QUERY_EVENTS_BYTE_BUDGET, QUERY_EVENTS_LIMIT};
@@ -932,18 +802,8 @@ mod build_query_events_response_tests {
     }
 }
 
-// ============================================================================
-// `parse_required_uuid`: the required-UUID guard behind `apply_change`'s
-// `change_id` and `apply_when_settled`'s `thread_id`.
-//
-// Pure synchronous fn (factored out of the handler so these validation
-// branches need no engine). The handler refuses to call the heavyweight
-// `LucidosEngine::apply_change` merge pipeline without a well-formed target.
-// ============================================================================
-
 #[test]
 fn apply_change_rejects_missing_change_id() {
-    // Missing, null, empty, and whitespace-only all collapse to "required".
     for bad in [
         json!({}),
         json!({"change_id": null}),
@@ -970,21 +830,10 @@ fn apply_change_rejects_malformed_change_id() {
 #[test]
 fn apply_change_accepts_valid_uuid_trimming_whitespace() {
     let id = Uuid::new_v4();
-    // Surrounding whitespace is trimmed before parsing — the LLM occasionally
-    // pads string args.
     let out = parse_required_uuid(&json!({"change_id": format!("  {id}  ")}), "change_id");
     assert_eq!(out.expect("valid padded UUID must parse"), id);
 }
 
-// ============================================================================
-// `apply_refusal_message`: what the `changes` tool says when the shared gate
-// refuses an Apply. The rule itself lives in `api::changes`; this is only the
-// wording, and the wording decides whether the agent does the right next thing.
-// ============================================================================
-
-/// A settling thread gets pointed at the standing apply. The panel calls that
-/// affordance "Apply on settle". It is the one answer that lands the
-/// user's change without the agent asking again.
 #[test]
 fn a_refusal_for_a_settling_thread_names_apply_when_settled() {
     use crate::api::changes::ChangeActionRefusal;
@@ -998,13 +847,6 @@ fn a_refusal_for_a_settling_thread_names_apply_when_settled() {
     );
 }
 
-/// The other three refusals must NOT name it, not even to forbid it.
-///
-/// A thread parked on a question is the one that bites: it reads as unsettled, so a
-/// bool-shaped gate pointed at a standing apply there. `standing_verdict`
-/// drops the arm on its first look, which costs the user a report and applies
-/// nothing. The bare absence is the assertion on purpose. A model reading
-/// "do NOT use X" still has X in front of it.
 #[test]
 fn a_refusal_that_waiting_cannot_fix_does_not_name_apply_when_settled() {
     use crate::api::changes::ChangeActionRefusal;
@@ -1108,10 +950,6 @@ fn thread_queue_policy_patch_rejects_unknown_fields() {
     );
 }
 
-/// `my_children` resolves to the CALLER's ambient thread id, never to anything
-/// the model supplies. There is no `parent` argument on the LLM surface to
-/// supply, which is the point: a model asking for "my children" cannot name a
-/// thread that is not its own.
 #[test]
 fn my_children_resolves_to_the_ambient_caller_thread() {
     let caller = Uuid::new_v4();
@@ -1132,8 +970,6 @@ fn my_children_resolves_to_the_ambient_caller_thread() {
         "omitted is no filter"
     );
 
-    // A model that invents a `parent` argument gets no filter at all rather
-    // than a listing of someone else's children.
     let someone_else = Uuid::new_v4();
     assert_eq!(
         parent_filter_arg(&json!({"parent": someone_else.to_string()}), caller),
@@ -1150,8 +986,6 @@ fn my_children_resolves_to_the_ambient_caller_thread() {
     );
 }
 
-/// `current` names the calling thread; a bad id or a non-string is refused
-/// rather than silently listing every change.
 #[test]
 fn sub_threads_of_resolves_current_and_refuses_the_rest() {
     use crate::core::changes::PendingScope;
@@ -1177,9 +1011,6 @@ fn sub_threads_of_resolves_current_and_refuses_the_rest() {
     }
 }
 
-/// An agent's archive names every member it left open, pinned sub-threads
-/// included (ADR 0312). Only a target left open is an error. An already
-/// archived target with a pinned sub-thread left open is a success.
 #[test]
 #[allow(
     clippy::field_reassign_with_default,
@@ -1218,8 +1049,6 @@ fn an_agent_archive_names_what_it_left_open() {
     assert!(left_open.contains("was left open"), "{left_open}");
 }
 
-/// `change_state` takes a change state kind. The retired `has_diff` is refused
-/// by name, so an old caller is told rather than handed every thread.
 #[test]
 fn the_change_state_filter_refuses_has_diff_and_unknown_kinds() {
     use crate::engine::thread_lifecycle::ChangeStateKind;
@@ -1236,8 +1065,6 @@ fn the_change_state_filter_refuses_has_diff_and_unknown_kinds() {
     assert!(unknown.contains("none, unproposed, proposed"), "{unknown}");
 }
 
-/// A filter the model spells wrongly is refused, never read as "no filter":
-/// that would answer with the whole workspace.
 #[test]
 fn a_boolean_filter_arg_refuses_what_is_not_a_boolean() {
     let args = serde_json::json!({
@@ -1280,8 +1107,6 @@ fn a_date_only_time_bound_is_refused_not_dropped() {
     );
 }
 
-/// A model that still calls the retired `execute_intent` learns the
-/// replacement, with its intent id, rather than "Unknown tool".
 #[test]
 fn a_call_to_execute_intent_is_refused_with_its_replacement() {
     use crate::llm::tool_names as tn;
@@ -1302,11 +1127,6 @@ fn a_call_to_execute_intent_is_refused_with_its_replacement() {
     }
 }
 
-// ============================================================================
-// `count_events_impl`: a thread-scoped count
-// ============================================================================
-
-/// Seed `mine` with two `Counted` rows and `other` with one, then count.
 async fn count_with(args: serde_json::Value, caller: Uuid, mine: Uuid) -> Result<String, String> {
     let (pool, db) = setup_test_db().await;
     let other = Uuid::new_v4();
@@ -1323,10 +1143,6 @@ async fn count_with(args: serde_json::Value, caller: Uuid, mine: Uuid) -> Result
     out
 }
 
-/// The incident's read, replayed through the tool: a thread mid-handoff whose
-/// newest row is a tool error. The result leads with `working`, which
-/// contradicts "the handoff failed" on the spot. A count says the same, and a
-/// read spanning every thread carries no header.
 #[tokio::test]
 async fn a_thread_scoped_read_leads_with_the_threads_liveness() {
     use crate::engine::event_bus::{BusEvent, EventBus};
@@ -1537,8 +1353,6 @@ async fn count_events_without_a_thread_counts_every_thread() {
     assert_eq!(parsed["count"], 3);
 }
 
-/// A bad id is refused. Reading it as absent would hand back the workspace
-/// total under a thread's name.
 #[tokio::test]
 async fn count_events_refuses_a_malformed_thread_id() {
     for bad in [json!("not-a-uuid"), json!(["x"]), json!(7)] {
@@ -1552,7 +1366,6 @@ async fn count_events_refuses_a_malformed_thread_id() {
     }
 }
 
-/// Insert a `changes` row naming `thread`, or none.
 async fn insert_change(pool: &PgPool, thread: Option<Uuid>) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -1603,8 +1416,6 @@ async fn the_change_gate_aims_at_the_workspace_when_the_probe_cannot_run() {
     teardown_test_db(&db).await;
 }
 
-/// Every flat per-verb name still reaches a handler, which refuses the empty
-/// arguments in its own words rather than answering "Unknown tool".
 #[tokio::test]
 async fn the_flat_back_compat_tool_names_still_dispatch() {
     use super::ToolDispatchExt;
@@ -1649,8 +1460,6 @@ async fn the_flat_back_compat_tool_names_still_dispatch() {
     teardown_test_db(&db).await;
 }
 
-/// `current` resolves from the thread the tool runs in. An id the model slips
-/// into the arguments does not move it.
 #[tokio::test]
 async fn the_event_tools_resolve_current_from_the_dispatching_thread() {
     use super::ToolDispatchExt;

@@ -1,9 +1,6 @@
-//! An atomic emit writes all of its events in one transaction, or none.
-
 use super::*;
 use crate::test_support::refuse_event_type;
 
-/// Split a `thread_message` into the pair `emit_atomically` takes.
 fn message_pair(thread_id: Uuid, text: &str) -> (ThreadEvent, EventMeta) {
     match thread_message(thread_id, None, text) {
         BusEvent::Thread { event, meta, .. } => (event, meta),
@@ -115,7 +112,6 @@ async fn a_suppressed_event_drops_the_whole_atomic_emit() {
     let thread_id = Uuid::new_v4();
     emit_thread_message(&bus, thread_id, None, "start").await;
 
-    // No read was requested, so Validate drops this sighting.
     let stale_sighting = (
         ThreadEvent::ThreadReplySeen {
             seen_version: 999,

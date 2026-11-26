@@ -24,8 +24,8 @@ looking for `manifest.toml`:
   Flat (`<plugin-id>/manifest.toml`) or one grouping level
   (`plugins/<plugin-id>/manifest.toml`) both work; flat is preferred because the
   generated install URL is shorter.
-- **At depth 0, the seven content-dir names (`apps`, `knowhow`, `triggers`,
-  `scripts`, `auth-modules`, `themes`, `fonts`) are skipped.** That guard stops
+- **At depth 0, the eight content-dir names (`apps`, `knowhow`, `triggers`,
+  `hooks`, `scripts`, `auth-modules`, `themes`, `fonts`) are skipped.** That guard stops
   a single-plugin repo (manifest at the root) from also reporting its own
   `apps/` as a candidate.
 - **At every depth, the walk skips hidden directories and build-output
@@ -43,7 +43,7 @@ looking for `manifest.toml`:
 
 **Root-level files that are not plugin directories are ignored.** A README,
 `CODEOWNERS`, `.github/`, `LICENSE`, `.gitignore` at the *marketplace* root are
-fine. The strict "only `manifest.toml` + the seven content dirs" validation
+fine. The strict "only `manifest.toml` + the eight content dirs" validation
 applies **inside a plugin root**, not to the marketplace repo. Use the root
 README as the human discovery index, as `lucidos-dev/plugins` does.
 

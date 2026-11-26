@@ -1,11 +1,3 @@
-//! Themes: named sets of design-token values that retune how Lucidos looks.
-//!
-//! A theme is a JSON file, `data/themes/<id>.json`, or one of the built-ins
-//! bundled below. It carries tokens only, never CSS. The engine is the one place
-//! that validates a theme and fills in derived tokens. Every surface (the shell,
-//! its boot script, app frames) applies the resolved map it is handed.
-//! Design: `docs/plans/2026-09-26-looks.md`, ADR 0296.
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::LazyLock;
@@ -26,21 +18,15 @@ mod protected;
 
 pub use parts::THEME_PARTS_CATALOG_JSON;
 
-/// The protected code font, emitted beside the colour palette.
 const PROTECTED_FONT_MONO_TOKEN: &str = "--protected-font-mono";
 const TEXT_STRONG_TOKEN: &str = "--text-strong";
 
-/// The `data/` subdirectory, and plugin content folder, that holds themes.
 pub const THEMES_DIR: &str = "themes";
 
-/// The theme mode values. No theme may take one as its id, so a write of
-/// `theme=dark` from code written before the rename is refused, never stored.
 pub const THEME_MODE_VALUES: [&str; 3] = ["light", "dark", "system"];
 
-/// The theme an unset or unknown `theme` preference means: no inline tokens.
 pub const DEFAULT_THEME_ID: &str = "lucidos";
 
-/// The theme token catalog, served verbatim by `GET /api/v1/themes/tokens`.
 pub const THEME_TOKEN_CATALOG_JSON: &str = include_str!("theme-tokens.json");
 
 const BUILT_IN_THEMES: &[(&str, &str)] = &[
@@ -61,26 +47,24 @@ const BUILT_IN_THEMES: &[(&str, &str)] = &[
     ("real-computer", include_str!("builtin/real-computer.json")),
 ];
 
-/// Caps the apply sites in `packages/lucidos-sdk/src/appearance.ts` check
+/// INVARIANT: Caps the apply sites in `packages/lucidos-sdk/src/appearance.ts` check
 /// again. They read these from the generated `theme-parts.ts`.
 const MAX_VALUE_LENGTH: usize = 256;
-/// The most tokens a resolved map may hold, and where every apply site stops.
 pub const MAX_RESOLVED_TOKENS: usize = 200;
 const MAX_ID_LENGTH: usize = 64;
 const MAX_NAME_LENGTH: usize = 80;
 const MAX_TEXT_LENGTH: usize = 400;
 
-/// WCAG's large-text floor. The engine refuses a theme whose text, or part text,
+/// INVARIANT: WCAG's large-text floor. The engine refuses a theme whose text, or part text,
 /// is fainter than this on its background. Above it, the protected palette
 /// repairs protected surfaces.
 const MIN_PAGE_TEXT_CONTRAST: f64 = 3.0;
 
-/// How far a shadow may reach from its box, so no theme can paint over a
+/// INVARIANT: How far a shadow may reach from its box, so no theme can paint over a
 /// neighbour such as an approval card.
 const MAX_SHADOW_REM: f64 = 2.0;
 const PX_PER_REM: f64 = 16.0;
 const MAX_SHADOW_PX: f64 = MAX_SHADOW_REM * PX_PER_REM;
-/// The functions a shadow value may call. Each only names a colour.
 const SHADOW_COLOUR_FUNCTIONS: &[&str] = &[
     "rgb",
     "rgba",
@@ -94,7 +78,6 @@ const SHADOW_COLOUR_FUNCTIONS: &[&str] = &[
     "color",
     "color-mix",
 ];
-/// The catalog kind whose values `validate_shadow_reach` checks.
 const SHADOW_KIND: &str = "shadow";
 
 static TOKEN_NAME_RE: LazyLock<Regex> =
@@ -105,14 +88,10 @@ static VALUE_BANNED_RE: LazyLock<Regex> = LazyLock::new(|| {
 static THEME_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*$").expect("static regex"));
 
-/// Custom property name to value, ordered so every serialisation is stable.
 pub type TokenMap = BTreeMap<String, String>;
 
-/// The code font's token, which `fonts.mono` fills.
 const FONT_MONO_TOKEN: &str = "--font-mono";
 
-/// Tokens that carry the user's UI font. A theme suggests one with `fonts.ui`
-/// instead, which is what lets the user's explicit pick win over it.
 const UI_FONT_TOKENS: &[&str] = &[
     "--font-ui",
     "--font-family",
@@ -121,15 +100,11 @@ const UI_FONT_TOKENS: &[&str] = &[
     "--font-features-code",
 ];
 
-/// The fonts a theme suggests, by font catalog id (`core::fonts`) or workspace
-/// font id (`core::workspace_fonts`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThemeFonts {
-    /// The UI font. It applies only on a device whose `font-family` is `theme`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<String>,
-    /// The code font. It fills `--font-mono`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mono: Option<String>,
 }
@@ -140,8 +115,6 @@ impl ThemeFonts {
     }
 }
 
-/// The family a theme belongs to. The picker draws one section per family, in
-/// declaration order, so similar themes sit together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThemeFamily {
@@ -151,7 +124,6 @@ pub enum ThemeFamily {
     Neutral,
 }
 
-/// The theme mode a map applies in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThemeMode {
@@ -168,8 +140,6 @@ impl ThemeMode {
     }
 }
 
-/// One mode's map: its tokens, and the parts that apply in that mode only.
-/// `parts` is the one key that is not a custom property name.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ThemeModeMap {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -178,7 +148,6 @@ pub struct ThemeModeMap {
     pub tokens: TokenMap,
 }
 
-/// A theme file as written to disk.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThemeDefinition {
@@ -191,7 +160,6 @@ pub struct ThemeDefinition {
     pub credit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<ThemeFamily>,
-    /// Applies in both modes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: TokenMap,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,7 +168,6 @@ pub struct ThemeDefinition {
     pub light: Option<ThemeModeMap>,
     #[serde(default, skip_serializing_if = "ThemeFonts::is_empty")]
     pub fonts: ThemeFonts,
-    /// Theme parts, in both modes. A mode's own `parts` win per (part, property).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parts: PartsMap,
 }
@@ -213,7 +180,7 @@ impl ThemeDefinition {
         }
     }
 
-    /// The modes this theme has a map for. A theme with neither applies only its
+    /// INVARIANT: The modes this theme has a map for. A theme with neither applies only its
     /// shared `tokens`, in both modes. A map that holds only parts does not
     /// count, so an effect in one mode never makes the theme single-mode.
     pub fn modes(&self) -> Vec<ThemeMode> {
@@ -244,7 +211,7 @@ pub enum ThemeSource {
     Workspace,
 }
 
-/// The token map each mode paints, derivation already applied, and the fonts
+/// INVARIANT: The token map each mode paints, derivation already applied, and the fonts
 /// the theme suggests. Every client resolves the UI font from `fonts.ui`.
 ///
 /// `fonts` names only fonts that exist and fit their slot. A workspace font
@@ -260,7 +227,6 @@ pub struct ResolvedTheme {
     pub workspace_fonts: Vec<WorkspaceFont>,
 }
 
-/// A theme as the API serves it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Theme {
     pub id: String,
@@ -273,8 +239,6 @@ pub struct Theme {
 
 pub type ThemeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-// --- The token catalog ---
-
 #[derive(Debug, Deserialize)]
 struct Catalog {
     tokens: Vec<CatalogToken>,
@@ -284,7 +248,6 @@ struct Catalog {
 struct CatalogToken {
     name: String,
     kind: String,
-    /// Whether `sdk-iframe.css` defines the token for app frames.
     #[serde(default)]
     frames: bool,
     default: CatalogDefault,
@@ -292,7 +255,6 @@ struct CatalogToken {
     derive: Option<Derivation>,
 }
 
-/// The value `base.css` gives a token in each mode.
 #[derive(Debug, Deserialize)]
 struct CatalogDefault {
     dark: String,
@@ -322,22 +284,16 @@ fn catalog_token(name: &str) -> Option<&'static CatalogToken> {
     CATALOG.tokens.iter().find(|t| t.name == name)
 }
 
-/// The catalog kind of a colour token. Every such token is registered as a
-/// `<color>` with `@property`, so a part colour may name it in `var()`.
 const COLOUR_KIND: &str = "color";
 
-/// Whether `name` is a catalog colour token.
 pub fn is_colour_token(name: &str) -> bool {
     catalog_token(name).is_some_and(|t| t.kind == COLOUR_KIND)
 }
 
-/// Whether `name` is a colour token app frames define. Frames register only
-/// these, so a frame part colour may name only these.
 pub fn is_frame_colour_token(name: &str) -> bool {
     catalog_token(name).is_some_and(|t| t.kind == COLOUR_KIND && t.frames)
 }
 
-/// Every catalog colour token, in catalog order, with whether frames define it.
 fn colour_tokens() -> impl Iterator<Item = (&'static str, bool)> {
     CATALOG
         .tokens
@@ -345,8 +301,6 @@ fn colour_tokens() -> impl Iterator<Item = (&'static str, bool)> {
         .filter(|t| t.kind == COLOUR_KIND)
         .map(|t| (t.name.as_str(), t.frames))
 }
-
-// --- Validation ---
 
 pub fn validate_id(id: &str) -> ThemeResult<()> {
     if THEME_MODE_VALUES.contains(&id) {
@@ -365,8 +319,6 @@ pub fn validate_id(id: &str) -> ThemeResult<()> {
     Ok(())
 }
 
-/// Lowercase letters and digits joined by single hyphens, within the length
-/// cap. The shape a theme id takes, and a font id too.
 pub fn is_well_formed_id(id: &str) -> bool {
     id.len() <= MAX_ID_LENGTH && THEME_ID_RE.is_match(id)
 }
@@ -381,14 +333,12 @@ pub fn is_valid_token_name(name: &str) -> bool {
 
 pub fn is_valid_token_value(value: &str) -> bool {
     let trimmed = value.trim();
-    // UTF-16 units, as JavaScript's `length` counts them at the apply site.
+    // INVARIANT: UTF-16 units, as JavaScript's `length` counts them at the apply site.
     !trimmed.is_empty()
         && trimmed.encode_utf16().count() <= MAX_VALUE_LENGTH
         && !VALUE_BANNED_RE.is_match(trimmed)
 }
 
-/// The catalog token a map key names, or the refusal that says why it is
-/// not one a theme may set.
 fn validate_token_name(label: &str, name: &str) -> ThemeResult<&'static CatalogToken> {
     if name.starts_with(PART_TOKEN_PREFIX) {
         return Err(format!("`{label}`: {name} is a part token. Set parts with `parts`.").into());
@@ -456,16 +406,11 @@ fn validate_map(label: &str, map: &TokenMap) -> ThemeResult<()> {
     Ok(())
 }
 
-/// Whether a colour token's value is a colour. The part grammar reads every
-/// form a part may write, and the evaluator the forms built-in themes use.
 fn is_colour_value(value: &str) -> bool {
     grammar::is_token_colour(value, &is_colour_token)
         || evaluate_in(&TokenMap::new(), ThemeMode::Dark, value).is_some()
 }
 
-/// An alias value as the part grammar reads it. A theme written before parts
-/// may size its glow in `rem` or `px`. A `rem` compiles as the same number of
-/// `em`, and a `px` as that many sixteenths of one.
 fn alias_value(value: &str) -> String {
     static LENGTH_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)(^|[\s(])([+-]?(?:\d+\.?\d*|\.\d+))(rem|px)\b").expect("static regex")
@@ -483,16 +428,13 @@ fn alias_value(value: &str) -> String {
         .into_owned()
 }
 
-/// A shadow may paint at most `MAX_SHADOW_PX` past its box. A layer reaches
-/// its larger offset, plus its spread, plus half its blur, where the blur has
-/// faded to half strength. A value whose reach cannot be read is refused.
 fn validate_shadow_reach(value: &str) -> Result<(), String> {
     for layer in color::split_top_level(value, |c| c == ',') {
         let mut lengths = Vec::new();
         for part in color::split_top_level(layer, char::is_whitespace) {
             let part = part.to_ascii_lowercase();
             if part.contains('(') {
-                // The call must be the whole word: `rgb(0 0 0)999px` hides a
+                // INVARIANT: The call must be the whole word: `rgb(0 0 0)999px` hides a
                 // length behind the colour.
                 match color::function_call(&part) {
                     Some((name, _)) if SHADOW_COLOUR_FUNCTIONS.contains(&name) => continue,
@@ -525,7 +467,7 @@ fn validate_shadow_reach(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// One word of a shadow as a length in px: `None` for a keyword or a colour.
+/// INVARIANT: One word of a shadow as a length in px: `None` for a keyword or a colour.
 /// CSS ends a word's first token at a `+`, and at a sign after a number, so
 /// `0+999px` is two lengths. A word that could hide one is refused.
 fn shadow_length_px(part: &str) -> Result<Option<f64>, String> {
@@ -563,10 +505,6 @@ fn shadow_length_px(part: &str) -> Result<Option<f64>, String> {
     }
 }
 
-/// A font a theme names is a catalog font or a workspace font. Neither makes a
-/// third-party request (ADR 0303, ADR 0308). A catalog font is checked here in
-/// full. A workspace font is checked against the fonts installed where they
-/// are at hand ([`check_installed_fonts`]), so this answers `None` for one.
 fn validate_font(slot: &str, id: &str) -> ThemeResult<Option<&'static FontSpec>> {
     if let Some(font) = fonts::find(id) {
         return Ok(Some(font));
@@ -577,7 +515,6 @@ fn validate_font(slot: &str, id: &str) -> ThemeResult<Option<&'static FontSpec>>
     Err(format!("`fonts.{slot}`: '{id}' is not a font id. GET /api/v1/fonts lists them.").into())
 }
 
-/// The two fonts a theme may suggest.
 #[derive(Debug, Clone, Copy)]
 enum FontSlot {
     Ui,
@@ -662,8 +599,6 @@ pub fn validate_definition(def: &ThemeDefinition) -> ThemeResult<()> {
     validate_fonts(def)?;
     for mode in [ThemeMode::Dark, ThemeMode::Light] {
         validate_readable(&resolve_theme_tokens(def, mode, None), mode)?;
-        // A code font adds one token whichever font it is, so its id stands in
-        // for the stack: the checks below read colours and the count.
         let resolved = resolve_mode(def, mode, def.fonts.mono.as_deref());
         validate_part_contrast(&resolved, mode)?;
         validate_screen_contrast(&resolved, mode)?;
@@ -679,9 +614,6 @@ pub fn validate_definition(def: &ThemeDefinition) -> ThemeResult<()> {
     Ok(())
 }
 
-/// Refuse a theme far enough off to read as hostile: text the page all but
-/// hides, or green and red swapped. A value that cannot be evaluated is left
-/// to the protected palette, which falls back to the default theme for it.
 fn validate_readable(tokens: &TokenMap, mode: ThemeMode) -> ThemeResult<()> {
     let colour = |token: &str| colour_in(tokens, mode, token);
     let m = mode.label();
@@ -710,10 +642,9 @@ fn validate_readable(tokens: &TokenMap, mode: ThemeMode) -> ThemeResult<()> {
     Ok(())
 }
 
-/// The part token the screen's scanlines compile to.
 const SCREEN_SCANLINES_TOKEN: &str = "--part-screen-background-image";
 
-/// Part text colours and the background each one sits on. A background part
+/// INVARIANT: Part text colours and the background each one sits on. A background part
 /// token falls back to the token after it, as its stylesheet rule does.
 const PART_TEXT_ON: &[(&str, &[&str])] = &[
     ("--part-chat-text-color", &["--bg-primary"]),
@@ -729,9 +660,6 @@ const PART_TEXT_ON: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Refuse a part text colour its background all but hides, at the floor page
-/// text must reach. A colour that cannot be evaluated, such as
-/// `currentcolor`, follows text that already passed.
 fn validate_part_contrast(resolved: &TokenMap, mode: ThemeMode) -> ThemeResult<()> {
     let page = colour_in(resolved, mode, "--bg-primary")
         .unwrap_or(Rgba::WHITE)
@@ -764,8 +692,6 @@ fn validate_part_contrast(resolved: &TokenMap, mode: ThemeMode) -> ThemeResult<(
     Ok(())
 }
 
-/// The screen part's scanlines paint under all page text. No stop may pull
-/// `--text-primary`, or a part colour on the page, under the page floor.
 fn validate_screen_contrast(resolved: &TokenMap, mode: ThemeMode) -> ThemeResult<()> {
     let Some(scanlines) = resolved.get(SCREEN_SCANLINES_TOKEN) else {
         return Ok(());
@@ -802,8 +728,6 @@ fn validate_screen_contrast(resolved: &TokenMap, mode: ThemeMode) -> ThemeResult
     Ok(())
 }
 
-/// How a refusal names a text colour: a token as itself, a part colour as
-/// its part and property.
 fn text_label(name: &str) -> String {
     parts::CATALOG
         .tokens()
@@ -814,7 +738,6 @@ fn text_label(name: &str) -> String {
         )
 }
 
-/// Parse and validate a theme file's bytes.
 pub fn parse_definition(bytes: &[u8]) -> ThemeResult<ThemeDefinition> {
     let raw: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("not a valid theme file: {e}"))?;
@@ -825,14 +748,8 @@ pub fn parse_definition(bytes: &[u8]) -> ThemeResult<ThemeDefinition> {
     Ok(def)
 }
 
-/// The preference holding the live style remote: a JSON map of custom
-/// property to value that any app may write (`appearance.ts`).
 pub const STYLE_OVERRIDES_KEY: &str = "style_overrides";
 
-/// Check a `style_overrides` write. A `--part-*` key must pass the part
-/// grammar, and a shadow token the reach cap; the apply sites check both
-/// again. Other keys and a map that does not parse are left to the apply
-/// sites, which drop them.
 pub fn validate_style_overrides(value: &str) -> Result<(), String> {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str(value) else {
         return Ok(());
@@ -856,13 +773,10 @@ pub fn validate_style_overrides(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `name` is a catalog shadow token, whose reach is capped.
 pub fn is_shadow_token(name: &str) -> bool {
     catalog_token(name).is_some_and(|t| t.kind == SHADOW_KIND)
 }
 
-/// Refuse a `parts` map of the wrong shape, in any of its three places, with a
-/// message that names it.
 fn check_parts_shapes(raw: &serde_json::Value) -> ThemeResult<()> {
     if let Some(parts) = raw.get("parts") {
         parts::check_shape("parts", parts)?;
@@ -884,8 +798,6 @@ fn check_parts_shapes(raw: &serde_json::Value) -> ThemeResult<()> {
     Ok(())
 }
 
-/// The theme id a `themes/`-relative file path names: `nord.json` is `nord`.
-/// Anything nested, or not ending `.json`, is not a theme file.
 pub fn id_from_file_name(file_name: &str) -> ThemeResult<&str> {
     let id = file_name
         .strip_suffix(".json")
@@ -895,8 +807,6 @@ pub fn id_from_file_name(file_name: &str) -> ThemeResult<&str> {
     Ok(id)
 }
 
-/// Every workspace font a theme names must be one of `installed`, and fit its
-/// slot. Asked where a theme is written, so its author reads the reason.
 pub fn check_installed_fonts(fonts: &ThemeFonts, installed: &WorkspaceFonts) -> ThemeResult<()> {
     for slot in FONT_SLOTS {
         let Some(id) = slot
@@ -925,10 +835,6 @@ fn names_workspace_font(fonts: &ThemeFonts) -> bool {
         .any(|slot| slot.id(fonts).is_some_and(workspace_fonts::is_workspace_id))
 }
 
-/// Validate a write of `bytes` to `themes/<file_name>` in the workspace: the
-/// path names a theme id that is not a built-in, and the bytes are a valid theme
-/// whose workspace fonts are among `installed`. `installed` runs only for a
-/// theme that names one, since listing reads the font files.
 pub fn validate_workspace_write(
     file_name: &str,
     bytes: &[u8],
@@ -947,18 +853,14 @@ pub fn validate_workspace_write(
     check_installed_fonts(&fonts, &installed())
 }
 
-/// The `themes/`-relative part of a `data/`-relative path, if it has one.
 fn themes_relative(data_path: &str) -> Option<&str> {
     data_path.strip_prefix(THEMES_DIR)?.strip_prefix('/')
 }
 
-/// Whether a `data/`-relative path lies under `themes/`.
 pub fn is_theme_path(data_path: &str) -> bool {
     themes_relative(data_path).is_some()
 }
 
-/// The theme half of `data_prefixes::validate_data_write`. A path outside
-/// `themes/` passes. `data_dir` holds the workspace fonts a theme may name.
 pub fn validate_data_write(data_dir: &Path, data_path: &str, bytes: &[u8]) -> Result<(), String> {
     match themes_relative(data_path) {
         Some(file_name) => {
@@ -969,15 +871,6 @@ pub fn validate_data_write(data_dir: &Path, data_path: &str, bytes: &[u8]) -> Re
     }
 }
 
-// --- Resolution ---
-
-/// The map one mode paints: the theme's own tokens, the protected palette
-/// derived from them, then the part tokens. A mode the theme leaves untouched
-/// paints nothing, and the stylesheet's protected defaults hold.
-///
-/// An alias token such as `--text-glow` compiles to part tokens and leaves
-/// the map, so no stylesheet paints it a second time. `mono_stack` is the
-/// code font `fonts.mono` resolved to.
 pub fn resolve_mode(def: &ThemeDefinition, mode: ThemeMode, mono_stack: Option<&str>) -> TokenMap {
     let mut resolved = resolve_theme_tokens(def, mode, mono_stack);
     let sets_tokens = !resolved.is_empty();
@@ -992,7 +885,7 @@ pub fn resolve_mode(def: &ThemeDefinition, mode: ThemeMode, mono_stack: Option<&
         .collect();
     let mode_parts = def.mode_map(mode).map(|m| &m.parts);
     resolved.extend(parts::resolve(&def.parts, mode_parts, &aliases));
-    // Scanlines sit under protected text, so a theme that sets them gets a
+    // INVARIANT: Scanlines sit under protected text, so a theme that sets them gets a
     // palette clamped against them even when it sets no token.
     if sets_tokens || resolved.contains_key(SCREEN_SCANLINES_TOKEN) {
         let palette = protected_palette(&resolved, mode);
@@ -1005,7 +898,7 @@ pub fn resolve_mode(def: &ThemeDefinition, mode: ThemeMode, mono_stack: Option<&
     resolved
 }
 
-/// Bold text where the UI font has no bold face. The catalog default steps
+/// INVARIANT: Bold text where the UI font has no bold face. The catalog default steps
 /// toward white in dark mode and toward black in light mode. That is wrong for
 /// a theme that paints a dark page in both. So a theme that sets a page or text
 /// colour steps away from its own page instead. `None` leaves the token alone.
@@ -1023,9 +916,6 @@ fn strong_text(tokens: &TokenMap, mode: ThemeMode) -> Option<String> {
     ))
 }
 
-/// The code font protected surfaces show a command in. Only a catalog font
-/// qualifies: a free-form `--font-mono` or a workspace font could be a symbol
-/// font and garble the command.
 fn protected_font_mono(def: &ThemeDefinition) -> &'static str {
     def.fonts
         .mono
@@ -1036,9 +926,6 @@ fn protected_font_mono(def: &ThemeDefinition) -> &'static str {
         .expect("the catalog lists the code font")
 }
 
-/// The protected palette a mode derives from `tokens`, the screen's scanlines
-/// included. With no tokens, it is the default theme's, which `base.css`
-/// carries.
 fn protected_palette(tokens: &TokenMap, mode: ThemeMode) -> Vec<(&'static str, String)> {
     let default = |token: &str| {
         colour_in(&TokenMap::new(), mode, token)
@@ -1058,13 +945,10 @@ fn protected_palette(tokens: &TokenMap, mode: ThemeMode) -> Vec<(&'static str, S
     })
 }
 
-/// A token's colour in one mode: the theme's value, else the catalog default,
-/// with every `var()` followed the same way. `None` when it cannot be read.
 fn colour_in(tokens: &TokenMap, mode: ThemeMode, token: &str) -> Option<Rgba> {
     evaluate_in(tokens, mode, &token_value(tokens, mode, token)?)
 }
 
-/// What a token holds in one mode: the theme's value, else the catalog default.
 fn token_value(tokens: &TokenMap, mode: ThemeMode, name: &str) -> Option<String> {
     tokens
         .get(name)
@@ -1072,13 +956,11 @@ fn token_value(tokens: &TokenMap, mode: ThemeMode, name: &str) -> Option<String>
         .or_else(|| catalog_token(name).map(|t| t.default_in(mode).to_string()))
 }
 
-/// A colour value in one mode, every `var()` followed through `tokens` and the
-/// catalog defaults. `None` when it cannot be read.
 fn evaluate_in(tokens: &TokenMap, mode: ThemeMode, value: &str) -> Option<Rgba> {
     color::evaluate(value, &|name| token_value(tokens, mode, name))
 }
 
-/// The theme's own tokens for one mode: shared tokens, then the mode's own,
+/// INVARIANT: The theme's own tokens for one mode: shared tokens, then the mode's own,
 /// then every catalog derivation whose seed the theme set and whose token it
 /// did not. `mono_stack` fills the code font, which validation keeps from
 /// colliding with an explicit token.
@@ -1113,9 +995,6 @@ fn resolve_theme_tokens(
     resolved
 }
 
-/// The fonts a theme suggests that exist and fit their slot, with the entry of
-/// each workspace font among them. A workspace font removed since the theme
-/// was written drops out here, so the slot falls back as if unset.
 fn usable_fonts(
     fonts: &ThemeFonts,
     installed: &WorkspaceFonts,
@@ -1153,7 +1032,6 @@ fn usable_fonts(
     (usable, entries)
 }
 
-/// The stack of a usable font, from the catalog or the workspace.
 fn stack_of<'a>(id: &str, entries: &'a [WorkspaceFont]) -> Option<&'a str> {
     fonts::find(id).map(|font| font.stack).or_else(|| {
         entries
@@ -1163,8 +1041,6 @@ fn stack_of<'a>(id: &str, entries: &'a [WorkspaceFont]) -> Option<&'a str> {
     })
 }
 
-/// What a theme paints in each mode, and the fonts it suggests, against the
-/// workspace fonts `installed`.
 pub fn resolve(definition: &ThemeDefinition, installed: &WorkspaceFonts) -> ResolvedTheme {
     let (fonts, workspace_fonts) = usable_fonts(&definition.fonts, installed);
     let mono_stack = fonts
@@ -1195,8 +1071,6 @@ fn build(
     }
 }
 
-/// The built-in themes, parsed and resolved once: they are compiled in, and the
-/// app-frame first-paint seed asks for one on every frame load.
 static BUILT_INS: LazyLock<Vec<Theme>> = LazyLock::new(|| {
     BUILT_IN_THEMES
         .iter()
@@ -1211,24 +1085,16 @@ fn built_in(id: &str) -> Option<Theme> {
     BUILT_INS.iter().find(|theme| theme.id == id).cloned()
 }
 
-// --- Loading ---
-
 fn workspace_theme_path(data_dir: &Path, id: &str) -> std::path::PathBuf {
     data_dir.join(THEMES_DIR).join(format!("{id}.json"))
 }
 
-/// Where workspace themes lived when they were called looks. The plugin
-/// refusal hint still reads it.
 pub const LEGACY_THEMES_DIR: &str = "looks";
 
-/// One theme by id, built-in first. `None` when no theme has that id.
 pub fn get(data_dir: &Path, id: &str) -> ThemeResult<Option<Theme>> {
     get_with(data_dir, id, &mut None)
 }
 
-/// [`get`], reading the workspace fonts into `installed` the first time a
-/// theme names one, so a caller loading many themes lists them once. Most
-/// themes name catalog fonts or none, and never read them.
 fn get_with(
     data_dir: &Path,
     id: &str,
@@ -1253,9 +1119,6 @@ fn get_with(
     Ok(Some(build(id, ThemeSource::Workspace, definition, fonts)))
 }
 
-/// Every theme: the built-ins in their curated order, then the workspace's by
-/// id. A workspace file that fails validation is skipped and logged, so one
-/// broken theme cannot empty the picker.
 pub fn list(data_dir: &Path) -> Vec<Theme> {
     let mut themes: Vec<Theme> = BUILT_INS.clone();
 
@@ -1283,9 +1146,6 @@ pub fn list(data_dir: &Path) -> Vec<Theme> {
     themes
 }
 
-/// The resolved maps the `theme` preference paints, as JSON, for the app-frame
-/// first-paint seed. `None` for the default theme or an unknown id, which paint
-/// nothing.
 pub fn resolved_json_for_preference(data_dir: &Path, id: &str) -> Option<String> {
     if id == DEFAULT_THEME_ID {
         return None;

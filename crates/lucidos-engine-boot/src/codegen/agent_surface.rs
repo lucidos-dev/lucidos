@@ -1,5 +1,3 @@
-//! The engine half of the tracked agent surface. Codegen adds the clap tree.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use lucidos_engine::capability_manifest;
@@ -69,8 +67,6 @@ fn sdk_exports(source: &str) -> Result<BTreeSet<String>, String> {
         .position(|line| *line == "};")
         .map(|offset| begin + offset)
         .ok_or("SDK export object has no end")?;
-    // This reader accepts only explicit identifier properties. A new syntax
-    // must teach the reader its meaning before codegen can certify coverage.
     let property =
         regex::Regex::new(r"^([A-Za-z_$][A-Za-z0-9_$]*)(?:\s*:\s*[A-Za-z_$][A-Za-z0-9_$]*)?,$")
             .unwrap();
@@ -87,7 +83,6 @@ fn sdk_exports(source: &str) -> Result<BTreeSet<String>, String> {
         if !seen.insert(name.clone()) {
             return Err(format!("duplicate SDK export: {name}"));
         }
-        // Underscore properties are SDK internals, not app-facing API.
         if !name.starts_with('_') {
             exports.insert(name);
         }

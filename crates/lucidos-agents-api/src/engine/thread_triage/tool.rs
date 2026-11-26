@@ -1,9 +1,3 @@
-//! The `threads` tool's `triage` and `apply_triage` actions (ADR 0349).
-//!
-//! The caller is `execute_tool`'s ambient thread, never an argument. Every
-//! decision lives in the pure modules beside this one. This file reads, runs
-//! the approved steps through the existing paths, and words the result.
-
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -20,7 +14,6 @@ use crate::engine::thread_events::agent_thread_actor;
 use crate::engine::thread_events::{AnswerKind, EventMeta, ThreadEvent};
 use crate::engine::tools::ToolOutcome;
 
-/// What the agent is told to do with a triage, beside the triage itself.
 const TRIAGE_GUIDANCE: &str = "Show this to the user grouped by action, with each thread's link \
      and reason. Ask which actions to apply, then call apply_triage with the entries they \
      approved. apply_triage runs only after the user replies. Delete is never applied by \
@@ -33,7 +26,6 @@ struct ApplyEntryArg {
     action: String,
 }
 
-/// Parse `apply_triage`'s `entries` argument.
 fn parse_requests(args: &serde_json::Value) -> Result<Vec<ApplyRequest>, String> {
     let entries: Vec<ApplyEntryArg> = args
         .get("entries")
@@ -69,8 +61,6 @@ fn parse_requests(args: &serde_json::Value) -> Result<Vec<ApplyRequest>, String>
 
 #[easy_ext::ext(ToolExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// LLM tool: classify every inbox thread, record the proposal on the
-    /// calling thread, and return it grouped for the user.
     async fn execute_triage_threads(&self, caller: Uuid) -> ToolOutcome {
         let rows = load(
             self.pool(),
@@ -94,7 +84,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         .to_string())
     }
 
-    /// LLM tool: apply the entries the user approved from the newest triage.
     async fn execute_apply_thread_triage(
         &self,
         args: &serde_json::Value,
@@ -128,13 +117,12 @@ pub(crate) impl crate::engine::LucidosEngine {
         Ok(serde_json::json!({ "applied": applied, "refused": refused }).to_string())
     }
 
-    /// Run one approved step through the path the user's own button takes.
+    /// INVARIANT: Run one approved step through the path the user's own button takes.
     async fn run_triage_step(&self, caller: Uuid, step: ApplyRequest) -> Result<(), String> {
         let actor = Some(agent_thread_actor(caller));
         match step.action {
             TriageAction::Archive => {
                 let engine = self.clone_arc();
-                // Boxed: the cascade's emits can re-enter an agentic loop.
                 Box::pin(archive_family(
                     &engine,
                     step.thread_id,
@@ -173,7 +161,6 @@ pub(crate) impl crate::engine::LucidosEngine {
                     AnswerResult::Conflict(message) => Err(message),
                 }
             }
-            // `plan_apply` refuses these first; this arm only keeps it honest.
             TriageAction::Delete | TriageAction::FollowUp | TriageAction::Keep => {
                 Err(format!("'{}' is not applied here", step.action.as_str()))
             }

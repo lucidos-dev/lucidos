@@ -1,7 +1,6 @@
 use super::*;
 use crate::engine::tools::import::ImportExt;
 
-/// Query params for commits list
 #[derive(Deserialize)]
 pub(super) struct CommitsQuery {
     pub path: Option<String>,
@@ -21,7 +20,6 @@ pub(super) struct CommitsResponse {
     pub has_more: bool,
 }
 
-/// Handle file upload and import
 pub(super) async fn upload_file(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -54,7 +52,6 @@ pub(super) async fn upload_file(
             })
         }
     };
-    // Get the file from multipart
     let field = match multipart.next_field().await {
         Ok(Some(field)) => field,
         Ok(None) => {
@@ -95,7 +92,7 @@ pub(super) async fn upload_file(
         }
     };
 
-    // Write to a temp file first, then import (since import_file expects a path).
+    // INVARIANT: Write to a temp file first, then import (since import_file expects a path).
     // The staging directory is unique per upload and owner-only, and removed
     // when it drops. A shared `<temp>/<filename>` would let another local user
     // read the upload or pre-plant a symlink to redirect the write.
@@ -119,7 +116,6 @@ pub(super) async fn upload_file(
         });
     }
 
-    // Import using the engine's import functionality — no lock needed
     let dest = format!("imported/{}", filename);
     log_legacy!(@upload, "Starting import for {}", filename);
     match state
@@ -130,17 +126,12 @@ pub(super) async fn upload_file(
         Ok((result, commit_sha, resolved_dest)) => {
             log_legacy!(@upload, "Import succeeded: {}", result);
 
-            // Reflect the ACTUAL final filename — a collision auto-suffix may
-            // have landed the file at e.g. "imported/Brev (1).pdf".
             let final_filename = resolved_dest
                 .rsplit('/')
                 .next()
                 .map(str::to_string)
                 .unwrap_or(filename);
 
-            // Spawn the post-import hook. Today it's a near no-op (memory
-            // indexing for text artifacts runs via `memory_consumer`); kept
-            // as the upload-side extension point.
             let engine = Arc::clone(&state.engine);
             tokio::spawn(async move {
                 engine.post_import_index(&resolved_dest, &commit_sha).await;
@@ -163,7 +154,6 @@ pub(super) async fn upload_file(
     }
 }
 
-/// Get the commit hash at or before a specific Unix timestamp
 pub(super) async fn get_commit_at_timestamp(
     State(state): State<AppState>,
     Query(query): Query<BeforeTimestampQuery>,
@@ -183,7 +173,6 @@ pub(super) async fn get_commit_at_timestamp(
     Ok(Json(serde_json::json!({ "commit": commit })))
 }
 
-/// GET /api/v1/commits?path=...&limit=...&offset=... - List commits touching a path prefix
 pub(super) async fn list_commits(
     State(state): State<AppState>,
     Query(query): Query<CommitsQuery>,
@@ -208,7 +197,6 @@ pub(super) async fn list_commits(
     }
 }
 
-/// Routes for the `/commits*` surface (artifact git history).
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/commits", get(list_commits))

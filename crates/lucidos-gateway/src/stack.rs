@@ -1,13 +1,3 @@
-//! One workspace stack = the spawned engine process + its health state.
-//!
-//! Engine bind depends on the build, per ADR 0014's dev runtime topology. See
-//! [`spawn_engine`]'s `loopback` argument.
-//!
-//! Either way engines are spawned **detached**, so a gateway crash or restart
-//! does not take them down. A re-adopting gateway reconnects through the
-//! pidfile and a health probe. Supervision is health-probe based, so it works
-//! identically for spawned and re-adopted engines.
-
 use crate::engine_hop::{self, Credential, EngineAddress};
 use crate::postgres::PgHandle;
 use crate::registry::Workspace;
@@ -18,19 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Does `path` lie inside a coding-agent worktree — one of the
-/// `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
-/// coding-agent thread?
-///
-/// A worktree is a throwaway checkout pinned to one commit, so anything
-/// long-lived that resolves into one is frozen at that commit forever. ADR 0021
-/// and `docs/plans/2026-07-26-worktree-pinned-stack-guard.md` hold the rest.
-/// Keep this in step with `path_is_in_cc_worktree` in `scripts/lib/workspace.sh`.
-///
-/// A pure path test on purpose: it must stay correct for an ORPHANED worktree
-/// whose directory is already gone, which is exactly when it matters most.
-/// Matches on the `.lucidos/worktrees` component pair, so a directory merely
-/// *named* `worktrees` is not caught.
 pub(crate) fn path_is_in_cc_worktree(path: &Path) -> bool {
     let comps: Vec<_> = path
         .components()
@@ -41,106 +18,53 @@ pub(crate) fn path_is_in_cc_worktree(path: &Path) -> bool {
         .any(|w| w[0] == ".lucidos" && w[1] == "worktrees")
 }
 
-// There is deliberately NO `LUCIDOS_ALLOW_WORKTREE_STACK` escape hatch in this
-// crate. The opt-out exists only for a session-scoped DIRECT engine. Every path
-// in the gateway is by definition the machine-global daemon, so honouring an
-// inherited opt-out here would re-open the hole the guards close. See ADR 0021
-// § "the opt-out stops at the gateway".
-
-/// Per-workspace health, surfaced on the control API and rendered in the picker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Health {
-    /// Offline snapshot restore owns the workspace.
     Restoring,
-    /// Spawned/adopted but not yet answering `/api/v1/health`.
     Booting,
-    /// Answering `/api/v1/health`.
     Healthy,
-    /// Failed to become healthy after the restart cap — surfaced for manual
-    /// retry / view-logs / delete. The gateway stops auto-respawning it.
     Unhealthy,
 }
 
-/// Who keeps a workspace's engine running, and so who may replace it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EngineKeeper {
-    /// The gateway, because somebody asked it to run this workspace: the
-    /// auto-start flag, a restore record, an open, a Retry. It spawns a
-    /// replacement when the engine exits, including for an engine it re-adopted
-    /// while answering one of those asks.
     Gateway,
-    /// Somebody else, whose engine the gateway found answering on the registered
-    /// port. Nobody asked it to start anything, so it reports and proxies that
-    /// engine but never replaces it. It cannot reproduce the environment,
-    /// database and model configuration the engine was launched with. A
-    /// replacement would be a different engine wearing the same address. The
-    /// stack is released when the engine exits, and the workspace reads as
-    /// stopped until somebody starts it again.
     External,
 }
 
-/// Mutable runtime state for one workspace stack. Held behind a `Mutex` in the
-/// gateway's stack map; the supervisor loop locks each in turn.
 pub struct StackRuntime {
     pub ws: Workspace,
     pub resolved_dir: PathBuf,
     pub pg: PgHandle,
-    /// The engine process this gateway spawned. `None` when it holds no handle:
-    /// an engine re-adopted across a gateway restart, or an
-    /// [`EngineKeeper::External`] one. Supervision is health-based, so a missing
-    /// `Child` only means "we can't `try_wait` it", not "it's down".
     pub engine: Option<Child>,
-    /// Whether this gateway may spawn a replacement engine here. Independent of
-    /// `engine`, which says only whether we hold a handle.
     pub keeper: EngineKeeper,
     pub health: Health,
-    /// Respawn attempts since the stack was last healthy. Caps auto-respawn.
     pub restart_attempts: u32,
-    /// Consecutive failed health probes since the stack was last healthy or
-    /// respawned. The supervisor requires several before culling an
-    /// alive-but-busy engine, so a single slow probe never triggers a respawn.
-    /// Reset on a healthy probe and on respawn.
     pub health_misses: u32,
     pub last_spawn: Option<Instant>,
     pub last_error: Option<String>,
-    /// The shared unread count, as the row subscription last read it.
-    /// Background aggregates use it; a device-facing listing replaces it with
-    /// that device's own count. `None` when unknown.
     pub last_unread: Option<u64>,
-    /// What this engine last said about its backups (the picker's per-row backup
-    /// line). `None` when unknown, on exactly the terms `last_unread` is: no
-    /// live row subscription, or a read that did not answer.
     pub last_successful_backup: Option<LastSuccessfulBackup>,
-    /// The task that keeps the two fields above current.
     pub row_subscription: RowSubscription,
 }
 
 impl StackRuntime {
-    /// Where this stack's engine answers: its engine socket.
     pub fn engine_address(&self) -> EngineAddress {
         EngineAddress::for_workspace(&self.resolved_dir, self.ws.port)
     }
 
-    /// Say nothing on the row: no badge, no backup line, no device count.
     pub fn blank_row(&mut self) {
         self.last_unread = None;
         self.last_successful_backup = None;
         self.row_subscription.forget_devices();
     }
 
-    /// End the row subscription. A row with no live stream shows nothing.
     pub fn stop_row_subscription(&mut self) {
         self.row_subscription.stop();
         self.blank_row();
     }
 
-    /// Keep the row subscription in step with one healthy probe of `engine`.
-    ///
-    /// An engine without `event_filter` is older than the row stream, and
-    /// would count a subscriber as a page. The gateway sends it nothing. Its
-    /// row stays quiet until it restarts onto a newer build, which the
-    /// supervisor brings about once it is idle.
     pub fn keep_row_subscription(
         &mut self,
         event_filter: bool,
@@ -157,7 +81,6 @@ impl StackRuntime {
         if !event_filter {
             self.stop_row_subscription();
         } else if !self.row_subscription.is_live() {
-            // Blank until the stream's hello brings the first snapshot.
             self.blank_row();
             self.row_subscription
                 .start(std::sync::Arc::downgrade(stack), engine.clone());
@@ -165,74 +88,45 @@ impl StackRuntime {
     }
 }
 
-/// What one workspace's engine reports about its backups, from
-/// `GET /api/v1/backup/last-successful`. Forwarded to the picker verbatim as
-/// part of [`WorkspaceStatus`].
-///
-/// The gateway holds no database handle (ADR 0014 §1), so this HTTP read is the
-/// only way it can know any of it. Staleness stays the engine's call, made
-/// against the one threshold in `core::backup::BACKUP_STALE_AFTER_SECONDS`:
-/// the engine names the instant, and the gateway only compares it with its
-/// clock.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LastSuccessfulBackup {
-    /// When the newest successful backup run finished, or `None` when this
-    /// workspace has never produced one.
     pub at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The engine's verdict that `at` is too old (or absent), at the read.
     pub stale: bool,
-    /// When the engine said `at` turns stale. No event announces that
-    /// instant, so [`Self::as_of`] applies it on each listing.
     #[serde(skip)]
     pub stale_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Whether backups are set up at all. It is what separates "the schedule has
-    /// never produced an archive" from "nobody set backups up here".
     pub configured: bool,
 }
 
 impl LastSuccessfulBackup {
-    /// This reading at `now`: stale once the engine's own instant has passed.
     pub fn as_of(mut self, now: chrono::DateTime<chrono::Utc>) -> Self {
         self.stale = self.stale || self.stale_at.is_some_and(|at| now > at);
         self
     }
 }
 
-/// Serializable status view for the control API / picker.
 #[derive(Serialize, Clone, Debug)]
 pub struct WorkspaceStatus {
     pub id: String,
     pub name: String,
-    /// The workspace directory, resolved. Engines project it into
-    /// `GET /api/v1/workspaces`, so a sandboxed agent can find a peer.
     pub path: PathBuf,
     pub port: u16,
     pub health: Health,
-    /// Whether the gateway auto-starts this workspace on boot (the picker renders
-    /// a per-workspace toggle bound to it). Mirrors [`Workspace::autostart`].
     pub autostart: bool,
-    /// Who made the workspace. Agents read it to see which entries the
-    /// workspace broker may delete or restore.
     pub origin: crate::registry::WorkspaceOrigin,
-    /// [`crate::registry::WorkspaceOrigin::is_machine_made`], so an engine reads
-    /// the verb split instead of restating it.
     pub machine_made: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    /// Unread-notification count for this workspace's per-row badge. Omitted
-    /// (not `0`) when unknown — a stopped/unhealthy/unpolled engine has no
-    /// count, so the picker shows no badge rather than a misleading zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unread_count: Option<u64>,
-    /// This workspace's backup line. Omitted when unknown, for the same reason
-    /// the count is: with no healthy engine to ask, the picker must say nothing
-    /// rather than report a workspace as never backed up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_successful_backup: Option<LastSuccessfulBackup>,
+    /// An interrupted delete holds this workspace until Trash finishes or
+    /// restores it, so the picker points there instead of offering a restart.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub delete_interrupted: bool,
 }
 
 impl WorkspaceStatus {
-    /// The row for a workspace with no engine to ask: no badge, no backup line.
     pub fn without_engine(
         ws: &Workspace,
         path: PathBuf,
@@ -251,6 +145,7 @@ impl WorkspaceStatus {
             last_error,
             unread_count: None,
             last_successful_backup: None,
+            delete_interrupted: false,
         }
     }
 }
@@ -271,18 +166,11 @@ impl StackRuntime {
             last_successful_backup: self
                 .last_successful_backup
                 .map(|line| line.as_of(chrono::Utc::now())),
+            delete_interrupted: false,
         }
     }
 }
 
-/// The workspace-specific variables every spawned engine gets, whatever the
-/// runtime posture. Split out of [`spawn_engine`] (which adds the conditional
-/// bind/TLS handling on top) so the set is inspectable, and pinned by a test.
-///
-/// Deliberately NOT here: a model-cache directory. The engine resolves ONE
-/// shared per-user cache itself and otherwise inherits whatever the packaged
-/// app or the headless service already chose (ADR 0061). Pinning it per
-/// workspace here would give every workspace its own copy.
 fn engine_env_overrides(
     ws: &Workspace,
     resolved_dir: &Path,
@@ -293,19 +181,12 @@ fn engine_env_overrides(
         ("LUCIDOS_WORKSPACE", resolved_dir.as_os_str().to_os_string()),
         ("DATABASE_URL", database_url.into()),
         ("LUCIDOS_API_PORT", ws.port.to_string().into()),
-        // Identity + callback so the engine's /api/v1/restart can ask the
-        // gateway to restart this one stack in place (dev Apply path).
         ("LUCIDOS_WORKSPACE_ID", ws.id.clone().into()),
         (
             "LUCIDOS_WORKSPACE_ORIGIN",
             ws.cleanup.origin.as_str().into(),
         ),
         ("LUCIDOS_GATEWAY_PORT", gateway_port.to_string().into()),
-        // The port a webhook delivery arrives on, resolved once here so the
-        // engine never re-derives it. The engine has no dependency on this
-        // crate, so a second derivation would be a second source of truth: it
-        // would still say 5261 the day the offset changes. "0" states there is
-        // no hook socket, which the ingress probe reads as nothing to probe.
         (
             "LUCIDOS_HOOK_PORT",
             crate::hook_socket::resolved_hook_port(gateway_port)
@@ -316,15 +197,6 @@ fn engine_env_overrides(
     ]
 }
 
-/// The frontend preview's two certificates, under names the engine never
-/// serves with (ADR 0267).
-///
-/// - The preview leaf from the loopback CA, which Vite serves loopback with.
-/// - The gateway's user cert, which Vite serves every other name with. Empty
-///   when the gateway has none, and then Vite binds loopback only.
-///
-/// A loopback engine loses `LUCIDOS_TLS_*` so it serves plain HTTP to the
-/// gateway. `None` removes a name, so an engine never inherits a stale pair.
 fn preview_tls_handoff(
     leaf: Option<&lucidos_loopback_ca::PreviewLeaf>,
     user_cert: Option<&str>,
@@ -335,8 +207,6 @@ fn preview_tls_handoff(
         PREVIEW_USER_TLS_KEY_ENV,
     };
     let user = match (user_cert, user_key) {
-        // Trimmed, as `serves_tls` and the gateway's own listener trim: a
-        // padded path would pass the check here and fail Vite's `existsSync`.
         (Some(c), Some(k)) if crate::net_config::serves_tls(user_cert, user_key) => {
             Some((c.trim().to_string(), k.trim().to_string()))
         }
@@ -352,33 +222,11 @@ fn preview_tls_handoff(
     ]
 }
 
-/// Spawn a workspace engine: detached, pointed at its workspace dir and
-/// database, told how to call the gateway back for an in-place restart.
-/// Inherits the gateway's environment and overrides the workspace-specific
-/// vars. Writes no pidfile: the engine publishes its own once it holds the
-/// workspace's owner lock (ADR 0438).
-///
-/// `loopback` controls the engine's bind, per ADR 0014's dev runtime topology:
-///   * **packaged, `true`**: loopback only, so the gateway is the sole
-///     network-facing surface. This is the security posture.
-///   * **dev, `false`**: all interfaces on `ws.port`, so `https://localhost:
-///     <port>/` reaches the workspace app directly as well as through the
-///     gateway. Dev-only convenience, not a relaxation of the posture above.
-///
-/// `proto` is the scheme the engine will serve, from the caller's
-/// `engine_scheme()`. Taken as an argument rather than re-derived from
-/// `loopback`, so the ports file cannot disagree with the scheme the engine
-/// serves on its TCP port. Publishing it is part of the spawn (ADR 0136), so
-/// a new spawn site cannot leave a workspace unresolvable.
-///
-/// The engine's stamp key is born here too, and crosses only the engine's
-/// stdin pipe. A spawn site cannot hand out an engine without one.
 pub struct EngineLaunch<'a> {
     pub loopback: bool,
     pub proto: &'a str,
     pub disposable: bool,
     pub managed_database: bool,
-    /// The frontend preview's leaf, when the gateway could write one.
     pub preview_leaf: Option<&'a lucidos_loopback_ca::PreviewLeaf>,
 }
 
@@ -406,19 +254,12 @@ pub fn spawn_engine(
     } = launch;
     let stamp_key = StampKey::generate()?;
     crate::diagnostic_log::secret(stamp_key.handover_line().trim().to_owned());
-    // The engine keeps its owner lock and pidfile in here, and wants a writable
-    // CWD.
     let state_dir = resolved_dir.join(".lucidos");
     std::fs::create_dir_all(&state_dir)?;
 
-    // A legacy `backup.key` can still live in here (ADR 0509), and it decrypts
-    // every archive it sealed (ADR 0153). This one call is both halves of the
-    // fix: it runs the moment the directory is created, and again on every
-    // later spawn, so a workspace predating the ADR converges with no sweep.
     crate::file_backup::exclude(&state_dir, "workspace state dir");
 
     let mut cmd = Command::new(engine_bin);
-    // Always override inheritance, including launches against external databases.
     managed_database_handoff(&mut cmd, managed_database);
     cmd.current_dir(resolved_dir).envs(engine_env_overrides(
         ws,
@@ -437,7 +278,6 @@ pub fn spawn_engine(
         };
     }
 
-    // Persistent engines must not inherit a frontend pinned to a worktree (ADR 0021).
     if let Some(dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
         if !disposable && path_is_in_cc_worktree(Path::new(&dir)) {
             crate::log_legacy!(
@@ -451,27 +291,11 @@ pub fn spawn_engine(
         }
     }
     if loopback {
-        // Dev and packaged alike (ADR 0096): loopback only. The gateway is the
-        // sole network-facing surface and terminates TLS, so the engine serves
-        // plain HTTP. Strip any inherited TLS config, so the port serves the
-        // http its ports file advertises. `LUCIDOS_BIND_LOOPBACK=1` is the engine's
-        // `behind_gateway` signal, and the engine also defaults to a loopback
-        // bind with `LUCIDOS_BIND_ALL` unset, so this stays loopback-only.
         cmd.env("LUCIDOS_BIND_LOOPBACK", "1")
             .env_remove("LUCIDOS_BIND_ALL")
             .env_remove("LUCIDOS_TLS_CERT")
             .env_remove("LUCIDOS_TLS_KEY");
     } else {
-        // Only `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`, which nothing sets: the
-        // engine is the direct front on its port. KEEP the inherited
-        // TLS so `https://localhost:<port>/` reaches it directly. The gateway
-        // reaches it over its engine socket either way. Clear the loopback flag so
-        // a respawn stays network-capable and not flagged as behind-gateway.
-        //
-        // Bind defaults to all interfaces, and must say so explicitly because
-        // the engine now defaults to loopback. Defer to `network.toml` when it
-        // exists, so the engine's own resolver derives the configured bind
-        // rather than being masked by BIND_ALL.
         cmd.env_remove("LUCIDOS_BIND_LOOPBACK");
         if crate::net_config::network_toml_exists() {
             cmd.env_remove("LUCIDOS_BIND_ALL");
@@ -480,7 +304,6 @@ pub fn spawn_engine(
         }
     }
 
-    // Persistent engines survive gateway death. Disposable engines stay in its owned group.
     #[cfg(unix)]
     if !disposable {
         use std::os::unix::process::CommandExt;
@@ -494,10 +317,7 @@ pub fn spawn_engine(
         }
     }
 
-    // The flag says a key is coming, so the engine reads one line of stdin.
-    // The key itself never enters the environment, where `ps eww` reads it.
     cmd.env(ENV_STAMP_KEY_ON_STDIN, "1").stdin(Stdio::piped());
-    // A gateway restarted under this engine takes it back as its own.
     cmd.env(ENV_STARTED_BY_GATEWAY, "1");
     let mut child = cmd.spawn()?;
     let stamp_key = hand_over_stamp_key(&mut child, stamp_key);
@@ -505,20 +325,12 @@ pub fn spawn_engine(
     Ok(SpawnedEngine { child, stamp_key })
 }
 
-/// An engine [`spawn_engine`] started, and the stamp key it holds. `None`
-/// means the handover failed, so the engine boots keyless.
 #[derive(Debug)]
 pub struct SpawnedEngine {
     pub child: Child,
     pub stamp_key: Option<StampKey>,
 }
 
-/// Write the key line into the child's stdin and close the pipe. Returns the
-/// key only when it arrived.
-///
-/// A failure is logged, never returned: the engine then boots keyless, which
-/// fails closed (every device claim unattested). The gateway records no key
-/// for it, so the supervisor's idle re-key respawns it.
 fn hand_over_stamp_key(child: &mut Child, key: StampKey) -> Option<StampKey> {
     use std::io::Write as _;
     let Some(mut stdin) = child.stdin.take() else {
@@ -538,21 +350,6 @@ fn hand_over_stamp_key(child: &mut Child, key: StampKey) -> Option<StampKey> {
     Some(key)
 }
 
-/// Publish `<workspace>/.lucidos/ports` for an engine that is up.
-///
-/// The cross-workspace resolvers read this file and nothing else:
-/// `lucidos-cli`'s `resolve_target` and the engine's `http::workspace_resolver`.
-/// Until this call existed nothing wrote it on a packaged install, because the
-/// gateway's own registry lives in `<app-data>/config/workspaces.json` and
-/// neither resolver knows about it. So `lucidos spawn-thread --to <ws>` failed
-/// on every packaged workspace.
-///
-/// Written here rather than in the resolvers because the running engine is the
-/// only thing that knows both halves for certain (ADR 0136).
-///
-/// Called on the spawn path AND on re-adoption. A re-adopted engine is just as
-/// running as a spawned one, and a gateway that only ever adopts would
-/// otherwise never publish: adoption returns before the spawn.
 pub fn publish_ports_file(resolved_dir: &Path, ws: &Workspace, api_port: u16, proto: &str) {
     let path = resolved_dir.join(".lucidos/ports");
     let existing = std::fs::read_to_string(&path).ok();
@@ -567,12 +364,6 @@ pub fn publish_ports_file(resolved_dir: &Path, ws: &Workspace, api_port: u16, pr
     }
 }
 
-/// Set `API_PORT` and `PROTO` in a ports file, preserving every other line.
-///
-/// Key-preserving because the dev scripts own the same file and write more into
-/// it: `scripts/lib/workspace.sh`'s `swap_ports` adds `VITE_PORT`, `PG_PORT`
-/// and `PG_DATABASE`, and `scripts/status.sh` sources the result.
-/// Clobbering it would strip a running dev workspace's database details.
 fn merge_ports_file(existing: Option<&str>, api_port: u16, proto: &str) -> String {
     let api_line = format!("API_PORT={api_port}");
     let proto_line = format!("PROTO={proto}");
@@ -602,19 +393,10 @@ fn merge_ports_file(existing: Option<&str>, api_port: u16, proto: &str) -> Strin
     out.join("\n")
 }
 
-/// The pid of the engine that owns `resolved_dir` right now, if one does.
-///
-/// Read through the owner lock, so a pidfile its holder left behind names
-/// nobody, whichever process now has that pid.
 pub fn live_engine_pid(resolved_dir: &Path) -> Option<u32> {
     lucidos_owner_lock::engine::live_pid(resolved_dir)
 }
 
-/// Whether an engine owns `resolved_dir`, for a stack held with no [`Child`].
-///
-/// The owner lock answers. [`pid_is_live`] still runs on whatever pid the file
-/// names, for its side effect: it reaps an exited engine of ours, which nothing
-/// else collects after `reload_gateway` re-execs the image.
 pub fn adopted_engine_alive(resolved_dir: &Path) -> bool {
     let named = std::fs::read_to_string(lucidos_owner_lock::engine::pid_path(resolved_dir))
         .ok()
@@ -622,31 +404,8 @@ pub fn adopted_engine_alive(resolved_dir: &Path) -> bool {
     named.is_some_and(pid_is_live) && live_engine_pid(resolved_dir) == named
 }
 
-/// Whether `pid` names a process that is still RUNNING, reaping it first when
-/// it is one of our own children that has already exited.
-///
-/// A bare `kill(pid, 0)` does NOT answer this. It succeeds for a **zombie**, a
-/// process that has exited and lingers in the process table until its parent
-/// reaps it. The gateway IS the parent of every engine it spawns. After a self
-/// re-exec it holds no `Child` handle for them, so nothing reaps them. A zombie
-/// engine then reads as alive forever, and `respawn_decision` never culls an
-/// alive engine.
-///
-/// `waitpid(pid, WNOHANG)` answers and repairs in one call. It is scoped to the
-/// single pid, so it can never consume another child's exit status:
-///   * `> 0`  the pid was our child, it had exited, it is now REAPED, not alive.
-///   * `== 0`  our child and still running, alive.
-///   * `< 0`  (`ECHILD`) not our child, so fall back to the existence probe.
-///
-/// A foreign zombie is indistinguishable in that last branch. But the only
-/// zombies the gateway can create are its own children, and the first branch
-/// clears those.
 #[cfg(unix)]
 pub fn pid_is_live(pid: u32) -> bool {
-    // Pid 0 is never an engine, and passing it on would be actively harmful.
-    // `waitpid(0, ...)` means "any child in MY process group". A corrupt
-    // pidfile could then reap a DIFFERENT engine and steal the exit status its
-    // `Child` handle waits for. It would read as dead and get culled.
     if pid == 0 {
         return false;
     }
@@ -670,31 +429,8 @@ pub fn pid_is_live(_pid: u32) -> bool {
     true
 }
 
-/// Wait on a process this gateway forked but holds no [`Child`] for, off the
-/// caller's thread, so it cannot linger as a zombie.
-///
-/// **Signalling an engine is not reaping it.** `reload_gateway` re-execs the
-/// image in place, so the pid is unchanged. Every engine the previous image
-/// spawned is still a child of this process, while every `Child` handle died
-/// with the image. The fresh image re-adopts those engines with `engine: None`,
-/// and their teardown then runs through [`reclaim_stale_engine`], which only
-/// knows a pid. Without this wait such an engine stays `<defunct>` for the
-/// gateway's whole lifetime.
-///
-/// A dedicated thread rather than the caller's, because a graceful drain takes
-/// about ten seconds. A plain `std::thread` rather than `spawn_blocking`, so
-/// this stays callable outside a tokio runtime.
-///
-/// Blocking `waitpid` is safe for a pid that is NOT ours: it returns `ECHILD`
-/// at once. It is scoped to the single pid, the same discipline
-/// [`pid_is_live`] documents, and it inherits the pid-recycling exposure the
-/// `kill` in [`reclaim_stale_engine`] already carries. It is the milder half of
-/// that pair.
 #[cfg(unix)]
 pub fn reap_forked_pid(pid: u32) {
-    // Same guard as `pid_is_live`: `waitpid(0, ...)` means "any child in MY
-    // process group", which could steal the exit status an engine's `Child`
-    // handle is waiting for.
     if pid == 0 {
         return;
     }
@@ -708,8 +444,6 @@ pub fn reap_forked_pid(pid: u32) {
             if waited >= 0 {
                 return;
             }
-            // A signal arriving mid-wait must not abandon the reap; anything
-            // else (ECHILD) means there is nothing of ours left to collect.
             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 return;
             }
@@ -720,21 +454,6 @@ pub fn reap_forked_pid(pid: u32) {
 #[cfg(not(unix))]
 pub fn reap_forked_pid(_pid: u32) {}
 
-/// Send SIGUSR1 to the engine that owns this workspace, if one does. Reap it
-/// too, if it is our own child. SIGUSR1 rather than SIGTERM, which the engine
-/// ignores.
-///
-/// No wait for the exit: the successor's own owner lock holds it until this
-/// engine is gone (ADR 0438).
-///
-/// The teardown path for an engine the gateway holds no [`Child`] for, and the
-/// reap is not optional: see [`reap_forked_pid`] for why such an engine is so
-/// often still a child of this process. Best-effort throughout.
-///
-/// **A pid that provably runs another program is never signalled or waited
-/// on.** The lock check and the `kill` are two steps, and the OS reuses pids.
-/// SIGUSR1 terminates a process that does not handle it, so the executable
-/// check stays as the guard across that gap.
 pub fn reclaim_stale_engine(resolved_dir: &Path) {
     #[cfg(unix)]
     if let Some(pid) = live_engine_pid(resolved_dir) {
@@ -758,40 +477,25 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
         unsafe {
             libc::kill(signal_pid, libc::SIGUSR1);
         }
-        // The successor publishes over the pidfile once it owns the
-        // workspace, so this is the last moment the pid is known.
         reap_forked_pid(pid);
     }
     #[cfg(not(unix))]
     let _ = resolved_dir;
 }
 
-/// `pid` as a `kill` target naming exactly one process. Strictly positive:
-/// `kill` reads 0 as "my whole process group", and a negative pid as a group or
-/// a broadcast.
 #[cfg(unix)]
 pub(crate) fn single_process_pid(pid: u32) -> Option<libc::pid_t> {
     libc::pid_t::try_from(pid).ok().filter(|p| *p > 0)
 }
 
-/// The engine's executable file name, as every launcher spells it.
 #[cfg(unix)]
 const ENGINE_EXECUTABLE_NAME: &str = "lucidos-engine";
 
-/// The executable `pid` runs, when that is provably some program other than
-/// one named `expected`. This is the guard before signalling a pid read from a
-/// file, since the OS reuses the pid of a process that has exited.
-///
-/// `None` when the path cannot be read, which is not evidence of reuse: a
-/// zombie reads that way.
 #[cfg(unix)]
 pub(crate) fn other_program_at_pid(pid: libc::pid_t, expected: &str) -> Option<PathBuf> {
     pid_executable(pid).filter(|exe| !executable_is_named(exe, expected))
 }
 
-/// Is `exe` the program named `expected`, judged by its file name? Linux's
-/// `/proc` appends ` (deleted)` once an update replaces the binary, and that is
-/// still the same program.
 #[cfg(unix)]
 fn executable_is_named(exe: &Path, expected: &str) -> bool {
     let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
@@ -800,7 +504,6 @@ fn executable_is_named(exe: &Path, expected: &str) -> bool {
     name.strip_suffix(" (deleted)").unwrap_or(name) == expected
 }
 
-/// The executable `pid` runs, or `None` when that cannot be read.
 #[cfg(target_os = "macos")]
 fn pid_executable(pid: libc::pid_t) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
@@ -810,58 +513,26 @@ fn pid_executable(pid: libc::pid_t) -> Option<PathBuf> {
     (len > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len as usize])))
 }
 
-/// Linux twin of the macOS probe, through `/proc`.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn pid_executable(pid: libc::pid_t) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
-/// Outcome of one health probe. Used to detect `Healthy`, which resets the
-/// stack, and to enrich the supervisor's log line.
-///
-/// The cull decision keys on whether the engine PROCESS is alive, NOT on this
-/// outcome. An alive engine is never culled (see `respawn_decision`), and only
-/// a process that has exited is respawned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProbeOutcome {
-    /// 2xx from `/api/v1/health`.
     Healthy,
-    /// Nothing accepted on the engine socket: no socket file, or one nobody
-    /// listens on. The engine is booting, crashed or mid-restart. Acted on as a
-    /// respawn only when the process is also dead.
     Unreachable,
-    /// The probe timed out (connect or read) — the process is (likely) alive
-    /// but too busy to answer within the budget. An alive engine is never culled,
-    /// so this never respawns on its own.
     Slow,
-    /// Any other error, or a non-2xx response. Like `Slow`, never culls an alive
-    /// engine.
     Other,
-    /// Something answered that is not this workspace's engine. Either the
-    /// kernel did not name this user as the engine socket's owner, and nothing
-    /// was sent, or a 2xx body named another workspace. Never trusted, and like
-    /// `Other` it never culls an alive engine.
     Foreign,
 }
 
-/// Probe the engine's `GET /api/v1/health` over its engine socket.
-///
-/// `workspace` is the directory the registry says this engine serves. Only a
-/// body naming it is `Healthy`.
 pub async fn probe_health(engine: &EngineAddress, workspace: &Path) -> ProbeOutcome {
     probe_engine(engine, workspace).await.outcome
 }
 
-/// How long a probe or a read may take before it counts as [`ProbeOutcome::Slow`].
-///
-/// The budget gives a busy engine headroom to answer. It can stay modest
-/// because a `Slow` outcome never culls a live engine.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// GET `path` from the engine and read its whole body, within `budget`.
-///
-/// Each call opens a fresh connection, so a probe verifies the engine accepts
-/// NEW connections rather than that an old one still works.
 async fn get_body(
     engine: &EngineAddress,
     path: &str,
@@ -894,8 +565,6 @@ async fn get_body(
         .unwrap_or(Err(ProbeOutcome::Slow))
 }
 
-/// [`get_body`] for a read that only a healthy answer feeds: anything else is
-/// "no reading".
 async fn get_success_body(engine: &EngineAddress, path: &str) -> Option<String> {
     match get_body(engine, path, PROBE_TIMEOUT).await {
         Ok((status, body)) if status.is_success() => Some(body),
@@ -903,38 +572,22 @@ async fn get_success_body(engine: &EngineAddress, path: &str) -> Option<String> 
     }
 }
 
-/// One health probe, and what a healthy engine said about its database.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EngineProbe {
     pub outcome: ProbeOutcome,
-    /// `Reachable` unless a healthy engine reported otherwise.
     pub database: DatabaseHealth,
-    /// A healthy engine said a gateway spawned it. `false` for an engine
-    /// another starter launched, and for an older engine that omits the field.
     pub started_by_gateway: bool,
-    /// A healthy engine's workspace client names
-    /// [`lucidos_gateway_stamp::workspace_client::LOOPBACK_TLS`].
     pub calls_gateway_over_tls: bool,
-    /// A healthy engine said it serves the row stream. `false` for an older
-    /// engine, which would count a subscriber as a page.
     pub event_filter: bool,
 }
 
-/// What an engine's health body says about its database (ADRs 0037, 0301).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DatabaseHealth {
     Reachable,
-    /// The database itself does not answer.
     NotAnswering,
-    /// The database answers, but the engine has no free pooled connection.
     PoolExhausted,
 }
 
-/// [`probe_health`], also reading the database health from the same body, so
-/// the slowness watch costs the supervisor no second request (ADR 0283).
-///
-/// `workspace` is the directory the registry says this engine serves. Only a
-/// body naming it is `Healthy`.
 pub async fn probe_engine(engine: &EngineAddress, workspace: &Path) -> EngineProbe {
     let outcome = |outcome| EngineProbe {
         outcome,
@@ -961,13 +614,6 @@ pub async fn probe_engine(engine: &EngineAddress, workspace: &Path) -> EnginePro
     }
 }
 
-/// The health body, parsed, when it names `workspace` as the engine's own.
-///
-/// The engine reports the `LUCIDOS_WORKSPACE` it runs in as `workspace_path`.
-/// Anything else is `None`: another workspace's engine, a body naming no
-/// workspace, or one that is not JSON. Compared by canonical path, so a
-/// symlinked registry entry still matches, and lexically when either path no
-/// longer resolves.
 fn own_health_body(body: &str, workspace: &Path) -> Option<serde_json::Value> {
     let health: serde_json::Value = serde_json::from_str(body).ok()?;
     let reported = Path::new(health.get("workspace_path")?.as_str()?);
@@ -978,10 +624,6 @@ fn own_health_body(body: &str, workspace: &Path) -> Option<serde_json::Value> {
     same.then_some(health)
 }
 
-/// The database health in a health body. Only an explicit `false` for
-/// `database_reachable` is an outage, and only an explicit `true` for
-/// `database_pool_exhausted` blames the pool. An older engine omits either
-/// field, and must never read as worse than it said.
 fn database_health(health: &serde_json::Value) -> DatabaseHealth {
     let flag = |key: &str| health.get(key).and_then(serde_json::Value::as_bool);
     match (flag("database_reachable"), flag("database_pool_exhausted")) {
@@ -991,24 +633,11 @@ fn database_health(health: &serde_json::Value) -> DatabaseHealth {
     }
 }
 
-/// An engine found answering on a registered port, and when it says it started.
-///
-/// `started_at` is `None` when the payload carries no timestamp. The gateway
-/// then cannot tell this engine from one it has just stopped, so a stopped
-/// workspace keeps its stop. See `GatewayState::adopt_running_engines`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LiveEngine {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Ask the engine socket whether `workspace`'s engine is there, and when it
-/// started.
-///
-/// `None` means no engine of `workspace` answered, so there is nothing to
-/// adopt. Something else answering is the same `None`. This is
-/// [`probe_health`] plus the one field that tells a fresh engine from one a stop
-/// is still draining. The two stay separate because the supervisor's 2s probe of
-/// a stack it already holds has no use for the body.
 pub async fn probe_live_engine(engine: &EngineAddress, workspace: &Path) -> Option<LiveEngine> {
     let health = own_health_body(
         &get_success_body(engine, "/api/v1/health").await?,
@@ -1019,11 +648,6 @@ pub async fn probe_live_engine(engine: &EngineAddress, workspace: &Path) -> Opti
     })
 }
 
-/// The `started_at` an engine's health payload reports, as an instant.
-///
-/// Every failure collapses to `None`: a missing field, or a timestamp in some
-/// other format. A caller reading `None` treats the engine as
-/// one it cannot identify, never as a fresh one.
 fn started_at_in(health: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
     let stamp = health.get("started_at")?.as_str()?;
     Some(chrono::DateTime::parse_from_rfc3339(stamp).ok()?.into())
@@ -1037,54 +661,27 @@ fn calls_gateway_over_tls(health: &serde_json::Value) -> bool {
         .is_some_and(|contract| contract.has(LOOPBACK_TLS))
 }
 
-/// Read a running engine's unread-notification count through its count-only
-/// probe (`?limit=0`). The row subscription calls it on a poke. Best-effort:
-/// any transport, non-2xx or parse failure returns `None`, so the row shows no
-/// badge until the retry answers.
-///
-/// This HTTP read is the ONLY count path: the gateway deliberately holds no DB
-/// handle (ADR 0014 §1). So a STOPPED workspace contributes nothing to the
-/// per-row badge or the aggregate total, which is the settled behaviour.
 pub async fn fetch_unread_count(engine: &EngineAddress) -> Option<u64> {
     let body = get_success_body(engine, "/api/v1/notifications?limit=0").await?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     json.get("unread_count")?.as_u64()
 }
 
-/// Whether an engine runs no turn right now, read off the thread list it
-/// already serves. `None` when it did not answer, which no caller may read as
-/// idle: a respawn then would kill a turn that never resumes.
 pub async fn engine_is_idle(engine: &EngineAddress) -> Option<bool> {
     let body = get_success_body(engine, "/api/v1/threads/list?status=running&limit=1").await?;
     no_thread_listed(&body)
 }
 
-/// Is this thread-list body an empty list? `None` for any other shape.
 fn no_thread_listed(body: &str) -> Option<bool> {
     let json: serde_json::Value = serde_json::from_str(body).ok()?;
     Some(json.as_array()?.is_empty())
 }
 
-/// Fetch a running engine's backup line, for the picker's per-row note.
-/// Best-effort on the same terms as [`fetch_unread_count`], and for the same
-/// reason: the gateway holds no database handle (ADR 0014 §1), so a stopped
-/// workspace has no backup fact and its row says nothing.
-///
-/// Every failure returns `None`, including a malformed `at`. A row that says
-/// nothing is honest; a row that reports a nightly-backed-up workspace as never
-/// backed up is not. Deliberately no `provider` parameter and no cloud call.
 pub async fn fetch_last_successful_backup(engine: &EngineAddress) -> Option<LastSuccessfulBackup> {
     let body = get_success_body(engine, "/api/v1/backup/last-successful").await?;
     parse_last_successful_backup(&body)
 }
 
-/// Read the backup line out of an engine's answer. Split from the request so the
-/// tolerated shapes are testable without a socket.
-///
-/// `at` is parsed rather than forwarded as text, so an unreadable timestamp
-/// becomes "unknown" here instead of an `Invalid Date` in the picker. A missing
-/// or null `at` is a real answer (never backed up), so only a present-but-
-/// unparseable one discards the whole reading.
 fn parse_last_successful_backup(body: &str) -> Option<LastSuccessfulBackup> {
     let json: serde_json::Value = serde_json::from_str(body).ok()?;
     let at = match json.get("at") {
@@ -1095,8 +692,6 @@ fn parse_last_successful_backup(body: &str) -> Option<LastSuccessfulBackup> {
                 .with_timezone(&chrono::Utc),
         ),
     };
-    // Lenient, unlike `at`: without the instant the row keeps the engine's
-    // verdict from the read, which is still true of that moment.
     let stale_at = json
         .get("stale_at")
         .and_then(serde_json::Value::as_str)
@@ -1110,65 +705,19 @@ fn parse_last_successful_backup(body: &str) -> Option<LastSuccessfulBackup> {
     })
 }
 
-/// Header the engine reads the originating device off. Mirrors
-/// `api::actor::HEADER_DEVICE_ID` in `lucidos-engine`, which the gateway cannot
-/// depend on. Rename one and the other must follow in lockstep, the same rule
-/// as the CLI's copy of the token header.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 
-/// Header carrying the authenticated device's pairing label, percent-encoded.
-/// Mirrors `api::actor::HEADER_DEVICE_LABEL` in `lucidos-engine`, same rule.
 pub const HEADER_DEVICE_LABEL: &str = "x-lucidos-device-label";
 
-/// How long the restart-intent notify may take before it is abandoned. Short on
-/// purpose: this sits in front of a user-visible Restart click, and the restart
-/// proceeds regardless. Well clear of a loopback round-trip to a healthy
-/// engine, which is sub-millisecond.
-///
-/// The whole budget is only ever spent on an engine that is NOT answering, and
-/// the caller holds that stack's lock while it waits. A picker poll can
-/// therefore stall behind it. Accepted rather than optimised away, because
-/// `respawn_stack` runs on the very next line and holds the same lock for
-/// longer. Skipping the notify for an `Unhealthy` stack is worse: a merely BUSY
-/// engine misses health probes without being dead, and its in-flight threads
-/// are exactly what the attribution is for.
 const RESTART_INTENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What a restart-intent notify did. Returned rather than logged and dropped,
-/// so the call sites and the tests can tell the three outcomes apart. **No
-/// caller may treat any of them as a reason not to restart.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartIntentNotify {
-    /// No device asked, so there is nothing to attribute and no call was made.
-    /// This is the supervisor's health respawn, `stop.sh`'s curl, the dev
-    /// launcher: every teardown that is genuinely not a user action.
     Skipped,
-    /// The engine acknowledged. Its next teardown will be device-attributed.
     Delivered,
-    /// The engine could not be reached, was too slow, or refused. The restart
-    /// goes ahead and its threads settle the way they did before this existed.
     Failed,
 }
 
-/// Tell one workspace's engine that a HUMAN asked for the teardown it is about
-/// to be signalled for, and which device they were on. Called immediately
-/// before `stop_engine_process` on the control-plane restart path, and nowhere
-/// else.
-///
-/// The engine cannot work this out for itself: `SIGUSR1` carries no sender.
-/// Without this call the picker's Restart is indistinguishable from a crash,
-/// and its in-flight threads settle at `failed` with no auto-resume. See the
-/// engine's `restart_intent` handler.
-///
-/// **Best effort, and bounded.** A failure here costs attribution on one
-/// restart, while blocking the restart would cost the user the thing they
-/// clicked. So every failure mode collapses to [`RestartIntentNotify`].
-///
-/// **`None` means skip, not "unknown device".** The engine refuses a call with
-/// no device anyway, so not calling is both cheaper and the same answer.
-///
-/// `signer` is the workspace id and the engine's stamp key. The engine accepts
-/// only a stamped device, so an engine adopted keyless refuses the notify.
 pub async fn notify_restart_intent(
     engine: &EngineAddress,
     signer: Option<(&str, &StampKey)>,
@@ -1238,12 +787,10 @@ mod tests {
                 PoolExhausted,
             ),
             (r#"{"database_reachable":true}"#, Reachable),
-            // A pool flag never overrides a reachable database.
             (
                 r#"{"database_reachable":true,"database_pool_exhausted":true}"#,
                 Reachable,
             ),
-            // An older engine.
             (r#"{"status":"ok"}"#, Reachable),
         ];
         for (body, report) in table {
@@ -1252,8 +799,6 @@ mod tests {
         }
     }
 
-    /// A child that is still running is live, and probing it must NOT reap or
-    /// otherwise disturb it: the very next `try_wait` has to still work.
     #[cfg(unix)]
     #[test]
     fn a_running_child_is_live() {
@@ -1270,8 +815,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Wait for our `true` child to exit without collecting its status.
-    /// `WNOWAIT` leaves it a zombie for the liveness probe to inspect and reap.
     #[cfg(unix)]
     fn wait_until_defunct(pid: u32) {
         loop {
@@ -1296,15 +839,9 @@ mod tests {
         }
     }
 
-    /// The bug this whole helper exists for: an exited child that nobody has
-    /// waited on is a ZOMBIE, and `kill(pid, 0)` still succeeds for it. It must
-    /// read as dead, and the probe must reap it so it stops existing at all.
     #[cfg(unix)]
     #[test]
     fn an_unreaped_exited_child_is_a_zombie_and_not_live() {
-        // Dropping a `Child` deliberately does NOT wait, so letting the handle
-        // fall out of scope leaves exactly the state a re-exec'd gateway is in:
-        // our own child, exited, and nobody reaping it.
         let pid = std::process::Command::new("true")
             .spawn()
             .expect("spawn true")
@@ -1322,15 +859,12 @@ mod tests {
             !pid_is_live(pid),
             "a zombie must not read as live (kill -0 says it does)"
         );
-        // And it is gone now, not merely reported dead.
         let mut status: libc::c_int = 0;
         // SAFETY: WNOHANG never blocks; the pid is expected to be reaped already.
         let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
         assert!(waited < 0, "the probe must have reaped the zombie");
     }
 
-    /// Pid 0 must be rejected before it reaches `waitpid`, where it would mean
-    /// "any child in my process group" and could reap an unrelated engine.
     #[cfg(unix)]
     #[test]
     fn pid_zero_is_never_live_and_never_reaps() {
@@ -1338,13 +872,10 @@ mod tests {
             .spawn()
             .expect("spawn true");
         let pid = bystander.id();
-        // Wait for it to actually exit, so it is exactly the kind of child
-        // `waitpid(0, …)` would grab if the guard were missing.
         wait_until_defunct(pid);
 
         assert!(!pid_is_live(0), "pid 0 must never read as live");
 
-        // The bystander's exit status is still ours to collect.
         match bystander.try_wait() {
             Ok(Some(_)) => {}
             other => panic!("pid 0 probe consumed another child's status: {other:?}"),
@@ -1353,8 +884,6 @@ mod tests {
         let _ = pid;
     }
 
-    /// A corrupt pidfile must never turn a reclaim into a group signal or a
-    /// broadcast. `u32::MAX` wraps to -1 as a `pid_t`, which is everything.
     #[cfg(unix)]
     #[test]
     fn only_a_positive_pid_is_a_kill_target() {
@@ -1383,8 +912,6 @@ mod tests {
         ));
     }
 
-    /// A live pid running some other program is reported as that program, and
-    /// one running the expected program is not.
     #[cfg(unix)]
     #[test]
     fn a_reused_pid_is_named_by_what_it_now_runs() {
@@ -1395,7 +922,6 @@ mod tests {
         let pid = single_process_pid(child.id()).expect("a positive pid");
         let exe = pid_executable(pid);
         let other = other_program_at_pid(pid, ENGINE_EXECUTABLE_NAME);
-        // Named from the probe, since `sleep` may resolve to a multi-call binary.
         let name = exe
             .as_deref()
             .and_then(Path::file_name)
@@ -1410,8 +936,6 @@ mod tests {
         assert_eq!(itself, None);
     }
 
-    /// A pid that is not ours and not running (already reaped by its own parent,
-    /// or never existed) is not live either.
     #[cfg(unix)]
     #[test]
     fn a_gone_pid_is_not_live() {
@@ -1419,23 +943,16 @@ mod tests {
             .spawn()
             .expect("spawn true");
         let pid = child.id();
-        let _ = child.wait(); // reaped here, so the pid is fully gone
+        let _ = child.wait();
         assert!(!pid_is_live(pid), "a reaped pid must not read as live");
     }
 
-    /// Regression cover: a live stack running out of an ORPHANED coding-agent
-    /// worktree serves a frozen `dist/`, so every frontend-only Apply silently
-    /// does nothing.
     #[test]
     fn detects_coding_agent_worktree_paths() {
         for p in [
             "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc",
             "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist",
             "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/target/debug/lucidos-engine",
-            // The PUBLISHED launch path (ADR 0063), which is what a worktree
-            // build actually produces and therefore what this guard has to
-            // catch. It moved out of `target/`, and the refusal must not have
-            // moved with it.
             "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/.launch/debug/plain/lucidos-engine",
         ] {
             assert!(
@@ -1445,8 +962,6 @@ mod tests {
         }
     }
 
-    /// Must not fire on a real checkout — including paths that merely contain
-    /// the word "worktrees", which a naive substring match would catch.
     #[test]
     fn leaves_real_checkout_paths_alone() {
         for p in [
@@ -1463,7 +978,6 @@ mod tests {
         }
     }
 
-    /// The pair must be adjacent — `.lucidos/<x>/worktrees` is not a CC worktree.
     #[test]
     fn requires_adjacent_lucidos_worktrees_components() {
         assert!(!path_is_in_cc_worktree(Path::new(
@@ -1472,9 +986,6 @@ mod tests {
         assert!(path_is_in_cc_worktree(Path::new("/w/.lucidos/worktrees")));
     }
 
-    /// The predicate must not touch the filesystem: an orphaned worktree's
-    /// directory is often already gone, and that is exactly when the guard has
-    /// to keep firing.
     #[test]
     fn does_not_require_the_path_to_exist() {
         assert!(path_is_in_cc_worktree(Path::new(
@@ -1482,8 +993,6 @@ mod tests {
         )));
     }
 
-    /// The picker binds its per-workspace auto-start toggle to this field, so the
-    /// status JSON must ALWAYS carry `autostart` (no skip).
     #[test]
     fn workspace_status_serializes_autostart() {
         let ws = Workspace {
@@ -1514,19 +1023,9 @@ mod tests {
         assert_eq!(json["autostart"], serde_json::json!(true));
         assert_eq!(json["health"], serde_json::json!("healthy"));
         assert_eq!(json["id"], serde_json::json!("dev"));
-        // Unknown count → field omitted (no misleading zero badge).
         assert!(json.get("unread_count").is_none());
     }
 
-    // ── Restart intent ───────────────────────────────────────────────────────
-    //
-    // The notify that turns a picker Restart from something the engine cannot
-    // distinguish from a crash into a user action it attributes to a device.
-    // Exercised against a mock engine on a real socket, because the thing worth
-    // pinning is the wire: the method, the path and the device header.
-
-    /// A one-shot engine that records the raw request it was sent, then 204s.
-    /// The directory holds its engine socket, so the caller keeps it alive.
     async fn capturing_engine() -> (
         tempfile::TempDir,
         EngineAddress,
@@ -1584,9 +1083,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_notify_is_aimed_at_the_stack_being_signalled_and_no_other() {
-        // Cross-workspace isolation: restarting one workspace must not touch
-        // another. The engine socket is the only thing that selects a target, so
-        // a second engine on a second socket must see nothing at all.
         let (_target_dir, target, target_saw) = capturing_engine().await;
         let (_bystander_dir, bystander, bystander_saw) = capturing_engine().await;
 
@@ -1605,9 +1101,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_device_means_no_call_at_all() {
-        // This is what keeps every non-user teardown honest: the supervisor's
-        // health respawn, `stop.sh`'s curl, the dev launcher. None of them names
-        // a device, so none of them can make a crash look like a user restart.
         let (_dir, engine, captured) = capturing_engine().await;
 
         for absent in [None, Some(""), Some("   ")] {
@@ -1625,10 +1118,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_engine_fails_the_notify_and_nothing_else() {
-        // The restart proceeds whatever happens here, so the only thing this
-        // must do is come back, promptly, with a verdict the caller can log. An
-        // engine that is already gone (or wedged) is the common case: the user
-        // is restarting it for a reason.
         let dir = test_engine::scratch();
         let started = Instant::now();
         let outcome =
@@ -1643,7 +1132,6 @@ mod tests {
         );
     }
 
-    /// A known count surfaces as `unread_count` for the picker's per-row badge.
     #[test]
     fn workspace_status_serializes_unread_count_when_known() {
         let ws = Workspace {
@@ -1672,14 +1160,8 @@ mod tests {
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["unread_count"], serde_json::json!(4));
-        // Unknown backup line → key omitted, so a row with no answer draws no
-        // note rather than reporting the workspace as never backed up.
         assert!(json.get("last_successful_backup").is_none());
     }
-
-    // ── The picker's backup line ─────────────────────────────────────────────
-    //
-    // See `docs/plans/2026-08-27-picker-last-successful-backup.md`.
 
     fn healthy_stack(backup: Option<LastSuccessfulBackup>) -> StackRuntime {
         StackRuntime {
@@ -1707,7 +1189,6 @@ mod tests {
         }
     }
 
-    /// A polled backup line reaches the picker whole, timestamp included.
     #[test]
     fn workspace_status_serializes_the_backup_line_when_known() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-08-26T02:00:07Z")
@@ -1731,9 +1212,6 @@ mod tests {
         );
     }
 
-    /// Never backed up is a real ANSWER, not a missing one, so the line is
-    /// present with a null `at`. The picker states it in words; the omitted-key
-    /// case above is the one that means "we could not ask".
     #[test]
     fn a_workspace_that_never_backed_up_still_reports_a_line() {
         let stack = healthy_stack(Some(LastSuccessfulBackup {
@@ -1749,8 +1227,6 @@ mod tests {
         assert_eq!(line["configured"], serde_json::json!(false));
     }
 
-    /// The re-key waits for an empty running list, and reads anything else as
-    /// not idle.
     #[test]
     fn idleness_is_an_empty_running_list_and_nothing_else() {
         assert_eq!(no_thread_listed("[]"), Some(true));
@@ -1759,7 +1235,6 @@ mod tests {
         assert_eq!(no_thread_listed("not json"), None);
     }
 
-    /// The engine's answer, read the way the row subscription reads it.
     #[test]
     fn a_backup_answer_parses_with_and_without_a_timestamp() {
         let dated = parse_last_successful_backup(
@@ -1776,8 +1251,6 @@ mod tests {
         assert!(never.stale);
     }
 
-    /// The engine names the instant its verdict flips, and a listing applies
-    /// it. So a backup turns stale on the row with no event and no re-read.
     #[test]
     fn a_backup_line_turns_stale_at_the_engines_instant() {
         let line = parse_last_successful_backup(
@@ -1788,11 +1261,9 @@ mod tests {
         let stale_at = line.stale_at.expect("the engine named the instant");
         assert!(!line.as_of(stale_at).stale);
         assert!(line.as_of(stale_at + chrono::Duration::seconds(1)).stale);
-        // The instant never reaches the picker: the wire shape is unchanged.
         let json = serde_json::to_value(line).unwrap();
         assert!(json.get("stale_at").is_none(), "{json}");
 
-        // Without the instant the engine's verdict stands, either way.
         let now = chrono::Utc::now();
         for stale in [true, false] {
             let body = format!(r#"{{"at":null,"stale":{stale},"configured":true}}"#);
@@ -1807,10 +1278,6 @@ mod tests {
         assert_eq!(garbled.stale_at, None);
     }
 
-    /// Anything the gateway cannot read whole is UNKNOWN, so the row stays
-    /// quiet. A garbled timestamp is the sharp case: forwarded as text it would
-    /// reach the picker as an `Invalid Date`, and a missing `stale` would have
-    /// the row guess.
     #[test]
     fn an_unreadable_backup_answer_is_no_answer() {
         for body in [
@@ -1827,10 +1294,6 @@ mod tests {
         }
     }
 
-    // ── Finding an engine somebody else started ──────────────────────────────
-
-    /// The field the discovery pass reads to tell a fresh engine from the one a
-    /// stop is still draining.
     #[test]
     fn a_health_payload_names_when_the_engine_started() {
         let body =
@@ -1839,8 +1302,6 @@ mod tests {
         assert_eq!(started.to_rfc3339(), "2026-08-22T09:34:40.135361+00:00");
     }
 
-    /// Anything unreadable names no start time, and the caller then treats the
-    /// engine as one it cannot identify rather than as a fresh one.
     #[test]
     fn an_unreadable_payload_names_no_start_time() {
         for body in [
@@ -1866,9 +1327,6 @@ mod tests {
         );
     }
 
-    /// I8: an engine socket held by somebody else is never healthy and never
-    /// adopted, and the probe sends it nothing. That is what keeps the
-    /// gateway from adopting, or later proxying to, a stranger.
     #[tokio::test]
     async fn a_strangers_socket_probes_foreign_and_hears_nothing() {
         let dir = test_engine::scratch();
@@ -1888,16 +1346,12 @@ mod tests {
         assert!(recorded.await.expect("recorder").is_empty());
     }
 
-    /// A 2xx is not an identity. The stand-in's 204 names no workspace, so it
-    /// is not this workspace's engine, however healthy it sounds.
     #[tokio::test]
     async fn an_answer_that_names_no_workspace_is_no_engine_of_ours() {
         let (_dir, engine, _saw) = capturing_engine().await;
         assert_eq!(probe_live_engine(&engine, Path::new("/ws/a")).await, None);
     }
 
-    /// A stand-in engine answering every health probe with `body`. The
-    /// directory holds its engine socket, so the caller keeps it alive.
     fn engine_answering(body: String) -> (tempfile::TempDir, EngineAddress) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = test_engine::scratch();
@@ -1917,9 +1371,6 @@ mod tests {
         (dir, engine)
     }
 
-    /// The supervisor's probe grants Healthy only to this workspace's engine.
-    /// Another workspace's engine answering on the port is Foreign, so it can
-    /// never keep a stack healthy.
     #[tokio::test]
     async fn a_probe_answered_by_another_workspace_is_foreign() {
         let root = tempfile::TempDir::new().unwrap();
@@ -1935,8 +1386,6 @@ mod tests {
         assert_eq!(probe_health(&own, &ours).await, ProbeOutcome::Healthy);
     }
 
-    /// Only an engine that says so reads as a gateway's own. An older engine
-    /// omits the field, and an engine another starter launched says `false`.
     #[tokio::test]
     async fn a_probe_reads_whether_a_gateway_spawned_the_engine() {
         let root = tempfile::TempDir::new().unwrap();
@@ -1954,8 +1403,6 @@ mod tests {
         }
     }
 
-    /// Only an engine that says it serves the row stream is subscribed to.
-    /// An older engine omits the field and would count the gateway as a page.
     #[tokio::test]
     async fn a_probe_reads_whether_the_engine_serves_the_row_stream() {
         let root = tempfile::TempDir::new().unwrap();
@@ -1980,8 +1427,6 @@ mod tests {
         }
     }
 
-    /// Only an engine whose workspace client names the https loopback calls
-    /// its gateway over TLS. An older engine names no such capability.
     #[tokio::test]
     async fn a_probe_reads_whether_the_engine_calls_its_gateway_over_tls() {
         use lucidos_gateway_stamp::workspace_client::ClientContract;
@@ -2005,7 +1450,6 @@ mod tests {
         }
     }
 
-    /// Only a body naming the expected directory counts, by canonical path.
     #[test]
     fn a_health_body_is_ours_only_when_it_names_our_workspace() {
         let root = tempfile::TempDir::new().unwrap();
@@ -2022,10 +1466,6 @@ mod tests {
         assert!(own_health_body("not json", &ours).is_none());
     }
 
-    /// A spawned engine must INHERIT its model cache location rather than be
-    /// given a per-workspace one (ADR 0061). Pinning `FASTEMBED_CACHE_DIR` or
-    /// `HF_HOME` here would leave a private copy under every workspace, and
-    /// override the shared directory the packaged app already set.
     #[test]
     fn a_spawned_engine_inherits_the_model_cache_instead_of_getting_its_own() {
         let ws = Workspace {
@@ -2100,9 +1540,6 @@ mod tests {
         }
     }
 
-    /// The engine probes its own public ingress, so it must be told the port a
-    /// delivery actually lands on. Deriving it a second time in the engine would
-    /// keep answering 5261 the day `HOOK_PORT_OFFSET` moves.
     #[test]
     fn a_spawned_engine_is_told_the_port_its_deliveries_arrive_on() {
         let ws = Workspace {
@@ -2163,16 +1600,11 @@ mod tests {
                 ),
             ]
         );
-        // The engine serves TLS iff it sees `LUCIDOS_TLS_*`. Handing a pair on
-        // under that name would make its loopback port serve https, against the
-        // http its ports file names.
         assert!(handed.iter().all(|(k, _)| !k.starts_with("LUCIDOS_TLS_")));
     }
 
     #[test]
     fn a_missing_leaf_or_user_cert_clears_its_names() {
-        // The same rule `serves_tls` applies: an empty value is how a launch
-        // script spells unset, so half a pair is no pair.
         for (cert, key) in [
             (None, None),
             (Some("/certs/cert.pem"), None),
@@ -2188,9 +1620,6 @@ mod tests {
         }
     }
 
-    /// The file is a KEY=VALUE store the dev scripts also write. `swap_ports`
-    /// puts the database details in there and `status.sh` sources them, so a
-    /// clobbering write would strip a live dev workspace's Postgres config.
     #[test]
     fn publishing_ports_keeps_the_keys_the_dev_scripts_own() {
         let merged = merge_ports_file(
@@ -2204,7 +1633,6 @@ mod tests {
         );
     }
 
-    /// The packaged case: no file at all until the gateway writes one.
     #[test]
     fn publishing_ports_writes_both_keys_when_there_is_no_file() {
         assert_eq!(
@@ -2213,9 +1641,6 @@ mod tests {
         );
     }
 
-    /// A file left by an earlier run can name a port the engine no longer
-    /// listens on, and a scheme it no longer serves. Both are corrected, or the
-    /// caller connects somewhere dead and blames the target workspace.
     #[test]
     fn publishing_ports_corrects_a_stale_file() {
         assert_eq!(
@@ -2224,14 +1649,6 @@ mod tests {
         );
     }
 
-    /// The publication has to be wired into the spawn, not merely available.
-    /// That is the half the unit tests above cannot see, and the half that was
-    /// missing: `merge_ports_file` could be perfect and every packaged
-    /// workspace still unresolvable. Spawns `/usr/bin/true` as a stand-in
-    /// engine, which is enough because publication does not wait on health.
-    ///
-    /// The spawner writes no pidfile. Only the engine names itself, once it
-    /// holds the workspace's owner lock (ADR 0438).
     #[test]
     fn disposable_engine_remains_in_the_owned_gateway_group() {
         use std::os::unix::fs::PermissionsExt;
@@ -2347,9 +1764,6 @@ mod tests {
         );
     }
 
-    /// Invariant 2 of the unattested-callers plan: the stamp key crosses the
-    /// stdin pipe and nothing else. The stand-in engine records its
-    /// environment and the first line of its stdin.
     #[cfg(unix)]
     #[test]
     fn the_stamp_key_crosses_stdin_and_never_the_environment() {

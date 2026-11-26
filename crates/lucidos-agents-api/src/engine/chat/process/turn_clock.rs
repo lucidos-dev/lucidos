@@ -1,19 +1,3 @@
-//! The turn's time context, split across two prompt tiers (ADR 0084).
-//!
-//! Anthropic caches by prefix. A value changing every turn, anywhere in the
-//! system block, rewrites that whole tier at every turn boundary. A wire probe
-//! measured 45,824 tokens rewritten against 27,145 read. It also found two
-//! unrelated threads at the same 58,854 system bytes, hashing differently. The
-//! clock alone kept a workspace-level block from being shared.
-//!
-//! Two rules come out of that, one per half:
-//!
-//! - [`timezone_section`] takes NO timestamp. It renders only from the IANA
-//!   name, so the cached block cannot notice the time or the thread.
-//! - [`current_time_block`] takes [`LucidosEngine::turn_started_at`], never a
-//!   wall clock. The message array is rebuilt from events per request, so the
-//!   block must come from persisted state. Otherwise the miss just moves tiers.
-
 use crate::engine::LucidosEngine;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -45,10 +29,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The invariant half, spliced into the cached system block.
-///
-/// Names the timezone and the rules for handling it, and points at the
-/// reading. No timestamp reaches this text.
 pub(super) fn timezone_section(user_timezone: &str) -> String {
     if user_timezone.is_empty() {
         return "USER TIMEZONE: not set yet, so times are given in UTC.\n\
@@ -92,7 +72,6 @@ pub(super) fn current_time_block(at: DateTime<Utc>, user_timezone: &str) -> Stri
     )
 }
 
-/// "Sunday, August 17, 2026", in whichever zone the value carries.
 fn date_of<Tz: chrono::TimeZone>(at: DateTime<Tz>) -> String
 where
     Tz::Offset: std::fmt::Display,
@@ -109,8 +88,6 @@ mod tests {
         Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
     }
 
-    /// The clock is the newest event on the thread. An answer-driven resume
-    /// re-uses an old request, so an older event must not win.
     #[tokio::test]
     async fn the_turn_started_at_is_the_newest_event_on_the_thread() {
         use crate::test_support::{setup_test_db, teardown_test_db, test_db_url};
@@ -157,12 +134,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The measured bug, as an assertion. Two turns differing only in when they
-    /// happened must produce the same system bytes.
-    ///
-    /// The anchors sit either side of a DST transition, the hardest case: it
-    /// moves offset, date, time and weekday at once. The old code spliced all
-    /// four into the system block.
     #[test]
     fn the_system_half_ignores_the_clock_and_the_message_half_does_not() {
         let winter = utc(2026, 1, 14, 13, 2);
@@ -179,8 +150,6 @@ mod tests {
             "the message half carries the reading, so it must move"
         );
 
-        // Nothing clock-shaped survives in the cached tier: no reading, no
-        // weekday, no offset (that last one moves twice a year on its own).
         let section = timezone_section("Europe/Oslo");
         for leaked in [
             "CURRENT TIME:",
@@ -197,8 +166,6 @@ mod tests {
         }
     }
 
-    /// A zone whose offset differs between the anchors proves the offset really
-    /// moved out of the system block, rather than being absent from one sample.
     #[test]
     fn the_offset_rides_with_the_reading_across_a_dst_transition() {
         let winter = current_time_block(utc(2026, 1, 14, 13, 2), "Europe/Oslo");
@@ -208,8 +175,6 @@ mod tests {
         assert!(summer.contains("15:02 Europe/Oslo (UTC+02:00)"), "{summer}");
     }
 
-    /// The agent answers "what time is it" from this block alone, so every part
-    /// it needs is in it: local date, local time, IANA name, offset, and UTC.
     #[test]
     fn the_block_carries_local_and_utc_unambiguously() {
         let block = current_time_block(utc(2026, 8, 17, 13, 2), "Europe/Oslo");
@@ -226,9 +191,6 @@ mod tests {
         );
     }
 
-    /// The old text dated the UTC instant, then paired it with a local
-    /// time-of-day. A late-evening turn therefore named the wrong day, and
-    /// every "yesterday" after it was off by one.
     #[test]
     fn the_local_date_is_the_local_date_past_midnight() {
         let block = current_time_block(utc(2026, 8, 17, 23, 30), "Europe/Oslo");
@@ -243,8 +205,6 @@ mod tests {
         );
     }
 
-    /// Timezone is a mandatory preference, so an empty one means setup mode.
-    /// The agent still needs a clock to run that interview.
     #[test]
     fn an_unset_timezone_still_gets_a_clock_and_a_pointer_to_it() {
         let block = current_time_block(utc(2026, 8, 17, 13, 2), "");
@@ -258,15 +218,12 @@ mod tests {
         assert!(section.contains("not set yet"), "{section}");
     }
 
-    /// A garbage IANA name must not lose the reading. It falls back to UTC,
-    /// which the offset then reports honestly as `+0`.
     #[test]
     fn an_unparseable_timezone_falls_back_to_utc_rather_than_dropping_the_time() {
         let block = current_time_block(utc(2026, 8, 17, 13, 2), "Not/AZone");
         assert!(block.contains("at 13:02 Not/AZone (UTC+00:00)."), "{block}");
     }
 
-    /// A negative offset renders with its sign, not as a bare number.
     #[test]
     fn a_western_timezone_renders_a_signed_offset() {
         let block = current_time_block(utc(2026, 8, 17, 13, 2), "America/New_York");
@@ -276,9 +233,6 @@ mod tests {
         );
     }
 
-    /// Not every zone is a whole hour from UTC. India is +05:30 and Nepal
-    /// +05:45, and a truncated offset is a figure the prompt states as fact and
-    /// the agent then converts from.
     #[test]
     fn a_sub_hour_offset_keeps_its_minutes() {
         let india = current_time_block(utc(2026, 8, 17, 13, 2), "Asia/Kolkata");
@@ -294,16 +248,6 @@ mod tests {
         );
     }
 
-    // ===== The wire, where the cache actually looks =====
-    //
-    // The tests above pin the clock's two halves. These assemble a real
-    // Anthropic request and assert on its serialized bytes, which is what
-    // Anthropic hashes and what `llm::cache_probe` reports.
-    //
-    // Scope is the whole cached-tier contract rather than the clock alone,
-    // because the property is one property: `super::turn_tail`'s two values
-    // split the same way and share this harness.
-
     use super::super::turn_tail::{
         client_url_block, engine_build_block, version_status, CLIENT_URL_POINTER,
         ENGINE_BUILD_POINTER,
@@ -314,10 +258,6 @@ mod tests {
     const TEST_URL: &str = "https://example.invalid/v1/messages";
     const TZ: &str = "Europe/Oslo";
 
-    /// The system block in miniature: the identity framing, the timezone
-    /// section, the language line, and the two pointers at the values that
-    /// left this tier. The rest of the real prompt is workspace-level static
-    /// text that would only pad the bytes.
     fn system_prompt() -> String {
         format!(
             "You are managing Lucidos, a personal assistant running in the \"myws\" workspace.\
@@ -326,9 +266,7 @@ mod tests {
         )
     }
 
-    /// The per-turn readings, in the order `run.rs` appends them.
     struct Tail {
-        /// `(update_available, source_behind_head)`.
         build: (bool, bool),
         origin: &'static str,
     }
@@ -342,9 +280,6 @@ mod tests {
         }
     }
 
-    /// One turn's messages, in the order `run.rs` builds them: a resume tool
-    /// pair, then the user message whose parts end with the request line and
-    /// then the three tail blocks.
     fn turn_messages(history: &str, request: &str, anchor: DateTime<Utc>) -> Vec<Message> {
         turn_messages_with_tail(history, request, anchor, Tail::default())
     }
@@ -419,15 +354,6 @@ mod tests {
         sha(&serde_json::to_vec(&request.system).expect("system serializes"))
     }
 
-    /// The message prefix Anthropic looks up, through `last`, canonicalized to
-    /// the content it keys on rather than the envelope we happened to send.
-    ///
-    /// Two encodings are undone, both from the wire's breakpoint placement on
-    /// the last two messages. It adds `cache_control`, and it rewrites bare
-    /// string content into a one-block array (the only shape that accepts the
-    /// marker). Neither changes a token, which is what the ~99% mid-turn read
-    /// rate in `data/artifacts/prompt-cache-clock-invalidation.md` shows. Left
-    /// in, both would read as prefix churn every time a breakpoint advances.
     fn message_prefix_hash(request: &ClaudeRequest, last: usize) -> String {
         let canonical: Vec<serde_json::Value> = request.messages[..=last]
             .iter()
@@ -458,11 +384,6 @@ mod tests {
             .count()
     }
 
-    /// Rebuilding one turn must reproduce every cached byte, and a LATER turn
-    /// must still find the same system block waiting for it.
-    ///
-    /// The second half is the measured bug: `system_bytes` held constant while
-    /// `system_hash` moved, so a boundary two minutes old rewrote 45,824 tokens.
     #[test]
     fn the_cached_prefix_survives_a_rebuild_and_a_later_turn() {
         let anchor = utc(2026, 8, 17, 13, 2);
@@ -480,8 +401,6 @@ mod tests {
             "a rebuild of one turn changed the message prefix"
         );
 
-        // Three hours later, same conversation state. Only the reading moves,
-        // and it moves in the message tier where it is uncached anyway.
         let later = request_for(turn_messages(
             "User: hi",
             "what is on today?",
@@ -498,13 +417,9 @@ mod tests {
             "the reading must actually be present in the message tier"
         );
 
-        // tools[-1], system, messages[-1] and messages[-2]. All four are spent.
         assert_eq!(marker_count(&first), 4);
     }
 
-    /// Round 2 pushes the breakpoint onto a newer last message, so round 1's
-    /// last message is now INSIDE the cached prefix. It has to be byte-identical
-    /// to what round 1 sent, or the fix moved the miss rather than removing it.
     #[test]
     fn round_two_finds_round_ones_last_message_unchanged() {
         let anchor = utc(2026, 8, 17, 13, 2);
@@ -538,13 +453,6 @@ mod tests {
         assert_eq!(marker_count(&round_two), 4);
     }
 
-    /// The system block is workspace-level, so two unrelated threads should
-    /// share one cache entry. A probe saw both at 58,854 bytes with differing
-    /// hashes, which the clock alone explained.
-    ///
-    /// Equal byte counts are not proof of equal content, which is why this
-    /// asserts the hash. It also catches a future thread-scoped value leaking
-    /// into the block, which would break sharing without moving the count.
     #[test]
     fn two_threads_in_one_workspace_share_the_system_block() {
         let one = request_for(turn_messages(
@@ -563,20 +471,9 @@ mod tests {
             system_hash(&two),
             "two threads in one workspace must present the same system block"
         );
-        // Guards against passing on an empty request: the threads really do
-        // differ everywhere the system block is not.
         assert_ne!(message_prefix_hash(&one, 2), message_prefix_hash(&two, 2));
     }
 
-    /// The guard above compares two threads at ONE moment, so a value that is
-    /// per-TURN rather than per-thread reads the same on both and passes. That
-    /// is exactly how the engine build state and the client URL sat in the
-    /// cached tier undetected. This is the missing axis: one thread, two turns,
-    /// with both of those values moved.
-    ///
-    /// A build flip alone was measured costing a full system-tier rewrite, at
-    /// 21,668 tokens times the write-minus-read rate. The origin flip is the
-    /// same shape, for a user reaching one workspace from two clients.
     #[test]
     fn one_thread_across_turns_keeps_the_system_block() {
         let first = request_for(turn_messages_with_tail(
@@ -588,8 +485,6 @@ mod tests {
                 origin: "https://localhost:5173",
             },
         ));
-        // Later: a newer engine is built and unswitched, and they moved to the
-        // desktop app on another origin.
         let later = request_for(turn_messages_with_tail(
             "User: hi",
             "is the change live?",
@@ -613,9 +508,6 @@ mod tests {
         assert_eq!(marker_count(&later), 4);
     }
 
-    /// The same claim from the other side, and the one a hash cannot make
-    /// readable: no build state and no URL appears anywhere in the system
-    /// block's bytes, whichever turn built it.
     #[test]
     fn no_build_state_and_no_origin_reaches_the_system_block() {
         let system = system_prompt();
@@ -632,7 +524,6 @@ mod tests {
                 "the cached system block leaks {leaked}:\n{system}"
             );
         }
-        // It still POINTS at both, or the agent cannot find them.
         assert!(
             system.contains("[ENGINE BUILD] block at the END"),
             "{system}"

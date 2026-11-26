@@ -1,8 +1,3 @@
-//! A trigger run the guard blocks on a missing grant waits on the owner's
-//! card in its own thread. Allow resumes that same turn, with its transcript
-//! intact, as a run of the same trigger. Always deny ends it, and later runs
-//! of that trigger end at once, without a card.
-
 use crate::engine::agent_question::{answer_pending_question, AnswerResult};
 use crate::engine::chat::process::ChatProcessExt;
 use crate::engine::permission::menu::{ALLOW_ONCE_LABEL, ALWAYS_ALLOW_LABEL, ALWAYS_DENY_LABEL};
@@ -18,8 +13,6 @@ use crate::triggers::TriggerConfig;
 use serde_json::json;
 use uuid::Uuid;
 
-/// A command the trigger channel's guard blocks, and the program grant that
-/// would allow it.
 const BLOCKED_COMMAND: &str = "curl -X POST https://example.com";
 const PROGRAM_GRANT: &str = "Bash(curl:*)";
 
@@ -46,7 +39,6 @@ async fn create_named_trigger(engine: &LucidosEngine, name: &str) -> TriggerConf
     engine.trigger_configs.read().unwrap()[&trigger_id].clone()
 }
 
-/// Fire `config` once, with the mock model calling the blocked command.
 async fn fire(engine: &LucidosEngine, config: &TriggerConfig) -> Uuid {
     let (outcome, thread_id) = fire_outcome(engine, config).await;
     let error = outcome.expect_err("the blocked run parks");
@@ -54,7 +46,6 @@ async fn fire(engine: &LucidosEngine, config: &TriggerConfig) -> Uuid {
     thread_id
 }
 
-/// Fire `config` once, and return how the run ended and its new thread.
 async fn fire_outcome(
     engine: &LucidosEngine,
     config: &TriggerConfig,
@@ -108,7 +99,6 @@ async fn status(engine: &LucidosEngine, thread_id: Uuid) -> String {
         .unwrap()
 }
 
-/// Pick the option labelled `label` on the run's card, as the owner.
 async fn answer(engine: &std::sync::Arc<LucidosEngine>, thread_id: Uuid, label: &str) {
     let (card_id, option_id): (String, String) = sqlx::query_as(
         "SELECT payload->>'tool_use_id', o->>'id' FROM events, \
@@ -130,7 +120,6 @@ async fn answer(engine: &std::sync::Arc<LucidosEngine>, thread_id: Uuid, label: 
     ));
 }
 
-/// The `request_event_id` of the run's reply, once it lands.
 async fn reply_turn(engine: &LucidosEngine, thread_id: Uuid) -> Option<Uuid> {
     for _ in 0..100 {
         let turn: Option<Option<Uuid>> = sqlx::query_scalar(
@@ -149,9 +138,6 @@ async fn reply_turn(engine: &LucidosEngine, thread_id: Uuid) -> Option<Uuid> {
     panic!("the resumed run never replied");
 }
 
-/// How many `TriggerExecuted` the trigger recorded, once at least one lands.
-/// These fires skip the executor, which records the parked fire, so the first
-/// is the resumed run's.
 async fn executions(engine: &LucidosEngine, config: &TriggerConfig) -> i64 {
     for _ in 0..100 {
         let count: i64 = sqlx::query_scalar(
@@ -243,8 +229,6 @@ fn always_allow_grants_the_trigger_and_resumes_in_place() {
     );
 }
 
-/// Always deny writes the card's pattern to that trigger's denies and nothing
-/// else. The next run ends at once with no card, and another trigger still asks.
 async fn always_deny_holds_for_that_trigger_only() {
     let (_pool, db) = setup_test_db().await;
     let (engine, _workspace) = boot_mock_engine(&db).await;

@@ -1,5 +1,3 @@
-//! Real local authentication tests, enabled with the bundled Postgres toolchain.
-
 use super::*;
 use sqlx::Connection as _;
 
@@ -17,7 +15,6 @@ impl Cluster {
         Self::start_with("")
     }
 
-    /// `extra` holds more postmaster options, shell-quoted for `pg_ctl -o`.
     fn start_with(extra: &str) -> Option<Self> {
         let (Some(bin), Some(lib)) = (
             std::env::var_os("LUCIDOS_PG_BIN_DIR"),
@@ -143,7 +140,6 @@ impl Cluster {
 impl Drop for Cluster {
     fn drop(&mut self) {
         if self.data.join("postmaster.pid").exists() {
-            // This fixture owns the cluster and its data directory.
             let _ = self
                 .command("pg_ctl")
                 .arg("-D")
@@ -154,8 +150,6 @@ impl Drop for Cluster {
     }
 }
 
-/// A full cluster refuses before authentication. The refusal must say so,
-/// rather than read as an authentication problem.
 #[tokio::test]
 async fn a_full_cluster_names_its_refusal_in_the_probe_error() {
     let Some(cluster) =
@@ -267,7 +261,6 @@ async fn disk_password_rules_do_not_authorize_a_loaded_trust_cluster() {
         .unwrap();
     assert_eq!(verified.0, socket);
 
-    // Malformed disk rules fail closed even while loaded rules remain safe.
     std::fs::write(
         cluster.data.join("pg_hba.conf"),
         "not a valid authentication rule\n",

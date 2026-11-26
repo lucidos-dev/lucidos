@@ -1,9 +1,3 @@
-//! Held messages: agent-sent messages a coding-agent thread keeps back while it
-//! waits on a human. See ADR 0256.
-//!
-//! The event store is the only state. A `MessageHeld` with no
-//! `HeldMessageReleased` naming it is still held, so a hold survives a restart.
-
 use crate::engine::chat::process::ChatProcessExt;
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,9 +17,6 @@ use crate::engine::types::ChatImage;
 use crate::engine::LucidosEngine;
 use crate::runtime::CodingAgent;
 
-/// The one definition of "still held": a `MessageHeld` row `e` that no
-/// `HeldMessageReleased` on its own thread names. A macro so both queries
-/// below can `concat!` it into a `const`.
 macro_rules! unreleased_held_message_sql {
     () => {
         "e.aggregate = 'thread' \
@@ -38,16 +29,12 @@ macro_rules! unreleased_held_message_sql {
     };
 }
 
-/// The held messages on a thread that nothing has released yet, oldest first.
-/// `$1` is the thread id as text.
 pub(crate) const UNRELEASED_HELD_MESSAGES_SQL: &str = concat!(
     "SELECT e.id, e.payload FROM events e WHERE e.aggregate_id = $1 AND ",
     unreleased_held_message_sql!(),
     " ORDER BY e.sequence ASC"
 );
 
-/// Every unreleased held message in the workspace with its owning thread,
-/// newest first. `$1` is the row limit.
 const WORKSPACE_HELD_MESSAGES_SQL: &str = concat!(
     "SELECT e.id, e.aggregate_id, e.payload, e.created, \
             t.title, t.first_message, t.source, t.archive_state, t.status \
@@ -58,8 +45,6 @@ const WORKSPACE_HELD_MESSAGES_SQL: &str = concat!(
     " ORDER BY e.created DESC LIMIT $1"
 );
 
-/// One held message as the `threads` tool's `held_messages` action reports
-/// it: what waits, on which thread, and the link that opens that thread.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HeldMessageSummary {
     pub held_message_id: Uuid,
@@ -69,7 +54,6 @@ pub struct HeldMessageSummary {
     pub section: String,
     pub status: crate::engine::thread_lifecycle::ThreadStatus,
     pub preview: String,
-    /// The whole message's length in characters.
     pub length: usize,
     pub image_count: usize,
     pub held_at: chrono::DateTime<chrono::Utc>,
@@ -91,15 +75,11 @@ struct HeldMessageRow {
 
 #[easy_ext::ext(HeldMessagesExt)]
 pub(crate) impl LucidosEngine {
-    /// Every unreleased held message in this workspace, newest first.
-    /// Read-only.
     async fn list_held_messages(&self, limit: i64) -> Result<Vec<HeldMessageSummary>, sqlx::Error> {
         list_held_messages(self.pool(), &self.workspace_name(), limit).await
     }
 }
 
-/// [`LucidosEngine::list_held_messages`] over an explicit pool and workspace,
-/// so a test can read two databases side by side.
 pub(crate) async fn list_held_messages(
     pool: &sqlx::PgPool,
     workspace: &str,
@@ -139,7 +119,6 @@ pub(crate) async fn list_held_messages(
         .collect())
 }
 
-/// One held message, rebuilt for delivery.
 #[derive(Debug, Clone)]
 pub(crate) struct HeldMessage {
     pub(crate) id: Uuid,
@@ -148,7 +127,6 @@ pub(crate) struct HeldMessage {
     pub(crate) origin: Option<MessageOrigin>,
 }
 
-/// Every unreleased held message on `thread_id`, oldest first.
 pub(crate) async fn unreleased_held_messages(
     pool: &sqlx::PgPool,
     workspace: &Path,
@@ -173,9 +151,6 @@ pub(crate) async fn unreleased_held_messages(
         .collect())
 }
 
-/// The origin a `MessageHeld` recorded. A value that no longer decodes is
-/// logged: the released message then goes out unattributed, and the route
-/// popover falls back to its engine-seeded explanation.
 fn held_origin(id: Uuid, payload: &serde_json::Value) -> Option<MessageOrigin> {
     let raw = payload.get("origin").filter(|v| !v.is_null())?;
     match serde_json::from_value::<MessageOrigin>(raw.clone()) {
@@ -192,13 +167,6 @@ fn held_origin(id: Uuid, payload: &serde_json::Value) -> Option<MessageOrigin> {
     }
 }
 
-/// Whether an incoming message on a coding-agent thread must be held.
-///
-/// Only a fresh agent-sent message is held. A human message answers the
-/// question or supersedes it (ADR 0082). A pre-emitted message or an engine
-/// re-entry is not a new message (ADR 0255). The hold lasts while the question
-/// is answerable or a permission card is pending. It also lasts while older
-/// held messages wait, so none is overtaken.
 pub(crate) async fn message_is_held(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -245,19 +213,9 @@ async fn has_unreleased_held_messages(
 
 pub(crate) struct ReleasedMessage {
     pub(crate) held: HeldMessage,
-    /// The `MessageReceived` row that delivers it.
     pub(crate) message_id: Uuid,
 }
 
-/// Release the oldest unreleased held message on `thread_id` and record its
-/// delivery, or return `None` when nothing is held.
-///
-/// The release and its `MessageReceived` are one atomic emit, so the message is
-/// either still held or received, never neither (ADR 0441). One at a time, so a
-/// crash mid-release strands at most the message it was on. The unique index
-/// refuses a release that lost a race; the loop then moves to the next message,
-/// so no message is delivered twice. A refused message that is still unreleased
-/// on the re-read was not a lost race, so it stays held and the loop ends.
 pub(crate) async fn claim_next_held_message(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -338,7 +296,7 @@ pub(crate) async fn claim_next_held_message(
     }
 }
 
-/// One lock per thread, so two releases never interleave their deliveries.
+/// INVARIANT: One lock per thread, so two releases never interleave their deliveries.
 /// In memory by design: it guards a delivery in progress, and a restart ends
 /// that delivery anyway.
 fn delivery_lock(thread_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
@@ -353,8 +311,6 @@ fn delivery_lock(thread_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// The event that holds `text` back. Stores its images in the blob store, as
-/// `MessageReceived` does, so the release can rebuild them.
 pub(crate) fn held_message_event(
     workspace: &Path,
     text: &str,
@@ -378,10 +334,6 @@ const AGENT_POLL: Duration = Duration::from_millis(500);
 
 #[easy_ext::ext(HeldMessageDeliveryExt)]
 pub(crate) impl LucidosEngine {
-    /// Deliver every held message on `thread_id` now, oldest first.
-    ///
-    /// Boxed for the same reason as `follow_up_child_thread`: delivery re-enters
-    /// the message router, which can call back here.
     fn deliver_held_messages(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -402,7 +354,7 @@ pub(crate) impl LucidosEngine {
         })
     }
 
-    /// Forward one released message to the agent. Its `MessageReceived` is
+    /// INVARIANT: Forward one released message to the agent. Its `MessageReceived` is
     /// already recorded, which is what keeps the router from holding it a
     /// second time.
     ///
@@ -478,8 +430,6 @@ pub(crate) impl LucidosEngine {
             .is_some_and(|s| s.is_live())
     }
 
-    /// Release the held messages once a question is resolved, in the
-    /// background, after the agent can take them.
     fn spawn_held_message_release(self: &Arc<Self>, thread_id: Uuid) {
         let engine = self.clone();
         tokio::spawn(async move {
@@ -500,7 +450,7 @@ pub(crate) impl LucidosEngine {
         });
     }
 
-    /// Wait until the thread's coding agent can take a message.
+    /// INVARIANT: Wait until the thread's coding agent can take a message.
     ///
     /// A resumed session needs time to start, so a missing one gets a grace
     /// period. Claude Code queues a message mid-turn on its own. Codex would

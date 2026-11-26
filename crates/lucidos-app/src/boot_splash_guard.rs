@@ -1,13 +1,3 @@
-//! Keeps a window that has reached the gateway off the bundled boot splash.
-//!
-//! WKWebView takes a mouse Back button as a history step, and the first entry of
-//! every launch window is the splash. The splash only waits for
-//! `desktop::launch`, which navigates once and exits. A window sent back there
-//! would wait for good, in front of a healthy gateway.
-//!
-//! The guard keys on what each webview has LOADED, never on its current URL.
-//! During a native Back, `WKWebView.URL` can already report the pending target.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -18,9 +8,6 @@ use tauri::Runtime;
 use crate::app_window::is_app_window;
 use crate::window_target::{is_bundled_app_url, window_is_navigated};
 
-/// The app windows, by label, that have loaded a gateway page. Only app windows
-/// start on the splash. A preview's label is unique, so recording one would
-/// grow the set with every preview opened.
 #[derive(Default)]
 struct ReachedGateway(Mutex<HashSet<String>>);
 
@@ -36,7 +23,6 @@ impl ReachedGateway {
     }
 
     fn labels(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
-        // A set of labels stays whole even if a holder panicked mid-insert.
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

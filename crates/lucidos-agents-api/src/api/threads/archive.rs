@@ -1,5 +1,3 @@
-//! HTTP boundary for archiving a thread family.
-
 use crate::engine::chat::agent_archive::AgentArchiveExt;
 use axum::{
     extract::{Path, State},
@@ -16,9 +14,6 @@ use crate::engine::chat::agent_archive::{AgentArchiveAck, AgentArchiveError};
 
 use super::extract_thread_uuid;
 
-/// Map a reach refusal into this handler's `{reason, message}` body, the same
-/// shape as every other rejection here. Status and slug both come from the
-/// error, so this cannot drift from the taxonomy.
 fn reach_rejection(
     e: crate::api::thread_reach::ThreadReachError,
 ) -> (StatusCode, axum::Json<serde_json::Value>) {
@@ -31,11 +26,6 @@ fn reach_rejection(
     )
 }
 
-/// POST /api/v1/threads/archive — cascading archive of a thread + every descendant.
-///
-/// The caller's reach is weighed first, then [`archive_family`] runs the
-/// cascade. Response:
-/// `{"archived": [<uuid>, ...], "skipped": [{thread_id, reason, message}, ...]}`.
 pub(in crate::api) async fn archive_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -61,21 +51,11 @@ pub(in crate::api) async fn archive_thread(
         .map(ArchiveOutcome::into_body)
 }
 
-/// `POST /api/v1/threads/:thread_id/archive`: archive on the caller's own
-/// authority (ADR 0310). Shaped like the detach route, and for the same
-/// reason: who is asking comes from the verified origin token, never the body.
-///
-/// - **A token-bearing caller** (an agent, or the CLI inside an agent session)
-///   archives only itself or one of its own direct children.
-/// - **A caller with no token** is the user's device or the local API, and
-///   runs the Archive button's cascade on any thread.
 pub(in crate::api) async fn archive_thread_as_caller(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<axum::Json<serde_json::Value>, ArchiveRejection> {
-    // The token names the caller, which is what `current` resolves to. A
-    // caller with no token has no thread, so the alias is refused there.
     let caller = match crate::core::subprocess_origin::subprocess_origin(&headers) {
         SubprocessOrigin::Subprocess {
             source_thread_id, ..
@@ -107,8 +87,6 @@ pub(in crate::api) async fn archive_thread_as_caller(
     }
 }
 
-/// The body an agent's archive answers with: what was archived now, or that
-/// the calling thread will be archived once its turn ends.
 fn agent_ack_body(ack: AgentArchiveAck) -> axum::Json<serde_json::Value> {
     match ack {
         AgentArchiveAck::Archived(outcome) => outcome.into_body(),

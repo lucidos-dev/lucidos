@@ -1,30 +1,9 @@
-//! Device presence tracking — which devices currently have a visible Lucidos tab.
-//!
-//! A device emits `DeviceVisible` when ANY top-level Lucidos tab becomes
-//! visible, and `DeviceHidden` when the last visible tab goes away
-//! (visibilitychange to 'hidden', window blur, beforeunload). This module
-//! answers a single question: "which devices might be active right now?"
-//! — the candidate list that the PresenceCheck protocol pings (see
-//! `system-knowhow/notifications/3-the-presencecheck-protocol.md` §3).
-//!
-//! Used by the OS push fan-out: empty candidate list → push_allowed=true
-//! directly (no point pinging). One or more candidates → run the
-//! PresenceCheck and let pongs make the call.
-//!
-//! Underlying events are transient (broadcast over EventBus, never
-//! persisted to the events table) and rows older than
-//! [`PRESENCE_STALE_AFTER`] are ignored by queries.
-//!
-//! Heartbeats: the frontend re-emits `DeviceVisible` every 30s while
-//! visible so a long-running session refreshes `visible_at` and rows
-//! don't go stale.
-
 use chrono::Duration;
 use sqlx::PgPool;
 
 use super::devices::NewIdRows;
 
-/// Rows older than this are considered stale and ignored by queries. The
+/// INVARIANT: Rows older than this are considered stale and ignored by queries. The
 /// frontend re-emits DeviceVisible every 30s while visible, so anything older
 /// than 2 minutes means the browser stopped reporting (crash, network drop,
 /// killed tab).
@@ -33,19 +12,10 @@ pub(crate) const PRESENCE_STALE_AFTER: Duration = Duration::seconds(120);
 pub struct DevicePresenceStore;
 
 impl DevicePresenceStore {
-    /// Record that a device's tab is now visible. Idempotent — also used as
-    /// the heartbeat refresh by re-emitting from the frontend. Returns `true`
-    /// when the row went from absent to present (real state change), `false`
-    /// when this is a heartbeat refresh on an existing row.
     pub async fn record_visible(
         pool: &PgPool,
         device_id: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        // `xmax = 0` distinguishes the INSERT path of an ON CONFLICT DO UPDATE
-        // from the UPDATE path: the system column holds the deleting xid (0
-        // for a freshly inserted row, current xid for an UPDATE). Same idiom
-        // as `devices::DeviceStore::register`. Single atomic query — no
-        // SELECT-then-UPSERT race between the existence check and the upsert.
         let inserted: bool = sqlx::query_scalar::<_, bool>(
             "INSERT INTO device_presence (device_id, visible_at) \
              VALUES ($1, NOW()) \
@@ -58,9 +28,6 @@ impl DevicePresenceStore {
         Ok(inserted)
     }
 
-    /// Record that a device's tab is no longer visible. Returns `true` if a
-    /// row was actually deleted, `false` if the unfocus was a no-op (already
-    /// hidden).
     pub async fn record_hidden(
         pool: &PgPool,
         device_id: &str,
@@ -72,15 +39,10 @@ impl DevicePresenceStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Return device_ids that pinged visible within the last
-    /// `PRESENCE_STALE_AFTER` window. Used by `send_push_to_all_with_app`
-    /// to decide whether to RUN the PresenceCheck protocol — empty list
-    /// → skip the ping and set `push_allowed = true` directly. See
-    /// `system-knowhow/notifications/3-the-presencecheck-protocol.md` §3.
     pub async fn candidates(
         pool: &PgPool,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        // Compute the staleness cutoff with the DATABASE clock, not the
+        // INVARIANT: Compute the staleness cutoff with the DATABASE clock, not the
         // process clock: `record_visible` writes `visible_at = NOW()` (the DB's
         // clock), so the comparison must use that same clock. Computing the
         // cutoff from `chrono::Utc::now()` here would mix two clocks — a fresh
@@ -100,7 +62,7 @@ impl DevicePresenceStore {
         Ok(rows.into_iter().map(|(d,)| d).collect())
     }
 
-    /// Drop a deleted device's presence row. Called only from the device
+    /// INVARIANT: Drop a deleted device's presence row. Called only from the device
     /// store's delete cascade, inside its transaction. `device_id` carries no
     /// foreign key, so nothing else would clear it.
     ///
@@ -116,7 +78,7 @@ impl DevicePresenceStore {
         Ok(())
     }
 
-    /// Move a device's presence row to a new id. Called only from
+    /// INVARIANT: Move a device's presence row to a new id. Called only from
     /// `DeviceStore::hand_over`.
     ///
     /// Takes a connection rather than the pool, because the hand-over is one
@@ -234,7 +196,6 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        // Hide one; the other still keeps the candidate list non-empty.
         DevicePresenceStore::record_hidden(&pool, "dev-1")
             .await
             .unwrap();
@@ -248,7 +209,6 @@ mod tests {
     #[tokio::test]
     async fn stale_rows_are_excluded_from_candidates() {
         let (pool, db) = setup_test_db().await;
-        // Insert a row past the staleness threshold.
         sqlx::query(
             "INSERT INTO device_presence (device_id, visible_at) \
              VALUES ($1, NOW() - INTERVAL '1 hour')",
@@ -270,7 +230,6 @@ mod tests {
     #[tokio::test]
     async fn record_visible_refreshes_visible_at() {
         let (pool, db) = setup_test_db().await;
-        // Pre-insert a stale row.
         sqlx::query(
             "INSERT INTO device_presence (device_id, visible_at) \
              VALUES ($1, NOW() - INTERVAL '1 hour')",

@@ -1,8 +1,3 @@
-//! Installed-plugin registry: project `PluginInstalled` / `PluginUninstalled`
-//! events into the current installed set, resolve free-form plugin queries to
-//! canonical ids, find the plugin owning a given file, and run the
-//! `check_plugin_updates` survey. Read-only over the event store.
-
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -25,9 +20,6 @@ fn install_canonical_id(payload: &serde_json::Value, aggregate_id: &str) -> Stri
         .to_string()
 }
 
-/// Canonical plugin id for a `PluginUninstalled` row: the `id` field in
-/// the payload (always present from the start), falling back to the
-/// `aggregate_id` column for symmetry with [`install_canonical_id`].
 fn uninstall_canonical_id(payload: &serde_json::Value, aggregate_id: &str) -> String {
     payload
         .pointer("/data/id")
@@ -103,7 +95,6 @@ pub(crate) async fn installed_plugin_summaries(
         .collect())
 }
 
-/// The URLs of a plugin's installed media, read from its media copy.
 fn installed_media(workspace_path: &Path, plugin_id: &str) -> PluginMedia {
     let copy = plugin_media::installed_dir(workspace_path, plugin_id);
     match plugin_media::load_index(&copy) {
@@ -122,9 +113,18 @@ fn installed_media(workspace_path: &Path, plugin_id: &str) -> PluginMedia {
     }
 }
 
-/// Read the latest known install record for a plugin id by scanning the
-/// `events` table. Returns `None` if the plugin is not installed (never
-/// installed, or installed then uninstalled).
+pub(crate) async fn event_hook_plugin_ids(
+    pool: &sqlx::PgPool,
+) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut hooks = std::collections::BTreeMap::new();
+    for (id, payload) in project_installs(pool).await? {
+        for hook in (InstalledRecord { payload }).hooks()? {
+            hooks.insert(hook.slug, id.clone());
+        }
+    }
+    Ok(hooks)
+}
+
 pub(crate) async fn latest_install(
     pool: &sqlx::PgPool,
     id: &str,
@@ -135,30 +135,19 @@ pub(crate) async fn latest_install(
         .map(|payload| InstalledRecord { payload }))
 }
 
-/// What a merge needs to know about the version a plugin is currently on: the
-/// install commit whose tree holds the shipped bytes, and the paths that version
-/// shipped. The *merge base* side of a three-way merge comes from here.
-///
-/// Only plugins with a recorded commit appear. A legacy row without one has no
-/// baseline, so its shipped files are plainly replaced. That matches how the
-/// Modified badge already reads such a row as unmodified.
 #[derive(Debug, Clone)]
 pub(crate) struct PluginBaseline {
     pub(crate) commit: String,
     pub(crate) files: Vec<String>,
 }
 
-/// The installed plugins as the install path needs them, keyed by canonical
-/// plugin id. `files` holds every installed plugin's recorded paths. `baselines`
-/// holds only those with a recorded commit, so a legacy row is installed yet has
-/// no baseline. `setups` holds every installed plugin's setup state.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InstalledPlugins {
     pub(crate) files: std::collections::BTreeMap<String, Vec<String>>,
     pub(crate) baselines: std::collections::BTreeMap<String, PluginBaseline>,
-    /// Every installed plugin's setup state, so staging can decide whether an
-    /// update runs setup again without a per-id query.
     pub(crate) setups: std::collections::BTreeMap<String, PriorSetup>,
+    pub(crate) hooks:
+        std::collections::BTreeMap<String, Vec<crate::engine::pending_plugins::PluginHook>>,
 }
 
 impl InstalledPlugins {
@@ -175,12 +164,6 @@ impl InstalledPlugins {
     }
 }
 
-/// Every installed plugin, from one projection scan.
-///
-/// Read whole rather than per id because the install path cannot name the id
-/// yet: it only learns it when the fetched `manifest.toml` parses, which happens
-/// inside the blocking task that this must be handed to. One projection scan is
-/// the same cost the Plugins panel already pays per load.
 pub(crate) async fn project_installed_plugins(
     pool: &sqlx::PgPool,
 ) -> Result<InstalledPlugins, Box<dyn std::error::Error + Send + Sync>> {
@@ -195,6 +178,10 @@ pub(crate) async fn project_installed_plugins(
             };
             installed.baselines.insert(id.clone(), baseline);
         }
+        let hooks = rec.hooks()?;
+        if !hooks.is_empty() {
+            installed.hooks.insert(id.clone(), hooks);
+        }
         installed.setups.insert(id.clone(), rec.prior_setup());
         installed.files.insert(id, files);
     }
@@ -205,8 +192,6 @@ pub(crate) struct InstalledRecord {
     payload: serde_json::Value,
 }
 
-/// An installed version's setup state: its normalized `setup` text, its
-/// `setup_revision` (0 when absent) and its version when the record names one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PriorSetup {
     pub(crate) text: Option<String>,
@@ -215,6 +200,16 @@ pub(crate) struct PriorSetup {
 }
 
 impl InstalledRecord {
+    pub(super) fn hooks(
+        &self,
+    ) -> Result<Vec<crate::engine::pending_plugins::PluginHook>, serde_json::Error> {
+        self.payload
+            .pointer("/data/manifest/hooks")
+            .map(|hooks| serde_json::from_value(hooks.clone()))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
     pub(crate) fn version(&self) -> Option<&str> {
         self.payload
             .pointer("/data/manifest/manifest/version")
@@ -233,7 +228,6 @@ impl InstalledRecord {
     pub(crate) fn manifest(&self) -> Option<&serde_json::Value> {
         self.payload.pointer("/data/manifest/manifest")
     }
-    /// The files this install owns, as the install recorded them.
     pub(crate) fn files(&self) -> Vec<String> {
         self.payload
             .pointer("/data/files")
@@ -246,28 +240,18 @@ impl InstalledRecord {
             })
             .unwrap_or_default()
     }
-    // `setup_thread_id` sits alongside `summary`/`files`/`installed_at` in the
-    // event's `manifest` payload map (one level above the raw toml, which is
-    // the nested `manifest/manifest`). Absent on installs that shipped no
-    // `setup` field and on every pre-feature legacy row.
     pub(crate) fn setup_thread_id(&self) -> Option<&str> {
         self.payload
             .pointer("/data/manifest/setup_thread_id")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
     }
-    /// The installed version's `setup_revision`, read from the raw manifest the
-    /// event round-trips. 0 when the manifest had none, as on every record
-    /// written before the field existed.
     pub(crate) fn setup_revision(&self) -> u64 {
         self.payload
             .pointer("/data/manifest/manifest/setup_revision")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     }
-    /// What the installed version's record says about its setup, for deciding
-    /// whether an update runs setup again. The text is the raw manifest
-    /// `setup`, normalized the way staging normalizes the new version's.
     pub(crate) fn prior_setup(&self) -> PriorSetup {
         PriorSetup {
             text: crate::engine::pending_plugins::normalize_setup(
@@ -279,12 +263,6 @@ impl InstalledRecord {
             version: self.version().map(str::to_string),
         }
     }
-    /// The workspace-repo commit sha captured when this version was installed
-    /// (the "Install plugin: <id> v<version>" commit). The baseline
-    /// [`plugin_modification_status`] diffs the plugin's current on-disk content
-    /// against to decide whether the user has locally modified it. `None` for
-    /// legacy rows installed before the sha was recorded — those degrade to
-    /// "not modified" (no baseline to diff against).
     pub(crate) fn commit(&self) -> Option<&str> {
         self.payload
             .pointer("/data/manifest/commit")
@@ -293,10 +271,6 @@ impl InstalledRecord {
     }
 }
 
-/// The app a plugin's "Open" button should launch: the first `apps/<app-id>/`
-/// directory among the installed files, preferring an app whose id equals the
-/// plugin id (the common one-app-named-after-the-plugin case). Returns `None`
-/// for plugins that install no app (knowhow/triggers/scripts only).
 pub(crate) fn primary_app_id(files: &[String], plugin_id: &str) -> Option<String> {
     let mut app_ids: Vec<&str> = files
         .iter()
@@ -312,15 +286,9 @@ pub(crate) fn primary_app_id(files: &[String], plugin_id: &str) -> Option<String
     app_ids.first().map(|s| s.to_string())
 }
 
-/// Normalize a free-form plugin reference into the dash-slug form used by
-/// install records — lowercased, with runs of whitespace / `_` / `-`
-/// collapsed to a single `-`, and any leading/trailing dashes trimmed.
-/// "No role playing" → "no-role-playing"; "anti_sycophancy_critique" →
-/// "anti-sycophancy-critique". Used by `resolve_plugin_query` to compare a
-/// human query against ids, manifest names, and app folders on equal terms.
 pub(crate) fn normalize_plugin_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut prev_dash = true; // suppresses leading dashes
+    let mut prev_dash = true;
     for c in s.chars() {
         if c.is_whitespace() || c == '-' || c == '_' {
             if !prev_dash {
@@ -340,16 +308,10 @@ pub(crate) fn normalize_plugin_query(s: &str) -> String {
     out
 }
 
-/// One plugin that could match a `resolve_plugin_query` lookup. Held in a
-/// per-install in-memory snapshot so the matcher can compare against ids,
-/// manifest names, and app folders without re-querying the DB per entry.
 #[derive(Debug, Clone)]
 struct InstalledIndex {
     plugin_id: String,
     plugin_name: String,
-    /// Pre-normalized strings the user might type to refer to this plugin:
-    /// the id itself, the manifest name, and any `apps/<dir>/...` folder
-    /// the plugin owns.
     aliases: std::collections::BTreeSet<String>,
 }
 
@@ -361,10 +323,6 @@ impl InstalledIndex {
             aliases.insert(normalize_plugin_query(name));
         }
         for file in record.files() {
-            // Each `apps/<folder>/...` entry contributes its folder as an
-            // alias, so an LLM that picked the on-disk folder name (the
-            // original "anti-sycophancy-critique" bug) still resolves to
-            // the canonical plugin id.
             if let Some(rest) = file.strip_prefix("apps/") {
                 if let Some(folder) = rest.split('/').next() {
                     if !folder.is_empty() {
@@ -394,8 +352,6 @@ async fn snapshot_installed(
         .collect())
 }
 
-/// The one "no such installed plugin" line, for every surface that resolves a
-/// plugin reference. Four copies of it drifted apart otherwise.
 pub(crate) fn not_installed_error(query: &str) -> String {
     format!(
         "Error: plugin '{}' is not currently installed (no PluginInstalled event, or already uninstalled)",
@@ -403,17 +359,6 @@ pub(crate) fn not_installed_error(query: &str) -> String {
     )
 }
 
-/// Resolve a free-form plugin reference (id, manifest name, or app folder
-/// installed by the plugin) to the canonical plugin id stored in the
-/// `PluginInstalled` event. Case-insensitive, dash/underscore/whitespace-
-/// insensitive. Returns the canonical id on a single match; an error
-/// message ready to surface to the LLM otherwise.
-///
-/// Errors:
-/// - "Error: plugin '<query>' is not currently installed (...)" when no
-///   currently-installed plugin matches.
-/// - "Error: '<query>' matches multiple plugins: [a, b]. Re-run with the
-///   exact id." when more than one match — never silently picks one.
 pub(crate) async fn resolve_plugin_query(
     pool: &sqlx::PgPool,
     query: &str,
@@ -422,7 +367,6 @@ pub(crate) async fn resolve_plugin_query(
         return Err("Error: plugin id/name is required".to_string());
     }
 
-    // Fast path: exact id match still works without a snapshot scan.
     match latest_install(pool, query).await {
         Ok(Some(_)) => return Ok(query.to_string()),
         Ok(None) => {}
@@ -460,10 +404,6 @@ pub(crate) async fn resolve_plugin_query(
     }
 }
 
-/// Identifier for the plugin that owns a given on-disk path. Returned by
-/// `find_plugin_owning_file` so callers can include both the canonical id
-/// (for the suggested `uninstall_plugin` command) and the human name
-/// (for the message body) without re-querying.
 #[derive(Debug, Clone)]
 pub(crate) struct PluginOwner {
     pub(crate) plugin_id: String,
@@ -511,22 +451,12 @@ pub(crate) async fn find_plugin_owning_app(
     Ok(None)
 }
 
-/// Whether a plugin's shipped content currently differs from what it installed,
-/// and which `data/`-relative paths differ. Derived on read (git + disk); never
-/// stored.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ModificationStatus {
     pub(crate) modified: bool,
     pub(crate) modified_paths: Vec<String>,
 }
 
-/// Compare two trigger definitions on their *functional* fields only — ignoring
-/// `slug` (normalized to the directory name at registration), `plugin_id`
-/// (stamped at registration, absent in the shipped authored file), and
-/// `group_id` (user-organizational, not a content edit). Used for the trigger
-/// arm of [`plugin_modification_status`], because `trigger.toml` is a gitignored,
-/// re-serialized projection (ADR 0019) whose bytes drift from the shipped form on
-/// every rebuild — only a semantic compare is meaningful.
 fn trigger_functional_eq(a: &TriggerDefinition, b: &TriggerDefinition) -> bool {
     let normalize = |d: &TriggerDefinition| {
         let mut d = d.clone();
@@ -538,28 +468,6 @@ fn trigger_functional_eq(a: &TriggerDefinition, b: &TriggerDefinition) -> bool {
     normalize(a) == normalize(b)
 }
 
-/// Decide whether the user has locally modified a plugin's shipped content since
-/// it was installed, and list the changed `data/`-relative paths. Pure read over
-/// the workspace git repo + disk — no stored state, so it self-heals when an edit
-/// is reverted and resets when the plugin is updated (the new install commit is
-/// the fresh baseline).
-///
-/// Per content type, against the plugin's install commit:
-/// - **app dirs** (`apps/<id>/`): a tree→workdir diff (including untracked files)
-///   scoped to the dir — catches edits, deletes, and user-ADDED files in the app.
-///   Build output ([`crate::core::is_build_output_path`]) never counts.
-/// - **flat files** (`knowhow/` / `scripts/` / `auth-modules/` and any non-
-///   `trigger.toml` file the plugin recorded): the same diff scoped to each
-///   recorded path — edits/deletes only (a brand-new file in those shared roots
-///   isn't attributable to the plugin).
-/// - **triggers** (`triggers/<slug>/trigger.toml`): NOT byte-diffed — the file is
-///   a gitignored, re-serialized projection, so the shipped definition (parsed
-///   from the install-commit blob) is compared field-by-field against the current
-///   on-disk definition via [`trigger_functional_eq`].
-///
-/// Returns not-modified for a legacy record with no recorded install commit, or
-/// when the repo / commit can't be opened (best-effort — a badge is not worth
-/// erroring a list load over).
 pub(crate) fn plugin_modification_status(
     workspace_path: &Path,
     record: &InstalledRecord,
@@ -570,13 +478,6 @@ pub(crate) fn plugin_modification_status(
     modification_status_for(workspace_path, commit_sha, &record.files())
 }
 
-/// [`plugin_modification_status`] over a baseline the caller already resolved.
-/// The install path reaches for this form: it holds a [`PluginBaseline`] read
-/// before the blocking fetch, and has no `InstalledRecord` in hand.
-///
-/// One body serves both, so the merge planner and the badge cannot drift on
-/// what "modified" means. That is why the planner consumes this instead of
-/// re-deriving its own diff.
 pub(crate) fn modification_status_for(
     workspace_path: &Path,
     commit_sha: &str,
@@ -584,7 +485,6 @@ pub(crate) fn modification_status_for(
 ) -> ModificationStatus {
     let unmodified = ModificationStatus::default();
 
-    // Partition recorded files by how each content type must be compared.
     let mut app_dirs: BTreeSet<String> = BTreeSet::new();
     let mut flat_files: Vec<String> = Vec::new();
     let mut trigger_files: Vec<String> = Vec::new();
@@ -644,7 +544,6 @@ pub(crate) fn modification_status_for(
         }
     }
 
-    // Triggers: semantic compare of the shipped vs current definition.
     for tf in &trigger_files {
         let shipped = tree
             .get_path(Path::new(&format!("data/{}", tf)))
@@ -654,7 +553,6 @@ pub(crate) fn modification_status_for(
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|text| TriggerDefinition::from_toml(&text).ok());
         let Some(shipped) = shipped else {
-            // No baseline blob (legacy / not committed) → can't judge; skip.
             continue;
         };
         let current = std::fs::read_to_string(workspace_path.join(DATA_DIR).join(tf))
@@ -662,7 +560,6 @@ pub(crate) fn modification_status_for(
             .and_then(|text| TriggerDefinition::from_toml(&text).ok());
         match current {
             Some(current) if trigger_functional_eq(&shipped, &current) => {}
-            // Differs, or the projection is gone (trigger removed) → modified.
             _ => {
                 changed.insert(tf.clone());
             }
@@ -675,10 +572,6 @@ pub(crate) fn modification_status_for(
     }
 }
 
-/// `check_plugin_updates(id?)` core. With `id == None`, surveys every
-/// currently-installed plugin (newest `PluginInstalled` not followed by
-/// `PluginUninstalled`); otherwise checks just the named plugin. Returns the
-/// pretty-printed JSON report verbatim — LLMs and tests read the same shape.
 pub(crate) async fn check_plugin_updates_impl(
     workspace_path: &Path,
     pool: &sqlx::PgPool,
@@ -695,9 +588,6 @@ pub(crate) async fn check_plugin_updates_impl(
             vec![(id, rec)]
         }
         None => {
-            // Survey: project the install state once, then defensively skip
-            // plugins whose recorded files are all gone from disk. Catches
-            // future drift where an uninstall path forgets to emit the event.
             let projected = match project_installs(pool).await {
                 Ok(p) => p,
                 Err(e) => return format!("Error: list installed plugins: {}", e),
@@ -726,10 +616,6 @@ pub(crate) async fn check_plugin_updates_impl(
         .unwrap_or_else(|e| format!("Error: serialize report: {}", e))
 }
 
-/// Survey-only defensive filter: a plugin counts as actually-uninstalled
-/// when every recorded file under `data/` is gone. Empty `files` (legacy
-/// records that didn't list files) doesn't trigger the skip — only an
-/// affirmative all-missing signal does.
 fn all_recorded_files_missing(data_dir: &Path, files: &[String]) -> bool {
     if files.is_empty() {
         return false;
@@ -766,8 +652,6 @@ async fn check_one(
         Ok(remote) => {
             let changed =
                 compare_versions(&installed_version, &remote.version) == UpdateDecision::Update;
-            // `update_plugin` refuses a version this release cannot install,
-            // so the report says so up front rather than offering it.
             let mismatch = plugins::check_engine_requirement(&remote.raw, &running_release()).err();
             serde_json::json!({
                 "id": id,
@@ -791,7 +675,7 @@ async fn check_one(
     }
 }
 
-/// Fetch a plugin source and read its `manifest.toml`.
+/// INVARIANT: Fetch a plugin source and read its `manifest.toml`.
 ///
 /// Runs on the blocking pool, like the install path's
 /// [`super::stage_install_request`]: the body contains no `.await` at all, and
@@ -817,7 +701,7 @@ pub(crate) async fn fetch_remote_manifest(
     .map_err(|e| format!("manifest fetch task panicked: {}", e))?
 }
 
-/// The synchronous body of [`fetch_remote_manifest`]. Never call this from an
+/// INVARIANT: The synchronous body of [`fetch_remote_manifest`]. Never call this from an
 /// async context directly.
 fn fetch_remote_manifest_blocking(
     workspace_path: &Path,
@@ -835,9 +719,6 @@ mod tests {
     use crate::test_support::{setup_test_db, teardown_test_db};
     use uuid::Uuid;
 
-    /// A `PluginInstalled` projection must carry the plugin's `files` and the
-    /// derived `content` kinds so the Plugins → Installed row can list what was
-    /// shipped and link to it — even for a plugin with no app.
     #[tokio::test]
     async fn installed_summary_carries_content_and_files() {
         let (pool, db_name) = setup_test_db().await;
@@ -868,7 +749,6 @@ mod tests {
             .iter()
             .find(|s| s.id == "demo")
             .expect("demo plugin present");
-        // content_dirs_from_files dedups + sorts (BTreeSet) → alphabetical.
         assert_eq!(demo.content, vec!["apps", "knowhow", "triggers"]);
         assert_eq!(demo.files.len(), 3);
         assert_eq!(demo.app_id.as_deref(), Some("demo"));
@@ -876,9 +756,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A non-app plugin (knowhow/triggers only) still projects with its content
-    /// and files, and `app_id` is `None` — it must be manageable from the
-    /// Plugins → Installed tab without an app.
     #[tokio::test]
     async fn installed_summary_non_app_plugin_has_no_app_id() {
         let (pool, db_name) = setup_test_db().await;
@@ -913,7 +790,6 @@ mod tests {
     }
 }
 
-/// Tests for [`plugin_modification_status`] — pure over git + disk, no DB.
 #[cfg(test)]
 mod modification_status_tests {
     use super::{plugin_modification_status, InstalledRecord, PriorSetup};
@@ -935,14 +811,11 @@ mod modification_status_tests {
         std::fs::write(p, content).unwrap();
     }
 
-    /// Stage shipped files on disk and make the install commit; return its sha.
     fn install_commit(ws: &Path, files: &[&str]) -> String {
         let rels: Vec<String> = files.iter().map(|s| s.to_string()).collect();
         crate::core::commit_data_paths_added(ws, &rels, "Install plugin: demo v1.0.0").unwrap()
     }
 
-    /// An `InstalledRecord` whose payload carries `commit` (when `Some`) + `files`,
-    /// mirroring the real `PluginInstalled` payload shape `InstalledRecord` reads.
     fn record(commit: Option<&str>, files: &[&str]) -> InstalledRecord {
         let mut manifest = serde_json::json!({
             "manifest": { "id": "demo", "name": "Demo", "version": "1.0.0" },
@@ -958,8 +831,6 @@ mod modification_status_tests {
         }
     }
 
-    /// The real `PluginInstalled` shape: the raw manifest sits at
-    /// `data.manifest.manifest`, beside the install's own fields.
     fn record_with_manifest(manifest: serde_json::Value) -> InstalledRecord {
         InstalledRecord {
             payload: serde_json::json!({
@@ -1029,7 +900,6 @@ mod modification_status_tests {
         let (_tmp, ws) = temp_workspace();
         write_data(&ws, "apps/demo/index.html", "x");
         let sha = install_commit(&ws, &["apps/demo/index.html"]);
-        // User adds a new (untracked) file inside the plugin's app dir.
         write_data(&ws, "apps/demo/extra.js", "console.log(1)");
         let status =
             plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
@@ -1065,7 +935,6 @@ mod modification_status_tests {
         let (_tmp, ws) = temp_workspace();
         write_data(&ws, "knowhow/demo.md", "notes");
         let sha = install_commit(&ws, &["knowhow/demo.md"]);
-        // A brand-new knowhow file the plugin never shipped → not attributable.
         write_data(&ws, "knowhow/my-own.md", "mine");
         let status = plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"]));
         assert!(
@@ -1092,7 +961,7 @@ mod modification_status_tests {
         write_data(&ws, "knowhow/demo.md", "notes");
         let sha = install_commit(&ws, &["knowhow/demo.md"]);
         write_data(&ws, "knowhow/demo.md", "EDITED");
-        write_data(&ws, "knowhow/demo.md", "notes"); // revert to installed content
+        write_data(&ws, "knowhow/demo.md", "notes");
         assert!(
             !plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"])).modified
         );
@@ -1103,17 +972,12 @@ mod modification_status_tests {
         let (_tmp, ws) = temp_workspace();
         write_data(&ws, "knowhow/demo.md", "notes");
         install_commit(&ws, &["knowhow/demo.md"]);
-        write_data(&ws, "knowhow/demo.md", "EDITED"); // even with an edit on disk...
-                                                      // ...a record with no baseline commit cannot be judged → not modified.
+        write_data(&ws, "knowhow/demo.md", "EDITED");
         assert!(!plugin_modification_status(&ws, &record(None, &["knowhow/demo.md"])).modified);
     }
 
     #[test]
     fn trigger_reserialized_projection_is_not_modified() {
-        // The shipped authored trigger.toml is committed; the on-disk projection
-        // is re-serialized (different bytes) AND carries the registration stamps
-        // (slug + plugin_id). A byte diff would false-positive; the semantic
-        // compare (ignoring slug/plugin_id/group_id) must read as not-modified.
         let (_tmp, ws) = temp_workspace();
         write_data(&ws, "triggers/watch/trigger.toml", TRIGGER_TOML);
         let sha = install_commit(&ws, &["triggers/watch/trigger.toml"]);

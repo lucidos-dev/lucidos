@@ -9,20 +9,13 @@ use crate::runtime::{CodingAgent, RunningAgent, SpawnArgs};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-/// Whether [`spawn_or_resume`] passed the agent a session to resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResumeAttempt {
-    /// No session id was given, so the agent started fresh.
     NotAttempted,
-    /// The agent took the resume.
     Resumed,
-    /// The agent refused the resume, and a fresh spawn replaced it.
     FellBack,
 }
 
-/// Try to resume a coding-agent session, falling back to fresh spawn on failure.
-/// Routes through the engine's `agent_runtimes` registry — caller picks the agent kind.
-/// `args.resume_session_id` controls whether resume is attempted at all.
 pub(super) async fn spawn_or_resume(
     engine: &LucidosEngine,
     agent: CodingAgent,
@@ -33,6 +26,7 @@ pub(super) async fn spawn_or_resume(
         .agent_runtimes
         .get(&agent)
         .ok_or_else(|| format!("No registered runtime for agent {:?}", agent))?;
+    engine.session_spawn_gate.wait().await;
     if args.resume_session_id.is_some() {
         let mut fresh = args.clone();
         match runtime.spawn(args, cancel.clone()).await {
@@ -52,22 +46,12 @@ pub(super) async fn spawn_or_resume(
     Ok((rt, ResumeAttempt::NotAttempted))
 }
 
-/// How many times a spawn may re-derive its branch name and try the create
-/// again. Each attempt costs one ref listing plus one `git worktree add`, and
-/// every retry means a sibling took the exact name this thread asked for. Ten
-/// is far past any real contention and still terminates.
 const MAX_BRANCH_CREATE_ATTEMPTS: usize = 10;
 
-/// Everything needed to mint a branch name for a thread that doesn't have one
-/// yet: `lucidos-<agent>-<app|repo>-<name>-<slug>-<id>`. See
-/// `git_ops::branch_name` for the shape and the duplicate numbering.
 pub(super) struct FreshBranch<'a> {
     pub(super) repo_root: &'a Path,
     pub(super) agent: CodingAgent,
     pub(super) scope: BranchScope,
-    /// The thread's display name (title, else first message), slugified into
-    /// the branch. Empty is fine: the slug then falls back to `thread`, and
-    /// the thread's short id is appended either way.
     pub(super) thread_name: &'a str,
     pub(super) thread_id: uuid::Uuid,
 }
@@ -128,24 +112,18 @@ impl FreshBranch<'_> {
     }
 }
 
-/// Result of resolving which branch a CC turn should run on.
 pub(super) struct BranchResolution {
     pub branch_name: String,
     pub reusing_branch: bool,
-    /// May be `None` even if the caller passed `Some` — see `resolve_branch_for_resume`.
     pub resume_session_id: Option<String>,
-    /// Set when a branch was recorded but git says it is gone.
     pub gone: Option<GoneBranch>,
 }
 
-/// A recorded branch git no longer has, and the session id dropped with it.
-/// A proven rename wins both back ([`recover_renamed_branch`]).
 pub(super) struct GoneBranch {
     pub branch_name: String,
     pub session_id: Option<String>,
 }
 
-/// The branch a thread's worktree moved to by renaming its gone branch.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct RecoveredBranch {
     pub branch_name: String,
@@ -173,9 +151,6 @@ pub(super) async fn recover_renamed_branch(
     })
 }
 
-/// The pure half's verdict, before any name is minted. Separate from
-/// [`BranchResolution`] so allocating a fresh name (which costs a git call)
-/// happens only on the path that actually needs one.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum BranchDecision {
     Reuse {
@@ -252,6 +227,93 @@ mod tests {
     use super::*;
     use crate::engine::git_ops::{git_cmd, LUCIDOS_BRANCH_PREFIX};
 
+    struct RecordingRuntime(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for RecordingRuntime {
+        fn kind(&self) -> CodingAgent {
+            CodingAgent::Codex
+        }
+
+        async fn spawn(
+            &self,
+            _args: SpawnArgs<'_>,
+            _cancel: CancellationToken,
+        ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err("recorded spawn".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_waits_for_the_api_listener() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        use std::sync::{atomic::Ordering, Arc};
+
+        let (engine, workspace) = crate::test_support::boot_mock_engine(&db).await;
+        let mut engine = Arc::into_inner(engine).expect("the fixture owns the engine");
+        let runtime = Arc::new(RecordingRuntime(Default::default()));
+        engine
+            .agent_runtimes
+            .insert(CodingAgent::Codex, runtime.clone());
+        engine.session_spawn_gate.hold();
+        let thread_id = uuid::Uuid::new_v4();
+        let path = workspace.path();
+        let sandbox = crate::runtime::agent_sandbox::Sandbox::resolve(&pool, path)
+            .await
+            .unwrap();
+        {
+            let spawn = spawn_or_resume(
+                &engine,
+                CodingAgent::Codex,
+                SpawnArgs {
+                    worktree_path: path,
+                    coding_agent_kind: Default::default(),
+                    workspace_path: path,
+                    allowed_tools: None,
+                    system_prompt: None,
+                    session_context: None,
+                    resume_session_id: None,
+                    model: None,
+                    reasoning_effort: None,
+                    thread_id,
+                    spawning_event_id: None,
+                    repo_name: None,
+                    interactive: false,
+                    build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
+                    user_env_vars: &[],
+                    binary_override: None,
+                    permission_mode: None,
+                    account_pin: None,
+                    additional_directories: &[],
+                    auto_compact: None,
+                    keep_alive: false,
+                    agent_run: crate::runtime::agent_run_marker::AgentRun::for_thread(
+                        path,
+                        thread_id,
+                        engine.teardown_handover.clone(),
+                    ),
+                    sandbox,
+                },
+                CancellationToken::new(),
+            );
+            tokio::pin!(spawn);
+            assert!(futures::poll!(&mut spawn).is_pending());
+            assert!(!runtime.0.load(Ordering::Relaxed));
+            engine.session_spawn_gate.open();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), spawn)
+                .await
+                .expect("opening the gate releases the spawn")
+                .err()
+                .expect("the fake runtime returns its sentinel error");
+            assert_eq!(error.to_string(), "recorded spawn");
+            assert!(runtime.0.load(Ordering::Relaxed));
+        }
+        drop(engine);
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
     async fn make_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
@@ -279,7 +341,6 @@ mod tests {
         }
     }
 
-    /// The name a `fresh_branch_for` thread mints when nothing is in its way.
     fn expected_name(thread_id: uuid::Uuid) -> String {
         format!(
             "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout-{}",
@@ -320,7 +381,6 @@ mod tests {
         );
     }
 
-    /// A linked worktree on a thread branch with one commit of its own.
     async fn make_thread_worktree(
         tmp: &tempfile::TempDir,
         repo: &std::path::Path,
@@ -344,8 +404,6 @@ mod tests {
         wt
     }
 
-    /// The reported loss: the repo's own workflow ran `git branch -m` on the
-    /// thread's branch, and the next message started a fresh session.
     #[tokio::test]
     async fn a_renamed_branch_keeps_its_session() {
         let (tmp, repo) = make_test_repo().await;
@@ -379,8 +437,6 @@ mod tests {
         assert_eq!(recovered.session_id.as_deref(), Some("live-sid"));
     }
 
-    /// A gone branch the worktree does not provably continue starts fresh, as
-    /// before, rather than refusing the spawn or keeping the stale session.
     #[tokio::test]
     async fn a_deleted_branch_beside_an_unrelated_one_starts_fresh() {
         let (tmp, repo) = make_test_repo().await;
@@ -408,8 +464,6 @@ mod tests {
         );
     }
 
-    /// A legacy `claude-code/*` branch is never renamed: a resumed thread that
-    /// predates the thread-named scheme keeps the branch holding its commits.
     #[tokio::test]
     async fn existing_legacy_resume_branch_keeps_its_name_and_session_id() {
         let (_tmp, repo) = make_test_repo().await;
@@ -425,11 +479,6 @@ mod tests {
         assert_eq!(resolution.resume_session_id, Some("good-sid".into()));
     }
 
-    /// The 2026-08-03 regression. Under e2e load every `rev-parse` was blowing
-    /// the 30s ceiling, the old `.unwrap_or(false)` read that as "branch gone",
-    /// and the fresh-branch path that follows is what let the spawn treat a live
-    /// worktree as somebody else's leftover and remove it. An unanswered probe
-    /// must leave both the branch and the session id alone.
     #[test]
     fn unverifiable_resume_branch_is_reused_not_replaced() {
         let decision = decide_branch_resolution(
@@ -448,7 +497,6 @@ mod tests {
         );
     }
 
-    /// A real answer still decides, in both directions.
     #[test]
     fn answered_probes_still_decide_branch_reuse() {
         assert_eq!(
@@ -484,8 +532,6 @@ mod tests {
         );
     }
 
-    /// Two threads with the same title do not collide at all any more: the id
-    /// segment separates them before a single ref is read.
     #[tokio::test]
     async fn two_threads_with_the_same_title_get_different_branches() {
         let (_tmp, repo) = make_test_repo().await;
@@ -501,9 +547,6 @@ mod tests {
         );
     }
 
-    /// Numbering is still there for the case it now covers: one thread minting
-    /// a second branch while the first one is still around. Exercised end to
-    /// end, through the ref listing, rather than against the pure allocator.
     #[tokio::test]
     async fn one_thread_minting_twice_is_numbered() {
         let (_tmp, repo) = make_test_repo().await;
@@ -521,8 +564,6 @@ mod tests {
         );
     }
 
-    /// Every minted name has to survive git's own ref validation, whatever the
-    /// thread was called.
     #[tokio::test]
     async fn minted_names_are_valid_git_refs() {
         let (_tmp, repo) = make_test_repo().await;
@@ -554,13 +595,8 @@ mod tests {
         }
     }
 
-    /// How many spawns the two race tests run at once. Kept under
-    /// [`MAX_BRANCH_CREATE_ATTEMPTS`]: each loss means some other task really
-    /// created that name, so a task can lose at most `SPAWNS - 1` times.
     const SPAWNS: usize = 8;
 
-    /// Run `SPAWNS` allocate-then-create sequences at once against one repo,
-    /// each with the thread id `id_for` hands it. Returns what each got.
     async fn race_spawns(
         repo: &std::path::Path,
         id_for: impl Fn(usize) -> uuid::Uuid,
@@ -592,8 +628,6 @@ mod tests {
         results
     }
 
-    /// Every branch a race produced must exist, and be the only one holding
-    /// its name.
     async fn assert_distinct_and_real(
         repo: &std::path::Path,
         results: Vec<Result<String, String>>,
@@ -616,9 +650,6 @@ mod tests {
         }
     }
 
-    /// The reported bug: six children spawned in one response, all against one
-    /// repo, all with prompts that open identically. Four died on
-    /// "a branch named X already exists" before doing any work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_spawns_from_one_prompt_get_distinct_branches() {
         let (_tmp, repo) = make_test_repo().await;
@@ -626,9 +657,6 @@ mod tests {
         assert_distinct_and_real(&repo, results).await;
     }
 
-    /// The same race with the discriminator taken away. Every task shares one
-    /// thread id and one title, so all derive the identical name. The retry is
-    /// then the only thing left that can save them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_lost_branch_race_retries_until_it_wins() {
         let (_tmp, repo) = make_test_repo().await;

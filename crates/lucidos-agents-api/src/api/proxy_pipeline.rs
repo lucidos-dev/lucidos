@@ -1,13 +1,3 @@
-//! Pipeline runner for `Vec<Box<dyn AuthLayer>>`. Threads `prior_layer_outputs`
-//! through layers in declared order, drives one-shot 401 retry across
-//! opted-in cache hits.
-//!
-//! `RAW_BODY_THRESHOLD_BYTES` switches the body view: requests ≤1MB get the
-//! full bytes (`BodyView::Raw`), larger ones get a SHA-256 + length
-//! (`BodyView::HashOnly`) so signers don't have to buffer megabytes for a
-//! signature they only compute over the digest. Engine policy layers may opt
-//! into raw bytes for inspecting JSON at either size.
-
 use crate::proxy_auth_layer::{body_hash, AuthLayer, BodyView, RetryHint};
 use axum::http::{HeaderName, Method, StatusCode};
 use bytes::Bytes;
@@ -15,37 +5,23 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Result of running the pipeline once. The pipeline merges per-layer
-/// `AuthMutation`s and exposes the merged result here.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineOutcome {
     pub headers: Vec<(HeaderName, String)>,
     pub query: Vec<(String, String)>,
     pub replace_body: Option<Bytes>,
-    /// URL safe to write to logs and error responses — credentials in
+    /// INVARIANT: URL safe to write to logs and error responses — credentials in
     /// the query string (e.g. `QueryParamLayer`'s value) are replaced
     /// with `REDACTED`. Layers that fold a credential into the URL MUST
     /// publish a redacted form via `outputs.log_url_replacement`; layers
     /// that only mutate headers leave this equal to the request URL.
     pub log_url: String,
-    /// Per-layer outputs keyed by namespace, in declared order.
     pub outputs: Value,
-    /// For each layer (in order): true iff the layer's `apply` returned
-    /// `AuthMutation { cache_was_hit: true, .. }`.
     pub cache_hits: Vec<bool>,
 }
 
-/// 1MB threshold matches the pipeline body-handling decision.
 pub const RAW_BODY_THRESHOLD_BYTES: usize = 1024 * 1024;
 
-/// Run all layers in order; merge results.
-///
-/// Body-mode handling: requests at or under `RAW_BODY_THRESHOLD_BYTES` (1MB)
-/// get `BodyView::Raw(&body)`; larger ones get `BodyView::HashOnly` with a
-/// precomputed SHA-256 + length, so layers can sign over the digest without
-/// buffering the full body into their own view. The hash buffer is owned
-/// here so its borrow lives for the whole pipeline run. Engine policy layers
-/// opting into raw bytes receive them at either size.
 pub async fn run_pipeline(
     layers: &[Arc<dyn AuthLayer>],
     method: &Method,
@@ -87,7 +63,6 @@ pub async fn run_pipeline(
         outcome.headers.extend(mutation.add_headers.into_iter());
         outcome.query.extend(mutation.add_query.into_iter());
         if mutation.replace_body.is_some() {
-            // Last layer to set wins; unusual but explicit.
             outcome.replace_body = mutation.replace_body;
         }
         if let Some(redacted) = mutation
@@ -110,17 +85,6 @@ pub async fn run_pipeline(
     Ok(outcome)
 }
 
-// ---- 401 retry decision ----------------------------------------------
-//
-// Replaces the legacy `proxy.rs::should_retry_after_401` (single-variant,
-// `script_handshake`-only) with a pipeline-aware version that triggers iff
-// some layer in the run consumed a cached value AND opted into retry.
-
-/// True iff the upstream returned 401 AND at least one layer in the
-/// pipeline (a) said its `apply` was a cache hit AND (b) opted in to
-/// `RetryHint::InvalidateAndRetry`. The pipeline runner then invalidates
-/// those layers' caches via `pipeline_invalidate_for_retry` and re-runs
-/// the pipeline once.
 pub fn pipeline_should_retry(
     layers: &[Arc<dyn AuthLayer>],
     outcome: &PipelineOutcome,
@@ -135,8 +99,6 @@ pub fn pipeline_should_retry(
         .any(|(layer, &hit)| hit && layer.retry_on_401() == RetryHint::InvalidateAndRetry)
 }
 
-/// Invalidate every layer that opted in AND was a cache hit. Called before
-/// the second pipeline run.
 pub async fn pipeline_invalidate_for_retry(
     layers: &[Arc<dyn AuthLayer>],
     outcome: &PipelineOutcome,
@@ -157,7 +119,6 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
 
-    /// Test layer that adds a header and publishes one output value.
     struct StaticHeaderLayer {
         name: &'static str,
         header: (HeaderName, String),
@@ -170,7 +131,6 @@ mod tests {
             self.name
         }
         fn scope_bindings(&self) -> Vec<ScopeBinding> {
-            // A test layer carries no real secret, so nothing binds it.
             Vec::new()
         }
         async fn apply(
@@ -247,11 +207,6 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
     }
 
-    // ---- Retry truth table -------------------------------------------
-
-    /// Layer with configurable retry hint + cache-hit behavior. Used to
-    /// drive the pipeline_should_retry / pipeline_invalidate_for_retry
-    /// truth tables.
     struct ConfigurableRetryLayer {
         name: &'static str,
         retry_hint: RetryHint,
@@ -265,7 +220,6 @@ mod tests {
             self.name
         }
         fn scope_bindings(&self) -> Vec<ScopeBinding> {
-            // A test layer carries no real secret, so nothing binds it.
             Vec::new()
         }
         fn retry_on_401(&self) -> RetryHint {
@@ -327,8 +281,6 @@ mod tests {
 
     #[test]
     fn retry_skipped_when_no_cache_hit() {
-        // Cache miss → 401 is a real auth failure, not staleness; no point
-        // retrying with the same fresh token.
         let layer: Arc<dyn AuthLayer> = Arc::new(ConfigurableRetryLayer {
             name: "x",
             retry_hint: RetryHint::InvalidateAndRetry,
@@ -361,8 +313,6 @@ mod tests {
 
     #[test]
     fn retry_triggered_when_any_layer_satisfies_the_predicate() {
-        // First layer: opt-in but cache miss. Second: opt-in and cache hit.
-        // Either one being a hit-and-opt-in is enough.
         let l1: Arc<dyn AuthLayer> = Arc::new(ConfigurableRetryLayer {
             name: "a",
             retry_hint: RetryHint::InvalidateAndRetry,
@@ -411,8 +361,6 @@ mod tests {
         assert!(!l3.invalidated.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// Layer that captures the body view it received so the test can
-    /// inspect whether the pipeline handed it raw bytes or a hash.
     struct BodyCapturingLayer {
         captured: std::sync::Mutex<Option<BodyViewSnapshot>>,
     }
@@ -429,7 +377,6 @@ mod tests {
             "capture"
         }
         fn scope_bindings(&self) -> Vec<ScopeBinding> {
-            // A test layer carries no real secret, so nothing binds it.
             Vec::new()
         }
         async fn apply(
@@ -471,7 +418,6 @@ mod tests {
             captured: std::sync::Mutex::new(None),
         });
         let layers: Vec<Arc<dyn AuthLayer>> = vec![layer.clone()];
-        // 1MB + 1 byte → exceeds RAW_BODY_THRESHOLD_BYTES.
         let body_size = RAW_BODY_THRESHOLD_BYTES + 1;
         let body = bytes::Bytes::from(vec![0xABu8; body_size]);
         let expected_hash = body_hash(&body);

@@ -1,12 +1,9 @@
-//! EventBus writes for domain events and trigger execution stamps.
-
 use super::{BusEvent, EmitResult, EventBus, SystemEvent};
 use crate::core::webhook_deliveries::{DeliveryKey, DeliveryOutcome};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::trigger_context::{current_event_trigger_depth, TriggerRunStatus};
 
 impl EventBus {
-    /// Shared durable trigger stamp for live execution and boot recovery.
     pub async fn record_trigger_executed_at(
         &self,
         trigger_id: &str,
@@ -25,10 +22,6 @@ impl EventBus {
         Ok(())
     }
 
-    /// The one write path for a domain event, durable or transient.
-    ///
-    /// On the bus rather than the engine, so a test can drive the LLM tool's
-    /// emit against a real database without booting an engine.
     pub async fn emit_domain_event(
         &self,
         event_type: &str,
@@ -42,9 +35,6 @@ impl EventBus {
             .await
     }
 
-    /// [`Self::emit_domain_event`] for a webhook delivery on a hook that
-    /// dedupes. The delivery is recorded in the event's own transaction, so a
-    /// resend inside its window emits nothing (ADR 0444).
     pub async fn emit_webhook_delivery(
         &self,
         event_type: &str,
@@ -57,18 +47,17 @@ impl EventBus {
     }
 }
 
-/// Build a domain event, refusing a name no caller may emit.
 fn domain_event(
     event_type: &str,
     payload: serde_json::Value,
     transient: bool,
     actor: MessageOrigin,
 ) -> Result<SystemEvent, Box<dyn std::error::Error + Send + Sync>> {
-    // In the write path so no caller can skip it. The HTTP route checked
+    // INVARIANT: In the write path so no caller can skip it. The HTTP route checked
     // the name; the LLM `emit_event` tool did not, and a reserved name from
     // either writes the same permanent row.
     crate::core::event_subscription::validate_emittable_event_type(event_type)?;
-    // `to_payload` drops the caller's `actor`. Logged here rather than
+    // INVARIANT: `to_payload` drops the caller's `actor`. Logged here rather than
     // there, because every reader of the event calls `to_payload` again.
     if let Some(claimed) = payload.get(SystemEvent::ACTOR_KEY) {
         log_legacy!(

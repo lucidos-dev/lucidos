@@ -63,8 +63,8 @@ declare_shards() {
     esac
 }
 SPECS_PER_SHARD_FLOOR=8
-# The engine suite's run limit on a runner, compile included. The engine job's
-# timeout-minutes in e2e.yml sits above it.
+# The engine suite's run limit on a runner, the test run only. Compile comes
+# first and sits outside it, under the engine job's timeout-minutes in e2e.yml.
 ENGINE_RUN_LIMIT_SECS=5400
 
 # request_field <python expression over `r`>: one value per line.
@@ -744,7 +744,6 @@ cmd_run() {
     local cmd=()
     case "$suite" in
         engine)
-            # A cold runner compiles the whole test binary inside the run limit.
             export LUCIDOS_TEST_RUN_LIMIT_SECS="${LUCIDOS_TEST_RUN_LIMIT_SECS:-$ENGINE_RUN_LIMIT_SECS}"
             use_native_test_postgres
             cmd=("$SCRIPT_DIR/test-engine.sh")

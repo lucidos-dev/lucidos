@@ -1,9 +1,3 @@
-//! The OAuth device authorization grant (RFC 8628), as a public client.
-//!
-//! The user opens the gateway's verification page on any device and enters
-//! the user code, while the engine polls the token endpoint. Nothing here is
-//! stored: an engine restart mid-sign-in only means starting again.
-
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -17,31 +11,20 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// The scopes the gateway advertises. Lucidos asks for no more.
 const SCOPES: &str = "openid profile email";
 
-/// The protocol's `surface` extension: which client application signs in, so
-/// a gateway can tell Lucidos sessions apart (Claude Code sends `claude_code`).
 const SURFACE: &str = "lucidos";
 
-/// The poll interval when the gateway names none (RFC 8628 §3.2).
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The longest a code may live, and the longest poll interval, whatever the
-/// gateway says. A larger value would overflow the deadline or stall the poll.
 const MAX_CODE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
-/// How much each `slow_down` adds to the interval (RFC 8628 §3.5).
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
 
-/// A started sign-in: what the user must see, and the code the engine polls
-/// with.
 pub struct DeviceAuthorization {
     device_code: String,
     pub user_code: String,
     pub verification_uri: String,
-    /// The verification page with the user code filled in, when the gateway
-    /// offers one.
     pub verification_uri_complete: Option<String>,
     pub expires_in: Duration,
     pub interval: Duration,
@@ -70,7 +53,6 @@ struct AuthorizationResponse {
     interval: Option<u64>,
 }
 
-/// Ask the gateway for a device code and a user code.
 pub async fn start(endpoints: &GatewayEndpoints) -> Result<DeviceAuthorization, BoxError> {
     let resp = http_client()
         .post(&endpoints.device_authorization)
@@ -109,13 +91,11 @@ pub async fn start(endpoints: &GatewayEndpoints) -> Result<DeviceAuthorization, 
     })
 }
 
-/// The verification page is shown as a link, so it must open a web page and
-/// nothing else.
 fn is_web_link(uri: &str) -> bool {
     reqwest::Url::parse(uri).is_ok_and(|u| matches!(u.scheme(), "https" | "http"))
 }
 
-/// Poll the token endpoint until the user approves, declines, or the code
+/// INVARIANT: Poll the token endpoint until the user approves, declines, or the code
 /// expires. A failed request is tried again on the next tick, since a
 /// gateway on a private network can drop out for a moment.
 pub async fn wait_for_tokens(
@@ -226,8 +206,6 @@ mod tests {
             .starts_with("Lucidos/"));
     }
 
-    /// A huge lifetime or interval would overflow the deadline or stall the
-    /// poll, so both are capped.
     #[tokio::test]
     async fn the_gateway_cannot_name_an_endless_code() {
         let gateway = MockGateway::start().await;
@@ -266,8 +244,6 @@ mod tests {
             .all(|f| f["grant_type"] == DEVICE_CODE_GRANT && f["device_code"] == "device-code"));
     }
 
-    /// A gateway that drops out mid-flow is polled again, and the sign-in
-    /// still lands.
     #[tokio::test]
     async fn polling_survives_a_failed_request() {
         let (gateway, endpoints, authorization) = started().await;
@@ -280,8 +256,6 @@ mod tests {
         assert_eq!(gateway.token_forms().len(), 2);
     }
 
-    /// RFC 8628 §3.5: each `slow_down` lengthens the interval for the rest of
-    /// the flow.
     #[tokio::test]
     async fn slow_down_lengthens_the_interval() {
         let step = Duration::from_millis(40);

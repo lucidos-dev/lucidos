@@ -1,12 +1,5 @@
-//! A thread's events commit in sequence order.
-//!
-//! The client catches up with `sequence > lastDbSeq`, so a higher sequence
-//! committing first makes every later catch-up skip the lower one for good.
-
 use super::*;
 
-/// An event that writes no `thread_summaries` column, so nothing in its own
-/// projection makes it wait for an earlier emit on the same thread.
 fn projection_free_event(thread_id: Uuid) -> BusEvent {
     BusEvent::Thread {
         thread_id,
@@ -25,12 +18,6 @@ async fn created_of(pool: &PgPool, event_id: Uuid) -> DateTime<Utc> {
         .unwrap()
 }
 
-/// Emit A is parked after its INSERT: an outside transaction holds the summary
-/// row A's projection writes. A later emit B on the same thread must then wait
-/// before it takes a sequence, rather than commit past A.
-///
-/// Deterministic both ways. Without the append lock, B never blocks and returns
-/// first. With it, Postgres reports B waiting before A is released.
 #[tokio::test]
 async fn a_later_emit_on_a_thread_cannot_commit_before_an_earlier_one() {
     let (pool, db_name) = setup_test_db().await;
@@ -81,9 +68,6 @@ async fn a_later_emit_on_a_thread_cannot_commit_before_an_earlier_one() {
     teardown_test_db(&db_name).await;
 }
 
-/// `created` is stamped after the append lock is granted, not at transaction
-/// start. Otherwise an emit whose transaction began first but queued second
-/// would carry an earlier stamp than the event it follows.
 #[tokio::test]
 async fn created_is_stamped_after_the_append_lock_is_granted() {
     let (pool, db_name) = setup_test_db().await;
@@ -116,8 +100,6 @@ async fn created_is_stamped_after_the_append_lock_is_granted() {
     teardown_test_db(&db_name).await;
 }
 
-/// A backfilled row carrying a `thread_id` is an append to that thread like any
-/// other, so it queues behind an emit still in flight there.
 #[tokio::test]
 async fn a_historical_replay_on_a_thread_waits_for_an_emit_in_flight() {
     let (pool, db_name) = setup_test_db().await;
@@ -176,13 +158,6 @@ async fn a_historical_replay_on_a_thread_waits_for_an_emit_in_flight() {
     teardown_test_db(&db_name).await;
 }
 
-/// The append lock is the first lock each emit takes, so no mix of emits can
-/// deadlock on it. Hammer a parent and its children at once: child terminals
-/// recount the parent and post a completion card on it, while the parent
-/// takes its own emits. Every emit must succeed, and the counts must match.
-///
-/// The cards are counted because they go out after commit, where a failure is
-/// logged rather than returned.
 #[tokio::test]
 async fn concurrent_emits_on_a_family_never_deadlock() {
     let (pool, db_name) = setup_test_db().await;
@@ -228,6 +203,59 @@ async fn concurrent_emits_on_a_family_never_deadlock() {
         4,
         "a completion card failed after its child's commit"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_teardown_aborting_a_whole_family_at_once_never_deadlocks() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    for round in 0..12 {
+        let top = Uuid::new_v4();
+        emit_thread_message(&bus, top, None, "top").await;
+        let mut running = Vec::new();
+        for _ in 0..3 {
+            let parent = Uuid::new_v4();
+            emit_thread_message(&bus, parent, Some(top), "parent").await;
+            running.push(parent);
+            for _ in 0..2 {
+                let child = Uuid::new_v4();
+                emit_thread_message(&bus, child, Some(parent), "child").await;
+                running.push(child);
+            }
+        }
+
+        let results = futures::future::join_all(running.iter().map(|thread_id| {
+            let bus = bus.clone();
+            let thread_id = *thread_id;
+            tokio::spawn(async move {
+                bus.emit(BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::ResponseAborted {
+                        text: String::new(),
+                        images: vec![],
+                        model: None,
+                        reasoning_effort: None,
+                        cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+                    },
+                    meta: EventMeta {
+                        actor: Some(crate::engine::thread_events::device_actor("d")),
+                        ..EventMeta::NONE
+                    },
+                })
+                .await
+                .map_err(|e| e.to_string())
+            })
+        }))
+        .await;
+        for result in results {
+            result
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: a teardown abort failed: {e}"));
+        }
+    }
 
     pool.close().await;
     teardown_test_db(&db_name).await;

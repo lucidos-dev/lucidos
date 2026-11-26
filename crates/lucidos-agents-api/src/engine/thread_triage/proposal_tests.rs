@@ -1,5 +1,3 @@
-//! The approval gate: a proposal on this thread, then a reply from the user.
-
 use super::*;
 use crate::engine::thread_events::{ActorMode, AnswerKind, EventChannel, MessageOrigin};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -10,7 +8,6 @@ fn device() -> MessageOrigin {
     }
 }
 
-/// Persist a message, as the chat API does before any turn reads it.
 async fn message(bus: &EventBus, thread_id: Uuid, origin: Option<MessageOrigin>) -> Uuid {
     let mode = if origin.is_some() {
         ActorMode::Human
@@ -43,7 +40,6 @@ async fn message(bus: &EventBus, thread_id: Uuid, origin: Option<MessageOrigin>)
     .unwrap()
 }
 
-/// A turn takes `message` as its request: its first step carries the id.
 async fn take_as_request(bus: &EventBus, thread_id: Uuid, message: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -59,7 +55,6 @@ async fn take_as_request(bus: &EventBus, thread_id: Uuid, message: Uuid) {
     .unwrap();
 }
 
-/// The user's message, read by the turn it started.
 async fn reply(bus: &EventBus, thread_id: Uuid) {
     let id = message(bus, thread_id, Some(device())).await;
     take_as_request(bus, thread_id, id).await;
@@ -106,7 +101,6 @@ async fn apply_needs_a_proposal_and_a_user_reply_after_it() {
     reply(&bus, caller).await;
     assert_eq!(gate(&pool, caller).await, Ok(proposed));
 
-    // A newer proposal needs its own reply.
     record_proposal(&bus, caller, vec![entry("archive")])
         .await
         .unwrap();
@@ -143,7 +137,6 @@ async fn answering_a_question_card_counts_as_the_users_reply() {
     teardown_test_db(&db).await;
 }
 
-/// A proposal on another thread opens nothing here.
 #[tokio::test]
 async fn a_proposal_binds_only_its_own_thread() {
     let (pool, db) = setup_test_db().await;
@@ -159,9 +152,6 @@ async fn a_proposal_binds_only_its_own_thread() {
     teardown_test_db(&db).await;
 }
 
-/// A follow-up typed while the triage turn runs is persisted before the agent
-/// reads it. Until a turn takes it or the loop injects it, the user has not
-/// answered the proposal. A withdrawn follow-up never answers it.
 #[tokio::test]
 async fn a_queued_message_counts_only_once_the_agent_read_it() {
     let (pool, db) = setup_test_db().await;
@@ -209,8 +199,6 @@ async fn a_queued_message_counts_only_once_the_agent_read_it() {
     teardown_test_db(&db).await;
 }
 
-/// A message a turn already took as its request still does not answer the
-/// proposal once the user withdrew it.
 #[tokio::test]
 async fn a_withdrawn_message_never_answers_even_after_a_turn_took_it() {
     let (pool, db) = setup_test_db().await;

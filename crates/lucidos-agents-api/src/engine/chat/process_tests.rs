@@ -17,9 +17,6 @@ use crate::engine::ContextRole;
 use crate::memory::QueryClassification;
 use std::future::pending;
 
-/// Helper to invoke `build_capture_sections` with mostly empty context
-/// strings so individual tests only fill in what they care about. Returns
-/// the produced sections; tests filter/index by name.
 #[allow(clippy::too_many_arguments)]
 fn run_build(
     system_prompt: &str,
@@ -59,13 +56,8 @@ fn run_build(
         "",
         setup_reminder,
         thread_depth_context,
-        // Empty for the same reason as the two tail blocks below, and filled
-        // in by `build_capture_sections_bills_the_todo_list_block`.
         "",
         user_message,
-        // Engine Build and Client URL empty, so the row set stays what the
-        // per-section tests below assert. The two are filled in by
-        // `build_capture_sections_surfaces_the_two_relocated_tail_blocks`.
         &TurnTail {
             child_threads: "",
             engine_build: "",
@@ -77,23 +69,10 @@ fn run_build(
     )
 }
 
-/// The clock block a turn really carries, so the capture row's size is a
-/// realistic one rather than a stub.
 const CLOCK_BLOCK: &str =
     "[CURRENT TIME]\nNow: Monday, August 17, 2026 at 15:02 Europe/Oslo (UTC+2).\n\
      The same instant in UTC: Monday, August 17, 2026 at 13:02.\n[END CURRENT TIME]";
 
-/// After Phase 1 of the trigger-knowhow-discovery refactor, `TriggerContext`
-/// no longer carries `knowhow_ids` or `event_payload`. The synthetic
-/// `load_knowhow` tool turns the engine fabricated for trigger fires
-/// (commits 6beff8f0b / b64df77f9) lived only in the in-memory messages
-/// vec on the first turn; resume rebuilt context from events and dropped
-/// the recipe body. Trigger threads now discover knowhow the same way
-/// chat does — system-prompt list + LLM-driven `load_knowhow` calls. The
-/// on_event triggering payload travels in the intent prefix instead of as
-/// a fabricated `MessageReceived`. This struct-init guard asserts the
-/// shape: a refactor that re-introduces either field will fail to compile
-/// here, which is the contract.
 #[test]
 fn trigger_context_has_no_preload_fields() {
     let _tc = trigger_context("id", "name");
@@ -134,7 +113,6 @@ fn started(
     build_trigger_started_event(tc, user_message, selection).expect("a fire opens its turn")
 }
 
-/// A resumed run carries on its own turn, so it builds no starter event.
 #[test]
 fn a_resumed_trigger_turn_builds_no_starter_event() {
     let tc = TriggerContext {
@@ -144,8 +122,6 @@ fn a_resumed_trigger_turn_builds_no_starter_event() {
     assert!(build_trigger_started_event(&tc, "Carry on.", &sel(None, None, None)).is_none());
 }
 
-/// The starter event records the email the trigger's actor field resolved
-/// to, so a display can credit the operator holding it (ADR 0623).
 #[test]
 fn build_trigger_started_event_records_the_actor_email() {
     let tc = trigger_fire_context("t-1", "Ticket intake", |fire| {
@@ -165,11 +141,6 @@ fn build_trigger_started_event_records_the_actor_email() {
     assert_eq!(actor_email.as_deref(), Some("sam@example.com"));
 }
 
-/// Regression for the v5-hash leak: the trigger id passed in (a
-/// `config.id` from `/api/v1/triggers`) must propagate verbatim to both
-/// `TriggerStarted.trigger_id` and `EngineReason::Scheduler.trigger_id`,
-/// otherwise the dropdown filter (which posts the same `config.id`) finds
-/// nothing in `thread_summaries.trigger_id`.
 #[test]
 fn build_trigger_started_event_preserves_config_id_verbatim() {
     let config_id = "5633f3e1-110c-4df4-a6fc-c0df8fd36df4";
@@ -205,9 +176,6 @@ fn build_trigger_started_event_preserves_config_id_verbatim() {
     assert_eq!(origin_name.as_deref(), Some("Job Listing Check"));
 }
 
-/// The starter event of a trigger thread records the model / effort the run
-/// ACTUALLY used, because it is the only place the per-thread model memory can
-/// read them from (a trigger thread has no `MessageReceived`).
 #[test]
 fn build_trigger_started_event_records_the_resolved_model_and_effort() {
     let (event, _meta) = started(
@@ -234,8 +202,6 @@ fn build_trigger_started_event_records_the_resolved_model_and_effort() {
     );
 }
 
-/// The override triple a caller passes `resolve_route_overrides`, spelled
-/// positionally so the cases read as (model, effort, provider).
 fn sel(
     model: Option<&str>,
     effort: Option<&str>,
@@ -248,18 +214,12 @@ fn sel(
     }
 }
 
-/// The deadline these tests run against. The real ones come from
-/// `engine::aux_purpose::budget_for`; here any finite value does, since every
-/// case either resolves at once or hangs forever.
 const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A paragraph long enough to clear the thin-output floor for any turn count.
 fn thick_summary() -> String {
     "Fixed the summariser. ".repeat(40)
 }
 
-/// A hang yields nothing, so the caller falls back to its cached summary
-/// rather than to a line claiming the turns were resolved (ADR 0102).
 #[tokio::test(start_paused = true)]
 async fn summarize_yields_nothing_when_flash_hangs() {
     let hang = pending::<Result<String, Box<dyn std::error::Error + Send + Sync>>>();
@@ -273,17 +233,12 @@ async fn summarize_yields_nothing_on_provider_error() {
     assert_eq!(summarize_or_none(err, 4, TEST_DEADLINE).await, None);
 }
 
-/// An empty answer is a failure, not a summary. A blank paragraph would
-/// otherwise overwrite a good cached one.
 #[tokio::test(start_paused = true)]
 async fn summarize_yields_nothing_on_a_blank_answer() {
     let blank = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>("  \n ".into()) };
     assert_eq!(summarize_or_none(blank, 9, TEST_DEADLINE).await, None);
 }
 
-/// The measured bad roll: 24 output tokens, roughly 100 chars, for a segment
-/// covering many turns. It is a SUCCESS to everything downstream, so before
-/// the floor it was cached and then held for about five turns.
 #[tokio::test(start_paused = true)]
 async fn summarize_yields_nothing_on_a_thin_answer() {
     let thin = async {
@@ -294,9 +249,6 @@ async fn summarize_yields_nothing_on_a_thin_answer() {
     assert_eq!(summarize_or_none(thin, 19, TEST_DEADLINE).await, None);
 }
 
-/// The floor scales with the turns covered, so a short segment is allowed a
-/// short paragraph. Two turns require 120 chars, which this clears while
-/// staying far under what a 19-turn segment would owe.
 #[tokio::test(start_paused = true)]
 async fn a_short_segment_may_have_a_short_summary() {
     let text = "Fixed the login redirect, and confirmed the session cookie now survives \
@@ -319,14 +271,8 @@ async fn summarize_returns_the_paragraph_it_got() {
     );
 }
 
-/// The floor counts CHARACTERS, not bytes. The summariser writes in the user's
-/// language, so a Norwegian or CJK paragraph is the ordinary case rather than
-/// an exotic one. At 3 bytes per character, a byte count would let a
-/// third-length CJK summary clear the floor and be cached for five turns.
 #[tokio::test(start_paused = true)]
 async fn a_multibyte_summary_is_measured_in_characters() {
-    // 250 CJK characters at 3 bytes each: 750 bytes, over the 19-turn floor of
-    // 600, but 250 characters, well under it.
     let text = "要約".repeat(125);
     assert!(
         text.len() > 600,
@@ -340,18 +286,12 @@ async fn a_multibyte_summary_is_measured_in_characters() {
     assert_eq!(summarize_or_none(thin, 19, TEST_DEADLINE).await, None);
 }
 
-/// The floor's own arithmetic, without a model. The requirement scales per
-/// covered turn and stops at the cap, so a long thread never owes a
-/// proportionally longer paragraph.
 #[test]
 fn the_thin_output_floor_scales_then_caps() {
-    // 100 chars is the measured bad roll. Fine for one turn, not for many.
     assert!(!summary_is_too_thin(100, 1));
     assert!(summary_is_too_thin(100, 19));
-    // The cap: 40 turns asks no more than 10 turns past it would.
     assert!(!summary_is_too_thin(600, 40));
     assert!(summary_is_too_thin(599, 40));
-    // Zero covered turns can demand nothing.
     assert!(!summary_is_too_thin(0, 0));
 }
 
@@ -378,8 +318,6 @@ async fn classify_falls_back_on_provider_error() {
     assert!(result.sub_queries.is_empty());
 }
 
-/// `all` is what the eval harness sets on both arms: every section retrieved,
-/// so the curated context mode has memory to curate rather than none.
 #[test]
 fn the_all_pin_retrieves_every_section() {
     let pinned = forced_classification(Some("all")).expect("`all` is a pin");
@@ -398,16 +336,11 @@ fn the_none_pin_retrieves_nothing() {
     assert!(pinned.sub_queries.is_empty());
 }
 
-/// The pin is opt-in. Unset has to leave every ordinary workspace on the
-/// classifier it has always used.
 #[test]
 fn no_pin_means_the_classifier_runs_as_before() {
     assert!(forced_classification(None).is_none());
 }
 
-/// A typo must not silently pin the classification to something, and must not
-/// kill the engine either. It falls through to the ordinary classifier, and the
-/// pin reader logs the ignored value.
 #[test]
 fn a_value_that_is_neither_all_nor_none_is_ignored() {
     assert!(forced_classification(Some("yes")).is_none());
@@ -417,10 +350,6 @@ fn a_value_that_is_neither_all_nor_none_is_ignored() {
     assert!(forced_classification(Some("all,none")).is_none());
 }
 
-/// Surrounding whitespace and a shouted spelling both come free with a shell
-/// export, and neither should cost a paid run its pin. `ALL` reaching the
-/// engine as "no pin" would be silent: the arms would classify live again and
-/// go back to voiding the pairs this exists to save.
 #[test]
 fn a_padded_or_shouted_pin_is_still_a_pin() {
     assert!(forced_classification(Some("  all  ")).is_some());
@@ -432,12 +361,6 @@ fn a_padded_or_shouted_pin_is_still_a_pin() {
     );
 }
 
-/// The eval harness exports this name and this value from its own copies of
-/// both strings, in `crates/lucidos-engine-bin/src/bin/lucidos-eval/workspace.rs`.
-/// Nothing but a literal joins the two sides.
-/// Rename or re-spell either and the harness keeps exporting the
-/// old one: nothing fails to compile, the pin silently stops working, and the
-/// run goes back to voiding the pairs it exists to save. This is the tripwire.
 #[test]
 fn the_pin_is_the_name_and_value_the_eval_harness_exports() {
     assert_eq!(
@@ -447,13 +370,6 @@ fn the_pin_is_the_name_and_value_the_eval_harness_exports() {
     assert!(forced_classification(Some("all")).is_some());
 }
 
-/// Regression: an earlier version of the system prompt said
-/// "shipped with the Lucidos engine" with no live-reload clause. The LLM
-/// repeatedly inferred "baked into the binary, restart required" and told
-/// users to restart after editing system-knowhow files — even though the
-/// engine reads them fresh from disk on every chat turn. The section MUST
-/// state explicitly that no engine restart is needed and that Apply is the
-/// only step required.
 #[test]
 fn system_knowhow_section_tells_llm_no_restart_needed_after_apply() {
     let summaries = vec![KnowhowSummary {
@@ -481,15 +397,10 @@ fn system_knowhow_section_is_empty_when_no_summaries_loaded() {
     assert!(build_system_knowhow_section(&[]).is_empty());
 }
 
-/// Per-trigger knowhow listing must scope to the firing trigger's slug —
-/// threads of OTHER triggers must not see this trigger's knowhow listed.
-/// The id namespace is `triggers/<slug>/<file>` so the LLM's `load_knowhow`
-/// call resolves through the same fallback path as bare ids.
 #[test]
 fn trigger_knowhow_section_scoped_to_firing_trigger() {
     let tmp = tempfile::tempdir().unwrap();
     let triggers_dir = tmp.path().to_path_buf();
-    // Drop a knowhow file under nightly-build/knowhow/
     let kh_dir = triggers_dir.join("nightly-build").join("knowhow");
     std::fs::create_dir_all(&kh_dir).unwrap();
     std::fs::write(
@@ -498,7 +409,6 @@ fn trigger_knowhow_section_scoped_to_firing_trigger() {
     )
     .unwrap();
 
-    // Thread of nightly-build sees the section.
     let section = build_trigger_knowhow_section(&triggers_dir, "nightly-build");
     assert!(
         section.starts_with("[TRIGGER KNOW-HOW]") && section.ends_with("[END TRIGGER KNOW-HOW]"),
@@ -513,7 +423,6 @@ fn trigger_knowhow_section_scoped_to_firing_trigger() {
         "section must use the trigger-scoped id namespace, got: {section}"
     );
 
-    // Thread of a different trigger sees nothing.
     let other = build_trigger_knowhow_section(&triggers_dir, "some-other-trigger");
     assert!(
         other.is_empty(),
@@ -526,18 +435,10 @@ fn trigger_knowhow_section_empty_when_no_files() {
     let tmp = tempfile::tempdir().unwrap();
     let triggers_dir = tmp.path().to_path_buf();
     std::fs::create_dir_all(triggers_dir.join("standalone").join("knowhow")).unwrap();
-    // Empty knowhow dir → no listing.
     let section = build_trigger_knowhow_section(&triggers_dir, "standalone");
     assert!(section.is_empty());
 }
 
-/// Regression for the `Status of Authentication Migration` thread, where
-/// the chat LLM signed off with "Etter restart er denne tråden borte —
-/// jeg husker ingenting. Kom tilbake i en ny tråd og si …" — telling the
-/// user the existing thread was gone and they had to start a NEW one.
-/// Threads are event-sourced; the next turn after a restart loads the
-/// full history from PostgreSQL. The rule must not claim threads, thread
-/// memory, or thread context get wiped.
 #[test]
 fn engine_restart_rule_does_not_claim_thread_is_wiped_or_lost() {
     let lowered = ENGINE_RESTART_RULE.to_lowercase();
@@ -562,9 +463,6 @@ fn engine_restart_rule_does_not_claim_thread_is_wiped_or_lost() {
     }
 }
 
-/// The rule must positively state what actually survives (the thread and
-/// its history) so the LLM sends users back to the same thread instead of
-/// a fresh one.
 #[test]
 fn engine_restart_rule_says_thread_survives_and_history_reloads() {
     let lowered = ENGINE_RESTART_RULE.to_lowercase();
@@ -582,9 +480,6 @@ fn engine_restart_rule_says_thread_survives_and_history_reloads() {
     );
 }
 
-/// The fix must keep the original guidance against promising post-restart
-/// continuation — that part of the old rule was correct and is the actual
-/// trap we want the LLM to avoid.
 #[test]
 fn engine_restart_rule_still_blocks_post_restart_promises() {
     assert!(
@@ -597,22 +492,10 @@ fn engine_restart_rule_still_blocks_post_restart_promises() {
     );
 }
 
-/// The rule as a DEV install sees it: the unconditional half plus the dev-only
-/// addendum, exactly as `build_chat_system_prompt` composes it when a Lucidos
-/// source checkout exists. The two are separate constants because the
-/// rebuild/restart choreography is meaningless on an install with no source
-/// (see `system_prompt::coding_surface_section`), but every assertion below
-/// still has to hold for the dev variant.
 fn apply_verify_rule_dev_variant() -> String {
     format!("{APPLY_VERIFY_RULE}{APPLY_VERIFY_DEV_ADDENDUM}")
 }
 
-/// The apply/verify rule must keep the chat agent from bouncing yes/no
-/// "did you apply it? / did you restart?" confirmations at the user — the
-/// font-fix-session failure pattern. It must (1) name both self-service tools,
-/// (2) ban the two confirmation questions, (3) tell the agent to probe the
-/// served asset instead of asking, (4) carry the workspace-prefixed-route
-/// gateway gotcha, and (5) ban the "does it look right now?" closer.
 #[test]
 fn apply_verify_rule_tells_agent_to_act_and_verify_not_ask() {
     let rule = apply_verify_rule_dev_variant();
@@ -647,10 +530,6 @@ fn apply_verify_rule_tells_agent_to_act_and_verify_not_ask() {
     );
 }
 
-/// The fix is a NARROW carve-out, not a ban on `ask_user_question` (the user
-/// explicitly flagged this during the work). The rule must reference the tool
-/// to scope the carve-out and must NOT blanket-ban it, so the LLM doesn't
-/// over-correct into never asking genuine next-step choices.
 #[test]
 fn apply_verify_rule_does_not_disable_ask_user_question() {
     assert!(
@@ -670,13 +549,6 @@ fn apply_verify_rule_does_not_disable_ask_user_question() {
     }
 }
 
-/// The rule must reinforce that the user works on Lucidos constantly and knows
-/// the apply/restart/reload dance — so the agent doesn't re-explain it (the
-/// other half of "don't interrogate the user").
-///
-/// Dev-variant only. On an install with no Lucidos source checkout the premise
-/// is false — there is no engine rebuild to know the dance for — so this half
-/// is deliberately absent there; `system_prompt::tests` pins that direction.
 #[test]
 fn apply_verify_rule_reinforces_user_knows_the_dance() {
     let rule = apply_verify_rule_dev_variant();
@@ -688,18 +560,8 @@ fn apply_verify_rule_reinforces_user_knows_the_dance() {
     );
 }
 
-/// Phase 3.1: every turn after the first must inject a `[LOADED KNOWHOW]`
-/// block listing the docs `load_knowhow` brought in earlier in the thread.
-/// The block lives in the user message so the LLM sees it on every turn —
-/// Phase 4 stubs the resume tool blocks for `load_knowhow` so the same body
-/// isn't sent twice.
 #[test]
 fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
-    // doc.body is already the formatted [SYSTEM-KNOWHOW: <name>] block
-    // produced by core::knowhow::load_one_knowhow_section. The function
-    // must push it verbatim — re-wrapping would double-nest markers and
-    // mismatch id-vs-name (id is the file id, name is the doc's display
-    // name from frontmatter).
     let docs = vec![
         LoadedKnowhow::loaded_turns_ago(
             "alpha",
@@ -717,12 +579,10 @@ fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
         s.ends_with("[END LOADED KNOWHOW]"),
         "block must close with the [END LOADED KNOWHOW] marker:\n{s}"
     );
-    // Bodies pass through verbatim — no re-wrapping with [SYSTEM-KNOWHOW: <id>].
     assert!(s.contains("[SYSTEM-KNOWHOW: Alpha Doc]"));
     assert!(s.contains("[KNOW-HOW: Beta Doc]"));
     assert!(s.contains("Body A"));
     assert!(s.contains("Body B"));
-    // The id must NOT appear as an outer marker — that would mean re-wrapping.
     assert!(
         !s.contains("[SYSTEM-KNOWHOW: alpha]"),
         "must not re-wrap with id as outer marker:\n{s}"
@@ -731,15 +591,12 @@ fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
         !s.contains("[SYSTEM-KNOWHOW: beta]"),
         "must not re-wrap with id as outer marker:\n{s}"
     );
-    // Header guidance is present so the LLM knows how to treat the section.
     assert!(
         s.contains("Treat their guidance as authoritative"),
         "header guidance missing from block:\n{s}"
     );
-    // The general rule rides here, so the agent can keep a doc in time.
     assert!(s.contains("call load_knowhow on it again"), "{s}");
     assert!(s.contains("unload_knowhow"), "{s}");
-    // Each doc keeps its id line. Its countdown rides in `[KNOWHOW RETENTION]`.
     for doc in &docs {
         let line = format!("(`{}`)", doc.id);
         assert!(s.contains(&line), "missing `{line}`:\n{s}");
@@ -750,8 +607,6 @@ fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
     }
 }
 
-/// The block is the stable half of the knowhow section: ageing a doc must not
-/// change one byte of it.
 #[test]
 fn loaded_knowhow_block_is_identical_at_every_idle_age() {
     let at = |idle_turns| {
@@ -765,7 +620,6 @@ fn loaded_knowhow_block_is_identical_at_every_idle_age() {
     assert_eq!(at(0), at(3));
 }
 
-/// One note per doc, in the doc's own words, in a block of its own.
 #[test]
 fn knowhow_retention_block_carries_one_note_per_doc() {
     let docs = vec![
@@ -787,17 +641,11 @@ fn knowhow_retention_block_returns_none_for_empty_docs() {
     assert!(build_knowhow_retention_block(&[]).is_none());
 }
 
-/// Empty loaded set must not produce a section — pushing an empty-string part
-/// would put a stray double-newline pair into the user message.
 #[test]
 fn loaded_knowhow_block_returns_none_for_empty_docs() {
     assert!(build_loaded_knowhow_block(&[]).is_none());
 }
 
-/// Phase 5.1: every base section must carry the API role + inner-tier
-/// group the viewer needs to render the new two-layer grouping. Empty
-/// content is filtered out so this test fills every slot to exercise the
-/// full `labeled` array.
 #[test]
 fn build_capture_sections_tags_existing_sections_with_role_and_group() {
     let sections = run_build(
@@ -841,7 +689,6 @@ fn build_capture_sections_tags_existing_sections_with_role_and_group() {
         Some("Identity & profile".to_string())
     );
 
-    // Spot-check one row from every inner tier the viewer renders.
     assert_eq!(
         by_name("File List").group,
         Some("Workspace inventory".to_string())
@@ -896,8 +743,6 @@ fn build_capture_sections_tags_existing_sections_with_role_and_group() {
     );
 }
 
-/// Phase 5.1: empty bodies must be filtered out — the viewer must not
-/// render zero-char rows for sections that don't apply this turn.
 #[test]
 fn build_capture_sections_filters_empty_sections() {
     let sections = run_build(
@@ -921,18 +766,12 @@ fn build_capture_sections_filters_empty_sections() {
         &[],
     );
     let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
-    // Current Time is unconditional: `turn_clock::current_time_block` always
-    // renders, so unlike the fifteen filtered rows it can never be empty.
     assert_eq!(
         names,
         vec!["System Instructions", "User Message", "Current Time"]
     );
 }
 
-/// The turn-start todo block is billed like any other section, so the viewer's
-/// budget bar accounts for it. It is absent on the overwhelming majority of
-/// turns, which is what keeps it cheap: `run_build` above passes it empty and
-/// no row appears.
 #[test]
 fn build_capture_sections_bills_the_todo_list_block() {
     let block = "[TODO LIST]\n1. [abandoned] a (doing a)\n[END TODO LIST]";
@@ -1001,8 +840,6 @@ fn build_capture_sections_bills_the_todo_list_block() {
     );
 }
 
-/// The MCP tools-not-sent line rides in the first user message, so the
-/// capture bills it on a row of its own.
 #[test]
 fn build_capture_sections_bills_the_mcp_tools_not_sent_notice() {
     let notice = "[MCP TOOLS NOT SENT] server 'github' (2: a, b)";
@@ -1045,13 +882,6 @@ fn build_capture_sections_bills_the_mcp_tools_not_sent_notice() {
     assert_eq!(row.content.as_deref(), Some(notice));
 }
 
-/// The two blocks ADR 0084 moved out of the system prompt are billed where
-/// they now ride: the request tail, one row each. Without their own rows the
-/// viewer's budget bar would lose them entirely, since they left the System
-/// Instructions row and joined nothing.
-///
-/// Engine Build is empty on a packaged install, which is why it filters out
-/// above rather than being unconditional like the clock.
 #[test]
 fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
     let sections = build_capture_sections(
@@ -1115,9 +945,6 @@ fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
     }
 }
 
-/// Phase 5.2: each loaded knowhow doc gets its own collapsible row under
-/// the "Loaded knowhow" inner group. Char count reflects the body so the
-/// viewer's budget bar stays honest when a round drops the body.
 #[test]
 fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
     let docs = vec![
@@ -1150,7 +977,6 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
         .filter(|s| s.group.as_deref() == Some("Loaded knowhow"))
         .collect();
     assert_eq!(knowhow.len(), 2, "one row per loaded doc");
-    // The row says why the doc is still loaded.
     assert_eq!(
         knowhow[0].name,
         format!("knowhow: doc-a ({})", docs[0].retention_note())
@@ -1160,7 +986,6 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
         format!("knowhow: doc-b ({})", docs[1].retention_note())
     );
     assert!(knowhow.iter().all(|s| s.role == ContextRole::User));
-    // Nothing else counts a knowhow doc's chars, so the delta is its own size.
     assert_eq!(knowhow[0].budget_delta_chars, "BODY A".chars().count());
     assert_eq!(knowhow[1].budget_delta_chars, "BODY BBBB".chars().count());
     assert_eq!(knowhow[0].content_chars, Some("BODY A".chars().count()));
@@ -1169,10 +994,6 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
     assert_eq!(knowhow[1].content.as_deref(), Some("BODY BBBB"));
 }
 
-/// Phase 5.3: each `(ToolUse, ToolResult)` pair from `resume_tool_blocks`
-/// becomes its own row under the `PriorMessage` role. Tool name + JSON
-/// args preview live in the row name so the viewer can show what call the
-/// pair represents without expanding it.
 #[test]
 fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
     use crate::llm::{ContentBlock, Message, MessageContent};
@@ -1239,8 +1060,6 @@ fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
     assert!(prior.iter().any(|s| s.name == "ToolUse: query_events"));
     assert!(prior.iter().any(|s| s.name == "ToolUse: load_knowhow"));
     assert!(prior.iter().all(|s| s.group.is_none()));
-    // Both sizes reflect the assembled "ToolUse: …\n\nToolResult:\n…" body,
-    // so the viewer's prior-messages budget stays accurate.
     assert!(prior.iter().all(|s| s.content.is_some()));
     assert!(prior.iter().all(|s| s.budget_delta_chars > 0));
     assert!(prior
@@ -1280,10 +1099,6 @@ fn build_capture_sections_includes_device_preferences_context() {
     assert!(section.budget_delta_chars > 0);
 }
 
-/// The turn's section list always carries its bodies, whatever the
-/// `capture_context` switch said when the turn started. The loop drops them
-/// per round (`round_capture_sections`), so a switch flipped while a question
-/// card held the turn open reaches the rounds after the answer.
 #[test]
 fn build_capture_sections_always_carries_the_bodies() {
     let docs = vec![LoadedKnowhow::loaded_turns_ago("doc", "BODY", 1)];
@@ -1319,12 +1134,6 @@ fn build_capture_sections_always_carries_the_bodies() {
     assert_eq!(knowhow.content.as_deref(), Some("BODY"));
 }
 
-/// The cap clips the BODY and never either count.
-///
-/// The Context Viewer's budget bar and the eval's utilisation axis read
-/// `budget_delta_chars`, and a region-size question reads `content_chars`.
-/// Both are the true assembled length here whatever the body does. ADR 0110's
-/// full capture lifts the cap, and that gate must not move either number.
 #[test]
 fn a_capped_body_still_reports_its_true_length() {
     let long = "x".repeat(20_000);
@@ -1369,13 +1178,6 @@ fn a_capped_body_still_reports_its_true_length() {
     );
 }
 
-/// The chat-agent prompt must nudge use of `ask_user_question` for
-/// choice-shaped questions (yes/no, A vs B, "what next?" follow-up menus)
-/// — symmetric with the CC-side `chat_style_prompts_nudge_use_of_ask_user_question`
-/// test in `agent_session::prompts`. Without this nudge the chat agent
-/// reads ACTION FIRST as a blanket "don't ask the user anything" rule and
-/// falls back to plaintext bullet lists for next-step alternatives — the
-/// exact failure pattern the rule was added to prevent.
 #[test]
 fn chat_prompt_nudges_use_of_ask_user_question() {
     let rule = super::ASK_USER_QUESTION_RULE;
@@ -1416,11 +1218,6 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
          `ask_user_question` alongside other tools (see the parallel CC rule \
          in `agent_session::prompts::ASK_USER_QUESTION_RULE`)",
     );
-    // Three observed Opus 4.7 leaks emitted
-    // `<ask_user_question>…</ask_user_question>` as
-    // literal assistant text instead of a tool call. The rule must name
-    // that exact failure mode so the next prompt edit can't silently drop
-    // the anti-pattern callout.
     assert!(
         rule.contains("<ask_user_question"),
         "chat ASK_USER_QUESTION_RULE must show the forbidden literal tag \
@@ -1438,14 +1235,6 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
     );
 }
 
-/// The chat-agent prompt must forbid claiming a repeated action ("again") was
-/// performed without actually calling the tool that turn. Observed failure
-/// (testing-notifications thread, 2026-06-30): the user said "again" four times;
-/// the agent fired `send_notification` on the first two, then — seeing the two
-/// prior identical `ToolUse: send_notification` entries in its context — wrote
-/// "Sent another" for the last two WITHOUT calling the tool, so nothing went
-/// out. The CRITICAL RULES anti-hallucination guidance was scoped to file
-/// writes; this rule generalizes it and names the repeat-request trap directly.
 #[test]
 fn chat_prompt_forbids_faking_repeated_actions() {
     let rule = super::REPEATED_ACTION_RULE;
@@ -1475,8 +1264,6 @@ fn chat_prompt_forbids_faking_repeated_actions() {
          happened this time — that misread is the root of the bug",
     );
 }
-
-// --- FreeText answer eligibility (child-completion vs. human follow-up) ---
 
 use super::run::message_can_answer_pending_question;
 use super::run::resolve_route_overrides;
@@ -1580,18 +1367,12 @@ use crate::engine::thread_events::ActorMode;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
-/// The model registry the resolver clamps the effort against. Empty, so every
-/// id takes the same prefix heuristic `RoutingProvider` would use for a model
-/// with no row (`claude-*` and the unregistered placeholder ids these tests use
-/// alike). Tests that need a specific provider build their own.
 fn registry() -> crate::llm::ModelRegistry {
     crate::llm::model_registry::empty()
 }
 
-/// The router's own model, standing in for an unset `chat_model`.
 const FALLBACK_MODEL: &str = "router-default";
 
-/// Store `effort` as the account's chat tier for `model`.
 async fn seed_chat_effort(pool: &sqlx::PgPool, model: &str, effort: &str) {
     crate::test_support::seed_preference(
         pool,
@@ -1602,7 +1383,6 @@ async fn seed_chat_effort(pool: &sqlx::PgPool, model: &str, effort: &str) {
     .unwrap();
 }
 
-/// A registry mapping one id to one provider, for the clamp cases.
 fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::ModelRegistry {
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
@@ -1614,10 +1394,6 @@ fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::Mo
     Arc::new(RwLock::new(map))
 }
 
-/// Coding-agent requests use the same HTTP `reasoning_effort` field for an
-/// explicit agent pick, but an omitted field means "fall through to agent
-/// settings/defaults". It must not be filled from the Lucidos chat preference:
-/// Codex and Claude Code have their own model/effort configuration surfaces.
 #[tokio::test]
 async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
     let (pool, db_name) = setup_test_db().await;
@@ -1699,9 +1475,6 @@ async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
     teardown_test_db(&db_name).await;
 }
 
-/// Per-thread memory at the route layer: a chat follow-up with no explicit
-/// override reuses the model/effort the thread last ran with, NOT the account
-/// preference (docs/plans/2026-07-03-per-thread-model-memory.md).
 #[tokio::test]
 async fn chat_route_reuses_thread_last_model_over_preference() {
     let (pool, db_name) = setup_test_db().await;
@@ -1742,11 +1515,6 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
     teardown_test_db(&db_name).await;
 }
 
-/// A trigger thread's starter event is `TriggerStarted`, never
-/// `MessageReceived`, so the per-thread memory has to read it too. Without this
-/// a Continue on a trigger thread pinned to a cheap model would jump back to
-/// the account model, and the in-thread picker would have been showing the
-/// wrong one the whole time.
 #[tokio::test]
 async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     let (pool, db_name) = setup_test_db().await;
@@ -1791,10 +1559,6 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     teardown_test_db(&db_name).await;
 }
 
-/// A trigger fire is a brand-new thread (`thread_id = None`) whose model /
-/// effort come from the trigger itself. The pinned value must beat the account
-/// preference, or a trigger deliberately moved to a cheap model would keep
-/// burning the account's chat model.
 #[tokio::test]
 async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
     let (pool, db_name) = setup_test_db().await;
@@ -1823,15 +1587,9 @@ async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
     teardown_test_db(&db_name).await;
 }
 
-/// A trigger that pins only the model runs it at that model's own tier, never
-/// the account model's. One that pins only the effort still inherits the
-/// account model. Pinning one must never freeze the other.
 #[tokio::test]
 async fn trigger_route_resolves_model_and_effort_independently() {
     let (pool, db_name) = setup_test_db().await;
-    // An adaptive Claude account model, so every tier is available and the
-    // clamp is a no-op: this test is about the two fields resolving
-    // independently, not about clamping (covered separately below).
     crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-5")
         .await
         .unwrap();
@@ -1880,14 +1638,6 @@ async fn trigger_route_resolves_model_and_effort_independently() {
     teardown_test_db(&db_name).await;
 }
 
-/// The resolved pair is clamped HERE, not only at the wire, so the effort a
-/// turn stamps on its events is the effort it actually sends.
-///
-/// The mismatch is manufactured by a stored tier the model's route cannot run.
-/// Left unclamped, the turn records `xhigh` for a local model,
-/// which the in-thread picker then displays as the thread's setting even though
-/// its dropdown offers no such tier, and which the next turn reads back as the
-/// thread's remembered effort.
 #[tokio::test]
 async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
     let (pool, db_name) = setup_test_db().await;
@@ -1918,7 +1668,6 @@ async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
     teardown_test_db(&db_name).await;
 }
 
-/// The route a `run_thread` child stamps, resolved the way the tool does it.
 async fn sub_thread_route(
     pool: &sqlx::PgPool,
     registry: &crate::llm::ModelRegistry,
@@ -1942,7 +1691,6 @@ async fn sub_thread_route(
     .await
 }
 
-/// An unpinned child follows its caller, never the account's `chat_model`.
 #[tokio::test]
 async fn an_unpinned_child_runs_on_its_callers_route_not_the_chat_model() {
     let (pool, db_name) = setup_test_db().await;
@@ -1968,7 +1716,6 @@ async fn an_unpinned_child_runs_on_its_callers_route_not_the_chat_model() {
     teardown_test_db(&db_name).await;
 }
 
-/// An effort pinned for the inherited model is clamped to what its route runs.
 #[tokio::test]
 async fn a_childs_pinned_effort_is_clamped_to_the_inherited_route() {
     let (pool, db_name) = setup_test_db().await;
@@ -1992,10 +1739,6 @@ async fn a_childs_pinned_effort_is_clamped_to_the_inherited_route() {
     teardown_test_db(&db_name).await;
 }
 
-/// A coding-agent route is exempt: the effort belongs to Claude Code / Codex,
-/// whose models are not in the chat registry and whose drivers validate it
-/// themselves. Clamping it against a chat model would answer a question about
-/// the wrong agent, and `xhigh` is a perfectly good Codex tier.
 #[tokio::test]
 async fn a_coding_agent_effort_is_not_clamped_against_the_chat_registry() {
     let (pool, db_name) = setup_test_db().await;
@@ -2201,8 +1944,6 @@ fn the_tool_call_cap_is_read_once_per_turn() {
     );
 }
 
-/// A genuine human follow-up typed on a thread with an open question is the
-/// one and only case that may be consumed as a FreeText answer.
 #[test]
 fn human_follow_up_can_answer_pending_question() {
     assert!(message_can_answer_pending_question(
@@ -2215,10 +1956,8 @@ fn human_follow_up_can_answer_pending_question() {
     ));
 }
 
-/// Images alone are an answer: a screenshot can be the whole reply.
 #[test]
 fn unattested_follow_up_cannot_answer_pending_question() {
-    // A typed device id is no person, so its message never answers a card.
     assert!(!message_can_answer_pending_question(
         false,
         "allow it",
@@ -2241,11 +1980,6 @@ fn image_only_follow_up_can_answer_pending_question() {
     ));
 }
 
-/// Regression guard for the emit-before-ack path: a human follow-up whose
-/// `MessageReceived` the API boundary already persisted must NOT also be
-/// consumed as the answer. Answering emits `UserQuestionAnswered` and no
-/// `MessageReceived`, so routing a pre-emitted message here would leave two
-/// events in the thread for one thing the user said.
 #[test]
 fn pre_emitted_message_cannot_also_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
@@ -2258,13 +1992,6 @@ fn pre_emitted_message_cannot_also_answer_pending_question() {
     ));
 }
 
-/// Regression: an agent-driven child-completion re-entry (the `[CHILD THREAD
-/// COMPLETED] …` block fed through `notify_parent_of_child_completion` with
-/// `ActorMode::Agent`) must NOT be eligible to answer the parent's open
-/// question. Before the `mode == Human` guard it was, producing a bogus
-/// `UserQuestionAnswered { FreeText }` stamped with a `thread_link`/`child`
-/// actor and silently consuming the user's question. It must instead fall
-/// through to the injection fast-path (queued as `ReentryFromEngine`).
 #[test]
 fn child_completion_wake_cannot_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
@@ -2277,8 +2004,6 @@ fn child_completion_wake_cannot_answer_pending_question() {
     ));
 }
 
-/// Engine-driven re-entries (recovery notes, scheduler) are likewise never the
-/// user's answer.
 #[test]
 fn engine_driven_message_cannot_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
@@ -2291,8 +2016,6 @@ fn engine_driven_message_cannot_answer_pending_question() {
     ));
 }
 
-/// A new thread has no pending question to answer, and an empty message can't
-/// be an answer regardless of who authored it.
 #[test]
 fn new_thread_or_empty_message_cannot_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
@@ -2313,17 +2036,6 @@ fn new_thread_or_empty_message_cannot_answer_pending_question() {
     ));
 }
 
-/// Where the question supersede sits IS the rule, so pin it. Both halves are
-/// load-bearing, and neither has any other seam to test through.
-///
-/// Below the answer fast-path: a message that could answer the question already
-/// did and returned, so anything still open here is a question this follow-up
-/// cannot answer. Inside the coding-agent block: a chat thread queues such a
-/// follow-up as an injection and keeps its question live, which is right there.
-///
-/// The bug this pins is a deadlock. The agent is parked inside the call that
-/// asked. The follow-up's own `CodingAgentPromptSent` then kills the card, and
-/// nothing is left that can release the agent.
 #[test]
 fn the_question_supersede_is_wired_below_the_answer_fast_path() {
     let source = include_str!("process/run.rs");
@@ -2346,8 +2058,6 @@ fn the_question_supersede_is_wired_below_the_answer_fast_path() {
         "the question supersede belongs in the coding-agent-only block, beside the permission one"
     );
 
-    // ADR 0255: a child's completion must not supersede a question the user
-    // can still answer. The decision is unit-tested, so pin that it gates.
     let keep_check = source
         .find("follow_up_keeps_open_question")
         .expect("the supersede must consult follow_up_keeps_open_question");
@@ -2356,9 +2066,6 @@ fn the_question_supersede_is_wired_below_the_answer_fast_path() {
         "the keep-open check must gate the question supersede"
     );
 
-    // ADR 0256: an agent-sent message is held before anything can supersede
-    // the question. A human message releases older held ones after its own
-    // supersedes, so the human is recorded as resolving any open card.
     let hold = source
         .find("held_messages::message_is_held")
         .expect("the router must hold agent messages behind an open question");
@@ -2375,9 +2082,6 @@ fn the_question_supersede_is_wired_below_the_answer_fast_path() {
     );
 }
 
-/// A provider the model has no route on is not stamped. The router would treat
-/// it as stale and fall through, so stamping it would record a backend the turn
-/// never reached. A provider the model does have passes through.
 #[tokio::test]
 async fn a_provider_the_model_cannot_use_is_not_stamped() {
     let (pool, db_name) = setup_test_db().await;
@@ -2416,7 +2120,6 @@ async fn a_provider_the_model_cannot_use_is_not_stamped() {
     teardown_test_db(&db_name).await;
 }
 
-/// Every section, each a unique token, so a test can tell where it landed.
 fn every_section() -> TurnSections<'static> {
     TurnSections {
         recent: "RECENT",
@@ -2449,7 +2152,6 @@ fn every_section() -> TurnSections<'static> {
     }
 }
 
-/// Where each token first appears in `text`, in the order asked for.
 fn positions(text: &str, tokens: &[&str]) -> Vec<usize> {
     tokens
         .iter()
@@ -2464,8 +2166,6 @@ fn is_ascending(xs: &[usize]) -> bool {
     xs.windows(2).all(|w| w[0] < w[1])
 }
 
-/// The stable half holds the five inputs that change only when the user
-/// changes something, in this order. Everything else is volatile.
 #[test]
 fn the_stable_text_holds_the_five_stable_sections_in_order() {
     let text = assemble_turn_text(&every_section());
@@ -2479,8 +2179,6 @@ fn the_stable_text_holds_the_five_stable_sections_in_order() {
     }
 }
 
-/// Today's relative order survives in the volatile half, with the retention
-/// notes where the knowhow block used to sit.
 #[test]
 fn the_volatile_text_keeps_the_relative_order() {
     let text = assemble_turn_text(&every_section());
@@ -2513,7 +2211,6 @@ fn the_volatile_text_keeps_the_relative_order() {
     );
 }
 
-/// I6: the request and the tail stay last.
 #[test]
 fn the_request_and_the_tail_end_the_volatile_text() {
     let text = assemble_turn_text(&every_section());
@@ -2525,7 +2222,6 @@ fn the_request_and_the_tail_end_the_volatile_text() {
     );
 }
 
-/// I5: each section reaches the model once, so no token appears twice.
 #[test]
 fn every_section_appears_exactly_once_across_the_two_texts() {
     let text = assemble_turn_text(&every_section());
@@ -2560,7 +2256,6 @@ fn every_section_appears_exactly_once_across_the_two_texts() {
     }
 }
 
-/// I1: the stable bytes depend on the stable inputs and on nothing else.
 #[test]
 fn the_stable_text_ignores_every_volatile_input() {
     let base = assemble_turn_text(&every_section());
@@ -2593,8 +2288,6 @@ fn the_stable_text_ignores_every_volatile_input() {
     assert_ne!(base.volatile, changed.volatile);
 }
 
-/// An empty section leaves no gap behind, and no stable inputs leave no
-/// stable text for the caller to turn into a block.
 #[test]
 fn empty_sections_leave_no_separator_behind() {
     let text = assemble_turn_text(&TurnSections {
@@ -2611,8 +2304,6 @@ fn empty_sections_leave_no_separator_behind() {
     assert_eq!(text.volatile, "Request: ASK\n\nCLIENT\n\nCLOCK");
 }
 
-/// I13: a trigger's own listing rides in the fire's volatile text, never in the
-/// stable block, so two triggers still share the stable entry.
 #[test]
 fn a_trigger_knowhow_listing_rides_in_the_volatile_text() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2638,7 +2329,6 @@ fn a_trigger_knowhow_listing_rides_in_the_volatile_text() {
     assert!(!text.stable.contains("nightly-build"), "{}", text.stable);
 }
 
-/// Removed know-how rides in the fire's volatile text and names what removed it.
 #[test]
 fn a_removed_knowhow_block_rides_in_the_volatile_text() {
     let removed = [crate::triggers::affected::RemovedKnowhow {
@@ -2672,7 +2362,6 @@ use super::run::trigger_model_override;
 
 const TRIGGER_DEFAULT: &str = "claude-sonnet-5-5";
 
-/// A registry serving the trigger default on Anthropic at its default effort.
 fn trigger_default_registry() -> crate::llm::ModelRegistry {
     let registry = registry_with(TRIGGER_DEFAULT, crate::llm::ProviderKind::Anthropic);
     registry
@@ -2684,8 +2373,6 @@ fn trigger_default_registry() -> crate::llm::ModelRegistry {
     registry
 }
 
-/// An unpinned trigger runs on the trigger model, never the chat model. It uses
-/// that model's default effort while the account stores no tier for it.
 #[tokio::test]
 async fn an_unpinned_trigger_runs_on_the_trigger_model_not_the_chat_model() {
     let (pool, db_name) = setup_test_db().await;
@@ -2716,7 +2403,6 @@ async fn an_unpinned_trigger_runs_on_the_trigger_model_not_the_chat_model() {
     teardown_test_db(&db_name).await;
 }
 
-/// A trigger's own pin wins over the trigger model, stored or default.
 #[tokio::test]
 async fn a_pinned_trigger_keeps_its_model() {
     let (pool, db_name) = setup_test_db().await;
@@ -2730,7 +2416,6 @@ async fn a_pinned_trigger_keeps_its_model() {
     teardown_test_db(&db_name).await;
 }
 
-/// A stored `trigger_model` replaces the catalog default.
 #[tokio::test]
 async fn a_stored_trigger_model_replaces_the_default() {
     let (pool, db_name) = setup_test_db().await;
@@ -2744,8 +2429,6 @@ async fn a_stored_trigger_model_replaces_the_default() {
     teardown_test_db(&db_name).await;
 }
 
-/// With the default on no configured backend, the fire follows the chat
-/// resolver instead of failing on a model the workspace cannot reach.
 #[tokio::test]
 async fn an_unreachable_trigger_default_leaves_the_fire_to_the_chat_resolver() {
     let (pool, db_name) = setup_test_db().await;
@@ -2763,8 +2446,6 @@ async fn an_unreachable_trigger_default_leaves_the_fire_to_the_chat_resolver() {
     teardown_test_db(&db_name).await;
 }
 
-/// The trigger model never reaches a chat turn: with no override and no thread
-/// memory, a turn still starts on the chat model.
 #[tokio::test]
 async fn the_trigger_model_never_reaches_a_chat_turn() {
     let (pool, db_name) = setup_test_db().await;
@@ -2817,8 +2498,6 @@ fn trigger_started_carries_retry_provenance() {
     assert_eq!(actual, Some(retry_of));
 }
 
-/// An existing coding-agent thread runs its coding agent whatever the caller
-/// asked. Every other thread keeps the caller's choice (ADR 0678).
 #[tokio::test]
 async fn a_coding_agent_thread_decides_its_lane() {
     use super::run::resolve_coding_agent_lane;
@@ -2870,8 +2549,6 @@ async fn a_coding_agent_thread_decides_its_lane() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// The first orphan starts a run; its older batch tail must precede any
-/// message queued while that run was being claimed, without awaiting its exit.
 #[test]
 fn an_orphan_batch_precedes_newer_inputs_on_a_starting_run() {
     crate::test_support::run_on_engine_runtime(

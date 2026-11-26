@@ -25,8 +25,6 @@ fn no_children_means_no_block() {
     assert_eq!(render_child_status(Ok(&ChildStatuses::default())), "");
 }
 
-/// The incident: the child reported "waiting" long ago and is working now.
-/// Both facts sit on one line, so the stale one reads as old.
 #[test]
 fn a_row_carries_the_state_now_beside_the_last_report() {
     let statuses = ChildStatuses {
@@ -177,8 +175,6 @@ mod db {
             .any(|w| Uuid::parse_str(w).is_ok())
     }
 
-    /// The read is live: a child that answers after its report shows its
-    /// state now, and the report's age stays beside it.
     #[tokio::test]
     async fn the_block_reads_each_childs_liveness_now() {
         let (pool, db) = setup_test_db().await;
@@ -221,7 +217,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A report filed for the parent's next turn is a report too.
     #[tokio::test]
     async fn a_filed_report_counts_as_the_newest_report() {
         let (pool, db) = setup_test_db().await;

@@ -1,7 +1,3 @@
-//! `lucidos main-check status`: where the *main check* stands (ADR 0464), and
-//! `lucidos main-check setting`: the main-check setting (ADR 0694). Both wrap
-//! `GET /api/v1/main-check`.
-
 use crate::http::{client as http_client, send_expect_json};
 use crate::workspace::{BoxError, Workspace};
 use serde_json::Value;
@@ -11,7 +7,6 @@ fn snapshot(ws: &Workspace) -> Result<Value, BoxError> {
     send_expect_json("GET", &url, http_client()?.get(&url))
 }
 
-/// Print the main-check setting, which `scripts/harden-suites.sh` reads.
 pub(crate) fn cmd_setting(ws: &Workspace) -> Result<(), BoxError> {
     if let Some(setting) = snapshot(ws)?.get("setting").and_then(Value::as_str) {
         println!("{setting}");
@@ -19,7 +14,6 @@ pub(crate) fn cmd_setting(ws: &Workspace) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Print the main check's state. `json` prints the engine's snapshot as is.
 pub(crate) fn cmd_status(ws: &Workspace, json: bool) -> Result<(), BoxError> {
     let snapshot = snapshot(ws)?;
     if json {
@@ -35,7 +29,6 @@ pub(crate) fn cmd_status(ws: &Workspace, json: bool) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// The snapshot in words, one fact per line.
 fn status_text(snapshot: &Value, workspace: &str) -> String {
     let field = |name: &str| snapshot.get(name).and_then(Value::as_str).unwrap_or("");
     let range = format!("{}..{}", short(field("from_sha")), short(field("to_sha")));
@@ -104,7 +97,6 @@ fn status_text(snapshot: &Value, workspace: &str) -> String {
     lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
-/// A sha as a reader scans it.
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }

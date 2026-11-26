@@ -201,6 +201,14 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "backup_origin",
+        owners: &["core/backup/mod.rs", "core/snapshot/restore_database.rs"],
+        announcement: Announcement::Silent {
+            reason: "Internal identity used to scope backup retention. Backup run events \
+                     announce the outcome.",
+        },
+    },
+    TableRule {
         table: "backup_recipient",
         owners: &["core/backup/recipient.rs"],
         announcement: Announcement::Announced {

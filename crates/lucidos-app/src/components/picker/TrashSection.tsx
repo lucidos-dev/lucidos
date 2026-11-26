@@ -2,21 +2,34 @@ import { useSignal } from '@preact/signals';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import {
-  abandonTrashStaging, confirmEmptyTrash, freezeEmptyTrash, listTrash, restoreTrash, type TrashEntry,
+  abandonTrashStaging, confirmEmptyTrash, finishTrashDelete, freezeEmptyTrash, listTrash, restoreTrash, type TrashEntry,
 } from '../../api/client/control';
 import { showConfirm, showToast } from '../../store/store';
 import { toFailed, type Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
+import { formatBytes } from '../../utils/formatBytes';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkBlock, SkText, SkeletonProvider } from '../shared/Skeleton';
+import { withProgressToast } from './progressToast';
+
+function trashStatus(entry: TrashEntry): string {
+  if (entry.finish_available) return 'Delete interrupted';
+  if (entry.status === 'restoring') return 'Restore interrupted';
+  if (entry.status === 'needs-attention') return 'Needs attention';
+  return 'Deleted';
+}
 
 function TrashRow({ entry, children }: { entry?: TrashEntry; children?: ComponentChildren }) {
+  const status = entry && trashStatus(entry);
   return (
-    <li class="list-row">
-      <div class="list-row-info">
-        <strong><SkText w="9rem">{entry?.name}</SkText></strong>
-        {entry?.warning && <p>{entry.warning}</p>}
+    <li class="ws-picker-trash-row">
+      <div class="ws-picker-trash-info">
+        <span class="ws-picker-name"><SkText w="9rem">{entry?.name}</SkText></span>
+        <span class={status && status !== 'Deleted' ? 'ws-picker-trash-status ws-picker-trash-status-warn' : 'ws-picker-trash-status'}>
+          <SkText w="7rem">{entry && [status, entry.bytes != null && formatBytes(entry.bytes)].filter(Boolean).join(' · ')}</SkText>
+        </span>
+        {entry?.warning && <p class="ws-picker-trash-note">{entry.warning}</p>}
       </div>
       <div class="ws-picker-trash-actions">
         <SkBlock w="4rem" h="1.75rem" round>{children}</SkBlock>
@@ -82,8 +95,24 @@ export function TrashSection({ inventory, showSkeleton, onChanged }: {
         { title: `Restore "${entry.name}"?`, variant: 'default' },
       )) return;
       await mutate(async () => {
-        await restoreTrash(entry.id);
+        await withProgressToast('trash-action', `Restoring "${entry.name}"…`, restoreTrash(entry.id));
         showToast(`Restored "${entry.name}".`, 'success');
+      });
+    });
+  }
+
+  function finish(entry: TrashEntry) {
+    void run(async () => {
+      if (!await showConfirm(
+        entry.database_backup
+          ? 'Lucidos stops it, keeps a copy of its database in Trash, and removes it from the picker. Empty Trash to free the space.'
+          : 'Lucidos stops it, deletes its database for good with no copy, and removes it from the picker.',
+        'Finish delete',
+        { title: `Finish deleting "${entry.name}"?`, variant: 'danger' },
+      )) return;
+      await mutate(async () => {
+        await withProgressToast('trash-action', `Deleting "${entry.name}"…`, finishTrashDelete(entry.id));
+        showToast(`Deleted "${entry.name}".`, 'success');
       });
     });
   }
@@ -111,7 +140,7 @@ export function TrashSection({ inventory, showSkeleton, onChanged }: {
         { title: 'Empty Trash?', variant: 'danger' },
       )) return;
       await mutate(async () => {
-        const { results } = await confirmEmptyTrash(batch.id, batch.phrase);
+        const { results } = await withProgressToast('trash-action', 'Emptying Trash…', confirmEmptyTrash(batch.id, batch.phrase));
         const names = new Map(entries.map((entry) => [entry.id, entry.name]));
         const skipped = results.filter((result) => result.status !== 'purged');
         if (!skipped.length) showToast('Trash emptied.', 'success');
@@ -132,28 +161,33 @@ export function TrashSection({ inventory, showSkeleton, onChanged }: {
       )}
       {state.status === 'loaded' && state.data.length > 0 && (
         <section aria-labelledby="ws-picker-trash-heading" class="ws-picker-trash">
-          <h2 id="ws-picker-trash-heading" class="list-section-title">Trash</h2>
+          <div class="ws-picker-trash-head">
+            <h2 id="ws-picker-trash-heading">Trash</h2>
+            <button type="button" class="ws-picker-trash-empty" disabled={busy.value} onClick={() => empty(state.data)}>
+              Empty Trash
+            </button>
+          </div>
           <ul>
             {state.data.map((entry) => (
               <TrashRow entry={entry} key={entry.id}>
                 {entry.status === 'restoring' && (
-                  <button type="button" class="action-btn" disabled={busy.value} onClick={() => resetStaging(entry)}>
+                  <button type="button" class="ws-picker-btn" disabled={busy.value} onClick={() => resetStaging(entry)}>
                     Reset staging
                   </button>
                 )}
                 {entry.restore_available && (
-                  <button type="button" class="action-btn" disabled={busy.value} onClick={() => restore(entry)}>
+                  <button type="button" class="ws-picker-btn" disabled={busy.value} onClick={() => restore(entry)}>
                     Restore
+                  </button>
+                )}
+                {entry.finish_available && (
+                  <button type="button" class="ws-picker-btn ws-picker-btn-danger-soft" disabled={busy.value} onClick={() => finish(entry)}>
+                    Finish delete
                   </button>
                 )}
               </TrashRow>
             ))}
           </ul>
-          <div class="ws-picker-trash-actions">
-            <button type="button" class="action-btn action-btn-danger" disabled={busy.value} onClick={() => empty(state.data)}>
-              Empty Trash
-            </button>
-          </div>
         </section>
       )}
     </LoadingFade>

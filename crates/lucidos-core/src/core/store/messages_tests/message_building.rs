@@ -1,8 +1,6 @@
 use super::msg_helpers::*;
 use super::*;
 
-// === Thread-aware tests ===
-
 #[test]
 fn messages_with_thread_id_preserved() {
     let events = vec![
@@ -28,13 +26,11 @@ fn messages_with_thread_id_preserved() {
         ),
     ];
     let msgs = build_session_messages(&events);
-    assert_eq!(msgs.len(), 4); // 2 user + 2 assistant
+    assert_eq!(msgs.len(), 4);
 }
 
 #[test]
 fn different_threads_build_independently() {
-    // Events from two different threads interleaved — build_session_messages
-    // processes them in order regardless of thread_id (filtering happens upstream)
     let events = vec![
         make_event(
             "MessageReceived",
@@ -89,26 +85,18 @@ fn follow_up_in_same_thread_different_request_ids() {
     ];
     let msgs = build_session_messages(&events);
     assert_eq!(msgs.len(), 4);
-    // First exchange
     assert_eq!(msgs[0].role, "user");
     assert_eq!(msgs[0].content, "first question");
     assert_eq!(msgs[1].role, "assistant");
     assert_eq!(msgs[1].content, "first answer");
-    // Follow-up exchange
     assert_eq!(msgs[2].role, "user");
     assert_eq!(msgs[2].content, "follow-up question");
     assert_eq!(msgs[3].role, "assistant");
     assert_eq!(msgs[3].content, "follow-up answer");
 }
 
-/// Regression: when trigger TextStreamed events (no channel) leak into a
-/// CC thread's event stream, the trigger text must NOT contaminate the CC
-/// exchange's response. With upstream thread_id filtering, these events should never
-/// appear in the same stream — but even if they do, the CC response must be correct.
 #[test]
 fn trigger_text_does_not_contaminate_cc_response() {
-    // Simulates the bug: CC exchange interleaved with trigger TextStreamed
-    // events that leaked through because they lacked channel: "trigger".
     let events = vec![
         make_event(
             "MessageReceived",
@@ -121,7 +109,6 @@ fn trigger_text_does_not_contaminate_cc_response() {
             0,
         ),
         make_event("Thinking", json!({"thread_id": "cc-thread"}), 1),
-        // Scheduled task text leaks in (different thread_id, no channel)
         make_event(
             "TextStreamed",
             json!({
@@ -130,7 +117,6 @@ fn trigger_text_does_not_contaminate_cc_response() {
             }),
             2,
         ),
-        // CC response arrives
         make_event(
             "CodingAgentTextStreamed",
             json!({
@@ -153,7 +139,6 @@ fn trigger_text_does_not_contaminate_cc_response() {
     ];
     let msgs = build_session_messages(&events);
 
-    // Find the CC response (channel=claude_code)
     let cc_response = msgs
         .iter()
         .find(|m| m.role == "assistant" && m.channel.as_deref() == Some("claude_code"));
@@ -166,10 +151,6 @@ fn trigger_text_does_not_contaminate_cc_response() {
     );
 }
 
-/// Result text extends beyond streamed text — extra content must appear in events.
-/// This mirrors the live-streaming fix: CC may bundle trailing text into the Result
-/// without a preceding Message event. The DB reconstruction must capture it as an event
-/// so the events-based renderer shows the full text.
 #[test]
 fn result_text_extra_content_appears_in_events() {
     let events = vec![
@@ -189,7 +170,6 @@ fn result_text_extra_content_appears_in_events() {
             json!({"name": "Bash", "result": "ok", "success": true}),
             3,
         ),
-        // ResponseGenerated has extra text ("All tests passed!") not in the streamed text
         make_event(
             "ResponseGenerated",
             json!({
@@ -204,7 +184,6 @@ fn result_text_extra_content_appears_in_events() {
     let assistant = &msgs[1];
     assert_eq!(assistant.role, "assistant");
 
-    // The events array must contain the extra "All tests passed!" text
     let text_events: Vec<_> = assistant
         .events
         .iter()
@@ -221,9 +200,6 @@ fn result_text_extra_content_appears_in_events() {
     );
 }
 
-/// Claude Code session with tool calls but no text yet (e.g. reload during first tool call).
-/// Step events must be preserved in a trailing assistant message so the frontend
-/// can show More/Less and Steps toggles.
 #[test]
 fn cc_tool_calls_without_text_preserves_step_events() {
     let events = vec![
@@ -232,7 +208,6 @@ fn cc_tool_calls_without_text_preserves_step_events() {
             json!({"text": "fix the bug", "channel": "claude_code"}),
             0,
         ),
-        // CC starts a tool call before sending any text
         make_event(
             "ToolCalled",
             json!({"name": "Read", "args": {"file_path": "src/main.rs"}}),
@@ -243,11 +218,9 @@ fn cc_tool_calls_without_text_preserves_step_events() {
             json!({"name": "Read", "result": "fn main() {}", "success": true}),
             2,
         ),
-        // No CodingAgentTextStreamed, no ResponseGenerated — reload mid-session
     ];
     let msgs = build_session_messages(&events);
 
-    // Must have user + assistant (even though no text was streamed)
     assert_eq!(
         msgs.len(),
         2,
@@ -258,7 +231,6 @@ fn cc_tool_calls_without_text_preserves_step_events() {
     assert_eq!(msgs[1].role, "assistant");
     assert_eq!(msgs[1].completed, None);
 
-    // The assistant message must have step events
     let step_events: Vec<_> = msgs[1]
         .events
         .iter()
@@ -271,9 +243,6 @@ fn cc_tool_calls_without_text_preserves_step_events() {
     );
 }
 
-/// Claude Code session with tool calls and some text — step events interleaved with text.
-/// Verifies that adding pending_events to the trailing flush doesn't break the
-/// normal case where text exists alongside tool calls.
 #[test]
 fn cc_tool_calls_with_text_still_works() {
     let events = vec![
@@ -297,7 +266,6 @@ fn cc_tool_calls_with_text_still_works() {
             json!({"name": "Read", "result": "fn main() {}", "success": true}),
             3,
         ),
-        // No ResponseGenerated — reload mid-session
     ];
     let msgs = build_session_messages(&events);
 
@@ -305,7 +273,6 @@ fn cc_tool_calls_with_text_still_works() {
     assert_eq!(msgs[1].role, "assistant");
     assert_eq!(msgs[1].completed, None);
 
-    // Must have both text and step events
     let has_text = msgs[1]
         .events
         .iter()
@@ -344,9 +311,6 @@ fn build_session_messages_marks_tool_step_success_from_payload() {
 
 #[test]
 fn build_session_messages_legacy_tool_result_without_success_defaults_to_true() {
-    // Historical events in the event store lack the `success` key. The
-    // projection must default to `true` to match the new event-schema default
-    // and avoid the long-standing "everything looks failed" bug on resume.
     let events = vec![
         make_event(
             "ToolCalled",
@@ -367,10 +331,6 @@ fn build_session_messages_legacy_tool_result_without_success_defaults_to_true() 
     );
 }
 
-/// The projection reads the author off the persisted actor (ADR 0150), so a
-/// guest's turn arrives at `history.rs` already attributed. Nothing about the
-/// turn's POSITION is consulted: two agents interleave, and only the writer
-/// knew which one wrote.
 #[test]
 fn a_guest_authored_response_carries_its_agent_into_the_projection() {
     let events = vec![
@@ -395,14 +355,10 @@ fn a_guest_authored_response_carries_its_agent_into_the_projection() {
             label: "Voice".into()
         })
     );
-    // The user's own turn is never given an author, whoever answered it.
     let user = msgs.iter().find(|m| m.role == "user").expect("user");
     assert_eq!(user.agent, None);
 }
 
-/// Our own agent stamps itself, and a row from before the actor existed reads
-/// as no author at all. Both render `Assistant`, so the distinction costs the
-/// reader nothing and keeps the projection honest about what was recorded.
 #[test]
 fn our_agent_is_named_and_a_legacy_row_names_nobody() {
     let events = vec![
@@ -424,8 +380,6 @@ fn our_agent_is_named_and_a_legacy_row_names_nobody() {
     assert_eq!(assistants[1].agent, None);
 }
 
-/// A human actor names a way IN, not an author. The projection must not read
-/// the device that sent the prompt as the agent that answered it.
 #[test]
 fn a_human_actor_never_becomes_an_authoring_agent() {
     let events = vec![make_event(
@@ -440,9 +394,6 @@ fn a_human_actor_never_becomes_an_authoring_agent() {
     assert_eq!(msgs[0].agent, None);
 }
 
-/// A spoken reply reaches the doer as the talker's turn, under the talker's
-/// own speaker label. Read as the doer's own prior turn it would agree with
-/// itself; read as the user's, it would obey an instruction nobody gave.
 #[test]
 fn a_spoken_reply_reaches_the_doer_under_its_own_label() {
     let events = vec![
@@ -470,15 +421,12 @@ fn a_spoken_reply_reaches_the_doer_under_its_own_label() {
             label: "Lucidos (aloud)".into()
         })
     );
-    // The label `history.rs` prints, read off the participant it reads it off.
     assert_eq!(
         spoken.agent.as_ref().expect("an author").speaker_label(),
         "Lucidos (aloud)"
     );
 }
 
-/// The talker speaks mid-call, often while the doer's own turn is still
-/// running. So its reply must consume none of that turn's pending steps.
 #[test]
 fn a_spoken_reply_takes_nothing_from_the_turn_around_it() {
     let events = vec![
@@ -514,8 +462,6 @@ fn a_spoken_reply_takes_nothing_from_the_turn_around_it() {
     assert_eq!(answer.steps[0].tool_name.as_deref(), Some("list_files"));
 }
 
-/// A reply with no words is written down nowhere, so nothing here has to
-/// render an empty assistant turn.
 #[test]
 fn a_spoken_reply_with_no_words_makes_no_message() {
     let events = vec![make_event(
@@ -530,9 +476,6 @@ fn a_spoken_reply_with_no_words_makes_no_message() {
     assert!(build_session_messages(&events).is_empty());
 }
 
-/// An utterance the talker answered alone still reaches the doer, as the user
-/// speaking. It started no turn, so nothing else would carry it, and the next
-/// question can lean on it.
 #[test]
 fn an_utterance_the_talker_handled_reaches_the_doer_as_the_user() {
     let events = vec![make_event(
@@ -547,16 +490,9 @@ fn an_utterance_the_talker_handled_reaches_the_doer_as_the_user() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].role, "user");
     assert_eq!(msgs[0].content, "hei");
-    // The caller said it, so no agent authored it.
     assert_eq!(msgs[0].agent, None);
 }
 
-/// One breath is several rows and one message (ADR 0201).
-///
-/// The transcriber cuts a sentence wherever the speaker breathes, so the
-/// engine writes a row per turn and the history joins them. The gap is between
-/// NEIGHBOURS: four pieces two seconds apart are one utterance, where measured
-/// against the first word the last would fall outside the bound.
 #[test]
 fn the_pieces_of_one_breath_read_back_as_one_message() {
     let events: Vec<_> = ["So what I", "wanted to ask", "you is", "this."]
@@ -578,14 +514,6 @@ fn the_pieces_of_one_breath_read_back_as_one_message() {
     assert_eq!(msgs[0].content, "So what I wanted to ask you is this.");
 }
 
-/// The talker's own note does not cut the sentence it was taken from.
-///
-/// A delegation lands within milliseconds of the fragment that prompted it,
-/// so it routinely arrives mid-sentence. The transcript joins the pieces
-/// either side of it, and the doer has to read the same message: a bubble the
-/// model never saw as one message is the failure this pins.
-///
-/// Plan: `docs/plans/2026-09-16-the-clock-is-the-only-order.md`.
 #[test]
 fn a_delegation_mid_sentence_leaves_one_message() {
     let events = vec![
@@ -633,11 +561,6 @@ fn a_delegation_mid_sentence_leaves_one_message() {
     );
 }
 
-/// The talker's own two replies are judged on timing, not on the note.
-///
-/// A reply goes down when the words stopped, so a delegation after it landed
-/// in the silence and does separate (ADR 0206). `spokenRowToGrow` splits them
-/// in the transcript, and this side has to agree.
 #[test]
 fn a_delegation_between_two_replies_still_cuts_them() {
     let events = vec![
@@ -677,10 +600,6 @@ fn a_delegation_between_two_replies_still_cuts_them() {
     assert_eq!(spoken, vec!["One moment.", "Still on it."], "{:?}", msgs);
 }
 
-/// A real turn AFTER the note still cuts the fragments apart.
-///
-/// The exemption counts the delegation's own row and nothing else, so a turn
-/// landing beside it must still put the count out.
 #[test]
 fn a_turn_after_the_note_still_cuts_the_fragments() {
     let events = vec![
@@ -724,10 +643,6 @@ fn a_turn_after_the_note_still_cuts_the_fragments() {
     );
 }
 
-/// A real turn between two fragments still cuts them apart.
-///
-/// The exemption above is for a note about the words. Anything the doer reads
-/// as another turn means the speaker said two things.
 #[test]
 fn a_turn_between_two_fragments_still_cuts_them() {
     let events = vec![
@@ -763,10 +678,6 @@ fn a_turn_between_two_fragments_still_cuts_them() {
     );
 }
 
-/// A dropped line redialled inside the bound is still two calls.
-///
-/// Nothing between them reaches the message list, so adjacency alone reads
-/// them as neighbours. The session is what says otherwise.
 #[test]
 fn two_calls_never_read_back_as_one_sentence() {
     let events = vec![
@@ -793,8 +704,6 @@ fn two_calls_never_read_back_as_one_sentence() {
     assert_eq!(msgs[1].content, "release notes");
 }
 
-/// Why the talker asked for this turn, in its own words and under its own
-/// label. The doer reads it as the request it is.
 #[test]
 fn a_delegation_tells_the_doer_what_it_was_asked_for() {
     let events = vec![
@@ -825,8 +734,6 @@ fn a_delegation_tells_the_doer_what_it_was_asked_for() {
     );
 }
 
-/// A delegation consumes none of the turn it started. Its steps and text
-/// belong to the turn the `MessageReceived` beside it opened.
 #[test]
 fn a_delegation_takes_nothing_from_the_turn_it_started() {
     let events = vec![
@@ -859,9 +766,6 @@ fn a_delegation_takes_nothing_from_the_turn_it_started() {
     assert_eq!(answer.steps[0].tool_name.as_deref(), Some("list_files"));
 }
 
-/// Session history is an allowlist, so the four side-question events never
-/// reach the main agent (ADR 0320). Interleaving them, even mid-turn, must
-/// leave the built messages identical.
 #[test]
 fn side_questions_never_enter_session_history() {
     let turn = |with_side_questions: bool| {
@@ -897,7 +801,6 @@ fn side_questions_never_enter_session_history() {
             json!({"text": "fixed", "request_id": "r1"}),
             5,
         ));
-        // Each built event gets a fresh id, so the two builds differ there.
         let mut messages = serde_json::to_value(build_session_messages(&events)).unwrap();
         for message in messages.as_array_mut().unwrap() {
             let fields = message.as_object_mut().unwrap();
@@ -912,8 +815,6 @@ fn side_questions_never_enter_session_history() {
     assert!(!text.contains("what is x?") && !text.contains("x is 3"));
 }
 
-/// A user-only message reads as a user turn in order, with its sender's
-/// device, and leaves the woken turn's request and reply alone (ADR 0649).
 #[test]
 fn a_user_only_message_is_a_user_turn_that_opens_no_request() {
     let device = |id: &str| json!({"kind": "device", "device_id": id});
@@ -969,7 +870,6 @@ fn a_user_only_message_is_a_user_turn_that_opens_no_request() {
     );
 }
 
-/// A message no device typed (a trigger, a parent thread) has no sender.
 #[test]
 fn only_a_device_origin_names_a_sender() {
     let events = vec![make_event(
@@ -980,9 +880,6 @@ fn only_a_device_origin_names_a_sender() {
     assert_eq!(build_session_messages(&events)[0].sender_device_id, None);
 }
 
-/// A user-only message posted while a reply streams follows that reply,
-/// which never saw it. While the turn still runs, its in-progress reply stays
-/// last and keeps the running steps on the message that woke it.
 #[test]
 fn a_user_only_message_during_a_turn_follows_its_reply() {
     let device = |id: &str| json!({"kind": "device", "device_id": id});

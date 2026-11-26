@@ -7,7 +7,6 @@ fn touch(path: &Path) {
     std::fs::write(path, "x").unwrap();
 }
 
-/// A home with nothing in it, so a test names every entry it plants.
 fn empty_home() -> (tempfile::TempDir, PathBuf) {
     let scratch = tempfile::tempdir().unwrap();
     let home = scratch.path().join(".lucidos");
@@ -30,8 +29,6 @@ fn an_older_entry_stays_where_it_is() {
     assert_eq!(entry_in(&home, LOCAL_TOKEN), home.join(LOCAL_TOKEN));
 }
 
-/// An older binary creates a missing entry in the home. A newer one creates
-/// it there too, or the two would split one setting in two.
 #[test]
 fn an_older_home_gets_new_entries_beside_its_old_ones() {
     let (_scratch, home) = empty_home();
@@ -60,7 +57,6 @@ fn the_old_copy_wins_when_both_exist() {
     assert_eq!(entry_in(&home, NETWORK_TOML), home.join(NETWORK_TOML));
 }
 
-/// A lock file alone marks a home an older release used.
 #[test]
 fn a_mint_lock_alone_marks_an_older_home() {
     let (_scratch, home) = empty_home();
@@ -76,7 +72,6 @@ fn a_dangling_link_counts_as_an_entry() {
     assert_eq!(entry_in(&home, RUN_DIR), home.join(RUN_DIR));
 }
 
-/// A name no older release used never lands in the home.
 #[test]
 fn a_new_name_always_resolves_to_the_subtree() {
     let (_scratch, home) = empty_home();
@@ -87,7 +82,6 @@ fn a_new_name_always_resolves_to_the_subtree() {
     );
 }
 
-/// Unrelated files in the home, such as caches, do not make it an older one.
 #[test]
 fn caches_do_not_mark_an_older_home() {
     let (_scratch, home) = empty_home();

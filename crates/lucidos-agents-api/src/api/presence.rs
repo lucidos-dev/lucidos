@@ -1,10 +1,3 @@
-//! `/device-presence` (`update_device_presence`): the frontend POSTs
-//! `{ device_id, visible }` when ANY top-level Lucidos tab transitions
-//! visible/hidden. Projects to `device_presence` and feeds the
-//! candidate list the PresenceCheck protocol pings (see
-//! `system-knowhow/notifications/3-the-presencecheck-protocol.md` §3). Per-thread focus is now
-//! reported live in the pong rather than via a separate POST loop.
-
 use super::*;
 
 #[derive(Deserialize)]
@@ -42,7 +35,6 @@ pub(super) async fn update_device_presence(
     }
 }
 
-/// Route for device presence (any visible tab → PresenceCheck candidate).
 pub(super) fn router() -> Router<AppState> {
     Router::new().route("/device-presence", post(update_device_presence))
 }

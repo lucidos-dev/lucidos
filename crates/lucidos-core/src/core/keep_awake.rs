@@ -1,27 +1,11 @@
-//! Keeps the computer awake while this engine has work in flight.
-//!
-//! Each piece of work holds an [`AwakeHold`] for as long as it runs. While one
-//! or more holds live, the process holds one `PreventUserIdleSystemSleep`
-//! assertion, the same as `caffeinate -i`. Lid close, an explicit Sleep and a
-//! thermal emergency still win. The assertion is named after the work, so
-//! `pmset -g assertions` says what Lucidos is waiting on.
-//!
-//! Why the engine owns it, and the alternatives turned down:
-//! `docs/adr/0366-the-engine-keeps-the-computer-awake-while-work-runs.md`.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-/// A kind of work that keeps the computer awake while it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Work {
-    /// A chat-pipeline turn: chat, an intent trigger, a sub-thread.
     ThreadTurn,
-    /// A Claude Code or Codex session, from spawn to exit.
     AgentSession,
-    /// A background bash, python or engine-run task.
     BackgroundTask,
-    /// A Thread Queue entry's work, script triggers included.
     QueueEntry,
     Backup,
 }
@@ -39,8 +23,6 @@ impl Work {
     }
 }
 
-/// Takes, renames and releases the one assertion. Split out so tests can
-/// record what the registry asked for.
 trait Assertion: Send {
     fn take(&mut self, name: &str) -> Result<(), String>;
     fn rename(&mut self, name: &str);
@@ -50,11 +32,9 @@ trait Assertion: Send {
 struct State {
     holds: BTreeMap<u64, (Work, String)>,
     next_id: u64,
-    /// Names the assertion, so `pmset` tells one workspace from another.
     workspace: String,
     assertion: Box<dyn Assertion>,
     held: bool,
-    /// A platform with no assertion says so once, not on every hold.
     warned: bool,
 }
 
@@ -69,8 +49,6 @@ impl State {
     }
 }
 
-/// The process-wide registry of holds. One engine process serves one
-/// workspace, so one registry per process is one per workspace.
 pub struct KeepAwake {
     state: Mutex<State>,
 }
@@ -78,20 +56,14 @@ pub struct KeepAwake {
 static GLOBAL: LazyLock<Arc<KeepAwake>> =
     LazyLock::new(|| Arc::new(KeepAwake::with_assertion(platform_assertion())));
 
-/// Hold the computer awake until the returned value drops.
-///
-/// `label` names this piece of work in the log, such as a thread id.
 pub fn hold(work: Work, label: impl Into<String>) -> AwakeHold {
     GLOBAL.acquire(work, label.into())
 }
 
-/// Name the assertion after this engine's workspace. Called once at boot.
 pub fn set_workspace(name: &str) {
     GLOBAL.lock().workspace = name.to_string();
 }
 
-/// Whether a hold with this label is live in the process registry. Lets a work
-/// site's test check its own hold while other tests hold theirs in parallel.
 #[cfg(any(test, feature = "test-support"))]
 pub fn is_held(label: &str) -> bool {
     GLOBAL.lock().holds.values().any(|(_, l)| l == label)
@@ -111,7 +83,7 @@ impl KeepAwake {
         }
     }
 
-    /// The registry's state. A panic while holding the lock leaves a map that
+    /// INVARIANT: The registry's state. A panic while holding the lock leaves a map that
     /// is still consistent, so a poisoned lock is recovered, not propagated.
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -172,8 +144,6 @@ impl KeepAwake {
     }
 }
 
-/// Keeps the computer awake until dropped. Hold it in the value or future that
-/// lives exactly as long as the work, so every exit path releases it.
 #[must_use = "the computer may sleep as soon as the hold drops"]
 pub struct AwakeHold {
     id: u64,
@@ -210,8 +180,6 @@ fn platform_assertion() -> Box<dyn Assertion> {
     Box::new(Unsupported)
 }
 
-/// The IOKit power assertion API, called directly so the assertion carries
-/// Lucidos's own name. A `caffeinate` child would show as `caffeinate`.
 #[cfg(target_os = "macos")]
 mod iokit {
     use super::Assertion;
@@ -250,7 +218,6 @@ mod iokit {
         fn IOPMAssertionRelease(id: IOPMAssertionID) -> i32;
     }
 
-    /// An owned CFString, released on drop.
     struct CfString(CFStringRef);
 
     impl CfString {
@@ -321,7 +288,6 @@ mod iokit {
 mod tests {
     use super::*;
 
-    /// What the registry asked of the assertion, in order.
     #[derive(Debug, Clone, PartialEq)]
     enum Call {
         Take(String),
@@ -400,7 +366,6 @@ mod tests {
         );
     }
 
-    /// Idle, then busy again: a fresh assertion, not a rename of a released one.
     #[test]
     fn work_after_idle_takes_a_new_assertion() {
         let (registry, calls) = registry(false);
@@ -416,8 +381,6 @@ mod tests {
         assert_eq!(calls.lock().unwrap().last(), Some(&Call::Release));
     }
 
-    /// No assertion on this platform: work still gets its hold, and nothing is
-    /// released that was never taken.
     #[test]
     fn a_platform_without_an_assertion_still_hands_out_holds() {
         let (registry, calls) = registry(true);
@@ -428,7 +391,6 @@ mod tests {
         assert!(registry.lock().holds.is_empty());
     }
 
-    /// A panic unwinding through the work still drops its hold.
     #[test]
     fn a_panic_releases_the_hold() {
         let (registry, calls) = registry(false);

@@ -4,25 +4,22 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// A mailbox password, as the account's `email_password` credential gives it.
 #[derive(Clone, PartialEq, Eq)]
 pub enum MailPassword {
-    /// The account has no `email_password` credential.
     Missing,
     Saved(String),
-    /// The credential holds a *secret reference* that cannot be read now. The
+    /// INVARIANT: The credential holds a *secret reference* that cannot be read now. The
     /// reason never quotes a value.
     Unreadable(String),
 }
 
 impl MailPassword {
-    /// Whether a password is on file, readable or not. A guard that keeps the
+    /// INVARIANT: Whether a password is on file, readable or not. A guard that keeps the
     /// password at its host must ask this, so an outage never reads as none.
     pub fn is_on_file(&self) -> bool {
         !matches!(self, Self::Missing)
     }
 
-    /// The password to sign in with, or why there is none to send.
     pub fn to_sign_in(&self, account: &str) -> Result<&str, String> {
         match self {
             Self::Saved(password) => Ok(password),
@@ -37,7 +34,6 @@ impl MailPassword {
     }
 }
 
-/// An email account with its mailbox password.
 #[derive(Clone)]
 pub struct EmailAccount {
     pub id: Uuid,
@@ -56,9 +52,6 @@ pub struct EmailAccount {
     pub updated_at: DateTime<Utc>,
 }
 
-// Manual `Debug` so an account never leaks its password through `{:?}` in a log
-// line or error message. Every other field (including the username) stays
-// visible so the struct is still useful for debugging connection problems.
 impl std::fmt::Debug for EmailAccount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmailAccount")
@@ -80,7 +73,6 @@ impl std::fmt::Debug for EmailAccount {
     }
 }
 
-/// Email account info without the password (safe for API responses)
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct EmailAccountInfo {
     pub id: Uuid,
@@ -98,11 +90,9 @@ pub struct EmailAccountInfo {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Store for managing email accounts in the database
 pub struct EmailStore;
 
 impl EmailStore {
-    /// Insert or update an email account (upsert by name)
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         pool: &PgPool,
@@ -166,7 +156,6 @@ impl EmailStore {
         service_name.strip_prefix("email:").unwrap_or(service_name)
     }
 
-    /// Get an email account by name, with its password.
     pub async fn get(pool: &PgPool, name: &str) -> Result<Option<EmailAccount>, sqlx::Error> {
         match Self::get_info(pool, name).await? {
             Some(info) => Ok(Some(with_password(pool, info).await?)),
@@ -174,8 +163,6 @@ impl EmailStore {
         }
     }
 
-    /// Get an email account's settings by name, without the password
-    /// (safe for the settings UI to pre-fill an edit form).
     pub async fn get_info(
         pool: &PgPool,
         name: &str,
@@ -192,7 +179,6 @@ impl EmailStore {
         .await
     }
 
-    /// Get the default email account (first by created_at), with its password.
     pub async fn get_default(pool: &PgPool) -> Result<Option<EmailAccount>, sqlx::Error> {
         let info = sqlx::query_as::<_, EmailAccountInfo>(
             r#"
@@ -210,7 +196,6 @@ impl EmailStore {
         }
     }
 
-    /// List all email accounts (without passwords)
     pub async fn list(pool: &PgPool) -> Result<Vec<EmailAccountInfo>, sqlx::Error> {
         sqlx::query_as::<_, EmailAccountInfo>(
             r#"
@@ -223,7 +208,6 @@ impl EmailStore {
         .await
     }
 
-    /// Link an email account to an OAuth account for XOAUTH2 authentication
     pub async fn link_oauth(
         pool: &PgPool,
         name: &str,
@@ -245,11 +229,6 @@ impl EmailStore {
     }
 }
 
-/// `info` with the password its `email_password` credential holds. The
-/// credential is the password's one home, so deleting it ends mail access.
-///
-/// A *secret reference* that cannot be read is [`MailPassword::Unreadable`],
-/// so IMAP and SMTP refuse to sign in rather than send no password.
 async fn with_password(pool: &PgPool, info: EmailAccountInfo) -> Result<EmailAccount, sqlx::Error> {
     let password = match crate::core::CredentialStore::get_email_password(pool, &info.name).await? {
         Some(credential) => match credential.secret(pool).await {
@@ -276,11 +255,6 @@ async fn with_password(pool: &PgPool, info: EmailAccountInfo) -> Result<EmailAcc
     })
 }
 
-// ---------------------------------------------------------------------------
-// EmailClient — IMAP read + SMTP send
-// ---------------------------------------------------------------------------
-
-/// Summary of an email (for listing)
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailSummary {
     pub uid: u32,
@@ -291,7 +265,6 @@ pub struct EmailSummary {
     pub preview: String,
 }
 
-/// Metadata about an email attachment (no binary data)
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailAttachmentInfo {
     pub index: usize,
@@ -300,7 +273,6 @@ pub struct EmailAttachmentInfo {
     pub size: usize,
 }
 
-/// Full email message
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailMessage {
     pub uid: u32,
@@ -314,14 +286,13 @@ pub struct EmailMessage {
     pub attachments: Vec<EmailAttachmentInfo>,
 }
 
-/// A file attachment to include in an email
 pub struct EmailAttachment {
     pub filename: String,
     pub mime_type: String,
     pub data: Vec<u8>,
 }
 
-/// A validated attachment path (path checked, filename extracted) but file not yet read.
+/// INVARIANT: A validated attachment path (path checked, filename extracted) but file not yet read.
 ///
 /// `Debug` carries no secret: both fields are the path the caller supplied, and
 /// the refusals below already quote it back. The file CONTENTS live on
@@ -333,7 +304,7 @@ pub struct ValidatedAttachment {
 }
 
 impl EmailAttachment {
-    /// Validate attachment paths without reading file data.
+    /// INVARIANT: Validate attachment paths without reading file data.
     /// Returns validated paths + basenames for use in confirmation previews.
     ///
     /// A traversal check alone is not enough here. The path joins onto the
@@ -347,8 +318,6 @@ impl EmailAttachment {
             if crate::core::is_path_traversal(rel_path) {
                 return Err(format!("Invalid attachment path '{}'. Paths must be relative to data/ with no '..' components.", rel_path));
             }
-            // Callers pass either spelling, so strip a leading `data/` before
-            // the prefix test rather than refusing the fuller one.
             let stripped = rel_path.strip_prefix("data/").unwrap_or(rel_path);
             if !super::is_known_data_prefix(stripped) {
                 return Err(format!(
@@ -358,7 +327,7 @@ impl EmailAttachment {
                     super::known_data_prefixes_text()
                 ));
             }
-            // An empty segment would turn the rest into an absolute path when
+            // INVARIANT: An empty segment would turn the rest into an absolute path when
             // the containment check joins it under its tree.
             let canonical = stripped
                 .split('/')
@@ -378,7 +347,7 @@ impl EmailAttachment {
         Ok(validated)
     }
 
-    /// Read attachments from workspace data/ directory.
+    /// INVARIANT: Read attachments from workspace data/ directory.
     /// Validates paths and reads file data in one step. A file that a symlink
     /// carries out of its typed subdirectory is refused, since the prefix test
     /// reads only the string.
@@ -411,7 +380,6 @@ impl EmailAttachment {
     }
 }
 
-/// Detect MIME type from file extension
 fn mime_type_from_extension(filename: &str) -> String {
     let ext = filename
         .rsplit_once('.')
@@ -448,10 +416,9 @@ fn mime_type_from_extension(filename: &str) -> String {
     .to_string()
 }
 
-/// Client for reading and sending emails via IMAP/SMTP
 pub struct EmailClient;
 
-/// Reject a raw IMAP SEARCH fragment that carries a bare CR or LF.
+/// INVARIANT: Reject a raw IMAP SEARCH fragment that carries a bare CR or LF.
 ///
 /// [`build_imap_query`]'s output is interpolated verbatim into the
 /// `UID SEARCH <query>` command line by `async_imap::Session::uid_search`,
@@ -478,7 +445,7 @@ fn reject_imap_line_break(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Build an IMAP SEARCH query string from optional search criteria and date filter.
+/// INVARIANT: Build an IMAP SEARCH query string from optional search criteria and date filter.
 /// The `search` parameter is passed through directly as IMAP criteria (e.g. `FROM "user@example.com"`).
 /// Callers MUST have run [`reject_imap_line_break`] over both arguments first.
 fn build_imap_query(search: Option<&str>, since: Option<&str>) -> String {
@@ -490,9 +457,6 @@ fn build_imap_query(search: Option<&str>, since: Option<&str>) -> String {
     }
 }
 
-/// Strip non-ASCII characters from quoted strings within an IMAP search query.
-/// Leaves keywords and structure intact, only sanitizes the user-visible search terms.
-/// Returns the sanitized query suitable for US-ASCII-only IMAP servers.
 fn sanitize_search_query(query: &str) -> String {
     let mut result = String::with_capacity(query.len());
     let mut in_quotes = false;
@@ -511,9 +475,6 @@ fn sanitize_search_query(query: &str) -> String {
     result
 }
 
-/// Check whether an email matches the search criteria from the original (possibly non-ASCII) query.
-/// Parses common IMAP search criteria (FROM, SUBJECT, TO, CC, TEXT) and checks case-insensitively.
-/// Server-side-only criteria (UNSEEN, SEEN, FLAGGED, etc.) are treated as matching.
 fn matches_search_filter(email: &EmailSummary, search: &str) -> bool {
     let criteria = parse_search_criteria(search);
     if criteria.is_empty() {
@@ -528,7 +489,7 @@ fn matches_single(email: &EmailSummary, criterion: &SearchCriterion) -> bool {
         SearchCriterion::Subject(term) => {
             email.subject.to_lowercase().contains(&term.to_lowercase())
         }
-        SearchCriterion::To => true, // EmailSummary lacks recipient fields; trust server-side filter
+        SearchCriterion::To => true,
         SearchCriterion::Text(term) => {
             let term_lower = term.to_lowercase();
             email.from.to_lowercase().contains(&term_lower)
@@ -550,8 +511,6 @@ enum SearchCriterion {
     ServerOnly,
 }
 
-/// Parse an IMAP search query into criteria for client-side filtering.
-/// Handles: FROM "x", SUBJECT "x", TO "x", TEXT "x", OR <c1> <c2>, and server-only keywords.
 fn parse_search_criteria(query: &str) -> Vec<SearchCriterion> {
     let mut criteria = Vec::new();
     let tokens = tokenize_imap_query(query);
@@ -574,7 +533,6 @@ fn parse_search_criteria(query: &str) -> Vec<SearchCriterion> {
     criteria
 }
 
-/// Parse a single IMAP search criterion starting at `pos`, advancing `pos` past it.
 fn parse_single_criterion(tokens: &[String], pos: &mut usize) -> SearchCriterion {
     if *pos >= tokens.len() {
         return SearchCriterion::ServerOnly;
@@ -597,7 +555,6 @@ fn parse_single_criterion(tokens: &[String], pos: &mut usize) -> SearchCriterion
             }
         }
         "SINCE" | "BEFORE" | "ON" | "SENTBEFORE" | "SENTSINCE" | "SENTON" => {
-            // Date criteria with an argument — skip the date value too
             *pos += 2;
             SearchCriterion::ServerOnly
         }
@@ -608,7 +565,6 @@ fn parse_single_criterion(tokens: &[String], pos: &mut usize) -> SearchCriterion
     }
 }
 
-/// Tokenize an IMAP search query into tokens, keeping quoted strings as single tokens.
 fn tokenize_imap_query(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -631,7 +587,6 @@ fn tokenize_imap_query(query: &str) -> Vec<String> {
     tokens
 }
 
-/// Remove surrounding quotes from a string if present.
 fn unquote(s: &str) -> String {
     s.strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
@@ -641,7 +596,6 @@ fn unquote(s: &str) -> String {
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Format an `Address` from mail_parser into a human-readable string
 fn format_address(addr: Option<&mail_parser::Address<'_>>) -> String {
     let Some(addr) = addr else {
         return String::new();
@@ -659,7 +613,6 @@ fn format_address(addr: Option<&mail_parser::Address<'_>>) -> String {
     parts.join(", ")
 }
 
-/// Extract MIME type string from a mail_parser ContentType.
 fn mime_type_from_content_type(ct: Option<&mail_parser::ContentType<'_>>) -> String {
     ct.map(|ct| {
         let ctype = ct.ctype();
@@ -669,7 +622,6 @@ fn mime_type_from_content_type(ct: Option<&mail_parser::ContentType<'_>>) -> Str
     .unwrap_or_else(|| "application/octet-stream".to_string())
 }
 
-/// Derive a fallback filename from a MIME part's content type.
 fn fallback_attachment_name(part: &mail_parser::MessagePart<'_>) -> String {
     use mail_parser::MimeHeaders;
     let ct: Option<&mail_parser::ContentType<'_>> = part.content_type();
@@ -684,7 +636,6 @@ fn fallback_attachment_name(part: &mail_parser::MessagePart<'_>) -> String {
     .to_string()
 }
 
-/// Extract attachment metadata from a parsed email message.
 fn extract_attachment_info(parsed: &mail_parser::Message<'_>) -> Vec<EmailAttachmentInfo> {
     use mail_parser::MimeHeaders;
 
@@ -712,7 +663,6 @@ fn extract_attachment_info(parsed: &mail_parser::Message<'_>) -> Vec<EmailAttach
     attachments
 }
 
-/// Strip HTML tags from a string (simple regex-free approach)
 fn strip_html_tags(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -724,11 +674,9 @@ fn strip_html_tags(html: &str) -> String {
             _ => {}
         }
     }
-    // Collapse whitespace
     result.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A stream type that can be either plain TCP or TLS-wrapped TCP.
 #[derive(Debug)]
 enum ImapStream {
     Plain(tokio::net::TcpStream),
@@ -781,8 +729,6 @@ impl tokio::io::AsyncWrite for ImapStream {
     }
 }
 
-/// XOAUTH2 authenticator for IMAP SASL authentication.
-/// Produces the XOAUTH2 string: `user=<email>\x01auth=Bearer <token>\x01\x01`
 struct XOAuth2 {
     user: String,
     access_token: String,
@@ -799,19 +745,8 @@ impl async_imap::Authenticator for &XOAuth2 {
     }
 }
 
-/// Hard wall-clock bound for establishing one IMAP session (TCP connect +
-/// TLS + greeting + auth). None of those phases carries its own timeout —
-/// `TcpStream::connect` waits on the OS (a filtered route can take 75s+ on
-/// macOS) and the greeting read is unbounded — so this gives the most common
-/// failure (an unreachable server) a fast, sharp error. Post-auth stalls are
-/// covered by the whole-operation `IMAP_OP_TIMEOUT` in `email_client.rs`;
-/// sibling of `SMTP_SEND_TIMEOUT` there.
 const IMAP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Connect to an IMAP server and return an authenticated session.
-/// Uses TLS if `account.use_tls` is true, plain TCP otherwise.
-/// If `oauth_access_token` is provided, uses XOAUTH2 SASL authentication
-/// instead of plain LOGIN.
 async fn imap_connect(
     account: &EmailAccount,
     oauth_access_token: Option<&str>,
@@ -819,7 +754,6 @@ async fn imap_connect(
     imap_connect_with_timeout(account, oauth_access_token, IMAP_CONNECT_TIMEOUT).await
 }
 
-/// `imap_connect` with an explicit wall-clock bound (tests pass a short one).
 async fn imap_connect_with_timeout(
     account: &EmailAccount,
     oauth_access_token: Option<&str>,

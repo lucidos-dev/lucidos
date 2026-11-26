@@ -19,7 +19,6 @@ fn beat_with(id: &str, frame: Value) -> Heartbeat {
     }
 }
 
-/// A relay with an attached, unblocked client on 1.0.0.
 fn attached(now: Instant) -> UpdateRelay {
     let relay = UpdateRelay::default();
     assert_eq!(relay.heartbeat(beat("1.0.0", None), now), None);
@@ -28,7 +27,6 @@ fn attached(now: Instant) -> UpdateRelay {
 
 #[test]
 fn a_fresh_gateway_reports_no_client_and_no_relay() {
-    // An old client sends no heartbeat, so this is what it looks like.
     let relay = UpdateRelay::default();
     assert_eq!(
         relay.snapshot(Instant::now()),
@@ -142,8 +140,6 @@ fn progress_reaches_the_snapshot_unchanged() {
 
 #[test]
 fn a_terminal_frame_ends_the_run_and_frees_the_slot() {
-    // A bundle-swap failure carries the recovery message the requester must
-    // read, so the frame survives whole.
     let now = Instant::now();
     let relay = attached(now);
     let ticket = relay.request(Some("1.1.0"), now).unwrap();
@@ -196,8 +192,6 @@ fn ticket_ids_never_repeat() {
 
 #[test]
 fn the_relay_never_runs_a_process() {
-    // ADR 0108: an installer the gateway spawns dies under `launchctl bootout`.
-    // The install belongs to the desktop client, so nothing here may start one.
     let source = include_str!("update_relay.rs");
     for forbidden in ["Command::new", "std::process", "tokio::process"] {
         assert!(
@@ -209,8 +203,6 @@ fn the_relay_never_runs_a_process() {
 
 #[test]
 fn a_claim_the_client_never_confirms_is_dropped() {
-    // The reply carrying the ticket can be lost, say to a client read timeout.
-    // The client then beats on with no progress, and the slot must free up.
     let t0 = Instant::now();
     let relay = attached(t0);
     relay.request(Some("1.1.0"), t0).unwrap();
@@ -223,7 +215,6 @@ fn a_claim_the_client_never_confirms_is_dropped() {
 
 #[test]
 fn a_confirmed_run_outlives_the_claim_window() {
-    // A long download keeps beating with progress, and must not be dropped.
     let t0 = Instant::now();
     let relay = attached(t0);
     let ticket = relay.request(Some("1.1.0"), t0).unwrap();
@@ -236,8 +227,6 @@ fn a_confirmed_run_outlives_the_claim_window() {
     );
     assert_eq!(relay.snapshot(later)["request"]["state"], "running");
 }
-
-// ── Refreshing the release check before refusing ────────────────────────────
 
 mod refreshing {
     use super::*;

@@ -1,5 +1,3 @@
-//! Fault sources classify locally. No provider/network/error-text heuristic feeds
-//! this signal. Pending pre-DB signals survive an engine exit in a bounded inbox.
 use crate::engine::event_bus::EventBus;
 pub use lucidos_diagnostic_log::fault::{FaultKind, Inbox};
 use std::path::Path;
@@ -10,7 +8,7 @@ static INBOX: OnceLock<Inbox> = OnceLock::new();
 type Barrier = tokio::sync::oneshot::Sender<Result<(), String>>;
 static WORKER: OnceLock<tokio::sync::mpsc::Sender<Barrier>> = OnceLock::new();
 
-/// Install before constructing the engine, so pre-DB panics survive too.
+/// INVARIANT: Install before constructing the engine, so pre-DB panics survive too.
 pub fn install(workspace: &Path) {
     if INBOX.set(Inbox::new(workspace)).is_err() {
         return;
@@ -30,7 +28,6 @@ pub fn record_pending(kind: FaultKind) {
     }
 }
 
-/// A single worker retries failed emits. Never acknowledge before commit.
 pub async fn drain(inbox: &Inbox, bus: &EventBus) -> Result<(), Error> {
     for (kind, id) in inbox.pending()? {
         bus.emit_internal_fault(id, kind).await?;
@@ -39,7 +36,7 @@ pub async fn drain(inbox: &Inbox, bus: &EventBus) -> Result<(), Error> {
     Ok(())
 }
 
-/// Ask the sole drain consumer to commit pending markers before a snapshot or
+/// INVARIANT: Ask the sole drain consumer to commit pending markers before a snapshot or
 /// successful-send boundary. A failed drain must never masquerade as no faults.
 pub async fn synchronize() -> Result<(), Error> {
     let worker = WORKER.get().ok_or("Fault worker not started")?;
@@ -75,7 +72,7 @@ async fn run_worker(inbox: Inbox, bus: EventBus, mut rx: tokio::sync::mpsc::Rece
             crate::log_legacy!("[InternalFault] inbox drain failed: {}", e);
         }
         if let Some(barrier) = barrier {
-            // A timed-out requester may disappear; the durable drain still
+            // INVARIANT: A timed-out requester may disappear; the durable drain still
             // completed and its result has already been logged above.
             let _ = barrier.send(result.map_err(|e| e.to_string()));
         }

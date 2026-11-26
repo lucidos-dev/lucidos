@@ -1,4 +1,4 @@
-//! The *stable prefix* of an Anthropic request, and its fingerprint.
+//! INVARIANT: The *stable prefix* of an Anthropic request, and its fingerprint.
 //!
 //! The stable prefix is the part of a chat turn's request that the next turn
 //! sends again unchanged: the tools, the system block and, on a Tree
@@ -15,9 +15,6 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::Serialize;
 use serde_json::Value;
 
-/// The fingerprint of `request`'s stable prefix, for a call to `model`.
-/// `None` only when the prefix does not serialize, which the real request
-/// would then fail on too.
 pub(crate) fn fingerprint(request: &ClaudeRequest, model: &str) -> Option<String> {
     fingerprint_through(request, model, request.stable_prefix_end)
 }
@@ -31,8 +28,6 @@ pub(crate) fn fingerprint_through(
     Some(short_hash(&bytes))
 }
 
-/// The first 16 hex characters of the SHA-256: wide enough that two
-/// prefixes never collide in practice, short enough to compare by eye.
 pub(crate) fn short_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     crate::core::hex::hex_lower(&Sha256::digest(bytes)[..8])
@@ -102,9 +97,6 @@ struct UnmarkedMessage<'a> {
     content: Content<'a>,
 }
 
-/// A `system` or message `content` value, serialized as content blocks with
-/// no `cache_control` key. Marking a bare string rewrites it into the block
-/// form, so a string serializes as the one text block it would become.
 enum Content<'a> {
     Text(&'a str),
     Blocks(&'a [Value]),
@@ -119,7 +111,6 @@ impl<'a> Content<'a> {
         }
     }
 
-    /// The blocks up to and including `block`.
     fn through(self, block: usize) -> Self {
         match self {
             Self::Blocks(blocks) => Self::Blocks(&blocks[..blocks.len().min(block + 1)]),

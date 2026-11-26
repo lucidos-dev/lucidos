@@ -1,14 +1,3 @@
-//! The secret store: every secret the workspace database holds is sealed with
-//! one per-workspace key (ADR 0509).
-//!
-//! A sealed value is text, `lsec1:<key id>:<base64 nonce and ciphertext>`,
-//! AES-256-GCM with the `table.column` name as associated data. A `CHECK`
-//! constraint on each column refuses anything else, so a dump or a `SELECT`
-//! through any role yields ciphertext.
-//!
-//! [`SECRET_COLUMNS`] is the one list of secret columns. The boot backfill,
-//! the agent role's grants and the guard test all read it.
-
 pub mod boot;
 pub mod key_store;
 pub mod one_home;
@@ -23,28 +12,19 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub use lucidos_secret_store::{sealed_key_id, SecretKey, SEALED_PREFIX};
 
-/// How a secret column holds its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
-    /// One sealed `TEXT` value (nullable or not).
     Text,
-    /// A `JSONB` object whose every value is a sealed string. Its names stay
-    /// readable, so a list can show them.
     JsonValues,
 }
 
-/// What `lucidos-engine secrets discard` does to a value no key opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Discard {
-    /// The row means nothing without the secret: remove it.
     DeleteRow,
-    /// The column reads `''` as "none": set it to that.
     SetEmpty,
-    /// Drop the entry from the JSON object.
     DropEntry,
 }
 
-/// One secret column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecretColumnSpec {
     pub table: &'static str,
@@ -55,12 +35,11 @@ pub struct SecretColumnSpec {
 }
 
 impl SecretColumnSpec {
-    /// `table.column`, the associated data every seal binds.
+    /// INVARIANT: `table.column`, the associated data every seal binds.
     pub fn name(&self) -> String {
         format!("{}.{}", self.table, self.column)
     }
 
-    /// The `CHECK` constraint's name, written by the migration.
     pub fn constraint(&self) -> String {
         format!("{}_{}_sealed", self.table, self.column)
     }
@@ -75,7 +54,6 @@ impl lucidos_secret_store::SealingContext for SecretColumnSpec {
     }
 }
 
-/// A secret `TEXT` column, as a type, so a row struct names its column once.
 pub trait SecretColumn {
     const SPEC: SecretColumnSpec;
 }
@@ -94,7 +72,6 @@ macro_rules! secret_columns {
                 };
             }
         )*
-        /// Every secret column in the workspace database.
         pub const SECRET_COLUMNS: &[SecretColumnSpec] = &[$($marker::SPEC),*];
     };
 }
@@ -113,9 +90,6 @@ secret_columns! {
     ChatGptPlanRefreshToken => "chatgpt_plan_accounts"."refresh_token", Text, empty: false, discard: DeleteRow;
 }
 
-/// The mailbox password column, which held a copy of the `email_password`
-/// credential. [`one_home::move_at_boot`] moves what it holds into
-/// `credentials` and drops it.
 pub struct EmailPassword;
 impl SecretColumn for EmailPassword {
     const SPEC: SecretColumnSpec = SecretColumnSpec {
@@ -127,15 +101,11 @@ impl SecretColumn for EmailPassword {
     };
 }
 
-/// Secret columns a boot step moves into `credentials` and then drops. While
-/// one still exists, the boot check reads its key ids and `secrets discard`
-/// clears it, exactly as for [`SECRET_COLUMNS`].
 pub const MOVED_SECRET_COLUMNS: &[SecretColumnSpec] = &[EmailPassword::SPEC];
 
-/// The key this engine seals with, installed once at boot.
 static KEY: OnceLock<SecretKey> = OnceLock::new();
 
-/// Install the workspace key. A second install of another key is refused: one
+/// INVARIANT: Install the workspace key. A second install of another key is refused: one
 /// engine serves one database.
 pub fn install(key: SecretKey) -> Result<(), BoxError> {
     let installed = KEY.get_or_init(|| key.clone());
@@ -145,8 +115,6 @@ pub fn install(key: SecretKey) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// The installed key. Unit tests share one fixed key, so a store round-trips
-/// without a boot.
 pub fn key() -> Result<&'static SecretKey, BoxError> {
     #[cfg(test)]
     {
@@ -159,19 +127,14 @@ pub fn key() -> Result<&'static SecretKey, BoxError> {
     }
 }
 
-/// Seal `plain` for `column` with the installed key.
 pub fn seal(column: &SecretColumnSpec, plain: &str) -> Result<String, BoxError> {
     key()?.seal(column, plain)
 }
 
-/// Open a value of `column` with the installed key.
 pub fn open(column: &SecretColumnSpec, stored: &str) -> Result<String, BoxError> {
     key()?.open(column, stored)
 }
 
-/// A secret of column `C`, plain in memory. It seals as it binds and opens as
-/// it decodes, so a query never sees the plain text and a caller never sees
-/// the ciphertext. `Debug` redacts it.
 pub struct Secret<C> {
     plain: String,
     column: PhantomData<C>,
@@ -194,7 +157,6 @@ impl<C> Secret<C> {
     }
 }
 
-/// Lets a `FromRow` derive open a column with `#[sqlx(try_from = "Secret<C>")]`.
 impl<C> From<Secret<C>> for String {
     fn from(secret: Secret<C>) -> Self {
         secret.plain
@@ -240,7 +202,6 @@ impl<C: SecretColumn> sqlx::Encode<'_, Postgres> for Secret<C> {
     }
 }
 
-/// Seal every value of a JSON object, for a [`Shape::JsonValues`] column.
 pub fn seal_json_values(
     column: &SecretColumnSpec,
     plain: &std::collections::HashMap<String, String>,
@@ -252,7 +213,6 @@ pub fn seal_json_values(
     Ok(serde_json::Value::Object(sealed))
 }
 
-/// Open every value of a JSON object [`seal_json_values`] wrote.
 pub fn open_json_values(
     column: &SecretColumnSpec,
     stored: serde_json::Value,

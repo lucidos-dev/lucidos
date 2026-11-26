@@ -1,9 +1,3 @@
-//! A's memory of B's compatibility verdict per relayed workspace, so a burst
-//! of requests shares one health and contract probe. It never holds an
-//! authorization: B checks the credential, claim and pairing on every request,
-//! and checks the contract binding A signs from this verdict.
-//! Invariants I1 to I6: docs/plans/2026-11-19-gateway-relay-request-queue.md.
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -13,11 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::remote_gateways::RemoteGateway;
 
-/// How long a verdict stands. B refuses a stale one, so this bounds wasted
-/// refusals, never what B admits.
 pub const RELAY_PROBE_TTL: Duration = Duration::from_secs(30);
 
-/// One relayed workspace on one remote, as paired now.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProbeKey {
     name: String,
@@ -37,18 +28,12 @@ impl ProbeKey {
     }
 }
 
-/// What a passed probe learned about B.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verdict {
-    /// What A signs for B to compare, or `None` when B cannot check one,
-    /// which leaves every request to probe.
     pub binding: Option<String>,
-    /// B serves its own client to a relayed device (`peer-served-client`).
     pub peer_client: bool,
 }
 
-/// What a slot's last probe found. A waiter that finds `Failed` probes alone,
-/// never queued.
 enum Probed {
     Passed { verdict: Verdict, at: Instant },
     Failed,
@@ -75,9 +60,6 @@ impl RelayProbeCache {
         }
     }
 
-    /// The verdict for `key`: cached, or from `probe`. Callers on a cold key
-    /// wait for one probe. `generation` is the remote store's, and a new one
-    /// drops every verdict.
     pub async fn resolve<E, F>(
         &self,
         key: &ProbeKey,
@@ -126,14 +108,12 @@ impl RelayProbeCache {
         result
     }
 
-    /// Forget `key`'s verdict, after B refused or could not be reached.
     pub fn evict(&self, key: &ProbeKey) {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         slots.1.remove(key);
     }
 }
 
-/// Does this status from B, or a transport error, void the verdict?
 pub fn voids_verdict(status: Option<axum::http::StatusCode>) -> bool {
     status.is_none_or(|s| matches!(s.as_u16(), 401 | 403 | 404 | 426 | 503))
 }

@@ -24,14 +24,10 @@ struct ValidationCases {
     invalid_values: Vec<String>,
 }
 
-/// The same fixture drives `appearance-themes.test.ts`, so the engine and every apply
-/// site agree on what a theme may contain.
 #[test]
 fn token_rules_match_the_shared_fixture() {
     let cases: ValidationCases =
         serde_json::from_str(include_str!("theme-validation-cases.json")).unwrap();
-    // The SDK refuses the same UI font tokens in a style override, and holds
-    // an override's shadow to the same reach.
     assert_eq!(cases.ui_font_tokens, UI_FONT_TOKENS);
     let shadows: Vec<&str> = CATALOG
         .tokens
@@ -161,13 +157,9 @@ fn a_seed_fills_in_its_derived_tokens() {
     assert_eq!(dark["--accent-action"], "var(--accent)");
     assert!(dark["--header-bar-top"].contains("var(--accent)"));
     assert_eq!(dark["--header-fg"], "var(--text-primary)");
-    // The light mode has no map, so nothing is set and nothing derives.
     assert!(resolve_mode(&d, ThemeMode::Light, None).is_empty());
 }
 
-/// Bold text steps away from the page, whichever mode paints it. A dark theme
-/// shown under the light theme still brightens its bold, and a light theme under
-/// the dark theme darkens it.
 #[test]
 fn strong_text_steps_away_from_the_themes_own_page() {
     let dark_page =
@@ -203,8 +195,6 @@ fn a_theme_keeps_its_own_strong_text_and_one_without_seeds_sets_none() {
     assert!(!resolve_mode(&square, ThemeMode::Light, None).contains_key("--text-strong"));
 }
 
-/// A theme that writes its own header fill has it carried up through the macOS
-/// title-bar band. One that only retunes the stops keeps the band solid.
 #[test]
 fn an_own_header_fill_continues_through_the_titlebar_band() {
     let striped = def(
@@ -388,7 +378,6 @@ fn a_served_theme_flattens_its_definition() {
 
 #[test]
 fn value_length_counts_what_javascript_counts() {
-    // An astral character is one char but two UTF-16 units.
     let value = "\u{1F600}".repeat(MAX_VALUE_LENGTH / 2);
     assert_eq!(value.encode_utf16().count(), MAX_VALUE_LENGTH);
     assert!(is_valid_token_value(&value));
@@ -396,8 +385,6 @@ fn value_length_counts_what_javascript_counts() {
     assert!(is_valid_token_value(&"a".repeat(MAX_VALUE_LENGTH)));
     assert!(!is_valid_token_value(&"a".repeat(MAX_VALUE_LENGTH + 1)));
 }
-
-// --- Fonts a theme suggests ---
 
 fn refusal(json: &str) -> String {
     validate_workspace_write("mine.json", json.as_bytes(), WorkspaceFonts::default)
@@ -411,10 +398,8 @@ fn a_theme_suggests_fonts_by_catalog_id() {
     let theme = build("x", ThemeSource::Workspace, d, &WorkspaceFonts::default());
     assert_eq!(theme.resolved.fonts.ui.as_deref(), Some("geist"));
     let stack = fonts::find("geist-mono").unwrap().stack;
-    // The code font is an ordinary token, so every surface paints it unchanged.
     assert_eq!(theme.resolved.dark[FONT_MONO_TOKEN], stack);
     assert_eq!(theme.resolved.light[FONT_MONO_TOKEN], stack);
-    // The UI font is NOT a token: laid inline, it would beat the user's pick.
     assert!(!theme.resolved.dark.contains_key("--font-ui"));
     let json = serde_json::to_value(&theme.resolved).unwrap();
     assert_eq!(json["fonts"]["ui"], "geist");
@@ -438,8 +423,6 @@ fn an_unknown_font_id_is_refused() {
     assert!(err.contains("`fonts.mono`"), "{err}");
 }
 
-/// ADR 0303: every catalog font is bundled, so a theme may name any of them,
-/// the three that once loaded from Google Fonts included.
 #[test]
 fn a_theme_may_name_every_catalog_font_fit_for_its_slot() {
     for font in fonts::FONT_CATALOG {
@@ -489,8 +472,6 @@ fn fonts_mono_and_a_font_mono_token_are_refused_together() {
     assert!(err.contains("not both"), "{err}");
 }
 
-/// The UI font reaches a theme only through `fonts.ui`. A token would be laid
-/// over the user's explicit pick.
 #[test]
 fn a_ui_font_token_is_refused() {
     for name in UI_FONT_TOKENS {
@@ -514,8 +495,6 @@ fn an_unknown_font_slot_is_refused() {
     assert!(err.contains("heading"), "{err}");
 }
 
-/// A device with no font set follows its theme. A font on the default theme
-/// would change what every fresh install paints (ADR 0077).
 #[test]
 fn the_default_theme_suggests_no_font() {
     assert!(built_in(DEFAULT_THEME_ID)
@@ -532,8 +511,6 @@ fn some_built_in_themes_suggest_a_ui_font() {
     assert_eq!(ui_font("minimal").as_deref(), Some("geist"));
     assert_eq!(ui_font("mono").as_deref(), Some("geist-mono"));
 }
-
-// --- Workspace fonts a theme suggests ---
 
 fn installed(fonts: &[(&str, &str)]) -> WorkspaceFonts {
     let dir = tempfile::tempdir().unwrap();
@@ -567,8 +544,6 @@ fn a_theme_may_name_an_installed_workspace_font_in_a_slot_it_fits() {
     assert!(err.contains("not an installed workspace font"), "{err}");
 }
 
-/// A theme is parsed apart from any workspace, so a well-formed workspace font
-/// id passes parsing. Whether it exists is asked where the fonts are at hand.
 #[test]
 fn parsing_accepts_a_well_formed_workspace_font_id_and_nothing_looser() {
     assert!(parse_definition(br#"{"name":"x","fonts":{"ui":"ws-brand"}}"#).is_ok());
@@ -585,14 +560,12 @@ fn a_resolved_theme_lays_a_workspace_code_font_and_carries_its_entry() {
     let theme = build("x", ThemeSource::Workspace, d, &fonts);
     let entry = fonts.find("ws-code").unwrap();
     assert_eq!(theme.resolved.dark[FONT_MONO_TOKEN], entry.stack);
-    // Approval cards keep a catalog code font: the workspace one is unchecked.
     assert_eq!(
         theme.resolved.dark[PROTECTED_FONT_MONO_TOKEN],
         protected_font_mono(&theme.definition)
     );
     assert_ne!(theme.resolved.dark[PROTECTED_FONT_MONO_TOKEN], entry.stack);
     assert_eq!(theme.resolved.fonts.ui.as_deref(), Some("ws-code"));
-    // One entry, though the font fills both slots.
     assert_eq!(theme.resolved.workspace_fonts, vec![entry.clone()]);
     let json = serde_json::to_value(&theme.resolved).unwrap();
     assert_eq!(
@@ -601,8 +574,6 @@ fn a_resolved_theme_lays_a_workspace_code_font_and_carries_its_entry() {
     );
 }
 
-/// A font removed after the theme was written drops out, so its slot falls
-/// back as if the theme had never named it.
 #[test]
 fn a_vanished_or_unfit_workspace_font_drops_out_of_the_resolved_theme() {
     let d = def(r#"{"name":"x","fonts":{"ui":"ws-gone","mono":"ws-brand"}}"#);
@@ -650,13 +621,10 @@ fn get_resolves_a_workspace_theme_against_the_workspace_fonts() {
     assert!(theme.resolved.fonts.ui.is_none());
 }
 
-// --- Protected surfaces ---
-
 fn colour(value: &str) -> color::Rgba {
     color::evaluate(value, &|_| None).unwrap_or_else(|| panic!("{value} is not a colour"))
 }
 
-/// Assert every rule the protected palette promises, for one mode's palette.
 fn assert_palette_holds(palette: &[(&str, String)], context: &str) {
     let get = |name: &str| {
         let value = &palette
@@ -733,8 +701,6 @@ fn every_built_in_theme_gets_a_palette_that_holds() {
     }
 }
 
-/// A hovered row and a menu's keyboard cursor paint `--bg-hover` on the page
-/// and on every popover, so the fill has to show on both.
 #[test]
 fn every_built_in_hover_fill_shows_on_the_page_and_on_a_surface() {
     const MIN_RATIO: f64 = 1.04;
@@ -757,8 +723,6 @@ fn every_built_in_hover_fill_shows_on_the_page_and_on_a_surface() {
     }
 }
 
-/// The clamp holds for any tokens at all, including ones validation refuses:
-/// a style override never passes through the theme validator.
 #[test]
 fn a_hostile_palette_is_clamped_readable() {
     let hostile: &[(&str, &[(&str, &str)])] = &[
@@ -820,8 +784,6 @@ fn a_hostile_palette_is_clamped_readable() {
     }
 }
 
-/// A sweep across page, text and accent colours: whatever a theme picks, the
-/// palette holds.
 #[test]
 fn the_palette_holds_across_a_sweep_of_themes() {
     let pages = [
@@ -878,8 +840,6 @@ fn a_theme_paints_the_palette_and_the_default_theme_leaves_it_to_the_stylesheet(
     );
 }
 
-/// The default theme paints nothing inline, so `base.css` must carry exactly
-/// the palette the engine derives for it.
 #[test]
 fn base_css_carries_the_default_protected_palette() {
     let css = include_str!("../../../../lucidos-app/src/styles/global/base.css");
@@ -919,8 +879,6 @@ fn base_css_carries_the_default_protected_palette() {
     }
 }
 
-// --- Refusal: a theme far enough off to be hostile ---
-
 #[test]
 fn a_theme_may_name_catalog_tokens_only() {
     let err = refusal(r#"{"name":"x","tokens":{"--z-modal":"0"}}"#);
@@ -939,15 +897,12 @@ fn text_the_page_hides_is_refused() {
         err.contains("in dark mode, --text-primary on --bg-primary is 1.0:1"),
         "{err}"
     );
-    // A shared page colour applies in both modes, and the light default text
-    // is dark, so the light mode is refused too.
     let err = refusal(r##"{"name":"x","tokens":{"--bg-primary":"#101010"}}"##);
     assert!(err.contains("in light mode"), "{err}");
 }
 
 #[test]
 fn faint_but_legible_text_is_accepted_and_clamped_on_approval_surfaces() {
-    // About 3.5:1: past the refusal floor, short of AA.
     let d = def(r##"{"name":"x","dark":{"--bg-primary":"#202020","--text-primary":"#808080"}}"##);
     let dark = resolve_mode(&d, ThemeMode::Dark, None);
     let text = colour(&dark["--protected-text"]);
@@ -1012,8 +967,6 @@ fn a_shadow_that_reaches_far_outside_its_box_is_refused() {
     }
 }
 
-/// A command on an approval card shows in a catalog code font or the default
-/// stack, never a free-form `--font-mono` a theme named.
 #[test]
 fn the_protected_code_font_is_a_catalog_stack() {
     let free = def(r#"{"name":"x","tokens":{"--font-mono":"'Wingdings', monospace"}}"#);
@@ -1085,7 +1038,6 @@ fn a_theme_write_is_validated_and_other_paths_are_not() {
         b"not json"
     )
     .is_ok());
-    // A sibling whose name only starts with `themes` is not under `themes/`.
     assert!(validate_data_write(
         std::path::Path::new("/nonexistent"),
         "themesy/mine.json",
@@ -1115,12 +1067,9 @@ fn a_theme_mode_value_is_never_a_theme_id() {
     assert!(validate_id("nord").is_ok());
 }
 
-/// Tests that read a shipped doc at run time.
 mod guard_tests {
     use super::*;
 
-    /// The agent-facing knowhow names every token a theme can tune, so the agent
-    /// never has to guess one. A new catalog token needs its row in the same change.
     #[test]
     fn the_themes_knowhow_lists_every_catalog_token() {
         let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");

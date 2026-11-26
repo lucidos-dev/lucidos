@@ -1,5 +1,3 @@
-//! Directional agent return access (ADR 0725).
-
 use std::collections::HashMap;
 
 use crate::error::ApiError;
@@ -14,14 +12,12 @@ const RECEIPT_TTL_SECS: u64 = 30;
 const MAX_PENDING_RECEIPTS: usize = 64;
 const MAX_OPERATION_BYTES: usize = 256 * 1024;
 
-/// A new generation on each enable prevents old receipts surviving revocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReturnGrant {
     pub id: String,
 }
 
-/// Non-secret callback metadata, registered over the existing pairing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReturnRoute {
@@ -37,7 +33,6 @@ struct Pending {
     expires_at: u64,
 }
 
-/// Active requests only. Dropping the gateway drops every unredeemed receipt.
 #[derive(Default)]
 pub(crate) struct Receipts(HashMap<String, Pending>);
 
@@ -87,7 +82,6 @@ impl Receipts {
     }
 }
 
-/// Registration conveys routing metadata only, never authority to return.
 pub(crate) async fn register_route(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,
@@ -121,7 +115,6 @@ pub(crate) struct ReceiptRequest {
     pub grant_id: String,
 }
 
-/// Only the pairing the source bound may redeem, once, while still registered.
 pub(crate) async fn redeem_receipt(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,

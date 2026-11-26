@@ -210,15 +210,35 @@ describe('app storage limits and failures', () => {
     expect((await set(demo, 'c', half)).ok).toBe(true);
   });
 
-  it('reports a full browser store to the app and to the user', async () => {
-    const full = vi.spyOn(PrototypeStorage.prototype, 'setItem').mockImplementation(() => {
+  it.each([
+    ['local', 'Open Lucidos in another browser or on another device'],
+    ['session', 'Copy any unsaved work, then close this tab'],
+  ])('explains how to recover from a full %s store', async (area, guidance) => {
+    vi.spyOn(PrototypeStorage.prototype, 'setItem').mockImplementation(() => {
       throw new DOMException('full', 'QuotaExceededError');
     });
-    const reply = await set(habit, 'a', '1');
-    full.mockRestore();
+    const reply = await set(habit, 'a', '1', { area });
     expect(reply.ok).toBe(false);
-    expect(reply.error).toContain('full');
-    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(reply.error).toBe('Browser storage is full');
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining(guidance),
+      'error',
+      expect.objectContaining({ title: 'App "habit-tracker" could not save' }),
+    );
+  });
+
+  it('explains how to recover when the browser blocks storage', async () => {
+    vi.spyOn(PrototypeStorage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('blocked', 'SecurityError');
+    });
+    const reply = await set(habit, 'a', '1');
+    expect(reply.ok).toBe(false);
+    expect(reply.error).toBe('Browser storage is unavailable here');
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining('Allow site data for Lucidos'),
+      'error',
+      expect.objectContaining({ title: 'App "habit-tracker" could not save' }),
+    );
   });
 
   it('logs an sdk-space failure rather than toasting it', async () => {

@@ -41,7 +41,6 @@ async fn chat_stream_with_thread_id() {
     let url = format!("{}/api/v1/chat/stream", base_url());
     let marker = unique_marker("api-thread");
 
-    // First message creates a thread
     let body1 = serde_json::json!({
         "message": format!("Say exactly: \"first {marker}\""),
         "mode": "human",
@@ -60,13 +59,9 @@ async fn chat_stream_with_thread_id() {
         "First message should return event_id"
     );
 
-    // Resolve the thread by marker — `archive[0]` would race with parallel
-    // tests whose threads can sort ahead and yield a 409 when their (mode,
-    // repo) doesn't match this follow-up.
     let row = poll_thread_summary_by_marker(&pool, &marker, 15).await;
     let thread_id = row.thread_id.to_string();
 
-    // Send a follow-up to the same thread
     let body2 = serde_json::json!({
         "message": format!("Say exactly: \"second {marker}\""),
         "mode": "human",
@@ -89,8 +84,6 @@ async fn chat_empty_message_is_rejected() {
     let client = user_client().await;
     let url = format!("{}/api/v1/chat/stream", base_url());
 
-    // A create with nothing to say is refused before any thread exists, for a
-    // human send and for a spawn (`lucidos spawn-thread --to`) alike.
     for body in [
         serde_json::json!({ "message": "", "mode": "human" }),
         serde_json::json!({ "message": "  \n", "mode": "agent", "caller_workspace": "elsewhere" }),
@@ -142,10 +135,6 @@ async fn chat_missing_image_refuses_text_and_image_only_sends() {
     }
 }
 
-/// Refactor regression: POST /api/v1/chat/stream used to hardcode parent_thread_id=NULL
-/// and initiator='user', causing CC-spawned child threads to be mislabeled as
-/// user-initiated roots. Verify the wire fields actually reach thread_summaries
-/// when the caller explicitly identifies as system.
 #[tokio::test]
 async fn parent_thread_id_propagates_to_projection() {
     let client = user_client().await;
@@ -183,7 +172,6 @@ async fn parent_thread_id_propagates_to_projection() {
     );
 }
 
-/// mode=human keeps threads user-initiated (regression check for the default path).
 #[tokio::test]
 async fn human_mode_means_user_initiated() {
     let client = user_client().await;
@@ -234,11 +222,6 @@ async fn invalid_parent_thread_id_returns_400() {
     );
 }
 
-/// `repo_id` accepts a UUID or a registered repo name (the
-/// `lucidos spawn-thread --repo <name>` CLI sends names). An unknown repo
-/// must surface a clean 400 at the API boundary, not a 500 from deep inside
-/// the engine when worktree creation fails. This is the chat-side mirror of
-/// the existing repo-switch lock check.
 #[tokio::test]
 async fn chat_stream_rejects_unknown_repo() {
     let client = user_client().await;
@@ -262,9 +245,6 @@ async fn chat_stream_rejects_unknown_repo() {
     );
 }
 
-/// `lucidos spawn-thread --coding-agent-model` reaches this route. A model the
-/// backend does not offer is refused before a thread exists. The text lists the
-/// valid ids, as `run_coding_agent` does (ADR 0488).
 #[tokio::test]
 async fn chat_stream_rejects_an_unoffered_coding_agent_model() {
     let client = user_client().await;
@@ -290,9 +270,6 @@ async fn chat_stream_rejects_an_unoffered_coding_agent_model() {
     );
 }
 
-/// `mode` is mandatory — requests omitting it must be rejected (not silently
-/// defaulted to human) so the spawn-thread skill and other callers cannot
-/// accidentally produce mislabeled threads.
 #[tokio::test]
 async fn missing_mode_returns_400() {
     let client = user_client().await;
@@ -313,15 +290,6 @@ async fn missing_mode_returns_400() {
     );
 }
 
-/// A thread is locked to its (mode, repo) at first message — switching
-/// either mid-thread caused multi-repo session mixing where the executor
-/// card and the commands menu disagreed (e.g. menu showed Lucidos skills
-/// while the session ran on a different repo). The chat handler must reject
-/// follow-ups that try to flip mode or repo.
-///
-/// `state='active'` here is the operative bit: the lock only kicks in once
-/// the thread has actually been sent. Drafts (`state='composing'`) intentionally
-/// permit mode toggling — see `chat_stream_allows_mode_switch_on_composing_thread`.
 #[tokio::test]
 async fn chat_stream_rejects_mode_switch_on_existing_thread() {
     let client = user_client().await;
@@ -359,10 +327,6 @@ async fn chat_stream_rejects_mode_switch_on_existing_thread() {
         resp.status(),
     );
 
-    // The rejection must SAY why. A bare status sends an empty body, and the
-    // frontend falls back to `statusText`, which is "" over HTTP/2, so the
-    // user's toast read "Failed to send message: 409" and named neither the
-    // thread's mode nor the one that was requested.
     let body: serde_json::Value = resp.json().await.expect("409 body must be JSON");
     let message = body["error"].as_str().unwrap_or_default();
     assert!(
@@ -377,17 +341,6 @@ async fn chat_stream_rejects_mode_switch_on_existing_thread() {
         .ok();
 }
 
-/// Regression: a draft can have its `source` column set to `'claude_code'`
-/// from a prior compose-mode toggle (the PUT compose CASE writes it). When
-/// the user toggles back to Lucidos and clicks Send before the debounced PUT
-/// lands, the chat request arrives with `use_coding_agent=false` and the
-/// row's stale source surfaces as a 409 ("Thread is locked to coding-agent
-/// mode; cannot switch to Lucidos Agent") — even though no message has ever
-/// been sent on the thread.
-///
-/// The mode lock must only apply to threads that have actually been sent
-/// (`state='active'`). Composing threads are still drafts; the user is
-/// allowed to change their mind right up to the moment of send.
 #[tokio::test]
 async fn chat_stream_allows_mode_switch_on_composing_thread() {
     let client = user_client().await;
@@ -411,7 +364,6 @@ async fn chat_stream_allows_mode_switch_on_composing_thread() {
             "message": "I changed my mind, send via Lucidos",
             "mode": "human",
             "thread_id": thread_id.to_string(),
-            // No use_coding_agent → Lucidos, despite source='claude_code'
         }))
         .send()
         .await
@@ -431,10 +383,6 @@ async fn chat_stream_allows_mode_switch_on_composing_thread() {
         .ok();
 }
 
-/// Companion to the mode-switch test: a CC thread bound to repo A must
-/// reject a follow-up requesting repo B (the menu would otherwise collapse
-/// to whichever repo's `changes` row is most recent and disagree with the
-/// executor card).
 #[tokio::test]
 async fn chat_stream_rejects_repo_switch_on_existing_cc_thread() {
     let client = user_client().await;
@@ -482,17 +430,11 @@ async fn chat_stream_rejects_repo_switch_on_existing_cc_thread() {
         .ok();
 }
 
-/// Regression: mobile screenshots in base64 routinely exceed axum's 2 MiB
-/// default body limit, surfacing as "Failed to send message: Failed to buffer
-/// the request body" toast. /api/v1/chat/stream must accept large image payloads.
 #[tokio::test]
 async fn chat_stream_accepts_large_image_payload() {
     let client = user_client().await;
     let url = format!("{}/api/v1/chat/stream", base_url());
 
-    // About 5 MiB of base64: above axum's 2 MiB default, below our 100 MiB cap.
-    // The bytes open with the PNG signature, since the server sniffs every
-    // inline image and refuses anything that is not one with a 415.
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.resize(4 * 1024 * 1024, 0);
     let large_base64 = {
@@ -522,14 +464,6 @@ async fn chat_stream_accepts_large_image_payload() {
     );
 }
 
-/// A `200` from `POST /chat/stream` must mean the follow-up is durably accepted,
-/// and two sends issued one after the other must record in that order.
-///
-/// Acceptance is the transaction that admits the input to the thread's input
-/// order. Recording `MessageReceived` follows in that order, inside the queued
-/// turn (`docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`, ADR 0449).
-/// The ack therefore never waits on the turn, and a reversal cannot happen: the
-/// second send's accepted sequence follows the first's.
 #[tokio::test]
 async fn follow_up_is_accepted_before_the_ack_and_records_in_send_order() {
     let client = user_client().await;
@@ -539,9 +473,6 @@ async fn follow_up_is_accepted_before_the_ack_and_records_in_send_order() {
     let url = format!("{}/api/v1/chat/stream", base_url());
     let marker = unique_marker("api-send-order");
 
-    // First message creates the thread. It is deliberately NOT pre-emitted (a
-    // brand-new thread's first message records in its spawned turn), so
-    // resolve the thread the same way the other tests do.
     let resp: serde_json::Value = client
         .post(&url)
         .json(&serde_json::json!({
@@ -559,8 +490,6 @@ async fn follow_up_is_accepted_before_the_ack_and_records_in_send_order() {
         .await
         .thread_id;
 
-    // Two follow-ups, issued strictly one after the other, exactly as the
-    // client's per-thread send chain does it.
     let mut event_ids = Vec::new();
     for (nth, text) in ["first follow-up", "second follow-up"].iter().enumerate() {
         let body = serde_json::json!({
@@ -578,9 +507,6 @@ async fn follow_up_is_accepted_before_the_ack_and_records_in_send_order() {
         let ack: serde_json::Value = resp.json().await.expect("Invalid JSON");
         let event_id: Uuid = ack["event_id"].as_str().unwrap().parse().unwrap();
 
-        // No polling: the ack is the claim under test, so read the acceptance
-        // once, immediately. A miss here means the handler acked before it
-        // committed the acceptance.
         let accepted: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM events WHERE event_type = 'OrdinarySubmissionAccepted' \
              AND payload->'data'->>'message_event_id' = $1)",
@@ -607,9 +533,6 @@ async fn follow_up_is_accepted_before_the_ack_and_records_in_send_order() {
     );
 }
 
-/// A client that lost the reply to its POST re-posts the same body, event id
-/// included. The engine must answer with the same ack and run nothing twice:
-/// one `MessageReceived`, one turn.
 #[tokio::test]
 async fn a_reposted_event_id_is_acked_once_and_runs_one_turn() {
     let client = user_client().await;
@@ -619,8 +542,6 @@ async fn a_reposted_event_id_is_acked_once_and_runs_one_turn() {
     let url = format!("{}/api/v1/chat/stream", base_url());
     let marker = unique_marker("api-repost");
 
-    // Named by the client, as the frontend does: without one, the ack carries
-    // an id no event uses.
     let opening_id = Uuid::new_v4().to_string();
     client
         .post(&url)
@@ -636,7 +557,6 @@ async fn a_reposted_event_id_is_acked_once_and_runs_one_turn() {
         .await
         .thread_id;
 
-    // How many turns started by `request` have ended.
     let turns_ended = |request: String| {
         let pool = pool.clone();
         async move {
@@ -663,8 +583,6 @@ async fn a_reposted_event_id_is_acked_once_and_runs_one_turn() {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     };
-    // A follow-up sent while that turn runs is injected into it rather than
-    // starting its own, so let it finish first.
     wait_for_turn_end(opening_id).await;
 
     let event_id = Uuid::new_v4().to_string();
@@ -690,7 +608,6 @@ async fn a_reposted_event_id_is_acked_once_and_runs_one_turn() {
     }
 
     wait_for_turn_end(event_id.clone()).await;
-    // Grace for a second turn, had the re-post started one.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert_eq!(
         turns_ended(event_id.clone()).await,
@@ -710,7 +627,6 @@ async fn a_reposted_event_id_is_acked_once_and_runs_one_turn() {
     assert_eq!(messages, 1, "the message must be recorded once");
 }
 
-/// A refused post must leave its event id free, so the corrected retry runs.
 #[tokio::test]
 async fn a_refused_post_leaves_its_event_id_free_for_the_retry() {
     let client = user_client().await;
@@ -745,25 +661,9 @@ async fn a_refused_post_leaves_its_event_id_free_for_the_retry() {
         .await
         .expect("Retried chat request failed");
     assert_eq!(retried.status(), 200);
-    // The thread only exists if the retry really ran.
     poll_thread_summary_by_marker(&pool, &marker, 15).await;
 }
 
-// ── Attribution and targeting refusals ──────────────────────────────
-//
-// Regression coverage for the 2026-08-06 incident. The Lucidos Agent was asked
-// to message every running coding-agent thread, no tool covered that, and
-// instead of reporting itself blocked it shelled out to `curl` and POSTed
-// straight to this endpoint. Two engine defects let that through and a third
-// hid it: the turn was recorded as `mode: human`, the POST reached the wrong
-// engine, and that engine materialized six threads from the unknown ids so
-// reading them back CONFIRMED the mistake.
-
-/// An unattributed caller may not record a turn as the user.
-///
-/// `http_client()` (not `user_client()`) is the point: no device id, no origin
-/// token, exactly the shape `curl` produces. The refusal must also leave the
-/// workspace untouched, which is the half a status-code-only assertion misses.
 #[tokio::test]
 async fn chat_stream_refuses_unattributed_human_mode() {
     let client = http_client();
@@ -816,14 +716,8 @@ async fn chat_stream_refuses_unattributed_human_mode() {
     assert_eq!(rows, 0, "a refused POST must create no thread");
 }
 
-/// An empty `device_id` in the body must not shadow a valid
-/// `x-lucidos-device-id` header. `Option::or` keeps a `Some("")`, so filtering
-/// blanks after the fallback instead of before it would refuse a request that
-/// is genuinely device-attributed.
 #[tokio::test]
 async fn an_empty_body_device_id_falls_back_to_the_header() {
-    // `user_client` carries the header for a registered device; the body field
-    // is deliberately blank on top of it.
     let client = user_client().await;
     let marker = unique_marker("api-blank-device-id");
 
@@ -845,18 +739,6 @@ async fn an_empty_body_device_id_falls_back_to_the_header() {
     );
 }
 
-// The escape hatch is proven by every other test in this file: they all post
-// `mode: "human"` through `user_client()`, which registers a device, and they
-// all expect 200. A dedicated "attributed request is accepted" test would only
-// spawn one more agentic turn against the shared capacity pool to assert what
-// `chat_stream_returns_event_id` already asserts.
-
-/// An unknown `thread_id` with no create signal must 404 and create nothing.
-///
-/// This is the behaviour whose absence made the incident self-confirming: the
-/// `MessageReceived` projection is an upsert, so an id naming nothing used to
-/// materialize the thread, and the agent's own read-back then found its message
-/// on the wrong engine and reported success.
 #[tokio::test]
 async fn chat_stream_does_not_create_a_thread_from_an_unknown_id() {
     let client = user_client().await;
@@ -904,7 +786,6 @@ async fn chat_stream_does_not_create_a_thread_from_an_unknown_id() {
     assert_eq!(events, 0, "and it must carry no seeded message");
 }
 
-/// `new_thread: true` is what turns the same POST into a legitimate create.
 #[tokio::test]
 async fn chat_stream_creates_a_thread_when_the_request_says_it_is_creating_one() {
     let client = user_client().await;
@@ -934,8 +815,6 @@ async fn chat_stream_creates_a_thread_when_the_request_says_it_is_creating_one()
     );
 }
 
-/// Ask the engine which workspace it serves. The same disclosure a mis-aimed
-/// caller uses to re-resolve its target, which is why the 409 body points here.
 async fn engine_workspace_name() -> String {
     let health: serde_json::Value = http_client()
         .get(format!("{}/api/v1/health", base_url()))
@@ -951,10 +830,6 @@ async fn engine_workspace_name() -> String {
         .to_string()
 }
 
-/// A request that names a different workspace must be refused by this engine,
-/// with the actual workspace named so the caller can re-resolve its target.
-/// Several engines run on one machine; without this a wrong port is served in
-/// full by whichever one is listening.
 #[tokio::test]
 async fn chat_stream_refuses_a_request_aimed_at_another_workspace() {
     let client = user_client().await;
@@ -1003,12 +878,6 @@ async fn chat_stream_refuses_a_request_aimed_at_another_workspace() {
     assert_eq!(rows, 0, "a mis-aimed request must write nothing");
 }
 
-/// The assertion is honored, not merely rejected: naming THIS workspace passes
-/// through. Asserted against `/health` rather than a chat POST because the
-/// check is router-wide middleware, so any endpoint proves it, and a chat POST
-/// would spend a real agentic turn out of the shared capacity pool to prove
-/// something about a header. Absent-changes-nothing is covered by every other
-/// test in this suite, none of which sends an assertion at all.
 #[tokio::test]
 async fn a_request_aimed_at_this_workspace_passes_through() {
     let actual = engine_workspace_name().await;
@@ -1027,22 +896,6 @@ async fn a_request_aimed_at_this_workspace_passes_through() {
     );
 }
 
-/// A caller that names its thread keeps that name.
-///
-/// This is the seam every spawn now depends on. Both spawn sites hand their
-/// caller's title to `process_message_with_steps` rather than writing it
-/// themselves, so `maybe_emit_titles` is the single place a thread is named.
-/// It has to write the name after `MessageReceived` creates the projection
-/// row, and it has to keep the title model out.
-///
-/// The caller mints the thread id, which is what a spawn does and what puts
-/// this on the branch a spawn takes. A supplied id reads as a follow-up
-/// however new the thread is, and an unnamed follow-up spends a title-model
-/// call. That is what makes the count below mean something.
-///
-/// The failure it guards is silent: the name is replaced about a second later
-/// by a model-generated one, and nothing errors. So the assertion waits for
-/// the turn to finish, which far outlasts titling.
 #[tokio::test]
 async fn a_caller_that_names_its_thread_keeps_that_name() {
     let client = user_client().await;
@@ -1067,10 +920,6 @@ async fn a_caller_that_names_its_thread_keeps_that_name() {
         .expect("Chat stream request failed");
     assert_eq!(resp.status(), 200, "got {}", resp.status());
 
-    // Outlast the window the title model would have renamed the thread in. A
-    // turn is a real model call, so waiting for it is several times longer
-    // than titling takes. Best effort: a slow turn must not fail this test,
-    // because the window has passed either way.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         let done: Option<bool> =

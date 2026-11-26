@@ -40,8 +40,6 @@ fn asking(
     }
 }
 
-/// Invariant 1: a handoff that names no implementer carries the old one as
-/// is, unvalidated, exactly as before the request could name one.
 #[test]
 fn a_handoff_naming_no_implementer_carries_the_old_one() {
     let old = implementer(
@@ -55,7 +53,6 @@ fn a_handoff_naming_no_implementer_carries_the_old_one() {
     );
 }
 
-/// Invariant 2: what the handoff names is what the successor runs on.
 #[test]
 fn the_named_implementer_reaches_the_successor() {
     let old = implementer(
@@ -84,8 +81,6 @@ fn the_named_implementer_reaches_the_successor() {
     );
 }
 
-/// A new backend starts from its own defaults: the old model and effort
-/// belong to the old backend.
 #[test]
 fn a_new_backend_carries_neither_model_nor_effort() {
     let old = implementer(
@@ -99,8 +94,6 @@ fn a_new_backend_carries_neither_model_nor_effort() {
     );
 }
 
-/// Invariant 3: an implementer the backend does not offer is refused, with
-/// the offered list, rather than swapped for a default.
 #[test]
 fn an_implementer_the_backend_lacks_is_refused() {
     let old = implementer(CodingAgent::ClaudeCode, None, None);
@@ -120,8 +113,6 @@ fn an_implementer_the_backend_lacks_is_refused() {
     }
 }
 
-/// Invariant 4: a carried effort survives a model change only while the new
-/// model accepts it.
 #[test]
 fn a_carried_effort_never_outlives_its_model() {
     let old = implementer(CodingAgent::Codex, Some("gpt-5.6-sol"), Some("max"));
@@ -139,9 +130,6 @@ fn a_carried_effort_never_outlives_its_model() {
     );
 }
 
-/// A rung names a bare model, so a pick of the old thread's model keeps the
-/// old thread's exact id. A `[1m]` variant is part of the prompt cache's key,
-/// so dropping it starts the successor cold.
 #[test]
 fn a_pick_of_the_same_model_keeps_its_context_variant() {
     for (old_model, pick) in [
@@ -166,7 +154,6 @@ fn a_pick_of_the_same_model_keeps_its_context_variant() {
     }
 }
 
-/// The old thread's variant never rescues a pick the backend does not offer.
 #[test]
 fn an_unoffered_spelling_of_the_same_model_is_still_refused() {
     let old = implementer(
@@ -179,7 +166,6 @@ fn an_unoffered_spelling_of_the_same_model_is_still_refused() {
     assert!(refusal.contains("not offered"), "{refusal}");
 }
 
-/// A pick that names a variant, or another model, runs as written.
 #[test]
 fn a_pick_naming_a_variant_or_another_model_runs_as_written() {
     let bare = implementer(
@@ -339,8 +325,6 @@ mod db {
         seed_handoff(bus, old, parent).await
     }
 
-    /// ADR 0560: a successor session keeps the thread and its branch, so an
-    /// integrated sub-thread hands off like any other coding-agent thread.
     #[tokio::test]
     async fn an_integrated_sub_thread_can_hand_off() {
         let (pool, db) = setup_test_db().await;
@@ -361,8 +345,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I16, I17: one event links both threads, durably, and a successor
-    /// shares its old thread's family root, so it runs in the same trial arm.
     #[tokio::test]
     async fn a_successor_links_both_ways_and_shares_the_family_root() {
         let (pool, db) = setup_test_db().await;
@@ -404,8 +386,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I14: a child that handed off owes its parent nothing, and new work on
-    /// it re-arms no report. Its successor reports in its place.
     #[tokio::test]
     async fn a_child_that_handed_off_owes_its_parent_no_report() {
         let (pool, db) = setup_test_db().await;
@@ -440,8 +420,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I15: the old thread's turn ends propose nothing: its work rides on the
-    /// successor's branch. The hold answers before any git or marker read.
     #[tokio::test]
     async fn the_old_threads_work_is_held_as_carried() {
         let (pool, db) = setup_test_db().await;
@@ -476,8 +454,6 @@ mod db {
         .unwrap();
     }
 
-    /// I9: the size is the latest capture of the thread's own turn. A
-    /// sub-agent's call and an auxiliary call on the thread do not count.
     #[tokio::test]
     async fn the_context_size_is_the_latest_turn_capture() {
         let (pool, db) = setup_test_db().await;
@@ -521,8 +497,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A thread that already handed off is offered no second handoff at any
-    /// size, and the reading says whether the thread has an applied change.
     #[tokio::test]
     async fn the_reading_offers_nothing_after_a_handoff_and_reports_an_apply() {
         let (pool, db) = setup_test_db().await;
@@ -571,7 +545,6 @@ mod db {
         }
     }
 
-    /// A `SessionStarted` on `coding_agent` with `continuity`.
     fn session_started(
         thread: Uuid,
         coding_agent: CodingAgent,
@@ -657,7 +630,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// The successor session of `thread`'s pending handoff starts.
     async fn start_successor(bus: &EventBus, pool: &sqlx::PgPool, thread: Uuid) {
         let handoff = pending_handoff(pool, thread)
             .await
@@ -667,9 +639,6 @@ mod db {
         emit(bus, thread, event).await;
     }
 
-    /// A handoff is pending from its `SessionHandedOff` until its
-    /// successor session's `SessionStarted`. It records no
-    /// thread, and the reading offers no second handoff meanwhile.
     #[tokio::test]
     async fn a_handoff_is_pending_until_the_next_session_starts() {
         let (pool, db) = setup_test_db().await;
@@ -721,9 +690,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A standing pause holds a successor unless the owner wrote between the
-    /// pause and the handoff. A turn running when the pause landed, or an
-    /// engine message, never releases it.
     #[tokio::test]
     async fn a_pause_holds_a_successor_the_owner_did_not_drive() {
         let (pool, db) = setup_test_db().await;
@@ -778,10 +744,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A handoff the owner's Stop held when it landed waits for their next
-    /// input, as the turn path's `thread_is_stopped` gate does. Eligibility
-    /// agrees, so the projection never leaves the thread `running` for a start
-    /// that never runs.
     #[tokio::test]
     async fn a_stop_holds_a_successor_until_the_owner_resumes() {
         use crate::engine::thread_events::{emit_response_canceled, CancelCause, MessageOrigin};
@@ -883,8 +845,6 @@ mod db {
             crate::test_support::event_wait_started(Uuid::new_v4()),
         )
         .await;
-        // An Apply lifts the Stop but runs no turn, so it must not leave the
-        // thread owing a start nobody makes.
         let applied: ThreadEvent = serde_json::from_value(serde_json::json!({
             "type": "ChangeApplied",
             "actor": {"kind": "device", "device_id": "test-device"},
@@ -955,8 +915,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// The pending check names its own aliases, so it reads the right thread
-    /// under an outer `s` alias. Another thread's session never ends it.
     #[tokio::test]
     async fn another_threads_session_never_ends_a_pending_handoff() {
         let (pool, db) = setup_test_db().await;
@@ -1014,9 +972,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A user's Stop withdraws a pending handoff, and so does a successor
-    /// turn that failed before its session started. A follow-up that only
-    /// redirected the turn, or a failure of the turn that handed off, does not.
     #[tokio::test]
     async fn a_stop_or_a_failed_successor_turn_ends_a_pending_handoff() {
         let (pool, db) = setup_test_db().await;
@@ -1052,8 +1007,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I15: a person's *Return to the old session* ends a pending handoff, so
-    /// the next input resumes the old session. A later handoff stands again.
     #[tokio::test]
     async fn pending_handoff_ignores_a_withdrawn_one() {
         let (pool, db) = setup_test_db().await;
@@ -1074,8 +1027,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// The set form and the per-thread form of "pending" never disagree: one
-    /// thread per way a handoff ends, one left pending, one never handed off.
     #[tokio::test]
     async fn the_pending_set_matches_the_per_thread_predicate() {
         let (pool, db) = setup_test_db().await;
@@ -1133,9 +1084,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I3 (parent unchanged): a child whose handoff is pending owes no
-    /// decision and keeps its report armed. Its successor session owes both,
-    /// and reports once at the real end.
     #[tokio::test]
     async fn a_child_keeps_its_parents_wait_across_a_handoff() {
         use crate::engine::turn_end::wake_decision::WakeDuty;
@@ -1178,9 +1126,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// Backend at boundary: a mid-thread request for another backend is
-    /// ignored, a handoff naming Codex starts a Codex session, and that
-    /// session then holds the thread's backend.
     #[tokio::test]
     async fn a_handoff_is_the_only_place_the_backend_changes() {
         use crate::engine::session_claim::resolve_thread_coding_agent as backend;
@@ -1213,8 +1158,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// The narrative's sections are written once here. The CLI's `--help`
-    /// is a string the CLI crate cannot import, so this pins it.
     #[test]
     fn the_cli_help_names_every_narrative_section() {
         let help = include_str!("../../../lucidos-cli/src/successor.rs");
@@ -1226,8 +1169,6 @@ mod db {
         }
     }
 
-    /// The successor's fresh branch gets a copy of the old branch's plan
-    /// marker, and a marker it already holds is kept.
     #[tokio::test]
     async fn the_plan_marker_carries_to_the_successor_branch() {
         let (pool, db) = setup_test_db().await;
@@ -1269,8 +1210,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A compaction after the last capture is the size from then on: its
-    /// `post_tokens`, or unknown when Claude Code did not report one.
     #[tokio::test]
     async fn a_later_compaction_replaces_the_size() {
         let (pool, db) = setup_test_db().await;
@@ -1321,8 +1260,6 @@ mod db {
         .unwrap();
     }
 
-    /// I11: a compaction between captures lowers the reading, and the window
-    /// still comes from the capture before it.
     #[tokio::test]
     async fn session_reading_after_compaction_keeps_the_window() {
         let (pool, db) = setup_test_db().await;
@@ -1354,8 +1291,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I11: an unknown `post_tokens` is an unknown reading, and a capture
-    /// after the compaction is the reading again.
     #[tokio::test]
     async fn session_reading_unknown_post_tokens_then_a_capture_after_compaction() {
         let (pool, db) = setup_test_db().await;
@@ -1386,8 +1321,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A thread hands off once. A racing second handoff rolls its whole emit
-    /// back, so it leaves no second link and no second event.
     #[tokio::test]
     async fn a_second_handoff_is_refused_and_leaves_no_trace() {
         let (pool, db) = setup_test_db().await;
@@ -1423,8 +1356,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I3, I4: the request recorded at the tap is pending until the thread's
-    /// turn ends, and carries who typed it and the implementer they picked.
     #[tokio::test]
     async fn a_request_is_pending_until_the_turn_ends() {
         let (pool, db) = setup_test_db().await;
@@ -1487,7 +1418,6 @@ mod db {
         use super::*;
         use crate::engine::event_bus::SystemEvent;
 
-        /// A lane thread whose batch has started.
         async fn lane_thread(bus: &EventBus) -> (Uuid, Uuid) {
             let thread = coding_thread(bus, None).await;
             let batch_id = Uuid::new_v4();
@@ -1552,9 +1482,6 @@ mod db {
             }
         }
 
-        /// The incident: a lane thread handed off during its open batch, the
-        /// run resumed the old session, and the batch landed. No start may
-        /// replay that handoff into the closed lane thread.
         #[tokio::test]
         async fn a_closed_lane_thread_starts_no_engine_handoff() {
             let (pool, db) = setup_test_db().await;
@@ -1612,7 +1539,6 @@ mod db {
             teardown_test_db(&db).await;
         }
 
-        /// Owed human input still gets its answer: admission refuses it.
         #[tokio::test]
         async fn a_closed_lane_thread_still_starts_the_users_request() {
             let (pool, db) = setup_test_db().await;
@@ -1643,8 +1569,6 @@ mod db {
     }
 }
 
-/// One process: the successor session waits until the old session's run lets
-/// go of the thread, so two subprocesses never run in one thread.
 #[tokio::test]
 async fn the_successor_session_waits_for_the_old_run_to_let_go() {
     use crate::engine::types::AgentSession;
@@ -1683,8 +1607,6 @@ fn the_brief_says_why_and_how_to_rebuild() {
     assert!(failed.contains("could not resume"), "{failed}");
 }
 
-/// I3: a brief leaves the request to the first message, and with none the
-/// session is told to ask where to pick up.
 #[test]
 fn the_brief_asks_for_a_request_only_when_none_follows() {
     let id = Uuid::new_v4();
@@ -1694,8 +1616,6 @@ fn the_brief_asks_for_a_request_only_when_none_follows() {
     assert!(without.contains("end your first turn on an AskUserQuestion card"));
 }
 
-/// A session started at a checkpoint is told to skip it. A flow saying "run
-/// it at first entry" then does not send it back there.
 #[test]
 fn a_checkpoint_handoff_is_told_to_skip_that_checkpoint() {
     let opening = narrative_opening(Some("pre-harden"), "Next: review.");
@@ -1708,8 +1628,6 @@ fn a_checkpoint_handoff_is_told_to_skip_that_checkpoint() {
     assert!(!plain.contains("skip"), "{plain}");
 }
 
-/// The successor agent reads its opening, then the user's request, then any
-/// other input that started the session: each once.
 #[test]
 fn the_first_message_reads_the_opening_then_the_request_once() {
     let opening = "A fresh session starts here.\n\n# Next step\nReview.";
@@ -1735,8 +1653,6 @@ fn the_first_message_reads_the_opening_then_the_request_once() {
     assert!(both.ends_with("Also fix the drawer"), "{both}");
 }
 
-/// The partial index only serves a probe whose event types it lists, so the
-/// migration must name every type `HANDOFF_LIFECYCLE_EVENT_TYPES` does.
 #[test]
 fn the_handoff_lifecycle_index_lists_every_probed_event_type() {
     const MIGRATION: &str = include_str!(
@@ -1750,8 +1666,6 @@ fn the_handoff_lifecycle_index_lists_every_probed_event_type() {
     }
 }
 
-/// `pending_handoff_threads_sql` filters end events to the lifecycle types, so
-/// a type `ends_handoff_sql` adds must join the const too.
 #[test]
 fn every_handoff_ending_event_type_is_a_lifecycle_type() {
     let ends = crate::engine::handoff_sql::ends_handoff_sql("end_row", "handoff");
@@ -1769,9 +1683,6 @@ fn every_handoff_ending_event_type_is_a_lifecycle_type() {
     }
 }
 
-/// I6: the opening names what the previous session left running, so the
-/// successor waits for it rather than starting it again. Nothing running
-/// leaves the opening alone.
 #[test]
 fn opening_lists_running_work() {
     let opening = narrative_opening(None, "# Outcomes");
@@ -1794,8 +1705,6 @@ fn opening_lists_running_work() {
     }
 }
 
-/// A natural turn end waits for input; an interrupted turn carries on. A typed
-/// request is input. The cause follows the ceiling, then the checkpoint.
 #[test]
 fn a_ceiling_handoff_starts_on_the_next_input() {
     use crate::engine::thread_events::{HandoffCause as C, SessionStart as S};
@@ -1825,8 +1734,6 @@ fn a_ceiling_handoff_starts_on_the_next_input() {
     );
 }
 
-/// I5: boot and a free thread start every handoff by themselves except a
-/// next-input start. A row from before the field starts as it always did.
 #[test]
 fn boot_does_not_start_an_on_next_input_handoff() {
     let row = |extra: serde_json::Value| -> PendingHandoff {

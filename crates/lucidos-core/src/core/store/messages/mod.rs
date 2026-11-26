@@ -25,18 +25,11 @@ pub use {
 pub use {resume::collect_tool_pairs_chronological, resume::ResumeToolPair};
 
 impl EventStore {
-    /// Build session messages from `events`, with every change a child report
-    /// names read at its status now.
     pub async fn build_messages_now(&self, events: &[EventRow]) -> Vec<SessionMessage> {
         let statuses = self.reported_change_statuses(events).await;
         build_session_messages_with(events, &statuses)
     }
 
-    /// The status each change named by a child report in `events` has now.
-    /// An id with no row maps to `None`.
-    ///
-    /// An unreadable store yields an empty map, logged. Each report then reads
-    /// as the child left it.
     pub async fn reported_change_statuses(&self, events: &[EventRow]) -> ChangeStatuses {
         let ids = reported_change_ids(events);
         match crate::core::changes::current_statuses(&self.pool, &ids).await {
@@ -55,9 +48,6 @@ impl EventStore {
         }
     }
 
-    /// Get all messages for a specific request (for history time travel)
-    /// Get session messages as raw text. HTML conversion happens at the API layer.
-    /// Queries directly by request_id using the idx_events_request_id index.
     pub async fn get_request_messages_by_id(
         &self,
         request_event_id: &str,
@@ -77,7 +67,7 @@ impl EventStore {
         Ok(self.build_messages_now(&events).await)
     }
 
-    /// Get recent messages across all conversations, ordered chronologically (oldest first).
+    /// INVARIANT: Get recent messages across all conversations, ordered chronologically (oldest first).
     /// `limit` controls the number of recent **threads** scoped in, not raw events.
     ///
     /// Scopes by thread_id: selects the N threads whose most recent
@@ -149,15 +139,6 @@ impl EventStore {
     }
 }
 
-/// The set of event ids a `ContextDismissed` dropped from future resume context.
-///
-/// They came from the retired `dismiss_from_context` tool (ADR 0109), so no new
-/// ones are written and every row is historical. The resume helper consults
-/// this set to drop both `(ToolCalled, ToolResult)` pairs (matched on the
-/// `ToolCalled.id`) and `ChildThreadCompleted` blocks.
-///
-/// **A keep does not cancel one** (ADR 0109's amendment). A keep moves an
-/// item's clock, and a dismissal is a standing drop.
 pub(crate) fn collect_dismissed_event_ids(
     events: &[EventRow],
 ) -> std::collections::HashSet<String> {

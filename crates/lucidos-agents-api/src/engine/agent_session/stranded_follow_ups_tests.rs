@@ -16,7 +16,6 @@ impl Thread {
         self.emit_answering(event, None).await
     }
 
-    /// Emit `event` as part of the request `anchor` opened.
     async fn emit_answering(&self, event: ThreadEvent, anchor: Option<Uuid>) -> Uuid {
         self.bus
             .emit(BusEvent::Thread {
@@ -61,7 +60,6 @@ impl Thread {
         self.session_started_by(None).await;
     }
 
-    /// A cache keep-alive's session, opened by its hidden anchor.
     async fn keep_alive_session_started(&self) {
         let anchor = self
             .emit(ThreadEvent::PromptInjected {
@@ -148,7 +146,6 @@ impl Thread {
         .await
     }
 
-    /// An engine prompt with no starter event, as auto-harden sends.
     async fn engine_prompt_sent(&self, text: &str) -> Uuid {
         self.emit(ThreadEvent::CodingAgentPromptSent {
             text: text.into(),
@@ -177,7 +174,6 @@ impl Thread {
         .await
     }
 
-    /// The stranded follow-up for `input`, if a fresh session redelivers it.
     async fn stranded_one(&self, input: Uuid) -> Option<StrandedFollowUp> {
         stranded_follow_ups(
             self.bus.pool(),
@@ -200,7 +196,6 @@ impl Thread {
         .await;
     }
 
-    /// The stranded follow-ups a session starting with `first_prompt` sees.
     async fn stranded(&self, first_prompt: Uuid) -> Vec<Uuid> {
         stranded_follow_ups(
             self.bus.pool(),
@@ -232,8 +227,6 @@ where
     teardown_test_db(&db_name).await;
 }
 
-/// The reported order: the process takes the follow-up into its queue, dies,
-/// and the next session starts with an answer as its first prompt.
 #[tokio::test]
 async fn a_follow_up_the_previous_session_never_read_is_stranded() {
     with_thread(|thread| async move {
@@ -260,9 +253,6 @@ async fn a_follow_up_the_previous_session_never_read_is_stranded() {
     .await;
 }
 
-/// The reported failure: Postgres ended the check's connection, and the turn
-/// failed on "expected to read 5 bytes, got 0 bytes at EOF". The pool skips its
-/// health check, so the query, not the acquire, meets the dead connection.
 #[tokio::test]
 async fn a_connection_the_server_ended_is_retried_and_the_check_succeeds() {
     let (pool, db_name) = setup_test_db().await;
@@ -291,7 +281,6 @@ async fn a_connection_the_server_ended_is_retried_and_the_check_succeeds() {
         .await
         .unwrap();
     assert!(ended, "the test must end the pooled connection's backend");
-    // The backend exits after the signal, so wait for it to go.
     let mut gone = false;
     for _ in 0..200 {
         gone =
@@ -380,8 +369,6 @@ async fn an_engine_message_is_not_stranded() {
     .await;
 }
 
-/// Only the previous session's follow-ups come back. A message an older session
-/// lost belongs to a conversation that has moved on.
 #[tokio::test]
 async fn a_follow_up_an_older_session_lost_stays_where_it_is() {
     with_thread(|thread| async move {
@@ -394,8 +381,6 @@ async fn a_follow_up_an_older_session_lost_stays_where_it_is() {
     .await;
 }
 
-/// A cache keep-alive forwards nothing. Its beat every few minutes must not
-/// push the previous session's follow-up out of the window.
 #[tokio::test]
 async fn a_keep_alive_session_does_not_hide_the_follow_up() {
     with_thread(|thread| async move {
@@ -409,8 +394,6 @@ async fn a_keep_alive_session_does_not_hide_the_follow_up() {
     .await;
 }
 
-/// A redelivery the next process also died holding was forwarded in the
-/// previous session too, so it comes back again.
 #[tokio::test]
 async fn a_redelivery_lost_again_comes_back_again() {
     with_thread(|thread| async move {
@@ -424,8 +407,6 @@ async fn a_redelivery_lost_again_comes_back_again() {
     .await;
 }
 
-/// A message no `CodingAgentPromptSent` names was never forwarded, as on an
-/// engine from before reads were reported.
 #[tokio::test]
 async fn a_message_never_forwarded_is_not_stranded() {
     with_thread(|thread| async move {
@@ -436,8 +417,6 @@ async fn a_message_never_forwarded_is_not_stranded() {
     .await;
 }
 
-/// An effort restart discarded the first prompt. Any later session delivers it,
-/// even one that started after another session already began.
 #[tokio::test]
 async fn a_discarded_prompt_is_stranded_for_every_later_session() {
     with_thread(|thread| async move {
@@ -450,7 +429,6 @@ async fn a_discarded_prompt_is_stranded_for_every_later_session() {
     .await;
 }
 
-/// The agent read the discarded prompt, so the discard is closed.
 #[tokio::test]
 async fn a_discarded_prompt_the_agent_read_later_is_not_stranded() {
     with_thread(|thread| async move {
@@ -463,7 +441,6 @@ async fn a_discarded_prompt_the_agent_read_later_is_not_stranded() {
     .await;
 }
 
-/// A discarded prompt the user took back is never redelivered.
 #[tokio::test]
 async fn a_discarded_prompt_the_user_removed_is_not_stranded() {
     with_thread(|thread| async move {
@@ -476,8 +453,6 @@ async fn a_discarded_prompt_the_user_removed_is_not_stranded() {
     .await;
 }
 
-/// A parent whose effort pick discarded its child's wake still learns the
-/// child finished: the next session redelivers the completion card.
 #[tokio::test]
 async fn a_discarded_child_wake_is_stranded_with_its_card() {
     with_thread(|thread| async move {
@@ -544,7 +519,6 @@ async fn a_discarded_nudge_is_stranded_with_its_text() {
     .await;
 }
 
-/// An engine coding turn's message is the only prompt its session opened for.
 #[tokio::test]
 async fn a_discarded_engine_message_is_stranded() {
     with_thread(|thread| async move {
@@ -560,7 +534,6 @@ async fn a_discarded_engine_message_is_stranded() {
     .await;
 }
 
-/// Every owed kind drops out once some session's agent read it.
 #[tokio::test]
 async fn a_discarded_input_of_any_kind_the_agent_read_is_not_stranded() {
     with_thread(|thread| async move {
@@ -584,7 +557,6 @@ async fn a_discarded_input_of_any_kind_the_agent_read_is_not_stranded() {
     .await;
 }
 
-/// A later resume sends its own nudge, and a keep-alive only warms the cache.
 #[tokio::test]
 async fn a_discarded_continuation_or_keep_alive_is_never_owed() {
     with_thread(|thread| async move {
@@ -600,7 +572,6 @@ async fn a_discarded_continuation_or_keep_alive_is_never_owed() {
     .await;
 }
 
-/// The starting session sends its own first prompt, so it does not send it twice.
 #[tokio::test]
 async fn the_first_prompt_is_not_redelivered() {
     with_thread(|thread| async move {
@@ -642,7 +613,6 @@ fn the_note_says_the_message_is_late_and_when_it_was_sent() {
     );
 }
 
-/// A wrong author would mislead the agent about whose request it is.
 #[test]
 fn the_note_names_who_sent_the_input() {
     let note = |input| late_delivery_note(input, Utc::now());
@@ -669,8 +639,6 @@ fn the_note_names_who_sent_the_input() {
     assert!(note(RedeliveredInput::ChildReport).contains("child thread's report below"));
 }
 
-/// Only a message writes a prompt row: a wake or an engine prompt already
-/// renders as its own event.
 #[test]
 fn only_a_redelivered_message_writes_a_prompt_row() {
     let redelivered = |input| AgentInputKind::Redelivered {
@@ -688,7 +656,6 @@ fn only_a_redelivered_message_writes_a_prompt_row() {
     assert!(!redelivered(RedeliveredInput::EnginePrompt).writes_prompt_sent());
 }
 
-/// A wake is no user's message, so no device block is held for it.
 #[test]
 fn a_redelivered_wake_has_no_user_origin() {
     let origin = Uuid::new_v4();
@@ -721,10 +688,6 @@ fn stranded_message(text: &str) -> StrandedFollowUp {
     }
 }
 
-/// The redelivery is its own input on the session's channel, named by the
-/// original message, ahead of a follow-up sent during the startup. It is
-/// marked unforwarded before it enters the channel, so a withdraw in between
-/// waits for its forward instead of overtaking it.
 #[tokio::test]
 async fn a_redelivery_is_queued_as_its_own_input_ahead_of_startup_input() {
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();

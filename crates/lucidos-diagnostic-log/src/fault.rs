@@ -1,5 +1,3 @@
-//! Closed internal-fault vocabulary and a bounded, crash-safe workspace inbox.
-//! The inbox contains no messages, paths or error text. Only EventBus consumes it.
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -36,15 +34,11 @@ impl FaultKind {
     }
 }
 
-/// The shell supervisor encodes a signal as 128 + signal number. Native
-/// callers must preserve the distinction with [`is_internal_engine_status`].
 pub fn is_internal_engine_exit(code: i32) -> bool {
     is_internal_engine_status(Some(code), None)
         || (code >= 128 && is_internal_engine_status(None, Some(code - 128)))
 }
 
-/// A returned error may be an external failure. Only a Rust panic exit or a
-/// fatal signal is internal; normal Stop/switch signals are excluded.
 pub fn is_internal_engine_status(code: Option<i32>, signal: Option<i32>) -> bool {
     code == Some(101)
         || signal.is_some_and(|signal| {
@@ -67,8 +61,6 @@ impl Inbox {
         Self(workspace.join(".lucidos/internal-faults"))
     }
 
-    /// First signal per kind wins until consumed. Publish only complete files;
-    /// a fatal panic can then return without relying on an async runtime.
     pub fn record(&self, kind: FaultKind) -> io::Result<()> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         std::fs::DirBuilder::new()
@@ -94,7 +86,6 @@ impl Inbox {
                 Err(e) => Err(e),
             }
         })();
-        // The unpublished temporary file is owned by this call alone.
         let cleanup = std::fs::remove_file(temp);
         result.and(cleanup)
     }
@@ -111,7 +102,6 @@ impl Inbox {
         Ok(pending)
     }
 
-    /// Only the engine's single drain worker acknowledges, after durable emit.
     pub fn acknowledge(&self, kind: FaultKind) -> io::Result<()> {
         std::fs::remove_file(self.0.join(kind.as_str()))
     }

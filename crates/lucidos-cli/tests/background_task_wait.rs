@@ -1,14 +1,8 @@
-//! Integration tests: `lucidos background-task wait` asks the engine's wait
-//! route for the calling thread, forwards `--max-secs`, and prints the answer.
-//! `run --poll` sends `poll: true`.
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 type Seen = Arc<Mutex<Vec<String>>>;
 
-/// An engine stand-in that records each request's path, query and body, and
-/// answers the wait route as a still-running task.
 async fn start_engine_stub() -> (u16, Seen) {
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
     let wait_seen = seen.clone();
@@ -51,8 +45,6 @@ fn write_ports_file(dir: &Path, port: u16) {
     .unwrap();
 }
 
-/// Runs the CLI with a cleared environment. A session's own
-/// `LUCIDOS_API_BASE_URL` would otherwise aim it at a real engine.
 fn run_cli(ws: &Path, thread_id: &str, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_lucidos"))
         .args(args)
@@ -66,8 +58,6 @@ fn run_cli(ws: &Path, thread_id: &str, args: &[&str]) -> std::process::Output {
         .expect("spawn cli")
 }
 
-// Multi-thread runtime: the CLI call blocks this thread while the stub needs
-// a worker of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_asks_the_threads_wait_route_and_prints_the_answer() {
     let (port, seen) = start_engine_stub().await;

@@ -1,5 +1,3 @@
-//! Source-string detection + `short_source` + archive-entry validation tests.
-
 use super::helpers::build_archive;
 use super::source::Source;
 use super::*;
@@ -83,7 +81,6 @@ fn short_source_strips_https_and_git_suffix() {
 
 #[test]
 fn validate_archive_entry_path_is_used() {
-    // Smoke: the public function in core::plugins still rejects ../.
     assert!(validate_archive_entry_path("a/../b").is_err());
 }
 
@@ -92,7 +89,6 @@ fn extract_zip_rejects_conflicting_header_names() {
     let tmp = tempfile::tempdir().unwrap();
     let archive = build_archive(tmp.path(), "conflict.zip", "manifest", &[]);
     let mut bytes = std::fs::read(&archive).unwrap();
-    // Keep the central directory name intact but give the local header another name.
     let name_offset = 30;
     bytes[name_offset..name_offset + "manifest.toml".len()].copy_from_slice(b"disguise.toml");
     std::fs::write(&archive, bytes).unwrap();

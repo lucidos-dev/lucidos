@@ -30,28 +30,15 @@ pub struct InstalledPluginSummary {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// The Lucidos Agent setup thread spawned at install time, when the plugin
-    /// shipped `setup` instructions. Recorded in the `PluginInstalled` payload;
-    /// drives the Plugins panel card's Setup→Open button across reloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_thread_id: Option<String>,
-    /// The plugin's primary app (`data/apps/<id>/`), if it installs one. The
-    /// card's "Open" button launches it; plugins with no app have `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
-    /// Content-dir kinds this plugin shipped (`apps`/`knowhow`/`triggers`/
-    /// `scripts`/`auth-modules`), derived from its recorded `files`. Drives the
-    /// content chips on the Plugins → Installed row. Empty for legacy records
-    /// whose `PluginInstalled` payload didn't list files.
     #[serde(default)]
     pub content: Vec<String>,
-    /// Every `data/`-relative path the plugin installed, from the
-    /// `PluginInstalled` payload. Lets Plugins → Installed link straight to each
-    /// shipped file (open the app, preview the knowhow/script). Empty for legacy
-    /// records that didn't list files.
     #[serde(default)]
     pub files: Vec<String>,
-    /// True when the plugin's shipped content currently differs from what it
+    /// INVARIANT: True when the plugin's shipped content currently differs from what it
     /// installed — i.e. the user (or the Lucidos Agent / a coding-agent thread)
     /// has locally edited an app/knowhow/script/trigger the plugin owns. Derived
     /// on read by diffing the current content against the install commit (see
@@ -60,17 +47,10 @@ pub struct InstalledPluginSummary {
     /// plugin is updated. Drives the Plugins-list "Modified" badge.
     #[serde(default)]
     pub modified: bool,
-    /// The `data/`-relative paths that currently differ from the install commit
-    /// (the badge tooltip; also the breadcrumb for a future "keep your patch" /
-    /// "propose upstream" flow). Empty when `modified` is false.
     #[serde(default)]
     pub modified_paths: Vec<String>,
-    /// The installed version's `engine` requirement as authored. `None` means
-    /// its manifest declares none, which the Plugins panel shows as a chip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_requirement: Option<String>,
-    /// The installed copy of its *plugin media*. Empty for a plugin installed
-    /// before media existed, until its next update.
     pub media: PluginMedia,
 }
 
@@ -82,7 +62,7 @@ pub enum MarketplacePluginStatus {
     UpdateAvailable,
 }
 
-/// One installable plugin, as a scan found it.
+/// INVARIANT: One installable plugin, as a scan found it.
 ///
 /// `Deserialize` is here for the *plugin catalog cache*
 /// (`core::plugin_catalog_cache`), which reads back what a scan wrote. Every
@@ -99,53 +79,28 @@ pub struct MarketplacePlugin {
     pub source: String,
     pub manifest: serde_json::Value,
     pub content: Vec<String>,
-    /// Topical categories (the *controlled vocabulary* — see
-    /// `crate::core::plugins::PLUGIN_CATEGORIES`). Only recognised values appear
-    /// here; an author's unknown tag is dropped and reported in `errors`. Drives
-    /// the Store tab's category filter/chips.
     #[serde(default)]
     pub categories: Vec<String>,
     pub files_count: usize,
     pub status: MarketplacePluginStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
-    /// Setup thread spawned for this plugin at install (installed plugins that
-    /// shipped a `setup` field only). The card's "Setup" button opens it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_thread_id: Option<String>,
-    /// True once the setup thread has finished (no longer running or waiting on
-    /// the user) — flips the card button from "Setup" to "Open". Filled by the
-    /// catalog handler from thread state; always `false` for available plugins
-    /// and for installs that spawned no setup thread.
     #[serde(default)]
     pub setup_complete: bool,
-    /// The plugin's primary app (`data/apps/<id>/`), if it ships one. The card's
-    /// "Open" button launches it; `None` → nothing to open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
-    /// True when the user has locally modified the plugin's shipped content since
-    /// install — overlaid from the matching installed summary. Always false for an
-    /// available (not-installed) catalog row. Drives the Plugins-list "Modified"
-    /// badge and the "your changes will be overwritten" update warning.
     #[serde(default)]
     pub modified: bool,
-    /// The `data/`-relative paths that currently differ from the install commit
-    /// (the badge tooltip). Empty unless `modified`.
     #[serde(default)]
     pub modified_paths: Vec<String>,
-    /// The manifest's `engine` requirement as the author wrote it. `None` means
-    /// the manifest declares none, which the Plugins panel shows as a chip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_requirement: Option<String>,
-    /// False when this Lucidos cannot install this version. Drives the disabled
-    /// Install or Update button; never blocks a plugin already installed.
     #[serde(default)]
     pub engine_compatible: bool,
-    /// Why not, in the user's words ("Needs Lucidos 0.46.1 or later"). Set
-    /// only when `engine_compatible` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_incompatible_reason: Option<String>,
-    /// The scan's cached copy of this version's *plugin media*.
     #[serde(default)]
     pub media: PluginMedia,
 }
@@ -240,11 +195,6 @@ pub fn remove_marketplace(registry: &mut PluginMarketplaceRegistry, id: &str) ->
     before != registry.marketplaces.len()
 }
 
-/// Every URL a scan of `registry` would clone.
-///
-/// The scan is synchronous, so a caller resolves credentials for these before
-/// handing the work to `spawn_blocking`. A source that does not parse is left
-/// out: the scan reports that error itself.
 pub fn clone_urls(registry: &PluginMarketplaceRegistry) -> Vec<String> {
     registry
         .marketplaces
@@ -299,7 +249,7 @@ pub fn scan_catalog(
     }
 }
 
-/// Drop the catalog media this catalog no longer needs. Call it only when the
+/// INVARIANT: Drop the catalog media this catalog no longer needs. Call it only when the
 /// catalog is published: a scan that lost its slot would prune the media of
 /// the scan that replaced it. A marketplace with no rows failed its scan, so
 /// it keeps what it had.
@@ -318,7 +268,7 @@ pub fn prune_media_for(workspace_path: &Path, catalog: &MarketplaceCatalog) {
     plugin_media::prune_cache(workspace_path, &registered, &scanned, &keep);
 }
 
-/// Stamp one catalog row with what is installed on this workspace right now.
+/// INVARIANT: Stamp one catalog row with what is installed on this workspace right now.
 ///
 /// Every install-derived field is set here and nowhere else. So a scan and a
 /// re-served cache cannot disagree about whether a plugin is installed. That
@@ -348,8 +298,6 @@ pub fn apply_installed_state(
         .unwrap_or_default();
 }
 
-/// Re-stamp a whole catalog against the installed list, for a caller serving
-/// cached rows. See [`apply_installed_state`] for why this is not optional.
 pub fn apply_installed_state_to_catalog(
     catalog: &mut MarketplaceCatalog,
     installed: &[InstalledPluginSummary],
@@ -361,7 +309,7 @@ pub fn apply_installed_state_to_catalog(
     }
 }
 
-/// Stamp one catalog row with whether the running release can install it.
+/// INVARIANT: Stamp one catalog row with whether the running release can install it.
 ///
 /// Set on serve rather than stored by the scan: the *plugin catalog cache*
 /// can outlive an engine upgrade, and a stored verdict would go stale.
@@ -376,7 +324,6 @@ pub fn apply_engine_compatibility(
     plugin.engine_incompatible_reason = mismatch.map(|m| m.short_reason());
 }
 
-/// [`apply_engine_compatibility`] over a whole catalog.
 pub fn apply_engine_compatibility_to_catalog(
     catalog: &mut MarketplaceCatalog,
     running: &Result<semver::Version, String>,
@@ -386,7 +333,7 @@ pub fn apply_engine_compatibility_to_catalog(
     }
 }
 
-/// The newest installable update per installed plugin. A version the running
+/// INVARIANT: The newest installable update per installed plugin. A version the running
 /// release cannot install is left out, so nobody is told to take an update
 /// they cannot take. It counts as new again once Lucidos meets its requirement.
 pub fn update_candidates(
@@ -425,11 +372,7 @@ fn scan_one_marketplace(
         drop(scratch);
         return Err("no plugin manifest.toml files found".to_string());
     }
-    // Per-plugin non-blocking warnings (e.g. unknown categories): the plugin
-    // still lists, the warning surfaces in the catalog's `errors`.
     let mut warnings: Vec<MarketplaceScanError> = Vec::new();
-    // Why each invalid plugin was skipped. With no valid plugin at all, the
-    // warnings are dropped, so the marketplace error carries these instead.
     let mut invalid: Vec<String> = Vec::new();
 
     let mut out = Vec::new();
@@ -450,8 +393,6 @@ fn scan_one_marketplace(
                     rel,
                     e
                 );
-                // Named in the catalog's errors too, so an author sees why
-                // their plugin does not list.
                 let reason = format!("plugin at '{}' is not valid: {}", display_root(&rel), e);
                 warnings.push(MarketplaceScanError {
                     marketplace_id: marketplace.id.clone(),
@@ -508,18 +449,15 @@ fn scan_one_marketplace(
             content,
             categories,
             files_count: planned.len(),
-            // Every install-derived field is filled by the one overlay below,
+            // INVARIANT: Every install-derived field is filled by the one overlay below,
             // so a served catalog and a fresh scan cannot disagree.
             status: MarketplacePluginStatus::Available,
             installed_version: None,
             setup_thread_id: None,
-            // Completion is a thread-state lookup the pure scan can't do; the
-            // catalog handler fills it in after the scan returns.
             setup_complete: false,
             app_id: None,
             modified: false,
             modified_paths: Vec::new(),
-            // Filled on serve by `apply_engine_compatibility`, never stored.
             engine_requirement: None,
             engine_compatible: false,
             engine_incompatible_reason: None,
@@ -543,7 +481,6 @@ fn scan_one_marketplace(
     Ok((out, warnings))
 }
 
-/// A plugin root for a message: the repo root reads as `.`.
 fn display_root(rel: &str) -> &str {
     if rel.is_empty() {
         "."
@@ -552,9 +489,6 @@ fn display_root(rel: &str) -> &str {
     }
 }
 
-/// Keep one scanned plugin version's media in the catalog cache, and answer
-/// the URLs a row draws. A copy that cannot be written leaves the row without
-/// media, and says why in its problems.
 fn cache_media(
     workspace_path: &Path,
     plugin: &MarketplacePlugin,
@@ -745,7 +679,7 @@ fn find_manifest_roots(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 
-/// Never follows a symlink, so the walk and every manifest it finds stay
+/// INVARIANT: Never follows a symlink, so the walk and every manifest it finds stay
 /// inside the cloned repo. A repo can commit a link to any host path.
 fn collect_manifest_roots(
     root: &Path,
@@ -854,7 +788,7 @@ fn canonical_source_key(source: &MarketplaceSource) -> String {
     }
 }
 
-/// The id slug reads the repo segment alone, never the display name, so a
+/// INVARIANT: The id slug reads the repo segment alone, never the display name, so a
 /// change to how marketplaces are named never changes an existing id.
 fn slug_for_source(source: &str) -> String {
     let label = id_repo_segment(source.trim());
@@ -894,8 +828,6 @@ fn id_repo_segment(source: &str) -> String {
         .to_string()
 }
 
-/// Owner plus repo, so `acme/lucidos-plugins` and `globex/lucidos-plugins` read
-/// apart. The repo drops the word "lucidos" and any word the owner already says.
 fn display_name_for_source(source: &str) -> String {
     let (owner, repo) = owner_and_repo(source);
     let owner_words: Vec<String> = owner

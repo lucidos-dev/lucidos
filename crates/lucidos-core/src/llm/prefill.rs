@@ -1,31 +1,15 @@
-//! A *prefill beat*'s request (ADR 0556). It sends the start of a thread's
-//! last model request again. The provider reads it from the prompt cache. A
-//! Messages beat hangs up before the model answers, and an OpenAI beat caps
-//! its output.
-//!
-//! A provider that can prefill hands back a [`PrefillPair`] with each reply.
-//! The cache keep-alive remembers the pair and later sends one of its bodies
-//! through [`crate::llm::LlmProvider::prefill`].
-
 use crate::llm::model_registry::ProviderKind;
 use crate::llm::provider::LlmResponse;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The two cuts of one request a beat can send.
 #[derive(Clone, Debug)]
 pub struct PrefillPair {
-    /// Through the last cache marker of the *stable prefix*: what the next
-    /// turn sends again, for a turn-end wait.
     pub stable: PrefillBody,
-    /// The whole request, for a wait on the thread's own question card,
-    /// where the answer extends this very request.
     pub whole: PrefillBody,
 }
 
 impl PrefillPair {
-    /// Stamp both bodies with the backend that served the turn and the model
-    /// the turn resolved to. Only the router knows either.
     pub(crate) fn routed(&mut self, provider: ProviderKind, model: &str) {
         for body in [&mut self.stable, &mut self.whole] {
             body.provider = Some(provider);
@@ -34,55 +18,35 @@ impl PrefillPair {
     }
 }
 
-/// One request body a beat sends, as the provider's own wire bytes.
 #[derive(Clone)]
 pub struct PrefillBody {
-    /// The backend that served the turn. `None` from a provider called
-    /// outside the router, which then has nowhere to send the beat.
     pub provider: Option<ProviderKind>,
-    /// The model the beat's cost is recorded under.
     pub model: String,
-    /// The effort the turn went out at, for the cost record.
     pub reasoning_effort: Option<String>,
-    /// The stable prefix this cut actually sends, when its wire supports it.
     pub stable_prefix_fingerprint: Option<String>,
-    /// The most output tokens this body allows. A beat that reports more
-    /// was not a prefill (ADR 0556, the first-beat guard). `None` for a beat
-    /// that hangs up before the model answers, whose usage block says nothing
-    /// of its output.
     pub output_cap: Option<u32>,
-    /// How the provider answers this body.
     pub(crate) reply: ReplyShape,
-    /// The model id the leaf provider was asked for, which it resolves
-    /// again on send.
     pub(crate) wire_model: String,
-    /// The betas the turn sent as the `anthropic-beta` header.
     pub(crate) betas: Vec<&'static str>,
     pub(crate) body: bytes::Bytes,
 }
 
-/// How a provider answers a beat, which decides what [`send`] reads.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ReplyShape {
-    /// One JSON reply, read whole.
     Json,
-    /// A stream, read up to `message_start`, then dropped.
     MessageStart,
 }
 
-/// What a wire adds to the turn's request to make its beat.
 pub(crate) struct BeatShape {
     pub(crate) output_cap: Option<u32>,
     pub(crate) reply: ReplyShape,
-    /// A content part appended after the last marker of both cuts, so it is
+    /// INVARIANT: A content part appended after the last marker of both cuts, so it is
     /// part of no cache key. It goes to the last item, which must be the
     /// user's.
     pub(crate) closing_part: Option<serde_json::Value>,
 }
 
 impl BeatShape {
-    /// A request recast to answer one JSON reply of at most `output_cap`
-    /// tokens, with nothing added to it.
     pub(crate) fn json_reply(output_cap: u32) -> Self {
         Self {
             output_cap: Some(output_cap),
@@ -109,13 +73,11 @@ impl PrefillBody {
         }
     }
 
-    /// The size of what a beat sends, for its cost record.
     pub fn request_chars(&self) -> usize {
         self.body.len()
     }
 }
 
-/// Never the body: it holds the whole conversation.
 impl std::fmt::Debug for PrefillBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefillBody")
@@ -127,31 +89,21 @@ impl std::fmt::Debug for PrefillBody {
     }
 }
 
-/// What the turn asked its leaf provider for, carried into both bodies.
 pub(crate) struct TurnRoute<'a> {
     pub(crate) wire_model: &'a str,
     pub(crate) reasoning_effort: Option<&'a str>,
     pub(crate) betas: &'a [&'static str],
 }
 
-/// Where a stable cut ends, in the request's list of messages or items.
 #[derive(Debug, PartialEq)]
 pub(crate) enum StableEnd {
-    /// After content part `part` of item `item`: the last marked part of the
-    /// stable prefix, where the turn wrote an entry.
     Part { item: usize, part: usize },
-    /// After the first `keep` items, then one unmarked user message of a
-    /// single character, which a closing part may follow. A request refuses
-    /// an empty list, and the character sits after the last marker, so it is
-    /// billed as plain input.
     Placeholder { keep: usize },
 }
 
-/// One item of the list a stable cut shortens: a message or an input item.
 pub(crate) trait CutItem {
     fn role(&self) -> Option<&str>;
     fn content_mut(&mut self) -> Option<&mut serde_json::Value>;
-    /// An unmarked user message of a single character.
     fn placeholder() -> Self;
 }
 
@@ -169,12 +121,6 @@ impl CutItem for serde_json::Value {
     }
 }
 
-/// The pair a beat on `request` sends. `request` is the turn's request in
-/// the form `shape` asks for, and `items` finds the list a stable cut
-/// shortens to `end`.
-///
-/// Each body serializes `request`'s own type, so it keeps the turn's byte
-/// order. A gateway may route on the raw bytes (ADR 0581).
 pub(crate) fn pair_of<R, I>(
     request: &R,
     items: impl Fn(&mut R) -> Option<&mut Vec<I>>,
@@ -234,8 +180,6 @@ fn cut<I: CutItem>(items: &mut Vec<I>, end: StableEnd) {
     }
 }
 
-/// Append `part` to the last item's content, which must be the user's. A
-/// string content becomes a list of text parts first. `None` otherwise.
 fn append_part<I: CutItem>(items: &mut [I], part: &serde_json::Value) -> Option<()> {
     let last = items.last_mut()?;
     if last.role() != Some("user") {
@@ -251,9 +195,6 @@ fn append_part<I: CutItem>(items: &mut [I], part: &serde_json::Value) -> Option<
     Some(())
 }
 
-/// What a beat cost, from the usage block of its reply or of its
-/// `message_start` message. One with no usage block is a failed beat:
-/// nothing says what it read.
 pub(crate) fn reply_usage(reply: &serde_json::Value) -> Result<LlmResponse, BoxError> {
     let usage = crate::llm::usage_wire::from_json(reply)
         .ok_or("the prefill reply carried no usage block")?;
@@ -266,11 +207,9 @@ pub(crate) fn reply_usage(reply: &serde_json::Value) -> Result<LlmResponse, BoxE
     })
 }
 
-/// The longest a beat may take. A prefill answers in seconds, and a beat is
-/// worth nothing once its window has passed.
 const PREFILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Send one prefill, once. A refused beat is not retried: the next tick
+/// INVARIANT: Send one prefill, once. A refused beat is not retried: the next tick
 /// decides afresh. `label` names the provider in the error.
 ///
 /// A [`ReplyShape::MessageStart`] beat streams like the turn did. This reads
@@ -327,8 +266,6 @@ pub(crate) async fn send(
     reply_usage(&message)
 }
 
-/// The `message` of the stream's `message_start` event. An `error` event
-/// first, or a stream that ends without one, is a failed beat.
 async fn message_start(response: reqwest::Response) -> Result<serde_json::Value, BoxError> {
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
@@ -352,9 +289,6 @@ async fn message_start(response: reqwest::Response) -> Result<serde_json::Value,
     Err("the prefill stream ended before message_start".into())
 }
 
-/// A provider that refused a prefill outright, with a 4xx other than a
-/// timeout or a rate limit. The first-beat guard marks such a provider
-/// unable to prefill, so it is its own type (ADR 0556).
 #[derive(Debug)]
 pub struct PrefillRefused {
     message: String,
@@ -378,7 +312,6 @@ impl std::fmt::Display for PrefillRefused {
 
 impl std::error::Error for PrefillRefused {}
 
-/// The error a provider that cannot prefill answers with.
 pub(crate) fn cannot_prefill(provider: Option<ProviderKind>) -> BoxError {
     match provider {
         Some(kind) => format!("{} cannot prefill a request", kind.as_str()).into(),
@@ -452,7 +385,6 @@ mod tests {
         assert_eq!(beat.served_model.as_deref(), Some("claude-opus-5-5"));
     }
 
-    /// A keep-alive beat that writes the cache keeps the write's lifetime.
     #[test]
     fn a_beat_keeps_the_write_split() {
         let reply = serde_json::json!({
@@ -501,7 +433,6 @@ mod tests {
         }
     }
 
-    /// Serve `chunks` as one SSE response, then keep the connection open.
     async fn serve_then_stall(chunks: Vec<&'static str>) -> String {
         use futures::StreamExt;
         let app = axum::Router::new().route(
@@ -529,8 +460,6 @@ mod tests {
         send(reqwest::Client::new().post(url), &streamed_body(), "Test").await
     }
 
-    /// The beat returns at `message_start` while the model's answer is still
-    /// streaming: it never reads a content block.
     #[tokio::test]
     async fn a_beat_hangs_up_at_message_start() {
         let url = serve_then_stall(vec!["event: ping\ndata: {\"type\":\"ping\"}\n\n", START]).await;

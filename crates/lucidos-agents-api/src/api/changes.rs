@@ -9,15 +9,6 @@ use crate::engine::LaneRemoval;
 use crate::engine::{ApplyResult, ApplyStatus};
 use axum::http::HeaderMap;
 
-/// Refuse a change verb this caller has no authority for (ADR 0168 clause 4).
-///
-/// The change's own thread is the target: applying a change acts on the thread
-/// that proposed it, so a parent applying its child's work stays in-subtree.
-///
-/// A change id naming nothing falls through. The engine's own "Change not
-/// found" is the honest answer, and a gate here would leak whether the id
-/// exists. A change naming no thread sits in nobody's subtree, so it takes the
-/// owner's standing instruction.
 async fn refuse_change_verb(
     state: &AppState,
     headers: &HeaderMap,
@@ -36,14 +27,6 @@ async fn refuse_change_verb(
     Ok(refuse_without_authority(&state.engine.event_bus, headers, thread_id, verb).await?)
 }
 
-/// The same gate for a batch, whose target is every change it will touch.
-///
-/// A thread caller passes only when every member sits in its own subtree, which
-/// is clause 3 applied member by member. The first member outside it needs the
-/// owner's standing instruction, exactly as a single change would.
-///
-/// Gated on the FILTERED list, the one the batch actually applies, so the
-/// authority question covers what happens rather than what was proposed.
 async fn refuse_batch_change_verb(
     state: &AppState,
     headers: &HeaderMap,
@@ -56,7 +39,6 @@ async fn refuse_batch_change_verb(
     Ok(())
 }
 
-/// GET /api/v1/changes — list pending + applied changes with pagination for applied
 pub(super) async fn list_changes(
     State(state): State<AppState>,
     Query(query): Query<ChangesListQuery>,
@@ -64,7 +46,6 @@ pub(super) async fn list_changes(
     read_changes(&state, &query).await.map(Json)
 }
 
-/// How many applied changes `GET /api/v1/changes` lists without a `limit`.
 pub(super) const CHANGES_DEFAULT_LIMIT: i64 = 15;
 
 pub(super) async fn read_changes(
@@ -76,7 +57,7 @@ pub(super) async fn read_changes(
 
     let pool = state.engine.pool();
     let proj = state.engine.changes();
-    // Fetch limit+1 on applied to detect has_more. The durable `apply_all_batches`
+    // INVARIANT: Fetch limit+1 on applied to detect has_more. The durable `apply_all_batches`
     // mirror holds a row only while a batch is in flight (inserted on start,
     // deleted on complete/cancel/recovery), so its non-emptiness is the
     // cross-reload truth for the "Applying changes…" toast — the driving
@@ -141,26 +122,14 @@ pub(super) async fn read_changes(
         "client_update_available": client_update,
         "has_more_applied": has_more_applied,
         "apply_all_in_progress": apply_all_in_progress,
-        // Which member is in flight and how far the batch got, so a reload
-        // keeps "thread N of M". Null while startup recovery has yet to
-        // re-seed the registry, even when `apply_all_in_progress` is true.
         "apply_all_batch": state.engine.apply_all_batches.lock().await.snapshot(),
-        // The landing lane: its open lane batch with the batch's step, and the
-        // changes waiting for the next batch.
         "landing_lane": state.engine.landing_lane_snapshot(),
-        // The main check: idle, running, passed, red or unavailable (ADR 0464).
         "main_check": state.engine.main_check_snapshot(),
-        // Threads carrying a standing apply. Keyed by THREAD, not by change: a
-        // sweep arms a thread that has proposed nothing yet, and the prompt row
-        // still has to render its armed state.
         "standing_apply_thread_ids": state.engine.armed_standing_apply_threads(),
-        // How long hardening and conflict resolution usually take here, for
-        // the apply toasts. Each is null until enough runs exist.
         "apply_estimates": apply_estimates,
     }))
 }
 
-/// GET /api/v1/changes/applied — list recently applied changes with pagination
 pub(super) async fn list_applied_changes(
     State(state): State<AppState>,
     Query(query): Query<ChangesListQuery>,
@@ -186,14 +155,13 @@ pub(super) async fn list_applied_changes(
     ))
 }
 
-/// POST /api/v1/changes/:id/revert — revert an applied change
 pub(super) async fn revert_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Reverting an applied change is at least as destructive as discarding a
+    // INVARIANT: Reverting an applied change is at least as destructive as discarding a
     // pending one, so it takes the same subtree-reach gate its siblings do. The
     // change keeps its `thread_id` after applying, so `refuse_change_verb` scopes
     // revert to the change's own thread exactly like discard.
@@ -207,49 +175,15 @@ pub(super) async fn revert_change(
     }
 }
 
-/// Why a single-change action is refused right now. See
-/// [`change_action_refusal`], which owns the rule.
-///
-/// The three thread-state variants stay apart because only ONE of them can be
-/// waited out with a *standing apply*. `standing_verdict` waits through a
-/// *settling* thread, and drops on a parked one. Collapse the two
-/// and a surface points the caller at a control that ends the moment it is
-/// pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChangeActionRefusal {
-    /// A pending change whose branch left nothing to merge. Apply only.
     NoFilesLeft,
-    /// The thread is *settling*: running, paused, or watching an event. It will
-    /// settle by itself, and a *standing apply* is what waits for that.
     ThreadSettling,
-    /// The thread is *parked*: unsettled, and not settling. It is on a
-    /// question card, or its turn failed while it still watches an event.
-    /// Only the user moves it on, so a standing apply cannot wait it out.
     ThreadParked,
-    /// The selector withholds the action for a reason no wait resolves.
     ActionUnavailable,
-    /// Apply on a set-aside change. It is brought back first (ADR 0328).
     ChangeSetAside,
 }
 
-/// Why the availability selector refuses `action` on this change, or `None`.
-///
-/// **The single definition of the per-change gate.** Two surfaces ask it and
-/// write their own sentence: the HTTP handlers as a 409, the `changes` LLM
-/// tool as a tool error. The reason is typed because a 409 body and a message
-/// an agent reads want different words. ADR 0106 turned down a frontend-only
-/// hide for splitting one rule in two, and a tool with no gate was that split
-/// again. See
-/// `docs/plans/2026-09-20-an-apply-the-agent-asks-for-takes-the-same-gate.md`.
-///
-/// Internal apply paths are intentionally NOT gated. They run while the thread
-/// legitimately reads running: the Apply All driver, `apply_now`, the
-/// post-hardening auto-apply, the standing-apply resolver.
-/// `change_ops_tests.rs` enrolls every one of them.
-///
-/// Three rows fall through to the engine, which answers them better: an
-/// unknown id, a threadless change, and a resolved one. Gating a terminal row
-/// would turn an idempotent retry into a spurious 409.
 pub(crate) async fn change_action_refusal(
     pool: &sqlx::PgPool,
     change_id: Uuid,
@@ -260,11 +194,6 @@ pub(crate) async fn change_action_refusal(
             .bind(change_id)
             .fetch_optional(pool)
             .await?;
-    // A pending change with no files left has nothing to apply. Merging it only
-    // pushes no-op commits, and can spend a harden-at-apply session on an empty
-    // diff. Refused before the thread-state gate so the message names the real
-    // reason, and only for Apply: Discard is how the user resolves one. See
-    // `core::changes::is_empty_pending_change`.
     if let Some((_, status, file_count)) = row.as_ref() {
         let apply = action == crate::engine::thread_lifecycle::ThreadAction::Apply;
         if *status == ChangeStatus::Pending && *file_count == 0 && apply {
@@ -294,12 +223,6 @@ pub(crate) async fn change_action_refusal(
             return Ok(None);
         }
     }
-    // They ask the canonical predicates rather than a third copy of their SQL,
-    // which is the drift this whole function exists to stop. An open question
-    // comes first: a standing apply drops on one, so naming it would point the
-    // caller at a control that ends at once. `settling` comes next, because a
-    // settling thread is often also unsettled, and settling is the stronger,
-    // actionable answer.
     if crate::engine::question_park_sql::thread_parked_on_question(pool, thread_id).await? {
         return Ok(Some(ChangeActionRefusal::ThreadParked));
     }
@@ -315,8 +238,6 @@ pub(crate) async fn change_action_refusal(
     Ok(Some(ChangeActionRefusal::ActionUnavailable))
 }
 
-/// Reject a single-change action the selector does not grant, as a 409. The
-/// HTTP rendering of [`change_action_refusal`].
 async fn guard_change_action(
     state: &AppState,
     change_id: Uuid,
@@ -338,15 +259,11 @@ async fn guard_change_action(
             )
             .with_reason("change_set_aside"));
         }
-        // The three thread-state refusals are one 409 here. The panel already
-        // draws the difference, and the caller's sentence has always said
-        // "in the thread's current state".
         Some(_) => reject_msg,
     };
     Err(ApiError::new(StatusCode::CONFLICT, msg))
 }
 
-/// POST /api/v1/changes/:id/apply — apply a single change
 pub(super) async fn apply_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -361,9 +278,6 @@ pub(super) async fn apply_change(
         "This change can't be applied in the thread's current state",
     )
     .await?;
-    // Apply-time reconcile of orphaned sibling pending changes is handled inside
-    // `apply_change` itself (gated on a real Applied transition), so it covers
-    // this handler, the no-live apply_now path, and the Apply-All driver uniformly.
     match state.engine.apply_change(id, actor).await {
         Ok(result) => {
             state.engine.broadcast_changes_updated().await;
@@ -373,7 +287,6 @@ pub(super) async fn apply_change(
     }
 }
 
-/// POST /api/v1/changes/:id/discard — discard a single change
 pub(super) async fn discard_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -397,7 +310,6 @@ pub(super) async fn discard_change(
     }
 }
 
-/// POST /api/v1/changes/:id/set-aside: keep a pending change for later.
 pub(super) async fn set_aside_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -418,7 +330,6 @@ pub(super) async fn set_aside_change(
     }
 }
 
-/// POST /api/v1/changes/:id/bring-back: return a set-aside change to pending.
 pub(super) async fn bring_back_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -434,27 +345,20 @@ pub(super) async fn bring_back_change(
     }
 }
 
-/// Body of `POST /api/v1/standing-applies`.
 #[derive(serde::Deserialize)]
 pub(super) struct ArmStandingApplyBody {
     thread_id: Uuid,
-    /// The change to apply. Omit it for a thread that has proposed nothing yet,
-    /// and the arm takes whatever it proposes.
     #[serde(default)]
     change_id: Option<Uuid>,
 }
 
-/// POST /api/v1/standing-applies: arm a standing apply for one thread.
-///
-/// The owner's instruction to apply once the thread settles (ADR 0168 clause
-/// 5). Re-arming a thread replaces its previous arm.
 pub(super) async fn arm_standing_apply(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ArmStandingApplyBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Arming an apply on a thread IS applying it, one settle later, so it takes
+    // INVARIANT: Arming an apply on a thread IS applying it, one settle later, so it takes
     // the gate the immediate apply takes. The `apply_when_settled` LLM tool is
     // the other way to this same act, and asks the same rule.
     refuse_without_authority(
@@ -464,7 +368,7 @@ pub(super) async fn arm_standing_apply(
         Action::Apply,
     )
     .await?;
-    // A change named here must be this thread's own pending one. Binding an
+    // INVARIANT: A change named here must be this thread's own pending one. Binding an
     // arm to somebody else's change would apply work the owner never saw on
     // this thread's settle.
     if let Some(change_id) = body.change_id {
@@ -506,15 +410,12 @@ pub(super) async fn arm_standing_apply(
     })))
 }
 
-/// DELETE /api/v1/standing-applies/:thread_id: take the instruction back.
 pub(super) async fn disarm_standing_apply(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Taking an apply back acts on the same thread's apply, so it asks the gate
-    // the arm asks. A caller that could not have armed here may not cancel here.
     refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -522,7 +423,7 @@ pub(super) async fn disarm_standing_apply(
         Action::Apply,
     )
     .await?;
-    // A 404 must mean "nothing was armed": the client reads it as already off.
+    // INVARIANT: A 404 must mean "nothing was armed": the client reads it as already off.
     // A failed delete leaves the arm live, so it answers 500 instead.
     let dropped = state
         .engine
@@ -538,24 +439,11 @@ pub(super) async fn disarm_standing_apply(
     ))
 }
 
-/// DELETE /api/v1/standing-applies: take back every standing apply here.
-///
-/// The workspace-scope off, for the prompt and the CLI. It drops a single arm
-/// as readily as a swept one.
-///
-/// Nothing armed answers 0 rather than 404. This is an off switch, and the
-/// owner pressing it on an already-off state got what they asked for. The
-/// per-thread route keeps its 404: naming a thread is a claim about that
-/// thread.
-///
-/// It stops no Apply All batch. Cancelling one is
-/// `POST /api/v1/changes/apply-all/cancel`, which also takes the sweep's arms.
 pub(super) async fn disarm_all_standing_applies(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Workspace scope, so no subtree contains it. Same reasoning as Apply All.
     refuse_without_authority(&state.engine.event_bus, &headers, None, Action::Apply).await?;
     let disarmed = state
         .engine
@@ -566,18 +454,12 @@ pub(super) async fn disarm_all_standing_applies(
     Ok(Json(serde_json::json!({ "disarmed": disarmed })))
 }
 
-/// Query for `POST /api/v1/changes/apply-all`.
 #[derive(serde::Deserialize, Default)]
 pub(super) struct ApplyAllQuery {
-    /// The sweep: also arm every thread still settling, so its change applies
-    /// when it lands.
     #[serde(default)]
     keep_going: bool,
 }
 
-/// What Apply All says when nothing could be applied now and the sweep was not
-/// asked for. Pure, so each refusal names the real reason rather than one blanket
-/// message.
 pub(super) fn empty_apply_all_refusal(
     total_pending: usize,
     not_ready: usize,
@@ -596,7 +478,6 @@ pub(super) fn empty_apply_all_refusal(
     }
 }
 
-/// What the sweep says once it has armed. Pure.
 pub(super) fn apply_all_on_settle_message(armed: usize) -> String {
     match armed {
         0 => "No thread is still settling, so there is nothing to apply as it settles.".into(),
@@ -605,28 +486,18 @@ pub(super) fn apply_all_on_settle_message(armed: usize) -> String {
     }
 }
 
-/// POST /api/v1/changes/apply-all — apply all pending changes
-///
-/// Emits durable `ApplyAllBatchStarted` with every pending change ID, applies
-/// the first change synchronously so the HTTP caller gets an immediate
-/// result, then hands off to the driver task. Subsequent `ChangeApplied` /
-/// `ChangeApplyFailed` events feed the driver, which advances the batch and
-/// fires the next apply — including across the conflict-recovery suspension
-/// window — until every member resolves and `ApplyAllBatchCompleted` lands.
 pub(super) async fn apply_all_changes(
     State(state): State<AppState>,
     Query(query): Query<ApplyAllQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Apply All aims at the workspace rather than at one thread, and as the
+    // INVARIANT: Apply All aims at the workspace rather than at one thread, and as the
     // sweep it arms threads that have proposed nothing yet. No subtree
     // contains that, so clause 3 cannot cover it and a thread caller needs the
     // owner's standing instruction. Before the batch record and the first
     // merge, so a refusal leaves neither.
     refuse_without_authority(&state.engine.event_bus, &headers, None, Action::Apply).await?;
-    // The rule lives on the engine, so the agent's `apply_as_they_settle` runs
-    // the same press this button does.
     let outcome = state
         .engine
         .run_apply_all(actor, query.keep_going)
@@ -643,7 +514,6 @@ pub(super) async fn apply_all_changes(
         ApplyAllOutcome::Started { .. } => (0, 0, 0, 0),
     };
     if let ApplyAllOutcome::NothingToApply { .. } = outcome {
-        // Asked for the sweep, arming IS the action.
         if !query.keep_going {
             return Err(ApiError::bad_request(empty_apply_all_refusal(
                 total_pending,
@@ -713,23 +583,12 @@ pub(super) async fn apply_all_changes(
     }
 }
 
-/// POST /api/v1/changes/apply-all/cancel — cancel the running Apply All batch.
-///
-/// Stops the driver from advancing to further members, interrupts the in-flight
-/// hardening/merge session, and emits `ApplyAllBatchCompleted`. Already-applied
-/// members stay applied; the in-flight apply aborts back to pending (best-effort
-/// for an in-progress merge); queued members stay pending. See
-/// `cancel_apply_all_batches` for the full semantics.
-///
-/// It also takes back every arm a sweep set. Cancel means "stop applying", and
-/// leaving the sweep running would keep applying for hours afterwards. A single
-/// arm the owner set on one change is not part of the sweep and survives.
 pub(super) async fn cancel_apply_all_changes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Cancel takes back the batch's Apply and the sweep's arms, so it asks the
+    // INVARIANT: Cancel takes back the batch's Apply and the sweep's arms, so it asks the
     // gate Apply All asks, aimed at the workspace. Before the batch is touched,
     // so a refusal stops nothing and says nothing about whether one runs.
     refuse_without_authority(&state.engine.event_bus, &headers, None, Action::Apply).await?;
@@ -754,16 +613,13 @@ pub(super) struct CancelLaneBatchBody {
     batch_id: Uuid,
 }
 
-/// POST /api/v1/changes/lane/cancel: cancel the resolving lane batch
-/// `batch_id` (ADR 0463). The batch fails whole and its lane thread stops.
-/// Every member stays pending and apply-ready, and nothing queues it again.
 pub(super) async fn cancel_lane_batch(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CancelLaneBatchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Cancel takes back every member's Apply, so it asks the gate Apply asks,
+    // INVARIANT: Cancel takes back every member's Apply, so it asks the gate Apply asks,
     // member by member, before the batch fails. A batch id naming no open
     // batch falls through to the lane's own refusal.
     let members = state
@@ -794,17 +650,13 @@ pub(super) async fn cancel_lane_batch(
     Ok(Json(serde_json::json!({ "canceled": body.batch_id })))
 }
 
-/// DELETE /api/v1/changes/:id/queue: take a change waiting in the landing
-/// lane back out (ADR 0463). It stays pending and apply-ready, and only a new
-/// Apply queues it again. A member of the open lane batch leaves only with
-/// its batch, so it answers 409 and names the batch's Cancel.
 pub(super) async fn remove_from_landing_lane(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Remove takes an Apply back, so it asks the gate Apply asks. It skips
+    // INVARIANT: Remove takes an Apply back, so it asks the gate Apply asks. It skips
     // the thread-state gate: the source thread stays free while its change
     // waits, and Remove touches no branch and no worktree.
     refuse_change_verb(&state, &headers, id, Action::Apply).await?;
@@ -824,8 +676,6 @@ pub(super) async fn remove_from_landing_lane(
     queue_removal_answer(Some(removal))
 }
 
-/// What Remove answers: `None` for a change id naming nothing, else what the
-/// lane decided. Pure, so every answer's status and slug are pinned.
 fn queue_removal_answer(
     removal: Option<Result<(), LaneRemoval>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -856,7 +706,6 @@ fn queue_removal_answer(
     }
 }
 
-/// GET /api/v1/changes/:id — get a single change by ID
 pub(super) async fn get_change(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -877,7 +726,6 @@ pub(super) async fn get_change(
     Ok(Json(change))
 }
 
-/// GET /api/v1/changes/for-repo/:repo_id — list changes for a specific repo
 pub(super) async fn list_changes_for_repo(
     State(state): State<AppState>,
     Path(repo_id): Path<Uuid>,
@@ -912,7 +760,6 @@ pub(super) async fn list_changes_for_repo(
     })))
 }
 
-/// POST /api/v1/changes/discard-all — discard all pending changes
 pub(super) async fn discard_all_changes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -927,7 +774,7 @@ pub(super) async fn discard_all_changes(
     if all_pending.is_empty() {
         return Err(ApiError::bad_request("No pending changes"));
     }
-    // Discard All sits on the Ready section, so it acts on the apply-ready
+    // INVARIANT: Discard All sits on the Ready section, so it acts on the apply-ready
     // changes only. Discarding an unsettled one would delete the branch and
     // worktree out from under a session that is still going. Mirrors the
     // Apply All filter and `guard_change_action`.
@@ -939,7 +786,6 @@ pub(super) async fn discard_all_changes(
             "No pending change is ready: each thread is still working or waiting for something, or its work is not hardened.",
         ));
     }
-    // Before the first discard, so a refusal deletes no branch and no worktree.
     refuse_batch_change_verb(&state, &headers, &pending, Action::Discard).await?;
     let mut discarded = 0;
     let mut failed = 0;
@@ -968,13 +814,6 @@ pub(super) async fn discard_all_changes(
     })))
 }
 
-/// Routes for the `/changes*` URL surface. The diff/file routes register
-/// here even though their handlers live in `api::repositories` — grouped by
-/// path, not handler location.
-///
-/// `/standing-applies` joins them: it is a change action, and one row per
-/// armed thread is the resource it acts on. The collection takes a DELETE of
-/// its own, which is the workspace-scope off.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -1016,8 +855,6 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    /// Remove answers 200 for a waiting change and 404 for an unknown id. A
-    /// batch member and a change not waiting each get a 409 with its own slug.
     #[test]
     fn remove_answers_each_lane_decision_with_its_own_status() {
         let refused = |removal| queue_removal_answer(removal).expect_err("refused");
@@ -1040,7 +877,6 @@ mod tests {
         assert_eq!(refused(None).status, StatusCode::NOT_FOUND);
     }
 
-    /// The refusal names the control the Changes panel draws.
     #[test]
     fn a_refusal_with_nothing_ready_points_at_apply_all_on_settle() {
         let msg = empty_apply_all_refusal(2, 2, 0);
@@ -1048,7 +884,6 @@ mod tests {
         assert!(!msg.contains("Keep going"), "{msg}");
     }
 
-    /// Ready changes the lane holds are named as applying, never as emptied.
     #[test]
     fn a_refusal_with_every_ready_change_applying_says_so() {
         let msg = empty_apply_all_refusal(3, 0, 3);
@@ -1057,10 +892,6 @@ mod tests {
         assert!(!emptied.contains("already applying"), "{emptied}");
     }
 
-    /// Pin the wire format so wire-breaking changes (renamed fields,
-    /// changed status casing, removed optionality) trip a test instead of
-    /// silently shipping. Per-variant correctness is covered by the
-    /// `ApplyResult` constructors in `engine::types`.
     #[test]
     fn applied_with_merge_serializes_to_expected_shape() {
         let change_id = Uuid::nil();
@@ -1104,12 +935,6 @@ mod tests {
         assert!(json.get("previous_commit").is_none());
     }
 
-    // ── the one per-change gate ──
-    //
-    // `change_action_refusal` is the whole rule. Both surfaces render it, so a
-    // hole here is a hole in the Apply button AND in the `changes` LLM tool.
-
-    /// Seed a coding-agent thread row in one state.
     async fn seed_cc_thread(
         pool: &sqlx::PgPool,
         thread_id: Uuid,
@@ -1132,7 +957,6 @@ mod tests {
         .expect("seed thread_summaries");
     }
 
-    /// Seed a change row owned by `thread_id`.
     async fn seed_change(
         pool: &sqlx::PgPool,
         change_id: Uuid,
@@ -1157,13 +981,6 @@ mod tests {
         .expect("seed changes");
     }
 
-    /// Every unsettled thread is refused Apply, and the reason tells settling
-    /// from parked.
-    ///
-    /// The split is the whole point. `standing_verdict` waits through a
-    /// running thread and an event wait. It drops on a question card. So one
-    /// shared reason would send the caller to a control that ends on its first
-    /// look.
     #[tokio::test]
     async fn an_unsettled_thread_is_refused_and_settling_is_told_from_parked() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1171,13 +988,10 @@ mod tests {
 
         let (pool, db_name) = setup_test_db().await;
 
-        // Mid-turn, watching an event (with and without a child), and parked
-        // on a question. All of them wake and may commit again.
         for (status, waits, children, expected) in [
             ("running", 0, 0, ChangeActionRefusal::ThreadSettling),
             ("idle", 1, 0, ChangeActionRefusal::ThreadSettling),
             ("idle", 1, 1, ChangeActionRefusal::ThreadSettling),
-            // A failed turn keeps its waits, and nothing but the user moves it.
             ("failed", 1, 0, ChangeActionRefusal::ThreadParked),
             (
                 "waiting_for_user_answer",
@@ -1204,8 +1018,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The reported reason and `standing_verdict` agree about who can be waited
-    /// out. Only `ThreadSettling` may be answered with a standing apply.
     #[test]
     fn only_the_settling_reason_is_one_a_standing_apply_waits_through() {
         use crate::engine::standing_apply::{
@@ -1224,26 +1036,18 @@ mod tests {
             turn_settle: TurnSettle::Settled,
         };
         let waits_it_out = |f: SettleFacts| matches!(standing_verdict(&f), StandingVerdict::Wait);
-        // The states behind ThreadSettling. The arm keeps its place.
         for (status, waits) in [("running", false), ("paused", false), ("idle", true)] {
             assert!(
                 waits_it_out(facts(status, waits)),
                 "a settling thread ({status}, waits={waits}) is what a standing apply waits through",
             );
         }
-        // The state behind ThreadParked. It ends the arm on its first look.
         assert!(
             !waits_it_out(facts("waiting_for_user_answer", false)),
             "a thread parked on a question drops the arm, so it must not read as settling",
         );
     }
 
-    /// The control: a settled coding-agent thread with a real diff applies.
-    /// Without this, a gate that refused everything would look correct.
-    ///
-    /// A delegating parent, idle apart from a running child, is settled too.
-    /// The child writes its own worktree (ADR 0249), so Apply and Discard both
-    /// pass the per-change gate.
     #[tokio::test]
     async fn a_settled_thread_is_not_refused_even_with_a_running_child() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1269,9 +1073,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A thread that withholds Apply for a reason no wait resolves reports
-    /// `ActionUnavailable`. A chat thread is the plain case. Telling an agent
-    /// to arm `apply_when_settled` here would arm a wait that never ends.
     #[tokio::test]
     async fn a_thread_that_will_never_offer_apply_says_so() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1328,8 +1129,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// An empty pending change is refused for Apply before the thread-state
-    /// question, and Discard stays the way out of it.
     #[tokio::test]
     async fn an_empty_pending_change_is_refused_for_apply_only() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1357,8 +1156,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// S5: Set aside is refused exactly where Discard is, in every thread
-    /// state, and granted where Discard is granted.
     #[tokio::test]
     async fn set_aside_is_refused_where_discard_is() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1386,8 +1183,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Discarding a set-aside change resets its branch, so it waits out a
-    /// thread still working on that branch, and passes on a settled one.
     #[tokio::test]
     async fn a_set_aside_change_is_not_discarded_under_a_working_thread() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1413,9 +1208,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A set-aside change is refused Apply with its own reason, so both
-    /// surfaces can say "bring it back first". Setting it aside again is an
-    /// idempotent retry, which the engine answers.
     #[tokio::test]
     async fn a_set_aside_change_is_refused_apply_until_brought_back() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1442,8 +1234,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Three rows the engine answers better than the gate does. Refusing them
-    /// here would turn an idempotent retry into a 409.
     #[tokio::test]
     async fn unknown_threadless_and_resolved_rows_fall_through() {
         use crate::engine::thread_lifecycle::ThreadAction;
@@ -1469,8 +1259,6 @@ mod tests {
             None,
         );
 
-        // Already applied, on a thread that is mid-turn again. The thread state
-        // must not reach a retry of a resolved change.
         let thread_id = Uuid::new_v4();
         let resolved = Uuid::new_v4();
         seed_cc_thread(&pool, thread_id, "running", 0, 0).await;

@@ -3,17 +3,10 @@ mod question_card_tests {
 
     #[test]
     fn the_tool_result_instruction_never_claims_the_user_saw_the_results() {
-        // It said "the user already read it" after every tool round. The user
-        // never sees a tool result, so the model took it as leave to skip the
-        // report.
         assert!(!TOOL_RESULTS_INSTRUCTION.contains("already read"));
         assert!(TOOL_RESULTS_INSTRUCTION.contains("never sees tool"));
     }
 
-    /// The rule lives in `question_card_gate`, but the loop decides when to
-    /// ask it. Pin the conditions, the round's own text and the refusal.
-    /// The round's text rides along rather than skipping the gate, so a card
-    /// pointing "above" at a two-line note is still refused.
     #[test]
     fn the_loop_asks_the_shared_rule_before_raising_a_card() {
         let run = include_str!("../agentic_loop/run.rs");
@@ -29,9 +22,6 @@ mod question_card_tests {
         }
     }
 
-    /// The special-tool walk emits the card's `message`. A refused
-    /// card `continue`s before reaching it, so it shows no message, and its
-    /// re-sent retry shows the message only once.
     #[test]
     fn a_refused_card_never_reaches_the_walk_that_shows_its_message() {
         let run = include_str!("../agentic_loop/run.rs");
@@ -46,8 +36,6 @@ mod question_card_tests {
         assert!(refused_branch.contains("continue;"));
     }
 
-    /// A quiet pick ends the turn after its batch: the loop returns before it
-    /// appends the round and calls the model again.
     #[test]
     fn a_quiet_answer_ends_the_turn_before_the_next_model_call() {
         let run = include_str!("../agentic_loop/run.rs");
@@ -62,8 +50,6 @@ mod question_card_tests {
         assert!(branch.contains("return Ok(terminal_result("));
     }
 
-    /// A quiet pick ends its turn on the option's quiet reply. The event, the
-    /// turn-end gate and the result all carry it, and no model call writes it.
     #[test]
     fn a_quiet_answer_ends_the_turn_on_the_quiet_reply() {
         let run = include_str!("../agentic_loop/run.rs");
@@ -79,8 +65,6 @@ mod question_card_tests {
 
     const NOTE: &str = "I've drafted the refund message and the two links it needs.";
 
-    /// A tool round whose text reached the user only as a summary tells the
-    /// model so, quoting the summary, before the usual instruction.
     #[test]
     fn a_progress_note_round_tells_the_model_what_the_user_saw() {
         let text = instruction_after_round(TOOL_RESULTS_INSTRUCTION, &[NOTE.to_string()], false);
@@ -98,8 +82,6 @@ mod question_card_tests {
         );
     }
 
-    /// The card gate's refusal quotes the note, so the round does not say it
-    /// twice.
     #[test]
     fn a_card_round_leaves_the_note_to_the_card_gate() {
         assert_eq!(

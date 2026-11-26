@@ -1,18 +1,8 @@
-//! E2E coverage for the refusal read route. It is what a cold page load is
-//! told about a hook that throws away the deliveries it does get.
-//!
-//! The engine's unit tests judge a row. This is the route that turns a row plus
-//! a declaration into the bar, over real HTTP. It is also the only place the
-//! two halves meet: the declaration gates, and the live row describes.
-//!
-//! See `docs/adr/0235-a-refused-delivery-is-an-outage.md`.
-
 use crate::support::{base_url, db_url, unique_marker, user_client};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Read the route the Webhooks page and the refusal bar both call.
 async fn read_refusals(client: &reqwest::Client, api: &str) -> Value {
     let resp = client
         .get(format!("{api}/api/v1/webhooks/refusals"))
@@ -23,7 +13,6 @@ async fn read_refusals(client: &reqwest::Client, api: &str) -> Value {
     resp.json().await.expect("invalid JSON")
 }
 
-/// Create one hook and return its id.
 async fn create_hook(client: &reqwest::Client, api: &str, name: &str) -> String {
     let body = json!({ "name": name, "event_type": "E2eRefusedDeliveryArrived" });
     let resp = client
@@ -37,11 +26,6 @@ async fn create_hook(client: &reqwest::Client, api: &str, name: &str) -> String 
     created["id"].as_str().expect("an id").to_string()
 }
 
-/// Put a hook into the state a long refusal run leaves behind.
-///
-/// Written straight to the row, because the engine's own writer needs real
-/// refused deliveries and a clock this test cannot wind. The ages come from
-/// `now()`, so they are the database's own, exactly as the route reads them.
 async fn seed_run(pool: &PgPool, hook_id: &str, enabled: bool, age_secs: f64, count: i32) {
     sqlx::query(
         "UPDATE webhooks SET enabled = $2, \
@@ -62,7 +46,6 @@ async fn seed_run(pool: &PgPool, hook_id: &str, enabled: bool, age_secs: f64, co
     .expect("seed refusal run");
 }
 
-/// Append one declaration for this hook, aged by `age_secs`.
 async fn seed_declaration(pool: &PgPool, hook_id: &str, name: &str, age_secs: f64) {
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, created, aggregate_id, aggregate) \
@@ -90,7 +73,6 @@ async fn seed_declaration(pool: &PgPool, hook_id: &str, name: &str, age_secs: f6
     .expect("seed declaration");
 }
 
-/// This hook's entry in the route's answer, or `None`.
 fn entry_for<'a>(answer: &'a Value, hook_id: &str) -> Option<&'a Value> {
     answer["refusing"]
         .as_array()
@@ -99,9 +81,6 @@ fn entry_for<'a>(answer: &'a Value, hook_id: &str) -> Option<&'a Value> {
         .find(|entry| entry["webhook_id"] == hook_id)
 }
 
-/// One test function, because sibling tests create hooks in the same workspace
-/// and the route answers over all of them. Every assertion is scoped to the
-/// hook this test made.
 #[tokio::test]
 async fn the_refusals_route_reports_a_declared_hook_and_drops_it_when_the_row_clears() {
     let client = user_client().await;
@@ -111,16 +90,12 @@ async fn the_refusals_route_reports_a_declared_hook_and_drops_it_when_the_row_cl
     let name = unique_marker("e2e-hook-refusal");
     let hook_id = create_hook(&client, &api, &name).await;
 
-    // A fresh hook is refusing nothing, and the static route resolves ahead of
-    // its `/webhooks/:id` sibling rather than parsing "refusals" as a uuid.
     let quiet = read_refusals(&client, &api).await;
     assert!(
         entry_for(&quiet, &hook_id).is_none(),
         "nothing declared yet"
     );
 
-    // A run alone is not enough. The engine having SAID so is what raises the
-    // bar, so a fault no cycle has declared draws nothing.
     let eighteen_days = 18.0 * 86_400.0;
     seed_run(&pool, &hook_id, false, eighteen_days, 42).await;
     let undeclared = read_refusals(&client, &api).await;
@@ -138,16 +113,12 @@ async fn the_refusals_route_reports_a_declared_hook_and_drops_it_when_the_row_cl
     assert_eq!(entry["refusals"], 42);
     assert_eq!(entry["reasons"]["disabled"], 42);
 
-    // The age is the RUN's, measured by the database, and it predates the
-    // declaration by seventeen days (ADR 0053).
     let secs = entry["refusing_secs"].as_i64().expect("refusing_secs");
     assert!(
         (1_555_000..=1_556_000).contains(&secs),
         "refusing_secs was {secs}, expected the run's own age"
     );
 
-    // Switching the hook back on ends the fault the declaration named. The
-    // route says so at once, without waiting for the next cycle to retract.
     sqlx::query("UPDATE webhooks SET enabled = TRUE WHERE id = $1::uuid")
         .bind(&hook_id)
         .execute(&pool)
@@ -159,8 +130,6 @@ async fn the_refusals_route_reports_a_declared_hook_and_drops_it_when_the_row_cl
         "a switched-on hook must not still read as switched off"
     );
 
-    // An app may not read which hooks are broken, the same rule every other
-    // webhook route carries.
     let as_app = client
         .get(format!("{api}/api/v1/webhooks/refusals"))
         .header("x-lucidos-app-id", "habit-tracker")

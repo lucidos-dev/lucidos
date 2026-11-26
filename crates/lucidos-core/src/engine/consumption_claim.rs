@@ -1,31 +1,19 @@
-//! The *consumption claim*: a human message is either taken back or consumed,
-//! never both. The event bus decides it under the thread append lock, so a
-//! removal and a delivery cannot both commit (ADR 0323 for coding agents).
-
 use uuid::Uuid;
 
 use crate::core::EventRow;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::thread_lifecycle::{ArchiveState, LifecycleViolation, ThreadType};
 
-/// What one thread event claims about a human message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageClaim {
-    /// Records the message itself.
     Records(Uuid),
-    /// Delivers the message to its recipient.
     Consumes(Uuid),
-    /// Takes the message back.
     Removes(Uuid),
 }
 
-/// The refusal reason when a removed message would be recorded or consumed.
 pub(crate) const REMOVED_REASON: &str = "the user took this message back";
-/// The refusal reason when a consumed message would be taken back.
 pub(crate) const CONSUMED_REASON: &str = "this message has already been delivered";
 
-/// The claim `event` makes, if any. A message claims under its own event id,
-/// so an event persisted under a fresh id names no message.
 pub(crate) fn claim_of(event: &ThreadEvent, meta: &EventMeta) -> Option<MessageClaim> {
     match event {
         ThreadEvent::MessageReceived { .. } => meta.event_id.map(MessageClaim::Records),
@@ -46,7 +34,6 @@ pub(crate) fn claim_of(event: &ThreadEvent, meta: &EventMeta) -> Option<MessageC
     }
 }
 
-/// Did the user take `message` back on `thread_id`?
 pub async fn was_removed<'e, E>(
     executor: E,
     thread_id: Uuid,
@@ -66,20 +53,17 @@ where
     .await
 }
 
-/// One definition for both the claim guard and Stop's candidate selection.
 const CONSUMED_PREDICATE: &str = "e.thread_id = candidate.thread_id AND ( \
     (e.event_type = 'PromptInjected' AND e.payload->>'injected_message_id' = candidate.id::text) \
  OR (e.event_type = 'ChatTurnSettingsResolved' AND e.payload->>'request_event_id' = candidate.id::text) \
  OR (e.event_type IN ('UserQuestionAnswered', 'UserOnlyMessagePosted') AND e.id = candidate.id))";
 
-/// Delivery receipts for separately persisted held messages.
 pub const HELD_MESSAGE_RECEIPT_TYPES: &[&str] = &[
     "PromptInjected",
     "ChatTurnSettingsResolved",
     "CodingAgentInputRead",
 ];
 
-/// Identify a receipt for a separately persisted message in the event stream.
 pub fn held_message_receipt_target(event: &ThreadEvent, meta: &EventMeta) -> Option<Uuid> {
     if let ThreadEvent::CodingAgentInputRead { input_event_id, .. } = event {
         return Some(*input_event_id);
@@ -93,7 +77,6 @@ pub fn held_message_receipt_target(event: &ThreadEvent, meta: &EventMeta) -> Opt
     }
 }
 
-/// Whether a stored row needs a receipt before it can enter model context.
 pub fn is_permission_held(event: &EventRow) -> bool {
     event.event_type == "MessageReceived"
         && event.payload["queued_for_permission"].as_bool() == Some(true)
@@ -102,8 +85,6 @@ pub fn is_permission_held(event: &EventRow) -> bool {
 pub(crate) const HELD_MESSAGE_SQL: &str =
     "candidate.event_type = 'MessageReceived' AND candidate.payload @> '{\"queued_for_permission\":true}'";
 
-/// Use the chat append guard's predicate and the coding agent's read receipt.
-/// The first receipt supplies ordering, while the original row supplies content.
 pub(crate) fn model_delivery_join() -> String {
     format!(
         "LEFT JOIN LATERAL (
@@ -127,7 +108,6 @@ pub(crate) fn model_event_visible() -> String {
     format!("(NOT ({HELD_MESSAGE_SQL}) OR delivery.sequence IS NOT NULL)")
 }
 
-/// Resolve a live or replayed receipt to its original message exactly once.
 pub async fn held_message_at_receipt(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -146,7 +126,7 @@ pub async fn held_message_at_receipt(
     .await
 }
 
-/// Was `message` delivered? A turn starter counts once its turn stamps
+/// INVARIANT: Was `message` delivered? A turn starter counts once its turn stamps
 /// `ChatTurnSettingsResolved`. A removal before that stamp refuses the stamp,
 /// so the turn never runs.
 async fn was_consumed<'e, E>(
@@ -167,7 +147,7 @@ where
     .await
 }
 
-/// Refuse an event whose claim contradicts one already committed. Runs inside
+/// INVARIANT: Refuse an event whose claim contradicts one already committed. Runs inside
 /// the emit's transaction, after the thread append lock.
 pub(crate) async fn check(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -186,7 +166,6 @@ pub(crate) async fn check(
             (REMOVED_REASON, thread_kind(tx, thread_id).await?)
         }
         MessageClaim::Removes(message) => {
-            // A coding agent's withdrawal is already confirmed by its holder.
             let kind = thread_kind(tx, thread_id).await?;
             if kind.0 != ThreadType::Chat || !was_consumed(&mut **tx, thread_id, message).await? {
                 return Ok(());
@@ -228,17 +207,14 @@ fn refusal_reason<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'
         .map(|violation| violation.reason.as_str())
 }
 
-/// The bus refused an emit because the user took its message back.
 pub fn is_removed_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
     refusal_reason(error) == Some(REMOVED_REASON)
 }
 
-/// The bus refused a removal because an agent already has the message.
 pub(crate) fn is_consumed_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
     refusal_reason(error) == Some(CONSUMED_REASON)
 }
 
-/// A taken-back input, including content a second device may not have loaded.
 #[derive(serde::Serialize)]
 pub struct TakenBackMessage {
     pub thread_id: Uuid,
@@ -248,14 +224,12 @@ pub struct TakenBackMessage {
     pub compose: crate::core::store::ComposeReport,
 }
 
-/// Partial failures are visible without preventing the live turn from stopping.
 #[derive(Default, serde::Serialize)]
 pub struct TakeBackReport {
     pub taken_back_messages: Vec<TakenBackMessage>,
     pub failed_take_back_ids: Vec<Uuid>,
 }
 
-/// The result of taking back one input, shared by Stop and the removal endpoint.
 pub enum TakeBackOutcome {
     Removed,
     AlreadyRemoved,
@@ -290,7 +264,7 @@ async fn take_back(
                 compose: None,
             },
             meta: EventMeta {
-                // All take-back callers compete for the same event identity.
+                // INVARIANT: All take-back callers compete for the same event identity.
                 // A duplicate insert rolls back before projecting or broadcasting.
                 event_id: Some(Uuid::new_v5(
                     &thread_id,
@@ -315,7 +289,7 @@ async fn take_back(
     }
 }
 
-/// Snapshot the durable acceptance set before canceling. Acceptance survives
+/// INVARIANT: Snapshot the durable acceptance set before canceling. Acceptance survives
 /// queue handoff, unlike its projection row, so recorded injections remain
 /// discoverable. The claim guard arbitrates any consumption race after this read.
 /// With no thread id, take back inputs on every Lucidos Agent thread.
@@ -402,7 +376,7 @@ pub async fn take_back_unconsumed(
     Ok(report)
 }
 
-/// Restore accepted content while holding the removal's append transaction.
+/// INVARIANT: Restore accepted content while holding the removal's append transaction.
 /// The stored acceptance is authoritative even before MessageReceived records.
 pub(crate) async fn restore_accepted_input(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

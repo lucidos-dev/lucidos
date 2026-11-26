@@ -1,20 +1,3 @@
-//! User-managed non-secret environment variables.
-//!
-//! A parallel mechanism to [`crate::core::credentials`]: plaintext key/value
-//! pairs the user (or the LLM) defines once and the engine injects as real
-//! environment variables into every subprocess it spawns — `run_python`,
-//! `run_bash`, background bash, scheduled scripts, triggers, Claude Code, and
-//! Codex — alongside the `CRED_*` / `OAUTH_*` injection.
-//!
-//! The store has a **second consumer**: [`apply_to_process_env`] copies every
-//! pair into the ENGINE'S OWN process env, once at startup. The two differ on
-//! restart, and its doc comment states the rule for both.
-//!
-//! These are deliberately **not** secret: the value is carried in the
-//! `EnvironmentVariableSet` SystemEvent (broadcast to every device), and may
-//! appear in tool-call payloads, logs, and the event store. That is the whole
-//! point and the reason they live outside the credential store.
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -23,11 +6,6 @@ use uuid::Uuid;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
-/// A single user-managed environment variable (name + plaintext value).
-///
-/// The name root `EnvironmentVariable` is used identically across DB
-/// (`environment_variables`), Rust, TS, the wire, and the events so the concept
-/// never drifts between layers (see `.claude/rules/glossary.md`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentVariable {
     pub id: Uuid,
@@ -37,15 +15,11 @@ pub struct EnvironmentVariable {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Reason a candidate name was rejected. Stringified at the API / tool boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameRejection {
-    /// Failed the `^[A-Z_][A-Z0-9_]*$` shape check.
     Invalid,
-    /// A well-formed name the engine itself owns — injecting it would clobber an
-    /// engine-critical var, so creation is refused outright.
     Reserved,
-    /// A name that makes a subprocess load code it never names (`BASH_ENV`,
+    /// INVARIANT: A name that makes a subprocess load code it never names (`BASH_ENV`,
     /// `LD_PRELOAD`, `NODE_OPTIONS`, `GIT_SSH_COMMAND`). The user may set it;
     /// an agent may not, since every later subprocess would run it unguarded.
     CodeInjecting,
@@ -71,7 +45,7 @@ impl NameRejection {
     }
 }
 
-/// Engine-owned env var names a user variable must never clobber. These are set
+/// INVARIANT: Engine-owned env var names a user variable must never clobber. These are set
 /// by the engine on every spawn (see `engine_impl::scripts::build_script_env_vars`
 /// and `runtime::spawn_env::apply_lucidos_env`); a user row with one of these
 /// names is refused at creation and filtered out again at injection time
@@ -79,13 +53,10 @@ impl NameRejection {
 /// `LUCIDOS_*`-style but user-settable; for coding-agent spawns the engine's
 /// value wins by ordering, for plain scripts the user's value applies.
 const RESERVED_EXACT: &[&str] = &[
-    // The workspace database (see `core::lucidos_database_url_env`).
     crate::core::LUCIDOS_DATABASE_URL,
     crate::core::MANAGED_DATABASE_ENV,
-    // Process / build env the engine controls.
     "PATH",
     "RUSTC_WRAPPER",
-    // Engine-owned LUCIDOS_* (see `api::actor` + `runtime::spawn_env`).
     "LUCIDOS_WORKSPACE",
     "LUCIDOS_WORKSPACE_ORIGIN",
     crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN,
@@ -97,7 +68,7 @@ const RESERVED_EXACT: &[&str] = &[
     "LUCIDOS_EVENT_ID",
     "LUCIDOS_SESSION_KIND",
     AGENT_RUN_ENV,
-    // Network exposure switches. The engine reads them after
+    // INVARIANT: Network exposure switches. The engine reads them after
     // `apply_to_process_env`, so a stored row would change how the NEXT boot
     // binds, serves TLS, or gates cross-origin browsers. Only the launcher sets
     // these, never a user row an agent can write.
@@ -109,12 +80,8 @@ const RESERVED_EXACT: &[&str] = &[
     "LUCIDOS_PERMISSIVE_CORS",
 ];
 
-/// Reserved name prefixes — the injection namespaces owned by the credential
-/// and OAuth stores.
 const RESERVED_PREFIXES: &[&str] = &["CRED_", "OAUTH_"];
 
-/// Whether `name` matches the allowed shape: uppercase ASCII letters, digits,
-/// and underscores, and must not start with a digit (`^[A-Z_][A-Z0-9_]*$`).
 pub fn is_valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -124,13 +91,10 @@ pub fn is_valid_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Whether `name` is reserved by the engine (exact name or reserved prefix).
-/// Assumes a syntactically valid name; callers validate shape first.
 pub fn is_reserved_name(name: &str) -> bool {
     RESERVED_EXACT.contains(&name) || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// Validate a candidate name: shape first, then reserved policy.
 pub fn validate_name(name: &str) -> Result<(), NameRejection> {
     if !is_valid_name(name) {
         return Err(NameRejection::Invalid);
@@ -141,9 +105,6 @@ pub fn validate_name(name: &str) -> Result<(), NameRejection> {
     Ok(())
 }
 
-/// [`validate_name`] for a write an agent makes or could have made: the
-/// `env_vars` tool, an agent-origin `/api/v1/env-vars` call, or the `data/.env`
-/// import. It also refuses the names the command guard treats as code-injecting.
 pub fn validate_agent_name(name: &str) -> Result<(), NameRejection> {
     validate_name(name)?;
     if is_code_injecting_env_name(name) {
@@ -152,7 +113,7 @@ pub fn validate_agent_name(name: &str) -> Result<(), NameRejection> {
     Ok(())
 }
 
-/// Store for user-managed environment variables.
+/// INVARIANT: Store for user-managed environment variables.
 ///
 /// **No caller can skip the event.** [`Self::upsert`], [`Self::update`] and
 /// [`Self::delete`] are the only reachable mutators: the raw row writes
@@ -179,10 +140,6 @@ fn parse_row(row: Row) -> EnvironmentVariable {
 }
 
 impl EnvironmentVariableStore {
-    /// Insert or update a variable (upsert by name). Returns the row id.
-    ///
-    /// **Private on purpose**: [`Self::upsert`] is the reachable mutator, and it
-    /// emits. See the type-level doc.
     async fn upsert_row(pool: &PgPool, name: &str, value: &str) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar::<_, Uuid>(
             r#"
@@ -200,12 +157,6 @@ impl EnvironmentVariableStore {
         .await
     }
 
-    /// Save a variable and announce it. The only way to create one.
-    ///
-    /// Announces unconditionally, unlike `RepositoryStore::register`: setting a
-    /// variable to the value it already holds is a deliberate user action on a
-    /// surface nothing re-runs on a loop, so there is no restart-spam hazard to
-    /// suppress and the timeline should show that the user did it.
     pub async fn upsert(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -227,7 +178,6 @@ impl EnvironmentVariableStore {
         Ok(id)
     }
 
-    /// Get a single variable by name.
     pub async fn get(
         pool: &PgPool,
         name: &str,
@@ -245,7 +195,6 @@ impl EnvironmentVariableStore {
         Ok(row.map(parse_row))
     }
 
-    /// List all variables, ordered by name.
     pub async fn list(pool: &PgPool) -> Result<Vec<EnvironmentVariable>, sqlx::Error> {
         let rows = sqlx::query_as::<_, Row>(
             r#"
@@ -259,9 +208,6 @@ impl EnvironmentVariableStore {
         Ok(rows.into_iter().map(parse_row).collect())
     }
 
-    /// Update the value of an existing variable. Returns `true` if a row existed.
-    ///
-    /// **Private on purpose**: [`Self::update`] is the reachable mutator.
     async fn update_row(pool: &PgPool, name: &str, value: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
@@ -277,8 +223,6 @@ impl EnvironmentVariableStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Update an existing variable and announce it. Announces only when a row
-    /// was actually updated, so an edit aimed at a missing name stays silent.
     pub async fn update(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -302,9 +246,6 @@ impl EnvironmentVariableStore {
         Ok(updated)
     }
 
-    /// Delete a variable by name. Returns `true` if a row existed.
-    ///
-    /// **Private on purpose**: [`Self::delete`] is the reachable mutator.
     async fn delete_row(pool: &PgPool, name: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM environment_variables WHERE name = $1")
             .bind(name)
@@ -313,10 +254,6 @@ impl EnvironmentVariableStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete a variable and announce it. The only way to remove one.
-    ///
-    /// `EnvironmentVariableDeleted` fires only when a row was actually deleted,
-    /// so a repeated or racing delete announces once.
     pub async fn delete(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -338,7 +275,7 @@ impl EnvironmentVariableStore {
         Ok(removed)
     }
 
-    /// Build the `(NAME, value)` pairs to inject into a spawned subprocess.
+    /// INVARIANT: Build the `(NAME, value)` pairs to inject into a spawned subprocess.
     ///
     /// Reserved-named rows are filtered out as a defense-in-depth backstop: the
     /// API and the LLM tool already refuse to create them, but a row that
@@ -356,7 +293,7 @@ impl EnvironmentVariableStore {
             .collect())
     }
 
-    /// [`Self::env_pairs`] for a spawn about to happen, logged under `label`.
+    /// INVARIANT: [`Self::env_pairs`] for a spawn about to happen, logged under `label`.
     ///
     /// A failed read falls back to the startup copy rather than to nothing.
     /// [`apply_to_subprocess_env`] removes every startup name missing here, so
@@ -373,23 +310,17 @@ impl EnvironmentVariableStore {
     }
 }
 
-/// The pairs [`apply_to_process_env`] copied into the engine's own env.
+const PER_SPAWN_ORIGIN_VARS: &[&str] = &[
+    crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN,
+    crate::core::subprocess_origin::ENV_SOURCE_THREAD_ID,
+];
+
 static STARTUP_ENV_VARS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
 fn startup_env_vars() -> &'static [(String, String)] {
     STARTUP_ENV_VARS.get().map_or(&[], Vec::as_slice)
 }
 
-/// The subprocess half of the store: stamp `pairs` onto `cmd`, first removing
-/// every startup variable `pairs` no longer holds.
-///
-/// A subprocess inherits the engine's env, and [`apply_to_process_env`] filled
-/// that once at startup. Without the removal, a variable deleted since then
-/// still reaches every spawn until the engine restarts. `pairs` is the full env
-/// the caller injects, so an engine-owned var it sets later still wins.
-///
-/// `inherited` also removes the engine's inherited secrets, for a chat or
-/// script subprocess. A name `pairs` sets is kept either way.
 pub fn apply_to_subprocess_env(
     cmd: &mut tokio::process::Command,
     pairs: &[(String, String)],
@@ -398,9 +329,6 @@ pub fn apply_to_subprocess_env(
     apply_env_over_startup(cmd, startup_env_vars(), pairs, inherited);
 }
 
-/// What a subprocess inherits for `name` from the engine's own env, when the
-/// spawn's pairs do not set it. A workspace var from startup inherits nothing:
-/// [`apply_to_subprocess_env`] strips it once the store no longer holds it.
 pub fn inherited_env_var(name: &str) -> Option<String> {
     inherited_over_startup(name, startup_env_vars(), std::env::var(name).ok())
 }
@@ -430,6 +358,7 @@ fn apply_env_over_startup(
     let removed = startup
         .iter()
         .map(|(name, _)| name.as_str())
+        .chain(PER_SPAWN_ORIGIN_VARS.iter().copied())
         .chain(stripped.into_iter().flatten());
     for name in removed {
         if !current.contains(name) {
@@ -441,8 +370,6 @@ fn apply_env_over_startup(
     }
 }
 
-/// Strip one layer of matching surrounding single or double quotes from a
-/// `.env` value (`"foo"` / `'foo'` → `foo`). Leaves unquoted/mismatched as-is.
 fn unquote(s: &str) -> String {
     let bytes = s.as_bytes();
     if bytes.len() >= 2 {
@@ -455,7 +382,7 @@ fn unquote(s: &str) -> String {
     s.to_string()
 }
 
-/// One-time startup migration: import any `<workspace>/data/.env` `KEY=VALUE`
+/// INVARIANT: One-time startup migration: import any `<workspace>/data/.env` `KEY=VALUE`
 /// lines into the `environment_variables` table, then **delete** the file. This
 /// is the consolidation that retires the legacy per-workspace `.env` mechanism
 /// (`load_workspace_env`) in favour of the single DB-backed store.
@@ -513,10 +440,6 @@ pub async fn migrate_env_file_to_db(
         let value = unquote(raw_val.trim());
         match validate_agent_name(key) {
             Ok(()) => {
-                // The DB wins over the file, which is what makes a retained
-                // file safe to re-read. A retry boot must not overwrite a value
-                // the user edited in Settings meanwhile, and must not re-emit
-                // `EnvironmentVariableSet` for a row that already landed.
                 match EnvironmentVariableStore::get(pool, key).await {
                     Ok(Some(_)) => {
                         already += 1;
@@ -541,7 +464,7 @@ pub async fn migrate_env_file_to_db(
                     }
                 }
             }
-            // An agent can write data/.env, so this name waits for the user.
+            // INVARIANT: An agent can write data/.env, so this name waits for the user.
             // Keeping the file keeps their legacy value until they set it.
             Err(NameRejection::CodeInjecting) => {
                 match EnvironmentVariableStore::get(pool, key).await {
@@ -564,7 +487,7 @@ pub async fn migrate_env_file_to_db(
         }
     }
 
-    // A line that failed to import still exists only in this file, so deleting
+    // INVARIANT: A line that failed to import still exists only in this file, so deleting
     // it now would lose the variable for good. A transient DB error at boot is
     // exactly when that happens. Keep the file and retry next boot.
     //
@@ -598,28 +521,8 @@ pub async fn migrate_env_file_to_db(
     }
 }
 
-/// The engine-process half of the store. Applies the stored variables to the
-/// ENGINE'S OWN process env, once at startup. That restores the inheritance the
-/// retired per-workspace `data/.env` provided (`load_workspace_env` used to
-/// `set_var` these at startup).
-///
-/// Two kinds of reader see them. Engine-internal shell-outs inherit the process
-/// env: the engine's own `git push`/`fetch`/`clone` (Apply time, repo add),
-/// stdio MCP servers, `open`. Engine code calling `std::env::var` reads them
-/// directly.
-///
-/// Reserved names are filtered (via `env_pairs`), so this can NEVER overwrite an
-/// engine-critical process var (`PATH`, internal `LUCIDOS_*`, …).
-///
-/// Restart semantics mirror the old `data/.env`, and this half is the one that
-/// needs a restart. Running once at startup means a caller inside the engine
-/// reads whatever the store held when the engine last started. A `OnceLock`
-/// around such a read pins that value for the process lifetime. The per-spawn
-/// injection ([`apply_to_subprocess_env`]) is the no-restart path for every
-/// tool and agent subprocess, deletions included, which is why the pairs are
-/// recorded here.
 pub async fn apply_to_process_env(pool: &PgPool) {
-    // Before any row lands in the process env, so the snapshot holds only
+    // INVARIANT: Before any row lands in the process env, so the snapshot holds only
     // what the engine inherited.
     super::inherited_secret_env();
     let pairs = match EnvironmentVariableStore::env_pairs(pool).await {
@@ -649,7 +552,7 @@ pub async fn apply_to_process_env(pool: &PgPool) {
     }
 }
 
-/// The variables that tell the `lucidos` CLI which engine to reach. A line
+/// INVARIANT: The variables that tell the `lucidos` CLI which engine to reach. A line
 /// that sets one can send a `data write --from` file anywhere.
 pub const LUCIDOS_CLI_ENV_NAMES: [&str; 3] = [
     "LUCIDOS_API_BASE_URL",
@@ -657,7 +560,7 @@ pub const LUCIDOS_CLI_ENV_NAMES: [&str; 3] = [
     "LUCIDOS_API_PORT",
 ];
 
-/// Environment-variable names that make the process the command starts run
+/// INVARIANT: Environment-variable names that make the process the command starts run
 /// code the command head says nothing about. The variable either names code
 /// to load, or moves where a config naming code is read from. Matched case-sensitively, because the
 /// loader and these interpreters read exact upper-case names.
@@ -675,7 +578,7 @@ const CODE_INJECTING_ENV_NAMES: &[&str] = &[
     "DYLD_",
     "BASH_ENV",
     "ENV=",
-    // The most direct one. The agent can write its own binary with an ordinary
+    // INVARIANT: The most direct one. The agent can write its own binary with an ordinary
     // in-workspace write, itself Safe. A `PATH=` preamble then runs it with no
     // card, no checkpoint and no judge call. Exact, so `PATHEXT=` and the
     // various build variables keep the fast path.
@@ -694,14 +597,14 @@ const CODE_INJECTING_ENV_NAMES: &[&str] = &[
     "GIT_EXTERNAL_DIFF",
     "GIT_PAGER",
     "GIT_EDITOR",
-    // Covers GIT_CONFIG_GLOBAL / _SYSTEM / _COUNT / _KEY_n / _VALUE_n. These are
+    // INVARIANT: Covers GIT_CONFIG_GLOBAL / _SYSTEM / _COUNT / _KEY_n / _VALUE_n. These are
     // the environment equivalents of `git -c` and `--config-env`, which
     // `git_subcommand_safety` already refuses by name as "an executable
     // config", and they reach the same place: a config file naming
     // `diff.external` makes a plain `git diff` run it. The same write-then-run
     // path as `PATH=` applies, since writing `data/g` is itself Safe.
     "GIT_CONFIG",
-    // These move where git, curl and wget look for their config, onto a file
+    // INVARIANT: These move where git, curl and wget look for their config, onto a file
     // an in-workspace write can plant. `HOME=. git diff` reads `./.gitconfig`
     // and runs its `diff.external`. `GIT_DIR=x` reads `x/config`.
     "HOME=",
@@ -712,28 +615,21 @@ const CODE_INJECTING_ENV_NAMES: &[&str] = &[
     "WGETRC=",
     "SYSTEM_WGETRC=",
     "GIT_EXEC_PATH=",
-    // The same move for read-only heads. ripgrep and ack read flags from a
-    // config file (`--pre`, `--pager`), less runs `LESSOPEN` per file, and
-    // `PAGER` is git's fallback for `GIT_PAGER`.
     "RIPGREP_CONFIG_PATH=",
     "LESSOPEN=",
     "LESSCLOSE=",
     "ACKRC=",
     "ACK_OPTIONS=",
-    // A prefix: `ACK_PAGER_COLOR` names a pager command too.
     "ACK_PAGER",
     "PAGER=",
-    // gh's config dir holds its pager and browser commands.
     "GH_CONFIG_DIR=",
     "GH_PAGER=",
     "GH_BROWSER=",
-    // A lesskey file sets `LESSOPEN` from its `#env` section. The prefix covers
-    // `LESSKEYIN`, `LESSKEY_CONTENT` and the `_SYSTEM` forms; `LESS` carries `-k`.
     "LESSKEY",
     "LESS=",
 ];
 
-/// True when the variable `name` is one of [`CODE_INJECTING_ENV_NAMES`], or
+/// INVARIANT: True when the variable `name` is one of [`CODE_INJECTING_ENV_NAMES`], or
 /// one of [`LUCIDOS_CLI_ENV_NAMES`], matched exactly.
 ///
 /// Also the agent-side refusal for a STORED variable
@@ -752,7 +648,6 @@ pub fn is_code_injecting_env_name(name: &str) -> bool {
             })
 }
 
-/// Identifies the engine-owned process run on a spawned agent.
 pub const AGENT_RUN_ENV: &str = "LUCIDOS_AGENT_RUN";
 
 #[cfg(test)]
@@ -778,14 +673,14 @@ mod tests {
     #[test]
     fn invalid_names_rejected() {
         for name in [
-            "",           // empty
-            "1ABC",       // leading digit
-            "lower",      // lowercase
-            "Mixed",      // mixed case
-            "WITH-DASH",  // dash
-            "WITH SPACE", // space
-            "WITH.DOT",   // dot
-            "TRAILING\n", // newline
+            "",
+            "1ABC",
+            "lower",
+            "Mixed",
+            "WITH-DASH",
+            "WITH SPACE",
+            "WITH.DOT",
+            "TRAILING\n",
         ] {
             assert!(!is_valid_name(name), "{name:?} should be invalid");
         }
@@ -808,11 +703,6 @@ mod tests {
         }
     }
 
-    /// Regression: an agent could store `LUCIDOS_PERMISSIVE_CORS=1` as a user
-    /// variable. The next boot copied it into the engine's own env and dropped
-    /// the same-origin gate, so any web page could read the loopback API.
-    /// The literals pin the names the launcher sets and the engine reads, so
-    /// they stay independent of `RESERVED_EXACT` on purpose.
     #[test]
     fn network_exposure_switches_are_reserved() {
         for name in [
@@ -847,8 +737,6 @@ mod tests {
         );
     }
 
-    /// The engine sets none of these any more (ADR 0481), so they belong to the
-    /// user's own projects, as `DATABASE_URL` always did.
     #[test]
     fn database_names_the_engine_does_not_own_are_storable() {
         for name in [
@@ -865,8 +753,6 @@ mod tests {
 
     #[test]
     fn lucidos_repo_is_allowed() {
-        // The user explicitly wants LUCIDOS_REPO-style vars settable; the engine
-        // wins by ordering on coding-agent spawns, so it's not hard-reserved.
         assert!(!is_reserved_name("LUCIDOS_REPO"));
         assert_eq!(validate_name("LUCIDOS_REPO"), Ok(()));
         assert!(!is_reserved_name("LUCIDOS_CUSTOM_THING"));
@@ -875,14 +761,9 @@ mod tests {
 
     #[test]
     fn validate_name_reports_invalid_before_reserved() {
-        // A lowercase reserved-ish name fails the shape check first.
         assert_eq!(validate_name("path"), Err(NameRejection::Invalid));
     }
 
-    /// The load-bearing guarantee: a variable write and its announcement are one
-    /// operation, so the Settings list on every device reloads no matter which
-    /// entry path made the write. Deletion announces only when a row was really
-    /// removed, so a racing double-delete speaks once.
     #[tokio::test]
     async fn every_mutation_announces_and_a_no_op_delete_does_not() {
         let (pool, db) = crate::test_support::setup_test_db().await;
@@ -943,9 +824,6 @@ mod tests {
             .collect()
     }
 
-    /// A subprocess inherits the engine's startup copy of every variable. So a
-    /// variable deleted since startup must be removed, or it still reaches the
-    /// spawn until the engine restarts.
     #[test]
     fn a_variable_deleted_since_startup_is_removed_from_the_subprocess() {
         let startup = pairs(&[("ANTHROPIC_MODEL", "old"), ("MY_FLAG", "1")]);
@@ -968,11 +846,39 @@ mod tests {
         assert_eq!(env.get("ADDED_LATER"), Some(&Some("x".to_string())));
     }
 
-    /// The env a real child prints, after `cmd` inherited `SLACK_USER_TOKEN`
-    /// and `GITHUB_TOKEN` and `inherited` was applied over it.
+    #[tokio::test]
+    async fn a_spawn_inherits_no_origin_it_does_not_set() {
+        use crate::core::subprocess_origin::{ENV_AGENT_ORIGIN_TOKEN, ENV_SOURCE_THREAD_ID};
+        let child_env = |spawn_pairs: Vec<(String, String)>| async move {
+            let mut cmd = tokio::process::Command::new("env");
+            cmd.env(ENV_AGENT_ORIGIN_TOKEN, "outer-session-token")
+                .env(ENV_SOURCE_THREAD_ID, "outer-session-thread");
+            apply_env_over_startup(&mut cmd, &[], &spawn_pairs, InheritedSecrets::Keep);
+            let output = cmd.output().await.expect("env runs");
+            String::from_utf8(output.stdout).expect("utf-8 env")
+        };
+
+        let threadless = child_env(vec![]).await;
+        assert!(!threadless.contains("outer-session"), "{threadless}");
+
+        let own = child_env(pairs(&[
+            (ENV_AGENT_ORIGIN_TOKEN, "own-token"),
+            (ENV_SOURCE_THREAD_ID, "own-thread"),
+        ]))
+        .await;
+        assert!(
+            own.contains(&format!("{ENV_AGENT_ORIGIN_TOKEN}=own-token")),
+            "{own}"
+        );
+        assert!(
+            own.contains(&format!("{ENV_SOURCE_THREAD_ID}=own-thread")),
+            "{own}"
+        );
+        assert!(!own.contains("outer-session"), "{own}");
+    }
+
     async fn child_env_after(inherited: InheritedSecrets<'_>) -> String {
         let mut cmd = tokio::process::Command::new("env");
-        // Stands in for the engine's own env, which the child inherits.
         cmd.env("SLACK_USER_TOKEN", "xoxp-from-the-launch-shell")
             .env("GITHUB_TOKEN", "inherited-gh-value");
         let spawn_pairs = pairs(&[("GITHUB_TOKEN", "row-gh-value")]);
@@ -988,8 +894,6 @@ mod tests {
         ]))
     }
 
-    /// A chat or script subprocess loses what the engine inherited, except a
-    /// name its own pairs set: there the spawn's value wins.
     #[tokio::test]
     async fn a_stripped_spawn_inherits_no_secret_it_does_not_set() {
         let snapshot = launch_shell_snapshot();
@@ -998,7 +902,6 @@ mod tests {
         assert!(env.contains("GITHUB_TOKEN=row-gh-value"), "{env}");
     }
 
-    /// A coding agent keeps them, since it may authenticate through one.
     #[tokio::test]
     async fn a_kept_spawn_still_inherits_the_engine_secrets() {
         let env = child_env_after(InheritedSecrets::Keep).await;
@@ -1008,9 +911,6 @@ mod tests {
         );
     }
 
-    /// The engine records the config dir a session runs under. A deleted
-    /// workspace var is stripped from the spawn, so its startup copy must not
-    /// be recorded either.
     #[test]
     fn a_startup_workspace_var_is_not_inherited() {
         let startup = pairs(&[("CLAUDE_CONFIG_DIR", "/home/u/.claude-personal")]);
@@ -1038,8 +938,6 @@ mod tests {
         EnvironmentVariableStore::upsert(&pool, &bus, "LUCIDOS_REPO", "my-repo", None)
             .await
             .expect("upsert LUCIDOS_REPO");
-        // A reserved-named row written out-of-band (the API/tool would refuse it)
-        // must be filtered out of the injected pairs as a defense-in-depth net.
         EnvironmentVariableStore::upsert(&pool, &bus, "LUCIDOS_DATABASE_URL", "evil", None)
             .await
             .expect("upsert reserved row");
@@ -1104,9 +1002,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// An agent can write `data/.env` with `run_bash`, so the boot import must
-    /// not store a name the `env_vars` tool refuses. The file stays until the
-    /// user has set that name, so a legacy value is never lost.
     #[tokio::test]
     async fn the_env_file_import_holds_a_code_injecting_name_for_the_user() {
         let (pool, db) = crate::test_support::setup_test_db().await;

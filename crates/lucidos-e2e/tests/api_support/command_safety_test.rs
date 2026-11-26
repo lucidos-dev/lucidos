@@ -1,20 +1,3 @@
-//! E2E coverage for the **Lucidos Agent command safety** HTTP surface (ADR
-//! 0002). Two contracts are exercised over real HTTP against the booted e2e
-//! workspace:
-//!
-//! 1. Trigger create and update refuse new category grants. The coding-agent
-//!    grant still round-trips independently.
-//! 2. The command-checkpoint **undo** and **diff** endpoints (Phase 4) fail
-//!    closed on an unknown or malformed checkpoint id.
-//! 3. The guard itself, end to end (Phase 4 and the 2026-08-06 addendum): a
-//!    scripted `run_python` really reaches it, and a command whose destruction
-//!    was gitignored leaves no undo card behind.
-//!
-//! The first two need no `command_guard` preference: the grant field is stored
-//! on the trigger regardless of the guard, and the endpoints resolve the
-//! checkpoint from the event store directly. The third turns the guard on for
-//! its own duration and puts it back.
-
 use crate::support::{base_url, local_process_client, unique_marker, user_client};
 use lucidos_engine::core::prefs;
 use serde_json::json;
@@ -68,10 +51,6 @@ async fn standing_deny_settings_control_the_live_hook_check() {
     assert_eq!(refusal, None);
 }
 
-/// Ensure a timezone preference exists so `create_trigger` doesn't have to fall
-/// back to its UTC default. The `set_preference` handler reads the key from the
-/// `?key=` query param (not the body), so pass it there with `{value}` in the
-/// body — the body-only `{key, value}` form is silently a no-op.
 async fn set_timezone_utc(client: &reqwest::Client) {
     let _ = client
         .put(format!(
@@ -84,7 +63,6 @@ async fn set_timezone_utc(client: &reqwest::Client) {
         .await;
 }
 
-/// Create a schedule trigger carrying `grant` and assert the API accepted it.
 async fn create_trigger_with_grant(client: &reqwest::Client, name: &str, grant: &[&str]) {
     let body = json!({
         "name": name,
@@ -113,9 +91,6 @@ async fn delete_trigger(client: &reqwest::Client, trigger_id: &str) {
         .await;
 }
 
-/// Read the `side_effect_grant` of one trigger as a sorted Vec. The TriggerInfo
-/// wire shape omits the field when empty (`skip_serializing_if = "Vec::is_empty"`),
-/// so an absent array reads back as the empty grant.
 fn grant_of(trigger: &serde_json::Value) -> Vec<String> {
     let mut v: Vec<String> = trigger["side_effect_grant"]
         .as_array()
@@ -129,11 +104,6 @@ fn grant_of(trigger: &serde_json::Value) -> Vec<String> {
     v
 }
 
-/// Poll `GET /api/v1/triggers` until the trigger named `name` has the expected
-/// (sorted) grant. POST/PUT return once the event is persisted, but the
-/// in-memory scheduler projection the list endpoint reads updates
-/// asynchronously — under the suite's parallel load a single GET races the
-/// subscriber, so poll until it catches up. Returns the trigger's id.
 async fn poll_trigger_grant(
     client: &reqwest::Client,
     name: &str,
@@ -173,7 +143,6 @@ async fn poll_trigger_grant(
     }
 }
 
-/// Even the workspace owner uses a program permission card for new grants.
 #[tokio::test]
 async fn trigger_create_and_update_refuse_new_category_grants() {
     let client = user_client().await;
@@ -215,7 +184,6 @@ async fn trigger_create_and_update_refuse_new_category_grants() {
     delete_trigger(&client, &trigger_id).await;
 }
 
-/// Send a trigger write stamped as an app frame and return the JSON answer.
 async fn app_frame_trigger_write(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -234,8 +202,6 @@ async fn app_frame_trigger_write(
         .expect("Invalid JSON")
 }
 
-/// Only the owner widens a side-effect grant (ADR 0641). An app frame is
-/// refused a new category on create and update, and may still narrow it.
 #[tokio::test]
 async fn an_app_frame_cannot_widen_a_side_effect_grant() {
     let client = user_client().await;
@@ -287,8 +253,6 @@ async fn an_app_frame_cannot_widen_a_side_effect_grant() {
     delete_trigger(&client, &trigger_id).await;
 }
 
-/// Poll `GET /api/v1/triggers` until the trigger named `name` lists `expected`
-/// as its `field` (`Null` = absent).
 async fn poll_trigger_field(
     client: &reqwest::Client,
     name: &str,
@@ -325,8 +289,6 @@ async fn poll_trigger_field(
     }
 }
 
-/// The owner's client grants and revokes the *coding-agent grant*, and the list
-/// always carries the field, so a missing one never reads as granted.
 #[tokio::test]
 async fn trigger_coding_agent_grant_round_trips() {
     let client = user_client().await;
@@ -367,12 +329,6 @@ async fn trigger_coding_agent_grant_round_trips() {
     delete_trigger(&client, &trigger_id).await;
 }
 
-/// `side_effect_grant` is a typed serde enum, so an unknown category fails to
-/// deserialize at the `Json` extractor before the handler runs. Note: axum
-/// 0.7's `Json` rejects a valid-JSON-but-wrong-shape body (a `JsonDataError`)
-/// with **422 Unprocessable Entity** — 400 is reserved for malformed JSON
-/// *syntax* (`JsonSyntaxError`). Either way the unknown category never reaches
-/// the scheduler.
 #[tokio::test]
 async fn trigger_create_rejects_unknown_side_effect_category() {
     let client = user_client().await;
@@ -397,15 +353,12 @@ async fn trigger_create_rejects_unknown_side_effect_category() {
     );
 }
 
-/// The same rejection applies to PUT: an unknown category can't sneak in via an
-/// update either.
 #[tokio::test]
 async fn trigger_update_rejects_unknown_side_effect_category() {
     let client = user_client().await;
     set_timezone_utc(&client).await;
     let name = unique_marker("e2e-bad-update");
 
-    // A real trigger to target.
     create_trigger_with_grant(&client, &name, &[]).await;
     let trigger_id = poll_trigger_grant(&client, &name, &[]).await;
 
@@ -421,15 +374,10 @@ async fn trigger_update_rejects_unknown_side_effect_category() {
         "Unknown side-effect category on update must be rejected (422)"
     );
 
-    // The bad update must not have mutated the stored grant.
     poll_trigger_grant(&client, &name, &[]).await;
     delete_trigger(&client, &trigger_id).await;
 }
 
-/// `POST /api/v1/command-checkpoint/undo` with an unknown id fails closed: the
-/// engine can't find a matching `CommandCheckpointed` event, so the handler
-/// returns 400 with an `[ERROR]`-prefixed body (mirrors the change
-/// discard/revert endpoints).
 #[tokio::test]
 async fn command_checkpoint_undo_unknown_id_returns_error() {
     let client = user_client().await;
@@ -458,9 +406,6 @@ async fn command_checkpoint_undo_unknown_id_returns_error() {
     );
 }
 
-/// A malformed body (missing the required `checkpoint_id`) is rejected before
-/// the handler runs — a guard against the endpoint silently treating an empty
-/// id as a valid no-op.
 #[tokio::test]
 async fn command_checkpoint_undo_missing_id_is_rejected() {
     let client = user_client().await;
@@ -477,11 +422,6 @@ async fn command_checkpoint_undo_missing_id_is_rejected() {
     );
 }
 
-/// `GET /api/v1/command-checkpoint/diff` refuses an id that is not a UUID
-/// before it can reach a ref name. The id is interpolated into
-/// `refs/lucidos/command-checkpoints/<id>` and
-/// `refs/lucidos/command-post-images/<id>`, so a path-shaped id is the thing
-/// this parse exists to stop.
 #[tokio::test]
 async fn command_checkpoint_diff_rejects_a_non_uuid_id() {
     let client = user_client().await;
@@ -500,9 +440,6 @@ async fn command_checkpoint_diff_rejects_a_non_uuid_id() {
     }
 }
 
-/// A well-formed id with no `CommandCheckpointed` behind it is a 404, not an
-/// empty diff: an empty diff means "this command changed nothing", which is a
-/// different claim from "there is no such checkpoint".
 #[tokio::test]
 async fn command_checkpoint_diff_unknown_id_is_not_found() {
     let client = user_client().await;
@@ -515,9 +452,6 @@ async fn command_checkpoint_diff_unknown_id_is_not_found() {
     assert_eq!(resp.status().as_u16(), 404);
 }
 
-// --- The guard, end to end (ADR 0002 Phase 4 + the 2026-08-06 addendum) ------
-
-/// Read a preference so the test can put it back.
 async fn get_preference(client: &reqwest::Client, key: &str) -> Option<String> {
     let resp = client
         .get(format!("{}/api/v1/preferences?key={key}", base_url()))
@@ -531,9 +465,6 @@ async fn get_preference(client: &reqwest::Client, key: &str) -> Option<String> {
 async fn set_preference(client: &reqwest::Client, key: &str, value: Option<&str>) {
     let body = match value {
         Some(v) => json!({ "value": v }),
-        // Restoring an unset preference: the accessors treat "" as unset for
-        // the guard (it compares against "true") and for the judge (anything
-        // but "false" is on).
         None => json!({ "value": "" }),
     };
     let resp = client
@@ -549,15 +480,6 @@ async fn set_preference(client: &reqwest::Client, key: &str, value: Option<&str>
     );
 }
 
-/// The set of `refs/lucidos/` refs in the workspace repo, by name.
-///
-/// A SET, not a count, because the count is not stable across the guarded window
-/// even under the tree lock. `create_command_checkpoint` opportunistically runs
-/// `prune_expired_checkpoints`, which reclaims pairs left in this persistent repo
-/// by PRIOR runs: the git repo is not reset per run, only the database is. The
-/// count then falls as old pairs age out mid-test, unrelated to this command.
-/// Comparing sets isolates what THIS command added: `after - before` is exactly
-/// the refs it left behind, and pruning only ever removes members of `before`.
 fn checkpoint_ref_set() -> std::collections::BTreeSet<String> {
     let out = crate::support::git_in(
         &crate::support::workspace_path(),
@@ -571,28 +493,6 @@ fn checkpoint_ref_set() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// The reported 2026-08-06 bug, driven through the **real guard** instead of a
-/// seeded event: a `run_python` step whose only destruction lands inside a
-/// gitignored path must leave no `CommandCheckpointed` card behind, because the
-/// snapshot never captured what it destroyed and the Undo it would offer could
-/// neither restore nor remove anything.
-///
-/// This is the one seam nothing else reaches.
-/// `command-checkpoint-card.spec.ts` seeds the event straight into the DB, and
-/// the `git_ops::checkpoint` unit tests stop at the git layer; only this
-/// exercises classify, snapshot, run, post image, and emit-or-suppress as one
-/// chain. It is reachable at all because the mock provider gained a
-/// `MOCK_RUN_PYTHON:` sentinel: without it nothing in e2e can make the agent
-/// issue a command for the guard to gate.
-///
-/// **Deliberately the negative case only.** Asserting the positive one (a card
-/// with counts, then an Undo that removes the created file) needs the command
-/// to make a git-VISIBLE change to the workspace repo, and `workspace_path()`
-/// is the very repo the apply tests merge into: a dirty tree fails their apply
-/// with "Cannot merge: the repository has uncommitted changes". So the
-/// created-file half is covered where it costs nothing, in the
-/// `git_ops::checkpoint` unit tests. Do NOT "complete" this test by adding a
-/// case that writes a tracked file.
 #[tokio::test]
 async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
     let pool = sqlx::PgPool::connect(&crate::support::db_url())
@@ -600,32 +500,18 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
         .expect("connect to the e2e workspace database");
     let client = crate::support::user_client().await;
 
-    // Both preferences are workspace-wide, so they are shared state within a
-    // run and get put back below, before the assertions, so a failing one still
-    // restores. A panic in the polling between here and there would leak them,
-    // which is tolerable and not worth a Drop guard: no other test reads either
-    // key, and the e2e database is recreated per run rather than per test.
     let guard = prefs::COMMAND_GUARD.key();
     let judge = prefs::COMMAND_GUARD_JUDGE.key();
     let prior_guard = get_preference(&client, guard).await;
     let prior_judge = get_preference(&client, judge).await;
-    // Judge off, so classification is the deterministic static fallback rather
-    // than a mock LLM reply that would not parse as a verdict.
     set_preference(&client, guard, Some("true")).await;
     set_preference(&client, judge, Some("false")).await;
 
-    // Scratch under `.lucidos/`, which the e2e workspace gitignores. Destroying
-    // it is exactly the shape of the reported step, and it leaves the working
-    // tree clean, so no concurrent apply test can see it.
     let scratch_rel = format!(".lucidos/tmp/e2e-ckpt-{}", uuid::Uuid::new_v4().simple());
     let scratch = crate::support::workspace_path().join(&scratch_rel);
     std::fs::create_dir_all(&scratch).expect("create scratch dir");
     std::fs::write(scratch.join("f.txt"), "scratch").expect("write scratch file");
 
-    // The checkpoint pair images the WHOLE working tree, so anything another
-    // test lands there between the two snapshots is read as this command's own
-    // effect and produces the card this test proves absent. Hold the tree still
-    // for the guarded turn; see `workspace_tree_lock`.
     let _tree_quiet = crate::support::workspace_tree_lock().write().await;
 
     let refs_before = checkpoint_ref_set();
@@ -646,8 +532,6 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
         .await
         .thread_id;
 
-    // Wait for the turn to finish, so "no card" is a settled answer rather than
-    // one the emit simply has not reached yet.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let done: i64 = sqlx::query_scalar(
@@ -688,8 +572,6 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
     set_preference(&client, guard, prior_guard.as_deref()).await;
     set_preference(&client, judge, prior_judge.as_deref()).await;
 
-    // The command really ran through the guard. Without this the "no card"
-    // assertion below would also pass if the tool had never been called.
     assert_eq!(
         tool_results, 1,
         "the scripted run_python should have produced exactly one ToolResult"
@@ -698,17 +580,10 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
         !scratch.exists(),
         "the command should have destroyed its scratch dir at {scratch_rel}"
     );
-    // The bug: this used to be 1, and its Undo restored nothing, removed
-    // nothing, and then reported "Reverted".
     assert_eq!(
         checkpoints, 0,
         "a command whose destruction was gitignored must leave no undo card"
     );
-    // And the pair it snapshotted was dropped rather than left pinning objects.
-    // Compare the ref SETS, not their counts: the count also moves when
-    // `create_command_checkpoint`'s opportunistic prune reclaims stale pairs from
-    // prior runs mid-window. What must hold is that THIS command added no
-    // surviving ref, which is exactly `after - before`.
     let leaked: Vec<String> = checkpoint_ref_set()
         .difference(&refs_before)
         .cloned()
@@ -719,7 +594,6 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
     );
 }
 
-/// The first event of `event_type` on `thread_id`, waiting up to `secs`.
 async fn poll_thread_event(
     pool: &sqlx::PgPool,
     thread_id: &str,
@@ -753,13 +627,6 @@ async fn mcp_server_rows(pool: &sqlx::PgPool, id: &str) -> i64 {
         .expect("DB query failed")
 }
 
-/// An MCP server setup spawns its command, so the guard gates it like the same
-/// command run through bash. A server reading a secret path raises a card, and
-/// nothing is registered or spawned while the card is open or after a cancel.
-///
-/// The guard gates a secret read even when it is off, and no stored grant
-/// covers one. So the test touches no preference and holds on any workspace.
-/// The file does not exist, so a regressed guard only spawns a failing `cat`.
 #[tokio::test]
 async fn an_mcp_server_setup_asks_before_it_spawns_anything() {
     let pool = sqlx::PgPool::connect(&crate::support::db_url())

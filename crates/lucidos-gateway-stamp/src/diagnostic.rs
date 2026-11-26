@@ -1,13 +1,9 @@
-//! Identity and integrity of one diagnostic delivery, independent of chat calls.
-
 use crate::Claim;
 
 pub const HEADER_DIAGNOSTIC_ORIGIN: &str = "x-lucidos-diagnostic-origin";
 pub const HEADER_DIAGNOSTIC_DELIVERY: &str = "x-lucidos-diagnostic-delivery";
 pub const HEADER_DIAGNOSTIC_DIGEST: &str = "x-lucidos-diagnostic-digest";
 
-/// Validated header-safe identity. Construction alone authenticates nothing;
-/// each hop must verify its signature before using the origin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticDelivery {
     origin: String,

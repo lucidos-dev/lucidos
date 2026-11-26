@@ -31,7 +31,6 @@ async fn remove(bus: &EventBus, thread_id: Uuid, message: Uuid) -> EmitResult {
     .await
 }
 
-/// A follow-up recorded while a turn runs: it names that turn's anchor.
 async fn record_follow_up(bus: &EventBus, thread_id: Uuid, message: Uuid) -> EmitResult {
     emit(
         bus,
@@ -50,15 +49,12 @@ const CONSUMERS: usize = 4;
 const ANSWER: usize = 2;
 const USER_ONLY: usize = 3;
 
-/// Record `message` the way the consumer at `consumer` finds it.
 async fn record_for(bus: &EventBus, thread_id: Uuid, consumer: usize, message: Uuid) {
     if consumer != ANSWER && consumer != USER_ONLY {
         record_follow_up(bus, thread_id, message).await.unwrap();
     }
 }
 
-/// Each delivery of `message`. Answers and user-only posts carry its own id;
-/// injections and turn starters follow a separate recorded message.
 fn consumers(message: Uuid) -> Vec<(&'static str, ThreadEvent, EventMeta)> {
     vec![
         (
@@ -184,8 +180,6 @@ async fn a_message_recorded_without_an_anchor_is_removable_until_its_turn_claims
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = seed_chat_thread(&bus, "hello").await;
-    // A turn starter, or a follow-up that arrived before the live turn
-    // stamped its anchor: both are recorded with no `request_event_id`.
     let message = Uuid::new_v4();
     emit(
         &bus,
@@ -273,8 +267,6 @@ async fn a_removed_unrecorded_input_frees_its_successor() {
     teardown_test_db(&db).await;
 }
 
-/// Stop must find accepted inputs even before recording, and after the queue
-/// executor has handed a recorded follow-up to the live turn.
 #[tokio::test]
 async fn stop_takes_back_queued_admitted_and_recorded_inputs() {
     use crate::engine::event_bus::SystemEvent;
@@ -356,7 +348,6 @@ async fn stop_takes_back_queued_admitted_and_recorded_inputs() {
         let (kind, event, meta) = consumers(message).remove(1);
         let error = emit(&bus, thread, event, meta).await.expect_err(kind);
         assert!(is_removed_refusal(&*error));
-        // Stop is idempotent: already removed text is never returned twice.
         assert!(
             take_back_unconsumed(&bus, Some(thread), Some(device_actor()))
                 .await
@@ -556,7 +547,6 @@ async fn stop_restores_durably_once_when_the_response_is_lost() {
         left.unwrap().taken_back_messages.len() + right.unwrap().taken_back_messages.len(),
         1
     );
-    // Neither HTTP response is needed to recover the stored draft.
     let restored = draft(&pool, thread).await;
     assert_eq!(restored.0, "newer draft\n\ntake me back");
     assert_eq!(restored.1, serde_json::json!(["new-image", "test-image"]));
@@ -597,7 +587,6 @@ async fn stop_restores_durably_once_when_the_response_is_lost() {
     .unwrap();
     let saved_restorations = payload["compose"]["restorations"].clone();
     let event = ThreadEvent::from_stored("QueuedMessageRemoved", payload).unwrap();
-    // A replay repairs an older projection and never overwrites a later epoch.
     for newer in [false, true] {
         sqlx::query("UPDATE thread_summaries SET compose_text='later',compose_images='[]',compose_restorations='[]',compose_epoch=$2 WHERE thread_id=$1")
             .bind(thread).bind(if newer { restored.2 + 1 } else { before.2 }).execute(&pool).await.unwrap();

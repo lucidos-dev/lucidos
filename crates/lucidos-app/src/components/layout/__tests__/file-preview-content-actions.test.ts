@@ -9,7 +9,7 @@ vi.mock('../../../utils/platform', async (importOriginal) => ({
 }));
 
 const { filePreviewContentActions } = await import('../ContentHeaderActions');
-const { repositories, workspacePath, panelOverlay, filePreviewSource, filePreviewEditing } =
+const { repositories, workspacePath, panelOverlay, filePreviewSource, filePreviewEditing, filePreviewWrap } =
   await import('../../../store/store');
 
 const keysOf = (path: string, mobile = false) => filePreviewContentActions(path, mobile).map((a) => a.key);
@@ -26,6 +26,18 @@ describe('filePreviewContentActions', () => {
     panelOverlay.value = null;
     filePreviewSource.value = false;
     filePreviewEditing.value = false;
+    filePreviewWrap.value = false;
+  });
+
+  it('keeps the wrap toggle listed and pressed while wrapping is on', () => {
+    const path = 'artifacts/notes.md';
+    panelOverlay.value = { type: 'file-preview', path };
+    filePreviewSource.value = true;
+    filePreviewWrap.value = true;
+
+    const wrap = filePreviewContentActions(path, false).find((a) => a.key === 'wrap-toggle');
+    expect(wrap).toBeDefined();
+    expect(wrap?.active).toBe(true);
   });
 
   it('returns nothing while the file is being edited', () => {

@@ -1,20 +1,11 @@
-//! The loopback client setup and the certificate's file name each have one
-//! definition (invariant I17 of `docs/plans/2026-11-19-desktop-window-https.md`).
-//! A second copy drifts on the next change, so this scans every Rust source in
-//! the tree for one.
-
 use std::path::{Path, PathBuf};
 
-/// Each guarded token, and the only files allowed to hold it.
 const GUARDED: &[(&str, &[&str])] = &[
     (
         "danger_accept_invalid_certs",
         &[
             "crates/lucidos-local-token/src/client.rs",
-            // The opt-in transport for a provider's own self-signed backend.
-            // It never reaches a loopback listener of ours.
             "crates/lucidos-agents-api/src/api/proxy.rs",
-            // A test naming it as forbidden on the tailnet probe.
             "crates/lucidos-agents-api/src/api/settings.rs",
         ],
     ),

@@ -1,11 +1,3 @@
-//! The command judge check. Each candidate model classifies the labelled set
-//! in `eval/command-guard/cases.toml`, through the guard's own questions
-//! and thresholds. The table says how often it got the lane right.
-//!
-//! The number that decides is false-`safe` on the irreversible items: a
-//! command the guard would wave through when it should have asked. Plan:
-//! `docs/plans/2026-10-09-haiku-4-5-vertex-retirement.md`, invariant I8.
-
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -16,7 +8,6 @@ use serde::Serialize;
 use crate::candidate::{candidate, percentile, pinned_provider, provider_for};
 use crate::Fallible;
 
-/// One classification, as written to the results file.
 #[derive(Debug, Serialize)]
 struct Classified<'a> {
     config: &'a str,
@@ -35,8 +26,6 @@ struct Classified<'a> {
     output_tokens: u32,
 }
 
-/// Run every candidate over the set, append each answer to `out` as JSON
-/// lines, and print the table.
 pub async fn run(set: &Path, candidates: &[String], out: &Path) -> Fallible<()> {
     let set: LabelledSet = toml::from_str(&std::fs::read_to_string(set)?)?;
     let pinned = pinned_provider()?;
@@ -101,7 +90,6 @@ pub async fn run(set: &Path, candidates: &[String], out: &Path) -> Fallible<()> 
     Ok(())
 }
 
-/// One table row for a candidate.
 fn summary_row(spec: &str, rows: &[(Classified<'_>, Duration)]) -> String {
     let answered: Vec<&Classified<'_>> = rows
         .iter()
@@ -154,8 +142,6 @@ fn summary_row(spec: &str, rows: &[(Classified<'_>, Duration)]) -> String {
 mod tests {
     use super::*;
 
-    /// The shipped set parses, every lane is one the judge answers, and only
-    /// the irreversible lane carries a category.
     #[test]
     fn the_labelled_set_is_well_formed() {
         let path = crate::eval_fixture_root().join("command-guard/cases.toml");

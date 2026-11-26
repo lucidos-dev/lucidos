@@ -1,5 +1,3 @@
-//! The hold predicate, the release claim, and when an answer releases.
-
 use super::*;
 use crate::engine::agent_question::answer_releases_held_messages;
 use crate::engine::agent_question::aq_test_helpers::{cc_meta, emit_user_question, seed_cc_thread};
@@ -65,8 +63,6 @@ async fn count_releases(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
     .expect("count releases")
 }
 
-/// The reported shape. A parent follows up on a child parked on the user's
-/// question. The follow-up must wait instead of superseding the question.
 #[tokio::test]
 async fn an_agent_message_is_held_behind_an_active_question() {
     let (pool, db_name) = setup_test_db().await;
@@ -81,8 +77,6 @@ async fn an_agent_message_is_held_behind_an_active_question() {
     teardown_test_db(&db_name).await;
 }
 
-/// A human message answers the question or supersedes it (ADR 0082). A message
-/// already on the wire, or an engine re-entry (ADR 0255), is not held either.
 #[tokio::test]
 async fn only_a_fresh_agent_message_is_held() {
     let (pool, db_name) = setup_test_db().await;
@@ -107,8 +101,6 @@ async fn only_a_fresh_agent_message_is_held() {
     teardown_test_db(&db_name).await;
 }
 
-/// An overtaken question has dead buttons, so an agent message still
-/// supersedes it rather than wait on a question nobody can answer.
 #[tokio::test]
 async fn an_agent_message_is_not_held_behind_an_overtaken_question() {
     let (pool, db_name) = setup_test_db().await;
@@ -137,9 +129,6 @@ async fn an_agent_message_is_not_held_behind_an_overtaken_question() {
     teardown_test_db(&db_name).await;
 }
 
-/// After a Cancel the question is gone but a message is still held. A newer
-/// agent message must queue behind it, never jump ahead and restart the child.
-/// Once the backlog is released, agent messages flow again.
 #[tokio::test]
 async fn an_agent_message_holds_behind_an_older_held_one() {
     let (pool, db_name) = setup_test_db().await;
@@ -166,8 +155,6 @@ async fn an_agent_message_holds_behind_an_older_held_one() {
     teardown_test_db(&db_name).await;
 }
 
-/// A release hands over the held messages one at a time, oldest first, and
-/// marks each one. Once all are claimed nothing is left to deliver twice.
 #[tokio::test]
 async fn claims_release_held_messages_one_at_a_time_oldest_first() {
     let (pool, db_name) = setup_test_db().await;
@@ -201,8 +188,6 @@ async fn claims_release_held_messages_one_at_a_time_oldest_first() {
     teardown_test_db(&db_name).await;
 }
 
-/// The delivery's `MessageReceived` is refused. The release must not land
-/// without it, so the message stays held at the head, ahead of a younger one.
 #[tokio::test]
 async fn a_refused_delivery_keeps_the_message_held() {
     let (pool, db_name) = setup_test_db().await;
@@ -229,8 +214,6 @@ async fn a_refused_delivery_keeps_the_message_held() {
     teardown_test_db(&db_name).await;
 }
 
-/// Two releases can race. The index lets only one `HeldMessageReleased` per
-/// held message land, so the loser cannot deliver it a second time.
 #[tokio::test]
 async fn a_held_message_can_be_released_only_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -256,9 +239,6 @@ async fn a_held_message_can_be_released_only_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// Two claims race for one held message. The unique index refuses the loser's
-/// release, and its `MessageReceived` rolls back with it, so the message is
-/// delivered once.
 #[tokio::test]
 async fn a_claim_that_loses_the_race_delivers_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -292,8 +272,6 @@ async fn a_claim_that_loses_the_race_delivers_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// The store can refuse a release for a reason other than a lost race, such
-/// as a full disk. The claim must then end with the message still held.
 #[tokio::test]
 async fn a_release_the_store_keeps_refusing_ends_the_claim() {
     let (pool, db_name) = setup_test_db().await;
@@ -316,7 +294,6 @@ async fn a_release_the_store_keeps_refusing_ends_the_claim() {
     teardown_test_db(&db_name).await;
 }
 
-/// Cancel means stop, so it keeps the hold. Every other resolution releases.
 #[test]
 fn only_a_cancel_keeps_the_hold() {
     assert!(!answer_releases_held_messages(&AnswerKind::Canceled));
@@ -337,9 +314,6 @@ fn only_a_cancel_keeps_the_hold() {
     }
 }
 
-/// A pending permission card waits on a human exactly as a question does. A
-/// parent's follow-up used to deny it on the user's behalf. It must wait
-/// instead, and once the card is resolved, agent messages flow again.
 #[tokio::test]
 async fn an_agent_message_is_held_behind_a_pending_permission_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -380,8 +354,6 @@ async fn an_agent_message_is_held_behind_a_pending_permission_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// The workspace-wide read names each message still held, on its owning
-/// thread, with the link that opens it. A released message drops out.
 #[tokio::test]
 async fn the_workspace_read_lists_what_is_still_held() {
     let (pool, db_name) = setup_test_db().await;
@@ -414,7 +386,6 @@ async fn the_workspace_read_lists_what_is_still_held() {
     teardown_test_db(&db_name).await;
 }
 
-/// Each workspace is its own database, so one never lists another's.
 #[tokio::test]
 async fn the_workspace_read_sees_only_its_own_database() {
     let (pool_a, db_a) = setup_test_db().await;

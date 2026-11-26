@@ -1,9 +1,7 @@
-//! Durable reads of the owner's Stop and the events that lift it.
-
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-/// Unknown state holds: a delayed wake is recoverable, an unwanted turn is not.
+/// INVARIANT: Unknown state holds: a delayed wake is recoverable, an unwanted turn is not.
 pub async fn thread_is_stopped(pool: &PgPool, thread_id: Uuid) -> bool {
     let stopped = match pool.acquire().await {
         Ok(mut connection) => stopped_before(&mut connection, thread_id, i64::MAX).await,
@@ -20,9 +18,6 @@ pub async fn thread_is_stopped(pool: &PgPool, thread_id: Uuid) -> bool {
     }
 }
 
-/// Whether the owner's Stop held `thread_id` just before sequence `before`.
-/// It reads on `connection`, so a caller inside a transaction sees its own
-/// writes.
 pub async fn stopped_before(
     connection: &mut PgConnection,
     thread_id: Uuid,
@@ -36,7 +31,7 @@ pub async fn stopped_before(
     )
 }
 
-/// Every event type [`transition`] can read as a Stop or a resume.
+/// INVARIANT: Every event type [`transition`] can read as a Stop or a resume.
 const TRANSITION_EVENTS: [&str; 7] = [
     "ResponseCanceled",
     "MessageReceived",
@@ -47,12 +42,8 @@ const TRANSITION_EVENTS: [&str; 7] = [
     "ChangeApplied",
 ];
 
-/// The event type [`transition`] can read as a Stop.
 const STOP_EVENTS: [&str; 1] = ["ResponseCanceled"];
 
-/// A thread's Stops (`true`) and resumes (`false`) before a sequence, newest
-/// first. It reads a page at a time, so a walk that ends near the latest
-/// event never reads the thread's whole history.
 struct Transitions<'a> {
     connection: &'a mut PgConnection,
     thread_id: Uuid,
@@ -89,7 +80,7 @@ impl<'a> Transitions<'a> {
             if self.exhausted {
                 return Ok(None);
             }
-            // Only the fields `transition` reads, never a message's text. A
+            // INVARIANT: Only the fields `transition` reads, never a message's text. A
             // message the user took back never ran, so it resumes nothing.
             let rows: Vec<(i64, String, serde_json::Value)> = sqlx::query_as(
                 "SELECT e.sequence, e.event_type, jsonb_build_object( \
@@ -125,9 +116,6 @@ impl<'a> Transitions<'a> {
     }
 }
 
-/// The first Stop of the run a resume at `before` lifts. `None` unless the
-/// latest transition before `before` is a Stop, so only the first resume after
-/// a Stop finds one.
 pub async fn lifted_stop(
     pool: &PgPool,
     thread_id: Uuid,
@@ -145,8 +133,6 @@ pub async fn lifted_stop(
     Ok(first_stop)
 }
 
-/// The first Stop of the thread's latest run of Stops, which no resume came
-/// between. Repeated Stops keep what the first one held.
 pub async fn latest_stop_run(pool: &PgPool, thread_id: Uuid) -> Result<Option<i64>, sqlx::Error> {
     let latest_stop = Transitions::before(
         &mut *pool.acquire().await?,
@@ -162,7 +148,7 @@ pub async fn latest_stop_run(pool: &PgPool, thread_id: Uuid) -> Result<Option<i6
     }
 }
 
-/// A transition is deliberately narrower than Human mode: an agent submitting
+/// INVARIANT: A transition is deliberately narrower than Human mode: an agent submitting
 /// a saved draft is human content, but cannot lift the owner's Stop.
 pub fn transition(event: &str, payload: &serde_json::Value) -> Option<bool> {
     let device_actor = payload["actor"]["kind"] == "device";

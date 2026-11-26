@@ -66,7 +66,9 @@ export async function confirmPluginInstallAction(
   } = form.request;
   let result: PluginConfirmInstallResponse;
   try {
-    result = await confirmPluginInstall(installId, keepLocalChanges);
+    result = form.request.hook_confirmation_required
+      ? await confirmPluginInstall(installId, keepLocalChanges, true)
+      : await confirmPluginInstall(installId, keepLocalChanges);
   } catch (e) {
     showToast(`Install failed: ${errorDetail(e)}`, 'error');
     closeInlineFormIfActive(form);
@@ -75,6 +77,9 @@ export async function confirmPluginInstallAction(
   void refreshPluginCatalogAfterMutation();
   void refreshApps();
   const receipted = markPluginInstalled(form, result);
+  if (result.hooks_needing_review?.length) {
+    showToast(`Review these hooks in Settings > Event Hooks to arm their installed content: ${result.hooks_needing_review.join(', ')}.`, 'warning');
+  }
   if (result.setup_thread_id) {
     try {
       focusSpawnedThread(result.setup_thread_id);
@@ -84,7 +89,7 @@ export async function confirmPluginInstallAction(
         'error',
       );
     }
-  } else if (!receipted) {
+  } else if (!receipted && !result.hooks_needing_review?.length) {
     showToast(`Installed ${pluginName} v${pluginVersion}`, 'success');
   }
 }

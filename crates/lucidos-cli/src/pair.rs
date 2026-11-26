@@ -1,34 +1,11 @@
-//! `lucidos pair`: mint a one-time pairing that enrols a device.
-//!
-//! The gateway authenticates every network caller. A browser cannot read the
-//! machine-local token file, so even a browser on this machine has to pair.
-//! This command is the bootstrap: run it in a terminal, then type the code into
-//! whichever device you want to let in. The typed code works only from another
-//! device on the LAN or the tailnet; the long secret and the link work anywhere.
-//!
-//! `--qr` draws the pairing link instead, so a phone scans it. That needs an address
-//! the phone can reach, which is the hard part of the whole feature: this
-//! command talks to `127.0.0.1`, and a QR aimed there helps nobody. The
-//! address comes from `--host`, else the gateway's external address, else the
-//! HTTPS origin the gateway serves with its own certificate, else Tailscale's
-//! own status. The gateway builds and encodes the URL.
-//!
-//! It reaches the gateway rather than a workspace engine, so it finds it
-//! through `crate::gateway`.
-
 use crate::gateway;
 use crate::workspace::BoxError;
 use lucidos_gateway_constants::{PAIR_PARAM, SIGIL};
 
-/// Where the gateway's own surface lives, behind the reserved sigil namespace.
 const PAIRING_CODE_PATH: &str = "/~/api/v1/auth/pairing-code";
 
-/// How long to wait for one reachability probe. Up to four run back to back,
-/// and a dead address is the ordinary answer. So this bounds what `--qr` costs on a
-/// machine nothing can reach.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Everything the command was asked for.
 pub struct PairArgs<'a> {
     pub port: Option<u16>,
     pub label: Option<&'a str>,
@@ -48,15 +25,9 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
 
     let token = local_token()?;
 
-    // The origin the NEW device should open, which is this gateway at a
-    // hostname that is not loopback. `None` means we found nothing reachable,
-    // and then there is no QR to draw.
     let origin = if args.qr {
         let probe = Probe::new(&client, &base)?;
         match args.host.map(str::trim).filter(|h| !h.is_empty()) {
-            // An explicit host is an assertion about a network we cannot see,
-            // so it is never refused. Probing only picks which of its two
-            // origins to use, and falls back to the ported one.
             Some(host) => Some(
                 reachable_origin(&probe, host)
                     .unwrap_or_else(|| origin_at_host(&probe.off_loopback_base, host)),
@@ -75,13 +46,9 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     let mut request = client
         .post(format!("{base}{PAIRING_CODE_PATH}"))
         .header(lucidos_local_token::HEADER_LOCAL_TOKEN, token);
-    // The label rides the code, so the device that redeems it is stored under
-    // the name printed below. Without this the flag names nothing.
     if let Some(label) = args.label {
         request = request.query(&[("label", label)]);
     }
-    // The gateway owns the URL shape, and validates the origin. Asking it keeps
-    // one definition of what a pairing link looks like.
     if let Some(origin) = &origin {
         request = request.query(&[("origin", origin.as_str())]);
     }
@@ -93,8 +60,6 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     let pair_url = body.get("pair_url").and_then(|u| u.as_str());
     let secret = body.get("secret").and_then(|s| s.as_str());
 
-    // User-facing CLI output that a person reads off the screen and types into
-    // a phone, so bare `println!` rather than the timestamped `log!`.
     println!();
     if args.qr {
         match pair_url {
@@ -120,20 +85,20 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
         println!("  Pairing secret: {secret}");
     }
     println!();
-    // With no reachable origin, a browser on this machine is the one device
-    // left, and the gateway refuses it a typed code. So it gets a loopback link.
     let link = pair_url
         .map(str::to_owned)
         .or_else(|| secret.map(|s| format!("{base}/{SIGIL}/#{PAIR_PARAM}={s}")));
-    match link {
+    match &link {
         Some(link) => println!("  Open {link} on the device you want to pair."),
         None => println!("  Open {base}/ on the device you want to pair, and enter the code."),
     }
     println!("  Or type the code on its pairing screen, from another device on your");
-    println!("  network or tailnet. Through a tunnel or proxy, paste the secret instead.");
+    println!("  local network or tailnet.");
+    if link.is_some() {
+        println!("  Through a tunnel or proxy, paste the secret or link into the");
+        println!("  Pairing secret or link field.");
+    }
     if let Some(label) = args.label {
-        // The pairing screen offers the device a name of its own, and what the
-        // person there types wins. So this is what it falls back to.
         println!("  Unless that device names itself, it will be listed as \"{label}\".");
     }
     println!("  It works once and expires in {minutes} minutes.");
@@ -144,8 +109,6 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Pure: what a code minted here waits for, once a device is paired. The
-/// redeemer of `kind` waits until a paired device taps Allow.
 fn awaiting_owner_note(kind: &str) -> String {
     format!(
         "\n  A device is already paired here, so the new {kind} waits until you tap\n  \
@@ -154,16 +117,16 @@ fn awaiting_owner_note(kind: &str) -> String {
     )
 }
 
-/// `lucidos pair --gateway`: mint a secret that lets another gateway relay this
-/// one's workspaces (ADR 0590).
-///
-/// It prints the `https` address the other gateway should use, found the way a
-/// device QR finds one. Without one there is nothing to pair over, so it says
-/// what to set up instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Grants {
+    pub manage: bool,
+    pub control: bool,
+}
+
 pub fn cmd_pair_gateway(
     port: Option<u16>,
     label: Option<&str>,
-    manage: bool,
+    grants: Grants,
 ) -> Result<(), BoxError> {
     let client = gateway::client()?;
     let base = gateway::the_gateway(
@@ -187,15 +150,24 @@ pub fn cmd_pair_gateway(
     if let Some(label) = label {
         request = request.query(&[("label", label)]);
     }
-    if manage {
+    if grants.manage {
         request = request.query(&[("manage", "true")]);
+    }
+    if grants.control {
+        request = request.query(&[("control", "true")]);
     }
     let Minted { code, minutes, .. } = mint(request)?;
 
     println!();
     println!("  Gateway pairing secret: {code}");
-    if manage {
+    if grants.manage {
         println!("  Devices on the other gateway may manage this gateway's users and devices.");
+    }
+    if grants.control {
+        println!(
+            "  Devices on the other gateway may create, start, stop and restore this \
+             gateway's workspaces."
+        );
     }
     println!();
     println!("  On the other gateway, open Settings -> Access -> Add a remote gateway,");
@@ -222,11 +194,8 @@ pub fn cmd_pair_gateway(
     Ok(())
 }
 
-/// Where the gateway mints a gateway pairing secret, apart from device pairings.
 const GATEWAY_PAIRING_CODE_PATH: &str = "/~/api/v1/auth/gateway-pairing-code";
 
-/// The machine-local token, which only a process on the gateway's machine can
-/// read.
 fn local_token() -> Result<String, BoxError> {
     lucidos_local_token::read().ok_or_else(|| -> BoxError {
         "no local token found. Only a process on the gateway's own machine can \
@@ -235,20 +204,15 @@ fn local_token() -> Result<String, BoxError> {
     })
 }
 
-/// A code the gateway minted, with the whole answer for any extra fields.
 struct Minted {
     code: String,
     minutes: u64,
     body: serde_json::Value,
 }
 
-/// Send a mint request and read the code out of the answer.
 fn mint(request: reqwest::blocking::RequestBuilder) -> Result<Minted, BoxError> {
     let response = request.send()?;
     if !response.status().is_success() {
-        // The gateway's own sentence, not just the status. A rejected
-        // `--host` returns a 400 explaining what shape an origin has to be,
-        // and "400 Bad Request" alone says nothing anyone can act on.
         let status = response.status();
         let reason = response
             .json::<serde_json::Value>()
@@ -275,12 +239,6 @@ fn mint(request: reqwest::blocking::RequestBuilder) -> Result<Minted, BoxError> 
     })
 }
 
-/// Pure: the pairing address, in the one order ADR 0550 sets. The external
-/// address comes first, since the user typed it. Then the HTTPS origin the
-/// gateway serves itself, then the tailnet origin. Each is asked for only when
-/// the one before has nothing. The Access page's `pairingOrigin` follows the
-/// same order, and adds two steps this command cannot see: the reader's own
-/// origin and the LAN address.
 fn pairing_origin(
     external: Option<String>,
     gateway_https: impl FnOnce() -> Option<String>,
@@ -289,8 +247,6 @@ fn pairing_origin(
     external.or_else(gateway_https).or_else(tailnet)
 }
 
-/// The origin a gateway pairing prints: the first `https` one, external
-/// address first. An `http` external address never hides a tailnet one.
 fn gateway_pairing_origin(
     external: Option<String>,
     gateway_https: impl FnOnce() -> Option<String>,
@@ -302,17 +258,9 @@ fn gateway_pairing_origin(
     })
 }
 
-/// What a pairing probe needs: this gateway at loopback, and the way another
-/// device would reach it.
 struct Probe {
-    /// This gateway's health at loopback, asked once.
     ours: Option<serde_json::Value>,
-    /// The client for an address off loopback. It checks certificates against
-    /// the public roots a phone trusts, so an origin it accepts is one the new
-    /// device can open. It follows no redirect: a redirect to loopback would
-    /// otherwise prove this gateway at an origin that is not its own.
     remote: reqwest::blocking::Client,
-    /// This gateway's loopback base, with the scheme the gateway serves off loopback.
     off_loopback_base: String,
 }
 
@@ -331,9 +279,6 @@ impl Probe {
     }
 }
 
-/// Pure: `base` with the scheme the gateway serves on an address that is not
-/// loopback. Loopback is https on every gateway, but another address is https
-/// only behind an operator certificate. Its health names the source.
 fn off_loopback_base(base: &str, health: Option<&serde_json::Value>) -> String {
     let operator = health
         .and_then(|h| h.pointer("/tls/source"))
@@ -344,8 +289,6 @@ fn off_loopback_base(base: &str, health: Option<&serde_json::Value>) -> String {
     format!("{scheme}://{authority}")
 }
 
-/// The HTTPS origin this gateway serves with its own certificate, once it
-/// answers there as this gateway. Its health names the origin.
 fn gateway_https_origin(probe: &Probe) -> Option<String> {
     let ours = probe.ours.as_ref()?;
     let origin = ours.pointer("/tls/https_origin")?.as_str()?;
@@ -353,12 +296,6 @@ fn gateway_https_origin(probe: &Probe) -> Option<String> {
     reaches_this_gateway(&probe.remote, origin, &id).then(|| origin.to_string())
 }
 
-/// The tailnet origin another device can open, or `None` with the reason
-/// printed.
-///
-/// Tailscale is asked, through `lucidos-tailscale`, and only to FIND AN ADDRESS
-/// TO PRINT, never in the auth decision, which keeps ADR 0094 intact. The
-/// address and name are the ones Tailscale reports (ADR 0588).
 fn tailnet_origin(probe: &Probe) -> Option<String> {
     let state = lucidos_tailscale::tailnet_state();
     let Some(node) = state.node() else {
@@ -373,11 +310,6 @@ fn tailnet_origin(probe: &Probe) -> Option<String> {
         .find(|origin| reaches_this_gateway(&probe.remote, origin, &ours))
 }
 
-/// The tailnet origins worth trying, most useful first.
-///
-/// `https://<name>` leads, but only when Tailscale can certify the name: that is
-/// the address with the installable app and push. Then the gateway's own port
-/// at the name a person can retype, then at the bare address.
 fn tailnet_candidates(base: &str, node: &lucidos_tailscale::TailnetNode) -> Vec<String> {
     let mut origins = Vec::new();
     if let Some(name) = node.https_name() {
@@ -391,15 +323,6 @@ fn tailnet_candidates(base: &str, node: &lucidos_tailscale::TailnetNode) -> Vec<
     origins
 }
 
-/// The origin at `host` that actually answers, or `None`.
-///
-/// Holding a tailnet address says nothing about being reachable at it, and
-/// both ways of getting that wrong ship by default. The packaged gateway binds
-/// loopback, where `<name>:<port>` is dead. `tailscale serve` is the mirror
-/// case: it fronts 443 on that same name and proxies to `127.0.0.1`, so it
-/// answers where the gateway's own port does not.
-///
-/// So this asks instead of inferring, and health is the question it asks.
 fn reachable_origin(probe: &Probe, host: &str) -> Option<String> {
     let ours = our_instance(probe, "Using the gateway's own port at --host")?;
     qr_origin_candidates(&probe.off_loopback_base, host)
@@ -407,10 +330,6 @@ fn reachable_origin(probe: &Probe, host: &str) -> Option<String> {
         .find(|origin| reaches_this_gateway(&probe.remote, origin, &ours))
 }
 
-/// The origins worth trying for `host`, most specific first.
-///
-/// Always `https` for the bare one: `serve` terminates TLS itself, even when
-/// the gateway behind it speaks plain HTTP.
 fn qr_origin_candidates(base: &str, host: &str) -> Vec<String> {
     let ported = origin_at_host(base, host);
     let served = format!("https://{host}");
@@ -421,12 +340,6 @@ fn qr_origin_candidates(base: &str, host: &str) -> Vec<String> {
     }
 }
 
-/// Does `origin` reach the gateway whose health carries `ours`?
-///
-/// Two gateways can run on one machine, and `serve` on 443 fronts only one of
-/// them. A pairing code works only on the gateway that minted it, so an answer
-/// from the other one is a dead QR. So the answer must carry our id, and a
-/// gateway older than `instance_id` proves nothing.
 fn reaches_this_gateway(client: &reqwest::blocking::Client, origin: &str, ours: &str) -> bool {
     health(client, origin)
         .as_ref()
@@ -435,8 +348,6 @@ fn reaches_this_gateway(client: &reqwest::blocking::Client, origin: &str, ours: 
         == Some(ours)
 }
 
-/// This gateway's `instance_id` over loopback, or `None` with `outcome` and
-/// the reason printed.
 fn our_instance(probe: &Probe, outcome: &str) -> Option<String> {
     let ours = probe.ours.as_ref().and_then(instance_id);
     if ours.is_none() {
@@ -448,7 +359,6 @@ fn our_instance(probe: &Probe, outcome: &str) -> Option<String> {
     ours
 }
 
-/// The `instance_id` a gateway's health carries.
 fn instance_id(health: &serde_json::Value) -> Option<String> {
     health
         .get("instance_id")
@@ -456,10 +366,6 @@ fn instance_id(health: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The health body at `origin`, or `None` when nothing answered in time.
-///
-/// Its own short timeout: several of these run back to back, and a dead
-/// address is the ordinary answer rather than the exceptional one.
 fn health(client: &reqwest::blocking::Client, origin: &str) -> Option<serde_json::Value> {
     client
         .get(format!("{origin}{}", gateway::HEALTH_PATH))
@@ -471,10 +377,6 @@ fn health(client: &reqwest::blocking::Client, origin: &str) -> Option<serde_json
         .ok()
 }
 
-/// `base` with its hostname swapped for `host`, keeping the scheme and port.
-///
-/// The same move `MobileAccessPage`'s `originAtHost` makes. `base` is the
-/// off-loopback one, so its scheme is what answers at `<host>:<port>`.
 fn origin_at_host(base: &str, host: &str) -> String {
     let (scheme, authority) = base.split_once("://").unwrap_or(("https", base));
     match authority.rsplit_once(':') {
@@ -485,18 +387,11 @@ fn origin_at_host(base: &str, host: &str) -> String {
     }
 }
 
-/// `data` as a QR made of half-block characters, or `None` if it does not fit.
-///
-/// Black on white, set explicitly. Half the terminals in use are dark, and the
-/// glyphs would then be light modules on a dark field. That is an inverted QR,
-/// which many scanners refuse. `NO_COLOR` drops the escapes for anyone who has
-/// asked for no colour, and their terminal's own theme then decides.
 fn terminal_qr(data: &str) -> Option<String> {
     let plain = std::env::var_os("NO_COLOR").is_some();
     Some(colorize(&qr_block(data)?, plain))
 }
 
-/// The bare half-block QR, before any colour is put around it.
 fn qr_block(data: &str) -> Option<String> {
     use qrcode::render::unicode;
     let code = qrcode::QrCode::new(data).ok()?;
@@ -509,8 +404,6 @@ fn qr_block(data: &str) -> Option<String> {
     )
 }
 
-/// Wrap every line in black-on-white, unless the caller asked for no colour.
-/// Split out so the escaping is testable without a terminal.
 fn colorize(block: &str, plain: bool) -> String {
     let mut out = String::with_capacity(block.len() * 2);
     for line in block.lines() {
@@ -530,7 +423,6 @@ fn colorize(block: &str, plain: bool) -> String {
 mod tests {
     use super::*;
 
-    /// A loopback origin that answers one request with `response`.
     fn answer_once(response: String) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -669,8 +561,6 @@ mod tests {
 
     #[test]
     fn swapping_the_host_keeps_the_scheme_and_the_port() {
-        // The gateway is found at loopback and reached from a phone by name.
-        // Everything but the hostname has to survive that swap.
         assert_eq!(
             origin_at_host("https://127.0.0.1:5251", "mac.tail1234.ts.net"),
             "https://mac.tail1234.ts.net:5251"
@@ -683,10 +573,6 @@ mod tests {
 
     #[test]
     fn a_served_tailnet_name_is_probed_as_well_as_the_gateway_port() {
-        // Both default setups get this wrong in opposite directions, so both
-        // origins have to be on the list. Under the packaged loopback bind
-        // `<name>:<port>` is dead; under `tailscale serve` the bare name is
-        // the live one, over TLS the gateway itself may not speak.
         assert_eq!(
             qr_origin_candidates("http://127.0.0.1:5252", "mac.tail1234.ts.net"),
             vec![
@@ -730,7 +616,6 @@ mod tests {
 
     #[test]
     fn without_a_certificate_there_is_no_https_candidate() {
-        // Headscale issues no certificates, so no serve URL can exist.
         assert_eq!(
             tailnet_candidates(
                 "http://127.0.0.1:5252",
@@ -741,7 +626,6 @@ mod tests {
                 "http://100.70.0.1:5252".to_string(),
             ]
         );
-        // MagicDNS off: the address Tailscale reported is all there is.
         assert_eq!(
             tailnet_candidates("http://127.0.0.1:5252", &node(None, false)),
             vec!["http://100.70.0.1:5252".to_string()]
@@ -759,8 +643,6 @@ mod tests {
     #[test]
     fn the_terminal_qr_is_black_on_white_unless_colour_is_declined() {
         let qr = terminal_qr("https://mac.tail1234.ts.net/~/?pair=01234567").unwrap();
-        // An inverted QR is one many scanners refuse, and a dark terminal makes
-        // every unstyled one inverted.
         assert!(qr.contains("\u{1b}[30;47m") || std::env::var_os("NO_COLOR").is_some());
 
         let plain = colorize("ab\ncd", true);
@@ -770,9 +652,6 @@ mod tests {
 
     #[test]
     fn a_pairing_qr_fits_an_ordinary_terminal() {
-        // A QR wider than the window wraps, and a wrapped QR scans as nothing.
-        // A MagicDNS pairing URL lands at version 3, so 29 modules plus the
-        // 8-module quiet zone. The unicode renderer packs two rows per line.
         let block = qr_block("https://mac.tail1234.ts.net/~/?pair=01234567").unwrap();
         let widest = block.lines().map(|l| l.chars().count()).max().unwrap();
         assert!(
@@ -783,7 +662,6 @@ mod tests {
 
     #[test]
     fn every_line_is_wrapped_and_reset() {
-        // A line left unreset paints the rest of the terminal white.
         let painted = colorize("ab\ncd", false);
         assert_eq!(
             painted,

@@ -1,10 +1,7 @@
-//! The buffer behind a coding-agent turn's `CodingAgentTextStreamed` events.
-
 use uuid::Uuid;
 
 const PARAGRAPH_BREAK: &str = "\n\n";
 
-/// A turn's assistant text, and how much of it is already persisted.
 #[derive(Default)]
 pub(crate) struct CodingAgentTextBuffer {
     text: String,
@@ -16,9 +13,6 @@ impl CodingAgentTextBuffer {
         self.text.push_str(text);
     }
 
-    /// Make the next text start a new paragraph. Idempotent, so a run of tool
-    /// calls with no prose between them adds one break, not one each. Text
-    /// ending in one newline gets the second only.
     pub(crate) fn break_paragraph(&mut self) {
         if self.text.is_empty() || self.text.ends_with(PARAGRAPH_BREAK) {
             return;
@@ -31,7 +25,6 @@ impl CodingAgentTextBuffer {
         self.text.push_str(missing);
     }
 
-    /// The tail not yet persisted, or `None` while it holds only whitespace.
     fn unflushed(&self) -> Option<&str> {
         let tail = &self.text[self.text.floor_char_boundary(self.persisted_len)..];
         (!tail.trim().is_empty()).then_some(tail)
@@ -41,16 +34,12 @@ impl CodingAgentTextBuffer {
         self.persisted_len = self.text.len();
     }
 
-    /// The unflushed tail, now marked persisted. `None` while it holds only
-    /// whitespace.
     fn take_tail(&mut self) -> Option<String> {
         let tail = self.unflushed()?.to_string();
         self.mark_flushed();
         Some(tail)
     }
 
-    /// Close the prose before `note`, then add `note` as its own paragraph.
-    /// Returns the two chunks to store: the prose, then the note.
     fn close_with_progress_note(&mut self, note: &str) -> (Option<String>, Option<String>) {
         let prose = self.take_tail();
         self.break_paragraph();
@@ -60,8 +49,6 @@ impl CodingAgentTextBuffer {
         (prose, note)
     }
 
-    /// Emit the unflushed tail as one `CodingAgentTextStreamed` and mark it
-    /// persisted. Does nothing while the tail holds only whitespace.
     pub(crate) async fn flush(
         &mut self,
         event_bus: &crate::engine::event_bus::EventBus,
@@ -149,21 +136,13 @@ async fn emit(
 mod tests {
     use super::CodingAgentTextBuffer;
 
-    /// One step of a turn, as the agent loop sees it.
     enum Step {
-        /// Text that opens a new content block.
         Block(&'static str),
-        /// More text for the block already open.
         Delta(&'static str),
         Tool,
-        /// A progress note, stored as its own chunk and marked `*`.
         Note(&'static str),
     }
 
-    /// Drive the buffer the way the loop does: break the paragraph where a
-    /// block opens, flush after every text chunk, and flush then break the
-    /// paragraph at every tool call. Returns every chunk that would have been
-    /// stored, plus the buffer.
     fn run(steps: &[Step]) -> (Vec<String>, CodingAgentTextBuffer) {
         let mut buf = CodingAgentTextBuffer::default();
         let mut chunks = Vec::new();

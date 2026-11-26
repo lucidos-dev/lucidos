@@ -1,16 +1,3 @@
-//! E2E coverage for a batch of reads run as one parallel run (ADR 0246).
-//!
-//! The mock's `MOCK_READ_FILES:` sentinel puts several `read_file` calls in one
-//! response. Only that reaches the parallel path through the real agent loop.
-//! Each call emits its own events as it starts and ends, so the rows may
-//! interleave in any order. The contract is the pairing: every result names
-//! its own call, lands after it, and carries that call's outcome.
-//!
-//! The paths do not exist on purpose. `read_file` resolves under `data/`, which
-//! the workspace tracks in git, and a scratch file there would dirty the tree
-//! the apply tests merge into. A missing file's result names its own path,
-//! which is all the pairing check needs.
-
 use crate::support::{base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client};
 use serde_json::json;
 
@@ -89,8 +76,6 @@ async fn a_batch_of_reads_pairs_each_result_with_its_own_call() {
     assert_eq!(calls.len(), 3, "one ToolCalled per read: {rows:?}");
     assert_eq!(results.len(), 3, "one ToolResult per read: {rows:?}");
 
-    // Concurrent inserts can commit in either order, so a call is known by
-    // its path rather than by its position.
     let mut started: Vec<&str> = calls
         .iter()
         .filter_map(|(_, _, call)| call["args"]["path"].as_str())

@@ -1,7 +1,3 @@
-//! Affected triggers through the real update and uninstall paths: the staged
-//! preview, the event, the confirm's outcome and its one notification. The
-//! matching rules themselves are tested in `triggers::affected`.
-
 use std::path::PathBuf;
 
 use super::helpers::*;
@@ -30,8 +26,6 @@ source = "https://github.com/example-org/example-repo"
 const INDEX: &str = "apps/token-cost/index.html";
 const DAILY: &str = "apps/token-cost/knowhow/daily-price-check.md";
 
-/// A trigger an agent created with `create_trigger`: it belongs to the app,
-/// names no path, and has no plugin provenance.
 fn agent_trigger(id: &str, name: &str) -> TriggerConfig {
     TriggerConfig::from_created_payload(&serde_json::json!({
         "trigger_id": id,
@@ -43,7 +37,6 @@ fn agent_trigger(id: &str, name: &str) -> TriggerConfig {
     .unwrap()
 }
 
-/// A trigger the acting plugin ships, which its own re-sync handles.
 fn own_trigger() -> TriggerConfig {
     let mut t = agent_trigger("t-own", "Token Cost refresh");
     t.plugin_id = Some("token-cost".to_string());
@@ -57,7 +50,6 @@ fn stage_version(ws: &Path, tag: &str, manifest: &str, files: &[(&str, &[u8])]) 
     extract_to(&dir, &archive)
 }
 
-/// A workspace with Token Cost v0.4.0 installed, the knowhow file included.
 async fn installed_v1(bus: &MockEventBus) -> (tempfile::TempDir, PathBuf) {
     let (tmp, ws) = fresh_workspace();
     let root = stage_version(
@@ -77,7 +69,6 @@ async fn installed_v1(bus: &MockEventBus) -> (tempfile::TempDir, PathBuf) {
     (tmp, ws)
 }
 
-/// Confirm the update to v0.6.0, which drops the knowhow file.
 async fn update_to_v2(
     ws: &Path,
     bus: &MockEventBus,
@@ -99,8 +90,6 @@ async fn update_to_v2(
     .expect("update")
 }
 
-/// Stage the update to v0.6.0 the way `stage_install_request` does, matching
-/// over `triggers`, and return the preview.
 fn staged_v2_preview(ws: &Path, triggers: &[TriggerConfig]) -> serde_json::Value {
     let pending = std::sync::Arc::new(PendingInstallsMap::default());
     let archive_dir = ws.join("archive-v2");
@@ -127,6 +116,7 @@ fn staged_v2_preview(ws: &Path, triggers: &[TriggerConfig]) -> serde_json::Value
             &Ok(installed),
             &GitCredentials::none(),
             &running(),
+            None,
         ),
         triggers,
     );
@@ -258,8 +248,6 @@ async fn a_clean_update_raises_no_notification() {
     assert!(notifications(&bus).is_empty());
 }
 
-/// The confirm matches over its own trigger snapshot, so a trigger created
-/// after the panel was staged still lands in the event.
 #[tokio::test]
 async fn the_confirm_sees_a_trigger_created_after_staging() {
     let bus = MockEventBus::new();
@@ -313,6 +301,7 @@ async fn an_uninstall_reports_previews_and_notifies_once() {
             "0.4.0",
             "Token Cost",
             vec![INDEX.to_string(), DAILY.to_string()],
+            Vec::new(),
         ),
         &triggers,
     );
@@ -335,11 +324,12 @@ async fn an_uninstall_reports_previews_and_notifies_once() {
         plugin_id: "token-cost".to_string(),
         plugin_version: "0.4.0".to_string(),
         plugin_name: "Token Cost".to_string(),
+        hooks: Vec::new(),
         files_present: vec![INDEX.to_string(), DAILY.to_string()],
         files_missing: vec![],
         created_at: chrono::Utc::now(),
     };
-    let outcome = uninstall_with_bus(&ws, &bus, &entry, &triggers, None)
+    let outcome = uninstall_with_bus(&ws, &bus, &entry, &triggers, None, vec![])
         .await
         .expect("uninstall");
 

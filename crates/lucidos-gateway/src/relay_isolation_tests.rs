@@ -1,6 +1,3 @@
-//! ADR 0723 security regressions, through both real gateway routers and a
-//! malicious engine socket. Ordinary Rust tests need no browser or live engine.
-//! The named browser test also exercises actual browser origin/worker rules.
 use super::*;
 use lucidos_gateway_stamp::workspace_operation::{RECEIVE_ROUTE, RECEIVE_START_ROUTE};
 
@@ -47,8 +44,6 @@ fn malicious_engine(seen: Seen, _: tokio::sync::oneshot::Receiver<()>) -> axum::
                         .body(Body::empty())
                         .unwrap()
                 }
-                // A foreign document can arrive under any API path and MIME.
-                // Content-Type is peer-controlled, not an authority decision.
                 _ => (
                     [
                         (header::CONTENT_TYPE, "text/html"),
@@ -460,19 +455,12 @@ async fn foreign_redirects_cannot_target_the_connecting_gateway() {
     }
 }
 
-/// Explicit invocation only: `cargo test --locked -p lucidos-gateway
-/// remote_browser_origin_boundary -- --ignored --nocapture`.
-/// Runs Chromium and mobile WebKit on ephemeral loopback gateways. No live
-/// workspace, device credential or engine is used. Node/Playwright come from
-/// the provisioned worktree node_modules, not a separate installation.
 #[tokio::test]
 #[ignore = "requires the provisioned Playwright browsers; invoke by name"]
 async fn remote_browser_origin_boundary() {
     let p = paired_with_engine(malicious_engine).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://localhost:{}", listener.local_addr().unwrap().port());
-    // Test-only historical runtime route: seed a worker installed before this
-    // upgrade. Production routing never serves this exception.
     let router = crate::server::gateway_router(p.a.clone()).route(
         "/dev@cloud/legacy-worker.js",
         axum::routing::get(|| async {
@@ -540,7 +528,6 @@ async fn gateway_support_does_not_certify_an_old_running_engine() {
     }
 }
 
-/// A page load always probes fresh; other requests may use a cached verdict.
 const PAGE_LOAD: &[(&str, &str)] = &[("sec-fetch-dest", "document")];
 
 #[tokio::test]
@@ -621,8 +608,6 @@ async fn engine_contract_probe_requires_pairing_and_signature_and_projects_only_
             }))
         })
     }).await;
-    // An older peer forwards its browser's `Origin`. Only the credential and
-    // the signature decide a gateway call, never browser metadata.
     for (credential, signature, foreign_origin, status) in [
         (false, false, false, StatusCode::UNAUTHORIZED),
         (true, false, false, StatusCode::UNAUTHORIZED),
@@ -741,8 +726,6 @@ async fn a_page_load_of_a_workspace_b_no_longer_has_goes_to_the_list() {
     assert_eq!(page.headers()[header::LOCATION], "/~/?pick");
 }
 
-/// Production Vite client, real e2e engine, and disposable A/B gateway routers.
-/// The repository runner supplies the engine/socket/key; never a live workspace.
 #[tokio::test]
 #[ignore = "run through scripts/e2e-api.sh with the production client and engine"]
 async fn remote_production_client_continuity() {
@@ -785,8 +768,6 @@ async fn remote_production_client_continuity() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://localhost:{}", listener.local_addr().unwrap().port());
-    // End real response streams without taking unrelated lazy-loaded client
-    // assets offline. The route exists only in this disposable test router.
     let (disconnect, _) = tokio::sync::broadcast::channel::<()>(1);
     let signal = disconnect.clone();
     let router = crate::server::gateway_router(p.a.clone())

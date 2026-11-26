@@ -1,37 +1,13 @@
-//! The working understanding: the model's picture of the job, written as
-//! ordinary text in its own reply and rendered back at the tail of every round.
-//!
-//! It is the only thing that outlives a turn, and where it is written is the
-//! point. A tool call costs a whole round, and text beside the next action
-//! costs nothing, so it rides in a marked span of the reply.
-//!
-//! **The parse reads assistant text only.** The engine renders the document
-//! back inside the user message. Scoping the parse to the model's own turn is
-//! what stops the engine reading its own rendering as a write.
-//!
-//! Three sections travel inside the span and only two are stored. `[TODO]` goes
-//! to the projection: the engine writes `waiting` and `abandoned` there, and a
-//! stored copy of the model's own text could never show them. `[KEEP OPEN]` is
-//! applied and dropped. A stored keep would be re-read as a fresh one every
-//! round, which is the standing keep ADR 0085 recorded as a design error.
-
 use std::collections::HashSet;
 use std::ops::Range;
 
 use crate::engine::thread_events::{TodoItem, TodoStatus};
 use crate::engine::tools::todo::MAX_TODO_ITEMS;
 
-/// What follows replaces the document. Also what the engine's own rendered
-/// block opens with, so the model meets one heading rather than two.
 pub(crate) const OPEN_REPLACE: &str = "[WORKING UNDERSTANDING]";
-/// What follows is appended to it.
 pub(crate) const OPEN_ADD: &str = "[WORKING UNDERSTANDING: ADD]";
-/// Ends either one.
 pub(crate) const CLOSE: &str = "[/WORKING UNDERSTANDING]";
 
-/// The shared opening of both forms, and of the engine's own rendered block.
-/// Enough to suppress a live stream on, and what [`strip_faulted_markup`] cuts
-/// from a reply the parse could not read.
 pub(crate) const MARKER_PREFIX: &str = "[WORKING UNDERSTANDING";
 
 pub(crate) const ASSISTANT_ROLE: &str = "assistant";
@@ -40,7 +16,7 @@ const CONSTRAINTS_HEADING: &str = "[CONSTRAINTS]";
 const TODO_HEADING: &str = "[TODO]";
 const KEEP_OPEN_HEADING: &str = "[KEEP OPEN]";
 
-/// Past this size the block's own header asks for a rewrite. Nothing is
+/// INVARIANT: Past this size the block's own header asks for a rewrite. Nothing is
 /// refused and nothing is truncated.
 ///
 /// Soft rather than the hard cap the scratchpad had. Under an append a refusal
@@ -49,45 +25,29 @@ const KEEP_OPEN_HEADING: &str = "[KEEP OPEN]";
 /// and one compiler error runs to about a thousand chars by itself.
 pub(crate) const ASK_TO_REWRITE_ABOVE_CHARS: usize = 8_000;
 
-/// What a superseded span in the model's own reply collapses to.
 pub(crate) const SUPERSEDED_SPAN: &str =
     "[an earlier version of your working understanding. The current one is below.]";
 
-/// Which of the two forms an opening marker named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Form {
-    /// Replace the document.
     Replace,
-    /// Append to it.
     Add,
 }
 
-/// One marked span, lifted out of a reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Span {
     pub(crate) form: Form,
-    /// Everything before the first section heading.
     pub(crate) body: String,
-    /// Present only when the span carried a `[CONSTRAINTS]` heading.
     pub(crate) constraints: Option<String>,
-    /// Present only when the span carried a `[TODO]` heading.
     pub(crate) todo: Option<Vec<TodoItem>>,
-    /// Addresses written under `[KEEP OPEN]`, as the model wrote them.
     pub(crate) keep_open: Vec<String>,
-    /// Where the span sits in the reply, both markers included.
     pub(crate) at: Range<usize>,
-    /// Whether the reply carried the closing marker. An unclosed span runs to
-    /// the end of the text, so on a cut reply it holds however far the model
-    /// had got. See [`ParsedReply::drop_unclosed`].
     pub(crate) closed: bool,
 }
 
-/// Every span in one reply, in the order they were written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ParsedReply {
     pub(crate) spans: Vec<Span>,
-    /// What the engine could not read, one line each. Reported in the next
-    /// round's framing rather than swallowed.
     pub(crate) faults: Vec<String>,
 }
 
@@ -101,16 +61,12 @@ impl ParsedReply {
     }
 }
 
-/// Whether the text a parse reads is all the model meant to write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplyEnd {
-    /// The model stopped on its own.
     Complete,
-    /// The user pressed Stop, so the engine made the cut.
     Truncated,
 }
 
-/// The document as the thread holds it: the body and the constraints.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WorkingUnderstanding {
     pub(crate) body: String,
@@ -126,12 +82,6 @@ impl WorkingUnderstanding {
         self.body.chars().count() + self.constraints.chars().count()
     }
 
-    /// The one string the durable event carries.
-    ///
-    /// The constraints ride under their own heading, so the two halves come
-    /// back apart. That is what lets an ADD accumulate each of them separately.
-    /// An empty constraints section is left out rather than written blank: the
-    /// render puts the heading back either way.
     pub(crate) fn to_document(&self) -> String {
         if self.constraints.trim().is_empty() {
             return self.body.trim().to_string();
@@ -143,7 +93,6 @@ impl WorkingUnderstanding {
         )
     }
 
-    /// Read a stored document back into its two halves.
     pub(crate) fn from_document(document: &str) -> Self {
         let mut body = String::new();
         let mut constraints = String::new();
@@ -168,14 +117,10 @@ impl WorkingUnderstanding {
     }
 }
 
-/// What applying a reply's spans produced, beside the new document.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Applied {
-    /// The checklist to write, when a span carried one.
     pub(crate) todo: Option<Vec<TodoItem>>,
-    /// Addresses to hold open, in the order written, deduplicated.
     pub(crate) keep_open: Vec<String>,
-    /// What could not be read, one line each.
     pub(crate) faults: Vec<String>,
 }
 
@@ -205,9 +150,6 @@ pub(crate) fn parse_reply(text: &str) -> ParsedReply {
         } else if rest.starts_with(OPEN_REPLACE) {
             (Form::Replace, OPEN_REPLACE.len())
         } else {
-            // An opening we could not read, such as a third form invented on
-            // the spot. Named rather than skipped in silence: a write nobody
-            // reports is one the model believes it made.
             parsed.faults.push(format!(
                 "an opening marker I could not read at `{}`. Write `{OPEN_REPLACE}` or \
                  `{OPEN_ADD}`.",
@@ -240,7 +182,6 @@ pub(crate) fn parse_reply(text: &str) -> ParsedReply {
     parsed
 }
 
-/// Split one span's text into the body and its three marked sections.
 fn read_span(
     form: Form,
     text: &str,
@@ -311,7 +252,6 @@ fn read_span(
     }
 }
 
-/// The section a line opens, allowing the two obvious decorations.
 fn heading_of(line: &str) -> Option<Section> {
     match normalise_heading(line).as_str() {
         CONSTRAINTS_HEADING => Some(Section::Constraints),
@@ -321,8 +261,6 @@ fn heading_of(line: &str) -> Option<Section> {
     }
 }
 
-/// Strip a markdown heading level and bold marks, so `## [TODO]` and
-/// `**[TODO]**` both count.
 fn normalise_heading(line: &str) -> String {
     line.trim()
         .trim_start_matches('#')
@@ -335,11 +273,6 @@ fn normalise_heading(line: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// A bare heading word alone on a line, which the brackets exist to prevent.
-///
-/// A thread discussing this design writes `todo` and `constraints` constantly,
-/// so the bare words are not headings. Saying so turns the collision into a
-/// nudge, rather than a checklist built out of the model's prose.
 fn near_miss(line: &str) -> Option<&'static str> {
     match normalise_heading(line).as_str() {
         "TODO" => Some(TODO_HEADING),
@@ -403,18 +336,11 @@ fn parse_todo_line(line: &str) -> Option<TodoItem> {
     }
     Some(TodoItem {
         content: content.to_string(),
-        // A text line carries one form of the item, so the present-continuous
-        // form the prompt bar shows while it runs is the same words.
         active_form: content.to_string(),
         status,
     })
 }
 
-/// The addresses under `[KEEP OPEN]`, one per line.
-///
-/// A keep carries an address and nothing else. A trailing number would be a
-/// duration, which asks the model to forecast again. That is the exact question
-/// it could not answer.
 fn read_keeps(lines: &[String], faults: &mut Vec<String>) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut keeps: Vec<String> = Vec::new();
@@ -463,11 +389,6 @@ pub(crate) fn apply_spans(
     let mut seen: HashSet<String> = HashSet::new();
     for span in &parsed.spans {
         match span.form {
-            // Each half replaces on its own, and a half the span never named
-            // stands. Replacing the constraints from an absent heading would
-            // wipe them on the one form most likely to omit it, a whole
-            // rewrite. Appending instead would stack a repeated constraint
-            // copy by copy.
             Form::Replace => {
                 if !span.body.trim().is_empty() {
                     next.body.clone_from(&span.body);
@@ -503,29 +424,10 @@ fn join_nonempty(head: &str, tail: &str) -> String {
     }
 }
 
-/// The reply with every marked span removed.
-///
-/// What is left is what was addressed to the user. Nothing of the document
-/// reaches the chat: not the live stream, not `ResponseGenerated`.
-///
-/// The N-span sibling of `inline_question_repair::splice_out`, which cuts one
-/// range. Named apart so a grep for either returns one function.
 pub(crate) fn splice_spans_out(text: &str, spans: &[Span]) -> String {
     replace_spans(text, spans, "")
 }
 
-/// The reply with leftover markup no span claimed removed.
-///
-/// Runs after the splice, over what it left. An opening the parse could not
-/// read, such as `[WORKING UNDERSTANDING: REPLACE]`, produces a fault and no
-/// span. The splice then has nothing to cut, and the whole block reaches the
-/// user.
-///
-/// The cut runs to the next [`CLOSE`], or to the end of the text when there is
-/// none. That is the rule [`parse_reply`] already applies to a span it could
-/// read, and it is chosen the same way: over-cutting shows the model its own
-/// closing sentence went missing, while leaving the block shows the user
-/// machinery addressed to nobody.
 pub(crate) fn strip_faulted_markup(text: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let mut at = 0usize;
@@ -545,18 +447,11 @@ pub(crate) fn strip_faulted_markup(text: &str) -> String {
         .join("\n\n")
 }
 
-/// The reply with every marked span collapsed to a one-line marker.
-///
-/// The model's reply holds its prose, its document and its next tool call
-/// together, so a superseded copy is SPLICED. Overwriting the whole block would
-/// take the words to the user and the record of the action with it.
 pub(crate) fn fold_spans(text: &str) -> Option<String> {
     let parsed = parse_reply(text);
     if parsed.spans.is_empty() {
         return None;
     }
-    // A marker longer than what it replaces would grow the request while
-    // claiming to shrink it, which is the same guard `apply_stub` applies.
     let folded = replace_spans(text, &parsed.spans, SUPERSEDED_SPAN);
     (folded.len() < text.len()).then_some(folded)
 }
@@ -579,12 +474,9 @@ fn replace_spans(text: &str, spans: &[Span], replacement: &str) -> String {
         .join("\n\n")
 }
 
-/// What the round has to say about the document, beside the document itself.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RoundNotices {
-    /// Everything the engine could not read, one line each.
     pub(crate) faults: Vec<String>,
-    /// The addresses a keep held this round.
     pub(crate) held_open: Vec<String>,
 }
 
@@ -640,8 +532,6 @@ pub(crate) fn render(
     block
 }
 
-/// The mark a status renders as. Three the model writes, and two the engine
-/// writes at a terminator, which come back as words.
 fn mark_of(status: TodoStatus) -> &'static str {
     match status {
         TodoStatus::Pending => " ",
@@ -652,18 +542,12 @@ fn mark_of(status: TodoStatus) -> &'static str {
     }
 }
 
-/// The block's own section name, in the prompt and in the capture.
 pub(crate) const SECTION: &str = "Working Understanding";
 
-/// The block's capture row, billed and grouped like the panel's.
 pub(crate) fn capture_section(block: &str) -> crate::engine::ContextSection {
     super::context_panel::tail_block_section(SECTION, block)
 }
 
-/// The thread's newest document, or `None` before its first write.
-///
-/// Read from the event log, so it survives an engine restart with no in-memory
-/// state to rescue.
 pub(crate) async fn latest_document(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,

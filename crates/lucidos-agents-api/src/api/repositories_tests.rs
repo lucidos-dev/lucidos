@@ -1,9 +1,5 @@
 use super::*;
 
-/// Parity with the frontend's `appIdFromFolder` helper. The two derivations
-/// MUST agree on what counts as a valid app folder — divergence would
-/// silently scope the backend diff to a phantom path while the frontend
-/// renders nothing.
 #[test]
 fn extract_app_id_matches_frontend_validation() {
     assert_eq!(
@@ -19,7 +15,6 @@ fn extract_app_id_matches_frontend_validation() {
         Some("habit-tracker".to_string())
     );
 
-    // Refusals: same shapes the TS helper rejects.
     assert_eq!(super::extract_app_id("/ws/data/artifacts/foo"), None);
     assert_eq!(super::extract_app_id("/ws/data/apps"), None);
     assert_eq!(super::extract_app_id("/ws/data/apps/"), None);
@@ -29,7 +24,6 @@ fn extract_app_id_matches_frontend_validation() {
     assert_eq!(super::extract_app_id("/ws/projects/foo"), None);
     assert_eq!(super::extract_app_id(""), None);
 
-    // Nested: last data/apps/ wins, same as the TS helper.
     assert_eq!(
         super::extract_app_id("/ws/data/apps/outer/data/apps/inner"),
         Some("inner".to_string())
@@ -45,14 +39,6 @@ fn browse_rejects_path_traversal() {
     assert!(!super::is_dangerous_browse_path("/tmp"));
 }
 
-// Tilde expansion moved to `core::home_path` (shared with the
-// `manage_repositories` tool and coding-agent `folder` resolution) and is
-// covered by `core::home_path::tests`.
-
-/// End-to-end of the worktree-diff helpers against a real git repo +
-/// linked worktree on a feature branch with one extra commit. Asserts
-/// the base ref resolves to a usable target and the diff range produces
-/// the expected single-file change.
 #[tokio::test]
 async fn worktree_diff_helpers_against_real_repo() {
     async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
@@ -67,10 +53,6 @@ async fn worktree_diff_helpers_against_real_repo() {
     let main_repo = tempfile::tempdir().unwrap();
     let main_path = main_repo.path();
 
-    // `-c init.defaultBranch=main` makes the test pass on hosts where the
-    // user's git defaults differ (master vs main). Without it,
-    // `git init` creates `master` and our subsequent `worktree add ... main`
-    // fails with "invalid reference: main".
     run(&["-c", "init.defaultBranch=main", "init", "-q"], main_path).await;
     run(&["config", "user.email", "test@example.com"], main_path).await;
     run(&["config", "user.name", "Test"], main_path).await;
@@ -80,7 +62,6 @@ async fn worktree_diff_helpers_against_real_repo() {
     run(&["add", "."], main_path).await;
     run(&["commit", "-q", "-m", "init"], main_path).await;
 
-    // Linked worktree on a new branch, one extra commit.
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
     run(
@@ -101,15 +82,12 @@ async fn worktree_diff_helpers_against_real_repo() {
     run(&["add", "."], &wt_path).await;
     run(&["commit", "-q", "-m", "edit readme"], &wt_path).await;
 
-    // Base ref: no `origin` remote, so origin/HEAD lookup fails — the
-    // helper must fall back to local `main`.
     let base = crate::engine::git_ops::default_local_branch(&wt_path).await;
     assert_eq!(
         base, "main",
         "expected fallback to local main when no origin remote is set, got {base}"
     );
 
-    // Repo root: must point back at the main worktree, not the linked one.
     let root = super::resolve_worktree_repo_root(&wt_path)
         .await
         .unwrap()
@@ -121,7 +99,6 @@ async fn worktree_diff_helpers_against_real_repo() {
         "repo root should be the main worktree: got {root}"
     );
 
-    // 3-dot diff against the resolved base: exactly one modified file.
     let range = format!("{}...HEAD", base);
     let out = run(&["diff", &range, "--no-color"], &wt_path).await;
     assert!(out.status.success(), "git diff failed: {:?}", out);
@@ -131,14 +108,6 @@ async fn worktree_diff_helpers_against_real_repo() {
     assert_eq!(files[0].status, "modified");
 }
 
-/// The Diff button must base its diff on **local** `main`, not the
-/// remote tracking ref `origin/main`. Otherwise, when local `main` is
-/// ahead of `origin/main` (e.g. the engine has applied work but the
-/// push to origin hasn't landed yet), every commit on local main that
-/// isn't on origin shows up in the Diff viewer as if it belonged to the
-/// current thread — even though Apply has already merged those commits.
-/// This was the symptom users saw as "the Diff button shows lots of
-/// code changes when the thread only touched markdown."
 #[tokio::test]
 async fn diff_base_is_local_main_when_origin_is_behind() {
     async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
@@ -174,9 +143,6 @@ async fn diff_base_is_local_main_when_origin_is_behind() {
     )
     .await;
     run(&["push", "-q", "origin", "main"], main_path).await;
-    // origin/HEAD must exist for `symbolic-ref refs/remotes/origin/HEAD`
-    // to succeed — that path is what the buggy code used to return
-    // `origin/main` instead of `main`.
     run(&["remote", "set-head", "origin", "main"], main_path).await;
 
     tokio::fs::write(main_path.join("already-applied.txt"), "shipped\n")
@@ -209,10 +175,6 @@ async fn diff_base_is_local_main_when_origin_is_behind() {
     run(&["add", "."], &wt_path).await;
     run(&["commit", "-q", "-m", "cc: add cc-work.txt"], &wt_path).await;
 
-    // The cc-diff response must:
-    //   - report `base_ref = "main"` (local), not `"origin/main"`
-    //   - list ONLY `cc-work.txt` — the already-applied commit's file
-    //     must not appear, because Apply has already merged it.
     let diff = super::diff_via_worktree(&wt_path, &wt_path, None)
         .await
         .expect("diff_via_worktree should succeed");
@@ -235,18 +197,6 @@ async fn diff_base_is_local_main_when_origin_is_behind() {
     );
 }
 
-/// The mirror of the test above: when the local default branch has been
-/// *rewritten* so the remote-tracking ref no longer reaches it — a repo
-/// migration, a force-pull, or a rebase landing on the user's local `main` —
-/// the Diff button must fall back to `origin/<default>`, which still holds the
-/// branch's true fork point. Otherwise the three-dot merge-base collapses to an
-/// ancient common ancestor and the diff balloons with unrelated churn.
-///
-/// Regression for the `example-repo` migration report: the migration system
-/// committed to the user's local `main` ("secrets transfer", "migration notice"
-/// commits) and rewrote its history so the PR branch's fork point was no longer
-/// an ancestor of local `main`. Lucidos diffed against local `main` and showed
-/// 59 files; the GitHub PR (diffed against the untouched remote base) showed 12.
 #[tokio::test]
 async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
@@ -272,7 +222,6 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     run(&["config", "user.email", "test@example.com"], main_path).await;
     run(&["config", "user.name", "Test"], main_path).await;
 
-    // Root commit, then the fork point the PR branch builds on top of.
     tokio::fs::write(main_path.join("README.md"), "init\n")
         .await
         .unwrap();
@@ -292,8 +241,6 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     )
     .await;
 
-    // Publish to origin and record origin/HEAD → main. `origin/main` now holds
-    // the fork point.
     run(
         &["remote", "add", "origin", origin_path.to_str().unwrap()],
         main_path,
@@ -302,7 +249,6 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     run(&["push", "-q", "origin", "main"], main_path).await;
     run(&["remote", "set-head", "origin", "main"], main_path).await;
 
-    // CC worktree forks from the fork point, adds its own file.
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
     run(
@@ -323,9 +269,6 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     run(&["add", "."], &wt_path).await;
     run(&["commit", "-q", "-m", "cc: add cc-work.txt"], &wt_path).await;
 
-    // A migration tool rewrites local `main`: reset back to the root and commit
-    // a migration notice. `origin/main` (the fork point) is no longer an
-    // ancestor of local `main` — they diverge at the root.
     run(&["reset", "-q", "--hard", &c_root], main_path).await;
     tokio::fs::write(main_path.join("MIGRATION.md"), "moved to new-org\n")
         .await
@@ -363,11 +306,6 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     );
 }
 
-/// App coding-agent threads operate on `data/apps/<id>/` inside the
-/// workspace git. The cc-diff response must scope to that pathspec so
-/// the Diff button doesn't surface stray edits the agent made outside
-/// its scope (the user picked "diff scoped to the app folder" — files
-/// in `data/artifacts/`, `data/knowhow/`, etc. must not appear).
 #[tokio::test]
 async fn diff_via_worktree_scopes_to_app_pathspec() {
     async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
@@ -379,7 +317,6 @@ async fn diff_via_worktree_scopes_to_app_pathspec() {
             .unwrap()
     }
 
-    // Simulate a workspace as a real git repo with main committed.
     let ws_dir = tempfile::tempdir().unwrap();
     let ws_path = ws_dir.path();
     run(&["-c", "init.defaultBranch=main", "init", "-q"], ws_path).await;
@@ -391,8 +328,6 @@ async fn diff_via_worktree_scopes_to_app_pathspec() {
     run(&["add", "."], ws_path).await;
     run(&["commit", "-q", "-m", "init"], ws_path).await;
 
-    // App CC worktree on a branch — touches the app folder AND files
-    // outside scope. We expect only the in-scope file in the response.
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
     run(
@@ -436,8 +371,6 @@ async fn diff_via_worktree_scopes_to_app_pathspec() {
         paths
     );
 
-    // Sanity: without the pathspec, the out-of-scope file is visible.
-    // Asserts the scoping is what's filtering it out, not test setup.
     let unscoped = super::diff_via_worktree(&wt_path, &wt_path, None)
         .await
         .expect("diff_via_worktree should succeed without pathspec");
@@ -450,10 +383,6 @@ async fn diff_via_worktree_scopes_to_app_pathspec() {
     );
 }
 
-// -------------------- resolve_recorded_branch --------------------
-
-/// A repo on `main` with one commit, plus a coding-agent branch carrying one
-/// more. Returns the repo path and the SHA of the branch's work.
 async fn repo_with_agent_branch(tracked: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
     use crate::engine::git_ops::git_cmd;
     let tmp = tempfile::tempdir().unwrap();
@@ -484,12 +413,6 @@ fn cc_meta() -> crate::engine::thread_events::EventMeta {
     }
 }
 
-/// Open a coding-agent thread the way a real first turn does: the user's
-/// message, then the spawn's `SessionStarted`. Both are load-bearing. The
-/// lifecycle rejects `CodingAgentIdled` on a thread it has not classified as
-/// CC, and `SessionStarted` is the only event that sets
-/// `thread_summaries.is_coding_agent`, which
-/// `thread_owns_a_coding_agent_worktree` reads.
 async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uuid) {
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
@@ -534,7 +457,6 @@ async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uui
     .unwrap();
 }
 
-/// Record a turn boundary the way a real idle does.
 async fn seed_idle(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
@@ -562,9 +484,6 @@ async fn seed_idle(
     .unwrap();
 }
 
-/// The reported bug at the API layer: the worktree has been reclaimed, so the
-/// Diff falls back to the branch recorded at spawn, which a rename inside the
-/// repo has since retired. It must find the work rather than 400 on a dead ref.
 #[tokio::test]
 async fn resolve_recorded_branch_follows_a_rename_once_the_worktree_is_gone() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -606,8 +525,6 @@ async fn resolve_recorded_branch_keeps_a_branch_that_still_exists() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Deleted rather than renamed: there is nothing to show, and the caller gets a
-/// message naming the branch instead of git's raw "ambiguous argument".
 #[tokio::test]
 async fn resolve_recorded_branch_reports_a_deleted_branch_by_name() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -632,11 +549,6 @@ async fn resolve_recorded_branch_reports_a_deleted_branch_by_name() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- resolve_diff_worktree --------------------
-
-/// A conflict-resolution session works in the merge worktree, on a temp branch
-/// that is not the thread's. Diffing it would answer the Diff button with the
-/// merge in progress instead of the thread's own work.
 #[test]
 fn live_thread_worktree_skips_a_conflict_merge_tree() {
     let own = std::path::PathBuf::from("/tmp/lucidos-test/thread-worktree");
@@ -659,10 +571,6 @@ fn live_thread_worktree_skips_a_conflict_merge_tree() {
     assert_eq!(super::live_thread_worktree(None), None);
 }
 
-/// A Tier-1 resolution merges in place: the session stays in the thread's own
-/// worktree, and its binding outlives the resolution. The Diff button must keep
-/// answering from that live worktree, during the merge and for the rest of the
-/// session.
 #[test]
 fn live_thread_worktree_keeps_the_own_tree_after_a_tier_1_binding() {
     let own = std::path::PathBuf::from("/tmp/lucidos-test/thread-worktree");
@@ -680,11 +588,6 @@ fn live_thread_worktree_keeps_the_own_tree_after_a_tier_1_binding() {
     );
 }
 
-/// The reported bug: an app coding-agent thread commits mid-turn, the Diff
-/// button lights up, and the click answers 404. No `CodingAgentIdled` has been
-/// emitted yet on a first turn, and an app thread records no
-/// `SessionStarted.repo_id` for the branch-ref fallback to use. The worktree is
-/// sitting at its deterministic path the whole time.
 #[tokio::test]
 async fn resolve_diff_worktree_finds_the_deterministic_path_before_the_first_idle() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -695,7 +598,6 @@ async fn resolve_diff_worktree_finds_the_deterministic_path_before_the_first_idl
     let expected =
         crate::engine::session_queries::deterministic_worktree_path(ws.path(), thread_id);
 
-    // Nothing on disk yet: the caller must fall through to the branch ref.
     assert_eq!(
         super::resolve_diff_worktree(&pool, thread_id, None, ws.path()).await,
         None,
@@ -713,10 +615,6 @@ async fn resolve_diff_worktree_finds_the_deterministic_path_before_the_first_idl
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The deterministic path reads the thread id's first 8 hex characters and
-/// nothing else. An id naming no thread must not reach the worktree of a real
-/// thread sharing that prefix. Nothing would scope that answer, so it would
-/// carry the real thread's whole diff.
 #[tokio::test]
 async fn resolve_diff_worktree_refuses_a_thread_id_it_does_not_know() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -727,7 +625,6 @@ async fn resolve_diff_worktree_refuses_a_thread_id_it_does_not_know() {
     let worktree = crate::engine::session_queries::deterministic_worktree_path(ws.path(), real);
     tokio::fs::create_dir_all(&worktree).await.unwrap();
 
-    // Same 8-char prefix, different uuid, no thread of its own.
     let mut bytes = real.into_bytes();
     bytes[15] ^= 0xff;
     let colliding = Uuid::from_bytes(bytes);
@@ -747,10 +644,6 @@ async fn resolve_diff_worktree_refuses_a_thread_id_it_does_not_know() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A lookup that could not run used to be indistinguishable from "not an app
-/// thread": both answered `None`, which both callers read as "diff the whole
-/// repo". A pool timeout then returned every file the agent touched anywhere
-/// in the workspace, with a 200 and no log.
 #[tokio::test]
 async fn an_unanswerable_app_pathspec_lookup_fails_the_request() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -770,7 +663,6 @@ async fn an_unanswerable_app_pathspec_lookup_fails_the_request() {
         "an app thread scopes its diff to its own folder"
     );
 
-    // A thread that is not an app thread is genuinely unscoped, and stays so.
     let other = Uuid::new_v4();
     sqlx::query("INSERT INTO thread_summaries (thread_id) VALUES ($1)")
         .bind(other)
@@ -792,9 +684,6 @@ async fn an_unanswerable_app_pathspec_lookup_fails_the_request() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A running turn owns the answer. The last idle describes where the PREVIOUS
-/// turn worked, so the live session's own worktree wins whenever both are on
-/// disk.
 #[tokio::test]
 async fn resolve_diff_worktree_prefers_the_running_session_over_the_last_idle() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -823,9 +712,6 @@ async fn resolve_diff_worktree_prefers_the_running_session_over_the_last_idle() 
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- git_show_file confinement --------------------
-
-/// A repo on `main` with one commit holding `files`.
 async fn repo_with_files(files: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
     use crate::engine::git_ops::git_cmd;
     let tmp = tempfile::tempdir().unwrap();
@@ -849,9 +735,6 @@ fn header_of(response: &Response, name: header::HeaderName) -> Option<String> {
         .map(|v| v.to_str().unwrap().to_string())
 }
 
-/// The repo file route and the change file route both answer through
-/// `git_show_file`, on the shell's own origin. A repo holds whatever its
-/// authors committed, so a document in it must never run as the shell.
 #[tokio::test]
 async fn git_show_file_sandboxes_documents_that_can_run_script() {
     let active = [
@@ -879,8 +762,6 @@ async fn git_show_file_sandboxes_documents_that_can_run_script() {
     }
 }
 
-/// `nosniff` covers every type, so a text or binary body is never read as a
-/// document. Only an active document needs the sandbox on top.
 #[tokio::test]
 async fn git_show_file_sends_nosniff_on_every_type() {
     let inert = ["notes.txt", "Makefile", "image.png", "spec.pdf", "main.rs"];
@@ -902,8 +783,6 @@ async fn git_show_file_sends_nosniff_on_every_type() {
     }
 }
 
-/// `RepositoryStore::register` emits `RepositoryAdded` itself, so the handler
-/// registering one repository must leave exactly one such event behind.
 #[tokio::test]
 async fn adding_a_repository_announces_it_exactly_once() {
     if !crate::test_support::in_engine_child(
@@ -951,8 +830,6 @@ async fn adding_a_repository_announces_it_exactly_once() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// An unanswerable branch probe keeps the recorded name, so the diff fails
-/// with git's own error instead of showing another branch.
 #[tokio::test]
 async fn resolve_recorded_branch_keeps_the_name_when_git_cannot_be_asked() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;

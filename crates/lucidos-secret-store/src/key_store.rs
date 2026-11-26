@@ -1,37 +1,21 @@
-//! Where the workspace keys live: the macOS Keychain on the packaged app, a
-//! key file everywhere else (ADR 0509).
-//!
-//! The engine reaches the Keychain through the `security-framework` library,
-//! never the `security` command: no OS-specific command runs in the engine.
-
 use std::path::{Path, PathBuf};
 
 use super::SecretKey;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Overrides which store [`resolve`] picks: `keychain` or `file`.
 pub const KEY_STORE_ENV: &str = "LUCIDOS_SECRET_KEY_STORE";
 
-/// The Keychain service every workspace key is filed under.
 pub const KEYCHAIN_SERVICE: &str = "Lucidos workspace secrets";
 
-/// The directory under the private subtree holding key files.
 pub const KEY_DIR_NAME: &str = lucidos_home::private::SECRET_KEYS_DIR;
 
-/// A place that keeps named keys. A cloud KMS or a password manager can be
-/// another one.
 pub trait KeyStore: Send + Sync {
-    /// Where `name` lives, in words a boot-failure message can show.
     fn describe(&self, name: &str) -> String;
     fn get(&self, name: &str) -> Result<Option<SecretKey>, BoxError>;
-    /// Store `key` under `name`, replacing what is there. Callers outside this
-    /// module go through [`KeyStore::put_new`] or [`replace_keeping`].
     fn put(&self, name: &str, key: &SecretKey) -> Result<(), BoxError>;
     fn delete(&self, name: &str) -> Result<(), BoxError>;
 
-    /// Store `key` under `name` only when nothing is there. `false` means a
-    /// key already holds the name, and it stays untouched.
     fn put_new(&self, name: &str, key: &SecretKey) -> Result<bool, BoxError> {
         if self.get(name)?.is_some() {
             return Ok(false);
@@ -41,9 +25,6 @@ pub trait KeyStore: Send + Sync {
     }
 }
 
-/// Store `key` under `name`, never losing the key it replaces. A different key
-/// already there moves to `<name>.<its key id>` first, and that name returns.
-/// Two workspaces on two clusters can share a database name, and so a key name.
 pub fn replace_keeping(
     store: &dyn KeyStore,
     name: &str,
@@ -62,27 +43,22 @@ pub fn replace_keeping(
     Ok(parked)
 }
 
-/// Where [`replace_keeping`] moves the key with id `key_id` that held `name`.
 pub fn parked_key_name(name: &str, key_id: &str) -> String {
     format!("{name}.{key_id}")
 }
 
-/// The name of the key that seals a database's secrets.
 pub fn secrets_key_name(database: &str) -> String {
     database.to_string()
 }
 
-/// The name of the key that seals a workspace's backup archives.
 pub fn backup_key_name(database: &str) -> String {
     format!("{database}.backup")
 }
 
-/// Independent of the secrets key so discarding secrets keeps snapshots valid.
 pub fn snapshot_key_name(database: &str) -> String {
     format!("{database}.snapshot")
 }
 
-/// A name becomes a file name and a Keychain account, so it stays plain.
 fn check_name(name: &str) -> Result<(), BoxError> {
     let plain = !name.is_empty()
         && !name.starts_with('.')
@@ -102,10 +78,6 @@ pub enum KeyStoreKind {
     File,
 }
 
-/// Pick the store: the Keychain for an engine inside the signed macOS `.app`,
-/// the key file otherwise. Any other binary changes identity on a rebuild or
-/// an upgrade. The Keychain would then prompt for it each time, which a
-/// headless service cannot answer.
 pub fn kind_for(
     override_value: Option<&str>,
     in_app_bundle: bool,
@@ -123,7 +95,6 @@ pub fn kind_for(
     }
 }
 
-/// The platform store. Callers inject a file or fake store in tests.
 pub fn resolve() -> Result<Box<dyn KeyStore>, BoxError> {
     let override_value = std::env::var(KEY_STORE_ENV).ok();
     let in_app_bundle = std::env::current_exe().is_ok_and(|exe| is_in_app_bundle(&exe));
@@ -134,8 +105,6 @@ pub fn resolve() -> Result<Box<dyn KeyStore>, BoxError> {
     )?)
 }
 
-/// Whether `exe` sits inside a macOS `.app` bundle, the one install the
-/// Keychain can trust across upgrades: its signature names the same team.
 pub fn is_in_app_bundle(exe: &Path) -> bool {
     exe.components().any(|part| {
         part.as_os_str()
@@ -144,7 +113,6 @@ pub fn is_in_app_bundle(exe: &Path) -> bool {
     })
 }
 
-/// The store of one kind, at its default place.
 pub fn store_of(kind: KeyStoreKind) -> Result<Box<dyn KeyStore>, BoxError> {
     match kind {
         KeyStoreKind::Keychain => keychain(),
@@ -152,8 +120,6 @@ pub fn store_of(kind: KeyStoreKind) -> Result<Box<dyn KeyStore>, BoxError> {
     }
 }
 
-/// The private entry `secret-keys`, outside every workspace directory, so a
-/// copy of a workspace never carries its key.
 pub fn default_key_dir() -> Result<PathBuf, BoxError> {
     if lucidos_home::path().is_none() {
         return Err("HOME is not set, so there is no key directory".into());
@@ -171,7 +137,6 @@ fn keychain() -> Result<Box<dyn KeyStore>, BoxError> {
     Err("the Keychain exists only on macOS".into())
 }
 
-/// Key files: `<dir>/<name>.key`, base64, mode 0600, in a 0700 directory.
 pub struct FileKeyStore {
     dir: PathBuf,
 }
@@ -185,8 +150,6 @@ impl FileKeyStore {
         self.dir.join(format!("{name}.key"))
     }
 
-    /// The keys open every secret and every archive, so they stay out of
-    /// Time Machine (ADR 0153). Best effort, like every exclusion.
     fn ensure_dir(&self) -> Result<(), BoxError> {
         std::fs::create_dir_all(&self.dir)?;
         restrict(&self.dir, 0o700)?;
@@ -229,8 +192,6 @@ impl KeyStore for FileKeyStore {
         }
     }
 
-    /// Writes a temp file beside the key, then renames it into place, so a
-    /// reader never sees half a key. `NamedTempFile` opens it 0600.
     fn put(&self, name: &str, key: &SecretKey) -> Result<(), BoxError> {
         use std::io::Write as _;
         check_name(name)?;
@@ -250,8 +211,6 @@ impl KeyStore for FileKeyStore {
         }
     }
 
-    /// Links the key into place without clobbering, so two processes minting
-    /// at once cannot both win.
     fn put_new(&self, name: &str, key: &SecretKey) -> Result<bool, BoxError> {
         use std::io::Write as _;
         check_name(name)?;
@@ -267,14 +226,11 @@ impl KeyStore for FileKeyStore {
     }
 }
 
-/// The login Keychain. It trusts the binary that created an item, so another
-/// process reading it gets a prompt the user must accept.
 #[cfg(target_os = "macos")]
 pub struct KeychainKeyStore;
 
 #[cfg(target_os = "macos")]
 impl KeychainKeyStore {
-    /// `errSecItemNotFound`.
     const NOT_FOUND: i32 = -25300;
 }
 

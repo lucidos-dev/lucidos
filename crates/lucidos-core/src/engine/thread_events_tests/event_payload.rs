@@ -25,7 +25,6 @@ fn trigger_retry_wire_shapes_survive_replay() {
     let thread_id = uuid::Uuid::new_v4();
     let entry_id = uuid::Uuid::new_v4();
     let fire_event_id = uuid::Uuid::new_v4();
-    // These literals pin the persisted wire contract.
     let deadline = "2030-01-01T12:00:00Z";
     let retry_of = json!({ "thread_id": thread_id, "deadline": deadline });
     let started: ThreadEvent = serde_json::from_value(json!({
@@ -77,7 +76,6 @@ fn old_trigger_started_is_not_a_retry() {
 
 #[test]
 fn claude_code_idled_has_changes_serialization() {
-    // With has_changes=true → field included
     let event = ThreadEvent::CodingAgentIdled {
         has_changes: true,
         is_external_repo: false,
@@ -94,7 +92,6 @@ fn claude_code_idled_has_changes_serialization() {
     assert_eq!(serialized["type"], "CodingAgentIdled");
     assert_eq!(serialized["has_changes"], true);
 
-    // With has_changes=false → field skipped (skip_serializing_if = "is_false")
     let event2 = ThreadEvent::CodingAgentIdled {
         has_changes: false,
         is_external_repo: false,
@@ -114,7 +111,6 @@ fn claude_code_idled_has_changes_serialization() {
         "false has_changes should be skipped"
     );
 
-    // Old DB format without has_changes deserializes with default=false
     let old_format: ThreadEvent = serde_json::from_str(r#"{"type":"CodingAgentIdled"}"#).unwrap();
     match old_format {
         ThreadEvent::CodingAgentIdled { has_changes, .. } => assert!(!has_changes),
@@ -122,9 +118,6 @@ fn claude_code_idled_has_changes_serialization() {
     }
 }
 
-/// Rows persisted while the in-thread permission-mode command existed carry a
-/// `permission_mode` key. They must still read, and resume must still find the
-/// session id on them.
 #[test]
 fn settings_changed_row_with_a_permission_mode_still_reads() {
     let row = json!({
@@ -148,7 +141,6 @@ fn settings_changed_row_with_a_permission_mode_still_reads() {
 
 #[test]
 fn tool_called_description_serialization() {
-    // With description → included in JSON
     let event = ThreadEvent::ToolCalled {
         name: "read_file".into(),
         args: json!({"path": "test.txt"}),
@@ -157,7 +149,6 @@ fn tool_called_description_serialization() {
     let serialized = serde_json::to_value(&event).unwrap();
     assert_eq!(serialized["description"], "Reading test.txt...");
 
-    // Empty description → skipped (skip_serializing_if = "is_empty_str")
     let event2 = ThreadEvent::ToolCalled {
         name: "read_file".into(),
         args: json!({"path": "test.txt"}),
@@ -172,7 +163,6 @@ fn tool_called_description_serialization() {
 
 #[test]
 fn tool_called_backward_compat_no_description() {
-    // Old DB rows without description field must still deserialize
     let old_format: ThreadEvent = serde_json::from_str(
         r#"{"type":"ToolCalled","name":"read_file","args":{"path":"test.txt"}}"#,
     )
@@ -205,7 +195,6 @@ fn cc_tool_called_description_serialization() {
     let serialized = serde_json::to_value(&event).unwrap();
     assert_eq!(serialized["description"], "Read main.rs");
 
-    // Empty → skipped
     let event2 = ThreadEvent::CodingAgentToolCalled {
         name: "Read".into(),
         args: json!({}),
@@ -233,7 +222,6 @@ fn cc_tool_called_result_tool_use_id_round_trip() {
     let serialized = serde_json::to_value(&call).unwrap();
     assert_eq!(serialized["tool_use_id"], "toolu_42");
 
-    // Empty id → skipped from the wire
     let call_no_id = ThreadEvent::CodingAgentToolCalled {
         name: "Bash".into(),
         args: json!({}),
@@ -248,7 +236,6 @@ fn cc_tool_called_result_tool_use_id_round_trip() {
         .get("tool_use_id")
         .is_none());
 
-    // Legacy DB row without tool_use_id deserializes cleanly
     let legacy: ThreadEvent =
         serde_json::from_str(r#"{"type":"CodingAgentToolResult","name":"","result":"ok"}"#)
             .unwrap();
@@ -260,8 +247,6 @@ fn cc_tool_called_result_tool_use_id_round_trip() {
     }
 }
 
-/// A sub-agent's call names its parent on the wire. The session's own call
-/// omits the field, so its payload is unchanged by the field's existence.
 #[test]
 fn cc_tool_called_parent_tool_use_id_round_trip() {
     let sub_call = ThreadEvent::CodingAgentToolCalled {
@@ -296,8 +281,6 @@ fn cc_tool_called_parent_tool_use_id_round_trip() {
         .is_none());
 }
 
-/// A call's `api_call_id` survives the wire, an absent one is omitted, and a
-/// row written before the field existed reads as having none.
 #[test]
 fn cc_tool_called_api_call_id_round_trip() {
     let call = ThreadEvent::CodingAgentToolCalled {
@@ -334,7 +317,6 @@ fn cc_tool_called_api_call_id_round_trip() {
         .is_none());
 }
 
-/// Rows written before the field existed read as the session's own work.
 #[test]
 fn legacy_rows_without_parent_tool_use_id_read_as_top_level() {
     let result: ThreadEvent = serde_json::from_str(
@@ -370,7 +352,6 @@ fn legacy_rows_without_parent_tool_use_id_read_as_top_level() {
     ));
 }
 
-/// The flag is written only on a note, so prose payloads keep their shape.
 #[test]
 fn cc_text_progress_note_round_trips_and_is_omitted_on_prose() {
     let event = |progress_note| ThreadEvent::CodingAgentTextStreamed {
@@ -427,7 +408,6 @@ fn message_received_with_image_hashes() {
     };
     let payload = event.to_payload(&EventMeta::NONE);
     assert_eq!(payload["text"], "look at this");
-    // Hashes are stored as a flat string array — no inline base64 anywhere.
     assert_eq!(payload["user_image_hashes"][0], "abcd1234");
     assert_eq!(payload["user_image_hashes"][1], "ef567890");
     assert!(
@@ -457,7 +437,6 @@ fn message_received_without_optional_fields() {
     };
     let payload = event.to_payload(&EventMeta::NONE);
     assert_eq!(payload["text"], "hello");
-    // Optional fields should be absent
     assert!(
         payload.get("user_image_hashes").is_none(),
         "empty user_image_hashes should be skipped"
@@ -518,10 +497,6 @@ fn trigger_started_event_invocation_serializes_event_type_and_id() {
 
 #[test]
 fn trigger_started_legacy_task_id_alias_deserializes() {
-    // Old DB rows persisted before the rename used `task_id`/`task_name`.
-    // The migration renames event_type values, but field names live in the
-    // jsonb payload and must continue to deserialize via serde aliases so
-    // historical rows replay cleanly.
     let json = r#"{"type":"TriggerStarted","task_id":"old","task_name":"legacy"}"#;
     let event: ThreadEvent = serde_json::from_str(json).unwrap();
     match event {
@@ -559,9 +534,6 @@ fn change_proposed_new_format() {
     assert_eq!(payload["change_id"], "c-1");
     assert_eq!(payload["description"], "Fix the bug");
     assert_eq!(payload["requires_restart"], true);
-    // Legacy fields should be absent (empty → skipped); `incomplete: false`
-    // is the default and must also be skipped so legacy DB rows decode
-    // without a wire-shape diff.
     assert!(payload.get("path").is_none());
     assert!(payload.get("diff").is_none());
     assert!(
@@ -571,8 +543,6 @@ fn change_proposed_new_format() {
     );
 }
 
-/// A `ResponseFailed` stored before `agent_exit` existed reads unchanged, and a
-/// failure that is not an agent's own exit writes the same bytes as before.
 #[test]
 fn response_failed_reads_old_rows_and_round_trips_agent_exit() {
     let old: ThreadEvent =

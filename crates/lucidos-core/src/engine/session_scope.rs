@@ -1,28 +1,14 @@
-//! The *agent session* as a unit of telemetry: which session of its thread an
-//! event belongs to. A thread starts in session 1. Each `SessionStarted` that
-//! carried no earlier context opens the next one: a fresh session, or a
-//! *successor session*. A resume stays in the session it resumed.
-//!
-//! Plan: `docs/plans/2026-10-23-successor-session-in-the-same-thread.md`.
-
 use uuid::Uuid;
 
 use super::thread_events::SessionContinuity;
 
-/// The `continuity.kind` wire names of a `SessionStarted` that opens a new
-/// session. `the_sql_names_every_kind_that_opens_a_session` pins it to
-/// [`SessionContinuity::opens_session`].
 const OPENING_KINDS: [&str; 2] = ["fresh", "handoff"];
 
-/// A SQL predicate over unaliased `events` columns: a `SessionStarted` that
-/// opened a new session of its thread.
 pub fn session_opened_sql() -> String {
     let kinds = OPENING_KINDS.map(|k| format!("'{k}'")).join(", ");
     format!("event_type = 'SessionStarted' AND payload->'continuity'->>'kind' IN ({kinds})")
 }
 
-/// A SQL scalar: the sequence that opened `thread`'s current session, or 0
-/// in its first. `thread` is a SQL expression, such as `$1` or `ts.thread_id`.
 pub(crate) fn current_session_start_sql(thread: &str) -> String {
     format!(
         "COALESCE((SELECT MAX(o.sequence) FROM events o \
@@ -31,13 +17,11 @@ pub(crate) fn current_session_start_sql(thread: &str) -> String {
     )
 }
 
-/// A SQL predicate: the event at `sequence`, a column of the caller's row,
-/// is in `thread`'s current session.
 pub fn in_current_session_sql(thread: &str, sequence: &str) -> String {
     format!("{sequence} > {}", current_session_start_sql(thread))
 }
 
-/// The ordinal of the session `thread_id` is in now, counted from 1. Read it
+/// INVARIANT: The ordinal of the session `thread_id` is in now, counted from 1. Read it
 /// under the thread's append lock, so no session opens in between.
 pub(crate) async fn current_session_ordinal(
     conn: &mut sqlx::PgConnection,
@@ -54,9 +38,6 @@ pub(crate) async fn current_session_ordinal(
 }
 
 impl SessionContinuity {
-    /// Whether a session starting with this continuity opens a new session
-    /// of its thread, rather than staying in the one it resumed. The first
-    /// session opens none: a thread is in session 1 from its start.
     pub fn opens_session(&self) -> bool {
         matches!(self, Self::Fresh { .. } | Self::Handoff { .. })
     }

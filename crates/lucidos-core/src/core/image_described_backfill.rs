@@ -1,4 +1,4 @@
-//! One-shot, idempotent backfill of `ImageDescribed` events from legacy
+//! INVARIANT: One-shot, idempotent backfill of `ImageDescribed` events from legacy
 //! `MessageReceived.image_description` payload fields.
 //!
 //! Pre-refactor, the agentic loop wrote the Flash-generated description back
@@ -25,45 +25,19 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Stable namespace for `Uuid::new_v5` so re-runs and reboots produce the
+/// INVARIANT: Stable namespace for `Uuid::new_v5` so re-runs and reboots produce the
 /// same event ids and the `INSERT ... ON CONFLICT DO NOTHING` gate stays
 /// effective. NAMESPACE_OID is one of the four built-in v5 namespaces; using
 /// it keeps the derivation reproducible without inventing a private namespace.
 const BACKFILL_NAMESPACE: Uuid = Uuid::NAMESPACE_OID;
 
-/// Page size for the scan. Each row's payload is small (text plus a short
-/// string array), so a page costs little memory. The cap only stops a
-/// multi-year events table loading at once. It is deliberately larger than
-/// `image_migration::MIGRATION_BATCH_SIZE`, which pages rows carrying inline
-/// base64 images.
 const BACKFILL_BATCH_SIZE: i64 = 200;
 
-/// Compute the deterministic event id for a backfilled `ImageDescribed`
-/// row. Collapses to the same value on every run for the same
-/// `(source_event_id, hash)` pair.
 pub fn derive_backfill_id(source_event_id: Uuid, hash: &str) -> Uuid {
     let key = format!("{}:{}", source_event_id, hash);
     Uuid::new_v5(&BACKFILL_NAMESPACE, key.as_bytes())
 }
 
-/// Walk legacy `MessageReceived` rows with a non-null `image_description`
-/// payload field and emit one `ImageDescribed` event per attached
-/// `user_image_hashes` entry. Returns the number of `ImageDescribed` rows
-/// inserted (across all sources). Re-runs return 0.
-///
-/// Skips legacy rows with no surviving hashes (e.g. multi-image messages
-/// where every image was dropped during the base64 → blob migration). Those
-/// would produce zero events anyway — there's nothing to attach the
-/// description to.
-///
-/// Performance notes: the gate query relies on a sequential scan over
-/// `MessageReceived` rows with a JSONB key check — there's no functional
-/// index on `payload->>'image_description'`. On a workspace with thousands
-/// of legacy image rows this is acceptable for a one-shot startup pass
-/// (the LEFT JOIN anti-join makes resumes cheap and the gate stops matching
-/// once a source has its events). Inserts run one-per-hash for simplicity;
-/// hash counts per message are typically 1–3 so a multi-row batched
-/// `INSERT` would only save a handful of round trips per legacy source.
 pub async fn backfill_image_described_from_legacy_payload(
     pool: &PgPool,
     event_bus: &EventBus,
@@ -71,16 +45,13 @@ pub async fn backfill_image_described_from_legacy_payload(
     backfill_with_batch_size(pool, event_bus, BACKFILL_BATCH_SIZE).await
 }
 
-/// Batch size is a parameter so tests can drive multi-batch walks without
-/// inserting hundreds of rows; production always passes
-/// [`BACKFILL_BATCH_SIZE`] via the public wrapper above.
 async fn backfill_with_batch_size(
     pool: &PgPool,
     event_bus: &EventBus,
     batch_size: i64,
 ) -> Result<usize, sqlx::Error> {
     let mut total_inserted = 0usize;
-    // Keyset cursor over the monotonic `events.sequence` column. Skipped rows
+    // INVARIANT: Keyset cursor over the monotonic `events.sequence` column. Skipped rows
     // (empty description, NULL thread_id, no surviving hashes) never gain an
     // `ImageDescribed` event, so they match the anti-join forever — a
     // LIMIT-only walk would either re-fetch them endlessly (infinite startup
@@ -91,16 +62,6 @@ async fn backfill_with_batch_size(
     // ones.
     let mut cursor: i64 = 0;
     loop {
-        // Anti-join `LEFT JOIN ... WHERE described.id IS NULL` skips any
-        // legacy row that already has an `ImageDescribed` event attached
-        // (same `source_event_id`), so a partially-completed prior run is
-        // resumed without re-walking already-backfilled rows.
-        //
-        // `thread_id` comes from the dedicated `events.thread_id` column,
-        // not from the payload — `make_message_received_with_origin`
-        // never sets a `thread_id` field in the payload, so reading
-        // `payload->>'thread_id'` here would always be NULL and the
-        // emitted `ImageDescribed` rows would have NULL `aggregate_id`.
         let batch: Vec<(Uuid, Option<Uuid>, Value, i64)> = sqlx::query_as(
             "SELECT m.id, m.thread_id, m.payload, m.sequence \
              FROM events m \
@@ -128,11 +89,6 @@ async fn backfill_with_batch_size(
                 _ => continue,
             };
             let Some(thread_id) = thread_id else {
-                // Legacy MessageReceived rows are always inserted with a
-                // non-null `thread_id` column by the EventBus persist
-                // path. A NULL here means the row predates the column or
-                // was inserted by something else — either way we have
-                // nothing to attach the `ImageDescribed` to.
                 crate::log_legacy!(
                     "[ImageDescribedBackfill] source={} has NULL thread_id column — skipping",
                     source_id
@@ -149,11 +105,6 @@ async fn backfill_with_batch_size(
                 })
                 .unwrap_or_default();
             if hashes.is_empty() {
-                // No surviving hashes (typically a row whose images were
-                // dropped during the base64 → blob migration). Nothing to
-                // attach an ImageDescribed to; the sequence cursor advances
-                // past the row, so the permanent skip can neither loop the
-                // walk nor strand later rows.
                 crate::log_legacy!(
                     "[ImageDescribedBackfill] source={} has image_description but no user_image_hashes — skipping",
                     source_id
@@ -168,7 +119,7 @@ async fn backfill_with_batch_size(
                     "description": description,
                     "model": "backfill",
                 });
-                // Route through `EventBus::replay_historical_event`, the
+                // INVARIANT: Route through `EventBus::replay_historical_event`, the
                 // dedicated entry point for historical backfills: it inserts
                 // with `ON CONFLICT (id) DO NOTHING` (so retries / reboots
                 // collide on the deterministic v5 id and skip), broadcasts on
@@ -184,11 +135,6 @@ async fn backfill_with_batch_size(
                         event_type: "ImageDescribed",
                         payload: &event_payload,
                         thread_id: Some(thread_id),
-                        // No original wall-clock for the description: the
-                        // legacy field was overwritten in place on the source
-                        // MessageReceived's payload, so the description's
-                        // creation time wasn't recorded. Default to the insert
-                        // time: sequence ordering preserves causality regardless.
                         created: None,
                         broadcast: true,
                     })
@@ -244,9 +190,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Single-image legacy row: backfill emits exactly one `ImageDescribed`
-    /// event with the right `source_event_id`, `hash`, `description`, and
-    /// `model = "backfill"`.
     #[tokio::test]
     async fn backfills_single_image_row() {
         let (pool, db_name) = setup_test_db().await;
@@ -270,11 +213,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inserted, 1);
-        // Assert payload AND column values (`aggregate_id`, `thread_id`):
-        // an earlier draft read thread_id from the payload (always null on
-        // real MessageReceived rows, since the constructor doesn't write
-        // it there), which silently inserted ImageDescribed rows with
-        // NULL aggregate_id / thread_id and broke every downstream join.
         let row: (Value, String, Option<Uuid>) = sqlx::query_as(
             "SELECT payload, aggregate_id, thread_id FROM events \
              WHERE event_type = 'ImageDescribed' \
@@ -303,9 +241,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Multi-image legacy row: backfill emits one event per attached hash,
-    /// all carrying the same description text. The set of `(source, hash)`
-    /// pairs is what consumers join on.
     #[tokio::test]
     async fn backfills_multi_image_row_with_one_event_per_hash() {
         let (pool, db_name) = setup_test_db().await;
@@ -348,9 +283,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Re-running the backfill is a no-op: the deterministic v5 event id
-    /// collides on the primary key and `ON CONFLICT (id) DO NOTHING` skips
-    /// the insert. This is the gate that makes startup-time invocation safe.
     #[tokio::test]
     async fn backfill_is_idempotent_on_repeated_runs() {
         let (pool, db_name) = setup_test_db().await;
@@ -387,10 +319,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A legacy row WITH a description but NO surviving hashes matches the
-    /// SQL gate on every pass (it never gains an `ImageDescribed`), so the
-    /// walk must advance past it instead of re-fetching it — before the
-    /// sequence cursor this looped forever at startup (fixed 2026-07-07).
     #[tokio::test]
     async fn terminates_when_row_has_description_but_no_hashes() {
         let (pool, db_name) = setup_test_db().await;
@@ -424,11 +352,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A permanently-skipped row (hash-less) OLDER than a processable row must
-    /// not strand the later row. Drives `batch_size = 1` so the skip fills its
-    /// own batch — the shape that made the pre-cursor walk terminate on a
-    /// fully-skipped batch and silently leave every later legacy row
-    /// unbackfilled.
     #[tokio::test]
     async fn skipped_rows_do_not_strand_later_rows() {
         let (pool, db_name) = setup_test_db().await;
@@ -475,8 +398,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Legacy rows without `image_description` are skipped — only rows that
-    /// would have lost data under the refactor get a backfill event.
     #[tokio::test]
     async fn skips_messagereceived_without_image_description() {
         let (pool, db_name) = setup_test_db().await;
@@ -505,9 +426,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Rows that already have an `ImageDescribed` event attached (e.g. from
-    /// a previous partial run, or because the agentic loop emitted one
-    /// post-refactor) must NOT receive duplicate backfill events.
     #[tokio::test]
     async fn skips_sources_already_described_by_an_event() {
         let (pool, db_name) = setup_test_db().await;
@@ -525,7 +443,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // Pre-existing ImageDescribed (post-refactor emit beat the backfill).
         let pre_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, thread_id) \
@@ -558,12 +475,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Routing through `EventBus::replay_historical_event` means a live
-    /// subscriber observes every backfilled `ImageDescribed` event — this is
-    /// the point of replacing the raw `INSERT INTO events` with the bus
-    /// entry point. Without this, a memory indexer / SSE bridge / projection
-    /// catcher attached during a long-running engine startup would never see
-    /// the backfilled rows.
     #[tokio::test]
     async fn backfill_broadcasts_inserted_rows_to_event_bus_subscribers() {
         use crate::engine::event_bus::{BusEvent, SystemEvent};
@@ -592,9 +503,6 @@ mod tests {
             .unwrap();
         assert_eq!(inserted, 2);
 
-        // Pull both broadcasts off the subscriber and verify they correspond
-        // to the inserted ImageDescribed rows. The broadcast happens inside
-        // the same task, so a small bounded recv is enough — no flake risk.
         let mut observed_hashes: std::collections::HashSet<String> = Default::default();
         for _ in 0..2 {
             let emitted = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
@@ -620,12 +528,10 @@ mod tests {
             "subscriber saw both hashes"
         );
 
-        // Re-run must be a true no-op: no row inserted AND no broadcast.
         let second = backfill_image_described_from_legacy_payload(&pool, &bus)
             .await
             .unwrap();
         assert_eq!(second, 0);
-        // No further events on the bus.
         let no_more = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(
             no_more.is_err(),
@@ -636,8 +542,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// `derive_backfill_id` is deterministic: same inputs produce the same
-    /// uuid across processes — the basis for the idempotency gate.
     #[test]
     fn derive_backfill_id_is_deterministic() {
         let source = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();

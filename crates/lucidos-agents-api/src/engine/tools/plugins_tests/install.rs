@@ -1,7 +1,3 @@
-//! Plugin install flow tests: source install, prepare/cancel confirm flow,
-//! setup-text handling, and end-to-end install / update / check via local
-//! git + archive fixtures.
-
 use std::path::PathBuf;
 
 use super::helpers::*;
@@ -11,15 +7,6 @@ use crate::engine::pending_plugins::normalize_setup;
 use crate::engine::event_bus::{EventBus, MockEventBus};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// `update_plugin(id)` core. Re-fetches the recorded `source`, compares
-/// semver, and re-runs the install with `overwrite=true` when the remote
-/// version is strictly greater. No-ops with a friendly message when already
-/// at latest (including when the remote is older — intentional downgrades
-/// aren't supported by `update_plugin`).
-///
-/// Test-only — production `update_plugin` routes through the dispatcher's
-/// `prepare_install_request` so the user confirms in the install panel
-/// before files are written.
 async fn update_plugin_impl(
     workspace_path: &Path,
     bus: &dyn EventBusEmitter,
@@ -123,8 +110,6 @@ async fn install_without_source_succeeds_and_omits_from_in_summary() {
     }
 }
 
-// --- Confirm-flow: prepare_install_request + cancel_pending_install_with_bus ---
-
 fn fresh_pending_map() -> std::sync::Arc<PendingInstallsMap> {
     std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -151,6 +136,7 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
         &Ok(Default::default()),
         &GitCredentials::none(),
         &running(),
+        None,
     );
 
     assert!(
@@ -176,11 +162,9 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
     assert_eq!(pending.lock().unwrap().len(), 1);
     assert!(pending.lock().unwrap().contains_key(install_id));
 
-    // Critically: nothing in data/ yet — the panel hasn't been confirmed.
     assert!(!scratch.join("data/knowhow/fixture.md").exists());
 }
 
-/// Theme Studio's shape: a plugin declaring the first release it works on.
 fn stage_with_engine(
     scratch: &Path,
     pending: &std::sync::Arc<PendingInstallsMap>,
@@ -205,6 +189,7 @@ fn stage_with_engine(
         &Ok(Default::default()),
         &GitCredentials::none(),
         running,
+        None,
     )
 }
 
@@ -265,8 +250,6 @@ fn a_met_engine_requirement_stages_as_usual() {
     );
 }
 
-/// No `engine` stages exactly as before. The payload says so with a null
-/// `engine_requirement`, which the confirmation panel shows as a quiet note.
 #[test]
 fn a_plugin_with_no_engine_stages_with_a_null_engine_requirement() {
     let (_tmp, scratch) = fresh_workspace();
@@ -280,6 +263,7 @@ fn a_plugin_with_no_engine_stages_with_a_null_engine_requirement() {
         &Ok(Default::default()),
         &GitCredentials::none(),
         &Ok(semver::Version::new(0, 1, 0)),
+        None,
     );
 
     assert!(
@@ -310,6 +294,7 @@ fn an_unreadable_release_refuses_only_a_plugin_that_declares_engine() {
         &Ok(Default::default()),
         &GitCredentials::none(),
         &unreadable,
+        None,
     );
     assert!(
         staged.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX),
@@ -334,6 +319,7 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
         &Ok(Default::default()),
         &GitCredentials::none(),
         &running(),
+        None,
     );
     let payload = parse_sentinel_payload(&result);
     let overwrites: Vec<&str> = payload["overwrites"]
@@ -343,15 +329,12 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert_eq!(overwrites, vec!["knowhow/fixture.md"]);
-    // Existing file untouched until user clicks Confirm.
     assert_eq!(
         std::fs::read_to_string(scratch.join("data/knowhow/fixture.md")).unwrap(),
         "existing"
     );
 }
 
-/// Files already on disk do not make an install an update: only the plugin's
-/// own install record does, with or without a merge baseline.
 #[test]
 fn a_collision_with_unrelated_files_stages_a_fresh_install() {
     let (_tmp, scratch) = fresh_workspace();
@@ -368,6 +351,7 @@ fn a_collision_with_unrelated_files_stages_a_fresh_install() {
         &Ok(Default::default()),
         &GitCredentials::none(),
         &running(),
+        None,
     );
     let payload = parse_sentinel_payload(&result);
     assert_eq!(payload["overwrites"].as_array().unwrap().len(), 1);
@@ -382,8 +366,7 @@ fn an_installed_plugin_stages_an_update_even_with_its_files_gone() {
     let archive = build_fixture_archive(&archive_dir, "v1");
     let installed = InstalledPlugins {
         files: [("fixture-plugin".to_string(), Vec::new())].into(),
-        baselines: Default::default(),
-        setups: Default::default(),
+        ..Default::default()
     };
 
     let result = prepare_install_request(
@@ -393,13 +376,13 @@ fn an_installed_plugin_stages_an_update_even_with_its_files_gone() {
         &Ok(installed),
         &GitCredentials::none(),
         &running(),
+        None,
     );
     let payload = parse_sentinel_payload(&result);
     assert!(payload["overwrites"].as_array().unwrap().is_empty());
     assert_eq!(payload["is_update"], true);
 }
 
-/// A staged fixture archive whose manifest carries `extra` lines after `source`.
 fn stage_with_setup(scratch: &Path, extra: &str, installed: InstalledPlugins) -> serde_json::Value {
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
@@ -417,6 +400,7 @@ fn stage_with_setup(scratch: &Path, extra: &str, installed: InstalledPlugins) ->
         &Ok(installed),
         &GitCredentials::none(),
         &running(),
+        None,
     );
     parse_sentinel_payload(&result)
 }
@@ -429,8 +413,6 @@ fn installed_with_setup(prior: PriorSetup) -> InstalledPlugins {
     }
 }
 
-/// The preview carries the occasion confirm would seed, decided by the same
-/// function, so the panel never promises a thread confirm would skip.
 #[test]
 fn the_preview_states_whether_an_update_runs_setup_again() {
     let (_tmp, scratch) = fresh_workspace();
@@ -481,9 +463,6 @@ fn the_preview_states_whether_an_update_runs_setup_again() {
     assert!(none["setup_run"].is_null());
 }
 
-/// The preview lists every file the confirm will delete, before the user
-/// confirms. A legacy record has no baseline, so its dropped file also gets a
-/// "Your edits" row: no edit to it can be ruled out.
 #[test]
 fn staging_an_update_lists_the_files_it_will_remove() {
     let (_tmp, scratch) = fresh_workspace();
@@ -499,8 +478,7 @@ fn staging_an_update_lists_the_files_it_will_remove() {
     ];
     let installed = InstalledPlugins {
         files: [("fixture-plugin".to_string(), recorded)].into(),
-        baselines: Default::default(),
-        setups: Default::default(),
+        ..Default::default()
     };
 
     let result = prepare_install_request(
@@ -510,6 +488,7 @@ fn staging_an_update_lists_the_files_it_will_remove() {
         &Ok(installed),
         &GitCredentials::none(),
         &running(),
+        None,
     );
     let payload = parse_sentinel_payload(&result);
     assert_eq!(payload["removes"], serde_json::json!(["knowhow/old.md"]));
@@ -523,8 +502,6 @@ fn staging_an_update_lists_the_files_it_will_remove() {
     );
 }
 
-/// Staging reads the other plugins' records itself. A dropped path another
-/// plugin still records is never offered for removal.
 #[test]
 fn staging_never_removes_a_path_another_plugin_records() {
     let (_tmp, scratch) = fresh_workspace();
@@ -544,8 +521,7 @@ fn staging_never_removes_a_path_another_plugin_records() {
             ("other-plugin".to_string(), vec![shared]),
         ]
         .into(),
-        baselines: Default::default(),
-        setups: Default::default(),
+        ..Default::default()
     };
 
     let result = prepare_install_request(
@@ -555,6 +531,7 @@ fn staging_never_removes_a_path_another_plugin_records() {
         &Ok(installed),
         &GitCredentials::none(),
         &running(),
+        None,
     );
     let payload = parse_sentinel_payload(&result);
     assert_eq!(payload["removes"], serde_json::json!([]));
@@ -572,13 +549,10 @@ fn records(entries: &[(&str, &[&str])]) -> InstalledPlugins {
                 )
             })
             .collect(),
-        baselines: Default::default(),
-        setups: Default::default(),
+        ..Default::default()
     }
 }
 
-/// The confirm acts on records read up to an hour earlier. It refuses only
-/// when they no longer support the plan.
 #[test]
 fn a_confirm_refuses_when_the_records_no_longer_support_its_plan() {
     let staged = records(&[("demo", &["knowhow/a.md", "knowhow/old.md"])]).files;
@@ -650,6 +624,7 @@ fn unreadable_baselines_refuse_a_staging_that_would_overwrite_files() {
         &Err("connection refused".to_string()),
         &GitCredentials::none(),
         &running(),
+        None,
     );
 
     assert!(result.starts_with("Error:"), "got: {}", result);
@@ -679,6 +654,7 @@ fn unreadable_baselines_still_stage_a_fresh_install() {
         &Err("connection refused".to_string()),
         &GitCredentials::none(),
         &running(),
+        None,
     );
 
     assert!(
@@ -701,6 +677,7 @@ fn prepare_install_request_returns_error_string_on_invalid_source() {
         &Ok(Default::default()),
         &GitCredentials::none(),
         &running(),
+        None,
     );
 
     assert!(result.starts_with("Error:"), "got: {}", result);
@@ -730,11 +707,11 @@ async fn cancel_pending_install_emits_event_and_drops_staging() {
         &Ok(Default::default()),
         &GitCredentials::none(),
         &running(),
+        None,
     );
     let payload = parse_sentinel_payload(&result);
     let install_id = payload["install_id"].as_str().unwrap().to_string();
 
-    // Capture the staged plugin_root so we can confirm cleanup on cancel.
     let staged_root = pending
         .lock()
         .unwrap()
@@ -791,9 +768,6 @@ async fn cancel_pending_install_returns_error_for_unknown_id() {
     assert!(bus.emitted_events().is_empty(), "no event on failed cancel");
 }
 
-/// The receipt panel prints this summary as its description line. It renders
-/// the manifest's `setup` as its own markdown section below, so a summary
-/// carrying the setup text shows the user the same wall twice.
 #[tokio::test]
 async fn install_summary_stays_one_line_when_manifest_declares_setup() {
     const SETUP_MANIFEST: &str = r#"
@@ -829,8 +803,6 @@ setup = "Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggeste
         "a manifest with setup must not widen the summary beyond the one line"
     );
 }
-
-// ---- Pure setup-change detection (drives confirm's spawn gate) --------
 
 #[test]
 fn normalize_setup_trims_and_collapses_empty() {
@@ -904,8 +876,6 @@ fn a_fresh_install_with_setup_runs_it_whatever_the_revision() {
     let fresh = Some(PluginSetupOccasion::FreshInstall);
     assert_eq!(setup_occasion(&staged(key, 0, None), None), fresh);
     assert_eq!(setup_occasion(&staged(key, 5, None), None), fresh);
-    // A prior record that shipped no setup text has nothing to compare, so
-    // this version's setup is new work.
     assert_eq!(
         setup_occasion(&staged(key, 0, None), Some(&prior(None, 0, Some("0.1.0")))),
         update(Some("0.1.0"), PluginSetupCause::InstructionsChanged)
@@ -927,7 +897,6 @@ fn an_update_that_changed_the_setup_text_runs_setup_for_that_reason() {
 #[test]
 fn an_update_with_the_same_text_and_no_revision_change_runs_nothing() {
     let old = prior(Some("wire up the key"), 0, Some("0.1.0"));
-    // Whitespace-only differences do not count as a change.
     assert_eq!(
         setup_occasion(&staged(Some("  wire up the key  "), 0, None), Some(&old)),
         None
@@ -958,7 +927,6 @@ fn a_raised_revision_runs_setup_when_the_text_is_unchanged() {
             }
         )
     );
-    // No reason is fine: the author's note is optional.
     assert_eq!(
         setup_occasion(&staged(Some("copy the skill"), 1, None), Some(&old)),
         update(
@@ -989,8 +957,6 @@ fn a_raised_revision_and_changed_text_run_setup_for_both_reasons() {
     );
 }
 
-/// A revision the author carries unchanged into the next release re-runs setup
-/// once, on the release that raised it.
 #[test]
 fn a_revision_carried_across_two_releases_runs_setup_once() {
     let text = Some("copy the skill");
@@ -1006,7 +972,6 @@ fn a_revision_carried_across_two_releases_runs_setup_once() {
     assert_eq!(carried, None, "0.2.0 to 0.3.0 keeps 2");
 }
 
-/// "Greater", not "differs": removing the field or rolling back never re-runs.
 #[test]
 fn a_lowered_or_removed_revision_runs_nothing() {
     let text = Some("copy the skill");
@@ -1023,7 +988,6 @@ fn super_slides() -> SeededPlugin {
     }
 }
 
-/// The origin a setup seed carries, for one occasion and confirming actor.
 fn setup_seed_origin(
     occasion: PluginSetupOccasion,
     actor: Option<&MessageOrigin>,
@@ -1034,8 +998,6 @@ fn setup_seed_origin(
     }
 }
 
-/// Every setup occasion seeds a typed engine origin naming the plugin and the
-/// version the popover shows. A seed with no origin reads Origin "Unknown".
 #[test]
 fn every_setup_occasion_seeds_a_typed_engine_origin() {
     let occasions = [
@@ -1064,8 +1026,6 @@ fn every_setup_occasion_seeds_a_typed_engine_origin() {
     }
 }
 
-/// The confirming device rides beside the engine origin, by id. Any other
-/// caller records nothing there: the popover can only name a device.
 #[test]
 fn the_setup_seed_names_the_confirming_device_and_only_a_device() {
     let device = MessageOrigin::Device {
@@ -1093,7 +1053,6 @@ fn the_setup_seed_names_the_confirming_device_and_only_a_device() {
     assert_eq!(reason_device(None), None);
 }
 
-/// The upstream-patch seed carries a typed engine origin, like the setup seed.
 #[test]
 fn the_upstream_patch_seed_carries_a_typed_engine_origin() {
     let device = MessageOrigin::Device {
@@ -1128,12 +1087,6 @@ fn the_upstream_patch_seed_carries_a_typed_engine_origin() {
 
 #[test]
 fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
-    // Regression: the setup thread must be a SubThread (so the queue's
-    // `prepare` step eager-emits MessageReceived and the thread materializes
-    // before confirm returns) bound to the SAME id recorded in PluginInstalled
-    // / returned to the frontend — NOT an AgentChat (which never materialized
-    // the thread and paired a Device origin with ActorMode::Agent, panicking
-    // make_message_received). The bound id is what the frontend navigates to.
     let tid = uuid::Uuid::new_v4();
     let req = build_setup_thread_request(
         tid,
@@ -1155,10 +1108,6 @@ fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
             );
             assert_eq!(title.as_deref(), Some("Set up Super Slides"));
             assert!(pre_emitted_origin.is_none());
-            // The seed is the SHORT, user-facing line only — the how-to lives in
-            // system-knowhow/plugin-setup and the author's setup text is
-            // referenced from the PluginInstalled event, so neither the
-            // meta-instructions nor the author text may leak into the bubble.
             assert_eq!(prompt, "Set up the newly installed Super Slides plugin.");
             assert!(
                 !prompt.contains("send_notification") && !prompt.contains("Walk the user"),
@@ -1171,10 +1120,6 @@ fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
 
 #[test]
 fn an_update_seeds_a_re_run_rather_than_a_first_install() {
-    // The whole point of the update seed: an agent reading it knows a previous
-    // run exists, and the thread list shows something other than the same
-    // title twice. Everything load-bearing about the SubThread shape holds
-    // exactly as on a fresh install, since it is the same spawn path.
     let tid = uuid::Uuid::new_v4();
     let req = build_setup_thread_request(
         tid,
@@ -1208,8 +1153,6 @@ fn an_update_seeds_a_re_run_rather_than_a_first_install() {
     }
 }
 
-/// Every cause words its own seed and keeps the title. The origin, which the
-/// popover reads, carries the same cause.
 #[test]
 fn each_update_cause_seeds_its_own_wording() {
     let cases = [
@@ -1264,11 +1207,6 @@ fn each_update_cause_seeds_its_own_wording() {
 
 #[test]
 fn an_update_from_a_versionless_record_still_seeds_a_re_run() {
-    // A legacy `PluginInstalled` row can name no version at all, which is why
-    // `installed_plugin_summaries` shows those as `unknown`. The occasion is a
-    // separate fact from the version for exactly this row: collapsing them
-    // seeded a real update as a first install, and the knowhow then skipped
-    // its whole reuse step and re-asked everything.
     let tid = uuid::Uuid::new_v4();
     let req = build_setup_thread_request(
         tid,
@@ -1292,19 +1230,6 @@ fn an_update_from_a_versionless_record_still_seeds_a_re_run() {
     }
 }
 
-// ---- DB-backed regression + lifecycle tests --------------------------
-//
-// These exercise the live `EventBus` + `latest_install` path that the four
-// plugin tools (install / check_plugin_updates / update_plugin /
-// uninstall_plugin) actually run through. The MockEventBus tests above
-// assert event shape; these assert the round-trip from emit → DB →
-// `InstalledRecord` works, which is where the "missing source" regression
-// hid for so long.
-
-/// Run a git command in `dir`, panicking on any failure. Used by the
-/// `file://` git-source tests where we stand up a bare repo locally so
-/// `update_plugin` has somewhere to re-fetch from without depending on
-/// the live `lucidos-dev/plugins` GitHub repo.
 fn git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)
@@ -1324,10 +1249,6 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-/// Stand up a bare git repo at `<scratch>/<name>.git` plus a working
-/// clone at `<scratch>/<name>-work/`, then commit `manifest.toml` and a
-/// `knowhow/<id>.md` file referencing `version`. Returns the bare repo
-/// path and the work tree so the caller can bump the version later.
 fn make_local_git_plugin(
     scratch: &Path,
     name: &str,
@@ -1365,8 +1286,6 @@ source = "{bare_url}"
     (bare, work)
 }
 
-/// Replace the manifest version + knowhow body in an existing work tree
-/// and push to the bare repo. Used by the `update_plugin` test.
 fn bump_local_git_plugin(
     work: &Path,
     id: &str,
@@ -1407,17 +1326,6 @@ fn a_git_subpath_that_escapes_the_clone_is_refused() {
     }
 }
 
-/// Regression test for the "installed manifest is missing 'source'" bug.
-///
-/// The PluginInstalled event payload nests the manifest inside the
-/// SystemEvent's `manifest` field (see `install_from_unpacked_with_bus`),
-/// and the persisted JSONB column wraps everything in serde's
-/// `{type, data}` envelope. Earlier versions of `InstalledRecord` read
-/// `payload.manifest.source`, which silently returned None and bubbled
-/// up as the misleading "installed manifest is missing 'source'" error
-/// from `check_plugin_updates`. This test installs a plugin via the same
-/// code path the LLM tool uses, then asserts the install record is
-/// findable by id and that source / version / files round-trip.
 #[tokio::test]
 async fn latest_install_round_trips_id_version_source_and_files() {
     let (pool, db_name) = setup_test_db().await;
@@ -1438,13 +1346,11 @@ async fn latest_install_round_trips_id_version_source_and_files() {
     .await
     .expect("install must succeed");
 
-    // Install record must be findable by the manifest id (not "unknown").
     let installed = latest_install(&pool, "fixture-plugin")
         .await
         .expect("query must succeed")
         .expect("install record must be findable by manifest id, not 'unknown'");
 
-    // Without the fix, all three of these return None / empty.
     assert_eq!(installed.version(), Some("0.1.0"), "version round-trip");
     assert_eq!(
         installed.source(),
@@ -1466,8 +1372,6 @@ async fn latest_install_round_trips_id_version_source_and_files() {
     teardown_test_db(&db_name).await;
 }
 
-/// Fetch the persisted payload(s) for an aggregate id, oldest first, so
-/// tests can index by emit order.
 async fn read_events(pool: &sqlx::PgPool, event_type: &str, id: &str) -> Vec<serde_json::Value> {
     let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
         r#"SELECT payload FROM events
@@ -1482,12 +1386,6 @@ async fn read_events(pool: &sqlx::PgPool, event_type: &str, id: &str) -> Vec<ser
     rows.into_iter().map(|(p,)| p).collect()
 }
 
-// ---- e2e test 1 -------------------------------------------------------
-
-/// Install from a local `.lucidos-plugin` archive via the same code path
-/// the LLM tool uses (`install_from_source_with_bus`). Verifies files
-/// land under `data/<dir>/...` and that a PluginInstalled event is
-/// persisted with the manifest payload.
 #[tokio::test]
 async fn e2e_install_from_local_archive() {
     let (pool, db_name) = setup_test_db().await;
@@ -1503,15 +1401,12 @@ async fn e2e_install_from_local_archive() {
         .expect("install from archive must succeed");
     assert_eq!(msg, "Installed Fixture Plugin v0.1.0 (2 files).");
 
-    // Files landed under data/.
     assert_eq!(
         std::fs::read_to_string(scratch.join("data/knowhow/fixture.md")).unwrap(),
         "v1-from-archive"
     );
     assert!(scratch.join("data/triggers/fixture/fixture.md").is_file());
 
-    // Exactly one PluginInstalled event, payload reflects the manifest
-    // and the archive source type.
     let events = read_events(&pool, "PluginInstalled", "fixture-plugin").await;
     assert_eq!(events.len(), 1, "exactly one PluginInstalled event");
     let raw_manifest = events[0]
@@ -1532,12 +1427,6 @@ async fn e2e_install_from_local_archive() {
     teardown_test_db(&db_name).await;
 }
 
-// ---- e2e test 2 -------------------------------------------------------
-
-/// Install from a local bare git repo via `file://...git` URL — the same
-/// `install_from_source_with_bus` path that handles GitHub URLs in
-/// production. Verifies the source URL is retrievable from the install
-/// record so `check_plugin_updates` and `update_plugin` can re-fetch.
 #[tokio::test]
 async fn e2e_install_from_local_git_source_records_source_url() {
     let (pool, db_name) = setup_test_db().await;
@@ -1564,7 +1453,6 @@ async fn e2e_install_from_local_git_source_records_source_url() {
         "v1 body"
     );
 
-    // Source URL must round-trip — without it, update_plugin can't re-fetch.
     let installed = latest_install(&pool, "git-fixture-plugin")
         .await
         .unwrap()
@@ -1579,13 +1467,6 @@ async fn e2e_install_from_local_git_source_records_source_url() {
     teardown_test_db(&db_name).await;
 }
 
-// ---- e2e test 3 -------------------------------------------------------
-
-/// Regression test for the "installed manifest is missing 'source'" bug
-/// at the tool-handler level (the version 1 test exercises only
-/// `InstalledRecord`). Drives the full `check_plugin_updates_impl` path
-/// the way the LLM dispatcher calls it, and asserts the JSON report
-/// contains real version + source data instead of the misleading error.
 #[tokio::test]
 async fn e2e_check_plugin_updates_returns_real_data_after_install() {
     let (pool, db_name) = setup_test_db().await;
@@ -1628,9 +1509,6 @@ async fn e2e_check_plugin_updates_returns_real_data_after_install() {
     teardown_test_db(&db_name).await;
 }
 
-/// An upstream that commits `manifest.toml` as a symlink to a host file must
-/// not get that file read: a parse error would quote its contents back into
-/// the update report.
 #[cfg(unix)]
 #[tokio::test]
 async fn e2e_check_plugin_updates_never_reads_a_symlinked_manifest() {
@@ -1666,9 +1544,6 @@ async fn e2e_check_plugin_updates_never_reads_a_symlinked_manifest() {
     teardown_test_db(&db_name).await;
 }
 
-/// `engine_requirement` is null exactly when the manifest has no `engine`, on
-/// the installed summary (the installed version) and in `check_plugin_updates`
-/// (the remote version).
 #[tokio::test]
 async fn e2e_engine_requirement_follows_the_manifest_on_installed_and_check_updates() {
     let (pool, db_name) = setup_test_db().await;
@@ -1692,8 +1567,6 @@ async fn e2e_engine_requirement_follows_the_manifest_on_installed_and_check_upda
     assert!(report[0]["engine_requirement"].is_null(), "{}", report[0]);
     assert_eq!(report[0]["engine_compatible"], true);
 
-    // The author declares a floor upstream. The report reads the remote
-    // manifest, so it sees the floor before the installed version does.
     let manifest = std::fs::read_to_string(work.join("manifest.toml")).unwrap();
     let declared = manifest.replace("source =", "engine = \">=0.1.0\"\nsource =");
     std::fs::write(work.join("manifest.toml"), declared).unwrap();
@@ -1712,13 +1585,6 @@ async fn e2e_engine_requirement_follows_the_manifest_on_installed_and_check_upda
     teardown_test_db(&db_name).await;
 }
 
-// ---- e2e test 4 -------------------------------------------------------
-
-/// `update_plugin` re-fetches when the upstream version bumps. Installs
-/// v0.1.0, pushes a v0.1.1 commit to the same bare repo, then invokes
-/// `update_plugin_impl`. Asserts the new content lands on disk and a
-/// second PluginInstalled event is recorded (updates reuse that variant
-/// per the documented contract — there is no separate PluginUpdated).
 #[tokio::test]
 async fn e2e_update_plugin_re_fetches_when_version_bumps() {
     let (pool, db_name) = setup_test_db().await;
@@ -1736,17 +1602,14 @@ async fn e2e_update_plugin_re_fetches_when_version_bumps() {
     );
     let source_url = format!("file://{}", bare.display());
 
-    // 1. Install v0.1.0.
     install_from_source_with_bus(&scratch, &bus, &source_url, false)
         .await
         .expect("install v0.1.0");
     let knowhow_path = scratch.join("data/knowhow/update-fixture-plugin.md");
     assert_eq!(std::fs::read_to_string(&knowhow_path).unwrap(), "v1 body");
 
-    // 2. Bump upstream to v0.1.1.
     bump_local_git_plugin(&work, "update-fixture-plugin", "0.1.0", "0.1.1", "v2 body");
 
-    // 3. update_plugin re-fetches and re-installs.
     let msg = update_plugin_impl(&scratch, &bus, &pool, "update-fixture-plugin").await;
     assert!(
         msg.starts_with("Installed Local Git Plugin v0.1.1"),
@@ -1754,7 +1617,6 @@ async fn e2e_update_plugin_re_fetches_when_version_bumps() {
         msg
     );
 
-    // 4. New content is on disk and a second PluginInstalled was recorded.
     assert_eq!(std::fs::read_to_string(&knowhow_path).unwrap(), "v2 body");
     let events = read_events(&pool, "PluginInstalled", "update-fixture-plugin").await;
     assert_eq!(
@@ -1775,7 +1637,6 @@ async fn e2e_update_plugin_re_fetches_when_version_bumps() {
         "0.1.1"
     );
 
-    // 5. Re-running update with no upstream change is a no-op (no third event).
     let again = update_plugin_impl(&scratch, &bus, &pool, "update-fixture-plugin").await;
     assert_eq!(again, "Already at latest (v0.1.1)");
     assert_eq!(
@@ -1789,8 +1650,6 @@ async fn e2e_update_plugin_re_fetches_when_version_bumps() {
     teardown_test_db(&db_name).await;
 }
 
-// ---- e2e test 5 -------------------------------------------------------
-
 const GIT_TRACK_MANIFEST: &str = r#"
 id = "git-track-plugin"
 version = "0.3.1"
@@ -1799,17 +1658,6 @@ description = "test"
 source = "https://github.com/x/git-track"
 "#;
 
-/// Regression test for the plugin-install git-tracking bug: installing a
-/// plugin wrote its files into `data/` but never staged/committed them, so
-/// every plugin file sat untracked forever (no version history, lost on a
-/// hard reset, invisible to git-based backups). Every other data-writing
-/// path (write_file/edit_file/data writes/marketplace registration) commits
-/// the files it writes; install was the lone exception.
-///
-/// Asserts the post-install working tree is clean for the plugin's files
-/// (none untracked) AND that exactly one commit, touching those files,
-/// records the install. Spans two content dirs (`apps/` + `knowhow/`) to
-/// prove the whole install lands in a SINGLE commit.
 #[tokio::test]
 async fn install_commits_written_files_so_working_tree_is_clean() {
     let (_tmp, scratch) = fresh_workspace();
@@ -1842,9 +1690,6 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
 
     let repo = git2::Repository::open(&scratch).expect("workspace must be a git repo");
 
-    // 1. None of the installed files may be left untracked/dirty. Before the
-    //    fix, every one of these reported `WT_NEW` (the `?? data/apps/...`
-    //    lines from the bug report).
     for rel in &write.installed_files {
         let repo_path = format!("data/{}", rel);
         let status = repo
@@ -1858,7 +1703,6 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
         );
     }
 
-    // 2. HEAD records the install with a descriptive, version-stamped message.
     let head_commit = repo
         .head()
         .and_then(|h| h.peel_to_commit())
@@ -1869,8 +1713,6 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
         "install commit must name the plugin and version"
     );
 
-    // 3. The commit's tree actually contains every installed file (one commit
-    //    across both `apps/` and `knowhow/`).
     let tree = head_commit.tree().expect("commit tree");
     for rel in &write.installed_files {
         let repo_path = format!("data/{}", rel);
@@ -1894,15 +1736,6 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
 mod guard_tests {
     use super::*;
 
-    /// Cross-layer pin: the engine writes both seeds, and two other layers have to
-    /// recognise them. The system prompt's route is what makes the agent call
-    /// `load_knowhow` at all, and the knowhow's frontmatter `description` is the
-    /// retrieval path behind it. Reword any one of the three alone and the thread
-    /// still starts, still looks right, and quietly gets a generic answer.
-    ///
-    /// Reading the real sources is what makes this a check on the set rather than
-    /// three assertions that the same string equals itself. Same shape as
-    /// `setup_interview_route_matches_the_frontend_seeded_prompt`.
     #[test]
     fn both_setup_seeds_route_to_the_plugin_setup_knowhow() {
         use crate::engine::chat::process::PLUGIN_SETUP_RULE;
@@ -1931,9 +1764,6 @@ mod guard_tests {
             .to_string();
         let route = PLUGIN_SETUP_RULE.to_lowercase();
 
-        // The verb every seed keeps, plus the word that tells the two occasions
-        // apart. A route or description carrying only "installed" leaves the update
-        // seed on retrieval alone.
         for word in ["set up", "install", "update"] {
             assert!(
                 route.contains(word),

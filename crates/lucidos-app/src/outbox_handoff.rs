@@ -1,33 +1,14 @@
-//! The desktop window's half of the outbox hand-off (ADR 0745).
-//!
-//! The window's storage belongs to its origin, so when it moves from
-//! `http://localhost:<port>` to `https://localhost:<port>` the http-era outbox
-//! becomes invisible. The hand-off page on the http origin passes the outbox
-//! here, the only command its capability grants, and the https page takes it.
-//!
-//! The payload is kept on disk until the https page acknowledges the import,
-//! so a crash in between loses nothing. Each store appends: a hand-off that
-//! ran twice keeps both payloads rather than replacing the first.
-//!
-//! Every store, empty or not, writes the done marker. The window then skips
-//! the hand-off page on every later launch ([`handoff_done`]).
-
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::Manager;
 
-/// Serialises the read-modify-write of the payload file. Managed as Tauri state.
 #[derive(Default)]
 pub struct OutboxHandoffStore(Mutex<()>);
 
-/// `<app_data>/config/outbox-handoff.json`: the payloads not yet acknowledged.
 fn payload_path(app_data: &Path) -> PathBuf {
     app_data.join("config").join("outbox-handoff.json")
 }
 
-/// Every payload stored and not yet acknowledged, oldest first. A missing file
-/// holds none. A corrupt one is an error: guessing empty would let the
-/// acknowledgement delete work nobody imported.
 fn load(path: &Path) -> Result<Vec<String>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
@@ -38,8 +19,6 @@ fn load(path: &Path) -> Result<Vec<String>, String> {
     }
 }
 
-/// Owner-only, since the payload carries the user's unsent messages. Written
-/// to a temp sibling and renamed, so a crash cannot truncate what is there.
 fn save(path: &Path, payloads: &[String]) -> Result<(), String> {
     use std::io::Write as _;
     let fail = |e: std::io::Error| format!("write {}: {e}", path.display());
@@ -61,20 +40,14 @@ fn save(path: &Path, payloads: &[String]) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(fail)
 }
 
-/// `<app_data>/config/outbox-handoff-done`: present once the hand-off page
-/// stored what the http origin held, even nothing.
 fn done_marker_path(app_data: &Path) -> PathBuf {
     app_data.join("config").join("outbox-handoff-done")
 }
 
-/// Has the hand-off page already run in this install's window?
 pub(crate) fn handoff_done(app_data: &Path) -> bool {
     done_marker_path(app_data).exists()
 }
 
-/// Keep `payload`, when there is one, then mark the hand-off done. The payload
-/// lands first, so a crash between the two reruns the hand-off rather than
-/// losing work.
 fn store(app_data: &Path, payload: Option<String>) -> Result<(), String> {
     if let Some(payload) = payload {
         append(&payload_path(app_data), payload)?;
@@ -93,9 +66,6 @@ fn append(path: &Path, payload: String) -> Result<(), String> {
     save(path, &payloads)
 }
 
-/// Drop the payloads the https page imported, one stored copy for each. They
-/// are named by content, never by position, so a payload stored while the
-/// import ran survives, even when two windows import at once.
 fn acknowledge(path: &Path, imported: &[String]) -> Result<(), String> {
     let mut rest = load(path)?;
     for payload in imported {
@@ -127,8 +97,6 @@ fn locked(store: &OutboxHandoffStore) -> Result<std::sync::MutexGuard<'_, ()>, S
         .map_err(|e| format!("outbox hand-off lock poisoned: {e}"))
 }
 
-/// Keep the http origin's outbox, as the hand-off page serialised it, or
-/// `None` when it held nothing. The one command the http origin may call.
 #[tauri::command]
 pub fn store_outbox_handoff(
     app: tauri::AppHandle,
@@ -140,7 +108,6 @@ pub fn store_outbox_handoff(
     store(&app_data, payload)
 }
 
-/// Every payload not yet acknowledged, for the https page to import.
 #[tauri::command]
 pub fn take_outbox_handoff(
     app: tauri::AppHandle,
@@ -151,7 +118,6 @@ pub fn take_outbox_handoff(
     load(&path)
 }
 
-/// The https page imported `payloads`, as it took them.
 #[tauri::command]
 pub fn acknowledge_outbox_handoff(
     app: tauri::AppHandle,

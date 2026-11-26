@@ -1,4 +1,4 @@
-//! One `claude_code.api_request` or `claude_code.api_error` record, built from
+//! INVARIANT: One `claude_code.api_request` or `claude_code.api_error` record, built from
 //! a persisted model call.
 //!
 //! Its attributes follow Claude Code's monitoring contract, so a gateway reads
@@ -18,64 +18,45 @@ use crate::llm::call_trace::CallFailure;
 use crate::llm::claude_gateway::gateway_managed_settings::GatewayManagedSettings;
 use crate::llm::claude_gateway::token_endpoint::jwt_claims;
 
-/// The `event.name` of a call that answered. Its body is this after the
-/// `claude_code.` prefix.
 const API_REQUEST: &str = "api_request";
 
-/// The `event.name` of a call that failed.
 const API_ERROR: &str = "api_error";
 
-/// How Lucidos names itself as the client.
 const CLIENT_NAME: &str = "lucidos";
 
-/// `identity.source` for a user named by the gateway sign-in's JWT, as Claude
-/// Code reports it.
 const IDENTITY_SOURCE: &str = "gateway-oidc";
 
-/// `speed` of every call. Lucidos never asks for fast mode.
 const SPEED: &str = "normal";
 
-/// The `effort` values Claude Code's contract accepts. A call at another tier,
-/// such as `none`, reports no effort.
 const REPORTED_EFFORTS: &[&str] = crate::core::preference_catalog::CODING_AGENT_EFFORTS;
 
-/// What one persisted gateway call says about itself.
 pub(crate) struct CallRow {
-    /// The row's own event sequence. Paired with `session.id` and the event
+    /// INVARIANT: The row's own event sequence. Paired with `session.id` and the event
     /// name, a collector can use it to drop a record sent twice.
     pub sequence: i64,
     pub thread_id: Option<Uuid>,
     pub created: DateTime<Utc>,
-    /// The model Lucidos asked for.
     pub model: String,
     pub duration_ms: Option<u64>,
     pub purpose: ContextPurpose,
-    /// The reasoning tier the call went out at, when it had one.
     pub reasoning_effort: Option<String>,
-    /// The turn the call belongs to, when one is known.
     pub prompt_id: Option<Uuid>,
-    /// The provider's id for the response, when it had one.
     pub request_id: Option<String>,
     pub outcome: Outcome,
 }
 
-/// How the call ended, with the facts only that ending has.
 pub(crate) enum Outcome {
     Completed {
         usage: ApiUsage,
-        /// Time to the first streamed token, when one arrived.
         ttft_ms: Option<u64>,
     },
     Failed {
         failure: CallFailure,
-        /// The last attempt's HTTP status, when a response arrived.
         status_code: Option<u16>,
         attempts: u32,
     },
 }
 
-/// Who signed in, from the access token's claims. `None` inside when the token
-/// is not a JWT.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Identity(Option<Claims>);
 
@@ -83,7 +64,6 @@ pub(crate) struct Identity(Option<Claims>);
 struct Claims {
     email: Option<String>,
     id: Option<String>,
-    /// The `groups` claim, comma-joined. `None` when empty.
     groups: Option<String>,
 }
 
@@ -93,7 +73,6 @@ impl Identity {
             return Self::default();
         };
         let claim = |name: &str| claims[name].as_str().map(str::to_string);
-        // Some IdPs send a lone group as a bare string rather than an array.
         let groups: Vec<&str> = match &claims["groups"] {
             serde_json::Value::String(group) => vec![group.as_str()],
             other => other
@@ -110,7 +89,6 @@ impl Identity {
         }))
     }
 
-    /// The identity attributes, in the order Claude Code sends them.
     fn attributes(&self) -> Vec<(&'static str, String)> {
         let Some(claims) = &self.0 else {
             return Vec::new();
@@ -123,25 +101,19 @@ impl Identity {
     }
 }
 
-/// One log record, ready to encode.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LogRecord {
-    /// The `event.name`, without the `claude_code.` prefix.
     pub event_name: &'static str,
     pub time_unix_nano: u64,
-    /// Every attribute is a string, as Claude Code sends them.
     pub attributes: Vec<(&'static str, String)>,
 }
 
 impl LogRecord {
-    /// The record body: `claude_code.` and the event name.
     pub(crate) fn body(&self) -> String {
         format!("claude_code.{}", self.event_name)
     }
 }
 
-/// The record for `row`. `policy` maps the model to the name telemetry
-/// reports it under.
 pub(crate) fn log_record(
     row: &CallRow,
     policy: Option<&GatewayManagedSettings>,
@@ -200,7 +172,6 @@ pub(crate) fn log_record(
     }
 }
 
-/// The `api_request` attributes that come before `speed`.
 fn completed_attributes(
     row: &CallRow,
     model: &str,
@@ -240,7 +211,7 @@ fn completed_attributes(
     attributes
 }
 
-/// The `api_error` attributes that come before `speed`. `attempt` is the
+/// INVARIANT: The `api_error` attributes that come before `speed`. `attempt` is the
 /// attempt the call failed on, as Claude Code counts it: from 1, so a call
 /// that failed before any send reports attempt 1.
 fn failed_attributes(
@@ -262,7 +233,7 @@ fn failed_attributes(
     attributes
 }
 
-/// Claude Code's error class slug for a failure, the value of `error` in its
+/// INVARIANT: Claude Code's error class slug for a failure, the value of `error` in its
 /// class mode. Never the provider's message: that can echo request content.
 /// Every slug matches `^[a-z0-9_]+$`, which that mode requires.
 fn error_class(failure: CallFailure, status_code: Option<u16>) -> &'static str {
@@ -278,8 +249,6 @@ fn error_class(failure: CallFailure, status_code: Option<u16>) -> &'static str {
     }
 }
 
-/// Which kind of call it was: `chat` for an agent's turn, `compaction` for
-/// history summarisation, else the auxiliary purpose's own name.
 fn query_source(purpose: ContextPurpose) -> String {
     match purpose {
         ContextPurpose::Turn => "chat".to_string(),
@@ -391,7 +360,6 @@ pub(crate) mod tests {
         assert_eq!(record.body(), "claude_code.api_request");
     }
 
-    /// Cached tokens are parts of the input total, each at its own share.
     #[test]
     fn a_call_prices_each_input_class_once() {
         let usage = ApiUsage {
@@ -406,8 +374,6 @@ pub(crate) mod tests {
             cache_creation_12h_tokens: None,
             cache_creation_requested_ttl: None,
         };
-        // Fresh 300k, read 500k, writes 100k at 5 minutes and 100k at 1 hour,
-        // then 100k out.
         let today = crate::llm::model_prices::today();
         let sonnet = price_table()
             .price_on("claude-sonnet-5-5", today)
@@ -422,7 +388,6 @@ pub(crate) mod tests {
         assert_eq!(usage.usd_on("my-local-model", today), None);
     }
 
-    /// An unknown price is not a free call, so the record leaves cost out.
     #[test]
     fn a_model_without_a_price_reports_no_cost() {
         let mut unpriced = row(1);
@@ -465,8 +430,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Only Claude Code's own tiers are reported, and a call without one
-    /// reports none.
     #[test]
     fn effort_is_reported_only_at_a_contract_tier() {
         let effort = |tier: Option<&str>| {
@@ -545,9 +508,6 @@ pub(crate) mod tests {
         assert_eq!(attribute(&record, "attempt"), Some("1"));
     }
 
-    /// The attribute names and values below are the contract of Claude Code
-    /// 2.1.300, read from its binary. They are literal on purpose: a rename
-    /// here is a change a collector would notice.
     #[test]
     fn a_failed_call_is_an_api_error_with_its_class() {
         let mut failed = failed_row(CallFailure::Http, Some(429));
@@ -599,8 +559,6 @@ pub(crate) mod tests {
         assert_eq!(error_slug(CallFailure::Other, None), "unknown");
     }
 
-    /// Claude Code's class mode drops an `error` that is not a bare slug, and
-    /// a message here could echo request content.
     #[test]
     fn every_error_class_is_a_slug() {
         for failure in FAILURES {
@@ -654,7 +612,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Absent stays absent: never an empty string or a zero.
     #[test]
     fn what_a_call_lacks_is_not_reported() {
         let record = log_record(&row(1), None, &Identity::default());
@@ -663,7 +620,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// `prompt.id` follows `event.sequence`, where Claude Code puts it.
     #[test]
     fn the_prompt_id_follows_the_event_sequence() {
         for call in [row(1), failed_row(CallFailure::Timeout, None)] {

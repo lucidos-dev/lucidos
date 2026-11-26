@@ -1,9 +1,3 @@
-//! Which device answers a `capture_app` / `refresh_app` call.
-//!
-//! Only the target device may answer: the one the agent named, else the turn's
-//! last used device. A quick "No app UI is currently open" from another device
-//! must never beat the real capture.
-
 use super::{app_ui_tool_impl, parse_save_target, PendingCaptures, SaveTarget, CAPTURE_TIMEOUT};
 use crate::core::ArtifactManager;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
@@ -21,7 +15,6 @@ use uuid::Uuid;
 const PHONE: &str = "device-phone";
 const LAPTOP: &str = "device-laptop";
 
-/// An error in the shape a page with no app frame sends back (`captureAppUIInner`).
 const NO_APP_OPEN: &str =
     "Error: No app UI is currently open. Open it with navigate_ui (target=app, app_id).";
 
@@ -48,8 +41,6 @@ fn actor_device(actor: Option<&MessageOrigin>) -> Option<String> {
     }
 }
 
-/// The next `AppUiCaptureRequested` for `thread_id`: its request id and the
-/// device it is scoped to.
 async fn next_capture(
     rx: &mut Receiver<EmittedEvent>,
     thread_id: Uuid,
@@ -58,7 +49,6 @@ async fn next_capture(
     (request_id, device)
 }
 
-/// [`next_capture`], plus the save format the request asks the frame for.
 async fn next_capture_with_format(
     rx: &mut Receiver<EmittedEvent>,
     thread_id: Uuid,
@@ -83,8 +73,6 @@ async fn next_capture_with_format(
     }
 }
 
-/// Start the tool on its own task, as the agentic loop would, so the test can
-/// answer the capture while it waits.
 fn start(
     bus: &Arc<EventBus>,
     pool: &PgPool,
@@ -97,7 +85,6 @@ fn start(
     let workspace = tempfile::tempdir().expect("tempdir");
     let artifacts = Arc::new(ArtifactManager::new(workspace.path().to_path_buf()).unwrap());
     let (bus, pool, pending) = (bus.clone(), pool.clone(), pending.clone());
-    // The workspace lives as long as the tool task that may write into it.
     tokio::spawn(async move {
         let args = json!({ "app_id": "habit-tracker" });
         let out = app_ui_tool_impl(
@@ -109,8 +96,6 @@ fn start(
     })
 }
 
-/// [`start`] with the caller's arguments and artifact store, asking the laptop
-/// for a capture with the usual timeout.
 fn start_with(
     bus: &Arc<EventBus>,
     pool: &PgPool,
@@ -141,8 +126,6 @@ fn start_with(
     })
 }
 
-/// The regression: the page without a frame answers first, and the laptop's
-/// real screenshot still reaches the agent.
 #[tokio::test]
 async fn a_page_without_the_app_cannot_beat_the_last_used_device() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -190,7 +173,6 @@ async fn a_page_without_the_app_cannot_beat_the_last_used_device() {
     teardown_test_db(&db).await;
 }
 
-/// `refresh_app` reloads only the last used device's app, then captures it.
 #[tokio::test]
 async fn refresh_is_scoped_to_the_last_used_device_too() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -235,8 +217,6 @@ async fn refresh_is_scoped_to_the_last_used_device_too() {
     teardown_test_db(&db).await;
 }
 
-/// An error the target sends back names it, so the agent knows which screen
-/// has no app open.
 #[tokio::test]
 async fn an_error_from_the_last_used_device_names_it() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -264,8 +244,6 @@ async fn an_error_from_the_last_used_device_names_it() {
     teardown_test_db(&db).await;
 }
 
-/// No answer: the result names the device that was asked, never a generic
-/// timeout.
 #[tokio::test]
 async fn a_timeout_names_the_device_that_did_not_answer() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -305,8 +283,6 @@ async fn a_timeout_names_the_device_that_did_not_answer() {
     teardown_test_db(&db).await;
 }
 
-/// A background or trigger turn has no last used device. The request names no
-/// device, and the first answer from any page is taken, as before.
 #[tokio::test]
 async fn with_no_last_used_device_any_page_may_answer() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -345,8 +321,6 @@ async fn with_no_last_used_device_any_page_may_answer() {
     teardown_test_db(&db).await;
 }
 
-/// A named device overrides the last used one: only the named device may
-/// answer, and its error says the agent named it.
 #[tokio::test]
 async fn a_named_device_answers_instead_of_the_last_used_one() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -394,8 +368,6 @@ async fn a_named_device_answers_instead_of_the_last_used_one() {
     teardown_test_db(&db).await;
 }
 
-/// An unknown device is refused before any page is asked, with the text
-/// `navigate_ui` gives.
 #[tokio::test]
 async fn an_unknown_device_asks_no_page() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -424,7 +396,6 @@ async fn an_unknown_device_asks_no_page() {
     teardown_test_db(&db).await;
 }
 
-/// A picture in `format`, base64 encoded, as a frame would send it.
 fn picture(format: image::ImageFormat) -> String {
     use base64::Engine;
     let mut bytes = std::io::Cursor::new(Vec::new());
@@ -469,7 +440,6 @@ fn a_save_path_must_stay_in_artifacts_and_name_a_format() {
         .contains(&CaptureFormat::extensions()));
 }
 
-/// A bad path is refused before any device is asked.
 #[tokio::test]
 async fn a_bad_save_path_asks_no_device() {
     let (bus, _rx, pool, db) = setup().await;
@@ -488,8 +458,6 @@ async fn a_bad_save_path_asks_no_device() {
     teardown_test_db(&db).await;
 }
 
-/// Run one saved capture to `path`, answered with `screenshot`. Returns the
-/// tool result, the format the request asked for, and the workspace.
 async fn saved_capture(
     path: &str,
     screenshot: &str,
@@ -555,7 +523,6 @@ async fn a_saved_capture_is_written_announced_and_still_seen() {
     assert_eq!(created, vec!["shots/board.png".to_string()]);
 }
 
-/// The data path an agent links in chat saves where that link points.
 #[tokio::test]
 async fn a_save_path_given_as_a_data_path_is_not_nested_twice() {
     let png = picture(image::ImageFormat::Png);
@@ -574,7 +541,6 @@ async fn a_save_path_given_as_a_data_path_is_not_nested_twice() {
     assert_eq!(created, vec!["shots/board.png".to_string()]);
 }
 
-/// A device that sent another format than the path names saves nothing.
 #[tokio::test]
 async fn a_picture_in_the_wrong_format_is_not_saved() {
     let jpeg = picture(image::ImageFormat::Jpeg);
@@ -589,7 +555,6 @@ async fn a_picture_in_the_wrong_format_is_not_saved() {
     assert!(created.is_empty());
 }
 
-/// A DOM-only answer carries no picture, so the result says nothing was saved.
 #[tokio::test]
 async fn a_capture_without_a_picture_saves_nothing() {
     let (out, _, workspace, created) =
@@ -609,14 +574,12 @@ async fn a_capture_without_a_picture_saves_nothing() {
     assert!(created.is_empty());
 }
 
-/// A write that fails is reported, never claimed as a save.
 #[tokio::test]
 async fn a_failed_write_is_reported() {
     let (bus, mut rx, pool, db) = setup().await;
     let pending: Arc<PendingCaptures> = Arc::default();
     let workspace = tempfile::tempdir().unwrap();
     let artifacts = Arc::new(ArtifactManager::new(workspace.path().to_path_buf()).unwrap());
-    // A file where the target's folder must go.
     std::fs::write(
         workspace.path().join("data/artifacts/shots"),
         "not a folder",
@@ -639,7 +602,6 @@ async fn a_failed_write_is_reported() {
     teardown_test_db(&db).await;
 }
 
-/// The page answers with its own error after 8 s, so the agent must wait longer.
 #[test]
 fn the_agent_waits_longer_than_the_page_deadline() {
     const PAGE: &str = include_str!("../../../../lucidos-app/src/store/actions/apps.ts");
@@ -656,7 +618,6 @@ fn the_agent_waits_longer_than_the_page_deadline() {
     assert!(CAPTURE_TIMEOUT > Duration::from_secs(secs));
 }
 
-/// Without a save path, the request asks for no format, and the wire omits it.
 #[tokio::test]
 async fn a_plain_capture_asks_for_no_format() {
     let (bus, mut rx, pool, db) = setup().await;

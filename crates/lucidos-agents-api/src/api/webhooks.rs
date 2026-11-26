@@ -1,4 +1,4 @@
-//! Webhooks: the user's CRUD, and the one route a sender actually calls.
+//! INVARIANT: Webhooks: the user's CRUD, and the one route a sender actually calls.
 //!
 //! Full design:
 //! `docs/plans/2026-08-19-webhooks-and-engines-off-the-network.md`.
@@ -34,24 +34,16 @@ struct WebhookRow {
     name: String,
     event_type: String,
     enabled: bool,
-    /// Whether a signature is configured. The config is returned too; this is
-    /// the one-glance answer a list needs.
     signed: bool,
     hmac: Option<HmacConfig>,
-    /// Absent means every arrival emits, so the log keeps the sender's retries.
     dedupe: Option<DedupeConfig>,
-    /// Request headers this hook copies into the event payload.
     headers: Vec<String>,
     created_at: String,
-    /// When a delivery last verified and emitted. `null` means never.
     last_accepted_at: Option<String>,
-    /// When a delivery last arrived and was turned away. `null` means never.
     last_refused_at: Option<String>,
     last_refusal_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal_run: Option<RefusalRun>,
-    /// Path a sender posts to, under whatever host the hook socket is exposed
-    /// on. The engine knows no public hostname, so it states the path alone.
     delivery_path: String,
 }
 
@@ -76,11 +68,6 @@ impl WebhookRow {
     }
 }
 
-/// The workspace slug a delivery URL carries.
-///
-/// The gateway hands every engine it spawns its own `LUCIDOS_WORKSPACE_ID`.
-/// With no gateway there is no hook socket either, so the directory name is a
-/// reasonable label for a URL nothing will call.
 fn workspace_slug(state: &AppState) -> String {
     std::env::var("LUCIDOS_WORKSPACE_ID").unwrap_or_else(|_| {
         state
@@ -118,49 +105,23 @@ struct CreateWebhookRequest {
     headers: Vec<String>,
 }
 
-/// Where the credential's value comes from, when the request brings one.
-///
-/// Absent is the shape this API had before: the credential already exists and
-/// `hmac.credential` merely names it.
-///
-/// # Which side invents a shared secret depends on the sender
-///
-/// GitHub takes whatever secret the receiver puts in its webhook form, so
-/// [`Self::Generate`] is right there and is the safer default: a hand-typed
-/// secret is the realistic weak link. Slack and Stripe issue their own and show
-/// it in their console, so those take [`Self::Provided`] and nothing else can
-/// work.
-///
-/// Both arms write one credential and then name it on the hook, so they differ
-/// only in where the value came from.
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum SigningSecret {
-    /// Mint 32 bytes of OS entropy, and return them once.
     Generate,
-    /// Store this exact value. Never echoed back: the caller already has it.
     Provided { value: String },
 }
 
-/// A webhook, plus whatever secret this one response is the only sight of.
-///
-/// Two handlers answer this shape. `create` always, and the `update` that
-/// turned a signed hook unsigned, which mints a token exactly as `create`
-/// would.
 #[derive(Serialize)]
 struct WebhookWithToken {
     #[serde(flatten)]
     webhook: WebhookRow,
     #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
-    /// The signing secret this request minted, for the only time it is
-    /// readable. Present only for `{"mode":"generate"}`, and the value to paste
-    /// into the sender's own webhook form.
     #[serde(skip_serializing_if = "Option::is_none")]
     signing_secret: Option<String>,
 }
 
-/// Create a webhook, and hand back its token once.
 async fn create_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -176,9 +137,6 @@ async fn create_webhook(
     let bringing_secret = body.signing_secret.is_some();
     if let Some(hmac) = body.hmac.as_ref() {
         validate_hmac_shape(hmac)?;
-        // A request bringing its own secret is about to write that credential,
-        // so requiring it beforehand would refuse the only flow that creates
-        // one. `check_signing_secret` does the opposite check for that case.
         if !bringing_secret {
             require_credential(&state, &hmac.credential).await?;
         }
@@ -192,8 +150,6 @@ async fn create_webhook(
     }
     let carried = validate_carried_headers(&body.headers, body.hmac.as_ref())?;
 
-    // Checked here, written after the insert. A create may overwrite nothing,
-    // so `may_replace` is `None`.
     let credential = body.hmac.as_ref().map(|hmac| hmac.credential.clone());
     let pending = match (body.signing_secret, credential.as_deref()) {
         (Some(secret), Some(name)) => {
@@ -231,13 +187,8 @@ async fn create_webhook(
     }))
 }
 
-/// The secret a request brought, checked but not yet written.
-///
-/// Splitting the check from the write is what keeps a failed mutation from
-/// changing a live hook. See [`PendingSecret::write`].
 struct PendingSecret {
     value: String,
-    /// `Some` only when we minted it, and only then is it echoed back.
     minted: Option<String>,
 }
 
@@ -275,8 +226,6 @@ fn check_signing_secret(
 }
 
 impl PendingSecret {
-    /// Refuse a pasted *secret reference* that does not resolve now, before
-    /// the hook is written, so no hook lands verifying against nothing.
     async fn resolvable(
         self,
         pool: &sqlx::PgPool,
@@ -301,8 +250,6 @@ impl PendingSecret {
             &state.engine.event_bus,
             credential,
             existing.map_or(&[][..], |c| c.base_urls.as_slice()),
-            // A signing secret is sent nowhere, so it has no transport shape.
-            // An existing row keeps whatever the user chose for it.
             existing.map_or(AuthType::Secret, |c| c.auth_type),
             &self.value,
             existing.map(|c| c.auth_header.as_str()),
@@ -315,17 +262,12 @@ impl PendingSecret {
     }
 }
 
-/// The credential a name currently resolves to, if any.
 async fn saved_credential(state: &AppState, name: &str) -> Result<Option<Credential>, ApiError> {
     CredentialStore::get(&state.pool, name)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
-/// Refuse a signature config the engine could never satisfy, on its own terms.
-///
-/// Split from the credential check below, because a request that BRINGS the
-/// secret has to pass this and fail that one.
 fn validate_hmac_shape(hmac: &HmacConfig) -> Result<(), ApiError> {
     if hmac.credential.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -353,9 +295,6 @@ fn validate_hmac_shape(hmac: &HmacConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The credential must exist now. A hook whose secret is missing refuses every
-/// delivery, and learning that from a sender's failed retries is worse than
-/// learning it here.
 async fn require_credential(state: &AppState, credential: &str) -> Result<(), ApiError> {
     let known = CredentialStore::get(&state.pool, credential)
         .await
@@ -370,7 +309,6 @@ async fn require_credential(state: &AppState, credential: &str) -> Result<(), Ap
 
 const AUTHORIZATION: &str = "authorization";
 
-/// Refuse a dedupe config that cannot do what it says.
 fn validate_dedupe(dedupe: &DedupeConfig) -> Result<(), ApiError> {
     if let Some(header) = dedupe.header.as_deref() {
         let header = header.trim();
@@ -401,12 +339,6 @@ fn validate_dedupe(dedupe: &DedupeConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Refuse a header allow-list that would carry a secret, and normalise the rest.
-///
-/// The events table is append-only, so a secret copied into a payload is there
-/// permanently. An allow-list beats filtering at write time: the refusal
-/// reaches whoever configured the hook, instead of silently dropping a header
-/// they expected to see.
 fn validate_carried_headers(
     requested: &[String],
     hmac: Option<&HmacConfig>,
@@ -446,13 +378,8 @@ struct UpdateWebhookRequest {
     event_type: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
-    /// Absent keeps the stored config, an object replaces it, and `null` stops
-    /// the hook signing. See [`HmacChange`] for what each does to the token.
     #[serde(default)]
     hmac: HmacChange,
-    /// Rotate the secret the hook verifies with. Works beside an `hmac` block
-    /// and on its own, which is the cheap gesture: change the secret and touch
-    /// nothing else.
     #[serde(default)]
     signing_secret: Option<SigningSecret>,
     #[serde(default)]
@@ -478,10 +405,6 @@ async fn update_webhook(
         validate_hmac_shape(hmac)?;
     }
 
-    // The stored hook decides two things a request cannot: which credential a
-    // rotation rewrites, and which headers a new signature config is checked
-    // against. Read it only when one of those is in play, since the common
-    // update is a name or an enabled flag.
     let touches_verifier = body.hmac != HmacChange::Keep || body.signing_secret.is_some();
     let stored = if body.headers.is_some() || touches_verifier {
         Some(
@@ -494,9 +417,6 @@ async fn update_webhook(
         None
     };
 
-    // What this hook will verify with once the update lands. A carried-header
-    // list is checked against THAT, so a new signature header cannot slip past
-    // a list the stored config allowed.
     let effective_hmac = match &body.hmac {
         HmacChange::Keep => stored.as_ref().and_then(|h| h.hmac.clone()),
         HmacChange::Set(hmac) => Some(hmac.clone()),
@@ -512,9 +432,6 @@ async fn update_webhook(
             requested,
             effective_hmac.as_ref(),
         )?),
-        // The list did not move, but the signature header may have. Re-check
-        // the stored list rather than writing it, so nothing is silently kept
-        // that the new config forbids.
         (None, Some(hook)) => {
             validate_carried_headers(&hook.headers, effective_hmac.as_ref())?;
             None
@@ -522,10 +439,6 @@ async fn update_webhook(
         (None, None) => None,
     };
 
-    // Checked here, written after the update lands. This request may overwrite
-    // one credential only: the one the hook already verifies with. So a
-    // rotation stays a rotation, and cannot reach an unrelated saved
-    // credential.
     let credential = effective_hmac.as_ref().map(|h| h.credential.clone());
     let mut existing = None;
     let pending = match body.signing_secret {
@@ -545,7 +458,6 @@ async fn update_webhook(
             Some(pending.resolvable(&state.pool, existing.as_ref()).await?)
         }
         None => {
-            // No secret came with it, so a new config must already have one.
             if let HmacChange::Set(hmac) = &body.hmac {
                 require_credential(&state, &hmac.credential).await?;
             }
@@ -602,11 +514,6 @@ async fn delete_webhook(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// What a refused delivery says back.
-///
-/// One message for every refusal, and it never names the reason. A public
-/// endpoint that tells "wrong token" apart from "bad signature" is telling
-/// whoever is guessing which half they got right. The log carries the detail.
 fn refused() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -615,28 +522,11 @@ fn refused() -> Response {
         .into_response()
 }
 
-/// Is this delivery the ingress probe's own knock?
-///
-/// The probe POSTs to a real hook with a bearer this engine minted for the
-/// current cycle, and expects to be turned away (ADR 0143). Left counted, it
-/// would stamp a refusal every 15 minutes on a healthy workspace and bury the
-/// one signal those columns exist to expose.
-///
-/// Pure, so the guard is testable without a database or a socket. It is the
-/// only thing standing between the probe and the refusal run, so it is checked
-/// in exactly one place.
 fn is_probe_delivery(headers: &HeaderMap) -> bool {
     webhooks::presented_bearer(header_str(headers, "authorization"))
         .is_some_and(webhook_probe_token::is_probe_token)
 }
 
-/// Record that a delivery arrived and was turned away, and why.
-///
-/// Two deliveries are deliberately not stamped. The probe's own refusal is
-/// skipped by [`is_probe_delivery`], so neither the stamps nor the refusal run
-/// move for it. And a stamp that fails is logged and dropped: the sender's
-/// delivery already happened, and losing an observation must never turn into a
-/// refusal the sender has to retry.
 async fn stamp_refused(
     state: &AppState,
     hook: &Webhook,
@@ -651,11 +541,6 @@ async fn stamp_refused(
     }
 }
 
-/// Record that a delivery verified and emitted.
-///
-/// Logged and dropped on failure, for the reason above: the event is already
-/// out, so a lost timestamp must not become a 500 the sender retries into a
-/// second event.
 async fn stamp_accepted(state: &AppState, hook: &Webhook) {
     if let Err(e) = WebhookStore::record_accepted(&state.pool, hook.id).await {
         crate::log_legacy!("[Webhook] '{}' could not stamp an accept: {e}", hook.name);
@@ -682,20 +567,6 @@ async fn signing_secret(
     }
 }
 
-/// `POST /api/v1/webhooks/:id/deliver`: verify a delivery, then emit its event.
-/// A verified Slack URL check is echoed instead (ADR 0624).
-///
-/// The body arrives as [`Bytes`] rather than `Json`, which is the whole point.
-/// Verification runs on those exact bytes, before any parse, and the signature
-/// covers them verbatim.
-///
-/// A delivery that authenticated stamps accepted, and one turned away stamps
-/// refused. "Arrived and was refused" and "never arrived" look identical from
-/// the events table, and have completely different causes.
-///
-/// Three outcomes stamp neither. An engine that could not emit, or could not
-/// read the signing credential, says nothing about the sender. The probe's own
-/// refusal is skipped on purpose.
 async fn deliver(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -704,8 +575,6 @@ async fn deliver(
 ) -> Response {
     let hook = match WebhookStore::get(&state.pool, id).await {
         Ok(Some(hook)) => hook,
-        // An unknown id and a disabled hook answer alike. Either way this URL
-        // accepts no deliveries, and saying which is a probe oracle.
         Ok(None) => return refused(),
         Err(e) => {
             crate::log_legacy!("[Webhook] could not load {id}: {e}");
@@ -717,17 +586,10 @@ async fn deliver(
         }
     };
     if !hook.enabled {
-        // Worth a stamp: a sender still delivering to a hook somebody switched
-        // off is exactly what the page should show, rather than silence. It is
-        // also the one refusal that examined nothing, which is what earns it
-        // its own words in `core::webhook_refusal`.
         stamp_refused(&state, &hook, &headers, DeliveryRefusal::Disabled).await;
         return refused();
     }
 
-    // A sender may sign any bytes. Non-UTF-8 cannot have come from a scheme we
-    // express, so it is refused before the lossy conversion that would
-    // otherwise change what gets verified.
     let Ok(body_str) = std::str::from_utf8(&body) else {
         crate::log_legacy!("[Webhook] '{}' refused: body is not UTF-8", hook.name);
         stamp_refused(&state, &hook, &headers, DeliveryRefusal::BodyNotUtf8).await;
@@ -736,9 +598,6 @@ async fn deliver(
 
     let secret = match signing_secret(&state.pool, hook.hmac.as_ref()).await {
         Ok(secret) => secret,
-        // Unknown, so not stamped: a refusal would tell the page the
-        // credential is missing and send the sender a 401 it must not retry.
-        // Never accepted unsigned either way.
         Err((status, reason)) => {
             crate::log_legacy!(
                 "[Webhook] '{}' credential lookup failed: {reason}",
@@ -774,8 +633,6 @@ async fn deliver(
         return refused();
     }
 
-    // Slack saving a Request URL is a handshake, not a delivery: echo it and
-    // emit nothing, so no trigger fires on it.
     if let Some(challenge) = webhooks::slack_url_verification(&hook, body_str) {
         stamp_accepted(&state, &hook).await;
         crate::log_legacy!("[Webhook] '{}' answered Slack's URL check", hook.name);
@@ -818,7 +675,7 @@ async fn deliver(
         }
         None => state
             .engine
-            // No trigger: a webhook delivery arrives from outside the workspace,
+            // INVARIANT: No trigger: a webhook delivery arrives from outside the workspace,
             // so no fire of ours emitted it and it must wake every subscriber.
             .emit_domain_event(&hook.event_type, payload, actor, None)
             .await
@@ -841,21 +698,16 @@ async fn deliver(
         }
         Ok(DeliveryOutcome::Duplicate(event_id)) => {
             crate::log_legacy!("[Webhook] '{}' ignored a resend", hook.name);
-            // A resend verified and landed. Only the second event is
-            // dropped, so the ingress carried this delivery in full.
             stamp_accepted(&state, &hook).await;
             duplicate(event_id)
         }
         Err(e) => {
-            // Nothing was written, so the sender's retry is a real retry.
             crate::log_legacy!("[Webhook] '{}' could not emit: {e}", hook.name);
             emit_failed()
         }
     }
 }
 
-/// What a resend gets: 200, carrying the event the first delivery emitted. The
-/// work is done, so the sender must stop retrying.
 fn duplicate(event_id: Uuid) -> Response {
     (
         StatusCode::OK,
@@ -867,8 +719,6 @@ fn duplicate(event_id: Uuid) -> Response {
         .into_response()
 }
 
-/// A delivery that authenticated but could not be turned into an event. The
-/// sender should retry, so this is deliberately a 5xx.
 fn emit_failed() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -877,11 +727,6 @@ fn emit_failed() -> Response {
         .into_response()
 }
 
-/// The allow-listed headers this delivery actually carried.
-///
-/// Keyed by the name as configured, so a condition matches the spelling the
-/// user wrote rather than a normalised one. An absent header is simply missing
-/// from the map.
 fn carried_headers(
     headers: &HeaderMap,
     allowed: &[String],
@@ -895,7 +740,6 @@ fn carried_headers(
         .collect()
 }
 
-/// A trimmed, non-empty header value.
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(name)
@@ -904,18 +748,6 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The event payload a delivery becomes: `{summary, headers, payload}`.
-///
-/// Three keys, always, whatever the sender posted. A condition reads
-/// `payload.action` for the sender's own field and `headers.X-GitHub-Event` for
-/// a carried header, both through the field paths of ADR 0119.
-///
-/// Wrapping is what makes a collision impossible rather than a rule about who
-/// wins one. A sender with its own `headers` field is simply `payload.headers`.
-///
-/// `summary` is copied up when the sender provides one, because the timeline
-/// reads it there and the sender's prose beats ours. The copy leaves
-/// `payload.summary` intact.
 fn delivery_payload(
     body: &str,
     hook_name: &str,
@@ -935,34 +767,17 @@ fn delivery_payload(
     })
 }
 
-/// The health of the public delivery path, for a cold page load.
-///
-/// SSE carries the two `WebhookIngress*` events while the app is open. This is
-/// what a client that just started reads instead of replaying the timeline.
 #[derive(Serialize)]
 pub(super) struct IngressStatus {
-    /// The live outage, or `null` when the path is healthy, was never probed,
-    /// or the declaration went stale.
     degraded: Option<IngressOutage>,
 }
 
-/// One standing outage of the ingress every webhook shares.
-///
-/// It names no webhook on purpose. The probe picks one hook as its target, and
-/// what failed is the path in front of all of them. So the page marks every
-/// enabled hook rather than the probed one.
 #[derive(Serialize)]
 struct IngressOutage {
-    /// The hook the probe used, not the owner of the outage. Named so a reader
-    /// can say which delivery path this is, and so the Discuss button can quote
-    /// it. The page still marks every enabled hook.
     webhook_name: String,
     host: String,
     port: u16,
-    /// The families that could not be reached: `ipv4`, `ipv6`, or both.
     families: Vec<Family>,
-    /// What each probed address answered. The verdict says a family is down,
-    /// and this says how each of its addresses failed.
     addresses: Vec<AddressProbe>,
     down_since: String,
     down_secs: i64,
@@ -1000,31 +815,18 @@ pub(super) async fn read_ingress_status(state: &AppState) -> Result<IngressStatu
     })
 }
 
-/// Which webhooks are turning their deliveries away, for a cold page load.
-///
-/// The verification-layer sibling of [`IngressStatus`]. SSE carries the two
-/// `WebhookDeliveries*` events while the app is open. This is what a client
-/// that just started reads instead of replaying the timeline.
 #[derive(Serialize)]
 pub(super) struct RefusalStatus {
-    /// One entry per hook with a standing declaration. Per hook, unlike the
-    /// ingress outage, because the fault belongs to the hook rather than to
-    /// the path in front of all of them.
     refusing: Vec<WebhookRefusal>,
 }
 
-/// One webhook that is throwing its deliveries away.
 #[derive(Serialize)]
 struct WebhookRefusal {
     webhook_id: String,
     webhook_name: String,
-    /// Whether the hook is switched on right now. The one-click recovery for
-    /// a `disabled` cause is to turn it back on, so the page needs it.
     enabled: bool,
     cause: RefusalCause,
-    /// How many deliveries have been turned away since one last verified.
     refusals: i64,
-    /// The run's breakdown by reason. The evidence, not the last line of it.
     reasons: std::collections::BTreeMap<String, i64>,
     refusing_since: String,
     refusing_secs: i64,
@@ -1051,9 +853,6 @@ pub(super) async fn read_refusal_status(state: &AppState) -> Result<RefusalStatu
         .into_iter()
         .filter(|hook| declared.contains_key(&hook.id.to_string()))
         .filter_map(|hook| match webhook_refusal::judge(&hook) {
-            // Over, or the row no longer supports it. The next cycle retracts
-            // it on the timeline; showing it here meanwhile would be a claim
-            // the page's own numbers contradict.
             webhook_refusal::RefusalVerdict::Clear => None,
             webhook_refusal::RefusalVerdict::Refusing(cause) => Some(WebhookRefusal {
                 webhook_id: hook.id.to_string(),
@@ -1077,7 +876,6 @@ pub(super) async fn read_refusal_status(state: &AppState) -> Result<RefusalStatu
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/webhooks", get(list_webhooks).post(create_webhook))
-        // Static before the param sibling, as `changes.rs` does for `/applied`.
         .route("/webhooks/ingress", get(ingress_status))
         .route("/webhooks/refusals", get(refusal_status))
         .route("/webhooks/:id", put(update_webhook).delete(delete_webhook))
@@ -1119,9 +917,6 @@ mod tests {
         map
     }
 
-    /// A credential read that failed is unknown, not missing. Reading it as
-    /// missing refused a possibly authentic delivery with a 401 and told the
-    /// page the credential did not exist.
     #[tokio::test]
     async fn a_failed_credential_read_is_an_error_and_not_a_missing_secret() {
         let unreachable = sqlx::postgres::PgPoolOptions::new()
@@ -1142,8 +937,6 @@ mod tests {
         );
     }
 
-    /// A signing secret held in 1Password that cannot be read now never lets
-    /// a delivery through unsigned. It answers 503, so the sender retries.
     #[tokio::test]
     async fn an_unreadable_signing_reference_answers_503() {
         let (pool, db) = crate::test_support::setup_test_db().await;
@@ -1184,8 +977,6 @@ mod tests {
         );
     }
 
-    /// The `body` special case is gone. Whatever the sender posted, a reader
-    /// finds it at exactly one place.
     #[test]
     fn every_body_produces_the_same_three_keys() {
         for body in [r#"{"a":1}"#, "[1,2,3]", "not json at all", "17"] {
@@ -1212,8 +1003,6 @@ mod tests {
         );
     }
 
-    /// Wrapping exists so this cannot be a rule about who wins. A sender's own
-    /// `headers` field is just another field it sent.
     #[test]
     fn a_sender_field_named_headers_does_not_collide() {
         let carried = carried_headers(
@@ -1225,8 +1014,6 @@ mod tests {
         assert_eq!(payload["payload"]["headers"]["mine"], true);
     }
 
-    /// The invariant ADR 0119's field paths buy: both halves are addressable by
-    /// a real condition, not just readable by hand.
     #[test]
     fn a_condition_resolves_both_a_sender_field_and_a_carried_header() {
         let carried = carried_headers(
@@ -1305,8 +1092,6 @@ mod tests {
         );
     }
 
-    /// Absent, an object and `null` are three different requests, and the DTO
-    /// tells them apart without an `Option<Option<_>>` anywhere.
     #[test]
     fn the_three_hmac_wire_forms_are_distinct() {
         fn parse(body: &str) -> HmacChange {
@@ -1330,24 +1115,16 @@ mod tests {
         credential
     }
 
-    /// A signing secret may write a name nothing holds, or rotate the hook's
-    /// own. It may never land on somebody else's credential.
-    ///
-    /// Without the bound, a hook pointed at `openai` would overwrite that API
-    /// key with 32 random bytes. The proxy would then present the webhook's
-    /// signing secret to OpenAI as the user's key.
     #[test]
     fn a_signing_secret_cannot_write_over_an_unrelated_credential() {
         let generate = || SigningSecret::Generate;
 
-        // A free name: written, whether this is a create or an update.
         assert!(check_signing_secret(generate(), "deploys-github", None, None).is_ok());
         assert!(
             check_signing_secret(generate(), "deploys-github", None, Some("old-name")).is_ok(),
             "a config repointed at a new credential creates it"
         );
 
-        // The hook's own credential: rotated.
         let own = saved_as("deploys-github", AuthType::Secret);
         assert!(
             check_signing_secret(
@@ -1360,7 +1137,6 @@ mod tests {
             "rotating the hook's own secret is the point of the field"
         );
 
-        // Anybody else's: refused, on create and on update alike.
         let theirs = saved_as("openai", AuthType::ApiKey);
         assert!(
             check_signing_secret(generate(), "openai", Some(&theirs), None).is_err(),
@@ -1373,7 +1149,6 @@ mod tests {
         );
     }
 
-    /// A pasted secret reaches the store exactly as the sender issued it.
     #[test]
     fn a_pasted_secret_is_neither_trimmed_nor_emptied() {
         let paste = |value: &str| SigningSecret::Provided {
@@ -1386,8 +1161,6 @@ mod tests {
             "a pasted secret is never echoed back: the caller already has it"
         );
 
-        // Refused by name rather than trimmed. Trimming can break a value that
-        // needs its padding, and keeping it breaks every delivery silently.
         assert!(check_signing_secret(paste(" whsec_pad "), "s", None, None).is_err());
         assert!(check_signing_secret(paste("whsec_pad\n"), "s", None, None).is_err());
         assert!(check_signing_secret(paste(""), "s", None, None).is_err());
@@ -1397,8 +1170,6 @@ mod tests {
         assert_eq!(minted.minted.as_deref(), Some(minted.value.as_str()));
     }
 
-    /// The mode is explicit on the wire, so neither arm can be reached by
-    /// accident. A generate carries no value, and a paste cannot omit one.
     #[test]
     fn a_signing_secret_states_which_side_invented_it() {
         let generate: SigningSecret = serde_json::from_str(r#"{"mode":"generate"}"#).unwrap();
@@ -1413,9 +1184,6 @@ mod tests {
         assert!(serde_json::from_str::<SigningSecret>(r#"{"mode":"invent"}"#).is_err());
     }
 
-    /// The shape checks that need no database. Each refuses a config `verify`
-    /// could never satisfy. So the refusal reaches whoever wrote it, rather
-    /// than reaching the sender as a silent 401 on every delivery.
     #[test]
     fn a_signature_config_that_cannot_verify_is_refused() {
         let ok = HmacConfig {
@@ -1464,14 +1232,6 @@ mod tests {
         .is_ok());
     }
 
-    /// The probe's own refusal never counts, and nothing else is exempt.
-    ///
-    /// The probe POSTs an unsigned body to a real hook every 15 minutes and
-    /// expects a 401. Counted, it would advance the refusal run four times an
-    /// hour on a perfectly healthy workspace and bury the signal the run
-    /// exists to carry.
-    ///
-    /// Serial, because the minted token lives in a process-wide slot.
     #[test]
     fn only_the_engines_own_probe_is_exempt_from_the_run() {
         static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1486,15 +1246,11 @@ mod tests {
             "the scheme is matched case-insensitively, as HTTP says"
         );
 
-        // Everything a real sender could present. GitHub attaches no bearer at
-        // all, which is the common case and must be counted.
         assert!(!is_probe_delivery(&HeaderMap::new()));
         assert!(!is_probe_delivery(&bearer("Bearer some-other-token")));
         assert!(!is_probe_delivery(&bearer("Bearer ")));
         assert!(!is_probe_delivery(&bearer(&token)), "no scheme, no match");
 
-        // A superseded token stops matching, so one leak cannot silence the
-        // run for as long as the engine runs.
         webhook_probe_token::mint().expect("mint again");
         assert!(!is_probe_delivery(&bearer(&format!("Bearer {token}"))));
 
@@ -1503,9 +1259,6 @@ mod tests {
 
     #[test]
     fn a_delivery_cannot_choose_the_event_type() {
-        // `event_type` in the body is another field the sender sent, and stays
-        // inert. `deliver` passes `hook.event_type` to `emit_domain_event`, and
-        // nothing anywhere reads this field.
         let payload = delivery_payload(
             r#"{"event_type":"NotificationCreated"}"#,
             "hook",
@@ -1702,7 +1455,6 @@ mod tests {
         };
         let taken = plain("order-taken").await;
 
-        // Create: the name is taken, so the hook write fails.
         let created = create_webhook(
             State(state.clone()),
             HeaderMap::new(),
@@ -1728,7 +1480,6 @@ mod tests {
             "no credential may be written for a hook that was not"
         );
 
-        // Update: rotating the secret while renaming onto a taken name.
         crate::test_support::seed_credential(
             &state.pool,
             "order-rotated-secret",

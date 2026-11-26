@@ -17,7 +17,6 @@ async fn commit(repo: &Path, file: &str) -> String {
     git(repo, &["rev-parse", "HEAD"]).await
 }
 
-/// A repository on `main` with one commit.
 pub(crate) async fn repo_at(path: &Path) -> PathBuf {
     std::fs::create_dir_all(path).unwrap();
     git(path, &["init", "-b", "main"]).await;
@@ -27,7 +26,6 @@ pub(crate) async fn repo_at(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Make `branch` in `repo` with one commit beyond `main`, and return its tip.
 pub(crate) async fn pending_branch(repo: &Path, branch: &str) -> String {
     git(repo, &["checkout", "-q", "-b", branch]).await;
     let tip = commit(repo, &format!("{branch}.txt")).await;
@@ -148,8 +146,6 @@ async fn a_restore_never_overwrites_newer_work_on_the_branch() {
     assert_eq!(branch_tip(&repo, "change").await, Some(diverged));
 }
 
-/// The target clone's `main` lags the source, so it lacks the bundle's
-/// prerequisite. The restore fetches `origin` and tries again.
 #[tokio::test]
 async fn a_lagging_clone_fetches_origin_for_the_prerequisites() {
     let tmp = tempfile::tempdir().unwrap();

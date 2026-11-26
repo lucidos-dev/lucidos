@@ -1,6 +1,3 @@
-//! Which calls of one batch may run together, and how the run behaves.
-//! ADR 0246 holds the reasoning.
-
 use super::{
     is_parallel_safe, parallel_run_end, run_concurrently, run_tool_with_cancel,
     MAX_PARALLEL_TOOL_CALLS, PARALLEL_SAFE_TOOLS,
@@ -32,9 +29,6 @@ fn write(path: &str) -> ToolCall {
     call(tn::WRITE_FILE, json!({ "path": path, "content": "x" }))
 }
 
-/// Skipping the guard for a run is only sound if the guard would have
-/// waved every one of these through anyway. The args carry a command the
-/// guard hard-blocks, so a tool that reads `command` would fail here.
 #[test]
 fn no_parallel_safe_tool_has_a_command_guard_lane() {
     let destructive = json!({ "command": "rm -rf /", "code": "import shutil; shutil.rmtree('/')" });
@@ -47,8 +41,6 @@ fn no_parallel_safe_tool_has_a_command_guard_lane() {
     }
 }
 
-/// A run calls `execute_tool` directly, so a tool the loop or
-/// `handle_special_tool` intercepts would lose its special handling.
 #[test]
 fn no_parallel_safe_tool_is_intercepted_before_execute_tool() {
     let intercepted = [
@@ -93,8 +85,6 @@ fn writes_commands_and_spawns_are_not_parallel_safe() {
     }
 }
 
-/// The model sees the grouped `events` tool, so the allowlist has to follow
-/// its `action` the way `execute_tool` does.
 #[test]
 fn a_grouped_tool_is_parallel_safe_only_for_a_read_action() {
     assert!(is_parallel_safe(tn::EVENTS, &json!({ "action": "query" })));
@@ -102,8 +92,6 @@ fn a_grouped_tool_is_parallel_safe_only_for_a_read_action() {
     assert!(!is_parallel_safe(tn::EVENTS, &json!({})));
 }
 
-/// A flat alias runs as itself whatever `action` it carries. Reading the
-/// action here would pass a write as the read it names, and run it in a run.
 #[test]
 fn a_flat_alias_is_judged_by_its_own_name_not_its_action() {
     assert!(!is_parallel_safe(
@@ -150,8 +138,6 @@ async fn job(delay_ms: u64, text: &'static str) -> ToolOutcome {
     Ok(text.to_string())
 }
 
-/// The slowest call comes first, so ordering by finish time would reorder
-/// the results, and running in sequence would take the sum of the delays.
 #[tokio::test(start_paused = true)]
 async fn outcomes_come_back_in_call_order_and_the_calls_overlap() {
     let started = tokio::time::Instant::now();
@@ -168,8 +154,6 @@ async fn outcomes_come_back_in_call_order_and_the_calls_overlap() {
     assert_eq!(started.elapsed(), Duration::from_millis(30));
 }
 
-/// A call's own emits run inside its future, so they land when it finishes.
-/// That is what makes a fast call's step resolve before a slow one's.
 #[tokio::test(start_paused = true)]
 async fn each_call_reports_when_it_finishes_not_in_call_order() {
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -215,9 +199,6 @@ async fn no_more_than_the_cap_run_at_once() {
     assert_eq!(peak.load(Ordering::SeqCst), MAX_PARALLEL_TOOL_CALLS);
 }
 
-/// One slow call holds one slot, never the others. Eight fast calls share the
-/// other three slots, so the run ends with the slow call at 100 ms. An
-/// ordered buffer would hold the finished slots and end at 120 ms.
 #[tokio::test(start_paused = true)]
 async fn a_slow_call_does_not_hold_up_the_calls_behind_it() {
     let started = tokio::time::Instant::now();
@@ -230,8 +211,6 @@ async fn a_slow_call_does_not_hold_up_the_calls_behind_it() {
     assert_eq!(started.elapsed(), Duration::from_millis(100));
 }
 
-/// A Stop settles every call, and every call still reports both ends. The
-/// cancel races only the work, so no step is left without its result.
 #[tokio::test(start_paused = true)]
 async fn a_stop_settles_every_call_and_each_still_reports_both_ends() {
     let token = CancellationToken::new();

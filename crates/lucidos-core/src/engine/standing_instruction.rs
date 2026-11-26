@@ -1,57 +1,12 @@
-//! Does this caller carry the workspace owner's standing instruction?
-//!
-//! A thread acts inside its own subtree on its own authority. Anything wider
-//! is the owner's button, and only a standing instruction lets a thread press
-//! one (ADR 0168 clauses 3 to 5). `api::thread_reach` answers which threads a
-//! caller may aim at. This answers on whose behalf it acts.
-//!
-//! **One definition, asked by every clause-4 verb.** A second spelling is how
-//! four routes drifted apart, so the verbs call the function below rather than
-//! re-deriving it.
-//!
-//! Both inputs are prefix fields of the *thread-bound origin token*, under its
-//! MAC (`api::actor`), so neither is a claim a caller can edit. The turn-start
-//! set is `crate::engine::switch_recovery_sql::THREAD_START_EVENTS_SQL`, shared with the recovery
-//! gates: "the owner opened this turn" must mean one thing. A once
-//! *permission* (`engine::permission`) ends with the same current turn,
-//! through [`opens_current_turn_sql`].
-//!
-//! **Nothing here can be self-granted.** An agent creates triggers freely, and
-//! an unchecked fire would promote its own thread to the owner's authority in
-//! two tool calls. So a fire is weighed by who authorized the trigger.
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Does this caller carry the owner's standing instruction? Two shapes, and
-/// no third.
-///
-/// **A turn the owner opened.** Their words in that turn are the press, and
-/// the thread's newest turn-start event carries a `Device` actor.
-///
-/// **A resume the engine made is the same turn carrying on.** After a switch,
-/// an API error or a hang, it inherits the turn it resumes, per ADR 0168
-/// clause 6. It never promotes one: a resumed agent turn stays the agent's.
-///
-/// **A trigger firing the owner authorized.** The same decision, made in
-/// advance. A fire reaches the engine two ways, so the shape has two records.
-/// An intent trigger runs on a thread whose turn starts with `TriggerStarted`.
-/// A script trigger has no thread, and its subprocess carries the fire's id on
-/// its own token instead. Either way the trigger's own provenance decides, per
-/// [`owner_authorized_trigger`].
-///
-/// Nothing is inherited. A thread spawned by one carrying the instruction
-/// opens its own turn with a `ThreadLink` actor, so it carries none.
-///
-/// **An unanswered probe is a no.** A read error, a thread that never started
-/// a turn, and a caller with neither input all answer false. Apply is not
-/// recoverable, so an unknown must not stand in for the owner.
 pub async fn carries_standing_instruction(
     pool: &PgPool,
     caller_thread_id: Option<Uuid>,
     emitting_trigger_id: Option<&str>,
 ) -> bool {
-    // The subprocess IS the fire, and its token says which one under the MAC.
+    // INVARIANT: The subprocess IS the fire, and its token says which one under the MAC.
     if let Some(trigger_id) = emitting_trigger_id {
         return owner_authorized_trigger(pool, trigger_id).await;
     }
@@ -67,8 +22,6 @@ pub async fn carries_standing_instruction(
     }
 }
 
-/// Did the owner's own device message open this thread's current turn? A
-/// trigger fire does not count, and neither does an unanswered probe.
 pub async fn owner_opened_current_turn(pool: &PgPool, thread_id: Uuid) -> bool {
     matches!(
         newest_turn_start(pool, thread_id).await,
@@ -76,30 +29,12 @@ pub async fn owner_opened_current_turn(pool: &PgPool, thread_id: Uuid) -> bool {
     )
 }
 
-/// What opened this thread's current turn, as far as the standing instruction
-/// is concerned.
 enum TurnStart {
-    /// A `Device` actor: the workspace owner at one of their own clients.
     OwnerOpened,
-    /// A trigger fired. Whose trigger is a separate question.
     TriggerFire { trigger_id: String },
-    /// An agent, another thread, or the engine itself.
     SomebodyElse,
 }
 
-/// SQL predicate over one `events` row: does it open the turn the standing
-/// instruction and a once *permission* are weighed against?
-///
-/// It is the recovery gates' turn-start set, minus any resume the owner did
-/// not click. So a resume reads as the turn it continues (ADR 0282), and the
-/// owner's own Continue still opens one. Unqualified columns, so use it only
-/// inside a query whose sole `FROM` is `events`.
-///
-/// `origin` before `actor` because a turn-start event naming a person carries
-/// the structured origin: `MessageReceived` stamps it at the chat boundary.
-/// `actor` is the `EventMeta` slot, for a start event that records its
-/// initiator there instead. Both hold a `MessageOrigin`, so `kind` means the
-/// same in either.
 pub(crate) fn opens_current_turn_sql() -> String {
     format!(
         "event_type IN ({starts}) \
@@ -110,8 +45,6 @@ pub(crate) fn opens_current_turn_sql() -> String {
     )
 }
 
-/// Read the thread's newest turn-start event. `None` when the thread has never
-/// started a turn, or the read failed.
 async fn newest_turn_start(pool: &PgPool, thread_id: Uuid) -> Option<TurnStart> {
     try_newest_turn_start(pool, thread_id)
         .await
@@ -122,7 +55,7 @@ async fn newest_turn_start(pool: &PgPool, thread_id: Uuid) -> Option<TurnStart> 
         .map(|(_, start)| start)
 }
 
-/// The event carrying the thread's standing instruction, if one holds. The
+/// INVARIANT: The event carrying the thread's standing instruction, if one holds. The
 /// acceptance transaction rereads it under the caller append lock, so a
 /// different turn cannot replace the instruction mid-send.
 pub async fn standing_instruction_event(
@@ -146,7 +79,7 @@ async fn try_newest_turn_start<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     thread_id: Uuid,
 ) -> Result<Option<(Uuid, TurnStart)>, sqlx::Error> {
-    // `task_id` is `TriggerStarted`'s legacy spelling of `trigger_id`, aliased
+    // INVARIANT: `task_id` is `TriggerStarted`'s legacy spelling of `trigger_id`, aliased
     // on the enum and therefore still live in old rows.
     let sql = format!(
         "SELECT id, event_type, \
@@ -165,7 +98,6 @@ async fn try_newest_turn_start<'e>(
         return Ok(None);
     };
     if event_type == "TriggerStarted" {
-        // A fire with no trigger id names nothing to check, so it is nobody's.
         return Ok(Some((
             event_id,
             match trigger_id {
@@ -183,21 +115,6 @@ async fn try_newest_turn_start<'e>(
     )))
 }
 
-/// Did the workspace owner authorize this trigger, so that a firing of it is
-/// their decision made in advance?
-///
-/// ADR 0168 puts it as "the owner wrote it and switched it on", and names both
-/// halves as checkable. So the newest of the trigger's authoring events must
-/// carry a `Device` actor: `TriggerCreated` is writing it, `TriggerEnabled` is
-/// switching it on, and `TriggerUpdated` is rewriting what it does.
-///
-/// **Newest, not any.** Without this the gate is a two-step self-promotion: an
-/// agent creates a trigger, fires it, and its thread now spends the owner's
-/// authority. An agent that rewrites an owner's trigger takes it back off.
-///
-/// A trigger nobody can show the owner authored answers false. That is the
-/// fail-closed direction, and it costs a legacy trigger only its reach OUTSIDE
-/// its own subtree, which clause 3 never needed.
 async fn owner_authorized_trigger(pool: &PgPool, trigger_id: &str) -> bool {
     match try_owner_authorized_trigger(pool, trigger_id).await {
         Ok(held) => held,

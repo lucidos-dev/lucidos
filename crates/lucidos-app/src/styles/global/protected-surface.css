@@ -66,6 +66,8 @@
     --lucidos-mark-fg: #ffffff;
     --claude-mark: var(--protected-caution);
     --codex-mark: var(--protected-accent);
+    --agent-icon-theme: var(--protected-accent);
+    --agent-icon-muted: var(--protected-text-muted);
 
     --syntax-key: var(--protected-accent);
     --syntax-string: var(--protected-text);

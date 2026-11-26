@@ -80,3 +80,40 @@ it('ignores a middle click in an installed PWA, which has nowhere to open a sepa
   platform.isStandalone = true;
   expect(middleClick()).not.toHaveBeenCalled();
 });
+
+const stopped = (unreachable: string | null = null): RemoteGatewayView => ({
+  ...cloud(unreachable),
+  workspaces: [{ id: 'dev', name: 'dev', health: 'unhealthy', last_error: 'not started' }],
+});
+
+function mountStopped(view: RemoteGatewayView, startsFirst: boolean): ReturnType<typeof vi.fn> {
+  const onOpen = vi.fn();
+  act(() => {
+    render(
+      <RemoteWorkspaceRowBody view={view} workspace={view.workspaces[0]} onOpen={onOpen} actions={null} startsFirst={startsFirst} />,
+      container,
+    );
+  });
+  return onOpen;
+}
+
+it('keeps a stopped row shut outside the gateway switcher', () => {
+  const onOpen = mountStopped(stopped(), false);
+  const row = container.querySelector<HTMLElement>('.ws-picker-open')!;
+  act(() => { row.click(); });
+  expect(onOpen).not.toHaveBeenCalled();
+});
+
+it('opens a stopped row that starts first, and says so', () => {
+  const onOpen = mountStopped(stopped(), true);
+  const row = container.querySelector<HTMLElement>('.ws-picker-open[role="button"]')!;
+  expect(row.getAttribute('aria-label')).toMatch(/^Start and open dev on cloud/);
+  act(() => { row.click(); });
+  expect(onOpen).toHaveBeenCalledWith('dev@cloud', expect.any(String));
+});
+
+it('never starts a row whose gateway is silent', () => {
+  const onOpen = mountStopped(stopped('timed out'), true);
+  act(() => { container.querySelector<HTMLElement>('.ws-picker-open')!.click(); });
+  expect(onOpen).not.toHaveBeenCalled();
+});

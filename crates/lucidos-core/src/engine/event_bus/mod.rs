@@ -19,6 +19,8 @@ type ThreadMutation =
 enum ThreadAppendEffect {
     Mutation(ThreadMutation),
     TriggerWrite(Box<SystemEvent>),
+    /// The domain events an allowing *event hook* returned (ADR 0746).
+    HookReturned(Vec<SystemEvent>),
 }
 
 use async_trait::async_trait;
@@ -422,6 +424,8 @@ pub use card_slot::{prompt_resolution_id, CardSlotTaken};
 mod diagnostic_bundles;
 mod domain_events;
 mod draft_submission;
+mod hook_gate;
+pub use hook_gate::{Asked, HookRefusal};
 mod internal_faults;
 mod ordinary_submission;
 pub mod spend_cap;
@@ -601,6 +605,16 @@ pub trait EventBusEmitter: Send + Sync {
         &self,
         event: BusEvent,
     ) -> Result<Option<EmitResult>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn emit_system_batch(
+        &self,
+        mut events: Vec<SystemEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if events.len() != 1 {
+            return Err("This event emitter cannot write a system event batch.".into());
+        }
+        self.emit(BusEvent::System(events.remove(0))).await?;
+        Ok(())
+    }
 }
 
 /// Channel capacity for the event broadcast.
@@ -724,6 +738,9 @@ pub struct EventBus {
     /// Threads running a *cache keep-alive* turn, whose output the projection
     /// skips. See [`projection::keep_alive`].
     keep_alive_turns: projection::keep_alive::KeepAliveTurns,
+    /// The armed *event hooks* and the runner that asks them. See
+    /// [`EventBus::ask_hooks`].
+    hook_gate: std::sync::Arc<hook_gate::HookGate>,
 }
 
 /// A provisional runtime turn must exist before its queue row becomes visible.
@@ -789,6 +806,7 @@ impl EventBus {
                 unbroadcast: UnbroadcastRows::default(),
                 append_tickets: AppendTickets::default(),
                 keep_alive_turns: Default::default(),
+                hook_gate: Default::default(),
             },
             parent_callback_rx,
         )
@@ -1573,10 +1591,27 @@ impl EventBus {
             emitting_trigger_id,
             ticket,
         } = committed;
+        self.publish_system_row(&ticket, event_id, seq, event, depth, emitting_trigger_id)
+    }
+
+    /// Broadcast one committed system row under its append's ticket. One
+    /// append may publish several.
+    fn publish_system_row(
+        &self,
+        ticket: &AppendTicket,
+        event_id: Uuid,
+        seq: i64,
+        event: SystemEvent,
+        depth: u32,
+        emitting_trigger_id: Option<String>,
+    ) -> EmitResult {
         if let SystemEvent::ThreadQueueDropped { entry_id, .. }
         | SystemEvent::ThreadQueueCompleted { entry_id } = &event
         {
             self.release_accepted_input(*entry_id);
+        }
+        if crate::core::event_hooks::ARMING_EVENT_TYPES.contains(&event.event_type()) {
+            self.hook_gate.forget_armed_hooks();
         }
         ticket.send(
             &self.event_tx,
@@ -2172,27 +2207,30 @@ impl EventBus {
             });
         }
 
-        let trigger_write = match effect {
-            Some(ThreadAppendEffect::TriggerWrite(event)) => {
-                let event_id = Uuid::new_v4();
-                let seq = self
-                    .persist_system_event(
-                        &mut tx,
-                        &ticket,
-                        event_id,
-                        &event,
-                        depth,
-                        emitting_trigger_id.as_deref(),
-                    )
-                    .await?;
-                Some((event_id, seq, *event))
-            }
+        let system_events = match effect {
+            Some(ThreadAppendEffect::TriggerWrite(event)) => vec![*event],
+            Some(ThreadAppendEffect::HookReturned(events)) => events,
             Some(ThreadAppendEffect::Mutation(mutation)) => {
                 mutation(&mut tx).await?;
-                None
+                Vec::new()
             }
-            None => None,
+            None => Vec::new(),
         };
+        let mut system_rows = Vec::with_capacity(system_events.len());
+        for event in system_events {
+            let event_id = Uuid::new_v4();
+            let seq = self
+                .persist_system_event(
+                    &mut tx,
+                    &ticket,
+                    event_id,
+                    &event,
+                    depth,
+                    emitting_trigger_id.as_deref(),
+                )
+                .await?;
+            system_rows.push((event_id, seq, event));
+        }
 
         // === Phase: PostCommit ===
         // Commit, then fan out. Every broadcast goes first, in sequence order,
@@ -2269,15 +2307,15 @@ impl EventBus {
                 });
             }
         }
-        if let Some((event_id, seq, event)) = trigger_write {
-            self.publish_system_event(CommittedSystemEvent {
+        for (event_id, seq, event) in system_rows {
+            self.publish_system_row(
+                &ticket,
                 event_id,
                 seq,
                 event,
                 depth,
-                emitting_trigger_id,
-                ticket,
-            });
+                emitting_trigger_id.clone(),
+            );
         }
         for (event_id, event, actor, ancestor_aggregates, side_effects) in fan_outs {
             if let ThreadEvent::UserQuestionAnswered {
@@ -2533,6 +2571,42 @@ impl EventBusEmitter for EventBus {
         event: BusEvent,
     ) -> Result<Option<EmitResult>, Box<dyn std::error::Error + Send + Sync>> {
         EventBus::emit(self, event).await
+    }
+
+    async fn emit_system_batch(
+        &self,
+        events: Vec<SystemEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if events.len() == 1 {
+            self.emit(BusEvent::System(
+                events.into_iter().next().expect("one event"),
+            ))
+            .await?;
+            return Ok(());
+        }
+        if events.iter().any(|event| !event.is_persisted()) {
+            return Err("A system event batch requires persisted events.".into());
+        }
+        let depth = current_event_trigger_depth();
+        let trigger = current_trigger_id();
+        let mut prepared = Vec::with_capacity(events.len());
+        for event in events {
+            prepared.push(self.with_notification_audience(event).await);
+        }
+        let Append { mut tx, ticket } = self.begin_append().await?;
+        let mut rows = Vec::with_capacity(prepared.len());
+        for event in prepared {
+            let id = Uuid::new_v4();
+            let seq = self
+                .persist_system_event(&mut tx, &ticket, id, &event, depth, trigger.as_deref())
+                .await?;
+            rows.push((id, seq, event));
+        }
+        tx.commit().await?;
+        for (id, seq, event) in rows {
+            self.publish_system_row(&ticket, id, seq, event, depth, trigger.clone());
+        }
+        Ok(())
     }
 }
 

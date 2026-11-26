@@ -1,5 +1,3 @@
-//! Destination-rendered diagnostic bundle construction, without transport.
-//! Phase 8 connects this private builder to consent-gated download/send paths.
 use chrono::{DateTime, SecondsFormat, Utc};
 use lucidos_diagnostic_log::bundle::{
     Bundle, Manifest, Missing, Source, SourceStatus, TimelineLine, MAX_COMPRESSED_BYTES,
@@ -26,8 +24,6 @@ pub struct Sources {
     pub boot_failure: Option<lucidos_diagnostic_log::Line>,
 }
 impl Sources {
-    /// Inputs must come from the workspace registry and resolved private data
-    /// dirs, never a request-supplied path or a host-log directory scan.
     pub fn new(workspace: &Path, gateway_data: &Path, client_data: Option<PathBuf>) -> Self {
         let (client, relaunch) = client_data
             .as_deref()
@@ -57,8 +53,6 @@ impl Sources {
     }
 }
 
-/// Mirrors the desktop shell's app_data_dir_from_env. A headless gateway may
-/// coexist with the desktop client; its gateway data dir is not client data.
 pub fn client_data_dir() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|home| {
@@ -97,7 +91,6 @@ fn collect_log(bundle: &mut Bundle, source: Source, dir: Option<&Path>, destinat
     };
     let mut present = false;
     for name in [ROTATED_FILE_NAME, FILE_NAME] {
-        // Exact known names only. NOFOLLOW excludes accidental links to raw logs.
         use std::os::unix::fs::OpenOptionsExt;
         let file = match File::options()
             .read(true)
@@ -148,7 +141,6 @@ fn collect_log(bundle: &mut Bundle, source: Source, dir: Option<&Path>, destinat
                         .get_mut(&source)
                         .unwrap()
                         .invalid_lines += 1;
-                    // Stop at an oversized record; do not parse its tail as a line.
                     bundle
                         .manifest
                         .sources
@@ -303,7 +295,6 @@ fn compress_to_limits(
         if bundle.timeline.is_empty() {
             return Err("Diagnostic metadata exceeds bundle cap".into());
         }
-        // Geometric reduction bounds compression work while retaining a suffix.
         let trim = (bundle.timeline.len() / 8).max(1);
         bundle.timeline.drain(..trim);
         bundle.manifest.trimmed_lines += trim;
@@ -378,9 +369,7 @@ fn collect_death(bundle: &mut Bundle, workspace: &Path, destination: Destination
 #[path = "diagnostic_bundle_tests.rs"]
 mod tests;
 
-/// Internal entry point for the consent-gated routes added in phase 8. It
-/// neither starts an engine nor sends a bundle. The registry supplies paths.
-#[allow(dead_code)] // Phase 8 supplies the consent-gated caller.
+#[allow(dead_code)]
 pub async fn collect(
     state: &crate::server::GatewayState,
     workspace: &crate::registry::Workspace,
@@ -437,7 +426,6 @@ async fn request_snapshot(
     .await;
     match result {
         Ok(Ok(snapshot)) => Some(snapshot),
-        // Failure is represented explicitly in every affected manifest source.
         Ok(Err(_)) | Err(_) => None,
     }
 }

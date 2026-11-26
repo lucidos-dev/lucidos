@@ -32,7 +32,6 @@ fn credential(value: &str) -> HeaderMap {
     headers
 }
 
-/// A landed: B's engine hears it, as the gateway, with B's local token.
 #[tokio::test]
 async fn a_landing_on_a_wakes_every_engine_b_routes() {
     let p = paired().await;
@@ -44,7 +43,6 @@ async fn a_landing_on_a_wakes_every_engine_b_routes() {
     assert!(nudges[0].contains(&token), "{}", nudges[0]);
 }
 
-/// Only a current pairing's credential nudges B.
 #[tokio::test]
 async fn b_takes_a_nudge_only_from_a_paired_gateway() {
     let p = paired().await;
@@ -63,7 +61,6 @@ async fn b_takes_a_nudge_only_from_a_paired_gateway() {
     assert_eq!(engine_nudges(&p).len(), 1);
 }
 
-/// The nudge follows the pairing: B's credential nudges nothing on A.
 #[tokio::test]
 async fn the_nudge_is_one_way() {
     let p = paired().await;
@@ -74,7 +71,6 @@ async fn the_nudge_is_one_way() {
     );
 }
 
-/// An older B lacks the call. A hears a 404 and shows nobody an error.
 #[tokio::test]
 async fn an_older_gateway_without_the_nudge_is_skipped_quietly() {
     let p = paired().await;
@@ -102,7 +98,6 @@ async fn an_older_gateway_without_the_nudge_is_skipped_quietly() {
     );
 }
 
-/// A's engine reports a landing on the control plane, as a local process.
 #[tokio::test]
 async fn an_engine_reports_a_landing_with_the_local_token() {
     let p = paired().await;
@@ -136,7 +131,6 @@ async fn paired_answer(state: &GatewayState) -> bool {
     body["paired"].as_bool().unwrap()
 }
 
-/// Either side of a pairing reads as paired. A lone gateway does not.
 #[tokio::test]
 async fn both_ends_of_a_pairing_answer_paired() {
     assert!(!paired_answer(&GatewayState::for_tests()).await);

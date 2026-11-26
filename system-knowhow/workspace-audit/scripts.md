@@ -112,6 +112,9 @@ Those writes remain readable files; see `docs/system-events.md` § Artifact prov
   Flag a script that repeats restore after a lost response as **broken**.
   Recommend the documented restore-status command.
 
+- **Scripts restoring a backup in one request.** A backup restores in the workspace picker; see `system-knowhow/backups.md` § Restore.
+  Flag a script that posts an archive to the gateway's `workspaces/restore` endpoint as **broken**: that endpoint takes only a finished upload session (ADR 0810).
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 Per `system-knowhow/lucidos-cli.md`:

@@ -1,27 +1,15 @@
-//! Persisted reasons Lucidos held an Apply or a proposal.
-
-/// Why the floor holds a branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanHold {
-    /// No marker at all.
     Missing,
-    /// The branch no longer carries the approved plan revision.
     Changed,
-    /// The plan marker or its committed revision could not be read.
     Unreadable,
-    /// A plan is recorded but the user has not approved it.
     AwaitingApproval,
-    /// A plan awaits approval and the branch lands plan files alone. The
-    /// decision is the user's, so the agent is not sent back to ask again.
     PlanOnlyAwaitingApproval,
-    /// Approval for later covers only a nonempty landing of plan files.
     PlanOnlyCode,
-    /// A bounded security fix whose work reaches past the files it named.
     OutsideBound,
 }
 
 impl PlanHold {
-    /// What a refused Apply tells the user.
     pub fn apply_refusal(self) -> &'static str {
         match self {
             PlanHold::PlanOnlyCode => {
@@ -54,7 +42,6 @@ impl PlanHold {
         }
     }
 
-    /// What the engine tells a live agent whose turn-end proposal it held.
     pub fn agent_nudge(self) -> &'static str {
         match self {
             PlanHold::PlanOnlyCode => {
@@ -100,23 +87,15 @@ impl PlanHold {
     }
 }
 
-/// Why a turn end's work may not become a change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposalHold {
-    /// The plan floor holds the branch.
     Plan(PlanHold),
-    /// The work never ran `/harden`, so Apply would harden it first.
     HardeningMissing,
-    /// An integrated sub-thread's hardened work. It hands its branch up to
-    /// its parent, whose agent merges it, so it never becomes a change.
     IntegratedIntoParent,
-    /// The thread handed off to a legacy successor thread. Its branch work rides on
-    /// the successor's branch, so this thread never proposes it.
     CarriedBySuccessor,
 }
 
 impl ProposalHold {
-    /// What a refused Apply tells the user.
     pub fn apply_refusal(self) -> &'static str {
         match self {
             ProposalHold::Plan(hold) => hold.apply_refusal(),
@@ -130,7 +109,6 @@ impl ProposalHold {
         }
     }
 
-    /// What the engine tells a live agent whose turn-end proposal it held.
     pub fn agent_nudge(self) -> &'static str {
         match self {
             ProposalHold::Plan(hold) => hold.agent_nudge(),
@@ -145,12 +123,10 @@ impl ProposalHold {
     }
 }
 
-/// Why an integrated sub-thread's work has no Apply.
 const INTEGRATED_HAS_NO_APPLY: &str =
     "This thread is integrated into its parent. Lucidos never proposes its work: the parent's \
      agent merges its branch, and the parent's change carries it.";
 
-/// Why a thread that handed off has no Apply.
 const CARRIED_HAS_NO_APPLY: &str =
     "This thread continued in a legacy successor thread, whose branch carries its work. Lucidos \
      never proposes it here: the successor's change carries it to Apply.";

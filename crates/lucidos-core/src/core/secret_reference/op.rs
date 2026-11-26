@@ -1,4 +1,4 @@
-//! The `op` command line tool as a [`SecretResolver`].
+//! INVARIANT: The `op` command line tool as a [`SecretResolver`].
 //!
 //! 1Password service accounts have no REST API, so the engine runs
 //! `op read --no-newline <reference>`. The child gets a cleared environment
@@ -16,13 +16,11 @@ use sqlx::PgPool;
 use super::{ResolveFailure, SecretReference, SecretResolver};
 use crate::core::CredentialStore;
 
-/// How long one `op` run may take before it counts as unreachable.
 pub const OP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The most of `op`'s stderr a failure reason quotes.
 const REASON_MAX_CHARS: usize = 300;
 
-/// What a `onepassword_service_account` credential holds, sealed: the token,
+/// INVARIANT: What a `onepassword_service_account` credential holds, sealed: the token,
 /// and optionally where `op` lives. The path sits here rather than in a
 /// preference because the agent role may write preferences, and whoever
 /// picks the binary receives the token.
@@ -34,7 +32,6 @@ pub struct ServiceAccount {
 }
 
 impl ServiceAccount {
-    /// Read the stored payload: a JSON object, or the bare token.
     pub fn parse(stored: &str) -> Self {
         serde_json::from_str::<Self>(stored).unwrap_or_else(|_| Self {
             token: stored.trim().to_string(),
@@ -42,9 +39,6 @@ impl ServiceAccount {
         })
     }
 
-    /// The `op` binary to run: the stored path, else the first `op` on the
-    /// engine's `PATH`, which already holds the usual install folders
-    /// (`core::user_path`).
     fn cli(&self) -> Result<PathBuf, ResolveFailure> {
         if let Some(path) = self.cli_path.as_deref().map(str::trim) {
             if !path.is_empty() {
@@ -63,7 +57,6 @@ impl ServiceAccount {
     }
 }
 
-/// The first executable `name` in `path`.
 fn find_on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -77,7 +70,6 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-/// Resolves through `op` with the workspace's service account.
 pub struct OpResolver {
     pool: PgPool,
     timeout: Duration,
@@ -117,7 +109,6 @@ impl SecretResolver for OpResolver {
     }
 }
 
-/// Run `op read` once. Only the token, `PATH` and `HOME` cross into the child.
 pub async fn run_op_read(
     account: &ServiceAccount,
     reference: &SecretReference,
@@ -133,16 +124,12 @@ pub async fn run_op_read(
         .map_err(|_| ResolveFailure::Definitive(format!("{} is not text", reference.as_str())))
 }
 
-/// What a working service account reaches: the `op` that ran, and the names
-/// of the vaults it may read.
 #[derive(Serialize)]
 pub struct VaultCheck {
     pub cli: String,
     pub vaults: Vec<String>,
 }
 
-/// Ask 1Password which vaults `account` may read, which proves the token and
-/// the `op` path work together.
 pub async fn list_vaults(
     account: &ServiceAccount,
     timeout: Duration,
@@ -164,7 +151,7 @@ pub async fn list_vaults(
     })
 }
 
-/// Run `op` once with `args`, returning its stdout. The child gets a cleared
+/// INVARIANT: Run `op` once with `args`, returning its stdout. The child gets a cleared
 /// environment holding only the token, `PATH` and `HOME`.
 async fn run_op(
     account: &ServiceAccount,
@@ -213,7 +200,7 @@ async fn run_op(
     Err(classify_op_failure(&format!("op said: {reason}")))
 }
 
-/// Sort an `op` error into a definitive answer or a transport failure.
+/// INVARIANT: Sort an `op` error into a definitive answer or a transport failure.
 ///
 /// Only an answer about the item, the vault or access is definitive. Anything
 /// else, such as a dropped connection, may pass, so the last good value

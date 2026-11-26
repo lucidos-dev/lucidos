@@ -4,9 +4,6 @@ mod question_reask_tests {
         MAX_PROSE_QUESTION_NUDGE, MAX_QUESTION_REASK,
     };
 
-    /// A chat turn that ended cleanly: no broken call, no trailing question,
-    /// no budget spent. Every test flips only the fields it is about, so a new
-    /// guard cannot be forgotten by a test that predates it.
     fn clean() -> QuestionReaskInputs {
         QuestionReaskInputs {
             ask_failed_last_iter: false,
@@ -20,8 +17,6 @@ mod question_reask_tests {
 
     #[test]
     fn no_force_when_no_cause_holds() {
-        // No failed ask, no leaked tag, no trailing question: the model's prose
-        // answer is legitimate, so never force a re-ask.
         assert_eq!(question_reask_cause(clean()), None);
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
@@ -34,7 +29,6 @@ mod question_reask_tests {
 
     #[test]
     fn forces_while_budget_remains() {
-        // Either broken-call cause forces a re-ask, for each force up to the cap.
         for forced in 0..MAX_QUESTION_REASK {
             assert_eq!(
                 question_reask_cause(QuestionReaskInputs {
@@ -59,8 +53,6 @@ mod question_reask_tests {
 
     #[test]
     fn a_rejected_call_wins_over_a_leaked_tag() {
-        // The more specific diagnosis: the model did reach the tool, so tell it
-        // what the call got wrong rather than that it typed a tag.
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
                 ask_failed_last_iter: true,
@@ -73,8 +65,6 @@ mod question_reask_tests {
 
     #[test]
     fn stops_forcing_at_cap() {
-        // Once the per-response budget is spent, fall through to a normal prose
-        // finalization so a stuck question path can't trap the loop.
         for inputs in [
             QuestionReaskInputs {
                 ask_failed_last_iter: true,
@@ -99,9 +89,6 @@ mod question_reask_tests {
 
     #[test]
     fn the_budget_is_shared_so_the_causes_cannot_alternate_past_the_cap() {
-        // One budget for the two broken-call causes, not one per cause.
-        // Otherwise a model alternating between a bad call and a typed tag
-        // would loop twice as long.
         let mut forced = 0;
         while question_reask_cause(QuestionReaskInputs {
             ask_failed_last_iter: forced % 2 == 0,
@@ -118,8 +105,6 @@ mod question_reask_tests {
 
     #[test]
     fn a_reply_ending_on_a_question_is_nudged() {
-        // The widest cause and the common failure: the model never reached the
-        // tool, it just typed "Want me to apply both?" and stopped.
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
                 ends_in_a_question: true,
@@ -131,15 +116,11 @@ mod question_reask_tests {
 
     #[test]
     fn a_reply_ending_on_a_statement_is_not_nudged() {
-        // The whole gate hangs off the trailing `?`. Without one there is no
-        // question to route to a card.
         assert_eq!(question_reask_cause(clean()), None);
     }
 
     #[test]
     fn the_prose_nudge_has_its_own_budget_and_stops_at_it() {
-        // Its own counter, so a turn that already spent the broken-call budget
-        // does not borrow from it, and vice versa.
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
                 ends_in_a_question: true,
@@ -152,9 +133,6 @@ mod question_reask_tests {
 
     #[test]
     fn one_diagnosis_per_turn() {
-        // A turn already corrected for a broken call is not corrected again for
-        // ending on a question. Three rounds of correction in one turn spends
-        // the user's money to say the same thing twice.
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
                 ends_in_a_question: true,
@@ -163,7 +141,6 @@ mod question_reask_tests {
             }),
             None
         );
-        // Including once the broken-call budget is exhausted.
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
                 ends_in_a_question: true,
@@ -177,8 +154,6 @@ mod question_reask_tests {
 
     #[test]
     fn a_broken_call_outranks_a_trailing_question() {
-        // Both hold when the model's ask was rejected and its prose fallback
-        // ends on the same question. Name the call it got wrong.
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
                 ask_failed_last_iter: true,
@@ -199,8 +174,6 @@ mod question_reask_tests {
 
     #[test]
     fn a_turn_nobody_can_answer_is_never_nudged() {
-        // A trigger run has nobody waiting. Nudging it parks a scheduled job on
-        // a card no one asked for.
         assert_eq!(
             question_reask_cause(QuestionReaskInputs {
                 ends_in_a_question: true,
@@ -211,14 +184,6 @@ mod question_reask_tests {
         );
     }
 
-    /// The caller resolves the audience, and getting it wrong is silent: the
-    /// nudge simply never fires. This gate read `response_channel ==
-    /// Some(Chat)` once, which is never true, because a chat turn passes
-    /// `None` there.
-    ///
-    /// So pin the call site's own argument rather than a channel the loop
-    /// re-derives. A bare `!is_trigger,` line is that argument; the other
-    /// `!is_trigger` in the file is part of a wider condition.
     #[test]
     fn the_caller_resolves_the_audience_and_a_trigger_is_the_only_exception() {
         let call_site = include_str!("../chat/process/run.rs");
@@ -232,12 +197,9 @@ mod question_reask_tests {
     #[test]
     fn the_detector_reads_the_end_of_the_reply() {
         assert!(reply_ends_in_a_question("Want me to apply both?"));
-        // Trailing whitespace and newlines are how a streamed reply ends.
         assert!(reply_ends_in_a_question("Want me to apply both?\n\n  "));
         assert!(!reply_ends_in_a_question("Applied both."));
         assert!(!reply_ends_in_a_question(""));
-        // A question mid-reply is usually rhetorical or quoted, and the model
-        // went on to answer it.
         assert!(!reply_ends_in_a_question(
             "Why did it fail? The frame is sandboxed."
         ));
@@ -245,8 +207,6 @@ mod question_reask_tests {
 
     #[test]
     fn each_cause_names_its_own_problem() {
-        // Telling the model a call was rejected when it never made one sends it
-        // looking for a mistake that isn't there.
         let rejected = QuestionReaskCause::CallRejected.instruction();
         let leaked = QuestionReaskCause::LeakedAsText.instruction();
         let prose = QuestionReaskCause::AskedInProse.instruction();
@@ -267,9 +227,6 @@ mod question_reask_tests {
 
     #[test]
     fn the_prose_nudge_keeps_the_open_ended_carve_out() {
-        // `ASK_USER_QUESTION_RULE` licenses plaintext for a question whose
-        // options would be guesses. Without the carve-out the nudge pushes the
-        // model to invent two, and it has no way to decline.
         let prose = QuestionReaskCause::AskedInProse.instruction();
         assert!(prose.contains("open-ended"));
         assert!(prose.contains("would be guesses"));
@@ -277,10 +234,6 @@ mod question_reask_tests {
 
     #[test]
     fn declining_the_nudge_keeps_the_draft_and_the_reason_stays_private() {
-        // The draft has already streamed, and the loop ends the turn on it when
-        // the model declines. A model told to repeat the question, or to explain
-        // itself to the user, shows them the question twice with a justification
-        // wedged between.
         let prose = QuestionReaskCause::AskedInProse.instruction();
         assert!(prose.contains("stays as your answer"));
         assert!(prose.contains("The user never sees that line"));
@@ -292,8 +245,6 @@ mod question_reask_tests {
 
     #[test]
     fn every_cause_logs_a_distinct_reason() {
-        // The `LlmCallRetried` reason is how we tell which guard fired and how
-        // often. Two causes sharing one string make that unreadable.
         let reasons = [
             QuestionReaskCause::CallRejected.retry_reason(),
             QuestionReaskCause::LeakedAsText.retry_reason(),
@@ -309,14 +260,6 @@ mod question_reask_tests {
 
     #[test]
     fn caps_are_bounded_and_below_the_default_tool_call_cap() {
-        // Sanity: both caps are small positive bounds, far under the outer
-        // tool-call backstop. The bounds are consts, so those assert at compile
-        // time; the cap's default lives in the catalog, so that one runs.
-        //
-        // This guards the DEFAULT cap, not the configured one: the tool-call cap
-        // is a user setting with no ceiling and a floor of 1, so a user who sets
-        // it to 1 has deliberately chosen for the backstop to fire before this
-        // guard. What must not drift is the unconfigured relationship.
         const { assert!(MAX_QUESTION_REASK >= 1) };
         assert!((MAX_QUESTION_REASK as f64) < crate::core::prefs::MAX_TOOL_CALLS.default_number());
         const { assert!(MAX_PROSE_QUESTION_NUDGE >= 1) };

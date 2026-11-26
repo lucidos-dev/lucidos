@@ -6,7 +6,6 @@ use std::path::Path;
 use uuid::Uuid;
 
 impl EventStore {
-    /// Get a snapshot of the conversation at a specific event
     pub async fn get_conversation_at_event(
         &self,
         event_id: Uuid,
@@ -51,11 +50,11 @@ impl EventStore {
                     current_steps.clear();
                     current_images.clear();
                 }
-                // "Thinking" is the legacy DB string; T7 renamed the variant to
+                // INVARIANT: "Thinking" is the legacy DB string; T7 renamed the variant to
                 // ThoughtStreamed. New rows store "ThoughtStreamed"; old rows
                 // are unchanged. Match both so legacy snapshots still render.
                 "Thinking" | "ThoughtStreamed" => {
-                    // Legacy payload fields — kept for old DB rows. New
+                    // INVARIANT: Legacy payload fields — kept for old DB rows. New
                     // emissions carry these on ContextCaptured.
                     let context_tokens = event
                         .payload
@@ -78,7 +77,7 @@ impl EventStore {
                         tool_called_event_id: None,
                     });
                 }
-                // "MemorySearched" is the legacy DB string; the variant was
+                // INVARIANT: "MemorySearched" is the legacy DB string; the variant was
                 // renamed to MemoryRecalled so it stops mirroring the `memory`
                 // tool's own "Searching memory" step. New rows store
                 // "MemoryRecalled"; old rows are unchanged. Match both so
@@ -118,7 +117,6 @@ impl EventStore {
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(true);
 
-                    // A legacy row carries no call id, and falls to the newest step.
                     let call_id =
                         super::tool_called_event_id_of(&event.payload).map(|id| id.to_string());
                     if let Some(step) = current_steps.iter_mut().rev().find(|step| match &call_id {

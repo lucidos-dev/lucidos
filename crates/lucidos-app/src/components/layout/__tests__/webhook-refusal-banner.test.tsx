@@ -86,6 +86,16 @@ describe('refusalBannerBody renders the bar', () => {
     onDiscuss = () => {},
   ) => refusalBannerBody({ layout: 'desktop', refusal: r, others, onOpenWebhooks, onDiscuss });
 
+  it('lands the measured ref on the bar itself, the box the shell lays out', () => {
+    const ref = { current: null };
+    const node = refusalBannerBody({
+      layout: 'desktop', refusal: refusal(), others: null, onOpenWebhooks: () => {}, onDiscuss: () => {}, elRef: ref,
+    });
+    const [bar] = findByClass(node, 'refusal-banner');
+    expect(bar.ref).toBe(ref);
+    expect(findByClass(node, 'refusal-banner-text')[0].ref).toBeUndefined();
+  });
+
   it('states the notice, from the table the Webhooks row reads too', () => {
     const notice = webhookRefusalNotice(refusal());
     const text = textOf(body());

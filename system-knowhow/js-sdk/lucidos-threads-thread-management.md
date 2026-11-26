@@ -46,6 +46,8 @@ Use these for thread metadata without subscribing to the full SSE stream.
 
 **`active` is a union, `status` is precise.** `active: true` selects `running` OR `waiting_for_user_answer`, which are opposites: the workspace working, or waiting on a person. "Is anything busy?" wants `status: 'running'`. "N threads I have something invested in" wants `active: true`. Passing both is a 400.
 
+A *held* thread parked on a question matches neither `status: 'waiting_for_user_answer'` nor `active: true`, and its `liveness.state` reads `held`. Its row's `status` still says `waiting_for_user_answer`, so count what needs the owner with the filter, never from `status`.
+
 ### Types
 
 ```ts
@@ -87,7 +89,8 @@ type UnproposedReason =
   | 'turn_incomplete'
   | 'awaiting_landing'
   | 'integrated_into_parent'
-  | 'carried_by_successor'; // Legacy successor threads only.
+  | 'carried_by_successor' // Legacy successor threads only.
+  | 'hook_refused'; // An event hook refused the proposal.
 
 type CodingAgentChangeState =
   | { kind: 'none' }

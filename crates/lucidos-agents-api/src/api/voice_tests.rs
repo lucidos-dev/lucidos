@@ -1,9 +1,3 @@
-//! The call ticket's mint and the upgrade that redeems it.
-//!
-//! Every refusal a person can act on is driven through the mint, since that is
-//! where our client reads it. The upgrade's tests are about the ticket itself
-//! and the re-check under it.
-
 use super::*;
 use crate::api::voice_ticket::{mint, CallTickets, NOT_FROM_THE_SHELL};
 use crate::core::subprocess_origin::{
@@ -25,12 +19,10 @@ fn headers_with(pairs: &[(&'static str, &str)]) -> HeaderMap {
     headers
 }
 
-/// A paired device as the gateway forwards it: its id and the stamp proving it.
 fn device_headers(device_id: &str) -> HeaderMap {
     crate::api::gateway_stamp::test_support::stamped_device_headers(device_id)
 }
 
-/// The upgrade's own URI, carrying `ticket` when there is one.
 fn call_uri(thread_id: Uuid, ticket: Option<&str>) -> Uri {
     let ticket = ticket.map_or(String::new(), |t| format!("&{QUERY_CALL_TICKET}={t}"));
     format!("/voice?thread_id={thread_id}{ticket}")
@@ -38,7 +30,6 @@ fn call_uri(thread_id: Uuid, ticket: Option<&str>) -> Uri {
         .expect("a valid URI")
 }
 
-/// The stores a call touches, fresh per test.
 struct Line {
     sessions: LiveVoiceSessions,
     tickets: CallTickets,
@@ -52,7 +43,6 @@ impl Line {
         }
     }
 
-    /// The owner asks their registered phone for a ticket.
     async fn owner_mints(&self, pool: &sqlx::PgPool, thread_id: Uuid) -> Result<String, ApiError> {
         crate::test_support::seed_device(pool, OWNERS_PHONE, Some("Mozilla/5.0"), None).await;
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
@@ -67,7 +57,6 @@ impl Line {
         .await
     }
 
-    /// Dial `thread_id` with `ticket`, as the gateway forwards it.
     async fn dial(
         &self,
         pool: &sqlx::PgPool,
@@ -88,7 +77,6 @@ impl Line {
         .await
     }
 
-    /// The whole call: mint from the phone, then dial from it.
     async fn owner_calls(
         &self,
         pool: &sqlx::PgPool,
@@ -115,7 +103,6 @@ async fn a_chat_thread(pool: &sqlx::PgPool) -> Uuid {
     thread_id
 }
 
-/// The workspace's home thread, the one thread a call runs on.
 async fn the_home_thread(pool: &sqlx::PgPool) -> Uuid {
     let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
     crate::engine::home_thread::ensure_home_thread(&bus, pool)
@@ -123,11 +110,6 @@ async fn the_home_thread(pool: &sqlx::PgPool) -> Uuid {
         .expect("create the home thread")
 }
 
-/// A thread a coding agent holds.
-///
-/// `source` reads `claude_code` for a started one and for a DRAFT alike.
-/// The compose write mirrors the picked mode into it, so a draft says who
-/// holds it before it carries a single message.
 async fn a_coding_agent_thread(pool: &sqlx::PgPool, state: &str) -> Uuid {
     let thread_id = Uuid::new_v4();
     sqlx::query(
@@ -141,7 +123,6 @@ async fn a_coding_agent_thread(pool: &sqlx::PgPool, state: &str) -> Uuid {
     thread_id
 }
 
-/// Opt this workspace into voice, or back out of it.
 async fn voice_set(pool: &sqlx::PgPool, on: bool) {
     let key = crate::core::prefs::VOICE_ENABLED.key();
     crate::core::PreferenceStore::set_row_for_test(pool, key, if on { "true" } else { "false" })
@@ -149,9 +130,6 @@ async fn voice_set(pool: &sqlx::PgPool, on: bool) {
         .expect("set the voice switch");
 }
 
-/// Voice ships off. A workspace that never opted in has no call to place,
-/// and the refusal lands before the thread is even looked up. Every
-/// workspace has Home, so the voice switch is the only one it names.
 #[tokio::test]
 async fn a_ticket_is_refused_while_voice_is_off() {
     let (pool, db_name) = setup_test_db().await;
@@ -165,7 +143,6 @@ async fn a_ticket_is_refused_while_voice_is_off() {
     assert_eq!(error.status, StatusCode::FORBIDDEN);
     assert!(error.message.contains("under Voice"), "{}", error.message);
 
-    // And it is the switch that decides, not the thread.
     voice_set(&pool, true).await;
     line.owner_calls(&pool, thread_id)
         .await
@@ -191,14 +168,6 @@ async fn an_unreadable_voice_switch_refuses_the_call() {
     teardown_test_db(&db_name).await;
 }
 
-/// A call reaches the Lucidos Agent and nothing else (ADR 0165).
-///
-/// Both states, because the draft is the one the user actually hits: they
-/// pick Claude Code in the compose view and press the control before the
-/// thread has a single message in it.
-///
-/// The message names the way back rather than saying only "no". The
-/// destination picker sits in the same row as the control they pressed.
 #[tokio::test]
 async fn a_ticket_for_a_coding_agent_thread_is_refused() {
     let (pool, db_name) = setup_test_db().await;
@@ -223,9 +192,6 @@ async fn a_ticket_for_a_coding_agent_thread_is_refused() {
     teardown_test_db(&db_name).await;
 }
 
-/// Voice sessions live in the home thread alone (ADR 0362, invariant I12).
-/// Any other Lucidos Agent thread is refused, and the message names where
-/// to go instead.
 #[tokio::test]
 async fn a_ticket_for_any_thread_but_home_is_refused() {
     let (pool, db_name) = setup_test_db().await;
@@ -263,10 +229,6 @@ async fn a_ticket_for_a_thread_that_does_not_exist_is_refused() {
     teardown_test_db(&db_name).await;
 }
 
-/// One live session per thread. It is what keeps every start paired with
-/// exactly one end, so the second caller is refused rather than queued. The
-/// mint refuses it, and so does a dial on a ticket minted before the first
-/// call began.
 #[tokio::test]
 async fn a_second_call_on_a_busy_thread_is_refused() {
     let (pool, db_name) = setup_test_db().await;
@@ -306,7 +268,6 @@ async fn a_second_call_on_a_busy_thread_is_refused() {
         "the refusal must not evict the first"
     );
 
-    // Ringing off frees the thread, and the next call gets a fresh id.
     drop(held);
     let second_id = line
         .owner_calls(&pool, thread_id)
@@ -318,8 +279,6 @@ async fn a_second_call_on_a_busy_thread_is_refused() {
     teardown_test_db(&db_name).await;
 }
 
-/// A ticket mint names its caller like any write. No credential, or a typed
-/// device id naming no registered row, is refused.
 #[tokio::test]
 async fn a_caller_naming_nobody_gets_no_ticket() {
     let (pool, db_name) = setup_test_db().await;
@@ -343,9 +302,6 @@ async fn a_caller_naming_nobody_gets_no_ticket() {
     teardown_test_db(&db_name).await;
 }
 
-/// A Lucidos-spawned subprocess proves who it is, and the answer is still
-/// no. A call speaks as the owner, and an agent never does, on any
-/// authority. Even the home thread's own token is refused.
 #[tokio::test]
 async fn an_agent_may_not_mint_a_ticket() {
     let (pool, db_name) = setup_test_db().await;
@@ -370,9 +326,6 @@ async fn an_agent_may_not_mint_a_ticket() {
     teardown_test_db(&db_name).await;
 }
 
-/// The mint takes the strict origin rule. A browser-shaped request naming an
-/// app document is refused, and so is one naming no page at all. The shell's
-/// own page gets its ticket.
 #[tokio::test]
 async fn a_ticket_is_refused_to_an_app_page_and_to_an_unnamed_page() {
     let (pool, db_name) = setup_test_db().await;
@@ -409,8 +362,6 @@ async fn a_ticket_is_refused_to_an_app_page_and_to_an_unnamed_page() {
     teardown_test_db(&db_name).await;
 }
 
-/// No ticket, or one the mint never issued, opens nothing. Each refusal
-/// lands before a slot is claimed.
 #[tokio::test]
 async fn an_upgrade_without_a_live_ticket_is_refused() {
     let (pool, db_name) = setup_test_db().await;
@@ -437,8 +388,6 @@ async fn an_upgrade_without_a_live_ticket_is_refused() {
     teardown_test_db(&db_name).await;
 }
 
-/// A ticket opens the thread it was minted for, once. Spent on another
-/// thread, it is gone, and home refuses it too.
 #[tokio::test]
 async fn a_ticket_opens_its_own_thread_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -475,8 +424,6 @@ async fn a_ticket_opens_its_own_thread_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// The call speaks as the device that minted the ticket, which the gateway
-/// stamps on the upgrade too.
 #[tokio::test]
 async fn the_call_speaks_as_the_device_that_minted_the_ticket() {
     let (pool, db_name) = setup_test_db().await;
@@ -498,9 +445,6 @@ async fn the_call_speaks_as_the_device_that_minted_the_ticket() {
     teardown_test_db(&db_name).await;
 }
 
-/// Through the gateway the header is the device it authenticated. A ticket
-/// another device minted must not stand in for it, even when both are the
-/// owner's.
 #[tokio::test]
 async fn a_header_naming_another_device_than_the_ticket_is_refused() {
     let (pool, db_name) = setup_test_db().await;
@@ -521,8 +465,6 @@ async fn a_header_naming_another_device_than_the_ticket_is_refused() {
     teardown_test_db(&db_name).await;
 }
 
-/// The upgrade re-checks what the mint checked. Voice switched off between
-/// the two refuses the call, and the ticket is spent by the attempt.
 #[tokio::test]
 async fn the_upgrade_re_checks_what_the_mint_checked() {
     let (pool, db_name) = setup_test_db().await;

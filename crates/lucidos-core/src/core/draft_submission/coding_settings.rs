@@ -1,4 +1,4 @@
-//! Coding picks must survive validation exactly; tolerant runtime defaults are
+//! INVARIANT: Coding picks must survive validation exactly; tolerant runtime defaults are
 //! not permission to replace an explicit choice in saved owner content.
 
 use super::SavedDraftSnapshot;
@@ -12,9 +12,6 @@ pub struct ResolvedCodingSelection {
 }
 
 impl SavedDraftSnapshot {
-    /// `bound_backend` belongs to an active thread. `default_backend` is the
-    /// current composer preference, used only when no thread binding exists.
-    /// Resolve that preference strictly before calling this method.
     pub fn resolve_coding_selection(
         &self,
         bound_backend: Option<CodingAgent>,

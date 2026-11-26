@@ -11,7 +11,7 @@ use serde::Deserialize;
 use sqlx::{types::Json, PgPool};
 use uuid::Uuid;
 
-use crate::core::store::thread_hold::{turn_hold, TurnHold};
+use crate::core::store::thread_hold::{thread_hold, turn_hold, TurnHold};
 use crate::core::store::{format_display_title, EventWaitSummary, UNTITLED_THREAD};
 
 use super::thread_events::SessionStart;
@@ -34,6 +34,7 @@ struct LivenessRow {
     handoff_pending: bool,
     between_turns: bool,
     queued: bool,
+    on_hold: bool,
     as_of: chrono::DateTime<chrono::Utc>,
 }
 
@@ -54,6 +55,7 @@ impl LivenessRow {
             between_turns: self.between_turns,
             queued: self.queued,
             held: false,
+            on_hold: self.on_hold,
         }
     }
 
@@ -153,6 +155,7 @@ static LIVENESS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
                 {between_turns} AS between_turns, \
                 EXISTS (SELECT 1 FROM thread_queue q \
                          WHERE q.thread_id = ts.thread_id AND q.status = 'queued') AS queued, \
+                ts.hold IS NOT NULL AS on_hold, \
                 date_trunc('second', now()) AS as_of \
            FROM thread_summaries ts \
            LEFT JOIN pending ON pending.thread_id = ts.thread_id \
@@ -191,9 +194,15 @@ pub async fn liveness_for_threads(
         };
         let facts = row.facts(successor.as_ref().map(|wake| wake.handoff.starts));
         let hold = match successor.and_then(|wake| wake.hold) {
-            None if derive(&facts) == LivenessState::Waiting => {
-                turn_hold(pool, row.thread_id).await?
-            }
+            None => match derive(&facts) {
+                LivenessState::Waiting => turn_hold(pool, row.thread_id).await?,
+                // Only a hold on a thread parked on a question derives
+                // `held` before the wake holds are read.
+                LivenessState::Held => thread_hold(pool, row.thread_id)
+                    .await?
+                    .map(|hold| TurnHold::Hold(Box::new(hold))),
+                _ => None,
+            },
             hold => hold,
         };
         result.insert(row.thread_id, row.into_liveness(facts, hold));

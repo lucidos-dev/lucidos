@@ -1,26 +1,7 @@
-//! Verify the lazy-load contract for `ToolResult`:
-//!
-//! 1. `GET /api/v1/threads/:tid/events` strips the `result` field from
-//!    `ToolResult` payloads and stamps a `result_stripped: true` marker.
-//!    Keeps `name` + `images` (inline step row + generated-image rendering
-//!    paths in `thread-events.ts` need them).
-//! 2. `GET /api/v1/events/:eid/tool-result` returns the original `result`
-//!    string on demand. Image-only tool results (no `result` written)
-//!    return `result: null` instead of 404.
-//! 3. `GET /api/v1/threads/:tid/events?include_context=true` opts back into
-//!    the full payload — the export-thread path uses this so bug-report
-//!    dumps stay complete.
-//!
-//! Together these stop a busy CC thread (one bash result per call, sometimes
-//! 150 kB+ each) from shipping all outputs up-front; the modal fetches the
-//! full text only when the user opens the step-detail.
-
 use crate::support::{base_url, db_url, http_client, seed_chat_thread_summary, unique_marker};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Seed a chat thread + a ToolResult event with a real `result` string and
-/// `images` array. Returns `(thread_id, event_id, result_text)`.
 async fn seed_thread_with_tool_result(pool: &sqlx::PgPool) -> (Uuid, Uuid, String) {
     let thread_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
@@ -64,7 +45,6 @@ async fn pool() -> sqlx::PgPool {
         .expect("Failed to connect to e2e DB")
 }
 
-/// Snapshot endpoint must omit `result` and stamp the marker.
 #[tokio::test]
 async fn snapshot_strips_tool_result_content_and_stamps_marker() {
     let pool = pool().await;
@@ -94,12 +74,10 @@ async fn snapshot_strips_tool_result_content_and_stamps_marker() {
         "result should be stripped from snapshot payload, got: {payload}"
     );
     assert_eq!(payload["result_stripped"], Value::Bool(true));
-    // Inline step row + generated-image rendering still need these.
     assert_eq!(payload["name"], "run_bash");
     assert_eq!(payload["images"], serde_json::json!(["sha-abc", "sha-def"]));
 }
 
-/// New endpoint returns the original `result` for the event.
 #[tokio::test]
 async fn tool_result_endpoint_returns_full_result() {
     let pool = pool().await;
@@ -118,8 +96,6 @@ async fn tool_result_endpoint_returns_full_result() {
     assert_eq!(body["result"], Value::String(result_text));
 }
 
-/// Image-only ToolResult (no `result` field) → endpoint returns `result: null`,
-/// not 404. The modal renders the inline images and elides the `<pre>` block.
 #[tokio::test]
 async fn tool_result_endpoint_returns_null_for_image_only_results() {
     let pool = pool().await;
@@ -161,7 +137,6 @@ async fn tool_result_endpoint_returns_null_for_image_only_results() {
     assert_eq!(body["result"], Value::Null);
 }
 
-/// Non-ToolResult event id → 404 (handler refuses to leak arbitrary payloads).
 #[tokio::test]
 async fn tool_result_endpoint_rejects_non_tool_result_event() {
     let pool = pool().await;
@@ -190,7 +165,6 @@ async fn tool_result_endpoint_rejects_non_tool_result_event() {
     assert_eq!(resp.status(), 404);
 }
 
-/// Unknown event id → 404.
 #[tokio::test]
 async fn tool_result_endpoint_404_on_unknown_event_id() {
     let _pool = pool().await;
@@ -205,8 +179,6 @@ async fn tool_result_endpoint_404_on_unknown_event_id() {
     assert_eq!(resp.status(), 404);
 }
 
-/// `?include_context=true` opts back into full `result` — covers the
-/// export-thread path so bug-report dumps stay complete after the strip.
 #[tokio::test]
 async fn snapshot_include_context_true_preserves_tool_result() {
     let pool = pool().await;

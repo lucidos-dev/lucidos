@@ -1,4 +1,4 @@
-//! HTTP endpoints for the content-addressed image blob store.
+//! INVARIANT: HTTP endpoints for the content-addressed image blob store.
 //!
 //! - POST /api/v1/threads/:id/blobs (multipart) → writes blob, emits
 //!   ImageUploaded, returns `{hash, mime, byte_size}`.
@@ -43,21 +43,12 @@ pub(super) struct BlobUploadResponse {
     pub byte_size: u64,
 }
 
-/// POST /api/v1/threads/:id/blobs — content-addressed image upload.
-///
-/// State-machine guard mirrors `PUT /threads/:id/compose`: rejects with
-/// 410 on `discarded`, 404 on missing, accepts `composing|active`. Archived
-/// threads carry `state='active'` plus `archive_state='archived'`, and
-/// uploads into them are accepted so a gmail-like revival reply can attach
-/// images. Same blob attached to two threads = two `ImageUploaded` events but
-/// a single on-disk file (write_blob is idempotent on identical bytes).
 pub(super) async fn post_blob(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<BlobUploadResponse>), ApiError> {
-    // An image joins the thread's draft, so the upload asks the draft's verb.
     refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -65,8 +56,6 @@ pub(super) async fn post_blob(
         COMPOSE_VERB,
     )
     .await?;
-    // Verify thread state before reading the upload body — fail fast on
-    // 404/410 without spending bandwidth on the file.
     let lookup: Option<(String,)> =
         sqlx::query_as("SELECT state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -85,9 +74,6 @@ pub(super) async fn post_blob(
         Some(ThreadState::Composing | ThreadState::Active) => {}
     }
 
-    // Read the single `file` part. The frontend uploads exactly one image
-    // per request so the user can show per-file progress + retry; bulk
-    // uploads have no UX advantage and would just complicate error reporting.
     let field = multipart
         .next_field()
         .await
@@ -122,7 +108,7 @@ pub(super) async fn post_blob(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // Pre-generate the browser-display preview off the request path so the
+    // INVARIANT: Pre-generate the browser-display preview off the request path so the
     // first GET /blobs/:hash/preview always hits the warm cache. Lazy
     // generation took 16-25 s for large iPhone JPEGs in dev, long enough
     // for iOS Safari to abort the fetch and leave the page with broken
@@ -145,10 +131,6 @@ pub(super) async fn post_blob(
     ))
 }
 
-/// The response a refused blob earns, wherever its bytes came from.
-///
-/// The 415 carries what the bytes turned out to be, so it names the caller's
-/// format rather than reciting the allowlist.
 fn refusal(e: BlobError) -> ApiError {
     match e {
         BlobError::UnsupportedMime(_) => {
@@ -159,10 +141,6 @@ fn refusal(e: BlobError) -> ApiError {
     }
 }
 
-/// Run a blob write off the async runtime, refusing as [`refusal`] says.
-///
-/// Hashing and the disk write block, and a large photo must not stall a worker
-/// other requests need.
 async fn store_off_runtime(
     write: impl FnOnce() -> Result<ResolvedBlob, BlobError> + Send + 'static,
 ) -> Result<ResolvedBlob, ApiError> {
@@ -203,9 +181,6 @@ async fn stream_immutable(path: std::path::PathBuf, mime: String) -> Result<Resp
     Ok(response.into_response())
 }
 
-/// GET /api/v1/blobs/:hash — stream the original blob bytes. Streamed via
-/// `tokio::fs::File` so the async runtime never blocks on a multi-MB read
-/// and the response body flows in chunks instead of materializing in memory.
 pub(super) async fn get_blob(
     State(state): State<AppState>,
     Path(hash): Path<String>,
@@ -217,11 +192,6 @@ pub(super) async fn get_blob(
     stream_immutable(resolved.path, resolved.mime).await
 }
 
-/// GET /api/v1/blobs/:hash/preview — stream a downscaled JPEG (long edge
-/// ≤ `PREVIEW_MAX_EDGE`) suitable for browser display. Resize is done once
-/// and cached under `.lucidos/blob-previews/`; second hit is a plain disk
-/// read. Decode happens off the async runtime via `spawn_blocking` so a
-/// 10 MB iPhone JPEG doesn't stall other requests.
 pub(super) async fn get_blob_preview(
     State(state): State<AppState>,
     Path(hash): Path<String>,
@@ -240,9 +210,6 @@ pub(super) async fn get_blob_preview(
     stream_immutable(resolved.path, resolved.mime).await
 }
 
-/// Routes for the `/blobs/*` read surface. The upload route is
-/// thread-shaped (`POST /api/v1/threads/:id/blobs`) and registers under
-/// `threads::router()`.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/blobs/:hash", get(get_blob))
@@ -261,7 +228,6 @@ mod tests {
         }
     }
 
-    /// The smallest PNG the blob sniff accepts: signature plus IHDR.
     fn png() -> Vec<u8> {
         vec![
             0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
@@ -273,7 +239,6 @@ mod tests {
     #[tokio::test]
     async fn an_inline_image_lands_in_the_blob_store_under_its_sniffed_format() {
         let dir = tempfile::tempdir().unwrap();
-        // The claim is a lie the store must ignore, as the upload route does.
         let hashes = store_inline_images(dir.path(), vec![inline(&png(), "image/jpeg")])
             .await
             .expect("a PNG is accepted");

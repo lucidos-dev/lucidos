@@ -2343,7 +2343,7 @@ outside the retired probe.
 ### The ride says when its own write landed short
 
 - **Added:** 2026-09-19
-- **Lives in:** `crates/lucidos-app/src/components/chat/scrollState.ts`,
+- **Lives in:** `crates/lucidos-app/src/components/chat/scrollRide.ts`,
   `reportRideLandedShort` and the `_rideShortReported` flag beside it, plus the
   three assertions naming it in
   `components/chat/__tests__/scroll-follow-the-live-edge.test.ts`. It writes one
@@ -2851,7 +2851,8 @@ outside the retired probe.
   content hold. Each test then asserts the line stays put, and its title drops
   `TODAY:`. Check with `grep -c "TODAY:"` on the file: it must print 0. If the
   owner drops phase 4, delete both tests and close this row.
-- **Status:** active
+- **Status:** `resolved` 2026-11-25. The tests now assert that late growth
+  leaves the reader on the same line.
 - **Investigation:** n/a (see the plan)
 
 ## 2. Model-tolerance measures

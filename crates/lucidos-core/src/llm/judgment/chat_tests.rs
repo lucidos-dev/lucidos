@@ -1,5 +1,3 @@
-//! The chat judgment provider, against a stubbed chat model.
-
 use super::*;
 use crate::llm::judgment::NoulCriteria;
 use crate::test_support::JudgmentChatStub;
@@ -56,8 +54,6 @@ async fn a_tool_answer_reads_back_as_typed_answers() {
     assert_eq!(judgment.answers.noul("needs_memory"), Some(0.6));
 }
 
-/// The judgment keeps the model the reply named, beside the alias it asked
-/// for, so a row shows when the provider answered with another model.
 #[tokio::test]
 async fn a_judgment_keeps_the_model_the_reply_named() {
     let (_, chat) = provider(JudgmentChatStub::answering(json!({})).served_by("gemini-3.6-flash"));
@@ -73,8 +69,6 @@ async fn a_judgment_keeps_the_model_the_reply_named() {
     assert_ne!(judgment.model.as_deref(), Some("gemini-3.6-flash"));
 }
 
-/// Every question, its id, its option names and the state reach the model,
-/// and the tool schema requires an answer to each.
 #[tokio::test]
 async fn the_model_sees_every_question_and_the_schema_pins_the_options() {
     let (stub, chat) = provider(JudgmentChatStub::answering(json!({})));
@@ -103,8 +97,6 @@ async fn the_model_sees_every_question_and_the_schema_pins_the_options() {
     assert_eq!(schema["properties"]["needs_memory"]["type"], "number");
 }
 
-/// The distribution is normalised in Rust, so a model answering in percent
-/// reads the same as one answering in fractions.
 #[test]
 fn a_choice_is_normalised_to_sum_to_one() {
     let criteria = vec![("a".to_string(), None), ("b".to_string(), None)];
@@ -114,8 +106,6 @@ fn a_choice_is_normalised_to_sum_to_one() {
     assert_eq!(answer.choice, "a");
 }
 
-/// An option left out reads as zero. A name nobody offered is ignored, so a
-/// misspelled option can never carry weight.
 #[test]
 fn missing_options_read_as_zero_and_invented_ones_are_ignored() {
     let criteria = vec![
@@ -160,8 +150,6 @@ fn a_uniform_choice_has_no_confidence_and_a_certain_one_full() {
     assert!((certain.confidence - 1.0).abs() < 1e-9);
 }
 
-/// A model that ignored the tool and wrote the object in text, fences and
-/// all, is still read.
 #[tokio::test]
 async fn an_object_in_text_is_read_when_the_tool_was_ignored() {
     let (_, chat) = provider(JudgmentChatStub::replying(
@@ -179,8 +167,6 @@ async fn an_object_in_text_is_read_when_the_tool_was_ignored() {
     assert_eq!(judgment.answers.choice("lane"), None);
 }
 
-/// Prose with no object is an empty answer set, not an error. The reply was
-/// paid for, and each site reads a missing answer as its safe default.
 #[tokio::test]
 async fn an_unreadable_reply_is_an_empty_answer_set() {
     for reply in ["", "   ", "I think it is probably fine."] {
@@ -215,7 +201,6 @@ async fn a_failed_call_is_an_error() {
         .is_err());
 }
 
-/// The capture needs the model, the usage and the size of what was sent.
 #[tokio::test]
 async fn the_judgment_reports_what_it_cost() {
     let (_, chat) = provider(JudgmentChatStub::answering(json!({ "needs_memory": 1 })));
@@ -236,7 +221,6 @@ async fn the_judgment_reports_what_it_cost() {
     assert!(judgment.request_chars > SYSTEM_PROMPT.chars().count());
 }
 
-/// A judgment that writes the cache keeps the write's lifetime for its row.
 #[tokio::test]
 async fn the_judgment_keeps_the_write_split() {
     let stub = JudgmentChatStub::answering(json!({ "needs_memory": 1 })).writing_the_1h_cache(150);

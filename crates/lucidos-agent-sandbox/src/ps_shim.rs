@@ -1,13 +1,9 @@
-//! The `ps` stand-in a sandboxed agent runs on macOS.
 use std::path::Path;
 
-/// macOS runs `/bin/ps` setuid, which its sandbox refuses. A sandboxed agent
-/// gets the `lucidos ps` stand-in in its place, and nobody else does.
 pub fn wanted(sandbox_active: bool, macos: bool) -> bool {
     sandbox_active && macos
 }
 
-/// The shim script that runs `ps` through the CLI at `cli`.
 pub fn script(cli: &Path) -> String {
     let quoted = cli.display().to_string().replace('\'', r"'\''");
     format!("#!/bin/sh\nexec '{quoted}' ps \"$@\"\n")

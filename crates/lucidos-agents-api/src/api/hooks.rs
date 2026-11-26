@@ -59,6 +59,8 @@ struct HookRow {
     arm_refusal: Option<String>,
     /// Why the owner cannot remove it here. `None` when they can.
     remove_refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +95,7 @@ impl HookRow {
             armed,
             arm_refusal: None,
             remove_refusal,
+            plugin_id: None,
         };
         row.arm_refusal = row.armable(asked).err();
         row
@@ -182,7 +185,19 @@ async fn read_rows(state: &AppState) -> Result<Vec<HookRow>, ApiError> {
     let armed = armed_hooks(&state.pool)
         .await
         .map_err(|e| ApiError::internal(format!("The hook armings cannot be read: {e}")))?;
-    Ok(rows(folders, armed, state.event_hooks.asked_event_types()))
+    let mut rows = rows(folders, armed, state.event_hooks.asked_event_types());
+    if !rows.is_empty() {
+        let mut owners = crate::engine::tools::plugins::event_hook_plugin_ids(&state.pool)
+            .await
+            .map_err(|e| ApiError::internal(format!("The plugin hooks cannot be read: {e}")))?;
+        for row in &mut rows {
+            if let Some(plugin_id) = owners.remove(row.slug()) {
+                row.remove_refusal = Some(format!("Uninstall {plugin_id} to remove this hook."));
+                row.plugin_id = Some(plugin_id);
+            }
+        }
+    }
+    Ok(rows)
 }
 
 async fn read_row(state: &AppState, slug: &str) -> Result<Option<HookRow>, ApiError> {
@@ -268,6 +283,7 @@ impl Verb<'_> {
 }
 
 /// One verb on one hook, as checked before anyone is asked.
+#[derive(PartialEq, Eq)]
 enum Plan {
     Arm {
         event_type: String,
@@ -406,6 +422,20 @@ async fn act(
         Gate::Act(actor) => actor,
         Gate::NeedsPermission(request_id) => return Ok(permission_required(&request_id)),
     };
+    let held = state.engine.lock_workspace_repo().await;
+    let current = read_row(state, slug).await?;
+    let current_plan = Plan::of(
+        verb,
+        slug,
+        current.as_ref(),
+        state.event_hooks.asked_event_types(),
+    )?;
+    if current_plan != plan {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "The hook changed. Review it and try again.",
+        ));
+    }
     let slug = slug.to_owned();
     match plan {
         Plan::Arm {
@@ -433,7 +463,7 @@ async fn act(
                 actor,
             };
             if folder {
-                delete_folder(state, &slug, removed).await?;
+                delete_folder(state, &held, &slug, removed).await?;
             } else {
                 record(state, &slug, removed).await?;
             }
@@ -493,19 +523,21 @@ fn removal_refusal(workspace: &std::path::Path, slug: &str) -> Option<String> {
 
 /// Delete `data/hooks/<slug>/`, commit that and emit `removed`, under the
 /// workspace repo lock.
-async fn delete_folder(state: &AppState, slug: &str, removed: SystemEvent) -> Result<(), ApiError> {
+async fn delete_folder(
+    state: &AppState,
+    held: &crate::engine::git_ops::WorkspaceRepoLock,
+    slug: &str,
+    removed: SystemEvent,
+) -> Result<(), ApiError> {
     let rel = format!("{HOOKS_DIR}/{slug}");
     let manager = crate::core::artifacts::ArtifactManager::new(state.workspace_path.clone())
         .map_err(|e| ApiError::internal(format!("The workspace repository cannot open: {e}")))?;
-    let held = state.engine.lock_workspace_repo().await;
-    // Checked again after the lock wait, immediately before the delete, so a
-    // link swapped in while the request waited cannot carry it out of data/.
     if let Some(why) = removal_refusal(&state.workspace_path, slug) {
         return Err(ApiError::new(StatusCode::CONFLICT, why));
     }
     manager
         .delete_data_dir_and_commit(
-            &held,
+            held,
             &state.engine.event_bus,
             &rel,
             &format!("Remove event hook {slug}"),

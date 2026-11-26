@@ -1,7 +1,6 @@
 use super::*;
 use crate::core::oauth::AuthorizationGrant;
 
-/// A state no other test opens, so parallel tests never share a slot.
 fn unique_state(prefix: &str) -> String {
     format!(
         "{prefix}{STATE_PREFIX_SEPARATOR}{}",
@@ -114,8 +113,6 @@ fn a_device_is_remembered_by_its_latest_prefix_and_last_origin() {
     );
 }
 
-/// Deliver `query` while a stand-in flow takes the grant and settles the page
-/// with `connected`. Returns the grant the flow saw, and the delivery.
 async fn deliver_to_flow(
     pending: PendingCallback,
     query: &str,
@@ -177,7 +174,6 @@ async fn a_flow_that_has_not_settled_in_time_leaves_the_page_pending() {
     let state = unique_state("/dev/");
     let pending = PendingCallback::open(&state, "testprov");
     let query = format!("code=the-code&state={}", urlencoding::encode(&state));
-    // The flow holds the reply and never settles it.
     let flow = tokio::spawn(async move {
         let received = pending.received().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -209,8 +205,6 @@ async fn a_flow_that_ends_without_settling_leaves_the_page_pending() {
 #[tokio::test(start_paused = true)]
 async fn a_callback_for_a_flow_that_already_ended_fails_at_once() {
     let state = unique_state("/dev/");
-    // The flow's receiver is gone while its slot is still open: the race
-    // between the delivery taking the slot and the flow giving up.
     let (deliver, received) = tokio::sync::oneshot::channel();
     drop(received);
     pending().insert(

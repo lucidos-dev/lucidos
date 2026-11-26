@@ -1,23 +1,3 @@
-//! The workspace registry — `<app-data>/config/workspaces.json`.
-//!
-//! Maps a stable, filesystem-safe `id` (the **slug**) to a workspace's display
-//! `name`, its on-disk `dir`, and the loopback `port` its engine binds. The slug
-//! is the routing key (`/<slug>/`, ADR 0014) and the directory name; it never
-//! changes. The `name` is a free-text display label — rename edits only this
-//! field, so a rename is a registry write with no directory move, DB reconnect,
-//! or port change.
-//!
-//! A slug can never collide with the gateway's reserved sigil namespace (`/~/`):
-//! slugs are `[a-z0-9-]`, so they cannot start with `~`. That single rule
-//! replaces the reserved-word list 0013 would have needed (ADR 0014 §2).
-//!
-//! `database_url` is a backward-compatible migration source from the old
-//! per-workspace-Postgres topology. Steady state is ADR 0014's shared cluster:
-//! the gateway creates/uses `lucidos_<workspace-id>` and passes that single
-//! database URL to the engine. When a legacy `database_url` is present and the
-//! shared database is missing, the gateway imports it, then ignores the legacy
-//! URL on future starts so the old cluster can be explicitly decommissioned.
-
 use serde::{Deserialize, Serialize};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -26,7 +6,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub use lucidos_gateway_constants::{slugify, SIGIL};
 
-/// Legacy entries stay protected until a user classifies them.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceOrigin {
@@ -34,7 +13,6 @@ pub enum WorkspaceOrigin {
     Demo,
     Eval,
     E2e,
-    /// Made through the workspace broker by an agent thread.
     Agent,
     #[default]
     Unknown,
@@ -52,8 +30,6 @@ impl WorkspaceOrigin {
         }
     }
 
-    /// A machine-made workspace is one an agent may delete, restore from Trash
-    /// or snapshot-restore into. The single definition of that split.
     pub fn is_machine_made(self) -> bool {
         match self {
             Self::Agent | Self::Demo | Self::Eval | Self::E2e => true,
@@ -62,14 +38,12 @@ impl WorkspaceOrigin {
     }
 }
 
-/// The agent thread that made a workspace through the broker.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CreatedBy {
     pub workspace_id: String,
     pub thread_id: String,
 }
 
-/// Cleanup authority is persisted with the entry, never inferred from its name.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceCleanup {
     #[serde(default)]
@@ -86,7 +60,6 @@ pub struct WorkspaceCleanup {
     pub created_by: Option<CreatedBy>,
 }
 
-/// Optional registration changes. Omitting them preserves an existing entry.
 #[derive(Deserialize, Default)]
 pub struct CleanupRegistration {
     pub origin: Option<WorkspaceOrigin>,
@@ -110,44 +83,14 @@ impl WorkspaceCleanup {
     }
 }
 
-/// One registered workspace.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Workspace {
-    /// Stable, filesystem-safe slug. The routing key (`/<slug>/`) and the
-    /// directory name for gateway-provisioned workspaces. Never changes.
     pub id: String,
-    /// Display label — any text (spaces, emoji). Rename edits only this.
     pub name: String,
-    /// Workspace directory. Relative paths resolve against `<app-data>`
-    /// (gateway-provisioned, packaged); absolute paths are used verbatim (dev
-    /// workspaces under `~/workspaces/<name>`).
     pub dir: String,
-    /// The workspace engine's loopback port. Assigned free at create time and
-    /// persisted so it is stable across reboots.
     pub port: u16,
-    /// Legacy migration source from the old per-workspace-Postgres topology.
-    /// New/updated entries omit it; the shared database is derived from `id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
-    /// Whether the gateway spawns this workspace's engine on boot.
-    ///
-    /// `true` → the engine is **auto-started** when the gateway (re)starts (the
-    /// always-on posture: a packaged install's login-launched gateway brings up
-    /// its auto-start workspaces, so triggers, scheduled tasks and push keep
-    /// working without anyone opening a window). This is the default every
-    /// gateway-provisioned workspace is born with, see
-    /// [`Workspace::gateway_provisioned`]. `false` (what the dev launcher
-    /// registers, and what the picker toggle can set) → the workspace is **listed**
-    /// in the picker but its engine is started only on an explicit open/launch
-    /// (lazy).
-    ///
-    /// It governs the BOOT posture and nothing else. An already-running engine is
-    /// re-adopted on gateway restart regardless, and a workspace the last
-    /// teardown stopped is restored regardless (see `crate::next_boot`): a
-    /// restart returns what it took whatever this says.
-    ///
-    /// Backward-compatible: a legacy entry with no field reads as `false`, and
-    /// [`Registry::migrate_to_current`] then lifts it to the current default.
     #[serde(default)]
     pub autostart: bool,
     #[serde(flatten)]
@@ -155,24 +98,6 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// A workspace the gateway provisions for itself under
-    /// `<app-data>/workspaces/<id>`: the entry shape both creation paths share,
-    /// picker **create** and **restore from backup**.
-    ///
-    /// Both go through here so the two can never disagree on the [`autostart`]
-    /// default again. They did until 2026-08-11: create said `true` and restore
-    /// said `false`, so a restored backup sat dark after every login, running no
-    /// triggers, scheduled tasks or push until somebody found the picker toggle.
-    /// Restoring a backup is at least as strong a statement that you want the
-    /// workspace running as creating one from scratch is, and the restored
-    /// workspace is exactly the one whose triggers and scheduled tasks were
-    /// already set up.
-    ///
-    /// Not for a workspace the gateway merely *registers*: the dev launcher
-    /// adopts an absolute `dir` outside app-data with autostart off, through
-    /// `GatewayState::adopt_workspace`.
-    ///
-    /// [`autostart`]: Workspace::autostart
     pub fn gateway_provisioned(id: String, name: String, port: u16) -> Self {
         Self {
             dir: format!("workspaces/{id}"),
@@ -188,9 +113,6 @@ impl Workspace {
         }
     }
 
-    /// Stamp a provisioned entry as made by an agent through the workspace
-    /// broker. Autostart is the caller's explicit choice, so a rig cannot
-    /// fill the next boot by default.
     pub fn agent_made(self, autostart: bool, created_by: CreatedBy) -> Self {
         Self {
             autostart,
@@ -204,8 +126,6 @@ impl Workspace {
         }
     }
 
-    /// Resolve [`Workspace::dir`] to an absolute path: absolute dirs are used
-    /// verbatim; relative dirs join `app_data`.
     pub fn resolve_dir(&self, app_data: &Path) -> PathBuf {
         let dir = PathBuf::from(&self.dir);
         if dir.is_absolute() {
@@ -216,19 +136,10 @@ impl Workspace {
     }
 }
 
-/// Schema version of the registry document, bumped when a load-time migration
-/// is added. `1` introduced the autostart default (see
-/// [`Registry::migrate_to_current`]).
 pub const REGISTRY_VERSION: u32 = 1;
 
-/// The on-disk registry document.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Registry {
-    /// What the document was written by, so a load-time migration runs exactly
-    /// once. A file written before versioning has no field and reads as `0`; a
-    /// registry created in memory starts at [`REGISTRY_VERSION`] (see the
-    /// hand-written `Default`, which serde's field default deliberately does not
-    /// share).
     #[serde(default)]
     pub version: u32,
     #[serde(default)]
@@ -245,12 +156,6 @@ impl Default for Registry {
 }
 
 impl Registry {
-    /// Load the registry from `path`. A missing file is an empty registry (the
-    /// first-run state — the gateway boots with no workspaces and the smart root
-    /// serves the picker, where the user names their first one). A present but
-    /// unparseable file is a hard error: silently discarding it would orphan
-    /// every registered workspace's data behind a fresh empty registry. A blank
-    /// file is one of those: [`Registry::save`] never leaves one.
     pub fn load(path: &Path) -> Result<Self, BoxError> {
         match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s)
@@ -260,23 +165,6 @@ impl Registry {
         }
     }
 
-    /// Bring a registry loaded from disk up to [`REGISTRY_VERSION`], returning
-    /// how many entries changed, or `None` when it was already current (nothing
-    /// to save).
-    ///
-    /// Version 1 lifts every entry to the autostart default. Nobody was ever
-    /// asked: `autostart: false` in an existing registry is the OLD default
-    /// rather than a decision, and leaving it means an always-on install stays
-    /// dark after every login, with no triggers, scheduled tasks or push until
-    /// somebody opens each workspace. A user who did deliberately turn it off
-    /// pays one toggle in the picker, which is the smaller harm. Running once,
-    /// stamped by the version, is what keeps a later deliberate `false` from
-    /// being flipped back on every boot.
-    ///
-    /// The caller decides WHEN this is appropriate: the packaged gateway runs it
-    /// at startup, while dev does not, because the dev launcher registers
-    /// `autostart: false` on purpose and would otherwise find every workspace it
-    /// has ever launched spawning at once.
     pub fn migrate_to_current(&mut self) -> Option<usize> {
         if self.version >= REGISTRY_VERSION {
             return None;
@@ -292,8 +180,6 @@ impl Registry {
         Some(changed)
     }
 
-    /// Persist the registry to `path` atomically, so a crash mid-write can't
-    /// truncate the registry and strand every workspace.
     pub fn save(&self, path: &Path) -> Result<(), BoxError> {
         crate::atomic_file::write(path, serde_json::to_string_pretty(self)?.as_bytes())
     }
@@ -310,22 +196,6 @@ impl Registry {
         self.workspaces.iter().any(|w| w.id == id)
     }
 
-    /// The workspace already carrying this display name, ignoring surrounding
-    /// space and letter case, skipping `except_id` (so renaming a workspace to
-    /// what it is already called is not a collision with itself).
-    ///
-    /// The display name is what a user picks a workspace BY, so two rows reading
-    /// the same thing simply cannot be told apart in the picker: what
-    /// distinguishes them is the address, and the address is the thing the user
-    /// never sees. Create / rename / restore therefore refuse a duplicate rather
-    /// than produce one. Case-insensitive because "Work" and "work" are no more
-    /// distinguishable in a list than two identical strings, and they slug to the
-    /// same address anyway.
-    ///
-    /// A WRITE-time rule only. Duplicates were legal until now, so a registry
-    /// holding some keeps working: the picker shows those rows' addresses so they
-    /// stay tellable apart until the user renames one. Nothing is renamed for
-    /// them.
     pub fn find_by_display_name(&self, name: &str, except_id: Option<&str>) -> Option<&Workspace> {
         self.workspaces.iter().find(|w| {
             Some(w.id.as_str()) != except_id
@@ -333,7 +203,6 @@ impl Registry {
         })
     }
 
-    /// Add a workspace. Errors if the id already exists.
     pub fn add(&mut self, ws: Workspace) -> Result<(), BoxError> {
         if self.contains(&ws.id) {
             return Err(format!("workspace id '{}' already registered", ws.id).into());
@@ -342,7 +211,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Remove a workspace by id, returning it. Errors if absent.
     pub fn remove(&mut self, id: &str) -> Result<Workspace, BoxError> {
         let idx = self
             .workspaces
@@ -352,9 +220,6 @@ impl Registry {
         Ok(self.workspaces.remove(idx))
     }
 
-    /// Allocate a free loopback port not already claimed by a registry entry.
-    /// Binds `:0` to get an OS-assigned free port (the desktop convention),
-    /// then re-rolls if it collides with an existing registry port.
     pub fn allocate_port(&self) -> Result<u16, BoxError> {
         let taken: Vec<u16> = self.workspaces.iter().map(|w| w.port).collect();
         for _ in 0..50 {
@@ -367,8 +232,6 @@ impl Registry {
     }
 }
 
-/// Make `base` unique against `existing` by appending `-2`, `-3`, … until it
-/// no longer collides.
 pub fn unique_slug(base: &str, existing: &dyn Fn(&str) -> bool) -> String {
     if !existing(base) {
         return base.to_string();
@@ -382,45 +245,14 @@ pub fn unique_slug(base: &str, existing: &dyn Fn(&str) -> bool) -> String {
     unreachable!("the loop returns once a free suffix is found")
 }
 
-/// True when `s` is a backup-filename timestamp `YYYYMMDD-HHMMSS` (8 digits, a
-/// hyphen, 6 digits). Mirrors the engine's `is_backup_timestamp` (duplicated per
-/// ADR 0014 §1 — the gateway must not link the engine crate).
-fn is_backup_timestamp(s: &str) -> bool {
-    match s.split_once('-') {
-        Some((date, time)) => {
-            date.len() == 8
-                && time.len() == 6
-                && date.bytes().all(|b| b.is_ascii_digit())
-                && time.bytes().all(|b| b.is_ascii_digit())
-        }
-        None => false,
-    }
-}
-
-/// Parse the workspace name a backup archive was produced for, from its
-/// filename. A backup is named `lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.age`
-/// (`.enc` for a legacy one); the `{name}` may contain hyphens, so strip the fixed prefix/suffix then the
-/// trailing `-YYYYMMDD-HHMMSS`. Returns `None` for anything not in that exact
-/// shape (the picker then asks the user for a name). Mirrors the engine's
-/// `core::backup::parse_workspace_name_from_archive` (duplicated, ADR 0014 §1) so
-/// the picker can prefill a default restore name without an engine round-trip.
 pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
-    let rest = filename.strip_prefix("lucidos-backup-")?;
-    let rest = [".age", ".enc"]
-        .iter()
-        .find_map(|suffix| rest.strip_suffix(suffix))?;
-    let (before_time, time) = rest.rsplit_once('-')?;
-    let (name, date) = before_time.rsplit_once('-')?;
-    if name.is_empty() || !is_backup_timestamp(&format!("{date}-{time}")) {
-        return None;
-    }
-    Some(name.to_string())
+    Some(
+        lucidos_gateway_constants::backup_archive::parse(filename)?
+            .workspace
+            .to_string(),
+    )
 }
 
-/// True if `id` is a safe routing key + directory name: non-empty, only
-/// `[a-z0-9-]` (so it can never start with the [`SIGIL`]), no path-traversal.
-/// The slug pipeline already produces this; the check guards control-API inputs
-/// that bypass slugify.
 pub fn is_valid_id(id: &str) -> bool {
     lucidos_gateway_constants::is_valid_workspace_id(id)
 }
@@ -529,8 +361,6 @@ mod tests {
 
     #[test]
     fn slugify_never_starts_with_sigil() {
-        // Even a name that is all sigils collapses to the fallback, never a
-        // slug that could shadow the gateway's `/~/` namespace.
         assert_eq!(slugify("~~~"), "workspace");
         assert_eq!(slugify("~admin"), "admin");
         assert!(!slugify("~weird~name").starts_with(SIGIL));
@@ -539,16 +369,26 @@ mod tests {
     #[test]
     fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
         assert_eq!(
+            parse_workspace_name_from_archive(
+                "lucidos-backup-e2e-test-20260601-040254-o012345abcdef.age",
+            )
+            .as_deref(),
+            Some("e2e-test")
+        );
+        assert!(parse_workspace_name_from_archive(
+            "lucidos-backup-e2e-test-20260601-040254-o012345ABCDEF.age",
+        )
+        .is_none());
+
+        assert_eq!(
             parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc").as_deref(),
             Some("myws")
         );
-        // Hyphenated name — only the timestamp tail is stripped.
         assert_eq!(
             parse_workspace_name_from_archive("lucidos-backup-e2e-test-20260601-040254.enc")
                 .as_deref(),
             Some("e2e-test")
         );
-        // Not archive-shaped → None (picker then requires a typed name).
         assert_eq!(
             parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.age").as_deref(),
             Some("myws")
@@ -574,14 +414,13 @@ mod tests {
         assert!(is_valid_id("work-2"));
         assert!(is_valid_id("a1b2"));
         assert!(!is_valid_id(""));
-        assert!(!is_valid_id("Work")); // uppercase
-        assert!(!is_valid_id("../etc")); // traversal
-        assert!(!is_valid_id("a/b")); // slash
+        assert!(!is_valid_id("Work"));
+        assert!(!is_valid_id("../etc"));
+        assert!(!is_valid_id("a/b"));
         assert!(!is_valid_id("-lead"));
         assert!(!is_valid_id("trail-"));
         assert!(!is_valid_id("under_score"));
-        assert!(!is_valid_id("~admin")); // sigil-prefixed
-                                         // `@` separates a remote route, `/<slug>@<gateway>/` (ADR 0591).
+        assert!(!is_valid_id("~admin"));
         assert!(!is_valid_id("dev@cloud"));
         assert!(!is_valid_id("@cloud"));
     }
@@ -622,23 +461,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspaces.json");
 
-        // Missing → empty.
         let reg = Registry::load(&path).unwrap();
         assert!(reg.workspaces.is_empty());
 
-        // Empty file → hard error. No writer leaves one, so a blank file is
-        // outside damage, and reading it as empty is what wiped registries.
         std::fs::write(&path, "   \n").unwrap();
         let err = Registry::load(&path).unwrap_err().to_string();
         assert!(err.contains(&path.display().to_string()), "{err}");
 
-        // Garbage → hard error (never silently drop registered workspaces).
         std::fs::write(&path, "{ not json").unwrap();
         assert!(Registry::load(&path).is_err());
     }
 
-    /// The temp name used to be fixed. A second writer's temp file at that
-    /// name, here a directory standing in for one, made every save fail.
     #[test]
     fn a_save_never_shares_its_temp_file_with_another_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -691,7 +524,6 @@ mod tests {
         assert_eq!(loaded.workspaces, reg.workspaces);
         assert_eq!(loaded.get("myws").unwrap().name, "My Workspace 💼");
         assert!(loaded.get("default").unwrap().database_url.is_none());
-        // The autostart flag round-trips per entry.
         assert!(loaded.get("myws").unwrap().autostart);
         assert!(!loaded.get("default").unwrap().autostart);
     }
@@ -716,8 +548,6 @@ mod tests {
 
     #[test]
     fn legacy_entry_without_autostart_defaults_false() {
-        // A registry written before the autostart field must still load, with
-        // autostart reading as false (backward-compatible #[serde(default)]).
         let json = r#"{"workspaces":[{"id":"dev","name":"Dev","dir":"/ws/dev","port":5173}]}"#;
         let reg: Registry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.workspaces.len(), 1);
@@ -725,13 +555,6 @@ mod tests {
         assert!(reg.get("dev").unwrap().database_url.is_none());
     }
 
-    // ── The autostart default and its one-time migration ─────────────────────
-
-    /// The default a freshly provisioned entry carries. Asserted on the shared
-    /// constructor rather than per call site, because the constructor is what
-    /// makes create and restore agree: a second creation path that hand-rolls
-    /// the literal is the bug this replaced (see
-    /// [`Workspace::gateway_provisioned`]).
     #[test]
     fn a_gateway_provisioned_workspace_runs_in_the_background() {
         let ws = Workspace::gateway_provisioned("myws".into(), "My Workspace 💼".into(), 5001);
@@ -743,7 +566,6 @@ mod tests {
         assert_eq!(ws.id, "myws");
         assert_eq!(ws.name, "My Workspace 💼");
         assert_eq!(ws.port, 5001);
-        // App-data relative: the gateway owns the directory it provisions.
         assert_eq!(ws.dir, "workspaces/myws");
         assert!(
             ws.database_url.is_none(),
@@ -751,8 +573,6 @@ mod tests {
         );
     }
 
-    /// A pre-versioning document: no `version`, entries written with the old
-    /// `autostart: false` default.
     fn legacy_registry() -> Registry {
         serde_json::from_str(
             r#"{"workspaces":[
@@ -776,13 +596,11 @@ mod tests {
         assert_eq!(reg.version, REGISTRY_VERSION);
     }
 
-    // The stamp is the whole point: without it, every boot would flip a toggle
-    // the user had deliberately turned off, and the picker control would be a lie.
     #[test]
     fn a_migrated_registry_is_never_migrated_again() {
         let mut reg = legacy_registry();
         reg.migrate_to_current();
-        reg.get_mut("myws").unwrap().autostart = false; // a deliberate choice
+        reg.get_mut("myws").unwrap().autostart = false;
         assert_eq!(reg.migrate_to_current(), None, "already current");
         assert!(
             !reg.get("myws").unwrap().autostart,
@@ -810,8 +628,6 @@ mod tests {
         assert!(loaded.get("myws").unwrap().autostart);
     }
 
-    // ── Display names are unique ─────────────────────────────────────────────
-
     fn two_workspaces() -> Registry {
         let mut reg = Registry::default();
         for (id, name) in [("personal", "personaaa"), ("personaaa", "personaaa2")] {
@@ -831,8 +647,6 @@ mod tests {
 
     #[test]
     fn a_taken_display_name_is_found_whatever_its_case_or_padding() {
-        // The reported picker screenshot: two rows both reading "personaaa",
-        // one at /personal/ and one at /personaaa/. Nothing may create that.
         let reg = two_workspaces();
         for probe in ["personaaa", "PersonAAA", "  personaaa  "] {
             assert_eq!(
@@ -846,7 +660,6 @@ mod tests {
 
     #[test]
     fn a_workspace_never_collides_with_itself_on_rename() {
-        // Re-saving the same name (or a case edit of it) must not be refused.
         let reg = two_workspaces();
         assert!(reg
             .find_by_display_name("personaaa", Some("personal"))
@@ -854,7 +667,6 @@ mod tests {
         assert!(reg
             .find_by_display_name("PERSONAAA", Some("personal"))
             .is_none());
-        // But taking the OTHER workspace's name still collides.
         assert_eq!(
             reg.find_by_display_name("personaaa2", Some("personal"))
                 .map(|w| w.id.as_str()),

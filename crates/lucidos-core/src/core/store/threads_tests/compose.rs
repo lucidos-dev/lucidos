@@ -1,7 +1,3 @@
-//! A composer submission consumes the thread's compose slot once, at accept
-//! (ADR 0450). The epoch always rises. The stored draft clears only when it is
-//! what was submitted, and the report is read from the same statement.
-
 use super::test_helpers::*;
 use super::*;
 
@@ -48,7 +44,6 @@ async fn restoration_journal_survives_writes_and_clears_on_consumption() {
     tx.commit().await.unwrap();
     assert_eq!(report.restorations.len(), 1);
     assert_eq!(report.restorations[0].text, "queued");
-    // Include shared images too: a pending client may have removed its copy.
     assert_eq!(
         report.restorations[0].image_hashes,
         ["shared", "queued-image"]
@@ -179,8 +174,6 @@ async fn a_discarded_thread_has_no_slot_to_consume() {
     teardown_test_db(&db).await;
 }
 
-/// Send beat the last debounced write, so the engine holds an earlier, shorter
-/// state of the message. That is still the draft the send consumed.
 #[tokio::test]
 async fn an_earlier_state_of_the_sent_draft_clears() {
     let (pool, db) = setup_test_db().await;
@@ -214,8 +207,6 @@ async fn consumption_rolls_back_with_failed_acceptance() {
     assert_eq!(consumed.selection, None);
     assert_eq!(consumed.compose_epoch, before.compose_epoch + 1);
 
-    // An acceptance write fails after consumption. PostgreSQL aborts the
-    // transaction, so the draft must survive, including its picks and token.
     assert!(sqlx::query("SELECT 1 / 0").execute(&mut *tx).await.is_err());
     tx.rollback().await.unwrap();
     assert_eq!(stored(&pool, id).await, before);

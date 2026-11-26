@@ -4,7 +4,6 @@ use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use serde_json::json;
 
-/// The Demo Director stamp trigger's condition.
 fn matches_device(payload: &serde_json::Value) -> bool {
     condition::evaluate(Some(&json!({"actor.kind": "device"})), payload)
 }
@@ -16,8 +15,6 @@ fn forged_device_payload() -> serde_json::Value {
     })
 }
 
-/// The report's exploit, on the shape the LLM tool emitted: no engine actor,
-/// and a `device` actor the agent wrote into its own payload.
 #[test]
 fn a_caller_written_actor_never_reaches_the_matcher() {
     let event = SystemEvent::DomainEvent {
@@ -36,7 +33,6 @@ fn a_caller_written_actor_never_reaches_the_matcher() {
     assert_eq!(matchable["summary"], "stamp the film script");
 }
 
-/// The HTTP shape: the engine's actor replaces the caller's, whole.
 #[test]
 fn the_engine_actor_replaces_a_caller_written_one() {
     let event = SystemEvent::DomainEvent {
@@ -56,8 +52,6 @@ fn the_engine_actor_replaces_a_caller_written_one() {
     assert!(!matches_device(&matchable_system_payload(&event)));
 }
 
-/// The LLM `emit_event` tool, end to end on a real database: the stored
-/// row, the value a trigger matches, and what the model is told.
 #[tokio::test]
 async fn the_emit_event_tool_cannot_forge_a_device_actor() {
     let (pool, db_name) = setup_test_db().await;
@@ -89,7 +83,6 @@ async fn the_emit_event_tool_cannot_forge_a_device_actor() {
     teardown_test_db(&db_name).await;
 }
 
-/// An honest emit names no actor and gets no warning.
 #[tokio::test]
 async fn the_emit_event_tool_stamps_the_agent_without_a_warning() {
     let (pool, db_name) = setup_test_db().await;

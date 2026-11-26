@@ -1,12 +1,3 @@
-//! The `recall` tool, the Tree memory module's four recall tools (ADR 0362):
-//! `zoom`, `find`, `search` and `date`. The routes in `api/recall.rs` and the
-//! generated `lucidos recall` commands call the same engine methods.
-//!
-//! `find` walks the workspace tree with the `MemoryFind` judgment site, and
-//! batches rows the way pg-jev does. A text prefilter caps each round, and
-//! about 40 lines go in one request. Batches run in parallel, and each verdict
-//! is cached by query and line.
-
 use futures::future::join_all;
 use serde::Serialize;
 use uuid::Uuid;
@@ -24,26 +15,16 @@ use crate::llm::judgment::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Lines in one judgment request, as pg-jev batches rows.
 const FIND_BATCH: usize = 40;
-/// Lines one round may judge. The text prefilter keeps the likeliest.
 const FIND_ROUND_CAP: usize = 200;
-/// Lines one round opens further.
 const FIND_OPEN: usize = 8;
-/// Levels one round opens a line by.
 const FIND_LEVELS: u32 = 2;
-/// Rounds before the walk stops.
 const FIND_ROUNDS: usize = 8;
-/// After this long no new round starts, so a slow judge returns what it found
-/// inside a CLI or tool call's patience.
 const FIND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
-/// The probability at or above which a line reads as relevant.
 const FIND_THRESHOLD: f64 = 0.5;
-/// Results a search or find returns unless asked otherwise, and the most.
 const DEFAULT_RESULTS: usize = 10;
 const MAX_RESULTS: usize = 20;
 
-/// One `find` result.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct FindHit {
     pub(crate) id: String,
@@ -64,7 +45,6 @@ fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The `id` argument, a bare `start+span` naming the calling thread.
 fn id_arg(args: &serde_json::Value, thread_id: Uuid) -> Result<NodeId, String> {
     let id = str_arg(args, "id").ok_or("id is required: a line's id from a memory view.")?;
     NodeId::parse(id, Some(thread_id))
@@ -119,7 +99,6 @@ pub(crate) impl LucidosEngine {
         Ok(serde_json::to_string(&hits)?)
     }
 
-    /// `zoom`: the lines under `id`, `levels` levels down.
     async fn recall_zoom(&self, id: NodeId, levels: u32) -> Result<serde_json::Value, BoxError> {
         let lines = self.recall_lines(id, levels).await?;
         Ok(serde_json::json!({ "id": id.to_string(), "lines": lines }))
@@ -132,12 +111,10 @@ pub(crate) impl LucidosEngine {
         recall::zoom(&self.pool, id, levels, &read).await
     }
 
-    /// `date`: when the entries under `id` happened.
     async fn recall_date(&self, id: NodeId) -> Result<serde_json::Value, BoxError> {
         recall::date(&self.pool, id).await
     }
 
-    /// `search`: messages holding every word of `text`, with tree addresses.
     async fn recall_search(
         &self,
         text: &str,
@@ -152,12 +129,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// `find`: walk the workspace tree for lines bearing on `query`.
-    ///
-    /// Each round judges a frontier of lines and opens the likeliest further,
-    /// until it reaches messages. A thread leaf is a result, and so is a line
-    /// that opens into nothing finer, such as an artifact. `cost_thread`
-    /// files the judgment calls' cost; `None` files it on the home thread.
     async fn recall_find(
         &self,
         query: &str,
@@ -213,7 +184,6 @@ pub(crate) impl LucidosEngine {
         Ok(hits)
     }
 
-    /// The site's provider: a System One pick with chat behind it, or chat.
     async fn find_judge(&self) -> Result<Box<dyn JudgmentProvider>, BoxError> {
         let call = self.aux_call(ContextPurpose::MemoryFind).await;
         let system_one =
@@ -222,8 +192,6 @@ pub(crate) impl LucidosEngine {
         Ok(for_site(system_one, chat))
     }
 
-    /// Where a walk starts: the workspace tree's coarsest built lines, split
-    /// from the newest end until about one batch of them.
     async fn find_roots(&self) -> Result<Vec<RecallLine>, BoxError> {
         let shapes = store::node_shapes(&self.pool, SummaryScope::Workspace).await?;
         let end = (0..)
@@ -254,9 +222,6 @@ pub(crate) impl LucidosEngine {
             .collect())
     }
 
-    /// Each row's probability of bearing on `query`: cached verdicts first,
-    /// the rest in parallel batches. A batch that fails reads as no, so one
-    /// bad call narrows the walk rather than ending it.
     async fn judge_rows(
         &self,
         judge: &dyn JudgmentProvider,
@@ -279,7 +244,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// One request: every row in `batch` as a yes/no question over one state.
 async fn judge_batch(
     judge: &dyn JudgmentProvider,
     query: &str,
@@ -343,8 +307,6 @@ fn hit(line: RecallLine, probability: f64) -> FindHit {
     }
 }
 
-/// The text prefilter: past `cap` rows, keep those sharing the most words
-/// with the query. Order among the kept rows stays the tree's.
 fn prefilter(query: &str, rows: Vec<RecallLine>, cap: usize) -> Vec<RecallLine> {
     if rows.len() <= cap {
         return rows;

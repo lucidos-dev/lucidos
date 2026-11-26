@@ -1,6 +1,3 @@
-//! An agent archiving on its own authority (ADR 0310): the ladder, the waiting
-//! refusal, and what the event records.
-
 use super::*;
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::{ActorMode, EventChannel};
@@ -45,8 +42,6 @@ async fn authorize(
     LucidosEngine::authorize_agent_archive(pool, caller, target).await
 }
 
-/// A thread reaches itself and its own direct children, and nothing else: not
-/// its parent, a sibling, a grandchild, or a thread that does not exist.
 #[tokio::test]
 async fn an_agent_reaches_only_itself_and_its_direct_children() {
     let (pool, db) = setup_test_db().await;
@@ -88,8 +83,6 @@ async fn an_agent_reaches_only_itself_and_its_direct_children() {
     teardown_test_db(&db).await;
 }
 
-/// A caller waiting on the user is refused with the Archive route's own
-/// status and slug (ADR 0259), not a wording of its own.
 #[tokio::test]
 async fn a_waiting_caller_gets_the_archive_routes_refusal() {
     let (pool, db) = setup_test_db().await;
@@ -134,7 +127,6 @@ async fn a_waiting_caller_gets_the_archive_routes_refusal() {
     teardown_test_db(&db).await;
 }
 
-/// A thread the user threw away cannot be archived, as it cannot be moved.
 #[tokio::test]
 async fn a_discarded_thread_is_refused() {
     let (pool, db) = setup_test_db().await;
@@ -154,8 +146,6 @@ async fn a_discarded_thread_is_refused() {
     teardown_test_db(&db).await;
 }
 
-/// A pinned thread is the user's to archive (ADR 0312). An agent is refused
-/// with the cascade's own slug, whether the target is its child or itself.
 #[tokio::test]
 async fn a_pinned_thread_is_refused_to_an_agent() {
     let (pool, db) = setup_test_db().await;
@@ -191,8 +181,6 @@ async fn a_pinned_thread_is_refused_to_an_agent() {
     teardown_test_db(&db).await;
 }
 
-/// The event names an agent and the thread it ran in. Archiving a child moves
-/// the child alone: its parent's row is untouched.
 #[tokio::test]
 async fn an_agent_archive_records_the_agent_thread_and_leaves_the_parent() {
     let (pool, db) = setup_test_db().await;
@@ -239,9 +227,6 @@ async fn an_agent_archive_records_the_agent_thread_and_leaves_the_parent() {
     teardown_test_db(&db).await;
 }
 
-/// No agent archives the home thread (ADR 0362, invariant I10): not its own
-/// agent, and not a thread whose child it could never be. The refusal is the
-/// Archive route's own status and slug.
 #[tokio::test]
 async fn no_agent_archives_the_home_thread() {
     let (pool, db) = setup_test_db().await;

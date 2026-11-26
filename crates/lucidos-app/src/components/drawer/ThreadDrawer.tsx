@@ -50,7 +50,7 @@ import { clearStackedMark, placeStackedMark } from './agentMarkLift';
 import { isMobile } from '../../utils/viewport';
 import { scrollBehavior } from '../../utils/motion';
 import type { ThreadSearchResult } from '../../api/threads';
-import { FolderIcon, PinIcon, CurrentIcon, HoldIcon, ArchiveIcon, DraftsIcon, BlockedIcon, ReviewIcon, InFlightIcon, SearchIcon, ChevronRightIcon, ClaudeIcon, CodexIcon, LucidosMarkIcon } from '../shared/icons';
+import { FolderIcon, PinIcon, CurrentIcon, HoldIcon, ArchiveIcon, DraftsIcon, BlockedIcon, ReviewIcon, InFlightIcon, SearchIcon, ChevronRightIcon, ClaudeIcon, CodexIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import type { ComponentType, VNode } from 'preact';
 import { customFolderSectionKey, knownFolderOf, splitByCustomFolder, threadFolders, type CustomFolderSectionKey, type ThreadFolder } from '../../store/threadFolders';
@@ -1065,7 +1065,7 @@ const AGENT_GLYPHS: Record<AgentGlyph, () => VNode> = {
     claude: () => <ClaudeIcon />,
     codex: () => <CodexIcon />,
     trigger: () => <CategoryIcon category="triggers" />,
-    lucidos: () => <><LucidosMarkIcon /><LucidosGlyph /></>,
+    lucidos: () => <LucidosGlyph />,
 };
 
 function isStackedAgents(channel: string | undefined, agents: CodingAgent[] | undefined): agents is CodingAgent[] {

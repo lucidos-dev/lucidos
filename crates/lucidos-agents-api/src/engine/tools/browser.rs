@@ -103,8 +103,6 @@ pub(crate) impl LucidosEngine {
                 if raw_path.is_empty() {
                     return Ok("Error: path is required".to_string());
                 }
-                // Normalize through resolve_data_path, then extract artifact-relative portion
-                // for the browser runtime (which prepends ARTIFACTS_DIR internally)
                 let (data_path, _) = match self.resolve_data_path(raw_path) {
                     Ok(p) => p,
                     Err(e) => return Ok(format!("Error: {}", e)),
@@ -135,9 +133,6 @@ pub(crate) impl LucidosEngine {
                             .unwrap_or(path)
                             .to_string();
 
-                        // The runtime writes a new timestamped file, which a
-                        // merge's `checkout -f main` leaves alone. So only the
-                        // commit needs the repo lock.
                         let held = self.lock_workspace_repo().await;
                         if let Err(e) = self
                             .artifact_manager
@@ -191,8 +186,6 @@ mod tests {
         );
     }
 
-    /// The regression: `find(" (")` stopped at the name's own parenthesis, so
-    /// the commit named a file that does not exist.
     #[test]
     fn a_parenthesis_in_the_name_does_not_truncate_the_path() {
         assert_eq!(

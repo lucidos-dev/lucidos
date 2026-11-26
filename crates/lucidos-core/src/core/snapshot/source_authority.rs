@@ -1,4 +1,4 @@
-//! Target-owned source verification. A request body is never evidence of origin.
+//! INVARIANT: Target-owned source verification. A request body is never evidence of origin.
 //! Approval spending uses the exact connection that verified the source; a lost
 //! spend response fails closed and is never retried on another protocol.
 use super::{handle::Handle, BoxError};
@@ -29,7 +29,6 @@ impl VerifiedSource {
         self.thread
     }
 
-    /// `target` must come from the target's validated registry binding.
     pub async fn verify(
         gateway_port: u16,
         source_hint: &str,
@@ -54,7 +53,7 @@ impl VerifiedSource {
             );
             let response = client
                 .post(&url)
-                // The gateway refuses an agent restore into a user workspace
+                // INVARIANT: The gateway refuses an agent restore into a user workspace
                 // here too, since policy "allow" never reaches `spend`.
                 .json(&serde_json::json!({
                     "origin_token": token,
@@ -78,7 +77,7 @@ impl VerifiedSource {
             .map_err(|_| "snapshot_restore_caller_unverified")?
     }
 
-    /// No retries: the source may have spent the card before a response is lost.
+    /// INVARIANT: No retries: the source may have spent the card before a response is lost.
     pub async fn spend(
         &self,
         target: &super::service::OfflineRestoreRequest,
@@ -133,7 +132,6 @@ async fn decode(mut response: reqwest::Response) -> Result<Proof, BoxError> {
     serde_json::from_slice(&bytes).map_err(|_| "snapshot_restore_caller_unverified".into())
 }
 
-/// Only a known slug leaves this module. The gateway's body never passes through.
 fn refusal_slug(bytes: &[u8]) -> Option<&'static str> {
     let body: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     (body.get("error")?.as_str()? == TARGET_PROTECTED).then_some(TARGET_PROTECTED)

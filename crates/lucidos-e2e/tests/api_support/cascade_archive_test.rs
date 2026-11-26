@@ -1,24 +1,7 @@
-//! Cascade archive API e2e tests.
-//!
-//! The pure-logic + DB-projection coverage of the cascade decision lives in
-//! `crates/lucidos-engine/src/engine/archive_family.rs`. The point of
-//! these e2e tests is to validate the WIRING: real HTTP → real EventBus →
-//! real `thread_summaries` projection → real response shape, against a booted
-//! e2e workspace.
-//!
-//! Setup pattern: seed `thread_summaries` rows directly (mirroring the
-//! `seed_cc_thread_summary` and `drawer-family-collapse.spec.ts` precedents)
-//! so each scenario is fast + deterministic, then POST `/api/v1/threads/archive`
-//! and assert on the response + the events the EventBus writes. Real CC sub-
-//! thread spawn would force an LLM round-trip we don't need to exercise.
-
 use crate::support::{base_url, count_events_of_type, db_url, user_client};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Seed a row in `thread_summaries` for a parent or descendant thread,
-/// covering every column the cascade gate consults. Cleanup is the caller's
-/// responsibility via `cleanup_threads`.
 #[allow(clippy::too_many_arguments)]
 async fn seed_thread(
     pool: &sqlx::PgPool,
@@ -64,7 +47,6 @@ async fn seed_thread(
 }
 
 async fn cleanup_threads(pool: &sqlx::PgPool, ids: &[Uuid]) {
-    // Best-effort cleanup so a hung test doesn't bleed rows into the next run.
     let _ = sqlx::query("DELETE FROM events WHERE thread_id = ANY($1)")
         .bind(ids)
         .execute(pool)
@@ -79,13 +61,6 @@ async fn count_thread_archived_events(pool: &sqlx::PgPool, thread_id: Uuid) -> i
     count_events_of_type(pool, thread_id, "ThreadArchived").await
 }
 
-/// Seed a `SessionStarted` event row directly (bypassing EventBus — these
-/// tests own the projection via `seed_thread`). The branch is deliberately a
-/// non-existent `claude-code/*` ref so that, if the archive path were to call
-/// `end_stale_waiting_session`, its `proposal_files_for_branch` lookup fails
-/// fast and the only observable side-effect is the synthetic settle
-/// `CodingAgentIdled` it emits. That settle event is the canary the
-/// regression test asserts on.
 async fn seed_session_started(pool: &sqlx::PgPool, thread_id: Uuid, branch: &str) {
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, created, thread_id, aggregate, aggregate_id) \
@@ -100,7 +75,6 @@ async fn seed_session_started(pool: &sqlx::PgPool, thread_id: Uuid, branch: &str
     .expect("failed to seed SessionStarted event");
 }
 
-/// Cascade success: parent + idle CC sub-thread both get `ThreadArchived`.
 #[tokio::test]
 async fn archive_cascade_archives_idle_descendants() {
     let client = user_client().await;
@@ -111,9 +85,7 @@ async fn archive_cascade_archives_idle_descendants() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Parent chat thread, idle, in inbox so the parent-gate admits Archive.
     seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
-    // Idle CC sub-thread, inbox, no pending changes — fully cascadable.
     seed_thread(
         &pool,
         child_id,
@@ -159,16 +131,12 @@ async fn archive_cascade_archives_idle_descendants() {
         child_id,
         ids,
     );
-    // Every member was archived, so nothing is reported as skipped. The key is
-    // always present, so a client never has to guess what an absence means.
     assert_eq!(
         body["skipped"],
         json!([]),
         "an archive that left nobody behind reports no skips: {body:?}"
     );
 
-    // EventBus emits run their own per-event transactions after the handler
-    // releases the FOR UPDATE lock — give the projection a beat to settle.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     assert_eq!(
@@ -182,9 +150,6 @@ async fn archive_cascade_archives_idle_descendants() {
         "child must have exactly one ThreadArchived event"
     );
 
-    // Each archived member reports the row version its archive produced, so a
-    // client can hold its optimistic archive until the row gets there (ADR
-    // 0437). A later write to the row can only move it further on.
     for id in [parent_id, child_id] {
         let reported = body["summary_versions"][id.to_string()]
             .as_i64()
@@ -205,14 +170,6 @@ async fn archive_cascade_archives_idle_descendants() {
     pool.close().await;
 }
 
-/// Idempotent re-archive: archiving an already-archived thread returns 200
-/// with an empty `archived` list and emits NO new `ThreadArchived` event —
-/// it is NOT a 409. This is the API-boundary guard for the stuck-Archive-button
-/// bug: a client whose `meta.section` desynced to 'inbox' (missed SSE / failed
-/// archive HTTP on a flaky PWA) re-POSTs archive; the old behaviour 409'd
-/// (`parent_not_archivable`), which the client rolled back into the button
-/// reappearing. Now the re-POST succeeds, so the client's optimistic
-/// 'archived' flip stands and the button disappears.
 #[tokio::test]
 async fn archive_already_archived_thread_is_idempotent() {
     let client = user_client().await;
@@ -221,7 +178,6 @@ async fn archive_already_archived_thread_is_idempotent() {
         .expect("Failed to connect to E2E workspace database");
 
     let thread_id = Uuid::new_v4();
-    // Already-archived chat thread, idle, no descendants.
     seed_thread(
         &pool, thread_id, None, false, "idle", "archived", false, false,
     )
@@ -249,8 +205,6 @@ async fn archive_already_archived_thread_is_idempotent() {
         "already-archived thread has nothing to re-emit: {archived:?}"
     );
 
-    // No ThreadArchived event should have been emitted (the row was seeded
-    // directly without one, so the count must stay at zero).
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
         count_thread_archived_events(&pool, thread_id).await,
@@ -262,8 +216,6 @@ async fn archive_already_archived_thread_is_idempotent() {
     pool.close().await;
 }
 
-/// Cascade reject: a Running CC sub-thread blocks the parent's archive with
-/// 409 `descendants_blocking`. NO `ThreadArchived` event lands.
 #[tokio::test]
 async fn archive_rejects_when_descendant_running() {
     let client = user_client().await;
@@ -275,7 +227,6 @@ async fn archive_rejects_when_descendant_running() {
     let child_id = Uuid::new_v4();
 
     seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
-    // Running CC sub-thread — the exact blocking combo per `is_blocking`.
     seed_thread(
         &pool,
         child_id,
@@ -317,9 +268,6 @@ async fn archive_rejects_when_descendant_running() {
         child_id,
     );
 
-    // Even if EventBus emits were lagging behind, no ThreadArchived should
-    // ever land in a rejected cascade — the handler rolls back the
-    // FOR UPDATE tx and returns before any emit loop.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
         count_thread_archived_events(&pool, parent_id).await,
@@ -336,8 +284,6 @@ async fn archive_rejects_when_descendant_running() {
     pool.close().await;
 }
 
-/// Cascade reject: a CC sub-thread with pending changes (waiting + proposed)
-/// blocks the parent's archive with 409 `descendants_blocking`.
 #[tokio::test]
 async fn archive_rejects_when_descendant_has_pending_changes() {
     let client = user_client().await;
@@ -349,9 +295,6 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     let child_id = Uuid::new_v4();
 
     seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
-    // CC sub-thread with a pending change: status=waiting, change state
-    // proposed. is_external_repo=false so the carve-out for
-    // external-repo pending CC doesn't bypass the blocking predicate.
     seed_thread(
         &pool,
         child_id,
@@ -410,22 +353,6 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     pool.close().await;
 }
 
-/// Regression: archiving a family of stale-waiting CC threads (a
-/// `SessionStarted` on a dead branch, no live subprocess) must NOT run
-/// `end_stale_waiting_session`'s heavy worktree teardown. The tell that it
-/// ran is a synthetic settle `CodingAgentIdled` emitted before
-/// `ThreadArchived`.
-///
-/// The old archive loop called `stop_agent(Archive)` unconditionally; with no
-/// live session it fell through to `end_stale_waiting_session`, which
-/// auto-commits the worktree, `git worktree remove --force`s it, recomputes
-/// the branch diff, and tries to propose a change — per descendant, serialized
-/// inside the one HTTP request. A real 8-track family (one large refactor
-/// worktree) took ~60s, timed the iOS PWA fetch out, left each child visibly
-/// "stuck" until its slow settle landed, and provoked a retry that ran two
-/// cascades over the same worktrees concurrently. Archive must only stop a
-/// LIVE subprocess: `ThreadArchived` alone settles the projection and the
-/// async worktree-cleanup worker GCs the worktree on its own schedule.
 #[tokio::test]
 async fn archive_does_not_settle_stale_cc_sessions() {
     let client = user_client().await;
@@ -436,9 +363,6 @@ async fn archive_does_not_settle_stale_cc_sessions() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Idle CC parent + idle CC child, both in inbox (fully cascadable), each
-    // carrying a SessionStarted on a dead branch — the exact stale-waiting
-    // shape a CC family is left in after an engine restart.
     seed_thread(&pool, parent_id, None, true, "idle", "inbox", false, false).await;
     seed_thread(
         &pool,
@@ -469,11 +393,8 @@ async fn archive_does_not_settle_stale_cc_sessions() {
         "cascade archive of stale-waiting CC family must succeed: body={body:?}"
     );
 
-    // EventBus emits run their own per-event transactions after the handler
-    // releases the FOR UPDATE lock — give the projection a beat to settle.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Both members must be archived…
     assert_eq!(
         count_thread_archived_events(&pool, parent_id).await,
         1,
@@ -485,9 +406,6 @@ async fn archive_does_not_settle_stale_cc_sessions() {
         "child must have exactly one ThreadArchived event"
     );
 
-    // …and NEITHER may have a settle CodingAgentIdled — its presence means the
-    // archive ran end_stale_waiting_session's heavy teardown for a stale
-    // session, the root cause of the multi-minute archive hang + retry race.
     assert_eq!(
         count_events_of_type(&pool, parent_id, "CodingAgentIdled").await,
         0,
@@ -503,8 +421,6 @@ async fn archive_does_not_settle_stale_cc_sessions() {
     pool.close().await;
 }
 
-/// Mark a seeded child as a *stopped child* (ADR 0252): a user Stop ended its
-/// turn and its parent is still owed a card.
 async fn mark_stopped_child(pool: &sqlx::PgPool, thread_id: Uuid) {
     sqlx::query(
         "UPDATE thread_summaries SET is_stopped_child = TRUE, parent_callback_pending = TRUE \
@@ -516,7 +432,6 @@ async fn mark_stopped_child(pool: &sqlx::PgPool, thread_id: Uuid) {
     .expect("failed to mark the stopped child");
 }
 
-/// `(payload status)` of every `ChildThreadCompleted` on `parent_id`.
 async fn completion_statuses(pool: &sqlx::PgPool, parent_id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT payload->>'status' FROM events \
@@ -540,8 +455,6 @@ async fn post_archive(thread_id: Uuid) -> u16 {
         .as_u16()
 }
 
-/// Archiving a stopped child is the user saying "done". Its parent gets the
-/// one canceled card it was owed.
 #[tokio::test]
 async fn archiving_a_stopped_child_sends_its_parent_a_canceled_card() {
     let pool = sqlx::PgPool::connect(&db_url())
@@ -576,9 +489,6 @@ async fn archiving_a_stopped_child_sends_its_parent_a_canceled_card() {
     pool.close().await;
 }
 
-/// A cascade from the parent archives the stopped child along with it. That
-/// parent is archived too, so it is owed nothing, and a card would pull it
-/// back into the inbox.
 #[tokio::test]
 async fn a_cascade_from_the_parent_sends_no_card_for_a_stopped_child() {
     let pool = sqlx::PgPool::connect(&db_url())

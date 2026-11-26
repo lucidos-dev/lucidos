@@ -4,8 +4,6 @@ use super::OpenAiProvider;
 
 const SOL: &str = "gpt-6.1-sol";
 
-/// A token source that hands out `plan-token-1`, and `plan-token-2` after
-/// a rejection.
 #[derive(Default)]
 pub(super) struct FakeTokens {
     pub(super) rejections: std::sync::Mutex<Vec<String>>,
@@ -26,11 +24,6 @@ impl crate::llm::chatgpt_plan::ChatGptPlanTokens for FakeTokens {
     }
 }
 
-/// Fields the plan route refuses or its docs say to omit, plus the two
-/// Lucidos sends on the platform that the probes saw refused. A pinned
-/// wire contract: the literals are the docs' list, less `max_tool_calls`.
-/// That one also names a preference, which ADR 0368 keeps to the catalog,
-/// and no route sends it.
 const PLAN_FORBIDDEN_FIELDS: &[&str] = &[
     "background",
     "conversation",
@@ -51,8 +44,6 @@ const PLAN_FORBIDDEN_FIELDS: &[&str] = &[
     "prompt_cache_options",
 ];
 
-/// The `unsupported_capability` answer a strict mock gives a body the
-/// plan route would refuse, or `None` for a body it accepts.
 pub(super) fn plan_refusal(body: &serde_json::Value) -> Option<String> {
     if !body["input"].is_array() {
         return Some(r#"{"detail":"Input must be a list"}"#.into());
@@ -76,12 +67,8 @@ pub(super) fn plan_refusal(body: &serde_json::Value) -> Option<String> {
 
 type PlanRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
 
-/// The plan's model listing, in its own shape: `SOL` listed, one hidden.
 pub(super) const PLAN_MODELS: &str = r#"{"models":[{"slug":"gpt-6.1-sol","visibility":"list"},{"slug":"gpt-reserve","visibility":"hide"}]}"#;
 
-/// A plan Responses mock. `answer` gets the request's index and returns a
-/// status and body; a strict check answers first. Records each request's
-/// `Authorization` header and body.
 pub(super) async fn serve_plan(answer: fn(usize) -> (u16, &'static str)) -> (String, PlanRequests) {
     let requests = PlanRequests::default();
     let record = requests.clone();
@@ -136,7 +123,6 @@ pub(super) fn plan_provider(base: &str, tokens: std::sync::Arc<FakeTokens>) -> O
     OpenAiProvider::new_chatgpt_plan(access, SOL.into(), base).unwrap()
 }
 
-/// Serve the plan model listing and fail if availability spends the plan.
 pub async fn plan_availability_fixture() -> (OpenAiProvider, PlanRequests) {
     let (base, requests) = serve_plan(|_| panic!("availability must not call a model")).await;
     (plan_provider(&base, Default::default()), requests)

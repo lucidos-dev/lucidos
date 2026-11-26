@@ -1,11 +1,5 @@
-//! E2E coverage for `GET /api/v1/models/background`, which Settings reads to
-//! show the model each background task runs on.
-
 use crate::support::{base_url, user_client};
 
-/// The e2e engine runs on the mock, and so do its background calls: every row
-/// resolves to it as the chat model, reachable, at a tier, with a recommended
-/// list for the picker.
 #[tokio::test]
 async fn every_background_row_resolves_on_the_mock_engine() {
     let client = user_client().await;
@@ -22,8 +16,6 @@ async fn every_background_row_resolves_on_the_mock_engine() {
         assert_eq!(row["model"], "mock", "{key}: {row}");
         assert_eq!(row["source"], "chat-model", "{key}: {row}");
         assert_eq!(row["reachable"], true, "{key}: {row}");
-        // Nothing has answered not-found on a fresh engine (ADR 0403). Pins
-        // the wire field the Settings caveat reads.
         assert_eq!(row["not_served"], serde_json::json!([]), "{key}: {row}");
         assert!(
             row["effort"].as_str().is_some_and(|e| !e.is_empty()),

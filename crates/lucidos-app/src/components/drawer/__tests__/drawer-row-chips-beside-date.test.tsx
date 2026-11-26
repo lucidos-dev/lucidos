@@ -122,11 +122,11 @@ describe('the agent mark', () => {
     expect(host.querySelector('.message-channel-tag')).toBeNull();
   });
 
-  it('carries the original flat Lucidos mark and the optional brand tile in the same centred slot', () => {
+  it('carries the flat Lucidos mark and the brand tile in the same centred slot', () => {
     mount(0, { channel: 'chat', codingAgent: undefined });
     const mark = host.querySelector('.thread-row-agent')!;
-    expect(mark.querySelector('.lucidos-mark-icon')?.getAttribute('fill')).toBe('currentColor');
-    expect(mark.querySelector('.lucidos-mark .lmk-bg')).not.toBeNull();
+    expect(mark.querySelector('.lucidos-agent-flat')?.getAttribute('fill')).toBe('currentColor');
+    expect(mark.querySelector('.lucidos-agent-tile .lmk-bg')).not.toBeNull();
     expect(host.querySelectorAll('.thread-row-agent')).toHaveLength(1);
   });
 

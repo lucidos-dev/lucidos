@@ -13,7 +13,21 @@ fn facts(status: ThreadStatus, age: Option<i64>) -> LivenessFacts {
         between_turns: false,
         queued: false,
         held: false,
+        on_hold: false,
     }
+}
+
+#[test]
+fn a_held_thread_with_an_open_card_reads_held() {
+    let parked = facts(ThreadStatus::WaitingForUserAnswer, Some(GRACE));
+    assert_eq!(derive(&parked), LivenessState::WaitingForUserAnswer);
+    assert_eq!(
+        derive(&LivenessFacts {
+            on_hold: true,
+            ..parked
+        }),
+        LivenessState::Held
+    );
 }
 
 fn with_handoff(mut f: LivenessFacts, starts: SessionStart) -> LivenessFacts {
@@ -21,7 +35,6 @@ fn with_handoff(mut f: LivenessFacts, starts: SessionStart) -> LivenessFacts {
     f
 }
 
-/// The table in the plan, row by row, with each threshold's edge.
 #[test]
 fn derive_follows_the_table_first_match_wins() {
     use LivenessState as L;
@@ -81,8 +94,6 @@ fn derive_follows_the_table_first_match_wins() {
     }
 }
 
-/// `stalled` comes from one shape only: an unprompted pending handoff on a
-/// thread with no turn in flight, past the grace.
 #[test]
 fn only_an_unprompted_handoff_past_the_grace_is_stalled() {
     let ages = [
@@ -110,6 +121,7 @@ fn only_an_unprompted_handoff_past_the_grace_is_stalled() {
                         between_turns: false,
                         queued: false,
                         held: false,
+                        on_hold: false,
                     };
                     let stalled = matches!(status, ThreadStatus::Idle | ThreadStatus::Waiting)
                         && pending_handoff.is_some_and(SessionStart::is_unprompted)
@@ -466,6 +478,40 @@ mod db {
     }
 
     #[tokio::test]
+    async fn a_held_thread_parked_on_a_question_reads_held_with_its_hold() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = seed_coding_thread(&bus, None).await;
+        emit(
+            &bus,
+            thread,
+            serde_json::json!({"type": "UserQuestionAsked", "tool_use_id": "q", "cc_session_id": "s", "question": "Pick?", "options": [], "multi_select": false}),
+        )
+        .await;
+        let parked = read(&pool, thread).await;
+        assert_eq!(parked.state, LivenessState::WaitingForUserAnswer);
+
+        let root = Uuid::new_v4();
+        emit(
+            &bus,
+            thread,
+            serde_json::json!({
+                "type": "ThreadHoldPlaced", "reason": "Taken over",
+                "hold_id": Uuid::new_v4(), "root_thread_id": root,
+            }),
+        )
+        .await;
+        let held = serde_json::to_value(read(&pool, thread).await).unwrap();
+        assert_eq!(held["state"], "held");
+        assert_eq!(held["status"], "waiting_for_user_answer");
+        assert_eq!(
+            held["hold"],
+            serde_json::json!({"by": "hold", "reason": "Taken over", "root_thread_id": root})
+        );
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
     async fn liveness_names_a_hold_on_a_successor() {
         let (pool, db) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
@@ -511,9 +557,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// The Film-takes incident, replayed. Mid-handoff, with a transient tool
-    /// error as the newest row, the thread is `working`. After its successor
-    /// session starts it is `working` in session 2, opened by the handoff.
     #[tokio::test]
     async fn the_incident_reads_working_at_every_point() {
         let (pool, db) = setup_test_db().await;
@@ -692,7 +735,6 @@ mod db {
                 .unwrap()
                 .is_none()
         );
-        // Cleanup callers must not consume an owed successor as a user Stop.
         let cleanup = seed_coding_thread(&engine.event_bus, None).await;
         emit(&engine.event_bus, cleanup, handed_off("after-this-turn")).await;
         emit(
@@ -764,9 +806,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// An unstarted handoff reads `working` inside the grace and `stalled`
-    /// past it. A next-input handoff owes nothing, and a failed start reads
-    /// `failed`.
     #[tokio::test]
     async fn a_handoff_is_stalled_only_when_owed_and_past_the_grace() {
         let (pool, db) = setup_test_db().await;
@@ -834,7 +873,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A handoff below a snapshot restore floor is history, never `stalled`.
     #[tokio::test]
     async fn a_handoff_below_the_restore_floor_is_not_stalled() {
         let (pool, db) = setup_test_db().await;
@@ -858,7 +896,6 @@ mod db {
         .execute(&pool)
         .await
         .unwrap();
-        // Restore runs the boot settlement before replaying pending work.
         crate::engine::agent_recovery::settle_orphaned_running_threads(
             &pool,
             &bus,
@@ -872,8 +909,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// A turn silent past `QUIET_AFTER` reads `quiet`, never `stalled`. A chat
-    /// thread has no session. Reading writes nothing.
     #[tokio::test]
     async fn a_silent_turn_is_quiet_and_a_read_writes_nothing() {
         let (pool, db) = setup_test_db().await;

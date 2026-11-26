@@ -1,7 +1,3 @@
-//! A re-entry that lands while a question is open waits behind the answer, so
-//! it must not move the thread off `waiting_for_user_answer`. See
-//! `docs/plans/2026-09-24-a-delivery-never-unparks-a-question.md`.
-
 use super::super::*;
 use super::*;
 
@@ -27,7 +23,6 @@ async fn emit_question(bus: &EventBus, thread_id: Uuid) {
     .unwrap();
 }
 
-/// The anchor an event-wait delivery persists before queueing its re-entry.
 async fn emit_delivery_anchor(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,

@@ -1,12 +1,3 @@
-//! Keeping a user's local edits across a plugin update, and removing the files
-//! the new version dropped.
-//!
-//! Each test drives the real staging-then-confirm sequence: plan the update
-//! against the recorded baseline, resolve the panel's keep control, save aside
-//! whatever will be discarded, then run the writer. Nothing here shortcuts to
-//! the merge function alone, because the invariants that matter are about what
-//! reaches disk and what reaches the install commit.
-
 use super::super::helpers::{build_archive, extract_to, fresh_workspace};
 use super::super::{install_from_unpacked_with_bus, InstallContext, LocalChangeWrites, SourceType};
 use super::*;
@@ -18,8 +9,6 @@ use crate::triggers::config::TriggerRun;
 use crate::triggers::definition::TriggerDefinition;
 use std::path::PathBuf;
 
-/// The planner as staging calls it for a plugin that shares no path with
-/// another one.
 fn plan_for(ws: &Path, baseline: &PluginBaseline, planned: &[PlannedFile]) -> UpdatePlan {
     super::plan_update(
         ws,
@@ -56,13 +45,10 @@ source = "https://github.com/example-org/example-repo"
 
 const NOTES: &str = "# Notes\nintro\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\n";
 
-/// Upstream's v2: rewrites the intro, far from where the user works.
 const NOTES_V2: &str = "# Notes\nintro (v2)\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\n";
 
-/// Upstream's v3: rewrites the intro again, still far from the user's hunk.
 const NOTES_V3: &str = "# Notes\nintro (v3)\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\n";
 
-/// The user's patch: a section appended at the end.
 const USER_SECTION: &str = "\n## Outlook snapshot\npeek-safe, EXAMINE only\n";
 
 const TRIGGER_TOML: &str = "name = \"Watcher\"\n\n[[on]]\nevent_type = \"FooHappened\"\n\n[run]\ntype = \"intent\"\nintent = \"do the thing\"\n";
@@ -85,8 +71,6 @@ fn write_data(ws: &Path, rel: &str, body: &str) {
     std::fs::write(p, body).unwrap();
 }
 
-/// Unpack a version's manifest + files into a staged plugin root, exactly as
-/// `fetch_source` would leave it.
 fn stage(ws: &Path, tag: &str, manifest: &str, files: &[(&str, &[u8])]) -> PathBuf {
     let dir = ws.join("staging").join(tag);
     std::fs::create_dir_all(&dir).unwrap();
@@ -94,8 +78,6 @@ fn stage(ws: &Path, tag: &str, manifest: &str, files: &[(&str, &[u8])]) -> PathB
     extract_to(&dir, &archive)
 }
 
-/// The install commit the writer recorded, read back off the emitted
-/// `PluginInstalled` exactly as `InstalledRecord::commit` does in production.
 fn recorded_install_commit(bus: &MockEventBus) -> String {
     bus.emitted_events()
         .iter()
@@ -117,8 +99,6 @@ fn baseline(bus: &MockEventBus, files: &[&str]) -> PluginBaseline {
     }
 }
 
-/// The bytes the install commit recorded for `rel`. The pristine-baseline
-/// invariant is about this, not about what is on disk.
 fn committed_blob(ws: &Path, commit: &str, rel: &str) -> String {
     let repo = git2::Repository::open(ws).unwrap();
     let tree = repo
@@ -135,7 +115,6 @@ fn committed_blob(ws: &Path, commit: &str, rel: &str) -> String {
     String::from_utf8(blob.content().to_vec()).unwrap()
 }
 
-/// Whether the install commit's tree holds `rel` at all.
 fn in_commit(ws: &Path, commit: &str, rel: &str) -> bool {
     let repo = git2::Repository::open(ws).unwrap();
     let tree = repo
@@ -148,7 +127,6 @@ fn in_commit(ws: &Path, commit: &str, rel: &str) -> bool {
     tree.get_path(Path::new(&format!("data/{}", rel))).is_ok()
 }
 
-/// What a confirmed update did to the user's edits, for assertions.
 #[derive(Debug)]
 struct UpdateOutcome {
     merged: Vec<String>,
@@ -157,13 +135,10 @@ struct UpdateOutcome {
     restored: Vec<String>,
     removed: Vec<String>,
     saved_paths: Vec<String>,
-    /// Every path the staged preview said the confirm would delete.
     removes: Vec<String>,
-    /// Every path the writer deleted.
     removed_files: Vec<String>,
 }
 
-/// Fresh install: no baseline, so no merge plan and no local changes.
 async fn install_first(ws: &Path, bus: &MockEventBus, files: &[(&str, &[u8])]) {
     let root = stage(ws, "v1", MANIFEST_V1, files);
     install_from_unpacked_with_bus(
@@ -176,8 +151,6 @@ async fn install_first(ws: &Path, bus: &MockEventBus, files: &[(&str, &[u8])]) {
     .expect("first install must succeed");
 }
 
-/// The confirm sequence for an update, step for step as
-/// `confirm_pending_install` runs it.
 async fn update(
     ws: &Path,
     bus: &MockEventBus,
@@ -198,7 +171,6 @@ async fn update(
     .await
 }
 
-/// [`update`] over any previous record, a legacy one with no baseline included.
 async fn update_over(
     ws: &Path,
     bus: &MockEventBus,
@@ -208,8 +180,6 @@ async fn update_over(
     baseline: Option<&PluginBaseline>,
     keep_local_changes: bool,
 ) -> UpdateOutcome {
-    // The version doubles as the staging directory name, so a fixture names it
-    // once and the two cannot drift.
     let version = crate::core::plugins::parse_manifest(manifest)
         .expect("fixture manifest must parse")
         .version;
@@ -253,8 +223,6 @@ async fn update_over(
     }
 }
 
-/// The whole point: upstream changes the top of the file, the user owns the
-/// bottom, and both survive.
 #[tokio::test]
 async fn clean_merge_keeps_the_user_hunk_and_takes_upstreams() {
     let (_tmp, ws) = fresh_workspace();
@@ -295,9 +263,6 @@ async fn clean_merge_keeps_the_user_hunk_and_takes_upstreams() {
     );
 }
 
-/// The install commit is the next update's merge base, so it must hold
-/// UPSTREAM's bytes even though the working tree holds the merge. Recording
-/// the merge instead is what silently drops the patch one update later.
 #[tokio::test]
 async fn install_commit_records_upstream_not_merged() {
     let (_tmp, ws) = fresh_workspace();
@@ -328,8 +293,6 @@ async fn install_commit_records_upstream_not_merged() {
     );
 }
 
-/// The regression this design exists for. Update two must not eat the patch
-/// that update one kept.
 #[tokio::test]
 async fn patch_carries_forward_across_two_updates() {
     let (_tmp, ws) = fresh_workspace();
@@ -376,9 +339,6 @@ async fn patch_carries_forward_across_two_updates() {
     );
 }
 
-/// Both sides rewrote the same line. Upstream wins on disk: a file carrying
-/// conflict markers is an instruction the engine would act on. The user's
-/// version is kept as a file plus a re-appliable patch.
 #[tokio::test]
 async fn conflict_writes_upstream_and_saves_ours_aside() {
     let (_tmp, ws) = fresh_workspace();
@@ -431,9 +391,6 @@ async fn conflict_writes_upstream_and_saves_ours_aside() {
     );
 }
 
-/// `trigger.toml` is a re-serialized projection the engine rewrites after every
-/// install, so its bytes never match what the plugin shipped. Text-merging it
-/// would report a conflict for every plugin trigger on every update.
 #[tokio::test]
 async fn trigger_projection_is_never_merged() {
     let (_tmp, ws) = fresh_workspace();
@@ -444,8 +401,6 @@ async fn trigger_projection_is_never_merged() {
     ];
     install_first(&ws, &bus, files).await;
 
-    // Re-serialized and registration-stamped, exactly as the scheduler leaves
-    // it: different bytes, same definition.
     let mut def = TriggerDefinition::from_toml(TRIGGER_TOML).unwrap();
     def.slug = "watch".to_string();
     def.plugin_id = Some("demo".to_string());
@@ -460,7 +415,6 @@ async fn trigger_projection_is_never_merged() {
         "a re-serialized projection is not a local edit: {outcome:?}"
     );
 
-    // Now a REAL definition change. Still never a conflict, just replaced.
     let mut edited = TriggerDefinition::from_toml(TRIGGER_TOML).unwrap();
     edited.slug = "watch".to_string();
     edited.run = TriggerRun::Intent {
@@ -480,8 +434,6 @@ async fn trigger_projection_is_never_merged() {
     assert!(outcome.conflicted.is_empty(), "never a conflict");
 }
 
-/// The common path must be untouched: no merge attempted, nothing saved aside,
-/// and `data/artifacts/` left clean.
 #[tokio::test]
 async fn unmodified_file_is_plainly_replaced() {
     let (_tmp, ws) = fresh_workspace();
@@ -510,11 +462,6 @@ async fn unmodified_file_is_plainly_replaced() {
     );
 }
 
-/// The repro: the user edits files, publishes those edits upstream, then
-/// updates back onto their own work. Every path they sent is byte-identical to
-/// what the new version ships, so only the one they held back is a decision.
-/// The panel counts what this plan holds, so an extra row is an extra question
-/// about a file nothing can happen to.
 #[tokio::test]
 async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
     let (_tmp, ws) = fresh_workspace();
@@ -525,10 +472,8 @@ async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
     ];
     install_first(&ws, &bus, files).await;
 
-    // Published upstream: their edit IS v2's content.
     let published = notes_with_user_section(NOTES);
     write_data(&ws, "knowhow/notes.md", &published);
-    // Held back: still only theirs.
     write_data(&ws, "apps/demo/index.html", "<h1>mine</h1>\n");
     let base = baseline(&bus, &["knowhow/notes.md", "apps/demo/index.html"]);
 
@@ -557,8 +502,6 @@ async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
         "only the file that really differs from upstream is a decision"
     );
 
-    // And clearing the keep control acts on that one file alone: the published
-    // edit is not "discarded", so nothing is copied aside for it.
     let outcome = update(
         &ws,
         &bus,
@@ -589,9 +532,6 @@ async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
     );
 }
 
-/// A path the panel says nothing about is still watched. The user edited it
-/// once, so they can edit it again while the panel sits open, and that edit is
-/// real work. Silent in the list must not mean unguarded at confirm.
 #[tokio::test]
 async fn a_file_dropped_for_matching_upstream_is_still_drift_checked() {
     let (_tmp, ws) = fresh_workspace();
@@ -626,8 +566,6 @@ async fn a_file_dropped_for_matching_upstream_is_still_drift_checked() {
     );
 }
 
-/// The panel's keep control switched off: clean upstream everywhere, but the
-/// discarded edit is still preserved rather than deleted.
 #[tokio::test]
 async fn keep_local_changes_false_replaces_and_saves_aside() {
     let (_tmp, ws) = fresh_workspace();
@@ -664,7 +602,6 @@ async fn keep_local_changes_false_replaces_and_saves_aside() {
     );
 }
 
-/// A binary file has no meaningful three-way merge whatever its size.
 #[tokio::test]
 async fn binary_file_is_replaced_not_merged() {
     let (_tmp, ws) = fresh_workspace();
@@ -685,8 +622,6 @@ async fn binary_file_is_replaced_not_merged() {
 
     assert_eq!(outcome.replaced, vec!["apps/demo/logo.bin".to_string()]);
     assert!(outcome.merged.is_empty() && outcome.conflicted.is_empty());
-    // Saved aside by copying the live file, since a binary is never held in
-    // the pending entry and has no patch to write beside it.
     let saved = data_path(
         &ws,
         "artifacts/plugin-local-changes/demo/v2.0.0/apps/demo/logo.bin",
@@ -698,9 +633,6 @@ async fn binary_file_is_replaced_not_merged() {
     );
 }
 
-/// A file the user deleted comes back, and reports as its own outcome. It must
-/// NOT read as `replaced`: nothing is saved aside for a deletion, so the panel
-/// would be promising a copy that does not exist.
 #[tokio::test]
 async fn a_locally_deleted_file_is_restored_not_replaced() {
     let (_tmp, ws) = fresh_workspace();
@@ -732,17 +664,12 @@ async fn a_locally_deleted_file_is_restored_not_replaced() {
     );
 }
 
-/// Installing the same version twice must not write the second batch of
-/// discarded edits over the first. That copy is the only place the first batch
-/// still exists in the working tree, because the confirm has just overwritten
-/// the live file.
 #[tokio::test]
 async fn a_second_save_of_one_version_never_overwrites_the_first() {
     let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
 
-    // Two reinstalls of the SAME version, each discarding a different edit.
     let first_edit = NOTES.replace("charlie", "charlie, my first way");
     write_data(&ws, "knowhow/notes.md", &first_edit);
     let theirs = NOTES.replace("charlie", "charlie, upstream's way");
@@ -790,10 +717,6 @@ async fn a_second_save_of_one_version_never_overwrites_the_first() {
     );
 }
 
-/// A merged file must end up with the mode the shipped file carries, on disk
-/// and in the install commit. `copy_atomic` gets that free from
-/// `std::fs::copy`, so only the merged path can lose it. A plugin script
-/// silently losing its executable bit on update would be hard to trace.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_merged_file_keeps_the_shipped_executable_bit() {
@@ -805,9 +728,6 @@ async fn a_merged_file_keeps_the_shipped_executable_bit() {
     write_data(&ws, "scripts/run.sh", &notes_with_user_section(NOTES));
     let base = baseline(&bus, &["scripts/run.sh"]);
 
-    // Upstream ships it executable. `build_archive` stores plain entries, so
-    // mark the staged file after extraction, which is what a git clone of an
-    // executable script leaves behind.
     let root = stage(
         &ws,
         "2.0.0",
@@ -865,8 +785,6 @@ async fn a_merged_file_keeps_the_shipped_executable_bit() {
     );
 }
 
-/// The size arm of the same rule, checked directly: building a real
-/// multi-megabyte fixture would cost far more than it proves.
 #[test]
 fn oversized_content_is_not_mergeable() {
     assert!(super::is_mergeable_text(b"ordinary text"));
@@ -881,8 +799,6 @@ fn oversized_content_is_not_mergeable() {
     ]));
 }
 
-/// After a merge the user still carries a patch, so the badge must still say
-/// so. This is also what proves the merge base stayed pristine.
 #[tokio::test]
 async fn badge_still_modified_after_a_clean_merge() {
     let (_tmp, ws) = fresh_workspace();
@@ -913,9 +829,6 @@ async fn badge_still_modified_after_a_clean_merge() {
     assert_eq!(status.modified_paths, vec!["knowhow/notes.md".to_string()]);
 }
 
-/// The staging window is an hour long. An edit inside it means the panel
-/// described content that is now gone. The confirm must refuse rather than
-/// write a merge against the old bytes.
 #[tokio::test]
 async fn confirm_refuses_when_local_content_changed_since_staging() {
     let (_tmp, ws) = fresh_workspace();
@@ -937,7 +850,6 @@ async fn confirm_refuses_when_local_content_changed_since_staging() {
         "clean right after staging"
     );
 
-    // The user edits again while the panel sits open.
     write_data(&ws, "knowhow/notes.md", "something else entirely\n");
     assert_eq!(
         plan.detect_drift(&ws).as_deref(),
@@ -946,9 +858,6 @@ async fn confirm_refuses_when_local_content_changed_since_staging() {
     );
 }
 
-/// The patch offered upstream is derived on read, so it is always against the
-/// version the user is actually on. It must also really apply, which is the
-/// only thing that makes it worth handing to a plugin author.
 #[tokio::test]
 async fn proposed_patch_applies_to_the_installed_version() {
     let (_tmp, ws) = fresh_workspace();
@@ -964,8 +873,6 @@ async fn proposed_patch_applies_to_the_installed_version() {
         "paths must be repo-root relative so git apply lands them: {patch}"
     );
 
-    // Apply it to a clean checkout of the INSTALLED version and check we get
-    // the user's file back.
     let tmp = tempfile::tempdir().unwrap();
     let scratch = tmp.path().to_path_buf();
     std::fs::create_dir_all(scratch.join("data/knowhow")).unwrap();
@@ -991,8 +898,6 @@ async fn proposed_patch_applies_to_the_installed_version() {
     );
 }
 
-/// An untouched plugin has nothing to propose, and a trigger projection is not
-/// a local edit anybody wrote.
 #[tokio::test]
 async fn nothing_to_propose_without_a_real_local_edit() {
     let (_tmp, ws) = fresh_workspace();
@@ -1008,7 +913,6 @@ async fn nothing_to_propose_without_a_real_local_edit() {
         "a clean install has no patch to offer"
     );
 
-    // Only the engine-generated trigger definition differs.
     let mut edited = TriggerDefinition::from_toml(TRIGGER_TOML).unwrap();
     edited.slug = "watch".to_string();
     edited.run = TriggerRun::Intent {
@@ -1025,9 +929,6 @@ async fn nothing_to_propose_without_a_real_local_edit() {
     );
 }
 
-/// A path reaches `modified_paths` on a mode change alone, and identical
-/// content has no diff. The proposal must then offer nothing, rather than a
-/// patch header with no hunks under it.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_mode_only_change_proposes_no_patch() {
@@ -1054,9 +955,6 @@ async fn a_mode_only_change_proposes_no_patch() {
     );
 }
 
-/// A user-added file inside a plugin's app dir that upstream now ships too.
-/// There is no baseline blob, so the merge base is empty and the two sides
-/// conflict. That routes to the same save-aside rule as any other conflict.
 #[tokio::test]
 async fn user_added_app_file_upstream_now_ships_is_a_conflict() {
     let (_tmp, ws) = fresh_workspace();
@@ -1094,9 +992,6 @@ async fn user_added_app_file_upstream_now_ships_is_a_conflict() {
 
 const TOPIC: &str = "# Topic\nhow to do the thing\n";
 
-/// The reported case: v2 moved a knowhow file out of its app folder. Both
-/// copies used to survive, and the stale one kept loading. Only the new path
-/// may remain, on disk and in the install commit.
 #[tokio::test]
 async fn a_moved_file_ends_up_only_at_its_new_path() {
     let (_tmp, ws) = fresh_workspace();
@@ -1164,8 +1059,6 @@ async fn a_moved_file_ends_up_only_at_its_new_path() {
     assert_eq!(recorded_removal, Some(vec![old]), "the event records it");
 }
 
-/// Only recorded paths are candidates. A file the user added beside a dropped
-/// one is theirs, so it stays, and so does its folder.
 #[tokio::test]
 async fn a_user_file_beside_a_dropped_one_survives() {
     let (_tmp, ws) = fresh_workspace();
@@ -1203,9 +1096,6 @@ async fn a_user_file_beside_a_dropped_one_survives() {
     );
 }
 
-/// An edited file the new version drops is saved aside, whole and as a patch,
-/// then removed. The keep control cannot keep it: a dropped file left in place
-/// is exactly the stale copy this exists to prevent.
 #[tokio::test]
 async fn an_edited_dropped_file_is_saved_aside_then_removed() {
     let (_tmp, ws) = fresh_workspace();
@@ -1254,8 +1144,6 @@ async fn an_edited_dropped_file_is_saved_aside_then_removed() {
     );
 }
 
-/// A legacy record has no install commit, so no edit can be ruled out. Every
-/// dropped file still on disk is saved aside whole, then removed.
 #[tokio::test]
 async fn a_legacy_record_saves_every_dropped_file_aside() {
     let (_tmp, ws) = fresh_workspace();
@@ -1297,7 +1185,6 @@ async fn a_legacy_record_saves_every_dropped_file_aside() {
     );
 }
 
-/// The paths an update must never delete, whatever the record says.
 #[tokio::test]
 async fn paths_an_update_must_not_delete_are_skipped() {
     let (_tmp, ws) = fresh_workspace();
@@ -1314,8 +1201,6 @@ async fn paths_an_update_must_not_delete_are_skipped() {
     )
     .await;
     std::fs::remove_file(data_path(&ws, "knowhow/gone.md")).unwrap();
-    // A tampered record: paths outside the content dirs, present on disk so
-    // only the guard can be what skips them.
     write_data(&ws, "config/secrets.json", "{}");
     std::fs::write(ws.join("outside.md"), "x").unwrap();
     let recorded: Vec<String> = [
@@ -1352,8 +1237,6 @@ async fn paths_an_update_must_not_delete_are_skipped() {
     assert!(plan.preview_json().as_array().unwrap().is_empty());
 }
 
-/// A case-only rename names one file on a case-insensitive volume. Removing
-/// the old spelling would delete the file the update just wrote.
 #[tokio::test]
 async fn a_case_only_rename_is_not_removed() {
     let (_tmp, ws) = fresh_workspace();
@@ -1373,16 +1256,12 @@ async fn a_case_only_rename_is_not_removed() {
     assert!(plan.removes().is_empty(), "{:?}", plan.removes());
 }
 
-/// Unedited means the install commit holds these exact bytes. A recorded file
-/// the commit lacks, for one an ignore rule kept out, is saved aside first.
 #[tokio::test]
 async fn a_dropped_file_the_install_commit_lacks_is_saved_aside() {
     let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     write_data(&ws, "knowhow/uncommitted.md", "only on disk\n");
-    // The Modified scan covers only the baseline's own files, so it cannot see
-    // this path. The plan must not read that silence as "unedited".
     let base = baseline(&bus, &["knowhow/notes.md"]);
     let recorded = [
         "knowhow/notes.md".to_string(),
@@ -1404,8 +1283,6 @@ async fn a_dropped_file_the_install_commit_lacks_is_saved_aside() {
     );
 }
 
-/// Nothing is deleted on a judgment the user did not see. A dropped file that
-/// changes inside the staging window refuses the confirm, edited or not.
 #[tokio::test]
 async fn a_dropped_file_changed_after_staging_refuses_the_confirm() {
     let (_tmp, ws) = fresh_workspace();

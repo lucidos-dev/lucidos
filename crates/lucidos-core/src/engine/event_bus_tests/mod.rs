@@ -1,8 +1,3 @@
-// Tests for [`super::EventBus`]. Split from the former single
-// `event_bus_tests.rs` into concern modules (see the `mod` declarations
-// below). Shared setup helpers live here so every concern module can reach
-// them via `use super::*`.
-
 use super::*;
 pub(crate) use crate::engine::thread_events::{
     ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, SessionEndReason, ThreadEvent,

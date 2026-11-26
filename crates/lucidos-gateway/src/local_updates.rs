@@ -1,4 +1,3 @@
-//! The Local channel exposes one staged feed and its one bundle, never a directory.
 use crate::{pairing, server::GatewayState};
 use axum::{
     extract::{Path, Request, State},
@@ -106,7 +105,6 @@ async fn feed(State(state): State<GatewayState>, req: Request) -> Response {
     if let Err(status) = authorize(&req) {
         return status.into_response();
     }
-    // Resolve from the socket and actual transport, never an untrusted Host header.
     let peer = req
         .extensions()
         .get::<pairing::Peer>()

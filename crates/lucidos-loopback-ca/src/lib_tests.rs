@@ -16,7 +16,6 @@ pub(crate) fn fresh_ca() -> (tempfile::TempDir, CaDir, LoopbackCa) {
     (scratch, dir, ca)
 }
 
-/// Validate `leaf` for `name` at `at`, as a client trusting only `ca` would.
 pub(crate) fn verify(
     ca: &LoopbackCa,
     leaf: &CertificateDer<'static>,

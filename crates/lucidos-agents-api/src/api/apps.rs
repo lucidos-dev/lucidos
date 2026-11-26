@@ -9,36 +9,18 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::core::contained_path::join_contained;
 use std::path::PathBuf;
 
-/// Query params for single app
 #[derive(Debug, Deserialize)]
 pub(super) struct AppQuery {
-    /// App ID
     pub id: String,
 }
 
-/// Query params for app-UI / app-file routes — accepts `thread_id` (WIP preview
-/// from an app coding-agent thread's worktree). When `thread_id` is set, the
-/// route serves the file from an app coding-agent thread's worktree instead
-/// of the live workspace copy. The thread must (a) be a coding-agent thread,
-/// (b) have `coding_agent_kind == 'app'`, and (c) own the same `app_id` we're
-/// serving — otherwise the route returns 404.
-///
-/// It also accepts `device`, which the host stamps onto the app frame's `src`.
-/// An isolated app frame cannot read the shell's storage, so the engine has to
-/// resolve that device's appearance itself: see
-/// [`super::app_ui::stamp_prefs_device`]. Absent, the global preferences
-/// answer, which is what a hand-typed app URL gets.
 #[derive(Debug, Deserialize)]
 pub(super) struct AppUiPreviewQuery {
     pub thread_id: Option<String>,
     pub device: Option<String>,
-    /// `1` asks for the file as an attachment. See [`attachment_disposition`].
     pub download: Option<u8>,
 }
 
-/// Resolve the worktree-relative root directory to serve from when an app-UI
-/// request carries `?thread_id=<id>`. Returns `Some(<wt>/data/apps/<id>/)` on
-/// successful match, `None` to 404 the request.
 async fn resolve_preview_root(
     state: &AppState,
     thread_id: &str,
@@ -58,7 +40,7 @@ async fn resolve_preview_root(
     if kind != "app" {
         return None;
     }
-    // folder is `<workspace>/data/apps/<id>/` — make sure the app id matches
+    // INVARIANT: folder is `<workspace>/data/apps/<id>/` — make sure the app id matches
     // what the caller is requesting; without this, a thread spawned for
     // `demo-director` could be used to preview `habit-tracker`'s URL.
     let folder_path = std::path::Path::new(&folder);
@@ -69,15 +51,7 @@ async fn resolve_preview_root(
     if recorded_app_id != expected_app_id {
         return None;
     }
-    // The `coding_agent_folder` column persists the LIVE workspace app
-    // folder path (`<ws>/data/apps/<id>/`), not the worktree-internal path
-    // — the matching cwd inside the worktree lives at
-    // `<worktree>/data/apps/<id>/`. Resolve the actual worktree via the
-    // engine's `resolve_thread_app_worktree` helper.
     let wt = state.engine.resolve_thread_app_worktree(tid).await?;
-    // Sparse-checkout worktrees mirror the workspace layout, so the served
-    // root is `<wt>/data/apps/<id>/`. The agent controls every part of that
-    // path, so a link at any level that leaves its own tree is refused.
     let data = crate::core::contained_path::join_contained(&wt, crate::core::DATA_DIR)?;
     let app_root = crate::core::contained_path::join_data_contained(
         &data,
@@ -89,9 +63,6 @@ async fn resolve_preview_root(
     Some(app_root)
 }
 
-/// One file of an app: from the named thread's worktree for a `?thread_id=`
-/// WIP preview, else from the live app folder. The caller has already refused
-/// a traversing `file`.
 async fn app_file(
     state: &AppState,
     app_id: &str,
@@ -124,7 +95,6 @@ fn refused_outside(file: &str, root: &std::path::Path) -> Response {
     (StatusCode::NOT_FOUND, "File not found").into_response()
 }
 
-/// Validate that an app ID is safe (no path traversal)
 fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && !id.contains("..")
@@ -133,7 +103,6 @@ fn is_valid_id(id: &str) -> bool {
         && !id.starts_with('.')
 }
 
-/// GET /api/v1/apps - List all apps
 pub(super) async fn list_apps(State(state): State<AppState>) -> Response {
     read_apps(&state).map(Json).into_response()
 }
@@ -149,7 +118,6 @@ pub(super) fn read_apps(
     })
 }
 
-/// GET /api/v1/app?id=... - Get app details
 pub(super) async fn get_app(
     State(state): State<AppState>,
     Query(query): Query<AppQuery>,
@@ -168,7 +136,6 @@ pub(super) async fn get_app(
     }
 }
 
-/// DELETE /api/v1/app?id=... - Delete an app
 pub(super) async fn delete_app(
     State(state): State<AppState>,
     Query(query): Query<AppQuery>,
@@ -178,7 +145,7 @@ pub(super) async fn delete_app(
         return (StatusCode::BAD_REQUEST, "Invalid app ID").into_response();
     }
 
-    // Plugin-installed apps are removed through the plugin uninstall confirm
+    // INVARIANT: Plugin-installed apps are removed through the plugin uninstall confirm
     // panel (the single removal authority — it also tears down the plugin's
     // triggers/knowhow/scripts and emits PluginUninstalled), never by raw
     // `rm -rf` of the app dir, which would orphan the PluginInstalled record.
@@ -211,8 +178,6 @@ pub(super) async fn delete_app(
         }
     }
 
-    // The manager emits `AppDeleted` from inside the write path, so resolve the
-    // device actor and hand it over (see `AppManager`'s type doc).
     let actor = crate::api::actor::user_actor(&headers, None);
     match state
         .app_manager
@@ -228,9 +193,6 @@ pub(super) async fn delete_app(
     }
 }
 
-/// POST /api/v1/app/opened?id=... - Record that the user opened an app's UI.
-/// The workspace prompt footprint judges an app's use by `AppOpened` alone
-/// (ADR 0413). So a widget or a missing app is refused.
 pub(super) async fn record_app_opened(
     State(state): State<AppState>,
     Query(query): Query<AppQuery>,
@@ -268,7 +230,6 @@ pub(super) async fn record_app_opened(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// PUT /api/v1/app?id=... - Update app metadata (name, description)
 pub(super) async fn update_app(
     State(state): State<AppState>,
     Query(query): Query<AppQuery>,
@@ -283,7 +244,7 @@ pub(super) async fn update_app(
         Some(n) => n,
         None => return (StatusCode::BAD_REQUEST, "name is required").into_response(),
     };
-    // An ABSENT `description` key means "leave it as it is", never "clear it".
+    // INVARIANT: An ABSENT `description` key means "leave it as it is", never "clear it".
     // `update_app_metadata` rewrites the whole `manifest.json` from the two
     // values it is handed, and the generated CLI omits the key entirely when
     // `--description` isn't passed (`lucidos apps update --id X --name Y`), so
@@ -323,7 +284,6 @@ pub(super) async fn update_app(
     }
 }
 
-/// GET /api/v1/app/:app_id/source - Read app source files
 pub(super) async fn read_app_source(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -348,7 +308,6 @@ pub(super) async fn read_app_source(
     }
 }
 
-/// PUT /api/v1/app/:app_id/source - Write app source files
 pub(super) async fn write_app_source(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -391,13 +350,6 @@ pub(super) async fn write_app_source(
     }
 }
 
-/// GET /app/:app_id/ - Serve app UI index.html.
-///
-/// Apps are static and returned with three rewrites. The brand tab icon goes
-/// in when the document names none. Absolute engine refs are re-scoped for the
-/// gateway. A `?thread_id=` WIP preview also gets the thread-id suffix on its
-/// relative `src`/`href`. SDK, theme CSS, audio shim and `<title>` stay opt-in
-/// via tags in the app's HTML (see `knowhow/js-sdk.md`).
 pub(super) async fn serve_app_ui(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -408,15 +360,8 @@ pub(super) async fn serve_app_ui(
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
     }
 
-    // Behind the gateway this iframe loads at `/<slug>/app/<id>/`; re-scope the
-    // app's absolute engine refs (e.g. `<script src="/api/v1/sdk.js">`) with the
-    // forwarded prefix so they route back to this workspace (ADR 0014 §4). A
-    // direct hit has no prefix → `/` → no-op.
     let prefix = crate::core::base_path::forwarded_prefix(&headers);
 
-    // WIP-preview path: serve index.html from an app coding-agent thread's
-    // worktree. The user reaches this by clicking the preview button in the
-    // thread's prompt row; the panel-overlay iframe URL gains `?thread_id=...`.
     let preview_thread_id = query.thread_id.as_deref();
     let ui_path = match app_file(&state, &app_id, preview_thread_id, "index.html").await {
         Ok(path) => path,
@@ -429,17 +374,12 @@ pub(super) async fn serve_app_ui(
 
     match std::fs::read_to_string(&ui_path) {
         Ok(content) => {
-            // Inject `?thread_id=<id>` into every relative src/href so the
-            // iframe's CSS/JS/static asset requests route back into the
-            // WIP-preview branch of `serve_app_file` instead of falling
-            // through to the live workspace copy — which would mix the WIP
-            // HTML with live CSS/JS and defeat the preview promise.
             let html = match preview_thread_id {
                 Some(tid) => rewrite_for_thread_id(&content, tid),
                 None => content,
             };
             let html = ensure_app_favicon(&html);
-            // Behind a gateway this frame sends no device credential with its
+            // INVARIANT: Behind a gateway this frame sends no device credential with its
             // own subresources, so it carries a pass in the URL instead (ADR
             // 0238). The rescope threads it onto root-absolute workspace refs,
             // and the base carries every relative one.
@@ -449,7 +389,7 @@ pub(super) async fn serve_app_ui(
                 Some(pass) => stamp_frame_capability(&html, &prefix, pass, &app_id),
                 None => html,
             };
-            // After the re-scope, which rewrites the same `src`. Both edit one
+            // INVARIANT: After the re-scope, which rewrites the same `src`. Both edit one
             // engine route's address and nothing else the app wrote.
             let html = match query.device.as_deref() {
                 Some(device) => stamp_prefs_device(&html, device),
@@ -468,7 +408,6 @@ pub(super) async fn serve_app_ui(
     }
 }
 
-/// GET /app/:app_id/*path - Serve app sub-files (CSS, JS, images, etc.)
 pub(super) async fn serve_app_file(
     State(state): State<AppState>,
     Path((app_id, file_path)): Path<(String, String)>,
@@ -491,9 +430,6 @@ pub(super) async fn serve_app_file(
     app_file_response(&full_path, &file_path, query.download, &request_headers).await
 }
 
-/// Answer for one app file, with validators under the engine-wide `no-cache`.
-/// A browser then revalidates an icon rather than downloading it again, and
-/// still sees an edited file at once.
 async fn app_file_response(
     full_path: &std::path::Path,
     file_path: &str,
@@ -522,16 +458,12 @@ fn attachment_disposition(download: Option<u8>, file_path: &str) -> Option<Strin
         return None;
     }
     let name = std::path::Path::new(file_path).file_name()?.to_str()?;
-    // A quote, a backslash or a control character would let the name carry a
-    // second header parameter. `is_path_traversal` has already run.
     if name.is_empty() || name.contains(['"', '\\', '\r', '\n']) {
         return None;
     }
     Some(format!("attachment; filename=\"{name}\""))
 }
 
-/// GET /app/:app_id/artifacts/*path - Serve shared artifacts for app iframes.
-/// Apps using relative paths like `../artifacts/...` resolve here.
 pub(super) async fn serve_app_artifact(
     State(state): State<AppState>,
     Path((_app_id, artifact_path)): Path<(String, String)>,
@@ -570,7 +502,6 @@ pub(super) async fn serve_app_artifact(
     }
 }
 
-/// Run `git log` for a path, returning commits that touched it.
 async fn git_log_for_path(
     workspace: &std::path::Path,
     path: &str,
@@ -662,7 +593,7 @@ pub(super) async fn get_git_history_with_paths(
     git_log_for_path(workspace, prefix, limit, offset, true).await
 }
 
-/// A page answers a capture request. Only the device the request names may
+/// INVARIANT: A page answers a capture request. Only the device the request names may
 /// answer it; any other is refused and the request stays open for that one.
 pub(super) async fn submit_app_capture(
     State(state): State<AppState>,
@@ -698,18 +629,13 @@ pub(super) async fn submit_app_capture(
     }
 }
 
-/// What the renewal call names.
 #[derive(Debug, Deserialize)]
 pub(super) struct FrameCapabilityQuery {
-    /// The app whose frame is asking. The HOST supplies it, from the frame it
-    /// owns, never the app (ADR 0231 decision 4).
     app_id: String,
 }
 
-/// A fresh pass, and when the host should come back for the next one.
 #[derive(Serialize)]
 struct FrameCapabilityBody {
-    /// `None` with no gateway in front, where a frame needs no pass at all.
     capability: Option<String>,
     renew_after_secs: i64,
 }
@@ -725,17 +651,6 @@ async fn mint_frame_capability(
     })
 }
 
-/// GET /api/v1/artifact-preview-capability - Mint the pass the host's HTML
-/// artifact preview stamps into its `<base href>`.
-///
-/// The preview runs at an opaque origin (ADR 0322). So behind a gateway its
-/// relative images and stylesheets need a pass, just as an app frame's do. The
-/// host calls this before it builds the preview, and again at half-life to
-/// push a renewal into every open preview.
-///
-/// Classified `Host` in `app_reach`, like `app-frame-capability`. The subject is
-/// fixed here, never read from the caller, so the pass reaches the artifacts
-/// tree and nothing else.
 async fn mint_artifact_preview_capability(headers: HeaderMap) -> Json<FrameCapabilityBody> {
     let prefix = crate::core::base_path::forwarded_prefix(&headers);
     Json(FrameCapabilityBody {
@@ -747,7 +662,6 @@ async fn mint_artifact_preview_capability(headers: HeaderMap) -> Json<FrameCapab
     })
 }
 
-/// Routes for the `/apps`, `/app*` and `/app-capture` surfaces.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/apps", get(list_apps))
@@ -757,7 +671,6 @@ pub(super) fn router() -> Router<AppState> {
             "/app/:app_id/source",
             get(read_app_source).put(write_app_source),
         )
-        // App capture endpoints
         .route("/app-capture", post(submit_app_capture))
         .route("/app-frame-capability", get(mint_frame_capability))
         .route(
@@ -766,7 +679,7 @@ pub(super) fn router() -> Router<AppState> {
         )
 }
 
-/// App UI routes nested at top-level `/app/*` (NOT under `/api/v1/`) — file
+/// INVARIANT: App UI routes nested at top-level `/app/*` (NOT under `/api/v1/`) — file
 /// serving must be path-shaped, because relative URLs in app HTML resolve
 /// against the document path.
 pub(super) fn ui_router() -> Router<AppState> {
@@ -782,9 +695,6 @@ mod tests {
 
     #[test]
     fn no_app_can_hold_the_artifact_preview_subject() {
-        // The preview pass is read as a narrower grant by name. An app that could
-        // take the name would have its own bundle refused, and its frame would
-        // carry the preview's reach instead of its own.
         assert!(!is_valid_id(
             lucidos_frame_capability::ARTIFACT_PREVIEW_SUBJECT
         ));
@@ -810,8 +720,6 @@ mod tests {
 
     #[test]
     fn asking_to_download_names_the_file_from_its_path() {
-        // The browser obeys this header, and ignores the link's own `download`
-        // attribute once the frame is cross-origin to the file.
         assert_eq!(
             attachment_disposition(Some(1), "reports/payload.txt").as_deref(),
             Some("attachment; filename=\"payload.txt\"")
@@ -820,8 +728,6 @@ mod tests {
 
     #[test]
     fn a_name_that_could_forge_a_header_parameter_is_refused() {
-        // A quote would close the filename and open a second parameter. The
-        // name comes off disk, so this is belt to `is_path_traversal`'s braces.
         assert_eq!(attachment_disposition(Some(1), "a\"b.txt"), None);
         assert_eq!(attachment_disposition(Some(1), "a\r\nX-Evil: 1"), None);
         assert_eq!(attachment_disposition(Some(1), ""), None);
@@ -829,9 +735,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_app_file_revalidates_rather_than_downloading_again() {
-        // Every surface that lists apps draws their icons from this route. A
-        // `no-store` answer refetched each one on every page load, so a menu of
-        // forty apps opened blank on a phone.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("icon.svg");
         std::fs::write(&path, "<svg/>").unwrap();

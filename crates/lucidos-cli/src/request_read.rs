@@ -1,11 +1,3 @@
-//! `lucidos request-read yes|no`: the turn's *read decision* on this thread's
-//! latest reply.
-//!
-//! The coding-agent counterpart of the chat agent's `request_read` LLM tool,
-//! over `POST /api/v1/threads/<id>/read-request`, which records the same
-//! events (ADR 0409, ADR 0417). `$LUCIDOS_THREAD_ID` names the thread and
-//! there is no `--thread` flag, so a session can only decide for its own reply.
-
 use clap::ValueEnum;
 
 use crate::http::{client as http_client, send_and_print};

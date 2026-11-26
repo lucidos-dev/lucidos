@@ -1,17 +1,13 @@
 #![cfg(any(test, feature = "test-support"))]
 
-//! EventBus fixtures shared by the core and orchestration tests.
-
 use super::event_bus::{BusEvent, EventBus};
 use super::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent, WakeMode};
 use uuid::Uuid;
 
-/// Create a parent Chat thread and a child thread, returning (parent_id, child_id).
 pub async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uuid, Uuid) {
     spawn_parent_child_with_mode(bus, child_channel, None).await
 }
 
-/// [`spawn_parent_child`], with the child spawned under `wake_mode`.
 pub async fn spawn_parent_child_with_mode(
     bus: &EventBus,
     child_channel: EventChannel,
@@ -49,7 +45,6 @@ pub async fn spawn_parent_child_with_mode(
     (parent_id, child_id)
 }
 
-/// Start `child_id` as a child of the existing thread `parent_id`.
 pub async fn spawn_child_of(
     bus: &EventBus,
     parent_id: Uuid,
@@ -106,7 +101,6 @@ pub async fn emit_cc_session_started(bus: &EventBus, child_id: Uuid) {
     .unwrap();
 }
 
-/// Helper: emit a MessageReceived event for a thread with an optional parent.
 pub async fn emit_thread_message(
     bus: &EventBus,
     thread_id: Uuid,
@@ -118,7 +112,6 @@ pub async fn emit_thread_message(
         .unwrap();
 }
 
-/// The human chat `MessageReceived` that [`emit_thread_message`] emits.
 pub fn thread_message(thread_id: Uuid, parent: Option<Uuid>, text: &str) -> BusEvent {
     BusEvent::Thread {
         thread_id,
@@ -144,10 +137,6 @@ pub fn thread_message(thread_id: Uuid, parent: Option<Uuid>, text: &str) -> BusE
     }
 }
 
-/// Helper: emit CodingAgentIdled with the given flags. When `has_changes=true`,
-/// also emits a synthetic `ChangeProposed` to mirror the production CC
-/// lifecycle (idle → propose). The `proposed` change state follows the pending
-/// `changes` row that proposal writes. [`emit_cc_idled`] is the idle alone.
 pub async fn emit_cc_idle(
     bus: &EventBus,
     thread_id: Uuid,
@@ -166,7 +155,6 @@ pub async fn emit_cc_idle(
     }
 }
 
-/// Emit CodingAgentIdled only, with no proposal behind it.
 pub async fn emit_cc_idled(
     bus: &EventBus,
     thread_id: Uuid,
@@ -193,14 +181,10 @@ pub async fn emit_cc_idled(
     .unwrap();
 }
 
-/// The `changes` row id [`emit_change_proposed`] writes for `thread_id`.
 pub fn test_change_id(thread_id: Uuid) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, thread_id.as_bytes())
 }
 
-/// Emit a vanilla `ChangeProposed` for `thread_id` and wait for it to land.
-/// `change_id` is derived from `thread_id`, so repeated proposals on one thread
-/// reuse one `changes` row, and [`test_change_id`] names it for a resolve.
 pub async fn emit_change_proposed(
     bus: &EventBus,
     thread_id: Uuid,
@@ -231,8 +215,6 @@ pub async fn emit_change_proposed(
     .unwrap();
 }
 
-/// Emit a Claude Code `MessageReceived` for the blocking-count tests. The
-/// channel sets the projected source used by the orphan-waiting reset.
 pub async fn emit_cc_message_received(
     bus: &EventBus,
     thread_id: Uuid,

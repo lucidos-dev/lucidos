@@ -1,11 +1,3 @@
-//! `awaited_by_parent` and `awaited_children_count`: the children a parent
-//! waits on (ADR 0672).
-//!
-//! A child is awaited when its finish wakes the parent and it is unfinished:
-//! active, holding a live event wait, or awaiting a child of its own. The last
-//! clause climbs any depth. A `no-wake` child is never awaited.
-//! See `docs/plans/2026-11-13-a-parent-waits-on-what-will-wake-it.md`.
-
 use super::super::*;
 use super::*;
 use crate::core::event_subscription::EventSubscription;
@@ -103,7 +95,6 @@ async fn detach(bus: &EventBus, parent_id: Uuid, child_id: Uuid) {
     .unwrap();
 }
 
-/// Start a running coding-agent child of `parent_id` under `wake_mode`.
 async fn spawn_running_child(bus: &EventBus, parent_id: Uuid, wake_mode: Option<WakeMode>) -> Uuid {
     let child_id = Uuid::new_v4();
     spawn_child_of(
@@ -118,8 +109,6 @@ async fn spawn_running_child(bus: &EventBus, parent_id: Uuid, wake_mode: Option<
     child_id
 }
 
-/// The reported shape: an idle top thread, an idle `wake` child that already
-/// reported, and a running `wake` grandchild.
 async fn spawn_reported_family(bus: &EventBus) -> (Uuid, Uuid, Uuid) {
     let (top, child) =
         spawn_parent_child_with_mode(bus, EventChannel::ClaudeCode, Some(WakeMode::Wake)).await;
@@ -152,7 +141,6 @@ async fn a_running_wake_child_is_awaited() {
     teardown_test_db(&db_name).await;
 }
 
-/// A child from before wake modes decides per turn, so it may wake.
 #[tokio::test]
 async fn a_child_with_no_stored_wake_mode_is_awaited() {
     let (pool, db_name) = setup_test_db().await;
@@ -166,8 +154,6 @@ async fn a_child_with_no_stored_wake_mode_is_awaited() {
     teardown_test_db(&db_name).await;
 }
 
-/// Nothing wakes the parent of a `no-wake` child, so it does not wait on it.
-/// The child still holds a child slot (ADR 0380).
 #[tokio::test]
 async fn a_running_no_wake_child_is_not_awaited() {
     let (pool, db_name) = setup_test_db().await;
@@ -185,8 +171,6 @@ async fn a_running_no_wake_child_is_not_awaited() {
     teardown_test_db(&db_name).await;
 }
 
-/// The user's report. The grandchild's finish starts a new turn on the child,
-/// which reports to the top thread again. So the top thread waits.
 #[tokio::test]
 async fn a_top_thread_waits_on_a_running_grandchild_behind_an_idle_child() {
     let (pool, db_name) = setup_test_db().await;
@@ -258,8 +242,6 @@ async fn the_roll_up_reaches_the_root_of_a_four_level_chain() {
 
     assert_eq!(awaited_children(&pool, root).await, 1);
 
-    // Each finish wakes the level above, until the chain's last turn ends.
-    // The test bus starts no woken turn, so its start event is emitted here.
     emit_cc_idle(&bus, third, false, None).await;
     for id in [second, first] {
         assert_eq!(awaited_children(&pool, root).await, 1);
@@ -278,7 +260,6 @@ async fn the_roll_up_reaches_the_root_of_a_four_level_chain() {
     teardown_test_db(&db_name).await;
 }
 
-/// A `no-wake` grandchild wakes nobody, so it stops the climb above it.
 #[tokio::test]
 async fn a_no_wake_grandchild_leaves_both_ancestors_idle() {
     let (pool, db_name) = setup_test_db().await;
@@ -297,7 +278,6 @@ async fn a_no_wake_grandchild_leaves_both_ancestors_idle() {
     teardown_test_db(&db_name).await;
 }
 
-/// A child idling on a wait has not finished (ADR 0254), at any depth.
 #[tokio::test]
 async fn a_wait_on_the_grandchild_keeps_both_ancestors_waiting_until_it_ends() {
     let (pool, db_name) = setup_test_db().await;
@@ -389,8 +369,6 @@ async fn each_awaited_child_counts_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// The frontend reads the count off each ancestor's aggregate. Without a
-/// rebroadcast the top thread's dot would move only on reload.
 #[tokio::test]
 async fn the_grandchild_finishing_rebroadcasts_both_ancestors() {
     let (pool, db_name) = setup_test_db().await;
@@ -431,8 +409,6 @@ async fn a_top_thread_holding_a_wait_is_nobodys_awaited_child() {
     teardown_test_db(&db_name).await;
 }
 
-/// The boot rebuild and the live climb share one predicate, so a rebuild from
-/// zeroed or drifted columns lands where the live projection stood.
 #[tokio::test]
 async fn the_rebuild_reaches_the_live_values_from_drifted_columns() {
     let (pool, db_name) = setup_test_db().await;
@@ -474,9 +450,6 @@ async fn the_rebuild_reaches_the_live_values_from_drifted_columns() {
     teardown_test_db(&db_name).await;
 }
 
-/// A legacy family stores a wrong `depth`: its backfill gave every child
-/// depth 1, grandchildren included. The rebuild must still reach the live
-/// values, so it cannot order its levels by `depth`.
 #[tokio::test]
 async fn the_rebuild_ignores_a_legacy_depth() {
     let (pool, db_name) = setup_test_db().await;

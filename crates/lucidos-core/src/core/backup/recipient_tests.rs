@@ -1,8 +1,6 @@
 use super::*;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// Every text the database holds about the recipient: the table and the
-/// events. A backup key must appear in none of it.
 async fn everything_stored(pool: &PgPool) -> String {
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT row_to_json(b)::text FROM backup_recipient b \
@@ -74,8 +72,6 @@ async fn confirming_with_nothing_pending_changes_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// Rotation is a second setup. The old recipient keeps sealing until the new
-/// key comes back, so backups never pause for a rotation.
 #[tokio::test]
 async fn a_rotation_keeps_the_old_recipient_until_the_new_key_returns() {
     let (pool, db) = setup_test_db().await;
@@ -139,8 +135,6 @@ async fn an_own_recipient_needs_no_paste_back_and_drops_a_pending_pair() {
     teardown_test_db(&db).await;
 }
 
-/// The invariant behind the whole design: setup, verify and rotate leave no
-/// backup key in any table or event.
 #[tokio::test]
 async fn no_backup_key_is_ever_stored() {
     let (pool, db) = setup_test_db().await;

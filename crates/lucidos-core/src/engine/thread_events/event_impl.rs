@@ -2,26 +2,20 @@ use serde_json::Value;
 
 use super::{EventMeta, ThreadEvent};
 
-/// The one tool whose args the inline render reads, so the args strip spares it.
 const GENERATE_IMAGE_TOOL: &str = "generate_image";
 
-/// The `reason` on a *cache keep-alive* turn's `CodingAgentIdled`.
 pub const KEEP_ALIVE_IDLE_REASON: &str = "cache_keep_alive";
 
-/// The `reason` on a *ceiling re-entry* turn's `CodingAgentIdled` (ADR 0629).
 pub const CEILING_REENTRY_IDLE_REASON: &str = "ceiling_reentry";
 
-/// The idle reasons of an engine turn: the agent did no work the user asked
+/// INVARIANT: The idle reasons of an engine turn: the agent did no work the user asked
 /// for, so no trigger, event wait or turn gap reads its idle.
 const ENGINE_TURN_IDLE_REASONS: [&str; 2] = [KEEP_ALIVE_IDLE_REASON, CEILING_REENTRY_IDLE_REASON];
 
-/// The events that end a *cache keep-alive* turn: a card the agent raised
-/// anyway. The thread now waits on a person, so the card and the turn after
-/// it show.
 pub const KEEP_ALIVE_ENDING_EVENT_TYPES: &[&str] =
     &["UserQuestionAsked", "CodingAgentPermissionRequest"];
 
-/// SQL true for every `events` row but an engine turn's idle, for each scan
+/// INVARIANT: SQL true for every `events` row but an engine turn's idle, for each scan
 /// that must agree with [`ThreadEvent::is_engine_turn_idle`]. `prefix` names
 /// the table alias with its dot, or is empty.
 pub fn not_an_engine_turn_idle_sql(prefix: &str) -> String {
@@ -35,12 +29,6 @@ pub fn not_an_engine_turn_idle_sql(prefix: &str) -> String {
 }
 
 impl ThreadEvent {
-    /// Names of the four `Response*` events that close a request. A chat turn
-    /// ends on one, and so does a coding-agent turn, which stamps its channel.
-    /// Excludes the coding-agent lifecycle events (`CodingAgentIdled`,
-    /// `SessionEnded`), which `chat::recovery::recover_orphaned_threads`
-    /// enumerates itself. A caller that wants only one agent's turns filters
-    /// on the channel, as `agent_session::turn_gap` does.
     pub const TERMINATOR_EVENT_TYPES: &'static [&'static str] = &[
         "ResponseGenerated",
         "ResponseCanceled",
@@ -48,75 +36,20 @@ impl ThreadEvent {
         "ResponseFailed",
     ];
 
-    /// Event names that mean a previously-emitted `UserQuestionAsked` is no
-    /// longer the latest interactive point on the thread — either the
-    /// surrounding turn ended (terminal), or the agent kept emitting
-    /// progression events past it (CC's parallel-tool-call race: the model
-    /// emitted `AskUserQuestion` alongside sibling tool_uses in one assistant
-    /// message; the hook blocked the question but the siblings dispatched).
-    /// Once any of these lands after a question, the next typed user text
-    /// must start a fresh follow-up rather than be routed as a `FreeText`
-    /// answer to the dead question. Three consumers:
-    ///
-    /// * `agent_question::lookup_active_question_tool_use_id` (the CC chat
-    ///   FreeText fast-path in `chat::process.rs`). `lookup_pending_question_…`
-    ///   is intentionally broader and ignores this list, so archive's
-    ///   cancel-stamp still works on overtaken questions.
-    /// * `crate::engine::question_park_sql::unanswered_question_exists_sql`, the restart preserve
-    ///   guard, which unions this list with three extras of its own. So a name
-    ///   added or removed here also moves the boundary between "this thread is
-    ///   a preserved checkpoint across a restart" and "this is an ordinary
-    ///   interrupted turn"; check that side too.
-    ///
-    /// * `question_park_sql::open_posted_card_sql`, the single definition of an
-    ///   open card (ADR 0803). It closes an agent's card on these events, and
-    ///   never a card Lucidos raised.
-    ///
-    /// The frontend imports the list as generated `QUESTION_OVERTAKEN_EVENT_TYPES`
-    /// (`store/thread-events/exchange-grouping.ts`). There it decides whether
-    /// the card renders struck through, and whether it reads "Needs your answer".
-    ///
-    /// `ResponseGenerated` is omitted because `UserQuestionAsked` is currently
-    /// CC-only on the production path; CC turns end with `CodingAgentIdled`,
-    /// not `ResponseGenerated`. That reasoning is scoped to the consumers
-    /// above; the preserve guard cannot afford the assumption, which is why it
-    /// adds `ResponseGenerated` / `SessionEnded` / `UserQuestionAnswered` in
-    /// `question_park_sql` rather than widening this list. The
-    /// chat-agent variants below are included for symmetry: the agentic loop
-    /// blocks sequentially on `ask_user_question` today, but the uniform list
-    /// defends against future regressions.
-    ///
-    /// `CodingAgentToolResult` is NOT in the set either. A result completes a
-    /// call issued earlier, and any call issued after the question is already
-    /// listed through its `CodingAgentToolCalled`. A result overtakes a question
-    /// only when it is the question's OWN result (Claude Code's rejection of an
-    /// Esc'd `AskUserQuestion`), which pairs by `tool_use_id`: see
-    /// [`Self::question_own_result_sql`].
-    ///
-    /// `UserQuestionAsked` is NOT in the set: the SQL's
-    /// `ORDER BY sequence DESC LIMIT 1` already picks the latest unanswered
-    /// question, so a replacement naturally takes over without an explicit
-    /// orphaning entry.
     pub const QUESTION_OVERTAKEN_EVENT_TYPES: &'static [&'static str] = &[
-        // Terminal (both agents)
         "ResponseAborted",
         "ResponseCanceled",
         "ResponseFailed",
         "CodingAgentIdled",
-        // CC progression — the parallel-tool-call race
         "CodingAgentTextStreamed",
         "CodingAgentToolCalled",
         "CodingAgentPromptSent",
-        // Chat-agent progression (symmetry; harmless on CC threads)
         "TextStreamed",
         "ThoughtStreamed",
         "ToolCalled",
         "ToolResult",
     ];
 
-    /// SQL for "`later` is the result of the call that asked `question`": the
-    /// one `CodingAgentToolResult` that ends a question without a new action by
-    /// the agent. Both arguments are table aliases over `events`.
     pub fn question_own_result_sql(question: &str, later: &str) -> String {
         format!(
             "({later}.event_type = 'CodingAgentToolResult' AND {})",
@@ -127,22 +60,16 @@ impl ThreadEvent {
         )
     }
 
-    /// SQL for "a result carrying `result_id` is the own result of `question`",
-    /// for a reader that holds the result's id rather than its row.
-    /// `question` is a table alias over `events`, `result_id` any SQL text.
     pub fn question_owns_result_id_sql(question: &str, result_id: &str) -> String {
         format!("({question}.payload->>'tool_use_id' = {result_id})")
     }
 
-    /// Drop a tool result's text from its serialized payload and mark it, so a
-    /// reader fetches it by event id. The snapshot and the live stream both
-    /// call this, which keeps a stripped result one shape everywhere.
     pub fn strip_result_text(payload: &mut serde_json::Map<String, Value>) {
         payload.remove("result");
         payload.insert("result_stripped".to_string(), Value::Bool(true));
     }
 
-    /// Drop a tool call's `args` from its serialized payload and mark it, so the
+    /// INVARIANT: Drop a tool call's `args` from its serialized payload and mark it, so the
     /// step modal fetches them from `GET /api/v1/events/:event_id/tool-args`.
     /// The snapshot and the live stream both call this, which keeps a stripped
     /// call one shape everywhere. A no-op for any other event type.
@@ -160,7 +87,7 @@ impl ThreadEvent {
             _ => return,
         };
         let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
-        // The generated image takes its alt text from the call's prompt, so
+        // INVARIANT: The generated image takes its alt text from the call's prompt, so
         // this one tool's args are read inline and stay.
         if name == GENERATE_IMAGE_TOOL {
             return;
@@ -178,7 +105,6 @@ impl ThreadEvent {
         payload.insert("args_stripped".to_string(), Value::Bool(true));
     }
 
-    /// Returns the variant name as a string, matching the DB `event_type` column.
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::MessageReceived { .. } => "MessageReceived",
@@ -225,8 +151,8 @@ impl ThreadEvent {
             Self::ThreadArchived => "ThreadArchived",
             Self::ThreadArchiveRequested => "ThreadArchiveRequested",
             Self::ThreadUnarchived => "ThreadUnarchived",
-            Self::ThreadReadRequested => "ThreadReadRequested",
-            Self::ThreadReadNotRequested => "ThreadReadNotRequested",
+            Self::ThreadReadRequested { .. } => "ThreadReadRequested",
+            Self::ThreadReadNotRequested { .. } => "ThreadReadNotRequested",
             Self::ParentWakeRequested => "ParentWakeRequested",
             Self::ParentWakeNotRequested => "ParentWakeNotRequested",
             Self::ThreadReplySeen { .. } => "ThreadReplySeen",
@@ -348,7 +274,6 @@ impl ThreadEvent {
             Self::ThreadMcpServerEnabled { .. } => "ThreadMcpServerEnabled",
             Self::ThreadMcpServerDisabled { .. } => "ThreadMcpServerDisabled",
             Self::HomeBoardArranged { .. } => "HomeBoardArranged",
-            // Transient
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
             Self::PreambleCompleted => "PreambleCompleted",
@@ -363,20 +288,6 @@ impl ThreadEvent {
         }
     }
 
-    /// Every wire `type` name this enum can produce.
-    ///
-    /// `validate_emittable_event_type` refuses all of them, so an app UI cannot
-    /// write a *domain* event under a thread-event name. Such a row is
-    /// permanent, and its `aggregate_id` is the event-type STRING rather than a
-    /// thread uuid. One `emit_event("EventWaitStarted", ...)` therefore breaks
-    /// every later query that casts `aggregate_id::uuid` on that name.
-    ///
-    /// The transient variants are here too. They are never persisted as thread
-    /// rows, but the deny list is about the NAME. A domain row carrying one
-    /// poisons a future query just as well.
-    ///
-    /// `reserved_type_names_cover_every_variant` recovers the real variant list
-    /// from serde and fails if this one has drifted.
     pub const RESERVED_TYPE_NAMES: &'static [&'static str] = &[
         "MessageReceived",
         "QueuedMessageRemoved",
@@ -558,7 +469,7 @@ impl ThreadEvent {
         "HomeBoardArranged",
     ];
 
-    /// The `#[serde(alias = ...)]` spellings, kept for rows written before a
+    /// INVARIANT: The `#[serde(alias = ...)]` spellings, kept for rows written before a
     /// rename.
     ///
     /// Denied at the emit boundary alongside the current names. An alias
@@ -602,17 +513,10 @@ impl ThreadEvent {
         "WidgetRestored",
     ];
 
-    /// Whether `name` is a `ThreadEvent` wire name, current or legacy.
     pub fn is_reserved_type_name(name: &str) -> bool {
         Self::RESERVED_TYPE_NAMES.contains(&name) || Self::LEGACY_TYPE_NAME_ALIASES.contains(&name)
     }
 
-    /// The `event_type` names of the four side-question events, for readers
-    /// that filter in SQL. `is_side_question_event` is the typed twin.
-    ///
-    /// No agent may see these rows, and none may count as thread activity.
-    /// Every reader that walks a thread's events generically excludes them,
-    /// each pinned by a test that feeds it these rows.
     pub const SIDE_QUESTION_EVENT_TYPES: &'static [&'static str] = &[
         "SideQuestionAsked",
         "SideQuestionAnswered",
@@ -620,18 +524,12 @@ impl ThreadEvent {
         "SideQuestionDismissed",
     ];
 
-    /// The notes a fan-in leaves on a parent that wake nothing. A note after
-    /// an unprocessed `ChildThreadCompleted` is no reaction to it, so readers
-    /// asking "is that card the parent's last word" skip them.
     pub const PARENT_NOTE_EVENT_TYPES: &'static [&'static str] = &[
         "ChildThreadStopped",
         "ChildThreadDetached",
         "ChildReportFiled",
     ];
 
-    /// Whether this is the idle an engine turn ends with: a *cache keep-alive*
-    /// or a *ceiling re-entry*. No agent, trigger or event wait may read it as
-    /// the agent finishing.
     pub fn is_engine_turn_idle(&self) -> bool {
         matches!(
             self,
@@ -640,8 +538,6 @@ impl ThreadEvent {
         )
     }
 
-    /// Whether this is one of the four side-question events, which no agent,
-    /// trigger or event wait may ever see.
     pub fn is_side_question_event(&self) -> bool {
         matches!(
             self,
@@ -652,11 +548,6 @@ impl ThreadEvent {
         )
     }
 
-    /// Whether this variant fires once per streamed text chunk (many fires per
-    /// turn). Used by the scheduler's trigger gate to short-circuit the
-    /// matcher for the per-token firehose — see
-    /// `crates/lucidos-engine/src/scheduler/mod.rs`. Adding a new per-token
-    /// streaming variant to the enum? Add it here too.
     pub fn is_per_token_streaming(&self) -> bool {
         matches!(
             self,
@@ -667,10 +558,6 @@ impl ThreadEvent {
         )
     }
 
-    /// Whether this variant moves an input of the completed-sub-thread archive
-    /// rule that its summary row does not hold: a question card (the orphaned
-    /// question scan) or a `changes` row. The projection then recounts the
-    /// ancestors' archivable counts even when the row's own sample is unchanged.
     pub fn moves_archive_input_off_summary(&self) -> bool {
         matches!(
             self,
@@ -686,9 +573,6 @@ impl ThreadEvent {
         )
     }
 
-    /// Whether this event should be persisted to the DB.
-    /// All variants are past-tense (events-only model); persistence is
-    /// orthogonal to tense. Transient variants live on SSE only.
     pub fn is_persisted(&self) -> bool {
         !matches!(
             self,
@@ -706,7 +590,7 @@ impl ThreadEvent {
         )
     }
 
-    /// The only `event_type` names [`Self::indexable_text`] returns text for.
+    /// INVARIANT: The only `event_type` names [`Self::indexable_text`] returns text for.
     /// It checks this list first, so a memory rebuild that filters on it in
     /// SQL indexes exactly what the live consumer does. A new arm there needs
     /// its name here too, or it never fires.
@@ -723,23 +607,15 @@ impl ThreadEvent {
         "ImageDescribed",
     ];
 
-    /// Returns the text content to index into memory, if this event type is indexable.
-    /// Used by both the live memory consumer and the rebuild path.
     pub fn indexable_text(&self) -> Option<&str> {
         if !Self::INDEXABLE_EVENT_TYPES.contains(&self.event_type()) {
             return None;
         }
         match self {
             Self::MessageReceived { text, .. } => Some(text),
-            // What the caller said on a CALL, which is the same fact in the
-            // other input mode. A delegated utterance was indexed through the
-            // `MessageReceived` beside it until ADR 0201 stopped writing one.
-            // Without this arm nothing spoken reaches memory at all.
             Self::SpokenMessageReceived { text, .. } => Some(text),
-            // What people said to each other in the thread. The agent reads
-            // it as context, so memory holds it too.
             Self::UserOnlyMessagePosted { text, .. } => Some(text),
-            // A `PromptInjected` carrying `injected_message_id` is an
+            // INVARIANT: A `PromptInjected` carrying `injected_message_id` is an
             // ACKNOWLEDGEMENT of a `MessageReceived` that is already persisted
             // and already indexed, with the same text copied verbatim. Indexing
             // it again files the user's sentence into memory twice. The engine
@@ -757,16 +633,11 @@ impl ThreadEvent {
             Self::ChildThreadCompleted { summary, .. } | Self::ChildReportFiled { summary, .. } => {
                 Some(summary)
             }
-            // Image descriptions carry real shared content (screenshots,
-            // tickets, photos). Index them so an image-only turn isn't a
-            // memory black hole — the title path already folds them in.
             Self::ImageDescribed { description, .. } => Some(description),
             _ => None,
         }
     }
 
-    /// A stored row back as its typed event: the inverse of [`Self::to_payload`].
-    /// The row keeps its type in the `event_type` column, not the payload.
     pub fn from_stored(
         event_type: &str,
         mut payload: Value,
@@ -778,8 +649,6 @@ impl ThreadEvent {
         Ok(serde_json::from_value(payload)?)
     }
 
-    /// This `UserQuestionAsked` as a *queued card*. Any other event comes back
-    /// unchanged.
     pub fn into_queued(self) -> Self {
         match self {
             Self::UserQuestionAsked {
@@ -805,8 +674,6 @@ impl ThreadEvent {
         }
     }
 
-    /// This *queued card* as the `UserQuestionAsked` that posts it. Any other
-    /// event comes back unchanged.
     pub fn queued_into_asked(self) -> Self {
         match self {
             Self::UserQuestionQueued {
@@ -832,7 +699,6 @@ impl ThreadEvent {
         }
     }
 
-    /// Serializes to JSON payload for DB storage, stripping the "type" tag.
     pub fn to_payload(&self, meta: &EventMeta) -> Value {
         let mut v = serde_json::to_value(self).expect("ThreadEvent serialization cannot fail");
         if let Some(obj) = v.as_object_mut() {

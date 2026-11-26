@@ -1,57 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { postWithUploadProgress, UPLOAD_STALL_MS, UPLOAD_RESPONSE_MS } from './uploadProgress';
+import {
+  postWithUploadProgress,
+  sendWithUploadProgress,
+  uploadErrorMessage,
+  UPLOAD_RESPONSE_MS,
+  UPLOAD_STALLED_MESSAGE,
+  UPLOAD_STALL_MS,
+  UPLOAD_TOO_LARGE_MESSAGE,
+  UPLOAD_UNREACHABLE_MESSAGE,
+} from './uploadProgress';
+import { SdkError } from '../../../../../packages/lucidos-sdk/src/_fetch';
 import { ApiError, isTransientFetchError, throwIfNotOk } from './_core';
 
 import { observeSourceGeneration } from '../../utils/restoreSourceGeneration';
 import { installRestoreAdmission } from '../../utils/restoreAdmission';
-
-type Handler = ((e: any) => void) | null;
-
-class FakeXhr {
-  static last: FakeXhr | null = null;
-  upload: { onprogress: Handler; onload: Handler } = { onprogress: null, onload: null };
-  onload: Handler = null;
-  onerror: Handler = null;
-  onabort: Handler = null;
-  method = '';
-  url = '';
-  requestHeaders: Record<string, string> = {};
-  body: unknown = null;
-  aborted = false;
-  status = 0;
-  statusText = '';
-  responseText = '';
-  private rawHeaders = '';
-
-  open(method: string, url: string) { this.method = method; this.url = url; }
-  setRequestHeader(k: string, v: string) { this.requestHeaders[k] = v; }
-  send(body: unknown) { this.body = body; FakeXhr.last = this; }
-  abort() { this.aborted = true; this.onabort?.({}); }
-  getAllResponseHeaders() { return this.rawHeaders; }
-
-  progress(loaded: number, total: number) {
-    this.upload.onprogress?.({ lengthComputable: true, loaded, total });
-  }
-  bodySent() { this.upload.onload?.({}); }
-  respond(status: number, body: string, headers: Record<string, string> = {}) {
-    this.status = status;
-    this.responseText = body;
-    this.rawHeaders = Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join('\r\n');
-    this.onload?.({});
-  }
-  dropConnection() { this.onerror?.({}); }
-}
-
-function current(): FakeXhr {
-  if (!FakeXhr.last) throw new Error('no request was sent');
-  return FakeXhr.last;
-}
-
-async function sent(): Promise<FakeXhr> {
-  await vi.advanceTimersByTimeAsync(0);
-  return current();
-}
+import { FakeXhr, installFakeXhr, sent, uninstallFakeXhr } from './__tests__/fakeXhr';
 
 describe('postWithUploadProgress', () => {
   beforeEach(() => {
@@ -179,5 +143,64 @@ describe('postWithUploadProgress', () => {
     const err = await throwIfNotOk(await p).catch((e) => e);
     expect(isTransientFetchError(err)).toBe(true);
     expect((err as ApiError).reason).not.toContain('<');
+  });
+});
+
+describe('sendWithUploadProgress', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    installFakeXhr();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    uninstallFakeXhr();
+  });
+
+  it('sends the method and headers it is given, and no workspace headers', async () => {
+    const p = sendWithUploadProgress({ method: 'PATCH', url: '/~/u', headers: { 'Upload-Offset': '0' }, body: new Blob(['x']) });
+    const xhr = await sent();
+    expect(xhr.method).toBe('PATCH');
+    expect(xhr.requestHeaders).toEqual({ 'Upload-Offset': '0' });
+    xhr.respond(204, '');
+    expect((await p).status).toBe(204);
+  });
+
+  it('rejects at once when the caller already cancelled', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(sendWithUploadProgress({ method: 'POST', url: '/u', body: 'x' }, { signal: controller.signal })).rejects.toBeTruthy();
+    expect(FakeXhr.last).toBeNull();
+  });
+});
+
+describe('uploadErrorMessage', () => {
+  async function refusal(status: number, body: string, contentType = 'text/html'): Promise<unknown> {
+    return throwIfNotOk(new Response(body, { status, headers: { 'content-type': contentType } })).catch((e) => e);
+  }
+
+  it('names a proxy body cap for an HTML 413', async () => {
+    expect(uploadErrorMessage(await refusal(413, '<html>Request Entity Too Large</html>'))).toBe(UPLOAD_TOO_LARGE_MESSAGE);
+  });
+
+  it('names a proxy that gave up for an HTML 502 or 504', async () => {
+    expect(uploadErrorMessage(await refusal(502, '<html>Bad gateway</html>'))).toContain('HTTP 502');
+    expect(uploadErrorMessage(await refusal(504, '<html>Gateway timeout</html>'))).toContain('HTTP 504');
+  });
+
+  it("keeps Lucidos's own sentence when the refusal carries one", async () => {
+    const err = await refusal(502, '{"error":"lab refused the request"}', 'application/json');
+    expect(uploadErrorMessage(err)).toBe('lab refused the request');
+  });
+
+  it('maps an SDK refusal by its status too', () => {
+    expect(uploadErrorMessage(new SdkError(413, 'Payload Too Large'))).toBe(UPLOAD_TOO_LARGE_MESSAGE);
+  });
+
+  it('says Lucidos could not be reached for a dropped connection', () => {
+    expect(uploadErrorMessage(new TypeError('Failed to fetch'))).toBe(UPLOAD_UNREACHABLE_MESSAGE);
+  });
+
+  it('passes a stall through with its own sentence', () => {
+    expect(uploadErrorMessage(new DOMException(UPLOAD_STALLED_MESSAGE, 'TimeoutError'))).toBe(UPLOAD_STALLED_MESSAGE);
   });
 });

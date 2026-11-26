@@ -1,23 +1,3 @@
-//! The loopback CA: a per-user certificate authority that signs what every
-//! Lucidos loopback listener serves (ADR 0745).
-//!
-//! Its name constraints permit only `localhost`, 127.0.0.0/8 and ::1/128. So
-//! the user's trust in it covers this machine's loopback alone, and a stolen
-//! key cannot vouch for a real site.
-//!
-//! It lives in the private entry `loopback-ca`: a storage root holding
-//! `ca.pem` and the 0600 `ca-key.pem`. The private subtree holds every secret,
-//! and an agent's sandbox denies it (ADR 0645). Every gateway the user runs
-//! shares the one CA. A load refuses a key another user could read, naming
-//! the cure. The certificate is public, so [`LoopbackCa::ensure`] also
-//! publishes a copy outside the private subtree ([`PUBLIC_CERT_FILE`]).
-//!
-//! It signs the gateway's loopback leaf, minted in memory ([`LeafResolver`]),
-//! and the preview's leaf, the one leaf key on disk
-//! ([`LoopbackCa::write_preview_leaf`]). [`trust`] adds the certificate to the
-//! user's own store, never a machine-wide one. Every in-tree client of a
-//! loopback listener builds through `lucidos_local_token::client`.
-
 mod der;
 mod leaf;
 pub mod trust;
@@ -36,23 +16,16 @@ use rcgen::{
 };
 use rustls::pki_types::CertificateDer;
 
-/// The certificate's file name inside the CA directory.
 pub const CERT_FILE: &str = "ca.pem";
 
-/// The signing key's file name inside the CA directory.
 pub const KEY_FILE: &str = "ca-key.pem";
 
-/// The CA's common name, and its nickname in an NSS database.
 pub const COMMON_NAME: &str = "Lucidos loopback CA";
 
-/// The lock every creator holds across its read, create and publish.
 const LOCK_FILE: &str = ".ca.lock";
 
-/// How long the CA itself is valid. Only leaves fall under Apple's 825-day cap.
 const CA_LIFETIME: Duration = Duration::from_secs(20 * 365 * 24 * 60 * 60);
 
-/// The directory holding the CA's certificate and key, and where the public
-/// copy of the certificate goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaDir {
     dir: PathBuf,
@@ -60,18 +33,12 @@ pub struct CaDir {
 }
 
 impl CaDir {
-    /// The private entry `loopback-ca`, and the public copy where
-    /// [`lucidos_local_token::loopback_cert::public_cert_path`] puts it.
-    /// `None` only when `HOME` is unset and nothing relocates the private
-    /// subtree.
     pub fn resolve() -> Option<CaDir> {
         let dir = lucidos_home::private_entry(lucidos_home::private::LOOPBACK_CA_DIR)?;
         let public_cert = lucidos_local_token::loopback_cert::public_cert_path()?;
         Some(CaDir { dir, public_cert })
     }
 
-    /// An explicit directory, with the public copy beside it. For tests and
-    /// for a caller holding one.
     pub fn at(path: impl Into<PathBuf>) -> CaDir {
         let dir = path.into();
         let public_cert = dir.with_file_name(PUBLIC_CERT_FILE);
@@ -90,22 +57,16 @@ impl CaDir {
         self.dir.join(KEY_FILE)
     }
 
-    /// The public copy of the certificate, readable inside an agent's sandbox.
     pub fn public_cert_path(&self) -> &Path {
         &self.public_cert
     }
 
-    /// The CA certificate as PEM, from the public copy, for a client that
-    /// verifies a loopback listener. Reads nothing private.
     pub fn read_certificate(&self) -> io::Result<String> {
         lucidos_local_token::loopback_cert::read_at(self.public_cert_path())
     }
 }
 
-/// The loaded CA, able to sign leaves.
 pub struct LoopbackCa {
-    /// A certificate with the CA's name and key, used only as the issuer of
-    /// the leaves it signs. The one on disk is what clients trust.
     issuer: rcgen::Certificate,
     key: KeyPair,
     cert_pem: String,
@@ -113,10 +74,6 @@ pub struct LoopbackCa {
 }
 
 impl LoopbackCa {
-    /// Load the CA in `dir`, creating it on first use.
-    ///
-    /// **First creator wins.** Two gateways starting together hold the lock in
-    /// turn, so the second loads what the first published.
     pub fn ensure(dir: &CaDir) -> io::Result<LoopbackCa> {
         lucidos_home::ensure_storage_root(dir.path())?;
         let lock = std::fs::OpenOptions::new()
@@ -134,7 +91,6 @@ impl LoopbackCa {
         Ok(ca)
     }
 
-    /// Load the CA in `dir`, refusing a key anyone else could read.
     pub fn load(dir: &CaDir) -> io::Result<LoopbackCa> {
         check_owner_only(dir)?;
         let key_pem = std::fs::read_to_string(dir.key_path())?;
@@ -191,8 +147,6 @@ impl LoopbackCa {
     }
 }
 
-/// The CA's parameters, apart from its validity. Deterministic, so the issuer
-/// rebuilt at load carries the exact name and key identifier on disk.
 fn ca_params() -> CertificateParams {
     let mut params = CertificateParams::default();
     let mut name = DistinguishedName::new();
@@ -215,14 +169,10 @@ fn ca_params() -> CertificateParams {
     params
 }
 
-/// Write `contents` to `dir/name` at mode 0600 from creation, through a
-/// rename, so no reader sees a partial file.
 fn publish(dir: &CaDir, name: &str, contents: &str) -> io::Result<()> {
     write_through_rename(&dir.path().join(name), contents)
 }
 
-/// Keep the public copy equal to the certificate, rewriting it only when it
-/// differs.
 fn publish_public_copy(dir: &CaDir, cert_pem: &str) -> io::Result<()> {
     let target = dir.public_cert_path();
     if std::fs::read_to_string(target).is_ok_and(|on_disk| on_disk == cert_pem) {
@@ -238,7 +188,6 @@ fn write_through_rename(target: &Path, contents: &str) -> io::Result<()> {
     std::fs::rename(&staged, target)
 }
 
-/// Refuse a CA whose directory or key another user owns or could reach.
 fn check_owner_only(dir: &CaDir) -> io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     check_owner_only_as(dir, unsafe { libc::geteuid() })

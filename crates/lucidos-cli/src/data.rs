@@ -4,12 +4,6 @@ use std::path::PathBuf;
 use crate::http::{client as http_client, send_expect_success};
 use crate::workspace::{BoxError, Workspace};
 
-/// Sub-directories of the workspace's `data/` that the CLI accepts as
-/// already-prefixed when resolving paths. Anything else gets `artifacts/`.
-///
-/// Must equal the engine's `MUTABLE_PREFIXES` in `core/data_prefixes.rs`, the
-/// trees its write route accepts. A test below pins the two together.
-/// `system-knowhow/` is not here: it is engine-shipped and read-only.
 const DATA_PREFIXES: &[&str] = &[
     "artifacts/",
     "apps/",
@@ -22,10 +16,6 @@ const DATA_PREFIXES: &[&str] = &[
     "fonts/",
 ];
 
-/// Validate `relative` and return its normalized, `data/`-rooted store path
-/// (e.g. `loose.txt` → `artifacts/loose.txt`). This store-relative form — with
-/// NO scheme — is the canonical clickable link target in Lucidos chat; see
-/// `chat_link` / `cmd_write`.
 pub(crate) fn normalize_data_path(relative: &str) -> Result<String, BoxError> {
     let trimmed = relative.trim();
     if trimmed.is_empty() {
@@ -44,17 +34,6 @@ pub(crate) fn resolve_data_path(ws: &Workspace, relative: &str) -> Result<PathBu
     Ok(ws.data_dir().join(normalize_data_path(relative)?))
 }
 
-/// Build the ready-to-paste clickable Lucidos chat link for a freshly written
-/// data file. The target is the bare, `data/`-rooted store path (NO scheme):
-/// the frontend's path linkifier rewrites it into a file-preview link. An
-/// invented `artifact:` / `file:` scheme dead-ends — no handler claims it — so
-/// the link MUST stay scheme-less. Label defaults to the file's basename.
-///
-/// An image gets markdown IMAGE syntax, which renders inline. Agents paste this
-/// line verbatim, and a plain link to a picture only opens a preview on tap.
-/// Markdown ends a bare destination at a space, so a path holding one is
-/// angle-bracketed. A known `size` becomes an image size hint, which lets the
-/// card or reply reserve the picture's box before it loads.
 fn chat_link(normalized: &str, size: Option<(usize, usize)>) -> String {
     let label = normalized.rsplit('/').next().unwrap_or(normalized);
     let image = is_image(label);
@@ -74,14 +53,9 @@ fn chat_link(normalized: &str, size: Option<(usize, usize)>) -> String {
     }
 }
 
-/// The largest side the frontend reads in a size hint (five digits).
 const MAX_HINT_SIDE: usize = 99_999;
 
-/// The size a browser draws the picture in `bytes` at, when the header says it
-/// for certain. A picture carrying EXIF data may be turned a quarter by its
-/// orientation tag, which `imagesize` does not read, so it gets no size.
 fn drawn_size(bytes: &[u8]) -> Option<(usize, usize)> {
-    // JPEG's APP1 segment, PNG's `eXIf` chunk, WebP's `EXIF` chunk.
     const EXIF_MARKERS: [&[u8]; 3] = [b"Exif\0\0", b"eXIf", b"EXIF"];
     let head = &bytes[..bytes.len().min(64 * 1024)];
     if EXIF_MARKERS
@@ -94,28 +68,17 @@ fn drawn_size(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((size.width, size.height))
 }
 
-/// Printed after saving a picture. An agent saved one, told the user "I've
-/// drawn out the options", and pasted no image line, so the user saw nothing.
-/// It names no order because stdout and stderr may interleave either way.
-///
-/// The card comes first because a reply written just before a tool call
-/// reaches the user only as a short summary, which drops the picture.
-/// `docs/plans/2026-09-25-a-card-after-a-picture-nobody-saw.md` has the
-/// transcripts.
 const IMAGE_NOT_SHOWN_YET: &str = "The user cannot see this picture yet. If a question card \
      comes next, put the `![...]` line ON the card: in its question, or in an option's \
      `preview`. For a choice, give each option its own picture of only that option. \
      Your words before any tool call reach the user only as a short summary, which drops \
      the picture. Otherwise paste the line in the reply that ends your turn.";
 
-/// Printed after saving any other artifact. An agent saved an HTML explainer
-/// and wrote its link just before a card, so the user got a summary and no link.
 const LINK_NOT_SHOWN_YET: &str = "The user cannot see this file yet. If a question card comes \
      next, put the link line ON the card, in its question. An option shows a link as plain \
      text. Your words before any tool call reach the user only as a short summary, which \
      drops the link. Otherwise paste the line in the reply that ends your turn.";
 
-/// The reminder for a freshly saved file, if the user is meant to see it.
 fn not_shown_yet(normalized: &str) -> Option<&'static str> {
     if is_image(normalized) {
         Some(IMAGE_NOT_SHOWN_YET)
@@ -126,8 +89,6 @@ fn not_shown_yet(normalized: &str) -> Option<&'static str> {
     }
 }
 
-/// Mirrors `IMAGE_EXTENSIONS` in the frontend's `utils/fileIcons.tsx`, and the
-/// engine card gate's `is_picture`, which a test below pins.
 fn is_image(file_name: &str) -> bool {
     const IMAGE_EXTENSIONS: &[&str] = &["gif", "jpeg", "jpg", "png", "svg", "webp"];
     file_name.rsplit_once('.').is_some_and(|(_, ext)| {
@@ -162,12 +123,6 @@ pub(crate) enum WriteSource {
     File(PathBuf),
 }
 
-/// Percent-encode a `data/`-rooted store path for use as URL path segments.
-/// Keeps `/` as the separator and the RFC 3986 unreserved set verbatim; encodes
-/// everything else. Without this a perfectly ordinary artifact name breaks the
-/// request: a space makes an invalid URL, and a `#` would be parsed as the
-/// start of a fragment and silently truncate the path. Axum percent-decodes
-/// `Path<String>` on the way in, so the engine sees the original bytes.
 fn encode_path_segments(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for b in path.bytes() {
@@ -181,28 +136,6 @@ fn encode_path_segments(path: &str) -> String {
     out
 }
 
-/// Write content to a `data/`-rooted path in the PARENT workspace.
-///
-/// Goes through the engine's `PUT /api/v1/data/*path` rather than writing the
-/// file directly, because that route is the *announced* write path: it commits
-/// the file to the `data/` repo and emits `DataFileWritten` plus, for an
-/// `artifacts/` path, the paired `Artifact*` entity event (ADR 0032, "a state
-/// write owns its announcement"). A direct `std::fs::write` here skipped all
-/// three, so a file this command created was invisible to the Files panel, to
-/// the memory index, to an `on_event: ArtifactCreated` trigger, and to git,
-/// until something else forced a reload. Worse, the chat link this very
-/// function prints then failed to resolve against the frontend's artifact cache
-/// and reloaded the whole workspace on click.
-///
-/// ADR 0032's registry (`core/announced_surfaces.rs`) covers `data/` writers in
-/// the ENGINE crate, so it could never have caught this one: the CLI is a
-/// separate binary. Routing through the engine makes it a caller of the
-/// registered writer instead of a second, unregistered one.
-///
-/// Consequence: this needs a running engine, like every other mutating
-/// subcommand (`events emit`, `notify`, `changes apply`). A failed write is a
-/// hard error and prints no chat link, rather than a silent local write nothing
-/// in the workspace knows about.
 pub(crate) fn cmd_write(
     ws: &Workspace,
     relative: &str,
@@ -236,9 +169,6 @@ pub(crate) fn cmd_write(
         .body(bytes);
     let reply = send_expect_success("PUT", &url, req)?;
 
-    // Echo the resolved absolute path on stderr so callers see exactly what was
-    // written, keeping stdout clean for the clickable link below. The path
-    // stays stderr's LAST line, so the notes go before it.
     let mut stderr = io::stderr();
     if let Some(warning) = write_warning(&reply) {
         writeln!(stderr, "{warning}")
@@ -251,16 +181,10 @@ pub(crate) fn cmd_write(
     writeln!(stderr, "{}", abs.display())
         .map_err(|e| format!("Failed to write status to stderr: {}", e))?;
 
-    // Print a ready-to-paste Lucidos chat link (an inline image for a picture)
-    // on stdout, mirroring `lucidos spawn-thread`. This gives the agent a
-    // canonical, working link to hand the user instead of inventing an
-    // `artifact:`/`file:` scheme that the frontend has no handler for.
     println!("{}", chat_link(&normalized, size));
     Ok(())
 }
 
-/// The `warning` a data write's reply carries, such as a knowhow file over the
-/// size cap. The write landed either way.
 fn write_warning(reply: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(reply).ok()?;
     value.get("warning")?.as_str().map(str::to_owned)
@@ -296,7 +220,6 @@ mod tests {
         }
     }
 
-    /// The quoted entries of the list that follows `declaration` in `source`.
     fn quoted_list<'a>(source: &'a str, declaration: &str, quote: char) -> Vec<&'a str> {
         let (_, rest) = source
             .split_once(declaration)
@@ -307,13 +230,6 @@ mod tests {
         entries
     }
 
-    /// The engine's `MUTABLE_PREFIXES` is the list of trees its data route
-    /// accepts. The CLI and the frontend cannot import it, so this test
-    /// reads all three sources. `/harden` runs it for an edit to any of them,
-    /// because the CLI includes them.
-    ///
-    /// A tree missing from a copy gets `artifacts/` in front, so the file
-    /// lands where nothing reads it.
     #[test]
     fn every_data_prefix_list_matches_the_engine() {
         const ENGINE: &str = include_str!("../../lucidos-core/src/core/data_prefixes.rs");
@@ -369,10 +285,6 @@ mod tests {
         assert!(resolve_data_path(&ws, "   ").is_err());
     }
 
-    // Landing the bytes on disk (and creating parent dirs) is the engine's job
-    // now, not this file's: see `cmd_write`. Those assertions live in
-    // `tests/data_write_lands_in_parent.rs`, against a stub engine.
-
     #[test]
     fn encode_path_segments_keeps_separators_and_unreserved_chars() {
         assert_eq!(
@@ -391,9 +303,6 @@ mod tests {
 
     #[test]
     fn encode_path_segments_escapes_the_fragment_and_query_markers() {
-        // Left raw, a `#` truncates the URL at the fragment and a `?` starts a
-        // query string, so the engine would receive a different path than the
-        // one written.
         assert_eq!(
             encode_path_segments("artifacts/a#b?c.md"),
             "artifacts/a%23b%3Fc.md"
@@ -402,8 +311,6 @@ mod tests {
 
     #[test]
     fn encode_path_segments_escapes_non_ascii_bytewise() {
-        // Percent-encoding is defined over BYTES, so a multi-byte char becomes
-        // one escape per UTF-8 byte.
         assert_eq!(
             encode_path_segments("artifacts/å.md"),
             "artifacts/%C3%A5.md"
@@ -425,8 +332,6 @@ mod tests {
 
     #[test]
     fn chat_link_uses_basename_label_and_bare_path_target() {
-        // No scheme on the target — a bare store path is what the frontend
-        // linkifier rewrites to a file preview; `artifact:`/`file:` dead-ends.
         assert_eq!(
             chat_link("artifacts/ticket-workflow/node-types-and-attributes.md", None),
             "[node-types-and-attributes.md](artifacts/ticket-workflow/node-types-and-attributes.md)"
@@ -443,9 +348,6 @@ mod tests {
 
     #[test]
     fn chat_link_for_an_image_is_markdown_image_syntax() {
-        // An agent pastes this line verbatim. A plain link to a picture only
-        // opens a preview on tap, so the user never sees the picture it meant
-        // to show.
         assert_eq!(
             chat_link("artifacts/design/options.png", None),
             "![options.png](artifacts/design/options.png)"
@@ -461,8 +363,6 @@ mod tests {
 
     #[test]
     fn chat_link_with_a_space_brackets_the_target() {
-        // Markdown ends a bare destination at the first space, so the line
-        // would render as literal text. An angle-bracketed one may hold spaces.
         assert_eq!(
             chat_link("artifacts/quarterly chart.png", None),
             "![quarterly chart.png](<artifacts/quarterly chart.png>)"
@@ -503,7 +403,6 @@ mod tests {
         );
     }
 
-    /// The PNG signature plus IHDR, which is all `blob_size` reads.
     fn png_header(w: u32, h: u32) -> Vec<u8> {
         let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
         png.extend_from_slice(&w.to_be_bytes());
@@ -530,8 +429,6 @@ mod tests {
 
     #[test]
     fn the_picture_reminder_sends_a_picture_before_a_card_onto_the_card() {
-        // A reply written just before a card arrives as a short summary. So
-        // "the same message" as the card is where a picture gets lost.
         let card = IMAGE_NOT_SHOWN_YET
             .find("ON the card")
             .expect("names the card");
@@ -544,8 +441,6 @@ mod tests {
         assert!(!IMAGE_NOT_SHOWN_YET.contains("same message"));
     }
 
-    /// The engine's question-card gate asks for this line's image form exactly
-    /// when the CLI prints one, so both read the same extensions.
     #[test]
     fn the_card_gate_reads_the_same_picture_extensions() {
         const GATE: &str =

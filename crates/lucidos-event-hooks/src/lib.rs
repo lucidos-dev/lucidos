@@ -1,16 +1,15 @@
-//! Event hooks (ADR 0746): the loader for `data/hooks/<slug>/hook.toml`, and
-//! the runner that asks one hook about one pending event.
-//!
-//! A leaf crate (ADR 0738). It implements the [`EventHooks`] interface from
-//! `lucidos-core`, and the engine executable hands it to the router.
-
 mod answer;
+mod asker;
 mod input;
 mod json_strings;
+mod plugin;
 mod runner;
+mod staged;
 
-pub use answer::{HookAnswer, Refusal, RefusalCause, ReturnedEvent};
-pub use input::{HookInput, PendingEvent};
+pub use answer::HookAnswer;
+pub use asker::WorkspaceHookAsker;
+pub use input::HookInput;
+pub use lucidos_core::core::event_hooks::{PendingEvent, Refusal, RefusalCause, ReturnedEvent};
 pub use runner::{effective_timeout, run_hook, Confinement};
 
 use std::ffi::OsString;
@@ -18,8 +17,9 @@ use std::path::{Path, PathBuf};
 
 use lucidos_core::core::contained_path::{join_contained, join_data_contained};
 use lucidos_core::core::event_hooks::{
-    EventHooks, HookDefinition, HookListing, HookedEventKind, ARMING_EVENT_TYPES, HOOKS_DIR,
-    HOOK_DEFINITION_FILE,
+    EventHooks, HookDefinition, HookListing, HookedEventKind, ARMING_EVENT_TYPES,
+    DEFAULT_TIMEOUT_SECS, HOOKS_DIR, HOOK_DEFINITION_FILE, REFUSED_EVENT_TYPE,
+    TIMEOUT_CEILING_SECS,
 };
 use lucidos_core::core::event_subscription::{
     condition, known_names, validate_subscribable_event_type, SubscriptionSurface,
@@ -30,20 +30,23 @@ use lucidos_core::core::{is_path_traversal, DATA_DIR};
 
 mod content_hash;
 
-/// How long a hook may run when its definition names no timeout.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
-
-/// The engine-wide ceiling on any hook's timeout. A hook can block a person's
-/// send, so one slow script must not stall the workspace for longer.
-pub const TIMEOUT_CEILING_SECS: u64 = 60;
-
-/// The hooks a workspace defines under its `data/hooks/` tree.
 pub struct WorkspaceHooks;
 
 impl EventHooks for WorkspaceHooks {
     fn list_definitions(&self, workspace: &Path) -> Result<Vec<HookListing>, String> {
-        let root = hooks_root(workspace)?;
-        let entries = match std::fs::read_dir(&root) {
+        self.list_at(&hooks_root(workspace)?)
+    }
+
+    fn bundle_plugin_scripts(
+        &self,
+        plugin_root: &Path,
+        planned: &mut Vec<lucidos_core::core::plugins::PlannedFile>,
+    ) -> Result<(), String> {
+        plugin::bundle_scripts(plugin_root, planned)
+    }
+
+    fn list_at(&self, root: &Path) -> Result<Vec<HookListing>, String> {
+        let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("{DATA_DIR}/{HOOKS_DIR} cannot be read: {e}")),
@@ -60,7 +63,7 @@ impl EventHooks for WorkspaceHooks {
         Ok(names
             .into_iter()
             .map(|name| match name.into_string() {
-                Ok(slug) => load(&root, slug),
+                Ok(slug) => load(root, slug),
                 Err(name) => not_utf8(name),
             })
             .collect())
@@ -72,7 +75,6 @@ fn hooks_root(workspace: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("{DATA_DIR}/{HOOKS_DIR} links outside {DATA_DIR}/"))
 }
 
-/// A folder name that is not UTF-8 names no path the loader can open again.
 fn not_utf8(name: OsString) -> HookListing {
     HookListing::Invalid {
         slug: name.to_string_lossy().into_owned(),
@@ -85,7 +87,6 @@ fn not_utf8(name: OsString) -> HookListing {
     }
 }
 
-/// Read and check one entry of the hooks tree.
 fn load(root: &Path, slug: String) -> HookListing {
     let mut problems = Vec::new();
     if slugify_kebab(&slug) != slug {
@@ -93,7 +94,6 @@ fn load(root: &Path, slug: String) -> HookListing {
             "The folder name '{slug}' is not a kebab-case slug, such as 'require-a-plan'."
         ));
     }
-    // The digest hashes this same text, so it binds the definition listed.
     let source = definition_source(root, &slug)
         .and_then(|(dir, text)| Ok((dir, parse_definition(&text)?, text)));
     let (dir, definition, text) = match source {
@@ -123,7 +123,7 @@ fn load(root: &Path, slug: String) -> HookListing {
         problems.push(problem);
     }
     let content_hash = match event_kind {
-        Some(_) if problems.is_empty() => content_hash::of(&dir, &text, &definition.script)
+        Some(_) if problems.is_empty() => content_hash::of(&dir, &text)
             .map_err(|problem| problems.push(problem))
             .ok(),
         _ => None,
@@ -143,7 +143,6 @@ fn load(root: &Path, slug: String) -> HookListing {
     }
 }
 
-/// The hook's folder and the text of its definition file.
 fn definition_source(root: &Path, slug: &str) -> Result<(PathBuf, String), String> {
     let dir = contained(root, slug)?;
     let metadata = std::fs::metadata(&dir).map_err(|e| format!("'{slug}' cannot be read: {e}"))?;
@@ -162,12 +161,7 @@ fn parse_definition(text: &str) -> Result<HookDefinition, String> {
     toml::from_str(text).map_err(|e| format!("{HOOK_DEFINITION_FILE} does not parse: {e}"))
 }
 
-/// The carrier of an event a hook may name. A hook is asked before its event
-/// is recorded, so it names a recorded thread or system event, and nothing
-/// else.
 fn hooked_event_kind(event_type: &str) -> Result<HookedEventKind, String> {
-    // The check below trims, but the definition keeps the name as written and
-    // is later matched against an event's exact type.
     if event_type.trim() != event_type {
         return Err(format!(
             "event_type: '{event_type}' must not start or end with a space."
@@ -177,6 +171,12 @@ fn hooked_event_kind(event_type: &str) -> Result<HookedEventKind, String> {
         return Err(format!(
             "event_type: '{event_type}' is how the owner arms, disarms or removes a hook, \
              and no hook can stop that."
+        ));
+    }
+    if event_type == REFUSED_EVENT_TYPE {
+        return Err(format!(
+            "event_type: '{event_type}' records a hook's refusal, and no hook is asked \
+             about what a hook caused."
         ));
     }
     match validate_subscribable_event_type(event_type, SubscriptionSurface::Trigger) {
@@ -191,8 +191,6 @@ fn hooked_event_kind(event_type: &str) -> Result<HookedEventKind, String> {
     }
 }
 
-/// The path of `script` in `hook_dir`, once it names a file there that a
-/// trigger runtime can run.
 fn check_script(hook_dir: &Path, script: &str) -> Result<PathBuf, String> {
     if script.is_empty() || is_path_traversal(script) {
         return Err(format!(
@@ -220,13 +218,6 @@ fn check_timeout(timeout_secs: Option<u64>) -> Result<(), String> {
     }
 }
 
-/// The script file of the hook `slug`, checked again at run time, since the
-/// tree may have changed since it was listed.
-fn hook_script_path(workspace: &Path, slug: &str, script: &str) -> Result<PathBuf, String> {
-    check_script(&contained(&hooks_root(workspace)?, slug)?, script)
-}
-
-/// `root.join(rel)`, refused when a symlink carries it out of `root`.
 fn contained(root: &Path, rel: &str) -> Result<PathBuf, String> {
     join_contained(root, rel).ok_or_else(|| format!("'{rel}' links outside its folder."))
 }

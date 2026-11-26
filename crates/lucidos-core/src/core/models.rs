@@ -1,13 +1,3 @@
-//! Database-backed registry of chat models for the Lucidos Agent picker.
-//!
-//! Plain config table (authoritative), mirroring the `mcp_servers` / `credentials`
-//! store pattern: the migration seeds builtins, the HTTP API mutates user rows,
-//! and CRUD emits audit `Model*` SystemEvents. The table is the catalogue the
-//! chat intelligence ladder picks from, and drives `RoutingProvider`'s provider
-//! selection. Which models the chat picker lists is the ladder's call
-//! (`runtime::chat_ladder`). The Claude Code `/model` picker is separate,
-//! discovered from Claude Code (`runtime::cc_model_discovery`).
-
 use sqlx::PgPool;
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
@@ -17,8 +7,6 @@ pub use super::model_types::{
     validate_routes, Model, ModelFields, Route, SOURCE_BUILTIN, SOURCE_USER,
 };
 
-/// Raw DB row: (id, label, routes, preferred_provider, vision,
-/// default_effort, successor, sort_order, source, created_at).
 type ModelRow = (
     String,
     String,
@@ -62,7 +50,7 @@ fn row_to_model(row: ModelRow) -> Model {
     }
 }
 
-/// The chat model registry.
+/// INVARIANT: The chat model registry.
 ///
 /// **No caller can skip the event.** [`Self::create`], [`Self::update`] and
 /// [`Self::delete`] are the only reachable mutators;
@@ -77,7 +65,7 @@ fn row_to_model(row: ModelRow) -> Model {
 pub struct ModelStore;
 
 impl ModelStore {
-    /// All models, ordered for display (sort_order, then label). The registry
+    /// INVARIANT: All models, ordered for display (sort_order, then label). The registry
     /// needs every row, so a saved pick off the chat ladder still routes.
     pub async fn list(pool: &PgPool) -> Result<Vec<Model>, sqlx::Error> {
         let rows: Vec<ModelRow> = sqlx::query_as(&format!(
@@ -97,8 +85,6 @@ impl ModelStore {
         Ok(row.map(row_to_model))
     }
 
-    /// Insert a user-added model row. **Private on purpose**: [`Self::create`]
-    /// is the reachable mutator, and it emits.
     async fn insert_row(
         pool: &PgPool,
         id: &str,
@@ -121,7 +107,7 @@ impl ModelStore {
         Ok(row_to_model(row))
     }
 
-    /// Update the editable fields of a user model (never `source` or `id`).
+    /// INVARIANT: Update the editable fields of a user model (never `source` or `id`).
     /// Every field is written as given, so the caller must resolve "absent from
     /// the request" to the existing value first. A `None` `preferred_provider`
     /// clears the pick and hands the model back to its first configured route.
@@ -146,8 +132,6 @@ impl ModelStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete a model row. **Private on purpose**: [`Self::delete`] is the
-    /// reachable mutator, and it emits.
     async fn delete_row(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM models WHERE id = $1")
             .bind(id)
@@ -156,11 +140,6 @@ impl ModelStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Add a user model and announce it. The only way to create one.
-    ///
-    /// Errors (unique violation) if `id` already exists; the caller maps that to
-    /// a 4xx so the user can pick another id. Nothing is announced on that
-    /// error, because nothing was written.
     pub async fn create(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -183,8 +162,6 @@ impl ModelStore {
         Ok(model)
     }
 
-    /// Edit a user model and announce it. Announces only when a row existed, so
-    /// an edit aimed at a missing id stays silent.
     pub async fn update(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -199,8 +176,6 @@ impl ModelStore {
         Ok(updated)
     }
 
-    /// Remove a model and announce it. The caller guards against deleting
-    /// builtins. `ModelDeleted` fires only when a row was actually removed.
     pub async fn delete(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -222,7 +197,6 @@ impl ModelStore {
         Ok(removed)
     }
 
-    /// The registry reloads wholesale on `ModelUpdated`.
     async fn announce_update(event_bus: &EventBus, id: &str, actor: Option<MessageOrigin>) {
         event_bus
             .emit_or_log(
@@ -242,13 +216,10 @@ mod tests {
     use crate::core::prefs;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
-    /// Whether `provider` can serve this model.
     fn routes_to(m: &Model, provider: &str) -> bool {
         m.routes.iter().any(|r| r.provider == provider)
     }
 
-    /// The window declared on this model's `provider` route, or `None` for an
-    /// undeclared one or no such route.
     fn window_on(m: &Model, provider: &str) -> Option<i32> {
         m.routes
             .iter()
@@ -256,13 +227,10 @@ mod tests {
             .and_then(|r| r.context_window)
     }
 
-    /// The window declared on the row's FIRST route, which is where the
-    /// migration put the retired `context_window` column.
     fn declared_window(m: &Model) -> Option<i32> {
         m.routes.first().and_then(|r| r.context_window)
     }
 
-    /// A single-route field set, which is what nearly every caller builds.
     fn fields(label: &str, provider: &str, sort_order: i32, window: Option<i32>) -> ModelFields {
         ModelFields {
             label: label.to_string(),
@@ -310,7 +278,6 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
-        // A user-created collision must survive migration replay byte for byte.
         for (id, migration) in [
             (
                 "gemini-4-argon",
@@ -438,10 +405,6 @@ mod tests {
                 .any(|m| m.id == "claude-sonnet-4-6" && m.is_builtin()),
             "Sonnet 4.6 is still SEEDED"
         );
-        // Ordered by sort_order, newest first: Fable 5.1 (-2), Fable 5 (0),
-        // Opus 5.5 (2), Sonnet 5.5 (4), Opus 5 (5), Sonnet 5 (7), Haiku 5.5
-        // (9), Opus 4.8 (10). That groups the current generation at the top of
-        // the picker. The Sonnet 5.5 pair shares 4, so the label breaks the tie.
         let fable51 = models
             .iter()
             .position(|m| m.id == "claude-fable-5-1")
@@ -490,9 +453,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Every builtin the direct Anthropic API serves is served by a Claude
-    /// gateway too: a copy of its `anthropic` route, placed right after it. A
-    /// row with no `anthropic` route gets none.
     #[tokio::test]
     async fn migration_routes_every_anthropic_builtin_to_the_claude_gateway() {
         let (pool, db_name) = setup_test_db().await;
@@ -525,9 +485,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Every builtin GPT row the API key serves is served by the ChatGPT plan
-    /// too: a copy of its `openai` route, placed right before it. A row with
-    /// no `openai` route gets none.
     #[tokio::test]
     async fn migration_routes_every_gpt_builtin_to_the_chatgpt_plan_first() {
         let (pool, db_name) = setup_test_db().await;
@@ -557,8 +514,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// GPT-6 Luna and Gemini 3.1 Flash-Lite head the background fallbacks, so
-    /// each routes first party first, then through OpenRouter.
     #[tokio::test]
     async fn migration_seeds_the_newest_small_models_with_an_openrouter_route() {
         let (pool, db_name) = setup_test_db().await;
@@ -585,7 +540,6 @@ mod tests {
             assert!(m.is_builtin() && m.vision, "{id}");
             assert_eq!(m.successor, None, "{id}");
             assert_eq!(m.default_effort.as_deref(), Some(effort), "{id}");
-            // A GPT row leads with the ChatGPT plan's copy of its route.
             let plan = (first_party == "openai").then_some(("chatgpt-plan", None, Some(window)));
             let expected: Vec<_> = plan
                 .into_iter()
@@ -621,13 +575,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The Grok family is seeded on the xAI provider, with every window
-    /// DECLARED. The id-shape fallback has no rule for a `grok-` id, so an
-    /// undeclared row would budget a 2M model at 200k.
-    ///
-    /// The window is asserted on all four, including the two of the prior
-    /// generation. Such a row still has to carry a true window: routing loads
-    /// it, so a saved `chat_model` naming one is budgeted from this column.
     #[tokio::test]
     async fn migration_seeds_the_grok_family_on_xai_with_declared_windows() {
         let (pool, db_name) = setup_test_db().await;
@@ -647,8 +594,6 @@ mod tests {
             assert_eq!(declared_window(&m), Some(window), "{id}");
         }
 
-        // The OpenRouter route for Grok is a different id on a different
-        // provider. Nothing in this seed may claim it.
         assert!(
             ModelStore::get(&pool, "x-ai/grok-4.6")
                 .await
@@ -660,10 +605,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The keyless free tier is seeded with every window DECLARED, since these
-    /// ids share no shape the fallback could read. Seeding does not switch the
-    /// tier on: the provider is built from the `opencode_free_enabled`
-    /// preference, so the rows stay filtered out until the user opts in.
     #[tokio::test]
     async fn migration_seeds_the_free_tier_with_declared_windows() {
         let (pool, db_name) = setup_test_db().await;
@@ -697,8 +638,6 @@ mod tests {
             assert_eq!(declared_window(&m), Some(window), "{id}");
         }
 
-        // The relay serves big-pickle only to the OpenCode CLI's own
-        // User-Agent, so a seeded row would never answer us.
         assert!(
             ModelStore::get(&pool, "big-pickle")
                 .await
@@ -710,10 +649,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The prior generation of every family keeps its row, because
-    /// `model_registry::load_from_db` loads every row so a saved `chat_model`
-    /// naming one still routes. Delete instead, and a bare `grok-4.5` falls to
-    /// the id-shape guess and lands on Vertex.
     #[tokio::test]
     async fn migration_keeps_the_prior_generation_of_every_family() {
         let (pool, db_name) = setup_test_db().await;
@@ -747,8 +682,6 @@ mod tests {
             assert!(m.is_builtin(), "{id}");
         }
 
-        // The current lineup, which no retirement may reach. Opus 5.5 and
-        // Sonnet 5.5 are the chat and trigger defaults.
         for id in [
             "claude-fable-5-1",
             "claude-opus-5-5",
@@ -805,7 +738,6 @@ mod tests {
         let fetched = ModelStore::get(&pool, "my-model").await.unwrap().unwrap();
         assert_eq!(fetched.label, "Renamed");
         assert!(routes_to(&fetched, "vertex"));
-        // source is immutable through update
         assert_eq!(fetched.source, SOURCE_USER);
 
         assert!(ModelStore::delete(&pool, &bus, "my-model", None)
@@ -817,10 +749,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The load-bearing guarantee: a registry write and its announcement are one
-    /// operation, so the in-memory ModelRegistry reloads no matter which entry
-    /// path made the write. An edit or delete aimed at a missing id changes
-    /// nothing and therefore announces nothing.
     #[tokio::test]
     async fn every_mutation_announces_and_a_miss_does_not() {
         let (pool, db_name) = setup_test_db().await;
@@ -871,15 +799,10 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A user model can declare its real context window, change it, and clear it
-    /// back to the prefix-map fallback. This is the storage half of the kimi-k3
-    /// fix: without a declared window the trim budget assumed 200k on a
-    /// 1,048,576-token model.
     #[tokio::test]
     async fn context_window_round_trips_and_clears() {
         let (pool, db_name) = setup_test_db().await;
 
-        // Absent on create → NULL (fall back to the prefix map).
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         let created = ModelStore::create(
             &pool,
@@ -892,7 +815,6 @@ mod tests {
         .unwrap();
         assert_eq!(declared_window(&created), None);
 
-        // Declared on create.
         let declared = ModelStore::create(
             &pool,
             &bus,
@@ -903,14 +825,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(declared_window(&declared), Some(1_048_576));
-        // …and survives a re-read, not just the RETURNING row.
         let reread = ModelStore::get(&pool, "moonshotai/kimi-k3")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(declared_window(&reread), Some(1_048_576));
 
-        // Update sets it.
         assert!(ModelStore::update(
             &pool,
             &bus,
@@ -923,7 +843,6 @@ mod tests {
         let fetched = ModelStore::get(&pool, "ctx-model").await.unwrap().unwrap();
         assert_eq!(declared_window(&fetched), Some(262_144));
 
-        // …and `None` clears it back to the fallback.
         assert!(ModelStore::update(
             &pool,
             &bus,
@@ -940,9 +859,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The builtins the vision seed leaves `false` because nobody has checked
-    /// that they read images. A builtin seeded later lands here or declares
-    /// `vision = TRUE`, so its seed has to decide.
     const BUILTINS_NOT_KNOWN_TO_READ_IMAGES: &[&str] = &[
         "gpt-5.3-codex-spark",
         "z-ai/glm-5.2",
@@ -958,15 +874,11 @@ mod tests {
         "hy3-free",
     ];
 
-    /// The families published as image-reading, which are the only ones the
-    /// seed may mark. Over-declaring sends images to a model that rejects them.
     fn in_an_image_reading_family(id: &str) -> bool {
         (id.starts_with("claude-") || id.starts_with("gemini-") || id.starts_with("gpt-"))
             && !BUILTINS_NOT_KNOWN_TO_READ_IMAGES.contains(&id)
     }
 
-    /// Every builtin is decided: it reads images, or it is listed as not known
-    /// to. And the flag sits only on the families that publish it.
     #[tokio::test]
     async fn every_builtin_declares_whether_it_reads_images() {
         let (pool, db_name) = setup_test_db().await;
@@ -997,8 +909,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The seed is a no-op on re-run, and never marks a user's own row, even
-    /// one whose id looks like an image-reading family.
     #[tokio::test]
     async fn the_vision_seed_reruns_cleanly_and_leaves_user_rows_alone() {
         let (pool, db_name) = setup_test_db().await;
@@ -1032,9 +942,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The builtins whose provider documents no default effort, so the seed
-    /// leaves them `NULL` and the engine sends no effort. A builtin seeded
-    /// later lands here or declares one, so its seed has to decide.
     const BUILTINS_WITH_NO_DOCUMENTED_EFFORT: &[&str] = &[
         "gpt-6-astra",
         "gpt-6.2-astra",
@@ -1051,9 +958,6 @@ mod tests {
         "hy3-free",
     ];
 
-    /// Every builtin is decided: it declares a default effort, or it is listed
-    /// as having none documented. A declared one runs unchanged on the row's
-    /// first route, so the tier a picker shows is the tier the engine sends.
     #[tokio::test]
     async fn every_builtin_declares_its_default_effort() {
         let (pool, db_name) = setup_test_db().await;
@@ -1094,8 +998,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The seed is a no-op on re-run, and never touches a user's own row, even
-    /// one whose id matches a seeded builtin's family.
     #[tokio::test]
     async fn the_default_effort_seed_reruns_cleanly_and_leaves_user_rows_alone() {
         let (pool, db_name) = setup_test_db().await;
@@ -1129,8 +1031,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The column's CHECK spells the ladder, since SQL cannot import it. A pin,
-    /// so a tier added to `EFFORT_LADDER` cannot be refused by the schema.
     #[tokio::test]
     async fn the_default_effort_check_allows_exactly_the_ladder() {
         let (pool, db_name) = setup_test_db().await;
@@ -1153,8 +1053,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The registry carries a row's default effort, and nothing for a model it
-    /// has no row for.
     #[tokio::test]
     async fn the_default_effort_reaches_the_registry() {
         let (pool, db_name) = setup_test_db().await;
@@ -1169,8 +1067,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The flag round-trips through create and update, and reaches the
-    /// in-memory registry the engine routes with.
     #[tokio::test]
     async fn the_vision_flag_round_trips_into_the_registry() {
         let (pool, db_name) = setup_test_db().await;
@@ -1206,26 +1102,15 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Builtins declare the window of the request Lucidos actually makes, which
-    /// is not always the model's theoretical maximum.
-    ///
-    /// The distinction is load-bearing for Claude. Lucidos requests 1M mode for
-    /// its own `[1m]` id suffix (the 1M-context beta in `build_claude_request`).
-    /// A bare id sends no beta, so most bare rows run at the 200k the prefix
-    /// map infers. The exception is a family whose DEFAULT window is 1M (Opus
-    /// 5, Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.x): its bare request is 1M
-    /// too.
     #[tokio::test]
     async fn migration_declares_context_window_on_verified_builtins() {
         let (pool, db_name) = setup_test_db().await;
 
         let expected: &[(&str, i32)] = &[
-            // OpenRouter / Vertex-Gemini — no context opt-in, full window applies.
             ("z-ai/glm-5.2", 1_048_576),
             ("gemini-3.1-pro-preview", 1_048_576),
             ("gemini-3.5-flash", 1_048_576),
             ("gemini-3-flash-preview", 1_048_576),
-            // Claude `[1m]` rows — these DO request 1M mode.
             ("claude-fable-5-1[1m]", 1_000_000),
             ("claude-fable-5[1m]", 1_000_000),
             ("claude-opus-5-5[1m]", 1_000_000),
@@ -1236,15 +1121,12 @@ mod tests {
             ("claude-opus-4-6[1m]", 1_000_000),
             ("claude-sonnet-5[1m]", 1_000_000),
             ("claude-sonnet-4-6[1m]", 1_000_000),
-            // Bare rows of the families whose default window is 1M: no beta
-            // needed, so the bare request is 1M as well.
             ("claude-fable-5-1", 1_000_000),
             ("claude-fable-5", 1_000_000),
             ("claude-opus-5-5", 1_000_000),
             ("claude-sonnet-5-5", 1_000_000),
             ("claude-opus-5", 1_000_000),
             ("claude-haiku-5-5", 1_000_000),
-            // OpenAI — no context opt-in either; the 400k guess understates these.
             ("gpt-5.5-pro", 1_050_000),
             ("gpt-5.5", 1_050_000),
             ("gpt-5.6-sol", 1_050_000),
@@ -1266,10 +1148,6 @@ mod tests {
             );
         }
 
-        // Every other bare Claude id stays undeclared, tracking the prefix
-        // map's 200k: the request carries no 1M beta and 1M is not their
-        // default. Declaring 1M here is the dangerous direction, because the
-        // packer would exceed the API mode the request actually selected.
         for id in [
             "claude-opus-4-8",
             "claude-opus-4-7",
@@ -1284,8 +1162,6 @@ mod tests {
             );
         }
 
-        // Unverified windows — an over-declared window is worse than the
-        // fallback (rejected request vs. trimming early).
         for id in [
             "claude-opus-4-5@20251101",
             "gpt-5.4",
@@ -1305,10 +1181,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The 1M-default window migration, re-run verbatim from its file. It
-    /// declares the window on every route sending the row's own id to Vertex or
-    /// Anthropic. It leaves a route with its own id, a window the user set, and
-    /// a user-created row sharing a builtin id.
     #[tokio::test]
     async fn the_1m_default_window_migration_declares_routes_and_leaves_user_choices() {
         const MIGRATION: &str = include_str!(
@@ -1316,8 +1188,6 @@ mod tests {
         );
         let (pool, db_name) = setup_test_db().await;
 
-        // The chain already ran this migration, so put each row back to a shape
-        // it has to act on (or refuse to).
         sqlx::raw_sql(
             r#"UPDATE models SET routes = '[{"provider": "vertex"}, {"provider": "anthropic"},
                    {"provider": "openrouter", "id": "anthropic/claude-opus-5"}]'
@@ -1352,21 +1222,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The GPT-6 Astra seed, as the migration chain leaves it.
-    ///
-    /// It used to run that migration's SQL verbatim through `include_str!`, to
-    /// pin its `ON CONFLICT DO UPDATE`. A workspace could already hold the id as
-    /// a hand-added `user` row. DO NOTHING would have left that row deletable,
-    /// outside every builtin protection.
-    ///
-    /// **That re-run is gone, because the statement can no longer execute.** It
-    /// writes `provider` and `context_window`, which the routes migration drops
-    /// AFTER it. Nothing can reach that SQL again on any workspace, so a test
-    /// re-running it would assert an unreachable path.
-    ///
-    /// What is still worth pinning is the FOLD. Astra's seed is a later
-    /// generation than the original registry, so its row proves a late
-    /// `provider` plus `context_window` landed correctly on one route.
     #[tokio::test]
     async fn the_astra_seed_survives_the_fold_into_routes() {
         let (pool, db_name) = setup_test_db().await;
@@ -1382,7 +1237,6 @@ mod tests {
             id: None,
             context_window: Some(1_050_000),
         };
-        // The ChatGPT plan's copy comes later, ahead of the folded route.
         let plan = Route {
             provider: "chatgpt-plan".to_string(),
             ..folded.clone()
@@ -1438,9 +1292,6 @@ mod tests {
     #[tokio::test]
     async fn create_duplicate_id_errors() {
         let (pool, db_name) = setup_test_db().await;
-        // Colliding with a seeded builtin id must fail (unique PK violation) so
-        // the API can return a clear "already exists" rather than silently
-        // overwriting a builtin.
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         let result = ModelStore::create(
             &pool,
@@ -1455,12 +1306,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The current-generation Claude rows are reachable from a workspace
-    /// holding only an Anthropic key, or only a Claude gateway sign-in.
-    ///
-    /// Vertex stays FIRST, so a workspace already on Vertex keeps its backend.
-    /// Every route leaves the id to default, because a first-party Claude id is
-    /// byte-identical on all three backends.
     #[tokio::test]
     async fn the_current_claude_generation_routes_to_vertex_anthropic_and_the_gateway() {
         let (pool, db_name) = setup_test_db().await;
@@ -1494,11 +1339,6 @@ mod tests {
                 m.preferred_provider, None,
                 "{id} must ship unpicked, so the first configured route serves"
             );
-            // The Anthropic route declares no window on the older `[1m]` rows or
-            // on Sonnet 5: the id-shape guess reads that route's own id, which
-            // carries `[1m]` where the row does. The bare Opus 5 and 5.5 rows
-            // run 1M by default, so 20260923075003 declares it on both routes.
-            // Sonnet 5.5 has no 200k mode, so its seed declares 1M on both.
             let expected = match id {
                 "claude-opus-5-5"
                 | "claude-opus-5"
@@ -1510,7 +1350,6 @@ mod tests {
             assert_eq!(window_on(&m, "claude-gateway"), expected, "{id}");
         }
 
-        // Fable is not published on Vertex, so its rows skip that route.
         for id in ["claude-fable-5-1", "claude-fable-5"] {
             let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
             assert_eq!(
@@ -1523,9 +1362,6 @@ mod tests {
             );
         }
 
-        // The retired rows are an explicit non-goal: their direct-API ids were
-        // never probed, and seeding one unverified trades a clean "not
-        // configured" refusal for a vendor 404.
         for id in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6"] {
             let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
             assert!(
@@ -1537,9 +1373,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A row cannot be stored with no route, nor with one provider twice. The
-    /// first makes the model unreachable with nothing saying so; the second
-    /// makes "the first configured route" ambiguous.
     #[tokio::test]
     async fn the_route_list_cannot_be_empty_or_name_a_provider_twice() {
         let (pool, db_name) = setup_test_db().await;
@@ -1570,8 +1403,6 @@ mod tests {
             "the CHECK must refuse a duplicated provider"
         );
 
-        // And the same judgment at the API boundary, which is what turns those
-        // into a sentence rather than a constraint-violation string.
         let refused = |routes: &[Route], says: &str| {
             let err = validate_routes(routes).expect_err("refused");
             assert!(err.contains(says), "{err}");
@@ -1585,11 +1416,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The `@default` re-spell reaches every store that reads a model id back
-    /// as a live setting, and moves nothing when its rename was skipped.
-    ///
-    /// The migration already ran on this database, so the test seeds legacy
-    /// spellings and runs the same file again. It is written to be re-runnable.
     #[tokio::test]
     async fn the_respell_leaves_no_saved_model_reference_orphaned() {
         const RESPELL: &str =
@@ -1602,8 +1428,6 @@ mod tests {
             prefs::MODEL_TITLE.key(),
         );
         let seed = [
-            // Opus 4.8 renames cleanly. Opus 5 collides with the bare row the
-            // first run produced, so its references must stay where they are.
             "DELETE FROM models WHERE id = 'claude-opus-4-8'".to_string(),
             "INSERT INTO models (id, label, routes, sort_order, source) VALUES \
              ('claude-opus-4-8@default', 'Opus 4.8', '[{\"provider\": \"vertex\"}]', 1, \
@@ -1692,8 +1516,6 @@ mod tests {
             );
         }
 
-        // The collision: the legacy row stays, and so does what names it. It
-        // keeps its Vertex-only route too, since the direct API rejects its id.
         let legacy = ModelStore::get(&pool, "claude-opus-5@default")
             .await
             .unwrap()
@@ -1711,9 +1533,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// One route the engine cannot decode fails the WHOLE registry read, so the
-    /// CHECK refuses every malformed shape a hand edit could write. A string
-    /// window must be refused too, rather than raise inside the cast.
     #[tokio::test]
     async fn a_malformed_route_cannot_reach_the_table() {
         let (pool, db_name) = setup_test_db().await;
@@ -1770,9 +1589,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The picker's write path. `preferred_provider` round-trips on a BUILTIN,
-    /// which is the case that matters: refusing it there would pin every seeded
-    /// model to whichever backend the migration listed first.
     #[tokio::test]
     async fn a_builtin_remembers_its_preferred_provider() {
         let (pool, db_name) = setup_test_db().await;

@@ -1,6 +1,3 @@
-//! HTTP endpoints for the compose state machine.
-//! See `docs/plans/2026-05-03-threads-as-drafts-design.md`.
-
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -24,14 +21,7 @@ use crate::engine::permission::Action;
 use crate::engine::thread_events::{EventMeta, RecoveredCompose, ThreadEvent};
 use crate::engine::thread_state::ThreadState;
 
-/// The clause-4 verb `PUT /api/v1/threads/:id/compose` and
-/// `POST /api/v1/threads/:id/blobs` ask (ADR 0168). The draft holds the next
-/// message and its model picks, so writing it drives the thread's session, as
-/// changing its model does.
 pub(in crate::api) const COMPOSE_VERB: Action = Action::Control;
-/// The clause-4 verb `DELETE /api/v1/threads/:id` asks. Discarding a draft
-/// thread takes it off the thread list, which is what Archive does to an
-/// active one.
 pub(in crate::api) const DISCARD_DRAFT_VERB: Action = Action::Archive;
 
 #[derive(Debug, Deserialize)]
@@ -40,7 +30,7 @@ pub(super) struct PostThreadBody {
     pub mode: String,
     #[serde(default)]
     pub recovered_compose: Option<RecoveredCompose>,
-    /// Request-only bytes: never copied into ThreadStarted or SSE.
+    /// INVARIANT: Request-only bytes: never copied into ThreadStarted or SSE.
     #[serde(default)]
     pub recovered_images: Vec<RecoveredImage>,
 }
@@ -51,8 +41,6 @@ pub(super) struct RecoveredImage {
     pub base64: String,
 }
 
-/// Validate the whole batch before writing anything. The HTTP router also caps
-/// the body at 100 MiB; this leaves headroom for text and JSON framing.
 fn restore_compose_images(
     workspace: &std::path::Path,
     hashes: &[String],
@@ -97,9 +85,6 @@ fn restore_compose_images(
     Ok(())
 }
 
-/// Legacy compose-image payload (`[{base64, mime_type}, ...]`). Mime is
-/// re-sniffed server-side from the bytes so this struct only needs the
-/// base64; the user-supplied mime_type is intentionally dropped.
 #[derive(Debug, Deserialize)]
 pub(super) struct LegacyComposeImage {
     pub base64: String,
@@ -108,33 +93,18 @@ pub(super) struct LegacyComposeImage {
 #[derive(Debug, Deserialize)]
 pub(super) struct PutComposeBody {
     pub text: String,
-    /// `null` (absent) preserves existing draft images via SQL COALESCE;
-    /// `[]` clears; `[hash, …]` replaces.
     #[serde(default)]
     pub image_hashes: Option<Vec<String>>,
-    /// Compat shim for legacy frontends still posting inline base64.
-    /// Mutually exclusive with `image_hashes`.
     #[serde(default)]
     pub images: Option<Vec<LegacyComposeImage>>,
     #[serde(default)]
     pub mode: Option<String>,
-    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
-    /// model + reasoning, coding-agent model + reasoning) as a partial
-    /// `ComposeSelectionOverride`-shaped object. `None` (absent) preserves the
-    /// stored selection. A present object replaces other picks; omitting
-    /// `codingAgent` preserves its stored pin for legacy clients.
     #[serde(default)]
     pub selection: Option<JsonValue>,
     #[serde(default)]
     pub compose_epoch: Option<i64>,
 }
 
-/// Accept a compose mode in either spelling, and answer with the STORED one.
-///
-/// Public API parameter values are kebab-case, so `claude-code` is what a
-/// caller reading the rest of this API will send. The snake form is what the
-/// column holds (`thread_summaries.compose_mode` and `source`), so it stays the
-/// stored spelling and only the boundary aliases.
 fn canonical_mode(mode: &str) -> Result<&'static str, ApiError> {
     match mode {
         "lucidos" => Ok("lucidos"),
@@ -145,8 +115,6 @@ fn canonical_mode(mode: &str) -> Result<&'static str, ApiError> {
     }
 }
 
-/// The one refusal both image paths answer with, so the legacy upload and the
-/// hash list cannot report the same cap differently.
 fn too_many_compose_images() -> ApiError {
     ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many compose images")
 }
@@ -155,8 +123,6 @@ fn is_blob_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Refuse a compose image list the projection must not store: too many
-/// entries, or an entry that is not a blob address.
 fn reject_compose_images(hashes: &[String]) -> Option<ApiError> {
     if hashes.len() > MAX_COMPOSE_IMAGES {
         return Some(too_many_compose_images());
@@ -168,20 +134,6 @@ fn reject_compose_images(hashes: &[String]) -> Option<ApiError> {
     )))
 }
 
-/// Map a thread row's `state` (Option = no row) to the HTTP error for an
-/// attempted compose write, returning `Some(_)` when the request must be
-/// rejected. `Composing` and `Active` accept compose updates; `Discarded`
-/// is the only hard reject. Archived threads carry `state='active'` plus
-/// `archive_state='archived'` and so flow through the `Active` arm — the
-/// gmail-like revival behavior (keystrokes lead up to the send that
-/// re-surfaces the thread) is preserved without needing a separate
-/// `Archived` value on this column. Used by the cold path after a zero-row
-/// UPDATE, where `state` is read back via a follow-up lookup to distinguish
-/// "no row" (404) from "row but wrong state" (410).
-///
-/// Listed exhaustively so a new `ThreadState` variant forces the author to
-/// make a deliberate accept/reject decision instead of inheriting whatever
-/// a catch-all happened to do.
 fn compose_error(state: Option<ThreadState>) -> Option<ApiError> {
     let Some(state) = state else {
         return Some(ApiError::not_found("thread not found"));
@@ -192,14 +144,6 @@ fn compose_error(state: Option<ThreadState>) -> Option<ApiError> {
     }
 }
 
-/// POST /api/v1/threads — create a thread in `composing` state.
-///
-/// Idempotent on `id`: re-POSTing the same `{id, mode}` returns 200; a
-/// different `mode` returns 409 (the user's first device wins, drift would
-/// reopen the bug class this redesign closed). Both successes answer with the
-/// draft's *compose report*. Recovery supplies initial content in the same
-/// event-backed insert. Its generation must match; retries acknowledge an
-/// existing destination in any state without changing its content or mode.
 pub(super) async fn post_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -279,7 +223,7 @@ pub(super) async fn post_thread(
             selection,
             restorations,
         ));
-        // A recovery retry observes the destination without restoring its old
+        // INVARIANT: A recovery retry observes the destination without restoring its old
         // payload over subsequent user edits, sends, mode changes or discards.
         if recovering {
             state
@@ -292,13 +236,6 @@ pub(super) async fn post_thread(
         }
         let existing_state =
             ThreadState::from_db_str(&state_str).map_err(|e| ApiError::internal(e.to_string()))?;
-        // Each arm fully handles its state — no spatial-ordering dependency
-        // between an early-return and a later match. Discarded returns 410
-        // unconditionally (the `ThreadDiscarded` projection sets BOTH
-        // state='discarded' AND archive_state='archived', and the 410-Gone
-        // contract for "this id is dead, mint a new one" must not be masked
-        // by the post-collapse archive flag). Active distinguishes the
-        // archived sub-case for a more specific 409 message.
         return match existing_state {
             ThreadState::Composing => {
                 if existing.mode.as_deref() == Some(mode) {
@@ -359,7 +296,7 @@ pub(super) async fn post_thread(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .is_some();
-    // `ThreadStarted` inserts with `ON CONFLICT DO NOTHING`, so a racing POST
+    // INVARIANT: `ThreadStarted` inserts with `ON CONFLICT DO NOTHING`, so a racing POST
     // from another device may own the row. Read it back: the report is then
     // whatever the row holds, in one consistent statement.
     let row: ComposeReportRow = sqlx::query_as(&format!(
@@ -394,7 +331,6 @@ pub(super) async fn post_thread(
     ))
 }
 
-/// `post_thread`'s lookup: the lifecycle columns, then [`COMPOSE_REPORT_COLS`].
 type PostThreadRow = (
     String,
     String,
@@ -455,8 +391,6 @@ fn stale_compose_epoch_response(current: ComposeReport) -> Response {
         .into_response()
 }
 
-/// The guarded compose UPDATE `put_compose` runs. Binds: id, text, images,
-/// mode, selection, compose epoch.
 fn compose_update_sql() -> String {
     format!(
         "UPDATE thread_summaries
@@ -481,7 +415,7 @@ fn compose_update_sql() -> String {
     )
 }
 
-/// PUT /api/v1/threads/:id/compose — update compose fields.
+/// INVARIANT: PUT /api/v1/threads/:id/compose — update compose fields.
 ///
 /// A shared transaction lock excludes coding-agent seed changes while the
 /// UPDATE applies the state-machine guard and returns the compose report.
@@ -497,7 +431,7 @@ pub(super) async fn put_compose(
     headers: HeaderMap,
     Json(body): Json<PutComposeBody>,
 ) -> Result<Response, ApiError> {
-    // Before the legacy upload too, so a refused caller leaves no blob behind.
+    // INVARIANT: Before the legacy upload too, so a refused caller leaves no blob behind.
     refuse_without_authority(&state.engine.event_bus, &headers, Some(id), COMPOSE_VERB).await?;
     if body.text.len() > MAX_COMPOSE_TEXT_BYTES {
         return Err(ApiError::new(
@@ -510,8 +444,6 @@ pub(super) async fn put_compose(
         None => None,
     };
 
-    // None = preserve (SQL COALESCE). `image_hashes` wins over legacy
-    // `images`; the latter is uploaded inline before the UPDATE.
     let new_image_hashes: Option<Vec<String>> = if let Some(hashes) = body.image_hashes {
         if let Some(rejection) = reject_compose_images(&hashes) {
             return Err(rejection);
@@ -530,9 +462,6 @@ pub(super) async fn put_compose(
         .as_ref()
         .map(|h| serde_json::Value::Array(h.iter().cloned().map(JsonValue::String).collect()));
 
-    // Guard the selection payload: it fans out over SSE like the text/images do,
-    // and a partial `ComposeSelectionOverride` is tiny (a handful of short
-    // fields), so anything large is a runaway client, not a real draft.
     if let Some(ref sel) = body.selection {
         if serde_json::to_string(sel).map(|s| s.len()).unwrap_or(0) > MAX_COMPOSE_SELECTION_BYTES {
             return Err(ApiError::new(
@@ -542,7 +471,7 @@ pub(super) async fn put_compose(
         }
     }
 
-    // Mode toggle on a thread that's already past `composing` is a contract
+    // INVARIANT: Mode toggle on a thread that's already past `composing` is a contract
     // violation — pre-check so we surface 409 before the UPDATE rejects it
     // for an unrelated reason and we lose the precise error.
     // `source` mirrors `compose_mode` so a draft that auto-archives without
@@ -570,8 +499,6 @@ pub(super) async fn put_compose(
     crate::core::preferences::lock_compose_agent_seed(&mut tx, false)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    // A draft is an archive input, so a sub-thread's draft appearing or
-    // clearing moves its ancestors' archivable sub-thread counts.
     let before: Option<(Option<Uuid>, bool)> = sqlx::query_as(&format!(
         "SELECT t.parent_thread_id, {} FROM thread_summaries t WHERE t.thread_id = $1",
         crate::core::store::HAS_DRAFT_SQL,
@@ -620,9 +547,6 @@ pub(super) async fn put_compose(
     Ok(Json(report).into_response())
 }
 
-/// Why a compose UPDATE matched zero rows. A follow-up read tells the
-/// refusals apart, so the client gets the reason rather than a bare "not
-/// applied". Never a success: a `2xx` from the PUT means the write landed.
 async fn refuse_unapplied_compose(
     state: &AppState,
     id: Uuid,
@@ -654,8 +578,6 @@ async fn refuse_unapplied_compose(
     unapplied_compose_refusal(st, current, sent_epoch, mode)
 }
 
-/// The refusal for a compose UPDATE that matched zero rows, given what a
-/// follow-up read found.
 fn unapplied_compose_refusal(
     st: Option<ThreadState>,
     current: Option<ComposeReport>,
@@ -670,18 +592,12 @@ fn unapplied_compose_refusal(
     if sent_epoch.is_some_and(|sent| sent != current.compose_epoch) {
         return Ok(stale_compose_epoch_response(current));
     }
-    // Mode locks at first send. This write is CURRENT: it matched the epoch,
-    // or carried none. A mode here is a real divergence rather than a
-    // straggler. Archived rows carry state='active' and reach this naturally.
     if mode.is_some() && matches!(st, Some(ThreadState::Active)) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "mode is locked once the thread has been sent",
         ));
     }
-    // The row satisfies every guard now, so it did not exist when the UPDATE
-    // took its snapshot: the write raced the transaction creating the thread.
-    // The text was not stored, and the client must not record it as stored.
     Err(ApiError::new(
         StatusCode::CONFLICT,
         "compose write raced the thread's creation and was not applied",
@@ -689,7 +605,6 @@ fn unapplied_compose_refusal(
     .with_reason("compose_not_applied"))
 }
 
-/// `refuse_unapplied_compose`'s lookup: `state`, then [`COMPOSE_REPORT_COLS`].
 type StateAndReportRow = (
     String,
     i64,
@@ -701,18 +616,12 @@ type StateAndReportRow = (
     JsonValue,
 );
 
-/// DELETE /api/v1/threads/:id — discard a composing thread.
-///
-/// Idempotent on missing/already-discarded ids (204). Active threads must
-/// use archive instead (409). A discard it performs answers `200` with the
-/// `summary_version` of its `ThreadDiscarded`. The client holds the discard
-/// until the row reaches it (ADR 0437).
 pub(super) async fn delete_thread(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    // Before the lookup, so a refusal says nothing about whether the thread exists.
+    // INVARIANT: Before the lookup, so a refusal says nothing about whether the thread exists.
     refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -731,14 +640,8 @@ pub(super) async fn delete_thread(
     };
     let current_state =
         ThreadState::from_db_str(&state_str).map_err(|e| ApiError::internal(e.to_string()))?;
-    // Each arm fully handles its state — no spatial-ordering dependency.
-    // Discarded is idempotent (204). Active is rejected; the
-    // already-archived sub-case takes the more specific 409 message
-    // ("thread already archived") since `archive_state` is the sole
-    // archive flag post-collapse and archived rows now carry
-    // state='active'.
     match current_state {
-        ThreadState::Composing => {} // fall through to emit ThreadDiscarded
+        ThreadState::Composing => {}
         ThreadState::Discarded => return Ok(StatusCode::NO_CONTENT.into_response()),
         ThreadState::Active => {
             if archive_state_str == "archived" {
@@ -779,8 +682,6 @@ pub(super) async fn delete_thread(
 mod tests {
     use super::*;
 
-    /// A 1x1 PNG whose trailing byte varies, so each call is distinct content
-    /// and lands its own blob. Enough leading bytes to pass the magic sniff.
     fn distinct_png_base64(seed: u8) -> String {
         use base64::Engine as _;
         let mut bytes: Vec<u8> = vec![
@@ -846,7 +747,6 @@ mod tests {
             .collect()
     }
 
-    /// Count the blob files the workspace holds, across the 256-way fan-out.
     fn blob_count(workspace: &std::path::Path) -> usize {
         let root = workspace.join("data/blobs");
         let Ok(shards) = std::fs::read_dir(&root) else {
@@ -859,9 +759,6 @@ mod tests {
             .sum()
     }
 
-    /// An over-cap legacy batch is refused before anything is written. The
-    /// cap used to run after the upload loop, so the workspace kept one blob
-    /// per image of a request the engine had answered 413.
     #[test]
     fn an_over_cap_legacy_upload_writes_no_blobs() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -877,7 +774,6 @@ mod tests {
         );
     }
 
-    /// A batch inside the cap still uploads, one blob per distinct image.
     #[test]
     fn a_legacy_upload_inside_the_cap_writes_one_blob_per_image() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -888,10 +784,6 @@ mod tests {
         assert_eq!(blob_count(tmp.path()), 3);
     }
 
-    /// `image_hashes` is a list of blob addresses, and the count cap bounds it
-    /// only once each entry has a bounded length. One unvalidated entry of any
-    /// size passes the count, lands in the projection row, and goes out in
-    /// every SSE frame. A megabyte here stands in for the reported 90 MB.
     #[test]
     fn a_compose_image_hash_that_is_not_a_blob_address_is_refused() {
         let real = "a".repeat(64);
@@ -914,7 +806,6 @@ mod tests {
         }
     }
 
-    /// The count cap still holds, and both image paths report it the same way.
     #[test]
     fn more_hashes_than_the_cap_are_refused_with_the_shared_message() {
         let hashes: Vec<String> = (0..=MAX_COMPOSE_IMAGES)

@@ -15,30 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
-/// How long the pipe readers may go with no bytes and no EOF before we call
-/// the pipes detached.
-///
-/// A flat deadline cannot express this. The readers can still be draining a
-/// backlog after the shell exits. On a loaded host they can also be starved
-/// for longer than any figure small enough to be worth waiting. So the window
-/// measures QUIET, and a reader making progress keeps extending it.
 const DETACHED_QUIET_WINDOW: Duration = Duration::from_millis(500);
 
-/// Hard cap on the whole post-exit drain, so a detached process that writes
-/// continuously cannot hold the tool open. Reached only by a process that is
-/// both detached and chatty; a plain detached one goes quiet immediately.
 const DETACHED_MAX_WAIT: Duration = Duration::from_secs(5);
 
-/// The outcome of waiting on a `run_bash` shell.
-///
-/// `wait_with_output()` could not express the middle variant, and that is the
-/// bug this type exists to make impossible. It returns on pipe EOF rather than
-/// on shell exit. So a shell that detached something holding those pipes looked
-/// identical to a shell still running. `run_bash` then reported `command timed
-/// out` for a launch that had already succeeded (ADR 0100).
 #[derive(Debug)]
 enum ShellWait {
-    /// The shell exited and both pipes closed.
     Completed {
         outcome: TaskOutcome,
         stdout: Vec<u8>,
@@ -46,8 +28,6 @@ enum ShellWait {
         stdout_total: u64,
         stderr_total: u64,
     },
-    /// The shell exited, but a process it detached still holds the pipes.
-    /// Carries whatever drained before the grace expired.
     Detached {
         outcome: TaskOutcome,
         stdout: Vec<u8>,
@@ -55,20 +35,11 @@ enum ShellWait {
         stdout_total: u64,
         stderr_total: u64,
     },
-    /// The shell itself never exited within the budget.
     TimedOut,
 }
 
-/// Where a pipe reader puts what it reads, and whether anyone still wants it.
-///
-/// A shared buffer rather than a `Vec` the task owns, because the caller stops
-/// waiting before the reader stops reading. A task that owns its buffer takes
-/// every collected byte with it, and those bytes are what the caller needs.
 struct PipeSink {
     buf: Mutex<Vec<u8>>,
-    /// Bytes this reader has taken off the pipe, ever. Read by the post-exit
-    /// wait to tell a reader draining a backlog from one sitting on an idle
-    /// pipe. Monotonic, so a stale read can only under-report progress.
     read_bytes: AtomicU64,
     discard: AtomicBool,
 }
@@ -91,12 +62,6 @@ impl PipeSink {
     }
 }
 
-/// Read `pipe` to exhaustion, appending into `sink` until it says stop.
-///
-/// It reads to EOF even after the caller has gone, and that is the point. The
-/// reader owns the pipe handle, so dropping the task closes the read end. The
-/// next write by a process we deliberately did not kill would then take
-/// `EPIPE` or `SIGPIPE`, killing it by the back door (ADR 0100).
 async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<PipeSink>) {
     let mut buf = [0u8; 8192];
     loop {
@@ -111,8 +76,6 @@ async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Pipe
                 }
             }
             Err(e) => {
-                // The write end is gone in a way that is not a clean EOF.
-                // Nothing more can arrive, so stop and keep what we have.
                 log_legacy!("[Bash] pipe read ended with an error: {}", e);
                 return;
             }
@@ -120,7 +83,7 @@ async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Pipe
     }
 }
 
-/// Wait for both readers to reach EOF after the shell has exited. `true` means
+/// INVARIANT: Wait for both readers to reach EOF after the shell has exited. `true` means
 /// they got there, so the output is complete.
 ///
 /// `false` means the pipes went quiet while still open, which is a process the
@@ -144,20 +107,14 @@ async fn drain_until_quiet(
     loop {
         let before = out_sink.progress() + err_sink.progress();
         let window = DETACHED_QUIET_WINDOW.min(deadline - tokio::time::Instant::now());
-        // Spawned alongside the window, so it competes for the same scheduler.
+        // INVARIANT: Spawned alongside the window, so it competes for the same scheduler.
         // A trivial task that does not finish in half a second means the
         // runtime never got to the readers either.
         let canary = tokio::spawn(async {});
         let finished = tokio::time::timeout(window, async {
             for slot in readers.iter_mut() {
                 if let Some(reader) = slot.as_mut() {
-                    // `drain_pipe` maps every read error to a clean stop, and
-                    // nothing aborts these tasks, so a JoinError is
-                    // unreachable.
                     let _ = reader.await;
-                    // Only reached when the await resolved. A window expiring
-                    // mid-await leaves the slot filled, which is correct: that
-                    // handle is merely pending and may be polled again.
                     *slot = None;
                 }
             }
@@ -174,7 +131,7 @@ async fn drain_until_quiet(
         if out_sink.progress() + err_sink.progress() != before {
             continue;
         }
-        // No bytes this window. That is only evidence of an idle pipe if the
+        // INVARIANT: No bytes this window. That is only evidence of an idle pipe if the
         // readers actually ran. A starved reader looks identical, and calling
         // it detached discards output the OS had already buffered.
         if !canary.is_finished() {
@@ -184,12 +141,6 @@ async fn drain_until_quiet(
     }
 }
 
-/// SIGKILLs the shell's whole process group when dropped while armed: on a
-/// timeout, or when a cancel drops the tool future mid-wait. `kill_on_drop`
-/// reaches only the shell, so a pipeline stage or `&` child it started would
-/// keep running. It disarms once the shell is reaped, since the group id can
-/// then be recycled. A detached survivor of a normal exit is left alone
-/// (ADR 0100).
 struct ShellGroupGuard(Option<u32>);
 
 impl Drop for ShellGroupGuard {
@@ -208,8 +159,6 @@ async fn wait_for_shell(
     mut child: tokio::process::Child,
     timeout: Duration,
 ) -> Result<ShellWait, Box<dyn std::error::Error + Send + Sync>> {
-    // Declared after `child`, so it drops first and signals the group while
-    // the shell is still unreaped.
     let mut group = ShellGroupGuard(child.id());
     let out_sink = PipeSink::new();
     let err_sink = PipeSink::new();
@@ -233,20 +182,15 @@ async fn wait_for_shell(
         }
         Err(_) => {
             release(&out_sink, &err_sink);
-            // `group` drops on return and SIGKILLs the shell's whole group.
             return Ok(ShellWait::TimedOut);
         }
     };
 
     let drained = drain_until_quiet(&mut readers, &out_sink, &err_sink).await;
 
-    // Typed, so a signal death can't be flattened into a bare number. The old
-    // `status.code().unwrap_or(-1)` reported a SIGSEGV as `-1`, which reads
-    // like an ordinary exit code.
     let outcome = TaskOutcome::from_status(status);
     let stdout = out_sink.take();
     let stderr = err_sink.take();
-    // Read after the take, so a total is never smaller than what it kept.
     let (stdout_total, stderr_total) = (out_sink.progress(), err_sink.progress());
     release(&out_sink, &err_sink);
     Ok(if drained {
@@ -268,8 +212,6 @@ async fn wait_for_shell(
     })
 }
 
-/// The result a background start returns: the task's handle, plus the note
-/// for any secret name its text mentioned that nothing set.
 pub(super) fn background_start_result(
     task_id: &str,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -322,7 +264,7 @@ pub(crate) impl LucidosEngine {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // Two callers can drop the wait on this child: a user cancel
+            // INVARIANT: Two callers can drop the wait on this child: a user cancel
             // through run_tool_with_cancel, and the per-tool timeout.
             // `wait_for_shell` kills the shell's group on both; kill_on_drop
             // also covers a drop before the wait starts.
@@ -342,15 +284,10 @@ pub(crate) impl LucidosEngine {
         let started = chrono::Utc::now();
         let child = spawn_shell(&mut cmd).map_err(|e| format!("Failed to spawn command: {}", e))?;
 
-        // Wait on the SHELL, not on pipe EOF. A command that detaches a
-        // process keeps the pipes open after the shell is gone. Waiting on EOF
-        // reported that as a timeout (ADR 0100).
         let pid = child.id();
         let waited = wait_for_shell(child, Duration::from_secs(timeout_secs)).await?;
         let (detached, outcome, raw_stdout, raw_stderr, stdout_total, stderr_total) = match waited {
             ShellWait::TimedOut => {
-                // The shell itself never exited. `wait_for_shell` has already
-                // SIGKILLed its whole process group.
                 return Err(format!("command timed out after {}s", timeout_secs).into());
             }
             ShellWait::Completed {
@@ -411,14 +348,12 @@ pub(crate) impl LucidosEngine {
             ));
         }
 
-        // Last thing before the result leaves: the caller persists it into the
+        // INVARIANT: Last thing before the result leaves: the caller persists it into the
         // `ToolResult` event verbatim. See `core::subprocess_secret_values`.
         let response = crate::core::redact_subprocess_output(
             &env.with_note(response),
             &crate::core::subprocess_secret_values(env_vars, crate::core::inherited_secret_env()),
         );
-        // A grantable refusal fails the tool call, which fails the trigger
-        // with a folder card. The output stays in the failure.
         let refused = !outcome.is_success()
             && crate::triggers::folder_grant::folder_refusal(
                 sandbox,
@@ -433,12 +368,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// `run_bash_background(command, description, timeout_secs?)`: spawn a long-running
-    /// shell command and return a `task_id` immediately. Emits
-    /// `BackgroundBashStarted`; the watcher emits `BackgroundBashCompleted`
-    /// when the child exits or the watchdog kills it. The registry entry
-    /// outlives that event by the retention window, so a `bash_output` drain
-    /// landing at the completion instant still gets the final tail.
     async fn execute_bash_background_tool(
         &self,
         args: &serde_json::Value,
@@ -491,15 +420,6 @@ pub(crate) impl LucidosEngine {
         ))
     }
 
-    /// Spawn a background task for a thread, record `BackgroundBashStarted`,
-    /// and start the watcher that records `BackgroundBashCompleted`. Returns
-    /// the task id and its start time.
-    ///
-    /// Shared by the chat agent's `run_bash_background` and
-    /// `run_python_background`, and by a coding agent's
-    /// `lucidos background-task run`. They differ in the directory the task
-    /// runs in and in its env: only the chat agent's carries the secrets.
-    /// `spec.description` is the agent's name for the work, shown on the wait.
     async fn start_background_task(
         &self,
         sandbox: &Sandbox,
@@ -554,13 +474,9 @@ pub(crate) impl LucidosEngine {
         let bus = self.event_bus.clone();
         let registry = self.bash_background.clone();
         tokio::spawn(async move {
-            // finish_rx only errors when the runtime is shutting down.
             if finish_rx.await.is_err() {
                 return;
             }
-            // `None` covers two cases, and neither is a loss. The entry was
-            // swept, or the teardown sweep took the record first and emitted
-            // this same event. Either way somebody else owns the completion.
             let Some(record) = registry.completion_record(&task_id).await else {
                 log_legacy!(
                     "[BashBg] watcher fired but task {} is gone or already recorded",
@@ -568,7 +484,7 @@ pub(crate) impl LucidosEngine {
                 );
                 return;
             };
-            // The teardown may have killed this task on its way out and then
+            // INVARIANT: The teardown may have killed this task on its way out and then
             // lost the race to record it. Built through the shared builder for
             // exactly that reason: the row must not depend on who won.
             let event = bash_background_recovery::completion_event(task_id.clone(), record);
@@ -581,7 +497,7 @@ pub(crate) impl LucidosEngine {
                 .await
             {
                 log_legacy!("[BashBg] failed to emit BackgroundBashCompleted: {}", e);
-                // Hand the claim back. It is a promise to write the row, and
+                // INVARIANT: Hand the claim back. It is a promise to write the row, and
                 // this one did not. Holding it tells the teardown the task is
                 // settled, and the boot sweep then reports a success as a loss.
                 registry.release_completion_claim(&task_id).await;
@@ -589,23 +505,6 @@ pub(crate) impl LucidosEngine {
         });
     }
 
-    /// `bash_output(task_id, wait_secs?)` — drain in-memory output if
-    /// the task is still running, else fall back to the persisted
-    /// `BackgroundBashCompleted` event. Returns a JSON string.
-    ///
-    /// When `wait_secs` is provided (1..=`BASH_OUTPUT_MAX_WAIT_SECS`),
-    /// blocks server-side for the full budget unless the task finishes
-    /// first. Replaces the sleep-poll antipattern where a chat agent
-    /// spawned `run_python_background` then issued a fresh `run_python`
-    /// containing `time.sleep(N)` — that burned two tool calls per wait,
-    /// doubled context, and stalled the turn. Values above the max are
-    /// clamped silently so a misprompted agent can't pin a model turn
-    /// forever.
-    ///
-    /// The result carries `elapsed_secs` (task runtime) and `waited_secs`
-    /// (how long THIS call actually blocked) because the model has no
-    /// clock: without them it infers elapsed time from what it *asked*
-    /// for and narrates "roughly 20 minutes in" 90 seconds into a build.
     async fn execute_bash_output_tool(
         &self,
         args: &serde_json::Value,
@@ -638,16 +537,13 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// The body of `bash_output`, with the wait already clamped by the caller.
-    /// `lucidos background-task output` and `wait` read through here too, so
-    /// every surface renders one task the same way.
     async fn drain_background_output(
         &self,
         task_id: &str,
         wait: std::time::Duration,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        // A message from the user outranks the rest of the wait: the loop
+        // INVARIANT: A message from the user outranks the rest of the wait: the loop
         // only picks injections up BETWEEN iterations, so without this the
         // follow-up sits unread for up to two minutes while we block.
         // Cancel is already handled a level up, in `run_tool_with_cancel`.
@@ -658,7 +554,7 @@ pub(crate) impl LucidosEngine {
         let call_started = std::time::Instant::now();
         let snapshot = match wakeup {
             Some((notify, pending)) => {
-                // Register the waiter BEFORE reading the counter. `enable()`
+                // INVARIANT: Register the waiter BEFORE reading the counter. `enable()`
                 // is what makes this race-free: any inject() from here on
                 // wakes a registered waiter, and any that already happened is
                 // visible in `pending`. Checking first and registering second
@@ -669,8 +565,6 @@ pub(crate) impl LucidosEngine {
                 notified.as_mut().enable();
 
                 if pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
-                    // The user already spoke — typically while the LLM call
-                    // that produced THIS tool call was in flight. Don't block.
                     self.bash_background
                         .read_output_in_memory_wait(task_id, std::time::Duration::ZERO)
                         .await
@@ -678,8 +572,6 @@ pub(crate) impl LucidosEngine {
                     tokio::select! {
                         biased;
                         snap = self.bash_background.read_output_in_memory_wait(task_id, wait) => snap,
-                        // The user spoke mid-wait. Drain what's there and hand
-                        // the turn back so the loop reads their message now.
                         _ = notified => {
                             self.bash_background
                                 .read_output_in_memory_wait(task_id, std::time::Duration::ZERO)
@@ -699,7 +591,7 @@ pub(crate) impl LucidosEngine {
             if snap.finished {
                 self.bash_background.mark_result_read(thread_id, task_id);
             }
-            // Same `as_reported` rule as the persisted row, so a task the
+            // INVARIANT: Same `as_reported` rule as the persisted row, so a task the
             // teardown killed does not read as `signal: 9` here and as no
             // status there. The two are one tool call to the LLM.
             let outcome = snap.outcome.map(|o| o.as_reported(snap.abandoned));
@@ -712,10 +604,6 @@ pub(crate) impl LucidosEngine {
                 "finished": snap.finished,
                 "timed_out": snap.timed_out,
                 "killed": snap.killed,
-                // Reachable in-memory, not just from the event store: after the
-                // teardown's kill, a drain inside the retention window reads a
-                // task this process abandoned. Both come from `ending`, because
-                // the two branches are one tool call and must not disagree.
                 "abandoned": snap.abandoned,
                 "elapsed_secs": snap.elapsed_secs,
                 "waited_secs": call_started.elapsed().as_secs(),
@@ -733,13 +621,6 @@ pub(crate) impl LucidosEngine {
         .await?
         {
             Some(result) => Ok(result),
-            // No registry entry and no completion row. Before calling the id
-            // unknown, ask whether this thread ever spawned it: a task with no
-            // recorded outcome looks exactly like a typo from here.
-            //
-            // Rare, because both settle paths write a completion. What is left
-            // is a task whose own settle emit failed, or one on a thread the
-            // boot sweep skips. So the message names no cause it cannot know.
             None => match bash_background_recovery::task_start_time(&self.pool, thread_id, task_id)
                 .await
             {
@@ -752,9 +633,6 @@ pub(crate) impl LucidosEngine {
                     started_at.to_rfc3339(),
                 )),
                 Ok(None) => Err(format!("Error: unknown task_id '{}'", task_id)),
-                // A probe that could not run must not answer "no". Reporting
-                // an unreadable event store as an unknown id sends the agent
-                // hunting a typo it did not make.
                 Err(e) => Err(format!(
                     "Error: no output for task '{}', and the event store could not be checked \
                      for whether this thread ever spawned it: {}",
@@ -764,8 +642,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// `bash_kill(task_id)`: stop a running background task as the calling
-    /// thread. Its completion does not re-open that thread (ADR 0369).
     async fn execute_bash_kill_tool(
         &self,
         args: &serde_json::Value,
@@ -790,12 +666,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The `bash_output` result for a task that left the registry, read off its
-/// persisted `BackgroundBashCompleted` row. `Ok(None)` when no row exists.
-///
-/// The streams are masked again on the way out. A row written before the
-/// write-time mask holds them raw, and nothing rewrites the events table.
-/// The reader has now read the result, so no wait delivers it (ADR 0619).
 async fn persisted_drain(
     pool: &sqlx::PgPool,
     registry: &crate::engine::bash_background::BackgroundBashRegistry,
@@ -833,9 +703,6 @@ async fn persisted_drain(
         value
     };
 
-    // The in-memory drain and this branch are one tool call to the LLM, so
-    // both render the outcome through `TaskOutcome`. Legacy rows have no
-    // `signal` key.
     let outcome = TaskOutcome::from_persisted(
         payload
             .get("exit_code")
@@ -855,13 +722,7 @@ async fn persisted_drain(
         "finished": true,
         "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
-        // True only on a row the recovery sweep wrote: the engine
-        // that owned the task stopped, so no status was ever
-        // reaped and `elapsed_secs` spans the downtime too.
         "abandoned": payload.get("abandoned").cloned().unwrap_or(serde_json::Value::Bool(false)),
-        // The in-memory branch's two time fields, so the LLM need not
-        // guess how long the task ran. `waited_secs` is measured: a drain
-        // can block and only then find the retention window closed.
         "elapsed_secs": persisted_elapsed_secs(&payload),
         "waited_secs": call_started.elapsed().as_secs(),
     })
@@ -870,10 +731,6 @@ async fn persisted_drain(
     Ok(Some(result))
 }
 
-/// Task runtime in seconds from a persisted `BackgroundBashCompleted`
-/// payload. `null` for a legacy row that predates the timestamp pair —
-/// an honest "unknown" the LLM can read, rather than a fabricated `0`
-/// it would narrate as "the build took no time at all".
 fn persisted_elapsed_secs(payload: &serde_json::Value) -> Option<i64> {
     let ts = |key: &str| {
         payload
@@ -890,9 +747,6 @@ mod tests {
     use super::*;
     use crate::engine::bash_background::truncate_output_tail;
 
-    /// A `BackgroundBashCompleted` written before the write-time mask still
-    /// holds the raw value, and its task's env is gone. So a drain that falls
-    /// back to the row masks it against the credentials stored now.
     #[tokio::test]
     async fn a_stored_row_holding_a_credential_drains_with_it_masked() {
         let (pool, db) = crate::test_support::setup_test_db().await;
@@ -906,7 +760,6 @@ mod tests {
         )
         .await;
         let thread_id = uuid::Uuid::new_v4();
-        // Written raw: the current write path can no longer produce this row.
         sqlx::query(
             "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
              VALUES ($1, 'thread', $2, 'BackgroundBashCompleted', $3, NOW(), $2::uuid)",
@@ -950,8 +803,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// ADR 0619: a result read off its persisted row is read, so no clean
-    /// turn end delivers it again.
     #[tokio::test]
     async fn a_persisted_read_marks_the_result_read() {
         let (pool, db) = crate::test_support::setup_test_db().await;
@@ -1007,8 +858,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// Spawn through the same shell and pipe setup `execute_bash_tool` uses,
-    /// so these exercise the real fd topology rather than a simplified one.
     fn spawn_like_the_tool(command: &str) -> tokio::process::Child {
         let mut cmd = command_shell()
             .command(&Sandbox::unsandboxed(), command)
@@ -1119,13 +968,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// Output and status for the ordinary case, and promptly.
-    ///
-    /// It deliberately does NOT assert `Completed` over `Detached`. Two
-    /// concurrent spawns can cross-inherit a pipe write end through the
-    /// parent's `dup2` window. A sibling test's shell then holds this one's
-    /// pipe open and delays EOF. The bytes and the status are exact either
-    /// way, and those are what the caller reads.
     #[tokio::test]
     async fn an_ordinary_command_reports_its_output_and_exit_status() {
         let started = std::time::Instant::now();
@@ -1159,16 +1001,10 @@ mod tests {
         );
     }
 
-    /// The incident shape. `&` binds looser than `&&`, so the whole chain runs
-    /// in one backgrounded subshell that keeps both pipe write ends open.
-    /// `wait_with_output()` waits for pipe EOF, so it blocked the full timeout
-    /// and reported a failure for a launch that had already succeeded.
     #[tokio::test]
     async fn a_detached_subshell_holding_the_pipes_does_not_look_like_a_timeout() {
         let started = std::time::Instant::now();
         let child = spawn_like_the_tool("echo launched && sleep 30 >/dev/null 2>&1 & echo queued");
-        // A 30s budget the detached `sleep` would blow through if we waited on
-        // pipe EOF. Reaching Detached quickly is the whole point.
         let waited = wait_for_shell(child, Duration::from_secs(30))
             .await
             .unwrap();
@@ -1197,19 +1033,6 @@ mod tests {
         }
     }
 
-    /// Returning must not kill what we chose not to kill. The reader task owns
-    /// the pipe handle, so aborting it closes the read end, and the detached
-    /// process takes `SIGPIPE` on its next write. `run_bash` would then report
-    /// a survivor it had just killed. Reading on, and discarding, is the fix.
-    ///
-    /// The chain stays silent until the test creates `go`, which it does only
-    /// once `Detached` is back. Then it writes to the inherited pipe and
-    /// touches the marker. A closed read end kills it before it gets there.
-    ///
-    /// The late write waits on `go`, not on a timer. A starved host stretches
-    /// the quiet window past any fixed delay, the write lands inside it, and
-    /// the wait reports `Completed`. The loop also ends once the tempdir is
-    /// gone, so a failed run leaves no process behind.
     #[tokio::test]
     async fn a_detached_process_is_not_killed_by_the_pipes_closing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1242,13 +1065,6 @@ mod tests {
         );
     }
 
-    /// One pipe closes while the other stays live and keeps producing, so the
-    /// quiet window expires and the wait loops.
-    ///
-    /// That is the only path where a reader completes but its partner does
-    /// not. A `JoinHandle` that has returned `Ready` must never be polled
-    /// again. The detached group redirects its stdout away, so the stdout
-    /// reader reaches EOF while the stderr reader is still going.
     #[tokio::test]
     async fn a_pipe_closing_while_the_other_keeps_producing_does_not_repoll_it() {
         let child = spawn_like_the_tool(
@@ -1287,12 +1103,6 @@ mod tests {
         );
     }
 
-    /// The distinction the fix rests on: a shell that never exits is still a
-    /// real timeout, and must not be softened into a success.
-    ///
-    /// It must also STOP the work, not just stop waiting for it.
-    /// `wait_for_shell` SIGKILLs the shell's process group. The marker file is
-    /// the proof: a surviving shell would create it a second later.
     #[tokio::test]
     async fn a_timeout_reports_a_timeout_and_kills_the_shell() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1307,7 +1117,6 @@ mod tests {
             "expected TimedOut, got {waited:?}"
         );
 
-        // Outlive the `sleep` the shell was running when we gave up on it.
         tokio::time::sleep(Duration::from_millis(1_500)).await;
         assert!(
             !marker.exists(),
@@ -1315,8 +1124,6 @@ mod tests {
         );
     }
 
-    /// A timeout stops the shell's children too. `kill_on_drop` alone reached
-    /// only the shell, so a `&` child kept running and created the marker.
     #[tokio::test]
     async fn a_timeout_kills_the_shells_background_children() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1341,8 +1148,6 @@ mod tests {
         );
     }
 
-    /// A user cancel drops the wait mid-flight. That must stop the shell's
-    /// children as well, not just the shell.
     #[tokio::test]
     async fn a_cancel_kills_the_shells_background_children() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1366,13 +1171,6 @@ mod tests {
         assert!(!marker.exists(), "the background child survived the cancel");
     }
 
-    /// Dropping `wait_with_output()` for `child.wait()` reopens the classic
-    /// deadlock: a child that fills the pipe buffer blocks forever unless
-    /// something drains it concurrently. 328 KB is several times any pipe
-    /// buffer, so this hangs to the timeout if the readers are not concurrent.
-    ///
-    /// Like the test above it accepts either exited variant, for the same
-    /// spawn-race reason. Every byte surviving is the assertion that matters.
     #[tokio::test]
     async fn a_chatty_command_does_not_deadlock_on_a_full_pipe() {
         let child = spawn_like_the_tool(
@@ -1395,8 +1193,6 @@ mod tests {
         assert_eq!(stdout.len(), 8000 * 41, "every byte must survive");
     }
 
-    /// A chatty command must not grow the engine's memory without bound. The
-    /// reader keeps a bounded head and still reports the full size.
     #[tokio::test]
     async fn a_chatty_command_keeps_a_bounded_head_and_reports_the_full_size() {
         let child = spawn_like_the_tool("head -c 2000000 /dev/zero | tr '\\0' a");
@@ -1428,9 +1224,6 @@ mod tests {
 
     #[test]
     fn truncate_output_tail_keeps_the_end_not_the_start() {
-        // A drain window is a progress view: the newest lines say where the
-        // build got to and which step failed. Head-truncating an oversized
-        // window would hand the LLM `Compiling serde` and drop the error.
         let s = format!("{}FAILED: linker error", "noise\n".repeat(500));
         let result = truncate_output_tail(&s, 100, 0);
         assert!(
@@ -1448,11 +1241,6 @@ mod tests {
 
     #[test]
     fn truncate_output_tail_counts_upstream_loss_too() {
-        // A full-budget wait can outrun the registry's 2 MB buffer cap, which
-        // discards unread bytes before this function ever sees them. Counting
-        // only what we trim here would report a smaller gap than really
-        // occurred — and a truncation marker that understates reads as a
-        // bound, so the LLM would trust a number that is a lie.
         let s = "x".repeat(300);
         let result = truncate_output_tail(&s, 100, 5_000);
         assert!(
@@ -1469,9 +1257,6 @@ mod tests {
 
     #[test]
     fn truncate_output_tail_marks_upstream_loss_even_when_it_fits() {
-        // Output that fits the cap is normally returned verbatim — but if the
-        // registry already dropped bytes, saying nothing would present a
-        // partial window as complete.
         let result = truncate_output_tail("the tail", 100, 900);
         assert!(
             result.contains("900 earlier bytes dropped"),
@@ -1488,10 +1273,7 @@ mod tests {
 
     #[test]
     fn truncate_output_tail_multibyte_boundary() {
-        // ceil_char_boundary must not split a multi-byte char — slicing by
-        // raw byte index would panic. 'é' is 2 bytes, so a 5-byte budget
-        // lands mid-char and has to round outward.
-        let s = "ééééé"; // 10 bytes in UTF-8
+        let s = "ééééé";
         let result = truncate_output_tail(s, 5, 0);
         assert!(result.contains("[truncated"));
         assert!(result.ends_with("éé"), "got {:?}", result);
@@ -1508,8 +1290,6 @@ mod tests {
 
     #[test]
     fn persisted_elapsed_secs_is_none_for_a_legacy_row() {
-        // An honest "unknown" beats a fabricated 0 the LLM would narrate as
-        // "the build took no time at all".
         assert_eq!(persisted_elapsed_secs(&serde_json::json!({})), None);
         assert_eq!(
             persisted_elapsed_secs(&serde_json::json!({"started_at": "not a date"})),
@@ -1518,20 +1298,12 @@ mod tests {
     }
 
     mod guard_tests {
-        /// This file with its test module cut off, through the shared reader.
         fn production_src() -> String {
             crate::test_support::source_scan::read_production_source(
                 &crate::test_support::source_scan::engine_source("engine/tools/bash.rs"),
             )
         }
 
-        /// The result leaves through the redaction, not around it, and the child
-        /// inherits none of the engine's own secrets.
-        ///
-        /// The string returned here is persisted verbatim in `ToolResult` and read
-        /// back by the agent. The composition is covered in
-        /// `core::subprocess_secrets`; this is the wiring, which a helper test
-        /// cannot see.
         #[test]
         fn the_bash_tool_result_leaves_through_the_secret_redaction() {
             let src = production_src();
@@ -1572,8 +1344,6 @@ mod tests {
             );
         }
 
-        /// One completion reaches the thread once. The event wait armed over the
-        /// task delivers it, so the watcher must not also push it into a session.
         #[test]
         fn the_completion_watcher_only_emits_and_never_pushes_into_a_session() {
             let src = production_src();

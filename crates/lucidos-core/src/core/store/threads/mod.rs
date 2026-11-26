@@ -10,15 +10,6 @@ use crate::engine::thread_lifecycle::{
 use crate::engine::thread_state::ThreadState;
 use serde::{Deserialize, Serialize};
 
-/// Two-state initiator stored in the `thread_summaries.initiator` text column
-/// and exposed on `ThreadSummary` for the frontend (`'user' | 'system'`).
-///
-/// This is intentionally separate from `ActorMode` (Human / Agent / Engine):
-/// the column has only ever held the binary user-vs-system distinction (the
-/// frontend renders a "system" badge on rows where `initiator == "system"`).
-/// The mapping at the wire boundary is `Human → user`, `Agent | Engine → system`.
-/// Promoting the column to a tri-state would require a DB migration and a
-/// frontend type change; defer until there is a UI need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LegacyInitiator {
@@ -34,10 +25,6 @@ impl LegacyInitiator {
         }
     }
 
-    /// Parse the legacy DB column value. Fails loud on unknown strings (per the
-    /// "no silent defaults" rule in CLAUDE.md) — a row with anything other than
-    /// `"user"` or `"system"` indicates corrupted state we want surfaced rather
-    /// than masked.
     pub fn from_db_str(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         match s {
             "user" => Ok(Self::User),
@@ -51,24 +38,6 @@ impl LegacyInitiator {
     }
 }
 
-/// One live *event wait*, as the client needs to render it.
-///
-/// Stored in the `thread_summaries.live_event_waits` JSONB column and carried
-/// verbatim on [`ThreadSummary`] and [`ThreadAggregate`]. Every field copies
-/// the wait's `EventWaitStarted` payload. So this projects the event rather
-/// than inventing a second notion of what a wait is (ADR 0047).
-///
-/// Deliberately NOT [`crate::engine::event_wait::LiveWait`], which is the
-/// dispatcher's runtime cache and carries what *matching* needs (`thread_id`,
-/// `tool_use_id`, `armed_at`, `watermark`). This carries what the subscription
-/// indicator draws, and nothing else: `reason` is the sentence, `on` is the
-/// chips, `expires_at` is the countdown, and `wait_id` is what the Stop
-/// waiting button cancels.
-///
-/// The TS mirror is `EventWaitSummary` in
-/// `crates/lucidos-app/src/store/thread-events/thread-event-types.ts`. Same
-/// name, same snake_case field names, so the column deserializes straight into
-/// `meta.liveEventWaits` with no mapping layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventWaitSummary {
     pub wait_id: uuid::Uuid,
@@ -79,8 +48,6 @@ pub struct EventWaitSummary {
     pub background_timing: Option<crate::engine::thread_events::BackgroundWaitTiming>,
 }
 
-/// Format a display title from optional title and first_message fields.
-/// Falls back to truncated first_message if title is None.
 pub fn format_display_title(title: Option<String>, first_message: Option<String>) -> String {
     title.unwrap_or_else(|| {
         let msg = first_message.unwrap_or_default();
@@ -92,7 +59,6 @@ pub fn format_display_title(title: Option<String>, first_message: Option<String>
     })
 }
 
-/// Summary info about an active thread.
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadSummary {
     pub thread_id: String,
@@ -101,61 +67,22 @@ pub struct ThreadSummary {
     pub initiator: LegacyInitiator,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_activity: chrono::DateTime<chrono::Utc>,
-    /// When the USER last drove this thread forward (message sent, question
-    /// answered, permission resolved, change applied/discarded). The drawer
-    /// sorts by this so background agent churn no longer reshuffles the list.
-    /// NOT NULL — defaults to the row's creation time for never-acted threads.
     pub last_user_action: chrono::DateTime<chrono::Utc>,
-    /// When the AGENT (or trigger) last did something — streaming, a terminal
-    /// response, an idle, a trigger fire/complete, or asking the user. Drives
-    /// the thread-row tooltip's "Agent ·" line, distinct from `last_user_action`
-    /// so the tooltip is accurate even right after the user acts.
     pub last_agent_action: chrono::DateTime<chrono::Utc>,
     pub message_count: i64,
-    /// Whether the user parked this thread in the Saved section
-    /// (`thread_summaries.is_saved`).
-    ///
-    /// `GET /api/v1/threads` also conveys this structurally, by returning saved
-    /// threads in its own `saved` array, and the drawer still reads it from
-    /// there. The field exists because the by-id read paths have no such array:
-    /// `GET /api/v1/threads/:id` returns one bare summary, and a client
-    /// bootstrapping a single thread from it (a notification tap landing on a
-    /// thread outside the loaded window) would otherwise have to either guess
-    /// `false` or re-fetch the whole grouped payload. Both sources read this same
-    /// column, so they cannot disagree.
     pub saved: bool,
-    /// The custom folder this pinned thread is filed in, an id from the
-    /// `thread_folders` preference. `None` lists it in plain Pinned, and so
-    /// does an id the list no longer holds. Always `None` while unpinned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_folder: Option<String>,
-    /// Whether this is the workspace's *home thread* (ADR 0362). Omitted when
-    /// false, so every other thread's wire bytes are unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub home: bool,
-    /// Thread section: "archived" (history/saved), "inbox" (needs user attention).
-    /// Stored in `thread_summaries.archive_state` column; aliased to `section` in
-    /// SELECTs to keep the JSON wire format stable.
     pub section: String,
-    /// Number of child threads still active (non-zero means parent is "ongoing").
     pub active_children_count: i64,
-    /// Direct children with `awaited_by_parent` set: the *awaited children*
-    /// (ADR 0672). Read by the frontend's Waiting dot and waiting indicator,
-    /// and by the turn-end read decision.
     pub awaited_children_count: i64,
-    /// This thread's parent waits on it: its finish wakes the parent, and it
-    /// is unfinished (active, holding a live event wait, or awaiting a child
-    /// of its own). The waiting indicator lists the children it names.
     pub awaited_by_parent: bool,
-    /// Total number of child threads (active + completed).
+    /// INVARIANT: Total number of child threads (active + completed).
     pub total_children_count: i64,
-    /// Number of *event waits* this thread currently holds unresolved. Read as
-    /// `count > 0` by the frontend's `resolveVisualStatus` to paint the same
-    /// Waiting dot `active_children_count` paints, and by nothing else: a
-    /// subscription holds no turn, so no backend predicate consumes it
-    /// (ADR 0049). Its own thread's waits only, never a descendant roll-up.
     pub live_event_wait_count: i64,
-    /// The same waits the count counts, spelled out: one entry per unresolved
+    /// INVARIANT: The same waits the count counts, spelled out: one entry per unresolved
     /// wait, oldest first. This is what the waiting indicator renders, so
     /// the count says how many and this says which.
     ///
@@ -166,177 +93,81 @@ pub struct ThreadSummary {
     /// The two columns are written by one `UPDATE` per projection arm, and the
     /// count is derived from this array's length, so they cannot disagree.
     pub live_event_waits: Vec<EventWaitSummary>,
-    /// The *cache keep-alive status*: what the keep-alive does for this
-    /// waiting thread. Absent when it has nothing to keep warm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_alive_status: Option<CacheKeepAliveStatus>,
-    /// Count of descendants (transitive) currently in a state that blocks this
-    /// thread from being archived (per `is_blocking` in `thread_lifecycle.rs`).
-    /// Maintained by EventBus on `thread_summaries.blocking_descendant_count`.
-    /// Consumed by `resolve_actions` via `count > 0`; the raw count enables
-    /// UI affordances like "3 sub-threads still busy".
     pub blocking_descendant_count: i64,
-    /// Count of descendants (transitive) currently in a state that needs user
-    /// attention (per `is_attention_needing` in `thread_lifecycle.rs`):
-    /// WaitingForUserAnswer, or an in-workspace coding-agent thread with pending changes.
-    /// Strict subset of `blocking_descendant_count` — drops the `Running` case.
-    /// Consumed by `display_section` via `count > 0` to bubble Current to the
-    /// ancestor chain even when sibling descendants are still running.
     pub attention_descendant_count: i64,
-    /// The *archivable sub-thread count*: how many sub-threads, at any depth,
-    /// the overflow menu's "Archive N completed sub-threads" would put away.
-    /// Exactly the press preflight's `safe_thread_count`. The engine recounts
-    /// it after commit (`thread_triage::archivable_count`).
     pub archivable_sub_thread_count: i64,
-    /// Whether this thread is a *stopped child*: a user Stop ended its turn,
-    /// and its parent is still owed the card that settles it (ADR 0252).
-    /// Counts toward attention and never toward blocking.
     pub is_stopped_child: bool,
-    /// The hold standing on this thread, if any (ADR 0805). A thread on hold
-    /// lists in the drawer's On hold section, and its composer shows the hold
-    /// strip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold: Option<ThreadHoldSummary>,
-    /// Whether the thread's agent asked the user to read its latest reply, and
-    /// the user has not seen it yet (ADR 0409). Lists the thread in the
-    /// drawer's Review group. Counts toward neither attention nor blocking.
     pub read_requested: bool,
-    /// The devices that saw the reply a pending read request points at, on a
-    /// team gateway (ADR 0623). A person whose device is here no longer lists
-    /// the thread under Review. Empty on a gateway with one person.
     pub reply_seen_devices: Vec<String>,
-    /// Whether an Apply Now is running on this thread, from its
-    /// `ApplyNowStarted` to its `ApplyNowEnded` (ADR 0437). Every client reads
-    /// "applying" from here rather than inferring it.
     pub apply_in_flight: bool,
-    /// Thread status, computed by the backend. Nothing writes `waiting` any
-    /// more; it survives on historical rows.
     pub status: ThreadStatus,
-    /// The row's version, one higher after every change to it. A trigger owns
+    /// INVARIANT: The row's version, one higher after every change to it. A trigger owns
     /// the column, so two reads with the same version saw the same row. The
     /// client never applies a summary older than the one it holds.
     pub summary_version: i64,
-    /// What the coding-agent branch holds toward a change (ADR 0400). `proposed`
-    /// follows the pending `changes` rows and drives Apply and the Archive
-    /// block. `unproposed` is branch work no change carries, with the reason
-    /// the last turn end withheld it.
     pub coding_agent_change_state: CodingAgentChangeState,
-    /// Whether the coding-agent thread is bound to an external repo. External repos
+    /// INVARIANT: Whether the coding-agent thread is bound to an external repo. External repos
     /// can't be Applied via the engine merge flow — the WaitingBanner shows
     /// Done/Archive instead, and `archive_thread` marks pending changes as
     /// applied so they don't sit forever.
     pub coding_agent_is_external_repo: bool,
-    /// When the thread last entered the 'running' state (for IN PROGRESS sort order).
+    /// INVARIANT: When the thread last entered the 'running' state (for IN PROGRESS sort order).
     pub last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Parent thread that spawned this one (for sub-thread navigation).
     pub parent_thread_id: Option<String>,
-    /// Cached title of the parent thread — saves an extra round-trip when the
-    /// route panel renders "Parent thread · <title>" links.
     pub parent_thread_title: Option<String>,
-    /// The *legacy successor thread* this one continued in, once it handed off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor: Option<SuccessorLink>,
-    /// The thread this *legacy successor thread* continues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_of: Option<SuccessorLink>,
-    /// Trigger that fired this thread (only for `channel == "trigger"` threads).
-    /// Snapshotted by the projection on `TriggerStarted`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_id: Option<String>,
-    /// Trigger name at fire-time (snapshot — falls back when the trigger is
-    /// later renamed or deleted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_name: Option<String>,
-    /// Repository the coding-agent thread bound to (only for `channel == "claude_code"`
-    /// threads). Stored as TEXT on `thread_summaries.cc_repo_id`; matches a
-    /// `repositories.id` UUID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cc_repo_id: Option<String>,
-    /// Current repo display name resolved from the registry. NULL when the
-    /// repo was deleted from `repositories` after the thread was bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cc_repo_name: Option<String>,
-    /// Coding-agent thread flavor — `'lucidos' | 'app' | 'external'`. Stored
-    /// on `thread_summaries.coding_agent_kind`. NULL for non-coding-agent threads and
-    /// legacy coding-agent rows (consumers default NULL → `'lucidos'`). Frontend reads
-    /// this to render the app-thread affordances (branch chip, WIP preview).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent_kind: Option<String>,
-    /// Canonical folder the coding agent operates on — `<ws>/data/apps/<id>/`
-    /// for App, the repo root for Lucidos and External. Stored on
-    /// `thread_summaries.coding_agent_folder`. NULL for non-coding-agent threads and
-    /// legacy rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent_folder: Option<String>,
-    /// Which backend drives this thread — `'claude-code' | 'codex'`. Stored on
-    /// `thread_summaries.coding_agent`. NULL for non-coding-agent threads and legacy coding-agent
-    /// rows (consumers default NULL → `'claude-code'` via `CodingAgent::parse`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent: Option<String>,
-    /// Every backend the thread's sessions started on, first use first, each
-    /// once. Stored on `thread_summaries.coding_agents`. Empty for threads that
-    /// never started a session and for legacy rows (see `coding_agent`).
     pub coding_agents: Vec<String>,
-    /// Compose state machine (`composing` | `active` | `discarded`). Orthogonal
-    /// to the archive flag (`archive_state` / wire field `section`): an archived
-    /// thread carries `state='active'` plus `archive_state='archived'`.
-    /// Frontends filter to render the drafts section as `state == 'composing'`.
     pub state: ThreadState,
-    /// In-progress compose text. Empty string when the user has nothing typed.
     pub compose_text: String,
-    /// Currently-attached compose image URLs. JSON array; empty when none.
     pub compose_images: serde_json::Value,
-    /// User's mode preference while composing (`lucidos` | `claude_code`).
-    /// `None` once the thread transitions out of `composing`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_mode: Option<String>,
-    /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
-    /// model + reasoning, coding-agent model + reasoning) as a partial
-    /// `ComposeSelectionOverride`-shaped object. `None` = no per-draft picks
-    /// stored; the frontend resolves each unset field to its account default.
-    /// Carried on the `/api/v1/threads` initial fetch so a reload rehydrates
-    /// the draft's picks (the DB is the authoritative store, like `compose_text`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_selection: Option<serde_json::Value>,
-    /// The thread's *compose epoch* (`docs/glossary.md`): the generation advanced by
+    /// INVARIANT: The thread's *compose epoch* (`docs/glossary.md`): the generation advanced by
     /// each submission or Stop restoration. The client echoes it on every
     /// compose PUT so the engine can refuse a write composed before a
     /// submission that has since landed. Carried on the summary because a
     /// reload is one of the two places a device learns it (the other is the
     /// `ThreadComposeChanged` broadcast).
     pub compose_epoch: i64,
-    /// Exact Stop additions retained across PUTs until consumption.
     pub compose_restorations: serde_json::Value,
-    /// Pending changes held by this thread's *sub-threads*, at any depth, not
-    /// counting its own. Filled only by `list_thread_summaries`, the list an
-    /// agent reads its children from, so it is omitted rather than zero on
-    /// every other read path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_sub_thread_change_count: Option<i64>,
-    /// The *reader fields* below are filled by [`attach_reader_fields`] on the
-    /// list and search paths an agent, the CLI or a script reads. Every other
-    /// read path omits them rather than reporting a default.
-    ///
-    /// Whether the thread holds a draft, by [`has_draft`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_draft: Option<bool>,
-    /// The draft's first [`PREVIEW_CHARS`] characters, present only
-    /// when the thread holds a draft.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_preview: Option<String>,
-    /// The whole draft's length in characters, beside `draft_preview`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_length: Option<usize>,
-    /// The *thread link*: `thread:<workspace>/<thread_id>`, by [`thread_link`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
-    /// The *thread liveness*, filled by `thread_liveness::attach` on the
-    /// same list and search paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub liveness: Option<crate::engine::thread_events::liveness::ThreadLiveness>,
 }
 
-/// SQL expression that extracts an app id from `{alias}.coding_agent_folder`.
+/// INVARIANT: SQL expression that extracts an app id from `{alias}.coding_agent_folder`.
 /// App coding-agent threads operate on `<ws>/data/apps/<id>` — the id is the
 /// segment immediately after `/data/apps/`. The folder resolver
 /// (`coding_agent_kind::match_app_id`) refuses any deeper path, so the folder
@@ -348,7 +179,7 @@ fn app_id_sql_expr(alias: &str) -> String {
     format!("split_part(split_part({alias}.coding_agent_folder, '/data/apps/', 2), '/', 1)")
 }
 
-/// SQL boolean mirroring the frontend `threadPassesChannelFilter` — the single
+/// INVARIANT: SQL boolean mirroring the frontend `threadPassesChannelFilter` — the single
 /// source of truth for "does this thread match the active drawer filter". A
 /// channel gate (`sources`) ANDed with per-channel facet narrowing: `trigger`
 /// rows by `trigger_ids`, coding-agent rows (persisted as source `claude_code`)
@@ -383,14 +214,6 @@ fn channel_facet_filter_sql(alias: &str, s: usize, t: usize, r: usize, a: usize)
     )
 }
 
-/// One selectable filter facet (trigger / repo / app) with the timestamp of its
-/// most-recent thread. `id` is non-null in practice (the queries filter
-/// `… IS NOT NULL`) but stays `Option` to match the nullable columns.
-///
-/// `name` is the resolved label, populated for the repos facet (live registry →
-/// `repo_names` projection) so a removed repo lists under its historical name
-/// rather than its raw UUID. NULL for trigger facets, whose labels the
-/// frontend resolves from its own registry.
 #[derive(Serialize, sqlx::FromRow)]
 pub struct FilterFacet {
     pub id: Option<String>,
@@ -398,12 +221,6 @@ pub struct FilterFacet {
     pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// One app folder a coding-agent thread worked in, labelled by the engine.
-/// The client cannot label it: the apps list never holds a widget (ADR 0402).
-///
-/// A live folder answers from its manifest. A removed one has no name, and its
-/// `kind` comes from the `app_kinds` projection when `AppDeleted` recorded it
-/// (ADR 0404). `kind` is also `None` for a live folder whose manifest is broken.
 #[derive(Serialize)]
 pub struct AppFilterFacet {
     pub id: String,
@@ -413,8 +230,6 @@ pub struct AppFilterFacet {
     pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Complete set of selectable drawer filter facets — every trigger / repo / app
-/// that has stamped at least one thread.
 #[derive(Serialize)]
 pub struct FilterFacets {
     pub triggers: Vec<FilterFacet>,
@@ -422,8 +237,6 @@ pub struct FilterFacets {
     pub apps: Vec<AppFilterFacet>,
 }
 
-/// Row type for thread summary queries — all columns selected from thread_summaries.
-/// Uses a named struct because sqlx only implements FromRow for tuples up to 16 elements.
 #[derive(sqlx::FromRow)]
 struct ThreadRow {
     thread_id: String,
@@ -450,13 +263,10 @@ struct ThreadRow {
     reply_seen_devices: Vec<String>,
     apply_in_flight: bool,
     live_event_wait_count: i64,
-    /// `sqlx::types::Json` rather than a bare `Vec`, because that is what
-    /// decodes a JSONB column into a typed value.
     live_event_waits: sqlx::types::Json<Vec<EventWaitSummary>>,
     cache_keep_alive_status: Option<sqlx::types::Json<CacheKeepAliveStatus>>,
     status: String,
     summary_version: i64,
-    /// The three columns `CodingAgentChangeState::from_columns` reads.
     coding_agent_change_state: String,
     coding_agent_unproposed_reason: Option<String>,
     coding_agent_requires_restart: bool,
@@ -489,7 +299,7 @@ struct ThreadRow {
     compose_restorations: serde_json::Value,
 }
 
-/// Per-event projection snapshot carried on persisted thread events
+/// INVARIANT: Per-event projection snapshot carried on persisted thread events
 /// (via `EmittedEvent.aggregate`) and on `fetchThreadEvents` HTTP responses
 /// (via `currentAggregate`). Frontend overlays this onto `thread.meta` so
 /// it never has to derive thread state from event-type lookups.
@@ -508,93 +318,47 @@ pub struct ThreadAggregate {
     pub initiator: LegacyInitiator,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_activity: chrono::DateTime<chrono::Utc>,
-    /// See `ThreadSummary::last_user_action`. Carried on the per-event SSE
-    /// aggregate so the drawer's sort key stays live without a refetch.
     pub last_user_action: chrono::DateTime<chrono::Utc>,
-    /// See `ThreadSummary::last_agent_action`. Carried on the per-event SSE
-    /// aggregate so the row tooltip's "Agent ·" line stays current.
     pub last_agent_action: chrono::DateTime<chrono::Utc>,
     pub message_count: i64,
     pub section: String,
     pub status: ThreadStatus,
-    /// See `ThreadSummary::summary_version`.
     pub summary_version: i64,
     pub active_children_count: i64,
-    /// See `ThreadSummary::awaited_children_count`. Carried on the per-event
-    /// SSE aggregate so a parent's Waiting dot follows its descendants live.
     pub awaited_children_count: i64,
-    /// See `ThreadSummary::awaited_by_parent`.
     pub awaited_by_parent: bool,
     pub total_children_count: i64,
-    /// Count of descendants (transitive) currently blocking this thread's
-    /// archive. See `ThreadSummary::blocking_descendant_count`. Carried on the
-    /// per-event SSE aggregate so the frontend can keep `meta` current
-    /// without an extra GET after every relevant transition.
     pub blocking_descendant_count: i64,
-    /// Count of descendants (transitive) currently in a state that needs user
-    /// attention. See `ThreadSummary::attention_descendant_count`. Drives the
-    /// Current-bubble rule in `display_section`. Strict subset of
-    /// `blocking_descendant_count` (drops the Running case). Carried on the
-    /// per-event SSE aggregate alongside `blocking_descendant_count` so the
-    /// frontend can recompute section without a refetch.
     pub attention_descendant_count: i64,
-    /// See `ThreadSummary::archivable_sub_thread_count`. Carried on the
-    /// rebroadcast aggregate so the overflow menu's count follows the family.
     pub archivable_sub_thread_count: i64,
-    /// See `ThreadSummary::is_stopped_child`. Carried on the per-event SSE
-    /// aggregate so the stopped-child notice and the attention badge appear
-    /// and clear live.
     pub is_stopped_child: bool,
-    /// See `ThreadSummary::hold`. Carried on the per-event SSE aggregate so
-    /// the On hold section and the hold strip follow Hold and Resume live.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold: Option<ThreadHoldSummary>,
-    /// See `ThreadSummary::read_requested`. Carried on the per-event SSE
-    /// aggregate so the Review group gains and loses the thread live, on every
-    /// device.
     pub read_requested: bool,
-    /// See `ThreadSummary::reply_seen_devices`. Carried on the per-event SSE
-    /// aggregate so a person's sighting leaves Review on their other devices.
     pub reply_seen_devices: Vec<String>,
-    /// See `ThreadSummary::apply_in_flight`. Carried on the per-event SSE
-    /// aggregate so every device shows the apply start and end live.
     pub apply_in_flight: bool,
-    /// Count of *event waits* this thread holds unresolved. See
-    /// `ThreadSummary::live_event_wait_count`. Carried on the per-event SSE
-    /// aggregate so the Waiting dot lights the moment a wait is registered or
-    /// resolved, on every open client, without a refetch.
     pub live_event_wait_count: i64,
-    /// The waits themselves. See `ThreadSummary::live_event_waits`.
+    /// INVARIANT: The waits themselves. See `ThreadSummary::live_event_waits`.
     ///
     /// Carried here as well as on the summary, and that is what makes the
     /// subscription panel self-healing. `applyAggregateToMeta` runs BEFORE
     /// `handleEvent`'s seq-dedup guard, so even a re-delivered event repairs a
     /// stranded list. That is the one path that could not repair it before.
     pub live_event_waits: Vec<EventWaitSummary>,
-    /// See `ThreadSummary::cache_keep_alive_status`. Carried on the per-event
-    /// SSE aggregate, so the status arrives with the event that changed it.
     pub cache_keep_alive_status: Option<CacheKeepAliveStatus>,
-    /// See `ThreadSummary::coding_agent_change_state`.
     pub coding_agent_change_state: CodingAgentChangeState,
     pub coding_agent_is_external_repo: bool,
     pub is_saved: bool,
-    /// See `ThreadSummary::pin_folder`. Carried on the per-event SSE aggregate
-    /// so a move between folders shows on every device live.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_folder: Option<String>,
-    /// See `ThreadSummary::home`. An SSE event can be the first a client hears
-    /// of the home thread, and it must not draw that thread in a section.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub home: bool,
     pub has_response: bool,
     pub last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     pub parent_thread_id: Option<String>,
     pub parent_thread_title: Option<String>,
-    /// See `ThreadSummary::successor`. Carried here so "Continued in" appears
-    /// live on the handoff's `SuccessorThreadSpawned`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor: Option<SuccessorLink>,
-    /// See `ThreadSummary::successor_of`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_of: Option<SuccessorLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -605,23 +369,17 @@ pub struct ThreadAggregate {
     pub cc_repo_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cc_repo_name: Option<String>,
-    /// Coding-agent thread flavor — see `ThreadSummary::coding_agent_kind`.
-    /// Wire field: `codingAgentKind` (camelCase via the struct-level rename).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent_kind: Option<String>,
-    /// Canonical folder — see `ThreadSummary::coding_agent_folder`.
-    /// Wire field: `codingAgentFolder` (camelCase via the struct-level rename).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent_folder: Option<String>,
-    /// Backend — see `ThreadSummary::coding_agent`. Wire field: `codingAgent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent: Option<String>,
-    /// Every backend used — see `ThreadSummary::coding_agents`. Wire field: `codingAgents`.
     pub coding_agents: Vec<String>,
     pub state: ThreadState,
 }
 
-/// Whether `ancestor` sits above `thread` in the thread tree, at any depth.
+/// INVARIANT: Whether `ancestor` sits above `thread` in the thread tree, at any depth.
 /// A thread is not its own ancestor.
 ///
 /// Mirrors the `ancestors` CTE in `engine::event_bus_projection_propagation`,
@@ -652,7 +410,7 @@ pub async fn is_thread_ancestor(
     .await
 }
 
-/// Fetch the projection snapshot for a thread. Polymorphic over executor —
+/// INVARIANT: Fetch the projection snapshot for a thread. Polymorphic over executor —
 /// callers pass either a `&PgPool` (HTTP handlers) or `&mut *tx` (inside an
 /// open transaction, for read-your-write semantics in `EventBus::emit()`).
 /// Returns `None` if the row doesn't exist.
@@ -733,7 +491,6 @@ fn row_to_thread_aggregate(
     })
 }
 
-/// One end of a *legacy successor thread* link: the other thread and its title.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SuccessorLink {
     pub thread_id: String,
@@ -746,7 +503,7 @@ impl SuccessorLink {
     }
 }
 
-/// SQL column list for thread summary queries, qualified with `alias` so the
+/// INVARIANT: SQL column list for thread summary queries, qualified with `alias` so the
 /// same shape works whether the caller's FROM clause aliases the table as
 /// `t` (the default — `THREAD_COLS` below) or `s` (the search query that
 /// joins `best_scores b` against `thread_summaries s`).
@@ -789,12 +546,6 @@ fn thread_cols(alias: &str) -> String {
     )
 }
 
-/// SQL scalar expression resolving a repo name from a `cc_repo_id` text
-/// expression: the live `repositories` registry wins (current name, including
-/// renames), falling back to the durable `repo_names` projection (last recorded
-/// name for a removed repo). `id_text_expr` is the text-typed UUID source —
-/// e.g. `t.cc_repo_id` or a subquery alias — cast on the FK side so both PK
-/// indexes stay usable.
 fn repo_name_expr(id_text_expr: &str) -> String {
     format!(
         "COALESCE(\
@@ -804,19 +555,9 @@ fn repo_name_expr(id_text_expr: &str) -> String {
     )
 }
 
-/// Default `thread_cols("t")` for the common `FROM thread_summaries t` shape.
-/// Cached because every list/get query path formats SQL with it.
 static THREAD_COLS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| thread_cols("t"));
 
 impl EventStore {
-    /// The name the user sees for a thread: its title once one exists, else a
-    /// truncated first message. Exactly [`format_display_title`], so a
-    /// coding-agent branch is named after the same string the thread drawer
-    /// shows rather than a second, drifting notion of "the thread's name".
-    ///
-    /// `None` when the thread has no projection row yet; empty when it has one
-    /// with neither field (a thread addressed by id before its first message
-    /// landed). Both leave the caller to supply its own fallback.
     pub async fn thread_display_title(&self, thread_id: uuid::Uuid) -> Option<String> {
         let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT title, first_message FROM thread_summaries WHERE thread_id = $1",
@@ -908,7 +649,6 @@ fn row_to_thread_summary(
     })
 }
 
-/// Search result for a thread, with a relevance score.
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadSearchResult {
     #[serde(flatten)]
@@ -916,32 +656,15 @@ pub struct ThreadSearchResult {
     pub score: f64,
 }
 
-/// Filters for the script/trigger-facing `list`/`count` query paths.
-/// Mirrors the wire query params of `GET /api/v1/threads/list`,
-/// `lucidos threads list`, and the `list_threads` LLM tool.
 pub struct ThreadSummaryFilters<'a> {
-    /// How to narrow by `thread_summaries.status`. See [`StatusFilter`].
     pub status: StatusFilter<'a>,
     pub sources: Option<&'a [String]>,
-    /// Restrict to the direct children of this thread. `None` is no filter.
-    ///
-    /// Direct children only (`parent_thread_id`), never the recursive ancestor
-    /// CTE: a parent addresses the level below it, which is what a star
-    /// topology at each level means. This is the read side of a parent
-    /// orchestrating its own fan-out, and it is how the Lucidos Agent recovers
-    /// a child's `thread_id` after history trimming drops the spawn result.
     pub parent: Option<uuid::Uuid>,
-    /// `Some(true)` keeps threads holding a draft, `Some(false)` keeps the
-    /// rest, `None` is no filter. "Holding a draft" is [`HAS_DRAFT_SQL`].
     pub has_draft: Option<bool>,
-    /// Keeps threads whose change state has this kind. `None` is no filter.
     pub change_state: Option<ChangeStateKind>,
     pub limit: i64,
 }
 
-/// The `WHERE` fragment for every filter but status, shared by the list and
-/// count queries. `$3` sources, `$4` parent, `$5` has_draft, `$6` change state.
-/// The list query binds its limit as `$7`.
 static SUMMARY_FILTER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "($3::text[] IS NULL OR t.source = ANY($3)) \
@@ -952,36 +675,14 @@ static SUMMARY_FILTER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     )
 });
 
-/// How a `list` / `count` query narrows by thread status.
-///
-/// An enum rather than two independent fields because the two ways of asking
-/// are alternatives, not filters that compose: "the active union" and "exactly
-/// these statuses" are two answers to one question, and a query carrying both
-/// would silently intersect. Every caller-facing surface refuses the
-/// combination with an actionable message; this type is what makes the refusal
-/// exhaustive instead of a check somebody can forget to write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusFilter<'a> {
-    /// No status narrowing.
     Any,
-    /// The `active` union: `true` selects [`active_thread_statuses`], `false`
-    /// selects everything else. The oldest of the three and the one every
-    /// existing caller uses, kept bit-for-bit so a patch release breaks nobody.
     Active(bool),
-    /// Exactly these statuses. This is the precise form: `OneOf(&[Running])`
-    /// answers "is the workspace busy?", which the `Active` union answers
-    /// wrongly, because a thread awaiting a user answer is blocked on the
-    /// human rather than working.
     OneOf(&'a [ThreadStatus]),
 }
 
 impl StatusFilter<'_> {
-    /// The two bind params the shared SQL predicate takes: the status list
-    /// (`None` disables the clause entirely) and whether to invert it.
-    ///
-    /// Collapsing all three variants onto one `(list, negate)` pair is what
-    /// lets `list_thread_summaries` and `count_thread_summaries` share one
-    /// static predicate instead of branching per variant.
     pub(crate) fn binds(&self) -> (Option<Vec<&'static str>>, bool) {
         match self {
             Self::Any => (None, false),
@@ -994,14 +695,19 @@ impl StatusFilter<'_> {
     }
 }
 
-/// The `WHERE` fragment [`StatusFilter::binds`] feeds, shared verbatim by the
-/// list and count queries so the two can never disagree about what a filter
-/// selects. `$1` is the status list (NULL disables the clause), `$2` inverts.
-pub(crate) const STATUS_FILTER_SQL: &str = "($1::text[] IS NULL \
-     OR ($2 = FALSE AND t.status = ANY($1)) \
-     OR ($2 = TRUE AND NOT (t.status = ANY($1))))";
+pub(crate) static STATUS_FILTER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let held_question = format!(
+        "(t.status = {} AND t.hold IS NOT NULL)",
+        ThreadStatus::WaitingForUserAnswer.sql_literal()
+    );
+    format!(
+        "($1::text[] IS NULL \
+             OR ($2 = FALSE AND t.status = ANY($1) AND NOT {held_question}) \
+             OR ($2 = TRUE AND (NOT (t.status = ANY($1)) OR {held_question})))"
+    )
+});
 
-/// What a list of thread names calls a thread with no name at all.
+/// INVARIANT: What a list of thread names calls a thread with no name at all.
 ///
 /// The last resort, after [`format_display_title`] has tried the title and the
 /// first message. One word, because the two voice lines that need it read out
@@ -1011,7 +717,7 @@ pub(crate) const STATUS_FILTER_SQL: &str = "($1::text[] IS NULL \
 /// title, so dropping it would report the workspace as quieter than it is.
 pub const UNTITLED_THREAD: &str = "Untitled";
 
-/// Statuses considered "active": the agentic loop is mid-flow.
+/// INVARIANT: Statuses considered "active": the agentic loop is mid-flow.
 ///
 /// A thread merely holding an *event wait* does NOT count: a subscription does
 /// not hold its thread's turn, so a thread watching for a release has genuinely
@@ -1029,28 +735,10 @@ pub fn active_thread_statuses() -> [&'static str; 2] {
     ]
 }
 
-/// SQL for "the thread aliased `alias` is still working": in flight, or ended
-/// a turn holding a live event wait, which wakes it for another. Bind
-/// [`active_thread_statuses`] to `statuses_param`.
-///
-/// A child still working owes its parent a report, so a parent's sibling count
-/// and a *wake mode* batch both read this.
 pub fn still_working_sql(alias: &str, statuses_param: &str) -> String {
     format!("({alias}.status = ANY({statuses_param}) OR {alias}.live_event_wait_count > 0)")
 }
 
-/// Parse caller-supplied status filter values into the typed form
-/// [`StatusFilter::OneOf`] takes.
-///
-/// Shared by every input surface (the HTTP query param, the LLM tool arg, and
-/// through them the CLI flag and the SDK option) so one wrong value produces
-/// one wording everywhere. Three things are deliberately errors rather than a
-/// quietly different answer, because a filter that answers a question nobody
-/// asked is the entire bug this filter exists to fix:
-///
-/// - an unrecognized value, which would otherwise select nothing,
-/// - an empty list, which would otherwise select everything,
-/// - a blank item inside an otherwise valid list, which hides a typo.
 pub fn parse_status_filter_values<S: AsRef<str>>(raw: &[S]) -> Result<Vec<ThreadStatus>, String> {
     let mut out = Vec::with_capacity(raw.len());
     for value in raw {
@@ -1075,16 +763,10 @@ pub fn parse_status_filter_values<S: AsRef<str>>(raw: &[S]) -> Result<Vec<Thread
     Ok(out)
 }
 
-/// Comma-separated form of [`parse_status_filter_values`], for the surfaces
-/// that carry the filter as one string: the HTTP query param, the CLI flag it
-/// forwards, and the string form of the LLM tool arg.
 pub fn parse_status_filter_csv(raw: &str) -> Result<Vec<ThreadStatus>, String> {
     parse_status_filter_values(&raw.split(',').collect::<Vec<_>>())
 }
 
-/// Comma-separated list of every accepted status value, for help text, tool
-/// schemas and error messages. Sourced from [`ThreadStatus::ALL`] so it cannot
-/// drift from the enum.
 pub fn status_value_list() -> String {
     ThreadStatus::ALL
         .iter()
@@ -1102,7 +784,6 @@ fn unknown_status_message(value: &str) -> String {
     )
 }
 
-/// A timeline event rendered inline in a thread view.
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadTimelineEvent {
     pub event_type: String,

@@ -1,19 +1,7 @@
-//! LLM-facing schemas for the autonomous browser-driving tools.
-//!
-//! The matching handlers live in `engine::tools::browser` and the runtime
-//! state lives in `runtime::browser`. This module owns only the JSON-shape
-//! contract that gets advertised to the LLM.
-//!
-//! One of the per-domain families `get_default_tools()` splices together; the
-//! full list lives in this module's parent (`llm::tools`).
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// All browser-driving tool definitions, in display order. Spliced into
-/// `get_default_tools()` so the LLM still sees the whole tool surface in
-/// one vec.
 pub(super) fn browser_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {

@@ -1,4 +1,3 @@
-//! Persistent channel selection. Raw values survive hand edits so refusals stay visible.
 use lucidos_update_channel::{Channel, CustomName, UpdateAddress, BETA_FEED_URL};
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +56,6 @@ impl UpdatesToml {
     }
 
     pub fn key(&self) -> String {
-        // Include slot contents so replacing a selected URL invalidates its answer.
         format!("{}:{:?}", self.channel, self.custom)
     }
 }
@@ -110,7 +108,6 @@ pub fn parse_updates_toml(contents: &str) -> UpdatesToml {
         }
         Ok(_) => UpdatesToml::default(),
         Err(e) => {
-            // A broken file must not silently turn a non-Stable pick into Stable.
             crate::log_legacy!("[ReleaseCheck] unreadable updates.toml: {e}");
             UpdatesToml {
                 channel: "unreadable configuration".into(),

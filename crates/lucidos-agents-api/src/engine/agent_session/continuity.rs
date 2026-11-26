@@ -1,15 +1,7 @@
-//! Whether a new coding-agent session carried the thread's earlier context,
-//! recorded on `SessionStarted` so the thread can say when one started over.
-
 use crate::engine::agent_session::resume::CC_TURN_CLOSER_EVENTS;
 use crate::engine::agent_session::spawn::ResumeAttempt;
 use crate::engine::thread_events::{FreshSessionReason, SessionContinuity, SessionEndReason};
 
-/// The continuity of the session about to start on `thread_id`. `None` when
-/// the thread's history could not be read: an absent field draws nothing,
-/// where a guess could tell the user something false. A pending `handoff`
-/// makes it a *successor session*. `provider_blocked` says the previous
-/// session's last turn was blocked, so the spawn started fresh on purpose.
 pub(super) async fn resolve_session_continuity(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
@@ -56,9 +48,6 @@ pub(super) async fn resolve_session_continuity(
     }
 }
 
-/// Pure half of [`resolve_session_continuity`]. A provider block names itself
-/// first, then a refused resume, then a gone branch, then whatever closed the
-/// previous turn.
 fn session_continuity(
     had_session_before: bool,
     attempt: ResumeAttempt,
@@ -78,9 +67,6 @@ fn session_continuity(
     SessionContinuity::Fresh { reason }
 }
 
-/// Why no session was offered for resume, read off the event that closed the
-/// previous turn. An idle that left nothing resumable, or no closer at all
-/// (the session died mid-turn), has no session to offer.
 fn fresh_reason_after(
     closer_type: Option<&str>,
     closer_reason: Option<&str>,
@@ -220,8 +206,6 @@ mod tests {
         );
     }
 
-    /// A pending handoff makes the session a successor session, unless the
-    /// spawn resumed after all, which a handoff never does.
     #[test]
     fn a_pending_handoff_names_the_successor_session() {
         let handoff: crate::engine::pending_handoff::PendingHandoff =
@@ -246,7 +230,6 @@ mod tests {
         );
     }
 
-    /// The wire spelling is the contract the client reads.
     #[test]
     fn continuity_serializes_kebab_case_on_kind() {
         assert_eq!(
@@ -255,7 +238,6 @@ mod tests {
         );
     }
 
-    /// Rows written before the field existed carry no `continuity` key.
     #[test]
     fn a_session_started_without_continuity_still_parses() {
         let mut row =

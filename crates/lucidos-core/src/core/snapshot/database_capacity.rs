@@ -1,4 +1,3 @@
-//! Read-only capacity probes bound to the PostgreSQL instance being restored.
 use super::{store::check_floor, BoxError};
 use std::{
     io::Read,
@@ -6,8 +5,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-/// SQL is expanded without retaining it in RAM or writing it to disk. Compressed
-/// archive length is not an estimate of the rows and indexes replay will build.
 pub fn expanded_dump_bytes(dump: &Path, url: &str) -> Result<u64, BoxError> {
     let mut child = crate::core::backup::pg_tool_command("pg_restore", url)?
         .args(["--no-owner", "--no-acl", "--file=-"])
@@ -54,14 +51,12 @@ impl DatabaseCapacity {
         })
     }
 
-    /// A native probe is allowed only when pg_control and postmaster.pid bind
+    /// INVARIANT: A native probe is allowed only when pg_control and postmaster.pid bind
     /// the SQL-reported directory to the running instance. Otherwise discover
     /// the local Docker container by its published port and verify its identity.
     pub fn native_paths(&self) -> Result<Option<&[PathBuf]>, BoxError> {
         let identity = match read_native_identity(&self.data) {
             Ok(identity) => identity,
-            // An inaccessible host path is not evidence about a container's
-            // filesystem. Try the independently identity-bound Docker probe.
             Err(error)
                 if matches!(
                     error.kind(),
@@ -109,7 +104,7 @@ impl DatabaseCapacity {
                 continue;
             }
 
-            // Read cluster files directly rather than forwarding database
+            // INVARIANT: Read cluster files directly rather than forwarding database
             // credentials to a container whose identity is not yet verified.
             let control = Command::new("docker")
                 .args(["exec", container, "cat", "--"])
@@ -134,7 +129,7 @@ impl DatabaseCapacity {
         let [container] = matched.as_slice() else {
             return Err("snapshot_capacity_cluster_mismatch".into());
         };
-        // Docker Desktop stores volumes in a VM. Host statfs on a container
+        // INVARIANT: Docker Desktop stores volumes in a VM. Host statfs on a container
         // path is invalid. Probe inside the verified container instead. Charge
         // all host reservations too: bind mounts may overlap host volumes and
         // we cannot safely equate a VM device number with a host device number.
@@ -156,11 +151,6 @@ impl DatabaseCapacity {
     }
 }
 
-/// Forward and rollback can each retain an old relation set until commit.
-/// Budget four times the larger expanded SQL/current DB estimate for relations,
-/// indexes and replay, plus two WAL targets. max_wal_size is a soft limit.
-/// The estimate includes the ordinary free-space floor.
-/// Other cluster tenants can still exhaust space with unlimited concurrent writes.
 fn replay_reservation(expanded: u64, current: u64, wal: u64) -> Result<u64, BoxError> {
     expanded
         .max(current)
@@ -264,8 +254,6 @@ mod tests {
         assert!(expanded > 1_000_000);
         let mut probe = DatabaseCapacity::discover(&pool, expanded).await.unwrap();
         assert!(probe.recovery_bytes > 0);
-        // Check authoritative paths on the disposable test cluster only. Keep
-        // this plumbing test independent of the host's actual free capacity.
         probe.reservation = u64::MAX;
         tokio::task::spawn_blocking(move || {
             assert!(super::super::capacity::preflight_database(

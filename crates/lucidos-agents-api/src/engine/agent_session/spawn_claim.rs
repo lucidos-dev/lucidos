@@ -6,7 +6,7 @@ use crate::engine::session_claim::SpawnClaim;
 
 #[easy_ext::ext(SpawnClaimExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Settle a `running` projection that no run holds. The settle holds the
+    /// INVARIANT: Settle a `running` projection that no run holds. The settle holds the
     /// claim, so no spawn can start between its check and its terminal. A run
     /// that holds the thread owns the turn, and nothing is settled.
     async fn settle_unclaimed_running_thread(
@@ -18,7 +18,7 @@ pub(crate) impl crate::engine::LucidosEngine {
         let Some(_claim) = self.claim_thread_for_spawn(thread_id, None).await? else {
             return Ok(false);
         };
-        // A user's Stop between successor sessions ends real pending work.
+        // INVARIANT: A user's Stop between successor sessions ends real pending work.
         // Hold the claim across this read and its terminal, excluding a spawn.
         let terminal = if terminal == crate::engine::claude_code::SettleTerminal::UserStop
             && !crate::engine::successor::between_successor_sessions(&self.pool, thread_id).await?

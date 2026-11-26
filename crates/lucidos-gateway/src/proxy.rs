@@ -1,21 +1,3 @@
-//! Reverse proxy: `/<slug>/*` → the workspace engine, over its engine socket
-//! ([`crate::engine_hop`]).
-//!
-//! A **pure strip-and-forward streaming proxy** (ADR 0014 §3). On the way in it
-//! strips the `/<slug>` prefix (so the engine sees the root-relative paths it
-//! already understands) and adds an `X-Forwarded-Prefix: /<slug>/` request
-//! header. On the way out it forwards the response **untouched** — body streamed
-//! both directions, compression intact, SSE flowing live. It does NOT read or
-//! rewrite `text/html` (the engine stamps `<base href>` / rewrites app refs from
-//! the forwarded prefix instead, ADR 0014 §4), does NOT strip `Accept-Encoding`,
-//! and carries no speculative retry. This removes the root cause of the gzip-502
-//! / empty-reply / lost-compression issues 0013 hit when the gateway read bodies
-//! as text.
-//!
-//! Hop-by-hop headers (RFC 7230 §6.1) are stripped in both directions so the
-//! gateway doesn't forward framing headers that conflict with hyper's own
-//! connection management.
-
 use std::borrow::Cow;
 
 use axum::body::Body;
@@ -25,8 +7,6 @@ use axum::response::{IntoResponse, Response};
 use crate::engine_hop::{self, Credential, EngineAddress};
 use lucidos_gateway_stamp::StampKey;
 
-/// Trusted hop provenance, consumed by the engine's restore generation fence.
-/// Every inbound value is stripped, including on WebSocket upgrades.
 pub(crate) const HEADER_CALLER_KIND: &str = "x-lucidos-caller-kind";
 
 fn caller_kind(headers: &HeaderMap, extensions: &axum::http::Extensions) -> &'static str {
@@ -42,15 +22,15 @@ fn caller_kind(headers: &HeaderMap, extensions: &axum::http::Extensions) -> &'st
     } else if extensions
         .get::<crate::auth::AuthenticatedLocalProcess>()
         .is_some()
-        // `enforce` admits an agent restore caller only from a loopback peer,
-        // so it is a local process too, just one the sandbox keeps tokenless.
-        || extensions.get::<crate::auth::AgentRestoreCaller>().is_some()
-        // A verified workspace call is an engine's own, even when a paired
-        // gateway relayed it, and an engine holds no restore generation.
+        || extensions
+            .get::<crate::auth::AgentRestoreCaller>()
+            .is_some()
         || extensions
             .get::<crate::workspace_calls::AttestedWorkspaceCall>()
             .is_some()
-        || extensions.get::<crate::diagnostic_transport::AttestedDiagnosticDelivery>().is_some()
+        || extensions
+            .get::<crate::diagnostic_transport::AttestedDiagnosticDelivery>()
+            .is_some()
     {
         "local-process"
     } else {
@@ -58,7 +38,6 @@ fn caller_kind(headers: &HeaderMap, extensions: &axum::http::Extensions) -> &'st
     }
 }
 
-/// Headers that are connection-specific and must not be forwarded by a proxy.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -75,28 +54,6 @@ pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP.iter().any(|h| n.eq_ignore_ascii_case(h))
 }
 
-/// Does the gateway own this request header, rather than forwarding it?
-///
-/// The trust boundary, and one definition for every hop. These names are the
-/// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, the device id, label
-/// and gateway stamp, a workspace call's claim, the two engine credentials, the gateway credential, the relay claim, its
-/// signature, and the local-browser stamp in both its forms. A client-supplied
-/// one must never reach the engine, nor another gateway. The caller re-injects
-/// the prefix, the device headers, the stamp and the local token itself. Whoever sends the upstream request
-/// re-frames `HOST` and `CONTENT_LENGTH`.
-///
-/// The two credentials are here for the reason the device id is, one step
-/// sharper. A wide-bound engine reads them as authorization
-/// (`lucidos_agents_api::api::local_auth`), so a client-chosen value would BE the
-/// authorization. Only the hook socket presents the hook socket token. A gateway
-/// credential (ADR 0590) is a secret no engine reads, so it never leaves here.
-///
-/// `keep_handover` marks the upgrade path, where three headers differ.
-/// `connection` and `upgrade` are kept: there they ARE the handshake, not
-/// framing to discard (ADR 0151). `origin` goes the other way. The upgrade path
-/// judges it here, in [`foreign_origin`], and consumes it (ADR 0163). The HTTP
-/// path forwards it for the engine's gate, except where [`vouches_for_origin`]
-/// consumes it.
 pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
     let n = name.as_str();
     if crate::diagnostic_transport::owns_header(n)
@@ -139,21 +96,6 @@ pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> boo
     is_hop_by_hop(name)
 }
 
-/// Whether `origin` and `host` name the same authority, with the scheme's
-/// default port filled in so `https://name.ts.net` matches `name.ts.net`.
-///
-/// A copy of the engine's `api::browser_origin` function of the same name. This
-/// crate has no dependency on the engine, and its Cargo header says a small
-/// shared surface is duplicated rather than shared. [`is_hop_by_hop`] above is
-/// the same trade.
-///
-/// The hostname-only arm takes an https origin on its default port, and nothing
-/// else. `port()` is `None` for exactly that, since the URL parser normalizes a
-/// default port away. Two gateways run on one machine, so unguarded a portless
-/// `Host` would match a page on the other one's port.
-///
-/// A `Host` carries no scheme, and every topology sending a portless one reaches
-/// us on 443. So `http://name` is a page on port 80, not this origin.
 pub(crate) fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else {
         return false;
@@ -172,23 +114,6 @@ pub(crate) fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
     url.scheme() == "https" && url.port().is_none() && origin_host.eq_ignore_ascii_case(host)
 }
 
-/// The page this request came from, when it is not one of ours.
-///
-/// A browser sends no `Sec-Fetch-Site` on a WebSocket handshake: Chromium and
-/// Gecko send no fetch metadata there at all. So the engine's same-origin gate
-/// has no input, and behind this hop its `Host` is the internal upstream rather
-/// than what the client dialled. The question is answered here instead, in the
-/// one place that still holds the client's own authority.
-///
-/// `Origin` carries the answer unforgeably, on the same terms `Sec-Fetch-Site`
-/// does for an ordinary request: the `WebSocket` constructor takes no headers,
-/// so page script cannot touch it. A handshake with no `Origin` is not from a
-/// browser and is left to the bind topology, exactly as the engine's gate
-/// leaves it. An `Origin` with no `Host` to compare against is refused rather
-/// than guessed at, for the same reason the engine refuses it.
-///
-/// An ordinary request meets the same question when it carries no fetch
-/// metadata, see [`vouches_for_origin`].
 fn foreign_origin(headers: &HeaderMap) -> Option<&str> {
     let origin = headers.get(header::ORIGIN)?.to_str().ok()?;
     let ours = headers
@@ -198,31 +123,12 @@ fn foreign_origin(headers: &HeaderMap) -> Option<&str> {
     (!ours).then_some(origin)
 }
 
-/// Does this gateway answer the engine's same-origin question for an ordinary
-/// request, so the engine need not?
-///
-/// A browser sends `Sec-Fetch-Site` only to https and loopback URLs. A
-/// plain-HTTP tailnet or LAN address gets none, so the engine's gate falls back
-/// to `Origin == Host`. Behind this hop its `Host` is the internal upstream, and
-/// every POST from our own page would fail. The client's own `Host` is here, so
-/// the compare is made here.
-///
-/// A request with fetch metadata is left to the engine, since that tells
-/// same-site from cross-site where a host compare cannot. A foreign `Origin` is
-/// forwarded, and the engine refuses it. This hop never refuses an ordinary
-/// request itself: the engine's app-asset exemption admits a font fetch from an
-/// opaque-origin frame, which carries `Origin: null`.
 pub(crate) fn vouches_for_origin(headers: &HeaderMap) -> bool {
     headers.contains_key(header::ORIGIN)
         && !headers.contains_key("sec-fetch-site")
         && foreign_origin(headers).is_none()
 }
 
-/// Is this a WebSocket upgrade request?
-///
-/// Both halves are required. `Connection` is a comma-separated LIST and a
-/// browser sends `keep-alive, Upgrade`, so a whole-value compare misses it.
-/// `Upgrade` names the protocol, and only websocket takes the splice path.
 pub(crate) fn is_websocket_upgrade(req: &axum::extract::Request) -> bool {
     let hands_over = req
         .headers()
@@ -240,37 +146,18 @@ pub(crate) fn is_websocket_upgrade(req: &axum::extract::Request) -> bool {
     hands_over && websocket
 }
 
-/// Strip a leading `/<slug>` from a path-and-query, returning the remainder
-/// (always starting with `/`). Returns `None` when the path is exactly
-/// `/<slug>` with no trailing slash — the caller redirects that to `/<slug>/`
-/// so the engine's stamped `<base href="/<slug>/">` resolves.
 pub fn strip_prefix<'a>(path_and_query: &'a str, slug: &str) -> Option<&'a str> {
     let prefix = format!("/{slug}");
     let rest = path_and_query.strip_prefix(&prefix)?;
     if rest.is_empty() {
-        // "/<slug>" exactly — needs the trailing-slash redirect.
         None
     } else if rest.starts_with('/') {
-        // "/<slug>/..." → "/..." (keep the leading slash).
         Some(rest)
     } else {
-        // "/<slug>foo" — a different slug sharing the prefix (e.g. "/devx").
         None
     }
 }
 
-/// Drop a `/~cap/<token>` segment, leaving the path the engine knows.
-///
-/// A frame capability is addressing, not authorization, by the time it reaches
-/// here: [`crate::auth_api::frame_capability_admits`] already decided. So the
-/// segment comes off whether it verified or not. A paired device reaches the
-/// same file without one, and the engine's URL space stays exactly what a
-/// direct-to-engine caller sees (ADR 0238).
-///
-/// **The split happens on the PATH, and the query is re-attached.** The gate
-/// reads `uri.path()`, so cutting a path-and-query here would let a `/` inside
-/// the query move the cut. The two would then disagree about what was verified
-/// and what is fetched, which is the invariant the whole design rests on.
 fn strip_frame_capability(path_and_query: &str) -> Cow<'_, str> {
     let (path, query) = match path_and_query.split_once('?') {
         Some((path, query)) => (path, Some(query)),
@@ -285,14 +172,6 @@ fn strip_frame_capability(path_and_query: &str) -> Cow<'_, str> {
     }
 }
 
-/// Proxy `req` to the engine at `engine`, stripping the `/<slug>` prefix and
-/// any frame capability, and adding `X-Forwarded-Prefix: <prefix>`.
-///
-/// `prefix` is where the browser sees this workspace: `/<slug>/` here, or
-/// `/<slug>@<name>/` for a request another gateway relayed (ADR 0591).
-///
-/// The hop is the engine socket ([`crate::engine_hop`]), so nothing below is
-/// written to a listener the kernel does not name as this user's.
 pub async fn proxy(
     engine: &EngineAddress,
     slug: &str,
@@ -310,8 +189,6 @@ pub async fn proxy(
         .to_string();
 
     let Some(rest) = strip_prefix(&path_and_query, slug) else {
-        // "/<slug>" with no trailing slash → redirect so the SPA shell loads at
-        // a path where the engine's injected <base href="<prefix>"> resolves.
         return Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
             .header(header::LOCATION, prefix)
@@ -325,24 +202,6 @@ pub async fn proxy(
         return proxy_upgrade(engine, rest, slug, prefix, local_token, stamp_key, req).await;
     }
 
-    // Forward request headers verbatim except the ones the gateway owns
-    // ([`gateway_owns_header`]): framing, which hyper re-frames for the
-    // streamed body, and the trust-boundary headers below. A client-forged
-    // value must never reach the engine.
-    //   - `x-forwarded-prefix` is LOAD-BEARING and re-injected below with the
-    //     gateway's own value. The engine's `forwarded_prefix` reads the first
-    //     value, so a spoofed one left in place would win.
-    //   - `x-forwarded-host` is NOT re-injected. The engine's credentialed-proxy
-    //     guard uses `Sec-Fetch-Site`, not a reconstructed host. It is still
-    //     stripped so a forged value cannot reach an upstream that trusts it.
-    //   - `x-lucidos-device-id` and `x-lucidos-device-label` are re-injected
-    //     from the AUTHENTICATED device, and only when there is one, with the
-    //     gateway stamp that proves it to the engine. `enforce` sets the
-    //     extension; a client cannot.
-    //   - A workspace call's claim is re-injected, stamped, only from the call
-    //     `workspace_calls` verified.
-    //   - `origin` is consumed when [`vouches_for_origin`] answers the engine's
-    //     same-origin question here. Otherwise the engine's gate reads it.
     let (parts, body) = req.into_parts();
     let origin_vouched = vouches_for_origin(&parts.headers);
     let mut upstream = Request::builder().method(parts.method).uri(rest);
@@ -385,20 +244,10 @@ pub async fn proxy(
             upstream = upstream.header(name, value);
         }
     }
-    // Stream the request body straight through, never buffered: a 100 MB
-    // `PUT /data/*` upload must not sit in gateway memory.
     let Ok(upstream) = upstream.body(body) else {
         return (StatusCode::BAD_REQUEST, "malformed request").into_response();
     };
 
-    // The local token proves to the engine that this hop is the gateway. An
-    // engine on a wide bind requires it; a loopback one ignores it. It is the
-    // gateway vouching for the hop, not the caller's own credential. `enforce`
-    // ran as a router layer, so all but one shape of request arrives already
-    // authorized (ADR 0094). The exception is an app frame's own tags, which
-    // `auth_api::is_public_app_asset` exempts. They carry nothing the token
-    // unlocks, and the dot-segment guard beside that list keeps the set from
-    // widening under a normalizing URL parser.
     let upstream = match engine_hop::send(engine, upstream, Credential::Local(local_token)).await {
         Ok(r) => r,
         Err(e) if e.is_foreign() => {
@@ -421,14 +270,6 @@ pub async fn proxy(
                 engine,
                 e
             );
-            // Boot-window UX (ADR 0014 §11): an engine cold boot (pgvector init,
-            // migrations, embedding warmup, ~20 CC sessions resuming) can take
-            // tens of seconds, during which a connect fails. Serve a lightweight
-            // auto-retry page for navigations instead of a raw 502 the user must
-            // reload by hand. This is the path that renders the ENGINE-reported
-            // phases: once `bring_up` sets the route (while the engine is still
-            // Booting), a lazy-start navigation lands here, not on `fallback`'s
-            // no-route branch. So `boot_label` carries the current phase.
             if crate::auth_api::is_nested_frame(&parts.headers) {
                 return frame_starting_page();
             }
@@ -439,35 +280,19 @@ pub async fn proxy(
     let (parts, body) = upstream.into_parts();
     let mut resp = Response::builder().status(parts.status);
     for (name, value) in &parts.headers {
-        // Forward everything except hop-by-hop framing. Content-length,
-        // content-encoding (compression survives end to end) and content-type
-        // all pass through untouched.
         if is_hop_by_hop(name) {
             continue;
         }
         resp = resp.header(name, value);
     }
-    // Stream the response body: critical for SSE (`/api/v1/events`) and free
-    // for everything else.
     resp.body(Body::new(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// Request logs omit queries, which can contain legacy pairing credentials.
 pub(crate) fn request_path_for_log(target: &str) -> &str {
     target.split(['?', '#']).next().unwrap_or_default()
 }
 
-/// Proxy a WebSocket upgrade to the engine, then splice the two byte streams.
-///
-/// Transparent by construction (ADR 0151): the gateway never parses a frame, so
-/// subprotocols, extensions, ping, pong and close all pass through with no code
-/// here to get them wrong. It carries the SAME rules as the HTTP path, because
-/// both read the trust boundary out of [`gateway_owns_header`].
-///
-/// `enforce` has already run as a router layer, so an unpaired caller never
-/// reaches this. That is the auth boundary, and it is inherited rather than
-/// re-implemented.
 async fn proxy_upgrade(
     engine: &EngineAddress,
     rest: &str,
@@ -477,13 +302,7 @@ async fn proxy_upgrade(
     stamp_key: Option<&StampKey>,
     mut req: axum::extract::Request,
 ) -> Response {
-    // The same-origin question, answered where the client's own authority still
-    // is. Refused before the engine is dialled, so a foreign page cannot even
-    // open the connection. See `foreign_origin` for why this hop owns
-    // the question rather than the engine's gate.
     if let Some(origin) = foreign_origin(req.headers()) {
-        // Named in full, because the browser hides a refused handshake's
-        // response and this log line is the only place the reason appears.
         crate::log_legacy!(
             "[Gateway] websocket upgrade to /{}{} refused: it came from {}, and this gateway \
              is reached at {:?}",
@@ -499,9 +318,6 @@ async fn proxy_upgrade(
             .into_response();
     }
 
-    // Taken before the request is consumed. Absent when hyper saw no
-    // upgradeable connection, which means HTTP/2 or a client that cannot hand
-    // over. Nothing to splice either way.
     let Some(client_upgrade) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
         return (StatusCode::BAD_REQUEST, "not an upgradeable connection").into_response();
     };
@@ -533,14 +349,9 @@ async fn proxy_upgrade(
         return (StatusCode::BAD_REQUEST, "malformed upgrade request").into_response();
     };
 
-    // The upgrade is a second way in, so it meets the same door (ADR 0151).
-    // Omitting the token here would let a wide-bound engine refuse the socket
-    // while serving every HTTP request beside it.
     let engine_response =
         match engine_hop::send_upgrade(engine, upstream, Credential::Local(local_token)).await {
             Ok(r) => r,
-            // A cold-booting engine looks exactly like this, so 503 rather than
-            // 502: the condition clears by itself and a client may retry.
             Err(e) if e.is_unreachable() => {
                 crate::log_legacy!(
                     "[Gateway] websocket upgrade to {}{} could not connect: {}",
@@ -561,8 +372,6 @@ async fn proxy_upgrade(
             }
         };
 
-    // The engine declined the upgrade (404, 401, anything). Forward its answer
-    // verbatim, so the client sees the engine's reason and not ours.
     if engine_response.status() != StatusCode::SWITCHING_PROTOCOLS {
         let (parts, body) = engine_response.into_parts();
         let mut out = Response::builder().status(parts.status);
@@ -576,8 +385,6 @@ async fn proxy_upgrade(
             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
     }
 
-    // Rebuild the 101 verbatim, framing headers included. On this path they are
-    // the handover the client's own hyper needs to see.
     let mut out = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
     for (name, value) in engine_response.headers().iter() {
         out = out.header(name, value);
@@ -594,8 +401,6 @@ async fn proxy_upgrade(
         };
         let mut client_io = hyper_util::rt::TokioIo::new(client_io);
         let mut engine_io = hyper_util::rt::TokioIo::new(engine_io);
-        // Either side closing ends the splice, which is the ordinary way a
-        // call ends. Only the rest is worth a line.
         if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut engine_io).await {
             if e.kind() != std::io::ErrorKind::ConnectionReset
                 && e.kind() != std::io::ErrorKind::BrokenPipe
@@ -609,43 +414,13 @@ async fn proxy_upgrade(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// A lightweight "workspace starting…" page that refreshes itself, served while a
-/// workspace engine is still booting (ADR 0014 §11). 503 so caches/bots don't
-/// treat it as the real page. It polls its own url every 2s (see
-/// [`splash_page_html`]) and reloads once the engine answers.
-/// Used by the proxy on a connect failure (engine cold boot) and by the gateway
-/// `fallback` when a document navigation lazy-starts a stopped workspace. A
-/// nested frame never gets it: see [`frame_starting_page`].
-///
-/// `label` is what the gateway currently knows about this boot
-/// ([`crate::server::GatewayState::boot_splash_label`]): the boot phase (see
-/// [`crate::boot_phase`]), or a RETRYING boot failure's message when an attempt
-/// failed on something that can still clear, such as a Docker daemon that has
-/// not finished starting. The proxy's own connect-failure path passes the
-/// neutral default. Each poll crossfades in the current label as the boot
-/// progresses.
-///
-/// A retrying failure belongs on THIS page rather than [`failed_page`] precisely
-/// because of the refresh: the condition is expected to clear, and when it does
-/// the next reload lands the user in the workspace with nothing to click.
-///
-/// Carries `X-Lucidos-Boot-Splash: 1` so the PWA service worker
-/// (`crates/lucidos-app/public/sw.js::networkFirstShell`) can tell this
-/// intentional 503 boot page apart from a transient 502/500. Without the marker
-/// the SW treats any non-ok navigation as an error and serves the cached app
-/// shell instead — which then 503-storms its API calls against the not-yet-ready
-/// engine, so the splash never shows for an installed PWA. The marker tells the SW
-/// to SHOW this response; it is never cached (still a 503 + `no-store`).
 pub fn starting_page(label: &str) -> Response {
-    // No escape link: the happy-path boot window.
     boot_splash_response(
         splash_page_html(label, Some(STARTING_POLL_SECS), false),
         STARTING_POLL_SECS,
     )
 }
 
-/// Reuse the trusted boot screen while A retires legacy browser state. The
-/// caller supplies only A-authored script with a JSON-escaped destination.
 pub fn client_upgrade_page(script: &str) -> Response {
     let html = splash_page_html("Updating remote workspace access…", None, true)
         .replace("</head>", &format!("<script>{script}</script></head>"));
@@ -659,23 +434,6 @@ pub fn client_upgrade_page(script: &str) -> Response {
         .into_response()
 }
 
-/// The boot-splash TERMINAL-FAILURE page: the engine reported a boot failure it
-/// cannot retry its way out of (see `lucidos-core/src/boot_failure.rs`), most
-/// commonly a database written by a NEWER Lucidos than the installed one — what an
-/// app downgrade produces. `message` is the engine's own user-facing sentence.
-///
-/// Differs from [`stalled_page`] in the two ways that matter: it states the actual
-/// cause instead of "taking longer than expected", and it carries **no poll and
-/// no meta-refresh** at all. Reloading cannot fix a boot that is definitionally
-/// unachievable, and the gateway has already stopped respawning the engine, so a
-/// refresh loop would only re-render the same page forever. The escape link to the
-/// picker is the one action left. Same 503 + boot-splash marker as its siblings, so
-/// the PWA service worker shows it rather than serving the cached app shell.
-///
-/// This page is also the ONLY place the "install a newer version" remedy can reach
-/// the user: the packaged in-app update toast is started from the workspace app's
-/// startup hook (`store/startup.ts` → `startAppUpdateChecks`), which never runs while
-/// the workspace is stuck on this splash.
 pub fn failed_page(message: &str) -> Response {
     boot_splash_response(
         splash_page_html(message, None, true),
@@ -683,15 +441,6 @@ pub fn failed_page(message: &str) -> Response {
     )
 }
 
-/// The boot-splash ESCAPE page, served once a workspace has been stuck in its boot
-/// window past the gateway's budget (`server::BOOT_ESCAPE_BUDGET`, private to
-/// that module, so this is a plain reference rather than a doc link). An
-/// alive-but-unreachable engine (misconfigured bind, network partition) is never
-/// marked `Unhealthy`, so without this the splash would poll forever with no way
-/// out. It keeps a SLOWER (10s) poll so a late-but-real recovery still
-/// lands on the workspace, AND shows a manual "Back to workspaces" link to the
-/// picker (`/~/?pick`, which stands down the cold-start auto-open so there is no
-/// picker↔workspace loop). Same 503 + boot-splash marker as [`starting_page`].
 pub fn stalled_page() -> Response {
     boot_splash_response(
         splash_page_html(
@@ -703,43 +452,22 @@ pub fn stalled_page() -> Response {
     )
 }
 
-/// The boot-window poll, while the boot is on time.
 const STARTING_POLL_SECS: u32 = 2;
-/// The slower poll once the boot has run past its budget.
 const STALLED_POLL_SECS: u32 = 10;
-/// What a failed page advertises. Only its frame version reloads at it.
 const FAILED_RETRY_AFTER_SECS: u32 = 60;
 
-/// What a nested frame (a widget, an app pane) gets in place of
-/// [`starting_page`]. See [`frame_page`].
 pub fn frame_starting_page() -> Response {
     frame_page(STARTING_POLL_SECS)
 }
 
-/// What a nested frame gets in place of [`stalled_page`], at its slower poll.
 pub fn frame_stalled_page() -> Response {
     frame_page(STALLED_POLL_SECS)
 }
 
-/// What a nested frame gets in place of [`failed_page`]. Unlike that page it
-/// still reloads, slowly: a frame has no escape link and nobody reloads it,
-/// so a fixed workspace would otherwise leave it blank until the host reloads.
 pub fn frame_failed_page() -> Response {
     frame_page(FAILED_RETRY_AFTER_SECS)
 }
 
-/// An empty page for a nested frame whose engine cannot answer, reloading
-/// itself every `refresh_secs`.
-///
-/// The splash is a full-screen brand page, so inside a frame it reads as the
-/// widget itself. Its poller cannot help either: an app frame is sandboxed to
-/// an opaque origin, so its `fetch` carries no cookie and never sees the engine
-/// return. A meta-refresh is a navigation, which carries the cookie, so the
-/// real document lands on the first reload after the engine answers. The host
-/// page owns any visible waiting state.
-///
-/// `color-scheme` follows the user's system, so the empty canvas stays
-/// transparent whenever the host's theme mode agrees with it.
 fn frame_page(refresh_secs: u32) -> Response {
     let html = format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="{refresh_secs}"><meta name="color-scheme" content="light dark"></head><body></body></html>"#
@@ -749,10 +477,6 @@ fn frame_page(refresh_secs: u32) -> Response {
         .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
 }
 
-/// Shared 503 boot-splash response shell: [`waiting_response`] plus the
-/// `X-Lucidos-Boot-Splash: 1` marker, so the PWA service worker
-/// (`networkFirstShell`) SHOWS the page rather than treating the non-ok
-/// navigation as an error and serving the cached app shell.
 fn boot_splash_response(html: String, retry_after: u32) -> Response {
     waiting_response(retry_after)
         .header("x-lucidos-boot-splash", HeaderValue::from_static("1"))
@@ -760,8 +484,6 @@ fn boot_splash_response(html: String, retry_after: u32) -> Response {
         .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
 }
 
-/// A 503 HTML page for a wait: `Retry-After` and `no-store`, so no cache keeps
-/// it past the wait.
 fn waiting_response(retry_after: u32) -> axum::http::response::Builder {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -773,55 +495,15 @@ fn waiting_response(retry_after: u32) -> axum::http::response::Builder {
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
 }
 
-/// The brand boot splash as a self-contained HTML page: a full-screen gradient
-/// wash with the white Lucidos mark playing its reveal animation, and `label`
-/// shown beneath it. The reusable background, where every boot-window surface
-/// passes its own text.
-///
-/// **This is the app's own boot splash, rendered by the gateway.** The page is
-/// assembled from [`app_splash_css`] and [`app_mark_svg`], both lifted verbatim
-/// out of `crates/lucidos-app/index.html` at compile time, so the two surfaces
-/// are one splash rather than two copies: the user crosses from this page to the
-/// app document mid-boot, on the same url, and nothing about the mark or the
-/// status can move because nothing about them is defined twice. What this page
-/// adds is its own canvas plus three documented deviations (a wrapping status
-/// line, no breathe across a reload, its own label), and one difference
-/// in timing rather than style: it renders the shared escape link outright,
-/// where the app document keeps the same link hidden until its boot gives up.
-/// It is also self-contained by necessity: it renders when no engine is
-/// reachable, so it can link nothing.
-///
-/// The `<link rel="icon">` is an inline `data:` URI mirror of
-/// `crates/lucidos-app/public/favicon.svg` (gradient tile on a rounded square),
-/// inlined for the same reason. Its geometry + gradient are the single-source
-/// values from the icon generator; keep them in sync if the brand changes there.
-///
-/// `label` is HTML-ESCAPED before interpolation. The phase labels are static
-/// strings, but [`failed_page`]'s message arrives from the engine over the
-/// `boot-failure` control endpoint — loopback-only and id-validated, yet no longer
-/// trusted-static once it crosses a wire. Escaping here rather than at that one
-/// call site keeps every present and future caller safe by construction.
-///
-/// `refresh_secs` sets the poll interval (2s on the happy-path [`starting_page`],
-/// slower on [`stalled_page`]). `None` omits the poll and the no-script refresh
-/// entirely, for [`failed_page`], where reloading can never change the outcome.
-/// When `escape` is set a manual "Back to workspaces" link to the picker is shown
-/// below the label.
 fn splash_page_html(label: &str, refresh_secs: Option<u32>, escape: bool) -> String {
-    // Split the template around the refresh tag, the label, and the escape link so
-    // the static CSS (full of `{}`) needs no `format!` brace-escaping.
     const HEAD_A: &str = r##"<!doctype html><html><head><meta charset="utf-8">
 "##;
     const HEAD_B: &str = r##"
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><radialGradient id='g' gradientUnits='userSpaceOnUse' cx='30' cy='22' r='125'><stop offset='0' stop-color='%232d83e0'/><stop offset='1' stop-color='%230a4ea8'/></radialGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g transform='translate(13 13) scale(0.74)' fill='%23fff'><rect x='17' y='17' width='29' height='29' rx='7'/><rect x='17' y='54' width='29' height='29' rx='7'/><rect x='54' y='54' width='29' height='29' rx='7'/><path d='M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z'/></g></svg>">
 <title>"##;
-    // Split again around the tab title: the failure page must not sit in the tab
-    // claiming "Starting…" while the page itself says the workspace cannot open.
     const STYLE_OPEN: &str = r##"</title>
 <style>
 "##;
-    // Everything the shared stylesheet does NOT cover: this document's own canvas,
-    // and the four places this page deliberately differs from the app splash.
     const GATEWAY_CSS_AND_BODY: &str = r##"
 html,body{margin:0;height:100%}
 /* Paint the gradient on the root with a base colour + fixed attachment so it
@@ -860,31 +542,13 @@ stalled/failed pages, where there is nothing else left to offer). */
 </head>
 <body>
 "##;
-    // 3. The last deviation, in markup rather than CSS: the app bakes its own
-    // status text ("Opening your workspace…"), ours is per-page.
     const MARK_TO_LABEL: &str = r##"
 <div class="boot-splash-foot">
 <div class="boot-splash-status boot-splash-status-shown">"##;
-    // Keep the mark built for as long as this tab is showing one. This page and
-    // the app shell are the SAME url (the poller below reloads this once the
-    // engine answers, then the engine serves index.html), so with no handover
-    // every reload, and the final swap to the app, would re-play the reveal: a
-    // mark that is already standing there drops to opacity 0 and rebuilds. Read
-    // the flag to skip our own reveal, and set it for whoever comes next.
-    // index.html REMOVES it as it reads it, so it can never suppress a reveal
-    // that would not have been a rebuild. sessionStorage is per-tab and
-    // same-origin (the gateway serves both documents), which is exactly the scope
-    // of "a mark is on screen in this tab right now".
     const HANDOVER: &str = r##"<script>try{var f=sessionStorage.getItem('lucidos-splash-mark-formed')==='1';sessionStorage.setItem('lucidos-splash-mark-formed','1');if(f){document.querySelector('.boot-splash').classList.add('boot-splash-formed')}}catch(e){}</script>"##;
-    // The picker link stands down the cold-start auto-open (`?pick`), so a manual
-    // tap can't loop back into the unreachable workspace.
     const ESCAPE_LINK: &str =
         r##"<a class="boot-splash-escape" href="/~/?pick">Back to workspaces</a>"##;
     let escape_html = if escape { ESCAPE_LINK } else { "" };
-    // The meta-refresh survives only for a browser with scripting off, where the
-    // poller cannot run. Omitted entirely (not `content="0"`) when there is
-    // nothing to wait for. `data-ready-label` is what the poller shows before
-    // it reloads into the app.
     let (refresh_html, poll_attrs) = match refresh_secs {
         Some(secs) => (
             format!(r#"<noscript><meta http-equiv="refresh" content="{secs}"></noscript>"#),
@@ -895,7 +559,6 @@ stalled/failed pages, where there is nothing else left to offer). */
         ),
         None => (String::new(), String::new()),
     };
-    // A page with nothing to wait for is not "Starting…".
     let title = if refresh_secs.is_some() {
         "Starting…"
     } else {
@@ -912,26 +575,8 @@ stalled/failed pages, where there is nothing else left to offer). */
     )
 }
 
-/// Advance the page IN PLACE. A reload per label repaints the whole splash
-/// and swaps the status with no transition. So fetch this same url instead,
-/// crossfade in the new label while the page is the same kind, and reload
-/// only when it is not: the engine answered, or the page became the stalled
-/// or failed one. `data-poll-secs` is the interval, and its absence (the
-/// failed page) means there is nothing to wait for. The 150ms before a swap
-/// waits out the `.boot-splash-status-swap` fade in index.html.
-///
-/// When the engine answers, the app document opens on its own baked status
-/// (`data-ready-label`). So the page crossfades to those words first, and
-/// reloads only once the 300ms fade-in has finished. The seam then joins two
-/// identical frames, instead of snapping a boot phase to new words.
 const SPLASH_POLLER: &str = r##"<script>(function(){var splash=document.querySelector('.boot-splash'),secs=Number(splash&&splash.getAttribute('data-poll-secs'));if(!secs)return;var every=secs*1000;if(!window.fetch||!window.DOMParser){setTimeout(function(){location.reload()},every);return}var status=splash.querySelector('.boot-splash-status'),ready=splash.getAttribute('data-ready-label'),swap;function reload(){location.reload()}function still(){return document.documentElement.getAttribute('data-motion')==='reduce'}function kind(doc){var s=doc.querySelector('.boot-splash');return s?s.getAttribute('data-poll-secs')+(s.querySelector('.boot-splash-escape')?'+escape':''):''}var mine=kind(document);function show(text,then){if(!status||text===status.textContent){if(then)then();return}clearTimeout(swap);status.classList.add('boot-splash-status-swap');swap=setTimeout(function(){status.textContent=text;status.classList.remove('boot-splash-status-swap');if(then)setTimeout(then,still()?0:300)},still()?0:150)}function poll(){fetch(location.href,{headers:{Accept:'text/html'},cache:'no-store'}).then(function(r){if(!r.headers.get('x-lucidos-boot-splash'))return r.ok&&ready?show(ready,reload):reload();return r.text().then(function(html){var doc=new DOMParser().parseFromString(html,'text/html');if(kind(doc)!==mine)return reload();var next=doc.querySelector('.boot-splash-status');if(next)show(next.textContent);setTimeout(poll,every)})}).catch(function(){setTimeout(poll,every)})}setTimeout(poll,every)})()</script>"##;
 
-/// The app document, embedded at COMPILE time. The splash must render with no
-/// engine reachable, so it cannot link the app's stylesheet; embedding the file
-/// lets this page carry the very same one inline. `include_str!` is a build
-/// dependency, so cargo rebuilds this crate whenever index.html changes, and
-/// `files_require_restart` (engine-side) treats index.html as a bundled asset for
-/// the same reason.
 const APP_INDEX_HTML: &str = include_str!("../../lucidos-app/index.html");
 
 const CSS_START: &str = "/* lucidos-boot-splash-css-start */";
@@ -941,38 +586,18 @@ const MARK_END: &str = "<!-- lucidos-boot-splash-mark-end -->";
 const STATUS_OPEN: &str =
     r#"<div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">"#;
 
-/// The boot-splash stylesheet, verbatim from index.html (see its "SINGLE SOURCE
-/// FOR BOTH SPLASH SURFACES" comment). This is why the two splashes cannot
-/// drift: there is one stylesheet, and this page overrides exactly four things
-/// in it.
-///
-/// Empty if the markers ever move, which degrades to an unstyled splash rather
-/// than taking the page down. `the_app_splash_stylesheet_and_mark_are_extractable`
-/// is what actually prevents that, at build-gate time.
 fn app_splash_css() -> &'static str {
     slice_between(APP_INDEX_HTML, CSS_START, CSS_END).unwrap_or("")
 }
 
-/// The boot-splash mark, verbatim from index.html, so both surfaces draw the
-/// same glyph with the same classes and the same reveal. Same empty-on-missing
-/// contract as [`app_splash_css`].
 fn app_mark_svg() -> &'static str {
     slice_between(APP_INDEX_HTML, MARK_START, MARK_END).unwrap_or("")
 }
 
-/// The status the app document bakes ("Opening your workspace…"), verbatim, so
-/// the poller hands over on the app's exact words. Empty if the element moves,
-/// and an empty label makes the poller reload without the crossfade.
 fn app_status_text() -> &'static str {
     slice_between(APP_INDEX_HTML, STATUS_OPEN, "</div>").unwrap_or("")
 }
 
-/// The app document's viewport, iOS home-screen and `theme-color` `<meta>`
-/// tags, verbatim. They decide how tall the viewport is in an installed PWA,
-/// and the splash centres its mark in that viewport. A page with a different
-/// set lays out in a different viewport, so its mark sits higher and drops at
-/// the hand-over. `theme-color` tints the browser toolbar above both pages.
-/// Lifted rather than copied, like the stylesheet, so the two cannot differ.
 fn app_device_meta() -> String {
     APP_INDEX_HTML
         .lines()
@@ -986,15 +611,12 @@ fn app_device_meta() -> String {
         .join("\n")
 }
 
-/// The text between `open` and the first following `close`, excluding both.
 fn slice_between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
     let start = haystack.find(open)? + open.len();
     let end = haystack[start..].find(close)? + start;
     Some(&haystack[start..end])
 }
 
-/// Escape text for interpolation into HTML element content or a quoted attribute.
-/// `&` first, or the later replacements' own ampersands would be double-escaped.
 fn escape_html_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1003,10 +625,6 @@ fn escape_html_text(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// The gateway's own credential, as the test modules below spell it.
-///
-/// Deliberately not a value any test client sends, so "the gateway's own
-/// reached the upstream" and "the client's did not" stay separate assertions.
 #[cfg(test)]
 const TEST_LOCAL_TOKEN: &str = "gateway-own-token";
 
@@ -1025,25 +643,18 @@ mod tests {
             strip_prefix("/dev/assets/x.js?v=1", "dev"),
             Some("/assets/x.js?v=1")
         );
-        // Exactly "/<slug>" → None (caller redirects to add trailing slash).
         assert_eq!(strip_prefix("/dev", "dev"), None);
     }
 
     #[test]
     fn strip_prefix_rejects_foreign_slugs() {
-        // A different slug that shares a prefix must not match.
         assert_eq!(strip_prefix("/devx/foo", "dev"), None);
         assert_eq!(strip_prefix("/other/foo", "dev"), None);
         assert_eq!(strip_prefix("/api/v1/health", "dev"), None);
     }
 
-    /// The anchors [`app_splash_css`] / [`app_mark_svg`] slice index.html on. A
-    /// rename there would silently leave this page unstyled or markless, which
-    /// is the one failure mode of sharing the file instead of copying it. The
-    /// app side pins the same contract in `src/utils/bootSplash.test.ts`.
     #[test]
     fn the_app_splash_stylesheet_and_mark_are_extractable() {
-        // One pair of each marker, or the slice silently takes the wrong span.
         for marker in [CSS_START, CSS_END, MARK_START, MARK_END] {
             assert_eq!(APP_INDEX_HTML.matches(marker).count(), 1, "{marker}");
         }
@@ -1057,9 +668,6 @@ mod tests {
         assert!(mark.contains("</svg>"), "{mark}");
     }
 
-    /// The poller crossfades to the app's own status before it reloads, so the
-    /// app document opens on identical words. An empty lift would quietly
-    /// bring the snap back, so pin the extraction and the stamp together.
     #[test]
     fn a_waiting_page_hands_over_on_the_app_documents_status() {
         assert_eq!(APP_INDEX_HTML.matches(STATUS_OPEN).count(), 1);
@@ -1068,24 +676,16 @@ mod tests {
         assert!(!text.contains('<') && !text.contains('\n'), "{text}");
         let stamp = format!(r#"data-ready-label="{}""#, escape_html_text(text));
         assert!(splash_page_html("Starting engine…", Some(2), false).contains(&stamp));
-        // The stalled page still polls, so a late recovery hands over too.
         assert!(splash_page_html("Taking longer", Some(10), true).contains(&stamp));
-        // The failed page has nothing to wait for, so nothing to hand over to.
         assert!(!splash_page_html("Cannot open", None, true).contains(r#"data-ready-label=""#));
     }
 
-    /// The page renders the app's splash rather than a copy of it: same
-    /// stylesheet, same mark, same class names. Nothing about the mark's size or
-    /// the status line's placement is defined here, so nothing can drift across
-    /// the seam where this page hands over to the app document.
     #[test]
     fn splash_page_is_built_from_the_app_splash_not_a_copy_of_it() {
         let html = splash_page_html("Starting engine", Some(2), true);
         assert!(html.contains(app_splash_css()), "{html}");
         assert!(html.contains(app_mark_svg()), "{html}");
         assert!(html.contains(r#"<div class="boot-splash""#), "{html}");
-        // The status and the escape link hang from the mark in the shared foot,
-        // so neither can move the mark (index.html `.boot-splash-foot`).
         assert!(app_splash_css().contains(".boot-splash-foot"));
         let foot = html
             .split(r#"<div class="boot-splash-foot">"#)
@@ -1096,26 +696,13 @@ mod tests {
             "{html}"
         );
         assert!(foot.contains("Back to workspaces"), "{html}");
-        // Everything below is about this page's OWN css (the tail after the
-        // shared sheet); the sheet itself is the app's to police.
         let tail = html.split("</style>").next().unwrap_or_default();
         let tail = tail.split("html,body{margin:0").nth(1).unwrap_or_default();
         let tail = strip_css_comments(tail);
-        // A rem length here would ride the root font-size, which differs between
-        // the two documents (the app root is var(--user-ui-scale)); that is what
-        // made the mark grow at the seam.
         assert!(!tail.contains("rem"), "{tail}");
-        // No type of its own either: every line on this page inherits the
-        // stack/size/spacing from `.boot-splash`. A `font-` declaration here is
-        // a second copy of a value the shared sheet already owns, and dropping
-        // the old `body{font-family:…}` without inheriting is what once left the
-        // escape link rendering in the UA serif.
         assert!(!tail.contains("font-"), "{tail}");
     }
 
-    /// The installed PWA sizes its viewport from these tags, and the splash
-    /// centres its mark in it. So this page must carry the app document's own
-    /// tags, or the mark drops when the app document takes over.
     #[test]
     fn splash_page_lays_out_in_the_app_documents_viewport() {
         let app_tag = |prefix: &str| {
@@ -1136,7 +723,6 @@ mod tests {
         );
         let status_bar = app_tag(r#"<meta name="apple-mobile-web-app-status-bar-style""#);
         assert!(html.contains(status_bar), "{html}");
-        // The toolbar keeps its colour when the app document takes over.
         let theme_color = app_tag(r#"<meta name="theme-color""#);
         assert!(html.contains(theme_color), "{html}");
         assert_eq!(
@@ -1146,9 +732,6 @@ mod tests {
         );
     }
 
-    /// A cold launch can open on this page, and iOS samples the top edge at
-    /// load. Neither document carries a status bar strip (ADR 0553), so the
-    /// installed iOS app meets the same translucent bar from the first frame.
     #[test]
     fn splash_page_carries_no_ios_status_bar_strip() {
         assert!(!APP_INDEX_HTML.contains("status-bar-fill"));
@@ -1157,11 +740,6 @@ mod tests {
         assert!(!html.contains("data-ios-status-bar"), "{html}");
     }
 
-    /// The shared sheet keys reduced motion on `data-motion`, which the app sets
-    /// from the device's Motion setting. This page has no boot script, so a
-    /// small one of its own resolves it before the splash markup parses. It
-    /// reads the workspace-scoped mirror the app's boot script reads. So a
-    /// device that chose Reduce in the app gets a still splash here too.
     #[test]
     fn splash_page_resolves_motion_before_the_splash_paints() {
         let html = splash_page_html("Starting engine", Some(2), false);
@@ -1174,8 +752,6 @@ mod tests {
             contract.contains("export const MOTION_STORAGE_KEY = 'lucidos-motion';"),
             "the page reads the mirror under the contract's key"
         );
-        // `ws:<slug>:<key>`, the namespacing `_storage.ts` gives every
-        // workspace-scoped key, with the raw key for the picker.
         assert!(html.contains("'ws:'+s+':'+k"), "{html}");
         assert!(html.contains("k='lucidos-motion'"), "{html}");
         let set = html
@@ -1186,16 +762,12 @@ mod tests {
             set < splash,
             "data-motion must be set before the splash markup"
         );
-        // The page's own reveal override must stand down under reduced motion.
         assert!(html.contains(
             r#":where(:root:not([data-motion="reduce"])) .boot-splash-mark{animation-name:boot-mark-reveal}"#
         ));
         assert!(!html.contains("prefers-reduced-motion:no-preference"));
     }
 
-    /// The escape link is one link with one appearance across both surfaces: the
-    /// app document offers the same link when its own boot gives up, so the rule
-    /// lives in the shared sheet and this page must NOT carry a second copy.
     #[test]
     fn escape_link_is_styled_by_the_shared_sheet_not_a_local_copy() {
         assert!(
@@ -1211,11 +783,6 @@ mod tests {
         );
     }
 
-    /// The canvas base colour is what iOS paints into the bottom safe-area strip
-    /// on BOTH splash surfaces, so the two must agree or the seam moves when this
-    /// page hands over to the app document mid-boot. index.html is embedded here
-    /// already, so read the value out of it rather than keeping a second copy of
-    /// the constant.
     #[test]
     fn splash_canvas_base_colour_matches_the_app_document() {
         let app_base = APP_INDEX_HTML
@@ -1234,8 +801,6 @@ mod tests {
         );
     }
 
-    /// CSS comments removed, so a comment that MENTIONS a unit is not read as a
-    /// declaration using it.
     fn strip_css_comments(css: &str) -> String {
         let mut out = String::new();
         let mut rest = css;
@@ -1250,12 +815,6 @@ mod tests {
         out
     }
 
-    /// Every document in a boot shows the SAME standing mark. This page can be
-    /// reloaded into another kind of splash, and the app document then replaces
-    /// it at the same url. Without a handover each would re-play the reveal and
-    /// rebuild a mark that is already on screen. The flag is set for the next
-    /// document and read to suppress our own reveal; index.html consumes it
-    /// (removing it), so it can never suppress a reveal that was not a rebuild.
     #[test]
     fn splash_keeps_the_mark_built_across_every_document_in_a_boot() {
         for html in [
@@ -1274,8 +833,6 @@ mod tests {
                 html.contains("classList.add('boot-splash-formed')"),
                 "{html}"
             );
-            // Once formed, the mark stands still: a reload restarts every
-            // animation, so a breathe would snap back to full opacity.
             assert!(
                 html.contains(".boot-splash-formed .boot-splash-mark{animation-name:none}"),
                 "{html}"
@@ -1286,13 +843,8 @@ mod tests {
     #[test]
     fn starting_splash_renders_the_phase_label_and_has_no_escape_link() {
         let html = splash_page_html("Running migrations…", Some(2), false);
-        // The current boot-phase label is shown beneath the mark.
         assert!(html.contains("Running migrations…"));
-        // The 2s poll that advances the label and drives the happy-path
-        // transition is preserved.
         assert!(html.contains(r#"data-poll-secs="2""#));
-        // The happy-path splash has NO escape link (no anchor, no picker href) and
-        // none of the removed auto-redirect machinery.
         assert!(!html.contains("<a "));
         assert!(!html.contains("/~/?pick"));
         assert!(!html.contains("Back to workspaces"));
@@ -1301,11 +853,6 @@ mod tests {
         assert!(!html.contains("lucidos-boot-since"));
     }
 
-    /// A new boot phase must not reload the page. A reload repaints the whole
-    /// splash and swaps the status with no transition, which read as the
-    /// splash jumping. The poller crossfades the label in place instead, and
-    /// the meta-refresh is only the fallback for a browser with scripting off.
-    /// The poller's behaviour is pinned in `src/utils/gatewaySplashPoller.test.ts`.
     #[test]
     fn a_new_phase_crossfades_in_place_rather_than_reloading() {
         let html = splash_page_html("Recovering sessions…", Some(2), false);
@@ -1316,16 +863,10 @@ mod tests {
         assert_eq!(html.matches("http-equiv=\"refresh\"").count(), 1, "{html}");
         assert!(html.contains(r#"data-poll-secs="2""#), "{html}");
         assert!(html.contains(SPLASH_POLLER), "{html}");
-        // The fade the poller runs is the shared one, so the app document's
-        // status changes look identical.
         assert!(SPLASH_POLLER.contains("boot-splash-status-swap"));
         assert!(app_splash_css().contains(".boot-splash-status.boot-splash-status-swap"));
     }
 
-    /// A gateway-observed failure the supervisor is still retrying rides the
-    /// SAME starting splash: the reason is visible, and the 2s refresh survives
-    /// so the page carries the user into the workspace the moment an attempt
-    /// succeeds. Reading as a dead end would be wrong, because it is not one.
     #[test]
     fn retrying_splash_states_the_reason_and_keeps_refreshing() {
         let resp = starting_page(
@@ -1347,7 +888,6 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("Retrying… (attempt 2 of 5)"), "{html}");
-        // The refresh is the whole point: this state clears by itself.
         assert!(html.contains(r#"data-poll-secs="2""#), "{html}");
         assert!(html.contains("<title>Starting…</title>"), "{html}");
     }
@@ -1356,15 +896,10 @@ mod tests {
     fn stalled_splash_has_manual_escape_link_and_slower_refresh() {
         let html = splash_page_html("This is taking longer than expected.", Some(10), true);
         assert!(html.contains("This is taking longer than expected."));
-        // A slower (10s) poll so a late-but-real recovery still lands on the
-        // workspace, rather than the happy-path 2s.
         assert!(html.contains(r#"data-poll-secs="10""#));
         assert!(html.contains(r#"<noscript><meta http-equiv="refresh" content="10"></noscript>"#));
-        // A MANUAL "Back to workspaces" link to the picker. `?pick` stands down the
-        // cold-start auto-open, so tapping it cannot loop back into the workspace.
         assert!(html.contains(r##"href="/~/?pick""##));
         assert!(html.contains("Back to workspaces"));
-        // It is a manual link, NOT the removed auto-redirect / countdown.
         assert!(!html.contains("show-escape"));
         assert!(!html.contains("lucidos-boot-since"));
     }
@@ -1381,8 +916,6 @@ mod tests {
         );
     }
 
-    /// A terminal failure must not self-refresh: the gateway has stopped
-    /// respawning, so a reload loop would re-render the same page forever.
     #[test]
     fn failure_splash_states_the_cause_with_no_refresh_but_an_escape_link() {
         let html = splash_page_html(
@@ -1395,30 +928,20 @@ mod tests {
             html.contains("its database was created by a newer version"),
             "{html}"
         );
-        // No meta-refresh AT ALL — not `content="0"`, not a long interval.
         assert!(!html.contains("http-equiv=\"refresh\""), "{html}");
-        // And no poll either, which would reload it just the same.
         assert!(!html.contains(r#"data-poll-secs=""#), "{html}");
-        // ...and the tab must not claim the workspace is still starting.
         assert!(
             html.contains("<title>Cannot open workspace</title>"),
             "{html}"
         );
         assert!(!html.contains("Starting…"), "{html}");
-        // The escape to the picker is the only action left.
         assert!(html.contains(r##"href="/~/?pick""##));
         assert!(html.contains("Back to workspaces"));
     }
 
-    /// The failure message crosses a wire (the `boot-failure` control endpoint), so
-    /// it is not trusted-static like the phase labels are.
     #[test]
     fn splash_escapes_html_in_the_label() {
         let html = splash_page_html(r#"<script>alert("x")</script> & 'quoted'"#, None, false);
-        // The page ships exactly THREE scripts of its own: the motion resolver,
-        // the mark handover and the poller. So a raw tag out of the label would
-        // show up as a fourth. Counting beats a bare "contains no <script>":
-        // that only held while the page had none.
         assert_eq!(
             html.matches("<script>").count(),
             3,
@@ -1452,10 +975,6 @@ mod tests {
     }
 }
 
-/// Tests for the streaming forwarder against a mock upstream. The gateway must
-/// add `X-Forwarded-Prefix`, NOT strip `Accept-Encoding`, stream the response
-/// body, and fall back to the auto-retry page (not a raw error) when the engine
-/// is unreachable.
 #[cfg(test)]
 mod proxy_tests {
     use super::*;
@@ -1464,11 +983,7 @@ mod proxy_tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A non-ASCII pairing label, so every test that forwards it also proves
-    /// the percent-encoding.
     const TEST_DEVICE_LABEL: &str = "Café iPhone";
-    /// [`TEST_DEVICE_LABEL`] as it reaches the engine, lowercased like the
-    /// captured request heads the tests search.
     pub(super) const TEST_DEVICE_LABEL_HEADER: &str = "x-lucidos-device-label: caf%c3%a9%20iphone";
 
     pub(super) fn test_device(id: &str) -> crate::auth::AuthenticatedDevice {
@@ -1478,8 +993,6 @@ mod proxy_tests {
         }
     }
 
-    /// Capturing upstream: records the raw request bytes it receives, then 200s.
-    /// The directory holds its engine socket, so the caller keeps it alive.
     async fn capturing_upstream() -> (
         tempfile::TempDir,
         EngineAddress,
@@ -1603,9 +1116,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn the_frame_capability_segment_never_reaches_the_engine() {
-        // The engine's URL space stays what a direct-to-engine caller sees. By
-        // the time a request gets here the pass is addressing rather than
-        // authorization (ADR 0238). So it comes off, and the query rides on.
         let (_dir, target, captured) = capturing_upstream().await;
         let resp = proxy(
             &target,
@@ -1648,15 +1158,10 @@ mod proxy_tests {
 
     #[test]
     fn the_capability_is_cut_out_of_the_path_and_never_out_of_the_query() {
-        // The gate reads `uri.path()`, so a `/` inside the query must not move
-        // the cut. Otherwise the verified path and the fetched path are two
-        // different strings, which is the invariant this design rests on.
         assert_eq!(
             strip_frame_capability("/~cap/tok/data/x.png?to=/a/b"),
             "/data/x.png?to=/a/b"
         );
-        // No slash after the token, so the path carries no capability at all.
-        // The query's slashes must not supply one.
         assert_eq!(
             strip_frame_capability("/~cap/tok?x=/y/data/z"),
             "/~cap/tok?x=/y/data/z"
@@ -1665,9 +1170,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn strips_client_spoofed_forwarded_prefix() {
-        // The gateway is the trust boundary: a client-supplied X-Forwarded-Prefix
-        // must NOT survive to the engine, or it would control the stamped
-        // `<base href>`. Only the gateway's own `/dev/` may reach the upstream.
         let (_dir, target, captured) = capturing_upstream().await;
         let req = axum::http::Request::builder()
             .method("GET")
@@ -1699,11 +1201,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn strips_client_spoofed_forwarded_host() {
-        // Trust-boundary hygiene: the gateway no longer injects x-forwarded-host
-        // (the engine's credentialed-proxy guard uses Sec-Fetch-Site, not a
-        // reconstructed host), but a client-forged inbound value must still be
-        // stripped so it can't reach an upstream that trusts it. Unlike
-        // x-forwarded-prefix, nothing is put back in its place.
         let (_dir, target, captured) = capturing_upstream().await;
         let req = axum::http::Request::builder()
             .method("GET")
@@ -1734,9 +1231,6 @@ mod proxy_tests {
         );
     }
 
-    /// What the engine sees when a browser POSTs through the gateway. A
-    /// plain-HTTP origin gets no `Sec-Fetch-Site` from any browser, so `Origin`
-    /// is the only signal there is.
     async fn upstream_saw_post(host: &str, origin: &str, sec_fetch_site: Option<&str>) -> String {
         let (_dir, target, captured) = capturing_upstream().await;
         let mut builder = axum::http::Request::builder()
@@ -1809,8 +1303,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn the_gateway_vouches_for_its_own_hop() {
-        // A wide-bound engine requires this, and a loopback one ignores it. It
-        // is sent either way so the two topologies take one code path.
         let (_dir, target, captured) = capturing_upstream().await;
         let req = request("GET", "/dev/api/v1/threads/list", Body::empty());
         let resp = proxy(
@@ -1836,10 +1328,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn a_client_cannot_supply_either_engine_credential() {
-        // The escalation this closes. A wide-bound engine reads both headers as
-        // authorization, so a value the caller chose would BE the
-        // authorization. The gateway owns both names and re-injects only its
-        // own local token.
         for spoofed in [
             crate::auth::HEADER_LOCAL_TOKEN,
             crate::auth::HEADER_HOOK_SOCKET_TOKEN,
@@ -1872,8 +1360,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn the_hook_socket_token_is_never_injected_on_the_proxy_path() {
-        // Only the hook socket presents it. Injecting it here would hand every
-        // proxied request a second credential, and widen what a proxy bug leaks.
         let (_dir, target, captured) = capturing_upstream().await;
         let req = request("GET", "/dev/", Body::empty());
         let resp = proxy(
@@ -1896,8 +1382,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn forwards_the_authenticated_device_id() {
-        // The engine keys push, per-device preferences and actor attribution on
-        // this header, so it must carry the device the gateway authenticated.
         let (_dir, target, captured) = capturing_upstream().await;
         let mut req = request("GET", "/dev/", Body::empty());
         req.extensions_mut().insert(test_device("device-1"));
@@ -1925,8 +1409,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn strips_client_spoofed_device_id() {
-        // A client-chosen device id would let any paired caller act as any other
-        // device. The gateway's own value is the only one allowed through.
         let (_dir, target, captured) = capturing_upstream().await;
         let mut req = axum::http::Request::builder()
             .method("GET")
@@ -1964,8 +1446,6 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn forwards_no_device_id_without_an_authenticated_one() {
-        // A local process holds no device row, so it must not be handed one.
-        // With no extension the header is stripped and nothing replaces it.
         let (_dir, target, captured) = capturing_upstream().await;
         let req = axum::http::Request::builder()
             .method("GET")
@@ -1992,7 +1472,6 @@ mod proxy_tests {
         );
     }
 
-    /// The stamp header value the upstream saw, if any.
     fn captured_stamp(got: &str) -> Option<String> {
         got.lines().find_map(|line| {
             line.strip_prefix(&format!(
@@ -2003,8 +1482,6 @@ mod proxy_tests {
         })
     }
 
-    /// The engine trusts a device only with a stamp under its own key. So the
-    /// proxy signs the device it authenticated, for this workspace.
     #[tokio::test]
     async fn signs_the_authenticated_device_for_the_engine() {
         let (_dir, target, captured) = capturing_upstream().await;
@@ -2032,9 +1509,6 @@ mod proxy_tests {
         assert!(!key.verify_now(&stamp, claim("device-2")), "{stamp}");
     }
 
-    /// A client's own stamp never reaches the engine, whatever else holds. With
-    /// no authenticated device nothing replaces it, and with no key (an engine
-    /// adopted keyless) the device goes unstamped.
     #[tokio::test]
     async fn strips_a_client_stamp_and_signs_nothing_without_a_key() {
         for device in [None, Some("device-1")] {
@@ -2068,8 +1542,6 @@ mod proxy_tests {
         }
     }
 
-    /// A workspace call's claim is the gateway's to send. A client's copy never
-    /// reaches the engine, so no client can name a verdict.
     #[tokio::test]
     async fn strips_a_client_workspace_call_claim() {
         let (_dir, target, captured) = capturing_upstream().await;
@@ -2133,14 +1605,8 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn unreachable_engine_serves_starting_page_with_boot_label() {
-        // Nothing listens on the socket, as during a cold boot. The
-        // boot-window page (503 + auto-refresh) replaces the raw 502 from 0013.
         let dir = test_engine::scratch();
         let target = test_engine::unreachable(&dir);
-        // The route is set while the engine is still Booting, so a cold-open
-        // navigation reaches the proxy (not fallback's no-route branch) during
-        // the engine-reported phases — the connect-failure splash MUST render the
-        // passed phase label, or those phases would never reach the user.
         let resp = proxy(
             &target,
             "dev",
@@ -2153,8 +1619,6 @@ mod proxy_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "2");
-        // The PWA service worker keys on this marker to SHOW the splash instead of
-        // falling back to the cached app shell (sw.js::networkFirstShell).
         assert_eq!(resp.headers().get("x-lucidos-boot-splash").unwrap(), "1");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -2166,9 +1630,6 @@ mod proxy_tests {
         );
     }
 
-    /// A widget is an iframe, and the brand splash would fill it. Its poller
-    /// also cannot reach the gateway from a sandboxed frame, so the splash
-    /// would stay after the engine came back.
     #[tokio::test]
     async fn an_unreachable_engine_gives_a_frame_the_quiet_page_not_the_splash() {
         let dir = test_engine::scratch();
@@ -2205,9 +1666,6 @@ mod proxy_tests {
         );
     }
 
-    /// I6: a response streams through the engine socket rather than being
-    /// buffered, which SSE (`/api/v1/events`) depends on. The engine holds its
-    /// second chunk back until the client has read the first.
     #[tokio::test]
     async fn a_response_streams_through_chunk_by_chunk() {
         use futures::StreamExt as _;
@@ -2254,10 +1712,6 @@ mod proxy_tests {
         assert_eq!(&second[..], b"data: two\n\n");
     }
 
-    /// I1 and I8: an engine socket the kernel does not name as this user's
-    /// gets nothing, not the local token, not the cookie, not the body. The
-    /// proxy answers 502 rather than the boot splash, because waiting will not
-    /// fix it.
     #[tokio::test]
     async fn a_strangers_engine_socket_receives_nothing_and_answers_502() {
         let dir = test_engine::scratch();
@@ -2287,9 +1741,6 @@ mod proxy_tests {
     }
 }
 
-/// The WebSocket upgrade hop (ADR 0151). Two things must hold and neither is
-/// visible from the HTTP tests above: the handshake survives the proxy, and the
-/// trust boundary is the same one.
 #[cfg(test)]
 mod upgrade_tests {
     use super::proxy_tests::{test_device, TEST_DEVICE_LABEL_HEADER};
@@ -2300,10 +1751,6 @@ mod upgrade_tests {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// A client's upgrade request, as a browser sends it.
-    ///
-    /// `Connection` carries a LIST, which is what browsers do and what a
-    /// whole-value compare would miss.
     fn upgrade_request_bytes(path: &str, extra: &str) -> String {
         format!(
             "GET {path} HTTP/1.1\r\n\
@@ -2316,7 +1763,6 @@ mod upgrade_tests {
         )
     }
 
-    /// Read a request or response head, stopping at the blank line.
     async fn read_head(sock: &mut (impl AsyncRead + Unpin)) -> String {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
@@ -2329,11 +1775,6 @@ mod upgrade_tests {
         String::from_utf8_lossy(&head).into_owned()
     }
 
-    /// A stand-in engine: completes the handshake, then echoes every byte.
-    ///
-    /// Raw bytes rather than a WebSocket library, deliberately. What these
-    /// tests must prove is that BYTES cross intact, because the gateway never
-    /// parses a frame. The directory holds its engine socket.
     async fn upgrading_upstream() -> (
         tempfile::TempDir,
         EngineAddress,
@@ -2366,9 +1807,6 @@ mod upgrade_tests {
         (dir, addr, captured)
     }
 
-    /// A gateway serving one route through the real [`proxy`], with an
-    /// optionally-authenticated device. `axum::serve` drives connections with
-    /// upgrades, which is what puts `OnUpgrade` in the request extensions.
     async fn gateway_serving(target: EngineAddress, device: Option<&'static str>) -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2396,8 +1834,6 @@ mod upgrade_tests {
         port
     }
 
-    /// Open an upgrade through a gateway and return its response head plus the
-    /// live socket.
     async fn upgrade_through(port: u16, extra: &str) -> (String, tokio::net::TcpStream) {
         let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -2410,9 +1846,6 @@ mod upgrade_tests {
         (head, client)
     }
 
-    /// The whole point: an upgrade crosses the gateway and bytes flow both
-    /// ways afterwards. A relay that re-framed messages could pass the
-    /// handshake half of this and still corrupt the payload.
     #[tokio::test]
     async fn an_upgrade_crosses_the_gateway_and_bytes_flow_both_ways() {
         let (_dir, upstream, captured) = upgrading_upstream().await;
@@ -2425,14 +1858,11 @@ mod upgrade_tests {
             "the engine's handshake answer must reach the client: {head}"
         );
 
-        // Bytes, not frames. The gateway is transparent, so whatever is
-        // written arrives unchanged.
         client.write_all(b"\x82\x03abc").await.unwrap();
         let mut back = [0u8; 5];
         client.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"\x82\x03abc");
 
-        // The engine saw a real handshake, with the prefix stripped.
         let got = captured.lock().await.clone();
         assert!(got.contains("get /api/v1/ws-echo http/1.1"), "{got}");
         assert!(got.contains("upgrade: websocket"), "{got}");
@@ -2440,9 +1870,6 @@ mod upgrade_tests {
         assert!(got.contains("x-forwarded-prefix: /dev/"), "{got}");
     }
 
-    /// The framing headers are the one thing the upgrade path must NOT strip.
-    /// The HTTP path drops both as hop-by-hop, and an engine that never sees
-    /// them refuses the handshake.
     #[tokio::test]
     async fn the_handover_headers_survive_the_upgrade_path() {
         let (_dir, upstream, captured) = upgrading_upstream().await;
@@ -2454,8 +1881,6 @@ mod upgrade_tests {
         assert!(got.contains("upgrade: websocket"), "{got}");
     }
 
-    /// Same trust boundary as the HTTP path: the authenticated device reaches
-    /// the engine, which keys push, preferences and attribution on it.
     #[tokio::test]
     async fn the_upgrade_path_forwards_the_authenticated_device() {
         let (_dir, upstream, captured) = upgrading_upstream().await;
@@ -2467,9 +1892,6 @@ mod upgrade_tests {
         assert!(got.contains(TEST_DEVICE_LABEL_HEADER), "{got}");
     }
 
-    /// A second path through the gateway is a second place to forget the trust
-    /// boundary. A forged device id would let a paired caller act as any other
-    /// device. It must die here exactly as it does on the HTTP path.
     #[tokio::test]
     async fn the_upgrade_path_strips_a_spoofed_device_id_and_prefix() {
         let (_dir, upstream, captured) = upgrading_upstream().await;
@@ -2493,8 +1915,6 @@ mod upgrade_tests {
         assert!(!got.contains("evil.example"), "{got}");
     }
 
-    /// A local process holds no device row, so nothing is handed to it. The
-    /// stripped forgery is not replaced by anything.
     #[tokio::test]
     async fn an_upgrade_with_no_authenticated_device_forwards_none() {
         let (_dir, upstream, captured) = upgrading_upstream().await;
@@ -2511,12 +1931,6 @@ mod upgrade_tests {
         assert!(!got.contains("x-lucidos-device-label"), "{got}");
     }
 
-    /// A browser handshake carries an `Origin` and no fetch metadata, because
-    /// Chromium and Gecko send none on one. The engine's own gate therefore has
-    /// nothing to decide with: behind this hop its `Host` is the internal
-    /// upstream, so the fallback would compare our own page against the wrong
-    /// authority and refuse it. The question is answered here, and the header
-    /// is consumed with it.
     #[tokio::test]
     async fn a_handshake_from_our_own_page_upgrades_and_leaves_its_origin_here() {
         let (_dir, upstream, captured) = upgrading_upstream().await;
@@ -2530,15 +1944,10 @@ mod upgrade_tests {
         );
     }
 
-    /// The attack this closes. A page on another port of this machine is
-    /// same-site, so its cookie rides along and pairing alone lets it through.
     #[tokio::test]
     async fn a_handshake_from_another_page_is_refused_and_the_engine_never_dialled() {
         let (_dir, upstream, captured) = upgrading_upstream().await;
         let gw = gateway_serving(upstream, None).await;
-        // Another host, then the same host on another port. The second is the
-        // sharper one: this `Host` carries no port, so a hostname-only compare
-        // would have waved it through.
         for origin in ["http://localhost:5252", "https://gateway.example:10000"] {
             let (head, _client) = upgrade_through(gw, &format!("Origin: {origin}\r\n")).await;
             assert!(head.starts_with("HTTP/1.1 403"), "{origin}: {head}");
@@ -2549,10 +1958,6 @@ mod upgrade_tests {
         );
     }
 
-    /// A phone's handshake compares a MagicDNS name against itself, because
-    /// `tailscale serve` passes the client's `Host` through. Both shipped serve
-    /// shapes are here: the browser omits `:443` from `Host` and writes it in
-    /// neither half of the `:10000` one.
     #[test]
     fn a_default_port_is_filled_in_before_comparing() {
         assert!(origin_authority_matches_host(
@@ -2574,9 +1979,6 @@ mod upgrade_tests {
         assert!(!origin_authority_matches_host("not a url", "localhost"));
     }
 
-    /// Two gateways run on one machine, each with its own `tailscale serve`
-    /// route. A portless `Host` means the default port, so the page on the
-    /// other route is foreign. Matching by hostname alone was the bypass.
     #[test]
     fn a_portless_host_matches_the_default_port_and_no_other() {
         assert!(!origin_authority_matches_host(
@@ -2587,8 +1989,6 @@ mod upgrade_tests {
             "https://name.ts.net:443",
             "name.ts.net"
         ));
-        // Port 80 is not port 443. A `Host` carries no scheme, so a plain-http
-        // page of the same name is another origin, not this one.
         assert!(!origin_authority_matches_host(
             "http://name.ts.net",
             "name.ts.net"
@@ -2599,8 +1999,6 @@ mod upgrade_tests {
         ));
     }
 
-    /// I1 and I8 on the second way in: a stranger's engine socket gets no
-    /// handshake, and the client hears 502 rather than "try again".
     #[tokio::test]
     async fn an_upgrade_to_a_strangers_socket_sends_nothing_and_answers_502() {
         let dir = test_engine::scratch();
@@ -2614,9 +2012,6 @@ mod upgrade_tests {
         );
     }
 
-    /// An engine that declines answers for itself. The gateway must not turn a
-    /// 404 into its own error, or the client cannot tell a missing route from
-    /// a broken proxy.
     #[tokio::test]
     async fn a_declined_upgrade_forwards_the_engines_own_answer() {
         let dir = test_engine::scratch();
@@ -2635,21 +2030,15 @@ mod upgrade_tests {
         assert!(head.starts_with("HTTP/1.1 404"), "{head}");
     }
 
-    /// A cold-booting engine looks like a refused connection. 503 says the
-    /// condition clears by itself, where 502 would read as a dead end.
     #[tokio::test]
     async fn an_unreachable_engine_answers_503_rather_than_a_boot_splash() {
         let dir = test_engine::scratch();
         let gw = gateway_serving(test_engine::unreachable(&dir), None).await;
         let (head, _client) = upgrade_through(gw, "").await;
         assert!(head.starts_with("HTTP/1.1 503"), "{head}");
-        // An HTML boot splash is meaningless to a socket, so it is not served.
         assert!(!head.to_lowercase().contains("text/html"), "{head}");
     }
 
-    /// `Connection` is a comma-separated list, and a browser sends
-    /// `keep-alive, Upgrade`. A whole-value compare would send every browser
-    /// upgrade down the HTTP path, which cannot hand a socket over.
     #[test]
     fn a_connection_list_still_names_the_upgrade() {
         let req = |conn: &str, upgrade: &str| {
@@ -2666,9 +2055,7 @@ mod upgrade_tests {
         )));
         assert!(is_websocket_upgrade(&req("Upgrade", "WebSocket")));
         assert!(!is_websocket_upgrade(&req("keep-alive", "websocket")));
-        // Some other protocol is not ours to splice.
         assert!(!is_websocket_upgrade(&req("Upgrade", "h2c")));
-        // A plain request never takes the path.
         let plain = axum::http::Request::builder()
             .uri("/dev/")
             .body(Body::empty())
@@ -2676,9 +2063,6 @@ mod upgrade_tests {
         assert!(!is_websocket_upgrade(&plain));
     }
 
-    /// The trust boundary is one predicate for both paths, and only three
-    /// headers differ. Pinned here so a future edit cannot widen the upgrade
-    /// path's exception past them.
     #[test]
     fn the_two_paths_differ_only_in_the_handover_and_the_origin() {
         for owned in [
@@ -2701,15 +2085,9 @@ mod upgrade_tests {
             assert!(gateway_owns_header(&name, false), "{handover}");
             assert!(!gateway_owns_header(&name, true), "{handover}");
         }
-        // The other way round. An ordinary request's `Origin` is the engine
-        // gate's to read. `proxy` consumes it only when `vouches_for_origin`
-        // has already answered the gate's question.
         let origin = HeaderName::from_static("origin");
         assert!(!gateway_owns_header(&origin, false));
         assert!(gateway_owns_header(&origin, true));
-        // `sec-fetch-site` crosses both paths on purpose. WebKit sends it on a
-        // handshake, page script cannot forge it, and it tells same-site from
-        // cross-site where a host compare cannot.
         for forwarded in [
             "accept-encoding",
             "sec-websocket-key",

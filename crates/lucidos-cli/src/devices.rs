@@ -1,25 +1,13 @@
-//! `lucidos devices`: list or revoke the devices paired with this machine's
-//! gateway.
-//!
-//! `revoke --all` is the way back in for a user whose only paired device lost
-//! its credential, such as a desktop window whose cookie was cleared. While a
-//! device is paired, a code from `lucidos pair` waits for that device's Allow.
-//! A stale row nobody can answer from would block it forever, so revoking it
-//! lets the next pairing redeem at once.
-
 use serde_json::Value;
 
 use crate::gateway;
 use crate::workspace::BoxError;
 
-/// The gateway's own device list, behind the reserved sigil namespace.
 const DEVICES_PATH: &str = "/~/api/v1/auth/devices";
 
-/// What the command was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     List,
-    /// One device by id, or every device.
     Revoke(Target),
 }
 
@@ -64,7 +52,6 @@ pub fn cmd_devices(action: &Action, port: Option<u16>) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// The paired devices, as the gateway lists them.
 fn list(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -87,8 +74,6 @@ fn list(
     }
 }
 
-/// Is any device paired with the gateway at `base`? `None` when the gateway
-/// would not say, so a caller prints nothing rather than guess.
 pub(crate) fn any_paired(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -97,7 +82,6 @@ pub(crate) fn any_paired(
     list(client, base, token).ok().map(|d| !d.is_empty())
 }
 
-/// Pure: the ids `target` names among `devices`.
 fn targets(devices: &[Value], target: &Target) -> Result<Vec<String>, BoxError> {
     let ids: Vec<String> = devices
         .iter()
@@ -113,7 +97,6 @@ fn targets(devices: &[Value], target: &Target) -> Result<Vec<String>, BoxError> 
     }
 }
 
-/// Pure: one line per device, for a person reading the terminal.
 fn describe(devices: &[Value]) -> String {
     if devices.is_empty() {
         return "No device is paired. `lucidos pair` pairs one.".to_string();

@@ -28,12 +28,10 @@ fn signed(prefix: &str, device: Option<AuthenticatedDevice>, key: &str) -> Heade
     headers
 }
 
-// ── Claims never cross routes ───────────────────────────────────────────────
-
 #[test]
 fn a_manage_claim_never_verifies_as_a_workspace_claim() {
-    let headers = signed(MANAGE_CLAIM_PREFIX, Some(device()), "key");
-    assert!(verify_manage_claim(&headers, "key", NOW).is_ok());
+    let headers = signed(MANAGE.claim_prefix, Some(device()), "key");
+    assert!(MANAGE.verify_claim(&headers, "key", NOW).is_ok());
     assert_eq!(
         relay::verify_claim(&headers, "key", "dev", NOW),
         Err(ClaimRefusal::PrefixMismatch)
@@ -45,30 +43,28 @@ fn a_workspace_claim_never_verifies_on_the_manage_hop() {
     let headers = signed("/dev@cloud/", Some(device()), "key");
     assert!(relay::verify_claim(&headers, "key", "dev", NOW).is_ok());
     assert_eq!(
-        verify_manage_claim(&headers, "key", NOW),
+        MANAGE.verify_claim(&headers, "key", NOW),
         Err(ClaimRefusal::PrefixMismatch)
     );
 }
 
 #[test]
 fn a_manage_claim_must_name_a_device() {
-    let headers = signed(MANAGE_CLAIM_PREFIX, None, "key");
+    let headers = signed(MANAGE.claim_prefix, None, "key");
     assert_eq!(
-        verify_manage_claim(&headers, "key", NOW),
+        MANAGE.verify_claim(&headers, "key", NOW),
         Err(ClaimRefusal::NoDevice)
     );
 }
 
 #[test]
 fn a_manage_claim_under_another_credential_is_refused() {
-    let headers = signed(MANAGE_CLAIM_PREFIX, Some(device()), "other");
+    let headers = signed(MANAGE.claim_prefix, Some(device()), "other");
     assert_eq!(
-        verify_manage_claim(&headers, "key", NOW),
+        MANAGE.verify_claim(&headers, "key", NOW),
         Err(ClaimRefusal::BadSignature)
     );
 }
-
-// ── The grant ───────────────────────────────────────────────────────────────
 
 #[test]
 fn a_pairing_record_from_before_the_grant_reads_as_not_granted() {
@@ -82,7 +78,6 @@ fn a_pairing_record_from_before_the_grant_reads_as_not_granted() {
     assert!(!gateway.may_manage);
 }
 
-/// A device on A calls its manage route for `cloud`.
 async fn through_a(
     p: &Paired,
     method: &str,
@@ -119,7 +114,11 @@ async fn through_a(
 
 fn grant(p: &Paired, may_manage: bool) {
     p.b.paired_gateways()
-        .set_may_manage(&p.pairing_id, may_manage)
+        .set_grant(
+            &p.pairing_id,
+            crate::gateway_protocol::HopGrant::Manage,
+            may_manage,
+        )
         .unwrap()
         .expect("the fixture's pairing exists");
 }
@@ -140,7 +139,7 @@ async fn the_hop_is_refused_until_b_grants_it() {
     let p = paired().await;
     let (status, body) = through_a(&p, "GET", "/users", None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["reason_kind"], REASON_NOT_GRANTED);
+    assert_eq!(body["reason_kind"], MANAGE.not_granted_kind);
 
     grant(&p, true);
     let (status, body) = through_a(&p, "GET", "/users", None).await;
@@ -174,7 +173,6 @@ async fn a_device_on_a_revokes_a_device_on_b() {
         .devices
         .iter()
         .any(|d| d.id == "b-laptop"));
-    // A's own devices are untouched.
     assert!(p
         .a
         .directory()
@@ -471,13 +469,24 @@ fn a_secret_minted_with_the_grant_pairs_with_it() {
     let store =
         crate::gateway_protocol::PairedGatewayStore::load(dir.path().join("p.json")).unwrap();
     let code = store
-        .mint_secret(None, true, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            crate::gateway_protocol::HopGrants {
+                manage: true,
+                control: false,
+            },
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     store
         .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
         .unwrap();
     let plain = store
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     store
         .redeem(&plain, None, crate::pairing::OwnerGate::NoDevicePaired)

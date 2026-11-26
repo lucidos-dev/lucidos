@@ -1,17 +1,3 @@
-//! An agent archiving a thread on its own authority (ADR 0310).
-//!
-//! The ladder is detach's (ADR 0278): the caller is ambient, never a parameter,
-//! and it reaches itself and its own direct children, nothing else. No
-//! standing instruction widens it.
-//!
-//! What happens next depends on the target:
-//!
-//! - **A direct child** runs the Archive button's cascade now, gate included.
-//! - **The caller itself** is mid-turn, so the cascade would refuse it, and the
-//!   turn's own end would move it back to the inbox anyway. The call records a
-//!   `ThreadArchiveRequested` instead, and the archive request resolver
-//!   (`engine::archive_request`) archives it once the turn has settled.
-
 use uuid::Uuid;
 
 use crate::engine::archive_family::{
@@ -21,27 +7,17 @@ use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{agent_thread_actor, EventMeta, ThreadEvent};
 use crate::engine::thread_lifecycle::ThreadStatus;
 
-/// Why an agent's archive was refused before the cascade ran, or by it. A
-/// pinned target is a `Refused` with the cascade's own `thread_pinned` body.
 #[derive(Debug)]
 pub(crate) enum AgentArchiveError {
-    /// A verified subprocess with no thread of its own.
     NoCaller,
-    /// No `thread_summaries` row for the target id.
     UnknownThread(Uuid),
-    /// The target is neither the caller nor one of its direct children. One
-    /// variant for a parent, a sibling and a grandchild, as detach has.
     NotYourThread(Uuid),
-    /// The target was thrown away by the user.
     Discarded(Uuid),
-    /// The Archive button's gate refused, with the route's own status and body.
     Refused(ArchiveRejection),
-    /// A row read or an emit failed.
     Internal(String),
 }
 
 impl AgentArchiveError {
-    /// HTTP status for `POST /api/v1/threads/:thread_id/archive`.
     pub fn status_code(&self) -> u16 {
         match self {
             Self::UnknownThread(_) => 404,
@@ -52,7 +28,6 @@ impl AgentArchiveError {
         }
     }
 
-    /// Machine-readable slug, beside the status.
     pub fn reason(&self) -> &str {
         match self {
             Self::NoCaller => "no_caller_thread",
@@ -96,25 +71,17 @@ impl std::fmt::Display for AgentArchiveError {
 
 impl std::error::Error for AgentArchiveError {}
 
-/// What the ladder allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentArchiveTarget {
-    /// The caller archives itself, once its turn ends.
     Caller,
-    /// One of the caller's direct children, archived now.
     DirectChild,
 }
 
-/// What the caller gets back.
 pub(crate) enum AgentArchiveAck {
-    /// A direct child's cascade ran.
     Archived(ArchiveOutcome),
-    /// The caller's own archive is recorded, and lands once its turn settles.
     Requested { thread_id: Uuid },
 }
 
-/// Record that `thread_id`'s own agent asked to be archived once its turn
-/// ends. The actor names that thread, as every agent archive does.
 pub(crate) async fn record_archive_request(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
@@ -132,18 +99,10 @@ pub(crate) async fn record_archive_request(
     Ok(())
 }
 
-/// The target's row as the ladder reads it:
-/// `(parent_thread_id, state, status, change state is proposed, is_saved, is_home)`.
 type TargetRow = (Option<Uuid>, Option<String>, String, bool, bool, bool);
 
 #[easy_ext::ext(AgentArchiveExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Load the target's row and run the ladder. Reads one row and writes
-    /// nothing, so it is testable without an engine.
-    ///
-    /// A waiting caller is refused here with the Archive route's own error
-    /// (ADR 0259). A running one is not: that is the ordinary case, and the
-    /// request waits for the turn to end.
     async fn authorize_agent_archive(
         pool: &sqlx::PgPool,
         caller: Option<Uuid>,
@@ -173,16 +132,11 @@ pub(crate) impl crate::engine::LucidosEngine {
         if state.as_deref() == Some("discarded") {
             return Err(AgentArchiveError::Discarded(target));
         }
-        // The home thread never ends (ADR 0362). Refused here too, so its own
-        // agent is told at once rather than recording a request nothing grants.
         if is_home {
             return Err(AgentArchiveError::Refused(
                 crate::engine::archive_family::home_thread_rejection(target),
             ));
         }
-        // A pinned thread is the user's to archive, never an agent's (ADR 0312).
-        // Refused here too, so a self-archive is told at once instead of
-        // recording a request the pin would hold back.
         if is_saved {
             return Err(AgentArchiveError::Refused(
                 crate::engine::archive_family::pinned_rejection(target),
@@ -198,8 +152,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         Ok(kind)
     }
 
-    /// Archive `target` on `caller`'s authority: a direct child now, the caller
-    /// itself once its turn ends.
     async fn archive_as_agent(
         &self,
         caller: Option<Uuid>,
@@ -211,8 +163,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         match kind {
             AgentArchiveTarget::DirectChild => {
                 let engine = self.clone_arc();
-                // Boxed: the cascade's emits reach the fan-in, which can
-                // re-enter an agentic loop whose tool dispatch calls back here.
                 Box::pin(archive_family(
                     &engine,
                     target,

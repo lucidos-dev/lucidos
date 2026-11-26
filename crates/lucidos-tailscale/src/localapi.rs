@@ -1,9 +1,3 @@
-//! A minimal, bounded LocalAPI client: one `GET` per connection, over HTTP/1.0.
-//!
-//! HTTP/1.0 keeps the reply unchunked, and Go's server closes the connection
-//! after it, so reading to the end is the whole protocol. No `Origin` or
-//! `Referer` is sent: LocalAPI refuses a request that carries either.
-
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -13,16 +7,13 @@ use crate::Answer;
 
 const STATUS_PATH: &str = "/localapi/v0/status?peers=false";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// The whole status exchange, from the request to the last byte.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_RESPONSE: usize = 1 << 20;
 
-/// This node's status.
 pub(crate) fn query(endpoint: &Endpoint) -> Answer {
     get(endpoint, STATUS_PATH, EXCHANGE_TIMEOUT)
 }
 
-/// `GET path`, cut off once `timeout` has passed since the request.
 pub(crate) fn get(endpoint: &Endpoint, path: &str, timeout: Duration) -> Answer {
     match endpoint {
         Endpoint::Tcp { port, token } => {
@@ -82,7 +73,6 @@ fn exchange<S: Read + Write + Timeouts>(mut stream: S, request: &str, timeout: D
             Ok(0) => break,
             Ok(n) if raw.len() + n <= MAX_RESPONSE => raw.extend_from_slice(&buf[..n]),
             Ok(_) => return Answer::Garbled("the reply was too large".into()),
-            // A daemon that takes the connection and says nothing is wedged.
             Err(_) if raw.is_empty() => return Answer::Silent,
             Err(e) => return Answer::Garbled(format!("the reply broke off ({e})")),
         }
@@ -102,7 +92,6 @@ fn request(path: &str, token: Option<&str>) -> String {
     format!("GET {path} HTTP/1.0\r\nHost: local-tailscaled.sock\r\n{auth}\r\n")
 }
 
-/// The body of a `200` reply, or the status line and body of any other.
 fn answer_of(raw: &[u8]) -> Answer {
     let text = String::from_utf8_lossy(raw);
     let Some((head, body)) = text.split_once("\r\n\r\n") else {
@@ -119,7 +108,6 @@ fn answer_of(raw: &[u8]) -> Answer {
     }
 }
 
-/// Standard base64 with padding: all Basic auth needs, without a dependency.
 fn base64(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -207,7 +195,6 @@ mod tests {
             .starts_with("GET /localapi/v0/cert/n?type=pair HTTP/1.0\r\n"));
     }
 
-    /// Serve one connection with `reply`, after reading the request.
     fn serve_once(reply: &'static str) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

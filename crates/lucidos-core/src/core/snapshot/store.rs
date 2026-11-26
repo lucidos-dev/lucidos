@@ -26,12 +26,10 @@ impl Store {
         Self::at(Self::database_root(database)?, workspace_id)
     }
 
-    /// Status reads resolve the store without initializing directories or keys.
     pub fn existing_for_database(database: &str, workspace_id: String) -> Result<Self, BoxError> {
         Self::existing_at(Self::database_root(database)?, workspace_id)
     }
 
-    /// Resolve an existing registry without changing permissions or files.
     pub fn existing_at(root: PathBuf, workspace_id: String) -> Result<Self, BoxError> {
         if workspace_id.trim().is_empty() || !std::fs::symlink_metadata(&root)?.is_dir() {
             return Err("snapshot_store_unavailable".into());
@@ -39,7 +37,6 @@ impl Store {
         Ok(Self { root, workspace_id })
     }
 
-    /// Resolve without creating a store, so unused snapshot support has no boot side effects.
     pub fn database_root(database: &str) -> Result<PathBuf, BoxError> {
         if database.is_empty()
             || database.starts_with('.')
@@ -54,7 +51,6 @@ impl Store {
         Ok(snapshots.join(database))
     }
 
-    /// Explicit root for the offline worker and disposable test stores.
     pub fn at(root: PathBuf, workspace_id: impl Into<String>) -> Result<Self, BoxError> {
         let workspace_id = workspace_id.into();
         if workspace_id.trim().is_empty() {
@@ -73,7 +69,6 @@ impl Store {
         self.root.join(handle.as_str())
     }
 
-    /// Cross-process protection for the offline worker and engine boot cleanup.
     pub fn try_lock(&self) -> Result<StoreLock, BoxError> {
         let file = private_file(&self.root.join("archive-job.lock"))?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|_| "archive_job_busy")?;
@@ -87,7 +82,7 @@ impl Store {
         Ok(path)
     }
 
-    /// Publish only after callers have verified all components. The rename is
+    /// INVARIANT: Publish only after callers have verified all components. The rename is
     /// durable and same-filesystem; no half-written snapshot can be listed.
     pub fn publish(&self, signed: &AuthenticatedManifest, key: &SecretKey) -> Result<(), BoxError> {
         let handle = &signed.manifest.handle;
@@ -220,7 +215,7 @@ impl Store {
         if manifest.keep || self.referenced()?.contains(handle) || newest_recovery == Some(handle) {
             return Err("snapshot is protected".into());
         }
-        // Unpublish with one rename, so a crash never leaves a listed snapshot
+        // INVARIANT: Unpublish with one rename, so a crash never leaves a listed snapshot
         // missing parts. Boot's partial cleanup finishes a cut-short removal.
         let doomed = self.root.join(".partial").join(handle.as_str());
         std::fs::rename(self.snapshot_dir(handle), &doomed)?;
@@ -247,8 +242,6 @@ impl Store {
         check_floor(available, total, estimate)
     }
 
-    /// Run at boot while holding the store lock. Only stale partial captures
-    /// are eligible; worktrees and workspace files are never in this tree.
     pub fn clean_partial(&self, now: DateTime<Utc>, lock: &StoreLock) -> Result<(), BoxError> {
         if lock.1 != self.root {
             return Err("snapshot store lock mismatch".into());
@@ -269,14 +262,9 @@ impl Store {
     }
 }
 
-/// Names the extraction tree a restore stages under `.partial`.
 pub(super) const RESTORE_STAGING_PREFIX: &str = "restore-";
 
 impl Store {
-    /// Remove the staging trees a settled restore left behind. Every original
-    /// they hold is also in the verified recovery snapshot (ADR 0612). It
-    /// touches only a tree named like this store's own staging, whatever a
-    /// journal lists. A tree held by an unsettled restore stays.
     pub fn discard_settled_staging(&self, lock: &StoreLock) -> Result<(), BoxError> {
         use super::journal::Phase;
         if lock.1 != self.root {
@@ -353,9 +341,6 @@ pub fn retention_victims(
     victims
 }
 
-/// The free-disk floor refused a capture or restore. `needed_bytes` is the
-/// space the user must free. The capture job branches on this type to tell the
-/// user; every other caller sees only the `snapshot_disk_floor` slug.
 #[derive(Debug)]
 pub struct DiskFloorRefused {
     pub needed_bytes: u64,
@@ -369,7 +354,6 @@ impl std::fmt::Display for DiskFloorRefused {
 
 impl std::error::Error for DiskFloorRefused {}
 
-/// Available and total bytes on the volume holding `path`.
 #[cfg(not(test))]
 pub(super) fn volume_space(path: &Path) -> std::io::Result<(u64, u64)> {
     if roomy_fixture_covers(path) {
@@ -381,12 +365,9 @@ pub(super) fn volume_space(path: &Path) -> std::io::Result<(u64, u64)> {
 #[cfg(all(not(test), feature = "test-support"))]
 static ROOMY_FIXTURE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Names a root whose snapshots see a roomy volume. An isolated fixture sets
-/// it for the engines it spawns, which share no memory with the test.
 #[cfg(all(not(test), any(debug_assertions, feature = "e2e-test-hooks")))]
 pub const ROOMY_FIXTURE_ROOT_ENV: &str = "LUCIDOS_TEST_ROOMY_SNAPSHOT_ROOT";
 
-/// Use the unit-test disk fixture for snapshots under an isolated test root.
 #[cfg(all(not(test), feature = "test-support"))]
 #[doc(hidden)]
 pub fn install_roomy_volume_for_test(root: PathBuf) {
@@ -395,8 +376,6 @@ pub fn install_roomy_volume_for_test(root: PathBuf) {
         .expect("one snapshot fixture root");
 }
 
-/// Whether `path` lies under an isolated fixture root. A shipped build has no
-/// such root, so a real host's disk always decides.
 #[cfg(not(test))]
 fn roomy_fixture_covers(path: &Path) -> bool {
     #[cfg(feature = "test-support")]
@@ -416,8 +395,6 @@ fn roomy_fixture_covers(path: &Path) -> bool {
     false
 }
 
-/// Tests read a fixed, roomy volume, so no snapshot test depends on how
-/// full the host's disk is. The floor arithmetic has its own tests.
 #[cfg(test)]
 pub(super) fn volume_space(_path: &Path) -> std::io::Result<(u64, u64)> {
     Ok(roomy_volume_space())
@@ -445,7 +422,6 @@ pub fn check_floor(available: u64, total: u64, estimate: u64) -> Result<(), BoxE
     let floor = (5 * 1024 * 1024 * 1024u64).max(total.div_ceil(10));
     match floor.checked_add(estimate) {
         Some(needed) if available >= needed => Ok(()),
-        // A need past `u64::MAX` can never be met, so report the most there is.
         needed => Err(Box::new(DiskFloorRefused {
             needed_bytes: needed.map_or(u64::MAX, |needed| needed - available),
         })),

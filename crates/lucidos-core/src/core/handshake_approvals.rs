@@ -1,49 +1,13 @@
-//! Which `script_handshake` scripts the engine will run.
-//!
-//! A handshake script is the one file under workspace `data/` that the engine
-//! executes (`api::proxy_script_runner`). Both `data/scripts/` and
-//! `data/config/apis.json` are writable over the unauthenticated API. An app UI
-//! reaches that API with the user's authority, so the write side cannot decide
-//! what may run. This record decides instead: the runner spawns a script only
-//! when its workspace-relative path and current SHA-256 are both here
-//! (ADR 0144).
-//!
-//! It lives in `<workspace>/.lucidos/` for the reason `core::grants` gives
-//! about permission grants: the file tools resolve nothing under `.lucidos/`
-//! except `tmp/`, and a record the caller can rewrite is not a record.
-//!
-//! **Authorship, never assertion.** Two writers record. The engine's in-process
-//! file tools do it when they write under `data/scripts/`, so the author is
-//! whoever drove those tools. `lucidos handshake approve` does it through a
-//! route no browser can reach. Nothing lets a caller vouch for content it did
-//! not write.
-//!
-//! **A record also says where the token may go.** A handshake script mints its
-//! own token, so no stored credential speaks for it and ADR 0144 decision 4 has
-//! nothing to check. The `base_url` column is that scope. It is filled by the
-//! boot seed, or bound on first use, and enforced from then on. Rewriting
-//! `apis.json` therefore cannot redirect a minted token to another host.
-//!
-//! **And which secrets the script may be handed.** A `script_handshake` entry
-//! names a stored credential and a list of OAuth providers, and the engine
-//! injects both into the script's environment. Neither travels to the entry's
-//! `base_url`, so the credential scope gate has nothing true to say about them.
-//! The `injects` column is the guard instead. It binds the same way the scope
-//! does, so an `apis.json` rewrite cannot swap one secret for another.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Engine-owned runtime directory holding the record, beside the permission
-/// grants. Gitignored, excluded from backup, unreachable by the file tools.
 const RUNTIME_DIR: &str = ".lucidos";
 
 const APPROVALS_FILE: &str = "approved-handshake-scripts";
 
-/// Stands in for an unbound column, so every line has four fields.
 const UNBOUND: &str = "-";
 
 const HEADER: &str = "\
@@ -66,7 +30,7 @@ const HEADER: &str = "\
 # for a different set is refused. See docs/adr/0144-app-authority-guard-at-use.md.
 ";
 
-/// Serializes read-modify-write on the record.
+/// INVARIANT: Serializes read-modify-write on the record.
 ///
 /// Every writer is in the engine process: the file tools, the startup seed,
 /// and the approve route the CLI calls. Two at once would each read the same
@@ -78,60 +42,37 @@ const HEADER: &str = "\
 /// racing anybody, and the rename below is atomic either way.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Take [`WRITE_LOCK`], recovering a poisoned one.
-///
-/// A panic while holding it would otherwise wedge every approval for the life
-/// of the process. The data is a file re-read under the lock, so a poisoned
-/// guard has nothing stale in it to protect against.
 fn write_guard() -> std::sync::MutexGuard<'static, ()> {
     WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Where `workspace_path` keeps the record.
 pub fn approvals_path(workspace_path: &Path) -> PathBuf {
     workspace_path.join(RUNTIME_DIR).join(APPROVALS_FILE)
 }
 
-/// Why a script was recorded. Carried on `HandshakeScriptApproved` so the
-/// timeline distinguishes an authored script from a seeded one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalSource {
-    /// An in-process file tool wrote the file.
     Authored,
-    /// `lucidos handshake approve` named it.
     Approved,
-    /// Present before this workspace had a record at all. See [`seed_if_absent`].
     Seeded,
 }
 
-/// One recorded script: the exact content the engine will run, the one upstream
-/// the token it mints may be sent to, and the secrets it may be handed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
-    /// Lowercase hex SHA-256 of the approved bytes.
     pub hash: String,
-    /// Where this script's token may go. `None` until the boot seed or the
-    /// first proxy call binds it.
     pub base_url: Option<String>,
-    /// Which secrets an `apis.json` entry may inject, as [`injected_secrets`]
-    /// spells them. `None` until the boot seed or the first proxy call binds it.
     pub injects: Option<BTreeSet<String>>,
 }
 
-/// What the boot seed records for one script, read off `apis.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedEntry {
-    /// The record key, as [`config_path_key`] spells it.
     pub path: String,
-    /// The one upstream every entry naming this script uses. `None` when they
-    /// disagree, which is not an answer, so it binds on first use instead.
     pub base_url: Option<String>,
-    /// The secrets every entry naming this script injects, on the same terms.
     pub injects: Option<BTreeSet<String>>,
 }
 
-/// How the record names the secrets one `script_handshake` entry injects.
+/// INVARIANT: How the record names the secrets one `script_handshake` entry injects.
 ///
 /// `c:` for a stored credential and `o:` for an OAuth provider, so a credential
 /// named `oauth:google` stays distinct from the `google` provider. Neither
@@ -155,7 +96,7 @@ pub fn injected_secrets<'a>(
         .collect()
 }
 
-/// Whether every member of `injects` survives a round trip through the record.
+/// INVARIANT: Whether every member of `injects` survives a round trip through the record.
 ///
 /// The column is comma joined inside a whitespace-split line, and a credential
 /// name is free text with no validation. A name carrying a comma or any
@@ -178,29 +119,11 @@ pub fn injects_are_recordable(injects: &BTreeSet<String>) -> bool {
         .all(|member| !member.contains(',') && !member.contains(char::is_whitespace))
 }
 
-/// Whether `base_url` can be written to the scope column and read back whole.
-///
-/// The sibling of [`injects_are_recordable`], for the column beside it, and it
-/// matters more. A value carrying a NEWLINE does not merely re-cut its own
-/// line. [`write_all`] ends every record with one, so the tail of the value
-/// becomes a RECORD OF ITS OWN.
-///
-/// That is a forged approval. A caller who can write `apis.json` picks the hash
-/// on the forged line, against a path they did not author. The runner's hash
-/// gate then approves whatever bytes match it. `apis.json` is writable over the
-/// unauthenticated data API, and this record decides who may run (ADR 0144).
-///
-/// Three callers, each doing a different job. The proxy gates first, for a 502
-/// naming the file to fix. The seed filters, writing the record directly.
-/// [`bind_scope_if_absent`] refuses as a floor under any future caller.
-///
-/// All three pass the TRIMMED value, which is what gets recorded. Padding is
-/// not forgery, and every other layer here trims before it uses the string.
 pub fn scope_is_recordable(base_url: &str) -> bool {
     !base_url.contains(char::is_whitespace)
 }
 
-/// Whether `rel_path` can be written to the path column and read back whole.
+/// INVARIANT: Whether `rel_path` can be written to the path column and read back whole.
 ///
 /// The third sibling, for the last column, and the same forgery. A path
 /// carrying a newline ends its record, and its tail becomes a record of its own
@@ -219,7 +142,6 @@ pub fn path_is_recordable(rel_path: &str) -> bool {
     !rel_path.contains(char::is_control) && rel_path.trim() == rel_path
 }
 
-/// Why [`path_is_recordable`] refused, for every caller's message.
 pub const UNRECORDABLE_PATH_REASON: &str =
     "contains a control character or starts or ends with whitespace";
 
@@ -227,7 +149,7 @@ fn unrecordable_path(rel_path: &str) -> BoxError {
     format!("refusing to record {rel_path:?}: it {UNRECORDABLE_PATH_REASON}").into()
 }
 
-/// The record key for an `apis.json` `script` value.
+/// INVARIANT: The record key for an `apis.json` `script` value.
 ///
 /// Config says `scripts/auth/x.py`, the record says `data/scripts/auth/x.py`.
 /// The runner derives the same key from the absolute path it runs. Both
@@ -236,7 +158,7 @@ pub fn config_path_key(script_rel_path: &str) -> String {
     format!("data/{}", config_path_under_data(script_rel_path))
 }
 
-/// The `data/`-relative remainder of an `apis.json` `script` value.
+/// INVARIANT: The `data/`-relative remainder of an `apis.json` `script` value.
 ///
 /// **Two spellings name one file.** The documented value is
 /// `scripts/auth/x.py`. A config written before resolution moved under `data/`
@@ -258,7 +180,6 @@ pub fn config_path_under_data(script_rel_path: &str) -> &str {
     rel.strip_prefix("data/").unwrap_or(rel)
 }
 
-/// Lowercase hex SHA-256 of `bytes`, the form every line stores.
 pub fn content_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -266,8 +187,6 @@ pub fn content_hash(bytes: &[u8]) -> String {
     crate::core::hex::hex_lower(&hasher.finalize())
 }
 
-/// Every recorded path and what was recorded for it. An unreadable file yields
-/// nothing, so a read failure refuses scripts rather than running them.
 pub fn entries(workspace_path: &Path) -> BTreeMap<String, Approval> {
     let path = approvals_path(workspace_path);
     match std::fs::read_to_string(&path) {
@@ -284,24 +203,21 @@ pub fn entries(workspace_path: &Path) -> BTreeMap<String, Approval> {
     }
 }
 
-/// Whether this exact content at this exact path may run.
 pub fn is_approved(workspace_path: &Path, rel_path: &str, bytes: &[u8]) -> bool {
     entries(workspace_path)
         .get(rel_path)
         .is_some_and(|recorded| recorded.hash == content_hash(bytes))
 }
 
-/// The upstream this script's minted token is bound to, if one is recorded.
 pub fn scope_for(workspace_path: &Path, rel_path: &str) -> Option<String> {
     entries(workspace_path).get(rel_path)?.base_url.clone()
 }
 
-/// The secrets this script may be handed, if a set is recorded.
 pub fn injects_for(workspace_path: &Path, rel_path: &str) -> Option<BTreeSet<String>> {
     entries(workspace_path).get(rel_path)?.injects.clone()
 }
 
-/// Record `rel_path` at its current content hash, replacing any earlier hash
+/// INVARIANT: Record `rel_path` at its current content hash, replacing any earlier hash
 /// for that path. Returns whether the file on disk changed.
 ///
 /// An existing scope and injected-secret set both survive. Re-authoring a
@@ -333,28 +249,15 @@ pub fn record(workspace_path: &Path, rel_path: &str, bytes: &[u8]) -> Result<boo
     Ok(true)
 }
 
-/// What [`bind_scope_if_absent`] or [`bind_injects_if_absent`] found. `T` is
-/// whatever that column holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindOutcome<T = String> {
-    /// This call recorded the value.
     Bound,
-    /// A value was already recorded. The caller checks its own against it,
+    /// INVARIANT: A value was already recorded. The caller checks its own against it,
     /// which is what makes two concurrent first requests safe.
     AlreadyBound(T),
-    /// Nothing to bind: no record for this path, or the bytes on disk are not
-    /// the approved ones. The runner's hash check is what answers either way.
     NotBindable,
 }
 
-/// Bind `rel_path`'s token to `base_url`, but only while it has no scope.
-///
-/// Trust on first sight, exactly as [`CredentialStore::infer_undeclared_scopes`]
-/// does for a credential that predates ADR 0144. A script authored now has no
-/// `apis.json` entry yet, so authorship has nothing to record. The first
-/// request that would use it decides, and every later one is checked.
-///
-/// [`CredentialStore::infer_undeclared_scopes`]: crate::core::CredentialStore::infer_undeclared_scopes
 pub fn bind_scope_if_absent(
     workspace_path: &Path,
     rel_path: &str,
@@ -363,7 +266,7 @@ pub fn bind_scope_if_absent(
     let _guard = write_guard();
     let mut current = entries(workspace_path);
     let Some(approval) = current.get_mut(rel_path) else {
-        // Not recorded at all. The runner refuses it by hash, and saying so is
+        // INVARIANT: Not recorded at all. The runner refuses it by hash, and saying so is
         // its job: inventing a line here would approve a script nobody wrote.
         return Ok(BindOutcome::NotBindable);
     };
@@ -374,7 +277,7 @@ pub fn bind_scope_if_absent(
     if wanted.is_empty() {
         return Ok(BindOutcome::NotBindable);
     }
-    // `trim` takes the ends and leaves the middle, so an interior newline
+    // INVARIANT: `trim` takes the ends and leaves the middle, so an interior newline
     // survives it and would forge a second record. The caller gates on
     // [`scope_is_recordable`] and answers 502; this is the backstop that keeps
     // any other caller from writing one.
@@ -393,15 +296,6 @@ pub fn bind_scope_if_absent(
     Ok(BindOutcome::Bound)
 }
 
-/// Bind which secrets `rel_path` may be handed, but only while it has no set.
-///
-/// The sibling of [`bind_scope_if_absent`], and the same trade. A script
-/// authored now has no `apis.json` entry, so authorship has nothing to read.
-/// The first request that would inject a secret decides, and every later one is
-/// checked against it.
-///
-/// An empty `injects` records nothing and reports `NotBindable`. No secret
-/// moves, so there is nothing for a record to protect.
 pub fn bind_injects_if_absent(
     workspace_path: &Path,
     rel_path: &str,
@@ -418,7 +312,7 @@ pub fn bind_injects_if_absent(
     if injects.is_empty() {
         return Ok(BindOutcome::NotBindable);
     }
-    // The same forgery the scope column has. A credential name carrying a
+    // INVARIANT: The same forgery the scope column has. A credential name carrying a
     // newline ends this record and starts one of its own, on a hash the caller
     // picked. The proxy gates on [`injects_are_recordable`] and answers 502;
     // this is the backstop that keeps any other caller from writing one.
@@ -437,7 +331,7 @@ pub fn bind_injects_if_absent(
     Ok(BindOutcome::Bound)
 }
 
-/// Whether the file on disk is still the content this record approved.
+/// INVARIANT: Whether the file on disk is still the content this record approved.
 ///
 /// Bind only the bytes the engine would actually run. Otherwise a caller swaps
 /// the script out, binds their own host through the refused call, then restores
@@ -449,7 +343,6 @@ fn runs_the_approved_bytes(workspace_path: &Path, rel_path: &str, hash: &str) ->
         .unwrap_or(false)
 }
 
-/// Drop `rel_path`, so the next run refuses it. Returns whether anything went.
 pub fn forget(workspace_path: &Path, rel_path: &str) -> Result<bool, BoxError> {
     let _guard = write_guard();
     let mut current = entries(workspace_path);
@@ -460,18 +353,6 @@ pub fn forget(workspace_path: &Path, rel_path: &str) -> Result<bool, BoxError> {
     Ok(true)
 }
 
-/// Record every path in `scripts` that exists on disk, each with the scope its
-/// `apis.json` entry names. Runs only when this workspace has no record at all,
-/// and returns what it recorded.
-///
-/// The file's own existence is the marker, so this runs once per workspace.
-/// Re-seeding on every start would bless a script an attacker planted between
-/// two starts, which is the whole thing the record exists to stop.
-///
-/// The one-time pass is trust on first sight, and deliberate: a workspace whose
-/// handshake worked before this ADR must keep working with no user action. A
-/// restore from backup drops `.lucidos/`, so a restored workspace seeds again
-/// on the same reasoning.
 pub fn seed_if_absent(
     workspace_path: &Path,
     scripts: &[SeedEntry],
@@ -497,7 +378,7 @@ pub fn seed_if_absent(
                     entry.path.clone(),
                     Approval {
                         hash: content_hash(&bytes),
-                        // Filtered on the same terms as `injects` below: the
+                        // INVARIANT: Filtered on the same terms as `injects` below: the
                         // seed writes the record directly, so it cannot lean on
                         // the proxy's gate having run. Trimmed first, and the
                         // trimmed value is what lands, matching what
@@ -520,22 +401,19 @@ pub fn seed_if_absent(
             }
         }
     }
-    // Written even when nothing was found, so the marker exists and a later
+    // INVARIANT: Written even when nothing was found, so the marker exists and a later
     // start cannot seed a script that appeared in between.
     write_all(workspace_path, &seeded)?;
     Ok(seeded.into_keys().collect())
 }
 
-/// `<workspace>`-relative form of `abs`, the key every entry uses. `None` when
-/// the path is outside the workspace, which the runner's traversal guard has
-/// already refused.
 pub fn workspace_relative(workspace_path: &Path, abs: &Path) -> Option<String> {
     abs.strip_prefix(workspace_path)
         .ok()
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// One `<sha256>  <base_url>  <injects>  <path>` line per entry, under the
+/// INVARIANT: One `<sha256>  <base_url>  <injects>  <path>` line per entry, under the
 /// header.
 ///
 /// **Every earlier shape still parses**, so a record from before either column
@@ -551,14 +429,12 @@ fn parse(contents: &str) -> BTreeMap<String, Approval> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // The hash is the first token; everything after the gap is the two
-        // columns and the path, so a path containing a space still round-trips.
         let Some((hash, rest)) = line.split_once(char::is_whitespace) else {
             continue;
         };
         let (base_url, rest) = split_scope(rest.trim_start());
         let (injects, path) = split_injects(rest);
-        // A path [`write_all`] would refuse is dropped here too, so a hand edit
+        // INVARIANT: A path [`write_all`] would refuse is dropped here too, so a hand edit
         // cannot plant a key that wedges every later write.
         if hash.len() != 64
             || !hash.chars().all(|c| c.is_ascii_hexdigit())
@@ -579,7 +455,6 @@ fn parse(contents: &str) -> BTreeMap<String, Approval> {
     out
 }
 
-/// Split the scope off the front of what follows the hash.
 fn split_scope(rest: &str) -> (Option<String>, &str) {
     let Some((head, tail)) = rest.split_once(char::is_whitespace) else {
         return (None, rest);
@@ -593,7 +468,6 @@ fn split_scope(rest: &str) -> (Option<String>, &str) {
     (None, rest)
 }
 
-/// Split the injected-secret set off the front of what follows the scope.
 fn split_injects(rest: &str) -> (Option<BTreeSet<String>>, &str) {
     let Some((head, tail)) = rest.split_once(char::is_whitespace) else {
         return (None, rest);
@@ -608,10 +482,6 @@ fn split_injects(rest: &str) -> (Option<BTreeSet<String>>, &str) {
     (None, rest)
 }
 
-/// Whether `head` is the injects column rather than the first token of a path.
-///
-/// Every member carries the `c:` or `o:` prefix [`injected_secrets`] writes, and
-/// every path starts with `data/`, so the two shapes cannot collide.
 fn is_injects_column(head: &str) -> bool {
     !head.is_empty()
         && head
@@ -619,8 +489,6 @@ fn is_injects_column(head: &str) -> bool {
             .all(|member| member.starts_with("c:") || member.starts_with("o:"))
 }
 
-/// Overwrite the record atomically, through a sibling temp file and a rename.
-/// The runner re-reads per call, so a change takes effect with no restart.
 fn write_all(workspace_path: &Path, entries: &BTreeMap<String, Approval>) -> Result<(), BoxError> {
     if let Some(rel) = entries.keys().find(|rel| !path_is_recordable(rel)) {
         return Err(unrecordable_path(rel));
@@ -631,8 +499,6 @@ fn write_all(workspace_path: &Path, entries: &BTreeMap<String, Approval>) -> Res
     }
     let mut body = String::from(HEADER);
     for (rel, approval) in entries {
-        // An empty set writes as unbound. Nothing is injected, so there is
-        // nothing for the next call to be checked against.
         let injects = match &approval.injects {
             Some(set) if !set.is_empty() => set.iter().cloned().collect::<Vec<_>>().join(","),
             _ => UNBOUND.to_string(),
@@ -646,7 +512,7 @@ fn write_all(workspace_path: &Path, entries: &BTreeMap<String, Approval>) -> Res
         body.push_str(rel);
         body.push('\n');
     }
-    // Per process, so a second writer cannot land on this one's temp file
+    // INVARIANT: Per process, so a second writer cannot land on this one's temp file
     // between its write and its rename. Callers are serialized by
     // [`WRITE_LOCK`], which leaves only another process to collide with.
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
@@ -669,7 +535,6 @@ mod tests {
         std::fs::write(abs, body).unwrap();
     }
 
-    /// A seed list naming scripts no `apis.json` entry scopes.
     fn unscoped(paths: &[&str]) -> Vec<SeedEntry> {
         paths
             .iter()
@@ -706,8 +571,6 @@ mod tests {
         ));
     }
 
-    /// The whole point of hashing the content: a recorded path whose bytes then
-    /// change is refused, so overwriting a blessed script buys nothing.
     #[test]
     fn changed_content_at_a_recorded_path_is_refused() {
         let ws = ws();
@@ -800,8 +663,6 @@ mod tests {
         ));
     }
 
-    /// A workspace upgrading gets its scope from the entry that already names
-    /// the script, so a later `apis.json` rewrite cannot redirect its token.
     #[test]
     fn seeding_records_the_scope_apis_json_names() {
         let ws = ws();
@@ -821,8 +682,6 @@ mod tests {
         );
     }
 
-    /// The guard would be worthless if every start blessed whatever `apis.json`
-    /// currently names: an attacker would only have to wait for a restart.
     #[test]
     fn seeding_runs_once_and_never_blesses_a_later_script() {
         let ws = ws();
@@ -843,8 +702,6 @@ mod tests {
         ));
     }
 
-    /// A workspace with no handshake at all still gets the marker, or the pass
-    /// above would fire on the next start.
     #[test]
     fn seeding_nothing_still_leaves_the_marker() {
         let ws = ws();
@@ -865,8 +722,6 @@ mod tests {
         assert!(approvals_path(ws.path()).exists());
     }
 
-    /// Trust on first sight, once. What binds a script is the first request
-    /// that would use it, and every later host is checked against that.
     #[test]
     fn a_scope_binds_once_and_never_moves() {
         let ws = ws();
@@ -889,8 +744,6 @@ mod tests {
         );
     }
 
-    /// Binding never invents an approval. An unrecorded script has to be
-    /// refused by the runner, which is the half that reads the bytes.
     #[test]
     fn binding_an_unrecorded_script_records_nothing() {
         let ws = ws();
@@ -901,9 +754,6 @@ mod tests {
         assert!(entries(ws.path()).is_empty());
     }
 
-    /// A script whose bytes no longer match its approval binds nothing. Left
-    /// open, a caller swaps the file out, binds their host through the call the
-    /// runner then refuses, and restores the approved bytes to collect.
     #[test]
     fn a_script_that_would_not_run_cannot_bind_a_scope() {
         let ws = ws();
@@ -917,8 +767,6 @@ mod tests {
         );
         assert!(scope_for(ws.path(), "data/scripts/a.py").is_none());
 
-        // Restoring the approved bytes leaves it unbound, so the next
-        // legitimate call is still the one that decides.
         write_script(ws.path(), "data/scripts/a.py", "approved");
         assert_eq!(
             bind_scope_if_absent(ws.path(), "data/scripts/a.py", "https://real.test").unwrap(),
@@ -926,7 +774,6 @@ mod tests {
         );
     }
 
-    /// A recorded script whose file is gone binds nothing either.
     #[test]
     fn a_missing_script_cannot_bind_a_scope() {
         let ws = ws();
@@ -937,7 +784,6 @@ mod tests {
         );
     }
 
-    /// Re-authoring a script changes what it does, not where its token belongs.
     #[test]
     fn re_recording_keeps_the_scope() {
         let ws = ws();
@@ -952,10 +798,6 @@ mod tests {
         );
     }
 
-    /// A credential and an OAuth provider are told apart by their prefix, so a
-    /// credential literally named `oauth:google` cannot pass for the `google`
-    /// provider. That name is real: it is the legacy spelling of an OAuth
-    /// client registration.
     #[test]
     fn a_credential_and_an_oauth_provider_never_collide() {
         assert_eq!(
@@ -965,9 +807,6 @@ mod tests {
         assert!(injected_secrets(None, std::iter::empty::<&str>()).is_empty());
     }
 
-    /// The swap this column exists to stop. `apis.json` is writable over the
-    /// API, so an entry naming an approved script can be rewritten to ask for a
-    /// different secret. The record decides, not the entry.
     #[test]
     fn an_injected_set_binds_once_and_never_moves() {
         let ws = ws();
@@ -989,9 +828,6 @@ mod tests {
         assert_eq!(injects_for(ws.path(), "data/scripts/a.py"), Some(first));
     }
 
-    /// A credential name is free text, and the column is comma joined inside a
-    /// whitespace-split line. A name carrying either would re-cut the line, so
-    /// the set is refused before anything is written.
     #[test]
     fn a_name_that_would_re_cut_the_line_is_not_recordable() {
         assert!(injects_are_recordable(&secrets(&[
@@ -1004,9 +840,6 @@ mod tests {
         assert!(!injects_are_recordable(&secrets(&["c:two\nlines"])));
     }
 
-    /// The scope column is the one an attacker picks, because `apis.json` is
-    /// writable over the unauthenticated data API. A newline there would end
-    /// the record early and start a second one.
     #[test]
     fn a_scope_that_would_re_cut_the_line_is_not_recordable() {
         assert!(scope_is_recordable("https://api.example.com"));
@@ -1016,10 +849,6 @@ mod tests {
         assert!(!scope_is_recordable("https://ok.test/\thttps://evil.test"));
     }
 
-    /// The whole attack, end to end. A crafted `apis.json` base_url would
-    /// otherwise write a second line carrying a hash the attacker chose,
-    /// against a path they did not author. The runner would then run whatever
-    /// bytes match that hash.
     #[test]
     fn a_newline_in_the_scope_cannot_forge_an_approval_line() {
         let ws = ws();
@@ -1027,31 +856,23 @@ mod tests {
         write_script(ws.path(), script, "print(1)");
         record(ws.path(), script, b"print(1)").unwrap();
 
-        // 64 hex characters, so the forged line would pass `parse`'s hash test.
         let forged_hash = "a".repeat(64);
         let hostile = format!("https://ok.test/\n{forged_hash}  https://evil.test");
 
         let outcome = bind_scope_if_absent(ws.path(), script, &hostile);
         assert!(outcome.is_err(), "a scope with a newline must be refused");
 
-        // Nothing was written, so the record still holds exactly one entry and
-        // the script is still bound to nothing.
         let after = entries(ws.path());
         assert_eq!(after.len(), 1, "no second record was forged");
         assert!(after.contains_key(script));
         assert_eq!(scope_for(ws.path(), script), None);
 
-        // And the forged hash never became an approval for the real path.
         assert!(
             !is_approved(ws.path(), script, b"whatever the attacker wrote"),
             "the runner must not accept bytes the forged line would have named"
         );
     }
 
-    /// The injects column's half of the forgery above, and the floor the
-    /// sibling already had. A credential name is free text, and `apis.json` is
-    /// writable over the unauthenticated data API. A newline in one would end
-    /// the record and start a line carrying a hash nobody authored.
     #[test]
     fn a_newline_in_an_injected_name_cannot_forge_an_approval_line() {
         let ws = ws();
@@ -1059,7 +880,6 @@ mod tests {
         write_script(ws.path(), script, "print(1)");
         record(ws.path(), script, b"print(1)").unwrap();
 
-        // 64 hex characters, so the forged line would pass `parse`'s hash test.
         let forged_hash = "a".repeat(64);
         let forged = format!("c:ok\n{forged_hash}  -  -  data/scripts/auth/evil.py");
         let hostile = secrets(&[forged.as_str()]);
@@ -1070,8 +890,6 @@ mod tests {
             "a secret name with a newline must be refused, got {outcome:?}"
         );
 
-        // Nothing was written, so the record still holds exactly the one entry
-        // and the script is still bound to no secret at all.
         let after = entries(ws.path());
         assert_eq!(after.len(), 1, "no second record was forged");
         assert!(
@@ -1082,8 +900,6 @@ mod tests {
         assert_eq!(injects_for(ws.path(), script), None);
     }
 
-    /// The path column's half of the forgery. An inner space stays legal, as
-    /// `parse` documents. A control character or edge whitespace is refused.
     #[test]
     fn a_path_that_would_re_cut_the_line_is_not_recordable() {
         assert!(path_is_recordable("data/scripts/auth/x.py"));
@@ -1097,8 +913,6 @@ mod tests {
         assert!(!path_is_recordable(" data/scripts/auth/x.py"));
     }
 
-    /// `parse` trims each line, so a path with trailing whitespace would read
-    /// back as its trimmed sibling. Its hash would then replace the sibling's.
     #[test]
     fn a_trailing_space_cannot_move_a_hash_onto_an_approved_path() {
         let ws = ws();
@@ -1113,15 +927,11 @@ mod tests {
         assert!(!is_approved(ws.path(), victim, b"print(2)"));
     }
 
-    /// A path key carrying a newline whose tail is a whole record line, on a
-    /// path already approved.
     fn path_forging_a_line_for(victim: &str) -> String {
         let forged_hash = "a".repeat(64);
         format!("data/scripts/auth/x.py\n{forged_hash}  https://evil.test  -  {victim}")
     }
 
-    /// The whole attack through `record`, the writer the file tools and the
-    /// approve route share. The forged tail would rebind the victim's scope.
     #[test]
     fn a_newline_in_the_path_cannot_forge_an_approval_line() {
         let ws = ws();
@@ -1138,8 +948,6 @@ mod tests {
         assert!(is_approved(ws.path(), victim, b"print(1)"));
     }
 
-    /// The seed writes the record directly, so it filters on its own. A path
-    /// that cannot round trip is not seeded, and every other path still is.
     #[test]
     fn the_seed_skips_a_path_that_would_forge_an_approval_line() {
         let ws = ws();
@@ -1156,8 +964,6 @@ mod tests {
         assert_eq!(scope_for(ws.path(), victim), None);
     }
 
-    /// The floor under every writer: an entry map holding an unrecordable key
-    /// is refused whole, and the record on disk stays as it was.
     #[test]
     fn write_all_refuses_a_path_that_would_forge_an_approval_line() {
         let ws = ws();
@@ -1179,8 +985,6 @@ mod tests {
         assert_eq!(entries(ws.path()).len(), 1, "the record was not rewritten");
     }
 
-    /// A hand-edited line whose path the writer would refuse is not read, so it
-    /// approves nothing and cannot wedge the next write.
     #[test]
     fn a_hand_edited_path_with_a_control_character_is_not_read() {
         let hash = "a".repeat(64);
@@ -1193,9 +997,6 @@ mod tests {
         );
     }
 
-    /// Padding is not forgery. Every layer on this path trims before it uses
-    /// the value, so the guard must too: refusing a padded base_url would
-    /// reject a config that bound fine before the guard existed.
     #[test]
     fn a_padded_scope_still_binds_and_records_trimmed() {
         let ws = ws();
@@ -1211,7 +1012,6 @@ mod tests {
         );
     }
 
-    /// The seed half of the rule above.
     #[test]
     fn seeding_a_padded_scope_records_it_trimmed() {
         let ws = ws();
@@ -1232,8 +1032,6 @@ mod tests {
         );
     }
 
-    /// The seed writes the record directly, so it filters the scope the same
-    /// way rather than trusting the proxy's gate to have run first.
     #[test]
     fn seeding_skips_a_scope_it_could_not_read_back() {
         let ws = ws();
@@ -1254,11 +1052,6 @@ mod tests {
             "an unrecordable scope is dropped, never written"
         );
 
-        // `scope_for` alone does not bind this test to the guard. Written
-        // through, the hostile value re-cuts the record into a junk first line
-        // plus a hash-less second one that `parse` drops. The scope reads as
-        // None either way. What separates the two states is WHICH key survives:
-        // the seeded path, or the fragment the re-cut left behind.
         let after = entries(ws.path());
         assert_eq!(after.len(), 1, "no second record was forged");
         assert!(
@@ -1268,8 +1061,6 @@ mod tests {
         );
     }
 
-    /// The seed writes the record directly, so it filters the same way rather
-    /// than trusting the gate to have run first.
     #[test]
     fn seeding_skips_an_injected_set_it_could_not_read_back() {
         let ws = ws();
@@ -1294,8 +1085,6 @@ mod tests {
         );
     }
 
-    /// Injecting nothing is not a state. There is no secret to protect, so
-    /// there is nothing to record and nothing to check later.
     #[test]
     fn an_empty_set_records_nothing() {
         let ws = ws();
@@ -1308,9 +1097,6 @@ mod tests {
         assert!(injects_for(ws.path(), "data/scripts/a.py").is_none());
     }
 
-    /// The same guard the scope has. A caller must not swap the script out,
-    /// bind a secret through the call the runner refuses, then restore the
-    /// approved bytes and collect.
     #[test]
     fn a_script_that_would_not_run_cannot_bind_an_injected_set() {
         let ws = ws();
@@ -1324,7 +1110,6 @@ mod tests {
         assert!(injects_for(ws.path(), "data/scripts/a.py").is_none());
     }
 
-    /// Re-authoring changes what a script does, not what it may be handed.
     #[test]
     fn re_recording_keeps_the_injected_set() {
         let ws = ws();
@@ -1337,8 +1122,6 @@ mod tests {
         assert_eq!(injects_for(ws.path(), "data/scripts/a.py"), Some(bound));
     }
 
-    /// A workspace upgrading gets its set from the entry that already names the
-    /// script, so a later `apis.json` rewrite cannot swap what it receives.
     #[test]
     fn seeding_records_the_injected_set_apis_json_names() {
         let ws = ws();
@@ -1359,8 +1142,6 @@ mod tests {
         );
     }
 
-    /// Both columns and a spaced path in one line, round-tripped. The path is
-    /// what tells the columns apart, so the spaces have to survive.
     #[test]
     fn a_scope_an_injected_set_and_a_spaced_path_round_trip() {
         let ws = ws();
@@ -1380,9 +1161,6 @@ mod tests {
         );
     }
 
-    /// Every shape a live workspace may hold, in one file. A packaged install's
-    /// record is two-column, and one written since the scope landed is three.
-    /// Both must keep running their scripts after this upgrade.
     #[test]
     fn two_three_and_four_column_lines_parse_side_by_side() {
         let ws = ws();
@@ -1416,7 +1194,6 @@ mod tests {
         assert!(injects_for(ws.path(), "data/scripts/auth/four-unbound.py").is_none());
     }
 
-    /// A record written before the scope column existed still runs its scripts.
     #[test]
     fn a_two_column_line_still_parses_with_no_scope() {
         let ws = ws();
@@ -1435,9 +1212,6 @@ mod tests {
         assert!(scope_for(ws.path(), "data/scripts/auth/my auth.py").is_none());
     }
 
-    /// A scope round-trips through a write, and so does a spaced path beside
-    /// it: the scope is the middle token and carries a scheme, the path is
-    /// everything after it.
     #[test]
     fn a_scope_and_a_spaced_path_round_trip() {
         let ws = ws();
@@ -1451,8 +1225,6 @@ mod tests {
         );
     }
 
-    /// One spelling for the config value and the record key, or the seed would
-    /// bless a path the runner never looks up.
     #[test]
     fn a_config_script_value_keys_the_same_record_the_runner_reads() {
         assert_eq!(
@@ -1465,10 +1237,6 @@ mod tests {
         );
     }
 
-    /// The spelling a config written before `data/`-relative resolution carries.
-    /// It names the same file, so it has to key the same line. Keying it
-    /// `data/data/...` seeded nothing and left a live workspace with no
-    /// handshake at all.
     #[test]
     fn the_data_prefixed_spelling_keys_the_same_record() {
         assert_eq!(
@@ -1477,8 +1245,6 @@ mod tests {
         );
     }
 
-    /// Stripped once, so a hand-doubled prefix stays visible for the runner's
-    /// guard to refuse rather than being laundered into a runnable path.
     #[test]
     fn a_doubled_prefix_is_stripped_only_once() {
         assert_eq!(
@@ -1487,8 +1253,6 @@ mod tests {
         );
     }
 
-    /// The prefix comes off on a segment boundary. A sibling directory whose
-    /// name merely starts with `data` keeps every character.
     #[test]
     fn a_directory_named_like_data_keeps_its_prefix() {
         assert_eq!(

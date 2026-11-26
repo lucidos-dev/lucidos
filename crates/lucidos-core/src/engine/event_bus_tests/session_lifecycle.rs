@@ -8,7 +8,6 @@ async fn test_session_started_updates_source_in_projection() {
 
     let thread_id = Uuid::new_v4();
 
-    // Thread initially created as "chat" (e.g. by spawn_thread)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -34,7 +33,6 @@ async fn test_session_started_updates_source_in_projection() {
     .await
     .unwrap();
 
-    // Verify source is "chat"
     let source: Option<String> =
         sqlx::query_scalar("SELECT source FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -47,7 +45,6 @@ async fn test_session_started_updates_source_in_projection() {
         "initial source should be chat"
     );
 
-    // SessionStarted fires when CC starts — should update source to "claude_code"
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
@@ -72,7 +69,6 @@ async fn test_session_started_updates_source_in_projection() {
     .await
     .unwrap();
 
-    // Verify source is now "claude_code"
     let source: Option<String> =
         sqlx::query_scalar("SELECT source FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -89,11 +85,6 @@ async fn test_session_started_updates_source_in_projection() {
     teardown_test_db(&db_name).await;
 }
 
-/// `last_user_action` and `last_agent_action` are attributed independently: a
-/// user-typed message bumps ONLY the user column; agent streaming bumps ONLY the
-/// agent column. The unchanged-column equality checks are the load-bearing ones —
-/// they prove the drawer's sort key (last_user_action) does not move on agent
-/// churn, which is the whole point of the split.
 #[tokio::test]
 async fn test_last_user_and_agent_action_attributed_separately() {
     let (pool, db_name) = setup_test_db().await;
@@ -134,11 +125,9 @@ async fn test_last_user_and_agent_action_attributed_separately() {
         },
     };
 
-    // 1. User message creates the row — both columns seed to ~now.
     bus.emit(human_message()).await.unwrap();
     let (u1, _a1) = fetch(pool.clone()).await;
 
-    // 2. Agent streams text — bumps last_agent_action ONLY.
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -158,7 +147,6 @@ async fn test_last_user_and_agent_action_attributed_separately() {
         "agent streaming must NOT bump last_user_action (the drawer sort key)"
     );
 
-    // 3. User follow-up — bumps last_user_action ONLY.
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     bus.emit(human_message()).await.unwrap();
     let (u3, a3) = fetch(pool.clone()).await;
@@ -172,9 +160,6 @@ async fn test_last_user_and_agent_action_attributed_separately() {
     teardown_test_db(&db_name).await;
 }
 
-/// A `PromptInjected` is a user action only when a human sent it. An agent's
-/// follow-up or an engine note (a wait delivery) is agent activity, so it must
-/// leave the drawer's sort key where it is.
 #[tokio::test]
 async fn a_prompt_injected_is_a_user_action_only_from_a_human() {
     let (pool, db_name) = setup_test_db().await;
@@ -279,7 +264,6 @@ async fn test_session_started_does_not_update_last_activity() {
 
     let thread_id = Uuid::new_v4();
 
-    // Create thread with MessageReceived
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -305,7 +289,6 @@ async fn test_session_started_does_not_update_last_activity() {
     .await
     .unwrap();
 
-    // Record last_activity after MessageReceived
     let activity_after_msg: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT last_activity FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -313,10 +296,8 @@ async fn test_session_started_does_not_update_last_activity() {
             .await
             .unwrap();
 
-    // Small delay so timestamps differ
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // SessionStarted should NOT update last_activity
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
@@ -357,11 +338,6 @@ async fn test_session_started_does_not_update_last_activity() {
     teardown_test_db(&db_name).await;
 }
 
-/// SessionEnded is mostly terminal: Shutdown, Panic, Closed, plus the
-/// LegacyNonTerminal catch-all for old DB rows must transition the thread to a
-/// terminal status with `has_response = TRUE`. The one exception is
-/// StaleResume — see `test_session_ended_stale_resume_keeps_status_running`
-/// for that case.
 #[tokio::test]
 async fn test_session_ended_transitions_to_terminal_status() {
     let (pool, db_name) = setup_test_db().await;
@@ -430,20 +406,6 @@ async fn test_session_ended_transitions_to_terminal_status() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression for "Drafts always in Drafts" report (2026-05-01): a CC follow-up
-/// triggered a stale resume and the user saw a transient "Aborted" exchange
-/// before the engine's internal retry produced a fresh `SessionStarted`.
-///
-/// Stale resume happens when CC's `--resume <sid>` returns an empty Result —
-/// the prior session expired. `run_session` emits
-/// `SessionEnded { StaleResume }` so restart-recovery's auto-detect resolver
-/// doesn't try to use the dead sid; the chat handler then retries the user's
-/// message against a fresh session within the same request.
-///
-/// During that retry window the thread MUST stay `running`. If the projection
-/// flips to `idle`, the frontend's `threadIdle && !isComplete && hasSteps`
-/// stale-exchange guard fires and the user sees "Aborted" until the retry's
-/// `SessionStarted` lands seconds later.
 #[tokio::test]
 async fn test_session_ended_stale_resume_keeps_status_running() {
     let (pool, db_name) = setup_test_db().await;
@@ -542,10 +504,6 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
     teardown_test_db(&db_name).await;
 }
 
-/// CC permission prompt must move the thread out of 'running' into
-/// 'waiting_for_user_answer' so the drawer surfaces it in REVIEW with the
-/// question-mark badge. CodingAgentPermissionResolved returns it to 'running'
-/// so the in-flight CC tool call can resume.
 #[tokio::test]
 async fn test_permission_request_transitions_status_to_waiting_for_user_answer() {
     let (pool, db_name) = setup_test_db().await;
@@ -679,7 +637,6 @@ async fn test_session_started_stores_repo_id() {
     let thread_id = Uuid::new_v4();
     let repo_uuid = "550e8400-e29b-41d4-a716-446655440000";
 
-    // Create thread with MessageReceived
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -705,7 +662,6 @@ async fn test_session_started_stores_repo_id() {
     .await
     .unwrap();
 
-    // SessionStarted with repo_id should store it in thread_summaries
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
@@ -742,8 +698,6 @@ async fn test_session_started_stores_repo_id() {
         "cc_repo_id must be stored from SessionStarted"
     );
 
-    // A subsequent SessionStarted WITHOUT repo_id must NOT clear the stored repo_id
-    // (this is the follow-up scenario where the frontend doesn't send repo_id)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
@@ -789,7 +743,6 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Parent thread
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
@@ -815,7 +768,6 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
     .await
     .unwrap();
 
-    // Non-CC child thread (source = "chat")
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
@@ -841,7 +793,6 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
     .await
     .unwrap();
 
-    // Non-CC child completes with ResponseGenerated — should trigger callback
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ResponseGenerated {
@@ -873,8 +824,6 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
 
 #[tokio::test]
 async fn the_newest_session_started_names_the_coding_agent_backend() {
-    // The backend is a fact of each session. A successor session may start on
-    // another one, and the thread then reads the newest session's backend.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -919,7 +868,6 @@ async fn the_newest_session_started_names_the_coding_agent_backend() {
         "first SessionStarted must stamp the backend"
     );
 
-    // A later session on Claude Code moves the thread to it.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: session_started(crate::engine::thread_events::CodingAgent::ClaudeCode),
@@ -944,19 +892,6 @@ async fn the_newest_session_started_names_the_coding_agent_backend() {
     teardown_test_db(&db_name).await;
 }
 
-// ---------------------------------------------------------------------------
-// ContinuationStarted is a channel-agnostic resume boundary
-//
-// It shares a projection arm with SessionStarted, but unlike SessionStarted it
-// is emitted on the chat and trigger paths too (`chat/rerun.rs`'s
-// `emit_resume_anchor`, reached from `POST /api/v1/threads/:id/continue`). The
-// arm used to hardcode `is_coding_agent = TRUE, source = $2`, so one Continue
-// click permanently relabeled a chat thread a coding-agent thread — and the
-// next click then took the coding-agent branch of `continue_thread`. These
-// tests pin both directions of the channel gate.
-// ---------------------------------------------------------------------------
-
-/// Emit the resume boundary `emit_resume_anchor` writes, on `channel`.
 fn continuation_started(thread_id: Uuid, channel: EventChannel) -> BusEvent {
     BusEvent::Thread {
         thread_id,
@@ -1032,8 +967,6 @@ async fn chat_continuation_started_does_not_flip_thread_to_coding_agent() {
 
 #[tokio::test]
 async fn trigger_continuation_started_keeps_trigger_source_and_flag_false() {
-    // `continue_chat` maps the abort's persisted channel back to EventChannel,
-    // so a trigger thread's Continue carries `Trigger`, not `Chat`.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -1078,9 +1011,6 @@ async fn trigger_continuation_started_keeps_trigger_source_and_flag_false() {
 
 #[tokio::test]
 async fn coding_agent_continuation_started_keeps_is_coding_agent_true() {
-    // The mirror of the two above: the real coding-agent resume must not
-    // regress. SessionStarted stamps the identity; the ClaudeCode-channel
-    // ContinuationStarted that follows a `--resume` keeps it.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -1133,10 +1063,6 @@ async fn coding_agent_continuation_started_keeps_is_coding_agent_true() {
 
 #[tokio::test]
 async fn chat_channel_continuation_started_never_clears_is_coding_agent() {
-    // The flag is monotone in this arm: no ordering of events can downgrade a
-    // coding-agent thread. Repairing rows already corrupted by the old
-    // hardcoded TRUE is the migration's job, not the projection's — a
-    // projection that could clear the flag would fight the recovery sweeps.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -1185,8 +1111,6 @@ async fn chat_channel_continuation_started_never_clears_is_coding_agent() {
 
 #[tokio::test]
 async fn chat_continuation_started_preserves_the_stored_draft() {
-    // A Continue consumes nothing: the user clicked Continue, they did not
-    // send. Only a send's accept consumes the compose slot (ADR 0450).
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 

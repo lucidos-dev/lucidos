@@ -1,24 +1,8 @@
-//! Free helpers for assembling the per-turn context snapshot: the extraction
-//! topic summary, the `[LOADED KNOWHOW]` user-message block, and the
-//! `ContextCaptured` section list rendered by the LLM Context Viewer. Pure
-//! functions — no engine state — so they unit-test without standing up an
-//! engine (see `process_tests.rs`).
-
 use super::turn_tail::TurnTail;
 use crate::engine::loaded_knowhow::LoadedKnowhow;
 
-/// Cap on per-section body persistence in `ContextCaptured` events. Both
-/// sizes a section carries stay real; the `content` body is truncated
-/// head/tail to this many characters so a 100 KB system prompt doesn't
-/// bloat every captured row.
-///
-/// Every section built here is a true count, so its `budget_delta_chars` and
-/// its `content_chars` agree. `Conversation` is the one row where they part,
-/// and the agentic loop builds that one.
 const SECTION_PERSIST_MAX: usize = 8_000;
 
-/// Build the 500-char extraction summary fed to the memory extractor: pipe-
-/// joined user turns from `prior` followed by the current `user_message`.
 pub(super) fn summarize_user_topics(
     prior: &[crate::core::store::SessionMessage],
     user_message: &str,
@@ -34,16 +18,6 @@ pub(super) fn summarize_user_topics(
     summary.chars().take(500).collect()
 }
 
-/// Per-section input to [`build_capture_sections`]. Carries the section
-/// name (rendered as the row label in the LLM Context Viewer), its body,
-/// the API role bucket the section ships under, and an optional inner
-/// "tier" group used by the viewer to nest sections within a role.
-///
-/// The inner-group taxonomy mirrors the `[USER MESSAGE]` ordering in
-/// `process_message_with_steps_internal` and the Phase 5 design diagram in
-/// `docs/plans/2026-05-15-loaded-knowhow-and-context-viewer-reorg.md`:
-/// Identity → Workspace inventory → Memory & history → Loaded knowhow →
-/// Active context → System notices → The request.
 struct LabeledSection<'a> {
     name: &'static str,
     content: &'a str,
@@ -79,12 +53,6 @@ pub(crate) fn build_capture_sections(
     use crate::engine::context::truncate_head_tail;
     use crate::engine::{ContextRole, ContextSection};
 
-    // Body capped at SECTION_PERSIST_MAX with head/tail preservation so a
-    // 100 KB system prompt doesn't bloat every captured event row. Both sizes
-    // remain the true length so the viewer's budget bar stays honest.
-    //
-    // The eval lifts that cap (ADR 0110), because a benchmark of context
-    // handling has to be able to read what was in the context.
     let cap = crate::engine::eval_capture::body_cap(SECTION_PERSIST_MAX);
     let truncate = |content: &str| -> Option<String> {
         Some(match cap {
@@ -238,8 +206,6 @@ pub(crate) fn build_capture_sections(
         .into_iter()
         .filter(|ls| !ls.content.is_empty())
         .map(|ls| {
-            // Nothing else counts these bytes, so the delta is the section's
-            // own size and the two agree.
             let chars = ls.content.chars().count();
             ContextSection {
                 name: ls.name.to_string(),
@@ -252,10 +218,6 @@ pub(crate) fn build_capture_sections(
         })
         .collect();
 
-    // Phase 5.2: surface every loaded knowhow doc as its own collapsible
-    // row so the viewer shows the body in a dedicated section instead of
-    // buried inside the User Message blob. Both sizes reflect the full
-    // body so the budget bar stays honest when a round drops the body.
     for doc in loaded_knowhow_docs {
         let chars = doc.body.chars().count();
         capture_sections.push(ContextSection {
@@ -268,10 +230,6 @@ pub(crate) fn build_capture_sections(
         });
     }
 
-    // Phase 5.3: surface each (ToolUse, ToolResult) pair from
-    // `resume_tool_blocks` as its own row under the PriorMessage role —
-    // before this they were invisible in the viewer even though they
-    // travel verbatim with every request and consume real budget.
     for pair in resume_tool_blocks.chunks(2) {
         if pair.len() != 2 {
             continue;
@@ -299,9 +257,6 @@ pub(crate) fn build_capture_sections(
             tool_name, args_preview, result_body
         );
         let pair_chars = pair_body.chars().count();
-        // The same cap as the static sections above. A
-        // resumed tool pair is a prior turn's work, which is exactly what a
-        // two-turn task's replay needs to show.
         capture_sections.push(ContextSection {
             name: format!("ToolUse: {}", tool_name),
             content: truncate(&pair_body),
@@ -315,7 +270,7 @@ pub(crate) fn build_capture_sections(
     capture_sections
 }
 
-/// Build the `[LOADED KNOWHOW]` block injected into the user message: the only
+/// INVARIANT: Build the `[LOADED KNOWHOW]` block injected into the user message: the only
 /// place a loaded doc's body rides after the turn that loaded it. Returns
 /// `None` for an empty loaded set so callers can skip pushing an empty section.
 ///
@@ -357,7 +312,6 @@ pub(crate) fn build_knowhow_retention_block(docs: &[LoadedKnowhow]) -> Option<St
     Some(s)
 }
 
-/// Every section of one turn's user message, by name. An empty one is absent.
 #[derive(Default)]
 pub(crate) struct TurnSections<'a> {
     pub recent: &'a str,
@@ -378,18 +332,14 @@ pub(crate) struct TurnSections<'a> {
     pub todo_list: &'a str,
     pub mcp_servers: &'a str,
     pub mcp_dropped_notice: &'a str,
-    /// The firing trigger's own know-how listing. Empty on a chat turn.
     pub trigger_knowhow: &'a str,
     pub setup_reminder: &'a str,
-    /// The user's words, without the `Request:` label.
     pub request: &'a str,
     pub tail: TurnTail<'a>,
 }
 
-/// One turn's user message text in its two halves.
 pub(crate) struct TurnText {
     pub stable: String,
-    /// Everything that moves per turn, ending with the request and the tail.
     pub volatile: String,
 }
 

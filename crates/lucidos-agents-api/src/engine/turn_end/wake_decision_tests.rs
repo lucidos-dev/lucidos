@@ -1,6 +1,3 @@
-//! The wake decision: I4 and I10 of
-//! `docs/plans/2026-10-11-sub-threads-wake-parents-only-when-needed.md`.
-
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -28,7 +25,6 @@ impl JudgmentProvider for Failing {
     }
 }
 
-/// Answers the gate's question with `Some(p)`, or with nothing at all.
 struct Answering(Option<f64>);
 
 #[async_trait]
@@ -53,7 +49,6 @@ impl JudgmentProvider for Answering {
     }
 }
 
-/// Never answers, so only the deadline ends the call.
 struct Hanging;
 
 #[async_trait]
@@ -68,10 +63,8 @@ impl JudgmentProvider for Hanging {
     }
 }
 
-/// One call a provider received: the state and the question set.
 type Asked = (Value, Vec<(String, Question)>);
 
-/// Answers with `p`, and keeps every state and question set it was asked.
 struct Recording {
     p: f64,
     asked: std::sync::Mutex<Vec<Asked>>,
@@ -175,7 +168,6 @@ fn the_tool_needs_an_explicit_boolean() {
     assert!(WakeDecision::from_tool_args(&json!({ "wake": "no" })).is_err());
 }
 
-/// I10: the call answers one yes-or-no question and is offered nothing else.
 #[test]
 fn the_call_asks_one_yes_or_no_question() {
     let questions = wake_questions();
@@ -216,8 +208,6 @@ fn the_state_carries_both_sides_of_the_report() {
     );
 }
 
-/// The call reads the siblings in words, since a bare count misled the
-/// decision models (ADR 0448). Only a count of 0 calls the report the last.
 #[test]
 fn only_the_last_running_child_reads_as_the_last() {
     assert!(siblings_note(0).contains("the last"));
@@ -228,8 +218,6 @@ fn only_the_last_running_child_reads_as_the_last() {
     }
 }
 
-/// The chat backend over the mock, which answers a forced call with a
-/// confident no and an unforced one in text.
 fn mock_chat() -> ChatJudgmentProvider {
     wake_decision_chat_judge(
         std::sync::Arc::new(crate::llm::mock::MockProvider::new(
@@ -239,8 +227,6 @@ fn mock_chat() -> ChatJudgmentProvider {
     )
 }
 
-/// The chat backend forces its answer tool, so the mock's no arrives. An
-/// unforced call would answer in text, which wakes.
 #[tokio::test]
 async fn the_chat_backend_is_forced_to_answer() {
     assert_eq!(
@@ -257,8 +243,6 @@ async fn decide_on(
     Some(decide(provider.as_ref(), Duration::from_secs(30)).await)
 }
 
-/// A pinned or measured chat model answers, alone or behind a failed System
-/// One call.
 #[tokio::test]
 async fn a_measured_or_pinned_chat_model_answers() {
     assert_eq!(
@@ -272,9 +256,6 @@ async fn a_measured_or_pinned_chat_model_answers() {
     );
 }
 
-/// With no measured model reachable, no chat model is asked. A System One
-/// pick answers alone, its failure wakes, and without one the parent wakes
-/// with no call.
 #[tokio::test]
 async fn with_no_measured_model_no_chat_model_is_asked() {
     assert_eq!(decide_on(None, None).await, None);
@@ -298,10 +279,6 @@ fn owed(holds_live_wait: bool) -> OwedReport {
     }
 }
 
-/// Whether a report wakes the parent follows the fan-in's own delivery rule
-/// for a finished turn (ADR 0446, I3). A cut-short turn wakes, unless the
-/// child is `no-wake` (ADR 0545). A held card waits for its event wait, so
-/// this turn end wakes nothing.
 #[test]
 fn the_report_wakes_the_parent_exactly_as_the_fan_in_delivers_it() {
     use ChildCompletionStatus::*;
@@ -350,8 +327,6 @@ fn the_report_wakes_the_parent_exactly_as_the_fan_in_delivers_it() {
     assert!(!owed(true).wakes_parent(TurnFinish::Finished(Success), yes));
 }
 
-/// The eval scores exactly what the gate asks: one state, one question set,
-/// one threshold.
 #[tokio::test]
 async fn the_eval_asks_what_the_gate_asks() {
     let turn = TurnRead {
@@ -400,8 +375,6 @@ async fn the_eval_asks_what_the_gate_asks() {
     }
 }
 
-/// I3 and I4 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`:
-/// a declared child is never asked, and still wakes when cut short or empty.
 #[test]
 fn a_declared_child_is_never_asked_and_its_doubts_still_wake() {
     let report = |declared: bool, decided: bool| OwedReport {
@@ -434,7 +407,6 @@ fn a_declared_child_is_never_asked_and_its_doubts_still_wake() {
     );
 }
 
-/// The declared answer names the mode and records nothing.
 #[test]
 fn the_declared_answer_names_the_mode() {
     for mode in WakeMode::ALL {
@@ -487,8 +459,6 @@ mod db {
         .unwrap();
     }
 
-    /// The gate asks only for a child owing its parent a card, and only once
-    /// per turn: a decision the turn already made is kept.
     #[tokio::test]
     async fn a_child_owes_a_report_until_its_turn_decides() {
         let (pool, db_name) = setup_test_db().await;
@@ -514,9 +484,6 @@ mod db {
         teardown_test_db(&db_name).await;
     }
 
-    /// The read decision learns where the report goes from the same column
-    /// the fan-in delivers by (ADR 0446, I4): a recorded no files a clean
-    /// report, and a recorded yes wakes the parent.
     #[tokio::test]
     async fn the_owed_report_reads_the_decision_the_fan_in_delivers_by() {
         let (pool, db_name) = setup_test_db().await;
@@ -539,8 +506,6 @@ mod db {
         teardown_test_db(&db_name).await;
     }
 
-    /// I4 and I10: only an undeclared child owes a wake decision, so only it
-    /// is offered `wake_parent` and told the wake rule.
     #[tokio::test]
     async fn only_an_undeclared_child_owes_a_wake_decision() {
         let (pool, db_name) = setup_test_db().await;
@@ -595,8 +560,6 @@ mod db {
         teardown_test_db(&db_name).await;
     }
 
-    /// The call reads what the parent last said and counts only the other
-    /// children still working.
     #[tokio::test]
     async fn the_parent_view_reads_its_reply_and_running_siblings() {
         let (pool, db_name) = setup_test_db().await;

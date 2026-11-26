@@ -3,10 +3,6 @@ use crate::core::secret_store::key_store::TestKeyStore;
 use crate::core::snapshot::jobs::{self, Action, Failure, State};
 use uuid::Uuid;
 
-/// Reconcile once the owner lock is free. A concurrent test's `fork` copies
-/// this process's lock descriptors, so a released lock stays held until that
-/// child execs (`lucidos-owner-lock` header). The refusal is transient. The
-/// deadline bounds only the wait: a call that took the lock runs to the end.
 async fn reconcile_when_owner_free(
     session: &std::sync::Arc<Session>,
     restore_id: Uuid,
@@ -261,7 +257,6 @@ async fn retention_announces_each_deletion_before_the_next_and_preserves_protect
         .clone()
         .prune(0, 0, |handle| {
             assert!(observer.get(&handle).is_err());
-            // The next eligible victim must still exist at notification time.
             if announced.is_empty() {
                 assert!(observer.get(&manifests[3].handle).is_ok());
             }
@@ -328,7 +323,6 @@ async fn retention_stops_at_a_failed_delete_without_announcing_it() {
         .clone()
         .prune(0, 0, |handle| {
             announced.push(handle);
-            // Simulate a protection changing between selection and deletion.
             observer.set_keep(&manifests[1].handle, true).unwrap();
             std::future::ready(Ok(()))
         })
@@ -423,7 +417,6 @@ async fn capture_publishes_actual_reports_and_check_detects_tampering() {
             .iter()
             .any(|needle| bytes.windows(needle.len()).any(|window| window == needle))
     };
-    // Check the detector without ever printing a needle in a failure message.
     assert!(contains_secret(secret.as_bytes()));
     std::fs::create_dir(workspace.path().join(".lucidos")).unwrap();
     std::fs::write(
@@ -542,7 +535,6 @@ async fn capture_publishes_actual_reports_and_check_detects_tampering() {
     }
     for name in ["files.tar.zst", "files.index.jsonl.zst"] {
         let bytes = zstd::decode_all(std::fs::File::open(snapshot.join(name)).unwrap()).unwrap();
-        // The whole tar stream includes entry headers, paths and contents.
         assert!(!contains_secret(&bytes), "secret in expanded file artifact");
     }
     let expanded = crate::core::backup::pg_tool_command("pg_restore", &test_db_url(&database))
@@ -706,8 +698,6 @@ async fn canceled_caller_retains_locks_until_capture_finishes() {
             )
             .await
     });
-    // Three owners means the outer caller has entered the job and spawned
-    // the worker, which cannot finish while we hold the sole connection.
     tokio::time::timeout(Duration::from_secs(10), async {
         while Arc::strong_count(&session) < 3 {
             tokio::task::yield_now().await;
@@ -867,7 +857,6 @@ async fn canceled_delete_waiter_keeps_locks_until_the_event_is_persisted() {
             )
             .await
     });
-    // The delete has happened but the event cannot reach the database yet.
     tokio::time::timeout(Duration::from_secs(10), async {
         while session.store.snapshot_dir(&handle).exists() {
             tokio::task::yield_now().await;
@@ -948,7 +937,6 @@ async fn runner_journals_original_policy_and_reuses_it_for_rollback() {
         .execute(&pool)
         .await
         .unwrap();
-    // B is newer than A and lives outside the database being restored.
     let later = session
         .clone()
         .capture(
@@ -1013,8 +1001,6 @@ async fn runner_journals_original_policy_and_reuses_it_for_rollback() {
         assert_eq!(unchanged.phase(), Phase::RecoveryCapture);
         assert!(unchanged.recovery.is_none());
     }
-    // Block the owned runner at its connected-database check. Canceling the
-    // requesting task must neither release the owner lock nor cancel recovery.
     let single_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&test_db_url(&database))
@@ -1199,8 +1185,6 @@ async fn incompatible_restore_contract_refuses_before_recovery_or_mutation() {
         if !newer_schema {
             saved.secret_key_ids = [crate::core::secret_store::SecretKey::generate().id()].into();
         }
-        // Authenticate a genuinely incompatible contract, rather than testing
-        // the unrelated MAC-tampering refusal.
         let signed =
             super::super::manifest::AuthenticatedManifest::seal(saved.clone(), &session.key)
                 .unwrap();
@@ -1409,8 +1393,6 @@ async fn mutation_and_boot_faults_recover_or_block_normal_boot() {
         );
         if preparation_failed {
             assert!(durable.recovery.is_none());
-            // Verification failure occurs after publication, but must never
-            // authorize staging or installing even a valid recovery archive.
             assert_eq!(
                 session
                     .list()
@@ -1534,7 +1516,6 @@ async fn interrupted_preparation_settles_without_connecting_or_replaying() {
             Phase::FailedUnchanged
         };
         assert_eq!(session.store.journals().unwrap()[0].phase(), expected);
-        // Restart recovery is idempotent and does not require any archived files.
         reconcile_when_owner_free(
             &session,
             journal.restore_id,
@@ -1583,15 +1564,12 @@ fn restore_admission_is_durable_exclusive_and_refuses_unknown_archives() {
     assert!(session.admit_restore(&other).is_err());
     assert_eq!(reopened.journals().unwrap().len(), 1);
 
-    // A restore the gateway never took settles, and stops blocking a new one.
     session.refuse_restore(journal.restore_id).unwrap();
     assert_eq!(reopened.journals().unwrap()[0].phase(), Phase::Refused);
     assert!(session.refuse_restore(journal.restore_id).is_err());
     session.admit_restore(&other).unwrap();
 }
 
-/// A capture that fails after it began writing must not leave its bytes: the
-/// disk floor never counts them, and boot clears only hour-old partials.
 #[tokio::test]
 async fn a_failed_capture_leaves_no_partial_directory() {
     use crate::test_support::{setup_test_db, teardown_test_db};
@@ -1641,9 +1619,6 @@ async fn a_failed_capture_leaves_no_partial_directory() {
     teardown_test_db(&database).await;
 }
 
-/// A workspace whose estimate exceeds the free disk fails with the shortfall
-/// rather than a bare capture failure. A sparse file sets the estimate without
-/// using disk.
 #[tokio::test]
 async fn a_capture_refused_by_the_disk_floor_names_the_space_to_free() {
     use crate::test_support::{setup_test_db, teardown_test_db, test_db_url};

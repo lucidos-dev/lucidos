@@ -1,6 +1,5 @@
 use super::*;
 
-// 1. every_persisted_event_is_classified
 #[test]
 fn every_persisted_event_is_classified() {
     for event_type in all_persisted_event_types() {
@@ -12,11 +11,6 @@ fn every_persisted_event_is_classified() {
     }
 }
 
-// 1b. Every persisted event type must resolve through `resolve_transition`
-// without falling into the "_ => violation('Unknown event type')" arm.
-// Without this, adding a new ThreadEvent variant to `all_persisted_event_types`
-// + `classify_event` is silently insufficient: emit_or_log swallows the error
-// and the event never lands in the events table.
 #[test]
 fn every_persisted_event_resolves_in_lifecycle() {
     for event_type in all_persisted_event_types() {
@@ -36,7 +30,6 @@ fn every_persisted_event_resolves_in_lifecycle() {
     }
 }
 
-// 2. metadata_events_are_correct
 #[test]
 fn metadata_events_are_correct() {
     let metadata_events = [
@@ -56,7 +49,6 @@ fn metadata_events_are_correct() {
     }
 }
 
-// 3. cc_events_never_classified_as_start
 #[test]
 fn cc_events_never_classified_as_start() {
     let cc_specific = [
@@ -77,7 +69,6 @@ fn cc_events_never_classified_as_start() {
     }
 }
 
-// 4. both_thread_types_share_same_legal_sections
 #[test]
 fn both_thread_types_share_same_legal_sections() {
     assert!(is_section_legal(ThreadType::Chat, ArchiveState::Archived));
@@ -92,7 +83,6 @@ fn both_thread_types_share_same_legal_sections() {
     ));
 }
 
-// 5. response_generated_surfaces_chat_to_inbox
 #[test]
 fn response_generated_surfaces_chat_to_inbox() {
     let result = resolve_transition(
@@ -105,7 +95,6 @@ fn response_generated_surfaces_chat_to_inbox() {
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
 }
 
-// 6. response_generated_does_not_surface_cc
 #[test]
 fn response_generated_does_not_surface_cc() {
     let result = resolve_transition(
@@ -118,7 +107,6 @@ fn response_generated_does_not_surface_cc() {
     assert_eq!(result.new_section, None);
 }
 
-// 7. claude_code_idled_surfaces_cc_to_inbox
 #[test]
 fn claude_code_idled_surfaces_cc_to_inbox() {
     let result = resolve_transition(
@@ -131,7 +119,6 @@ fn claude_code_idled_surfaces_cc_to_inbox() {
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
 }
 
-// 8. claude_code_idled_rejected_for_chat
 #[test]
 fn claude_code_idled_rejected_for_chat() {
     let result = resolve_transition(
@@ -143,7 +130,6 @@ fn claude_code_idled_rejected_for_chat() {
     assert!(result.is_err());
 }
 
-// 9. change_applied_keeps_inbox — thread stays in REVIEW so Archive button appears
 #[test]
 fn change_applied_keeps_inbox() {
     let result = resolve_transition(
@@ -159,7 +145,6 @@ fn change_applied_keeps_inbox() {
     );
 }
 
-// 10. change_applied_no_op_if_not_in_inbox
 #[test]
 fn change_applied_no_op_if_not_in_inbox() {
     let result = resolve_transition(
@@ -172,7 +157,6 @@ fn change_applied_no_op_if_not_in_inbox() {
     assert_eq!(result.new_section, None);
 }
 
-// 12. thread_archived_clears_inbox_both_types
 #[test]
 fn thread_archived_clears_inbox_both_types() {
     let chat = resolve_transition(
@@ -194,8 +178,6 @@ fn thread_archived_clears_inbox_both_types() {
     assert_eq!(cc.new_section, Some(ArchiveState::Archived));
 }
 
-/// A pinned thread is never archived (ADR 0312), so the pin brings an archived
-/// thread back to the inbox, for both thread types.
 #[test]
 fn thread_saved_moves_an_archived_thread_to_the_inbox() {
     for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
@@ -213,19 +195,13 @@ fn only_the_pinned_archived_pair_is_illegal() {
     assert!(!is_retention_legal(ArchiveState::Archived, true));
 }
 
-// 13. thread_archived_is_terminal
 #[test]
 fn thread_archived_is_terminal() {
     assert_eq!(classify_event("ThreadArchived"), Some(EventClass::Terminal));
 }
 
-// 14. chat_sub_threads_stay_in_the_inbox
 #[test]
 fn chat_sub_threads_stay_in_the_inbox() {
-    // A finished chat sub-thread is attended: its parent spawned it and the
-    // user can see it under that parent. Routing it to Archived writes a state
-    // no `ThreadArchived` event backs, so the drawer dims a row nobody
-    // archived. Depth is not an input to the bottom guard.
     let result = resolve_transition(
         "ResponseGenerated",
         ThreadType::Chat,
@@ -236,12 +212,8 @@ fn chat_sub_threads_stay_in_the_inbox() {
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
 }
 
-// 14a. unattended_trigger_runs_route_to_archived
 #[test]
 fn unattended_trigger_runs_route_to_archived() {
-    // The one population the bottom guard still covers. A scheduled task run
-    // nobody opted into reviewing hides on its terminal event. It must not
-    // ask for attention on work the user never started.
     for event_type in ["ResponseGenerated", "ResponseAborted", "ResponseCanceled"] {
         let result =
             resolve_transition(event_type, ThreadType::Chat, ArchiveState::Inbox, true).unwrap();
@@ -272,11 +244,8 @@ fn interrupted_trigger_fire_surfaces_without_changing_status() {
     }));
 }
 
-// 14a2. undo_restores_an_unattended_trigger_run
 #[test]
 fn undo_restores_an_unattended_trigger_run() {
-    // Archive all can take a trigger run that is still unattended, such as
-    // one a restart stranded in Current. Its Undo must bring it back.
     let result = resolve_transition(
         "ThreadUnarchived",
         ThreadType::Chat,
@@ -287,10 +256,8 @@ fn undo_restores_an_unattended_trigger_run() {
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
 }
 
-// 14b. response_aborted_surfaces_both_thread_types_to_inbox
 #[test]
 fn response_aborted_surfaces_both_thread_types_to_inbox() {
-    // Chat thread: ResponseAborted → inbox
     let chat = resolve_transition(
         "ResponseAborted",
         ThreadType::Chat,
@@ -300,7 +267,6 @@ fn response_aborted_surfaces_both_thread_types_to_inbox() {
     .unwrap();
     assert_eq!(chat.new_section, Some(ArchiveState::Inbox));
 
-    // CC thread: ResponseAborted → inbox (aborted CC needs user attention in REVIEW)
     let cc = resolve_transition(
         "ResponseAborted",
         ThreadType::CodingAgent,
@@ -311,12 +277,8 @@ fn response_aborted_surfaces_both_thread_types_to_inbox() {
     assert_eq!(cc.new_section, Some(ArchiveState::Inbox));
 }
 
-// 14c. response_aborted_chat_sub_thread_stays_in_the_inbox
 #[test]
 fn response_aborted_chat_sub_thread_stays_in_the_inbox() {
-    // Same contract as `chat_sub_threads_stay_in_the_inbox` above. An abort
-    // matters more, not less, for a sub-thread: the row is how the user finds
-    // out the delegated work died.
     let result = resolve_transition(
         "ResponseAborted",
         ThreadType::Chat,
@@ -327,9 +289,6 @@ fn response_aborted_chat_sub_thread_stays_in_the_inbox() {
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
 }
 
-// CC threads also receive a CodingAgentIdled after ResponseCanceled in the
-// normal path, but the no-session settle fallback (claude_code.rs) emits
-// ResponseCanceled alone — so the inbox transition must hold for both.
 #[test]
 fn response_canceled_surfaces_both_thread_types_to_inbox() {
     let chat = resolve_transition(
@@ -353,7 +312,6 @@ fn response_canceled_surfaces_both_thread_types_to_inbox() {
 
 #[test]
 fn response_canceled_chat_sub_thread_stays_in_the_inbox() {
-    // Same contract as `chat_sub_threads_stay_in_the_inbox` above.
     let result = resolve_transition(
         "ResponseCanceled",
         ThreadType::Chat,
@@ -364,12 +322,8 @@ fn response_canceled_chat_sub_thread_stays_in_the_inbox() {
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
 }
 
-// 14d. cc_threads_go_to_inbox_even_when_unattended
 #[test]
 fn cc_threads_go_to_inbox_even_when_unattended() {
-    // The bottom guard's coding-agent exemption, pinned from the only side
-    // that can now exercise it. Every session ends needing Apply, Discard or
-    // Archive, so an unattended one must still surface.
     for event_type in ["CodingAgentIdled", "ResponseAborted", "ChangeProposed"] {
         let result = resolve_transition(
             event_type,
@@ -386,11 +340,8 @@ fn cc_threads_go_to_inbox_even_when_unattended() {
     }
 }
 
-// 14e. an_event_that_waits_on_the_user_never_archives
 #[test]
 fn an_event_that_waits_on_the_user_never_archives() {
-    // The unattended guard used to archive a trigger run the moment it asked
-    // the user something, so the question never reached them (ADR 0259).
     for &event_type in WAITING_FOR_USER_ANSWER_EVENTS {
         let mut legal_somewhere = false;
         for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
@@ -415,7 +366,6 @@ fn an_event_that_waits_on_the_user_never_archives() {
     }
 }
 
-// 14f. waiting_for_user_answer_events_match_the_status_table
 #[test]
 fn waiting_for_user_answer_events_match_the_status_table() {
     use std::collections::BTreeSet;
@@ -432,7 +382,6 @@ fn waiting_for_user_answer_events_match_the_status_table() {
     );
 }
 
-// 14g. only_a_waiting_thread_or_the_home_thread_refuses_archive
 #[test]
 fn only_a_waiting_thread_or_the_home_thread_refuses_archive() {
     for status in ThreadStatus::ALL {
@@ -451,7 +400,6 @@ fn only_a_waiting_thread_or_the_home_thread_refuses_archive() {
     }
 }
 
-// 15. no_transition_produces_illegal_section
 #[test]
 fn no_transition_produces_illegal_section() {
     let thread_types = [ThreadType::Chat, ThreadType::CodingAgent];
@@ -481,18 +429,6 @@ fn no_transition_produces_illegal_section() {
     }
 }
 
-// 16. a_call_writes_only_metadata
-//
-// Every row a voice call adds is Metadata, and none of them moves a section.
-// Both properties matter, for reasons that differ per event.
-//
-// `SpokenReplyGenerated` lands while the doer's own turn is still running, so
-// Terminal would settle a turn it has no part in. `SpokenMessageReceived`
-// starts nothing: the talker decides whether the doer is wanted, so Start
-// would leave the thread waiting on a turn that never runs.
-//
-// `WorkDelegated` is the exception and has its own case below. It IS the
-// start of a delegated call's turn (ADR 0201).
 #[test]
 fn a_call_writes_only_metadata() {
     let voice_events = [
@@ -528,14 +464,6 @@ fn a_call_writes_only_metadata() {
     }
 }
 
-// 16b. a_delegation_starts_a_turn_exactly_as_the_message_it_replaced
-//
-// `WorkDelegated` carries the start of a delegated call's turn, and no
-// `MessageReceived` is written beside it (ADR 0201).
-//
-// Compared against `MessageReceived` rather than pinned to a literal, so the
-// two can never drift: whatever a typed message does to a thread, a delegation
-// does.
 #[test]
 fn a_delegation_starts_a_turn_exactly_as_the_message_it_replaced() {
     assert_eq!(classify_event("WorkDelegated"), Some(EventClass::Start));
@@ -555,11 +483,6 @@ fn a_delegation_starts_a_turn_exactly_as_the_message_it_replaced() {
     }
 }
 
-// 17. a_side_question_moves_nothing
-//
-// A side question is a card beside the thread, never a turn (ADR 0320). Its
-// four events are persisted so the card survives reload. None of them may
-// move a status, a section, recency or the message count.
 #[test]
 fn a_side_question_moves_nothing() {
     use crate::engine::thread_events::ThreadEvent;

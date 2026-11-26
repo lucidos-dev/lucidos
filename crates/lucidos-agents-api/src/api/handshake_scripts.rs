@@ -1,20 +1,7 @@
-//! Reading and granting handshake-script approvals (ADR 0144).
-//!
-//! Two routes with deliberately different gates. Reading is safe for anyone
-//! who can reach the API, and the Files panel needs it to warn at edit time.
-//! Approving is the act that lets a file run as the engine user, so it refuses
-//! a browser-shaped caller and belongs to `lucidos handshake approve`.
-//!
-//! **Why refusing a browser is sound here, when ADR 0144 rules out telling an
-//! app from the shell.** Those are different questions. `Sec-Fetch-*` is set by
-//! the browser and page JavaScript cannot suppress it, so "this came from a
-//! browser at all" is unforgeable. What no header answers is WHICH document in
-//! that browser sent it, and this route never asks.
-
 use super::*;
 use crate::core::handshake_approvals::{self, ApprovalSource};
 
-/// Whether this request came from inside a browser.
+/// INVARIANT: Whether this request came from inside a browser.
 ///
 /// Fetch metadata is a forbidden header set, so a page cannot add or remove
 /// it, and every current browser sends it. `Origin` catches a
@@ -25,18 +12,14 @@ fn is_browser_request(headers: &HeaderMap) -> bool {
         || headers.contains_key(axum::http::header::ORIGIN)
 }
 
-/// One handshake script the config names, and whether it may run.
 #[derive(Serialize)]
 pub(super) struct HandshakeScriptState {
-    /// Workspace-relative, e.g. `data/scripts/auth/comfort-cloud.py`.
     path: String,
-    /// The file is on disk.
     exists: bool,
-    /// Its current bytes are recorded, so a proxy call will run it.
     approved: bool,
 }
 
-/// The `data/scripts/`-relative path an approval is keyed by, from whatever the
+/// INVARIANT: The `data/scripts/`-relative path an approval is keyed by, from whatever the
 /// caller typed.
 ///
 /// Three spellings reach here and all mean one file: the `apis.json` value
@@ -77,8 +60,6 @@ fn approval_key(workspace_path: &std::path::Path, raw: &str) -> Result<String, S
     Ok(rel)
 }
 
-/// GET /api/v1/handshake-scripts, every script `apis.json` names with its
-/// approval state. Read-only, so a browser may ask.
 pub(super) async fn list_handshake_scripts(State(state): State<AppState>) -> Response {
     let load = crate::api::load_proxy_config(&state.workspace_path);
     let recorded = handshake_approvals::entries(&state.workspace_path);
@@ -107,7 +88,7 @@ pub(super) struct ApproveRequest {
     pub path: String,
 }
 
-/// POST /api/v1/handshake-scripts/approve, recording a script's current bytes
+/// INVARIANT: POST /api/v1/handshake-scripts/approve, recording a script's current bytes
 /// as approved. Non-browser callers only: this is what
 /// `lucidos handshake approve` calls.
 pub(super) async fn approve_handshake_script(
@@ -126,7 +107,7 @@ pub(super) async fn approve_handshake_script(
         )
             .into_response();
     }
-    // Approving widens what a signer may run, so it is recorded before it is
+    // INVARIANT: Approving widens what a signer may run, so it is recorded before it is
     // done rather than after.
     let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
         Ok(a) => a,
@@ -204,8 +185,6 @@ mod tests {
         h
     }
 
-    /// The gate the approve route runs. An app UI cannot strip fetch metadata,
-    /// so it cannot present itself as the CLI.
     #[test]
     fn a_browser_is_recognised_however_it_asks() {
         assert!(is_browser_request(&hm(&[(
@@ -217,7 +196,6 @@ mod tests {
             "origin",
             "https://localhost:5251"
         )])));
-        // The CLI, the API e2e suite, another process on this machine.
         assert!(!is_browser_request(&HeaderMap::new()));
         assert!(!is_browser_request(&hm(&[("user-agent", "lucidos-cli")])));
     }
@@ -239,10 +217,6 @@ mod tests {
         }
     }
 
-    /// This route and the runner have to key one config value the same line.
-    /// They drifted once: this side accepted both spellings and the runner's
-    /// side doubled the prefix, so `lucidos handshake approve` recorded a path
-    /// no proxy call ever looked up.
     #[test]
     fn approving_keys_a_config_value_the_way_the_runner_does() {
         let ws = std::path::Path::new("/ws");
@@ -271,13 +245,6 @@ mod tests {
     }
 
     mod guard_tests {
-        /// Approval follows authorship, so there is no tool for it. Otherwise an
-        /// app wanting a script blessed would only have to talk the agent into
-        /// pressing the button. Knowhow it wrote is one way to try.
-        ///
-        /// The agent CAN still make a script runnable, by writing the content
-        /// itself through `write_file` or `edit_file`. That is the same power as
-        /// `run_python`, which it already has, so it is not what this guards.
         #[test]
         fn the_llm_tool_surface_knows_nothing_about_approving() {
             let offenders: Vec<String> = crate::test_support::source_scan::production_sources()

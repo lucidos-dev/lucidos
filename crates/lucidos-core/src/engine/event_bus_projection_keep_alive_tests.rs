@@ -1,6 +1,3 @@
-//! A cache keep-alive turn leaves the summary row as it found it (I7), and a
-//! real turn opener after it projects as usual (I8).
-
 use super::*;
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::{ActorMode, KEEP_ALIVE_IDLE_REASON};
@@ -35,7 +32,6 @@ fn idle(reason: Option<&str>) -> ThreadEvent {
     }
 }
 
-/// What a person sees of the thread, plus the turn flag.
 type Row = (String, chrono::DateTime<chrono::Utc>, i32, bool, bool);
 
 async fn row(pool: &sqlx::PgPool, thread_id: Uuid) -> Row {
@@ -71,7 +67,14 @@ async fn a_keep_alive_turn_leaves_the_row_as_it_was_and_projects_again_once_clea
 
     seed_thread_event(&bus, thread_id, keep_alive_anchor()).await;
     bus.mark_keep_alive_turn(thread_id, true).await;
-    seed_thread_event(&bus, thread_id, ThreadEvent::ThreadReadRequested).await;
+    seed_thread_event(
+        &bus,
+        thread_id,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     seed_thread_event(&bus, thread_id, idle(Some(KEEP_ALIVE_IDLE_REASON))).await;
     let after_keep_alive = row(&pool, thread_id).await;
     assert!(after_keep_alive.4, "the turn flag is set");
@@ -101,8 +104,6 @@ async fn a_keep_alive_turn_leaves_the_row_as_it_was_and_projects_again_once_clea
     teardown_test_db(&db_name).await;
 }
 
-/// An anchor whose beat was skipped marks nothing, so the real turn that won
-/// the thread projects in full.
 #[tokio::test]
 async fn an_anchor_alone_marks_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -120,8 +121,6 @@ async fn an_anchor_alone_marks_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// A card raised during a keep-alive makes the turn real: the thread waits on
-/// a person, and what follows the answer must show.
 #[tokio::test]
 async fn a_card_ends_the_keep_alive_turn() {
     let (pool, db_name) = setup_test_db().await;

@@ -1,9 +1,3 @@
-//! Tool grant lanes, their Settings text format and their legacy file names.
-//!
-//! The engine imports the legacy files under `<workspace>/.lucidos/` into the
-//! permissions store at boot and deletes them after commit. [`migration`]
-//! seeds files for workspaces that predate per-workspace tool grants.
-
 pub mod migration;
 
 use std::path::{Path, PathBuf};
@@ -11,54 +5,39 @@ use std::sync::Mutex;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Serializes every [`write_raw`] in this process, so two writers never share
+/// INVARIANT: Serializes every [`write_raw`] in this process, so two writers never share
 /// a scratch file. `core::handshake_approvals` guards its own record the same
 /// way.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Take [`WRITE_LOCK`], recovering a poisoned one. A panic under the lock
+/// INVARIANT: Take [`WRITE_LOCK`], recovering a poisoned one. A panic under the lock
 /// leaves the file consistent, because every write lands through a rename.
 fn write_guard() -> std::sync::MutexGuard<'static, ()> {
     WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Engine-owned runtime directory at the workspace root, holding the grant
+/// INVARIANT: Engine-owned runtime directory at the workspace root, holding the grant
 /// files alongside the pidfile, the ports file and the worktrees. Gitignored,
 /// excluded from backup, and unreachable by the file tools.
 const GRANTS_DIR: &str = ".lucidos";
 
-/// Where `workspace_path` keeps its legacy grant files.
 pub fn grants_dir(workspace_path: &Path) -> PathBuf {
     workspace_path.join(GRANTS_DIR)
 }
 
-/// One of the three persisted allowlists. Each gates a different caller, so the
-/// pattern languages are unrelated and a single merged file would be ambiguous:
-/// `Bash(git:*)` grants a command head, bare `Bash` grants every command
-/// after the engine's unconditional floor, and `Mcp(slack:*)` grants MCP tools.
-///
-/// Serializes as its own [`GrantFile::file_name`], so the `grant_file` on a
-/// `PermissionGrantsChanged` event reads as the name the Settings editor shows.
-/// `the_wire_name_is_the_file_name` pins the two together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GrantFile {
-    /// The Lucidos Agent command guard (ADR 0002).
     #[serde(rename = "agent-allowed-commands")]
     AgentCommands,
-    /// Claude Code's `--allowedTools`, handed over on every spawn.
     #[serde(rename = "cc-allowed-tools")]
     CodingAgentTools,
-    /// The Lucidos Agent's MCP tool gate.
     #[serde(rename = "mcp-allowed-tools")]
     McpTools,
-    /// The *standing denies*: command rules that refuse a command on every
-    /// lane, before any allow. Its lines are spelled as `AgentCommands` lines.
     #[serde(rename = "agent-denied-commands")]
     AgentDeniedCommands,
 }
 
 impl GrantFile {
-    /// Every lane, for the migration and for tests that must cover them all.
     pub const ALL: [GrantFile; 4] = [
         Self::AgentCommands,
         Self::CodingAgentTools,
@@ -66,12 +45,10 @@ impl GrantFile {
         Self::AgentDeniedCommands,
     ];
 
-    /// Whether this lane holds standing denies instead of allows.
     pub fn denies(self) -> bool {
         matches!(self, Self::AgentDeniedCommands)
     }
 
-    /// The file name inside [`grants_dir`].
     pub fn file_name(self) -> &'static str {
         match self {
             Self::AgentCommands => "agent-allowed-commands",
@@ -81,8 +58,6 @@ impl GrantFile {
         }
     }
 
-    /// The instructional comment the editor opens with, so it shows
-    /// the pattern language before the first grant exists.
     pub fn header(self) -> &'static str {
         match self {
             Self::AgentCommands => {
@@ -109,7 +84,6 @@ impl GrantFile {
         }
     }
 
-    /// Format a lane for its Settings editor: the header and one pattern per line.
     pub fn editor_body(self, patterns: &[String]) -> String {
         let mut body = self.header().to_string();
         for pattern in patterns {
@@ -123,9 +97,6 @@ impl GrantFile {
         dir.join(self.file_name())
     }
 
-    /// Whether `pattern` has a shape this lane's matcher reads. A line it does
-    /// not recognize still grants exactly what it granted in the file, which
-    /// is an exact match at most. It is shown as *legacy unmapped*.
     pub fn recognizes(self, pattern: &str) -> bool {
         match self {
             Self::AgentCommands | Self::AgentDeniedCommands => {
@@ -133,7 +104,7 @@ impl GrantFile {
                     || pattern == "Python"
                     || call_argument(pattern, "Bash")
                         .and_then(|arg| arg.strip_suffix(":*"))
-                        // This lane trusts no repo script, so a path head
+                        // INVARIANT: This lane trusts no repo script, so a path head
                         // covers nothing.
                         .is_some_and(|head| is_bare_word(head) && !head.contains('/'))
             }
@@ -153,7 +124,6 @@ impl GrantFile {
     }
 }
 
-/// The argument of `<name>(<argument>)`, when `pattern` has that shape.
 fn call_argument<'p>(pattern: &'p str, name: &str) -> Option<&'p str> {
     pattern
         .strip_prefix(name)?
@@ -161,7 +131,6 @@ fn call_argument<'p>(pattern: &'p str, name: &str) -> Option<&'p str> {
         .strip_suffix(')')
 }
 
-/// A non-empty word with no space, bracket or colon in it.
 fn is_bare_word(word: &str) -> bool {
     !word.is_empty()
         && !word
@@ -169,29 +138,19 @@ fn is_bare_word(word: &str) -> bool {
             .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ':'))
 }
 
-/// What changed a lane's standing grants. Each new row records it as its
-/// `source`, and the `PermissionGrantsChanged` audit row names it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GrantSource {
-    /// The owner's Always allow tap on a tool card.
     Card,
-    /// The owner's edit in a Settings allowlist editor. Every event written
-    /// before the source existed came from there.
     #[default]
     Settings,
-    /// The one-time import of the legacy grant file.
     LegacyImport,
-    /// Historical import review approval.
     FileReview,
-    /// Historical mirror deletion.
     FileEdit,
-    /// A revoke through `DELETE /api/v1/permissions/:permission_id`.
     Revoke,
 }
 
 impl GrantSource {
-    /// The stored spelling of the source in the permissions row.
     pub fn wire(self) -> &'static str {
         match self {
             Self::Card => "card",
@@ -204,7 +163,6 @@ impl GrantSource {
     }
 }
 
-/// Read the files made by the legacy seeding migration in its tests.
 #[cfg(test)]
 fn patterns(dir: &Path, file: GrantFile) -> Vec<String> {
     match std::fs::read_to_string(file.path_in(dir)) {
@@ -214,10 +172,6 @@ fn patterns(dir: &Path, file: GrantFile) -> Vec<String> {
     }
 }
 
-/// The granted lines of an allowlist body.
-///
-/// Public so a caller that already holds the body can name what it granted
-/// without a second read of the file it just wrote.
 pub fn parse_patterns(contents: &str) -> Vec<String> {
     contents
         .lines()
@@ -227,7 +181,6 @@ pub fn parse_patterns(contents: &str) -> Vec<String> {
         .collect()
 }
 
-/// Overwrite the file atomically, through a sibling temp file and a rename.
 pub fn write_raw(dir: &Path, file: GrantFile, contents: &str) -> Result<(), BoxError> {
     let _guard = write_guard();
     std::fs::create_dir_all(dir)?;
@@ -238,7 +191,7 @@ pub fn write_raw(dir: &Path, file: GrantFile, contents: &str) -> Result<(), BoxE
     Ok(())
 }
 
-/// The sibling file a write is staged in before its rename.
+/// INVARIANT: The sibling file a write is staged in before its rename.
 ///
 /// The name carries the pid. A second PROCESS on this workspace then cannot
 /// interleave into one shared scratch file, whose rename would publish a torn
@@ -252,7 +205,7 @@ fn scratch_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests;
 
-/// Resolving symlinks is what the sandbox needs (see `sandbox_writable_roots`),
+/// INVARIANT: Resolving symlinks is what the sandbox needs (see `sandbox_writable_roots`),
 /// but it also means a `data` symlink decides what the hole covers. Relocating
 /// the tree (`data -> /Volumes/ext/lucidos-data`) is legitimate and stays
 /// allowed. Two shapes are not, and both grant `.lucidos/` runtime state or a
@@ -275,7 +228,7 @@ pub fn grants_more_than_the_data_tree(resolved_data: &Path, workspace: &Path) ->
     let runtime_dir = crate::core::grants::grants_dir(&workspace);
     match std::fs::canonicalize(&runtime_dir) {
         Ok(resolved_runtime) => resolved_data.starts_with(&resolved_runtime),
-        // No runtime dir yet means nothing to reach into. Fall back to the
+        // INVARIANT: No runtime dir yet means nothing to reach into. Fall back to the
         // unresolved path so a probe failure still refuses the obvious shape.
         Err(_) => resolved_data.starts_with(&runtime_dir),
     }

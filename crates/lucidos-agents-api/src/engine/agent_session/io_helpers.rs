@@ -2,7 +2,7 @@
 use crate::engine::session_follow_ups::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::AgentUserInput;
 
-/// Put `input`, just received, back at the head of `msg_rx`. The caller holds
+/// INVARIANT: Put `input`, just received, back at the head of `msg_rx`. The caller holds
 /// the `agent_sessions` lock every sender takes, so nothing slips in between.
 pub(super) fn requeue_at_head(
     msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
@@ -10,7 +10,6 @@ pub(super) fn requeue_at_head(
     input: AgentUserInput,
 ) {
     let behind: Vec<_> = std::iter::from_fn(|| msg_rx.try_recv().ok()).collect();
-    // The caller holds the open receiver, so a send cannot fail.
     for input in std::iter::once(input).chain(behind) {
         let _ = msg_tx.send(input);
     }
@@ -72,8 +71,6 @@ mod tests {
         assert!(rx.try_recv().is_err(), "channel must be empty after drain");
     }
 
-    /// A discarded wake stays owed, so the next session redelivers it as a
-    /// wake rather than as a message the user never sent.
     #[test]
     fn only_a_redelivered_human_message_becomes_an_orphan() {
         use crate::engine::thread_events::ActorMode;
@@ -104,9 +101,6 @@ mod tests {
         assert_eq!(orphans[0].event_id, human_id);
     }
 
-    /// The reported incident drained the engine's own Continue and re-ran it
-    /// as something the user said. Preserve unread Continues as engine re-entry
-    /// so an answer recap or harden request cannot disappear with the run.
     #[test]
     fn a_drained_input_keeps_its_kind() {
         use crate::engine::thread_events::ActorMode;
@@ -139,8 +133,6 @@ mod tests {
         );
     }
 
-    /// Unread instructions survive a run exit and reach the coding agent in
-    /// order, without creating a user message or invoking the chat provider.
     #[test]
     fn unread_continuation_payloads_reach_the_coding_agent() {
         crate::test_support::run_on_engine_runtime(

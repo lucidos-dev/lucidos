@@ -1,14 +1,3 @@
-//! A coding agent's *background task*: work that has to outlive the turn.
-//!
-//! A coding agent cannot keep a job running past its own turn, because the
-//! engine stops every process the agent started when the turn ends
-//! (`runtime::agent_run_marker`). So the engine runs
-//! the job itself, through the registry behind the chat agent's
-//! `run_bash_background`, and arms an *event wait* on its
-//! `BackgroundBashCompleted`. The agent ends its turn, and the wait re-opens the
-//! thread when the job finishes. The agent reaches this through `lucidos
-//! background-task` over `/api/v1/threads/:thread_id/background-tasks`.
-
 use crate::engine::tools::bash::BashExt;
 use std::path::PathBuf;
 
@@ -22,24 +11,16 @@ use crate::engine::event_wait::{OwnerTurn, StoppedTask};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::LucidosEngine;
 
-/// The longest a coding agent's background task may run, in seconds: 4 h, so
-/// an unattended run such as a filmed take finishes. The chat agent's
-/// background tools keep their own `BG_MAX_TIMEOUT_SECS`.
 pub(crate) const AGENT_BG_MAX_TIMEOUT_SECS: u64 = 14_400;
 
-/// How long a background task runs when the agent names no `--timeout-secs`.
-/// A forgotten run still dies at the hour.
 pub(crate) const AGENT_BG_DEFAULT_TIMEOUT_SECS: u64 = 3_600;
 
-/// The watchdog for one task: the agent's ask, between 1 s and the ceiling.
 fn agent_task_timeout_secs(asked: Option<u64>) -> u64 {
     asked
         .unwrap_or(AGENT_BG_DEFAULT_TIMEOUT_SECS)
         .clamp(1, AGENT_BG_MAX_TIMEOUT_SECS)
 }
 
-/// Nobody can answer a card here. An unproven match points the agent at the
-/// foreground, where the owner can allow it once.
 fn background_floor_refusal(found: crate::engine::command_guard::Catastrophe) -> String {
     use crate::engine::command_guard::Catastrophe;
     match found {
@@ -51,37 +32,22 @@ fn background_floor_refusal(found: crate::engine::command_guard::Catastrophe) ->
     }
 }
 
-/// The longest one `lucidos background-task wait` blocks, in seconds. The
-/// Claude Code prompt cache lives 5 minutes or 1 hour from the last request's
-/// start, so the next request lands inside either (ADR 0470).
 pub(crate) const AGENT_WAIT_MAX_SECS: u64 = 230;
 
-/// What `lucidos background-task wait` answers.
 #[derive(Debug)]
 pub(crate) struct AgentWaitAnswer {
-    /// What `output` returns, as JSON text.
     pub output: String,
-    /// The child reports the wait took, oldest first.
     pub child_reports: Vec<ChildReport>,
 }
 
-/// What starting a background task did.
 #[derive(Debug)]
 pub(crate) enum BackgroundTaskStart {
-    /// Running, and an event wait re-opens the thread when it finishes.
     Watched { task_id: String, timeout_secs: u64 },
-    /// Running, but nothing will re-open the thread when it finishes: a
-    /// subscription cap or an error refused the wait.
     Unwatched { task_id: String, timeout_secs: u64 },
-    /// Running with no event wait, because the agent asked to poll it with
-    /// `lucidos background-task wait`.
     Polled { task_id: String, timeout_secs: u64 },
-    /// Finished before a wait was needed. `output` is the task's result, in the
-    /// same JSON shape `output` returns.
     Finished { task_id: String, output: String },
 }
 
-/// How a just-started task stands once the engine has tried to arm its wait.
 #[derive(Debug, PartialEq, Eq)]
 enum Settled {
     Watched,
@@ -99,14 +65,12 @@ fn settle_start(task_id: &str, covered: &[String], still_running: bool) -> Settl
     }
 }
 
-/// How long one `wait` blocks: the caller's ask, never past the cap.
 fn agent_wait_secs(max_secs: Option<u64>) -> u64 {
     max_secs
         .unwrap_or(AGENT_WAIT_MAX_SECS)
         .min(AGENT_WAIT_MAX_SECS)
 }
 
-/// What `lucidos background-task stop` prints, for the agent reading it.
 pub(crate) fn stopped_message(stopped: &StoppedTask) -> String {
     let mut message = format!(
         "Stopped background task {} ({}). Its completion will not re-open this thread.",
@@ -116,8 +80,6 @@ pub(crate) fn stopped_message(stopped: &StoppedTask) -> String {
     message
 }
 
-/// The note for waits a stop ended whole because they watched more than the
-/// stopped task. Empty when there were none.
 pub(crate) fn ended_waits_note(ended_with_others: &[String]) -> String {
     if ended_with_others.is_empty() {
         return String::new();
@@ -129,7 +91,6 @@ pub(crate) fn ended_waits_note(ended_with_others: &[String]) -> String {
     )
 }
 
-/// Kill a thread's running background tasks, and log how many.
 async fn kill_threads_tasks(registry: &BackgroundBashRegistry, thread_id: Uuid, why: &str) {
     let killed = registry.kill_for_thread(thread_id).await;
     if killed > 0 {
@@ -141,9 +102,6 @@ async fn kill_threads_tasks(registry: &BackgroundBashRegistry, thread_id: Uuid, 
 
 const WORK_ENDING_EVENT_TYPES: [&str; 2] = ["ThreadArchived", "ThreadDiscarded"];
 
-/// Apply one read of the bus to the running background tasks. A lag hands
-/// back the archives and discards it dropped. Returns `false` once the bus
-/// closes.
 async fn reap_ended_work(
     received: Result<EmittedEvent, RecvError>,
     replay: &mut LagReplay,
@@ -166,7 +124,6 @@ async fn reap_ended_work(
     true
 }
 
-/// The thread events that end a thread's work, and so its background tasks.
 fn ends_the_threads_work(event: &crate::engine::thread_events::ThreadEvent) -> bool {
     use crate::engine::thread_events::ThreadEvent;
     matches!(
@@ -181,15 +138,6 @@ pub fn start_background_task_reaper(engine: &std::sync::Arc<LucidosEngine>) {
 
 #[easy_ext::ext(BackgroundTaskExt)]
 pub(crate) impl LucidosEngine {
-    /// Start `command` as a background task in this thread's worktree. Under
-    /// [`CompletionDelivery::EventWait`], arm the wait that re-opens the thread
-    /// when it finishes. The wait names the task by `description`, or by its
-    /// command when there is none. Under [`CompletionDelivery::Poll`] nothing
-    /// is armed: the agent polls with `lucidos background-task wait`.
-    ///
-    /// `timeout_secs` defaults to an hour rather than to the chat tool's ten
-    /// minutes. A coding agent reaches for this exactly when the work is long,
-    /// and a watchdog firing mid-suite reads as a failure.
     async fn start_background_task_for_agent(
         &self,
         thread_id: Uuid,
@@ -258,8 +206,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// The worktree of this thread's live coding-agent session, where its
-    /// background tasks run.
     async fn agent_worktree(&self, thread_id: Uuid) -> Result<PathBuf, String> {
         let sessions = self.agent_sessions.lock().await;
         sessions
@@ -272,8 +218,6 @@ pub(crate) impl LucidosEngine {
             })
     }
 
-    /// The output of one of this thread's background tasks: what arrived since
-    /// the last read while it runs, and its final record once it has finished.
     async fn background_task_output_for_agent(
         &self,
         thread_id: Uuid,
@@ -284,14 +228,6 @@ pub(crate) impl LucidosEngine {
             .await
     }
 
-    /// Block until one of this thread's background tasks finishes, or
-    /// `max_secs` pass, then return what `output` returns: the new output, and
-    /// the final record once finished. The cap is clamped to
-    /// [`AGENT_WAIT_MAX_SECS`] whatever the caller asks. A timed-out wait
-    /// leaves the task running.
-    ///
-    /// A child report waiting unread ends the wait early, and the answer
-    /// carries it (`agent_session::child_reports`).
     async fn background_task_wait_for_agent(
         &self,
         thread_id: Uuid,
@@ -306,7 +242,6 @@ pub(crate) impl LucidosEngine {
             Some(mut waiting) => {
                 let report_arrived = async {
                     if waiting.wait_for(|n| *n > 0).await.is_err() {
-                        // The session ended: no report can arrive now.
                         std::future::pending::<()>().await;
                     }
                 };
@@ -321,7 +256,6 @@ pub(crate) impl LucidosEngine {
             }
             None => self.drain_background_output(task_id, wait, thread_id).await,
         }?;
-        // Take only when a report waits, so a plain wait never calls the run loop.
         let child_reports = match waiting {
             Some(waiting) if *waiting.borrow() > 0 => {
                 self.take_child_reports(thread_id, actor).await
@@ -334,9 +268,6 @@ pub(crate) impl LucidosEngine {
         })
     }
 
-    /// Stop one of this thread's running background tasks. Its completion is
-    /// still recorded, as killed, but it does not re-open this thread: the
-    /// stop stands the thread's own waits on it down first (ADR 0369).
     async fn stop_background_task_for_agent(
         &self,
         thread_id: Uuid,
@@ -352,23 +283,10 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Kill every running background task of a thread whose work is being
-    /// thrown away. Each killed task still records its completion, as killed.
-    ///
-    /// Called from every place a thread's work ends: `stop_agent` for a live
-    /// session, the user's change discards in `change_ops::discard`, and the bus
-    /// subscriber below for an archived or discarded thread.
     async fn abandon_background_tasks(&self, thread_id: Uuid, why: &str) {
         kill_threads_tasks(&self.bash_background, thread_id, why).await;
     }
 
-    /// Kill a thread's background tasks when the bus says the thread ended.
-    ///
-    /// On the bus rather than at each endpoint, for the reason
-    /// `cancel_waits_ended_by` gives. A thread is archived by the button, by a
-    /// parent's cascade and by an agent tool. The persisted event is the one
-    /// point they all share. An archive usually finds no live session, so
-    /// `stop_agent` never runs for it.
     fn start_background_task_reaper(self: &std::sync::Arc<Self>) {
         let (mut rx, mut replay) = LagReplay::subscribe(
             &self.event_bus,
@@ -388,7 +306,7 @@ pub(crate) impl LucidosEngine {
         });
     }
 
-    /// A task id is an address, and this thread may only use its own. A task
+    /// INVARIANT: A task id is an address, and this thread may only use its own. A task
     /// the registry no longer holds passes: the event-store fallback in
     /// `execute_bash_output_tool` is already scoped to this thread.
     async fn refuse_another_threads_task(

@@ -1,7 +1,3 @@
-//! `GET /api/v1/threads/:thread_id/switch-estimate?model=&effort=`: what
-//! switching a thread to that model and effort would cost. A missing `model`
-//! or `effort` leaves that axis unchanged.
-
 use axum::{
     extract::{Path, Query, State},
     Json,

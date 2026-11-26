@@ -1,28 +1,3 @@
-//! Generic API proxy for HTTPS-iframe apps that need to call HTTP backends.
-//!
-//! Apps mount inside an HTTPS iframe (the engine port). The browser blocks
-//! direct calls to `http://localhost:5005` from such pages (mixed content),
-//! and CORS gets in the way of cross-origin XHR. This module forwards
-//! requests through the engine to a configured backend, optionally injecting
-//! an auth header sourced from the credential store.
-//!
-//! Configured via `data/config/apis.json`. `auth` is a *pipeline* of layers
-//! (see `proxy_pipeline_config::PipelineConfig`); the legacy single-variant
-//! `{"type": "bearer", "credential": …}` shape no longer deserializes and is
-//! rewritten in place at startup by
-//! `proxy_migration::migrate_apis_json_if_needed`:
-//! ```json
-//! {
-//!   "sonos":   { "base_url": "http://localhost:5005" },
-//!   "comfort": { "base_url": "https://accsmart.panasonic.com",
-//!                "auth": { "pipeline": [
-//!                  { "type": "static_credential",
-//!                    "kind": "bearer",
-//!                    "credential": "comfort-cloud" }
-//!                ] } }
-//! }
-//! ```
-
 use super::*;
 
 use crate::api::proxy_pipeline_config::{LayerConfig, PipelineConfig};
@@ -38,20 +13,13 @@ use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Per-API config entry from `data/config/apis.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub base_url: String,
-    /// Pipeline of `AuthLayer` impls applied in order on every outbound
-    /// request. The legacy single-variant `ProxyAuth` shape is upgraded
-    /// to a pipeline at engine startup by
-    /// `proxy_migration::migrate_apis_json_if_needed`.
     #[serde(default)]
     pub auth: Option<PipelineConfig>,
     #[serde(default)]
     pub insecure_transport: bool,
-    /// How long this entry waits on one upstream request, in seconds. Wins over
-    /// the workspace's `proxy_timeout_secs`; see `api::proxy_timeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<f64>,
 }
@@ -66,23 +34,14 @@ pub enum HmacAlgorithm {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HmacSignedPayload {
-    /// Sign the request's query string (Binance shape).
     QueryString,
 }
 
 pub type ProxyConfigMap = HashMap<String, ProxyConfig>;
 
-/// Whether the upstream has to prove who it is.
-///
-/// The engine used to accept any certificate from every provider, which handed
-/// an on-path attacker the API key for an ordinary public API. Validation is
-/// now the default, and the exception is per provider and explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// Certificates are validated. Every provider, unless it opted out.
     Verified,
-    /// Certificates are accepted unchecked. Reachable only through
-    /// `insecure_transport` on an `apis.json` entry.
     Unverified,
 }
 
@@ -95,8 +54,6 @@ fn proxy_client_options() -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
 }
 
-/// The default client. Validates certificates, so a credential only ever
-/// reaches a host that proved its name.
 static VERIFIED_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     proxy_client_options()
         .build()
@@ -120,22 +77,12 @@ fn client_for(transport: Transport) -> &'static reqwest::Client {
 pub use crate::engine::provider_rejection::RejectedProvider;
 use crate::engine::provider_rejection::PROXY_CONFIG_REL_PATH;
 
-/// One entry whose transport the engine will not vouch for, and why.
-///
-/// Either it opted out of certificate validation, or it would put a credential
-/// on plain `http://` to a host that is not loopback. Both are worth saying out
-/// loud at boot, where a user can still see the whole list.
 #[derive(Debug, Clone)]
 pub struct InsecureTransport {
     pub provider: String,
     pub reason: String,
 }
 
-/// What `apis.json` yielded: the providers the engine will serve, the entries
-/// it refuses, and the ones whose transport it will not vouch for.
-///
-/// None of the three is an error. A refused entry is a configuration mistake
-/// the user can fix, reported by name, while every other entry keeps working.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyConfigLoad {
     pub providers: ProxyConfigMap,
@@ -143,10 +90,6 @@ pub struct ProxyConfigLoad {
     pub insecure: Vec<InsecureTransport>,
 }
 
-/// The only value in `values`, or `None` when there are none or more than one.
-///
-/// One entry naming a script is an answer for the seed. Two entries disagreeing
-/// is not, so those bind on first use instead of taking whichever came first.
 fn only<T>(values: impl IntoIterator<Item = T>) -> Option<T> {
     let mut it = values.into_iter();
     match (it.next(), it.next()) {
@@ -163,13 +106,6 @@ impl ProxyConfigLoad {
             .collect()
     }
 
-    /// The same scripts, each with the upstream its token may be sent to and
-    /// the secrets its entries inject.
-    ///
-    /// The startup seed writes both into the approvals record. A rewritten
-    /// `apis.json` then cannot redirect a minted token, nor swap the secret a
-    /// script receives (ADR 0144). One entry naming a script is an answer. Two
-    /// entries disagreeing is not, and those bind on first use instead.
     pub fn handshake_seed_entries(&self) -> Vec<crate::core::handshake_approvals::SeedEntry> {
         use crate::api::proxy_pipeline_config::LayerConfig;
         use crate::core::handshake_approvals::{config_path_key, injected_secrets, SeedEntry};
@@ -203,12 +139,6 @@ impl ProxyConfigLoad {
             .collect()
     }
 
-    /// Which `base_url` each named credential is used against, across every
-    /// entry that names it.
-    ///
-    /// The startup pass reads this to give a scope to a credential that has
-    /// none. One entry naming it is an answer. Two entries disagreeing is not,
-    /// which is why the values are a set rather than the first one seen.
     pub fn credential_scopes(
         &self,
     ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
@@ -249,15 +179,6 @@ impl ProxyConfigLoad {
     }
 }
 
-/// Load proxy config from `<workspace>/data/config/apis.json`.
-/// Missing file means no proxies are configured, and yields an empty load.
-///
-/// **Never fails.** One malformed entry used to fail the whole file, and
-/// `main.rs` turned that into a boot abort. So a single bad provider took a
-/// workspace offline until somebody edited JSON by hand. Every entry is now
-/// parsed on its own: the good ones load, the bad ones come back in
-/// `rejected` with a reason, and the caller decides how loudly to say so.
-/// See `docs/plans/2026-08-26-apis-json-must-not-kill-the-engine-boot.md`.
 pub fn load_proxy_config(workspace_path: &FsPath) -> ProxyConfigLoad {
     let path = workspace_path.join(PROXY_CONFIG_REL_PATH);
     if !path.exists() {
@@ -274,9 +195,6 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> ProxyConfigLoad {
         Ok(c) => c,
         Err(e) => return file_level(format!("could not be read: {e}")),
     };
-    // Deserialize the outer object only, so one unparseable entry costs
-    // nothing but itself. A root that is not an object has no entries to
-    // salvage and is reported whole.
     let raw: HashMap<String, serde_json::Value> = match serde_json::from_str(&content) {
         Ok(m) => m,
         Err(e) => return file_level(format!("is not usable: {e}")),
@@ -300,18 +218,11 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> ProxyConfigLoad {
             }),
         }
     }
-    // Stable order so a log line, an event payload and a test all read the
-    // same way regardless of the hash map's iteration order.
     load.rejected.sort_by(|a, b| a.provider.cmp(&b.provider));
     load.insecure.sort_by(|a, b| a.provider.cmp(&b.provider));
     load
 }
 
-/// Why this entry's transport is worth saying out loud at boot, if it is.
-///
-/// The refusal itself happens per request in [`ScopedPipeline::bind`], which is
-/// the only place that knows the resolved base URL and the built layers. This
-/// is the same judgment, read off the file so a user hears it once.
 fn insecure_transport_reason(cfg: &ProxyConfig) -> Option<String> {
     if cfg.insecure_transport {
         return Some(format!(
@@ -334,18 +245,11 @@ fn insecure_transport_reason(cfg: &ProxyConfig) -> Option<String> {
 
 fn plaintext_to_a_public_host(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
-        // Unparseable, so nothing here can vouch for it. The request path
-        // refuses it outright, and calling it insecure as well would be noise.
         return false;
     };
     url.scheme() == "http" && !host_is_loopback(url.host_str().unwrap_or_default())
 }
 
-/// True when `host` names this machine over the loopback interface.
-///
-/// `host_str` brackets an IPv6 literal, so those come off before parsing.
-/// `is_loopback` then covers all of `127.0.0.0/8` and `::1`, not just the two
-/// spellings people write.
 fn host_is_loopback(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if host == "localhost" {
@@ -357,12 +261,8 @@ fn host_is_loopback(host: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// One provider's entry, or the reason the engine will not serve it.
 fn parse_provider(name: &str, entry: &serde_json::Value) -> Result<ProxyConfig, String> {
     let cfg: ProxyConfig = serde_json::from_value(entry.clone()).map_err(|e| {
-        // A legacy `auth` block reaching here is one the startup migration
-        // could not rewrite. Serde's "missing field `pipeline`" says nothing
-        // a user can act on, and the translator's own words do.
         entry
             .get("auth")
             .and_then(|auth| super::proxy_migration::legacy_rejection(name, auth))
@@ -374,10 +274,6 @@ fn parse_provider(name: &str, entry: &serde_json::Value) -> Result<ProxyConfig, 
     {
         return Err(format!("provider '{name}': {reason}"));
     }
-    // Walk the pipeline and validate any ScriptHandshake layer's script
-    // path, before the engine can be tricked into running an out-of-workspace
-    // file. The rule itself lives with the spawn, in
-    // `proxy_script_runner::script_path_rejection`, so the two cannot disagree.
     for layer in cfg.auth.iter().flat_map(|p| &p.pipeline) {
         if let LayerConfig::ScriptHandshake { script, .. } = layer {
             if let Some(reason) = super::proxy_script_runner::script_path_rejection(script) {
@@ -388,9 +284,6 @@ fn parse_provider(name: &str, entry: &serde_json::Value) -> Result<ProxyConfig, 
     Ok(cfg)
 }
 
-/// Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded.
-/// Caller MUST pass an already-lowercase string. `HeaderName::as_str()` is
-/// guaranteed lowercase by the `http` crate, so callers route through that.
 fn is_hop_by_hop(name_lower: &str) -> bool {
     matches!(
         name_lower,
@@ -483,11 +376,6 @@ fn forwards_response_header(name: &str) -> bool {
 
 pub(super) const PROXIED_DOCUMENT_CSP: &str = "sandbox";
 
-/// The engine's own headers on every proxied response.
-///
-/// `nosniff` keeps a browser from reading HTML or script into a body typed as
-/// something else. A body typed as a document gets the sandbox, and so does
-/// an untyped one. Navigating to a proxy URL then never runs upstream code.
 fn confine_proxied_response(headers: &mut HeaderMap) {
     headers.insert(
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
@@ -536,7 +424,6 @@ pub(crate) async fn refuse_proxied_request(
     .into_response()
 }
 
-/// Build a copy of `headers` with stripped headers removed.
 pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
     let mut filtered = HeaderMap::new();
     for (name, value) in headers {
@@ -559,37 +446,14 @@ fn forbidden_cross_origin_proxy_response() -> Response {
         .into_response()
 }
 
-/// Reject `..` traversal segments and backslashes in the upstream REQUEST path.
-/// Without this, a caller can splice `/api/v1/proxy/x/../../admin` and most
-/// upstreams normalize the result, escaping any path prefix the operator set in
-/// `base_url` (e.g. `https://example.com/safe-prefix`).
-///
-/// A URL path, not a filesystem path, which is why it is looser than
-/// `is_path_traversal`: a leading `/` is normal here, and a segment that merely
-/// contains `..` (`foo..bar`) is a legitimate resource name. The name states
-/// its domain, so nobody reaches for it where a file path is meant. That is how
-/// the `script_handshake` guard once ended up weaker than its sibling.
-///
-/// Compares DECODED segments, not the literal `..`. Axum decodes the wildcard
-/// capture exactly once, so `%252e%252e` arrives here as `%2e%2e`, which the
-/// URL parser still normalizes into a parent segment.
-/// [`build_contained_target_url`] is the structural guard; this one turns the
-/// same input into an early, clear 400.
 pub fn request_path_has_traversal(path: &str) -> bool {
     path.split('/').any(segment_is_parent) || path.contains('\\')
 }
 
-/// True when one path segment normalizes to `..`.
-///
-/// Mirrors the WHATWG double-dot rule the `url` crate implements: either dot
-/// may be written literally or as `%2e`, in any case. A single-dot segment is
-/// deliberately not matched, because it cannot leave a prefix.
 fn segment_is_parent(segment: &str) -> bool {
     segment.to_ascii_lowercase().replace("%2e", ".") == ".."
 }
 
-/// Build the upstream URL: `<base_url>/<path>?<query>`. Handles trailing/
-/// leading slashes so a `/path` and a `base_url/` don't produce `//`.
 pub fn build_target_url(base_url: &str, path: &str, query: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
     let path_part = if path.is_empty() {
@@ -655,8 +519,6 @@ fn redirect_path_within_base(base_url: &str, target_path: &str) -> Option<String
     )
 }
 
-/// Append `key=urlencoded(value)` to a URL's query string. Preserves any
-/// existing query and chooses `?` vs `&` accordingly.
 pub(crate) fn append_query_param(url: &str, key: &str, value: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{}{}{}={}", url, separator, key, urlencoding::encode(value),)
@@ -680,7 +542,6 @@ pub(crate) fn redacted_query_log_url(url: &str, key: &str) -> String {
     append_query_param(&masked, key, REDACTED)
 }
 
-/// Compute HMAC over `data` with `secret` and return lowercase hex.
 pub(crate) fn compute_hmac_hex(algorithm: HmacAlgorithm, secret: &[u8], data: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::{Sha256, Sha512};
@@ -700,7 +561,6 @@ pub(crate) fn compute_hmac_hex(algorithm: HmacAlgorithm, secret: &[u8], data: &[
     }
 }
 
-/// Resolve config name → ProxyConfig. Returns 404 if name not configured.
 pub(crate) async fn resolve_proxy_target(
     workspace_path: &FsPath,
     name: &str,
@@ -724,16 +584,6 @@ pub(crate) async fn resolve_proxy_target(
     ))
 }
 
-/// Look up a single credential by service name, mapping missing/empty/db
-/// failures to the same `(StatusCode, String)` error shape every auth path
-/// uses. The single source of truth for "this credential must exist and be
-/// non-empty, or the proxy can't proceed".
-///
-/// Resolves an OAuth client registration too, which `CredentialStore::get` is
-/// deliberately blind to. An `apis.json` entry may name one explicitly (a
-/// `script_handshake` layer whose script does its own token exchange), and it is
-/// named rather than merely present, so the ambiguity `get`'s exclusion exists
-/// to prevent does not arise here.
 pub(crate) async fn fetch_required_credential(
     pool: &sqlx::PgPool,
     name: &str,
@@ -765,9 +615,6 @@ pub(crate) async fn fetch_required_credential(
     }
 }
 
-/// Look up a single credential's secret, with a *secret reference* resolved.
-/// Same error shapes as `fetch_required_credential`, and a reference that
-/// cannot be read is a 502 naming the credential.
 pub(crate) async fn lookup_credential_value(
     pool: &sqlx::PgPool,
     name: &str,
@@ -779,22 +626,6 @@ pub(crate) async fn lookup_credential_value(
         .map_err(|reason| (StatusCode::BAD_GATEWAY, reason))
 }
 
-/// Refuse to present `name` to a provider no member of its scope covers
-/// (ADR 0144).
-///
-/// `data/config/apis.json` is writable over the API, so `base_url` is caller
-/// data. Without this, an entry naming `github` and pointing at an attacker
-/// host makes the engine attach that credential and forward it. The rule is
-/// already applied to git: `core::git_auth` re-checks the same predicate on
-/// every credential callback, so a redirect cannot carry a secret off.
-///
-/// A credential's scope is a SET, because one key often covers several
-/// hostnames of one provider. Each member is judged exactly as a lone scope
-/// was, so declaring a second host widens the credential by that host alone.
-///
-/// A credential with no scope is refused rather than presented anywhere. The
-/// startup pass infers a scope for one that predates this rule, so what reaches
-/// here unscoped is a row nothing in `apis.json` explains.
 pub(crate) async fn check_credential_scope(
     pool: &sqlx::PgPool,
     name: &str,
@@ -827,23 +658,12 @@ pub(crate) async fn check_credential_scope(
     Ok(())
 }
 
-/// An auth pipeline that has been checked against the URL it will be sent to.
-///
-/// **This is the chokepoint.** [`dispatch_scoped`] takes one of these and
-/// nothing else, and [`ScopedPipeline::bind`] is the only way to make one. So
-/// every arm that reaches the network passed the gate, including any arm added
-/// later: the `apis.json` pipeline, the builtin model providers, and whatever
-/// comes next. Three separate per-arm checks is what let two of them drift
-/// (ADR 0144 decision 4).
 pub(crate) struct ScopedPipeline {
     base_url: String,
     layers: Vec<Arc<dyn crate::proxy_auth_layer::AuthLayer>>,
     transport: Transport,
 }
 
-/// Counts the layers rather than showing them. Every layer holds a live
-/// credential, so a derived `Debug` would print secrets into a test failure or
-/// a log line.
 impl std::fmt::Debug for ScopedPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScopedPipeline")
@@ -854,10 +674,6 @@ impl std::fmt::Debug for ScopedPipeline {
     }
 }
 
-/// What the gate needs to judge a pipeline.
-///
-/// Named separately from the engine so a test can drive the gate with a temp
-/// workspace and an offline bus. It also makes the gate state what it needs.
 pub(crate) struct ScopeContext<'a> {
     pub pool: &'a sqlx::PgPool,
     pub workspace_path: &'a FsPath,
@@ -875,8 +691,6 @@ impl<'a> ScopeContext<'a> {
 }
 
 impl ScopedPipeline {
-    /// Check every layer's bindings against `base_url`, and settle the
-    /// transport. Refuses rather than forwarding whenever either says no.
     pub(crate) async fn bind(
         ctx: &ScopeContext<'_>,
         name: &str,
@@ -884,17 +698,12 @@ impl ScopedPipeline {
         layers: Vec<Arc<dyn crate::proxy_auth_layer::AuthLayer>>,
         insecure_transport: bool,
     ) -> Result<Self, (StatusCode, String)> {
-        // Nothing downstream can judge a URL it cannot parse, and a binding
-        // that compares against one silently matches nothing. Refuse here,
-        // through the same predicate a stored scope member has to pass.
         if !crate::core::credentials::url_names_a_host(&base_url) {
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("proxy '{name}' base_url is not a URL with a host: {base_url}"),
             ));
         }
-        // Every layer here exists to attach auth, so a non-empty pipeline is
-        // exactly "this request carries a credential".
         if !layers.is_empty() && !insecure_transport && plaintext_to_a_public_host(&base_url) {
             return Err((
                 StatusCode::BAD_GATEWAY,
@@ -922,7 +731,6 @@ impl ScopedPipeline {
     }
 }
 
-/// Refuse one layer's secret unless its own scope covers `base_url`.
 async fn enforce_binding(
     ctx: &ScopeContext<'_>,
     name: &str,
@@ -957,17 +765,6 @@ async fn enforce_binding(
     }
 }
 
-/// Refuse to hand a handshake script a secret it was not approved with.
-///
-/// A `script_handshake` entry names a stored credential and a list of OAuth
-/// providers, and both land in the script's environment. Neither is sent to the
-/// entry's `base_url`, so [`check_credential_scope`] has nothing true to say
-/// here: it refuses every ordinary OAuth handshake, whose credential is scoped
-/// to the provider's token endpoint by design.
-///
-/// The real exposure is an `apis.json` rewrite naming a different secret on an
-/// already-approved script. The record answers that, on the same terms as the
-/// scope beside it (ADR 0144).
 async fn check_handshake_injects(
     ctx: &ScopeContext<'_>,
     name: &str,
@@ -976,8 +773,6 @@ async fn check_handshake_injects(
 ) -> Result<(), (StatusCode, String)> {
     use crate::core::handshake_approvals::{self, BindOutcome};
     let workspace = ctx.workspace_path;
-    // A name carrying a comma or whitespace cannot be written to the record
-    // without re-cutting the line, so it is refused before anything is written.
     if !handshake_approvals::injects_are_recordable(injects) {
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -1009,7 +804,7 @@ async fn check_handshake_injects(
             false => Err(refuse(&recorded)),
         };
     }
-    // Trust on first sight, as the scope does. Two concurrent first requests
+    // INVARIANT: Trust on first sight, as the scope does. Two concurrent first requests
     // race here, so the outcome carries whichever set won and this one is
     // checked against it.
     match handshake_approvals::bind_injects_if_absent(workspace, script, injects) {
@@ -1037,8 +832,6 @@ async fn check_handshake_injects(
             true => Ok(()),
             false => Err(refuse(&recorded)),
         },
-        // Nothing to bind: unrecorded, or its bytes are not the approved ones.
-        // The runner refuses it by hash, and that message is the useful one.
         Ok(BindOutcome::NotBindable) => Ok(()),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1047,12 +840,6 @@ async fn check_handshake_injects(
     }
 }
 
-/// Refuse a minted handshake token for a host the script is not bound to.
-///
-/// A script mints its own token, so no stored credential speaks for it. Its
-/// scope lives beside its hash in `.lucidos/approved-handshake-scripts`, which
-/// no API caller can write. An unbound script binds here, once, and is checked
-/// from then on (ADR 0144).
 async fn check_handshake_scope(
     ctx: &ScopeContext<'_>,
     name: &str,
@@ -1087,7 +874,7 @@ async fn check_handshake_scope(
             ),
         ));
     }
-    // Trust on first sight. Two concurrent first requests race here, so the
+    // INVARIANT: Trust on first sight. Two concurrent first requests race here, so the
     // outcome carries whichever scope won and this one is checked against it.
     match handshake_approvals::bind_scope_if_absent(workspace, script, base_url) {
         Ok(BindOutcome::Bound) => {
@@ -1116,8 +903,6 @@ async fn check_handshake_scope(
                 false => Err(refuse(&scope)),
             }
         }
-        // Nothing to scope: unrecorded, or its bytes are not the approved ones.
-        // The runner refuses it by hash, and that message is the useful one.
         Ok(BindOutcome::NotBindable) => Ok(()),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1126,7 +911,7 @@ async fn check_handshake_scope(
     }
 }
 
-/// Forward a request to the configured upstream and return the upstream
+/// INVARIANT: Forward a request to the configured upstream and return the upstream
 /// response (headers + body + status). Pure with respect to AppState: takes
 /// only the data it needs, so the integration tests can spin up a tiny axum
 /// server and exercise this directly.
@@ -1165,7 +950,6 @@ pub async fn forward_request(
         filtered.remove(name);
     }
     for (name, value) in &filtered {
-        // Pass raw bytes so non-ASCII header values (rare but valid) survive.
         builder = builder.header(name.as_str(), value.as_bytes());
     }
     for (name, value) in &auth_headers {
@@ -1184,8 +968,6 @@ pub async fn forward_request(
             let resp_body = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
-                    // A streamed reply that outlasts the wait lands here, not
-                    // in the send arm, and it is the same timeout: a 504.
                     let is_timeout = e.is_timeout();
                     let safe_e = e.without_url();
                     log_legacy!(
@@ -1211,9 +993,6 @@ pub async fn forward_request(
             super::internal_faults::external(response)
         }
         Err(e) => {
-            // `reqwest::Error`'s Display and Debug impls embed the request URL,
-            // which for `query_param` auth contains the credential. Strip it
-            // before logging or surfacing the error to the caller.
             let is_timeout = e.is_timeout();
             let safe_e = e.without_url();
             log_legacy!("[Proxy] forward to {} failed: {}", log_url, safe_e);
@@ -1234,7 +1013,6 @@ pub async fn forward_request(
     }
 }
 
-/// Axum handler: `/api/v1/proxy/:name/*path`.
 pub(super) async fn proxy_handler(
     State(state): State<AppState>,
     Path((name, path)): Path<(String, String)>,
@@ -1243,7 +1021,6 @@ pub(super) async fn proxy_handler(
     proxy_handle_inner(state, name, path, req).await
 }
 
-/// Axum handler: `/api/v1/proxy/:name` (no path component).
 pub(super) async fn proxy_handler_root(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1252,16 +1029,6 @@ pub(super) async fn proxy_handler_root(
     proxy_handle_inner(state, name, String::new(), req).await
 }
 
-/// Re-scan `<workspace>/data/auth-modules/` and atomically swap the
-/// engine's compiled-module map. Returns the sorted list of module names
-/// now loaded. Shared by:
-///  - the HTTP `POST /api/v1/proxy-modules/reload` endpoint,
-///  - the `reload_proxy_modules` LLM tool,
-///  - the post-install reload triggered when `install_plugin` writes any
-///    `auth-modules/` content.
-///
-/// In-flight pipeline runs holding an `Arc<CompiledModule>` finish on the
-/// old module; new runs see the new map.
 pub(crate) async fn reload_proxy_modules_into(
     engine: &crate::engine::LucidosEngine,
     workspace_path: &FsPath,
@@ -1280,10 +1047,6 @@ pub(crate) async fn reload_proxy_modules_into(
     Ok(names)
 }
 
-/// Axum handler: `POST /api/v1/proxy-modules/reload` — re-scan the WASM
-/// auth modules directory and swap the engine's compiled-module map
-/// atomically. Returns the names now available so the caller (HTTP or
-/// LLM tool) can confirm what's loaded.
 pub(super) async fn proxy_modules_reload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1291,7 +1054,6 @@ pub(super) async fn proxy_modules_reload(
     if !browser_proxy_request_allowed(&headers) {
         return forbidden_cross_origin_proxy_response();
     }
-    // Before the swap: a reload replaces every compiled signer module.
     let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -1328,7 +1090,6 @@ pub(super) async fn proxy_modules_reload(
 
 const MAX_REDIRECT_HOPS: usize = 5;
 
-/// True for the 30x statuses we follow.
 fn is_redirect_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -1348,14 +1109,6 @@ fn redirect_downgrades_to_get(status: StatusCode, method: &Method) -> bool {
     }
 }
 
-/// The full origin a signed request is bound to: `(scheme, host, port)`.
-/// Used to refuse re-signing after a redirect that crosses the origin —
-/// host-only matching would re-send the credential after a `https → http`
-/// scheme downgrade (credential over plaintext) or a hop to a *different
-/// port* on the same host (e.g. an internal admin service). `None` when
-/// the URL doesn't parse or has no host. Scheme and host are lowercased;
-/// port falls back to the scheme's default so `https://h` and
-/// `https://h:443` compare equal.
 fn origin_of(url: &str) -> Option<(String, String, Option<u16>)> {
     let u = reqwest::Url::parse(url).ok()?;
     let host = u.host_str()?.to_ascii_lowercase();
@@ -1366,17 +1119,11 @@ fn origin_of(url: &str) -> Option<(String, String, Option<u16>)> {
     ))
 }
 
-/// Resolve a `Location` header value (relative or absolute) against the
-/// URL we just hit, returning the absolute target URL.
 fn resolve_redirect_location(current_url: &str, location: &str) -> Option<reqwest::Url> {
     let base = reqwest::Url::parse(current_url).ok()?;
     base.join(location).ok()
 }
 
-/// A resolved proxy target. `apis.json` entries build their auth layers per
-/// request from `config.auth`; a builtin model-provider target carries its
-/// base URL + pre-built auth layers (sourced from the engine's own provider
-/// credentials — see [`crate::api::proxy_builtin`]).
 pub(crate) enum ResolvedProxy {
     Config(ProxyConfig),
     Builtin {
@@ -1402,12 +1149,6 @@ pub(crate) async fn resolve_named_proxy(
     }
 }
 
-/// Dispatch a [`ResolvedProxy`]. Both arms bind a [`ScopedPipeline`] before
-/// anything reaches the network.
-///
-/// A model provider's reply records what the call cost, for `owner`
-/// (`api::proxy_cost`). A speech call is rewritten, recorded
-/// or refused so its cost is never lost (`api::proxy_speech`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_resolved(
     engine: &Arc<crate::engine::LucidosEngine>,
@@ -1446,12 +1187,9 @@ pub(crate) async fn dispatch_resolved(
             .await?;
             record_model_call(engine, owner.clone(), upstream, &path, &body, response).await
         }
-        // The builtin arm builds its own layers, so it binds its own pipeline.
-        // Same gate, same type, no second way to reach the network.
         ResolvedProxy::Builtin { base_url, layers } => {
             let ctx = ScopeContext::from_engine(engine);
             let scoped = ScopedPipeline::bind(&ctx, name, base_url, layers, false).await?;
-            // A builtin has no entry, so only the workspace value applies.
             let timeout = crate::api::proxy_timeout::resolve(ctx.pool, None).await?;
             prepare_request(&Upstream::Builtin { name }, &mut headers);
             let response = dispatch_scoped(
@@ -1529,11 +1267,6 @@ async fn proxy_handle_inner(
     }
 }
 
-/// Top-level proxy dispatch — exposed so the `proxy_request` LLM tool can
-/// share the same code path as the HTTP handler. Builds the per-request
-/// pipeline, forwards (with same-host redirect re-signing), and on 401
-/// from upstream invalidates opted-in caches and re-runs the SAME layers
-/// (the cache invalidation is what changes between attempts).
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_proxy_request(
     engine: &Arc<crate::engine::LucidosEngine>,
@@ -1545,10 +1278,6 @@ pub async fn dispatch_proxy_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
-    // Build layers once. The 401-retry path reuses the same layers and
-    // just calls invalidate_cache on the opted-in ones — re-fetching
-    // every credential and re-instantiating WASM signers would be wasted
-    // work.
     let layers = build_pipeline_layers(engine, name, config).await?;
     let scoped = ScopedPipeline::bind(
         &ScopeContext::from_engine(engine),
@@ -1562,18 +1291,6 @@ pub async fn dispatch_proxy_request(
     dispatch_scoped(name, &scoped, timeout, method, path, query, headers, body).await
 }
 
-/// Forward through a scoped pipeline (with same-host redirect re-signing) and
-/// drive the one-shot 401 invalidate-and-retry.
-///
-/// Shared by two callers, so their forward, redirect and retry semantics stay
-/// identical. [`dispatch_proxy_request`] builds layers from a `ProxyConfig`,
-/// and [`crate::api::proxy_builtin::resolve_builtin_provider`] builds them from
-/// the engine's own model-provider credentials.
-///
-/// Takes a [`ScopedPipeline`] rather than loose layers, which is what makes the
-/// scope gate impossible to skip. `timeout` is required for the same reason:
-/// every arm resolves one through `api::proxy_timeout::resolve`. It bounds
-/// each upstream request, and the call as a whole gets a [`CallBudget`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_scoped(
     name: &str,
@@ -1620,8 +1337,6 @@ pub(crate) async fn dispatch_scoped(
     Ok(response)
 }
 
-/// Build the per-request layer pipeline from a `ProxyConfig`. No-op when
-/// `config.auth` is `None` (returns an empty `Vec`).
 async fn build_pipeline_layers(
     engine: &Arc<crate::engine::LucidosEngine>,
     name: &str,
@@ -1630,7 +1345,7 @@ async fn build_pipeline_layers(
     let Some(pipeline_cfg) = config.auth.as_ref() else {
         return Ok(Vec::new());
     };
-    // Snapshot the module map and drop the read guard before the (async)
+    // INVARIANT: Snapshot the module map and drop the read guard before the (async)
     // credential lookups inside `build_pipeline`. Holding the guard
     // across DB IO would let a slow lookup block the
     // `proxy_modules_reload` writer (tokio's RwLock is write-preferring,
@@ -1703,8 +1418,6 @@ async fn follow_redirects(
 
     let mut current_path = initial_path.to_string();
     let mut current_query: Option<String> = initial_query.map(|s| s.to_string());
-    // Per hop, because a 303 turns the next one into a bodyless GET. The
-    // pipeline signs over both, so the downgrade has to reach it too.
     let mut current_method = method.clone();
     let mut current_body = body.clone();
     let mut first_outcome: Option<crate::api::proxy_pipeline::PipelineOutcome> = None;
@@ -1723,8 +1436,6 @@ async fn follow_redirects(
             build_contained_target_url(base_url, &current_path, current_query.as_deref()).map_err(
                 |reason| {
                     log_legacy!("[Proxy] {} refused an upstream URL: {}", name, reason);
-                    // Hop 0 is the caller's own path, so that is a 400. A later
-                    // hop is the upstream misdirecting us, which is a 502.
                     let status = if hops == 0 {
                         StatusCode::BAD_REQUEST
                     } else {
@@ -1773,8 +1484,6 @@ async fn follow_redirects(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Final URL for this hop = target + pipeline-added query params,
-        // URL-encoded. Layers return raw values; engine handles encoding.
         let final_url = merge_query_params(&target_url, &outcome.query);
         let request_timeout = budget.next_request().ok_or_else(out_of_time)?;
 
@@ -1831,7 +1540,7 @@ async fn follow_redirects(
             )
         })?;
         if target_origin != initial_origin {
-            // Names only — no full URLs in the log (a Location can carry a
+            // INVARIANT: Names only — no full URLs in the log (a Location can carry a
             // credential in its query string).
             log_legacy!(
                 "[Proxy] {} returned redirect to origin {}://{}:{:?} but auth was bound to {}://{}:{:?} — refused",
@@ -1851,8 +1560,6 @@ async fn follow_redirects(
                 ),
             ));
         }
-        // The `Location` is absolute on the origin and the next hop re-anchors
-        // on the base, so what carries forward is the part below the prefix.
         current_path = redirect_path_within_base(base_url, target.path()).ok_or_else(|| {
             log_legacy!(
                 "[Proxy] {} refused a redirect to '{}', outside its base path",
@@ -1884,9 +1591,6 @@ fn merge_query_params(url: &str, pairs: &[(String, String)]) -> String {
     out
 }
 
-/// Routes for the generic API proxy — forwards to a backend configured in
-/// `data/config/apis.json`. Two root routes so callers can hit
-/// `/proxy/sonos` (no trailing path) as well as `/proxy/sonos/play/2`.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/proxy/:name", any(proxy_handler_root))

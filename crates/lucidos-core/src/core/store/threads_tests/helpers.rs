@@ -2,10 +2,6 @@ pub(super) use crate::test_support::{setup_test_db, teardown_test_db};
 pub(super) use sqlx::PgPool;
 pub(super) use uuid::Uuid;
 
-/// Insert a parent thread and a child thread referencing it. Returns
-/// `(parent_id, child_id)`. `child_saved` controls whether the child
-/// is_saved (the parent is never saved). Both have has_response=TRUE
-/// so they show up in get_recent_threads / get_older_threads.
 pub(super) async fn insert_parent_child(pool: &PgPool, child_saved: bool) -> (Uuid, Uuid) {
     let parent = Uuid::new_v4();
     let child = Uuid::new_v4();
@@ -23,9 +19,6 @@ pub(super) async fn insert_parent_child(pool: &PgPool, child_saved: bool) -> (Uu
     (parent, child)
 }
 
-/// Insert a trigger-source thread with the given trigger_id/trigger_name and
-/// last_activity offset. Returns the new thread id. has_response=TRUE so the
-/// thread surfaces in `get_older_threads`.
 pub(super) async fn insert_trigger_thread(
     pool: &PgPool,
     trigger_id: &str,
@@ -33,8 +26,6 @@ pub(super) async fn insert_trigger_thread(
     minutes_ago: i64,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    // The drawer sorts by last_user_action, so stagger it (not just
-    // last_activity) to control the order these helpers' callers assert on.
     sqlx::query(
             "INSERT INTO thread_summaries \
              (thread_id, title, source, message_count, last_activity, last_user_action, last_agent_action, has_response, is_saved, trigger_id, trigger_name) \
@@ -50,8 +41,6 @@ pub(super) async fn insert_trigger_thread(
     id
 }
 
-/// Insert a CC-source thread bound to the given repo UUID with the given
-/// last_activity offset. Returns the new thread id.
 pub(super) async fn insert_cc_repo_thread(pool: &PgPool, repo_id: &str, minutes_ago: i64) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -68,7 +57,6 @@ pub(super) async fn insert_cc_repo_thread(pool: &PgPool, repo_id: &str, minutes_
     id
 }
 
-/// Register a repo in the `repositories` table so `cc_repo_name` resolves.
 pub(super) async fn insert_repository(pool: &PgPool, repo_id: Uuid, name: &str, path: &str) {
     sqlx::query("INSERT INTO repositories (id, name, path) VALUES ($1, $2, $3)")
         .bind(repo_id)
@@ -79,9 +67,6 @@ pub(super) async fn insert_repository(pool: &PgPool, repo_id: Uuid, name: &str, 
         .expect("insert repository");
 }
 
-/// Seed the durable `repo_names` projection (what the EventBus
-/// `RepositoryAdded` arm writes). Lets a test simulate "this repo's name was
-/// recorded, then the repo was removed from the live registry".
 pub(super) async fn insert_repo_name(pool: &PgPool, repo_id: Uuid, name: &str) {
     sqlx::query("INSERT INTO repo_names (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name")
         .bind(repo_id)
@@ -91,8 +76,6 @@ pub(super) async fn insert_repo_name(pool: &PgPool, repo_id: Uuid, name: &str) {
         .expect("insert repo_name");
 }
 
-/// Remove a repo from the live `repositories` registry — mirrors
-/// `RepositoryStore::remove`. The `repo_names` projection is left untouched.
 pub(super) async fn delete_repository(pool: &PgPool, repo_id: Uuid) {
     sqlx::query("DELETE FROM repositories WHERE id = $1")
         .bind(repo_id)
@@ -101,12 +84,7 @@ pub(super) async fn delete_repository(pool: &PgPool, repo_id: Uuid) {
         .expect("delete repository");
 }
 
-/// Insert a `changes` row binding a thread to a `repo_root` path. Powers the
-/// repo-name scavenge backfill: a pre-`RepositoryAdded` repo's name is
-/// recoverable from this path's basename even when no event recorded it.
 pub(super) async fn insert_change(pool: &PgPool, thread_id: Uuid, repo_root: &str) {
-    // `branch_name` is unique per open change (`idx_changes_unique_open_branch`),
-    // so derive a fresh one per row.
     let request_id = Uuid::new_v4();
     sqlx::query("INSERT INTO changes (request_id, branch_name, repo_root, thread_id) VALUES ($1, $2, $3, $4)")
         .bind(request_id)
@@ -118,8 +96,6 @@ pub(super) async fn insert_change(pool: &PgPool, thread_id: Uuid, repo_root: &st
         .expect("insert change");
 }
 
-/// Insert an app coding-agent thread operating on `data/apps/<app_id>` with the
-/// given last_activity offset and archive state. Returns the new thread id.
 pub(super) async fn insert_app_thread(
     pool: &PgPool,
     app_id: &str,
@@ -146,11 +122,6 @@ pub(super) async fn insert_app_thread(
     id
 }
 
-/// Insert a trigger-source thread row with NULL trigger_id/trigger_name —
-/// the state every legacy thread is in after the broken
-/// `20260429214800_addtriggeridtothreadsummaries.sql` backfill, which only
-/// reads `payload->>'trigger_id'` and skips the legacy `task_id`/`task_name`
-/// pair. Returns the new thread id.
 pub(super) async fn insert_null_trigger_thread(pool: &PgPool, minutes_ago: i64) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -166,8 +137,6 @@ pub(super) async fn insert_null_trigger_thread(pool: &PgPool, minutes_ago: i64) 
     id
 }
 
-/// Insert a `TriggerStarted` event for the given thread with a raw payload.
-/// Lets the test mimic legacy (`task_id`) vs modern (`trigger_id`) shapes.
 pub(super) async fn insert_trigger_started_event(
     pool: &PgPool,
     thread_id: Uuid,
@@ -225,8 +194,6 @@ pub(super) async fn insert_message(pool: &PgPool, thread_id: Uuid, event_type: &
     .expect("insert event");
 }
 
-/// `memory_entries` is created by `PgVectorIndex::new` rather than a migration,
-/// so any test that joins it must initialize the index first.
 pub(super) async fn initialize_memory_entries(pool: &PgPool) {
     crate::core::store::ensure_memory_entries_table(pool)
         .await

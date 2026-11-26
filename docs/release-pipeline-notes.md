@@ -127,24 +127,45 @@ The orderings stay deliberately different. `register_service` writes after its u
 
 ## Release blockers
 
-`release-blockers.tsv` is private release metadata, stripped from the public tree.
-Its tab-separated header is `id state ref work_item title reason`.
-Use tabs between fields, end every row with a newline, and retain rows after they close.
+The blocker ledger lives in the workspace event store. The Software Factory app
+writes it, and `scripts/lib/release_blockers_ledger.py` reads it through
+`lucidos events count` and `lucidos events query`. A ledger is keyed by the
+repository's root commit. Recording a blocker needs no repository commit.
 
-- `open`: `ref` and `reason` are `-`; refuses every cut.
+The reader projects the records into one row per blocker, under the header
+`id state ref work_item title reason`:
+
+- `open` refuses every cut.
 - `fixed`: `ref` is the fixing commit; passes only when that commit is in the cut.
-- `withdrawn`: `ref` is `-`; a reason records why this was never a blocker.
-- `waived`: `ref` is one `N.N.N` version; the owner must authorize the reason.
+- `withdrawn` passes. Only a paired device may withdraw.
+- `waived`: `ref` is one `N.N.N` version. Only a paired device may waive.
 
-`work_item` is a tracker id or `-`. Neither the tracker nor event availability
-decides the verdict. Commit ledger updates to main through the usual review.
+A ledger counts only once a paired device opens it. A void, also device only,
+removes a rejected record. An agent's device-only record is listed as
+unconfirmed and changes nothing. Any doubt refuses with exit 1:
+
+- no CLI, a CLI failure, or unreadable output;
+- a count that moved during the read, twice;
+- no device ledger, or two;
+- an unvoided rejected record, an unknown `v`, or an `invalid` blocker.
+
 An unattended release never writes a waiver. There is no waiver flag.
 
+The digest is the 12-hex prefix of `git hash-object` over the snapshot. The
+report names the ledger, its sequence and the digest. The local tag message adds
+the whole snapshot, which is the record of what the gate judged.
+`release_blockers_ledger.py --until-sequence` replays the snapshot at that
+sequence as a cross-check. The sequence is the highest one the read saw, and
+Postgres allots sequences before commit. So an emit in flight during the read
+can land below it, and the replay then differs.
+
+The record format and the app's script: the app's `knowhow/release-blockers.md`.
+
 Phase A records its gate trailer in verify-build state for deterministic retries.
-Phase B checks current main knowledge again without rebuilding the candidate.
+Phase B reads the ledger from the workspace event store again without rebuilding the candidate.
 Waivers appear in the gate report, STILL OWED and the local annotated tag.
 
-`ReleaseGateChecked` emission is best effort; the ledger commit is the audit authority.
+`ReleaseGateChecked` emission is best effort. It carries `ledger`, `ledger_sequence` and `ledger_digest`.
 Nightly preflight returns SKIP on refusal, with a `release_blockers` JSON field.
 For `auto`, a version-specific waiver refuses until the version is selected.
 The mirror workflow checks the public trailer before either tarball push arm runs.

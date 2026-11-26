@@ -2452,7 +2452,7 @@ describe('a reading position that names a step row', () => {
   });
 });
 
-describe('a restored reading position holds while the transcript settles', () => {
+describe('a restored reading position holds through content growth', () => {
   const IDS = ['t0', 't1', 't2', 't3', 't4', 't5'];
   const opts = { live: () => ({}), resetOnEmpty: true, anchorsToContent: true };
   let origRO: unknown;
@@ -2530,7 +2530,7 @@ describe('a restored reading position holds while the transcript settles', () =>
     detach();
   });
 
-  it('lets go once the reader scrolls', () => {
+  it('holds the new line once the reader scrolls away from the restored line', () => {
     localStorage.setItem('k', 'anchor:-150:t2');
     const el = mockTranscript({ ids: IDS, turnHeight: 400, scrollTop: 0 });
     const { onScroll, onResize } = makeScrollObservers(el);
@@ -2542,7 +2542,11 @@ describe('a restored reading position holds while the transcript settles', () =>
     el.setTurnHeightOf('t0', 900);
     onResize();
 
-    expect(el.scrollTop).toBe(700);
+    expect(el.scrollTop).toBe(1200);
+
+    el.setTurnHeightOf('t1', 900);
+    onResize();
+    expect(el.scrollTop).toBe(1200);
     detach();
   });
 });

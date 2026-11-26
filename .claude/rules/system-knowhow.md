@@ -106,7 +106,7 @@ When a change narrows what a caller may do, **grep the corpus for the thing you 
 A new surface here cannot land without a matching `system-knowhow/*.md`, either a new file or a section appended to one:
 
 - **`ThreadEvent` variant:** a row in `thread-events.md`, plus a deep-dive section if the payload is non-trivial.
-- **`SystemEvent` variant:** a doc comment on the variant (`docs/system-events.md` for more). If user-meaningful, also in `thread-events.md` or `workspace-learning.md`.
+- **`SystemEvent` variant:** record its behavior in `docs/system-events.md`. Use an `INVARIANT:` comment at a call site for any local invariant a type or test does not enforce. If user-meaningful, also in `thread-events.md` or `workspace-learning.md`.
 - **`lucidos.*` SDK method or namespace:** a `## lucidos.<namespace>` section in `js-sdk.md` (signature, example, when-to-use).
 - **`lucidos` CLI subcommand or flag:** a section in `lucidos-cli.md`.
 - **Auth-pipeline shape in `apis.json`** (signer kind, layer, header or body mode): a worked example in `building-an-auth-handshake.md`.

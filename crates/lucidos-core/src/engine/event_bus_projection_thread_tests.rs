@@ -1,10 +1,3 @@
-//! The `thread_summaries` projection: naming a thread, and what a proposal
-//! may name.
-//!
-//! The naming contract is an ordering one: a title event updates a row and
-//! never creates it, so it has to follow the thread's first `MessageReceived`.
-//! ADR 0240 holds the reasoning and the rejected upsert.
-
 use super::write_thread_title;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
@@ -36,9 +29,6 @@ async fn plan_only_code_refusal_persists_through_the_event_projection() {
     teardown_test_db(&db).await;
 }
 
-/// A lane batch's integration branch is never a change, whoever proposes it
-/// (ADR 0463). The projection is the one place every `ChangeProposed` passes,
-/// so it refuses the event and the emit writes nothing.
 #[tokio::test]
 async fn a_proposal_naming_a_lane_branch_is_refused_and_writes_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -95,7 +85,6 @@ async fn a_proposal_naming_a_lane_branch_is_refused_and_writes_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// Emit a thread's first message, which is what creates its projection row.
 async fn first_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>) {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -129,10 +118,6 @@ async fn stored_title(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
         .flatten()
 }
 
-/// A name with no row to land in is reported, not swallowed.
-///
-/// The `false` is the whole point. Its caller turns it into a log line naming
-/// the thread, so a mis-ordered emit site is found on its first spawn.
 #[tokio::test]
 async fn a_name_arriving_before_the_thread_row_reports_that_it_was_dropped() {
     let (pool, db_name) = setup_test_db().await;
@@ -152,7 +137,6 @@ async fn a_name_arriving_before_the_thread_row_reports_that_it_was_dropped() {
     teardown_test_db(&db_name).await;
 }
 
-/// The ordinary case: the row is there, and it takes the name.
 #[tokio::test]
 async fn a_name_arriving_after_the_first_message_is_written() {
     let (pool, db_name) = setup_test_db().await;
@@ -176,12 +160,6 @@ async fn a_name_arriving_after_the_first_message_is_written() {
     teardown_test_db(&db_name).await;
 }
 
-/// Why the title arm must never become an upsert.
-///
-/// `MessageReceived` writes `parent_thread_id`, `depth` and `initiator` on its
-/// INSERT path only. A row conjured by an earlier title event would send the
-/// real message down the conflict arm instead. The sub-thread would lose its
-/// parent while the parent's child count still went up.
 #[tokio::test]
 async fn an_early_title_does_not_cost_a_sub_thread_its_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -190,8 +168,6 @@ async fn an_early_title_does_not_cost_a_sub_thread_its_parent() {
     let child_id = Uuid::new_v4();
     first_message(&bus, parent_id, None).await;
 
-    // The mis-ordered emit this whole change exists to prevent, replayed
-    // deliberately: a title for a thread that does not exist yet.
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ThreadTitleGenerated {
@@ -268,8 +244,6 @@ async fn backends_of(pool: &sqlx::PgPool, thread_id: Uuid) -> (Option<String>, V
         .unwrap()
 }
 
-/// `coding_agents` lists each backend a thread's sessions started on once, in
-/// first-use order. `coding_agent` stays the newest session's backend.
 #[tokio::test]
 async fn the_backends_a_thread_used_are_listed_once_in_first_use_order() {
     use crate::engine::thread_events::CodingAgent::{ClaudeCode, Codex};
@@ -332,9 +306,6 @@ async fn the_backends_a_thread_used_are_listed_once_in_first_use_order() {
 const ADD_CODING_AGENTS: &str =
     include_str!("../../migrations/20261024054546_add_coding_agents_to_thread_summaries.sql");
 
-/// The backfill lists every backend from a thread's SessionStarted events.
-/// A legacy session, whose payload names no backend, counts as Claude Code,
-/// so a later handoff appends to `{claude-code}` rather than to `{}`.
 #[tokio::test]
 async fn the_backfill_lists_legacy_sessions_as_claude_code() {
     use crate::engine::thread_events::CodingAgent::{ClaudeCode, Codex};
@@ -347,8 +318,6 @@ async fn the_backfill_lists_legacy_sessions_as_claude_code() {
     start_session_on(&bus, handed_off, Codex).await;
     first_message(&bus, fresh, None).await;
 
-    // The state before this migration: a legacy session's payload and row name
-    // no backend, and the column does not exist yet.
     sqlx::raw_sql(&format!(
         "UPDATE events SET payload = payload - 'coding_agent' \
            WHERE event_type = 'SessionStarted' AND aggregate_id = '{legacy}'; \

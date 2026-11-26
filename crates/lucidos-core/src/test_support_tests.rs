@@ -31,7 +31,6 @@ async fn drop_template(template: &str) {
         .expect("drop template");
 }
 
-/// A template no other test or worktree shares, so its build is this test's.
 fn private_template() -> String {
     format!("lucidos_template_t{}", Uuid::new_v4().simple())
 }
@@ -105,8 +104,6 @@ async fn a_half_built_template_is_rebuilt_rather_than_cloned() {
     drop_template(&template).await;
 }
 
-/// A sweep listed a half-built template as stale, and another run rebuilt it
-/// before the sweep took its lock. The fresh template must survive.
 #[tokio::test]
 async fn a_sweep_spares_a_template_rebuilt_since_it_listed_it() {
     let template = private_template();

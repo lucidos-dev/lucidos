@@ -29,9 +29,6 @@ async fn archive_state(pool: &PgPool, thread_id: Uuid) -> String {
         .unwrap()
 }
 
-/// S1 and S4: a set-aside change leaves every pending read and takes the
-/// thread off `proposed`, which Review, attention and the archive gate read.
-/// Bringing it back restores both.
 #[tokio::test]
 async fn set_aside_leaves_pending_and_bring_back_returns_it() {
     let (pool, db) = setup_test_db().await;
@@ -83,8 +80,6 @@ async fn set_aside_leaves_pending_and_bring_back_returns_it() {
     teardown_test_db(&db).await;
 }
 
-/// S3: the database refuses a second open row on one branch, whatever mix of
-/// pending and set aside the two would be.
 #[tokio::test]
 async fn a_branch_holds_one_open_change() {
     let (pool, db) = setup_test_db().await;
@@ -115,8 +110,6 @@ async fn a_branch_holds_one_open_change() {
     teardown_test_db(&db).await;
 }
 
-/// O2 at the projection: work proposed straight into set-aside on an archived
-/// thread stays out of the way. The thread stays archived and asks nothing.
 #[tokio::test]
 async fn a_proposal_made_set_aside_leaves_an_archived_thread_archived() {
     let (pool, db) = setup_test_db().await;
@@ -152,8 +145,6 @@ async fn a_proposal_made_set_aside_leaves_an_archived_thread_archived() {
     teardown_test_db(&db).await;
 }
 
-/// S4: the rebuild replays both status events, and a proposal made straight
-/// into set-aside, to the status the live projection wrote.
 #[tokio::test]
 async fn rebuild_restores_each_set_aside_shape() {
     let (pool, db) = setup_test_db().await;
@@ -196,8 +187,6 @@ async fn rebuild_restores_each_set_aside_shape() {
     teardown_test_db(&db).await;
 }
 
-/// Bringing a change back on an archived thread surfaces the thread, as a
-/// proposal does, so an archived thread never holds a pending change.
 #[tokio::test]
 async fn bringing_a_change_back_surfaces_an_archived_thread() {
     let (pool, db) = setup_test_db().await;

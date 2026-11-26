@@ -1,36 +1,19 @@
-//! The migration marker: `<workspace>/.lucidos/database-migrated`, naming the
-//! database this workspace's engine last migrated (ADR 0481).
-//!
-//! A wiped schema otherwise looks exactly like a new database. Migrations would
-//! rebuild it blank, and the workspace would open empty without a word. With
-//! the marker, the engine refuses instead and tells the user how to recover.
-//!
-//! A missing marker never blocks: a new workspace, a restored one and every
-//! test harness start without one. Neither does one naming another cluster or
-//! database. A flow that recreates a workspace's database under a surviving
-//! `.lucidos/` calls [`forget`].
-
 use std::path::{Path, PathBuf};
 
 use sqlx::PgPool;
 
-/// The marker's file name inside `<workspace>/.lucidos/`.
 pub const FILE_NAME: &str = "database-migrated";
 
-/// Where the marker for `workspace` lives.
 pub fn path(workspace: &Path) -> PathBuf {
     workspace.join(".lucidos").join(FILE_NAME)
 }
 
-/// The identity the marker holds. `None` when there is no marker, or it cannot
-/// be read: an unknown marker must never block.
 pub fn read(workspace: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path(workspace)).ok()?;
     let identity = text.trim();
     (!identity.is_empty()).then(|| identity.to_string())
 }
 
-/// Record a database identity, for the next boot to check against.
 pub fn write(workspace: &Path, identity: &str) -> std::io::Result<()> {
     let marker = path(workspace);
     if let Some(dir) = marker.parent() {
@@ -39,7 +22,6 @@ pub fn write(workspace: &Path, identity: &str) -> std::io::Result<()> {
     std::fs::write(marker, format!("{identity}\n"))
 }
 
-/// Remove the marker, for a flow that recreates the database on purpose.
 pub fn forget(workspace: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path(workspace)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -47,16 +29,13 @@ pub fn forget(workspace: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Whether the database holds sqlx's migration table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationTable {
     Present,
     Missing,
-    /// The query did not answer. Never evidence of a wipe.
     Unknown,
 }
 
-/// Look up `_sqlx_migrations` the way sqlx created it, through `search_path`.
 pub async fn migration_table(pool: &PgPool) -> MigrationTable {
     match sqlx::query_scalar::<_, bool>("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
         .fetch_one(pool)
@@ -68,9 +47,6 @@ pub async fn migration_table(pool: &PgPool) -> MigrationTable {
     }
 }
 
-/// `<cluster>/<database>`, or the database alone when the cluster's
-/// `system_identifier` is unknown. A same-named database in another cluster
-/// then never matches.
 fn identity_of(cluster: Option<&str>, database: &str) -> String {
     match cluster {
         Some(cluster) => format!("{cluster}/{database}"),
@@ -78,8 +54,6 @@ fn identity_of(cluster: Option<&str>, database: &str) -> String {
     }
 }
 
-/// The identity of the database behind `database_url`, or `None` when the URL
-/// does not parse.
 async fn database_identity(database_url: &str, pool: &PgPool) -> Option<String> {
     let database = lucidos_pg_url::PgUrl::parse(database_url).ok()?.database;
     let cluster =
@@ -90,8 +64,6 @@ async fn database_identity(database_url: &str, pool: &PgPool) -> Option<String> 
     Some(identity_of(cluster.as_deref(), &database))
 }
 
-/// Whether the marker names the database behind `database_url`: this
-/// database, in this cluster, was migrated before.
 pub async fn marker_names(workspace: &Path, database_url: &str, pool: &PgPool) -> bool {
     let Some(marker) = read(workspace) else {
         return false;
@@ -99,7 +71,7 @@ pub async fn marker_names(workspace: &Path, database_url: &str, pool: &PgPool) -
     database_identity(database_url, pool).await.as_deref() == Some(marker.as_str())
 }
 
-/// The terminal boot-failure message when the database behind `database_url`
+/// INVARIANT: The terminal boot-failure message when the database behind `database_url`
 /// was wiped, else `None`. Runs before migrating. A wipe needs both facts:
 /// the marker names this database, and its migration table is confirmed gone.
 pub async fn refuse_wiped_database(
@@ -112,8 +84,6 @@ pub async fn refuse_wiped_database(
     wiped.then(|| crate::boot_failure::wiped_database_message(workspace))
 }
 
-/// Write the marker after a successful migration. A failure is logged: it only
-/// costs the next boot its check.
 pub async fn record_migrated(workspace: &Path, database_url: &str, pool: &PgPool) {
     let Some(identity) = database_identity(database_url, pool).await else {
         return;
@@ -155,8 +125,6 @@ mod tests {
         assert_eq!(read(workspace.path()), None);
     }
 
-    /// The incident: a script's `DROP SCHEMA public CASCADE` reached the live
-    /// database, and the next boot migrated it blank.
     #[tokio::test]
     async fn a_dropped_schema_is_refused_only_once_the_marker_names_it() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -220,9 +188,6 @@ mod tests {
     mod guard_tests {
         use super::*;
 
-        /// The e2e reset recreates its database under a `.lucidos/` it keeps, so it
-        /// must delete the marker by name. Shell cannot import the constant, so
-        /// this pins the copy.
         #[test]
         fn the_e2e_database_reset_forgets_the_marker() {
             let script =

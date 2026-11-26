@@ -1,17 +1,3 @@
-//! What a model call through the credentialed proxy cost.
-//!
-//! The proxy forwards an app's or a script's bytes to an upstream it never
-//! parses. A model provider upstream still spends the user's money, so the
-//! call records a `ContextCaptured` like every engine call (ADR 0242). It
-//! records only what the provider reported: a reply with no usage block, such
-//! as a quota read, records nothing.
-//!
-//! OpenAI speech reports usage only on a stream, or not at all for `tts-1`.
-//! `api::proxy_speech` rewrites, records or refuses those requests.
-//!
-//! The record runs on its own task. The caller gets its response unchanged and
-//! no later than the proxy would have returned it.
-
 use axum::body::{Body, Bytes};
 use axum::http::header::{ACCEPT_ENCODING, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
@@ -25,14 +11,10 @@ use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
 use crate::llm::served_model::served_model_of;
 use crate::llm::usage_wire;
 
-/// The Gemini API's host. Vertex hosts are recognised by `llm::vertex`.
 const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
 
-/// Where a proxied request went.
 pub(crate) enum Upstream<'a> {
-    /// A builtin provider proxy. Every one is a model provider.
     Builtin { name: &'a str },
-    /// An `apis.json` entry, known only by its base URL.
     Configured { base_url: &'a str },
 }
 
@@ -64,7 +46,6 @@ pub(crate) fn prepare_request(upstream: &Upstream<'_>, headers: &mut HeaderMap) 
     }
 }
 
-/// Whether `base_url` points at a model provider's API.
 fn is_model_host(base_url: &str) -> bool {
     use crate::engine::tools::credentials::host_of;
     let Some(host) = host_of(base_url) else {
@@ -85,14 +66,9 @@ fn is_model_host(base_url: &str) -> bool {
         || crate::llm::vertex::is_vertex_host(&host)
 }
 
-/// Who a proxied call's cost belongs to, as the origin token proves it.
-/// Both are `None` for a caller with no verified token.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct CostOwner {
-    /// The thread the row records on. `None` records on the home thread.
     pub(crate) thread: Option<Uuid>,
-    /// The trigger whose fire made the call. A script fire has no thread,
-    /// so this is all that names it.
     pub(crate) trigger: Option<String>,
 }
 
@@ -110,7 +86,6 @@ pub(crate) fn cost_owner(headers: &HeaderMap) -> CostOwner {
     }
 }
 
-/// Record what a proxied model call cost, and hand back its response.
 pub(crate) async fn record_model_call(
     engine: &Arc<LucidosEngine>,
     owner: CostOwner,
@@ -146,7 +121,6 @@ pub(crate) async fn record_model_call(
     Response::from_parts(parts, Body::from(bytes))
 }
 
-/// Record one proxied call's cost, on a task of its own.
 pub(crate) fn record(
     engine: &Arc<LucidosEngine>,
     owner: CostOwner,
@@ -174,7 +148,6 @@ pub(crate) fn record(
     });
 }
 
-/// Whether a reply is a server-sent event stream.
 pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
@@ -182,16 +155,12 @@ pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.starts_with("text/event-stream"))
 }
 
-/// What one forwarded call reported.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReportedCall {
     pub(crate) provider: Option<String>,
     pub(crate) usage: ApiUsage,
-    /// The model the request asked for, else the one the reply named.
     pub(crate) model: String,
-    /// The model the reply named.
     pub(crate) served_model: Option<String>,
-    /// The upstream's id for the reply, from its headers.
     pub(crate) request_id: Option<String>,
 }
 
@@ -202,7 +171,6 @@ impl ReportedCall {
         }
         self
     }
-    /// This call, with the request id the upstream's reply headers carry.
     pub(crate) fn answered_by(self, headers: &HeaderMap) -> Self {
         Self {
             request_id: crate::llm::call_trace::request_id_of(headers),
@@ -211,7 +179,6 @@ impl ReportedCall {
     }
 }
 
-/// What a reply reported, or `None` when it names no prompt tokens.
 fn reported(reply: &[u8], streamed: bool, request_body: &[u8], path: &str) -> Option<ReportedCall> {
     let reply_json = (!streamed)
         .then(|| serde_json::from_slice::<serde_json::Value>(reply).ok())
@@ -239,8 +206,6 @@ fn reported(reply: &[u8], streamed: bool, request_body: &[u8], path: &str) -> Op
     })
 }
 
-/// The model a streamed reply names: in an OpenAI frame, or in an Anthropic
-/// `message_start`.
 fn streamed_model_of(stream: &str) -> Option<String> {
     stream
         .lines()
@@ -251,8 +216,6 @@ fn streamed_model_of(stream: &str) -> Option<String> {
         })
 }
 
-/// The model the request asked for: the body's, else the one a Gemini path
-/// carries (`models/<model>:<method>`).
 fn requested_model_of(request_body: &[u8], path: &str) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(request_body)
         .ok()

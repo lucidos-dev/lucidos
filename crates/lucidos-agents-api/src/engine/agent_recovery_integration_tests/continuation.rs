@@ -6,10 +6,6 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// The continue endpoint's contract: a `ContinuationRequested` on the CC
-/// channel persists with the user's reason, and the spawn dispatcher forwards
-/// it as a `SpawnRequest::Continue`. Exercises "endpoint emits, bus sends,
-/// dispatcher forwards" without the Axum router, which needs a whole engine.
 #[tokio::test]
 async fn continuation_requested_emission_produces_a_spawn_request() {
     use crate::engine::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
@@ -20,14 +16,12 @@ async fn continuation_requested_emission_produces_a_spawn_request() {
     let (handle, mut spawn_rx) = SpawnDispatcher::spawn(pool.clone(), bus.clone());
 
     let thread_id = Uuid::new_v4();
-    // Seed SessionStarted so the lifecycle contract accepts CC events.
     let cc_meta = EventMeta {
         channel: Some(EventChannel::ClaudeCode),
         ..EventMeta::NONE
     };
     crate::test_support::start_cc_session(&bus, thread_id, "claude-code/cont", None).await;
 
-    // What the continue endpoint does:
     let res = bus
         .emit(BusEvent::Thread {
             thread_id,
@@ -58,9 +52,6 @@ async fn continuation_requested_emission_produces_a_spawn_request() {
     teardown_test_db(&db_name).await;
 }
 
-/// Recovery's synthetic `CodingAgentIdled { engine_restart_interrupt }` must
-/// never become a spawn request. Otherwise the event that surfaces the
-/// Continue affordance would loop back into auto-spawning the agent.
 #[tokio::test]
 async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
     let (pool, db_name) = setup_test_db().await;
@@ -74,7 +65,6 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
     };
     crate::test_support::start_cc_session(&bus, thread_id, "claude-code/int", None).await;
 
-    // Simulate recovery surfacing the interrupt:
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::CodingAgentIdled {
@@ -95,8 +85,6 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
     .expect("emit succeeds")
     .expect("persisted");
 
-    // The bus sends in PostCommit, before `emit` returns, so an empty channel
-    // here is final.
     assert!(
         requests.try_recv().is_err(),
         "synthetic CodingAgentIdled must not produce a spawn request"
@@ -106,12 +94,6 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
     teardown_test_db(&db_name).await;
 }
 
-/// The stale-resume retry of a continuation runs with NO resume sid — the one
-/// we had is dead — so the fresh subprocess starts with zero context. Its input
-/// must therefore carry the reconstructed conversation ahead of
-/// `CONTINUE_RESUME_USER_MESSAGE`, or the agent is told to "continue from where
-/// you left off" with no idea where that was. Same contract the chat path's
-/// retry has always had (`chat::process_cc`).
 #[tokio::test]
 async fn continuation_retry_input_recaps_the_thread_before_the_continue_message() {
     use crate::engine::agent_recovery::{continue_retry_input, CONTINUE_RESUME_USER_MESSAGE};
@@ -184,10 +166,6 @@ async fn continuation_retry_input_recaps_the_thread_before_the_continue_message(
     teardown_test_db(&db_name).await;
 }
 
-/// A thread with no reconstructable history still yields a usable retry input:
-/// the brief and the continue message, never an empty string. An empty stdin
-/// parks `claude --print --resume` forever waiting for input, the exact hang
-/// `CONTINUE_RESUME_USER_MESSAGE` exists to prevent.
 #[tokio::test]
 async fn continuation_retry_input_is_never_empty() {
     use crate::engine::agent_recovery::{continue_retry_input, CONTINUE_RESUME_USER_MESSAGE};
@@ -222,19 +200,6 @@ async fn continuation_retry_input_is_never_empty() {
     teardown_test_db(&db_name).await;
 }
 
-// ---------------------------------------------------------------------------
-// continue_input_for_reason: what the resumed agent is actually told.
-//
-// Regression suite for 2026-08-10 (thread 728de3cc). A question answered after
-// the subprocess was torn down used to resume with nothing but "Continue from
-// where you left off." The answer reached the model nowhere, and Claude Code's
-// own transcript had already closed the tool call as "the user doesn't want to
-// proceed", so the model announced "you declined the card and said continue,
-// so I am treating that as approval" and started implementing.
-// ---------------------------------------------------------------------------
-
-/// Seed a coding-agent thread parked on a question the user answered by typing,
-/// the exact shape of the reproduction.
 async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, typed: &str) {
     use crate::engine::thread_events::{AnswerKind, QuestionOption};
 
@@ -345,7 +310,6 @@ async fn answered_after_idle_resume_carries_the_answer_and_denies_the_rejection(
     )
     .await;
 
-    // 1. The answer reaches the model at all. This is the whole bug.
     assert!(
         input.contains(typed),
         "the resume must carry the user's answer verbatim: {input}"
@@ -355,14 +319,11 @@ async fn answered_after_idle_resume_carries_the_answer_and_denies_the_rejection(
         "the resume must say which question it answers: {input}"
     );
 
-    // 2. A typed reply is not a selection, so it cannot be read as "Approve".
     assert!(
         input.contains("picks none of them"),
         "a typed reply must be marked as selecting no option: {input}"
     );
 
-    // 3. The teardown stamp is disarmed in both directions: the user declined
-    //    nothing, and equally approved nothing.
     assert!(
         input.contains("the user declined nothing"),
         "the resume must contradict the transcript's rejection stamp: {input}"
@@ -372,9 +333,6 @@ async fn answered_after_idle_resume_carries_the_answer_and_denies_the_rejection(
         "the resume must also refuse the opposite reading: {input}"
     );
 
-    // 4. And it must not read as licence to carry on with the pre-question plan.
-    //    Yet a typed reply often asks something else, and leaves the question
-    //    open for a re-ask.
     assert!(
         input.contains("Do not re-ask the same question unless the answer left it open"),
         "the resume must block a re-ask of an answered question only: {input}"
@@ -384,10 +342,6 @@ async fn answered_after_idle_resume_carries_the_answer_and_denies_the_rejection(
     teardown_test_db(&db_name).await;
 }
 
-/// Only `answered_after_idle` changes. A user-clicked Continue, the hang
-/// watchdog, the api-error auto-resume and the switch auto-resume all keep
-/// sending exactly today's message, even on a thread that happens to carry an
-/// answered question from an earlier turn.
 #[tokio::test]
 async fn other_continuation_reasons_still_send_the_bare_continue_message() {
     use crate::engine::agent_recovery::{
@@ -426,9 +380,6 @@ async fn other_continuation_reasons_still_send_the_bare_continue_message() {
     teardown_test_db(&db_name).await;
 }
 
-/// The empty-stdin floor. With no answer to recap the input falls back to the
-/// exact constant, never to an empty string: an empty stdin parks
-/// `claude --print --resume` forever and zombies the thread.
 #[tokio::test]
 async fn answered_after_idle_falls_back_to_the_bare_message_with_nothing_to_recap() {
     use crate::engine::agent_recovery::{
@@ -453,14 +404,6 @@ async fn answered_after_idle_falls_back_to_the_bare_message_with_nothing_to_reca
     teardown_test_db(&db_name).await;
 }
 
-/// The sibling path. When `--resume` finds a dead session id the continuation
-/// retries with NO resume sid, so the fresh subprocess's entire context is the
-/// reconstruction plus this tail. `reconstruct_summary` does not project
-/// `UserQuestionAsked` / `UserQuestionAnswered` (see `fetch_relevant_events`),
-/// so if the tail were the bare continue message the answer would be lost all
-/// over again, on the path likeliest to hit it: a thread parked long enough to
-/// be answered after teardown is also a thread parked long enough for its
-/// transcript to age out.
 #[tokio::test]
 async fn the_stale_resume_retry_also_carries_the_answer() {
     use crate::engine::agent_recovery::{continue_retry_input, ANSWERED_AFTER_IDLE_REASON};
@@ -493,8 +436,6 @@ async fn the_stale_resume_retry_also_carries_the_answer() {
     teardown_test_db(&db_name).await;
 }
 
-/// Harden resumes the held thread to run `/harden`, never with the bare
-/// continue message. Its turn end then proposes through the normal floor.
 #[tokio::test]
 async fn a_harden_request_resumes_with_the_harden_message() {
     use crate::engine::agent_recovery::{continue_input_for_reason, HARDEN_REQUESTED_REASON};
@@ -515,9 +456,6 @@ async fn a_harden_request_resumes_with_the_harden_message() {
     teardown_test_db(&db_name).await;
 }
 
-/// Try again after a start failure must hand the agent the message it never
-/// read, with the same words the user typed (the I7 contract). The events are
-/// the ones a real start failure leaves.
 #[tokio::test]
 async fn a_start_failure_leaves_its_message_owed_to_the_next_continue() {
     use crate::engine::thread_events::{CodingAgentExit, CodingAgentExitStage};
@@ -588,9 +526,6 @@ fn aborted(cause: crate::engine::thread_events::AbortCause) -> ThreadEvent {
     }
 }
 
-/// The events a switch leaves on a thread whose prompt the engine wrote and
-/// whose agent read nothing: the engine prompt, the switch teardown abort,
-/// and the boot floor's withdrawal. Returns the prompt's event id.
 async fn seed_unread_engine_prompt_after_switch(
     bus: &EventBus,
     thread_id: Uuid,
@@ -620,9 +555,6 @@ async fn seed_unread_engine_prompt_after_switch(
     prompt_id
 }
 
-/// A switch that lands before the agent spawned leaves its engine prompt
-/// unread, behind two aborts. A resume of any reason must hand it over: a bare
-/// "continue" asks an agent with no context to resume work it was never told.
 #[tokio::test]
 async fn a_thread_whose_agent_read_nothing_gets_its_engine_prompt_on_every_resume() {
     use crate::engine::agent_recovery::{
@@ -651,9 +583,6 @@ async fn a_thread_whose_agent_read_nothing_gets_its_engine_prompt_on_every_resum
     teardown_test_db(&db_name).await;
 }
 
-/// The spawn writes `SessionStarted` before the agent reads its first prompt,
-/// so a switch can land between the two. The agent read nothing: it still owes
-/// the prompt, and a resume must hand it over.
 #[tokio::test]
 async fn a_thread_that_started_but_read_nothing_gets_its_prompt_on_every_resume() {
     use crate::engine::agent_recovery::{
@@ -682,8 +611,6 @@ async fn a_thread_that_started_but_read_nothing_gets_its_prompt_on_every_resume(
     teardown_test_db(&db_name).await;
 }
 
-/// The same events once the agent read its prompt: it resumes its own session,
-/// so only Continue's existing start-failure rule applies, and it finds nothing.
 #[tokio::test]
 async fn a_thread_whose_agent_read_its_prompt_keeps_the_bare_continue() {
     use crate::engine::agent_recovery::{
@@ -722,8 +649,6 @@ async fn a_thread_whose_agent_read_its_prompt_keeps_the_bare_continue() {
     teardown_test_db(&db_name).await;
 }
 
-/// An agent that answered has the conversation, even where no read was
-/// recorded (a thread from before the input ledger). Each output kind counts.
 #[tokio::test]
 async fn a_thread_whose_agent_produced_output_keeps_the_bare_continue() {
     use crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON;
@@ -760,7 +685,6 @@ async fn a_thread_whose_agent_produced_output_keeps_the_bare_continue() {
     }
 }
 
-/// A message the user took back is not owed to the agent.
 #[tokio::test]
 async fn a_message_the_user_took_back_is_not_replayed() {
     use crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON;
@@ -801,7 +725,6 @@ async fn a_message_the_user_took_back_is_not_replayed() {
     teardown_test_db(&db_name).await;
 }
 
-/// Emit `event` on `thread_id`'s Claude Code channel and return its id.
 async fn emit_cc(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -817,9 +740,6 @@ async fn emit_cc(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
     .event_id
 }
 
-/// What an effort pick before the agent's first read leaves: the prompt
-/// "Hey", a follow-up forwarded behind it, the cancel, and the discard.
-/// Returns the prompt's and the follow-up's `MessageReceived` ids.
 async fn effort_pick_discards_the_first_prompt(bus: &EventBus, thread_id: Uuid) -> (Uuid, Uuid) {
     use crate::engine::thread_events::{emit_response_canceled, CancelCause};
 
@@ -869,7 +789,6 @@ async fn effort_pick_discards_the_first_prompt(bus: &EventBus, thread_id: Uuid) 
     (prompt, follow_up)
 }
 
-/// The ids of the follow-ups a session starting with `first_prompt` redelivers.
 async fn stranded_ids(pool: &sqlx::PgPool, thread_id: Uuid, first_prompt: &[Uuid]) -> Vec<Uuid> {
     crate::engine::agent_session::stranded_follow_ups::stranded_follow_ups(
         pool,
@@ -884,8 +803,6 @@ async fn stranded_ids(pool: &sqlx::PgPool, thread_id: Uuid, first_prompt: &[Uuid
     .collect()
 }
 
-/// An older thread an effort restart left with a discarded prompt: the next
-/// session delivers it, ahead of the follow-up queued behind it.
 #[tokio::test]
 async fn the_next_session_delivers_an_older_discarded_prompt() {
     let (pool, db_name) = setup_test_db().await;
@@ -909,8 +826,6 @@ async fn the_next_session_delivers_an_older_discarded_prompt() {
     teardown_test_db(&db_name).await;
 }
 
-/// A child wake an effort pick discarded, ahead of a turn that ended on its own.
-/// Returns the wake's `ChildThreadCompleted` id.
 async fn effort_pick_discards_a_child_wake(bus: &EventBus, thread_id: Uuid) -> Uuid {
     use crate::engine::thread_events::ChildCompletionStatus;
 
@@ -951,8 +866,6 @@ async fn effort_pick_discards_a_child_wake(bus: &EventBus, thread_id: Uuid) -> U
     wake
 }
 
-/// An older discarded child wake stays owed to the next session until its
-/// agent reads it.
 #[tokio::test]
 async fn an_older_discarded_child_wake_stays_owed_until_read() {
     let (pool, db_name) = setup_test_db().await;
@@ -982,8 +895,6 @@ async fn an_older_discarded_child_wake_stays_owed_until_read() {
     teardown_test_db(&db_name).await;
 }
 
-/// A discarded continuation sent its own nudge, and a keep-alive only warms
-/// the cache: neither is owed.
 #[tokio::test]
 async fn a_discarded_continuation_or_keep_alive_leaves_nothing_owed() {
     use crate::engine::thread_events::{ActorMode, EngineReason, MessageOrigin};

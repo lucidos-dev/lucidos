@@ -1,14 +1,3 @@
-//! End-to-end API tests for widgets (ADRs 0402, 0415, 0466).
-//!
-//! Three plan invariants an external client is placed to prove over real HTTP:
-//!
-//! - Sizing a widget's cards writes one thread event, and no file or commit.
-//! - Delete (a thread) removes exactly that thread's own widgets (6).
-//! - Archive removes no widget (7).
-//!
-//! Threads are seeded directly, as `delete_thread_test.rs` does. Widget
-//! folders are committed fixtures written through the data API.
-
 use crate::delete_thread_test::{cleanup, seed_thread};
 use crate::support::{
     base_url, db_url, git, remove_data_fixtures, user_client, workspace_path, workspace_tree_lock,
@@ -17,12 +6,10 @@ use crate::support::{
 use serde_json::json;
 use uuid::Uuid;
 
-/// A unique folder id, so parallel runs never share one.
 fn folder(stem: &str) -> String {
     format!("{stem}-{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
-/// Commit a widget (or, with `kind: "app"`, an app) under `data/apps/<id>/`.
 async fn write_app_folder(client: &reqwest::Client, id: &str, manifest: serde_json::Value) {
     let _tree = workspace_tree_lock().read().await;
     write_data_fixture(
@@ -51,7 +38,6 @@ fn app_dir(id: &str) -> std::path::PathBuf {
     workspace_path().join("data/apps").join(id)
 }
 
-/// The subjects of every commit that touched an app folder, newest first.
 fn folder_history(id: &str) -> String {
     let out = git(&["log", "--format=%s", "--", &format!("data/apps/{id}")]);
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -93,7 +79,6 @@ async fn a_widget_card_size_writes_one_event_without_touching_disk() {
     let id = folder("fare-grid");
     write_app_folder(&client, &id, widget_manifest(thread, false)).await;
 
-    // A widget is never an app in the list, but answers by id.
     let apps: Vec<serde_json::Value> = client
         .get(format!("{}/api/v1/apps", base_url()))
         .send()
@@ -116,7 +101,6 @@ async fn a_widget_card_size_writes_one_event_without_touching_disk() {
         .expect("app JSON");
     assert_eq!(app["kind"], "widget");
 
-    // A reply embeds a widget now, so nothing shows one (ADR 0466).
     let (status, _) = post(
         &client,
         "/widgets/show",
@@ -131,7 +115,6 @@ async fn a_widget_card_size_writes_one_event_without_touching_disk() {
     let history_before = folder_history(&id);
     let manifest_before = std::fs::read_to_string(app_dir(&id).join("manifest.json")).unwrap();
 
-    // The retired pin routes and their thread listing are gone.
     for route in ["/widgets/pin", "/widgets/unpin"] {
         let (status, _) = post(&client, route, json!({ "app_id": id, "thread_id": thread })).await;
         assert!([404, 405].contains(&status), "{route} is gone: {status}");
@@ -168,7 +151,6 @@ async fn a_widget_card_size_writes_one_event_without_touching_disk() {
         "a card size must change no file"
     );
 
-    // One event, carrying the app id and the size and nothing else.
     let payloads: Vec<(String, serde_json::Value)> = sqlx::query_as(
         "SELECT event_type, payload FROM events WHERE thread_id = $1 \
          AND (event_type LIKE 'Widget%' OR event_type = 'InlineWidgetSized') ORDER BY sequence",
@@ -188,7 +170,6 @@ async fn a_widget_card_size_writes_one_event_without_touching_disk() {
         );
     }
 
-    // A second thread may not hold a widget that is not reusable.
     let other = Uuid::new_v4();
     seed_thread(&pool, other, None, "idle").await;
     let (status, _) = post(
@@ -247,7 +228,6 @@ async fn delete_removes_exactly_the_threads_own_widgets() {
     );
     assert!(app_dir(&siblings).exists(), "another thread's widget stays");
 
-    // One commit removed the owned widget and touched nothing else.
     let subject = folder_history(&owned)
         .lines()
         .next()
@@ -306,9 +286,6 @@ async fn archive_keeps_a_threads_widget() {
     pool.close().await;
 }
 
-/// ADR 0415 over real HTTP. The built-in sound player resolves, and two param
-/// sets are two instances with their own card sizes. Bad params and an
-/// undeclared size are refused, and no route may change the built-in.
 #[tokio::test]
 async fn built_in_instances_size_apart_and_the_built_in_stays_read_only() {
     let client = user_client().await;
@@ -407,8 +384,6 @@ async fn dashboard(client: &reqwest::Client, which: &str) -> serde_json::Value {
         .expect("the dashboard is JSON")
 }
 
-/// (app id, size) per tile, keeping only this test's widgets: other tests may
-/// add to the same dashboards.
 fn tile_sizes(board: &serde_json::Value, ours: &[&str]) -> Vec<(String, String)> {
     board["tiles"]
         .as_array()
@@ -424,11 +399,6 @@ fn tile_sizes(board: &serde_json::Value, ours: &[&str]) -> Vec<(String, String)>
         .collect()
 }
 
-/// Prompt parity for the dashboards (ADRs 0432, 0496). Each dashboard holds
-/// its own tiles, and an arrangement over HTTP reads back the same. A new tile
-/// lands at its first declared size, and an undeclared size is refused.
-/// Adding a thread's own widget makes it reusable in the same action. An add
-/// may name a declared size.
 #[tokio::test]
 async fn the_dashboards_hold_their_own_tiles_over_http() {
     let client = user_client().await;
@@ -517,7 +487,6 @@ async fn the_dashboards_hold_their_own_tiles_over_http() {
         [(owned.clone(), "medium".into())]
     );
 
-    // An add at a size lands at it, and an undeclared one is refused (I7).
     let (status, body) = post(
         &client,
         "/widgets/dashboard-add",
@@ -562,9 +531,6 @@ async fn the_dashboards_hold_their_own_tiles_over_http() {
     pool.close().await;
 }
 
-/// ADR 0532 over real HTTP. An app that is not a widget joins a dashboard as a
-/// quarter-size shortcut through the one checked add. The tile reads back as
-/// `kind: "app"`, takes only `quarter`, and refuses params and unknown ids.
 #[tokio::test]
 async fn an_app_joins_a_dashboard_as_a_quarter_shortcut_over_http() {
     let client = user_client().await;

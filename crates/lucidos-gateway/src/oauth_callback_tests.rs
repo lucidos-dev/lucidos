@@ -23,10 +23,8 @@ fn callback_request(uri: &str, from: Option<Peer>) -> Request<Body> {
     req
 }
 
-/// What a stand-in engine saw of each request: its query and headers.
 type Seen = Arc<Mutex<Vec<(String, HeaderMap)>>>;
 
-/// A stand-in engine answering the delivery route with `status` and `page`.
 fn engine(status: StatusCode, page: &'static str) -> (tempfile::TempDir, EngineSeen) {
     let dir = test_engine::scratch();
     let seen: Seen = Arc::default();
@@ -50,14 +48,10 @@ struct EngineSeen {
     seen: Seen,
 }
 
-/// A stand-in peer gateway on a loopback port: the health probe, and the
-/// hand-off route answering `status` with `page`.
 async fn peer_gateway(status: StatusCode, page: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
     fake_peer(status, page, &[(HANDOFF_ANSWERED_HEADER, "1")]).await
 }
 
-/// A peer gateway from before the hand-off route: its picker shell answers
-/// the path with a 200.
 async fn old_peer_gateway() -> (u16, Arc<Mutex<Vec<String>>>) {
     fake_peer(StatusCode::OK, "<!-- picker shell -->", &[]).await
 }
@@ -123,7 +117,6 @@ fn a_forwarded_code_crosses_byte_for_byte() {
             format!("code={code}&state=%2Fdev%2F~n")
         );
     }
-    // A key that only starts with a field's name is not that field.
     assert_eq!(forwarded_query("codex=leak&code=c"), "code=c");
 }
 
@@ -163,7 +156,6 @@ fn only_a_direct_caller_on_this_machine_is_from_this_machine() {
     assert!(!from_this_machine(Some(&peer(LAN_PEER)), &empty));
     assert!(!from_this_machine(None, &empty));
 
-    // A browser here that opened this machine's own tailnet or LAN address.
     let tailnet: SocketAddr = "100.64.0.5:8443".parse().unwrap();
     let own_address = Peer {
         remote: "100.64.0.5:50000".parse().unwrap(),
@@ -181,7 +173,6 @@ fn only_a_direct_caller_on_this_machine_is_from_this_machine() {
     public.public_listener = true;
     assert!(!from_this_machine(Some(&public), &empty));
 
-    // A tunnel on this machine connects over loopback too.
     let mut tunnelled = HeaderMap::new();
     tunnelled.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
     assert!(!from_this_machine(Some(&peer(LOOPBACK_PEER)), &tunnelled));
@@ -205,7 +196,6 @@ async fn a_callback_from_off_this_machine_reaches_no_engine() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
     drop(state);
-    // Nothing connected, so the recorder still waits. Nothing was sent.
     assert!(!recorded.is_finished());
     recorded.abort();
 }
@@ -332,7 +322,6 @@ async fn a_claiming_engine_ends_the_route_before_any_peer() {
     assert_eq!(page, "engine: provider error");
 }
 
-/// The hand-off route on the main listener: loopback only, own engines only.
 #[tokio::test]
 async fn a_handoff_is_loopback_only_and_never_handed_on() {
     let state = GatewayState::for_tests();
@@ -367,8 +356,6 @@ async fn a_handoff_is_loopback_only_and_never_handed_on() {
     assert_eq!(unclaimed.status(), StatusCode::NOT_FOUND);
 }
 
-// ── A remote workspace: the callback crosses the relay ─────────────────────
-
 #[tokio::test]
 async fn a_remote_callback_crosses_the_relay_device_less_with_the_callback_fields_only() {
     let p = crate::relay::tests::paired().await;
@@ -381,7 +368,6 @@ async fn a_remote_callback_crosses_the_relay_device_less_with_the_callback_field
     let response = router(p.a.clone()).oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // B's stand-in engine lowercases what it saw.
     let seen = p.seen.lock().unwrap().last().cloned().unwrap();
     let (target, headers) = seen.split_once('\n').unwrap();
     assert_eq!(
@@ -415,10 +401,6 @@ fn the_callback_port_binds_both_loopback_families() {
     assert_eq!(v6.to_string(), "[::1]:14981");
 }
 
-// ── Locality and the web redirect route ────────────────────────────────────
-
-/// A gateway with one paired device and a stand-in `dev` engine that records
-/// every request's headers.
 fn workspace_gateway() -> (GatewayState, tempfile::TempDir, Seen) {
     let state = GatewayState::for_tests();
     state
@@ -476,7 +458,6 @@ async fn only_a_browser_on_this_machine_is_stamped_local() {
     device_request(&state, Some(peer(LAN_PEER)), &[]).await;
     assert_eq!(last_stamp(&seen), None);
 
-    // A tunnel on this machine connects over loopback, and says so.
     device_request(
         &state,
         Some(peer(LOOPBACK_PEER)),

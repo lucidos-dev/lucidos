@@ -1,23 +1,3 @@
-//! PreToolUse hook for Claude Code's `Edit` and `Write` tools — the early
-//! enforcement of the `implementation-plan` skill. If the branch has no
-//! Planned marker yet, a source edit is denied with a reason telling the model
-//! to either run the `implementation-plan` skill (complex work) or acknowledge
-//! a local fix via `lucidos planned mark --simple "<reason>"`. Once a marker
-//! exists (either kind), every edit passes.
-//!
-//! Two deliberate exemptions keep the gate from deadlocking or misfiring:
-//!   * **`docs/plans/` writes are allowed.** Writing the plan file is itself
-//!     part of planning and happens BEFORE the marker is recorded — gating it
-//!     would make the skill impossible to run.
-//!   * **No skill, no gate.** External repos (and app worktrees) don't ship
-//!     `.claude/skills/implementation-plan/SKILL.md`; there the hook is a
-//!     silent no-op.
-//!
-//! Wired into `<workspace>/.lucidos/cc-settings.json` via `cc_settings.rs`,
-//! on the Edit/Write matchers. Fails OPEN on parse / I/O / engine-unreachable
-//! errors so a hook bug can't brick every Edit/Write call. Claude-Code only —
-//! Codex has no PreToolUse hook and is covered by the prompt rule + Apply floor.
-
 use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
@@ -38,32 +18,19 @@ struct ToolInput {
     file_path: String,
 }
 
-/// Tools we gate. Both need a Planned marker before they touch source.
 pub(crate) fn is_gated_tool(name: &str) -> bool {
     matches!(name, "Edit" | "Write")
 }
 
-/// The skill ships at this path in Lucidos-source worktrees; absent in external
-/// repos and app worktrees, where the gate must be a silent no-op.
 fn plan_skill_available(cwd: &Path) -> bool {
     cwd.join(".claude/skills/implementation-plan/SKILL.md")
         .is_file()
 }
 
-/// Writing the plan file itself must never be blocked by the missing-plan gate
-/// — it happens before the marker is recorded. `docs/plans/` is the repo
-/// convention (also the auto-commit allow-list in `git_ops::commits`).
 pub(crate) fn is_plan_artifact(file_path: &str) -> bool {
     file_path.contains("docs/plans/")
 }
 
-/// Deny reason for a `Missing` marker — no plan recorded yet.
-///
-/// The third option, the bounded security-fix lane, is named here and nowhere
-/// else a session reads by default. This text is the only one guaranteed to
-/// arrive when an unattended run needs it, and an unattended run is the one
-/// that cannot ask. Its precondition leads the sentence so an attended session
-/// cannot skim past it: a session with a user to ask must ask.
 pub(crate) fn build_deny_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: this branch has no implementation-plan marker yet. Before editing source, \
@@ -84,25 +51,6 @@ pub(crate) fn build_deny_json(file_path: &str) -> String {
     deny_envelope(&reason)
 }
 
-/// Deny reason for a `Proposed` marker — a plan exists but the user hasn't
-/// approved it. The path forward is approval, NOT re-running the skill.
-///
-/// It names the `AskUserQuestion` tool and its option pair because prose alone
-/// is what failed: told only to "present the plan and wait", the agent wrote a
-/// summary and ended the turn, and the thread sat idle until the user typed
-/// "approve" by hand (2026-08-02). Approval is a DECISION question, and this
-/// hook firing is the proof: source edits are blocked until it is answered.
-///
-/// The pair is stated as a FLOOR, not a fixed shape, matching
-/// `ASK_USER_QUESTION_RULE` / `IMPLEMENTATION_PLAN_RULE` in the engine's
-/// `agent_session::prompts` and the `implementation-plan` skill. Stated
-/// unconditionally (as it was until 2026-08-04), an agent that surfaced a real
-/// fork kept `Request changes` as a third button, which then meant only "I will
-/// type what I want changed": the dead-end shape the prompts' NEVER AUTHOR AN
-/// "OTHER" OPTION rule bans.
-///
-/// The card's options come from the skill's approval checkpoint, which this
-/// text points at rather than restating.
 pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: the implementation plan on this branch is awaiting the user's approval. \
@@ -154,15 +102,12 @@ pub(crate) fn run() -> Result<(), BoxError> {
         }
     };
     if !is_gated_tool(&payload.tool_name) {
-        // settings.json only routes Edit/Write here; an unknown matcher means
-        // CC's contract changed — fall through rather than denying every call.
         return Ok(());
     }
     if payload.tool_input.file_path.is_empty() {
         return Ok(());
     }
     if is_plan_artifact(&payload.tool_input.file_path) {
-        // Writing the plan itself is part of planning — never gate it.
         return Ok(());
     }
 
@@ -174,7 +119,6 @@ pub(crate) fn run() -> Result<(), BoxError> {
         }
     };
     if !plan_skill_available(&cwd) {
-        // External repo / app worktree — the skill isn't shipped here.
         return Ok(());
     }
 
@@ -221,9 +165,6 @@ pub(crate) fn run() -> Result<(), BoxError> {
             Ok(())
         }
         Err(e) => {
-            // Engine unreachable / git-context / parse failure — fail OPEN so a
-            // transient hiccup doesn't block every edit. The Apply-time floor
-            // is the durable backstop if a marker-less change still slips through.
             eprintln!("cc-plan-gate: engine check failed, allowing: {}", e);
             Ok(())
         }
@@ -246,8 +187,6 @@ mod tests {
 
     #[test]
     fn plan_artifact_exempts_docs_plans_writes() {
-        // The plan file is written before the marker exists; gating it would
-        // deadlock the skill.
         assert!(is_plan_artifact(
             "/wt/docs/plans/2026-06-18-enforce-plan.md"
         ));
@@ -277,10 +216,6 @@ mod tests {
             reason.contains("lucidos planned mark --simple"),
             "reason must offer the local-fix escape: {reason}"
         );
-        // The bounded security-fix lane is named nowhere else a session reads
-        // by default, and an unattended run is the one that cannot ask. Its
-        // precondition must lead, or an attended session reads it as a general
-        // way past the gate.
         for needle in [
             "ONLY IF NOBODY CAN BE ASKED",
             "lucidos planned mark --security-fix",
@@ -316,34 +251,18 @@ mod tests {
             reason.contains("approval"),
             "awaiting-approval reason must mention approval: {reason}"
         );
-        // It must NOT push the agent to re-run the skill — the plan exists.
         assert!(
             reason.contains("Do NOT re-run"),
             "awaiting-approval reason must tell the agent not to re-plan: {reason}"
         );
-        // "Present the plan and wait" is what failed: the agent wrote prose and
-        // the thread sat idle until the user typed "approve" by hand
-        // (2026-08-02). This hook firing IS the proof that approval is a
-        // decision the agent is blocked on, so it must say how to ask. Keep the
-        // option pair identical to the prompt rules and the skill.
         for needle in [
             "`AskUserQuestion`",
             "`Approve` / `Request changes`",
             "DECISION question",
-            // The pair is a FLOOR, described the same way here as in the two
-            // prompt rules and the skill: a plan that offers a real fork puts
-            // the fork in the second slot rather than pushing `Request changes`
-            // to a third, where it would mean only "I will type what I want
-            // changed" (2026-08-04). A fork answer is an approval, so this text
-            // must also say the marker can be flipped after revising the plan.
             "that fork takes the second slot",
             "A tapped fork is an approval",
             "A fork pick does not re-mark",
-            // A typed question is a request for changes, never an approval: an
-            // agent read one as a fork pick and approved its own plan.
             "A typed reply that asks, suggests or questions is a request for changes",
-            // The user never sees a message that also calls a tool, so the plan
-            // summary rides on the card.
             "Put the plan summary on the card's question itself",
         ] {
             assert!(
@@ -354,8 +273,6 @@ mod tests {
         }
     }
 
-    /// The card's options live with the skill's approval checkpoint, so the
-    /// gate points there rather than reading the context itself.
     #[test]
     fn awaiting_approval_points_at_the_skills_checkpoint() {
         let out = build_awaiting_approval_json("/tmp/x.rs");

@@ -1,4 +1,4 @@
-//! Typed snapshot announcements. Payloads contain handles and fixed outcomes,
+//! INVARIANT: Typed snapshot announcements. Payloads contain handles and fixed outcomes,
 //! never primitive errors, filesystem paths, database URLs or key material.
 use super::{jobs, BoxError};
 use crate::engine::event_bus::{EventBus, SystemEvent};
@@ -105,7 +105,6 @@ mod tests {
         receiver.try_recv().unwrap();
         assert!(receiver.try_recv().is_err());
 
-        // A fresh bus models losing the acknowledgement and restarting.
         let (restarted, _callbacks) = EventBus::new(pool.clone());
         let mut after_restart = restarted.subscribe();
         restarted.emit_system_once(id, event(true)).await.unwrap();
@@ -165,7 +164,6 @@ mod tests {
             assert_eq!(rediscovered.len(), 1);
             events.outcome(&rediscovered[0]).await.unwrap();
         }
-        // Rewinding the database must not replay the surviving external job.
         let generation = uuid::Uuid::new_v4();
         sqlx::query("INSERT INTO snapshot_restore_boundary (singleton, restore_id, snapshot, restored_at, event_sequence) VALUES (TRUE, $1, $2, NOW(), 0)")
             .bind(generation).bind(job.handle.as_str()).execute(&pool).await.unwrap();

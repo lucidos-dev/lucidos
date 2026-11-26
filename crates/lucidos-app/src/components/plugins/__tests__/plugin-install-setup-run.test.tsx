@@ -69,3 +69,15 @@ describe('the install panel and setup on an update', () => {
     expect(noteOf({ ...base })).toBeUndefined();
   });
 });
+
+it('names the events a plugin can stop before confirmation', () => {
+  noteOf({
+    ...base,
+    hooks: [{ slug: 'gate', name: 'Gate', event_type: 'ChangeProposed' }],
+  });
+  const section = [...host!.querySelectorAll('section')]
+    .find((node) => node.textContent?.includes('Can stop progress'));
+  expect(section?.textContent).toContain('Gate');
+  expect(section?.textContent).toContain('ChangeProposed');
+  expect(section?.querySelector('[aria-expanded="true"]')).not.toBeNull();
+});

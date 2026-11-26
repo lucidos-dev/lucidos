@@ -119,10 +119,10 @@ A *script* Lucidos asks before it records an *event*, so a workspace can stop pr
 
 A hook is asked only where the act has not happened yet, so a refusal can stop it. Reacting after an event is a trigger's job. A transient event is never recorded, so no hook can name one.
 
-A hook runs only once the owner **arms** it, in Settings > Event Hooks or with `lucidos hooks arm`. Arming binds the hook's current definition and script. An edit leaves it **changed**: its events are refused until the owner arms the new content or disarms it. An agent arms, disarms or removes a hook only with the owner's Allow once.
+A hook runs only once the owner **arms** it, in Settings > Event Hooks or with `lucidos hooks arm`. Arming binds every file in the hook's folder. An edit leaves it **changed**: its events are refused until the owner arms the new content or disarms it. An agent arms, disarms or removes a hook only with the owner's Allow once.
 
-**Today no hook can be armed yet,** because Lucidos asks hooks about no event so far. A definition changes nothing yet.
-See also: *hook definition*, *hook answer*, *trigger*, `system-knowhow/lucidos-cli/subcommands-9.md` § `lucidos hooks list | arm | disarm | remove`.
+Lucidos asks hooks about four events: a thread's first `MessageReceived`, `TriggerStarted`, `ChangeProposed` and `ChangeApplyRequested`. Every refusal records `EventHookRefused`.
+See also: *hook definition*, *hook answer*, *trigger*, `system-knowhow/event-hooks`, `system-knowhow/lucidos-cli/subcommands-9.md` § `lucidos hooks list | arm | disarm | remove`.
 
 ### Hook definition
 The file `data/hooks/<slug>/hook.toml` that declares an *event hook*. You write it, and Lucidos never rewrites it, unlike a *trigger definition*. Its keys:
@@ -140,11 +140,19 @@ See also: *event hook*, *field path*.
 What an *event hook*'s script decides about one pending event. The script runs as a trigger script does. It reads the hook's slug and the event on stdin, with every stored secret masked out. It prints one JSON object, and its `answer` key names the answer:
 
 - `allow`, with an optional `events` list of domain events to record beside the event;
-- `needs-input`, naming the `argument` it needs;
+- `needs-input`, naming the `argument` it needs. It refuses for now, since no surface offers hook arguments yet;
 - `refuse`, with a `reason`.
 
-A hook fails closed. A crash, a run past its `timeout_secs`, or output that is no answer each count as a refusal. An event Lucidos records itself is no answer, so a hook returns domain events only. Nothing asks a hook yet, so no script runs.
+A hook fails closed. A crash, a run past its `timeout_secs`, or output that is no answer each count as a refusal. An event Lucidos records itself is no answer, so a hook returns domain events only.
 See also: *event hook*, *hook definition*.
+
+### Software factory
+How a workspace moves its own repository's changes through named stages, with rules that hold work back until they are met. It is workspace content built from Lucidos's parts. Stage facts are events, and flows mark *handoff checkpoints*. *Triggers* follow a stage, *event hooks* stop progress, and a *stage map* reads the stages back.
+See also: `system-knowhow/building-a-software-factory`.
+
+### Stage map
+The ordered stages of a repository's delivery, plus the rules naming the events that move a change into each one. The stages Lucidos's own events mark work for any repository. A *software factory* adds its own stage by naming the events that start and end it.
+See also: *software factory*.
 
 ### Typed answer
 What you type into the composer while a *question card* waits. It is that card's answer, so it shows on the card under **Your answer**, never as a message below. While sending, the card's header reads **Sending**. If Lucidos does not answer, it reads **Not sent**, with a retry icon under your answer and the options live again. Tapping an option or typing a new answer replaces it.

@@ -1,43 +1,3 @@
-//! `todo_write` tool — the Lucidos Agent's runtime todo list. Replace-whole-list
-//! semantics: each call's `items` become the new truth and any prior list is
-//! implicitly dropped. The empty list clears the panel.
-//!
-//! **The list reads back.** Every call answers with the resulting list, and
-//! `action: "read"` asks for it without writing. Before that the tool answered
-//! with a count, so the list existed only in the user's prompt bar. The agent
-//! could not see the settle below rewrite its items, and a long thread drifted
-//! with nothing in context to contradict it. The turn-start `[TODO LIST]` block
-//! closes the same gap from the other side. See
-//! `docs/plans/2026-09-20-the-agent-can-read-its-own-todo-list.md`.
-//!
-//! Also hosts [`settle_open_todos`], the engine-side hook that runs whenever a
-//! thread stops working the list: at response termination, and at each unpark
-//! no response follows (`todo_consumer` has the triggers and says which is
-//! which). The agent's contract is "either keep working
-//! the list until every item is `completed`, or call `todo_write` with `[]` to
-//! drop it explicitly." If the agent terminates a response with any OPEN item
-//! still on the list, the engine emits a new `TodoListWritten` with those items
-//! settled to an engine-only status. The list stays visible (the user keeps the
-//! trail of what was completed) but the settled items render with a distinct
-//! status, so it is obvious the agent did not see them through. All-completed
-//! lists are left alone, since finished lists persist by design.
-//!
-//! **Which status they settle to is the point of the hook.** A thread still
-//! holding a live *event wait* did not walk away, it parked: per ADR 0049
-//! `await_event` does not hold the turn, so a subscribed thread ends its
-//! response like any other and then sleeps until the event arrives. Its open
-//! items settle to `Waiting`, which is the same reading the thread's own status
-//! dot already gives that fact. A thread that a live direct child still owes a
-//! report parked the same way. Everything else settles to `Abandoned`.
-//!
-//! See `docs/plans/2026-05-18-todo-list-design.md` for the original design,
-//! `docs/plans/2026-08-09-a-subscribed-threads-todo-list-reads-as-waiting.md`
-//! for the waiting split,
-//! `docs/plans/2026-08-11-a-canceled-subscription-settles-the-todo-list.md` for
-//! the second trigger that keeps `Waiting` from stranding, and
-//! `docs/plans/2026-11-02-a-thread-parked-on-its-children-reads-as-waiting.md`
-//! for live children.
-
 use super::ToolOutcome;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent, TodoItem, TodoStatus};
@@ -49,38 +9,17 @@ use crate::engine::LucidosEngine;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// CC's `TodoWrite` uses the same order-of-magnitude limit — runaway lists
-/// are a bug indicator, not a feature.
 pub(crate) const MAX_TODO_ITEMS: usize = 50;
 
-/// The tool's default action, and what nearly every call does.
 const ACTION_WRITE: &str = "write";
-/// The action that answers with the list and changes nothing.
 const ACTION_READ: &str = "read";
 
-/// Standalone handler so tests can drive validation branches without a full
-/// engine boot — `LucidosEngine::execute_todo_write` is the thin wrapper.
-/// Pattern mirrors `query_events_impl` in `tools/mod.rs`.
-///
-/// Two actions on one tool rather than two tools, because a second registry
-/// entry is billed on every request of every thread. The reasoning, and why
-/// the tool keeps a name that says `write`, are in
-/// `docs/plans/2026-09-20-the-agent-can-read-its-own-todo-list.md`.
 pub(crate) async fn todo_tool_impl(
     event_bus: &EventBus,
     pool: &PgPool,
     args: &serde_json::Value,
     thread_id: uuid::Uuid,
 ) -> ToolOutcome {
-    // A wrong-typed or unknown action is refused rather than read as the
-    // default, matching `notes` below. Falling through to the write branch
-    // would answer a misspelt `read` by clearing the list.
-    //
-    // Explicit `null` is ABSENT, not a type error. That is the reading `notes`
-    // gives it, and the shape several SDKs serialise an omitted optional field
-    // into. It is safe because `action` is a verb selector, not an interlock: a
-    // call says what it destroys in `todos`, and a caller passing no verb asked
-    // for the default.
     let action = match args.get("action") {
         None | Some(serde_json::Value::Null) => ACTION_WRITE,
         Some(serde_json::Value::String(raw)) => raw.as_str(),
@@ -105,12 +44,6 @@ pub(crate) async fn todo_tool_impl(
     }
 }
 
-/// Answer with the thread's current list, writing nothing.
-///
-/// The read exists because the list is otherwise invisible to its own author:
-/// it renders to the USER in the prompt bar, and the settle rewrites it after
-/// the agent has stopped looking. A failed query is reported as a failure, so
-/// the agent never reads one as an empty list.
 async fn todo_read(pool: &PgPool, thread_id: uuid::Uuid) -> ToolOutcome {
     let snapshot = latest_todo_list(pool, thread_id)
         .await
@@ -158,20 +91,6 @@ fn render_todo_list(items: &[TodoItem], notes: Option<&str>) -> String {
     out
 }
 
-/// The `[TODO LIST]` block a turn opens with, or the empty string.
-///
-/// Rendered ONLY when the list still says something the agent might need to
-/// correct, which is any item that is not `completed`. A thread that never
-/// wrote a list, one that cleared it, and one that finished everything each pay
-/// nothing. See [`TodoSnapshot::all_completed`] for why the gate is not
-/// `TodoStatus::is_open`.
-///
-/// Nothing at all under *self-curated context mode*, which renders the same
-/// checklist inside the working understanding at the tail of every round. A
-/// second copy there would be the cost bug twice over.
-///
-/// It lives here rather than beside the other turn blocks. Every rendering of
-/// the list then sits in one file with the tool that writes it.
 pub(crate) fn turn_start_block(
     mode: crate::engine::chat::process::context_mode::ContextMode,
     snapshot: Option<&TodoSnapshot>,
@@ -192,15 +111,11 @@ pub(crate) fn turn_start_block(
     )
 }
 
-/// Replace the whole list with `todos`, and answer with what the user now sees.
 async fn todo_write(
     event_bus: &EventBus,
     args: &serde_json::Value,
     thread_id: uuid::Uuid,
 ) -> ToolOutcome {
-    // `todos` is not in the schema's `required` array, because `read` takes no
-    // list. So this is the only gate on it, and it names the action that would
-    // have made the field optional.
     let raw_items = match args.get("todos").and_then(|v| v.as_array()) {
         Some(items) => items,
         None if args.get("todos").is_none() => {
@@ -254,11 +169,6 @@ async fn todo_write(
             }
             in_progress_seen = true;
         }
-        // Both engine-only statuses are refused here, and with one message:
-        // they are two answers to a question the engine settles at response
-        // termination (did this thread park on an event wait, or walk away?),
-        // so a model writing either would be asserting something it cannot know
-        // yet. See `settle_open_todos`.
         if matches!(item.status, TodoStatus::Abandoned | TodoStatus::Waiting) {
             return Err(format!(
                 "Error: todo item at index {} has status `{}`, which is engine-only \
@@ -285,10 +195,6 @@ async fn todo_write(
         Some(_) => return Err("Error: `notes` must be a string".to_string()),
     };
 
-    // Rendered BEFORE the emit moves the items, and from the validated list
-    // rather than from a re-read. The settle runs at the terminator, so nothing
-    // rewrites this list between the emit and the answer. A second query would
-    // only be a slower way to the same bytes.
     let answer = if items.is_empty() {
         match notes.as_deref() {
             Some(notes) => format!("Todo list cleared.\nNotes: {notes}"),
@@ -314,11 +220,6 @@ async fn todo_write(
     Ok(answer)
 }
 
-/// How many items on the thread's newest todo list are still open.
-///
-/// `TodoStatus::is_open` decides, which is the point. The *wake check* asks the
-/// question the settle answers moments later. A second definition of "open"
-/// would let the gate and the panel describe different work.
 pub(crate) async fn open_todo_count(pool: &PgPool, thread_id: Uuid) -> Result<usize, sqlx::Error> {
     Ok(latest_todo_list(pool, thread_id).await?.map_or(0, |list| {
         list.items.iter().filter(|i| i.status.is_open()).count()
@@ -327,7 +228,7 @@ pub(crate) async fn open_todo_count(pool: &PgPool, thread_id: Uuid) -> Result<us
 
 #[easy_ext::ext(TodoExt)]
 pub(crate) impl LucidosEngine {
-    /// The two facts the *wake check* decides on, as
+    /// INVARIANT: The two facts the *wake check* decides on, as
     /// `(open items, something will re-open this thread)`.
     ///
     /// The open count is `None` when the read failed, which is UNKNOWN rather
@@ -378,10 +279,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The wake check's facts once the list holds `open` open items and the
-/// live-child probe has run. A live child reports back on its own, so it
-/// covers the thread. A probe that could not run is UNKNOWN, reported as an
-/// unknown count so it never nudges.
 fn wake_facts_given_child_probe(
     open: usize,
     holds_live_child: Result<bool, sqlx::Error>,
@@ -455,11 +352,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    // ---- Reading the list back: the tool result, the read action, the block.
-
-    /// The whole reason the tool stopped answering with a count. The agent
-    /// rewrites the WHOLE list next call, so all three fields of every item
-    /// have to come back.
     #[tokio::test]
     async fn a_write_answers_with_the_resulting_list() {
         let (bus, _rx, pool, db) = setup().await;
@@ -493,8 +385,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A read must be a read. Emitting anything here would rewrite the user's
-    /// panel and move the sequence the settle's race check is scoped to.
     #[tokio::test]
     async fn a_read_answers_with_the_list_and_writes_nothing() {
         let (bus, mut rx, pool, db) = setup().await;
@@ -524,9 +414,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The reported bug, from the agent's side. The settle wrote `abandoned`
-    /// over work the agent believes it finished, and until now nothing could
-    /// tell it so.
     #[tokio::test]
     async fn a_read_reports_the_statuses_the_engine_assigned() {
         let (bus, mut rx, pool, db) = setup().await;
@@ -549,8 +436,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Two shapes of nothing, and neither reads as a failure. A thread that
-    /// cleared its list is distinguishable from one that never had one.
     #[tokio::test]
     async fn a_read_of_no_list_says_so() {
         let (bus, _rx, pool, db) = setup().await;
@@ -573,9 +458,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// An action the handler does not know is refused, never read as the
-    /// default. Falling through would answer a misspelt `read` by clearing the
-    /// list, which is the one outcome nothing can walk back.
     #[tokio::test]
     async fn an_unknown_or_wrong_typed_action_is_refused() {
         let (bus, _rx, pool, db) = setup().await;
@@ -602,10 +484,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// An explicit `null` action is absent, and absent is the write default.
-    /// Several SDKs serialise an omitted optional field that way, so refusing
-    /// it would cost a round and buy nothing: what a call destroys it says in
-    /// `todos`, never in `action`.
     #[tokio::test]
     async fn a_null_action_is_the_write_default() {
         let (bus, _rx, pool, db) = setup().await;
@@ -634,10 +512,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A read carrying a list says two contradictory things, and honouring
-    /// either half silently is worse than refusing. Taking the read would leave
-    /// the panel untouched while handing back the OLD list, which is the drift
-    /// this whole surface exists to end.
     #[tokio::test]
     async fn a_read_carrying_a_list_is_refused() {
         let (bus, _rx, pool, db) = setup().await;
@@ -667,8 +541,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Each thread reads its own list and no other. `latest_todo_list` is the
-    /// only source, and it is scoped by `thread_id`.
     #[tokio::test]
     async fn a_read_sees_only_its_own_threads_list() {
         let (bus, _rx, pool, db) = setup().await;
@@ -722,9 +594,6 @@ mod tests {
         }
     }
 
-    /// A live child reports back on its own, so it re-opens the thread as
-    /// surely as a subscription does. A probe that could not run is UNKNOWN,
-    /// and unknown never nudges.
     #[test]
     fn the_wake_check_counts_a_live_child_as_covered() {
         assert_eq!(wake_facts_given_child_probe(2, Ok(true)), (Some(2), true));
@@ -735,9 +604,6 @@ mod tests {
         );
     }
 
-    /// A turn on a thread with nothing to reconcile pays nothing. Three shapes
-    /// qualify, and the all-completed one is the reason this is not
-    /// `TodoStatus::is_open`: a finished list has no drift to correct.
     #[test]
     fn the_turn_start_block_is_empty_when_there_is_nothing_to_reconcile() {
         assert_eq!(turn_start_block(ContextMode::Off, None), "");
@@ -751,9 +617,6 @@ mod tests {
         );
     }
 
-    /// Under the mode the checklist already renders inside the working
-    /// understanding, at the tail of every round. This block there would be a
-    /// second surface for one list, and a second thing to keep in step.
     #[test]
     fn the_turn_start_block_is_empty_under_the_context_mode() {
         let unfinished = snapshot(&[TodoStatus::Abandoned]);
@@ -761,8 +624,6 @@ mod tests {
         assert_eq!(turn_start_block(ContextMode::On, Some(&unfinished)), "");
     }
 
-    /// `Abandoned` is terminal to the settle, so it is the status the agent is
-    /// likeliest to be carrying wrongly. The block exists for it.
     #[test]
     fn the_turn_start_block_carries_a_settled_list() {
         let block = turn_start_block(
@@ -776,8 +637,6 @@ mod tests {
         assert!(block.contains("doing item 1"), "got: {block}");
     }
 
-    /// A list the agent is still working, with no engine status on it, needs no
-    /// explanation of statuses the engine never wrote.
     #[test]
     fn the_settle_note_appears_only_on_a_settled_list() {
         let untouched = render_todo_list(&snapshot(&[TodoStatus::Pending]).items, None);
@@ -788,7 +647,6 @@ mod tests {
         assert!(dropped.contains("are the engine's"), "got: {dropped}");
     }
 
-    /// Read the notes off the newest list, which is what the prompt block does.
     async fn latest_notes(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
         latest_todo_list(pool, thread_id)
             .await
@@ -796,8 +654,6 @@ mod tests {
             .and_then(|list| list.notes)
     }
 
-    /// ADR 0085 decision 1: notes ride beside the items on the same call, and
-    /// replace-whole-list covers them too.
     #[tokio::test]
     async fn todo_write_keeps_notes_beside_the_items_and_replaces_them_whole() {
         let (bus, _rx, pool, db) = setup().await;
@@ -820,9 +676,6 @@ mod tests {
             Some("collect.sh needs bash 5, /opt/homebrew/bin/bash works")
         );
 
-        // A later call that carries no notes drops them, exactly as an omitted
-        // item drops it. There is one way to clear the block and it is the same
-        // way the list is cleared.
         let without = json!({
             "todos": [
                 { "content": "a", "active_form": "doing a", "status": "completed" },
@@ -837,8 +690,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Blank is absent. A whitespace note is not worth storing, and folding the
-    /// two means the model has one spelling for "clear my notes".
     #[tokio::test]
     async fn todo_write_treats_a_blank_note_as_no_note() {
         let (bus, _rx, pool, db) = setup().await;
@@ -857,11 +708,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A wrong-typed `notes` is refused, not read as "clear them".
-    ///
-    /// `todos` already errors on the wrong type. Notes are the one block the
-    /// context mode leaves the model across a boundary. Losing them with no
-    /// message is the worst way for this call to go wrong.
     #[tokio::test]
     async fn todo_write_refuses_a_non_string_note() {
         let (bus, _rx, pool, db) = setup().await;
@@ -891,7 +737,6 @@ mod tests {
             "a refused call must not have written anything"
         );
 
-        // Explicit null is the model saying "no notes", not a type error.
         todo_tool_impl(&bus, &pool, &json!({"todos": [], "notes": null}), thread_id)
             .await
             .expect("null clears");
@@ -901,9 +746,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The settle re-emits the whole list, so it must carry the notes through.
-    /// Dropping them would erase what the agent wrote every time a turn ended
-    /// with an item still open, which is most of them.
     #[tokio::test]
     async fn settling_the_list_leaves_the_notes_alone() {
         let (bus, mut rx, pool, db) = setup().await;
@@ -952,10 +794,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// `todos` left the schema's `required` array so `read` can omit it, which
-    /// makes the handler the only gate on it. The refusal names the one action
-    /// that may leave it out. Otherwise a model that dropped it by accident
-    /// reads the error as "this tool no longer takes a list".
     #[tokio::test]
     async fn todo_write_rejects_missing_todos_field() {
         let (bus, _rx, pool, db) = setup().await;
@@ -1100,9 +938,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Drain any TodoListWritten broadcasts already in flight for `thread_id`
-    /// so a follow-up assertion sees a clean channel. Returns once the channel
-    /// has no more buffered events for the thread.
     async fn drain_todo_events_for(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid) {
         use tokio::time::{timeout, Duration};
         loop {
@@ -1120,9 +955,6 @@ mod tests {
         }
     }
 
-    /// Assert no TodoListWritten broadcast for `thread_id` arrives within a
-    /// short window. Other broadcasts (e.g. thread_summaries projection
-    /// side effects) are ignored — we only care about the cleanup-or-not.
     async fn assert_no_todo_cleanup(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid) {
         use tokio::time::{timeout, Duration};
         let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
@@ -1269,9 +1101,6 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_is_idempotent_once_already_marked() {
-        // Two terminators in a row (e.g. ResponseAborted then ResponseCanceled
-        // via the safety-net path) must not re-emit a TodoListWritten when
-        // the latest already shows abandoned + completed only.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1286,11 +1115,9 @@ mod tests {
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        // First call flips.
         settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         let _flipped = next_todo_event(&mut rx, thread_id).await;
 
-        // Second call is a no-op.
         settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
@@ -1300,8 +1127,6 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_uses_only_the_latest_list_state() {
-        // Earlier write was mid-task; later write completed everything.
-        // The hook sees the latest (all-completed) and stays quiet.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1333,14 +1158,9 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_skips_when_newer_list_written_after_terminator() {
-        // Simulates: turn A's terminator landed but the consumer was slow.
-        // Before the consumer's SELECT, turn B started and wrote a fresh
-        // in-progress list. The consumer must NOT flip turn B's items — it
-        // should defer to turn B's own terminator.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        // Seed turn A's stale in-progress list.
         let stale = json!({
             "todos": [
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
@@ -1350,9 +1170,6 @@ mod tests {
             .await
             .expect("seed stale");
 
-        // Pretend turn A's terminator was assigned a sequence value — capture
-        // the current max-sequence as our terminator marker. Anything written
-        // AFTER that should be treated as turn B's fresh state.
         let terminator_seq: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE thread_id = $1",
         )
@@ -1361,7 +1178,6 @@ mod tests {
         .await
         .expect("max seq");
 
-        // Now turn B writes a fresh list AFTER the terminator.
         let fresh = json!({
             "todos": [
                 { "content": "b", "active_form": "doing b", "status": "in_progress" },
@@ -1373,8 +1189,6 @@ mod tests {
             .expect("seed fresh");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        // Consumer finally processes turn A's terminator. It should see the
-        // newer turn-B list and skip — turn B owns its list.
         settle_open_todos(&bus, &pool, thread_id, terminator_seq, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
@@ -1405,9 +1219,6 @@ mod tests {
 
     #[tokio::test]
     async fn todo_write_rejects_waiting_status_from_llm() {
-        // The sibling of the test above: `waiting` is the engine's answer to a
-        // question about the thread's subscriptions, so the model may no more
-        // write it than it may write `abandoned`.
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1426,8 +1237,6 @@ mod tests {
         pool.close().await;
         teardown_test_db(&db).await;
     }
-
-    // ---- The waiting split: a subscribed thread parked, it did not walk away.
 
     async fn seed_event_wait(bus: &EventBus, thread_id: Uuid) -> Uuid {
         use crate::core::event_subscription::EventSubscription;
@@ -1480,10 +1289,6 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_settles_to_waiting_while_a_subscription_is_live() {
-        // The reported bug. `await_event` does not hold the turn (ADR 0049), so
-        // a thread that parks on a wait terminates its response like any other
-        // and the hook ran on it within milliseconds of the agent saying it
-        // would keep watching. Calling that "abandoned" is the lie.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1524,10 +1329,6 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_settles_waiting_items_to_abandoned_once_the_wait_resolves() {
-        // `Waiting` is open, not terminal, and this is why: the wake arrived,
-        // the agent still did not finish the list, so the next terminator has
-        // to be able to call it what it now is. Otherwise a parked list reads
-        // as parked forever.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1564,10 +1365,6 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_reads_the_wait_state_as_of_the_terminator() {
-        // Why the liveness question is asked of the event store and not of
-        // `thread_summaries.live_event_wait_count`: this consumer is async, so
-        // a wait delivered between the terminator and the SELECT would make a
-        // thread that was demonstrably parked read as one that never waited.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1581,10 +1378,8 @@ mod tests {
             .expect("seed write");
         let wait_id = seed_event_wait(&bus, thread_id).await;
 
-        // The terminator landed here, with the wait still live.
         let terminator_seq = max_seq(&pool, thread_id).await;
 
-        // ...and the delivery beat the consumer to it.
         deliver_event_wait(&bus, thread_id, wait_id).await;
         drain_todo_events_for(&mut rx, thread_id).await;
 
@@ -1604,9 +1399,6 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_is_idempotent_while_the_subscription_stays_live() {
-        // The sibling of `settle_open_todos_is_idempotent_once_already_marked`,
-        // for the other settled status: the two terminators of one turn must
-        // not each re-emit an identical parked list.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1633,9 +1425,6 @@ mod tests {
 
     #[tokio::test]
     async fn settle_open_todos_never_un_abandons_an_item_for_a_later_subscription() {
-        // `Abandoned` is terminal in the other direction. The agent walked away
-        // from this item in an earlier turn; subscribing to something in a
-        // later one does not make that item parked work.
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1663,8 +1452,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    // ---- The wake check's half of the question: how much is still open.
-
     async fn seed_list(bus: &EventBus, pool: &sqlx::PgPool, thread_id: Uuid, statuses: &[&str]) {
         let todos: Vec<_> = statuses
             .iter()
@@ -1690,8 +1477,6 @@ mod tests {
 
     #[tokio::test]
     async fn open_todo_count_is_zero_for_every_shape_that_leaves_nothing_open() {
-        // The four shapes an ordinary turn ends in. Each must read zero, or the
-        // wake check spends a round on a turn that finished its work.
         let (bus, _rx, pool, db) = setup().await;
 
         let never_wrote = Uuid::new_v4();
@@ -1705,8 +1490,6 @@ mod tests {
         seed_list(&bus, &pool, finished, &["completed", "completed"]).await;
         assert_eq!(count_open(&pool, finished).await, 0, "all completed");
 
-        // Already settled by an earlier terminator. `Abandoned` is terminal, so
-        // it must not re-trigger the check on every later turn of the thread.
         let walked_away = Uuid::new_v4();
         seed_list(&bus, &pool, walked_away, &["completed", "in_progress"]).await;
         settle_open_todos(&bus, &pool, walked_away, i64::MAX, false).await;
@@ -1737,11 +1520,6 @@ mod tests {
 
     #[tokio::test]
     async fn open_todo_count_treats_a_parked_item_as_open() {
-        // `Waiting` is open, per `TodoStatus::is_open`, and this is the case
-        // that makes sharing that predicate matter. A wait resolved in an
-        // earlier turn leaves `Waiting` items behind on the list. If the agent
-        // ends the next turn without re-arming, that work is unwatched again
-        // and the check has to see it.
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
@@ -1757,9 +1535,6 @@ mod tests {
 
     #[tokio::test]
     async fn open_todo_count_reads_only_the_newest_list() {
-        // Replace-whole-list semantics. An earlier turn's open items are gone
-        // once the agent writes a new list, and counting them would nudge over
-        // work that no longer exists.
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 

@@ -1,5 +1,3 @@
-//! PreToolUse hook for Claude Code's AskUserQuestion tool.
-
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
@@ -13,9 +11,6 @@ pub(crate) struct HookPayload {
     pub(crate) tool_input: ToolInput,
 }
 
-/// The questions stay raw JSON: the engine's `parse_ask_user_question_inputs`
-/// owns their schema. A typed copy here dropped every field it did not name,
-/// which is how option pictures (`preview`) never reached the card.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ToolInput {
     pub(crate) questions: serde_json::Value,
@@ -37,22 +32,15 @@ struct AskUserQuestionRequestBody<'a> {
 struct AskUserQuestionResponseBody {
     questions: serde_json::Value,
     answers: serde_json::Value,
-    /// Set when the engine refused the card, which the user never saw.
     #[serde(default)]
     refusal: Option<String>,
-    /// Every pick was a *quiet option*, so the agent's turn ends here.
     #[serde(default)]
     quiet: bool,
 }
 
-/// Why the turn ended after a *quiet option*. Shared with the Codex
-/// `ask_user_question` MCP tool, which can only ask the agent to stop.
 pub(crate) const QUIET_ANSWER_NOTE: &str = "The user picked a quiet option: \
     end your turn now. Write no reply and do no further work.";
 
-/// Always exits 0 with a decision on stdout. Claude Code treats any other exit
-/// as a non-blocking error and runs its native tool. In a headless session that
-/// tool answers "the user did not answer" at once, and the agent asks in prose.
 pub(crate) fn run() -> Result<(), BoxError> {
     println!("{}", output_for(ask()));
     Ok(())
@@ -69,8 +57,6 @@ fn output_for(asked: Result<AskUserQuestionResponseBody, BoxError>) -> String {
     }
 }
 
-/// The tool result for a question that got no answer back from the engine.
-/// Shared with the Codex `ask_user_question` MCP tool.
 pub(crate) fn card_not_shown_reason(tool: &str, cause: &str) -> String {
     format!(
         "The question tool failed, and no answer came back ({cause}). \
@@ -80,8 +66,6 @@ pub(crate) fn card_not_shown_reason(tool: &str, cause: &str) -> String {
     )
 }
 
-/// POST a question to the engine and decode its answer. A non-2xx keeps the
-/// engine's error text, which often says how to fix the question.
 pub(crate) fn post_question<R: serde::de::DeserializeOwned>(
     client: &reqwest::blocking::Client,
     endpoint: &str,
@@ -127,8 +111,6 @@ fn ask() -> Result<AskUserQuestionResponseBody, BoxError> {
     )?)
 }
 
-/// Deny the tool call: Claude Code hands the reason to the model as the tool
-/// result.
 fn build_refusal_output(reason: &str) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
@@ -140,14 +122,6 @@ fn build_refusal_output(reason: &str) -> String {
     .to_string()
 }
 
-/// Build the JSON Claude Code expects on a PreToolUse hook's stdout when the
-/// hook satisfies the tool itself: `permissionDecision: allow` plus
-/// `updatedInput` carrying the synthesized answers (CC then constructs a
-/// matching `tool_result` for its session). Echoes the questions array
-/// verbatim alongside the answers — both fields are required.
-///
-/// A quiet answer adds the hook-common `continue: false`, so Claude Code ends
-/// the turn after the tool call instead of generating a reply.
 fn build_hook_output(
     questions: &serde_json::Value,
     answers: &serde_json::Value,
@@ -204,10 +178,6 @@ mod tests {
         );
     }
 
-    /// A session put a picture in every option's `preview`, and the card showed
-    /// none: this hook re-typed each option as label plus description and
-    /// dropped the rest. The engine owns the question schema, so the hook
-    /// forwards the questions exactly as Claude Code sent them.
     #[test]
     fn parse_hook_payload_keeps_every_option_field_for_the_engine() {
         let raw = r#"{
@@ -256,8 +226,6 @@ mod tests {
         );
     }
 
-    /// A failed request must deny the call, never fall through to Claude Code's
-    /// native tool.
     #[test]
     fn a_failed_request_denies_the_call_instead_of_falling_through() {
         let output = output_for(Err("engine answered 500 Internal Server Error".into()));
@@ -271,8 +239,6 @@ mod tests {
         assert!(reason.contains("same error comes back twice"), "{reason}");
     }
 
-    /// The engine's error text often says how to fix the question, so a
-    /// non-2xx must carry it to the agent.
     #[test]
     fn post_question_keeps_the_engine_error_text() {
         use std::io::Write;

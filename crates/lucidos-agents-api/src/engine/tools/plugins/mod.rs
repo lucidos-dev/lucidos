@@ -35,6 +35,7 @@ use crate::triggers::affected::{self, AffectedTrigger};
 use crate::triggers::TriggerConfig;
 
 mod affected_triggers;
+pub(crate) mod hooks;
 pub(crate) mod marketplaces;
 mod merge;
 mod registry;
@@ -65,7 +66,7 @@ pub(crate) use registry::find_plugin_owning_file;
 // The `delete_app` HTTP handler (`api::apps`) routes plugin-owned app deletes
 // to the uninstall panel via this — the app-level mirror of the file guard.
 pub(crate) use registry::find_plugin_owning_app;
-pub(crate) use registry::installed_plugin_summaries;
+pub(crate) use registry::{event_hook_plugin_ids, installed_plugin_summaries};
 
 /// Sentinel prefix on the `install_plugin` / `update_plugin` tool result. The
 /// agentic loop strips it and emits the *form request*
@@ -253,6 +254,7 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     // The staging body is synchronous, so its credentials are resolved here.
     let credentials = credentials_for_source(&engine.pool, source_str).await;
     let running = running_release();
+    let event_hooks = engine.event_hook_catalog.get().cloned();
     let staged = match tokio::task::spawn_blocking(move || {
         prepare_install_request(
             &workspace,
@@ -261,6 +263,7 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
             &installed,
             &credentials,
             &running,
+            event_hooks.as_deref(),
         )
     })
     .await
@@ -335,6 +338,7 @@ pub(crate) fn prepare_install_request(
     installed: &InstalledPluginsRead,
     credentials: &GitCredentials,
     running: &Result<semver::Version, String>,
+    catalog: Option<&dyn crate::core::event_hooks::EventHooks>,
 ) -> String {
     let source = match detect_source(source_str) {
         Ok(s) => s,
@@ -345,7 +349,7 @@ pub(crate) fn prepare_install_request(
             Ok(t) => t,
             Err(e) => return format!("Error: {}", e),
         };
-    let (manifest, planned) = match validate_tree(&plugin_root) {
+    let (manifest, mut planned) = match validate_tree(&plugin_root) {
         Ok(t) => t,
         Err(e) => return format!("Error: {}", e),
     };
@@ -354,6 +358,34 @@ pub(crate) fn prepare_install_request(
             "Error: {}",
             mismatch.refusal(&manifest.name, &manifest.version)
         );
+    }
+
+    let plugin_hooks = match hooks::prepare(&plugin_root, &mut planned, catalog) {
+        Ok(hooks) => hooks,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let prior_hooks = installed
+        .as_ref()
+        .ok()
+        .and_then(|installed| installed.hooks.get(&manifest.id))
+        .cloned()
+        .unwrap_or_default();
+    if !plugin_hooks.is_empty() {
+        let result = installed
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|installed| {
+                hooks::check_ownership(
+                    workspace_path,
+                    &manifest.id,
+                    &plugin_hooks,
+                    &installed.files,
+                    &[],
+                )
+            });
+        if let Err(e) = result {
+            return format!("Error: {e}");
+        }
     }
 
     let data_dir = workspace_path.join(DATA_DIR);
@@ -413,6 +445,8 @@ pub(crate) fn prepare_install_request(
             .map(|p| p.data_relative.clone())
             .collect::<Vec<_>>(),
         "overwrites": overwrites,
+        "hooks": plugin_hooks,
+        "hook_confirmation_required": !plugin_hooks.is_empty() || !prior_hooks.is_empty(),
         "removes": plan.removes(),
         "is_update": is_update,
         "local_changes": plan.preview_json(),
@@ -433,6 +467,8 @@ pub(crate) fn prepare_install_request(
         plugin_version: manifest.version.clone(),
         plugin_name: manifest.name.clone(),
         setup,
+        hooks: plugin_hooks,
+        prior_hooks,
         plan,
         recorded_files: installed.as_ref().ok().map(|i| i.files.clone()),
         created_at: chrono::Utc::now(),
@@ -534,6 +570,10 @@ pub(crate) async fn prepare_uninstall_plugin(
     let version = installed.version().unwrap_or("unknown").to_string();
     let name = installed.name().unwrap_or(&id);
     let files = installed.files();
+    let hooks = match installed.hooks() {
+        Ok(hooks) => hooks,
+        Err(e) => return format!("Error: read installed hooks: {e}"),
+    };
 
     prepare_uninstall_request(
         workspace_path,
@@ -542,6 +582,7 @@ pub(crate) async fn prepare_uninstall_plugin(
         &version,
         name,
         files,
+        hooks,
     )
 }
 
@@ -557,6 +598,7 @@ pub(crate) fn prepare_uninstall_request(
     version: &str,
     name: &str,
     recorded_files: Vec<String>,
+    hooks: Vec<crate::engine::pending_plugins::PluginHook>,
 ) -> String {
     let data_dir = workspace_path.join(DATA_DIR);
     let mut files_present = Vec::new();
@@ -591,6 +633,7 @@ pub(crate) fn prepare_uninstall_request(
         plugin_id: id.to_string(),
         plugin_version: version.to_string(),
         plugin_name: name.to_string(),
+        hooks,
         files_present,
         files_missing,
         created_at: chrono::Utc::now(),
@@ -675,16 +718,24 @@ pub struct ConfirmedUninstall {
 pub async fn confirm_pending_uninstall(
     engine: &LucidosEngine,
     uninstall_id: &str,
+    owner_confirmed_hooks: bool,
     actor: Option<MessageOrigin>,
 ) -> Result<ConfirmedUninstall, String> {
     let pending = {
         sweep_stale_pending_uninstalls(&engine.pending_uninstalls);
-        engine
+        let mut uninstalls = engine
             .pending_uninstalls
             .lock()
-            .expect("pending_uninstalls mutex poisoned")
+            .expect("pending_uninstalls mutex poisoned");
+        let pending = uninstalls
+            .get(uninstall_id)
+            .ok_or_else(|| format!("no pending uninstall with id '{uninstall_id}'"))?;
+        if !pending.hooks.is_empty() && !owner_confirmed_hooks {
+            return Err(hooks::CONFIRMATION_REQUIRED.into());
+        }
+        uninstalls
             .remove(uninstall_id)
-            .ok_or_else(|| format!("no pending uninstall with id '{}'", uninstall_id))?
+            .expect("the pending uninstall is locked")
     };
 
     let outcome = {
@@ -693,12 +744,50 @@ pub async fn confirm_pending_uninstall(
         // a half-written repo, and so this commit can't race a concurrent
         // write_file/edit_file commit. Mirrors the install confirm flow.
         let _repo_guard = engine.lock_workspace_repo().await;
+        let installed = project_installed_plugins(&engine.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let current_hooks = installed
+            .hooks
+            .get(&pending.plugin_id)
+            .map_or(&[][..], Vec::as_slice);
+        if current_hooks != pending.hooks {
+            return Err(
+                "The installed plugin changed after review. Stage the uninstall again.".into(),
+            );
+        }
+        if !pending.hooks.is_empty() {
+            let reviewed = pending
+                .files_present
+                .iter()
+                .chain(&pending.files_missing)
+                .collect::<std::collections::BTreeSet<_>>();
+            let current = installed
+                .files
+                .get(&pending.plugin_id)
+                .into_iter()
+                .flatten()
+                .collect();
+            if reviewed != current
+                || installed
+                    .setups
+                    .get(&pending.plugin_id)
+                    .and_then(|setup| setup.version.as_deref())
+                    != Some(pending.plugin_version.as_str())
+            {
+                return Err(
+                    "The installed plugin changed after review. Stage the uninstall again.".into(),
+                );
+            }
+        }
+        let hook_events = hooks::removed(&pending.hooks, &[], actor.clone());
         uninstall_with_bus(
             &engine.workspace_path,
             &engine.event_bus,
             &pending,
             &affected_triggers::snapshot_triggers(engine),
             actor.clone(),
+            hook_events,
         )
         .await?
     };
@@ -763,7 +852,12 @@ pub(crate) async fn uninstall_with_bus(
     pending: &PendingUninstall,
     triggers: &[TriggerConfig],
     actor: Option<MessageOrigin>,
+    mut hook_events: Vec<SystemEvent>,
 ) -> Result<ConfirmedUninstall, String> {
+    hooks::check_paths(
+        workspace_path,
+        pending.files_present.iter().map(String::as_str),
+    )?;
     let data_dir = workspace_path.join(DATA_DIR);
 
     let mut files_deleted = Vec::with_capacity(pending.files_present.len());
@@ -824,7 +918,7 @@ pub(crate) async fn uninstall_with_bus(
     }
 
     let affected = affected::affected_triggers(&files_deleted, triggers, &pending.plugin_id);
-    bus.emit(BusEvent::System(SystemEvent::PluginUninstalled {
+    hook_events.push(SystemEvent::PluginUninstalled {
         id: pending.plugin_id.clone(),
         version: pending.plugin_version.clone(),
         files: all_files,
@@ -832,9 +926,10 @@ pub(crate) async fn uninstall_with_bus(
         files_missing: files_missing_now.clone(),
         affected_triggers: affected.clone(),
         actor: actor.clone(),
-    }))
-    .await
-    .map_err(|e| format!("emit PluginUninstalled: {}", e))?;
+    });
+    bus.emit_system_batch(hook_events)
+        .await
+        .map_err(|e| format!("emit PluginUninstalled: {e}"))?;
     affected_triggers::notify(
         bus,
         &pending.plugin_name,
@@ -943,6 +1038,7 @@ pub struct LocalChangeReport {
 /// `auth-modules/` means the WASM signer map must refresh).
 pub struct ConfirmedInstall {
     pub summary: String,
+    pub hooks_needing_review: Vec<String>,
     pub installed_files: Vec<String>,
     /// Files the previous version shipped and this one dropped, now deleted.
     pub removed_files: Vec<String>,
@@ -1164,16 +1260,25 @@ pub async fn confirm_pending_install(
     engine: &LucidosEngine,
     install_id: &str,
     keep_local_changes: bool,
+    owner_confirmed_hooks: bool,
     actor: Option<MessageOrigin>,
 ) -> Result<ConfirmedInstall, String> {
     let pending = {
         sweep_stale_pending(&engine.pending_installs);
-        engine
+        let mut installs = engine
             .pending_installs
             .lock()
-            .expect("pending_installs mutex poisoned")
+            .expect("pending_installs mutex poisoned");
+        let pending = installs
+            .get(install_id)
+            .ok_or_else(|| format!("no pending install with id '{install_id}'"))?;
+        if (!pending.hooks.is_empty() || !pending.prior_hooks.is_empty()) && !owner_confirmed_hooks
+        {
+            return Err(hooks::CONFIRMATION_REQUIRED.into());
+        }
+        installs
             .remove(install_id)
-            .ok_or_else(|| format!("no pending install with id '{}'", install_id))?
+            .expect("the pending install is locked")
     };
 
     // Pre-allocate the setup thread id only when this confirm has setup work
@@ -1223,6 +1328,38 @@ pub async fn confirm_pending_install(
             &records_now,
             &removals,
         )?;
+        let current_hooks = records_now
+            .as_ref()
+            .ok()
+            .and_then(|installed| installed.hooks.get(&pending.plugin_id))
+            .map_or(&[][..], Vec::as_slice);
+        if current_hooks != pending.prior_hooks {
+            return Err("The plugin hooks changed after review. Stage the update again.".into());
+        }
+        let hook_install = if pending.hooks.is_empty() && pending.prior_hooks.is_empty() {
+            None
+        } else {
+            let installed = records_now.as_ref().map_err(Clone::clone)?;
+            let catalog = engine
+                .event_hook_catalog
+                .get()
+                .ok_or("The event hook catalog is unavailable.")?;
+            let armed = hooks::load_armed(&engine.pool).await?;
+            hooks::check_ownership(
+                &engine.workspace_path,
+                &pending.plugin_id,
+                &pending.hooks,
+                &installed.files,
+                &armed,
+            )?;
+            Some(hooks::Install {
+                plugin_id: &pending.plugin_id,
+                catalog: catalog.as_ref(),
+                staged: &pending.hooks,
+                prior: current_hooks,
+                armed,
+            })
+        };
         let resolved = pending.plan.resolve(keep_local_changes);
         // Before a single byte is overwritten, so a failure past this point
         // cannot take the user's work with it.
@@ -1254,6 +1391,7 @@ pub async fn confirm_pending_install(
                 setup_thread_id,
                 local: writes,
                 removals,
+                hook_install,
                 triggers: affected_triggers::snapshot_triggers(engine),
                 ..InstallContext::plain(pending.source_type, true)
             },
@@ -1266,6 +1404,7 @@ pub async fn confirm_pending_install(
     };
     let InstallWrite {
         summary,
+        hooks_needing_review,
         installed_files,
         removed_files,
         affected_triggers,
@@ -1304,6 +1443,7 @@ pub async fn confirm_pending_install(
 
     Ok(ConfirmedInstall {
         summary,
+        hooks_needing_review,
         installed_files,
         removed_files,
         affected_triggers,
@@ -1739,7 +1879,7 @@ fn validate_plugin_triggers_event_driven(planned: &[PlannedFile]) -> Result<(), 
 
 /// Everything about one install write except the content itself: where it came
 /// from, who asked for it, and what to do with the user's local edits.
-pub(crate) struct InstallContext {
+pub(crate) struct InstallContext<'a> {
     pub(crate) source_type: SourceType,
     /// The user already saw the overwrite list in the panel, so a confirm
     /// passes `true`. A caller that has not shown one passes `false` and gets
@@ -1758,12 +1898,13 @@ pub(crate) struct InstallContext {
     /// `data/`-relative paths the previous version shipped and this one
     /// dropped, deleted after the writes. Edited ones are already saved aside.
     pub(crate) removals: Vec<String>,
+    hook_install: Option<hooks::Install<'a>>,
     /// Every trigger, for reporting the ones a removal leaves without their
     /// knowhow. Empty when nothing is removed.
     pub(crate) triggers: Vec<TriggerConfig>,
 }
 
-impl InstallContext {
+impl InstallContext<'_> {
     /// An install with no local edits to weigh, nothing to remove, and nobody
     /// to attribute it to.
     pub(crate) fn plain(source_type: SourceType, overwrite: bool) -> Self {
@@ -1774,6 +1915,7 @@ impl InstallContext {
             setup_thread_id: None,
             local: LocalChangeWrites::default(),
             removals: Vec::new(),
+            hook_install: None,
             triggers: Vec::new(),
         }
     }
@@ -1783,6 +1925,7 @@ impl InstallContext {
 #[derive(Debug)]
 pub(crate) struct InstallWrite {
     pub(crate) summary: String,
+    pub(crate) hooks_needing_review: Vec<String>,
     /// Every `data/`-relative path written. The confirm uses it verbatim (no
     /// re-walk) for the auto-reload decision and the HTTP response.
     pub(crate) installed_files: Vec<String>,
@@ -1820,7 +1963,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
     workspace_path: &Path,
     bus: &dyn EventBusEmitter,
     plugin_root: &Path,
-    ctx: InstallContext,
+    ctx: InstallContext<'_>,
 ) -> Result<InstallWrite, String> {
     let InstallContext {
         source_type,
@@ -1829,10 +1972,34 @@ pub(crate) async fn install_from_unpacked_with_bus(
         setup_thread_id,
         local,
         removals,
+        hook_install,
         triggers,
     } = ctx;
     let (manifest, planned) = validate_tree(plugin_root).map_err(|e| e.to_string())?;
     let data_dir = workspace_path.join(DATA_DIR);
+    if let Some(install) = &hook_install {
+        let staged = hooks::inspect(
+            &plugin_root.join(crate::core::event_hooks::HOOKS_DIR),
+            install.catalog,
+        )?;
+        if manifest.id != install.plugin_id || staged != install.staged {
+            return Err(
+                "The staged hook content changed after review. Stage the install again.".into(),
+            );
+        }
+    } else if planned
+        .iter()
+        .any(|file| hooks::slug(&file.data_relative).is_some())
+    {
+        return Err(hooks::CONFIRMATION_REQUIRED.into());
+    }
+    hooks::check_paths(
+        workspace_path,
+        planned
+            .iter()
+            .map(|file| file.data_relative.as_str())
+            .chain(removals.iter().map(String::as_str)),
+    )?;
 
     // Plugins may only ship event-driven (`on:`) triggers — reject a shipped
     // `trigger.toml` with a cron `schedule` BEFORE any file is written (clean
@@ -1949,7 +2116,14 @@ pub(crate) async fn install_from_unpacked_with_bus(
         payload.insert("setup_thread_id".into(), serde_json::json!(tid.to_string()));
     }
 
-    bus.emit(BusEvent::System(SystemEvent::PluginInstalled {
+    let (mut hook_events, unarmed_hooks) = match hook_install {
+        Some(install) => {
+            payload.insert("hooks".into(), serde_json::json!(install.staged));
+            install.events(workspace_path, actor.clone())
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    hook_events.push(SystemEvent::PluginInstalled {
         id: manifest.id.clone(),
         manifest: serde_json::Value::Object(payload),
         files: installed_files.clone(),
@@ -1958,9 +2132,10 @@ pub(crate) async fn install_from_unpacked_with_bus(
         installed_at,
         source_type: source_type.as_str().to_string(),
         actor: actor.clone(),
-    }))
-    .await
-    .map_err(|e| format!("event emit failed: {}", e))?;
+    });
+    bus.emit_system_batch(hook_events)
+        .await
+        .map_err(|e| format!("event emit failed: {e}"))?;
     affected_triggers::notify(
         bus,
         &manifest.name,
@@ -1982,7 +2157,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
         1 => " Removed 1 file this version no longer ships.".to_string(),
         n => format!(" Removed {n} files this version no longer ships."),
     };
-    let result = format!(
+    let mut result = format!(
         "Installed {} v{} ({} files).{}{}",
         manifest.name,
         manifest.version,
@@ -1990,8 +2165,15 @@ pub(crate) async fn install_from_unpacked_with_bus(
         removed_note,
         media_note.unwrap_or_default()
     );
+    if !unarmed_hooks.is_empty() {
+        result.push_str(&format!(
+            " Review these hooks in Settings > Event Hooks to arm their installed content: {}.",
+            unarmed_hooks.join(", ")
+        ));
+    }
     Ok(InstallWrite {
         summary: result,
+        hooks_needing_review: unarmed_hooks,
         installed_files,
         removed_files,
         affected_triggers: affected,
@@ -2063,3 +2245,7 @@ mod widgets_tests;
 #[cfg(test)]
 #[path = "../plugins_tests/affected_triggers.rs"]
 mod affected_triggers_tests;
+
+#[cfg(test)]
+#[path = "../plugins_tests/hooks.rs"]
+mod hook_tests;

@@ -1,6 +1,5 @@
 use super::*;
 
-/// 26 bytes, so an offset reads back as a letter and an off-by-one is visible.
 const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
 
 fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
@@ -204,8 +203,6 @@ async fn a_weakened_or_listed_if_none_match_still_hits() {
     }
 }
 
-/// The reported bug: a rebuilt artifact kept playing its old bytes. The
-/// validator has to move when the file does, or the browser never refetches.
 #[tokio::test]
 async fn a_rewritten_file_gets_a_new_etag() {
     let dir = tempfile::tempdir().unwrap();
@@ -216,8 +213,6 @@ async fn a_rewritten_file_gets_a_new_etag() {
     )
     .expect("etag");
 
-    // A same-second rewrite would be indistinguishable on a coarse clock, so
-    // move both halves of the tag: the length and the mtime.
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     std::fs::write(&path, b"rebuilt with different bytes entirely").unwrap();
 
@@ -236,8 +231,6 @@ async fn a_rewritten_file_gets_a_new_etag() {
     );
 }
 
-/// A range against a validator that has moved must never splice old and new
-/// bytes together.
 #[tokio::test]
 async fn a_stale_if_range_degrades_to_the_full_body() {
     let dir = tempfile::tempdir().unwrap();
@@ -278,10 +271,6 @@ async fn a_fresh_if_range_serves_the_slice() {
     }
 }
 
-/// The headers and the bytes must describe one file. A rebuild that lands
-/// between them would otherwise send new bytes under the old length and ETag.
-/// A build tool writes a temp file and renames it over the target, so the open
-/// handle keeps the version its headers were measured from.
 #[tokio::test]
 async fn a_rebuild_mid_request_cannot_change_the_bytes_already_promised() {
     let dir = tempfile::tempdir().unwrap();
@@ -365,12 +354,10 @@ fn range_specs_resolve_against_the_file_length() {
         resolve_range(Some("bytes=0-0"), 26),
         Slice { start: 0, end: 0 }
     );
-    // An end past the last byte clamps rather than failing.
     assert_eq!(
         resolve_range(Some("bytes=20-999"), 26),
         Slice { start: 20, end: 25 }
     );
-    // A suffix longer than the file is the whole file.
     assert_eq!(
         resolve_range(Some("bytes=-999"), 26),
         Slice { start: 0, end: 25 }
@@ -379,7 +366,6 @@ fn range_specs_resolve_against_the_file_length() {
     assert_eq!(resolve_range(Some("bytes=-0"), 26), Unsatisfiable);
     assert_eq!(resolve_range(Some("bytes=9-5"), 26), Unsatisfiable);
     assert_eq!(resolve_range(Some("bytes=0-0"), 0), Unsatisfiable);
-    // Anything we cannot read is answered with the full body, never a guess.
     for junk in ["", "bytes=", "items=0-1", "bytes=abc-def", "bytes=1-x"] {
         assert_eq!(resolve_range(Some(junk), 26), Full, "spec: {junk}");
     }
@@ -405,7 +391,6 @@ fn an_active_document_is_sandboxed_without_the_workspace_origin() {
             .unwrap_or_else(|| panic!("{content_type} served with no sandbox"));
         assert!(csp.starts_with("sandbox "), "{content_type}: {csp}");
         assert!(csp.contains("allow-scripts"), "{content_type}: {csp}");
-        // The whole point: the file must not run as the shell.
         assert!(!csp.contains("allow-same-origin"), "{content_type}: {csp}");
         assert!(!csp.contains("escape-sandbox"), "{content_type}: {csp}");
     }
@@ -443,8 +428,6 @@ fn a_response_with_no_type_is_left_alone() {
 
 #[test]
 fn a_not_modified_answer_is_sandboxed_by_what_its_path_names() {
-    // `ServeDir` sends a 304 with no type. The browser merges its headers into
-    // the cached copy, so this is what sandboxes a page cached before the fix.
     let response = sandbox_documents(StatusCode::NOT_MODIFIED.into_response(), "text/html");
     assert_eq!(
         header_of(&response, header::CONTENT_SECURITY_POLICY).as_deref(),

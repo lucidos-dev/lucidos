@@ -1,6 +1,3 @@
-//! One open card per thread: a second card queues, a release posts only into
-//! a free slot, and the owner cannot answer a card they never saw.
-
 use super::super::*;
 use super::*;
 
@@ -47,7 +44,6 @@ async fn answer(
     .await
 }
 
-/// `(event_type, tool_use_id)` of every card event on the thread, in order.
 async fn card_rows(pool: &PgPool, thread_id: Uuid) -> Vec<(String, String)> {
     sqlx::query_as(
         "SELECT event_type, payload->>'tool_use_id' FROM events \
@@ -340,7 +336,6 @@ async fn the_owner_cannot_answer_a_queued_card_but_the_engine_can_retire_it() {
         "question_queued"
     );
 
-    // A client's answer is placed, so even its Canceled is refused.
     let client_cancel = bus
         .emit_question_answer(
             thread_id,

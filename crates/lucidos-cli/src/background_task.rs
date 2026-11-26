@@ -1,15 +1,3 @@
-//! `lucidos background-task run | wait | output | stop`: a coding agent's
-//! *background tasks*, work the engine runs so it can outlive one tool call.
-//!
-//! `run` hands the command to the engine, which runs it in this thread's
-//! worktree and arms an event wait on its completion. The agent then ends its
-//! turn, and the wait re-opens the thread with the result. `run --poll` arms
-//! nothing, and the agent calls `wait` until the task finishes. Over
-//! `/api/v1/threads/<id>/background-tasks`.
-//!
-//! `$LUCIDOS_THREAD_ID` names the thread and there is no `--thread` flag, so a
-//! session cannot start, read or stop another thread's tasks.
-
 use serde_json::json;
 
 use crate::http::{client as http_client, client_with_timeout, send_and_print};
@@ -31,12 +19,6 @@ pub(crate) fn tasks_url(ws: &Workspace, thread_id: &str) -> String {
     )
 }
 
-/// The command line the engine's shell runs.
-///
-/// One argument passes through verbatim, so a quoted pipeline or redirect
-/// (`-- 'cargo test > log 2>&1'`) keeps its meaning. Several arguments are
-/// quoted one by one, so `-- cargo test --lib "my filter"` runs exactly those
-/// words and the shell expands nothing.
 pub(crate) fn shell_command_line(args: &[String]) -> String {
     match args {
         [single] => single.clone(),
@@ -60,15 +42,11 @@ fn shell_quote(arg: &str) -> String {
     }
 }
 
-/// How long `wait` lets the engine answer. The engine caps one wait at 230 s,
-/// so this only has to outlast that and the round trip.
 pub(crate) const WAIT_RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(290);
 
-/// What `run` asks for, beside the command.
 pub(crate) struct RunOptions<'a> {
     pub description: Option<&'a str>,
     pub timeout_secs: Option<u64>,
-    /// Arm no event wait: the agent polls with `wait`.
     pub poll: bool,
 }
 
@@ -139,7 +117,6 @@ mod tests {
         }
     }
 
-    /// The engine names the task on the thread's waiting row by this field.
     #[test]
     fn the_description_reaches_the_request_body() {
         let body = run_body(&args(&["make"]), &options(Some("the release build"), false));
@@ -147,8 +124,6 @@ mod tests {
         assert!(run_body(&args(&["make"]), &options(None, false))["description"].is_null());
     }
 
-    /// `--poll` is what keeps the engine from arming a wake-up the agent
-    /// would read after it already polled the result.
     #[test]
     fn poll_reaches_the_request_body() {
         assert_eq!(

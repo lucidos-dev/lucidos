@@ -88,7 +88,10 @@ describe('a code that arrived in the launch URL', () => {
     expect(gateSrc).toMatch(/setError\(null\);\s*adopt\(pasted\);/);
     expect(gateSrc).toMatch(/setScanning\(false\);\s*adopt\(scannedCode\);/);
     expect(gateSrc).toMatch(
-      /if \(isPairingSecret\(token\)\) void redeem\(token\);\s*else setCode\(token\);/,
+      /if \(isPairingSecret\(token\)\) void redeem\(token\);\s*else enterShortCode\(token\);/,
+    );
+    expect(gateSrc).toMatch(
+      /const enterShortCode = \(digits: string\) => \{\s*setSecretText\(''\);\s*setCode\(digits\);\s*\};/,
     );
   });
 });

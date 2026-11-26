@@ -1,18 +1,5 @@
-//! `GET /api/v1/data/*path`: cache validators, byte ranges, and the one thing
-//! only a live request can prove.
-//!
-//! The compression layer sits between the handler and the wire, and it strips
-//! `Accept-Ranges` from anything it compresses. The engine's unit tests call the
-//! handler directly, so they never see that layer. These tests send a real
-//! `accept-encoding` the way a browser does.
-//!
-//! This suite's reqwest build has no `gzip`/`brotli` feature, so it sends no
-//! `accept-encoding` on its own and never transparently decodes one. Both halves
-//! matter: the header under test is exactly the one we set by hand.
-
 use crate::support::{base_url, http_client, unique_marker, workspace_path};
 
-/// 256 distinct bytes, so a slice at any offset is unambiguous.
 fn payload() -> Vec<u8> {
     (0..=255u8).collect()
 }
@@ -37,8 +24,6 @@ fn header(response: &reqwest::Response, name: &str) -> Option<String> {
     Some(response.headers().get(name)?.to_str().unwrap().to_string())
 }
 
-/// One test rather than several, because they share a file in the workspace
-/// tree and the tree lock is held for the whole sequence.
 #[tokio::test]
 async fn data_route_serves_ranges_and_revalidates() {
     let client = http_client();
@@ -49,7 +34,6 @@ async fn data_route_serves_ranges_and_revalidates() {
     write_artifact(&name, &bytes);
     let url = data_url(&name);
 
-    // --- Full read, with the accept-encoding a browser really sends ---
     let full = client
         .get(&url)
         .header("accept-encoding", "gzip, br")
@@ -78,7 +62,6 @@ async fn data_route_serves_ranges_and_revalidates() {
     );
     assert_eq!(full.bytes().await.unwrap().as_ref(), bytes.as_slice());
 
-    // --- A mid-file range ---
     let partial = client
         .get(&url)
         .header("range", "bytes=100-149")
@@ -98,7 +81,6 @@ async fn data_route_serves_ranges_and_revalidates() {
         "the slice must be the bytes the range named"
     );
 
-    // --- An open-ended range ---
     let tail = client
         .get(&url)
         .header("range", "bytes=250-")
@@ -113,7 +95,6 @@ async fn data_route_serves_ranges_and_revalidates() {
     );
     assert_eq!(tail.bytes().await.unwrap().as_ref(), &bytes[250..]);
 
-    // --- Past the end ---
     let past = client
         .get(&url)
         .header("range", "bytes=900-1000")
@@ -127,7 +108,6 @@ async fn data_route_serves_ranges_and_revalidates() {
         Some("bytes */256")
     );
 
-    // --- Revalidation against an unchanged file ---
     let unchanged = client
         .get(&url)
         .header("if-none-match", &etag)
@@ -138,7 +118,6 @@ async fn data_route_serves_ranges_and_revalidates() {
     assert_eq!(unchanged.status(), 304);
     assert!(unchanged.bytes().await.unwrap().is_empty());
 
-    // --- The reported bug: the file is rebuilt on disk ---
     let rebuilt: Vec<u8> = (0..=255u8).rev().chain(0..=127u8).collect();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     write_artifact(&name, &rebuilt);
@@ -157,8 +136,6 @@ async fn data_route_serves_ranges_and_revalidates() {
     std::fs::remove_file(artifact_path(&name)).ok();
 }
 
-/// The media exclusion must not have switched compression off wholesale: it is
-/// there to shrink multi-MB payloads on the rest of the API.
 #[tokio::test]
 async fn text_on_the_data_route_still_compresses() {
     let client = http_client();

@@ -1,28 +1,12 @@
-//! A provider's usage block, read into an [`ApiUsage`].
-//!
-//! The one reader of each provider's usage shape. The chat providers, the
-//! Claude Code readers, the keep-alive, the web search backends and the proxy
-//! all call it. So no path can drop a field another path reads.
-
 use serde_json::Value;
 
 use crate::llm::api_usage::ApiUsage;
 use crate::llm::cache_lifetime::CacheLifetime;
 
-/// The usage a JSON body reports, in whichever provider's shape it carries.
-///
-/// - Gemini: `usageMetadata`, with thinking billed as output. Its cached
-///   count is a part of `promptTokenCount`, and Gemini bills no cache write.
-/// - Any other provider: its `usage` block, read by [`from_block`].
-///
-/// `None` when the body names no prompt tokens, so a reply that is not a
-/// model call never reads as one that cost nothing.
 pub fn from_json(body: &Value) -> Option<ApiUsage> {
     from_frame(body).filter(|u| u.input_tokens > 0)
 }
 
-/// [`from_json`] without the prompt check, for one frame of a stream: a
-/// frame may carry only the output count.
 pub(crate) fn from_frame(body: &Value) -> Option<ApiUsage> {
     if let Some(meta) = body.get("usageMetadata") {
         let output = count(meta, "candidatesTokenCount").unwrap_or(0)
@@ -40,7 +24,7 @@ pub(crate) fn from_frame(body: &Value) -> Option<ApiUsage> {
     read_block(body.get("usage")?, echoed)
 }
 
-/// A bare `usage` object, in the engine's `ApiUsage` convention:
+/// INVARIANT: A bare `usage` object, in the engine's `ApiUsage` convention:
 /// `input_tokens` counts every prompt token, and both cache counts are parts
 /// of it.
 ///
@@ -55,8 +39,6 @@ pub fn from_block(block: &Value) -> Option<ApiUsage> {
     read_block(block, None)
 }
 
-/// [`from_block`], with the `prompt_cache_options.ttl` an OpenAI Responses
-/// body echoes beside the block.
 fn read_block(block: &Value, echoed: Option<CacheLifetime>) -> Option<ApiUsage> {
     let prompt = count(block, "prompt_tokens");
     let completion = count(block, "completion_tokens");
@@ -98,8 +80,6 @@ fn read_block(block: &Value, echoed: Option<CacheLifetime>) -> Option<ApiUsage> 
     ))
 }
 
-/// The 1-hour part of an Anthropic cache write. The rest of the write went to
-/// the 5-minute cache.
 fn anthropic_1h_part(block: &Value) -> Option<u32> {
     block
         .pointer("/cache_creation/ephemeral_1h_input_tokens")
@@ -107,7 +87,7 @@ fn anthropic_1h_part(block: &Value) -> Option<u32> {
         .map(clamp)
 }
 
-/// `read` with the 30-minute and 12-hour parts of an OpenAI cache write.
+/// INVARIANT: `read` with the 30-minute and 12-hour parts of an OpenAI cache write.
 ///
 /// The split in the `*_tokens_details` object wins, zero parts included: a
 /// zero part is evidence. A split that names more tokens than the write is
@@ -146,22 +126,14 @@ fn with_openai_split(
     }
 }
 
-/// One count from a `*_tokens_details` object, `0` when absent.
 fn detail(details: Option<&Value>, field: &str) -> u64 {
     details.and_then(|d| count(d, field)).unwrap_or(0)
 }
 
-/// The usage a stream sent as one JSON array reports, as Gemini's
-/// `streamGenerateContent` does without `alt=sse`. Each chunk is one frame.
 pub fn from_chunks(chunks: &[Value]) -> Option<ApiUsage> {
     fold(chunks.iter().filter_map(from_frame))
 }
 
-/// The usage a buffered server-sent-event stream reports.
-///
-/// Each provider spreads its counters over frames: Anthropic puts the prompt
-/// in `message_start` and the output in `message_delta`, OpenAI Responses its
-/// totals in `response.completed`.
 pub fn from_event_stream(body: &str) -> Option<ApiUsage> {
     let frames = body
         .lines()
@@ -178,15 +150,10 @@ pub fn from_event_stream(body: &str) -> Option<ApiUsage> {
     fold(frames)
 }
 
-/// The frames merged into the call's total. `None` when no frame named a
-/// prompt token.
 fn fold(frames: impl Iterator<Item = ApiUsage>) -> Option<ApiUsage> {
     frames.reduce(merge).filter(|u| u.input_tokens > 0)
 }
 
-/// Two frames of one call, merged. The counters only grow, so the larger of
-/// each is the call's total, and a split part a frame omits keeps the other
-/// frame's.
 pub fn merge(a: ApiUsage, b: ApiUsage) -> ApiUsage {
     let part = |a: Option<u32>, b: Option<u32>| a.max(b);
     ApiUsage {
@@ -257,8 +224,6 @@ mod tests {
         assert_eq!(counts(from_json(&written).unwrap()), (40, 3, 12, 20));
     }
 
-    /// OpenRouter reports an Anthropic cache write inside `prompt_tokens`, as it
-    /// does the read.
     #[test]
     fn chat_completions_counts_its_cache_write_inside_the_prompt() {
         let chat = json!({"usage": {"prompt_tokens": 50, "completion_tokens": 7,
@@ -273,7 +238,6 @@ mod tests {
         assert_eq!(counts(from_json(&body).unwrap()), (90, 12, 0, 0));
     }
 
-    /// `promptTokenCount` already counts the cached part, as in the chat path.
     #[test]
     fn gemini_counts_its_cache_hit_inside_the_prompt() {
         let body = json!({"usageMetadata": {"promptTokenCount": 5000,
@@ -281,7 +245,6 @@ mod tests {
         assert_eq!(counts(from_json(&body).unwrap()), (5000, 3, 4096, 0));
     }
 
-    /// A body that is not a model call reports nothing, never a free call.
     #[test]
     fn a_body_without_prompt_tokens_reports_nothing() {
         assert!(from_json(&json!({"quota": {"remaining": 3}})).is_none());
@@ -304,7 +267,6 @@ mod tests {
         assert_eq!(counts(from_event_stream(stream).unwrap()), (9, 2, 0, 0));
     }
 
-    /// The write's lifetime parts: 1 hour, 30 minutes, 12 hours.
     fn split_of(usage: Option<ApiUsage>) -> (Option<u32>, Option<u32>, Option<u32>) {
         let u = usage.expect("usage");
         (
@@ -339,7 +301,6 @@ mod tests {
         assert_eq!(split_of(from_json(&body)), (None, Some(0), Some(20)));
     }
 
-    /// A split that claims more than the write is no evidence, echo or not.
     #[test]
     fn an_over_summed_responses_split_is_dropped() {
         let body = json!({"prompt_cache_options": {"ttl": "30m"},
@@ -359,7 +320,6 @@ mod tests {
         assert_eq!(split_of(from_json(&body)), (None, None, Some(20)));
     }
 
-    /// A split object that names no part is no split, so the echo still counts.
     #[test]
     fn the_echoed_ttl_names_a_write_with_an_empty_split() {
         for split in [json!(null), json!({})] {
@@ -374,8 +334,6 @@ mod tests {
         }
     }
 
-    /// A later frame that omits the split keeps the one an earlier frame
-    /// reported.
     #[test]
     fn a_merge_keeps_a_split_one_frame_omits() {
         let start = from_block(
@@ -389,8 +347,6 @@ mod tests {
         assert_eq!(merged.cache_creation_1h_tokens, Some(30));
     }
 
-    /// The `[DONE]` line after the usage frame is not JSON, so it is skipped
-    /// rather than ending the parse.
     #[test]
     fn a_speech_stream_reads_its_done_frame() {
         let stream = "data: {\"type\":\"speech.audio.delta\",\"audio\":\"SUQz\"}\n\n\

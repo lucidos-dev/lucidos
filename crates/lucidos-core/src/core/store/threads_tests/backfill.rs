@@ -74,12 +74,6 @@ async fn backfill_trigger_id_rewrites_v5_hashes_to_config_ids() {
     teardown_test_db(&db).await;
 }
 
-/// Regression for the bug where every trigger thread
-/// rendered with NULL `trigger_id` because the
-/// `20260429214800_addtriggeridtothreadsummaries.sql` backfill only read
-/// `payload->>'trigger_id'` and ignored legacy events that stored the id
-/// under `task_id`. The runtime backfill below recovers the value from
-/// `events`, COALESCEing both shapes.
 #[tokio::test]
 async fn backfill_trigger_id_from_events_reads_legacy_task_id() {
     let (pool, db) = setup_test_db().await;
@@ -109,8 +103,6 @@ async fn backfill_trigger_id_from_events_reads_legacy_task_id() {
     )
     .await;
 
-    // Already-set trigger_id must NOT be overwritten — the runtime
-    // projection populated it, so events would just confirm what's there.
     let preset = insert_trigger_thread(&pool, "preset-id", "Preset Name", 30).await;
     insert_trigger_started_event(
         &pool,
@@ -122,8 +114,6 @@ async fn backfill_trigger_id_from_events_reads_legacy_task_id() {
     )
     .await;
 
-    // Trigger-source thread with no TriggerStarted event in `events`
-    // (corruption / lost event). Must stay NULL — never invent values.
     let orphan = insert_null_trigger_thread(&pool, 20).await;
 
     let updated = store
@@ -168,10 +158,6 @@ async fn backfill_trigger_id_from_events_reads_legacy_task_id() {
     teardown_test_db(&db).await;
 }
 
-/// Reproduce the original bug end-to-end: a legacy event
-/// with `task_id` set to the v5 hash of `config.id`, and a NULL row in
-/// `thread_summaries`. After both backfills run in startup order the
-/// dropdown filter (which sends `config.id`) must match.
 #[tokio::test]
 async fn both_backfills_compose_legacy_task_id_to_config_id() {
     let (pool, db) = setup_test_db().await;
@@ -223,38 +209,23 @@ async fn both_backfills_compose_legacy_task_id_to_config_id() {
     teardown_test_db(&db).await;
 }
 
-/// The bug fix for repos that predate the `RepositoryAdded` event: their name
-/// is in neither the live `repositories` registry (once removed) nor the event
-/// log, so the filter showed the raw UUID. Their path survives in
-/// `changes.repo_root`, and the backfill scavenges its basename into
-/// `repo_names`, so the deleted repo lists as `example-repo`, not a UUID, AND
-/// the projection-backed names already present are left untouched.
 #[tokio::test]
 async fn backfill_repo_names_from_changes_recovers_basename() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
-    // A removed pre-event repo: a CC thread references it and a change recorded
-    // its path, but it's in neither `repositories` nor `repo_names`.
     let deleted_repo = Uuid::new_v4();
     let cc = insert_cc_repo_thread(&pool, &deleted_repo.to_string(), 60).await;
     insert_change(&pool, cc, "/Users/me/projects/example-repo").await;
 
-    // A repo already named in the projection (registry / RepositoryAdded) must
-    // NOT be clobbered by the path basename.
     let named_repo = Uuid::new_v4();
     insert_repo_name(&pool, named_repo, "Canonical Name").await;
     let named_cc = insert_cc_repo_thread(&pool, &named_repo.to_string(), 50).await;
     insert_change(&pool, named_cc, "/Users/me/projects/lowercase").await;
 
-    // A repo with no change: nothing to scavenge — stays absent (NULL name).
     let nameless_repo = Uuid::new_v4();
     insert_cc_repo_thread(&pool, &nameless_repo.to_string(), 40).await;
 
-    // App coding-agent threads record a *workspace* root in repo_root (basename
-    // = workspace, not a repo). They have no cc_repo_id today, but the guard is
-    // belt-and-suspenders for the documented footgun — pin it with an artificial
-    // app row that DOES carry a cc_repo_id.
     let app_repo = Uuid::new_v4();
     let app = insert_cc_repo_thread(&pool, &app_repo.to_string(), 30).await;
     sqlx::query("UPDATE thread_summaries SET coding_agent_kind = 'app' WHERE thread_id = $1")
@@ -302,8 +273,6 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
         "app thread's workspace-root basename must not be scavenged as a repo name"
     );
 
-    // The user-visible surface: the repos filter facet now labels the deleted
-    // repo with its recovered name instead of the UUID.
     let ws = tempfile::tempdir().unwrap();
     let apps = crate::core::AppManager::new(ws.path()).unwrap();
     let facets = store
@@ -326,9 +295,6 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
     teardown_test_db(&db).await;
 }
 
-/// Insert a coding-agent thread row with an explicit kind, external flag, and
-/// stale `cc_repo_id`, mirroring the orphaned-thread state (a random repo id
-/// bound at first `SessionStarted`, the live registry having since moved on).
 async fn insert_ca_thread(
     pool: &sqlx::PgPool,
     kind: Option<&str>,
@@ -370,22 +336,13 @@ async fn backfill_repoints_lucidos_and_legacy_threads_to_deterministic_id() {
     let legacy_external_id = Uuid::new_v4().to_string();
     let live_external_id = Uuid::new_v4();
 
-    // lucidos-kind and legacy-NULL-kind threads BOTH target the Lucidos source
-    // by definition → both should be re-pointed.
     let lucidos = insert_ca_thread(&pool, Some("lucidos"), false, Some(&stale_a)).await;
     let legacy = insert_ca_thread(&pool, None, false, Some(&stale_b)).await;
-    // Modern external-repo thread (kind='external') — untouched.
     let external = insert_ca_thread(&pool, Some("external"), true, Some(&external_id)).await;
-    // LEGACY external-repo thread: created before the kind column, so
-    // coding_agent_kind IS NULL but the durable external flag is set. The
-    // `kind IS NULL` arm must NOT mis-repoint it (the regression guard).
     let legacy_external = insert_ca_thread(&pool, None, true, Some(&legacy_external_id)).await;
-    // A NULL-kind thread whose cc_repo_id is still a LIVE repository (not
-    // orphaned) — must be left alone even without the external flag.
     insert_repository(&pool, live_external_id, "other", "/tmp/other").await;
     let live_bound =
         insert_ca_thread(&pool, None, false, Some(&live_external_id.to_string())).await;
-    // App thread — untouched.
     let app = insert_app_thread(&pool, "demo", 5, false).await;
 
     let det = Uuid::new_v4();
@@ -429,7 +386,6 @@ async fn backfill_repoints_lucidos_and_legacy_threads_to_deterministic_id() {
         "app thread cc_repo_id stays NULL"
     );
 
-    // Idempotent — a second boot re-points nothing (marker set).
     let again = store
         .backfill_cc_repo_id_to_deterministic(det)
         .await

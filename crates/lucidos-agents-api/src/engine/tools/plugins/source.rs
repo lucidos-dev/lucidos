@@ -1,8 +1,3 @@
-//! Plugin install-source detection and fetching: classify a source string
-//! (git URL / GitHub tree URL / local archive), clone or unzip it into a
-//! scratch dir, and the per-file atomic copy used by the writer. Pure
-//! filesystem/network helpers — no engine or event-bus coupling.
-
 use crate::engine::pending_plugins::SourceType;
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
@@ -12,24 +7,19 @@ use crate::core::plugins::{
     is_git_url, validate_archive_entry_path, ValidationError, PLUGIN_ARCHIVE_EXT,
 };
 
-/// Where the source string points and how to fetch it.
 #[derive(Debug)]
 pub(crate) enum Source {
-    /// Full git URL with optional branch and subpath inside the repo.
     Git {
         url: String,
         branch: Option<String>,
         subpath: Option<String>,
     },
-    /// Local path to a `.lucidos-plugin` archive.
     Archive(PathBuf),
 }
 
-/// Detect the install source by shape of the input string.
 pub(crate) fn detect_source(s: &str) -> Result<Source, String> {
     let trimmed = s.trim();
 
-    // GitHub tree URL → repo + branch + subpath.
     if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
         if let Some(parsed) = parse_github_tree(rest) {
             return Ok(parsed);
@@ -81,11 +71,6 @@ fn parse_github_tree(rest: &str) -> Option<Source> {
     })
 }
 
-/// The stored credentials a [`fetch_source`] of `source_str` may present.
-///
-/// The fetch is synchronous, so its credentials are resolved out here. A
-/// local archive and an unparseable string need none: the fetch itself
-/// reports whatever is wrong with them.
 pub(crate) async fn credentials_for_source(pool: &PgPool, source_str: &str) -> GitCredentials {
     match detect_source(source_str) {
         Ok(Source::Git { url, .. }) => GitCredentials::resolve_one(pool, &url).await,
@@ -93,10 +78,6 @@ pub(crate) async fn credentials_for_source(pool: &PgPool, source_str: &str) -> G
     }
 }
 
-/// Fetch the source into a fresh `tempfile::TempDir` under
-/// `.lucidos/tmp/plugins/`. Returns the TempDir guard (auto-cleans on drop)
-/// and the plugin root inside it (where `manifest.toml` lives — for git-tree
-/// URLs this is the subpath, not the repo root).
 pub(crate) fn fetch_source(
     workspace: &Path,
     source: &Source,
@@ -114,9 +95,6 @@ pub(crate) fn fetch_source(
             subpath,
         } => {
             let clone_target = scratch.path().join("repo");
-            // The returned repo drops at the end of this statement: git2 types
-            // are not Send, and the caller awaits. `shallow_clone` handles
-            // credentials and the `file://` depth exception.
             crate::core::git_auth::shallow_clone(
                 url,
                 branch.as_deref(),
@@ -182,8 +160,6 @@ pub(crate) fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Atomic-per-file copy: write to `<dest>.tmp` then rename. Caller is
-/// responsible for ensuring the parent dir exists.
 pub(crate) fn copy_atomic(src: &Path, dst: &Path) -> Result<(), String> {
     write_via_tmp(dst, |tmp| {
         std::fs::copy(src, tmp)
@@ -192,8 +168,6 @@ pub(crate) fn copy_atomic(src: &Path, dst: &Path) -> Result<(), String> {
     })
 }
 
-/// [`copy_atomic`] for bytes the caller already holds. The merge path writes
-/// the merged content this way, since there is no source file to copy from.
 pub(crate) fn write_atomic(bytes: &[u8], dst: &Path) -> Result<(), String> {
     write_via_tmp(dst, |tmp| {
         std::fs::write(tmp, bytes).map_err(|e| format!("write {:?}: {}", tmp, e))
@@ -204,19 +178,13 @@ pub(crate) fn write_atomic_like(bytes: &[u8], dst: &Path, mode_of: &Path) -> Res
     write_via_tmp(dst, |tmp| {
         std::fs::write(tmp, bytes).map_err(|e| format!("write {:?}: {}", tmp, e))?;
         let Ok(meta) = std::fs::metadata(mode_of) else {
-            // Shipped file unreadable: the copy path would have failed already,
-            // so the default mode is the least surprising outcome here.
             return Ok(());
         };
-        // Set on the temp file, so the rename publishes content and mode
-        // together and no reader sees one without the other.
         std::fs::set_permissions(tmp, meta.permissions())
             .map_err(|e| format!("set mode on {:?}: {}", tmp, e))
     })
 }
 
-/// The git file mode for `path`: `0o100755` when its owner-execute bit is set,
-/// `0o100644` otherwise. Git records only those two for a regular file.
 pub(crate) fn git_file_mode(path: &Path) -> u32 {
     #[cfg(unix)]
     {
@@ -231,9 +199,6 @@ pub(crate) fn git_file_mode(path: &Path) -> u32 {
     0o100644
 }
 
-/// Fill a uniquely-named sibling of `dst`, then rename it over `dst`. A rename
-/// within one directory is atomic, so a reader sees the old file or the new
-/// one, never a half-written one.
 fn write_via_tmp(dst: &Path, fill: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {:?}: {}", parent, e))?;

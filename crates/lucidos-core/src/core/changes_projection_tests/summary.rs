@@ -29,7 +29,6 @@ async fn stored_summary(pool: &PgPool, change_id: Uuid) -> Option<String> {
         .summary
 }
 
-/// Emits one proposal on a fresh thread and returns the pieces a test needs.
 async fn proposed_change(description: &str) -> (PgPool, String, EventBus, Uuid, Uuid) {
     let (pool, db) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
@@ -58,8 +57,6 @@ async fn a_summary_of_the_current_commit_list_is_stored() {
     teardown_test_db(&db).await;
 }
 
-/// The race this guards: the model was still summarizing two commits when a
-/// third landed. Its late answer describes a list the change no longer has.
 #[tokio::test]
 async fn a_summary_of_an_older_commit_list_is_dropped() {
     let (pool, db, bus, thread, change_id) = proposed_change(TWO_COMMITS).await;
@@ -87,8 +84,6 @@ async fn a_new_commit_list_clears_the_summary() {
     teardown_test_db(&db).await;
 }
 
-/// An idle re-proposes the same commits on every turn end. That must not throw
-/// away a summary that still fits.
 #[tokio::test]
 async fn re_proposing_the_same_commit_list_keeps_the_summary() {
     let (pool, db, bus, thread, change_id) = proposed_change(TWO_COMMITS).await;

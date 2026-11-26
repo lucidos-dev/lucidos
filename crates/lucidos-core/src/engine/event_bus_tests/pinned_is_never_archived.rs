@@ -1,6 +1,3 @@
-//! A pinned thread is never archived (ADR 0312). Every path that archives or
-//! pins keeps the pair apart, and the table refuses it outright.
-
 use super::super::*;
 use super::*;
 
@@ -31,7 +28,6 @@ async fn emit_reply(bus: &EventBus, thread_id: Uuid) {
     .await;
 }
 
-/// `(archive_state, is_saved)` for one thread.
 async fn retention(pool: &PgPool, thread_id: Uuid) -> (String, bool) {
     sqlx::query_as("SELECT archive_state, is_saved FROM thread_summaries WHERE thread_id = $1")
         .bind(thread_id)
@@ -87,9 +83,6 @@ async fn archiving_a_pinned_thread_unpins_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// The automatic archive of an unattended trigger run skips a pinned thread.
-/// An unpinned run of the same shape still archives, which the first half
-/// shows before the pin.
 #[tokio::test]
 async fn an_unattended_trigger_run_never_archives_a_pinned_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -197,8 +190,6 @@ async fn the_table_refuses_a_pinned_archived_row() {
     teardown_test_db(&db_name).await;
 }
 
-/// The migration already ran on this database, so the test turns the
-/// constraint off, seeds the rows it repairs, and runs the same file again.
 #[tokio::test]
 async fn the_repair_keeps_the_pin_and_moves_the_thread_to_the_inbox() {
     let (pool, db_name) = setup_test_db().await;

@@ -1,22 +1,9 @@
-//! `lucidos proxy` — call backends configured in `data/config/apis.json`
-//! through the engine, so scripts never see credentials.
-//!
-//! curl-style ergonomics:
-//! - body to stdout, status discarded by default (exit 0 even on 4xx/5xx)
-//! - `--fail` mirrors `curl --fail`: nonzero exit on 4xx/5xx, suppress body
-//! - `--include` mirrors `curl -i`: prepend status line + headers to stdout
-//! - `-H` repeated for headers, `-X` for method, `-d` / stdin for body
-
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::http::{client_with_timeout, format_request_error, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
-/// How long `lucidos proxy` waits on the engine: the engine's 600 s cap on one
-/// proxied call, plus a margin. The engine owns the real limit, set by
-/// `proxy_timeout_secs` or an entry's `timeout_secs`, so this must never cut
-/// first. An engine test pins the number against the engine's cap.
 const CLIENT_WAIT_SECS: u64 = 660;
 
 #[derive(Debug, Clone)]
@@ -88,7 +75,7 @@ pub(crate) fn run(ws: &Workspace, args: ProxyArgs) -> Result<u8, BoxError> {
             status.as_u16(),
             status.canonical_reason().unwrap_or("")
         );
-        return Ok(22); // curl uses exit 22 for HTTP errors
+        return Ok(22);
     }
 
     out.write_all(&body)?;
@@ -109,10 +96,6 @@ fn read_body(source: &BodySource) -> Result<Option<Vec<u8>>, BoxError> {
     }
 }
 
-/// Build the engine URL: `<base>/api/v1/proxy/<name><path>`.
-/// Names are restricted to ASCII alphanumeric + `-` + `_` so they're safe
-/// to splice into a path segment without URL-encoding (the same charset that
-/// the JSON config file would realistically use).
 pub(crate) fn build_request_url(
     base_url: &str,
     name: &str,
@@ -156,7 +139,6 @@ fn parse_method(s: &str) -> Result<reqwest::Method, BoxError> {
         .map_err(|e| format!("Invalid HTTP method {:?}: {}", s, e).into())
 }
 
-/// Parse `-H "Foo: bar"` repeated arguments into header pairs.
 pub(crate) fn parse_headers(raw: &[String]) -> Result<Vec<(String, String)>, BoxError> {
     let mut out = Vec::with_capacity(raw.len());
     for entry in raw {

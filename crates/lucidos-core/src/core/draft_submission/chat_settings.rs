@@ -1,4 +1,4 @@
-//! Strict chat resolution for saved owner content. Ordinary routing tolerates
+//! INVARIANT: Strict chat resolution for saved owner content. Ordinary routing tolerates
 //! stale registry picks; accepting a saved draft must never silently replace one.
 
 use super::SavedDraftSnapshot;
@@ -8,9 +8,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 impl SavedDraftSnapshot {
-    /// Resolve a composing draft with `thread_id=None`, or an active thread
-    /// with its id so the same per-thread memory as the composer applies.
-    /// The submission service validates channel/destination before calling this.
     pub async fn resolve_chat_selection(
         &self,
         pool: &PgPool,
@@ -18,7 +15,7 @@ impl SavedDraftSnapshot {
         thread_id: Option<Uuid>,
         is_configured: impl Fn(ProviderKind) -> bool,
     ) -> Result<ResolvedModelSelection, Box<dyn std::error::Error + Send + Sync>> {
-        // Freeze the registry across default resolution and route validation.
+        // INVARIANT: Freeze the registry across default resolution and route validation.
         // A failed read must not become the ordinary router's prefix fallback.
         let registry = std::sync::Arc::new(std::sync::RwLock::new(
             defaults

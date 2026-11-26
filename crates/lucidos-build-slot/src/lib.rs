@@ -1,25 +1,3 @@
-//! *Build slot*: one of N permits to run a heavy build on this host.
-//!
-//! Every coding-agent worktree has its own `target/`, so N parallel `cargo`
-//! builds of `lucidos-engine` are N full compiles resident at once, which OOMs
-//! the machine. This crate is the shared pool that stops them piling up. Both
-//! the `lucidos build-slot` CLI verb and the engine's own rebuild use it.
-//!
-//! A slot is an `fs2` flock held by the process running the build, so the
-//! kernel releases it on death. A killed build therefore cannot wedge the
-//! pool, which is the property the ad-hoc `mkdir` lock this replaces lacked.
-//!
-//! Deliberately not a queue: whoever samples a freed slot first takes it.
-//! Arrival order is an explicit non-goal, because ticket state is exactly the
-//! stale state this design removes. The one exception is a *priority waiter*,
-//! the build a user is watching ([`SlotClass::Priority`]). While one waits,
-//! ordinary builds leave a freed slot to it (ADR 0304).
-//!
-//! A granted slot also SHAPES the build it admits, at a lower scheduling
-//! priority and with a share of the host's cores ([`BuildLimits`]). Counting
-//! builds alone is not enough: the count is derived from RAM, and three
-//! holders on one 18-core host ran three full-core clippy trees.
-
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -27,16 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Per-process escape hatch overriding the resolved slot count.
 pub const ENV_MAX_BUILDS: &str = "LUCIDOS_MAX_CONCURRENT_BUILDS";
 
-/// Exported into the wrapped child, marking its whole process tree as already
-/// holding a slot. A nested acquisition reads it and passes straight through,
-/// which is what stops `make test` deadlocking against `test-engine.sh`.
 pub const ENV_HELD: &str = "LUCIDOS_BUILD_SLOT_HELD";
 
-/// Socket supplied by a background task's watchdog. An open connection
-/// marks a build-slot wait for as long as the broker holds it.
 pub const ENV_WAIT_SOCKET: &str = "LUCIDOS_BUILD_SLOT_WAIT_SOCKET";
 
 #[cfg(unix)]
@@ -44,78 +16,45 @@ pub fn notify_background_wait() -> Option<std::os::unix::net::UnixStream> {
     std::os::unix::net::UnixStream::connect(std::env::var_os(ENV_WAIT_SOCKET)?).ok()
 }
 
-/// Nice increment a lease passes to each directly wrapped step.
 pub const ENV_LEASE_NICE: &str = "LUCIDOS_BUILD_SLOT_LEASE_NICE";
 
-/// Test seam: overrides the pool directory that would otherwise sit under
-/// `$HOME`. Tests must never touch the real machine-wide pool.
 pub const ENV_POOL_DIR: &str = "LUCIDOS_BUILD_SLOT_DIR";
 
-/// Overrides the nice increment a granted build runs at. `0` opts out, which
-/// is what a foreground build wants.
 pub const ENV_NICE: &str = "LUCIDOS_BUILD_SLOT_NICE";
 
-/// The build's scheduling class: ordinary, priority, or background.
 pub const ENV_CLASS: &str = "LUCIDOS_BUILD_SLOT_CLASS";
 
-/// Compatibility input from older engines. New spawns set only ENV_CLASS.
 pub const ENV_LEGACY_PRIORITY: &str = "LUCIDOS_BUILD_SLOT_PRIORITY";
 
-/// The cargo variable the core share is exported as. Read as well as written:
-/// a value the caller already set always wins.
 pub const ENV_CARGO_JOBS: &str = "CARGO_BUILD_JOBS";
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Nice increment applied to a granted build.
-///
-/// Ten is the conventional background value: a bare `nice <cmd>` means exactly
-/// this on macOS and on GNU coreutils. An idle host pays nothing, because nice
-/// only bites under contention. Every holder gets the same increment, so it
-/// never changes how two builds compete with each other. What it buys is a
-/// usable machine while they run.
 const DEFAULT_NICE: i32 = 10;
 
-/// Highest increment honoured. The kernel clamps above this anyway.
 const MAX_NICE: i32 = 19;
 
-/// Gibibytes budgeted for one heavy build, including headroom above measured peaks.
 const GIB_PER_BUILD: u64 = 12;
 
-/// Gibibytes reserved for the OS and standing services before sizing the pool.
 const GIB_HOST_RESERVE: u64 = 8;
 
-/// Ceiling on the derived count. Past this, cores rather than memory bind, and
-/// nobody wants sixteen concurrent rustc trees on one box.
 const MAX_DERIVED_CAPACITY: u64 = 8;
 
-/// Used when host RAM cannot be read. Deliberately not 1: a guard that cannot
-/// measure must degrade to cautious, not to serialising every build.
 const UNKNOWN_RAM_CAPACITY: usize = 2;
 
-/// Base interval between polls while waiting for a slot.
 const POLL_BASE: Duration = Duration::from_millis(250);
 
-/// Name of the machine-wide file holding the configured slot count.
 const CAPACITY_FILE: &str = "capacity";
 
-/// File waiters hold a shared lock on. See [`BuildSlotPool::anyone_waiting`].
 const WAITING_FILE: &str = "waiting.lock";
 
-/// File priority waiters hold a shared lock on. See
-/// [`BuildSlotPool::priority_waiting`].
 const PRIORITY_FILE: &str = "priority.lock";
 const BACKGROUND_FILE: &str = "background.lock";
 
-/// Who is asking for a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotClass {
-    /// Automatic repairs yield freed slots to chosen work.
     Background,
-    /// Chosen work: ordinary agent lint, tests, e2e and terminal builds.
     Ordinary,
-    /// The build a user is waiting on. Ordinary builds leave a freed slot to
-    /// it, and it runs un-niced unless told otherwise.
     Priority,
 }
 
@@ -128,7 +67,6 @@ impl SlotClass {
         }
     }
 
-    /// The class `as_str` names, or `None` for any other value.
     pub fn parse(raw: &str) -> Option<Self> {
         [Self::Ordinary, Self::Priority, Self::Background]
             .into_iter()
@@ -136,13 +74,11 @@ impl SlotClass {
     }
 }
 
-/// Unknown values keep the ordinary class.
 pub fn resolve_class(raw: Option<&str>) -> SlotClass {
     raw.and_then(SlotClass::parse)
         .unwrap_or(SlotClass::Ordinary)
 }
 
-/// Older engines can still ask for Apply priority when the new class is unset.
 pub fn resolve_class_with_legacy(raw: Option<&str>, legacy: Option<&str>) -> SlotClass {
     if raw.is_none() && legacy.map(str::trim) == Some("1") {
         SlotClass::Priority
@@ -151,17 +87,11 @@ pub fn resolve_class_with_legacy(raw: Option<&str>, legacy: Option<&str>) -> Slo
     }
 }
 
-/// Where a resolved slot count came from. Reported by status so a host whose
-/// participants disagree is visible rather than silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapacitySource {
-    /// `LUCIDOS_MAX_CONCURRENT_BUILDS` in this process's environment.
     EnvVar,
-    /// The machine-wide capacity file next to the pool.
     File,
-    /// Derived from host RAM.
     HostRam,
-    /// Host RAM could not be read.
     Fallback,
 }
 
@@ -176,20 +106,12 @@ impl CapacitySource {
     }
 }
 
-/// A resolved slot count and the source that supplied it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
     pub value: usize,
     pub source: CapacitySource,
 }
 
-/// Resolve the slot count from its three sources, in precedence order.
-///
-/// A value of zero would freeze every build on the host with no way back. So
-/// zero and unparseable input are both ignored rather than honoured. That
-/// differs from the Thread Queue's *capacity policy*, where 0 means "hold": a
-/// held queue is drained by raising the cap, but a frozen build slot would
-/// take the machine's own rebuild down with it.
 pub fn resolve_capacity(
     env_override: Option<&str>,
     file_contents: Option<&str>,
@@ -220,13 +142,11 @@ pub fn resolve_capacity(
     }
 }
 
-/// A positive slot count, or `None` for absent, blank, unparseable or zero.
 fn parse_capacity(raw: Option<&str>) -> Option<usize> {
     let n: usize = raw?.trim().parse().ok()?;
     (n >= 1).then_some(n)
 }
 
-/// RAM available to host build slots, bounded by the Linux cgroup limit.
 pub fn host_total_ram_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -306,7 +226,6 @@ fn mountinfo_path(path: &str) -> String {
         .replace("\\134", "\\")
 }
 
-/// `MemTotal:  16316108 kB` from `/proc/meminfo`, as bytes.
 #[cfg(any(target_os = "linux", test))]
 fn parse_meminfo_total(text: &str) -> Option<u64> {
     let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
@@ -314,8 +233,6 @@ fn parse_meminfo_total(text: &str) -> Option<u64> {
     Some(kb * 1024)
 }
 
-/// The slot this process holds, when it is already inside a wrapped build.
-/// `Some` means a nested acquisition must pass straight through.
 pub fn inherited_slot() -> Option<String> {
     std::env::var(ENV_HELD)
         .ok()
@@ -323,33 +240,18 @@ pub fn inherited_slot() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// What the broker imposes on a build it has just granted a slot to.
-///
-/// Both halves reach the whole compile tree from one act at the broker. A nice
-/// value survives fork and exec, and the job count is an environment variable
-/// every `cargo` under it reads.
-///
-/// A non-root process cannot lower a nice increment again, so the broker
-/// applies it once. A lease delegates this to each directly wrapped step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildLimits {
-    /// Nice increment for the process that spawns the build. `0` leaves the
-    /// priority alone.
     pub nice: i32,
-    /// Cores to allow the build, exported as [`ENV_CARGO_JOBS`]. `None` means
-    /// export nothing, because the caller set it or the host would not say.
     pub jobs: Option<usize>,
 }
 
 impl BuildLimits {
-    /// Impose nothing when there is no grant or the limits already apply.
     pub const NONE: Self = Self {
         nice: 0,
         jobs: None,
     };
 
-    /// A lease already exported the job count, but has yet to nice this step.
-    /// An ordinary nested wrapper inherits both limits from its parent.
     pub fn nested(lease_nice: Option<&str>) -> Self {
         let nice = lease_nice
             .and_then(|raw| raw.parse::<i32>().ok())
@@ -359,13 +261,6 @@ impl BuildLimits {
     }
 }
 
-/// The nice increment for a granted build, from [`ENV_NICE`] or the class
-/// default: [`DEFAULT_NICE`] for an ordinary build, none for a priority one.
-///
-/// Junk falls back rather than failing: a limiter that cannot read its own
-/// setting must still let the build run. A negative value resolves to zero,
-/// because raising a build's priority needs privilege we do not have and is
-/// not what this exists for.
 pub fn resolve_nice(raw: Option<&str>, class: SlotClass) -> i32 {
     let default = match class {
         SlotClass::Ordinary => DEFAULT_NICE,
@@ -380,46 +275,27 @@ pub fn resolve_nice(raw: Option<&str>, class: SlotClass) -> i32 {
         .unwrap_or(default)
 }
 
-/// Cores this build may use, given how many slots are held right now.
-///
-/// `holders` counts this build's own slot, so a solo build divides by one and
-/// keeps the whole host. The common case must not pay for contention that is
-/// not happening. At full contention every holder sits at the guaranteed
-/// `ncpu / capacity`, and 1 is the floor under that, for a host with fewer
-/// cores than slots.
 pub fn cpu_share(ncpu: usize, holders: usize, capacity: usize) -> usize {
     let guaranteed = (ncpu / capacity.max(1)).max(1);
     let allocated = ncpu / holders.max(1);
     allocated.max(guaranteed)
 }
 
-/// Cores this host reports, or `None` when it will not say.
-///
-/// `None` is not a failure to report. The broker exports no job count, and the
-/// build runs at cargo's own default, as it did before a slot governed cores.
 pub fn host_ncpu() -> Option<usize> {
     std::thread::available_parallelism().ok().map(|n| n.get())
 }
 
-/// The machine-wide pool of build slots.
 pub struct BuildSlotPool {
     dir: PathBuf,
     capacity: Capacity,
 }
 
 impl BuildSlotPool {
-    /// Open the pool for this host, creating its directory if needed.
-    ///
-    /// Every caller treats an `Err` as fail-open and runs the build
-    /// unrestricted: a limiter that cannot open its own pool must never be the
-    /// reason a build does not happen.
     pub fn open() -> Result<Self, BoxError> {
         let dir = default_pool_dir()?;
         Self::open_at(dir)
     }
 
-    /// Open a pool rooted at an explicit directory. Used by tests and by the
-    /// [`ENV_POOL_DIR`] seam.
     pub fn open_at(dir: PathBuf) -> Result<Self, BoxError> {
         std::fs::create_dir_all(&dir)?;
         let file_contents = std::fs::read_to_string(dir.join(CAPACITY_FILE)).ok();
@@ -431,9 +307,6 @@ impl BuildSlotPool {
         Ok(Self { dir, capacity })
     }
 
-    /// Open a pool with an explicit count, consulting no environment and no
-    /// capacity file. Tests use it so two of them can hold different-sized
-    /// pools at once without racing over one process-wide variable.
     pub fn with_capacity(dir: PathBuf, value: usize) -> Result<Self, BoxError> {
         std::fs::create_dir_all(&dir)?;
         Ok(Self {
@@ -453,8 +326,6 @@ impl BuildSlotPool {
         &self.dir
     }
 
-    /// Write the machine-wide capacity file. Rejects zero for the reason
-    /// [`resolve_capacity`] documents.
     pub fn set_capacity(&self, value: usize) -> Result<(), BoxError> {
         if value < 1 {
             return Err("a build-slot capacity of 0 would freeze every build on this host".into());
@@ -467,14 +338,10 @@ impl BuildSlotPool {
         self.dir.join(format!("slot-{index}.lock"))
     }
 
-    /// Take the first free slot as an ordinary build, or `None` when all are
-    /// held or a priority build is waiting for the next one.
     pub fn try_acquire(&self, label: &str) -> Option<BuildSlotGuard> {
         self.try_acquire_as(label, SlotClass::Ordinary)
     }
 
-    /// Take the first free slot for a build of `class`. An ordinary build
-    /// yields to a waiting priority build. Nothing raises the slot count.
     pub fn try_acquire_as(&self, label: &str, class: SlotClass) -> Option<BuildSlotGuard> {
         let _background_turn = if class == SlotClass::Background {
             match self.flag_turn(WAITING_FILE) {
@@ -484,7 +351,6 @@ impl BuildSlotPool {
         } else {
             None
         };
-        // Held until the slot walk ends, so the check and the take are one step.
         let _turn = match class {
             SlotClass::Priority => None,
             SlotClass::Ordinary | SlotClass::Background => match self.ordinary_turn() {
@@ -510,13 +376,6 @@ impl BuildSlotPool {
         Some(guard)
     }
 
-    /// Block until a slot frees, calling `on_wait` once per poll so the caller
-    /// can report progress. Returns `None` only when `max_wait` elapsed.
-    ///
-    /// The waiting flag is raised BEFORE the first `on_wait`. That is what
-    /// lets a caller announce contention from inside the callback and still
-    /// be seen by a holder releasing at that moment. A priority build raises
-    /// the priority flag at the same point, and drops it with the wait.
     pub fn acquire(
         &self,
         label: &str,
@@ -527,8 +386,6 @@ impl BuildSlotPool {
         if let Some(guard) = self.try_acquire_as(label, class) {
             return Some(guard);
         }
-        // Announce that somebody is queued behind the pool, so a releasing
-        // holder knows to emit rather than staying silent on the fast path.
         let _waiting = match class {
             SlotClass::Background => self.mark_background_waiting(),
             SlotClass::Ordinary | SlotClass::Priority => self.mark_waiting(),
@@ -551,36 +408,21 @@ impl BuildSlotPool {
         }
     }
 
-    /// Poll interval, jittered per process so waiters released together do not
-    /// resample in lockstep and thrash the same slot file.
     fn poll_interval(&self) -> Duration {
         let jitter = u64::from(std::process::id() % 100);
         POLL_BASE + Duration::from_millis(jitter)
     }
 
-    /// Take a shared lock on the waiting file for as long as this process is
-    /// queued. Reports "somebody is blocked right now" to `--status`.
-    ///
-    /// Deliberately NOT what gates the release announcement. A waiter that hit
-    /// `--max-wait` has exited and taken its flag with it. Gating on this would
-    /// go silent for exactly the subscriber that needs waking.
     pub fn mark_waiting(&self) -> Option<WaitingFlag> {
         let file = self.open_flag_file(WAITING_FILE)?;
         fs2::FileExt::lock_shared(&file).ok()?;
         Some(WaitingFlag { file })
     }
 
-    /// Is somebody blocked on this pool right now?
-    ///
-    /// Answered by trying to take the waiting file exclusively: success means
-    /// no waiter holds it. A probe that cannot run answers `true`, so the
-    /// failure direction is a redundant announcement rather than a waiter left
-    /// asleep.
     pub fn anyone_waiting(&self) -> bool {
         self.try_anyone_waiting().unwrap_or(true)
     }
 
-    /// Admission can fail open on unreadable state without hiding it from builds.
     pub fn try_anyone_waiting(&self) -> Result<bool, BoxError> {
         Ok(self.flag_waiting(WAITING_FILE)? || self.flag_waiting(BACKGROUND_FILE)?)
     }
@@ -599,43 +441,22 @@ impl BuildSlotPool {
         }
     }
 
-    /// Take a shared lock on the priority file for as long as a priority build
-    /// waits. Shared, so two priority builds can wait at once. The kernel drops
-    /// it on death, so no priority claim can outlive its waiter.
-    ///
-    /// Blocking, like [`mark_waiting`](Self::mark_waiting). The only thing
-    /// that can hold the file exclusively is an [`ordinary_turn`], which lasts
-    /// one slot walk. A non-blocking try would lose the flag for the whole wait.
-    ///
-    /// [`ordinary_turn`]: Self::ordinary_turn
     pub fn mark_priority_waiting(&self) -> Option<WaitingFlag> {
         let file = self.open_flag_file(PRIORITY_FILE)?;
         fs2::FileExt::lock_shared(&file).ok()?;
         Some(WaitingFlag { file })
     }
 
-    /// Background waiters announce separately, so they never block themselves.
     pub fn mark_background_waiting(&self) -> Option<WaitingFlag> {
         let file = self.open_flag_file(BACKGROUND_FILE)?;
         fs2::FileExt::lock_shared(&file).ok()?;
         Some(WaitingFlag { file })
     }
 
-    /// Is a priority build waiting for a slot right now?
     pub fn priority_waiting(&self) -> bool {
         matches!(self.ordinary_turn(), OrdinaryTurn::Yield)
     }
 
-    /// May an ordinary build try the slots now?
-    ///
-    /// `Open` carries the priority file locked exclusively, and the caller
-    /// holds it across its slot walk, so no priority waiter arrives mid-walk.
-    /// Two ordinary builds checking at the same instant see each other's
-    /// lock and one yields for a poll, which is harmless.
-    ///
-    /// Fails OPEN, unlike [`anyone_waiting`](Self::anyone_waiting): a file that
-    /// cannot be opened means nobody waits. The other direction would stall
-    /// every ordinary build on the host behind a broken file.
     fn ordinary_turn(&self) -> OrdinaryTurn {
         self.flag_turn(PRIORITY_FILE)
     }
@@ -660,10 +481,6 @@ impl BuildSlotPool {
             .ok()
     }
 
-    /// Current occupancy, one entry per slot.
-    ///
-    /// Probing takes no slot: each file is try-locked and immediately
-    /// released, so asking why a build is waiting never makes it wait longer.
     pub fn status(&self) -> Vec<SlotState> {
         (0..self.capacity.value)
             .map(|index| SlotState {
@@ -673,34 +490,14 @@ impl BuildSlotPool {
             .collect()
     }
 
-    /// How many entries of a status snapshot are occupied.
     pub fn count_held(states: &[SlotState]) -> usize {
         states.iter().filter(|s| s.holder.is_some()).count()
     }
 
-    /// Slots held right now, this process's own included.
-    ///
-    /// Reuses the [`status`](Self::status) walk rather than adding a second
-    /// one, so asking how busy the host is still takes no slot. Our own lock
-    /// counts because the probe opens its own descriptor, and `flock` denies
-    /// that one even to the process already holding the file.
     pub fn held_slots(&self) -> usize {
         Self::count_held(&self.status())
     }
 
-    /// What to impose on the build this slot was just granted to.
-    ///
-    /// Call it AFTER taking the slot, because the share counts this holder and
-    /// the walk has to see our own lock. Counting at that point also narrows
-    /// the race two simultaneous acquirers run: each already holds a distinct
-    /// slot, so only the window before the other's lock lands is open. A build
-    /// keeps the allocation it took, and nothing rebalances it.
-    ///
-    /// `caller_jobs` is whatever [`ENV_CARGO_JOBS`] already held. An explicit
-    /// value always wins and the broker exports nothing: `scripts/lib/e2e.sh`
-    /// caps its release build at half the cores, and that number is the
-    /// caller's to choose. Blank is not a value, which is how that script
-    /// reads it too.
     pub fn granted_limits(
         &self,
         ncpu: Option<usize>,
@@ -722,7 +519,6 @@ impl BuildSlotPool {
 
     fn probe_holder(&self, index: usize) -> Option<SlotHolder> {
         let path = self.slot_path(index);
-        // No file yet means the slot has never been taken.
         let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&path) else {
             return None;
         };
@@ -736,7 +532,6 @@ impl BuildSlotPool {
     }
 }
 
-/// A held build slot. Dropping it frees the slot, and so does process death.
 pub struct BuildSlotGuard {
     index: usize,
     file: File,
@@ -747,8 +542,6 @@ impl BuildSlotGuard {
         self.index
     }
 
-    /// Record who holds this slot, for `status` to read back. Best effort: the
-    /// slot is already held, and unreadable metadata must not fail a build.
     fn write_metadata(&mut self, label: &str) {
         let started = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -777,15 +570,11 @@ impl Drop for BuildSlotGuard {
     }
 }
 
-/// The answer to [`BuildSlotPool::ordinary_turn`].
 enum OrdinaryTurn {
-    /// Go ahead, holding this (when the file opened) until the attempt ends.
     Open(Option<File>),
-    /// A priority build is waiting: leave the next slot to it.
     Yield,
 }
 
-/// Evidence that this process is queued for a slot. Held for the wait only.
 pub struct WaitingFlag {
     file: File,
 }
@@ -796,14 +585,12 @@ impl Drop for WaitingFlag {
     }
 }
 
-/// One slot's occupancy at probe time.
 #[derive(Debug, Clone)]
 pub struct SlotState {
     pub index: usize,
     pub holder: Option<SlotHolder>,
 }
 
-/// Who holds a slot, as recorded by the holder itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlotHolder {
     pub pid: Option<u32>,
@@ -813,9 +600,6 @@ pub struct SlotHolder {
 }
 
 impl SlotHolder {
-    /// Parse the `KEY=value` metadata block. An unknown key is ignored and a
-    /// missing one leaves its field empty. A slot taken by an older build
-    /// therefore still reports whatever it did write.
     pub fn parse(raw: &str) -> Self {
         let mut out = Self::default();
         for line in raw.lines() {
@@ -833,7 +617,6 @@ impl SlotHolder {
         out
     }
 
-    /// Seconds this slot has been held, when the holder recorded a start.
     pub fn held_secs(&self) -> Option<u64> {
         let started = self.started_epoch?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -841,12 +624,6 @@ impl SlotHolder {
     }
 }
 
-/// `$LUCIDOS_BUILD_SLOT_DIR`, else `$HOME/.lucidos/build-slots`. The second
-/// asserts the Lucidos home as a storage root first.
-///
-/// Machine-wide on purpose: host RAM is machine-wide, several workspaces run
-/// at once by design, and an external-repo agent session builds outside every
-/// Lucidos checkout.
 pub fn default_pool_dir() -> Result<PathBuf, BoxError> {
     if let Ok(dir) = std::env::var(ENV_POOL_DIR) {
         let trimmed = dir.trim();

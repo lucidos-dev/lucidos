@@ -282,6 +282,13 @@ finish it. Two ways out:
   `https://mymac.tailnet-name.ts.net/<slug>/`. Settings → Access prints exactly
   that under **Other addresses** (a fold under Pair a device), with a Copy
   button, so point the user there.
+- **A proxy in front of the gateway may cap request bodies.** Cloudflare caps
+  them at 100 MB, and nginx defaults to 1 MiB (`client_max_body_size`).
+  **Restore from backup** passes any cap down to 512 KiB: the *restore upload*
+  sends chunks of at most 32 MiB, halves one the proxy refuses with 413, and
+  resumes from the gateway's offset. A chat attachment or a file upload still
+  travels as one request. Above the cap it fails with "larger than this
+  connection to Lucidos accepts (HTTP 413)". Raise the cap on the proxy for those.
 
 ## Quick triage
 

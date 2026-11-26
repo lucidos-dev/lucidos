@@ -49,6 +49,8 @@ paths:
   - "scripts/dev-prerequisites.sh"
   - "scripts/lib/dev_prerequisites*.sh"
   - "scripts/lib/build_prerequisites*.sh"
+  - "scripts/measure-app.sh"
+  - "scripts/lib/lab_slot.sh"
   - "scripts/measure-engine-build.sh"
   - "scripts/lib/measure_probe*.sh"
   - "scripts/engine-module-graph.py"

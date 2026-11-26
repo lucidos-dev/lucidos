@@ -1,30 +1,17 @@
-//! The *hold*, and the one reader that answers "may Lucidos start a turn
-//! here by itself?".
-//!
-//! A hold lives only in events: the last of `ThreadHoldPlaced`,
-//! `ThreadHoldLifted` and the retired `AutomationPaused` / `AutomationUnpaused`
-//! on the thread wins. A retired pause folds as a hold rooted on its own
-//! thread, whose id is the pause event's id.
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::engine::thread_events::MessageOrigin;
 
-/// A hold standing on a thread.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadHold {
     pub reason: String,
-    /// Shared by every thread one Hold reached.
     pub hold_id: Uuid,
-    /// The thread the Hold was placed on.
     pub root_thread_id: Uuid,
-    /// The sequence of the event that placed it on this thread.
     pub placed_sequence: i64,
     pub placed_by: Option<MessageOrigin>,
 }
 
-/// The four event types the hold folds from, newest wins.
 pub const HOLD_EVENT_TYPES: [&str; 4] = [
     "ThreadHoldPlaced",
     "ThreadHoldLifted",
@@ -32,19 +19,15 @@ pub const HOLD_EVENT_TYPES: [&str; 4] = [
     "AutomationUnpaused",
 ];
 
-/// The hold as the drawer and the composer strip read it, from
-/// `thread_summaries.hold`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadHoldSummary {
     pub reason: String,
-    /// The thread the Hold was placed on. Only that thread offers Resume.
     pub root_thread_id: String,
     pub placed_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placed_by: Option<MessageOrigin>,
 }
 
-/// The hold standing on `thread_id`, if any.
 pub async fn thread_hold<'e>(
     pool: impl sqlx::PgExecutor<'e>,
     thread_id: Uuid,
@@ -89,19 +72,13 @@ pub async fn thread_hold<'e>(
     }))
 }
 
-/// What keeps Lucidos from starting a turn on a thread by itself.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnHold {
-    /// The owner's Stop (ADR 0696).
     Stop,
-    /// A card is open on the thread, and no turn starts until it closes
-    /// (ADR 0803). Its close releases the wakes it held.
     OpenCard { card_id: String },
-    /// The thread is on hold until Resume.
     Hold(Box<ThreadHold>),
 }
 
-/// The hold that takes precedence on `thread_id`, if any.
 pub async fn turn_hold(pool: &PgPool, thread_id: Uuid) -> Result<Option<TurnHold>, sqlx::Error> {
     let mut connection = pool.acquire().await?;
     if super::thread_stop::stopped_before(&mut connection, thread_id, i64::MAX).await? {
@@ -117,10 +94,6 @@ pub async fn turn_hold(pool: &PgPool, thread_id: Uuid) -> Result<Option<TurnHold
         .map(|hold| TurnHold::Hold(Box::new(hold))))
 }
 
-/// Whether Lucidos may start a turn on `thread_id` by itself: a report
-/// wake, an event-wait delivery, a turn-end nudge, a handoff, a standing
-/// apply or a boot recovery. An unreadable state holds: a delayed wake is
-/// recoverable, an unwanted turn is not.
 pub async fn may_start_turn(pool: &PgPool, thread_id: Uuid) -> bool {
     match turn_hold(pool, thread_id).await {
         Ok(hold) => hold.is_none(),
@@ -131,7 +104,6 @@ pub async fn may_start_turn(pool: &PgPool, thread_id: Uuid) -> bool {
     }
 }
 
-/// Whether `thread_id` is on hold. An unreadable state counts as held.
 pub async fn thread_is_held(pool: &PgPool, thread_id: Uuid) -> bool {
     match thread_hold(pool, thread_id).await {
         Ok(hold) => hold.is_some(),

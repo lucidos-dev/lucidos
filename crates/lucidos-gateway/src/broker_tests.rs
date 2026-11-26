@@ -509,7 +509,6 @@ async fn delete_failure_after_the_stop_boundary_is_not_marked_unchanged() {
     let mut ws = workspace("fixture", WorkspaceOrigin::Demo);
     let dir = temp.path().join("fixture");
     std::fs::create_dir(&dir).unwrap();
-    // Fail the owner-lock open after the stop boundary, before database work.
     std::fs::write(dir.join(".lucidos"), "fixture obstruction").unwrap();
     ws.dir = dir.to_string_lossy().into_owned();
     state.register_for_test(ws);
@@ -531,8 +530,6 @@ async fn delete_failure_after_the_stop_boundary_is_not_marked_unchanged() {
 async fn registry_write_failure_after_a_rename_is_not_marked_unchanged() {
     let (_temp, state) = state();
     state.register_for_test(workspace("fixture", WorkspaceOrigin::Demo));
-    // Replacing the registry destination with a directory forces save to fail,
-    // after rename has changed the in-memory registration.
     let registry = state.app_data().join("workspaces.json");
     if registry.exists() {
         std::fs::remove_file(&registry).unwrap();

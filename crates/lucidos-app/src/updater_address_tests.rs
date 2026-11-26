@@ -1,6 +1,3 @@
-//! The update address in the packaged updater: how a check resolves it, and
-//! proof that an address never changes which key verifies the bundle.
-
 use super::*;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
@@ -25,8 +22,6 @@ fn refusal(status: Option<&str>) -> String {
         Ok(source) => panic!("expected the check to stop, got {source:?}"),
     }
 }
-
-// ── Resolving the address ────────────────────────────────────────────────────
 
 #[test]
 fn an_unset_address_checks_the_published_release() {
@@ -81,10 +76,6 @@ fn a_silent_or_garbled_gateway_stops_the_check() {
     assert!(refusal(Some(&body)).contains("update_address 7"));
 }
 
-// ── The configuration the address sits beside ────────────────────────────────
-
-/// Loopback http needs the plugin's insecure-transport switch. That switch
-/// must never let the published endpoints drop to plain http.
 #[test]
 fn every_configured_endpoint_is_https_and_passes_the_address_rule() {
     let conf = tauri_conf();
@@ -100,8 +91,6 @@ fn every_configured_endpoint_is_https_and_passes_the_address_rule() {
     }
 }
 
-/// The key is baked into `tauri.conf.json`. Overriding it in code would let
-/// an update address bring its own key.
 #[test]
 fn no_shipped_source_overrides_the_updater_key() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -127,11 +116,6 @@ fn no_shipped_source_overrides_the_updater_key() {
     }
 }
 
-// ── The key verifies the bundle, whatever the address ────────────────────────
-
-/// Serves the fixture `latest.json` and bundle on loopback until the test
-/// process ends. The manifest names the bundle at `bundle_host`. Returns the
-/// `latest.json` address.
 fn serve_fixture(bundle_host: &str) -> UpdateAddress {
     serve_fixture_version(bundle_host, "99.0.0")
 }
@@ -140,8 +124,6 @@ fn serve_fixture_version(bundle_host: &str, version: &str) -> UpdateAddress {
     serve_channel_fixture(bundle_host, version, None, None).0
 }
 
-/// Each observed request includes its headers, so Local proves authentication
-/// on both HTTP hops. Redirects can be injected on either hop.
 fn serve_channel_fixture(
     bundle_host: &str,
     version: &str,
@@ -248,7 +230,6 @@ fn a_channel_error_stops_the_check_without_falling_back_to_stable() {
 #[test]
 fn a_correctly_signed_downgrade_is_refused_against_the_baked_release() {
     let app = mock_app(Some(FIXTURE_PUBKEY.trim()));
-    // Above the crate's 0.1.0, below every shipped Lucidos release.
     let source = UpdateSource::Address(serve_fixture_version("127.0.0.1", "0.2.0"));
     let updater = updater_for(app.handle(), &source).unwrap();
     let result = tauri::async_runtime::block_on(check_offer(&updater));
@@ -260,8 +241,6 @@ fn a_correctly_signed_downgrade_is_refused_against_the_baked_release() {
     }
 }
 
-/// A mock app whose updater config is the production one, key included.
-/// `pubkey` swaps the key for the positive control only.
 fn mock_app(pubkey: Option<&str>) -> tauri::App<MockRuntime> {
     mock_app_at(pubkey, None)
 }
@@ -287,8 +266,6 @@ fn mock_app_at(pubkey: Option<&str>, endpoint: Option<&UpdateAddress>) -> tauri:
         .expect("mock app")
 }
 
-/// The Local channel trusts the machine's loopback CA, which a test host may
-/// not have, so the fixture hands it a throwaway certificate.
 fn fixture_updater<R: Runtime>(
     app: &AppHandle<R>,
     source: &UpdateSource,
@@ -428,7 +405,6 @@ fn malformed_channels_never_fall_back_or_receive_local_credentials() {
     }
 }
 
-/// Check and download through the production `updater_for`.
 fn fetch_through_the_address(
     app: &tauri::App<MockRuntime>,
     bundle_host: &str,
@@ -453,8 +429,6 @@ fn a_bundle_signed_by_another_key_is_refused_under_an_address() {
     assert!(err.to_lowercase().contains("signature"), "{err}");
 }
 
-/// The control: the same fixture verifies once its own key is configured,
-/// so the refusal above is the key and not a broken fixture or server.
 #[test]
 fn the_same_bundle_verifies_under_its_own_key() {
     let bytes = fetch_through_the_address(&mock_app(Some(FIXTURE_PUBKEY.trim())), "127.0.0.1")
@@ -462,9 +436,6 @@ fn the_same_bundle_verifies_under_its_own_key() {
     assert_eq!(bytes, FIXTURE_BUNDLE);
 }
 
-/// The insecure-transport switch is for a loopback address. An offer whose
-/// bundle would come over plain http from another host is refused before
-/// any download.
 #[test]
 fn an_offer_naming_a_plain_http_bundle_elsewhere_is_refused() {
     let err = fetch_through_the_address(&mock_app(Some(FIXTURE_PUBKEY.trim())), "example.com")

@@ -1,12 +1,3 @@
-//! The stored sign-in as a [`GatewayAccess`]: it presents the token only
-//! to the gateway that issued it, refreshes it before it expires, and reads
-//! that gateway's managed settings.
-//!
-//! The refresh is the gateway's own, not `core::oauth::refresh_oauth_if_needed`.
-//! That one reads a stored OAuth client with a `client_id` and a fixed
-//! `token_url`. The gateway is a public client with no `client_id`, and its
-//! token endpoint comes from discovery.
-
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -21,26 +12,22 @@ use crate::engine::event_bus::EventBus;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A token this close to its expiry is refreshed first.
 const REFRESH_MARGIN_SECS: i64 = 60;
 
-/// The gateway access behind the gateway provider.
 pub struct StoredGatewayAccess {
     pool: PgPool,
     event_bus: EventBus,
     origin: GatewayOrigin,
-    /// Serialises refreshes. A gateway may rotate the refresh token, so two
+    /// INVARIANT: Serialises refreshes. A gateway may rotate the refresh token, so two
     /// turns refreshing at once would leave one holding a spent token. Every
     /// source the engine builds shares one, since a provider rebuild makes a
     /// new source while turns on the old one still run.
     refresh_lock: Arc<RefreshLock>,
 }
 
-/// The lock every [`StoredGatewayAccess`] of one engine shares.
 pub type RefreshLock = tokio::sync::Mutex<()>;
 
 impl StoredGatewayAccess {
-    /// A source for the gateway at `origin`, the configured gateway URL.
     pub fn new(
         pool: PgPool,
         event_bus: EventBus,
@@ -55,8 +42,6 @@ impl StoredGatewayAccess {
         }
     }
 
-    /// The stored sign-in, if `origin` issued it. A sign-in to any other
-    /// gateway is refused, so its token never reaches this one.
     async fn account_for_origin(&self) -> Result<ClaudeGatewayAccount, BoxError> {
         let account = ClaudeGatewayAccountStore::get(&self.pool)
             .await
@@ -131,8 +116,6 @@ impl StoredGatewayAccess {
         Err(sign_in_again())
     }
 
-    /// Forget the sign-in holding `rejected`, so Settings says to sign in
-    /// again. A failure to forget still leaves the turn's own error.
     async fn forget(&self, rejected: RejectedToken<'_>) {
         if let Err(e) =
             ClaudeGatewayAccountStore::forget_rejected(&self.pool, &self.event_bus, rejected).await
@@ -153,7 +136,7 @@ impl GatewayAccess for StoredGatewayAccess {
             return Ok(account.access_token);
         }
         let _refreshing = self.refresh_lock.lock().await;
-        // Another turn may have refreshed while this one waited.
+        // INVARIANT: Another turn may have refreshed while this one waited.
         let account = self.account_for_origin().await?;
         if !expiring(&account) {
             return Ok(account.access_token);
@@ -168,7 +151,7 @@ impl GatewayAccess for StoredGatewayAccess {
     async fn renew_rejected(&self, rejected: &str) -> Result<String, BoxError> {
         let _refreshing = self.refresh_lock.lock().await;
         let account = self.account_for_origin().await?;
-        // Another turn may have renewed it while this one waited.
+        // INVARIANT: Another turn may have renewed it while this one waited.
         if account.access_token != rejected {
             return Ok(account.access_token);
         }
@@ -180,8 +163,6 @@ impl GatewayAccess for StoredGatewayAccess {
     }
 }
 
-/// Whether the token expires within the margin. A token with no stated expiry
-/// is taken as valid until the gateway answers `401`, which renews it.
 fn expiring(account: &ClaudeGatewayAccount) -> bool {
     account.token_expiry.is_some_and(|expiry| {
         expiry < chrono::Utc::now() + chrono::Duration::seconds(REFRESH_MARGIN_SECS)
@@ -296,8 +277,6 @@ mod tests {
         f.done().await;
     }
 
-    /// A token is never presented to a gateway other than its issuer, even
-    /// before it expires.
     #[tokio::test]
     async fn a_sign_in_to_another_gateway_is_refused() {
         let f = Fixture::new().await;
@@ -312,8 +291,6 @@ mod tests {
         f.done().await;
     }
 
-    /// An expired token refreshes once before the call, and the rotated
-    /// refresh token is stored.
     #[tokio::test]
     async fn an_expired_token_refreshes_before_the_call() {
         let f = Fixture::new().await;
@@ -348,8 +325,6 @@ mod tests {
         f.done().await;
     }
 
-    /// Both tokens are sealed at rest, after a sign-in and after a refresh
-    /// rewrites them (ADR 0509).
     #[tokio::test]
     async fn the_stored_tokens_are_sealed() {
         let f = Fixture::new().await;
@@ -377,8 +352,6 @@ mod tests {
         f.done().await;
     }
 
-    /// Two turns needing a refresh at once spend the refresh token once,
-    /// even on two sources: a provider rebuild makes a new one mid-turn.
     #[tokio::test]
     async fn concurrent_calls_refresh_once() {
         let f = Fixture::new().await;
@@ -407,8 +380,6 @@ mod tests {
         f.done().await;
     }
 
-    /// A rejected refresh token ends the sign-in and says to sign in again,
-    /// rather than failing silently or falling back.
     #[tokio::test]
     async fn invalid_grant_signs_out_and_says_sign_in_again() {
         let f = Fixture::new().await;
@@ -455,8 +426,6 @@ mod tests {
         f.done().await;
     }
 
-    /// The refresh rejected the OLD token. A sign-in made since holds a new
-    /// one, and survives.
     #[tokio::test]
     async fn forgetting_a_rejected_token_keeps_a_newer_sign_in() {
         let f = Fixture::new().await;
@@ -478,7 +447,6 @@ mod tests {
         f.done().await;
     }
 
-    /// A token the gateway ended early refreshes, even before its expiry.
     #[tokio::test]
     async fn a_rejected_token_renews() {
         let f = Fixture::new().await;
@@ -499,8 +467,6 @@ mod tests {
         f.done().await;
     }
 
-    /// A rejected token with nothing to renew it ends the sign-in, so
-    /// Settings says to sign in again rather than "signed in".
     #[tokio::test]
     async fn a_rejected_token_with_no_refresh_token_signs_out() {
         let f = Fixture::new().await;
@@ -518,8 +484,6 @@ mod tests {
         f.done().await;
     }
 
-    /// A refresh that spent the old refresh token stores nothing over a
-    /// sign-in made since.
     #[tokio::test]
     async fn a_refresh_never_overwrites_a_newer_sign_in() {
         let f = Fixture::new().await;
@@ -543,8 +507,6 @@ mod tests {
         f.done().await;
     }
 
-    /// A sign-in and a sign-out announce once each, carrying no token. A
-    /// repeated sign-out announces nothing.
     #[tokio::test]
     async fn sign_in_and_sign_out_announce_without_tokens() {
         let f = Fixture::new().await;
@@ -593,8 +555,6 @@ mod tests {
         f.done().await;
     }
 
-    /// A sign-out revokes both tokens at the issuer after forgetting them. A
-    /// rejected sign-in holds nothing worth revoking.
     #[tokio::test]
     async fn a_sign_out_revokes_and_a_rejection_does_not() {
         let f = Fixture::new().await;
@@ -632,9 +592,6 @@ mod tests {
         f.done().await;
     }
 
-    /// The gateway token lives apart from `oauth_accounts`. So no reader of
-    /// that table can hand it out: script env vars, `http_request`, the app
-    /// proxy and the access-token endpoint all read only there.
     #[tokio::test]
     async fn no_generic_oauth_reader_sees_the_gateway_token() {
         let f = Fixture::new().await;
@@ -673,8 +630,6 @@ mod tests {
         assert!(!shown.contains("secret"), "{shown}");
     }
 
-    /// A sign-in stored with no email reports the one its access token names,
-    /// and a stored email still wins.
     #[test]
     fn the_reported_account_falls_back_to_the_access_token_email() {
         use crate::llm::claude_gateway::account::ClaudeGatewayAccountInfo;

@@ -1,13 +1,3 @@
-//! Populate a workspace with 2 years of simulated history for testing
-//!
-//! This populates:
-//! - PostgreSQL event store (persistent event log) with backdated timestamps
-//! - Memory index (vector search) with backdated timestamps
-//! - Notifications (scheduler results) with backdated timestamps
-//! - Sample artifacts on disk
-//!
-//! Usage: cargo run -p lucidos-engine-bin --bin populate_memory [workspace_path]
-
 use chrono::{Duration, Utc};
 use lucidos_engine::log_legacy;
 use lucidos_engine::memory::{EmbeddingProvider, FastEmbedProvider, MemorySource, PgVectorIndex};
@@ -17,7 +7,6 @@ use sqlx::FromRow;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-// Large variety of content for unique test data generation
 const PROJECTS: &[&str] = &[
     "Website Redesign",
     "Q1 Sales Analysis",
@@ -275,7 +264,6 @@ const MODULES: &[&str] = &[
     "user management",
 ];
 
-/// Generate a unique user message based on day and index
 fn generate_user_message(day: i64, idx: i64, project: &str) -> String {
     let seed = ((day * 7 + idx * 13) as usize).wrapping_mul(31);
     let person = PEOPLE[seed % PEOPLE.len()];
@@ -283,7 +271,6 @@ fn generate_user_message(day: i64, idx: i64, project: &str) -> String {
     let feature = FEATURES[(seed / 5) % FEATURES.len()];
     let module = MODULES[(seed / 7) % MODULES.len()];
 
-    // Use day to create truly varied messages
     match (day + idx) % 60 {
         0 => format!(
             "Started deep work session on {} today, focusing on the {} module",
@@ -521,7 +508,6 @@ fn generate_user_message(day: i64, idx: i64, project: &str) -> String {
                 "project management"
             ][seed % 4]
         ),
-        // Car-specific messages for better searchability
         49 => format!(
             "Car service appointment at {} - they checked the {}",
             [
@@ -629,7 +615,6 @@ fn generate_assistant_response(day: i64, idx: i64, project: &str) -> String {
         26 => format!("Episode logged. You're caught up on {}!", SHOWS[seed % SHOWS.len()]),
         27 => format!("Dinner noted. {} is now in your favorites.", RESTAURANTS[seed % RESTAURANTS.len()]),
         28 => format!("Subscription renewal tracked. Your monthly subscriptions total ${}.", 30 + seed % 100),
-        // Car-related responses
         29 => format!("Car service logged. I'll remind you to pick it up. Your car is at {} miles now.", 45000 + (seed * 50) % 15000),
         30 => format!("Oil change recorded. Based on your driving, next one in about {} months.", 3 + seed % 4),
         31 => format!("Car inspection passed - great! Next due in {}. I've added a reminder.", ["6 months", "1 year", "2 years"][seed % 3]),
@@ -673,7 +658,6 @@ fn generate_morning_brief(day: i64) -> String {
         16 => format!("Rise and shine! {} code freeze tomorrow. {} PR needs merge today. {} at {}.", project1, project2, ["Call with stakeholders", "Team sync", "Customer demo"][seed % 3], meeting_time),
         17 => format!("Morning! {} downtime scheduled for {}pm maintenance. {} work continues.", project1, 2 + seed % 4, project2),
         18 => format!("Good morning! {} metrics: {}% uptime, {}ms latency. {} focus today.", project1, 99 + (seed % 2), 50 + seed % 100, project2),
-        // Car-related morning briefs
         19 => format!("Good morning! Reminder: car service appointment at {}am today. After that, {} standup.", 9 + seed % 3, project1),
         20 => format!("Rise and shine! Your car insurance payment of ${} is due this week. {} work continues.", 80 + seed % 100, project1),
         21 => format!("Morning! Car registration expires in {} days - renew online. {} meeting at {}pm.", 5 + seed % 10, project1, 2 + seed % 3),
@@ -683,17 +667,12 @@ fn generate_morning_brief(day: i64) -> String {
     }
 }
 
-/// Event struct with backdated timestamps
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 struct BackdatedEvent {
     id: Uuid,
     event_type: String,
     payload: serde_json::Value,
     created: chrono::DateTime<Utc>,
-    /// The thread this event belongs to, carried as the real column rather
-    /// than a payload field. A migration moved `thread_id` off the payload,
-    /// and every thread-scoped reader keys on the column. `None` for an event
-    /// that belongs to no thread, such as an artifact.
     thread_id: Option<Uuid>,
 }
 
@@ -708,7 +687,6 @@ impl BackdatedEvent {
         }
     }
 
-    /// [`Self::new`] for an event a thread owns.
     fn in_thread(
         event_type: &str,
         thread_id: Uuid,
@@ -767,21 +745,11 @@ impl BackdatedEvent {
     }
 }
 
-/// The insert every seeded event goes through.
-///
-/// `thread_id` and `aggregate_id` are columns, not payload keys. Written as
-/// payload alone, a seeded event is invisible to every thread-scoped surface:
-/// the thread view, the snapshot endpoint and each projection read the column.
 const INSERT_EVENT_SQL: &str = r#"
     INSERT INTO events (id, event_type, payload, created, thread_id, aggregate_id)
     VALUES ($1, $2, $3, $4, $5, $6)
 "#;
 
-/// How many events one full run writes, for the line the tool opens with.
-///
-/// Two per conversation, plus the day's artifacts, plus the one
-/// `TriggerCompleted` the morning brief leaves. Miss the last term and the
-/// announced figure disagrees with the count the same run prints at the end.
 fn planned_event_total(
     working_days: i64,
     conversations_per_day: i64,
@@ -790,7 +758,6 @@ fn planned_event_total(
     working_days * (conversations_per_day * 2 + artifacts_per_day + 1)
 }
 
-/// Insert backdated event directly
 async fn append_backdated_event(
     pool: &sqlx::PgPool,
     event: &BackdatedEvent,
@@ -808,7 +775,6 @@ async fn append_backdated_event(
     Ok(())
 }
 
-/// Generate realistic artifacts based on project type
 fn generate_artifact_with_content(day: i64, idx: i64, project: &str) -> (String, String, String) {
     let seed = ((day * 7 + idx * 13) as usize).wrapping_mul(31);
     let base_date = Utc::now() - Duration::days(730);
@@ -818,7 +784,6 @@ fn generate_artifact_with_content(day: i64, idx: i64, project: &str) -> (String,
     let person = PEOPLE[seed % PEOPLE.len()];
     let person2 = PEOPLE[(seed + 5) % PEOPLE.len()];
 
-    // Generate project-appropriate artifacts
     match project {
         "Fitness Tracker" => generate_fitness_artifact(day, idx, seed, &date.to_string()),
         "Q1 Sales Analysis" | "Marketing Campaign" | "User Research" => {
@@ -1235,8 +1200,6 @@ Felt {} today. {} were a bit tight during the first kilometer but loosened up af
     }
 }
 
-// Nested `format!` keeps the seed-data templates visually contiguous; collapsing
-// them into outer-format placeholders would scatter the literal text.
 #[allow(clippy::format_in_format_args)]
 fn generate_analysis_artifact(
     day: i64,
@@ -2316,8 +2279,6 @@ POST /webhooks
     }
 }
 
-// Same rationale as `generate_analysis_artifact`: nested format! keeps the seed
-// templates readable as literal blocks.
 #[allow(clippy::format_in_format_args)]
 fn generate_security_artifact(
     day: i64,
@@ -2652,8 +2613,6 @@ This report presents findings from the security assessment conducted on {}. The 
     }
 }
 
-// Many context inputs (project / date / person / org) feed the seed templates;
-// nested format! preserves their readability — see other generator helpers above.
 #[allow(clippy::too_many_arguments, clippy::format_in_format_args)]
 fn generate_general_artifact(
     day: i64,
@@ -3530,29 +3489,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log_legacy!("[Populate] === History Population Tool (with backdated timestamps) ===\n");
     log_legacy!("[Populate] Workspace: {}\n", workspace_path.display());
 
-    // Create workspace structure
     std::fs::create_dir_all(workspace_path.join("data"))?;
     std::fs::create_dir_all(workspace_path.join("artifacts"))?;
 
-    // Connect to PostgreSQL (use DATABASE_URL env var)
     let database_url = lucidos_engine::core::database_url();
     log_legacy!(
         "[Populate] Connecting to PostgreSQL at {}",
         lucidos_engine::core::redact_postgres_secrets(&database_url)
     );
 
-    // Create shared connection pool
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(10)
         .connect(&database_url)
         .await?;
 
-    // The migrations own every table, as they do for the engine.
     lucidos_engine::core::store::MIGRATOR.run(&pool).await?;
     log_legacy!("[Populate] Schema migrated");
 
-    // Initialize embedder and memory index. Share the engine's per-user model
-    // cache rather than fetching a private copy next to the working directory.
     log_legacy!("[Populate] Initializing embedder (first run downloads the model)...");
     lucidos_engine::memory::apply_default_cache_dir(&workspace_path);
     let embedder = FastEmbedProvider::new()?;
@@ -3560,11 +3513,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log_legacy!("[Populate] Creating memory index...");
     let memory_index = PgVectorIndex::new(pool.clone()).await?;
 
-    let working_days: i64 = 730; // Full 2 years
+    let working_days: i64 = 730;
     let conversations_per_day: i64 = 3;
-    let artifacts_per_day: i64 = 1; // Fewer but more substantial artifacts
+    let artifacts_per_day: i64 = 1;
 
-    // Base date: 2 years ago
     let base_date = Utc::now() - Duration::days(730);
 
     let total_events = planned_event_total(working_days, conversations_per_day, artifacts_per_day);
@@ -3585,18 +3537,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let project2 = PROJECTS[(day as usize + 7) % PROJECTS.len()];
         let request_id = Uuid::new_v4();
 
-        // Calculate backdated timestamp for this day
-        // Add some variation within the day (9am-6pm)
         let day_start = base_date + Duration::days(day);
-        let hour_offset = 9 + (day % 9); // 9am to 5pm
+        let hour_offset = 9 + (day % 9);
         let event_time = day_start + Duration::hours(hour_offset);
 
-        // Simulate conversations
         for i in 0..conversations_per_day {
             let project = if i % 2 == 0 { project1 } else { project2 };
             let msg_time = event_time + Duration::minutes(i * 30);
 
-            // User message
             let user_msg = generate_user_message(day, i, project);
             let user_event = BackdatedEvent::user_message(request_id, &user_msg, msg_time);
             append_backdated_event(&pool, &user_event).await?;
@@ -3618,7 +3566,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await?;
             event_count += 1;
 
-            // Assistant response (a few seconds later)
             let response_time = msg_time + Duration::seconds(5);
             let assistant_msg = generate_assistant_response(day, i, project);
             let assistant_event =
@@ -3645,13 +3592,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             event_count += 1;
         }
 
-        // Simulate artifact creation - actually create files on disk
         for i in 0..artifacts_per_day {
             let project = if i % 2 == 0 { project1 } else { project2 };
             let (path, description, content) = generate_artifact_with_content(day, i, project);
             let artifact_time = event_time + Duration::hours(2) + Duration::minutes(i * 15);
 
-            // Create the actual file on disk
             let full_path = artifacts_path.join(&path);
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -3693,12 +3638,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             artifact_count += 1;
         }
 
-        // Generate morning brief notification every day
-        let morning_time = day_start + Duration::hours(8); // 8am
+        let morning_time = day_start + Duration::hours(8);
         let brief = generate_morning_brief(day);
         let task_id = Uuid::new_v4();
 
-        // Create notification
         NotificationStore::insert_with_timestamp(
             &pool,
             "Morning Brief",
@@ -3712,7 +3655,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await?;
 
-        // Create event for the scheduled task
         let task_request_id = Uuid::new_v4();
         let task_event = BackdatedEvent::trigger_completed(
             task_request_id,
@@ -3724,7 +3666,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         append_backdated_event(&pool, &task_event).await?;
         event_count += 1;
 
-        // Index the scheduled task event in memory (as regular event)
         let embedding = embedder.embed(&brief).await?;
         memory_index
             .index_entry(
@@ -3757,7 +3698,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // Mark older notifications as read (keep last 10 as unread)
     log_legacy!("\n[Populate] Marking older notifications as read (keeping 10 unread)...");
     sqlx::query(
         r#"
@@ -3773,7 +3713,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .execute(&pool)
     .await?;
 
-    // Create personal tracking files (always present)
     log_legacy!("[Populate] Creating personal tracking files...");
     std::fs::write(
         artifacts_path.join("todo.md"),
@@ -3790,7 +3729,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let elapsed = start.elapsed();
 
-    // Verify counts
     let db_events: Vec<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM events")
         .fetch_all(&pool)
         .await?;
@@ -3804,8 +3742,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "[Populate]   PostgreSQL notifications: {}",
         db_notifications[0].0
     );
-    // Propagated, not defaulted. A failed count printed as `0` reads as
-    // "indexing wrote nothing" right after it wrote thousands of entries.
     log_legacy!(
         "[Populate]   Memory index entries: {}",
         memory_index.len().await?
@@ -3828,11 +3764,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 mod tests {
     use super::*;
 
-    /// A seeded conversation event has to be reachable from its thread.
-    ///
-    /// The thread view, the snapshot endpoint and every projection read the
-    /// `thread_id` COLUMN. Written into the payload alone, as a migration once
-    /// allowed, the whole seeded history is invisible to all of them.
     #[test]
     fn a_conversation_event_carries_its_thread_as_a_column() {
         let thread = Uuid::new_v4();
@@ -3856,14 +3787,12 @@ mod tests {
         }
     }
 
-    /// An artifact belongs to no thread, and says so rather than borrowing one.
     #[test]
     fn an_artifact_event_belongs_to_no_thread() {
         let event = BackdatedEvent::new("ArtifactCreated", serde_json::json!({}), Utc::now());
         assert_eq!(event.thread_id, None);
     }
 
-    /// The insert has to name both columns, or the field above goes nowhere.
     #[test]
     fn the_insert_names_the_thread_columns() {
         let sql = INSERT_EVENT_SQL;
@@ -3871,21 +3800,15 @@ mod tests {
         assert!(sql.contains("aggregate_id"), "{sql}");
     }
 
-    /// The opening line must match the count the same run prints at the end.
-    /// Leaving out the daily `TriggerCompleted` announced 5110 against 5840.
     #[test]
     fn the_announced_total_counts_the_daily_trigger_event() {
         assert_eq!(planned_event_total(730, 3, 1), 730 * 8);
         assert_eq!(planned_event_total(1, 0, 0), 1, "the trigger fires daily");
     }
 
-    /// A seeded gym message can name a hobby past the sixth. Indexed `% 6`,
-    /// the last 14 of the 20 entries were unreachable whatever the day.
     #[test]
     fn a_gym_message_reaches_past_the_first_six_hobbies() {
         let tail = &HOBBIES[6..];
-        // Arm 18 of the message table is the gym line, reached when the day
-        // and the message index sum to 18 modulo 60.
         let reached = (0..600i64).any(|day| {
             (0..60i64).filter(|idx| (day + idx) % 60 == 18).any(|idx| {
                 let message = generate_user_message(day, idx, "API Migration");

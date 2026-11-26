@@ -128,6 +128,13 @@ describe('deviceSetupState', () => {
     });
   });
 
+  it('calls an installed app ready, even one opened over plain HTTP', () => {
+    expect(reader({ hostname: HOST_IP, standalone: true, secureContext: false })).toEqual({
+      kind: 'ready',
+      hostname: HOST_IP,
+    });
+  });
+
   it('accepts the host\'s reported MagicDNS name whatever its suffix', () => {
     const headscale = 'mymac.example-tailnet.test';
     expect(reader({ hostname: headscale, hostMagicDnsName: headscale })).toEqual({

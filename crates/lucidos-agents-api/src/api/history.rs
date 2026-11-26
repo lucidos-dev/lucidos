@@ -5,15 +5,10 @@ use crate::core::event_subscription::frames::{
 use axum::body::Body;
 use tokio::io::AsyncWriteExt;
 
-/// Inter-task pipe size between the gzip encoder writer and the response body
-/// reader. Large enough that a burst of small events need not round-trip
-/// through the writer per frame. Small enough to bound memory if a client
-/// stalls.
 const GZIP_PIPE_BUF_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 pub(super) struct GlobalEventsQuery {
-    /// Selects the row stream: see `lucidos_gateway_stamp::row_stream`.
     aggregates: Option<String>,
 }
 
@@ -32,8 +27,6 @@ pub(super) async fn global_events(
     .await
 }
 
-/// The event stream. With `aggregates` it is the row stream, which sends an
-/// event's type and aggregate and never its payload.
 async fn event_stream(
     event_bus: &crate::engine::event_bus::EventBus,
     sse_connections: &crate::api::sse_connections::SseConnectionCounter,
@@ -42,16 +35,9 @@ async fn event_stream(
     headers: &HeaderMap,
 ) -> Response {
     let wanted = aggregates.map(lucidos_gateway_stamp::row_stream::parse_aggregates);
-    // Register a page in the live SSE-connection count. The guard is moved
-    // into the stream's closure below, so the count decrements exactly when
-    // the stream is dropped. The push fan-out reads this count to decide
-    // whether to run the PresenceCheck (system-knowhow/notifications/3-the-presencecheck-protocol.md §3):
-    // a connected page can pong even when its device_presence heartbeat has
-    // gone stale. A row stream is a gateway, never a page. It cannot pong, so
-    // counting it would make every push wait.
     let conn_guard = wanted.is_none().then(|| sse_connections.connect());
     let rx = event_bus.subscribe();
-    // Subscribe first, then read the durable generation. Every event buffered
+    // INVARIANT: Subscribe first, then read the durable generation. Every event buffered
     // during this read follows the hello, including on the gzip transport.
     // An unreadable boundary must never look like a workspace without restores.
     let boundary = match crate::core::snapshot::boundary::read(pool).await {
@@ -60,8 +46,6 @@ async fn event_stream(
     };
     let hello = stream_hello(boundary.as_ref().map(|boundary| boundary.restore_id));
     let json_stream = tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), move |r| {
-        // `move` captures `conn_guard` by value; it lives as long as this
-        // closure (i.e. as long as the stream), then Drop decrements the count.
         let _hold = &conn_guard;
         match r {
             Ok(emitted) => match &wanted {
@@ -98,7 +82,6 @@ fn row_stream_frame(
     serde_json::to_string(&frame).ok()
 }
 
-/// Connection metadata, not a domain event: never persisted or replayed.
 fn stream_hello(generation: Option<uuid::Uuid>) -> String {
     serde_json::json!({
         "type": "StreamHello",
@@ -107,8 +90,6 @@ fn stream_hello(generation: Option<uuid::Uuid>) -> String {
     .to_string()
 }
 
-/// One frame on the wire. `data:` frames carry an event; the keep-alive frame
-/// is a named event with an empty payload.
 enum Frame {
     Data(String),
     Keepalive,
@@ -141,8 +122,6 @@ where
     )
 }
 
-/// Plain (uncompressed) SSE response, for clients that don't advertise `gzip`
-/// in `Accept-Encoding`.
 fn plain_sse_response<S>(json_stream: S) -> Response
 where
     S: Stream<Item = String> + Send + 'static,
@@ -157,12 +136,6 @@ where
         .expect("static SSE response builder is infallible")
 }
 
-/// Gzip-compressed SSE response. The streaming `GzipEncoder` gets an explicit
-/// per-event `flush()` (Z_SYNC_FLUSH). Each event therefore reaches the client
-/// as it is emitted, rather than when the encoder fills its window.
-///
-/// The wire format is identical to the plain response. Only the transport
-/// bytes are compressed, so every EventSource parser sees the same events.
 fn gzipped_sse_response<S>(json_stream: S) -> Response
 where
     S: Stream<Item = String> + Send + 'static,
@@ -179,14 +152,10 @@ where
         let frames = with_keepalives(json_stream);
         tokio::pin!(frames);
         while let Some(frame) = frames.next().await {
-            // Sequential `?` short-circuits on the first IO error (client
-            // gone), avoiding extra writes into a half-broken encoder.
             let write_result: std::io::Result<()> = async {
                 for chunk in frame.chunks() {
                     encoder.write_all(chunk).await?;
                 }
-                // flush() emits a Z_SYNC_FLUSH block: bytes leave the
-                // encoder immediately so latency stays close to plain SSE.
                 encoder.flush().await
             }
             .await;
@@ -194,7 +163,6 @@ where
                 break;
             }
         }
-        // Best-effort gzip trailer; client may have already disconnected.
         let _ = encoder.shutdown().await;
     });
 
@@ -203,18 +171,11 @@ where
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CONTENT_ENCODING, "gzip")
         .header(header::CACHE_CONTROL, "no-cache")
-        // Hint to reverse proxies (e.g. nginx) not to buffer the body.
         .header("X-Accel-Buffering", "no")
         .body(Body::from_stream(body_stream))
         .expect("static SSE response builder is infallible")
 }
 
-/// Returns true iff `Accept-Encoding` advertises gzip with a non-zero
-/// quality. Honors RFC 7231 §5.3.5: a `q=0` weight on `gzip` is an
-/// explicit opt-out (e.g. for clients with broken decompressors), so
-/// callers must skip compression even though the token is present.
-/// Strict on the token name — `x-gzip` (a distinct historical encoding)
-/// is not accepted.
 fn accepts_gzip(headers: &HeaderMap) -> bool {
     let Some(val) = headers.get(header::ACCEPT_ENCODING) else {
         return false;
@@ -228,7 +189,6 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
         if !token.eq_ignore_ascii_case("gzip") {
             return false;
         }
-        // Default weight is 1.0 when no q parameter is present.
         params.all(|param| {
             let Some((name, value)) = param.split_once('=') else {
                 return true;
@@ -236,9 +196,6 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
             if !name.trim().eq_ignore_ascii_case("q") {
                 return true;
             }
-            // Treat unparseable / explicitly-zero weights as opt-out.
-            // (Per RFC, valid q is in [0, 1] with up to 3 decimals; any
-            // strictly positive value keeps gzip acceptable.)
             value
                 .trim()
                 .parse::<f32>()
@@ -272,102 +229,57 @@ pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<s
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let engine_version = crate::build_identity().engine_version;
-    // Read fresh from disk on each request so version bumps from applied
-    // changes are picked up without an engine restart.
     let latest_engine_version = read_engine_version();
     let latest_tauri_app_version = read_app_version();
     let database = state.engine.database_health();
     let agent_sandbox_unavailable = crate::runtime::agent_sandbox::unavailable_reason().await;
     let body = Json(serde_json::json!({
-        // Deliberately still "ok" (and a 200) when `database_reachable` is false:
-        // this half is about the engine PROCESS, which is answering. Failing the
-        // endpoint would recruit the gateway's respawn machinery against a
-        // condition respawning cannot fix, and ADR 0014 forbids culling an alive
-        // engine. See `engine::db_health` and ADR 0037.
         "status": status,
         "workspace_client": lucidos_gateway_stamp::workspace_client::ClientContract::engine(),
         "workspace": workspace_name,
         "workspace_path": state.workspace_path.to_string_lossy(),
         "started_at": state.started_at.to_rfc3339(),
-        // A gateway spawned this engine, so a restarted gateway takes it back
-        // as its own and re-keys it (`api::gateway_stamp`).
         "started_by_gateway": crate::api::gateway_stamp::started_by_gateway(),
-        // This engine serves the row stream, so a gateway may subscribe.
         lucidos_gateway_stamp::row_stream::HEALTH_FIELD: true,
-        // Is the workspace database answering? An engine outlives its database,
+        // INVARIANT: Is the workspace database answering? An engine outlives its database,
         // and a client that cannot tell holds a black boot splash and reports
         // the outage once per failed load. Read from an atomic the background
         // probe writes, so this never puts database latency on the endpoint.
         "database_reachable": database.is_reachable(),
-        // Why it is not: `true` when the database answers but no pooled
-        // connection is free. Only ever true while `database_reachable` is
-        // false, so the slowness warning can name the right fix (ADR 0301).
         "database_pool_exhausted": database.is_pool_exhausted(),
         "release": crate::build_identity().release,
         "release_dirty": crate::build_identity().release_dirty,
         "engine_version": engine_version,
         "latest_engine_version": latest_engine_version,
         "latest_tauri_app_version": latest_tauri_app_version,
-        // True in a PACKAGED desktop build (runs as the launchd service / behind
-        // the bundled gateway; no source checkout). The frontend reads this to
-        // route the "Restart" control: packaged → restart the LaunchAgent
-        // (`launchctl kickstart -k`) or POST the bundled gateway; dev → the
-        // /restart script (`web-dev.sh --engine-only`, which rebuilds first).
         "packaged": is_packaged(),
-        // False when the engine booted without any LLM provider configured (the
-        // UnconfiguredProvider sentinel — packaged first run). The frontend
-        // reads this to show first-run provider onboarding (→ Settings →
-        // Providers) instead of letting the user chat into a guaranteed error.
         "llm_configured": state.engine.llm_configured(),
-        // Which provider backends are actually configured, so the frontend can
-        // filter the model picker to providers the user has set up. `null` means
-        // "don't filter" (mock / no routing); an array enumerates live backends.
-        // Reflects a runtime credential swap (read from the live provider).
         "configured_providers": state.engine.configured_providers(),
-        // Why agent-steered spawns cannot run sandboxed on this machine, or
-        // null when they can. The client pairs it with `agents_unsandboxed`
-        // for the standing sandbox banner (ADR 0645).
         "agent_sandbox_unavailable": agent_sandbox_unavailable,
-        // True when the sandbox runs but cannot stop an agent emptying a
-        // protected file: Linux below Landlock ABI 3 (ADR 0645).
         "agent_sandbox_truncation_unguarded":
             crate::runtime::agent_sandbox::truncation_unguarded().await,
-        // True when a trigger's write scope cannot stop permission, owner,
-        // time or xattr changes outside it: Linux under Landlock alone.
         "agent_sandbox_metadata_unguarded":
             crate::runtime::agent_sandbox::metadata_unguarded().await,
     }));
     (code, body)
 }
 
-/// True in a packaged desktop build, detected by the ABSENCE of a Lucidos source
-/// checkout above the running binary. A packaged `.app` engine has no
-/// `scripts/web-dev.sh` ancestor, so [`crate::paths::repo_root`] errs. A dev
-/// engine resolves it, under the gateway (ADR 0014) or the legacy single-engine
-/// model.
-///
-/// Delegates to [`crate::paths::has_lucidos_source`] so this flag and the chat
-/// agent's own "can I edit Lucidos here?" answer cannot drift. The compose
-/// destination picker hides "Lucidos source" on the strength of THIS field, and
-/// `run_coding_agent` refuses a source spawn on that one.
 fn is_packaged() -> bool {
     !crate::paths::has_lucidos_source()
 }
 
-/// launchd label of the always-on engine service (matches
+/// INVARIANT: launchd label of the always-on engine service (matches
 /// `crates/lucidos-app/src/desktop.rs` `SERVICE_AGENT_LABEL`). The client's own
 /// login agent is a separate job and is deliberately NOT restarted from here:
 /// restarting the service must not disturb the window the user is looking at.
 const LAUNCH_AGENT_LABEL: &str = "com.lucidos.engine";
 
-/// Read a VERSION file from disk, returning "unknown" if missing.
 fn read_version_file(path: &std::path::Path) -> String {
     std::fs::read_to_string(path)
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Read the engine VERSION from disk (picks up bumps without restart).
 fn read_engine_version() -> String {
     let path = crate::paths::repo_root()
         .ok()
@@ -376,7 +288,6 @@ fn read_engine_version() -> String {
     read_version_file(&path)
 }
 
-/// Read the Tauri app VERSION from disk.
 fn read_app_version() -> String {
     let path = crate::paths::repo_root()
         .ok()
@@ -385,7 +296,7 @@ fn read_app_version() -> String {
     read_version_file(&path)
 }
 
-/// Switch the engine onto the new version, the disruptive step of the
+/// INVARIANT: Switch the engine onto the new version, the disruptive step of the
 /// new-version-available flow. The new binary is ALREADY on disk, rebuilt by
 /// dev's *Apply* or installed by the packaged updater, so this only RESPAWNS.
 ///
@@ -401,7 +312,7 @@ pub(super) async fn restart_engine(
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let actor = super::actor::user_actor(&headers, None);
-    // Stash the device actor for the teardown-time boundary emit (Phase 3) and the
+    // INVARIANT: Stash the device actor for the teardown-time boundary emit (Phase 3) and the
     // recovery auto-resume signal (Phase 4). No pre-emit here. First writer wins,
     // and this IS the first writer: the gateway's restart-intent notify fires on
     // the respawn we are about to ask for, and must not overwrite the click's own
@@ -410,7 +321,7 @@ pub(super) async fn restart_engine(
 
     let outcome = respawn_this_engine(&state).await;
 
-    // Nothing asked this engine to go down after all. Every arm in
+    // INVARIANT: Nothing asked this engine to go down after all. Every arm in
     // `respawn_this_engine` fails BEFORE the process is signalled, so the stash
     // now describes a restart that never happened. Left in place it would attach
     // to whatever teardown came next, and under first-writer-wins it would
@@ -425,25 +336,9 @@ pub(super) async fn restart_engine(
     outcome
 }
 
-/// Ask something to respawn this engine, by whichever route exists. Split out of
-/// [`restart_engine`] so its several failure exits meet the stash-cleanup above
-/// at one place instead of each having to remember it.
-///
-/// Prefer the gateway control API whenever the gateway spawned us, in dev and
-/// packaged alike, since it injects `LUCIDOS_GATEWAY_PORT` and
-/// `LUCIDOS_WORKSPACE_ID`. Fall back to launchd (packaged, no gateway) or
-/// `web-dev.sh --engine-only` (legacy `LUCIDOS_NO_GATEWAY` dev).
-///
-/// `Ok` means the teardown is under way, not merely requested. The gateway
-/// signals the engine inside the call it answers. When it moves to a newer
-/// binary first, its new image signals it a moment later (ADR 0461). launchctl and
-/// `web-dev.sh` have been spawned by then. Every `Err` leaves this process
-/// running.
 async fn respawn_this_engine(
     state: &AppState,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // The gateway (dev or packaged) respawns this workspace's stack in place onto
-    // the already-on-disk binary — no rebuild here.
     if let (Ok(port), Ok(id)) = (
         std::env::var("LUCIDOS_GATEWAY_PORT"),
         std::env::var("LUCIDOS_WORKSPACE_ID"),
@@ -452,14 +347,9 @@ async fn respawn_this_engine(
     }
 
     if is_packaged() {
-        // Packaged, no gateway (legacy single-engine): launchd restarts the
-        // service onto the updater-installed binary.
         return restart_via_launchd();
     }
 
-    // Legacy `LUCIDOS_NO_GATEWAY` dev: no gateway to respawn the engine, so drive
-    // it via `web-dev.sh --engine-only`. Apply already rebuilt the binary, so the
-    // build step here is a fast near-noop; the respawn is what matters.
     let script = crate::paths::script("web-dev.sh").map_err(|e| {
         log_legacy!("[Restart] {}", e);
         (
@@ -533,11 +423,6 @@ async fn respawn_this_engine(
     }
 }
 
-/// `GET /api/v1/engine/version-status`. Reports the running engine's build id
-/// and whether a newer version is ready to switch onto. Also reports whether
-/// the build is packaged, and the dev background-rebuild state. Drives the "New
-/// version available" surface; packaged routes to the release updater instead.
-/// See `crates/lucidos-engine/src/engine/engine_version.rs`.
 pub(super) async fn engine_version_status(
     State(state): State<AppState>,
 ) -> Json<crate::engine::engine_version::VersionStatus> {
@@ -550,8 +435,6 @@ pub(super) async fn read_engine_version_status(
     state.engine.version_status().await
 }
 
-/// Build output only, bounded to its last 64 KiB. Kept separate from the
-/// engine log so diagnostics do not disclose unrelated chat or runtime output.
 async fn engine_build_log(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -589,13 +472,11 @@ async fn read_build_log(path: &std::path::Path) -> Result<String, (StatusCode, S
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// `GET /api/v1/engine/diagnostic-log`: sanitized logs for this engine's agents.
 async fn engine_diagnostic_log(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Result<impl IntoResponse, ApiError> {
-    /// Scans in flight. Each holds the whole matching window in memory.
     static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let source = DiagnosticLogSource {
         dir: crate::diagnostic_log::dir_for(&state.workspace_path),
@@ -610,7 +491,6 @@ async fn engine_diagnostic_log(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 
-/// Where a diagnostic log query reads, and what bounds its concurrency.
 struct DiagnosticLogSource {
     dir: std::path::PathBuf,
     started: bool,
@@ -618,8 +498,6 @@ struct DiagnosticLogSource {
     scans: &'static tokio::sync::Semaphore,
 }
 
-/// Only an agent subprocess this engine minted a token for may read, and
-/// never through an app frame's stamp.
 pub(super) fn diagnostic_log_reader_allowed(headers: &HeaderMap) -> bool {
     !headers.contains_key(super::app_reach::APP_ID_HEADER)
         && matches!(
@@ -724,7 +602,6 @@ async fn fetch_gateway_diagnostic_log(
         .send()
         .await
         .map_err(|_| unreachable)?;
-    // Older gateways can serve the workspace picker for an unknown control route.
     let picker = response.status().is_success()
         && response
             .headers()
@@ -754,19 +631,6 @@ async fn fetch_gateway_diagnostic_log(
     Ok(result)
 }
 
-/// `GET /api/v1/engine/changelog`: every published release's notes, newest
-/// first, for the *What's New* panel (Settings > System).
-///
-/// Takes no state and needs no database. It DOES read the checkout and may
-/// reach the network: a panel answering "what is new" cannot be limited to what
-/// shipped with this binary. `crate::engine::changelog` owns that and degrades
-/// to the baked copy, which is why this handler is the one request the fetch
-/// ever runs on.
-///
-/// Deliberately does NOT restate which release is running. `/health` already
-/// carries `release` and the frontend already holds it. One source of truth
-/// keeps the panel's "you are running this" mark from disagreeing with the
-/// Versions section two tabs away.
 pub(super) async fn engine_changelog() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "releases": crate::engine::changelog::changelog_releases().await,
@@ -787,9 +651,6 @@ pub(super) struct RebuildQuery {
     mode: RebuildMode,
 }
 
-/// Build source without switching. `mode=join` preserves the build in flight;
-/// omitting it retains the explicit restart escape hatch (ADR 0412).
-/// No-op packaged. Version-status and SSE report progress and readiness.
 pub(super) async fn engine_rebuild(
     State(state): State<AppState>,
     Query(query): Query<RebuildQuery>,
@@ -801,12 +662,6 @@ pub(super) async fn engine_rebuild(
     StatusCode::ACCEPTED
 }
 
-/// Gateway-mode restart (ADR 0014): POST the gateway's control API (behind the
-/// sigil namespace `/~/`) to respawn just this workspace's stack. The gateway
-/// kills the old engine and spawns a fresh one on the same loopback port. The
-/// frontend tolerates the brief network rejection after the 2xx.
-///
-/// A non-2xx response is a real gateway error, returned as one.
 async fn restart_via_gateway(
     gateway_port: &str,
     workspace_id: &str,
@@ -834,15 +689,13 @@ async fn restart_via_gateway(
     }
 }
 
-/// Packaged restart: the engine runs as the `com.lucidos.engine` launchd
+/// INVARIANT: Packaged restart: the engine runs as the `com.lucidos.engine` launchd
 /// service, so it restarts itself with `launchctl kickstart -k`. launchd
 /// SIGTERMs the service supervisor, which sends the engine its graceful-stop
 /// SIGUSR1 and respawns a clean Postgres and engine. We spawn launchctl and
 /// return 200 at once: the response flushes during the drain window, and the
 /// frontend tolerates a network rejection after a 2xx.
 fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // `launchctl kickstart` targets `gui/<uid>/<label>`; resolve the uid of the
-    // user whose launchd domain the service was bootstrapped into (us).
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
     log_legacy!("[Restart] Packaged mode: launchctl kickstart -k {}", target);
@@ -862,7 +715,6 @@ fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Val
     }
 }
 
-/// Get conversation history up to a specific event
 pub(super) async fn get_history(
     State(state): State<AppState>,
     Query(query): Query<EventQuery>,
@@ -906,7 +758,6 @@ fn parse_optional_rfc3339(
     }
 }
 
-/// Get recent messages across all history (flat timeline)
 pub(super) async fn get_recent_messages(
     State(state): State<AppState>,
     Query(query): Query<MessagesQuery>,
@@ -927,7 +778,6 @@ pub(super) async fn get_recent_messages(
     Ok(Json(messages))
 }
 
-/// Get all messages for a specific session (for history time travel)
 pub(super) async fn get_session_messages(
     State(state): State<AppState>,
     Query(query): Query<SessionMessagesQuery>,
@@ -958,13 +808,8 @@ pub(super) struct EventsQueryParams {
     before_event_id: Option<uuid::Uuid>,
     #[serde(default)]
     after_event_id: Option<uuid::Uuid>,
-    /// Restrict to one thread. Absent is every thread, which is what every
-    /// pre-existing caller sends, so the filter can only ever narrow.
     #[serde(default)]
     thread_id: Option<uuid::Uuid>,
-    /// Resolve one event by primary key. A `String` rather than a `Uuid`,
-    /// unlike the two cursors above. This is the address an agent noted from
-    /// a tool result, so it arrives in the `evt-<32 hex>` form.
     #[serde(default)]
     event_id: Option<String>,
     #[serde(default = "default_events_limit")]
@@ -975,9 +820,6 @@ fn default_events_limit() -> i64 {
     100
 }
 
-/// Reject paging requests that pin both ends of the cursor at once: there's
-/// no coherent semantics for "strictly older than X AND strictly newer than
-/// Y" in a paging API. Returned as a 400 by the HTTP handler.
 fn validate_cursor_pair(
     before_event_id: Option<uuid::Uuid>,
     after_event_id: Option<uuid::Uuid>,
@@ -996,19 +838,10 @@ pub(super) struct EventsCountParams {
     since: Option<String>,
     #[serde(default)]
     until: Option<String>,
-    /// Restrict to one thread. A value that is not a uuid is a 400, never a
-    /// workspace-wide count under a thread's name.
     #[serde(default)]
     thread_id: Option<uuid::Uuid>,
 }
 
-/// REST endpoint that mirrors the `count_events` LLM tool: per-type counts +
-/// byte totals over the given time window. With `event_type`, returns
-/// `{count, byte_total}` for that type; without, returns
-/// `{by_type:[...], total_count, total_byte_total}` sorted by count desc.
-///
-/// Use this to size a sweep before drilling with `/events/query` — same
-/// design rationale as the LLM tool (see `crate::engine::tools::execute_count_events`).
 pub(super) async fn count_events(
     State(state): State<AppState>,
     Query(q): Query<EventsCountParams>,
@@ -1063,7 +896,6 @@ pub(super) async fn count_events(
     }
 }
 
-/// REST endpoint to query stored events by type/time (not SSE)
 pub(super) async fn query_events(
     State(state): State<AppState>,
     Query(q): Query<EventsQueryParams>,
@@ -1076,7 +908,7 @@ pub(super) async fn query_events(
     if let Err(msg) = validate_cursor_pair(q.before_event_id, q.after_event_id) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
-    // Refused rather than ignored: a malformed address silently dropped would
+    // INVARIANT: Refused rather than ignored: a malformed address silently dropped would
     // widen a one-row lookup into the newest 100 events of every type.
     let event_id = match q.event_id.as_deref() {
         None => None,
@@ -1130,20 +962,6 @@ pub(super) async fn query_events(
     }
 }
 
-/// The engine's own event names merged with every type this workspace's store
-/// has seen, sorted. Feeds the trigger form's `on_event:` dropdown.
-///
-/// The engine half is **derived**, never restated. `event_type_catalog` builds
-/// it from the two enumerations the engine keeps. So a rename reaches this list
-/// and the subscription validator in one commit, and every engine name offered
-/// here validates. A hand-copied constant was the previous shape, and it had
-/// drifted: 32 names, no `SystemEvent` at all, though the scheduler routes
-/// every persisted system frame to the trigger matcher.
-///
-/// The store half carries the workspace's own domain events, which no
-/// enumeration can know about. `event_type_catalog` runs it through the
-/// validator too, so a retired engine name still holding rows is dropped. The
-/// dropdown offers no name the next subscription refuses.
 pub(super) async fn event_types(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
@@ -1175,26 +993,11 @@ pub(super) async fn emit_event(
             .into_response();
     }
 
-    // The caller's identity, never the payload's: `to_payload` replaces any
-    // `actor` the caller wrote. An app frame's emit carries its registered
-    // device, so it reads `device`. A thread's subprocess carries its origin
-    // token, so the `lucidos` CLI and a script trigger read as the agent.
     let actor = match super::actor::require_user_actor_response(&headers, &state.pool).await {
         Ok(actor) => actor,
         Err(refusal) => return refusal,
     };
 
-    // Re-establish the caller's event-trigger chain depth on this request task.
-    //
-    // A script trigger's `lucidos events emit` lands here on an axum task. It
-    // shares nothing with the fire that spawned the script, so the emit used to
-    // stamp 0 and restart the chain. That is why a script trigger subscribed to
-    // the event its own script emits never stopped. The depth comes off the
-    // HMAC-signed origin token, so it is authenticated and a caller cannot
-    // declare a lower one to escape the cap.
-    //
-    // The fire comes off the same token, for the same reason. The scope cannot
-    // carry it either, so the emit states it (ADR 0137).
     let (depth, emitting_trigger_id) = emit_chain_and_trigger(&headers);
     let emit = async {
         if body.transient {
@@ -1234,14 +1037,6 @@ pub(super) async fn emit_event(
     }
 }
 
-/// The chain depth and the emitting trigger an inbound emit belongs to.
-///
-/// A Lucidos-spawned subprocess presents a signed origin token carrying both.
-/// Every other caller (a browser, an app UI, an external API client) roots its
-/// own chain at 0 and claims no trigger. That is an ordinary user action.
-///
-/// Both come off ONE verify. They ride the same token, so reading them apart
-/// would check the same MAC twice on every emit.
 fn emit_chain_and_trigger(headers: &HeaderMap) -> (u32, Option<String>) {
     match crate::core::subprocess_origin::subprocess_origin(headers) {
         crate::core::subprocess_origin::SubprocessOrigin::Subprocess {
@@ -1253,15 +1048,6 @@ fn emit_chain_and_trigger(headers: &HeaderMap) -> (u32, Option<String>) {
     }
 }
 
-/// Routes for the engine-level surfaces this module's handlers own:
-/// `/health`, `/restart`, `/workspaces`, `/history`, `/messages`,
-/// `/session/messages`, the `/engine/*` routes (version-status,
-/// changelog, rebuild, build-log, diagnostic-log), and the `/events*` surface (global SSE stream +
-/// event-store queries).
-///
-/// Four `/events/:event_id/*` routes join them: `context`, `tool-result`,
-/// `tool-args` and `location`. They are part of the events URL surface, so
-/// they register here even though their handlers live in `api::threads`.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
@@ -1344,7 +1130,6 @@ mod tests {
         assert!(text.ends_with("publish failed"));
     }
 
-    /// Real construction and handlers, isolated from the user's HOME and keys.
     #[tokio::test]
     async fn providerless_boot_health_chat_and_live_configuration() {
         use crate::{core::prefs, llm::ProviderBuildContext, test_support::*};
@@ -1359,7 +1144,6 @@ mod tests {
                         "api::history::tests::providerless_boot_health_chat_and_live_configuration",
                         "--nocapture",
                     ])
-                    // Match the engine runtime stack for the chat orchestrator future.
                     .env("RUST_MIN_STACK", "16777216")
                     .env(CHILD, "1")
                     .env("GIT_AUTHOR_NAME", "Test User")
@@ -1478,7 +1262,6 @@ mod tests {
             failure.to_string().contains(providers_settings!()),
             "{failure}"
         );
-        // A local URL needs no credential or network call to exercise hot-swap.
         for (key, value) in [
             (prefs::LOCAL_BASE_URL.key(), "http://127.0.0.1:1/v1"),
             (prefs::PROVIDER_ENABLED_LOCAL.key(), "true"),
@@ -1576,7 +1359,6 @@ mod tests {
         }
     }
 
-    /// A draining engine must not read as healthy, or a gateway adopts it.
     #[test]
     fn an_engine_in_teardown_reports_unavailable() {
         assert_eq!(
@@ -1586,11 +1368,6 @@ mod tests {
         assert_eq!(health_status(false), (StatusCode::OK, "ok"));
     }
 
-    /// The emit surface reads both facts off the token, and neither off a
-    /// header a caller could set (ADR 0137, ADR 0138).
-    ///
-    /// A trigger's script posts here from its own process, so the fire's
-    /// task-local reaches nothing. The token is what carries the fire across.
     #[test]
     fn an_emit_takes_its_depth_and_its_fire_from_the_signed_token() {
         use crate::core::subprocess_origin::{
@@ -1628,20 +1405,12 @@ mod tests {
 
     const KEEPALIVE_WIRE: &[u8] = b"event: keepalive\ndata:\n\n";
 
-    /// A browser must not wait for an event to learn the stream is open.
-    ///
-    /// WebKit fires `EventSource.onopen` on the first body BYTES, where
-    /// Chromium fires it on the response headers. Nothing was written until the
-    /// first event or the first keep-alive tick. So Safari and the iOS PWA sat
-    /// at `connecting` for up to 30 seconds after every page load.
     #[tokio::test]
     async fn the_gzipped_stream_writes_its_first_bytes_before_any_event() {
         use async_compression::tokio::bufread::GzipDecoder;
         use tokio::io::{AsyncReadExt, BufReader};
         use tokio_util::io::StreamReader;
 
-        // A stream that never yields: exactly the common case, a page that
-        // connects while nothing is happening in the workspace.
         let silent = futures::stream::pending::<String>();
         let response = gzipped_sse_response(silent);
         let body = response
@@ -1650,8 +1419,6 @@ mod tests {
             .map(|chunk| chunk.map_err(std::io::Error::other));
         let mut wire = GzipDecoder::new(BufReader::new(StreamReader::new(body)));
 
-        // Generously under SSE_KEEPALIVE_INTERVAL, and far under the 10s a
-        // browser test waits. The open frame makes this immediate.
         let mut first = vec![0u8; KEEPALIVE_WIRE.len()];
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1663,8 +1430,6 @@ mod tests {
         assert_eq!(first, KEEPALIVE_WIRE);
     }
 
-    /// The plain response opens with the same keep-alive event, then relays
-    /// events as bare `data:` frames. A comment line would never reach JS.
     #[tokio::test]
     async fn the_plain_stream_opens_with_the_keepalive_event_and_relays_data() {
         let events = futures::stream::iter(["{\"a\":1}".to_string()])
@@ -1695,7 +1460,6 @@ mod tests {
         );
     }
 
-    /// A quiet stream keeps sending keep-alives, one per interval.
     #[tokio::test(start_paused = true)]
     async fn a_quiet_stream_sends_a_keepalive_every_interval() {
         let frames = with_keepalives(futures::stream::pending::<String>());
@@ -1705,7 +1469,6 @@ mod tests {
         }
     }
 
-    /// The generated client constant and the wire agree on the event name.
     #[test]
     fn the_keepalive_frame_names_the_exported_event() {
         let wire = Frame::Keepalive.chunks().concat();
@@ -1715,11 +1478,6 @@ mod tests {
         );
     }
 
-    /// Regression (ADR 0014): an engine built from a source checkout must report
-    /// as NOT packaged. Keying off `LUCIDOS_STATIC_DIR` made a dev engine look
-    /// packaged, because ADR 0014 has the dev engine set that var too. Detection
-    /// is the `scripts/web-dev.sh` source marker, so this test binary, living
-    /// inside the repo, classifies as dev.
     #[test]
     fn is_packaged_false_for_source_build() {
         assert!(
@@ -1728,10 +1486,6 @@ mod tests {
         );
     }
 
-    /// `Accept-Encoding` parser must recognise gzip in any of its standard
-    /// shapes: a bare token, a q-value, anywhere in a comma-separated list, and
-    /// case-insensitive. It must reject look-alikes like `x-gzip`, which is a
-    /// distinct historical encoding.
     #[test]
     fn accepts_gzip_recognises_standard_offers() {
         fn h(value: &str) -> axum::http::HeaderMap {
@@ -1753,26 +1507,14 @@ mod tests {
         assert!(!accepts_gzip(&h("")));
         assert!(!accepts_gzip(&axum::http::HeaderMap::new()));
 
-        // RFC 7231 §5.3.5: a quality of 0 means "not acceptable" — clients
-        // use this to explicitly opt OUT of an encoding (e.g. broken
-        // intermediaries, decompression bugs). Compressing the response
-        // anyway forces gzip on a client that asked us not to.
         assert!(!accepts_gzip(&h("gzip;q=0")));
         assert!(!accepts_gzip(&h("gzip; q=0")));
         assert!(!accepts_gzip(&h("gzip;q=0.0")));
         assert!(!accepts_gzip(&h("gzip;q=0.000")));
         assert!(!accepts_gzip(&h("deflate, gzip;q=0")));
-        // Other encodings at q=0 don't change gzip's acceptability.
         assert!(accepts_gzip(&h("gzip, deflate;q=0")));
     }
 
-    /// What the dropdown offers on a workspace whose store is empty. Every
-    /// name in it has to be one a trigger can actually fire on.
-    ///
-    /// The old hand-written constant needed a containment check here, since
-    /// nothing tied it to the enums. The list is derived now, and its own
-    /// module proves every entry validates. What is left to pin is the two
-    /// gates the derivation applies, and one name the dropdown lost once.
     #[test]
     fn the_dropdown_seed_offers_only_names_a_trigger_can_fire_on() {
         use crate::core::event_subscription::{known_names, SubscriptionSurface};
@@ -1788,24 +1530,15 @@ mod tests {
             );
         }
 
-        // The one gate a persisted name can still fail: a per-token streaming
-        // variant is dropped before the matcher.
         for streaming in crate::core::event_subscription::PER_TOKEN_STREAMING_EVENT_TYPES {
             assert!(!seed.contains(streaming), "'{streaming}' never reaches it");
         }
 
-        // Regression: with this name absent, a workspace could only subscribe
-        // to a child thread's outcome after one had already completed. Being
-        // told when a child finishes is what you wire up beforehand.
         assert!(seed.contains(&"ChildThreadCompleted"));
     }
 
-    /// A cursor the engine cannot parse is refused, not dropped. Dropping it
-    /// leaves `None`, which the stores read as "no bound", so the query
-    /// silently widens to every row.
     #[test]
     fn a_malformed_timestamp_cursor_is_refused_rather_than_dropped() {
-        // The shape a CLI or an LLM caller naturally sends for a day window.
         let err = parse_optional_rfc3339("since", Some("2026-09-01"))
             .expect_err("a bare date is not RFC 3339");
         assert!(
@@ -1821,7 +1554,6 @@ mod tests {
         }
     }
 
-    /// Absent stays absent, and a real RFC 3339 value still parses to UTC.
     #[test]
     fn an_absent_cursor_is_no_bound_and_a_valid_one_lands_in_utc() {
         assert_eq!(parse_optional_rfc3339("since", None), Ok(None));
@@ -1854,11 +1586,8 @@ mod tests {
         use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus, SystemEvent};
         use lucidos_gateway_stamp::row_stream;
 
-        /// A marker put in every payload field. It must never reach a frame.
         const SECRET: &str = "row-stream-payload-marker";
 
-        /// The events the row stream sends, each with a marked payload where
-        /// it has one, in the shared contract's order.
         fn picker_row_events() -> Vec<SystemEvent> {
             let now = chrono::Utc::now();
             let actor = Some(crate::engine::thread_events::MessageOrigin::Device {
@@ -1935,8 +1664,6 @@ mod tests {
             row_stream::AGGREGATES.map(str::to_string).to_vec()
         }
 
-        /// The shared names are the engine's own: `lucidos-gateway-stamp`
-        /// cannot import them, so this is the pin.
         #[test]
         fn the_shared_contract_names_the_engines_events_and_frames() {
             let events = picker_row_events();
@@ -1962,8 +1689,6 @@ mod tests {
             );
         }
 
-        /// A frame is the type and the aggregate. No audience, text,
-        /// preference value or actor crosses, whatever aggregates are asked.
         #[test]
         fn a_frame_never_carries_a_payload() {
             for event in picker_row_events() {
@@ -1985,8 +1710,6 @@ mod tests {
             }
         }
 
-        /// Sharing an aggregate is not enough: the key reveal rides `ops`
-        /// and the language rides `preference`, and neither is sent.
         #[test]
         fn events_outside_the_shared_lists_are_dropped() {
             let dropped = [
@@ -2016,8 +1739,6 @@ mod tests {
             }
         }
 
-        /// INV-2 and INV-6: a row stream is not a page, and every write that
-        /// moves the unread count or the backup line puts a frame on it.
         #[tokio::test]
         async fn every_picker_row_write_reaches_the_stream_and_no_page_is_counted() {
             use crate::core::preferences::PreferenceStore;
@@ -2067,19 +1788,15 @@ mod tests {
                     .unwrap(),
                 1
             );
-            // A thread delete removes its notifications, and a users change
-            // can move a device to another reader.
             bus.emit(BusEvent::System(threads_deleted(None)))
                 .await
                 .unwrap();
             bus.emit(BusEvent::System(SystemEvent::UsersChanged))
                 .await
                 .unwrap();
-            // The schedule write that flips `configured`.
             PreferenceStore::set(&pool, &bus, prefs::BACKUP_PROVIDER.key(), SECRET, None)
                 .await
                 .unwrap();
-            // An unrelated `ops` event sits between and yields no frame.
             bus.emit(BusEvent::System(SystemEvent::BackupKeyRevealed {
                 actor: None,
             }))
@@ -2120,8 +1837,6 @@ mod tests {
                 ]
             );
 
-            // The unfiltered stream still counts as a page, and still sends
-            // the whole event.
             let page = event_stream(&bus, &pages, &pool, None, &HeaderMap::new()).await;
             assert_eq!(pages.count(), 1);
             let mut page_body = page.into_body().into_data_stream();
@@ -2143,9 +1858,6 @@ mod tests {
         }
     }
 
-    /// The frontend's SSE handler keys off `type` and reads `data.count`.
-    /// If the wire shape drifts, lagged tabs lose their resync signal and
-    /// stuck "Thinking" spinners come back.
     #[test]
     fn lagged_event_json_has_stable_wire_shape() {
         let parsed: serde_json::Value = serde_json::from_str(&lagged_event_json(42)).unwrap();
@@ -2156,11 +1868,6 @@ mod tests {
     mod guard_tests {
         use super::*;
 
-        /// Regression: `read_app_version` must read fresh from disk on every call.
-        /// A cached value makes a version bump from an applied change invisible to
-        /// the health endpoint until an engine restart.
-        ///
-        /// One test rather than three, because all three mutate the same file.
         #[test]
         fn read_app_version_reads_fresh_from_disk() {
             let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2171,7 +1878,6 @@ mod tests {
                 .join("VERSION");
             let original = std::fs::read_to_string(&version_file).ok();
 
-            // Drop guard ensures cleanup even if an assertion panics.
             struct Restore(std::path::PathBuf, Option<String>);
             impl Drop for Restore {
                 fn drop(&mut self) {
@@ -2187,22 +1893,16 @@ mod tests {
             }
             let _guard = Restore(version_file.clone(), original);
 
-            // Picks up initial write.
             std::fs::write(&version_file, "1.0.0-test\n").unwrap();
             assert_eq!(read_app_version(), "1.0.0-test");
 
-            // Picks up version bump without restart.
             std::fs::write(&version_file, "2.0.0-test\n").unwrap();
             assert_eq!(read_app_version(), "2.0.0-test");
 
-            // Returns "unknown" when the file is missing.
             std::fs::remove_file(&version_file).unwrap();
             assert_eq!(read_app_version(), "unknown");
         }
 
-        /// read_engine_version reads the engine VERSION from disk on each call,
-        /// allowing the health endpoint to detect newer engine versions on disk
-        /// without an engine restart.
         #[test]
         fn read_engine_version_reads_fresh_from_disk() {
             let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

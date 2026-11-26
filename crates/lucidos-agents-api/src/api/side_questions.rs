@@ -1,18 +1,11 @@
-//! `/side-questions`: ask a *side question* beside a thread, and dismiss its
-//! card. The ask and its outcome are recorded as side-question events no
-//! agent reads (ADR 0320).
-
 use super::*;
 use crate::engine::agent_session::side_question::AgentSessionSideQuestionExt;
 
 #[derive(Deserialize)]
 pub(super) struct SideQuestionBody {
     thread_id: String,
-    /// Named by the client, so its pending card and the recorded events
-    /// reconcile by id.
     side_question_id: uuid::Uuid,
     question: String,
-    /// Blobs the user attached, uploaded before the ask.
     #[serde(default)]
     image_hashes: Vec<String>,
 }
@@ -23,7 +16,6 @@ pub(super) struct SideQuestionDismissBody {
     side_question_id: uuid::Uuid,
 }
 
-/// A side-question failure as its HTTP response.
 fn side_question_error(
     failure: crate::engine::agent_session::side_question::SideQuestionFailure,
 ) -> ApiError {
@@ -63,8 +55,6 @@ async fn side_question_target(
     Ok((thread_id, actor))
 }
 
-/// `POST /api/v1/side-questions`: answer a side question beside the thread's
-/// work, in a Claude Code or a Lucidos Agent thread, with any attached images.
 pub(super) async fn ask_side_question(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -95,8 +85,6 @@ pub(super) async fn ask_side_question(
         .map_err(side_question_error)
 }
 
-/// `POST /api/v1/side-questions/dismiss`: record that the user dismissed a
-/// side question's card. The ask stays, so the card can reopen.
 pub(super) async fn dismiss_side_question(
     State(state): State<AppState>,
     headers: HeaderMap,

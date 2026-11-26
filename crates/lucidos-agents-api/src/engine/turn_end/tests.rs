@@ -1,6 +1,3 @@
-//! The turn-end gate: each test pins one invariant of
-//! `docs/plans/2026-10-10-turn-end-gate-enforces-valid-states.md`.
-
 use super::read_decision::{
     chat_turn_read, coding_agent_turn_read, decision_from, read_decision_chat_judge,
     read_decision_prompt, record_forced_decision, wake_settles_first, AnsweredQuestion,
@@ -48,8 +45,6 @@ fn idle(facts: SessionFacts) -> TurnEndState {
 const PLAN: ProposalHold = ProposalHold::Plan(PlanHold::Missing);
 const HARDEN: ProposalHold = ProposalHold::HardeningMissing;
 
-// ---- the requirements ----
-
 #[test]
 fn an_undecided_turn_owes_a_read_decision_and_a_decided_one_does_not() {
     let undecided = TurnEndState::default();
@@ -72,8 +67,6 @@ fn the_read_decision_is_forced_and_a_hold_re_enters() {
         ]
     );
 }
-
-// ---- re-entry bounds ----
 
 #[test]
 fn a_held_proposal_nudges_once_per_branch_head() {
@@ -109,8 +102,6 @@ fn an_unreadable_head_nudges_once() {
     assert!(ledger.take_due(&held).is_none());
 }
 
-/// The plan and the harden keep separate keys: once the plan is settled at
-/// the same HEAD, the harden ask is still owed, and a new commit re-arms it.
 #[test]
 fn a_settled_plan_lets_the_harden_ask_through_at_the_same_head() {
     let mut ledger = ReentryLedger::default();
@@ -130,9 +121,6 @@ fn a_settled_plan_lets_the_harden_ask_through_at_the_same_head() {
         .is_some());
 }
 
-/// A plan-only branch awaits the user's decision. A nudge would make the agent
-/// re-ask mid-discussion, so it sends nobody back, while a mixed branch's
-/// waiting plan still does.
 #[test]
 fn a_plan_only_hold_sends_the_agent_nowhere() {
     let mut ledger = ReentryLedger::default();
@@ -153,8 +141,6 @@ fn work_with_no_hold_is_left_alone() {
     assert!(ledger.take_due(&idle(session("a1", None))).is_none());
 }
 
-/// An integrated sub-thread's handed-up work is its finished state, so its
-/// turn end sends the agent nowhere.
 #[test]
 fn integrated_work_sends_the_agent_nowhere() {
     let mut ledger = ReentryLedger::default();
@@ -162,11 +148,8 @@ fn integrated_work_sends_the_agent_nowhere() {
     assert!(ledger.take_due(&held).is_none());
 }
 
-// ---- the context ceiling (ADR 0629) ----
-
 const K: u64 = 1_000;
 
-/// An owed crossing in a 1M window, under a 300k ceiling.
 fn past(tokens: u64) -> CeilingFacts {
     CeilingFacts {
         owed: ContextCeiling::Tokens(300 * K).crossed_by(SessionReading {
@@ -234,8 +217,6 @@ fn ceiling_delivery_needs_a_recorded_crossing() {
     assert_eq!(facts.crossing(), None);
 }
 
-/// I1, I16: an unread input, an open card or a pending handoff keeps the
-/// session from handing off at this turn end.
 #[test]
 fn ceiling_never_fires_while_the_session_is_busy() {
     let busy = CeilingFacts {
@@ -245,8 +226,6 @@ fn ceiling_never_fires_while_the_session_is_busy() {
     assert_eq!(busy.crossing(), None);
 }
 
-/// I13: a turn due both re-entries sends only the ceiling's, and the hold's
-/// HEAD stays unspent for the successor session.
 #[test]
 fn ceiling_outranks_the_proposal_hold() {
     let crossing = past(400 * K).crossing();
@@ -271,8 +250,6 @@ fn ceiling_outranks_the_proposal_hold() {
     );
 }
 
-/// The ledger sends the ceiling once per run, and the crossing counts on an
-/// external-repo turn whose session facts never complete.
 #[test]
 fn the_ledger_sends_the_ceiling_once_even_with_no_session_facts() {
     let crossing = past(400 * K).crossing();
@@ -285,8 +262,6 @@ fn the_ledger_sends_the_ceiling_once_even_with_no_session_facts() {
     assert_eq!(ledger.take_due(&external), None);
 }
 
-/// A held thread withheld the re-entry rather than sending it. The ledger
-/// forgets it, so the next idle sends it again, at the same HEAD too.
 #[test]
 fn a_withheld_reentry_comes_due_again() {
     let crossing = past(400 * K).crossing();
@@ -316,8 +291,6 @@ fn session_13_shape_delivers_the_recorded_crossing_once() {
     );
     assert_eq!(ledger.take_due(&turn_end), None);
 }
-
-// ---- the forced read decision ----
 
 async fn emit(bus: &EventBus, thread_id: Uuid, channel: EventChannel, event: ThreadEvent) -> Uuid {
     bus.emit_for_id(BusEvent::Thread {
@@ -363,7 +336,6 @@ fn idled_event() -> ThreadEvent {
     serde_json::from_value(serde_json::json!({ "type": "CodingAgentIdled", "data": {} })).unwrap()
 }
 
-/// A deadline no offline test reaches.
 const TEST_DEADLINE: Duration = Duration::from_secs(30);
 
 fn forced<'a>(
@@ -377,7 +349,6 @@ fn forced<'a>(
     }
 }
 
-/// The read decision's chat backend over `provider`.
 fn chat_judge(provider: impl crate::llm::LlmProvider + 'static) -> ChatJudgmentProvider {
     read_decision_chat_judge(Arc::new(provider), None)
 }
@@ -390,9 +361,6 @@ fn turn(message: &str, reply: &str) -> TurnRead {
     }
 }
 
-/// The Home turn that landed in Review: a finished child thread's report opened
-/// it, and the reply said the change was applied. The report must never reach
-/// the forced call dressed as the user's request.
 #[test]
 fn a_child_report_reaches_the_forced_call_as_a_report_not_the_users_message() {
     let home = TurnRead {
@@ -414,7 +382,6 @@ fn a_child_report_reaches_the_forced_call_as_a_report_not_the_users_message() {
     assert!(asked.starts_with("The user's message:\n"), "{asked}");
 }
 
-/// The event names pin the wire contract: they are the stored event types.
 #[test]
 fn the_opening_source_follows_the_event_and_its_sender() {
     let source = OpeningSource::from_event;
@@ -488,8 +455,6 @@ async fn an_empty_reply_is_a_no_without_a_call() {
     );
 }
 
-/// A model that answers in text gave no answer, and a missing answer asks to
-/// be read (I4).
 #[tokio::test]
 async fn a_text_answer_is_no_answer_and_asks_to_be_read() {
     let judge = chat_judge(ScriptedProvider::new("m", vec!["I think yes."]));
@@ -503,8 +468,6 @@ async fn a_text_answer_is_no_answer_and_asks_to_be_read() {
     );
 }
 
-/// The threshold reads the probability of yes. A tie reads, and a missing
-/// answer reads (I4).
 #[test]
 fn the_threshold_reads_a_tie_and_a_missing_answer_as_a_read() {
     let answered = |p: f64| {
@@ -526,8 +489,6 @@ fn the_threshold_reads_a_tie_and_a_missing_answer_as_a_read() {
     assert_eq!(decision_from(&Answers::default()), ReadDecision::Requested);
 }
 
-/// What the read decision asks any backend: one yes/no question, over the
-/// turn as text. Nothing else rides on the call (I10).
 #[tokio::test]
 async fn the_decision_asks_one_question_over_the_turn() {
     type Asked = (serde_json::Value, Vec<(String, Question)>);
@@ -561,8 +522,6 @@ async fn the_decision_asks_one_question_over_the_turn() {
     );
 }
 
-/// A call that fails records a read request in the engine's name. The reply
-/// then waits in Review rather than hiding.
 #[tokio::test]
 async fn a_failed_call_records_a_read_request_from_the_engine() {
     let (pool, db) = setup_test_db().await;
@@ -579,7 +538,7 @@ async fn a_failed_call_records_a_read_request_from_the_engine() {
     let outcome: Result<ReadDecision, Box<dyn std::error::Error + Send + Sync>> =
         Err("the System One call and its chat fallback both failed".into());
     assert_eq!(
-        record_forced_decision(&bus, thread_id, outcome).await,
+        record_forced_decision(&pool, &bus, thread_id, None, outcome).await,
         ReadDecision::Requested
     );
 
@@ -714,8 +673,6 @@ async fn trigger_read_decision_case() {
     teardown_test_db(&db).await;
 }
 
-// ---- the coding-agent turn ----
-
 #[tokio::test]
 async fn a_coding_agent_turn_reads_only_its_own_handoff() {
     let (pool, db) = setup_test_db().await;
@@ -789,8 +746,6 @@ async fn a_coding_agent_turn_reads_only_its_own_handoff() {
     teardown_test_db(&db).await;
 }
 
-/// An earlier turn's decision never satisfies a later turn: the turn starts
-/// after the previous `CodingAgentIdled`.
 #[tokio::test]
 async fn a_coding_agent_turn_reads_its_own_decision_message_and_reply() {
     let (pool, db) = setup_test_db().await;
@@ -800,7 +755,15 @@ async fn a_coding_agent_turn_reads_its_own_decision_message_and_reply() {
     emit(&bus, thread_id, cc, message("fix the build")).await;
     start_cc_session(&bus, thread_id, "claude-code/test", None).await;
 
-    emit(&bus, thread_id, cc, ThreadEvent::ThreadReadNotRequested).await;
+    emit(
+        &bus,
+        thread_id,
+        cc,
+        ThreadEvent::ThreadReadNotRequested {
+            supersedes_request: false,
+        },
+    )
+    .await;
     emit(&bus, thread_id, cc, reply("Fixed.")).await;
     emit(&bus, thread_id, cc, idled_event()).await;
     let follow_up = ThreadEvent::PromptInjected {
@@ -827,7 +790,15 @@ async fn a_coding_agent_turn_reads_its_own_decision_message_and_reply() {
     assert_eq!(turn.source, OpeningSource::UserMessage);
     assert_eq!(turn.reply, "The crash comes from the parser.");
 
-    emit(&bus, thread_id, cc, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        thread_id,
+        cc,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     assert!(
         coding_agent_turn_read(&pool, thread_id, None)
             .await
@@ -835,8 +806,6 @@ async fn a_coding_agent_turn_reads_its_own_decision_message_and_reply() {
             .decided
     );
 
-    // A follow-up that lands before the turn ends moves neither the
-    // decision nor the opening message.
     let mid_turn = ThreadEvent::PromptInjected {
         text: "also check the logs".into(),
         mode: ActorMode::Human,
@@ -854,8 +823,6 @@ async fn a_coding_agent_turn_reads_its_own_decision_message_and_reply() {
     teardown_test_db(&db).await;
 }
 
-/// An event-wait delivery or a re-entry speaks for the engine, so the forced
-/// call must not read it as the user's request.
 #[tokio::test]
 async fn a_coding_agent_turn_opened_by_an_agent_prompt_says_so() {
     let (pool, db) = setup_test_db().await;
@@ -881,7 +848,6 @@ async fn a_coding_agent_turn_opened_by_an_agent_prompt_says_so() {
     assert_eq!(turn.message, "The background task finished.");
     assert_eq!(turn.source, OpeningSource::AgentOrEngine);
 
-    // An engine retrigger names the engine only in its origin.
     emit(&bus, thread_id, cc, idled_event()).await;
     let retrigger = ThreadEvent::CodingAgentPromptSent {
         input_event_id: None,
@@ -900,8 +866,6 @@ async fn a_coding_agent_turn_opened_by_an_agent_prompt_says_so() {
     teardown_test_db(&db).await;
 }
 
-/// The change already asks for the look. A read request beside it would
-/// outlive the Apply as an unread dot, so the turn decides no, unasked.
 #[tokio::test]
 async fn a_turn_holding_a_change_decides_no_without_a_call() {
     let (pool, db) = setup_test_db().await;
@@ -944,7 +908,7 @@ async fn a_turn_holding_a_change_decides_no_without_a_call() {
     let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::ReadDecision);
     let outcome = forced(&judge, &capture).decide(&turn).await;
     assert_eq!(
-        record_forced_decision(&bus, thread_id, outcome).await,
+        record_forced_decision(&pool, &bus, thread_id, Some(&turn), outcome).await,
         ReadDecision::NotRequested
     );
     assert!(aux_captures(&pool, thread_id, "read_decision")
@@ -963,11 +927,6 @@ async fn a_turn_holding_a_change_decides_no_without_a_call() {
     teardown_test_db(&db).await;
 }
 
-// ---- work still in flight ----
-
-/// The nightly orchestrator's progress turn: a sub-thread reported, and the
-/// thread still waits on the others. The forced call must learn that, and the
-/// final turn, with nothing left, must read as it did before.
 #[test]
 fn a_turn_ending_in_flight_says_what_it_waits_on_and_the_end_does_not() {
     let step = TurnRead {
@@ -1007,20 +966,14 @@ fn a_turn_ending_in_flight_says_what_it_waits_on_and_the_end_does_not() {
     };
     assert!(!read_decision_prompt(&end).contains("Closing note"));
 
-    // The note means nothing unless the system prompt says what it implies.
     assert!(READ_DECISION_INSTRUCTIONS.contains(
         "When a closing note says the thread's work is still in flight, a progress report"
     ));
 }
 
-// ---- a report the parent agent acts on (ADR 0446) ----
-
 const PARENT_NOTE: &str =
     "The parent agent acts on a waking report now and reads a filed repeat on its next turn.";
 
-/// The archive sub-thread that landed in Review: a parent agent asked for a
-/// run, the reply reported it, and the report woke the parent. The forced call
-/// must learn that the parent acts on it (I2).
 fn archive_report() -> TurnRead {
     TurnRead {
         source: OpeningSource::AgentOrEngine,
@@ -1037,7 +990,6 @@ fn a_report_that_wakes_the_parent_agent_says_so() {
     let prompt = read_decision_prompt(&archive_report());
     assert!(prompt.ends_with(PARENT_NOTE), "{prompt}");
 
-    // Both notes show, the in-flight one first.
     let in_flight = TurnRead {
         in_flight: InFlight {
             sub_threads: 1,
@@ -1050,13 +1002,10 @@ fn a_report_that_wakes_the_parent_agent_says_so() {
     assert!(both.contains("It waits on 1 sub-thread.\n\n"), "{both}");
     assert!(both.ends_with(PARENT_NOTE), "{both}");
 
-    // The note means nothing unless the system prompt says what it implies.
     assert!(READ_DECISION_INSTRUCTIONS
         .contains("When a closing note says the parent agent acts on this reply now"));
 }
 
-/// ADR 0607 shares the must-see criteria with the sub-thread's own rule, so
-/// the judge's paragraph has to stay what ADR 0472 measured.
 #[test]
 fn the_judge_keeps_its_parent_paragraph_byte_for_byte() {
     assert!(READ_DECISION_INSTRUCTIONS.contains(
@@ -1072,7 +1021,6 @@ fn the_judge_keeps_its_parent_paragraph_byte_for_byte() {
     ));
 }
 
-/// A filed report, and a turn the user opened or resumed, read as before.
 #[test]
 fn only_an_agent_opened_turn_waking_its_parent_carries_the_note() {
     let filed = TurnRead {
@@ -1096,9 +1044,6 @@ fn only_an_agent_opened_turn_waking_its_parent_carries_the_note() {
     }
 }
 
-/// The read prompt claims a wake exactly when the fan-in delivers one (I4).
-/// The test records the wake decision as the gate does, and builds the read
-/// prompt from it. Then the child's reply reaches the parent.
 #[tokio::test]
 async fn the_parent_note_matches_what_the_fan_in_delivers() {
     let (pool, db) = setup_test_db().await;
@@ -1150,9 +1095,6 @@ async fn the_parent_note_matches_what_the_fan_in_delivers() {
     teardown_test_db(&db).await;
 }
 
-/// The wake decision runs first only where the read decision reads it, so
-/// every other turn still makes both calls at once (I7). An agent's own read
-/// decision is kept, and no call reads the wake for it (I1).
 #[test]
 fn the_wake_decision_settles_first_only_for_a_forced_read_on_an_agent_turn() {
     let agent_turn = archive_report();
@@ -1164,8 +1106,6 @@ fn the_wake_decision_settles_first_only_for_a_forced_read_on_an_agent_turn() {
     };
     assert!(!wake_settles_first(false, &users_own));
 }
-
-// ---- a question answered inside the turn ----
 
 fn asked(tool_use_id: &str, question: &str, options: &[(&str, &str)]) -> ThreadEvent {
     ThreadEvent::UserQuestionAsked {
@@ -1207,9 +1147,6 @@ fn typed(text: &str) -> AnswerKind {
     }
 }
 
-/// The trigger run that landed in Review: it asked the user a question, the
-/// answer resumed the same turn, and the reply only confirmed that answer.
-/// The forced call saw the run's instruction and the reply, never the answer.
 #[test]
 fn an_answer_inside_the_turn_reaches_the_forced_call_between_opener_and_reply() {
     let watch = TurnRead {
@@ -1239,12 +1176,9 @@ fn an_answer_inside_the_turn_reaches_the_forced_call_between_opener_and_reply() 
         "{prompt}"
     );
 
-    // The answer means nothing unless the system prompt says what it implies.
     assert!(READ_DECISION_INSTRUCTIONS.contains("The user answered"));
 }
 
-/// A chat turn reads the latest answer after its opener, never one from an
-/// earlier turn, and a cancelled card is no answer.
 #[tokio::test]
 async fn a_chat_turn_reads_the_answer_after_its_opener_only() {
     let (pool, db) = setup_test_db().await;
@@ -1300,7 +1234,6 @@ async fn a_chat_turn_reads_the_answer_after_its_opener_only() {
     teardown_test_db(&db).await;
 }
 
-/// A coding-agent turn reads the answer given since its last idle.
 #[tokio::test]
 async fn a_coding_agent_turn_reads_the_answer_since_its_last_idle() {
     let (pool, db) = setup_test_db().await;
@@ -1370,8 +1303,6 @@ fn child_message(text: &str, parent: Uuid) -> ThreadEvent {
     }
 }
 
-/// Both turn readers take the in-flight facts from the summary as the turn
-/// ends: a running sub-thread and the thread's own live event wait.
 #[tokio::test]
 async fn both_turn_readers_see_a_running_sub_thread_and_a_live_wait() {
     let (pool, db) = setup_test_db().await;
@@ -1444,8 +1375,6 @@ async fn both_turn_readers_see_a_running_sub_thread_and_a_live_wait() {
     teardown_test_db(&db).await;
 }
 
-// ---- a notification the turn already sent ----
-
 fn pushed(title: &str, message: &str) -> PushedNotification {
     PushedNotification {
         title: title.into(),
@@ -1453,8 +1382,6 @@ fn pushed(title: &str, message: &str) -> PushedNotification {
     }
 }
 
-/// A turn that pushed its news and ended undecided: the forced call must
-/// learn what the push already said (I5).
 #[test]
 fn a_turn_that_pushed_says_what_the_user_already_got() {
     let run = TurnRead {
@@ -1493,7 +1420,6 @@ fn a_turn_that_pushed_says_what_the_user_already_got() {
     };
     assert!(!read_decision_prompt(&quiet).contains("Closing note"));
 
-    // The note means nothing unless the question says what it implies.
     assert!(READ_DECISION_INSTRUCTIONS
         .contains("When a closing note says the turn already sent the user a notification"));
 }
@@ -1508,7 +1434,6 @@ fn a_routine_trigger_report_is_a_no_even_when_requested() {
         .contains("The one exception is a failure the notification does not mention."));
 }
 
-/// A long push reaches the call cut in the middle, like the reply.
 #[test]
 fn a_long_push_is_cut_to_its_budget() {
     let long = "x".repeat(10_000);
@@ -1524,7 +1449,6 @@ fn a_long_push_is_cut_to_its_budget() {
     );
 }
 
-/// Emit a `send_notification` call and its result.
 async fn send_notification(bus: &EventBus, thread_id: Uuid, title: &str, success: bool) {
     let called = emit(
         bus,
@@ -1557,8 +1481,6 @@ async fn send_notification(bus: &EventBus, thread_id: Uuid, title: &str, success
     .await;
 }
 
-/// The push note counts only what this turn delivered: never a push from an
-/// earlier turn, a failed one, or one on another thread (I4).
 #[tokio::test]
 async fn a_chat_turn_reads_only_the_pushes_it_delivered() {
     let (pool, db) = setup_test_db().await;
@@ -1590,8 +1512,6 @@ fn unstarted(head: &str) -> SessionFacts {
     }
 }
 
-/// An approved plan with no source change sends the agent back once per
-/// session, never after a Stop, and an asked one is asked again.
 #[test]
 fn the_approved_plan_re_entry_sends_once_and_only_after_a_completed_turn() {
     let mut ledger = ReentryLedger::default();
@@ -1612,7 +1532,6 @@ fn the_approved_plan_re_entry_sends_once_and_only_after_a_completed_turn() {
     );
 }
 
-/// The ceiling outranks the approved plan, which outranks a proposal hold.
 #[test]
 fn the_approved_plan_sits_between_the_ceiling_and_the_hold() {
     let crossing = CeilingCrossing {
@@ -1668,4 +1587,222 @@ fn only_an_unpaused_due_hold_hides_its_owner_reason() {
     assert!(!ledger
         .hold_reentry("b2", false)
         .contains(ProposalHold::Plan(PlanHold::PlanOnlyAwaitingApproval)));
+}
+
+async fn read_requested(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar("SELECT read_requested FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn opened_by(source: OpeningSource) -> TurnRead {
+    TurnRead {
+        source,
+        ..TurnRead::default()
+    }
+}
+
+fn child_opening(
+    parent: Uuid,
+    wake_mode: Option<crate::engine::thread_events::WakeMode>,
+) -> ThreadEvent {
+    let mut opening = message("report please");
+    if let ThreadEvent::MessageReceived {
+        parent_thread_id,
+        wake_mode: mode,
+        mode: actor_mode,
+        ..
+    } = &mut opening
+    {
+        *parent_thread_id = Some(parent);
+        *mode = wake_mode;
+        *actor_mode = ActorMode::Agent;
+    }
+    opening
+}
+
+async fn asked_to_be_read(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+    parent: Option<Uuid>,
+    wake_mode: Option<crate::engine::thread_events::WakeMode>,
+    opener: OpeningSource,
+) -> Uuid {
+    let thread_id = Uuid::new_v4();
+    let opening = match parent {
+        Some(parent) => child_opening(parent, wake_mode),
+        None => message("report please"),
+    };
+    emit(bus, thread_id, EventChannel::Chat, opening).await;
+    let turn = opened_by(opener);
+    record_forced_decision(
+        pool,
+        bus,
+        thread_id,
+        Some(&turn),
+        Ok(ReadDecision::Requested),
+    )
+    .await;
+    emit(
+        bus,
+        thread_id,
+        EventChannel::Chat,
+        reply("Blocked on the shell."),
+    )
+    .await;
+    thread_id
+}
+
+async fn decide_no(pool: &sqlx::PgPool, bus: &EventBus, thread_id: Uuid) {
+    let turn = opened_by(OpeningSource::AgentOrEngine);
+    record_forced_decision(
+        pool,
+        bus,
+        thread_id,
+        Some(&turn),
+        Ok(ReadDecision::NotRequested),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_later_no_clears_an_unseen_request_only_where_the_parent_acts() {
+    use crate::engine::thread_events::WakeMode;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = Uuid::new_v4();
+    emit(&bus, parent, EventChannel::Chat, message("run the program")).await;
+
+    let cases = [
+        (Some(parent), Some(WakeMode::Wake), false),
+        (Some(parent), Some(WakeMode::WakeWhenAllDone), false),
+        (Some(parent), Some(WakeMode::NoWake), true),
+        (Some(parent), None, true),
+        (None, None, true),
+    ];
+    for (parent_id, wake_mode, still_requested) in cases {
+        let opener = OpeningSource::ChildThreadReport;
+        let thread_id = asked_to_be_read(&pool, &bus, parent_id, wake_mode, opener).await;
+        decide_no(&pool, &bus, thread_id).await;
+        assert_eq!(
+            read_requested(&pool, thread_id).await,
+            still_requested,
+            "parent {parent_id:?}, wake mode {wake_mode:?}"
+        );
+    }
+
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_later_no_leaves_a_request_from_a_turn_the_user_opened() {
+    use crate::engine::thread_events::WakeMode;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = Uuid::new_v4();
+    emit(&bus, parent, EventChannel::Chat, message("run the program")).await;
+
+    let opener = OpeningSource::UserMessage;
+    let users = asked_to_be_read(&pool, &bus, Some(parent), Some(WakeMode::Wake), opener).await;
+    decide_no(&pool, &bus, users).await;
+    assert!(read_requested(&pool, users).await);
+
+    let unread = Uuid::new_v4();
+    emit(&bus, unread, EventChannel::Chat, message("report please")).await;
+    record_forced_decision(&pool, &bus, unread, None, Err("unreadable".into())).await;
+    decide_no(&pool, &bus, unread).await;
+    assert!(read_requested(&pool, unread).await);
+
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_parent_yes_over_an_unseen_user_yes_keeps_it_for_a_later_no() {
+    use crate::engine::thread_events::WakeMode;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = Uuid::new_v4();
+    emit(&bus, parent, EventChannel::Chat, message("run the program")).await;
+
+    let opener = OpeningSource::UserMessage;
+    let child = asked_to_be_read(&pool, &bus, Some(parent), Some(WakeMode::Wake), opener).await;
+    let parents_turn = opened_by(OpeningSource::ChildThreadReport);
+    record_forced_decision(
+        &pool,
+        &bus,
+        child,
+        Some(&parents_turn),
+        Ok(ReadDecision::Requested),
+    )
+    .await;
+    decide_no(&pool, &bus, child).await;
+    assert!(read_requested(&pool, child).await);
+
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_later_no_leaves_a_request_from_a_turn_the_user_wrote_into() {
+    use crate::engine::thread_events::WakeMode;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = Uuid::new_v4();
+    emit(&bus, parent, EventChannel::Chat, message("run the program")).await;
+
+    let child = Uuid::new_v4();
+    let opening = child_opening(parent, Some(WakeMode::Wake));
+    let opener = emit(&bus, child, EventChannel::Chat, opening).await;
+    let follow_up = child_opening(parent, Some(WakeMode::Wake));
+    emit(&bus, child, EventChannel::Chat, follow_up).await;
+    let parents_turn = chat_turn_read(&pool, child, opener, "").await;
+    assert!(!parents_turn.reply_is_the_users());
+
+    let question = message("what did you find?");
+    emit(&bus, child, EventChannel::Chat, question).await;
+    let turn = chat_turn_read(&pool, child, opener, "Found it.").await;
+    assert!(turn.user_wrote_in_turn);
+    record_forced_decision(&pool, &bus, child, Some(&turn), Ok(ReadDecision::Requested)).await;
+    emit(&bus, child, EventChannel::Chat, reply("Found it.")).await;
+    decide_no(&pool, &bus, child).await;
+    assert!(read_requested(&pool, child).await);
+
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_coding_agent_turn_counts_only_human_input_as_the_users() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let cc = EventChannel::ClaudeCode;
+    let parent = Uuid::new_v4();
+    emit(&bus, parent, EventChannel::Chat, message("run the program")).await;
+    let child = Uuid::new_v4();
+    emit(&bus, child, cc, child_opening(parent, None)).await;
+    start_cc_session(&bus, child, "claude-code/test", None).await;
+
+    let follow_up = emit(&bus, child, cc, child_opening(parent, None)).await;
+    let forwarded = ThreadEvent::CodingAgentPromptSent {
+        text: "report please".into(),
+        coding_agent: CodingAgent::ClaudeCode,
+        origin: None,
+        input_event_id: Some(follow_up),
+    };
+    emit(&bus, child, cc, forwarded).await;
+    let parents_turn = coding_agent_turn_read(&pool, child, None).await.unwrap();
+    assert!(!parents_turn.user_wrote_in_turn);
+
+    let mid_turn = ThreadEvent::PromptInjected {
+        text: "what did you find?".into(),
+        mode: ActorMode::Human,
+        origin: None,
+        injected_message_id: None,
+        delivered_event_id: None,
+    };
+    emit(&bus, child, cc, mid_turn).await;
+    let turn = coding_agent_turn_read(&pool, child, None).await.unwrap();
+    assert!(turn.user_wrote_in_turn);
+
+    teardown_test_db(&db).await;
 }

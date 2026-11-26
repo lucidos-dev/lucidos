@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// The purpose of a plan, supplied explicitly when planning starts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlanKind {
@@ -18,7 +17,6 @@ impl PlanKind {
     }
 }
 
-/// Evidence that opened the source-edit gate or approved a plan-only landing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlanApprovalKind {
@@ -37,7 +35,6 @@ impl From<PlanKind> for PlanApprovalKind {
     }
 }
 
-/// What the user's plan approval permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlanScope {
@@ -45,7 +42,6 @@ pub enum PlanScope {
     PlanOnly,
 }
 
-/// Content of the actual proposed or landed diff. Historical events default to code.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeContent {

@@ -1,4 +1,4 @@
-//! The gateway URL Claude Code's managed settings force on this machine.
+//! INVARIANT: The gateway URL Claude Code's managed settings force on this machine.
 //!
 //! Settings offers it as the gateway URL. Reading it never signs in: the user
 //! still confirms the URL.
@@ -7,18 +7,14 @@ use std::path::Path;
 
 use super::GatewayOrigin;
 
-/// The managed setting that names the gateway Claude Code signs in to.
 const GATEWAY_URL_KEY: &str = "forceLoginGatewayUrl";
 
-/// The gateway this machine's Claude Code managed settings name, if any.
 pub fn suggested_url() -> Option<String> {
     suggested_url_in(&lucidos_claude_code_managed::managed_settings_path(
         Path::new(lucidos_claude_code_managed::MANAGED_DIR),
     ))
 }
 
-/// The gateway the managed settings file at `path` names. A missing file, or
-/// a URL that cannot be a gateway origin, suggests nothing.
 fn suggested_url_in(path: &Path) -> Option<String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,

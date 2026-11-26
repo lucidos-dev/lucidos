@@ -1,9 +1,3 @@
-//! A live `log stream` of Seatbelt write denials, on macOS.
-//!
-//! The kernel streams these records but does not store them, so a `log show`
-//! after the command has exited finds nothing. A trigger-scoped spawn starts
-//! the stream first, and a failed command reads what it buffered.
-
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::{BufRead, BufReader};
@@ -13,41 +7,27 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// Each stream ends by itself, so an engine that exits leaves none behind
-/// for long.
 const STREAM_MINUTES: u64 = 15;
 const STREAM_LIFETIME: Duration = Duration::from_secs(STREAM_MINUTES * 60);
-/// The longest confined command that reads a denial, as [`ensure`] last
-/// named it. A stream must outlive every command spawned under it, and a
-/// record must outlive the command that caused it.
 static LONGEST_COMMAND_SECS: AtomicU64 = AtomicU64::new(0);
 const READY_WAIT: Duration = Duration::from_secs(2);
 const KEPT_RECORDS: usize = 512;
-/// How long a failed command waits for its denial to arrive.
 const ARRIVAL_WAIT: Duration = Duration::from_millis(500);
 
-/// Why the denial stream is missing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamProblem {
-    /// A renewal could not spawn, so the old stream runs out first.
     NotRenewed,
-    /// No stream attached, so folder grants rely on command output.
     NotStarted,
 }
 
 enum State {
     Idle,
-    /// A first stream is attaching. Other spawns go ahead without waiting.
     Starting,
     Live {
         generation: u64,
         since: Instant,
-        /// The next stream is attaching in the background. A renewal that
-        /// fails leaves this set, so the old stream runs out first.
         renewing: bool,
     },
-    /// A stream that could not start, such as for a user who is not an admin,
-    /// is tried again only after a full stream lifetime.
     Failed {
         at: Instant,
     },
@@ -68,10 +48,6 @@ fn watch() -> MutexGuard<'static, Watch> {
     WATCH.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Makes sure a stream is live before a confined command spawns. The first
-/// call waits up to two seconds for the stream to attach. A renewal attaches
-/// in the background while the old stream still covers new commands.
-/// `report` hears of a stream that could not start or renew.
 pub fn ensure(longest_command: Duration, report: fn(StreamProblem)) {
     LONGEST_COMMAND_SECS.store(longest_command.as_secs(), Ordering::Relaxed);
     let generation = {
@@ -109,8 +85,6 @@ pub fn ensure(longest_command: Duration, report: fn(StreamProblem)) {
     settle(generation, off_the_runtime(|| start(generation)), report);
 }
 
-/// Records the outcome of a start. The stream counts as live only while it
-/// still runs, checked under the lock its reader takes when it ends.
 fn settle(generation: u64, stream: Option<Arc<AtomicBool>>, report: fn(StreamProblem)) {
     let mut watch = watch();
     if stream.is_some_and(|running| running.load(Ordering::Acquire)) {
@@ -127,7 +101,6 @@ fn settle(generation: u64, stream: Option<Arc<AtomicBool>>, report: fn(StreamPro
     }
 }
 
-/// Runs a blocking wait without stalling the other tasks on a tokio worker.
 fn off_the_runtime<T>(wait: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(runtime) if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -137,7 +110,6 @@ fn off_the_runtime<T>(wait: impl FnOnce() -> T) -> T {
     }
 }
 
-/// The first buffered write denial for `pid` since `started`.
 pub async fn denial(pid: u32, started: chrono::DateTime<chrono::Utc>) -> Option<String> {
     let live = matches!(watch().state, State::Live { .. });
     let deadline = Instant::now() + ARRIVAL_WAIT;
@@ -154,8 +126,6 @@ pub async fn denial(pid: u32, started: chrono::DateTime<chrono::Utc>) -> Option<
     }
 }
 
-/// Starts a stream and waits until it delivers a marker this process logs.
-/// The flag it returns stays set while the stream runs.
 fn start(generation: u64) -> Option<Arc<AtomicBool>> {
     let marker = format!("lucidos-seatbelt-watch-{}-{generation}", std::process::id());
     let predicate = predicate(&marker);
@@ -223,7 +193,6 @@ fn start(generation: u64) -> Option<Arc<AtomicBool>> {
     None
 }
 
-/// Write denials from the senders the parser trusts, or this run's marker.
 fn predicate(marker: &str) -> String {
     let senders = SEATBELT_SENDERS
         .iter()
@@ -270,8 +239,6 @@ fn stop(pid: u32) {
 
 pub const SEATBELT_SENDERS: [&str; 2] = ["/kernel", "/usr/libexec/sandboxd"];
 
-/// The first Seatbelt write denial for `pid` in `log stream --style ndjson`
-/// lines, as a line [`crate::write_refusal::refused_path`] reads, from a [`SEATBELT_SENDERS`] entry.
 pub fn seatbelt_denial(
     ndjson: &str,
     pid: u32,
@@ -302,8 +269,6 @@ pub fn seatbelt_denial(
 mod tests {
     use super::*;
 
-    /// One `log stream --style ndjson` line, in the shape the kernel's Sandbox
-    /// extension logs a denial.
     fn log_line(sender: &str, timestamp: &str, message: &str) -> String {
         serde_json::json!({
             "eventMessage": message,
@@ -340,10 +305,8 @@ mod tests {
             ),
             expected
         );
-        // A child can log this message itself.
         assert_eq!(denial("/usr/bin/logger", at, create), None);
         assert_eq!(denial("/bin/sh", at, create), None);
-        // Another run, or another process.
         assert_eq!(
             denial("/kernel", "2026-11-19 09:59:59.000000+0100", create),
             None
@@ -356,7 +319,6 @@ mod tests {
             ),
             None
         );
-        // Reads and relative paths never name a grantable folder.
         assert_eq!(
             denial(
                 "/kernel",

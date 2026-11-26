@@ -1,83 +1,39 @@
-//! The gateway constants other components must agree with: the engine reads
-//! them directly, the app through the generated `gateway-constants.ts`
-//! (ADR 0368).
-
-/// The `chrono` format that starts every engine and gateway log line: RFC 3339
-/// with the local UTC offset, such as `2026-11-11T21:25:19+01:00`. A line in
-/// the host log then names its day and zone on any install.
 pub const LOG_STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%:z";
 
-/// A device session must never impersonate a device paired with the gateway.
 pub const DEVICE_SESSION_OWNER_DEVICE: &str = "device_session_owner_device";
 
-/// Digits in a pairing code. Short enough to type on a phone. Its safety comes
-/// from the TTL, single use and a local-only channel, not from the digits.
 pub const PAIRING_CODE_DIGITS: u32 = 8;
 
-/// The prefix of a device pairing secret, the long secret a QR or link carries.
 pub const DEVICE_PAIRING_SECRET_PREFIX: &str = "ldp_";
 
-/// The prefix of a gateway pairing secret, which one gateway pastes into
-/// another.
 pub const GATEWAY_PAIRING_SECRET_PREFIX: &str = "lgp_";
 
-/// Lowercase base32 characters after a pairing secret's prefix. 26 of them
-/// carry 130 random bits, which no flood can guess.
 pub const PAIRING_SECRET_CHARS: usize = 26;
 
-/// The URL parameter carrying the code to the pairing screen.
-///
-/// `crates/lucidos-app/src/utils/pairingCodeSeed.ts` reads it, then strips it
-/// from the address bar.
 pub const PAIR_PARAM: &str = "pair";
 
-/// The reserved sigil that prefixes all gateway-owned paths (`/~/…`). A
-/// workspace slug can never start with it.
 pub const SIGIL: char = '~';
 
-/// The gateway's own health. Public, so a probe presents no credential. Its
-/// `instance_id` is what proves which gateway answered at an address.
 pub const GATEWAY_HEALTH_PATH: &str = "/~/api/v1/health";
 
-/// Joins a workspace slug to a remote gateway's short name in a route:
-/// `/<slug>@<name>/` (ADR 0591). A slug never contains it.
 pub const REMOTE_ROUTE_SEPARATOR: char = '@';
 
-/// The longest short name a remote gateway may take, since it becomes part of
-/// every route to its workspaces.
 pub const REMOTE_GATEWAY_NAME_MAX_LEN: usize = 32;
 
-/// The loopback port an OAuth provider redirects to. Fixed, because the
-/// redirect URI is registered with the provider ahead of time. The gateway
-/// owns it, and an engine binds it only with no gateway.
 pub const OAUTH_CALLBACK_PORT: u16 = 14981;
 
-/// The path the loopback OAuth callback answers on.
 pub const OAUTH_CALLBACK_PATH: &str = "/oauth/callback";
 
-/// Separates the routing prefix from the nonce in a gateway-mode OAuth
-/// `state` (`/dev/~<nonce>`). A nonce is base64url and never holds it, so the
-/// LAST one splits the value.
 pub const OAUTH_STATE_PREFIX_SEPARATOR: char = '~';
 
-/// The engine route a gateway delivers an OAuth callback to, relative to the
-/// engine's `/api/v1` mount.
 pub const OAUTH_DELIVERY_ROUTE: &str = "/internal/oauth/callback";
 
-/// The path a *web redirect URI* names on a gateway's own origin:
-/// `https://<origin>/~/oauth/callback`. Public, since a provider sends the
-/// browser there with no credential.
 pub const OAUTH_WEB_CALLBACK_PATH: &str = "/~/oauth/callback";
 
-/// Stamped by the gateway facing the browser on a request that reached it
-/// straight from this machine. The engine then offers the loopback redirect.
-/// The gateway strips a client's copy on every hop.
 pub const HEADER_LOCAL_BROWSER: &str = "x-lucidos-local-browser";
 
-/// Prefix for databases provisioned by the gateway's shared Postgres cluster.
 pub const WORKSPACE_DATABASE_PREFIX: &str = "lucidos_";
 
-/// Registry routing keys, including legacy ids up to 64 bytes.
 pub fn is_valid_workspace_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -88,16 +44,10 @@ pub fn is_valid_workspace_id(id: &str) -> bool {
         && !id.ends_with('-')
 }
 
-/// Do two display names name the same workspace? Trimmed and case-insensitive:
-/// "Work" and "work" are no more tellable apart in a list than two equal ones.
 pub fn display_names_match(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
-/// Derive a stable, filesystem- and URL-safe slug from a display name:
-/// lowercase, non-alphanumerics collapsed to single `-`, leading/trailing `-`
-/// trimmed. Empty input (or all-punctuation) falls back to `workspace`. The
-/// output is always `[a-z0-9-]`, so it can never start with the gateway sigil.
 pub fn slugify(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut prev_dash = false;
@@ -120,7 +70,6 @@ pub fn slugify(name: &str) -> String {
     }
 }
 
-/// The database authority shared by gateway provisioning and offline restore.
 pub fn workspace_database_name(
     id: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -157,3 +106,5 @@ mod tests {
         }
     }
 }
+
+pub mod backup_archive;

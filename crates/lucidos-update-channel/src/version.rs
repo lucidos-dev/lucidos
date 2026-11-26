@@ -1,11 +1,9 @@
 use semver::Version;
 
-/// Whether a feed version can participate in release precedence.
 pub fn is_valid_version(version: &str) -> bool {
     Version::parse(version.trim()).is_ok()
 }
 
-/// Invalid versions fail closed. Build metadata does not change precedence.
 pub fn is_upgrade(current: &str, offered: &str) -> bool {
     let (Ok(current), Ok(offered)) = (
         Version::parse(current.trim()),
@@ -16,7 +14,6 @@ pub fn is_upgrade(current: &str, offered: &str) -> bool {
     offered.cmp_precedence(&current).is_gt()
 }
 
-/// Strictly increasing semver precedence, shared with TypeScript through codegen.
 pub const ORDERED_VERSIONS: &[&str] = &[
     "0.0.0",
     "9.1.0",

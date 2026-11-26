@@ -21,6 +21,11 @@ import type { PendingCommits } from '../../../api/client';
 
 const cancelApplyAllBatch = vi.fn(async () => {});
 vi.mock('../../../store/actions/chat-changes', () => ({ cancelApplyAllBatch: () => cancelApplyAllBatch() }));
+const focusPaneSpy = vi.fn();
+vi.mock('../../../store/actions/pane', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../store/actions/pane')>(),
+  focusPane: (...args: unknown[]) => focusPaneSpy(...args),
+}));
 const focusThreadOrBootstrap = vi.fn();
 vi.mock('../../../store/actions/threads', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../../store/actions/threads')>(),
@@ -481,6 +486,20 @@ describe('ActivityMenuGroup', () => {
     pendingRow?.click();
     expect(onClose).toHaveBeenCalledOnce();
     expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Build new version');
+  });
+
+  it('focuses the thread pane before the version toast is raised, so the toast lands there', () => {
+    engineVersionPending.value = true;
+    const order: string[] = [];
+    focusPaneSpy.mockImplementationOnce((pane: string) => { order.push(`focus ${pane}`); });
+    const { host: el } = mount();
+    const stop = toasts.subscribe((list) => {
+      if (list.some((t) => t.key === 'engine-new-version')) order.push('toast');
+    });
+    const pendingRow = [...el.querySelectorAll('button')].find((b) => b.textContent?.includes('New code pending'));
+    pendingRow?.click();
+    stop();
+    expect(order).toEqual(['focus thread', 'toast']);
   });
 
   it('opens a fix thread the page never loaded, such as an archived one', async () => {

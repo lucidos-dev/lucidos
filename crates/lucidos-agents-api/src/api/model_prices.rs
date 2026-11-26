@@ -1,6 +1,3 @@
-//! `GET /api/v1/model-prices`: the *price table*, the shipped cards merged
-//! with this workspace's override, each card with its origin (ADR 0525).
-
 use std::sync::Arc;
 
 use axum::{extract::State, routing::get, Json, Router};

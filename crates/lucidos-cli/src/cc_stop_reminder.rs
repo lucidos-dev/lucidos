@@ -1,13 +1,3 @@
-//! Stop hook subcommand: when Claude Code ends its turn on a plaintext
-//! question, send it back once to re-ask through AskUserQuestion. A soft block:
-//! the model re-asks, or keeps its open-ended question and stops again.
-//!
-//! Asking for `/harden` belongs to the engine's turn-end gate, which reaches
-//! both backends (ADR 0417).
-//!
-//! Wired into `<workspace>/.lucidos/cc-settings.json` via the engine's
-//! `cc_settings.rs`.
-
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -15,12 +5,8 @@ use serde::Deserialize;
 
 use crate::workspace::BoxError;
 
-/// Env var the engine sets for sessions that can ask the owner ordinary
-/// questions. Absent for unattended sessions and integrated sub-threads.
 pub(crate) const SESSION_KIND_ENV: &str = "LUCIDOS_SESSION_KIND";
 
-/// Value of [`SESSION_KIND_ENV`] that means "user is at the keyboard, safe
-/// to redirect plaintext questions to AskUserQuestion".
 pub(crate) const SESSION_KIND_INTERACTIVE: &str = "interactive";
 
 #[expect(
@@ -32,10 +18,6 @@ fn cc_sentinel_path(kind: &str, key: &str) -> PathBuf {
     std::env::temp_dir().join(format!("lucidos-cc-{}-{}", kind, key))
 }
 
-/// Subset of CC's Stop-hook stdin payload. CC sends additional fields
-/// (`session_id`, `cwd`, `permission_mode`, `effort`, etc.) that we ignore —
-/// keep this `#[derive(Deserialize)]` permissive (no `deny_unknown_fields`)
-/// so a future CC release adding new fields can't break the hook.
 #[derive(Debug, Deserialize)]
 pub(crate) struct StopHookPayload {
     pub(crate) transcript_path: String,
@@ -45,16 +27,6 @@ pub(crate) fn parse_stop_hook_payload(raw: &str) -> Result<StopHookPayload, BoxE
     serde_json::from_str(raw).map_err(Into::into)
 }
 
-/// Walk the CC transcript JSONL and return the UUID of the last assistant
-/// message iff its FINAL text block ends with `?`, `stop_reason == "end_turn"`,
-/// and no `tool_use` block follows that text. This is the "CC ended its turn
-/// with a plaintext question" signal that the Stop hook turns into an
-/// AskUserQuestion redirect.
-///
-/// Returns `Ok(None)` when the transcript is empty, the last assistant message
-/// doesn't match the pattern, or individual lines are malformed (skipped).
-/// Returns `Err` only when the file can't be opened — caller treats that as
-/// "no signal" so a missing transcript can't break the harden path.
 pub(crate) fn detect_plaintext_question(
     transcript_path: &Path,
 ) -> Result<Option<String>, BoxError> {
@@ -62,11 +34,6 @@ pub(crate) fn detect_plaintext_question(
         .map_err(|e| format!("open transcript {}: {}", transcript_path.display(), e))?;
     let reader = BufReader::new(file);
 
-    // Streaming forward and overwriting `last` is simpler than reverse-seeking
-    // and good enough — transcripts cap at a few MB even for long sessions.
-    // Cheap substring check before the JSON parse rejects the bulk (user /
-    // tool_result / queue-operation / attachment lines) without allocating a
-    // `serde_json::Value` tree per line.
     let mut last_assistant: Option<serde_json::Value> = None;
     for line in reader.lines() {
         let Ok(line) = line else { continue };
@@ -98,7 +65,6 @@ pub(crate) fn detect_plaintext_question(
         .cloned()
         .unwrap_or_default();
 
-    // Find the index of the LAST text block.
     let last_text_idx = content
         .iter()
         .enumerate()
@@ -109,8 +75,6 @@ pub(crate) fn detect_plaintext_question(
         return Ok(None);
     };
 
-    // Reject if any tool_use sits AFTER the last text — CC was working,
-    // not asking.
     let tool_after = content[idx + 1..]
         .iter()
         .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
@@ -171,7 +135,6 @@ pub(crate) fn run() -> Result<(), BoxError> {
     let Some(message_uuid) = question_uuid else {
         return Ok(());
     };
-    // The sentinel means this message was already sent back once.
     let sentinel = question_sentinel_path(&message_uuid);
     if !sentinel.exists() {
         write_sentinel(&sentinel);
@@ -180,12 +143,6 @@ pub(crate) fn run() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Writing the sentinel is the redirect's loop guard. If it silently failed,
-/// the hook would redirect the same question on every Stop. Surface the failure on stderr (CC's hook
-/// stderr is preserved) instead of `let _ = `.
-///
-/// Created exclusively, so a symlink another user planted at the path is
-/// refused rather than followed. A sentinel already there is the guard holding.
 fn write_sentinel(path: &Path) {
     let created = std::fs::OpenOptions::new()
         .write(true)
@@ -233,7 +190,6 @@ mod tests {
 
     #[test]
     fn parse_stop_hook_payload_tolerates_extra_fields() {
-        // CC adds fields over time (permission_mode, effort, etc) — must not break.
         let raw = r#"{
             "session_id": "sid-2",
             "transcript_path": "/tmp/x.jsonl",
@@ -284,8 +240,6 @@ mod tests {
         })]);
         let input = serde_json::json!({ "transcript_path": path }).to_string();
 
-        // Integrated sessions omit the interactive marker. The exact same
-        // transcript still redirects when an owner card is available.
         assert_eq!(redirect_question(None, &input), None);
         assert_eq!(
             redirect_question(Some(SESSION_KIND_INTERACTIVE), &input).as_deref(),
@@ -380,8 +334,6 @@ mod tests {
 
     #[test]
     fn detect_plaintext_question_skips_malformed_lines() {
-        // write_transcript only takes JSON values, so build the file by hand
-        // here to mix a malformed line in alongside a valid one.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
         let good = serde_json::json!({
@@ -421,8 +373,6 @@ mod tests {
 
     #[test]
     fn question_sentinel_path_is_keyed_on_message_uuid() {
-        // Two different message UUIDs must produce two different paths,
-        // so a redirect for one message doesn't suppress the next.
         let a = question_sentinel_path("aaaa");
         let b = question_sentinel_path("bbbb");
         assert_ne!(a, b);
@@ -430,8 +380,6 @@ mod tests {
         assert!(b.to_string_lossy().contains("bbbb"));
     }
 
-    /// The hook acts on a plaintext question and nothing else. Asking for
-    /// `/harden` has one definition, the engine's turn-end gate (ADR 0417).
     #[test]
     fn the_hook_never_asks_for_harden() {
         assert!(!build_question_redirect_json().contains("/harden"));

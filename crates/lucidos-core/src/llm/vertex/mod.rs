@@ -1,17 +1,3 @@
-//! Google Vertex AI provider.
-//!
-//! This module owns the shared `VertexProvider` struct, auth/token plumbing,
-//! endpoint construction, and the `LlmProvider` dispatch. The two request
-//! paths live in child modules:
-//!
-//! - [`claude`] — Claude/Anthropic request-build + SSE stream-parse.
-//! - [`gemini`] — Gemini request-build + response-mapping + search grounding.
-//!
-//! Splitting is purely structural — the public surface (`VertexProvider`,
-//! `LocationHandle`, `TokenCache`, and the free `location_handle` /
-//! `read_location` / `vertex_host` / `get_cached_access_token` helpers) is
-//! unchanged and still reachable at `crate::llm::vertex::*`.
-
 use crate::llm::call_trace;
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
@@ -26,20 +12,12 @@ mod claude;
 mod gemini;
 pub use super::vertex_defaults::sdk_request_defaults;
 
-/// Shared handle to the current Vertex AI region. Updated in place by the
-/// engine when `vertex_region` changes; provider clones read the new value
-/// on their next API call.
 pub type LocationHandle = Arc<std::sync::RwLock<String>>;
 
-/// Construct a `LocationHandle` from an initial region string.
 pub fn location_handle(initial: String) -> LocationHandle {
     Arc::new(std::sync::RwLock::new(initial))
 }
 
-/// Snapshot the current region. Returns `"global"` if the lock is poisoned —
-/// poisoning means a writer panicked mid-update, which should never happen
-/// (writers only call `*guard = new`), but readers still shouldn't take down
-/// every LLM and image call if it does.
 pub fn read_location(handle: &LocationHandle) -> String {
     handle.read().map(|g| g.clone()).unwrap_or_else(|e| {
         crate::log_legacy!(
@@ -50,7 +28,7 @@ pub fn read_location(handle: &LocationHandle) -> String {
     })
 }
 
-/// Derive the Vertex AI API host for a given `location`.
+/// INVARIANT: Derive the Vertex AI API host for a given `location`.
 ///
 /// Three cases, because Vertex serves them on different hosts:
 /// - `global` → the default `aiplatform.googleapis.com`.
@@ -67,8 +45,6 @@ pub fn read_location(handle: &LocationHandle) -> String {
 /// `https://evil.test#-aiplatform.googleapis.com`, whose host is `evil.test`,
 /// and a live ADC access token follows it there.
 pub fn vertex_host(location: &str) -> String {
-    // DNS is case-insensitive and every real region is lowercase, so folding
-    // case first keeps `EUROPE-WEST1` working instead of discarding it.
     let lowered = location.to_ascii_lowercase();
     let location = well_formed_location(&lowered);
     if location == "global" {
@@ -80,27 +56,17 @@ pub fn vertex_host(location: &str) -> String {
     }
 }
 
-/// The model Google Search grounding runs on, for the provider and the request.
 pub const GROUNDING_MODEL: &str = "gemini-3.1-flash-lite";
 
-/// The global Vertex AI host, which a regional host carries as its suffix.
 const VERTEX_GLOBAL_HOST: &str = "aiplatform.googleapis.com";
-/// What a multi-region Vertex AI host ends with.
 const VERTEX_MULTI_REGION_SUFFIX: &str = ".rep.googleapis.com";
 
-/// Whether `host` is a Vertex AI host, in any shape [`vertex_host`] builds.
 pub fn is_vertex_host(host: &str) -> bool {
     host == VERTEX_GLOBAL_HOST
         || host.ends_with(&format!("-{VERTEX_GLOBAL_HOST}"))
         || (host.starts_with("aiplatform.") && host.ends_with(VERTEX_MULTI_REGION_SUFFIX))
 }
 
-/// `location` if it can only ever be a label inside a Google host, else
-/// `global`.
-///
-/// Every real Vertex location is lowercase letters, digits and dashes: `global`,
-/// `eu`, `europe-west1`. Anything else cannot reach a valid endpoint anyway, so
-/// refusing it costs nothing and closes the host-injection above.
 fn well_formed_location(location: &str) -> &str {
     let ok = !location.is_empty()
         && location
@@ -116,21 +82,10 @@ fn well_formed_location(location: &str) -> &str {
     "global"
 }
 
-/// Is `location` one of Vertex's two multi-regions?
-///
-/// They carry Anthropic publisher models but no Google ones. So `vertex_region
-/// = eu` is both the right setting to reach Claude there and a guaranteed 404
-/// for any Gemini model. [`vertex_host`] branches on this, so the host
-/// derivation and the advice cannot name different sets.
 fn is_multi_region(location: &str) -> bool {
     matches!(location, "us" | "eu")
 }
 
-/// The segment after `/<name>/` in an endpoint this module built.
-///
-/// Read back from the URL rather than from the inputs that shaped it. A failure
-/// message then cannot name a project or location the request did not use. A
-/// pinned endpoint reports the location it pinned.
 fn segment_after(url: &str, name: &str) -> Option<String> {
     url.split(&format!("/{name}/"))
         .nth(1)?
@@ -139,48 +94,20 @@ fn segment_after(url: &str, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The `locations/<name>` segment of an endpoint this module built.
-///
-/// `location` here, `region` in anything the user reads: this parses a URL
-/// segment Google spells `locations`, while the Settings label and the
-/// `VERTEX_REGION` env var both say region.
 fn location_from_endpoint(url: &str) -> Option<String> {
     segment_after(url, "locations")
 }
 
-/// The `projects/<id>` segment of an endpoint this module built.
-///
-/// The one Vertex input with no Settings field. It resolves from
-/// `VERTEX_PROJECT_ID`, then the quota project in the gcloud ADC file, then
-/// `gcloud config`. So a user reading a 404 cannot otherwise see which project
-/// the request was billed to.
 fn project_from_endpoint(url: &str) -> Option<String> {
     segment_after(url, "projects")
 }
 
-/// Rewrite Vertex's publisher-model 404 into advice the user can act on.
-///
-/// That 404 has several causes and Vertex names no fix for any of them. The
-/// project may be one that never enabled Claude, the model may need enabling in
-/// Model Garden, or the region may be wrong. The message names the project and
-/// the region it actually used, then the fixes that apply.
-///
-/// Naming the project is the load-bearing half. It is the one Vertex input with
-/// no Settings field, so a user who is on the wrong one has nothing to compare
-/// against.
-///
-/// Returns `None` for every other failure, so an unrelated error keeps its own
-/// wording. The message appends the raw Vertex sentence, so nothing is lost.
 pub(crate) fn explain_publisher_model_404(
     status: u16,
     body: &str,
     model: &str,
     url: &str,
 ) -> Option<String> {
-    // Every live sample spells it `Publisher model`, on the Anthropic and the
-    // Google publisher alike. Matched case-insensitively anyway. No other 404
-    // body carries the phrase, so a wider match cannot misfire. A casing change
-    // at Google would otherwise drop the advice in silence.
     if status != 404 || !body.to_ascii_lowercase().contains("publisher model") {
         return None;
     }
@@ -199,9 +126,6 @@ pub(crate) fn explain_publisher_model_404(
         );
     }
 
-    // Sending the user to the region setting is only honest when changing it
-    // could help. Two cases where it cannot, and naming the setting would point
-    // at a control that must not move.
     if VertexProvider::region_is_pinned(model) {
         advice.push_str(&format!(
             " This model always runs in `{location}`, whatever the region setting says."
@@ -228,16 +152,13 @@ pub struct VertexProvider {
     location: LocationHandle,
     model: String,
     client: reqwest::Client,
-    /// Client without per-request timeout, used for Claude streaming where
+    /// INVARIANT: Client without per-request timeout, used for Claude streaming where
     /// we apply per-chunk timeouts instead.
     streaming_client: reqwest::Client,
-    /// Shared cached access token with expiry (tokens last 3600s, refresh at 3000s)
     token_cache: TokenCache,
 }
 
 impl VertexProvider {
-    /// Build the provider; returns `Err` if either reqwest builder rejects
-    /// the configuration so the engine can fail at startup with a logged reason.
     pub fn new(
         project_id: String,
         location: String,
@@ -274,18 +195,15 @@ impl VertexProvider {
         })
     }
 
-    /// Snapshot the current region. URL builders call this per-request.
     fn current_location(&self) -> String {
         read_location(&self.location)
     }
 
-    /// Whether Vertex uses the Claude request path for this model. Reasoning
-    /// tier selection uses the same classification.
     pub fn is_claude_model(model: &str) -> bool {
         super::claude_model::is_vertex_claude_model(model)
     }
 
-    /// Gemini `:generateContent` endpoint pinned to `locations/global`,
+    /// INVARIANT: Gemini `:generateContent` endpoint pinned to `locations/global`,
     /// ignoring the configured region entirely.
     ///
     /// Two callers need this, for different reasons:
@@ -308,14 +226,6 @@ impl VertexProvider {
         )
     }
 
-    /// Does this model's endpoint ignore the configured region?
-    ///
-    /// True for Gemini 3 and the verified Gemini 4 routes; global is supported
-    /// independently of the workspace's configured Claude region. Named rather
-    /// than spelled inline because two things must agree: which endpoint the
-    /// request takes, and whether a failure may tell the user to change the
-    /// region. [`endpoint_for_model`](Self::endpoint_for_model) branches on
-    /// this, so the two cannot drift.
     fn region_is_pinned(model: &str) -> bool {
         !Self::is_claude_model(model)
             && (model.starts_with("gemini-3")
@@ -337,7 +247,6 @@ impl VertexProvider {
         }
     }
 
-    /// A Claude model's endpoint, which a turn and its prefill beat share.
     fn claude_endpoint(&self, model: &str) -> String {
         let location = self.current_location();
         format!(
@@ -353,8 +262,6 @@ impl VertexProvider {
         get_cached_access_token(&self.token_cache).await
     }
 
-    /// Invalidate the cached token and refresh it. Returns the new token on success.
-    /// `retried_auth` is flipped to true to prevent infinite retry loops.
     async fn handle_auth_refresh(&self, model: &str, retried_auth: &mut bool) -> Option<String> {
         *retried_auth = true;
         if let Ok(mut cache) = self.token_cache.lock() {
@@ -372,8 +279,6 @@ impl VertexProvider {
         }
     }
 
-    /// Send an HTTP request with retry on retryable status codes and network errors.
-    /// On 401, invalidates the cached token, refreshes it, and retries once.
     async fn request_with_retry(
         &self,
         model: &str,
@@ -501,9 +406,6 @@ impl LlmProvider for VertexProvider {
 mod tests {
     use super::*;
 
-    /// The project and region in the message come from the URL the request
-    /// used, for every endpoint shape this module builds. `gemini-3*` is the
-    /// sharp case: it pins `global` and ignores the configured region.
     #[test]
     fn the_project_and_region_are_read_back_out_of_every_endpoint_shape() {
         let provider =
@@ -533,12 +435,6 @@ mod tests {
         assert_eq!(project_from_endpoint(junk), None);
     }
 
-    /// The reported incident: a user pointed at a Google Cloud project that
-    /// never enabled Claude, on a region that serves it fine elsewhere. Every
-    /// Anthropic model 404s there, so the region is a red herring.
-    ///
-    /// The project is the one Vertex input with no Settings field, so a message
-    /// that does not name it leaves nothing to compare against.
     #[test]
     fn the_message_names_the_project_the_request_was_billed_to() {
         let url = "https://europe-west1-aiplatform.googleapis.com/v1/projects/example-project\
@@ -559,9 +455,6 @@ mod tests {
         );
     }
 
-    /// The 404 a fresh Vertex setup meets. Google's own sentence names neither
-    /// fix, so the rewrite has to name the region, where to change it, and the
-    /// per-project Model Garden step. The raw sentence is kept.
     #[test]
     fn a_claude_publisher_model_404_names_the_region_and_both_fixes() {
         let body = concat!(
@@ -588,9 +481,6 @@ mod tests {
         assert!(message.contains(body), "the raw Vertex text must survive");
     }
 
-    /// A `gemini-3*` endpoint pins `global` and ignores the region setting.
-    /// Pointing the user at that setting would name a control that cannot move
-    /// the request. It reports the pin instead.
     #[test]
     fn a_pinned_model_never_sends_the_user_to_the_region_setting() {
         let provider =
@@ -613,9 +503,6 @@ mod tests {
         );
     }
 
-    /// The pin rule has one spelling. `endpoint_for_model` and the advice both
-    /// branch on it, so a model routed to `global` is exactly a model the
-    /// advice calls pinned.
     #[test]
     fn the_pin_predicate_agrees_with_where_the_request_goes() {
         let provider =
@@ -643,9 +530,6 @@ mod tests {
         }
     }
 
-    /// A Gemini model on `eu` or `us` 404s by construction: those multi-regions
-    /// carry no Google publisher models. Telling the user to change the region
-    /// is wrong, because `eu` is often exactly what Claude needs.
     #[test]
     fn a_gemini_404_in_a_multi_region_does_not_ask_for_the_region_setting() {
         for region in ["eu", "us"] {
@@ -666,8 +550,6 @@ mod tests {
         }
     }
 
-    /// The same model in an ordinary region DOES take the region advice: there
-    /// the setting is the thing to look at, and nothing else depends on it.
     #[test]
     fn a_gemini_404_in_an_ordinary_region_still_asks_for_the_region_setting() {
         let provider = VertexProvider::new(
@@ -688,8 +570,6 @@ mod tests {
         );
     }
 
-    /// `vertex_host` and the advice read the same multi-region set, so neither
-    /// can start naming a location the other does not.
     #[test]
     fn the_multi_region_set_is_the_one_the_host_derivation_uses() {
         for location in ["eu", "us"] {
@@ -708,8 +588,6 @@ mod tests {
         }
     }
 
-    /// A Google publisher model needs no Model Garden opt-in, so that sentence
-    /// would be wrong advice. The region half still applies.
     #[test]
     fn a_gemini_publisher_model_404_omits_the_model_garden_step() {
         let body = "Publisher model `projects/example-project/locations/eu/publishers\
@@ -724,9 +602,6 @@ mod tests {
         assert!(!message.contains("Model Garden"), "{message}");
     }
 
-    /// The match is on the phrase, not on Google's casing of it. Every live
-    /// sample says `Publisher model`, so a capitalised variant would drop the
-    /// advice silently, with the 404 looking untouched.
     #[test]
     fn the_phrase_is_matched_whatever_google_capitalises() {
         let url = "https://aiplatform.eu.rep.googleapis.com/v1/projects/example-project\
@@ -744,10 +619,6 @@ mod tests {
         }
     }
 
-    /// The distinction the rewrite exists to keep. A project that HAS access
-    /// but no quota answers 429 in the same region. Reading that as a region
-    /// problem would send the user to change a setting that is already right.
-    /// A 404 from anything else keeps its own wording too.
     #[test]
     fn only_a_publisher_model_404_is_rewritten() {
         let url = "https://europe-west1-aiplatform.googleapis.com/v1/projects/example-project\
@@ -770,8 +641,6 @@ mod tests {
         );
     }
 
-    /// Every host `vertex_host` builds reads back as a Vertex host, which is
-    /// how the proxy knows a reply from one is a model call.
     #[test]
     fn every_built_vertex_host_is_recognised() {
         for location in ["global", "eu", "us", "europe-west1"] {
@@ -782,25 +651,17 @@ mod tests {
 
     #[test]
     fn vertex_host_covers_global_multiregion_and_specific_region() {
-        // global → default host
         assert_eq!(vertex_host("global"), "aiplatform.googleapis.com");
-        // multi-regions → dedicated .rep.googleapis.com host
         assert_eq!(vertex_host("us"), "aiplatform.us.rep.googleapis.com");
         assert_eq!(vertex_host("eu"), "aiplatform.eu.rep.googleapis.com");
-        // a specific region → {region}-aiplatform.googleapis.com
         assert_eq!(
             vertex_host("europe-west1"),
             "europe-west1-aiplatform.googleapis.com"
         );
     }
 
-    /// `vertex_region` is a settable preference, and it lands inside a host
-    /// name. A caller who can write it must not be able to choose the host: the
-    /// builtin `vertex` proxy mints a live ADC access token and sends it there.
     #[test]
     fn a_malformed_region_cannot_choose_the_host() {
-        // Case folds rather than being discarded: DNS does not care, and a
-        // user who typed it that way still reaches their own region.
         assert_eq!(
             vertex_host("EUROPE-WEST1"),
             "europe-west1-aiplatform.googleapis.com"
@@ -825,22 +686,8 @@ mod tests {
         }
     }
 
-    /// Grounded web search must ALWAYS hit `locations/global`, whatever region
-    /// the workspace is pinned to.
-    ///
-    /// Regression for the 2026-07-03 break: `search_with_grounding` routed its
-    /// Gemini 2.5 call through `endpoint_for_model`, which sends any
-    /// non-`gemini-3*` model to the configured *chat* region. A workspace on
-    /// `vertex_region = eu` (the correct setting to reach Claude Opus 5 there)
-    /// therefore asked a multi-region that publishes no Google models for a
-    /// Gemini one, and every search 404'd with `Publisher model
-    /// projects/…/locations/eu/… was not found`. Verified against the live API:
-    /// grounding returns 200 on `global` and on `europe-west1`, and 404 on both
-    /// the `eu` and `us` multi-regions.
     #[test]
     fn grounding_endpoint_is_global_for_every_region() {
-        // Every shape `vertex_host` distinguishes: the two multi-regions (which
-        // serve no Gemini models at all), a specific region, and global itself.
         for region in ["eu", "us", "europe-west1", "global"] {
             let provider =
                 VertexProvider::new("my-project".into(), region.into(), "claude-opus-5".into())
@@ -856,8 +703,6 @@ mod tests {
         }
     }
 
-    /// The `gemini-3*` carve-out routes through the same global builder, so the
-    /// two callers can't drift apart.
     #[test]
     fn gemini_3_models_use_the_global_endpoint_builder() {
         let provider =
@@ -869,10 +714,6 @@ mod tests {
         );
     }
 
-    /// The region-following path is deliberately unchanged: a Gemini model that
-    /// is NOT grounding and NOT `gemini-3*` still resolves against the
-    /// configured region. Guards the fix from over-reaching into a blanket
-    /// "all Gemini is global" rule, which would silently move chat traffic.
     #[test]
     fn non_grounding_gemini_still_follows_the_configured_region() {
         let provider = VertexProvider::new(
@@ -895,14 +736,11 @@ mod tests {
             VertexProvider::new("my-project".into(), "eu".into(), "claude-opus-4-8".into())
                 .unwrap();
         let url = provider.endpoint_for_model("claude-opus-4-8");
-        // Host must be the multi-region REP endpoint, NOT the default host or a
-        // bogus `eu-aiplatform.googleapis.com` regional host (the 404 bug).
         assert!(
             url.starts_with("https://aiplatform.eu.rep.googleapis.com/"),
             "eu multi-region must use the rep host: {}",
             url
         );
-        // Path is unchanged — only the host derivation differs.
         assert!(
             url.ends_with(
                 "/v1/projects/my-project/locations/eu/publishers/anthropic/models/claude-opus-4-8:streamRawPredict"
@@ -1029,8 +867,6 @@ mod tests {
         );
     }
 
-    /// A Vertex call reaches the call trace: its sends count and the answering
-    /// status shows, like any other provider's.
     #[tokio::test]
     async fn a_vertex_call_traces_its_attempts_and_status() {
         let app = axum::Router::new().fallback(|| async { (axum::http::StatusCode::OK, "{}") });

@@ -1,13 +1,3 @@
-//! The voice socket's *call ticket*, against a booted engine.
-//!
-//! A browser sends no `Referer` on a socket handshake, so an app page on the
-//! engine's origin could dial `/api/v1/voice` as the owner. The upgrade now
-//! redeems a ticket from `POST /api/v1/voice/ticket`, a plain `fetch` that
-//! runs the strict origin rule (ADR 0598).
-//!
-//! No test here lets an upgrade succeed: a live call would reach a real voice
-//! provider. A ticket is spent on another thread instead, then replayed on home.
-
 use crate::support::{base_url, browser_handshake, db_url, user_client};
 use lucidos_engine::core::prefs;
 use reqwest::StatusCode;
@@ -26,8 +16,6 @@ async fn home_thread() -> Uuid {
     home
 }
 
-/// Dial `thread_id` as the registered device, with `ticket` if given. The
-/// `ticket` query name pins the wire contract the client dials with.
 async fn dial(client: &reqwest::Client, thread_id: Uuid, ticket: Option<&str>) -> StatusCode {
     let mut path = format!("/api/v1/voice?thread_id={thread_id}");
     if let Some(ticket) = ticket {
@@ -40,7 +28,6 @@ async fn dial(client: &reqwest::Client, thread_id: Uuid, ticket: Option<&str>) -
         .status()
 }
 
-/// A browser-shaped mint, naming the page it came from if `referer` is given.
 async fn mint(
     client: &reqwest::Client,
     thread_id: Uuid,
@@ -56,9 +43,6 @@ async fn mint(
     request.send().await.expect("mint request failed")
 }
 
-/// Turns voice on, or restores the default on `None`. The handler answers 200
-/// on failure too, so the body's `success` is the result. A delete of an unset
-/// key reports "not found", which is already the default.
 async fn set_voice_enabled(client: &reqwest::Client, on: Option<bool>) {
     let url = format!(
         "{}/api/v1/preferences?key={}",
@@ -111,10 +95,6 @@ async fn an_app_document_cannot_mint_a_ticket() {
     );
 }
 
-/// A ticket opens only the thread it names, and spends on the first try.
-///
-/// Voice is a global switch. The steps run in their own task, so a panic there
-/// still reaches the restore before anything asserts.
 #[tokio::test]
 async fn a_ticket_spent_on_another_thread_cannot_then_open_home() {
     let client = user_client().await;
@@ -139,7 +119,6 @@ async fn a_ticket_spent_on_another_thread_cannot_then_open_home() {
 
     assert_eq!(mint_status, StatusCode::OK, "the shell's mint: {body}");
     assert!(!ticket.is_empty(), "the mint answers a ticket: {body}");
-    // Pins the wire contract: the client is told a ticket lives 30 seconds.
     assert_eq!(body["expires_in_secs"], 30, "{body}");
     assert_eq!(
         elsewhere,

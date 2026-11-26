@@ -1,13 +1,8 @@
-//! Offline database replay. The caller authenticates the dump and retains the
-//! archive locks. Replay clears archived grants and durably stages the current
-//! carried rows. First boot installs them after migrations, before dispatch.
 use super::BoxError;
 use std::{collections::BTreeMap, path::Path};
 
 const ACCESS_TABLES: [&str; 3] = ["devices", "device_presence", "push_subscriptions"];
 
-/// The rows a restore takes from the current timeline, never the archive: the
-/// access tables whole, and the preference that lets agents restore.
 fn carried_rows() -> Vec<(&'static str, String)> {
     let mut carried: Vec<_> = ACCESS_TABLES
         .into_iter()
@@ -23,7 +18,6 @@ fn carried_rows() -> Vec<(&'static str, String)> {
     carried
 }
 
-/// Removes every carried preference, archived or current.
 fn clear_carried_preferences() -> String {
     format!(
         "DELETE FROM public.preferences WHERE key = '{}';",
@@ -31,14 +25,14 @@ fn clear_carried_preferences() -> String {
     )
 }
 
-/// Must succeed after normal first-boot migrations and before any auth, worker
+const ACCESS_ROWS_TIME_ZONE: &str = "SET LOCAL TimeZone = 'UTC';";
+
+/// INVARIANT: Must succeed after normal first-boot migrations and before any auth, worker
 /// or HTTP dispatch. Failure leaves staging intact for retry or recovery.
 pub async fn finish_access_after_migrations(pool: &sqlx::PgPool) -> Result<(), BoxError> {
     async {
         let mut tx = pool.begin().await?;
-        // A crash after this transaction commits but before first boot removes
-        // its external marker must be safe to retry. Replay creates staging
-        // atomically, and only this transaction consumes it.
+        sqlx::raw_sql(ACCESS_ROWS_TIME_ZONE).execute(&mut *tx).await?;
         let staged: bool = sqlx::query_scalar("SELECT to_regclass('snapshot_restore_access.rows') IS NOT NULL")
             .fetch_one(&mut *tx).await?;
         if !staged {
@@ -48,9 +42,18 @@ pub async fn finish_access_after_migrations(pool: &sqlx::PgPool) -> Result<(), B
         sqlx::raw_sql(&format!("LOCK TABLE snapshot_restore_access.rows IN ACCESS EXCLUSIVE MODE; TRUNCATE public.push_subscriptions, public.device_presence, public.devices; {}", clear_carried_preferences()))
             .execute(&mut *tx).await?;
         for (table, filter) in carried_rows() {
-            // Populate by name, never by the column order of an older archive.
-            // EXCEPT ALL in both directions checks exact values AND cardinality;
-            // jsonb_populate_record otherwise silently ignores missing columns.
+            sqlx::raw_sql(&format!(
+                "UPDATE snapshot_restore_access.rows r SET value = r.value || COALESCE((
+                   SELECT jsonb_object_agg(c.column_name, to_jsonb((r.value->>c.column_name)::timestamptz))
+                   FROM information_schema.columns c
+                   WHERE c.table_schema = 'public' AND c.table_name = '{table}'
+                     AND c.data_type = 'timestamp with time zone'
+                     AND jsonb_typeof(r.value->c.column_name) = 'string'
+                 ), '{{}}'::jsonb)
+                 WHERE r.table_name = '{table}';"
+            ))
+            .execute(&mut *tx)
+            .await?;
             let statement = format!(
                 "INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, value)).* FROM snapshot_restore_access.rows WHERE table_name = '{table}';
                  SELECT 1 / CASE WHEN NOT EXISTS (
@@ -61,6 +64,16 @@ pub async fn finish_access_after_migrations(pool: &sqlx::PgPool) -> Result<(), B
             );
             sqlx::raw_sql(&statement).execute(&mut *tx).await?;
         }
+        sqlx::raw_sql(
+            "DELETE FROM public.backup_origin
+             WHERE EXISTS (SELECT 1 FROM snapshot_restore_access.rows WHERE table_name = 'backup_origin');
+             INSERT INTO public.backup_origin (workspace_path, origin)
+             SELECT value->>'workspace_path', value->>'origin'
+             FROM snapshot_restore_access.rows
+             WHERE table_name = 'backup_origin' AND value <> 'null'::jsonb;",
+        )
+        .execute(&mut *tx)
+        .await?;
         sqlx::raw_sql("DROP SCHEMA snapshot_restore_access CASCADE;")
             .execute(&mut *tx).await?;
         tx.commit().await?;
@@ -86,8 +99,8 @@ fn transaction_checks(rows: &BTreeMap<String, i64>) -> Result<(String, String), 
     {
         return Err("invalid snapshot table counts".into());
     }
-    let mut before = String::from("CREATE TEMP TABLE snapshot_current_access (table_name text NOT NULL, value jsonb NOT NULL) ON COMMIT DROP;\n");
-    // A replay interrupted before first boot already has authoritative staging.
+    let mut before = format!("{ACCESS_ROWS_TIME_ZONE}\nCREATE TEMP TABLE snapshot_current_access (table_name text NOT NULL, value jsonb NOT NULL) ON COMMIT DROP;\n");
+    // INVARIANT: A replay interrupted before first boot already has authoritative staging.
     // Rollback must carry that set, not the deliberately empty public tables.
     before.push_str("DO $snapshot$ BEGIN IF to_regclass('snapshot_restore_access.rows') IS NOT NULL THEN INSERT INTO pg_temp.snapshot_current_access SELECT * FROM snapshot_restore_access.rows; ELSE\n");
     for (table, filter) in carried_rows() {
@@ -95,22 +108,28 @@ fn transaction_checks(rows: &BTreeMap<String, i64>) -> Result<(String, String), 
             "INSERT INTO pg_temp.snapshot_current_access SELECT '{table}', to_jsonb(t) FROM public.{table} t WHERE {filter};\n"
         ));
     }
+    before.push_str(
+        "IF to_regclass('public.backup_origin') IS NULL THEN
+             INSERT INTO pg_temp.snapshot_current_access VALUES ('backup_origin', 'null'::jsonb);
+         ELSE
+             INSERT INTO pg_temp.snapshot_current_access
+             SELECT 'backup_origin', COALESCE((SELECT to_jsonb(t) FROM public.backup_origin t), 'null'::jsonb);
+         END IF;\n",
+    );
     before.push_str("END IF; END $snapshot$;\n");
-    // pg_restore --clean drops only objects named by its archive. Reset the
+    // INVARIANT: pg_restore --clean drops only objects named by its archive. Reset the
     // application schema too, so newer tables, views and routines cannot leak
     // into the restored point in time. Recreate the default schema for dumps
     // which omit its creation; temporary access copies survive outside it.
     // This executes inside the same transaction as replay and validation.
     before.push_str("DROP SCHEMA public CASCADE;\nCREATE SCHEMA public;\n");
-    // Keep an independent cardinality check after replay rather than assuming
-    // cleanup or an archive's schema section produced the expected table set.
     let mut after = format!(
         "SELECT 1 / CASE WHEN (SELECT count(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public') = {} THEN 1 ELSE 0 END;\n",
         rows.len()
     );
     for (table, count) in rows {
         let quoted = table.replace('"', "\"\"");
-        // Never interpolate table names into a PL/pgSQL string literal. The
+        // INVARIANT: Never interpolate table names into a PL/pgSQL string literal. The
         // count itself is a typed nonnegative integer, not archive-provided SQL.
         after.push_str(&format!(
             "SELECT 1 / CASE WHEN (SELECT count(*) FROM public.\"{quoted}\") = {count} THEN 1 ELSE 0 END;\n"
@@ -118,8 +137,6 @@ fn transaction_checks(rows: &BTreeMap<String, i64>) -> Result<(String, String), 
     }
     after.push_str("TRUNCATE public.push_subscriptions, public.device_presence, public.devices;\n");
     after.push_str(&clear_carried_preferences());
-    // Keep staging outside public so a crash/replay cannot mix archived grants
-    // with current access. No keys or plaintext secrets leave PostgreSQL.
     after.push_str("DROP SCHEMA IF EXISTS snapshot_restore_access CASCADE; CREATE SCHEMA snapshot_restore_access; REVOKE ALL ON SCHEMA snapshot_restore_access FROM PUBLIC; CREATE TABLE snapshot_restore_access.rows (table_name text NOT NULL, value jsonb NOT NULL);\n");
     after.push_str(
         "INSERT INTO snapshot_restore_access.rows SELECT * FROM pg_temp.snapshot_current_access;\n",

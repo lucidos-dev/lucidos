@@ -954,7 +954,7 @@ describe('index.html inline boot splash', () => {
     expect(redirectIdx).toBeLessThan(moduleIdx);
     expect(html).toContain("localStorage.getItem('lucidos-last-workspace')");
     expect(html).toContain("has('pick')");
-    expect(html).toContain("getAttribute('href') !== '/~/'");
+    expect(html).toContain("baseHref === '/~/'");
   });
 
   describe('height pin', () => {

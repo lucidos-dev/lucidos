@@ -1,5 +1,3 @@
-//! Hosted search using the plan provider's authenticated Responses wire.
-
 use async_trait::async_trait;
 
 use super::{WebSearchProvider, WebSearchResult};

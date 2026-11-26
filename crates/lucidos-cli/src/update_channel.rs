@@ -1,5 +1,3 @@
-//! Machine-global update channels, directly or through an owner-approved engine request.
-
 use lucidos_update_channel::{
     Channel, CustomName, UpdateAddress, GATEWAY_STATUS_PATH, RELEASE_CHECK_PATH,
 };
@@ -24,7 +22,6 @@ pub enum Action {
 }
 
 pub fn cmd_update_channel(action: &Action, port: Option<u16>) -> Result<u8, BoxError> {
-    // Validate before probing, so a typo fails fast even offline.
     let body = request_body(action)?;
     let control = ControlClient::resolve(port)?;
     let snapshot = match exchange_control(&control, body) {
@@ -45,7 +42,6 @@ pub fn cmd_update_channel(action: &Action, port: Option<u16>) -> Result<u8, BoxE
     Ok(0)
 }
 
-/// Probe support before writes: an old gateway could silently ignore new fields.
 fn exchange_control(control: &ControlClient, body: Option<Value>) -> Result<Value, BoxError> {
     let status = control.send(reqwest::Method::GET, GATEWAY_STATUS_PATH, None)?;
     let snapshot = status.get("release_check").cloned().unwrap_or(Value::Null);
@@ -195,7 +191,6 @@ mod tests {
     fn reads_and_partial_writes() {
         assert_eq!(request_body(&Action::Show).unwrap(), None);
         assert_eq!(request_body(&Action::List).unwrap(), None);
-        // Pins the gateway wire contract: selecting Stable never clears slots.
         assert_eq!(
             request_body(&Action::Set("stable".into())).unwrap(),
             Some(json!({"channel":"stable"}))
@@ -369,7 +364,6 @@ mod tests {
         .await
         .unwrap();
         server.abort();
-        // A PUT would get 404 instead, proving the capability check preceded it.
         assert!(result.contains("Update Lucidos first"), "{result}");
     }
 

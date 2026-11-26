@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use lucidos_gateway_constants::backup_archive;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -18,7 +19,7 @@ use crate::core::{oauth, prefs};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A transport failure as the user reads it: the provider, the step that lost
+/// INVARIANT: A transport failure as the user reads it: the provider, the step that lost
 /// the connection, then every cause in the chain.
 ///
 /// reqwest's own text stops at "error sending request for url (…)", which hides
@@ -39,7 +40,7 @@ fn transport_failure(provider: &str, step: &str, e: reqwest::Error) -> String {
     format!("Lost the connection to {provider} while {step} ({chain}).")
 }
 
-/// Registry entry: (id, name, oauth_provider, required_scopes, grant_scopes,
+/// INVARIANT: Registry entry: (id, name, oauth_provider, required_scopes, grant_scopes,
 /// constructor).
 /// The constructor receives the pool AND the entry's `required_scopes`. The
 /// readiness verdict the Settings page renders and the preflight the backup
@@ -55,31 +56,15 @@ type BackupProviderEntry = (
     fn(PgPool, &'static [&'static str]) -> Box<dyn BackupProvider>,
 );
 
-/// A backup is "stale" once the newest good one is older than this. 24h matches
-/// the most aggressive built-in schedule.
-///
-/// The ONE definition of stale, so no two surfaces can disagree about the word.
-/// The Settings page's health card measures the newest archive the provider
-/// holds; the picker's row line measures the newest successful RUN. Both read
-/// the threshold here (`api::backup::build_backup_status` and
-/// `api::backup::build_last_successful`), and the frontend renders the boolean
-/// rather than re-deriving 24h of its own.
 pub const BACKUP_STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
 
-/// A backup is "overdue" once the newest good one is older than this. The
-/// app-shell banner warns at this line, where `stale` only colours a status line.
-///
-/// A different concept from [`BACKUP_STALE_AFTER_SECONDS`]: a manual-only
-/// workspace is routinely a day old, and nagging at 24h would train users to
-/// dismiss the banner.
 pub const BACKUP_OVERDUE_AFTER_SECONDS: i64 = 7 * 24 * 60 * 60;
 
-/// Check whether a backup schedule value represents an active (enabled) schedule.
 pub fn is_schedule_active(value: &str) -> bool {
     !value.is_empty() && value != "off"
 }
 
-/// Will a backup actually run, given the stored `(schedule, provider)` pair?
+/// INVARIANT: Will a backup actually run, given the stored `(schedule, provider)` pair?
 ///
 /// Both halves are required, which is what `Scheduler::reload_backup_schedule`
 /// asks before it registers a job: an active cron with no destination has
@@ -96,7 +81,7 @@ fn provider_is_set(provider: Option<&str>) -> bool {
     provider.is_some_and(|p| !p.is_empty())
 }
 
-/// Are this workspace's backups set up: is a destination stored?
+/// INVARIANT: Are this workspace's backups set up: is a destination stored?
 ///
 /// The schedule is not part of it. "Manual only" stores schedule `off`, and
 /// that is a way of using backups, not a lack of them. The app-shell banner
@@ -110,7 +95,7 @@ pub async fn backups_are_configured(pool: &PgPool) -> Result<bool, BoxError> {
     Ok(provider_is_set(provider.as_deref()))
 }
 
-/// Read the backup retention count from preferences. A missing or unparseable
+/// INVARIANT: Read the backup retention count from preferences. A missing or unparseable
 /// row is the catalog default, and a stored count is held inside the catalog
 /// bounds; a FAILED read is an `Err`.
 ///
@@ -127,8 +112,6 @@ pub async fn get_retention_count(pool: &PgPool) -> Result<usize, BoxError> {
     Ok(prefs::BACKUP_RETENTION.try_read(pool).await?.round() as usize)
 }
 
-/// Static registry of all backup providers: (id, name, oauth_provider,
-/// required_scopes, grant_scopes, constructor).
 const PROVIDERS: &[BackupProviderEntry] = &[
     (
         "google_drive",
@@ -142,7 +125,7 @@ const PROVIDERS: &[BackupProviderEntry] = &[
         "dropbox",
         "Dropbox",
         "dropbox",
-        // Never empty: an empty list makes every connected account read as
+        // INVARIANT: Never empty: an empty list makes every connected account read as
         // ready however narrow its grant. The failure then lands on
         // `files/create_folder_v2` returning a 400 mid-backup.
         dropbox::BACKUP_SCOPES,
@@ -151,17 +134,13 @@ const PROVIDERS: &[BackupProviderEntry] = &[
     ),
 ];
 
-/// The valid backup provider ids — the agent-settable `backup_provider`
-/// preference enum (see `core::preference_catalog`). Kept in sync with
-/// [`PROVIDERS`] above by `provider_ids_match_registry` in the tests.
 pub const PROVIDER_IDS: &[&str] = &["google_drive", "dropbox"];
 
-/// Provider metadata including the OAuth provider name for readiness checks.
 pub struct ProviderMeta {
     pub id: &'static str,
     pub name: &'static str,
     pub oauth_provider: &'static str,
-    /// Every scope substring that must appear in the OAuth account's scopes for
+    /// INVARIANT: Every scope substring that must appear in the OAuth account's scopes for
     /// the provider to be ready. Empty slice means connecting is enough.
     ///
     /// This is the SAME list the provider's preflight checks, deliberately.
@@ -170,14 +149,9 @@ pub struct ProviderMeta {
     /// access* and enables *Back up now*. Preflight fails and tells the user to
     /// reconnect, with no button left to do it.
     pub required_scopes: &'static [&'static str],
-    /// The scopes an authorization actually asks for. Not a second readiness
-    /// list: it exists so an unmet `required_scopes` matcher can be reported
-    /// under a name the user can find in the provider's own console. See
-    /// [`name_missing_scopes`].
     pub grant_scopes: &'static [&'static str],
 }
 
-/// List all registered backup providers with their metadata.
 pub fn list_providers() -> Vec<ProviderMeta> {
     PROVIDERS
         .iter()
@@ -191,12 +165,11 @@ pub fn list_providers() -> Vec<ProviderMeta> {
         .collect()
 }
 
-/// Look up one provider's metadata by id. `None` for an id not in [`PROVIDERS`].
 pub fn provider_meta(provider_id: &str) -> Option<ProviderMeta> {
     list_providers().into_iter().find(|m| m.id == provider_id)
 }
 
-/// Does a granted-scope string carry `required`?
+/// INVARIANT: Does a granted-scope string carry `required`?
 ///
 /// Substring rather than token match, deliberately: Google's registry entry is
 /// the fragment `"drive"`, which has to match the full
@@ -213,7 +186,7 @@ pub fn scopes_include(granted: &str, required: &str) -> bool {
     required.is_empty() || granted.contains(required)
 }
 
-/// Which of `required` a granted-scope string is missing, in the order the
+/// INVARIANT: Which of `required` a granted-scope string is missing, in the order the
 /// provider declared them so a message reads the same every time.
 ///
 /// The ONE place the scope question is answered. Both providers' preflights and
@@ -227,24 +200,6 @@ pub fn missing_scopes(granted: &str, required: &'static [&'static str]) -> Vec<&
         .collect()
 }
 
-/// Rewrite a list of unmet requirements into the scopes a user can act on.
-///
-/// `required_scopes` are MATCHERS, not names. Readiness asks whether a granted
-/// scope CONTAINS the entry ([`scopes_include`]). Google Drive's whole
-/// requirement is therefore the fragment `drive`, matching the full
-/// `https://www.googleapis.com/auth/drive.file` URL. Reporting that fragment to
-/// a human names a "drive permission" that appears in no Google console, which
-/// defeats the point of naming it at all.
-///
-/// So each unmet matcher is mapped to the first `grant_scopes` entry containing
-/// it, applying the same containment rule from the other side. Dropbox's
-/// requirements are already whole scope names and map to themselves, which is
-/// also exactly what its App Console lists. A matcher no grant scope contains
-/// falls back to itself: a provider whose two lists have drifted should still
-/// say WHICH permission is short rather than drop it.
-///
-/// Engine-side on purpose. The page and `get_backup_status` both render what
-/// this returns, so they cannot name a requirement differently.
 pub fn name_missing_scopes(
     missing: Vec<&'static str>,
     grant_scopes: &'static [&'static str],
@@ -261,33 +216,14 @@ pub fn name_missing_scopes(
         .collect()
 }
 
-/// Whether a backup provider can actually upload right now.
-///
-/// Both halves of "is this working?" in one value: is the OAuth account
-/// connected at all, and does that account carry the scope the provider needs.
-/// Shared by the Settings page (`api::backup::list_providers`) and the agent's
-/// `get_backup_status`. The human and the agent can never be told different
-/// things about the same provider. With only the page knowing, an agent reports
-/// a backup as fully configured while its upload leg has no account behind it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderReadiness {
-    /// An OAuth account row exists for this provider.
     pub connected: bool,
-    /// Which of the provider's `required_scopes` the connected account does NOT
-    /// carry, in the order the provider declared them. Empty when the provider
-    /// is ready, and also empty when nothing is connected: there is no grant to
-    /// measure, and listing every scope as "missing" would describe a
-    /// not-connected provider as a half-granted one.
-    ///
-    /// Reported all the way to the Backup page. "Access not granted" with no
-    /// permission named cannot distinguish a grant that never happened from one
-    /// that came back a scope short. A user presses *Grant access*, completes
-    /// the authorization, and meets the same red line.
     pub missing_scopes: Vec<&'static str>,
 }
 
 impl ProviderReadiness {
-    /// Connected AND holding every required scope.
+    /// INVARIANT: Connected AND holding every required scope.
     ///
     /// Derived rather than stored, deliberately. Keeping both a boolean and the
     /// list it is computed from allows a state where they disagree, and a method
@@ -298,10 +234,6 @@ impl ProviderReadiness {
     }
 }
 
-/// Resolve [`ProviderReadiness`] for one provider.
-///
-/// A DB error propagates rather than degrading to "not connected": a transient
-/// failure must not be reported to a user (or an agent) as a missing account.
 pub async fn provider_readiness(
     pool: &PgPool,
     meta: &ProviderMeta,
@@ -315,7 +247,6 @@ pub async fn provider_readiness(
             )
             .into()
         })?;
-    // Named on the way out, so every consumer reports one string for one gap.
     let missing_scopes = account
         .as_ref()
         .map(|a| {
@@ -331,7 +262,6 @@ pub async fn provider_readiness(
     })
 }
 
-/// Create a backup provider by ID.
 pub fn get_provider(provider_id: &str, pool: &PgPool) -> Result<Box<dyn BackupProvider>, String> {
     PROVIDERS
         .iter()
@@ -340,10 +270,6 @@ pub fn get_provider(provider_id: &str, pool: &PgPool) -> Result<Box<dyn BackupPr
         .ok_or_else(|| format!("Unknown backup provider: {}", provider_id))
 }
 
-/// Get the connected OAuth account for a backup provider, refreshing its token
-/// if needed. Callers that only want the token use [`get_oauth_token`]; the
-/// whole account is what a scope preflight needs, since the granted `scopes`
-/// live on the row.
 pub async fn get_oauth_account(
     pool: &PgPool,
     provider: &str,
@@ -364,12 +290,10 @@ pub async fn get_oauth_account(
         })
 }
 
-/// Get an OAuth token for a backup provider, refreshing if needed.
 pub async fn get_oauth_token(pool: &PgPool, provider: &str) -> Result<String, BoxError> {
     Ok(get_oauth_account(pool, provider).await?.access_token)
 }
 
-/// Metadata for a single backup stored by a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupEntry {
     pub id: String,
@@ -378,7 +302,6 @@ pub struct BackupEntry {
     pub created_at: DateTime<Utc>,
 }
 
-/// Terminal outcome of a backup run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackupRunStatus {
@@ -386,31 +309,18 @@ pub enum BackupRunStatus {
     Failure,
 }
 
-/// Persisted record of the most recent backup run's terminal outcome. Written
-/// by `run_backup` on both paths and stored under `prefs::BACKUP_LAST_RUN`, so the
-/// page survives engine restarts. The `BackupCompleted` and `BackupFailed` SSE
-/// events are ephemeral.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupLastRun {
     pub status: BackupRunStatus,
-    /// When the run reached its terminal state (RFC 3339).
     pub at: DateTime<Utc>,
-    /// When the run STARTED (RFC 3339). `None` for records written before
-    /// start-time tracking existed (`#[serde(default)]` keeps them readable); the
-    /// duration is `at - started_at` when present.
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
-    /// Filename of the produced backup (success only).
     pub filename: Option<String>,
-    /// Size of the produced backup in bytes (success only).
     pub size_bytes: Option<u64>,
-    /// Error message (failure only).
     pub error: Option<String>,
 }
 
 impl BackupLastRun {
-    /// Build a success record from the produced backup entry and the run's
-    /// start time (the terminal time is stamped now).
     pub fn success(entry: &BackupEntry, started_at: DateTime<Utc>) -> Self {
         Self {
             status: BackupRunStatus::Success,
@@ -422,7 +332,6 @@ impl BackupLastRun {
         }
     }
 
-    /// Build a failure record from the error message and the run's start time.
     pub fn failure(error: &str, started_at: DateTime<Utc>) -> Self {
         Self {
             status: BackupRunStatus::Failure,
@@ -435,9 +344,6 @@ impl BackupLastRun {
     }
 }
 
-/// Persist the last-run outcome under `prefs::BACKUP_LAST_RUN`. Failure to
-/// persist is returned to the caller so it can log it — the health card would
-/// otherwise silently lag behind the real outcome.
 pub async fn persist_last_run(pool: &PgPool, run: &BackupLastRun) -> Result<(), BoxError> {
     use crate::core::PreferenceStore;
     let value = serde_json::to_string(run)?;
@@ -445,12 +351,6 @@ pub async fn persist_last_run(pool: &PgPool, run: &BackupLastRun) -> Result<(), 
     Ok(())
 }
 
-/// Read the persisted last-run outcome. Returns `None` when never recorded.
-///
-/// A malformed stored value and an unreadable row both resolve to `None`, so
-/// the status card degrades instead of failing. Each logs first. A silent
-/// `None` reads exactly like a workspace that has never backed up, and that is
-/// the reading a user acts on.
 pub async fn load_last_run(pool: &PgPool) -> Option<BackupLastRun> {
     let key = prefs::BACKUP_LAST_RUN.key();
     let raw = match prefs::BACKUP_LAST_RUN.try_stored(pool).await {
@@ -469,28 +369,16 @@ pub async fn load_last_run(pool: &PgPool) -> Option<BackupLastRun> {
     }
 }
 
-/// One historical backup run, reconstructed from a persisted `BackupCompleted` /
-/// `BackupFailed` event. The `events` table IS the durable run history (start /
-/// finish / size); this is its read model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupRunSummary {
     pub status: BackupRunStatus,
-    /// When the run started (RFC 3339); `None` only for malformed/legacy rows.
     pub started_at: Option<DateTime<Utc>>,
-    /// When the run reached its terminal state.
     pub finished_at: DateTime<Utc>,
-    /// Produced archive filename (success only).
     pub filename: Option<String>,
-    /// Encrypted archive size in bytes (success only).
     pub size_bytes: Option<u64>,
-    /// Error message (failure only).
     pub error: Option<String>,
 }
 
-/// Load the most recent backup runs (newest first, capped at `limit`) from the
-/// persisted `BackupCompleted` / `BackupFailed` events — the durable run history.
-/// A query error logs and returns an empty list rather than failing the caller
-/// (the status surface degrades to "no history", never an error).
 pub async fn load_recent_runs(pool: &PgPool, limit: i64) -> Vec<BackupRunSummary> {
     use sqlx::Row;
 
@@ -520,7 +408,7 @@ pub async fn load_recent_runs(pool: &PgPool, limit: i64) -> Vec<BackupRunSummary
         .collect()
 }
 
-/// When the newest SUCCESSFUL backup run finished, or `None` when this workspace
+/// INVARIANT: When the newest SUCCESSFUL backup run finished, or `None` when this workspace
 /// has never produced one.
 ///
 /// The `BackupCompleted` row is the evidence, so a failure since the last good
@@ -539,8 +427,6 @@ pub async fn load_last_successful_backup(pool: &PgPool) -> Result<Option<DateTim
         .map(|run| run.finished_at))
 }
 
-/// The newest SUCCESSFUL backup run, or `None` when there is none. A query
-/// failure is an `Err`, for the reason [`load_last_successful_backup`] gives.
 pub async fn load_last_successful_backup_run(
     pool: &PgPool,
 ) -> Result<Option<BackupRunSummary>, BoxError> {
@@ -558,16 +444,9 @@ pub async fn load_last_successful_backup_run(
     };
     let payload: serde_json::Value = row.get("payload");
     let created: DateTime<Utc> = row.get("created");
-    // Through the same reader the history list uses, so the two cannot disagree
-    // about where a run's finish time lives in the payload.
     Ok(backup_run_from_event("BackupCompleted", &payload, created))
 }
 
-/// Reconstruct a [`BackupRunSummary`] from one persisted backup event row. Pure
-/// (no DB) so the payload-shape parsing is unit-testable. System events persist
-/// as `{ "type": .., "data": { .. } }` (the `#[serde(tag = "type", content =
-/// "data")]` shape); a bare data object is tolerated too. `created` is the
-/// fallback for `finished_at` if the payload lacks it.
 fn backup_run_from_event(
     event_type: &str,
     payload: &serde_json::Value,
@@ -606,22 +485,12 @@ fn backup_run_from_event(
     }
 }
 
-/// Trait for cloud storage backends that can store/retrieve encrypted backups.
 #[async_trait]
 pub trait BackupProvider: Send + Sync {
     fn name(&self) -> &str;
     fn id(&self) -> &str;
-    /// The OAuth provider name used for token lookup (e.g. "google", "dropbox").
     fn oauth_provider(&self) -> &str;
-    /// Web URL to this provider's backups folder, for the Settings → Backup
-    /// "View backups folder" link. `None` when the provider can't form one.
     async fn folder_url(&self) -> Option<String>;
-    /// Fail-fast checks run BEFORE any expensive backup work (pg_dump, the
-    /// multi-GB tar, the multi-minute encrypt). `estimated_upload_bytes` is the
-    /// orchestrator's estimate of the encrypted archive size. The provider uses
-    /// it to reject the run up front when the upload cannot succeed, rather than
-    /// failing at the final upload. Also verifies the token is valid and the
-    /// required scope exists.
     async fn preflight(&self, estimated_upload_bytes: u64) -> Result<(), BoxError>;
     async fn upload(
         &self,
@@ -639,24 +508,69 @@ pub trait BackupProvider: Send + Sync {
     async fn delete(&self, backup_id: &str) -> Result<(), BoxError>;
 }
 
-/// The archive entry holding the secret store key the dump's secrets are
+/// INVARIANT: The archive entry holding the secret store key the dump's secrets are
 /// sealed with. Restore files it into the key store and never into the
 /// workspace directory.
 pub const SECRET_STORE_KEY_ENTRY: &str = "secret-store.key";
 
-/// A backup archive's filename is `{ARCHIVE_PREFIX}{name}-{timestamp}{suffix}`,
-/// where the suffix names the format: `.age` for an archive sealed to the
-/// backup recipient, `.enc` for a legacy one. The gateway's
-/// `registry::parse_workspace_name_from_archive` spells the same shape and
-/// cannot import these.
-const ARCHIVE_PREFIX: &str = "lucidos-backup-";
-const ARCHIVE_SUFFIXES: [&str; 2] = [crypto::AGE_SUFFIX, crypto::LEGACY_SUFFIX];
+#[derive(Debug, PartialEq, Eq)]
+pub struct BackupOrigin(String);
 
-/// The workspace directory name used in backup archive filenames
-/// (`lucidos-backup-{name}-{timestamp}.age`). Falls back to `"workspace"` when
-/// the path has no final component. The upload path and the prune matcher both
-/// derive the name from here, so they can never disagree on which archives are
-/// "this workspace's".
+impl std::str::FromStr for BackupOrigin {
+    type Err = &'static str;
+
+    fn from_str(token: &str) -> Result<Self, Self::Err> {
+        if !backup_archive::is_origin(token) {
+            return Err("Invalid backup origin");
+        }
+        Ok(Self(token.to_string()))
+    }
+}
+
+async fn canonical_backup_path(workspace: &Path) -> Result<String, BoxError> {
+    tokio::fs::canonicalize(workspace)
+        .await?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "The canonical workspace path is not valid UTF-8".into())
+}
+
+pub async fn read_backup_origin(
+    pool: &PgPool,
+    workspace: &Path,
+) -> Result<Option<BackupOrigin>, BoxError> {
+    let path = canonical_backup_path(workspace).await?;
+    let token: Option<String> = sqlx::query_scalar(
+        "SELECT origin FROM backup_origin WHERE singleton AND workspace_path = $1",
+    )
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(token.map(|token| token.parse()).transpose()?)
+}
+
+pub async fn resolve_backup_origin(
+    pool: &PgPool,
+    workspace: &Path,
+) -> Result<BackupOrigin, BoxError> {
+    let path = canonical_backup_path(workspace).await?;
+    let random: u64 = rand::random();
+    let candidate = format!("{:012x}", random & 0xffff_ffff_ffff);
+    let token: String = sqlx::query_scalar(
+        "INSERT INTO backup_origin (workspace_path, origin) VALUES ($1, $2)
+         ON CONFLICT (singleton) DO UPDATE SET
+           workspace_path = EXCLUDED.workspace_path,
+           origin = CASE WHEN backup_origin.workspace_path = EXCLUDED.workspace_path
+                         THEN backup_origin.origin ELSE EXCLUDED.origin END
+         RETURNING origin",
+    )
+    .bind(path)
+    .bind(candidate)
+    .fetch_one(pool)
+    .await?;
+    Ok(token.parse()?)
+}
+
 pub fn workspace_archive_name(workspace: &Path) -> &str {
     workspace
         .file_name()
@@ -664,49 +578,6 @@ pub fn workspace_archive_name(workspace: &Path) -> &str {
         .unwrap_or("workspace")
 }
 
-/// Parse the workspace name a backup archive was produced for, from its
-/// filename. `create_backup` stamps `lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.age`
-/// (`.enc` for a legacy archive)
-/// (see [`workspace_archive_name`]); this is the inverse, used by the gateway
-/// picker to derive a default workspace name for a restore. The `{name}` may
-/// itself contain hyphens (`e2e-test`), so we strip the fixed prefix/suffix and
-/// then the trailing `-YYYYMMDD-HHMMSS` timestamp (shape-validated via
-/// [`is_backup_timestamp`]). Returns `None` for anything not in that exact shape
-/// — the caller then asks the user for a name.
-pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
-    let rest = filename.strip_prefix(ARCHIVE_PREFIX)?;
-    let rest = ARCHIVE_SUFFIXES
-        .iter()
-        .find_map(|suffix| rest.strip_suffix(suffix))?;
-    // Split off the trailing `-HHMMSS`, then the `-YYYYMMDD` before it; whatever
-    // remains is the workspace name. Both halves must be timestamp-shaped.
-    let (before_time, time) = rest.rsplit_once('-')?;
-    let (name, date) = before_time.rsplit_once('-')?;
-    if name.is_empty() || !is_backup_timestamp(&format!("{date}-{time}")) {
-        return None;
-    }
-    Some(name.to_string())
-}
-
-/// Restore a local encrypted backup archive INTO an already-provisioned
-/// workspace directory and database. This is the gateway picker's restore path.
-/// The gateway has already reserved the registry entry, provisioned Postgres,
-/// and created `workspace_dir`. Here we only decrypt, decompress, move the
-/// workspace files in, and `pg_restore` the dump into `database_url`.
-/// Returns the warnings the user must see, such as a pending change branch
-/// that could not come back.
-///
-/// Deliberately NARROWER than the old cloud `restore_backup`:
-///   * **No provider / download** — the archive is already on disk (`encrypted_path`).
-///   * **No `init-workspace.sh` / `~/workspaces/{name}`** — the gateway owns
-///     provisioning and the dir (which may live under the gateway app-data dir).
-///   * **No `user_dir/` extraction over `~/.lucidos`.** Current backups no longer
-///     include `~/.lucidos` at all (see `tar_and_compress`). LEGACY archives
-///     carry it under `user_dir/`, and applying that on restore would CLOBBER
-///     the target's gateway registry and other machine-global state. So we drop
-///     any `user_dir/` from the staging tree before moving files in.
-///   * **No migrations** — the engine server the gateway spawns afterward runs
-///     `sqlx::migrate!()` at construction, upgrading an older-schema restore.
 pub async fn restore_archive_into(
     workspace_dir: &Path,
     database_url: &str,
@@ -714,20 +585,14 @@ pub async fn restore_archive_into(
     encrypted_path: &Path,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
 ) -> Result<Vec<String>, BoxError> {
-    // Fail fast (before decrypt/decompress) if the bundled PG client tools can't
-    // be resolved — restore drives pg_restore + psql. Path-bearing message.
     pg_tools_preflight(database_url)?;
 
     let temp_dir = tempfile::tempdir()?;
     let progress = Arc::new(progress);
 
-    // Phase weights — there is no download phase (the file is already local), so
-    // decrypt starts at 0 and restore fills the remainder to 100.
     let enc_bytes = std::fs::metadata(encrypted_path)?.len();
     let (decrypt_end, decompress_end) = estimate_restore_weights(enc_bytes, 0);
 
-    // Phases 1-2: decrypt + decompress/untar into staging, then drop user_dir/
-    // (blocking I/O on the blocking pool).
     let (staging_dir, secret_key, bundles) = {
         let progress = progress.clone();
         let encrypted_path = encrypted_path.to_path_buf();
@@ -739,7 +604,6 @@ pub async fn restore_archive_into(
             Option<PathBuf>,
         );
         tokio::task::spawn_blocking(move || -> Result<Staged, BoxError> {
-            // Phase 1: decrypt
             progress("decrypting", 0, 100);
             let compressed_path = temp_path.join("backup.tar.zst");
             {
@@ -763,7 +627,6 @@ pub async fn restore_archive_into(
                 crypto::open(&key, reader, &mut output)?;
             }
 
-            // Phase 2: decompress + untar into staging
             progress("decompressing", decrypt_end, 100);
             let staging_dir = temp_path.join("staging");
             std::fs::create_dir_all(&staging_dir)?;
@@ -774,7 +637,7 @@ pub async fn restore_archive_into(
                 archive.unpack(&staging_dir)?;
             }
 
-            // Drop any `user_dir/`, the source's ~/.lucidos, so it is neither
+            // INVARIANT: Drop any `user_dir/`, the source's ~/.lucidos, so it is neither
             // applied over the target's ~/.lucidos nor littered into the restored
             // workspace. Current backups no longer include it (see
             // `tar_and_compress`); this stays as defense for LEGACY archives.
@@ -783,8 +646,6 @@ pub async fn restore_archive_into(
                 std::fs::remove_dir_all(&user_dir_staging)?;
             }
 
-            // The secret store key goes to the key store, never into the
-            // workspace directory. An archive from before ADR 0509 has none.
             let key_entry = staging_dir.join(SECRET_STORE_KEY_ENTRY);
             let secret_key = match std::fs::read_to_string(&key_entry) {
                 Ok(text) => {
@@ -795,8 +656,6 @@ pub async fn restore_archive_into(
                 Err(e) => return Err(e.into()),
             };
 
-            // The pending change bundles go back into their repositories,
-            // never into the workspace directory.
             let staged_bundles = staging_dir.join(pending_bundles::ARCHIVE_DIR);
             let bundles = if staged_bundles.exists() {
                 let kept = temp_path.join(pending_bundles::ARCHIVE_DIR);
@@ -811,7 +670,6 @@ pub async fn restore_archive_into(
         .await??
     };
 
-    // Phase 3: move staged files into the (gateway-created) workspace dir.
     progress("initializing", decompress_end, 100);
     {
         let workspace_dir = workspace_dir.to_path_buf();
@@ -822,8 +680,6 @@ pub async fn restore_archive_into(
         .await??;
     }
 
-    // A branch that cannot come back is a warning for the user, never fatal:
-    // the workspace and the rest of its pending changes still restore.
     let mut warnings = Vec::new();
     if let Some(bundles) = bundles {
         match pending_bundles::restore_bundles(&bundles).await {
@@ -839,9 +695,6 @@ pub async fn restore_archive_into(
         log_legacy!("[Restore] {warning}");
     }
 
-    // Phase 4: restore the database dump into the provisioned Postgres. Skipped
-    // entirely when the archive carries no dump (no Postgres work, no psql) — a
-    // real backup always includes `lucidos_backup.dump`.
     progress("restoring_db", decompress_end + 1, 100);
     {
         let ws_dir = workspace_dir.to_path_buf();
@@ -851,7 +704,7 @@ pub async fn restore_archive_into(
             if dump_path.exists() {
                 terminate_other_connections(&database_url)?;
                 pg_restore(&database_url, &dump_path)?;
-                // The restore succeeded, so failing it now would be wrong. The
+                // INVARIANT: The restore succeeded, so failing it now would be wrong. The
                 // leftover is a full database dump in the workspace root.
                 if let Err(e) = std::fs::remove_file(&dump_path) {
                     log_legacy!(
@@ -866,7 +719,7 @@ pub async fn restore_archive_into(
         .await??;
     }
 
-    // The restored secrets open only with the key they were sealed with.
+    // INVARIANT: The restored secrets open only with the key they were sealed with.
     // Failing here leaves a database that would refuse to boot, so say so now.
     if let Some(key) = secret_key {
         use crate::core::secret_store::key_store;
@@ -885,38 +738,28 @@ pub async fn restore_archive_into(
     Ok(warnings)
 }
 
-/// Create an encrypted backup of a workspace and its database.
-///
-/// Pipeline: pg_dump -> tar (exclude .lucidos/) -> zstd compress -> seal -> upload.
-/// `pending_branches` are the `(repo_root, branch)` pairs of unresolved changes,
-/// bundled into the archive by [`pending_bundles::write_bundles`].
-/// `key` seals the archive: the backup recipient, or a legacy key until the
-/// switch.
-///
-/// Phases 1-3 (pg_dump, compress, encrypt) run in `spawn_blocking` so they don't
-/// starve the tokio runtime — this ensures SSE progress events reach the client.
 pub async fn create_backup(
+    pool: &PgPool,
     workspace: &Path,
     database_url: &str,
-    pending_branches: &[(String, String)],
     key: crypto::SealingKey,
     provider: &dyn BackupProvider,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
-) -> Result<BackupEntry, BoxError> {
+) -> Result<(BackupEntry, BackupOrigin), BoxError> {
+    let origin = resolve_backup_origin(pool, workspace)
+        .await
+        .map_err(|e| format!("could not resolve the backup origin: {e}"))?;
+    let pending_branches = crate::core::changes::unresolved_change_branches(pool)
+        .await
+        .map_err(|e| format!("could not list the pending changes to back up: {e}"))?;
     crate::log_legacy!(
         "[Backup] Starting backup to {} (provider: {})",
         provider.name(),
         provider.id()
     );
 
-    // Fail fast if the bundled PG client tools cannot be resolved, with a
-    // path-bearing message, before any upload-size walk, preflight or encryption.
     pg_tools_preflight(database_url)?;
 
-    // Estimate the upload size up front, in one workspace walk on the blocking
-    // pool. The provider's preflight can then fail fast on a quota, scope or
-    // token problem, BEFORE pg_dump, the multi-GB tar and the encrypt. The tar
-    // phase still walks once more to stream the files.
     let ws_bytes = {
         let workspace = workspace.to_path_buf();
         tokio::task::spawn_blocking(move || {
@@ -925,17 +768,13 @@ pub async fn create_backup(
         .await?
     };
 
-    // PREFLIGHT — token, required scope, and free space. The only gate before
-    // expensive work; an actionable error here costs seconds, not ~25 minutes.
     provider.preflight(estimate_archive_size(ws_bytes)).await?;
 
     let temp_dir = tempfile::tempdir()?;
     let progress = Arc::new(progress);
 
-    // Bundle unresolved change branches into the staging area, so the archive
-    // seals them with everything else and the temp dir removes them.
     let pending_dir = temp_dir.path().join(pending_bundles::ARCHIVE_DIR);
-    let pending_dir = pending_bundles::write_bundles(workspace, pending_branches, &pending_dir)
+    let pending_dir = pending_bundles::write_bundles(workspace, &pending_branches, &pending_dir)
         .await?
         .then_some(pending_dir);
 
@@ -956,8 +795,17 @@ pub async fn create_backup(
         })
         .await??
     };
-    seal_and_upload(
-        workspace,
+    let workspace_name = workspace_archive_name(workspace);
+    let suffix = key.archive_suffix();
+    let filename = backup_archive::format_marked(
+        workspace_name,
+        Utc::now().format("%Y%m%d-%H%M%S"),
+        &origin.0,
+        suffix,
+    );
+
+    let entry = seal_and_upload(
+        filename,
         temp_dir.path(),
         &compressed_path,
         ws_bytes,
@@ -965,12 +813,12 @@ pub async fn create_backup(
         provider,
         progress,
     )
-    .await
+    .await?;
+    Ok((entry, origin))
 }
 
-/// Seal a captured archive on the blocking pool, then upload it asynchronously.
 async fn seal_and_upload(
-    workspace: &Path,
+    filename: String,
     temp_path: &Path,
     compressed_path: &Path,
     ws_bytes: u64,
@@ -979,7 +827,6 @@ async fn seal_and_upload(
     progress: Arc<impl Fn(&str, usize, usize) + Send + Sync + 'static>,
 ) -> Result<BackupEntry, BoxError> {
     let suffix = key.archive_suffix();
-    // Encryption is blocking I/O; upload below remains asynchronous.
     let (encrypted_path, encrypt_end) = {
         let progress = progress.clone();
         let temp_path = temp_path.to_path_buf();
@@ -987,7 +834,6 @@ async fn seal_and_upload(
 
         tokio::task::spawn_blocking(move || -> Result<(PathBuf, usize), BoxError> {
             let (_, compress_end, encrypt_end) = estimate_weights(ws_bytes);
-            // Phase 3: encrypt with per-chunk progress (compress_end% → encrypt_end%)
             crate::log_legacy!("[Backup] Phase 3/4: encrypt");
             progress("encrypting", compress_end, 100);
             let encrypted_path = temp_path.join(format!("backup{suffix}"));
@@ -1019,13 +865,8 @@ async fn seal_and_upload(
         .await??
     };
 
-    // Phase 4: upload with progress (encrypt_end% → 100%)
     crate::log_legacy!("[Backup] Phase 4/4: upload");
     progress("uploading", encrypt_end, 100);
-    let workspace_name = workspace_archive_name(workspace);
-    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-    let filename = format!("{ARCHIVE_PREFIX}{workspace_name}-{timestamp}{suffix}");
-
     let upload_progress = |done: u64, total: u64| {
         let pct = if total > 0 {
             encrypt_end + ((100 - encrypt_end) as f64 * done as f64 / total as f64) as usize
@@ -1048,76 +889,42 @@ async fn seal_and_upload(
     })
 }
 
-/// True when `s` is a backup-filename timestamp of the form `YYYYMMDD-HHMMSS`
-/// (8 digits, a hyphen, 6 digits) — the shape `create_backup` stamps via
-/// `Utc::now().format("%Y%m%d-%H%M%S")`. Validating it lets the archive matcher
-/// reject files whose name merely shares a workspace's prefix (e.g. workspace
-/// `myws` vs `myws-2`, where `lucidos-backup-myws-2-…` belongs to
-/// the latter).
-fn is_backup_timestamp(s: &str) -> bool {
-    match s.split_once('-') {
-        Some((date, time)) => {
-            date.len() == 8
-                && time.len() == 6
-                && date.bytes().all(|b| b.is_ascii_digit())
-                && time.bytes().all(|b| b.is_ascii_digit())
-        }
-        None => false,
-    }
+pub fn is_own_backup_archive(filename: &str, workspace_name: &str, origin: &BackupOrigin) -> bool {
+    backup_archive::parse(filename).is_some_and(|archive| {
+        archive.workspace == workspace_name && archive.origin == Some(origin.0.as_str())
+    })
 }
 
-/// True when `filename` is an encrypted backup archive produced by THIS
-/// workspace. It must match `lucidos-backup-{workspace_name}-{timestamp}` and
-/// an archive suffix exactly, timestamp shape included. This is the guard that keeps pruning off
-/// another workspace's archives, and off any unrelated file in the shared
-/// folder.
-pub fn is_own_backup_archive(filename: &str, workspace_name: &str) -> bool {
-    parse_workspace_name_from_archive(filename).as_deref() == Some(workspace_name)
-}
-
-/// From everything the provider lists in the shared backup folder, choose which
-/// archives to delete: narrow to THIS workspace's archives, keep the newest
-/// `keep`, and return the remainder OLDEST-FIRST for deletion. Pure so the
-/// selection rule is unit-testable without a live provider.
 fn select_prunable(
     entries: Vec<BackupEntry>,
     workspace_name: &str,
+    origin: &BackupOrigin,
     keep: usize,
 ) -> Vec<BackupEntry> {
     let mut own: Vec<BackupEntry> = entries
         .into_iter()
-        .filter(|e| is_own_backup_archive(&e.filename, workspace_name))
+        .filter(|e| is_own_backup_archive(&e.filename, workspace_name, origin))
         .collect();
     if own.len() <= keep {
         return Vec::new();
     }
-    // Newest first, then split off the newest `keep` to retain; the tail is
-    // what we delete. Reverse it so deletion proceeds oldest-first.
     own.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     let mut to_delete = own.split_off(keep);
     to_delete.reverse();
     to_delete
 }
 
-/// Delete this workspace's old backups beyond the retention limit, keeping the
-/// newest `keep`.
-///
-/// Lists everything in the provider's shared backup folder, narrows to THIS
-/// workspace's `lucidos-backup-{workspace_name}-*` archives, then deletes
-/// oldest-first. Another workspace's backups and any unrelated file in the
-/// folder are never touched (see [`select_prunable`]). Returns the number of
-/// backups deleted. A single delete failure is logged and skipped rather than
-/// propagated: one stuck archive must not abort cleanup of the rest.
 pub async fn prune_old_backups(
     provider: &dyn BackupProvider,
     workspace_name: &str,
+    origin: &BackupOrigin,
     keep: usize,
 ) -> Result<usize, BoxError> {
     if keep == 0 {
         return Ok(0);
     }
     let entries = provider.list_backups().await?;
-    let to_delete = select_prunable(entries, workspace_name, keep);
+    let to_delete = select_prunable(entries, workspace_name, origin, keep);
     let mut deleted = 0;
     for entry in to_delete {
         match provider.delete(&entry.id).await {
@@ -1133,7 +940,7 @@ pub async fn prune_old_backups(
     Ok(deleted)
 }
 
-/// The snapshot capture's free-space estimate. Unlike the backup preflight it
+/// INVARIANT: The snapshot capture's free-space estimate. Unlike the backup preflight it
 /// refuses an unreadable tree, so a disk floor is never checked against zero.
 pub(crate) fn snapshot_file_estimate(workspace: &Path) -> Result<u64, BoxError> {
     included_file_bytes(
@@ -1143,10 +950,6 @@ pub(crate) fn snapshot_file_estimate(workspace: &Path) -> Result<u64, BoxError> 
     )
 }
 
-/// Sum the on-disk size of every file that WILL be included in the backup tar
-/// (i.e. after the hardcoded + `.backupignore` exclusions). One walk, shared by
-/// preflight's free-space estimate and the phase-weight estimate. The tar phase
-/// walks once more to actually stream the files.
 fn workspace_backup_size(workspace: &Path, ignore: &BackupIgnore) -> u64 {
     included_file_bytes(workspace, ignore, Unreadable::Skip).unwrap_or_default()
 }
@@ -1159,16 +962,12 @@ fn included_file_bytes(
     sum_file_bytes(workspace, walkdir(workspace)?, ignore, unreadable)
 }
 
-/// What the size walk does with a file it cannot stat for a reason other than
-/// it being gone.
 #[derive(Debug, Clone, Copy)]
 enum Unreadable {
     Skip,
     Refuse,
 }
 
-/// A file that vanishes after the walk, such as a pruned worktree, counts as
-/// nothing.
 fn sum_file_bytes(
     workspace: &Path,
     paths: Vec<PathBuf>,
@@ -1190,30 +989,13 @@ fn sum_file_bytes(
     Ok(bytes)
 }
 
-/// Estimate the size of the *encrypted archive that will be uploaded* from the
-/// raw workspace size. The pipeline tar+zstd-compresses (~3:1) then AES-GCM
-/// encrypts (adds only ~16 bytes per chunk), so the upload is ≈ a third of the
-/// workspace. Used by preflight's free-space check; matches the 0.33 ratio
-/// `estimate_weights` uses for `compressed_mb` so the two stay consistent.
 fn estimate_archive_size(ws_bytes: u64) -> u64 {
     ws_bytes / 3
 }
 
-/// Estimate progress weights for each backup phase from the (already-computed)
-/// workspace size in bytes.
-///
-/// Returns `(dump_end, compress_end, encrypt_end)` as percentages (0-100).
-/// Upload fills the remainder to 100%.
-///
-/// Rough speed estimates from real workspaces:
-///
-/// - pg_dump: ~50 MB/s plus 2s overhead
-/// - compress: ~25 MB/s (tar + zstd level 3)
-/// - encrypt: ~5 MB/s (AES-256-GCM, 1 MB chunks)
-/// - upload: ~10 MB/s, network dependent
 fn estimate_weights(ws_bytes: u64) -> (usize, usize, usize) {
     let ws_mb = ws_bytes as f64 / 1_048_576.0;
-    let compressed_mb = ws_mb * 0.33; // zstd ~3:1 ratio estimate
+    let compressed_mb = ws_mb * 0.33;
 
     let dump_time = ws_mb / 50.0 + 2.0;
     let compress_time = ws_mb / 25.0;
@@ -1225,8 +1007,6 @@ fn estimate_weights(ws_bytes: u64) -> (usize, usize, usize) {
     let compress_pct = ((compress_time / total) * 100.0) as usize;
     let encrypt_pct = ((encrypt_time / total) * 100.0) as usize;
 
-    // Ensure each phase gets at least 2% so the bar visibly moves,
-    // and cap so later phases always have room.
     let dump_end = dump_pct.clamp(2, 90);
     let compress_end = (dump_end + compress_pct.max(2)).min(93);
     let encrypt_end = (compress_end + encrypt_pct.max(2)).min(97);
@@ -1234,21 +1014,9 @@ fn estimate_weights(ws_bytes: u64) -> (usize, usize, usize) {
     (dump_end, compress_end, encrypt_end)
 }
 
-/// Estimate progress weights for restore phases based on encrypted file size.
-///
-/// Returns `(decrypt_end, decompress_end)` as percentages (0-100).
-/// `download_end` is the starting point (download phase already accounted for).
-/// Restore DB fills the remainder to 100%.
-///
-/// Rough speed estimates:
-///   decrypt    ~5 MB/s  (AES-256-GCM, 1 MB chunks)
-///   decompress ~50 MB/s (zstd + untar to disk)
-///   restore    ~20 MB/s (psql import) + 2s overhead
 fn estimate_restore_weights(enc_bytes: u64, download_end: usize) -> (usize, usize) {
     let enc_mb = enc_bytes as f64 / 1_048_576.0;
-    // Encrypted ≈ compressed (encryption adds ~16 bytes/MB overhead)
     let compressed_mb = enc_mb;
-    // Estimate uncompressed size (zstd ~3:1)
     let uncompressed_mb = compressed_mb * 3.0;
 
     let decrypt_time = enc_mb / 5.0;
@@ -1260,15 +1028,12 @@ fn estimate_restore_weights(enc_bytes: u64, download_end: usize) -> (usize, usiz
     let decrypt_pct = ((decrypt_time / total) * remaining as f64) as usize;
     let decompress_pct = ((decompress_time / total) * remaining as f64) as usize;
 
-    // Ensure each phase gets at least 2% so the bar visibly moves
     let decrypt_end = (download_end + decrypt_pct.max(2)).min(95);
     let decompress_end = (decrypt_end + decompress_pct.max(2)).min(97);
 
     (decrypt_end, decompress_end)
 }
 
-/// Read wrapper that calls a callback with total bytes read so far.
-/// Used to report fine-grained progress during encrypt/decrypt.
 struct ProgressReader<R, F> {
     inner: R,
     bytes_read: u64,
@@ -1284,14 +1049,11 @@ impl<R: std::io::Read, F: FnMut(u64)> std::io::Read for ProgressReader<R, F> {
     }
 }
 
-/// Move all entries from `src` into `dest`, preserving directory structure.
-/// Used to move staged restore contents into the workspace after validation.
 fn move_contents(src: &Path, dest: &Path) -> Result<(), BoxError> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
-        // Try rename first (fast, same filesystem), fall back to copy+delete
         if let Err(e) = std::fs::rename(&src_path, &dest_path) {
             crate::log_legacy!(
                 "[Backup] rename failed for {}, falling back to copy: {}",
@@ -1310,7 +1072,6 @@ fn move_contents(src: &Path, dest: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Recursively copy a directory tree.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), BoxError> {
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(src)? {
@@ -1326,7 +1087,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Apply the libpq env for `database_url` onto `cmd`. Returns `Err` when the
+/// INVARIANT: Apply the libpq env for `database_url` onto `cmd`. Returns `Err` when the
 /// URL does not parse, so the caller fails loudly. Otherwise it would spawn a
 /// subprocess that inherits zero `PG*` vars and gets a confusing connection
 /// error from libpq.
@@ -1343,7 +1104,7 @@ fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(
     Ok(())
 }
 
-/// Build a `Command` for a PostgreSQL client tool (`pg_dump` / `pg_restore` /
+/// INVARIANT: Build a `Command` for a PostgreSQL client tool (`pg_dump` / `pg_restore` /
 /// `psql`), resolved + ready to run.
 ///
 /// In a packaged build the relocatable PG client binaries live at
@@ -1365,10 +1126,6 @@ pub fn pg_tool_command(name: &str, database_url: &str) -> Result<std::process::C
     Ok(cmd)
 }
 
-/// Pure resolution of a PG client tool path: an absolute `<bin_dir>/<name>`
-/// (must exist — fail fast with the path) when `bin_dir` is given, else the bare
-/// `name` for a PATH lookup. Split out from `pg_tool_command` so the
-/// resolution + the missing-binary error are unit-testable without env/spawn.
 fn resolve_pg_tool_path(name: &str, bin_dir: Option<&Path>) -> Result<PathBuf, BoxError> {
     match bin_dir {
         Some(dir) => {
@@ -1387,11 +1144,6 @@ fn resolve_pg_tool_path(name: &str, bin_dir: Option<&Path>) -> Result<PathBuf, B
     }
 }
 
-/// Fail fast at the START of a backup or restore if the bundled PG client tools
-/// cannot be resolved, with a path-bearing error. The alternative is a cryptic
-/// ENOENT deep inside `pg_dump`, `pg_restore` or `psql`, after the run has
-/// already started. A no-op in dev, where `LUCIDOS_PG_BIN_DIR` is unset and the
-/// bare PATH lookup is validated when the tool actually runs.
 fn pg_tools_preflight(database_url: &str) -> Result<(), BoxError> {
     if std::env::var_os("LUCIDOS_PG_BIN_DIR").is_none() {
         return Ok(());
@@ -1402,7 +1154,7 @@ fn pg_tools_preflight(database_url: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Run pg_dump to export the database in custom archive format.
+/// INVARIANT: Run pg_dump to export the database in custom archive format.
 ///
 /// Custom format (`-Fc`) is a compressed binary format restored via `pg_restore`.
 /// It avoids PostgreSQL 18's `\restrict` / `\unrestrict` psql meta-commands
@@ -1446,23 +1198,12 @@ fn pg_dump_with_snapshot(
     Ok(())
 }
 
-/// The target database name from a postgres URL, for `psql --dbname`.
-///
-/// We pull the name from the same parse that seeds the `PG*` env. Host, port,
-/// user and password still flow via env, kept out of argv, and only the dbname
-/// lands on the command line.
 fn pg_dbname(database_url: &str) -> Result<String, BoxError> {
     Ok(lucidos_pg_url::PgUrl::parse(database_url)?.database)
 }
 
-/// Session-level SET parameters that exist in newer PostgreSQL versions but not
-/// older ones. When restoring a dump created by a newer pg_dump into an older
-/// server, these SET statements cause a fatal error. We strip them from the SQL
-/// before piping to psql.
 const CROSS_VERSION_SET_PARAMS: &[&str] = &["transaction_timeout"];
 
-/// Returns true if `line` is a `SET <param> = ...;` for a parameter in
-/// [`CROSS_VERSION_SET_PARAMS`]. Pure for testability.
 fn is_cross_version_set(line: &str) -> bool {
     let trimmed = line.trim();
     let upper = trimmed.to_uppercase();
@@ -1479,18 +1220,24 @@ fn is_cross_version_set(line: &str) -> bool {
     false
 }
 
-/// Restore a database from a custom-format dump file using pg_restore.
-///
-/// Pipes `pg_restore --file=-` (SQL to stdout) through a filter that strips
-/// session SET statements for parameters that don't exist in older PostgreSQL
-/// versions (e.g. `transaction_timeout` added in PG 17), then feeds the
-/// filtered SQL to `psql --single-transaction`. This makes cross-version
-/// restores (e.g. PG 17 dump → PG 16 server) work without losing atomicity.
 fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
-    pg_restore_with_checks(database_url, dump_path, "", "")
+    pg_restore_with_checks(
+        database_url,
+        dump_path,
+        "",
+        "
+        DO $$
+        BEGIN
+            IF to_regclass('public.backup_origin') IS NOT NULL THEN
+                DELETE FROM public.backup_origin;
+            END IF;
+        END
+        $$;
+        ",
+    )
 }
 
-/// Offline snapshot replay shares the archive SQL filtering and atomic psql
+/// INVARIANT: Offline snapshot replay shares the archive SQL filtering and atomic psql
 /// pipeline. The surrounding SQL is generated internally, never caller input.
 pub(super) fn pg_restore_with_checks(
     database_url: &str,
@@ -1502,7 +1249,6 @@ pub(super) fn pg_restore_with_checks(
 
     let dbname = pg_dbname(database_url)?;
 
-    // Step 1: pg_restore outputs SQL to stdout
     let mut restore_cmd = pg_tool_command("pg_restore", database_url)?;
     let restore_output = restore_cmd
         .args([
@@ -1524,7 +1270,6 @@ pub(super) fn pg_restore_with_checks(
         .into());
     }
 
-    // Step 2: filter out cross-version SET statements
     let reader = BufReader::new(&restore_output.stdout[..]);
     let mut filtered = Vec::with_capacity(restore_output.stdout.len() + before.len() + after.len());
     filtered.extend_from_slice(before.as_bytes());
@@ -1539,7 +1284,6 @@ pub(super) fn pg_restore_with_checks(
 
     filtered.extend_from_slice(after.as_bytes());
 
-    // Step 3: pipe filtered SQL to psql inside a single transaction
     let mut psql_cmd = pg_tool_command("psql", database_url)?;
     let mut psql = psql_cmd
         .args(psql_restore_args(&dbname))
@@ -1548,7 +1292,7 @@ pub(super) fn pg_restore_with_checks(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    // Write stdin on a separate thread while `wait_with_output` drains
+    // INVARIANT: Write stdin on a separate thread while `wait_with_output` drains
     // stdout/stderr. A synchronous `write_all` before the wait can deadlock on
     // a large restore: psql blocks once its stdout pipe fills, stops reading
     // stdin, and our write blocks forever. The write result is checked AFTER
@@ -1573,7 +1317,7 @@ pub(super) fn pg_restore_with_checks(
     Ok(())
 }
 
-/// The psql arguments that replay a restore's SQL.
+/// INVARIANT: The psql arguments that replay a restore's SQL.
 ///
 /// `ON_ERROR_STOP` is what makes a failed restore exit non-zero. Without it,
 /// one failing statement rolls the single transaction back, and psql still
@@ -1590,11 +1334,6 @@ fn psql_restore_args(dbname: &str) -> [&str; 6] {
     ]
 }
 
-/// Terminate all other database connections to allow pg_restore --clean to drop objects.
-///
-/// The engine's connection pool holds connections that may have cached prepared
-/// statements. pg_restore --clean needs to DROP and recreate tables, which requires
-/// no other sessions holding locks. After termination, the pool auto-reconnects.
 fn terminate_other_connections(database_url: &str) -> Result<(), BoxError> {
     let mut cmd = pg_tool_command("psql", database_url)?;
     let output = cmd
@@ -1612,13 +1351,9 @@ fn terminate_other_connections(database_url: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// A single parsed `.backupignore` rule.
 enum IgnorePattern {
-    /// A plain path with no wildcards. Matches the path and everything under
-    /// it via component-prefix comparison — identical semantics to the
-    /// hardcoded `rel.starts_with(...)` checks.
     Prefix(PathBuf),
-    /// A pattern containing glob wildcards (`*`, `?`, `[`). Matched against the
+    /// INVARIANT: A pattern containing glob wildcards (`*`, `?`, `[`). Matched against the
     /// workspace-relative path *and each of its ancestors*, so a glob that
     /// names a directory also excludes that directory's entire subtree. With
     /// `glob`'s default options `*` matches across `/`, so wildcard patterns are
@@ -1636,23 +1371,18 @@ impl IgnorePattern {
     }
 }
 
-/// Parsed contents of a workspace's `data/.backupignore` — a gitignore-style
-/// list of workspace-relative paths to omit from the backup, *in addition* to
-/// the hardcoded exclusions. Loaded and parsed once per backup run, and shared
-/// across the size estimate and the tar walk. An absent or empty file yields an
-/// empty set.
 #[derive(Default)]
 pub(crate) struct BackupIgnore(Vec<IgnorePattern>);
 
 impl BackupIgnore {
-    /// Destructive restore cannot interpret an unreadable or malformed policy
+    /// INVARIANT: Destructive restore cannot interpret an unreadable or malformed policy
     /// as permission to replace files. Keep capture's matching semantics.
     pub(crate) fn load_for_restore(workspace: &Path) -> Result<Self, BoxError> {
         let path = workspace.join("data/.backupignore");
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // A dangling policy link is not an absent policy.
+                // INVARIANT: A dangling policy link is not an absent policy.
                 if std::fs::symlink_metadata(&path).is_ok() {
                     return Err("snapshot restore ignore policy is unreadable".into());
                 }
@@ -1700,9 +1430,6 @@ impl BackupIgnore {
         Ok(Self::parse(&patterns.join("\n")))
     }
 
-    /// Load `<workspace>/data/.backupignore`. A missing file is the common case
-    /// and yields no patterns silently. Any other read error is logged and also
-    /// treated as no patterns: a broken ignore file never aborts the backup.
     fn load(workspace: &Path) -> Self {
         let path = workspace.join("data").join(".backupignore");
         match std::fs::read_to_string(&path) {
@@ -1719,10 +1446,6 @@ impl BackupIgnore {
         }
     }
 
-    /// Parse the file body: one pattern per line, blank lines and `#` comments
-    /// skipped, a trailing `/` tolerated. Patterns with wildcard chars compile
-    /// to `glob::Pattern`; the rest are plain component-prefixes. A malformed
-    /// glob is logged and skipped rather than aborting the parse.
     fn parse(content: &str) -> Self {
         let mut patterns = Vec::new();
         for raw in content.lines() {
@@ -1730,7 +1453,6 @@ impl BackupIgnore {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            // Tolerate a trailing slash: `foo/` behaves like `foo`.
             let line = line.trim_end_matches('/');
             if line.is_empty() {
                 continue;
@@ -1751,7 +1473,6 @@ impl BackupIgnore {
         Self(patterns)
     }
 
-    /// True if any parsed pattern matches the workspace-relative path.
     fn matches(&self, rel: &Path) -> bool {
         self.0.iter().any(|p| p.matches(rel))
     }
@@ -1767,19 +1488,6 @@ impl BackupIgnore {
     }
 }
 
-/// True if a workspace-relative path must be omitted from the backup tar
-/// and from the size estimate.
-///
-/// Excludes (hardcoded, always — cheap checks first):
-/// - `.lucidos/` — ephemeral runtime/cache
-/// - `data/postgres/` — live PGDATA, captured via pg_dump
-/// - `data/postgres.*/` — archived PGDATA siblings (e.g.
-///   `postgres.migrated-<ts>/` left by `scripts/lib/workspace.sh` after the
-///   one-time bind-mount → Docker-volume migration). These can be many GB
-///   and are redundant with pg_dump.
-///
-/// Then, in addition, any path matched by the workspace's `.backupignore`
-/// (`ignore`) — see [`BackupIgnore`].
 pub(crate) fn is_excluded_workspace_path(rel: &Path, ignore: &BackupIgnore) -> bool {
     if rel.starts_with(".lucidos") {
         return true;
@@ -1796,9 +1504,6 @@ pub(crate) fn is_excluded_workspace_path(rel: &Path, ignore: &BackupIgnore) -> b
     ignore.matches(rel)
 }
 
-/// Build a tar header for a file, copying size + mtime from filesystem metadata.
-/// Falls back to mtime=0 when the OS doesn't expose modified time (best-effort,
-/// matches tar's "no mtime known" convention).
 fn header_for_file(metadata: &std::fs::Metadata) -> tar::Header {
     let mut header = tar::Header::new_gnu();
     header.set_size(metadata.len());
@@ -1815,14 +1520,6 @@ fn header_for_file(metadata: &std::fs::Metadata) -> tar::Header {
     header
 }
 
-/// Classify an `io::Result` so the backup walk tolerates paths that vanish
-/// mid-walk: `Ok(Some(v))` = use it, `Ok(None)` = the path was removed
-/// (`NotFound`) so skip it, `Err(e)` = a real error to propagate.
-///
-/// A workspace's background jobs constantly create and tear down git worktrees
-/// under `.git/`. A path the walk enumerated can disappear before tar reads it.
-/// A single vanished path must not abort the whole backup. Other error kinds,
-/// permissions and I/O, still must.
 fn skip_if_vanished<T>(path: &Path, result: std::io::Result<T>) -> Result<Option<T>, BoxError> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -1834,7 +1531,7 @@ fn skip_if_vanished<T>(path: &Path, result: std::io::Result<T>) -> Result<Option
     }
 }
 
-/// Yields exactly `len` bytes of `inner`: cut short if the source grew, and
+/// INVARIANT: Yields exactly `len` bytes of `inner`: cut short if the source grew, and
 /// zero-filled if it shrank.
 ///
 /// A tar header states its entry's size before the data. The tar crate copies
@@ -1844,7 +1541,6 @@ fn skip_if_vanished<T>(path: &Path, result: std::io::Result<T>) -> Result<Option
 struct ExactLen<R> {
     inner: R,
     remaining: u64,
-    /// Zero bytes written in place of data the source no longer had.
     padded: u64,
 }
 
@@ -1879,9 +1575,6 @@ impl<R: std::io::Read> std::io::Read for ExactLen<R> {
     }
 }
 
-/// Append `content` as one entry holding exactly the size `header` declares,
-/// whatever length the source yields. Returns the zero bytes written in place
-/// of data the source no longer had.
 fn append_exact<W: std::io::Write, R: std::io::Read>(
     builder: &mut tar::Builder<W>,
     header: &mut tar::Header,
@@ -1893,15 +1586,10 @@ fn append_exact<W: std::io::Write, R: std::io::Read>(
     Ok(content.padded)
 }
 
-/// How a file changed while `append_file` copied it. The archive stays well
-/// formed either way, but the entry holds a torn copy.
 #[derive(Debug, PartialEq)]
 enum CopyDrift {
-    /// The file grew. The entry holds its first `kept` bytes.
     Grew { kept: u64 },
-    /// The file shrank. The entry ends in `padded` zero bytes.
     Shrank { padded: u64 },
-    /// The file was written, and its final length matches no simpler case.
     Rewritten,
 }
 
@@ -1915,8 +1603,6 @@ impl std::fmt::Display for CopyDrift {
     }
 }
 
-/// Compare the open handle's stat from before the copy with one from after it.
-/// `padded` is what [`append_exact`] zero-filled, the one change the read saw.
 fn copy_drift(
     before: &std::fs::Metadata,
     after: &std::fs::Metadata,
@@ -1933,7 +1619,7 @@ fn copy_drift(
     }
 }
 
-/// Append a single file at `path` to the tar `builder` under archive path `archive_path`.
+/// INVARIANT: Append a single file at `path` to the tar `builder` under archive path `archive_path`.
 ///
 /// The size comes from the open handle, not from an earlier stat of the path. A
 /// file replaced by a rename in between would otherwise bring another length. A
@@ -1943,7 +1629,6 @@ fn append_file<W: std::io::Write>(
     path: &Path,
     archive_path: &Path,
 ) -> Result<(), BoxError> {
-    // The file may have vanished since the walk listed it; skip it.
     let Some(file) = skip_if_vanished(path, std::fs::File::open(path))? else {
         return Ok(());
     };
@@ -1962,18 +1647,6 @@ fn append_file<W: std::io::Write>(
     Ok(())
 }
 
-/// Tar workspace files (excluding .lucidos/) and SQL dump, then zstd compress.
-///
-/// Streams tar entries directly through zstd to a file — never holds the full
-/// archive in memory.
-///
-/// The workspace's own `.git/` IS included (artifact version history); only
-/// `.lucidos/`, `data/postgres*`, and `data/.backupignore` entries are excluded
-/// (see [`is_excluded_workspace_path`]). The user-level `~/.lucidos/` is
-/// deliberately NOT included. `restore_archive_into` unconditionally discards
-/// any `user_dir/`, because it would clobber the target's machine-global gateway
-/// registry, so backing it up is multi-GB of dead weight. The gateway's
-/// `deleted/` stashes alone can be several GB.
 fn tar_and_compress(
     workspace: &Path,
     sql_dump: &Path,
@@ -1986,9 +1659,6 @@ fn tar_and_compress(
     let encoder = zstd::Encoder::new(file, 3)?;
     let mut builder = tar::Builder::new(encoder);
 
-    // Add workspace files, excluding .lucidos/, data/postgres/, any
-    // data/postgres.*/ siblings, and anything matched by data/.backupignore
-    // (see is_excluded_workspace_path).
     for path in walkdir(workspace)? {
         let rel = path.strip_prefix(workspace)?;
 
@@ -2004,7 +1674,7 @@ fn tar_and_compress(
         }
     }
 
-    // Add the SQL dump at the archive root. Unlike a workspace file, a missing
+    // INVARIANT: Add the SQL dump at the archive root. Unlike a workspace file, a missing
     // dump is an error: the backup is worthless without it.
     std::fs::metadata(sql_dump)?;
     append_file(&mut builder, sql_dump, Path::new("lucidos_backup.dump"))?;
@@ -2019,7 +1689,7 @@ fn tar_and_compress(
     Ok(())
 }
 
-/// Recursively walk the workspace, returning all regular file paths.
+/// INVARIANT: Recursively walk the workspace, returning all regular file paths.
 ///
 /// One symlink is followed: a top-level `data` relocating the tree to another
 /// disk. That layout is supported, and both coding-agent back ends grant it
@@ -2038,9 +1708,6 @@ fn walkdir(root: &Path) -> Result<Vec<PathBuf>, BoxError> {
     let mut skipped = 0usize;
     walkdir_inner(root, root, &mut results, &mut skipped)?;
     if skipped > 0 {
-        // One line per walk, not one per link. The walk runs before
-        // `is_excluded_workspace_path`, so it meets every symlink under
-        // `.lucidos/` too, and a dev workspace has hundreds of those.
         crate::log_legacy!(
             "[Backup] Skipped {} symlink(s); only a relocated {}/ is followed",
             skipped,
@@ -2050,16 +1717,15 @@ fn walkdir(root: &Path) -> Result<Vec<PathBuf>, BoxError> {
     Ok(results)
 }
 
-/// What the walk does with a symlink it met.
 pub(crate) enum SymlinkAction {
-    /// The one relocation a backup follows. Recursion enters the LINK path
+    /// INVARIANT: The one relocation a backup follows. Recursion enters the LINK path
     /// rather than its target, so every child stays under the workspace and
     /// `is_excluded_workspace_path` keeps working on the relative path.
     Follow,
     Skip,
 }
 
-/// Decide a symlink's fate, or FAIL the backup.
+/// INVARIANT: Decide a symlink's fate, or FAIL the backup.
 ///
 /// A top-level `data` link that does not resolve is an error, never a skip.
 /// Skipping it archives a workspace holding no artifacts, apps, knowhow or
@@ -2086,9 +1752,6 @@ pub(crate) fn classify_symlink(path: &Path, root: &Path) -> Result<SymlinkAction
         )
         .into());
     }
-    // A link resolving onto a parent of the workspace would pull `.lucidos/`
-    // and every sibling worktree into the archive. The coding-agent grants
-    // refuse the same shape.
     if crate::core::grants::grants_more_than_the_data_tree(&resolved, root) {
         return Err(format!(
             "{} resolves to {}, which contains the workspace. Refusing to back \
@@ -2107,13 +1770,9 @@ fn walkdir_inner(
     results: &mut Vec<PathBuf>,
     skipped: &mut usize,
 ) -> Result<(), BoxError> {
-    // Only the walk ROOT reaches this as a non-directory; recursion already
-    // checked the entry type. A root reached through a symlink is the caller's
-    // own choice and stays allowed.
     if !dir.is_dir() {
         return Ok(());
     }
-    // The directory may be removed mid-walk; treat a vanished dir as empty.
     let Some(entries) = skip_if_vanished(dir, std::fs::read_dir(dir))? else {
         return Ok(());
     };
@@ -2122,8 +1781,6 @@ fn walkdir_inner(
             continue;
         };
         let path = entry.path();
-        // `file_type` reads the entry itself, so a symlink reports as one
-        // rather than as whatever it points at.
         let Some(file_type) = skip_if_vanished(&path, entry.file_type())? else {
             continue;
         };
@@ -2132,10 +1789,6 @@ fn walkdir_inner(
                 SymlinkAction::Follow => walkdir_inner(&path, root, results, skipped)?,
                 SymlinkAction::Skip => {
                     *skipped += 1;
-                    // Name the ones at the workspace root. A relocation lives
-                    // there, so a link this walk declines to follow is worth
-                    // reading by name. Deeper ones are `.lucidos/` noise and
-                    // stay in the count.
                     if dir == root {
                         crate::log_legacy!("[Backup] Not following symlink {}", path.display());
                     }

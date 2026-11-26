@@ -1,34 +1,18 @@
-//! The stamp keys across a dev reload's re-exec.
-//!
-//! `reload_gateway` replaces this image and keeps every engine running. Each
-//! engine still holds the key it got at spawn, so the new image needs the same
-//! keys or it signs nothing those engines accept. They cross the exec in a
-//! pipe, the way the owner lock's descriptor does. Only the descriptor number
-//! travels in the environment, never a key.
-//!
-//! A restart that is not a re-exec loses the table. The supervisor then
-//! respawns each keyless engine it keeps once that engine is idle.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use lucidos_gateway_stamp::StampKey;
 
-/// Where a re-exec names the descriptor holding the key table.
 pub const INHERITED_STAMP_KEYS_FD_ENV: &str = "LUCIDOS_GATEWAY_STAMP_KEYS_FD";
 
-/// Workspace id to the stamp key of its running engine.
 pub type StampKeys = HashMap<String, Arc<StampKey>>;
 
-/// The table as pipe text: one `<workspace id> <key line>` per engine.
 fn encode(keys: &StampKeys) -> String {
     keys.iter()
         .map(|(id, key)| format!("{id} {}", key.handover_line()))
         .collect()
 }
 
-/// Read [`encode`]'s text back. A malformed line is skipped, which leaves that
-/// engine keyless: its devices read as unattested until it is re-keyed.
 fn decode(text: &str) -> StampKeys {
     text.lines()
         .filter_map(|line| {
@@ -40,13 +24,6 @@ fn decode(text: &str) -> StampKeys {
         .collect()
 }
 
-/// A pipe holding `keys`, returning its read end for a re-exec to inherit.
-///
-/// `std::io::pipe` makes both ends close-on-exec, atomically where the OS can
-/// (Linux), so no engine spawned meanwhile inherits either. The caller clears
-/// the flag on the read end in its `pre_exec`. The write end is non-blocking
-/// and closed before return: a table larger than the pipe buffer fails here
-/// rather than hanging the reload.
 #[cfg(unix)]
 pub fn pipe_for_exec(keys: &StampKeys) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::io::Write as _;
@@ -58,11 +35,6 @@ pub fn pipe_for_exec(keys: &StampKeys) -> std::io::Result<std::os::fd::OwnedFd> 
     Ok(read.into())
 }
 
-/// Take the key table a `reload_gateway` re-exec handed this image, and drop
-/// its descriptor and its variable.
-///
-/// Call before the first spawn, while the process is still single-threaded,
-/// since it sets process env. Empty on any launch that is not a re-exec.
 #[cfg(unix)]
 pub fn take_inherited() -> StampKeys {
     use std::os::fd::FromRawFd as _;
@@ -71,7 +43,6 @@ pub fn take_inherited() -> StampKeys {
     unsafe {
         std::env::remove_var(INHERITED_STAMP_KEYS_FD_ENV);
     }
-    // Stdio never carries the table.
     let Some(fd) = value
         .and_then(|v| v.parse::<std::os::fd::RawFd>().ok())
         .filter(|&fd| fd > 2)
@@ -89,9 +60,6 @@ pub fn take_inherited() -> StampKeys {
     keys
 }
 
-/// Read what the previous image wrote before its exec. The read end is
-/// non-blocking, so a child that inherited the write end cannot hang the
-/// boot: the table is already in the pipe buffer, and the read stops there.
 #[cfg(unix)]
 fn read_written(mut pipe: std::fs::File) -> String {
     use std::io::Read as _;
@@ -117,7 +85,6 @@ fn read_written(mut pipe: std::fs::File) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// No re-exec hands anything over off Unix.
 #[cfg(not(unix))]
 pub fn take_inherited() -> StampKeys {
     StampKeys::new()
@@ -182,8 +149,6 @@ mod tests {
         assert!(same_keys(&keys, &decode(&text)));
     }
 
-    /// A child that inherited the write end keeps it open. The boot still
-    /// reads the table and goes on, rather than waiting for an EOF.
     #[cfg(unix)]
     #[test]
     fn a_held_write_end_does_not_hang_the_read() {

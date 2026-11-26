@@ -1,86 +1,35 @@
-//! The three answers a hook script gives, read from its stdout.
-//!
-//! The stdout is one JSON object whose `answer` names it:
-//!
-//! - `{"answer": "allow"}`, optionally with `"events": [{"event_type", "payload"}]`;
-//! - `{"answer": "needs-input", "argument": "<name>"}`;
-//! - `{"answer": "refuse", "reason": "<why>"}`.
-
+use lucidos_core::core::event_hooks::{Refusal, RefusalCause, ReturnedEvent};
 use lucidos_core::core::event_subscription::validate_emittable_event_type;
 use lucidos_core::core::{redact_subprocess_output_in_json, sanitize_for_jsonb};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::json_strings::map_object_strings;
 
-/// What a hook decided about one pending event. Anything but a well-formed
-/// answer from a script that exited cleanly is a [`HookAnswer::Refuse`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum HookAnswer {
-    /// The event may be recorded, together with the hook's own events.
-    Allow {
-        events: Vec<ReturnedEvent>,
-    },
-    /// The hook needs one of its declared arguments before it can decide.
-    NeedsInput {
-        argument: String,
-    },
+    Allow { events: Vec<ReturnedEvent> },
+    NeedsInput { argument: String },
     Refuse(Refusal),
 }
 
-/// A domain event an allowing hook asks to record beside the hooked event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReturnedEvent {
-    pub event_type: String,
-    #[serde(default)]
-    pub payload: Map<String, Value>,
+pub(crate) fn map_event_strings(
+    event: ReturnedEvent,
+    f: &impl Fn(&str) -> String,
+) -> Result<ReturnedEvent, String> {
+    Ok(ReturnedEvent {
+        event_type: f(&event.event_type),
+        payload: map_object_strings(event.payload, f)?,
+    })
 }
 
-impl ReturnedEvent {
-    /// This event with `f` applied to its type and to every string in its
-    /// payload, object keys included. `Err` names a key two payload keys
-    /// both became.
-    pub(crate) fn map_strings(self, f: &impl Fn(&str) -> String) -> Result<Self, String> {
-        Ok(ReturnedEvent {
-            event_type: f(&self.event_type),
-            payload: map_object_strings(self.payload, f)?,
-        })
-    }
-
-    /// This event with every secret masked out of its payload, object keys
-    /// included, by the shared masker.
-    pub(crate) fn masked(self, secrets: &[String]) -> Self {
-        let mut payload = Value::Object(self.payload);
-        redact_subprocess_output_in_json(&mut payload, secrets);
-        let Value::Object(payload) = payload else {
-            unreachable!("masking keeps an object an object");
-        };
-        ReturnedEvent { payload, ..self }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Refusal {
-    pub cause: RefusalCause,
-    /// What the actor who caused the event reads: the hook's own reason, or
-    /// what went wrong with the hook.
-    pub reason: String,
-    /// The tail of the script's stderr when it failed. It is not the hook's
-    /// chosen reason, so it may hold data the actor must not read.
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RefusalCause {
-    /// The hook answered `refuse`.
-    Refused,
-    /// The script could not start, or exited unsuccessfully.
-    Crashed,
-    TimedOut,
-    /// The script exited cleanly, and its stdout was not an answer.
-    InvalidAnswer,
+pub(crate) fn masked_event(event: ReturnedEvent, secrets: &[String]) -> ReturnedEvent {
+    let mut payload = Value::Object(event.payload);
+    redact_subprocess_output_in_json(&mut payload, secrets);
+    let Value::Object(payload) = payload else {
+        unreachable!("masking keeps an object an object");
+    };
+    ReturnedEvent { payload, ..event }
 }
 
 #[derive(Deserialize)]
@@ -98,9 +47,6 @@ enum WireAnswer {
     },
 }
 
-/// Parse a cleanly exited script's stdout. `Err` names what makes it no
-/// answer, and the runner turns it into a refusal. Postgres stores no NUL,
-/// so neither an answer nor an `Err` holds one.
 pub(crate) fn parse(stdout: &str) -> Result<HookAnswer, String> {
     let wire: WireAnswer = serde_json::from_str(stdout.trim())
         .map_err(|e| sanitize_for_jsonb(&format!("the stdout is not an answer: {e}")))?;
@@ -108,7 +54,7 @@ pub(crate) fn parse(stdout: &str) -> Result<HookAnswer, String> {
         WireAnswer::Allow { events } => {
             let events = events
                 .into_iter()
-                .map(|event| event.map_strings(&sanitize_for_jsonb))
+                .map(|event| map_event_strings(event, &sanitize_for_jsonb))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|key| {
                     format!("two keys of an event payload read as '{key}' without NUL bytes")
@@ -213,8 +159,6 @@ mod tests {
         assert!(!err.contains('\0'), "{err:?}");
     }
 
-    /// Two keys that differ only by NUL bytes would collapse into one and
-    /// lose a value, so the answer is refused instead.
     #[test]
     fn keys_that_collide_without_nul_refuse() {
         let err = parse(
@@ -247,7 +191,6 @@ mod tests {
         assert!(parse(r#"{"answer": "refuse"}"#).is_err());
     }
 
-    /// A misspelled key or answer must never pass as some other answer.
     #[test]
     fn anything_else_is_no_answer() {
         for stdout in [

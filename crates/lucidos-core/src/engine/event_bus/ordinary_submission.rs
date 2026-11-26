@@ -1,5 +1,3 @@
-//! Atomic ordinary acceptance. Message recording remains execution-time work:
-//! pending questions and coding redirects have their own recording order.
 use super::*;
 use crate::core::store::ComposeReport;
 use crate::engine::thread_events::input_order::{InputAdmission, InputOrder, InputPosition};
@@ -7,7 +5,7 @@ use crate::engine::thread_events::queue::ThreadQueueRequest;
 use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use serde::{Deserialize, Serialize};
 
-/// The authenticated transport captures this before resolving defaults or contexts.
+/// INVARIANT: The authenticated transport captures this before resolving defaults or contexts.
 /// Keep the normalized wire request, including its explicit selections and fence;
 /// the resolved execution request is separately retained in the acceptance event.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -35,7 +33,6 @@ impl OrdinarySubmissionIntent {
     }
 }
 
-/// The immutable acknowledgement of one accepted composer input.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct OrdinarySubmissionReceipt {
     pub event_id: Uuid,
@@ -45,7 +42,7 @@ pub struct OrdinarySubmissionReceipt {
 
 pub struct OrdinaryAcceptance {
     pub receipt: OrdinarySubmissionReceipt,
-    /// Replays never join or advance input order. New acceptance retains its
+    /// INVARIANT: Replays never join or advance input order. New acceptance retains its
     /// runtime turn in EventBus until the durable queue's executor takes it.
     pub replayed: bool,
 }
@@ -59,7 +56,7 @@ impl EventBus {
         read_receipt(&self.pool, intent, actor).await
     }
 
-    /// The caller authenticates and fully resolves the request first. A fence
+    /// INVARIANT: The caller authenticates and fully resolves the request first. A fence
     /// belongs to the send intent, never a fresh read immediately before POST.
     pub async fn accept_ordinary_submission(
         &self,
@@ -89,7 +86,7 @@ impl EventBus {
         }
         let mut append = self.begin_append().await?;
         Self::lock_thread_append(&mut append.tx, thread_id).await?;
-        // Message identities are workspace-wide, including concurrent requests
+        // INVARIANT: Message identities are workspace-wide, including concurrent requests
         // naming different threads.
         sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
             .bind(0x6f72_6469_i32)
@@ -294,7 +291,6 @@ mod tests {
         let actor = MessageOrigin::Device {
             device_id: "synthetic-owner".into(),
         };
-        // Urgent answers must not wait for the turn that is asking this question.
         let _blocked = bus.input_order.join(thread);
         let stale = bus
             .emit_question_answer(
@@ -415,7 +411,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rebuilt, (String::new(), epoch + 1, json!([])));
-        // A plain pick stays urgent even with a stale compose fence.
         bus.emit_question_answer(
             thread,
             ThreadEvent::UserQuestionAnswered {
@@ -517,7 +512,6 @@ mod tests {
         assert_eq!(messages, 0, "acceptance must not pre-emit a message");
         sqlx::query("UPDATE thread_summaries SET compose_text='newer draft',compose_epoch=compose_epoch+1 WHERE thread_id=$1")
             .bind(thread).execute(&pool).await.unwrap();
-        // A later input has overtaken the replay's sequence.
         let next = order
             .admit(
                 &pool,
@@ -619,7 +613,6 @@ mod tests {
             .unwrap()
             .receipt;
         let (fresh_bus, _) = EventBus::new(pool.clone());
-        // No prepared payload or current model registry is needed to retry.
         assert_eq!(
             fresh_bus
                 .ordinary_submission_receipt(&intent, &actor)

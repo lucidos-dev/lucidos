@@ -58,10 +58,10 @@ The timestamp column is `created`, not `created_at`. `aggregate_id` is `text`, s
 
 **Persisted means subscribable** (`docs/adr/0113-persisted-system-events-are-subscribable.md`). A persisted `SystemEvent` is a valid `await_event` name and a valid trigger `on:` entry. A transient frame is refused at registration, because it writes no row for either matcher to see. One predicate decides it for both fan-outs: `core::event_subscription::is_subscribable_system_event`, keyed on `SystemEvent::is_persisted()`. So a new variant needs no separate list, only the persistence decision it already makes.
 
-The catalog is `SystemEvent`, and each variant's doc comment states its payload and emit site. Behaviour that the comments do not carry is in `docs/system-events.md`. The rules below bind every event:
+The catalog is `SystemEvent`; its fields define each wire payload. `docs/system-events.md` records event behavior, projection effects, emit order and contracts. Use an `INVARIANT:` comment at a call site for any local invariant a type or test does not enforce; the strip keeps it. The rules below bind every event:
 
 - **Events are immutable and named in the past tense.** The wire shape is `SystemEvent` with `#[serde(tag = "type", content = "data")]`. Rename a variant only with a serde alias, because old rows keep their names, or with a migration that rewrites those rows (ADR 0655).
-- **A new variant costs five match arms and a doc comment.** It states its aggregate, `aggregate_id`, payload, and whether it is persisted. Record its projection effect in `docs/system-events.md` when the comment cannot hold it.
+- **A new variant costs five match arms and an entry in `docs/system-events.md`.** Record its aggregate, `aggregate_id`, persistence and projection behavior there; the Rust fields define the payload shape. Use an `INVARIANT:` comment at a call site for any local invariant a type or test does not enforce.
 - **Audit events carry `actor`**, and the actor merges into the payload through `merge_actor`. An engine-driven event (ingress, supervisor, flaky detection) carries none.
 - **`Credential*`, reveal and token events never carry a secret**, only the service name and type. An event that states a set carries the result in full, never a delta.
 - **`ChangeApplied` is emitted at most once per `change_id`.** The unique index `events_change_applied_once` and the `ApplyClaim` enforce it (ADR 0442).

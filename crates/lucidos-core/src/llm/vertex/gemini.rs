@@ -1,7 +1,3 @@
-//! Gemini/Vertex request-build + response-mapping for `VertexProvider`,
-//! plus the Google-Search grounding helper. The `VertexProvider` struct and
-//! shared auth/config live in the parent `vertex` module.
-
 use super::VertexProvider;
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolCall, ToolDefinition,
@@ -12,17 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 impl VertexProvider {
-    /// Search the web using Gemini's Google Search grounding.
-    /// Returns a formatted string with the grounded answer and numbered source list.
-    ///
-    /// Always issued against the GLOBAL endpoint via
-    /// [`VertexProvider::global_gemini_endpoint`], never the configured region —
-    /// grounding is a global-endpoint feature, and the configured region is the
-    /// *chat* region, which may serve no Gemini models at all (see that method's
-    /// docs). Routing this call through `endpoint_for_model` instead is the
-    /// 2026-07-03 regression: `vertex_region = eu` (needed for Claude Opus 5)
-    /// sent it to a multi-region with no Google publisher models and every
-    /// search 404'd. Pinned by `grounding_endpoint_is_global_for_every_region`.
     pub async fn search_with_grounding(
         &self,
         query: &str,
@@ -34,8 +19,6 @@ impl VertexProvider {
         let model = super::GROUNDING_MODEL;
         let request = serde_json::json!({
             "system_instruction": {
-                // Shared with the other web-search backends so all three ask for
-                // the same behavior — see `llm::web_search`.
                 "parts": [{"text": crate::llm::web_search::SEARCH_SYSTEM_PROMPT}]
             },
             "contents": [{
@@ -97,8 +80,6 @@ impl VertexProvider {
 
         let access_token = self.get_access_token().await?;
 
-        // The failure branch reads the region back out of this binding, so the
-        // message names the region the request used.
         let url = self.endpoint_for_model(model);
 
         let (status, body) = self
@@ -135,7 +116,7 @@ impl VertexProvider {
             }
         };
 
-        // Gemini uses non-streaming requests, so emit the full final text at
+        // INVARIANT: Gemini uses non-streaming requests, so emit the full final text at
         // once. `build_gemini_llm_response` suppresses text attached to
         // function-call turns because Gemini Flash has returned internal
         // reasoning in ordinary text parts there; only text-only final answers
@@ -148,7 +129,7 @@ impl VertexProvider {
     }
 }
 
-/// Render a Gemini grounding response into the shared search-result shape.
+/// INVARIANT: Render a Gemini grounding response into the shared search-result shape.
 ///
 /// A 200 with no candidate is an ERROR, not an empty web. So is a candidate
 /// that stopped for a reason other than `STOP` with nothing to show. The
@@ -167,7 +148,6 @@ fn grounded_search_result(
         return Err(format!("Gemini search returned no answer ({reason})").into());
     };
 
-    // The grounded text answer.
     let answer = candidate["content"]["parts"]
         .as_array()
         .and_then(|parts| {
@@ -177,7 +157,6 @@ fn grounded_search_result(
         })
         .unwrap_or_default();
 
-    // Grounding chunks: the sources, with URL and title.
     let chunks = candidate["groundingMetadata"]["groundingChunks"]
         .as_array()
         .map(Vec::as_slice)
@@ -204,15 +183,11 @@ fn grounded_search_result(
         .into());
     }
 
-    // Shared with the Anthropic and OpenAI backends so all three render one
-    // shape; hand-rolling it here is what let this backend drift.
     Ok(crate::llm::web_search::format_search_result(
         &answer, &sources,
     ))
 }
 
-/// A Gemini reply body as the cross-provider `LlmResponse`, naming the model
-/// that served it.
 fn parse_gemini_reply(body: &str) -> Result<LlmResponse, serde_json::Error> {
     let reply: serde_json::Value = serde_json::from_str(body)?;
     let served_model = crate::llm::served_model::served_model_of(&reply);
@@ -222,20 +197,12 @@ fn parse_gemini_reply(body: &str) -> Result<LlmResponse, serde_json::Error> {
     })
 }
 
-/// Translate a parsed `VertexResponse` (Gemini non-streaming reply) into
-/// the cross-provider `LlmResponse`. Pulled out of the axum-adjacent
-/// handler so empty-completion behaviour can be unit-tested — the previous
-/// inline mapping discarded `finishReason` + `usageMetadata`, which made
-/// "model returned nothing" indistinguishable from a safety block or a
-/// `MAX_TOKENS` cutoff. We now preserve both verbatim.
 fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut thinking_chars: usize = 0;
     let mut thought_parts: usize = 0;
-    // Thinking billed with no thought part returned, which is how Gemini 2.5
-    // answers when thoughts are not requested.
     let billed_thinking = parsed
         .usage_metadata
         .as_ref()
@@ -246,7 +213,6 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         if let Some(candidate) = candidates.into_iter().next() {
             stop_reason = candidate.finish_reason;
             for part in candidate.content.parts {
-                // Skip thinking parts — internal reasoning, not shown to user
                 if part.thought {
                     thought_parts += 1;
                     if let Some(text) = part.text {
@@ -268,10 +234,6 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
             }
         }
     }
-    // One join, two mutually exclusive destinations, so neither can be set
-    // without the other being ruled out. Text beside a `functionCall` is Gemini
-    // narrating its plan rather than answering: it is billed as thinking and
-    // kept off the screen, and it rides back to the model as `model_only_text`.
     let mut content = None;
     let mut narration = None;
     if !text_parts.is_empty() {
@@ -279,12 +241,8 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         if tool_calls.is_empty() {
             content = Some(joined);
         } else {
-            // Summed per part, not over the joined string, so the separators
-            // the join adds never inflate the figure the cost modal shows.
             thinking_chars =
                 thinking_chars.saturating_add(text_parts.iter().map(|s| s.len()).sum::<usize>());
-            // An all-empty narration would put an empty text part on the next
-            // request's assistant turn. Send nothing rather than that.
             narration = (!joined.is_empty()).then_some(joined);
         }
     }
@@ -299,7 +257,6 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
             crate::llm::api_usage::ApiUsage {
                 input_tokens: clamp(input),
                 output_tokens: clamp(output),
-                // GenerateContent reports cache reads in its usage metadata.
                 cache_read_tokens: clamp(cache_read),
                 ..Default::default()
             }
@@ -312,24 +269,18 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         stop_reason,
         usage,
         stable_prefix_fingerprint: None,
-        // The reply's own field, which `parse_gemini_reply` reads.
         served_model: None,
         provider: None,
         thinking_chars: (thinking_chars > 0).then_some(thinking_chars),
-        // Proof the model thought, which keeps a billed but textless thinking
+        // INVARIANT: Proof the model thought, which keeps a billed but textless thinking
         // turn out of the dropped-output branch of `classify_empty_completion`.
         thinking_blocks: (thought_parts > 0 || billed_thinking).then_some(thought_parts.max(1)),
         unknown_sse_dropped: 0,
-        // Mutually exclusive with `content` by construction above: `narration`
-        // is `Some` only on a tool-call turn, which is exactly when `content`
-        // is `None`.
         model_only_text: narration,
         progress_notes: Vec::new(),
         prefill: None,
     }
 }
-
-// ===== Gemini/Vertex request/response types =====
 
 #[derive(Serialize)]
 struct VertexRequest {
@@ -343,8 +294,6 @@ struct VertexRequest {
     tool_config: Option<VertexToolConfig>,
 }
 
-/// Set only for a forced call: `ANY` mode with the one tool allowed, which
-/// makes the model call it.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VertexToolConfig {
@@ -391,11 +340,6 @@ struct VertexPart {
     function_call: Option<VertexFunctionCallPart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     function_response: Option<VertexFunctionResponsePart>,
-    /// Gemini 3 attaches an opaque `thoughtSignature` to the first
-    /// `functionCall` part of every turn and rejects the next request with
-    /// HTTP 400 INVALID_ARGUMENT unless the same signature is echoed back on
-    /// the same `functionCall` part. Sits at the part level (peer of
-    /// `functionCall`), not inside it.
     #[serde(skip_serializing_if = "Option::is_none")]
     thought_signature: Option<String>,
 }
@@ -419,7 +363,7 @@ struct VertexFunctionResponsePart {
     response: serde_json::Value,
 }
 
-/// Convert engine `Message`s to Gemini `VertexContent`s.
+/// INVARIANT: Convert engine `Message`s to Gemini `VertexContent`s.
 ///
 /// Walks the list left-to-right while building a `tool_use_id → name` map from
 /// `ContentBlock::ToolUse` blocks so that later `ContentBlock::ToolResult`
@@ -476,8 +420,6 @@ fn message_content_to_parts(
         MessageContent::Blocks(blocks) => blocks
             .into_iter()
             .map(|block| match block {
-                // A tail block is an ordinary text part here. Only the engine
-                // and Anthropic's cache anchor care who wrote it.
                 ContentBlock::Text { text }
                             | ContentBlock::EngineTail { text }
                             | ContentBlock::MemoryView { text }
@@ -558,19 +500,12 @@ struct VertexTool {
 struct VertexFunction {
     name: String,
     description: String,
-    /// Full JSON Schema, never the older `parameters` field. That one takes an
-    /// OpenAPI subset. One untyped node or `$schema` key fails the request, and
-    /// built-in and MCP tool schemas carry both.
     parameters_json_schema: serde_json::Value,
 }
 
 #[derive(Deserialize)]
 struct VertexResponse {
     candidates: Option<Vec<VertexCandidate>>,
-    /// Top-level token-usage block. Present on every non-error Gemini
-    /// response — we map `promptTokenCount` → `input_tokens` and
-    /// `candidatesTokenCount` plus `thoughtsTokenCount` → `output_tokens`,
-    /// so cost analytics has the same shape as Anthropic/OpenAI responses.
     #[serde(rename = "usageMetadata", default)]
     usage_metadata: Option<VertexUsageMetadata>,
 }
@@ -579,10 +514,6 @@ struct VertexResponse {
 struct VertexCandidate {
     #[serde(default)]
     content: VertexResponseContent,
-    /// `"STOP"` for a normal completion; `"MAX_TOKENS"`, `"SAFETY"`,
-    /// `"RECITATION"`, `"OTHER"`, `"BLOCKLIST"`, ... for early termination.
-    /// Preserved verbatim so empty-completion debugging can distinguish
-    /// "model said nothing" from a content-policy block.
     #[serde(rename = "finishReason", default)]
     finish_reason: Option<String>,
 }
@@ -597,19 +528,15 @@ struct VertexResponseContent {
 struct VertexUsageMetadata {
     #[serde(rename = "promptTokenCount", default)]
     prompt_token_count: Option<u64>,
-    /// The part of the prompt served from a cache. `promptTokenCount` counts it.
     #[serde(rename = "cachedContentTokenCount", default)]
     cached_content_token_count: Option<u64>,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: Option<u64>,
-    /// Billed at the output rate but reported apart from the candidates, so
-    /// the output total adds it back.
     #[serde(rename = "thoughtsTokenCount", default)]
     thoughts_token_count: Option<u64>,
 }
 
 impl VertexUsageMetadata {
-    /// Every billed output token: the answer plus the thinking behind it.
     fn output_token_count(&self) -> Option<u64> {
         match (self.candidates_token_count, self.thoughts_token_count) {
             (None, None) => None,
@@ -625,12 +552,11 @@ impl VertexUsageMetadata {
 #[derive(Deserialize)]
 struct VertexResponsePart {
     text: Option<String>,
-    /// When true, this part contains internal reasoning (Gemini thinking mode).
     #[serde(default)]
     thought: bool,
     #[serde(rename = "functionCall")]
     function_call: Option<VertexFunctionCall>,
-    /// Opaque encrypted reasoning signature Gemini 3 attaches to the first
+    /// INVARIANT: Opaque encrypted reasoning signature Gemini 3 attaches to the first
     /// `functionCall` part of every turn. Must be echoed back on the next
     /// request or the API rejects with HTTP 400 INVALID_ARGUMENT
     /// "Function call is missing a thought_signature".
@@ -650,8 +576,6 @@ mod tests {
     use crate::llm::provider::{ContentBlock, Message, MessageContent};
     use crate::llm::vertex_defaults::{gemini_thinking_level, sdk_request_defaults};
 
-    /// An untyped node or a `$schema` key reaches Gemini verbatim, under the
-    /// field that accepts full JSON Schema. The wire names are the contract.
     #[test]
     fn a_tool_schema_goes_out_verbatim_as_json_schema() {
         let schema = serde_json::json!({
@@ -674,8 +598,6 @@ mod tests {
         assert!(vertex_tools(Vec::new()).is_none());
     }
 
-    /// Gemini forces a call with `ANY` mode and the one function allowed. An
-    /// ordinary request sends no tool config.
     #[test]
     fn a_forced_call_allows_only_its_function() {
         let request = |tool_config| VertexRequest {
@@ -723,10 +645,8 @@ mod tests {
         ]);
         let parts = message_content_to_parts(content, &mut HashMap::new()).unwrap();
         assert_eq!(parts.len(), 2);
-        // First part is text
         assert_eq!(parts[0].text.as_deref(), Some("describe this"));
         assert!(parts[0].inline_data.is_none());
-        // Second part is image
         assert!(parts[1].text.is_none());
         let inline = parts[1].inline_data.as_ref().unwrap();
         assert_eq!(inline.mime_type, "image/jpeg");
@@ -749,11 +669,9 @@ mod tests {
         let json = serde_json::to_value(&parts).unwrap();
         let arr = json.as_array().unwrap();
 
-        // Text part: only "text" field, no "inlineData"
         assert_eq!(arr[0]["text"], "look at this");
         assert!(arr[0].get("inlineData").is_none());
 
-        // Image part: only "inlineData" field, no "text"
         assert!(arr[1].get("text").is_none());
         assert_eq!(arr[1]["inlineData"]["mimeType"], "image/png");
         assert_eq!(arr[1]["inlineData"]["data"], "AAAA");
@@ -761,11 +679,6 @@ mod tests {
 
     #[test]
     fn tool_use_only_assistant_message_emits_function_call_part() {
-        // Repro: an assistant message whose only block is a `ToolUse` used to
-        // produce `parts: []` for that content, which Gemini rejects with
-        // INVALID_ARGUMENT "Unable to submit request because it must include
-        // at least one parts field". The conversation below is the exact
-        // shape the agentic loop builds after the very first tool call.
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -829,10 +742,6 @@ mod tests {
         );
     }
 
-    /// Gemini 4 refuses a user turn that mixes `functionResponse` parts with
-    /// text or images, as "Requests ending with a model turn are not
-    /// supported". Every turn after a tool round has that mix: the results,
-    /// then the loop's instruction, then the context panel.
     #[test]
     fn function_responses_travel_in_a_turn_of_their_own() {
         let image = ContentBlock::Image {
@@ -940,12 +849,6 @@ mod tests {
 
     #[test]
     fn function_call_part_round_trips_thought_signature_to_wire() {
-        // Gemini 3 attaches `thoughtSignature` to the first `functionCall`
-        // part of every turn and hard-rejects the next request with HTTP 400
-        // INVALID_ARGUMENT "Function call is missing a thought_signature"
-        // unless the same signature is echoed back. The ContentBlock::ToolUse
-        // we built from the prior turn's response must carry the signature
-        // through to the VertexPart on the next request.
         let messages = vec![Message {
             role: "assistant".to_string(),
             content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
@@ -968,9 +871,6 @@ mod tests {
 
     #[test]
     fn function_call_part_omits_thought_signature_when_none() {
-        // Older models (Gemini 2.5, Claude through this provider) don't emit
-        // a signature. Emitting `"thoughtSignature": null` would be wasteful;
-        // omit the field entirely.
         let messages = vec![Message {
             role: "assistant".to_string(),
             content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
@@ -992,9 +892,6 @@ mod tests {
 
     #[test]
     fn vertex_response_part_reads_thought_signature_from_wire() {
-        // Wire shape from Gemini 3's generateContent response. The signature
-        // sits on the same part as the functionCall and must be captured into
-        // ToolCall so the next request can echo it back.
         let body = r#"{
             "candidates": [{
                 "content": {
@@ -1083,9 +980,6 @@ mod tests {
         assert_eq!(resp.thinking_chars, Some(thinking.len()));
     }
 
-    /// A final turn is the printable case: the text IS the answer, so it rides
-    /// in `content` and nothing is model-only. Guards the pair invariant from
-    /// the other side, since setting both fields would send the text twice.
     #[test]
     fn build_gemini_llm_response_keeps_a_final_answer_printable() {
         let answer = "Here is the review. The rename handler closes over a stale id.";
@@ -1106,9 +1000,6 @@ mod tests {
         assert_eq!(resp.history_text(), Some(answer));
     }
 
-    /// An empty text part beside a call must not become an empty text part on
-    /// the next request's assistant turn. Gemini never asked for one, and the
-    /// old code could not produce it because it dropped the text entirely.
     #[test]
     fn build_gemini_llm_response_drops_an_empty_narration() {
         let body = serde_json::json!({
@@ -1134,9 +1025,6 @@ mod tests {
         assert_eq!(resp.history_text(), None);
     }
 
-    /// The wire proof. Gemini attaches its signature to the first `functionCall`
-    /// part only, and Vertex rejects a turn that comes back without it. The
-    /// added text part must not displace it.
     #[test]
     fn a_gemini_tool_call_turn_goes_back_as_narration_then_calls() {
         let narration = "Reading both files before I judge anything.";
@@ -1158,7 +1046,6 @@ mod tests {
         let parsed: VertexResponse = serde_json::from_value(body).unwrap();
         let resp = build_gemini_llm_response(parsed);
 
-        // Assembled exactly as `agentic_loop::run` assembles the assistant turn.
         let mut blocks: Vec<ContentBlock> = Vec::new();
         if let Some(text) = resp.history_text() {
             blocks.push(ContentBlock::Text {
@@ -1224,8 +1111,6 @@ mod tests {
         assert_eq!(resp.thinking_chars, Some(thought.len()));
     }
 
-    /// Thinking is billed at the output rate, and Gemini reports it apart from
-    /// the candidates, so the output total adds it back.
     #[test]
     fn build_gemini_llm_response_counts_thought_tokens_as_output() {
         let body = serde_json::json!({
@@ -1247,9 +1132,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.output_tokens), Some(128));
     }
 
-    /// A turn that thought without returning a thought part still reports
-    /// that it thought. Its billed thinking tokens are output tokens, so the
-    /// empty-completion classifier would otherwise call them dropped output.
     #[test]
     fn build_gemini_llm_response_reports_thinking_billed_without_thought_parts() {
         let body = serde_json::json!({
@@ -1271,14 +1153,6 @@ mod tests {
         assert_eq!(resp.thinking_chars, None);
     }
 
-    /// Gemini's empty-completion case is the regression target — a
-    /// candidate with no parts (or only thought parts), `finishReason`
-    /// `"SAFETY"`/`"MAX_TOKENS"`/etc., and a populated `usageMetadata`.
-    /// The previous mapping discarded both fields and we couldn't
-    /// distinguish "model said nothing" from a content-policy block or a
-    /// token-budget cutoff. The pure helper must preserve both.
-    /// `promptTokenCount` already counts the cached part, so input stays whole
-    /// and the cached part rides as a cache read, priced at Gemini's read rate.
     #[test]
     fn a_gemini_cache_hit_is_recorded_as_a_cache_read() {
         let body = r#"{
@@ -1325,10 +1199,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
-    /// Normal `STOP` completion path — both finishReason and usage flow
-    /// through the same helper so cross-provider analytics has parity with
-    /// the Claude-via-Vertex path that captures these via `message_start`
-    /// + `message_delta`.
     #[test]
     fn build_gemini_llm_response_captures_stop_and_usage_on_success() {
         let body = r#"{
@@ -1351,9 +1221,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.output_tokens), Some(7));
     }
 
-    /// MAX_TOKENS truncation: model spent the whole budget without ending
-    /// naturally. Output text may or may not be present; finishReason MUST
-    /// surface so the empty-completion diagnostic can flag truncation.
     #[test]
     fn build_gemini_llm_response_surfaces_max_tokens_truncation() {
         let body = r#"{
@@ -1376,9 +1243,7 @@ mod tests {
 
     #[test]
     fn gemini_thinking_level_clamps_to_model_supported_levels() {
-        // Flash supports the full set: minimal/low/medium/high.
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "none"), "minimal");
-        // The command judge's default runs at `none` (ADR 0406).
         assert_eq!(
             gemini_thinking_level("gemini-3-flash-preview", "none"),
             "minimal"
@@ -1391,13 +1256,11 @@ mod tests {
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "high"), "high");
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "xhigh"), "high");
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "max"), "high");
-        // 3.8 Flash has no minimal: Vertex answers it with a 400.
         assert_eq!(gemini_thinking_level("gemini-3.8-flash", "none"), "low");
         assert_eq!(
             gemini_thinking_level("gemini-3.8-flash", "medium"),
             "medium"
         );
-        // Pro accepts only low/high: minimal floors to low, medium rounds to high.
         assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "none"), "low");
         assert_eq!(
             gemini_thinking_level("gemini-3-pro-preview", "medium"),
@@ -1407,13 +1270,9 @@ mod tests {
             gemini_thinking_level("gemini-3-pro-preview", "high"),
             "high"
         );
-        // Unknown falls back to "high" — the model default.
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "bogus"), "high");
     }
 
-    /// A safety block is a 200 with no candidate. Reporting it as "no results"
-    /// returns `Ok`, and the chain stops there: Vertex leads the chain, so
-    /// Anthropic and OpenAI would never be asked.
     #[test]
     fn a_blocked_grounding_response_is_an_error_not_an_empty_search() {
         let body = serde_json::json!({
@@ -1425,9 +1284,6 @@ mod tests {
         assert!(err.contains("SAFETY"), "{err}");
     }
 
-    /// The same for a candidate that stopped early with nothing to show. The
-    /// answer and the sources are both empty, so there is no partial result to
-    /// keep and no reason to end the chain.
     #[test]
     fn a_non_stop_finish_reason_with_no_result_is_an_error() {
         for reason in ["SAFETY", "RECITATION", "BLOCKLIST", "MAX_TOKENS"] {
@@ -1445,8 +1301,6 @@ mod tests {
         }
     }
 
-    /// A genuinely empty search still succeeds, so the chain stops instead of
-    /// re-billing the same query on every remaining backend.
     #[test]
     fn an_empty_but_finished_grounding_response_stays_ok() {
         let body = serde_json::json!({
@@ -1458,8 +1312,6 @@ mod tests {
         );
     }
 
-    /// Partial output is kept: a stopped candidate that still carried sources
-    /// is worth returning, exactly as the Anthropic and OpenAI guards do it.
     #[test]
     fn a_grounded_answer_renders_with_its_sources() {
         let body = serde_json::json!({
@@ -1521,16 +1373,12 @@ mod tests {
 
     #[test]
     fn gemini_generation_config_none_for_non_gemini_3() {
-        // Claude-via-Vertex and Gemini 2.5 must not get a thinkingConfig here.
         assert!(gemini_generation_config("claude-opus-4-8", Some("high")).is_none());
         assert!(gemini_generation_config("gemini-2.5-flash", Some("high")).is_none());
     }
 
     #[test]
     fn gemini_generation_config_uses_thinking_level_never_budget() {
-        // Gemini 3.x must always use thinkingLevel + includeThoughts and NEVER
-        // the deprecated thinkingBudget — sending a budget to a 3.x model can 400
-        // and degrades quality, including for the `none`/Off case.
         for effort in ["none", "low", "medium", "high", "max"] {
             let cfg = gemini_generation_config("gemini-3.5-flash", Some(effort)).unwrap();
             let json = serde_json::to_value(&cfg).unwrap();
@@ -1544,8 +1392,6 @@ mod tests {
         }
     }
 
-    /// No effort leaves the level to the model, and still routes its thoughts
-    /// out of the visible answer.
     #[test]
     fn gemini_generation_config_sends_no_level_when_effort_absent() {
         let cfg = gemini_generation_config("gemini-3.5-flash", None).unwrap();

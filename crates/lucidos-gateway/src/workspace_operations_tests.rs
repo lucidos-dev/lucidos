@@ -167,7 +167,11 @@ fn grant_return(a: &GatewayState, b: &GatewayState, pairing: &RemoteGateway, a_u
 fn pair(a: &GatewayState, b: &GatewayState, address: &str, name: &str) -> RemoteGateway {
     let secret = b
         .paired_gateways()
-        .mint_secret(Some("local".into()), false, Minter::PairedDevice)
+        .mint_secret(
+            Some("local".into()),
+            Default::default(),
+            Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
@@ -197,7 +201,6 @@ fn pair(a: &GatewayState, b: &GatewayState, address: &str, name: &str) -> Remote
 }
 
 type Seen = Arc<Mutex<Vec<SignedOperation>>>;
-/// The verified remote start header of each operation the target received.
 type Starts = Arc<Mutex<Vec<Option<RemoteStart>>>>;
 
 fn target(state: &GatewayState) -> (Seen, tempfile::TempDir) {
@@ -209,8 +212,6 @@ fn target_with_starts(state: &GatewayState) -> (Seen, Starts, tempfile::TempDir)
     engine_serving(state, &[RECEIVE_ROUTE, RECEIVE_START_ROUTE])
 }
 
-/// A target engine that serves only `routes`. An engine that predates the
-/// remote start setting serves only [`RECEIVE_ROUTE`].
 fn engine_serving(
     state: &GatewayState,
     routes: &[&'static str],
@@ -293,7 +294,6 @@ async fn a_peer_spawn_obeys_the_receiving_pairing_setting_and_reads_never_do() {
         label: "local".into(),
     });
 
-    // A new pairing starts at Deny: the spawn never reaches the engine.
     let denied = call(&a, &signed_spawn(&a_key, "target@c"), true).await;
     assert!(denied.status().is_client_error(), "{}", denied.status());
     let denied = body_text(denied).await;
@@ -303,7 +303,6 @@ async fn a_peer_spawn_obeys_the_receiving_pairing_setting_and_reads_never_do() {
     );
     assert!(seen.lock().unwrap().is_empty());
 
-    // A read through the same Deny pairing still works, and carries no start.
     assert_ok(call(&a, &signed(&a_key, None, Some("target@c")), true).await).await;
     assert_eq!(*starts.lock().unwrap(), vec![None]);
 
@@ -322,7 +321,6 @@ async fn a_peer_spawn_obeys_the_receiving_pairing_setting_and_reads_never_do() {
         );
     }
 
-    // C's own workspaces start threads with no question and no pairing.
     let c_key = source(&c);
     assert_ok(call(&c, &signed_spawn(&c_key, "target"), true).await).await;
     assert_eq!(
@@ -338,7 +336,6 @@ async fn a_start_to_an_engine_that_cannot_enforce_the_setting_is_refused() {
     let c_url = listen(&c).await;
     let ac = pair(&a, &c, &c_url, "c");
     let a_key = source(&a);
-    // An engine built before the remote start setting serves only the read route.
     let (seen, _, _target_dir) = engine_serving(&c, &[RECEIVE_ROUTE]);
     let assert_refused = |body: &str| {
         assert!(body.contains("cannot enforce"), "{body}");
@@ -354,7 +351,6 @@ async fn a_start_to_an_engine_that_cannot_enforce_the_setting_is_refused() {
         assert!(refused.status().is_client_error(), "{}", refused.status());
         assert_refused(&body_text(refused).await);
     }
-    // C's own workspaces get the same refusal.
     let refused = call(&c, &signed_spawn(&source(&c), "target"), true).await;
     assert!(refused.status().is_client_error(), "{}", refused.status());
     assert_refused(&body_text(refused).await);
@@ -363,7 +359,6 @@ async fn a_start_to_an_engine_that_cannot_enforce_the_setting_is_refused() {
         "the old engine saw no start"
     );
 
-    // Reads still reach the old engine.
     assert_ok(call(&a, &signed(&a_key, None, Some("target@c")), true).await).await;
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
@@ -383,7 +378,6 @@ async fn a_refused_route_names_the_step_the_user_takes() {
     let (b, _b_dir) = isolated();
     pair(&a, &b, "http://127.0.0.1:1", "b");
 
-    // Paired with access off, by label or by id, and not paired at all: one step covers each.
     for selector in ["local", a.gateway_id(), "elsewhere"] {
         let off = refusal(&b, Some(selector), "target").await;
         assert!(

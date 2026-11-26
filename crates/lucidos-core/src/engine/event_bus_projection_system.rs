@@ -1,11 +1,3 @@
-//! System projections: `EventBus::update_system_projection` materializes
-//! `NotificationCreated` rows into the `notifications` table, the
-//! `ThreadQueue*` events into the `thread_queue` table, and `RepositoryAdded`
-//! into the durable `repo_names` table (so removed repos keep a resolvable
-//! name), and `AppDeleted` into `app_kinds` (so a removed widget stays one).
-//! `McpServerStopped` and `McpServerRemoved` clear the server from every
-//! `thread_summaries.enabled_mcp_servers` (ADR 0430).
-
 use uuid::Uuid;
 
 use super::super::{EventBus, SystemEvent};
@@ -24,8 +16,6 @@ async fn project_queued(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     queued: QueuedProjection<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Upsert also serves boot requeue: the original immutable request stays,
-    // while admission time resets for the new queue wait.
     sqlx::query(
         "INSERT INTO thread_queue (id, kind, trigger_id, trigger_name, thread_id, summary, request, status, queued_at) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,'queued',NOW()) \
@@ -37,10 +27,6 @@ async fn project_queued(
 }
 
 impl EventBus {
-    /// Fill in the audience of a `NotificationCreated` that names none, from
-    /// the root thread of the thread it opens (ADR 0623). The event then carries
-    /// it, so a replay projects the same row. A lookup that fails leaves the
-    /// whole team: a notification must never silently reach nobody.
     pub(crate) async fn with_notification_audience(&self, event: SystemEvent) -> SystemEvent {
         let SystemEvent::NotificationCreated {
             id,
@@ -88,8 +74,6 @@ impl EventBus {
             push_group,
         }
     }
-
-    // ---- System projection ----
 
     pub(crate) async fn update_system_projection(
         &self,
@@ -140,7 +124,7 @@ impl EventBus {
                 compose,
                 ..
             } => {
-                // A projection rebuild applies the accepted report once, never
+                // INVARIANT: A projection rebuild applies the accepted report once, never
                 // over a newer compose epoch. Live acceptance consumed this
                 // slot already on the same transaction.
                 if let Some(report) = compose {
@@ -191,7 +175,7 @@ impl EventBus {
                     {
                         return Err("draft_retry_key_conflict".into());
                     }
-                    // Replaying this acceptance must not resurrect completed
+                    // INVARIANT: Replaying this acceptance must not resurrect completed
                     // work or consume a draft written after it.
                     return Ok(());
                 }
@@ -250,7 +234,7 @@ impl EventBus {
                 thread_id,
                 actor: _,
             } => {
-                // `admitted_at` keeps the FIRST admission's time. A trigger
+                // INVARIANT: `admitted_at` keeps the FIRST admission's time. A trigger
                 // fire re-emits this event once it creates its thread (see
                 // `ThreadQueue::record_entry_thread`). Restamping there would
                 // restart the age the panel shows for a running entry. A
@@ -276,7 +260,7 @@ impl EventBus {
                 Ok(())
             }
             SystemEvent::RepositoryAdded { repo_id, name, .. } => {
-                // Durable repo-name projection: retain the name so a later
+                // INVARIANT: Durable repo-name projection: retain the name so a later
                 // RepositoryRemoved (which deliberately does NOT touch this
                 // table) can't erase it — the filter / thread rows keep
                 // resolving the historical name instead of the raw UUID.
@@ -293,7 +277,6 @@ impl EventBus {
                 }
                 Ok(())
             }
-            // Stop and Remove switch the server off in every thread (ADR 0430).
             SystemEvent::McpServerStopped { server_id, .. }
             | SystemEvent::McpServerRemoved { server_id, .. } => {
                 sqlx::query(
@@ -311,7 +294,6 @@ impl EventBus {
                 kind: Some(kind),
                 ..
             } => {
-                // Stored in the spelling serde writes, and read back through serde.
                 let kind = serde_json::to_value(kind)?;
                 sqlx::query(
                     "INSERT INTO app_kinds (app_id, kind) VALUES ($1, $2) \

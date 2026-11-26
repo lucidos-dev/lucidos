@@ -17,91 +17,50 @@ use crate::triggers::{
 pub struct TriggerInfo {
     pub id: String,
     pub name: String,
-    /// Stable kebab-case slug. Directory segment for per-trigger know-how at
-    /// `data/triggers/{slug}/knowhow/`.
     pub slug: String,
     pub cron_expressions: Vec<String>,
     pub timezone: String,
     pub paused: bool,
     pub last_run: Option<String>,
-    /// Outcome of the most recent completed firing (`ok` / `failed`), surfaced
-    /// on the trigger row. Absent until the trigger has run at least once under
-    /// an engine that records status (legacy runs → timestamp only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_status: Option<TriggerRunStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run: Option<String>,
-    /// The next few upcoming fire times (RFC3339, UTC), merged across every cron
-    /// expression. `next_run` is its first entry; the panel shows the rest so a
-    /// wrong schedule is visible before it costs anything (a "monthly" trigger
-    /// listing three dates a year apart gives itself away).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub next_runs: Vec<String>,
-    /// Set when the trigger's cron schedule can never fire, e.g. `0 0 9 31 2 *`.
-    /// Renders as an error on the row instead of the "No more runs" chip a spent
-    /// one-shot gets. Only reachable for triggers stored before the create /
-    /// update guard existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_error: Option<String>,
     pub run: serde_json::Value,
-    /// Event subscriptions. Empty for schedule-only triggers; each entry pairs
-    /// an event type with an optional per-entry payload filter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on: Vec<EventSubscription>,
-    /// Owning app directory name (e.g. `"trigger-workflow"`), used to deep-link
-    /// notifications back to the right app. None for standalone triggers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
-    /// When true, threads spawned by this trigger surface in REVIEW on
-    /// completion instead of going straight to ARCHIVE.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub go_to_review: bool,
-    /// Owning *trigger group* id (UUID string) used by the panel to sort the
-    /// trigger under the right section. None places the trigger under the
-    /// "Ungrouped" section.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
-    /// Historical category grants. They confer no authority.
+    /// INVARIANT: Historical category grants. They confer no authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
     pub program_grants: Vec<TriggerProgramGrantInfo>,
-    /// Folders outside the workspace this trigger's subprocesses may write.
     pub folder_grants: Vec<TriggerFolderGrantInfo>,
-    /// Program patterns the owner chose Always deny for, on this trigger.
-    /// `revoke_program_denies` takes one back.
     pub program_denies: Vec<String>,
-    /// Folders the owner chose Always deny for, on this trigger.
-    /// `revoke_folder_denies` takes one back.
     pub folder_denies: Vec<String>,
     pub coding_agent_grant: bool,
-    /// The context ceiling copied onto each fired thread (ADR 0629). Absent =
-    /// the workspace preference `coding_agent_context_ceiling`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_ceiling: Option<ContextCeiling>,
-    /// The MCP server ids this trigger's fires use (ADR 0430). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<String>,
-    /// Plugin provenance (ADR 0019) — the id of the *plugin* that auto-registered
-    /// this trigger, or absent for a user-created one. Drives the Triggers
-    /// panel's "from \<plugin\>" chip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
-    /// The **trigger model** this trigger's intent fires on. Absent = the
-    /// account `trigger_model` preference (the "Default" option in the form).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Reasoning effort for this trigger's intent fires. Absent = the account's
-    /// tier for the model it runs on, else that model's default effort.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// The backend the pinned model runs on. Absent = the model's own
-    /// preferred provider, then its first configured route.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// The continue key spec (ADR 0623). Absent = every fire starts a thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continue_key: Option<ContinueKeySpec>,
-    /// The actor field (ADR 0623). Absent = fires credit nobody.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<ActorField>,
 }
@@ -114,7 +73,6 @@ pub struct TriggerProgramGrantInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TriggerFolderGrantInfo {
-    /// The path `revoke_folder_grants` takes back.
     pub folder: String,
 }
 
@@ -128,8 +86,6 @@ impl TriggerInfo {
             );
             serde_json::Value::Null
         });
-        // One pass over the schedule feeds both fields: `next_run` is just the
-        // head of the preview, so the two can never disagree.
         let next_runs = config.next_runs(crate::scheduler::cron_rules::CRON_PREVIEW_COUNT);
         Self {
             id: config.id.clone(),
@@ -192,11 +148,7 @@ pub struct TriggersListResponse {
 #[derive(Serialize)]
 pub struct HistoricalTriggerInfo {
     pub id: String,
-    /// Snapshot from the most recent thread spawned by this trigger. None when
-    /// no `TriggerStarted` event ever carried a name (legacy data).
     pub name: Option<String>,
-    /// `last_activity` of the most recent thread spawned by this trigger
-    /// (RFC3339, UTC). Frontend uses it to disambiguate same-named entries.
     pub last_activity: String,
 }
 
@@ -211,67 +163,37 @@ pub struct CreateTriggerCronRequest {
     pub requested_grants: RequestedTriggerGrants,
     pub name: String,
     pub run: serde_json::Value,
-    /// Stable kebab-case slug for the trigger. Directory segment for
-    /// per-trigger know-how at `data/triggers/{slug}/knowhow/`. Optional —
-    /// derived from `name` (with UUID fallback) when omitted.
     #[serde(default)]
     pub slug: Option<String>,
     #[serde(default)]
     pub cron_expressions: Vec<String>,
-    /// Event subscriptions. Empty for schedule-only triggers; each entry pairs
-    /// an event type with an optional per-entry payload filter (no `condition`
-    /// = fire on every matching event).
     #[serde(default)]
     pub on: Vec<EventSubscription>,
     #[serde(default)]
     pub app_id: Option<String>,
-    /// When true, threads spawned by this trigger surface in REVIEW on
-    /// completion instead of going straight to ARCHIVE. Default false.
     #[serde(default)]
     pub go_to_review: bool,
-    /// Optional *trigger group* id. Pure organizational label — the trigger
-    /// fires identically regardless of group. The handler validates the id
-    /// against the in-memory group registry and rejects unknown values.
     #[serde(default)]
     pub group_id: Option<String>,
-    /// Retired input. A non-empty list is refused.
     #[serde(default)]
     pub side_effect_grant: Vec<SideEffectCategory>,
-    /// The **coding-agent grant**. Default false. Only a person may set it:
-    /// see [`refuse_unowned_grant`].
     #[serde(default)]
     pub coding_agent_grant: bool,
-    /// The context ceiling copied onto each fired thread, read by
+    /// INVARIANT: The context ceiling copied onto each fired thread, read by
     /// `ContextCeiling::parse`. Omitted or null = the workspace preference. An
     /// agent may not set one above the workspace's.
     #[serde(default)]
     pub context_ceiling: Option<String>,
-    /// The MCP server ids this trigger's fires use (ADR 0430). Only these
-    /// servers' tools run silently in its threads. An id no server has yet is
-    /// accepted, and each fire reports it.
     #[serde(default)]
     pub mcp_servers: Vec<String>,
-    /// The **trigger model** this trigger's intent fires on. Omitted, null, or
-    /// blank = the account `trigger_model` preference. Not checked against the model registry:
-    /// see [`normalize_route_setting`].
     #[serde(default)]
     pub model: Option<String>,
-    /// Reasoning effort for this trigger's intent fires. Omitted, null, or blank
-    /// = the account's tier for the model, else its default effort. Must be
-    /// one of `none|low|medium|high|xhigh|max`; anything else is a 400.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    /// The backend the pinned model runs on, when it has more than one route.
-    /// Omitted, null, or blank = the model's own preferred provider. Requires a
-    /// model pin and must name one of that model's routes.
     #[serde(default)]
     pub provider: Option<String>,
-    /// The continue key spec (ADR 0623), checked by [`ContinueKeySpec::parse`].
-    /// Omitted, null or `[]` = every fire starts a new thread.
     #[serde(default)]
     pub continue_key: Option<serde_json::Value>,
-    /// The actor field (ADR 0623), checked by [`ActorField::parse`]. Omitted,
-    /// null or blank = fires credit nobody.
     #[serde(default)]
     pub actor: Option<serde_json::Value>,
 }
@@ -288,30 +210,18 @@ pub struct UpdateTriggerCronRequest {
     pub cron_expressions: Option<Vec<String>>,
     #[serde(default)]
     pub paused: Option<bool>,
-    /// Full replacement for the event subscription list. None = field absent
-    /// (don't change), Some(empty) = clear all subscriptions, Some(non-empty)
-    /// = replace with the new set. Partial edits aren't supported — send the
-    /// whole list.
     #[serde(default)]
     pub on: Option<Vec<EventSubscription>>,
-    /// None = field absent (don't change), Some(None) = explicitly null (clear), Some(Some(v)) = set.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub app_id: Option<Option<String>>,
     #[serde(default)]
     pub go_to_review: Option<bool>,
-    /// Optional slug edit (e.g. trigger renamed). Validated against
-    /// [`is_valid_trigger_slug`] — invalid values reject the request with 400.
     #[serde(default)]
     pub slug: Option<String>,
-    /// None = field absent (don't change), Some(None) = explicitly null (clear),
-    /// Some(Some(v)) = set. The handler validates `v` against the in-memory
-    /// trigger-group registry.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub group_id: Option<Option<String>>,
-    /// Send an empty array to clear the historical categories.
     #[serde(default)]
     pub side_effect_grant: Option<Vec<SideEffectCategory>>,
-    /// Revoke these program scopes.
     #[serde(default)]
     pub revoke_program_grants: Vec<String>,
     #[serde(default)]
@@ -320,51 +230,30 @@ pub struct UpdateTriggerCronRequest {
     pub revoke_program_denies: Vec<String>,
     #[serde(default)]
     pub revoke_folder_denies: Vec<String>,
-    /// None = field absent (don't change). Only a person may set `true`: see
-    /// [`refuse_unowned_grant`].
     #[serde(default)]
     pub coding_agent_grant: Option<bool>,
-    /// None = field absent (don't change), Some(None) = explicitly null (back to
-    /// the workspace preference), Some(Some(v)) = set, checked like create.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub context_ceiling: Option<Option<String>>,
-    /// Full replacement for the MCP server ids. None = field absent (don't
-    /// change), Some(empty) = clear, Some(non-empty) = replace.
     #[serde(default)]
     pub mcp_servers: Option<Vec<String>>,
-    /// None = field absent (don't change), Some(None) = explicitly null (back to
-    /// the account `trigger_model` preference), Some(Some(v)) = set. A blank or
-    /// `"null"` string clears too, per [`normalize_route_setting`].
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub model: Option<Option<String>>,
-    /// Same triple state as [`Self::model`], validated against
-    /// `none|low|medium|high|xhigh|max`.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub reasoning_effort: Option<Option<String>>,
-    /// Same triple state as [`Self::model`]. A change of model without one
-    /// clears the old pin: see [`resolve_trigger_provider_update`].
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub provider: Option<Option<String>>,
-    /// Full replacement for the continue key spec. None = field absent (don't
-    /// change), null or `[]` = clear, a spec = replace.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub continue_key: Option<Option<serde_json::Value>>,
-    /// Same triple state as [`Self::continue_key`], for the actor field.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub actor: Option<Option<serde_json::Value>>,
 }
 
-/// Check a submitted context ceiling. Absent or null reads as `None`, the
-/// workspace preference.
 pub(crate) fn parse_context_ceiling_arg(
     raw: Option<&str>,
 ) -> Result<Option<ContextCeiling>, String> {
     raw.map(ContextCeiling::parse).transpose()
 }
 
-/// Validate a slug submitted in a `TriggerUpdated` request. Trims whitespace
-/// then runs [`is_valid_trigger_slug`]; returns the trimmed value on success.
-/// Pure helper, exposed for unit tests.
 pub(crate) fn validate_update_slug(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if !is_valid_trigger_slug(trimmed) {
@@ -396,7 +285,6 @@ pub(super) struct TriggerIdQuery {
     id: String,
 }
 
-/// List all triggers from scheduler's in-memory state (event-sourced).
 pub(super) async fn list_triggers(State(state): State<AppState>) -> Json<TriggersListResponse> {
     Json(read_triggers(&state).await)
 }
@@ -407,7 +295,6 @@ pub(super) async fn read_triggers(state: &AppState) -> TriggersListResponse {
     TriggersListResponse { triggers }
 }
 
-/// Every trigger that has ever spawned a thread, deleted or live.
 pub(super) async fn list_historical_triggers(
     State(state): State<AppState>,
 ) -> Result<Json<HistoricalTriggersResponse>, (StatusCode, String)> {
@@ -440,16 +327,12 @@ pub(super) async fn read_historical_triggers(
     Ok(HistoricalTriggersResponse { triggers })
 }
 
-/// An agent or an app frame: a caller that may not widen a trigger's grants.
 fn is_unowned_caller(headers: &HeaderMap) -> bool {
     let origin = crate::api::actor::user_actor(headers, None);
     super::intelligence_ladder::is_agent_caller(headers, origin.as_ref())
         || headers.contains_key(super::app_reach::APP_ID_HEADER)
 }
 
-/// Refuse a write that `widens` a trigger's grants from anyone but a person.
-/// The owner decides what each trigger may do unattended (ADR 0641).
-/// Any caller may narrow or keep the current grant.
 pub(super) fn refuse_unowned_grant(headers: &HeaderMap, widens: bool) -> Result<(), ApiError> {
     if !widens {
         return Ok(());
@@ -470,8 +353,6 @@ pub(super) fn refuse_unowned_grant(headers: &HeaderMap, widens: bool) -> Result<
     Ok(())
 }
 
-/// Refuse a revoke of `what` (folder grants, or denies) from anyone but the
-/// owner. The owner made that choice, so only the owner takes it back.
 fn refuse_unowned_revoke(headers: &HeaderMap, what: &str) -> Result<(), ApiError> {
     if is_unowned_caller(headers) {
         return Err(ApiError::new(
@@ -487,8 +368,6 @@ fn refuse_unowned_revoke(headers: &HeaderMap, what: &str) -> Result<(), ApiError
     Ok(())
 }
 
-/// Refuse the folder-grant and deny revokes a request carries, unless the
-/// caller is the owner.
 fn refuse_unowned_revokes(
     headers: &HeaderMap,
     request: &UpdateTriggerCronRequest,
@@ -502,8 +381,6 @@ fn refuse_unowned_revokes(
     Ok(())
 }
 
-/// Refuse an agent's trigger model pick off the chat intelligence ladder,
-/// judged as the trigger will fire on it. The owner's pick passes (ADR 0525).
 async fn refuse_agent_chat_pick(
     state: &AppState,
     headers: &HeaderMap,
@@ -528,19 +405,16 @@ fn trigger_grant_host(headers: &HeaderMap) -> Option<uuid::Uuid> {
     super::permission_requests::calling_agent_thread(headers).ok()
 }
 
-/// Create a new trigger
 pub(super) async fn create_trigger(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateTriggerCronRequest>,
 ) -> Result<Json<ApiResult>, ApiError> {
-    // Validate name
     let name = request.name.trim();
     if name.is_empty() {
         return Ok(ApiResult::err("Trigger name is required"));
     }
 
-    // Validate run field
     let run: TriggerRun = match serde_json::from_value(request.run.clone()) {
         Ok(r) => r,
         Err(e) => return Ok(ApiResult::err(format!("Invalid 'run' field: {}", e))),
@@ -570,9 +444,6 @@ pub(super) async fn create_trigger(
         Err(msg) => return Ok(ApiResult::err(msg)),
     };
 
-    // Read timezone from preferences before validating cron: the guard reports its
-    // next-run preview in the trigger's own timezone. A missing preference defaults
-    // to UTC; a read failure surfaces instead of silently scheduling the wrong zone.
     let timezone = match prefs::TIMEZONE.try_stored(&state.pool).await {
         Ok(Some(tz)) => tz,
         Ok(None) => crate::triggers::definition::default_timezone(),
@@ -584,8 +455,6 @@ pub(super) async fn create_trigger(
         }
     };
 
-    // Validate cron expressions if provided. This rejects a schedule that can
-    // never fire (Feb 31 and friends), not just a malformed one.
     let validated = match crate::scheduler::cron_rules::validate_cron_expressions(
         request
             .cron_expressions
@@ -633,8 +502,6 @@ pub(super) async fn create_trigger(
     if request.go_to_review {
         payload["go_to_review"] = serde_json::json!(true);
     }
-    // Validate trigger-group membership against the in-memory registry so a
-    // dangling group_id can't survive the round-trip. Unknown id → 400.
     if let Some(ref gid) = request.group_id {
         let trimmed = gid.trim();
         if !trimmed.is_empty() {
@@ -692,9 +559,6 @@ pub(super) async fn create_trigger(
         Ok(None) => {}
         Err(e) => return Ok(ApiResult::err(e)),
     }
-    // Model / reasoning effort: only stamped when the user picked something
-    // other than Default, so a trigger on the account defaults keeps exactly the
-    // payload it had before the fields existed.
     if let Some(model) = normalize_route_setting(request.model.as_deref()) {
         payload["model"] = serde_json::json!(model);
     }
@@ -756,7 +620,6 @@ pub(super) async fn create_trigger(
     ))
 }
 
-/// Update an existing trigger
 pub(super) async fn update_trigger(
     State(state): State<AppState>,
     Query(query): Query<TriggerIdQuery>,
@@ -765,15 +628,11 @@ pub(super) async fn update_trigger(
 ) -> Result<Json<ApiResult>, ApiError> {
     let task_id = query.id;
 
-    // Fetch existing trigger from in-memory state
     let existing = match state.scheduler.lock().await.get_trigger_config(&task_id) {
         Some(c) => c,
         None => return Ok(ApiResult::err(format!("Trigger '{}' not found", task_id))),
     };
 
-    // Validate cron expressions if provided, against the trigger's own timezone
-    // (an update cannot change it). This rejects a schedule that can never fire
-    // (Feb 31 and friends), not just a malformed one.
     let validated = match request.cron_expressions {
         Some(ref exprs) => match crate::scheduler::cron_rules::validate_cron_expressions(
             exprs.iter().map(|s| s.trim().to_string()).collect(),
@@ -785,7 +644,6 @@ pub(super) async fn update_trigger(
         None => None,
     };
 
-    // Validate run field if changing
     if let Some(ref run_val) = request.run {
         match serde_json::from_value::<TriggerRun>(run_val.clone()) {
             Ok(parsed_run) => {
@@ -797,7 +655,6 @@ pub(super) async fn update_trigger(
         }
     }
 
-    // Build update payload with only changed fields
     let trigger_id_str = task_id.clone();
     let mut update_payload = serde_json::json!({ "trigger_id": trigger_id_str });
 
@@ -841,8 +698,6 @@ pub(super) async fn update_trigger(
         update_payload["on"] =
             serde_json::to_value(subs).expect("EventSubscription serialization is infallible");
     }
-    // Same null-vs-absent semantics for app_id: explicit null clears the link
-    // (e.g. trigger moved out of an app), absent leaves it alone.
     if let Some(v) = &request.app_id {
         let normalized = v
             .as_ref()
@@ -859,9 +714,6 @@ pub(super) async fn update_trigger(
             Err(e) => return Ok(ApiResult::err(e)),
         }
     }
-    // group_id update: same null-vs-absent semantics as app_id. Setting a value
-    // validates against the in-memory registry; null clears membership; absent
-    // leaves the trigger in its current group.
     if let Some(v) = &request.group_id {
         let normalized = v
             .as_ref()
@@ -906,7 +758,6 @@ pub(super) async fn update_trigger(
             Ok(ceiling) => ceiling,
             Err(e) => return Ok(ApiResult::err(e)),
         };
-        // Clearing back to the workspace's is never a raise past it.
         if let Err(e) =
             super::threads::context_ceiling::refuse_agent_trigger_raise(&state, &headers, ceiling)
                 .await
@@ -931,9 +782,6 @@ pub(super) async fn update_trigger(
             Err(e) => return Ok(ApiResult::err(e)),
         }
     }
-    // Model / reasoning effort: same null-vs-absent semantics as app_id, so a
-    // rename-only save leaves the trigger's model alone while an explicit null
-    // (or the form's blank Default) clears it back to the account preference.
     if let Some(v) = &request.model {
         update_payload["model"] = serde_json::json!(normalize_route_setting(v.as_deref()));
     }
@@ -969,7 +817,6 @@ pub(super) async fn update_trigger(
         Err(e) => return Ok(ApiResult::err(e)),
     }
 
-    // Ensure trigger still has at least one firing mechanism after update
     let updated_crons = validated
         .as_ref()
         .map(|v| &v.expressions)
@@ -989,7 +836,6 @@ pub(super) async fn update_trigger(
     }
     refuse_unowned_grant(&headers, existing.widens_a_grant(&next))?;
     let edits_granted = existing.unowned_edit_clears_grants(&next);
-    // Editing work that runs with existing grants requires attestation.
     if edits_granted
         && crate::api::actor::owner_attestation(&headers)
             == crate::api::actor::OwnerAttestation::Unattested
@@ -1030,15 +876,12 @@ pub(super) async fn update_trigger(
         crate::scheduler::user_tasks::notify_trigger_grants_cleared(&state.engine, &existing).await;
     }
 
-    // Only an update that actually rewrote the schedule has a preview to report;
-    // one that only renamed the trigger says nothing about its cron.
     Ok(ApiResult::ok_for_trigger(
         validated.as_ref().map(CronPreview::from_validated),
         event_warnings,
     ))
 }
 
-/// Delete a trigger
 pub(super) async fn delete_trigger(
     State(state): State<AppState>,
     Query(query): Query<TriggerIdQuery>,
@@ -1046,7 +889,6 @@ pub(super) async fn delete_trigger(
 ) -> Json<ApiResult> {
     let task_id = query.id;
 
-    // Check trigger exists in in-memory state
     if state
         .scheduler
         .lock()
@@ -1075,23 +917,15 @@ pub(super) async fn delete_trigger(
     ApiResult::ok()
 }
 
-/// Result of `POST /api/v1/triggers/run`.
-///
-/// `success: true` with `status: "already-running"` is the honest answer when
-/// admission coalesced the fire away: the request was valid and nothing new
-/// started. A bare `{"success": true}` would read as "it started", which is the
-/// class of lie this whole operation replaces.
 #[derive(Serialize)]
 pub struct TriggerRunResponse {
     pub success: bool,
-    /// `started` | `queued` | `already-running`. Absent on a refusal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<&'static str>,
-    /// Human-readable summary; on a refusal this is the reason.
     pub message: String,
 }
 
-/// Fire an existing trigger once, right now, outside its schedule.
+/// INVARIANT: Fire an existing trigger once, right now, outside its schedule.
 ///
 /// No actor is stamped, deliberately: an **off-schedule run** is
 /// indistinguishable downstream from a scheduled fire, and an actor on the
@@ -1120,7 +954,6 @@ pub(super) async fn run_trigger(
     )
 }
 
-/// Routes for the `/triggers*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -1139,7 +972,6 @@ mod tests {
     use super::*;
     use crate::engine::tools::scheduler::{parse_run_arg, validate_script_path};
 
-    /// A secret read has no wire form, so a create or update naming it 4xxs.
     #[test]
     fn a_grant_naming_a_secret_read_is_refused() {
         let grant = serde_json::json!({ "side_effect_grant": ["secret_read"] });
@@ -1165,9 +997,6 @@ mod tests {
         h
     }
 
-    /// Only the attested owner widens a trigger's grants. An agent, an app
-    /// frame or a typed device id may narrow them, or send back what the
-    /// trigger holds.
     #[test]
     fn only_a_person_widens_a_grant() {
         use crate::core::subprocess_origin::{
@@ -1227,11 +1056,6 @@ mod tests {
         }
     }
 
-    // --- Script paths at the create / update boundary ---
-
-    /// A traversal path used to pass create and update, because the extension
-    /// check was the only one there. The trigger answered 200 with a cron
-    /// preview, showed as armed, and every fire died on the execution guard.
     #[test]
     fn validate_script_path_rejects_a_traversal() {
         for path in [
@@ -1245,8 +1069,6 @@ mod tests {
         }
     }
 
-    /// The extension rule still runs, and an in-tree path still passes. The
-    /// boundary refuses exactly what the fire-time guard refuses, no more.
     #[test]
     fn validate_script_path_keeps_the_extension_rule() {
         assert!(validate_script_path("scripts/daily-summary.sh").is_ok());
@@ -1255,9 +1077,6 @@ mod tests {
         assert!(err.contains("Unsupported script extension"), "{err}");
     }
 
-    /// The `create_trigger` and `update_trigger` tools parse `run` through
-    /// `parse_run_arg`. It once only deserialized, so a traversal path reached
-    /// `TriggerCreated` from the agent side.
     #[test]
     fn the_trigger_tools_refuse_a_traversal_script_path() {
         for path in ["../x.sh", "/etc/x.sh"] {
@@ -1270,8 +1089,6 @@ mod tests {
         );
         assert!(parse_run_arg(&serde_json::json!({ "type": "intent", "intent": "hi" })).is_ok());
     }
-
-    // --- Slug resolution at the create boundary ---
 
     #[test]
     fn an_explicit_create_slug_is_validated_and_kept() {
@@ -1297,15 +1114,11 @@ mod tests {
 
     #[test]
     fn a_second_trigger_of_the_same_name_gets_its_own_slug() {
-        // Both would be `daily-summary`, which is one directory under
-        // `data/triggers/`, so the second must not collide with the first.
         let taken: std::collections::HashSet<String> =
             ["daily-summary".to_string()].into_iter().collect();
         let slug = crate::triggers::mint_unique_trigger_slug("Daily Summary", "uuid-2", &taken);
         assert_eq!(slug, "daily-summary-2");
     }
-
-    // --- Slug edits at the update boundary ---
 
     #[test]
     fn validate_update_slug_accepts_well_formed() {
@@ -1313,7 +1126,6 @@ mod tests {
             validate_update_slug("renamed-trigger").unwrap(),
             "renamed-trigger"
         );
-        // Trims whitespace.
         assert_eq!(validate_update_slug("  abc  ").unwrap(), "abc");
     }
 
@@ -1324,8 +1136,6 @@ mod tests {
         let err = validate_update_slug("-leading").unwrap_err();
         assert!(err.contains("Invalid slug"));
     }
-
-    // --- Request shape: slug field deserializes ---
 
     #[test]
     fn create_request_accepts_slug_field() {
@@ -1348,8 +1158,6 @@ mod tests {
         assert_eq!(req.slug.as_deref(), Some("renamed-trigger"));
     }
 
-    // --- Request shape: the provider pin ---
-
     #[test]
     fn create_request_accepts_a_provider_pin() {
         let req: CreateTriggerCronRequest = serde_json::from_value(serde_json::json!({
@@ -1363,7 +1171,6 @@ mod tests {
         assert_eq!(req.provider.as_deref(), Some("anthropic"));
     }
 
-    /// Absent keeps the pin and null clears it, so the two must not collapse.
     #[test]
     fn update_request_tells_an_absent_provider_from_a_null_one() {
         let absent: UpdateTriggerCronRequest =
@@ -1506,8 +1313,6 @@ mod tests {
         let info = serde_json::to_value(TriggerInfo::from_config(&config)).unwrap();
         assert_eq!(info["app_id"], "trigger-workflow");
     }
-
-    // --- Handlers against a booted engine ---
 
     async fn engine_state(name: &str) -> Option<(AppState, tempfile::TempDir, String)> {
         if !crate::test_support::in_engine_child(&format!("api::triggers::tests::{name}")).await {

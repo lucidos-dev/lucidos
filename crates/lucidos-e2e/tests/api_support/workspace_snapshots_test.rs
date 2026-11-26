@@ -1,5 +1,3 @@
-//! Snapshot route boundaries exercise the actual router without opening a key
-//! store or capturing data. Capture integrity uses disposable service fixtures.
 use crate::support::{base_url, http_client, local_process_client};
 use serde_json::{json, Value};
 

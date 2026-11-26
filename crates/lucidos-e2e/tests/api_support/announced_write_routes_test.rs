@@ -1,11 +1,6 @@
-//! The routes that replace an agent's direct SQL write each announce the
-//! change (ADR 0760). A direct write emitted nothing,
-//! so every client that follows events showed stale data.
-
 use crate::support::{base_url, db_url, unique_marker, user_client, E2E_DEVICE_ID};
 use lucidos_engine::core::prefs;
 
-/// How many persisted events of `event_type` carry `needle` in their payload.
 async fn events_naming(pool: &sqlx::PgPool, event_type: &str, needle: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE event_type = $1 AND position($2 in payload::text) > 0",
@@ -73,9 +68,6 @@ async fn a_preference_reset_announces_the_return_to_the_default() {
     assert_eq!(count().await, before + 1);
 }
 
-/// The generated command reaches the gated route. The CLI's machine-local
-/// token passes the mutating gate, which answers 401 only to no credential.
-/// The owner gate then refuses a human-only key with 403, exactly as on `set`.
 #[test]
 fn the_cli_reset_command_meets_the_route_gate() {
     let out = crate::lucidos_cli_test::lucidos_cmd()
@@ -114,8 +106,6 @@ async fn forgetting_a_browser_login_removes_its_row() {
     assert_eq!(left, 0);
 }
 
-/// An unknown id changes nothing and fails with the tool's own sentence, so a
-/// script that replaced a SQL delete sees its command fail.
 #[tokio::test]
 async fn correcting_an_unknown_memory_id_fails_with_the_tools_sentence() {
     let owner = user_client().await;

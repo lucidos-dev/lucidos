@@ -1,12 +1,7 @@
-//! Durable no-replay floor derived from the verified external restore journal.
-//! Installing this observation does not complete a restore or permit dispatch.
 use super::{first_boot, store::Store, BoxError};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-/// SQL for the event sequence the last restore installed, or 0 when this
-/// workspace was never restored. Work at or below it is archived. A macro, so
-/// a SQL literal can splice it with `concat!`.
 #[macro_export]
 macro_rules! restore_floor_sql {
     () => {
@@ -28,7 +23,7 @@ pub async fn read(pool: &PgPool) -> Result<Option<Boundary>, sqlx::Error> {
         .fetch_optional(pool).await
 }
 
-/// Install under owner + archive locks, after migrations and before Engine is
+/// INVARIANT: Install under owner + archive locks, after migrations and before Engine is
 /// constructed. The journal remains FilesRestored until every settlement has
 /// succeeded. Repeating after a crash must retain the original event floor;
 /// otherwise newly submitted work could be mistaken for archived work.
@@ -43,7 +38,7 @@ pub async fn install(
     sqlx::query("LOCK TABLE snapshot_restore_boundary IN EXCLUSIVE MODE")
         .execute(&mut *tx)
         .await?;
-    // No engine dispatch may exist here. Lock out concurrent event appends as
+    // INVARIANT: No engine dispatch may exist here. Lock out concurrent event appends as
     // well, so every row in the restored history is below the recorded floor.
     sqlx::query("LOCK TABLE events IN SHARE MODE")
         .execute(&mut *tx)
@@ -64,14 +59,13 @@ pub async fn install(
     Ok(boundary)
 }
 
-/// A failed read is not permission to replay an old scheduled slot.
 pub async fn permits_slot(pool: &PgPool, slot: DateTime<Utc>) -> Result<bool, sqlx::Error> {
     Ok(read(pool)
         .await?
         .is_none_or(|boundary| slot > boundary.restored_at))
 }
 
-/// A restore's settlement terminals are observations of archived work, not
+/// INVARIANT: A restore's settlement terminals are observations of archived work, not
 /// fresh child completions. A real post-restore turn must precede a callback.
 pub async fn thread_turn_after_restore(
     pool: &sqlx::PgPool,

@@ -1,9 +1,3 @@
-//! E2E coverage for a Slack hook over real HTTP: the v0 signature, and the
-//! `url_verification` handshake Slack runs when you save a Request URL.
-//!
-//! The signature here is computed independently with the `hmac` crate, never
-//! with the engine's own signer, so a bug in that signer cannot pass itself.
-
 use crate::support::{base_url, db_url, unique_marker, user_client};
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
@@ -12,7 +6,6 @@ use sqlx::PgPool;
 
 const SECRET: &str = "8f742231b10e8888abcd99yyyzzz85a5";
 
-/// Create a hook signed the way Slack signs, with a provided signing secret.
 async fn create_hook(client: &reqwest::Client, api: &str, marker: &str, hmac: Value) -> String {
     let resp = client
         .post(format!("{api}/api/v1/webhooks"))
@@ -40,7 +33,6 @@ fn slack_hmac(marker: &str) -> Value {
     })
 }
 
-/// Hex HMAC-SHA256 of `message` under the shared secret.
 fn hex_hmac(message: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
     mac.update(message.as_bytes());
@@ -51,7 +43,6 @@ fn hex_hmac(message: &str) -> String {
         .collect()
 }
 
-/// Slack's v0 signature: `v0=` plus the HMAC over `v0:<ts>:<body>`.
 fn slack_signature(timestamp: i64, body: &str) -> String {
     format!("v0={}", hex_hmac(&format!("v0:{timestamp}:{body}")))
 }
@@ -103,7 +94,6 @@ fn url_check(challenge: &str) -> String {
     json!({ "token": "t", "challenge": challenge, "type": "url_verification" }).to_string()
 }
 
-/// A delivery signed exactly as Slack signs it authenticates and emits.
 #[tokio::test]
 async fn a_slack_v0_signed_delivery_emits_its_event() {
     let client = user_client().await;
@@ -127,7 +117,6 @@ async fn a_slack_v0_signed_delivery_emits_its_event() {
     assert_eq!(status, 401, "an unsigned delivery is refused");
 }
 
-/// Slack saving the Request URL gets its challenge back, and no event.
 #[tokio::test]
 async fn a_signed_url_check_echoes_the_challenge_and_emits_nothing() {
     let client = user_client().await;
@@ -145,7 +134,6 @@ async fn a_signed_url_check_echoes_the_challenge_and_emits_nothing() {
     assert_eq!(events_of_type(&format!("SlackEvent{marker}")).await, 0);
 }
 
-/// A forged challenge never echoes: verification runs first.
 #[tokio::test]
 async fn an_unsigned_url_check_is_refused() {
     let client = user_client().await;
@@ -165,8 +153,6 @@ async fn an_unsigned_url_check_is_refused() {
     assert_eq!(events_of_type(&format!("SlackEvent{marker}")).await, 0);
 }
 
-/// Only a Slack hook answers the handshake. Any other signed hook treats the
-/// same body as an ordinary delivery.
 #[tokio::test]
 async fn a_non_slack_hook_emits_a_url_check_like_any_body() {
     let client = user_client().await;

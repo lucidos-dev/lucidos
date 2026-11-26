@@ -9,8 +9,6 @@ use crate::test_support::{
 };
 use tokio::sync::broadcast;
 
-/// How many `ChangeProposed` the trigger matcher was handed since the last
-/// call: each one fires every trigger subscribed to `ChangeProposed`.
 fn change_proposed_dispatches(rx: &mut broadcast::Receiver<EmittedEvent>) -> usize {
     let mut count = 0;
     while let Ok(emitted) = rx.try_recv() {
@@ -23,9 +21,6 @@ fn change_proposed_dispatches(rx: &mut broadcast::Receiver<EmittedEvent>) -> usi
     count
 }
 
-/// The upgrade burst: the boot pass records an archived thread's unproposed
-/// branch work once. Every later pass, and every later archive, finds the
-/// change row and stays silent, so a trigger never hears a re-sync.
 #[tokio::test]
 async fn a_second_pass_never_re_announces_set_aside_branch_work() {
     let (pool, db) = setup_test_db().await;
@@ -93,10 +88,6 @@ async fn a_second_pass_never_re_announces_set_aside_branch_work() {
     teardown_test_db(&db).await;
 }
 
-/// An integrated sub-thread proposes nothing, so its handed-up work has no
-/// change row. Archiving its parent before the merge archives the child too.
-/// The archive net then sets the child's work aside, as for any archived
-/// thread (ADR 0465).
 #[tokio::test]
 async fn an_archived_integrated_childs_unmerged_work_is_set_aside() {
     let (pool, db) = setup_test_db().await;
@@ -166,9 +157,6 @@ async fn an_archived_integrated_childs_unmerged_work_is_set_aside() {
     teardown_test_db(&db).await;
 }
 
-/// A child of `parent` resting idle with one committed file on `branch`, in a
-/// new worktree of `repo`. An integrated child holds that work for its parent,
-/// as its hardened turn end does. Returns the child and its file.
 async fn child_with_work(
     bus: &EventBus,
     pool: &PgPool,
@@ -262,9 +250,6 @@ async fn change_proposed_count(pool: &PgPool, thread_id: Uuid) -> i64 {
     .unwrap()
 }
 
-/// The parent's change landed without merging its integrated child's branch.
-/// Nothing would ever propose that work, so the landing sets it aside. The
-/// child's strip then stops saying its parent merges it (ADR 0465).
 #[tokio::test]
 async fn a_parents_landing_sets_aside_an_integrated_childs_unmerged_work() {
     let (pool, db) = setup_test_db().await;
@@ -321,8 +306,6 @@ async fn a_parents_landing_sets_aside_an_integrated_childs_unmerged_work() {
     teardown_test_db(&db).await;
 }
 
-/// A second landing of the parent finds the set-aside row and adds nothing,
-/// so a trigger on `ChangeProposed` hears the child's branch once.
 #[tokio::test]
 async fn a_second_parent_landing_adds_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -346,11 +329,6 @@ async fn a_second_parent_landing_adds_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// A landing leaves four children alone:
-/// - an integrated child whose branch the parent merged, which is on `main`;
-/// - a running integrated child, whose report still wakes the parent;
-/// - an idle one whose report the parent has not had yet;
-/// - an independent child, which proposes its own work.
 #[tokio::test]
 async fn a_parents_landing_leaves_merged_live_and_independent_children_alone() {
     let (pool, db) = setup_test_db().await;
@@ -425,9 +403,6 @@ async fn a_parents_landing_leaves_merged_live_and_independent_children_alone() {
     teardown_test_db(&db).await;
 }
 
-/// A lane thread archived mid-batch leaves work on its integration branch. The
-/// landing lane lands or drops that branch, so the net reads it as no branch
-/// work at all (ADR 0463). Live and at boot, it records nothing.
 #[tokio::test]
 async fn the_archive_net_skips_a_lane_threads_integration_branch() {
     let (pool, db) = setup_test_db().await;
@@ -487,8 +462,6 @@ fn change_proposed(set_aside: bool) -> ThreadEvent {
     }
 }
 
-/// The filter `triggers.md` gives a "changes to apply" trigger. A pending
-/// proposal omits `set_aside`, so a bare `false` would match nothing.
 #[test]
 fn the_documented_changes_to_apply_filter_skips_only_set_aside_work() {
     use crate::core::event_subscription::{condition, matchable_thread_payload};
@@ -520,8 +493,6 @@ fn wait_canceled(wait_id: Uuid, cause: EventWaitCancelCause) -> ThreadEvent {
     }
 }
 
-/// A coding-agent thread whose last turn ended `terminal`, with one committed
-/// file on its branch.
 async fn thread_with_branch_work(
     bus: &EventBus,
     branch: &str,
@@ -552,9 +523,6 @@ fn generated() -> ThreadEvent {
     }
 }
 
-/// ADR 0395: the idle held its proposal while the wait was live. Once the
-/// last wait is canceled, the work falls due as complete work, because the
-/// turn ended cleanly. While any wait is left, nothing is due.
 #[tokio::test]
 async fn a_canceled_last_wait_releases_the_held_work() {
     let (pool, db) = setup_test_db().await;
@@ -618,9 +586,6 @@ async fn a_canceled_last_wait_releases_the_held_work() {
     teardown_test_db(&db).await;
 }
 
-/// The release re-checks the thread rather than trusting the cancel: a running
-/// turn's own idle proposes, an archive sets the work aside instead, and a
-/// failed turn recovers through Continue.
 #[tokio::test]
 async fn held_work_is_released_only_for_an_idle_open_thread_whose_turn_proposes() {
     let (pool, db) = setup_test_db().await;
@@ -675,10 +640,6 @@ async fn held_work_is_released_only_for_an_idle_open_thread_whose_turn_proposes(
     teardown_test_db(&db).await;
 }
 
-/// Only a cancel that leaves the thread open releases held work. A delivery or
-/// an expiry re-opens the thread, whose next idle proposes, so the net would
-/// propose twice. An archive or a discard ends the thread, and its own paths
-/// settle the work.
 #[test]
 fn only_a_cancel_that_leaves_the_thread_open_releases_held_work() {
     let wait_id = Uuid::new_v4();
@@ -718,9 +679,6 @@ fn only_a_cancel_that_leaves_the_thread_open_releases_held_work() {
     );
 }
 
-/// The archived removal may commit a tree's dirt on its branch before the tree
-/// goes. The net then sets that work aside, so it is listed, not just kept.
-/// Stripping build artifacts moves no branch, so it wakes nothing.
 #[test]
 fn a_full_worktree_removal_sets_aside_what_it_left_on_the_branch() {
     let cleaned = |tier| ThreadEvent::WorktreeCleaned {
@@ -735,8 +693,6 @@ fn a_full_worktree_removal_sets_aside_what_it_left_on_the_branch() {
     assert_eq!(BranchWorkMoment::of(&cleaned(1), &EventMeta::NONE), None);
 }
 
-/// Any landed change may leave an integrated sub-thread's work stranded, so
-/// every `ChangeApplied` wakes the net for its thread.
 #[test]
 fn a_landed_change_wakes_the_net_for_its_integrated_children() {
     assert_eq!(
@@ -745,8 +701,6 @@ fn a_landed_change_wakes_the_net_for_its_integrated_children() {
     );
 }
 
-/// The replay list gates live frames too, so every event a moment comes from
-/// must be on it.
 #[test]
 fn the_net_replays_every_event_a_moment_comes_from() {
     let moments = [
@@ -771,10 +725,6 @@ fn the_net_replays_every_event_a_moment_comes_from() {
     assert_eq!(BranchWorkMoment::EVENT_TYPES.len(), moments.len());
 }
 
-/// The net reads whether the parent's card waits on it BEFORE it proposes, and
-/// sends the card AFTER. The proposal clears the deferral fact, so reading it
-/// afterwards would strand the card. Source-text, like the run loop's ordering
-/// pins: the property is the order of three calls.
 #[test]
 fn the_net_reads_the_card_deferral_before_proposing_and_sends_after() {
     const SRC: &str = include_str!("orphaned_branch_work.rs");
@@ -794,9 +744,6 @@ fn the_net_reads_the_card_deferral_before_proposing_and_sends_after() {
     );
 }
 
-/// I5: withdrawing a change touches only its row, so the branch keeps every
-/// commit. The archive net reads a withdrawn row as undecided: archiving the
-/// thread afterwards sets the work aside, live and at boot.
 #[tokio::test]
 async fn the_archive_net_sets_aside_a_branch_whose_only_row_is_withdrawn() {
     use crate::engine::change_ops::emit_change_withdrawn;
@@ -887,8 +834,6 @@ async fn the_archive_net_sets_aside_a_branch_whose_only_row_is_withdrawn() {
     }
 }
 
-/// A discard is a decision the user made. Archiving the thread afterwards must
-/// not file the same branch work again as a set-aside change.
 #[tokio::test]
 async fn the_archive_net_never_resurrects_a_discarded_change() {
     let (pool, db) = setup_test_db().await;
@@ -951,8 +896,6 @@ async fn the_archive_net_never_resurrects_a_discarded_change() {
     teardown_test_db(&db).await;
 }
 
-/// The external flag is read from the projection. When that read fails the
-/// thread counts as external, and the net reads no branch work for it.
 #[tokio::test]
 async fn an_unreadable_external_flag_yields_no_branch_work() {
     let (pool, db) = setup_test_db().await;
@@ -984,8 +927,6 @@ async fn an_unreadable_external_flag_yields_no_branch_work() {
     teardown_test_db(&db).await;
 }
 
-/// The Harden offer follows the recorded unproposed reason. A stopped turn
-/// records another reason, so it is never offered a hardening run.
 #[tokio::test]
 async fn work_awaits_hardening_follows_the_recorded_reason() {
     let (pool, db) = setup_test_db().await;
@@ -1023,9 +964,6 @@ async fn work_awaits_hardening_follows_the_recorded_reason() {
     teardown_test_db(&db).await;
 }
 
-/// Both moments lost to a broadcast lag must still reach the net. An archive's
-/// work is set aside now, not at the next boot. A canceled wait's held work is
-/// proposed, credited to whoever canceled it.
 #[tokio::test]
 async fn moments_lost_to_a_lag_still_reach_the_net() {
     use crate::engine::thread_events::EventMeta;
@@ -1104,8 +1042,6 @@ async fn moments_lost_to_a_lag_still_reach_the_net() {
     teardown_test_db(&db).await;
 }
 
-/// A thread with one commit on `branch`, which handed off to a successor at
-/// that commit. Returns the old thread, the successor and the worktree.
 async fn handed_off_thread(
     bus: &EventBus,
     branch: &str,
@@ -1145,9 +1081,6 @@ async fn handed_off_thread(
     (old, successor, tmp, repo, wt)
 }
 
-/// I15: archiving the old thread before its successor's change lands sets
-/// nothing aside. The successor's branch carries the work, and its change
-/// owns it.
 #[tokio::test]
 async fn work_a_successor_carries_is_never_set_aside() {
     let (pool, db) = setup_test_db().await;
@@ -1179,8 +1112,6 @@ async fn work_a_successor_carries_is_never_set_aside() {
     teardown_test_db(&db).await;
 }
 
-/// Legacy chains: the boot pass leaves an archived old thread's carried work
-/// alone, so nothing re-proposes a legacy successor thread's predecessor.
 #[tokio::test]
 async fn the_boot_pass_never_proposes_a_legacy_predecessor() {
     let (pool, db) = setup_test_db().await;
@@ -1212,10 +1143,6 @@ async fn the_boot_pass_never_proposes_a_legacy_predecessor() {
     teardown_test_db(&db).await;
 }
 
-/// I15: a commit the old thread made after the handoff is residue. The
-/// successor never saw it, so its landing sets it aside rather than lose it.
-/// The successor has no branch yet, so ancestry is unknown, and unknown sets
-/// aside.
 #[tokio::test]
 async fn work_after_the_handoff_is_set_aside_when_the_successor_lands() {
     let (pool, db) = setup_test_db().await;
@@ -1243,8 +1170,6 @@ async fn work_after_the_handoff_is_set_aside_when_the_successor_lands() {
     teardown_test_db(&db).await;
 }
 
-/// I15: a successor whose spawn never made a branch carries nothing. So the
-/// old thread's archive sets its work aside rather than strand it.
 #[tokio::test]
 async fn a_successor_with_no_branch_carries_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -1270,9 +1195,6 @@ async fn a_successor_with_no_branch_carries_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// A Discard resets the successor's branch to main. The old thread's work at
-/// the handoff was the successor's to decide. So the Discard covers it, and
-/// nothing comes back as a set-aside change.
 #[tokio::test]
 async fn a_discarded_successor_brings_nothing_back() {
     let (pool, db) = setup_test_db().await;
@@ -1298,8 +1220,6 @@ async fn a_discarded_successor_brings_nothing_back() {
     teardown_test_db(&db).await;
 }
 
-/// A set-aside change from before the handoff is still open on the branch,
-/// and a branch holds one open change. So the residue pass adds none.
 #[tokio::test]
 async fn an_open_change_from_before_the_handoff_keeps_the_residue_pass_quiet() {
     let (pool, db) = setup_test_db().await;
@@ -1333,9 +1253,6 @@ async fn an_open_change_from_before_the_handoff_keeps_the_residue_pass_quiet() {
     teardown_test_db(&db).await;
 }
 
-/// I15: a change applied on the branch before the handoff does not stop the
-/// residue after it from being set aside. Only a decision since the handoff
-/// covers the residue.
 #[tokio::test]
 async fn residue_is_set_aside_even_after_an_earlier_apply() {
     let (pool, db) = setup_test_db().await;
@@ -1371,8 +1288,6 @@ async fn residue_is_set_aside_even_after_an_earlier_apply() {
     teardown_test_db(&db).await;
 }
 
-/// The successor's resolved change wakes the residue pass, applied or
-/// discarded.
 #[test]
 fn a_resolved_change_wakes_the_residue_pass() {
     assert_eq!(
@@ -1388,8 +1303,6 @@ fn a_resolved_change_wakes_the_residue_pass() {
     );
 }
 
-/// I15: commits after the handoff that the successor's branch already holds
-/// are carried, not residue. Git confirms the old head is in that branch.
 #[tokio::test]
 async fn work_the_successors_branch_holds_is_never_residue() {
     let (pool, db) = setup_test_db().await;

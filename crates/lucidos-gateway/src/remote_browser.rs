@@ -1,4 +1,3 @@
-//! Trusted client and untrusted remote data boundary (ADR 0723).
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -17,7 +16,6 @@ pub struct RemoteStartup {
 
 pub(crate) const MAX_CLIENT_HEALTH_BYTES: usize = 64 * 1024;
 
-/// The installed build, generated after Vite stamps its final output bytes.
 #[derive(serde::Deserialize)]
 pub struct InstalledClient {
     version: u32,
@@ -51,7 +49,6 @@ pub fn contract() -> ClientContract {
     ClientContract::gateway()
 }
 
-/// B's gateway contract from its health, when this gateway supports it.
 pub fn compatible(health: &serde_json::Value) -> Option<ClientContract> {
     health
         .get("workspace_client")
@@ -59,8 +56,6 @@ pub fn compatible(health: &serde_json::Value) -> Option<ClientContract> {
         .filter(|c| c.supports_gateway())
 }
 
-/// What A signs into a relayed request and B recomputes from its own
-/// contracts, so a request negotiated against other contracts fails.
 pub fn contract_binding(gateway: &ClientContract, engine: &ClientContract) -> String {
     serde_json::to_string(&(gateway, engine)).unwrap_or_default()
 }
@@ -75,8 +70,6 @@ pub fn is_data_path(path: &str) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-/// Browser metadata is checked before credentials or private handlers. Opaque
-/// frames retain only the narrow public asset and signed capability exemptions.
 pub fn foreign_private_request(req: &Request) -> bool {
     let headers = req.headers();
     let shell_path = req
@@ -99,9 +92,6 @@ pub fn foreign_private_request(req: &Request) -> bool {
     {
         return false;
     }
-    // Fetch metadata names the browser's own verdict, so it beats a host
-    // compare. A proxy that rewrites `Host` would fail every write here.
-    // An opaque `Origin: null` stays refused whatever the metadata says.
     if let Some(site) = headers.get("sec-fetch-site") {
         let opaque = headers
             .get(header::ORIGIN)
@@ -123,8 +113,6 @@ pub fn foreign_private_request(req: &Request) -> bool {
     false
 }
 
-/// Resolve with the browser URL parser, then require the exact workspace's
-/// data namespace. Neither peer transport URLs nor sibling routes are browser destinations.
 pub fn scoped_location(location: &str, request: &str, route: &str) -> Option<String> {
     if location.contains('\\') {
         return None;
@@ -156,8 +144,6 @@ pub fn data_response(
     route: &str,
     cors_resource: bool,
 ) -> Response {
-    // Every `Location` B sends must stay in this workspace's data namespace,
-    // whatever the status. A 304 carries none and passes untouched.
     let location = match response.headers().get(header::LOCATION) {
         None => None,
         Some(value) => match value
@@ -177,8 +163,6 @@ pub fn data_response(
     };
     let mut out = crate::relay::streamed_response(response);
     let headers = out.headers_mut();
-    // A browser enforces every CSP header, so B's own policy can only narrow
-    // A's sandbox. Keeping it holds a document B locked down to B's terms.
     let remote_csp: Vec<HeaderValue> = headers
         .get_all(header::CONTENT_SECURITY_POLICY)
         .iter()
@@ -208,10 +192,6 @@ pub fn data_response(
     for name in remove {
         headers.remove(name);
     }
-    // Opaque app frames need CORS for SDK modules and fonts. A authors this
-    // policy only for the existing public allowlist and read-only frame
-    // capabilities, which B verifies before returning the resource. B's
-    // CORS headers cannot grant access to a private API or A's control plane.
     if cors_resource {
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -321,7 +301,6 @@ mod tests {
     fn private_browser_sources_fail_closed_before_authentication() {
         for (site, origin, refused) in [
             ("same-origin", "https://gateway.test", false),
-            // A proxy that rewrote `Host`: the browser's verdict stands.
             ("same-origin", "https://public.example", false),
             ("same-origin", "null", true),
             ("cross-site", "https://evil.test", true),

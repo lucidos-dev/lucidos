@@ -1,11 +1,3 @@
-//! The row subscription: one task per stack that follows its engine's row
-//! stream and keeps the picker row current (ADR 0756).
-//!
-//! A frame is a poke, never the value. The unread count depends on who reads
-//! it, so on a poke the task reads the engine's two snapshot routes again.
-//! The gateway holds no database handle (ADR 0014 §1), and those reads stay
-//! the only road to either fact.
-
 use std::collections::HashMap;
 use std::sync::Weak;
 use std::time::Duration;
@@ -20,42 +12,24 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::engine_hop::{self, Credential, EngineAddress};
 use crate::stack::{self, StackRuntime};
 
-/// How long a failed snapshot read waits before it runs again. The stream is
-/// live, so no later frame is owed, and the row must not stay blank.
 const SNAPSHOT_RETRY: Duration = Duration::from_secs(2);
 
-/// The longest frame line the task buffers. A frame is under a hundred bytes.
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
-/// One stack's row subscription, and the counts that live only while it does.
 pub struct RowSubscription {
     task: Option<Task>,
-    /// Each paired device's own unread count, read on a listing. Held only
-    /// between two frames that could move it.
     device_unread: HashMap<String, u64>,
-    /// Rises whenever the held counts are dropped, so a read that started
-    /// before the drop cannot store its answer after it.
     epoch: u64,
-    /// The status the last stream was refused with, so a standing refusal
-    /// logs once and not on every supervise pass.
     refused: Option<StatusCode>,
-    /// How long the stream may stay silent before the task drops it.
     silence_limit: Duration,
-    /// What the gateway has done about an engine too old to serve the stream.
     without_stream: WithoutStream,
 }
 
-/// Where a stack stands with a healthy engine that lacks the row stream. It
-/// outlives a stopped subscription, so one engine is logged and respawned
-/// once, not on every supervise pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum WithoutStream {
-    /// The engine serves the stream, or none has answered yet.
     #[default]
     No,
-    /// The engine lacks it, and that is logged.
     Seen,
-    /// The gateway respawned the engine for it. It does not do so twice.
     Respawned,
 }
 
@@ -72,20 +46,13 @@ impl Default for RowSubscription {
     }
 }
 
-/// Why a row stream stopped being followed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
-    /// The engine answered the request with this status.
     Refused(StatusCode),
-    /// The engine sent nothing for the silence limit: no answer to the
-    /// request, or no frame and no keepalive after it.
     Stalled,
-    /// The stream closed, or its request never got an answer.
     Closed,
 }
 
-/// The task's handle. Dropping it ends the task, so a deleted stack leaves no
-/// stream behind.
 struct Task(tokio::task::JoinHandle<()>);
 
 impl Drop for Task {
@@ -95,27 +62,21 @@ impl Drop for Task {
 }
 
 impl RowSubscription {
-    /// A task follows the stream right now.
     pub fn is_live(&self) -> bool {
         self.task.as_ref().is_some_and(|t| !t.0.is_finished())
     }
 
-    /// Follow `engine`'s row stream for the stack behind `stack`, replacing
-    /// any earlier task.
     pub fn start(&mut self, stack: Weak<AsyncMutex<StackRuntime>>, engine: EngineAddress) {
         self.forget_devices();
         let silence_limit = self.silence_limit;
         self.task = Some(Task(tokio::spawn(run(stack, engine, silence_limit))));
     }
 
-    /// End the task. The caller blanks the row.
     pub fn stop(&mut self) {
         self.task = None;
         self.forget_devices();
     }
 
-    /// Record what a healthy probe said about the stream. Returns `true` the
-    /// first time an engine is seen to lack it, so the caller logs it once.
     pub fn note_engine_stream(&mut self, offered: bool) -> bool {
         let first_sight = !offered && self.without_stream == WithoutStream::No;
         if offered {
@@ -126,52 +87,39 @@ impl RowSubscription {
         first_sight
     }
 
-    /// The engine last probed healthy lacks the stream, so nothing here is
-    /// kept current for it.
     pub fn engine_lacks_stream(&self) -> bool {
         self.without_stream != WithoutStream::No
     }
 
-    /// The gateway may still respawn this engine to get the stream.
     pub fn stream_respawn_owed(&self) -> bool {
         self.without_stream == WithoutStream::Seen
     }
 
-    /// The gateway respawned the engine for the stream.
     pub fn note_stream_respawn(&mut self) {
         self.without_stream = WithoutStream::Respawned;
     }
 
-    /// Drop every held device count.
     pub fn forget_devices(&mut self) {
         self.device_unread.clear();
         self.epoch += 1;
     }
 
-    /// The held count for `device_id`, and the epoch a fresh read must name
-    /// to store its answer. `None` with no live stream: nothing would ever
-    /// drop a count held then.
     pub fn device_unread(&self, device_id: &str) -> Option<(Option<u64>, u64)> {
         self.is_live()
             .then(|| (self.device_unread.get(device_id).copied(), self.epoch))
     }
 
-    /// Hold `count` for `device_id`, unless the counts were dropped since
-    /// `epoch`.
     pub fn remember_device(&mut self, epoch: u64, device_id: &str, count: u64) {
         if self.is_live() && epoch == self.epoch {
             self.device_unread.insert(device_id.to_string(), count);
         }
     }
 
-    /// Drop a silent stream after `limit`, so a test need not wait out the
-    /// real one.
     #[cfg(test)]
     pub fn set_silence_limit_for_test(&mut self, limit: Duration) {
         self.silence_limit = limit;
     }
 
-    /// A subscription that reads as live and follows nothing.
     #[cfg(test)]
     pub fn live_for_test() -> Self {
         Self {
@@ -205,16 +153,9 @@ async fn run(
         End::Closed => crate::log!("[Gateway] row stream to '{}' ended", id),
     }
     s.row_subscription.refused = refused;
-    // No live stream, so nothing held is trusted: the row says nothing until
-    // the next subscription's first snapshot.
     s.blank_row();
 }
 
-/// Read the stream to its end, and ask for a snapshot read on every poke.
-///
-/// Any bytes count as life, a keepalive included. A stream silent for
-/// `silence_limit` is dropped, and the next healthy probe subscribes again.
-/// The limit also bounds the wait for the engine's answer to the request.
 async fn follow(
     stack: &Weak<AsyncMutex<StackRuntime>>,
     engine: &EngineAddress,
@@ -259,7 +200,6 @@ async fn follow(
     }
 }
 
-/// The poke in one SSE line, if it is a `data:` line carrying one.
 fn poke_in(line: &[u8]) -> Option<Poke> {
     let json = line.strip_prefix(b"data:")?;
     serde_json::from_slice::<row_stream::Frame>(json)
@@ -267,11 +207,6 @@ fn poke_in(line: &[u8]) -> Option<Poke> {
         .poke()
 }
 
-/// Read the two snapshot routes after each poke and write the row.
-///
-/// `Notify` holds one permit, so a poke during a read queues exactly one
-/// more read, and a burst of frames costs two. A read that keeps failing is
-/// logged once, not on every retry.
 async fn refresh_on_poke(
     stack: &Weak<AsyncMutex<StackRuntime>>,
     engine: &EngineAddress,
@@ -290,7 +225,6 @@ async fn refresh_on_poke(
             let complete = unread.is_some() && backup.is_some();
             {
                 let mut s = stack.lock().await;
-                // `None` for a read that failed: no badge, never a stale one.
                 s.last_unread = unread;
                 s.last_successful_backup = backup;
                 if !complete && !failing {

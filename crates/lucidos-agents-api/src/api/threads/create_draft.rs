@@ -1,10 +1,3 @@
-//! `POST /api/v1/threads/drafts`: an agent creates a draft for the owner
-//! (ADR 0665). The body is a [`CreateDraftRequest`]. The answer is the draft as
-//! `GET /api/v1/threads/drafts?thread_id=` reads it, plus `created`.
-//!
-//! Only an agent inside a thread may call it, since the draft's id derives from
-//! the calling thread. A person starts a draft from the composer instead.
-
 use axum::{
     extract::{rejection::JsonRejection, State},
     http::{HeaderMap, StatusCode},

@@ -1,6 +1,3 @@
-//! The archive request (ADR 0310): a thread's own archive waits for its turn to
-//! settle, holds while anything would refuse it, and closes on a new message.
-
 use super::*;
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::{ActorMode, AnswerKind, EventChannel, EventMeta};
@@ -48,7 +45,6 @@ async fn message(bus: &EventBus, thread_id: Uuid) {
     .await;
 }
 
-/// Record the request through the function `archive_as_agent` calls.
 async fn request(bus: &EventBus, thread_id: Uuid) {
     crate::engine::chat::agent_archive::record_archive_request(bus, thread_id)
         .await
@@ -165,8 +161,6 @@ fn settled_facts() -> RequestFacts {
     }
 }
 
-/// Every fact the verdict reads, one at a time: each holds the request, and
-/// only the settled thread with nothing refusing it archives.
 #[test]
 fn the_verdict_archives_only_a_settled_thread_nothing_refuses() {
     assert_eq!(request_verdict(&settled_facts()), RequestVerdict::Archive);
@@ -199,8 +193,6 @@ fn the_verdict_archives_only_a_settled_thread_nothing_refuses() {
     }
 }
 
-/// The ordinary case: the agent asks mid-turn, and the archive waits for the
-/// turn to end.
 #[tokio::test]
 async fn a_request_made_mid_turn_lands_after_the_turn_ends() {
     let (pool, db) = setup_test_db().await;
@@ -217,8 +209,6 @@ async fn a_request_made_mid_turn_lands_after_the_turn_ends() {
     teardown_test_db(&db).await;
 }
 
-/// A thread the user pinned after its agent asked stays open: an agent never
-/// archives a pinned thread (ADR 0312). The request lands once it is unpinned.
 #[tokio::test]
 async fn a_pin_holds_the_request_until_it_is_unpinned() {
     let (pool, db) = setup_test_db().await;
@@ -237,8 +227,6 @@ async fn a_pin_holds_the_request_until_it_is_unpinned() {
     teardown_test_db(&db).await;
 }
 
-/// A follow-up message after the request means somebody wants more from the
-/// thread, so the request closes and stays closed after that turn too.
 #[tokio::test]
 async fn a_new_message_closes_the_request() {
     let (pool, db) = setup_test_db().await;
@@ -257,7 +245,6 @@ async fn a_new_message_closes_the_request() {
     teardown_test_db(&db).await;
 }
 
-/// Restored history never renews archive authority, including after a settle.
 #[tokio::test]
 async fn restore_expires_archived_requests_but_accepts_fresh_requests() {
     let (pool, db) = setup_test_db().await;
@@ -273,7 +260,6 @@ async fn restore_expires_archived_requests_but_accepts_fresh_requests() {
     assert!(!request_is_open(&pool, thread).await.unwrap());
     assert!(threads_with_open_requests(&pool).await.unwrap().is_empty());
     assert_eq!(verdict(&pool, thread).await, RequestVerdict::Closed);
-    // An unrelated new event must not resurrect the old request.
     reply(&bus, thread, EventChannel::Chat).await;
     assert!(!request_is_open(&pool, thread).await.unwrap());
     request(&bus, thread).await;
@@ -286,7 +272,6 @@ async fn restore_expires_archived_requests_but_accepts_fresh_requests() {
     teardown_test_db(&db).await;
 }
 
-/// Once the archive lands, the request is spent.
 #[tokio::test]
 async fn an_archive_closes_the_request() {
     let (pool, db) = setup_test_db().await;
@@ -314,8 +299,6 @@ async fn an_archive_closes_the_request() {
     teardown_test_db(&db).await;
 }
 
-/// A question card holds the request (ADR 0259); the answered turn's end
-/// releases it.
 #[tokio::test]
 async fn a_question_holds_the_request_until_the_turn_after_it_ends() {
     let (pool, db) = setup_test_db().await;
@@ -363,8 +346,6 @@ async fn a_question_holds_the_request_until_the_turn_after_it_ends() {
     teardown_test_db(&db).await;
 }
 
-/// A coding-agent thread that asked to go while its change was still pending
-/// waits for the apply, then goes.
 #[tokio::test]
 async fn a_pending_change_holds_the_request_until_it_is_applied() {
     let (pool, db) = setup_test_db().await;
@@ -384,8 +365,6 @@ async fn a_pending_change_holds_the_request_until_it_is_applied() {
     teardown_test_db(&db).await;
 }
 
-/// Between a coding agent's terminal and its idle the branch is still being
-/// written. With no live session to finish the settle, the request waits.
 #[tokio::test]
 async fn a_turn_between_its_terminal_and_its_idle_holds_the_request() {
     let (pool, db) = setup_test_db().await;
@@ -403,7 +382,6 @@ async fn a_turn_between_its_terminal_and_its_idle_holds_the_request() {
     teardown_test_db(&db).await;
 }
 
-/// A thread nobody asked to archive is never touched, however settled it is.
 #[tokio::test]
 async fn a_thread_with_no_request_is_closed() {
     let (pool, db) = setup_test_db().await;
@@ -417,9 +395,6 @@ async fn a_thread_with_no_request_is_closed() {
     teardown_test_db(&db).await;
 }
 
-/// An external-repo change is not one the Archive button's gate refuses: the
-/// cascade clears it. So it does not hold the request, or the thread would
-/// wait for an apply that can never come.
 #[tokio::test]
 async fn an_external_repo_change_does_not_hold_the_request() {
     let (pool, db) = setup_test_db().await;
@@ -445,8 +420,6 @@ async fn an_external_repo_change_does_not_hold_the_request() {
     teardown_test_db(&db).await;
 }
 
-/// The request `archive_as_agent` records names an agent and the thread that
-/// asked, so the event log says who archived it.
 #[tokio::test]
 async fn the_recorded_request_names_the_agent_thread() {
     let (pool, db) = setup_test_db().await;
@@ -470,9 +443,6 @@ async fn the_recorded_request_names_the_agent_thread() {
     teardown_test_db(&db).await;
 }
 
-/// A watched parent hears its child stop blocking. The bus rebroadcasts the
-/// parent's aggregate as a thread event on the parent, which is what wakes a
-/// request held on `blocking_descendants` (docs/code-review-priors.md).
 #[tokio::test]
 async fn a_child_that_stops_blocking_wakes_its_parent() {
     let (pool, db) = setup_test_db().await;
@@ -526,8 +496,6 @@ async fn a_child_that_stops_blocking_wakes_its_parent() {
     teardown_test_db(&db).await;
 }
 
-/// An Apply or Discard releases its change claim with no event behind it. The
-/// resolver must retry on its own, or the request waits forever.
 #[test]
 fn a_request_held_by_a_change_claim_lands_after_the_claim_is_released() {
     crate::test_support::run_on_engine_runtime(

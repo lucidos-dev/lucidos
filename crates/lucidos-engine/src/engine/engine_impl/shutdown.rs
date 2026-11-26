@@ -112,7 +112,7 @@ impl LucidosEngine {
             // so a question-parked chat thread is still in `processing_thread_ids()`
             // and would otherwise get the device "Paused by restart" abort here
             // (the reproduced chat screenshot). `None` channel = chat bucket.
-            emit_teardown_abort_unless_question_parked(
+            let boundary = emit_teardown_abort_unless_question_parked(
                 &self.pool,
                 &self.event_bus,
                 *thread_id,
@@ -129,8 +129,11 @@ impl LucidosEngine {
             // this is the `external_terminal_emitted` flag on `AgentSession`
             // because `run_session` keeps running and re-reads it; the chat
             // loop has no equivalent re-read — it just exits when its token
-            // is cancelled, so eviction is enough.
-            self.force_evict_chat_thread(*thread_id);
+            // is cancelled, so eviction is enough. An unwritten abort keeps the
+            // thread, so that sweep writes it with the same teardown actor.
+            if boundary.settles_turn() {
+                self.force_evict_chat_thread(*thread_id);
+            }
         }
 
         // ---- CC threads -----------------------------------------------------
@@ -180,7 +183,7 @@ impl LucidosEngine {
                         crate::engine::thread_events::CC_ORIGINATING_EVENT_TYPES,
                     )
                     .await;
-                    emit_teardown_abort_unless_question_parked(
+                    let boundary = emit_teardown_abort_unless_question_parked(
                         &self.pool,
                         &self.event_bus,
                         *thread_id,
@@ -190,7 +193,9 @@ impl LucidosEngine {
                         actor,
                     )
                     .await;
-                    flag.store(true, std::sync::atomic::Ordering::Release);
+                    if boundary.settles_turn() {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
             },
         ))
@@ -437,6 +442,28 @@ impl LucidosEngine {
     }
 }
 
+/// What [`emit_teardown_abort_unless_question_parked`] did with one thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownBoundary {
+    /// Parked on an unanswered question, so no abort was written.
+    Preserved,
+    /// The boundary abort persisted.
+    Aborted,
+    /// The abort failed to persist. The thread still owes its terminal.
+    Unwritten,
+}
+
+impl TeardownBoundary {
+    /// Whether the thread needs no other shutdown terminal. Only then may a
+    /// caller suppress the session's own abort or evict the chat thread.
+    pub fn settles_turn(self) -> bool {
+        self != Self::Unwritten
+    }
+}
+
+/// How many times the teardown writes one boundary abort before giving up.
+const TEARDOWN_ABORT_ATTEMPTS: u32 = 3;
+
 /// Teardown boundary emit for one in-flight thread — coding-agent OR chat:
 /// emits the `ResponseAborted { cause: EngineShutdown, actor }` that
 /// post-restart recovery reads as "user-initiated switch" — UNLESS the thread
@@ -459,12 +486,15 @@ impl LucidosEngine {
 /// `thread_has_unanswered_question` predicate — the DRY guard so a chat and a
 /// coding-agent restart can't diverge on what "parked" means.
 ///
-/// Returns whether the abort was emitted. For coding-agent threads the caller
-/// must set the session's `external_terminal_emitted` flag in BOTH cases — the
-/// preserved session's run loop still sees the shutdown interrupt (both the
-/// Result classify and the stop arm produce `Aborted(EngineShutdown)`), and
-/// only that flag keeps those in-loop paths from landing the abort this skip
-/// just avoided.
+/// For coding-agent threads the caller sets the session's
+/// `external_terminal_emitted` flag when [`TeardownBoundary::settles_turn`]
+/// holds. A preserved session still sees the shutdown interrupt. Only the flag
+/// keeps its Result classify and stop arm from writing the skipped abort.
+///
+/// An `Unwritten` result leaves the flag clear. The session's own shutdown
+/// abort then carries the same teardown actor, so recovery still reads a
+/// switch. A failed write once set the flag anyway, and recovery read a user
+/// switch as a crash.
 pub async fn emit_teardown_abort_unless_question_parked(
     pool: &sqlx::PgPool,
     event_bus: &crate::engine::event_bus::EventBus,
@@ -473,32 +503,75 @@ pub async fn emit_teardown_abort_unless_question_parked(
     text: String,
     originating_event_id: Option<uuid::Uuid>,
     actor: Option<crate::engine::thread_events::MessageOrigin>,
-) -> bool {
-    use crate::engine::thread_events::{self, EventMeta};
+) -> TeardownBoundary {
+    use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
     if crate::engine::question_park_sql::thread_has_unanswered_question(pool, thread_id).await {
         log_legacy!(
             "[Restart] Preserving thread {} — parked on an unanswered question, no boundary abort",
             thread_id
         );
-        return false;
+        return TeardownBoundary::Preserved;
     }
-    thread_events::emit_response_aborted(
-        event_bus,
-        thread_id,
-        thread_events::AbortCause::EngineShutdown,
-        text,
-        vec![],
-        None,
-        None,
-        EventMeta {
-            channel,
-            request_event_id: originating_event_id,
-            actor,
-            ..EventMeta::NONE
-        },
-        "[Restart] ResponseAborted (teardown)",
-    )
-    .await;
-    true
+    let mut attempt = 1;
+    loop {
+        // Direct .emit (not emit_response_aborted): the retry reads the Err.
+        let outcome = event_bus
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ResponseAborted {
+                    text: text.clone(),
+                    images: vec![],
+                    model: None,
+                    reasoning_effort: None,
+                    cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+                },
+                meta: EventMeta {
+                    channel,
+                    request_event_id: originating_event_id,
+                    actor: actor.clone(),
+                    ..EventMeta::NONE
+                },
+            })
+            .await;
+        match outcome {
+            Ok(Some(_)) => return TeardownBoundary::Aborted,
+            Ok(None) => {
+                log_legacy!(
+                    "[Restart] Boundary abort for thread {} was not persisted",
+                    thread_id
+                );
+                return TeardownBoundary::Unwritten;
+            }
+            Err(e) if attempt < TEARDOWN_ABORT_ATTEMPTS && rolled_back(e.as_ref()) => {
+                log_legacy!(
+                    "[Restart] Boundary abort for thread {} rolled back on attempt {}, retrying: {}",
+                    thread_id,
+                    attempt,
+                    e
+                );
+                attempt += 1;
+            }
+            Err(e) => {
+                log_legacy!(
+                    "[Restart] Boundary abort for thread {} failed: {}",
+                    thread_id,
+                    e
+                );
+                return TeardownBoundary::Unwritten;
+            }
+        }
+    }
+}
+
+/// Whether Postgres rolled the whole transaction back: a deadlock or a
+/// serialization failure (SQLSTATE class 40). Nothing persisted, so writing
+/// the event again cannot write it twice.
+fn rolled_back(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(|e| match e {
+            sqlx::Error::Database(db) => db.code(),
+            _ => None,
+        })
+        .is_some_and(|code| code.starts_with("40"))
 }

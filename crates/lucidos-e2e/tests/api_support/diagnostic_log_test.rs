@@ -1,8 +1,5 @@
-//! The diagnostic log answers only this engine's agents (ADR 0667). A caller
-//! without a verified origin token meets the refusal, never a line.
 use crate::support::{base_url, http_client};
 
-/// The refusal's `reason` slug. A wire contract.
 const AGENT_ONLY: &str = "diagnostic_log_agent_only";
 
 #[tokio::test]
@@ -39,7 +36,6 @@ async fn diagnostic_snapshot_is_local_and_contains_only_bounded_evidence() {
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let snapshot: serde_json::Value = response.json().await.unwrap();
-    // Pin the bounded wire contract across the process boundary.
     assert!(snapshot["events"].as_array().unwrap().len() <= 2000);
     assert!(snapshot["faults"].as_array().unwrap().len() <= 32);
     assert!(snapshot["versions"]["engine"].is_string());

@@ -10,11 +10,12 @@ import {
   repairRemoteGateway,
   updateRemoteGatewayHeaders,
   rotateRemoteGateway,
-  setPairedGatewayMayManage,
+  setPairedGatewayGrant,
   setPairedGatewayRemoteStarts,
   setRemoteGatewayReturnAccess,
   setRemoteGatewayTrustedPairing,
   unpairGateway,
+  type HopGrant,
   type PairedGateway,
   type RemoteGateway,
   type RemoteGatewayListing,
@@ -143,6 +144,63 @@ export function remoteStartsDetail(setting: RemoteStartSetting): string {
   }
 }
 
+const HOP_GRANTS: readonly HopGrant[] = ['manage', 'control'];
+
+const GRANT_SCOPES: Record<HopGrant, string> = {
+  manage: 'manage users and devices',
+  control: 'create, start, stop and restore workspaces',
+};
+
+const GRANT_CONFIRMS: Record<HopGrant, (label: string) => { title: string; message: string }> = {
+  manage: (label) => ({
+    title: `Let ${label} manage users and devices?`,
+    message: `Every device paired with ${label} can then list, revoke and reassign this gateway's `
+      + 'devices, and add, rename and remove its users.\n\n'
+      + 'Pairing codes, gateway pairings and the rest of Settings stay on this gateway.',
+  }),
+  control: (label) => ({
+    title: `Let ${label} create and restore workspaces?`,
+    message: `Every device paired with ${label} can then create, start and stop this gateway's `
+      + 'workspaces, and restore a backup into a new one. That uses disk and memory here.\n\n'
+      + 'Deleting, renaming and the rest of Settings stay on this gateway.',
+  }),
+};
+
+const GRANT_DETAILS: Record<HopGrant, string> = {
+  manage: 'may manage its users and devices',
+  control: 'may create and restore its workspaces',
+};
+
+export function grantsDetail(gateway: PairedGateway): string {
+  const granted = HOP_GRANTS.filter((grant) => gateway[`may_${grant}`]).map((grant) => GRANT_DETAILS[grant]);
+  return ["can open this gateway's workspaces", ...granted].join(' · ');
+}
+
+function GrantToggle({ gateway, grant, onChange }: {
+  gateway: PairedGateway;
+  grant: HopGrant;
+  onChange: (on: boolean) => void;
+}) {
+  const label = `Let devices on ${gateway.label} ${GRANT_SCOPES[grant]}`;
+  const on = gateway[`may_${grant}`];
+  return (
+    <label class="toggle-switch" data-tooltip={label}>
+      <input
+        type="checkbox"
+        aria-label={label}
+        checked={on}
+        onChange={(e) => {
+          const input = e.currentTarget as HTMLInputElement;
+          const wanted = input.checked;
+          input.checked = on;
+          onChange(wanted);
+        }}
+      />
+      <span class="toggle-slider" />
+    </label>
+  );
+}
+
 interface MintedGatewayCode {
   code: string;
   expiresAt: number;
@@ -190,21 +248,16 @@ export function PairGatewaySection({
     }
   };
 
-  const setManage = async (gateway: PairedGateway, mayManage: boolean) => {
-    if (mayManage) {
-      const ok = await showConfirm(
-        `Every device paired with ${gateway.label} can then list, revoke and reassign this gateway's `
-          + 'devices, and add, rename and remove its users.\n\n'
-          + 'Pairing codes, gateway pairings and the rest of Settings stay on this gateway.',
-        'Allow',
-        { title: `Let ${gateway.label} manage users and devices?`, variant: 'default' },
-      );
+  const setGrant = async (gateway: PairedGateway, grant: HopGrant, on: boolean) => {
+    if (on) {
+      const ask = GRANT_CONFIRMS[grant](gateway.label);
+      const ok = await showConfirm(ask.message, 'Allow', { title: ask.title, variant: 'default' });
       if (!ok) return;
     }
     try {
-      await setPairedGatewayMayManage(gateway.id, mayManage);
+      await setPairedGatewayGrant(gateway.id, grant, on);
     } catch (e) {
-      showToast(`Couldn't change what ${gateway.label} may manage: ${errorDetail(e)}`, 'error');
+      showToast(`Couldn't change what ${gateway.label} may do here: ${errorDetail(e)}`, 'error');
     }
     await reload();
   };
@@ -319,7 +372,7 @@ export function PairGatewaySection({
               <GatewayRow
                 key={gateway.id}
                 title={gateway.label}
-                detail={`Paired ${timeAgo(gateway.paired_at, Date.now())} · ${gateway.last_used_at ? `last used ${timeAgo(gateway.last_used_at, Date.now())}` : 'not used yet'} · ${gateway.may_manage ? "can open this gateway's workspaces and manage its users and devices" : "can open this gateway's workspaces"} · ${remoteStartsDetail(gateway.remote_starts)}`}
+                detail={`Paired ${timeAgo(gateway.paired_at, Date.now())} · ${gateway.last_used_at ? `last used ${timeAgo(gateway.last_used_at, Date.now())}` : 'not used yet'} · ${grantsDetail(gateway)} · ${remoteStartsDetail(gateway.remote_starts)}`}
                 action={
                   <>
                     <Dropdown
@@ -327,23 +380,14 @@ export function PairGatewaySection({
                       value={gateway.remote_starts}
                       onChange={(value) => void setRemoteStarts(gateway, value as RemoteStartSetting)}
                     />
-                    <label
-                      class="toggle-switch"
-                      data-tooltip={`Let devices on ${gateway.label} manage users and devices`}
-                    >
-                      <input
-                        type="checkbox"
-                        aria-label={`Let devices on ${gateway.label} manage users and devices`}
-                        checked={gateway.may_manage}
-                        onChange={(e) => {
-                          const input = e.currentTarget as HTMLInputElement;
-                          const wanted = input.checked;
-                          input.checked = gateway.may_manage;
-                          void setManage(gateway, wanted);
-                        }}
+                    {HOP_GRANTS.map((grant) => (
+                      <GrantToggle
+                        key={grant}
+                        gateway={gateway}
+                        grant={grant}
+                        onChange={(on) => void setGrant(gateway, grant, on)}
                       />
-                      <span class="toggle-slider" />
-                    </label>
+                    ))}
                     <button class="action-btn action-btn-danger" onClick={() => void unpair(gateway)}>
                       Unpair
                     </button>

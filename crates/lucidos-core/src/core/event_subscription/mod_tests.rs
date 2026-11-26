@@ -8,27 +8,19 @@ fn sub(event_type: &str, condition: Option<Value>) -> EventSubscription {
     }
 }
 
-/// Validate for the **wait** surface, the stricter of the two. Only the
-/// `EventWait*` family differs, so these tests read the wait surface as the
-/// default and name the trigger one where the two part company.
 fn awaitable(name: &str) -> Result<SubscriptionVerdict, String> {
     validate_subscribable_event_type(name, SubscriptionSurface::Wait)
 }
 
-/// Validate for the **trigger** surface, a strict superset of the wait one.
 fn triggerable(name: &str) -> Result<SubscriptionVerdict, String> {
     validate_subscribable_event_type(name, SubscriptionSurface::Trigger)
 }
-
-// ── matches / any_matches ───────────────────────────────────────────
 
 #[test]
 fn matches_requires_both_name_and_condition() {
     let s = sub("ChangeProposed", Some(json!({"file_count": {"$gt": 0}})));
     assert!(s.matches("ChangeProposed", &json!({"file_count": 3})));
-    // Right name, condition false.
     assert!(!s.matches("ChangeProposed", &json!({"file_count": 0})));
-    // Condition true, wrong name.
     assert!(!s.matches("ChangeApplied", &json!({"file_count": 3})));
 }
 
@@ -60,8 +52,6 @@ fn any_matches_is_per_entry_or() {
         sub("ChangeProposed", Some(json!({"file_count": {"$gt": 5}}))),
         sub("ResponseGenerated", None),
     ];
-    // Second entry matches even though the first entry's condition fails, and
-    // the first entry's condition must NOT constrain the second entry's event.
     assert!(EventSubscription::any_matches(
         &subs,
         "ResponseGenerated",
@@ -101,8 +91,6 @@ fn parity_table_holds_for_the_shared_matcher() {
     }
 }
 
-// ── normalize_list / from_object_entry ──────────────────────────────
-
 #[test]
 fn normalize_list_trims_and_drops_blank_names() {
     let out = EventSubscription::normalize_list(vec![
@@ -124,12 +112,10 @@ fn from_object_entry_reads_name_and_optional_condition() {
     assert_eq!(s.event_type, "ChangeProposed");
     assert_eq!(s.condition, Some(json!({"a": 1})));
 
-    // An explicit null condition is the same as absent.
     let obj = json!({"event_type": "X", "condition": null});
     let s = EventSubscription::from_object_entry(obj.as_object().unwrap()).unwrap();
     assert_eq!(s.condition, None);
 
-    // Missing or blank name is rejected.
     assert!(EventSubscription::from_object_entry(json!({}).as_object().unwrap()).is_none());
     assert!(
         EventSubscription::from_object_entry(json!({"event_type": "  "}).as_object().unwrap())
@@ -137,11 +123,6 @@ fn from_object_entry_reads_name_and_optional_condition() {
     );
 }
 
-// ── the subscribability gate (I9) ───────────────────────────────────
-
-/// The name constant and the predicate are two spellings of one blocklist, so
-/// a variant added to one and not the other is a silent hole: the dispatcher
-/// would drop the event while the tool still accepted a wait on it.
 #[test]
 fn per_token_streaming_names_match_the_predicate() {
     let streaming: Vec<ThreadEvent> = vec![
@@ -185,8 +166,6 @@ fn per_token_streaming_names_match_the_predicate() {
 
 #[test]
 fn the_gate_admits_ordinary_lifecycle_and_per_action_events() {
-    // Per-action variants are high cardinality but deliberately subscribable:
-    // a subscriber scopes them with a `condition:` rather than being refused.
     assert!(is_subscribable(&ThreadEvent::ToolCalled {
         name: "run_bash".to_string(),
         args: json!({}),
@@ -195,8 +174,6 @@ fn the_gate_admits_ordinary_lifecycle_and_per_action_events() {
     assert!(is_subscribable(&ThreadEvent::ThreadArchived));
 }
 
-/// An engine turn's idle records no work the user asked for, so the gate
-/// drops it. A ceiling re-entry is one, like a keep-alive (ADR 0629).
 #[test]
 fn engine_turn_idles_are_never_subscribable() {
     use crate::engine::thread_events::{CEILING_REENTRY_IDLE_REASON, KEEP_ALIVE_IDLE_REASON};
@@ -226,8 +203,6 @@ fn engine_turn_idles_are_never_subscribable() {
     }
 }
 
-/// No agent, trigger or event wait may see a side question (ADR 0320): the
-/// gate drops each one, both surfaces refuse the name, and no list offers it.
 #[test]
 fn side_questions_are_never_subscribable() {
     let events = crate::test_support::every_side_question_event();
@@ -252,7 +227,6 @@ fn side_questions_are_never_subscribable() {
     }
 }
 
-/// Dropped before any subscriber sees it, so neither surface may take it.
 #[test]
 fn streaming_variants_are_refused_at_both_surfaces() {
     for name in PER_TOKEN_STREAMING_EVENT_TYPES {
@@ -265,9 +239,6 @@ fn streaming_variants_are_refused_at_both_surfaces() {
     }
 }
 
-/// The one family the two surfaces disagree about. A wait on it self-satisfies,
-/// so the wait surface refuses it. A trigger spawns a separate thread, so it may
-/// watch the family and the gate never drops it.
 #[test]
 fn the_event_wait_family_is_refused_for_a_wait_and_accepted_for_a_trigger() {
     for name in EVENT_WAIT_EVENT_TYPES {
@@ -294,7 +265,6 @@ fn a_known_thread_event_name_is_awaitable() {
         awaitable("ChangeProposed"),
         Ok(SubscriptionVerdict::KnownThreadEvent),
     );
-    // Leading/trailing whitespace is tolerated, matching normalize_list.
     assert_eq!(
         awaitable("  ResponseGenerated "),
         Ok(SubscriptionVerdict::KnownThreadEvent),
@@ -303,8 +273,6 @@ fn a_known_thread_event_name_is_awaitable() {
 
 #[test]
 fn an_unknown_name_is_accepted_for_the_caller_to_corroborate() {
-    // A workspace-defined domain event nobody has emitted yet. Refusing these
-    // would break the most valuable case for the tool.
     assert_eq!(
         awaitable("ReleasePublished"),
         Ok(SubscriptionVerdict::UnknownName),
@@ -316,11 +284,6 @@ fn an_empty_name_is_refused() {
     assert!(awaitable("   ").is_err());
 }
 
-// ── persisted system events (ADR 0113) ──────────────────────────────
-
-/// The bug this rule fixes. A backup completion is a durable fact, and nothing
-/// accompanies it. Before ADR 0113 the tool refused it and advised waiting on a
-/// companion event that does not exist.
 #[test]
 fn a_persisted_system_event_name_is_awaitable() {
     for name in ["BackupCompleted", "BackupFailed", "NotificationCreated"] {
@@ -332,8 +295,6 @@ fn a_persisted_system_event_name_is_awaitable() {
     }
 }
 
-/// Every reserved name the engine does not persist, swept rather than sampled,
-/// so a new transient variant cannot quietly become awaitable.
 #[test]
 fn every_transient_system_frame_is_refused() {
     use crate::engine::event_bus::SystemEvent;
@@ -353,8 +314,6 @@ fn every_transient_system_frame_is_refused() {
     assert!(refused > 20, "the sweep found only {refused} frames");
 }
 
-/// The advice has to point at something that exists. That is what the old
-/// message got wrong.
 #[test]
 fn the_refusal_names_the_terminal_event_where_one_exists() {
     let err = awaitable("BackupProgress").unwrap_err();
@@ -373,14 +332,11 @@ fn the_refusal_names_the_terminal_event_where_one_exists() {
     }
     assert!(awaitable("SnapshotDeleted").is_ok());
 
-    // A frame with no terminal twin simply gets the shorter message.
     let err = awaitable("Toast").unwrap_err();
     assert!(err.contains("transient"), "{err}");
     assert!(!err.contains("Subscribe to"), "nothing to point at: {err}");
 }
 
-/// A wrapper is not an event. Calling either one transient would be a lie, and
-/// a wait on it could never match: the row is filed under the inner name.
 #[test]
 fn a_transport_wrapper_is_refused_as_a_wrapper() {
     for name in TRANSPORT_TYPE_NAMES {
@@ -390,8 +346,6 @@ fn a_transport_wrapper_is_refused_as_a_wrapper() {
     }
 }
 
-/// The gate both fan-outs run, so the set each offers is one function rather
-/// than two expressions that happen to agree today (I8).
 #[test]
 fn the_system_gate_admits_a_persisted_frame_and_any_domain_event() {
     use crate::engine::event_bus::SystemEvent;
@@ -409,8 +363,6 @@ fn the_system_gate_admits_a_persisted_frame_and_any_domain_event() {
         }
     ));
 
-    // A domain event qualifies on either setting of `transient`: the workspace
-    // chose the name, so the emitter and the subscriber are the same party.
     for transient in [false, true] {
         assert!(is_subscribable_system_event(&SystemEvent::DomainEvent {
             event_type: "ReleasePublished".to_string(),
@@ -422,9 +374,6 @@ fn the_system_gate_admits_a_persisted_frame_and_any_domain_event() {
     }
 }
 
-/// `ChangeDiscarded` is both a `SystemEvent` variant and a `ThreadEvent` one.
-/// The thread-scoped reading wins: it is the only one of the pair a `condition`
-/// can scope to a thread.
 #[test]
 fn a_name_that_is_both_resolves_to_the_thread_event() {
     assert_eq!(
@@ -433,9 +382,6 @@ fn a_name_that_is_both_resolves_to_the_thread_event() {
     );
 }
 
-// ── near misses and retired names ───────────────────────────────────
-
-/// The incident. Both names were accepted, armed, and never matched.
 #[test]
 fn the_incident_names_are_refused_with_the_right_suggestion() {
     let err = refuse_near_miss("CredentialStored").unwrap_err();
@@ -445,15 +391,11 @@ fn the_incident_names_are_refused_with_the_right_suggestion() {
     );
     assert!(err.contains("Did you mean CredentialCreated"), "{err}");
 
-    // A credential request is a form request now, so its resolution is the
-    // closest real name. The request itself still comes up.
     let err = refuse_near_miss("CredentialRequestResolved").unwrap_err();
     assert!(err.contains("Did you mean FormRequestResolved"), "{err}");
     assert!(err.contains("CredentialRequested"), "{err}");
 }
 
-/// A retired name is caught by exact lookup, never by the heuristic. A rename
-/// that changed the leading words leaves no letters to match on.
 #[test]
 fn a_retired_name_is_refused_and_names_its_replacement() {
     for (retired, replacement) in [
@@ -485,8 +427,6 @@ fn a_plain_misspelling_of_an_engine_name_is_refused() {
     }
 }
 
-/// Case 2, the one to get right. A workspace's own domain event passes, even
-/// when it reads like an engine name.
 #[test]
 fn a_workspace_domain_event_is_never_refused_by_the_heuristic() {
     for name in [
@@ -513,10 +453,6 @@ fn the_never_emitted_note_names_the_type_and_the_way_to_check() {
     assert!(note.contains("event_types"), "{note}");
 }
 
-/// The corpus is derived, so a rename cannot strand a name in it. Every entry
-/// has to validate as known at the surface it was drawn for. This is the
-/// contract the `event_types` action rests on: a name the agent reads off the
-/// list is always a name the validator then accepts.
 #[test]
 fn every_derived_known_name_validates_as_known() {
     for surface in [SubscriptionSurface::Wait, SubscriptionSurface::Trigger] {
@@ -534,8 +470,6 @@ fn every_derived_known_name_validates_as_known() {
     }
 }
 
-/// A retired name must not also be a live one. Revert a rename without
-/// dropping its alias and every subscription on the revived name is refused.
 #[test]
 fn no_retired_alias_is_also_a_live_known_name() {
     let live = known_names::subscribable_event_type_names(SubscriptionSurface::Trigger);
@@ -544,7 +478,6 @@ fn no_retired_alias_is_also_a_live_known_name() {
     }
 }
 
-/// A suggestion the caller cannot act on is worse than none.
 #[test]
 fn a_suggestion_is_always_a_name_a_wait_can_match() {
     for name in [
@@ -567,11 +500,6 @@ fn a_suggestion_is_always_a_name_a_wait_can_match() {
     }
 }
 
-// ── the adjacent-tag envelope ───────────────────────────────────────
-
-/// `SystemEvent` is `#[serde(tag = "type", content = "data")]`, so its row is
-/// `{"type": …, "data": {…}}`. The condition language is a flat one-level
-/// lookup, so the view must flatten or every such condition is silently false.
 #[test]
 fn the_envelope_is_flattened_so_a_condition_names_the_events_own_fields() {
     let row = json!({"type": "BackupFailed", "data": {"error": "disk full"}});
@@ -580,8 +508,6 @@ fn the_envelope_is_flattened_so_a_condition_names_the_events_own_fields() {
     assert!(sub("BackupFailed", Some(json!({"error": "disk full"}))).matches("BackupFailed", &view));
 }
 
-/// The live frame and the stored row are the same bytes, built by the same
-/// `to_payload`, so one function flattens both.
 #[test]
 fn the_live_view_of_a_system_event_is_the_view_of_its_row() {
     use crate::engine::event_bus::SystemEvent;
@@ -591,40 +517,29 @@ fn the_live_view_of_a_system_event_is_the_view_of_its_row() {
         started_at: started,
         finished_at: started,
     };
-    // What the row's payload column holds, replayed through the row path.
     let replayed = matchable_payload(event.stored_event_type(), event.to_payload(), None);
     assert_eq!(matchable_system_payload(&event), replayed);
     assert_eq!(replayed["error"], json!("disk full"));
 }
 
-/// A unit-like variant serializes with no `data` at all. No persisted variant
-/// is unit-like today, so this pins the arm that keeps the next one matchable.
 #[test]
 fn a_content_free_envelope_flattens_to_an_empty_object() {
     let row = json!({"type": "BackupFailed"});
     assert_eq!(matchable_payload("BackupFailed", row, None), json!({}));
 }
 
-/// Under a persisted name the shape decides, so a payload that merely owns a
-/// `type` key keeps every field it wrote.
 #[test]
 fn a_payload_that_is_not_the_envelope_passes_through() {
-    // `type` names something else.
     let p = json!({"type": "pdf", "data": {"x": 1}});
     assert_eq!(matchable_payload("ArtifactImported", p.clone(), None), p);
 
-    // Right `type`, but a third key, so it is the event's own fields.
     let p = json!({"type": "ArtifactImported", "data": {"x": 1}, "summary": "s"});
     assert_eq!(matchable_payload("ArtifactImported", p.clone(), None), p);
 
-    // Right `type`, but the content cannot carry named fields.
     let p = json!({"type": "ArtifactImported", "data": 7});
     assert_eq!(matchable_payload("ArtifactImported", p.clone(), None), p);
 }
 
-/// The shape alone is ambiguous, so the name decides first. Only a persisted
-/// `SystemEvent` name writes a real envelope, and a workspace may author a
-/// domain payload in that exact shape. Flattening it would drop what it wrote.
 #[test]
 fn a_domain_event_authored_in_the_envelope_shape_keeps_its_payload() {
     let authored = json!({"type": "ReleasePublished", "data": {"version": "1.2.0"}});
@@ -638,8 +553,6 @@ fn a_domain_event_authored_in_the_envelope_shape_keeps_its_payload() {
         json!({"error": "disk full"})
     );
 }
-
-// ── matchable_payload ───────────────────────────────────────────────
 
 #[test]
 fn the_matchable_payload_carries_the_thread_the_event_belongs_to() {
@@ -669,9 +582,6 @@ fn the_matchable_payload_carries_the_thread_the_event_belongs_to() {
     );
 }
 
-/// A `uuid::Uuid` serializes as its hyphenated string, so the injected value has
-/// to be that same spelling: a condition carries whatever the `threads` list
-/// printed, and `$eq` on a JSON string is a byte comparison.
 #[test]
 fn the_injected_id_is_spelled_the_way_a_uuid_serializes() {
     let thread = Uuid::new_v4();
@@ -679,8 +589,6 @@ fn the_injected_id_is_spelled_the_way_a_uuid_serializes() {
     assert_eq!(view["thread_id"], serde_json::to_value(thread).unwrap());
 }
 
-/// Insert-if-absent. An event that owns the key keeps its value, which is what
-/// keeps a user-authored domain payload honest.
 #[test]
 fn an_owned_thread_id_is_never_shadowed() {
     let carrier = Uuid::new_v4();
@@ -693,10 +601,6 @@ fn an_owned_thread_id_is_never_shadowed() {
     assert_eq!(view["thread_id"], json!(owned.to_string()));
 }
 
-/// An event belonging to no thread is not thread-scopable, and the view says so
-/// by omission rather than by inventing a value. A condition naming a missing
-/// field never matches (`missing_field_does_not_match`), so such a subscription
-/// simply never fires, identically on the live and the replay path.
 #[test]
 fn an_event_with_no_thread_gets_no_key() {
     let payload = json!({"summary": "release published"});
@@ -704,11 +608,6 @@ fn an_event_with_no_thread_gets_no_key() {
     assert_eq!(view, payload);
     assert!(view.get("thread_id").is_none());
 
-    // Which is what makes a domain event not thread-scopable, on every path:
-    // the key is absent rather than invented, and a condition naming a missing
-    // field never matches (`missing_field_does_not_match`). So such a
-    // subscription is silent, identically live and on replay, instead of one
-    // path resolving it.
     assert!(
         !sub(
             "ReleasePublished",
@@ -719,7 +618,6 @@ fn an_event_with_no_thread_gets_no_key() {
     );
 }
 
-/// Domain payloads are whatever the workspace wrote, including a bare scalar.
 #[test]
 fn a_non_object_payload_is_left_alone() {
     let view = matchable_payload(
@@ -730,17 +628,11 @@ fn a_non_object_payload_is_left_alone() {
     assert_eq!(view, json!("just a string"));
 }
 
-// ── validate_emittable_event_type ────────────────────────────────────
-
 #[test]
 fn an_empty_event_type_is_refused() {
     assert!(validate_emittable_event_type("").is_err());
 }
 
-/// Spoofing prevention: an untrusted app must not emit a domain event whose
-/// name collides with a `SystemEvent` variant. After the SSE unwrap, the wire
-/// frame is indistinguishable from a real system frame, and a forged
-/// `NotificationCreated` would reach every connected client.
 #[test]
 fn a_system_event_name_is_refused() {
     for name in [
@@ -761,8 +653,6 @@ fn a_system_event_name_is_refused() {
     }
 }
 
-/// A frame the SSE route writes itself is refused too. A forged `Lagged`
-/// would make every connected client resync on an app's say-so.
 #[test]
 fn a_route_frame_name_is_refused() {
     for name in crate::core::event_subscription::frames::ROUTE_FRAMES {
@@ -773,12 +663,6 @@ fn a_route_frame_name_is_refused() {
     }
 }
 
-/// Regression: a `ThreadEvent` name is refused too.
-///
-/// Only `SystemEvent` names were, so one `emit_event("EventWaitStarted", ...)`
-/// wrote a permanent domain row whose `aggregate_id` was that literal string.
-/// The boot rebuild casts `aggregate_id::uuid`, so the row wedged it. Events
-/// are append-only, which makes the fix a boundary and never a cleanup.
 #[test]
 fn a_thread_event_name_is_refused() {
     for name in [
@@ -788,12 +672,8 @@ fn a_thread_event_name_is_refused() {
         "ResponseGenerated",
         "ToolCalled",
         "SessionStarted",
-        // Transient variants: never persisted as thread rows, but a domain row
-        // under the name poisons a future query just the same.
         "NavigationRequested",
         "CumulativeTextUpdated",
-        // Legacy serde aliases deserialize INTO their variant, so refusing the
-        // new spelling and allowing the old one leaves the forgery standing.
         "Thinking",
         "ClaudeCodeToolCalled",
     ] {
@@ -804,8 +684,6 @@ fn a_thread_event_name_is_refused() {
     }
 }
 
-/// Every name the deny lists carry is refused, with no gap between the list
-/// and the predicate that reads it.
 #[test]
 fn every_reserved_name_is_refused() {
     use crate::engine::event_bus::SystemEvent;
@@ -838,11 +716,6 @@ fn a_workspace_domain_name_is_accepted() {
     }
 }
 
-// ── the catalog ─────────────────────────────────────────────────────
-
-/// Write one row directly, the only way to stand up history no live emit can
-/// produce. `EventBus` refuses a retired name and never writes a transient
-/// frame, and both shapes sit in a store that has run through a rename.
 async fn insert_raw_event(pool: &sqlx::PgPool, event_type: &str) {
     sqlx::query("INSERT INTO events (id, event_type, payload) VALUES ($1, $2, $3)")
         .bind(Uuid::new_v4())
@@ -853,11 +726,6 @@ async fn insert_raw_event(pool: &sqlx::PgPool, event_type: &str) {
         .expect("seed a historical row");
 }
 
-/// **Every name the catalog offers is a name the validator accepts.**
-///
-/// A store carries the names of retired engine events, because the rows
-/// outlive the rename. Offering one would send the caller to a dropdown entry
-/// their next subscription refuses.
 #[tokio::test]
 async fn the_catalog_never_offers_a_name_the_validator_refuses() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -909,10 +777,6 @@ async fn the_catalog_never_offers_a_name_the_validator_refuses() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Waiting on a name and being allowed to emit it are different permissions.
-///
-/// Persisted system events became awaitable (ADR 0113), and the forge guard is
-/// deliberately untouched: every one of them is still refused here.
 #[test]
 fn a_name_that_became_awaitable_is_still_not_emittable() {
     use crate::engine::event_bus::SystemEvent;

@@ -1,6 +1,3 @@
-//! The SDK's copy of the engine constants a client must agree with. Generated,
-//! so no client restates one (ADR 0368).
-
 use std::fmt::Display;
 
 use lucidos_engine::codegen_inputs::command_guard::{
@@ -49,7 +46,6 @@ fn list(values: &[&str]) -> String {
     format!("[{}] as const", quoted.join(", "))
 }
 
-/// The file being written, and the engine source file its next exports copy.
 struct Writer {
     out: String,
     file: &'static str,
@@ -64,7 +60,6 @@ impl Writer {
         self.renamed(name, name, value);
     }
 
-    /// An export whose TS name differs from the engine constant it copies.
     fn renamed(&mut self, source: &str, name: &str, value: impl Display) {
         self.out.push_str(&format!(
             "/** `{source}` in `{}`. */\nexport const {name} = {value};\n\n",

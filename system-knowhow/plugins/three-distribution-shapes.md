@@ -154,7 +154,7 @@ If the recorded manifest has no `source`, the update returns an error rather tha
 
 - a path another installed plugin still records;
 - a path the new version ships under another case, since a case-insensitive volume such as the macOS default sees one file;
-- a path outside the seven content dirs;
+- a path outside the eight content dirs;
 - a `triggers/<slug>/trigger.toml`, which the trigger re-sync deletes together with the trigger (see "Shipping triggers");
 - a file already gone from disk.
 
@@ -191,15 +191,18 @@ A version that fails to parse (`compare_versions` with garbage on either side) c
 Uninstall stages a confirmation panel, just like install, and deletes nothing until the user confirms. The `plugins(action="uninstall", id)` tool (`prepare_uninstall_plugin`) and the Plugins panel's **Uninstall** button (`stage_uninstall_request`) open the same panel. Staging:
 
 - Resolves `id` (or the manifest `name`, or an owned `apps/<dir>` folder) and reads the newest `PluginInstalled` record.
-- Splits the recorded files into `files_present` and `files_missing`, and lists both in the panel. A recorded path outside the seven content dirs counts as missing, so the panel never offers it for deletion.
+- Splits the recorded files into `files_present` and `files_missing`, and lists both in the panel. A recorded path outside the eight content dirs counts as missing, so the panel never offers it for deletion.
 - Expires after 1 hour, like an install.
+
+For plugins with event hooks, only the owner can confirm. If an install
+changes the hook scope after staging, stage the uninstall again.
 
 **Confirm** (`confirm_pending_uninstall`, then `uninstall_with_bus`):
 
 1. Deletes each present file under `data/` and prunes empty parent folders. A content-dir root such as `data/apps/` always stays.
 2. Commits the deletion in one commit, `"Uninstall plugin: <id> v<version>"`.
 3. Emits `PluginUninstalled` with `files`, `files_deleted` and `files_missing`. A file that vanished between staging and confirm goes into `files_missing`.
-4. Deletes the triggers stamped with this plugin's id, and reloads WASM signers if an `auth-modules/` file went.
+4. Ends the armings of the plugin's hooks. Deletes its registered triggers and reloads WASM signers if an `auth-modules/` file went.
 
 The panel also lists every affected trigger under **Triggers that use these files**, from the staged `affected_triggers` (see "Affected triggers"). Uninstall leaves those triggers in place.
 

@@ -1,5 +1,3 @@
-//! Foundation types, event bus, and event projections.
-
 pub mod consumption_claim;
 pub mod continuation_reason;
 pub mod event_bus;

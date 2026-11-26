@@ -1,5 +1,3 @@
-//! Restored usage keeps historical attribution without pinning current billing.
-
 use crate::core::EventStore;
 use crate::runtime::agent_runtime::CodexUsageSnapshot;
 use serde_json::Value;
@@ -68,7 +66,6 @@ fn matching_provider<'a>(
             return None;
         }
     }
-    // Only providers the Codex evidence parser can establish are eligible.
     match capture["provider"].as_str()? {
         provider @ ("openai" | "chatgpt-plan") => Some(provider),
         _ => None,
@@ -189,7 +186,6 @@ mod tests {
                 .as_deref(),
             Some("openai")
         );
-        // A capture in this launch must not replace the historical candidate.
         let mut current = capture();
         current["provider"] = json!("chatgpt-plan");
         emit(current).await;
@@ -209,7 +205,6 @@ mod tests {
                 .await
                 .is_none()
         );
-        // An unbound process must not borrow an older process's session id.
         start_cc_session(&bus, thread_id, "test/codex-resume", None).await;
         emit(capture()).await;
         let unbound = Uuid::new_v4();

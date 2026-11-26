@@ -62,7 +62,14 @@ The schedule, provider, and retention are ordinary agent-settable preferences:
 |---|---|---|
 | `backup_schedule` | a 6-field cron, or `off` | When automatic backups run (user's timezone). `off` disables them. |
 | `backup_provider` | `google_drive` \| `dropbox` | Where to upload. Independent of `backup_schedule`: a destination stays configured with the schedule `off`, and the Backup page opens on it. The account itself is connected in **Settings → Accounts**, not here. |
-| `backup_retention` | `1`–`1000` | How many recent backups to keep; older ones are pruned after each success. The UI dropdown offers 1, 3, 5, 10, 20 and 50. |
+| `backup_retention` | `1`–`1000` | How many recent backups to keep; older backups from this copy are pruned after each success. The UI dropdown offers 1, 3, 5, 10, 20 and 50. |
+
+Every new archive is named
+`lucidos-backup-{name}-{YYYYMMDD-HHMMSS}-o{origin}.age` (`.enc` with a legacy
+backup key). The *backup origin* identifies the workspace copy that wrote it.
+Retention and the Backup page's latest cloud backup use that copy's archives.
+Archives without an origin remain available for restore and are kept by
+automatic retention.
 
 Set them with `preferences(action="set")`, for example `preferences(action="set", key="backup_schedule",
 value="0 0 3 * * *")` then `preferences(action="set", key="backup_provider",

@@ -1,5 +1,3 @@
-//! The outbound workspace-call route: who may call, and what verdict rides.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -13,7 +11,6 @@ use crate::test_support::{setup_test_db, teardown_test_db};
 
 type Seen = Arc<Mutex<Option<HeaderMap>>>;
 
-/// A stand-in gateway on loopback that records the headers of the call.
 async fn stand_in_gateway() -> (String, Seen) {
     let seen: Seen = Default::default();
     let record = seen.clone();
@@ -125,7 +122,6 @@ async fn with_no_gateway_the_caller_hears_to_post_directly() {
     teardown_test_db(&db).await;
 }
 
-/// The verdict is the calling thread's own, read from the verified token.
 #[tokio::test]
 async fn the_call_carries_the_calling_threads_verdict() {
     let _ = crate::api::gateway_stamp::test_support::stamp_for("d1");
@@ -186,7 +182,6 @@ async fn the_call_carries_the_calling_threads_verdict() {
     teardown_test_db(&db).await;
 }
 
-/// The CLI builds its URL with `workspace_call_path`, so the route matches it.
 #[tokio::test]
 async fn the_route_matches_the_path_the_cli_builds() {
     use tower::ServiceExt as _;
@@ -210,8 +205,6 @@ async fn the_route_matches_the_path_the_cli_builds() {
     assert_eq!(&body[..], b"work2");
 }
 
-/// The body names the mode, and nothing signs it, so a subprocess that
-/// claims `human` is sent as an agent.
 #[test]
 fn a_subprocess_never_calls_as_a_human() {
     let mode = |m: &str| subprocess_mode(&serde_json::json!({ "mode": m }));

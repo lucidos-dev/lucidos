@@ -1,10 +1,3 @@
-//! Persisted thread events and their cross-cutting metadata.
-//!
-//! Re-export barrel: every public item keeps its original
-//! `crate::engine::thread_events::*` path. The `ThreadEvent` enum lives in
-//! `event.rs` (its inherent `impl` in `event_impl.rs`); supporting types and
-//! the emit helpers are grouped by responsibility seam in the sibling modules.
-
 mod actor;
 pub mod affected_trigger;
 mod agent_exit;
@@ -52,7 +45,6 @@ mod triage;
 mod turn_end_facts;
 mod turn_origin;
 
-/// This event ages loaded knowhow when a turn finishes.
 pub const TURN_FINISHED_EVENT: &str = "ResponseGenerated";
 
 pub use crate::core::coding_agent::CodingAgent;
@@ -145,13 +137,11 @@ mod todo_tests;
 #[path = "../thread_events_tests/variants.rs"]
 mod variant_tests;
 
-/// A human follow-up makes a trigger thread attended. Both projection and
+/// INVARIANT: A human follow-up makes a trigger thread attended. Both projection and
 /// recovery bind `$2` from `ActorMode::Human`, including legacy missing modes.
 pub const HUMAN_MESSAGE_SQL: &str =
     "event_type = 'MessageReceived' AND COALESCE(payload->>'mode', $2) = $2";
 
-/// What the home thread is called when it is created. The user may rename it,
-/// and nothing else does.
 pub const HOME_THREAD_TITLE: &str = "Home";
 
 #[cfg(any(test, feature = "test-support"))]

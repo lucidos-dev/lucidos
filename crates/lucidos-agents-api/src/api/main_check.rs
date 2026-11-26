@@ -1,5 +1,3 @@
-//! The main check's routes (ADR 0464): read where it stands, and close a red.
-
 use super::actor::require_owner_device;
 use super::*;
 use crate::engine::event_bus::EventBus;
@@ -8,8 +6,6 @@ use crate::engine::MainCheckCloseRefusal;
 use axum::http::HeaderMap;
 use sqlx::PgPool;
 
-/// GET /api/v1/main-check: the main check as it stands. The same snapshot
-/// rides `GET /api/v1/changes` and every `ChangesUpdated` frame.
 pub(super) async fn get_main_check(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!(state.engine.main_check_snapshot()))
 }
@@ -27,7 +23,6 @@ pub(super) async fn close_main_check(
     close_answer(answer)
 }
 
-/// POST /api/v1/main-check/fix-now: start the owner's main repair now.
 pub(super) async fn fix_main_now(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -62,7 +57,6 @@ pub(super) async fn fix_main_now(
     }
 }
 
-/// Closing a red main check uses the owner-device gate.
 async fn require_maintainer(
     headers: &HeaderMap,
     pool: &PgPool,
@@ -71,8 +65,6 @@ async fn require_maintainer(
     require_owner_device(headers, pool, event_bus, None, "close the red main check").await
 }
 
-/// What Close answers once the maintainer asked. Pure, so every answer's
-/// status and slug are pinned.
 fn close_answer(
     answer: Result<(), MainCheckCloseRefusal>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -134,8 +126,6 @@ mod tests {
         assert_eq!(unread.reason, Some("main_check_state_unread"));
     }
 
-    /// ADR 0464: only the maintainer closes a red. The machine-local token is
-    /// what a script holds, and it once passed as an engine-mode API caller.
     #[tokio::test]
     async fn only_the_owners_device_may_close_a_red() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;

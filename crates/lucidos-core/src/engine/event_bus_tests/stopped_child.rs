@@ -1,10 +1,3 @@
-//! A user Stop on a child thread makes a *stopped child* (ADR 0252).
-//!
-//! The parent gets a `ChildThreadStopped` note and no turn. It is still owed
-//! a `ChildThreadCompleted`, which the child's next finished turn or a settle
-//! (Archive, Discard) delivers. Each test pins one invariant of
-//! `docs/plans/2026-09-23-stopped-child.md`.
-
 use super::super::ChildSettle;
 use super::*;
 use crate::engine::thread_events::CancelCause;
@@ -18,7 +11,6 @@ async fn count_events(pool: &PgPool, thread_id: Uuid, event_type: &str) -> i64 {
         .unwrap()
 }
 
-/// `(is_stopped_child, parent_callback_pending)` for `thread_id`.
 async fn read_stop_state(pool: &PgPool, thread_id: Uuid) -> (bool, bool) {
     sqlx::query_as(
         "SELECT is_stopped_child, parent_callback_pending FROM thread_summaries \
@@ -30,7 +22,6 @@ async fn read_stop_state(pool: &PgPool, thread_id: Uuid) -> (bool, bool) {
     .unwrap()
 }
 
-/// `(blocking_descendant_count, attention_descendant_count)` for `thread_id`.
 async fn read_descendant_counts(pool: &PgPool, thread_id: Uuid) -> (i32, i32) {
     sqlx::query_as(
         "SELECT blocking_descendant_count, attention_descendant_count \
@@ -50,7 +41,6 @@ async fn read_status(pool: &PgPool, thread_id: Uuid) -> String {
         .unwrap()
 }
 
-/// Settle the parent's own turn, so a wake would show as a status flip.
 async fn settle_parent(bus: &EventBus, parent_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
@@ -66,8 +56,6 @@ async fn settle_parent(bus: &EventBus, parent_id: Uuid) {
     .unwrap();
 }
 
-/// The incident. A Stop on a coding-agent child, with the idle the interrupt
-/// emits right after it, must leave the parent asleep with one note.
 #[tokio::test]
 async fn a_user_stop_on_a_coding_agent_child_notes_the_parent_without_waking_it() {
     let (pool, db_name) = setup_test_db().await;
@@ -78,8 +66,6 @@ async fn a_user_stop_on_a_coding_agent_child_notes_the_parent_without_waking_it(
     settle_parent(&bus, parent_id).await;
 
     emit_response_canceled_with_cause(&bus, child_id, CancelCause::UserStop).await;
-    // The interrupt's own idle. The marker is still set, so without the
-    // stopped-child gate this is what reached the parent as "completed".
     emit_cc_idle(&bus, child_id, false, None).await;
 
     assert_eq!(
@@ -112,8 +98,6 @@ async fn a_user_stop_on_a_coding_agent_child_notes_the_parent_without_waking_it(
     teardown_test_db(&db_name).await;
 }
 
-/// Same contract on the Lucidos Agent lane, which reaches `should_callback`
-/// through a different arm.
 #[tokio::test]
 async fn a_user_stop_on_a_chat_child_notes_the_parent_without_waking_it() {
     let (pool, db_name) = setup_test_db().await;
@@ -137,8 +121,6 @@ async fn a_user_stop_on_a_chat_child_notes_the_parent_without_waking_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// A cancel that Apply, Discard or Archive carried still reports as before:
-/// only `UserStop` pauses.
 #[tokio::test]
 async fn a_user_action_cancel_still_reports_a_cancellation_to_the_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -164,8 +146,6 @@ async fn a_user_action_cancel_still_reports_a_cancellation_to_the_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// A Stop the parent is owed nothing for says nothing. The marker is clear
-/// because this turn already reported, so there is no stopped child to make.
 #[tokio::test]
 async fn a_user_stop_after_the_turn_already_reported_is_silent() {
     let (pool, db_name) = setup_test_db().await;
@@ -197,8 +177,6 @@ async fn a_user_stop_after_the_turn_already_reported_is_silent() {
     teardown_test_db(&db_name).await;
 }
 
-/// The user types into the stopped child and it keeps working. Its next
-/// finished turn is what reports, exactly once, with the real status.
 #[tokio::test]
 async fn a_stopped_child_that_continues_reports_its_next_turn_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -243,10 +221,6 @@ fn input_read(started_turn: bool) -> ThreadEvent {
     }
 }
 
-/// The user sends a message mid-turn, then cancels the question the agent
-/// asked. The cancel is a Stop, but the agent then reads the queued message
-/// and starts a turn for it. That read is new work: the thread runs again and
-/// is no longer a stopped child.
 #[tokio::test]
 async fn a_queued_message_read_after_a_stop_ends_the_stopped_state() {
     let (pool, db_name) = setup_test_db().await;
@@ -298,8 +272,6 @@ async fn a_queued_message_read_after_a_stop_ends_the_stopped_state() {
     teardown_test_db(&db_name).await;
 }
 
-/// Archive and Discard are the acts that mean "done". Each sends the one
-/// canceled card the parent was owed and wakes it. A second settle is a no-op.
 #[tokio::test]
 async fn settling_a_stopped_child_sends_one_canceled_card_and_wakes_the_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -346,8 +318,6 @@ async fn settling_a_stopped_child_sends_one_canceled_card_and_wakes_the_parent()
     teardown_test_db(&db_name).await;
 }
 
-/// A settle on a thread that is not a stopped child does nothing, so the
-/// archive and discard paths can call it for every thread.
 #[tokio::test]
 async fn settling_a_thread_that_is_not_a_stopped_child_is_a_no_op() {
     let (pool, db_name) = setup_test_db().await;
@@ -369,9 +339,6 @@ async fn settling_a_thread_that_is_not_a_stopped_child_is_a_no_op() {
     teardown_test_db(&db_name).await;
 }
 
-/// A stopped child needs the user, so it counts toward its parent's
-/// attention. It must not count toward blocking, or archiving the parent
-/// would be refused. Both new work and a settle take it back out.
 #[tokio::test]
 async fn a_stopped_child_counts_toward_attention_and_never_toward_blocking() {
     let (pool, db_name) = setup_test_db().await;
@@ -405,7 +372,6 @@ async fn a_stopped_child_counts_toward_attention_and_never_toward_blocking() {
          reconciles the parent's attention count"
     );
 
-    // The boot rebuild is a separate SQL mirror of the same predicate.
     emit_thread_message(&bus, child_id, None, "once more").await;
     emit_response_canceled_with_cause(&bus, child_id, CancelCause::UserStop).await;
     sqlx::query("UPDATE thread_summaries SET attention_descendant_count = 0")
@@ -425,7 +391,6 @@ async fn a_stopped_child_counts_toward_attention_and_never_toward_blocking() {
     teardown_test_db(&db_name).await;
 }
 
-/// A Stop on a top-thread has no parent to tell, and changes nothing.
 #[tokio::test]
 async fn a_user_stop_on_a_top_thread_changes_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -448,8 +413,6 @@ async fn a_user_stop_on_a_top_thread_changes_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// ADR 0011's boot sweep re-fires a card that is the parent's last event. A
-/// sibling's later stopped note wakes nothing, so it must not hide that card.
 #[tokio::test]
 async fn a_stopped_note_does_not_hide_an_unprocessed_card_from_the_boot_sweep() {
     let (pool, db_name) = setup_test_db().await;
@@ -482,9 +445,6 @@ async fn a_stopped_note_does_not_hide_an_unprocessed_card_from_the_boot_sweep() 
     teardown_test_db(&db_name).await;
 }
 
-/// An agent cancelling its own child records the same `user_stop` cause as a
-/// person's Stop. It expects the canceled card and gets it: its actor says it
-/// is not the user.
 #[tokio::test]
 async fn an_agents_cancel_of_its_own_child_still_reports_a_cancellation() {
     let (pool, db_name) = setup_test_db().await;
@@ -524,9 +484,6 @@ async fn an_agents_cancel_of_its_own_child_still_reports_a_cancellation() {
     teardown_test_db(&db_name).await;
 }
 
-/// A cascade from the parent archives a stopped child without settling it.
-/// The archive clears the flag, so nothing keeps counting a child the user
-/// put away: not the badge, not the notice, not the worktree hold.
 #[tokio::test]
 async fn archiving_a_stopped_child_clears_the_flag() {
     let (pool, db_name) = setup_test_db().await;
@@ -553,9 +510,6 @@ async fn archiving_a_stopped_child_clears_the_flag() {
     teardown_test_db(&db_name).await;
 }
 
-/// A discard leaves a stopped child's event wait alone, and the wait wakes
-/// the child again. So a discard settles nothing then. An archive ends the
-/// wait, and settles.
 #[tokio::test]
 async fn a_discard_does_not_settle_a_stopped_child_that_holds_a_wait() {
     let (pool, db_name) = setup_test_db().await;
@@ -596,8 +550,6 @@ async fn a_discard_does_not_settle_a_stopped_child_that_holds_a_wait() {
     teardown_test_db(&db_name).await;
 }
 
-/// Deleting a stopped child is the user ending it too. The parent is told,
-/// in words that say what the user did.
 #[tokio::test]
 async fn deleting_a_stopped_child_sends_the_parent_a_canceled_card() {
     let (pool, db_name) = setup_test_db().await;

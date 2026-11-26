@@ -1,12 +1,7 @@
-//! An events row records what the trigger matcher read off its broadcast: the
-//! dispatch depth and the emitting trigger. A lagged scheduler replays the row
-//! and must decide exactly as the live frame did.
-
 use super::super::*;
 use super::*;
 use crate::engine::trigger_context::EVENT_TRIGGER_DEPTH;
 
-/// The two provenance columns of one row, read back as the matcher sees them.
 async fn stored_provenance(pool: &PgPool, event_id: Uuid) -> (Option<i32>, Option<String>) {
     sqlx::query_as("SELECT trigger_chain_depth, emitting_trigger_id FROM events WHERE id = $1")
         .bind(event_id)
@@ -15,7 +10,6 @@ async fn stored_provenance(pool: &PgPool, event_id: Uuid) -> (Option<i32>, Optio
         .unwrap()
 }
 
-/// Emit `event` as trigger `t-1`'s fire, at chain depth 2, and return the row.
 async fn emit_inside_a_fire(bus: &EventBus, event: BusEvent) -> Uuid {
     EVENT_TRIGGER_DEPTH
         .scope(2, bus.emit_as_trigger(event, Some("t-1".into())))
@@ -60,8 +54,6 @@ async fn a_thread_row_records_the_fires_depth_and_trigger() {
     teardown_test_db(&db).await;
 }
 
-/// A domain event dispatches at its variant's depth, not the frame's, so the
-/// row records the variant's.
 #[tokio::test]
 async fn a_domain_row_records_its_variants_depth() {
     let (pool, db) = setup_test_db().await;
@@ -84,8 +76,6 @@ async fn a_domain_row_records_its_variants_depth() {
     teardown_test_db(&db).await;
 }
 
-/// Outside any fire both columns stay `NULL`, which is how every older row
-/// reads too.
 #[tokio::test]
 async fn an_ordinary_row_records_nothing() {
     let (pool, db) = setup_test_db().await;

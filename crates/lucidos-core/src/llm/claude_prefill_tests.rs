@@ -23,8 +23,6 @@ fn text(role: &str, text: &str) -> Message {
     }
 }
 
-/// A turn's user message. A Tree turn leads with the snapshot's view block
-/// and two thread view rungs.
 fn user_message(tree: bool) -> Message {
     let mut blocks = Vec::new();
     if tree {
@@ -48,7 +46,6 @@ fn user_message(tree: bool) -> Message {
     }
 }
 
-/// The prior turn's tool pairs, which lead the messages of a resumed turn.
 fn resume_blocks() -> Vec<Message> {
     vec![
         text("assistant", "reading it"),
@@ -83,17 +80,14 @@ fn json(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("a body is JSON")
 }
 
-/// What the turn itself sent, as JSON.
 fn sent(request: &ClaudeRequest) -> Value {
     serde_json::to_value(request).unwrap()
 }
 
-/// The block a beat appends to the last message.
 fn beat_block() -> Value {
     serde_json::json!({"type": "text", "text": BEAT_PROMPT})
 }
 
-/// `message`'s content with the beat block after it.
 fn with_beat_block(message: &mut Value) {
     let blocks = message["content"].as_array_mut().expect("block content");
     blocks.push(beat_block());
@@ -131,7 +125,6 @@ fn the_whole_cut_is_the_turn_with_one_block_after_its_last_marker() {
     assert_eq!(markers(&whole), markers(&sent(&turn)), "markers kept");
 }
 
-/// `body` with the beat block taken out, as raw bytes.
 fn without_beat_block(body: &[u8]) -> Vec<u8> {
     let block = format!(",{}", beat_block());
     let text = std::str::from_utf8(body).expect("a body is UTF-8");
@@ -139,14 +132,10 @@ fn without_beat_block(body: &[u8]) -> Vec<u8> {
     text.replacen(&block, "", 1).into_bytes()
 }
 
-/// The turn's request as the bytes it sent.
 fn sent_bytes(request: &ClaudeRequest) -> Vec<u8> {
     serde_json::to_vec(request).unwrap()
 }
 
-/// A beat repeats the turn's bytes, key order included. A gateway can route
-/// on the raw body, so a key-sorted copy may reach a cache the turn never
-/// wrote (ADR 0581).
 #[test]
 fn the_whole_cut_sends_the_turns_own_bytes() {
     let turn = request(vec![user_message(true)], MODEL, "high");
@@ -201,8 +190,6 @@ fn a_forced_tool_keeps_its_tool_choice() {
     }
 }
 
-/// A first round marks every view block, so the stable cut ends at the
-/// stable-prefix end, and holds exactly the bytes the turn sent there.
 #[test]
 fn the_stable_cut_ends_at_the_stable_prefix_end() {
     let turn = request(vec![user_message(true)], MODEL, "high");
@@ -225,9 +212,6 @@ fn the_stable_cut_ends_at_the_stable_prefix_end() {
         .is_some());
 }
 
-/// The stable cut fingerprints like the turn: the same content, through the
-/// same block, whatever the markers. The beat block after it is no part of
-/// the stable prefix.
 #[test]
 fn the_stable_cut_matches_the_turn_fingerprint() {
     let turn = request(vec![user_message(true)], MODEL, "high");
@@ -255,9 +239,6 @@ fn the_stable_cut_matches_the_turn_fingerprint() {
     );
 }
 
-/// A resumed turn spends two markers on its newest messages, so its last
-/// view block goes unmarked. The cut stops at the last marked one, where
-/// the turn wrote an entry, rather than write one of its own.
 #[test]
 fn the_stable_cut_stops_at_the_last_marked_block() {
     let mut messages = resume_blocks();
@@ -309,9 +290,6 @@ fn a_resumed_turns_cut_already_has_a_marker_but_omits_a_view_block() {
     assert!(pair.stable.stable_prefix_fingerprint.is_some());
 }
 
-/// A Classic turn has no view blocks, so its stable prefix ends at the
-/// system block. The cut sends that, and one plain user message that ends
-/// with the beat block.
 #[test]
 fn a_classic_cut_ends_at_the_system_block() {
     let turn = request(vec![user_message(false)], MODEL, "high");
@@ -331,8 +309,6 @@ fn a_classic_cut_ends_at_the_system_block() {
     assert_eq!(stable["max_tokens"], sent["max_tokens"]);
 }
 
-/// Every parameter of the turn stays, so the beat shares its cache pool.
-/// With the budget under `max_tokens`, budget thinking beats too.
 #[test]
 fn budget_thinking_beats_with_its_budget_kept() {
     let turn = request(vec![user_message(true)], "claude-sonnet-4-5", "high");
@@ -350,8 +326,6 @@ fn budget_thinking_beats_with_its_budget_kept() {
     assert_eq!(whole["max_tokens"], sent(&turn)["max_tokens"]);
 }
 
-/// The beat block goes in the user's last message, so a request that ends
-/// on the assistant's has nowhere to put it.
 #[test]
 fn a_request_ending_on_the_assistant_never_beats() {
     let turn = request(

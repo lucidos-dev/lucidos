@@ -1,9 +1,3 @@
-//! What the `judge` handler does before and after the network call.
-//!
-//! Resolving the provider needs a key and a server. Everything either side of
-//! that is pinned here: the argument reading, the capture the call leaves
-//! behind, and the body the answers are rendered into.
-
 use std::collections::HashMap;
 
 use super::*;
@@ -32,8 +26,6 @@ fn a_question_the_agent_wrote_reads_into_the_wire_type() {
     assert!(ids.contains(&"urgent") && ids.contains(&"team"), "{ids:?}");
 }
 
-/// A malformed question names itself, so the agent can fix that one rather
-/// than guessing which of fifty it got wrong.
 #[test]
 fn a_malformed_question_is_refused_by_id() {
     let value = json!({
@@ -52,8 +44,6 @@ fn a_missing_or_empty_questions_object_is_refused() {
     assert!(empty.contains("empty"), "{empty}");
 }
 
-/// The whole distribution reaches the agent, not just the chosen option. A
-/// result carrying only `choice` would throw away the reason for the call.
 #[tokio::test]
 async fn the_rendered_body_carries_every_probability_and_the_counts() {
     struct Distribution;
@@ -123,8 +113,6 @@ async fn the_rendered_body_carries_every_probability_and_the_counts() {
     assert_eq!(body["answers"]["urgent"]["noul"], 0.31);
     assert_eq!(body["answers"]["team"]["probabilities"]["technical"], 0.4);
     assert_eq!(body["answers"]["team"]["confidence"], 0.55);
-    // A dropped answer is visible rather than silent: the model can see that
-    // one of the three questions it asked came back unreadable.
     assert_eq!(body["asked"], 3);
     assert_eq!(body["answered"], 2);
 
@@ -132,7 +120,6 @@ async fn the_rendered_body_carries_every_probability_and_the_counts() {
     teardown_test_db(&db_name).await;
 }
 
-/// A provider that answers after a delay the deadline in the test is shorter than.
 #[tokio::test]
 async fn a_judgment_past_its_deadline_fails_and_records_nothing() {
     struct Slow;
@@ -178,8 +165,6 @@ async fn a_judgment_past_its_deadline_fails_and_records_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// A judgment provider that answers nothing and reports a fixed cost. What the
-/// capture tests care about is the usage, which an empty answer set still has.
 struct CostlyStub;
 
 #[async_trait::async_trait]
@@ -204,8 +189,6 @@ impl JudgmentProvider for CostlyStub {
     }
 }
 
-/// The tool logged its token counts and dropped them, so an agent's own
-/// judgments were spend nobody could see.
 #[tokio::test]
 async fn the_judge_tool_records_what_the_judgment_cost() {
     let (pool, db_name) = setup_test_db().await;
@@ -235,8 +218,6 @@ async fn the_judge_tool_records_what_the_judgment_cost() {
     teardown_test_db(&db_name).await;
 }
 
-/// A call that never answered spent nothing here, because the provider errors
-/// before it reports usage. The tool's own failure path stays a failure.
 #[tokio::test]
 async fn a_failed_judgment_records_nothing_and_reports_the_error() {
     struct Failing;

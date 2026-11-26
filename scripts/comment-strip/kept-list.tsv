@@ -1618,7 +1618,6 @@ crates/lucidos-app/src/components/chat/scrollState.ts	3469e61ef443909f	keep	Re-w
 crates/lucidos-app/src/components/chat/scrollState.ts	3791e24c71af21fb	keep	Adding a settle guard to programmatic scroll would wrongly drop the focus marker.
 crates/lucidos-app/src/components/chat/scrollState.ts	37f60d3392ce69aa	keep	Agent start budget must cover slow cold-cache replies; shorter drops replies silently.
 crates/lucidos-app/src/components/chat/scrollState.ts	3c33f42eb547d611	keep	Both image checks needed; dropping one settles hold while images decode.
-crates/lucidos-app/src/components/chat/scrollState.ts	3e0d6a8d72cf3c16	keep	Clamp after shrink is not user scroll; dropping gesture check unparks wrongly.
 crates/lucidos-app/src/components/chat/scrollState.ts	3e5373d849559d53	keep	Both lapse call sites needed; deadline is wall-clock; one missing goes unnoticed.
 crates/lucidos-app/src/components/chat/scrollState.ts	42b228c3e07a6a58	keep	Must stay a signal so showScrollToBottom re-renders; a plain var breaks silently.
 crates/lucidos-app/src/components/chat/scrollState.ts	45168336bb5ed05c	keep	Platform moves and held writes must not end the ride; misclassifying them breaks landing.
@@ -1678,11 +1677,9 @@ crates/lucidos-app/src/components/chat/scrollState.ts	ce860ccc5eaf7272	keep	Corr
 crates/lucidos-app/src/components/chat/scrollState.ts	d4ecea8f69331c68	keep	Redundant tween cancels iOS momentum; a no-op write needs a manual reconcile.
 crates/lucidos-app/src/components/chat/scrollState.ts	d5b9b8062062d1a9	keep	Re-arming clears held stamp, silently switching what the landing records.
 crates/lucidos-app/src/components/chat/scrollState.ts	d780de7f0ad90d89	keep	Seed written only by the toggle; a scroll writing it cancels every future thread.
-crates/lucidos-app/src/components/chat/scrollState.ts	da9f6a52a07ceb3a	keep	Disarm must use the narrow predicate; the wide one retires the ride's own writes.
 crates/lucidos-app/src/components/chat/scrollState.ts	db02c8cb66e1bb10	keep	Releasing claim at scroll call lets competing scroll override landing; nothing else flags it.
 crates/lucidos-app/src/components/chat/scrollState.ts	dd4fc8a0b57bc88a	keep	Unmarked reveal reads as reader scroll; the self-write looks no-op but is the mark.
 crates/lucidos-app/src/components/chat/scrollState.ts	df1c1c0aa6c3460c	keep	Polling or notifying on release misses later claims; listener is required.
-crates/lucidos-app/src/components/chat/scrollState.ts	e0a12b46028e187f	keep	Ownership guard stops a stale deadline clearing a newer claim and un-guarding restore.
 crates/lucidos-app/src/components/chat/scrollState.ts	e0ddb5a545a9c966	keep	Growth rounds must re-ask, or a wake with no transcript is lost
 crates/lucidos-app/src/components/chat/scrollState.ts	e30f7e2581efb500	keep	Engine emits no MessageReceived for typed answers; the question-card branch depends on it.
 crates/lucidos-app/src/components/chat/scrollState.ts	e352e60a4b08e93b	keep	Resolve must stay claim-gated, unlike the landing line, or superseded calls resolve newer claims.
@@ -1961,46 +1958,26 @@ crates/lucidos-app/src/components/files/sideBySideDiff.tsx	6296fc8ad6efe04c	adr	
 crates/lucidos-app/src/components/files/sideBySideDiff.tsx	71298dcba77b778e	adr	Rejected similarity pairing; index pairing is the design choice.
 crates/lucidos-app/src/components/files/sideBySideDiff.tsx	84ce3d9fd8c67572	keep	Per-line highlighting breaks multi-line constructs; highlight the whole hunk at once.
 crates/lucidos-app/src/components/layout/ActivityMenuRows.tsx	72676892938a50da	adr	Module split and pure activityMenuGroup design choice.
-crates/lucidos-app/src/components/layout/ActivityMenuRows.tsx	cd3e92d155277ae8	keep	Toast captures focused pane at creation; focus must precede it.
-crates/lucidos-app/src/components/layout/AgentSandboxBanner.tsx	88df761856527679	keep	Opt-out must outrank unavailable; reversing silently hides the standing sandbox risk.
 crates/lucidos-app/src/components/layout/AgentSandboxBanner.tsx	d7a4a780c21e9548	adr	Rejects dismiss because bar retracts itself; design choice.
-crates/lucidos-app/src/components/layout/AppHeader.tsx	165266aa84cde8f0	keep	Pointerdown would shift focus during window drags; click avoids it.
-crates/lucidos-app/src/components/layout/AppHeader.tsx	24e60e81390dce2a	keep	MacOS traffic lights centre on this band; header layout changes misalign them silently.
 crates/lucidos-app/src/components/layout/AppHeader.tsx	360794c5ddcc1774	keep	Moving the gate inside the component re-runs the drag effect each render.
-crates/lucidos-app/src/components/layout/AppHeader.tsx	458b21a32291ea05	keep	Tauri drag regions need click, not pointerdown, or window drags move focus.
 crates/lucidos-app/src/components/layout/AppHeader.tsx	8896841835ce8176	keep	iOS edge gestures and iframe touch capture make the header the reliable swipe target.
-crates/lucidos-app/src/components/layout/AppHeader.tsx	f07d9870995f79a4	keep	Tab order follows DOM order; a reorder silently breaks keyboard navigation.
-crates/lucidos-app/src/components/layout/AppHeader.tsx	f616b343b43a322d	keep	Pointerdown would shift focus during window drags; click avoids it.
-crates/lucidos-app/src/components/layout/BackupReminderBanner.tsx	0c09ce4c942593f0	keep	ref must sit on the bar itself or ResizeObserver measures the wrong box
 crates/lucidos-app/src/components/layout/BackupReminderBanner.tsx	25b7830cb12dafff	keep	CSS matches this string; a shared or renamed property silently breaks banner clearance.
 crates/lucidos-app/src/components/layout/BackupReminderBanner.tsx	a545322b2238abb0	adr	Explains why the banner is persistent rather than a toast; a design rationale at subsystem level.
 crates/lucidos-app/src/components/layout/BrandBadge.tsx	29b290276aa53d87	adr	Explains one shared cap for both counts; a shared-constant rationale the code does not show.
-crates/lucidos-app/src/components/layout/BrandBadge.tsx	4b5cc9d642d6a07b	keep	Keyed remount works around iOS WebKit frozen animation; removing the key silently breaks it.
-crates/lucidos-app/src/components/layout/BrandBadge.tsx	9f4aa128a3273dcf	keep	tooltip on this badge would silently never fire; pointer-events passes taps through
-crates/lucidos-app/src/components/layout/BrandMenuRows.tsx	9ee4abe4e83ac138	keep	Bypassing openWhatsNew would leave a stale update target behind.
 crates/lucidos-app/src/components/layout/BrandMenuRows.tsx	c23acd999ef5dd63	keep	iOS keyboard needs focus inside the touch gesture; reordering the calls silently breaks it.
-crates/lucidos-app/src/components/layout/BrandMenuRows.tsx	d0b92dd350f25ebf	keep	Null anchor avoids a toggle race; naming the mark or removing the null reopens the palette bug.
 crates/lucidos-app/src/components/layout/BrandMenuRows.tsx	d3e2f3a0d82bfbea	keep	Focusing the prompt here raises the iOS keyboard behind the modal; adding focus breaks it.
 crates/lucidos-app/src/components/layout/BrandMenuRows.tsx	dfe43aa10d2bfe5e	keep	Unfolded state resets only because Overlay unmounts on close.
 crates/lucidos-app/src/components/layout/BrandMenuRows.tsx	f93521a0e6544454	keep	plain click avoids composeHandlers, which would raise the iOS keyboard
 crates/lucidos-app/src/components/layout/BrandMenuRows.tsx	f9e9b0e6b0e92cfc	adr	Explains role=none choice and pure-function design; the rationale is partly visible in the code.
 crates/lucidos-app/src/components/layout/ConnectionBanner.tsx	09665b9e8c2c33dd	adr	Keyed on the table for consistency; design rationale, not a line constraint.
-crates/lucidos-app/src/components/layout/ConnectionBanner.tsx	57c322265043cd04	keep	Dismiss control would hide a live fault; nothing else flags it.
-crates/lucidos-app/src/components/layout/ConnectionBanner.tsx	bc64c34ba279b7fe	keep	Connecting fuse must exceed poll interval or bar flashes on loads.
 crates/lucidos-app/src/components/layout/ConnectionBanner.tsx	ee1c2fbeffc16b9f	adr	Full detail reserved for the widest surface; layout design choice.
 crates/lucidos-app/src/components/layout/ConnectionBanner.tsx	f52b5314fc514921	adr	Mark placement pinned by e2e spec; design rationale, not a line constraint.
 crates/lucidos-app/src/components/layout/ContentHeaderActions.tsx	012dc3a2f2c58e5c	adr	Module design: phones pull-refresh, so Refresh shows only where it predates pull.
-crates/lucidos-app/src/components/layout/ContentHeaderActions.tsx	766b323f87f519cb	keep	Toggle must stay visible while wrapping; hiding it strands the reader.
-crates/lucidos-app/src/components/layout/ContentHeaderActions.tsx	89b7922ca88fa844	keep	WKWebView drops target=_blank; an anchor would silently do nothing.
 crates/lucidos-app/src/components/layout/ContentHeaderActions.tsx	a03e56d418447859	adr	Explains why the copy takes a prop rather than sniffing the DOM.
 crates/lucidos-app/src/components/layout/ContentHeaderActions.tsx	b4d7c404f9e8a5c7	adr	Shared list rendered by both menus, so they cannot diverge; design rationale.
-crates/lucidos-app/src/components/layout/ContentHeaderActions.tsx	dbba900935af4e93	keep	A dead anchor looks live; collapsing the platform branch hides breakage.
 crates/lucidos-app/src/components/layout/ContentNav.tsx	296e808d439d1b47	adr	Records why no group component exists; a rejected alternative, not a line constraint.
-crates/lucidos-app/src/components/layout/ContentPane.tsx	3a47e180a67dc9cc	keep	Per-view repaint was reverted for header-transform bursts; obvious fix reintroduces that bug.
 crates/lucidos-app/src/components/layout/ContentPane.tsx	3c33a294bea69af6	keep	Second mounted copy would register a duplicate repaint callback on resume.
 crates/lucidos-app/src/components/layout/ContentPane.tsx	5b4e4d385409fa58	keep	Fullscreen check must read live; render-time capture goes stale under a mount-once subscription.
-crates/lucidos-app/src/components/layout/ContentPane.tsx	669da5f90d3c9219	keep	Lazy-loading these would hide first paint; nothing flags eager import removal.
-crates/lucidos-app/src/components/layout/Drawer.tsx	7911f1d8eb06a8cf	keep	Gating on isTauri alone opens system browser on Browser row.
 crates/lucidos-app/src/components/layout/DrawerDivider.tsx	7eb19e7e71cbe427	adr	Records ADR 0056 clamp decision; widening end is the non-obvious part.
 crates/lucidos-app/src/components/layout/EdgeSwipeZones.tsx	0569a5a8592e552f	keep	Edge strips must stay topmost and match EDGE_NAV_GUARD constants; else gesture leaks.
 crates/lucidos-app/src/components/layout/HeaderMark.tsx	1fa35a2ad14b6ac2	adr	Why peer-count fetch lives on click, not on row expand.
@@ -2011,91 +1988,54 @@ crates/lucidos-app/src/components/layout/IngressBanner.tsx	30fc6fdcd7b5a783	adr	
 crates/lucidos-app/src/components/layout/IngressBanner.tsx	4926cdc134444cea	keep	Focus nudge shifts viewport on iOS; WebKit then drops the tap click.
 crates/lucidos-app/src/components/layout/IngressBanner.tsx	4ddf16bdbee97f58	keep	elRef must sit on the bar itself or ResizeObserver measures the wrong box.
 crates/lucidos-app/src/components/layout/IngressBanner.tsx	e071be60c0181bf5	keep	No fuse by design; copying connection bar's fuse delays outage news.
-crates/lucidos-app/src/components/layout/InlineForm.tsx	0072867fdcd50317	keep	Dropping defaultPrevented check lets one Escape wipe unsaved edits.
 crates/lucidos-app/src/components/layout/InlineForm.tsx	743cb2322f6d9f90	keep	Key must stay JSON-encoded; plain concatenation can collide and keep stale draft.
 crates/lucidos-app/src/components/layout/MobileAppHeader.tsx	2c2bb9623c40b902	adr	Explains why the mark bundles three controls and both drawers stay.
 crates/lucidos-app/src/components/layout/MobileAppHeader.tsx	5f19e9434c9aee4c	keep	Hiding dots while drawers are open traps users; nothing flags it.
 crates/lucidos-app/src/components/layout/MobileAppHeader.tsx	9853df3da15ff884	keep	Trailing cluster must stay two icon boxes or the fixed header span breaks.
-crates/lucidos-app/src/components/layout/MobileAppHeader.tsx	cbdc1029e30ac464	keep	iOS repaint compensation depends on this attribute; removing it glitches scrolling.
 crates/lucidos-app/src/components/layout/MobileAppHeader.tsx	d974f3856aa5c8d0	adr	Deliberately omits setup button on mobile; rejects a permanent icon.
 crates/lucidos-app/src/components/layout/MobileAppHeader.tsx	eef248eae89f9819	keep	Must stay inside scroll container and use sticky with app-header CSS vars.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	2d39b33f94f22bac	keep	Padding is iOS scroll slack; removing it lets iOS offset the header viewport.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	2eb7dfddf0a89471	keep	onWake must blur preserved focus, or the activeElementOpensKeyboard signal goes stale.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	30fd37352980213a	keep	Keyboard handoff must skip padding change, or content jumps by keyboard height.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	38c175c84e3be0c7	keep	Event-based flag misses DOM-removal focus loss; must re-derive from live focus.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	47ef2e14af280312	adr	Module-level ownership of track transform and transition; a design boundary.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	50f7211d116310ba	keep	Wake must blur ghost focus, write via computeAppHeight, and reset lastSetHeight.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	5aa90d75177bea40	keep	No CSS opt-out; must preventDefault on touchstart, not touchmove, or native swipe fires.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	6156d5de07d5e542	keep	Reflow flush stops next frame's style pass animating the snap; looks like dead code.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	618c1821e7e390fc	keep	WKWebView keeps keyboard-up touch geometry; relayout must run last.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	62dbcb45388f1175	keep	Edge-gesture suppression must keep running in fullscreen; gating it reintroduces back-swipe.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	63e98ea372f6fd4e	keep	Shrinking content moves no scrollTop, so only mutation observer detects hold changes.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	70ca7d9e9b95c662	keep	Must run after suppression, or native WebKit swipe survives a pseudo-fullscreen app.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	7fcc9f93bf11501c	keep	Poll must live here, or it restores app height and leaves a black band.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	82897de714594ed6	keep	Touchstart suppression must precede WebKit's edge recognizer, which commits before the 8px lock.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	941b0f34b0275605	keep	Band hold must drain, not regrow; otherwise scroll clamps and release lands elsewhere.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	9c6127f15fc2779b	keep	Re-announce guard stops focus-window reserve being wiped by full-height reading.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	a2b7b2b48bdec236	keep	Resume close must reach the fold, or the WKWebView touch bug returns.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	a5d4f41615e963cc	adr	Module-level architecture and desync rules; not per-line constraints.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	a87478b7b222a2fb	keep	Px, not rem: rem scaling pushed app shell past the viewport after UI-scale change.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	adbc22f49978557d	keep	useEffect would flash or slide the first render; must stay a layout effect.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	aea4d2272768f000	adr	Records rejected re-pin-to-bottom alternative; subsystem-level design choice.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	b1e7f1d9a6ac2fe4	keep	Frame-swipe bridge must post gone when a frame unloads, or the drag hangs.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	b350c56b88b0b088	keep	Guard must cover CSS edge zone; narrower leaks WebKit back-swipe to gateway.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	b465e3ba27a0d3b4	adr	One keyboard-aware reading site; writing raw innerHeight would hide prompt behind keys.
-crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	b52cdaa9f759c85b	keep	Slack must be seeded before focus; resize arrives too late for iOS.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	cced689300f04fa9	keep	Silent-close guard: without it, syncBand wipes the armed reserve in a live focus window.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	d153a9d68d89acee	keep	Platform quirk: focus change fires no event; stale flag blocks taps.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	e4f177ded19eeb87	keep	iOS Safari scrolls the document on keyboard open; the reset prevents layout shift.
 crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx	e967a4d9848da12b	keep	A row re-render mid-drag kills its touch; listeners must stay on the container.
 crates/lucidos-app/src/components/layout/NotificationsMenuRows.tsx	72456977c2c157d8	keep	Lifting unfold state to parent leaks stale state across reopens; unflagged.
-crates/lucidos-app/src/components/layout/NotificationsMenuRows.tsx	d476e9d94c11d424	keep	Gating preventDefault per row would bring back the native menu; nothing flags it.
 crates/lucidos-app/src/components/layout/NotificationsMenuRows.tsx	edbe51289dc2b697	adr	Explains why all rows share one alternate function; a design decision.
 crates/lucidos-app/src/components/layout/NotificationsMenuRows.tsx	f5a4e3961b34575e	adr	Module design: why rows exist; routing lives elsewhere.
-crates/lucidos-app/src/components/layout/OverlayLayer.tsx	2319eab6515cc373	keep	Forcing home under refresh prevents inert blocking the toast; nothing flags it.
-crates/lucidos-app/src/components/layout/OverlayLayer.tsx	2770ceaed698676b	keep	Warns appendChild drops focus; a silent regression if moveBefore is removed.
-crates/lucidos-app/src/components/layout/RefreshIndicator.tsx	2e82e7e7ec40eeef	keep	Disabled buttons lose tooltip hover; aria-disabled keeps it.
-crates/lucidos-app/src/components/layout/RefreshIndicator.tsx	da1217e1b0346410	keep	Must read overlay: preview clears its registration only after render.
 crates/lucidos-app/src/components/layout/SlownessBanner.tsx	0790e7179c5fd05a	adr	Design rationale: bar over toast, dismissal, dual mounts.
-crates/lucidos-app/src/components/layout/SlownessBanner.tsx	95541f35e3e89489	keep	Ref must sit on the laid-out box, or measured height is wrong.
 crates/lucidos-app/src/components/layout/SplitLayout.tsx	1d7c9bb7fef812a0	keep	Drawer must not write threadDrawerOpen, or it never returns.
 crates/lucidos-app/src/components/layout/SplitLayout.tsx	3746551277f795e6	keep	UI-scale change fires no window resize; observer is required.
-crates/lucidos-app/src/components/layout/ThreadFilterPanel.tsx	b60cf13a9de2a642	keep	Not Overlay: wrapping it would swallow outside clicks; Escape registration must stay.
 crates/lucidos-app/src/components/layout/ThreadFilterPanel.tsx	cb113789a71d8e22	keep	Toggle bypasses early-return; stale selection else makes click a no-op.
-crates/lucidos-app/src/components/layout/ThreadFilterPanel.tsx	d9b31ecb86ac2b71	keep	Pressed means open only; obvious filtered-pressed change is a silent UX bug.
-crates/lucidos-app/src/components/layout/ThreadFilterPanel.tsx	e6b2ac0e7b57b3ff	keep	Indeterminate is DOM-only; a JSX prop silently does nothing.
 crates/lucidos-app/src/components/layout/ThreadHeaderActions.tsx	004cd0913c436ad1	keep	Collapse must budget the indicator as the content row budgets the bell.
-crates/lucidos-app/src/components/layout/ThreadHeaderActions.tsx	97b06b7b440eb53b	keep	Anchor must be set so re-activation doesn't race outside-pointerdown dismiss.
 crates/lucidos-app/src/components/layout/ThreadHeaderActions.tsx	a50dc1cf45fb5452	adr	Design of progressive collapse and desktop-only scope.
 crates/lucidos-app/src/components/layout/ThreadHeaderActions.tsx	add6f6fa9de0b75b	adr	Fold order is a design choice; mistakes show in the layout.
-crates/lucidos-app/src/components/layout/ThreadPane.tsx	18847caf1aedcb54	keep	Height must be read before submit's deferred reset; that order is not shown here.
-crates/lucidos-app/src/components/layout/ThreadPane.tsx	1ae56db11922e93b	keep	Transitions and safety timer must use this base, or the speed slider fails.
 crates/lucidos-app/src/components/layout/ThreadPane.tsx	63e681bcc7be05a6	keep	Removing the body key remounts the prompt and breaks the FLIP measurement.
 crates/lucidos-app/src/components/layout/ThreadPane.tsx	880b72eb316baf32	keep	Every exit path must reset the deferred height or the textarea sticks tall.
 crates/lucidos-app/src/components/layout/ThreadPane.tsx	a2b184fff46e1a9a	keep	Prompt node must persist for useHideOnScroll; keys prevent diff pairing.
-crates/lucidos-app/src/components/layout/ThreadPane.tsx	af27c380c3ccaa2f	keep	Clearing height on position-only FLIP snaps drafts; autoResize owns height.
-crates/lucidos-app/src/components/layout/ThreadPane.tsx	bc8458efbb74a3a4	keep	Transforms block iOS Safari keyboard; skipping the slide is essential and unflagged.
 crates/lucidos-app/src/components/layout/ThreadsHeaderControls.tsx	4a5816fda1214e7a	keep	Font load can narrow clamped text; missing loadingdone listener leaves stale fit.
-crates/lucidos-app/src/components/layout/ThreadsHeaderControls.tsx	74ec6d686a111d31	keep	Accessible name and inert must stay; disclosure pattern breaks silently otherwise.
 crates/lucidos-app/src/components/layout/ThreadsHeaderControls.tsx	e4eae9b8d7eb3ab7	keep	Translucency must stay on the group; shell.css shapes must remain opaque.
-crates/lucidos-app/src/components/layout/UiBlockingOverlay.tsx	650be4f34e7a455e	keep	Tooltip z-index must stay above blocker, coupled to CSS; breakage is visually noticed.
-crates/lucidos-app/src/components/layout/UiBlockingOverlay.tsx	ed540acb133a53aa	keep	Capture phase is needed so shortcut handlers on document and window are blocked.
 crates/lucidos-app/src/components/layout/WebhookRefusalBanner.tsx	38b79ff8c5a578a0	adr	Records why this is a separate bar and mount strategy, citing an ADR.
 crates/lucidos-app/src/components/layout/WebhookRefusalBanner.tsx	aff0542fd49cd62b	keep	Empty focus nudge is deliberate for iOS; removing it reintroduces an iOS bug.
 crates/lucidos-app/src/components/layout/WebhookRefusalBanner.tsx	c0c22bfb138ee171	keep	Non-null assertion holds only inside show; moving it breaks silently at runtime.
-crates/lucidos-app/src/components/layout/WebhookRefusalBanner.tsx	de2c0f678f34bda8	keep	Bar must not be dismissable, or a live data loss gets hidden.
 crates/lucidos-app/src/components/layout/WebhookRefusalBanner.tsx	e071be60c0181bf5	keep	Each bar needs its own height var; sharing silently miscounts stacked header height.
 crates/lucidos-app/src/components/layout/WorkspaceActionRow.tsx	d3ea60088ef16534	keep	Colon in key prevents collision with a workspace slug; keyed diff reuses wrong node.
 crates/lucidos-app/src/components/layout/WorkspaceActionRow.tsx	eec9db2b5e2eb3e5	adr	Explains why the alternate mode is an inline row rather than a popover.
-crates/lucidos-app/src/components/layout/WorkspaceMenuRows.tsx	0a978890a10f70de	keep	role=none avoids orphan menu item; accessibility break invisible to editors.
-crates/lucidos-app/src/components/layout/WorkspaceMenuRows.tsx	454a4f2abef46867	keep	Removing !enginePending would invite refresh onto still-old engine via Tauri axis.
-crates/lucidos-app/src/components/layout/WorkspaceMenuRows.tsx	823e3f750b967286	keep	OK must re-check the ready version, or an unnamed version gets switched onto.
 crates/lucidos-app/src/components/layout/WorkspaceMenuRows.tsx	b19447d295ce10fe	keep	pointer-events none stops the badge stealing the row's tap.
-crates/lucidos-app/src/components/layout/WorkspaceMenuRows.tsx	b9e104c37ac46dcf	keep	Menu must close before modal opens; dismiss contract eats the first click.
 crates/lucidos-app/src/components/layout/WorkspaceNameLabel.tsx	314546919952f0d8	keep	Hidden label must stay in DOM or scrollWidth measurement reads zero.
 crates/lucidos-app/src/components/layout/WorkspaceNameLabel.tsx	de512e1f65537123	keep	Margin cannot be read back when hidden; constant must mirror shell.css.
-crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	1be86f0a8875504e	keep	Gating pill on label load reintroduces layout bounce; marker must trail.
-crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	218288b470390247	keep	Unhealthy rows must not open; opening lands in a dead shell.
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	3ca960a940c32ad6	keep	Menu must always close on switch; the toast is the only failure report
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	546ca71670a0f4fd	keep	Captured-once rule and null vs undefined sentinel; breaking either shows as skeleton glitch
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	5dcf119a8e9c991a	keep	Pill and list must share one name source or rename shows stale text.
@@ -2105,64 +2045,27 @@ crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	7e0f28b42d239d75	
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	814b76d6bc2816ab	adr	Rejects collapsing the two gates; browser suite would catch it.
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	871cab1ac8309254	adr	Module design: switcher versus picker split, rejected separate popover.
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	a6452fd59321ab2a	keep	Gateway origin and /~/ path must match serving layout; nothing else flags a break
-crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	b1da2029e7c3b37f	keep	Props are independent; dropping the recheck shows action on unhealthy rows.
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	b8fd0293d1bf5e08	keep	Chevron beside pill would ellipsise names; width budget is non-obvious.
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	c71f971b8bd982ea	adr	Fetch placed on expand, not menu open, to keep gateway traffic off other controls.
 crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	cdbda13d3c2d8961	keep	Tooltip-only errors need aria-label or assistive tech cannot reach them.
-crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx	df089101ee361c17	keep	role none on inert row with ARIA global attrs is contradictory; nothing flags it.
-crates/lucidos-app/src/components/layout/appBanner.ts	19e2a08d537241b5	keep	Measure-time rem read; captured value goes stale on UI scale change, nothing flags it
-crates/lucidos-app/src/components/layout/appBanner.ts	6716ca4310f46d56	keep	Both layouts mount; a missing viewport gate races two observers on one var
 crates/lucidos-app/src/components/layout/appBanner.ts	7d6ff7a95b15dd70	adr	Module-level rationale for shared banner logic and six banners
-crates/lucidos-app/src/components/layout/appBanner.ts	eb5a6b7df7cb8ce5	keep	Each banner needs its own var; shared var and teardown clearing prevent stale reservations
-crates/lucidos-app/src/components/layout/contentLanding.ts	c0076f0451a75198	keep	Claim lifetime per visit; re-asking after dismissal would silently misplace the reader
-crates/lucidos-app/src/components/layout/contentViewKey.ts	039da26f275a07cc	keep	Receipt marker must stay out of the key or the panel re-covers at completion
-crates/lucidos-app/src/components/layout/contentViewKey.ts	0bf0b9e208f25d45	keep	Key must ignore sentAt or the panel recovers scroll and re-covers on send
 crates/lucidos-app/src/components/layout/contentViewKey.ts	1bbf881f386bc923	adr	Justifies digest choice and tradeoffs for keys stored in localStorage
-crates/lucidos-app/src/components/layout/contentViewKey.ts	add28c3decf8af8c	keep	app-ui must stay one key; per-app keys would break its load cover.
 crates/lucidos-app/src/components/layout/contentViewKey.ts	b1ec958dfd908beb	adr	Explains why the view key must distinguish form types; design rationale
-crates/lucidos-app/src/components/layout/contentViewKey.ts	dc59f7c7bb0dce44	keep	Credential edit and new must not share a key or panels collide silently
-crates/lucidos-app/src/components/layout/dividerDrag.ts	dd22169637d80c70	keep	Browser sends fake move during capture; clamping it breaks double-click.
 crates/lucidos-app/src/components/layout/drawerState.ts	5b3d2319dc2a06aa	adr	Rejected far-side slide; desktop-left reasoning is design rationale.
-crates/lucidos-app/src/components/layout/drawerState.ts	5c65889a1613fec2	keep	Stale fallback timer could cut a later close short.
-crates/lucidos-app/src/components/layout/drawerState.ts	806fe14e6a395e3e	keep	Returning false keeps neighbor taps; reduced motion skips animationend, so closes at once.
-crates/lucidos-app/src/components/layout/drawnLayout.ts	146b3256b8df30b7	keep	Class must precede write or the pane animation is lost.
 crates/lucidos-app/src/components/layout/drawnLayout.ts	ccb64b8be91611c8	keep	Switching .value to .peek silently stops the fit toggle redrawing.
 crates/lucidos-app/src/components/layout/drawnLayout.ts	d2299d4f50620efd	keep	DOM reads inside the computed would go stale silently; measure outside it.
-crates/lucidos-app/src/components/layout/edgeTapReplay.ts	14eafaf4c91c6af5	keep	Lift must be read at document capture; re-render can strand the strip's touch.
-crates/lucidos-app/src/components/layout/edgeTapReplay.ts	396b3bb60adacc72	keep	Host cannot click into iframes; the SDK touch bridge owns them.
-crates/lucidos-app/src/components/layout/edgeTapReplay.ts	68a8126c4da2e2d6	keep	Focus must run inside the touchend gesture or iOS won't open the keyboard.
 crates/lucidos-app/src/components/layout/headerActions.tsx	0d44a40dcef5eb7f	adr	Design rationale for one shared record across three clusters.
-crates/lucidos-app/src/components/layout/headerActions.tsx	3606eae039be4732	keep	Popover openers must use onMenuClick; the menu row's anchor is gone.
-crates/lucidos-app/src/components/layout/headerActions.tsx	5fb4c6fdcbc66e60	keep	Keep aria-disabled: disabled attribute removes focus, stranding arrow-key navigation.
 crates/lucidos-app/src/components/layout/headerActions.tsx	9668e6ac0fa7fd37	keep	Custom render must spread attrs, or measurement and addressing break silently.
 crates/lucidos-app/src/components/layout/headerDblClick.ts	eb79b95bcfbbf692	keep	Divider formula mirrors shell.css; avoid closest('.threads-header') hit-testing, it misses the header sliver.
 crates/lucidos-app/src/components/layout/headerHelpers.ts	1dc945628f6dab49	adr	Design rule: one function yields both title forms, by intent.
-crates/lucidos-app/src/components/layout/headerHelpers.ts	d7900d31ec487b13	keep	Fallback looks dead but guards old persisted menu items with unknown names.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	17e27044d996607d	keep	Watch must carry intermediate heights; comparing only the previous reading silently loses the close.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	2d6d34df42a3e004	keep	Shrinking, not growing, avoids a scroll-offset clamp jump; the direction looks wrong.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	48bae90abae4a410	keep	Stamp-only guard swallows later resumes; both halves must share this window.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	5d2947b23ef9c890	keep	Echo must not arm a watch; folding it would cause a second close.
 crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	665fb0cbb2ba7c3e	keep	Echo window must stay short or a real reopen-close is lost silently.
 crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	8a42f3c94a36d4c9	keep	Caller must settle app-height before this reading, or the bounce starts wrong.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	96d4ef541e88d476	keep	iOS suspend fires no resize; must trust the caller, not a viewport reading.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	b180f3524ebe4be2	keep	iOS zero-height quirk; removing the guard silently fakes a keyboard cover.
 crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	cd7a3a487c3aff1f	keep	Must run after the handler writes app-height; a separate listener breaks the bounce.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	e430026cfae9cc77	keep	Blurring dismisses the keyboard and iOS blocks reopening; the offsetHeight read looks removable.
-crates/lucidos-app/src/components/layout/keyboardCloseRelayout.ts	e764385650887a51	keep	The no-op scroll looks dead but forces the layout viewport to recompute.
 crates/lucidos-app/src/components/layout/paneDrag.ts	7a2824c06255de38	adr	Module-level design: DOM-free, single lead, tested without a browser.
-crates/lucidos-app/src/components/layout/paneDrag.ts	c3981cabe2deb0ea	keep	Browser owns native pan on uncancelable moves; removing the check fights scroll.
-crates/lucidos-app/src/components/layout/paneDrag.ts	f453fcf5c7144743	keep	Non-passive touchstart is required for the edge gate to cancel.
-crates/lucidos-app/src/components/layout/paneDrag.ts	f68d436fa7c31133	keep	Frame must stay ignored until its own release; removing ignoredFrames breaks it.
-crates/lucidos-app/src/components/layout/paneFocus.ts	3b71fbeaa5cf97b7	keep	Force path must skip overlay check: data-overlay-open lingers a frame during teardown.
-crates/lucidos-app/src/components/layout/paneFocus.ts	62b9e7373cd1a1d8	keep	Anchoring on activeElement reintroduces Tab escape after pane clicks.
 crates/lucidos-app/src/components/layout/paneFocus.ts	6a533848349f3c55	keep	Dropping the tabindex=-1 exclusion makes the trap cycle removed buttons.
 crates/lucidos-app/src/components/layout/paneFocus.ts	89e914386b19d8fa	adr	Explains why the retry budget exists; a design rationale, not a line constraint.
-crates/lucidos-app/src/components/layout/paneFocus.ts	8a07efa43c43bcb4	keep	Stale-marker bail aborts Search Everywhere focus if marker assignment removed; silent.
-crates/lucidos-app/src/components/layout/paneFocus.ts	9be19c67ad176dd5	keep	Falling back to prompt on unloaded thread breaks transcript focus; nothing flags it.
-crates/lucidos-app/src/components/layout/paneFocus.ts	f14e49d275dcd34d	keep	Thread selector must stay scoped to .thread-view or retry loops forever.
 crates/lucidos-app/src/components/layout/paneFocus.ts	f293f917e05782d3	keep	Pointer-down misses iframe clicks; a replacement must catch them, or the marker goes stale.
 crates/lucidos-app/src/components/layout/splitHelpers.ts	18b256acf5abfc2a	keep	Must track CSS slow duration token; drift desyncs transitions silently.
-crates/lucidos-app/src/components/layout/splitHelpers.ts	81bbae7c76cee2c8	keep	Timer must outlive scaled transition; 100ms slack must stay unscaled or class drops early.
 crates/lucidos-app/src/components/layout/splitHelpers.ts	8668c94b1d776c6c	keep	Keyboard step must share the drag's clamp; divergence is unflagged.
 crates/lucidos-app/src/components/layout/unreadCountLabel.ts	b35a1a390db32e16	adr	Separate module so badge can import it without pulling menu rows into shell.
 crates/lucidos-app/src/components/layout/unreadCountLabel.ts	dd94035e04942288	adr	Chosen 99+ cap, not the bell's 999, to protect menu-row layout.
@@ -2283,12 +2186,9 @@ crates/lucidos-app/src/components/search/searchIndex.ts	fecee345f45e06bd	keep	An
 crates/lucidos-app/src/components/search/searchSections.ts	e45a5aef1d488d54	adr	Records why menu sorts last among tied sections.
 crates/lucidos-app/src/components/search/titleMatch.ts	718af401148c6678	keep	Rust parity; camelCase boundary absence is silent, non-obvious choice.
 crates/lucidos-app/src/components/search/titleMatch.ts	a808403deaa59d23	keep	Array order must match Rust enum; reordering silently breaks ranking.
-crates/lucidos-app/src/components/settings/AllowlistEditor.tsx	4341d8322e520c15	keep	Writing draft alone silently revokes agent-appended grants during re-read pause.
-crates/lucidos-app/src/components/settings/AllowlistEditor.tsx	61a7aaa45d96b70b	keep	Stale read would overwrite the draft; the guard must remain.
 crates/lucidos-app/src/components/settings/AllowlistEditor.tsx	dcc781f7499e7508	keep	Dirty flag would miss in-flight draft; counter is the only guard.
 crates/lucidos-app/src/components/settings/ApiKeyProviderSettings.tsx	cea0dcb33d787bd1	adr	Records page-level rationale for explainer placement, not a constraint.
 crates/lucidos-app/src/components/settings/BackupKeyPanel.tsx	13b8b419faf507e3	keep	Engine doesn't announce setup/verify writes; removing re-read leaves panel stale.
-crates/lucidos-app/src/components/settings/BackupKeyPanel.tsx	823af69007615c32	keep	Check must scan whole paste; secret can follow comment lines in key files.
 crates/lucidos-app/src/components/settings/BackupKeyPanel.tsx	a5bf38bd43c6dd34	adr	Module scope: engine never stores the backup key; shown once.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	0cbad6b04acc373d	keep	Bare JSX newline collapses the sentence; a formatting fix an editor would undo unseen.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	0d8436c15909afd6	keep	Background refresh must not reset loaded controls to skeletons; nothing flags that regression.
@@ -2301,7 +2201,6 @@ crates/lucidos-app/src/components/settings/BackupSection.tsx	67530eff1f1d40f7	ke
 crates/lucidos-app/src/components/settings/BackupSection.tsx	741d57537a91763e	keep	Claiming writes before await lets in-flight SSE refresh detect stale reads; ordering is unenforced.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	74b868189226a5de	keep	Writes counter must bump before grant so refresh cannot overwrite verdict.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	780640d8d9ece54a	keep	Silent refresh must not match mount path; local writes must win over reads.
-crates/lucidos-app/src/components/settings/BackupSection.tsx	78720f8711026951	keep	Engine flag lingers after terminal SSE; polling must continue until it clears.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	7d4a310d81b6a521	keep	Only failed writes roll back; rolling back on stale verdict would mislead.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	843fe208fbcc796c	keep	Closure captures stale render state; refresh must read live ref and write counter.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	933a3ffded8d8a6f	keep	Provider and schedule share one endpoint; in-flight write must lock both controls.
@@ -2311,7 +2210,6 @@ crates/lucidos-app/src/components/settings/BackupSection.tsx	c8014a6ff94c6383	ke
 crates/lucidos-app/src/components/settings/BackupSection.tsx	cf57d0fa0329aeee	keep	Write carries schedule; guard must stay even if dropdown disabled.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	d57adb36c109fe8a	adr	Explains placing the setup offer at rest, not in the explainer.
 crates/lucidos-app/src/components/settings/BackupSection.tsx	ea0f94d83b60523d	keep	Endpoint writes both keys; sending other schedule value silently changes it.
-crates/lucidos-app/src/components/settings/BackupSection.tsx	ea89e4f614805ceb	keep	Unknown status must answer no: loadStatus resets to loading, causing offer flash.
 crates/lucidos-app/src/components/settings/ChatGptPlanSettings.tsx	3920820a6257cd2b	keep	Pause expiry needs a re-read timer; nothing else triggers it, and device clock must not drive it.
 crates/lucidos-app/src/components/settings/CodingAgentBinariesSection.tsx	67b512009fa78636	keep	Stale slow fetch could overwrite fresher reload; nothing flags it
 crates/lucidos-app/src/components/settings/CodingAgentBinariesSection.tsx	bce3ee336d188249	adr	Explains live detection over persisted paths for the whole section
@@ -2343,24 +2241,17 @@ crates/lucidos-app/src/components/settings/JudgmentModelRow.tsx	b6fa5384e2a4a35a
 crates/lucidos-app/src/components/settings/KeyboardShortcutsSection.tsx	b2239def43d1810a	keep	Capture phase must stay, or Escape dispatcher or other listeners fire.
 crates/lucidos-app/src/components/settings/LocalProviderSettings.tsx	3b9d58f41b28d1a1	keep	Re-arm must match Save's trim test, or stale draft gets written back.
 crates/lucidos-app/src/components/settings/LocalProviderSettings.tsx	49f289f307baf1aa	keep	Engine subscriber must keep watching local_base_url, or edits need restart.
-crates/lucidos-app/src/components/settings/MarketplacesSection.tsx	875d7b9f7aa1c833	keep	URL is identity: engine hashes it, so editing it changes the marketplace.
 crates/lucidos-app/src/components/settings/MarketplacesSection.tsx	a009a2fe61cc0af6	keep	iOS focuses only inside a user gesture; the field must always exist.
-crates/lucidos-app/src/components/settings/McpServersPage.tsx	0e444f508f62a05c	keep	Off-then-on per tool does not commute; requests must serialize.
 crates/lucidos-app/src/components/settings/McpServersPage.tsx	1b180ffa5c2659c7	keep	Start is deliberately not optimistic; spawn can fail after showing running.
 crates/lucidos-app/src/components/settings/McpServersPage.tsx	3c196cdac6185656	adr	Explicit skeleton prop keeps the row pure and testable.
 crates/lucidos-app/src/components/settings/McpServersPage.tsx	b3a274e38fe2c403	adr	One builder for real and skeleton markup; a design choice.
-crates/lucidos-app/src/components/settings/McpServersPage.tsx	ba00d38e7ffbc0e1	keep	Every list fetch must take the next epoch as it starts.
 crates/lucidos-app/src/components/settings/McpServersPage.tsx	c67b784d168c0eb2	adr	Design choice: one response for all figures keeps header and rows consistent.
 crates/lucidos-app/src/components/settings/MemoryChoice.tsx	f3b28493b109df9f	keep	Compactor cap must match the press cap; nothing enforces it.
 crates/lucidos-app/src/components/settings/MemoryInspector.tsx	ccff11f27f2262c8	keep	Only the newest entries read may land; stale reads would overwrite.
-crates/lucidos-app/src/components/settings/MemoryModuleSection.tsx	2d9a9b24388430bd	keep	Unset must still write classic; else the choice prompt returns.
 crates/lucidos-app/src/components/settings/MemoryModuleSection.tsx	356697f72b13a212	keep	Anchor string must match the Models page id; nothing checks it.
 crates/lucidos-app/src/components/settings/MemoryModuleSection.tsx	c3489e9f30bbcc87	keep	Gating this read on Tree would hide whether a backfill resumes.
-crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	02032b830d7cd976	keep	Rebuilding the engine-verified serve URL can silently change the string.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	0597b70c9df69908	keep	Never use funnel: the engine has no inbound auth, so public exposure is unsafe.
-crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	08030fc2f4a43d3f	keep	Reader arrival must not answer the gateway-port question; merging the predicates advertises a dead address.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	190901a6a6dfb7cd	keep	Off Tauri, openExternal throws synchronously; a .catch fix silently breaks mobile taps.
-crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	1a6ff595d3215317	keep	Never compose https; only gateway or engine can prove cert trust.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	37a6f6bb0498f599	keep	Must stay ungated: devices lacking Tailscale need this row without the Tauri bridge.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	3b43bf923a6c656e	adr	Explains why lanUrl is silenced under a tailnet-pinned bind.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	3c086ffd9c4ad663	keep	Terminal-frame race: without this fallback the badge spins forever on a finished run.
@@ -2369,17 +2260,13 @@ crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	592022a77fe5b686
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	6717f0b415c1d09d	keep	Layout effect must run before passive clear, or search hit misses opening the section.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	689c0f6f8964134f	adr	Explains independence of concerns across proofs; a design structure, not a line constraint.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	7cdf4571777f2e37	adr	Design rationale for keeping the device list and Revoke here.
-crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	7fa344a1cdb90be0	keep	Do not match bare 100.64/10; that CGNAT range proves nothing about tailnet membership.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	89b124f8a58a8376	keep	Row url carries the workspace path; swapping it in would leak the path.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	8df554b4a3c2d750	keep	Shell must render while loading: a search anchor waiting on a fetch is missed.
-crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	90376f4c65e3fd69	keep	Serve URL must not be bind-gated; loopback default would silently lose it.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	9acc18f013224f5c	keep	Pass location.hostname, never location.host; the port breaks the .ts.net check silently.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	a7237dd133199d0a	keep	Platform-gating this read removes the browser's only concern-1 source, silently.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	b83d94aad0821349	keep	Notification points at this position; moving the section breaks that link.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	c2742737086b1c8f	adr	Page-level section order and always-rendered design, following setup sequence.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	c412a12ed3b3f844	keep	Gating the MagicDNS read to desktop silently removes the browser's only tailnet name.
-crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	d6fd6d3ac82b6ee1	keep	Standalone branch must precede secureContext check; reordering wrongly prompts installed apps.
-crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	ebcfa25a0b1e7036	keep	Rows must stay workspace-scoped; bare gateway origin silently breaks multi-workspace installs.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	f721209bcf6b5e37	keep	tskey enrolls nodes; keeping rejected key on screen exposes a live credential.
 crates/lucidos-app/src/components/settings/MobileAccessPage.tsx	fd7d812d6de17d8a	adr	Explains why reachability logic is one shared unit.
 crates/lucidos-app/src/components/settings/ModelRoutesEditor.tsx	51ce381e1e006c05	adr	Design choice: builtins take route edits; routes are not identity.
@@ -2388,7 +2275,6 @@ crates/lucidos-app/src/components/settings/ModelSelectionRow.tsx	c12ebd306cde5dd
 crates/lucidos-app/src/components/settings/ModelsManager.tsx	05fc1eb85bf61d83	adr	Explains grouping over a flat list and keeping retired builtin rows.
 crates/lucidos-app/src/components/settings/ModelsManager.tsx	57deb3309b604230	keep	Window is per backend; routes[0] shows the wrong one once preferred differs.
 crates/lucidos-app/src/components/settings/ModelsManager.tsx	79a9f8f4ea0500d8	adr	Shared row keeps retired models deletable; design rationale for one unit.
-crates/lucidos-app/src/components/settings/NetworkAccessPage.tsx	0369be14694186f4	keep	Anchor must render on mount; async appearance is missed by scroll effect.
 crates/lucidos-app/src/components/settings/NetworkAccessPage.tsx	b2e77ce781ae3642	adr	Explains why the bind control lives in the picker.
 crates/lucidos-app/src/components/settings/OpenCodeFreeSettings.tsx	722e7772ebf64d8c	keep	Privacy terms must sit beside the toggle; nothing flags moving them.
 crates/lucidos-app/src/components/settings/OpenCodeFreeSettings.tsx	b04627aa4d094e1d	keep	Bare read is the subscription; removing it silently stops re-renders.
@@ -2404,12 +2290,8 @@ crates/lucidos-app/src/components/settings/PairingRequestsSection.tsx	2777db83eb
 crates/lucidos-app/src/components/settings/ProviderBlock.tsx	10634d519e3cb883	keep	Coupled to engine ProviderKind and preference key suffix; TS won't catch drift.
 crates/lucidos-app/src/components/settings/ProviderBlock.tsx	2ebdff5bdc9eda19	keep	Hold must outlast probes; riding duration-scale snaps the switch back.
 crates/lucidos-app/src/components/settings/ProviderBlock.tsx	74260d56547f6d59	keep	Off must never clear the stored key; a parked key is lost silently
-crates/lucidos-app/src/components/settings/ProviderBlock.tsx	799dbf217302af30	keep	Derived-only switch would spring back; the held press is required.
-crates/lucidos-app/src/components/settings/ProviderBlock.tsx	bad21c7f1f5460ce	keep	savePreference toasts and never rejects, so a catch-based revert never fires.
-crates/lucidos-app/src/components/settings/ProviderBlock.tsx	de65543092e67f5d	keep	Timeout on local hold would hide key field mid-setup.
 crates/lucidos-app/src/components/settings/ProviderBlockFrame.tsx	4b8baed1059cc40f	adr	Module rationale for sharing one frame across two derivations.
 crates/lucidos-app/src/components/settings/ProvidersPage.tsx	1a5032fb4c972cb3	keep	Bare read is the subscription; a linter may strip it and reactivity stops silently.
-crates/lucidos-app/src/components/settings/ReleaseNoticesPage.tsx	8139a3697f566d9f	keep	Failed load must stay checked first, or errors show as all-clear.
 crates/lucidos-app/src/components/settings/ReleaseNoticesPage.tsx	aa8b4f4fbf6e62b2	adr	Design rationale for separating owed and answered rows on the page.
 crates/lucidos-app/src/components/settings/ReleaseNoticesPage.tsx	c7125339a075e291	adr	Records list-ordering choice; matches other release-keyed Settings lists.
 crates/lucidos-app/src/components/settings/ReleaseNoticesPage.tsx	ebd2efcb4411de8e	keep	Answered rows must keep a live action; greying them out reads as done.
@@ -2423,7 +2305,6 @@ crates/lucidos-app/src/components/settings/RetainedRestoreSources.tsx	7ca91ccfef
 crates/lucidos-app/src/components/settings/SettingsHome.tsx	115a3dde964d5a1a	adr	Eager load avoids chunk waits; all nav items show on every platform.
 crates/lucidos-app/src/components/settings/SettingsHome.tsx	5d3b1c3fb2e1b5ba	keep	Calling per row would spend the attention read early.
 crates/lucidos-app/src/components/settings/SettingsNavRow.tsx	286e198586f694d9	adr	Shared row keeps the accessibility contract in one place.
-crates/lucidos-app/src/components/settings/SettingsNavRow.tsx	7bf506862d0e09c8	keep	Div would drop keyboard access; nothing flags the regression.
 crates/lucidos-app/src/components/settings/SettingsView.tsx	0e4d5af9d89d4866	keep	Keying by service_name collides api-key and oauth_client rows; nothing flags it.
 crates/lucidos-app/src/components/settings/SettingsView.tsx	13c33a64327d52a1	adr	Degrades to empty list rather than error: a page-level design choice.
 crates/lucidos-app/src/components/settings/SettingsView.tsx	17f965c4288ab963	keep	Stale scopes reused for another provider; nothing flags it.
@@ -2455,7 +2336,6 @@ crates/lucidos-app/src/components/settings/SystemPage.tsx	db7e508e9ee8746b	keep	
 crates/lucidos-app/src/components/settings/SystemPage.tsx	ee17f0b1c1ffa74d	adr	Explains how panels map to submenu and subview; module-level structure.
 crates/lucidos-app/src/components/settings/SystemSubmenu.tsx	0f511bac952d577b	keep	A union badge would dot a row whose destination has no work.
 crates/lucidos-app/src/components/settings/ThemePicker.tsx	1018cd4d6a933b51	keep	Style values rely on loader sanitising; unsanitised CSS values would inject.
-crates/lucidos-app/src/components/settings/ThemePicker.tsx	4a35fbaff446bef8	keep	Non-obvious rounding: nearest-rounding would skip cards at clamped ends.
 crates/lucidos-app/src/components/settings/ThemePicker.tsx	55e2ccd2b7f82fc8	adr	Component overview with design rationale; mostly describes behaviour.
 crates/lucidos-app/src/components/settings/TitleStyleRow.tsx	53d71d257eeb07dd	keep	Effect must re-arm, or the field silently ignores later server frames.
 crates/lucidos-app/src/components/settings/TreeBackfillConfirm.tsx	05f7d406894fb0bd	keep	Nothing may spend before Start; an auto-start would spend silently.
@@ -2465,13 +2345,9 @@ crates/lucidos-app/src/components/settings/VoiceSection.tsx	83064d8507c8e664	adr
 crates/lucidos-app/src/components/settings/VoiceSection.tsx	b04627aa4d094e1d	keep	Bare preferences.value read is the subscription; removing it freezes the picker.
 crates/lucidos-app/src/components/settings/VoiceSection.tsx	e2037c6a27c02d68	keep	Empty resident list is meaningful; defaulting it would silently re-enable sections.
 crates/lucidos-app/src/components/settings/WebhookSignatureFields.tsx	16c5dedf053abe3c	adr	Why presets and raw fields are one component; design rationale.
-crates/lucidos-app/src/components/settings/WebhookSignatureFields.tsx	70b0043adbb41221	keep	Trimming would silently alter the secret; engine refuses whitespace by name instead.
 crates/lucidos-app/src/components/settings/WebhookSignatureFields.tsx	ce88018310e27010	keep	Default source would silently rotate a working secret nobody asked to replace.
-crates/lucidos-app/src/components/settings/WebhookSignatureFields.tsx	dfc5a379d2f9695f	keep	Trimming would silently change the secret; the engine's named refusal is the intended check.
 crates/lucidos-app/src/components/settings/WebhooksPage.tsx	0f32fa0d91b91b36	keep	One shared clock: per-row reads desync rows and freeze elapsed labels.
-crates/lucidos-app/src/components/settings/WebhooksPage.tsx	4040c22b8e3e61ce	keep	Token shows once; auto-dismiss would lose the only copy.
 crates/lucidos-app/src/components/settings/WebhooksPage.tsx	48976f43d27f5f34	keep	Update path must drop token when adding signature; verify needs one verifier.
-crates/lucidos-app/src/components/settings/WebhooksPage.tsx	4b935dabd2ab4433	keep	Action keeps toast open; duration 0 means dismiss at once, not never.
 crates/lucidos-app/src/components/settings/WebhooksPage.tsx	50d09071adc0a398	keep	Reading the signal is the SSE subscription; copying it silently stops freshness.
 crates/lucidos-app/src/components/settings/WebhooksPage.tsx	76cada1d304f66cc	keep	Keeps the form outside the fade so a reload cannot wipe typed input.
 crates/lucidos-app/src/components/settings/WebhooksPage.tsx	9e9420f9b92ba4a9	keep	Enter must not submit from the signature section: half-filled config.
@@ -2482,68 +2358,42 @@ crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	1c228d2c8bd6191d	kee
 crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	2a2825b727c3a19b	adr	Target release wins when visible; opening the running release would answer the wrong question.
 crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	3ed4e17e0bc0169d	keep	Derive per render; seeding useState collapses all releases if health answers late.
 crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	4321456a0787db8b	adr	Explains why the newer status exists; subsystem design.
-crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	79ca8edcd56981e0	keep	Version must come from heading; build id shows silently on dev.
 crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	7a2f42cb4b74dd01	adr	Rationale for passing a rendered node; design choice.
-crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	894fb48b9175487f	keep	Bare true argument; default would offer a wrong Check for Updates action.
 crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	cf23cf691be8f7aa	keep	Signal-held target re-opens rows and fights toggles; subtle, unflagged.
 crates/lucidos-app/src/components/settings/WhatsNewPage.tsx	daf108c9473e03c1	keep	Deep-link scroll silently no-ops if attribute changes; nothing flags it.
 crates/lucidos-app/src/components/settings/backgroundModels.ts	08ebbd95c9d53a5e	keep	Adding a provider step would be silently dropped; nothing flags it.
-crates/lucidos-app/src/components/settings/backupProviderScopes.ts	61aef7f2223c7beb	keep	Scope list must match engine GRANT_SCOPES; mismatch degrades silently.
 crates/lucidos-app/src/components/settings/backupProviderScopes.ts	846fd7d1d00e85a1	adr	Rejects re-mapping missing scopes in UI; a second answer would drift.
 crates/lucidos-app/src/components/settings/backupProviderScopes.ts	e4e7f0962773f26f	keep	Copy claims must track engine encryption and scope behaviour; drift misleads users.
-crates/lucidos-app/src/components/settings/backupSeeding.ts	4618ef7136da787f	keep	Deciding from the first-settled read caused a real provider override bug.
-crates/lucidos-app/src/components/settings/backupSeeding.ts	5ce691953e81cdda	keep	Unknown schedule must not default to off; silently disables nightly backup.
 crates/lucidos-app/src/components/settings/backupSeeding.ts	7e0a2e670ab1a107	adr	Explains why seeding decision lives in one shared module.
-crates/lucidos-app/src/components/settings/backupSeeding.ts	ea086d9b2cf37c12	keep	Stale out-of-order or mid-action results would apply silently; guards not obvious.
 crates/lucidos-app/src/components/settings/chatgptPlanView.ts	737c48f4f6bf7969	keep	Stopping a pending sign-in must not sign the user out.
 crates/lucidos-app/src/components/settings/claudeGatewayView.ts	737c48f4f6bf7969	keep	Stopping a pending sign-in must not sign the user out.
 crates/lucidos-app/src/components/settings/communicationSamples.ts	73ae52900eaacaa8	keep	Merging sentences would send users to the wrong fix; nothing flags it.
 crates/lucidos-app/src/components/settings/communicationSamples.ts	91ebab22f60d1290	keep	synthetic version must not collide with shipped RELEASE file
 crates/lucidos-app/src/components/settings/communicationSamples.ts	e5540c321a959cfe	adr	Module purpose; the inert rule is guarded by a test.
-crates/lucidos-app/src/components/settings/deviceList.ts	7284125d486f5b55	keep	Checking raw id instead of displayed name silently stores derived name as real name.
-crates/lucidos-app/src/components/settings/deviceList.ts	be4f2a271dd6bd25	keep	Wording must not claim the device never opened this workspace; nothing flags falsehood.
 crates/lucidos-app/src/components/settings/deviceList.ts	e80ef4147a7fa249	adr	Design rationale for summary copy; not a constraint on these lines.
 crates/lucidos-app/src/components/settings/deviceList.ts	fd12e2b03095e376	adr	module-level reason for merging two device lists
 crates/lucidos-app/src/components/settings/intelligenceLadder.ts	2889b16d14c323c0	keep	Storing shipped ladder would freeze preference and block future refreshes; nothing flags it.
 crates/lucidos-app/src/components/settings/judgmentBackend.ts	26e2da453f9c3661	keep	Coupling to engine default logic; pinned chat model must not move default.
 crates/lucidos-app/src/components/settings/judgmentBackend.ts	4d489a8dae7e7016	keep	Coupling: regex must match engine's workers_ai_url parser.
-crates/lucidos-app/src/components/settings/judgmentBackend.ts	71c0b008c671cc20	keep	Restore-on-switch-back and both-halves rules are unflagged; reverting them breaks silently.
 crates/lucidos-app/src/components/settings/judgmentBackend.ts	8193a27178c6a1f1	keep	Ids must not collide with real models; pick detection depends on it.
 crates/lucidos-app/src/components/settings/judgmentBackend.ts	9146b5fa95503aa4	keep	Default must match engine's default_endpoint; nothing flags divergence.
 crates/lucidos-app/src/components/settings/judgmentBackend.ts	b8dd3e4641bd3ac1	keep	Picked row must stay offered; env key is invisible, else selection breaks.
-crates/lucidos-app/src/components/settings/judgmentBackend.ts	daebf24f5d87f2e9	keep	TypeSafe listed on key alone is intended; fixing it reintroduces a bug.
-crates/lucidos-app/src/components/settings/mcpCost.ts	844dbc91d2968f4a	keep	Bans deriving token figures; past 205k to 361k misreport.
-crates/lucidos-app/src/components/settings/mcpCost.ts	e4364f7d4e460e69	keep	Forbids recomputing totals on optimistic patch; nothing flags it.
-crates/lucidos-app/src/components/settings/mcpToolIntents.ts	660a00a4b1729693	keep	Engine's acked state must win over stale intents; dropping the check reintroduces bug.
 crates/lucidos-app/src/components/settings/mcpToolIntents.ts	da71fcd367a9b8e0	adr	ADR-referenced definition of pending intent fields.
-crates/lucidos-app/src/components/settings/oauthConnectForm.ts	07b9d0cb295d66db	keep	Passing granted scopes makes Reconnect unable to recover lost scope.
 crates/lucidos-app/src/components/settings/oauthConnectForm.ts	1a38ab596204c401	adr	Explains why this file is its own module.
 crates/lucidos-app/src/components/settings/oauthConnectForm.ts	2a55c6d52b1717cc	keep	Must match engine's missing_requested_scopes; meta scopes need evidence, not echo.
-crates/lucidos-app/src/components/settings/oauthConnectForm.ts	bfa9048d76cd9343	keep	Some providers omit meta scopes from echo; absence proves nothing.
-crates/lucidos-app/src/components/settings/oauthConnectForm.ts	fd5aef98e822e149	keep	Strict false check; truthiness would flag older engines' missing field as refusal.
 crates/lucidos-app/src/components/settings/providerCredential.ts	416a740f8e61a010	keep	Excluding oauth_client prevents silent deletion; must agree with engine CredentialStore::get.
 crates/lucidos-app/src/components/settings/providerCredential.ts	7617a76d3c07a4ce	keep	Engine scopes keys to URL; unscoped save leaves provider keyless, cleared field moves nothing.
-crates/lucidos-app/src/components/settings/providerEnablement.ts	4f77d6299ceb4293	keep	Both loads required; unloaded credentials misdraw configured providers as not set up.
 crates/lucidos-app/src/components/settings/providerEnablement.ts	8f88470e68e7b75a	adr	Module rationale: two sources needed, rejected single-source alternative.
-crates/lucidos-app/src/components/settings/providerEnablement.ts	e69f5af32b7aa63d	keep	Writing false on never-configured provider silently vetoes a later env key.
-crates/lucidos-app/src/components/settings/providerEnablement.ts	f12186cca5c77e4c	keep	Unknown must not render as off; guessing silently drops switch-off presses.
-crates/lucidos-app/src/components/settings/responseStyle.ts	b9bbb0d889861ee9	keep	Persisting shipped rows silently freezes shipped text; nothing flags it.
 crates/lucidos-app/src/components/settings/restartControl.ts	f723b5a9a8cbbac9	adr	Design choice: return the home rather than per-site booleans.
 crates/lucidos-app/src/components/settings/settingsSectionRefresh.ts	87622ea48a9aac45	keep	Components inside function sections must register refreshes here; forgetting goes stale silently.
-crates/lucidos-app/src/components/settings/themeStripMotion.ts	99e73c6a477d423b	keep	Promise callbacks run in registration order; moving this earlier runs onSettled before ghost removal.
-crates/lucidos-app/src/components/settings/themeStripMotion.ts	cc4cc909727614df	keep	Mid-move reads of the strip are stale; nothing flags wrong results.
 crates/lucidos-app/src/components/settings/useBackgroundModels.ts	f97b107dbf7ebf81	keep	Unset half waits on engine; a catalog default would silently show wrong model.
 crates/lucidos-app/src/components/settings/useCodeCountdown.ts	d7dfcb79ad27fc25	keep	Hidden-tab throttling makes countdown stale; listener needed to re-read.
 crates/lucidos-app/src/components/settings/webhookDelivery.ts	bb4bc362fb1bf4d7	adr	Module rationale: refusals distinguish silence causes; design choice.
 crates/lucidos-app/src/components/settings/webhookDelivery.ts	cb236b803ac9235b	adr	Rejected alternative of replacing the other line; UI-level.
 crates/lucidos-app/src/components/settings/webhookSignature.ts	0eea83d9082bd6ab	adr	Rejects positional lookup; keyed lookup already shown.
 crates/lucidos-app/src/components/settings/webhookSignature.ts	964e689a022f9634	adr	Module design: pure presets and secret-source reasoning.
-crates/lucidos-app/src/components/settings/webhookSignature.ts	d0b352a245ee387d	keep	Slack and Stripe must not offer generate; invented secret never verifies.
-crates/lucidos-app/src/components/settings/webhookSignature.ts	d5be042cc95cab8a	keep	Partial match silently rewrites preset fields on save; nothing flags it.
 crates/lucidos-app/src/components/shared/AllowlistRow.tsx	bd6214039019c01b	keep	JSX autocorrect=off turns it on; nothing warns the editor.
-crates/lucidos-app/src/components/shared/ArrivalList.tsx	3c0cab05f9d9b794	keep	Visibility must be read here; inside the observer, hidden tabs never run it.
 crates/lucidos-app/src/components/shared/ArrivalList.tsx	8356779d5fe98829	keep	Marker class must stay on row root; a wrapper hides the inset wash.
-crates/lucidos-app/src/components/shared/ArrivalList.tsx	e64b9f1a625ff688	keep	Slack must exceed roll time, or lights retire unseen mid-roll.
 crates/lucidos-app/src/components/shared/BlobImage.tsx	0bc9de6436339c31	keep	Bare img stays broken after engine restart or iOS wake; retry is required.
 crates/lucidos-app/src/components/shared/CategoryIcon.tsx	69cbc5a125243198	adr	Design: one shared apps glyph definition across two files.
 crates/lucidos-app/src/components/shared/ConfirmDialog.tsx	229c805d82c53ebf	keep	Keying on visible would silently skip focus on a replacing confirm.
@@ -2551,11 +2401,8 @@ crates/lucidos-app/src/components/shared/ConfirmDialog.tsx	cf9046fd4cf0b0be	adr	
 crates/lucidos-app/src/components/shared/ConfirmDialog.tsx	d05b4cbae5748ca0	keep	Chrome promotes overflowing scroller to Tab stop; tabIndex -1 prevents it.
 crates/lucidos-app/src/components/shared/ControlOptionList.tsx	c0e77e90dfefb6ad	adr	Subsystem decision: stateless list, caller owns state.
 crates/lucidos-app/src/components/shared/CrossfadeStack.tsx	e4744f582154ce9c	keep	WebKit starts fresh-mounted animations late; layers must stay mounted.
-crates/lucidos-app/src/components/shared/Disclosure.tsx	2860bdaa550956fc	keep	Reads must precede writes and run after commit, or measurements silently go wrong.
-crates/lucidos-app/src/components/shared/Disclosure.tsx	59ae7b4143505cca	keep	offsetHeight is the obvious fix; its rounding causes a small jump.
 crates/lucidos-app/src/components/shared/Disclosure.tsx	ea1dc51b124b563d	keep	Measure must only read; a write there re-lays out the page per row.
 crates/lucidos-app/src/components/shared/Disclosure.tsx	efd12ef50b5640d9	adr	Design rationale: animate own height rather than FLIP copies.
-crates/lucidos-app/src/components/shared/Disclosure.tsx	f0ae8744aeff914a	keep	Without the bump, a stale queued roll for an older toggle runs.
 crates/lucidos-app/src/components/shared/Dropdown.tsx	10da2601760624d4	keep	WebKit won't focus buttons on click; asserting trigger focus prevents silent typeahead breakage.
 crates/lucidos-app/src/components/shared/Dropdown.tsx	4351bd39847e7ff9	keep	Close must cancel the deferred frame or Tab pulls focus back and reopens menu.
 crates/lucidos-app/src/components/shared/Dropdown.tsx	6437c6547cdc3b3c	keep	Portal avoids transform containing blocks and stacking-context z-index capping.
@@ -2569,10 +2416,8 @@ crates/lucidos-app/src/components/shared/Explainer.tsx	6197a1a8ad8daad6	keep	Ove
 crates/lucidos-app/src/components/shared/Explainer.tsx	b25808c8197d2b46	keep	useRef would leave the anchor null on open; the state hook is required.
 crates/lucidos-app/src/components/shared/Explainer.tsx	bc3128e77d5272e9	keep	Explainer inside the label hijacks label clicks; nothing else warns.
 crates/lucidos-app/src/components/shared/FindBar.tsx	d83f5db6386e9730	keep	Request effect must run after cleanup or the new session is ended.
-crates/lucidos-app/src/components/shared/GlyphBadge.tsx	85a0fb749e64df89	keep	Adding a deps array leaves ink stale after text changes.
 crates/lucidos-app/src/components/shared/HiddenFileInput.tsx	8b4f603dccc76b40	keep	display:none or visibility:hidden silently drops change on iOS PWA.
 crates/lucidos-app/src/components/shared/HiddenFileInput.tsx	ca4d7dd477da31ac	keep	Enter does not open file inputs in all engines; handler is needed.
-crates/lucidos-app/src/components/shared/IframeTabExit.tsx	52cc934493ba0bd5	keep	Cross-iframe relatedTarget reads null or frame; the check depends on it.
 crates/lucidos-app/src/components/shared/ImagePopup.tsx	0114cd870295bbcb	keep	Effect order matters; optional chain hides a silent no-op if moved.
 crates/lucidos-app/src/components/shared/ImagePopup.tsx	06188dac9b204707	keep	Lock must precede flush, or layout effect races transform reset.
 crates/lucidos-app/src/components/shared/ImagePopup.tsx	072b2dced3b4ef6e	keep	Must not use cached ensureLayout; mid-animation geometry needs fresh capture.
@@ -2640,7 +2485,6 @@ crates/lucidos-app/src/components/shared/SplitButton.tsx	d3b305701c6d3fe7	keep	W
 crates/lucidos-app/src/components/shared/Surface.tsx	f77450707af41823	adr	Records the one-close-affordance design rule for all surfaces.
 crates/lucidos-app/src/components/shared/SystemAttentionBadge.tsx	e0b6c940d1db6c58	keep	Off-screen text fuses into labels; host must compose aria-label.
 crates/lucidos-app/src/components/shared/ThreadNav.tsx	411d53862b08c9a8	adr	Why Back and Forward are separate exports: mobile header places the mark between them.
-crates/lucidos-app/src/components/shared/ThreadOverflowItems.tsx	2ebd2a7e5e3d4c75	keep	Plain disabled drops focus order; aria-disabled and hidden reason needed.
 crates/lucidos-app/src/components/shared/ThreadToggleButton.tsx	2ecad7dee09d7930	adr	Design rationale for one badge; rejects double-badging alternative.
 crates/lucidos-app/src/components/shared/ThreadToggleButton.tsx	cdf02d65db78551b	keep	Must swallow click and pointerdown; SplitLayout focus and popover dismissal depend on it.
 crates/lucidos-app/src/components/shared/Toast.tsx	053b7d61e53d62ad	keep	Removing tabIndex=-1 adds unnamed Tab stops; common a11y advice tempts that removal.
@@ -2701,18 +2545,11 @@ crates/lucidos-app/src/components/shared/scaleSlider.ts	a072fcaaeaac2d08	keep	Na
 crates/lucidos-app/src/components/shared/scaleWheel.ts	1ee2445515987958	keep	Must exceed a pinch's inter-event gap or gestures split.
 crates/lucidos-app/src/components/shared/scaleWheel.ts	2ca0084e26ef64de	adr	Module-level rationale: distance is the unit; rejects per-event steps.
 crates/lucidos-app/src/components/shared/scaleWheel.ts	aacfd14544e6796d	adr	Explains placing the policy in one testable unit.
-crates/lucidos-app/src/components/shared/scaleWheel.ts	f7b1e09bc04073ed	keep	Modifier-gated notch floor fixes slow macOS ticks; pinch must get no floor.
-crates/lucidos-app/src/components/shared/scaleWheelListener.ts	060c7030941c8d65	keep	Queued frame after cleanup would reopen panel; removing zoom.stop breaks silently.
-crates/lucidos-app/src/components/shared/scaleWheelListener.ts	106dfb92f413d0bf	keep	Non-passive listener janks scroll; attach only while zoom is possible.
 crates/lucidos-app/src/components/shared/scaleWheelListener.ts	3ca937fd207d030e	keep	Modifier mid-pinch stopping gesture is guarded only by memoization.
 crates/lucidos-app/src/components/shared/scaleWheelListener.ts	556566a2af0752fd	keep	Push before the frame's SDK loads reaches nobody; silent wheel failure.
-crates/lucidos-app/src/components/shared/scaleWheelListener.ts	6a0dec6eff8e14a5	keep	Drained step after close would reopen panel; nothing flags removing this effect.
-crates/lucidos-app/src/components/shared/scaleWheelListener.ts	acb8955c80f52521	keep	Sync effect keeps listener present before paint; async would leak pinches to browser.
-crates/lucidos-app/src/components/shared/scaleWheelListener.ts	c0a4ddce3c91a33a	keep	Pinch reads as ctrl without keydown; ctrlKey must not count as held.
 crates/lucidos-app/src/components/shared/scaleWheelListener.ts	ffb7ff25329b13e5	keep	Frames must arm listeners in step with shell; coupling to app frames is silent.
 crates/lucidos-app/src/components/shared/setupInterview.ts	cf61f3257a566062	adr	Records why confirm-first and one shared copy; design decision, not a line constraint.
 crates/lucidos-app/src/components/shared/threadVisualStatus.ts	14b68029c8d6b656	adr	Records why the derivation is pure and split out; module-level decision.
-crates/lucidos-app/src/components/shared/threadVisualStatus.ts	258bf408d291c25f	keep	Live-wait-before-changes ordering prevents Apply on unfinished branch; reordering is silent.
 crates/lucidos-app/src/components/shared/threadVisualStatus.ts	d5395d6e842ab672	keep	Backend must not write waiting for pending changes; silent wrong status otherwise.
 crates/lucidos-app/src/components/shared/threadVisualStatus.ts	e58cd2cd7106d513	adr	Records single-source-of-truth design across surfaces; architectural rationale.
 crates/lucidos-app/src/components/shared/toastFocus.ts	cfeeeb6a6054bac6	keep	Forward Tab must be handled everywhere and overlay blocks exit; silent focus escape otherwise.
@@ -2720,11 +2557,8 @@ crates/lucidos-app/src/components/shared/toastPressProbe.ts	145feed068886571	kee
 crates/lucidos-app/src/components/shared/toastPressProbe.ts	334083e15b746656	keep	Grace must exceed WebKit synthetic-click delay or taps misread as no-click.
 crates/lucidos-app/src/components/shared/toastPressProbe.ts	4629c964e08cf0d5	keep	Must read defaultPrevented after full dispatch; a cancel can come from any listener.
 crates/lucidos-app/src/components/shared/toastReflow.ts	b64c50e9fa5a34bb	adr	Module design: FLIP reflow helper, DOM-free split, Toast captures tops.
-crates/lucidos-app/src/components/shared/toastTap.ts	78b5a9130d575ec0	keep	Tap must never run danger or confirm actions; accidental commit otherwise.
-crates/lucidos-app/src/components/shared/toastUrgency.ts	796392984a47540c	keep	Timed toasts vanish under modal; error and warning must not be deferred.
 crates/lucidos-app/src/components/shared/toastUrgency.ts	cc6c27085b8c852e	adr	Stack-wide urgency: per-toast z-index cannot escape the container stacking context.
 crates/lucidos-app/src/components/shared/useListFilter.ts	89089aa08f7c62af	adr	Ownership boundary: hook handles query, host keeps focus and selection.
-crates/lucidos-app/src/components/shared/useRowActionsGesture.ts	f7c6c03121d6a190	keep	Control presses must not also arm row hold; label counts as control.
 crates/lucidos-app/src/components/thread-queue/ThreadQueueView.tsx	0e56275055bf91f3	keep	Render-time read of threadMap.value keeps title reactive; staleness is silent.
 crates/lucidos-app/src/components/thread-queue/ThreadQueueView.tsx	210d3000a4309dc3	keep	Run now and Drop act on projection, which doesn't hold user-chat entries.
 crates/lucidos-app/src/components/triggers/TriggerDetails.tsx	12962663ae2e9e10	keep	Empty-valued placeholder would silently clear the field; obvious fix breaks it.
@@ -10490,12 +10324,11 @@ crates/lucidos-gateway/src/local_updates.rs	63fad0411d39ab8b	adr	Module surface 
 crates/lucidos-gateway/src/main.rs	3c2e4f1ac58c39ab	keep	Debug-form quoting breaks the splash's parse of boot failure.
 crates/lucidos-gateway/src/main.rs	674bdfe7abf68e81	keep	set_var is sound only single-threaded; lock fd take must precede hydrate.
 crates/lucidos-gateway/src/main.rs	738117235faedc00	keep	Running gateway spawns it; reordering or prefixing silently breaks the badge.
-crates/lucidos-gateway/src/manage_hop.rs	58fc326d71d69fc0	keep	Forwarding B's 401 would falsely tell the browser its own session failed.
-crates/lucidos-gateway/src/manage_hop.rs	5998462abba9ef1b	keep	Handlers must see no device of B's own, or self-revocation becomes possible
-crates/lucidos-gateway/src/manage_hop.rs	87bad14207bcabf2	keep	Decoded path would break encoded emails; must forward the raw URI path
-crates/lucidos-gateway/src/manage_hop.rs	a5847634d7764152	keep	Passing a device through would let manage calls revoke the caller.
-crates/lucidos-gateway/src/manage_hop.rs	a7ba10952b34c3b7	keep	Manage prefix must never match a workspace slug, or claims could cross scopes
-crates/lucidos-gateway/src/manage_hop.rs	ddde9717e7fa172e	adr	Router boundary: pairing and control plane deliberately excluded.
+crates/lucidos-gateway/src/gateway_hop.rs	251debbc22bf5e75	keep	Handlers must see no device of B's own, or self-revocation becomes possible
+crates/lucidos-gateway/src/gateway_hop.rs	587b75f6edaa8311	adr	Router boundary: exactly the hop's allow-list, everything else 404.
+crates/lucidos-gateway/src/gateway_hop.rs	58fc326d71d69fc0	keep	Forwarding B's 401 would falsely tell the browser its own session failed.
+crates/lucidos-gateway/src/gateway_hop.rs	87bad14207bcabf2	keep	Decoded path would break encoded emails; must forward the raw URI path
+crates/lucidos-gateway/src/gateway_hop.rs	ea162182e4a91008	keep	Hop prefix must never match a workspace slug, or claims could cross scopes
 crates/lucidos-gateway/src/net_config.rs	0aec61da85301a29	keep	Tailnet IP may be absent at boot; loopback must stay required or boot splash hangs.
 crates/lucidos-gateway/src/net_config.rs	4a2936a869fbec39	keep	Typing entries lets one bad entry void the whole file's config.
 crates/lucidos-gateway/src/net_config.rs	5103b7c98c2cf10a	keep	Refusing link-local blocks SSRF to cloud metadata; nothing else flags it.

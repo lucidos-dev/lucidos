@@ -1,30 +1,19 @@
-//! Keeps the discovered Claude Code model list fresh
-//! (`runtime::cc_model_discovery`). Probes run in the background and never on
-//! a request path, so a slow or absent Claude Code only leaves the last list.
-
 use super::LucidosEngine;
 use crate::core::prefs;
 use crate::runtime::cc_model_discovery as discovery;
 use crate::runtime::AccountPin;
 
-/// Serve the list the last probe found, then schedule a refresh if needed.
 pub async fn start_cc_model_discovery(engine: &LucidosEngine) {
     engine.start_cc_model_discovery().await;
 }
 
 #[easy_ext::ext(CcModelDiscoveryExt)]
 pub(crate) impl LucidosEngine {
-    /// Serve the list the last probe found, then probe again if it is missing,
-    /// a day old, or from an older Claude Code. Called once at boot.
     async fn start_cc_model_discovery(&self) {
         discovery::load(self.workspace_path());
         self.refresh_cc_models_if_stale(None, None);
     }
 
-    /// Probe Claude Code in the background when the list needs it.
-    /// `reported_version` and `reported_account` are what a session's
-    /// handshake just named. Returns at once: every read the probe needs
-    /// happens in the spawned task.
     fn refresh_cc_models_if_stale(
         &self,
         reported_version: Option<&str>,
@@ -52,8 +41,6 @@ pub(crate) impl LucidosEngine {
                         return;
                     }
                 };
-            // A session in the workspace, minus everything a turn needs: no
-            // thread, no prompt, no pinned model, no resume.
             let args = crate::runtime::SpawnArgs {
                 worktree_path: &workspace,
                 coding_agent_kind: Default::default(),
@@ -99,11 +86,6 @@ pub(crate) impl LucidosEngine {
         });
     }
 
-    /// Mark `model` refused: Claude Code `cc_version` ran another model when a
-    /// session on `session` asked for it. Automatic picks skip it until it
-    /// serves again; the picker and the ladder keep it. Persisted across a
-    /// restart. Only a session on the `live` account counts. True while no
-    /// agent has asked the owner about the refusal yet.
     fn record_cc_model_refusal(
         &self,
         model: &str,
@@ -117,20 +99,14 @@ pub(crate) impl LucidosEngine {
         discovery::refusal_untold(model)
     }
 
-    /// Whether the owner is still owed the questions about the refusal of
-    /// `model`: another thread may have asked since this one saw its swap.
     fn cc_model_refusal_untold(&self, model: &str) -> bool {
         discovery::refusal_untold(model)
     }
 
-    /// An agent asked the owner about the refusal of `model`. Persisted, so no
-    /// later swap asks again until the refusal clears.
     fn record_cc_model_refusal_told(&self, model: &str) {
         discovery::record_refusal_told(self.workspace_path(), model);
     }
 
-    /// `model` served as asked in a session on `session`, so a refusal of it
-    /// ends. Only a session on the `live` account counts.
     fn record_cc_model_served(
         &self,
         model: &str,
@@ -142,8 +118,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// A Claude Code session started while `live` is the live account. Drops
-    /// refusals another account learned.
     fn observe_cc_live_account(&self, live: Option<&AccountPin>) {
         discovery::observe_live_account(self.workspace_path(), live);
     }

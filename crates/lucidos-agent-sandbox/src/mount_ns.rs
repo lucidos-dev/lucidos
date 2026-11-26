@@ -1,18 +1,5 @@
-//! Linux read-only mounts around a trigger's write scope.
-//!
-//! Landlock does not gate metadata: chmod, chown, utimes and xattrs. So a
-//! child with a write scope also enters its own user and mount namespace.
-//! There every mount turns read-only, and writable clones of the write roots
-//! go back over their paths. Claude Code's sandbox does the same with
-//! bubblewrap.
-//!
-//! Where the kernel refuses an unprivileged user namespace, [`supported`] says
-//! so once per process, and the child runs under Landlock alone.
-
 use std::path::{Path, PathBuf};
 
-/// The roots that need a writable clone: canonical, existing, and not inside
-/// another root, since a recursive clone of the outer one carries it.
 pub fn outermost_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut real: Vec<PathBuf> = roots
         .iter()
@@ -28,8 +15,6 @@ pub fn outermost_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Whether a scope leaves anything to mount read-only. A scope holding `/`
-/// already lets the child write everywhere Landlock allows.
 pub fn confines(roots: &[PathBuf]) -> bool {
     !roots.iter().any(|root| root == Path::new("/"))
 }
@@ -61,8 +46,6 @@ mod sys {
         userns_fd: u64,
     }
 
-    /// Everything the child needs, built in the parent so that
-    /// [`ReadOnlyOutside::enter`] allocates nothing.
     pub struct ReadOnlyOutside {
         roots: Vec<CString>,
         clones: Vec<libc::c_int>,
@@ -71,7 +54,6 @@ mod sys {
     }
 
     impl ReadOnlyOutside {
-        /// `None` when the scope leaves nothing to mount read-only.
         pub fn new(write_roots: &[PathBuf]) -> io::Result<Option<Self>> {
             let roots = super::outermost_roots(write_roots);
             if !super::confines(&roots) {
@@ -91,10 +73,6 @@ mod sys {
             }))
         }
 
-        /// Enter the namespace. Safe between fork and exec: syscalls on
-        /// buffers built in the parent, no allocation, no lock. Once the
-        /// unshare succeeds, any later failure fails the spawn. A child left
-        /// without its id map could no longer write its own files.
         pub fn enter(&mut self) -> io::Result<()> {
             // SAFETY: integer flags only.
             check(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) })?;
@@ -112,8 +90,6 @@ mod sys {
                     std::ptr::null(),
                 )
             })?;
-            // Inherited mounts are locked to their children, so only a
-            // recursive clone may copy one.
             for (root, clone) in self.roots.iter().zip(self.clones.iter_mut()) {
                 // SAFETY: a NUL-terminated path; the result is checked.
                 let fd = unsafe {
@@ -127,7 +103,6 @@ mod sys {
                 check_long(fd)?;
                 *clone = fd as libc::c_int;
             }
-            // The clones are detached, outside `/`, so they stay writable.
             let attr = MountAttr {
                 attr_set: MOUNT_ATTR_RDONLY,
                 attr_clr: 0,
@@ -202,23 +177,15 @@ mod sys {
         }
     }
 
-    /// Whether a child here can enter the namespace. A real trial decides,
-    /// once per process. The kernel version cannot tell, since a sysctl, an
-    /// AppArmor policy or a container's seccomp profile may refuse it.
     pub fn supported() -> bool {
         static SUPPORTED: OnceLock<bool> = OnceLock::new();
         if let Some(known) = SUPPORTED.get() {
             return *known;
         }
-        // A trial that could not run decides nothing. This spawn runs under
-        // Landlock alone, and the next spawn tries again.
         trial().is_some_and(|answer| *SUPPORTED.get_or_init(|| answer))
     }
 
-    /// `None` when the trial could not run, such as a fork refused under load.
     fn trial() -> Option<bool> {
-        // `/dev` is in every trigger scope, and its inherited submounts test
-        // the recursive clone. The trial writes nothing.
         let mut trial = match ReadOnlyOutside::new(&[PathBuf::from("/dev")]) {
             Ok(Some(trial)) => trial,
             Ok(None) => return Some(false),

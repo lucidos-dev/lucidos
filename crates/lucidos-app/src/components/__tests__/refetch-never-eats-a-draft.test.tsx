@@ -78,6 +78,26 @@ describe('the allowlist editor drops a re-read the user typed under', () => {
     expect(rows()[0].value).toBe('Bash(git log)');
   });
 
+  it('keeps the typed pattern when a re-read it predates fails', async () => {
+    let next: Promise<string> = Promise.resolve('# header\nBash(git status)\n');
+    const load = vi.fn(() => next);
+    render(<AllowlistEditor {...editorProps(load)} />, host);
+    await waitFor(() => rows().length === 1);
+
+    let fail!: (e: unknown) => void;
+    next = new Promise<string>((_, reject) => { fail = reject; });
+    permissionGrantsVersion.value++;
+    await waitFor(() => load.mock.calls.length === 2);
+
+    typeInto(rows()[0], 'Bash(git log)');
+    await waitFor(() => rows()[0].value === 'Bash(git log)');
+
+    fail(new Error('request timed out'));
+    await settle();
+
+    expect(rows()[0]?.value).toBe('Bash(git log)');
+  });
+
   it('still takes the new file when nobody typed', async () => {
     let next: Promise<string> = Promise.resolve('# header\nBash(git status)\n');
     const load = vi.fn(() => next);

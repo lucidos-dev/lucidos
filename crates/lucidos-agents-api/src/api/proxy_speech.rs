@@ -1,15 +1,3 @@
-//! What a text-to-speech call through the proxy cost.
-//!
-//! OpenAI's `/audio/speech` reports its usage only on a server-sent event
-//! stream, in the closing `speech.audio.done` frame. Its default reply is bare
-//! audio with no usage, so `api::proxy_cost` could record nothing for it.
-//!
-//! So the proxy asks for the stream on the caller's behalf. `proxy_cost` then
-//! records the stream's usage, and this module hands the caller the audio the
-//! frames carry. `tts-1` streams nothing, so it records the input's length,
-//! which OpenAI bills by. A format the proxy cannot record is refused.
-//! Why: ADR 0423.
-
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -26,33 +14,23 @@ use crate::engine::LucidosEngine;
 const CONTENT_DIGEST: HeaderName = HeaderName::from_static("content-digest");
 const DIGEST: HeaderName = HeaderName::from_static("digest");
 
-/// OpenAI's speech endpoint, relative to its API base.
 const SPEECH_PATH: &str = "audio/speech";
 
-/// `tts-1` and `tts-1-hd` stream no SSE, and OpenAI bills them per character.
 const PER_CHARACTER_MODEL_PREFIX: &str = "tts-1";
 
-/// OpenAI's raw PCM: 24 kHz, mono, signed 16-bit little-endian.
 const PCM_SAMPLE_RATE: u32 = 24_000;
 const PCM_BYTES_PER_SAMPLE: u16 = 2;
 
-/// What the proxy does with one request.
 #[derive(Debug)]
 pub(crate) enum SpeechPlan {
-    /// Not a speech call it changes.
     Untouched,
-    /// Asked for the stream. The caller gets this container back.
     Streamed(Container),
-    /// Billed per input character, recorded once the call succeeds.
     PerCharacter { model: String, characters: usize },
 }
 
-/// The audio file the caller gets from a stream's PCM or encoded frames.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Container {
-    /// The frames are already the file, with this `Content-Type`.
     AsStreamed(&'static str),
-    /// The frames are PCM, wrapped in a WAV header.
     Wav,
 }
 
@@ -98,7 +76,6 @@ pub(crate) fn ask_for_usage(
     }
 }
 
-/// The JSON body of a request to OpenAI's speech endpoint, if it is one.
 fn speech_request(
     base_url: &str,
     path: &str,
@@ -114,8 +91,6 @@ fn speech_request(
     serde_json::from_slice(body).ok()
 }
 
-/// A `flac` or `opus` stream loses its container, and the plain reply reports
-/// no usage. So neither can be served with its cost recorded.
 fn refusal(format: &str) -> (StatusCode, String) {
     (
         StatusCode::BAD_REQUEST,
@@ -126,7 +101,6 @@ fn refusal(format: &str) -> (StatusCode, String) {
     )
 }
 
-/// Hand the caller what it asked for, and record a per-character call.
 pub(crate) async fn finish(
     engine: &Arc<LucidosEngine>,
     owner: crate::api::proxy_cost::CostOwner,
@@ -147,7 +121,7 @@ pub(crate) async fn finish(
     }
 }
 
-/// A per-character call, with the characters in the input count. Its price
+/// INVARIANT: A per-character call, with the characters in the input count. Its price
 /// card is per 1M characters.
 fn per_character_call(model: String, characters: usize) -> ReportedCall {
     ReportedCall {
@@ -162,9 +136,6 @@ fn per_character_call(model: String, characters: usize) -> ReportedCall {
     }
 }
 
-/// Turn a rewritten call's stream back into the audio the caller asked for.
-///
-/// An error reply, or one that is not a stream, passes through unchanged.
 async fn restore_audio(container: Container, response: Response) -> Response {
     if !response.status().is_success() || !is_event_stream(response.headers()) {
         return response;
@@ -186,7 +157,6 @@ async fn restore_audio(container: Container, response: Response) -> Response {
         Container::AsStreamed(content_type) => (content_type, audio),
         Container::Wav => ("audio/wav", wav_of(&audio)),
     };
-    // Each of these describes the stream's bytes, not the audio's.
     for stale in [CONTENT_LENGTH, ETAG, CONTENT_DIGEST, DIGEST] {
         parts.headers.remove(stale);
     }
@@ -196,11 +166,6 @@ async fn restore_audio(container: Container, response: Response) -> Response {
     Response::from_parts(parts, Body::from(file))
 }
 
-/// The audio a stream's `speech.audio.delta` frames carry, in order. The
-/// closing `[DONE]` line is not JSON and is skipped.
-///
-/// A stream that stops before `speech.audio.done` was cut off mid-speech, so
-/// its partial audio is an upstream failure, not a reply.
 fn audio_of(stream: &str) -> Result<Vec<u8>, String> {
     let mut audio = Vec::new();
     let mut done = false;
@@ -235,7 +200,6 @@ fn audio_of(stream: &str) -> Result<Vec<u8>, String> {
     Ok(audio)
 }
 
-/// OpenAI's PCM inside the 44-byte header of a plain PCM WAV file.
 fn wav_of(pcm: &[u8]) -> Vec<u8> {
     let data_len = u32::try_from(pcm.len()).unwrap_or(u32::MAX);
     let block_align = PCM_BYTES_PER_SAMPLE;
@@ -245,8 +209,8 @@ fn wav_of(pcm: &[u8]) -> Vec<u8> {
     wav.extend_from_slice(&data_len.saturating_add(36).to_le_bytes());
     wav.extend_from_slice(b"WAVEfmt ");
     wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
     wav.extend_from_slice(&PCM_SAMPLE_RATE.to_le_bytes());
     wav.extend_from_slice(&byte_rate.to_le_bytes());
     wav.extend_from_slice(&block_align.to_le_bytes());

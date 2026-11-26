@@ -1,6 +1,3 @@
-//! A thread waiting on the user is never archived, by any path. See
-//! `docs/plans/2026-09-23-a-thread-waiting-on-the-user-cannot-be-archived.md`.
-
 use super::super::*;
 use super::*;
 
@@ -131,9 +128,6 @@ async fn an_interrupted_fire_report_restores_the_inbox_and_preserves_failure_and
     teardown_test_db(&db_name).await;
 }
 
-/// The live path: an unattended trigger run asked the user a question, and
-/// the unattended guard rewrote the question's Inbox to Archived. The thread
-/// then left Current and Needs attention with the question still open.
 #[tokio::test]
 async fn an_unattended_trigger_run_that_asks_the_user_stays_in_the_inbox() {
     let (pool, db_name) = setup_test_db().await;
@@ -152,8 +146,6 @@ async fn an_unattended_trigger_run_that_asks_the_user_stays_in_the_inbox() {
     teardown_test_db(&db_name).await;
 }
 
-/// The EventBus backstop. Whatever route emits it, `ThreadArchived` on a
-/// parked thread is refused: nothing is persisted and the row is untouched.
 #[tokio::test]
 async fn the_bus_refuses_to_archive_a_parked_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -194,9 +186,6 @@ async fn the_bus_refuses_to_archive_a_parked_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// Threads a pre-fix engine archived while parked are repaired at boot, with
-/// no manual step. Replaying their events through the fixed contract yields
-/// `inbox`, so the migration only makes the projection agree with its events.
 #[tokio::test]
 async fn the_migration_unarchives_threads_stuck_waiting_for_the_user() {
     let (pool, db_name) = setup_test_db().await;

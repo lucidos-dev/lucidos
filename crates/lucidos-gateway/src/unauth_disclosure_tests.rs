@@ -1,14 +1,7 @@
-//! What the public surface tells a caller with no credential.
-//!
-//! A gateway on a LAN or tailnet bind answers anyone who can reach it. Its
-//! public paths must not tell such a caller which workspaces exist, which
-//! release runs, or which addresses it still waits to bind.
-
 use super::*;
 
 const LOCAL: (&str, &str) = (auth::HEADER_LOCAL_TOKEN, "test-local-token");
 
-/// A gateway with a picker on disk and one stopped workspace, `secret-ws`.
 fn gateway_with_one_workspace() -> (GatewayState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -42,7 +35,6 @@ async fn call(state: &GatewayState, uri: &str, headers: &[(&str, &str)]) -> Resp
         .unwrap()
 }
 
-/// Status, the headers a client can read, and the body, as one comparable value.
 async fn observed(response: Response) -> (StatusCode, Vec<(String, String)>, String) {
     let status = response.status();
     let mut headers: Vec<(String, String)> = response
@@ -80,7 +72,6 @@ async fn the_bare_root_never_names_the_sole_workspace_to_a_stranger() {
     );
     assert!(!body.contains("secret-ws"));
 
-    // The owner's own browser still drops straight into its only workspace.
     let owner = call(&state, "/", &[page_load[0], page_load[1], LOCAL]).await;
     assert_eq!(owner.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(owner.headers()[header::LOCATION], "/secret-ws/");
@@ -89,8 +80,6 @@ async fn the_bare_root_never_names_the_sole_workspace_to_a_stranger() {
 #[tokio::test]
 async fn a_public_app_asset_answers_a_stopped_and_an_unknown_workspace_alike() {
     let (state, _dir) = gateway_with_one_workspace();
-    // A script tag, a page load and a frame: the three shapes the fallback
-    // tells apart.
     let shapes: [&[(&str, &str)]; 3] = [
         &[("sec-fetch-mode", "no-cors"), ("sec-fetch-dest", "script")],
         &[
@@ -133,7 +122,6 @@ async fn public_health_holds_no_release_count_or_pending_address() {
     }
     assert!(!body.contains("100.64.0.9"));
 
-    // This machine's own processes still read all of it.
     let (_, _, body) =
         observed(call(&state, crate::peers::GATEWAY_HEALTH_PATH, &[LOCAL]).await).await;
     let local: serde_json::Value = serde_json::from_str(&body).unwrap();

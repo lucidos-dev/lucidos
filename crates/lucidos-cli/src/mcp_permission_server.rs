@@ -1,23 +1,3 @@
-//! MCP stdio server shared by both coding-agent backends.
-//!
-//! Claude Code spawns it as `--permission-prompt-tool mcp__lucidos_perm__approve`
-//! (server name `lucidos_perm`): each `approve` call forwards the permission
-//! request to the parent engine's `/api/v1/internal/permission-prompt` endpoint
-//! and returns the user's decision as an MCP `text` content block.
-//!
-//! Codex spawns it as MCP server `lucidos` with `enabled_tools =
-//! ["ask_user_question"]` (see `runtime/codex.rs::build_codex_turn_command`):
-//! each `ask_user_question` call forwards the question to
-//! `/api/v1/internal/ask-user-question` — the same blocking endpoint CC's
-//! PreToolUse hook uses — and returns the user's answer as the tool result, so
-//! the Codex turn continues in place once the user clicks the QuestionCard.
-//!
-//! The two backends therefore need DISJOINT tool sets, and each hides the
-//! other's tool by a different mechanism. Codex filters client-side with
-//! `enabled_tools`. Claude Code has no per-server filter, so it passes
-//! `--permission-only` and the server itself stops advertising
-//! `ask_user_question` ([`ToolSet`]).
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, Write};
@@ -29,23 +9,9 @@ use crate::workspace::{resolve_from_env, BoxError};
 const TOOL_APPROVE: &str = "approve";
 const TOOL_ASK_USER_QUESTION: &str = "ask_user_question";
 
-/// Which of this server's tools the spawning backend may see and call.
-///
-/// `ask_user_question` exists for **Codex**, which has no question tool of its
-/// own. Claude Code does: its native `AskUserQuestion` is intercepted by the
-/// `ask-user-question-hook` PreToolUse hook and renders the same QuestionCard.
-/// Advertising the MCP duplicate to CC broke twice over: CC has no way to
-/// auto-approve an MCP tool call, so merely asking the user a question first
-/// raised a permission card for `mcp__lucidos_perm__ask_user_question`; and
-/// `agent_session::lifecycle::is_user_question_tool` only suppresses the
-/// tool-call step for the two intended names, so the question also
-/// double-surfaced as a step plus a card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolSet {
-    /// Everything the server implements. Codex's set, narrowed on its side to
-    /// `ask_user_question` by `enabled_tools`.
     All,
-    /// `approve` only, for Claude Code.
     PermissionOnly,
 }
 
@@ -109,9 +75,6 @@ pub fn run(tools: ToolSet) -> Result<(), BoxError> {
         let req: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                // Reply with a JSON-RPC parse error so the client doesn't hang
-                // waiting for a response. id=null per spec when the request id
-                // can't be recovered.
                 eprintln!("[lucidos-mcp-perm] bad jsonrpc: {}", e);
                 let resp = JsonRpcResponse {
                     jsonrpc: "2.0",
@@ -152,12 +115,7 @@ fn handle(
         })),
         "tools/list" => Ok(serde_json::json!({ "tools": tool_definitions(tools) })),
         "tools/call" => match req.params.get("name").and_then(|v| v.as_str()) {
-            // CC's --permission-prompt-tool designation strips the server/tool
-            // prefix before dispatch, so legacy callers arrive with no name —
-            // route those to approve for back-compat.
             Some(TOOL_APPROVE) | None => call_approve(&req.params, client, base_url, thread_id),
-            // An unadvertised tool is unreachable, not merely hidden: a model
-            // that guessed the name falls through to the unknown-tool error.
             Some(TOOL_ASK_USER_QUESTION) if tools.advertises(TOOL_ASK_USER_QUESTION) => {
                 call_ask_user_question(&req.params, client, base_url, thread_id)
             }
@@ -182,7 +140,6 @@ fn handle(
     })
 }
 
-/// The `tools/list` payload for `tools`, in a stable order (`approve` first).
 fn tool_definitions(tools: ToolSet) -> Vec<Value> {
     let mut out = Vec::new();
     if tools.advertises(TOOL_APPROVE) {
@@ -326,11 +283,6 @@ fn call_approve(
 struct AskUserQuestionRequestBody<'a> {
     thread_id: &'a str,
     tool_use_id: &'a str,
-    /// The coding-agent session id paired with the question. The MCP server
-    /// never learns the Codex thread id (the MCP protocol doesn't carry it),
-    /// so this is empty for Codex-originated questions. The field is
-    /// write-only on the engine side — recovery resumes via
-    /// `CodingAgentIdled` / `CodingAgentSettingsChanged`, never this event.
     session_id: &'a str,
     questions: Value,
 }
@@ -338,19 +290,12 @@ struct AskUserQuestionRequestBody<'a> {
 #[derive(Deserialize)]
 struct AskUserQuestionResponseBody {
     answers: Value,
-    /// Set when the engine refused the card, which the user never saw.
     #[serde(default)]
     refusal: Option<String>,
-    /// Every pick was a *quiet option*, so the result asks the agent to stop.
     #[serde(default)]
     quiet: bool,
 }
 
-/// Translate one MCP `ask_user_question` call into the engine's question-walk
-/// shape (the same `/api/v1/internal/ask-user-question` endpoint CC's
-/// PreToolUse hook uses), block until the user answers, and return the answer
-/// as the tool result. One question per call — the model calls again for the
-/// next question.
 fn call_ask_user_question(
     params: &Value,
     client: &reqwest::blocking::Client,
@@ -359,11 +304,6 @@ fn call_ask_user_question(
 ) -> Result<Value, String> {
     let endpoint = format!("{}/api/v1/internal/ask-user-question", base_url);
     let args = params.get("arguments").ok_or("missing arguments")?;
-    // Trimmed BEFORE sending: the engine keys its `{question: answer}` map
-    // on the trimmed question text (`question_text` in the engine's
-    // parser), so an untrimmed key here (models love trailing newlines)
-    // would miss the lookup below and degrade the tool result to the
-    // serialized whole map.
     let question = args
         .get("question")
         .and_then(|v| v.as_str())
@@ -379,9 +319,6 @@ fn call_ask_user_question(
         Err(reason) => return Ok(tool_error_result(&reason)),
     };
 
-    // Engine wire shape — same as CC's `tool_input.questions` (the engine's
-    // `parse_ask_user_question_inputs` reads `question` / `options[].label` /
-    // `multiSelect`).
     let questions = serde_json::json!([{
         "question": question,
         "header": "",
@@ -389,10 +326,6 @@ fn call_ask_user_question(
         "options": options,
     }]);
 
-    // Fresh id per call: there is no stable Codex-side tool_use_id visible to
-    // an MCP server, so each ask is its own question. A codex child killed
-    // mid-question therefore re-asks on resume instead of replaying a stale
-    // answer — acceptable; the user answers once more.
     let tool_use_id = format!("codex-q-{}", uuid::Uuid::new_v4());
 
     let body = AskUserQuestionRequestBody {
@@ -409,13 +342,10 @@ fn call_ask_user_question(
     )
 }
 
-/// A failed request is a tool error with retry guidance, not a protocol error.
-/// The agent then asks again with the tool rather than in prose.
 fn card_not_shown_result(cause: &str) -> Value {
     tool_error_result(&card_not_shown_reason(TOOL_ASK_USER_QUESTION, cause))
 }
 
-/// A tool result the model reads and acts on, unlike a protocol error.
 fn tool_error_result(text: &str) -> Value {
     serde_json::json!({
         "content": [{ "type": "text", "text": text }],
@@ -423,11 +353,6 @@ fn tool_error_result(text: &str) -> Value {
     })
 }
 
-/// The card's options. An absent, blank or empty list is an intentional free-text
-/// question. Anything else that does not yield a button per entry is refused,
-/// so the model corrects the call: a card with no buttons would otherwise
-/// reach the user as free text they never asked for. Some models send the
-/// array as a JSON-encoded string, which is accepted.
 fn parse_options(raw: Option<&Value>) -> Result<Vec<Value>, String> {
     let decoded;
     let entries = match raw {
@@ -459,10 +384,6 @@ fn parse_options(raw: Option<&Value>) -> Result<Vec<Value>, String> {
 const OPTIONS_SHAPE_ERROR: &str =
     "`options` must be an array of labels or {label, description} objects, or omitted for a free-text question";
 
-/// One option in the engine's wire shape. The schema advertises plain labels,
-/// but a model may still send `{ label, description, preview }`. Dropping that
-/// object would leave the card with no button for it, so it passes through.
-/// An entry with no string label yields `None`, which the caller refuses.
 fn engine_option(option: &Value) -> Option<Value> {
     if let Some(label) = option.as_str() {
         return Some(serde_json::json!({ "label": label }));
@@ -483,8 +404,6 @@ fn engine_option(option: &Value) -> Option<Value> {
     Some(out)
 }
 
-/// The MCP tool result: the user's answer, or the engine's refusal as an error
-/// so the agent reads why no card was shown.
 fn ask_tool_result(resp: &AskUserQuestionResponseBody, question: &str) -> Value {
     match &resp.refusal {
         Some(refusal) => tool_error_result(refusal),
@@ -500,10 +419,6 @@ fn ask_tool_result(resp: &AskUserQuestionResponseBody, question: &str) -> Value 
     }
 }
 
-/// Pull the single question's answer out of the engine's
-/// `{question_text: answer}` map. Falls back to the whole map serialized as
-/// JSON if the key is missing (defensive — the engine keys the map on the
-/// exact question text we sent).
 fn extract_single_answer(answers: &Value, question: &str) -> String {
     match answers.get(question) {
         Some(Value::String(s)) => s.clone(),
@@ -520,8 +435,6 @@ mod tests {
         reqwest::blocking::Client::new()
     }
 
-    /// An unreachable engine is a tool error with retry guidance, never a bare
-    /// protocol error.
     #[test]
     fn an_unreachable_engine_returns_retry_guidance_as_a_tool_error() {
         let port = {
@@ -568,13 +481,8 @@ mod tests {
         let tools = &resp.result.unwrap()["tools"];
         assert_eq!(tools[0]["name"], "approve");
         assert_eq!(tools[0]["inputSchema"]["required"][0], "tool_name");
-        // Codex spawns this server with `enabled_tools = ["ask_user_question"]`
-        // — the tool must be advertised or the filter yields an empty tool set
-        // and Codex silently loses its question path.
         assert_eq!(tools[1]["name"], "ask_user_question");
         assert_eq!(tools[1]["inputSchema"]["required"][0], "question");
-        // Codex writes a widget embed in an object option's description
-        // (ADR 0415), so the schema must offer the object form.
         let kinds = &tools[1]["inputSchema"]["properties"]["options"]["items"]["anyOf"];
         assert_eq!(kinds[0]["type"], "string");
         assert_eq!(kinds[1]["type"], "object");
@@ -584,12 +492,6 @@ mod tests {
             .contains("app:<id>"));
     }
 
-    /// Claude Code has its own `AskUserQuestion` tool, hooked to the same
-    /// QuestionCard. Advertising the MCP duplicate to CC made asking the user
-    /// a question raise a permission card for
-    /// `mcp__lucidos_perm__ask_user_question` (CC cannot auto-approve an MCP
-    /// tool), and double-surfaced the question as a tool-call step beside the
-    /// card. CC's spawn passes `--permission-only`; this is what that means.
     #[test]
     fn permission_only_hides_the_question_tool_from_claude_code() {
         let req = JsonRpcRequest {
@@ -619,8 +521,6 @@ mod tests {
         );
     }
 
-    /// Hidden means unreachable, not just undocumented: CC's model could still
-    /// emit the name from an older transcript on `--resume`.
     #[test]
     fn permission_only_refuses_a_question_tool_call() {
         let req = JsonRpcRequest {
@@ -646,10 +546,6 @@ mod tests {
             .contains("ask_user_question"));
     }
 
-    /// Codex reads this schema, not the engine's system prompt, when deciding
-    /// what to pass as `options`. There is no text-entry option kind, so an
-    /// "Other, I'll type it" label comes straight back as the user's answer.
-    /// Mirrors `CODEX_ASK_USER_QUESTION_RULE` in the engine's prompts.
     #[test]
     fn ask_user_question_options_schema_bans_a_text_entry_escape_label() {
         let req = JsonRpcRequest {
@@ -690,8 +586,6 @@ mod tests {
 
     #[test]
     fn ask_user_question_requires_question_text() {
-        // The engine rejects empty question text server-side; failing fast
-        // here keeps the error close to the model instead of a 500 round-trip.
         let req = JsonRpcRequest {
             id: Some(Value::from(8)),
             method: "tools/call".to_string(),
@@ -705,8 +599,6 @@ mod tests {
         assert!(err["message"].as_str().unwrap().contains("question"));
     }
 
-    /// Object options used to be dropped without a word, so a card could
-    /// arrive with no buttons at all.
     #[test]
     fn an_object_option_keeps_its_label_description_preview_quiet_and_reply() {
         let options: Vec<Value> = [
@@ -759,7 +651,6 @@ mod tests {
         }
     }
 
-    /// A protocol error may reach the model with no text, so it would ask in prose.
     #[test]
     fn malformed_options_come_back_as_a_tool_error_the_model_reads() {
         let params = serde_json::json!({
@@ -784,7 +675,6 @@ mod tests {
         );
     }
 
-    /// A dropped choice must never turn into a button-less card.
     #[test]
     fn malformed_options_are_refused_instead_of_dropped() {
         for bad in [
@@ -805,9 +695,6 @@ mod tests {
         assert_eq!(extract_single_answer(&answers, "Deploy now?"), "Yes");
     }
 
-    /// The engine keys its answers map on the TRIMMED question text — the
-    /// tool must send a trimmed question or the lookup degrades to the
-    /// whole-map fallback for any model-emitted trailing newline.
     #[test]
     fn ask_user_question_trims_question_before_use() {
         let args = serde_json::json!({ "question": "  Deploy now?\n" });
@@ -854,7 +741,6 @@ mod tests {
         assert_eq!(result["content"][0]["text"], "Yes");
     }
 
-    /// MCP cannot end a Codex turn, so a quiet answer asks the agent to stop.
     #[test]
     fn a_quiet_answer_tells_the_agent_to_end_its_turn() {
         let resp: AskUserQuestionResponseBody = serde_json::from_value(serde_json::json!({

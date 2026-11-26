@@ -178,6 +178,8 @@ html, html[data-theme-mode="dark"] {
     --lucidos-mark-fg: #ffffff;
     --claude-mark: var(--initiator-coding-agent);
     --codex-mark: var(--text-primary);
+    --agent-icon-theme: var(--accent);
+    --agent-icon-muted: var(--text-muted);
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);

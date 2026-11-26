@@ -221,7 +221,7 @@ async function fetchWithDefaults(url: string, init: RequestInit | undefined, tim
   }
 }
 
-async function fetchWithDeadline(url: string, init: RequestInit, timeoutMs: number | undefined): Promise<Response> {
+export async function fetchWithDeadline(url: string, init: RequestInit, timeoutMs: number | undefined): Promise<Response> {
   if (timeoutMs === undefined) return fetch(url, init);
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;

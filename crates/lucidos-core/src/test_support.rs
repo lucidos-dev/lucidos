@@ -1,10 +1,6 @@
-//! Shared helpers for unit tests that need a real Postgres connection.
-//! Each call to `setup_test_db` clones a fresh, migrated database, and returns
-//! the pool plus the database name to pass back to `teardown_test_db`.
-
 #![cfg(any(test, feature = "test-support"))]
 
-/// Inbox query tests share the production decoder slot across test databases.
+/// INVARIANT: Inbox query tests share the production decoder slot across test databases.
 pub static DIAGNOSTIC_QUERY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use crate::core::store::MIGRATOR;
@@ -51,7 +47,6 @@ impl sqlx::error::DatabaseError for ServerError {
     }
 }
 
-/// A server error carrying the SQLSTATE `code`, as Postgres would send it.
 pub fn server_error(code: &'static str, message: &str) -> sqlx::Error {
     sqlx::Error::Database(Box::new(ServerError {
         code,
@@ -59,7 +54,7 @@ pub fn server_error(code: &'static str, message: &str) -> sqlx::Error {
     }))
 }
 
-/// Overrun every subscriber's buffer, so its next `recv` is a
+/// INVARIANT: Overrun every subscriber's buffer, so its next `recv` is a
 /// `RecvError::Lagged`. The way to reproduce a lag without timing: emit the
 /// event under test first, flood, then hand the subscriber's first `recv` to
 /// its one-step seam.
@@ -82,9 +77,6 @@ fn admin_url() -> String {
         .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/postgres".into())
 }
 
-/// An `LlmProvider` that hands out one scripted reply per call and reports a
-/// fixed token usage. Lets a test drive a retry or resample loop, and assert
-/// on the `ContextCaptured` rows each round trip leaves behind.
 pub struct ScriptedProvider {
     replies: std::sync::Mutex<std::vec::IntoIter<String>>,
     model: String,
@@ -93,8 +85,6 @@ pub struct ScriptedProvider {
     requests: std::sync::Mutex<Vec<RecordedRequest>>,
 }
 
-/// What one `ScriptedProvider` call was asked: the system prompt and the text
-/// of each message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedRequest {
     pub system_prompt: Option<String>,
@@ -102,8 +92,6 @@ pub struct RecordedRequest {
 }
 
 impl ScriptedProvider {
-    /// One reply per expected call, in order. Running out is an error, which
-    /// is what catches a loop calling more times than the test expects.
     pub fn new(model: &str, replies: Vec<&str>) -> Self {
         Self {
             replies: std::sync::Mutex::new(
@@ -120,7 +108,6 @@ impl ScriptedProvider {
         }
     }
 
-    /// Every request the provider has received, oldest first.
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.requests.lock().expect("recorded requests").clone()
     }
@@ -188,11 +175,6 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
     }
 }
 
-/// An `LlmProvider` that answers a chat judgment, and keeps every user
-/// message and tool list it was sent.
-///
-/// One reply serves every call. The usage matches [`ScriptedProvider`]'s, so a
-/// capture test asserts the same numbers on either.
 pub struct JudgmentChatStub {
     reply: Result<serde_json::Value, String>,
     model: String,
@@ -210,7 +192,6 @@ impl JudgmentChatStub {
         }
     }
 
-    /// Answers through the answer tool with these arguments.
     pub fn answering(arguments: serde_json::Value) -> Self {
         Self::new(Ok(serde_json::json!({
             "content": null,
@@ -222,7 +203,6 @@ impl JudgmentChatStub {
         })))
     }
 
-    /// Has the reply name `model` as the one that served it.
     pub fn served_by(mut self, model: &str) -> Self {
         if let Ok(reply) = self.reply.as_mut() {
             reply["served_model"] = model.into();
@@ -230,17 +210,14 @@ impl JudgmentChatStub {
         self
     }
 
-    /// Ignores the tool and replies in text.
     pub fn replying(text: &str) -> Self {
         Self::new(Ok(serde_json::json!({ "content": text, "tool_calls": [] })))
     }
 
-    /// The call itself fails.
     pub fn failing(error: &str) -> Self {
         Self::new(Err(error.to_string()))
     }
 
-    /// This stub, reporting a write of `tokens` to the 1-hour cache.
     pub fn writing_the_1h_cache(mut self, tokens: u32) -> Self {
         if let Ok(reply) = &mut self.reply {
             reply["usage"]["cache_creation_tokens"] = tokens.into();
@@ -249,7 +226,6 @@ impl JudgmentChatStub {
         self
     }
 
-    /// The user messages sent so far.
     pub fn messages(&self) -> Vec<String> {
         self.sent
             .lock()
@@ -297,7 +273,6 @@ impl crate::llm::provider::LlmProvider for JudgmentChatStub {
     }
 }
 
-/// Every auxiliary capture of one purpose on one thread, oldest first.
 pub async fn aux_captures(pool: &PgPool, thread_id: Uuid, purpose: &str) -> Vec<serde_json::Value> {
     sqlx::query_scalar::<_, serde_json::Value>(
         "SELECT payload FROM events \
@@ -312,7 +287,7 @@ pub async fn aux_captures(pool: &PgPool, thread_id: Uuid, purpose: &str) -> Vec<
     .expect("read auxiliary captures")
 }
 
-/// Connection URL for a throwaway database created by `setup_test_db`. Lets a
+/// INVARIANT: Connection URL for a throwaway database created by `setup_test_db`. Lets a
 /// test open its own dedicated connection to the same DB, as a restarted engine
 /// would.
 ///
@@ -328,9 +303,6 @@ pub fn test_db_url(db_name: &str) -> String {
         Some((head, q)) => (head, Some(q)),
         None => (base.as_str(), None),
     };
-    // Start looking after the `//` that opens the authority. A URL naming no
-    // database then keeps its host, rather than losing everything before the
-    // last slash.
     let authority_start = before_query.find("//").map(|i| i + 2).unwrap_or(0);
     let swapped = match before_query[authority_start..].find('/') {
         Some(i) => format!("{}/{}", &before_query[..authority_start + i], db_name),
@@ -342,19 +314,16 @@ pub fn test_db_url(db_name: &str) -> String {
     }
 }
 
-/// The agent role URL unit tests record in place of the one boot provisions.
 pub const AGENT_DATABASE_URL: &str =
     "postgresql://lucidos_test_agent:pw@localhost:5432/lucidos_test?options=-c%20default_transaction_read_only%3Don";
 
-/// Record [`AGENT_DATABASE_URL`] as boot would. The first record wins, and a
+/// INVARIANT: Record [`AGENT_DATABASE_URL`] as boot would. The first record wins, and a
 /// test that builds a whole engine records the role it provisioned. So a test
 /// reads the recorded URL, never this constant.
 pub fn install_agent_database_url() {
     crate::core::set_agent_database_url(AGENT_DATABASE_URL.to_string());
 }
 
-/// A fresh database with this branch's full schema, cloned from the migrated
-/// template (`template_db_name`). Each call gets its own database.
 pub async fn setup_test_db() -> (PgPool, String) {
     let db_name = format!(
         "lucidos_test_{}",
@@ -369,7 +338,7 @@ pub async fn setup_test_db() -> (PgPool, String) {
     (pool, db_name)
 }
 
-/// The template a migration set clones from. The hash covers every migration's
+/// INVARIANT: The template a migration set clones from. The hash covers every migration's
 /// version and checksum, so an edited or added migration names a new template.
 /// The prefix stays outside `lucidos_test_%`, which `test-engine.sh` sweeps.
 fn template_db_name(migrator: &sqlx::migrate::Migrator) -> String {
@@ -383,11 +352,9 @@ fn template_db_name(migrator: &sqlx::migrate::Migrator) -> String {
     format!("lucidos_template_{}", &digest[..16])
 }
 
-/// The next template build drops any other template built longer ago than
-/// this. So a container shared by many branches does not keep every schema.
 const STALE_TEMPLATE_SECS: i64 = 7 * 24 * 3600;
 
-/// Clone `template` into `db_name`, building the template first if needed.
+/// INVARIANT: Clone `template` into `db_name`, building the template first if needed.
 ///
 /// Locking, on `hashtext(template)` as a session advisory lock: a clone holds
 /// it shared, a build or a stale-template drop holds it exclusive. So a
@@ -428,8 +395,6 @@ async fn template_is_ready(admin: &mut sqlx::PgConnection, template: &str) -> bo
         .unwrap_or(false)
 }
 
-/// `FILE_COPY` copies the template's files, which beats the WAL-logged default
-/// for a small database. Servers before 15 know only the plain clone.
 async fn create_from_template(admin: &mut sqlx::PgConnection, template: &str, db_name: &str) {
     let server_version: i32 =
         sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
@@ -442,7 +407,7 @@ async fn create_from_template(admin: &mut sqlx::PgConnection, template: &str, db
         ""
     };
     let sql = format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\"{strategy}");
-    // Postgres refuses a clone while any session is connected to the template
+    // INVARIANT: Postgres refuses a clone while any session is connected to the template
     // (55006). Nobody should be, since it disallows connections, but a backend
     // still closing can linger for a moment.
     for attempt in 1.. {
@@ -458,7 +423,7 @@ async fn create_from_template(admin: &mut sqlx::PgConnection, template: &str, db
     }
 }
 
-/// Build `template` with the same migrations a fresh database used to run, then
+/// INVARIANT: Build `template` with the same migrations a fresh database used to run, then
 /// mark it a template that refuses connections. The mark is the ready signal,
 /// so a build that died half-way is dropped and redone.
 async fn build_template_db(admin: &mut sqlx::PgConnection, template: &str) {
@@ -505,16 +470,12 @@ async fn build_template_db(admin: &mut sqlx::PgConnection, template: &str) {
         .expect("release template build lock");
 }
 
-/// Drop every other template built more than `STALE_TEMPLATE_SECS` ago that no
-/// clone holds right now. A branch still using one rebuilds it on its next test.
 async fn drop_stale_templates(admin: &mut sqlx::PgConnection, keep: &str) {
     for name in stale_templates(admin, keep, None).await {
         drop_if_still_stale(admin, keep, &name).await;
     }
 }
 
-/// Templates other than `keep` built more than `STALE_TEMPLATE_SECS` ago, or
-/// never finished. `only` narrows the answer to one name.
 async fn stale_templates(
     admin: &mut sqlx::PgConnection,
     keep: &str,
@@ -538,8 +499,6 @@ async fn stale_templates(
     .expect("list stale templates")
 }
 
-/// Drop `name` under its exclusive lock, judging it stale again once locked:
-/// another test run may have rebuilt it since the list was read.
 async fn drop_if_still_stale(admin: &mut sqlx::PgConnection, keep: &str, name: &str) {
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
         .bind(name)
@@ -550,7 +509,6 @@ async fn drop_if_still_stale(admin: &mut sqlx::PgConnection, keep: &str, name: &
         return;
     }
     if !stale_templates(admin, keep, Some(name)).await.is_empty() {
-        // Best effort: a template that will not drop costs only disk.
         let _ = sqlx::query(&format!("ALTER DATABASE \"{name}\" WITH IS_TEMPLATE false"))
             .execute(&mut *admin)
             .await;
@@ -565,7 +523,7 @@ async fn drop_if_still_stale(admin: &mut sqlx::PgConnection, keep: &str, name: &
         .expect("release stale template lock");
 }
 
-/// Emit one thread event as test setup and return the id of the row it wrote.
+/// INVARIANT: Emit one thread event as test setup and return the id of the row it wrote.
 ///
 /// **Unwraps both levels of `EventBus::emit`, and that is the whole point.**
 /// It returns `Result<Option<EmitResult>>`, so a seed written as
@@ -594,11 +552,6 @@ pub async fn seed_thread_event(bus: &EventBus, thread_id: Uuid, event: ThreadEve
     .event_id
 }
 
-/// Insert a card event as a row written before the one-open-card gate.
-///
-/// A thread upgraded with several open cards keeps them, and its readers must
-/// still list each one. The bus now refuses to create that state, so a raw
-/// insert stands in for the old data. It runs no projection.
 pub async fn seed_pre_gate_card(pool: &PgPool, thread_id: Uuid, event: ThreadEvent) {
     let event_type = event.event_type();
     let payload = event.to_payload(&EventMeta::NONE);
@@ -616,13 +569,6 @@ pub async fn seed_pre_gate_card(pool: &PgPool, thread_id: Uuid, event: ThreadEve
     .unwrap_or_else(|e| panic!("insert pre-gate {event_type} on thread {thread_id}: {e}"));
 }
 
-/// Block until this database has `n` backends waiting on a lock. That is the
-/// signal that a racing statement reached its lock, rather than merely having
-/// been spawned. Scoped to `current_database()`, so a concurrent test's
-/// disposable database cannot satisfy it.
-///
-/// Panics rather than returning on timeout: a race that never materialised
-/// means the test proved nothing, and passing quietly is how it would rot.
 pub async fn wait_until_blocked_on_locks(pool: &PgPool, n: i64) {
     for _ in 0..200 {
         let blocked: i64 = sqlx::query_scalar(
@@ -640,8 +586,6 @@ pub async fn wait_until_blocked_on_locks(pool: &PgPool, n: i64) {
     panic!("fewer than {n} backends ever blocked on a lock, so the race never happened");
 }
 
-/// Make Postgres refuse every insert of `event_type` from now on, so an emit
-/// fails at Persist exactly as a real store error would. One per database.
 pub async fn refuse_event_type(pool: &PgPool, event_type: &str) {
     sqlx::query(&format!(
         "CREATE FUNCTION refuse_event() RETURNS trigger AS $$ BEGIN \
@@ -660,8 +604,6 @@ pub async fn refuse_event_type(pool: &PgPool, event_type: &str) {
     .expect("create the refusing trigger");
 }
 
-/// A new chat thread opened by a human message, so it has a
-/// `thread_summaries` row for later events to project into.
 pub async fn seed_chat_thread(bus: &EventBus, text: &str) -> Uuid {
     let thread_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
@@ -677,7 +619,6 @@ pub async fn seed_chat_thread(bus: &EventBus, text: &str) -> Uuid {
     thread_id
 }
 
-/// A person's message, with every optional field empty.
 pub fn message_received(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
         provider: None,
@@ -696,8 +637,6 @@ pub fn message_received(text: &str) -> ThreadEvent {
     }
 }
 
-/// One of each side-question event, for the tests pinning that no agent,
-/// trigger or event wait ever sees one (ADR 0320).
 pub fn every_side_question_event() -> Vec<ThreadEvent> {
     let side_question_id = Uuid::new_v4();
     vec![
@@ -718,14 +657,6 @@ pub fn every_side_question_event() -> Vec<ThreadEvent> {
     ]
 }
 
-/// Build a tiny git repo with `main` + initial commit and a worktree on
-/// `branch`. Returns `(tmpdir, repo_root, worktree_path)`. Caller must keep
-/// `tmpdir` in scope for the test duration: dropping it `rm -rf`'s the repo.
-///
-/// Shared by tests that need a real on-disk git repo + worktree pair (the
-/// `seed_branch_work` tests in `session_seed_tests.rs` and the startup
-/// sweep tests in `agent_recovery_tests.rs`). The same boilerplate also lives
-/// in git_ops_tests.rs / worktree_cleanup_tests.rs.
 pub async fn make_repo_and_worktree(branch: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -754,9 +685,6 @@ pub async fn make_repo_and_worktree(branch: &str) -> (tempfile::TempDir, PathBuf
     (tmp, repo, wt)
 }
 
-/// Read one thread's projected change state, reason and restart flag included.
-/// Panics if the row is missing: every caller seeds a `SessionStarted` first,
-/// so a missing row means the projection write did not land.
 pub async fn read_change_state(
     pool: &PgPool,
     thread_id: Uuid,
@@ -777,7 +705,6 @@ pub async fn read_change_state(
     )
 }
 
-/// The coarse half of [`read_change_state`].
 pub async fn read_change_state_kind(
     pool: &PgPool,
     thread_id: Uuid,
@@ -785,8 +712,6 @@ pub async fn read_change_state_kind(
     read_change_state(pool, thread_id).await.kind()
 }
 
-/// Set one thread's change state directly, as a fixture. The `CHECK`
-/// constraints still apply, so an illegal state fails the test.
 pub async fn seed_change_state(
     pool: &PgPool,
     thread_id: Uuid,
@@ -812,13 +737,6 @@ pub async fn seed_change_state(
     .unwrap();
 }
 
-/// Emit `SessionStarted` on the `CodingAgent` channel so the projection
-/// upserts an `is_coding_agent=true, state='active'` row in `thread_summaries`. Pass
-/// `repo_id = Some(...)` to stamp `cc_repo_id` on the projection row (the
-/// external-repo branch); `None` covers the in-workspace common case.
-///
-/// `session_id` is a fixed sentinel — no test reads it back. The branch and
-/// repo_id are the per-test inputs that actually matter.
 pub async fn start_cc_session(
     bus: &EventBus,
     thread_id: Uuid,
@@ -850,9 +768,34 @@ pub async fn start_cc_session(
     .unwrap();
 }
 
-/// Whether this process is the child that boots a whole engine. The parent
-/// reruns `test` in a child with its own HOME, asserts it passed, and gets
-/// `false`.
+pub async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> Uuid {
+    start_cc_session(bus, thread_id, branch, None).await;
+    let change_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
+            change_id: change_id.to_string(),
+            description: Some("Fix".into()),
+            files: vec!["src/main.rs".into()],
+            requires_restart: false,
+            origin: None,
+            commit_sha: None,
+            branch_name: branch.into(),
+            repo_root: "/tmp".into(),
+            hardened: false,
+            incomplete: false,
+            set_aside: false,
+            path: String::new(),
+            diff: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    change_id
+}
+
 pub async fn in_engine_child(test: &str) -> bool {
     const CHILD: &str = "LUCIDOS_TEST_ENGINE_CHILD";
     if std::env::var(CHILD).as_deref() == Ok(test) {
@@ -890,8 +833,6 @@ pub async fn in_engine_child(test: &str) -> bool {
     false
 }
 
-/// Run the test `make_test` builds on the engine's own runtime and stack size.
-/// A test that drives a whole turn needs both: a test thread overflows on it.
 pub fn run_on_engine_runtime<M, F>(name: &'static str, make_test: M)
 where
     M: FnOnce() -> F + Send + 'static,
@@ -914,29 +855,23 @@ where
     }
 }
 
-/// A coding-agent thread with a session, a child of `parent` when given.
 pub async fn seed_coding_thread(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
     let thread_id = Uuid::new_v4();
     seed_coding_thread_as(bus, thread_id, parent).await;
     thread_id
 }
 
-/// [`seed_coding_thread`] under a known id, for a test that names the thread
-/// before it boots the engine.
 pub async fn seed_coding_thread_as(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>) {
     emit_cc(bus, thread_id, message_from_parent("work", parent)).await;
     start_cc_session(bus, thread_id, &format!("claude-code/{thread_id}"), None).await;
 }
 
-/// [`seed_coding_thread`] whose turn has ended, so a card Lucidos raises
-/// posts at once rather than waiting for the turn's end (ADR 0803).
 pub async fn seed_idle_coding_thread(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
     let thread_id = seed_coding_thread(bus, parent).await;
     end_coding_turn(bus, thread_id).await;
     thread_id
 }
 
-/// The coding agent's turn on `thread_id` ends.
 pub async fn end_coding_turn(bus: &EventBus, thread_id: Uuid) {
     emit_cc(
         bus,
@@ -957,8 +892,6 @@ pub async fn end_coding_turn(bus: &EventBus, thread_id: Uuid) {
     .await;
 }
 
-/// Put `thread_id` on hold as its own root, the way a Hold records it, and
-/// return the hold id. The engine's `place_hold` adds the tree reach.
 pub async fn seed_hold(bus: &EventBus, thread_id: Uuid) -> Uuid {
     let hold_id = Uuid::new_v4();
     seed_thread_event(
@@ -974,7 +907,7 @@ pub async fn seed_hold(bus: &EventBus, thread_id: Uuid) -> Uuid {
     hold_id
 }
 
-/// A legacy *successor thread* chain: `old` continued in a new thread, which
+/// INVARIANT: A legacy *successor thread* chain: `old` continued in a new thread, which
 /// opens as a child of `parent` when given. Nothing creates one any more, but
 /// their events stay and must keep reading as they did. Returns the successor.
 pub async fn seed_handoff(bus: &EventBus, old: Uuid, parent: Option<Uuid>) -> Uuid {
@@ -1018,8 +951,6 @@ async fn emit_cc(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
     .unwrap_or_else(|e| panic!("emit on {thread_id}: {e}"));
 }
 
-/// An `EventWaitStarted` armed now, watching `BackgroundBashCompleted` for an
-/// hour: the wait a coding agent's `lucidos background-task run` arms.
 pub fn event_wait_started(wait_id: Uuid) -> ThreadEvent {
     ThreadEvent::EventWaitStarted {
         background_timing: None,
@@ -1036,15 +967,6 @@ pub fn event_wait_started(wait_id: Uuid) -> ThreadEvent {
     }
 }
 
-/// Seed a credential for a test that only cares that one exists.
-///
-/// The store's mutators take the `EventBus` because a credential write and its
-/// `Credential{Created,Updated}` announcement are one operation (see
-/// `CredentialStore`'s type doc). A fixture has no bus of its own and no
-/// interest in the event, so this builds a throwaway one against the test
-/// database rather than pushing that ceremony into every seeding call site.
-/// Tests that assert ON the event build their own bus and call the store
-/// directly.
 pub async fn seed_credential(
     pool: &PgPool,
     service_name: &str,
@@ -1068,15 +990,6 @@ pub async fn seed_credential(
     .unwrap_or_else(|e| panic!("seed credential {service_name}: {e}"));
 }
 
-/// Delete a credential in a test.
-///
-/// Exists so callers outside the engine layer do not have to name
-/// `crate::engine::event_bus` to build a bus for the store's
-/// `CredentialDeleted` emit: `llm/*.rs` is forbidden from depending on
-/// `crate::engine` (see `llm::validate::tests::llm_does_not_depend_on_engine`).
-/// Still takes a NAME rather than the store's id, because that is what a
-/// fixture has in hand. It resolves the id first, so a caller does not have to
-/// thread one through just to clean up after itself.
 pub async fn delete_credential(pool: &PgPool, service_name: &str) {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let Some(id) = sqlx::query_scalar::<_, uuid::Uuid>(
@@ -1093,11 +1006,6 @@ pub async fn delete_credential(pool: &PgPool, service_name: &str) {
         .unwrap_or_else(|e| panic!("delete credential {service_name}: {e}"));
 }
 
-/// Register a device and give it a display name, for a test that needs one to
-/// exist (actor resolution, presence, device-scoped preferences).
-///
-/// Same rationale as [`seed_credential`]: the store's mutators own their
-/// `Device{Registered,Renamed}` emits, and a fixture has no bus of its own.
 pub async fn seed_device(pool: &PgPool, id: &str, user_agent: Option<&str>, name: Option<&str>) {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     crate::core::DeviceStore::register(pool, &bus, id, user_agent, None, None)
@@ -1110,12 +1018,7 @@ pub async fn seed_device(pool: &PgPool, id: &str, user_agent: Option<&str>, name
     }
 }
 
-/// Seed a connected OAuth account for a test that needs one to exist (token
-/// resolution, provider routing, scope merging).
-///
-/// Argument order mirrors `OAuthStore::connect` minus the bus and actor, which
-/// a fixture has no opinion about. Same rationale as [`seed_credential`].
-#[allow(clippy::too_many_arguments)] // mirrors the store's column list
+#[allow(clippy::too_many_arguments)]
 pub async fn seed_oauth_account(
     pool: &PgPool,
     provider: &str,
@@ -1140,13 +1043,7 @@ pub async fn seed_oauth_account(
     .await
 }
 
-/// Seed an account whose GRANTED scopes differ from the set it was ASKED for.
-///
-/// The shape a provider produces when it refuses part of a request (a Dropbox
-/// app whose Permissions tab has not enabled a scope). [`seed_oauth_account`]
-/// cannot express it: it seeds granted and desired identically, which is the
-/// ordinary case and says nothing about recovery.
-#[allow(clippy::too_many_arguments)] // mirrors the store's column list
+#[allow(clippy::too_many_arguments)]
 pub async fn seed_oauth_account_with_desired(
     pool: &PgPool,
     provider: &str,
@@ -1176,18 +1073,11 @@ pub async fn seed_oauth_account_with_desired(
     .map(|stored| stored.id)
 }
 
-/// Seed a global preference for a test that just needs one stored.
-///
-/// Same rationale as [`seed_credential`]: `PreferenceStore`'s writers announce
-/// `PreferencesChanged`, and a fixture has no bus of its own. Returns the
-/// store's `Result` so existing call sites keep their `.unwrap()`. Tests that
-/// assert ON the announcement build a bus and call the store directly.
 pub async fn seed_preference(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     crate::core::PreferenceStore::set(pool, &bus, key, value, None).await
 }
 
-/// Store a Claude gateway sign-in from `issuer`, through its store.
 pub async fn seed_claude_gateway_sign_in(pool: &PgPool, issuer: &str) {
     use crate::llm::claude_gateway::{account::ClaudeGatewayAccountStore, GatewayOrigin};
     let (bus, _callback_rx) = EventBus::new(pool.clone());
@@ -1203,13 +1093,11 @@ pub async fn seed_claude_gateway_sign_in(pool: &PgPool, issuer: &str) {
         .expect("store the sign-in");
 }
 
-/// Store a ChatGPT plan sign-in holding `access_token`, through its store.
 pub async fn seed_chatgpt_plan_sign_in(pool: &PgPool, access_token: &str) {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     crate::llm::chatgpt_plan::ChatGptPlanAccountStore::seed_sign_in(pool, &bus, access_token).await;
 }
 
-/// [`seed_preference`], scoped to one device.
 pub async fn seed_preference_for_device(
     pool: &PgPool,
     key: &str,
@@ -1220,10 +1108,6 @@ pub async fn seed_preference_for_device(
     crate::core::PreferenceStore::set_for_device(pool, &bus, key, value, device_id, None).await
 }
 
-/// Insert one row on a trigger's aggregate stream, back-dated to `created`.
-///
-/// A raw insert rather than an emit, because the run-history reads compare
-/// against `created`, and the bus always stamps the database's `now()`.
 pub async fn seed_trigger_event(
     pool: &PgPool,
     trigger_id: &str,
@@ -1245,26 +1129,11 @@ pub async fn seed_trigger_event(
     .expect("insert trigger event");
 }
 
-/// An `EventBus` backed by a pool that never dials, for tests whose subject is
-/// a rejection or a filesystem effect and that never reach an emit.
-///
-/// `connect_lazy` builds the pool without touching the network, so this stays a
-/// fast no-DB test. If a test using it DOES reach an emit, `emit_or_log` logs
-/// the connection failure rather than panicking, which is the wrong shape for
-/// an assertion: a test that cares about the event wants a real
-/// `setup_test_db`.
-///
-/// The short acquire timeout is what keeps "reaches an emit" cheap. sqlx retries
-/// a refused connection until the timeout expires, so on the 30s default a
-/// single unwanted emit stalls the test for half a minute (three writes in one
-/// test, and it is a 90s test).
 pub fn offline_event_bus() -> EventBus {
     let (bus, _callback_rx) = EventBus::new(offline_pool());
     bus
 }
 
-/// The never-dialling pool under [`offline_event_bus`], for a test whose
-/// subject refuses before any query.
 pub fn offline_pool() -> PgPool {
     PgPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(50))
@@ -1291,18 +1160,9 @@ pub async fn teardown_test_db(db_name: &str) {
     admin_pool.close().await;
 }
 
-/// Reading the engine's own sources, for the repo's source-scan tripwires
-/// (`announced_surfaces_tests`, the trigger write chokepoint guard).
-///
-/// Rust is not parsed. These helpers only locate the *production* text of each
-/// file so a scan can look for a structure the codebase forbids. Test modules
-/// are excluded by path convention and each file is truncated at its first
-/// top-level `#[cfg(test)]`, because a fixture doing the forbidden thing is
-/// setup rather than a real call site.
 pub mod source_scan {
     use std::path::{Path, PathBuf};
 
-    /// The source root of this crate.
     pub fn src_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
@@ -1316,7 +1176,6 @@ pub mod source_scan {
         ]
     }
 
-    /// Resolve paths in order from the foundation to the agent API.
     pub fn engine_source(rel: &str) -> PathBuf {
         source_roots()
             .into_iter()
@@ -1325,7 +1184,6 @@ pub mod source_scan {
             .unwrap_or_else(|| src_root().join(rel))
     }
 
-    /// A path convention test module.
     pub fn is_test_path(rel: &str) -> bool {
         rel.split('/').any(|part| {
             let base = part.strip_suffix(".rs").unwrap_or(part);
@@ -1333,11 +1191,6 @@ pub mod source_scan {
         })
     }
 
-    /// Read a source file with its inline test module cut off. Inline
-    /// `mod tests` sits at the end of the file by convention, so truncating at
-    /// the first top-level `#[cfg(test)]` drops it whole. A file-level
-    /// `#![cfg(test)]` never compiles outside tests, so it has no production
-    /// text at all.
     pub fn read_production_source(path: &Path) -> String {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -1355,7 +1208,6 @@ pub mod source_scan {
         }
     }
 
-    /// Production sources in the shared module tree, boot and the executable.
     pub fn production_sources() -> Vec<(String, String)> {
         let mut out = Vec::new();
         let boot = "../../lucidos-engine-boot/src";
@@ -1405,12 +1257,6 @@ pub mod source_scan {
     }
 }
 
-/// A self-signed certificate for `127.0.0.1` and `localhost`, and its private
-/// key, as PEM.
-///
-/// Built with the `openssl` crate rather than a new dev-dependency. It carries
-/// a SAN because rustls refuses a certificate with none before it weighs the
-/// signature, even for a client that accepts invalid certificates.
 pub fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
     use openssl::asn1::Asn1Time;
     use openssl::hash::MessageDigest;
@@ -1447,6 +1293,89 @@ pub fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
         builder.build().to_pem().unwrap(),
         key.private_key_to_pem_pkcs8().unwrap(),
     )
+}
+
+pub struct FakeHookAsker {
+    verdict: crate::core::event_hooks::HookVerdict,
+    asked: std::sync::Mutex<Vec<crate::core::event_hooks::PendingEvent>>,
+    hold: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+impl FakeHookAsker {
+    pub fn new(verdict: crate::core::event_hooks::HookVerdict) -> std::sync::Arc<Self> {
+        Self::held(verdict, None)
+    }
+
+    pub fn held(
+        verdict: crate::core::event_hooks::HookVerdict,
+        hold: Option<std::sync::Arc<tokio::sync::Notify>>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            verdict,
+            asked: std::sync::Mutex::new(Vec::new()),
+            hold,
+        })
+    }
+
+    pub fn asked(&self) -> Vec<crate::core::event_hooks::PendingEvent> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::core::event_hooks::EventHookAsker for FakeHookAsker {
+    async fn ask(
+        &self,
+        ask: crate::core::event_hooks::HookAsk<'_>,
+    ) -> crate::core::event_hooks::HookVerdict {
+        self.asked.lock().unwrap().push(ask.pending.clone());
+        if let Some(hold) = &self.hold {
+            hold.notified().await;
+        }
+        self.verdict.clone()
+    }
+}
+
+pub fn hook_refuses(reason: &str) -> crate::core::event_hooks::HookVerdict {
+    crate::core::event_hooks::HookVerdict::Refused(crate::core::event_hooks::Refusal {
+        cause: crate::core::event_hooks::RefusalCause::Refused,
+        reason: reason.into(),
+        detail: None,
+    })
+}
+
+pub async fn arm_hook(bus: &EventBus, slug: &str, event_type: &str) {
+    bus.emit(BusEvent::System(SystemEvent::EventHookArmed {
+        slug: slug.into(),
+        event_type: event_type.into(),
+        content_hash: "abc".into(),
+        actor: None,
+    }))
+    .await
+    .unwrap();
+}
+
+pub async fn install_refusing_hook(
+    bus: &EventBus,
+    slug: &str,
+    event_type: &str,
+    reason: &str,
+) -> std::sync::Arc<FakeHookAsker> {
+    let asker = FakeHookAsker::new(hook_refuses(reason));
+    bus.install_event_hook_asker(asker.clone()).await.unwrap();
+    arm_hook(bus, slug, event_type).await;
+    asker
+}
+
+pub async fn hook_refusals(pool: &PgPool, slug: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'EventHookRefused' \
+         AND payload->'data'->>'slug' = $1",
+    )
+    .bind(slug)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[cfg(test)]

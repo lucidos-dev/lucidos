@@ -46,6 +46,7 @@ pub(crate) enum SpawnRoot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefusedOrigin {
     Webhook,
+    EventHook,
     System,
     /// An agent with no thread to trace it to.
     Agent,
@@ -162,6 +163,7 @@ fn step(origin: MessageOrigin, linkage: Option<Uuid>) -> Step {
         MessageOrigin::Engine { reason } => Step::Root(root_of_engine_reason(reason)),
         MessageOrigin::Agent { .. } => Step::Root(SpawnRoot::Refused(RefusedOrigin::Agent)),
         MessageOrigin::Webhook { .. } => Step::Root(SpawnRoot::Refused(RefusedOrigin::Webhook)),
+        MessageOrigin::EventHook { .. } => Step::Root(SpawnRoot::Refused(RefusedOrigin::EventHook)),
         caller @ MessageOrigin::UnattestedCaller { .. } => {
             Step::Root(SpawnRoot::Unattested(caller))
         }
@@ -407,6 +409,7 @@ impl std::fmt::Display for SpawnRefusal {
             Self::Origin(origin) => {
                 let cause = match origin {
                     RefusedOrigin::Webhook => "a webhook",
+                    RefusedOrigin::EventHook => "an event hook",
                     RefusedOrigin::System => "the host system",
                     RefusedOrigin::Agent => "an agent with no thread to trace it to",
                     RefusedOrigin::Untraceable => "a cause the engine could not trace",

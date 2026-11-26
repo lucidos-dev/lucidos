@@ -121,7 +121,7 @@ function stampServiceWorker(): Plugin {
       };
       stamp(swPath);
       for (const name of Object.keys(bundle)) {
-        if (name.endsWith('.js')) stamp(resolve(outDir, name));
+        if (name.endsWith('.js') || name.endsWith('.html')) stamp(resolve(outDir, name));
       }
     },
   };

@@ -37,7 +37,7 @@ The append-only file in the *workspace gateway*'s data directory that records ev
 See also: *user*, *paired device*.
 
 ### Pairing code
-The 8-digit one-time code that makes a device a *paired device*, for a person who has to type. It works once and expires in five minutes. **It works only from another device on the LAN or the tailnet.** On the machine Lucidos runs on, and through a tunnel, a proxy or `tailscale serve`, Lucidos refuses it. It says to scan the QR or open the link instead (ADR 0615). Each code is minted beside a *pairing secret*, and using either spends both.
+The 8-digit one-time code that makes a device a *paired device*, for a person who has to type. It works once and expires in five minutes. **It works only from another device on the LAN or the tailnet.** On the machine Lucidos runs on, and through a tunnel, a proxy or `tailscale serve`, Lucidos refuses it. Scan the QR, open the pairing link or use the **Pairing secret or link** field (ADR 0615). Each code is minted beside a *pairing secret*, and using either spends both.
 
 Two places produce one to pass on: **Settings → Access → Pair a device** (press **Create a pairing code**), and `lucidos pair` on the machine Lucidos runs on. The desktop app mints a third silently for itself: it reads the local file that proves it is on the machine, and pairs its own window on launch.
 
@@ -88,6 +88,18 @@ See also: *gateway pairing*, *pairing secret*, `system-knowhow/lucidos-cli/subco
 A switch on one *gateway pairing*, on the gateway being opened: devices on the other gateway may also manage this gateway's *users* and *paired devices*. Off by default. It belongs to the pairing, never to a *user*, and reaches nothing else on this gateway (ADR 0656). `lucidos pair --gateway --manage` starts a pairing with it on.
 See also: *gateway pairing*, `system-knowhow/remote-access/settings-access-2.md` § Manage a remote gateway's users and devices.
 
+### Control grant
+A switch on one *gateway pairing*, on the gateway being opened: devices on the other gateway may create, start, stop and restore workspaces here, from their own Workspaces list. Off by default. It reaches nothing destructive: deleting and renaming stay with this gateway's own devices (ADR 0811). `lucidos pair --gateway --control` starts a pairing with it on.
+See also: *gateway pairing*, *gateway switcher*, `system-knowhow/remote-access/settings-access-2.md` § Control a remote gateway's workspaces.
+
+### Gateway switcher
+The row of pills above the Workspaces list that picks which gateway the list shows: **This gateway** first, then each *remote gateway* with a dot for whether it answers. **This gateway** keeps the usual list, local and remote rows mixed. Picking a remote lists its workspaces, and **New workspace**, **Restore**, **Start** and **Stop** act there when its *control grant* is on (ADR 0811). It shows only while a remote gateway is paired.
+See also: *control grant*, *remote workspace*.
+
+### Restore upload
+How a backup reaches the gateway for **Restore from backup**: in chunks, so any size passes a proxy that caps request bodies, such as a Cloudflare tunnel. The picker shows its progress. A dropped connection or a reload resumes where the gateway stopped, if the same file is picked again within 24 hours (ADR 0810).
+See also: *remote gateway*, `system-knowhow/remote-access.md`.
+
 ### Return access grant
 An optional grant on an existing *gateway pairing*, controlled by the gateway that holds the outgoing pairing. If A pairs to B, B gets no access back to A or A's other pairings. Only A's owner may enable return access so B's agents can read and start threads through A. Preserve the originating gateway, workspace, thread and source authorization. Off by default, one grant per source gateway.
 
@@ -115,7 +127,7 @@ Set it under **Settings → Access → Pair a gateway**, or with **Always allow*
 See also: *gateway pairing*, *return access grant*, `system-knowhow/remote-access/settings-access-2.md` § Remote start setting.
 
 ### Remote workspace
-A *workspace* on a *remote gateway*, opened through this gateway at `/<slug>@<name>/`, such as `/dev@cloud/`. The Workspaces list shows it among the local ones in the *workspace order*, tagged `@<name>` and greyed while its gateway does not answer. Its gateway owns starting, stopping, renaming and deleting it, so this gateway offers none of those. A thread link names one as `thread:dev@cloud/<uuid>`. Inside a remote workspace, a link without `@` means a workspace on that same remote gateway, since that gateway's agent wrote it.
+A *workspace* on a *remote gateway*, opened through this gateway at `/<slug>@<name>/`, such as `/dev@cloud/`. The Workspaces list shows it among the local ones in the *workspace order*, tagged `@<name>` and greyed while its gateway does not answer. Its gateway owns renaming and deleting it. Starting and stopping it, and creating or restoring workspaces there, need that gateway's *control grant* and the *gateway switcher*. A thread link names one as `thread:dev@cloud/<uuid>`. Inside a remote workspace, a link without `@` means a workspace on that same remote gateway, since that gateway's agent wrote it.
 See also: *remote gateway*, *gateway pairing*.
 
 ### External address

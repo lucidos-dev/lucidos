@@ -54,7 +54,7 @@ lucidos-shell-env = { path = "../lucidos-shell-env" }
 # Already in the lockfile through the engine.
 fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
-axum = { version = "0.7", features = ["macros", "multipart"] }
+axum = { version = "0.7", features = ["macros"] }
 # The WebSocket upgrade hop (ADR 0151). `reqwest` cannot carry an upgrade, so
 # that one path speaks HTTP/1.1 directly and then splices the two byte streams.
 # No WebSocket library here on purpose: the gateway never parses a frame. Both
@@ -77,6 +77,9 @@ dotenvy = "0.15"
 # crate already in the lockfile via the engine, so it does not widen the
 # gateway's dependency surface in any real sense.
 sha2 = "0.10"
+# A restore upload's tus headers carry base64: the filename metadata and the
+# chunk checksum (ADR 0810). Already in the lockfile via the engine.
+base64 = "0.22"
 # The relay signs each device claim with an HMAC keyed by the gateway
 # credential (ADR 0591). Already in the lockfile via the engine.
 hmac = "0.12"

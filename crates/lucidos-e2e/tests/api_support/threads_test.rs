@@ -17,7 +17,6 @@ async fn threads_list_returns_expected_shape() {
 
     let body: serde_json::Value = resp.json().await.expect("Invalid JSON");
 
-    // Must have expected top-level fields
     assert!(body["saved"].is_array(), "saved should be array");
     assert!(body["archive"].is_array(), "archive should be array");
     assert!(body["active"].is_array(), "active should be array");
@@ -25,8 +24,6 @@ async fn threads_list_returns_expected_shape() {
         body["active_threads"].is_array(),
         "active_threads should be array"
     );
-    // Total archived-pile size for the collapsed Archive badge — distinct from
-    // the loaded `archive` window.
     assert!(
         body["archive_count"].is_u64(),
         "archive_count should be a non-negative integer"
@@ -38,7 +35,6 @@ async fn thread_appears_after_sending_message() {
     let client = user_client().await;
     let marker = unique_marker("api-threads-list");
 
-    // Send a message to create a thread
     let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"listed {marker}\""),
@@ -51,12 +47,9 @@ async fn thread_appears_after_sending_message() {
         .await
         .expect("Chat request failed");
 
-    // Poll until the thread appears in archive (requires has_response = TRUE,
-    // i.e., the LLM has finished generating a response)
     let body = poll_threads_until_archive(&client, 30).await;
     let archive = body["archive"].as_array().unwrap();
 
-    // Verify thread has expected fields
     let thread = &archive[0];
     assert!(
         thread["thread_id"].is_string(),
@@ -77,7 +70,6 @@ async fn thread_messages_endpoint_returns_events() {
         .expect("Failed to connect to E2E workspace database");
     let marker = unique_marker("api-thread-msgs");
 
-    // Create a thread
     let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"messages {marker}\""),
@@ -90,17 +82,11 @@ async fn thread_messages_endpoint_returns_events() {
         .await
         .expect("Chat request failed");
 
-    // Find OUR thread by marker — archive[0] races with parallel tests that
-    // also create threads, and may resolve to a CC thread without any
-    // SessionMessage-producing events.
     let thread_id = poll_thread_summary_by_marker(&pool, &marker, 30)
         .await
         .thread_id
         .to_string();
 
-    // Poll messages until at least one appears — there can be a small window
-    // between the thread appearing in archive (thread_summaries projection) and
-    // the events being queryable via the messages endpoint.
     let messages_url = format!("{}/api/v1/threads/{}/messages", base_url(), thread_id);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -141,9 +127,6 @@ async fn disk_usage_worktrees_returns_inventory_shape() {
     let arr = body["worktrees"]
         .as_array()
         .expect("worktrees should be an array");
-    // Each row (if any) must carry the documented fields. We don't assume
-    // any particular row count — fresh test workspaces may have zero CC
-    // worktrees on disk.
     for row in arr {
         assert!(row["thread_id"].is_string(), "thread_id is string");
         assert!(row["worktree_path"].is_string(), "worktree_path is string");
@@ -156,8 +139,6 @@ async fn disk_usage_worktrees_returns_inventory_shape() {
     }
 }
 
-/// The summary says whether a recommended cleanup is running. That flag is
-/// how a reloaded page learns about a pass whose terminal event it missed.
 #[tokio::test]
 async fn disk_usage_summary_says_whether_a_cleanup_is_running() {
     let client = user_client().await;
@@ -179,9 +160,6 @@ async fn disk_usage_summary_says_whether_a_cleanup_is_running() {
     );
 }
 
-/// The bulk cleanup route is mounted and refuses an unknown action before it
-/// touches anything. A real pass is not run here: it would reclaim worktrees
-/// other e2e tests share this workspace with.
 #[tokio::test]
 async fn disk_usage_cleanup_refuses_an_unknown_action() {
     let client = user_client().await;
@@ -200,7 +178,6 @@ async fn thread_save_and_unsave() {
     let client = user_client().await;
     let marker = unique_marker("api-save");
 
-    // Create a thread
     let chat_url = format!("{}/api/v1/chat/stream", base_url());
     let chat_body = serde_json::json!({
         "message": format!("Say exactly: \"save-api {marker}\""),
@@ -213,13 +190,11 @@ async fn thread_save_and_unsave() {
         .await
         .expect("Chat request failed");
 
-    // Poll until the thread appears in archive
     let threads = poll_threads_until_archive(&client, 30).await;
     let thread_id = threads["archive"].as_array().unwrap()[0]["thread_id"]
         .as_str()
         .unwrap();
 
-    // Save the thread
     let save_url = format!("{}/api/v1/threads/save", base_url());
     let save_body = serde_json::json!({ "thread_id": thread_id });
     let save_resp = client
@@ -230,10 +205,6 @@ async fn thread_save_and_unsave() {
         .expect("Save request failed");
     assert_eq!(save_resp.status(), 200);
 
-    // Idempotent: a duplicate save (e.g. an iOS PWA double-submit) must be a
-    // 200 no-op, not a 409. Before the fix the second request hit the action
-    // guard after the first flipped is_saved=TRUE and 409'd, whose client
-    // handler then reverted the pin icon + toasted a spurious error.
     let save_again = client
         .post(&save_url)
         .json(&save_body)
@@ -246,7 +217,6 @@ async fn thread_save_and_unsave() {
         "Saving an already-saved thread must be an idempotent 200, not 409"
     );
 
-    // Verify it appears in saved
     let threads_url = format!("{}/api/v1/threads", base_url());
     let threads2: serde_json::Value = client
         .get(&threads_url)
@@ -264,7 +234,6 @@ async fn thread_save_and_unsave() {
         "Thread should appear in saved list"
     );
 
-    // Unsave the thread
     let unsave_url = format!("{}/api/v1/threads/unsave", base_url());
     let unsave_body = serde_json::json!({ "thread_id": thread_id });
     let unsave_resp = client
@@ -275,8 +244,6 @@ async fn thread_save_and_unsave() {
         .expect("Unsave request failed");
     assert_eq!(unsave_resp.status(), 200);
 
-    // Idempotent the other way too: a duplicate unsave on an already-unsaved
-    // thread is a 200 no-op, not a 409.
     let unsave_again = client
         .post(&unsave_url)
         .json(&unsave_body)
@@ -290,9 +257,6 @@ async fn thread_save_and_unsave() {
     );
 }
 
-/// A custom folder files a pin. Pinning with a folder lands the thread in it.
-/// A move needs a pinned thread and a folder the list holds. Unpinning drops
-/// the folder.
 #[tokio::test]
 async fn test_pin_into_a_custom_folder() {
     let client = user_client().await;
@@ -415,8 +379,6 @@ async fn test_pin_into_a_custom_folder() {
     client.delete(&prefs_url).send().await.ok();
 }
 
-/// Only a thread's own agent takes its child reports. A device caller, which
-/// holds no thread-bound origin token, is refused before anything is taken.
 #[tokio::test]
 async fn a_device_cannot_take_a_threads_child_reports() {
     let client = user_client().await;

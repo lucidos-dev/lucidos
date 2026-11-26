@@ -1,10 +1,3 @@
-//! `GET /api/v1/threads/:thread_id/cache-warmth`: how long the thread's prompt
-//! cache stays warm, and what the keep-alive does about it. `warmth` is
-//! `warm`, `cold` or `unknown`: a cache whose lifetime no evidence gives is
-//! never called either (ADR 0575). `remaining_secs` is set only when warm.
-//! `keep_alive` is null when cold. The status carries its own prices. `ttl`
-//! names the lifetime a warm cache was measured on, and what says so.
-
 use axum::{
     extract::{Path, State},
     Json,
@@ -23,11 +16,9 @@ pub(in crate::api) struct CacheWarmth {
     warmth: Warmth,
     remaining_secs: Option<i64>,
     keep_alive: Option<CacheKeepAliveStatus>,
-    /// Set only when warm.
     ttl: Option<WarmthTtl>,
 }
 
-/// The lifetime a warm cache was measured on, and its evidence (ADR 0575).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct WarmthTtl {
     lifetime: CacheLifetime,
@@ -37,9 +28,7 @@ struct WarmthTtl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum TtlEvidence {
-    /// The response split the cache write by lifetime.
     Reported,
-    /// The request asked for it, on a route that honours it.
     Requested,
 }
 

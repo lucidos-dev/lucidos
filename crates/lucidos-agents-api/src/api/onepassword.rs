@@ -1,4 +1,4 @@
-//! Settings, 1Password: the workspace's service account, which reads every
+//! INVARIANT: Settings, 1Password: the workspace's service account, which reads every
 //! *secret reference*.
 //!
 //! The token is a credential of type `onepassword_service_account`. These
@@ -15,17 +15,14 @@ use crate::core::secret_reference::ResolveFailure;
 use crate::core::{AuthType, CredentialStore};
 use crate::engine::thread_events::MessageOrigin;
 
-/// The service name a service account saved here is stored under.
 const SERVICE_NAME: &str = "1password-service-account";
 
-/// What Settings shows about the service account. Never the token.
 #[derive(Serialize)]
 pub(super) struct OnepasswordStatus {
     saved: bool,
     cli_path: Option<String>,
 }
 
-/// `PUT /api/v1/onepassword`. A blank `token` keeps the stored one.
 #[derive(Deserialize)]
 pub(super) struct SaveOnepasswordRequest {
     #[serde(default)]
@@ -61,8 +58,6 @@ async fn stored_account(pool: &PgPool) -> Result<Option<ServiceAccount>, ApiErro
         })
 }
 
-/// `GET /api/v1/onepassword`: whether a service account is saved, and the
-/// `op` path it names.
 async fn get_onepassword(
     State(state): State<AppState>,
 ) -> Result<Json<OnepasswordStatus>, ApiError> {
@@ -73,7 +68,6 @@ async fn get_onepassword(
     }))
 }
 
-/// `PUT /api/v1/onepassword`: save the token, the `op` path, or both.
 async fn save_onepassword(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -123,8 +117,6 @@ async fn save_onepassword(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /api/v1/onepassword`: remove every service account, which ends
-/// every secret reference.
 async fn delete_onepassword(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -154,8 +146,6 @@ async fn delete_onepassword(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /api/v1/onepassword/test`: run `op` with the saved service account
-/// and name the vaults it reaches.
 async fn test_onepassword(
     State(state): State<AppState>,
     headers: HeaderMap,

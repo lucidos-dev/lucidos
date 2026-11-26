@@ -83,7 +83,7 @@ Each `--duration-*` token is its 1x literal times `var(--duration-scale)`. That 
 - **Content-pane structural padding uses a `--space-*` token and one 1rem gutter.**
   - **The scale** is `--space-{xs,sm,md,lg,xl}`, in `base.css` and mirrored in `api/sdk_iframe.css`. Keep the two blocks identical. Never redefine a step.
   - **Every content-pane view shares the `--space-lg` horizontal gutter** on its structural padding: the toolbar, list rows, empty states and headers. `/harden` flags a raw `padding: N rem` gutter.
-  - **Carve-outs, each with a comment at the site:** full-bleed views (app-ui iframe, previews, diffs), the Files tree (`.file-item`), card-like elements (boxes, pills, chips, badges), inline controls, computed-px values, `1px` borders, `0` and `env()`.
+  - **Carve-outs need an `INVARIANT:` comment at each site:** full-bleed views (app-ui iframe, previews, diffs), the Files tree (`.file-item`), card-like elements (boxes, pills, chips, badges), inline controls, computed-px values, `1px` borders, `0` and `env()`.
 - **The content pane places every view; no view places itself.** Default-deny rules on `.content-pane-body` children, overlays included, give the *content column*, scroll gutter and *end space* (`docs/glossary.md`). Opt out only with `content-view-full-bleed`.
   - **Column** (`panels/content.css`): cap, centre, top padding. A view root sets only `padding-inline: var(--space-lg)`. Pinned by `content-pane-one-column.test.ts` and e2e.
   - **Scroll gutter** (`panels/shell.css`), kept while the view fits. Pinned by `content-pane-scroll-gutter.test.ts` and e2e.

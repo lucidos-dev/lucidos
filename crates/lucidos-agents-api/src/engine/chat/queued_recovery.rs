@@ -1,22 +1,3 @@
-//! Which queued follow-ups a thread still owes an answer for, asked of the
-//! event store rather than of an in-memory channel.
-//!
-//! A follow-up typed mid-turn is persisted as `MessageReceived` before it
-//! reaches the running turn's injection channel, so the message was never at
-//! risk. Only the answer to "has the loop consumed it" lived in memory, as a
-//! channel remainder that died with the process. Three already-written markers
-//! answer it instead: a `PromptInjected.injected_message_id` (consumed), a
-//! `QueuedMessageRemoved.removed_message_id` (retracted), and any event's
-//! `request_event_id` (a turn picked it up).
-//!
-//! [`STRANDED_QUEUED_MESSAGES_SQL`] is asked where the channel is GONE, which
-//! is the resume (`chat/rerun.rs`). The turn tail asks nothing: its drain is
-//! total while the process lives. The channel keeps delivery and the wakeup,
-//! since a row cannot un-park a tool blocked in `bash_output(wait_secs=…)`.
-//!
-//! Scope, rejected alternatives and the ordering decision:
-//! `docs/plans/2026-09-21-a-queued-follow-up-survives-the-restart.md`.
-
 use std::path::Path;
 
 use uuid::Uuid;
@@ -25,26 +6,6 @@ use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::types::ChatImage;
 use crate::engine::{InjectedPrompt, InjectedPromptKind};
 
-/// The undrained queued messages on a thread, oldest first.
-///
-/// `$1` thread id as text, `$2` the originating event of the turn that owns the
-/// drain, `$3` the window end sequence. A `const` so tests drive the exact
-/// predicate the callers run, like `THREAD_START_EVENTS_SQL`.
-///
-/// Each arm is a separate reason a message is not owed:
-///
-/// * `sequence > $2` keeps the window behind the interrupted turn. No lower
-///   bound would replay messages stranded weeks ago into a live conversation.
-/// * `sequence <= $3` stops at the reader's fence ([`window_end_sequence`]).
-/// * no `PromptInjected` naming it: the loop took it. Announcing a
-///   recovered message writes one, which is what makes a second pass a no-op.
-/// * no `QueuedMessageRemoved` naming it: a retraction beats a recovery.
-/// * no event stamped with it as `request_event_id`: a turn has it, running or
-///   finished. A TERMINATOR-only test let Continue take a live turn's message.
-///
-/// It never asks whether the message was spoken: a turn branching on a live
-/// call answers one question two ways (ADR 0149). A caller's utterance is a
-/// `SpokenMessageReceived`, which the event-type arm already excludes.
 pub(crate) const STRANDED_QUEUED_MESSAGES_SQL: &str = "\
 SELECT e.id, e.payload \
   FROM events e \
@@ -83,8 +44,6 @@ pub(crate) async fn window_end_sequence(
     .await
 }
 
-/// Run [`STRANDED_QUEUED_MESSAGES_SQL`] and rebuild each row as the
-/// `InjectedPrompt` the live path would have carried, attachments included.
 pub(crate) async fn undrained_user_messages(
     pool: &sqlx::PgPool,
     workspace: &Path,
@@ -121,10 +80,6 @@ pub(crate) fn images_for_row(
     (!images.is_empty()).then_some(images)
 }
 
-/// Rebuild one `MessageReceived` row as a `UserText` injection.
-///
-/// `mode` falls back to `Human` for the same reason the event's own serde
-/// default does: rows written before the field existed were all user-typed.
 fn prompt_from_message_row(
     workspace: &Path,
     id: Uuid,
@@ -154,8 +109,6 @@ fn prompt_from_message_row(
     }
 }
 
-/// Decode the wire spelling of `ActorMode`. Paired with `ActorMode::as_str`,
-/// which writes it.
 fn actor_mode_from_wire(s: &str) -> Option<ActorMode> {
     match s {
         "human" => Some(ActorMode::Human),

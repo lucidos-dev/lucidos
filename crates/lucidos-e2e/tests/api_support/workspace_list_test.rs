@@ -1,17 +1,5 @@
-//! `GET /api/v1/workspaces`: this machine's workspaces, as the engine's own
-//! gateway lists them.
-//!
-//! The request carries no local token, which is the sandboxed agent's position
-//! (ADR 0645). The harness attaches a gateway identity only when a live gateway
-//! lists this workspace (`workspace_label_test.rs` has the detail). So the
-//! expected answer is read from the identity the engine holds, never assumed.
-//!
-//! The projection's edge cases live in the unit tests beside the handler,
-//! `api/workspace_list.rs`.
-
 use crate::support::{base_url, http_client};
 
-/// The `content` of `<meta name="{name}" content="…">` in `html`, or `None`.
 fn meta_content(html: &str, name: &str) -> Option<String> {
     let start = html.find(&format!("<meta name=\"{name}\" content=\""))?;
     let value = html[start..].split_once("content=\"")?.1.split_once('"')?.0;
@@ -39,8 +27,6 @@ async fn workspace_list_needs_no_token_and_carries_only_the_projection() {
         .await
         .expect("Workspace list request failed");
     if !has_gateway {
-        // An engine with no gateway has no list to project, and says so
-        // rather than answering with an empty machine.
         assert_eq!(resp.status(), 503, "no gateway answers 503");
         return;
     }

@@ -1,6 +1,3 @@
-//! Plugin-query resolution, file-ownership guard, normalization, and
-//! check-plugin-updates survey tests.
-
 use std::path::PathBuf;
 
 use super::helpers::*;
@@ -9,20 +6,6 @@ use super::*;
 use crate::engine::event_bus::EventBus;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-// ---- Plugin-query resolution + delete-guard tests -------------------
-//
-// Regression for the bug where an LLM picked the app *folder*
-// (`anti-sycophancy-critique`) as the `uninstall_plugin` id, the lookup
-// failed because the registered plugin id was `no-role-playing`, and the
-// agent then bypassed the panel by calling `delete_file` on each path
-// individually. Two behaviors must hold afterwards:
-//   1. `resolve_plugin_query` accepts the id, the manifest name, OR an
-//      app folder name (case-insensitive, dash-normalized) and returns
-//      the canonical id.
-//   2. `find_plugin_owning_file` returns `Some(id)` for any path that a
-//      currently-installed plugin owns, so `delete_file` can refuse and
-//      route the agent back through the confirm panel.
-
 const APP_FIXTURE_MANIFEST: &str = r#"
 id = "no-role-playing"
 version = "0.1.2"
@@ -30,9 +13,6 @@ name = "No role playing"
 description = "test"
 "#;
 
-/// Build a fixture archive whose manifest id (`no-role-playing`) is
-/// deliberately different from its app folder (`anti-sycophancy-critique`)
-/// — the exact mismatch from the original bug report.
 fn build_app_fixture_archive(tmp: &Path) -> PathBuf {
     build_archive(
         tmp,
@@ -51,7 +31,6 @@ fn build_app_fixture_archive(tmp: &Path) -> PathBuf {
     )
 }
 
-/// Install the app-fixture into `scratch` and return the workspace root.
 async fn install_app_fixture(scratch: &Path, bus: &dyn EventBusEmitter) {
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
@@ -89,8 +68,6 @@ async fn resolve_plugin_query_matches_manifest_name_case_insensitive() {
     let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
-    // Manifest name is "No role playing" — same words, mixed casing,
-    // and a trailing space all resolve to the canonical id.
     for q in [
         "No role playing",
         "no role playing",
@@ -108,9 +85,6 @@ async fn resolve_plugin_query_matches_manifest_name_case_insensitive() {
 
 #[tokio::test]
 async fn resolve_plugin_query_matches_app_folder_name() {
-    // The original bug: agent passed `anti-sycophancy-critique` (the app
-    // folder) instead of `no-role-playing` (the plugin id). The fix must
-    // accept either.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -121,7 +95,6 @@ async fn resolve_plugin_query_matches_app_folder_name() {
         .expect("app folder name must resolve");
     assert_eq!(id, "no-role-playing");
 
-    // Same with a free-form re-spacing.
     let id = super::resolve_plugin_query(&pool, "Anti Sycophancy Critique")
         .await
         .expect("re-spaced app folder must resolve");
@@ -152,9 +125,6 @@ async fn resolve_plugin_query_unknown_returns_not_installed_error() {
 
 #[tokio::test]
 async fn resolve_plugin_query_ambiguous_lists_candidates() {
-    // Two installed plugins share the manifest name "Demo" — a plain
-    // `Demo` query matches both, must error and list both ids so the
-    // agent can pick one.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -197,9 +167,6 @@ async fn resolve_plugin_query_ambiguous_lists_candidates() {
 
 #[tokio::test]
 async fn resolve_plugin_query_ignores_uninstalled_plugin() {
-    // An uninstall hides the install record from `latest_install`; the
-    // resolver must respect that and report not-installed for both id
-    // and folder queries.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -215,7 +182,7 @@ async fn resolve_plugin_query_ignores_uninstalled_plugin() {
     );
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None)
+    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None, vec![])
         .await
         .expect("uninstall must succeed");
 
@@ -238,11 +205,6 @@ async fn resolve_plugin_query_ignores_uninstalled_plugin() {
 
 #[tokio::test]
 async fn prepare_uninstall_plugin_resolves_via_app_folder() {
-    // End-to-end version of the bug: the original install registered
-    // `no-role-playing` but the agent called `prepare_uninstall_plugin`
-    // with `anti-sycophancy-critique`. With the resolver in place, the
-    // sentinel must come back pointing at the canonical id and listing
-    // the recorded files.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -297,7 +259,6 @@ async fn find_plugin_owning_file_returns_none_for_unrelated_paths() {
     let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
-    // A user-authored file the plugin doesn't own — must not be guarded.
     let owner = super::find_plugin_owning_file(&pool, "artifacts/my-notes.md")
         .await
         .expect("query must succeed");
@@ -311,9 +272,6 @@ async fn find_plugin_owning_file_returns_none_for_unrelated_paths() {
 
 #[tokio::test]
 async fn find_plugin_owning_file_returns_none_after_uninstall() {
-    // Once the plugin is uninstalled, its old paths are no longer guarded
-    // — the user (or recovery agent) is free to delete leftover empty
-    // directories etc. without the engine refusing.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -324,7 +282,7 @@ async fn find_plugin_owning_file_returns_none_after_uninstall() {
     let _ = super::prepare_uninstall_plugin(&scratch, &pool, &pending, "no-role-playing").await;
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None)
+    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None, vec![])
         .await
         .expect("uninstall must succeed");
 
@@ -341,9 +299,6 @@ async fn find_plugin_owning_file_returns_none_after_uninstall() {
 
 #[tokio::test]
 async fn find_plugin_owning_app_returns_owner_for_installed_app() {
-    // The app-delete mirror of the file guard: the fixture's app folder is
-    // `anti-sycophancy-critique`, installed by plugin `no-role-playing`.
-    // Deleting that app must resolve to the owning plugin so the handler 409s.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -361,8 +316,6 @@ async fn find_plugin_owning_app_returns_owner_for_installed_app() {
 
 #[tokio::test]
 async fn find_plugin_owning_app_returns_none_for_standalone_app() {
-    // A standalone app (no PluginInstalled record) must NOT resolve to an
-    // owner — it deletes directly, no 409.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -376,10 +329,6 @@ async fn find_plugin_owning_app_returns_none_for_standalone_app() {
         "standalone apps must not resolve to an owner"
     );
 
-    // Prefix-boundary: the trailing slash in `apps/<id>/` means a strict
-    // prefix of an owned folder must NOT match. The plugin owns
-    // `apps/anti-sycophancy-critique/...`; `anti-sycophancy` is a prefix but a
-    // different app and must delete directly (no 409).
     let owner = super::find_plugin_owning_app(&pool, "anti-sycophancy")
         .await
         .expect("query must succeed");
@@ -393,7 +342,6 @@ async fn find_plugin_owning_app_returns_none_for_standalone_app() {
 
 #[tokio::test]
 async fn find_plugin_owning_app_returns_none_after_uninstall() {
-    // Once the plugin is uninstalled, its app is no longer guarded.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let (_tmp, scratch) = fresh_workspace();
@@ -404,7 +352,7 @@ async fn find_plugin_owning_app_returns_none_after_uninstall() {
     let _ = super::prepare_uninstall_plugin(&scratch, &pool, &pending, "no-role-playing").await;
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None)
+    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None, vec![])
         .await
         .expect("uninstall must succeed");
 
@@ -430,9 +378,6 @@ fn normalize_plugin_query_collapses_case_whitespace_and_dashes() {
     assert_eq!(n(""), "");
 }
 
-/// Regression: `check_plugin_updates(None)` must not surface a plugin once
-/// it's been uninstalled. Drives the same flow as the LLM tool — install,
-/// uninstall, then survey — and asserts the survey is empty.
 #[tokio::test]
 async fn check_plugin_updates_skips_uninstalled_plugin() {
     let (pool, db_name) = setup_test_db().await;
@@ -447,17 +392,15 @@ async fn check_plugin_updates_skips_uninstalled_plugin() {
         .await
         .expect("install must succeed");
 
-    // Uninstall via the production code path (prepare → confirm).
     let pending: std::sync::Arc<PendingUninstallsMap> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let _ = prepare_uninstall_plugin(&scratch, &pool, &pending, "fixture-plugin").await;
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    uninstall_with_bus(&scratch, &bus, &entry, &[], None)
+    uninstall_with_bus(&scratch, &bus, &entry, &[], None, vec![])
         .await
         .expect("uninstall must succeed");
 
-    // Survey: no installed plugins → empty report.
     let report_json = check_plugin_updates_impl(&scratch, &pool, None).await;
     let report: Vec<serde_json::Value> =
         serde_json::from_str(&report_json).expect("report parses as JSON");
@@ -467,7 +410,6 @@ async fn check_plugin_updates_skips_uninstalled_plugin() {
         report_json
     );
 
-    // Single-id check: explicit not-installed shape, not a stale install record.
     let single_json =
         check_plugin_updates_impl(&scratch, &pool, Some("fixture-plugin".to_string())).await;
     let single: Vec<serde_json::Value> = serde_json::from_str(&single_json).unwrap();
@@ -485,18 +427,10 @@ async fn check_plugin_updates_skips_uninstalled_plugin() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: legacy `PluginInstalled` events from before the
-/// `aggregate_id` projection was fixed have `aggregate_id = 'unknown'` even
-/// though the payload's manifest carries the real id. A subsequent
-/// `PluginUninstalled` (correctly stamped with the real id) must still be
-/// recognized as superseding the install — projection has to compare on the
-/// canonical id from the payload, not on `aggregate_id`. Reproduces the
-/// 2026-05-13 "browser-learning v0.1.0 still showing as installed" bug.
 #[tokio::test]
 async fn check_plugin_updates_ignores_install_with_legacy_unknown_aggregate_id() {
     let (pool, db_name) = setup_test_db().await;
 
-    // Legacy install: aggregate_id stamped 'unknown', payload manifest has real id.
     let legacy_install_payload = serde_json::json!({
         "type": "PluginInstalled",
         "data": {
@@ -528,7 +462,6 @@ async fn check_plugin_updates_ignores_install_with_legacy_unknown_aggregate_id()
     .await
     .expect("insert legacy install");
 
-    // Correct uninstall: aggregate_id matches the canonical id.
     let uninstall_payload = serde_json::json!({
         "type": "PluginUninstalled",
         "data": {
@@ -551,8 +484,6 @@ async fn check_plugin_updates_ignores_install_with_legacy_unknown_aggregate_id()
 
     let (_tmp, scratch) = fresh_workspace();
 
-    // Survey: legacy 'unknown' install + correct uninstall → projection
-    // must match by canonical id and report nothing installed.
     let report_json = check_plugin_updates_impl(&scratch, &pool, None).await;
     let report: Vec<serde_json::Value> =
         serde_json::from_str(&report_json).expect("report parses as JSON");
@@ -565,15 +496,10 @@ async fn check_plugin_updates_ignores_install_with_legacy_unknown_aggregate_id()
     teardown_test_db(&db_name).await;
 }
 
-/// Defensive cross-check: even if the registry projection drifted and
-/// reported a plugin as installed, surveys must skip plugins whose recorded
-/// files are all gone from disk. Catches future bugs where an uninstall
-/// path forgets to emit the event.
 #[tokio::test]
 async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk() {
     let (pool, db_name) = setup_test_db().await;
 
-    // Synthesize an install event but never write the files to disk.
     let install_payload = serde_json::json!({
         "type": "PluginInstalled",
         "data": {
@@ -607,7 +533,6 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
 
     let (_tmp, scratch) = fresh_workspace();
 
-    // Survey: registry says installed, but no files on disk → skip.
     let report_json = check_plugin_updates_impl(&scratch, &pool, None).await;
     let report: Vec<serde_json::Value> =
         serde_json::from_str(&report_json).expect("report parses as JSON");
@@ -617,8 +542,6 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
         report_json
     );
 
-    // Single-id mode still honors the explicit ask (defensive skip is
-    // survey-only — a direct check should still surface the registry state).
     let single_json =
         check_plugin_updates_impl(&scratch, &pool, Some("ghost-plugin".to_string())).await;
     let single: Vec<serde_json::Value> = serde_json::from_str(&single_json).unwrap();
@@ -628,10 +551,6 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
     teardown_test_db(&db_name).await;
 }
 
-/// The install-time `setup_thread_id` must round-trip through the
-/// `PluginInstalled` payload into the installed-plugin summary (it drives the
-/// Plugins panel card's Setup→Open button), and `app_id` must surface the app the
-/// "Open" button launches.
 #[tokio::test]
 async fn installed_summary_surfaces_setup_thread_and_app_id() {
     let (pool, db_name) = setup_test_db().await;
@@ -667,15 +586,11 @@ async fn installed_summary_surfaces_setup_thread_and_app_id() {
         Some(setup_tid.to_string().as_str()),
         "setup_thread_id must round-trip from the PluginInstalled payload"
     );
-    // The fixture's app folder differs from the plugin id, so primary_app_id
-    // falls back to the first (only) app directory.
     assert_eq!(plugin.app_id.as_deref(), Some("anti-sycophancy-critique"));
 
     teardown_test_db(&db_name).await;
 }
 
-/// An install with no setup thread (the common case) leaves `setup_thread_id`
-/// absent, and a plugin that ships no app leaves `app_id` absent.
 #[tokio::test]
 async fn installed_summary_omits_setup_and_app_when_absent() {
     let (pool, db_name) = setup_test_db().await;
@@ -683,7 +598,6 @@ async fn installed_summary_omits_setup_and_app_when_absent() {
     let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
-    // A knowhow-only fixture: no app dir, installed with no setup thread.
     let archive = build_fixture_archive(&archive_dir, "v1");
     install_from_source_with_bus(&scratch, &bus, archive.to_str().unwrap(), false)
         .await
@@ -708,17 +622,14 @@ async fn installed_summary_omits_setup_and_app_when_absent() {
 #[test]
 fn primary_app_id_prefers_plugin_id_then_first_app() {
     use super::registry::primary_app_id as p;
-    // No app files → nothing to open.
     assert_eq!(
         p(&["knowhow/x.md".into(), "triggers/t/run.md".into()], "plug"),
         None
     );
-    // Single app, folder name differs from plugin id → that app.
     assert_eq!(
         p(&["apps/dashboard/index.html".into()], "plug"),
         Some("dashboard".to_string())
     );
-    // Multiple apps, one matching the plugin id → prefer the matching one.
     assert_eq!(
         p(
             &["apps/zeta/index.html".into(), "apps/plug/index.html".into(),],
@@ -726,7 +637,6 @@ fn primary_app_id_prefers_plugin_id_then_first_app() {
         ),
         Some("plug".to_string())
     );
-    // Multiple apps, none matching → first alphabetically (deterministic).
     assert_eq!(
         p(
             &[

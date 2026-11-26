@@ -43,6 +43,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 #[path = "cleanup_actions.rs"]
 pub(crate) mod cleanup_actions;
+#[path = "finish_delete.rs"]
+mod finish_delete;
 #[path = "snapshot_restore.rs"]
 mod snapshot_restore;
 #[path = "trash_actions.rs"]
@@ -53,10 +55,8 @@ pub(crate) mod trash_actions;
 /// no-op rebuild does not raise the picker's "new gateway available" badge.
 pub const GATEWAY_BUILD_ID: &str = env!("GATEWAY_BUILD_ID");
 
-/// In-memory state of the picker's restore-from-backup flow. One slot, so one
-/// restore at a time, polled at `GET /~/api/v1/control/restore-status`. Never
-/// persisted: a restore that dies with the gateway is gone, and its
-/// half-provisioned workspace is cleaned up.
+/// Picker restore status. Running progress is transient; terminal results
+/// survive gateway re-exec until dismissed or superseded.
 #[derive(Clone, serde::Serialize, Default, Debug, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RestoreStatus {
@@ -72,13 +72,275 @@ pub enum RestoreStatus {
     /// Registered, and started on a best-effort basis. `warnings` are what
     /// did not come back, such as a pending change branch, for the user.
     Completed {
+        result_id: String,
         id: String,
         name: String,
         warnings: Vec<String>,
     },
     /// Failed before committing, so nothing was registered: cleanup removed the
     /// half-provisioned workspace. `error` is the user-facing message.
-    Failed { name: String, error: String },
+    Failed {
+        result_id: String,
+        name: String,
+        error: String,
+    },
+}
+
+#[derive(Default)]
+struct PickerRestore {
+    running: Option<RunningRestore>,
+    // Oldest first, so removing the newest unread result exposes the next.
+    unread: Vec<RestoreResult>,
+}
+
+struct RunningRestore {
+    result_id: String,
+    id: String,
+    name: String,
+    phase: String,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct RestoreResult {
+    result_id: String,
+    id: String,
+    name: String,
+    outcome: Result<Vec<String>, String>,
+}
+
+impl RestoreResult {
+    fn status(&self) -> RestoreStatus {
+        match &self.outcome {
+            Ok(warnings) => RestoreStatus::Completed {
+                result_id: self.result_id.clone(),
+                id: self.id.clone(),
+                name: self.name.clone(),
+                warnings: warnings.clone(),
+            },
+            Err(error) => RestoreStatus::Failed {
+                result_id: self.result_id.clone(),
+                name: self.name.clone(),
+                error: error.clone(),
+            },
+        }
+    }
+}
+
+impl PickerRestore {
+    const FILE_NAME: &str = "restore-results.json";
+
+    fn load(app_data: &Path) -> Result<Self, BoxError> {
+        let path = app_data.join(Self::FILE_NAME);
+        let unread = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                format!(
+                    "Invalid restore results at {}: {e}. Move the file aside to start the gateway without those unread results.",
+                    path.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(format!(
+                    "Cannot read restore results at {}: {e}. Check file access before starting the gateway.",
+                    path.display()
+                )
+                .into());
+            }
+        };
+        Ok(Self {
+            running: None,
+            unread,
+        })
+    }
+
+    fn save(app_data: &Path, unread: &[RestoreResult]) -> Result<(), ApiError> {
+        let result = (|| -> Result<(), BoxError> {
+            crate::atomic_file::write_owner_only(
+                &app_data.join(Self::FILE_NAME),
+                &serde_json::to_vec(unread)?,
+            )
+        })();
+        result.map_err(|e| ApiError::internal(format!("Could not save restore results: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod restore_result_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_restore_results_explain_how_to_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PickerRestore::FILE_NAME);
+        let contents = b"invalid JSON";
+        std::fs::write(&path, contents).unwrap();
+
+        let error = PickerRestore::load(dir.path()).err().unwrap().to_string();
+        assert!(error.contains(path.to_str().unwrap()));
+        assert!(error.contains("Move the file aside"));
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+
+        std::fs::rename(&path, path.with_extension("saved")).unwrap();
+        assert!(PickerRestore::load(dir.path()).unwrap().unread.is_empty());
+    }
+
+    fn finish(gateway: &GatewayState, id: &str, name: &str, outcome: Result<Vec<String>, String>) {
+        gateway.inner.restore.write().unwrap().running = Some(RunningRestore {
+            result_id: format!("{id}-attempt"),
+            id: id.into(),
+            name: name.into(),
+            phase: "starting".into(),
+        });
+        gateway.finish_picker_restore(outcome);
+    }
+
+    #[tokio::test]
+    async fn picker_restore_results_survive_gateway_reconstruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = || GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        let warnings = vec!["A pending branch could not be restored".into()];
+        let completed = RestoreStatus::Completed {
+            result_id: "first-attempt".into(),
+            id: "first".into(),
+            name: "First".into(),
+            warnings: warnings.clone(),
+        };
+        let error = "Invalid backup key";
+        let failed = RestoreStatus::Failed {
+            result_id: "second-attempt".into(),
+            name: "Second".into(),
+            error: error.into(),
+        };
+
+        let gateway = boot();
+        finish(&gateway, "first", "First", Ok(warnings));
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::metadata(gateway.app_data().join(PickerRestore::FILE_NAME))
+            .unwrap()
+            .permissions();
+        assert_eq!(permissions.mode() & 0o077, 0);
+        let gateway = boot();
+        assert_eq!(gateway.restore_status(), completed);
+        finish(&gateway, "second", "Second", Err(error.into()));
+        let gateway = boot();
+        assert_eq!(gateway.restore_status(), failed);
+        gateway.clear_restore_status("second-attempt").unwrap();
+        gateway.clear_restore_status("second-attempt").unwrap();
+        let gateway = boot();
+        assert_eq!(gateway.restore_status(), completed);
+
+        finish(&gateway, "second", "Second", Err(error.into()));
+        let refused = gateway
+            .restore_workspace("backup", "key".into(), Some("Second".into()), || {
+                Err(ApiError::internal("Archive claim failed"))
+            })
+            .await;
+        assert!(refused.is_err());
+        assert_eq!(boot().restore_status(), failed);
+
+        // The spawned restore cannot run until this current-thread test yields.
+        gateway
+            .restore_workspace("backup", "key".into(), Some("SECOND".into()), || {
+                Ok(dir.path().join("claimed-archive"))
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            gateway.restore_status(),
+            RestoreStatus::Running { .. }
+        ));
+        assert!(gateway.clear_restore_status("first-attempt").is_err());
+        let gateway = boot();
+        assert_eq!(gateway.restore_status(), completed);
+        gateway.clear_restore_status("first-attempt").unwrap();
+        assert_eq!(boot().restore_status(), RestoreStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn duplicate_http_dismissal_leaves_the_next_result_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = || GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        let gateway = boot();
+        finish(
+            &gateway,
+            "first",
+            "First",
+            Err("First restore failed".into()),
+        );
+        let first = gateway.restore_status();
+        finish(&gateway, "second", "Second", Ok(Vec::new()));
+        finish(&gateway, "third", "Third", Ok(Vec::new()));
+        let third = gateway.restore_status();
+        let routes = crate::control::router().with_state(gateway);
+        for (uri, expected) in [
+            ("/restore-status", StatusCode::BAD_REQUEST),
+            (
+                "/restore-status?result_id=second-attempt",
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "/restore-status?result_id=second-attempt",
+                StatusCode::NO_CONTENT,
+            ),
+        ] {
+            let response = routes
+                .clone()
+                .oneshot(
+                    axum::http::Request::delete(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::BAD_REQUEST {
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("Update the picker"));
+            }
+        }
+        let gateway = boot();
+        assert_eq!(gateway.restore_status(), third);
+        gateway.clear_restore_status("third-attempt").unwrap();
+        assert_eq!(boot().restore_status(), first);
+    }
+
+    #[tokio::test]
+    async fn failed_supersession_keeps_old_result_and_cleans_up_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        finish(&gateway, "test", "Test", Err("Invalid backup key".into()));
+        let previous = gateway.restore_status();
+
+        let results = gateway.app_data().join(PickerRestore::FILE_NAME);
+        let original = results.with_extension("saved");
+        std::fs::rename(&results, &original).unwrap();
+        std::fs::create_dir(&results).unwrap();
+        let archive = dir.path().join("claimed-archive");
+        std::fs::write(&archive, b"archive").unwrap();
+
+        let result = gateway
+            .restore_workspace("backup", "key".into(), Some("Test".into()), || {
+                Ok(archive.clone())
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!archive.exists());
+        assert!(gateway.clear_restore_status("test-attempt").is_err());
+        assert_eq!(gateway.restore_status(), previous);
+
+        std::fs::remove_dir(&results).unwrap();
+        std::fs::rename(original, results).unwrap();
+        let reconstructed = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        assert_eq!(reconstructed.restore_status(), previous);
+    }
+}
+
+fn remove_claimed_restore_archive(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        crate::log_legacy!("[Gateway] could not remove claimed restore archive: {error}");
+    }
 }
 
 /// Supervisor cadence + thresholds.
@@ -313,10 +575,10 @@ struct GatewayInner {
     /// only when the workspace boots healthy, is stopped, or a fresh attempt
     /// begins.
     boot_failures: RwLock<HashMap<String, BootFailure>>,
-    /// Single-slot state of the picker's restore-from-backup flow (see
-    /// [`RestoreStatus`]). Polled via the control API; never persisted.
-    restore: RwLock<RestoreStatus>,
+    /// One active restore and the ordered unread terminal results.
+    restore: RwLock<PickerRestore>,
     snapshot_restores: Mutex<HashSet<String>>,
+    control_jobs: crate::control_jobs::ControlJobs,
     #[cfg(test)]
     snapshot_test: Mutex<Option<Arc<snapshot_restore::OrderingProbe>>>,
     workspace_operations: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
@@ -353,6 +615,8 @@ struct GatewayInner {
     cleanup_review: Mutex<crate::cleanup::ReviewCache>,
     /// The update relay to the desktop client (ADR 0338).
     update_relay: crate::update_relay::UpdateRelay,
+    /// Staged restore uploads (ADR 0810).
+    restore_uploads: crate::restore_upload::RestoreUploads,
 }
 
 /// Where a running engine's pid comes from, for the slowness attribution.
@@ -484,8 +748,9 @@ impl GatewayState {
                 stamp_keys: RwLock::new(HashMap::new()),
                 boot_phases: RwLock::new(HashMap::new()),
                 boot_failures: RwLock::new(HashMap::new()),
-                restore: RwLock::new(RestoreStatus::default()),
+                restore: RwLock::new(PickerRestore::load(&scratch).unwrap()),
                 snapshot_restores: Mutex::new(HashSet::new()),
+                control_jobs: Default::default(),
                 #[cfg(test)]
                 snapshot_test: Mutex::new(None),
                 workspace_operations: Mutex::new(HashMap::new()),
@@ -511,12 +776,19 @@ impl GatewayState {
                 slowness: slowness::Slowness::default(),
                 cleanup_review: Mutex::new(crate::cleanup::ReviewCache::default()),
                 update_relay: crate::update_relay::UpdateRelay::default(),
+                restore_uploads: crate::restore_upload::RestoreUploads::new(
+                    crate::restore_upload::restore_uploads_path(&scratch),
+                ),
             }),
         }
     }
 
     pub(crate) fn app_data(&self) -> &PathBuf {
         &self.inner.app_data
+    }
+
+    pub(crate) fn restore_uploads(&self) -> &crate::restore_upload::RestoreUploads {
+        &self.inner.restore_uploads
     }
 
     pub(crate) fn has_desktop_client(&self) -> bool {
@@ -798,6 +1070,24 @@ impl GatewayState {
         self.clear_runtime_state(&workspace.id);
         self.clear_stop(&workspace.id);
         Ok(())
+    }
+
+    /// Run a long control mutation so a dropped request cannot cut it short
+    /// ([`crate::control_jobs`]).
+    pub(crate) async fn run_control_job<F>(
+        &self,
+        key: String,
+        start: impl FnOnce() -> F,
+    ) -> crate::control_jobs::JobOutcome
+    where
+        F: std::future::Future<Output = Result<crate::control_jobs::JobBody, ApiError>>
+            + Send
+            + 'static,
+    {
+        self.inner
+            .control_jobs
+            .run(key, crate::control_jobs::CONTROL_JOB_WAIT, start)
+            .await
     }
 
     pub(crate) fn cleanup_review_mutation(&self) -> CleanupReviewMutation {
@@ -1905,9 +2195,9 @@ impl GatewayState {
                     .or_else(|| self.snapshot_restore_failure(&ws.id))
                     .map(str::to_owned);
                 let path = ws.resolve_dir(self.app_data());
-                out.push(WorkspaceStatus::without_engine(
-                    &ws, path, health, last_error,
-                ));
+                let mut status = WorkspaceStatus::without_engine(&ws, path, health, last_error);
+                status.delete_interrupted = cleanup_failure.is_some();
+                out.push(status);
                 continue;
             }
             if let Some(stack) = stacks.get(&ws.id) {
@@ -3158,26 +3448,42 @@ impl GatewayState {
 
     /// Current restore-flow state, for the picker's poll.
     pub fn restore_status(&self) -> RestoreStatus {
-        self.inner
-            .restore
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or(RestoreStatus::Idle)
+        let Ok(st) = self.inner.restore.read() else {
+            return RestoreStatus::Idle;
+        };
+        if let Some(running) = &st.running {
+            return RestoreStatus::Running {
+                id: running.id.clone(),
+                name: running.name.clone(),
+                phase: running.phase.clone(),
+            };
+        }
+        st.unread
+            .last()
+            .map_or(RestoreStatus::Idle, RestoreResult::status)
     }
 
-    /// Clear a terminal (completed/failed) restore result back to Idle so the
-    /// picker's banner can be dismissed. Refused while a restore is running so a
-    /// stray call can't wipe live progress.
-    pub fn clear_restore_status(&self) -> Result<(), ApiError> {
+    /// Dismiss the unread result that matches the banner the picker saw.
+    pub fn clear_restore_status(&self, result_id: &str) -> Result<(), ApiError> {
         let mut st = self
             .inner
             .restore
             .write()
             .map_err(|_| ApiError::internal("restore state poisoned"))?;
-        if matches!(*st, RestoreStatus::Running { .. }) {
+        if st.running.is_some() {
             return Err(ApiError::conflict("A restore is in progress"));
         }
-        *st = RestoreStatus::Idle;
+        let Some(index) = st
+            .unread
+            .iter()
+            .position(|result| result.result_id == result_id)
+        else {
+            return Ok(());
+        };
+        let mut remaining = st.unread.clone();
+        remaining.remove(index);
+        PickerRestore::save(self.app_data(), &remaining)?;
+        st.unread = remaining;
         Ok(())
     }
 
@@ -3192,17 +3498,57 @@ impl GatewayState {
     /// Callers hold the registry lock across this read, which is what makes the
     /// pair atomic. Lock order is always registry then restore.
     fn restore_reserved_name(&self) -> Option<String> {
-        match self.inner.restore.read().ok().as_deref() {
-            Some(RestoreStatus::Running { name, .. }) => Some(name.clone()),
-            _ => None,
+        self.inner
+            .restore
+            .read()
+            .ok()?
+            .running
+            .as_ref()
+            .map(|running| running.name.clone())
+    }
+
+    /// Update the phase of an in-flight restore.
+    fn set_restore_phase(&self, phase: &str) {
+        if let Ok(mut st) = self.inner.restore.write() {
+            if let Some(running) = &mut st.running {
+                running.phase = phase.to_string();
+            }
         }
     }
 
-    /// Update the `phase` of an in-flight restore (no-op if not Running).
-    fn set_restore_phase(&self, phase: &str) {
-        if let Ok(mut st) = self.inner.restore.write() {
-            if let RestoreStatus::Running { phase: p, .. } = &mut *st {
-                *p = phase.to_string();
+    fn finish_picker_restore(&self, outcome: Result<Vec<String>, String>) {
+        let Ok(mut st) = self.inner.restore.write() else {
+            return;
+        };
+        let Some(RunningRestore {
+            result_id,
+            id,
+            name,
+            ..
+        }) = st.running.take()
+        else {
+            return;
+        };
+        if let Err(error) = &outcome {
+            crate::log_legacy!("[Gateway] restore '{id}' failed: {error}");
+        }
+        st.unread.push(RestoreResult {
+            result_id,
+            id,
+            name,
+            outcome,
+        });
+        if let Err(error) = PickerRestore::save(self.app_data(), &st.unread) {
+            crate::log_legacy!("[Gateway] {error:?}");
+            let warning = "The gateway could not save this restore result for its next launch.";
+            if let Some(result) = st.unread.last_mut() {
+                match &mut result.outcome {
+                    Ok(warnings) => warnings.push(warning.into()),
+                    Err(error) => {
+                        error.push(' ');
+                        error.push_str(warning);
+                    }
+                }
             }
         }
     }
@@ -3219,23 +3565,26 @@ impl GatewayState {
     ///
     /// The entry it commits auto-starts, like [`Self::create_workspace`]'s, so a
     /// restored workspace resumes its triggers and push at the next login.
+    ///
+    /// Name and reservation checks run before `take_archive`, so the user can
+    /// fix the name and reuse the staged upload (ADR 0810).
+    /// A failure saving superseded results discards the claimed archive.
     pub async fn restore_workspace(
         &self,
-        archive_tmp: PathBuf,
-        archive_filename: String,
+        archive_filename: &str,
         backup_key: String,
         requested_name: Option<String>,
+        take_archive: impl FnOnce() -> Result<PathBuf, ApiError>,
     ) -> Result<(String, String), ApiError> {
         // An explicit name wins, otherwise parse it from the archive filename.
         // A non-archive filename with no explicit name is a 400 telling the
         // picker to ask for one.
-        let derived = || registry::parse_workspace_name_from_archive(&archive_filename);
+        let derived = || registry::parse_workspace_name_from_archive(archive_filename);
         let name = requested_name
             .map(|n| n.trim().to_string())
             .filter(|n| !n.is_empty())
             .or_else(derived)
             .ok_or_else(|| {
-                let _ = std::fs::remove_file(&archive_tmp);
                 ApiError::bad_request(
                     "Could not determine a workspace name from the file — enter one.",
                 )
@@ -3251,72 +3600,67 @@ impl GatewayState {
         //
         // Lock order is registry then restore, everywhere, so the two can never
         // deadlock against each other.
-        let (id, port) = {
+        let (id, port, archive_tmp) = {
             let reg = self.inner.registry.lock().unwrap();
-            let mut st = self.inner.restore.write().map_err(|_| {
-                let _ = std::fs::remove_file(&archive_tmp);
-                ApiError::internal("restore state poisoned")
-            })?;
+            let mut st = self
+                .inner
+                .restore
+                .write()
+                .map_err(|_| ApiError::internal("restore state poisoned"))?;
             // Check-and-set the single slot, so two near-simultaneous restores
             // cannot both pass. The control handler's pre-check is a
             // best-effort fast-fail; this is the authoritative gate.
-            if matches!(*st, RestoreStatus::Running { .. }) {
-                let _ = std::fs::remove_file(&archive_tmp);
+            if st.running.is_some() {
                 return Err(ApiError::conflict("A restore is already in progress"));
             }
             // The name first, then the address it derives. A duplicate NAME is
             // the one the user can see, so say that when both are taken.
             if let Some(existing) = reg.find_by_display_name(&name, None) {
-                let _ = std::fs::remove_file(&archive_tmp);
                 return Err(ApiError::conflict(name_taken_message(&existing.name)));
             }
             let slug = registry::slugify(&name);
-            if let Err(refusal) = refuse_an_id_postgres_would_truncate(&name, &slug) {
-                let _ = std::fs::remove_file(&archive_tmp);
-                return Err(refusal);
-            }
+            refuse_an_id_postgres_would_truncate(&name, &slug)?;
             if let Some(existing) = reg.get(&slug) {
-                let _ = std::fs::remove_file(&archive_tmp);
                 return Err(ApiError::conflict(address_taken_message(
                     &slug,
                     &existing.name,
                 )));
             }
-            let port = reg.allocate_port().map_err(|e| {
-                let _ = std::fs::remove_file(&archive_tmp);
-                ApiError::internal(e.to_string())
+            let port = reg
+                .allocate_port()
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            let result_id = lucidos_local_token::mint_hex(16).map_err(|e| {
+                ApiError::internal(format!("Could not identify the restore attempt: {e}"))
             })?;
-            *st = RestoreStatus::Running {
+            let archive_tmp = take_archive()?;
+            if st.unread.iter().any(|result| result.id == slug) {
+                let remaining: Vec<_> = st
+                    .unread
+                    .iter()
+                    .filter(|result| result.id != slug)
+                    .cloned()
+                    .collect();
+                if let Err(error) = PickerRestore::save(self.app_data(), &remaining) {
+                    remove_claimed_restore_archive(&archive_tmp);
+                    return Err(error);
+                }
+                st.unread = remaining;
+            }
+            st.running = Some(RunningRestore {
+                result_id,
                 id: slug.clone(),
                 name: name.clone(),
                 phase: "starting".to_string(),
-            };
-            (slug, port)
+            });
+            (slug, port, archive_tmp)
         };
 
         let ws = Workspace::gateway_provisioned(id.clone(), name.clone(), port);
         let me = self.clone();
-        let (id_done, name_done) = (id.clone(), name.clone());
         tokio::spawn(async move {
             let outcome = me.run_restore(ws, &archive_tmp, &backup_key).await;
-            let _ = std::fs::remove_file(&archive_tmp);
-            let next = match outcome {
-                Ok(warnings) => RestoreStatus::Completed {
-                    id: id_done,
-                    name: name_done,
-                    warnings,
-                },
-                Err(e) => {
-                    crate::log_legacy!("[Gateway] restore '{}' failed: {}", id_done, e);
-                    RestoreStatus::Failed {
-                        name: name_done,
-                        error: e,
-                    }
-                }
-            };
-            if let Ok(mut st) = me.inner.restore.write() {
-                *st = next;
-            }
+            me.finish_picker_restore(outcome);
+            remove_claimed_restore_archive(&archive_tmp);
         });
 
         Ok((id, name))
@@ -3846,45 +4190,9 @@ impl GatewayState {
         if self.snapshot_restore_blocks(id) {
             return Err("workspace_restoring".into());
         }
-        let others = self
-            .inner
-            .registry
-            .lock()
-            .unwrap()
-            .workspaces
-            .iter()
-            .filter(|other| other.id != ws.id)
-            .cloned()
-            .collect::<Vec<_>>();
-        crate::cleanup::registered_resources(&others, self.app_data(), peers)?.require_unowned(
-            &ws.resolve_dir(self.app_data()),
-            &postgres::database_name(id)?,
-        )?;
-        // The database is dropped below by registry id, so a stopped workspace
-        // and an unhealthy stack with no `PgHandle` are cleaned up the same
-        // way. The shared Postgres cluster stays up for peers.
-        //
-        // Take the stack out from under the map lock first, so the blocking
-        // process signal does not pin the whole map.
-        let removed = self.inner.stacks.lock().await.remove(id);
-        if let Some(stack) = removed {
-            let mut s = stack.lock().await;
-            stop_engine_process(&mut s);
-        }
         let dir = ws.resolve_dir(self.app_data());
-        stack::reclaim_stale_engine(&dir);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let _owner = loop {
-            if let Some(owner) = lucidos_owner_lock::OwnerLock::try_acquire(
-                &lucidos_owner_lock::engine::lock_path(&dir),
-            )? {
-                break owner;
-            }
-            if Instant::now() >= deadline {
-                return Err("workspace stop timed out".into());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
+        self.require_unowned_by_others(ws, &dir, peers)?;
+        let _owner = self.stop_for_deletion(id, &dir).await?;
         let backend = self.inner.pg_backend.clone();
         let app_data = self.app_data().to_owned();
         let workspace = ws.clone();
@@ -3899,39 +4207,13 @@ impl GatewayState {
         .await??;
         entry.audit = Some(audit.clone());
         entry.save(&root)?;
-        let backend = self.inner.pg_backend.clone();
-        let app_data = self.app_data().to_owned();
-        let workspace_id = id.to_owned();
-        let deletion_operation = entry
-            .deletion_operation
-            .clone()
-            .ok_or("missing deletion identity")?;
-        tokio::task::spawn_blocking(move || {
-            postgres::cleanup_mark_original(&backend, &app_data, &workspace_id, &deletion_operation)
-        })
-        .await??;
-        entry.move_folder(&root)?;
-        self.trash_snapshots(id, &root)?;
-        // A failed drop leaves both registry and journal for explicit recovery.
-        self.teardown_postgres(ws).await?;
-        entry.phase = crate::trash::Phase::DatabaseDropped;
-        entry.save(&root)?;
-        let prune_entry = entry.clone();
-        let prune_root = root.clone();
-        tokio::task::spawn_blocking(move || prune_entry.prune_worktrees(&prune_root)).await??;
-        {
-            let mut reg = self.inner.registry.lock().unwrap();
-            let mut updated = reg.clone();
-            updated.remove(id)?;
-            updated.save(&self.inner.registry_path)?;
-            *reg = updated;
-        }
-        self.forget_workspace_order(id);
-        entry.phase = crate::trash::Phase::Completed;
-        entry.save(&root)?;
-        self.clear_runtime_state(id);
-        self.clear_stop(id);
-        Ok(())
+        self.advance_deletion(
+            ws,
+            &mut entry,
+            &root,
+            &finish_delete::PostgresDeletion(self),
+        )
+        .await
     }
 
     /// Respawn one stack's engine in place: stop the old process, re-ensure its
@@ -4837,6 +5119,10 @@ pub async fn run(
                 engine_address_factory: EngineAddress::for_workspace,
                 device_cookie_name: auth::device_cookie_name(&app_data),
                 gateway_id: crate::gateway_identity::load_or_create(&app_data)?,
+                restore_uploads: crate::restore_upload::RestoreUploads::new(
+                    crate::restore_upload::restore_uploads_path(&app_data),
+                ),
+                restore: RwLock::new(PickerRestore::load(&app_data)?),
                 app_data,
                 has_desktop_client,
                 registry_path,
@@ -4874,8 +5160,8 @@ pub async fn run(
                 stamp_keys: RwLock::new(inherited_stamp_keys),
                 boot_phases: RwLock::new(HashMap::new()),
                 boot_failures: RwLock::new(HashMap::new()),
-                restore: RwLock::new(RestoreStatus::default()),
                 snapshot_restores: Mutex::new(HashSet::new()),
+                control_jobs: Default::default(),
                 #[cfg(test)]
                 snapshot_test: Mutex::new(None),
                 workspace_operations: Mutex::new(HashMap::new()),
@@ -4936,6 +5222,20 @@ pub async fn run(
                     .rotate_due(rotator.peer_connection())
                     .await;
                 tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
+    // Staged restore uploads expire 24 h after their last chunk (ADR 0810).
+    // The first pass also drops an archive a restore held when we stopped.
+    {
+        let sweeper = state.clone();
+        tokio::spawn(async move {
+            use crate::restore_upload::{now_secs, SWEEP_INTERVAL};
+            sweeper.restore_uploads().sweep_on_start(now_secs());
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                sweeper.restore_uploads().sweep(now_secs());
             }
         });
     }
@@ -6354,7 +6654,7 @@ pub(crate) async fn serve_remote_client(
         return installed_remote_shell(state, route, unavailable);
     }
     if path == "manifest.json" {
-        return serve_gateway_manifest(state, &format!("{route}/"), &format!("{route}/"));
+        return serve_workspace_manifest(state, &format!("{route}/"));
     }
     if path == "sw.js"
         || path.split('/').any(|part| part.starts_with('.'))
@@ -6558,7 +6858,7 @@ fn picker_start_url(pair_code: Option<&str>) -> String {
 /// access widens `scope` to `/` so in-app workspace switches stay inside the
 /// PWA installed from the gateway's stable port.
 fn serve_workspace_manifest(state: &GatewayState, workspace_url: &str) -> Response {
-    serve_gateway_manifest(state, workspace_url, workspace_url)
+    serve_gateway_manifest(state, &picker_start_url(None), workspace_url)
 }
 
 fn serve_gateway_manifest(state: &GatewayState, start_url: &str, id: &str) -> Response {
@@ -8572,25 +8872,24 @@ mod tests {
         assert_eq!(sum_unread([Some(0), Some(2)]), 2);
     }
 
-    /// Installing from `http(s)://host:<gateway-port>/<workspace>/` must also stay in the
-    /// gateway's full-origin scope. Otherwise the workspace switcher navigates
-    /// out of the installed PWA and opens a browser.
-    #[test]
-    fn workspace_manifest_widens_scope_but_launches_workspace() {
-        let source = r#"{
-            "name": "Lucidos",
-            "start_url": ".",
-            "scope": ".",
-            "display": "standalone"
-        }"#;
-        let out: serde_json::Value =
-            serde_json::from_str(&gateway_manifest_json(source, "/dev/", "/dev/"))
-                .expect("valid JSON");
+    #[tokio::test]
+    async fn workspace_manifest_keeps_identity_but_launches_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), APP_MANIFEST_JSON).unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
 
-        assert_eq!(out["scope"], "/");
-        assert_eq!(out["start_url"], "/dev/");
-        assert_eq!(out["id"], "/dev/");
-        assert_eq!(out["display"], "standalone");
+        for workspace_url in ["/dev/", "/dev@peer/"] {
+            let response = serve_workspace_manifest(&state, workspace_url);
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(out["scope"], "/");
+            assert_eq!(out["start_url"], "/~/");
+            assert_eq!(out["id"], workspace_url);
+            assert_eq!(out["display"], "standalone");
+        }
     }
 
     #[test]
@@ -9449,7 +9748,11 @@ mod tests {
         let statuses = reloaded.list_status().await;
         let status = statuses.iter().find(|status| status.id == ws.id).unwrap();
         assert!(status.health == Health::Unhealthy);
-        assert!(status.last_error.as_ref().unwrap().contains("cleanup"));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some(snapshot_restore::CLEANUP_INTERRUPTED)
+        );
+        assert!(status.delete_interrupted);
         let response = serve_workspace(
             &reloaded,
             &ws.id,

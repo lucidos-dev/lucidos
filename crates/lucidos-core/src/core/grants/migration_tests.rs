@@ -1,12 +1,6 @@
-//! The migration is the risky half of ADR 0095: it runs once, on installs
-//! nobody here can inspect, and a mistake either strands a working setup or
-//! reinstates a permission the user removed.
-
 use super::*;
 use crate::core::grants::{self, GrantFile};
 
-/// A machine mid-upgrade: a user dir with global grants, a gateway registry,
-/// and workspace directories on disk.
 struct Machine {
     _tmp: tempfile::TempDir,
     user_dir: PathBuf,
@@ -30,7 +24,6 @@ impl Machine {
         }
     }
 
-    /// A machine-global grant file holding `patterns`.
     fn with_global(&self, file: GrantFile, patterns: &[&str]) -> &Self {
         let mut body = file.header().to_string();
         for p in patterns {
@@ -41,7 +34,6 @@ impl Machine {
         self
     }
 
-    /// A workspace directory registered under an absolute path.
     fn with_workspace(&self, name: &str) -> PathBuf {
         let dir = self.root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -73,8 +65,6 @@ impl Machine {
 
 const GRANTED: &[&str] = &["Bash", "Python"];
 
-/// The upgrade half of the split. Every workspace on the machine at migration
-/// time keeps reading exactly what the machine-global file held.
 #[test]
 fn a_workspace_present_at_migration_time_inherits_the_global_grants() {
     let m = Machine::new();
@@ -101,8 +91,6 @@ fn a_workspace_present_at_migration_time_inherits_the_global_grants() {
     }
 }
 
-/// The seeded file says where the grants came from, so a later reader can tell
-/// an inherited grant from one chosen here.
 #[test]
 fn a_seeded_file_names_its_origin_and_the_grants_survive_the_header() {
     let m = Machine::new();
@@ -123,9 +111,6 @@ fn a_seeded_file_names_its_origin_and_the_grants_survive_the_header() {
     );
 }
 
-/// The creation half of the split, and the whole point of the change. A
-/// workspace made after the migration inherits nothing, least of all the bare
-/// `Bash` and `Python` grants nobody chose for it.
 #[test]
 fn a_workspace_created_after_the_migration_starts_with_no_grants() {
     let m = Machine::new();
@@ -134,7 +119,6 @@ fn a_workspace_created_after_the_migration_starts_with_no_grants() {
     m.write_registry(&[dev.to_str().unwrap()]);
     m.migrate(&dev);
 
-    // Created afterwards, registered afterwards, and its own engine boots.
     let fresh = m.with_workspace("fresh");
     m.write_registry(&[dev.to_str().unwrap(), fresh.to_str().unwrap()]);
     m.migrate(&fresh);
@@ -153,8 +137,6 @@ fn a_workspace_created_after_the_migration_starts_with_no_grants() {
     );
 }
 
-/// Re-running must never bring back a grant the user dropped. The stamp is what
-/// makes that true, rather than comparing contents.
 #[test]
 fn re_running_never_resurrects_a_deleted_grant_or_duplicates_a_line() {
     let m = Machine::new();
@@ -163,11 +145,9 @@ fn re_running_never_resurrects_a_deleted_grant_or_duplicates_a_line() {
     m.write_registry(&[dev.to_str().unwrap()]);
     m.migrate(&dev);
 
-    // The user drops `Bash` in this workspace and keeps `Python`.
     let dir = grants::grants_dir(&dev);
     grants::write_raw(&dir, GrantFile::AgentCommands, "Python\n").unwrap();
 
-    // A later boot, with the machine record removed so the seed is retried.
     std::fs::remove_file(m.record()).unwrap();
     m.migrate(&dev);
 
@@ -178,8 +158,6 @@ fn re_running_never_resurrects_a_deleted_grant_or_duplicates_a_line() {
     );
 }
 
-/// A fresh install has no global files at all. That is the ordinary case, not
-/// an error, and every workspace simply starts empty.
 #[test]
 fn a_fresh_install_with_no_global_files_seeds_nothing_and_still_closes_the_door() {
     let m = Machine::new();
@@ -203,8 +181,6 @@ fn a_fresh_install_with_no_global_files_seeds_nothing_and_still_closes_the_door(
     );
 }
 
-/// The originals stay put. A later release deletes them, and until then they
-/// are the only remaining copy if anything went wrong here.
 #[test]
 fn the_global_files_are_copied_not_moved() {
     let m = Machine::new();
@@ -230,9 +206,6 @@ fn the_global_files_are_copied_not_moved() {
     }
 }
 
-/// Discovery is the registry, never a glob of a workspaces root. A packaged
-/// install keeps its workspaces under the OS app-data dir, which is what the
-/// relative entry stands for here.
 #[test]
 fn discovery_resolves_both_absolute_and_app_data_relative_registry_entries() {
     let m = Machine::new();
@@ -242,8 +215,6 @@ fn discovery_resolves_both_absolute_and_app_data_relative_registry_entries() {
     std::fs::create_dir_all(&relative).unwrap();
     m.write_registry(&[absolute.to_str().unwrap(), "workspaces/packaged"]);
 
-    // Own workspace deliberately outside the registry, so only discovery can
-    // reach these two.
     let own = m.with_workspace("own");
     m.migrate(&own);
 
@@ -257,9 +228,6 @@ fn discovery_resolves_both_absolute_and_app_data_relative_registry_entries() {
     }
 }
 
-/// An unregistered workspace still gets its grants, because the engine running
-/// it is proof that it exists. The e2e suite runs exactly this shape, with no
-/// gateway and no registry.
 #[test]
 fn the_engines_own_workspace_is_seeded_even_with_no_registry() {
     let m = Machine::new();
@@ -275,8 +243,6 @@ fn the_engines_own_workspace_is_seeded_even_with_no_registry() {
     assert!(m.record().exists(), "an absent registry is a normal case");
 }
 
-/// A registry that cannot be parsed is UNKNOWN, never "no workspaces". Writing
-/// the record on a failed read would strand every workspace it names.
 #[test]
 fn an_unparseable_registry_seeds_nothing_and_leaves_the_door_open() {
     let m = Machine::new();
@@ -295,9 +261,6 @@ fn an_unparseable_registry_seeds_nothing_and_leaves_the_door_open() {
     );
 }
 
-/// A blank registry is damage, not an empty machine. The launcher once
-/// truncated the file in place, and reading the gap as "no workspaces" would
-/// close the door on every workspace it names.
 #[test]
 fn a_blank_registry_seeds_nothing_and_leaves_the_door_open() {
     let m = Machine::new();
@@ -311,8 +274,6 @@ fn a_blank_registry_seeds_nothing_and_leaves_the_door_open() {
     assert!(!m.record().exists(), "the next boot must try again");
 }
 
-/// The record is the machine-wide gate. Present means the seed has run, so a
-/// second call touches nothing even where a workspace was somehow missed.
 #[test]
 fn the_machine_record_stops_a_second_run() {
     let m = Machine::new();
@@ -327,8 +288,6 @@ fn the_machine_record_stops_a_second_run() {
     assert!(grants::patterns(&grants::grants_dir(&dev), GrantFile::AgentCommands).is_empty());
 }
 
-/// The record names the date and the workspaces it seeded, so the reason a new
-/// workspace starts empty is legible on disk.
 #[test]
 fn the_machine_record_reads_as_an_explanation() {
     let m = Machine::new();
@@ -344,8 +303,6 @@ fn the_machine_record_reads_as_an_explanation() {
     assert!(body.contains(&dev.canonicalize().unwrap().display().to_string()));
 }
 
-/// A registered directory that no longer exists is skipped. Seeding it would
-/// recreate a workspace the user deleted.
 #[test]
 fn a_registered_workspace_that_is_gone_is_skipped_not_recreated() {
     let m = Machine::new();
@@ -360,8 +317,6 @@ fn a_registered_workspace_that_is_gone_is_skipped_not_recreated() {
     assert!(m.record().exists());
 }
 
-/// A global file holding only its instructional header carries no decision, so
-/// nothing is inherited from it.
 #[test]
 fn a_global_file_with_no_grants_seeds_no_file() {
     let m = Machine::new();
@@ -376,8 +331,6 @@ fn a_global_file_with_no_grants_seeds_no_file() {
         .exists());
 }
 
-/// One workspace named twice cannot be seeded twice, whichever way the registry
-/// and the engine spell its path.
 #[test]
 fn a_workspace_named_by_both_the_registry_and_the_engine_is_seeded_once() {
     let m = Machine::new();

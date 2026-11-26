@@ -33,8 +33,6 @@ const LIMITS: FootprintLimits = FootprintLimits {
     unused_days: 60,
 };
 
-/// Text that appears only because the workspace has items is workspace
-/// footprint. With no items, no section may count a char.
 #[test]
 fn an_empty_workspace_reports_zero_for_every_section() {
     for (spec, section) in build_sections(&FootprintInputs::default()) {
@@ -51,9 +49,6 @@ fn every_section_has_a_unique_id() {
     assert_eq!(ids.len(), SECTIONS.len());
 }
 
-/// The report's sections are the very text the turn's system prompt carries,
-/// built from the same files by the same loaders and builders. The Widgets
-/// rules and the list's header are engine text, counted in neither.
 #[tokio::test]
 async fn each_system_prompt_section_is_the_text_the_turn_sends() {
     let bus = crate::test_support::offline_event_bus();
@@ -227,8 +222,6 @@ fn a_knowhow_id_resolves_to_its_file_in_load_order() {
     assert_eq!(knowhow_doc_path(&dirs, "missing"), None);
 }
 
-/// Loading an intent loads these docs with no `load_knowhow` call of their
-/// own, so the unused check must count them as used.
 #[test]
 fn an_intent_loads_its_knowhow_ids_and_its_apps_whole_folder() {
     let intents = vec![
@@ -274,9 +267,6 @@ fn an_open_app_listing_is_its_own_kind_named_after_the_app() {
     assert_eq!(item.name, "Habit Tracker");
 }
 
-/// The MCP tool schemas ride only threads that enable a server (ADR 0430), so
-/// the section lists each server with its threads. It stays out of the
-/// every-turn total, and so does the notice for what the ceiling cut.
 #[test]
 fn the_mcp_schemas_are_per_server_and_outside_the_every_turn_total() {
     let inputs = FootprintInputs {

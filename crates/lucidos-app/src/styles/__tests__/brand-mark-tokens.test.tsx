@@ -41,7 +41,7 @@ function renderMarks(background: boolean): SVGSVGElement[] {
 }
 
 describe('the brand mark tokens', () => {
-  it('are the five marks tokens, host-only and never derived from the seeds', () => {
+  it('are the seven marks tokens, host-only and never derived from the seeds', () => {
     const marks = catalog.tokens.filter(t => t.group === 'marks');
     expect(marks.map(t => t.name)).toEqual([
       '--lucidos-mark-bg-top',
@@ -49,6 +49,8 @@ describe('the brand mark tokens', () => {
       '--lucidos-mark-fg',
       '--claude-mark',
       '--codex-mark',
+      '--agent-icon-theme',
+      '--agent-icon-muted',
     ]);
     for (const token of marks) {
       expect(token.frames, token.name).toBe(false);
@@ -59,6 +61,11 @@ describe('the brand mark tokens', () => {
   it('keep the Claude mark on --initiator-coding-agent and Codex on the primary text colour by default', () => {
     expect(defaultOf('--claude-mark')).toBe('var(--initiator-coding-agent)');
     expect(defaultOf('--codex-mark')).toBe('var(--text-primary)');
+  });
+
+  it('keep the Theme look on the accent and the Muted look on the muted text colour by default', () => {
+    expect(defaultOf('--agent-icon-theme')).toBe('var(--accent)');
+    expect(defaultOf('--agent-icon-muted')).toBe('var(--text-muted)');
   });
 });
 
@@ -121,23 +128,45 @@ describe('the Claude mark', () => {
 });
 
 
-describe('optional agent colours', () => {
-  it('preserves the existing appearance outside the drawer when colours are off', () => {
-    const css = readFileSync(resolve(styles, 'global/base.css'), 'utf-8');
-    expect(cssRules(css).filter(r => r.selector.includes('data-agent-brand-colours'))).toEqual([]);
+describe('the agent icon colors setting', () => {
+  const rules = cssRules(readFileSync(resolve(styles, 'components.css'), 'utf-8'));
+  const props = (selector: string) => {
+    const rule = rules.find(r => r.selector === selector);
+    expect(rule, selector).toBeDefined();
+    return rule!.props;
+  };
+  const flatLooks = ':root:is([data-agent-icon-colors="theme"], [data-agent-icon-colors="muted"]) ';
+  const iconSlots = ':is(.thread-row-agent, .response-executor-icon, .initiator-icon, .nav-history-icon)';
+
+  it('maps each flat look to its own theme token on the icon itself, so scoped theme overrides reach it', () => {
+    const flatTargets = ':is(.thread-row-agent, .response-executor-icon, .initiator-icon, .nav-history-icon, .lucidos-agent-flat)';
+    expect(props(`:root[data-agent-icon-colors="theme"] ${flatTargets}`).get('--agent-icon-flat')).toBe('var(--agent-icon-theme)');
+    expect(props(`:root[data-agent-icon-colors="muted"] ${flatTargets}`).get('--agent-icon-flat')).toBe('var(--agent-icon-muted)');
   });
 
-  it('uses the original flat drawer marks unless brand colours are enabled', () => {
-    const rules = cssRules(readFileSync(resolve(styles, 'drawer.css'), 'utf-8'));
-    const props = (selector: string) => rules.find(r => r.selector === selector)!.props;
-    const enabled = ':root:not([data-agent-brand-colours="off"]) ';
-    expect(props('.thread-row-agent').get('color')).toBe('var(--text-muted)');
-    expect(props('.thread-row-agent .codex-icon').get('fill')).toBe('currentColor');
-    expect(props('.thread-row-agent[data-glyph="lucidos"] .lucidos-mark').get('display')).toBe('none');
-    expect(props(enabled + '.thread-row-agent .claude-icon').get('color')).toBe('var(--claude-mark)');
-    expect(props(enabled + '.thread-row-agent .codex-icon').get('fill')).toBe('var(--codex-mark)');
-    expect(props(enabled + '.thread-row-agent .lucidos-mark-icon').get('display')).toBe('none');
-    expect(props(enabled + '.thread-row-agent[data-glyph="lucidos"] .lucidos-mark').get('display')).toBe('block');
+  it('recolors Claude and Codex in every agent icon slot under a flat look', () => {
+    const slots = props(flatLooks + iconSlots);
+    expect(slots.get('--claude-mark')).toBe('var(--agent-icon-flat)');
+    expect(slots.get('--codex-mark')).toBe('var(--agent-icon-flat)');
+  });
+
+  it('swaps the Lucidos tile for the flat mark under a flat look only', () => {
+    expect(props('.lucidos-agent-flat').get('display')).toBe('none');
+    expect(props('.lucidos-agent-flat').get('color')).toBe('var(--agent-icon-flat)');
+    expect(props(flatLooks + '.lucidos-agent-flat').get('display')).toBe('inline-block');
+    expect(props(flatLooks + '.lucidos-agent-tile').get('display')).toBe('none');
+  });
+
+  it('leaves Brand to the brand tokens, with no rule of its own', () => {
+    const sheets = styleSheetPaths(styles).map(path => readFileSync(path, 'utf-8'));
+    const brandRules = sheets.flatMap(css => cssRules(css).filter(r => r.selector.includes('"brand"')));
+    expect(brandRules).toEqual([]);
+  });
+
+  it('colors drawer marks from the brand tokens, like the thread pane', () => {
+    const drawer = cssRules(readFileSync(resolve(styles, 'drawer.css'), 'utf-8'));
+    expect(drawer.find(r => r.selector === '.thread-row-agent .claude-icon')!.props.get('color')).toBe('var(--claude-mark)');
+    expect(drawer.filter(r => /\.codex-icon|\.lucidos-mark/.test(r.selector))).toEqual([]);
   });
 });
 

@@ -32,9 +32,6 @@ async fn password_column_exists(pool: &PgPool) -> bool {
     column_exists(pool, &EmailPassword::SPEC).await.unwrap()
 }
 
-/// The "one home" invariant for mailboxes: a password only the old column
-/// held becomes the account's credential, the column goes, and a second boot
-/// changes nothing.
 #[tokio::test]
 async fn a_mailbox_password_moves_into_its_credential_and_the_column_goes() {
     let (pool, db_name) = setup_test_db().await;
@@ -61,8 +58,6 @@ async fn a_mailbox_password_moves_into_its_credential_and_the_column_goes() {
     teardown_test_db(&db_name).await;
 }
 
-/// The credential was always the source of truth, so an existing one wins
-/// over the copy, which goes with the column.
 #[tokio::test]
 async fn an_existing_credential_keeps_its_value_over_the_old_copy() {
     let (pool, db_name) = setup_test_db().await;
@@ -92,8 +87,6 @@ async fn an_existing_credential_keeps_its_value_over_the_old_copy() {
     teardown_test_db(&db_name).await;
 }
 
-/// Another credential holding the account's name pushes the password to
-/// `email:<name>`, which the mailbox lookup also resolves.
 #[tokio::test]
 async fn a_taken_name_moves_the_password_to_the_prefixed_name() {
     let (pool, db_name) = setup_test_db().await;
@@ -144,9 +137,6 @@ async fn seed_unmoved_server(pool: &PgPool, id: &str, env: &[(&str, &str)]) {
     .unwrap();
 }
 
-/// The "one home" invariant for MCP servers: every value written before
-/// pointers existed becomes a `secret` credential, and the server's launch
-/// env still holds the same values.
 #[tokio::test]
 async fn mcp_env_values_move_into_credentials_and_still_reach_the_launch() {
     let (pool, db_name) = setup_test_db().await;
@@ -186,8 +176,6 @@ async fn mcp_env_values_move_into_credentials_and_still_reach_the_launch() {
     teardown_test_db(&db_name).await;
 }
 
-/// The move runs once per server. A plain value the user adds afterwards is a
-/// choice, and a later boot leaves it where it is.
 #[tokio::test]
 async fn a_plain_value_added_after_the_move_stays_in_env() {
     let (pool, db_name) = setup_test_db().await;

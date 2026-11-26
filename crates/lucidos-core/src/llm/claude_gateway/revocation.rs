@@ -1,4 +1,4 @@
-//! Token revocation at sign-out (RFC 7009), best effort.
+//! INVARIANT: Token revocation at sign-out (RFC 7009), best effort.
 //!
 //! A sign-out forgets the tokens first and revokes after, so a gateway that
 //! cannot be reached never keeps the user signed in.
@@ -7,7 +7,6 @@ use super::discovery::discover;
 use super::token_endpoint::{excerpt, http_client};
 use super::{GatewayOrigin, GrantedTokens};
 
-/// The tokens of a sign-in that has just ended, to revoke at their issuer.
 pub struct EndedSignIn {
     pub issuer: String,
     pub access_token: String,
@@ -15,8 +14,6 @@ pub struct EndedSignIn {
 }
 
 impl EndedSignIn {
-    /// Tokens the gateway granted that no stored sign-in kept, because a
-    /// sign-out or a URL change won the race to the row.
     pub fn unkept(issuer: &GatewayOrigin, tokens: &GrantedTokens) -> Self {
         Self {
             issuer: issuer.to_string(),
@@ -26,8 +23,6 @@ impl EndedSignIn {
     }
 }
 
-/// Revoke `ended`'s tokens at its issuer, when the issuer's discovery
-/// document names a revocation endpoint. Every failure is logged and dropped.
 pub async fn revoke(ended: EndedSignIn) {
     let Ok(origin) = GatewayOrigin::parse(&ended.issuer) else {
         return;
@@ -83,8 +78,6 @@ mod tests {
         }
     }
 
-    /// The bearer first, then the refresh token with its hint, each from a
-    /// public client with the Lucidos `User-Agent`.
     #[tokio::test]
     async fn sign_out_revokes_the_bearer_then_the_refresh_token() {
         let gateway = MockGateway::start().await;
@@ -119,7 +112,6 @@ mod tests {
         );
     }
 
-    /// An unreachable gateway is logged, never raised.
     #[tokio::test]
     async fn an_unreachable_gateway_is_only_logged() {
         revoke(EndedSignIn {

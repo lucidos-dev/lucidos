@@ -1,4 +1,4 @@
-//! The pause after the plan's usage limit is spent. OpenAI's docs say to
+//! INVARIANT: The pause after the plan's usage limit is spent. OpenAI's docs say to
 //! pause new plan requests rather than retry, so each one fails fast, with no
 //! request sent, until the pause ends.
 
@@ -10,19 +10,16 @@ use chrono::{DateTime, Utc};
 use super::{ChatGptPlanError, ChatGptPlanFailure};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 
-/// How long plan requests fail fast after a limit answer.
 pub const LIMIT_PAUSE: Duration = Duration::from_secs(10 * 60);
 
-/// One pause per engine, shared by every provider build so a rebuild keeps it.
+/// INVARIANT: One pause per engine, shared by every provider build so a rebuild keeps it.
 pub struct LimitPause {
     paused: Mutex<Option<Paused>>,
-    /// Announces each pause. `None` in tests that build no event bus.
     event_bus: Option<EventBus>,
 }
 
 struct Paused {
     until: DateTime<Utc>,
-    /// The answer that began the pause, returned to every request it stops.
     error: ChatGptPlanError,
 }
 
@@ -42,7 +39,6 @@ impl LimitPause {
         }
     }
 
-    /// The limit answer that paused plan requests, while the pause lasts.
     pub fn refusal(&self) -> Option<ChatGptPlanError> {
         let paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
         paused
@@ -51,7 +47,6 @@ impl LimitPause {
             .map(|paused| paused.error.clone())
     }
 
-    /// When the current pause ends, or `None` with no pause.
     pub fn paused_until(&self) -> Option<DateTime<Utc>> {
         let paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
         paused
@@ -60,8 +55,6 @@ impl LimitPause {
             .filter(|until| Utc::now() < *until)
     }
 
-    /// Pause on a limit answer, and announce it unless a pause already runs.
-    /// Any other failure leaves the pause alone.
     pub async fn observe(&self, error: &ChatGptPlanError) {
         if error.failure != ChatGptPlanFailure::LimitReached {
             return;
@@ -121,7 +114,6 @@ mod tests {
         assert!(length > chrono::Duration::minutes(9));
     }
 
-    /// A second limit answer inside the pause neither extends nor announces.
     #[tokio::test]
     async fn a_second_limit_answer_keeps_the_first_pause() {
         let pause = LimitPause::unannounced();
@@ -145,7 +137,6 @@ mod tests {
         assert!(pause.refusal().is_none());
     }
 
-    /// A pause that ran out lets requests through again.
     #[tokio::test]
     async fn an_ended_pause_lets_requests_through() {
         let pause = LimitPause::unannounced();

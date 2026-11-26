@@ -5,19 +5,8 @@ use crate::llm::tool_names as tn;
 
 const PUSH_ENABLED_REPLY: &str = "[PUSH_NOTIFICATION_REQUEST][ACTION COMPLETED] Push notifications enabled for this device. Tell the user what to expect, keyed off the last used device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app: notifications arrive as native macOS notifications governed by System Settings → Notifications (macOS asks for permission on first launch; if no banner appears, allow Lucidos there); do NOT mention browser permission or site settings. Otherwise they are in a web browser or installed PWA, and the browser will now ask for notification permission and they should click Allow. Note: in a development build (tauri-dev) native desktop banners don't appear at all, so run Lucidos in a browser/PWA to receive notifications while developing. Either way, they'll get notifications for triggered tasks and alerts.";
 
-/// Longest stored value `get_preferences` prints in full.
-///
-/// Most preferences are an id, a tier or a boolean, so this never fires for
-/// them. The *style library* is the one key whose value is a document, and the
-/// listing prints every key on every call.
 const MAX_LISTED_VALUE_CHARS: usize = 200;
 
-/// What `get_preferences` shows for one stored value.
-///
-/// A long value is summarised rather than printed. The listing is billed on
-/// every call, and the style library alone may hold 20 instructions of 1,000
-/// characters. The summary still says the value is there and how long it is,
-/// which is what the agent needs to decide its next call.
 fn summarize_pref_value(value: &str) -> String {
     let len = value.chars().count();
     if len <= MAX_LISTED_VALUE_CHARS {
@@ -31,9 +20,6 @@ fn summarize_pref_value(value: &str) -> String {
     )
 }
 
-/// Format a duration suffix like " (3m 12s)" from an optional start + an end
-/// time, or "" when the start time is unknown (legacy run records). Used by the
-/// `get_backup_status` surface.
 fn backup_duration_suffix(
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     finished_at: chrono::DateTime<chrono::Utc>,
@@ -47,7 +33,6 @@ fn backup_duration_suffix(
     }
 }
 
-/// Human-readable byte size (GB / MB / B) for the `get_backup_status` surface.
 fn human_size(bytes: Option<u64>) -> String {
     match bytes {
         Some(b) if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
@@ -57,28 +42,17 @@ fn human_size(bytes: Option<u64>) -> String {
     }
 }
 
-/// What `get_backup_status` knows about the selected provider's account.
-///
-/// Distinguishing all six states is the point: the `backup_provider` preference
-/// only names a destination, it connects nothing, so a provider that is set is
-/// not a provider that works. Collapsing "no account" into the same silence as
-/// "connected" is what let an agent tell a user their Dropbox backups were
-/// configured when every upload would have failed (2026-08-05).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderAccount {
-    /// No `backup_provider` preference set.
     Unset,
-    /// The preference names a provider this engine doesn't have.
     UnknownProvider,
     LookupFailed(String),
-    /// No OAuth account exists for this provider.
     NotConnected,
-    /// Connected, but the grant is short one or more of the scopes the provider
+    /// INVARIANT: Connected, but the grant is short one or more of the scopes the provider
     /// needs. Carries WHICH, so the agent can name them exactly as the Backup
     /// page does: the two read the same `provider_readiness` verdict and must
     /// not be able to describe it differently.
     MissingScope(Vec<&'static str>),
-    /// Connected with everything the provider needs.
     Ready,
 }
 
@@ -113,23 +87,12 @@ fn backup_provider_line(provider: &str, account: &ProviderAccount) -> String {
 
 #[easy_ext::ext(PreferencesExt)]
 pub(crate) impl LucidosEngine {
-    /// Handler for the read-only `get_backup_status` tool. Reports the backup
-    /// schedule (in the user's timezone) + computed next run, provider, retention,
-    /// the last run with duration, recent run history, and staleness — so the
-    /// agent can answer "when's my next/last backup?" without dropping to raw
-    /// HTTP. Read-only: it makes no changes. The schedule/provider/retention are
-    /// CHANGED via `set_preference`.
     async fn execute_get_backup_status(
         &self,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         use crate::core::backup::{self, is_schedule_active, BackupRunStatus};
 
         let pool = &self.pool;
-        // A read that FAILED is not "no schedule set". `.ok().flatten()` collapsed
-        // both into `None`, and the `_` arm below then reports
-        // "Schedule: off (automatic backups disabled)" to the agent, which relays
-        // it to the user as fact. Surface the unknown instead of a plausible
-        // default, per the no-silent-plausible-defaults rule.
         let cron = match prefs::BACKUP_SCHEDULE.try_stored(pool).await {
             Ok(v) => v,
             Err(e) => {
@@ -148,15 +111,9 @@ pub(crate) impl LucidosEngine {
                 ))
             }
         };
-        // Display only, so the default is the right answer on an unreadable
-        // row; the prune caller in `scheduler::backup` skips instead.
         let retention = prefs::BACKUP_RETENTION.read(pool).await.round() as usize;
         let tz: chrono_tz::Tz = self.user_timezone().await.parse().unwrap_or(chrono_tz::UTC);
 
-        // Resolve the provider's account state before rendering. Reported
-        // whatever the schedule says: a manual "Back up now" needs a connected
-        // account too, so hiding this behind an active schedule would answer
-        // "is my backup set up?" with only half the truth.
         let provider_name = provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
         let account = match provider_name {
             None => ProviderAccount::Unset,
@@ -250,12 +207,6 @@ pub(crate) impl LucidosEngine {
         Ok(out)
     }
 
-    /// Dispatch for the unified preference tools. `set_preference` / `get_preferences`
-    /// replace the former set_language / set_timezone / enable_push_notifications
-    /// trio — the side-effects those carried (in-memory locale, LanguageSet /
-    /// TimezoneSet, the push handshake + devices.push_enabled sync) now live in the
-    /// shared write chokepoint (`engine/preferences.rs`) keyed off the preference
-    /// catalog.
     async fn execute_preferences_tool(
         &self,
         name: &str,
@@ -282,7 +233,7 @@ pub(crate) impl LucidosEngine {
             );
         }
 
-        // Catalog gate: only agent-settable keys, with validated values. Internal
+        // INVARIANT: Catalog gate: only agent-settable keys, with validated values. Internal
         // keys (command_guard, backup config, keybindings, …) are rejected here —
         // the agent must not disable its own command guard.
         let spec = match prefs::lookup(key) {
@@ -301,9 +252,6 @@ pub(crate) impl LucidosEngine {
             return Ok(format!("Error: {}", e));
         }
 
-        // Device-scope is decided by the catalog — the agent never passes a device
-        // id. A device-scoped key needs the caller's device; without one (e.g. a
-        // trigger context) the write can't be attributed to a device.
         let scoped_device = match spec.scope {
             PrefScope::Device => match device_id {
                 Some(did) => Some(did),
@@ -325,7 +273,6 @@ pub(crate) impl LucidosEngine {
             Err(e) => return Ok(format!("Error: {}", e)),
         };
 
-        // Push has bespoke, platform-aware copy + a frontend handshake.
         match outcome.push_enabled {
             Some(true) => return Ok(PUSH_ENABLED_REPLY.to_string()),
             Some(false) => {
@@ -338,21 +285,10 @@ pub(crate) impl LucidosEngine {
             PrefScope::Device => " for this device",
             PrefScope::Global => "",
         };
-        // `chat_model` / `chat_reasoning_efforts` are the DEFAULT for NEW Lucidos
-        // Agent threads only — a thread that's already running reuses its own
-        // last-used model/effort, independent of this preference (per-thread model
-        // memory; see `PreferenceStore::resolve_chat_overrides_for_thread`). So the
-        // generic "open views pick this up" note would be misleading here: it must
-        // NOT imply this preference switches the current/running thread on its next
-        // turn. (The in-thread picker CAN change a running thread — that path writes
-        // a per-thread value, not this account default.)
         let effect_note = match key {
             k if k == prefs::CHAT_MODEL.key() => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current model (whatever it last used), so this preference change does NOT switch the current thread's model on its next turn. To change a running thread's model, use its in-thread model picker.",
             k if k == prefs::TRIGGER_MODEL.key() => " This is the default for intent triggers that pin no model. It applies from the trigger's next fire, and a trigger's own model still wins. It does not change any chat thread.",
             k if k == prefs::CHAT_REASONING_EFFORTS.key() => " These are the defaults for NEW Lucidos Agent threads. A thread that's already running, including this one, keeps its current reasoning effort while it stays on the same model, so this change does NOT move the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
-            // A turn builds its system prompt once, at setup. So the style the
-            // user just asked for lands on their NEXT message, and claiming
-            // otherwise makes this very reply read as a broken promise.
             k if k == prefs::RESPONSE_STYLE.key() || k == prefs::RESPONSE_STYLES.key() => " It applies from the next message, in this thread and every other: a turn builds its prompt once at the start, so this one finishes in the style it began in. It covers triggers too, and it does NOT change coding-agent sessions.",
             _ => " Open Lucidos views pick this up automatically.",
         };
@@ -369,9 +305,6 @@ pub(crate) impl LucidosEngine {
         &self,
         device_id: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Read both the global map and the device-effective map so the agent can
-        // see when a per-device override is shadowing the global value (the
-        // device-scope trap that cost ~30 tool calls in a real thread).
         let global = PreferenceStore::get_all(&self.pool).await?;
         let effective = match device_id {
             Some(did) => PreferenceStore::get_all_for_device(&self.pool, did).await?,
@@ -381,18 +314,10 @@ pub(crate) impl LucidosEngine {
         let mut out = String::from(
             "Settable preferences — set with set_preference(key, value). Device-scoped keys apply to the calling device only.\n",
         );
-        // NOTE: the loop below renders one line per key, so a value that can be
-        // kilobytes has to be summarised. See `summarize_pref_value`.
         let agent_specs = prefs::CATALOG
             .iter()
             .filter(|spec| spec.access == PrefAccess::Agent);
         for spec in agent_specs {
-            // An empty stored value is named, never rendered as `(unset)` or
-            // as a blank. It states the STATE, which is true of every key: the
-            // row exists and holds nothing. What that state MEANS is per-key,
-            // and the description is where each key says so. It matters for
-            // `voice_resident_sections`, where an empty row means no sections
-            // and an absent one means the three defaults.
             let current = match effective.get(spec.key).map(String::as_str) {
                 None => "(unset)".to_string(),
                 Some("") => "(empty)".to_string(),
@@ -410,7 +335,6 @@ pub(crate) impl LucidosEngine {
                 prefs::allowed_values_hint(spec),
                 spec.default_label(),
             ));
-            // Make a shadowing device override explicit.
             if spec.scope == PrefScope::Device {
                 let glob = global.get(spec.key).map(String::as_str);
                 let eff = effective.get(spec.key).map(String::as_str);
@@ -425,7 +349,7 @@ pub(crate) impl LucidosEngine {
             }
         }
 
-        // Human-only settings that exist in the store, shown read-only so the
+        // INVARIANT: Human-only settings that exist in the store, shown read-only so the
         // agent can explain them but knows not to set them. Engine bookkeeping
         // is never printed: it holds a transport secret and migration markers.
         let internal: Vec<String> = prefs::internal_specs()
@@ -454,11 +378,6 @@ pub(crate) impl LucidosEngine {
 mod backup_status_tests {
     use super::{backup_provider_line, ProviderAccount};
 
-    /// The regression this whole line exists for: a provider preference that is
-    /// SET is not a provider that WORKS. `backup_provider` only names a
-    /// destination, so the agent must be told, in the same breath, that nothing
-    /// is connected behind it. The 2026-08-05 session read `Provider: dropbox`
-    /// and told the user backups were configured.
     #[test]
     fn not_connected_is_stated_loudly_and_names_accounts() {
         let line = backup_provider_line("dropbox", &ProviderAccount::NotConnected);
@@ -486,10 +405,6 @@ mod backup_status_tests {
         );
     }
 
-    /// Connected-but-underscoped is its own state: telling the user to connect
-    /// an account they already have would send them in a circle. It also names
-    /// WHICH scopes are short, so the agent relays the same specific gap the
-    /// Backup page shows rather than a vaguer version of it.
     #[test]
     fn missing_scope_is_distinct_from_not_connected_and_names_the_scopes() {
         let line = backup_provider_line(
@@ -512,8 +427,6 @@ mod backup_status_tests {
         assert!(!line.contains("Provider:  "), "no empty name hole: {line}");
     }
 
-    /// A failed lookup is UNKNOWN, never a "no" (CLAUDE.md's no-silent-defaults
-    /// rule, same reasoning as the schedule/provider preference reads above).
     #[test]
     fn lookup_failure_refuses_to_report_either_verdict() {
         let line = backup_provider_line(
@@ -528,8 +441,6 @@ mod backup_status_tests {
         );
     }
 
-    /// A typo'd provider id must name the valid ids rather than looking like a
-    /// connection problem.
     #[test]
     fn unknown_provider_lists_the_valid_ids() {
         let line = backup_provider_line("dropbx", &ProviderAccount::UnknownProvider);

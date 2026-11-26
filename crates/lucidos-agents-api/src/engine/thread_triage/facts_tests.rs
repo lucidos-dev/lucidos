@@ -1,6 +1,3 @@
-//! The facts loader against a real projection: which rows are roots, and what
-//! rolls up into them.
-
 use super::*;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
@@ -38,7 +35,6 @@ async fn spawn(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
     id
 }
 
-/// Settle a seeded row the way a finished turn leaves it.
 async fn settle(pool: &PgPool, id: Uuid, set: &str) {
     sqlx::query(&format!(
         "UPDATE thread_summaries SET status = 'idle', has_response = TRUE, {set} \
@@ -111,10 +107,33 @@ async fn the_loader_reads_inbox_roots_and_rolls_sub_threads_up() {
     settle(&pool, child, "compose_text = 'half a thought'").await;
     let archived = spawn(&bus, None).await;
     settle(&pool, archived, "archive_state = 'archived'").await;
-    // An orphaned card: the turn ended with the question still unanswered.
     let orphan = spawn(&bus, None).await;
     ask(&bus, orphan).await;
     settle(&pool, orphan, "archive_state = 'inbox'").await;
+    let held = spawn(&bus, None).await;
+    ask(&bus, held).await;
+    bus.emit(BusEvent::Thread {
+        thread_id: held,
+        event: ThreadEvent::ThreadHoldPlaced {
+            reason: "Taken over".into(),
+            hold_id: Uuid::new_v4(),
+            root_thread_id: held,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT archive_state || '/' || status FROM thread_summaries WHERE thread_id = $1"
+        )
+        .bind(held)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "inbox/waiting_for_user_answer",
+        "the held thread's card is open in the inbox"
+    );
 
     let rows = load(
         &pool,
@@ -149,8 +168,11 @@ async fn the_loader_reads_inbox_roots_and_rolls_sub_threads_up() {
         orphan_row.facts.has_pending_question,
         "an orphaned card counts as a pending question"
     );
+    assert!(
+        !find(&rows, held).facts.has_pending_question,
+        "a held thread's card waits on its hold, not the owner"
+    );
 
-    // The apply-time scope reads a named id wherever it sits now.
     let rows = load(&pool, TriageScope::Ids(&[archived])).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].section, "archived");
@@ -193,8 +215,6 @@ async fn only_a_triggers_newest_root_run_is_its_newest() {
     teardown_test_db(&db).await;
 }
 
-/// Archiving a root cancels a sub-thread's event wait, and Undo cannot bring
-/// the wait back. So a waiting sub-thread keeps its root, like a running one.
 #[tokio::test]
 async fn a_sub_threads_live_event_wait_keeps_its_root_busy() {
     let (pool, db) = setup_test_db().await;
@@ -211,8 +231,6 @@ async fn a_sub_threads_live_event_wait_keeps_its_root_busy() {
     teardown_test_db(&db).await;
 }
 
-/// The drawer hides a thread still being composed until it holds a draft, so
-/// triage and Archive all never count one the user cannot see.
 #[tokio::test]
 async fn an_empty_composing_thread_is_not_a_root() {
     let (pool, db) = setup_test_db().await;
@@ -237,9 +255,6 @@ async fn an_empty_composing_thread_is_not_a_root() {
     teardown_test_db(&db).await;
 }
 
-/// Archive all counts inbox threads the way the drawer's badge does. An
-/// archived sub-thread is not one. An inbox thread below it is its own root,
-/// so it is counted there and not again under the root above.
 #[tokio::test]
 async fn a_root_counts_its_inbox_sub_threads_once() {
     let (pool, db) = setup_test_db().await;
@@ -269,9 +284,6 @@ async fn a_root_counts_its_inbox_sub_threads_once() {
     teardown_test_db(&db).await;
 }
 
-/// The drawer's family root is the topmost ancestor, through archived ones. A
-/// triage root under a pinned family is pinned, so nothing archives a thread
-/// the drawer shows under Pinned.
 #[tokio::test]
 async fn a_root_knows_its_drawer_family_and_whether_it_is_pinned() {
     let (pool, db) = setup_test_db().await;
@@ -313,9 +325,6 @@ async fn a_root_knows_its_drawer_family_and_whether_it_is_pinned() {
     teardown_test_db(&db).await;
 }
 
-/// The home thread is never a triage root, so neither triage nor Archive all
-/// offers to put it away. Its sub-threads stand as roots of their own, the way
-/// the drawer shows them (ADR 0362).
 #[tokio::test]
 async fn the_home_thread_is_not_a_root_and_its_sub_threads_are() {
     let (pool, db) = setup_test_db().await;

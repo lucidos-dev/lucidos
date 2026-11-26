@@ -1,17 +1,9 @@
-//! Plugin uninstall flow tests: confirm-flow delete, conflict/overwrite/
-//! uninstall round-trip, path-safety + empty-parent pruning, cancel paths.
-
 use super::helpers::*;
 use super::*;
 
 use crate::engine::event_bus::{EventBus, MockEventBus};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// `uninstall_plugin` confirm flow: prepare_uninstall_plugin returns the
-/// `[PLUGIN_UNINSTALL_REQUEST]` sentinel, the user confirms via the panel,
-/// and uninstall_with_bus deletes the recorded files + emits an extended
-/// PluginUninstalled with `files_deleted` populated. Asserts the symmetric
-/// install-confirm shape: prepare doesn't touch disk, confirm does.
 #[tokio::test]
 async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
     let (pool, db_name) = setup_test_db().await;
@@ -41,15 +33,11 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
         sentinel
     );
 
-    // Files MUST still be on disk before confirm — symmetric with install,
-    // which doesn't write until the panel resolves.
     assert!(
         knowhow_path.is_file(),
         "prepare must not delete files before confirm"
     );
 
-    // Pop the pending entry and run the delete-and-emit step directly
-    // (mirrors what confirm_pending_uninstall does without an engine).
     let uninstall_id = pending_uninstalls
         .lock()
         .unwrap()
@@ -62,7 +50,7 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
         .unwrap()
         .remove(&uninstall_id)
         .unwrap();
-    let outcome = uninstall_with_bus(&scratch, &bus, &pending, &[], None)
+    let outcome = uninstall_with_bus(&scratch, &bus, &pending, &[], None, vec![])
         .await
         .expect("uninstall_with_bus");
 
@@ -88,9 +76,6 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
         ]
     );
 
-    // Files actually gone now — and the empty `triggers/fixture/` dir was
-    // pruned (but `triggers/` itself remains, since it's the content-dir
-    // root the prune is forbidden to cross).
     assert!(!knowhow_path.exists(), "knowhow file must be deleted");
     assert!(!trigger_path.exists(), "trigger file must be deleted");
     assert!(
@@ -102,7 +87,6 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
         "content-dir root must NOT be pruned"
     );
 
-    // Event recorded with files_deleted populated.
     let events = read_events(&pool, "PluginUninstalled", "fixture-plugin").await;
     assert_eq!(events.len(), 1, "exactly one PluginUninstalled event");
     let payload = &events[0];
@@ -117,7 +101,6 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
     assert!(deleted.contains(&"knowhow/fixture.md"));
     assert!(deleted.contains(&"triggers/fixture/fixture.md"));
 
-    // After uninstall, latest_install returns None for this id.
     let after = latest_install(&pool, "fixture-plugin").await.unwrap();
     assert!(
         after.is_none(),
@@ -138,7 +121,6 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
 
     let bus = MockEventBus::new();
 
-    // 1. Fresh install lands files and emits PluginInstalled.
     let write = install_from_unpacked_with_bus(
         &workspace,
         &bus,
@@ -194,7 +176,6 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         other => panic!("expected PluginInstalled, got {:?}", other),
     }
 
-    // 2. Re-install without overwrite returns the conflict error and emits nothing new.
     let v2_archive_dir = scratch.join("archive_v2");
     std::fs::create_dir_all(&v2_archive_dir).unwrap();
     let archive_v2 = build_fixture_archive(&v2_archive_dir, "v2");
@@ -223,10 +204,8 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         1,
         "conflict path must not emit a second event"
     );
-    // File on disk unchanged — still v1.
     assert_eq!(std::fs::read_to_string(&kn_path).unwrap(), "v1");
 
-    // 3. Re-install with overwrite=true succeeds and the file content updates.
     let write2 = install_from_unpacked_with_bus(
         &workspace,
         &bus,
@@ -247,9 +226,6 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         "overwrite must emit a new PluginInstalled"
     );
 
-    // 4. Uninstall via the new confirm flow: build a PendingUninstall directly
-    //    from the recorded files and run uninstall_with_bus. Asserts that
-    //    files now actually disappear (the v2 behavior — v1 was guide-only).
     let recorded_files = match &bus.emitted_events()[1] {
         BusEvent::System(SystemEvent::PluginInstalled { files, .. }) => files.clone(),
         other => panic!("expected PluginInstalled at index 1, got {:?}", other),
@@ -258,11 +234,12 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         plugin_id: "fixture-plugin".to_string(),
         plugin_version: "0.1.0".to_string(),
         plugin_name: "Fixture Plugin".to_string(),
+        hooks: Vec::new(),
         files_present: recorded_files.clone(),
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    let outcome = uninstall_with_bus(&workspace, &bus, &pending, &[], None)
+    let outcome = uninstall_with_bus(&workspace, &bus, &pending, &[], None, vec![])
         .await
         .expect("uninstall should succeed");
     assert!(
@@ -273,7 +250,6 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         outcome.summary
     );
     assert_eq!(outcome.files_deleted.len(), 2);
-    // Files actually deleted now.
     assert!(!kn_path.exists(), "uninstall must delete the knowhow file");
     assert!(
         !trig_path.exists(),
@@ -312,14 +288,6 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
     }
 }
 
-/// Regression test for the uninstall half of the plugin git-tracking bug:
-/// uninstall deleted the plugin's files from `data/` but never committed the
-/// deletion, leaving the removal unrecorded in git history. This is the
-/// symmetric counterpart of `install_commits_written_files_so_working_tree_is_clean`.
-///
-/// Installs (which now commits the files), then uninstalls and asserts the
-/// removal lands in ONE commit, the files leave the HEAD tree, and the working
-/// tree is left clean (no uncommitted deletions / ghosts).
 #[tokio::test]
 async fn uninstall_commits_deletions_so_working_tree_is_clean() {
     const MANIFEST: &str = r#"
@@ -353,8 +321,6 @@ source = "https://github.com/x/uninstall-track"
     .await
     .expect("install");
 
-    // Sanity: install committed the files (covered in depth by the install
-    // regression test) — so the uninstall has a tracked deletion to make.
     let repo = git2::Repository::open(&scratch).unwrap();
     for rel in &write.installed_files {
         assert!(
@@ -370,16 +336,16 @@ source = "https://github.com/x/uninstall-track"
         plugin_id: "uninstall-track-plugin".to_string(),
         plugin_version: "1.2.0".to_string(),
         plugin_name: "Uninstall Track Plugin".to_string(),
+        hooks: Vec::new(),
         files_present: write.installed_files.clone(),
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    let outcome = uninstall_with_bus(&scratch, &bus, &pending, &[], None)
+    let outcome = uninstall_with_bus(&scratch, &bus, &pending, &[], None, vec![])
         .await
         .expect("uninstall");
     assert_eq!(outcome.files_deleted.len(), write.installed_files.len());
 
-    // Files gone from disk.
     for rel in &write.installed_files {
         assert!(
             !scratch.join("data").join(rel).exists(),
@@ -388,8 +354,6 @@ source = "https://github.com/x/uninstall-track"
         );
     }
 
-    // HEAD now records the uninstall, and the deleted files are gone from its
-    // tree — the deletion is version-controlled, not just a dirty working tree.
     let head = repo.head().and_then(|h| h.peel_to_commit()).unwrap();
     assert_eq!(
         head.message().unwrap_or(""),
@@ -406,7 +370,6 @@ source = "https://github.com/x/uninstall-track"
         );
     }
 
-    // Working tree is clean: no staged-or-unstaged deletions left dangling.
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(false);
     let dirty: Vec<String> = repo
@@ -422,8 +385,6 @@ source = "https://github.com/x/uninstall-track"
     );
 }
 
-// ---- uninstall confirm-flow unit tests ------------------------------
-
 #[test]
 fn is_safe_data_path_accepts_content_dir_files() {
     assert!(super::is_safe_data_path("apps/foo/index.html"));
@@ -435,16 +396,13 @@ fn is_safe_data_path_accepts_content_dir_files() {
 
 #[test]
 fn is_safe_data_path_rejects_traversal_and_unknown_roots() {
-    // Traversal attempts (delegated to `core::is_path_traversal`).
     assert!(!super::is_safe_data_path("../etc/passwd"));
     assert!(!super::is_safe_data_path("apps/../../etc/passwd"));
     assert!(!super::is_safe_data_path("/etc/passwd"));
     assert!(!super::is_safe_data_path("\\windows\\system32"));
-    // Unknown content-dir roots — defense against tampered install records.
     assert!(!super::is_safe_data_path("artifacts/foo.txt"));
     assert!(!super::is_safe_data_path("postgres/data.bin"));
     assert!(!super::is_safe_data_path(".lucidos/secrets"));
-    // Empty.
     assert!(!super::is_safe_data_path(""));
 }
 
@@ -456,8 +414,6 @@ fn prune_empty_parents_stops_at_content_dir_root() {
     std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
     std::fs::write(&nested, b"x").unwrap();
 
-    // Simulate the file already removed; prune should walk up sub → myapp,
-    // remove both, then stop at apps/ (the content-dir root).
     std::fs::remove_file(&nested).unwrap();
     super::prune_empty_parents(&data_dir, "apps/myapp/sub/leaf.html");
 
@@ -498,7 +454,6 @@ fn prepare_uninstall_request_partitions_present_and_missing() {
     let data_dir = scratch.join("data");
     std::fs::create_dir_all(data_dir.join("apps/foo")).unwrap();
     std::fs::write(data_dir.join("apps/foo/index.html"), b"<html/>").unwrap();
-    // knowhow/foo.md does NOT exist → expected in `files_missing`.
 
     let pending: std::sync::Arc<PendingUninstallsMap> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -511,8 +466,9 @@ fn prepare_uninstall_request_partitions_present_and_missing() {
         vec![
             "apps/foo/index.html".to_string(),
             "knowhow/foo.md".to_string(),
-            "../etc/passwd".to_string(), // unsafe — must land in `missing`
+            "../etc/passwd".to_string(),
         ],
+        Vec::new(),
     );
 
     assert!(result.starts_with(PLUGIN_UNINSTALL_REQUEST_PREFIX));
@@ -542,7 +498,6 @@ fn prepare_uninstall_request_partitions_present_and_missing() {
         "unsafe path must surface in files_missing, never in files_present"
     );
 
-    // PendingUninstall registered under the returned uninstall_id.
     let uninstall_id = parsed["uninstall_id"].as_str().unwrap();
     assert!(pending.lock().unwrap().contains_key(uninstall_id));
 }
@@ -556,6 +511,7 @@ async fn cancel_pending_uninstall_emits_event_and_drops_entry() {
         plugin_id: "foo".to_string(),
         plugin_version: "1.0.0".to_string(),
         plugin_name: "Foo".to_string(),
+        hooks: Vec::new(),
         files_present: vec!["apps/foo/index.html".to_string()],
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
@@ -599,20 +555,16 @@ async fn cancel_pending_uninstall_returns_error_for_unknown_id() {
 
 #[tokio::test]
 async fn uninstall_with_bus_handles_file_disappearing_between_prepare_and_confirm() {
-    // Race: prepare snapshots the file as present, then the user (or another
-    // process) deletes it manually before clicking Confirm. uninstall_with_bus
-    // must NOT fail — fold it into files_missing and continue.
     let (_tmp, scratch) = fresh_workspace();
     let data_dir = scratch.join("data");
     std::fs::create_dir_all(data_dir.join("knowhow")).unwrap();
     std::fs::write(data_dir.join("knowhow/stays.md"), b"x").unwrap();
-    // The "raced" file is intentionally not created on disk, even though
-    // we'll mark it as files_present in the pending entry.
 
     let pending = PendingUninstall {
         plugin_id: "race-fixture".to_string(),
         plugin_version: "0.1.0".to_string(),
         plugin_name: "Race Fixture".to_string(),
+        hooks: Vec::new(),
         files_present: vec![
             "knowhow/stays.md".to_string(),
             "knowhow/already-gone.md".to_string(),
@@ -622,7 +574,7 @@ async fn uninstall_with_bus_handles_file_disappearing_between_prepare_and_confir
     };
 
     let bus = MockEventBus::new();
-    let outcome = super::uninstall_with_bus(&scratch, &bus, &pending, &[], None)
+    let outcome = super::uninstall_with_bus(&scratch, &bus, &pending, &[], None, vec![])
         .await
         .expect("race must not fail uninstall");
 
@@ -648,6 +600,7 @@ async fn uninstall_with_bus_never_deletes_an_unsafe_recorded_path() {
         plugin_id: "tampered".to_string(),
         plugin_version: "0.1.0".to_string(),
         plugin_name: "Tampered".to_string(),
+        hooks: Vec::new(),
         files_present: vec![
             "config/secrets.json".to_string(),
             "../outside.md".to_string(),
@@ -656,7 +609,7 @@ async fn uninstall_with_bus_never_deletes_an_unsafe_recorded_path() {
         created_at: chrono::Utc::now(),
     };
     let bus = MockEventBus::new();
-    let outcome = super::uninstall_with_bus(&scratch, &bus, &pending, &[], None)
+    let outcome = super::uninstall_with_bus(&scratch, &bus, &pending, &[], None, vec![])
         .await
         .expect("a tampered record must not fail the uninstall");
 
@@ -670,7 +623,6 @@ async fn uninstall_with_bus_never_deletes_an_unsafe_recorded_path() {
     assert!(scratch.join("outside.md").exists());
 }
 
-/// Reads the workspace repo at the moment `PluginUninstalled` is emitted.
 struct CommitProbeBus {
     workspace: std::path::PathBuf,
     rel: String,
@@ -727,6 +679,7 @@ async fn uninstall_commits_the_deletion_before_it_announces_it() {
         plugin_id: "fixture-plugin".to_string(),
         plugin_version: "0.1.0".to_string(),
         plugin_name: "Fixture Plugin".to_string(),
+        hooks: Vec::new(),
         files_present: write.installed_files.clone(),
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
@@ -736,7 +689,7 @@ async fn uninstall_commits_the_deletion_before_it_announces_it() {
         rel: write.installed_files[0].clone(),
         deletion_committed_at_emit: std::sync::Mutex::new(None),
     };
-    super::uninstall_with_bus(&scratch, &probe, &pending, &[], None)
+    super::uninstall_with_bus(&scratch, &probe, &pending, &[], None, vec![])
         .await
         .expect("uninstall");
 

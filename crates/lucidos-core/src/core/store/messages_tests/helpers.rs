@@ -15,7 +15,6 @@ pub(super) fn make_event(event_type: &str, payload: serde_json::Value, secs: i64
     }
 }
 
-// Helper: generate a text segment of exactly `n` chars padded with dots
 pub(super) fn pad(prefix: &str, n: usize) -> String {
     let mut s = prefix.to_string();
     while s.len() < n {
@@ -25,7 +24,6 @@ pub(super) fn pad(prefix: &str, n: usize) -> String {
     s
 }
 
-/// Helper: count text events in a ResponseEvent vec
 pub(super) fn text_events(events: &[ResponseEvent]) -> Vec<&str> {
     events
         .iter()
@@ -36,7 +34,6 @@ pub(super) fn text_events(events: &[ResponseEvent]) -> Vec<&str> {
         .collect()
 }
 
-/// Helper: count step events in a ResponseEvent vec
 pub(super) fn step_events(events: &[ResponseEvent]) -> Vec<(&str, bool)> {
     events
         .iter()

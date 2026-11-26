@@ -63,7 +63,6 @@ async fn served_frontend_commit_fact_records_known_changes_only() {
     std::fs::write(initial.join(SOURCE_COMMIT_FILE), &first).unwrap();
     let handle = Arc::new(RwLock::new(initial.clone()));
     engine.init_served_frontend(handle.clone(), initial.clone());
-    // A boot fallback serves live dist, whose stamp can change before a swap.
     std::fs::write(initial.join(SOURCE_COMMIT_FILE), &second).unwrap();
 
     for (index, commit) in [second.as_str(), second.as_str(), "invalid"]

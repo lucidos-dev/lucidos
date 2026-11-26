@@ -12,20 +12,11 @@ fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
     h
 }
 
-/// Both rules, so a test names which one it is asserting.
 const BOTH_RULES: [(&str, RefererRule); 2] = [
     ("Required", RefererRule::Required),
     ("WhenPresent", RefererRule::WhenPresent),
 ];
 
-/// Regression: an app iframe cannot read a credential, and cannot read the
-/// backup key either.
-///
-/// Both routes returned their secret to any caller. The `Referer` path is the
-/// only thing that differs: a standalone app tab is same-origin, so
-/// `Sec-Fetch-Site` reads `same-origin` for it exactly as for the Settings
-/// page. The fixtures below are that tab, which is the case still worth pinning
-/// now an app frame is isolated.
 #[test]
 fn an_app_document_is_refused_under_either_rule() {
     for (label, rule) in BOTH_RULES {
@@ -46,7 +37,6 @@ fn an_app_document_is_refused_under_either_rule() {
     }
 }
 
-/// The Settings page keeps working, direct and behind the gateway.
 #[test]
 fn the_workspace_shell_is_allowed_under_either_rule() {
     for (label, rule) in BOTH_RULES {
@@ -55,8 +45,6 @@ fn the_workspace_shell_is_allowed_under_either_rule() {
             "https://localhost:5251/index.html",
             "https://localhost:5251/dev/",
             "https://localhost:5251/dev/index.html",
-            // A workspace whose slug is literally `app` is a shell, not an app:
-            // no app id follows.
             "https://localhost:5251/app/",
         ] {
             assert!(
@@ -70,10 +58,6 @@ fn the_workspace_shell_is_allowed_under_either_rule() {
     }
 }
 
-/// The mint holds the gateway control plane's rule.
-///
-/// A browser that suppressed its `Referer` removed the only thing telling it
-/// apart from an app. So `referrerPolicy: 'no-referrer'` cannot mint.
 #[test]
 fn a_browser_that_hides_its_referer_cannot_mint() {
     for pairs in [
@@ -87,12 +71,6 @@ fn a_browser_that_hides_its_referer_cannot_mint() {
     }
 }
 
-/// The redeem lets that same request through, and the token is what gates it.
-///
-/// The service worker re-issues a `GET` on iOS. A re-issue is meant to carry
-/// the original referrer, and a browser that dropped it would take the Copy
-/// button down in the installed PWA. Nothing is lost: a token exists only
-/// because a mint passed the strict rule above.
 #[test]
 fn a_browser_that_hides_its_referer_can_still_redeem() {
     assert!(reveal_request_allowed(
@@ -101,8 +79,6 @@ fn a_browser_that_hides_its_referer_can_still_redeem() {
     ));
 }
 
-/// A non-browser client sends no fetch metadata at all. The loopback bind is
-/// its boundary, and this is the CLI and the API e2e suite.
 #[test]
 fn a_non_browser_client_is_allowed_under_either_rule() {
     for (label, rule) in BOTH_RULES {
@@ -133,8 +109,6 @@ fn a_token_reveals_its_own_subject_exactly_once() {
     }
 }
 
-/// A token is bound to the row it was minted for. Without this, one click on
-/// one credential would open every other one for 30 seconds.
 #[test]
 fn a_token_does_not_reveal_a_different_credential() {
     let store = RevealTokens::new();
@@ -149,9 +123,6 @@ fn a_token_does_not_reveal_a_different_credential() {
     );
 }
 
-/// The two secrets share one store, so a token must not cross between them.
-/// A credential reveal is an ordinary Settings click; the backup key encrypts
-/// every archive the workspace ever uploaded.
 #[test]
 fn a_credential_token_does_not_open_the_backup_key() {
     let store = RevealTokens::new();
@@ -171,7 +142,6 @@ fn an_unknown_token_is_refused() {
     assert!(!store.redeem("nope", RevealSubject::Credential(uuid::Uuid::new_v4())));
 }
 
-/// Two mints never collide, and each spends independently.
 #[test]
 fn two_tokens_are_distinct() {
     let store = RevealTokens::new();
@@ -185,8 +155,6 @@ fn two_tokens_are_distinct() {
     assert!(store.redeem(&second, b));
 }
 
-/// The mint response tells the caller how long it has, so a client can decide
-/// whether to re-mint rather than guessing at the window.
 #[test]
 fn the_mint_response_reports_the_window() {
     let body = RevealTokenResponse::new("abc".to_string());
@@ -194,8 +162,6 @@ fn the_mint_response_reports_the_window() {
     assert_eq!(body.expires_in_secs, TOKEN_TTL.as_secs());
 }
 
-/// Both refusals name what happened. A silent 403 in front of a Copy button is
-/// undebuggable from the page.
 #[test]
 fn a_refusal_says_which_wall_it_hit() {
     let (status, body) = forbidden("the backup key");
@@ -220,8 +186,6 @@ fn any_device_session_header_refuses_secret_reveal() {
     }
 }
 
-/// Which rule each credential step runs is the gate, and the predicate tests
-/// above pass whichever rule a handler picks. So this reads the two call sites.
 #[test]
 fn the_credential_mint_is_strict_and_its_redeem_lenient() {
     let source = include_str!("credential_reveal.rs");

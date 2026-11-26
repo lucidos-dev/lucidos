@@ -1,22 +1,3 @@
-//! The typed `data/` subdirectories, the *data prefixes*: the one list every
-//! surface that turns a caller's path into a `data/` path reads.
-//!
-//! Everything else under the `data/` root is gitignored config (`.env`,
-//! `postgres/`) that no caller-supplied path may reach. A traversal check alone
-//! stops a path leaving `data/`, not reaching `.env` inside it. Readers: the HTTP data
-//! route, the agent file tools (`normalize_data_path`), email attachments, and,
-//! through source-reading pin tests, the `lucidos` CLI and the frontend.
-
-/// Mutable workspace-data prefixes: user-owned trees the API may write and
-/// delete.
-///
-/// The write side cannot tell an app from the shell. So each of these is
-/// guarded at the point of USE instead (ADR 0156 decision 2). A new prefix
-/// states its guard in `tests::GUARD_AT_USE`, and a test fails if it does not.
-///
-/// `config/` and `auth-modules/` are coupled: `config/apis.json` references
-/// signers by name from `auth-modules/`, so deleting one without the other
-/// leaves a dangling reference.
 pub const MUTABLE_PREFIXES: &[&str] = &[
     "artifacts/",
     "apps/",
@@ -29,11 +10,8 @@ pub const MUTABLE_PREFIXES: &[&str] = &[
     "fonts/",
 ];
 
-/// Engine-shipped reference knowhow served from `<repo>/system-knowhow/`.
-/// Readable, never writable.
 pub const READ_ONLY_PREFIXES: &[&str] = &[super::knowhow::SYSTEM_KNOWHOW_PREFIX];
 
-/// Every data prefix, mutable first.
 pub fn known_data_prefixes() -> impl Iterator<Item = &'static str> {
     MUTABLE_PREFIXES
         .iter()
@@ -41,22 +19,14 @@ pub fn known_data_prefixes() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
-/// Whether a `data/`-relative path names one of the data prefixes.
 pub fn is_known_data_prefix(relative_path: &str) -> bool {
     known_data_prefixes().any(|p| relative_path.starts_with(p))
 }
 
-/// Whether a data path lies in a tree whose files are checked whole before
-/// they are written: `themes/` and `fonts/`. Such a file is written or copied
-/// whole, never edited in place, and every change to it is announced, so an
-/// open picker refreshes.
 pub fn is_checked_whole(data_path: &str) -> bool {
     super::themes::is_theme_path(data_path) || super::workspace_fonts::is_font_path(data_path)
 }
 
-/// The check every writer of a `data/` path runs before the bytes reach disk:
-/// the data route, `write_file` and `copy_file`. A path outside the checked
-/// trees passes. One function, so the surfaces cannot disagree.
 pub fn validate_data_write(
     data_dir: &std::path::Path,
     data_path: &str,
@@ -66,7 +36,7 @@ pub fn validate_data_write(
     super::workspace_fonts::validate_data_write(data_dir, data_path, bytes)
 }
 
-/// Where `data_path` really lands once every symlink on it resolves, as a
+/// INVARIANT: Where `data_path` really lands once every symlink on it resolves, as a
 /// path relative to `data_dir`.
 ///
 /// The prefix allowlist reads a string, and a symlink makes the string lie: a
@@ -78,7 +48,6 @@ pub fn validate_data_write(
 /// cannot resolve, such as a dangling link, is an error: a write through it
 /// would create its target, wherever that is.
 pub fn resolved_data_path(data_dir: &std::path::Path, data_path: &str) -> Result<String, String> {
-    // No `data/` yet means nothing below it exists, so nothing is linked.
     let Ok(root) = data_dir.canonicalize() else {
         return Ok(data_path.to_string());
     };
@@ -103,7 +72,6 @@ pub fn resolved_data_path(data_dir: &std::path::Path, data_path: &str) -> Result
         .ok_or_else(|| format!("'{data_path}' resolves to a path that is not UTF-8"))
 }
 
-/// The data prefixes as one comma-separated line, for a refusal to name.
 pub fn known_data_prefixes_text() -> String {
     known_data_prefixes().collect::<Vec<_>>().join(", ")
 }
@@ -112,7 +80,6 @@ pub fn known_data_prefixes_text() -> String {
 mod tests {
     use super::*;
 
-    /// What refuses each mutable prefix at the point of use.
     const GUARD_AT_USE: &[(&str, &str)] = &[
         ("artifacts/", "none: content the user owns"),
         ("apps/", "none: content the user owns"),
@@ -141,9 +108,6 @@ mod tests {
         ),
     ];
 
-    /// No header tells an app from the shell (ADR 0156 decision 1). So a
-    /// prefix is safe because of what refuses it downstream, never because of
-    /// who wrote it. Adding a prefix costs one table row.
     #[test]
     fn every_mutable_prefix_states_what_guards_it_at_use() {
         let guarded: Vec<&str> = GUARD_AT_USE.iter().map(|(prefix, _)| *prefix).collect();
@@ -166,8 +130,6 @@ mod tests {
         assert!(is_known_data_prefix("system-knowhow/themes.md"));
     }
 
-    /// A workspace `data/` dir holding `artifacts/real.md` and `.env`, plus a
-    /// file outside the workspace altogether.
     fn linked_tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let ws = tempfile::tempdir().unwrap();
         let data = ws.path().join("data");
@@ -203,7 +165,6 @@ mod tests {
             resolved_data_path(&data, "artifacts/alias.md").unwrap(),
             "artifacts/real.md"
         );
-        // Inside data/ but past the allowlist: the caller's prefix rule refuses it.
         assert_eq!(resolved_data_path(&data, "artifacts/env").unwrap(), ".env");
         for path in [
             "artifacts/file-out",

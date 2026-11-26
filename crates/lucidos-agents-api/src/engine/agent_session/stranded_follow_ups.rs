@@ -1,14 +1,3 @@
-//! Follow-ups a coding agent's process took into its input queue and died
-//! holding. Plan: `docs/plans/2026-10-17-a-follow-up-a-dead-agent-never-read.md`.
-//!
-//! Claude Code keeps queued input in process memory. A process that dies
-//! before it reads an input takes the input with it, and the user's bubble
-//! stays "Queued" for good. The event store already says which inputs those
-//! are (ADR 0236): a `CodingAgentPromptSent` names the message, and no
-//! `CodingAgentInputRead` or `QueuedMessageRemoved` does. The next session
-//! forwards each one again, and a Remove with no process to ask records its
-//! tombstone from the same facts.
-
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -24,8 +13,6 @@ use crate::engine::types::ChatImage;
 use crate::engine::types::{AgentSession, AgentUserInput, RedeliveredInput};
 use crate::engine::AgentInputKind;
 
-/// Nothing settled `m` on thread `$1`: no agent read it, and the user did not
-/// take it back.
 const UNSETTLED: &str = "\
 NOT EXISTS ( \
          SELECT 1 FROM events r \
@@ -38,7 +25,6 @@ NOT EXISTS ( \
             AND t.event_type = 'QueuedMessageRemoved' \
             AND t.payload->>'removed_message_id' = m.id::text)";
 
-/// A human `MessageReceived` `m` on thread `$1` that nothing settled.
 static OWED_HUMAN_MESSAGE: LazyLock<String> = LazyLock::new(|| {
     format!(
         "m.event_type = 'MessageReceived' \
@@ -47,9 +33,6 @@ static OWED_HUMAN_MESSAGE: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// The input kinds a discard leaves owed, one per [`RedeliveredInput`]. A
-/// continuation is not one: a later resume sends its own nudge. A cache
-/// keep-alive only warms the cache.
 static OWED_KIND: LazyLock<String> = LazyLock::new(|| {
     format!(
         "(m.event_type IN ('MessageReceived', 'ChildThreadCompleted', 'ChildReportFiled', \
@@ -60,8 +43,6 @@ static OWED_KIND: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// An effort restart discarded `m` before the agent read it. Older threads
-/// carry these; nothing writes one since the rung locks for a turn (ADR 0542).
 const DISCARDED: &str = "\
 EXISTS ( \
          SELECT 1 FROM events d \
@@ -69,12 +50,9 @@ EXISTS ( \
             AND d.event_type = 'CodingAgentInputDiscarded' \
             AND d.payload->>'input_event_id' = m.id::text)";
 
-/// The one definition of a *discarded input* still owed, over alias `m` and
-/// thread id `$1`.
 static DISCARDED_AND_OWED: LazyLock<String> =
     LazyLock::new(|| format!("{} AND {UNSETTLED} AND {DISCARDED}", *OWED_KIND));
 
-/// The columns of an [`EventRow`], over alias `m`.
 pub(crate) const OWED_ROW_COLUMNS: &str =
     "m.id, m.event_type, m.payload, m.created, m.thread_id, m.sequence";
 
@@ -107,10 +85,8 @@ SELECT {OWED_ROW_COLUMNS} \
     )
 });
 
-/// One input a session dropped before its agent read it.
 #[derive(Debug, Clone)]
 pub(crate) struct StrandedFollowUp {
-    /// Its event, which the redelivery's read names.
     pub event_id: Uuid,
     pub input: RedeliveredInput,
     pub text: String,
@@ -118,9 +94,6 @@ pub(crate) struct StrandedFollowUp {
     pub sent_at: DateTime<Utc>,
 }
 
-/// Run [`STRANDED_FOLLOW_UPS_SQL`] and rebuild each input with its images.
-/// A dropped connection is retried, so a Postgres restart does not fail the
-/// session that asks.
 pub(crate) async fn stranded_follow_ups(
     pool: &sqlx::PgPool,
     workspace: &Path,
@@ -148,18 +121,13 @@ pub(crate) async fn stranded_follow_ups(
         .collect())
 }
 
-/// What became of a follow-up no live process holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputFate {
-    /// The agent read it, in some session.
     Read,
-    /// A session forwarded it and no agent read it: only a dead process held it.
     Stranded,
-    /// No session forwarded it yet, so a spawn may still be on its way to it.
     NeverForwarded,
 }
 
-/// Ask the store what became of `input_event_id`'s input.
 pub(crate) async fn input_fate(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -185,8 +153,6 @@ pub(crate) async fn input_fate(
     })
 }
 
-/// The note in front of a redelivered input. It names who sent it and when, so
-/// the agent can weigh it against what happened since.
 pub(crate) fn late_delivery_note(input: RedeliveredInput, sent_at: DateTime<Utc>) -> String {
     let sent_at = sent_at.format("%Y-%m-%d %H:%M");
     let (what, sender) = match input {
@@ -215,9 +181,6 @@ pub(crate) fn late_delivery_note(input: RedeliveredInput, sent_at: DateTime<Utc>
 
 #[easy_ext::ext(StrandedFollowUpsExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Queue `stranded`, from [`stranded_follow_ups`], on the starting
-    /// session's channel, behind its first prompt and ahead of anything sent
-    /// during the startup.
     async fn redeliver_stranded_follow_ups(
         &self,
         thread_id: Uuid,
@@ -228,7 +191,7 @@ pub(crate) impl crate::engine::LucidosEngine {
         if stranded.is_empty() {
             return;
         }
-        // Under the lock every sender takes, so nothing slips in between.
+        // INVARIANT: Under the lock every sender takes, so nothing slips in between.
         let mut sessions = self.agent_sessions.lock().await;
         let Some(session) = sessions
             .get_mut(&thread_id)
@@ -245,7 +208,6 @@ pub(crate) impl crate::engine::LucidosEngine {
     }
 }
 
-/// Queue `stranded` oldest first, then put back what arrived during startup.
 fn queue_ahead_of_startup_input(
     session: &mut AgentSession,
     msg_rx: &mut UnboundedReceiver<AgentUserInput>,
@@ -260,11 +222,11 @@ fn queue_ahead_of_startup_input(
     }
 }
 
-/// Queue one stranded follow-up as its own input. It is marked unforwarded
+/// INVARIANT: Queue one stranded follow-up as its own input. It is marked unforwarded
 /// first, so a withdraw waits for its forward rather than overtaking it.
 fn queue_follow_up(session: &mut AgentSession, follow_up: StrandedFollowUp) {
     session.unforwarded_inputs.insert(follow_up.event_id);
-    // The caller holds the open receiver, so the send cannot fail.
+    // INVARIANT: The caller holds the open receiver, so the send cannot fail.
     let _ = session.msg_tx.send(AgentUserInput {
         text: follow_up.text,
         images: follow_up.images,

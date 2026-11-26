@@ -16,36 +16,26 @@ pub struct AppManifest {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    /// Kept verbatim, so a metadata rewrite never alters what the author
+    /// INVARIANT: Kept verbatim, so a metadata rewrite never alters what the author
     /// wrote. `AppReveal::from_manifest` reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reveal: Option<String>,
-    /// Kept verbatim like `reveal`. `AppKind::from_manifest` reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// The thread a widget was made in. Kept verbatim; `App` parses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_thread_id: Option<String>,
-    /// The plugin that ships a widget, instead of a thread (ADR 0414).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_plugin_id: Option<String>,
-    /// A reusable widget is offered to every thread (ADR 0402).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reusable: bool,
-    /// The names a widget takes in its *widget params* (ADR 0415).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, AppParam>,
-    /// The *widget sizes* a widget supports, first the default. Kept verbatim;
-    /// `check_widget_manifest` reads it (ADR 0432).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sizes: Option<Vec<String>>,
-    /// A widget that draws its own shape gets a see-through tile (ADR 0432).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transparent: bool,
 }
 
-/// One of the four sizes a widget takes as a tile on a dashboard: one cell,
-/// two cells wide, two by two, or four by two (ADR 0432).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WidgetSize {
@@ -56,10 +46,10 @@ pub enum WidgetSize {
 }
 
 impl WidgetSize {
-    /// Smallest first, the order the fallback walks.
+    /// INVARIANT: Smallest first, the order the fallback walks.
     pub const ALL: [Self; 4] = [Self::Small, Self::Medium, Self::Large, Self::Xl];
 
-    /// What a widget that declares no sizes supports: small, medium and
+    /// INVARIANT: What a widget that declares no sizes supports: small, medium and
     /// large, medium first because `default_of` starts a tile at the first.
     /// XL is opt-in: a box four cells wide stretches a widget written
     /// without it in mind.
@@ -78,23 +68,16 @@ impl WidgetSize {
         Self::ALL.into_iter().find(|size| size.as_str() == name)
     }
 
-    /// Every size name, for an error that tells the caller what to use:
-    /// "small, medium, large or xl".
     pub fn choices() -> String {
         let names = Self::ALL.map(Self::as_str);
         let (last, rest) = names.split_last().expect("ALL is not empty");
         format!("{} or {last}", rest.join(", "))
     }
 
-    /// The size a new tile of a widget declaring `declared` starts at: its
-    /// first, else the size of a widget that declares none.
     pub fn default_of(declared: &[Self]) -> Self {
         declared.first().copied().unwrap_or(Self::UNDECLARED[0])
     }
 
-    /// The size a tile shows when a layout asks for this one: itself when
-    /// declared, else the nearest smaller declared size, else the nearest
-    /// larger. `declared` is never empty for a loaded widget.
     pub fn fit(self, declared: &[Self]) -> Self {
         if declared.contains(&self) {
             return self;
@@ -105,9 +88,6 @@ impl WidgetSize {
     }
 }
 
-/// The size of any dashboard tile. A widget shows at one of its four
-/// `WidgetSize`s, and an *app shortcut* is always a quarter: half a small
-/// cell's edge on each side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TileSize {
@@ -119,7 +99,6 @@ pub enum TileSize {
 }
 
 impl TileSize {
-    /// Smallest first.
     pub const ALL: [Self; 5] = [
         Self::Quarter,
         Self::Small,
@@ -138,7 +117,6 @@ impl TileSize {
         }
     }
 
-    /// The widget size this tile size is, or `None` for a quarter.
     pub fn widget_size(self) -> Option<WidgetSize> {
         match self {
             Self::Quarter => None,
@@ -161,18 +139,12 @@ impl From<WidgetSize> for TileSize {
     }
 }
 
-/// What the manifest says about a widget's tile, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WidgetTile {
-    /// Never empty for a widget, and empty for an app.
     pub sizes: Vec<WidgetSize>,
     pub transparent: bool,
 }
 
-/// The one check of a manifest's `sizes` and `transparent`, shared by the
-/// loader, `create_app` and the plugin installer. Only a widget takes either.
-/// Sizes are known names, at least one, with no duplicate. A widget that
-/// declares none supports small, medium and large, and starts medium.
 pub fn check_widget_manifest(kind: AppKind, manifest: &AppManifest) -> Result<WidgetTile, String> {
     if kind != AppKind::Widget {
         if manifest.sizes.is_some() {
@@ -196,7 +168,6 @@ pub fn check_widget_manifest(kind: AppKind, manifest: &AppManifest) -> Result<Wi
     })
 }
 
-/// A list of size names as sizes, or why it is not a valid list.
 pub fn parse_widget_sizes(names: &[String]) -> Result<Vec<WidgetSize>, String> {
     if names.is_empty() {
         return Err("\"sizes\" must name at least one size".into());
@@ -217,7 +188,6 @@ pub fn parse_widget_sizes(names: &[String]) -> Result<Vec<WidgetSize>, String> {
     Ok(sizes)
 }
 
-/// One name a widget takes in its *widget params*, as its manifest declares it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppParam {
     #[serde(default)]
@@ -226,19 +196,16 @@ pub struct AppParam {
     pub required: bool,
 }
 
-/// What an app folder is. The one classifier every apps reader filters
-/// through, so a widget never reaches the apps list (ADR 0402).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AppKind {
     #[default]
     App,
-    /// A visual answer that lives in a thread: an app that is not listed.
     Widget,
 }
 
 impl AppKind {
-    /// An unrecognised value lists the app as an app rather than failing the
+    /// INVARIANT: An unrecognised value lists the app as an app rather than failing the
     /// manifest. Hiding a folder on a typo would lose it; the audit reports it.
     pub fn from_manifest(app_id: &str, value: Option<&str>) -> Self {
         match value {
@@ -263,8 +230,6 @@ impl AppKind {
     }
 }
 
-/// Who owns a widget: the thread it was made in, or the plugin that ships it
-/// (ADR 0414). Never both. On the wire it is the one field it names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WidgetOrigin {
@@ -287,8 +252,6 @@ impl WidgetOrigin {
         }
     }
 
-    /// The manifest's two origin fields as one origin. Naming both is an
-    /// error, since the widget would then have two owners.
     fn from_manifest(app_id: &str, manifest: &AppManifest) -> Result<Option<Self>, String> {
         match (&manifest.origin_thread_id, &manifest.origin_plugin_id) {
             (Some(_), Some(_)) => Err(format!(
@@ -315,33 +278,24 @@ impl WidgetOrigin {
     }
 }
 
-/// What `create_app` makes. A widget always records the thread it was made
-/// in, so a widget without an origin cannot be created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewAppKind {
     App,
     Widget {
         origin_thread_id: uuid::Uuid,
-        /// The sizes it declares; `None` writes none, which reads as small, medium and large.
         sizes: Option<Vec<WidgetSize>>,
     },
 }
 
-/// When the host lifts its cover off an opening app.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AppReveal {
-    /// On the frame's `load` event.
     #[default]
     OnLoad,
-    /// When the app calls `lucidos.ui.ready()`.
     OnReady,
 }
 
 impl AppReveal {
-    /// An unrecognised value opens the app as `on-load` rather than failing
-    /// the manifest: a typo must not drop the app from the list. The workspace
-    /// audit reports it instead.
     fn from_manifest(app_id: &str, value: Option<&str>) -> Self {
         match value {
             None | Some("on-load") => Self::OnLoad,
@@ -358,14 +312,11 @@ impl AppReveal {
     }
 }
 
-/// The file types an app icon may be (ADR 0414).
 pub const APP_ICON_EXTENSIONS: [&str; 3] = ["svg", "png", "webp"];
-/// The largest file that still counts as an app icon.
 pub const APP_ICON_MAX_BYTES: u64 = 512 * 1024;
-/// Where `create_app` writes the icon it is handed.
 pub const APP_ICON_DEFAULT_PATH: &str = "assets/icon.svg";
 
-/// The manifest's `icon` when it names a usable image inside `app_dir`, else
+/// INVARIANT: The manifest's `icon` when it names a usable image inside `app_dir`, else
 /// `None`, and the monogram tile stands in. Usable means a relative path to a
 /// regular file with an icon extension, under the size cap. It must resolve
 /// inside the folder, even through a symlinked directory.
@@ -394,10 +345,8 @@ pub(crate) fn resolve_app_icon(app_dir: &Path, value: Option<&str>) -> Option<St
     inside.then(|| raw.to_string())
 }
 
-/// What `create_app` writes beside the manifest.
 pub struct AppFiles<'a> {
     pub html: &'a str,
-    /// Written to `APP_ICON_DEFAULT_PATH`, which the manifest then names.
     pub icon_svg: Option<&'a str>,
 }
 
@@ -410,7 +359,6 @@ impl<'a> From<&'a str> for AppFiles<'a> {
     }
 }
 
-/// Refuses an icon `create_app` could write but never show.
 fn check_icon_svg(svg: &str) -> Result<(), String> {
     if !svg.contains("<svg") {
         return Err("icon_svg must be an SVG document with an <svg> element".to_string());
@@ -430,8 +378,6 @@ pub struct App {
     pub id: String,
     pub name: String,
     pub description: String,
-    /// The app icon as a path inside the app folder, validated by
-    /// `resolve_app_icon`. Absent when the manifest names no usable image.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub reveal: AppReveal,
@@ -441,19 +387,15 @@ pub struct App {
     pub reusable: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, AppParam>,
-    /// A *built-in widget*: shipped with Lucidos and read-only (ADR 0415).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub built_in: bool,
-    /// A widget's *widget sizes*, first the default. Empty for an app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sizes: Vec<WidgetSize>,
-    /// A widget whose tile is see-through, so it draws its own shape.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transparent: bool,
 }
 
 impl App {
-    /// The size a new tile of this widget starts at.
     pub fn default_size(&self) -> WidgetSize {
         WidgetSize::default_of(&self.sizes)
     }
@@ -462,18 +404,16 @@ impl App {
         self.kind == AppKind::Widget
     }
 
-    /// The thread a widget was made in, when a thread owns it.
     pub fn origin_thread(&self) -> Option<uuid::Uuid> {
         self.origin.as_ref().and_then(WidgetOrigin::thread)
     }
 
-    /// The plugin that ships a widget, when a plugin owns it.
     pub fn origin_plugin(&self) -> Option<&str> {
         self.origin.as_ref().and_then(WidgetOrigin::plugin)
     }
 }
 
-/// Defence-in-depth: API handlers validate app ids at the boundary
+/// INVARIANT: Defence-in-depth: API handlers validate app ids at the boundary
 /// (`is_valid_id` in `api/apps.rs`), but `AppManager` is also reached from LLM
 /// tool handlers (`engine/tools/apps.rs` passes the model-provided `id`
 /// straight through). A `..` segment or absolute path would let the joined
@@ -491,19 +431,16 @@ fn reject_path_traversal(p: &str) -> Result<(), std::io::Error> {
 
 pub struct AppManager {
     apps_path: PathBuf,
-    /// The shipped `system-widgets/` directory, read-only (ADR 0415).
     system_widgets_path: Option<PathBuf>,
     repo: Mutex<Repository>,
 }
 
-/// Why a write may not start a new app under the reserved prefix.
 pub const RESERVED_APP_ID: &str = concat!(
     "app ids starting '",
     built_in_widget_prefix!(),
     "' are reserved for built-in widgets. Pick another id"
 );
 
-/// Why every mutating path refuses a built-in widget.
 pub const BUILT_IN_READ_ONLY: &str = "built-in widgets ship with Lucidos and are read-only. \
      To change one, make a widget or an app of your own from its files";
 
@@ -530,14 +467,11 @@ impl AppManager {
         })
     }
 
-    /// Serve the *built-in widgets* from this shipped directory.
     pub fn with_system_widgets(mut self, dir: Option<PathBuf>) -> Self {
         self.system_widgets_path = dir;
         self
     }
 
-    /// The folder of the built-in widget this id names, if it names one. A
-    /// built-in resolves before a workspace app of the same id.
     fn built_in_dir(&self, app_id: &str) -> Option<PathBuf> {
         if !has_built_in_prefix(app_id)
             || crate::core::is_path_traversal(app_id)
@@ -549,12 +483,10 @@ impl AppManager {
         dir.join("manifest.json").is_file().then_some(dir)
     }
 
-    /// Whether this id names a built-in widget.
     pub fn is_built_in(&self, app_id: &str) -> bool {
         self.built_in_dir(app_id).is_some()
     }
 
-    /// Refuse a write to a built-in widget, naming it.
     pub fn refuse_built_in(&self, app_id: &str) -> Result<(), String> {
         if self.is_built_in(app_id) {
             return Err(format!(
@@ -565,14 +497,12 @@ impl AppManager {
         Ok(())
     }
 
-    /// Where a data path under `apps/` lives on disk when it is inside a
-    /// built-in widget, so a read reaches the shipped file.
     pub fn built_in_data_path(&self, data_path: &str) -> Option<PathBuf> {
         let (app_id, rest) = data_path.strip_prefix("apps/")?.split_once('/')?;
         Some(self.built_in_dir(app_id)?.join(rest))
     }
 
-    /// Why a write to this data path must be refused, if it must: it is inside
+    /// INVARIANT: Why a write to this data path must be refused, if it must: it is inside
     /// a built-in widget, or it would start a new workspace app under the
     /// reserved `lucidos-` prefix. A workspace app that already holds such an
     /// id stays writable.
@@ -586,17 +516,11 @@ impl AppManager {
         (has_built_in_prefix(app_id) && !self.app_exists(app_id)).then_some(RESERVED_APP_ID)
     }
 
-    /// The folder an app id resolves to: the built-in widget's, else the
-    /// workspace's `data/apps/<id>`.
     fn app_dir(&self, app_id: &str) -> PathBuf {
         self.built_in_dir(app_id)
             .unwrap_or_else(|| self.apps_path.join(app_id))
     }
 
-    /// [`Self::app_dir`] for a caller that reads files out of it, or `None`
-    /// when the folder, or `data/apps/` itself, is a symlink out of its tree.
-    /// Containment judged against such a folder alone would trust everything
-    /// under its target.
     pub fn contained_app_dir(&self, app_id: &str) -> Option<PathBuf> {
         match self.built_in_dir(app_id) {
             Some(dir) => Some(dir),
@@ -607,7 +531,7 @@ impl AppManager {
         }
     }
 
-    /// Runs one write with the workspace repo lock held across its existence
+    /// INVARIANT: Runs one write with the workspace repo lock held across its existence
     /// check, its read, its file change and its commit. A merge's
     /// `checkout -f main` runs under the same lock, so it cannot rewrite the
     /// file between the save and the commit.
@@ -616,7 +540,7 @@ impl AppManager {
         write(&held)
     }
 
-    /// Stage a single app file and commit.
+    /// INVARIANT: Stage a single app file and commit.
     /// `app_path` is relative to data/apps/ (e.g., "my-app/index.html").
     ///
     /// The repo lock excludes the engine's other writers. A coding agent's `git`
@@ -640,7 +564,6 @@ impl AppManager {
         })
     }
 
-    /// Stage multiple app files and commit in one operation.
     fn commit_batch(
         &self,
         _held: &WorkspaceRepoLock,
@@ -660,7 +583,6 @@ impl AppManager {
         })
     }
 
-    /// Load an App from its manifest.json on disk.
     fn load_app(&self, app_dir: &Path, built_in: bool) -> Result<App, std::io::Error> {
         let id = app_dir
             .file_name()
@@ -687,7 +609,6 @@ impl AppManager {
         let origin = WidgetOrigin::from_manifest(&id, &manifest)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let kind = AppKind::from_manifest(&id, manifest.kind.as_deref());
-        // A bad value must not drop the widget off its board; the audit reports it.
         let tile = check_widget_manifest(kind, &manifest).unwrap_or_else(|e| {
             log_legacy!("[Apps] {}: {}, using the default tile", id, e);
             WidgetTile {
@@ -714,19 +635,14 @@ impl AppManager {
         })
     }
 
-    /// The apps list: every app folder that is not a widget. Every apps
-    /// reader goes through here, so none of them shows a widget.
     pub fn list_apps(&self) -> Result<Vec<App>, std::io::Error> {
         Ok(self.apps_and_reusable_widgets()?.0)
     }
 
-    /// The reusable widgets: the ones any thread may show.
     pub fn list_reusable_widgets(&self) -> Result<Vec<App>, std::io::Error> {
         Ok(self.apps_and_reusable_widgets()?.1)
     }
 
-    /// The apps list and the reusable widgets from ONE scan, so a reader
-    /// needing both cannot see a widget in both or in neither.
     pub fn apps_and_reusable_widgets(&self) -> Result<(Vec<App>, Vec<App>), std::io::Error> {
         let (widgets, apps): (Vec<App>, Vec<App>) =
             self.list_all()?.into_iter().partition(App::is_widget);
@@ -734,8 +650,6 @@ impl AppManager {
         Ok((apps, reusable))
     }
 
-    /// The widgets these threads own: made in one of them and not reusable.
-    /// These are what Delete (a thread) removes.
     pub fn widgets_owned_by(
         &self,
         thread_ids: &[uuid::Uuid],
@@ -752,7 +666,7 @@ impl AppManager {
             .collect())
     }
 
-    /// Every app folder with a readable manifest, apps and widgets alike, and
+    /// INVARIANT: Every app folder with a readable manifest, apps and widgets alike, and
     /// every built-in widget, by name and then id. A workspace folder a
     /// built-in shadows is skipped. `read_dir` promises no order, and the apps
     /// list rides the cached system prompt, so an unsorted scan could rewrite
@@ -789,7 +703,6 @@ impl AppManager {
         Ok(())
     }
 
-    /// Get a specific app by ID.
     pub fn get_app(&self, app_id: &str) -> Result<App, std::io::Error> {
         reject_path_traversal(app_id)?;
         if let Some(dir) = self.built_in_dir(app_id) {
@@ -805,13 +718,6 @@ impl AppManager {
         self.load_app(&app_dir, false)
     }
 
-    /// Whether the app exists as far as the apps list is concerned: a
-    /// `manifest.json` is present under `data/apps/<id>/`. Matches `list_apps`,
-    /// which skips directories without a readable manifest — so this is the
-    /// honest "would this id appear in the list?" check. It decides AppCreated
-    /// vs AppUpdated when the raw file tools touch an app, and it is what
-    /// `create_app` refuses on. Workspace apps only: a built-in widget is not
-    /// a folder the file tools can create or remove.
     pub fn app_exists(&self, app_id: &str) -> bool {
         if reject_path_traversal(app_id).is_err() {
             return false;
@@ -819,19 +725,17 @@ impl AppManager {
         self.apps_path.join(app_id).join("manifest.json").exists()
     }
 
-    /// The app's display name from its manifest, or `None` if it can't be read.
+    /// INVARIANT: The app's display name from its manifest, or `None` if it can't be read.
     /// Used to populate the `name` field on `AppCreated`/`AppUpdated`.
     pub fn app_name(&self, app_id: &str) -> Option<String> {
         self.get_app(app_id).ok().map(|a| a.name)
     }
 
-    /// The app's kind from its manifest, or `None` if it can't be read.
-    /// Read before a delete, for `AppDeleted` (ADR 0404).
     pub fn app_kind(&self, app_id: &str) -> Option<AppKind> {
         self.get_app(app_id).ok().map(|a| a.kind)
     }
 
-    /// Create an app on disk (manifest.json, index.html and an optional icon),
+    /// INVARIANT: Create an app on disk (manifest.json, index.html and an optional icon),
     /// commit it to git, and announce it.
     ///
     /// `AppCreated` is what puts the app in every client's list; the emit lives
@@ -925,7 +829,7 @@ impl AppManager {
             transparent: false,
         };
         check_widget_manifest(kind, &manifest)?;
-        // The manifest lands LAST, because its presence is what `app_exists`
+        // INVARIANT: The manifest lands LAST, because its presence is what `app_exists`
         // reads and what the guard above refuses on. A create that dies partway
         // leaves a directory that is not an app yet. The next attempt then
         // finishes it, instead of hitting "already exists".
@@ -960,7 +864,6 @@ impl AppManager {
         Ok((app_dir, commit))
     }
 
-    /// Delete an app directory, commit to git, and announce it.
     pub async fn delete_app(
         &self,
         event_bus: &EventBus,
@@ -985,8 +888,6 @@ impl AppManager {
         Ok(commit)
     }
 
-    /// Remove the app's folder and commit. Returns the kind it had, which
-    /// `AppDeleted` records (ADR 0404).
     fn remove_app_dir(
         &self,
         held: &WorkspaceRepoLock,
@@ -1003,11 +904,6 @@ impl AppManager {
         Ok((kind, commit))
     }
 
-    /// Commit the removal of directories already gone from disk. The removal
-    /// stays outside the retry, so a retried attempt only re-stages absent
-    /// paths onto the winner's head. Staging is tolerant and the commit goes
-    /// through `commit_index_unless_unchanged`, because a coding agent's `git`
-    /// may have committed the deletion already.
     fn commit_removals(
         &self,
         _held: &WorkspaceRepoLock,
@@ -1026,8 +922,6 @@ impl AppManager {
         })
     }
 
-    /// Update an app's name and description in manifest.json (preserving
-    /// every other field), commit, and announce it.
     pub async fn update_app_metadata(
         &self,
         event_bus: &EventBus,
@@ -1074,9 +968,6 @@ impl AppManager {
         Ok(commit)
     }
 
-    /// Make a widget reusable, or stop reusing it. Only the flag changes: the
-    /// origin thread stays recorded, so a widget that stops being reusable is
-    /// owned by its origin thread again. Refuses anything that is not a widget.
     pub async fn set_widget_reusable(
         &self,
         event_bus: &EventBus,
@@ -1101,7 +992,6 @@ impl AppManager {
         Ok(commit)
     }
 
-    /// Returns the widget's name and the commit.
     fn write_widget_reusable(
         &self,
         held: &WorkspaceRepoLock,
@@ -1140,7 +1030,7 @@ impl AppManager {
         Ok((app.name, commit))
     }
 
-    /// Remove the widgets Delete (a thread) takes with it, in one commit, and
+    /// INVARIANT: Remove the widgets Delete (a thread) takes with it, in one commit, and
     /// announce each one. Returns the ids removed. Only widgets are accepted,
     /// so this can never remove an app. A widget made reusable since the caller
     /// listed it is kept. A folder that fails to go stops the run, but what
@@ -1178,8 +1068,6 @@ impl AppManager {
         }
     }
 
-    /// Returns the ids removed and committed, and the error that stopped the
-    /// run early, if one did.
     fn remove_widget_dirs(
         &self,
         held: &WorkspaceRepoLock,
@@ -1217,8 +1105,6 @@ impl AppManager {
         Ok((removed, failure))
     }
 
-    /// Read all editable text files in an app, returning (name, content) pairs.
-    /// Skips manifest.json (metadata) and binary files. Sorts with index.html first.
     pub fn read_app_source(
         &self,
         app_id: &str,
@@ -1231,7 +1117,7 @@ impl AppManager {
             return Err(format!("App not found: {}", app_id).into());
         }
 
-        // The listing skips symlinks, so each name read below is a plain file.
+        // INVARIANT: The listing skips symlinks, so each name read below is a plain file.
         let file_names = self.list_app_files(app_id);
         let mut result = Vec::new();
         for name in file_names {
@@ -1264,13 +1150,6 @@ impl AppManager {
         Ok(result)
     }
 
-    /// Write app source files, commit to git, and announce the app changed.
-    /// Validates each filename to reject path traversal and absolute paths.
-    ///
-    /// One `AppUpdated` per save, not per file: this is the editor's save
-    /// button, and the agent's per-file writes go through the file tools, which
-    /// coalesce into a single end-of-turn `AppUpdated` instead (see
-    /// `engine/tools/files.rs::app_lifecycle_event`).
     pub async fn write_app_source(
         &self,
         event_bus: &EventBus,
@@ -1316,17 +1195,15 @@ impl AppManager {
         Ok(commit)
     }
 
-    /// Where an app's `manifest.json` lives. `app_id` must already be valid.
     pub fn manifest_path(&self, app_id: &str) -> PathBuf {
         self.apps_path.join(app_id).join("manifest.json")
     }
 
-    /// Get the path to an app's index.html.
     pub fn get_app_path(&self, app_id: &str) -> PathBuf {
         self.app_dir(app_id).join("index.html")
     }
 
-    /// Recursively list the plain files in an app directory. A symlink is
+    /// INVARIANT: Recursively list the plain files in an app directory. A symlink is
     /// skipped: a link out of the folder would name host files.
     pub fn list_app_files(&self, app_id: &str) -> Vec<String> {
         let mut files = Vec::new();
@@ -1359,7 +1236,7 @@ impl AppManager {
         files
     }
 
-    /// Delete a single file from an app and commit.
+    /// INVARIANT: Delete a single file from an app and commit.
     /// `app_path` is relative to data/apps/ (e.g., "my-app/old-file.js").
     ///
     /// Deliberately silent, and registered as an exemption in
@@ -1379,7 +1256,7 @@ impl AppManager {
         let full_path = self.apps_path.join(app_path);
         std::fs::remove_file(&full_path)?;
 
-        // The file removal above stays outside the retry closure, so a retried
+        // INVARIANT: The file removal above stays outside the retry closure, so a retried
         // attempt only re-stages an already-absent path onto the winner's head.
         // Staging is tolerant and the commit goes through
         // `commit_index_unless_unchanged`, because the writer that won the race
@@ -1396,7 +1273,6 @@ impl AppManager {
     }
 }
 
-/// True if `id` is a syntactically valid app id (no path traversal, no slashes).
 pub fn is_valid_app_id(id: &str) -> bool {
     !id.is_empty()
         && !id.contains("..")
@@ -1424,10 +1300,6 @@ pub mod tests {
 
     #[test]
     fn app_manifest_ignores_legacy_knowhow_field() {
-        // Manifests stamped by the old know-how pass still carry a `knowhow`
-        // array on disk. The field is no longer part of AppManifest; serde must
-        // ignore the unknown key rather than fail to deserialize, so existing
-        // apps keep loading (and the stale field drops on the next rewrite).
         let json = r#"{
             "name": "Legacy App",
             "description": "Has a stamped knowhow array",
@@ -1480,8 +1352,6 @@ pub mod tests {
         assert!(deserialized.reusable);
     }
 
-    /// A widget's declared params reach `App`, so the agent and the checks
-    /// read them; a manifest with none serializes as before (ADR 0415).
     #[test]
     fn declared_params_reach_the_app_and_absent_ones_stay_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1509,8 +1379,6 @@ pub mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    /// The one tile check: known names, at least one, no duplicate, and only
-    /// on a widget. None declared reads as small, medium and large (ADR 0432).
     #[test]
     fn the_widget_manifest_check_refuses_every_bad_sizes_shape() {
         let widget = |json: &str| check_widget_manifest(AppKind::Widget, &manifest(json));
@@ -1543,9 +1411,6 @@ pub mod tests {
         }
     }
 
-    /// A widget that declares no sizes takes small, medium and large and
-    /// starts medium, as a WidgetKit widget does. XL is opt-in. A declared
-    /// list is the whole choice.
     #[test]
     fn an_undeclared_widget_takes_three_sizes_without_xl_and_starts_medium() {
         use WidgetSize::*;
@@ -1558,13 +1423,11 @@ pub mod tests {
         assert_eq!(WidgetSize::default_of(&[Large, Small]), Large);
     }
 
-    /// The literal pins the wording an agent reads in a size error.
     #[test]
     fn a_size_error_names_every_size() {
         assert_eq!(WidgetSize::choices(), "small, medium, large or xl");
     }
 
-    /// `xl` is a known name, and `ALL` and the tile sizes agree on it.
     #[test]
     fn a_manifest_may_declare_xl() {
         let names = |sizes: &[&str]| sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -1580,8 +1443,6 @@ pub mod tests {
         }
     }
 
-    /// A widget with no sizes takes the undeclared three, a bad list loads with the
-    /// default rather than dropping the widget, and an app carries none.
     #[test]
     fn a_widget_loads_its_sizes_and_a_bad_list_falls_back_to_the_undeclared_three() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1618,8 +1479,6 @@ pub mod tests {
         assert!(plain.get("sizes").is_none() && plain.get("transparent").is_none());
     }
 
-    /// Rule 4 of the size contract: the asked size if declared, else the
-    /// nearest smaller, else the nearest larger.
     #[test]
     fn an_undeclared_size_fits_the_nearest_smaller_then_larger() {
         use WidgetSize::*;
@@ -1634,7 +1493,6 @@ pub mod tests {
         assert_eq!(Small.fit(&[Xl]), Xl);
     }
 
-    /// `create_app` writes the sizes it is given, and refuses none on an app.
     #[tokio::test]
     async fn create_app_writes_a_widgets_sizes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1665,8 +1523,6 @@ pub mod tests {
         std::fs::write(dir.join("manifest.json"), json).unwrap();
     }
 
-    /// The apps list rides the cached system prompt, so its order must not
-    /// depend on the order folders were created in.
     #[test]
     fn apps_list_by_name_whatever_order_their_folders_were_made_in() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1707,8 +1563,6 @@ pub mod tests {
         );
     }
 
-    /// A typo in `reveal` must not make the manifest invalid, which would drop
-    /// the app from the list. It opens as on-load, and the audit reports it.
     #[test]
     fn an_unrecognised_reveal_still_lists_the_app_as_on_load() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1744,8 +1598,6 @@ pub mod tests {
         assert_eq!(json["reveal"], "on-ready");
     }
 
-    /// Invariant I14: a widget has one owner. A plugin widget is never a
-    /// thread's, so thread delete leaves it, and naming both owners is refused.
     #[test]
     fn a_widget_has_exactly_one_origin() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1778,8 +1630,6 @@ pub mod tests {
         assert!(manager.widgets_owned_by(&[thread]).unwrap().is_empty());
     }
 
-    /// Invariant I1: `icon` yields an icon only for a usable image file inside
-    /// the app folder. Everything else lists the app with no icon.
     #[test]
     fn only_a_usable_image_path_in_the_folder_becomes_the_icon() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1815,8 +1665,6 @@ pub mod tests {
         }
     }
 
-    /// Invariant I2: a symlink never carries the icon out of the app folder,
-    /// whether the link is the file or a directory on the way to it.
     #[cfg(unix)]
     #[test]
     fn a_symlink_out_of_the_folder_is_never_the_icon() {
@@ -1848,7 +1696,6 @@ pub mod tests {
         assert_eq!(manager.get_app("dir-link").unwrap().icon, None);
     }
 
-    /// `GET /api/v1/app/:id/source` returned every linked file's content.
     #[cfg(unix)]
     #[test]
     fn app_source_never_reads_through_a_symlink() {
@@ -1877,8 +1724,6 @@ pub mod tests {
         assert_eq!(manager.contained_app_dir("whole"), None);
     }
 
-    /// Judged against a linked `data/apps/` alone, every app folder under its
-    /// target counted as inside.
     #[cfg(unix)]
     #[test]
     fn a_linked_apps_folder_holds_no_contained_app() {
@@ -1934,7 +1779,7 @@ pub mod tests {
         }
     }
 
-    /// The rewrite rebuilds the manifest from its known fields, so a field it
+    /// INVARIANT: The rewrite rebuilds the manifest from its known fields, so a field it
     /// forgot would be dropped by a rename.
     #[tokio::test]
     async fn a_metadata_update_keeps_the_reveal_opt_in() {
@@ -1967,7 +1812,6 @@ pub mod tests {
         let ws = tmp.path();
         let manager = AppManager::new(ws).unwrap();
 
-        // Create the app directory so write_app_source doesn't fail on "not found"
         let app_dir = ws.join("data/apps/test-app");
         std::fs::create_dir_all(&app_dir).unwrap();
 
@@ -1987,10 +1831,6 @@ pub mod tests {
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
     }
 
-    /// The app id itself must also be traversal-guarded: `create_app` is
-    /// reached from the LLM tool handler with a model-provided id, and an
-    /// unchecked `../…` id would create (or, via delete_app, remove) files
-    /// outside `data/apps/`.
     #[tokio::test]
     async fn path_validation_rejects_traversal_in_app_id() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2043,10 +1883,6 @@ pub mod tests {
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
     }
 
-    // --- re-creating a live app (the silent truncation) -------------------
-
-    /// `AppCreated` is a transient event, so it reaches subscribers and never
-    /// the events table. Counting it means draining the bus.
     #[cfg(test)]
     fn app_created_ids(
         rx: &mut tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
@@ -2060,9 +1896,6 @@ pub mod tests {
         ids
     }
 
-    /// A model re-issuing `create_app` for a live id used to rewrite
-    /// `index.html` and orphan every other file the app had grown. The refusal
-    /// keeps the app whole, and names the tool that changes it instead.
     #[tokio::test]
     async fn create_app_refuses_an_id_that_already_exists() {
         let bus = crate::test_support::offline_event_bus();
@@ -2082,7 +1915,6 @@ pub mod tests {
             .await
             .expect("first create");
 
-        // The app grows a second page the way a real one does.
         let app_dir = tmp.path().join("data/apps/habit-tracker");
         let sibling = app_dir.join("stats.html");
         std::fs::write(&sibling, "<h1>stats").unwrap();
@@ -2120,9 +1952,6 @@ pub mod tests {
         );
     }
 
-    /// "Exists" means what the apps list means: a readable `manifest.json`. A
-    /// bare directory laid down by `write_file` is not an app yet, so
-    /// `create_app` still finishes it.
     #[tokio::test]
     async fn create_app_still_finishes_a_manifest_less_directory() {
         let bus = crate::test_support::offline_event_bus();
@@ -2152,16 +1981,12 @@ pub mod tests {
         assert!(app_dir.join("notes.md").exists(), "scaffolding survives");
     }
 
-    /// A create that dies before the manifest stays retryable. The manifest is
-    /// the marker the guard reads, so writing it last is what keeps a
-    /// half-written app finishable.
     #[tokio::test]
     async fn create_app_can_be_retried_after_a_failed_attempt() {
         let bus = crate::test_support::offline_event_bus();
         let tmp = tempfile::tempdir().unwrap();
         let manager = AppManager::new(tmp.path()).unwrap();
 
-        // A directory sitting where index.html goes fails the first write.
         let app_dir = tmp.path().join("data/apps/habit-tracker");
         std::fs::create_dir_all(app_dir.join("index.html")).unwrap();
 
@@ -2196,13 +2021,10 @@ pub mod tests {
         assert!(manager.app_exists("habit-tracker"));
     }
 
-    // --- widgets: the app kind (ADR 0402) ---------------------------------
-
     fn thread(n: u128) -> uuid::Uuid {
         uuid::Uuid::from_u128(n)
     }
 
-    /// The fixture every reader test shares: one app and one widget.
     pub async fn app_and_widget(manager: &AppManager, bus: &EventBus) -> uuid::Uuid {
         let origin = thread(1);
         manager
@@ -2256,7 +2078,6 @@ pub mod tests {
         assert!(!widget.reusable);
     }
 
-    /// A file-tool delete reads this before the manifest goes (ADR 0404).
     #[tokio::test]
     async fn app_kind_reads_the_manifest_and_is_none_once_gone() {
         let bus = crate::test_support::offline_event_bus();
@@ -2391,7 +2212,6 @@ pub mod tests {
             .unwrap()
             .is_empty());
 
-        // A widget made reusable after the caller listed it is kept.
         manager
             .create_app(
                 &bus,
@@ -2418,7 +2238,6 @@ pub mod tests {
         assert!(manager.app_exists("shared"));
     }
 
-    /// A shipped `system-widgets/` holding one built-in, `lucidos-player`.
     #[cfg(test)]
     fn with_built_in(ws: &Path) -> (tempfile::TempDir, AppManager) {
         let shipped = tempfile::tempdir().unwrap();
@@ -2437,8 +2256,6 @@ pub mod tests {
         (shipped, manager)
     }
 
-    /// A built-in resolves before a workspace folder of the same id, and the
-    /// lists carry it once, marked built-in (ADR 0415).
     #[test]
     fn a_built_in_resolves_first_and_lists_once() {
         let ws = tempfile::tempdir().unwrap();
@@ -2464,8 +2281,6 @@ pub mod tests {
         assert!(apps.iter().any(|a| a.id == "lucidos-mine"));
     }
 
-    /// The read-only invariant, path by path: no AppManager write reaches a
-    /// built-in, and no new app takes the reserved prefix.
     #[tokio::test]
     async fn every_mutating_path_refuses_a_built_in() {
         let bus = crate::test_support::offline_event_bus();
@@ -2527,7 +2342,6 @@ pub mod tests {
         }
     }
 
-    /// The source view reads a built-in, so "Make app" can copy it.
     #[test]
     fn a_built_in_source_reads_from_the_shipped_folder() {
         let ws = tempfile::tempdir().unwrap();
@@ -2547,9 +2361,7 @@ pub mod tests {
         );
     }
 
-    // --- every write waits for the workspace repo lock (I7) ---------------
-
-    /// Polls `write` once while this test holds the workspace repo lock, and
+    /// INVARIANT: Polls `write` once while this test holds the workspace repo lock, and
     /// checks it has not touched disk. A merge's `checkout -f main` runs under
     /// that lock, so a write that saves outside it can be reverted after its
     /// commit. Then releases the lock and finishes the write.
@@ -2673,11 +2485,8 @@ pub mod tests {
     mod guard_tests {
         use super::*;
 
-        /// A pin, because the doc cannot import the constants it states.
         #[test]
         fn the_app_icon_doc_states_the_real_rules() {
-            // Read at run time: an `include_str!` would make the doc an engine
-            // embed, and every edit to it an Apply that needs a restart.
             let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
             let doc =
                 crate::core::knowhow::doc_family_text(&repo, "system-knowhow/building-an-app.md");

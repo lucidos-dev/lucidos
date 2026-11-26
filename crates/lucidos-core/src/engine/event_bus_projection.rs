@@ -1,4 +1,4 @@
-//! Projection updaters for `EventBus`. Both methods take an open
+//! INVARIANT: Projection updaters for `EventBus`. Both methods take an open
 //! `sqlx::Transaction` and run inside the same DB tx as the event insert,
 //! so a projection failure rolls back the event itself — never persist an
 //! event whose projection didn't apply.

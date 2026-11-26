@@ -280,7 +280,6 @@ async fn a_bad_change_is_the_caller_s_mistake() {
 
 #[tokio::test]
 async fn any_paired_device_may_change_users_including_ones_it_is_not() {
-    // Identity without authority: nothing branches on who the caller is.
     let state = seeded();
     let cookie = format!("{}=cred-phone", state.device_cookie_name());
     let response = call(
@@ -345,7 +344,6 @@ async fn a_pairing_code_names_its_user_and_refuses_a_stranger() {
     .users[1]
         .id
         .clone();
-    // The paired phone mints, so the redeem needs no Allow.
     let cookie = format!("{}=cred-phone", state.device_cookie_name());
     let minted = call(
         &state,

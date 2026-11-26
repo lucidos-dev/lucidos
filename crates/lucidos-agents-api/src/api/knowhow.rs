@@ -5,23 +5,13 @@ use crate::core::knowhow::{
     SYSTEM_KNOWHOW_PREFIX,
 };
 
-/// Stamped on a `/knowhow/read` answer over the size cap, with its byte count.
-/// The body stays byte-identical, so an app reading the route sees no change.
-/// `lucidos knowhow read` prints a note from it.
 const HEADER_KNOWHOW_OVERSIZED: &str = "lucidos-knowhow-oversized";
 use crate::core::SystemKnowhowStore;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
-/// Listing entry for knowhow surfaces — used by the file-preview "did you mean"
-/// suggestion when a stale knowhow link 404s, and by any other UI that needs
-/// the merged user + system knowhow set.
 #[derive(Serialize)]
 pub struct KnowhowEntry {
-    /// The knowhow id. User-curated knowhow uses the path under `data/knowhow/`
-    /// without `.md`; engine-shipped reference docs have the `system-knowhow/`
-    /// prefix baked in. This is what `load_knowhow` accepts and what intent
-    /// frontmatter (`knowhow: [...]`) references.
     pub id: String,
     pub name: String,
     pub description: String,
@@ -32,16 +22,6 @@ pub struct ListKnowhowResponse {
     pub knowhow: Vec<KnowhowEntry>,
 }
 
-/// List the knowhow docs. Returns the merged user knowhow (local > shared)
-/// followed by engine-shipped system-knowhow with the `system-knowhow/`
-/// prefix already applied to ids. Each group is alphabetical (inherited from
-/// the loader); system entries follow user entries so callers (e.g. the
-/// file-preview "did you mean" suggestion) can group them naturally.
-///
-/// Docs, not every file. A user root lists what
-/// [`crate::core::KnowhowListDepth`] counts as a doc, so a doc's own
-/// references are as absent here as from the Know-how routing list.
-/// `/knowhow/read` still reads any of them by full id.
 pub(super) async fn list_knowhow(State(state): State<AppState>) -> Json<ListKnowhowResponse> {
     let kh_dirs = state.engine.knowhow_dirs();
     let mut entries: Vec<KnowhowEntry> = KnowhowStore::load_merged_summaries(&kh_dirs)
@@ -67,24 +47,11 @@ pub(super) async fn list_knowhow(State(state): State<AppState>) -> Json<ListKnow
     Json(ListKnowhowResponse { knowhow: entries })
 }
 
-/// Query for [`read_knowhow`].
 #[derive(Deserialize)]
 pub struct ReadKnowhowQuery {
-    /// The knowhow id, exactly as it appears in the `/knowhow` listing — a
-    /// user knowhow id (path under `data/knowhow/` without `.md`) or a
-    /// `system-knowhow/`-prefixed engine-shipped doc.
     pub id: String,
 }
 
-/// Read a single knowhow doc's full content by id.
-///
-/// Returns the same `[KNOW-HOW: …]` / `[SYSTEM-KNOWHOW: …]` block the
-/// `load_knowhow` LLM tool produces (via the shared
-/// [`load_one_knowhow_section`]), so a coding-agent thread that lacks the
-/// `load_knowhow` tool — e.g. an app coding-agent thread whose sparse-checkout
-/// worktree can't see the engine's `system-knowhow/` on disk — can fetch the
-/// identical guidance through `lucidos knowhow read <id>`. 404 with the shared
-/// not-found sentinel when the id resolves to nothing.
 pub(super) async fn read_knowhow(
     State(state): State<AppState>,
     Query(query): Query<ReadKnowhowQuery>,
@@ -109,13 +76,10 @@ pub(super) async fn read_knowhow(
     }
 }
 
-/// Held across the check and the emit in [`record_knowhow_read`]. Without it
+/// INVARIANT: Held across the check and the emit in [`record_knowhow_read`]. Without it
 /// two concurrent reads of one doc both see no row today, and both emit.
 static KNOWHOW_READ_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Record the read as use evidence for the workspace prompt footprint, which
-/// judges in whole days. So one `KnowhowRead` per doc per day is enough, and
-/// an app re-reading a doc in a loop adds no rows.
 async fn record_knowhow_read(state: &AppState, id: &str, actor: Option<MessageOrigin>) {
     let _gate = KNOWHOW_READ_GATE.lock().await;
     let recorded_today = sqlx::query_scalar::<_, bool>(
@@ -144,7 +108,6 @@ async fn record_knowhow_read(state: &AppState, id: &str, actor: Option<MessageOr
     }
 }
 
-/// Route for the `/knowhow` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/knowhow", get(list_knowhow))

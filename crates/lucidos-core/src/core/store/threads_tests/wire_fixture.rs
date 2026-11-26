@@ -1,9 +1,3 @@
-//! Pins the wire bytes of `ThreadSummary` and `ThreadAggregate`.
-//!
-//! Each fixture runs a fixed `ThreadRow` through the production mapping and
-//! compares the JSON to a literal. A change to a field's Rust type must leave
-//! these bytes alone: the frontend reads them without a translation layer.
-
 use super::*;
 use crate::engine::thread_state::ThreadState;
 
@@ -80,7 +74,6 @@ fn fixture_row() -> ThreadRow {
     }
 }
 
-/// A wire fixture with fields populated even when ordinary summary reads omit them.
 fn full_thread_summary_fixture(
     liveness: crate::engine::thread_events::liveness::ThreadLiveness,
 ) -> ThreadSummary {
@@ -183,7 +176,6 @@ fn thread_aggregate_serializes_to_the_pinned_bytes() {
     assert_eq!(serde_json::to_string(&aggregate).unwrap(), expected);
 }
 
-/// Every value the two columns hold serializes back to the column's own text.
 #[test]
 fn every_status_and_state_value_keeps_its_wire_text() {
     for status in ThreadStatus::ALL {
@@ -204,8 +196,6 @@ fn every_status_and_state_value_keeps_its_wire_text() {
     }
 }
 
-/// Each change state is one tagged object, and each detail rides only on its
-/// own kind. These bytes are the wire contract the frontend's union reads.
 #[test]
 fn every_change_state_serializes_to_its_tagged_object() {
     for (kind, reason, requires_restart, expected) in [
@@ -244,8 +234,6 @@ fn every_change_state_serializes_to_its_tagged_object() {
     }
 }
 
-/// The home thread's summary carries `"home":true` beside `saved`. Every other
-/// summary omits the key, which is what keeps the bytes above unchanged.
 #[test]
 fn only_the_home_threads_summary_carries_the_home_key() {
     let summary = EventStore::rows_to_thread_summaries(vec![ThreadRow {
@@ -261,9 +249,6 @@ fn only_the_home_threads_summary_carries_the_home_key() {
     );
 }
 
-/// The per-event aggregate carries the same key. A client can meet the home
-/// thread first through an SSE event. Without the key, the client draws that
-/// thread in Current as an ordinary one.
 #[test]
 fn only_the_home_threads_aggregate_carries_the_home_key() {
     let aggregate = row_to_thread_aggregate(ThreadRow {
@@ -278,8 +263,6 @@ fn only_the_home_threads_aggregate_carries_the_home_key() {
     );
 }
 
-/// A status rides both wires as one tagged object, the shape the frontend's
-/// generated `CacheKeepAliveStatus` union reads.
 #[test]
 fn a_keep_alive_status_serializes_to_its_tagged_object() {
     let row = || ThreadRow {
@@ -307,8 +290,6 @@ fn a_keep_alive_status_serializes_to_its_tagged_object() {
     assert!(aggregate.contains(&expected), "{aggregate}");
 }
 
-/// The hold rides both wires with the same inner shape, which the app's
-/// `ThreadHoldSummary` reads.
 #[test]
 fn a_hold_serializes_on_both_wires() {
     let row = || ThreadRow {
@@ -334,8 +315,6 @@ fn a_hold_serializes_on_both_wires() {
     assert!(aggregate.contains(expected), "{aggregate}");
 }
 
-/// The folder rides both wires, and an unfiled pin sends
-/// no key, so every other thread's wire bytes are unchanged.
 #[test]
 fn a_pin_folder_serializes_on_both_wires_and_is_omitted_when_unset() {
     let filed = || ThreadRow {
@@ -360,7 +339,6 @@ mod guard_tests {
     use crate::engine::thread_events::liveness::{LivenessState, ThreadLiveness};
     use std::collections::BTreeSet;
 
-    // Keep this exhaustive even when a new field is skipped by serde.
     macro_rules! classify_summary_fields {
         ($summary:expr, { $($field:ident => $reason:literal,)* }) => {{
             let ThreadSummary { $($field: _,)* } = $summary;

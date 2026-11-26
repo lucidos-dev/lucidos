@@ -408,6 +408,14 @@ describe('attachPaneDragTouches', () => {
     expect(w.calls).toEqual(['grab', 'follow -142', 'navigate 1', 'rest true']);
   });
 
+  it('listens to touchstart without passive, so the edge gate can cancel it', () => {
+    const { drag } = setup();
+    const surface = { addEventListener: vi.fn() };
+    attachPaneDragTouches(surface as unknown as EventTarget, drag, { gate: () => true });
+    const start = surface.addEventListener.mock.calls.find(([type]) => type === 'touchstart');
+    expect(start?.[2]).toEqual({ passive: false });
+  });
+
   it('ignores an event with no touch lists rather than throwing', () => {
     const w = wire();
     w.surface.dispatchEvent(touchEvent('touchstart', [pt(7, 200)], [pt(7, 200)]));

@@ -1,9 +1,3 @@
-//! `POST /api/v1/threads/:thread_id/confinement-tests`, a coding agent's
-//! *confinement run* (`lucidos confinement-tests run`).
-//!
-//! The engine owns the command and the permission check; see
-//! `engine::agent_session::confinement_run`.
-
 use crate::engine::agent_session::confinement_run::ConfinementRunExt;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -17,12 +11,9 @@ use crate::engine::agent_session::confinement_run::{
     Asking, CertifiedRun, ConfinementRun, TreeState,
 };
 
-/// No command field: the engine runs only its own script.
 #[derive(Deserialize)]
 pub(in crate::api) struct RunRequest {
-    /// The card an earlier call answered with, while the caller waits on it.
     card_id: Option<String>,
-    /// `false` raises no card when no permission covers the run.
     #[serde(default = "ask_owner_by_default")]
     ask_owner: bool,
 }
@@ -41,7 +32,6 @@ impl RunRequest {
     }
 }
 
-/// POST /api/v1/threads/:thread_id/confinement-tests
 pub(in crate::api) async fn run_confinement_tests(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -58,8 +48,6 @@ pub(in crate::api) async fn run_confinement_tests(
     run_response(run).map(Json)
 }
 
-/// What the CLI reads. `state` decides its next move, and `message` is for the
-/// agent reading the output. A refusal is a 409 carrying its reason.
 fn run_response(run: ConfinementRun) -> Result<serde_json::Value, (StatusCode, String)> {
     Ok(match run {
         ConfinementRun::Refused { reason } => return Err((StatusCode::CONFLICT, reason)),

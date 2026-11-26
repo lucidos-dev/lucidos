@@ -1,4 +1,3 @@
-//! Exercise the shipped binary before any engine, listener or Postgres starts.
 use lucidos_diagnostic_log::{writer::Record, Destination};
 use std::process::Command;
 

@@ -1,5 +1,3 @@
-//! Saved-owner-content submission. Transports supply authenticated provenance,
-//! never a send payload. Every surface must use this service (ADR 0651).
 use crate::core::draft_submission::{
     DraftSubmissionAuthority, DraftSubmissionReceipt, SavedDraftRow, SavedDraftScope,
     SavedDraftSnapshot, SubmitDraftRequest, SAVED_DRAFT_COLS,
@@ -59,8 +57,6 @@ impl DraftSubmissionService<'_> {
         self.accept_current(request, actor, authority, raw).await
     }
 
-    /// Tests supply the actor and authority directly. Authority is rechecked
-    /// and, when single-use, spent at atomic acceptance.
     #[cfg(test)]
     pub async fn submit(
         &self,
@@ -75,9 +71,6 @@ impl DraftSubmissionService<'_> {
         self.accept_current(request, actor, authority, raw).await
     }
 
-    /// The target's saved draft. It refuses as stale unless it is still the
-    /// revision and epoch the request names. It refuses as missing when the
-    /// drafts read would list nothing for it.
     async fn read_current(
         &self,
         request: &SubmitDraftRequest,
@@ -94,7 +87,6 @@ impl DraftSubmissionService<'_> {
         Ok(raw)
     }
 
-    /// Resolve the send for a current draft and accept it.
     async fn accept_current(
         &self,
         request: SubmitDraftRequest,
@@ -234,9 +226,6 @@ impl DraftSubmissionService<'_> {
             repo.name
                 .eq_ignore_ascii_case(super::LucidosEngine::DEFAULT_REPO_NAME)
         });
-        // A stale source registration must not disable unrelated app or
-        // external targets. Only absence is optional; other filesystem
-        // failures remain explicit refusals. A source send still requires it.
         let source_path = match source.map(|repo| std::fs::canonicalize(&repo.path)) {
             Some(Ok(path)) => Some(path),
             Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -378,15 +367,12 @@ fn strict_backend(value: &str) -> Result<CodingAgent, Box<dyn std::error::Error 
         .ok_or_else(|| "draft_coding_backend_unsupported".into())
 }
 
-/// Who reads a refusal, so its next step names a command that caller has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalAudience {
     CodingAgent,
     ChatAgent,
 }
 
-/// A refusal as a transport reports it: an HTTP status, a stable reason slug
-/// and a message that keeps the original slug and names the next step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalReport {
     pub status: u16,
@@ -475,8 +461,6 @@ pub fn refusal_report(
 
 #[easy_ext::ext(DraftSubmissionExt)]
 pub(crate) impl super::LucidosEngine {
-    /// Native entry point shared by agent transports. The engine resolves the
-    /// owner's authority for `caller` and rechecks it at commit.
     async fn submit_saved_draft_as_agent(
         &self,
         caller: Uuid,
@@ -489,7 +473,6 @@ pub(crate) impl super::LucidosEngine {
             .await
     }
 
-    /// Tests supply the actor and authority directly.
     #[cfg(test)]
     async fn submit_saved_draft(
         &self,

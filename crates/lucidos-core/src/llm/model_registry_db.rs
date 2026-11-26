@@ -1,5 +1,3 @@
-//! Load the model registry and replace the shared routing map.
-
 use std::collections::HashMap;
 
 use sqlx::PgPool;
@@ -7,9 +5,6 @@ use sqlx::PgPool;
 use super::model_registry::{routes_from_models, ModelRegistry, ModelRouting};
 use crate::core::ModelStore;
 
-/// Load all rows from the `models` table. A saved `chat_model` can still name
-/// a model that was later disabled. On a DB error, return an empty map and log; routing
-/// then degrades to the prefix heuristic rather than failing every call.
 pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
     match ModelStore::list(pool).await {
         Ok(models) => routes_from_models(models),
@@ -23,7 +18,6 @@ pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
     }
 }
 
-/// Refill `registry` from the `models` table, replacing what it held.
 pub async fn reload(registry: &ModelRegistry, pool: &PgPool) {
     let fresh = load_from_db(pool).await;
     match registry.write() {

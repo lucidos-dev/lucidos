@@ -1,56 +1,21 @@
 use crate::http::{client as http_client, send_and_print, send_or_refusal};
 use crate::workspace::{BoxError, Workspace};
 
-/// Env var carrying the calling thread's id. Read only to resolve
-/// `--my-children` into a `parent` filter, which is a convenience over a
-/// public read. It is NOT how the engine learns who the caller is: that comes
-/// from the thread-bound origin token the HTTP client forwards, which is why
-/// `follow-up` has no `--from` flag to get wrong.
 pub(crate) const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
 
-/// Env var carrying the event that spawned this subprocess. Defaults
-/// `follow-up --event-id`, matching how `spawn-thread` defaults
-/// `--caller-event-id`.
 const ENV_EVENT_ID: &str = "LUCIDOS_EVENT_ID";
 
 #[derive(Default)]
 pub(crate) struct ListFilters<'a> {
-    /// `Some(true)` selects the UNION of `running` and
-    /// `waiting_for_user_answer`, `Some(false)` inverts it, `None` filters
-    /// nothing. For "is the workspace busy?" callers want `status` with
-    /// `running` alone: a thread awaiting a user answer is blocked on the
-    /// human, not working.
     pub active: Option<bool>,
-    /// Exactly these statuses, from repeated `--status` flags and/or
-    /// comma-separated values. Empty means no status narrowing. Clap already
-    /// refuses this together with `active`; the engine validates the values and
-    /// is the single place that owns the wording for a bad one.
     pub status: &'a [String],
-    /// Comma-separated source list (`chat`, `trigger`, `coding-agent`).
-    /// Legacy `claude_code` is also accepted by the engine.
     pub source: Option<&'a str>,
-    /// Server clamps to 1..=1000 (default 100). `None` on the `count` path,
-    /// which has no page to size.
     pub limit: Option<u32>,
-    /// Restrict to the direct children of this thread. Same name as the
-    /// `parent` query param and as the `my_children` filter the LLM tool
-    /// resolves from its own ambient thread.
     pub parent: Option<String>,
-    /// `Some(true)` keeps threads holding an unsent draft, `Some(false)` the
-    /// rest, `None` filters nothing.
     pub has_draft: Option<bool>,
-    /// Keeps coding-agent threads in this change state. The engine validates
-    /// the value, so a typo comes back as its refusal.
     pub change_state: Option<String>,
 }
 
-/// Resolve `--parent <uuid>` / `--my-children` into the single `parent` value
-/// the query param takes.
-///
-/// `--my-children` is sugar for `--parent $LUCIDOS_THREAD_ID`, so outside a
-/// Lucidos-spawned subprocess it has nothing to resolve to. That is an error
-/// rather than a silent unfiltered list: "show me my children" answered with
-/// every thread in the workspace is the wrong answer, not a broader one.
 pub(crate) fn resolve_parent_filter(
     parent: Option<String>,
     my_children: bool,
@@ -79,9 +44,6 @@ pub(crate) fn cmd_list(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), B
     send_filtered(&url, &filters)
 }
 
-/// Same filters as `cmd_list`, against the count endpoint. `limit` is carried
-/// in the shared `ListFilters` and left `None` here, mirroring how the store
-/// and HTTP layers reuse one filter struct for both queries.
 pub(crate) fn cmd_count(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/threads/count", ws.base_url());
     send_filtered(&url, &filters)
@@ -91,7 +53,6 @@ fn send_filtered(url: &str, filters: &ListFilters<'_>) -> Result<(), BoxError> {
     send_get(url, &build_query_params(filters))
 }
 
-/// GET `url` with `params`, printing the body verbatim like every read here.
 fn send_get(url: &str, params: &[(&'static str, String)]) -> Result<(), BoxError> {
     let mut req = http_client()?.get(url);
     if !params.is_empty() {
@@ -100,8 +61,6 @@ fn send_get(url: &str, params: &[(&'static str, String)]) -> Result<(), BoxError
     send_and_print("GET", url, req)
 }
 
-/// `lucidos threads drafts`: every thread holding an unsent draft, or one
-/// thread's draft with its whole text. Read-only.
 pub(crate) fn cmd_drafts(
     ws: &Workspace,
     limit: Option<u32>,
@@ -111,15 +70,11 @@ pub(crate) fn cmd_drafts(
     send_get(&url, &drafts_query_params(limit, thread))
 }
 
-/// `lucidos threads held-messages`: every held message still waiting behind
-/// a human. Read-only.
 pub(crate) fn cmd_held_messages(ws: &Workspace, limit: Option<u32>) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/threads/held-messages", ws.base_url());
     send_get(&url, &limit_param(limit))
 }
 
-/// `lucidos threads search`: find threads by what was said in them or typed
-/// into their draft. Read-only.
 pub(crate) fn cmd_search(ws: &Workspace, query: &str, limit: Option<u32>) -> Result<(), BoxError> {
     if query.trim().is_empty() {
         return Err("the search query must be non-empty. Say what was discussed.".into());
@@ -145,19 +100,6 @@ fn drafts_query_params(limit: Option<u32>, thread: Option<&str>) -> Vec<(&'stati
     params
 }
 
-/// `lucidos threads follow-up`: send a message to one of the calling thread's
-/// own child threads.
-///
-/// The caller is never stated. It comes off the thread-bound origin token the
-/// HTTP client forwards, and the engine looks the relationship up from the
-/// child's projection row, so this command cannot address a thread the calling
-/// thread did not spawn. That is also why there is no `--from`.
-///
-/// Prints the ack body verbatim, like every other write verb in this CLI
-/// (`changes apply`, `notify`, `threads list` / `count`). The ack already
-/// carries a `detail` sentence saying what happened to the message, so there
-/// is nothing to synthesize, and reformatting it here would put a second copy
-/// of the ack's wording one repo away from the first.
 pub(crate) fn cmd_follow_up(
     ws: &Workspace,
     child_thread_id: &str,
@@ -188,19 +130,12 @@ pub(crate) fn cmd_follow_up(
     if let Some(id) = event_id.map(str::trim).filter(|s| !s.is_empty()) {
         body["event_id"] = serde_json::Value::String(id.to_string());
     }
-    // Only sent when set, so the engine's `#[serde(default)]` is what decides
-    // the default and the CLI never has to restate it.
     if urgent {
         body["urgent"] = serde_json::Value::Bool(true);
     }
     send_and_print("POST", &url, http_client()?.post(&url).json(&body))
 }
 
-/// `lucidos threads detach`: move a child thread to top level (ADR 0278).
-///
-/// Like `follow-up`, the caller is never stated. The origin token decides
-/// whether this may move only the calling thread's own children, or, with no
-/// token, any nested thread.
 pub(crate) fn cmd_detach(ws: &Workspace, child_thread_id: &str) -> Result<(), BoxError> {
     let child = child_thread_id.trim();
     if uuid::Uuid::parse_str(child).is_err() {
@@ -214,9 +149,6 @@ pub(crate) fn cmd_detach(ws: &Workspace, child_thread_id: &str) -> Result<(), Bo
     send_and_print("POST", &url, http_client()?.post(&url))
 }
 
-/// `lucidos threads child-reports`: take the child reports this thread's agent
-/// has not read yet. The engine withdraws each queued copy, so a report is
-/// read once.
 pub(crate) fn cmd_child_reports(ws: &Workspace) -> Result<(), BoxError> {
     let thread_id = source_thread_id_from_env().ok_or(
         "LUCIDOS_THREAD_ID is not set, so there is no thread to read child reports for. \
@@ -229,13 +161,6 @@ pub(crate) fn cmd_child_reports(ws: &Workspace) -> Result<(), BoxError> {
     send_and_print("POST", &url, http_client()?.post(&url))
 }
 
-/// `lucidos threads archive`: archive this thread or one of its own direct
-/// children (ADR 0310).
-///
-/// Like `detach`, the caller is never stated. `current` goes to the engine as
-/// written, and it resolves the alias against the origin token, so the CLI
-/// cannot aim it at another thread. The only check here keeps the value one
-/// path segment; the engine owns what the segment may name.
 pub(crate) fn cmd_archive(ws: &Workspace, thread: &str) -> Result<(), BoxError> {
     let target = thread.trim();
     if target.is_empty() || target.contains(['/', '?', '#']) || target.contains(char::is_whitespace)
@@ -250,7 +175,6 @@ pub(crate) fn cmd_archive(ws: &Workspace, thread: &str) -> Result<(), BoxError> 
     send_and_print("POST", &url, http_client()?.post(&url))
 }
 
-/// The thread `--thread` names, or this thread when it names none.
 fn target_thread(thread: Option<&str>) -> Result<String, BoxError> {
     let target = match thread {
         Some(t) => t.trim().to_string(),
@@ -265,8 +189,6 @@ fn target_thread(thread: Option<&str>) -> Result<String, BoxError> {
     Ok(target)
 }
 
-/// `lucidos threads context-ceiling`: set a thread's context ceiling. The
-/// engine parses the value and decides who may set it.
 pub(crate) fn cmd_context_ceiling(
     ws: &Workspace,
     ceiling: &str,
@@ -278,7 +200,6 @@ pub(crate) fn cmd_context_ceiling(
     send_and_print("PUT", &url, http_client()?.put(&url).json(&body))
 }
 
-/// `lucidos threads hold`: put a thread and its sub-threads on hold.
 pub(crate) fn cmd_hold(ws: &Workspace, reason: &str, thread: Option<&str>) -> Result<(), BoxError> {
     let target = target_thread(thread)?;
     let url = format!("{}/api/v1/threads/{target}/hold", ws.base_url());
@@ -286,15 +207,12 @@ pub(crate) fn cmd_hold(ws: &Workspace, reason: &str, thread: Option<&str>) -> Re
     send_and_print("POST", &url, http_client()?.post(&url).json(&body))
 }
 
-/// `lucidos threads resume`: end a hold. The engine decides who may.
 pub(crate) fn cmd_resume(ws: &Workspace, thread: Option<&str>) -> Result<(), BoxError> {
     let target = target_thread(thread)?;
     let url = format!("{}/api/v1/threads/{target}/hold", ws.base_url());
     send_and_print("DELETE", &url, http_client()?.delete(&url))
 }
 
-/// `lucidos threads create-draft`'s body, sent as written. The engine
-/// validates it and maps the picks onto the composer's selection.
 #[derive(serde::Serialize)]
 pub(crate) struct DraftRequest {
     pub text: String,
@@ -314,8 +232,6 @@ pub(crate) fn cmd_create_draft(ws: &Workspace, request: &DraftRequest) -> Result
     send_and_print("POST", &url, http_client()?.post(&url).json(request))
 }
 
-/// `lucidos threads submit-draft`: send a saved draft by revision and epoch.
-/// The engine resolves the owner's authority and answers with the receipt.
 pub(crate) fn cmd_submit_draft(
     ws: &Workspace,
     thread: &str,
@@ -344,8 +260,6 @@ pub(crate) fn cmd_submit_draft(
     Ok(())
 }
 
-/// A send that failed without a refusal may still have landed. The key lets
-/// the caller read its receipt back instead of sending twice.
 fn naming_the_retry_key(error: BoxError, retry_key: &str) -> BoxError {
     format!(
         "{error}\nThis send's retry key is {retry_key}. If it may have landed, run the same \
@@ -354,8 +268,6 @@ fn naming_the_retry_key(error: BoxError, retry_key: &str) -> BoxError {
     .into()
 }
 
-/// Default `--event-id` from the spawning event, the way `spawn-thread`
-/// defaults `--caller-event-id`.
 pub(crate) fn event_id_from_env() -> Option<String> {
     std::env::var(ENV_EVENT_ID)
         .ok()
@@ -363,7 +275,6 @@ pub(crate) fn event_id_from_env() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Read the calling thread's id for `--my-children`.
 pub(crate) fn source_thread_id_from_env() -> Option<String> {
     std::env::var(ENV_SOURCE_THREAD_ID).ok()
 }
@@ -373,9 +284,6 @@ pub(crate) fn build_query_params(filters: &ListFilters<'_>) -> Vec<(&'static str
     if let Some(a) = filters.active {
         params.push(("active", a.to_string()));
     }
-    // Repeated `--status a --status b` and `--status a,b` are the same
-    // request: both arrive as one comma-separated param. The engine owns
-    // validation, so a bad value produces one wording rather than two.
     if !filters.status.is_empty() {
         params.push(("status", filters.status.join(",")));
     }
@@ -405,7 +313,6 @@ pub(crate) fn build_query_params(filters: &ListFilters<'_>) -> Vec<(&'static str
 mod tests {
     use super::*;
 
-    /// A failed submit-draft keeps its error and names the key to retry with.
     #[test]
     fn a_failed_submit_draft_names_its_retry_key() {
         let error = naming_the_retry_key("connection reset".into(), "key-1").to_string();
@@ -413,15 +320,12 @@ mod tests {
         assert!(error.contains("--retry-key key-1"), "{error}");
     }
 
-    /// No status flags, so the status axis contributes nothing.
     const NO_STATUS: &[String] = &[];
 
     fn statuses(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| v.to_string()).collect()
     }
 
-    /// The five original filter axes, positionally, so each test names only
-    /// what it sets.
     fn build_query_params(
         active: Option<bool>,
         status: &[String],
@@ -484,8 +388,6 @@ mod tests {
         assert_eq!(params, vec![("status", "running".to_string())]);
     }
 
-    /// Repeated flags and one comma-separated flag are the same request, so
-    /// neither form is a second thing the engine has to know about.
     #[test]
     fn repeated_and_comma_separated_status_flags_produce_one_param() {
         let repeated = build_query_params(
@@ -567,8 +469,6 @@ mod tests {
         );
     }
 
-    /// The status axis composes with the others exactly as `active` does. Clap
-    /// refuses `--active --status`, so the two never both appear here.
     #[test]
     fn status_composes_with_the_other_filters() {
         let parent = "99999999-9999-9999-9999-999999999999";
@@ -599,9 +499,6 @@ mod tests {
         );
     }
 
-    /// "Show me my children" answered with every thread in the workspace is
-    /// the wrong answer, not a broader one, so an unresolvable `--my-children`
-    /// is an error rather than a silent no-op.
     #[test]
     fn my_children_without_a_calling_thread_is_an_actionable_error() {
         for env in [None, Some(String::new()), Some("   ".to_string())] {

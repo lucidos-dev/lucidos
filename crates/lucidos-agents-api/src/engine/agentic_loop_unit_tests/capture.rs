@@ -16,7 +16,6 @@ mod parse_app_capture_marker_tests {
 
     #[test]
     fn returns_none_for_missing_close_bracket() {
-        // No `]\n` after the prefix → can't separate screenshot from DOM.
         assert!(parse_app_capture_marker("[APP_CAPTURE:abc no bracket").is_none());
     }
 
@@ -49,13 +48,6 @@ mod format_capture_result_tests {
 
     #[test]
     fn omits_marker_when_screenshot_is_empty() {
-        // SDK sets `screenshot = ""` when its rasterizer fails and puts the
-        // failure in `dom`.
-        // Emitting `[APP_CAPTURE:]` (empty marker) would make the agentic loop
-        // build an empty Image content block, which the Anthropic API rejects
-        // with `400 "image cannot be empty"`. Drop the marker entirely so the
-        // tool-result text falls through to the plain-text path and the LLM
-        // still sees the failure reason.
         let formatted = format_capture_result(
             "",
             "",
@@ -85,8 +77,6 @@ mod sniff_image_media_type_tests {
         assert_eq!(sniff_image_media_type(&jpeg), "image/jpeg");
     }
 
-    /// A prefix that is not a whole number of base64 quads still sniffs. The
-    /// strict decoder would refuse it unless the slice is rounded down.
     #[test]
     fn a_prefix_that_is_not_a_whole_number_of_quads_still_sniffs() {
         let jpeg = b64(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F']);
@@ -101,7 +91,6 @@ mod sniff_image_media_type_tests {
 
     #[test]
     fn detects_webp_from_magic() {
-        // RIFF????WEBP — sniff_image_mime checks bytes [0..4] and [8..12].
         let webp = b64(&[
             b'R', b'I', b'F', b'F', 0x00, 0x00, 0x00, 0x00, b'W', b'E', b'B', b'P',
         ]);
@@ -116,7 +105,6 @@ mod sniff_image_media_type_tests {
 
     #[test]
     fn detects_heic_from_ftyp_brand() {
-        // ????ftyp + brand at offset 8-11.
         let heic = b64(&[
             0x00, 0x00, 0x00, 0x20, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c',
         ]);
@@ -125,9 +113,6 @@ mod sniff_image_media_type_tests {
 
     #[test]
     fn defaults_to_png_for_unknown() {
-        // Unknown prefix — caller is feeding us our own captures, so PNG is the
-        // safer default (the Anthropic API will reject either way; we pick the
-        // pre-fix hardcoded value to keep behaviour identical for non-image input).
         assert_eq!(sniff_image_media_type(&b64(&[0; 16])), "image/png");
         assert_eq!(sniff_image_media_type(""), "image/png");
     }

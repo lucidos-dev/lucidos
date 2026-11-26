@@ -1,10 +1,6 @@
-//! The frontend's copy of the catalog, generated so a client never writes a
-//! preference default or value list by hand (ADR 0368).
-
 use super::*;
 use crate::core::codegen::{quoted, REGENERATE};
 
-/// What a client reads: settings only. Engine bookkeeping never reaches it.
 fn client_specs() -> impl Iterator<Item = &'static PrefSpec> {
     CATALOG
         .iter()
@@ -12,7 +8,6 @@ fn client_specs() -> impl Iterator<Item = &'static PrefSpec> {
         .filter(|spec| !matches!(spec.access, PrefAccess::Engine { .. }))
 }
 
-/// `theme-mode` is exported as `PREF_THEME_MODE`.
 fn export_name(key: &str) -> String {
     format!("PREF_{}", key.to_ascii_uppercase().replace('-', "_"))
 }

@@ -1,8 +1,3 @@
-//! The wire shape of a question, and the reading of an answer.
-//!
-//! Every expected body here is copied from the TypeSafe API reference. They are
-//! the contract, so a change to one is a change to the integration.
-
 use super::*;
 
 fn choice_question() -> Question {
@@ -53,9 +48,6 @@ fn a_choice_serializes_its_options_as_a_map_in_the_declared_order() {
     assert_eq!(json, expected);
 }
 
-/// The `judge` tool takes its questions from the agent as JSON, so the type
-/// that writes the wire body has to read one too. A second struct mirroring
-/// this one is the drift this test exists to stop.
 #[test]
 fn a_question_reads_back_from_the_shape_it_writes() {
     for question in [
@@ -78,9 +70,6 @@ fn a_question_reads_back_from_the_shape_it_writes() {
     }
 }
 
-/// Decoding straight from the wire keeps the author's option order, because a
-/// `MapAccess` visits entries in document order. Nothing depends on the order,
-/// but a decode that silently sorted would make a captured payload unreadable.
 #[test]
 fn a_choice_decoded_from_the_wire_keeps_its_declared_order() {
     let json = r#"{"type":"choice","instructions":"Which team?","criteria":{"technical":null,"billing":null,"sales":null}}"#;
@@ -114,9 +103,6 @@ fn each_answer_type_reads_back_from_its_documented_shape() {
     assert_eq!(choice.probability("technical"), 0.85);
 }
 
-/// TypeSafe's third primitive has no variant here, because no call site asks
-/// one. An answer of a type the enum cannot read is dropped rather than
-/// failing the whole call, which is what keeps that omission harmless.
 #[test]
 fn a_score_answer_is_simply_unreadable() {
     let score = serde_json::from_value::<Answer>(serde_json::json!({
@@ -128,9 +114,6 @@ fn a_score_answer_is_simply_unreadable() {
     assert!(score.is_err());
 }
 
-/// The rule the command guard's tie-break rests on. An option the answer never
-/// mentioned reads as impossible, so asking for the harmless option's
-/// probability can only ever under-state it.
 #[test]
 fn an_option_the_answer_omits_has_probability_zero() {
     let answer = ChoiceAnswer {
@@ -142,9 +125,6 @@ fn an_option_the_answer_omits_has_probability_zero() {
     assert_eq!(answer.probability("irreversible"), 1.0);
 }
 
-/// What the `judge` tool hands back: the answers keyed by the ids the agent
-/// chose, each carrying its whole distribution. Returning only `choice` would
-/// throw away the one thing Jev is asked for.
 #[test]
 fn answers_serialize_as_an_object_keyed_by_question_id() {
     let answers = Answers::new(HashMap::from([

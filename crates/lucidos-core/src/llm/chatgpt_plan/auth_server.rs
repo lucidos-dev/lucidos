@@ -1,14 +1,12 @@
-//! OpenAI's auth host, where the sign-in, the token refresh and the `id_token`
+//! INVARIANT: OpenAI's auth host, where the sign-in, the token refresh and the `id_token`
 //! keys live. A plan token and a refresh token go to no other host.
 
 use std::time::Duration;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// OpenAI's auth origin, the only real host the sign-in talks to.
 pub const OPENAI_AUTH_ORIGIN: &str = "https://auth.openai.com";
 
-/// The auth origin a sign-in uses: OpenAI's, or a loopback mock in tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthServer {
     origin: String,
@@ -21,7 +19,6 @@ impl AuthServer {
         }
     }
 
-    /// `origin` when it is OpenAI's or a loopback mock, else why not.
     pub fn parse(origin: &str) -> Result<Self, BoxError> {
         let origin = origin.trim().trim_end_matches('/');
         if origin == OPENAI_AUTH_ORIGIN {
@@ -58,7 +55,7 @@ impl AuthServer {
     }
 }
 
-/// The client for every auth host call and the plan's model listing. It
+/// INVARIANT: The client for every auth host call and the plan's model listing. It
 /// follows no redirect, so a `307` cannot resend a code or a token elsewhere.
 pub(super) fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
@@ -67,7 +64,6 @@ pub(super) fn http_client() -> &'static reqwest::Client {
             .user_agent(crate::llm::lucidos_user_agent())
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            // Only fails on TLS-backend init.
             .expect("ChatGPT plan auth HTTP client builder")
     });
     &CLIENT

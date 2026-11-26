@@ -1,14 +1,3 @@
-//! *Form requests*: a request from the agent that the user must act on.
-//!
-//! Five `ThreadEvent` variants open one (`FORM_REQUEST_EVENT_TYPES`), and one
-//! `FormRequestResolved` closes it, keyed on `request_id`. Both are persisted,
-//! so an unanswered request survives a lost stream frame, a reload and an
-//! engine restart. The client reads the open ones from
-//! `GET /api/v1/form-requests/pending` on every stream open.
-//!
-//! This module is the one place that decides whether a request is still open.
-//! See `docs/plans/2026-09-24-form-requests-survive-a-reconnect.md`.
-
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -18,7 +7,6 @@ use crate::engine::thread_events::{EventMeta, FormRequestOutcome, MessageOrigin,
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The request variants. Each carries `request_id` and a JSON `payload`.
 pub const FORM_REQUEST_EVENT_TYPES: &[&str] = &[
     "CredentialRequested",
     "PluginInstallRequested",
@@ -27,37 +15,29 @@ pub const FORM_REQUEST_EVENT_TYPES: &[&str] = &[
     "OAuthAuthorizationRequested",
 ];
 
-/// The kinds whose open state lives in engine memory, and so dies with it:
-/// plugin staging and the OAuth callback listener. Expired at boot.
 const MEMORY_BACKED_EVENT_TYPES: &[&str] = &[
     "PluginInstallRequested",
     "PluginUninstallRequested",
     "OAuthAuthorizationRequested",
 ];
 
-/// Serializes every resolve, so a check and its emit cannot interleave with
+/// INVARIANT: Serializes every resolve, so a check and its emit cannot interleave with
 /// another resolve of the same request. One engine owns a workspace database.
 static RESOLVE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// An open form request, as `GET /api/v1/form-requests/pending` serves it.
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingFormRequest {
     pub thread_id: Uuid,
     pub request_id: Uuid,
-    /// The request event as the stream carries it: `type` plus its payload,
-    /// meta fields (`actor`, `request_event_id`) included.
     pub event: serde_json::Value,
 }
 
-/// SQL that is true when the request row `e` has a resolution.
 const RESOLVED_SQL: &str = "EXISTS ( \
      SELECT 1 FROM events r \
      WHERE r.event_type = 'FormRequestResolved' \
        AND r.payload->>'request_id' = e.payload->>'request_id')";
 
-/// Every open form request in a thread the user can still see: not archived,
-/// not discarded. Oldest first.
 pub async fn pending(pool: &PgPool) -> Result<Vec<PendingFormRequest>, sqlx::Error> {
     let rows: Vec<(Uuid, Option<String>, serde_json::Value)> = sqlx::query_as(&format!(
         "SELECT e.thread_id, e.payload->>'request_id', \
@@ -85,7 +65,6 @@ pub async fn pending(pool: &PgPool) -> Result<Vec<PendingFormRequest>, sqlx::Err
         .collect())
 }
 
-/// Requested identities with persisted resolution evidence, regardless of archive state.
 pub async fn resolved_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Uuid>, sqlx::Error> {
     let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
     let rows: Vec<String> = sqlx::query_scalar(
@@ -98,15 +77,12 @@ pub async fn resolved_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Uuid>, sqlx
     Ok(rows.into_iter().filter_map(|id| id.parse().ok()).collect())
 }
 
-/// One open request row, for the in-engine sweeps.
 struct OpenRequest {
     request_id: Uuid,
     event_type: String,
-    /// The request's own `payload` string, parsed.
     body: serde_json::Value,
 }
 
-/// Open requests of the given types, in one thread or in all of them.
 async fn open_requests(
     pool: &PgPool,
     thread_id: Option<Uuid>,
@@ -138,7 +114,6 @@ async fn open_requests(
         .collect())
 }
 
-/// The variant name of the form request `request_id` names, if any does.
 pub async fn event_type_of(pool: &PgPool, request_id: Uuid) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT event_type FROM events \
@@ -151,11 +126,6 @@ pub async fn event_type_of(pool: &PgPool, request_id: Uuid) -> Result<Option<Str
     .await
 }
 
-/// Close `request_id` with `outcome`, once.
-///
-/// Returns whether this call emitted the resolution. `false` means there is
-/// nothing to close: no form request has that id (a plugin staged over HTTP, a
-/// Settings-initiated OAuth flow), or it is already resolved.
 pub async fn resolve(
     pool: &PgPool,
     bus: &EventBus,
@@ -190,8 +160,6 @@ pub async fn resolve(
     Ok(true)
 }
 
-/// [`resolve`] for a caller that has no one to report a failure to: a sweep, a
-/// listener task, an emit site whose own work already succeeded.
 pub async fn resolve_or_log(
     pool: &PgPool,
     bus: &EventBus,
@@ -204,9 +172,6 @@ pub async fn resolve_or_log(
     }
 }
 
-/// Complete `request_id` when it names a request of `kind`. For a save or a
-/// send that says which form it answers. The work itself already succeeded, so
-/// a failure here is logged rather than reported.
 pub async fn complete_named_request(
     pool: &PgPool,
     bus: &EventBus,
@@ -225,7 +190,6 @@ pub async fn complete_named_request(
     }
 }
 
-/// Resolve every open request `pick` selects. For the sweeps.
 async fn resolve_open_where(
     pool: &PgPool,
     bus: &EventBus,
@@ -247,7 +211,7 @@ async fn resolve_open_where(
     }
 }
 
-/// What a request is about, when a newer one for the same thing replaces it.
+/// INVARIANT: What a request is about, when a newer one for the same thing replaces it.
 /// `None` for a kind where two open at once are both valid (two emails).
 fn subject(event_type: &str, body: &serde_json::Value) -> Option<String> {
     let key = match event_type {
@@ -258,7 +222,7 @@ fn subject(event_type: &str, body: &serde_json::Value) -> Option<String> {
     body[key].as_str().map(str::to_string)
 }
 
-/// Supersede the thread's open requests for the same subject as `event`.
+/// INVARIANT: Supersede the thread's open requests for the same subject as `event`.
 /// Run just before `event` is emitted, so only the newest stays open.
 pub async fn supersede_same_subject(
     pool: &PgPool,
@@ -288,8 +252,6 @@ pub async fn supersede_same_subject(
     .await;
 }
 
-/// Emit a new form request, superseding the older ones it replaces first.
-/// The one emitter for a sentinel-born request, shared by both agentic loops.
 pub async fn emit_request(
     pool: &PgPool,
     bus: &EventBus,
@@ -310,7 +272,7 @@ pub async fn emit_request(
     .await;
 }
 
-/// A new user message answers the thread's open forms, as it does a permission
+/// INVARIANT: A new user message answers the thread's open forms, as it does a permission
 /// card. The OAuth page is left to its own flow, which is still listening.
 pub async fn supersede_on_user_message(
     pool: &PgPool,
@@ -335,8 +297,6 @@ pub async fn supersede_on_user_message(
     .await;
 }
 
-/// A saved credential answers every open request for its service, whichever
-/// form or device saved it.
 pub async fn complete_credential_requests_for(
     pool: &PgPool,
     bus: &EventBus,
@@ -355,7 +315,7 @@ pub async fn complete_credential_requests_for(
     .await;
 }
 
-/// Whether `request` can still be answered, as far as engine memory can say.
+/// INVARIANT: Whether `request` can still be answered, as far as engine memory can say.
 ///
 /// A plugin request whose staging is gone cannot: its Confirm would 404. It is
 /// filtered out rather than resolved, because a Confirm in flight pops the
@@ -369,8 +329,6 @@ pub fn is_answerable(request: &PendingFormRequest, is_staged: impl Fn(&str, Uuid
     }
 }
 
-/// Boot: expire every open request whose state lived in engine memory. The
-/// staging and the listeners died with the previous engine.
 pub async fn expire_memory_backed_requests(pool: &PgPool, bus: &EventBus) {
     resolve_open_where(
         pool,

@@ -1,20 +1,9 @@
-//! The workspace order: the user's order for the workspace list, at
-//! `<app-data>/config/workspace-order.json`.
-//!
-//! One list of *order keys*. A key is the route segment the workspace opens
-//! at: `<slug>` for a local workspace, `<slug>@<gateway>` for a remote one. The
-//! picker and the in-app switcher on every paired device draw the same order.
-//! A workspace with no key keeps its default place after the ordered ones, so
-//! an empty order is the default list.
-
 use crate::BoxError;
 use lucidos_gateway_constants::REMOTE_ROUTE_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// The most keys one order may hold. Far past any real workspace count, and
-/// small enough that a hostile body cannot grow the file without bound.
 pub const MAX_KEYS: usize = 1000;
 
 pub fn workspace_order_path(app_data: &Path) -> PathBuf {
@@ -27,8 +16,6 @@ pub struct WorkspaceOrder {
 }
 
 impl WorkspaceOrder {
-    /// `keys` as an order, or why not: too many, a malformed key, or a key
-    /// listed twice.
     pub fn new(keys: Vec<String>) -> Result<Self, String> {
         if keys.len() > MAX_KEYS {
             return Err(format!("an order holds at most {MAX_KEYS} workspaces"));
@@ -49,7 +36,6 @@ impl WorkspaceOrder {
         &self.keys
     }
 
-    /// A missing file is the empty order, the state before any reorder.
     pub fn load(path: &Path) -> Result<Self, BoxError> {
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
@@ -66,7 +52,6 @@ impl WorkspaceOrder {
     }
 }
 
-/// `<slug>` or `<slug>@<gateway>`, each part a valid id.
 fn is_valid_key(key: &str) -> bool {
     match key.split_once(REMOTE_ROUTE_SEPARATOR) {
         None => crate::registry::is_valid_id(key),
@@ -77,16 +62,12 @@ fn is_valid_key(key: &str) -> bool {
     }
 }
 
-/// The stored order with its file. Writes go to disk before memory, under one
-/// lock, so a reader never sees an order the disk does not hold.
 pub struct WorkspaceOrderStore {
     path: PathBuf,
     order: Mutex<WorkspaceOrder>,
 }
 
 impl WorkspaceOrderStore {
-    /// An unreadable file starts the empty order rather than failing the
-    /// gateway: an order is a preference, and the next save replaces the file.
     pub fn load(path: PathBuf) -> Self {
         let order = WorkspaceOrder::load(&path).unwrap_or_else(|e| {
             crate::log_legacy!("[Gateway] workspace order unreadable, starting empty: {e}");
@@ -109,7 +90,6 @@ impl WorkspaceOrderStore {
         Ok(())
     }
 
-    /// Drop `key`, if the order holds it.
     pub fn forget(&self, key: &str) -> Result<(), BoxError> {
         let mut current = self.order.lock().unwrap();
         if !current.keys.iter().any(|k| k == key) {

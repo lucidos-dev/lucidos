@@ -70,12 +70,6 @@ async fn get_pending_by_branch_returns_only_pending() {
     teardown_test_db(&db).await;
 }
 
-/// The case ADR 0106 feared, at the projection. A parent's change is applied,
-/// then the parent commits again on the same branch. `emit_change_proposed`
-/// asks `get_pending_by_branch` for an id to reuse; after the apply that
-/// answers `None`, so the next proposal is a NEW row. The applied row keeps
-/// its status and commits, and the one-pending-per-branch index does not
-/// trip on it (ADR 0249).
 #[tokio::test]
 async fn a_proposal_after_an_apply_on_the_same_branch_is_a_new_change() {
     let (pool, db) = setup_test_db().await;
@@ -129,9 +123,6 @@ async fn a_proposal_after_an_apply_on_the_same_branch_is_a_new_change() {
     teardown_test_db(&db).await;
 }
 
-/// `idx_changes_unique_open_branch` keeps the open count per branch to one,
-/// so `other_open_for_branch` is always false in practice.
-/// `change_ops::discard_change` calls it defensively before wiping a branch.
 #[tokio::test]
 async fn other_open_for_branch_returns_false_when_only_one_is_open() {
     let (pool, db) = setup_test_db().await;
@@ -145,7 +136,6 @@ async fn other_open_for_branch_returns_false_when_only_one_is_open() {
     assert!(!proj.other_open_for_branch("branch-x", id).await.unwrap());
     assert!(!proj.other_open_for_branch("branch-y", id).await.unwrap());
 
-    // A different change on a different branch — still no overlap on branch-x.
     let other_id = Uuid::new_v4();
     emit(
         &bus,
@@ -274,8 +264,6 @@ async fn requires_restart_since_filters_by_resolved_at() {
     let thread = Uuid::new_v4();
     start_cc_thread(&bus, thread).await;
 
-    // Sandwich the cutoff between sleeps so `early.resolved_at` is strictly
-    // less and the next apply's `resolved_at` is strictly greater.
     let early = Uuid::new_v4();
     emit(&bus, thread, aggregate_proposed(early, "early", "/r")).await;
     emit(&bus, thread, applied_event(early, &["c"], true)).await;
@@ -315,13 +303,6 @@ async fn requires_restart_since_ignores_non_restart_changes() {
     teardown_test_db(&db).await;
 }
 
-/// `broadcast_changes_updated` passes a sentinel meaning "since forever" to
-/// answer "is any restart-required change applied at all?". Postgres
-/// `timestamptz` cannot represent `chrono::DateTime::<Utc>::MIN_UTC`
-/// (year -262143) so binding it returns `error: timestamp out of range`,
-/// which silently degrades to `false` and the toast never appears. The
-/// `Utc` epoch (1970) is the canonical sentinel — well within the Postgres
-/// timestamptz domain (4713 BC … 294276 AD).
 #[tokio::test]
 async fn requires_restart_since_unix_epoch_returns_correct_result() {
     let (pool, db) = setup_test_db().await;
@@ -415,7 +396,6 @@ async fn client_update_since_ignores_pre_cutoff() {
     )
     .await;
     emit(&bus, thread, applied_event(id, &["c"], false)).await;
-    // Cutoff in the future → no events qualify
     let cutoff = Utc::now() + chrono::Duration::seconds(60);
 
     let proj = ChangesProjection::new(pool);
@@ -435,10 +415,6 @@ async fn restart_groups_since_groups_by_thread_in_apply_order() {
     let cutoff = pg_now(&pool).await;
     tokio::time::sleep(std::time::Duration::from_millis(CUTOFF_GAP_MS)).await;
 
-    // Sleeps between rapid applies force strictly-distinct `resolved_at`
-    // timestamps (Postgres `transaction_timestamp()` has microsecond
-    // resolution, so back-to-back txs can collide under heavy load and
-    // make `ORDER BY resolved_at ASC` non-deterministic).
     let a1 = Uuid::new_v4();
     emit(&bus, thread_a, aggregate_proposed(a1, "a-1", "/r")).await;
     emit(
@@ -502,13 +478,6 @@ async fn restart_groups_since_ignores_non_restart() {
     teardown_test_db(&db).await;
 }
 
-/// The conflict-resolution duty derivation: a pending change whose latest
-/// merge-lifecycle event is an unpaired `MergeConflictDetected` is an
-/// in-flight conflict resolution; any closing event ends the duty, and a
-/// later retry's `MergeConflictDetected` re-opens it. This is what lets an
-/// auto-recovery continuation re-attach the merge duty after a stray kill
-/// (`ConflictResolutionCleanupAction::HandOff` skips the closing emits so
-/// the pairing stays open on purpose).
 #[tokio::test]
 async fn pending_conflict_change_follows_merge_event_pairing() {
     let (pool, db) = setup_test_db().await;
@@ -518,7 +487,6 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
     let change = Uuid::new_v4();
     let proj = ChangesProjection::new(pool);
 
-    // Pending change with no merge activity → no duty.
     emit(&bus, thread, aggregate_proposed(change, "cr", "/r")).await;
     assert!(
         proj.pending_conflict_change_for_thread(thread)
@@ -528,7 +496,6 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
         "a pending change without MergeConflictDetected is not a duty"
     );
 
-    // Conflict resolution started → duty open.
     emit(
         &bus,
         thread,
@@ -546,8 +513,6 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
         .expect("unpaired MergeConflictDetected must surface the duty");
     assert_eq!(duty.id, change);
 
-    // A real abort closes the pairing (MergeResolutionCleared +
-    // ChangeApplyFailed) — the change stays pending but the duty is gone.
     emit(
         &bus,
         thread,
@@ -582,7 +547,6 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
         "the change-scoped probe agrees the pairing is closed"
     );
 
-    // A later apply retry re-opens it.
     emit(
         &bus,
         thread,
@@ -605,8 +569,6 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
         "the change-scoped probe agrees the pairing is open"
     );
 
-    // The apply landing ends it for good (row leaves pending AND the
-    // pairing closes).
     emit(&bus, thread, applied_event(change, &["fix: x"], false)).await;
     assert!(
         proj.pending_conflict_change_for_thread(thread)
@@ -623,10 +585,6 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
     teardown_test_db(&db).await;
 }
 
-/// The Changes panel reads `resolving_conflict` off the served frame. So a
-/// reload still shows a conflict-resolving apply as in flight, with no
-/// standing apply offered. It takes an open pairing on a thread that has not
-/// finished: a pairing a crash stranded on a settled thread keeps its Discard.
 #[tokio::test]
 async fn enrich_marks_only_changes_whose_conflict_pairing_is_open() {
     let (pool, db) = setup_test_db().await;
@@ -715,17 +673,6 @@ async fn enrich_marks_only_changes_whose_conflict_pairing_is_open() {
     teardown_test_db(&db).await;
 }
 
-/// Regression, 2026-08-11: the pairing must stay open for the WHOLE
-/// resolution, not just until the resolver's first sign of life. `apply_change`
-/// now refuses to move `main` while `conflict_pairing_open` is true, so
-/// anything that closed the pairing early would re-arm the exact incident: a
-/// second apply landing the merge at step 2 of the resolver's 5-step prompt and
-/// then resetting its worktree mid-turn.
-///
-/// The mid-turn traffic replayed here is what the buggy path actually produced:
-/// a `CodingAgentIdled` (emitted by `apply_now_success`'s worktree reset) and a
-/// fresh `ChangeProposed` for the same change (the resolver's auto-commit
-/// hook). Neither is a merge-lifecycle event, so neither may close the pairing.
 #[tokio::test]
 async fn conflict_pairing_stays_open_through_the_resolver_mid_turn_traffic() {
     let (pool, db) = setup_test_db().await;
@@ -774,8 +721,6 @@ async fn conflict_pairing_stays_open_through_the_resolver_mid_turn_traffic() {
         );
     }
 
-    // The resolver's own completion is what closes it, and only then may
-    // another caller merge.
     emit(&bus, thread, applied_event(change, &["fix: jitter"], false)).await;
     assert!(
         !proj.conflict_pairing_open(thread, change).await.unwrap(),
@@ -785,11 +730,6 @@ async fn conflict_pairing_stays_open_through_the_resolver_mid_turn_traffic() {
     teardown_test_db(&db).await;
 }
 
-/// With two open pairings on one thread (an older one stranded by a crash),
-/// the NEWEST wins — the continuation that just fired belongs to the most
-/// recently started merge; binding the stranded older change would ff-merge
-/// the wrong branch on a clean turn end. The change-scoped probe still
-/// reports both open, so change-aware callers are unaffected.
 #[tokio::test]
 async fn pending_conflict_change_prefers_newest_open_pairing() {
     let (pool, db) = setup_test_db().await;
@@ -823,7 +763,6 @@ async fn pending_conflict_change_prefers_newest_open_pairing() {
     assert!(proj.conflict_pairing_open(thread, stranded).await.unwrap());
     assert!(proj.conflict_pairing_open(thread, live).await.unwrap());
 
-    // Closing the newest falls back to the stranded one.
     emit(
         &bus,
         thread,
@@ -918,8 +857,6 @@ fn idled() -> ThreadEvent {
     }
 }
 
-/// The flags a reader sees for one change, next to the status `threads list`
-/// shows for its thread.
 async fn read_one(pool: &PgPool, proj: &ChangesProjection, thread: Uuid) -> (String, bool, bool) {
     let status: String =
         sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
@@ -942,10 +879,6 @@ async fn read_one(pool: &PgPool, proj: &ChangesProjection, thread: Uuid) -> (Str
     (status, thread.unsettled(), thread.settling())
 }
 
-/// A session proposed, then an event delivery started a new turn and it kept
-/// working. The `changes` tool read that change as settled, and an
-/// orchestrator told the user the session was done. Driven by real events, so
-/// the flag has to follow the status every step of the way.
 #[tokio::test]
 async fn a_change_reads_unsettled_whenever_its_thread_works_again() {
     let (pool, db) = setup_test_db().await;
@@ -995,10 +928,6 @@ async fn a_change_reads_unsettled_whenever_its_thread_works_again() {
     teardown_test_db(&db).await;
 }
 
-/// The list and the Apply gate read the same state. At 21:14 an Apply All hit
-/// a conflict and the thread went back to work resolving it. The `changes`
-/// tool then listed the change with every flag false, while `apply` on the same
-/// change was refused because the thread had not finished.
 #[tokio::test]
 async fn the_list_and_the_apply_gate_agree_on_every_thread_state() {
     let (pool, db) = setup_test_db().await;
@@ -1080,9 +1009,6 @@ async fn the_list_and_the_apply_gate_agree_on_every_thread_state() {
     teardown_test_db(&db).await;
 }
 
-/// The threads-list count and the `changes` filter read one definition of
-/// "sub-thread", so over the same tree they agree. The root's own change is in
-/// neither: a completion card keeps it apart too.
 #[tokio::test]
 async fn the_sub_thread_count_and_the_filter_agree_on_one_tree() {
     use crate::core::changes::{list_pending_for_readers, PendingScope};
@@ -1090,8 +1016,6 @@ async fn the_sub_thread_count_and_the_filter_agree_on_one_tree() {
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let proj = ChangesProjection::new(pool.clone());
 
-    // root holds its own change; child and grandchild hold one each; the
-    // quiet sibling holds none.
     let [root, child, grandchild, quiet] = [(); 4].map(|_| Uuid::new_v4());
     for (i, thread) in [root, child, grandchild, quiet].into_iter().enumerate() {
         start_cc_thread(&bus, thread).await;
@@ -1133,7 +1057,6 @@ async fn the_sub_thread_count_and_the_filter_agree_on_one_tree() {
     assert_eq!(counts.get(&child).copied(), Some(1));
     assert_eq!(counts.get(&quiet), None, "nothing below the quiet sibling");
 
-    // The list an agent reads carries the count on every row, zero included.
     let store = crate::core::store::EventStore::new(pool.clone());
     let rows = store
         .list_thread_summaries(crate::core::store::ThreadSummaryFilters {
@@ -1155,22 +1078,14 @@ async fn the_sub_thread_count_and_the_filter_agree_on_one_tree() {
     assert_eq!(count_of(root), Some(2));
     assert_eq!(count_of(grandchild), Some(0));
 
-    // Every other read path omits it rather than claiming zero.
     let by_id = store.get_threads_by_ids(&[root.to_string()]).await.unwrap();
     assert_eq!(by_id[0].pending_sub_thread_change_count, None);
 
     teardown_test_db(&db).await;
 }
 
-/// Buffer to put around a cutoff so the surrounding `resolved_at`
-/// timestamps land strictly on the expected side. Has to absorb scheduler
-/// jitter and Docker network round-trips on macOS, where 1ms is too tight.
 const CUTOFF_GAP_MS: u64 = 50;
 
-/// Returns Postgres `NOW()` so cutoffs are in the same clock as
-/// `resolved_at` (set via SQL `NOW()`). Mixing Rust `Utc::now()` with
-/// Postgres NOW() flakes under clock drift between host and the Postgres
-/// container (notably after laptop sleep/wake on macOS Docker).
 async fn pg_now(pool: &PgPool) -> DateTime<Utc> {
     sqlx::query_scalar("SELECT NOW()")
         .fetch_one(pool)

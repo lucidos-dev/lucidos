@@ -1,5 +1,3 @@
-//! Child environment reachability checks shared by the real spawn builders.
-
 use super::*;
 use std::collections::BTreeMap;
 
@@ -51,7 +49,6 @@ fn unreachable(policy: &Policy, env: &BTreeMap<String, String>) -> Vec<String> {
     failures
 }
 
-/// Exercise the builder's real values, then the packaged socket shape on every host.
 pub fn assert_spawn_env_reachable(
     workspace: &Path,
     overrides: impl IntoIterator<Item = (String, String)>,

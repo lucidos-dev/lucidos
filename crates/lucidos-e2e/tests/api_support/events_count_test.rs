@@ -1,8 +1,3 @@
-//! `GET /api/v1/events/count` honours `thread_id`.
-//!
-//! The grouped `events` tool offers `thread_id` on `count`, and the endpoint
-//! once ignored it, so a thread-scoped count returned the workspace total.
-
 use crate::support::{base_url, db_url, http_client};
 use serde_json::Value;
 use uuid::Uuid;

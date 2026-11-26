@@ -668,11 +668,12 @@ export const PREF_LONG_PROMPT_SHARE = {
   fallback: null,
 } as const;
 
-export const PREF_AGENT_BRAND_COLOURS = {
-  key: "agent-brand-colours",
+export const PREF_AGENT_ICON_COLORS = {
+  key: "agent-icon-colors",
   scope: "device",
-  type: "flag",
-  fallback: "true",
+  type: "enum",
+  values: ["brand", "theme", "muted"],
+  fallback: "brand",
 } as const;
 
 export const PREF_THEME_MODE = {
@@ -1155,7 +1156,7 @@ export const PREFERENCE_CATALOG = {
   "intelligence_ladder_claude_code": PREF_INTELLIGENCE_LADDER_CLAUDE_CODE,
   "intelligence_ladder_codex": PREF_INTELLIGENCE_LADDER_CODEX,
   "long_prompt_share": PREF_LONG_PROMPT_SHARE,
-  "agent-brand-colours": PREF_AGENT_BRAND_COLOURS,
+  "agent-icon-colors": PREF_AGENT_ICON_COLORS,
   "theme-mode": PREF_THEME_MODE,
   "font-family": PREF_FONT_FAMILY,
   "ui-scale": PREF_UI_SCALE,

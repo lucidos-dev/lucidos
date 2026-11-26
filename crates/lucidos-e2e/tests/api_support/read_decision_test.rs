@@ -1,20 +1,9 @@
-//! E2E for the chat turn end's *read decision* (ADR 0417), on the mock model.
-//!
-//! What it pins, against a real engine:
-//!
-//! * a turn that ends without deciding gets one forced decision, recorded
-//!   before its `ResponseGenerated`, and the reply stays the draft
-//! * the forced call records its cost as a `read_decision` capture
-//! * a reply that carries its own decision beside its text ends the turn in
-//!   one round, with no forced call
-
 use crate::support::{base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client};
 use lucidos_engine::llm::mock::{
     MOCK_READ_BESIDE_REPLY_SENTINEL, MOCK_READ_YES_SENTINEL, MOCK_RESPONSE,
 };
 use uuid::Uuid;
 
-/// Send `message` as a new chat turn and wait for its `ResponseGenerated`.
 async fn finished_turn(pool: &sqlx::PgPool, label: &str, message: &str) -> Uuid {
     let marker = unique_marker(label);
     let resp = user_client()

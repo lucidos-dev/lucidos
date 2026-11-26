@@ -140,6 +140,7 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
     case 'thread_link': return origin.mode ?? 'agent';
     case 'agent':       return 'agent';
     case 'webhook':     return 'engine';
+    case 'event_hook':  return 'engine';
     case 'engine':      return 'engine';
     case 'system':      return 'engine';
   }

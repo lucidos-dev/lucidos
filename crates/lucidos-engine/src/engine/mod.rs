@@ -45,6 +45,7 @@ pub mod coding_turn_end;
 pub mod continuation_queries;
 pub mod replay_inputs;
 pub mod resume_anchor;
+pub mod session_spawn_gate;
 pub mod sse_connections;
 pub mod thread_stop;
 pub mod turn_start_gate;
@@ -810,6 +811,7 @@ pub struct LucidosEngine {
     /// The ChatGPT plan access every provider build shares, held here so the
     /// status route reads the same limit pause the provider observes.
     pub chatgpt_plan_access: crate::llm::chatgpt_plan::ChatGptPlanAccess,
+    pub event_hook_catalog: std::sync::OnceLock<Arc<dyn crate::core::event_hooks::EventHooks>>,
     /// Plugin installs awaiting user confirmation in the install panel.
     /// Key: install_id (UUID). Value: staged plugin tree + manifest. Inserted
     /// when `install_plugin` returns the `[PLUGIN_INSTALL_REQUEST]` sentinel;
@@ -842,6 +844,7 @@ pub struct LucidosEngine {
     /// Registered coding-agent backends (Claude Code, Codex, …).
     /// Engine code spawns agents via this registry instead of naming a concrete runtime.
     pub agent_runtimes: HashMap<CodingAgent, Arc<dyn AgentRuntime>>,
+    pub session_spawn_gate: session_spawn_gate::SessionSpawnGate,
     /// The system prompt each thread's latest Claude Code spawn appended. A
     /// side question's session copy appends the same one, so its prompt prefix
     /// matches and the transcript reads from the prompt cache. Memory only: a

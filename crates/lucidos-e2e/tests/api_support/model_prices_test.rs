@@ -1,6 +1,3 @@
-//! E2E coverage for `GET /api/v1/model-prices`: the shipped price cards, and
-//! the workspace override merged over them card by card (ADR 0525).
-
 use crate::support::{base_url, user_client, workspace_tree_lock, write_data_fixture};
 
 const OVERRIDE: &str = "config/model-prices.json";
@@ -15,9 +12,6 @@ async fn price_table(client: &reqwest::Client) -> serde_json::Value {
     resp.json().await.expect("json body")
 }
 
-/// A newer override card joins the shipped one and the shipped card keeps
-/// its span, so a past day keeps its price. Removing the file restores the
-/// shipped table.
 #[tokio::test]
 async fn the_override_merges_card_by_card() {
     let _tree = workspace_tree_lock().read().await;

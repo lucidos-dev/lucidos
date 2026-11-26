@@ -24,7 +24,6 @@ pub(crate) impl LucidosEngine {
                         change_id,
                         e
                     );
-                    // Announced as the apply's outcome, so Apply All moves on.
                     let actor = engine.pending_apply_actors.take(change_id);
                     engine
                         .emit_apply_failed(thread_id, change_id, &e.to_string(), actor)
@@ -51,8 +50,6 @@ pub(crate) impl LucidosEngine {
                 }
             };
 
-            // The temp branch starts at `main`, so the conflicts are those of
-            // merging the change into `main`, the same paths Tiers 1 and 2 name.
             let conflicts = crate::engine::git_ops::predict_merge_into_main(
                 std::path::Path::new(&change.repo_root),
                 &change.branch_name,
@@ -103,7 +100,7 @@ pub(crate) impl LucidosEngine {
 
             let request_id = Uuid::new_v4();
             let cancel_token = tokio_util::sync::CancellationToken::new();
-            // Direct run_direct_agent (bypasses process_message_with_steps):
+            // INVARIANT: Direct run_direct_agent (bypasses process_message_with_steps):
             // engine-driven Tier-3 merge orchestration. The prompt is
             // engine-synthesized via `start_merge_and_get_prompt`, and the
             // session holds the change's apply claim for its whole run.
@@ -169,8 +166,6 @@ pub(crate) impl LucidosEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let change_id = apply_claim.change_id();
         let mut spawn_claim = self.hand_apply_hold_to_run(thread_hold).await;
-        // Probe the worktree for the actual conflicting files so the panel
-        // shows real numbers — mirrors apply_now::merge_via_cc_session.
         let conflict_files = probe_merge_conflicts(wt_path).await;
         let merge_prompt = self
             .start_merge_and_get_prompt(
@@ -188,13 +183,6 @@ pub(crate) impl LucidosEngine {
         let request_id = Uuid::new_v4();
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
-        // Direct run_direct_agent (bypasses process_message_with_steps):
-        // engine-driven Tier-2 merge retry. Needs `recovery_worktree:
-        // Some((wt_path, branch_name))` to run CC in the merge worktree
-        // (not the main repo root) and `resume_token` to continue a prior
-        // CC conversation if one exists. Neither concept exists in the
-        // unified router's surface — chat doesn't have worktree-bound
-        // sessions or CC `--resume` tokens.
         self.run_direct_agent(
             &mut spawn_claim,
             request_id,

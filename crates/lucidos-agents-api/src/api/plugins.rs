@@ -1,16 +1,3 @@
-//! HTTP endpoint for staging a `.lucidos-plugin` archive uploaded from the
-//! browser onto a filesystem path the LLM tool `install_plugin` can consume.
-//!
-//! The plugins v1 design (`docs/plans/2026-04-29-plugins-v1-design.md`) keeps
-//! the install logic in the LLM tool. The browser cannot hand a `File` blob
-//! to the tool directly, so we stage the bytes under
-//! `.lucidos/tmp/plugins/uploads/<uuid>/<name>` and return the absolute path.
-//! The chat layer then sends a message like "Install the plugin at <path>",
-//! and the LLM calls `install_plugin` with that path.
-//!
-//! Those staged bytes are this module's to reclaim, and nothing downstream
-//! does it: see [`prune_uploads_older_than`].
-
 use crate::engine::tools::plugins::marketplaces::MarketplacesExt;
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -44,14 +31,8 @@ use crate::triggers::affected::AffectedTrigger;
 
 pub(crate) const MAX_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
 
-/// How long a staged upload survives before a later plugin request reclaims it.
-///
-/// One hour, matching the pending-install TTL in `engine::tools::plugins`. An
-/// archive is the input to an install, so it outlives that install's own
-/// staging by nothing.
 const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// Where [`upload_archive`] stages browser uploads, one directory per upload.
 fn uploads_root(workspace_path: &std::path::Path) -> std::path::PathBuf {
     workspace_path
         .join(crate::core::TMP_DIR)
@@ -62,7 +43,6 @@ fn uploads_root(workspace_path: &std::path::Path) -> std::path::PathBuf {
 async fn prune_uploads_older_than(root: &std::path::Path, ttl: std::time::Duration) {
     let mut entries = match tokio::fs::read_dir(root).await {
         Ok(entries) => entries,
-        // A workspace that never uploaded has no directory here.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             log_legacy!(@Plugins, "prune uploads: read {:?} failed: {}", root, e);
@@ -158,10 +138,7 @@ pub(super) struct ProposeUpstreamRequest {
 
 #[derive(Debug, Serialize)]
 pub(super) struct ProposeUpstreamResponse {
-    /// `data/`-relative path of the generated patch.
     pub patch_path: String,
-    /// The thread that will take the patch to the plugin's author. The
-    /// frontend navigates the user into it.
     pub thread_id: Uuid,
 }
 
@@ -179,10 +156,6 @@ pub(super) async fn list_marketplaces(
     }))
 }
 
-/// `POST /api/v1/plugins/marketplaces` (Settings, Marketplaces "Add", and the
-/// one-click official-marketplace button). Registers a new marketplace or
-/// re-registers an existing source under a new name; the shared write path
-/// announces either outcome, so every open Plugins panel refreshes in place.
 pub(super) async fn add_marketplace_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -206,9 +179,6 @@ pub(super) async fn add_marketplace_handler(
     }))
 }
 
-/// `DELETE /api/v1/plugins/marketplaces/:id`. 404 when the id was never
-/// registered (nothing is written or announced); 500 for a registry the engine
-/// could not write or commit.
 pub(super) async fn remove_marketplace_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -229,21 +199,12 @@ pub(super) async fn remove_marketplace_handler(
     }))
 }
 
-/// The catalog plus what a client needs to say how fresh it is.
-///
-/// Flattened, so the wire shape stays the one object the frontend's
-/// `MarketplaceCatalog` mirrors. `MarketplaceCatalog` itself stays a pure scan
-/// result: freshness is a property of the answer, not of the scan.
 #[derive(Debug, Serialize)]
 pub(super) struct CatalogResponse {
     #[serde(flatten)]
     catalog: MarketplaceCatalog,
-    /// When the scan behind `plugins` finished. Absent until the first one has.
     scanned_at: Option<String>,
-    /// A scan is running now, so these plugins may be about to change.
     scanning: bool,
-    /// Why the last scan could not run at all. Distinct from `errors`, which is
-    /// per marketplace and still ships a usable catalog.
     scan_error: Option<String>,
 }
 
@@ -277,9 +238,6 @@ pub(super) async fn read_catalog(
     if due {
         spawn_rescan(state, ScanCause::Routine);
     }
-    // A scan this request just queued counts as running. Otherwise a cold
-    // workspace answers "nothing cached, nothing scanning", which the panel
-    // renders as "No plugins found".
     let scanning = due || plugin_catalog_cache::scan_is_running(cached.scan_started_at, now);
 
     let mut catalog = plugin_catalog_cache::merge_with_registry(&cached, &registry);
@@ -294,7 +252,7 @@ pub(super) async fn read_catalog(
     })
 }
 
-/// `POST /api/v1/plugins/catalog/rescan`, the panel's manual refresh.
+/// INVARIANT: `POST /api/v1/plugins/catalog/rescan`, the panel's manual refresh.
 ///
 /// Returns as soon as the scan is queued. A scan already running goes round
 /// once more after it, so the answer is a scan that started after the request.
@@ -314,11 +272,6 @@ fn spawn_rescan(state: &AppState, cause: ScanCause) {
     });
 }
 
-/// `GET /api/v1/plugins/installed` — the Plugins → Installed list. Unlike
-/// `catalog`, this reads only the `PluginInstalled`/`PluginUninstalled` event
-/// projection (no marketplace scan), so it works offline and still lists a
-/// plugin whose marketplace was later removed. Each summary carries the
-/// shipped `content` kinds + `files` so the row can link to what was installed.
 pub(super) async fn installed(
     State(state): State<AppState>,
 ) -> Result<Json<InstalledPluginsResponse>, (StatusCode, Json<JsonValue>)> {
@@ -339,11 +292,6 @@ pub(super) async fn read_installed(
     Ok(InstalledPluginsResponse { plugins })
 }
 
-/// Setup counts as "complete" once its thread is no longer actively working or
-/// waiting on the user — any `thread_summaries.status` other than `running` /
-/// `waiting_for_user_answer` (the two `ThreadStatus` values that mean the setup
-/// agent is still mid-turn or blocked on the user). Pure, so the boundary is
-/// unit-testable.
 fn setup_status_is_complete(status: ThreadStatus) -> bool {
     !matches!(
         status,
@@ -351,18 +299,6 @@ fn setup_status_is_complete(status: ThreadStatus) -> bool {
     )
 }
 
-/// Resolve a setup thread's completion for the Plugins panel card from the two
-/// signals we can observe: `summary_status` is its `thread_summaries.status`
-/// (`Some` once the thread has a row), `in_queue` is whether a live
-/// `thread_queue` entry still exists for it.
-/// - present → done once it's neither `running` nor `waiting_for_user_answer`.
-/// - absent but queued → still pending (not complete) → card keeps "Setup"
-///   through the brief post-spawn lag before the agent's first event lands.
-/// - absent and not queued → the thread is *gone* (lost spawn, deleted, or a
-///   stale catalog id) → complete, so the card falls through to "Open" instead
-///   of a "Setup" button that 404s on click.
-///
-/// Pure, so the present/pending/gone boundaries are unit-testable.
 fn resolve_setup_complete(summary_status: Option<ThreadStatus>, in_queue: bool) -> bool {
     match summary_status {
         Some(status) => setup_status_is_complete(status),
@@ -370,14 +306,6 @@ fn resolve_setup_complete(summary_status: Option<ThreadStatus>, in_queue: bool) 
     }
 }
 
-/// Fill `MarketplacePlugin::setup_complete` from each setup thread's state. The
-/// pure `scan_catalog` can't reach the DB, so it leaves the flag `false`; this
-/// enriches the scanned catalog before it ships, routing each id through
-/// [`resolve_setup_complete`] (present → lifecycle status; queued → pending;
-/// gone → complete). A summary-lookup failure is logged, not fatal — the
-/// catalog still renders, just pinned to "Setup". A queue-lookup failure falls
-/// back to treating unknown ids as still-queued (pending), so a transient error
-/// can never flip a real pending setup to "Open".
 async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatalog) {
     let ids: Vec<Uuid> = catalog
         .plugins
@@ -453,11 +381,6 @@ pub(super) async fn stage_install(
     Err(err(StatusCode::BAD_REQUEST, msg))
 }
 
-/// `POST /api/v1/plugins/uninstall-request` — stage an uninstall from the App
-/// Store UI. Mirrors `stage_install`: resolves the plugin id, partitions its
-/// recorded files into present/missing, and returns the staged
-/// `PluginUninstallRequest` JSON for the confirm panel. The same staging the
-/// `uninstall_plugin` LLM tool produces, just initiated from a button.
 pub(super) async fn stage_uninstall(
     State(state): State<AppState>,
     Json(body): Json<StageUninstallRequest>,
@@ -509,7 +432,6 @@ pub(super) async fn upload_archive(
         .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("read body: {e}")))?;
     let byte_size = bytes.len() as u64;
 
-    // Reclaim what earlier uploads left before adding one.
     let uploads = uploads_root(&state.workspace_path);
     prune_uploads_older_than(&uploads, UPLOAD_TTL).await;
 
@@ -525,7 +447,6 @@ pub(super) async fn upload_archive(
     let dest = upload_dir.join(&safe_name);
     if let Err(e) = tokio::fs::write(&dest, &bytes).await {
         log_legacy!(@Plugins, "upload {} ({} bytes): write {:?} failed: {}", safe_name, byte_size, dest, e);
-        // Only what this attempt created, and only because it failed.
         let _ = tokio::fs::remove_dir_all(&upload_dir).await;
         return Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -545,28 +466,19 @@ pub(super) async fn upload_archive(
 #[derive(Debug, Serialize)]
 pub(super) struct ConfirmInstallResponse {
     pub summary: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hooks_needing_review: Vec<String>,
     pub installed_files: Vec<String>,
-    /// Files the previous version shipped and this one dropped, which the
-    /// update deleted. Absent when it deleted none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub removed_files: Vec<String>,
-    /// Triggers the plugin does not own that relied on a removed file.
-    /// Absent when none did.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub affected_triggers: Vec<AffectedTrigger>,
-    /// Set when the installed plugin shipped `setup` instructions: the id of
-    /// the Lucidos Agent thread spawned to walk the user through them. The
-    /// frontend navigates the user to this thread after a successful install.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_thread_id: Option<uuid::Uuid>,
-    /// What the install did to files the user had locally edited. Absent when
-    /// it met none, which is every fresh install.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_changes: Option<LocalChangesResponse>,
 }
 
-/// The wire shape of [`LocalChangeReport`], so the receipt panel can say which
-/// edits were kept, which were lost, and where the lost ones went.
 #[derive(Debug, Serialize)]
 pub(super) struct LocalChangesResponse {
     pub merged: Vec<String>,
@@ -594,6 +506,8 @@ impl From<LocalChangeReport> for LocalChangesResponse {
 pub(super) struct ConfirmInstallQuery {
     #[serde(default = "keep_local_changes_default")]
     pub keep_local_changes: bool,
+    #[serde(default)]
+    pub confirm_hooks: bool,
 }
 
 fn keep_local_changes_default() -> bool {
@@ -603,16 +517,20 @@ fn keep_local_changes_default() -> bool {
 fn pending_status(err_msg: &str) -> StatusCode {
     if err_msg.starts_with("no pending ") {
         StatusCode::NOT_FOUND
+    } else if err_msg == crate::engine::tools::plugins::hooks::CONFIRMATION_REQUIRED {
+        StatusCode::FORBIDDEN
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
-/// Close the *form request* a chat turn opened for the staged plugin `id`.
-///
-/// A missing entry means the staging is gone (the TTL, a restart, another
-/// device got there first), so the request can no longer be answered. Any
-/// other failure leaves it open, so the user can press the button again.
+fn owner_confirms_hooks(headers: &HeaderMap) -> bool {
+    use super::actor::{owner_attestation, OwnerAttestation};
+    use super::secret_reveal::{reveal_request_allowed, RefererRule};
+    owner_attestation(headers) == OwnerAttestation::Owner
+        && reveal_request_allowed(headers, RefererRule::Required)
+}
+
 async fn settle_plugin_request<T>(
     state: &AppState,
     id: &str,
@@ -625,7 +543,6 @@ async fn settle_plugin_request<T>(
         Err(e) if pending_status(e) == StatusCode::NOT_FOUND => FormRequestOutcome::Expired,
         Err(_) => return,
     };
-    // A staged id is always a uuid; one that is not names no form request.
     let Ok(request_id) = id.parse() else { return };
     crate::engine::form_requests::resolve_or_log(
         &state.pool,
@@ -637,14 +554,6 @@ async fn settle_plugin_request<T>(
     .await;
 }
 
-/// `POST /api/v1/plugins/install/:install_id/confirm` — user accepted the
-/// staged install in the install panel. Pops the entry, writes files into
-/// `data/`, emits `PluginInstalled` (stamped with the device that clicked
-/// Confirm), and (if the install touched any `auth-modules/` paths)
-/// auto-reloads the proxy WASM signer map.
-///
-/// Also sweeps the uploads directory, since an install is where a browser
-/// upload stops being anybody's input. See [`prune_uploads_older_than`].
 pub(super) async fn confirm_install(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -657,6 +566,7 @@ pub(super) async fn confirm_install(
         &state.engine,
         &install_id,
         query.keep_local_changes,
+        query.confirm_hooks && owner_confirms_hooks(&headers),
         actor.clone(),
     )
     .await;
@@ -671,6 +581,7 @@ pub(super) async fn confirm_install(
     match result {
         Ok(outcome) => Ok(Json(ConfirmInstallResponse {
             summary: outcome.summary,
+            hooks_needing_review: outcome.hooks_needing_review,
             installed_files: outcome.installed_files,
             removed_files: outcome.removed_files,
             affected_triggers: outcome.affected_triggers,
@@ -681,12 +592,6 @@ pub(super) async fn confirm_install(
     }
 }
 
-/// `POST /api/v1/plugins/install/:install_id/cancel` — user dismissed the
-/// staged install. Drops the staged temp dir and emits
-/// `PluginInstallCanceled` (stamped with the device that clicked Cancel)
-/// for audit. Idempotent: a missing `install_id` returns 404 (cleaner than
-/// treating "not pending" as success). Sweeps the uploads directory too, the
-/// same way [`confirm_install`] does.
 pub(super) async fn cancel_install(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -714,23 +619,23 @@ pub(super) struct ConfirmUninstallResponse {
     pub summary: String,
     pub files_deleted: Vec<String>,
     pub files_missing: Vec<String>,
-    /// As on [`ConfirmInstallResponse`], over the deleted files.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub affected_triggers: Vec<AffectedTrigger>,
 }
 
-/// `POST /api/v1/plugins/uninstall/:uninstall_id/confirm` — user accepted the
-/// staged uninstall in the panel. Pops the entry, deletes the recorded files
-/// from `data/`, prunes empty parent dirs, emits `PluginUninstalled` (stamped
-/// with the confirming device), and (if any `auth-modules/` paths were
-/// touched) reloads the proxy WASM signer map. Symmetric with `confirm_install`.
 pub(super) async fn confirm_uninstall(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(uninstall_id): Path<String>,
 ) -> Result<Json<ConfirmUninstallResponse>, (StatusCode, Json<JsonValue>)> {
     let actor = super::actor::user_actor(&headers, None);
-    let result = confirm_pending_uninstall(&state.engine, &uninstall_id, actor.clone()).await;
+    let result = confirm_pending_uninstall(
+        &state.engine,
+        &uninstall_id,
+        owner_confirms_hooks(&headers),
+        actor.clone(),
+    )
+    .await;
     settle_plugin_request(
         &state,
         &uninstall_id,
@@ -750,9 +655,6 @@ pub(super) async fn confirm_uninstall(
     }
 }
 
-/// `POST /api/v1/plugins/uninstall/:uninstall_id/cancel` — user dismissed the
-/// staged uninstall. No files are touched; emits `PluginUninstallCanceled`
-/// for audit. Idempotent (404 on missing id).
 pub(super) async fn cancel_uninstall(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -774,13 +676,6 @@ pub(super) async fn cancel_uninstall(
     }
 }
 
-/// `POST /api/v1/plugins/propose-upstream`: offer the caller's local patch to
-/// the plugin's author. Derives the diff, writes it under `data/artifacts/`,
-/// and spawns a thread to take it from there. The engine performs no GitHub
-/// operation itself.
-///
-/// 400 when the plugin is unknown, has no recorded baseline, or has no local
-/// changes to propose. All three are things the user can act on.
 pub(super) async fn propose_upstream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -800,7 +695,6 @@ pub(super) async fn propose_upstream(
     }
 }
 
-/// Routes for the `/plugins/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -846,10 +740,6 @@ mod tests {
     use crate::test_support::{setup_test_db, teardown_test_db};
     use uuid::Uuid;
 
-    /// Nothing used to reclaim a staged upload. An install copied the bytes
-    /// out and left the directory, and an upload the browser never sent left
-    /// one too. At `MAX_ARCHIVE_BYTES` each, that is 50 MiB kept forever per
-    /// abandoned upload.
     #[tokio::test]
     async fn a_stale_upload_is_reclaimed_and_a_live_one_is_left_alone() {
         let workspace = tempfile::tempdir().expect("a workspace");
@@ -871,8 +761,6 @@ mod tests {
         assert!(root.exists(), "the uploads root survives its own sweep");
     }
 
-    /// The sweep runs on every upload, confirm and cancel, so a workspace that
-    /// has never uploaded has to meet it silently.
     #[tokio::test]
     async fn pruning_a_workspace_that_never_uploaded_is_a_no_op() {
         let workspace = tempfile::tempdir().expect("a workspace");
@@ -883,13 +771,10 @@ mod tests {
 
     #[test]
     fn setup_complete_only_when_not_running_or_waiting() {
-        // The two statuses that mean the setup agent is still mid-turn or
-        // blocked on the user → not done.
         assert!(!setup_status_is_complete(ThreadStatus::Running));
         assert!(!setup_status_is_complete(
             ThreadStatus::WaitingForUserAnswer
         ));
-        // The settled statuses → done (button flips to Open).
         assert!(setup_status_is_complete(ThreadStatus::Idle));
         assert!(setup_status_is_complete(ThreadStatus::Failed));
     }
@@ -929,11 +814,6 @@ mod tests {
         }
     }
 
-    /// Regression guard: `mark_setup_complete` must read the lifecycle column
-    /// (`status`), not the compose-state column (`state`). A running setup
-    /// thread must keep the card on "Setup"; once it settles, "Open". Reading
-    /// the wrong column made `setup_complete` always true (the `state` column
-    /// holds `active`, never `running`), so the "Setup" button never showed.
     #[tokio::test]
     async fn mark_setup_complete_reads_status_not_state() {
         let (pool, db_name) = setup_test_db().await;
@@ -944,7 +824,6 @@ mod tests {
             .await
             .expect("seed thread row");
 
-        // Running setup thread → not complete (card shows "Setup").
         sqlx::query("UPDATE thread_summaries SET status = 'running' WHERE thread_id = $1")
             .bind(tid)
             .execute(&pool)
@@ -957,7 +836,6 @@ mod tests {
             "a running setup thread must leave setup_complete=false"
         );
 
-        // Settled (idle) → complete (card shows "Open").
         sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE thread_id = $1")
             .bind(tid)
             .execute(&pool)
@@ -975,23 +853,16 @@ mod tests {
 
     #[test]
     fn resolve_setup_complete_present_pending_gone() {
-        // Present → lifecycle status decides.
         assert!(!resolve_setup_complete(Some(ThreadStatus::Running), false));
         assert!(!resolve_setup_complete(
             Some(ThreadStatus::WaitingForUserAnswer),
             false
         ));
         assert!(resolve_setup_complete(Some(ThreadStatus::Idle), false));
-        // Absent but queued → still pending (card keeps Setup, no flicker).
         assert!(!resolve_setup_complete(None, true));
-        // Absent and not queued → gone → complete (card falls through to Open).
         assert!(resolve_setup_complete(None, false));
     }
 
-    /// A setup thread that is *gone* — no `thread_summaries` row and no live
-    /// `thread_queue` entry (lost spawn, deleted thread, or a stale catalog id)
-    /// — must resolve to complete so the card falls through to "Open" instead
-    /// of a "Setup" button that 404s on click.
     #[tokio::test]
     async fn mark_setup_complete_gone_thread_falls_through_to_open() {
         let (pool, db_name) = setup_test_db().await;
@@ -1004,9 +875,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A setup thread spawned but not yet materialized (a live `thread_queue`
-    /// entry, no `thread_summaries` row) is genuinely pending — keep the card on
-    /// "Setup" through the post-spawn lag.
     #[tokio::test]
     async fn mark_setup_complete_queued_thread_stays_incomplete() {
         let (pool, db_name) = setup_test_db().await;
@@ -1047,6 +915,23 @@ mod tests {
         tokio::fs::write(&not_a_directory, b"file").await.unwrap();
         super::prune_uploads_older_than(&not_a_directory, std::time::Duration::ZERO).await;
         assert!(not_a_directory.exists());
+    }
+
+    #[test]
+    fn plugin_hooks_confirm_requires_an_attested_owner_outside_an_app_document() {
+        use crate::api::gateway_stamp::test_support::stamped_device_headers;
+        assert!(!super::owner_confirms_hooks(&super::HeaderMap::new()));
+        let mut owner = stamped_device_headers("owner");
+        assert!(super::owner_confirms_hooks(&owner));
+        owner.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(!super::owner_confirms_hooks(&owner));
+        owner.insert("referer", "https://example.test/dev/".parse().unwrap());
+        assert!(super::owner_confirms_hooks(&owner));
+        owner.insert(
+            "referer",
+            "https://example.test/dev/app/tool/".parse().unwrap(),
+        );
+        assert!(!super::owner_confirms_hooks(&owner));
     }
 
     #[test]
@@ -1139,6 +1024,7 @@ mod tests {
                 gone(),
                 super::Query(super::ConfirmInstallQuery {
                     keep_local_changes: true,
+                    confirm_hooks: false,
                 }),
             )
             .await

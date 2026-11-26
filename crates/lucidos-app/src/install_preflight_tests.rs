@@ -1,9 +1,3 @@
-//! What the client warns about, and how often.
-//!
-//! The two rules under test are the ones a user feels. Coexistence must be
-//! silent, or a developer running source beside the app is nagged on every
-//! launch. And a real conflict must be said once, not once per launch.
-
 use super::*;
 use lucidos_installs::{Install, InstallKind, Inventory, PortConflict};
 
@@ -24,7 +18,6 @@ fn install(kind: InstallKind, name: &str, version: Option<&str>, port: u16) -> I
     }
 }
 
-/// The trap: a current app and an ancient installer instance, both on 5252.
 fn contended() -> Inventory {
     Inventory {
         installs: vec![
@@ -43,7 +36,6 @@ fn contended() -> Inventory {
     }
 }
 
-/// The maintainer's setup: two installs, two ports, nothing to say.
 fn coexisting() -> Inventory {
     Inventory {
         installs: vec![
@@ -92,7 +84,6 @@ fn a_contended_port_names_both_installs_and_their_versions() {
 
 #[test]
 fn the_notice_names_the_version_actually_answering() {
-    // The whole incident in one sentence: a current app, an ancient engine.
     let notice = conflict_notice(&contended(), 5252, Some("0.26.2"), "0.36.0").unwrap();
 
     assert!(
@@ -107,8 +98,6 @@ fn the_notice_names_the_version_actually_answering() {
 
 #[test]
 fn a_matching_release_leaves_the_live_version_unsaid() {
-    // A conflict can exist while OUR gateway happens to hold the port. Say the
-    // installs contend, and claim nothing about a mismatch that is not there.
     let notice = conflict_notice(&contended(), 5252, Some("0.36.0"), "0.36.0").unwrap();
 
     assert!(!notice.body.contains("is answered by"));
@@ -136,7 +125,6 @@ fn the_notice_is_said_once_per_machine_state() {
         "the same conflict is not worth a second dialog"
     );
 
-    // The machine changes: a third install joins the contention.
     let mut grown = contended();
     grown.conflicts[0].installs.push("a third".to_string());
     let second = conflict_notice(&grown, 5252, None, "0.36.0").unwrap();
@@ -161,8 +149,6 @@ fn parse_release_tolerates_a_gateway_that_carries_no_version() {
         parse_release(r#"{"release":"9.2.0-rc.10"}"#).as_deref(),
         Some("9.2.0-rc.10")
     );
-    // An older gateway, a non-JSON body, and a blank field all mean "unknown",
-    // which the notice renders by saying nothing rather than by guessing.
     assert_eq!(parse_release(r#"{"status":"ok"}"#), None);
     assert_eq!(parse_release(r#"{"release":"  "}"#), None);
     assert_eq!(parse_release("<!DOCTYPE html>"), None);

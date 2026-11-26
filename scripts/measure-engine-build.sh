@@ -9,7 +9,7 @@
 #                                   [--out <dir>] [--compare <results.tsv> --match-jobs]
 #                                   [--only "<step> ..."] [--fix-commit <rev>]
 #                                   [--probe-set agents|core|stack] [--sample-host-rss]
-#                                   [--per-crate] [--jobs-share N]
+#                                   [--per-crate] [--jobs-share N] [--record-lab]
 #
 #   --cold       Also time cold builds in a fresh temporary target dir.
 #   --packages   The engine packages to build and test. Default: lucidos-engine.
@@ -29,6 +29,7 @@
 #   --per-crate         Write per-workspace-target wall time and RSS TSVs.
 #   --jobs-share        Run with N Cargo jobs, within the build slot.
 #   --sample-host-rss   Sample total rustc and clippy-driver RSS twice a second.
+#   --record-lab        Run three passes and record one workspace result per step.
 #
 # Each probe inserts one private function into a file, then times an
 # incremental build, test build and `make lint`'s clippy pair. Probe files must
@@ -65,9 +66,12 @@ PROBE_SET=""
 SAMPLE_HOST_RSS=0
 PER_CRATE=0
 JOBS_SHARE=""
+RECORD_LAB=0
+BENCHMARK_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --cold) COLD=1; shift ;;
+        --record-lab) RECORD_LAB=1; shift ;;
         --packages) PACKAGES="${2:?--packages needs a value}"; shift 2 ;;
         --out) OUT_DIR="${2:?--out needs a value}"; shift 2 ;;
         --compare) COMPARE="${2:?--compare needs a value}"; shift 2 ;;
@@ -144,8 +148,6 @@ if [ "$MATCH_JOBS" -eq 1 ] && [ -z "$COMPARE" ]; then
     echo "--match-jobs requires --compare" >&2
     exit 2
 fi
-: > "$RESULTS"
-
 if [ -z "$PACKAGES" ]; then
     if [ "$PROBE_SET" = stack ]; then
         # The tier map is introduced with the stack guardrails.
@@ -160,6 +162,28 @@ if [ -z "$PACKAGES" ]; then
 fi
 PKG_ARGS=()
 for pkg in $PACKAGES; do PKG_ARGS+=(-p "$pkg"); done
+if [ "$RECORD_LAB" -eq 1 ]; then
+    # shellcheck source=scripts/lib/lab_slot.sh
+    source "$SCRIPT_DIR/lib/lab_slot.sh" || exit 1
+    if [ -z "${LAB_BUILD_PASS:-}" ]; then
+        LAB_KIND=build
+        LAB_TOOLCHAIN="$(rustc --version)" || exit 1
+        LAB_RUN="$(node -p 'require("node:crypto").randomUUID()')" || exit 1
+        export LAB_KIND LAB_TOOLCHAIN LAB_RUN
+        export LAB_OUT="$OUT_DIR"
+        passes=()
+        sample_count="$(node "$SCRIPT_DIR/scoreboard/lab-cli.mjs" sample-count)" || exit 1
+        for ((sample = 1; sample <= sample_count; sample++)); do
+            pass="$OUT_DIR/sample-$sample"
+            LAB_BUILD_PASS="$sample" "$SCRIPT_DIR/measure-engine-build.sh" "${BENCHMARK_ARGS[@]}" --out "$pass" || exit $?
+            passes+=("$pass/results.tsv")
+        done
+        node "$SCRIPT_DIR/scoreboard/lab-cli.mjs" record "$LAB_KIND" "$LAB_TOOLCHAIN" "$LAB_RUN" "$PACKAGES" "${passes[@]}"
+        exit $?
+    fi
+fi
+
+: > "$RESULTS" || exit 1
 BUILD_ARGS=("${PKG_ARGS[@]}")
 TEST_ARGS=(--lib)
 if [ "$PROBE_SET" = stack ]; then
@@ -266,8 +290,12 @@ step() { # <name> <command...>
     # package). Without it the step still records wall time, and RSS reads `?`.
     local rss_timer=(env LC_ALL=C /usr/bin/time "$time_flag")
     [ -x /usr/bin/time ] || rss_timer=(env LC_ALL=C)
+    local runner=("$SCRIPT_DIR/with-build-slot.sh" --label "measure-engine-build: $name" --)
+    if [ "$RECORD_LAB" -eq 1 ]; then
+        runner=(lab_step "build lab: $name")
+    fi
     # shellcheck disable=SC2016
-    "$SCRIPT_DIR/with-build-slot.sh" --label "measure-engine-build: $name" -- \
+    "${runner[@]}" \
         bash -c '
             if [ "$1" -eq 1 ]; then
                 sample_host_rss > "$2" &
@@ -289,7 +317,11 @@ step() { # <name> <command...>
     local secs
     secs="$(grep '^MEASURE_SECONDS ' "$log" | tail -1 | awk '{print $2}')"
     if [ "$rc" -ne 0 ]; then
-        echo "measure-engine-build.sh: step $name failed (exit $rc), see $log" >&2
+        if [ "$RECORD_LAB" -eq 1 ] && [ "$rc" -eq 75 ]; then
+            echo "Build lab deferred before $name. See $log" >&2
+        else
+            echo "measure-engine-build.sh: step $name failed (exit $rc), see $log" >&2
+        fi
         exit "$rc"
     fi
     [ -f "$report" ] && cp "$report" "$OUT_DIR/$name.timing.html"
@@ -305,7 +337,9 @@ step() { # <name> <command...>
     if [ "$SAMPLE_HOST_RSS" -eq 1 ]; then
         host_rss="$(awk '$1 > peak { peak = $1 } END { print peak + 0 }' "$OUT_DIR/$name.rss")"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$secs" "${cores:-?}" "${rss:-?}" "$host_rss" >> "$RESULTS"
+    if [[ "$name" != prepare_* ]]; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$secs" "${cores:-?}" "${rss:-?}" "$host_rss" >> "$RESULTS"
+    fi
     printf '%-34s %8ss  %3s cores  %s KiB peak RSS  %s KiB host RSS\n' \
         "$name" "$secs" "${cores:-?}" "${rss:-?}" "$host_rss"
 }
@@ -313,6 +347,12 @@ step() { # <name> <command...>
 run_build() { step "$1" cargo build --locked "${BUILD_ARGS[@]}" --timings; }
 run_test() { step "$1" cargo test --locked "${PKG_ARGS[@]}" "${TEST_ARGS[@]+"${TEST_ARGS[@]}"}" --no-run --timings; }
 run_clippy() { step "$1" make --no-print-directory lint-rust-clippy; }
+
+prepare_warm() {
+    local mode="$1" name="warm_$1"
+    if [ "$RECORD_LAB" -eq 1 ]; then name="prepare_$name"; fi
+    run_"$mode" "$name"
+}
 
 echo "packages: $PACKAGES"
 echo "results:  $RESULTS"
@@ -343,7 +383,7 @@ run_stack_probes() {
         warmed=1
     fi
     if [ "$mode" = build ] && selected noop_build; then
-        [ "$warmed" -eq 1 ] || run_build warm_build
+        [ "$warmed" -eq 1 ] || prepare_warm build
         run_build noop_build
         warmed=1
     fi
@@ -351,7 +391,7 @@ run_stack_probes() {
         name="edit_$(probe_name "$file")_$mode"
         if selected "$name"; then
             if [ "$warmed" -eq 0 ]; then
-                run_"$mode" "warm_$mode"
+                prepare_warm "$mode"
                 warmed=1
             fi
             probe "$file" || exit 1
@@ -372,7 +412,10 @@ else
     if selected warm_build; then run_build warm_build; fi
     if selected warm_test; then run_test warm_test; fi
     if selected warm_clippy; then run_clippy warm_clippy; fi
-    if selected noop_build; then run_build noop_build; fi
+    if selected noop_build; then
+        if [ "$RECORD_LAB" -eq 1 ] && ! selected warm_build; then prepare_warm build; fi
+        run_build noop_build
+    fi
     for file in "${PROBE_FILES[@]}"; do
         module="$(probe_name "$file")"
         for mode in build test clippy; do

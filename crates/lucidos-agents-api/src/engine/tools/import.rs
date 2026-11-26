@@ -7,11 +7,6 @@ use chrono::Utc;
 use std::path::Path;
 use std::time::Duration;
 
-/// Standard refusal text when `git_clone` is called without a destination, or
-/// with one that lacks a recognized prefix. Per best-practices rule 8, the
-/// agent must pick a route explicitly — there is no default and no fallback.
-/// Lives next to the route enum so the wire message can't drift from the
-/// tool description in `llm/tools/misc.rs`.
 const GIT_CLONE_DESTINATION_REQUIRED: &str =
     "Error: destination is required and must start with one of two prefixes — \
      '.lucidos/tmp/<name>/' (ephemeral, gitignored, the default per best-practices \
@@ -23,20 +18,13 @@ const GIT_CLONE_DESTINATION_REQUIRED: &str =
      but not in the workspace, use `lucidos data-store add <name> <source-dir>` \
      to move into ~/.lucidos/data/<name>/.";
 
-/// How long one `git_clone` call may spend fetching before it gives up.
 const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Where a `git_clone` invocation should land. Decided by parsing the
-/// LLM-provided `destination` parameter. Variants carry the resolved
-/// subdirectory name so the dispatch site doesn't need a second match.
 enum GitCloneRoute {
     Artifacts(String),
     Tmp(String),
 }
 
-// Inner recursive helper: every parameter is per-recursion-frame state
-// (filters + four mutable counters); flattening into a struct would just
-// wrap the same set without simplifying the call sites below.
 #[allow(clippy::too_many_arguments)]
 fn walk_dir(
     dir: &Path,
@@ -51,9 +39,6 @@ fn walk_dir(
     skipped_count: &mut usize,
     total_bytes: &mut u64,
 ) -> Result<(), String> {
-    // Bail mid-walk once the bulk threshold trips so a 1 GB clone
-    // doesn't read 1 GB of UTF-8 into memory before the outer site
-    // refuses. The outer site re-checks the same predicate.
     if *imported_count > MAX_BULK_FILE_COUNT || *total_bytes > MAX_BULK_BYTES {
         return Ok(());
     }
@@ -80,8 +65,6 @@ fn walk_dir(
             if let Some(ext) = pattern.strip_prefix("*.") {
                 return path.extension().is_some_and(|e| e.to_string_lossy() == ext);
             }
-            // A whole path component only: `.git/**` must not swallow
-            // `.github/`, and `build/**` must not swallow `build.rs`.
             let dir = pattern.trim_end_matches("/**");
             relative_str == dir || relative_str.starts_with(&format!("{dir}/"))
         });
@@ -136,9 +119,6 @@ fn walk_dir(
             let dest_path = format!("{}/{}", dest_base, relative_str);
 
             if is_binary {
-                // Binary files aren't imported here: write_batch_and_commit
-                // is text-only and committing arbitrary binaries by default
-                // would bloat the repo.
                 *skipped_count += 1;
             } else {
                 match std::fs::read_to_string(&path) {
@@ -149,7 +129,6 @@ fn walk_dir(
                         *imported_count += 1;
                     }
                     Err(_) => {
-                        // Not valid UTF-8, same reason as binary above.
                         *skipped_count += 1;
                     }
                 }
@@ -159,8 +138,6 @@ fn walk_dir(
     Ok(())
 }
 
-/// Where `import_file` writes, under `data/artifacts/`: always in `imported/`,
-/// whether the destination names that folder, its data path, or neither.
 fn import_destination(destination: Option<&str>, filename: &str) -> String {
     let path = destination.map_or(filename, crate::core::artifact_relative_path);
     format!("imported/{}", path.trim_start_matches("imported/"))
@@ -168,8 +145,6 @@ fn import_destination(destination: Option<&str>, filename: &str) -> String {
 
 #[easy_ext::ext(ImportExt)]
 pub(crate) impl LucidosEngine {
-    /// `thread_id` anchors the capture for the summary call an `import_file`
-    /// makes. The tool dispatcher holds it, so that spend has a home.
     async fn execute_import_tool(
         &self,
         name: &str,
@@ -193,7 +168,6 @@ pub(crate) impl LucidosEngine {
                 let source = &std::path::absolute(source)?;
                 crate::runtime::agent_sandbox::private_file_check(self.workspace_path())(source)?;
 
-                // Validate source exists and is a file
                 if !source.exists() {
                     return Ok(format!("Error: File not found: {}", source_path));
                 }
@@ -211,7 +185,6 @@ pub(crate) impl LucidosEngine {
                     }
                 }
 
-                // Determine destination path
                 let filename = source
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -237,7 +210,6 @@ pub(crate) impl LucidosEngine {
                     Err(e) => return Ok(format!("Error: {}", e)),
                 };
 
-                // Check if file is binary by extension
                 let extension = source
                     .extension()
                     .and_then(|e| e.to_str())
@@ -246,7 +218,6 @@ pub(crate) impl LucidosEngine {
                 let is_binary = crate::core::is_binary_extension(&extension);
 
                 let (summary, _file_size, commit_sha) = if is_binary {
-                    // Other binary file: copy as bytes
                     let bytes = match std::fs::read(source) {
                         Ok(b) => b,
                         Err(e) => return Ok(format!("Error: Failed to read file: {}", e)),
@@ -264,15 +235,12 @@ pub(crate) impl LucidosEngine {
                         )
                         .await?;
 
-                    // Metadata-only summary for binary files
                     let summary = format!("{} file ({} bytes)", extension.to_uppercase(), size);
                     (Some(summary), size, main_commit)
                 } else {
-                    // Text file: read as string
                     let content = match std::fs::read_to_string(source) {
                         Ok(c) => c,
                         Err(e) => {
-                            // Fallback: try as binary if text read fails
                             let bytes = match std::fs::read(source) {
                                 Ok(b) => b,
                                 Err(e2) => {
@@ -325,7 +293,6 @@ pub(crate) impl LucidosEngine {
                         .await?;
                     drop(held);
 
-                    // Generate summary for text files
                     let summary = self
                         .summarize_artifact(&dest_relative, &content, thread_id)
                         .await;
@@ -356,7 +323,6 @@ pub(crate) impl LucidosEngine {
                     return Ok("Error: url is required".to_string());
                 }
 
-                // libgit2 opens local clone sources inside the engine.
                 let local_source = if crate::core::git_auth::is_local_url(url) {
                     let (_, source) = url.split_once("://").expect("a file URL has a scheme");
                     let source = if source.starts_with("localhost/") {
@@ -412,9 +378,6 @@ pub(crate) impl LucidosEngine {
                     );
                 }
 
-                // Per best-practices rule 8, the agent must explicitly pick the
-                // route — bare names are rejected so we never silently land a
-                // clone under `data/artifacts/`.
                 let dest_route = if let Some(sub) = raw_destination
                     .strip_prefix(crate::core::TMP_DIR)
                     .and_then(|rest| rest.strip_prefix('/'))
@@ -458,8 +421,6 @@ pub(crate) impl LucidosEngine {
                     })
                     .unwrap_or_default();
 
-                // Both routes below clone the same URL, so this resolves its
-                // credentials once, out here.
                 let credentials =
                     crate::core::git_auth::GitCredentials::resolve_one(&self.pool, url).await;
 
@@ -491,7 +452,6 @@ pub(crate) impl LucidosEngine {
                         )
                         .await
                         {
-                            // `e` already names the clone and the fix.
                             return Ok(format!("Error: {}", e));
                         }
                         return Ok(format!(
@@ -503,8 +463,6 @@ pub(crate) impl LucidosEngine {
                     GitCloneRoute::Artifacts(sub) => sub,
                 };
 
-                // An owner-only scratch directory, removed with the clone on
-                // every return.
                 let scratch = match tempfile::Builder::new().prefix("lucidos-clone-").tempdir() {
                     Ok(dir) => dir,
                     Err(e) => return Ok(format!("Error: cannot create a clone directory: {e}")),
@@ -521,11 +479,9 @@ pub(crate) impl LucidosEngine {
                 )
                 .await
                 {
-                    // `e` already names the clone and the fix.
                     return Ok(format!("Error: {}", e));
                 }
 
-                // Default exclusions
                 let default_excludes = [
                     ".git",
                     ".git/**",
@@ -542,7 +498,6 @@ pub(crate) impl LucidosEngine {
                     "vendor/**",
                 ];
 
-                // Walk the cloned repo and import files
                 let mut imported_count = 0;
                 let mut skipped_count = 0;
                 let mut imported_files: Vec<String> = Vec::new();
@@ -582,7 +537,6 @@ pub(crate) impl LucidosEngine {
                     ));
                 }
 
-                // Write all files and commit in one operation
                 let commit_msg = format!("Import {} files from {}", imported_count, shown_url);
                 let commit_sha = self
                     .artifact_manager
@@ -593,7 +547,6 @@ pub(crate) impl LucidosEngine {
                     )
                     .await?;
 
-                // Emit event for the batch import
                 self.event_bus
                     .emit(BusEvent::System(SystemEvent::RepositoryImported {
                         url: shown_url.clone(),
@@ -606,7 +559,6 @@ pub(crate) impl LucidosEngine {
                     }))
                     .await?;
 
-                // Index in memory
                 let summary = format!(
                     "Repository {} cloned: {} files imported to artifacts/{}",
                     repo_name, imported_count, dest_base
@@ -632,18 +584,12 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Import a file into the artifact store (write + git commit + event), for
-    /// the upload API.
-    /// Returns `(result_message, commit_sha, resolved_dest_relative)` — the
-    /// resolved path can differ from the requested one when a Finder-style
-    /// auto-suffix was applied to avoid overwriting an existing artifact.
     async fn import_file_from_path(
         &self,
         source: &std::path::Path,
         dest_relative: &str,
         writer: crate::engine::event_bus::ArtifactWriter,
     ) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
-        // Check file exists
         if !source.exists() {
             return Err(format!("File not found: {:?}", source).into());
         }
@@ -656,7 +602,6 @@ pub(crate) impl LucidosEngine {
             .artifact_manager
             .resolve_collision_free_path(dest_relative)?;
 
-        // Determine if binary by extension
         let extension = source
             .extension()
             .and_then(|e| e.to_str())
@@ -664,7 +609,6 @@ pub(crate) impl LucidosEngine {
             .to_lowercase();
         let is_binary = crate::core::is_binary_extension(&extension);
 
-        // Phase 1: Write file to artifact store + git commit (synchronous)
         let commit_sha = if is_binary {
             let bytes = std::fs::read(source)?;
             self.artifact_manager
@@ -700,7 +644,6 @@ pub(crate) impl LucidosEngine {
                 source_detail: source.to_string_lossy().to_string(),
                 commit_hash: commit_sha.clone(),
                 summary: None,
-                // An upload from the UI, which no thread's turn made.
                 writer_thread_id: None,
                 writer: Some(writer),
             }))
@@ -736,9 +679,6 @@ mod tests {
         assert_eq!(import_destination(None, "x.pdf"), "imported/x.pdf");
     }
 
-    /// Regression: `git_clone` wrote the raw URL, `user:token@` included, to
-    /// the log, the tool result, the workspace commit message and the
-    /// `RepositoryImported` event. Only the clone itself may see it now.
     #[test]
     fn git_clone_hands_the_raw_url_only_to_the_clone() {
         let src = include_str!("import.rs");
@@ -768,9 +708,6 @@ mod tests {
         );
     }
 
-    /// `walk_dir` was a nested `fn` inside `git_clone`'s match arm, which is why
-    /// the bug below shipped untested. It is lifted to module level (a pure move,
-    /// it captured nothing) so the recursion can be exercised directly.
     fn walk(root: &Path, include: &[String], exclude: &[String]) -> (Vec<String>, usize) {
         let mut collected = Vec::new();
         let mut imported_files = Vec::new();
@@ -793,9 +730,6 @@ mod tests {
         (imported_files, skipped)
     }
 
-    /// A `dir/**` default exclude used to match by raw string prefix, so
-    /// `.git/**` silently dropped `.github/` and `.gitignore`, and `build/**`
-    /// dropped `build.rs`.
     #[test]
     fn a_dir_default_exclude_skips_only_that_directory() {
         let d = tempfile::tempdir().unwrap();
@@ -843,14 +777,6 @@ mod tests {
         d
     }
 
-    /// Regression: `include_patterns` was matched against DIRECTORY entries and a
-    /// non-match `continue`d BEFORE the `path.is_dir()` recursion, so a non-empty
-    /// include list pruned whole subtrees. `Pattern::new("src/**/*.rs")` does not
-    /// match the bare directory `src`, so the tool schema's own example
-    /// `['*.py', 'src/**/*.rs']` reached only TOP-LEVEL matches: on the tree
-    /// below it returned `["top.py"]` and lost both nested `.rs` files, and on a
-    /// repo whose every match is nested (the ordinary shape for that example) it
-    /// imported nothing at all.
     #[test]
     fn include_patterns_select_files_without_pruning_the_directories_holding_them() {
         let d = tree();
@@ -867,9 +793,6 @@ mod tests {
         );
     }
 
-    /// The other half of the contract: pruning a subtree is `exclude_patterns`'
-    /// job, and lifting the directory check out of the include gate must not have
-    /// disturbed it.
     #[test]
     fn exclude_patterns_still_prune_a_subtree() {
         let d = tree();
@@ -900,8 +823,6 @@ mod tests {
         assert_eq!(skipped, 2, "both links are skipped");
     }
 
-    /// Hold the repo lock, start an import, then take the destination name
-    /// while the import waits. A path resolved before the lock would be stale.
     #[tokio::test]
     async fn import_file_from_path_resolves_its_destination_under_the_repo_lock() {
         use crate::test_support::{
@@ -1003,8 +924,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// An empty include list imports everything, the pre-existing behaviour that
-    /// masked the bug (the buggy gate was a no-op when `is_included` was always true).
     #[test]
     fn an_empty_include_list_imports_the_whole_tree() {
         let d = tree();

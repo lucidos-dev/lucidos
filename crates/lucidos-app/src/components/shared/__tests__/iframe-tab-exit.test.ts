@@ -20,9 +20,9 @@ describe('onIframeTabExitFocus', () => {
     return { frame: document.querySelector('iframe')!, stop: q('stop')!, first: q('first')!, next: q('next') };
   }
 
-  it('hands a Tab out of the frame to the next control in the pane', () => {
-    const { stop, next } = pane();
-    onIframeTabExitFocus({ currentTarget: stop, relatedTarget: null });
+  it.each(['missing', 'the frame'] as const)('hands a Tab out when the related target is %s', (target) => {
+    const { frame, stop, next } = pane();
+    onIframeTabExitFocus({ currentTarget: stop, relatedTarget: target === 'missing' ? null : frame });
     expect(document.activeElement).toBe(next);
   });
 

@@ -1,23 +1,12 @@
-//! An OTLP logs export request (`ExportLogsServiceRequest`), in either OTLP/HTTP
-//! encoding.
-//!
-//! Protobuf is written by hand over the closed subset a batch uses: one
-//! resource, one scope, and log records whose values are all strings. That
-//! keeps a protobuf code generator out of the build. The field numbers are
-//! those of `opentelemetry/proto/logs/v1/logs.proto` and its imports.
-
 use serde_json::{json, Value};
 
 use super::record::LogRecord;
 use super::switch::Protocol;
 
-/// `service.name` on the resource.
 const SERVICE_NAME: &str = "lucidos";
 
-/// The instrumentation scope every record is emitted under.
 const SCOPE_NAME: &str = "lucidos.gateway-telemetry";
 
-/// `SEVERITY_NUMBER_INFO`.
 const SEVERITY_INFO: u64 = 9;
 
 const SEVERITY_TEXT: &str = "INFO";
@@ -26,8 +15,6 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// The request carrying `records`, encoded for `protocol`. `observed_unix_nano`
-/// is when the exporter picked them up.
 pub(crate) fn encode(
     protocol: Protocol,
     records: &[LogRecord],
@@ -39,7 +26,7 @@ pub(crate) fn encode(
     }
 }
 
-/// The OTLP JSON mapping: camelCase field names, 64-bit integers as decimal
+/// INVARIANT: The OTLP JSON mapping: camelCase field names, 64-bit integers as decimal
 /// strings, and enums as numbers.
 fn json_body(records: &[LogRecord], observed_unix_nano: u64) -> Vec<u8> {
     let string_attributes = |pairs: &[(&str, String)]| -> Value {
@@ -82,7 +69,6 @@ fn resource_attributes() -> [(&'static str, String); 4] {
     ]
 }
 
-/// The OpenTelemetry `os.type` for a Rust target OS, as Claude Code reports it.
 fn os_type(os: &str) -> &str {
     match os {
         "macos" => "darwin",
@@ -90,7 +76,6 @@ fn os_type(os: &str) -> &str {
     }
 }
 
-/// The OpenTelemetry `host.arch` for a Rust target architecture.
 fn host_arch(arch: &str) -> &str {
     match arch {
         "x86_64" => "amd64",
@@ -99,7 +84,6 @@ fn host_arch(arch: &str) -> &str {
     }
 }
 
-/// Protobuf wire types.
 const VARINT: u8 = 0;
 const FIXED64: u8 = 1;
 const LEN: u8 = 2;
@@ -129,7 +113,6 @@ fn protobuf(records: &[LogRecord], observed_unix_nano: u64) -> Vec<u8> {
     request
 }
 
-/// A `LogRecord`.
 fn log_record(record: &LogRecord, observed_unix_nano: u64) -> Vec<u8> {
     let mut out = Vec::new();
     put_fixed64(&mut out, 1, record.time_unix_nano);
@@ -143,7 +126,6 @@ fn log_record(record: &LogRecord, observed_unix_nano: u64) -> Vec<u8> {
     out
 }
 
-/// A `KeyValue` holding a string.
 fn key_value(key: &str, value: &str) -> Vec<u8> {
     let mut out = Vec::new();
     put_bytes(&mut out, 1, key.as_bytes());
@@ -151,7 +133,6 @@ fn key_value(key: &str, value: &str) -> Vec<u8> {
     out
 }
 
-/// An `AnyValue` holding a string.
 fn string_value(value: &str) -> Vec<u8> {
     let mut out = Vec::new();
     put_bytes(&mut out, 1, value.as_bytes());
@@ -196,7 +177,6 @@ pub(crate) mod tests {
     use super::super::record::{log_record, Identity};
     use super::*;
 
-    /// One decoded protobuf field.
     #[derive(Debug, Clone, PartialEq)]
     pub(crate) enum Field {
         Varint(u64),
@@ -204,8 +184,6 @@ pub(crate) mod tests {
         Bytes(Vec<u8>),
     }
 
-    /// Decode one protobuf message into `(field number, value)` pairs,
-    /// refusing anything malformed. Enough to check field numbers.
     pub(crate) fn decode(mut bytes: &[u8]) -> Vec<(u64, Field)> {
         fn varint(bytes: &mut &[u8]) -> u64 {
             let mut value = 0u64;
@@ -257,7 +235,6 @@ pub(crate) mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    /// The `(key, string value)` pairs of repeated `KeyValue` field `number`.
     pub(crate) fn string_pairs(fields: &[(u64, Field)], number: u64) -> Vec<(String, String)> {
         bytes_of(fields, number)
             .iter()
@@ -269,7 +246,6 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// The log records of a protobuf request, each as its decoded fields.
     pub(crate) fn protobuf_records(body: &[u8]) -> Vec<Vec<(u64, Field)>> {
         let request = decode(body);
         let resource_logs = decode(&bytes_of(&request, 1)[0]);
@@ -299,7 +275,6 @@ pub(crate) mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect::<Vec<_>>()
         );
-        // The OpenTelemetry semantic-convention keys, pinned as a wire contract.
         let keys: Vec<String> = string_pairs(&resource, 1)
             .into_iter()
             .map(|(k, _)| k)
@@ -360,7 +335,6 @@ pub(crate) mod tests {
         assert_eq!(scope_logs["logRecords"].as_array().unwrap().len(), 2);
     }
 
-    /// Claude Code's names, so a collector groups both clients' hosts alike.
     #[test]
     fn the_host_is_named_in_opentelemetry_terms() {
         assert_eq!(os_type("macos"), "darwin");

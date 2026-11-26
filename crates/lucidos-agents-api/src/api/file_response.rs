@@ -1,4 +1,4 @@
-//! Serve a file over HTTP with cache validators and byte-range support.
+//! INVARIANT: Serve a file over HTTP with cache validators and byte-range support.
 //!
 //! `serve_file` answers `GET /api/v1/data/*path`, app files and plugin media.
 //! Those range from a 2 KB app icon to an 80 MB video artifact. Three
@@ -21,20 +21,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-/// What a `Range` header asks for, once resolved against the file's length.
 #[derive(Debug, PartialEq, Eq)]
 enum RangeOutcome {
-    /// No range, an unparseable one, or more than one spec. RFC 9110 lets a
-    /// server answer any range request with the full body, and multi-range would
-    /// otherwise mean multipart/byteranges.
     Full,
-    /// Inclusive byte offsets, both within the file.
     Slice { start: u64, end: u64 },
-    /// Syntactically valid, but no byte of it exists. Answers 416.
     Unsatisfiable,
 }
 
-/// Serve `path` as `content_type`, honouring the conditional and range headers
+/// INVARIANT: Serve `path` as `content_type`, honouring the conditional and range headers
 /// in `request_headers`.
 ///
 /// Always emits `Accept-Ranges: bytes`. Note that the compression layer strips
@@ -45,7 +39,7 @@ pub(super) async fn serve_file(
     content_type: &'static str,
     request_headers: &HeaderMap,
 ) -> Response {
-    // Open first, then stat the open handle, and stream that same handle. A
+    // INVARIANT: Open first, then stat the open handle, and stream that same handle. A
     // path-based stat would describe a different file from the one we send the
     // moment an artifact is rebuilt mid-request: the headers would carry the old
     // length and ETag over the new bytes. Rebuilding an artifact is exactly the
@@ -61,8 +55,6 @@ pub(super) async fn serve_file(
         Ok(meta) => meta,
         Err(e) => return read_failed(e),
     };
-    // A directory opens fine where the old `fs::read` failed. Without this it
-    // would answer 200 with a Content-Length and an empty body.
     if !meta.is_file() {
         return (StatusCode::NOT_FOUND, "File not found").into_response();
     }
@@ -93,8 +85,6 @@ pub(super) async fn serve_file(
         }
     }
 
-    // A stale `If-Range` degrades to the full body. Serving the requested slice
-    // of a file that has since changed would splice old and new bytes together.
     let range_is_fresh = match header_str(request_headers, header::IF_RANGE) {
         None => true,
         Some(v) => {
@@ -112,7 +102,6 @@ pub(super) async fn serve_file(
     match outcome {
         RangeOutcome::Unsatisfiable => {
             let mut headers = base;
-            // No payload, so the file's own type would be a lie.
             headers.remove(header::CONTENT_TYPE);
             if let Ok(v) = HeaderValue::from_str(&format!("bytes */{}", len)) {
                 headers.insert(header::CONTENT_RANGE, v);
@@ -141,22 +130,9 @@ pub(super) async fn serve_file(
     }
 }
 
-/// The CSP a served workspace document runs under: scripts yes, the workspace
-/// origin no.
-///
-/// `allow-same-origin` is absent, and that is the whole point. The file came
-/// from an upload, an agent's web fetch or an app, so it must not run as the
-/// shell. It runs at an opaque origin, exactly like the artifact preview frame
-/// (ADR 0322). A popup it opens inherits the sandbox, since
-/// `allow-popups-to-escape-sandbox` is absent too.
 pub(super) const DOCUMENT_SANDBOX_CSP: &str =
     "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads";
 
-/// Is this a type a browser renders as a document that can run script?
-///
-/// HTML, and every XML flavour. An XML document runs a `<script>` in the XHTML
-/// namespace, and SVG is XML. An image tag never runs one, so an `<img>` of an
-/// SVG is unaffected by the header either way.
 pub(super) fn is_active_document(content_type: &str) -> bool {
     let essence = content_type
         .split(';')
@@ -170,7 +146,7 @@ pub(super) fn is_active_document(content_type: &str) -> bool {
         || essence.ends_with("+xml")
 }
 
-/// Sandbox a workspace file response when it is an active document.
+/// INVARIANT: Sandbox a workspace file response when it is an active document.
 ///
 /// Every mount that serves `data/` files inline passes its response through
 /// here: `/data/*`, `GET /api/v1/data/*path` and `/app/:id/artifacts/*path`.
@@ -210,8 +186,6 @@ fn with_length(mut headers: HeaderMap, len: u64) -> HeaderMap {
     headers
 }
 
-/// Stream `count` bytes from `start`. `ReaderStream` reads in chunks, so an
-/// 80 MB artifact never lands in memory whole.
 async fn body_slice(
     mut file: tokio::fs::File,
     start: u64,
@@ -227,22 +201,16 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name)?.to_str().ok()
 }
 
-/// A strong validator built from length and mtime. Both change on a rebuild, so
-/// a same-size overwrite still produces a new tag.
 fn etag_for(len: u64, modified: &SystemTime) -> Option<String> {
     let nanos = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos();
     Some(format!("\"{}-{}\"", len, nanos))
 }
 
-/// IMF-fixdate, the only format RFC 9110 lets a server send. chrono's `%a` and
-/// `%b` are English regardless of locale, which is what the format requires.
 fn http_date(t: &SystemTime) -> String {
     let stamp: chrono::DateTime<chrono::Utc> = (*t).into();
     stamp.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-/// `If-None-Match` is a comma-separated list, or `*`. A cache may weaken a tag
-/// it stored, so compare past a `W/` prefix.
 pub(super) fn if_none_match_hits(header: &str, etag: &str) -> bool {
     let header = header.trim();
     if header == "*" {
@@ -268,8 +236,6 @@ fn resolve_range(header: Option<&str>, len: u64) -> RangeOutcome {
     };
     let (first, last) = (first.trim(), last.trim());
 
-    // `bytes=-N`: the last N bytes. N == 0 asks for nothing, which is a range no
-    // byte satisfies.
     if first.is_empty() {
         let Ok(suffix) = last.parse::<u64>() else {
             return RangeOutcome::Full;
@@ -289,8 +255,6 @@ fn resolve_range(header: Option<&str>, len: u64) -> RangeOutcome {
     if start >= len {
         return RangeOutcome::Unsatisfiable;
     }
-    // `bytes=N-` runs to the end. An explicit end past the last byte clamps
-    // rather than failing, per RFC 9110.
     let end = if last.is_empty() {
         len - 1
     } else {

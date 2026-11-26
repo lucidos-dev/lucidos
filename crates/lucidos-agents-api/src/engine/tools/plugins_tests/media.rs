@@ -1,5 +1,3 @@
-//! Plugin media through install, update and uninstall (ADR 0414).
-
 use super::helpers::*;
 use super::*;
 use crate::core::plugin_media::{self, installed_dir, listed_file, read_index};
@@ -33,8 +31,6 @@ fn huge() -> Vec<u8> {
     vec![0; plugin_media::MAX_SCREENSHOT_BYTES as usize + 1]
 }
 
-/// Invariants I8 and I9: media lands in its own copy, never in the file list
-/// or the install commit, and an oversize screenshot is dropped, not fatal.
 #[tokio::test]
 async fn install_keeps_media_outside_the_workspace_content() {
     let (_tmp, scratch) = fresh_workspace();
@@ -84,7 +80,6 @@ async fn install_keeps_media_outside_the_workspace_content() {
     );
 }
 
-/// Invariant I11: an update swaps the copy whole and uninstall deletes it.
 #[tokio::test]
 async fn update_replaces_media_and_uninstall_removes_it() {
     let (_tmp, scratch) = fresh_workspace();
@@ -121,17 +116,17 @@ async fn update_replaces_media_and_uninstall_removes_it() {
         plugin_id: "media-plugin".into(),
         plugin_version: "1.1.0".into(),
         plugin_name: "Media Plugin".into(),
+        hooks: Vec::new(),
         files_present: write.installed_files,
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, &[], None)
+    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, &[], None, vec![])
         .await
         .expect("uninstall");
     assert!(!copy.exists());
 }
 
-/// Invariant I10: installed media does not depend on the marketplace's cache.
 #[tokio::test]
 async fn installed_media_outlives_the_marketplace() {
     let (_tmp, scratch) = fresh_workspace();

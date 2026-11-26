@@ -1,13 +1,3 @@
-//! `lucidos ask-permission <action> --thread <id> --reason "<why>"`: ask the
-//! workspace owner for a *permission* to do one act outside this thread's own
-//! authority (ADR 0664).
-//!
-//! The engine records the request on the thread the origin token names, and
-//! words the card itself. A question card lives inside the turn that asks it.
-//! So the agent then asks its question tool with the printed id alone. The
-//! engine shows its own card in that question's place. The action list lives
-//! in the engine, which refuses an unknown or unaskable action.
-
 use std::time::Instant;
 
 use serde_json::json;
@@ -17,30 +7,22 @@ use crate::http::{
 };
 use crate::workspace::{BoxError, Workspace};
 
-/// The exit code for a call that waits on the owner's permission.
 pub(crate) const EXIT_NEEDS_PERMISSION: u8 = 2;
 
-/// What a call that may need the owner's permission came to.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Reply {
     Done(String),
     NeedsPermission(String),
-    /// The engine parked the act on a card in Lucidos. The owner's Allow once
-    /// runs it there, so the caller does not run it again.
     WaitingForOwner,
 }
 
-/// Read the answer to such a call. A refusal shows only the engine's `error`
-/// text, never the rest of the body.
 pub(crate) fn reply(method: &str, url: &str, status: u16, text: &str) -> Result<Reply, BoxError> {
     let body: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
     if status == 202 && body["reason"] == "waiting_for_owner" {
         return Ok(Reply::WaitingForOwner);
     }
     if (200..300).contains(&status) {
-        // Some routes answer 200 with `{success: false, error}` for a refusal.
         if body["success"] == serde_json::Value::Bool(false) {
-            // Some of them carry the reason in `message`, and some in neither.
             let reason = body["error"]
                 .as_str()
                 .or(body["message"].as_str())
@@ -58,7 +40,6 @@ pub(crate) fn reply(method: &str, url: &str, status: u16, text: &str) -> Result<
     Err(format!("{method} {url} returned {status}: {error}").into())
 }
 
-/// What the caller reads when the act waits on the owner's card.
 pub(crate) const WAITING_FOR_OWNER_TEXT: &str =
     "Nothing happened yet. This request does not prove it came from the workspace owner, \
      so Lucidos asked them on a card in Lucidos. Their Allow once runs it there; do not \
@@ -72,7 +53,6 @@ pub(crate) fn permission_text(request_id: &str) -> String {
     )
 }
 
-/// Send one act with a JSON body. See [`send_and_report`].
 pub(crate) fn send_act(
     client: reqwest::blocking::Client,
     method: reqwest::Method,
@@ -83,9 +63,6 @@ pub(crate) fn send_act(
     send_and_report(method.as_str(), url, request)
 }
 
-/// Send one request that may need the owner's permission. Prints the
-/// engine's answer, or how to ask the owner, and returns the exit code.
-/// Every generated command sends through here.
 pub(crate) fn send_and_report(
     method: &str,
     url: &str,
@@ -97,7 +74,6 @@ pub(crate) fn send_and_report(
         .map_err(|e| format_request_error(method, url, &e, start.elapsed()))?;
     let status = resp.status().as_u16();
     if let Some(note) = child_reports_note(resp.headers()) {
-        // A side channel for the agent reading this, beside the body it parses.
         eprintln!("{note}");
     }
     let text = resp
@@ -162,7 +138,6 @@ pub(crate) fn cmd_ask(
     Ok(())
 }
 
-/// Prepare a batch and print the instruction for asking with it.
 pub(crate) fn cmd_batch(ws: &Workspace, items: serde_json::Value) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/permissions/batches", ws.base_url());
     let resp = send_expect_json(
@@ -186,7 +161,6 @@ fn ask_instruction(id: &str) -> String {
     )
 }
 
-/// What the agent reads back: the request id, and the one way to ask with it.
 pub(crate) fn outcome_text(id: &str) -> String {
     format!(
         "{} If the owner allows it, do the act next, in this turn. \
@@ -223,7 +197,6 @@ mod tests {
         assert!(text.contains("AskUserQuestion"), "{text}");
     }
 
-    /// A script reads the exit code, so a refusal in a 200 body must fail it.
     #[test]
     fn a_success_false_body_fails_the_command() {
         let body = r#"{"success":false,"error":"Preference 'x' not found"}"#;
@@ -254,8 +227,6 @@ mod tests {
         assert!(text.contains("run it again"), "{text}");
     }
 
-    /// A refusal prints the engine's `error` text and nothing else from the
-    /// body, so no other field can reach the agent's output.
     #[test]
     fn a_refusal_shows_only_the_error_text() {
         let body = r#"{"error": "That workspace is the user's.", "detail": "x-secret-value"}"#;
@@ -273,7 +244,6 @@ mod tests {
         assert!(!err.contains("not json"), "{err}");
     }
 
-    /// A parked act is not done: the owner's card runs it later, or never.
     #[test]
     fn an_act_parked_on_the_owners_card_waits_and_is_not_done() {
         let body = r#"{"error": "Only the workspace owner may do this.",

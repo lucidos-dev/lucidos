@@ -1,4 +1,3 @@
-//! Table-bounded gateway control requests. The local credential stays in the engine.
 use super::{
     error::ApiError,
     permission_requests::{self, Spent},
@@ -62,7 +61,6 @@ impl Request {
     }
 
     fn ask(&self, route: &Route) -> Result<permission_requests::Ask, ApiError> {
-        // Canonicalize recursively even when serde_json's preserve_order feature is enabled.
         fn canonical(value: &Value) -> Value {
             match value {
                 Value::Object(map) => {

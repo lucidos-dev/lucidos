@@ -1,15 +1,3 @@
-//! `lucidos tls`: the local certificate, and what the gateway serves over
-//! HTTPS.
-//!
-//! The local certificate is the per-user loopback CA. `trust` and `forget`
-//! act on it here, as the user, since only the user can change their own
-//! certificate store.
-//!
-//! The gateway settles its certificates itself. An operator's
-//! `LUCIDOS_TLS_CERT`/`KEY` serves every name it covers. The tailnet name gets
-//! it only when a phone would accept it there, and otherwise a certificate
-//! tailscaled issues. This command only reads the answer.
-
 use lucidos_loopback_ca::trust::{self, TrustStatus};
 use lucidos_loopback_ca::{CaDir, LoopbackCa};
 use serde_json::Value;
@@ -17,10 +5,8 @@ use serde_json::Value;
 use crate::gateway;
 use crate::workspace::BoxError;
 
-/// The gateway control route for the TLS state.
 const TLS_PATH: &str = "/~/api/v1/control/tls";
 
-/// The CA directory. `None` only when HOME is unset.
 fn ca_dir() -> Result<CaDir, BoxError> {
     CaDir::resolve()
         .ok_or_else(|| "HOME is not set, so Lucidos cannot find its local certificate".into())
@@ -76,8 +62,6 @@ pub fn cmd_tls_status(port: Option<u16>) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// The local certificate's line: whether browsers on this machine accept
-/// https://localhost.
 fn describe_local(status: &TrustStatus) -> String {
     match status {
         TrustStatus::Trusted => {
@@ -90,7 +74,6 @@ fn describe_local(status: &TrustStatus) -> String {
     }
 }
 
-/// What a person reads, from the gateway's answer.
 fn describe(body: &Value) -> String {
     let text = |key: &str| body.get(key).and_then(Value::as_str);
     let operator_beside = body

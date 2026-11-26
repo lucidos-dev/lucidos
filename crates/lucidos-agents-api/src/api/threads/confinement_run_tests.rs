@@ -1,9 +1,5 @@
-//! Who may ask for a confinement run, and what the caller can steer.
-
 use super::*;
 
-/// The handler admits the thread's own agent before it reaches the engine.
-/// `background_tasks_tests` proves what that check refuses.
 #[test]
 fn the_route_admits_only_the_threads_own_agent_first() {
     let src = include_str!("confinement_run.rs");
@@ -17,7 +13,6 @@ fn the_route_admits_only_the_threads_own_agent_first() {
     assert!(check < run, "the caller check runs first");
 }
 
-/// The request carries no command, so no caller text reaches the spawn.
 #[test]
 fn the_request_carries_no_command() {
     let req: RunRequest =

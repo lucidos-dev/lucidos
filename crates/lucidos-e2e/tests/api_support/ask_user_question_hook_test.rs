@@ -1,7 +1,3 @@
-//! E2E for POST /api/v1/internal/ask-user-question — the long-poll endpoint
-//! invoked by the lucidos-cli ask-user-question-hook subcommand from inside
-//! CC subprocesses. Drives the endpoint with HTTP only — no real CC needed.
-
 use crate::support::{base_url, count_events_of_type, db_url, seed_cc_thread_summary, user_client};
 use serde_json::json;
 use sqlx::PgPool;
@@ -9,13 +5,6 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-/// Poll until the hook endpoint has persisted `UserQuestionAsked` for
-/// `tool_use_id`.
-///
-/// Every answering task below waits on this first: answering before the emit
-/// lands makes the handler's pending-question lookup 409. A query error
-/// panics rather than reading as "not yet", which would surface as the
-/// deadline panic and name the wrong cause.
 async fn wait_for_question_asked(pool: &PgPool, thread_id: Uuid, tool_use_id: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -45,19 +34,10 @@ async fn long_poll_returns_answer_when_user_responds() {
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let tool_use_id = format!("toolu_e2e_{}", thread_id.simple());
-    // The hook emits UserQuestionAsked / accepts the answer keyed on a
-    // synthetic per-question id `{outer}#q{i}`. Even with one question we
-    // address `#q0`. See `synth_question_id` in `api/internal.rs`.
     let q0_id = format!("{tool_use_id}#q0");
 
-    // Seed a SessionStarted so the lifecycle classifier treats this as a CC
-    // thread (UserQuestionAsked is CC-only and would otherwise be rejected).
     seed_cc_thread_summary(&pool, thread_id, "running").await;
 
-    // Background: wait for the hook endpoint to emit UserQuestionAsked, then
-    // simulate the user answering. Polling the events table avoids a race
-    // between the hook's emit and the answer-question handler's pending-question
-    // lookup (which would otherwise 409).
     let client_bg = client.clone();
     let q0_id_bg = q0_id.clone();
     let pool_bg = pool.clone();
@@ -79,7 +59,6 @@ async fn long_poll_returns_answer_when_user_responds() {
         assert_eq!(resp.status().as_u16(), 200, "answer-question should accept");
     });
 
-    // Hook side — blocks until the answer arrives (or test timeout).
     let resp = tokio::time::timeout(
         Duration::from_secs(5),
         client
@@ -114,7 +93,6 @@ async fn long_poll_returns_answer_when_user_responds() {
         "hook output should contain {{question: label}}"
     );
 
-    // Cleanup
     sqlx::query("DELETE FROM events WHERE thread_id = $1")
         .bind(thread_id)
         .execute(&pool)
@@ -127,7 +105,6 @@ async fn long_poll_returns_answer_when_user_responds() {
         .ok();
 }
 
-/// Upload the suite's PNG to `thread_id` and return its blob hash.
 async fn upload_png(client: &reqwest::Client, thread_id: Uuid) -> String {
     let form = reqwest::multipart::Form::new().part(
         "file",
@@ -147,9 +124,6 @@ async fn upload_png(client: &reqwest::Client, thread_id: Uuid) -> String {
     body["hash"].as_str().expect("hash").to_string()
 }
 
-/// A typed answer's image reaches the coding agent as its blob path, which a
-/// Claude Code session may open because it is granted `data/`. An answer
-/// naming an image the workspace never received is refused outright.
 #[tokio::test]
 async fn an_answer_image_reaches_the_hook_as_its_blob_path() {
     let client = user_client().await;
@@ -243,18 +217,6 @@ async fn an_answer_image_reaches_the_hook_as_its_blob_path() {
         .ok();
 }
 
-/// An answer-less resolution releases the agent parked inside this endpoint,
-/// and ends the whole batch rather than just its own card.
-///
-/// That release is the whole point of the supersede path: a coding agent asking
-/// a question blocks here, so only a resolution lets it read anything else.
-/// `Canceled` and `Superseded` share the code that does it
-/// (`batch_ending_answer`, `answer_resolves_without_resume`), and `Canceled` is
-/// the one a client may post, so it drives the test. The Superseded-specific
-/// half (the string the agent reads) is unit-covered in `agent_question.rs`.
-///
-/// Two questions, because the untouched card is resolved by a padding row
-/// alone. Without it a restart would re-fire the walk and re-ask it.
 #[tokio::test]
 async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
     let client = user_client().await;
@@ -333,8 +295,6 @@ async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
         "the untouched card ends the same way, never as unanswered"
     );
 
-    // The second card was never asked, so only the padding row resolves it.
-    // Without that row a restart would re-fire the walk and re-ask it.
     let padded_kind: Option<String> = sqlx::query_scalar(
         "SELECT payload->'answer'->>'kind' FROM events \
          WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered' \
@@ -352,7 +312,6 @@ async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
         "the padding must record the kind that ended the batch"
     );
 
-    // A supersede leaves the next turn to the follow-up that caused it.
     for event_type in ["CodingAgentPromptSent", "ContinuationRequested"] {
         let count = count_events_of_type(&pool, thread_id, event_type).await;
         assert_eq!(
@@ -373,9 +332,6 @@ async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
         .ok();
 }
 
-/// A *quiet option* picked on Claude Code: the hook learns to stop the turn,
-/// the `[quiet]` tag never reaches a label, and nothing wakes the agent. No
-/// session is live here, so a loud pick would emit a `ContinuationRequested`.
 #[tokio::test]
 async fn a_quiet_pick_stops_the_turn_and_wakes_nothing() {
     let client = user_client().await;
@@ -478,13 +434,6 @@ async fn a_quiet_pick_stops_the_turn_and_wakes_nothing() {
         .ok();
 }
 
-/// `Superseded` asserts something no client can make true: that a follow-up
-/// arrived and replaced this question. Only the message router knows that, so
-/// the endpoint refuses the kind and leaves the question pending.
-///
-/// It is on the public enum because it rides the same persisted
-/// `UserQuestionAnswered` as every other answer. That is exactly why the
-/// refusal has to be tested rather than assumed from the type.
 #[tokio::test]
 async fn answer_question_refuses_a_client_supplied_superseded() {
     let client = user_client().await;
@@ -651,10 +600,6 @@ async fn multi_select_empty_answer_is_rejected() {
 
     seed_cc_thread_summary(&pool, thread_id, "running").await;
 
-    // Pre-seed the question so answer-question can find it (we don't want to
-    // race the long-poll endpoint here — this is purely a validation test).
-    // Use the synthetic per-question id `#q0` because that's what the hook
-    // endpoint emits and what the answer endpoint matches against.
     sqlx::query(
         "INSERT INTO events (id, thread_id, event_type, payload, created, aggregate, aggregate_id)
          VALUES ($1, $2, 'UserQuestionAsked', $3, NOW(), 'thread', $4)",
@@ -721,13 +666,8 @@ async fn returns_immediately_when_answer_already_persisted() {
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let tool_use_id = format!("toolu_recovery_{}", thread_id.simple());
-    // Crash-recovery answer is keyed on the synthetic `#q0` id — the hook
-    // re-POSTs the same outer tool_use_id on restart, the handler re-derives
-    // `#q0` and finds the persisted UserQuestionAnswered.
     let q0_id = format!("{tool_use_id}#q0");
 
-    // Pre-insert a UserQuestionAnswered event directly to simulate "engine
-    // restarted; the user already answered before crash".
     sqlx::query(
         "INSERT INTO events (id, thread_id, event_type, payload, created, aggregate, aggregate_id)
          VALUES ($1, $2, 'UserQuestionAnswered', $3, NOW(), 'thread', $4)",
@@ -764,9 +704,6 @@ async fn returns_immediately_when_answer_already_persisted() {
         .await
         .expect("hook post");
 
-    // Fast path = "no long-poll", not "sub-1s round-trip" — under parallel
-    // test load HTTPS handshake + DB lookup can take ~1s. Long-poll timeout
-    // is much higher; 5s leaves headroom while still catching regressions.
     assert!(
         start.elapsed() < Duration::from_secs(5),
         "should not block when answer already exists; took {:?}",
@@ -783,8 +720,6 @@ async fn returns_immediately_when_answer_already_persisted() {
         .unwrap();
 }
 
-/// ADR 0415 on the hook path: a bad option widget refuses the batch before any
-/// card is written, and a good one is lifted into the option's `widget`.
 #[tokio::test]
 async fn an_option_widget_is_checked_and_lifted_on_the_hook_path() {
     let client = user_client().await;
@@ -893,8 +828,6 @@ async fn an_option_widget_is_checked_and_lifted_on_the_hook_path() {
         .ok();
 }
 
-/// Both coding-agent backends use this endpoint. An integrated child's
-/// ordinary decision (including plan approval) belongs in its parent report.
 #[tokio::test]
 async fn integrated_sub_thread_questions_never_open_an_owner_card() {
     let client = user_client().await;

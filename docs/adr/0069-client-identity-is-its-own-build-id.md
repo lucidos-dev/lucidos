@@ -17,8 +17,8 @@ into the client bundle so the System page could show it.
 
 The engine's `VERSION` is not baked into the client bundle. The client's
 identity is `CLIENT_BUILD_ID`, supplied by the `virtual:build-id` virtual module
-and stamped by the `lucidos-sw-stamp` plugin with the same id it writes into
-`sw.js`.
+and stamped by the `lucidos-sw-stamp` plugin with the same id it writes into the
+HTML shell and `sw.js`.
 
 ## Rationale
 
@@ -32,10 +32,9 @@ string.
 content hashes, so it is deterministic. A no-op rebuild yields the same id and
 reports no update.
 
-It is also the id `sw.js` carries. The client therefore compares the build that
-produced the executing code against the served `sw.js`. The alternative
-comparand, the controlling service worker, can run ahead of the loaded page
-after a claim without reload.
+The refresh badge compares the running build with the HTML shell served for the
+current route. That shell identifies which bundle a reload would load.
+A controlling service worker can claim the page while it still runs an older bundle.
 
 ## Consequences
 

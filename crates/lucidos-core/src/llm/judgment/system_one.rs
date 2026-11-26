@@ -1,4 +1,4 @@
-//! A System One endpoint, which answers the typed questions in [`super`].
+//! INVARIANT: A System One endpoint, which answers the typed questions in [`super`].
 //!
 //! One `POST` carries the state, the model and every question. TypeSafe's Jev,
 //! Cloudflare's Clef and a self-hosted model all speak this body, so they
@@ -20,19 +20,15 @@ use serde_json::{json, Value};
 
 use super::{Answer, Answers, Judgment, JudgmentProvider, Question};
 
-/// TypeSafe's API root. The builtin `typesafe` proxy pins it too.
+/// INVARIANT: TypeSafe's API root. The builtin `typesafe` proxy pins it too.
 pub const TYPESAFE_API_BASE_URL: &str = "https://api.typesafe.ai/v1";
 
-/// The alias that always names TypeSafe's current flagship model.
 pub const JEV_DEFAULT_MODEL: &str = "jev-latest";
 
-/// A judgment provider backed by one System One endpoint.
 pub struct SystemOneProvider {
-    /// The full request URL, path included.
     url: String,
-    /// The model the body asks for.
     model: String,
-    /// Never logged and never formatted into an error. It reaches exactly one
+    /// INVARIANT: Never logged and never formatted into an error. It reaches exactly one
     /// place, the `Authorization` header. `None` for a self-hosted endpoint
     /// that takes no key.
     api_key: Option<String>,
@@ -56,10 +52,6 @@ impl SystemOneProvider {
     }
 }
 
-/// Build the request body for one call.
-///
-/// Pure, so a test can assert the wire shape and that a redacted state stayed
-/// redacted, without standing up a server.
 pub fn build_request_body(model: &str, state: &Value, questions: &[(String, Question)]) -> Value {
     let mut map = serde_json::Map::with_capacity(questions.len());
     for (id, question) in questions {
@@ -71,7 +63,7 @@ pub fn build_request_body(model: &str, state: &Value, questions: &[(String, Ques
     json!({ "state": state, "model": model, "questions": Value::Object(map) })
 }
 
-/// Parse one response body into the answers, what they cost, and what answered.
+/// INVARIANT: Parse one response body into the answers, what they cost, and what answered.
 ///
 /// An answer whose type the enum does not recognize is dropped rather than
 /// failing the whole call. The caller reads a missing id the same way it reads
@@ -141,15 +133,12 @@ impl JudgmentProvider for SystemOneProvider {
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {
-            // The body describes the offending field on a 422 and is safe to
-            // surface. The key is in the header, never here.
             return Err(
                 crate::llm::ProviderError::from_http("System One", status.as_u16(), &text).into(),
             );
         }
         let mut judgment = parse_response(&text)?;
         judgment.request_chars = request_chars;
-        // A response naming no model was answered by the one we asked for.
         judgment.model.get_or_insert_with(|| self.model.clone());
         Ok(judgment)
     }

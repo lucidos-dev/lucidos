@@ -1,18 +1,3 @@
-//! The Linux backend: a Landlock ruleset the child applies to itself.
-//!
-//! Landlock is an allowlist with no subtraction. A right granted on a folder
-//! reaches everything beneath it. So [`grants`] walks down from `/` along each
-//! restricted path, and grants every sibling it passes whole. A folder on the
-//! way down gets only what everything beneath it may have.
-//!
-//! The walk lists folders as they are at spawn time. So a child cannot create
-//! an entry directly in a folder on the way down, such as `$HOME` (decision 11
-//! of `docs/plans/2026-11-10-os-sandbox-for-agent-subprocesses.md`).
-//!
-//! Landlock does not gate path lookup, so a child still reaches an open
-//! folder beneath a hidden one. Pathname Unix-socket connects are not gated
-//! either, so `Policy::connectable_sockets` needs no Landlock rule (ADR 0645).
-
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -22,19 +7,12 @@ pub const EXECUTE: u64 = 1 << 0;
 pub const WRITE_FILE: u64 = 1 << 1;
 pub const READ_FILE: u64 = 1 << 2;
 pub const READ_DIR: u64 = 1 << 3;
-/// Every right ABI 1 defines: bits 0 to 12.
 pub const ABI1_RIGHTS: u64 = (1 << 13) - 1;
-/// Rename or link across folders, from ABI 2. A kernel without it refuses
-/// every such rename, whatever the rules say.
 pub const REFER: u64 = 1 << 13;
-/// Truncate a file, from ABI 3.
 pub const TRUNCATE: u64 = 1 << 14;
-/// `ioctl` on a device, from ABI 5.
 pub const IOCTL_DEV: u64 = 1 << 15;
-/// The rights a rule on a file, rather than a folder, may carry.
 pub const FILE_RIGHTS: u64 = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
 
-/// The rights the kernel at Landlock ABI `abi` can restrict.
 pub fn handled_rights(abi: u32) -> u64 {
     let mut rights = ABI1_RIGHTS;
     if abi >= 2 {
@@ -49,20 +27,14 @@ pub fn handled_rights(abi: u32) -> u64 {
     rights
 }
 
-/// What one rule grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Grant {
-    /// Every handled right.
     Full,
-    /// Read, list and execute.
     Read,
-    /// List the folder's entries. A folder above a hidden one gets this, so
-    /// `ls ~` works. The hidden folder's names are listable too.
     ListOnly,
 }
 
 impl Grant {
-    /// The rights bits of this grant, within `handled`.
     pub fn rights(self, handled: u64) -> u64 {
         match self {
             Grant::Full => handled,
@@ -72,7 +44,6 @@ impl Grant {
     }
 }
 
-/// How the policy treats one path, by its most specific root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     Open,
@@ -80,13 +51,10 @@ enum Class {
     Hidden,
 }
 
-/// The rules that implement `policy`, from `/` down. `policy` paths must be
-/// resolved ([`Policy::resolved`]).
 pub fn grants(policy: &Policy) -> io::Result<Vec<(PathBuf, Grant)>> {
     grants_from(Path::new("/"), policy)
 }
 
-/// [`grants`] below an explicit top, so a test walks a temp tree.
 pub fn grants_from(top: &Path, policy: &Policy) -> io::Result<Vec<(PathBuf, Grant)>> {
     let walk = Walk::new(policy);
     let mut out = Vec::new();
@@ -127,7 +95,6 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// The class of `path`: that of its deepest root, else open.
     fn class(&self, path: &Path) -> Class {
         if self.private.iter().any(|root| beneath(path, root)) {
             return Class::Hidden;
@@ -149,7 +116,6 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// Whether some root lies strictly beneath `path`.
     fn has_root_beneath(&self, path: &Path) -> bool {
         self.rooted
             .iter()
@@ -159,8 +125,6 @@ impl<'a> Walk<'a> {
                 .is_some_and(|roots| roots.iter().any(|root| root != path && beneath(root, path)))
     }
 
-    /// What a folder with a root beneath it may get: the least anything
-    /// beneath it may have. `None` for a hidden folder.
     fn ancestor_grant(&self, dir: &Path) -> Option<Grant> {
         let below = |class: Class| {
             self.rooted
@@ -237,7 +201,6 @@ mod sys {
         parent_fd: i32,
     }
 
-    /// The kernel's Landlock ABI version, or why there is none.
     fn abi() -> io::Result<u32> {
         // SAFETY: the version query takes no attribute pointer.
         let v = unsafe {
@@ -254,8 +217,6 @@ mod sys {
         Ok(v as u32)
     }
 
-    /// Whether Landlock is enabled here. Never inferred from a kernel version:
-    /// a kernel can build it and leave it out of `lsm=`.
     pub fn probe() -> Availability {
         match abi() {
             Ok(v) if v >= 1 => Availability::Available,
@@ -270,13 +231,10 @@ mod sys {
         }
     }
 
-    /// Whether this kernel's Landlock can restrict truncation.
     pub fn guards_truncation() -> bool {
         abi().is_ok_and(|v| handled_rights(v) & super::TRUNCATE != 0)
     }
 
-    /// A ruleset built in the parent. The child applies it with
-    /// [`Ruleset::restrict_self`].
     pub struct Ruleset {
         fd: OwnedFd,
     }
@@ -320,7 +278,6 @@ mod sys {
             };
             if raw < 0 {
                 let err = io::Error::last_os_error();
-                // Gone since the walk listed it: nothing to grant.
                 if err.raw_os_error() == Some(libc::ENOENT) {
                     return Ok(());
                 }
@@ -363,8 +320,6 @@ mod sys {
             Ok(())
         }
 
-        /// Restrict the calling process. Safe between fork and exec: two
-        /// syscalls, no allocation, no lock.
         pub fn restrict_self(&self) -> io::Result<()> {
             // SAFETY: prctl with integer arguments only.
             if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {

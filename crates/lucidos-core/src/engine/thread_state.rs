@@ -1,22 +1,3 @@
-//! Thread state machine — compose lifecycle only.
-//!
-//! A thread is the unified entity for both drafts and conversations. It enters
-//! `Composing` on `ThreadStarted`, transitions to `Active` on `MessageReceived`,
-//! and to `Discarded` on `ThreadDiscarded` (terminal, only valid from
-//! `Composing`).
-//!
-//! The archive flag is intentionally NOT modelled here — it lives on the
-//! separate `archive_state` column (`Inbox | Archived`), maintained by the
-//! `thread_lifecycle::resolve_transition` contract layer. An archived thread
-//! carries `state='active'` plus `archive_state='archived'`; the two axes are
-//! orthogonal by construction. Anywhere that needs "is this thread archived"
-//! reads `archive_state` directly. Compose / send / blob-upload gates only
-//! care about the compose axis, which is what `ThreadState` represents.
-//!
-//! `Discarded` is a hard terminal — every compose PUT and message POST returns
-//! 410 Gone. This is the "make impossible states impossible" lever that
-//! replaces the old LWW + tombstone machinery.
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,8 +9,6 @@ pub enum ThreadState {
 }
 
 impl ThreadState {
-    /// Parse the DB column value. Fails loud on unknown strings (per CLAUDE.md
-    /// "no silent defaults") — corrupted state should surface, not be masked.
     pub fn from_db_str(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         match s {
             "composing" => Ok(Self::Composing),
@@ -51,8 +30,6 @@ impl ThreadState {
         }
     }
 
-    /// Mode (lucidos vs claude_code) is only mutable while composing — the
-    /// first `MessageReceived` locks it on the thread.
     pub fn can_change_mode(self) -> bool {
         matches!(self, Self::Composing)
     }
@@ -82,10 +59,6 @@ mod tests {
 
     #[test]
     fn from_db_str_rejects_archived_and_unknown() {
-        // `archived` was a legal value before the state↔archive_state collapse;
-        // post-migration no row may carry it. The parser rejects it loud so a
-        // stray row surfaces as a 500 instead of silently routing to an arm
-        // that no longer exists.
         assert!(ThreadState::from_db_str("archived").is_err());
         assert!(ThreadState::from_db_str("bogus").is_err());
         assert!(ThreadState::from_db_str("").is_err());

@@ -1,13 +1,9 @@
-//! Bounded cleanup subprocesses. File-backed I/O avoids pipe deadlocks, including
-//! inherited pipes held open by descendants after the immediate child exits.
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-// Bulk transfers can spend hours in COPY on large workspaces. Keep their
-// safety bound separate from short catalog and filesystem operations.
 const BULK_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -33,8 +29,6 @@ fn run(
                 std::thread::sleep(Duration::from_millis(20));
             }
             result => {
-                // Only this newly spawned process group is signalled. Reap the
-                // direct child even if group signalling failed.
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
@@ -47,8 +41,6 @@ fn run(
             }
         }
     };
-    // Cleanup tools must not leave writers behind that could alter an archive
-    // after it has been fsynced and accepted as a recovery copy.
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }

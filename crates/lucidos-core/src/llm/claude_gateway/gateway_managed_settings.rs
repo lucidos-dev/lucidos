@@ -1,14 +1,3 @@
-//! The *gateway managed settings*: the policy a Claude gateway sets for the
-//! signed-in user, served at `GET {base}/managed/settings`.
-//!
-//! The protocol calls the body the user's Claude Code `managed-settings.json`.
-//! Lucidos reads only the model allowlist and the telemetry switches from it.
-//! No other setting reaches any process.
-//!
-//! The document is fetched after a sign-in, after each token refresh, and
-//! hourly. It is stored on the account row, so a restart keeps it and a
-//! sign-out drops it. A failed fetch keeps the last stored document.
-
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -22,19 +11,15 @@ use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus, SystemEvent};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Where the gateway serves its managed settings, relative to the origin.
 const MANAGED_SETTINGS_PATH: &str = "/managed/settings";
 
-/// How often the background task asks whether a fetch is due.
 const CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// One gateway's managed settings for one user. Holds a JSON object; anything
-/// else reads as an empty policy.
 #[derive(Clone, Default, PartialEq)]
 pub struct GatewayManagedSettings(Map<String, Value>);
 
 impl std::fmt::Debug for GatewayManagedSettings {
-    /// Names the keys only: an `env` value can be a collector's credential.
+    /// INVARIANT: Names the keys only: an `env` value can be a collector's credential.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_set().entries(self.0.keys()).finish()
     }
@@ -45,14 +30,10 @@ impl GatewayManagedSettings {
         Self(document.as_object().cloned().unwrap_or_default())
     }
 
-    /// The string value of `key` in the policy's `env` block.
     pub fn env(&self, key: &str) -> Option<&str> {
         self.0.get("env")?.get(key)?.as_str()
     }
 
-    /// The policy's `availableModels` entries, verbatim. `None` when it sets
-    /// none, an empty list included: a policy allowing no model at all would
-    /// leave the gateway unusable, and the gateway still refuses what it bars.
     pub fn available_models(&self) -> Option<Vec<String>> {
         let entries: Vec<String> = self
             .0
@@ -64,10 +45,6 @@ impl GatewayManagedSettings {
         (!entries.is_empty()).then_some(entries)
     }
 
-    /// The model ids the allowlist serves, when the policy sets one. Each
-    /// entry loses a trailing `[...]` (as in `[1m]`), and an `id@alias`
-    /// entry, which only names how telemetry reports a model, is dropped.
-    /// `None` when nothing is left, so the gateway's listing stays in charge.
     pub fn served_ids(&self) -> Option<Vec<String>> {
         let mut ids: Vec<String> = Vec::new();
         for entry in self.available_models()? {
@@ -79,8 +56,6 @@ impl GatewayManagedSettings {
         (!ids.is_empty()).then_some(ids)
     }
 
-    /// How telemetry names `model`: `id-alias` when the allowlist holds an
-    /// `id@alias` entry for it, else its id. A `[1m]` suffix is dropped.
     pub fn reported_model(&self, model: &str) -> String {
         let id = strip_bracket_suffix(model);
         let prefix = format!("{id}@");
@@ -94,15 +69,12 @@ impl GatewayManagedSettings {
             .unwrap_or_else(|| id.to_string())
     }
 
-    /// Whether the policy asks a client for usage telemetry: Claude Code's own
-    /// switches, `CLAUDE_CODE_ENABLE_TELEMETRY=1` with an OTLP logs exporter.
     pub fn telemetry_requested(&self) -> bool {
         self.env("CLAUDE_CODE_ENABLE_TELEMETRY") == Some("1")
             && self.env("OTEL_LOGS_EXPORTER") == Some("otlp")
     }
 }
 
-/// `entry` without a trailing `[...]`, such as the `[1m]` of a 1M model.
 fn strip_bracket_suffix(entry: &str) -> &str {
     match entry.strip_suffix(']').and_then(|rest| rest.rfind('[')) {
         Some(open) => &entry[..open],
@@ -110,21 +82,16 @@ fn strip_bracket_suffix(entry: &str) -> &str {
     }
 }
 
-/// What one fetch found.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Fetched {
-    /// `304`: the stored document still holds.
     Unchanged,
-    /// `404`: the gateway has no policy for this user.
     NoPolicy,
-    /// A policy, with the `ETag` to send back next time.
     Policy {
         document: Value,
         etag: Option<String>,
     },
 }
 
-/// Ask `origin` for its managed settings, sending `etag` as `If-None-Match`.
 pub(crate) async fn fetch(
     origin: &GatewayOrigin,
     bearer: &str,
@@ -168,8 +135,6 @@ pub(crate) async fn fetch(
     })
 }
 
-/// The policy itself. The protocol sends it as the body, and some gateways
-/// wrap it as `{"settings": {...}}`. Either is read.
 fn unwrapped(value: Value) -> Result<Value, String> {
     let document = match value {
         Value::Object(mut body) => match body.remove("settings") {
@@ -189,8 +154,6 @@ fn unwrapped(value: Value) -> Result<Value, String> {
     Ok(document)
 }
 
-/// Fetch the managed settings for `account`, the stored sign-in, with
-/// `bearer`, and store them. A failure is logged and keeps the stored ones.
 pub(crate) async fn refresh(
     pool: &PgPool,
     event_bus: &EventBus,
@@ -214,9 +177,6 @@ pub(crate) async fn refresh(
     }
 }
 
-/// Fetch the managed settings when a fetch is due: after a sign-in, and once
-/// the stored ones are an hour old. A restart picks up where it left off,
-/// since the fetch time is stored.
 pub fn spawn_refresh_task(
     mut rx: tokio::sync::broadcast::Receiver<EmittedEvent>,
     pool: PgPool,
@@ -323,7 +283,6 @@ mod tests {
         );
     }
 
-    /// An `id@alias` entry names how telemetry reports that model.
     #[test]
     fn the_reported_model_follows_an_alias_entry() {
         let policy = GatewayManagedSettings::from_document(&json!({"availableModels": [
@@ -365,8 +324,6 @@ mod tests {
         assert!(unwrapped(json!(["not", "an", "object"])).is_err());
     }
 
-    /// `404` means no policy and `200 {}` an empty one. The protocol keeps
-    /// them apart, and so does the fetch.
     #[tokio::test]
     async fn no_policy_and_an_empty_policy_differ() {
         let gateway = MockGateway::start().await;
@@ -384,8 +341,6 @@ mod tests {
         );
     }
 
-    /// The stored `ETag` goes back as `If-None-Match`, with the bearer, and a
-    /// matching one answers `304`.
     #[tokio::test]
     async fn a_matching_etag_is_unchanged() {
         let gateway = MockGateway::start().await;
@@ -483,8 +438,6 @@ mod tests {
             })
         }
 
-        /// The policy lands on the account row, so a restart reads it back. A
-        /// change announces once, carrying no `env` value.
         #[tokio::test]
         async fn a_fetched_policy_is_stored_and_announced_once() {
             let f = Fixture::new().await;
@@ -509,7 +462,6 @@ mod tests {
             f.done().await;
         }
 
-        /// A failed fetch keeps the last stored policy.
         #[tokio::test]
         async fn a_failed_fetch_keeps_the_stored_policy() {
             let f = Fixture::new().await;
@@ -527,8 +479,6 @@ mod tests {
             f.done().await;
         }
 
-        /// The policy belongs to one sign-in. A new sign-in starts with none,
-        /// and a fetch for an ended sign-in stores nothing.
         #[tokio::test]
         async fn the_policy_vanishes_with_the_sign_in() {
             let f = Fixture::new().await;
@@ -557,7 +507,6 @@ mod tests {
             f.done().await;
         }
 
-        /// A sign-in starts a fetch, and a fresh policy is not fetched again.
         #[tokio::test]
         async fn the_task_fetches_after_a_sign_in() {
             let f = Fixture::new().await;

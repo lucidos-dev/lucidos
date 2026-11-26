@@ -1,11 +1,3 @@
-//! Tests for the shared marketplace registry write path.
-//!
-//! The bug these pin: registering a marketplace persisted and committed, but
-//! announced only `DataFileWritten` for a `config/` path, which no frontend arm
-//! consumes. So an open Plugins panel never learned the list had changed. The
-//! rename case (re-registering the same source under a new name) is the one
-//! that surfaced it, and it is the one an `if created` guard would drop.
-
 use super::*;
 
 use crate::core::plugin_marketplaces::load_registry;
@@ -15,7 +7,6 @@ use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 
 const SOURCE: &str = "https://github.com/example-org/example-repo";
 
-/// A workspace with a git repo, which `commit_data_path` needs.
 fn workspace() -> (tempfile::TempDir, ArtifactManager) {
     let dir = tempfile::TempDir::new().unwrap();
     let am = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
@@ -32,7 +23,6 @@ fn agent_actor() -> MessageOrigin {
     }
 }
 
-/// Every `SystemEvent` the bus recorded, in emit order.
 fn system_events(bus: &MockEventBus) -> Vec<SystemEvent> {
     bus.emitted_events()
         .into_iter()
@@ -78,8 +68,6 @@ fn data_file_written_paths(bus: &MockEventBus) -> Vec<String> {
         .collect()
 }
 
-/// A first registration announces the entity event (so open panels refresh)
-/// AND keeps the file-level `DataFileWritten` audit with its commit sha.
 #[tokio::test]
 async fn registering_announces_the_entity_event_and_the_file_write() {
     let (dir, am) = workspace();
@@ -117,11 +105,6 @@ async fn registering_announces_the_entity_event_and_the_file_write() {
     );
 }
 
-/// The rename. Re-registering the SAME source under a new name is an upsert: it
-/// mutates the existing entry rather than adding a second one, reports
-/// `created: false`, and must announce again carrying the NEW name. This is the
-/// exact sequence from the bug report (register, then rename), and the case a
-/// `if created { announce }` guard would silently drop.
 #[tokio::test]
 async fn renaming_announces_again_with_the_new_name() {
     let (dir, am) = workspace();
@@ -173,12 +156,10 @@ async fn renaming_announces_again_with_the_new_name() {
     );
     assert_eq!(events[1].1, "Example's plugins", "carrying the NEW name");
 
-    // And the rename is what a reloading client would read back.
     let persisted = load_registry(dir.path()).expect("reload");
     assert_eq!(persisted.marketplaces[0].name, "Example's plugins");
 }
 
-/// Removal announces its own event, so the list drops the row live.
 #[tokio::test]
 async fn removing_announces_the_removal() {
     let (dir, am) = workspace();
@@ -212,10 +193,6 @@ async fn removing_announces_the_removal() {
     assert_eq!(removed_ids(&bus), vec![registration.marketplace.id]);
 }
 
-/// Removing an id that was never registered is `Ok(None)`, not an error and not
-/// an announcement. That is what lets the HTTP handler return 404 without
-/// sniffing an error string, and it keeps a bogus id from broadcasting a
-/// removal that never happened.
 #[tokio::test]
 async fn removing_an_unknown_marketplace_is_a_silent_no_op() {
     let (dir, am) = workspace();
@@ -239,8 +216,6 @@ async fn removing_an_unknown_marketplace_is_a_silent_no_op() {
     );
 }
 
-/// The actor threads through to the event, so the timeline distinguishes a
-/// marketplace the user added in Settings from one an agent registered mid-chat.
 #[tokio::test]
 async fn the_actor_reaches_the_announced_event() {
     let (dir, am) = workspace();
@@ -267,8 +242,6 @@ async fn the_actor_reaches_the_announced_event() {
     );
 }
 
-/// An unusable source fails as `InvalidSource` (the handler's 400) and writes
-/// nothing: no registry file change, no commit, no announcement.
 #[tokio::test]
 async fn an_invalid_source_is_rejected_without_writing_or_announcing() {
     let (dir, am) = workspace();

@@ -28,9 +28,6 @@ fn lines(body: &str) -> Vec<String> {
     crate::core::grants::parse_patterns(body)
 }
 
-/// A Codex command persists Claude Code's own lines, `Bash` and
-/// `Bash(<head>:*)`, read from the unwrapped command (ADR 0571). A
-/// `file_change` derives no persisted line at all.
 #[test]
 fn derive_allow_pattern_codex_persists_claude_codes_bash_lines() {
     let cmd_input = serde_json::json!({ "command": "/bin/zsh -lc 'git push'", "cwd": "/wt" });
@@ -55,7 +52,6 @@ fn derive_allow_pattern_codex_persists_claude_codes_bash_lines() {
         .as_deref(),
         Some("Bash(git:*)")
     );
-    // Claude Code's protected-path rule follows the line it persists.
     let hook = serde_json::json!({ "command": "/bin/zsh -lc 'echo x > .git/hooks/pre-commit'" });
     assert_eq!(
         derive_allow_pattern(
@@ -82,8 +78,6 @@ fn derive_allow_pattern_codex_persists_claude_codes_bash_lines() {
     }
 }
 
-/// The card names the head that carded, not a read before it. The click
-/// stores that head, and the stored line covers the same command next time.
 #[test]
 fn a_compound_read_derives_the_head_the_fast_path_does_not_settle() {
     let command = "/bin/zsh -lc 'cat data/pid; ps -p 1; rg --files docs; \
@@ -108,20 +102,15 @@ fn a_compound_read_derives_the_head_the_fast_path_does_not_settle() {
         &crate::engine::command_guard::TrustedHeads::NONE,
         |p| p == stored
     ));
-    // Every segment Safe: the first head, as before.
     let reads = serde_json::json!({ "command": "cat a; ls" });
     assert_eq!(
         command_grant_head(&reads, &TrustedHeads::NONE).as_deref(),
         Some("cat")
     );
-    // The head that carded runs its arguments, so no click can grant it.
     let wrapped = serde_json::json!({ "command": "cat a; timeout 5 curl https://example.com" });
     assert_eq!(command_grant_head(&wrapped, &TrustedHeads::NONE), None);
 }
 
-/// Session scope for codex commands is head-scoped, exactly like Bash. The
-/// bare-name fallback would let one "Allow for this thread" click on
-/// `git push` silently auto-approve a later `rm -rf ~/x`.
 #[test]
 fn derive_allow_pattern_codex_command_session_is_head_scoped() {
     let input = serde_json::json!({ "command": "git push origin main", "cwd": "/wt" });
@@ -135,8 +124,6 @@ fn derive_allow_pattern_codex_command_session_is_head_scoped() {
         .as_deref(),
         Some("command_execution(git:*)"),
     );
-    // A DIFFERENT head must produce a different pattern. That is the whole
-    // point of the scoping.
     let rm = serde_json::json!({ "command": "rm -rf /tmp/x" });
     assert_eq!(
         derive_allow_pattern(
@@ -150,9 +137,6 @@ fn derive_allow_pattern_codex_command_session_is_head_scoped() {
     );
 }
 
-/// Codex wraps EVERY command it runs as `/bin/zsh -lc '<script>'`. Taking the
-/// first whitespace token therefore derived the same pattern for all of them,
-/// so one session click blanket-approved the rest of the thread.
 #[test]
 fn derive_allow_pattern_codex_command_session_reads_inside_the_wrapper() {
     let wrapped =
@@ -177,7 +161,6 @@ fn derive_allow_pattern_codex_command_session_reads_inside_the_wrapper() {
         .as_deref(),
         Some("command_execution(rm:*)"),
     );
-    // The same holds for a Claude Code `Bash` command carrying a wrapper.
     assert_eq!(
         derive_allow_pattern(
             "Bash",
@@ -190,8 +173,6 @@ fn derive_allow_pattern_codex_command_session_reads_inside_the_wrapper() {
     );
 }
 
-/// A second shell inside Codex's wrapper names the real command, never `bash`.
-/// A line that runs its arguments through a shell derives nothing at all.
 #[test]
 fn derive_allow_pattern_reads_through_a_nested_shell_and_never_stores_one() {
     let nested = serde_json::json!({ "command": "/bin/zsh -lc \"bash -c 'git push'\"" });
@@ -212,8 +193,6 @@ fn derive_allow_pattern_reads_through_a_nested_shell_and_never_stores_one() {
     }
 }
 
-/// Claude Code prefix-matches `--allowedTools` itself, so a line naming a
-/// shell or an exec wrapper would skip its card for any wrapped command.
 #[test]
 fn allowed_tools_flag_drops_a_line_that_names_a_shell_or_an_exec_wrapper() {
     let body = "Bash\nBash(git:*)\nBash(rm:*)\nBash(find:*)\nBash(python3:*)\nBash(bash:*)\nBash(zsh:*)\nBash(timeout:*)\nRead\n\
@@ -225,8 +204,6 @@ fn allowed_tools_flag_drops_a_line_that_names_a_shell_or_an_exec_wrapper() {
     assert_eq!(result, want.join(","));
 }
 
-/// A path line is the engine's to check: Claude Code would prefix-match it
-/// with no trust check (ADR 0571).
 #[test]
 fn allowed_tools_flag_drops_a_path_line() {
     let body = "Bash(./scripts/check.sh:*)\nBash(scripts/check.sh:*)\nBash(/tmp/x.sh:*)\n\
@@ -235,8 +212,6 @@ fn allowed_tools_flag_drops_a_path_line() {
     assert_eq!(allowed_tools_flag(lines(body)), want.join(","));
 }
 
-/// A command running nothing derivable gets NO session pattern. The bare-name
-/// fallback would read one click as a grant for every command in the thread.
 #[test]
 fn derive_allow_pattern_command_with_no_head_has_no_session_pattern() {
     for command in ["", "   ", "2>/dev/null"] {
@@ -251,9 +226,6 @@ fn derive_allow_pattern_command_with_no_head_has_no_session_pattern() {
     }
 }
 
-/// file_change approvals carry no stable identifier (only reason/grant_root)
-/// — there is nothing meaningful to scope a session grant to, so NO session
-/// pattern derives and every file-change approval renders its own card.
 #[test]
 fn derive_allow_pattern_codex_file_change_has_no_session_pattern() {
     let input = serde_json::json!({ "reason": "writes outside worktree", "grant_root": "/etc" });
@@ -340,13 +312,6 @@ fn derive_allow_pattern_skill_missing_input_returns_none() {
     );
 }
 
-/// CC's `--permission-mode acceptEdits` routes parametric file-path tools
-/// (Edit/Write/NotebookEdit) through `--permission-prompt-tool` for any
-/// out-of-cwd path **regardless** of bare entries in `--allowedTools`.
-/// Persisting bare `Edit` (etc.) silently does nothing for the very paths
-/// that surfaced the prompt — so the engine must refuse to write them.
-/// In-cwd paths never reach this card (acceptEdits auto-approves), so no
-/// legitimate caller is denied by this guard.
 #[test]
 fn derive_allow_pattern_broad_returns_none_for_acceptedits_routed_tools() {
     let input = serde_json::json!({"file_path": "/x", "old_string": "a", "new_string": "b"});
@@ -372,11 +337,6 @@ fn derive_allow_pattern_broad_returns_none_for_acceptedits_routed_tools() {
     );
 }
 
-/// CC always routes `ExitPlanMode` through `--permission-prompt-tool`
-/// regardless of `--allowedTools` — plan-mode exit is the user's plan
-/// approval step, not a regular tool call. Persisting bare `ExitPlanMode`
-/// to the allowlist would mislead the user into thinking the prompt would
-/// stop coming back; suppress so the UI hides the broad button.
 #[test]
 fn derive_allow_pattern_broad_returns_none_for_exit_plan_mode() {
     let input = serde_json::json!({ "plan": "Step 1: do thing" });
@@ -392,9 +352,6 @@ fn derive_allow_pattern_broad_returns_none_for_exit_plan_mode() {
     );
 }
 
-/// Narrow scope for the same tools is still None (no narrow pattern is
-/// generated for path-tools today). Documented here so a future addition
-/// of `Edit(<glob>)` patterns is an intentional change, not a side-effect.
 #[test]
 fn derive_allow_pattern_narrow_remains_none_for_path_tools() {
     let input = serde_json::json!({"file_path": "/x"});
@@ -417,8 +374,6 @@ fn derive_allow_pattern_narrow_remains_none_for_path_tools() {
     );
 }
 
-/// A write under `.claude/` or `.git/` is protected: no head grant covers it,
-/// so a narrow click could not widen the agent's permissions or plant a hook.
 #[test]
 fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
     for command in [
@@ -441,8 +396,6 @@ fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
         "sort --output=.claude/x a",
         "sort --compress-program=sh .claude/x",
         "sort --unknown .claude/x",
-        // git calls that write work-tree files, or that a global option or an
-        // environment variable points somewhere else.
         "git checkout .claude/settings.json",
         "git restore .claude/x",
         "git -c core.hooksPath=x commit -m m .claude/x",
@@ -450,36 +403,26 @@ fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
         "GIT_INDEX_FILE=.claude/x git add a",
         "bash -c 'echo x > .claude/settings.json'",
         "python3 - <<'EOF'\nopen('.claude/settings.json', 'w').write('{}')\nEOF",
-        // Quote shapes the masking must read as the shell does, so a write
-        // never hides inside what only looks like one quoted argument.
         "echo $'\\''\nrm -rf .claude/x\necho '\nx'",
         "echo \\$'a\\'\nrm -rf .claude/x\necho '\nx'",
         "cat <<EOF\n'\nEOF\nrm -rf .claude/x\necho '\nx'",
         "echo it\\'s; rm -rf .claude/x",
-        // A read hands the path to a later writing segment.
         "grep -rl foo .claude/rules | xargs sed -i 's/foo/bar/'",
         "find .claude/ -name '*.json' | xargs rm",
         "echo 'echo {} > .claude/settings.json' | sh",
         "N=.claude/settings.json; tee \"$N\" < cfg",
-        // A heredoc body that runs as code.
         "cat <<'EOF' | sh\necho '{}' > .claude/settings.local.json\nEOF",
         "python3 - <<EOF\nfile = open('.claude/settings.json', 'w')\nEOF",
         "cat > /tmp/f.sh <<'EOF'\necho x > .git/hooks/pre-commit\nEOF\nbash /tmp/f.sh",
-        // A shell wrapper with a preamble or operands keeps its shell head.
         "sh -c 'cp \"$1\" \"$2\"' _ hook.sh .git/hooks/pre-commit",
         ">.claude/settings.json bash -c true",
         "X=\"$(cp cfg .claude/settings.json)\"; bash -c true",
-        // A comment, where a quote is text.
         "echo hi #'\nrm -rf .claude/hooks\n# '",
         "mkdir -p \"/tmp/x; cat \"; cp cfg \"/tmp/x; cat /../..$PWD/.claude/settings.json\"; : '<<'",
-        // A function that shadows a read-only head.
         "ls() { rm -rf \"$@\"; }; ls .claude/hooks",
         "ls () ( rm -rf \"$@\" ); ls .claude/hooks",
-        // A head no table proves read-only.
         "psql -Atc 'select 1' | grep -o '\\.claude/[^ ]*'",
         "N=/tmp/n.md; cat > \"$N\" <<'EOF'\nSee .claude/rules/x.md.\nEOF\nlucidos successor start --narrative \"$N\"",
-        // A sed that edits in place, runs a script file, or writes or runs
-        // from its script.
         "sed -i.bak s/a/b/ .claude/rules/x.md",
         "sed -i '' 's/a/b/' .claude/rules/x.md",
         "sed -Ei 's/a/b/' .claude/rules/x.md",
@@ -508,9 +451,7 @@ fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
         "sed 's/[/]/x/w .claude/x' in.txt",
         "sed s/a/b/ -i .claude/x",
         "sed --sandboxed 's/a/b/' .claude/x",
-        // A path-qualified head may be any binary.
         "/tmp/bin/sed -n p .claude/x",
-        // A substitution whose body writes, at any depth.
         "echo $(rm -rf .claude/x)",
         "x=$(sed -i s/a/b/ .claude/y)",
         "echo $(echo $(rm .git/index))",
@@ -520,7 +461,6 @@ fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
         "diff <(rm .claude/a) b",
         "cat .claude/x > >(sh)",
         "cat <<EOF\n$(cat .claude/x)\nEOF",
-        // Spliced output can inject a flag or name the path a redirect writes.
         "sed -n \"$(echo 1)p\" .claude/x",
         ">$(printf .claude/x) cat a",
         "cat a > $(printf .claude/x)",
@@ -528,10 +468,8 @@ fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
         "cd x; sort a > $(echo .claude/x)",
         "cp a \"$(echo .claude/x)\"",
         "ls <>$(echo .claude/x)",
-        // A code-injecting variable can run another binary under a read head.
         "PATH=./bin; cat .claude/x",
         "PATH=$(pwd)/bin cat .claude/x",
-        // A loop or `if` body that writes, or a keyword that hides a writer.
         "for f in .claude/*; do rm \"$f\"; done",
         "if true; then cp a .git/hooks/x; fi",
         "while read f; do rm \"$f\"; done < .claude/list",
@@ -544,29 +482,22 @@ fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
         "for f in a; do\nrm .claude/x\ndone",
         "case .claude/x in *) ;; esac",
         "for f in $(rm .claude/x); do :; done",
-        // A comment ends at its line, and a quoted group word is still text.
         "# note\nrm .claude/x",
         "echo \"(\"; f() { rm .claude/x; }; f",
-        // A `#` that the shell reads as text opens no comment.
         "find .claude/ -name \\;# -o -delete",
         "find .claude/ -name ';#' -o -delete <<< x",
         "git log 'a;#' --output=.claude/settings.json; # x",
         "sort 'a;#' -o .claude/settings.json; # x",
-        // A noclobber override or `>&word` still redirects into the file.
         "cat .claude/rules/a >| .claude/settings.json",
         "cat .claude/rules/a >! .claude/settings.json",
         "cat a >| $(echo .claude/x)",
         "cat .claude/rules/a >&.claude/settings.json",
-        // An ANSI-C word can spell any option or script.
         "sed -n $' #\\nw .claude/settings.json' in.txt",
         "sort $'-o.claude/x' a",
-        // A nested backtick runs its body.
         "echo `echo \\`touch .claude/x\\``",
-        // BSD sed reads a delimiter inside brackets as text, and `-l` as a flag.
         "sed -n 's/[/]/p;/w .claude/rules/p' in.txt",
         "sed -n 's/[[:alpha:]/]/p;/w .claude/rules/p' in.txt",
         "sed -l 's/a/b/w .claude/settings.json' p",
-        // A loop or printf can set a variable that changes what runs or where.
         "for PATH in ./bin; do cat .claude/x; done",
         "printf -v PATH ./bin; cat .claude/x",
         "TMPDIR=.claude/ sort big.txt",
@@ -577,9 +508,6 @@ fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
     }
 }
 
-/// A command that only mentions or reads a protected path is not protected.
-/// The engine matches every Bash grant itself, so refusing one of these
-/// carded it on every call with no "Always allow" (ADR 0634).
 #[test]
 fn input_touches_protected_path_ignores_a_mention_or_a_read() {
     for command in [
@@ -596,7 +524,6 @@ fn input_touches_protected_path_ignores_a_mention_or_a_read() {
         "zsh -lc 'grep -rn TODO .claude/rules'",
         "/bin/zsh -lc 'bash -c \"cat .claude/rules/a.md\"'",
         "cd /repo && grep -rn x .claude/rules",
-        // A sed that only prints to stdout.
         "sed -n '64,67p' .claude/rules/x.md",
         "rg -n x .claude/rules | sed \"s|a||\"",
         "sed -n '1p;5p' .claude/rules/x.md",
@@ -612,8 +539,6 @@ fn input_touches_protected_path_ignores_a_mention_or_a_read() {
         "sed -n '0~4p' .claude/rules/x.md 2>/dev/null",
         "sed 'r .claude/rules/y.md' .claude/rules/x.md",
         "sed --quiet --regexp-extended -e '1,3p' -- .claude/rules/x.md",
-        // A substitution whose body reads, with its output in an assignment or
-        // standing in for a path.
         "x=$(sed -n 1p .claude/rules/a.md)",
         "x=\"$(cat .claude/rules/a.md)\"",
         "n=`wc -l < .claude/rules/a.md`",
@@ -622,7 +547,6 @@ fn input_touches_protected_path_ignores_a_mention_or_a_read() {
         "X=$(cat .claude/rules/a.md) grep -n y .claude/rules/b.md",
         "diff <(cat .claude/a) b",
         "diff <(git show main:.claude/rules/a.md) .claude/rules/a.md",
-        // A loop or `if` whose every command reads.
         "R=/repo; rg -n x .claude/rules | sed \"s|$R/||\"",
         "for f in a .claude/rules/x.md:84; do ln=${f##*:}; line=$(sed -n \"${ln}p\" \"$f\"); done",
         "for f in $(ls .claude/rules); do wc -l \"$f\"; done",
@@ -630,31 +554,25 @@ fn input_touches_protected_path_ignores_a_mention_or_a_read() {
         "if grep -q x .claude/a; then cat .claude/b; else echo no; fi",
         "! grep -q x .claude/rules/a.md",
         "for f in .claude/rules/*.md; do\nhead -3 \"$f\"\ndone",
-        // A quoted `(` or `{` is text, not a group.
         "grep -E \"(a|b)\" .claude/rules/x.md",
         "echo \"see .claude/x (y)\"",
         "grep -n '{' .claude/settings.json",
-        // A spliced word under a head with no writing option.
         "cd \"$(git rev-parse --show-toplevel)\" && cat .claude/x",
         "readlink -f \"$(pwd)/.claude\"",
         "cat \"$(git rev-parse --show-toplevel)/.claude/x\"",
         "ls $(dirname .claude/rules/x.md)",
         "cat $(echo .claude/x)",
-        // A sort with only reading options.
         "sort .claude/list",
         "sort -u -k2,2 -t: .claude/list",
         "grep x .claude/a | sort -rn | head",
         "sort --reverse --key=2 -- .claude/list",
-        // A comment line, or a comment after a command.
         "# list the rules\nls .claude/rules",
         "cat .claude/x # example: echo x > .claude/y",
         "ls .claude/rules # don't touch",
         "cat .claude/x # example: echo $'x'",
         "sort .claude/list # not sort -o",
-        // A bracket that holds no delimiter.
         "sed -n '/[0-9]/p' .claude/rules/x.md",
         "sed 's/[[:space:]]*$//' .claude/rules/x.md",
-        // git calls that write only git's own index, objects and refs.
         "git check-ignore -v .claude/settings.local.json",
         "git for-each-ref refs/heads | grep .claude/",
         "git merge-base --is-ancestor HEAD main && cat .claude/x",
@@ -675,9 +593,6 @@ fn input_touches_protected_path_returns_false_for_unrelated_bash_command() {
 
 #[test]
 fn input_touches_protected_path_does_not_match_substrings_without_trailing_slash() {
-    // `.claude` (no slash) and `.git` (no slash) appear in unrelated
-    // identifiers — `.claude_backup`, file extension `.gitignore`, etc.
-    // The trailing slash anchors to the actual protected directory.
     let input = serde_json::json!({"command": "cat .gitignore"});
     assert!(!input_touches_protected_path("Bash", &input));
     let input = serde_json::json!({"command": "ls .claude_backup"});
@@ -686,11 +601,6 @@ fn input_touches_protected_path_does_not_match_substrings_without_trailing_slash
 
 #[test]
 fn input_touches_protected_path_returns_false_for_non_bash_tools() {
-    // Read / Edit / Glob / Grep / NotebookEdit on `~/.claude/skills/...`
-    // all auto-approved silently under bare allowlist entries (see
-    // `CC_PROTECTED_PATH_MARKERS` doc) — so the filter is Bash-only.
-    // Widen the match arm in `input_touches_protected_path` if CC
-    // tightens later.
     let edit_input = serde_json::json!({
         "file_path": "/Users/me/repo/.claude/commands/harden.md",
         "old_string": "x",
@@ -748,8 +658,6 @@ fn derive_allow_pattern_narrow_returns_none_when_bash_command_touches_dot_git() 
 
 #[test]
 fn derive_allow_pattern_session_returns_none_when_bash_command_touches_dot_claude() {
-    // A session pattern is a head grant like the narrow one, so it never
-    // covers a protected-path write either.
     let input = serde_json::json!({
         "command": "rm -rf /Users/me/.claude/skills/grill"
     });
@@ -761,8 +669,6 @@ fn derive_allow_pattern_session_returns_none_when_bash_command_touches_dot_claud
 
 #[test]
 fn derive_allow_pattern_broad_unaffected_for_unrelated_bash_command() {
-    // Regression guard: the protected-path filter must NOT suppress
-    // legitimate Broad/Narrow grants for ordinary commands.
     let input = serde_json::json!({"command": "git status"});
     assert_eq!(
         derive_allow_pattern("Bash", &input, AllowScope::Broad, &TrustedHeads::NONE).as_deref(),
@@ -819,8 +725,6 @@ fn derive_allow_pattern_session_notebookedit_uses_notebook_path() {
 
 #[test]
 fn derive_allow_pattern_session_two_edits_to_same_file_match() {
-    // Different `old_string`/`new_string` payloads must derive the same
-    // session pattern so the second prompt auto-resolves against the first.
     let a = serde_json::json!({"file_path": "/x", "old_string": "a", "new_string": "b"});
     let b = serde_json::json!({"file_path": "/x", "old_string": "c", "new_string": "d"});
     assert_eq!(
@@ -856,9 +760,6 @@ fn derive_allow_pattern_session_skill_reuses_narrow_pattern() {
     );
 }
 
-/// Bare-tool fallback for tools without a narrow sub-scope. Session scope
-/// is engine-side, so `BROAD_ALLOW_INEFFECTIVE` does not apply — the user
-/// gets to remember any prompt for the rest of the thread.
 #[test]
 fn derive_allow_pattern_session_other_tool_falls_back_to_bare_name() {
     let input = serde_json::json!({"pattern": "foo"});
@@ -867,9 +768,6 @@ fn derive_allow_pattern_session_other_tool_falls_back_to_bare_name() {
         Some("Read"),
     );
 }
-
-// Reading and rewriting the file are covered in `core::grants` and
-// `permission::tool_grants`, which own it for all three permission lanes.
 
 #[test]
 fn allowed_tools_flag_keeps_grants_in_order_after_the_engine_tools() {

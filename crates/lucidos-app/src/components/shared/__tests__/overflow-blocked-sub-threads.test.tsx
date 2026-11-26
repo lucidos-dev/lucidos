@@ -61,7 +61,12 @@ describe('Blocking sub-threads in the thread overflow menu', () => {
             `Fix login redirect${SUB_THREAD_STATE.running}`,
             `Bump the SDK${SUB_THREAD_STATE.pending_change}`,
         ]);
-        for (const exit of menu.querySelectorAll('.thread-overflow-item-blocked')) {
+        const exits = [...menu.querySelectorAll<HTMLButtonElement>('.thread-overflow-item-blocked')];
+        expect(exits).not.toHaveLength(0);
+        for (const exit of exits) {
+            expect(exit.getAttribute('aria-disabled')).toBe('true');
+            exit.focus();
+            expect(document.activeElement).toBe(exit);
             expect(exit.querySelector('.visually-hidden')?.textContent?.trim()).toBe(blockedBySubThreads(2));
         }
 

@@ -1,11 +1,3 @@
-//! Keeps the proxy's injected credentials out of what it hands back.
-//!
-//! The proxy injects a credential so the caller never holds it. An upstream
-//! can still repeat it: a pagination `Link`, a redirect `Location`, an error
-//! body quoting the request. [`InjectedSecrets`] collects every form the
-//! upstream received, and `proxy::forward_with_redirects` masks them in the
-//! reply and in its refusals before either leaves.
-
 use axum::body::{Body, Bytes};
 use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -14,19 +6,13 @@ use axum::response::Response;
 use crate::api::proxy_pipeline::PipelineOutcome;
 use crate::core::{redact_secret_bytes, redact_secret_values};
 
-/// Headers that describe the upstream's exact bytes. A masked body no longer
-/// matches them, so they go with the change.
 const BYTE_DESCRIBING_HEADERS: [&str; 4] =
     ["content-length", "content-digest", "repr-digest", "digest"];
 
-/// Every form of every credential the pipeline put on the wire, over all
-/// hops of one forwarded call.
 #[derive(Debug, Default)]
 pub(crate) struct InjectedSecrets(Vec<String>);
 
 impl InjectedSecrets {
-    /// Record what one hop's pipeline sent: each injected header value and
-    /// query value, plus the forms an upstream can derive from them.
     pub(crate) fn add_hop(&mut self, outcome: &PipelineOutcome) {
         let header_values = outcome.headers.iter().map(|(_, value)| value);
         for value in header_values {
@@ -47,8 +33,6 @@ impl InjectedSecrets {
         self.0.is_empty()
     }
 
-    /// The caller's headers for one hop. With a credential on it, the hop asks
-    /// for an uncompressed reply, which is the only kind the proxy can mask.
     pub(crate) fn request_headers(&self, caller: &HeaderMap) -> HeaderMap {
         let mut headers = caller.clone();
         if !self.is_empty() {
@@ -61,12 +45,6 @@ impl InjectedSecrets {
         redact_secret_values(text, &self.0)
     }
 
-    /// The reply with every injected credential masked in its headers and
-    /// body. A reply that names none comes back byte for byte.
-    ///
-    /// An encoded body cannot be read, so it is refused rather than passed on
-    /// unchecked. The hop asked for `identity`, so only an upstream that
-    /// ignored the request sends one.
     pub(crate) async fn redact_response(
         &self,
         response: Response,
@@ -82,7 +60,6 @@ impl InjectedSecrets {
             )
         })?;
         if let Some(encoding) = unreadable_encoding(&parts.headers, &body) {
-            // The coding name is upstream text, so it can carry an echo too.
             return Err((
                 StatusCode::BAD_GATEWAY,
                 self.redact_text(&format!(
@@ -115,9 +92,6 @@ impl InjectedSecrets {
         }
     }
 
-    /// `value` and the forms an echo may carry it in. A URL percent-encodes
-    /// it, in either hex case, with a space as `%20` or `+`. A JSON encoder
-    /// may write `/` as `\/`.
     fn add_with_echo_forms(&mut self, value: &str) {
         let encoded = urlencoding::encode(value).into_owned();
         let lower_hex = lowercase_percent_escapes(&encoded);
@@ -133,8 +107,6 @@ impl InjectedSecrets {
         self.add(lower_hex);
     }
 
-    /// The `user:password` pair a Basic credential decodes to, and the
-    /// password alone. An upstream that decoded the header can quote either.
     fn add_basic_pair(&mut self, credentials: &str) {
         use base64::Engine;
         let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(credentials) else {
@@ -150,9 +122,6 @@ impl InjectedSecrets {
     }
 }
 
-/// Split an `Authorization`-style value into its scheme and its single
-/// credential token (RFC 9110 §11.4), as in `Bearer <token>`. A value with
-/// parameters after the scheme yields `None`: it has no one token to split.
 fn auth_scheme_credentials(value: &str) -> Option<(&str, &str)> {
     let (scheme, credentials) = value.split_once(' ')?;
     let credentials = credentials.trim_start_matches(' ');
@@ -163,8 +132,6 @@ fn auth_scheme_credentials(value: &str) -> Option<(&str, &str)> {
     (scheme_ok && credentials_ok).then_some((scheme, credentials))
 }
 
-/// `%2B` read as `%2b`. Percent escapes are case-insensitive, so an upstream
-/// may echo either.
 fn lowercase_percent_escapes(encoded: &str) -> String {
     let mut out = String::with_capacity(encoded.len());
     let mut chars = encoded.chars();
@@ -177,7 +144,6 @@ fn lowercase_percent_escapes(encoded: &str) -> String {
     out
 }
 
-/// The body's content coding, unless it is one the proxy can read as is.
 fn unreadable_encoding(headers: &HeaderMap, body: &Bytes) -> Option<String> {
     if body.is_empty() {
         return None;
@@ -226,7 +192,6 @@ mod tests {
 
     #[test]
     fn a_basic_header_yields_its_decoded_pair_and_password() {
-        // base64("user:hunter22")
         let secrets = secrets_of(&outcome(
             &[("authorization", "Basic dXNlcjpodW50ZXIyMg==")],
             &[],

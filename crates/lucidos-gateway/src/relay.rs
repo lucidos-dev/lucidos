@@ -1,16 +1,3 @@
-//! The relay: gateway A serves gateway B's workspaces to A's own devices.
-//!
-//! A routes `/<slug>@<name>/*` to B's `/~/api/gateway/v1/relay/<slug>/*`. It
-//! presents its gateway credential and a claim naming the calling device and
-//! the outside prefix, signed with an HMAC keyed by the credential. B checks
-//! both, stamps the device under a namespaced id, and serves the request
-//! through its ordinary workspace route. ADR 0591 records why this is the one
-//! hop that proxies another gateway's workspaces.
-//! A serves its own frontend; only B's data and sandboxed content cross this
-//! hop into A's browser origin (ADR 0723).
-//!
-//! Both halves live here: [`relay`] is A's, [`receive`] is B's.
-
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -27,43 +14,26 @@ use crate::gateway_protocol::{
 use crate::relay_timing::{Label, ReceiveClock, RelayClock};
 use crate::server::GatewayState;
 
-/// The relay call, relative to [`GATEWAY_API_PREFIX`].
 pub const RELAY_PATH: &str = "/relay";
 
-/// The header carrying A's claim about the calling device.
 pub const HEADER_RELAY_CLAIM: &str = "x-lucidos-relay-claim";
 
-/// The header carrying the claim's HMAC, in lowercase hex.
 pub const HEADER_RELAY_SIGNATURE: &str = "x-lucidos-relay-signature";
 
-/// Present when A's browser runs on A's machine. Its value is the HMAC of the
-/// claim plus [`LOCAL_BROWSER_BINDING`], so it holds for that claim only. A
-/// gateway that predates it ignores it, which is why it is not a claim field.
 pub const HEADER_RELAY_LOCAL_BROWSER: &str = "x-lucidos-relay-local-browser";
 
-/// Appended to the claim before signing the local-browser stamp, so the stamp's
-/// MAC can never equal the claim's own.
 const LOCAL_BROWSER_BINDING: &str = "|local-browser";
 
-/// The user A holds the calling device under, as `<id>|<name>|<emails>`,
-/// each percent-encoded, the emails comma-joined (ADR 0623). Beside the claim
-/// rather than in it, so a gateway that predates users ignores it. An
-/// older A sends no emails field.
 pub const HEADER_RELAY_USER: &str = "x-lucidos-relay-user";
 
-/// The HMAC of the claim, [`USER_BINDING`] and the user value, so the
-/// user holds for that claim only.
 pub const HEADER_RELAY_USER_SIGNATURE: &str = "x-lucidos-relay-user-signature";
 
 const USER_BINDING: &str = "|user|";
 
-/// The HMAC of the claim, [`CONTRACT_BINDING`] and the client contracts A
-/// negotiated. B recomputes it from its own and refuses a mismatch with 426.
 pub const HEADER_RELAY_CONTRACT: &str = "x-lucidos-relay-contract";
 
 const CONTRACT_BINDING: &str = "|contract|";
 
-/// The [`HEADER_RELAY_CONTRACT`] value for `binding` on `claim`.
 pub fn sign_contract(credential: &str, claim: &str, binding: &str) -> String {
     sign(credential, &format!("{claim}{CONTRACT_BINDING}{binding}"))
 }
@@ -76,8 +46,6 @@ pub const LEGACY_HEADER_RELAY_OPERATOR: &str = "x-lucidos-relay-operator";
 pub const LEGACY_HEADER_RELAY_OPERATOR_SIGNATURE: &str = "x-lucidos-relay-operator-signature";
 const LEGACY_OPERATOR_BINDING: &str = "|operator|";
 
-/// Every header that carries a relayed user, old names included, so a proxy
-/// can strip them all.
 pub const RELAY_USER_HEADERS: [&str; 4] = [
     HEADER_RELAY_USER,
     HEADER_RELAY_USER_SIGNATURE,
@@ -85,13 +53,10 @@ pub const RELAY_USER_HEADERS: [&str; 4] = [
     LEGACY_HEADER_RELAY_OPERATOR_SIGNATURE,
 ];
 
-/// A user as A signs it for B.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayedUser {
     pub id: String,
     pub name: String,
-    /// What lets B tell the user is one of its own: B merges a relayed
-    /// user into the local user holding the same email.
     pub emails: Vec<String>,
 }
 
@@ -125,13 +90,10 @@ impl RelayedUser {
     }
 }
 
-/// The [`HEADER_RELAY_USER_SIGNATURE`] value for `user` on `claim`.
 pub fn sign_user(credential: &str, claim: &str, user: &str) -> String {
     sign(credential, &format!("{claim}{USER_BINDING}{user}"))
 }
 
-/// The user A signed for this verified request, if any. A missing or
-/// forged signature carries none: only A's signature may name a user.
 pub fn signed_user(headers: &HeaderMap, credential: &str) -> Option<RelayedUser> {
     let read = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let claim = read(HEADER_RELAY_CLAIM)?;
@@ -153,31 +115,18 @@ pub fn signed_user(headers: &HeaderMap, credential: &str) -> Option<RelayedUser>
     RelayedUser::decode(user)
 }
 
-/// The first field of every claim. A new claim shape gets a new version.
 const CLAIM_VERSION: &str = "v1";
 
-/// Separates claim fields. `urlencoding` escapes it, so no field contains it.
 const CLAIM_SEPARATOR: char = '|';
 
-/// How far a claim's issue time may sit from B's clock, either way.
 pub(crate) const CLAIM_MAX_SKEW_SECS: u64 = 300;
 
-/// Split a route segment `<slug>@<name>` into its halves.
-///
-/// `None` unless both halves are valid ids. `@` is never part of a slug, so a
-/// `None` here falls through to the local lookup, which misses.
 pub fn remote_route(segment: &str) -> Option<(&str, &str)> {
     let (slug, name) = segment.split_once(lucidos_gateway_constants::REMOTE_ROUTE_SEPARATOR)?;
     (crate::registry::is_valid_id(slug) && crate::registry::is_valid_id(name))
         .then_some((slug, name))
 }
 
-/// Does A pass this request to a remote gateway for B to verify?
-///
-/// A frame capability on a remote route is B's to verify, since B's engine
-/// minted it and only B holds the key. So A checks its shape and nothing else:
-/// a read-only, non-upgrade request with no dot segment. B then refuses a
-/// capability that does not verify, because the claim carries no device.
 pub fn carries_a_remote_frame_capability(req: &Request) -> bool {
     let path = req.uri().path();
     let remote = path
@@ -192,19 +141,14 @@ pub fn carries_a_remote_frame_capability(req: &Request) -> bool {
         && !req.headers().contains_key(header::UPGRADE)
 }
 
-/// What A says about one relayed request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayClaim {
     pub issued_at: i64,
-    /// Where the browser sees the workspace on A: `/<slug>@<name>/`.
     pub prefix: String,
-    /// The device A authenticated. `None` for what A admits without one.
     pub device: Option<AuthenticatedDevice>,
 }
 
 impl RelayClaim {
-    /// The claim as one header value: version, issue time, prefix, device id
-    /// and label, each percent-encoded.
     pub fn encode(&self) -> String {
         let (id, label) = match &self.device {
             Some(d) => (d.id.as_str(), d.label.as_str()),
@@ -241,7 +185,6 @@ impl RelayClaim {
     }
 }
 
-/// The HMAC-SHA256 of `claim`, keyed by `credential`, in lowercase hex.
 pub fn sign(credential: &str, claim: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(credential.as_bytes())
         .expect("HMAC takes a key of any length");
@@ -253,12 +196,10 @@ pub fn sign(credential: &str, claim: &str) -> String {
         .collect()
 }
 
-/// The [`HEADER_RELAY_LOCAL_BROWSER`] value for `claim`.
 pub fn sign_local_browser(credential: &str, claim: &str) -> String {
     sign(credential, &format!("{claim}{LOCAL_BROWSER_BINDING}"))
 }
 
-/// Does this verified request carry A's stamp that its browser is local to A?
 fn stamped_local_browser(headers: &HeaderMap, credential: &str) -> bool {
     let read = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     match (read(HEADER_RELAY_CLAIM), read(HEADER_RELAY_LOCAL_BROWSER)) {
@@ -267,8 +208,6 @@ fn stamped_local_browser(headers: &HeaderMap, credential: &str) -> bool {
     }
 }
 
-/// Why B refused a relayed request. Each is a 401: A holds a credential, so
-/// the reason is for its log, not for a user.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ClaimRefusal {
     Missing,
@@ -294,11 +233,6 @@ impl ClaimRefusal {
     }
 }
 
-/// B's check of a workspace claim, against the credential the request
-/// presented.
-///
-/// The prefix must be `/<slug>@<name>/` for the slug in the path, so A cannot
-/// point B's engine at another workspace's address.
 pub fn verify_claim(
     headers: &HeaderMap,
     credential: &str,
@@ -314,9 +248,6 @@ pub fn verify_claim(
     })
 }
 
-/// The checks every claim kind shares: signature, shape, age and device id.
-/// `prefix_fits` decides which route the claim was signed for, so a claim
-/// for one route never verifies on another.
 pub(crate) fn verify_signed_claim(
     headers: &HeaderMap,
     credential: &str,
@@ -348,8 +279,6 @@ pub(crate) fn verify_signed_claim(
     Ok(claim)
 }
 
-/// A device id B can namespace: the characters A's own ids use, and no `:`,
-/// which separates the pairing id from the device id.
 fn is_usable_device_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -358,16 +287,10 @@ fn is_usable_device_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// The device id B's engine sees for a relayed device.
 pub fn namespaced_device_id(pairing_id: &str, device_id: &str) -> String {
     format!("{pairing_id}:{device_id}")
 }
 
-/// A's half: relay `req`, addressed to `/<slug>@<name>/…`, to remote gateway
-/// `name`.
-///
-/// `enforce` already ran, so the caller is a device A authenticated, or a
-/// request A admits without one. The claim says which.
 pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -> Response {
     let route = format!("/{slug}@{name}");
     let peer = req
@@ -380,7 +303,6 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
     crate::relay_timing::timed_response(clock, flight, response)
 }
 
-/// [`relay`], marking each stage on `clock` as it passes.
 async fn relay_timed(
     state: &GatewayState,
     slug: &str,
@@ -389,9 +311,6 @@ async fn relay_timed(
     req: Request,
     clock: &mut RelayClock,
 ) -> Response {
-    // A page load that B cannot serve goes back to the workspace list, which
-    // says what is wrong with B. A remembered remote workspace then never
-    // traps a launch on an error page.
     let navigation = crate::auth_api::is_top_level_navigation(req.headers());
     let to_the_list = || redirect(&format!("/{}/?pick", crate::registry::SIGIL));
     let Some(remote) = state
@@ -419,8 +338,6 @@ async fn relay_timed(
         Some(rest) if rest.starts_with('/') => rest,
         _ => return redirect(&format!("{route}/")),
     };
-    // A URL parser collapses `..`, so `/dev@cloud/../../~/api/gateway/v1/…`
-    // would reach another of B's gateway calls with A's credential.
     if crate::auth_api::carries_a_dot_segment(req.uri().path()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -499,7 +416,6 @@ async fn relay_timed(
     }
 }
 
-/// One relayed workspace on B, as one request reaches it.
 struct Peer<'a> {
     state: &'a GatewayState,
     remote: &'a crate::remote_gateways::RemoteGateway,
@@ -510,8 +426,6 @@ struct Peer<'a> {
 }
 
 impl Peer<'_> {
-    /// Send `req` to B for `rest`, signed with the caller's device claim and
-    /// the contract binding. `drop` names request headers B must not see.
     async fn send(
         &self,
         rest: &str,
@@ -544,11 +458,6 @@ impl Peer<'_> {
         let path = format!("{GATEWAY_API_PREFIX}{RELAY_PATH}/{slug}{rest}");
         let mut headers = HeaderMap::new();
         for (header_name, value) in &parts.headers {
-            // A already checked browser origin and the public/capability exemptions.
-            // This is now a signed gateway hop, not a browser request at B's origin.
-            // Forwarding A's Origin with B's Host makes legitimate writes fail;
-            // forwarding an opaque app's metadata also blocks its public resources.
-            // B derives device authority only from the signed claim, never cookies.
             let consumed = header_name == header::ORIGIN
                 || header_name == header::COOKIE
                 || header_name == "sec-fetch-site"
@@ -601,11 +510,8 @@ impl Peer<'_> {
     }
 }
 
-/// The largest shell A reads from B to stamp.
 const MAX_PEER_SHELL_BYTES: usize = 4 * 1024 * 1024;
 
-/// Request headers that would let B answer the shell with anything but a
-/// complete, uncompressed document A can stamp.
 fn shell_fetch_drops() -> [HeaderName; 5] {
     [
         header::ACCEPT_ENCODING,
@@ -616,8 +522,6 @@ fn shell_fetch_drops() -> [HeaderName; 5] {
     ]
 }
 
-/// Trusted pairing: B's own client, at A's origin. A worker script never
-/// comes from B, and A keeps its own manifest.
 async fn serve_peer_client(peer: &Peer<'_>, rest: &str, req: Request) -> Response {
     let (state, route, name) = (peer.state, peer.route, peer.remote.name.as_str());
     if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
@@ -668,8 +572,6 @@ async fn serve_peer_client(peer: &Peer<'_>, rest: &str, req: Request) -> Respons
     }
 }
 
-/// An asset B lacks comes from A's installed client. A fallback shell is A's
-/// own build, so its hashed bundle names exist only here.
 async fn own_client_asset(peer: &Peer<'_>, rest: &str, method: axum::http::Method) -> Response {
     let Ok(req) = Request::builder().method(method).body(Body::empty()) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -677,8 +579,6 @@ async fn own_client_asset(peer: &Peer<'_>, rest: &str, method: axum::http::Metho
     crate::server::serve_remote_client(peer.state, peer.route, rest, req, None).await
 }
 
-/// B's shell document, or `None` when B did not send a complete HTML page
-/// within the peer timeout.
 async fn peer_shell(peer: &Peer<'_>, rest: &str, req: Request) -> Option<String> {
     tokio::time::timeout(
         crate::peer_connection::PEER_TIMEOUT,
@@ -719,8 +619,6 @@ async fn read_peer_shell(peer: &Peer<'_>, rest: &str, req: Request) -> Option<St
     String::from_utf8(bytes).ok()
 }
 
-/// One of B's client assets, at A's origin. Unlike `data_response` it runs
-/// unsandboxed, so it keeps no redirect and no header that sets origin state.
 fn peer_client_response(response: reqwest::Response) -> Response {
     if response.status().is_redirection() && response.status() != StatusCode::NOT_MODIFIED {
         return (
@@ -738,8 +636,6 @@ fn peer_client_response(response: reqwest::Response) -> Response {
     out
 }
 
-/// B's health and engine contract probes for one relayed request. `Ok` holds
-/// what A learned about B, or `Err` the response that ends the request.
 async fn probe(
     state: &GatewayState,
     client: &crate::peer_connection::PeerConnection,
@@ -772,7 +668,6 @@ async fn probe(
     let Some(gateway) = crate::remote_browser::compatible(&health) else {
         return Err(crate::remote_browser::upgrade_required());
     };
-    // Never infer the running engine's API from its gateway's release.
     let open = open_device.is_some();
     let Some((_, contract_headers)) =
         signed_claim_headers(state, &remote.credential, format!("{route}/"), open_device)
@@ -809,7 +704,6 @@ async fn probe(
             });
         }
         let starting = response.status() == StatusCode::ACCEPTED;
-        // Bound untrusted health bodies, including streamed/chunked responses.
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream
@@ -877,10 +771,6 @@ async fn probe(
     })
 }
 
-/// `upstream` carrying `body`, as the client's `headers` declare it.
-///
-/// A body streams through, never buffered. A request that declares none
-/// sends none, so a GET does not go out chunked.
 pub(crate) fn with_body(
     upstream: reqwest::RequestBuilder,
     headers: &HeaderMap,
@@ -897,8 +787,6 @@ pub(crate) fn with_body(
     }
 }
 
-/// B's answer for the client, streamed, with only the headers
-/// [`relays_response_header`] lets through.
 pub(crate) fn streamed_response(response: reqwest::Response) -> Response {
     let mut out = Response::builder().status(response.status());
     for (header_name, value) in response.headers() {
@@ -912,9 +800,6 @@ pub(crate) fn streamed_response(response: reqwest::Response) -> Response {
     .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
-/// The claim A signs for `device` at `prefix`, and the headers that carry it:
-/// the claim, its signature, and the signed user when the device has one.
-/// `None` when a value cannot be a header.
 pub(crate) fn signed_claim_headers(
     state: &GatewayState,
     credential: &str,
@@ -965,10 +850,6 @@ pub(crate) fn signed_claim_headers(
     Some((claim, headers))
 }
 
-/// Does a header from B's response reach the browser?
-///
-/// The browser reads it on A's origin. So a header that sets origin-wide state
-/// would reach A's device cookie, A's storage or A's service-worker scope.
 pub(crate) fn relays_response_header(name: &HeaderName) -> bool {
     let n = name.as_str();
     !crate::proxy::is_hop_by_hop(name)
@@ -985,7 +866,6 @@ pub(crate) fn relays_response_header(name: &HeaderName) -> bool {
         )
 }
 
-/// A positive `Content-Length`, as sent.
 fn declared_body_length(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(header::CONTENT_LENGTH)
@@ -1002,11 +882,6 @@ fn redirect(location: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// B's half: serve a request A relayed, behind `require_gateway`.
-///
-/// The claim is checked against the credential the request presented, which
-/// `require_gateway` already matched to a current pairing. The request then
-/// becomes `/<slug>/…` and takes B's ordinary workspace route.
 pub async fn receive(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,
@@ -1055,8 +930,6 @@ pub async fn receive(
         }
     };
     clock.verify = clock.mark();
-    // This signed pairing-only probe exposes the engine contract, never its
-    // health body (which includes private workspace paths and configuration).
     if rest == "/~client" || rest == "/~client/open" {
         if req.method() != axum::http::Method::GET || original.query().is_some() {
             return StatusCode::BAD_REQUEST.into_response();
@@ -1124,9 +997,6 @@ pub async fn receive(
         parts.extensions.insert(device);
     }
     let local = Request::from_parts(parts, body);
-    // A claim with no device reaches only what B admits without one: the OAuth
-    // callback above, public app assets, and a frame capability. B, not A,
-    // verifies a frame capability: B's engine minted it.
     if !has_device
         && !crate::auth_api::is_public_app_asset(local.uri().path())
         && !crate::auth_api::frame_capability_admits(&state, &local)
@@ -1138,8 +1008,6 @@ pub async fn receive(
     clock.finish(response)
 }
 
-/// Remember the user A signed for a relayed device, when it changed, so
-/// B's engines can name the user. A failed write costs only the display.
 fn record_relayed_user(
     state: &GatewayState,
     gateway: &AuthenticatedGateway,
@@ -1156,8 +1024,6 @@ fn record_relayed_user(
     if state.directory().relayed.contains(&seen) {
         return;
     }
-    // Judged under the log lock: an unpair that already ran has forgotten
-    // this pairing's users, so a request still in flight must not add one.
     let pairing_id = &gateway.pairing_id;
     let recorded = state.record(|directory| {
         let paired = state

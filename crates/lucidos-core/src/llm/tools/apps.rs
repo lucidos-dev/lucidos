@@ -1,6 +1,3 @@
-//! LLM-facing schemas for app-management tools (create/list/refresh/capture,
-//! load_knowhow).
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

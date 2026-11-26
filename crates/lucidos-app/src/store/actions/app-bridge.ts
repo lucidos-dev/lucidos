@@ -23,7 +23,7 @@ import { registrationToAwait } from '../../utils/deviceRegistration';
 import { appFrameFor, appIdForFrame } from '../../utils/appFrame';
 import { peerClient } from '../../../../../packages/lucidos-sdk/src/_peerScope';
 import { WORKSPACE_ID } from '../../utils/basePath';
-import { rawStorageKey } from '../../utils/workspaceStorage';
+import { isStorageQuotaError, rawStorageKey, reportStoragePressure } from '../../utils/workspaceStorage';
 import { focusedThreadId, showToast } from '../store';
 import { BRIDGED_FETCH_SLOTS, FetchLanes, type LanesSnapshot } from './bridgedFetchLanes';
 import {
@@ -174,6 +174,12 @@ interface StorageTarget {
   area: AppStorageArea;
 }
 
+class BrowserStorageError extends Error {
+  constructor(readonly reason: 'full' | 'unavailable') {
+    super(reason === 'full' ? 'Browser storage is full' : 'Browser storage is unavailable here');
+  }
+}
+
 function storageTarget(args: StorageArgs): StorageTarget {
   const { space, area } = args;
   if (!APP_STORAGE_SPACES.includes(space as AppStorageSpace)) {
@@ -197,7 +203,7 @@ function browserStore(area: AppStorageArea): Storage {
     if (store) return store;
   } catch {
   }
-  throw new Error('Browser storage is unavailable here');
+  throw new BrowserStorageError('unavailable');
 }
 
 function storedPrefix(appId: string, space: AppStorageSpace): string {
@@ -241,8 +247,15 @@ function storageSet(appId: string, args: StorageArgs): null {
   if (refusal) throw new Error(refusal);
   try {
     store.setItem(prefix + key, value);
-  } catch {
-    throw new Error('Browser storage is full');
+  } catch (error) {
+    if (isStorageQuotaError(error)) {
+      reportStoragePressure(area, store);
+      throw new BrowserStorageError('full');
+    }
+    if (error instanceof DOMException && error.name === 'SecurityError') {
+      throw new BrowserStorageError('unavailable');
+    }
+    throw error;
   }
   return null;
 }
@@ -294,7 +307,7 @@ function runStorageOp(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (storageArgs.space === 'app') {
-      showToast(message, 'error', {
+      showToast(storageFailureMessage(error, message, storageArgs.area), 'error', {
         title: `App "${appId}" could not save`,
         key: `app-storage:${appId}`,
       });
@@ -305,6 +318,18 @@ function runStorageOp(
   }
 }
 
+function storageFailureMessage(error: unknown, message: string, area: unknown): string {
+  if (!(error instanceof BrowserStorageError)) {
+    return `If this keeps happening, report it to the app author. ${message}`;
+  }
+  if (error.reason === 'full') {
+    if (area === 'session') {
+      return 'Browser storage is full for this tab. Copy any unsaved work, then close this tab, reopen Lucidos, and try again.';
+    }
+    return 'Browser storage is full. Open Lucidos in another browser or on another device. Clearing Lucidos site data can remove drafts and app settings on this device.';
+  }
+  return 'Browser storage is unavailable. Allow site data for Lucidos in your browser settings, or try another browser or device.';
+}
 
 const MAX_BREADCRUMB_DETAIL_BYTES = 2000;
 

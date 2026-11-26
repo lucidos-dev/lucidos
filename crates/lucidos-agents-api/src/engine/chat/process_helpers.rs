@@ -1,7 +1,3 @@
-//! Pure helpers and constructors used by the chat process flow. None touch
-//! `LucidosEngine` — free functions and constants reusable across the chat
-//! module.
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
@@ -15,119 +11,39 @@ use crate::engine::thread_events::{
 };
 use crate::engine::types::AgentSession;
 
-/// Trigger context passed into the chat process flow. None for user-driven chat.
 pub(super) struct TriggerContext {
     pub trigger_id: String,
     pub trigger_name: String,
-    /// Stable kebab-case slug of the firing trigger, used to scope the
-    /// per-trigger know-how listing in the fire's message to
-    /// `data/triggers/{slug}/knowhow/`.
     pub slug: String,
     pub go_to_review: bool,
-    /// The MCP servers the trigger lists. The fire enables each in its thread
-    /// before round 1 (ADR 0430).
     pub mcp_servers: Vec<String>,
     pub turn: TriggerTurn,
 }
 
-/// How a trigger turn begins.
 pub(super) enum TriggerTurn {
-    /// A fire: its turn opens with `TriggerStarted`.
     Fire(TriggerFire),
-    /// A run the owner allowed after it parked on a grant card. It carries on
-    /// its own turn, so it runs only with a pre-emitted origin. The queue
-    /// already completed its entry.
     Resume,
 }
 
-/// What a fire carries beyond its trigger.
 pub(super) struct TriggerFire {
     pub retry_of: Option<RetryOf>,
     pub invocation: TriggerInvocation,
-    /// The *Thread Queue* entry this fire was admitted under.
-    ///
-    /// A trigger entry binds no thread at submit time, so the turn reports the
-    /// id it mints back to the queue through
-    /// `ThreadQueue::record_entry_thread`. That is what lets the boot sweep
-    /// hand a fire that already started to thread-level recovery instead of
-    /// running it a second time (ADR 0133).
-    ///
-    /// Not an `Option`, because every trigger fire is admitted by the queue
-    /// before it runs. A nullable id would let a new fire path skip the report
-    /// and silently re-run after every restart, which is the bug ADR 0133
-    /// fixed. The compiler carries the id from the executor instead.
     pub queue_entry_id: Uuid,
-    /// A new thread's continue key claim (ADR 0623). The turn writes the key
-    /// into `TriggerStarted`, then releases the claim.
     pub continue_key: Option<crate::triggers::continue_key::ContinueKeyClaim>,
-    /// The email the trigger's actor field resolved to (ADR 0623).
     pub actor_email: Option<String>,
 }
 
-/// What restarts actually do to a chat thread, written as the chat-system
-/// prompt block. The threading model: events are persisted in PostgreSQL, so
-/// when the user returns to a thread its full history reloads on the next LLM
-/// turn (see the `Load conversation history from DB` step in the same module).
-/// What does NOT survive is anything in-flight: a streaming response or an
-/// autonomous loop. A child's report does survive, since its card is durable. The earlier wording said the
-/// thread itself was "wiped" and the LLM had "NO memory", which led the LLM
-/// to instruct users to start a NEW thread after a restart instead of
-/// returning to the existing one (observed in the
-/// `Status of Authentication Migration` thread).
 pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGHT WORK, NOT THREAD MEMORY:\nThe thread survives a restart: every message, tool call and response is persisted, and your next turn loads the full history. Send the user back to THIS thread to re-prompt, never to a fresh one. In-flight work does NOT survive: a streaming response, an autonomous loop, a `sleep N minutes then check back` intent. You do not run between turns, and nothing resumes on its own once a restart cuts a response off, so never promise anything \"after the restart\", \"once it comes back up\", or \"check back later\".";
 
-/// Stops the chat agent from bouncing yes/no "did you apply it? / did you
-/// restart?" confirmations back at the user during the apply→restart loop.
-/// The agent owns the grouped `changes` tool (action list/apply) and can probe served assets, so
-/// it must inspect and verify state itself rather than asking. Motivated by a
-/// font-fix session where, after applying a backend change, the agent kept
-/// asking the user to confirm they'd applied/restarted and "does it match
-/// now?" instead of checking. Pairs with `ENGINE_RESTART_RULE` (the agent
-/// CANNOT restart the engine — only the user triggers the rebuild) and the
-/// `ASK_USER_QUESTION_RULE` carve-out (ask only for genuine decisions). The
-/// served-asset probe note records the gateway routing gotcha: bundled SDK /
-/// static assets live under the workspace-prefixed route.
-///
-/// **Install-independent half.** Everything here holds wherever *changes*
-/// exist — which includes an install with no Lucidos source checkout, since
-/// app coding-agent threads still propose changes the user Applies. The
-/// dev-only half (the "works on Lucidos constantly" framing and the
-/// Rust-change rebuild/restart choreography) lives in
-/// [`APPLY_VERIFY_DEV_ADDENDUM`] and is spliced only when a source checkout
-/// exists — a packaged install never rebuilds the engine, and an app change
-/// never restarts it, so promising that dance there is simply wrong.
 pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES, ACT AND VERIFY RATHER THAN ASK:\nYou have the `changes` tool (action 'list' / 'apply'), so never bounce a yes/no question back at the user about state you can check yourself.\n- NEVER ask \"have you applied it?\". Call action 'list' and read whether it is `pending` or `applied`. If they asked for it to be applied, call action 'apply' rather than asking permission for what they just told you to do.\n- PROBE SERVED ASSETS UNDER THE WORKSPACE-PREFIXED ROUTE, e.g. `https://<host>/<workspace>/api/v1/sdk-iframe.css`, never a bare `/api/v1/...`: a bare path makes the gateway read the first segment (`api`) as a workspace name and 404 with \"unknown workspace 'api'\".\n- State what you verified, objectively, and never close an apply loop with \"does it look right now?\". Reserve `ask_user_question` for a genuine decision, not to confirm a step you could check.";
 
-/// Establish the state BEFORE forming an assessment, and never assert that
-/// something did not happen without having looked.
-///
-/// Same shape as [`APPLY_VERIFY_RULE`], which forbids asking whether a change
-/// was applied and requires calling `list` instead: both replace a guess with a
-/// lookup the agent already has. The difference is what triggers it. That one
-/// fires on a question the agent is about to ASK the user; this one fires on a
-/// claim it is about to MAKE, which nothing before the turn can see.
-///
-/// **It states an ORDER, not a review step.** An "audit what you wrote" rule
-/// fires once the model has decided what it thinks, which is when it is least
-/// likely to go and check. On 2026-08-09 the failure was exactly that shape:
-/// asked whether to give up on the project, the agent asserted there had been
-/// no traction, and the facts contradicting it were in memory the whole time.
-/// It only looked one turn later, after the user objected, by which point they
-/// had supplied the fact themselves and the lookup could do nothing but agree
-/// with them.
-///
-/// `__MEMORY_LOOKUP__` names what to look with, which depends on the memory
-/// module: [`MEMORY_LOOKUP_CLASSIC`] or [`MEMORY_LOOKUP_TREE`].
-///
-/// The closing paragraph bans a thread verdict made from history in any reply,
-/// not only an assessment (ADR 0679).
 pub(super) const LOOK_BEFORE_ASSESSING_RULE: &str = "ESTABLISH THE STATE BEFORE YOU FORM AN ASSESSMENT:\nAsked to judge, compare or advise on something of theirs, find out how it is ACTUALLY going before deciding what you think. __MEMORY_LOOKUP__ An ORDER, not a review at the end: once you have a view you will not go looking.\n- NEVER assert something has not happened, does not exist, or was never discussed, unless you looked. Absence from your context is not absence from their history.\n- For answering, not browsing: stop once you have what you need.\nIn EVERY reply, not only when asked to judge: say what another thread, change or phase is doing NOW (waiting, running, blocked, done) only from a read in THIS turn: the [CHILD THREADS] block, `events`, `threads` or `changes`. Otherwise say it in the past tense with its time (\"At 13:36 it reported waiting\"). Your earlier messages and its earlier reports are history. Read what a thread is doing from liveness.state. status: idle means no turn is open. A waiting thread wakes itself on the waits liveness names.";
 
 pub(super) const MEMORY_LOOKUP_CLASSIC: &str = "Injected memories come first; when they are thin, the `memory` and `threads` tools both have a 'search'.";
 
 pub(super) const MEMORY_LOOKUP_TREE: &str = "Your memory views come first; when they are thin, the `recall` and `threads` tools both have a 'search'.";
 
-/// The half of the apply/verify rule that is only true on an install launched
+/// INVARIANT: The half of the apply/verify rule that is only true on an install launched
 /// from a Lucidos source checkout: the engine rebuild+restart choreography for
 /// a Rust change, and the "this user does this daily" framing.
 ///
@@ -150,12 +66,6 @@ pub(super) const MEMORY_LOOKUP_TREE: &str = "Your memory views come first; when 
 /// change, which is exactly the kind the failure involved.
 pub(super) const APPLY_VERIFY_DEV_ADDENDUM: &str = "\n- The user works on Lucidos constantly and knows the apply/restart/reload dance cold, so do not re-explain it or ask them to confirm they did it.\n- NEVER ask \"did you restart?\", and never infer it from what you applied earlier: the ENGINE BUILD section states it, fresh every turn. They restart whenever they like, including mid-turn.\n- You cannot restart the engine yourself. So after applying a `requires_restart: true` change, say what that section says, live or waiting on their switch, and never assert either without reading it.\n- Probing a served asset verifies a change that ALTERED a served asset, nothing else. A backend-only change alters none, so the section is the whole answer.";
 
-/// Build the TriggerStarted thread-event + meta for a scheduler-fired trigger
-/// run. Extracted as a pure function so the wiring rule "the `config.id`
-/// passed in is what gets stamped into both `TriggerStarted.trigger_id` and
-/// `EngineReason::Scheduler.trigger_id`" stays unit-testable without standing
-/// up the LLM that `process_trigger` runs through.
-/// `None` for a resume, which opens no turn.
 pub(super) fn build_trigger_started_event(
     tc: &TriggerContext,
     user_message: &str,
@@ -172,17 +82,12 @@ pub(super) fn build_trigger_started_event(
             trigger_name: Some(tc.trigger_name.clone()),
             prompt: Some(user_message.to_string()),
             invocation: Some(fire.invocation.clone()),
-            // Scheduler-fired triggers always carry Engine origin so the
-            // route popover can render "Engine · Scheduled · <name>".
             origin: Some(MessageOrigin::engine(EngineReason::Scheduler {
                 trigger_id: tc.trigger_id.clone(),
                 trigger_name: Some(tc.trigger_name.clone()),
                 actor_email: fire.actor_email.clone(),
             })),
             go_to_review: tc.go_to_review,
-            // The RESOLVED pair, not the trigger's raw pin: an unpinned trigger
-            // records the account model it actually ran on, so the thread's
-            // model memory is honest either way.
             model: selection.model.clone(),
             reasoning_effort: selection.reasoning_effort.clone(),
             provider: selection.provider.clone(),
@@ -195,18 +100,8 @@ pub(super) fn build_trigger_started_event(
     ))
 }
 
-/// Chars a summary must reach per assistant turn it covers, before the floor
-/// below counts it as a failed roll rather than a paragraph.
-///
-/// Deliberately generous. The measured healthy answers ran 380 to 850 output
-/// tokens, so roughly 1,500 to 3,400 chars. The one bad roll was 24 output
-/// tokens, about 100 chars. Anything between the two is a judgment we have no
-/// data for, so the floor only catches answers close to the bad one.
 const SUMMARY_MIN_CHARS_PER_TURN: usize = 60;
 
-/// Ceiling on that requirement. A thread covering 40 turns does not owe a
-/// 2,400-char paragraph: the summariser compresses, and past a point a longer
-/// segment yields a denser paragraph rather than a proportionally longer one.
 const SUMMARY_MIN_CHARS_CAP: usize = 600;
 
 pub(super) fn summary_is_too_thin(chars: usize, covered_turns: usize) -> bool {
@@ -214,16 +109,6 @@ pub(super) fn summary_is_too_thin(chars: usize, covered_turns: usize) -> bool {
     chars < required
 }
 
-/// Run the summarization future under `deadline`, or `None`.
-///
-/// `None` means the call did not produce a usable paragraph, and the caller
-/// decides what to render instead. Since ADR 0102 that is the thread's cached
-/// summary where one exists. So a failure costs freshness rather than the whole
-/// earlier region, and the refresh gate stays open for the next turn to re-roll.
-///
-/// `deadline` comes from `engine::aux_purpose::budget_for`, which sizes it to
-/// contain the provider's own retries. It used to be one 30s constant shared
-/// with classification, which the 4-attempt retry budget could not fit inside.
 pub(super) async fn summarize_or_none<F>(
     fut: F,
     older_len: usize,
@@ -272,25 +157,8 @@ where
     }
 }
 
-/// Pins the query classification for the whole process, instead of asking the
-/// LLM each turn.
-///
-/// Classification is a Flash call, so two engines over byte-identical
-/// workspaces routinely disagree on `needs_memory`. The context-mode eval runs
-/// exactly that shape, and a disagreement voids the whole task pair
-/// (`lucidos_eval::analyse::retrieval_disagreed`). Pinning both arms removes
-/// the confound. See `crates/lucidos-engine-bin/src/bin/lucidos-eval/workspace.rs`.
 pub(super) const FORCE_QUERY_CLASSIFICATION_ENV: &str = "LUCIDOS_FORCE_QUERY_CLASSIFICATION";
 
-/// Read one raw env value into a pinned classification.
-///
-/// `all` needs everything, which is `QueryClassification::default()`. `none`
-/// needs nothing. Every other value, including unset, returns `None` and
-/// leaves the caller on the LLM call. A typo must not pin, and must not fail
-/// the boot either: an engine that refuses to start over a stray variable is
-/// worse than one that classifies as it always did.
-///
-/// Pure, so the tests never touch the process environment.
 pub(super) fn forced_classification(
     raw: Option<&str>,
 ) -> Option<crate::memory::QueryClassification> {
@@ -309,20 +177,12 @@ pub(super) fn forced_classification(
     None
 }
 
-/// This turn's classification when the process pins one, logged like any other.
-///
-/// `None` leaves the caller on today's path: ask the classification model and
-/// pay the round-trip. The env read happens once, because process configuration cannot
-/// change under a running engine.
 pub(super) fn pinned_classification() -> Option<crate::memory::QueryClassification> {
     static PIN: OnceLock<Option<crate::memory::QueryClassification>> = OnceLock::new();
     let pinned = PIN
         .get_or_init(|| {
             let raw = std::env::var(FORCE_QUERY_CLASSIFICATION_ENV).ok();
             let parsed = forced_classification(raw.as_deref());
-            // A set-but-unparsed value earns a line of its own. The pin is
-            // opt-in, so silence reads as "not set". Without this, a run that
-            // meant to pin classifies on and says nothing about why.
             if parsed.is_none() {
                 if let Some(value) = raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
                     log_legacy!(
@@ -340,7 +200,7 @@ pub(super) fn pinned_classification() -> Option<crate::memory::QueryClassificati
     Some(pinned)
 }
 
-/// The one line a turn writes about its classification.
+/// INVARIANT: The one line a turn writes about its classification.
 ///
 /// Shared so a pinned turn logs at the same place an unpinned one does, and
 /// says which it was. A pinned run that logged nothing would read as a run
@@ -355,7 +215,7 @@ fn log_classification(c: &crate::memory::QueryClassification, pinned: bool) {
         pin, c.needs_memory, c.needs_file_list, c.needs_credentials, c.sub_queries);
 }
 
-/// Run the Flash classification future under `deadline`. On error or timeout,
+/// INVARIANT: Run the Flash classification future under `deadline`. On error or timeout,
 /// fall back to `QueryClassification::default()` ("needs everything").
 ///
 /// `deadline` comes from `engine::aux_purpose::budget_for`. Classification runs
@@ -398,18 +258,6 @@ where
     }
 }
 
-/// Build the `[TRIGGER KNOW-HOW]` block for a trigger fire's user message.
-/// Lists files under `<workspace>/data/triggers/<slug>/knowhow/`,
-/// scoped so threads of OTHER triggers never see this trigger's items.
-/// Returns empty when the trigger has no knowhow files (caller appends nothing).
-///
-/// It names this trigger's own docs, so it differs per trigger. That is why it
-/// rides in the volatile part of the message and not in the system block,
-/// which every fire and chat turn shares.
-///
-/// IDs use the global `triggers/<slug>/<file>` namespace so the listed
-/// `load_knowhow` calls resolve via the same fallback resolution
-/// (`load_with_fallback`) regular ids do.
 pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug: &str) -> String {
     let summaries = crate::core::KnowhowStore::load_trigger_summaries(triggers_dir, slug);
     if summaries.is_empty() {
@@ -433,10 +281,6 @@ pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug
     section
 }
 
-/// Build the `[REMOVED KNOW-HOW]` block for a trigger fire whose know-how a
-/// plugin removed. Empty when nothing is removed. Like the block above it
-/// names this trigger's own files, so it rides in the volatile part of the
-/// message (ADR 0490). It only warns: the run still goes ahead.
 pub(super) fn build_removed_knowhow_section(
     removed: &[crate::triggers::affected::RemovedKnowhow],
 ) -> String {
@@ -480,27 +324,6 @@ pub(super) fn build_system_knowhow_section(
 
 pub(super) const REDIRECT_INTERRUPT_MAX_WAIT: Duration = Duration::from_secs(30);
 
-/// Whether a follow-up routed to a live coding-agent session should first
-/// interrupt the in-flight turn ("interrupt-and-redirect") instead of being
-/// forwarded as-is.
-///
-/// Ordinary follow-ups steer a capable process without ending its turn. Codex
-/// exec and app-servers without `turn/steer` still interrupt before redirecting.
-/// Urgent follow-ups interrupt on either backend, since a long tool call may
-/// postpone when a steered message becomes visible to the agent.
-///
-/// Pure so the routing rule is unit-tested without standing up a session.
-///
-/// - `is_in_flight`: the session is alive and NOT at a turn boundary
-///   (`AgentSession::is_in_flight`). A follow-up to an idle-but-alive session
-///   is picked up immediately on either backend, so there is nothing to
-///   interrupt and urgency does not manufacture a turn to stop.
-/// - `is_user_message`: the input is a genuine user follow-up, not an
-///   engine-internal re-entry (`AgentInputKind::ReentryFromEngine`). An engine
-///   re-entry never redirects, urgent or not: it resumes a thread that is
-///   waiting on something.
-/// - `urgent`: the caller marked the follow-up as one the child must act on
-///   now, accepting that its current turn ends. See `FollowUpDelivery`.
 pub(super) fn should_redirect_followup(
     coding_agent: crate::runtime::CodingAgent,
     is_in_flight: bool,
@@ -537,7 +360,7 @@ pub(super) fn arm_followup_redirect(
     ) {
         return None;
     }
-    // Keep the interrupted turn's idle from terminating the subprocess. A flag
+    // INVARIANT: Keep the interrupted turn's idle from terminating the subprocess. A flag
     // rather than a count, because the thing being expressed is a promise ("a
     // message is coming"), not a quantity, and it has to hold across a window in
     // which the message provably is not in `msg_rx` yet.
@@ -548,24 +371,11 @@ pub(super) fn arm_followup_redirect(
     // leaves only this promise.
     s.redirect_followup_pending = true;
     s.cancel_actor = origin.clone();
-    // Mark this interrupt as a redirect (not a Stop click) so the run_session
-    // interrupt arm classifies the interrupted turn as
-    // `CancelCause::SupersededByFollowup` — rendered neutrally — instead of
-    // `UserStop`. Drained by `take_session_redirect_cause`.
     s.redirect_cause = Some(crate::engine::thread_events::CancelCause::SupersededByFollowup);
     s.interrupt.notify_one();
     Some(s.idle_notify.clone())
 }
 
-/// Whether a coding-agent follow-up that could not answer the open question
-/// leaves it open, instead of superseding it.
-///
-/// Only an engine re-entry (a child's completion, an event-wait delivery) on a
-/// question the user can still answer. It reaches the agent without a
-/// `CodingAgentPromptSent`, so the card stays live, and the parked agent reads
-/// it after the answer. Everything else still supersedes, per ADR 0082: a
-/// message's own prompt overtakes the card, and an overtaken question or a
-/// dead session leaves nothing an answer could release. See ADR 0255.
 pub(super) async fn follow_up_keeps_open_question(
     pool: &sqlx::PgPool,
     agent_sessions: &TokioMutex<HashMap<Uuid, AgentSession>>,
@@ -578,9 +388,6 @@ pub(super) async fn follow_up_keeps_open_question(
             .is_some()
 }
 
-/// Whether this input is an engine re-entry reaching a live coding-agent
-/// session. It sends no `CodingAgentPromptSent`, so it overtakes no open card:
-/// a question or a permission card stays answerable (ADR 0255, ADR 0256).
 pub(super) async fn reentry_reaches_live_session(
     agent_sessions: &TokioMutex<HashMap<Uuid, AgentSession>>,
     thread_id: Uuid,
@@ -596,12 +403,6 @@ pub(super) async fn reentry_reaches_live_session(
         .is_some_and(|s| s.is_live())
 }
 
-/// Whether a chat-lane follow-up denies the thread's open permission cards.
-///
-/// A person answers a card by writing instead. Any other input queues behind a
-/// live turn, whose loop still waits on the card, so it leaves the card to the
-/// user. Examples: a child's completion, a wait delivery, an agent follow-up.
-/// With no live turn nothing waits on the card, and any input clears it.
 pub(super) fn chat_follow_up_supersedes_cards(
     mode: crate::engine::thread_events::ActorMode,
     has_live_turn: bool,

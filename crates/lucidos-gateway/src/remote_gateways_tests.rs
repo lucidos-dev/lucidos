@@ -4,8 +4,6 @@ use crate::peers::GATEWAY_HEALTH_PATH;
 use lucidos_local_token::test_support::serve_https;
 use serde_json::json;
 
-/// What A calls itself in these tests. Not `instance_id()`: A and B share
-/// this test process, so they would share that id too.
 const A_INSTANCE: &str = "gateway-a";
 
 fn store(dir: &tempfile::TempDir) -> RemoteGatewayStore {
@@ -21,7 +19,6 @@ fn request(address: &str, code: &str, name: &str) -> AddRequest {
     }
 }
 
-/// Stand-in access proxy: reject a missing, duplicated, or overridden token.
 pub(crate) fn proxy_guard(router: axum::Router) -> axum::Router {
     router.layer(axum::middleware::from_fn(
         |req: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -42,7 +39,6 @@ pub(crate) fn proxy_headers() -> ExtraHeaders {
     .unwrap()
 }
 
-/// Gateway B, serving the router the process serves, over https.
 struct GatewayB {
     state: GatewayState,
     address: String,
@@ -62,7 +58,6 @@ async fn gateway_b() -> GatewayB {
     }
 }
 
-/// A stand-in answering health with `body`, over https.
 async fn stand_in(body: serde_json::Value) -> (String, PeerConnection) {
     let router = axum::Router::new().route(
         GATEWAY_HEALTH_PATH,
@@ -125,7 +120,6 @@ fn an_address_must_be_an_https_origin() {
     }
 }
 
-/// `https` adds nothing on loopback, where nothing crosses a network.
 #[test]
 fn a_loopback_address_may_be_plain_http() {
     for loopback in [
@@ -238,7 +232,11 @@ async fn a_pairs_with_b_over_https_and_b_records_the_grant() {
     let code = b
         .state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
 
     let row = add(
@@ -268,8 +266,6 @@ async fn a_pairs_with_b_over_https_and_b_records_the_grant() {
         .is_some());
 }
 
-/// Plan invariant 9: B's local process minted the secret, and B has a paired
-/// device. So A waits for that device's Allow, then adds B on a retry.
 #[tokio::test]
 async fn a_waits_for_b_s_owner_then_pairs_on_a_retry() {
     let b = gateway_b().await;
@@ -287,7 +283,11 @@ async fn a_waits_for_b_s_owner_then_pairs_on_a_retry() {
     let code = b
         .state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::LocalProcess)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::LocalProcess,
+        )
         .unwrap();
     let attempt = || {
         add(
@@ -322,7 +322,11 @@ async fn removing_b_on_a_asks_b_to_forget_the_grant() {
     let code = b
         .state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     add(
         &a,
@@ -339,12 +343,15 @@ async fn removing_b_on_a_asks_b_to_forget_the_grant() {
     assert!(b.state.paired_gateways().list().is_empty());
 }
 
-/// Pair A with B as `cloud`, sending `headers`.
 async fn paired_as_cloud(b: &GatewayB, a: &RemoteGatewayStore, headers: ExtraHeaders) {
     let code = b
         .state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let mut pairing = request(&b.address, &code, "cloud");
     pairing.headers = headers;
@@ -354,7 +361,11 @@ async fn paired_as_cloud(b: &GatewayB, a: &RemoteGatewayStore, headers: ExtraHea
 fn fresh_secret(b: &GatewayB) -> String {
     b.state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap()
 }
 
@@ -511,8 +522,6 @@ async fn re_pair_renews_return_access_only_for_an_own_device() {
     assert!(a.remote_gateways().list()[0].return_access.is_none());
 }
 
-/// B unpairs A's `cloud`, then A pairs it again as `repair_handler` does.
-/// Not through the handler: A and B share this process's `instance_id()`.
 async fn revoke_and_repair(
     a: &GatewayState,
     b: &GatewayB,
@@ -545,7 +554,11 @@ async fn a_plain_http_address_is_refused_before_the_code_is_spent() {
     let code = b
         .state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let http = "http://lucidos.example.com";
 
@@ -577,8 +590,6 @@ fn health_router() -> axum::Router {
     )
 }
 
-/// An address stored as `http://` before loopback served TLS still reaches
-/// its gateway, now over https.
 #[tokio::test]
 async fn a_stored_http_loopback_address_is_called_over_https() {
     let port = serve_https(health_router()).port();
@@ -589,7 +600,6 @@ async fn a_stored_http_loopback_address_is_called_over_https() {
         .expect("the loopback address is read as https");
     assert_eq!(body["role"], "gateway");
 
-    // Refused before any connection: the scheme alone decides.
     let error = client
         .health("http://lucidos.example.com")
         .await
@@ -597,8 +607,6 @@ async fn a_stored_http_loopback_address_is_called_over_https() {
     assert!(error.contains("scheme"), "{error}");
 }
 
-/// Every gateway serves a leaf from the loopback CA on loopback, which no
-/// public root signs.
 #[tokio::test]
 async fn a_loopback_gateway_answers_under_the_loopback_ca() {
     let port = serve_https(health_router()).port();
@@ -610,8 +618,6 @@ async fn a_loopback_gateway_answers_under_the_loopback_ca() {
     assert_eq!(body["role"], "gateway");
 }
 
-/// Plain http on a loopback port is not a gateway: it never gets a request,
-/// so a squatter there never sees a credential.
 #[tokio::test]
 async fn a_plaintext_loopback_listener_is_not_reached() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -632,7 +638,11 @@ async fn a_loopback_gateway_pairs_at_its_stored_http_address() {
     let address = format!("http://127.0.0.1:{port}");
     let code = b
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let a_dir = tempfile::tempdir().unwrap();
     let a = store(&a_dir);
@@ -719,7 +729,11 @@ async fn the_list_never_carries_a_credential() {
     let code = b
         .state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     add(
         &a,
@@ -741,7 +755,6 @@ fn credential_header(credential: &str) -> axum::http::HeaderMap {
     headers
 }
 
-/// Make `dir` refuse new files, so the next save fails. Undone on drop.
 pub(crate) struct ReadOnlyDir<'a>(pub(crate) &'a std::path::Path);
 
 impl<'a> ReadOnlyDir<'a> {
@@ -800,7 +813,11 @@ async fn an_own_device_registers_return_access_and_refreshes_an_older_pairing() 
     let secret = b
         .state
         .paired_gateways()
-        .mint_secret(Some("Routing gateway".into()), false, Minter::PairedDevice)
+        .mint_secret(
+            Some("Routing gateway".into()),
+            Default::default(),
+            Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
@@ -1027,7 +1044,6 @@ fn a_failed_return_access_save_preserves_the_previous_grant() {
     assert_eq!(store(&dir).list()[0].return_access, first.return_access);
 }
 
-/// A failed save adds nothing, so a retry finds the name still free.
 #[test]
 fn a_failed_save_leaves_the_store_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
@@ -1124,7 +1140,6 @@ fn a_failed_migration_preserves_the_complete_original_file() {
     )
     .unwrap();
     let original = std::fs::read(&path).unwrap();
-    // Block the atomic replacement, after key generation and sealing succeed.
     std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
     assert!(RemoteGatewayStore::load(path.clone()).is_err());
     assert_eq!(std::fs::read(path).unwrap(), original);
@@ -1226,7 +1241,11 @@ async fn proxy_headers_reach_health_pair_requests_and_leave_without_changing_ori
     let bstate = GatewayState::for_tests_with_static_dir(Some(bdir.path().to_path_buf()));
     let code = bstate
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
     let recorded = seen.clone();
@@ -1399,7 +1418,11 @@ async fn sender_recovers_before_and_after_remote_acceptance() {
     let code = b
         .state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     add(
         &a,
@@ -1412,7 +1435,6 @@ async fn sender_recovers_before_and_after_remote_acceptance() {
     .unwrap();
     let original = a.list()[0].credential.clone();
     let intent = a.begin_rotation("cloud").unwrap();
-    // Restart before B receives anything.
     drop(a);
     let a = RemoteGatewayStore::load(path.clone()).unwrap();
     a.rotate(&b.client, "cloud").await.unwrap();
@@ -1430,8 +1452,6 @@ async fn sender_recovers_before_and_after_remote_acceptance() {
 
     let intent = a.begin_rotation("cloud").unwrap();
     let candidate = intent.rotation.pending.as_ref().unwrap();
-    // B commits, but A never sees the response. A restarts and must recover
-    // with the same candidate instead of minting another credential.
     assert!(b
         .state
         .paired_gateways()
@@ -1505,7 +1525,11 @@ fn durable_destination_identity_survives_store_reload_and_legacy_rows_stay_reada
 fn mint(b: &GatewayB) -> String {
     b.state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap()
 }
 
@@ -1540,7 +1564,6 @@ async fn duplicate_destination_uses_conflict_and_preserves_the_unused_code() {
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("cloud"));
     assert_eq!(b.state.paired_gateways().list().len(), 1);
-    // Another initiating gateway can still redeem the unconsumed code.
     let other_dir = tempfile::tempdir().unwrap();
     add(
         &store(&other_dir),
@@ -1595,7 +1618,6 @@ fn insertion_refuses_the_same_durable_destination_after_reload() {
     assert_eq!(a.list().len(), 1);
 }
 
-/// Real pairing routes with a simulated independent process's public boot id.
 fn router_with_boot(state: GatewayState, boot: &str) -> axum::Router {
     let boot = boot.to_string();
     crate::server::gateway_router(state).layer(axum::middleware::from_fn(
@@ -1665,7 +1687,6 @@ async fn legacy_identity_hydrates_through_saved_proxy_headers_and_distinct_peers
     add(&a, &b.client, A_INSTANCE, "a", req).await.unwrap();
     a.write(|data| data.gateways[0].gateway_id = None).unwrap();
     let c = gateway_b().await;
-    // Different real gateways in one test process need distinct simulated boot ids.
     let c_port = serve_https(router_with_boot(c.state.clone(), "new-boot")).port();
     add(
         &a,
@@ -1727,7 +1748,6 @@ async fn saved_durable_identity_catches_a_new_alias_after_restart_and_only_retur
     .await
     .unwrap();
     let original_grant = b.state.paired_gateways().list()[0].id.clone();
-    // The old origin no longer answers after the destination restarts elsewhere.
     a.write(|data| data.gateways[0].address = closed_address())
         .unwrap();
     drop(a);
@@ -1816,7 +1836,6 @@ async fn failed_compensation_reports_the_unrevoked_grant() {
     assert_eq!(a.list().len(), 1);
 }
 
-/// An older peer with real grants but no durable identity fields on the wire.
 fn legacy_router(state: GatewayState, boot: &str) -> axum::Router {
     router_with_boot(state, boot).layer(axum::middleware::from_fn(
         |req: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -1910,7 +1929,6 @@ async fn hydration_checks_pairing_identity_and_keeps_saved_credentials_off_new_o
         }))
         .route(&own_path, get(|headers: axum::http::HeaderMap| async move {
             assert_eq!(headers[HEADER_GATEWAY_CREDENTIAL], "credential");
-            // This is not the saved grant: its claimed destination must not hydrate it.
             Json(json!({"pairing_id":"wrong-pairing", "gateway_id":"untrusted-identity"}))
         })));
     let port = serve_https(saved_router).port();

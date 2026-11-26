@@ -1,6 +1,5 @@
 use super::*;
 
-/// A registry file with `body` as its `providers` array.
 fn registry_dir(body: &str) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -18,12 +17,6 @@ const ONE_ROW: &str = r#"[{
     "auth_url": "https://acme.test/authorize",
     "token_url": "https://api.acme.test/token"
 }]"#;
-
-// ── Degradation (INV-2) ──────────────────────────────────────────────────
-//
-// Every one of these is a state a shipped install can genuinely be in, so each
-// must yield an empty registry rather than an error: the Connect form's manual
-// path is unaffected, and autofill is only ever an accelerator.
 
 #[test]
 fn an_unavailable_knowhow_dir_yields_no_providers() {
@@ -50,13 +43,8 @@ fn a_registry_file_with_no_providers_key_yields_no_providers() {
     assert!(load_providers(Some(tmp.path())).is_empty());
 }
 
-// ── Parsing ──────────────────────────────────────────────────────────────
-
 #[test]
 fn an_omitted_optional_field_parses_as_absent_not_empty() {
-    // Absent must stay absent all the way to the credential: an empty string
-    // written into `userinfo_method` would be a value the flow then has to
-    // second-guess, where `None` already means "the engine default".
     let tmp = registry_dir(ONE_ROW);
     let rows = load_providers(Some(tmp.path()));
     assert_eq!(rows.len(), 1);
@@ -70,8 +58,6 @@ fn an_omitted_optional_field_parses_as_absent_not_empty() {
 
 #[test]
 fn an_unknown_key_does_not_fail_the_whole_file() {
-    // The file ships publicly and is hand-edited. One future key must not take
-    // autofill out for every provider.
     let tmp = registry_dir(
         r#"[{
             "id": "acme", "label": "Acme",
@@ -83,8 +69,6 @@ fn an_unknown_key_does_not_fail_the_whole_file() {
     );
     assert_eq!(load_providers(Some(tmp.path())).len(), 1);
 }
-
-// ── Lookup ───────────────────────────────────────────────────────────────
 
 #[test]
 fn find_provider_matches_case_insensitively_and_trims() {
@@ -100,28 +84,12 @@ fn find_provider_matches_case_insensitively_and_trims() {
 #[test]
 fn find_provider_misses_an_unknown_or_blank_name() {
     let tmp = registry_dir(ONE_ROW);
-    // A derived name is deliberately a miss: the form asks which base provider
-    // it runs on rather than guessing from the spelling.
     assert!(find_provider(Some(tmp.path()), "acme-health").is_none());
     assert!(find_provider(Some(tmp.path()), "").is_none());
     assert!(find_provider(Some(tmp.path()), "   ").is_none());
 }
 
-// ── The shipped file (INV-3, INV-9) ──────────────────────────────────────
-
-/// How long a console hint may be, in characters.
-///
-/// Both hints are rendered VERBATIM, and as of 2026-08-07 in four places: the
-/// credential form's help block, the shortfall aside beside *Reconnect* on
-/// Settings > Accounts, the blocked state beside *Grant access* on the Backup
-/// page, and the `connect_oauth_account` result the agent reads. So a row that
-/// grows into a paragraph does not become a paragraph in one place, it becomes
-/// one in four. The cap is a character count rather than a sentence count
-/// because a scope name is full of full stops (`files.content.write`), which is
-/// exactly the kind of value these hints list.
 const HINT_MAX_CHARS: usize = 400;
-
-// ── Sign-in scopes ───────────────────────────────────────────────────────
 
 #[test]
 fn a_row_matches_its_auth_url_host_and_not_a_lookalike() {
@@ -154,16 +122,12 @@ mod guard_tests {
             .join("system-knowhow")
     }
 
-    /// The shipped rows, loaded from the real `system-knowhow/` directory.
     fn shipped_rows() -> Vec<OAuthProviderRow> {
         load_providers(Some(shipped_dir().as_path()))
     }
 
     #[test]
     fn the_shipped_registry_parses_and_every_row_is_usable() {
-        // A typo in the data file is invisible until someone presses Connect. The
-        // symptom, an empty form or an endpoint-less credential, then reads as a
-        // code bug rather than a bad row.
         let rows = shipped_rows();
         assert!(
             !rows.is_empty(),
@@ -198,8 +162,6 @@ mod guard_tests {
         }
     }
 
-    /// A row prefills a credential, so its endpoints must pass the same https rule
-    /// the save applies. The row's field names are the credential's keys.
     #[test]
     fn every_shipped_row_names_only_secure_endpoints() {
         for row in shipped_rows() {
@@ -235,9 +197,6 @@ mod guard_tests {
 
     #[test]
     fn the_knowhow_markdown_restates_no_registry_row() {
-        // The markdown is the prose beside the registry, not a second copy of it.
-        // A table that came back would be free to drift from the rows the engine
-        // actually serves, which is the whole failure the split removed.
         let markdown = std::fs::read_to_string(shipped_dir().join("oauth-providers.md"))
             .expect("oauth-providers.md ships beside the registry");
         for row in shipped_rows() {
@@ -259,9 +218,6 @@ mod guard_tests {
 
     #[test]
     fn oauth_registry_names_no_provider() {
-        // CLAUDE.md bans provider-specific instructions in code. The registry lets
-        // this module know five providers without naming one. A hardcoded fallback
-        // creeping in here would quietly undo that.
         let source = include_str!("oauth_registry.rs");
         for row in shipped_rows().iter() {
             assert!(

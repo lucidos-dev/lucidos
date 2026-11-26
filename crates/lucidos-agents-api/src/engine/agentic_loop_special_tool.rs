@@ -1,7 +1,3 @@
-//! Engine-side tool dispatch: `handle_special_tool` covers tools that need
-//! more than `execute_tool()` can give them (capture/refresh app UI,
-//! run_thread, resume_thread, run_coding_agent, …).
-
 use crate::engine::tools::ToolDispatchExt;
 use uuid::Uuid;
 
@@ -11,44 +7,18 @@ use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
 use crate::triggers::{normalize_route_setting, validate_trigger_reasoning_effort};
 
-/// How a thread spawned by `run_thread` / `run_coding_agent` relates to the
-/// thread that issued the spawn. Drives both the spawn linkage (parent /
-/// spawning event ids) and the result-text branch.
-///
-/// `Child` (default) carries the child's resolved *wake mode*, and keeps the
-/// callback: the spawning thread's `notify_parent_if_child` fires when the spawned thread reaches
-/// a terminal event, and `active_children_count` is incremented while the
-/// spawned thread is in flight. The wire string is `"child"`; `"sub"` is
-/// accepted as a back-compat alias from before the glossary settled on
-/// *child thread* (direct descendant) vs *sub-thread* (transitive).
-///
-/// `Top` drops the linkage entirely — no callback, no count bump. The
-/// spawned thread appears as an independent top-level thread in the list.
-/// Use when the spawn is for the user to follow, not for the spawning
-/// thread to resume on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Relation {
     Child(WakeMode),
     Top,
 }
 
-/// The originating tool call's coordinates for a spawn: the thread that issued
-/// it and the `ToolCalled` event id (when known). Bundled because the two
-/// always travel together into the cross-workspace `WorkspaceCallCtx` as
-/// `source_thread_id` / `source_event_id`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SpawnSource {
     thread_id: Uuid,
     tool_called_event_id: Option<Uuid>,
 }
 
-/// Parse the optional `relation` and `wake_mode` arguments from a spawn tool
-/// call. The relation defaults to [`Relation::Child`] when absent, and accepts
-/// `"child"` (canonical) and `"sub"` (back-compat alias from the pre-glossary
-/// wire name). A child's wake mode is the declared one, else the default for a
-/// parent that is or is not the home thread. Unknown values, non-string types
-/// and a wake mode on a top spawn are errors. So the LLM sees the contract
-/// violation instead of silently getting a default.
 pub(crate) fn parse_relation(
     args: &serde_json::Value,
     parent_is_home: bool,
@@ -76,10 +46,6 @@ pub(crate) fn parse_relation(
     }
 }
 
-/// Parse the optional `coding_agent` argument from `run_coding_agent`.
-/// `None` means the caller named no agent. Accepts the canonical kebab-case
-/// values plus the underscore alias for Claude Code. A typo is an error, so a
-/// request for Codex never silently starts Claude Code.
 pub(crate) fn parse_coding_agent(
     args: &serde_json::Value,
 ) -> Result<Option<crate::runtime::CodingAgent>, String> {
@@ -100,10 +66,6 @@ pub(crate) fn parse_coding_agent(
     }
 }
 
-/// The agent a spawn runs: the requested one, or the first installed in
-/// `CodingAgent::ALL` order (Claude Code first) when none was named. A request for a missing agent is refused
-/// and names what is installed, so the model never reports a session that
-/// cannot start.
 pub(crate) fn pick_installed_coding_agent(
     requested: Option<crate::runtime::CodingAgent>,
     is_installed: impl Fn(crate::runtime::CodingAgent) -> bool,
@@ -134,18 +96,6 @@ pub(crate) fn pick_installed_coding_agent(
     }
 }
 
-/// The route a `run_thread` child asks for, before the account fills its gaps.
-///
-/// The child inherits the calling turn's model, effort and provider, and an
-/// explicit pin wins per field. A pinned model other than the caller's drops
-/// the inherited effort and provider, which belong to the caller's model.
-///
-/// Validation follows the trigger route pins, the other place a chat model and
-/// effort are pinned per spawn. The model id passes through unchecked
-/// (`normalize_route_setting`). A registry row can be disabled long after the
-/// caller read it, and a bad id surfaces as an ordinary thread failure. The
-/// tier vocabulary is ours, so a typo there is rejected by name
-/// (`validate_trigger_reasoning_effort`), never swapped for the default.
 pub(crate) fn sub_thread_route_overrides(
     args: &serde_json::Value,
     caller: &crate::core::ResolvedModelSelection,
@@ -168,9 +118,6 @@ pub(crate) fn sub_thread_route_overrides(
     })
 }
 
-/// Read an optional string tool argument, rejecting a non-string instead of
-/// reading it as absent. A caller that sent the wrong type must learn its pin
-/// did not apply, rather than silently getting the account default.
 fn optional_string_arg<'a>(
     args: &'a serde_json::Value,
     key: &str,
@@ -182,23 +129,6 @@ fn optional_string_arg<'a>(
     }
 }
 
-/// The ATTRIBUTION half of a spawn: the `MessageOrigin` to stamp on the spawned
-/// thread's first `MessageReceived` so the message route popover names and links
-/// the thread that launched it.
-///
-/// Takes no [`Relation`], and that is the invariant rather than an oversight:
-/// both relations were launched by the same thread and the popover should say so
-/// either way. Only the CALLBACK half varies, in [`Relation::spawn_linkage`].
-/// For `Child` this is exactly what `synthesize_legacy_origin` would have built
-/// from the linkage, so a child spawn's persisted payload is unchanged; for
-/// `Top` it is the same origin carried *without* linkage, which is the fix.
-///
-/// `direction: Parent` because from the spawned thread's point of view the
-/// linked thread is the one that started it, whatever the relation. Origin
-/// without linkage is an established shape here, not a new one:
-/// `build_follow_up_message` (`chat/child_follow_up.rs`) already emits a
-/// `MessageReceived` this way so a follow-up attributes to the parent without
-/// re-counting the child.
 pub(crate) fn spawn_origin(
     spawning_thread_id: Uuid,
     tool_called_event_id: Option<Uuid>,
@@ -212,17 +142,8 @@ pub(crate) fn spawn_origin(
     })
 }
 
-/// Longest argument dump an MCP permission card carries. Past it the summary is
-/// clamped, so neither the card nor the persisted payload is unbounded.
 const MCP_ARGS_SUMMARY_LIMIT: usize = 500;
 
-/// The argument text an `McpPermissionRequested` card shows, and the same text
-/// the event payload keeps and SSE broadcasts.
-///
-/// Redacted before it is written down. A connection string reaches an MCP tool
-/// as an ordinary argument, and the event row is immutable. Every sibling
-/// permission lane scrubs the same way: see `command_permission`'s
-/// `redact_postgres_secrets` and `cc_permission`'s JSON walk.
 fn mcp_arguments_summary(tool_args: &serde_json::Value) -> String {
     let mut redacted = tool_args.clone();
     crate::core::redact_postgres_secrets_in_json(&mut redacted);
@@ -237,8 +158,6 @@ fn mcp_arguments_summary(tool_args: &serde_json::Value) -> String {
     }
 }
 
-/// What a child's report does to this conversation under its wake mode, as
-/// the spawn result states it. The parent reads this to know whether to wait.
 fn child_report_contract(mode: WakeMode) -> &'static str {
     match mode {
         WakeMode::Wake => {
@@ -260,8 +179,6 @@ fn child_report_contract(mode: WakeMode) -> &'static str {
 
 #[easy_ext::ext(AgenticLoopSpecialToolExt)]
 pub(crate) impl LucidosEngine {
-    /// Resolves the agent for a same-workspace spawn from the binaries the
-    /// spawn itself would find, honouring each agent's binary-path preference.
     async fn pick_installed_coding_agent(
         &self,
         requested: Option<crate::runtime::CodingAgent>,
@@ -290,8 +207,6 @@ impl Relation {
         }
     }
 
-    /// The child's wake mode, which rides beside the linkage. `None` for a
-    /// top spawn, which reports to nobody.
     pub(crate) fn wake_mode(self) -> Option<WakeMode> {
         match self {
             Self::Child(mode) => Some(mode),
@@ -322,12 +237,6 @@ impl Relation {
         }
     }
 
-    /// Tool-result text returned when a spawn lands in the *Thread Queue*
-    /// instead of starting immediately (the system is at background
-    /// capacity). `label` names the spawn flavor ("Thread" / "Claude Code
-    /// session"). The callback contract per relation is unchanged — it just
-    /// starts later — so each branch restates it, mirroring the success
-    /// texts.
     pub(crate) fn queued_spawn_text(self, label: &str, thread_id: Uuid, position: usize) -> String {
         let base = format!(
             "{label} queued at position {position} in the Thread Queue — Lucidos is at \
@@ -375,9 +284,6 @@ impl Relation {
     }
 }
 
-/// What a chat `ask_user_question` hands the loop: the tool result, and
-/// whether every pick was a *quiet option*, which ends the turn, and the
-/// *quiet reply* that turn ends on.
 pub(super) struct ChatAskOutcome {
     pub result: String,
     pub quiet: bool,
@@ -396,11 +302,6 @@ impl ChatAskOutcome {
 
 #[easy_ext::ext(SpecialToolDispatchExt)]
 pub(super) impl LucidosEngine {
-    /// Handle tool calls that need special processing outside of `execute_tool`.
-    /// Returns `Some(result)` if the tool was handled, `None` if it should fall through
-    /// to `execute_tool()`.
-    // Per-parameter rationale lives in the inline comments below; a bundle
-    // struct would just rename the same set of fields.
     #[allow(clippy::too_many_arguments)]
     async fn handle_special_tool(
         &self,
@@ -409,25 +310,10 @@ pub(super) impl LucidosEngine {
         thread_id: Uuid,
         user_images: Option<&[crate::engine::types::ChatImage]>,
         device_id: Option<&str>,
-        // Event_id of the just-emitted ToolCalled event. Forwarded as
-        // `spawning_event_id` for spawn-style tools (run_thread,
-        // run_coding_agent)
-        // so the new thread can be traced back to the exact tool call that
-        // started it.
         tool_called_event_id: Option<Uuid>,
-        // Outer batch id `ask_user_question` keys its per-question wait
-        // registry sub_ids on (see `synth_question_id`).
         tool_use_id: &str,
-        // Per-turn event meta, cloned onto any emitted event. Its channel is
-        // `Some(Trigger)` for a scheduled trigger and `None` for chat. That
-        // picks the MCP gate's trigger rule over its card. Its actor goes on
-        // the permission card.
         meta: &EventMeta,
-        // Cancel token for the response — lets a blocking MCP permission card
-        // resolve as canceled when the user clicks Stop, instead of dangling.
         cancel_token: &tokio_util::sync::CancellationToken,
-        // The model, effort and provider this turn runs on. A `run_thread`
-        // child inherits it.
         caller_route: &crate::core::ResolvedModelSelection,
     ) -> Option<String> {
         if tool_name == tn::CAPTURE_APP || tool_name == tn::REFRESH_APP {
@@ -477,9 +363,6 @@ pub(super) impl LucidosEngine {
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                // Defer workspace_name() until we know the same-workspace
-                // path needs it — most calls omit `workspace` and stay local,
-                // and workspace_name() allocates a fresh String each call.
                 let current_ws = if workspace_arg.is_some() {
                     Some(self.workspace_name())
                 } else {
@@ -513,8 +396,6 @@ pub(super) impl LucidosEngine {
                     Ok(m) => m,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
-                // Validated model, not the raw arg: a tier Codex restricts is
-                // checked against the id the spawn will actually carry.
                 let spawn_effort = match crate::runtime::validate_coding_agent_effort(
                     coding_agent,
                     spawn_model.as_deref(),
@@ -523,8 +404,6 @@ pub(super) impl LucidosEngine {
                     Ok(e) => e,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
-                // The Lucidos Agent is an agent: its pick must be a rung. A
-                // cross-workspace spawn is checked by the target's chat route.
                 if let Err(e) = crate::runtime::intelligence_ladder::check_agent_pick(
                     self.pool(),
                     &self.model_routes(),
@@ -540,8 +419,6 @@ pub(super) impl LucidosEngine {
                     relation.spawn_linkage(thread_id, tool_called_event_id);
                 let origin = spawn_origin(thread_id, tool_called_event_id);
 
-                // `folder` is the canonical parameter; `repo` was a deprecated
-                // alias, now removed (see `removed_repo_alias_error`).
                 if let Some(err) = removed_repo_alias_error(tool_args) {
                     return Some(err.to_string());
                 }
@@ -550,24 +427,12 @@ pub(super) impl LucidosEngine {
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                // Omitting `folder` MEANS "edit Lucidos itself" — which only
-                // exists on an install launched from a source checkout. Refuse
-                // here, synchronously, so the model learns it in the same turn
-                // and can tell the user the truth instead of narrating platform
-                // edits it cannot make. (`run_session` guards the same case for
-                // every other caller; this site exists because a tool result is
-                // the only channel the model actually reads.)
                 if folder_input.is_none() && !crate::paths::has_lucidos_source() {
                     return Some(format!(
                         "Error: {}",
                         crate::engine::agent_session::err_no_lucidos_source()
                     ));
                 }
-                // Resolve the folder against the §3.2 classification table.
-                // App folder (`data/apps/<id>` or absolute path under the
-                // workspace's `data/apps/<id>`) → spawn an app coding-agent
-                // thread. Lucidos source → existing flow. Registered repo
-                // name → existing external-repo flow.
                 let mut spawn_repo_id: Option<String> = None;
                 let mut spawn_app_id: Option<String> = None;
                 if let Some(folder_in) = folder_input {
@@ -577,7 +442,7 @@ pub(super) impl LucidosEngine {
                     let ws_root = self.workspace_path().to_path_buf();
                     let pool = self.pool.clone();
                     let folder_in_owned = folder_in.to_string();
-                    // Snapshot the repo registry up front. The classifier's
+                    // INVARIANT: Snapshot the repo registry up front. The classifier's
                     // `external_repo_match` closure is sync; without this
                     // snapshot it would have to await, and a no-op closure
                     // would mean External never matches and every registered
@@ -610,10 +475,6 @@ pub(super) impl LucidosEngine {
                              not a registered repo and not a path on disk in this workspace."
                         ));
                     };
-                    // Resolve the Lucidos source repo root for the classifier.
-                    // Absent on a packaged build (no source checkout) — `None`
-                    // means the Lucidos-source branch can't match; App +
-                    // External still classify.
                     let lucidos_root = registered_repos
                         .iter()
                         .find(|r| r.name == "Lucidos")
@@ -630,16 +491,11 @@ pub(super) impl LucidosEngine {
                         },
                     );
                     match class {
-                        Ok(FolderClassification::Lucidos { .. }) => {
-                            // Existing flow — no repo_id, default folder.
-                        }
+                        Ok(FolderClassification::Lucidos { .. }) => {}
                         Ok(FolderClassification::App { app_id, .. }) => {
                             spawn_app_id = Some(app_id);
                         }
                         Ok(FolderClassification::External { repo_root }) => {
-                            // The classifier already confirmed this path is
-                            // a registered external repo; pull the UUID from
-                            // the snapshot rather than re-querying.
                             if let Some(repo) = registered_repos
                                 .iter()
                                 .find(|r| std::path::Path::new(&r.path) == repo_root)
@@ -659,8 +515,6 @@ pub(super) impl LucidosEngine {
                 }
                 let repo_id = spawn_repo_id;
 
-                // Absent `images` → forward the current message's images (default).
-                // Present (even empty) → caller has explicitly chosen the selection.
                 let resolved_images: Option<Vec<crate::engine::types::ChatImage>> = match tool_args
                     .get("images")
                 {
@@ -698,7 +552,6 @@ pub(super) impl LucidosEngine {
                 let images = resolved_images.as_deref().or(user_images);
                 let cc_thread_id = uuid::Uuid::new_v4();
                 let request = crate::engine::thread_queue::ThreadQueueRequest::CodingAgent {
-                    // Stamped by `submit` from this task's chain depth.
                     depth: 0,
                     prompt: prompt.to_string(),
                     cc_thread_id,
@@ -738,7 +591,6 @@ pub(super) impl LucidosEngine {
                     Ok(r) => r,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
-                // The Lucidos Agent is an agent: its chat pick must be a rung.
                 if let Err(e) = crate::runtime::intelligence_ladder::check_agent_pick(
                     self.pool(),
                     &self.model_routes(),
@@ -774,7 +626,7 @@ pub(super) impl LucidosEngine {
                                     Ok(overrides) => overrides,
                                     Err(e) => return Some(format!("Error: {}", e)),
                                 };
-                            // Resolved and clamped now, so the child's eager
+                            // INVARIANT: Resolved and clamped now, so the child's eager
                             // MessageReceived stamps the route it runs on.
                             let route =
                                 crate::engine::chat::process::resolve_available_route_overrides(
@@ -787,14 +639,13 @@ pub(super) impl LucidosEngine {
                                 )
                                 .await;
                             let caller_title = tool_args["title"].as_str();
-                            // The eager MessageReceived (a Child relation child's
+                            // INVARIANT: The eager MessageReceived (a Child relation child's
                             // active_children_count must increment before the parent
                             // can complete this turn) lives in the Thread Queue
                             // executor's `prepare` hook — `submit` awaits it inline
                             // on the admitted path, preserving the ordering.
                             let request =
                                 crate::engine::thread_queue::ThreadQueueRequest::SubThread {
-                                    // Stamped by `submit`, as above.
                                     depth: 0,
                                     prompt: prompt.to_string(),
                                     child_thread_id,
@@ -843,8 +694,6 @@ pub(super) impl LucidosEngine {
                 )
             };
 
-            // A thread may call only the servers it enabled. Asked before the
-            // gate, so no card asks the user to allow a call that cannot run.
             if let Some(refusal) = self
                 .mcp_manager
                 .not_enabled_refusal(thread_id, &server_id, tool_name)
@@ -853,11 +702,6 @@ pub(super) impl LucidosEngine {
                 return Some(format!("Error: {refusal}"));
             }
 
-            // Pre-authorization gate (ADR 0430). The server's `auto_approve`
-            // flag proceeds anywhere. A trigger thread proceeds only on a
-            // server its trigger lists, and is refused otherwise. A chat
-            // thread asks the user (in-thread `McpPermissionRequested` card),
-            // which also honors a prior session / `mcp-allowed-tools` grant.
             let firing_trigger = if meta.channel == Some(EventChannel::Trigger) {
                 self.trigger_of_thread(thread_id).await
             } else {
@@ -914,20 +758,6 @@ pub(super) impl LucidosEngine {
         }
     }
 
-    /// Cross-workspace `run_coding_agent`: POST a coding-agent spawn request
-    /// to another workspace's engine. Returns the formatted tool-result string (success
-    /// text on 2xx, error string otherwise) so the caller can pass it through
-    /// to the LLM unchanged.
-    ///
-    /// Cross-workspace requires `relation=Top` — child-thread auto-resume
-    /// callbacks across workspaces are unsupported because the receiving
-    /// engine has no way to notify ours when the spawned thread terminates.
-    /// Refusing Child explicitly (instead of silently downgrading to Top)
-    /// keeps the LLM honest about the no-callback semantics.
-    ///
-    /// Image forwarding is not supported across workspaces yet — the images
-    /// live in this workspace's blob store and the receiver wouldn't be able
-    /// to resolve them. The `images` arg is ignored for cross-workspace.
     async fn cross_workspace_run_coding_agent(
         &self,
         prompt: &str,
@@ -956,8 +786,6 @@ pub(super) impl LucidosEngine {
             .get("title")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        // `repo` was a deprecated alias for `folder`, now removed (see
-        // `removed_repo_alias_error`).
         if let Some(err) = removed_repo_alias_error(tool_args) {
             return err.to_string();
         }
@@ -965,12 +793,6 @@ pub(super) impl LucidosEngine {
             .get("folder")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        // Validate the pins HERE too: this path returns before the local
-        // spawn's validation, and the receiving engine passes them straight to
-        // the agent. Codex's list is compiled into both engines, so the sender
-        // can check it. Claude Code's is discovered per workspace, so this
-        // engine's list says nothing about the target's: the id goes through,
-        // and the target's Claude Code accepts it or fails the child loudly.
         let requested_model = tool_args.get("model").and_then(|v| v.as_str());
         let model = match coding_agent {
             crate::runtime::CodingAgent::ClaudeCode => requested_model
@@ -984,8 +806,6 @@ pub(super) impl LucidosEngine {
                 }
             }
         };
-        // For Claude Code only the shared tier vocabulary applies: a model's
-        // own tiers come from the target's list, which this engine cannot see.
         let effort_model = match coding_agent {
             crate::runtime::CodingAgent::ClaudeCode => None,
             crate::runtime::CodingAgent::Codex => model.as_deref(),
@@ -1036,7 +856,7 @@ pub(super) impl LucidosEngine {
         }
     }
 
-    /// Chat-side `ask_user_question`: walks the question batch via
+    /// INVARIANT: Chat-side `ask_user_question`: walks the question batch via
     /// `walk_question_batch(channel=Chat)` and returns the joined
     /// `{question_text: answer_label}` map as a JSON string. The `Chat`
     /// channel is what makes `answer_pending_question` skip the CC-only
@@ -1059,7 +879,6 @@ pub(super) impl LucidosEngine {
             );
         }
 
-        // An ask naming a prepared permission request shows the engine's card.
         use crate::engine::permission::prepare::{prepared_ask, PreparedAsk};
         let (questions, permission_request) =
             match prepared_ask(self.pool(), thread_id, &questions).await {
@@ -1094,9 +913,6 @@ pub(super) impl LucidosEngine {
         };
 
         if outcome.answer_kinds.is_empty() {
-            // LLM sent zero questions in the batch. Surface a typed-error
-            // shape rather than the empty `{}` so the model gets a clear
-            // signal to retry with at least one question.
             return ChatAskOutcome::failed(
                 "Error: `questions` array was empty — pass at least one question",
             );
@@ -1130,23 +946,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// `repo` was removed as an alias for `folder`. A straggler still passing
-    /// it must get a loud rename error, never a silent misroute.
     #[test]
     fn a_removed_repo_alias_is_rejected_with_a_rename_error() {
         assert_eq!(
             removed_repo_alias_error(&json!({ "repo": "Lucidos" })),
             Some("Error: `repo` was renamed to `folder`. Pass `folder` instead.")
         );
-        // Absent, empty, or whitespace-only `repo` is not the alias: no error.
         assert!(removed_repo_alias_error(&json!({ "folder": "data/apps/x" })).is_none());
         assert!(removed_repo_alias_error(&json!({ "repo": "" })).is_none());
         assert!(removed_repo_alias_error(&json!({ "repo": "  " })).is_none());
     }
 
-    /// The summary is persisted into the event payload and broadcast over SSE.
-    /// A connection string in a tool argument was written down in the clear.
-    /// Every sibling permission lane scrubs first.
     #[test]
     fn mcp_arguments_summary_redacts_a_postgres_password() {
         let args = json!({
@@ -1161,8 +971,6 @@ mod tests {
         assert!(summary.contains("SELECT 1"), "{summary}");
     }
 
-    /// The clamp keeps the card and the payload bounded, and must land on a
-    /// character boundary rather than mid-codepoint.
     #[test]
     fn mcp_arguments_summary_clamps_on_a_char_boundary() {
         let args = json!({ "note": "æ".repeat(2000) });
@@ -1255,10 +1063,6 @@ mod tests {
         assert!(!text.contains("Claude Code"), "{text}");
     }
 
-    // --- run_thread route inheritance ---------------------------------------
-
-    /// The calling turn's route: a trigger pinned to Sonnet at `low`, on
-    /// Anthropic.
     fn caller() -> crate::core::ResolvedModelSelection {
         route(Some("claude-sonnet-5"), Some("low"), Some("anthropic"))
     }
@@ -1279,15 +1083,11 @@ mod tests {
         sub_thread_route_overrides(&args, &caller()).expect("valid pins")
     }
 
-    /// The incident: an unpinned child ran on the account model, not on the
-    /// route its pinned parent paid for.
     #[test]
     fn run_thread_without_pins_inherits_the_whole_caller_route() {
         assert_eq!(overrides(json!({"prompt": "summarize this"})), caller());
     }
 
-    /// The caller's effort and provider belong to the caller's model, so a
-    /// different model resolves its own.
     #[test]
     fn run_thread_model_pin_drops_the_inherited_effort_and_provider() {
         assert_eq!(
@@ -1324,9 +1124,6 @@ mod tests {
         );
     }
 
-    /// The tier vocabulary is ours, so a typo is a caller error. Rejecting it
-    /// by name is what stops the spawn quietly running at `xhigh` while the
-    /// caller believes it asked for something cheaper.
     #[test]
     fn run_thread_rejects_an_unknown_reasoning_effort_and_names_it() {
         let err = sub_thread_route_overrides(
@@ -1341,9 +1138,6 @@ mod tests {
         );
     }
 
-    /// The model id is NOT checked against the registry, matching the trigger
-    /// route pins: a row can be disabled long after the caller read it, and a
-    /// bad id surfaces as an ordinary thread failure instead.
     #[test]
     fn run_thread_passes_an_unknown_model_id_through_unchecked() {
         assert_eq!(
@@ -1352,9 +1146,6 @@ mod tests {
         );
     }
 
-    /// Blank and null both read as "no pin", the same normalization the trigger
-    /// form's Default option travels through. `Some("")` must never reach the
-    /// provider as a model id.
     #[test]
     fn run_thread_reads_a_blank_or_null_pin_as_inheriting() {
         for args in [
@@ -1366,8 +1157,6 @@ mod tests {
         }
     }
 
-    /// A wrong-typed pin is refused rather than read as absent: silently
-    /// inheriting would tell the caller its pin applied.
     #[test]
     fn run_thread_rejects_a_non_string_pin() {
         for args in [
@@ -1383,11 +1172,6 @@ mod tests {
         }
     }
 
-    // --- linkage vs attribution --------------------------------------------
-
-    /// A `Top` spawn reports back to nobody: no parent linkage, so
-    /// `notify_parent_if_child` early-returns and the projection's spawn branch
-    /// never bumps the spawning thread's counts.
     #[test]
     fn top_spawn_carries_no_callback_linkage() {
         let spawning_thread = Uuid::new_v4();
@@ -1408,9 +1192,6 @@ mod tests {
         );
     }
 
-    /// The bug this pair of methods exists to prevent: a `Top` spawn dropped the
-    /// linkage AND the attribution, so its route popover said "Unknown". The
-    /// origin names the spawning thread regardless of relation.
     #[test]
     fn every_spawn_is_attributed_to_its_spawning_thread() {
         use crate::engine::thread_events::{MessageOrigin, ThreadDirection};
@@ -1429,20 +1210,12 @@ mod tests {
         );
     }
 
-    /// `make_message_received` `.expect()`s on an origin whose `mode()` disagrees
-    /// with the carried `ActorMode`, and both spawn paths emit with
-    /// `ActorMode::Agent`. Pin the pairing so a drift is a failed test rather
-    /// than a panic in the Thread Queue prepare hook.
     #[test]
     fn spawn_origin_mode_matches_the_agent_emit_sites() {
         let origin = spawn_origin(Uuid::new_v4(), None).expect("always Some");
         assert_eq!(origin.mode(), ActorMode::Agent);
     }
 
-    /// A child spawn's payload must not change: the explicit origin has to equal
-    /// what `synthesize_legacy_origin` built from its linkage before this split
-    /// existed. Compared through a real `MessageReceived`, which is where the
-    /// two meet.
     #[test]
     fn child_spawn_origin_equals_what_legacy_synthesis_produced() {
         use crate::engine::thread_events::ThreadEvent;
@@ -1452,7 +1225,6 @@ mod tests {
         let (parent_thread_id, spawning_event_id) =
             Relation::Child(WakeMode::Wake).spawn_linkage(spawning_thread, Some(tool_call));
 
-        // `explicit_origin: None` takes the legacy-synthesis branch.
         let synthesized = crate::engine::chat::make_message_received(
             workspace,
             "do the thing",
@@ -1492,8 +1264,6 @@ mod tests {
         };
         assert_eq!(a, b, "a child spawn's persisted origin must be unchanged");
     }
-
-    // --- spawn text and run_coding_agent guards -----------------------------
 
     #[test]
     fn run_thread_text_states_the_callback_contract_and_the_workspace_link() {
@@ -1550,7 +1320,6 @@ mod tests {
         }
     }
 
-    /// An executable file, so the binary-path preference reads it as installed.
     fn fake_agent_binary(dir: &std::path::Path) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("claude");

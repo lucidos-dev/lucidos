@@ -11,17 +11,47 @@ use crate::net_config;
 use crate::peers;
 use crate::release_check::ConfigWriteError;
 use crate::server::{GatewayState, RestoreStatus};
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, head, post, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub fn router() -> Router<GatewayState> {
+/// The routes the control hop shares with this gateway's own picker: restore
+/// and the workspace lifecycle (ADR 0811).
+fn shared_routes() -> Router<GatewayState> {
     Router::new()
+        // Restore a backup into a new workspace: stage the archive as a
+        // resumable tus upload, then commit it by naming the session (ADR 0810).
+        // A chunk streams to disk, so no body limit applies to it.
+        .route("/restore-uploads", post(crate::restore_upload::create))
+        .route(
+            "/restore-uploads/:id",
+            head(crate::restore_upload::head)
+                .patch(crate::restore_upload::patch)
+                .delete(crate::restore_upload::delete),
+        )
+        .route("/workspaces/restore", post(restore))
+        .route("/restore-status", get(restore_status).delete(clear_restore))
+        .route("/workspaces/:id/start", post(start))
+        .route("/workspaces/:id/stop", post(stop))
+}
+
+/// The control hop's allow-list, nested on B behind its control grant (ADR
+/// 0811). A workspace row takes the gateway-protocol shape, so no directory
+/// or port leaves this machine.
+pub fn hop_routes() -> Router<GatewayState> {
+    shared_routes().route(
+        "/workspaces",
+        get(crate::gateway_protocol::list_workspaces).post(create_listed),
+    )
+}
+
+pub fn router() -> Router<GatewayState> {
+    shared_routes()
         .route("/workspaces", get(list).post(create))
         .route("/workspace-order", put(set_workspace_order))
         .route("/cleanup", get(cleanup_review))
@@ -36,6 +66,7 @@ pub fn router() -> Router<GatewayState> {
         )
         .route("/trash/:id/restore", post(trash_restore))
         .route("/trash/:id/abandon-staging", post(trash_abandon_staging))
+        .route("/trash/:id/finish-delete", post(trash_finish_delete))
         // Register a directory that already exists, without provisioning or
         // starting anything. `create`'s sibling for a tree somebody else owns.
         .route("/workspaces/adopt", post(adopt))
@@ -44,14 +75,6 @@ pub fn router() -> Router<GatewayState> {
         // what each row subscription holds. A device's own total asks engines.
         .route("/unread-total", get(unread_total))
         .route("/diagnostic-log", get(crate::diagnostic_log::query))
-        // Restore a local backup archive into a new workspace (picker upload).
-        // The body is a multipart upload of a potentially multi-GB archive, so the
-        // default 2 MB extractor limit is lifted for this route only.
-        .route(
-            "/workspaces/restore",
-            post(restore).layer(DefaultBodyLimit::disable()),
-        )
-        .route("/restore-status", get(restore_status).delete(clear_restore))
         // Gateway self-update: is a rebuilt binary waiting, and adopt it (re-exec).
         .route("/gateway/status", get(gateway_status))
         .route("/gateway/reload", post(gateway_reload))
@@ -113,8 +136,6 @@ pub fn router() -> Router<GatewayState> {
         )
         .route("/workspaces/:id/rename", post(rename))
         .route("/workspaces/:id/restart", post(restart))
-        .route("/workspaces/:id/start", post(start))
-        .route("/workspaces/:id/stop", post(stop))
         .route("/workspaces/:id/autostart", post(set_autostart))
         // A booting engine reports its current phase here (best-effort) so the
         // boot splash can narrate the wait. Called by the engine during its own
@@ -188,12 +209,22 @@ async fn confirm_cleanup(
     device: Option<Extension<auth::AuthenticatedDevice>>,
     headers: HeaderMap,
     Json(body): Json<ConfirmCleanupBody>,
-) -> Result<Json<crate::server::cleanup_actions::Batch>, ApiError> {
+) -> Result<crate::control_jobs::JobOutcome, ApiError> {
     let actor = cleanup_device(device, &headers)?;
-    state
-        .confirm_cleanup(&id, &body.confirm, &actor.id)
-        .await
-        .map(|batch| Json(batch.public()))
+    let key = format!("cleanup-confirm:{id}:{}", body.confirm);
+    let job = state.clone();
+    Ok(state
+        .run_control_job(key, move || async move {
+            let batch = job.confirm_cleanup(&id, &body.confirm, &actor.id).await?;
+            job_json(batch.public())
+        })
+        .await)
+}
+
+fn job_json(body: impl Serialize) -> Result<crate::control_jobs::JobBody, ApiError> {
+    serde_json::to_value(body)
+        .map(Some)
+        .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 async fn cleanup_review(State(state): State<GatewayState>) -> Json<crate::cleanup::Review> {
@@ -211,10 +242,29 @@ async fn trash_restore(
     Path(id): Path<String>,
     device: Option<Extension<auth::AuthenticatedDevice>>,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
+) -> Result<crate::control_jobs::JobOutcome, ApiError> {
     cleanup_device(device, &headers)?;
-    state.restore_trash(&id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let job = state.clone();
+    Ok(state
+        .run_control_job(format!("trash-restore:{id}"), move || async move {
+            job.restore_trash(&id).await.map(|()| None)
+        })
+        .await)
+}
+
+async fn trash_finish_delete(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+    headers: HeaderMap,
+) -> Result<crate::control_jobs::JobOutcome, ApiError> {
+    let actor = cleanup_device(device, &headers)?;
+    let job = state.clone();
+    Ok(state
+        .run_control_job(format!("trash-finish-delete:{id}"), move || async move {
+            job.finish_trash_delete(&id, &actor.id).await.map(|()| None)
+        })
+        .await)
 }
 
 async fn trash_abandon_staging(
@@ -243,12 +293,15 @@ async fn confirm_empty_trash(
     device: Option<Extension<auth::AuthenticatedDevice>>,
     headers: HeaderMap,
     Json(body): Json<ConfirmCleanupBody>,
-) -> Result<Json<crate::server::trash_actions::EmptyBatch>, ApiError> {
+) -> Result<crate::control_jobs::JobOutcome, ApiError> {
     cleanup_device(device, &headers)?;
-    state
-        .confirm_empty_trash(&id, &body.confirm)
-        .await
-        .map(Json)
+    let key = format!("empty-trash-confirm:{id}:{}", body.confirm);
+    let job = state.clone();
+    Ok(state
+        .run_control_job(key, move || async move {
+            job_json(job.confirm_empty_trash(&id, &body.confirm).await?)
+        })
+        .await)
 }
 
 // ── Control-plane CSRF defense ─────────────────────────────────────────────
@@ -567,16 +620,32 @@ async fn create(
     State(state): State<GatewayState>,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let status = create_named(&state, &body).await?;
+    Ok(Json(json!({ "workspace": status })))
+}
+
+/// [`create`] through the control hop, answering the gateway-protocol row.
+async fn create_listed(
+    State(state): State<GatewayState>,
+    Json(body): Json<CreateBody>,
+) -> Result<Json<Value>, ApiError> {
+    let status = create_named(&state, &body).await?;
+    let row = crate::gateway_protocol::ListedWorkspace::from(status);
+    Ok(Json(json!({ "workspace": row })))
+}
+
+async fn create_named(
+    state: &GatewayState,
+    body: &CreateBody,
+) -> Result<crate::stack::WorkspaceStatus, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
         return Err(ApiError::bad_request("workspace name must not be empty"));
     }
-    // Picker "+ New": auto-start off by default — the user opens it now; whether
+    // Picker "+ New": auto-start off by default; the user opens it now. Whether
     // it auto-starts on a future gateway boot is their per-workspace toggle.
-    // The gateway returns a typed error: a duplicate display name is a 409 the
-    // user can act on, not a 500.
-    let status = state.create_workspace(name).await?;
-    Ok(Json(json!({ "workspace": status })))
+    // A duplicate display name is a typed 409 the user can act on, not a 500.
+    state.create_workspace(name).await
 }
 
 /// Register an existing directory as a workspace, and start nothing.
@@ -610,87 +679,41 @@ async fn adopt(
     Ok(Json(json!({ "workspace": ws, "owner_token": owner_token })))
 }
 
-/// Restore a local encrypted backup archive into a NEW workspace. Multipart body:
-/// `file` (the `.age`, or a legacy `.enc`), `key` (the backup key, or the base64
-/// key of a legacy archive), and optional `name` (sent only
-/// when the derived name collides with an existing workspace). Streams the upload
-/// to a temp file, then hands off to the gateway's restore flow (which validates,
-/// provisions, shells out to the engine, and registers the workspace). Returns
-/// 200 `{id, name}` once the background restore has started — the picker polls
-/// `GET /restore-status` for progress.
+#[derive(Deserialize)]
+struct RestoreBody {
+    /// The id of a complete restore upload session.
+    upload: String,
+    key: String,
+    /// Sent only when the name parsed from the archive collides or is absent.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Restore a staged backup archive into a NEW workspace. The archive arrived
+/// through `/restore-uploads`; this commit names the session and carries the
+/// key, which never touches disk. Answers `{id, name}` once the background
+/// restore has started, and the picker polls `GET /restore-status`.
 async fn restore(
     State(state): State<GatewayState>,
-    mut multipart: Multipart,
+    Json(body): Json<RestoreBody>,
 ) -> Result<Json<Value>, ApiError> {
-    // Reject a concurrent restore before consuming a (possibly multi-GB) upload.
     if matches!(state.restore_status(), RestoreStatus::Running { .. }) {
         return Err(ApiError::conflict("A restore is already in progress"));
     }
-
-    // The streamed temp archive is removed on ANY early return from here on — a
-    // connection dropped mid-upload, a malformed trailing field, or a missing
-    // key — via this guard, so a (possibly multi-GB) archive is never orphaned in
-    // the temp dir. It's kept only when ownership passes to
-    // `restore_workspace` (which then owns cleanup). `tempfile` creates it
-    // owner-only, so the archive is never readable by another local user.
-    let mut guard: Option<tempfile::TempPath> = None;
-    let mut filename = String::new();
-    let mut key: Option<String> = None;
-    let mut name: Option<String> = None;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::bad_request(format!("upload error: {e}")))?
-    {
-        // Capture the field name as owned so the borrow ends before we move the
-        // field into the streaming helper.
-        let field_name = field.name().map(|s| s.to_string());
-        match field_name.as_deref() {
-            Some("file") => {
-                filename = field.file_name().unwrap_or_default().to_string();
-                let path = tempfile::Builder::new()
-                    .prefix("lucidos-restore-")
-                    .suffix(".archive")
-                    .tempfile()
-                    .map_err(|e| ApiError::internal(format!("temp file: {e}")))?
-                    .into_temp_path();
-                stream_field_to_file(field, &path).await?;
-                guard = Some(path);
-            }
-            Some("key") => {
-                key = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| ApiError::bad_request(format!("bad key field: {e}")))?,
-                )
-            }
-            Some("name") => {
-                name = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| ApiError::bad_request(format!("bad name field: {e}")))?,
-                )
-            }
-            _ => {}
-        }
+    let key = body.key.trim().to_string();
+    if key.is_empty() {
+        return Err(ApiError::bad_request("missing backup key"));
     }
-
-    let guard = guard.ok_or_else(|| ApiError::bad_request("missing 'file' field"))?;
-    let key = key
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| ApiError::bad_request("missing backup key"))?;
-    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-
-    // Hand the temp file to the restore flow; it removes it when the background
-    // restore finishes, or on its own error paths.
-    let tmp = guard
-        .keep()
-        .map_err(|e| ApiError::internal(format!("temp file: {e}")))?;
-    let (id, ws_name) = state.restore_workspace(tmp, filename, key, name).await?;
+    let uploads = state.restore_uploads();
+    let claim = uploads.claim_complete(&body.upload, crate::restore_upload::now_secs())?;
+    let filename = claim.record().filename.clone();
+    let (id, ws_name) = state
+        .restore_workspace(&filename, key, body.name, || claim.take())
+        .await?;
+    crate::log_legacy!(
+        "[Gateway] restore upload {} committed into '{id}'",
+        body.upload
+    );
     Ok(Json(json!({ "id": id, "name": ws_name })))
 }
 
@@ -1083,35 +1106,25 @@ async fn set_external_address(
     Ok(Json(external_address_json(&state, probe.as_ref())))
 }
 
-/// Dismiss a terminal restore result (back to Idle). 409 while one is running.
-async fn clear_restore(State(state): State<GatewayState>) -> Result<StatusCode, ApiError> {
-    state.clear_restore_status()?;
-    Ok(StatusCode::NO_CONTENT)
+#[derive(Deserialize)]
+struct RestoreDismissal {
+    result_id: Option<String>,
 }
 
-/// Stream one multipart field to `path` without buffering the whole upload in
-/// memory (a backup archive can be many GB).
-async fn stream_field_to_file(
-    mut field: axum::extract::multipart::Field<'_>,
-    path: &std::path::Path,
-) -> Result<(), ApiError> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(path)
-        .await
-        .map_err(|e| ApiError::internal(format!("temp file: {e}")))?;
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| ApiError::bad_request(format!("upload read: {e}")))?
-    {
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| ApiError::internal(format!("temp write: {e}")))?;
-    }
-    file.flush()
-        .await
-        .map_err(|e| ApiError::internal(format!("temp flush: {e}")))?;
-    Ok(())
+/// Dismiss a matching terminal result. 409 while a restore is running.
+async fn clear_restore(
+    State(state): State<GatewayState>,
+    Query(dismissal): Query<RestoreDismissal>,
+) -> Result<StatusCode, ApiError> {
+    let result_id = dismissal
+        .result_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("Update the picker to dismiss this restore result.")
+        })?;
+    state.clear_restore_status(result_id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn rename(
@@ -1524,6 +1537,16 @@ mod authz_tests {
         ("POST", "/~/api/v1/control/workspaces"),
         ("POST", "/~/api/v1/control/workspaces/adopt"),
         ("POST", "/~/api/v1/control/workspaces/restore"),
+        // Stages a backup archive on this machine's disk (ADR 0810).
+        ("POST", "/~/api/v1/control/restore-uploads"),
+        (
+            "PATCH",
+            "/~/api/v1/control/restore-uploads/00000000000000000000000000000000",
+        ),
+        (
+            "DELETE",
+            "/~/api/v1/control/restore-uploads/00000000000000000000000000000000",
+        ),
         ("POST", "/~/api/v1/control/trash/workspace-test/restore"),
         (
             "POST",

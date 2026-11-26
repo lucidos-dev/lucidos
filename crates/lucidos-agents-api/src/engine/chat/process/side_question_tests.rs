@@ -9,8 +9,6 @@ fn reply_calling(tool: &str) -> LlmResponse {
     .unwrap()
 }
 
-/// A side question never runs a tool. The call is echoed back with a refusal,
-/// so the next round has to answer from what it knows.
 #[test]
 fn a_tool_call_is_answered_with_a_refusal_and_never_run() {
     let mut messages = Vec::new();

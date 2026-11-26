@@ -1,130 +1,3 @@
-//! Turn-gap resume note (sibling of `external_edits`).
-//!
-//! A coding agent's `--resume` replays its own conversation, not what happened
-//! to its work while it was idle. So when the user clicks Apply, Discard or
-//! Revert, when an Apply attempt fails, or when the cleanup worker reclaims the
-//! worktree, the resumed agent is blind to it: it tells the user the change is
-//! still awaiting Apply, offers to Apply commits that no longer exist on the
-//! branch, or treats reverted work as still in `main`.
-//!
-//! [`compute_turn_gap_note`] closes that gap with a short, stateless note
-//! prepended to the resumed prompt. It surfaces every covered event that landed
-//! in the **turn gap**: the window between the agent's *previous* turn boundary
-//! and the *current* one, i.e. with a `sequence` strictly between the previous
-//! boundary and the current turn's triggering event.
-//!
-//! - **Upper bound (exclusive):** the current turn's triggering event
-//!   (`current_origin_id`), by its **sequence**, not merely its id. The engine
-//!   persists the user's `MessageReceived` *before* spawning/resuming the agent
-//!   (see `chat/process/run.rs`, "Emit MessageReceived FIRST"), so by the time
-//!   this runs the current message is already in the events table. Excluding it
-//!   is what makes the threshold the *previous* boundary rather than the
-//!   current one. Excluding everything *after* it matters too. A follow-up
-//!   that queues for a starting run is persisted before the spawn builds its
-//!   prompt. An id-only bound would let that later message become the
-//!   "previous" boundary and swallow the entire gap. An event that lands after
-//!   the origin is not lost, it simply
-//!   belongs to the next turn's gap.
-//! - **Lower bound (exclusive):** the most-recent turn-boundary event *before*
-//!   the current one. The boundary set is [`boundary_event_types`]: every type
-//!   that can ORIGINATE a coding-agent turn (`CC_ORIGINATING_EVENT_TYPES`, the
-//!   shared definition, so the two cannot drift) plus
-//!   [`EXTRA_BOUNDARY_EVENT_TYPES`], the two that start a turn without ever
-//!   being an origin id. Hand-listing the boundary set is what let
-//!   `TriggerStarted` and `ChildThreadCompleted` fall out of it. A turn woken
-//!   by a finished child did not advance the threshold. The note fired on that
-//!   turn and then again on the next one.
-//!
-//! This is **stateless and self-clearing**. Once the agent reads the prompt the
-//! note rode on, that prompt's boundary becomes the *previous* one. The same
-//! events then fall below the threshold and never re-fire. No new event,
-//! no projection column, no state to clear: the events table is the cursor.
-//!
-//! ## In-session prompts
-//!
-//! A kept-alive session takes its next prompt without a respawn, and that
-//! prompt carries the note too ([`compute_turn_gap_note_until`]). Its upper
-//! bound is the `CodingAgentPromptSent` the session writes before it forwards.
-//! An origin bound would lose every event landing between origin and that
-//! write. The lower bound still comes from the origin, so a message queued
-//! behind it cannot swallow the gap.
-//!
-//! **A boundary counts only once the agent read it.** A `CodingAgentInputRead`
-//! must name its id or its `input_event_id`. Nothing the engine writes claims
-//! delivery. So no interleaving loses a note: a prompt the agent never read,
-//! whether the send failed, the agent died or the user withdrew it, moves no
-//! bound. The next prompt or the respawn covers its window.
-//!
-//! **A verbatim read counts for nothing either.** A slash command reaches the
-//! agent exactly as typed (`input_ledger::forwards_verbatim`), so it carried no
-//! note. Its read says so, and the next framed prompt carries the whole gap.
-//!
-//! A boundary older than the workspace's first read predates read reports
-//! (ADR 0268) and counts as before. The bounds per input, and the argument,
-//! are in `docs/plans/2026-10-11-turn-gap-note-for-kept-alive-sessions.md`.
-//!
-//! Known repeat, never a loss: a note computed while an earlier prompt is
-//! forwarded but unread re-lists that prompt's gap.
-//!
-//! ## What is covered, and what is deliberately not
-//!
-//! Covered: `ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`,
-//! `ChangeApplyFailed`, `WorktreeCleaned`. Those are the persisted events that
-//! land in the gap and that the replay cannot show the agent.
-//!
-//! `ChildThreadStopped` is covered for the same reason. Unlike its sibling
-//! `ChildThreadCompleted` it wakes nothing, so no turn carries it (ADR 0252).
-//! `ChildThreadDetached` too: the user moved a child out, and nothing wakes
-//! the agent to say so (ADR 0278). And `ChildReportFiled`, a report its wake
-//! mode or wake decision filed: this note is how a coding-agent parent
-//! reads it, in full, once.
-//!
-//! `BackgroundBashCompleted` is covered too, minus the ones an event wait
-//! delivered: that delivery is the prompt the re-opened turn carries. Also
-//! minus a task the thread stopped itself, which stood its watch down
-//! (ADR 0369). What reaches here is the one nobody delivered. A task whose
-//! wait a cap refused is one example.
-//!
-//! A **restart that cut off the last turn** is covered as well. The engine
-//! stops the session at teardown. Claude Code then closes the running tool call
-//! with its own "The user doesn't want to proceed" text. Unnamed, that reads as
-//! a user refusal, and the resumed agent stops retrying the work. Only the
-//! gap's newest coding-agent terminal counts (see
-//! [`last_turn_cut_off_by_restart`]), so a finished resume hears nothing.
-//!
-//! Deliberately NOT covered, because another mechanism already delivers them:
-//! `ChildThreadCompleted` (itself a CC turn origin, it wakes the parent
-//! carrying the child's summary), `UserQuestionAnswered` and
-//! `CodingAgentPermissionResolved` (delivered in-band to the waiting call), and
-//! everything the agent itself emitted, which the replay already contains.
-//!
-//! Deliberately NOT covered, because a note would add nothing:
-//! `MergeConflictDetected` / `MergeResolutionStarted` / `MergeResolutionCleared`
-//! (the conflict session spawns with a purpose-built system prompt naming the
-//! conflicted files, strictly more informative), `ChangeHardened` (the agent's
-//! own `/harden` run caused it), `CodingAgentSettingsChanged` (the resumed
-//! process already runs with the new model / effort), `ThreadTitleRenamed` /
-//! `ThreadSaved` / `ThreadUnsaved` / `QueuedMessageRemoved` (cosmetic, or
-//! removed before delivery), `MessageHeld` / `HeldMessageReleased` (the
-//! release delivers the message itself), and `ThreadArchived` / `ThreadDiscarded`
-//! (terminal; archive's pending-change discard already arrives as
-//! `ChangeDiscarded`).
-//!
-//! A newly-hidden event is one more arm in [`GapEvent`], not a redesign.
-//!
-//! ## User-only messages
-//!
-//! A `UserOnlyMessagePosted` (ADR 0649) is talk between people that woke
-//! nothing. The same window carries every one since the previous turn, so the
-//! agent reads each exactly once, at the head of its next woken prompt. They
-//! render as their own block after the note ([`user_talk_block`]), each
-//! under its user name on a team gateway.
-//!
-//! Like `external_edits`, the helper is best-effort: any query error degrades
-//! silently to `None` (resume proceeds without the note rather than failing),
-//! and a payload that will not parse degrades to vaguer wording rather than
-//! dropping the event.
-
 use std::collections::HashMap;
 
 use uuid::Uuid;
@@ -132,79 +5,49 @@ use uuid::Uuid;
 use crate::engine::thread_events::CC_ORIGINATING_EVENT_TYPES;
 use crate::engine::thread_events::{AbortCause, EventChannel, ThreadEvent};
 
-/// Max number of bullet lines to render before truncating, so a thread that
-/// applied a large batch can't blow up the resumed prompt. Mirrors the
-/// `MAX_LINES` convention in `external_edits`.
 const MAX_LINES: usize = 50;
 
 const MAX_LINES_PER_EVENT: usize = 20;
 
-/// Event types the note surfaces. See the module docs for the reasoned
-/// exclusions.
 const COVERED_EVENT_TYPES: &[&str] = &[
     "ChangeApplied",
     "ChangeDiscarded",
     "ChangeReverted",
     "ChangeApplyFailed",
     "WorktreeCleaned",
-    // Every completion no event wait delivered. The query drops the delivered
-    // ones, whose delivery is the prompt the re-opened turn already carries.
     "BackgroundBashCompleted",
-    // A user Stop on one of this agent's children. It wakes nothing, so this
-    // note is the only way a coding-agent parent hears the child is alive
-    // (ADR 0252).
     "ChildThreadStopped",
-    // One of this agent's children was moved to top level. It wakes nothing,
-    // and without the note the agent reads a child that never reports back
-    // (ADR 0278).
     "ChildThreadDetached",
     "ChildReportFiled",
 ];
 
 const EXTRA_BOUNDARY_EVENT_TYPES: &[&str] = &["CodingAgentPromptSent"];
 
-/// Talk between people that woke nothing. See the module docs.
 const USER_ONLY_MESSAGE_EVENT_TYPE: &str = "UserOnlyMessagePosted";
 
-/// Max user-only messages one prompt carries, newest kept. A long paused
-/// conversation must not crowd out the message that woke the agent.
 const MAX_USER_ONLY_MESSAGES: usize = 50;
 
-/// Max characters of one user-only message a prompt carries. A pasted log
-/// must not crowd out the rest either.
 const MAX_USER_ONLY_MESSAGE_CHARS: usize = 2000;
 
-/// A change description is the agent's own summary and can be long; keep the
-/// bullet readable.
 const MAX_DESCRIPTION_CHARS: usize = 80;
 
-/// How long after its own stand-down a killed task's completion still counts
+/// INVARIANT: How long after its own stand-down a killed task's completion still counts
 /// as the thread's own stop. The reap takes the 3 s stop grace plus the drain,
 /// so a minute is generous even on a saturated host.
 const SELF_STOP_REAP_WINDOW_SECS: i64 = 60;
 
-/// Apply errors are user-facing toast copy and can carry a git stderr dump.
 const MAX_ERROR_CHARS: usize = 200;
 
-/// The turn-gap note plus the one fact its caller needs back.
 pub(crate) struct TurnGapNote {
-    /// The rendered note, then the user-only messages since the previous
-    /// turn, ready to prepend to the resumed prompt.
     pub note: String,
     pub explains_worktree_reset: bool,
-    /// The `UserOnlyMessagePosted` events the note carries. A fresh session's
-    /// thread history leaves them out, so the agent reads each once.
     pub user_event_ids: Vec<Uuid>,
 }
 
-/// One covered event, parsed out of its payload.
 enum GapEvent {
     Applied {
         change_id: String,
-        /// Commit subjects merged to `main`, oldest first. Empty for no-op
-        /// applies.
         commits: Vec<String>,
-        /// SHA of `main` after the merge, already shortened to <= 8 chars.
         short_sha: Option<String>,
     },
     Discarded {
@@ -222,49 +65,30 @@ enum GapEvent {
         freed_bytes: u64,
         branch_deleted: bool,
     },
-    /// A background task this session spawned ended, and no wake reached the
-    /// session. See [`COVERED_EVENT_TYPES`] for why only those land here.
     BackgroundTaskEnded {
         task_id: String,
         command: String,
-        /// The engine's own stop ended it, so there is no verdict to report.
         abandoned: bool,
-        /// The task blew its own `timeout_secs`.
         timed_out: bool,
-        /// `bash_kill` ended it. Distinct from `abandoned`, which is the
-        /// engine's own shutdown sending the same signal.
         killed: bool,
-        /// The rendered status phrase, shared with every other LLM-facing
-        /// surface via `TaskOutcome::describe`. Empty when the payload carried
-        /// no status at all, which is a row from before that pair existed.
         status: String,
         started_at: String,
     },
-    /// A user Stop paused one of this agent's child threads. See
-    /// [`COVERED_EVENT_TYPES`].
     ChildStopped {
         child_thread_id: String,
         title: String,
     },
-    /// One of this agent's children was moved to top level. See
-    /// [`COVERED_EVENT_TYPES`].
     ChildMovedOut {
         child_thread_id: String,
         title: String,
     },
-    /// A child's report, filed without waking this agent: the whole
-    /// `[CHILD THREAD REPORT FILED]` block a chat parent reads.
     ChildReportFiled {
         block: String,
     },
-    /// An engine restart stopped the agent's last turn mid-call. See
-    /// [`last_turn_cut_off_by_restart`].
     RestartCutOffLastTurn,
 }
 
 impl GapEvent {
-    /// The change this event resolved, when it names one. Drives the single
-    /// `changes` lookup that resolves branch names and descriptions.
     fn change_id(&self) -> Option<&str> {
         match self {
             Self::Applied { change_id, .. }
@@ -297,8 +121,6 @@ impl GapEvent {
     }
 }
 
-/// The branch of the change an event resolved, or `""` when it names no change
-/// or the `changes` row could not be resolved.
 fn branch_for<'a>(event: &GapEvent, facts: &'a HashMap<Uuid, ChangeFacts>) -> &'a str {
     facts_for(event, facts)
         .map(|f| f.branch_name.as_str())
@@ -315,7 +137,6 @@ fn facts_for<'a>(
         .and_then(|id| facts.get(&id))
 }
 
-/// What the `changes` projection knows about a change the note mentions.
 struct ChangeFacts {
     branch_name: String,
     description: String,
@@ -329,14 +150,6 @@ fn boundary_event_types() -> Vec<String> {
         .collect()
 }
 
-/// Build a note telling the resuming agent what happened to its work in the gap
-/// before the current turn. Returns `None` when nothing did.
-///
-/// `current_origin_id` is the event that triggered this turn (already
-/// persisted, see the module docs). It is the exclusive upper bound, so the
-/// threshold becomes the *previous* turn boundary. `session_branch` is the
-/// branch this session is resuming on, used to tell "your branch was reset"
-/// apart from "a stale change on another branch was cleaned up".
 pub(crate) async fn compute_turn_gap_note(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -353,11 +166,6 @@ pub(crate) async fn compute_turn_gap_note(
     .await
 }
 
-/// [`compute_turn_gap_note`] with its two bounds taken from different events,
-/// for a prompt to a live session (see the module docs).
-///
-/// The lower bound is the newest turn boundary before `anchor_id`. The upper
-/// bound is `until_id`, exclusive. A spawn passes its origin as both.
 pub(crate) async fn compute_turn_gap_note_until(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -382,35 +190,6 @@ pub(crate) async fn compute_turn_gap_note_until(
         (None, None)
     });
 
-    // `payload - 'stdout' - 'stderr' - 'text'`: nothing here reads those keys.
-    // A `BackgroundBashCompleted` carries up to 100 KB of each stream, and a
-    // `ResponseGenerated` carries the whole answer. Fetching them to build a
-    // one-line note is the whole transfer for nothing.
-    //
-    // The gap's `Response*` terminals ride the same window, for
-    // `last_turn_cut_off_by_restart`.
-    //
-    // A completion an event wait already delivered is dropped: the delivery is
-    // the prompt this turn carries, so a note line would say it twice, and
-    // claim nobody told the agent.
-    //
-    // So is a completion that landed before the previous turn's idle. The
-    // agent was still in its turn and read it there, through `background-task
-    // wait` or its own output read. A polled task always lands this way.
-    //
-    // So is a killed task whose watch this thread stood down just before.
-    // That is the thread's own stop (ADR 0369), and its reap usually lands
-    // after the turn that issued it ended. An older stand-down is a watch the
-    // agent dropped, and a later kill by somebody else is still news.
-    //
-    // A boundary counts only once the agent read the input it carried: a
-    // `CodingAgentInputRead` names its id, or its `input_event_id`. It must
-    // not be `verbatim`: a slash command carried no note. A read carrying
-    // `assumed` is an old row, where a timer settled the input with no report
-    // from the agent, so it proves nothing either. One that went unread (a
-    // failed send, a dead agent, a withdrawal, a rejection) delivered no note,
-    // so the next prompt carries its gap. A boundary older than the
-    // workspace's first read predates read reports, and counts as before.
     let rows: Vec<(Uuid, String, serde_json::Value)> =
         sqlx::query_as::<_, (Uuid, String, serde_json::Value)>(&format!(
             "SELECT e.id, e.event_type, \
@@ -480,7 +259,6 @@ pub(crate) async fn compute_turn_gap_note_until(
         .bind(until_sequence)
         .bind(crate::engine::thread_events::CACHE_KEEP_ALIVE_REASON_KIND)
         .bind(USER_ONLY_MESSAGE_EVENT_TYPE)
-        // One past the cap, so the block can tell a cut message.
         .bind((MAX_USER_ONLY_MESSAGE_CHARS + 1) as i32)
         .fetch_all(pool)
         .await
@@ -543,10 +321,6 @@ pub(crate) async fn compute_turn_gap_note_until(
     })
 }
 
-/// The user-only messages a prompt carries, oldest first, from their
-/// `UserOnlyMessagePosted` payloads. `None` when there are none.
-///
-/// Each reads under the name `history.rs` gives the same message.
 fn user_talk_block(
     payloads: &[serde_json::Value],
     users: &crate::gateway_users::UserSnapshot,
@@ -577,16 +351,6 @@ fn user_talk_block(
     Some(block)
 }
 
-/// True when the gap's newest coding-agent terminal is an abort an engine
-/// restart caused. `terminals` is in sequence order.
-///
-/// Only the newest one counts. `ContinuationRequested` is no turn boundary, so
-/// a finished resume shares its gap with the abort before it. The resume's own
-/// terminal then says the restart is behind it.
-///
-/// `EngineShutdown` is the teardown's abort, and `RecoveryAfterRestart` settles
-/// a turn a crash cut off. Every other cause is a different story: a user
-/// cancel, or a subprocess that died on its own under a live engine.
 fn last_turn_cut_off_by_restart(terminals: &[(String, serde_json::Value)]) -> bool {
     terminals
         .iter()
@@ -608,9 +372,6 @@ fn last_turn_cut_off_by_restart(terminals: &[(String, serde_json::Value)]) -> bo
         })
 }
 
-/// Turn one `(event_type, payload)` row into a [`GapEvent`]. Missing fields
-/// degrade to empty rather than dropping the event: knowing a change was
-/// discarded matters more than knowing which one.
 fn parse_gap_event(
     (event_id, event_type, payload): (Uuid, String, serde_json::Value),
 ) -> Option<GapEvent> {
@@ -687,8 +448,6 @@ fn parse_gap_event(
                 MAX_DESCRIPTION_CHARS,
             ),
         }),
-        // No change statuses: the block names each change as the report left
-        // it, and the CHANGE lines above say what moved since.
         "ChildReportFiled" => Some(GapEvent::ChildReportFiled {
             block: crate::core::store::messages::format_child_report_filed_block(
                 &crate::core::events::EventRow {
@@ -698,20 +457,14 @@ fn parse_gap_event(
                 &crate::core::store::ChangeStatuses::new(),
             ),
         }),
-        // A covered type the query returned but this match doesn't know would
-        // be a programming error; skip it rather than panic mid-resume.
         _ => None,
     }
 }
 
-/// A boolean payload field. Absent means false, which is how every flag on
-/// `BackgroundBashCompleted` is serialized when it does not apply.
 fn bool_field(payload: &serde_json::Value, key: &str) -> bool {
     payload.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-/// A nullable integer payload field, as `i32`. `None` for absent or `null`,
-/// which is what an `exit_code` or `signal` that does not apply carries.
 fn int_field(payload: &serde_json::Value, key: &str) -> Option<i32> {
     payload.get(key).and_then(|v| v.as_i64()).map(|n| n as i32)
 }
@@ -763,18 +516,10 @@ async fn load_change_facts(pool: &sqlx::PgPool, events: &[GapEvent]) -> HashMap<
     .unwrap_or_default()
 }
 
-/// Shorten to the first 8 characters on a char boundary (never a raw byte
-/// slice, see CLAUDE.md "Never slice strings by byte index").
 fn short(s: &str) -> String {
     s[..s.floor_char_boundary(8)].to_string()
 }
 
-/// Shorten to at most `max` CHARACTERS, appending an ellipsis when it cuts.
-///
-/// Both halves count characters. The guard counted characters, the cut took a
-/// byte index. A description in a non-Latin script lost most of its intended
-/// length: 80 bytes of Japanese is roughly 26 characters. Mirrors
-/// `reconstruct::truncate`.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -807,7 +552,6 @@ fn build_note(
         let branch = branch_for(event, facts);
         let label = change_label(event.change_id().unwrap_or(""), facts_for(event, facts));
 
-        // Per event as well as overall, so no one event can starve the rest.
         let mut spent_here = 0usize;
         for line in render(event, &label, branch, session_branch) {
             if lines < MAX_LINES && spent_here < MAX_LINES_PER_EVENT {
@@ -821,8 +565,6 @@ fn build_note(
         }
     }
 
-    // "not shown" rather than "more", because the dropped lines are no longer
-    // only the tail: a per-event cap drops from the middle too.
     if truncated > 0 {
         note.push_str(&format!("\n… and {} more line(s) not shown", truncated));
     }
@@ -835,8 +577,6 @@ fn build_note(
     note
 }
 
-/// The bullet(s) for one event. Applies render one line per merged commit; every
-/// other kind renders exactly one line.
 fn render(
     event: &GapEvent,
     label: &str,
@@ -850,9 +590,6 @@ fn render(
             short_sha,
         } => {
             if commits.is_empty() {
-                // No-op apply (nothing to merge / already merged). Render a row
-                // anyway so the agent knows the change resolved, rather than an
-                // empty bullet.
                 return vec![format!(
                     "- APPLIED: change {}: no commits / already merged.",
                     short_change_id(change_id)
@@ -917,7 +654,7 @@ fn render(
     }
 }
 
-/// The bullet for a turn an engine restart cut off. It quotes the text Claude
+/// INVARIANT: The bullet for a turn an engine restart cut off. It quotes the text Claude
 /// Code writes at teardown, so the agent recognises the lines it must discount.
 const RESTART_CUT_OFF_LINE: &str = "- ENGINE RESTART: the Lucidos engine restarted while your \
     last turn was running, and it stopped your session mid-turn. Your transcript may show a tool \
@@ -928,8 +665,6 @@ const RESTART_CUT_OFF_LINE: &str = "- ENGINE RESTART: the Lucidos engine restart
     again: first check whether it had side effects that may have partly happened, then carry on \
     with your plan.";
 
-/// The bullet for a child a user Stop paused. It says what the
-/// `[CHILD THREAD STOPPED]` block says to a chat parent: the child is alive.
 fn child_stopped_line(child_thread_id: &str, title: &str) -> String {
     let name = child_name(child_thread_id, title);
     format!(
@@ -940,8 +675,6 @@ fn child_stopped_line(child_thread_id: &str, title: &str) -> String {
     )
 }
 
-/// The bullet for a child moved to top level. It says what the
-/// `[CHILD THREAD MOVED OUT]` block says to a chat parent.
 fn child_moved_out_line(child_thread_id: &str, title: &str) -> String {
     let name = child_name(child_thread_id, title);
     format!(
@@ -951,7 +684,6 @@ fn child_moved_out_line(child_thread_id: &str, title: &str) -> String {
     )
 }
 
-/// A child named by title and id, or by id alone when it has no title.
 fn child_name(child_thread_id: &str, title: &str) -> String {
     if title.is_empty() {
         format!("thread {child_thread_id}")
@@ -982,8 +714,6 @@ fn discarded_line(label: &str, branch: &str, session_branch: Option<&str>) -> St
     }
 }
 
-/// What [`background_task_line`] renders. A struct rather than six positional
-/// strings and flags, which is one transposition away from swapping two.
 struct BackgroundTaskLine<'a> {
     command: &'a str,
     task_id: &'a str,
@@ -1073,7 +803,6 @@ fn closing_guidance(events: &[GapEvent]) -> Vec<&'static str> {
     out
 }
 
-/// `"the description"` when the `changes` row has one, else `change abc12345`.
 fn change_label(change_id: &str, facts: Option<&ChangeFacts>) -> String {
     match facts
         .map(|f| f.description.trim())
@@ -1092,7 +821,6 @@ fn on_branch(branch: &str) -> String {
     }
 }
 
-/// Short id for a bullet, char-boundary safe.
 fn short_change_id(id: &str) -> String {
     if id.is_empty() {
         "?".to_string()

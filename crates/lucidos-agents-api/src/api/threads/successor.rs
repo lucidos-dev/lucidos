@@ -1,22 +1,3 @@
-//! *Successor sessions*: a coding-agent thread's context size, and the handoff
-//! to a fresh session in the same thread.
-//!
-//! - `GET /api/v1/threads/:thread_id/context`: the size and what it calls for.
-//! - `POST /api/v1/threads/:thread_id/handoff-checkpoints`: record a *handoff
-//!   checkpoint* run and answer with its *handoff estimate* (ADR 0505).
-//! - `POST /api/v1/threads/:thread_id/successor`: the agent's handoff, after it
-//!   wrote its *handoff narrative*.
-//! - `POST /api/v1/threads/:thread_id/successor-offer/continue`: the user chose
-//!   *Continue with context* on the Successor card.
-//! - `POST /api/v1/threads/:thread_id/successor-offer/decline`: the user chose
-//!   *Stay here* on the Successor card.
-//! - `POST /api/v1/threads/:thread_id/successor/withdraw`: a person chose
-//!   *Return to the old session* on a pending ceiling handoff (ADR 0629).
-//!
-//! A handoff creates no thread, no branch and no change. It records
-//! `SessionHandedOff`, and the thread's next session starts fresh from its
-//! opening once the current run lets go of the thread.
-
 use crate::engine::successor::SuccessorExt;
 use axum::{
     extract::{Path, State},
@@ -55,10 +36,6 @@ fn parse_thread_id(raw: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(raw).map_err(|e| ApiError::bad_request(format!("Invalid thread id: {e}")))
 }
 
-/// The context reading, plus the implementer a coding-agent thread runs on,
-/// which a plan card names beside the one it recommends. A checkpoint run
-/// also carries the *handoff estimate*'s verdict. The plain reading carries
-/// the Successor card's verdict, and any ceiling handoff waiting to start.
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct ThreadContextResponse {
     #[serde(flatten)]
@@ -72,8 +49,6 @@ pub(in crate::api) struct ThreadContextResponse {
     ceiling_handoff: Option<CeilingHandoff>,
 }
 
-/// A checkpoint run as a flow names it: a name, and optionally the progress
-/// as `<done>/<total>`.
 #[derive(Debug, Default, Deserialize)]
 pub(in crate::api) struct CheckpointFields {
     #[serde(default)]
@@ -94,7 +69,6 @@ impl CheckpointFields {
     }
 }
 
-/// The thread's columns the context reading needs, or a 404.
 async fn context_row(
     state: &AppState,
     thread_id: Uuid,
@@ -146,11 +120,10 @@ pub(in crate::api) async fn thread_context(
 
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct WithdrawResponse {
-    /// The thread's ceiling now, raised past the session's size.
     ceiling: ContextCeiling,
 }
 
-/// *Return to the old session* on a pending ceiling handoff: a person only.
+/// INVARIANT: *Return to the old session* on a pending ceiling handoff: a person only.
 /// It raises the thread's ceiling past the session's size, then withdraws the
 /// handoff, so the next input resumes the old session.
 pub(in crate::api) async fn withdraw_successor(
@@ -197,8 +170,6 @@ pub(in crate::api) async fn withdraw_successor(
     }
 }
 
-/// Record *Stay here* on a coding-agent thread's Successor card, at the
-/// context size it holds now. The card stays hidden until the thread grows.
 pub(in crate::api) async fn decline_successor_offer(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -214,7 +185,6 @@ pub(in crate::api) async fn decline_successor_offer(
             "Only a coding-agent thread has a Successor card.",
         ));
     }
-    // A tap on a card the thread outgrew (a turn started) records nothing.
     hand_off_candidate(&state, thread_id, true).await?;
     let input_tokens = crate::engine::successor::thread_context(&state.pool, thread_id)
         .await
@@ -240,8 +210,6 @@ pub(in crate::api) async fn decline_successor_offer(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A checkpoint run's body. `offered` marks a `--ask` run. `default_floor`
-/// marks a run that declares the *default floor*.
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct CheckpointRequest {
     name: String,
@@ -253,8 +221,6 @@ pub(in crate::api) struct CheckpointRequest {
     default_floor: bool,
 }
 
-/// The rungs `thread_id`'s surface ladder offers it at a run that declares
-/// the default floor. A model the backend swapped away is never offered.
 async fn floor_rungs(state: &AppState, thread_id: Uuid) -> Result<FloorRungs, ApiError> {
     let surface = state.engine.thread_coding_agent(thread_id).await.into();
     let ladder =
@@ -284,8 +250,6 @@ async fn floor_rungs(state: &AppState, thread_id: Uuid) -> Result<FloorRungs, Ap
     Ok(rungs)
 }
 
-/// Record a checkpoint run on a coding-agent thread and answer with the
-/// context reading and the verdict. A thread records only its own runs.
 pub(in crate::api) async fn record_handoff_checkpoint(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -343,9 +307,6 @@ pub(in crate::api) async fn record_handoff_checkpoint(
     }))
 }
 
-/// The implementer a coding-agent thread runs on: its backend, and the model
-/// and effort its calls use (`cc_thread_runs_on`). A successor session carries
-/// these over.
 async fn thread_implementer(
     state: &AppState,
     thread_id: Uuid,
@@ -365,24 +326,16 @@ async fn thread_implementer(
     })
 }
 
-/// The agent's handoff: a *handoff narrative*, and optionally the successor
-/// session's implementer. An agent names none, so the implementer the user
-/// picked at the *Successor card* applies (`pending_successor_request`).
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct SuccessorRequest {
     #[serde(default)]
     narrative: String,
     #[serde(flatten)]
     implementer: ImplementerRequest,
-    /// The checkpoint run the handoff happens at, which the opening names so
-    /// the successor session skips it.
     #[serde(flatten)]
     checkpoint: CheckpointFields,
 }
 
-/// The *Successor card*'s Continue: the user's first request for the
-/// successor session, if they typed one, and the implementer they picked. The
-/// body names no path: the engine picks it by cache warmth (ADR 0539).
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct ContinueRequest {
     #[serde(default)]
@@ -393,27 +346,18 @@ pub(in crate::api) struct ContinueRequest {
 
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct SuccessorResponse {
-    /// What the successor session runs on, so the caller reports what it
-    /// started.
     implementer: Implementer,
     starts: SessionStart,
 }
 
-/// Which way Continue went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(in crate::api) enum HandoffPath {
-    /// The cache was warm: the agent is writing the narrative, and the
-    /// successor session follows its turn.
     Narrative,
-    /// The cache was cold, or its lifetime unknown, or the provider blocked
-    /// the session: the successor session starts at once from a brief.
     Brief,
 }
 
 impl HandoffPath {
-    /// A blocked session is never asked for a narrative, whatever the cache's
-    /// warmth: waking it would replay the history that tripped the block.
     fn of(warmth: CacheWarmth, blocking_policy: Option<&'static str>) -> Self {
         match (warmth, blocking_policy) {
             (CacheWarmth::Warm, None) => Self::Narrative,
@@ -425,12 +369,10 @@ impl HandoffPath {
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct ContinueResponse {
     path: HandoffPath,
-    /// The handoff, once it is recorded: at once on the brief path.
     #[serde(flatten)]
     successor: Option<SuccessorResponse>,
 }
 
-/// The thread, as the handoff reads it.
 #[derive(sqlx::FromRow)]
 struct HandingOffThread {
     is_coding_agent: bool,
@@ -443,33 +385,26 @@ fn refusal(status: StatusCode, reason: &'static str, message: impl Into<String>)
     ApiError::new(status, message).with_reason(reason)
 }
 
-/// How a successor session opens.
 enum Opening {
-    /// The agent's *handoff narrative*, and the request the user recorded at
-    /// the *Successor card*.
     Narrative {
         narrative: String,
         request: Option<HandoffRequest>,
     },
-    /// No narrative: the *handoff brief* for `cause`, and the user's request if
-    /// any.
     Brief {
         cause: BriefCause,
         request: Option<HandoffRequest>,
     },
 }
 
-/// One handoff, as `hand_off` runs it.
 struct HandoffStart {
     thread_id: Uuid,
     opening: Opening,
     implementer: ImplementerRequest,
-    /// The agent itself named `implementer`, so it must be a rung.
     picked_by_agent: bool,
     checkpoint: Option<CheckpointRun>,
 }
 
-/// The thread, once it may hand off: the refusals every handoff shares.
+/// INVARIANT: The thread, once it may hand off: the refusals every handoff shares.
 /// `require_idle` is the composer's: a stale tap must not hand off a thread
 /// whose turn has started since. A failed turn has ended too, and a provider
 /// block leaves its thread `failed`. The agent's own handoff runs inside its
@@ -524,7 +459,6 @@ async fn hand_off_candidate(
     Ok((thread, title))
 }
 
-/// What the caller is told about a [`HandoffBlock`].
 fn block_refusal(state: &AppState, block: HandoffBlock, title: &str) -> ApiError {
     let (reason, message) = match block {
         HandoffBlock::LegacySuccessor(successor) => (
@@ -564,8 +498,6 @@ fn already_handing_off(title: &str) -> ApiError {
     )
 }
 
-/// A thread hands off only itself: an agent cannot hand off another thread's
-/// work. Answers whether the caller is the agent of `thread_id`.
 fn caller_is_the_agent(headers: &HeaderMap, thread_id: Uuid) -> Result<bool, ApiError> {
     match crate::core::subprocess_origin::subprocess_origin(headers) {
         SubprocessOrigin::Subprocess {
@@ -580,7 +512,6 @@ fn caller_is_the_agent(headers: &HeaderMap, thread_id: Uuid) -> Result<bool, Api
     }
 }
 
-/// The agent's handoff, after it wrote its *handoff narrative*.
 pub(in crate::api) async fn spawn_successor(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -600,8 +531,6 @@ pub(in crate::api) async fn spawn_successor(
             ),
         ));
     }
-    // What the user asked for at the card, while the agent wrote this. The
-    // agent names no implementer of its own, so the user's pick stands.
     let pending = pending_successor_request(&state.pool, thread_id)
         .await
         .map_err(ApiError::db)?
@@ -630,11 +559,6 @@ pub(in crate::api) async fn spawn_successor(
     .map(Json)
 }
 
-/// The *Successor card*'s Continue. The engine picks the path by the cache's
-/// warmth now. Warm: record the request and ask the agent for its *handoff
-/// narrative*, and the successor session follows when the agent hands off.
-/// Cold: start the successor session at once from a *handoff brief*, and wake
-/// nothing on the current session (ADR 0539).
 pub(in crate::api) async fn continue_in_successor(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -659,8 +583,6 @@ pub(in crate::api) async fn continue_in_successor(
         by: actor.clone(),
     });
     let (thread, _) = hand_off_candidate(&state, thread_id, true).await?;
-    // Refuse a pick the backend does not offer now. A warm tap would
-    // otherwise cost a narrative turn that the handoff then refuses.
     resolve_implementer(
         &thread_implementer(&state, thread_id, thread.coding_agent.as_deref()).await?,
         &request.implementer,
@@ -710,8 +632,6 @@ pub(in crate::api) async fn continue_in_successor(
     Ok(Json(ContinueResponse { path, successor }))
 }
 
-/// Record the user's request on the thread, then ask its agent for the
-/// *handoff narrative* as a user would.
 async fn request_narrative(
     state: &AppState,
     headers: &HeaderMap,
@@ -752,9 +672,6 @@ async fn request_narrative(
         .map(|_ack| ())
 }
 
-/// Record `start.thread_id`'s handoff, then start its successor session once
-/// nothing holds the thread. A handoff is an act in the thread's own subtree,
-/// so it needs no authority.
 async fn hand_off(
     state: &AppState,
     headers: &HeaderMap,
@@ -778,8 +695,6 @@ async fn hand_off(
         &requested,
     )
     .map_err(|e| refusal(StatusCode::BAD_REQUEST, "implementer-not-offered", e))?;
-    // An agent's own pick must be a rung. Carrying the thread's pair over
-    // is no pick: the owner may have chosen it off the ladder (ADR 0500).
     if from_agent && picked_by_agent {
         crate::api::intelligence_ladder::refuse_off_ladder(
             state,

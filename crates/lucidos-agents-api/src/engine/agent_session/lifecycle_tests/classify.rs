@@ -1,15 +1,6 @@
 use super::*;
 use crate::runtime::is_user_question_tool;
 
-/// Every question tool must suppress the `CodingAgentToolCalled` emit: the
-/// `UserQuestionAsked` event renders the card, and a tool-call step on top
-/// double-surfaces the question. Every other tool (including OTHER lucidos MCP
-/// tools like the permission `approve`) must keep emitting, or its step
-/// silently vanishes from the timeline.
-///
-/// THREE names, not two. CC reaches the MCP question tool under its own mount
-/// name as well as calling its native one, and that third name was missing:
-/// the step it emitted sat pending above the card until the user answered.
 #[test]
 fn question_tools_are_suppressed_other_tools_are_not() {
     assert!(is_user_question_tool(
@@ -37,11 +28,6 @@ fn question_tools_are_suppressed_other_tools_are_not() {
     }
 }
 
-/// A normal `Generated` Result must always emit
-/// `CodingAgentIdled` regardless of inflight inputs, otherwise the thread sits in
-/// stored=Archived → DisplaySection::Archive instead of Current.
-/// Inflight-followup race protection lives in the run-loop's
-/// subprocess-termination decision, not here.
 #[test]
 fn generated_result_always_emits_idle() {
     let (terminal, emit_idle) = classify_result(false, None, false, None, false);
@@ -53,10 +39,6 @@ fn generated_result_always_emits_idle() {
     );
 }
 
-/// CC's stream-json result with `is_error: true` — produced when the
-/// upstream API call dies mid-stream — must classify as `Failed` so the
-/// frontend renders the partial response with a red failure indicator
-/// instead of the green check ResponseGenerated would produce.
 #[test]
 fn cc_error_classifies_as_failed() {
     let err = "Stream interrupted: connection reset".to_string();
@@ -69,9 +51,6 @@ fn cc_error_classifies_as_failed() {
     );
 }
 
-/// Shutdown beats CC error — the engine is going down regardless of how
-/// CC ended its turn. Without this, an `Aborted` recovery path would
-/// double-emit on restart (Failed already landed, then Aborted overwrites).
 #[test]
 fn shutdown_wins_over_cc_error() {
     let (terminal, emit_idle) =
@@ -86,16 +65,6 @@ fn shutdown_wins_over_cc_error() {
     );
 }
 
-/// user_hit_stop beats cc_error: this is the interrupt-cancel case. The
-/// `Stop` button (Cancel = Esc) routes through CC's native interrupt, and an
-/// interrupted turn comes back as a `Result` with `is_error: true` (CC
-/// reports the aborted turn, e.g. `stop_reason=tool_use` / an
-/// `[ede_diagnostic]` line). That error is *caused by* the user's cancel, so
-/// it must classify as `Canceled`, not `Failed`, otherwise the user sees a
-/// red "Failed" dot for a turn they deliberately stopped and the
-/// branch-preservation gate (keyed on `Canceled`) never fires. A real
-/// failure on a turn the user did NOT stop still classifies as `Failed`
-/// (user_hit_stop is false there, see `cc_error_wins_over_empty_text`).
 #[test]
 fn user_hit_stop_wins_over_cc_error() {
     use crate::engine::thread_events::CancelCause;
@@ -112,14 +81,6 @@ fn user_hit_stop_wins_over_cc_error() {
     );
 }
 
-/// Empty assistant text on an otherwise-clean turn classifies as `Failed`,
-/// not `Generated`. Without this branch, a Claude Code subprocess that bailed after
-/// an OOM-killed Bash (exit 137) emits `ResponseGenerated { text: "" }`
-/// and `CodingAgentIdled { has_changes: true }` — the UI then shows a
-/// silent "completed" turn even though the user got nothing back. Routing
-/// through `Failed` surfaces the red dot in the UI and (via
-/// `idle_change_write`) refuses to auto-propose the partial
-/// worktree state for Apply.
 #[test]
 fn empty_text_classifies_as_failed_with_empty_response_error() {
     let (terminal, emit_idle) = classify_result(false, None, false, None, true);
@@ -136,11 +97,6 @@ fn empty_text_classifies_as_failed_with_empty_response_error() {
     );
 }
 
-/// CC's own error message wins over the generic empty-text fallback —
-/// without this, an `is_error: true` Result with empty text would surface
-/// "no visible response" instead of the actual upstream cause (e.g. a
-/// rate-limit or 5xx). The engine's failure message must be the more
-/// specific one when CC has told us why.
 #[test]
 fn cc_error_wins_over_empty_text() {
     let err = "rate_limit_error".to_string();
@@ -148,10 +104,6 @@ fn cc_error_wins_over_empty_text() {
     assert_eq!(terminal, TerminalKind::Failed { error: err });
 }
 
-/// User-driven cancel that happens to land on an empty Result is still a
-/// cancel: the user clicked Stop, the turn ended deliberately. Routing
-/// to Failed here would mislabel a deliberate stop as an unexpected
-/// failure and break the cancel UX.
 #[test]
 fn user_hit_stop_wins_over_empty_text() {
     use crate::engine::thread_events::CancelCause;
@@ -159,12 +111,6 @@ fn user_hit_stop_wins_over_empty_text() {
     assert_eq!(terminal, TerminalKind::Canceled(CancelCause::UserStop));
 }
 
-/// A Codex mid-turn follow-up redirect (`redirect_cause` set) classifies
-/// the interrupted turn as `Canceled(SupersededByFollowup)`, NOT `UserStop`,
-/// so the frontend renders it neutrally (like the chat/CC follow-up) instead of
-/// "Canceled ✕". Still a cancel mechanically (no Generated, no proposal); only
-/// the cause differs. The redirect flag is meaningful only when user_hit_stop
-/// is set (an interrupt fired); it never overrides shutdown/error precedence.
 #[test]
 fn redirect_followup_classifies_as_superseded_by_followup() {
     use crate::engine::thread_events::CancelCause;
@@ -184,8 +130,6 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
         emit_idle,
         "redirect cancel is still a turn boundary: CodingAgentIdled must follow"
     );
-    // Same inputs but with an interrupt-caused cc_error still classify as the
-    // redirect cancel (user_hit_stop ranks above cc_error).
     let (with_err, _) = classify_result(
         true,
         Some(CancelCause::SupersededByFollowup),
@@ -197,7 +141,6 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
         with_err,
         TerminalKind::Canceled(CancelCause::SupersededByFollowup),
     );
-    // redirect flag without user_hit_stop is inert: a clean Result is Generated.
     let (clean, _) = classify_result(
         false,
         Some(CancelCause::SupersededByFollowup),
@@ -206,7 +149,6 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
         false,
     );
     assert_eq!(clean, TerminalKind::Generated);
-    // Shutdown still wins over a redirect interrupt.
     let (shutdown, _) = classify_result(
         true,
         Some(CancelCause::SupersededByFollowup),
@@ -220,10 +162,6 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
     );
 }
 
-/// Shutdown wins over empty text: engine going down classifies as
-/// `Aborted` (not `Failed`) regardless of what CC sent. Without this,
-/// a shutdown that lands on an empty Result would emit ResponseFailed
-/// and the recovery path would skip re-resuming the session.
 #[test]
 fn shutdown_wins_over_empty_text() {
     use crate::engine::thread_events::AbortCause;
@@ -235,8 +173,6 @@ fn shutdown_wins_over_empty_text() {
     );
 }
 
-/// An interrupt Codex sent on its own fails the turn. When the user stopped
-/// or redirected the turn, the Stop latch still ranks above that error.
 #[test]
 fn an_unrequested_interrupt_fails_unless_the_user_stopped() {
     use crate::engine::thread_events::CancelCause;
@@ -264,12 +200,6 @@ fn an_unrequested_interrupt_fails_unless_the_user_stopped() {
     assert!(emit_idle);
 }
 
-/// Empty-text Result on an otherwise-clean turn classifies as `Failed`
-/// (the OOM-killed Bash / SIGTERM'd subprocess scenario). A failed turn is
-/// unfinished, so its work is withheld and never surfaces as a pending
-/// change (ADR 0400). The user gets a red-dot terminal, and the partial work
-/// stays on the branch for resume. Without this branch the empty Result
-/// would render as a green "completed" turn AND propose the partial work.
 #[test]
 fn empty_text_failed_does_not_propose() {
     let (terminal, _) = classify_result(false, None, false, None, true);
@@ -281,9 +211,6 @@ fn empty_text_failed_does_not_propose() {
     );
 }
 
-/// The maximally stale-looking turn: resumed, the backend did NOT confirm the
-/// attach, empty output, zero activity, no error. Every other stale-resume test
-/// flips exactly one field of this baseline, so each asserts one gate.
 fn stale_baseline() -> StaleResumeInputs {
     StaleResumeInputs {
         has_resume_session: true,
@@ -296,18 +223,11 @@ fn stale_baseline() -> StaleResumeInputs {
     }
 }
 
-/// Empty Result on a resumed turn with no error AND no tool calls AND no
-/// confirmed attach → real stale-resume signal (a dead session produces an
-/// immediate empty answer with zero activity). The run-loop retries with a
-/// fresh spawn, REUSING the worktree (it no longer deletes it).
 #[test]
 fn empty_result_on_resume_with_no_error_is_stale_resume() {
     assert!(is_stale_resume_signal(stale_baseline()));
 }
 
-/// Empty Result on a resumed turn WITH a CC-reported error → real
-/// upstream failure, NOT stale resume. Without this guard a transient
-/// network drop would trigger a spurious fresh-spawn retry.
 #[test]
 fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
     assert!(!is_stale_resume_signal(StaleResumeInputs {
@@ -316,32 +236,14 @@ fn empty_result_on_resume_with_cc_error_is_not_stale_resume() {
     }));
 }
 
-/// THE FABLE FALSE-POSITIVE REGRESSION GUARD (2026-07-02). A terse model
-/// (Fable-5) routinely emits empty assistant text and jumps straight to a tool
-/// call — so `result_text_empty && buffered_text_empty` are both true even
-/// though the session is alive and working. A tool call this turn
-/// (`no_tool_calls_this_turn == false`) MUST veto the stale-resume verdict.
-/// Before this gate, every terse Fable resume was misclassified as stale,
-/// cancelled, and re-spawned → a duplicate CC process on the shared worktree
-/// (2x quota burn).
 #[test]
 fn empty_result_on_resume_but_made_tool_calls_is_not_stale_resume() {
     assert!(!is_stale_resume_signal(StaleResumeInputs {
-        // a tool call happened → ALIVE
         no_tool_calls_this_turn: false,
         ..stale_baseline()
     }));
 }
 
-/// THE SWITCH-RESUME FALSE-POSITIVE REGRESSION GUARD (2026-07-29, thread
-/// `cb503361`). The backend reported back the SAME session id we asked to
-/// `--resume`, which proves the conversation is live — so NO amount of empty
-/// output may call it stale. Here the turn is empty and inactive purely because
-/// `claude --print --resume` emitted a `result` for its own synthetic
-/// `Continue from where you left off.` / `No response requested.` turn (injected
-/// to close a tool_use the switch teardown interrupted) before reading our
-/// stdin. Without this gate the healthy Opus-5 session was cancelled 10 ms after
-/// Init and the thread wedged at `running` for 8 minutes.
 #[test]
 fn confirmed_attach_is_never_stale_resume() {
     assert!(!is_stale_resume_signal(StaleResumeInputs {
@@ -350,11 +252,6 @@ fn confirmed_attach_is_never_stale_resume() {
     }));
 }
 
-/// The complement of the guard above: the backend reported a DIFFERENT session
-/// id than the one we asked to resume (CC silently started a fresh conversation
-/// / Codex fell back to `thread/start`). There is no structural proof of life,
-/// so the empty-echo heuristic still governs and this IS stale. Keeps the
-/// `dev/bf997e21` CLAUDE_CONFIG_DIR-relocation recovery working.
 #[test]
 fn unconfirmed_attach_still_falls_back_to_the_empty_echo_heuristic() {
     assert!(is_stale_resume_signal(StaleResumeInputs {
@@ -363,8 +260,6 @@ fn unconfirmed_attach_still_falls_back_to_the_empty_echo_heuristic() {
     }));
 }
 
-/// Non-resumed turn never qualifies (the retry path only makes sense
-/// when the dead session id actually came from a prior CodingAgentIdled).
 #[test]
 fn fresh_session_is_never_stale_resume() {
     assert!(!is_stale_resume_signal(StaleResumeInputs {
@@ -373,10 +268,6 @@ fn fresh_session_is_never_stale_resume() {
     }));
 }
 
-/// The resume-settle baseline is the stale one with the veto SATISFIED: same
-/// empty shape, on a resume the backend structurally confirmed. Exactly the turn
-/// `confirmed_attach_is_never_stale_resume` protects from cancellation, seen from
-/// the other side, so the two baselines differ in one field on purpose.
 fn settle_baseline() -> StaleResumeInputs {
     StaleResumeInputs {
         resume_attach_confirmed: true,
@@ -384,40 +275,16 @@ fn settle_baseline() -> StaleResumeInputs {
     }
 }
 
-/// THE SWALLOWED-FOLLOW-UP REGRESSION GUARD (2026-08-05, thread `6398bb2f`).
-/// The user pressed Stop, then sent a follow-up. The resumed CC drained a
-/// `<task-notification>` left queued by the killed session, closed that turn with
-/// a `<synthetic>` "No response requested." (nothing on the wire: no text, no
-/// tool call, no API call), and emitted a `result` for it 18 ms before our prompt
-/// was dequeued. Classifying that Result as ours reported an OOM that never
-/// happened and killed the subprocess 137 ms after CC had started answering the
-/// user. The Result belongs to the settle turn; the run loop must skip it.
-///
-/// The thread's events confirm the no-API-call half empirically: not one
-/// `ContextCaptured` between `SessionStarted` at 03:47:47 and the
-/// `ResponseFailed` five seconds later.
 #[test]
 fn confirmed_attach_with_no_activity_is_a_resume_settle_result() {
     assert!(is_resume_settle_result(settle_baseline(), true));
 }
 
-/// THE OTHER HALF OF THAT GUARD. A model that WAS asked our prompt and answered
-/// with nothing produces the identical eight-field shape, and skipping it would
-/// discard a real terminal and strand the turn at `running` until the inactivity
-/// watchdog fired ten minutes later. The API call is what tells them apart:
-/// one `Usage` frame means the backend asked the model something, so whatever
-/// came back is an answer to us, however empty. It falls through to
-/// `classify_result` and fails honestly.
 #[test]
 fn an_empty_answer_that_cost_an_api_call_is_not_a_settle_turn() {
     assert!(!is_resume_settle_result(settle_baseline(), false));
 }
 
-/// With no API call made, the two predicates read the same eight fields and are
-/// mutually exclusive on `resume_attach_confirmed`: such a resumed turn is either
-/// a dead session to respawn or a settle turn to skip, never both and never
-/// neither. Pinning it here is what stops a future edit from making one shape
-/// fall through to the empty-response `Failed` again.
 #[test]
 fn stale_resume_and_resume_settle_partition_the_empty_resumed_turn() {
     for confirmed in [true, false] {
@@ -433,9 +300,6 @@ fn stale_resume_and_resume_settle_partition_the_empty_resumed_turn() {
     }
 }
 
-/// A tool call proves the backend is working on OUR prompt rather than settling
-/// leftovers, the same aliveness signal that vetoes the stale verdict. Skipping
-/// here would drop a real (if terse) turn's terminal on the floor.
 #[test]
 fn resume_settle_needs_zero_tool_calls() {
     assert!(!is_resume_settle_result(
@@ -447,9 +311,6 @@ fn resume_settle_needs_zero_tool_calls() {
     ));
 }
 
-/// A `cc_error` is a real failure to report (an upstream drop, a 5xx). Skipping
-/// it would hide the failure AND leave the loop waiting for a Result that is
-/// never coming.
 #[test]
 fn resume_settle_never_swallows_a_reported_error() {
     assert!(!is_resume_settle_result(
@@ -461,10 +322,6 @@ fn resume_settle_never_swallows_a_reported_error() {
     ));
 }
 
-/// THE BOUND. The call site records the skipped Result, so
-/// `no_prior_results_this_turn` is false for every Result after it and the skip
-/// cannot repeat. Without this a backend that only ever emits empty Results
-/// would wedge the thread at `running` instead of failing it.
 #[test]
 fn only_the_first_result_of_a_session_can_be_a_settle_turn() {
     assert!(!is_resume_settle_result(
@@ -476,9 +333,6 @@ fn only_the_first_result_of_a_session_can_be_a_settle_turn() {
     ));
 }
 
-/// Either text channel carrying content means the turn produced an answer.
-/// `text` is the Result's own payload (the slash-command path), `buffered` is
-/// what streamed as Message events; a settle turn has neither.
 #[test]
 fn resume_settle_needs_both_text_channels_empty() {
     assert!(!is_resume_settle_result(
@@ -497,9 +351,6 @@ fn resume_settle_needs_both_text_channels_empty() {
     ));
 }
 
-/// A fresh spawn has no leftovers to settle: nothing was interrupted and no
-/// notification is queued, so an empty Result there is a real (empty) turn and
-/// must classify normally.
 #[test]
 fn fresh_session_has_no_settle_turn_to_skip() {
     assert!(!is_resume_settle_result(
@@ -511,9 +362,6 @@ fn fresh_session_has_no_settle_turn_to_skip() {
     ));
 }
 
-/// The OOM case `EMPTY_RESPONSE_ERROR` was written for stays a failure. A killed
-/// Bash tool leaves tool calls behind, so the settle predicate refuses it and
-/// `classify_result` still lands `Failed`.
 #[test]
 fn oom_killed_turn_still_fails_rather_than_being_skipped() {
     let oom_shaped = StaleResumeInputs {
@@ -532,10 +380,6 @@ fn oom_killed_turn_still_fails_rather_than_being_skipped() {
     );
 }
 
-/// CC's EXPLICIT session-not-found error IS a definitive stale-resume signal —
-/// the one whitelisted `cc_error` string, because re-resuming a gone session can
-/// never succeed. This is the exact error from dev/bf997e21 (a mid-flight
-/// `CLAUDE_CONFIG_DIR` switch relocated CC's transcript store).
 #[test]
 fn explicit_no_conversation_found_is_definitive() {
     assert!(is_definitive_session_not_found(Some(
@@ -543,10 +387,6 @@ fn explicit_no_conversation_found_is_definitive() {
     )));
 }
 
-/// A generic `cc_error` (transient upstream failure) must NOT be treated as
-/// session-not-found — otherwise the recovery would `worktree remove` on a 5xx
-/// and strand the user's in-flight work. Only the exact whitelisted string
-/// qualifies.
 #[test]
 fn generic_cc_error_is_not_session_not_found() {
     assert!(!is_definitive_session_not_found(Some(
@@ -556,29 +396,15 @@ fn generic_cc_error_is_not_session_not_found() {
     assert!(!is_definitive_session_not_found(Some("")));
 }
 
-/// No error at all is not a session-not-found signal (that path is the
-/// empty-echo `is_stale_resume_signal` heuristic instead).
 #[test]
 fn no_error_is_not_session_not_found() {
     assert!(!is_definitive_session_not_found(None));
 }
 
-/// Pin every input combination to its expected (terminal, emit_idle) pair.
-/// The invariants this guards:
-///   - `Generated` → `emit_idle = true`. Skipping idle here is the bug —
-///     CC really finished, so the thread row must flip to `waiting`/`idle`
-///     and the section must move to Current.
-///   - `Aborted` → `emit_idle = false`. Emitting idle on shutdown makes
-///     `recover_orphaned_worktrees` think the session is "truly idle" and
-///     skip recovery on restart.
-///   - `Canceled` (user-driven stop) → `emit_idle = true`. Cancel is a
-///     turn boundary; the dispatcher needs `CodingAgentIdled` to pick up
-///     the next message via `--resume`.
 #[test]
 fn classify_result_table() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
     let cases = [
-        // (user_hit_stop, is_shutdown) → (terminal, emit_idle)
         ((false, false), (TerminalKind::Generated, true)),
         (
             (true, false),
@@ -588,7 +414,6 @@ fn classify_result_table() {
             (false, true),
             (TerminalKind::Aborted(AbortCause::EngineShutdown), false),
         ),
-        // Shutdown overrides user_hit_stop: Aborted, idle skipped.
         (
             (true, true),
             (TerminalKind::Aborted(AbortCause::EngineShutdown), false),
@@ -596,7 +421,6 @@ fn classify_result_table() {
     ];
     for ((stop, shutdown), expected) in cases {
         assert_eq!(
-            // redirect=false: this table pins the non-redirect cause matrix.
             classify_result(stop, None, shutdown, None, false),
             expected,
             "(user_hit_stop={}, is_shutdown={})",
@@ -606,8 +430,6 @@ fn classify_result_table() {
     }
 }
 
-/// Real Cancel click on an actively-working CC emits `ResponseCanceled` —
-/// this is the only path that should ever produce that event.
 #[test]
 fn real_cancel_on_working_cc_emits_canceled() {
     use crate::engine::thread_events::CancelCause;
@@ -618,10 +440,6 @@ fn real_cancel_on_working_cc_emits_canceled() {
     );
 }
 
-/// Cancel click that races in after CC went idle emits nothing — the
-/// previous turn's `ResponseGenerated` already terminated it. Without
-/// this, the late Cancel would land a phantom "Canceled the response"
-/// on a turn that finished cleanly.
 #[test]
 fn cancel_racing_idle_emits_no_terminal_event() {
     assert_eq!(
@@ -632,10 +450,6 @@ fn cancel_racing_idle_emits_no_terminal_event() {
     );
 }
 
-/// Apply / Discard / Archive trigger the stop signal but their own
-/// lifecycle event (`ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`)
-/// is the terminator. The stop arm must NOT emit `ResponseCanceled` on
-/// top — the user didn't cancel.
 #[test]
 fn user_action_suppresses_terminal_regardless_of_idle() {
     assert_eq!(
@@ -652,10 +466,6 @@ fn user_action_suppresses_terminal_regardless_of_idle() {
     );
 }
 
-/// Shutdown of an idle CC must emit nothing: the prior exchange already
-/// completed cleanly via `CodingAgentIdled`, and emitting `Aborted` here
-/// would relabel a finished exchange as crashed when the engine goes
-/// down.
 #[test]
 fn shutdown_of_idle_session_emits_no_terminal_event() {
     assert_eq!(
@@ -670,9 +480,6 @@ fn shutdown_of_idle_session_emits_no_terminal_event() {
     );
 }
 
-/// Shutdown of a working CC emits `Aborted` — the in-flight exchange was
-/// killed by the engine, not finished by CC. Shutdown wins over the
-/// user-action suppress flag — the system kill is the dominant cause.
 #[test]
 fn shutdown_of_working_session_emits_aborted() {
     use crate::engine::thread_events::AbortCause;
@@ -688,17 +495,10 @@ fn shutdown_of_working_session_emits_aborted() {
     );
 }
 
-/// Auto-commit on cleanup ONLY fires for clean Generated turns the user
-/// hasn't asked to discard. The bug we're fixing: previously the cleanup
-/// path auto-committed any worktree dirt on safety-net abort, the
-/// per-commit hook fired for that commit, and a spurious ChangeProposed
-/// landed for partial work. Pin every input combination to the expected
-/// commit/no-commit decision.
 #[test]
 fn should_auto_commit_on_cleanup_table() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
     let cases: &[(bool, &Option<TerminalKind>, bool, &str)] = &[
-        // Discard always wins — never commit, even on a clean Generated.
         (
             true,
             &Some(TerminalKind::Generated),
@@ -706,14 +506,12 @@ fn should_auto_commit_on_cleanup_table() {
             "discard wins over Generated",
         ),
         (true, &None, false, "discard wins over safety-net abort"),
-        // Generated + not discarded → the only commit path.
         (
             false,
             &Some(TerminalKind::Generated),
             true,
             "clean Generated commits",
         ),
-        // Every non-Generated terminal refuses, regardless of discard.
         (
             false,
             &Some(TerminalKind::Failed {
@@ -734,9 +532,6 @@ fn should_auto_commit_on_cleanup_table() {
             false,
             "Aborted (shutdown) must NOT auto-commit — mid-work",
         ),
-        // Safety-net abort sets terminal to None inside cleanup. THIS is
-        // the regression test for the original bug: cleanup auto-commit
-        // on safety-net fired the per-commit hook → spurious ChangeProposed.
         (
             false,
             &None,
@@ -753,10 +548,6 @@ fn should_auto_commit_on_cleanup_table() {
     }
 }
 
-/// A restart interrupts Claude Code, which still answers with a `Result`. That
-/// Result must leave the worktree dirty, so the resumed agent finds its edits
-/// exactly as it left them. Committing them made the tree read clean, and the
-/// resumed agent concluded its work was lost.
 #[test]
 fn only_a_shutdown_result_leaves_the_worktree_uncommitted() {
     use crate::engine::thread_events::CancelCause;
@@ -815,9 +606,6 @@ fn conflict_resolution_cleanup_only_applies_clean_generated_turns() {
     }
 }
 
-/// A lane thread's run reports to the lane by the merge-fix rule. Only a clean
-/// generated turn completes. A failed or unfinished turn fails the batch
-/// whole, and a pending continuation hands the batch on without a report.
 #[test]
 fn a_lane_thread_run_completes_fails_or_hands_off_like_a_merge_fix() {
     use crate::engine::landing_lane::LaneThreadEnd;
@@ -857,9 +645,6 @@ fn a_lane_thread_run_completes_fails_or_hands_off_like_a_merge_fix() {
     );
 }
 
-/// A Stop on a lane thread ends the turn, as on any thread, and keeps the
-/// batch open for the thread's next turn. Only Archive or Discard, which end
-/// the thread's part, fail it.
 #[test]
 fn a_stopped_lane_thread_keeps_its_batch_open() {
     use crate::engine::landing_lane::LaneThreadEnd;
@@ -903,18 +688,6 @@ fn a_stopped_lane_thread_keeps_its_batch_open() {
     ));
 }
 
-/// A pending auto-recovery continuation transfers the merge duty instead of
-/// aborting — for interrupted turns, regardless of leftover unmerged files (a
-/// stray-killed merge turn is EXPECTED to leave conflicts behind for the
-/// continuation to finish). The 2026-07-10 incident: a stray SIGTERM 84ms
-/// after the merge-session spawn aborted the apply and raced destructive git
-/// cleanup against the continuation that was already resuming the same turn.
-///
-/// Two outcomes still beat the hand-off:
-/// - a clean `Generated` turn with the merge fully committed applies on the
-///   spot (an external-watchdog false positive racing a natural end must not
-///   defer finished work to a fragile `--resume`);
-/// - a user cancel aborts (Stop means "don't land this merge").
 #[test]
 fn conflict_resolution_hands_off_when_continuation_pending() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
@@ -929,8 +702,6 @@ fn conflict_resolution_hands_off_when_continuation_pending() {
             }),
         ),
         (false, Some(TerminalKind::Aborted(AbortCause::SafetyNet))),
-        // Generated with unmerged files left behind: the turn didn't finish
-        // the merge — the continuation picks it up.
         (true, Some(TerminalKind::Generated)),
     ] {
         assert_eq!(
@@ -959,14 +730,6 @@ fn conflict_resolution_hands_off_when_continuation_pending() {
     );
 }
 
-/// Abort cleanup deletes only what the merge attempt created: the temp
-/// worktree + temp branch of the Tier-3 shape, and only when this session
-/// actually ran on that temp branch. A Tier-2 merge (no `merge_temp_branch`)
-/// ran in the thread's own worktree on the real change branch — deleting
-/// those would destroy the user's committed work. And a STALE recorded temp
-/// branch (a pruned-temp re-attach put the session on the change branch
-/// while the row still carries the dead attempt's columns) must not condemn
-/// the thread worktree the session actually ran in.
 #[test]
 fn conflict_abort_deletes_only_temp_merge_state() {
     assert!(conflict_abort_deletes_temp_state(
@@ -983,9 +746,6 @@ fn conflict_abort_deletes_only_temp_merge_state() {
     ));
 }
 
-/// A spawn with nothing to send parks the agent on stdin, and the thread reads
-/// as working until the watchdog. Text or an image is input; blank text alone
-/// is not.
 #[test]
 fn a_spawn_needs_text_or_an_image() {
     let image = crate::engine::types::ChatImage {
@@ -1003,9 +763,6 @@ fn a_spawn_needs_text_or_an_image() {
     }
 }
 
-/// The refusal must come before the spawn touches the database, a worktree or
-/// a process. Anything ahead of it could leave state behind for a turn that
-/// never runs.
 #[test]
 fn run_direct_agent_refuses_empty_input_before_anything_else() {
     let source = include_str!("../run_session/run.rs");
@@ -1025,52 +782,19 @@ fn run_direct_agent_refuses_empty_input_before_anything_else() {
     );
 }
 
-/// Pin every input combination of `classify_session_end_action`. The
-/// invariants this guards:
-///   - `(has_commits=true, files_empty=true, external=false)` → `KeepEmptyBranch`,
-///     not `Propose`. This is the phantom-Change regression — observed
-///     when CC's auto-commit on cleanup advances the branch ref while
-///     the user concurrently clicked Apply Now, leaving the post-Apply
-///     branch with commits whose contents already live on main. Without
-///     this filter the engine emits a `ChangeProposed` with no files
-///     and the thread title as the fallback description, which the
-///     frontend renders as a pending Change the user can only Discard.
-///   - External repos with commits keep their branch regardless of
-///     `files_empty` — the user owns push/PR there; deleting the ref
-///     because the net diff happens to be zero would lose work.
-///   - No commits on the branch always routes to `KeepEmptyBranch`,
-///     regardless of the other inputs (the diff signal is moot). The branch
-///     is KEPT (the session is resumable) — `KeepEmptyBranch` no longer
-///     deletes (the thread-9e37697e data-loss fix); only the explicit
-///     Discard / conflict paths `git branch -D`.
-///   - A cancel keeps the branch so the session stays resumable, even with no
-///     commits. A Stop or a failure with net work withholds it: an unfinished
-///     turn never proposes (ADR 0400). A redirect never proposes: its follow-up
-///     continues the branch. All rank below the external and crash arms.
 #[test]
 fn classify_session_end_action_table() {
     use SessionEndAction::*;
     use TurnCancel::{Failed, None as NotCanceled, Redirected, Stopped};
     let cases = [
-        // (has_commits, files_empty, is_external, safety_net_fired, cancel) → action
-        //
-        // Healthy turn (no safety net, not cancelled):
         ((true, false, false, false, NotCanceled), Propose),
-        ((true, true, false, false, NotCanceled), KeepEmptyBranch), // phantom-Change regression
+        ((true, true, false, false, NotCanceled), KeepEmptyBranch),
         ((true, false, true, false, NotCanceled), KeepExternalBranch),
         ((true, true, true, false, NotCanceled), KeepExternalBranch),
         ((false, false, false, false, NotCanceled), KeepEmptyBranch),
         ((false, true, false, false, NotCanceled), KeepEmptyBranch),
         ((false, false, true, false, NotCanceled), KeepEmptyBranch),
         ((false, true, true, false, NotCanceled), KeepEmptyBranch),
-        //
-        // Safety-net fired — CC died mid-stream:
-        //   - In our own repo with commits: CrashedKeepBranch (keep work,
-        //     no ChangeProposed). files_empty doesn't matter; even an
-        //     empty-diff commit is partial work.
-        //   - External repo with commits: still KeepExternalBranch — user
-        //     owns the ref regardless of how the session ended.
-        //   - No commits: KeepEmptyBranch — nothing to propose (branch still kept, resumable).
         ((true, false, false, true, NotCanceled), CrashedKeepBranch),
         ((true, true, false, true, NotCanceled), CrashedKeepBranch),
         ((true, false, true, true, NotCanceled), KeepExternalBranch),
@@ -1079,28 +803,19 @@ fn classify_session_end_action_table() {
         ((false, true, false, true, NotCanceled), KeepEmptyBranch),
         ((false, false, true, true, NotCanceled), KeepEmptyBranch),
         ((false, true, true, true, NotCanceled), KeepEmptyBranch),
-        //
-        // A Stop keeps the branch so the session stays resumable. The
-        // grilling-cancel bug is the no-commits row: it MUST be
-        // KeepCanceledBranch, not KeepEmptyBranch. Net work is withheld,
-        // never proposed: the turn did not finish.
-        ((false, true, false, false, Stopped), KeepCanceledBranch), // grilling cancel (the bug)
+        ((false, true, false, false, Stopped), KeepCanceledBranch),
         ((false, false, false, false, Stopped), KeepCanceledBranch),
         ((true, false, false, false, Stopped), WithholdUnfinished),
         ((true, true, false, false, Stopped), KeepCanceledBranch),
-        // A failure is unfinished too. With no net work it keeps the branch
-        // like any session end.
         ((true, false, false, false, Failed), WithholdUnfinished),
         ((true, true, false, false, Failed), KeepEmptyBranch),
         ((false, true, false, false, Failed), KeepEmptyBranch),
         ((true, false, true, false, Failed), KeepExternalBranch),
         ((true, false, false, true, Failed), CrashedKeepBranch),
-        // A redirect never proposes: its follow-up continues on the branch.
         ((true, false, false, false, Redirected), KeepCanceledBranch),
         ((false, true, false, false, Redirected), KeepCanceledBranch),
-        // External repo and crash arms still win over both cancels:
         ((true, false, true, false, Stopped), KeepExternalBranch),
-        ((true, false, false, true, Stopped), CrashedKeepBranch), // defensive: can't really co-occur
+        ((true, false, false, true, Stopped), CrashedKeepBranch),
         ((true, false, true, false, Redirected), KeepExternalBranch),
     ];
     for ((has_commits, files_empty, is_external, safety_net_fired, cancel), expected) in cases {
@@ -1116,8 +831,6 @@ fn classify_session_end_action_table() {
             expected,
             "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired}, cancel={cancel:?})",
         );
-        // A pending handoff carries any net work over to the successor
-        // session. Only the external and crash arms rank above it.
         let handed_off = match expected {
             KeepExternalBranch | CrashedKeepBranch => expected,
             _ if has_commits && !files_empty => CarriedBySuccessor,
@@ -1138,10 +851,6 @@ fn classify_session_end_action_table() {
     }
 }
 
-/// The `user_hit_stop` latch must clear after the cancel/abort terminal it
-/// produced is emitted — a `Result` is a turn boundary. `Generated` / `Failed`
-/// can't co-occur with a set latch (it ranks above both in `classify_result`),
-/// so only the cancel/abort terminals need to clear it.
 #[test]
 fn terminal_clears_user_hit_stop_for_cancel_and_abort_only() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
@@ -1160,24 +869,10 @@ fn terminal_clears_user_hit_stop_for_cancel_and_abort_only() {
     }));
 }
 
-/// Regression for the "successful turn mislabeled Canceled (twice)" bug.
-///
-/// When the Stop button interrupts an in-flight turn but follow-ups are already
-/// queued, the run loop keeps the subprocess alive to drain them
-/// (`TerminateDecision::KeepAliveForFollowup`). CC reports the interrupted turn
-/// as a `Result` with `is_error` (`stop_reason=tool_use`) → the first
-/// `Canceled`. The drained follow-ups then complete with real, successful output
-/// and emit a SECOND `Result`. Without clearing the `user_hit_stop` latch after
-/// the first cancel, that second `Result` re-classifies as `Canceled` —
-/// stamping finished, committed work as "Canceled" and emitting a phantom
-/// second `ResponseCanceled` carrying the completed text (exactly what the user
-/// saw). Clearing the latch makes the completion classify as `Generated`.
 #[test]
 fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
     use crate::engine::thread_events::CancelCause;
 
-    // 1) The Stop interrupts the in-flight turn; CC's Result carries the
-    //    interrupt diagnostic (is_error) and the latch is set.
     let mut user_hit_stop = true;
     let (first, _) = classify_result(
         user_hit_stop,
@@ -1192,8 +887,6 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
         "the interrupt must classify as the first Canceled"
     );
 
-    // 2) The run loop clears the latch once that cancel terminal is emitted,
-    //    because the subprocess is kept alive to drain inflight follow-ups.
     if terminal_clears_user_hit_stop(&first) {
         user_hit_stop = false;
     }
@@ -1203,8 +896,6 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
          next Result classifies fresh"
     );
 
-    // 3) The drained follow-ups complete successfully with full text. With the
-    //    latch cleared this is a clean completion, NOT a second cancel.
     let (second, _) = classify_result(user_hit_stop, None, false, None, false);
     assert_eq!(
         second,
@@ -1214,9 +905,6 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
     );
 }
 
-/// Only the user's own finished turn decides anything at its end, the wait
-/// over running background tasks included. A user Stop must never be
-/// overridden by a completion re-opening the thread.
 #[test]
 fn only_a_clean_turn_end_arms_the_background_wait() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
@@ -1268,8 +956,6 @@ fn only_a_clean_turn_end_arms_the_background_wait() {
     assert!(!turn_ended_cleanly(&None, false, false));
 }
 
-/// A swap's re-entry goes out at a clean idle with nothing else on its way.
-/// Any other idle keeps it pending, so it is never lost and never doubled.
 #[test]
 fn a_model_swap_reentry_waits_for_a_clean_idle_with_nothing_else_due() {
     let ready = ModelSwapIdle {

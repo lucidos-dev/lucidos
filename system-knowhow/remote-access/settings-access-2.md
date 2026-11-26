@@ -157,6 +157,47 @@ pairing codes, gateway pairings, the external address and updates stay on B.
   the section. On B, the switch sits on each row under Settings → Access →
   Pair a gateway.
 
+#### Control a remote gateway's workspaces
+
+The *control grant* lets devices on A create, start, stop and restore B's
+workspaces (ADR 0811). It is a separate switch from the manage grant: one
+reaches B's people, the other B's disk and memory.
+
+- **Off by default**, for every pairing, old and new. A re-pair starts it off
+  again. B's user turns it on for one paired gateway, with the second switch on
+  its row under Settings → Access → Pair a gateway.
+  `lucidos pair --gateway --control` mints a secret whose pairing starts with
+  it on.
+- **In the app**, the *gateway switcher* above A's Workspaces list picks the
+  gateway. **This gateway** keeps the usual list of local and remote rows.
+  Picking B lists B's workspaces with Start and Stop, and the footer reads
+  **+ New workspace on B** and **Restore onto B**. Opening a stopped row starts
+  it first, then opens it over the relay. An action B refuses stays off, and
+  the footer says why: the grant is off, B needs an update, or B is silent.
+- **Nothing destructive is reachable.** Delete, Trash, rename, snapshot
+  restore, adoption, pairing, the external address, TLS, updates and settings
+  stay with B's own devices.
+- **A calls** `/~/api/v1/remote-gateways/<name>/control/<call>`, where
+  `<call>` is the same path as on B's own `/~/api/v1/control/`:
+  `workspaces` (list and create), `workspaces/<id>/start`,
+  `workspaces/<id>/stop`, `restore-uploads` and `restore-uploads/<id>`
+  (the chunked *restore upload*), `workspaces/restore` (the commit) and
+  `restore-status`. A listed workspace carries its id, name, health, last
+  error and unread count, never B's directory or port.
+- **B keeps unread restore results across gateway relaunches.** A dismissal
+  names the result the picker showed. If an older picker cannot dismiss the
+  result, update the picker and try again.
+- **One request carries one restore chunk**, at most 32 MiB. A proxy in front
+  of B that caps bodies lower answers 413, and the upload shrinks its chunks.
+- **Refusals carry a `reason_kind`.** `control-not-granted` (403) means B's
+  user has not turned the grant on. `remote-gateway-too-old` (409) means B
+  predates the hop. `remote-refused` (502) means B no longer accepts A.
+  `remote-unexpected-answer` (502) means B answered with something other than
+  JSON or plain text, which A never passes to the browser. It keeps a 413 when
+  the page was a proxy's body-size refusal, so the upload still shrinks.
+- **B's log names each change** with the device on A and the gateway it came
+  through, for example `control POST /workspaces by 'My iPhone' via 'Gateway A'`.
+
 **A remote behind an access proxy.** Prefer a tailnet address when both
 machines have one. Otherwise enter the remote's HTTPS address and add its
 required header names and values under **Extra headers** before pairing.

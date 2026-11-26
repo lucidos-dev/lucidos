@@ -1,12 +1,7 @@
-//! The absolute path a refused write names, read from a command's output.
-
 use std::path::Path;
 
-/// How a Seatbelt write denial reads once [`crate::seatbelt_log`] finds it.
 pub const REFUSED_WRITE: &str = "Sandbox refused a write to ";
 
-/// The path of the last refused write in `output`: a Seatbelt denial, a
-/// shell diagnostic or a Python `PermissionError` or `OSError`.
 pub fn refused_path(output: &str) -> Option<&Path> {
     const REFUSALS: [&str; 3] = [
         "Permission denied",
@@ -26,14 +21,12 @@ pub fn refused_path(output: &str) -> Option<&Path> {
                 let (_, path) = line.split_once(&format!("{refusal}: "))?;
                 let quote = path.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
                 let path = path.strip_prefix(quote)?.strip_suffix(quote)?;
-                // Python escapes characters in the exception's filename.
                 (!path.contains(['\\', quote])).then_some(path)
             })?
         } else {
             let location = REFUSALS
                 .iter()
                 .find_map(|refusal| line.strip_suffix(&format!(": {refusal}")))?;
-            // Preserve colons in the filename after a shell's line prefix.
             let location = location
                 .split_once(": ")
                 .map_or(location, |(prefix, rest)| {
@@ -60,8 +53,6 @@ pub fn refused_path(output: &str) -> Option<&Path> {
                 .or_else(|| path.strip_prefix('"').and_then(|p| p.strip_suffix('"')))
                 .unwrap_or(path)
         };
-        // The process can change directories, so its relative path has no
-        // reliable base in the engine.
         let path = Path::new(path);
         path.is_absolute().then_some(path)
     })
@@ -81,7 +72,6 @@ mod tests {
             refused_path("PermissionError: [Errno 1] Operation not permitted: '/outside/file'"),
             Some(Path::new("/outside/file"))
         );
-        // Linux read-only mounts refuse an outside write with EROFS.
         assert_eq!(
             refused_path("sh: 1: cannot create /outside/a: Read-only file system"),
             Some(Path::new("/outside/a"))

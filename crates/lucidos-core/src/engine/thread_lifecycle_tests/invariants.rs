@@ -2,14 +2,8 @@ use super::*;
 
 const SECTION_TRANSITION_EVENTS: &[(&str, &str)] = &[("ThreadArchived", "archived")];
 
-// 25. start_events_set_status_running
 #[test]
 fn start_events_with_transitions_set_running() {
-    // Start classification is about exchange grouping (UI), not status.
-    // Some Start events (MissingHardeningDetected, MergeConflictDetected) don't
-    // set status=running in event_bus_projection_thread.rs. This test only
-    // checks that Start events with a status transition always set Running
-    // (never idle/waiting).
     let transitions: std::collections::HashMap<&str, StatusTransition> =
         status_transitions().into_iter().collect();
     for event_type in all_persisted_event_types() {
@@ -29,10 +23,6 @@ fn start_events_with_transitions_set_running() {
     }
 }
 
-// 26. The coarse table describes finished work. The projection additionally
-// preserves running for eligible automatic successor transitions; sequence
-// integration tests in thread_liveness_tests cover that durable-event axis.
-// terminal_events_never_set_running
 #[test]
 fn terminal_events_never_set_running() {
     let transitions: std::collections::HashMap<&str, StatusTransition> =
@@ -54,7 +44,6 @@ fn terminal_events_never_set_running() {
     }
 }
 
-// 27. section_transition_events_are_valid_persisted_events
 #[test]
 fn section_transition_events_are_valid_persisted_events() {
     let all = all_persisted_event_types();
@@ -67,11 +56,6 @@ fn section_transition_events_are_valid_persisted_events() {
     }
 }
 
-// ── Phase 0: Pre-refactor safety net ──
-
-/// Cross-validate: events with status_transitions Setting → Running must be
-/// classified as Start (or at least not Terminal). Events Setting → Idle/Waiting
-/// must NOT be classified as Start.
 #[test]
 fn status_transition_classification_consistency() {
     let transitions: std::collections::HashMap<&str, StatusTransition> =
@@ -80,7 +64,6 @@ fn status_transition_classification_consistency() {
         let class = classify_event(event);
         match &transition.status {
             StatusRule::Set(ThreadStatus::Running) => {
-                // Running-setters should be Start or Activity, never Terminal
                 if let Some(c) = class {
                     assert_ne!(
                         c,
@@ -93,7 +76,6 @@ fn status_transition_classification_consistency() {
             StatusRule::Set(ThreadStatus::Idle)
             | StatusRule::Set(ThreadStatus::Waiting)
             | StatusRule::Set(ThreadStatus::Failed) => {
-                // Idle/Waiting/Failed-setters should NOT be Start
                 if let Some(c) = class {
                     assert_ne!(
                         c,
@@ -103,14 +85,11 @@ fn status_transition_classification_consistency() {
                     );
                 }
             }
-            _ => {} // NoChange is fine in any class
+            _ => {}
         }
     }
 }
 
-/// Cross-validate: CcFlagRule != None should only appear on CC-relevant events
-/// (Change*, ClaudeCode*, MergeConflict*, ThreadArchived). This catches accidental
-/// change-state mutations on chat-only events.
 #[test]
 fn cc_flag_rules_only_on_cc_relevant_events() {
     let cc_relevant_prefixes = ["Change", "CodingAgent", "MergeConflict", "ThreadArchived"];
@@ -128,8 +107,6 @@ fn cc_flag_rules_only_on_cc_relevant_events() {
     }
 }
 
-/// Cross-validate: MESSAGE_COUNT_EVENTS should all be Start events —
-/// only user-initiated "start of exchange" events increment the count.
 #[test]
 fn message_count_events_are_start_events() {
     for event in MESSAGE_COUNT_EVENTS {
@@ -143,8 +120,6 @@ fn message_count_events_are_start_events() {
     }
 }
 
-/// Cross-validate: every event that has a StatusTransition must be a persisted
-/// event type. Transient events should never appear in status_transitions().
 #[test]
 fn status_transitions_only_contain_persisted_events() {
     let all = all_persisted_event_types();
@@ -158,10 +133,6 @@ fn status_transitions_only_contain_persisted_events() {
     }
 }
 
-/// Cross-validate: Start events that set status=Running should also appear in
-/// LAST_ACTIVITY_EVENTS (they start a new exchange, so they're activity).
-/// Activity-classified events (like CodingAgentPromptSent) may set Running
-/// without updating last_activity — they only update last_revived_at.
 #[test]
 fn start_running_setters_are_in_last_activity_events() {
     for (event, transition) in status_transitions() {
@@ -196,9 +167,6 @@ fn is_blocking_definition() {
     let cc = CodingAgent;
     let chat = Chat;
 
-    // Running / WaitingForUserAnswer always block, regardless of archive_state
-    // — active work cannot be "already terminal", so the Archived short-circuit
-    // must not mask it.
     assert!(is_blocking(chat, Running, Archived, false, false));
     assert!(is_blocking(cc, Running, Archived, true, false));
     assert!(is_blocking(cc, Running, Archived, true, true));
@@ -210,47 +178,32 @@ fn is_blocking_definition() {
         false
     ));
 
-    // Archived + Idle does NOT block — the user dismissed the thread and
-    // it isn't stranding active work. Holds even with pending changes (the
-    // cascade clears dangling change rows before archiving).
     assert!(!is_blocking(chat, Idle, Archived, false, false));
     assert!(!is_blocking(cc, Idle, Archived, false, false));
     assert!(!is_blocking(cc, Idle, Archived, true, false));
 
-    // Inbox + Running blocks (both thread types) regardless of repo.
     assert!(is_blocking(chat, Running, Inbox, false, false));
     assert!(is_blocking(cc, Running, Inbox, false, false));
     assert!(is_blocking(cc, Running, Inbox, false, true));
 
-    // Inbox + WaitingForUserAnswer blocks.
     assert!(is_blocking(cc, WaitingForUserAnswer, Inbox, false, false));
     assert!(is_blocking(chat, WaitingForUserAnswer, Inbox, false, false));
     assert!(is_blocking(cc, WaitingForUserAnswer, Inbox, false, true));
 
-    // Inbox + has_pending_changes blocks for in-workspace CC only.
     assert!(is_blocking(cc, Idle, Inbox, true, false));
     assert!(!is_blocking(chat, Idle, Inbox, true, false));
-    // External-repo CC with pending changes is the carve-out: the frontend
-    // surfaces Archive (not Apply) for these, and the cascade handler clears
-    // the change with ChangeApplied before archiving — so it must NOT block.
     assert!(!is_blocking(cc, Idle, Inbox, true, true));
 
-    // Idle no-pending in Inbox does not block.
     assert!(!is_blocking(chat, Idle, Inbox, false, false));
     assert!(!is_blocking(cc, Idle, Inbox, false, false));
     assert!(!is_blocking(cc, Idle, Inbox, false, true));
 
-    // Waiting (CC pending-review) status alone doesn't block; the
-    // has_pending_changes signal does.
     assert!(!is_blocking(cc, Waiting, Inbox, false, false));
 
-    // Failed status alone does not block — it's a terminal-ish state, not active work.
     assert!(!is_blocking(cc, Failed, Inbox, false, false));
     assert!(!is_blocking(chat, Failed, Inbox, false, false));
 }
 
-/// `own_blocker` names the clause that holds, and the status clauses win over a
-/// pending change: a waiting thread with a change asks for the answer first.
 #[test]
 fn own_blocker_names_the_clause() {
     use ArchiveState::*;
@@ -274,8 +227,6 @@ fn own_blocker_names_the_clause() {
     assert_eq!(own_blocker(cc, Idle, Archived, proposed, false), None);
     assert_eq!(own_blocker(cc, Idle, Inbox, proposed, true), None);
     assert_eq!(own_blocker(Chat, Idle, Inbox, proposed, false), None);
-    // A parked agent with an unproposed diff keeps Archive and Delete back
-    // until Stop waiting proposes it (ADR 0395).
     assert_eq!(
         own_blocker(cc, Idle, Inbox, held, false),
         Some(OwnBlocker::HeldProposal)
@@ -284,8 +235,6 @@ fn own_blocker_names_the_clause() {
     assert_eq!(own_blocker(cc, Idle, Inbox, none, false), None);
 }
 
-/// Only a live wait turns unproposed work into held work. A proposal wins
-/// over a wait, and unproposed work with no wait is not held (ADR 0395).
 #[test]
 fn change_work_is_held_only_while_a_wait_is_live() {
     use ChangeStateKind::{None as NoWork, Proposed, Unproposed};
@@ -297,7 +246,6 @@ fn change_work_is_held_only_while_a_wait_is_live() {
     assert_eq!(ChangeWork::of(NoWork, false), ChangeWork::None);
 }
 
-/// The quoted values inside the migration's `CHECK (<column> ... IN (...))`.
 fn check_values(migration: &str, column: &str) -> Vec<String> {
     let from = migration
         .find(&format!("{column} IN ("))
@@ -312,12 +260,9 @@ fn check_values(migration: &str, column: &str) -> Vec<String> {
 const CHANGE_STATE_MIGRATION: &str =
     include_str!("../../../migrations/20261009125328_coding_agent_change_state.sql");
 
-/// The migration that last redefined the unproposed-reason CHECK.
 const UNPROPOSED_REASON_MIGRATION: &str =
-    include_str!("../../../migrations/20261123150400_allow_changed_plan_reason.sql");
+    include_str!("../../../migrations/20261125082512_allow_hook_refused_reason.sql");
 
-/// I2: the database admits exactly the Rust state kinds and reasons. A variant
-/// added on one side only fails here, before a row can carry it.
 #[test]
 fn the_migration_check_lists_equal_the_rust_enums() {
     let kinds: Vec<String> = ChangeStateKind::ALL
@@ -341,8 +286,6 @@ fn the_migration_check_lists_equal_the_rust_enums() {
     );
 }
 
-/// I2: each wire name is the column text, so the serde form and `as_str`
-/// never drift, and `parse` reads back what `as_str` wrote.
 #[test]
 fn the_state_and_reason_wire_names_equal_their_column_text() {
     for kind in ChangeStateKind::ALL {
@@ -355,9 +298,6 @@ fn the_state_and_reason_wire_names_equal_their_column_text() {
     }
 }
 
-/// I2: the hold reasons derive from `ProposalHold`, never restated. Every
-/// hold maps to its own reason. Only `TurnIncomplete` and `AwaitingLanding`
-/// come from elsewhere.
 #[test]
 fn every_proposal_hold_maps_to_its_own_reason() {
     use crate::engine::thread_events::change_hold::{PlanHold, ProposalHold};
@@ -385,15 +325,15 @@ fn every_proposal_hold_maps_to_its_own_reason() {
         .filter(|r| {
             !matches!(
                 r,
-                UnproposedReason::TurnIncomplete | UnproposedReason::AwaitingLanding
+                UnproposedReason::TurnIncomplete
+                    | UnproposedReason::AwaitingLanding
+                    | UnproposedReason::HookRefused
             )
         })
         .collect();
     assert_eq!(from_holds, expected);
 }
 
-/// I1 in the type: each detail rides only on its own kind, and the column
-/// reader maps every legal row back to the state that wrote it.
 #[test]
 fn the_column_reader_round_trips_every_legal_state() {
     let mut states = vec![
@@ -422,8 +362,6 @@ fn the_column_reader_round_trips_every_legal_state() {
     }
 }
 
-/// The home thread outranks everything, the thread's own blocker outranks a
-/// descendant's, and the enum's order picks the strongest descendant.
 #[test]
 fn action_blocker_picks_one_reason_in_priority_order() {
     use OwnBlocker::*;
@@ -450,8 +388,6 @@ fn action_blocker_picks_one_reason_in_priority_order() {
     assert_eq!(action_blocker(None, false, None), Blocker::None);
 }
 
-/// A descendant blocker's slug is its own blocker's slug behind `descendant_`.
-/// The generated TS builds the descendant slug that way, so this pins it.
 #[test]
 fn descendant_blocker_slugs_prefix_the_own_slugs() {
     for own in OwnBlocker::ALL {

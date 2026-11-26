@@ -1,7 +1,3 @@
-//! Who may press which button. Every test here proves one of three things: an
-//! agent cannot leave its own subtree, the owner's standing instruction lets it,
-//! or the user's own device never notices that either rule exists.
-
 use super::*;
 use crate::core::subprocess_origin::{
     init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
@@ -13,8 +9,6 @@ use crate::engine::thread_events::{
 use crate::test_support::{setup_test_db, teardown_test_db};
 use sqlx::PgPool;
 
-/// Every clause-4 verb, so a test that must hold "per verb" says so by
-/// iterating rather than by picking one and hoping.
 const EVERY_VERB: &[Action] = &[
     Action::Archive,
     Action::Cancel,
@@ -31,34 +25,16 @@ const EVERY_VERB: &[Action] = &[
     Action::Continue,
 ];
 
-/// The owner buttons other than a card answer. Clause 3 and clause 5 still
-/// cover these, and no longer cover a card answer (ADR 0664).
 fn owner_buttons() -> impl Iterator<Item = &'static Action> {
     EVERY_VERB.iter().filter(|verb| !verb.answers_a_card())
 }
 
-/// The verbs that left clause 4: thread creation (ADR 0475) and the handoff to
-/// a legacy successor thread. Kept for stored approval cards.
 const RETIRED_VERBS: &[Action] = &[
     Action::CreateTopThread,
     Action::DetachChild,
     Action::SpawnSuccessor,
 ];
 
-/// Every surface carrying a clause-4 verb, and the file its handler lives in.
-///
-/// Several HTTP routes per verb, since Apply, Discard and cancel each arrive by
-/// more than one path. The LLM tools that press Apply in-process are here too.
-/// Hand-written, which is its weakness: a route added elsewhere is invisible
-/// here until somebody adds the row, and that is how arming an apply shipped
-/// ungated. Review a new change route against this list.
-///
-/// The three permission consent routes are here too: answering a card is a
-/// clause-4 verb on the card's thread.
-///
-/// Deliberately absent: an agent's archive (`archive_thread_as_caller`'s token
-/// branch, `execute_archive_thread`). It applies a narrower ladder, the caller
-/// or its direct child, which no standing instruction widens (ADR 0310).
 const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("changes.rs", CHANGES_RS, "apply_change"),
     ("changes.rs", CHANGES_RS, "discard_change"),
@@ -136,10 +112,6 @@ const MCP_PERMISSION_RS: &str = include_str!("mcp_permission.rs");
 const MCP_RS: &str = include_str!("mcp.rs");
 const THREAD_REACH_RS: &str = include_str!("thread_reach.rs");
 
-/// The gate under any of its names: the header form a route asks, the thread
-/// form an in-process tool asks, and the local wrappers. Each wrapper is
-/// asserted to reach the real one by the test below, so naming them here is
-/// not a hole.
 const GATE_CALLS: &[&str] = &[
     "refuse_without_authority",
     "refuse_thread_without_authority",
@@ -150,13 +122,6 @@ const GATE_CALLS: &[&str] = &[
     "authorize_checkpoint_undo",
 ];
 
-/// The plan's own verification for "the standing instruction has exactly one
-/// definition": a source scan asserting every clause-4 verb asks it rather than
-/// re-deriving the check.
-///
-/// A behavioral test cannot cover this. Both ADRs diagnose one failure: a verb
-/// gated on the route somebody remembered and forgotten on its second. A route
-/// that never calls the gate has no behavior to assert against.
 #[test]
 fn every_clause_4_route_asks_the_gate() {
     for (path, source, handler) in GATED_HANDLERS {
@@ -197,9 +162,6 @@ fn every_clause_4_route_asks_the_gate() {
             "{wrapper} stands in for the gate, so it must reach {reaches}"
         );
     }
-    // The controls: two reads that ask no gate, one a free function and one a
-    // method. A slicer running past a body would pick the gate up from a
-    // neighbour, and every assertion above would be passing on nothing.
     for (source, read_only) in [
         (CHANGES_RS, "list_changes"),
         (TOOLS_RS, "execute_list_changes"),
@@ -212,8 +174,6 @@ fn every_clause_4_route_asks_the_gate() {
     }
 }
 
-/// ADR 0475: creating a top-thread and an agent's detach ask no gate. The
-/// create route and the engine's move are where the gate used to sit.
 #[test]
 fn creating_a_top_thread_asks_no_gate() {
     for (source, handler) in [
@@ -231,12 +191,6 @@ fn creating_a_top_thread_asks_no_gate() {
     }
 }
 
-/// One function or method body, as source text.
-///
-/// The end is the closing brace at the same column the `async fn` sits on. A
-/// method inside an `impl` therefore stops at its own brace, rather than
-/// running to the end of the block and borrowing a neighbour's gate. Crude on
-/// purpose: it needs to find a call, not parse Rust.
 fn handler_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     let decl = source.find(&format!("async fn {name}("))?;
     let line_start = source[..decl].rfind('\n').map_or(0, |i| i + 1);
@@ -253,12 +207,6 @@ fn handler_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// The refusal is the sentence an agent acts on, so it has to read as one.
-///
-/// Two ways it stopped reading once the verb set grew past archive and cancel.
-/// A frame that inflected the verb produced "a thread applys itself". A
-/// root-aimed refusal pointed at "this thread", which names nothing, since that
-/// refusal exists precisely when there is no thread.
 #[test]
 fn every_refusal_reads_as_a_sentence() {
     for verb in EVERY_VERB {
@@ -292,20 +240,10 @@ fn every_refusal_reads_as_a_sentence() {
     }
 }
 
-/// Headers as a Lucidos-spawned subprocess sends them: a thread-bound origin
-/// token it cannot re-point, minted over `thread_id`.
-///
-/// The secret is per-engine-startup and installed first-writer-wins, so each
-/// test installs one rather than assuming a booted engine did. Without it,
-/// minting returns `None` and every header map comes out empty, which would
-/// make a token-bearing caller read as an ordinary untokened one. That is the
-/// opposite of what these tests assert.
 fn agent_headers(thread_id: Option<Uuid>) -> HeaderMap {
     agent_headers_for_fire(thread_id, None)
 }
 
-/// The same, for a subprocess that IS a trigger's fire. The trigger id rides
-/// the signed prefix, so it is authenticated exactly as the thread id is.
 fn agent_headers_for_fire(thread_id: Option<Uuid>, emitting_trigger_id: Option<&str>) -> HeaderMap {
     init_agent_origin_secret("thread-reach-test-secret".to_string());
     let mut h = HeaderMap::new();
@@ -315,14 +253,10 @@ fn agent_headers_for_fire(thread_id: Option<Uuid>, emitting_trigger_id: Option<&
     h
 }
 
-/// The user's browser or phone: a device id the gateway stamped, and no
-/// origin token.
 fn device_headers() -> HeaderMap {
     crate::api::gateway_stamp::test_support::stamped_device_headers("device-abc")
 }
 
-/// Callers that identify themselves without proving the owner: a typed device
-/// id, the machine-local token, and nothing at all.
 fn unattested_headers() -> Vec<HeaderMap> {
     let local = crate::api::local_auth::publish_test_local_token();
     let mut typed = HeaderMap::new();
@@ -342,9 +276,6 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>) {
     seed_thread_opened_by(bus, thread_id, parent, None).await;
 }
 
-/// Seed a thread whose turn `origin` opened. `None` is the shape every ladder
-/// test wants: a thread nobody's device spoke into, so it carries no standing
-/// instruction and the ladder is the only thing answering.
 async fn seed_thread_opened_by(
     bus: &EventBus,
     thread_id: Uuid,
@@ -377,8 +308,6 @@ async fn seed_thread_opened_by(
     .unwrap();
 }
 
-/// A bus over `pool`, for a gate call that emits only when it spends a
-/// permission.
 fn bus_for(pool: &PgPool) -> EventBus {
     EventBus::new(pool.clone()).0
 }
@@ -429,9 +358,6 @@ fn owner_device() -> MessageOrigin {
     }
 }
 
-/// A root with two children, and a grandchild under the first child. Enough
-/// shape to tell a descendant from a sibling, and a direct child from a
-/// deeper one.
 struct Family {
     root: Uuid,
     child: Uuid,
@@ -457,8 +383,6 @@ async fn family(pool: &PgPool) -> Family {
     }
 }
 
-/// A thread ends its own work whenever it likes. This is the case that costs
-/// no query at all, which is why it is asserted before the tree cases.
 #[tokio::test]
 async fn a_thread_reaches_itself() {
     let (pool, db_name) = setup_test_db().await;
@@ -472,9 +396,6 @@ async fn a_thread_reaches_itself() {
     teardown_test_db(&db_name).await;
 }
 
-/// Descendants, not just direct children. The archive route cascades to the
-/// whole family, so a ladder that stopped at one level would authorize less
-/// than the verb actually does.
 #[tokio::test]
 async fn a_thread_reaches_its_child_and_its_grandchild() {
     let (pool, db_name) = setup_test_db().await;
@@ -497,8 +418,6 @@ async fn a_thread_reaches_its_child_and_its_grandchild() {
     teardown_test_db(&db_name).await;
 }
 
-/// The defect this whole change exists to close: ADR 0083's star topology says
-/// nothing points sideways, and archive said otherwise.
 #[tokio::test]
 async fn a_thread_cannot_reach_its_sibling() {
     let (pool, db_name) = setup_test_db().await;
@@ -535,8 +454,6 @@ async fn a_thread_cannot_reach_its_sibling() {
     teardown_test_db(&db_name).await;
 }
 
-/// Upward is refused as firmly as sideways. A child that thinks its parent has
-/// gone wrong reports to the parent; it does not stop it.
 #[tokio::test]
 async fn a_thread_cannot_reach_its_own_parent_or_grandparent() {
     let (pool, db_name) = setup_test_db().await;
@@ -564,9 +481,6 @@ async fn a_thread_cannot_reach_its_own_parent_or_grandparent() {
     teardown_test_db(&db_name).await;
 }
 
-/// A top-level thread in another part of the workspace, and a uuid with no row
-/// at all. Both are out of reach, and both refuse identically: the caller
-/// learns the thread is not its own and nothing about whether it exists.
 #[tokio::test]
 async fn a_thread_reaches_neither_an_unrelated_thread_nor_a_missing_one() {
     let (pool, db_name) = setup_test_db().await;
@@ -592,9 +506,6 @@ async fn a_thread_reaches_neither_an_unrelated_thread_nor_a_missing_one() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant: the user is unaffected. The owner's stamped device reaches every
-/// thread for every verb. An unattested caller keeps that reach except at the
-/// owner's own verbs, where it is refused.
 #[tokio::test]
 async fn a_user_device_reaches_every_thread_exactly_as_before() {
     let (pool, db_name) = setup_test_db().await;
@@ -627,8 +538,6 @@ async fn a_user_device_reaches_every_thread_exactly_as_before() {
     teardown_test_db(&db_name).await;
 }
 
-/// The same ladder, reached the way a real request reaches it: through the
-/// token rather than through a caller id someone passed in.
 #[tokio::test]
 async fn a_tokened_agent_is_bound_to_its_own_subtree() {
     let (pool, db_name) = setup_test_db().await;
@@ -654,10 +563,6 @@ async fn a_tokened_agent_is_bound_to_its_own_subtree() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant: a clause-4 verb aimed outside the caller's own subtree refuses
-/// when no standing instruction is present. Per verb, because the gate is per
-/// verb: a caller carrying a token and no owner turn gets the same answer
-/// whichever button it reaches for.
 #[tokio::test]
 async fn every_verb_refuses_outside_the_subtree_with_no_standing_instruction() {
     let (pool, db_name) = setup_test_db().await;
@@ -677,9 +582,6 @@ async fn every_verb_refuses_outside_the_subtree_with_no_standing_instruction() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant: in-subtree action needs no standing instruction. The 264 measured
-/// in-lane applies are this test, and a parent that could no longer apply its
-/// own child's work is the failure it guards.
 #[tokio::test]
 async fn every_verb_reaches_the_caller_s_own_subtree_with_no_owner_turn() {
     let (pool, db_name) = setup_test_db().await;
@@ -701,8 +603,6 @@ async fn every_verb_reaches_the_caller_s_own_subtree_with_no_owner_turn() {
     teardown_test_db(&db_name).await;
 }
 
-/// A retired verb needs no authority. A thread in a turn nobody's
-/// device opened, and a subprocess with no thread, both pass at any target.
 #[tokio::test]
 async fn a_retired_verb_passes_with_no_authority() {
     let (pool, db_name) = setup_test_db().await;
@@ -739,8 +639,6 @@ async fn a_retired_verb_passes_with_no_authority() {
     teardown_test_db(&db_name).await;
 }
 
-/// Clause 5: the owner opened this turn, so their words in it are the press.
-/// The same caller that was refused above now reaches its sibling.
 #[tokio::test]
 async fn a_turn_the_owner_opened_reaches_past_the_subtree() {
     let (pool, db_name) = setup_test_db().await;
@@ -769,9 +667,6 @@ async fn a_turn_the_owner_opened_reaches_past_the_subtree() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant: a trigger firing counts as a standing instruction, and a trigger
-/// thread still reaches its own subtree without one. Both sides, because the
-/// failure signal is a nightly pipeline that stops applying at 3am.
 #[tokio::test]
 async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
     let (pool, db_name) = setup_test_db().await;
@@ -779,7 +674,6 @@ async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
     let f = family(&pool).await;
     let trigger_thread = Uuid::new_v4();
     let its_child = Uuid::new_v4();
-    // The owner wrote the trigger, which is what makes its fire theirs.
     bus.emit(BusEvent::System(
         crate::engine::event_bus::SystemEvent::TriggerCreated {
             trigger_id: "nightly".into(),
@@ -831,9 +725,6 @@ async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
     teardown_test_db(&db_name).await;
 }
 
-/// A script trigger has no thread to read a turn from, and is the same standing
-/// instruction. Its fire rides the token, so it reaches what an intent
-/// trigger's thread reaches.
 #[tokio::test]
 async fn a_script_trigger_fire_carries_the_instruction_with_no_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -863,9 +754,6 @@ async fn a_script_trigger_fire_carries_the_instruction_with_no_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// A subprocess with a token, no thread and no fire behind it. It has no
-/// subtree and no turn, so it is refused rather than handed the whole
-/// workspace. Same answer the event-wait routes give.
 #[tokio::test]
 async fn a_threadless_subprocess_is_refused_rather_than_given_every_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -882,9 +770,6 @@ async fn a_threadless_subprocess_is_refused_rather_than_given_every_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// `POST /api/v1/chat/cancel` with no `thread_id` stops every thread in the
-/// workspace, which is the user's global Stop. A thread-bound caller is
-/// refused explicitly rather than quietly reread as "cancel yourself".
 #[tokio::test]
 async fn a_tokened_agent_cannot_cancel_the_whole_workspace() {
     let (pool, db_name) = setup_test_db().await;
@@ -906,10 +791,6 @@ async fn a_tokened_agent_cannot_cancel_the_whole_workspace() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant: a refusal never names a parent the caller does not have. This
-/// caller is a top-thread, so the old "say so to your parent thread" pointed at
-/// nothing. Asserted over every verb and both target shapes, since the sentence
-/// is what an agent acts on.
 #[tokio::test]
 async fn no_refusal_sends_a_top_thread_to_a_parent_it_does_not_have() {
     let (pool, db_name) = setup_test_db().await;
@@ -935,9 +816,6 @@ async fn no_refusal_sends_a_top_thread_to_a_parent_it_does_not_have() {
     teardown_test_db(&db_name).await;
 }
 
-/// A token re-pointed at another thread does not verify, so it reads as no
-/// token at all. Re-asserted here because this ladder is only as strong as
-/// that binding: `api::actor` owns the property, and this is what leans on it.
 #[tokio::test]
 async fn a_forged_token_does_not_authenticate_as_the_thread_it_names() {
     let (pool, db_name) = setup_test_db().await;
@@ -965,13 +843,6 @@ async fn a_forged_token_does_not_authenticate_as_the_thread_it_names() {
     teardown_test_db(&db_name).await;
 }
 
-// ── The home thread (ADR 0362) ────────────────────────────────────────────
-//
-// Invariant I11: reach widens for the home thread, and authority does not.
-
-/// The home thread follows up any thread: its own child, a sibling family's
-/// root, and a sub-thread deep in somebody else's family. Any other thread
-/// still reaches its direct children only.
 #[tokio::test]
 async fn the_home_thread_follows_up_any_thread_and_a_sibling_does_not() {
     let (pool, db_name) = setup_test_db().await;
@@ -1005,9 +876,6 @@ async fn the_home_thread_follows_up_any_thread_and_a_sibling_does_not() {
     teardown_test_db(&db_name).await;
 }
 
-/// The home thread presses an owner button outside its own subtree only on a
-/// standing instruction. A turn nobody's device opened refuses every verb,
-/// and a turn the owner opened allows them, exactly as for any thread.
 #[tokio::test]
 async fn the_home_thread_gains_reach_but_not_authority() {
     let (pool, db_name) = setup_test_db().await;
@@ -1042,9 +910,6 @@ async fn the_home_thread_gains_reach_but_not_authority() {
     teardown_test_db(&db_name).await;
 }
 
-/// No agent presses either Always-allow grant, whatever thread it runs in and
-/// whoever opened its turn. The owner's device still does, and an agent keeps
-/// the three narrower answers.
 #[test]
 fn an_agent_never_presses_an_always_allow_grant() {
     use crate::engine::thread_events::AllowScope;
@@ -1070,9 +935,6 @@ fn an_agent_never_presses_an_always_allow_grant() {
     }
 }
 
-/// Regression: the Settings routes write the same permission grants the card's
-/// Always-allow writes, and only asked whether the caller was identified. An
-/// agent token passed, so `PUT /cc-allowed-tools` with `Bash(*)` answered 204.
 #[test]
 fn an_agent_never_writes_a_permission_grant_through_settings() {
     let err = require_owner_for_permission_grant(&agent_headers(Some(Uuid::new_v4()))).unwrap_err();
@@ -1110,12 +972,6 @@ fn an_agent_never_writes_a_permission_grant_through_settings() {
     }
 }
 
-/// Regression: `PUT /api/v1/preferences` passed any key through. An agent
-/// refused `command_guard` by its own tool could still write it with one
-/// `lucidos preferences set`, and switch off its own command guard.
-///
-/// Every key the catalog withholds from the agent is refused to an agent
-/// caller. A key the agent may write, and an app's own key, still pass.
 #[test]
 fn an_agent_never_writes_a_human_only_preference() {
     use crate::api::settings::require_owner_for_human_only_preference;
@@ -1148,10 +1004,6 @@ fn an_agent_never_writes_a_human_only_preference() {
     }
 }
 
-/// Regression: `configure_email` could not turn send confirmation off, but
-/// `PUT /api/v1/credentials` wrote the flag for any caller. So an agent could
-/// still drop the user's confirmation card with one HTTP call. Only an edit
-/// that turns the flag off is gated, and an unknown stored value counts as on.
 #[test]
 fn an_agent_never_turns_off_email_send_confirmation() {
     use crate::api::settings::lowers_send_confirmation as lowers;
@@ -1163,9 +1015,6 @@ fn an_agent_never_turns_off_email_send_confirmation() {
     assert!(!lowers(true, Ok(Some(false))));
 }
 
-/// Every route writing a human-only setting, confirming a send or revealing a
-/// secret refuses an agent before it acts. So a refused agent leaves the stored
-/// value unchanged, sends nothing, and spends no reveal token.
 #[test]
 fn every_human_only_route_refuses_an_agent_before_it_acts() {
     let settings = include_str!("settings.rs");
@@ -1261,8 +1110,6 @@ fn every_human_only_route_refuses_an_agent_before_it_acts() {
     }
 }
 
-/// All three consent routes ask the permission gate before resolving, so a
-/// refusal answers no card.
 #[test]
 fn every_consent_route_asks_the_gate_before_it_answers() {
     for (path, source, handler) in [
@@ -1291,9 +1138,6 @@ fn every_consent_route_asks_the_gate_before_it_answers() {
     }
 }
 
-/// Taking back a queued message drives the target thread's session, so the
-/// route asks the Control gate before it reads or writes anything. A refusal
-/// then removes nothing, and says nothing about whether the message exists.
 #[test]
 fn removing_a_queued_message_asks_the_control_gate_first() {
     let body = handler_body(CHAT_RS, "remove_queued_message").expect("the handler exists");
@@ -1310,8 +1154,6 @@ fn removing_a_queued_message_asks_the_control_gate_first() {
     assert!(gate < first_read, "the gate must run before any lookup");
 }
 
-/// Each draft and undo route asks the gate, as its own verb, before its first
-/// write. A refusal then writes no blob, draft or discard, and restores no file.
 #[test]
 fn draft_and_undo_routes_ask_the_gate_before_they_write() {
     for (source, handler, gate, verb, writes) in [
@@ -1368,8 +1210,6 @@ fn draft_and_undo_routes_ask_the_gate_before_they_write() {
     }
 }
 
-/// The ladder the route above relies on. An agent takes back a queued message
-/// in its own subtree, never a sibling's. The user's device is unaffected.
 #[tokio::test]
 async fn a_queued_message_is_taken_back_only_inside_the_callers_subtree() {
     let (pool, db_name) = setup_test_db().await;
@@ -1395,10 +1235,6 @@ async fn a_queued_message_is_taken_back_only_inside_the_callers_subtree() {
     teardown_test_db(&db_name).await;
 }
 
-/// Cancelling Apply All takes back the batch's Apply and the sweep's arms, so
-/// the route asks the gate Apply All asks, aimed at the workspace. It runs
-/// before the batch or an arm is touched, so a refusal stops nothing and
-/// reveals nothing about whether a batch is running.
 #[test]
 fn cancelling_apply_all_asks_the_apply_gate_first() {
     let body = handler_body(CHANGES_RS, "cancel_apply_all_changes").expect("the handler exists");
@@ -1415,9 +1251,6 @@ fn cancelling_apply_all_asks_the_apply_gate_first() {
     }
 }
 
-/// The ladder the route above relies on. The workspace is nobody's subtree, so
-/// no agent cancels Apply All on reach alone, not even the root of a family.
-/// The user's device is unaffected.
 #[tokio::test]
 async fn only_the_owner_cancels_apply_all() {
     let (pool, db_name) = setup_test_db().await;
@@ -1438,9 +1271,6 @@ async fn only_the_owner_cancels_apply_all() {
     teardown_test_db(&db_name).await;
 }
 
-/// No thread answers a permission card (I18): not inside its own subtree, and
-/// not on the owner's words in its turn. A denial is an answer too. The user's
-/// device always answers, and no agent ever presses Always allow.
 #[tokio::test]
 async fn no_thread_answers_a_permission_card() {
     use crate::engine::thread_events::AllowScope;
@@ -1498,9 +1328,6 @@ async fn no_thread_answers_a_permission_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// Clause 5 no longer covers a card answer, and neither does clause 3 (I18).
-/// A thread answers no card on its own subtree, a turn the owner opened or a
-/// trigger firing. The owner's confirmed batch is the only relay.
 #[tokio::test]
 async fn a_card_answer_from_a_thread_needs_a_batch() {
     let (pool, db_name) = setup_test_db().await;
@@ -1552,7 +1379,6 @@ async fn a_card_answer_from_a_thread_needs_a_batch() {
     teardown_test_db(&db_name).await;
 }
 
-/// Grant `label` on `caller`'s request to `verb` `target`, as the owner would.
 async fn allow(bus: &EventBus, caller: Uuid, verb: Action, target: Uuid, label: &str) {
     use crate::api::permission_requests::{tests::grant, thread_ask};
     let ask = thread_ask(bus.pool(), caller, verb, Some(target), "I need it.")
@@ -1561,9 +1387,6 @@ async fn allow(bus: &EventBus, caller: Uuid, verb: Action, target: Uuid, label: 
     grant(bus, caller, ask, label).await;
 }
 
-/// Invariant 1 and 2 at the thread gate: with no permission the act out of
-/// reach is refused. Allow once lets exactly one act through, on its verb and
-/// target only.
 #[tokio::test]
 async fn allow_once_lets_one_act_out_of_reach_through_once() {
     use crate::engine::permission::menu::ALLOW_ONCE_LABEL;
@@ -1597,7 +1420,6 @@ async fn allow_once_lets_one_act_out_of_reach_through_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant 2: two racing acts on one Allow once, and exactly one runs.
 #[tokio::test]
 async fn two_racing_acts_spend_one_allow_once_once() {
     use crate::engine::permission::menu::ALLOW_ONCE_LABEL;
@@ -1615,8 +1437,6 @@ async fn two_racing_acts_spend_one_allow_once_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// Always allow holds on the workspace: any thread may press that verb on
-/// that target, again and again. Apply offers no Always allow.
 #[tokio::test]
 async fn always_allow_lets_any_thread_press_the_verb_on_its_target() {
     use crate::engine::permission::menu::{ALWAYS_ALLOW_LABEL, DONT_ALLOW_LABEL};
@@ -1630,7 +1450,6 @@ async fn always_allow_lets_any_thread_press_the_verb_on_its_target() {
             .await
             .unwrap();
     }
-    // The card promises the act to a thread, so a threadless caller holds none.
     assert_eq!(
         refuse_without_authority(&bus, &agent_headers(None), Some(f.root), Action::Archive).await,
         Err(ThreadReachError::NoCallerThread(Action::Archive))
@@ -1649,8 +1468,6 @@ async fn always_allow_lets_any_thread_press_the_verb_on_its_target() {
     teardown_test_db(&db_name).await;
 }
 
-/// The gate never spends a draft send's grant: draft acceptance spends it in
-/// its own transaction (ADR 0651).
 #[tokio::test]
 async fn the_gate_leaves_a_draft_sends_grant_to_its_acceptance() {
     use crate::engine::permission::thread_user;
@@ -1687,8 +1504,6 @@ async fn the_gate_leaves_a_draft_sends_grant_to_its_acceptance() {
     teardown_test_db(&db_name).await;
 }
 
-/// A refusal must write nothing: no locked family, no cleared pending change,
-/// no cancel-stamped question card. So the gate runs before the cascade.
 #[test]
 fn archive_asks_the_reach_gate_before_the_cascade() {
     let body = handler_body(ARCHIVE_RS, "archive_thread").expect("the handler exists");

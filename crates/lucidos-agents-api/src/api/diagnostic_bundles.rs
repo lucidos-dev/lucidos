@@ -1,4 +1,3 @@
-//! Authenticated diagnostic ingress and agent-only bounded inbox queries.
 use super::{ApiError, AppState};
 use axum::{
     extract::{Path, RawQuery, Request, State},
@@ -40,7 +39,7 @@ async fn ingest(
     let permit = slots
         .try_acquire()
         .map_err(|_| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Diagnostic receiver busy"))?;
-    // Enforce while streaming, including chunked bodies with no Content-Length.
+    // INVARIANT: Enforce while streaming, including chunked bodies with no Content-Length.
     let bytes = axum::body::to_bytes(req.into_body(), MAX_COMPRESSED_BYTES)
         .await
         .map_err(|_| {
@@ -59,7 +58,7 @@ async fn ingest(
         } else {
             Err("Diagnostic body digest mismatch".into())
         };
-        // Cancellation leaves the slot with this task until decoding finishes.
+        // INVARIANT: Cancellation leaves the slot with this task until decoding finishes.
         (permit, incoming)
     })
     .await
@@ -70,7 +69,7 @@ async fn ingest(
         )
     })?;
     let _permit = permit;
-    // Decoder errors may quote private input. Never return or log them.
+    // INVARIANT: Decoder errors may quote private input. Never return or log them.
     let incoming = incoming.map_err(|_| ApiError::bad_request("Invalid diagnostic bundle"))?;
     bus.receive_diagnostic_bundle(&incoming)
         .await

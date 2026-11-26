@@ -1,11 +1,3 @@
-//! User-only messages and the agent pause at the API (ADR 0649).
-//!
-//! A chat send on a team gateway may carry *user mentions* and an *agent
-//! mention*. The engine reads the pause, flips it as the route says, and either
-//! takes the ordinary path or records a `UserOnlyMessagePosted` that starts no
-//! turn. `/api/v1/threads/:thread_id/agent-pause` is the chip: GET reads the
-//! pause, POST flips it.
-
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -26,10 +18,8 @@ use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 use crate::gateway_users::UserSnapshot;
 
-/// The 400 for mentions on a gateway with fewer than two users.
 const NO_TEAM: &str = "Mentioning a user needs a gateway with two or more users.";
 
-/// The 503 while the gateway has not named its users yet.
 fn users_unknown() -> ApiError {
     ApiError::new(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -47,8 +37,6 @@ pub(super) fn router() -> Router<AppState> {
 
 pub(super) use crate::engine::thread_users::UserAddressing;
 
-/// Check a send's mentions. `None` takes the ordinary path untouched: a
-/// gateway with one user, and every input that is not a user typing.
 pub(super) fn user_addressing(
     mentions: Vec<String>,
     agent_mentioned: bool,
@@ -121,7 +109,7 @@ async fn addressing_while_users_unknown(
     }
 }
 
-/// Refuse a user-only message that would create a coding-agent thread with
+/// INVARIANT: Refuse a user-only message that would create a coding-agent thread with
 /// no session. A thread not started yet is never paused and has no open
 /// question, so the mentions alone decide it, before anything records.
 pub(super) fn refuse_user_only_start(
@@ -150,7 +138,6 @@ use crate::engine::thread_users::{
     post_user_only_message, route_user_only_message, UserOnlyMessage,
 };
 
-/// A known thread's id, or a 400 or 404.
 async fn known_thread(state: &AppState, raw: &str) -> Result<Uuid, ApiError> {
     let thread_id = Uuid::parse_str(raw)
         .map_err(|e| ApiError::bad_request(format!("Invalid thread_id: {e}")))?;
@@ -168,9 +155,6 @@ async fn known_thread(state: &AppState, raw: &str) -> Result<Uuid, ApiError> {
     Ok(thread_id)
 }
 
-/// GET /api/v1/threads/:thread_id/agent-pause: whether the agent is paused,
-/// as `{ "paused" }`. A client cannot fold it from a transcript page, since
-/// the last flip may sit on an older page.
 async fn read_agent_pause(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -187,8 +171,6 @@ struct AgentPauseBody {
     paused: bool,
 }
 
-/// POST /api/v1/threads/:thread_id/agent-pause: the chip. Any paired device
-/// may flip it, since the pause is never authority. Answers `{ "paused" }`.
 async fn set_agent_pause(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -447,8 +429,6 @@ mod tests {
         .unwrap()
     }
 
-    /// A draft started with a teammate pauses, becomes a real chat thread,
-    /// and runs no turn. The agent mention resumes it.
     #[tokio::test]
     async fn a_mention_pauses_a_draft_and_the_agent_mention_resumes_it() {
         let (pool, db_name) = setup_test_db().await;
@@ -505,8 +485,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A coding-agent thread's first message must reach its agent. The check
-    /// is pure, so it runs before the send consumes a draft.
     #[test]
     fn a_user_only_message_cannot_start_a_coding_agent_thread() {
         let kim = mention(&["kim"], false);
@@ -516,8 +494,6 @@ mod tests {
         assert!(refuse_user_only_start(None, true).is_ok());
     }
 
-    /// An untagged reply on a paused thread with an open question card is
-    /// the card's answer, so it reaches the agent.
     #[tokio::test]
     async fn an_untagged_reply_to_an_open_card_wakes_a_paused_agent() {
         let (pool, db_name) = setup_test_db().await;
@@ -559,8 +535,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A user-only message can be a thread's first event, and it lists the
-    /// thread.
     #[tokio::test]
     async fn a_user_only_message_starts_a_chat_thread() {
         let (pool, db_name) = setup_test_db().await;

@@ -1,9 +1,5 @@
-//! The row registry, without a pool.
-
 use super::*;
 
-/// A stored value round-trips through its id, so Settings and the engine
-/// agree on every row.
 #[test]
 fn every_row_reads_back_from_its_id() {
     for endpoint in SystemOneEndpoint::ALL {
@@ -11,7 +7,6 @@ fn every_row_reads_back_from_its_id() {
     }
 }
 
-/// `chat` is a site's default, never a System One row.
 #[test]
 fn chat_is_not_a_row() {
     assert_eq!(SystemOneEndpoint::from_id("chat"), None);
@@ -56,8 +51,6 @@ fn a_workers_ai_scope_yields_the_model_url() {
     );
 }
 
-/// The token is sent to whatever URL this returns, so anything but the
-/// Cloudflare API with a plain account id is refused.
 #[test]
 fn a_scope_naming_no_account_yields_nothing() {
     for scope in [
@@ -72,8 +65,6 @@ fn a_scope_naming_no_account_yields_nothing() {
     }
 }
 
-/// OpenRouter and OpenAI are chat providers too. Their rows read the key and
-/// the switch the chat provider reads, so one switch parks both uses.
 #[test]
 fn openrouter_and_openai_share_their_chat_providers_switch_and_key() {
     use crate::llm::ProviderKind;

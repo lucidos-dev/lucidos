@@ -1,13 +1,3 @@
-//! The boot step that gives every user-entered secret one home, the
-//! `credentials` table.
-//!
-//! Two older places held such secrets: `email_accounts.password`, a copy of
-//! the `email_password` credential, and the values of `mcp_servers.env`. A
-//! migration sees only their ciphertext (ADR 0509), so this step runs in Rust
-//! once the secrets key is installed. It runs before the EventBus exists,
-//! like a migration, so it announces nothing. Every part is idempotent: a
-//! second boot finds nothing left to move.
-
 use sqlx::PgPool;
 
 use super::boot::column_exists;
@@ -16,8 +6,6 @@ use crate::core::{AuthType, CredentialStore, McpServerStore};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Move both sets of values into `credentials`, then drop the mailbox
-/// password column.
 pub async fn move_at_boot(pool: &PgPool) -> Result<(), BoxError> {
     let mailboxes = move_mailbox_passwords(pool).await?;
     if mailboxes > 0 {
@@ -30,7 +18,7 @@ pub async fn move_at_boot(pool: &PgPool) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Give every mailbox password with no `email_password` credential one, then
+/// INVARIANT: Give every mailbox password with no `email_password` credential one, then
 /// drop `email_accounts.password`. Returns how many it moved.
 ///
 /// The credential takes the account's name. When another credential already

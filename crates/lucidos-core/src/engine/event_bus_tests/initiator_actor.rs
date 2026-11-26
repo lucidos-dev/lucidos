@@ -1,8 +1,6 @@
 use super::super::*;
 use super::*;
 
-// ---- Initiator propagation tests ----
-/// User-initiated chat thread has initiator='user'.
 #[tokio::test]
 async fn initiator_user_chat() {
     let (pool, db_name) = setup_test_db().await;
@@ -46,7 +44,6 @@ async fn initiator_user_chat() {
     teardown_test_db(&db_name).await;
 }
 
-/// Scheduled task thread has initiator='system'.
 #[tokio::test]
 async fn initiator_system_trigger() {
     let (pool, db_name) = setup_test_db().await;
@@ -88,7 +85,6 @@ async fn initiator_system_trigger() {
     teardown_test_db(&db_name).await;
 }
 
-/// CC sub-thread of a scheduled task inherits initiator='system'.
 #[tokio::test]
 async fn initiator_inherited_system_to_cc_child() {
     let (pool, db_name) = setup_test_db().await;
@@ -96,7 +92,6 @@ async fn initiator_inherited_system_to_cc_child() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Parent: trigger run (system-initiated)
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::TriggerStarted {
@@ -120,7 +115,6 @@ async fn initiator_inherited_system_to_cc_child() {
     .await
     .unwrap();
 
-    // Child: CC thread spawned by trigger run
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
@@ -165,7 +159,6 @@ async fn initiator_inherited_system_to_cc_child() {
     teardown_test_db(&db_name).await;
 }
 
-/// CC sub-thread of a user chat has initiator='user'.
 #[tokio::test]
 async fn initiator_inherited_user_to_cc_child() {
     let (pool, db_name) = setup_test_db().await;
@@ -173,7 +166,6 @@ async fn initiator_inherited_user_to_cc_child() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Parent: user chat
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
@@ -199,7 +191,6 @@ async fn initiator_inherited_user_to_cc_child() {
     .await
     .unwrap();
 
-    // Child: CC thread spawned by agentic loop
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
@@ -240,7 +231,6 @@ async fn initiator_inherited_user_to_cc_child() {
     teardown_test_db(&db_name).await;
 }
 
-/// MessageReceived with source="system" creates system-initiated thread.
 #[tokio::test]
 async fn initiator_from_message_source_field() {
     let (pool, db_name) = setup_test_db().await;
@@ -284,7 +274,6 @@ async fn initiator_from_message_source_field() {
     teardown_test_db(&db_name).await;
 }
 
-/// SessionStarted ON CONFLICT does not overwrite initiator set by prior MessageReceived.
 #[tokio::test]
 async fn initiator_preserved_on_session_started_upsert() {
     let (pool, db_name) = setup_test_db().await;
@@ -292,7 +281,6 @@ async fn initiator_preserved_on_session_started_upsert() {
     let parent_id = Uuid::new_v4();
     let cc_thread_id = Uuid::new_v4();
 
-    // Parent: trigger run (system)
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::TriggerStarted {
@@ -316,7 +304,6 @@ async fn initiator_preserved_on_session_started_upsert() {
     .await
     .unwrap();
 
-    // CC child: MessageReceived creates row with initiator=system (inherited)
     bus.emit(BusEvent::Thread {
         thread_id: cc_thread_id,
         event: ThreadEvent::MessageReceived {
@@ -342,7 +329,6 @@ async fn initiator_preserved_on_session_started_upsert() {
     .await
     .unwrap();
 
-    // SessionStarted upserts the same row — must not reset initiator
     bus.emit(BusEvent::Thread {
         thread_id: cc_thread_id,
         event: ThreadEvent::SessionStarted {
@@ -382,8 +368,6 @@ async fn initiator_preserved_on_session_started_upsert() {
     teardown_test_db(&db_name).await;
 }
 
-/// MessageReceived persists `spawning_event_id` into thread_summaries so a
-/// system-spawned thread records the exact parent event that triggered it.
 #[tokio::test]
 async fn spawning_event_id_persists_for_system_spawn() {
     let (pool, db_name) = setup_test_db().await;
@@ -469,10 +453,6 @@ async fn spawning_event_id_persists_for_system_spawn() {
     teardown_test_db(&db_name).await;
 }
 
-// ── Phase 0: Pre-refactor safety net ──
-/// Cross-validate: verify that SystemEvent serialization round-trips correctly
-/// for all persisted system event variants. If serialization breaks, events
-/// written to the DB can't be read back on replay.
 #[test]
 fn persisted_system_events_round_trip_through_json() {
     let events = vec![
@@ -498,7 +478,6 @@ fn persisted_system_events_round_trip_through_json() {
     for event in &events {
         assert!(event.is_persisted(), "{:?} should be persisted", event);
         let payload = event.to_payload();
-        // Verify payload has the expected envelope structure
         assert!(
             payload.get("type").is_some(),
             "Serialized payload for {:?} must have 'type' field",

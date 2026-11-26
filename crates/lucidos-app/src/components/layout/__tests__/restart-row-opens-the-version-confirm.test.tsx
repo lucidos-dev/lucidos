@@ -85,6 +85,12 @@ describe('nothing newer', () => {
     expect(host.querySelector('.brand-menu-confirm')?.textContent).toBe('OK');
   });
 
+  it('draws the inline confirm as a plain row, not a menu item', async () => {
+    tapRow();
+    await settled();
+    expect(host.querySelector('.brand-menu-confirm-row')?.getAttribute('role')).toBe('none');
+  });
+
   it('restarts only once that OK is pressed, and closes the menu with it', async () => {
     tapRow();
     await settled();

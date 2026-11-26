@@ -1,10 +1,3 @@
-//! HTTP consent endpoint for the command-guard permission lane (ADR 0002,
-//! Phase 2) — the chat counterpart of `mcp::submit_mcp_consent`. The
-//! `PermissionCard` rendered for a `CommandPermissionRequested` event POSTs
-//! here; the handler wakes the in-process agentic loop blocked on the entry,
-//! records any "Always allow" grant, and emits the paired
-//! `CommandPermissionResolved`.
-
 use super::*;
 use crate::engine::command_permission::resolve_command_permission;
 use crate::engine::permission::tool_grants::AnsweredBy;
@@ -14,26 +7,12 @@ use crate::engine::thread_events::AllowScope;
 pub(super) struct CommandConsentRequest {
     pub request_id: String,
     pub allowed: bool,
-    /// When `Some(_)` and `allowed`, the engine records the derived pattern as
-    /// a *tool grant* so future matching commands skip the prompt: `session`
-    /// held by the thread, `narrow` / `broad` standing. Absent (Allow once)
-    /// records nothing. Unknown wire values 4xx via serde, matching the
-    /// engine's typed enum exactly.
     #[serde(default)]
     pub persist_scope: Option<AllowScope>,
-    /// Always deny: with `allowed` false, the engine also stores the card's
-    /// deny line as a *standing deny*. Ignored on an allow.
     #[serde(default)]
     pub always_deny: bool,
 }
 
-/// POST /api/v1/command-permission/consent — resolve a command-guard
-/// permission card. Mirrors the MCP consent endpoint, but the waiter is the
-/// in-process agentic loop (via the entry's broadcast) rather than an MCP HTTP
-/// handler, so there is no legacy oneshot fallback.
-///
-/// Thin: resolving one is `command_permission::resolve_command_permission`,
-/// which a spoken answer reaches too. This adds the actor and the wire shape.
 pub(super) async fn submit_command_consent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -78,7 +57,6 @@ pub(super) async fn submit_command_consent(
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
     if !answered {
-        // Already resolved (superseded / orphan-recovery / canceled) or unknown.
         return (
             StatusCode::NOT_FOUND,
             "No pending command permission with that ID",
@@ -93,8 +71,6 @@ struct CommandDenyCheck {
     command: String,
 }
 
-/// Pre-execution check for provider tools that can run without an approval
-/// request. It never grants a command or dispatches one to the judge.
 async fn check_command_deny(
     State(state): State<AppState>,
     Json(body): Json<CommandDenyCheck>,
@@ -103,8 +79,6 @@ async fn check_command_deny(
     Json(refusal_for(&state.pool, CommandKind::Shell, &body.command).await)
 }
 
-/// Route for the command-guard permission consent (ADR 0002) — chat mirror
-/// of `/mcp/consent`.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/command-permission/consent", post(submit_command_consent))
@@ -137,7 +111,6 @@ mod tests {
                 .unwrap();
         assert!(body.always_deny);
 
-        // Unknown wire value rejected at the boundary (would 400 in axum).
         assert!(serde_json::from_str::<CommandConsentRequest>(
             r#"{"request_id":"r","allowed":true,"persist_scope":"yolo"}"#
         )

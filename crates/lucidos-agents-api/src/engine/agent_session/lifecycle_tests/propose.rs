@@ -1,8 +1,5 @@
 use super::*;
 
-/// `EndSession` must translate to a plain `break` at the call site, not
-/// `stop.notify_one()` — the stop arm would emit a phantom
-/// `ResponseCanceled` on top of the natural `ResponseGenerated`.
 #[test]
 fn conflict_resolution_ends_session_on_idle() {
     assert_eq!(
@@ -14,15 +11,11 @@ fn conflict_resolution_ends_session_on_idle() {
 
 #[test]
 fn conflict_resolution_during_shutdown_still_ends_session() {
-    // The merge worktree is throwaway and recovery never resumes a
-    // conflict session; shutdown does not change the action.
     assert_eq!(idle_action(true, true), IdleAction::EndSession);
 }
 
 #[test]
 fn normal_idle_outside_shutdown_exits_subprocess() {
-    // Runtime contract: every non-shutdown idle kills CC. The next turn
-    // arrives via `--resume` against a fresh subprocess.
     assert_eq!(
         idle_action(false, false),
         IdleAction::ExitSubprocess,
@@ -32,9 +25,6 @@ fn normal_idle_outside_shutdown_exits_subprocess() {
 
 #[test]
 fn normal_idle_during_shutdown_does_nothing() {
-    // The post-loop shutdown branch preserves the worktree+branch so
-    // `recover_orphaned_worktrees` can resume after restart. Killing CC
-    // here would race with that.
     assert_eq!(
         idle_action(false, true),
         IdleAction::Nothing,
@@ -42,13 +32,6 @@ fn normal_idle_during_shutdown_does_nothing() {
     );
 }
 
-/// Anchor: the default idle path with no inflight work kills CC. The next
-/// turn arrives via `--resume` against a fresh subprocess.
-///
-/// This is also the arm that carries a turn which died on a transient upstream API
-/// error to the idle exit where `maybe_auto_resume_after_api_error` lives, so a
-/// false keep-alive here does not merely leak a subprocess, it silently cancels
-/// that recovery.
 #[test]
 fn terminate_decision_default_terminates() {
     assert_eq!(
@@ -58,10 +41,6 @@ fn terminate_decision_default_terminates() {
     );
 }
 
-/// A session that handed off exits at its idle even with a follow-up queued
-/// or promised. Kept alive, it would run that follow-up as a turn of its own
-/// before the successor session starts. The queued input instead drains to
-/// the successor session, whose opening it reads first.
 #[test]
 fn terminate_decision_handed_off_leaves_queued_follow_ups_to_the_successor() {
     assert_eq!(
@@ -71,8 +50,6 @@ fn terminate_decision_handed_off_leaves_queued_follow_ups_to_the_successor() {
     );
 }
 
-/// The other half: a handed-off session forwards no more input, so it stays
-/// queued for the idle exit to drain. Source-text, as the watchdog pins are.
 #[test]
 fn a_handed_off_session_forwards_no_more_input() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -92,9 +69,6 @@ fn a_handed_off_session_forwards_no_more_input() {
     );
 }
 
-/// A handoff can end, for example by a Stop, and leave input queued. Every
-/// idle exit refreshes the loop's flag, so the input arm opens again rather
-/// than keeping a live subprocess that never reads its queue.
 #[test]
 fn every_idle_exit_refreshes_the_handoff_flag() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -125,8 +99,6 @@ fn every_idle_exit_refreshes_the_handoff_flag() {
     }
 }
 
-/// A policy block closes the gate like a handoff: the input arm stops
-/// forwarding, and the idle exit leaves the queue to a fresh session.
 #[test]
 fn a_provider_block_closes_the_input_gate() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -144,8 +116,6 @@ fn a_provider_block_closes_the_input_gate() {
     assert!(RUN_SRC[exit..].contains("let leaves_queue_to_next_session = !input_gate.forwards();"));
 }
 
-/// An input the session forwarded before it handed off sits in the agent's own
-/// queue, and the agent reads it. Killing the process would lose it.
 #[test]
 fn terminate_decision_handed_off_still_waits_for_what_the_agent_was_sent() {
     assert_eq!(
@@ -158,10 +128,6 @@ fn terminate_decision_handed_off_still_waits_for_what_the_agent_was_sent() {
     );
 }
 
-/// A follow-up was sent but the run loop has not forwarded it yet, so it is sitting
-/// in `msg_rx`. Keep CC alive so the next turn consumes it without a respawn
-/// round-trip. This is the window the idle-termination race lives in
-/// (`docs/plans/2026-06-27-cc-idle-termination-followup-race.md`).
 #[test]
 fn terminate_decision_queued_followup_keeps_alive() {
     assert_eq!(
@@ -175,9 +141,6 @@ fn terminate_decision_queued_followup_keeps_alive() {
     );
 }
 
-/// `arm_followup_redirect` reserved the subprocess and its caller has not routed
-/// the message yet, so it provably is not in `msg_rx`. This is the only window the
-/// channel cannot answer for.
 #[test]
 fn terminate_decision_armed_redirect_keeps_alive() {
     assert_eq!(
@@ -191,9 +154,6 @@ fn terminate_decision_armed_redirect_keeps_alive() {
     );
 }
 
-/// A running background task is not a follow-up. Its completion re-opens the
-/// thread through an event wait, which resumes a terminated session. Holding
-/// an idle subprocess for up to an hour would buy nothing.
 #[test]
 fn terminate_decision_has_no_background_task_keep_alive() {
     const LIFECYCLE_SRC: &str = include_str!("../lifecycle.rs");
@@ -203,10 +163,6 @@ fn terminate_decision_has_no_background_task_keep_alive() {
     );
 }
 
-/// Claude Code reads an input forwarded after a turn's last tool call only as a
-/// second turn, after the first turn's `Result`. That read must re-arm the run
-/// loop. Otherwise it drops every event of the second turn as a straggler, and
-/// the agent's answer never reaches the transcript (ADR 0268).
 #[test]
 fn a_read_after_the_terminal_starts_a_turn() {
     assert!(starts_turn_after_terminal(false, true, true));
@@ -224,9 +180,6 @@ fn a_read_after_the_terminal_starts_a_turn() {
     );
 }
 
-/// A restart teardown emits the turn's terminal from outside the run loop. The
-/// agent then answers the interrupt as if the user had rejected its work, and
-/// the run loop drops that answer like any other straggler.
 #[test]
 fn an_external_terminal_ends_the_turn() {
     use std::sync::atomic::AtomicBool;
@@ -303,14 +256,8 @@ fn reset_per_turn_flags_clears_all_flags() {
     );
 }
 
-/// Conflict-resolution sessions must never propose at idle — the merge
-/// IS the original change being applied; a phantom second pending row
-/// (keyed on `merge-tmp/<change-id>`) shows up in the UI and the
-/// original change's `ChangeApplied` leaves it orphaned.
 #[test]
 fn conflict_session_never_proposes_change_at_idle() {
-    // Not external, not shutdown, conflict session: must refuse — even on a
-    // Generated terminal, because the merge result is the original change.
     assert!(
         idle_change_write(
             IdleSession {
@@ -324,8 +271,6 @@ fn conflict_session_never_proposes_change_at_idle() {
     );
 }
 
-/// Normal sessions that ended Generated may write change state — that's what
-/// makes the Apply button appear. Anchor-test for the happy path.
 #[test]
 fn normal_generated_session_may_touch_change_state() {
     assert!(
@@ -335,10 +280,6 @@ fn normal_generated_session_may_touch_change_state() {
     );
 }
 
-/// A clean idle on a thread still holding an event wait proposes no new change.
-/// The agent parked mid-work, and the wait re-opens the thread for the idle
-/// that proposes. An open change still follows the branch, so a standing apply
-/// never fires on a stale row (ADR 0395).
 #[test]
 fn a_live_event_wait_holds_the_clean_idle_to_a_resync() {
     let waiting = IdleSession {
@@ -358,9 +299,6 @@ fn a_live_event_wait_holds_the_clean_idle_to_a_resync() {
     );
 }
 
-/// A session whose handoff is pending proposes nothing, whatever its terminal
-/// and even with a wait live: its successor session carries the branch work.
-/// This is what keeps Apply and Review from flashing between the two sessions.
 #[test]
 fn a_pending_handoff_never_proposes_at_idle() {
     use crate::engine::thread_events::CancelCause;
@@ -382,8 +320,6 @@ fn a_pending_handoff_never_proposes_at_idle() {
     }
 }
 
-/// The hold covers finished-looking work only. A user Stop with a wait live is
-/// still unfinished, so its work is withheld and announced (ADR 0400).
 #[test]
 fn a_live_event_wait_does_not_hold_a_user_stop() {
     use crate::engine::thread_events::CancelCause;
@@ -400,14 +336,6 @@ fn a_live_event_wait_does_not_hold_a_user_stop() {
     );
 }
 
-/// The gate takes NO "does the branch have a diff" input, and that omission is
-/// load-bearing rather than an oversight. Folding it in (the old
-/// `should_propose_change_at_idle`) made the empty-diff arm unreachable, so a
-/// branch whose commits cancelled out never reconciled its pending change and
-/// the card kept advertising files the live Diff didn't show (change
-/// `2cc8391f`). A clean Generated idle must pass this gate either way; the
-/// caller then routes on the file list — propose when non-empty, reconcile the
-/// existing pending row to zero when empty.
 #[test]
 fn gate_is_blind_to_whether_the_branch_has_a_diff() {
     let clean_idle = idle_change_write(IdleSession::default(), &Some(TerminalKind::Generated))
@@ -448,9 +376,6 @@ fn shutdown_does_not_propose() {
     );
 }
 
-/// A failed terminal (CC error, empty Result, mid-stream API drop) is an
-/// unfinished turn. Its work stays on the branch, withheld and announced, and
-/// the user resumes or discards it (ADR 0400).
 #[test]
 fn failed_terminal_withholds_at_idle() {
     let write = idle_change_write(
@@ -463,9 +388,6 @@ fn failed_terminal_withholds_at_idle() {
     assert!(!write.unwrap().finished(), "a failed turn never proposes");
 }
 
-/// A user Stop withholds what the turn left: an unfinished turn never proposes
-/// (ADR 0400). The other cancels write nothing: a redirect's follow-up
-/// continues the branch, and an Apply or Discard stop owns the change itself.
 #[test]
 fn only_a_user_stop_withholds_a_cancelled_turn() {
     use crate::engine::thread_events::CancelCause;
@@ -484,8 +406,6 @@ fn only_a_user_stop_withholds_a_cancelled_turn() {
     }
 }
 
-/// An aborted terminal is unfinished, so its work is withheld. At engine
-/// shutdown the `is_shutdown` gate refuses first, and boot settles the turn.
 #[test]
 fn aborted_terminal_withholds_unless_the_engine_is_shutting_down() {
     use crate::engine::thread_events::AbortCause;
@@ -507,8 +427,6 @@ fn aborted_terminal_withholds_unless_the_engine_is_shutting_down() {
     );
 }
 
-/// Only a finished turn proposes. A resync keeps an open change in step, and
-/// an unfinished turn proposes nothing at all.
 #[test]
 fn only_a_finished_write_proposes() {
     assert!(IdleChangeWrite::Complete.finished());
@@ -516,14 +434,6 @@ fn only_a_finished_write_proposes() {
     assert!(!IdleChangeWrite::Unfinished.finished());
 }
 
-/// Safety-net abort sets terminal_kind = None (no terminal was emitted
-/// inside the loop). This is the regression we're guarding: previously
-/// the cleanup auto-commit fired the post-commit hook, emitting a
-/// spurious per-commit ChangeProposed even though the aggregate gate
-/// here had no terminal kind to act on. The cleanup auto-commit is now
-/// gated by `should_auto_commit_on_cleanup` which makes the same
-/// decision for the per-commit path; this test pins that the aggregate
-/// path also refuses None.
 #[test]
 fn no_terminal_kind_does_not_propose_at_idle() {
     assert!(
@@ -531,8 +441,6 @@ fn no_terminal_kind_does_not_propose_at_idle() {
         "None terminal (safety-net abort) must NOT auto-propose"
     );
 }
-
-// -------------------- idle_change_flags --------------------
 
 #[test]
 fn answered_non_empty_probe_reports_changes() {
@@ -555,9 +463,6 @@ fn answered_non_empty_probe_without_restart_files() {
 
 #[test]
 fn answered_empty_probe_clears_a_previously_true_state() {
-    // Commit then revert: git ANSWERED, and the answer is that the branch
-    // carries no diff. Carrying `true` forward here is the phantom-Apply
-    // regression `idle_change_write` documents.
     assert_eq!(
         idle_change_flags(Some(&[]), (true, true)),
         (false, false),
@@ -567,8 +472,6 @@ fn answered_empty_probe_clears_a_previously_true_state() {
 
 #[test]
 fn unanswerable_probe_preserves_a_true_state() {
-    // The renamed-branch bug: `git diff <base>...<gone-ref>` exits 128. That
-    // is UNKNOWN, and must never downgrade the Diff button to dark.
     assert_eq!(
         idle_change_flags(None, (true, true)),
         (true, true),
@@ -585,8 +488,6 @@ fn unanswerable_probe_preserves_a_false_state() {
     );
 }
 
-/// Source with every run of whitespace folded to one space, so a check reads
-/// the code and not its rustfmt line breaks.
 fn squashed(src: &str) -> String {
     src.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -594,9 +495,6 @@ fn squashed(src: &str) -> String {
 mod guard_tests {
     use super::*;
 
-    /// The restart teardown and the watchdog only ever raise the external terminal
-    /// flag, because each of them kills the session. Clearing it would let the
-    /// interrupted agent's reply land after "Paused by restart".
     #[test]
     fn the_external_terminal_flag_is_only_ever_raised() {
         let mut setters = 0;
@@ -624,9 +522,6 @@ mod guard_tests {
     }
 }
 
-/// The idle exit reads the redirect promise and the channel depth under the
-/// same `agent_sessions` lock the chat fast path sends under. Releasing or
-/// awaiting between the lock and the decision makes the three windows a sample.
 #[test]
 fn the_idle_decision_reads_its_windows_under_the_sessions_lock() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -652,8 +547,6 @@ fn the_idle_decision_reads_its_windows_under_the_sessions_lock() {
     );
 }
 
-/// The Result arm must feed the classified terminal into the `user_hit_stop`
-/// latch, or an interrupt superseded by follow-ups relabels their success.
 #[test]
 fn the_result_arm_clears_the_stop_latch_from_the_classified_terminal() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -666,8 +559,6 @@ fn the_result_arm_clears_the_stop_latch_from_the_classified_terminal() {
     );
 }
 
-/// The Result arm commits the worktree only when `result_auto_commits` allows
-/// it, so a restart's Result leaves the dirt for the resumed agent to find.
 #[test]
 fn the_result_arm_commits_only_as_result_auto_commits_allows() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -680,9 +571,6 @@ fn the_result_arm_commits_only_as_result_auto_commits_allows() {
     );
 }
 
-/// The `HandOff` arm of a conflict-resolution cleanup runs no git command and
-/// takes or emits nothing. The continuation owns the merge, worktree, branch,
-/// parked apply actor and event pairing.
 #[test]
 fn a_conflict_hand_off_touches_no_merge_state() {
     const COMPLETION_SRC: &str = include_str!("../run_session/completion.rs");
@@ -709,9 +597,6 @@ fn a_conflict_hand_off_touches_no_merge_state() {
     }
 }
 
-/// The settle skip passes the run loop's own count of API calls, and skips by
-/// recording the Result and reading on. A literal there would skip a real, empty
-/// answer to our prompt and strand the turn at `running`.
 #[test]
 fn the_settle_skip_is_decided_by_the_api_call_count() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -727,9 +612,6 @@ fn the_settle_skip_is_decided_by_the_api_call_count() {
     assert!(arm.contains("continue 'event_loop;"));
 }
 
-/// Past the hung-tool ceiling the in-loop watchdog fires only when the thread
-/// is still `running`. A pending question card counts as a tool in flight, and
-/// the user may take as long as they like to answer it.
 #[test]
 fn the_ceiling_fire_re_checks_that_the_thread_is_running() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -750,8 +632,6 @@ fn the_ceiling_fire_re_checks_that_the_thread_is_running() {
     );
 }
 
-/// An external terminal that already landed is skipped by the safety net, the
-/// same as a naturally closed turn. A second terminal relabels a closed turn.
 #[test]
 fn the_safety_net_skip_emits_nothing() {
     const COMPLETION_SRC: &str = include_str!("../run_session/completion.rs");

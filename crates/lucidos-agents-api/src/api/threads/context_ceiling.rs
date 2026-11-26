@@ -1,8 +1,3 @@
-//! `PUT /api/v1/threads/:thread_id/context-ceiling`: set a thread's *context
-//! ceiling* (ADR 0629), `{"ceiling": "200k"}`. It records `ContextCeilingSet`
-//! under the caller and answers the ceiling now in force. The engine decides
-//! who may set what (`context_ceiling::set_ceiling`).
-
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
     http::{HeaderMap, StatusCode},
@@ -27,8 +22,6 @@ pub(in crate::api) struct ContextCeilingResponse {
     ceiling: ContextCeiling,
 }
 
-/// Who a request sets a ceiling as: an agent, from the thread its origin
-/// token names, or a person.
 pub(in crate::api) fn ceiling_setter(headers: &HeaderMap) -> CeilingSetter {
     let origin = crate::api::actor::user_actor(headers, None);
     if !super::super::intelligence_ladder::is_agent_caller(headers, origin.as_ref()) {
@@ -49,7 +42,6 @@ fn forbidden(refusal: CeilingRefusal) -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, refusal.message).with_reason(refusal.reason)
 }
 
-/// Refuse a trigger ceiling the caller may not write, for the trigger routes.
 pub(in crate::api) async fn refuse_agent_trigger_raise(
     state: &AppState,
     headers: &HeaderMap,
@@ -103,8 +95,6 @@ mod tests {
         HEADER_DEVICE_ID,
     };
 
-    /// Both ceiling routes ask this who calls: a person may raise and
-    /// withdraw, an agent may not (ADR 0629).
     #[test]
     fn a_subprocess_sets_as_an_agent_and_a_device_as_a_person() {
         init_agent_origin_secret("context-ceiling-test-secret".to_string());

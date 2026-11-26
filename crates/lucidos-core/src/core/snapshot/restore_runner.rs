@@ -1,4 +1,4 @@
-//! Offline runner preparation. Retain Session (and both locks) across all steps.
+//! INVARIANT: Offline runner preparation. Retain Session (and both locks) across all steps.
 use super::Session;
 use crate::core::snapshot::{
     file_swap::{FileSwap, FrozenPolicy},
@@ -9,7 +9,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 impl Session {
-    /// Read-only admission checks while the engine still owns the workspace.
+    /// INVARIANT: Read-only admission checks while the engine still owns the workspace.
     /// The offline worker repeats them after shutdown to close the mutation race.
     pub fn preflight_restore(
         &self,
@@ -49,7 +49,7 @@ impl Session {
             .map_err(|_| "snapshot_restore_admission_failed".into())
     }
 
-    /// Settle an admitted restore the gateway provably never took. A lost
+    /// INVARIANT: Settle an admitted restore the gateway provably never took. A lost
     /// delivery must not call this: the offline run may already own the journal.
     pub fn refuse_restore(&self, restore_id: Uuid) -> Result<(), BoxError> {
         let mut journal = self.restore_journal(restore_id)?;
@@ -57,7 +57,6 @@ impl Session {
         self.store.save_journal(&journal)
     }
 
-    /// Enable the offline command's machine-readable, fixed-vocabulary protocol.
     pub fn with_restore_reporting(mut self) -> Self {
         self.report_restore = true;
         self
@@ -65,10 +64,8 @@ impl Session {
 
     fn report(&self, phase: &'static str) {
         if self.report_restore {
-            // CLI protocol consumed by the gateway. Never format errors, paths,
-            // caller labels, database URLs or credentials into these lines.
             use std::io::Write;
-            // A disconnected observer cannot cancel a restore. The external
+            // INVARIANT: A disconnected observer cannot cancel a restore. The external
             // journal is authoritative; a broken output pipe is unrecoverable.
             let _ = writeln!(std::io::stdout().lock(), "{phase}");
         }
@@ -82,10 +79,6 @@ impl Session {
         Ok(())
     }
 
-    /// Prepare either forward installation or recovery with the same durable
-    /// preservation policy. No live file or database mutation occurs here.
-    /// On return, every retained staging/trash root has been fsynced into the
-    /// external journal. Only the offline runner may use the returned swap.
     pub fn prepare_restore_files(
         &self,
         restore_id: Uuid,
@@ -108,8 +101,6 @@ impl Session {
             .recovery
             .as_ref()
             .ok_or("snapshot recovery missing")?;
-        // Refuse changed recovery identity even if the caller supplied a valid
-        // but unrelated recovery handle.
         let recovery_manifest = self.store.get(recovery, &self.key)?;
         if recovery_manifest.restore_id != Some(restore_id)
             || recovery_manifest.kind != crate::core::snapshot::manifest::Kind::Recovery
@@ -124,7 +115,7 @@ impl Session {
                 policy: FrozenPolicy::capture(workspace)?,
                 staging_roots: Vec::new(),
             });
-            // Persist before even preparing replacement files. A crash never
+            // INVARIANT: Persist before even preparing replacement files. A crash never
             // falls back to the archive's .backupignore during rollback.
             self.store.save_journal(&journal)?;
         }
@@ -170,7 +161,7 @@ impl Session {
 }
 
 impl Session {
-    /// Offline entry point. `gateway_slug` must come from the gateway registry,
+    /// INVARIANT: Offline entry point. `gateway_slug` must come from the gateway registry,
     /// whose workspace path and database binding the caller has already checked.
     /// An owned task retains the engine owner lock through recovery capture and
     /// installation, even when the requesting task is canceled.
@@ -183,6 +174,7 @@ impl Session {
     ) -> Result<(), BoxError> {
         let pool = pool.clone();
         let database_url = database_url.to_owned();
+        let secret = database_url.clone();
         let workspace = workspace.to_owned();
         let super::OfflineRestoreRequest {
             restore_id,
@@ -218,7 +210,6 @@ impl Session {
                 let manifest = worker.store.get(&journal.snapshot, &worker.key)?;
                 worker.preflight_restore_contract(&url, &manifest)?;
                 worker.check(&journal.snapshot, &url)?;
-                // Refuse unsafe filesystem bindings before creating recovery.
                 FrozenPolicy::capture(&target)?;
                 let current = crate::core::backup::snapshot_file_estimate(&target)?;
                 let expanded = super::super::database_capacity::expanded_dump_bytes(
@@ -266,7 +257,7 @@ impl Session {
             })
             .await
             .map_err(|_| "snapshot_restore_worker_failed")?;
-            // Keep the owner lock across the restricted boot, including rollback.
+            // INVARIANT: Keep the owner lock across the restricted boot, including rollback.
             let _owner = owner;
             if !matches!(
                 self.restore_journal(restore_id)?.phase(),
@@ -341,12 +332,17 @@ impl Session {
             } else {
                 self.report("files-restored");
             }
-            // Forward boot stays blocked until restored-log settlement is wired.
             installed
         })
         .await
         .map_err(|_| "snapshot_restore_worker_failed")?
-        .map_err(|_| "snapshot_restore_failed".into())
+        .map_err(|cause| {
+            crate::log_legacy!(
+                "[Snapshot] restore failed: {}",
+                cause.to_string().replace(&secret, "<database-url>")
+            );
+            "snapshot_restore_failed".into()
+        })
     }
 
     fn install_restore_inner(
@@ -376,7 +372,6 @@ impl Session {
         self.preflight_restore_contract(database_url, &recovery_manifest)?;
         self.report("staging");
         let swap = self.prepare_restore_files(restore_id, workspace)?;
-        // Preparation has appended retained roots and the frozen policy.
         journal = self.restore_journal(restore_id)?;
         crate::core::snapshot::worktree_exemptions::preserve(self.store.root(), workspace)?;
         journal.advance(Phase::DbRestore)?;
@@ -401,7 +396,7 @@ impl Session {
             self.store.save_journal(&journal)
         })();
         if result.is_err() {
-            // Even an uncertain transaction outcome must replay recovery; never
+            // INVARIANT: Even an uncertain transaction outcome must replay recovery; never
             // mark unchanged merely because pg_restore reported failure.
             self.rollback_restore_inner(restore_id, workspace, database_url)?;
             return Err("snapshot_restore_rolled_back".into());
@@ -409,8 +404,6 @@ impl Session {
         Ok(())
     }
 
-    /// Settle interrupted preparation without replay; a possibly committed
-    /// installation always restores the verified recovery snapshot instead.
     pub async fn reconcile_interrupted_restore(
         self: std::sync::Arc<Self>,
         restore_id: Uuid,
@@ -447,15 +440,13 @@ impl Session {
         .await
         .map_err(|_| "snapshot_restore_worker_failed")??;
         if rollback {
-            // The durable mutation phase still blocks every normal engine boot
-            // while rollback acquires the owner lock for the complete replay.
             self.rollback_restore(restore_id, workspace, database_url)
                 .await?;
         }
         Ok(())
     }
 
-    /// Gateway crash recovery uses this same path. It never recaptures policy
+    /// INVARIANT: Gateway crash recovery uses this same path. It never recaptures policy
     /// or recovery from a partly restored workspace.
     pub async fn rollback_restore(
         self: std::sync::Arc<Self>,
@@ -527,9 +518,9 @@ impl Session {
             super::super::first_boot::remove_marker(workspace)?;
             Ok::<_, BoxError>(())
         })();
-        // Re-read roots added by rollback preparation before saving status.
+        // INVARIANT: Re-read roots added by rollback preparation before saving status.
         journal = self.restore_journal(restore_id)?;
-        // Access staging still needs restricted boot verification. Keep the engine blocked
+        // INVARIANT: Access staging still needs restricted boot verification. Keep the engine blocked
         // until that step verifies equality; do not claim RolledBack here.
         if result.is_err() {
             journal.advance(Phase::NeedsAttention)?;

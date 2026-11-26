@@ -16,7 +16,6 @@ fn since(last_input: LastInput) -> SinceLastInput {
     }
 }
 
-/// The reply the user typed into a card in the incident.
 const TYPED_REPLY: &str = "I need site publisher to be readable on mobike";
 
 fn typed() -> LastInput {
@@ -27,7 +26,6 @@ fn message() -> LastInput {
     LastInput::Message("what is in the next release?".to_string())
 }
 
-/// The refusal for owing words when there is no input text to quote.
 fn card_refusal() -> String {
     Refusal::OwesWords {
         input: LastInput::None,
@@ -36,7 +34,6 @@ fn card_refusal() -> String {
     .text()
 }
 
-/// A card that points "above".
 const POINTS_ABOVE: &str = "Go with the copy above?";
 
 fn points_above(questions: &serde_json::Value) -> bool {
@@ -47,12 +44,6 @@ fn owes_words(s: SinceLastInput) -> bool {
     matches!(should_refuse(&s, ""), Some(Refusal::OwesWords { .. }))
 }
 
-// ---------------------------------------------------------------------------
-// The decision
-// ---------------------------------------------------------------------------
-
-/// A typed answer may answer the card, ask back or say something else. So
-/// the agent may ask its question again at once, as after any message.
 #[test]
 fn a_re_ask_right_after_a_typed_answer_passes() {
     assert_eq!(should_refuse(&since(typed()), ""), None);
@@ -60,8 +51,6 @@ fn a_re_ask_right_after_a_typed_answer_passes() {
 
 #[test]
 fn a_card_after_unreported_tool_work_is_refused() {
-    // The chat case: asked what the next release holds, the agent ran git log
-    // and raised "How do you want to continue?".
     for input in [message(), LastInput::Picked, LastInput::None] {
         assert!(owes_words(SinceLastInput {
             unreported_tool_calls: 2,
@@ -82,7 +71,6 @@ fn a_pick_followed_at_once_by_the_next_card_passes() {
 
 #[test]
 fn a_preamble_does_not_report_the_work_after_it() {
-    // "Let me check the log", then git log, then a card: the log went unreported.
     assert!(owes_words(SinceLastInput {
         words: "Let me check the log.".to_string(),
         unreported_tool_calls: 1,
@@ -132,19 +120,12 @@ fn the_refusal_starts_with_the_marker_and_offers_the_escape() {
     assert!(!card_refusal().contains('\u{2014}'));
 }
 
-/// The refusal asks for prose and never blames hidden reasoning.
 #[test]
 fn the_refusal_asks_for_prose() {
     assert!(card_refusal().contains("plain prose"));
     assert!(!card_refusal().contains("hidden reasoning"));
 }
 
-// ---------------------------------------------------------------------------
-// A card that points "above" at nothing
-// ---------------------------------------------------------------------------
-
-/// The note Claude Code showed in the incident, 224 characters. The copy the
-/// card pointed at stayed in the agent's reasoning.
 const INCIDENT_NOTE: &str = "I'll rework the card options into user-facing language: \"Keep it \
      plain,\" \"Technical,\" and \"I write software,\" keeping the precise agent-facing \
      instructions separate. The structural question still needs to be resolved next.";
@@ -183,8 +164,6 @@ fn a_card_pointing_above_at_a_note_is_refused() {
 
 #[test]
 fn a_card_pointing_above_after_nothing_at_all_is_refused() {
-    // The chat case: "You use the message above", with no words since the
-    // user's message. A picked answer owes no words, so only this rule fires.
     let s = SinceLastInput {
         words: String::new(),
         ..since(LastInput::Picked)
@@ -302,8 +281,6 @@ fn the_points_above_refusal_quotes_what_the_user_saw() {
 
 #[test]
 fn a_chat_round_that_spoke_owes_nothing() {
-    // Tool work, then this round's words, which are not persisted yet. The
-    // words report the work, just as skipping the gate used to.
     let s = SinceLastInput {
         unreported_tool_calls: 3,
         ..since(typed())
@@ -331,7 +308,6 @@ fn a_persisted_round_is_not_counted_twice() {
     .with_round_text(INCIDENT_NOTE);
     assert_eq!(s.words, format!("Earlier. {INCIDENT_NOTE}"));
 
-    // Only a prefix of the round reached the events: the overlap counts once.
     let (saved, _) = INCIDENT_NOTE.split_at(100);
     let partly = SinceLastInput {
         words: format!("Earlier. {saved}"),
@@ -340,7 +316,6 @@ fn a_persisted_round_is_not_counted_twice() {
     .with_round_text(INCIDENT_NOTE);
     assert_eq!(partly.words, format!("Earlier. {INCIDENT_NOTE}"));
 
-    // Nothing of the round is saved yet: it is appended whole.
     let unsaved = SinceLastInput {
         words: "Earlier. ".to_string(),
         ..since(message())
@@ -357,20 +332,13 @@ fn a_persisted_round_is_not_counted_twice() {
     assert_eq!(blank.unreported_tool_calls, 1, "blank text reports nothing");
 }
 
-// ---------------------------------------------------------------------------
-// A re-ask after a typed answer and a progress note
-// ---------------------------------------------------------------------------
-
-/// The incident: the user typed a correction into a card instead of picking.
 const CORRECTION: &str = "2. Sry ignored was wrong i mean theres no one to tell it to. I just \
      post into the void";
 
-/// The progress note the chat agent showed before it asked again.
 const BORROW_NOTE: &str = "Since you lack an audience, borrowing one is the path forward: get \
      the principal engineer/CTO to post about it, pitch an engineering blog post, lean on \
      Shorts' algorithmic reach, and reply to big accounts.";
 
-/// The card it asked again, which points nowhere.
 const DRAFT_EITHER: &str = "Want me to draft either of these?";
 
 #[test]
@@ -405,7 +373,6 @@ fn a_long_reply_is_quoted_cut_and_on_one_line() {
 
     let short = "ok \n then";
     assert_eq!(quote(short), "ok then");
-    // Cutting counts characters, so a multi-byte reply never splits a char.
     let wide = "\u{e6}".repeat(QUOTED_INPUT_CHARS + 1);
     assert_eq!(
         quote(&wide),
@@ -436,7 +403,6 @@ fn owing_words_quotes_the_input_it_means() {
     assert!(after_message.contains("this message: \"what is in the next release?\""));
     assert!(after_message.contains(NOTHING_NEW));
 
-    // Nothing to quote: no claim about an input at all.
     for input in [
         LastInput::Picked,
         LastInput::None,
@@ -476,14 +442,8 @@ fn a_refusal_carries_the_input_it_was_decided_on() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A card after a picture nobody saw
-// ---------------------------------------------------------------------------
-
 const MOCKUP: &str = "artifacts/mockups/status-timestamp-dot.png";
 
-/// The summary Claude Code showed in the incident, in place of a reply that
-/// held the picture.
 const INCIDENT_SUMMARY: &str = "I've generated a mockup comparing today's status line to the \
      proposed one, showing how the dot is replaced by icons or omitted on two-line layouts.";
 
@@ -543,8 +503,6 @@ fn a_picture_in_the_words_passes_in_every_form_the_renderer_takes() {
     }
 }
 
-/// `lucidos data write` prints the picture line with an image size hint, and
-/// the agent pastes it as printed.
 #[test]
 fn a_picture_carrying_a_size_hint_passes() {
     for shown in [
@@ -593,8 +551,6 @@ fn a_picture_refusal_is_sent_once_per_input() {
     assert_eq!(should_refuse(&s, ""), None);
 }
 
-/// The third incident: the card showed the picture, a refusal for owing
-/// words followed, and the agent's retry dropped the picture.
 #[test]
 fn a_retry_that_drops_a_picture_is_refused_after_another_refusal() {
     let s = SinceLastInput {
@@ -616,8 +572,6 @@ fn a_retry_that_drops_a_picture_is_refused_after_another_refusal() {
     );
 }
 
-/// The first refusal for an input goes to the picture. Spent on owing words,
-/// it let the retry through without the picture: the second incident.
 #[test]
 fn a_missing_picture_comes_before_owing_words() {
     for s in [
@@ -657,13 +611,10 @@ fn the_artifact_refusal_names_the_path_and_the_card() {
     assert!(text.contains(&format!("`{MOCKUP}`, `artifacts/b.png`")));
     assert!(text.contains("they have read nothing from you"));
     assert!(text.contains("ON the card"));
-    // Claude Code's tool has `preview`, the chat agent's has a description,
-    // and Codex's has neither, so it falls back to the question.
     assert!(text.contains("its `preview` or description, whichever your tool has"));
     assert!(text.contains("its own picture of only that option"));
     assert!(text.contains("`[...](...)` link to any other file"));
     assert!(text.contains("an option shows a link as plain text"));
-    // It outranks owing words, so it carries both of that refusal's asks.
     assert!(text.contains("answer it in plain prose"));
     assert!(text.contains("say what you found"));
     assert!(text.contains("unchanged"));
@@ -698,14 +649,8 @@ fn only_picture_extensions_need_the_image_form() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// A card after a page nobody linked
-// ---------------------------------------------------------------------------
-
 const EXPLAINER: &str = "artifacts/tree-memory-corrections.html";
 
-/// The summary Claude Code showed in the incident, in place of a reply that
-/// held the link to the explainer.
 const EXPLAINER_SUMMARY: &str = "I've put together a one-page overview covering the log and \
      tree approach, plus two glossary definitions included below.";
 
@@ -721,7 +666,6 @@ fn explainer_link() -> String {
     format!("[tree-memory-corrections.html]({EXPLAINER})")
 }
 
-/// The incident's card. `question_link` and `preview` go where named.
 fn glossary_card(question_link: &str, preview: Option<&str>) -> serde_json::Value {
     json!([{
         "question": format!("Add this entry to docs/glossary.md?\n\n**Workspace anchor**: a line in a thread memory view.\n{question_link}"),
@@ -760,7 +704,6 @@ fn a_page_linked_in_the_words_or_the_question_passes() {
     );
 }
 
-/// An option renders inside a button, which shows a link as its label alone.
 #[test]
 fn a_page_linked_only_in_an_option_is_refused() {
     let link = explainer_link();
@@ -781,7 +724,6 @@ fn an_option_keeps_its_pictures_and_loses_its_link_targets() {
     assert_eq!(without_link_targets("no markdown"), "no markdown");
 }
 
-/// Markdown ends a bare target at a space, so only the bracketed form opens.
 #[test]
 fn a_page_with_a_space_needs_the_bracketed_link() {
     let s = |words: &str| SinceLastInput {
@@ -814,12 +756,6 @@ fn a_bare_path_or_an_image_line_does_not_link_a_page() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// A card whose question carries the report
-// ---------------------------------------------------------------------------
-
-/// A card question in the incident's shape: the findings, the picture, then
-/// the decision. The agent had saved the picture, then asked.
 fn reporting_card(picture: &str) -> serde_json::Value {
     let findings = "- The hold opens a different menu from each button. ".repeat(10);
     json!([{
@@ -835,7 +771,6 @@ fn reporting_card(picture: &str) -> serde_json::Value {
     }])
 }
 
-/// What the gate decides for `questions`, as `refuse_card` folds it.
 fn decide(s: SinceLastInput, questions: &serde_json::Value) -> Option<Refusal> {
     should_refuse(
         &s.with_card_question(&longest_card_question(questions)),
@@ -843,8 +778,6 @@ fn decide(s: SinceLastInput, questions: &serde_json::Value) -> Option<Refusal> {
     )
 }
 
-/// The incident: the card held the findings and the picture, and a refusal
-/// for owing words made the agent re-send it without either.
 #[test]
 fn a_card_whose_question_carries_the_report_owes_no_words() {
     let card = reporting_card(MOCKUP);
@@ -902,8 +835,6 @@ fn a_short_card_question_does_not_report_the_work() {
     ));
 }
 
-/// The first incident's card: "How do you want to continue?", with the
-/// answer only in the option text.
 #[test]
 fn a_report_only_in_the_options_does_not_count() {
     let long = "The release holds two fixes and a new setting. ".repeat(15);
@@ -930,10 +861,6 @@ fn a_reporting_card_still_needs_the_picture() {
         })
     );
 }
-
-// ---------------------------------------------------------------------------
-// The query, against the event shapes the agents actually write
-// ---------------------------------------------------------------------------
 
 async fn insert(pool: &PgPool, thread_id: Uuid, event_type: &str, payload: serde_json::Value) {
     sqlx::query(
@@ -979,8 +906,6 @@ async fn answered(pool: &PgPool, thread_id: Uuid, answer: serde_json::Value) {
     .await;
 }
 
-/// `lucidos ask-permission` tells the agent to ask at once, and the engine
-/// writes the card that names the act. Refusing it contradicts the CLI.
 #[tokio::test]
 async fn a_permission_request_card_passes_right_after_its_ask() {
     let (pool, db) = setup_test_db().await;
@@ -1018,7 +943,6 @@ async fn a_permission_request_card_passes_right_after_its_ask() {
 async fn the_query_reads_what_each_agent_writes() {
     let (pool, db) = setup_test_db().await;
 
-    // Claude Code: a typed reply to a card, then only blank text.
     let t = Uuid::new_v4();
     insert(
         &pool,
@@ -1055,7 +979,6 @@ async fn the_query_reads_what_each_agent_writes() {
         "blank text reports no work, and the refusal quotes the typed text"
     );
 
-    // The refusal comes back as a tool result, so the re-sent card passes.
     insert(
         &pool,
         t,
@@ -1070,7 +993,6 @@ async fn the_query_reads_what_each_agent_writes() {
         "refused once per input"
     );
 
-    // Chat: a message, tool work, no text.
     let c = Uuid::new_v4();
     insert(
         &pool,
@@ -1127,7 +1049,6 @@ async fn the_query_reads_what_each_agent_writes() {
         "work after the words is unreported"
     );
 
-    // A pick, then the next card at once.
     let p = Uuid::new_v4();
     insert(
         &pool,
@@ -1146,7 +1067,6 @@ async fn the_query_reads_what_each_agent_writes() {
         .await
         .is_none());
 
-    // A card already shown is a crash-recovery re-POST and always passes.
     insert(
         &pool,
         t,
@@ -1163,9 +1083,6 @@ async fn the_query_reads_what_each_agent_writes() {
     teardown_test_db(&db).await;
 }
 
-/// Coding-agent results are stored whole, so a long grep over the gate's own
-/// source can quote the marker far into its output. Only the start of a result
-/// may stand for "already refused".
 #[tokio::test]
 async fn a_result_quoting_the_marker_deep_in_its_output_is_not_a_refusal() {
     let (pool, db) = setup_test_db().await;
@@ -1198,8 +1115,6 @@ async fn a_result_quoting_the_marker_deep_in_its_output_is_not_a_refusal() {
     teardown_test_db(&db).await;
 }
 
-/// Codex returns the refusal as an MCP result, which its driver stores as the
-/// result's JSON. The marker then sits inside the wrapper, and still counts.
 #[tokio::test]
 async fn a_codex_refusal_in_its_mcp_wrapper_counts() {
     let (pool, db) = setup_test_db().await;
@@ -1233,8 +1148,6 @@ async fn a_codex_refusal_in_its_mcp_wrapper_counts() {
     teardown_test_db(&db).await;
 }
 
-/// The incident end to end: the words since the typed reply are read back
-/// from the events, joined in order, and quoted in the refusal.
 #[tokio::test]
 async fn the_query_reads_the_words_a_card_points_above_at() {
     let (pool, db) = setup_test_db().await;
@@ -1281,8 +1194,6 @@ async fn the_query_reads_the_words_a_card_points_above_at() {
     teardown_test_db(&db).await;
 }
 
-/// The `DataFileWritten` shape `PUT /api/v1/data` emits: no thread_id, the
-/// saving thread in the actor.
 async fn data_file_written(pool: &PgPool, saved_by: Uuid, path: &str) {
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id) \
@@ -1302,7 +1213,6 @@ async fn data_file_written(pool: &PgPool, saved_by: Uuid, path: &str) {
     .expect("insert DataFileWritten");
 }
 
-/// The incident end to end, with a decoy for each save that must not count.
 #[tokio::test]
 async fn the_query_finds_the_artifacts_this_thread_saved_since_the_input() {
     let (pool, db) = setup_test_db().await;
@@ -1379,8 +1289,6 @@ async fn the_query_finds_the_artifacts_this_thread_saved_since_the_input() {
     teardown_test_db(&db).await;
 }
 
-/// The second incident: the user typed a complaint into a card, the agent
-/// rendered a mockup with tool work it never reported, then asked again.
 #[tokio::test]
 async fn a_rendered_mockup_after_a_typed_reply_gets_the_picture_refusal() {
     let (pool, db) = setup_test_db().await;
@@ -1417,8 +1325,6 @@ async fn a_rendered_mockup_after_a_typed_reply_gets_the_picture_refusal() {
     teardown_test_db(&db).await;
 }
 
-/// The third incident end to end: a short note, the save, then a card whose
-/// question held the findings and the picture.
 #[tokio::test]
 async fn the_query_passes_a_card_that_carries_its_report() {
     let (pool, db) = setup_test_db().await;
@@ -1447,8 +1353,6 @@ async fn the_query_passes_a_card_that_carries_its_report() {
     teardown_test_db(&db).await;
 }
 
-/// After a refusal for owing words, the retry dropped the picture the first
-/// card showed. It gets one more refusal, and only one.
 #[tokio::test]
 async fn the_query_refuses_a_retry_that_drops_the_picture_once() {
     let (pool, db) = setup_test_db().await;
@@ -1533,12 +1437,6 @@ async fn a_query_error_shows_the_card() {
     teardown_test_db(&db).await;
 }
 
-// ---------------------------------------------------------------------------
-// A card that carries its own answer in `message`
-// ---------------------------------------------------------------------------
-
-/// The steps the incident's agent drafted and never showed, short enough to
-/// be note-sized.
 const CARD_MESSAGE: &str = "1. Open Web Analytics and press **Manage site**.\n\
      2. Change the setup choice to **Enable**.\n3. Save.";
 
@@ -1605,7 +1503,6 @@ fn every_refusal_names_the_message_field() {
     }
 }
 
-/// Every refusal built over `words`, one per reason.
 fn refusals_over(words: &str) -> Vec<Refusal> {
     vec![
         Refusal::OwesWords {
@@ -1622,7 +1519,6 @@ fn refusals_over(words: &str) -> Vec<Refusal> {
     ]
 }
 
-/// The incident: the agent trusted its own context over the user's screen.
 #[test]
 fn every_refusal_quotes_what_the_user_read() {
     for refusal in refusals_over(INCIDENT_NOTE) {
@@ -1702,18 +1598,11 @@ fn the_decision_hands_the_refusal_what_the_user_read() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A card after a progress note
-// ---------------------------------------------------------------------------
-
-/// The incident's only visible text: the provider's summary of the steps the
-/// agent wrote before its card. The steps never reached the user.
 const SUMMARY_NOTE: &str = "I've laid out the cancellation steps and what it affects here: \
      coding agents keep working fine since they already run on Vertex, but you'd lose access \
      to Fable 5/5.1 and the \"Anthropic sub\" button in the provider app would start \
      failing after the paid period ends.";
 
-/// The incident's card, which carried no `message`.
 fn cancellation_card() -> serde_json::Value {
     json!([{
         "question": "Should I record the cancellation, so no thread or trigger switches to \
@@ -1730,7 +1619,6 @@ fn cancel_message() -> LastInput {
     LastInput::Message("i need to cancel my anthropic sub, what do i do".to_string())
 }
 
-/// The incident round: tool work, then the summary as the round's only text.
 fn after_summary() -> SinceLastInput {
     SinceLastInput {
         unreported_tool_calls: 2,
@@ -1742,7 +1630,6 @@ fn after_summary() -> SinceLastInput {
     })
 }
 
-/// Prose after the note is a reply the user read in full, so the card passes.
 #[test]
 fn text_after_a_progress_note_passes() {
     let text = format!("{SUMMARY_NOTE}\nCancel at Settings > Billing.");
@@ -1765,9 +1652,6 @@ fn the_incident_card_after_a_progress_note_is_refused() {
     );
 }
 
-/// The same words as plain text are a real reply, so the length rule and
-/// the new rule both leave the card alone. This is why the old gate missed
-/// the incident: only the block type tells the two apart.
 #[test]
 fn the_same_words_as_text_pass() {
     let s = SinceLastInput {
@@ -1793,8 +1677,6 @@ fn a_second_card_after_a_progress_note_passes() {
     assert_eq!(should_refuse(&s, &card_text(&cancellation_card())), None);
 }
 
-/// An unseen artifact still outranks the note: its refusal is the one a
-/// retry could otherwise drop a picture past.
 #[test]
 fn an_unseen_artifact_outranks_a_progress_note() {
     let s = SinceLastInput {
@@ -1850,7 +1732,6 @@ async fn the_query_reads_a_claude_code_progress_note() {
         "a progress note as the last words refuses the card"
     );
 
-    // A sub-agent's narration is not the session's reply, so it hides nothing.
     insert(
         &pool,
         t,
@@ -1866,7 +1747,6 @@ async fn the_query_reads_a_claude_code_progress_note() {
         "sub-agent text after the note leaves it the last thing the user read"
     );
 
-    // Prose written after the note is what the user read last.
     cc_text(&pool, t, "\n\nThe overview covers the three phases.").await;
     assert!(
         refuse_card(&pool, t, "toolu_card", &cancellation_card(), None, None)
@@ -1878,10 +1758,6 @@ async fn the_query_reads_a_claude_code_progress_note() {
     teardown_test_db(&db).await;
 }
 
-/// Invariant I11: a coding agent's second look runs only once the session loop
-/// has persisted the text written before the card. The hook arrives first, the
-/// first look refuses, and the gate waits for the loop's signal rather than a
-/// clock. The text lands, the signal fires, and the card passes.
 #[tokio::test]
 async fn the_second_look_waits_for_the_loop_to_persist_the_text() {
     let (pool, db) = setup_test_db().await;
@@ -1924,10 +1800,6 @@ async fn the_second_look_waits_for_the_loop_to_persist_the_text() {
     teardown_test_db(&db).await;
 }
 
-/// A hook carries the agent's own tool use id, so it waits for that one. An
-/// MCP ask carries an id the stream never sees, so the session's n-th ask
-/// waits for its n-th MCP question tool use. Every ask takes its ordinal,
-/// waiting or not, so an earlier card never answers a later one.
 #[tokio::test]
 async fn a_card_waits_for_its_own_question_tool_use() {
     use crate::runtime::{
@@ -1958,10 +1830,8 @@ async fn a_card_waits_for_its_own_question_tool_use() {
     );
     hook.await.expect("hook gate");
 
-    // The first MCP card passed its first look and never waited.
     assert_eq!(flushes.ask("codex-q-1"), CardAsk::McpAsk(1));
     flushes.flushed("item_1", MCP, &question("Ship it?"));
-    // The second arrives before the loop flushed its tool use.
     let second = wait(flushes.ask("codex-q-2"));
     tokio::task::yield_now().await;
     assert!(
@@ -1982,8 +1852,6 @@ async fn a_card_waits_for_its_own_question_tool_use() {
     last.await.expect("an ended loop releases every waiter");
 }
 
-/// The MCP ask tool mints the ids [`QuestionFlushes::ask`] counts as MCP
-/// asks. This pins the wire contract between the CLI and the engine.
 #[test]
 fn the_mcp_ask_tool_mints_the_prefix_the_gate_counts() {
     let cli = include_str!("../../../lucidos-cli/src/mcp_permission_server.rs");

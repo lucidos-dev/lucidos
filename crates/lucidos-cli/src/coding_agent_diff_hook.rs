@@ -1,9 +1,3 @@
-//! Git post-commit hook callback for coding-agent worktrees.
-//!
-//! The installed shell hook calls this after each commit. It is intentionally
-//! silent and safe to run outside Lucidos-spawned processes: without
-//! `LUCIDOS_THREAD_ID`, it no-ops so terminal users are not affected.
-
 use std::time::Instant;
 
 use serde::Serialize;

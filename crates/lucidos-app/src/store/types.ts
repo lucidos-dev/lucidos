@@ -666,6 +666,8 @@ export interface PluginInstallRequest {
   manifest: Record<string, unknown>;
   files: string[];
   overwrites: string[];
+  hooks?: { slug: string; name: string; event_type: string }[];
+  hook_confirmation_required?: boolean;
   removes?: string[];
   is_update?: boolean;
   setup?: string | null;

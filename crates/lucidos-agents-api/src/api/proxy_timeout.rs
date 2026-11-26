@@ -1,27 +1,13 @@
-//! How long the proxy waits on one upstream request.
-//!
-//! Two layers decide it, in this order: an `apis.json` entry's own
-//! `timeout_secs`, then the workspace preference [`prefs::PROXY_TIMEOUT_SECS`],
-//! then that preference's catalog default. The builtin model providers have no
-//! entry, so the preference is their only knob. See ADR 0277.
-//!
-//! The wait applies per upstream request, so a redirect hop and the one 401
-//! retry each start their own. [`CallBudget`] caps the whole proxied call at
-//! [`MAX_SECS`], which is what lets a client wait a fixed time and never cut
-//! first. At the catalog default the cap never binds for ten requests.
-
 use crate::core::prefs;
 use crate::core::proxy_timeout_bounds::{MAX_SECS, MIN_SECS};
 use axum::http::StatusCode;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// The wait when nothing is configured: the catalog default.
 pub(crate) fn default_wait() -> Duration {
     Duration::from_secs_f64(prefs::PROXY_TIMEOUT_SECS.default_number())
 }
 
-/// Why `secs` is not a usable wait for `field`, if it is not.
 pub(crate) fn range_rejection(field: &str, secs: f64) -> Option<String> {
     if secs.is_finite() && secs >= MIN_SECS as f64 && secs <= MAX_SECS as f64 {
         return None;
@@ -55,8 +41,6 @@ pub(crate) fn effective(
     }
 }
 
-/// The waits one proxied call may spend: each upstream request up to
-/// `per_request`, and all of them together up to a fixed cap.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CallBudget {
     per_request: Duration,
@@ -64,7 +48,6 @@ pub(crate) struct CallBudget {
 }
 
 impl CallBudget {
-    /// A budget starting now, capped at [`MAX_SECS`] for the whole call.
     pub(crate) fn start(per_request: Duration) -> Self {
         Self::with_cap(per_request, Duration::from_secs(MAX_SECS))
     }
@@ -76,14 +59,11 @@ impl CallBudget {
         }
     }
 
-    /// What is left of the whole call, or `None` once it is out of time.
     pub(crate) fn time_left(&self) -> Option<Duration> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         (!left.is_zero()).then_some(left)
     }
 
-    /// The wait for the next upstream request, or `None` once the call is
-    /// out of time.
     pub(crate) fn next_request(&self) -> Option<Duration> {
         self.time_left().map(|left| left.min(self.per_request))
     }
@@ -210,8 +190,6 @@ mod tests {
 
     mod guard_tests {
 
-        /// `lucidos proxy` cannot import this crate, so it carries
-        /// [`CLIENT_WAIT_SECS`] as a literal and this test pins it.
         #[test]
         fn the_cli_waits_the_client_wait() {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

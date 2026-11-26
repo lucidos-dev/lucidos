@@ -43,7 +43,6 @@ fn parse_ignores_legacy_domains_and_keywords() {
     let text = "---\nname: Panasonic\ndomains:\n  - heatpump\n  - panasonic\n---\n# Heatpump API\nControls heatpumps.";
     let (name, description, _) = parse_frontmatter(text).unwrap();
     assert_eq!(name, "Panasonic");
-    // Legacy domains are ignored; description is derived from body
     assert_eq!(description, "Panasonic: Controls heatpumps.");
 }
 
@@ -58,16 +57,12 @@ fn summary_excludes_content() {
     assert!(!json.contains("content"));
 }
 
-/// The ids a listing produced, sorted, so a test states the whole set rather
-/// than sampling it.
 fn listed_ids(summaries: &[KnowhowSummary]) -> Vec<String> {
     let mut ids: Vec<String> = summaries.iter().map(|s| s.id.clone()).collect();
     ids.sort();
     ids
 }
 
-/// A top-level root lists a file at the root and a file one group folder in.
-/// Anything deeper is a reference belonging to a doc, so it takes no row.
 #[test]
 fn top_level_root_lists_files_and_one_group_deep() {
     let tmp = tempfile::tempdir().unwrap();
@@ -93,8 +88,6 @@ fn top_level_root_lists_files_and_one_group_deep() {
     );
 }
 
-/// Listing changed; resolution did not. A reference below the listing depth
-/// loads by its full id, through the plain loader and through the fallback.
 #[test]
 fn a_reference_below_the_listing_depth_still_loads_by_its_full_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -203,8 +196,6 @@ fn dirs_with_triggers(local: &std::path::Path, triggers: &std::path::Path) -> Kn
     }
 }
 
-// --- Task 1: load_merged_summaries ---
-
 #[test]
 fn load_merged_summaries_local_overrides_shared() {
     let tmp = tempfile::tempdir().unwrap();
@@ -253,10 +244,6 @@ fn load_merged_summaries_local_overrides_shared() {
     );
 }
 
-/// The six group-folder docs a live workspace routes to. They are files in the
-/// TOP-LEVEL root, one group folder deep, so the root cannot be tightened to
-/// depth 1 without losing them. Two are named after an app and after the
-/// trigger namespace, and are neither app-scoped nor trigger-scoped.
 #[test]
 fn group_folder_docs_in_the_top_level_root_stay_listed() {
     const DOCS: [&str; 6] = [
@@ -303,8 +290,6 @@ fn load_merged_summaries_shared_none_is_local_only() {
     assert_eq!(summaries[0].id, "test");
 }
 
-// --- load_with_fallback ---
-
 #[test]
 fn load_with_fallback_prefers_local() {
     let tmp = tempfile::tempdir().unwrap();
@@ -344,8 +329,6 @@ fn load_with_fallback_none_when_missing() {
     let kh = KnowhowStore::load_with_fallback(&dirs(None, &local), "missing");
     assert!(kh.is_none());
 }
-
-// --- load_knowhow_sections_merged ---
 
 #[test]
 fn load_knowhow_sections_merged_uses_both_sources() {
@@ -476,13 +459,6 @@ fn load_knowhow_sections_merged_handles_missing_system_dir() {
     );
 }
 
-// --- App-scoped knowhow resolution ---
-//
-// Knowhow ids of the form `<app>/<rest>` (e.g. `finn-jobs/finn-search-workflow`)
-// — surfaced in the system prompt's Know-how list — must resolve against
-// `<workspace>/data/apps/<app>/knowhow/<rest>.md` in addition to the top-level
-// local/shared dirs.
-
 #[test]
 fn load_knowhow_sections_merged_loads_app_scoped_knowhow() {
     let tmp = tempfile::tempdir().unwrap();
@@ -533,8 +509,6 @@ fn load_with_fallback_loads_app_scoped_knowhow() {
     assert_eq!(kh.name, "Foo Bar");
 }
 
-/// An app is already the group, so a folder in its knowhow dir holds one
-/// doc's references. They take no row, and the doc still loads them by id.
 #[test]
 fn app_scoped_root_lists_only_its_own_top_level_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -573,9 +547,6 @@ fn app_scoped_root_lists_only_its_own_top_level_files() {
 
 #[test]
 fn load_with_fallback_prefers_local_over_app_scoped() {
-    // If a top-level knowhow file shares the same id-shape as an app-scoped
-    // one (e.g. local has `foo/bar.md`, apps also has `foo/knowhow/bar.md`),
-    // the bare-id local match wins per the documented lookup order.
     let tmp = tempfile::tempdir().unwrap();
     let local = tmp.path().join("local");
     let apps = tmp.path().join("apps");
@@ -591,15 +562,8 @@ fn load_with_fallback_prefers_local_over_app_scoped() {
     assert_eq!(kh.name, "Local Foo Bar", "local must win over app-scoped");
 }
 
-// app_scoped_knowhow_path is the security boundary — an absolute or
-// backslash-prefixed `rest` segment would let `Path::join("/etc/passwd.md")`
-// replace the apps_dir prefix and escape to the filesystem root. The
-// outer is_safe_id only sees the full id (which doesn't start with `/`),
-// so the splitter has to re-validate `rest`.
-
 #[test]
 fn app_scoped_path_rejects_double_slash_escape() {
-    // `foo//bar` splits to ("foo", "/bar"); `/bar.md` is absolute on Unix.
     let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
     assert!(
         app_scoped_knowhow_path(&apps, "foo//bar").is_none(),
@@ -618,8 +582,6 @@ fn app_scoped_path_rejects_backslash_escape() {
 
 #[test]
 fn app_scoped_path_rejects_traversal_in_rest() {
-    // Caught by the outer is_safe_id (`..` anywhere), but assert the
-    // contract directly so a future refactor doesn't lose this behavior.
     let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
     assert!(app_scoped_knowhow_path(&apps, "foo/../bar").is_none());
 }
@@ -637,9 +599,6 @@ fn knowhow_not_found_body_branches_on_prefix() {
 
 #[test]
 fn is_not_found_body_round_trips_with_knowhow_not_found_body() {
-    // Both branches of knowhow_not_found_body must be detected as
-    // not-found — the load_knowhow handler uses this to gate persistence
-    // into the loaded set.
     assert!(is_not_found_body(&knowhow_not_found_body("any-id")));
     assert!(is_not_found_body(&knowhow_not_found_body(
         "system-knowhow/any-id"
@@ -649,15 +608,11 @@ fn is_not_found_body_round_trips_with_knowhow_not_found_body() {
 #[test]
 fn is_not_found_body_rejects_real_doc_bodies() {
     assert!(!is_not_found_body("just some random doc body"));
-    // A formatted [KNOW-HOW: ...] section is the canonical "real" hit
-    // shape — it must NOT match the not-found sentinel.
     assert!(!is_not_found_body(
         "[KNOW-HOW: Some Doc]\nbody\n[END KNOW-HOW]"
     ));
     assert!(!is_not_found_body(""));
 }
-
-// --- Trigger-scoped resolution via load_with_fallback ---
 
 #[test]
 fn load_with_fallback_resolves_trigger_scoped_id() {
@@ -701,17 +656,11 @@ fn load_with_fallback_returns_none_for_unknown_trigger_id() {
 #[test]
 fn trigger_scoped_path_rejects_traversal() {
     let triggers = std::path::PathBuf::from("/tmp/lucidos-test/triggers");
-    // outer is_safe_id catches `..`
     assert!(trigger_scoped_knowhow_path(&triggers, "triggers/foo/../bar").is_none());
-    // empty slug
     assert!(trigger_scoped_knowhow_path(&triggers, "triggers//bar").is_none());
-    // empty rest
     assert!(trigger_scoped_knowhow_path(&triggers, "triggers/foo/").is_none());
-    // missing prefix
     assert!(trigger_scoped_knowhow_path(&triggers, "foo/bar").is_none());
 }
-
-// --- Per-trigger knowhow summaries ---
 
 #[test]
 fn load_trigger_summaries_reads_files_under_slug_knowhow_dir() {
@@ -738,8 +687,6 @@ fn load_trigger_summaries_reads_files_under_slug_knowhow_dir() {
     assert_eq!(orch.name, "Orchestration");
 }
 
-/// A trigger is already the group, so a folder in its knowhow dir holds one
-/// doc's references. They take no row, and the doc still loads them by id.
 #[test]
 fn trigger_scoped_root_lists_only_its_own_top_level_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -796,15 +743,6 @@ fn app_scoped_path_builds_well_formed_path_for_safe_id() {
 mod guard_tests {
     use super::*;
 
-    /// The setup interview's id, resolved end to end against the REAL shipped
-    /// directory rather than a temp fixture. The other system-knowhow cases here
-    /// prove the prefix machinery works. This one proves that the id the chat
-    /// system prompt hands to `load_knowhow` comes back with a body.
-    ///
-    /// Worth its own case because the entry point is a button, and a user who
-    /// clicks it cannot recover from a miss. Both ways to break it leave the route
-    /// looking fine at the callsite: renaming the file, or breaking its
-    /// frontmatter so `load_summaries` drops it.
     #[test]
     fn shipped_setup_interview_knowhow_resolves_by_its_routed_id() {
         let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");

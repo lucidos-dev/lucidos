@@ -2,10 +2,6 @@ use super::cp_helpers::*;
 use super::*;
 use crate::core::changes::{ChangeStatus, MergeWorktree};
 
-/// Simulates the historical write-through gap: events exist in the store
-/// but their `changes` row was never written. `rebuild_missing_from_events`
-/// must replay the lifecycle into a single row with the correct terminal
-/// status, original `created_at`, and event-time `resolved_at`.
 #[tokio::test]
 async fn rebuild_missing_from_events_recovers_applied_change() {
     let (pool, db) = setup_test_db().await;
@@ -27,7 +23,6 @@ async fn rebuild_missing_from_events_recovers_applied_change() {
     )
     .await;
 
-    // Simulate the historical projection gap: drop the row, keep the events.
     sqlx::query("DELETE FROM changes WHERE id = $1")
         .bind(change_id)
         .execute(&pool)
@@ -57,7 +52,6 @@ async fn rebuild_missing_from_events_recovers_applied_change() {
     assert!(row.resolved_at.is_some());
     assert!(row.hardened, "aggregate_proposed seeds hardened=true");
 
-    // Idempotent: a second rebuild finds nothing missing.
     assert_eq!(proj.rebuild_missing_from_events().await.unwrap(), 0);
 
     teardown_test_db(&db).await;
@@ -163,8 +157,6 @@ async fn rebuild_missing_from_events_uses_latest_proposed_payload() {
     teardown_test_db(&db).await;
 }
 
-/// `ChangeHardened` after the latest `ChangeProposed(hardened=false)` must
-/// flip `hardened` to true on the rebuilt row.
 #[tokio::test]
 async fn rebuild_missing_from_events_applies_change_hardened_after_proposed() {
     let (pool, db) = setup_test_db().await;
@@ -226,8 +218,6 @@ async fn rebuild_missing_from_events_applies_change_hardened_after_proposed() {
     teardown_test_db(&db).await;
 }
 
-/// A change recovered with an active merge worktree must surface in
-/// `with_merge_worktree()` so startup cleanup can reach it.
 #[tokio::test]
 async fn rebuild_missing_from_events_carries_active_merge_worktree() {
     let (pool, db) = setup_test_db().await;
@@ -283,8 +273,6 @@ async fn rebuild_missing_from_events_carries_active_merge_worktree() {
     teardown_test_db(&db).await;
 }
 
-/// MergeResolutionCleared after Started must clear the worktree fields,
-/// so a recovered row doesn't claim a worktree that's already gone.
 #[tokio::test]
 async fn rebuild_missing_from_events_clears_resolved_merge_worktree() {
     let (pool, db) = setup_test_db().await;
@@ -336,13 +324,6 @@ async fn rebuild_missing_from_events_clears_resolved_merge_worktree() {
     teardown_test_db(&db).await;
 }
 
-/// Pins the "forward find above guarantees at least one aggregate
-/// ChangeProposed row" invariant in `rebuild_one_from_events`: with a single
-/// aggregate ChangeProposed (so forward and reverse both hit the same row),
-/// rebuild must NOT panic. Pre-harden the `.unwrap()` on `.rev().find()`
-/// implicitly relied on this; the `.expect("…guarantees…")` is now the
-/// documented contract. The test would panic at the expect message if anyone
-/// ever broke the chain by removing the forward-find early return.
 #[tokio::test]
 async fn rebuild_one_from_events_does_not_panic_when_only_aggregate_proposed_exists() {
     let (pool, db) = setup_test_db().await;
@@ -381,8 +362,6 @@ async fn rebuild_one_from_events_does_not_panic_when_only_aggregate_proposed_exi
     teardown_test_db(&db).await;
 }
 
-/// Healthy projection: every change_id in events already has a row.
-/// rebuild_missing_from_events must recover nothing — no spurious work.
 #[tokio::test]
 async fn rebuild_missing_from_events_is_noop_when_projection_healthy() {
     let (pool, db) = setup_test_db().await;
@@ -405,13 +384,6 @@ async fn rebuild_missing_from_events_is_noop_when_projection_healthy() {
     teardown_test_db(&db).await;
 }
 
-/// External repo CC threads must not have rows in the changes table — the
-/// runtime gates (`idle_change_write`, the SessionEnded
-/// cleanup path) all skip propose_change for external repos, and the
-/// cleanup migration removes any rows that survived from before those
-/// gates were added. This test pins the SQL pattern itself: run the same
-/// DELETE the migration runs, and verify external-repo rows are removed
-/// while internal-repo rows are preserved.
 #[tokio::test]
 async fn cleanup_sql_drops_external_repo_changes_keeps_internal() {
     let (pool, db) = setup_test_db().await;
@@ -452,7 +424,6 @@ async fn cleanup_sql_drops_external_repo_changes_keeps_internal() {
             .unwrap();
     }
 
-    // Mirrors the cleanup migration: keep both in sync if either changes.
     sqlx::query(
         "DELETE FROM changes WHERE thread_id IN \
                 (SELECT thread_id FROM thread_summaries WHERE coding_agent_is_external_repo = true)",

@@ -325,6 +325,16 @@ impl ThreadQueueExecutor for EngineThreadQueueExecutor {
         let Some(engine) = self.engine.upgrade() else {
             return;
         };
+        // The queue cannot take back an admitted entry, so a hook armed on a
+        // first message is asked by the turn instead. An unreadable answer
+        // leaves it to the turn too, whose ask then refuses.
+        let first_message = crate::core::event_hooks::FIRST_MESSAGE_EVENT_TYPE;
+        if !matches!(
+            engine.event_bus.hooks_armed_on(first_message).await,
+            Ok(false)
+        ) {
+            return;
+        }
         let Some(event) = eager_sub_thread_message(engine.workspace_path(), request) else {
             return;
         };
@@ -1553,5 +1563,68 @@ mod tests {
             trigger_id_scope_bodies(&src),
             vec!["id, f(x, \") not this one\")"]
         );
+    }
+
+    /// Admit a sub-thread spawn through the real `prepare`, and return the
+    /// origin it pre-recorded.
+    async fn prepared_origin(engine: &std::sync::Arc<LucidosEngine>, child: Uuid) -> Option<Uuid> {
+        let mut request = ThreadQueueRequest::SubThread {
+            depth: 0,
+            prompt: "gated work".into(),
+            child_thread_id: child,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            wake_mode: None,
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            pre_emitted_origin: None,
+            origin: spawning_thread_link(Uuid::new_v4()),
+        };
+        EngineThreadQueueExecutor::new(std::sync::Arc::downgrade(engine))
+            .prepare(&mut request)
+            .await;
+        let ThreadQueueRequest::SubThread {
+            pre_emitted_origin, ..
+        } = request
+        else {
+            unreachable!("prepare keeps the request kind");
+        };
+        pre_emitted_origin
+    }
+
+    /// The queue cannot cancel an admitted entry. So with a hook armed on a
+    /// first message, the turn asks once and records the message.
+    #[tokio::test]
+    async fn an_armed_first_message_hook_leaves_the_sub_thread_message_to_its_turn() {
+        use crate::core::event_hooks::HookVerdict;
+        use crate::test_support::{arm_hook, setup_test_db, teardown_test_db, FakeHookAsker};
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = crate::engine_test_support::boot_mock_engine(&db).await;
+        let unhooked = Uuid::new_v4();
+        assert!(prepared_origin(&engine, unhooked).await.is_some());
+
+        let asker = FakeHookAsker::new(HookVerdict::Allowed(Vec::new()));
+        engine
+            .event_bus
+            .install_event_hook_asker(asker.clone())
+            .await
+            .unwrap();
+        arm_hook(&engine.event_bus, "gate", "MessageReceived").await;
+        let hooked = Uuid::new_v4();
+
+        assert_eq!(prepared_origin(&engine, hooked).await, None);
+        assert!(asker.asked().is_empty());
+        let recorded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'MessageReceived'",
+        )
+        .bind(hooked)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, 0);
+        engine.pool().close().await;
+        teardown_test_db(&db).await;
     }
 }

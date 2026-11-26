@@ -12,7 +12,7 @@ pub struct PinnedAppUi {
     pub ui_id: String,
 }
 
-/// Per-device pinned app UIs.
+/// INVARIANT: Per-device pinned app UIs.
 ///
 /// **No caller can skip the event.** [`Self::pin`] and [`Self::unpin`] are the
 /// only reachable single-row mutators, and they emit
@@ -25,7 +25,6 @@ pub struct PinnedAppUi {
 pub struct PinnedAppStore;
 
 impl PinnedAppStore {
-    /// List pinned app UIs for a device, ordered by creation time
     pub async fn list_for_device(
         pool: &PgPool,
         device_id: &str,
@@ -39,7 +38,7 @@ impl PinnedAppStore {
         Ok(rows)
     }
 
-    /// Insert a pin row (idempotent). **Private on purpose**: [`Self::pin`] is
+    /// INVARIANT: Insert a pin row (idempotent). **Private on purpose**: [`Self::pin`] is
     /// the reachable mutator, and it emits.
     async fn insert_row(
         pool: &PgPool,
@@ -60,8 +59,6 @@ impl PinnedAppStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete a pin row. **Private on purpose**: [`Self::unpin`] is the
-    /// reachable mutator, and it emits.
     async fn delete_row(
         pool: &PgPool,
         app_id: &str,
@@ -79,9 +76,6 @@ impl PinnedAppStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Pin an app UI for a device and announce it. Idempotent: a duplicate
-    /// click inserts nothing and therefore announces nothing, so repeated taps
-    /// cannot flood the events table.
     pub async fn pin(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -106,8 +100,6 @@ impl PinnedAppStore {
         Ok(pinned)
     }
 
-    /// Unpin an app UI for a device and announce it. Announces only when a row
-    /// was actually removed.
     pub async fn unpin(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -132,7 +124,7 @@ impl PinnedAppStore {
         Ok(unpinned)
     }
 
-    /// Delete every pin for a device, silently. Called only from the device
+    /// INVARIANT: Delete every pin for a device, silently. Called only from the device
     /// store's delete cascade, whose `DeviceDeleted` is the announcement: the
     /// device is gone, so an unpin event per app would describe changes to a
     /// device no client still tracks. Registered as a `pinned_apps` exemption in
@@ -150,7 +142,7 @@ impl PinnedAppStore {
         Ok(())
     }
 
-    /// Move every pin from one device id to another, silently. Called only from
+    /// INVARIANT: Move every pin from one device id to another, silently. Called only from
     /// `DeviceStore::hand_over`, whose `DeviceHandedOver` is the announcement:
     /// the pins are unchanged, only the id naming them is, so a pin event per
     /// app would report changes nobody made. Registered as a `pinned_apps`

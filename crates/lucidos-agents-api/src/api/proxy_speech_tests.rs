@@ -37,8 +37,6 @@ fn a_default_speech_request_asks_for_the_stream() {
     ));
 }
 
-/// A caller's explicit `audio` is the default spelled out. The proxy buffers
-/// the reply whole either way, so no streaming is lost.
 #[test]
 fn an_explicit_audio_stream_format_is_asked_for_the_stream_too() {
     let request = speech(json!({"stream_format": "audio", "response_format": "aac"}));
@@ -50,7 +48,6 @@ fn an_explicit_audio_stream_format_is_asked_for_the_stream_too() {
     ));
 }
 
-/// A `wav` stream loses its header, so the proxy asks for PCM and adds one.
 #[test]
 fn a_wav_request_asks_for_pcm() {
     let (forwarded, plan) = plan("audio/speech", speech(json!({"response_format": "wav"})));
@@ -70,8 +67,6 @@ fn a_flac_or_opus_request_is_refused_before_it_leaves() {
     }
 }
 
-/// A caller that asked for the stream itself gets its usage recorded, so
-/// even `flac` passes.
 #[test]
 fn a_caller_chosen_stream_is_never_refused() {
     let request = speech(json!({"stream_format": "sse", "response_format": "flac"}));
@@ -80,7 +75,6 @@ fn a_caller_chosen_stream_is_never_refused() {
     assert!(matches!(plan, SpeechPlan::Untouched));
 }
 
-/// `tts-1` reports no usage, so the input's characters are what it costs.
 #[test]
 fn a_tts_1_request_is_billed_by_its_characters() {
     for model in ["tts-1", "tts-1-hd"] {
@@ -101,7 +95,6 @@ fn a_tts_1_request_is_billed_by_its_characters() {
     }
 }
 
-/// Every one of these reaches the upstream byte for byte.
 #[test]
 fn only_an_openai_speech_request_is_touched() {
     let untouched = [
@@ -164,7 +157,6 @@ async fn the_caller_gets_the_audio_the_deltas_carry() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(audio, b"\xff\xf3abcd");
     assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "audio/mpeg");
-    // These described the stream, so none may survive with the stream's value.
     assert!(headers
         .get(CONTENT_LENGTH)
         .is_none_or(|v| v.to_str().unwrap() == audio.len().to_string()));
@@ -172,7 +164,6 @@ async fn the_caller_gets_the_audio_the_deltas_carry() {
     assert!(headers.get(CONTENT_DIGEST).is_none());
 }
 
-/// The header OpenAI's own `wav` reply carries: PCM, mono, 24 kHz, 16-bit.
 #[tokio::test]
 async fn a_wav_caller_gets_its_pcm_inside_a_wav_header() {
     let pcm = [1u8, 0, 2, 0, 3, 0];
@@ -204,7 +195,6 @@ async fn an_upstream_error_reaches_the_caller_unchanged() {
     assert_eq!(bytes, error.as_bytes());
 }
 
-/// An upstream that ignored the stream format sent audio already.
 #[tokio::test]
 async fn a_reply_that_is_not_a_stream_passes_through() {
     let reply = upstream_reply(StatusCode::OK, "audio/mpeg", "ID3".into());
@@ -213,8 +203,6 @@ async fn a_reply_that_is_not_a_stream_passes_through() {
     assert_eq!(bytes, b"ID3");
 }
 
-/// Each would otherwise reach the caller as an empty or cut-off file with a
-/// 200: no audio, a delta with no audio, and a stream with no done frame.
 #[tokio::test]
 async fn a_stream_without_whole_audio_is_a_bad_gateway() {
     for stream in [

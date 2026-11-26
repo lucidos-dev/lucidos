@@ -1,14 +1,8 @@
-/// SQL predicate matching the teardown boundary abort of a user-initiated *Switch to
-/// new version*: an `EngineShutdown` `ResponseAborted` stamped with the device that
-/// clicked switch. Assumes the row is already scoped to one thread's events.
-///
-/// Shared by [`switch_was_user_initiated`], the unengaged scan and the chat
-/// candidate scan so "what a switch abort looks like" is defined exactly once.
 pub const SWITCH_TEARDOWN_ABORT_SQL: &str = "event_type = 'ResponseAborted' \
      AND payload->'actor'->>'kind' = 'device' \
      AND payload->>'cause' = 'engine_shutdown'";
 
-/// SQL list of the events that begin (or restart) a thread's turn.
+/// INVARIANT: SQL list of the events that begin (or restart) a thread's turn.
 ///
 /// Two questions read it, and they must not answer differently about which turn
 /// is current. The recovery gates ask through [`after_latest_thread_start_sql`],
@@ -18,7 +12,7 @@ pub(crate) const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
     'CodingAgentUserMessageSent','TriggerStarted','ContinuationStarted',\
     'OrphanRecoveryStarted'";
 
-/// SQL boolean: the event at `seq_expr` is newer than every
+/// INVARIANT: SQL boolean: the event at `seq_expr` is newer than every
 /// [`THREAD_START_EVENTS_SQL`] event on the thread at `id_expr`, so it belongs
 /// to that thread's **current** turn.
 ///
@@ -49,7 +43,7 @@ pub fn after_latest_thread_start_sql(id_expr: &str, seq_expr: &str) -> String {
     )
 }
 
-/// A switch abort can authorize a resume until a later start or abort
+/// INVARIANT: A switch abort can authorize a resume until a later start or abort
 /// supersedes it.
 ///
 /// Coding-agent resume, chat resume and boot settlement share this predicate.

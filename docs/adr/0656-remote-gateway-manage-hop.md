@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-11-11
+- **Amended by**: [0811](0811-remote-gateway-control-hop.md), which opens an allow-listed part of the control plane behind its own grant.
 - **Extends**: [ADR 0590](0590-gateway-pairing-is-a-deliberate-grant.md), [ADR 0591](0591-the-relay-is-the-one-proxied-hop.md)
 
 ## Context

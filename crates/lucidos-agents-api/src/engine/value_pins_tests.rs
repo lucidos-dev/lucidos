@@ -1,12 +1,7 @@
-//! Pins every copy of an engine value that cannot import it (ADR 0368). The
-//! LLM reads `system-knowhow/` raw, and shell cannot read a Rust constant. So
-//! each copy is read here and compared with the constant, rendered from the
-//! constant itself. A number a reader does not need leaves the doc instead.
-//!
-//! `scripts/lib/harden_suites.sh` selects this test for a `system-knowhow/`
-//! change, and for the scripts in its `HS_ENGINE_PINNED` list. That list must
-//! name every other `file` below, and `harden_suites_test.sh` checks it.
-
+use crate::core::event_hooks::{
+    DEFAULT_TIMEOUT_SECS as HOOK_DEFAULT_TIMEOUT_SECS,
+    TIMEOUT_CEILING_SECS as HOOK_TIMEOUT_CEILING_SECS,
+};
 use crate::core::plugins::MAX_ID_LEN as PLUGIN_MAX_ID_LEN;
 use crate::core::prefs::{
     CHAT_MODEL, LOCAL_BASE_URL, MAX_TOOL_CALLS, PROXY_TIMEOUT_SECS, VERTEX_REGION,
@@ -32,8 +27,6 @@ use lucidos_gateway_constants::{
 };
 use std::path::Path;
 
-/// One copy of a value. Every place `file` says `before`, then a slot, then
-/// `after` must hold `value` in the slot, and at least one place must exist.
 struct Pin {
     file: &'static str,
     before: String,
@@ -63,6 +56,7 @@ const JS_SDK: &str = "system-knowhow/js-sdk.md";
 const OAUTH_PROVIDERS: &str = "system-knowhow/oauth-providers.md";
 const GLOSSARY: &str = "system-knowhow/glossary.md";
 const FONTS: &str = "system-knowhow/workspace-fonts.md";
+const EVENT_HOOKS: &str = "system-knowhow/event-hooks.md";
 
 fn script_pins() -> Vec<Pin> {
     vec![
@@ -97,7 +91,6 @@ fn knowhow_pins() -> Vec<Pin> {
     let output_cap = format!("{} KB", MAX_OUTPUT_BYTES / 1024);
     let wait_hours = WAIT_MAX_SECS / 3600;
     let mut pins = vec![
-        // The sync and background tool ceilings, and the drain.
         pin(
             RUNNING_PYTHON,
             "the first ",
@@ -120,6 +113,18 @@ fn knowhow_pins() -> Vec<Pin> {
             BG_DEFAULT_TIMEOUT_SECS,
         ),
         pin(RUNNING_PYTHON, " s, max ", " s)", BG_MAX_TIMEOUT_SECS),
+        pin(
+            EVENT_HOOKS,
+            "`timeout_secs` (",
+            " by default,",
+            HOOK_DEFAULT_TIMEOUT_SECS,
+        ),
+        pin(
+            EVENT_HOOKS,
+            " by default, at most ",
+            ")",
+            HOOK_TIMEOUT_CEILING_SECS,
+        ),
         pin(
             RUNNING_PYTHON,
             "| up to ",
@@ -162,7 +167,6 @@ fn knowhow_pins() -> Vec<Pin> {
             " each",
             &output_cap,
         ),
-        // The trigger chain ceiling.
         pin(
             THREAD_EVENTS,
             "field, default ",
@@ -187,7 +191,6 @@ fn knowhow_pins() -> Vec<Pin> {
             "):",
             DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
         ),
-        // The per-thread child cap.
         pin(
             "system-knowhow/thread-queue.md",
             "`max_concurrent_children_per_thread` (",
@@ -206,7 +209,6 @@ fn knowhow_pins() -> Vec<Pin> {
             ")",
             DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD,
         ),
-        // The todo list and sub-thread depth.
         pin(GLOSSARY, "(at most ", " items", MAX_TODO_ITEMS),
         pin(THREAD_EVENTS, "enforces ≤ ", " items", MAX_TODO_ITEMS),
         pin(
@@ -221,7 +223,6 @@ fn knowhow_pins() -> Vec<Pin> {
             " is refused",
             MAX_THREAD_DEPTH + 1,
         ),
-        // Event waits.
         pin(
             LUCIDOS_CLI,
             "`--timeout-secs` is required and capped at ",
@@ -252,7 +253,6 @@ fn knowhow_pins() -> Vec<Pin> {
             " live waits**",
             MAX_LIVE_WAITS_PER_THREAD,
         ),
-        // Proxy timeouts.
         pin(
             LUCIDOS_CLI,
             "The engine waits **",
@@ -305,7 +305,6 @@ fn knowhow_pins() -> Vec<Pin> {
             ".",
             PROXY_MAX_SECS,
         ),
-        // Workspace fonts.
         pin(FONTS, "| Up to ", " lowercase letters", MAX_SLUG_LEN),
         pin(
             FONTS,
@@ -316,14 +315,12 @@ fn knowhow_pins() -> Vec<Pin> {
         pin(FONTS, "| 1 to ", " per font |", MAX_FACES),
         pin(FONTS, "| Fonts | ", " per workspace", MAX_FONTS),
         pin(FONTS, "| Label | 1 to ", " characters |", MAX_LABEL_CHARS),
-        // Plugin ids.
         pin(
             "system-knowhow/plugins.md",
             "max ",
             " chars",
             PLUGIN_MAX_ID_LEN,
         ),
-        // Preferences.
         pin(
             JS_SDK,
             "region default `",
@@ -354,7 +351,6 @@ fn knowhow_pins() -> Vec<Pin> {
             "`",
             MAX_TOOL_CALLS.bounds().0,
         ),
-        // The OAuth listener port the user registers with a provider.
         pin(OAUTH_PROVIDERS, "loopback port (", ")", CALLBACK_PORT),
     ];
     for doc in [GLOSSARY, OAUTH_PROVIDERS] {
@@ -365,11 +361,8 @@ fn knowhow_pins() -> Vec<Pin> {
     pins
 }
 
-/// The longest slot read as a copy. A longer gap between `before` and `after`
-/// is unrelated text that happens to share the prefix.
 const SLOT_CHARS: usize = 40;
 
-/// Every slot `text` fills between `before` and `after`.
 fn slots<'a>(text: &'a str, before: &str, after: &str) -> Vec<&'a str> {
     let mut found = Vec::new();
     let mut rest = text;
@@ -395,7 +388,6 @@ fn a_pin_reads_every_copy_and_rejects_a_drifted_one() {
 mod guard_tests {
     use super::*;
 
-    /// Every way the pins in `pins` drifted from their files, one line each.
     fn drift(pins: Vec<Pin>) -> Vec<String> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut drift = Vec::new();

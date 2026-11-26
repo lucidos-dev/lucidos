@@ -29,8 +29,6 @@ fn a_model_provider_host_is_recognised_and_a_plain_api_is_not() {
     assert!(Upstream::Builtin { name: "openai" }.is_model_provider());
 }
 
-/// The row keeps both: the model the request asked for, and the one the
-/// reply says served it.
 #[test]
 fn a_json_reply_reports_its_usage_and_serving_model() {
     let reply = body(
@@ -55,8 +53,6 @@ fn a_streamed_reply_takes_its_model_from_the_request() {
     assert_eq!(call.served_model, None, "this stream names no model");
 }
 
-/// An Anthropic stream names its model in `message_start`, and an OpenAI
-/// stream in every chunk.
 #[test]
 fn a_streamed_reply_reports_the_model_it_names() {
     let anthropic = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5-20260101\",\"usage\":{\"input_tokens\":7}}}\n\n\
@@ -78,8 +74,6 @@ fn a_streamed_reply_reports_the_model_it_names() {
     assert_eq!(call.served_model.as_deref(), Some("gpt-6.1-2026"));
 }
 
-/// The upstream's own id for the reply rides along into the row, from either
-/// header a provider uses.
 #[test]
 fn a_reply_header_names_the_request_id() {
     let call = || ReportedCall {
@@ -98,8 +92,6 @@ fn a_reply_header_names_the_request_id() {
     );
 }
 
-/// The stream `api::proxy_speech` asks OpenAI's speech endpoint for. Its last
-/// frame carries the usage, and the model comes from the request.
 #[test]
 fn a_speech_stream_reports_its_usage_and_requested_model() {
     let reply = b"data: {\"type\":\"speech.audio.delta\",\"audio\":\"SUQz\"}\n\n\
@@ -111,7 +103,6 @@ fn a_speech_stream_reports_its_usage_and_requested_model() {
     assert_eq!(call.model, "gpt-4o-mini-tts");
 }
 
-/// Vertex names its model in the path, not the body.
 #[test]
 fn a_vertex_reply_takes_its_model_from_the_path() {
     let reply = body(json!({"usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 2}}));
@@ -123,8 +114,6 @@ fn a_vertex_reply_takes_its_model_from_the_path() {
     );
 }
 
-/// A request that names no model, on a path that names none, is priced
-/// under the model the reply names.
 #[test]
 fn a_request_naming_no_model_takes_the_replys() {
     let reply = body(json!({"model": "gpt-6.1-2026", "usage": {"prompt_tokens": 3}}));
@@ -133,16 +122,12 @@ fn a_request_naming_no_model_takes_the_replys() {
     assert_eq!(call.served_model.as_deref(), Some("gpt-6.1-2026"));
 }
 
-/// A quota read or an error page spent nothing measurable, so nothing is
-/// recorded rather than a free call.
 #[test]
 fn a_reply_without_usage_records_nothing() {
     assert!(reported(&body(json!({"remaining": 12})), false, b"", "/quota").is_none());
     assert!(reported(b"<html>bad gateway</html>", false, b"", "/v1").is_none());
 }
 
-/// The proxy route captures its path with no leading slash, and Gemini names
-/// the serving model as `modelVersion`.
 #[test]
 fn a_gemini_reply_takes_its_model_from_the_bare_path_and_model_version() {
     let path = "models/gemini-2.5-flash:generateContent";
@@ -164,8 +149,6 @@ fn a_gemini_reply_takes_its_model_from_the_bare_path_and_model_version() {
     assert_eq!(call.served_model.as_deref(), Some("gemini-2.5-flash-002"));
 }
 
-/// `streamGenerateContent` without `alt=sse` answers with one JSON array of
-/// chunks, whose counters grow chunk by chunk.
 #[test]
 fn a_gemini_stream_sent_as_a_json_array_reports_its_usage() {
     let reply = body(json!([
@@ -179,8 +162,6 @@ fn a_gemini_stream_sent_as_a_json_array_reports_its_usage() {
     assert_eq!(call.served_model.as_deref(), Some("gemini-3-flash"));
 }
 
-/// A model provider is asked for a plain reply, which the cost parse can
-/// read. Any other upstream keeps the caller's encoding.
 #[test]
 fn only_a_model_provider_loses_the_callers_accept_encoding() {
     let headers = || {
@@ -210,8 +191,6 @@ fn origin_headers(token: &str) -> HeaderMap {
     h
 }
 
-/// A proxied call's cost lands on the thread whose subprocess the origin
-/// token proves made it. No token, or a forged one, names no thread.
 #[test]
 fn only_a_verified_origin_token_names_the_cost_thread() {
     use crate::core::subprocess_origin::{init_agent_origin_secret, mint_agent_origin_token};
@@ -227,8 +206,6 @@ fn only_a_verified_origin_token_names_the_cost_thread() {
     assert_eq!(cost_owner(&HeaderMap::new()), CostOwner::default());
 }
 
-/// A script trigger fire has no thread, so its token's trigger is all that
-/// names who spent the call.
 #[test]
 fn a_trigger_fires_token_names_the_cost_trigger() {
     use crate::core::subprocess_origin::{init_agent_origin_secret, mint_agent_origin_token};
@@ -253,8 +230,6 @@ fn gateway_usage_keeps_its_provider_for_managed_telemetry() {
     }
 }
 
-/// The cost parse and the redaction read a reply with no size cap. That is
-/// safe only because `forward_request` hands back the whole reply as one buffer.
 #[tokio::test]
 async fn forward_request_hands_back_a_streamed_upstream_reply_as_one_buffer() {
     use futures::StreamExt;

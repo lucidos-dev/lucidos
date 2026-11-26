@@ -8,8 +8,9 @@
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use lucidos_agents_api::api::actor::build_message_origin;
 use lucidos_engine::core::subprocess_origin::{
-    init_agent_origin_secret, mint_agent_origin_token, subprocess_origin, SubprocessOrigin,
-    HEADER_AGENT_ORIGIN_TOKEN, HEADER_DEVICE_ID,
+    event_hook_origin_env_vars, init_agent_origin_secret, mint_agent_origin_token,
+    subprocess_origin, SubprocessOrigin, ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN,
+    HEADER_DEVICE_ID,
 };
 use lucidos_engine::engine::thread_events::{ActorMode, MessageOrigin};
 use uuid::Uuid;
@@ -188,7 +189,7 @@ fn a_subprocess_cannot_stamp_a_thread_its_token_was_not_minted_for() {
     let h = headers(&[
         ("user-agent", "curl/8.7.1"),
         // Every other field left as minted, so only the thread swap is on trial.
-        (HEADER_AGENT_ORIGIN_TOKEN, &format!("{theirs}@0@-.{mac}")),
+        (HEADER_AGENT_ORIGIN_TOKEN, &format!("{theirs}@0@-@-.{mac}")),
     ]);
 
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
@@ -275,6 +276,7 @@ fn a_thread_less_script_token_carries_its_fires_chain_depth() {
             source_thread_id: None,
             chain_depth: 2,
             emitting_trigger_id: None,
+            event_hook: None,
         }
     );
 }
@@ -291,6 +293,7 @@ fn a_thread_bound_token_carries_both_the_thread_and_the_depth() {
             source_thread_id: Some(tid),
             chain_depth: 3,
             emitting_trigger_id: None,
+            event_hook: None,
         }
     );
 }
@@ -325,6 +328,7 @@ fn a_spawn_outside_any_fire_carries_depth_zero() {
             source_thread_id: Some(tid),
             chain_depth: 0,
             emitting_trigger_id: None,
+            event_hook: None,
         }
     );
 }
@@ -347,6 +351,7 @@ fn a_script_fires_token_names_the_trigger_that_ran_it() {
             source_thread_id: None,
             chain_depth: 1,
             emitting_trigger_id: Some(trigger),
+            event_hook: None,
         }
     );
 }
@@ -363,10 +368,77 @@ fn a_trigger_claim_cannot_be_forged_by_an_untrusted_caller() {
     let sdk = headers(&[("user-agent", "Mozilla/5.0")]);
     assert_eq!(subprocess_origin(&sdk), SubprocessOrigin::NotSubprocess);
 
-    let forged = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-@0@{victim}.{mac}"))]);
+    let forged = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-@0@-@{victim}.{mac}"))]);
     assert_eq!(
         subprocess_origin(&forged),
         SubprocessOrigin::NotSubprocess,
         "a spliced trigger claim must not authenticate"
     );
+}
+
+// ---- The event hook (ADR 0746) ----
+
+/// The token an event hook's script holds, minted as the asker mints it.
+fn hook_token(chain_depth: u32, slug: &str) -> String {
+    init_agent_origin_secret("subprocess-integration-secret".to_string());
+    event_hook_origin_env_vars(chain_depth, slug)
+        .into_iter()
+        .find_map(|(name, value)| (name == ENV_AGENT_ORIGIN_TOKEN).then_some(value))
+        .expect("secret installed at least once")
+}
+
+/// A hook's script acts as its hook, never as the thread whose event it
+/// judges, and stays on the hooked event's trigger chain.
+#[test]
+fn a_hook_scripts_token_names_its_hook_and_no_thread() {
+    let h = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &hook_token(2, "require-a-plan"))]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: None,
+            chain_depth: 2,
+            emitting_trigger_id: None,
+            event_hook: Some("require-a-plan".to_string()),
+        }
+    );
+    assert_eq!(
+        build_message_origin(&h, ActorMode::Human, None, None, None, None, None),
+        Some(MessageOrigin::EventHook {
+            slug: "require-a-plan".to_string()
+        })
+    );
+}
+
+/// The bus asks no hook about what a hook caused. So stripping the claim would
+/// put a hook's own events back in front of the hooks, and forging one would
+/// let any script skip them. The MAC covers the claim, so neither verifies.
+#[test]
+fn a_hook_claim_can_be_neither_forged_nor_stripped() {
+    let hook = hook_token(0, "require-a-plan");
+    let hook_mac = hook.rsplit_once('.').expect("minted token has a mac").1;
+    let plain = token_for(None);
+    let plain_mac = plain.rsplit_once('.').expect("minted token has a mac").1;
+
+    for (label, candidate) in [
+        ("stripped claim", format!("-@0@-@-.{hook_mac}")),
+        ("forged claim", format!("-@0@require-a-plan@-.{plain_mac}")),
+        ("swapped claim", format!("-@0@another-hook@-.{hook_mac}")),
+    ] {
+        let h = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &candidate)]);
+        assert_eq!(
+            subprocess_origin(&h),
+            SubprocessOrigin::NotSubprocess,
+            "{label} must not authenticate"
+        );
+    }
+}
+
+/// A slug that would read as no claim gets no token, so the script cannot
+/// write rather than writing as an ordinary script.
+#[test]
+fn a_slug_that_reads_as_no_claim_gets_no_token() {
+    init_agent_origin_secret("subprocess-integration-secret".to_string());
+    for slug in ["-", "", "has space"] {
+        assert_eq!(event_hook_origin_env_vars(0, slug), vec![], "{slug:?}");
+    }
 }

@@ -1,10 +1,5 @@
-//! Tests for the grant-file store. The migration has its own suite.
-
 use super::*;
 
-/// The temp file a write renames from must be unique per process. A shared
-/// name lets two engines on one workspace interleave their bytes. The rename
-/// then publishes the torn result as the authoritative allowlist.
 #[test]
 fn write_raw_uses_a_process_unique_temp_name() {
     let tmp = tempfile::tempdir().unwrap();
@@ -27,14 +22,11 @@ fn write_raw_uses_a_process_unique_temp_name() {
         scratch.display()
     );
 
-    // The write still lands, and leaves no scratch file behind.
     write_raw(&dir, file, "Bash\n").unwrap();
     assert_eq!(patterns(&dir, file), vec!["Bash".to_string()]);
     assert!(!scratch.exists(), "the temp file is renamed away");
 }
 
-/// The whole point of per-workspace grants, in one test: a yes said in one
-/// workspace binds there and nowhere else.
 #[test]
 fn a_grant_in_one_workspace_is_invisible_from_another() {
     let tmp = tempfile::tempdir().unwrap();
@@ -60,8 +52,6 @@ fn a_grant_in_one_workspace_is_invisible_from_another() {
     }
 }
 
-/// A restored workspace has no `.lucidos/` at all, and must read as "nothing
-/// granted" rather than fail. Fail-closed and quiet: the user is prompted once.
 #[test]
 fn an_absent_grants_directory_reads_empty_rather_than_erroring() {
     let tmp = tempfile::tempdir().unwrap();
@@ -91,9 +81,6 @@ fn write_then_read_round_trips_and_parses() {
     );
 }
 
-/// Each lane owns its own file. A grant on one must never satisfy another,
-/// because the three pattern languages overlap textually: bare `Bash` is legal
-/// in both the command guard and the Claude Code allowlist.
 #[test]
 fn the_three_lanes_do_not_share_a_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -110,9 +97,6 @@ fn the_three_lanes_do_not_share_a_file() {
     assert_eq!(unique.len(), names.len(), "every lane needs its own file");
 }
 
-/// There is exactly one lookup. A workspace with no grant file grants nothing,
-/// whatever the machine-global file it replaced still holds: the migration
-/// seeds, and after that nothing reads outside the workspace.
 #[test]
 fn a_workspace_never_falls_back_to_the_machine_global_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -129,9 +113,6 @@ fn a_workspace_never_falls_back_to_the_machine_global_file() {
     }
 }
 
-/// Grants live beside the other engine-owned runtime state, not in `data/`.
-/// The file tools can reach `data/`, and a permission file the agent can
-/// rewrite is not a permission file.
 #[test]
 fn grants_live_in_the_engine_owned_runtime_directory() {
     let dir = grants_dir(Path::new("/tmp/workspaces/myws"));
@@ -146,11 +127,6 @@ fn grants_live_in_the_engine_owned_runtime_directory() {
     }
 }
 
-/// The lane's wire name is its file name, everywhere.
-///
-/// A `PermissionGrantsChanged` event carries a `GrantFile`, and the audit
-/// timeline is read next to the Settings editor, which is labelled by file
-/// name. A second spelling would make the reader match them up by hand.
 #[test]
 fn the_wire_name_is_the_file_name() {
     for file in GrantFile::ALL {
@@ -165,7 +141,6 @@ fn the_wire_name_is_the_file_name() {
     }
 }
 
-/// The Settings editor round-trips each pattern and includes its lane instructions.
 #[test]
 fn an_editor_body_parses_back_to_its_lines() {
     for file in GrantFile::ALL {
@@ -176,8 +151,6 @@ fn an_editor_body_parses_back_to_its_lines() {
     }
 }
 
-/// Each lane recognizes the shapes its own matcher reads. Anything else is
-/// kept but shown as legacy unmapped, never dropped.
 #[test]
 fn each_lane_recognizes_only_the_shapes_its_matcher_reads() {
     let cases = [

@@ -1,32 +1,10 @@
-//! One packaged GUI client per app-data dir, held by the client's owner lock
-//! (`lucidos_owner_lock::client`, ADR 0438). Why: ADR 0471.
-//!
-//! LaunchServices keeps a Finder, Dock or `open` launch of one bundle to one
-//! client. A direct exec of `Contents/MacOS/lucidos-app`, or a second copy of
-//! the bundle, bypasses it, and that second client adopts every workspace.
-//!
-//! The lock file is close-on-exec, which two relaunch paths depend on:
-//! - `restart_process` execs in place, and the new image takes the lock again;
-//! - a spawned relaunch watcher outlives the client, and must not keep the lock
-//!   it would otherwise block the relaunch with.
-//!
-//! A relaunch that spawns the new client before exiting (Tauri's `restart`)
-//! must call [`release_client_owner_lock`] first.
-
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use lucidos_owner_lock::{client, OwnerLock};
 
-/// Held until exit once [`claim_client_owner_lock`] takes it, unless
-/// [`release_client_owner_lock`] gives it up first.
 static CLIENT_OWNER_LOCK: Mutex<Option<OwnerLock>> = Mutex::new(None);
 
-/// Take the client's owner lock, before any Tauri init.
-///
-/// `Err` is the refusal for stderr: another client holds the lock, and the
-/// caller must exit. Dev builds take no lock. A lock that fails for any other
-/// reason is reported and skipped, since a client must start even then.
 pub fn claim_client_owner_lock() -> Result<(), String> {
     if tauri::is_dev() {
         return Ok(());
@@ -53,9 +31,6 @@ pub fn claim_client_owner_lock() -> Result<(), String> {
     }
 }
 
-/// Give up the lock ahead of a relaunch that starts the new client before
-/// this one exits, as `AppHandle::restart` does on macOS. Without it the new
-/// client finds the lock held and refuses to start.
 pub(crate) fn release_client_owner_lock() {
     drop(
         CLIENT_OWNER_LOCK
@@ -65,15 +40,11 @@ pub(crate) fn release_client_owner_lock() {
     );
 }
 
-/// Take the lock in `app_data` and publish this pid. `None` means another
-/// client holds it.
 fn take(app_data: &Path) -> std::io::Result<Option<OwnerLock>> {
     lucidos_home::ensure_storage_root(app_data)?;
     let Some(lock) = OwnerLock::try_acquire(&client::lock_path(app_data))? else {
         return Ok(None);
     };
-    // The lock alone keeps the client single. The pid only names the holder
-    // in a refusal, so failing to publish it must not cost the lock.
     if let Err(e) = lock.publish_pid(&client::pid_path(app_data)) {
         eprintln!("[client] owner lock held, but its pid was not published ({e})");
     }
@@ -98,9 +69,6 @@ mod tests {
         assert!(take(tmp.path()).unwrap().is_none());
         assert_eq!(client::published_pid(tmp.path()), Some(std::process::id()));
         drop(first);
-        // Other tests spawn children in parallel, and a child holds a copy of
-        // the lock file between its fork and its exec. So the lock frees soon,
-        // not at once.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while take(tmp.path()).unwrap().is_none() {
             assert!(std::time::Instant::now() < deadline, "the lock never freed");
@@ -108,8 +76,6 @@ mod tests {
         }
     }
 
-    // A relaunch watcher outlives the client, and the in-place restart execs.
-    // Either would hold the lock past the client's exit if the fd survived.
     #[cfg(unix)]
     #[test]
     fn the_lock_never_crosses_an_exec() {

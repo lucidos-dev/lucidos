@@ -1,6 +1,3 @@
-//! Only the owner edits an intelligence ladder freely. An agent edits one by
-//! spending the owner's `edit-intelligence-ladder` permission (ADR 0750).
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
@@ -25,7 +22,6 @@ async fn call(state: &AppState, uri: &str, headers: HeaderMap, body: Value) -> (
     send(router(), state, method, uri, headers, body).await
 }
 
-/// One request through the `/api/v1/models` routes.
 async fn models(
     state: &AppState,
     method: &str,
@@ -130,7 +126,6 @@ async fn an_agent_edits_a_ladder_only_while_it_holds_the_owners_permission() {
     let (status, body) = call(&state, SORT, agent(), sort_body("The swap.")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // The once permission is spent, so the next edit asks again.
     let (status, body) = call(&state, SORT, agent(), sort_body("The swap.")).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     allow(asked(&body), ALLOW_FOR_THIS_THREAD_LABEL).await;
@@ -139,7 +134,6 @@ async fn an_agent_edits_a_ladder_only_while_it_holds_the_owners_permission() {
         assert_eq!(status, StatusCode::OK, "this thread holds it: {body}");
     }
 
-    // Another thread holds nothing.
     let other = agent_thread(&bus).await;
     let (status, body) = call(&state, SORT, agent_headers(Some(other)), sort_body("Why.")).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -172,7 +166,6 @@ async fn a_refused_edit_gives_the_once_permission_back() {
         Resolution::Granted(_)
     ));
 
-    // The default's model stays on, so this edit is refused and changes nothing.
     let ladder = intelligence_ladder::load(
         &state.pool,
         &state.engine.model_routes(),
@@ -269,8 +262,6 @@ async fn chat_ladder(state: &AppState) -> intelligence_ladder::IntelligenceLadde
     .await
 }
 
-/// A model on the chat ladder that may leave it: not the default's. Chat
-/// stores no default rung here, so its default selection names that model.
 async fn removable_laddered_model(state: &AppState) -> String {
     let ladder = chat_ladder(state).await;
     let offer =
@@ -286,7 +277,6 @@ async fn removable_laddered_model(state: &AppState) -> String {
         .expect("a model on the chat ladder besides the default's")
 }
 
-/// The request id a `permission_required` answer gives to ask with.
 fn asked(body: &Value) -> String {
     assert_eq!(body["reason"], "permission_required", "{body}");
     body["request_id"].as_str().unwrap().to_owned()
@@ -390,7 +380,6 @@ async fn a_refused_model_edit_gives_the_once_permission_back() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     allow_once(&bus, thread, &asked(&body)).await;
 
-    // No such model, so this edit is refused and changes nothing.
     let (status, body) = models(&state, "PUT", unknown, agent(), toggle(false, "Why.")).await;
     assert_eq!(
         (status, &body["success"]),
@@ -425,7 +414,6 @@ async fn deleting_a_laddered_model_asks_the_owner_first() {
     let thread = agent_thread(&bus).await;
     let agent = || agent_headers(Some(thread));
 
-    // A user model served the way a laddered builtin is, so it can join.
     let other = removable_laddered_model(&state).await;
     let served = crate::core::ModelStore::get(&state.pool, &other)
         .await
@@ -479,8 +467,6 @@ async fn deleting_a_laddered_model_asks_the_owner_first() {
     teardown_test_db(&db).await;
 }
 
-/// Run one `manage_models` action as the Lucidos Agent in `thread` would,
-/// through the engine's real `/api/v1` router.
 async fn manage_models(
     state: &AppState,
     thread: uuid::Uuid,
@@ -501,7 +487,6 @@ async fn manage_models(
         .await
 }
 
-/// The request id a tool refusal tells the agent to ask with.
 fn tool_asked(refusal: &str) -> String {
     assert!(refusal.starts_with("Error: Nothing changed"), "{refusal}");
     refusal.split('`').nth(1).unwrap().to_owned()
@@ -585,7 +570,6 @@ async fn a_refused_model_tool_edit_gives_the_once_permission_back() {
         .unwrap_err();
     allow_once(&bus, thread, &tool_asked(&err)).await;
 
-    // No such model, so this edit is refused and changes nothing.
     let err = manage_models(&state, thread, unknown).await.unwrap_err();
     assert!(err.contains("not found"), "{err}");
 

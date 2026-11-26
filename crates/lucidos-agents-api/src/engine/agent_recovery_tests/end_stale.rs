@@ -1,17 +1,4 @@
 mod end_stale_session_branch_preservation {
-    //! Regression: when the user clicks Apply on a thread with no live CC
-    //! session, `apply_now` calls `end_stale_waiting_session(.., discard=false, ..)`
-    //! which used to silently `git branch -D` the branch in the
-    //! `proposal_files=None` arm — losing the user's committed work whenever
-    //! the per-commit `ChangeProposed` events hadn't synced into the `changes`
-    //! projection (so the branch had no pending change). Symptom: the
-    //! UI shows "No changes to apply — branch is already merged or has no
-    //! commits" and the Files diff fails with "unknown revision".
-    //!
-    //! We can't instantiate a full `LucidosEngine` from a unit test, so we
-    //! pin the contract by replaying the exact git operations
-    //! `end_stale_waiting_session` performs in the no-proposal-files +
-    //! discard=false path, and asserting the branch survives.
 
     use crate::engine::agent_recovery::rescue_stale_worktree;
     use crate::engine::git_ops::{
@@ -20,18 +7,11 @@ mod end_stale_session_branch_preservation {
     };
     use crate::test_support::make_repo_and_worktree;
 
-    /// `proposal_files_for_branch` returns `None` for a branch whose commits
-    /// have an empty net diff (commit + revert). That's the trigger condition
-    /// for the deleted else branch — the case where the buggy code would have
-    /// run `git branch -D` had we not removed it.
     #[tokio::test]
     async fn apply_intent_preserves_branch_when_proposal_files_returns_none() {
         let branch = "claude-code/preserve-branch-on-apply";
         let (_tmp, repo_root, wt) = make_repo_and_worktree(branch).await;
 
-        // Commits with zero net diff — same shape as commit + revert,
-        // npm install + reset, or any other no-op pair CC can produce. This
-        // is what trips `proposal_files_for_branch` into returning None.
         std::fs::write(wt.join("scratch.txt"), "v1").unwrap();
         git_cmd(&["add", "."], &wt).await.unwrap();
         git_cmd(&["commit", "-m", "add scratch"], &wt)
@@ -41,16 +21,12 @@ mod end_stale_session_branch_preservation {
             .await
             .unwrap();
 
-        // Precondition: proposal_files returns None (the trigger condition).
         assert_eq!(
             proposal_files_for_branch(&repo_root, branch).await,
             None,
             "test setup must reproduce the proposal_files=None trigger condition"
         );
 
-        // Step 1 of end_stale_waiting_session: find the worktree and rescue it
-        // with a commit. It is NOT removed on this path, so the assertion below
-        // covers the tree as well as the branch.
         assert!(
             matches!(
                 find_worktree_for_branch(&repo_root, branch).await,
@@ -65,20 +41,12 @@ mod end_stale_session_branch_preservation {
              cleanup worker (ADR 0035)"
         );
 
-        // Step 2 (post-fix): the no-proposal-files else branch is a no-op
-        // for discard=false. The buggy version called
-        // `git_cmd(&["branch", "-D", branch], &repo_root)` here.
-        //
-        // A future regression that re-introduces the deletion in
-        // `end_stale_waiting_session` (or in a sibling cleanup path) will
-        // fail the branch_head_sha check below.
         assert!(
             branch_head_sha(&repo_root, branch).await.is_some(),
             "Apply intent on a branch with no proposable diff must leave the \
              branch ref intact so the user can retry / inspect / discard"
         );
 
-        // And the user's actual commits are still reachable.
         let log = git_cmd(&["log", "--oneline", branch], &repo_root)
             .await
             .expect("git log runs");
@@ -91,11 +59,6 @@ mod end_stale_session_branch_preservation {
         );
     }
 
-    /// Same setup, but the branch has real changes, so
-    /// `proposal_files_for_branch` returns `Some(..)`. The function takes the
-    /// propose-change arm (not the deleted else) and the branch is preserved by
-    /// that path's normal success flow. We pin this to make sure removing the
-    /// destructive else branch did not interfere with the happy path.
     #[tokio::test]
     async fn apply_intent_preserves_branch_when_proposal_files_returns_some() {
         let branch = "claude-code/preserve-branch-with-real-diff";
@@ -114,7 +77,6 @@ mod end_stale_session_branch_preservation {
             "test setup: real-changes branch yields Some(files)"
         );
 
-        // Step 1 of end_stale_waiting_session: rescue the worktree, keep it.
         rescue_stale_worktree(&wt).await;
 
         assert!(
@@ -126,17 +88,6 @@ mod end_stale_session_branch_preservation {
 }
 
 mod unknown_worktree_lookup_is_not_a_no {
-    //! Regression for the class in `.claude/rules/rust.md`: a probe that could
-    //! not run must never authorize a destructive arm.
-    //!
-    //! `find_worktree_for_branch` used to answer `None` for a spawn failure, a
-    //! non-zero exit and its 30s timeout, all routine on a saturated host. The
-    //! stale settle read that as "nothing holds the branch" and skipped the
-    //! rescue, or, on a Discard, force-removed whatever tree it did find.
-    //!
-    //! The lookup is a parameter now, so this drives the `Unknown` arm against a
-    //! real repo. A bogus root would prove nothing, since the removal would have
-    //! failed against it anyway.
 
     use crate::engine::agent_recovery::settle_stale_worktree;
     use crate::engine::git_ops::{branch_head_sha, proposal_files_for_branch, WorktreeLookup};
@@ -145,8 +96,6 @@ mod unknown_worktree_lookup_is_not_a_no {
 
     const BRANCH: &str = "lucidos-claude-code-repo-unknown-lookup-3e0ffee0";
 
-    /// A Discard is the one arm that removes a tree. It must still not remove
-    /// one git never located, even though the user asked for the discard.
     #[tokio::test]
     async fn an_unknown_lookup_never_removes_a_stale_worktree() {
         let (_tmp, repo_root, wt) = make_repo_and_worktree(BRANCH).await;
@@ -176,8 +125,6 @@ mod unknown_worktree_lookup_is_not_a_no {
         );
     }
 
-    /// The same skip on the non-discard arm. An auto-commit is not destructive,
-    /// but committing into a tree we could not locate is still acting on a guess.
     #[tokio::test]
     async fn an_unknown_lookup_never_rescues_a_stale_worktree() {
         let (_tmp, repo_root, wt) = make_repo_and_worktree(BRANCH).await;
@@ -199,8 +146,6 @@ mod unknown_worktree_lookup_is_not_a_no {
         );
     }
 
-    /// The counterpart, so the two skips above are not vacuous: a located tree
-    /// really is removed on a Discard.
     #[tokio::test]
     async fn a_found_lookup_still_removes_the_discarded_worktree() {
         let (_tmp, repo_root, wt) = make_repo_and_worktree(BRANCH).await;
@@ -223,14 +168,6 @@ mod unknown_worktree_lookup_is_not_a_no {
 }
 
 mod app_thread_stale_settle {
-    //! An **app** coding-agent thread's worktree and branch live in the
-    //! WORKSPACE git, not the Lucidos source repo. `end_stale_waiting_session`
-    //! used to ask the Lucidos repo about both, so Apply proposed nothing, Stop
-    //! settled with no Apply card, and Discard left the branch behind.
-    //!
-    //! These pin the routing target with a real workspace-shaped repo, and the
-    //! worktree property the settle now holds: a Discard removes the tree,
-    //! everything else rescues it and leaves it alone.
 
     use crate::engine::agent_recovery::{
         remove_discarded_stale_worktree, rescue_stale_worktree, stale_discard_branch_delete_root,
@@ -260,10 +197,6 @@ mod app_thread_stale_settle {
         git_cmd(&["commit", "-m", "seed"], root).await.unwrap();
     }
 
-    /// A workspace git holding the thread's app, a sibling app and an artifact,
-    /// plus a separate Lucidos-source repo. Returns
-    /// `(tmpdir, workspace, lucidos, app worktree)`, with the worktree a sparse
-    /// cone over the thread's own app, exactly as the spawn path builds it.
     async fn workspace_with_app_worktree() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
@@ -312,9 +245,6 @@ mod app_thread_stale_settle {
             .unwrap();
     }
 
-    /// The bug. The app branch is proposable from the workspace git and
-    /// invisible to the Lucidos repo. A settle rooted at the Lucidos repo
-    /// therefore reads committed work as "no proposable diff".
     #[tokio::test]
     async fn an_app_branch_is_proposable_only_from_the_workspace_git() {
         let (_tmp, workspace, lucidos, wt) = workspace_with_app_worktree().await;
@@ -342,8 +272,6 @@ mod app_thread_stale_settle {
         );
     }
 
-    /// The rescue commit is what carries uncommitted work into the Apply card:
-    /// the proposal reads committed state only.
     #[tokio::test]
     async fn the_rescue_commit_puts_uncommitted_app_work_into_the_proposal() {
         let (_tmp, workspace, _lucidos, wt) = workspace_with_app_worktree().await;
@@ -368,8 +296,6 @@ mod app_thread_stale_settle {
         );
     }
 
-    /// Discard is the one arm that removes the tree, and it has to: git refuses
-    /// to delete a branch a worktree still has checked out.
     #[tokio::test]
     async fn discarding_an_app_thread_leaves_no_branch_and_no_worktree() {
         let (_tmp, workspace, lucidos, wt) = workspace_with_app_worktree().await;
@@ -393,11 +319,6 @@ mod app_thread_stale_settle {
         );
     }
 
-    /// The structural half, in the style of ADR 0035's
-    /// `the_completion_path_removes_only_the_two_worktrees_it_is_allowed_to`. A
-    /// behavioural test shows only that today's paths keep the tree. It cannot
-    /// stop the next reader putting a removal back on the Apply or Stop arm.
-    /// There it would be a teardown reclaiming a worktree.
     #[test]
     fn the_stale_settle_removes_a_worktree_only_on_discard() {
         const RECOVERY_SRC: &str = include_str!("../agent_recovery/recovery.rs");
@@ -428,18 +349,6 @@ mod app_thread_stale_settle {
 }
 
 mod a_refused_branch_delete_is_reported {
-    //! The stale settle's `git branch -D` must say so when git refuses.
-    //!
-    //! `git_cmd` answers `Ok` for a non-zero exit, so an `if let Err` over it
-    //! fires only on a spawn failure or the 30s timeout. Git refuses while a
-    //! worktree still holds the branch, which is what an `Unknown` lookup
-    //! leaves: `settle_stale_worktree` skips its removal, and the Discard then
-    //! failed silently with the branch and its commits still there.
-    //!
-    //! `end_stale_waiting_session` needs a `LucidosEngine`, so the call site is
-    //! pinned by source, in the style of the tripwire above. The behavioural
-    //! half proves what the scan is about, against real git in a tempdir it
-    //! made itself.
 
     use crate::engine::git_ops::{branch_head_sha, git_cmd, git_ran_ok};
     use crate::test_support::make_repo_and_worktree;
@@ -496,12 +405,6 @@ mod a_refused_branch_delete_is_reported {
 }
 
 mod a_stale_recovery_keeps_withheld_work_visible {
-    //! I9: stale-session recovery ends its turn with `CodingAgentIdled`. Its
-    //! `has_changes` must report the branch's work whether a change carries it
-    //! or the turn end withheld it. Reporting "proposed or not" erased
-    //! withheld work to `none`. `end_stale_waiting_session` needs a
-    //! `LucidosEngine`, so the call site is pinned by source and the projection
-    //! half is replayed through the bus.
 
     use crate::engine::event_bus::{BusEvent, EventBus};
     use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent, UnproposedReason};
@@ -531,8 +434,6 @@ mod a_stale_recovery_keeps_withheld_work_visible {
         );
     }
 
-    /// The stale path's events for withheld work: the withholding, then the
-    /// idle with work. The work ends unproposed with its reason, never `none`.
     #[tokio::test]
     async fn withheld_work_survives_the_stale_idle() {
         let (pool, db) = setup_test_db().await;
@@ -586,11 +487,6 @@ mod a_stale_recovery_keeps_withheld_work_visible {
 }
 
 mod recovery_pass_shape {
-    //! Source-shape checks for `recovery.rs`. No harness builds a
-    //! `LucidosEngine`, so the stale settle and the boot recovery pass cannot be
-    //! driven end to end. Each test pins one ordering or call shape that no
-    //! behavioural test can see. Comment lines are stripped first, so a comment
-    //! cannot satisfy or break a check.
 
     const RECOVERY_SRC: &str = include_str!("../agent_recovery/recovery.rs");
     const MAIN_SRC: &str = include_str!("../../../../lucidos-engine-bin/src/main.rs");

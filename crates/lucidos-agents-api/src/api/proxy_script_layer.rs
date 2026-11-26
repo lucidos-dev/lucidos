@@ -1,8 +1,3 @@
-//! `ScriptHandshakeLayer` — runs a per-provider login script (or reuses
-//! a cached result) and attaches the resulting headers to subsequent
-//! requests. Owns the singleflight gate that keeps concurrent first-time
-//! requests for the same proxy from all spawning the script.
-
 use crate::api::proxy::fetch_required_credential;
 use crate::core::oauth;
 use crate::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint, ScopeBinding};
@@ -21,25 +16,14 @@ fn handshake_ttl(expires_in: u64) -> Duration {
     Duration::from_secs(expires_in.max(MIN_HANDSHAKE_TTL_SECS))
 }
 
-/// Looks up + auto-refreshes the OAuth accounts that a script_handshake
-/// layer wants injected as `OAUTH_<P>_ACCESS_TOKEN` env vars. Trait so
-/// the layer's tests can stub it without a Postgres pool.
 #[async_trait]
 pub trait OAuthLookup: Send + Sync {
-    /// Return the account for each requested provider (auto-refreshed if
-    /// expired). Errors mapped to layer-friendly `(StatusCode, message)`.
-    /// A missing provider must surface as `502 BAD_GATEWAY` with a message
-    /// that names the provider, so the operator knows which
-    /// `connect_oauth_account` to run.
     async fn fetch_for_providers(
         &self,
         providers: &[String],
     ) -> Result<Vec<oauth::OAuthAccount>, (StatusCode, String)>;
 }
 
-/// Default `OAuthLookup` impl used in production: pulls from the
-/// `oauth_accounts` table and calls `oauth::refresh_oauth_if_needed` on
-/// each row.
 pub struct DbOAuthLookup {
     pool: PgPool,
 }
@@ -84,9 +68,6 @@ impl OAuthLookup for DbOAuthLookup {
 pub struct ScriptHandshakeLayer {
     namespace: String,
     proxy_name: String,
-    /// Optional: the credential whose `CRED_<NAME>*` env vars are injected
-    /// before the script runs. `None` = inject no credential env vars (the
-    /// script obtains its secret by other means).
     credential: Option<String>,
     script_rel_path: String,
     base_url: String,
@@ -98,9 +79,6 @@ pub struct ScriptHandshakeLayer {
 }
 
 impl ScriptHandshakeLayer {
-    // Plain constructor that stores each parameter into the matching struct
-    // field — wrapping in a builder would only push the parameter list up one
-    // level without simplifying the layer-construction site.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         namespace: String,
@@ -143,10 +121,6 @@ impl ScriptHandshakeLayer {
         )
     }
 
-    /// Resolve the headers for this request: cache hit → reuse; miss →
-    /// singleflight the script run, parse, cache, return. Bool is whether
-    /// the headers came from a pre-existing cache entry (so a 401 from
-    /// upstream is worth a retry-after-cache-invalidation).
     async fn resolve_headers(
         &self,
     ) -> Result<(Vec<(HeaderName, HeaderValue)>, bool), (StatusCode, String)> {
@@ -157,10 +131,6 @@ impl ScriptHandshakeLayer {
         Ok((token.headers, was_hit))
     }
 
-    /// Actually run the script: pull credential + OAuth tokens, build env
-    /// vars, call the runner, map errors to (StatusCode, message). OAuth
-    /// lookup runs first so a missing provider fails fast with a clear
-    /// 502 before the credential store is touched.
     async fn run_script(
         &self,
     ) -> Result<(Vec<(HeaderName, HeaderValue)>, Duration), (StatusCode, String)> {
@@ -174,10 +144,6 @@ impl ScriptHandshakeLayer {
                 .await?
         };
 
-        // Inject `CRED_<NAME>*` only when a credential is configured. When
-        // it's absent the script sources its secret elsewhere (OS keychain,
-        // OAuth-only exchange) — run it with no credential env vars from this
-        // layer, and don't error on the missing credential.
         let mut env_vars = match &self.credential {
             Some(name) => {
                 let cred = fetch_required_credential(&self.pool, name).await?;
@@ -206,8 +172,6 @@ impl ScriptHandshakeLayer {
                 let ttl = handshake_ttl(out.expires_in);
                 Ok((out.headers, ttl))
             }
-            // Both name a broken `apis.json`, not a broken upstream, so they
-            // answer 500 rather than the 502 every other arm gets.
             Err(e @ (RunError::NotFound(_) | RunError::PathRejected(_))) => {
                 Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
             }
@@ -247,10 +211,6 @@ impl AuthLayer for ScriptHandshakeLayer {
     async fn apply(&self, _input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         let (headers, was_hit) = self.resolve_headers().await?;
 
-        // Convert to (name, String) once. A non-ASCII HeaderValue can't
-        // be forwarded as a UTF-8 string; surface the error instead of
-        // silently sending an empty header that would cause an opaque
-        // upstream 401.
         let mut add_headers: Vec<(HeaderName, String)> = Vec::with_capacity(headers.len());
         for (name, value) in headers {
             let s = value.to_str().map_err(|e| {
@@ -290,10 +250,6 @@ impl AuthLayer for ScriptHandshakeLayer {
 mod tests {
     use super::*;
 
-    /// Write the fixture script AND record it as approved, which is what an
-    /// in-process file tool does when the agent authors one. Without the
-    /// record the runner refuses it before the spawn (ADR 0144). Every test
-    /// here would then fail on the guard rather than on what it checks.
     fn write_approved_script(ws: &std::path::Path, body: &str) {
         let rel = "data/scripts/auth/echo.py";
         let abs = ws.join(rel);
@@ -329,9 +285,6 @@ mod tests {
         }
     }
 
-    /// Errors with the production "provider not connected" message via
-    /// the shared `oauth::provider_not_connected_msg` helper, so layer
-    /// tests assert against the same string the user would see.
     struct MissingProviderLookup;
 
     #[async_trait]
@@ -348,8 +301,6 @@ mod tests {
         }
     }
 
-    /// Panics on invocation — proves the layer skips OAuth lookup when
-    /// `oauth_providers` is empty.
     struct PanicLookup;
 
     #[async_trait]
@@ -431,8 +382,6 @@ mod tests {
         assert_eq!(m.add_headers[0].0.as_str(), "authorization");
         assert_eq!(m.add_headers[0].1, "Bearer cached-token");
 
-        // Outputs expose the produced headers (as an object — downstream
-        // layers look up `prior["script_handshake"]["headers"]["x-foo"]`).
         let headers = m.outputs["headers"].as_object().unwrap();
         assert_eq!(
             headers.get("authorization").and_then(|v| v.as_str()),
@@ -442,10 +391,6 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_non_ascii_header_value_with_502() {
-        // A handshake script that returns a header with non-ASCII bytes
-        // would silently get forwarded as an empty Authorization header
-        // (and the upstream would 401 with no diagnostic). Surface as 502
-        // instead so the operator sees an actionable error.
         let cache = Arc::new(ProxyTokenCache::new());
         let layer = layer_no_oauth(cache.clone());
         let raw = HeaderValue::from_bytes(b"\xff non-ascii").unwrap();
@@ -488,12 +433,6 @@ mod tests {
         assert!(cache.get(&key).await.is_none(), "should be invalidated");
     }
 
-    /// A minted token is bound to the host it was minted for. An `apis.json`
-    /// rewrite that repoints the same entry at another host must miss the warm
-    /// cache, never replay the token. Keying by proxy name alone leaked it. The
-    /// cache hit skipped the runner's hash check. A rewritten base_url plus an
-    /// unrecorded script then handed a token minted for the legit host to the
-    /// attacker. This test fails if the base_url leaves the cache key.
     #[tokio::test]
     async fn a_rewritten_base_url_cannot_replay_a_cached_token_to_another_host() {
         let cache = Arc::new(ProxyTokenCache::new());
@@ -510,7 +449,6 @@ mod tests {
             cache.clone(),
             Arc::new(PanicLookup),
         );
-        // Warm the cache exactly as a legitimate first call would.
         cache
             .insert(
                 &legit.cache_key(),
@@ -522,8 +460,6 @@ mod tests {
             )
             .await;
 
-        // The app rewrites apis.json: same entry name (the old cache key), the
-        // attacker's host, and an unrecorded script.
         let attacker = ScriptHandshakeLayer::new(
             "script_handshake".into(),
             "comfort".into(),
@@ -546,7 +482,6 @@ mod tests {
             cache.get(&attacker.cache_key()).await.is_none(),
             "the token minted for the legit host must not be reachable off it"
         );
-        // The legit host still serves its cached token, a hit with no script run.
         let body = Bytes::new();
         let prior = HashMap::new();
         let input = input_for(&body, "https://accsmart.panasonic.test/x", &prior);
@@ -555,10 +490,6 @@ mod tests {
         assert_eq!(m.add_headers[0].1, "Bearer minted-for-panasonic");
     }
 
-    /// The injected secrets decide the minted token, so changing the credential
-    /// (or the OAuth providers) must change the cache key. Otherwise a config
-    /// that swaps the injected account keeps serving the token minted for the old
-    /// one until it expires.
     #[tokio::test]
     async fn changing_the_injected_credential_changes_the_cache_key() {
         let cache = Arc::new(ProxyTokenCache::new());
@@ -742,7 +673,6 @@ print(json.dumps({
 
         let (pool, db_name) = setup_test_db().await;
 
-        // (auth_type, auth_value, expected env-vars seen by script)
         type AuthCase = (
             AuthType,
             &'static str,
@@ -773,8 +703,6 @@ print(json.dumps({
             )
             .await;
 
-            // Fresh ProxyTokenCache + layer per iteration so the previous
-            // case's headers can't satisfy this one's request.
             let layer = ScriptHandshakeLayer::new(
                 "script_handshake".into(),
                 "proxy".into(),
@@ -832,15 +760,6 @@ print(json.dumps({
 
     #[tokio::test]
     async fn credential_none_runs_script_without_injecting_cred_env_vars() {
-        // A script_handshake layer with no configured credential must run the
-        // script (returning its headers) and inject NO `CRED_*` env vars — the
-        // script sources its secret elsewhere. It must not error on the absent
-        // credential, and must not touch the credential store (so a lazy pool
-        // pointed at an unreachable DB is fine — it's never queried).
-        //
-        // The script lives under `data/scripts/auth/` while the config value is
-        // `scripts/auth/echo.py`, so this also exercises the `data/`-relative
-        // path resolution end-to-end through the layer.
         const ECHO_SCRIPT: &str = r#"
 import os, json
 print(json.dumps({

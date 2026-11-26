@@ -6,17 +6,6 @@ use crate::engine::LucidosEngine;
 
 use crate::engine::restore_boot::{turn_activity_events, turn_terminal_events};
 
-/// SQL the orphan-recovery sweep runs to find chat / trigger / CC threads
-/// whose last exchange has activity events but no terminal event. Extracted
-/// from `recover_orphaned_threads` as a `const` so the test in the sibling
-/// module can run the exact same query against a hand-built fixture without
-/// duplicating the SQL.
-///
-/// An archived thread is a candidate only while it is still `running`, so its
-/// turn died with the last engine. A turn that died then still died, and an
-/// archived thread left `running` shows in Current. The status test keeps the
-/// sweep off history: every earlier engine reset those rows to `idle` at boot,
-/// so a first boot does not revive every archived thread that ever crashed.
 const ORPHAN_THREADS_SQL: &str = concat!(
     r#"
 WITH candidate_threads AS (
@@ -102,14 +91,9 @@ WHERE e.event_type IN ('ToolCalled', 'ToolResult')
 ORDER BY e.thread_id, e.created, e.sequence
 "#;
 
-/// What a recovery abort says when the dead turn streamed no text of its own.
 pub(crate) const RESTART_INTERRUPTED_TEXT: &str =
     "This response was interrupted by an engine restart.";
 
-/// The channel a recovery abort is emitted on: the one stamped on the turn's
-/// start row. A legacy start carries none, so its event type decides.
-/// `ChildThreadCompleted` rows carry the parent's channel, stamped by
-/// `notify_parent_of_child_completion`.
 pub(crate) fn start_channel(
     stamped: Option<&str>,
     start_type: Option<&str>,
@@ -124,13 +108,6 @@ pub(crate) fn start_channel(
         })
 }
 
-/// Record that the restart interrupted a thread's turn: a
-/// `ResponseAborted { RecoveryAfterRestart }` anchored on the turn's start
-/// event, so it reads "Response interrupted" with a Continue. The chat sweep
-/// and both boot settles end a dead turn this way.
-///
-/// Direct `.emit` rather than `emit_response_aborted`, so each caller can log
-/// the `Err` against the thread it was settling.
 pub(crate) async fn emit_restart_abort(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: uuid::Uuid,
@@ -179,29 +156,7 @@ pub async fn resume_pending_chat_switches(
 
 #[easy_ext::ext(ChatRecoveryExt)]
 pub(crate) impl LucidosEngine {
-    /// Detect threads whose last exchange has activity events but no terminal event.
-    /// These are in-flight threads (chat or CC) that died when the engine crashed.
-    /// Handles both first-exchange orphans (has_response=false) and multi-exchange
-    /// orphans where a previous exchange completed but the latest was interrupted
-    /// (e.g., lid close during tool execution after a prior ResponseGenerated).
-    ///
-    /// Emits ResponseAborted via EventBus with partial text so the thread is
-    /// marked UNREAD and the user notices. The actor is stamped as `System` so
-    /// the AbortPanel renders "System": the host system killed the previous
-    /// response (engine crashed, OS killed the process, etc.); the engine on
-    /// restart is just marking it. `request_event_id` is the originating
-    /// MessageReceived/TriggerStarted id — the user-facing rerun path uses
-    /// this to find the prompt to re-run.
-    ///
-    /// `exclude_thread_ids` — threads being actively recovered by worktree recovery;
-    /// they should not be aborted here since CC recovery will handle them.
     async fn recover_orphaned_threads(self: &Arc<Self>, exclude_thread_ids: &[uuid::Uuid]) {
-        // Find threads where the LAST exchange boundary (MessageReceived or
-        // TriggerStarted) has activity events after it but no terminal
-        // event. Returns the originating event id and the originating event's
-        // type so the emitted ResponseAborted can carry `request_event_id`
-        // linking back to it AND the right channel (chat vs trigger).
-        // Tuple shape: (thread_id, partial_text, originating_event_id, originating_event_type, originating_channel).
         type OrphanRow = (
             uuid::Uuid,
             Option<String>,
@@ -266,16 +221,9 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Blast-radius bound on the boot auto-resume. A switch normally interrupts one
-/// or two in-flight chat threads; this only bites on a pathological workspace.
-/// Anything over the cap is logged by thread id and keeps its manual Continue —
-/// a silent truncation would read as "resumed everything".
 const MAX_CHAT_SWITCH_RESUMES: usize = 16;
 
 fn switch_resume_candidates_sql() -> String {
-    // One row per thread: the unsuperseded clause admits only a thread's newest
-    // abort. Oldest interruption first, so a boot resumes in the order the
-    // threads were interrupted.
     format!(
         "SELECT e.aggregate_id::uuid AS thread_id, e.sequence AS abort_sequence \
          FROM events e \
@@ -295,9 +243,6 @@ fn switch_resume_candidates_sql() -> String {
     )
 }
 
-/// Run [`switch_resume_candidates_sql`]. Errors yield an empty list (logged): a
-/// transient DB failure must degrade to the manual Continue affordance, never to a
-/// panic on the boot path.
 pub(crate) async fn switch_resume_candidates(pool: &sqlx::PgPool) -> Vec<uuid::Uuid> {
     match sqlx::query_as::<_, (uuid::Uuid, i64)>(&switch_resume_candidates_sql())
         .fetch_all(pool)
@@ -317,7 +262,7 @@ pub(crate) async fn switch_resume_candidates(pool: &sqlx::PgPool) -> Vec<uuid::U
 
 #[easy_ext::ext(ChatSwitchResumeExt)]
 pub(crate) impl LucidosEngine {
-    /// Auto-resume the chat / trigger threads a user-initiated *Switch to new
+    /// INVARIANT: Auto-resume the chat / trigger threads a user-initiated *Switch to new
     /// version* interrupted — the chat parity of `resume_pending_switches`.
     ///
     /// Drives each candidate through `continue_chat`, the same entry point the
@@ -380,7 +325,7 @@ pub(crate) impl LucidosEngine {
                     );
                     resumed.push(thread_id);
                 }
-                // NOT added to `resumed`: the promise was not kept, so the floor
+                // INVARIANT: NOT added to `resumed`: the promise was not kept, so the floor
                 // must withdraw it and restore the manual Continue button.
                 Err(e) => log_legacy!(
                     "[Recovery] chat switch-resume for thread {} failed: {} — \
@@ -412,30 +357,10 @@ fn interrupted_tool_result(
 
 #[easy_ext::ext(OrphanToolRecoveryExt)]
 pub(crate) impl LucidosEngine {
-    /// Re-emit a synthetic `ToolResult` for every persisted `ToolCalled` that
-    /// has no matching `ToolResult` in the same thread. Mirror of the
-    /// `ResponseAborted` recovery sweep above, but at the inner tool layer:
-    /// when the engine dies mid-tool, the `ToolCalled` event lands in the
-    /// events table but no `ToolResult` ever arrives. On the next LLM call,
-    /// the resume builder reconstructs an assistant `tool_use` block for
-    /// that orphan, and the Claude API rejects with "tool_use ids were
-    /// found without tool_result blocks immediately after".
-    ///
-    /// Pairing rule lives in `core::store::find_orphan_tool_called_ids` —
-    /// shared with the resume builder so both layers identify the same set
-    /// of orphans.
-    ///
-    /// Idempotent: subsequent restarts find no orphans because the synthetic
-    /// `ToolResult` we emit on the first pass pairs with the same
-    /// `ToolCalled` on the second pass.
     async fn recover_orphan_tool_calls(self: &Arc<Self>) {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, MessageOrigin};
 
-        // Archived threads included, as in `recover_orphaned_threads`: the
-        // aborted turn's dangling call still needs its pair. SQL is in the
-        // `ORPHAN_TOOL_CALLS_SQL` const at module top so the sibling test in
-        // `recovery_tests` can run the exact same query.
         let rows: Vec<EventRow> = match sqlx::query_as::<_, EventRow>(&orphan_tool_calls_sql())
             .fetch_all(self.pool())
             .await

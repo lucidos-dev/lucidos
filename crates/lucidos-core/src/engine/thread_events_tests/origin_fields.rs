@@ -18,7 +18,6 @@ fn continuation_started_event_can_carry_engine_origin() {
 
 #[test]
 fn continuation_started_event_origin_defaults_to_none_when_missing() {
-    // Old DB rows without origin must deserialize cleanly.
     let json = r#"{"type":"ContinuationStarted","branch":"claude-code/20260318"}"#;
     let parsed: ThreadEvent = serde_json::from_str(json).unwrap();
     match parsed {
@@ -32,11 +31,6 @@ fn continuation_started_event_origin_defaults_to_none_when_missing() {
 
 #[test]
 fn continuation_started_event_accepts_legacy_session_recovered_alias() {
-    // Old DB rows persisted as SessionRecovered must still deserialize as the
-    // renamed ContinuationStarted variant. Also covers the older SessionResumed
-    // name (renamed → SessionRecovered in 2026-03-20, then →
-    // ContinuationStarted in 2026-05-13). Without the serde aliases the
-    // projection blows up on every historical row.
     for legacy in &[
         r#"{"type":"SessionRecovered","branch":"claude-code/legacy"}"#,
         r#"{"type":"SessionResumed","branch":"claude-code/older-legacy"}"#,
@@ -81,7 +75,6 @@ fn change_proposed_event_can_carry_engine_origin() {
 
 #[test]
 fn change_proposed_event_origin_defaults_to_none_when_missing() {
-    // Old DB rows without origin must deserialize cleanly.
     let json = r#"{"type":"ChangeProposed","change_id":"x","description":"y","files":[],"requires_restart":false}"#;
     let parsed: ThreadEvent = serde_json::from_str(json).unwrap();
     match parsed {
@@ -203,8 +196,6 @@ fn trigger_started_origin_defaults_to_none_when_missing() {
     }
 }
 
-// ---- `mode` field deserialization for MessageReceived ----
-
 #[test]
 fn message_received_mode_field_deserializes() {
     let json = r#"{"type":"MessageReceived","text":"hi","mode":"engine"}"#;
@@ -215,9 +206,6 @@ fn message_received_mode_field_deserializes() {
     }
 }
 
-/// Legacy DB rows predating the `mode` field must replay as `Human` so
-/// historical events keep loading. New emissions are forced by the API
-/// layer to set `mode` explicitly.
 #[test]
 fn message_received_no_mode_defaults_to_human() {
     let json = r#"{"type":"MessageReceived","text":"hi"}"#;
@@ -228,14 +216,10 @@ fn message_received_no_mode_defaults_to_human() {
     }
 }
 
-// ---- the cause of a plugin setup update ----
-
 fn setup_occasion(json: &str) -> PluginSetupOccasion {
     serde_json::from_str(json).unwrap()
 }
 
-/// Every `plugin_setup` origin stored before the cause existed means the
-/// instructions changed, so it must decode to exactly that.
 #[test]
 fn a_legacy_plugin_setup_update_decodes_as_instructions_changed() {
     for json in [

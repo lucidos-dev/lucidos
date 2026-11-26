@@ -1,8 +1,3 @@
-//! The `permissions` table: a projection of `PermissionGranted`,
-//! `PermissionSpent`, `PermissionRestored`, `PermissionRevoked` and `ChangeApplied`, written in the
-//! thread projection's transaction, and of `PermissionGrantsChanged`, written
-//! in the system projection's.
-
 use uuid::Uuid;
 
 use super::{action_wire, Action, Holder, Lifetime, PickedBy};
@@ -11,7 +6,6 @@ use crate::core::grants::{GrantFile, GrantSource};
 type Tx<'a, 'b> = &'a mut sqlx::Transaction<'b, sqlx::Postgres>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// One granted permission, as its event carries it.
 pub(crate) struct Granted<'a> {
     pub(crate) permission_id: Uuid,
     pub(crate) action: Action,
@@ -23,8 +17,6 @@ pub(crate) struct Granted<'a> {
     pub(crate) picked_by: &'a PickedBy,
 }
 
-/// Record a granted permission. A second live row for the same tool grant
-/// line and holder is dropped, so a replay converges.
 pub(crate) async fn write_granted(
     tx: Tx<'_, '_>,
     thread_id: Uuid,
@@ -55,7 +47,7 @@ pub(crate) async fn write_granted(
     Ok(())
 }
 
-/// Make `grant_file`'s live standing rows equal `patterns`: end each row the
+/// INVARIANT: Make `grant_file`'s live standing rows equal `patterns`: end each row the
 /// set dropped, and add a row for each line it gained. A thread that no longer
 /// exists is not recorded as where a row was granted. Legacy imports only add
 /// rows, even when the file omits held grants.
@@ -95,8 +87,6 @@ pub(crate) async fn write_standing_set(
     Ok(())
 }
 
-/// End a live permission for `reason`, and say whether it was live. An ended
-/// one keeps its first reason.
 async fn end_live(tx: Tx<'_, '_>, permission_id: Uuid, reason: &str) -> Result<bool, BoxError> {
     let ended = sqlx::query(
         "UPDATE permissions SET ended_at = NOW(), end_reason = $2 \
@@ -109,7 +99,6 @@ async fn end_live(tx: Tx<'_, '_>, permission_id: Uuid, reason: &str) -> Result<b
     Ok(ended.rows_affected() > 0)
 }
 
-/// End a live permission for `reason`. An ended one keeps its first reason.
 pub(crate) async fn write_ended(
     tx: Tx<'_, '_>,
     permission_id: Uuid,
@@ -119,8 +108,6 @@ pub(crate) async fn write_ended(
     Ok(())
 }
 
-/// Spend a live permission. A spend of one that already ended, such as a
-/// revoked one, fails, so its event rolls back and the action never runs.
 pub(crate) async fn write_spent(tx: Tx<'_, '_>, permission_id: Uuid) -> Result<(), BoxError> {
     if end_live(tx, permission_id, "spent").await? {
         Ok(())
@@ -129,8 +116,6 @@ pub(crate) async fn write_spent(tx: Tx<'_, '_>, permission_id: Uuid) -> Result<(
     }
 }
 
-/// The thread's change applied, so every *until the plan lands* permission it
-/// holds ends.
 pub async fn end_until_plan_lands(tx: Tx<'_, '_>, thread_id: Uuid) -> Result<(), BoxError> {
     sqlx::query(
         "UPDATE permissions SET ended_at = NOW(), end_reason = 'plan_landed' \
@@ -143,7 +128,7 @@ pub async fn end_until_plan_lands(tx: Tx<'_, '_>, thread_id: Uuid) -> Result<(),
     Ok(())
 }
 
-/// Copy only a spent once grant. Keep the original request, holder and timestamp,
+/// INVARIANT: Copy only a spent once grant. Keep the original request, holder and timestamp,
 /// so restoration cannot extend the grant into another turn or snapshot era.
 pub(crate) async fn write_restored(
     tx: Tx<'_, '_>,
@@ -165,7 +150,6 @@ pub(crate) async fn write_restored(
     .execute(&mut **tx)
     .await?;
     if copied.rows_affected() == 0 {
-        // A projection replay may already have inserted this exact restoration.
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM permissions WHERE permission_id = $1)")
                 .bind(restored)

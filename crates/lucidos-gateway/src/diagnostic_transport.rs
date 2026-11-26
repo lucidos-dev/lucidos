@@ -1,4 +1,3 @@
-//! Diagnostic workspace-call ingress. Chat stamps cannot authorize a delivery.
 use crate::{
     error::ApiError,
     gateway_protocol::{AuthenticatedGateway, HEADER_GATEWAY_CREDENTIAL},
@@ -17,8 +16,6 @@ use lucidos_gateway_stamp::{
 
 const HEADER_SIGNATURE: &str = "x-lucidos-diagnostic-relay-signature";
 
-/// Only constructed after authenticating the source hop. The proxy strips all
-/// incoming claim headers and stamps this extension for the receiving engine.
 #[derive(Debug, Clone)]
 pub(crate) struct AttestedDiagnosticDelivery(DiagnosticDelivery);
 
@@ -92,8 +89,6 @@ fn verified_relay(
     ) {
         return None;
     }
-    // The sender chooses workspace names, but cannot choose another pairing's
-    // namespace. Hash a framed tuple to keep even maximum-length names bounded.
     use sha2::{Digest, Sha256};
     let identity = serde_json::to_vec(&(pairing_id, delivery.origin())).ok()?;
     let origin = format!("paired:{:x}", Sha256::digest(identity));
@@ -101,8 +96,6 @@ fn verified_relay(
         .map(AttestedDiagnosticDelivery)
 }
 
-/// Behind the paired-gateway credential gate. The relay signature additionally
-/// binds diagnostic purpose, target, authenticated origin, delivery and body.
 pub(crate) async fn receive(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,

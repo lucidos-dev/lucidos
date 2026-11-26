@@ -1,10 +1,3 @@
-//! A best-effort signal from the gateway to every engine it routes.
-//!
-//! The gateway owns state its engines show, such as users and pairings
-//! that wait for an Allow. When it changes, each engine hears a POST and tells
-//! its pages through its own event stream. Nobody waits on the hops: a missed
-//! signal costs one stale screen until the next read, never a wrong decision.
-
 use std::time::Duration;
 
 use axum::body::Body;
@@ -13,12 +6,8 @@ use axum::http::{header, Request, StatusCode};
 use crate::engine_hop::{self, Credential, EngineAddress};
 use crate::server::GatewayState;
 
-/// One engine hop.
 const ENGINE_SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// POST `body` to `path` on every routed engine. Returns at once; outside a
-/// runtime, which only a sync test is, it does nothing. `what` names the
-/// signal in the log.
 pub fn signal_engines(
     state: &GatewayState,
     path: &'static str,
@@ -60,7 +49,6 @@ async fn signal_engine(
     let sent = engine_hop::send(engine, request, Credential::Local(local_token));
     match tokio::time::timeout(ENGINE_SIGNAL_TIMEOUT, sent).await {
         Ok(Ok(response)) if response.status().is_success() => {}
-        // An engine that predates the signal has no such route.
         Ok(Ok(response)) if response.status() == StatusCode::NOT_FOUND => {}
         Ok(Ok(response)) => crate::log_legacy!(
             "[Gateway] engine at {engine} refused the {what} signal: HTTP {}",

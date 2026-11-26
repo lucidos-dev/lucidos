@@ -3,10 +3,8 @@ import { batch, effect } from '@preact/signals';
 
 import {
   ApiError,
-  UPLOAD_STALLED_MESSAGE,
-  UPLOAD_UNANSWERED_MESSAGE,
   isTransientFetchError,
-  isTransportError,
+  uploadErrorMessage,
   uploadThreadBlob,
 } from '../../api/client';
 import { addAttachedImageHash, rememberSessionBlobUrl } from '../../components/chat/pastedImages';
@@ -83,18 +81,6 @@ function newPendingUpload(threadId: string, localId: string, file: File): Pendin
   };
 }
 
-export function describeUploadFailure(err: unknown): string {
-  if (err instanceof ApiError) return err.reason;
-  if (isTransportError(err)) return 'Lucidos could not be reached';
-  if (err instanceof DOMException && err.name === 'TimeoutError') {
-    const ours = err.message === UPLOAD_STALLED_MESSAGE || err.message === UPLOAD_UNANSWERED_MESSAGE;
-    return ours ? err.message : 'Lucidos took too long to answer';
-  }
-  if (err instanceof DOMException && err.name === 'AbortError') return 'The upload was interrupted';
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
-
 function isRefusal(err: unknown): boolean {
   return err instanceof ApiError && err.httpCode >= 400 && err.httpCode < 500;
 }
@@ -104,7 +90,7 @@ export function stateAfterFailure(
   failedAttempts: number,
   connected: boolean,
 ): PendingUploadState {
-  const reason = describeUploadFailure(err);
+  const reason = uploadErrorMessage(err);
   if (!isTransientFetchError(err)) return { kind: 'failed', reason, retryable: !isRefusal(err) };
   if (!connected) return { kind: 'offline', reason };
   if (failedAttempts > UPLOAD_RETRY_DELAYS_MS.length) return { kind: 'failed', reason, retryable: true };

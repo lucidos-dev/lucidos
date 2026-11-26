@@ -1,11 +1,3 @@
-//! `lucidos wake-parent yes|no`: a child thread's *wake decision* on this
-//! turn's report to its parent.
-//!
-//! The coding-agent counterpart of the chat agent's `wake_parent` LLM tool,
-//! over `POST /api/v1/threads/<id>/wake-decision`, which records the same
-//! events. `$LUCIDOS_THREAD_ID` names the thread and there is no `--thread`
-//! flag, so a session can only decide for its own report.
-
 use clap::ValueEnum;
 
 use crate::http::{client as http_client, send_and_print};

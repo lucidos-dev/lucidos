@@ -20,8 +20,6 @@ mod image_pin_tests {
         }
     }
 
-    /// The shape the loop builds for `view_image` / `read_file` on an image: the
-    /// explicit-view result text plus the lifted image block.
     #[test]
     fn recognises_an_explicitly_requested_image() {
         let blocks = vec![
@@ -34,8 +32,6 @@ mod image_pin_tests {
         assert!(holds_explicitly_requested_image(&blocks));
     }
 
-    /// `capture_app` writes the page's DOM text as its result, so it is not
-    /// recognised — ambient captures must keep aging out after one call.
     #[test]
     fn does_not_recognise_an_ambient_capture() {
         let blocks = vec![tool_result("Habit Tracker\nStreak: 4 days"), image_block()];
@@ -48,11 +44,6 @@ mod image_pin_tests {
         assert!(!holds_explicitly_requested_image(&blocks));
     }
 
-    /// Pinned images are exempt from trim pass 0 by construction, and the model
-    /// can issue as many image reads in one turn as its tool-call cap allows. A
-    /// "describe every photo in this folder" turn would otherwise accumulate
-    /// hundreds of un-strippable images and blow the context window. The cap
-    /// releases the oldest pin, keeping the most recent window.
     #[test]
     fn pins_are_capped_and_release_oldest_first() {
         let mut pins = Vec::new();

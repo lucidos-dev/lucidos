@@ -1,13 +1,3 @@
-//! Child→parent fan-in.
-//!
-//! When a child thread reaches a terminal event, [`EventBus::emit`]'s PostCommit
-//! phase drives these methods to decrement the parent's `active_children_count`,
-//! surface the parent to inbox, and emit the typed `ChildThreadCompleted` onto
-//! the parent thread.
-//!
-//! A report its wake mode or wake decision files lands as a `ChildReportFiled`
-//! instead, with no wake, no status write and no callback. See [`Delivery`].
-
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -19,11 +9,6 @@ use crate::engine::thread_events::{
 };
 use crate::engine::thread_lifecycle::{ArchiveState, ChangeStateKind, ThreadStatus};
 
-/// What the fan-in reads about a child, in one self-joined query.
-///
-/// `parent_is_coding_agent` comes from a `LEFT JOIN` on the parent's own row.
-/// It is `None` when the child has no parent, or when that parent row is
-/// missing (corruption, no safe default).
 #[derive(sqlx::FromRow)]
 struct ChildRow {
     parent_thread_id: Option<Uuid>,
@@ -36,43 +21,23 @@ struct ChildRow {
     status: ThreadStatus,
     coding_agent_change_state: ChangeStateKind,
     parent_is_coding_agent: Option<bool>,
-    /// The child's wake decision for this turn, NULL while undecided.
     parent_wake_requested: Option<bool>,
-    /// The child's *wake mode*, NULL when its spawn declared none.
     wake_mode: Option<String>,
-    /// Whether another child of the same parent, spawned
-    /// `wake-when-all-done`, is still working.
     batch_still_working: bool,
-    /// The child is in a *cache keep-alive* turn, which finishes nothing.
     keep_alive_turn: bool,
-    /// The child's handoff is pending, so its successor session reports at
-    /// the real end. Or it handed off to a legacy successor thread, which reports in
-    /// its place.
     handed_off: bool,
 }
 
 impl ChildRow {
-    /// A coding-agent child whose idle held its proposal (ADR 0395): its branch
-    /// has a diff, and no change carries it yet.
     fn holds_unproposed_work(&self) -> bool {
         self.is_coding_agent && self.coding_agent_change_state == ChangeStateKind::Unproposed
     }
 
-    /// The declared mode. A value the column's CHECK would refuse reads as
-    /// undeclared, which falls back to the wake decision.
     fn wake_mode(&self) -> Option<WakeMode> {
         self.wake_mode.as_deref().and_then(WakeMode::parse)
     }
 }
 
-/// [`ChildRow`]'s query. Bind the child, [`active_thread_statuses`] and the
-/// batch mode's name.
-///
-/// It runs after the child's terminal commits, so a sibling whose terminal
-/// committed first is no longer working. That is what lets the last batch child
-/// to commit always wake the parent (ADR 0451).
-///
-/// [`active_thread_statuses`]: crate::core::store::active_thread_statuses
 fn child_row_sql() -> String {
     format!(
         "SELECT c.parent_thread_id, c.is_coding_agent, c.title, \
@@ -91,7 +56,7 @@ fn child_row_sql() -> String {
     )
 }
 
-/// SQL for "another child of `child`'s parent, spawned `wake-when-all-done`,
+/// INVARIANT: SQL for "another child of `child`'s parent, spawned `wake-when-all-done`,
 /// is still working": the batch [`Delivery::for_report`] waits on. Bind
 /// `active_thread_statuses` to `statuses_param` and the batch mode's name to
 /// `mode_param`. The fan-in and the turn-end gate both read it, so the read
@@ -113,30 +78,19 @@ pub fn batch_still_working_sql(child: &str, statuses_param: &str, mode_param: &s
     )
 }
 
-/// Per-status summary caps. Success, no-changes and canceled summaries come
-/// from a real response the orchestrator may want most of. A failure summary
-/// is often a panic or a stack trace and must never dominate the parent's
-/// context.
 const SUCCESS_SUMMARY_CAP: usize = 2000;
 const FAILURE_SUMMARY_CAP: usize = 200;
 
-/// What an `interrupted` card tells the parent. Nothing resumes the child, so
-/// the parent must know the way to continue it.
 const INTERRUPTED_SUMMARY: &str = "An engine restart cut this child's turn before it \
      finished, and nothing will resume it on its own. Its work so far is kept. To continue, \
      send it a follow-up with follow_up_child_thread. If its own work may have \
      crashed the engine, such as a heavy build or test run, ask the user before restarting it.";
 
-/// What the card says when the last working child of a `wake-when-all-done`
-/// batch ends in an abort that otherwise sends no card.
 const BATCH_ABORT_SUMMARY: &str = "This child's turn was aborted before it finished, \
      with no report of its own, and nothing will resume it. It was the last child of your \
      wake-when-all-done batch still working, so this card wakes you to combine what the \
      batch filed. Send it a follow-up with follow_up_child_thread if you need its part.";
 
-/// Whether `event` is a restart abort that nobody promised to resume: a crash,
-/// or a teardown the user did not ask for. The user's own switch resumes the
-/// turn, so its abort is not a completion.
 fn restart_cut_without_resume(
     event: &ThreadEvent,
     actor: Option<&crate::engine::thread_events::MessageOrigin>,
@@ -148,7 +102,6 @@ fn restart_cut_without_resume(
     )
 }
 
-/// Cut `summary` to `cap` bytes on a char boundary, marking the cut.
 fn cap_summary(summary: String, cap: usize) -> String {
     if summary.len() <= cap {
         return summary;
@@ -157,7 +110,7 @@ fn cap_summary(summary: String, cap: usize) -> String {
     format!("{}… (truncated)", &summary[..cut])
 }
 
-/// The failure card's text. A provider policy block keeps the provider's own
+/// INVARIANT: The failure card's text. A provider policy block keeps the provider's own
 /// words and adds what the parent must do next. Its tail never falls to the
 /// cut, so the provider's words give way to fit `cap`. Every other failure
 /// relays `error` as it is.
@@ -174,24 +127,16 @@ fn failure_summary(error: &str, provider_error: Option<&ProviderError>, cap: usi
     format!("{words} {explanation}")
 }
 
-/// Whether a child is mid-turn, by the one in-flight definition the counters
-/// use. A child mid-turn is not owed a settle: its own terminal will report.
 fn in_flight(status: ThreadStatus) -> bool {
     crate::core::store::active_thread_statuses().contains(&status.as_str())
 }
 
-/// The name a completion card gives the child: its title, else the start of
-/// its first message.
 fn child_label(title: Option<String>, first_message: Option<String>) -> String {
     title
         .or_else(|| first_message.map(|m| m.chars().take(80).collect()))
         .unwrap_or_else(|| "unknown task".into())
 }
 
-/// Which user act ended a child that still owed its parent a card: a
-/// *stopped child* (ADR 0252) or one that ended a turn holding an event wait
-/// (ADR 0254). Each becomes the summary of the canceled card, so the parent
-/// reads what the user actually did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildSettle {
     Archived,
@@ -210,40 +155,23 @@ impl ChildSettle {
         }
     }
 
-    /// Whether this act ends the child's event waits. Archive and delete do.
-    /// A discard does not, so a child holding a wait wakes again and its turn reports.
     fn ends_waits(self) -> bool {
         !matches!(self, Self::Discarded)
     }
 }
 
-/// A canceled card a settle decided is owed, read while the child's row still
+/// INVARIANT: A canceled card a settle decided is owed, read while the child's row still
 /// exists. Delivered separately, because a delete must read before it deletes
 /// and deliver after it commits.
 pub struct OwedChildCard(ChildCompletion);
 
-/// Whether a child's report wakes its parent or is filed for its next turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
-    /// A `ChildThreadCompleted` that starts a parent turn.
     Wake,
-    /// A `ChildReportFiled` the parent reads on its next turn. It starts no
-    /// turn, moves no status, and no boot sweep re-fires it.
     File,
 }
 
 impl Delivery {
-    /// How one report is delivered (ADR 0451, as amended by ADR 0545).
-    ///
-    /// - `NoWake` files every report, whatever its status. The user reads a
-    ///   failure or a restart cut in the child itself.
-    /// - Under any other mode only a clean finish can file, and a recorded
-    ///   yes wakes. For a declared child only the engine records one: a turn
-    ///   it cut short, or an empty reply.
-    /// - A declared mode decides the rest. `WakeWhenAllDone` files while
-    ///   another child of its batch still works.
-    /// - With no mode, the wake decision does: a recorded no files, and an
-    ///   undecided turn wakes.
     pub fn for_report(
         status: ChildCompletionStatus,
         wake_mode: Option<WakeMode>,
@@ -266,9 +194,6 @@ impl Delivery {
         }
     }
 
-    /// How a card the engine owes outside a turn's own terminal is delivered:
-    /// a settle's canceled card, or the card held while an event wait was
-    /// live. No turn decided anything for it, so only the mode counts.
     fn for_owed_card(wake_mode: Option<WakeMode>) -> Self {
         if wake_mode == Some(WakeMode::NoWake) {
             Self::File
@@ -278,8 +203,6 @@ impl Delivery {
     }
 }
 
-/// One report owed to a parent, ready to deliver. The terminal fan-in, a
-/// settle, and the end of a child's last event wait each build one.
 struct ChildCompletion {
     child_thread_id: Uuid,
     parent_id: Uuid,
@@ -291,7 +214,7 @@ struct ChildCompletion {
     delivery: Delivery,
 }
 
-/// What a wake changed on the parent's row, so a caller that then fails to
+/// INVARIANT: What a wake changed on the parent's row, so a caller that then fails to
 /// drive a turn can put it back exactly.
 ///
 /// `revived_at` is a fencing token, not bookkeeping. The rollback matches on
@@ -311,15 +234,12 @@ struct ChildCompletion {
 /// `active_threads`.
 pub(super) struct ParentWake {
     pub(super) prev_status: String,
-    /// Nullable: a thread that has never been revived carries no stamp.
+    /// INVARIANT: Nullable: a thread that has never been revived carries no stamp.
     pub(super) prev_revived_at: Option<chrono::DateTime<Utc>>,
     pub(super) revived_at: chrono::DateTime<Utc>,
 }
 
 impl EventBus {
-    /// Send a ChildrenCountChanged transient event to the parent thread's SSE channel.
-    /// `aggregate` carries any other projection changes (e.g. archive_state) the
-    /// caller made before emitting — the frontend overlays it onto thread.meta.
     pub(super) fn send_children_count_event(
         &self,
         parent_id: Uuid,
@@ -342,7 +262,6 @@ impl EventBus {
         });
     }
 
-    /// Query children counts from DB and broadcast to the parent thread's SSE channel.
     pub(super) async fn broadcast_children_count(&self, parent_id: Uuid) {
         let counts: Option<(i64, i64)> = match sqlx::query_as(
             "SELECT active_children_count::bigint, total_children_count::bigint FROM thread_summaries WHERE thread_id = $1"
@@ -361,18 +280,6 @@ impl EventBus {
         }
     }
 
-    /// Handle parent notification when a child thread emits a terminal event.
-    /// Decrements the parent's `active_children_count` and, for completion events,
-    /// sends a callback message with results.
-    ///
-    /// `terminal_event_id` is `event`'s own row id. It travels to the parent on
-    /// the [`ParentCallback`], where the stand-down gate needs it. `None` when
-    /// the caller has no row to name: [`Self::announce_withheld_completion`]
-    /// replays a terminal whose own fan-in already stood down, and the gate then
-    /// abstains, which is the fail-open side.
-    ///
-    /// `actor` is the terminal's own, which tells the user's switch from a
-    /// crash: see [`restart_cut_without_resume`].
     pub(super) async fn notify_parent_if_child(
         &self,
         child_thread_id: Uuid,
@@ -380,15 +287,13 @@ impl EventBus {
         event: &ThreadEvent,
         actor: Option<&crate::engine::thread_events::MessageOrigin>,
     ) {
-        // Not a terminal, and still sometimes the moment a card falls due:
-        // see `announce_when_last_wait_ends`.
         if let ThreadEvent::EventWaitCanceled { cause, .. } = event {
             self.announce_when_last_wait_ends(child_thread_id, *cause)
                 .await;
             return;
         }
 
-        // Cancel = user-driven, terminal. Abort splits three ways:
+        // INVARIANT: Cancel = user-driven, terminal. Abort splits three ways:
         // - The user's own switch promises a resume: no decrement, no
         //   callback, since the resumed turn reports.
         // - A restart nobody promised to undo is a completion, reported as
@@ -424,8 +329,6 @@ impl EventBus {
             return;
         }
 
-        // Restored-log settlement may emit a new idle/abort row for an old
-        // turn. Its new sequence does not grant permission to wake the parent.
         if matches!(
             event,
             ThreadEvent::ResponseAborted {
@@ -452,7 +355,7 @@ impl EventBus {
             }
         }
 
-        // **A terminal the engine is about to auto-resume is not a completion.**
+        // INVARIANT: **A terminal the engine is about to auto-resume is not a completion.**
         // The child is still working, and the resume lands seconds later. A card
         // here tells the parent the work is lost, and a parent that believes it
         // spawns a duplicate onto the same files. Withhold, and let the REAL
@@ -480,9 +383,6 @@ impl EventBus {
         let Some(row) = self.load_child_row(child_thread_id).await else {
             return;
         };
-        // A keep-alive turn's terminal reports nothing: the child still waits.
-        // A child that handed off reports nothing either: its successor
-        // session, or a legacy successor thread, does.
         if row.keep_alive_turn || row.handed_off {
             return;
         }
@@ -504,22 +404,6 @@ impl EventBus {
             return;
         };
 
-        // **A user Stop pauses a child; it does not finish it** (ADR 0252).
-        // The child is alive and one message continues it, so the parent gets
-        // a note and no turn. A woken parent acts, and here it would act on
-        // work that is still running.
-        //
-        // `is_stopped_child` was set in-tx by the cancel's own projection arm,
-        // only when this turn was still owed a card and a person pressed Stop.
-        // A Stop the parent is owed nothing for returns in silence. A cancel an
-        // agent issued is not a Stop of the user's: it falls through and
-        // reports a canceled card, as it always did.
-        //
-        // While the child stays stopped, no terminal speaks for it. The idle
-        // that follows the Stop is the one that matters: the marker is still
-        // set, so without this it would reach the parent as a "completed"
-        // card. What settles a stopped child is a start event, which clears
-        // the flag and lets its turn report, or `settle_child`.
         if let ThreadEvent::ResponseCanceled {
             cause: CancelCause::UserStop,
             ..
@@ -541,13 +425,6 @@ impl EventBus {
             return;
         }
 
-        // **A child holding a live event wait has not finished** (ADR 0254).
-        // Arming a wait and ending the turn is the event-wait contract, and
-        // the wait wakes the child for another turn. So a turn that ends
-        // holding one reports nothing, and the marker stays set for the turn
-        // the wait wakes. A failed turn still reports: that is loud and worth
-        // knowing whatever comes next. A cancel that ended the child reports
-        // too.
         if holds_live_wait
             && matches!(
                 event,
@@ -564,7 +441,7 @@ impl EventBus {
             return;
         }
 
-        // **The idle closing a redirected turn is no completion either.** Its
+        // INVARIANT: **The idle closing a redirected turn is no completion either.** Its
         // cancel stood down at `is_terminal`, and the turn the redirect runs
         // next reports. The marker stays set for it.
         if matches!(event, ThreadEvent::CodingAgentIdled { .. })
@@ -577,7 +454,7 @@ impl EventBus {
             return;
         }
 
-        // CC threads can emit CodingAgentIdled multiple times (initial work,
+        // INVARIANT: CC threads can emit CodingAgentIdled multiple times (initial work,
         // auto-harden, background agents). Only process the first one —
         // subsequent idles should not decrement the counter again or send
         // duplicate callbacks to the parent. Reads as "this child owes its
@@ -590,7 +467,7 @@ impl EventBus {
             return;
         }
 
-        // Coding-agent sessions can terminate without ever emitting CodingAgentIdled or
+        // INVARIANT: Coding-agent sessions can terminate without ever emitting CodingAgentIdled or
         // SessionEnded — e.g. the user cancels and the session sits archived,
         // leaving only ResponseCanceled (or a terminal-cause ResponseAborted
         // from a SafetyNet / ProcessKilled crash) as the signal. The
@@ -625,16 +502,6 @@ impl EventBus {
                     | ThreadEvent::SessionEnded { .. }
             )
         };
-        // Completion events trigger a callback to the parent (typed
-        // ChildThreadCompleted on the parent thread) and surface the parent
-        // to inbox. ResponseCanceled is included for a cancel that is not a
-        // person's Stop: an agent cancelling its own child, or a `UserAction`.
-        // A person's Stop and a redirect returned above.
-        // ResponseAborted reports only for a child a restart cut with no
-        // resume promised. The user already sees any other abort's error state
-        // (SafetyNet/ProcessKilled), and a switch abort was filtered out above.
-        // For coding-agent children, SessionEnded also counts when the run's
-        // callback is still pending: handles sessions that end without idling.
         let should_callback = matches!(
             (is_coding_agent, event),
             (true, ThreadEvent::CodingAgentIdled { .. })
@@ -647,36 +514,15 @@ impl EventBus {
                 && parent_callback_pending
                 && matches!(event, ThreadEvent::SessionEnded { .. }));
 
-        // Decrement-only paths must still clear the marker or a follow-up event
-        // (CodingAgentIdled, SessionEnded) re-decrements via the
-        // `parent_callback_pending` gate above. The should_callback path clears
-        // in-tx via the ChildThreadCompleted projection arm; an abort that
-        // sends no card emits no typed event, so clear here directly.
-        // Non-CC chat children emit exactly one terminator per request (the
-        // agentic loop's `has_terminator_for` guard), so they need no marker; CC
-        // children can have multiple terminal events for the same turn.
         let clear_callback_for_terminal_abort = should_decrement
             && is_coding_agent
             && matches!(event, ThreadEvent::ResponseAborted { .. });
 
-        // The decrement of parent's `active_children_count` runs IN-TX via
-        // `reconcile_parent_active_children_count` in `update_thread_projection`
-        // for every terminal event arm, and the same projection step pushes
-        // the parent onto `extra_ancestors` so the post-commit ancestor loop
-        // broadcasts a `ChildrenCountChanged` with the correct value. The
-        // only work left here is the archive-state flip + its broadcast
-        // when `should_callback` is true — gated accordingly. Pure
-        // `should_decrement && !should_callback` paths (CC terminal abort,
-        // non-CC ResponseAborted/SessionEnded) used to land here only for
-        // the decrement; the in-tx reconcile + in-tx broadcast now cover it.
         if clear_callback_for_terminal_abort {
             self.clear_pending_parent_callback(child_thread_id).await;
         }
 
         if !should_callback {
-            // An abort the user sees as an error sends no card. In a batch that
-            // silence would strand its siblings' filed reports. So the last
-            // batch child still working reports the abort as a failure.
             if should_decrement
                 && matches!(event, ThreadEvent::ResponseAborted { .. })
                 && wake_mode == Some(WakeMode::WakeWhenAllDone)
@@ -702,13 +548,9 @@ impl EventBus {
 
         let label = child_label(title, first_msg);
 
-        // The child's last response text becomes the `summary` field on the
-        // typed event. The failure path overrides it with the error.
         let last_response = self.last_response_text(child_thread_id).await;
 
         let (status, summary, cap) = match event {
-            // The cut turn produced no result, and the newest response text
-            // belongs to an earlier turn. Say what happened instead.
             ThreadEvent::CodingAgentIdled {
                 reason: Some(reason),
                 ..
@@ -750,7 +592,7 @@ impl EventBus {
                 failure_summary(error, provider_error.as_ref(), FAILURE_SUMMARY_CAP),
                 FAILURE_SUMMARY_CAP,
             ),
-            // A cancel that ended the child. Pull the
+            // INVARIANT: A cancel that ended the child. Pull the
             // partial-stream text from ResponseCanceled itself; falling back
             // to last_response would surface a *prior* turn's text and read
             // as if the canceled turn had completed.
@@ -759,8 +601,6 @@ impl EventBus {
                 text.clone(),
                 SUCCESS_SUMMARY_CAP,
             ),
-            // Defensive: any other terminal event slipping through still
-            // produces a typed completion so the parent isn't left waiting.
             _ => (
                 ChildCompletionStatus::Success,
                 last_response.clone().unwrap_or_default(),
@@ -802,8 +642,6 @@ impl EventBus {
         .await;
     }
 
-    /// Read [`ChildRow`] for `child_thread_id`. `None` when the row is gone, or
-    /// when the read failed, which is logged.
     async fn load_child_row(&self, child_thread_id: Uuid) -> Option<ChildRow> {
         sqlx::query_as::<_, ChildRow>(&child_row_sql())
             .bind(child_thread_id)
@@ -821,11 +659,6 @@ impl EventBus {
             })
     }
 
-    /// Whether `child_thread_id`'s current turn ended as a redirect cancel:
-    /// its newest terminal or start event is one. A start event after the
-    /// cancel is the redirected turn, which reports. The start events are the
-    /// ones `mark_parent_callback_pending` names. Every miss answers no, so
-    /// the card still goes out.
     async fn turn_ended_as_redirect(&self, child_thread_id: Uuid) -> bool {
         sqlx::query_scalar::<_, bool>(&format!("SELECT {}", turn_ended_as_redirect_sql("$1")))
             .bind(child_thread_id.to_string())
@@ -841,7 +674,6 @@ impl EventBus {
             })
     }
 
-    /// The text of `child_thread_id`'s newest `ResponseGenerated`, if any.
     async fn last_response_text(&self, child_thread_id: Uuid) -> Option<String> {
         sqlx::query_scalar(
             "SELECT payload->>'text' FROM events \
@@ -862,16 +694,6 @@ impl EventBus {
         })
     }
 
-    /// Deliver the card a child holding a wait held back, once its last event wait
-    /// ends without waking it (ADR 0254).
-    ///
-    /// A delivery or an expiry wakes the child, and that turn reports. Stop
-    /// waiting and an agent standing a wait down wake nothing, so without this
-    /// the parent would never hear. An archive or a discard of the thread is
-    /// the settle's business: see `settle_child`.
-    ///
-    /// A child with held work defers to the branch-work net, which proposes
-    /// the work and then sends this card with the change listed (ADR 0395).
     async fn announce_when_last_wait_ends(
         &self,
         child_thread_id: Uuid,
@@ -882,7 +704,7 @@ impl EventBus {
         }
     }
 
-    /// Whether `child_thread_id`'s held card waits on the branch-work net to
+    /// INVARIANT: Whether `child_thread_id`'s held card waits on the branch-work net to
     /// propose its work first. Read it BEFORE proposing: the proposal is what
     /// clears it.
     pub async fn held_card_awaits_proposal(&self, child_thread_id: Uuid) -> bool {
@@ -891,14 +713,10 @@ impl EventBus {
             .is_some_and(|row| row.parent_callback_pending && row.holds_unproposed_work())
     }
 
-    /// Send the held card the cancel deferred, once the branch-work net has
-    /// proposed the work it waited on.
     pub async fn send_held_card_after_proposal(&self, child_thread_id: Uuid) {
         self.send_held_card(child_thread_id, false).await;
     }
 
-    /// Only an idle child still owed a card qualifies. A running child's own
-    /// terminal reports, and a stopped child waits for the user.
     async fn send_held_card(&self, child_thread_id: Uuid, defer_unproposed_work: bool) {
         let Some(row) = self.load_child_row(child_thread_id).await else {
             return;
@@ -907,8 +725,6 @@ impl EventBus {
             return;
         }
         let delivery = Delivery::for_owed_card(row.wake_mode());
-        // Idle only. A failed or paused child still owes its parent a card,
-        // and the next resume or the settle carries it with the real status.
         let ChildRow {
             parent_thread_id: Some(parent_id),
             is_coding_agent,
@@ -944,7 +760,6 @@ impl EventBus {
                 parent_id,
                 parent_is_coding_agent,
                 label: child_label(title, first_msg),
-                // A diff the net could not propose is still work.
                 status: if is_coding_agent && coding_agent_change_state == ChangeStateKind::None {
                     ChildCompletionStatus::NoChanges
                 } else {
@@ -959,11 +774,7 @@ impl EventBus {
         .await;
     }
 
-    /// Record on the parent that a user Stop paused one of its children
-    /// (ADR 0252). No wake, no status write and no callback: the parent stays
-    /// exactly as it was, and reads the note on its next turn.
     async fn announce_stopped_child(&self, parent_id: Uuid, child_thread_id: Uuid, label: String) {
-        // Box::pin for the same recursion `deliver_child_completion` breaks.
         Box::pin(self.emit_or_log(
             BusEvent::Thread {
                 thread_id: parent_id,
@@ -978,25 +789,12 @@ impl EventBus {
         .await;
     }
 
-    /// Send the canceled card a child still owed its parent, because the user
-    /// archived, discarded or deleted it (ADR 0252, ADR 0254). A no-op for any other thread, so a caller need not check first.
-    ///
-    /// The caller decides WHICH thread the user acted on. A cascading archive
-    /// must pass only its root: a grandchild archived along with its parent
-    /// owes that parent nothing, and a card would un-archive it.
     pub async fn settle_child(&self, child_thread_id: Uuid, settled_by: ChildSettle) {
         if let Some(card) = self.owed_child_card(child_thread_id, settled_by).await {
             self.deliver_owed_child_card(card).await;
         }
     }
 
-    /// The canceled card `child_thread_id` owes its parent if the user ends it
-    /// by `settled_by`, or `None` when it owes nothing.
-    ///
-    /// Owed means the marker is still set on a child not in flight: a stopped
-    /// child, one that ended a turn holding an event wait, or one a crash left
-    /// owed. A child still holding a wait owes nothing to an act that leaves
-    /// its waits alone, because it wakes again and its turn reports.
     pub async fn owed_child_card(
         &self,
         child_thread_id: Uuid,
@@ -1032,7 +830,6 @@ impl EventBus {
         }))
     }
 
-    /// Deliver a card [`Self::owed_child_card`] decided is owed.
     pub async fn deliver_owed_child_card(&self, card: OwedChildCard) {
         crate::log_legacy!(
             "[FanOut] Child {} settled by the user: sending its parent {} the canceled card",
@@ -1042,8 +839,6 @@ impl EventBus {
         self.deliver_child_completion(card.0, None).await;
     }
 
-    /// Deliver one report to the parent: wake it with a
-    /// `ChildThreadCompleted`, or file a `ChildReportFiled`.
     async fn deliver_child_completion(&self, card: ChildCompletion, repeat_head: Option<&str>) {
         let ChildCompletion {
             child_thread_id,
@@ -1082,10 +877,6 @@ impl EventBus {
         } else {
             None
         };
-        // A repeat owes no parent turn. A Stop or a hold files the report
-        // silently, and so does an open card on a coding-agent parent: the
-        // resume or the card's close hands it over (ADR 0803). A chat
-        // parent's wake behind an open card queues behind its running turn.
         let held_parent = repeat.is_none()
             && delivery == Delivery::Wake
             && if parent_is_coding_agent == Some(true) {
@@ -1101,12 +892,12 @@ impl EventBus {
                 .await;
             return;
         }
-        // Held for the rest of the function: every path below that gives up on
+        // INVARIANT: Held for the rest of the function: every path below that gives up on
         // driving a turn hands it to `undo_parent_wake`, so the parent is not
         // left reading "Requesting" against nothing.
         let wake = self.update_parent_after_child_terminal(parent_id).await;
 
-        // Emit the typed source-of-truth event onto the parent thread. The
+        // INVARIANT: Emit the typed source-of-truth event onto the parent thread. The
         // `parent_callback_pending` marker is cleared by THIS emit's projection
         // arm (see ChildThreadCompleted in `update_thread_projection`), in
         // the same transaction as the event INSERT — so the event and the
@@ -1124,7 +915,7 @@ impl EventBus {
             sub_thread_pending_changes,
             integrated_branch,
         };
-        // Box::pin here because `emit_or_log → emit → notify_parent_if_child`
+        // INVARIANT: Box::pin here because `emit_or_log → emit → notify_parent_if_child`
         // is the recursion the compiler flags — the emitted ChildThreadCompleted
         // for the parent will itself walk back through `notify_parent_if_child`
         // (which immediately exits because ChildThreadCompleted isn't a
@@ -1170,7 +961,7 @@ impl EventBus {
             }
         };
 
-        // Defensive: `parent_is_coding_agent` should always be `Some` here
+        // INVARIANT: Defensive: `parent_is_coding_agent` should always be `Some` here
         // (the parent thread row must exist for its child to have spawned),
         // so a `None` is a serious state corruption — skip the kick rather
         // than guess. The projection arm already cleared the child's marker
@@ -1208,7 +999,7 @@ impl EventBus {
             self.roll_back_parent_wake(parent_id, wake.as_ref()).await;
             return;
         };
-        // The wake promised a turn. If the channel is gone (its receiver dies
+        // INVARIANT: The wake promised a turn. If the channel is gone (its receiver dies
         // only as the engine goes down) nothing will drive one, so put the
         // status back. The card stays: `refire_unprocessed_child_completions`
         // re-drives this wake on the next boot, and a rollback that writes no
@@ -1224,17 +1015,12 @@ impl EventBus {
         }
     }
 
-    /// File a report on the parent without waking it: no status write,
-    /// no inbox move and no callback. The emit's own projection settles the
-    /// child's marker. A failed emit leaves the marker set, so the child's
-    /// next terminal tries again.
     async fn file_child_report(&self, parent_id: Uuid, child_thread_id: Uuid, event: ThreadEvent) {
         crate::log_legacy!(
             "[FanOut] Child {}'s report does not wake its parent {}: filing it",
             child_thread_id,
             parent_id
         );
-        // Box::pin for the same recursion `deliver_child_completion` breaks.
         Box::pin(self.emit_or_log(
             BusEvent::Thread {
                 thread_id: parent_id,
@@ -1246,9 +1032,6 @@ impl EventBus {
         .await;
     }
 
-    /// Both report events have the same stored payload. The child must have
-    /// produced the summary this turn, since report text can fall back to an
-    /// earlier reply. Missing evidence leaves delivery to the wake rules.
     async fn matches_last_child_report(
         &self,
         parent_id: Uuid,
@@ -1283,8 +1066,6 @@ impl EventBus {
         .unwrap_or(false)
     }
 
-    /// The branch an integrated child hands up with a successful report, for
-    /// its parent's agent to merge. Any other finish hands nothing up.
     async fn reported_integrated_branch(
         &self,
         child_thread_id: Uuid,
@@ -1296,8 +1077,6 @@ impl EventBus {
         crate::core::store::integrated::handed_up_branch(&self.pool, child_thread_id).await
     }
 
-    /// The changes a report names: those the child left pending on its own
-    /// branch, and those held below it.
     async fn reported_changes(
         &self,
         child_thread_id: Uuid,
@@ -1308,11 +1087,6 @@ impl EventBus {
         bool,
     ) {
         let mut complete = true;
-        // Look up which proposed changes the child left in `pending` state.
-        // CC chats that ended with `has_changes: true` typically have one;
-        // chat children and `no_changes` idles have zero. Failures are
-        // reported with `pending_change_ids = []` regardless because the
-        // worktree state isn't reviewable.
         let pending_change_ids: Vec<String> = if matches!(status, ChildCompletionStatus::Failure) {
             Vec::new()
         } else {
@@ -1335,8 +1109,6 @@ impl EventBus {
             }
         };
 
-        // Changes held below the child, whatever its own status: they are other
-        // threads' work, and an orchestrator's children hold all of it.
         let sub_thread_pending_changes =
             match crate::core::changes::sub_thread_pending_changes(&self.pool, child_thread_id)
                 .await
@@ -1355,7 +1127,7 @@ impl EventBus {
         (pending_change_ids, sub_thread_pending_changes, complete)
     }
 
-    /// Announce a terminal the fan-in withheld, because the auto-resume it was
+    /// INVARIANT: Announce a terminal the fan-in withheld, because the auto-resume it was
     /// withheld for is not going to happen.
     ///
     /// The withheld terminal was always a `ResponseFailed`: only
@@ -1387,7 +1159,7 @@ impl EventBus {
         .await;
     }
 
-    /// Mark the parent awake on a child completion that warrants user
+    /// INVARIANT: Mark the parent awake on a child completion that warrants user
     /// attention (`should_callback`): inbox, `running`, then one aggregate
     /// broadcast carrying both plus any counter change from the in-tx
     /// reconcile.
@@ -1419,7 +1191,7 @@ impl EventBus {
         &self,
         parent_id: Uuid,
     ) -> Option<ParentWake> {
-        // The self-join reads the pre-UPDATE row in the same statement, so the
+        // INVARIANT: The self-join reads the pre-UPDATE row in the same statement, so the
         // rollback value cannot be a second query racing the write.
         //
         // `FOR UPDATE` is load-bearing, not decoration. Two children of one
@@ -1465,8 +1237,6 @@ impl EventBus {
                 return None;
             }
         };
-        // `None` here is the missing-parent-row case: nothing was written, so
-        // there is no wake to report and nothing for a caller to undo.
         let (active, total, prev_status, prev_revived_at, revived_at) = row?;
         self.request_archive_recount(parent_id);
         let aggregate =
@@ -1489,7 +1259,7 @@ impl EventBus {
         })
     }
 
-    /// Roll the wake back on a path that gave up before any turn was driven.
+    /// INVARIANT: Roll the wake back on a path that gave up before any turn was driven.
     /// Left alone, the parent spins "Requesting" against nothing until the
     /// next boot reset.
     ///
@@ -1514,8 +1284,6 @@ impl EventBus {
         parent_id: Uuid,
         wake: Option<&ParentWake>,
     ) {
-        // No wake to undo: `should_callback` was false, the parent's row is
-        // gone, or the write itself failed.
         let Some(wake) = wake else { return };
         if let Err(e) = sqlx::query(
             "UPDATE thread_summaries SET status = $2, last_revived_at = $3 \
@@ -1536,9 +1304,6 @@ impl EventBus {
         }
     }
 
-    /// [`undo_parent_wake`](Self::undo_parent_wake), then recount the archive
-    /// counts the restored status feeds. The undo writes no event, so the
-    /// projection never samples it.
     async fn roll_back_parent_wake(&self, parent_id: Uuid, wake: Option<&ParentWake>) {
         if wake.is_none() {
             return;
@@ -1547,12 +1312,6 @@ impl EventBus {
         self.request_archive_recount(parent_id);
     }
 
-    /// Settle the child's `parent_callback_pending` marker on a coding-agent
-    /// child's terminal `ResponseAborted`. The counter already came down
-    /// through the in-tx reconcile. A crash-class abort sends no card, and the
-    /// user is looking at the child's error state. A restart abort's
-    /// `interrupted` card follows this clear, and its projection arm clears the
-    /// marker too. The child keeps FALSE until a start event sets it again.
     async fn clear_pending_parent_callback(&self, child_thread_id: Uuid) {
         if let Err(e) = sqlx::query(
             "UPDATE thread_summaries SET parent_callback_pending = FALSE WHERE thread_id = $1",
@@ -1569,33 +1328,8 @@ impl EventBus {
         }
     }
 
-    /// Boot-recovery sweep that re-derives parent-resume wakes lost to an engine
-    /// restart (ADR 0011, weakness B1). The in-memory `ParentCallback` channel is
-    /// recreated empty on restart, so a child that completed while the engine was
-    /// down — or whose wake was queued but not yet consumed when it died — leaves
-    /// a persisted `ChildThreadCompleted` on the parent with no resume ever fired.
-    /// Without this sweep the fan-in strands permanently.
-    ///
-    /// Selection: every parent whose **latest persisted event is a
-    /// `ChildThreadCompleted`** — nothing came after the completion card, so the
-    /// parent never reacted. The moment a parent resumes it emits a fresh terminal
-    /// event with a higher sequence, so a processed completion is no longer the
-    /// latest event and is skipped; a resume that died mid-flight leaves a
-    /// `SessionStarted` / streamed token as the latest event and is handled by the
-    /// CC auto-resume recovery instead, not re-fired here. This makes the sweep
-    /// idempotent across boots via the event-id anchor, with no double-handling.
-    ///
-    /// Each candidate is re-injected through the same `send_parent_callback` the
-    /// live fan-in uses. At boot the parent wake hold queues it. A second wake
-    /// for a card recovery already queued is dropped. After the release the
-    /// listener drains it through the exact same
-    /// `notify_parent_of_child_completion` path — the recovery duplicates no
-    /// resume logic, it only re-delivers the lost wake. Returns the number of
-    /// wakes re-fired (for the boot log). Mirrors
-    /// `propose_held_back_changes_on_startup`: the persisted event is the source
-    /// of truth, the in-memory wake is a cache rebuilt from it.
     pub async fn refire_unprocessed_child_completions(&self) -> usize {
-        // Restored completion cards are history on every boot, including
+        // INVARIANT: Restored completion cards are history on every boot, including
         // after the first-boot marker is gone. An unknown floor refuses wakes.
         let floor = match crate::core::snapshot::boundary::read(&self.pool).await {
             Ok(boundary) => boundary.map_or(0, |boundary| boundary.event_sequence),
@@ -1604,36 +1338,6 @@ impl EventBus {
                 return 0;
             }
         };
-        // `e.aggregate_id` is the parent thread id (text); `payload->>'child_thread_id'`
-        // is the child's uuid string. The JOIN drops parents whose summary row is
-        // gone (can't resume a parent with no row); `state IS DISTINCT FROM
-        // 'discarded'` (NULL-safe) skips a parent the user threw away while still
-        // selecting legacy NULL-state rows. The NOT EXISTS makes the card the
-        // thread's last word — scoped to `aggregate = 'thread'` to match
-        // `lookup_last_activity` and never let a same-id non-thread event suppress
-        // a real fan-in. See the selection rationale above. A later
-        // `ChildThreadStopped`, `ChildThreadDetached` or `ChildReportFiled` is
-        // not a reaction: it wakes nothing, so a card it follows is still
-        // unprocessed (ADR 0252, ADR 0278). A filed report is never selected
-        // itself, since only a `ChildThreadCompleted` is. Nor is a side question, which no agent reads (ADR 0320).
-        // No card was written after its child moved out, since the emit
-        // refuses one, so every card this finds was earned.
-        //
-        // The OUTER `e.aggregate = 'thread'` is load-bearing for a second reason.
-        // On a DOMAIN event `aggregate_id` holds the event TYPE NAME, not a uuid,
-        // and `POST /api/v1/events/emit` accepts any type name that is not a
-        // reserved `SystemEvent`. `ChildThreadCompleted` is a `ThreadEvent` name,
-        // so an app UI (untrusted, per that handler's own comment) can persist a
-        // row whose `aggregate_id` is the literal string. Events are append-only,
-        // so an unscoped `e.aggregate_id::uuid` JOIN would then fail this sweep
-        // with `invalid input syntax for type uuid` on EVERY later boot, and every
-        // child-completion wake lost to a restart would strand its parent forever.
-        //
-        // A card from a `no-wake` child is never re-fired. It was written
-        // before such a child stopped waking its parent (ADR 0545), and its
-        // wake now would start the very turn that rule removes. The child is
-        // matched as text, so a malformed id selects the card and reaches the
-        // per-row skip below instead of failing the sweep.
         let rows: Vec<(Uuid, String, Option<String>, bool)> = match sqlx::query_as(
             "SELECT e.id, e.aggregate_id, e.payload->>'child_thread_id', p.is_coding_agent \
              FROM events e \
@@ -1692,14 +1396,7 @@ impl EventBus {
                 parent_id,
                 event_id
             );
-            // Wake the parent here too, exactly as the live fan-in does. A
-            // re-fired wake runs the same turn with the same setup cost, so
-            // without this the recovered parent reads "Done" for that whole
-            // window: the very gap this path is re-firing to close.
             let wake = self.update_parent_after_child_terminal(parent_id).await;
-            // No terminal id: this sweep reads the completion card, and the
-            // child terminal behind it is not recorded on the row. The gate
-            // abstains, which is the fail-open side.
             if !self.send_parent_callback(
                 parent_id,
                 child_id,
@@ -1721,9 +1418,6 @@ impl EventBus {
         refired
     }
 
-    /// Hand the wake to the listener task, or to the parent wake hold during
-    /// boot recovery and teardown. Returns whether it was accepted, so a caller that already
-    /// marked the parent awake can roll that back when no turn will follow.
     fn send_parent_callback(
         &self,
         parent_thread_id: Uuid,

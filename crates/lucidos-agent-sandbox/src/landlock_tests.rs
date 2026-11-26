@@ -1,7 +1,5 @@
 use super::*;
 
-/// A tree shaped like a home: a private subtree, a gateway data dir holding a
-/// workspace, and a cache beside them.
 fn home() -> (tempfile::TempDir, PathBuf, Policy) {
     let scratch = tempfile::tempdir().unwrap();
     let top = std::fs::canonicalize(scratch.path()).unwrap();
@@ -54,8 +52,6 @@ fn hidden_roots_get_no_rule_and_their_siblings_get_everything() {
     assert_eq!(g("projects"), Some(Grant::Full));
 }
 
-/// A folder on the way down may only list, so `ls ~` works and nothing
-/// beneath it inherits a write.
 #[test]
 fn a_folder_above_a_hidden_root_may_only_list() {
     let (_scratch, top, policy) = home();

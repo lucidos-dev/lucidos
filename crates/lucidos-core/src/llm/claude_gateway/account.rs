@@ -1,4 +1,4 @@
-//! The workspace's sign-in to its Claude gateway: at most one, in
+//! INVARIANT: The workspace's sign-in to its Claude gateway: at most one, in
 //! `claude_gateway_accounts`.
 //!
 //! The tokens stay out of `oauth_accounts` on purpose. Every reader of that
@@ -21,36 +21,29 @@ use crate::engine::thread_events::MessageOrigin;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The columns a [`ClaudeGatewayAccount`] reads.
 const ACCOUNT_COLUMNS: &str = "issuer, email, access_token, refresh_token, token_expiry, \
      created_at, updated_at, managed_settings, managed_settings_etag, managed_settings_fetched_at, \
      managed_telemetry_since";
 
-/// The stored sign-in, tokens included. Engine-internal only.
 #[derive(Clone)]
 pub struct ClaudeGatewayAccount {
-    /// The gateway origin that issued the tokens. They go to no other host.
+    /// INVARIANT: The gateway origin that issued the tokens. They go to no other host.
     pub issuer: String,
     pub email: Option<String>,
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub token_expiry: Option<DateTime<Utc>>,
-    /// When the user signed in. A token refresh leaves it, so it names this
-    /// sign-in apart from any later one.
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// The gateway's managed settings for this user. `None` when it has no
-    /// policy for them, or none was fetched yet.
     pub managed_settings: Option<sqlx::types::Json<serde_json::Value>>,
     pub managed_settings_etag: Option<String>,
-    /// When the managed settings were last fetched. `None` until the first.
     pub managed_settings_fetched_at: Option<DateTime<Utc>>,
-    /// Since when the managed settings have asked for usage telemetry. `None`
+    /// INVARIANT: Since when the managed settings have asked for usage telemetry. `None`
     /// while they do not. A capture made earlier is never sent.
     pub managed_telemetry_since: Option<DateTime<Utc>>,
 }
 
-// Manual `FromRow`: both tokens are sealed at rest, and open as they decode.
+// INVARIANT: Manual `FromRow`: both tokens are sealed at rest, and open as they decode.
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ClaudeGatewayAccount {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row as _;
@@ -75,7 +68,6 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ClaudeGatewayAccount {
 }
 
 impl ClaudeGatewayAccount {
-    /// The gateway's managed settings, when it set a policy for this user.
     pub fn managed_settings(&self) -> Option<GatewayManagedSettings> {
         self.managed_settings
             .as_ref()
@@ -107,7 +99,6 @@ impl std::fmt::Debug for ClaudeGatewayAccount {
     }
 }
 
-/// The stored sign-in as the API reports it: who and where, never a token.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ClaudeGatewayAccountInfo {
     pub issuer: String,
@@ -119,8 +110,6 @@ impl From<&ClaudeGatewayAccount> for ClaudeGatewayAccountInfo {
     fn from(account: &ClaudeGatewayAccount) -> Self {
         Self {
             issuer: account.issuer.clone(),
-            // A refresh never rewrites `email`, so a row stored with none may
-            // still name its account in the access token.
             email: account
                 .email
                 .clone()
@@ -132,7 +121,7 @@ impl From<&ClaudeGatewayAccount> for ClaudeGatewayAccountInfo {
 
 pub use crate::engine::provider_events::ClaudeGatewaySignOutReason;
 
-/// The token the gateway rejected. A sign-in is forgotten only while it
+/// INVARIANT: The token the gateway rejected. A sign-in is forgotten only while it
 /// still holds that token.
 #[derive(Clone, Copy)]
 pub enum RejectedToken<'a> {
@@ -140,8 +129,6 @@ pub enum RejectedToken<'a> {
     Access(&'a str),
 }
 
-/// The only access to `claude_gateway_accounts`. A sign-in and a sign-out
-/// announce themselves; a token refresh is silent.
 pub struct ClaudeGatewayAccountStore;
 
 impl ClaudeGatewayAccountStore {
@@ -153,7 +140,7 @@ impl ClaudeGatewayAccountStore {
         .await
     }
 
-    /// The stored sign-in, when its managed settings are due a fetch: never
+    /// INVARIANT: The stored sign-in, when its managed settings are due a fetch: never
     /// fetched, or fetched over an hour ago. The age is the database's own,
     /// so the engine clock cannot skew it.
     pub(super) async fn managed_settings_due(
@@ -168,7 +155,7 @@ impl ClaudeGatewayAccountStore {
         .await
     }
 
-    /// Store what a managed settings fetch for `account` found, and announce
+    /// INVARIANT: Store what a managed settings fetch for `account` found, and announce
     /// a changed policy. Stores nothing once that sign-in has ended, so a
     /// fetch racing a sign-out or a new sign-in cannot attach its policy.
     pub(super) async fn store_managed_settings(
@@ -196,7 +183,7 @@ impl ClaudeGatewayAccountStore {
         let telemetry = policy
             .as_ref()
             .is_some_and(GatewayManagedSettings::telemetry_requested);
-        // Telemetry applies from when a policy first asked for it. The first
+        // INVARIANT: Telemetry applies from when a policy first asked for it. The first
         // policy after a sign-in decides from the sign-in on, since the
         // exporter holds every capture until it arrives.
         let changed: Option<bool> = sqlx::query_scalar(
@@ -250,7 +237,6 @@ impl ClaudeGatewayAccountStore {
         Ok(())
     }
 
-    /// Store a completed sign-in, replacing any earlier one, and announce it.
     pub async fn sign_in(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -297,9 +283,6 @@ impl ClaudeGatewayAccountStore {
         Ok(())
     }
 
-    /// Forget the sign-in and announce it with `reason`. Returns whether there
-    /// was one, and announces only then. Its tokens are then revoked at the
-    /// issuer in the background, best effort.
     pub async fn sign_out(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -316,8 +299,6 @@ impl ClaudeGatewayAccountStore {
         Ok(signed_out)
     }
 
-    /// Forget a sign-in whose token the gateway rejected, and announce it with
-    /// no actor. A sign-in made since, with a new token, is kept.
     pub async fn forget_rejected(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -334,8 +315,6 @@ impl ClaudeGatewayAccountStore {
         Ok(removed.is_some())
     }
 
-    /// Whether the last sign-in ended because the gateway rejected it, with no
-    /// sign-in since. Read from the events, so it survives a restart.
     pub async fn rejected_last(pool: &PgPool) -> Result<bool, sqlx::Error> {
         let reason: Option<Option<String>> = sqlx::query_scalar(
             "SELECT payload->'data'->>'reason' FROM events
@@ -370,7 +349,7 @@ impl ClaudeGatewayAccountStore {
             .await;
     }
 
-    /// Delete the row, only if it holds the `rejected` token when one is
+    /// INVARIANT: Delete the row, only if it holds the `rejected` token when one is
     /// given. Returns the removed sign-in.
     ///
     /// A sealed token carries a random nonce, so SQL cannot compare it. The
@@ -391,8 +370,6 @@ impl ClaudeGatewayAccountStore {
             return Ok(None);
         };
         let tokens = open_tokens(&access_token, refresh_token.as_deref());
-        // A token that does not open is not the one the gateway rejected:
-        // the engine opened that one to present it.
         let holds_rejected = match (rejected, &tokens) {
             (None, _) => true,
             (Some(_), Err(_)) => false,
@@ -424,7 +401,7 @@ impl ClaudeGatewayAccountStore {
         Ok(Some(RemovedSignIn { issuer, revocable }))
     }
 
-    /// Store refreshed tokens for the sign-in that held `spent_refresh_token`.
+    /// INVARIANT: Store refreshed tokens for the sign-in that held `spent_refresh_token`.
     /// Returns `false` when that sign-in is gone, so a refresh racing a
     /// sign-out or a newer sign-in cannot overwrite it. A `None` refresh token
     /// keeps the stored one.
@@ -469,14 +446,11 @@ impl ClaudeGatewayAccountStore {
     }
 }
 
-/// A sign-in [`ClaudeGatewayAccountStore::delete_row`] removed. Its tokens are
-/// revocable only when they opened.
 struct RemovedSignIn {
     issuer: String,
     revocable: Option<EndedSignIn>,
 }
 
-/// Open a stored access token and refresh token.
 fn open_tokens(
     access_token: &str,
     refresh_token: Option<&str>,

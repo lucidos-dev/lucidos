@@ -1,5 +1,3 @@
-//! The only outbound gateway-to-gateway transport. Redirects are refused;
-//! streaming calls have no total timeout. Interactive calls set their own.
 use crate::auth;
 use crate::gateway_protocol::{
     PairAnswer, GATEWAY_API_PREFIX, HEADER_GATEWAY_CREDENTIAL, PAIRING_PATH, PAIR_PATH,
@@ -9,20 +7,12 @@ use crate::remote_gateways::{ExtraHeaders, RemoteGateway};
 use std::time::Duration;
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What B answered a pairing secret with.
 #[derive(Debug)]
 pub enum PairReply {
     Paired(PairAnswer),
-    /// B waits for a device paired with B to allow it. Sending the same
-    /// secret again pairs once it has.
     AwaitingOwner,
 }
 
-/// A's client for B: `https` only, certificates checked, no redirects.
-///
-/// A loopback B gets the loopback client, which trusts only the loopback CA
-/// that every gateway on this machine serves on loopback. So another process
-/// squatting B's port gets no credential.
 #[derive(Clone)]
 pub struct PeerConnection {
     http: reqwest::Client,
@@ -46,9 +36,6 @@ impl PeerConnection {
         Ok(Self { http, loopback })
     }
 
-    /// A connection whose loopback client trusts `root_pem` instead of the CA
-    /// this build resolves. A fixture whose gateways serve a private HOME's
-    /// loopback CA needs it: the `test-support` client trusts another CA.
     #[cfg(test)]
     pub(crate) fn trusting_loopback_root(root_pem: &str) -> Result<Self, String> {
         let mut connection = Self::new()?;
@@ -66,9 +53,6 @@ impl PeerConnection {
         Ok(connection)
     }
 
-    /// The client for `origin`, and the origin to call. A loopback origin gets
-    /// the loopback client over https. One stored as `http://` before every
-    /// loopback listener served TLS is read as `https://`.
     fn endpoint(&self, origin: &str) -> (reqwest::Client, String) {
         if crate::remote_gateways::is_loopback_origin(origin) {
             let https = match origin.strip_prefix("http://") {
@@ -80,7 +64,6 @@ impl PeerConnection {
         (self.http.clone(), origin.to_string())
     }
 
-    /// Send callback hints to the registered routing origin without credentials.
     pub(crate) fn return_request(
         &self,
         origin: &str,
@@ -94,8 +77,6 @@ impl PeerConnection {
         Ok(client.post(format!("{origin}{path}")))
     }
 
-    /// Build a request to this remote's origin, with its gateway credential.
-    /// No caller can supply a different destination URL.
     pub fn request(
         &self,
         gateway: &RemoteGateway,
@@ -115,7 +96,6 @@ impl PeerConnection {
         ))
     }
 
-    /// B's public health body.
     pub async fn health(&self, origin: &str) -> Result<serde_json::Value, String> {
         self.health_with_headers(origin, &ExtraHeaders::default())
             .await
@@ -192,7 +172,6 @@ impl PeerConnection {
         })
     }
 
-    /// Redeem `code` at B.
     pub async fn pair_with_headers(
         &self,
         origin: &str,
@@ -221,8 +200,6 @@ impl PeerConnection {
             .map_err(|e| format!("{origin} paired, but its answer was unreadable: {e}"))
     }
 
-    /// Recover first with the candidate: B may have committed before A crashed.
-    /// Only a 401 permits retrying the durable intent with the old credential.
     pub async fn rotate(&self, gateway: &RemoteGateway, candidate: &str) -> Result<u32, String> {
         let mut proposed = gateway.clone();
         proposed.credential = candidate.to_owned();
@@ -275,7 +252,6 @@ impl PeerConnection {
                 response.status().as_u16()
             ));
         }
-        // Confirm the new credential and retire B's old-key overlap before completion.
         let response = self
             .request(
                 &proposed,
@@ -301,8 +277,6 @@ impl PeerConnection {
         rotation_protocol(&identity)
     }
 
-    /// Read the destination identity through this saved grant's trusted origin.
-    /// Older peers may omit it, but must still identify the caller's pairing.
     pub async fn destination_identity(
         &self,
         gateway: &RemoteGateway,
@@ -331,7 +305,6 @@ impl PeerConnection {
         }
     }
 
-    /// Ask B to forget this pairing.
     pub async fn leave(&self, gateway: &RemoteGateway) -> Result<(), String> {
         let request = self
             .request(
@@ -352,7 +325,6 @@ impl PeerConnection {
     }
 }
 
-/// The reason a request failed, naming a refused redirect plainly.
 fn reached_error(e: &reqwest::Error) -> String {
     if e.is_redirect() {
         return "it redirected elsewhere, and a gateway credential never follows a redirect"
@@ -361,7 +333,6 @@ fn reached_error(e: &reqwest::Error) -> String {
     crate::external_address::error_chain(e)
 }
 
-/// A JSON body, without reqwest's `json` feature.
 async fn read_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, String> {
@@ -369,7 +340,6 @@ async fn read_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
-/// B's own sentence for a refusal, else the status.
 async fn refusal(response: reqwest::Response) -> String {
     let status = response.status();
     read_json::<serde_json::Value>(response)

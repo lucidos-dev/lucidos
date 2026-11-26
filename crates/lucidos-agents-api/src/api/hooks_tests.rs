@@ -1,6 +1,3 @@
-//! Only the owner arms, disarms or removes an event hook. An agent needs a once
-//! permission for the exact act, and an arm binds the content it allowed.
-
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -113,10 +110,10 @@ fn a_hook_arms_only_when_valid_asked_and_not_armed_already() {
         problems: vec!["broken".into()],
     };
     assert!(refusal(invalid, &[HOOKED]).unwrap().contains("problems"));
-    assert!(refusal(gate_listing("abc"), ASKED_EVENT_TYPES)
+    assert_eq!(refusal(gate_listing("abc"), ASKED_EVENT_TYPES), None);
+    assert!(refusal(gate_listing("abc"), &["ChangeProposed"])
         .unwrap()
         .contains(HOOKED));
-    // A changed hook arms again, at its new content.
     let changed = rows(
         vec![(gate_listing("new"), None)],
         vec![armed(GATE, "old")],
@@ -137,8 +134,6 @@ fn a_slug_is_one_plain_path_segment() {
     }
 }
 
-/// An entry is removed in place, so a link out of `data/hooks/` is removable.
-/// A name the routes cannot carry, or an entry that cannot be opened, is not.
 #[cfg(unix)]
 #[test]
 fn a_removal_is_refused_only_when_the_entry_cannot_be_named_or_opened() {
@@ -157,7 +152,6 @@ fn a_removal_is_refused_only_when_the_entry_cannot_be_named_or_opened() {
         .unwrap()
         .contains("cannot be opened"));
 
-    // A tree that links out of data/ is left alone, whatever it holds.
     let elsewhere = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(elsewhere.path().join(GATE)).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
@@ -165,8 +159,6 @@ fn a_removal_is_refused_only_when_the_entry_cannot_be_named_or_opened() {
     assert!(removal_refusal(ws, GATE).unwrap().contains("links outside"));
 }
 
-/// A refused removal stops before the gate, so no agent spends an Allow once
-/// on it.
 #[test]
 fn a_refused_removal_is_refused_before_anyone_is_asked() {
     let row = rows(vec![(gate_listing("abc"), Some("why".into()))], vec![], &[]).remove(0);
@@ -177,8 +169,6 @@ fn a_refused_removal_is_refused_before_anyone_is_asked() {
     assert_eq!(refusal.message, "why");
 }
 
-/// One hook, `gate`, present while its folder exists. A test edits it by
-/// setting `digest`.
 struct FakeHooks {
     digest: Mutex<String>,
     asked: &'static [&'static str],
@@ -297,7 +287,6 @@ async fn the_owner_arms_disarms_and_removes_a_hook() {
     let (arm, disarm) = ("/hooks/gate/arm", "/hooks/gate/disarm");
 
     assert_eq!(listed(&state).await[0]["arm_state"], "disarmed");
-    // An app document carries the owner's stamp, and is still refused.
     let mut app = owner();
     app.insert("sec-fetch-site", "same-origin".parse().unwrap());
     app.insert(
@@ -314,8 +303,6 @@ async fn the_owner_arms_disarms_and_removes_a_hook() {
     let (status, body) = call(&state, "POST", arm, owner(), json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
-    // An edit after arming is no longer armed, and arms again at the new content.
-    // An arm names the content its caller was shown, and stale content is refused.
     hooks.edit("second");
     assert_eq!(listed(&state).await[0]["arm_state"], "changed");
     let shown = |hash: &str| json!({ "content_hash": hash });
@@ -335,7 +322,6 @@ async fn the_owner_arms_disarms_and_removes_a_hook() {
     let (status, body) = call(&state, "POST", disarm, owner(), json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
-    // A folder that left while armed lists as missing, and removing it ends the arming.
     let (status, _) = call(&state, "POST", arm, owner(), json!({})).await;
     assert_eq!(status, StatusCode::OK);
     std::fs::remove_dir_all(gate_dir(workspace.path())).unwrap();
@@ -348,7 +334,6 @@ async fn the_owner_arms_disarms_and_removes_a_hook() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(listed(&state).await.is_empty());
 
-    // Removing a folder deletes it.
     write_gate(workspace.path());
     let (status, _) = call(&state, "POST", arm, owner(), json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -422,7 +407,6 @@ async fn an_agent_acts_only_on_a_once_permission_for_the_exact_content() {
     assert_eq!(status, StatusCode::OK, "{row}");
     assert_eq!(row["armed"]["actor"]["mode"], "agent", "{row}");
 
-    // The once permission is spent, so disarming asks too.
     let (status, body) = call(
         &state,
         "POST",
@@ -443,7 +427,6 @@ async fn an_agent_acts_only_on_a_once_permission_for_the_exact_content() {
     .await;
     assert_eq!(status, StatusCode::OK, "{row}");
 
-    // An edit after the owner allowed an arm asks again.
     let (_, body) = call(&state, "POST", "/hooks/gate/arm", agent(), reason.clone()).await;
     let first = asked(&body);
     allow_once(first.clone()).await;
@@ -459,21 +442,18 @@ async fn an_agent_acts_only_on_a_once_permission_for_the_exact_content() {
 }
 
 #[tokio::test]
-async fn a_held_messages_hook_and_an_unattested_caller_are_refused() {
-    if !in_engine_child(
-        "api::hooks::tests::a_held_messages_hook_and_an_unattested_caller_are_refused",
-    )
-    .await
+async fn an_unasked_hook_and_an_unattested_caller_are_refused() {
+    if !in_engine_child("api::hooks::tests::an_unasked_hook_and_an_unattested_caller_are_refused")
+        .await
     {
         return;
     }
     let (_pool, db) = setup_test_db().await;
     let (engine, workspace) = boot_mock_engine(&db).await;
-    let (state, _) = hooks_state(engine.clone(), workspace.path(), ASKED_EVENT_TYPES).await;
+    let (state, _) = hooks_state(engine.clone(), workspace.path(), &["ChangeProposed"]).await;
     let thread = agent_thread(&state.engine.event_bus).await;
     let reason = json!({ "reason": "The plan rule needs it." });
 
-    // No asking site asks yet, so the real list refuses every arm, the owner's too.
     for headers in [owner(), agent_headers(Some(thread))] {
         let (status, body) = call(&state, "POST", "/hooks/gate/arm", headers, reason.clone()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");

@@ -374,6 +374,7 @@ event system EnvironmentVariableDeleted
 event system EnvironmentVariableSet
 event system EventHookArmed
 event system EventHookDisarmed
+event system EventHookRefused
 event system EventHookRemoved
 event system FrontendBuildWatchStateChanged
 event system FrontendPreviewStarted
@@ -684,5 +685,5 @@ event thread WidgetUnpinned
 event thread WorkDelegated
 event thread WorkingUnderstandingWritten
 event thread WorktreeCleaned
-wire crates/lucidos-app/src/generated/thread-event-wire.ts c3ab3b1bbc6248108c754711d0846d49b919378ba6bc6058b94729d229181950
-wire crates/lucidos-app/src/generated/thread-lifecycle.ts 9d7dc4ed9ab2c0adc6db14ccfe01640f94ee97fb4613af469b73a59262034840
+wire crates/lucidos-app/src/generated/thread-event-wire.ts 0801c662bc39a763632325c21aa5f69fbfb5a3f0f6e0e1ae9a2bbadb56872608
+wire crates/lucidos-app/src/generated/thread-lifecycle.ts 310dbd43742a993135aaed9481a2182de1f69b79cc102d6f06565916a04b43b1

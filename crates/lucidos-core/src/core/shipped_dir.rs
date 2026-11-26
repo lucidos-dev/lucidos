@@ -1,20 +1,13 @@
-//! A directory Lucidos ships beside the engine binary: `system-knowhow/` and
-//! `system-widgets/`. A packaged build stages each one and points an env var at
-//! it. A dev checkout reads it from the repo root.
-
 use std::path::{Path, PathBuf};
 
-/// One shipped directory: its name in the repo and the bundle, and the env var
-/// a packaged launcher sets to its staged path.
 pub struct ShippedDir {
     pub name: &'static str,
     pub env_var: &'static str,
     pub log_tag: &'static str,
-    /// What goes missing when the directory is unavailable, for the warning.
     pub degrades: &'static str,
 }
 
-/// Resolve a shipped directory at boot, returning the resolved dir (if any)
+/// INVARIANT: Resolve a shipped directory at boot, returning the resolved dir (if any)
 /// plus at most one loud warning to log.
 ///
 /// Resolution order (INV-3 of the "package system-knowhow" plan):
@@ -40,8 +33,6 @@ pub fn resolve_shipped_dir(
         log_tag,
         degrades,
     } = dir;
-    // Trim only to DETECT a blank value (= unset). The path keeps its original
-    // bytes, since a legitimate dir path may carry edge whitespace.
     if let Some(value) = env_value.filter(|v| !v.trim().is_empty()) {
         let candidate = PathBuf::from(value);
         if candidate.is_dir() {

@@ -5,11 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::core::coding_agent::CodingAgent;
 use crate::core::preference_catalog as prefs;
 
-/// Where an intelligence ladder applies: who picks from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LadderSurface {
-    /// The Lucidos Agent's chat threads.
     Chat,
     ClaudeCode,
     Codex,
@@ -18,7 +16,6 @@ pub enum LadderSurface {
 impl LadderSurface {
     pub const ALL: [Self; 3] = [Self::Chat, Self::ClaudeCode, Self::Codex];
 
-    /// The backend a coding-agent surface runs on. `None` for chat.
     pub fn coding_agent(self) -> Option<CodingAgent> {
         match self {
             Self::Chat => None,
@@ -27,7 +24,6 @@ impl LadderSurface {
         }
     }
 
-    /// The wire string: `chat`, `claude-code` or `codex`.
     pub fn as_wire(self) -> &'static str {
         match self {
             Self::Chat => "chat",
@@ -36,14 +32,11 @@ impl LadderSurface {
         }
     }
 
-    /// The name a refusal uses: "the Lucidos Agent intelligence ladder".
     pub fn display_name(self) -> &'static str {
         self.coding_agent()
             .map_or("Lucidos Agent", CodingAgent::display_name)
     }
 
-    /// The efforts a rung on this surface may name. Chat takes `none`, which
-    /// no coding agent offers.
     pub fn efforts(self) -> &'static [&'static str] {
         match self {
             Self::Chat => prefs::REASONING_EFFORTS,
@@ -51,7 +44,6 @@ impl LadderSurface {
         }
     }
 
-    /// The owner's override for this surface.
     pub fn override_pref(self) -> &'static prefs::Pref<prefs::Optional> {
         match self {
             Self::Chat => &prefs::INTELLIGENCE_LADDER_CHAT,
@@ -69,8 +61,6 @@ impl LadderSurface {
         }
     }
 
-    /// The *intelligence profile* this surface ranks on: chat on general,
-    /// the coding agents on coding.
     pub fn profile_band(self, pair: &EstimatedPair) -> i32 {
         match self {
             Self::Chat => pair.general_band,
@@ -88,43 +78,29 @@ impl From<CodingAgent> for LadderSurface {
     }
 }
 
-/// One pair's bands in the rung estimates. A token or time band counts steps
-/// from the reference pair's, on its own grid. An intelligence band is a
-/// profile's estimated score in steps of 2 points, so the file never carries
-/// the score itself (ADR 0527).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EstimatedPair {
     pub model: String,
     pub effort: String,
-    /// The *general* profile, which chat ranks on.
     pub general_band: i32,
-    /// The *coding* profile, which the coding agents rank on.
     pub coding_band: i32,
-    /// No coding score was published; the model gap estimates its coding band.
-    /// Covered scores may also be smoothed by the monotone effort envelope.
     pub coding_estimated: bool,
-    /// Billed tokens per task in output-token equivalents. Times the model's
-    /// output price, it is the cost per task.
     pub token_band: i32,
     pub time_band: i32,
 }
 
-/// One pair of a surface's shipped list.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurfacePair {
     pub model: String,
     pub effort: String,
-    /// Global frontier flag retained for offline comparisons.
     pub on: bool,
-    /// The shipped default remains on when available, even if dominated.
     pub pinned: bool,
-    /// Every dominating pair, including ones outside the global frontier.
     pub dominators: Vec<IntelligenceRung>,
 }
 
-/// Each *ladder surface*'s shipped pairs, least to most intelligent on its
+/// INVARIANT: Each *ladder surface*'s shipped pairs, least to most intelligent on its
 /// profile.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,7 +110,6 @@ pub struct SurfacePairs {
     pub codex: Vec<SurfacePair>,
 }
 
-/// `llm/rung_estimates.json`, less its `_note`.
 #[derive(Debug, Deserialize)]
 pub struct RungEstimates {
     pub source: String,
@@ -150,12 +125,10 @@ static RUNG_ESTIMATES: LazyLock<RungEstimates> = LazyLock::new(|| {
         .expect("llm/rung_estimates.json is malformed: rerun estimate_rungs.py")
 });
 
-/// The rung estimates every surface shares.
 pub fn rung_estimates() -> &'static RungEstimates {
     &RUNG_ESTIMATES
 }
 
-/// One model at one effort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntelligenceRung {
     pub model: String,
@@ -177,18 +150,12 @@ impl std::fmt::Display for IntelligenceRung {
     }
 }
 
-/// The suffix that runs a model in its 1M-context variant.
 pub const CONTEXT_VARIANT: &str = "[1m]";
 
-/// The model an intelligence rung names, without the decorations that keep
-/// the same model: a `[1m]` *context variant* and a `@default` version pin.
 pub fn intelligence_rung_model_base(id: &str) -> String {
     strip_version_pin(id.strip_suffix(CONTEXT_VARIANT).unwrap_or(id))
 }
 
-/// A model id without the `@default` version pin the Claude Code picker writes
-/// on some rows. Shared by the two callers that must see through it, so they
-/// cannot disagree about what the decoration means.
 pub fn strip_version_pin(id: &str) -> String {
     id.replace("@default", "")
 }

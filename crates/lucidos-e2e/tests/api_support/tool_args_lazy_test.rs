@@ -1,20 +1,3 @@
-//! Verify the lazy-load contract for `CodingAgentToolCalled.args`, the sibling
-//! of `tool_result_lazy_test.rs`:
-//!
-//! 1. `GET /api/v1/threads/:tid/events` drops `args` and stamps an
-//!    `args_stripped: true` marker, keeping `name`, `description` and
-//!    `tool_use_id` so the inline step row still labels and pairs itself.
-//! 2. A row with NO `description` gets one filled from `describe_cc_tool`
-//!    before the drop, so a pre-May-2026 row does not degrade to a bare tool
-//!    name.
-//! 3. `GET /api/v1/events/:eid/tool-args` returns the original args on demand.
-//! 4. `?include_context=true` opts back into the full payload, which is what
-//!    keeps an exported bug report complete.
-//!
-//! `args` is the single heaviest thing a coding-agent snapshot carries: an
-//! `Edit`'s two versions of a hunk, a `Write`'s whole file. Nothing inline
-//! renders it, so the modal fetches it only when the user opens a step.
-
 use crate::support::{base_url, db_url, http_client, seed_chat_thread_summary, unique_marker};
 use serde_json::Value;
 use uuid::Uuid;
@@ -25,9 +8,6 @@ async fn pool() -> sqlx::PgPool {
         .expect("Failed to connect to e2e DB")
 }
 
-/// Seed a thread plus one `CodingAgentToolCalled`. `description` is omitted
-/// when `describe` is `None`, which is the shape of every row written before
-/// the engine started stamping it.
 async fn seed_thread_with_tool_call(
     pool: &sqlx::PgPool,
     describe: Option<&str>,
@@ -78,7 +58,6 @@ async fn seed_thread_with_tool_call(
     (thread_id, event_id, args)
 }
 
-/// Fetch one thread's snapshot and return the tool-call row's payload.
 async fn tool_call_payload(thread_id: Uuid, query: &str) -> Value {
     let client = http_client();
     let url = format!(
@@ -117,14 +96,11 @@ async fn snapshot_strips_tool_call_args_and_stamps_marker() {
         "args should be stripped from the snapshot payload, got: {payload}"
     );
     assert_eq!(payload["args_stripped"], Value::Bool(true));
-    // The inline step row labels by `description` and pairs by `tool_use_id`.
     assert_eq!(payload["description"], "Edit shell.css");
     assert_eq!(payload["name"], "Edit");
     assert_eq!(payload["tool_use_id"], "tu-A");
 }
 
-/// A row written before the engine stamped `description` still renders its real
-/// label. The strip fills it from the args it is about to drop.
 #[tokio::test]
 async fn snapshot_fills_a_missing_description_before_dropping_the_args() {
     let pool = pool().await;
@@ -158,8 +134,6 @@ async fn tool_args_endpoint_returns_the_full_args() {
     assert_eq!(body["args"], args);
 }
 
-/// A tool called with no arguments is a real answer rather than a missing one.
-/// So the endpoint serves null and the modal draws its label-only state.
 #[tokio::test]
 async fn tool_args_endpoint_returns_null_when_no_args_were_recorded() {
     let pool = pool().await;
@@ -191,10 +165,6 @@ async fn tool_args_endpoint_returns_null_when_no_args_were_recorded() {
     assert_eq!(body["args"], Value::Null);
 }
 
-/// The chat channel's own `ToolCalled` is stripped too, so the endpoint serves
-/// it. The two sides ask one predicate for exactly this reason: a strip whose
-/// fetch does not recognise the type it stripped serves a 404 where the modal
-/// expects the command line.
 #[tokio::test]
 async fn tool_args_endpoint_serves_a_chat_tool_call() {
     let pool = pool().await;
@@ -226,8 +196,6 @@ async fn tool_args_endpoint_serves_a_chat_tool_call() {
     assert_eq!(body["args"]["path"], Value::String(format!("{marker}.md")));
 }
 
-/// An event that is not a tool call at all is still refused, so the endpoint
-/// cannot become a second door onto an arbitrary payload.
 #[tokio::test]
 async fn tool_args_endpoint_rejects_an_event_that_is_not_a_tool_call() {
     let pool = pool().await;
@@ -268,8 +236,6 @@ async fn tool_args_endpoint_404_on_unknown_event_id() {
     assert_eq!(resp.status(), 404);
 }
 
-/// `?include_context=true` opts back into the full payload, which is what the
-/// export-thread path reads so a bug report keeps every tool input.
 #[tokio::test]
 async fn snapshot_include_context_true_preserves_tool_call_args() {
     let pool = pool().await;

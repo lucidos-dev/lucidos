@@ -1,22 +1,3 @@
-//! The gateway-to-gateway protocol, from the side that grants: gateway B.
-//!
-//! B mints a *gateway pairing secret*, gateway A redeems it, and A then holds a
-//! gateway credential for B. ADR 0590 records why this is a grant of its own
-//! rather than one more device. A's half lives in [`crate::remote_gateways`].
-//!
-//! # Two pairing kinds, never crossing
-//!
-//! Gateway pairings live in [`PairedGatewayStore`], apart from the device
-//! pairings in `GatewayInner::pending_pairings`. A device secret never pairs a
-//! gateway, and a gateway secret never pairs a device.
-//!
-//! # The path and the version only add
-//!
-//! Every call lives under [`GATEWAY_API_PREFIX`]. The device gate in
-//! [`crate::auth_api::enforce`] stands aside there, and [`router`] checks the
-//! gateway credential itself. B's public health names [`GATEWAY_PROTOCOL`], so
-//! A can hide what an older B lacks.
-
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -39,53 +20,40 @@ use crate::stack::Health;
 use lucidos_gateway_stamp::remote_start::RemoteStartSetting;
 use lucidos_gateway_stamp::WORKSPACE_CALLS_PATH;
 
-/// The protocol version B names in its public health. Bumped only when a call
-/// is ADDED; nothing under [`GATEWAY_API_PREFIX`] is ever removed or changed.
-pub const GATEWAY_PROTOCOL: u32 = 5;
+pub const GATEWAY_PROTOCOL: u32 = 6;
 
 pub const OPERATIONS_PROTOCOL: u32 = 5;
 
-/// The first protocol with the manage hop, [`crate::manage_hop`]. Protocol 3
-/// added workspace calls.
 pub const MANAGE_PROTOCOL: u32 = 4;
+
+/// The first protocol with the control hop, [`crate::gateway_hop::CONTROL`].
+pub const CONTROL_PROTOCOL: u32 = 6;
 
 pub const ROTATE_PATH: &str = "/rotate";
 
-/// Where every gateway-to-gateway call lives.
 pub const GATEWAY_API_PREFIX: &str = "/~/api/gateway/v1";
 
-/// The namespace [`router`] is nested at. Everything under it skips the device
-/// gate, so anything this router does not route must answer 404 here.
 pub const GATEWAY_API_ROOT: &str = "/~/api/gateway";
 
-/// The header that carries A's gateway credential.
 pub const HEADER_GATEWAY_CREDENTIAL: &str = "x-lucidos-gateway-credential";
 
-/// Redeem a gateway pairing secret, relative to [`GATEWAY_API_PREFIX`].
 pub const PAIR_PATH: &str = "/pair";
 
-/// Read or end the caller's own pairing, relative to [`GATEWAY_API_PREFIX`].
 pub const PAIRING_PATH: &str = "/pairing";
 
-/// List B's workspaces, relative to [`GATEWAY_API_PREFIX`].
 pub const WORKSPACES_PATH: &str = "/workspaces";
 
-/// Manage B's users and devices, relative to [`GATEWAY_API_PREFIX`].
 pub const MANAGE_PATH: &str = "/manage";
 
-/// Is this path in the gateway-to-gateway namespace?
+pub const CONTROL_PATH: &str = "/control";
+
 pub fn is_gateway_api_path(path: &str) -> bool {
     path.strip_prefix(GATEWAY_API_ROOT)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// One gateway B has granted access to, as B persists it.
-///
-/// A digest of the credential, never the credential, for the reason
-/// `auth::PairedDevice` gives: a leaked file must not be standing access.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairedGateway {
-    /// The pairing id. B namespaces relayed devices under it (ADR 0591).
     pub id: String,
     pub label: String,
     pub credential_digest: String,
@@ -94,12 +62,10 @@ pub struct PairedGateway {
     pub last_used_at: Option<String>,
     #[serde(default)]
     pub previous_credential: Option<PreviousCredential>,
-    /// May devices on this gateway manage B's users and devices? Off unless
-    /// B's user turned it on (ADR 0656).
     #[serde(default)]
     pub may_manage: bool,
-    /// May agents on this gateway start threads here? Deny unless B's user
-    /// chose otherwise, which an older record therefore reads as (ADR 0725).
+    #[serde(default)]
+    pub may_control: bool,
     #[serde(default)]
     pub remote_starts: RemoteStartSetting,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,29 +78,46 @@ pub struct PreviousCredential {
     pub expires_at: i64,
 }
 
-/// B's paired-gateway file, `<data dir>/paired-gateways.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairedGateways {
     #[serde(default)]
     pub gateways: Vec<PairedGateway>,
 }
 
-/// Per gateway, beside the device store and never shared (ADR 0132).
 pub fn paired_gateways_path(app_data: &Path) -> PathBuf {
     app_data.join("paired-gateways.json")
 }
 
-/// The gateway A became by redeeming a secret, stamped on the request by
-/// [`require_gateway`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedGateway {
     pub pairing_id: String,
     pub label: String,
     pub may_manage: bool,
+    pub may_control: bool,
     pub remote_starts: RemoteStartSetting,
 }
 
-/// What one redemption produced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HopGrants {
+    pub manage: bool,
+    pub control: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopGrant {
+    Manage,
+    Control,
+}
+
+impl HopGrant {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Manage => "manage",
+            Self::Control => "control",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum GatewayRedemption {
     Paired {
@@ -142,25 +125,16 @@ pub enum GatewayRedemption {
         credential: String,
     },
     Rejected,
-    /// Waiting for a paired device's Allow. A presents the secret again.
-    /// `started` is true on the redeem that began the wait.
     AwaitingOwner {
         started: bool,
     },
     Declined,
 }
 
-/// B's paired gateways and its outstanding gateway pairings.
-///
-/// The same locking shape as the device store in `server.rs`. The data lock is
-/// held only to read or mutate, and `writing` orders the file writes. Every
-/// write publishes current memory, so a slow writer cannot restore a pairing
-/// an Unpair removed.
 pub struct PairedGatewayStore {
     path: PathBuf,
     gateways: Mutex<PairedGateways>,
     writing: Mutex<()>,
-    /// Never persisted, like device pairings: a pairing lives five minutes.
     pending: Mutex<PendingPairings>,
     receipts: Mutex<crate::return_access::Receipts>,
     operation_nonces: Mutex<std::collections::HashMap<(String, String), u64>>,
@@ -179,12 +153,10 @@ impl PairedGatewayStore {
         })
     }
 
-    /// Mint a gateway pairing secret, carrying the label B's user suggested
-    /// and whether the pairing starts with the manage grant.
     pub fn mint_secret(
         &self,
         label: Option<String>,
-        may_manage: bool,
+        grants: HopGrants,
         minter: Minter,
     ) -> Result<String, String> {
         self.pending
@@ -193,21 +165,13 @@ impl PairedGatewayStore {
             .mint(crate::pairing::PairingIntent {
                 label,
                 user_id: None,
-                may_manage,
+                grants,
                 minter,
             })
             .map(|minted| minted.secret)
             .map_err(|e| format!("could not mint a gateway pairing secret: {e}"))
     }
 
-    /// Redeem `secret` and record a paired gateway, once `gate` lets it.
-    ///
-    /// Never throttled: the secret is long enough that no flood can guess it,
-    /// so no flood can spend a budget that stands before the right one.
-    ///
-    /// The label B's user gave the secret wins here, unlike a device. B's user
-    /// is naming a machine they chose to trust, and A only offers its own
-    /// hostname.
     pub fn redeem(
         &self,
         secret: &str,
@@ -246,7 +210,8 @@ impl PairedGatewayStore {
             paired_at: chrono::Utc::now().to_rfc3339(),
             last_used_at: None,
             previous_credential: None,
-            may_manage: intent.may_manage,
+            may_manage: intent.grants.manage,
+            may_control: intent.grants.control,
             remote_starts: RemoteStartSetting::default(),
             return_route: None,
         };
@@ -258,7 +223,6 @@ impl PairedGatewayStore {
         })
     }
 
-    /// The gateway pairings waiting for a paired device's answer.
     pub fn requests(&self) -> Vec<PairingRequest> {
         self.pending
             .lock()
@@ -266,7 +230,6 @@ impl PairedGatewayStore {
             .unwrap_or_default()
     }
 
-    /// Answer the waiting request `id`. `false` when none has that id.
     pub fn answer(&self, id: &str, answer: PairingAnswer) -> Result<bool, String> {
         Ok(self
             .pending
@@ -275,17 +238,11 @@ impl PairedGatewayStore {
             .answer(id, answer))
     }
 
-    /// The paired gateway whose credential this request carries.
-    ///
-    /// Only the dedicated header counts. A cookie is never read here, so a
-    /// browser's jar cannot stand in for a gateway. A poisoned lock fails
-    /// closed.
     pub fn authorize(&self, headers: &HeaderMap) -> Result<Option<AuthenticatedGateway>, String> {
         let Some(digest) = presented_digest(headers) else {
             return Ok(None);
         };
         self.with_authenticated(&digest, |gateway, current| {
-            // First successful use of the new key durably ends the overlap.
             if current {
                 gateway.previous_credential = None;
             }
@@ -302,13 +259,12 @@ impl PairedGatewayStore {
                 pairing_id: gateway.id.clone(),
                 label: gateway.label.clone(),
                 may_manage: gateway.may_manage,
+                may_control: gateway.may_control,
                 remote_starts: gateway.remote_starts,
             })
         })
     }
 
-    /// Install A's durably sealed candidate. Repeating an intent is idempotent.
-    /// A chooses the key before contacting B so a lost response is recoverable.
     pub fn rotate(&self, headers: &HeaderMap, candidate: &str) -> Result<bool, String> {
         if candidate.len() != 64
             || !candidate
@@ -327,7 +283,6 @@ impl PairedGatewayStore {
             if ct_eq(&gateway.credential_digest, &replacement) {
                 return Ok(());
             }
-            // An old overlap key cannot race the current key into a third key.
             if !current {
                 return Err("a previous credential cannot start another rotation".into());
             }
@@ -387,8 +342,6 @@ impl PairedGatewayStore {
             .is_ok_and(|store| store.gateways.is_empty())
     }
 
-    /// Forget a paired gateway. `false` when none had that id. Its next call
-    /// is refused, because [`Self::authorize`] reads memory.
     pub fn unpair(&self, id: &str) -> Result<bool, String> {
         let mut removed = false;
         self.write(|store| {
@@ -402,36 +355,33 @@ impl PairedGatewayStore {
         Ok(removed)
     }
 
-    /// Turn the manage grant on or off. `None` when no pairing had that id.
-    /// The next call reads it, because [`Self::authorize`] reads memory.
-    pub fn set_may_manage(
+    pub fn set_grant(
         &self,
         id: &str,
-        may_manage: bool,
+        grant: HopGrant,
+        on: bool,
     ) -> Result<Option<PairedGateway>, String> {
         let mut updated = None;
         self.write(|store| {
             if let Some(gateway) = store.gateways.iter_mut().find(|g| g.id == id) {
-                gateway.may_manage = may_manage;
+                match grant {
+                    HopGrant::Manage => gateway.may_manage = on,
+                    HopGrant::Control => gateway.may_control = on,
+                }
                 updated = Some(gateway.clone());
             }
         })?;
         if let Some(gateway) = &updated {
             crate::log_legacy!(
-                "[Gateway] {} the manage grant for '{}'",
-                if may_manage {
-                    "turned on"
-                } else {
-                    "turned off"
-                },
+                "[Gateway] {} the {} grant for '{}'",
+                if on { "turned on" } else { "turned off" },
+                grant.name(),
                 gateway.label
             );
         }
         Ok(updated)
     }
 
-    /// Set the remote start setting. `None` when no pairing had that id.
-    /// The next spawn reads it, because dispatch re-runs [`Self::authorize`].
     pub fn set_remote_starts(
         &self,
         id: &str,
@@ -510,8 +460,6 @@ impl PairedGatewayStore {
         }
     }
 
-    /// Keep the pairing lock through issuance/redemption, so an unpair cannot
-    /// race the receipt's current-pairing check.
     pub(crate) fn with_pairing_receipts<T>(
         &self,
         pairing: &str,
@@ -544,7 +492,6 @@ impl PairedGatewayStore {
             "paired gateway store is unavailable".to_string()
         }
         let _writing = self.writing.lock().map_err(unavailable)?;
-        // Save first, publish after: a failed save changes nothing anyone sees.
         let mut next = self.gateways.lock().map_err(unavailable)?.clone();
         mutate(&mut next);
         auth::save_store(&next, &self.path)
@@ -554,10 +501,6 @@ impl PairedGatewayStore {
     }
 }
 
-/// The gateway-to-gateway router, nested at [`GATEWAY_API_ROOT`].
-///
-/// Every route but [`PAIR_PATH`] sits behind [`require_gateway`]. The fallback
-/// answers 404 rather than letting the picker's fallback serve this namespace.
 pub fn router(state: GatewayState) -> Router<GatewayState> {
     let v1 = Router::new()
         .route(PAIRING_PATH, get(own_pairing).delete(leave))
@@ -583,8 +526,6 @@ pub fn router(state: GatewayState) -> Router<GatewayState> {
             &format!("{}/:slug", crate::relay::RELAY_PATH),
             any(crate::relay::receive),
         )
-        // A wildcard never matches an empty tail, so the workspace root
-        // `/relay/<slug>/` needs a route of its own.
         .route(
             &format!("{}/:slug/", crate::relay::RELAY_PATH),
             any(crate::relay::receive),
@@ -605,19 +546,20 @@ pub fn router(state: GatewayState) -> Router<GatewayState> {
             &format!("{WORKSPACE_CALLS_PATH}/:target/diagnostic-bundles"),
             post(crate::diagnostic_transport::receive),
         )
-        .nest(MANAGE_PATH, crate::manage_hop::receiver())
+        .nest(
+            MANAGE_PATH,
+            crate::gateway_hop::receiver(&crate::gateway_hop::MANAGE),
+        )
+        .nest(
+            CONTROL_PATH,
+            crate::gateway_hop::receiver(&crate::gateway_hop::CONTROL),
+        )
         .route_layer(middleware::from_fn_with_state(state, require_gateway))
-        // A return caller has no credential for us; we authenticate its receipt
-        // by calling the source through our existing outgoing pairing instead.
         .route(
             "/return-operation",
             post(crate::workspace_operations::receive_return),
         )
-        // Pair is the call A makes before it holds a credential. The long secret
-        // is the only thing standing here: single use, expiring, and too long
-        // for any flood to guess, so nothing here is throttled.
         .route(PAIR_PATH, post(pair))
-        // Authenticate atomically with rotation, without consuming overlap first.
         .route(ROTATE_PATH, post(rotate));
     let version = GATEWAY_API_PREFIX
         .strip_prefix(GATEWAY_API_ROOT)
@@ -629,7 +571,6 @@ async fn not_found() -> ApiError {
     ApiError::not_found("no such gateway-to-gateway call")
 }
 
-/// Refuse a call without a current pairing's credential.
 async fn require_gateway(
     State(state): State<GatewayState>,
     mut req: Request,
@@ -677,30 +618,22 @@ async fn rotate(
 
 #[derive(Deserialize)]
 struct PairRequest {
-    /// The gateway pairing secret. Named `code` on the wire, which only adds.
     code: String,
-    /// What A calls itself. B's user may already have named the secret.
     #[serde(default)]
     label: Option<String>,
 }
 
-/// What A learns by redeeming a secret.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairAnswer {
-    /// Durable destination identity. Absent on older peers, never public health.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_id: Option<String>,
     pub pairing_id: String,
     pub credential: String,
     pub gateway_protocol: u32,
-    /// B's ADR 0550 external address, when it is `https`. Told only to a
-    /// gateway holding a secret, never in public health.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_address: Option<String>,
 }
 
-/// Redeem a gateway pairing secret. A local process's secret answers 202 until
-/// a paired device allows it, so A presents it again (`crate::pairing_requests`).
 async fn pair(
     State(state): State<GatewayState>,
     Json(body): Json<PairRequest>,
@@ -763,7 +696,6 @@ struct OwnPairing {
     gateway_protocol: u32,
 }
 
-/// The caller's own pairing, so A can tell a live grant from a revoked one.
 async fn own_pairing(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,
@@ -776,44 +708,42 @@ async fn own_pairing(
     })
 }
 
-/// One of B's workspaces, as a paired gateway lists it.
-///
-/// No port and no directory: A reaches the workspace through the relay, so
-/// neither means anything on A's side.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListedWorkspace {
     pub id: String,
     pub name: String,
     pub health: Health,
-    /// B's own reason, as its picker shows it. `"not started"` tells a stopped
-    /// workspace from a failed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    /// B's unread-notification count for the workspace, absent when B has none
-    /// to report (a stopped engine, or an older B that never sent one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread_count: Option<u64>,
 }
 
-/// B's workspaces, for A's Workspaces list.
-async fn list_workspaces(State(state): State<GatewayState>) -> Json<Vec<ListedWorkspace>> {
+impl From<crate::stack::WorkspaceStatus> for ListedWorkspace {
+    fn from(w: crate::stack::WorkspaceStatus) -> Self {
+        Self {
+            id: w.id,
+            name: w.name,
+            health: w.health,
+            last_error: w.last_error,
+            unread_count: w.unread_count,
+        }
+    }
+}
+
+pub(crate) async fn list_workspaces(
+    State(state): State<GatewayState>,
+) -> Json<Vec<ListedWorkspace>> {
     Json(
         state
             .list_status()
             .await
             .into_iter()
-            .map(|w| ListedWorkspace {
-                id: w.id,
-                name: w.name,
-                health: w.health,
-                last_error: w.last_error,
-                unread_count: w.unread_count,
-            })
+            .map(Into::into)
             .collect(),
     )
 }
 
-/// A removed B, so B forgets the grant too.
 async fn leave(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,
@@ -822,9 +752,6 @@ async fn leave(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Forget a paired gateway and the users it relayed, so they no longer
-/// count. `false` when no pairing had that id. A retry after a failed forget
-/// still forgets, though the pairing itself is already gone.
 fn end_pairing(state: &GatewayState, id: &str) -> Result<bool, ApiError> {
     let unpaired = state
         .paired_gateways()
@@ -837,13 +764,13 @@ fn end_pairing(state: &GatewayState, id: &str) -> Result<bool, ApiError> {
     Ok(unpaired)
 }
 
-/// B's management routes, merged into `auth_api::router` behind its gates.
 pub fn management_router() -> Router<GatewayState> {
     Router::new()
         .route("/gateway-pairing-code", post(gateway_pairing_code))
         .route("/gateways", get(list_gateways))
         .route("/gateways/:id", axum::routing::delete(unpair_gateway))
         .route("/gateways/:id/manage", axum::routing::put(set_manage))
+        .route("/gateways/:id/control", axum::routing::put(set_control))
         .route(
             "/gateways/:id/remote-starts",
             axum::routing::put(set_remote_starts),
@@ -854,15 +781,15 @@ pub fn management_router() -> Router<GatewayState> {
 struct GatewayCodeQuery {
     #[serde(default)]
     label: Option<String>,
-    /// Start the pairing with the manage grant on, as `lucidos pair
-    /// --gateway --manage` asks.
     #[serde(default)]
     manage: bool,
+    /// Start it with the control grant on, as `--control` asks.
+    #[serde(default)]
+    control: bool,
 }
 
 #[derive(Serialize)]
 struct GatewayCodeBody {
-    /// The gateway pairing secret. Named `code` on the wire, which only adds.
     code: String,
     expires_in_secs: u64,
 }
@@ -882,7 +809,10 @@ async fn gateway_pairing_code(
         .paired_gateways()
         .mint_secret(
             label,
-            query.manage,
+            HopGrants {
+                manage: query.manage,
+                control: query.control,
+            },
             crate::pairing_requests::minter(device.as_ref()),
         )
         .map_err(ApiError::internal)?;
@@ -899,6 +829,7 @@ pub struct GatewayRow {
     pub paired_at: String,
     pub last_used_at: Option<String>,
     pub may_manage: bool,
+    pub may_control: bool,
     pub remote_starts: RemoteStartSetting,
 }
 
@@ -910,6 +841,7 @@ impl From<PairedGateway> for GatewayRow {
             paired_at: g.paired_at,
             last_used_at: g.last_used_at,
             may_manage: g.may_manage,
+            may_control: g.may_control,
             remote_starts: g.remote_starts,
         }
     }
@@ -932,13 +864,35 @@ struct ManageBody {
 }
 
 async fn set_manage(
+    state: State<GatewayState>,
+    id: axum::extract::Path<String>,
+    Json(body): Json<ManageBody>,
+) -> Result<Json<GatewayRow>, ApiError> {
+    set_grant(state, id, HopGrant::Manage, body.may_manage)
+}
+
+#[derive(Deserialize)]
+struct ControlBody {
+    may_control: bool,
+}
+
+async fn set_control(
+    state: State<GatewayState>,
+    id: axum::extract::Path<String>,
+    Json(body): Json<ControlBody>,
+) -> Result<Json<GatewayRow>, ApiError> {
+    set_grant(state, id, HopGrant::Control, body.may_control)
+}
+
+fn set_grant(
     State(state): State<GatewayState>,
     axum::extract::Path(id): axum::extract::Path<String>,
-    Json(body): Json<ManageBody>,
+    grant: HopGrant,
+    on: bool,
 ) -> Result<Json<GatewayRow>, ApiError> {
     state
         .paired_gateways()
-        .set_may_manage(&id, body.may_manage)
+        .set_grant(&id, grant, on)
         .map_err(ApiError::internal)?
         .map(|g| Json(g.into()))
         .ok_or_else(|| ApiError::not_found("no paired gateway with that id"))

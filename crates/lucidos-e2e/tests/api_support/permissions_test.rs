@@ -1,11 +1,3 @@
-//! Coverage for `/api/v1/permissions`, permission batches and a thread's
-//! `/hold` (ADR 0664).
-//!
-//! A batch needs a thread-bound origin token, which only a subprocess the
-//! engine spawned holds. So this suite covers the list, the refusals, a hold
-//! and resume from a device, and the CLI loop. The engine's `permission` and
-//! `thread_hold` tests cover a grant, a batch and a Hold's reach.
-
 use crate::support::{
     base_url, db_url, seed_cc_thread_summary, seed_chat_thread_summary, unattested_user_client,
     user_client,
@@ -26,7 +18,6 @@ async fn permissions_list_answers_a_list() {
     }
 }
 
-/// Revoking an unknown permission is a 404, and a malformed id a 400.
 #[tokio::test]
 async fn revoke_names_what_it_could_not_find() {
     let client = user_client().await;
@@ -46,7 +37,6 @@ async fn revoke_names_what_it_could_not_find() {
     assert_eq!(resp.status(), 400);
 }
 
-/// A batch rides its raiser's thread, so a device, which has none, is refused.
 #[tokio::test]
 async fn a_batch_needs_a_thread_to_raise_it_on() {
     let resp = user_client()
@@ -68,9 +58,6 @@ fn hold_url(thread_id: uuid::Uuid) -> String {
     format!("{}/api/v1/threads/{thread_id}/hold", base_url())
 }
 
-/// The owner holds a thread and resumes it, a coding-agent thread and a chat
-/// thread alike. A repeat changes nothing, and an unattested caller cannot
-/// resume.
 #[tokio::test]
 async fn the_owner_holds_and_resumes_a_thread() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
@@ -115,8 +102,6 @@ async fn the_owner_holds_and_resumes_a_thread() {
     }
 }
 
-/// Hold and Resume name what they refused: an unknown thread is a 404, and a
-/// body with no reason a 400.
 #[tokio::test]
 async fn hold_and_resume_name_what_they_refused() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
@@ -148,7 +133,6 @@ async fn hold_and_resume_name_what_they_refused() {
     assert_eq!(resp.status(), 404);
 }
 
-/// The CLI lists permissions and surfaces the batch route's refusal.
 #[test]
 fn cli_permissions_reach_the_routes() {
     let out = crate::lucidos_cli_test::lucidos_cmd()

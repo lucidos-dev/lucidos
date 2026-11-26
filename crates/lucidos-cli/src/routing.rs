@@ -1,12 +1,20 @@
-//! Closed reads and spawns through the caller's own engine, never a peer URL.
-
 use crate::workspace::{BoxError, Workspace};
 use crate::{EventsCmd, ThreadsCmd};
 use clap::Args;
+use lucidos_gateway_stamp::is_plain_target;
 use lucidos_gateway_stamp::workspace_operation::{
     ReadKind, ReadRequest, RoutingRequest, WorkspaceOperation, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 use serde_json::Value;
+
+pub(crate) fn routed_workspace_name(target: &str) -> Option<&str> {
+    let workspace = match target.split_once('@') {
+        Some((workspace, remote)) if is_plain_target(remote) => workspace,
+        Some(_) => return None,
+        None => target,
+    };
+    is_plain_target(workspace).then_some(workspace)
+}
 
 #[derive(Args, Debug, Clone, Default)]
 pub(crate) struct Selection {
@@ -36,7 +44,7 @@ impl Selection {
             if route
                 .to
                 .as_ref()
-                .is_some_and(|to| to != workspace && to.split('@').next() != Some(workspace))
+                .is_some_and(|to| to != workspace && routed_workspace_name(to) != Some(workspace))
             {
                 return Err("The thread link and --to select different workspaces.".into());
             }
@@ -150,7 +158,6 @@ fn liveness(ws: &Workspace, route: &Selection, thread: Option<&str>) {
     let Some(thread) = thread else {
         return;
     };
-    // An unavailable liveness read claims no state, matching ordinary event reads.
     if let Ok(value) = read_value(
         ws,
         route,
@@ -281,5 +288,19 @@ mod tests {
         let (route, read) = route.for_read(read).unwrap();
         assert_eq!(route.to.as_deref(), Some("target@cloud"));
         assert_eq!(read.thread_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn invalid_routed_target_prefix_cannot_match_a_thread_link() {
+        let route = Selection {
+            via: None,
+            to: Some("target@cloud/not-a-name".into()),
+        };
+        let read = request(
+            ReadKind::ThreadMessages,
+            Some("thread:target/thread-1".into()),
+            Vec::new(),
+        );
+        assert!(route.for_read(read).is_err());
     }
 }

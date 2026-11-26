@@ -1,5 +1,3 @@
-//! Periodic database reachability and schema probes (ADRs 0037 and 0481).
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,17 +6,10 @@ use lucidos_engine::engine::db_health::{apply_probe, apply_schema_probe, Databas
 use lucidos_engine::engine::LucidosEngine;
 use sqlx::{Connection, PgConnection, PgPool};
 
-/// How often the background task probes. Matches the frontend's own health poll,
-/// so a recovery surfaces within about one client tick of actually happening.
 const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Ceiling on one probe. This bound keeps a wedged connection from stalling
-/// the ticker. It is shorter than the frontend and gateway health timeouts.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// One round trip through the pool, bounded. `None` when the query answered.
-/// Otherwise a direct connection says why it did not, bounded too, so a tick
-/// never lasts much past twice [`PROBE_TIMEOUT`].
 async fn probe_once(pool: &PgPool) -> Option<DatabaseHealth> {
     let pooled = tokio::time::timeout(PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(pool)).await;
     if matches!(pooled, Ok(Ok(_))) {
@@ -27,8 +18,6 @@ async fn probe_once(pool: &PgPool) -> Option<DatabaseHealth> {
     Some(probe_outside_pool(pool).await)
 }
 
-/// Whether the database answers a connection of its own, with the pool's
-/// connect options and one timeout over connect and query together.
 async fn probe_outside_pool(pool: &PgPool) -> DatabaseHealth {
     let options = pool.connect_options();
     let attempt = async {
@@ -45,8 +34,6 @@ async fn probe_outside_pool(pool: &PgPool) -> DatabaseHealth {
     }
 }
 
-/// Report the wiped database and stop, when the migration marker agrees
-/// it is this database. `false` when it does not, and the engine runs on.
 async fn stop_on_wiped_database(engine: &LucidosEngine) -> bool {
     let workspace = engine.workspace_path();
     let named = tokio::time::timeout(
@@ -70,11 +57,6 @@ async fn stop_on_wiped_database(engine: &LucidosEngine) -> bool {
     true
 }
 
-/// Start the background reachability probe. Spawned once at boot, alongside
-/// the other periodic engine tasks in `main.rs`.
-///
-/// Packaged installs run this probe too. The frontend uses the same degraded
-/// surface in both cases and picks the remedy text from the `packaged` flag.
 pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut failures: u32 = 0;
@@ -91,8 +73,6 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
             let (reachable, next_failures) =
                 apply_probe(was.is_reachable(), failures, failure.is_none());
             failures = next_failures;
-            // Only after the pool answered, and bounded like it, so a tick
-            // still never lasts much past twice `PROBE_TIMEOUT`.
             let table = if failure.is_none() {
                 tokio::time::timeout(
                     PROBE_TIMEOUT,
@@ -130,8 +110,6 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Stop through the engine's own graceful path, the SIGUSR1 `main.rs` handles,
-/// so agent sessions and background tasks are torn down too.
 #[cfg(unix)]
 fn request_own_shutdown() {
     // SAFETY: kill takes no pointers; getpid names this process.
@@ -161,8 +139,6 @@ mod tests {
         assert_eq!(apply_schema_probe(0, MigrationTable::Missing), (1, false));
     }
 
-    /// The load-bearing negative case: during a Docker or socket outage the
-    /// query errors, and that must never count toward a wipe (ADR 0037).
     #[test]
     fn an_unanswered_probe_leaves_the_run_alone() {
         assert_eq!(apply_schema_probe(0, MigrationTable::Unknown), (0, false));
@@ -228,8 +204,6 @@ mod tests {
 
     #[test]
     fn one_failure_is_not_enough_to_claim_an_outage() {
-        // The load-bearing negative case: a single timed-out probe on a saturated
-        // host must not put the whole client into its degraded surface.
         assert_eq!(apply_probe(true, 0, false), (true, 1));
     }
 
@@ -242,14 +216,11 @@ mod tests {
 
     #[test]
     fn a_single_success_restores_it() {
-        // Asymmetric by design: proof of life needs no hysteresis.
         assert_eq!(apply_probe(false, 7, true), (true, 0));
     }
 
     #[test]
     fn a_settled_outage_stays_settled_without_re_announcing() {
-        // Already false: further failures keep it false and keep counting, so the
-        // caller's `now != was` guard logs the transition exactly once.
         let (reachable, failures) = apply_probe(false, 2, false);
         assert!(!reachable);
         assert_eq!(failures, 3);
@@ -257,8 +228,6 @@ mod tests {
 
     #[test]
     fn a_long_outage_cannot_overflow_the_tally() {
-        // Saturating rather than wrapping: a wrap would take the count back under
-        // the threshold and flip a dead database to "reachable".
         let (reachable, failures) = apply_probe(false, u32::MAX, false);
         assert!(!reachable);
         assert_eq!(failures, u32::MAX);

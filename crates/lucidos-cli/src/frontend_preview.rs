@@ -1,21 +1,3 @@
-//! `lucidos frontend-preview`: start, stop, or inspect the supervised Vite dev
-//! server that shows a coding-agent worktree's frontend before Apply
-//! (`engine::frontend_preview`).
-//!
-//! This is the half a coding agent can reach. A `vite` the agent starts itself
-//! dies the moment its turn ends, because the engine kills the session's whole
-//! process group; asking the engine to start one is the entire difference
-//! between a preview that survives the message and one that does not.
-//!
-//! `start` defaults `--thread-id` from `$LUCIDOS_THREAD_ID`, so inside a
-//! coding-agent worktree the whole invocation is `lucidos frontend-preview
-//! start`, and the printed URL is what goes into the reply.
-//!
-//! Hand-written rather than generated from the capability parity manifest
-//! (ADR 0018): the preview is a development affordance with a supervised
-//! process behind it, not a workspace capability, so it has no LLM tool and no
-//! SDK facade.
-
 use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
@@ -23,22 +5,16 @@ fn endpoint(ws: &Workspace, suffix: &str) -> String {
     format!("{}/api/v1/frontend-preview{}", ws.base_url(), suffix)
 }
 
-/// The thread whose worktree to preview: the flag, else the ambient
-/// `$LUCIDOS_THREAD_ID` a coding-agent subprocess is spawned with.
 pub(crate) fn resolve_thread_id(flag: Option<&str>) -> Result<String, BoxError> {
     if let Some(id) = flag.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(id.to_string());
     }
     match std::env::var("LUCIDOS_THREAD_ID") {
         Ok(id) if !id.trim().is_empty() => Ok(id.trim().to_string()),
-        // Named rather than generic: outside a coding-agent subprocess there is
-        // no ambient thread, and the caller needs to know the flag is the fix.
         _ => Err("No thread to preview: pass --thread-id <uuid>, or run this inside a coding-agent worktree where $LUCIDOS_THREAD_ID is set.".into()),
     }
 }
 
-/// One line describing what the engine reported, for a human or an agent that
-/// is about to paste it into a reply. Pure, so the wording is testable.
 pub(crate) fn describe(body: &serde_json::Value) -> String {
     if body.get("running").and_then(|v| v.as_bool()) != Some(true) {
         return "No frontend preview is running.".to_string();
@@ -69,8 +45,6 @@ fn post(ws: &Workspace, suffix: &str, body: serde_json::Value) -> Result<(), Box
         .text()
         .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
     if !status.is_success() {
-        // The engine's refusals name the worktree or the missing file, so they
-        // are surfaced verbatim rather than replaced with a status code.
         return Err(format!("POST {} returned {}: {}", url, status, text).into());
     }
     let parsed: serde_json::Value = serde_json::from_str(&text)
@@ -111,19 +85,13 @@ pub(crate) fn cmd_status(ws: &Workspace) -> Result<(), BoxError> {
 mod tests {
     use super::*;
 
-    /// One test, not three, because all three cases mutate the SAME process-wide
-    /// env var and Rust runs `#[test]`s in one binary concurrently: split up,
-    /// they would race each other's `set_var` / `remove_var`.
     #[test]
     fn the_thread_is_the_flag_then_the_ambient_id_then_an_error_naming_the_flag() {
         std::env::set_var("LUCIDOS_THREAD_ID", "11111111-1111-1111-1111-111111111111");
-        // A coding agent previewing a SIBLING thread's worktree must not
-        // silently get its own.
         assert_eq!(
             resolve_thread_id(Some("22222222-2222-2222-2222-222222222222")).unwrap(),
             "22222222-2222-2222-2222-222222222222"
         );
-        // A blank flag is no flag, not an empty thread id.
         assert_eq!(
             resolve_thread_id(Some("  ")).unwrap(),
             "11111111-1111-1111-1111-111111111111"

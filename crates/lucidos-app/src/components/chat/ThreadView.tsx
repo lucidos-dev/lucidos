@@ -22,7 +22,7 @@ import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, deepLinkTargetIndex, exchangeKey, drawnResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
 import { rowsDrawnByClamp } from '../../store/event-rendering';
 import { statusLabel } from '../../store/exchange-status';
-import { showScrollToBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isScrollHeld, markAnchorScroll, onScrollHoldReleased, scrollHoldReleased, deepLinkTarget, scrolledFromTop } from './scrollState';
+import { showScrollToBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isScrollHeld, holdAcrossRelayout, onScrollHoldReleased, scrollHoldReleased, deepLinkTarget, scrolledFromTop } from './scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
 import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, clampedScrollTop, scrollAsksForOlder, canSeedRenderWindow, deepLinkEdge, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type StoredWindowKind, type WindowEdge } from './threadWindow';
 import { transcriptScrolls } from './transcriptScrolls';
@@ -827,7 +827,7 @@ export function ThreadView() {
         const pend = pendingExpandRef.current;
         if (!el || !pend) return;
         pendingExpandRef.current = null;
-        markAnchorScroll(el, pend.prevScrollTop + (el.scrollHeight - pend.prevScrollHeight));
+        holdAcrossRelayout(el, pend.prevScrollTop + (el.scrollHeight - pend.prevScrollHeight));
     }, [edgeKey, winTick]);
 
     useEffect(() => () => {
@@ -848,7 +848,7 @@ export function ThreadView() {
         const hold = isElementVisible(el) ? pend : null;
         const anchored = anchorAfterBackfill(exchanges, pend);
         if (!anchored) {
-            if (hold) markAnchorScroll(el, holdTargetTop(el, hold));
+            if (hold) holdAcrossRelayout(el, holdTargetTop(el, hold));
             return;
         }
         storeEdge(threadId, anchored, exchanges);

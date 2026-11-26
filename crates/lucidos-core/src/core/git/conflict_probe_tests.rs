@@ -7,8 +7,6 @@ async fn commit_file(repo: &Path, name: &str, body: &str, msg: &str) {
     git_cmd(&["commit", "-m", msg], repo).await.unwrap();
 }
 
-/// A repo whose `clash` branch and `main` both rewrite `init.txt`, and whose
-/// `fresh` branch only adds a file.
 async fn diverged_repo() -> (tempfile::TempDir, PathBuf) {
     let (tmp, repo) = make_test_repo().await;
     git_cmd(&["checkout", "-b", "clash"], &repo).await.unwrap();
@@ -37,7 +35,6 @@ fn merge_tree_output_is_read_by_exit_code() {
         classify_merge_tree(Some(1), "abc123\na.rs\nsrc/b.rs\n"),
         MergeProbe::Conflicts(vec!["a.rs".into(), "src/b.rs".into()])
     );
-    // A failure is not a clean merge, whatever stdout holds.
     assert_eq!(classify_merge_tree(Some(128), ""), MergeProbe::Unknown);
     assert_eq!(classify_merge_tree(None, ""), MergeProbe::Unknown);
 }
@@ -57,7 +54,6 @@ async fn a_branch_editing_what_main_edited_is_predicted_to_conflict() {
 
 #[tokio::test]
 async fn the_conflict_list_names_only_conflicting_paths() {
-    // Tier 3 names these in MergeConflictDetected, not the change's whole list.
     let (_tmp, repo) = diverged_repo().await;
     git_cmd(&["checkout", "clash"], &repo).await.unwrap();
     commit_file(&repo, "untouched-by-main.txt", "x", "a clean addition").await;
@@ -97,7 +93,6 @@ async fn the_probe_changes_no_ref_index_or_worktree() {
     assert_eq!(refs_and_status(&repo).await, before);
 }
 
-/// The answer is reused until a tip moves, and asked again once one does.
 #[tokio::test]
 async fn a_moved_tip_is_probed_again() {
     let (_tmp, repo) = diverged_repo().await;
@@ -131,8 +126,6 @@ fn cached_for(repo: &Path) -> Vec<MergeProbe> {
         .collect()
 }
 
-/// A repeat read at the same tips is a cache hit, so a changes broadcast costs
-/// one `rev-parse` per change. An unknown is never cached.
 #[tokio::test]
 async fn an_answer_is_cached_and_an_unknown_is_not() {
     let (_tmp, repo) = diverged_repo().await;

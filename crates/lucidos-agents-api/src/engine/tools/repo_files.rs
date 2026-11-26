@@ -1,31 +1,7 @@
-//! Reaching files inside a *registered repository* from the chat file tools.
-//!
-//! `read_file`, `glob_files`, `grep_files` and `edit_file` take an optional
-//! `repo`. With it set the path is repo-root-relative rather than `data/`-
-//! relative, and resolution runs through here instead of through
-//! `normalize_data_path`. See `docs/adr/0093-file-tools-reach-registered-repos.md`.
-//!
-//! Three things this module owns, and nothing else does:
-//!
-//! - **Which repos exist.** Only a row in `repositories` resolves. No file tool
-//!   takes a filesystem path, so an unregistered tree is unreachable by name
-//!   and unreachable by accident.
-//! - **Where a path may land.** [`resolve_in_repo`] refuses `..` and absolute
-//!   inputs, then canonicalizes and proves containment, so a symlink inside the
-//!   repo pointing out is refused. Same guard, same reasoning as
-//!   `resolve_tmp_path` (ADR 0051 § "Why a symlink guard").
-//! - **Which files a walk sees.** [`repo_entries`] enumerates through
-//!   `git ls-files`, so `.gitignore` decides. A grep over a Rust repo must not
-//!   descend `target/`, and no hand-maintained skip list stays correct.
-
 use std::path::{Path, PathBuf};
 
 use crate::core::repositories::{Repository, RepositoryStore};
 
-/// Resolve the `repo` tool argument (a registered repository's name or id) to
-/// its row. The error is agent-facing and names the recovery route: a wrong
-/// name is by far the likeliest cause, and the file tools cannot list
-/// repositories themselves.
 pub(crate) async fn resolve_repo(pool: &sqlx::PgPool, repo: &str) -> Result<Repository, String> {
     let repo = repo.trim();
     if repo.is_empty() {
@@ -93,25 +69,10 @@ pub(crate) async fn repo_entries(repo_root: &Path) -> Result<Vec<(String, PathBu
     Ok(entries)
 }
 
-/// The live file a requested path is a dead copy of, or `None` to go ahead.
-///
-/// A repo carries gitignored DUPLICATES of its own tracked files: build
-/// staging under `crates/lucidos-app/bundle-resources/`, and every abandoned
-/// coding-agent worktree. Each is frozen at the commit that produced it, and
-/// nothing on disk says so. A caller that reaches one by path reads the tree as
-/// it was weeks ago and cannot tell.
-///
-/// Not hypothetical. A workspace audit ran `find . -name workspace-audit.md |
-/// head -1`, got the five-week-old staged copy, and reported against checks the
-/// recipe no longer has.
-///
-/// A search never lands here, because [`repo_entries`] enumerates through
-/// `git ls-files`. Only a path a caller names itself can, which is why the
-/// guard belongs on resolution rather than on the walk.
 pub(crate) async fn shadowed_tracked_path(repo_root: &Path, relative: &str) -> Option<String> {
     use crate::engine::git_ops::git_answer;
 
-    // Every arm falls to ALLOW when git cannot answer. A probe that could not
+    // INVARIANT: Every arm falls to ALLOW when git cannot answer. A probe that could not
     // run must not cost the caller the read: a stale read is recoverable, and a
     // tool that refuses everything whenever git is slow is not.
     if git_answer(&["ls-files", "--error-unmatch", "--", relative], repo_root)
@@ -120,14 +81,13 @@ pub(crate) async fn shadowed_tracked_path(repo_root: &Path, relative: &str) -> O
     {
         return None;
     }
-    // Untracked and not ignored is an ordinary new file, which is fine to read.
     if !git_answer(&["check-ignore", "-q", "--", relative], repo_root)
         .await
         .or_unknown(false)
     {
         return None;
     }
-    // Ignored. A dead copy repeats the live path under a staging or worktree
+    // INVARIANT: Ignored. A dead copy repeats the live path under a staging or worktree
     // prefix, so drop leading components until one names a tracked file.
     //
     // A BARE BASENAME never counts. `staging/postgres/README.md` would
@@ -165,13 +125,10 @@ async fn prefix_holds_a_copy(repo_root: &Path, prefix: &str, tail: &str) -> bool
     String::from_utf8_lossy(&output.stdout)
         .split('\0')
         .filter(|p| !p.is_empty() && *p != tail)
-        // The first sibling found ends it, and the cap bounds the walk over a
-        // directory holding thousands.
         .take(50)
         .any(|sibling| repo_root.join(format!("{prefix}{sibling}")).exists())
 }
 
-/// What the caller is told, naming the live path rather than just refusing.
 pub(crate) fn stale_copy_refusal(requested: &str, live: &str) -> String {
     format!(
         "'{requested}' is a dead copy: git ignores it, and '{live}' is the live file. \
@@ -264,8 +221,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(got).unwrap(), "inside");
     }
 
-    /// A typo must read as a typo. Canonicalization fails on a missing path, so
-    /// the containment check is skipped rather than reported as an escape.
     #[test]
     fn a_missing_path_is_not_a_security_error() {
         let repo = tempfile::tempdir().unwrap();
@@ -281,7 +236,6 @@ mod tests {
         write(repo.path(), "src/main.rs", "fn main() {}");
         write(repo.path(), "target/debug/huge.bin", "build output");
         git(repo.path(), &["add", "."]);
-        // Written after `git add`, so it is untracked but not ignored.
         write(repo.path(), "src/fresh.rs", "brand new");
 
         let rels: Vec<String> = repo_entries(repo.path())
@@ -299,9 +253,6 @@ mod tests {
         );
     }
 
-    /// A tracked symlink pointing out of the repo must not enter the walk.
-    /// `grep_entries` reads its entries directly, so an entry that escapes is
-    /// an entry whose contents leave the repository.
     #[tokio::test]
     async fn entries_drop_a_symlink_that_escapes_the_repository() {
         let outside = tempfile::tempdir().unwrap();
@@ -335,9 +286,6 @@ mod tests {
         }
     }
 
-    /// A symlink INSIDE the repo is dropped too. The walk cannot prove
-    /// containment cheaply per entry, so it follows no link at all. The target
-    /// is listed under its own real path anyway.
     #[tokio::test]
     async fn entries_drop_an_internal_symlink_but_keep_its_target() {
         let repo = tempfile::tempdir().unwrap();
@@ -357,8 +305,6 @@ mod tests {
         assert_eq!(rels, vec!["src/real.rs".to_string()]);
     }
 
-    /// `--cached` lists a tracked file that no longer exists on disk. A glob
-    /// answering with it would hand back paths whose reads then fail.
     #[tokio::test]
     async fn entries_drop_a_tracked_file_deleted_from_the_working_tree() {
         let repo = tempfile::tempdir().unwrap();
@@ -379,8 +325,6 @@ mod tests {
         assert_eq!(rels, vec!["keep.rs".to_string()]);
     }
 
-    /// The incident this guard exists for: a stale staged copy of a doc the
-    /// repo also tracks, reached by a path a caller typed.
     #[tokio::test]
     async fn a_gitignored_duplicate_names_the_live_file() {
         let repo = tempfile::tempdir().unwrap();
@@ -390,8 +334,6 @@ mod tests {
         write(repo.path(), ".gitignore", "staging/\n");
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-qm", "init"]);
-        // Staging carries the directory, which is what tells a copy from a
-        // path that merely ends the same way.
         write(
             repo.path(),
             "staging/system-knowhow/recipe.md",
@@ -403,8 +345,6 @@ mod tests {
         assert_eq!(live.as_deref(), Some("system-knowhow/recipe.md"));
     }
 
-    /// A shared suffix is not a duplicate. A dependency's own source ends like
-    /// the repo's, and refusing to read it would be the worse bug.
     #[tokio::test]
     async fn a_suffix_that_shares_no_directory_is_allowed() {
         let repo = tempfile::tempdir().unwrap();
@@ -414,7 +354,6 @@ mod tests {
         write(repo.path(), ".gitignore", "node_modules/\n");
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-qm", "init"]);
-        // The dependency has an `src/index.ts` and nothing else of ours.
         write(repo.path(), "node_modules/dep/src/index.ts", "theirs");
 
         assert!(
@@ -424,8 +363,6 @@ mod tests {
         );
     }
 
-    /// Build output with no tracked twin stays readable. A session debugging a
-    /// packaged build has to be able to read what the build staged.
     #[tokio::test]
     async fn an_ignored_file_that_shadows_nothing_is_allowed() {
         let repo = tempfile::tempdir().unwrap();
@@ -456,8 +393,6 @@ mod tests {
         );
     }
 
-    /// A file the caller just wrote is untracked and unignored, and nothing
-    /// about it is stale.
     #[tokio::test]
     async fn a_brand_new_untracked_file_is_allowed() {
         let repo = tempfile::tempdir().unwrap();
@@ -472,8 +407,6 @@ mod tests {
             .is_none());
     }
 
-    /// A shared basename is not a duplicate. Refusing a staged `README.md`
-    /// because the repo root has one would be a dead tool, not a guard.
     #[tokio::test]
     async fn a_bare_basename_match_is_not_enough() {
         let repo = tempfile::tempdir().unwrap();
@@ -495,8 +428,6 @@ mod tests {
         );
     }
 
-    /// The refusal has to carry the live path, or the caller just retries the
-    /// dead one.
     #[test]
     fn the_refusal_names_where_to_read_instead() {
         let msg = stale_copy_refusal("staging/a/recipe.md", "a/recipe.md");

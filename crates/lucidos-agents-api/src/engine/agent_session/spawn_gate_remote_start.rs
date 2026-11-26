@@ -1,13 +1,3 @@
-//! The remote start gate: an Ask start's first turn waits for the owner.
-//!
-//! The receiving gateway signs its *remote start setting* onto every routed
-//! spawn (ADR 0725). An Ask start records its pairing on the thread's first
-//! `MessageReceived`. Until the owner allows that start on its card, no turn
-//! of the thread runs: not the first, not a Continue, not a boot resume.
-//!
-//! The gate keys on the thread's first message, never on the turn's origin,
-//! because a resume runs under an engine origin.
-
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -32,22 +22,15 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const START_CARD_HEADER: &str = "Remote start";
 
-/// Where a thread's start stands.
 #[derive(Debug, PartialEq)]
 enum StartState {
-    /// Not an Ask start: the gate has nothing to hold.
     NotAsked,
-    /// An Ask start with no card yet.
     Unasked(RemoteStartAsk),
-    /// Its card waits for the owner.
     Open,
-    /// The owner allowed it.
     Allowed,
-    /// The owner refused it, or Stop closed its card.
     Closed,
 }
 
-/// The thread's start card, and the answer it got, if any.
 async fn start_card(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -74,7 +57,6 @@ async fn start_card(
     )))
 }
 
-/// What the owner's answer chose. `None` for a card Stop closed.
 fn chosen(request: &PermissionRequest, answer: &AnswerKind) -> Option<PermissionChoice> {
     match answer {
         AnswerKind::Selected { option_id } => request.choices.get(option_id).cloned(),
@@ -99,7 +81,6 @@ async fn start_state(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<StartState,
     })
 }
 
-/// The card an Ask start parks on. The engine words every option.
 fn card(thread_id: Uuid, pairing: &RemoteStartAsk) -> RequestCard {
     let label = &pairing.pairing_label;
     let setting = "under Settings → Access → Pair a gateway";
@@ -149,7 +130,6 @@ fn card(thread_id: Uuid, pairing: &RemoteStartAsk) -> RequestCard {
     }
 }
 
-/// What a turn of a refused start fails with. No card is open to hold it.
 pub(crate) const START_REFUSED_ERROR: &str =
     "This workspace's owner did not allow this remote start, so the thread does not run.";
 
@@ -223,8 +203,6 @@ const START_BEGAN_EVENT_TYPES_SQL: &str = "'ContinuationRequested','Continuation
     'ContextCaptured','ResponseGenerated','ResponseFailed','ResponseCanceled',\
     'CodingAgentInputRead','CodingAgentTextStreamed','CodingAgentToolCalled'";
 
-/// Unarchived threads whose start card has an answer and no begun turn after
-/// it, with the answer's actor. The caller keeps only the grants.
 async fn answered_unbegun_starts(
     pool: &sqlx::PgPool,
 ) -> Result<Vec<(Uuid, Option<serde_json::Value>)>, BoxError> {
@@ -292,9 +270,6 @@ pub async fn begin_allowed_starts_on_startup(engine: &Arc<LucidosEngine>) {
 
 #[easy_ext::ext(RemoteStartGateExt)]
 pub(crate) impl LucidosEngine {
-    /// Act on the owner's answer to a start card, in the background: run the
-    /// first turn on a grant, end the thread on a refusal. The answer path
-    /// already saved a Remember pick. `choice` is `None` when Stop closed the card.
     fn spawn_remote_start_answer(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -328,14 +303,10 @@ pub(crate) impl LucidosEngine {
                 self.refuse_start(thread_id, &start, actor).await;
                 Ok(())
             }
-            // Stop closed the card, and Stop settles the thread itself.
             _ => Ok(()),
         }
     }
 
-    /// Run the first turn of an allowed start. A coding agent gets the input
-    /// it never had through the owner-allowed continuation. A chat turn
-    /// replays the parked message, with its recorded settings and images.
     async fn begin_allowed_start(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -399,7 +370,6 @@ pub(crate) impl LucidosEngine {
         .map(|_| ())
     }
 
-    /// End a refused start: its exchange closes as refused, and no turn runs.
     async fn refuse_start(
         &self,
         thread_id: Uuid,

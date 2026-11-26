@@ -1,5 +1,3 @@
-//! Frozen cleanup selections. The persisted definition, never browser paths,
-//! controls execution. Each member is re-observed under its operation lock.
 use super::*;
 use serde::{Deserialize, Serialize};
 
@@ -42,8 +40,6 @@ pub(crate) struct FrozenMember {
     #[serde(default)]
     pub retained_branches: Vec<String>,
 }
-/// Persist only the resource observed by the gateway; folder names never
-/// imply database ownership. Untagged keeps existing registered batches readable.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum FrozenResource {
@@ -159,8 +155,6 @@ fn save(batch: &Batch, root: &Path) -> Result<(), BoxError> {
     std::fs::File::open(root)?.sync_all()?;
     Ok(())
 }
-/// External effects are injected so tests exercise the production journal
-/// ordering without a running cluster or access to live workspace databases.
 enum DatabaseDeleteStep {
     Observe,
     Dump(PathBuf),
@@ -187,17 +181,12 @@ where
     entry.phase = crate::trash::Phase::Moved;
     entry.save(&root)?;
     effect(DatabaseDeleteStep::Mark(entry.deletion_operation.clone())).await?;
-    // A crash before this sync cannot have reached DROP, even if COMMENT ran.
-    // A crash after it resolves through the operation marker or the dump.
     entry.drop_started = Some(true);
     entry.save(&root)?;
     effect(DatabaseDeleteStep::Drop).await?;
     entry.phase = crate::trash::Phase::Completed;
     entry.save(&root)
 }
-/// Explicit unlock matters for a short operation lease: a concurrently forked
-/// child may still hold a copy of the file description until exec. That child
-/// must not extend the lease after the parent's operation has finished.
 pub(super) struct ResourcePublicationLock(std::fs::File);
 impl Drop for ResourcePublicationLock {
     fn drop(&mut self) {
@@ -205,7 +194,6 @@ impl Drop for ResourcePublicationLock {
     }
 }
 impl GatewayState {
-    /// Caller holds the resource publication lease and workspace operation lock.
     pub(super) async fn reconcile_cleanup_entry<F, Fut>(
         &self,
         entry: &mut crate::trash::Entry,
@@ -238,8 +226,6 @@ impl GatewayState {
             }
             _ => return Err("cleanup journal resource mismatch".into()),
         };
-        // The publication lease prevents participating gateways from adopting
-        // either resource between these proofs and terminal publication.
         let others = {
             let registry = self.inner.registry.lock().unwrap();
             if let Some(ws) = workspace {
@@ -297,9 +283,6 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Same host-wide lock for every gateway, including distinct installations
-    /// sharing Docker or overlapping resource directories. Never wait while
-    /// holding a per-workspace lock: a competing publication returns conflict.
     pub(super) fn resource_publication_lock(&self) -> Result<ResourcePublicationLock, ApiError> {
         let acquire = || -> Result<ResourcePublicationLock, BoxError> {
             use std::os::unix::fs::OpenOptionsExt;
@@ -400,8 +383,6 @@ impl GatewayState {
         .await
     }
 
-    /// Paired-device action: leave the occupied staging database untouched and
-    /// durably record its name before ordinary restore allocates another one.
     pub(crate) async fn rotate_trash_restore(&self, id: &str) -> Result<(), ApiError> {
         let backend = self.inner.pg_backend.clone();
         let home = self.app_data().clone();
@@ -553,7 +534,6 @@ impl GatewayState {
         audit: Option<crate::cleanup_audit::Audit>,
     ) -> Result<(), BoxError> {
         self.folder_ownership(directory, false, peers)?;
-        // Do not stop an unregistered engine: a changed/running resource must survive.
         let lock_path = lucidos_owner_lock::engine::lock_path(directory);
         let _owner = lucidos_owner_lock::OwnerLock::try_acquire(&lock_path)?
             .ok_or("folder engine is running; skipped")?;
@@ -569,7 +549,6 @@ impl GatewayState {
             entry.audit = audit;
             entry.save(&root)?;
             entry.move_folder(&root)?;
-            // No database belongs to this resource.
             entry.phase = crate::trash::Phase::DatabaseDropped;
             entry.save(&root)?;
             entry.prune_worktrees(&root)?;
@@ -916,9 +895,7 @@ impl GatewayState {
                 batch.audits.insert(member.id.clone(), audit);
             }
         }
-        // Every pending member's identity is durable before the first external effect.
         save(&batch, &root).map_err(|e| ApiError::conflict(e.to_string()))?;
-        // Terminal journals repair completion events before retry observes resources.
         crate::trash::list(self.app_data()).map_err(|e| ApiError::conflict(e.to_string()))?;
         for member in &batch.members {
             if batch.results.iter().any(|r| r.id == member.id) {
@@ -1229,7 +1206,6 @@ mod tests {
                 state.inner.registry.lock().unwrap().contains("scratch"),
                 observation != Some(false)
             );
-            // The deleted workspace's key goes with it; a remote namesake stays.
             assert_eq!(
                 state.workspace_order().keys(),
                 if observation == Some(false) {
@@ -1310,7 +1286,6 @@ mod tests {
                 };
                 entry.audit = Some(audit.clone());
                 entry.save(&journal).unwrap();
-                // The rename happened, but saving Moved did not.
                 crate::trash::rename_exclusive(&source, &journal.join("workspace")).unwrap();
                 let root = batch_root(state.app_data(), "batch-test").unwrap();
                 std::fs::create_dir_all(&root).unwrap();
@@ -1526,8 +1501,6 @@ mod tests {
                     .count(),
                 if failure == 5 { 2 } else { 1 }
             );
-            // Before the durable drop checkpoint even a marked original needs
-            // no SQL recovery. Afterwards the dump and operation resolve it.
             assert_eq!(entry.can_cancel_without_database(), failure < 4);
         }
     }
@@ -1539,8 +1512,6 @@ mod tests {
         let parent = state.app_data().join("deleted");
         let (mut entry, root) =
             crate::trash::DatabaseEntry::prepare(&parent, "lucidos_orphan").unwrap();
-        // Model the crash after Moved was synced, before or after COMMENT.
-        // No DROP can have occurred, and this test has no Postgres to contact.
         entry.phase = crate::trash::Phase::Moved;
         entry.save(&root).unwrap();
         let id = root.file_name().unwrap().to_str().unwrap();
@@ -1718,9 +1689,6 @@ mod tests {
             .delete_frozen_folder_with_peers(&folder, &fingerprint, &[], None)
             .await
             .is_err());
-        // Parallel process-spawning tests can briefly inherit the preceding
-        // lock before exec closes it. Acquire the fixture lock before testing
-        // the production nonblocking refusal.
         let lock =
             lucidos_owner_lock::OwnerLock::acquire(&lucidos_owner_lock::engine::lock_path(&folder))
                 .unwrap();
@@ -2182,7 +2150,6 @@ mod tests {
                 entry.audit = Some(audit.clone());
                 entry.move_folder(&journal_root).unwrap();
                 entry.phase = crate::trash::Phase::Completed;
-                // Simulate the crash between terminal journal sync and event publication.
                 std::fs::write(
                     journal_root.join("entry.json"),
                     serde_json::to_vec(&entry).unwrap(),
@@ -2215,7 +2182,6 @@ mod tests {
                 assert_eq!(stored.audits["scratch"], audit);
                 continue;
             }
-            // No registration survives. Retry must use proven completion, not absence.
             let result = state
                 .confirm_cleanup("batch-test", "Delete Scratch", "second-device")
                 .await

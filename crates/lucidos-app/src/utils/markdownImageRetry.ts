@@ -47,10 +47,6 @@ function onImageLoad(event: Event): void {
   retry.timer = null;
 }
 
-export function isImageRetryPending(img: HTMLImageElement): boolean {
-  return (retries.get(img)?.timer ?? null) !== null;
-}
-
 export function installMarkdownImageRetry(): () => void {
   document.addEventListener('error', onImageError, { capture: true });
   document.addEventListener('load', onImageLoad, { capture: true });

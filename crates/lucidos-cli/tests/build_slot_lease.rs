@@ -128,7 +128,6 @@ fn an_ordinary_build_cannot_take_a_leased_slot_between_steps() {
 #[test]
 fn a_lease_frees_its_slot_when_its_owner_dies() {
     let mut lease = Lease::start(true);
-    // Keep stdin open in the test so EOF cannot be the cause of release.
     let _input = lease.shell_or_broker.stdin.take().unwrap();
     lease.kill_owner();
     lease.assert_released();
@@ -177,7 +176,6 @@ fn a_stalled_nested_announcement_preserves_the_completed_command_exit_code() {
     let (mut peer, posted) = accept_post(&listener, &mut child);
     assert!(dir.path().join("completed").exists());
     let event = read_post(&mut peer);
-    // Keep the socket open without a response until the CLI reaches its deadline.
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert_eq!(status.code(), Some(23));
@@ -347,7 +345,6 @@ fn a_shell_lease_links_its_nested_step_and_reports_the_body_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = dir.path().join("scripts");
     std::fs::create_dir(&scripts).unwrap();
-    // Use the real broker without the host memory gate or global CLI lookup.
     let shim = scripts.join("with-build-slot.sh");
     std::fs::write(
         &shim,

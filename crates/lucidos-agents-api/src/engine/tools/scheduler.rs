@@ -9,17 +9,10 @@ use crate::triggers::{
     validate_trigger_provider, validate_trigger_reasoning_effort, ActorField, ContinueKeySpec,
     EventSubscription, TriggerRun, ACTOR_FIELD_KEY,
 };
-// Lets the never-fires diagnosis and the AND-footgun check read a parsed
-// schedule's day-of-month / month / day-of-week ordinal sets, instead of
-// re-parsing the cron field strings by hand.
 
-/// Both write tools here arm a trigger's `on:` list, never a thread's wait.
 const TRIGGER_SURFACE: crate::core::event_subscription::SubscriptionSurface =
     crate::core::event_subscription::SubscriptionSurface::Trigger;
 
-/// The two accepted shapes of a trigger's `run` field, for a parse failure to
-/// quote back. One const, because the two copies drifted: update's named the
-/// retired `text` alias where create's named `intent`.
 const RUN_FIELD_SHAPES: &str =
     "Expected { type: 'intent', intent: '...' } or { type: 'script', path: '...' }";
 
@@ -31,8 +24,6 @@ pub(crate) fn check_scheduling_tool_in_trigger(
 ) -> Option<String> {
     let active_id = active_trigger_id?;
 
-    // Early-return for tool names we don't gate, so we don't allocate format
-    // strings on every read-only call (e.g. `list_triggers`).
     match tool_name {
         tn::CREATE_TRIGGER
         | tn::UPDATE_TRIGGER
@@ -62,13 +53,10 @@ pub(crate) fn check_scheduling_tool_in_trigger(
                 preamble, tool_name, active_id
             )),
         },
-        _ => None, // unreachable after the early-return above
+        _ => None,
     }
 }
 
-/// The model, reasoning effort and provider pins an `update_trigger` call sets.
-/// Each is `None` when the call leaves it alone and `Some(None)` when it goes
-/// back to the account default.
 #[derive(Debug, PartialEq)]
 struct RoutePinUpdate {
     model: Option<Option<String>>,
@@ -76,8 +64,6 @@ struct RoutePinUpdate {
     provider: Option<Option<String>>,
 }
 
-/// Read the three pins from `update_trigger` args. A provider pin is also
-/// cleared when the model moves without one: a pin belongs to its model.
 fn route_pin_update(
     registry: &crate::llm::ModelRegistry,
     existing: &crate::triggers::TriggerConfig,
@@ -120,8 +106,6 @@ pub(crate) impl LucidosEngine {
         thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let actor = Some(super::agent_tool_actor(thread_id));
-        // Defense in depth: the prompt envelope asks the LLM not to call these
-        // during a trigger fire; this enforces it even when the LLM ignores it.
         let active_id = crate::scheduler::user_tasks::current_trigger_id();
         let active_name = active_id.as_deref().and_then(|id| {
             self.trigger_configs
@@ -147,8 +131,6 @@ pub(crate) impl LucidosEngine {
                     Ok(subs) => subs,
                     Err(e) => return Ok(e),
                 };
-                // Every entry in the `on` array. A trigger armed on a name the
-                // engine never emits looks armed and never fires.
                 let event_warnings = match crate::core::event_subscription::check_subscriptions(
                     &self.pool,
                     &subscriptions,
@@ -160,16 +142,12 @@ pub(crate) impl LucidosEngine {
                     Err(msg) => return Ok(format!("Error: {msg}")),
                 };
 
-                // Timezone first: the never-fires guard reports its next-run
-                // preview in it, and a trigger without one is refused anyway, so
-                // there is nothing to validate cron against until it is known.
                 let tz_val = self.user_timezone.read().await.clone();
                 if tz_val.is_empty() {
                     return Ok("Error: User timezone is not set. Call set_preference(key=\"timezone\", value=\"…\") first to set the user's timezone before creating triggers.".to_string());
                 }
                 let tz = cron_tz_or_utc(&tz_val, "create_trigger");
 
-                // Parse cron: accepts a single string or an array of strings (optional if on is set)
                 let cron = if args.get("cron").is_some() && !args["cron"].is_null() {
                     match parse_cron_arg(&args["cron"], tz) {
                         Ok(v) => v,
@@ -190,11 +168,9 @@ pub(crate) impl LucidosEngine {
                     );
                 }
 
-                // Parse run field: { type: "intent", intent: "..." } or { type: "script", path: "..." }
                 let run: TriggerRun = match args.get("run") {
                     Some(run_val) if !run_val.is_null() => parse_run_arg(run_val)?,
                     _ => {
-                        // Backward compat: accept prompt_text as a shorthand
                         let prompt_text = args
                             .get("prompt_text")
                             .and_then(|v| v.as_str())
@@ -208,7 +184,6 @@ pub(crate) impl LucidosEngine {
                     }
                 };
 
-                // Emit via EventBus — persists to events table AND notifies scheduler instantly
                 let trigger_id_str = uuid::Uuid::new_v4().to_string();
                 let cron_display = cron_expressions.join(", ");
                 let mut event_payload = serde_json::json!({
@@ -222,8 +197,6 @@ pub(crate) impl LucidosEngine {
                     event_payload["on"] = serde_json::to_value(&subscriptions)
                         .expect("EventSubscription serialization is infallible");
                 }
-                // Owning app dir (e.g. "trigger-workflow"); stamped onto notifications
-                // emitted from this trigger so the popover can deep-link to the app.
                 if let Some(aid) = args
                     .get("app_id")
                     .and_then(|v| v.as_str())
@@ -239,9 +212,6 @@ pub(crate) impl LucidosEngine {
                 {
                     event_payload["go_to_review"] = serde_json::json!(true);
                 }
-                // Optional trigger group membership. Validate against the
-                // in-memory registry so dangling references can't slip in via
-                // the LLM tool surface — the HTTP API rejects the same case.
                 if let Some(gid) = args
                     .get("group_id")
                     .and_then(|v| v.as_str())
@@ -257,9 +227,6 @@ pub(crate) impl LucidosEngine {
                     }
                     event_payload["group_id"] = serde_json::json!(gid);
                 }
-                // Per-trigger model / reasoning effort. Absent (the common case)
-                // leaves the trigger on the account chat defaults, so only an
-                // explicit pick is stamped.
                 if let Some(model) =
                     normalize_route_setting(args.get("model").and_then(|v| v.as_str()))
                 {
@@ -283,7 +250,6 @@ pub(crate) impl LucidosEngine {
                     Ok(None) => {}
                     Err(e) => return Ok(format!("Error: {}", e)),
                 }
-                // An agent's chat pick must be a rung (ADR 0525).
                 if let Err(e) = crate::runtime::intelligence_ladder::check_agent_pick(
                     &self.pool,
                     &self.model_routes(),
@@ -427,10 +393,6 @@ pub(crate) impl LucidosEngine {
                     _ => return Ok("Error: trigger_id is required".to_string()),
                 };
 
-                // Read the existing config up front. An unknown id is refused
-                // either way, so failing fast costs nothing, and the trigger's own
-                // timezone is what the cron guard below validates against (update
-                // cannot change it).
                 let existing = {
                     let configs = self.trigger_configs.read().unwrap();
                     configs.get(&trigger_id).cloned()
@@ -449,8 +411,6 @@ pub(crate) impl LucidosEngine {
                     Ok(on) => on,
                     Err(e) => return Ok(e),
                 };
-                // Only what this call supplies. An `on:` list left absent keeps
-                // whatever the trigger already had.
                 let event_warnings = match crate::core::event_subscription::check_subscriptions(
                     &self.pool,
                     new_on.as_deref().unwrap_or_default(),
@@ -489,8 +449,6 @@ pub(crate) impl LucidosEngine {
                     Err(e) => return Ok(format!("Error: {}", e)),
                 };
 
-                // A changed pick must be a rung, judged as the trigger will
-                // fire on it (ADR 0525).
                 if new_model.is_some() || new_reasoning_effort.is_some() {
                     let model = new_model.clone().unwrap_or_else(|| existing.model.clone());
                     let effort = new_reasoning_effort
@@ -545,7 +503,6 @@ pub(crate) impl LucidosEngine {
                     );
                 }
 
-                // Build update payload with only changed fields
                 let mut update_payload = serde_json::json!({
                     "trigger_id": trigger_id,
                 });
@@ -609,7 +566,6 @@ pub(crate) impl LucidosEngine {
                     updated_fields.push("actor");
                 }
 
-                // Ensure trigger still has at least one firing mechanism
                 let updated_schedule = new_cron
                     .as_ref()
                     .map(|c| &c.expressions)
@@ -628,7 +584,6 @@ pub(crate) impl LucidosEngine {
                 {
                     return Ok(format!("Error: {e}"));
                 }
-                // This tool is always an agent's, never the owner's.
                 let grant_notice = existing.unowned_edit_clears_grants(&next).then(|| {
                     crate::triggers::TriggerConfig::clear_grants_in(&mut update_payload);
                     format!("\n\n{}", existing.grants_cleared_notice())
@@ -657,8 +612,6 @@ pub(crate) impl LucidosEngine {
                     .as_ref()
                     .map(|c| c.expressions.join(", "))
                     .unwrap_or_else(|| existing.schedule.join(", "));
-                // Only the caller's own new expressions carry a preview: an
-                // update that left the schedule alone has nothing new to report.
                 let advice = new_cron
                     .as_ref()
                     .map(|c| c.advice_suffix())
@@ -677,7 +630,6 @@ pub(crate) impl LucidosEngine {
                     _ => return Ok("Error: trigger_id is required".to_string()),
                 };
 
-                // Check if trigger exists in in-memory state
                 let existing = {
                     let configs = self.trigger_configs.read().unwrap();
                     configs.get(&trigger_id).cloned()
@@ -730,7 +682,7 @@ pub(crate) impl LucidosEngine {
                     return Ok(format!("Trigger '{}' is {}.", existing.name, state));
                 }
                 let payload = serde_json::json!({ "trigger_id": &trigger_id, "paused": paused });
-                // Through the chokepoint so the registry is already paused when
+                // INVARIANT: Through the chokepoint so the registry is already paused when
                 // the next tool call in this same turn reads it. `pause_trigger`
                 // followed by `run_trigger` is the agent-side twin of the HTTP
                 // race, and it would otherwise fire the trigger it just paused.
@@ -747,8 +699,6 @@ pub(crate) impl LucidosEngine {
                     Some(s) if !s.is_empty() => s.to_string(),
                     _ => return Ok("Error: trigger_id is required".to_string()),
                 };
-                // Every refusal and the submit itself live in one place so the
-                // LLM, CLI and HTTP surfaces cannot drift apart.
                 match self.run_trigger_off_schedule(&trigger_id).await {
                     Ok(outcome) => Ok(format!("[ACTION COMPLETED] {}", outcome.message())),
                     Err(refusal) => Ok(format!("Error: {}", refusal.message())),
@@ -765,8 +715,6 @@ pub(crate) impl LucidosEngine {
                     return Ok("No trigger groups found.".to_string());
                 }
 
-                // Denormalize member counts from the trigger registry — no
-                // projection table; the in-memory state is already authoritative.
                 let mut counts: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
                 {
@@ -904,8 +852,6 @@ pub(crate) impl LucidosEngine {
                         None => return Ok(format!("Error: No group found with ID {}", group_id)),
                     }
                 };
-                // Block-delete-if-non-empty: surface the members so the LLM can
-                // either move them (update_trigger group_id) or delete them.
                 let members: Vec<String> = {
                     let configs = self.trigger_configs.read().unwrap();
                     configs
@@ -952,9 +898,6 @@ pub(crate) fn validate_script_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// [`validate_script_path`] for a parsed `run`, the check every create and
-/// update path shares: the `/api/v1/triggers` routes and the `create_trigger` /
-/// `update_trigger` LLM tools. An intent run has no path to check.
 pub(crate) fn validate_trigger_run(run: &TriggerRun) -> Result<(), String> {
     match run {
         TriggerRun::Script { path } => validate_script_path(path),
@@ -962,8 +905,6 @@ pub(crate) fn validate_trigger_run(run: &TriggerRun) -> Result<(), String> {
     }
 }
 
-/// Parse the tool's `run` argument and refuse a script path the trigger could
-/// never run, before a `TriggerCreated` or `TriggerUpdated` exists.
 pub(crate) fn parse_run_arg(run_val: &serde_json::Value) -> Result<TriggerRun, String> {
     let run: TriggerRun = serde_json::from_value(run_val.clone())
         .map_err(|e| format!("Invalid 'run' field: {}. {}", e, RUN_FIELD_SHAPES))?;
@@ -971,7 +912,6 @@ pub(crate) fn parse_run_arg(run_val: &serde_json::Value) -> Result<TriggerRun, S
     Ok(run)
 }
 
-/// Build human-readable trigger description for create responses.
 fn trigger_description(cron_display: &str, subscriptions: &[EventSubscription]) -> String {
     let event_display = if subscriptions.is_empty() {
         None
@@ -991,11 +931,6 @@ fn trigger_description(cron_display: &str, subscriptions: &[EventSubscription]) 
     }
 }
 
-/// The event-type warnings, appended to a trigger tool's success text.
-///
-/// The write went through, so this is a note rather than an error. It names a
-/// type nobody here has emitted, which is the caller's chance to catch a typo
-/// in a domain event name of their own.
 fn warning_suffix(warnings: &[String]) -> String {
     if warnings.is_empty() {
         return String::new();
@@ -1003,9 +938,6 @@ fn warning_suffix(warnings: &[String]) -> String {
     format!("\n\nWARNING: {}", warnings.join("\nWARNING: "))
 }
 
-/// Parse the LLM tool's `mcp_servers` argument. `None` when absent. `null`
-/// clears, so it reads as an empty list, and so does `[]`. A single string is
-/// one id. Anything else is an `Error: ...` string the LLM can read directly.
 pub(crate) fn mcp_servers_arg(
     value: Option<&serde_json::Value>,
 ) -> Result<Option<Vec<String>>, String> {
@@ -1022,8 +954,6 @@ pub(crate) fn mcp_servers_arg(
     }
 }
 
-/// A text arg an update may leave alone, clear or set: `None` when absent,
-/// `Some(None)` when null or blank, `Some(Some(text))` otherwise.
 fn clearable_text_arg(args: &serde_json::Value, key: &str) -> Option<Option<String>> {
     let supplied = args.get(key)?;
     Some(
@@ -1034,8 +964,6 @@ fn clearable_text_arg(args: &serde_json::Value, key: &str) -> Option<Option<Stri
     )
 }
 
-/// The `on` of an update: `None` when absent, and a list (empty for null)
-/// when given.
 fn on_update_arg(args: &serde_json::Value) -> Result<Option<Vec<EventSubscription>>, String> {
     let Some(supplied) = args.get("on") else {
         return Ok(None);
@@ -1043,7 +971,6 @@ fn on_update_arg(args: &serde_json::Value) -> Result<Option<Vec<EventSubscriptio
     parse_on_arg(Some(supplied)).map(Some)
 }
 
-/// The `cron` of an update: `None` when absent, an empty set for null.
 fn cron_update_arg(
     args: &serde_json::Value,
     timezone: &str,
@@ -1057,7 +984,6 @@ fn cron_update_arg(
     parse_cron_arg(supplied, cron_tz_or_utc(timezone, "update_trigger")).map(Some)
 }
 
-/// The `continue_key` of an update: `None` when absent, `Some(None)` to clear.
 fn continue_key_update_arg(
     args: &serde_json::Value,
 ) -> Result<Option<Option<ContinueKeySpec>>, String> {
@@ -1067,7 +993,6 @@ fn continue_key_update_arg(
     ContinueKeySpec::parse(Some(raw)).map(Some)
 }
 
-/// The explicit `order` of a new group, refused when it does not fit.
 fn group_order_arg(args: &serde_json::Value) -> Result<Option<i32>, String> {
     match args.get("order").and_then(|v| v.as_i64()) {
         Some(n) => i32::try_from(n)
@@ -1077,17 +1002,6 @@ fn group_order_arg(args: &serde_json::Value) -> Result<Option<i32>, String> {
     }
 }
 
-/// Parse the LLM tool's `on` argument into a Vec of subscriptions, accepting:
-///
-/// 1. Absent / `null` → empty Vec.
-/// 2. Single string `"EventName"` → one entry, no condition.
-/// 3. Array of strings `["A", "B"]` → entries with no conditions.
-/// 4. Array of subscription objects
-///    `[{"event_type": "X", "condition": {...}}, ...]` → as-is.
-/// 5. Single subscription object → one-entry Vec.
-///
-/// Returns the parsed Vec on success; otherwise an `Error: ...` string the
-/// LLM can read directly. Blank `event_type` strings are dropped.
 pub(crate) fn parse_on_arg(
     value: Option<&serde_json::Value>,
 ) -> Result<Vec<EventSubscription>, String> {

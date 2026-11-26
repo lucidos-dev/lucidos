@@ -9,31 +9,23 @@ use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{ActorMode, EngineReason};
 use std::time::Duration;
 
-/// How long a hardening turn may take from its end to its idle before the
-/// apply gives up. The run loop only proposes in between.
 const HARDEN_TURN_SETTLE_LIMIT: Duration = Duration::from_secs(120);
 
 const HARDEN_TURN_UNSETTLED: &str = "Hardening finished, but its thread did not settle in time, \
      so the change was not applied. Apply it again.";
 
-/// How often a settle wait re-asks when no event on its thread arrives.
 const SETTLE_RECHECK: Duration = Duration::from_secs(5);
 
-/// How a hardening run ended, for [`LucidosEngine::apply_after_hardening`].
 pub(crate) enum HardeningRun {
-    /// The run finished. `aborted` is true when it was cancelled.
     Ended {
         aborted: bool,
     },
     Failed(String),
-    /// The run's thread did not settle in time, or its settle could not be
+    /// INVARIANT: The run's thread did not settle in time, or its settle could not be
     /// read. Applying could merge a branch its proposal still writes.
     Unsettled,
 }
 
-/// Wait until `settled` answers true, re-asking on each event `wakes` carries
-/// that `is_wake` accepts and on every recheck tick. Returns false once
-/// `limit` passes unsettled.
 pub(crate) async fn wait_until_settled<T, F, Fut>(
     mut settled: F,
     wakes: &mut tokio::sync::broadcast::Receiver<T>,
@@ -60,7 +52,6 @@ where
                     Ok(event) if is_wake(&event) => return,
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
-                    // Only the tick wakes a closed bus.
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         std::future::pending::<()>().await
                     }
@@ -73,12 +64,6 @@ where
 
 #[easy_ext::ext(ClaudeCodeSpawnExt)]
 pub(crate) impl LucidosEngine {
-    /// Spawn a Claude Code subprocess to run `/harden` on the given branch's worktree.
-    /// When `auto_apply_change_id` is `Some`, the apply is re-entered after
-    /// hardening completes (or `ChangeApplyFailed` is emitted on failure).
-    /// `actor` carries the user who initiated the original apply so the
-    /// resulting `ChangeApplied` stamps that user instead of the engine
-    /// fallback.
     fn spawn_hardening_session(
         &self,
         thread_id: Uuid,
@@ -136,7 +121,7 @@ pub(crate) impl LucidosEngine {
                         }
                     };
 
-                    // Direct run_direct_agent (bypasses process_message_with_steps):
+                    // INVARIANT: Direct run_direct_agent (bypasses process_message_with_steps):
                     // engine-driven auto-harden. Needs `system_prompt_override` to
                     // swap CC's normal system prompt for the hardening-only directive
                     // above, and `recovery_worktree: Some((worktree_path, branch_name))`
@@ -154,7 +139,7 @@ pub(crate) impl LucidosEngine {
                             None,
                             &cancel_token,
                             None,
-                            Some((worktree_path, branch_name)), // recovery_worktree — reuse existing worktree
+                            Some((worktree_path, branch_name)),
                             None,
                             Some(hardening_system_prompt),
                             None,
@@ -193,7 +178,7 @@ pub(crate) impl LucidosEngine {
         });
     }
 
-    /// Finish an Apply that routed `/harden` through the thread's live
+    /// INVARIANT: Finish an Apply that routed `/harden` through the thread's live
     /// session, whose own turn end proposes but never applies. Re-enters the
     /// apply once that turn has settled. Its idle follows the proposal, and an
     /// earlier apply would race the proposal on the same branch.
@@ -207,8 +192,6 @@ pub(crate) impl LucidosEngine {
         let engine = self.clone_arc();
         let mut wakes = self.event_bus.subscribe();
         tokio::spawn(async move {
-            // A rejected prompt or an ended session ran no `/harden`, and the
-            // marker check in `apply_after_hardening` reports that.
             if let Err(e) = wait_for_prompt_turn(answered, "waiting for hardening").await {
                 log_legacy!("[ClaudeCode] Hardening for change {}: {}", change_id, e);
             }
@@ -240,8 +223,6 @@ pub(crate) impl LucidosEngine {
         });
     }
 
-    /// No agent turn on the thread sits between its terminal and its idle.
-    /// An unanswered probe reads as unsettled, so the wait asks again.
     async fn agent_turn_settled(&self, thread_id: Uuid) -> bool {
         use crate::engine::standing_apply::{read_turn_settle, TurnSettle};
         matches!(
@@ -250,9 +231,6 @@ pub(crate) impl LucidosEngine {
         )
     }
 
-    /// Re-enter an apply once its hardening run ended: apply the change when
-    /// the marker landed, else report the apply failed. Every report reaches
-    /// an Apply All batch the change belongs to.
     async fn apply_after_hardening(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -260,7 +238,7 @@ pub(crate) impl LucidosEngine {
         run: HardeningRun,
         actor: Option<MessageOrigin>,
     ) {
-        // Idempotency: if another device clicked Apply while CC was
+        // INVARIANT: Idempotency: if another device clicked Apply while CC was
         // running /harden, the change row is already applied and the
         // marker has been consumed by the apply. Every arm below would
         // otherwise report a spurious failure after the user saw
@@ -351,8 +329,6 @@ pub(crate) impl LucidosEngine {
             "[ClaudeCode] Hardening completed for change {}, auto-applying",
             change_id
         );
-        // Emit ChangeHardened so apply_change doesn't re-enter the
-        // unhardened path and respawn hardening.
         self.emit_change_hardened(thread_id, change_id, "[ClaudeCode] ChangeHardened")
             .await;
         match self.apply_change(change_id, actor).await {
@@ -364,8 +340,6 @@ pub(crate) impl LucidosEngine {
                 );
                 self.broadcast_changes_updated().await;
             }
-            // Log only: `apply_change` announces its own failures,
-            // and a second emit draws the same card twice.
             Err(e) => {
                 log_legacy!(
                     "[ClaudeCode] Auto-apply failed after hardening for change {}: {}",
@@ -376,13 +350,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Discard pending CC changes without ending the session.
-    /// Resets the worktree to main, if it is still on the session's branch,
-    /// and re-enters idle state.
-    ///
-    /// `actor` is the user who clicked Discard — propagated to any
-    /// `ChangeApplyFailed` emitted by the stale-session fallback so the
-    /// resulting event carries the real actor.
     async fn discard_cc_changes(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -399,9 +366,6 @@ pub(crate) impl LucidosEngine {
             claimant,
         } = target
         else {
-            // No live session, so fall back to stale session handling.
-            // discard=true because this is the user-clicked Discard
-            // button: explicit user intent.
             return self.end_stale_waiting_session(thread_id, true, actor).await;
         };
 
@@ -423,7 +387,7 @@ pub(crate) impl LucidosEngine {
         Ok(())
     }
 
-    /// Run a coding-agent sub-thread spawn (the `run_coding_agent` LLM tool's work,
+    /// INVARIANT: Run a coding-agent sub-thread spawn (the `run_coding_agent` LLM tool's work,
     /// executed by the Thread Queue once the entry is admitted). Routes the
     /// actual coding-agent work through `process_message_with_steps` (the unified
     /// router), mirroring the chat parallel `spawn_thread`. The future
@@ -454,8 +418,6 @@ pub(crate) impl LucidosEngine {
             origin,
         } = params;
 
-        // Stash the app id for run_direct_agent to pick up. Cleared by the
-        // run_direct_agent path once the spawn target is resolved.
         if let Some(ref a) = app_id {
             let mut guard = self
                 .pending_app_spawn
@@ -463,7 +425,7 @@ pub(crate) impl LucidosEngine {
                 .expect("pending_app_spawn poisoned");
             guard.insert(cc_thread_id, a.clone());
         }
-        // Naming is decided here and carried out by `process_message_with_steps`
+        // INVARIANT: Naming is decided here and carried out by `process_message_with_steps`
         // below, which writes the caller's name after the thread's row exists.
         // A title this spawn emitted itself would land before the row and be
         // dropped.
@@ -476,9 +438,6 @@ pub(crate) impl LucidosEngine {
         let repo_id_owned = repo_id;
 
         {
-            // Transient: parent's UI immediately renders the new CC sub-thread.
-            // It carries the placeholder because the thread has no row yet, so
-            // nothing durable can hold a name for it either.
             engine
                 .event_bus
                 .emit_or_log(
@@ -496,26 +455,13 @@ pub(crate) impl LucidosEngine {
                 )
                 .await;
 
-            // Route the actual CC work through the unified router. Mirrors
-            // `spawn_thread` (the chat parallel for sub-thread fan-out): the
-            // slow path emits MessageReceived (with channel=ClaudeCode and the
-            // `ThreadLink { mode: Agent }` origin the spawn site stamped, which
-            // names the launching thread whatever the relation), registers the
-            // thread, and runs `run_cc_chat_branch`, which dispatches to
-            // `run_direct_agent` on the thread's spawn claim.
             let result = engine
                 .process_message_with_steps(
                     &prompt_owned,
                     None,
                     None,
                     None,
-                    // `reasoning_effort`: the caller's pin, or None to inherit
-                    // the backend default. `resolve_route_overrides` passes a
-                    // coding-agent effort straight through: the tier belongs to
-                    // CC / Codex, not to the chat registry.
                     reasoning_effort.as_deref(),
-                    // `provider_override`: always None. A coding-agent thread
-                    // runs on its own backend, not on a chat-registry route.
                     None,
                     images_owned.as_deref(),
                     device_id_owned.as_deref(),
@@ -529,18 +475,9 @@ pub(crate) impl LucidosEngine {
                     spawning_event_id,
                     wake_mode,
                     ActorMode::Agent,
-                    // `cc_model` — the caller's pin, validated against this
-                    // backend's picker at the tool boundary. It reaches
-                    // `run_direct_agent`'s explicit-param slot, which wins over
-                    // the session and thread-event fallbacks, so a spawn runs on
-                    // the model the caller named rather than on CC's own
-                    // default.
                     model.as_deref(),
                     Some(coding_agent),
-                    None, // pre_emitted_origin — router emits MR itself
-                    // The caller's chosen name. `maybe_emit_titles` writes it
-                    // after `MessageReceived` creates the row, and skips the
-                    // title model. `None` here reads as "nobody named this".
+                    None,
                     naming.caller_title.as_deref(),
                     origin,
                     None,
@@ -560,7 +497,7 @@ pub(crate) impl LucidosEngine {
 
                         engine.broadcast_changes_updated().await;
                     }
-                    // Drain the orphan chain, as every other spawn site does. A
+                    // INVARIANT: Drain the orphan chain, as every other spawn site does. A
                     // follow-up that reached the session as it went idle comes
                     // back here, and dropping it leaves the message unanswered.
                     if !res.orphaned_injections.is_empty() {
@@ -586,11 +523,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Look up the pending change a finished background turn proposed (by
-    /// `request_id`) and apply it; an apply failure surfaces as a
-    /// `ChangeApplyFailed` event on the thread, emitted by the apply path
-    /// itself. Shared by the coding-agent and agent-chat Thread Queue
-    /// execution paths.
     async fn auto_apply_proposed_change(
         self: &Arc<Self>,
         request_id: Uuid,
@@ -613,7 +545,6 @@ pub(crate) impl LucidosEngine {
             Ok(r) => {
                 log_legacy!("[ClaudeCode] Auto-applied change: {}", r.message)
             }
-            // Log only: `apply_change` announces its own failures.
             Err(e) => {
                 log_legacy!("[ClaudeCode] Failed to auto-apply: {}", e);
             }
@@ -626,14 +557,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// Byte index just past the `}` closing the block that declares the guard.
-    ///
-    /// Braces are counted, never matched by substring. A closure in that span
-    /// satisfies a scan for `};`, so such a scan passes the shape it exists to
-    /// catch.
-    ///
-    /// It does not parse. A brace inside a string or a comment in that span
-    /// would fool it, and the span carries neither.
     fn end_of_guard_block(src: &str, lock_at: usize) -> Option<usize> {
         let open = src[..lock_at].rfind('{')?;
         let mut depth = 0usize;
@@ -661,11 +584,9 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             tx.send(9).unwrap();
-            // Unsettled while the other thread's event is read.
             tokio::time::sleep(Duration::from_secs(1)).await;
             flip.store(true, Ordering::SeqCst);
             tx.send(7).unwrap();
-            // Keeps the bus open, so only the event can end the wait early.
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         let started = tokio::time::Instant::now();
@@ -796,24 +717,12 @@ mod tests {
             assert!(subscribe < spawn, "the idle event could slip past the task");
         }
 
-        /// This file with its test module cut off, through the shared reader the
-        /// engine's other source scans use.
         fn production_src() -> String {
             crate::test_support::source_scan::read_production_source(
                 &crate::test_support::source_scan::engine_source("engine/claude_code/spawn.rs"),
             )
         }
 
-        /// No teardown here awaits while holding the `agent_sessions` guard.
-        ///
-        /// `agent_sessions` is engine-global, so one held guard blocks every live
-        /// run loop, the Stop button, Apply and every permission answer. A
-        /// `return <expr>` evaluates its expression BEFORE the enclosing block's
-        /// guard drops, which is how `discard_cc_changes` came to await a
-        /// multi-minute teardown under the lock.
-        ///
-        /// A scan, because the failure is a wall-clock stall rather than a wrong
-        /// value: nothing a unit test can assert on, and the shape is exact.
         #[test]
         fn no_stale_session_teardown_here_awaits_under_the_sessions_guard() {
             let src = production_src();

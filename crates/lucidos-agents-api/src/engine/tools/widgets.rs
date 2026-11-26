@@ -136,7 +136,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// The widget fit note for one widget, rendered in `thread_id`.
     async fn check_widget_fit(
         &self,
         app_id: &str,
@@ -147,7 +146,6 @@ pub(crate) impl LucidosEngine {
         widget_fit::check_widget_fit(&cx, app_id, thread_id, preferred, WIDGET_FIT_BOX_BUDGET).await
     }
 
-    /// An explicitly selected fit-only renderer, attributed to its source thread.
     async fn check_widget_fit_with_renderer(
         &self,
         app_id: &str,
@@ -171,8 +169,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// What a write tool appends to its result for the widget files it wrote.
-    /// It never fails, so a write's result always stands.
     async fn widget_fit_notes<'p>(
         &self,
         written: impl IntoIterator<Item = &'p str>,
@@ -198,7 +194,6 @@ pub(crate) impl LucidosEngine {
 
 #[easy_ext::ext(DashboardWidgetsExt)]
 pub(crate) impl LucidosEngine {
-    /// The dashboard the agent names, else the last used device's.
     async fn named_dashboard(
         &self,
         args: &serde_json::Value,
@@ -282,8 +277,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// One line per tile, in order, with the sizes each widget takes. An app
-/// shortcut is always a quarter.
 fn describe_dashboard(view: &DashboardView) -> String {
     let name = view.dashboard.as_str();
     if view.tiles.is_empty() {
@@ -325,7 +318,6 @@ fn app_id(args: &serde_json::Value) -> Result<&str, BoxError> {
         .ok_or_else(|| "app_id is required".into())
 }
 
-/// The `size` argument, when one is given.
 fn optional_size(args: &serde_json::Value) -> Result<Option<WidgetSize>, BoxError> {
     match &args["size"] {
         serde_json::Value::Null => Ok(None),
@@ -336,7 +328,6 @@ fn optional_size(args: &serde_json::Value) -> Result<Option<WidgetSize>, BoxErro
     }
 }
 
-/// The thread a widget action targets: the caller's own unless named.
 fn target_thread(args: &serde_json::Value, caller: Uuid) -> Result<Uuid, BoxError> {
     match &args["thread_id"] {
         serde_json::Value::Null => Ok(caller),
@@ -348,7 +339,6 @@ fn target_thread(args: &serde_json::Value, caller: Uuid) -> Result<Uuid, BoxErro
     }
 }
 
-/// The actions the handler recognises. A test pins them to the manifest.
 #[cfg(test)]
 pub(crate) fn recognized_actions() -> Vec<&'static str> {
     ACTIONS.split(',').map(str::trim).collect()

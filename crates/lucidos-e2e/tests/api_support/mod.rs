@@ -1,10 +1,6 @@
-//! Shared harness for E2E API integration tests.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Minimal valid PNG (signature + IHDR start). Enough for the engine's
-/// magic-byte sniff to recognize image/png; not a real renderable image.
 pub fn png_bytes() -> Vec<u8> {
     vec![
         0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
@@ -12,9 +8,6 @@ pub fn png_bytes() -> Vec<u8> {
     ]
 }
 
-/// Encode an in-memory JPEG of given dimensions — needed by tests that
-/// exercise the preview downscale path against a real-sized image, since
-/// `png_bytes()` produces a 1×1 image that's already below the preview cap.
 pub fn encoded_jpeg(width: u32, height: u32) -> Vec<u8> {
     use image::codecs::jpeg::JpegEncoder;
     use image::{ColorType, ImageEncoder};
@@ -44,7 +37,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
-/// The engine's API port, from the workspace's ports file.
 fn api_port() -> u16 {
     let workspace = workspace_path();
     let ports_file = workspace.join(".lucidos/ports");
@@ -62,42 +54,18 @@ fn api_port() -> u16 {
         .unwrap_or_else(|| panic!("API_PORT not found in {}", ports_file.display()))
 }
 
-/// Serializes every test that touches the workspace's backup recipient or
-/// legacy backup key.
-///
-/// `backup_key_test` clears both to prove a schedule is refused before setup,
-/// while `backup_schedule_test` sets a recipient so its schedule may turn on.
-/// Run in parallel, either reds the other.
-///
-/// Lives here rather than in either test file because a lock only one side
-/// takes is not a lock.
 pub fn backup_key_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
     &LOCK
 }
 
-/// Serializes every test that temporarily widens the engine's thread-queue
-/// capacity policy to guarantee itself an admission slot.
-///
-/// The policy is a single shared setting, and the widen is a read-modify-write:
-/// each test reads the current policy, raises the limits it needs, fires, then
-/// PUTs the value it read back. Two of those overlapping is not a slower test,
-/// it is a leak. The second reader saves the FIRST one's widened policy as "the
-/// original", and restores that after the first has already put the real one
-/// back, so the whole rest of the suite runs on 512 concurrent slots and every
-/// admission-refusal assertion silently stops testing anything.
-///
-/// Lives here rather than in either test file because a lock only one side
-/// takes is not a lock.
 pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
     &LOCK
 }
 
-/// The capacity policy the engine runs with, read off the queue endpoint.
-/// A restore then puts back exactly what was there, not a guess at defaults.
 pub async fn capacity_policy(client: &reqwest::Client) -> serde_json::Value {
     let body: serde_json::Value = client
         .get(format!("{}/api/v1/thread-queue", base_url()))
@@ -110,9 +78,6 @@ pub async fn capacity_policy(client: &reqwest::Client) -> serde_json::Value {
     body["policy"].clone()
 }
 
-/// Replace the capacity policy. Sent whole: `PUT /thread-queue/policy` fills
-/// absent fields with defaults, so a partial body would silently reset every
-/// limit the caller did not name.
 async fn set_capacity_policy(client: &reqwest::Client, policy: &serde_json::Value) {
     let resp = client
         .put(format!("{}/api/v1/thread-queue/policy", base_url()))
@@ -125,26 +90,6 @@ async fn set_capacity_policy(client: &reqwest::Client, policy: &serde_json::Valu
     assert_eq!(status, 200, "policy PUT rejected: {body}");
 }
 
-/// Run `work` with the shared capacity pool widened, so it never queues behind
-/// other tests' in-flight chats.
-///
-/// A free pool slot is the PREMISE of a test that starts a thread or fires a
-/// trigger, not part of what it proves. This suite runs its whole API surface
-/// in parallel, and sampling `GET /thread-queue` through a full run shows the
-/// pool pinned at its 32-slot ceiling. A human chat waits for a slot before
-/// its first message is recorded. Its thread can then stay absent from
-/// `thread_summaries` for longer than any poll. A cron submit is reported as
-/// `queued`. Raising the ceiling drains the waiters at once.
-///
-/// - **The restore runs on every path out.** `work` runs on its own task, so a
-///   panic inside it is caught, the original policy goes back, and the panic
-///   then resumes. Otherwise the shared engine keeps the widened limits for
-///   the rest of the suite, and every admission-refusal assertion stops
-///   testing anything.
-/// - **The widen is a read-modify-write over one shared setting.**
-///   `capacity_policy_lock` makes two of them exclusive. That stops the second
-///   saving the first's widened policy as "the original".
-/// - One helper, because a copy per test drifts out of step with the others.
 pub async fn with_pool_room<T: Send + 'static>(
     client: &reqwest::Client,
     work: impl std::future::Future<Output = T> + Send + 'static,
@@ -153,9 +98,6 @@ pub async fn with_pool_room<T: Send + 'static>(
     with_pool_room_held(client, work).await
 }
 
-/// [`with_pool_room`] for a caller that already holds `capacity_policy_lock`.
-/// The lock is not reentrant, so a test that reads the policy around the
-/// widen takes it once and calls this.
 pub async fn with_pool_room_held<T: Send + 'static>(
     client: &reqwest::Client,
     work: impl std::future::Future<Output = T> + Send + 'static,
@@ -173,80 +115,12 @@ pub async fn with_pool_room_held<T: Send + 'static>(
     }
 }
 
-/// Holds the e2e workspace's working tree still for the one test that asserts
-/// on a snapshot of the whole tree.
-///
-/// A command checkpoint is a pair of images of the ENTIRE working tree, taken
-/// either side of a guarded command, and
-/// `command_safety_test::a_command_destroying_only_ignored_content_leaves_no_undo_card`
-/// asserts the pair comes out empty. Its own command only destroys a gitignored
-/// path, so it contributes nothing, but the pair also captures whatever ELSE
-/// lands in the tree between the two snapshots. The apply tests merge files
-/// into `data/apps/` there, and on 2026-08-07 both full-suite runs caught
-/// `style-a.css` + `style-b.css` from `app_coding_agent_concurrent_apply` in the
-/// window: the guard read them as the command's own effects and emitted exactly
-/// the card the test exists to prove absent.
-///
-/// Read/write rather than a plain mutex, so the tree writers keep running
-/// concurrently with EACH OTHER and only the exclusive windows are exclusive.
-/// Writers take `read()`.
-///
-/// THREE KINDS of holder take `write()`, and the last two are easy to miss.
-///
-/// The snapshot is the first. The second is **any test that MERGES**. The
-/// engine refuses to merge into a tree with uncommitted changes. A `read()`
-/// holder may be part-way through creating a file it has not committed. That
-/// refusal reached `app_coding_agent_concurrent_apply` as `Cannot merge: the
-/// repository has uncommitted changes`, on one full run out of two. Merging
-/// needs the tree QUIET, not merely un-snapshotted.
-///
-/// A merging test still takes ONE guard for its whole window, so requests it
-/// fires inside that window overlap exactly as before. What `write()` costs is
-/// the concurrency BETWEEN tests, which was the unsound part. It costs nothing
-/// WITHIN a test, which is what those tests are about.
-///
-/// An apply the test expects to be REFUSED merges nothing and needs no guard.
-///
-/// The third is **any test that runs `git commit` in the workspace itself**.
-/// Git reads the index before it locks it. So a commit racing an engine data
-/// write writes back a stale index, and one side's staged files drop out of it.
-///
-/// **Every writer has to take it, so this is an obligation on new tests too.**
-/// A lock the checkpoint test holds against only SOME writers still lets the
-/// rest recreate the card. The writers today:
-///
-/// - the three apply tests;
-/// - the two trigger tests, whose script files appear and are removed;
-/// - the file-edit tests and the agent file-tool tests;
-/// - the CLI data-write test;
-/// - the handshake-approval test, for its `data/scripts` and `data/config` writes.
-///
-/// If you add a test that creates, edits or deletes a non-ignored file
-/// under the e2e workspace, take a `read()` guard across that mutation. Take a
-/// `write()` one if the mutation is a merge or your own commit. Writes under
-/// `.lucidos/` and `data/blobs/` need nothing: the workspace gitignores both, so
-/// no snapshot ever sees them.
-///
-/// Only the moment a file APPEARS or DISAPPEARS needs the guard. A file present
-/// across both images cancels out of the diff, so committing it later, or
-/// reading it, is free.
-///
-/// Lives here rather than in either test file because a lock only one side
-/// takes is not a lock.
 pub fn workspace_tree_lock() -> &'static tokio::sync::RwLock<()> {
     static LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
         std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
     &LOCK
 }
 
-/// Write a fixture file under `data/` through `PUT /api/v1/data/<rel>`, the
-/// normal data-write path.
-///
-/// The engine writes the file and commits it in one step, under the same repo
-/// lock the apply's dirty-tree gate takes. So the fixture is never an
-/// uncommitted file that another test's apply can refuse. The file still
-/// appears in the tree, so callers hold a `workspace_tree_lock` read guard
-/// across this call.
 pub async fn write_data_fixture(
     client: &reqwest::Client,
     rel: &str,
@@ -267,21 +141,7 @@ pub async fn write_data_fixture(
     Err(format!("PUT /api/v1/data/{rel} returned {status}: {body}"))
 }
 
-/// Delete committed fixtures under `data/<dir>/` and leave that path clean in
-/// git. `files` are `data/`-relative. Best-effort: a failed cleanup must not
-/// fail the assertion its test exists for.
-///
-/// Each file goes through `DELETE /api/v1/data/<rel>`, which removes it and
-/// commits the removal in one step under the engine's repo lock. So the
-/// deletion never sits uncommitted for a concurrent apply to refuse. A file
-/// that never appeared, such as output of a script that never ran, fails its
-/// delete harmlessly.
-///
-/// A committed delete is terminal. An auto-commit that staged the fixture
-/// earlier is pinned to the HEAD it staged from. libgit2 refuses it, and the
-/// retry re-stages without the file.
 pub async fn remove_data_fixtures(client: &reqwest::Client, dir: &str, files: &[String]) {
-    // The files disappear from the tree; see `workspace_tree_lock`.
     let _tree = workspace_tree_lock().read().await;
     for rel in files {
         let _ = client
@@ -289,12 +149,9 @@ pub async fn remove_data_fixtures(client: &reqwest::Client, dir: &str, files: &[
             .send()
             .await;
     }
-    // Git tracks no directories, so dropping the emptied ones changes no
-    // tracked state. A directory that still holds a file stays.
     remove_empty_dirs(&workspace_path().join("data").join(dir));
 }
 
-/// Remove `dir` and every directory under it that holds no file.
 fn remove_empty_dirs(dir: &Path) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -303,23 +160,15 @@ fn remove_empty_dirs(dir: &Path) {
             }
         }
     }
-    // `remove_dir` refuses a directory that is not empty, which is the prune.
     let _ = fs::remove_dir(dir);
 }
 
-/// Held by every test that writes `data/config/apis.json`.
-///
-/// It is one file per workspace, and each such test writes it whole and
-/// deletes it when done. Two at once delete each other's entries. The tree
-/// lock above cannot help: its `read()` guards are shared.
 pub fn apis_json_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
     &LOCK
 }
 
-/// `$E2E_WORKSPACE`, which the e2e scripts always export. The fallback
-/// mirrors `E2E_DEFAULT_WORKSPACE` in `scripts/lib/e2e_root.sh`.
 pub fn workspace_path() -> PathBuf {
     if let Ok(ws) = std::env::var("E2E_WORKSPACE") {
         return PathBuf::from(ws);
@@ -333,7 +182,6 @@ pub fn workspace_path() -> PathBuf {
     root.join("workspaces/e2e-test")
 }
 
-/// The E2E workspace's database URL.
 pub fn db_url() -> String {
     let ws = workspace_path();
     let db_slug = ws
@@ -368,8 +216,6 @@ pub fn db_url() -> String {
     )
 }
 
-/// The shared cluster's host port. `shared_pg_psql` in
-/// `scripts/lib/workspace.sh` reads `LUCIDOS_EXTERNAL_PG_PORT` the same way.
 fn db_port() -> String {
     if let Ok(port) = std::env::var("LUCIDOS_EXTERNAL_PG_PORT") {
         return port;
@@ -383,7 +229,6 @@ fn db_port() -> String {
     let port_line = String::from_utf8_lossy(&port_output.stdout)
         .trim()
         .to_string();
-    // Format: "0.0.0.0:5438" or "[::]:5438" — take the last port number
     port_line
         .lines()
         .next()
@@ -392,8 +237,6 @@ fn db_port() -> String {
         .to_string()
 }
 
-/// The engine under test. A directly launched engine serves plain http on
-/// loopback (`scripts/lib/e2e.sh`).
 pub fn base_url() -> String {
     format!("http://localhost:{}", api_port())
 }
@@ -404,17 +247,6 @@ pub fn http_client() -> reqwest::Client {
         .expect("Failed to build HTTP client")
 }
 
-/// A WebSocket handshake carrying an `Origin`, which is what a browser sends.
-///
-/// Chromium and Gecko send no fetch metadata on a WebSocket handshake, so the
-/// engine's same-origin gate falls back to comparing `Origin` against `Host`
-/// (ADR 0163). Direct to the engine those agree, and this is what proves it
-/// against the real middleware stack. Omitting the header is what let the
-/// gate's behaviour here go untested until a call was refused in the field.
-///
-/// `Connection` stays the single token reqwest is known to carry. The list form
-/// a browser writes is the gateway's business, and its own
-/// `a_connection_list_still_names_the_upgrade` already pins it.
 pub fn browser_handshake(
     client: &reqwest::Client,
     path: &str,
@@ -429,16 +261,6 @@ pub fn browser_handshake(
         .header("origin", origin)
 }
 
-/// Put `device_id` in the `devices` table, so a header naming it is evidence.
-///
-/// `api::actor::require_user_actor` suppresses an id that names no row, so an
-/// unregistered id is a header rather than an identity and the request is
-/// refused. A test that sends its OWN id (rather than taking [`user_client`])
-/// registers it here first. `POST /devices/register` is the one bootstrap the
-/// mutating gate exempts, so the bare client is the right caller for it.
-///
-/// An upsert, so calling it repeatedly is free and emits no second
-/// `DeviceRegistered`.
 pub async fn register_device(device_id: &str) {
     let resp = http_client()
         .post(format!("{}/api/v1/devices/register", base_url()))
@@ -456,14 +278,8 @@ pub async fn register_device(device_id: &str) {
     );
 }
 
-/// Device id this suite registers to stand in for the user's own client.
-/// Stable across tests: registration is an upsert, and the `DeviceRegistered`
-/// event only fires on the genuine first insert.
 pub const E2E_DEVICE_ID: &str = "e2e-api-client";
 
-/// The stamp key the harness piped into the engine it started, and the
-/// workspace its stamps name (`scripts/lib/e2e_stamp.sh`). `None` for an
-/// engine the harness did not start: every device is then unattested.
 fn harness_stamp_key() -> Option<(lucidos_gateway_stamp::StampKey, String)> {
     let text = fs::read_to_string(workspace_path().join(".lucidos/e2e-stamp-key")).ok()?;
     let mut lines = text.lines();
@@ -471,8 +287,6 @@ fn harness_stamp_key() -> Option<(lucidos_gateway_stamp::StampKey, String)> {
     Some((key, lines.next()?.to_string()))
 }
 
-/// The gateway stamp a gateway would forward with `device_id`, signed now.
-/// It verifies for `lucidos_gateway_stamp::WINDOW_SECS`.
 pub fn device_stamp(device_id: &str) -> Option<String> {
     let (key, workspace_id) = harness_stamp_key()?;
     Some(key.sign_now(lucidos_gateway_stamp::Claim::Device {
@@ -481,8 +295,6 @@ pub fn device_stamp(device_id: &str) -> Option<String> {
     }))
 }
 
-/// `builder` speaking as `device_id`, with the stamp a gateway would forward.
-/// A per-request header replaces the client's default of the same name.
 pub fn as_stamped_device(
     builder: reqwest::RequestBuilder,
     device_id: &str,
@@ -494,9 +306,6 @@ pub fn as_stamped_device(
     }
 }
 
-/// `builder` speaking as a thread of `caller_workspace` whose spawn gate said
-/// `verdict`, with the stamp a gateway would forward. Without a harness key the
-/// call stays unstamped, an unattested caller.
 pub fn as_stamped_workspace_call(
     builder: reqwest::RequestBuilder,
     caller_workspace: &str,
@@ -517,8 +326,6 @@ pub fn as_stamped_workspace_call(
         .header(lucidos_gateway_stamp::HEADER_CALLER_VERDICT, verdict)
 }
 
-/// Headers naming the suite's device, stamped when `stamped` and the harness
-/// holds a key.
 fn device_headers(stamped: bool) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -541,47 +348,16 @@ fn device_client(stamped: bool) -> reqwest::Client {
         .expect("Failed to build device-attributed HTTP client")
 }
 
-/// An HTTP client that speaks for the user, the way the browser does through
-/// the gateway: every request carries `x-lucidos-device-id` for a device that
-/// is registered in this workspace, and the stamp that proves it.
-///
-/// **The stamp expires** after `lucidos_gateway_stamp::WINDOW_SECS`. A step
-/// that runs later than that in a long test builds a fresh client.
-///
-/// Use this for anything posting `mode: "human"`. The engine refuses a human
-/// claim it has no evidence for (`api::chat::human_mode_is_attributed`), and
-/// this suite IS a legitimate external client, so the honest way to keep it
-/// working is to be a registered one rather than to weaken the gate. Tests that
-/// deliberately exercise the refusal keep using the bare [`http_client`].
-///
-/// **A fresh client per call, deliberately.** Caching one in a `static` looks
-/// like the obvious saving (registration is an upsert, so every call after the
-/// first is a no-op write) and it is a trap: a `reqwest::Client` owns a
-/// connection pool bound to the runtime that built it, each `#[tokio::test]`
-/// gets its OWN runtime, and the first test to finish takes the pool's dispatch
-/// task down with it. A later test reusing the cached client then fails with
-/// `hyper::Error(User(DispatchGone), "runtime dropped the dispatch task")`, on a
-/// different test each run depending on scheduling. The registration POST is a
-/// single indexed upsert against a local engine, which is not the cost worth
-/// optimising here.
 pub async fn user_client() -> reqwest::Client {
     register_device(E2E_DEVICE_ID).await;
     device_client(true)
 }
 
-/// [`user_client`] with no stamp: the registered device id alone, which any
-/// local process can type. The engine reads it as an unattested caller.
 pub async fn unattested_user_client() -> reqwest::Client {
     register_device(E2E_DEVICE_ID).await;
     device_client(false)
 }
 
-/// An HTTP client that speaks as a process on this machine, the way `lucidos`
-/// run from a shell does: every request carries the machine-local token.
-///
-/// The marker writes (`mark-hardened`, `mark-planned`, `approve-plan`)
-/// refuse a caller holding only a device id. A test of those routes takes this
-/// client, and a test of the refusal takes [`user_client`].
 pub fn local_process_client() -> reqwest::Client {
     let token = lucidos_local_token::read().unwrap_or_else(|| {
         panic!(
@@ -599,18 +375,10 @@ pub fn local_process_client() -> reqwest::Client {
         .expect("Failed to build local-process HTTP client")
 }
 
-/// Run a git command in the e2e workspace, asserting success.
 pub fn git(args: &[&str]) -> std::process::Output {
     git_in(&workspace_path(), args)
 }
 
-/// Run a git command in an arbitrary directory, asserting success.
-///
-/// Retries on `.git/index.lock` collisions — `#[tokio::test]`s run
-/// concurrently in one process, and two tests touching the same workspace
-/// (e.g. both `app_coding_agent_*` tests against `e2e-test`) race on the
-/// workspace's git index. The lock is short-lived; a few short backoffs
-/// drain it without changing what's actually under test.
 pub fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
     let mut attempt = 0u32;
     loop {
@@ -639,10 +407,6 @@ pub fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
     }
 }
 
-/// `<prefix>-<millis>`, never repeated within this process.
-///
-/// The tests run concurrently, so two can ask in the same millisecond. A
-/// repeat hands both the same thread, and each reads the other's result.
 pub fn unique_marker(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -666,8 +430,6 @@ fn unique_marker_never_repeats_inside_one_millisecond() {
     assert_eq!(markers.len(), 1000);
 }
 
-/// A fresh name for a workspace font's directory, one the engine's slug rule
-/// accepts.
 pub fn e2e_font_slug(prefix: &str) -> String {
     let slug = format!("{prefix}-{:016x}", uuid::Uuid::new_v4().as_u64_pair().0);
     assert!(
@@ -677,10 +439,6 @@ pub fn e2e_font_slug(prefix: &str) -> String {
     slug
 }
 
-/// Seed (or upsert) a CC-classified `thread_summaries` row. Required before
-/// emitting CC-only `ThreadEvent`s (`ChangeProposed`,
-/// `CodingAgentPermissionRequest`, …) — the lifecycle classifier rejects them
-/// when the thread isn't classified as CC.
 pub async fn seed_cc_thread_summary(pool: &sqlx::PgPool, thread_id: uuid::Uuid, status: &str) {
     sqlx::query(
         "INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status) \
@@ -694,9 +452,6 @@ pub async fn seed_cc_thread_summary(pool: &sqlx::PgPool, thread_id: uuid::Uuid, 
     .expect("failed to seed thread_summaries");
 }
 
-/// Seed an app coding-agent thread row. Sets `coding_agent_kind='app'` and
-/// `coding_agent_folder=<workspace>/data/apps/<app_id>/` so
-/// `load_apply_kind_context` dispatches through the App branch.
 pub async fn seed_app_cc_thread_summary(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
@@ -728,11 +483,6 @@ pub async fn seed_app_cc_thread_summary(
     .expect("failed to seed app thread_summaries");
 }
 
-/// Seed (or upsert) a chat-classified `thread_summaries` row. Required
-/// before emitting `UserQuestionAsked` on a chat thread — the lifecycle
-/// validator accepts the variant on chat threads now that the chat agent's
-/// `ask_user_question` tool also raises it, but the row must exist with
-/// `source = 'chat'` so the classifier resolves to `ThreadType::Chat`.
 pub async fn seed_chat_thread_summary(pool: &sqlx::PgPool, thread_id: uuid::Uuid, status: &str) {
     sqlx::query(
         "INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status) \
@@ -746,8 +496,6 @@ pub async fn seed_chat_thread_summary(pool: &sqlx::PgPool, thread_id: uuid::Uuid
     .expect("failed to seed chat thread_summaries");
 }
 
-/// Poll `/api/v1/threads` until `archive` is non-empty, returning the parsed response.
-/// Times out after `max_secs` with a panic.
 pub async fn poll_threads_until_archive(
     client: &reqwest::Client,
     max_secs: u64,
@@ -776,8 +524,6 @@ pub async fn poll_threads_until_archive(
     }
 }
 
-/// `POST /api/v1/repositories` for the given path with a `unique_marker(label)`
-/// name, asserting `201 Created` and returning the new repo id.
 pub async fn register_repo(client: &reqwest::Client, path: &Path, label: &str) -> String {
     let body = serde_json::json!({
         "name": unique_marker(label),
@@ -795,12 +541,6 @@ pub async fn register_repo(client: &reqwest::Client, path: &Path, label: &str) -
     repo["id"].as_str().unwrap().to_string()
 }
 
-/// Count events of one type on a thread.
-///
-/// Most callers assert this is ZERO, so a query error must never come back as a
-/// count. Swallowing one into `0` turns a "nothing was emitted" assertion into a
-/// pass the moment the DB hiccups. Here rather than in either test file, so the
-/// two cannot grow different failure behaviour for the same question.
 pub async fn count_events_of_type(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
@@ -816,16 +556,12 @@ pub async fn count_events_of_type(
     .unwrap_or_else(|e| panic!("counting {event_type} on thread {thread_id} failed: {e}"))
 }
 
-/// Subset of `thread_summaries` columns the API tests poll for.
 pub struct ThreadSummaryRow {
     pub thread_id: uuid::Uuid,
     pub parent_thread_id: Option<uuid::Uuid>,
     pub initiator: String,
 }
 
-/// Poll thread_summaries for the row whose first_message contains `marker`.
-/// Tests sending chat messages with a unique marker use this to find their
-/// own thread without racing parallel tests on `archive[0]` order.
 pub async fn poll_thread_summary_by_marker(
     pool: &sqlx::PgPool,
     marker: &str,
@@ -857,9 +593,6 @@ pub async fn poll_thread_summary_by_marker(
     }
 }
 
-/// Commit one file on a new branch in the e2e workspace, off `main`, through a
-/// throwaway worktree. The worktree is removed afterwards and the branch kept,
-/// the shape a coding-agent branch has once cleanup reclaimed its tree.
 pub fn commit_on_new_branch(branch: &str, file: &str, contents: &str) {
     let wt_tmp = tempfile::tempdir().unwrap();
     let wt_dir = wt_tmp.path();
@@ -879,9 +612,6 @@ pub fn commit_on_new_branch(branch: &str, file: &str, contents: &str) {
     git(&["worktree", "remove", "--force", wt_dir.to_str().unwrap()]);
 }
 
-/// Record a coding-agent session on `branch` for `thread_id`, straight into
-/// the events table. Kind `app` routes the engine to the workspace repo, where
-/// `commit_on_new_branch` puts the work.
 pub async fn insert_session_started(pool: &sqlx::PgPool, thread_id: uuid::Uuid, branch: &str) {
     let payload = serde_json::json!({
         "coding_agent": "claude-code",

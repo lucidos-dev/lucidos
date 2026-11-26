@@ -1,5 +1,3 @@
-//! Gateway-owned, immutable cleanup events, independent of workspace engines
-//! and Trash retention. Authorization is durable before any destructive effect.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -11,13 +9,9 @@ pub(crate) enum Actor {
     Device {
         device_id: String,
     },
-    /// Proof was verified against this workspace's ephemeral owner digest.
-    /// Never retain the bearer token itself.
     Owner {
         workspace_id: String,
     },
-    /// An agent thread through the workspace broker, after its engine spent
-    /// the owner's Allow once.
     Agent {
         workspace_id: String,
         thread_id: String,

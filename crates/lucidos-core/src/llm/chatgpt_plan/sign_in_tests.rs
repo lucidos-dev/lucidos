@@ -10,7 +10,6 @@ use crate::llm::chatgpt_plan::id_token::test_support::signed_id_token;
 use crate::llm::chatgpt_plan::mock_auth::MockAuth;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// The redirect URI OpenAI's docs require, pinned as a wire contract.
 const REDIRECT_URI: &str = "http://127.0.0.1:14981/oauth/callback";
 
 fn laptop() -> Option<MessageOrigin> {
@@ -48,7 +47,6 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Queue a grant whose `id_token` answers `pending` for `client_id`.
     fn grant_for(&self, pending: &PendingSignIn, client_id: &str) {
         let nonce = param(pending, "nonce").unwrap();
         self.mock.reply_to_token(
@@ -82,7 +80,6 @@ impl Fixture {
             .await
     }
 
-    /// A first sign-in, completed as `oaiapp_1`.
     async fn sign_in_first(&self) {
         let pending = self.begin().await;
         self.grant_for(&pending, "oaiapp_1");
@@ -96,7 +93,6 @@ impl Fixture {
             .unwrap()
     }
 
-    /// The revoke requests the mock received, once the first has arrived.
     async fn revoked(&self) -> Vec<HashMap<String, String>> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while self.mock.revoke_forms().is_empty() && tokio::time::Instant::now() < deadline {
@@ -123,8 +119,6 @@ fn param(pending: &PendingSignIn, key: &str) -> Option<String> {
     params(pending).remove(key)
 }
 
-/// The first sign-in registers through the dynamic entrypoint, and every
-/// later request uses the id OpenAI issued. The entrypoint is never stored.
 #[tokio::test]
 async fn the_first_sign_in_registers_and_stores_the_issued_client_id() {
     let f = Fixture::new().await;
@@ -168,8 +162,6 @@ async fn the_first_sign_in_registers_and_stores_the_issued_client_id() {
     f.done().await;
 }
 
-/// A later sign-in sends the issued id with the last ID token as a hint, and
-/// keeps the host id. A callback that omits the client id is accepted.
 #[tokio::test]
 async fn a_later_sign_in_reuses_the_issued_client_id() {
     let f = Fixture::new().await;
@@ -197,9 +189,6 @@ async fn a_later_sign_in_reuses_the_issued_client_id() {
     f.done().await;
 }
 
-/// A gateway from before ADR 0636 forwards only `code` and `state`, which
-/// parse to a grant with no client id. The refusal names the gateway, and
-/// nothing reaches the token endpoint or the store.
 #[tokio::test]
 async fn a_first_sign_in_relayed_by_an_old_gateway_names_the_gateway() {
     let f = Fixture::new().await;
@@ -217,8 +206,6 @@ async fn a_first_sign_in_relayed_by_an_old_gateway_names_the_gateway() {
     f.done().await;
 }
 
-/// A callback naming another client id, or the registration entrypoint, is
-/// refused before any token request.
 #[tokio::test]
 async fn a_mismatched_client_id_is_refused_without_a_token_request() {
     let f = Fixture::new().await;
@@ -235,7 +222,6 @@ async fn a_mismatched_client_id_is_refused_without_a_token_request() {
     f.done().await;
 }
 
-/// The registered client id cannot bring in another ChatGPT account.
 #[tokio::test]
 async fn a_later_sign_in_as_another_account_is_refused() {
     use crate::llm::chatgpt_plan::id_token::test_support::signed_id_token_for;
@@ -265,8 +251,6 @@ async fn a_later_sign_in_as_another_account_is_refused() {
     f.done().await;
 }
 
-/// Forgetting the account clears the registration, so the next sign-in
-/// registers afresh and any ChatGPT account may use it.
 #[tokio::test]
 async fn a_forgotten_account_lets_another_account_sign_in() {
     use crate::llm::chatgpt_plan::id_token::test_support::signed_id_token_for;
@@ -322,7 +306,6 @@ async fn a_forgotten_account_lets_another_account_sign_in() {
     f.done().await;
 }
 
-/// An ID token for another attempt stores nothing.
 #[tokio::test]
 async fn an_id_token_with_another_nonce_stores_nothing() {
     let f = Fixture::new().await;
@@ -345,7 +328,6 @@ async fn an_id_token_with_another_nonce_stores_nothing() {
     f.done().await;
 }
 
-/// The host id is minted once, survives sign-out, and names no user.
 #[tokio::test]
 async fn the_host_id_is_minted_once_and_survives_sign_out() {
     let f = Fixture::new().await;
@@ -371,8 +353,6 @@ async fn the_host_id_is_minted_once_and_survives_sign_out() {
     f.done().await;
 }
 
-/// A sign-in announces once with the device that started it, and carries no
-/// token.
 #[tokio::test]
 async fn a_sign_in_is_announced_with_its_actor_and_no_token() {
     let f = Fixture::new().await;

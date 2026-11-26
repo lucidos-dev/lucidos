@@ -11,11 +11,6 @@ pub use crate::core::oauth_callback::CallbackRoute;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-// ---------------------------------------------------------------------------
-// Data types
-// ---------------------------------------------------------------------------
-
-/// Full OAuth account row including tokens (internal use only)
 #[derive(Clone)]
 pub struct OAuthAccount {
     pub id: Uuid,
@@ -25,15 +20,13 @@ pub struct OAuthAccount {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub token_expiry: Option<DateTime<Utc>>,
-    /// What the provider GRANTED. See [`OAuthAccountInfo::desired_scopes`] for
-    /// the set that was asked for.
     pub scopes: String,
     pub desired_scopes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-// Manual `FromRow`: both tokens are sealed at rest, and open as they decode.
+// INVARIANT: Manual `FromRow`: both tokens are sealed at rest, and open as they decode.
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for OAuthAccount {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row as _;
@@ -57,7 +50,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for OAuthAccount {
     }
 }
 
-// Manual `Debug` so an account never leaks its tokens through `{:?}`. Refresh
+// INVARIANT: Manual `Debug` so an account never leaks its tokens through `{:?}`. Refresh
 // token presence stays visible; the value does not.
 impl std::fmt::Debug for OAuthAccount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,16 +73,14 @@ impl std::fmt::Debug for OAuthAccount {
     }
 }
 
-/// OAuth account info without tokens (safe for API responses)
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct OAuthAccountInfo {
     pub id: Uuid,
     pub provider: String,
     pub email: Option<String>,
     pub display_name: Option<String>,
-    /// What the provider GRANTED.
     pub scopes: String,
-    /// What the account was ASKED for, accumulated across every authorization.
+    /// INVARIANT: What the account was ASKED for, accumulated across every authorization.
     ///
     /// *Reconnect* re-requests this, never `scopes`. `prepare_oauth_flow`
     /// merges the request with the existing grant, so asking for the granted
@@ -98,22 +89,14 @@ pub struct OAuthAccountInfo {
     /// `None` for an account connected before the column existed. The caller
     /// falls back to something never narrower than the granted set.
     pub desired_scopes: Option<String>,
-    /// The account holds a refresh token, so renewal works and
-    /// `offline_access` was granted. Presence only: the value never leaves the
-    /// engine. Derived in the SELECT, not a column.
     pub has_refresh_token: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// Whether a row ends up holding a refresh token, as SQL.
-///
-/// An empty string is not a token. `refresh_token` takes an `Option<&str>`, so
-/// a provider answering `"refresh_token": ""` would otherwise read as proof
-/// that renewal works.
 const HAS_REFRESH_TOKEN_SQL: &str = "(COALESCE(refresh_token, '') <> '')";
 
-/// The refresh token a write may store: `None` for an absent or empty one.
+/// INVARIANT: The refresh token a write may store: `None` for an absent or empty one.
 ///
 /// Every token write goes through this. Each write keeps the stored token only
 /// when handed NULL. An empty answer would otherwise erase a working token and
@@ -122,72 +105,34 @@ fn usable_refresh_token(token: Option<&str>) -> Option<&str> {
     token.filter(|t| !t.is_empty())
 }
 
-/// A stored OAuth account, as [`OAuthStore::connect`] left it.
 pub struct ConnectedAccount {
     pub id: Uuid,
-    /// Read from the ROW, never from the token response. A re-authorization
+    /// INVARIANT: Read from the ROW, never from the token response. A re-authorization
     /// returning no refresh token keeps the one the account already had, and
     /// renewal still works (see `upsert_row`'s `COALESCE`). Both the tool
     /// result and the Accounts card answer `offline_access` from this.
     pub has_refresh_token: bool,
 }
 
-// ---------------------------------------------------------------------------
-// OAuth client credential requests
-// ---------------------------------------------------------------------------
-//
-// The engine ships NO hardcoded endpoint table. Known providers, their
-// endpoints and their typical scopes live in
-// `system-knowhow/oauth-providers.md`, which the agent reads and maintains.
-// Whatever endpoints the agent passes here are persisted into the
-// per-credential JSON. That JSON is the single source of truth both
-// `prepare_oauth_flow` and `refresh_oauth_if_needed` read back.
-
-/// Endpoint values used to pre-fill the credential modal. Whatever
-/// is present lands in the request's `defaults` block, which tells the modal to
-/// pre-fill (and stop requiring) the endpoint fields. All-`None` means no
-/// `defaults` block, so the modal expands its endpoint section for manual entry.
 #[derive(Debug, Default, Clone)]
 pub struct OAuthClientOverrides {
     pub base_url: Option<String>,
     pub auth_url: Option<String>,
     pub token_url: Option<String>,
     pub userinfo_url: Option<String>,
-    /// `"POST"` when the provider's userinfo endpoint refuses GET (Dropbox).
-    /// Omit for the OIDC default. See [`UserinfoMethod`].
     pub userinfo_method: Option<String>,
-    /// Extra authorization-URL parameters in `key=value&key=value` form, e.g.
-    /// the provider's own spelling of "issue a refresh token". Omit to keep
-    /// [`DEFAULT_AUTHORIZE_PARAMS`]. See [`AuthorizeParams`].
     pub authorize_params: Option<String>,
-    /// Loopback callback URI to register with this provider. Omit for the
-    /// default (`127.0.0.1`); supply the `localhost` form only for a provider
-    /// that won't accept the IP literal. See `default_redirect_uri` and the
-    /// oauth-providers knowhow.
     pub redirect_uri: Option<String>,
 }
 
-/// Normalize the credential name for a provider's OAuth client registration.
-///
-/// Lowercased, so `Dropbox` and `dropbox` cannot address two registrations. A
-/// leading `oauth:` is stripped because agents and knowhow in the wild still
-/// write that spelling, and either form must reach the same row.
 pub fn client_provider_name(name: &str) -> String {
     let name = name.trim().to_lowercase();
-    // A bare `oauth:` would strip to nothing. Keep the input so the caller's
-    // emptiness check rejects it, rather than manufacturing a row named "".
     match name.strip_prefix("oauth:") {
         Some(rest) if !rest.is_empty() => rest.to_string(),
         _ => name,
     }
 }
 
-/// Build the credential-request JSON the frontend modal opens for an
-/// `oauth_client` flow. Single source of truth for service/prompt/base_urls
-/// shape — both the LLM tool path and the OAuth re-auth API path call here.
-///
-/// The scope is a one-member set. A registration names the provider's own API
-/// host, and `base_urls` is the spelling every layer uses (ADR 0161).
 pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) -> serde_json::Value {
     let base_url = overrides
         .base_url
@@ -199,8 +144,6 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
         "base_urls": [base_url],
         "auth_type": "oauth_client",
     });
-    // Only keys the caller supplied go into `defaults`, never present-but-null,
-    // so the modal can treat "key absent" as "not pre-filled".
     let mut defaults = serde_json::Map::new();
     for (key, value) in [
         ("auth_url", &overrides.auth_url),
@@ -221,16 +164,6 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
 }
 
 impl OAuthClientOverrides {
-    /// Prefill from an *OAuth provider registry* row, so the credential modal
-    /// asks only for the Client ID.
-    ///
-    /// This is the whole of the registry's authority: it seeds a credential at
-    /// write time and never participates in a flow. `prepare_oauth_flow` still
-    /// reads endpoints back out of the stored credential, so a credential keeps
-    /// fully describing its own authorization.
-    ///
-    /// No scopes: each connection names its own when it starts, because a scope
-    /// set belongs to what the connection is FOR, not to the provider.
     pub fn from_registry(row: &crate::core::oauth_registry::OAuthProviderRow) -> Self {
         Self {
             base_url: Some(row.base_url.clone()),
@@ -244,19 +177,8 @@ impl OAuthClientOverrides {
     }
 }
 
-/// The credential fields [`prepare_oauth_flow`] hard-requires, in the order it
-/// reads them. A caller can then tell "this credential cannot drive a flow"
-/// from "this flow failed".
 const REQUIRED_FLOW_FIELDS: [&str; 3] = ["client_id", "auth_url", "token_url"];
 
-/// Which required fields a stored `oauth_client` secret is missing.
-///
-/// Empty means the credential can drive a flow. Anything else is the list the
-/// repair form reopens for. Without it the user reaches Connect and meets a
-/// bare *"Missing auth_url"* toast, one screen away from the cause.
-///
-/// A secret that is not a JSON object counts as missing everything: there is no
-/// recoverable client id inside an unparseable blob.
 pub fn missing_flow_fields(auth_value: &str) -> Vec<&'static str> {
     let parsed = serde_json::from_str::<serde_json::Value>(auth_value).ok();
     let present = |key: &str| {
@@ -273,12 +195,6 @@ pub fn missing_flow_fields(auth_value: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// True when the credential's trimmed `client_secret` equals its trimmed
-/// `client_id`.
-///
-/// A client ID is public, so a secret equal to it was pasted into the wrong
-/// field. A provider answers it with a bare `invalid_client`, so the flow is
-/// refused before it reaches one.
 pub fn client_secret_repeats_client_id(client_config: &serde_json::Value) -> bool {
     let trimmed = |key: &str| client_config[key].as_str().map(str::trim);
     match (trimmed("client_id"), trimmed("client_secret")) {
@@ -287,8 +203,6 @@ pub fn client_secret_repeats_client_id(client_config: &serde_json::Value) -> boo
     }
 }
 
-/// The refusal for a credential [`client_secret_repeats_client_id`] flags. It
-/// names the two fixes and never the value.
 pub fn repeated_secret_message(provider: &str) -> String {
     format!(
         "The client secret saved for {provider} is identical to its client ID, so {provider} \
@@ -297,11 +211,9 @@ pub fn repeated_secret_message(provider: &str) -> String {
     )
 }
 
-/// What a bare Connect requests when the provider's registry row names no
-/// *sign-in scopes* of its own.
 const DEFAULT_SIGN_IN_SCOPES: &str = "openid email profile";
 
-/// The *sign-in scopes* for the provider behind `credential_value`.
+/// INVARIANT: The *sign-in scopes* for the provider behind `credential_value`.
 ///
 /// `named_row`, the registry row the provider's own name resolves to, decides
 /// first, so a hand-typed `auth_url` on another host cannot lose its scopes.
@@ -325,13 +237,6 @@ pub fn sign_in_scopes_for(
         .unwrap_or_else(|| DEFAULT_SIGN_IN_SCOPES.to_string())
 }
 
-/// The credential request that REPAIRS an existing `oauth_client` rather than
-/// creating one.
-///
-/// Two additions the create path has no use for. `existing_credential_id`
-/// updates the row rather than adding a second registration for the provider,
-/// and `missing` tells the form which fields it reopened for. The stored
-/// `client_id` rides along in `defaults` so a repair does not ask for it twice.
 pub fn oauth_client_repair_request(
     provider: &str,
     overrides: &OAuthClientOverrides,
@@ -340,7 +245,7 @@ pub fn oauth_client_repair_request(
     missing: &[&str],
 ) -> serde_json::Value {
     let mut request = oauth_client_request(provider, overrides);
-    // A repair carries NO scope, and dropping the key is what says so. The row
+    // INVARIANT: A repair carries NO scope, and dropping the key is what says so. The row
     // already exists, so its stored `base_urls` are the answer and the form
     // seeds from those. The overrides here come from the registry, or from the
     // `https://{provider}.com` guess for a derived name the registry misses.
@@ -359,8 +264,6 @@ pub fn oauth_client_repair_request(
     request
 }
 
-/// The repair request for a credential whose client secret repeats its client
-/// ID. `missing` names `client_secret` so the form reopens on it.
 pub fn oauth_client_secret_repair_request(
     provider: &str,
     overrides: &OAuthClientOverrides,
@@ -374,11 +277,8 @@ pub fn oauth_client_secret_repair_request(
     request
 }
 
-/// The `missing` entry that says "the client secret is wrong", not absent. The
-/// credential form words it (`describeMissingFields`).
 pub const REPEATED_SECRET_FIELD: &str = "client_secret";
 
-/// "a" / "a and b" / "a, b and c".
 fn join_human(items: &[&str]) -> String {
     match items {
         [] => String::new(),
@@ -387,7 +287,7 @@ fn join_human(items: &[&str]) -> String {
     }
 }
 
-/// True when `host` is `domain` itself, or a subdomain of it.
+/// INVARIANT: True when `host` is `domain` itself, or a subdomain of it.
 ///
 /// Anchored at a label boundary, which is the whole point. `notgithub.com`
 /// strips to `not`, which does not end in a dot, and
@@ -401,7 +301,7 @@ fn host_is(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-/// Determine the provider name from an API URL.
+/// INVARIANT: Determine the provider name from an API URL.
 ///
 /// Classification reads the parsed HOST, never the URL string. Substring
 /// matching let `https://api.github.com.attacker.example/` read as GitHub, and
@@ -435,13 +335,8 @@ pub fn provider_for_url(url: &str) -> Option<&'static str> {
     }
 }
 
-/// The credential fields naming an endpoint that a secret travels to. The token
-/// endpoint receives the client secret, the code, the PKCE verifier and the
-/// refresh token. The userinfo endpoint receives the access token. The user
-/// signs in on the authorization page.
 const SECRET_BEARING_ENDPOINTS: [&str; 3] = ["auth_url", "token_url", "userinfo_url"];
 
-/// True when `host` (as `Url::host_str` spells it) never leaves this machine.
 fn is_loopback_host(host: &str) -> bool {
     let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
     match unbracketed.parse::<std::net::IpAddr>() {
@@ -450,15 +345,11 @@ fn is_loopback_host(host: &str) -> bool {
     }
 }
 
-/// True for `https`, and for `http` only to a loopback host, where the request
-/// never leaves the machine.
 fn is_secure_endpoint(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
         || (url.scheme() == "http" && url.host_str().is_some_and(is_loopback_host))
 }
 
-/// Refuse an OAuth endpoint that would carry a secret in cleartext. The error
-/// names the credential and the field, never the URL or any secret.
 fn require_secure_endpoint(credential: &str, field: &str, url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url.trim())
         .map_err(|_| format!("The {field} of the {credential} OAuth client is not a valid URL"))?;
@@ -472,8 +363,6 @@ fn require_secure_endpoint(credential: &str, field: &str, url: &str) -> Result<(
     ))
 }
 
-/// Refuse a parsed `oauth_client` secret whose endpoints are not all secure.
-/// Absent and blank fields pass: [`missing_flow_fields`] owns those.
 fn check_client_endpoints_in(credential: &str, config: &serde_json::Value) -> Result<(), String> {
     for field in SECRET_BEARING_ENDPOINTS {
         let url = config.get(field).and_then(|v| v.as_str()).map(str::trim);
@@ -484,7 +373,7 @@ fn check_client_endpoints_in(credential: &str, config: &serde_json::Value) -> Re
     Ok(())
 }
 
-/// Refuse an `oauth_client` secret about to be saved whose endpoints would send
+/// INVARIANT: Refuse an `oauth_client` secret about to be saved whose endpoints would send
 /// a secret over cleartext. The flow checks again on read, so a row written
 /// before this check still cannot leak.
 ///
@@ -497,26 +386,10 @@ pub fn check_client_endpoints(credential: &str, auth_value: &str) -> Result<(), 
     }
 }
 
-// ---------------------------------------------------------------------------
-// OAuthStore — database operations
-// ---------------------------------------------------------------------------
-
-/// Store for managing OAuth accounts in the database.
-///
-/// **No caller can skip the event.** [`Self::connect`] and [`Self::delete`] are
-/// the only reachable mutators of an account's existence; the raw row writes
-/// are private to this module. `OAuthAccount{Connected,Deleted}` is what
-/// reloads the Settings Accounts list on every device.
-///
-/// [`Self::update_tokens`] is the one deliberate exception: a token rotation is
-/// not a user-visible change (see its doc).
-///
-/// Same shape as `RepositoryStore`. See `core::announced_surfaces` and
-/// `docs/adr/0032-a-state-write-owns-its-announcement.md`.
 pub struct OAuthStore;
 
 impl OAuthStore {
-    /// Insert or update an OAuth account row (upsert on provider+email).
+    /// INVARIANT: Insert or update an OAuth account row (upsert on provider+email).
     /// Uses a separate conflict clause when email is NULL because PostgreSQL
     /// treats NULL != NULL, so `UNIQUE(provider, email)` never fires for NULLs.
     /// A partial unique index `oauth_accounts_provider_no_email` covers that case.
@@ -595,7 +468,6 @@ impl OAuthStore {
         })
     }
 
-    /// Get an OAuth account by ID (includes tokens)
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<OAuthAccount>, sqlx::Error> {
         sqlx::query_as::<_, OAuthAccount>(
             r#"
@@ -611,7 +483,7 @@ impl OAuthStore {
         .await
     }
 
-    /// Resolve the active OAuth account for a provider: the most-recently
+    /// INVARIANT: Resolve the active OAuth account for a provider: the most-recently
     /// CONNECTED one.
     ///
     /// When two accounts share a provider (an old narrow-scope connection plus
@@ -643,7 +515,7 @@ impl OAuthStore {
         .await
     }
 
-    /// Refresh an account's tokens in place.
+    /// INVARIANT: Refresh an account's tokens in place.
     ///
     /// Deliberately silent, and registered as the one `oauth_accounts`
     /// exemption in `core::announced_surfaces`. A token rotation changes
@@ -676,7 +548,6 @@ impl OAuthStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// List all OAuth accounts without tokens (safe for API)
     pub async fn list(pool: &PgPool) -> Result<Vec<OAuthAccountInfo>, sqlx::Error> {
         sqlx::query_as::<_, OAuthAccountInfo>(&format!(
             r#"
@@ -691,7 +562,6 @@ impl OAuthStore {
         .await
     }
 
-    /// List all OAuth accounts including tokens (for env injection into scripts)
     pub async fn list_all_with_tokens(pool: &PgPool) -> Result<Vec<OAuthAccount>, sqlx::Error> {
         sqlx::query_as::<_, OAuthAccount>(
             r#"
@@ -706,8 +576,6 @@ impl OAuthStore {
         .await
     }
 
-    /// Delete an OAuth account row. **Private on purpose**: [`Self::delete`] is
-    /// the reachable mutator, and it emits.
     async fn delete_row(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM oauth_accounts WHERE id = $1")
             .bind(id)
@@ -717,13 +585,13 @@ impl OAuthStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Store a freshly authorized OAuth account and announce it. The only way
+    /// INVARIANT: Store a freshly authorized OAuth account and announce it. The only way
     /// to connect one.
     ///
     /// Announces on a re-authorization too (the upsert path), because
     /// re-connecting is how scopes are granted: the account's capabilities
     /// changed even though the row already existed.
-    #[allow(clippy::too_many_arguments)] // one arg per token column, plus the bus and actor
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -763,10 +631,6 @@ impl OAuthStore {
         Ok(stored)
     }
 
-    /// Delete an OAuth account and announce it. The only way to disconnect one.
-    ///
-    /// `OAuthAccountDeleted` fires only when a row was actually deleted, so a
-    /// repeated or racing disconnect announces once.
     pub async fn delete(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -789,9 +653,6 @@ impl OAuthStore {
     }
 }
 
-/// User-facing message for "this OAuth provider was requested but no account
-/// is connected for it". One source of truth so the proxy `script_handshake`
-/// layer's production code and its test stub stay in lockstep.
 pub fn provider_not_connected_msg(provider: &str) -> String {
     format!(
         "script_handshake requires OAuth provider '{}' but no account is connected; \
@@ -800,19 +661,12 @@ pub fn provider_not_connected_msg(provider: &str) -> String {
     )
 }
 
-/// Why `get_account_with_fresh_token` could not return a usable account.
-/// Each caller maps these to its own HTTP status and error message.
 pub enum AccountLookupError {
     NotConnected,
     DbError(BoxError),
-    /// The user-facing message from [`refresh_or_reconnect`].
     RefreshFailed(String),
 }
 
-/// One-shot "give me a valid access token for this provider": loads the
-/// account row and refreshes the token if it's expired or expiring soon.
-/// Used by the `http_request` tool, `proxy_script_layer::DbOAuthLookup`, the
-/// backup providers and the `/api/v1/oauth/{provider}/access-token` endpoint.
 pub async fn get_account_with_fresh_token(
     pool: &PgPool,
     provider: &str,
@@ -827,7 +681,7 @@ pub async fn get_account_with_fresh_token(
     Ok(account)
 }
 
-/// [`refresh_oauth_if_needed`], with a failure turned into a message that
+/// INVARIANT: [`refresh_oauth_if_needed`], with a failure turned into a message that
 /// names the account and tells the user to reconnect it.
 ///
 /// A caller that gets `Err` must not send `account.access_token`. The engine
@@ -848,7 +702,6 @@ pub async fn refresh_or_reconnect(pool: &PgPool, account: &mut OAuthAccount) -> 
     })
 }
 
-/// How a refusal names an OAuth account to the user.
 fn account_label(account: &OAuthAccount) -> String {
     match account.email.as_deref().or(account.display_name.as_deref()) {
         Some(name) => format!("the account {name}"),
@@ -856,7 +709,7 @@ fn account_label(account: &OAuthAccount) -> String {
     }
 }
 
-/// The OAuth access token an email account presents, refreshed first.
+/// INVARIANT: The OAuth access token an email account presents, refreshed first.
 ///
 /// `Ok(None)` only for an account with no OAuth link, which uses its stored
 /// password. Every other failure refuses, so IMAP and SMTP never skip XOAUTH2
@@ -889,12 +742,6 @@ pub async fn linked_account_token(
     Ok(Some(account.access_token))
 }
 
-/// Build `OAUTH_*` environment variables from connected OAuth accounts.
-///
-/// The provider name goes through [`crate::core::env_var_segment`], the same
-/// transform `CRED_*` uses, so any provider lands as a legal shell identifier.
-/// Shared by subprocess injection and the proxy `script_handshake` layer, so
-/// the names stay identical across entry points.
 pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
     let mut env_vars = Vec::new();
     for account in accounts {
@@ -907,51 +754,27 @@ pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
     env_vars
 }
 
-/// The two `OAUTH_*` names one provider's account can set: its access token
-/// and its email.
 pub fn account_env_names(provider: &str) -> [String; 2] {
     let prefix = format!("OAUTH_{}", crate::core::env_var_segment(provider));
     [format!("{prefix}_ACCESS_TOKEN"), format!("{prefix}_EMAIL")]
 }
 
-// ---------------------------------------------------------------------------
-// Loopback callback endpoint — the single source of the redirect URI
-// ---------------------------------------------------------------------------
-//
-// The authorization request and the token exchange MUST send a byte-identical
-// `redirect_uri` (OAuth 2.0 §4.1.3), matching what the provider has registered.
-// Both legs therefore read the ONE value `resolve_redirect_uri` returns, never
-// a rebuilt literal.
-
 pub(crate) use lucidos_gateway_constants::{
     OAUTH_CALLBACK_PATH as CALLBACK_PATH, OAUTH_CALLBACK_PORT as CALLBACK_PORT,
 };
-/// Host form advertised unless the credential overrides it. The loopback IP is
+/// INVARIANT: Host form advertised unless the credential overrides it. The loopback IP is
 /// the default because some providers reject the name `localhost` outright.
 const DEFAULT_CALLBACK_HOST: &str = "127.0.0.1";
-/// Every loopback host form the listener can receive on. These are the only
-/// values a credential's `redirect_uri` may take: the port and path belong to
-/// the listener, so any other value produces a flow that hangs until the
-/// timeout.
-///
-/// Which form a provider will accept is a *provider* fact and lives in
-/// `system-knowhow/oauth-providers.md`, not here.
 const CALLBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 
 fn callback_uri_for_host(host: &str) -> String {
     format!("http://{}:{}{}", host, CALLBACK_PORT, CALLBACK_PATH)
 }
 
-/// The redirect URI advertised when a credential doesn't override it.
-///
-/// Public because the Connect form offers it for copying into the provider's
-/// console: it has to be registered character for character, so the one place
-/// that knows it must be the one that states it.
 pub fn default_redirect_uri() -> String {
     callback_uri_for_host(DEFAULT_CALLBACK_HOST)
 }
 
-/// Every redirect URI the local listener can serve, in preference order.
 fn accepted_redirect_uris() -> Vec<String> {
     CALLBACK_HOSTS
         .iter()
@@ -960,7 +783,7 @@ fn accepted_redirect_uris() -> Vec<String> {
         .collect()
 }
 
-/// Resolve the redirect URI for a flow from the credential JSON.
+/// INVARIANT: Resolve the redirect URI for a flow from the credential JSON.
 ///
 /// Absent or blank `redirect_uri` => the default loopback-IP form, so every
 /// already-connected provider keeps the exact URI it was registered with. A
@@ -990,13 +813,6 @@ fn resolve_redirect_uri(client_config: &serde_json::Value) -> Result<String, Box
     .into())
 }
 
-/// The ONE redirect URI for a flow, chosen by where its browser runs.
-///
-/// A browser on the machine of the gateway it reached follows the loopback
-/// URI. Any other browser needs a *web redirect URI* on its own origin, listed
-/// on the credential. Without one the flow refuses before the provider page
-/// opens, rather than sending the browser to a loopback address that is dead
-/// for it.
 fn redirect_uri_for(
     provider: &str,
     route: &CallbackRoute,
@@ -1010,17 +826,11 @@ fn redirect_uri_for(
     }
 }
 
-/// The web redirect URI for a browser on another machine, or the refusal
-/// naming what to fix.
-///
-/// Each refusal is one sentence that fits an error toast with the URI in it.
 fn web_redirect_uri_for(
     provider: &str,
     browser: &crate::core::oauth_callback::BrowserContext,
     client_config: &serde_json::Value,
 ) -> Result<String, BoxError> {
-    // A plain-http page's `Origin` never reaches here: the gateway consumes it
-    // when it vouches for the request. So one refusal covers both causes.
     let Some(uri) = browser
         .web_redirect_uri()
         .filter(|uri| uri.starts_with("https://"))
@@ -1051,7 +861,6 @@ fn web_redirect_uri_for(
     Ok(uri)
 }
 
-/// The credential's `web_redirect_uris`, trimmed. Absent means none.
 fn web_redirect_uris(client_config: &serde_json::Value) -> Vec<String> {
     client_config["web_redirect_uris"]
         .as_array()
@@ -1065,11 +874,7 @@ fn web_redirect_uris(client_config: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
-// Client authentication — confidential vs public
-// ---------------------------------------------------------------------------
-
-/// A PKCE verifier/challenge pair (RFC 7636).
+/// INVARIANT: A PKCE verifier/challenge pair (RFC 7636).
 ///
 /// The verifier is a one-time secret: it is the only thing standing between an
 /// intercepted authorization code and a token, so it must never be logged.
@@ -1078,8 +883,6 @@ pub(crate) struct Pkce {
     challenge: String,
 }
 
-// Manual `Debug` so the verifier can't leak through `{:?}`, matching the
-// treatment of access/refresh tokens elsewhere in this module.
 impl std::fmt::Debug for Pkce {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pkce")
@@ -1099,7 +902,6 @@ impl Pkce {
         }
     }
 
-    /// `BASE64URL-NOPAD(SHA256(ASCII(verifier)))`, the `S256` method.
     pub(crate) fn challenge_for(verifier: &str) -> String {
         use sha2::{Digest, Sha256};
         base64_url_nopad(&Sha256::digest(verifier.as_bytes()))
@@ -1119,10 +921,6 @@ fn base64_url_nopad(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// 32 CSPRNG bytes, base64url-encoded to 43 characters that need no escaping in
-/// a URL. Shared by both unguessable values an authorization request carries:
-/// the PKCE verifier (RFC 7636 wants 43..=128 unreserved characters, and 32
-/// bytes is its recommended entropy) and the `state` nonce.
 pub(crate) fn random_url_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
@@ -1130,7 +928,7 @@ pub(crate) fn random_url_token() -> String {
     base64_url_nopad(&bytes)
 }
 
-/// The `state` parameter for one authorization: an unguessable value sent on the
+/// INVARIANT: The `state` parameter for one authorization: an unguessable value sent on the
 /// authorization request and required back on the callback (RFC 6749 §4.1.2
 /// makes echoing it mandatory when it was sent).
 ///
@@ -1150,24 +948,11 @@ fn generate_oauth_state() -> String {
     random_url_token()
 }
 
-/// How the client proves itself when redeeming the authorization code.
-///
-/// Derived SOLELY from whether the credential carries a `client_secret`. That
-/// is OAuth's own confidential/public distinction, so the engine never needs to
-/// know which provider it is talking to.
-///
-/// A desktop app that ships no secret is a *public* client (RFC 8252), and the
-/// redemption is authenticated with PKCE instead. Providers reject a secret
-/// from a public client and reject a secret-less redemption from a confidential
-/// one, so the two shapes must not be mixed.
 enum ClientAuth {
-    /// The credential has a `client_secret`: send it, and send no PKCE.
     Confidential(String),
-    /// No `client_secret`: omit it and authenticate with PKCE.
     Public(Pkce),
 }
 
-// Manual `Debug` so neither the client secret nor the PKCE verifier leaks.
 impl std::fmt::Debug for ClientAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1206,7 +991,6 @@ impl ClientAuth {
         }
     }
 
-    /// Label for logs. Never includes the secret or the verifier.
     fn kind(&self) -> &'static str {
         match self {
             Self::Confidential(_) => "confidential",
@@ -1215,31 +999,17 @@ impl ClientAuth {
     }
 }
 
-/// The extra authorization-URL parameters a provider needs, beyond the ones the
-/// protocol itself defines.
-///
-/// This exists because "ask for a refresh token" has no standard spelling. A
-/// provider that never sees its own spelling issues no refresh token at all.
-///
-/// So the value is credential data, one per registration, documented per
-/// provider in `system-knowhow/oauth-providers.md`. No provider-specific
-/// BEHAVIOR is coded here (CLAUDE.md § "No provider-specific instructions in
-/// code"): the flow sends whatever the credential stores. The one place this
-/// module branches on a provider is [`provider_for_url`], which is a deliberate
-/// exception and is not extended.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuthorizeParams(Vec<(String, String)>);
 
-/// What a credential with no `authorize_params` sends. Absent means
+/// INVARIANT: What a credential with no `authorize_params` sends. Absent means
 /// "unchanged", never "nothing": a credential written before the key existed
 /// was authorized with exactly these two.
 pub const DEFAULT_AUTHORIZE_PARAMS: &str = "access_type=offline&prompt=consent";
 
-/// The opt-out, for a provider strict enough to reject a parameter it does not
-/// know. Without it, [`DEFAULT_AUTHORIZE_PARAMS`] would be unavoidable.
 const AUTHORIZE_PARAMS_NONE: &str = "none";
 
-/// Parameters the flow itself owns. A credential is agent- and user-writable.
+/// INVARIANT: Parameters the flow itself owns. A credential is agent- and user-writable.
 /// Letting it set these would let a field that reads like provider trivia
 /// rewrite the loopback `redirect_uri`, or narrow the requested `scope`.
 const RESERVED_AUTHORIZE_KEYS: &[&str] = &[
@@ -1253,16 +1023,6 @@ const RESERVED_AUTHORIZE_KEYS: &[&str] = &[
 ];
 
 impl AuthorizeParams {
-    /// Parse the credential's `authorize_params`, in `key=value&key=value` form.
-    ///
-    /// Absent or blank means [`DEFAULT_AUTHORIZE_PARAMS`]; the literal `none`
-    /// means send nothing extra. Both halves of a pair are percent-decoded here
-    /// and re-encoded on the way out, so a value carrying `&` or `=` survives
-    /// as one value.
-    ///
-    /// Errors rather than dropping a bad pair. A silently ignored parameter
-    /// would surface as a provider behaving inexplicably, with nothing to point
-    /// at.
     pub fn parse(raw: Option<&str>) -> Result<Self, String> {
         let raw = raw.map(str::trim).unwrap_or_default();
         let raw = if raw.is_empty() {
@@ -1296,7 +1056,6 @@ impl AuthorizeParams {
         Ok(Self(pairs))
     }
 
-    /// Append the pairs to an authorization URL that already carries a query.
     fn append_to(&self, url: &mut String) {
         for (key, value) in &self.0 {
             url.push('&');
@@ -1307,19 +1066,12 @@ impl AuthorizeParams {
     }
 }
 
-/// Percent-decode one half of an `authorize_params` pair. Invalid encoding is
-/// left as written: a bare `%` is likelier to be a literal than a typo worth
-/// failing the whole flow over.
 fn decode_param(raw: &str) -> String {
     urlencoding::decode(raw)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| raw.to_string())
 }
 
-/// Build the provider's authorization URL.
-///
-/// `code_challenge` is appended only for a public client, so a confidential
-/// flow produces exactly the URL it always has.
 fn build_authorize_url(
     auth_url: &str,
     client_id: &str,
@@ -1329,8 +1081,6 @@ fn build_authorize_url(
     auth: &ClientAuth,
     extra: &AuthorizeParams,
 ) -> String {
-    // Some authorization endpoints already carry a query (Azure AD B2C pins its
-    // user flow with `?p=…`), so appending a second `?` would corrupt the URL.
     let separator = if auth_url.contains('?') { '&' } else { '?' };
     let mut url = format!(
         "{}{}client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",
@@ -1351,10 +1101,6 @@ fn build_authorize_url(
     url
 }
 
-// ---------------------------------------------------------------------------
-// Token exchange & refresh (HTTP)
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -1364,11 +1110,10 @@ pub struct TokenResponse {
     pub scope: Option<String>,
 }
 
-/// The longest token lifetime taken at face value: one hundred years.
 const MAX_TOKEN_LIFETIME_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 
 impl TokenResponse {
-    /// When the access token expires, counted from `now`. `None` when the
+    /// INVARIANT: When the access token expires, counted from `now`. `None` when the
     /// provider gave no lifetime.
     ///
     /// `expires_in` is the provider's number, and a "never expires" sentinel
@@ -1382,7 +1127,7 @@ impl TokenResponse {
     }
 }
 
-// Manual `Debug` so a token-exchange/refresh response never leaks its tokens
+// INVARIANT: Manual `Debug` so a token-exchange/refresh response never leaks its tokens
 // through `{:?}`. Non-secret fields (expiry, type, scope) stay visible.
 impl std::fmt::Debug for TokenResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1399,10 +1144,9 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
-/// Most redirects one OAuth request follows. Matches reqwest's default policy.
 const MAX_OAUTH_REDIRECTS: usize = 10;
 
-/// Bounded, shared HTTP client for the OAuth token and userinfo endpoints.
+/// INVARIANT: Bounded, shared HTTP client for the OAuth token and userinfo endpoints.
 ///
 /// A bare `reqwest::Client::new()` has NO timeout, and `refresh_oauth_if_needed`
 /// runs on the email-send path, where a stalled identity provider would hang
@@ -1429,18 +1173,14 @@ fn bounded_http_client() -> &'static reqwest::Client {
                 }
             }))
             .build()
-            // Only fails on TLS-backend init.
             .expect("OAuth HTTP client builder")
     });
     &CLIENT
 }
 
-/// Longest raw provider body echoed into an error. A token endpoint that fails
-/// behind a proxy can answer with a whole HTML page; the first couple of
-/// kilobytes always carry the useful part.
 const MAX_ERROR_BODY_CHARS: usize = 2000;
 
-/// Render a non-success token-endpoint response into one human-readable line.
+/// INVARIANT: Render a non-success token-endpoint response into one human-readable line.
 ///
 /// OAuth 2.0 §5.2 error bodies are JSON with `error` / `error_description`;
 /// Microsoft adds a numeric `error_codes` array. Pulling those out is what
@@ -1495,8 +1235,6 @@ fn describe_token_error(
     )
 }
 
-/// Surface the redirect policy's own reason, which reqwest's display hides
-/// behind "error following redirect". Any other error passes through.
 fn redirect_refusal_or(error: reqwest::Error) -> BoxError {
     match std::error::Error::source(&error) {
         Some(reason) if error.is_redirect() => reason.to_string().into(),
@@ -1504,7 +1242,7 @@ fn redirect_refusal_or(error: reqwest::Error) -> BoxError {
     }
 }
 
-/// POST a token-endpoint form and parse the response, surfacing the provider's
+/// INVARIANT: POST a token-endpoint form and parse the response, surfacing the provider's
 /// own error text on failure. Shared by the code exchange and the refresh so
 /// both legs report failures identically.
 ///
@@ -1537,7 +1275,6 @@ async fn post_token_request(
     Ok(token)
 }
 
-/// Form pairs for the authorization-code redemption (OAuth 2.0 §4.1.3).
 fn exchange_form<'a>(
     code: &'a str,
     client_id: &'a str,
@@ -1559,11 +1296,6 @@ fn exchange_form<'a>(
     form
 }
 
-/// Form pairs for a refresh-token grant (OAuth 2.0 §6).
-///
-/// PKCE has no role here: it authenticates the one-time code redemption, not
-/// later refreshes. A public client must still omit `client_secret`, or the
-/// provider rejects the refresh as it would reject the redemption.
 fn refresh_form<'a>(
     refresh_token: &'a str,
     client_id: &'a str,
@@ -1580,10 +1312,6 @@ fn refresh_form<'a>(
     form
 }
 
-/// What an `invalid_client` refusal leaves unsaid: the fix for how the request
-/// authenticated, then what could be malformed. Counts only, never the values.
-///
-/// The fix comes first and stays short: it is what an error toast has room for.
 fn invalid_client_hint(client_id: &str, auth: &ClientAuth, redirect_uri: &str) -> String {
     let not_visible_ascii = |value: &str| value.chars().filter(|c| !c.is_ascii_graphic()).count();
     let id_chars = not_visible_ascii(client_id);
@@ -1609,7 +1337,6 @@ fn invalid_client_hint(client_id: &str, auth: &ClientAuth, redirect_uri: &str) -
     }
 }
 
-/// Exchange an authorization code for tokens.
 async fn exchange_code(
     credential: &str,
     token_url: &str,
@@ -1623,7 +1350,6 @@ async fn exchange_code(
     post_token_request("Token exchange", credential, token_url, &form, Some(&hint)).await
 }
 
-/// Refresh an access token using a refresh token.
 async fn refresh_access_token(
     credential: &str,
     token_url: &str,
@@ -1635,20 +1361,13 @@ async fn refresh_access_token(
     post_token_request("Token refresh", credential, token_url, &form, None).await
 }
 
-/// Returns true if the account's token needs refreshing (expired, expiring
-/// within 60 seconds, or no expiry with a refresh token available).
 pub fn token_needs_refresh(account: &OAuthAccount) -> bool {
     match account.token_expiry {
         Some(exp) => exp < Utc::now() + chrono::Duration::seconds(60),
-        // No expiry stored, so validity cannot be checked: refresh proactively.
-        // A provider whose tokens do not expire issues no refresh token either,
-        // so this never triggers for one.
         None => account.refresh_token.is_some(),
     }
 }
 
-/// Refresh an expired or nearly-expired token and persist it, mutating
-/// `account` in place. A token that is still good is left alone.
 pub async fn refresh_oauth_if_needed(
     pool: &PgPool,
     account: &mut OAuthAccount,
@@ -1673,7 +1392,7 @@ pub async fn refresh_oauth_if_needed(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Missing client_id in {} credentials", cred_service))?;
-    // Blank or absent means a public client, whose refresh must omit
+    // INVARIANT: Blank or absent means a public client, whose refresh must omit
     // `client_secret` exactly as its code redemption did.
     let csec = config["client_secret"]
         .as_str()
@@ -1714,8 +1433,6 @@ pub async fn refresh_oauth_if_needed(
     Ok(())
 }
 
-/// Force-refresh an OAuth token regardless of expiry.
-/// Use when a 401 suggests the token is invalid despite not appearing expired.
 pub async fn force_refresh_oauth(
     pool: &PgPool,
     account: &mut OAuthAccount,
@@ -1724,7 +1441,6 @@ pub async fn force_refresh_oauth(
     refresh_oauth_if_needed(pool, account).await
 }
 
-/// Merge two space-separated scope strings, deduplicating.
 pub fn merge_scopes(existing: &str, requested: &str) -> String {
     let mut all: Vec<&str> = existing.split_whitespace().collect();
     for scope in requested.split_whitespace() {
@@ -1735,7 +1451,7 @@ pub fn merge_scopes(existing: &str, requested: &str) -> String {
     all.join(" ")
 }
 
-/// Scopes a provider may leave out of the echoed `scope` after granting them,
+/// INVARIANT: Scopes a provider may leave out of the echoed `scope` after granting them,
 /// so their absence from it proves nothing.
 ///
 /// These are the OIDC and meta scopes, which name no resource. Microsoft omits
@@ -1744,7 +1460,7 @@ pub fn merge_scopes(existing: &str, requested: &str) -> String {
 /// nothing else. GitHub knows none of them, and a bare Connect asks for three.
 const META_SCOPES: [&str; 4] = ["offline_access", "openid", "profile", "email"];
 
-/// What a grant produced that its echoed scope list cannot say.
+/// INVARIANT: What a grant produced that its echoed scope list cannot say.
 ///
 /// `offline_access` is the one that matters. It asks for a refresh token, and
 /// the token itself IS the answer. Diff the echo instead and a resource-scoped
@@ -1752,11 +1468,10 @@ const META_SCOPES: [&str; 4] = ["offline_access", "openid", "profile", "email"];
 /// portal to enable something already enabled.
 #[derive(Debug, Clone, Copy)]
 pub struct GrantEvidence {
-    /// The account holds a refresh token, so renewal works.
     pub refresh_token: bool,
 }
 
-/// Which scopes an authorization asked for and did not get, in the order they
+/// INVARIANT: Which scopes an authorization asked for and did not get, in the order they
 /// were requested.
 ///
 /// **A resource scope is an exact token set difference**, never containment.
@@ -1790,7 +1505,7 @@ pub fn missing_requested_scopes(
         .collect()
 }
 
-/// Temporary loopback listener for the OAuth callback.
+/// INVARIANT: Temporary loopback listener for the OAuth callback.
 ///
 /// Binds **both** loopback families on the same port. IPv4 is required; IPv6 is
 /// best-effort so a host with IPv6 disabled still completes the flow. Both are
@@ -1801,14 +1516,8 @@ struct CallbackListener {
 }
 
 impl CallbackListener {
-    /// Returns the raw `io::Error` rather than a `BoxError` so the caller can
-    /// branch on its kind: `AddrInUse` is the one failure with a remedy the user
-    /// can act on, and it needs different words from every other bind failure
-    /// (see [`callback_bind_error`]).
     async fn bind(port: u16) -> std::io::Result<Self> {
         let v4 = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-        // Resolve the port actually bound before adding the second socket — the
-        // caller may pass 0 (tests), and both families must land on one port.
         let port = v4.local_addr()?.port();
         let mut listeners = vec![v4];
         match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
@@ -1822,7 +1531,6 @@ impl CallbackListener {
         Ok(Self { listeners })
     }
 
-    /// Addresses actually bound — lets the tests drive each loopback family.
     #[cfg(test)]
     fn local_addrs(&self) -> Vec<std::net::SocketAddr> {
         self.listeners
@@ -1831,8 +1539,6 @@ impl CallbackListener {
             .collect()
     }
 
-    /// Accept the next connection on whichever family it arrives.
-    /// `TcpListener::accept` is cancel-safe, so dropping the losing futures is fine.
     async fn accept(&self) -> std::io::Result<tokio::net::TcpStream> {
         let accepts: Vec<_> = self
             .listeners
@@ -1844,14 +1550,10 @@ impl CallbackListener {
     }
 }
 
-/// The task that currently owns the loopback callback port, if any.
-///
-/// One process-level owner, superseded by whichever authorization starts next.
-/// See `docs/adr/0068-oauth-callback-port-has-one-owner.md`.
 static ACTIVE_CALLBACK_FLOW: std::sync::LazyLock<tokio::sync::Mutex<Option<ActiveCallbackFlow>>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
-/// The flow registered in [`ACTIVE_CALLBACK_FLOW`], and whether it still holds
+/// INVARIANT: The flow registered in [`ACTIVE_CALLBACK_FLOW`], and whether it still holds
 /// the port.
 ///
 /// The two are separate because a flow's task OUTLIVES its ownership of the
@@ -1859,36 +1561,26 @@ static ACTIVE_CALLBACK_FLOW: std::sync::LazyLock<tokio::sync::Mutex<Option<Activ
 /// with the port already released.
 struct ActiveCallbackFlow {
     task: tokio::task::JoinHandle<()>,
-    /// The *form request* the flow's authorization page answers. A flow
+    /// INVARIANT: The *form request* the flow's authorization page answers. A flow
     /// superseded while still listening is resolved by whoever supersedes it,
     /// because the aborted task cannot resolve itself.
     request_id: uuid::Uuid,
-    /// Set once at registration, cleared by the flow itself the instant it stops
+    /// INVARIANT: Set once at registration, cleared by the flow itself the instant it stops
     /// holding the listener. Ordered so that `false` implies the sockets are
     /// already closed: the store happens after the future that owns them has
     /// resolved and dropped them.
     holds_port: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// What a caller is told when nobody finished the authorization in time.
-///
-/// It does not claim the page opened. The engine only knows it asked the
-/// client to open it, and a lost stream frame looks identical from here.
 pub const OAUTH_TIMEOUT_MSG: &str =
     "OAuth authorization timed out after 120 seconds. The authorization page may not have \
      opened, or it was left unfinished. Start the connection again to retry.";
 
-/// What a caller is told when its flow's result channel closed with no result.
-///
-/// The sender drops without sending only when the task went away, which is
-/// almost always a supersede: something the user did, not an internal fault.
-/// Shared by BOTH entry points, because either can be superseded and they must
-/// not describe it differently.
 pub const FLOW_SUPERSEDED_MSG: &str =
     "This authorization was canceled, most likely because a newer one was started. \
      Start it again if you still need it.";
 
-/// Cancel the flow that owns the callback port, and wait until its socket is
+/// INVARIANT: Cancel the flow that owns the callback port, and wait until its socket is
 /// actually closed. Returns the form request of the live flow it superseded.
 ///
 /// **The await is the whole point.** `JoinHandle::abort` only *requests*
@@ -1913,14 +1605,6 @@ async fn release_callback_port(slot: &mut Option<ActiveCallbackFlow>) -> Option<
     Some(flow.request_id)
 }
 
-/// Explain a callback-listener bind failure.
-///
-/// By the time this runs the engine has already released its own flow, so
-/// `AddrInUse` means a *different* process holds the port. Workspaces run
-/// concurrently and share this one machine-wide port, so that is almost always
-/// another workspace part-way through connecting an account. Say so: the raw
-/// `Address already in use` names nothing the user can act on. Every other
-/// error kind keeps its own text.
 fn callback_bind_error(port: u16, e: std::io::Error) -> BoxError {
     if e.kind() != std::io::ErrorKind::AddrInUse {
         return e.into();
@@ -1934,12 +1618,9 @@ fn callback_bind_error(port: u16, e: std::io::Error) -> BoxError {
     .into()
 }
 
-/// Cap on the buffered request line. Authorization codes run to kilobytes, so
-/// the ceiling is generous: it exists only to stop a client that never sends a
-/// newline from growing the buffer forever.
 const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
 
-/// How long one connection gets to send its request line before we abandon it
+/// INVARIANT: How long one connection gets to send its request line before we abandon it
 /// and go back to waiting.
 ///
 /// A browser sends immediately after connecting, but a speculative preconnect
@@ -1947,7 +1628,7 @@ const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
 /// real redirect behind it in the accept queue until the flow times out.
 const CALLBACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Read the HTTP request line — everything before the first newline.
+/// INVARIANT: Read the HTTP request line — everything before the first newline.
 ///
 /// This MUST loop. A single read returns only what has arrived so far, and the
 /// authorization code sits in the request line. A read-once implementation
@@ -1972,7 +1653,7 @@ async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<String,
         }
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
-            break; // EOF without a newline: use whatever arrived.
+            break;
         }
         buf.extend_from_slice(&chunk[..read]);
     }
@@ -1982,12 +1663,6 @@ async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<String,
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Look up a query parameter and percent-decode it.
-///
-/// `plus_is_space` decides how `+` is treated. Providers form-encode
-/// human-readable text with `+` for space. An authorization code is an opaque
-/// RFC 3986 query value where `+` is literal, so decoding it as a space would
-/// corrupt the code.
 pub(crate) fn query_param(query: &str, key: &str, plus_is_space: bool) -> Option<String> {
     let raw = query
         .split('&')
@@ -1997,7 +1672,6 @@ pub(crate) fn query_param(query: &str, key: &str, plus_is_space: bool) -> Option
     } else {
         raw.to_string()
     };
-    // A malformed escape must not hide the value: fall back to the raw text.
     Some(
         urlencoding::decode(&raw)
             .map(|decoded| decoded.into_owned())
@@ -2005,31 +1679,16 @@ pub(crate) fn query_param(query: &str, key: &str, plus_is_space: bool) -> Option
     )
 }
 
-/// Does a callback query carry the `state` this flow sent?
-///
-/// `plus_is_space` is false because the value is an opaque base64url token, not
-/// form-encoded text. A callback with no `state` gets the same verdict as one
-/// with a wrong `state`: every conforming provider echoes what it was sent
-/// (RFC 6749 §4.1.2), so an absent value did not come from our authorization.
 fn callback_state_matches(query: &str, expected: &str) -> bool {
     query_param(query, "state", false).is_some_and(|got| got == expected)
 }
 
-/// What a callback that granted access carried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationGrant {
     pub code: String,
-    /// The client id the provider issued, which Sign in with ChatGPT returns
-    /// beside the code. Other providers send none.
     pub client_id: Option<String>,
 }
 
-/// Turn a callback query string into the grant, or into the provider's own
-/// reason for refusing.
-///
-/// A denial arrives as `?error=…&error_description=…` with no `code`. Reporting
-/// that as "no authorization code" hides the one piece of information the user
-/// needs (OAuth 2.0 §4.1.2.1).
 pub(crate) fn parse_callback_query(query: &str) -> Result<AuthorizationGrant, BoxError> {
     if let Some(code) = query_param(query, "code", false).filter(|c| !c.is_empty()) {
         let client_id = query_param(query, "client_id", false).filter(|c| !c.is_empty());
@@ -2051,9 +1710,6 @@ pub(crate) fn parse_callback_query(query: &str) -> Result<AuthorizationGrant, Bo
     Err("No authorization code in callback".into())
 }
 
-/// Best-effort browser response. The flow's outcome reaches the user through
-/// the engine, so a browser that has already navigated away must not fail the
-/// caller. Log it anyway, so a regression here surfaces.
 async fn respond_to_browser(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
     use tokio::io::AsyncWriteExt;
 
@@ -2076,16 +1732,11 @@ async fn respond_to_browser(stream: &mut tokio::net::TcpStream, status: &str, bo
     }
 }
 
-/// How far a flow got when its callback page was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackPageState {
-    /// The code was exchanged and the account stored.
     Connected,
-    /// The callback arrived and the flow has not finished within the wait.
     Pending,
-    /// The code exchange or the account store failed.
     Failed,
-    /// The provider refused, or the callback was not this flow's.
     Refused,
 }
 
@@ -2095,21 +1746,16 @@ impl CallbackPageState {
     }
 }
 
-/// How long the browser's callback request waits for the flow's outcome.
+/// INVARIANT: How long the browser's callback request waits for the flow's outcome.
 ///
 /// Shorter than the gateway's wait for the engine, so the engine always answers
 /// first and a slow exchange degrades to [`CallbackPageState::Pending`].
 pub(crate) const PAGE_SETTLE_WAIT: std::time::Duration =
     std::time::Duration::from_secs(lucidos_engine_socket::OAUTH_CALLBACK_HOP_TIMEOUT.as_secs() - 2);
 
-/// The flow's end of the browser's open callback request.
-///
-/// A flow that drops it without settling leaves the page at
-/// [`CallbackPageState::Pending`], never at a guess.
 #[derive(Debug)]
 pub struct PageReply(tokio::sync::oneshot::Sender<CallbackPageState>);
 
-/// The delivery side of a [`PageReply`].
 pub(crate) struct PageSettled(tokio::sync::oneshot::Receiver<CallbackPageState>);
 
 impl PageReply {
@@ -2118,20 +1764,17 @@ impl PageReply {
         (Self(tx), PageSettled(rx))
     }
 
-    /// Report how the flow ended. `connected` is true once the account is stored.
     pub fn settle(self, connected: bool) {
         let state = if connected {
             CallbackPageState::Connected
         } else {
             CallbackPageState::Failed
         };
-        // The browser may have left or the wait elapsed. Nothing to tell.
         let _ = self.0.send(state);
     }
 }
 
 impl PageSettled {
-    /// The flow's outcome, or `Pending` when it does not settle within the wait.
     pub(crate) async fn state(self) -> CallbackPageState {
         match tokio::time::timeout(PAGE_SETTLE_WAIT, self.0).await {
             Ok(Ok(state)) => state,
@@ -2140,23 +1783,15 @@ impl PageSettled {
     }
 }
 
-/// A callback that granted access, with the reply that settles its page.
 #[derive(Debug)]
 pub struct ReceivedGrant {
     pub grant: AuthorizationGrant,
     pub reply: PageReply,
 }
 
-/// The Lucidos mark, baked in from the one file that defines it.
-///
-/// `include_str!` rather than a copy, so the artwork has one definition and no
-/// second copy to keep in step with a rebrand. It is embedded rather than
-/// fetched because the whole page is (see [`callback_page`]). The file's own
-/// `xmlns` rides along, and `callback_page_fetches_nothing` allows exactly that
-/// one namespace identifier.
 const BRAND_MARK: &str = include_str!("../../../lucidos-app/public/favicon.svg");
 
-/// The page the provider's redirect lands on.
+/// INVARIANT: The page the provider's redirect lands on.
 ///
 /// It wears the surface and arrangement of the *workspace picker*
 /// (`styles/picker.css` `.ws-picker`), so it is recognisably ours on sight. Its
@@ -2198,8 +1833,6 @@ pub(crate) fn callback_page(provider: &str, state: CallbackPageState) -> String 
             "Tried to connect",
         ),
     };
-    // `provider` is a bare identifier (`dropbox`, `ghealth`), but escape it
-    // anyway so this stays safe if a caller ever passes something richer.
     let provider = provider
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -2209,8 +1842,6 @@ pub(crate) fn callback_page(provider: &str, state: CallbackPageState) -> String 
     } else {
         format!("Lucidos {provider}")
     };
-    // No value, no row: a flow whose provider name never reached this far would
-    // otherwise draw the hairline and the label over nothing.
     let footer = if provider.is_empty() {
         String::new()
     } else {
@@ -2251,7 +1882,7 @@ pub(crate) fn callback_page(provider: &str, state: CallbackPageState) -> String 
     )
 }
 
-/// Wait for the provider's redirect and extract the authorization code.
+/// INVARIANT: Wait for the provider's redirect and extract the authorization code.
 ///
 /// `expected_state` is the nonce this flow put on its authorization request
 /// (see [`generate_oauth_state`]). A callback that does not echo it back is
@@ -2265,7 +1896,7 @@ async fn wait_for_oauth_callback(
 ) -> Result<ReceivedGrant, BoxError> {
     loop {
         let mut stream = listener.accept().await?;
-        // A misbehaving connection is discarded, never fatal: a reset or idle
+        // INVARIANT: A misbehaving connection is discarded, never fatal: a reset or idle
         // preconnect must not fail an authorization the user completed.
         let request_line =
             match tokio::time::timeout(CALLBACK_READ_TIMEOUT, read_request_line(&mut stream)).await
@@ -2286,7 +1917,7 @@ async fn wait_for_oauth_callback(
         let target = request_line.split_whitespace().nth(1).unwrap_or("");
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
-        // Browsers open extra connections to the callback origin (favicon
+        // INVARIANT: Browsers open extra connections to the callback origin (favicon
         // probes, speculative preconnects). Treating one as the callback would
         // consume the accept and strand the flow. Answer them and keep waiting:
         // the caller's timeout bounds this loop.
@@ -2295,11 +1926,6 @@ async fn wait_for_oauth_callback(
             continue;
         }
 
-        // Not this flow's redirect: skip it and keep waiting. The BROWSER still
-        // gets the real failure page, not the probe's empty body: the likeliest
-        // sender is a human finishing a consent screen this flow superseded.
-        // Nothing from the query is rendered, so the page's injection contract
-        // is unchanged.
         if !callback_state_matches(query, expected_state) {
             crate::log_legacy!(
                 "[OAuth] Ignoring a {} callback that did not carry this flow's state",
@@ -2318,7 +1944,6 @@ async fn wait_for_oauth_callback(
                 return Err(refusal);
             }
         };
-        // The browser's request stays open until the flow stores the account.
         let (reply, settled) = PageReply::pair();
         let provider = provider.to_string();
         tokio::spawn(async move {
@@ -2334,11 +1959,8 @@ async fn wait_for_oauth_callback(
     }
 }
 
-/// What a flow waits on for its callback.
 enum CallbackWait {
-    /// This engine's own loopback sockets (no gateway).
     Listener(CallbackListener),
-    /// The gateway's forward to `/api/v1/internal/oauth/callback`.
     Gateway(crate::core::oauth_callback::PendingCallback),
 }
 
@@ -2351,34 +1973,16 @@ impl CallbackWait {
     }
 }
 
-/// What a completed OAuth token exchange produced.
-///
-/// A named struct rather than a tuple, because the two scope sets are the whole
-/// point of reporting an authorization and are indistinguishable positionally.
 pub struct OAuthFlowOutcome {
     pub email: Option<String>,
     pub display_name: Option<String>,
-    /// What the provider GRANTED. Falls back to [`Self::requested_scopes`] when
-    /// the token response carried no `scope`, which is what a provider granting
-    /// exactly what it was asked for typically does.
     pub granted_scopes: String,
-    /// What this flow ASKED for: the caller's scopes merged with everything the
-    /// account already held and had ever been asked for. The difference from
-    /// [`Self::granted_scopes`] is the shortfall
-    /// ([`missing_requested_scopes`]).
     pub requested_scopes: String,
-    /// The stored account holds a refresh token. This is what answers
-    /// `offline_access`, which a provider may grant without echoing. See
-    /// [`ConnectedAccount::has_refresh_token`].
     pub has_refresh_token: bool,
 }
 
-/// Outcome of an OAuth token exchange, or the reason it failed.
 pub type OAuthFlowResult = Result<OAuthFlowOutcome, String>;
 
-/// How the authorization page was answered, from how the wait for its
-/// callback ended: the outer error is the 120 s timeout, the inner one a
-/// provider that redirected back with an error.
 fn authorization_outcome<T, E, F>(
     waited: &Result<Result<T, E>, F>,
 ) -> crate::engine::thread_events::FormRequestOutcome {
@@ -2390,27 +1994,12 @@ fn authorization_outcome<T, E, F>(
     }
 }
 
-/// Result of preparing an OAuth flow: the auth URL, plus a receiver that
-/// resolves when the background flow completes.
 pub struct PreparedOAuthFlow {
     pub auth_url: String,
-    /// The id an `OAuthAuthorizationRequested` for this flow must carry. The
-    /// flow resolves it when its wait for the callback ends.
     pub request_id: uuid::Uuid,
     pub result_rx: tokio::sync::oneshot::Receiver<OAuthFlowResult>,
 }
 
-/// Prepare an OAuth flow, spawning the background task that waits for the
-/// callback, exchanges the code and stores the account.
-///
-/// The caller opens `auth_url` and awaits `result_rx` for the outcome.
-///
-/// `initiator` is the device that started the flow. It rides the
-/// `OAuthAccountConnected` event, so the frontend can bring THAT device back to
-/// the front when the authorization lands. `None` for an engine-internal flow,
-/// which the frontend reads as "not mine".
-///
-/// `route` says how the callback comes back. See [`CallbackRoute`].
 pub async fn prepare_oauth_flow(
     pool: &PgPool,
     event_bus: &EventBus,
@@ -2421,11 +2010,9 @@ pub async fn prepare_oauth_flow(
 ) -> Result<PreparedOAuthFlow, BoxError> {
     use crate::core::CredentialStore;
 
-    // One name for the account lookup, the client credential and the stored
-    // row, so `oauth:Dropbox` and `dropbox` cannot connect two accounts.
     let provider = client_provider_name(provider);
 
-    // What this flow will ASK for: everything the account already holds, plus
+    // INVARIANT: What this flow will ASK for: everything the account already holds, plus
     // everything it has ever been asked for, plus what this caller wants. Never
     // narrower than any of the three.
     //
@@ -2457,8 +2044,6 @@ pub async fn prepare_oauth_flow(
     if client_secret_repeats_client_id(&client_config) {
         return Err(repeated_secret_message(&provider).into());
     }
-    // A blank or absent client_secret is not an error: it is how a *public*
-    // client is expressed (see `ClientAuth`).
     let auth = ClientAuth::from_secret(client_config["client_secret"].as_str());
 
     let auth_url = client_config["auth_url"]
@@ -2473,22 +2058,14 @@ pub async fn prepare_oauth_flow(
         .as_str()
         .map(|s| s.to_string());
     let userinfo_method = UserinfoMethod::parse(client_config["userinfo_method"].as_str());
-    // Parsed with the other credential reads, so a malformed value fails before
-    // the loopback listener binds and the browser opens.
     let authorize_params = AuthorizeParams::parse(client_config["authorize_params"].as_str())?;
-    // Before the browser opens, so the user never consents to a flow whose
-    // code or token would then travel in cleartext.
     check_client_endpoints_in(&provider, &client_config)?;
 
-    // The ONE redirect URI for this flow, resolved before anything else so a
-    // bad override, or a browser that cannot follow it, fails before Connect.
     let redirect_uri = redirect_uri_for(&provider, &route, &client_config)?;
 
-    // This flow's `state`, generated before anything waits on it so the URL and
-    // the wait are handed the same value by construction.
     let state = route.state_for(&generate_oauth_state());
 
-    // Wait BEFORE returning the URL, so the callback cannot arrive before
+    // INVARIANT: Wait BEFORE returning the URL, so the callback cannot arrive before
     // anything is waiting for it. Only the no-gateway path holds the slot.
     let (wait, mut active_flow) = match route {
         CallbackRoute::OwnListener => {
@@ -2503,7 +2080,6 @@ pub async fn prepare_oauth_flow(
         ),
     };
 
-    // From the same `redirect_uri` the exchange below will send.
     let auth_request_url = build_authorize_url(
         &auth_url,
         &client_id,
@@ -2534,7 +2110,6 @@ pub async fn prepare_oauth_flow(
     let task_holds_port = holds_port.clone();
 
     let task = tokio::spawn(async move {
-        // Set once the callback lands, and settled after the exchange and store.
         let mut page_reply: Option<PageReply> = None;
         let result = async {
             let waited = tokio::time::timeout(
@@ -2543,14 +2118,12 @@ pub async fn prepare_oauth_flow(
             )
             .await;
 
-            // The future owns the listener or the delivery slot, so both the
+            // INVARIANT: The future owns the listener or the delivery slot, so both the
             // completed and the timed-out path have already closed it. Publish
             // that BEFORE the token exchange, which is a network round trip and
             // must not be abortable by a supersede.
             task_holds_port.store(false, std::sync::atomic::Ordering::Release);
 
-            // The authorization page is answered the moment the wait ends,
-            // whatever the token exchange below makes of it.
             crate::engine::form_requests::resolve_or_log(
                 &pool,
                 &event_bus,
@@ -2566,8 +2139,6 @@ pub async fn prepare_oauth_flow(
             let code = received.grant.code;
             page_reply = Some(received.reply);
 
-            // `exchange_code` already names the leg and carries the provider's
-            // own error text, so it is NOT re-wrapped.
             let token_resp = exchange_code(
                 &provider,
                 &token_url,
@@ -2587,11 +2158,8 @@ pub async fn prepare_oauth_flow(
 
             let token_expiry = token_resp.expiry_from(chrono::Utc::now());
 
-            // What the provider granted, falling back to what was requested.
             let granted_scopes = token_resp.scope.as_deref().unwrap_or(&merged_scopes);
 
-            // Both scope sets are stored. Their difference IS the shortfall a
-            // later *Reconnect* re-requests.
             let stored = OAuthStore::connect(
                 &pool,
                 &event_bus,
@@ -2619,10 +2187,8 @@ pub async fn prepare_oauth_flow(
                 email,
                 display_name,
                 granted_scopes: granted_scopes.to_string(),
-                // The set the authorization URL was built from. Anything
-                // derived later from the stored account could disagree.
                 requested_scopes: merged_scopes.clone(),
-                // From the row the upsert left, not from `token_resp`: a
+                // INVARIANT: From the row the upsert left, not from `token_resp`: a
                 // re-authorization returning no refresh token keeps the one
                 // the account already had, and the Accounts card reads that
                 // same row.
@@ -2637,7 +2203,7 @@ pub async fn prepare_oauth_flow(
         let _ = result_tx.send(result);
     });
 
-    // Register the new owner before releasing the lock, so the next flow has
+    // INVARIANT: Register the new owner before releasing the lock, so the next flow has
     // something to supersede and the port is never orphaned again.
     if let Some(slot) = active_flow.as_mut() {
         **slot = Some(ActiveCallbackFlow {
@@ -2655,7 +2221,7 @@ pub async fn prepare_oauth_flow(
     })
 }
 
-/// Bind this engine's own callback listener, superseding the flow that holds it.
+/// INVARIANT: Bind this engine's own callback listener, superseding the flow that holds it.
 ///
 /// Returns the slot still locked: the caller holds it past the spawn, so two
 /// callers cannot both find it empty and race for the socket. See
@@ -2691,15 +2257,6 @@ async fn bind_own_listener(
     Ok((listener, active_flow))
 }
 
-/// Run the full OAuth flow end-to-end, handing `auth_url` to `open_auth_url` at
-/// the moment something already waits for the callback.
-///
-/// **The engine does not open browsers.** Deciding where a URL is displayed
-/// belongs to the client, which knows the platform and the user's
-/// in-app-browser preference, so the caller supplies an opener.
-///
-/// The opener runs AFTER `prepare_oauth_flow` has started waiting, so the
-/// callback can never arrive before something is waiting for it.
 pub async fn run_oauth_flow<F>(
     pool: &PgPool,
     event_bus: &EventBus,
@@ -2718,15 +2275,9 @@ where
         "[OAuth] Handing {} authorization URL to the client to open",
         provider
     );
-    // A failed hand-off is fatal to the flow, not best-effort: nothing will
-    // ever reach the callback, so waiting out the timeout would only turn a
-    // precise error into "authorization timed out".
     open_auth_url(&prepared.auth_url, prepared.request_id).await?;
 
     let result = prepared.result_rx.await;
-    // The listener resolves the page when its wait ends. The opener can write
-    // the page's row after that, or after a newer flow superseded this one, so
-    // close it here too. Resolving an already-closed request is a no-op.
     use crate::engine::thread_events::FormRequestOutcome;
     let answered = match &result {
         Ok(Ok(_)) => FormRequestOutcome::Completed,
@@ -2746,15 +2297,6 @@ where
         .map_err(|e| e.into())
 }
 
-/// Whether a provider's userinfo endpoint is fetched with GET or POST.
-///
-/// GET is the OIDC norm and the default, so a credential that omits the key
-/// keeps working untouched. The alternative exists because some providers serve
-/// their userinfo equivalent as POST-only.
-///
-/// Read from the credential's optional `userinfo_method` key. Chosen explicitly
-/// rather than sniffed from a 400-then-retry: a silent method fallback would
-/// hide a genuinely broken endpoint behind a second request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserinfoMethod {
     Get,
@@ -2762,9 +2304,6 @@ pub enum UserinfoMethod {
 }
 
 impl UserinfoMethod {
-    /// Parse the credential's `userinfo_method`. Absent, blank, or unrecognized
-    /// all mean GET: the endpoint's method is not worth failing a completed
-    /// authorization over, and every pre-existing credential omits the key.
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(str::trim).unwrap_or_default().to_ascii_uppercase() {
             m if m == "POST" => Self::Post,
@@ -2773,11 +2312,6 @@ impl UserinfoMethod {
     }
 }
 
-/// The display name in a userinfo response.
-///
-/// Two shapes in the wild: OIDC's flat `"name": "Jane Doe"`, and a nested
-/// object carrying `display_name`. Read both, or the nested case yields no
-/// name at all.
 fn userinfo_display_name(body: &serde_json::Value) -> Option<String> {
     let name = body.get("name")?;
     if let Some(flat) = name.as_str() {
@@ -2788,10 +2322,6 @@ fn userinfo_display_name(body: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Fetch `(email, display_name)` from a userinfo endpoint.
-///
-/// Best-effort: any error is logged and downgraded to `(None, None)`, so the
-/// OAuth flow completes without this optional metadata.
 async fn fetch_userinfo(
     userinfo_url: &str,
     access_token: &str,
@@ -2800,7 +2330,7 @@ async fn fetch_userinfo(
     let client = bounded_http_client();
     let request = match method {
         UserinfoMethod::Get => client.get(userinfo_url),
-        // No body and no `Content-Type`, deliberately. A JSON content type with
+        // INVARIANT: No body and no `Content-Type`, deliberately. A JSON content type with
         // an empty body is rejected, and so is `{}`. Omitting the header is
         // both what such endpoints accept and the most neutral thing to send.
         UserinfoMethod::Post => client.post(userinfo_url),

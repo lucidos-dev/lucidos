@@ -1,14 +1,5 @@
-//! The working understanding: the parse, the apply, and the render.
-//!
-//! Every test here is an invariant of
-//! `docs/plans/2026-08-24-self-curated-context-mode-engine-half.md`, and the
-//! name says which behaviour would break without it.
-
 use super::*;
 
-/// A whole 32-hex address, as the panel prints one. Never a shortened form:
-/// the old guidance's example carried an ellipsis, and Opus copied it into 28
-/// of the 31 addresses it wrote back.
 const ADDRESS: &str = "evt-0123456789abcdef0123456789abcdef";
 const OTHER_ADDRESS: &str = "evt-fedcba9876543210fedcba9876543210";
 
@@ -23,8 +14,6 @@ fn apply(document: &WorkingUnderstanding, reply: &str) -> (WorkingUnderstanding,
     apply_spans(document, &parse_reply(reply))
 }
 
-/// The prefix is spelled as its own literal, so a rename of either opening
-/// marker would leave the stream suppression and the scan matching nothing.
 #[test]
 fn the_marker_prefix_opens_both_forms() {
     assert!(OPEN_REPLACE.starts_with(MARKER_PREFIX));
@@ -35,10 +24,6 @@ fn the_marker_prefix_opens_both_forms() {
     );
 }
 
-// ---- the parse rule that cannot lose a write ----
-
-/// Invariant 9. An unclosed marker is the case the rule is chosen on: stopping
-/// instead loses the write outright and the model never retries.
 #[test]
 fn an_unclosed_marker_captures_to_the_end_of_the_reply() {
     let parsed = parse_reply("before\n[WORKING UNDERSTANDING]\nthe body\nand more");
@@ -51,7 +36,6 @@ fn an_unclosed_marker_captures_to_the_end_of_the_reply() {
     );
 }
 
-/// Invariant 10. No opening marker means no write, and the document stands.
 #[test]
 fn silence_keeps_the_document() {
     let before = doc("what I know", "do not touch the frontend");
@@ -61,8 +45,6 @@ fn silence_keeps_the_document() {
     assert!(applied.todo.is_none());
 }
 
-/// Invariant 11, first order. A replace then an add is the replacement plus the
-/// addition, never the second span winning outright.
 #[test]
 fn a_replace_then_an_add_apply_in_that_order() {
     let (after, _) = apply(
@@ -74,8 +56,6 @@ fn a_replace_then_an_add_apply_in_that_order() {
     assert_eq!(after.body, "fresh\nand one more line");
 }
 
-/// Invariant 11, the other order. The replace must win, and the earlier add
-/// must not survive it.
 #[test]
 fn an_add_then_a_replace_apply_in_that_order() {
     let (after, _) = apply(
@@ -86,8 +66,6 @@ fn an_add_then_a_replace_apply_in_that_order() {
     assert_eq!(after.body, "the whole thing");
 }
 
-/// Invariant 12. The engine renders the document back under the very marker a
-/// replace opens with, so a role-blind parse would double it every round.
 #[test]
 fn the_engines_own_rendering_is_never_read_as_a_write() {
     let rendered = render(
@@ -106,8 +84,6 @@ fn the_engines_own_rendering_is_never_read_as_a_write() {
     );
 }
 
-/// A Stop cuts the reply mid-block. The fragment must not rewrite the document,
-/// and the user still never sees it.
 #[test]
 fn a_stop_cut_fragment_cannot_rewrite_the_document() {
     let before = doc("weeks of notes", "call it X");
@@ -132,8 +108,6 @@ fn a_stop_cut_fragment_cannot_rewrite_the_document() {
     assert_eq!(mixed.spans[0].body, "finished");
 }
 
-/// Invariant 13. The model's reply carries its prose, its document and its next
-/// action together, so a superseded copy is spliced rather than overwritten.
 #[test]
 fn folding_a_superseded_span_keeps_everything_around_it() {
     let reply = format!(
@@ -147,15 +121,11 @@ fn folding_a_superseded_span_keeps_everything_around_it() {
     assert!(!folded.contains("private notes"));
 }
 
-/// Nothing to fold leaves the block alone, so an ordinary reply is not rewritten
-/// on a sweep round for nothing.
 #[test]
 fn a_reply_with_no_span_does_not_fold() {
     assert!(fold_spans("ordinary prose, no markers").is_none());
 }
 
-/// A span shorter than the marker that would replace it stays. Folding it would
-/// grow the request while claiming to shrink it.
 #[test]
 fn a_span_smaller_than_its_own_marker_is_left_alone() {
     let reply = format!("{OPEN_REPLACE}\nshort\n{CLOSE}");
@@ -163,8 +133,6 @@ fn a_span_smaller_than_its_own_marker_is_left_alone() {
     assert!(fold_spans(&reply).is_none());
 }
 
-/// Invariant 31. What is left after the splice is what was addressed to the
-/// user, and no part of the document is in it.
 #[test]
 fn splicing_leaves_only_what_was_addressed_to_the_user() {
     let reply = "Reading the file now.\n\
@@ -176,8 +144,6 @@ fn splicing_leaves_only_what_was_addressed_to_the_user() {
     assert!(!visible.contains(MARKER_PREFIX));
 }
 
-/// Invariant 32's precondition. A reply that is nothing but the document leaves
-/// nothing for the user, which is what the loop reads to continue the turn.
 #[test]
 fn a_reply_that_is_only_the_document_splices_to_nothing() {
     let reply = "[WORKING UNDERSTANDING]\nnotes only\n[/WORKING UNDERSTANDING]";
@@ -185,9 +151,6 @@ fn a_reply_that_is_only_the_document_splices_to_nothing() {
     assert!(splice_spans_out(reply, &parsed.spans).is_empty());
 }
 
-/// An opening nobody can read leaves no span, so the splice cuts nothing and
-/// the whole block used to reach the user. The fault is reported to the model
-/// either way; the markup is not the user's business.
 #[test]
 fn a_malformed_opening_marker_does_not_reach_the_user() {
     let reply = "Here is the plan.\n\
@@ -203,26 +166,18 @@ fn a_malformed_opening_marker_does_not_reach_the_user() {
     assert_eq!(visible, "Here is the plan.\n\nStarting now.");
 }
 
-/// An unreadable opening with no closing marker runs to the end, the same rule
-/// the parse applies to a span it could read.
 #[test]
 fn a_malformed_opening_with_no_close_takes_the_rest() {
     let visible = strip_faulted_markup("Working on it.\n[WORKING UNDERSTANDING: NEW]\nthe body");
     assert_eq!(visible, "Working on it.");
 }
 
-/// The strip is a no-op over ordinary prose, so it can run on every faulted
-/// round without a second condition guarding it.
 #[test]
 fn stripping_leaves_text_that_carries_no_markup_alone() {
     let text = "Nothing here mentions the block at all.";
     assert_eq!(strip_faulted_markup(text), text);
 }
 
-// ---- the three sections ----
-
-/// Invariant 34, the constraints half. Adding one constraint must not silently
-/// drop the rest.
 #[test]
 fn an_add_accumulates_the_constraints() {
     let (after, _) = apply(
@@ -237,8 +192,6 @@ fn an_add_accumulates_the_constraints() {
     );
 }
 
-/// Invariant 34, the checklist half. Ticking a box means rewriting the list, so
-/// last occurrence wins even under an ADD.
 #[test]
 fn an_add_replaces_the_checklist() {
     let (_, applied) = apply(
@@ -252,8 +205,6 @@ fn an_add_replaces_the_checklist() {
     assert_eq!(items[0].content, "read the file");
 }
 
-/// A rewrite that says nothing about the checklist leaves it standing. Clearing
-/// the user-visible list is not what silence about it means.
 #[test]
 fn a_span_with_no_checklist_writes_none() {
     let (_, applied) = apply(
@@ -263,9 +214,6 @@ fn a_span_with_no_checklist_writes_none() {
     assert!(applied.todo.is_none());
 }
 
-/// A REPLACE carrying no body of its own replaces nothing. The guidance's own
-/// `[KEEP OPEN]` example is a marker and a heading. Read as a whole-document
-/// rewrite, it would wipe the notes the moment a keep is written.
 #[test]
 fn a_replace_with_no_body_keeps_the_document() {
     let before = doc("twenty rounds of notes", "do not touch the frontend");
@@ -277,9 +225,6 @@ fn a_replace_with_no_body_keeps_the_document() {
     assert_eq!(applied.keep_open, vec![ADDRESS.to_string()]);
 }
 
-/// A bodyless REPLACE still REPLACES the section it carries. Appending there
-/// would stack a repeated constraint copy by copy, every round the model
-/// restated it.
 #[test]
 fn a_bodyless_replace_replaces_the_constraints_it_carries() {
     let before = doc("", "do not touch the frontend");
@@ -291,7 +236,6 @@ fn a_bodyless_replace_replaces_the_constraints_it_carries() {
     assert_eq!(twice.body, "", "the body is still not its business");
 }
 
-/// The same for a bare checklist. Ticking a box must not cost the document.
 #[test]
 fn a_replace_carrying_only_a_checklist_keeps_the_document() {
     let before = doc("twenty rounds of notes", "call it X");
@@ -303,9 +247,6 @@ fn a_replace_carrying_only_a_checklist_keeps_the_document() {
     assert_eq!(applied.todo.as_ref().map(Vec::len), Some(1));
 }
 
-/// A REPLACE sets each half the span actually named, so a whole rewrite that
-/// forgets `[CONSTRAINTS]` keeps them. They used to be typed over with an empty
-/// string, which lost them on the one form most likely to omit the heading.
 #[test]
 fn a_replace_that_omits_the_constraints_keeps_them() {
     let (after, _) = apply(
@@ -316,9 +257,6 @@ fn a_replace_that_omits_the_constraints_keeps_them() {
     assert_eq!(after.constraints, "old constraint");
 }
 
-/// Dropping them is still possible, and it has to be written. An empty heading
-/// is the only way to say it, and it is the same shape the render shows every
-/// round.
 #[test]
 fn an_empty_constraints_heading_clears_them() {
     let (after, _) = apply(
@@ -329,8 +267,6 @@ fn an_empty_constraints_heading_clears_them() {
     assert_eq!(after.constraints, "");
 }
 
-/// Invariant 14. Only the body and the constraints are stored: a stored
-/// checklist could never show `waiting` or `abandoned`.
 #[test]
 fn the_checklist_and_the_keeps_are_never_stored() {
     let (after, applied) = apply(
@@ -348,8 +284,6 @@ fn the_checklist_and_the_keeps_are_never_stored() {
     assert_eq!(applied.keep_open, vec![ADDRESS.to_string()]);
 }
 
-/// Invariant 33. Replaying the stored document cannot re-assert a keep, which
-/// is the standing keep ADR 0085 recorded as a design error.
 #[test]
 fn replaying_the_stored_document_asserts_no_keep() {
     let (after, _) = apply(
@@ -364,8 +298,6 @@ fn replaying_the_stored_document_asserts_no_keep() {
     assert!(again.keep_open.is_empty());
 }
 
-/// The document survives its own storage round trip, or an ADD would append to
-/// half of it.
 #[test]
 fn the_document_round_trips_through_its_stored_form() {
     let before = doc("line one\nline two", "call it X");
@@ -375,10 +307,6 @@ fn the_document_round_trips_through_its_stored_form() {
     );
 }
 
-// ---- the headings, and what happens near one ----
-
-/// Invariant 21, the prose half. A thread discussing this design writes the
-/// words constantly, so a sentence is never a heading.
 #[test]
 fn prose_about_the_headings_is_not_a_heading() {
     let (after, applied) = apply(
@@ -392,8 +320,6 @@ fn prose_about_the_headings_is_not_a_heading() {
     assert!(after.body.contains("The todo list and the constraints"));
 }
 
-/// Invariant 21, the near-miss half. A bare heading draws a nudge rather than
-/// silence, so the collision becomes a correction.
 #[test]
 fn a_bare_heading_is_named_rather_than_read() {
     let (_, applied) = apply(
@@ -408,8 +334,6 @@ fn a_bare_heading_is_named_rather_than_read() {
     );
 }
 
-/// The two obvious decorations count, because a model writing markdown reaches
-/// for them without thinking.
 #[test]
 fn a_decorated_heading_still_counts() {
     for heading in ["## [TODO]", "**[TODO]**", "### [TODO]:"] {
@@ -423,8 +347,6 @@ fn a_decorated_heading_still_counts() {
     }
 }
 
-/// All five marks parse. The model writes three, and the engine writes the
-/// other two at a terminator, so a rewrite of the rendered list must survive.
 #[test]
 fn every_checklist_mark_round_trips() {
     let (_, applied) = apply(
@@ -447,8 +369,6 @@ fn every_checklist_mark_round_trips() {
     );
 }
 
-/// A checklist line that will not parse is named, and the rest of the list
-/// still lands. Nothing is refused.
 #[test]
 fn an_unreadable_checklist_line_is_named() {
     let (_, applied) = apply(
@@ -463,9 +383,6 @@ fn an_unreadable_checklist_line_is_named() {
     );
 }
 
-/// A second item in progress is named, and the later one reads as pending. The
-/// document is left as written, but at most one item is in progress: that is
-/// what the prompt bar renders and what `todo_write` refuses outright.
 #[test]
 fn a_second_item_in_progress_is_named_and_demoted() {
     let (_, applied) = apply(
@@ -483,8 +400,6 @@ fn a_second_item_in_progress_is_named_and_demoted() {
     );
 }
 
-/// A list past the cap is named and truncated to it, so the projection stays
-/// writable and the model can see why.
 #[test]
 fn a_checklist_past_the_cap_is_named() {
     let lines: String = (0..=MAX_TODO_ITEMS)
@@ -502,10 +417,6 @@ fn a_checklist_past_the_cap_is_named() {
     );
 }
 
-// ---- keeps ----
-
-/// Invariant 24. A mistyped address in text would do nothing at all. A keep
-/// that fails in silence is a result vanishing while it is needed.
 #[test]
 fn an_address_that_is_not_an_address_is_reported() {
     let (_, applied) = apply(
@@ -520,8 +431,6 @@ fn an_address_that_is_not_an_address_is_reported() {
     );
 }
 
-/// Invariant 27. A keep carries an address and nothing else: a duration would
-/// ask the model to forecast again.
 #[test]
 fn a_trailing_duration_is_ignored_and_reported() {
     let (_, applied) = apply(
@@ -539,7 +448,6 @@ fn a_trailing_duration_is_ignored_and_reported() {
     );
 }
 
-/// Two spans in one reply hold two things, in order, with no repeats.
 #[test]
 fn keeps_accumulate_across_spans_and_deduplicate() {
     let (_, applied) = apply(
@@ -556,9 +464,6 @@ fn keeps_accumulate_across_spans_and_deduplicate() {
     );
 }
 
-/// An address is an identifier, so the model dresses it like one. The keep is
-/// the mode's only curation lever, and losing one to a pair of backticks would
-/// cost the item the model asked to hold.
 #[test]
 fn a_decorated_address_is_still_an_address() {
     for written in [
@@ -583,10 +488,6 @@ fn a_decorated_address_is_still_an_address() {
     }
 }
 
-// ---- the render ----
-
-/// Invariant 18. Nothing is refused on size: the header carries the request and
-/// the document is intact.
 #[test]
 fn nothing_is_refused_on_size() {
     let long = "x".repeat(ASK_TO_REWRITE_ABOVE_CHARS + 1);
@@ -596,8 +497,6 @@ fn nothing_is_refused_on_size() {
     assert!(!block.contains("Error"));
 }
 
-/// The constraints heading renders empty or not, so an omission is visible on
-/// every round rather than at the moment it costs something.
 #[test]
 fn the_constraints_heading_always_renders() {
     let block = render(
@@ -611,8 +510,6 @@ fn the_constraints_heading_always_renders() {
     assert!(block.ends_with(CLOSE));
 }
 
-/// Invariant 14's other half. The render regenerates the checklist from the
-/// projection, so the two engine-written statuses reach the model.
 #[test]
 fn the_render_carries_the_engine_written_statuses() {
     let items = vec![
@@ -632,8 +529,6 @@ fn the_render_carries_the_engine_written_statuses() {
     assert!(block.contains("- [abandoned] walked away"));
 }
 
-/// The framing reports what the round held and what it could not read, one line
-/// each, in the block's own header.
 #[test]
 fn the_framing_names_the_faults_and_the_holds() {
     let notices = RoundNotices {
@@ -645,13 +540,8 @@ fn the_framing_names_the_faults_and_the_holds() {
     assert!(block.contains(&format!("Held open this round: {ADDRESS}")));
 }
 
-/// Invariant 17. Every address on this surface is the whole 32 hex digits, or
-/// the `evt-<hex>` placeholder. A shortened one is copied back verbatim and
-/// resolves to nothing.
 #[test]
 fn no_surface_shows_a_shortened_address() {
-    // Every place this block can print one: the held-open line, a fault, and
-    // the body the model pasted an address into.
     let notices = RoundNotices {
         faults: vec![format!("`{OTHER_ADDRESS}` is not an address I could read.")],
         held_open: vec![ADDRESS.to_string()],

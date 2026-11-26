@@ -1,9 +1,3 @@
-//! `thread_summaries.summary_version` goes up by one on every change to a row,
-//! whoever writes it, and on nothing else. The client orders every summary it
-//! receives by this number, so a writer that could skip the bump could put a
-//! stale status on screen. Raw SQL is the writer these tests use, because it is
-//! the one no Rust helper could ever have covered.
-
 use super::test_helpers::*;
 use super::*;
 
@@ -169,10 +163,6 @@ async fn the_aggregate_and_the_summary_carry_the_row_version() {
     teardown_test_db(&db).await;
 }
 
-/// A write that answers its caller with a version must answer with the one its
-/// own event broadcast. A client holds an optimistic row until it sees that
-/// version (ADR 0437), so a different number would hold it too long or too
-/// briefly.
 #[tokio::test]
 async fn an_emit_returns_the_version_its_broadcast_aggregate_carried() {
     use crate::engine::event_bus::{BusEvent, EventBus};

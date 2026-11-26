@@ -1,5 +1,3 @@
-//! The users the gateway knows, and the calling device's user (ADR 0623).
-
 use axum::{http::HeaderMap, routing::get, Json, Router};
 
 use super::AppState;
@@ -15,10 +13,6 @@ pub(super) fn router() -> Router<AppState> {
         .route("/operators/people", get(legacy_users))
 }
 
-/// GET /api/v1/users/me: the devices whose reads count as the caller's.
-/// `devices` is null when the caller reads as the whole team: a gateway with
-/// fewer than two users, or a device no user holds. A page reads its
-/// Review group through it.
 async fn me(headers: HeaderMap) -> Json<serde_json::Value> {
     Json(reader_devices(&headers))
 }
@@ -31,9 +25,6 @@ pub(super) fn reader_devices(headers: &HeaderMap) -> serde_json::Value {
     serde_json::json!({ "devices": reader.devices() })
 }
 
-/// GET /api/v1/users: every user the gateway knows, and `you`, the
-/// caller's user or null. `team` is true with two or more users: only then
-/// does a chat send take mentions (ADR 0649).
 async fn users(headers: HeaderMap) -> Json<serde_json::Value> {
     Json(user_list(&headers))
 }

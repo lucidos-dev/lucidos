@@ -1,52 +1,18 @@
-//! Two more values that must not sit in the cached system block (ADR 0084),
-//! split the way [`super::turn_clock`] split the clock.
-//!
-//! The rule the system block lives by is that it holds nothing varying per
-//! turn or per thread: it is a function of workspace state and preferences,
-//! and of nothing else. Two values broke it, and neither tripped the guard,
-//! because that guard compares two threads at ONE moment and both read the
-//! same current value.
-//!
-//! - **The engine build state**, a function of live build state, rebuilt
-//!   every turn. Its three states are 327 to 374 characters, and the 7-day
-//!   data has two threads on one build disagreeing by exactly 44 of them.
-//! - **The client URL**, read from `frontend_origin`, a runtime value set
-//!   from the last observed request origin.
-//!
-//! Each splits the same way. The invariant guidance is a `const` taking no
-//! argument, so nothing volatile can reach the cached tier through it. The
-//! reading rides in a labelled block at the end of the user message.
-
 use crate::engine::engine_version::VersionStatus;
 use crate::engine::LucidosEngine;
 
 #[easy_ext::ext(TurnTailExt)]
 pub(crate) impl LucidosEngine {
-    /// The origin the user is reaching this workspace on, read once per turn.
-    ///
-    /// `frontend_origin` is set from the last observed request, so this is a
-    /// runtime reading and not workspace state. That is exactly why it feeds
-    /// [`client_url_block`] rather than the system prompt.
     fn client_url(&self) -> String {
         if let Some(origin) = self.frontend_origin.lock().unwrap().as_ref() {
             return origin.clone();
         }
-        // No request origin observed yet: the engine serves the frontend
-        // itself, so its own TLS setting decides the scheme (never hardcode
-        // http/https, see the intra-host scheme rule).
         let api_port = std::env::var("LUCIDOS_API_PORT").unwrap_or_else(|_| "3000".to_string());
         let port = std::env::var("VITE_PORT").unwrap_or(api_port);
         format!("{}://localhost:{}", crate::net_config::tls_scheme(), port)
     }
 }
 
-/// The invariant half of the engine build state, spliced into the cached
-/// system block. Dev installs only, matching the apply-verify addendum that
-/// forwards to it.
-///
-/// Every claim here holds on every turn: where the reading is, what question
-/// it settles, and that it may move under the agent mid-turn. The state
-/// itself is the one thing that changes, and that is [`engine_build_block`].
 pub(super) const ENGINE_BUILD_POINTER: &str = "\n\nENGINE BUILD:\n\
      The [ENGINE BUILD] block at the END of the request says whether the user \
      has switched onto the newest build, and is rebuilt every turn. That is \
@@ -71,34 +37,22 @@ pub(super) fn engine_build_block(status: &VersionStatus) -> String {
     format!("[ENGINE BUILD]\n{state}\n[END ENGINE BUILD]")
 }
 
-/// The invariant half of the client URL: what the agent should do about it.
-///
-/// The URL itself is a runtime value, so only the pointer is cacheable.
 pub(super) const CLIENT_URL_POINTER: &str = "\n\nThe Lucidos client the user \
      is talking to you from is at the URL in the [CLIENT URL] block at the END \
      of the request. To see an app UI, use capture_app, never browser_open.";
 
-/// The volatile half: the origin this workspace was last reached on.
 pub(super) fn client_url_block(frontend_url: &str) -> String {
     format!("[CLIENT URL]\n{frontend_url}\n[END CLIENT URL]")
 }
 
-/// The blocks that ride at the END of the user message rather than in the
-/// cached system block, in wire order.
-///
-/// Named rather than positional `&str`s. The consumers pass them through a
-/// long argument list, where two adjacent strings are one typo away from
-/// swapping.
 #[derive(Default)]
 pub(crate) struct TurnTail<'a> {
-    /// [`super::child_status::child_status_block`], empty without children.
     pub child_threads: &'a str,
     pub engine_build: &'a str,
     pub client_url: &'a str,
     pub current_time: &'a str,
 }
 
-/// A version-status fixture shared with the system prompt footprint.
 pub(super) fn version_status(update_available: bool, source_behind_head: bool) -> VersionStatus {
     VersionStatus {
         build_deferred: None,
@@ -119,7 +73,6 @@ pub(super) fn version_status(update_available: bool, source_behind_head: bool) -
     }
 }
 
-/// All readings billed by the prompt footprint, including the held case.
 pub(super) fn build_statuses() -> Vec<VersionStatus> {
     let mut statuses: Vec<_> = [(false, false), (true, false), (false, true)]
         .into_iter()
@@ -139,10 +92,6 @@ pub(super) fn build_statuses() -> Vec<VersionStatus> {
 mod tests {
     use super::*;
 
-    /// Nothing pending, so an applied restart-requiring change IS live and the
-    /// user HAS restarted. Stated affirmatively, because "no update available"
-    /// is a double negative the model has to reason through at exactly the
-    /// moment it is guessing.
     #[test]
     fn a_current_engine_says_so_affirmatively() {
         let block = engine_build_block(&version_status(false, false));
@@ -157,8 +106,6 @@ mod tests {
         );
     }
 
-    /// A built-but-not-switched engine is the one case where "the user has not
-    /// restarted" is true, and it is the only case that may say so.
     #[test]
     fn a_built_but_unswitched_engine_says_the_change_is_not_live() {
         let block = engine_build_block(&version_status(true, false));
@@ -173,9 +120,6 @@ mod tests {
         );
     }
 
-    /// Source ahead with no binary behind it is NOT "the user has not
-    /// switched": there is nothing to switch onto, so telling them to restart
-    /// sends them to a button that would do nothing.
     #[test]
     fn source_ahead_of_a_built_binary_does_not_tell_the_user_to_switch() {
         let block = engine_build_block(&version_status(false, true));
@@ -190,8 +134,6 @@ mod tests {
         );
     }
 
-    /// The cases must produce different text. Collapsing any two
-    /// would restore the guess this block exists to remove.
     #[test]
     fn the_build_states_are_distinct() {
         let blocks: Vec<String> = build_statuses()
@@ -206,12 +148,6 @@ mod tests {
         }
     }
 
-    /// It answers the question the apply-verify addendum forwards to it, and
-    /// says the answer can change under the agent's feet: the user restarts on
-    /// their own schedule, including while a turn is running.
-    ///
-    /// Both claims are invariant, so the POINTER carries them. The addendum
-    /// names "ENGINE BUILD section", which is the pointer's own heading.
     #[test]
     fn the_pointer_answers_the_restart_question_and_dates_itself() {
         assert!(
@@ -233,8 +169,6 @@ mod tests {
         );
     }
 
-    /// No build id in the text. The user cannot look one up on any screen, so
-    /// putting it here only invites the agent to quote a hex string at them.
     #[test]
     fn the_block_carries_no_build_id() {
         let mut status = version_status(true, false);
@@ -249,8 +183,6 @@ mod tests {
         );
     }
 
-    /// The whole point of the split: nothing a build state says may appear in
-    /// the cached half, or the system tier is rewritten when the state flips.
     #[test]
     fn the_cached_pointer_leaks_no_build_state_and_no_url() {
         for leaked in [
@@ -272,9 +204,6 @@ mod tests {
         }
     }
 
-    /// The client URL pointer keeps the instruction that rode with the URL. It
-    /// is the reason the sentence exists at all: an agent that reaches for
-    /// browser_open on its own app UI gets a screenshot of nothing useful.
     #[test]
     fn the_client_url_pointer_keeps_the_capture_app_instruction() {
         assert!(
@@ -287,8 +216,6 @@ mod tests {
         );
     }
 
-    /// Both tail blocks are labelled and closed, so the model can tell where
-    /// each ends inside one concatenated user message.
     #[test]
     fn both_tail_blocks_are_delimited() {
         let build = engine_build_block(&version_status(false, false));

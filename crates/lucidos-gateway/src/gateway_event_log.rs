@@ -1,17 +1,3 @@
-//! The gateway event log: devices and users, event sourced (ADR 0623).
-//!
-//! Every pairing, revoke and user change is one line of JSON appended to
-//! `<data dir>/gateway-events.jsonl`, and synced before anyone acts on it. The
-//! [`Directory`] is a projection of that file: replaying the log rebuilds it.
-//! The log needs no Postgres, so a device still signs in while Postgres is down.
-//!
-//! **A user is identity without authority.** Nothing in the gateway reads
-//! a user to allow or refuse a request. [`crate::auth::authorize_with_match`]
-//! reads only [`Directory::devices`].
-//!
-//! The log replaces `paired-devices.json`, which [`open`] migrates exactly once
-//! into seed events, every device under one user.
-
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -20,18 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, PairedDevice, PairedDevices};
 
-/// The log's file name, under the gateway's data dir.
 pub const LOG_FILE: &str = "gateway-events.jsonl";
 
-/// What `paired-devices.json` is renamed to once its rows are in the log. No
-/// gateway reads it again, so a downgrade cannot revive a revoked device.
 const MIGRATED_SUFFIX: &str = "migrated";
 
-/// The name of the user a gateway creates for itself: the one that holds
-/// every migrated device, or the first device paired with no user named.
 pub const FIRST_USER_NAME: &str = "Owner";
 
-/// One change to the devices or users, named in the past tense.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum GatewayEvent {
@@ -41,8 +21,6 @@ pub enum GatewayEvent {
         credential_digest: String,
         user_id: String,
     },
-    /// A device reached this gateway, at most once a day. A liveness hint for
-    /// the devices list, never an auth input.
     DeviceSeen {
         device_id: String,
     },
@@ -61,7 +39,6 @@ pub enum GatewayEvent {
         user_id: String,
         name: String,
     },
-    /// Its devices were revoked first, each with its own `DeviceRevoked`.
     UserRemoved {
         user_id: String,
     },
@@ -73,37 +50,27 @@ pub enum GatewayEvent {
         user_id: String,
         email: String,
     },
-    /// A device relayed through a gateway pairing arrived with a signed
-    /// user that differs from the last one recorded for it.
     RelayedUserSeen {
         device_id: String,
         user_id: String,
         name: String,
         via: String,
-        /// The emails A holds for the user. An engine merges the relayed
-        /// user into the local one holding the same email.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         emails: Vec<String>,
     },
-    /// A gateway pairing ended, so its relayed users are gone. Device ids
-    /// relayed through it start with `<pairing_id>:`.
     RelayedPairingForgotten {
         pairing_id: String,
     },
 }
 
 impl GatewayEvent {
-    /// Does this change who is who? `DeviceSeen` does not, so engines are not
-    /// told about it.
     pub fn changes_identity(&self) -> bool {
         !matches!(self, Self::DeviceSeen { .. })
     }
 }
 
-/// One line of the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoggedEvent {
-    /// RFC 3339, when the change happened.
     pub at: String,
     pub event: GatewayEvent,
 }
@@ -117,49 +84,35 @@ impl LoggedEvent {
     }
 }
 
-/// A user, as this gateway knows them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct User {
     pub id: String,
     pub name: String,
-    /// Lowercase. One email belongs to at most one user.
     pub emails: Vec<String>,
     pub added_at: String,
 }
 
-/// A device that reaches this gateway through a gateway pairing, with the
-/// user the other gateway signed for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RelayedDevice {
-    /// The namespaced id this gateway's engines see.
     pub device_id: String,
-    /// Namespaced like the device id, so it never collides with a local one.
     pub user_id: String,
     pub name: String,
-    /// The other gateway's label.
     pub via: String,
-    /// The emails A signed for the user, lowercase.
     #[serde(default)]
     pub emails: Vec<String>,
 }
 
-/// The projection of the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Directory {
-    /// Every paired device. Authorization reads this and nothing else.
     pub devices: PairedDevices,
-    /// Oldest first, which is what makes [`Directory::first_user`] stable.
     pub users: Vec<User>,
-    /// Which user holds each device.
     pub memberships: BTreeMap<String, String>,
     pub relayed: Vec<RelayedDevice>,
 }
 
-/// Why a change was refused. Always the caller's mistake, said plainly.
 pub type Refusal = String;
 
 impl Directory {
-    /// Rebuild the projection from logged events, oldest first.
     pub fn replay<'a>(events: impl IntoIterator<Item = &'a LoggedEvent>) -> Self {
         let mut directory = Self::default();
         for event in events {
@@ -168,8 +121,6 @@ impl Directory {
         directory
     }
 
-    /// Fold one event in. Total: an event naming something already gone
-    /// changes nothing, so a log always replays.
     pub fn apply(&mut self, logged: &LoggedEvent) {
         let at = &logged.at;
         match &logged.event {
@@ -272,12 +223,10 @@ impl Directory {
         self.devices.devices.iter().any(|d| d.id == id)
     }
 
-    /// The user a device belongs to.
     pub fn user_of_device(&self, device_id: &str) -> Option<&str> {
         self.memberships.get(device_id).map(String::as_str)
     }
 
-    /// The devices a user holds, in pairing order.
     pub fn devices_of(&self, user_id: &str) -> Vec<&str> {
         self.devices
             .devices
@@ -287,14 +236,10 @@ impl Directory {
             .collect()
     }
 
-    /// The oldest user still here: the one a pairing with no user
-    /// named joins.
     pub fn first_user(&self) -> Option<&User> {
         self.users.first()
     }
 
-    /// The events that pair a device. With no user named it joins the
-    /// first user, which a gateway with none creates first.
     pub fn pair(
         &self,
         device_id: &str,
@@ -327,7 +272,6 @@ impl Directory {
         Ok(events)
     }
 
-    /// The event that revokes a device, or none when no device has that id.
     pub fn revoke(&self, device_id: &str) -> Vec<GatewayEvent> {
         if !self.has_device(device_id) {
             return Vec::new();
@@ -352,8 +296,6 @@ impl Directory {
         }])
     }
 
-    /// Revoke every device the user holds, then remove the user. That
-    /// is how a team offboards someone.
     pub fn remove_user(&self, id: &str) -> Result<Vec<GatewayEvent>, Refusal> {
         self.require_user(id)?;
         let mut events: Vec<GatewayEvent> = self
@@ -414,8 +356,6 @@ impl Directory {
         }])
     }
 
-    /// The event recording a relayed device's signed user, or none when
-    /// it is what the log already says.
     pub fn relayed_seen(&self, seen: RelayedDevice) -> Option<GatewayEvent> {
         if self.relayed.contains(&seen) {
             return None;
@@ -429,8 +369,6 @@ impl Directory {
         })
     }
 
-    /// The event dropping the users relayed through an ended pairing, or
-    /// none when it relayed nobody.
     pub fn pairing_forgotten(&self, pairing_id: &str) -> Option<GatewayEvent> {
         let prefix = format!("{pairing_id}:");
         self.relayed
@@ -441,7 +379,6 @@ impl Directory {
             })
     }
 
-    /// The user holding an email, matched without regard to case.
     pub fn user_of_email(&self, email: &str) -> Option<&User> {
         let email = email.trim().to_lowercase();
         self.users.iter().find(|o| o.emails.contains(&email))
@@ -468,8 +405,6 @@ fn valid_name(name: &str) -> Result<String, Refusal> {
     Ok(name.to_string())
 }
 
-/// Lowercase and trimmed. Checks the shape only: the address is a key to
-/// match against, never somewhere Lucidos sends mail.
 pub fn normalize_email(email: &str) -> Result<String, Refusal> {
     let email = email.trim().to_lowercase();
     let valid = email.len() <= 254
@@ -483,7 +418,6 @@ pub fn normalize_email(email: &str) -> Result<String, Refusal> {
     Ok(email)
 }
 
-/// The log file, append only.
 #[derive(Debug)]
 pub struct EventLog {
     path: PathBuf,
@@ -494,7 +428,6 @@ impl EventLog {
         &self.path
     }
 
-    /// Append events and sync them to disk before returning.
     pub fn append(&self, events: &[LoggedEvent]) -> Result<(), crate::BoxError> {
         if events.is_empty() {
             return Ok(());
@@ -513,9 +446,6 @@ impl EventLog {
     }
 }
 
-/// Run `write` on the log, and on failure cut the file back to its length
-/// before. A partial line left in place would land mid-file at the next
-/// append, and the next boot could not replay the log.
 fn append_or_cut(
     file: &mut std::fs::File,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
@@ -528,8 +458,6 @@ fn append_or_cut(
     written
 }
 
-/// Open for appending, created owner-only: the log carries credential
-/// digests. `truncate` starts the file over, for the one-time migration.
 fn open_owner_only(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -549,23 +477,14 @@ fn open_owner_only(path: &Path, truncate: bool) -> std::io::Result<std::fs::File
     options.open(path)
 }
 
-/// What [`open`] found, for the boot log.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Opened {
-    /// The log existed and replayed.
     Replayed,
-    /// A torn last line, left by a crash mid-append, was cut off.
     RepairedTornTail,
-    /// The device store moved into the log, with this many devices.
     Migrated(usize),
-    /// Nothing to load: a fresh install. The file appears on the first event.
     Fresh,
 }
 
-/// Open this gateway's log, migrating `paired-devices.json` the first time.
-///
-/// `legacy` is the pre-isolation machine-global store, read only when this
-/// gateway has neither a log nor a store of its own.
 pub fn open(
     app_data: &Path,
     legacy: Option<&Path>,
@@ -608,7 +527,6 @@ pub fn open(
     ))
 }
 
-/// Written under the data dir once [`cut_devices_once`] has run.
 pub const DEVICE_CUT_MARKER: &str = "device-cut-loopback-tls.done";
 
 /// Revoke every paired device and delete the old device stores, once.
@@ -661,8 +579,6 @@ pub fn cut_devices_once(
     Ok(Some(revoked.len()))
 }
 
-/// The events that reproduce a device store: one user holding every
-/// device, each paired and last seen when the store says.
 pub fn seed_events(store: &PairedDevices) -> Result<Vec<LoggedEvent>, crate::BoxError> {
     let Some(first) = store.devices.first() else {
         return Ok(Vec::new());
@@ -697,8 +613,6 @@ pub fn seed_events(store: &PairedDevices) -> Result<Vec<LoggedEvent>, crate::Box
     Ok(events)
 }
 
-/// Write the seed whole, then rename it into place, so a crash leaves either
-/// no log (and the store still there) or the complete one.
 fn write_seed(path: &Path, events: &[LoggedEvent]) -> Result<(), crate::BoxError> {
     let mut lines = String::new();
     for event in events {
@@ -708,7 +622,6 @@ fn write_seed(path: &Path, events: &[LoggedEvent]) -> Result<(), crate::BoxError
     replace_whole(path, &lines)
 }
 
-/// Write `contents` to a temp file, sync it, then rename it over `path`.
 fn replace_whole(path: &Path, contents: &str) -> Result<(), crate::BoxError> {
     let tmp = path.with_extension("jsonl.tmp");
     let mut file = open_owner_only(&tmp, true)?;
@@ -718,14 +631,8 @@ fn replace_whole(path: &Path, contents: &str) -> Result<(), crate::BoxError> {
     Ok(())
 }
 
-/// What the log is copied to before [`rename_operator_to_user`] rewrites it.
 pub const PRE_USER_RENAME_SUFFIX: &str = "pre-user-rename";
 
-/// Rewrite a log written before *operator* became *user* (ADR 0655): the
-/// `Operator*` event types become `User*` and `operator_id` becomes `user_id`.
-/// The old file stays beside it. A log with nothing to rename is untouched,
-/// so a second run is a no-op. A line that does not parse is kept verbatim,
-/// for [`read_log`] to judge.
 fn rename_operator_to_user(path: &Path) -> Result<(), crate::BoxError> {
     let raw = std::fs::read_to_string(path)?;
     let mut changed = false;
@@ -757,7 +664,6 @@ fn rename_operator_to_user(path: &Path) -> Result<(), crate::BoxError> {
     replace_whole(path, &rewritten)
 }
 
-/// Rename one logged event in place. True when anything changed.
 fn rename_logged_value(logged: &mut serde_json::Value) -> bool {
     let Some(event) = logged.get_mut("event") else {
         return false;
@@ -778,9 +684,6 @@ fn rename_logged_value(logged: &mut serde_json::Value) -> bool {
     changed
 }
 
-/// Read every event. A last line with no newline that does not parse is a
-/// torn append: it is cut off the file, and `true` says so. Any other bad line
-/// is an error, since skipping it could forget a revoke.
 fn read_log(path: &Path) -> Result<(Vec<LoggedEvent>, bool), crate::BoxError> {
     let raw = std::fs::read_to_string(path)?;
     let (complete, tail) = match raw.rfind('\n') {
@@ -800,7 +703,6 @@ fn read_log(path: &Path) -> Result<(Vec<LoggedEvent>, bool), crate::BoxError> {
         return Ok((events, false));
     }
     if let Ok(event) = serde_json::from_str(tail) {
-        // Whole but unterminated: end the line, or the next append joins it.
         let mut file = open_owner_only(path, false)?;
         file.write_all(b"\n")?;
         file.sync_data()?;

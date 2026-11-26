@@ -1,5 +1,3 @@
-//! Startup commands and generated contracts for the engine executable.
-
 pub mod codegen;
 pub mod config_change_notifications;
 pub mod construction;

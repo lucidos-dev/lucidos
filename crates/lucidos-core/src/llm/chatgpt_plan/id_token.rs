@@ -1,9 +1,3 @@
-//! Verifying the sign-in's `id_token`: RS256 against the auth host's JWKS,
-//! with the issuer, audience and `nonce` checked (OIDC Core § 3.1.3.7).
-//!
-//! The issuer and the key set URL come from the auth host's discovery
-//! document, never from a guess.
-
 use std::collections::HashSet;
 
 use base64::Engine as _;
@@ -14,12 +8,11 @@ use super::auth_server::{http_client, AuthServer};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The signed-in ChatGPT account, read from a verified `id_token`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Identity {
     pub issuer: String,
     pub subject: String,
-    /// Only displayed, never used to decide anything.
+    /// INVARIANT: Only displayed, never used to decide anything.
     pub email: Option<String>,
 }
 
@@ -48,8 +41,6 @@ struct ProfileClaims {
     email: Option<String>,
 }
 
-/// Verify `id_token`, issued to `client_id` for the sign-in that sent
-/// `nonce`, and return the account it names.
 pub(super) async fn verify(
     auth: &AuthServer,
     id_token: &str,
@@ -124,7 +115,6 @@ fn verify_with(
     })
 }
 
-/// The RSA key `kid` names. A token with no `kid` takes the only RSA key.
 fn signing_key(keys: &KeySet, kid: Option<&str>) -> Result<RS256PublicKey, BoxError> {
     let mut rsa = keys.keys.iter().filter(|key| key.kty == "RSA");
     let key = match kid {
@@ -153,7 +143,6 @@ pub mod test_support {
     use super::*;
     use jwt_simple::prelude::{Claims, Duration, RS256KeyPair, RSAKeyPairLike as _};
 
-    /// One signing key for every test: RSA key generation is slow.
     pub(crate) fn test_key() -> &'static RS256KeyPair {
         static KEY: std::sync::LazyLock<RS256KeyPair> = std::sync::LazyLock::new(|| {
             RS256KeyPair::generate(2048)
@@ -163,7 +152,6 @@ pub mod test_support {
         &KEY
     }
 
-    /// The JWKS a test auth host serves for [`test_key`].
     pub(crate) fn test_jwks() -> serde_json::Value {
         let components = test_key().public_key().to_components();
         let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
@@ -177,13 +165,12 @@ pub mod test_support {
         }]})
     }
 
-    /// An `id_token` signed with [`test_key`], shaped like OpenAI's: `aud`
+    /// INVARIANT: An `id_token` signed with [`test_key`], shaped like OpenAI's: `aud`
     /// is an array holding the client id.
     pub fn signed_id_token(issuer: &str, client_id: &str, nonce: &str) -> String {
         signed_id_token_for("user-123", issuer, client_id, nonce)
     }
 
-    /// [`signed_id_token`] for the account `subject`.
     pub(crate) fn signed_id_token_for(
         subject: &str,
         issuer: &str,

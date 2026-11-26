@@ -1,8 +1,3 @@
-//! `POST /api/v1/threads/:thread_id/cache-keep-alive`: the user turns the
-//! cache keep-alive off for this thread, `{"state": "off"}`, or back on,
-//! `{"state": "on"}` (ADR 0554). It records the event under the caller's
-//! device, and answers 204.
-
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
     http::{HeaderMap, StatusCode},

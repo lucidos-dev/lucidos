@@ -148,6 +148,7 @@ Work on a *coding-agent thread*'s branch that no pending *change* carries. Its r
 | `awaiting_landing` | The thread's change waits in the *landing lane*. The newer work is proposed once that change lands or its batch fails. |
 | `integrated_into_parent` | An *integrated sub-thread*'s hardened work. It is never proposed: its parent's agent merges the branch. If the parent's change lands without it, the work is set aside. |
 | `carried_by_successor` | The thread continued in a legacy *successor thread*, whose branch starts at this thread's last commit. It is never proposed here: the successor's change carries it. A *successor session* never sets it, since it stays in the same thread. |
+| `hook_refused` | An *event hook* refused the proposal. `EventHookRefused` records its reason. An open change the branch moved past is withdrawn, so Apply cannot merge the refused commits. The next turn end asks the hook again. |
 
 No reason means no turn end withheld it. The thread is still running, waits on an event, works in an external repo, or its work was set aside. A turn end that withholds work emits `ProposalWithheld`. Unfinished work is never a proposal: Continue resumes the turn, and a turn that finishes proposes it.
 

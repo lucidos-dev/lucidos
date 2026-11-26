@@ -1,5 +1,3 @@
-//! A withdrawn change hands its work back to the branch undecided (ADR 0400).
-
 use super::cp_helpers::*;
 use super::*;
 use crate::core::changes::ChangeStatus;
@@ -20,9 +18,6 @@ async fn archive_state(pool: &PgPool, thread_id: Uuid) -> String {
         .unwrap()
 }
 
-/// I5: a withdrawn change leaves every open read and the open-branch index,
-/// and the thread lands on unproposed work with no reason. The archive net
-/// reads the branch as undecided, so it still sets the work aside.
 #[tokio::test]
 async fn a_withdrawn_change_leaves_the_open_reads_and_hands_back_its_branch() {
     let (pool, db) = setup_test_db().await;
@@ -69,8 +64,6 @@ async fn a_withdrawn_change_leaves_the_open_reads_and_hands_back_its_branch() {
     teardown_test_db(&db).await;
 }
 
-/// Withdrawing a set-aside change surfaces its archived thread: the work is
-/// back on the branch and somebody has to decide it.
 #[tokio::test]
 async fn withdrawing_a_set_aside_change_surfaces_an_archived_thread() {
     let (pool, db) = setup_test_db().await;
@@ -113,8 +106,6 @@ async fn withdrawing_a_set_aside_change_surfaces_an_archived_thread() {
     teardown_test_db(&db).await;
 }
 
-/// I4 on the rebuild path: a lost withdrawn row comes back withdrawn. Rebuilt
-/// as pending, it would offer an Apply on work a turn never finished.
 #[tokio::test]
 async fn rebuild_restores_a_withdrawn_change_as_withdrawn() {
     let (pool, db) = setup_test_db().await;

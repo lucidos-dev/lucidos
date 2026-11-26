@@ -1,7 +1,3 @@
-//! The app's copy of the gateway constants it must agree with (ADR 0368). They
-//! live in `lucidos-gateway-constants`, so the engine renders them without
-//! depending on the gateway (ADR 0014).
-
 use lucidos_gateway_constants::{
     DEVICE_PAIRING_SECRET_PREFIX, GATEWAY_PAIRING_SECRET_PREFIX, OAUTH_WEB_CALLBACK_PATH,
     PAIRING_CODE_DIGITS, PAIRING_SECRET_CHARS, PAIR_PARAM, REMOTE_GATEWAY_NAME_MAX_LEN,

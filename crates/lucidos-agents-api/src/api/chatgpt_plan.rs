@@ -1,14 +1,3 @@
-//! Sign in with ChatGPT, for Settings and the `lucidos chatgpt-plan` CLI.
-//!
-//! - `GET /api/v1/providers/chatgpt-plan`: the stored sign-in, the attempt in
-//!   progress and the usage-limit pause. Never a token.
-//! - `POST /api/v1/providers/chatgpt-plan/sign-in`: start an attempt and answer
-//!   with the ChatGPT page the browser must open. Refused for a browser that
-//!   is not on a computer running Lucidos (ADR 0636).
-//! - `POST /api/v1/providers/chatgpt-plan/sign-out`: stop any attempt in
-//!   progress and forget the stored sign-in. `?forget_account=true` also
-//!   forgets the registration, so the next sign-in may use another account.
-
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
@@ -39,9 +28,6 @@ async fn status(State(state): State<AppState>) -> Result<Json<ChatGptPlanStatus>
         .map_err(ApiError::db)
 }
 
-/// The browser the ChatGPT page opens in: the one that sent this request, else
-/// the one its device last used. A terminal sends neither, and gets the local
-/// default of [`CallbackRoute::for_browser`].
 fn requesting_browser(headers: &HeaderMap) -> Option<BrowserContext> {
     BrowserContext::from_headers(headers).or_else(|| {
         headers

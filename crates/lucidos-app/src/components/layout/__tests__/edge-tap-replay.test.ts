@@ -171,6 +171,24 @@ describe('the strip gate replays what it cancels', () => {
   });
 });
 
+describe('replayEdgeTap watches the lift at document capture', () => {
+  it('sees a lift that does not bubble, so a re-render cannot strand the touch', () => {
+    const row = document.createElement('div');
+    document.body.appendChild(row);
+    const clicks: ReplayCandidate[] = [];
+    const host: ReplayHost = {
+      ...documentReplayHost(),
+      elementsFromPoint: () => [row],
+      dispatchClick: (target) => { clicks.push(target); },
+    };
+    const start = touch(1, 8);
+    replayEdgeTap(host, { changedTouches: [start], touches: [start] });
+    row.dispatchEvent(Object.assign(new Event('touchend'), { changedTouches: [touch(1, 8)], touches: [] }));
+    expect(clicks).toHaveLength(1);
+    row.remove();
+  });
+});
+
 describe('documentReplayHost', () => {
   it('focuses a text field before it clicks it', () => {
     const input = document.createElement('input');

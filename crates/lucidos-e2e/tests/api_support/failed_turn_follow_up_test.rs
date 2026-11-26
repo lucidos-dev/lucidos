@@ -1,18 +1,9 @@
-//! E2E: a follow-up typed into a chat turn that then FAILS still gets a turn.
-//!
-//! The follow-up is injected into the live turn. The turn's model call then
-//! errors, so the loop exits before reading it. The turn tail drains it as an
-//! orphan. An `Err` returns no `ProcessResult` to carry it back to the caller,
-//! so the engine must re-submit it.
-
 use crate::support::{base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client};
 use lucidos_engine::llm::mock::{
     MOCK_FAIL_AFTER_MS_SENTINEL, MOCK_RESPONSE, MOCK_SCRIPTED_FAILURE,
 };
 use uuid::Uuid;
 
-/// Long enough for the follow-up to land inside the live turn, on a loaded
-/// host too. The test checks that it did, rather than trusting the number.
 const FAIL_AFTER_MS: u64 = 8_000;
 
 async fn sequence_of(pool: &sqlx::PgPool, event_id: &str) -> Option<i64> {
@@ -23,7 +14,6 @@ async fn sequence_of(pool: &sqlx::PgPool, event_id: &str) -> Option<i64> {
         .expect("events query failed")
 }
 
-/// The sequence and text of the first `event_type` anchored on `anchor`.
 async fn anchored(
     pool: &sqlx::PgPool,
     thread_id: Uuid,

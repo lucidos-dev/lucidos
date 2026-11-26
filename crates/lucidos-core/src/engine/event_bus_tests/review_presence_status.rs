@@ -1,9 +1,6 @@
 use super::super::*;
 use super::*;
 
-/// Bug: CodingAgentIdled(has_changes=false) from Default section was suppressed,
-/// leaving the thread in ARCHIVE. First idle (no changes) must surface in REVIEW
-/// so the user knows the Claude Code session completed.
 #[tokio::test]
 async fn cc_idle_no_changes_from_default_goes_to_review() {
     let (pool, db_name) = setup_test_db().await;
@@ -12,7 +9,6 @@ async fn cc_idle_no_changes_from_default_goes_to_review() {
 
     start_cc_session(&bus, thread_id, "claude-code/explore", None).await;
 
-    // CC completes with no file changes
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
 
     let (section, status): (String, String) =
@@ -29,8 +25,6 @@ async fn cc_idle_no_changes_from_default_goes_to_review() {
     teardown_test_db(&db_name).await;
 }
 
-/// Housekeeping: CodingAgentIdled(has_changes=false) when section is already 'inbox'
-/// (after apply/discard) must not change section — it's already in REVIEW.
 #[tokio::test]
 async fn cc_idle_no_changes_from_inbox_stays_inbox() {
     let (pool, db_name) = setup_test_db().await;
@@ -40,7 +34,6 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
     start_cc_session(&bus, thread_id, "claude-code/fix", None).await;
     emit_cc_idle(&bus, thread_id, true, None).await;
 
-    // Apply the change — section stays 'inbox' for Archive button
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
@@ -83,7 +76,6 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
     .await
     .unwrap();
 
-    // Housekeeping idle — section already 'inbox', must stay 'inbox'
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
 
     let section: String =
@@ -101,16 +93,11 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
     teardown_test_db(&db_name).await;
 }
 
-/// When a parent chat thread has active CC children and ResponseGenerated fires,
-/// the broadcast aggregate must carry both the section transition (to inbox) and
-/// the children count, so the frontend updates both atomically — preventing a
-/// transient REVIEW state (should be WAITING).
 #[tokio::test]
 async fn response_generated_on_parent_with_children_broadcasts_children_count() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-    // Create parent chat thread
     let parent_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
@@ -137,7 +124,6 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
     .await
     .unwrap();
 
-    // Spawn two CC children
     for i in 0..2 {
         let child_id = Uuid::new_v4();
         bus.emit(BusEvent::Thread {
@@ -168,10 +154,8 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
 
     assert_active_children(&pool, parent_id, 2, "parent should have 2 active children").await;
 
-    // Subscribe to capture events AFTER children are spawned
     let mut rx = bus.subscribe();
 
-    // Parent finishes responding → ResponseGenerated → section transitions to inbox
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::ResponseGenerated {
@@ -185,10 +169,6 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
     .await
     .unwrap();
 
-    // ResponseGenerated's aggregate snapshot carries section AND
-    // active_children_count in one envelope — no follow-up section-change
-    // event or ChildrenCountChanged broadcast is needed for the frontend to
-    // render consistent state.
     let mut response_generated_aggregate: Option<crate::core::store::ThreadAggregate> = None;
     while let Ok(emitted) = rx.try_recv() {
         if let BusEvent::Thread {
@@ -238,7 +218,6 @@ async fn emit_device_visible_writes_to_device_presence_projection() {
         "DeviceVisible should mark the device visible in device_presence"
     );
 
-    // Transient — never persisted to events.
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE event_type IN ('DeviceVisible', 'DeviceHidden')",
     )
@@ -267,8 +246,6 @@ async fn device_visible_heartbeat_does_not_broadcast() {
     .unwrap();
     assert!(rx.try_recv().is_ok(), "first DeviceVisible must broadcast");
 
-    // Heartbeat — same device, already-recorded-visible. Should NOT broadcast
-    // so we don't wake every SSE subscriber every 30s.
     bus.emit(BusEvent::System(SystemEvent::DeviceVisible {
         device_id: "dev-1".into(),
     }))
@@ -289,7 +266,6 @@ async fn emit_device_hidden_clears_presence_and_no_op_when_already_hidden() {
     let (bus, _cb) = EventBus::new(pool.clone());
     let mut rx = bus.subscribe();
 
-    // Hide a device that was never visible — no-op, no broadcast.
     bus.emit(BusEvent::System(SystemEvent::DeviceHidden {
         device_id: "dev-never".into(),
     }))
@@ -300,7 +276,6 @@ async fn emit_device_hidden_clears_presence_and_no_op_when_already_hidden() {
         "DeviceHidden on a non-visible device must not broadcast"
     );
 
-    // Now visible → hidden → projection cleared.
     bus.emit(BusEvent::System(SystemEvent::DeviceVisible {
         device_id: "dev-1".into(),
     }))
@@ -324,21 +299,12 @@ async fn emit_device_hidden_clears_presence_and_no_op_when_already_hidden() {
     teardown_test_db(&db_name).await;
 }
 
-/// CC may emit a `Result` mid-session — e.g. when the model invokes a Skill
-/// tool that triggers another model turn — making the engine emit
-/// `CodingAgentIdled` before CC is actually done. The next `CodingAgentToolCalled`
-/// (or text/result) proves CC is still working, so the projection must bump
-/// status back to `running` to keep the thread out of REVIEW while work
-/// continues. Without this, the thread shows in REVIEW with a stale "idle"
-/// status while the agent is mid-tool-call.
 #[tokio::test]
 async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    // Seed: MessageReceived → SessionStarted → CodingAgentIdled.
-    // After Idled, status is 'idle' (no changes).
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -418,9 +384,6 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
             .unwrap();
     assert_eq!(status, "idle", "post-Idled status should be idle");
 
-    // Now: CC continues with a tool call (e.g. it invoked Skill and the
-    // skill content triggers another model turn). The engine never emitted
-    // a new MessageReceived/PromptSent — this is internal CC continuation.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::CodingAgentToolCalled {
@@ -456,8 +419,6 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
     teardown_test_db(&db_name).await;
 }
 
-/// Same recovery for `CodingAgentTextStreamed` arriving after Idled —
-/// CC's response text streaming proves work is in progress.
 #[tokio::test]
 async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
     let (pool, db_name) = setup_test_db().await;
@@ -538,11 +499,6 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
     teardown_test_db(&db_name).await;
 }
 
-/// `events_pkey` is the structural reason the agentic loop's old inject
-/// path silently dropped `PromptInjected` events: a row already
-/// existed with the same id (the optimistic `MessageReceived`). Locking
-/// this in here so a future schema change that relaxes the constraint
-/// doesn't quietly resurrect that bug.
 #[tokio::test]
 async fn emit_with_existing_event_id_fails_with_pkey_violation() {
     let (pool, db_name) = setup_test_db().await;
@@ -608,11 +564,6 @@ async fn emit_with_existing_event_id_fails_with_pkey_violation() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: a failed CC turn emits `ResponseFailed` (status='failed') then
-/// `CodingAgentIdled` in the same turn. The idle is CC-lifecycle bookkeeping and
-/// must NOT downgrade 'failed' → 'idle' — otherwise the red error dot in the
-/// thread list disappears (the originally-reported "this should have gotten an
-/// error dot" bug, e.g. CC `Not logged in · Please run /login`).
 #[tokio::test]
 async fn cc_idle_after_failed_turn_preserves_failed_status() {
     let (pool, db_name) = setup_test_db().await;
@@ -621,7 +572,6 @@ async fn cc_idle_after_failed_turn_preserves_failed_status() {
 
     start_cc_session(&bus, thread_id, "claude-code/login-error", None).await;
 
-    // CC turn ends in failure — terminal event sets status='failed'.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseFailed {
@@ -646,7 +596,6 @@ async fn cc_idle_after_failed_turn_preserves_failed_status() {
         "ResponseFailed must set status='failed'"
     );
 
-    // The same turn's bookkeeping idle (no changes) follows.
     emit_cc_idle(&bus, thread_id, false, Some("sid-fail")).await;
 
     let after_idle: String =
@@ -665,9 +614,6 @@ async fn cc_idle_after_failed_turn_preserves_failed_status() {
     teardown_test_db(&db_name).await;
 }
 
-/// Complement: a *successful* CC turn (ResponseGenerated → CodingAgentIdled) must
-/// still settle to 'idle'. The failed-preservation CASE only fires on 'failed',
-/// so a normal turn is unaffected.
 #[tokio::test]
 async fn cc_idle_after_successful_turn_settles_idle() {
     let (pool, db_name) = setup_test_db().await;

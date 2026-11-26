@@ -1,19 +1,3 @@
-//! Withdrawing a queued follow-up the coding agent has not read yet. Plan:
-//! `docs/plans/2026-09-29-withdraw-a-queued-claude-code-message.md`.
-//!
-//! A withdraw travels API, then run loop, then driver, then agent. The
-//! run loop owns the input ledger, so it decides whether the message is still
-//! owed. It never blocks on the agent: it keeps each pending answer, and
-//! settles the ledger and records the `QueuedMessageRemoved` tombstone once
-//! the answer lands. The tombstone therefore always matches what the agent
-//! did, even when the HTTP caller gave up first.
-//!
-//! For an input this session never forwarded, the store answers
-//! (`stranded_follow_ups::InputFate`). One an earlier session forwarded and no
-//! agent read sat in a dead process's queue, so it is withdrawn. One no session
-//! forwarded may still be on its way to a spawn, so it is refused. With no
-//! session at all, the engine answers while it holds the thread claim.
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -37,23 +21,17 @@ pub(crate) const NOT_YET_FORWARDED: &str =
 pub(crate) const NO_LIVE_SESSION: &str =
     "The coding agent's session has ended, so the message can no longer be taken back.";
 
-/// How long the API waits for a withdraw. Claude Code answers at once; the
-/// slack covers a run loop busy with another event.
 const WITHDRAW_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A withdraw Claude Code has answered, back in the run loop.
 #[derive(Debug)]
 pub(crate) struct WithdrawAnswered {
     request: WithdrawInputRequest,
     outcome: InputWithdrawal,
 }
 
-/// The run loop's withdraws still waiting on Claude Code's answer.
 pub(crate) type PendingWithdraws =
     FuturesUnordered<Pin<Box<dyn Future<Output = WithdrawAnswered> + Send>>>;
 
-/// Start answering a withdraw for an input the run loop has already forwarded.
-/// The answer joins `pending`, unless it is known at once.
 pub(crate) fn begin_withdraw(
     inputs: &InputLedger,
     driver: &mpsc::UnboundedSender<WithdrawRequest>,
@@ -63,7 +41,6 @@ pub(crate) fn begin_withdraw(
     pending: &mut PendingWithdraws,
 ) {
     if inputs.awaits_tombstone(request.input_event_id) {
-        // The agent already dropped it; only the tombstone is left to record.
         let outcome = InputWithdrawal::Withdrawn;
         pending.push(Box::pin(std::future::ready(WithdrawAnswered {
             request,
@@ -80,7 +57,6 @@ pub(crate) fn begin_withdraw(
         return;
     }
     let Some(input_uuid) = inputs.withdrawable(request.input_event_id) else {
-        // The requester may have gone away; nobody is left to tell.
         let _ = request.reply.send(InputWithdrawal::AlreadyRead);
         return;
     };
@@ -135,8 +111,6 @@ pub(crate) async fn withdraw_ceiling_before_stop(
     )
 }
 
-/// The answer for an input this session never forwarded. Never a read of its
-/// own (the plan's first invariant).
 async fn unheld_outcome(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -163,8 +137,6 @@ pub(crate) async fn settle_answered_withdraws(
     }
 }
 
-/// Settle a withdraw the agent answered. A removal leaves the ledger on
-/// success, and its tombstone hides its bubble on every device.
 pub(crate) async fn finish_withdraw(
     bus: &EventBus,
     thread_id: Uuid,
@@ -181,13 +153,11 @@ pub(crate) async fn finish_withdraw(
             }
             recorded
         }
-        // A take settles once all its withdraws answer (`settle_take`).
         (other, _) => other,
     };
     let _ = request.reply.send(outcome);
 }
 
-/// Record the `QueuedMessageRemoved` that hides the bubble on every device.
 async fn record_tombstone(
     bus: &EventBus,
     thread_id: Uuid,
@@ -217,9 +187,6 @@ async fn record_tombstone(
     }
 }
 
-/// Ask the thread's live session to take back `input_event_id`'s message.
-/// `None` when no run loop took the request: no live session, or one that
-/// ended before it answered.
 async fn withdraw_from_session(
     sessions: &Mutex<HashMap<Uuid, AgentSession>>,
     thread_id: Uuid,
@@ -249,7 +216,7 @@ async fn withdraw_from_session(
     }
 }
 
-/// Withdraw before dispatch without asking a coding agent to drop an input
+/// INVARIANT: Withdraw before dispatch without asking a coding agent to drop an input
 /// it never received. The queue row lock orders this against admission.
 async fn take_back_permission_held_input(
     bus: &EventBus,
@@ -332,7 +299,6 @@ async fn take_back_permission_held_input(
 
 #[easy_ext::ext(WithdrawExt)]
 pub(crate) impl LucidosEngine {
-    /// Take back a follow-up the thread's coding agent has not read yet.
     async fn withdraw_coding_agent_input(
         &self,
         thread_id: Uuid,
@@ -378,7 +344,6 @@ pub(crate) impl LucidosEngine {
         .await
         {
             Some(outcome) => outcome,
-            // A run took the thread meanwhile, so its loop answers.
             None => ask_session()
                 .await
                 .unwrap_or_else(|| InputWithdrawal::Refused(NO_LIVE_SESSION.to_string())),
@@ -386,7 +351,7 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Answer a withdraw while holding the thread claim `claim` yields, so no
+/// INVARIANT: Answer a withdraw while holding the thread claim `claim` yields, so no
 /// session can start and forward the message while the tombstone is written.
 /// `None` when a live run holds the thread.
 async fn withdraw_while_claimed<C, E: std::fmt::Display>(

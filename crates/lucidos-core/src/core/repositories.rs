@@ -6,19 +6,12 @@ use uuid::Uuid;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
-/// Fixed namespace for deriving deterministic repository ids via UUIDv5.
+/// INVARIANT: Fixed namespace for deriving deterministic repository ids via UUIDv5.
 /// Generated once and frozen: changing it would re-derive every repo's id and
 /// re-orphan every `thread_summaries.cc_repo_id` binding — exactly the failure
 /// this scheme exists to prevent.
 const REPO_ID_NAMESPACE: Uuid = Uuid::from_u128(0xb6c1f4e2_5a3d_4f8b_9c2e_1d7a0f3e6b54);
 
-/// A repository's **deterministic identity**. Derived from the repo's git
-/// root-commit SHA (intrinsic to the history, so it survives moving, renaming,
-/// re-cloning, and a registry wipe — every re-registration recomputes the same
-/// id from disk), falling back to the canonical path for a repo with no commits
-/// yet. Replaces the former random `gen_random_uuid()` surrogate PK, whose
-/// regeneration orphaned coding-agent threads. See `docs/glossary.md`
-/// § "deterministic repo id".
 pub fn deterministic_id(root_commit_sha: Option<&str>, canonical_path: &str) -> Uuid {
     match root_commit_sha {
         Some(sha) if !sha.trim().is_empty() => {
@@ -34,49 +27,15 @@ pub struct Repository {
     pub name: String,
     pub path: String,
     pub description: Option<String>,
-    /// The repo's root-commit SHA — the basis of `id` (see `deterministic_id`).
-    /// `None` for a repo registered with no commits (id fell back to the path).
     pub root_commit_sha: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
-/// Registry of registered repositories.
-///
-/// **No caller can skip the event.** [`Self::register`] and [`Self::unregister`]
-/// are the ONLY reachable mutators: the raw row writes ([`Self::upsert_row`] /
-/// [`Self::delete_row`]) are private to this module, so nothing anywhere in the
-/// crate can change the registry without the paired `Repository{Added,Removed}`
-/// emit being attempted. That is deliberate and load-bearing, not stylistic:
-/// those events are what maintain the durable `repo_names` projection and what
-/// the frontend's SSE arm listens on to reload its repository list. A writer
-/// that omitted them left the row invisible until the user reloaded the page,
-/// which is exactly what the `manage_repositories` agent tool did while it
-/// called the raw writer directly. Moving the emit into the write path is the
-/// fix; adding it per call site was not, because the next call site forgets.
-///
-/// The guarantee is about *reachability*, not atomicity: the row commits in its
-/// own transaction and the emit follows through `emit_or_log`, the same
-/// fire-and-forget contract every `SystemEvent` emitter in the engine uses. A
-/// transient failure inside `emit` is therefore logged, not propagated, and
-/// costs one live refresh. Nothing durable is lost: while a repo exists its
-/// name resolves from the `repositories` row itself (`repo_name_expr` reads
-/// `COALESCE(repositories, repo_names)`), and the next client load refetches
-/// `/api/v1/repositories` outright. Making the two atomic would mean threading
-/// a caller-owned transaction through `EventBus::emit`, which owns its own.
-///
-/// Same shape as `EventStore`, which kept its read facade after its `append*`
-/// write methods moved inside `EventBus` (see `CLAUDE.md` § Core Architectural
-/// Principles).
 pub struct RepositoryStore;
 
-/// What a raw registry row write did, so [`RepositoryStore::register`] knows
-/// what to announce. Private: callers see only the resulting [`Repository`].
 struct UpsertOutcome {
     repo: Repository,
-    /// The row was created, or a user-visible field (name / path / description)
-    /// moved. False for a no-op re-registration.
     changed: bool,
-    /// The id of a row at this path that the write collapsed away, if any.
     collapsed: Option<Uuid>,
 }
 
@@ -89,7 +48,7 @@ impl RepositoryStore {
         .await
     }
 
-    /// Write (or rewrite) a repository row under its deterministic id, and
+    /// INVARIANT: Write (or rewrite) a repository row under its deterministic id, and
     /// report whether anything the outside world can observe actually changed.
     ///
     /// **Private on purpose.** This is the raw row write with no event; going
@@ -126,7 +85,7 @@ impl RepositoryStore {
     ) -> Result<UpsertOutcome, sqlx::Error> {
         let id = deterministic_id(root_commit_sha, path);
         let mut tx = pool.begin().await?;
-        // Serialize concurrent registrations of the SAME path. The collapse
+        // INVARIANT: Serialize concurrent registrations of the SAME path. The collapse
         // below is keyed on the deterministic `id`, but `path` carries its own
         // UNIQUE constraint that the id arbiter does not cover. Two concurrent
         // registrations that derive DIFFERENT ids for one path race between the
@@ -140,18 +99,11 @@ impl RepositoryStore {
             .bind(path)
             .execute(&mut *tx)
             .await?;
-        // Read the pre-existing row inside the same tx so the change check below
-        // sees the state the upsert is about to replace, with no window for a
-        // concurrent writer between the two (the advisory lock above already
-        // serializes same-path registrations).
         let prior: Option<(String, String, Option<String>)> =
             sqlx::query_as("SELECT name, path, description FROM repositories WHERE id = $1")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        // `path` is UNIQUE, so this removes at most one row. Capture its id:
-        // that repository just stopped existing under that identity, and
-        // `register` announces it so no registry mutation goes unheard.
         let collapsed: Option<Uuid> = sqlx::query_scalar(
             "DELETE FROM repositories WHERE path = $1 AND id <> $2 RETURNING id",
         )
@@ -177,7 +129,7 @@ impl RepositoryStore {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        // Compare against the RETURNING row, not the inputs: the description
+        // INVARIANT: Compare against the RETURNING row, not the inputs: the description
         // COALESCE keeps the stored value when the caller passes None, so the
         // returned row is the only honest picture of the post-write state.
         let changed = prior.is_none_or(|(name, path, description)| {
@@ -195,7 +147,7 @@ impl RepositoryStore {
         })
     }
 
-    /// Register (or re-register) a repository under its deterministic id, and
+    /// INVARIANT: Register (or re-register) a repository under its deterministic id, and
     /// announce it. The ONLY way to add a repository: see the type-level doc
     /// for why the emit is not the caller's choice.
     ///
@@ -272,7 +224,6 @@ impl RepositoryStore {
         .await
     }
 
-    /// Resolve a repository by UUID or case-insensitive name.
     pub async fn resolve(
         pool: &PgPool,
         id_or_name: &str,
@@ -286,11 +237,6 @@ impl RepositoryStore {
         Self::get_by_name(pool, id_or_name).await
     }
 
-    /// Delete a repository row. **Private on purpose**, same as
-    /// [`Self::upsert_row`]: [`Self::unregister`] is the reachable mutator, and
-    /// it emits.
-    /// Returns the deleted row's name, path and description, which the
-    /// announcement records so Undo can re-register it.
     async fn delete_row(
         pool: &PgPool,
         id: Uuid,
@@ -301,7 +247,7 @@ impl RepositoryStore {
             .await
     }
 
-    /// Unregister a repository and announce it. The ONLY way to remove one.
+    /// INVARIANT: Unregister a repository and announce it. The ONLY way to remove one.
     ///
     /// `RepositoryRemoved` fires only when a row was actually deleted, so a
     /// repeated or racing delete announces once. The `repo_names` projection
@@ -347,7 +293,6 @@ mod tests {
 
     #[test]
     fn deterministic_id_same_root_commit_ignores_path() {
-        // Same git history at two different paths → one identity (move/clone safe).
         let a = deterministic_id(Some("0123abc"), "/Users/me/projects/lucidos");
         let b = deterministic_id(Some("0123abc"), "/Users/me/IdeaProjects/lucidos");
         assert_eq!(a, b);
@@ -374,15 +319,9 @@ mod tests {
             deterministic_id(None, "/path/two"),
             "different path → different id"
         );
-        // An empty/whitespace SHA is treated as "no commit" → path fallback.
         assert_eq!(deterministic_id(Some("   "), "/path/one"), a);
     }
 
-    /// The load-bearing guarantee: a registry write and its announcement are one
-    /// operation. A creation, a rename, and a path move each emit; a no-op
-    /// re-registration does not, so the engine's every-boot re-register of the
-    /// Lucidos source repo cannot spam the log or re-fire `RepositoryAdded`
-    /// triggers on a plain restart.
     #[tokio::test]
     async fn register_emits_on_create_and_change_but_not_on_a_no_op() {
         let (pool, db) = setup_test_db().await;
@@ -420,9 +359,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A description that only fills in (COALESCE keeps the stored value when
-    /// the caller passes None) still counts as a change the first time and a
-    /// no-op after, so the check reads the post-write row rather than the args.
     #[tokio::test]
     async fn register_change_check_reads_the_written_row_not_the_arguments() {
         let (pool, db) = setup_test_db().await;
@@ -442,8 +378,6 @@ mod tests {
         .unwrap();
         assert_eq!(emitted(&pool, "RepositoryAdded").await, 1);
 
-        // Passing None must not wipe the stored description, and must not read
-        // as a change just because the argument differs from the stored value.
         let repo =
             RepositoryStore::register(&pool, &bus, "Example", "/tmp/x", None, Some(sha), None)
                 .await
@@ -458,8 +392,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Removal announces exactly once: a repeated delete finds no row and stays
-    /// silent, so a racing double-remove cannot emit twice.
     #[tokio::test]
     async fn unregister_emits_once_and_is_silent_when_nothing_was_removed() {
         let (pool, db) = setup_test_db().await;
@@ -503,7 +435,6 @@ mod tests {
         assert_eq!(r1.id, deterministic_id(Some(sha), "/tmp/repo-a"));
         assert_eq!(r1.root_commit_sha.as_deref(), Some(sha));
 
-        // Remove + re-add (even renamed) yields the SAME id — never re-orphans.
         RepositoryStore::unregister(&pool, &bus, r1.id, None)
             .await
             .unwrap();
@@ -520,7 +451,6 @@ mod tests {
     async fn register_rewrites_legacy_random_id_at_same_path() {
         let (pool, db) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
-        // Legacy state: a random-id row already occupies the path.
         let legacy = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO repositories (id, name, path) VALUES ($1, 'Lucidos', '/tmp/lucidos')",
@@ -557,9 +487,6 @@ mod tests {
             1,
             "the id rewrite is a change consumers must see"
         );
-        // The collapsed legacy row left the registry, so it is announced too.
-        // Without this a consumer tracking the old id would keep pointing at a
-        // row that silently vanished.
         let removed: Vec<String> = sqlx::query_scalar(
             "SELECT payload->'data'->>'repo_id' FROM events WHERE event_type = 'RepositoryRemoved'",
         )
@@ -571,10 +498,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A repo registered before its first commit takes a path-derived id; once
-    /// it has a root commit the id changes, so the old identity is collapsed
-    /// away. Both halves are announced: Removed for the id that is gone, Added
-    /// for the one that replaced it.
     #[tokio::test]
     async fn register_announces_both_halves_when_the_id_changes_at_one_path() {
         let (pool, db) = setup_test_db().await;
@@ -608,7 +531,6 @@ mod tests {
         let a = RepositoryStore::register(&pool, &bus, "R", "/tmp/old", None, Some(sha), None)
             .await
             .unwrap();
-        // Same history re-registered at a new path → same id, single row, path moved.
         let b = RepositoryStore::register(&pool, &bus, "R", "/tmp/new", None, Some(sha), None)
             .await
             .unwrap();
@@ -623,17 +545,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Regression: concurrent registrations of the SAME path that derive
-    /// DIFFERENT deterministic ids (one resolves a root-commit sha, the
-    /// other falls back to the path id when `root_commit_sha` transiently
-    /// returns None under concurrent git load) must converge to a single
-    /// row, not collide on the `path` UNIQUE constraint and surface a
-    /// spurious 409. Reproduces the e2e api `repo_files_test` flake where
-    /// ~12 parallel tests register the e2e workspace path at once.
-    ///
-    /// Drives the raw writer directly: the subject is the SQL collapse, and
-    /// keeping 24 concurrent EventBus emits out of it keeps the failure
-    /// attributable to the constraint rather than to bus contention.
     #[tokio::test]
     async fn upsert_row_is_concurrency_safe_for_same_path_with_divergent_ids() {
         let (pool, db) = setup_test_db().await;
@@ -643,8 +554,6 @@ mod tests {
         for i in 0..24 {
             let pool = pool.clone();
             handles.push(tokio::spawn(async move {
-                // Alternate between a stable sha-derived id and the path-fallback
-                // id so the two id families compete for the same `path`.
                 let sha = if i % 2 == 0 { Some("cafef00d") } else { None };
                 RepositoryStore::upsert_row(&pool, &format!("name-{i}"), path, None, sha).await
             }));

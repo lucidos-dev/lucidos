@@ -1,12 +1,3 @@
-//! The chat agentic loop, split into the driver and its free helpers.
-//!
-//! - [`run`] holds `run_agentic_loop`, the cohesive loop driver.
-//! - [`helpers`] holds the free helper functions / small types it uses.
-//!
-//! Helpers are re-exported here so existing `agentic_loop::X` callers (and the
-//! `super::X` references in the special-tool and test sibling modules) keep
-//! resolving unchanged.
-
 mod helpers;
 pub(crate) mod run;
 
@@ -18,7 +9,6 @@ mod special_tool;
 #[cfg(test)]
 use crate::engine::agentic_loop::special_tool::SpecialToolDispatchExt;
 
-// The chat route tests resolve a child's route the way `run_thread` does.
 #[cfg(test)]
 pub(crate) use special_tool::sub_thread_route_overrides;
 

@@ -1,7 +1,3 @@
-//! What a thread holds unsent, as the `threads` tool, the CLI and scripts read
-//! it: the `drafts` read, the reader fields on `list`, the draft filters, and
-//! draft text in search.
-
 use super::super::*;
 use super::test_helpers::*;
 use crate::core::store::EventStore;
@@ -9,9 +5,6 @@ use crate::engine::thread_lifecycle::ChangeStateKind;
 
 const WS: &str = "myws";
 
-/// Insert a thread holding `text` and `images` as its draft. `edited_minutes_ago`
-/// stamps `compose_updated_at`; `None` leaves it unknown, as on a draft written
-/// before the column existed.
 async fn insert_draft_thread(
     pool: &PgPool,
     title: &str,
@@ -90,8 +83,6 @@ fn a_draft_is_any_text_or_any_image() {
     assert!(has_draft("", &serde_json::json!(["a".repeat(64)])));
 }
 
-/// The read the agent was missing: one call names every draft and its owning
-/// thread, and nothing without a draft rides along.
 #[tokio::test]
 async fn drafts_lists_every_draft_and_no_empty_one() {
     let (pool, db) = setup_test_db().await;
@@ -147,7 +138,6 @@ async fn drafts_lists_every_draft_and_no_empty_one() {
     teardown_test_db(&db).await;
 }
 
-/// A draft longer than the preview is still readable whole, by thread id.
 #[tokio::test]
 async fn one_draft_by_id_carries_its_whole_text() {
     let (pool, db) = setup_test_db().await;
@@ -168,8 +158,6 @@ async fn one_draft_by_id_carries_its_whole_text() {
     assert_eq!(one.text.as_deref(), Some(long.as_str()));
     let detail = serde_json::to_value(&one).expect("serialize detail");
     assert_eq!(detail["snapshot"]["text"], long);
-    // A newly inserted projection starts at revision zero. Preserve that
-    // token too; a reader must not invent its own revision.
     assert_eq!(detail["snapshot"]["draft_revision"], 0);
     assert_eq!(detail["snapshot"]["compose_epoch"], 0);
     assert_eq!(detail["snapshot"]["image_hashes"], serde_json::json!([]));
@@ -186,8 +174,6 @@ async fn one_draft_by_id_carries_its_whole_text() {
     teardown_test_db(&db).await;
 }
 
-/// A revision names the whole compose report, including image-only drafts and
-/// selection-only edits. The read must not assemble it from separate queries.
 #[tokio::test]
 async fn draft_snapshot_tracks_ordered_images_and_selection_edits() {
     let (pool, db) = setup_test_db().await;
@@ -220,8 +206,6 @@ async fn draft_snapshot_tracks_ordered_images_and_selection_edits() {
     teardown_test_db(&db).await;
 }
 
-/// I7: the draft revision an agent sends by moves only with the saved draft.
-/// Activity and a new title move `summary_version` and must leave it alone.
 #[tokio::test]
 async fn the_draft_revision_moves_only_with_the_draft() {
     let (pool, db) = setup_test_db().await;
@@ -257,8 +241,6 @@ async fn the_draft_revision_moves_only_with_the_draft() {
     teardown_test_db(&db).await;
 }
 
-/// A workspace reads its own drafts, never another's. Each workspace is its
-/// own database, which is what the two pools stand in for.
 #[tokio::test]
 async fn a_workspace_reads_only_its_own_drafts() {
     let (pool_a, db_a) = setup_test_db().await;
@@ -282,8 +264,6 @@ async fn a_workspace_reads_only_its_own_drafts() {
     teardown_test_db(&db_b).await;
 }
 
-/// One `list` call maps every thread to its draft, and the draft filter keeps
-/// the count in step with the rows.
 #[tokio::test]
 async fn list_rows_carry_the_draft_and_the_filter_selects_on_it() {
     let (pool, db) = setup_test_db().await;
@@ -323,7 +303,6 @@ async fn list_rows_carry_the_draft_and_the_filter_selects_on_it() {
     teardown_test_db(&db).await;
 }
 
-/// Each change state selects exactly its own thread, and the count agrees.
 #[tokio::test]
 async fn the_change_state_filter_selects_on_the_projected_state() {
     use crate::engine::thread_lifecycle::CodingAgentChangeState;
@@ -371,7 +350,6 @@ async fn the_change_state_filter_selects_on_the_projected_state() {
     teardown_test_db(&db).await;
 }
 
-/// A phrase from a draft finds its thread, though no message ever said it.
 #[tokio::test]
 async fn search_finds_a_thread_by_its_draft() {
     let (pool, db) = setup_test_db().await;

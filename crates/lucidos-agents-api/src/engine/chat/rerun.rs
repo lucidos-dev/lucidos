@@ -17,14 +17,9 @@ use crate::scheduler::user_tasks::{
     TriggerRunGrants,
 };
 
-/// Caps for the engine system note's bullet list.
 const MAX_BULLET_ENTRIES: usize = 50;
-/// Byte cap for bullet-field truncation; `floor_char_boundary` rounds the
-/// cut down to the nearest UTF-8 char boundary.
 const MAX_FIELD_BYTES: usize = 200;
 
-/// What the resumed run says to the model, after the owner allowed the grant
-/// its blocked command needed.
 const ALLOWED_RUN_NOTE: &str = "[Engine note] The owner allowed what the blocked command \
     needed. Run it again and carry on.";
 
@@ -50,9 +45,6 @@ async fn abort_resumed_by_unclaimed_boundary(
 
 #[easy_ext::ext(RerunExt)]
 pub(crate) impl LucidosEngine {
-    /// Resume a chat or trigger thread on the user's behalf: a trigger run
-    /// parked on a card the owner granted, else an aborted turn. `grants` hold
-    /// for that one trigger run. See module-level docs for the abort sequence.
     async fn continue_chat(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -71,7 +63,6 @@ pub(crate) impl LucidosEngine {
         {
             return Ok(self.resume_allowed_run(thread_id, turn, grants).await);
         }
-        // Find the most recent ResponseAborted for this thread.
         let abort_row: Option<(Uuid, Option<Uuid>, Option<String>)> = sqlx::query_as(
             "SELECT id, \
                     NULLIF(payload->>'request_event_id','')::uuid AS request_event_id, \
@@ -104,12 +95,6 @@ pub(crate) impl LucidosEngine {
             return Ok(ContinueChatOutcome::AlreadyResumed);
         }
 
-        // Resolve the originating event. Prefer `request_event_id` stamped on
-        // the ResponseAborted (set by the engine-restart paths). Fall back to
-        // the most recent originating event before the abort for legacy DB
-        // rows that lack the field. Uses `CHAT_ORIGINATING_EVENT_TYPES` so a
-        // chat-agent turn woken from a finished child resolves to the CTC,
-        // not a stale older MR from a previous completed turn.
         let originating_event_id = match abort_request_event_id {
             Some(id) => Some(id),
             None => {
@@ -140,10 +125,6 @@ pub(crate) impl LucidosEngine {
         let summary = build_side_effect_summary(&between_events);
         let engine_note = build_engine_note(&summary);
 
-        // Which channel the resumed turn is emitted on. The abort's own channel
-        // wins when it has one; otherwise fall back to the thread's recorded
-        // `source` — see `resolve_resume_channel` for why the bare `Chat` default
-        // was wrong for trigger threads.
         let thread_source: Option<String> = sqlx::query_scalar::<_, String>(
             "SELECT source FROM thread_summaries WHERE thread_id = $1",
         )
@@ -153,10 +134,6 @@ pub(crate) impl LucidosEngine {
         let resume_channel =
             resolve_resume_channel(abort_channel.as_deref(), thread_source.as_deref());
 
-        // A genuine interruption the user asked to revive → the resume gets its
-        // own boundary + the side-effect reminder. The anchor carries the
-        // interrupted turn so the resume can also recover whatever the user
-        // queued behind it, and the abort so only one resume claims it.
         let claim = self
             .spawn_chat_resume(
                 thread_id,
@@ -183,10 +160,6 @@ pub(crate) impl LucidosEngine {
         })
     }
 
-    /// Carry on the parked turn of a trigger run, as a run of the trigger that
-    /// owns the thread. A thread whose trigger is gone has nothing to resume.
-    /// The fire recorded a failed `TriggerExecuted` when it parked, so the
-    /// resumed run records its real outcome once it ends, unless it parks again.
     async fn resume_allowed_run(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -217,31 +190,6 @@ pub(crate) impl LucidosEngine {
         ContinueChatOutcome::Resumed
     }
 
-    /// Re-enter the agentic loop with `engine_note` as the current turn, anchored
-    /// per `anchor` (see [`ChatResumeAnchor`] — a new `ContinuationStarted`
-    /// boundary for the manual Continue, or the interrupted turn's own
-    /// `request_event_id` for an answer-driven resume).
-    /// Shared by the manual-Continue path ([`continue_chat`], which computes the
-    /// note from the aborted run's side effects) AND the question answer-resume
-    /// path ([`crate::engine::agent_question::resume_chat_after_answer`], which
-    /// re-runs a chat thread whose question was answered with no live loop after
-    /// a restart — the chat parity of CC's `--resume`). One re-entry site so the
-    /// two paths can't drift on how a chat continuation is spawned.
-    ///
-    /// Returns the anchor claim. Its event id is the `pre_emitted_origin` every
-    /// resulting event is stamped with. The frontend groups them by it into the
-    /// resume exchange (or, for `ExistingTurn`, back into the turn that was
-    /// interrupted). A lost claim spawns nothing.
-    ///
-    /// Returns a boxed `dyn Future` rather than being a plain `async fn` on
-    /// purpose: this method is reachable from `process_message_with_steps` (the
-    /// chat FreeText answer path → `answer_pending_question` →
-    /// `resume_chat_after_answer` → here), and it in turn spawns a fresh
-    /// `process_message_with_steps` turn — a mutual async recursion whose opaque
-    /// return types would form an infinite cycle (`E0391`) and whose `Send`
-    /// inference would loop. The concrete boxed return type is the type-erasure
-    /// boundary that terminates both: callers await a `dyn Future + Send`, not an
-    /// opaque type that transitively contains itself.
     fn spawn_chat_resume(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -252,7 +200,7 @@ pub(crate) impl LucidosEngine {
     ) -> ChatResumeFuture {
         let engine = self.clone_arc();
         Box::pin(async move {
-            // Sampled BEFORE the anchor emit, which is this reader's fence: a
+            // INVARIANT: Sampled BEFORE the anchor emit, which is this reader's fence: a
             // message landing after it finds no live handle and gets a turn of
             // its own from the chat API. See `queued_recovery`.
             let window_end = super::queued_recovery::window_end_sequence(engine.pool(), thread_id)
@@ -295,18 +243,9 @@ pub(crate) impl LucidosEngine {
             )
             .await;
 
-            // The engine note itself is the user prompt to the LLM (the original
-            // prompt is in the thread history). `pre_emitted_origin =
-            // Some(anchor_event_id)` skips a fresh MessageReceived emit and
-            // stamps every resulting event with `request_event_id =
-            // anchor_event_id` — the frontend uses this to gather them into the
-            // resume exchange (or back into the interrupted turn's own exchange).
             let loop_engine = engine.clone();
             let prompt_for_llm =
                 prompt_with_recovered_messages(engine_note, recovered.as_ref().map(|r| &*r.text));
-            // The recovered messages' own attachments. An image-only follow-up
-            // says nothing without them, and the live orphan path carries them
-            // the same way.
             let recovered_images = recovered.and_then(|r| r.images);
             tokio::spawn(async move {
                 if let Err(e) = loop_engine
@@ -316,7 +255,7 @@ pub(crate) impl LucidosEngine {
                         None,
                         None,
                         None,
-                        None, // provider_override
+                        None,
                         recovered_images.as_deref(),
                         None,
                         None,
@@ -349,29 +288,18 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The three engine handles the recovery reads and writes through.
-///
-/// Grouped so [`ingest_queued_messages_for_resume`] stays a free function: a
-/// test drives it with a bare `EventBus` and a temp directory, which is what
-/// makes the emitted-event surface checkable without a live agentic loop.
 pub(crate) struct ResumeStores<'a> {
     pub(crate) bus: &'a EventBus,
     pub(crate) pool: &'a sqlx::PgPool,
     pub(crate) workspace: &'a std::path::Path,
 }
 
-/// What the resume recovered: the follow-ups' coalesced text, and the bytes
-/// they were sent with.
-///
-/// Both halves travel, because a message is not its text alone. An image-only
-/// follow-up carries nothing else, and the live injection path hands the model
-/// the bytes (`coalesced_images_for_reprocess`).
 pub(crate) struct RecoveredMessages {
     pub(crate) text: String,
     pub(crate) images: Option<Vec<crate::engine::types::ChatImage>>,
 }
 
-/// Announce every queued follow-up this resume still owes an answer for, and
+/// INVARIANT: Announce every queued follow-up this resume still owes an answer for, and
 /// return what the resumed turn should carry.
 ///
 /// The announcement is a `PromptInjected` per message, awaited before the
@@ -500,16 +428,11 @@ async fn events_between(
     .await
 }
 
-/// One row of the interrupted turn: event id, event type, payload.
 type BetweenEvent = (Uuid, String, serde_json::Value);
 
-/// Format the side-effect summary for the engine note.
-/// Returns either a non-empty markdown bullet list or an explanatory line.
 fn build_side_effect_summary(events: &[BetweenEvent]) -> String {
-    // Pair ToolCalled + ToolResult by walking forward; the ToolResult event
-    // for a call may follow immediately or after ThoughtStreamed/TextStreamed events.
     let mut summary_lines: Vec<String> = Vec::new();
-    let mut pending_calls: Vec<(Uuid, String, String)> = Vec::new(); // (event id, tool_name, args_summary)
+    let mut pending_calls: Vec<(Uuid, String, String)> = Vec::new();
 
     for (event_id, event_type, payload) in events {
         match event_type.as_str() {
@@ -538,8 +461,6 @@ fn build_side_effect_summary(events: &[BetweenEvent]) -> String {
                     .unwrap_or("(no result)")
                     .to_string();
                 let result_summary = truncate_for_note(&result_text);
-                // A parallel run answers in completion order, so a result
-                // names its call. A legacy row pairs with the newest call.
                 let answered = match crate::core::store::tool_called_event_id_of(payload) {
                     Some(call_id) => pending_calls
                         .iter()
@@ -558,7 +479,7 @@ fn build_side_effect_summary(events: &[BetweenEvent]) -> String {
                     }
                 }
             }
-            _ => {} // ThoughtStreamed + TextStreamed don't appear in the LLM-visible summary
+            _ => {}
         }
     }
 
@@ -603,22 +524,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The restart teardown stamps `channel: None` on every chat AND trigger
-    /// abort (it only sets `Some(ClaudeCode)` to mark the coding-agent bucket),
-    /// so the `source` fallback is what a switch-interrupted thread actually
-    /// resolves through. Getting it wrong is not cosmetic: the
-    /// `ContinuationStarted` projection arm writes `source = <channel>`, so a
-    /// bare `Chat` default rewrites a trigger thread's `source` to `chat`.
     #[test]
     fn resume_channel_prefers_the_abort_then_the_thread_source() {
-        // Abort carries a channel → it wins outright.
         assert_eq!(
             resolve_resume_channel(Some("claude_code"), Some("chat")),
             EventChannel::ClaudeCode
         );
 
-        // Channel-less teardown abort → derive from the thread's source, so a
-        // trigger thread resumes as Trigger and keeps its identity.
         assert_eq!(
             resolve_resume_channel(None, Some("trigger")),
             EventChannel::Trigger
@@ -627,13 +539,11 @@ mod tests {
             resolve_resume_channel(None, Some("chat")),
             EventChannel::Chat
         );
-        // Legacy source spelling still resolves via the shared wire decoder.
         assert_eq!(
             resolve_resume_channel(None, Some("scheduled_trigger")),
             EventChannel::Trigger
         );
 
-        // Nothing usable → the historical Chat default, never a panic.
         assert_eq!(resolve_resume_channel(None, None), EventChannel::Chat);
         assert_eq!(
             resolve_resume_channel(Some("from_the_future"), Some("also_unknown")),
@@ -663,8 +573,6 @@ mod tests {
         );
     }
 
-    /// A parallel run answers in completion order. Pairing each result with
-    /// the newest pending call would put the wrong call beside it.
     #[test]
     fn summary_pairs_results_by_call_id_in_any_order() {
         let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
@@ -753,7 +661,6 @@ mod tests {
         ];
         let s = build_side_effect_summary(&events);
         assert!(s.contains("..."), "expected ellipsis on truncation: {}", s);
-        // Args + result both capped at 200 bytes (truncate_for_note's contract).
         for line in s.lines() {
             for field in line.split("→") {
                 assert!(
@@ -803,12 +710,6 @@ mod tests {
         assert!(note.contains("Engine performed no automatic skipping"));
     }
 
-    /// The Continue note's window is the abort's `request_event_id`, so a
-    /// mis-anchored abort silently empties it. Seeded as the reported shape: a
-    /// turn that ran a tool, a follow-up the user queued mid-turn, then the
-    /// restart teardown. Anchored on the turn, the note names the tool call;
-    /// anchored on the queued follow-up, the window holds nothing and the
-    /// resumed agent is told no actions completed, so it redoes the work.
     #[tokio::test]
     async fn continue_note_window_covers_the_interrupted_turn() {
         use crate::engine::event_bus::{BusEvent, EventBus};

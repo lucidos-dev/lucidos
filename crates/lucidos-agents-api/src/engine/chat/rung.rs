@@ -1,5 +1,3 @@
-//! Durable next-turn rung picks and fixed live-turn settings (ADR 0544).
-
 use uuid::Uuid;
 
 use crate::core::ResolvedModelSelection;
@@ -8,7 +6,6 @@ use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, Threa
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::turn_start_gate::TurnStartGate;
 
-/// What such a refusal says to the person.
 pub(crate) const TURN_RUNNING_MESSAGE: &str =
     "The model and effort stay fixed while a turn runs. Pick again when it ends.";
 
@@ -19,7 +16,6 @@ pub(crate) fn turn_open(status: ThreadStatus) -> bool {
     )
 }
 
-/// The thread's projected status. A thread with no row reads as idle.
 async fn thread_status(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<ThreadStatus, sqlx::Error> {
     let status: Option<String> =
         sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
@@ -29,16 +25,11 @@ async fn thread_status(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<ThreadSta
     Ok(ThreadStatus::parse(status.as_deref().unwrap_or_default()))
 }
 
-/// What [`LucidosEngine::record_chat_settings`] did with a pick.
-///
-/// [`LucidosEngine::record_chat_settings`]: crate::engine::LucidosEngine::record_chat_settings
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatSettingsOutcome {
-    /// Recorded. The thread's next turn runs on it.
     Recorded,
 }
 
-/// Record a resolved next-turn pick, ordered against turn admission.
 async fn record_pick(
     bus: &EventBus,
     gate: &TurnStartGate,
@@ -70,8 +61,6 @@ async fn record_pick(
     Ok(ChatSettingsOutcome::Recorded)
 }
 
-/// Applied turn stamps survive reload and continuations. Older turns fall
-/// back to their latest non-injected starter.
 async fn live_pair(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -120,12 +109,10 @@ async fn running_turn_overrides(
 
 #[easy_ext::ext(RungExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Whether a turn runs or is starting on a Lucidos Agent thread.
     async fn chat_turn_runs(&self, thread_id: Uuid) -> Result<bool, sqlx::Error> {
         turn_runs(self.pool(), &self.turn_start_gate, thread_id).await
     }
 
-    /// See [`running_turn_overrides`].
     async fn running_turn_overrides(
         &self,
         thread_id: Uuid,
@@ -133,8 +120,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         running_turn_overrides(self.pool(), &self.turn_start_gate, thread_id).await
     }
 
-    /// Record a person's rung pick on a Lucidos Agent thread. It records the
-    /// pair a turn resolves from the pick, so the stamp names what runs next.
     async fn record_chat_settings(
         &self,
         thread_id: Uuid,
@@ -153,8 +138,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         .await
     }
 
-    /// The pair a turn on this thread answers with, given what a caller asked
-    /// for. Resolved exactly as the turn resolves it.
     async fn resolve_chat_pair(
         &self,
         thread_id: Uuid,
@@ -171,12 +154,11 @@ pub(crate) impl crate::engine::LucidosEngine {
         .await
     }
 
-    /// Read the applied pair, excluding pending picks and injected messages.
     async fn live_chat_pair(&self, thread_id: Uuid) -> Result<ResolvedModelSelection, sqlx::Error> {
         live_pair(self.pool(), thread_id).await
     }
 
-    /// Whether a message for a running turn names a pair other than the one
+    /// INVARIANT: Whether a message for a running turn names a pair other than the one
     /// that turn answers with. The caller refuses such a message before it
     /// records anything, so its override is never dropped silently.
     async fn mid_turn_override_differs(

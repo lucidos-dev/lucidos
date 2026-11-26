@@ -1,13 +1,3 @@
-//! `GET /api/v1/fonts` and `GET /api/v1/fonts/<file>`: the font catalog, and
-//! the vendored fonts served to app iframes by the local engine rather than
-//! fetched from Google.
-//!
-//! Unit tests in `core/fonts.rs` and `api/fonts.rs` cover the embedded bytes and
-//! the stylesheet text. Only a booted engine can show that the two are actually
-//! ROUTED. It also shows that the stylesheet's relative `url()` resolves to the
-//! sibling that serves the font. A missing route fails silently in the browser: the `<link>`
-//! 404s and every app quietly renders in system mono.
-
 use crate::support::{base_url, http_client};
 
 #[tokio::test]
@@ -31,9 +21,6 @@ async fn fira_code_stylesheet_points_at_a_font_that_is_really_there() {
     let css = resp.text().await.expect("stylesheet body");
     assert!(css.contains("@font-face"), "got:\n{css}");
 
-    // Resolve the src the way a browser does: relative to the stylesheet's own
-    // URL. That is what makes this work under a gateway prefix, and following it
-    // for real is the only way to prove the two routes agree.
     let src = css
         .split("url('")
         .nth(1)
@@ -57,8 +44,6 @@ async fn fira_code_stylesheet_points_at_a_font_that_is_really_there() {
         Some("font/woff2")
     );
 
-    // Length first: an empty body would make the magic-number slice below panic
-    // on an index rather than say what was wrong.
     let bytes = resp.bytes().await.expect("font body");
     assert!(
         bytes.len() > 50_000,
@@ -68,8 +53,6 @@ async fn fira_code_stylesheet_points_at_a_font_that_is_really_there() {
     assert_eq!(&bytes[..4], b"wOF2", "not a woff2 payload");
 }
 
-/// Every font the catalog calls vendored has a stylesheet, and every `url()`
-/// in it resolves to a woff2 the engine serves.
 #[tokio::test]
 async fn every_vendored_font_in_the_catalog_is_routed() {
     let client = http_client();
@@ -121,9 +104,6 @@ fn allow_origin(resp: &reqwest::Response) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
-/// An app frame's origin is `null`, and a font fetch is CORS-mode. Without the
-/// header Chromium refuses the woff2 and every app renders in system mono. The
-/// request carries what the browser's does, so the same-origin gate sees it too.
 #[tokio::test]
 async fn an_app_frame_may_read_fira_code_across_its_opaque_origin() {
     let client = http_client();
@@ -154,8 +134,6 @@ async fn an_app_frame_may_read_fira_code_across_its_opaque_origin() {
     }
 }
 
-/// The grant is the fonts' alone. `sdk.js` loads as a no-cors tag and needs
-/// none, and the API proper must never offer a cross-origin read.
 #[tokio::test]
 async fn no_other_api_route_offers_a_cross_origin_read() {
     let client = http_client();

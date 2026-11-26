@@ -1,10 +1,3 @@
-//! `POST /api/v1/threads/:thread_id/submit-draft`: an agent sends the owner's
-//! saved draft exactly as saved (ADR 0651). The body names a revision, never
-//! content. The answer is 202 with the receipt: accepted, not yet run.
-//!
-//! Only an agent inside a thread may call it. The engine resolves the owner's
-//! authority itself: a standing instruction or a live Allow once card.
-
 use crate::engine::draft_submission::DraftSubmissionExt;
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
@@ -20,13 +13,11 @@ use crate::core::draft_submission::{DraftSubmissionReceipt, SubmitDraftRequest};
 use crate::core::subprocess_origin::SubprocessOrigin;
 use crate::engine::draft_submission::{refusal_report, RefusalAudience};
 
-/// Unknown fields fail closed, so no caller can add text, images or settings.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct SubmitDraftBody {
     expected_revision: i64,
     expected_epoch: i64,
-    /// Names this send. Omitted, the engine mints one and the receipt echoes it.
     #[serde(default)]
     retry_key: Option<Uuid>,
 }
@@ -60,9 +51,6 @@ pub(in crate::api) async fn submit_draft(
     }
 }
 
-/// A chat agent and a coding agent reach this route alike, through the CLI.
-/// Each refusal names a next step the caller's own kind of thread has. A
-/// failed lookup keeps the refusal and names the step every agent has.
 async fn refusal_audience(pool: &sqlx::PgPool, caller: Uuid) -> RefusalAudience {
     let coding: Result<Option<bool>, _> =
         sqlx::query_scalar("SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1")
@@ -79,8 +67,6 @@ async fn refusal_audience(pool: &sqlx::PgPool, caller: Uuid) -> RefusalAudience 
     }
 }
 
-/// The calling agent's thread, as its origin token's MAC proves it. A device,
-/// the local token and a threadless subprocess are refused.
 fn submitting_agent(headers: &HeaderMap) -> Result<Uuid, ApiError> {
     match crate::core::subprocess_origin::subprocess_origin(headers) {
         SubprocessOrigin::Subprocess {

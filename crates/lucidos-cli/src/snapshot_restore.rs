@@ -1,4 +1,3 @@
-//! Agent restore admission: prove the issuing workspace before gateway routing.
 use crate::workspace::BoxError;
 use serde_json::{json, Value};
 
@@ -45,8 +44,6 @@ pub(super) fn run(
 ) -> Result<u8, BoxError> {
     validate_target(target, expected)?;
     let path = format!("{}/restore", super::handle_path(handle)?);
-    // No owner-device impersonation: a terminal without an issuing thread must
-    // use the owner UI. The source engine verifies the opaque origin credential.
     let thread = std::env::var("LUCIDOS_THREAD_ID")
         .map_err(|_| "snapshot_restore_caller_unverified")?
         .parse::<uuid::Uuid>()?;
@@ -56,7 +53,6 @@ pub(super) fn run(
     let engine = crate::workspace::resolve_from_env()?.base_url();
     let proof = caller_proof(&client, &engine)?;
     let source = verified_source(&proof, thread, target)?;
-    // Self-restore is refused before even probing a gateway.
     let base = crate::gateway::the_gateway(
         &crate::gateway::client()?,
         port,
@@ -85,10 +81,6 @@ pub(super) fn run(
     Ok(code)
 }
 
-/// Asks this workspace's own engine to vouch for the calling thread.
-///
-/// The client carries the origin token. The engine checks it with its own key,
-/// so the agent needs no socket or local token, which the sandbox denies it.
 fn caller_proof(client: &reqwest::blocking::Client, engine: &str) -> Result<Value, BoxError> {
     let response = client
         .get(format!("{engine}/api/v1/snapshots/restore-caller"))
@@ -379,8 +371,6 @@ mod tests {
                         Err(error) => panic!("accept status request: {error}"),
                     }
                 };
-                // macOS hands the accepted stream the listener's non-blocking
-                // flag, so a request still in flight would read as WouldBlock.
                 stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))

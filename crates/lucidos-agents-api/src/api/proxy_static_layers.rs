@@ -1,4 +1,4 @@
-//! Static credential layers — Bearer / ApiKey / Basic share a single
+//! INVARIANT: Static credential layers — Bearer / ApiKey / Basic share a single
 //! `StaticHeaderLayer` (they differ only in header name + value
 //! formatting, computed at construction time). QueryParam is its own
 //! layer because it injects into the URL and publishes a redacted
@@ -11,14 +11,6 @@ use crate::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, ScopeBinding}
 use async_trait::async_trait;
 use axum::http::{HeaderName, StatusCode};
 
-/// Adds one fixed header to the outgoing request. Bearer / ApiKey / Basic
-/// auth all reduce to "compute the header value once at construction,
-/// emit it on every apply" — see the `bearer`, `api_key`, `basic`
-/// constructors.
-///
-/// Every constructor takes the [`ScopeBinding`] for the value it carries. The
-/// caller has to say where the secret came from, because that is the only
-/// thing the gate can check it against.
 pub struct StaticHeaderLayer {
     namespace: String,
     header_name: HeaderName,
@@ -27,7 +19,6 @@ pub struct StaticHeaderLayer {
 }
 
 impl StaticHeaderLayer {
-    /// `Authorization: Bearer <token>`.
     pub fn bearer(namespace: String, token: String, binding: ScopeBinding) -> Self {
         Self {
             namespace,
@@ -37,8 +28,6 @@ impl StaticHeaderLayer {
         }
     }
 
-    /// Custom header (e.g. `X-API-Key`) with the credential as the bare
-    /// value. `header_name_str` is validated and lowercased by `HeaderName`.
     pub fn api_key(
         namespace: String,
         header_name_str: &str,
@@ -55,7 +44,6 @@ impl StaticHeaderLayer {
         })
     }
 
-    /// `Authorization: Basic base64(user:password)`.
     pub fn basic(namespace: String, username: &str, password: &str, binding: ScopeBinding) -> Self {
         use base64::Engine;
         let encoded =
@@ -204,7 +192,6 @@ mod tests {
         let input = input_for(&body, "https://example.com/x", &prior);
         let m = layer.apply(&input).await.unwrap();
         assert_eq!(m.add_headers[0].0.as_str(), "authorization");
-        // base64("user:pass") = "dXNlcjpwYXNz"
         assert_eq!(m.add_headers[0].1, "Basic dXNlcjpwYXNz");
     }
 
@@ -227,10 +214,6 @@ mod tests {
         assert!(log_url.contains("REDACTED"));
     }
 
-    /// A same-origin redirect whose `Location` echoes the query hands the next
-    /// hop a target URL that already carries the credential. Masking only the
-    /// copy this layer appends left the real one in the line `forward_request`
-    /// writes when that hop fails.
     #[tokio::test]
     async fn a_credential_already_in_the_url_is_masked_rather_than_shadowed() {
         let layer = QueryParamLayer::new(
@@ -254,7 +237,6 @@ mod tests {
             log_url.contains("page=2"),
             "an unrelated parameter survives: {log_url}"
         );
-        // The forwarded request is untouched: only the log line is masked.
         assert_eq!(m.add_query[0], ("api-key".into(), "actual-secret".into()));
     }
 }

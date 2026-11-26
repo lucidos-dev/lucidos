@@ -1,5 +1,6 @@
 import { signal } from '@preact/signals';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
+import { peerClient } from '../../../../packages/lucidos-sdk/src/_peerScope';
 import { withBase, REMOTE_GATEWAY } from '../utils/basePath';
 import { isUnstampedBuildId } from '../utils/buildId';
 import { preferences, showToast } from '../store/store';
@@ -191,16 +192,45 @@ export function reloadForStaleChunk(): boolean {
   return true;
 }
 
-const SW_BUILD_ID_RE = /BUILD_ID\s*=\s*['"]([^'"]+)['"]/;
+const SHELL_BUILD_ID_RE = /<meta\s+name="lucidos-build-id"\s+content="([^"]+)"\s*\/?>/;
+const PEER_FALLBACK_RE = /<meta\s+name="lucidos-peer-client-unavailable"\s/;
+const SHELL_BUILD_ID_SCAN_BYTES = 8 * 1024;
+
+async function readShellBuildId(response: Response): Promise<string | null> {
+  const runningPeerClient = peerClient() !== null;
+  const inspect = (prefix: string): string | null | undefined => runningPeerClient && PEER_FALLBACK_RE.test(prefix)
+    ? null
+    : SHELL_BUILD_ID_RE.exec(prefix)?.[1];
+  if (!response.body) {
+    return inspect((await response.text()).slice(0, SHELL_BUILD_ID_SCAN_BYTES)) ?? null;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let remaining = SHELL_BUILD_ID_SCAN_BYTES;
+  let prefix = '';
+  try {
+    while (remaining > 0) {
+      const { done, value } = await reader.read();
+      if (done) return null;
+      const chunk = value.subarray(0, remaining);
+      remaining -= chunk.byteLength;
+      prefix += decoder.decode(chunk, { stream: true });
+      const id = inspect(prefix);
+      if (id !== undefined) return id;
+    }
+    return null;
+  } finally {
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
 
 export async function getServedBuildId(): Promise<string | null> {
-  if (typeof navigator === 'undefined' || (REMOTE_GATEWAY === null && !('serviceWorker' in navigator))) return null;
   try {
-    const resp = await fetch(REMOTE_GATEWAY === null ? withBase('/sw.js') : '/~/sw.js', { cache: 'no-store' });
-    if (!resp.ok) return null;
-    const id = SW_BUILD_ID_RE.exec(await resp.text())?.[1];
-    if (!id || isUnstampedBuildId(id)) return null;
-    return id;
+    const response = await fetch(withBase('/'), { cache: 'no-store', headers: { Accept: 'text/html' } });
+    if (!response.ok || response.headers.has('x-lucidos-pairing')) return null;
+    const id = await readShellBuildId(response);
+    return id && !isUnstampedBuildId(id) ? id : null;
   } catch {
     return null;
   }

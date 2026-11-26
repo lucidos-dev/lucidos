@@ -1,4 +1,4 @@
-//! `thread_summaries` blocking/attention propagation helpers for the
+//! INVARIANT: `thread_summaries` blocking/attention propagation helpers for the
 //! `EventBus` projection — the before/after `BlockingSample`, the ancestor
 //! `active_children_count` / `blocking_descendant_count` /
 //! `attention_descendant_count` reconciles, and the one-shot rebuild.
@@ -18,11 +18,6 @@ use crate::engine::thread_lifecycle::{
     is_attention_needing, is_blocking, ArchiveState, ChangeStateKind, ThreadStatus, ThreadType,
 };
 
-/// Sample of the `thread_summaries` columns that feed `is_blocking` and
-/// `is_attention_needing`.
-/// Loaded before and after every projection update so the projection can
-/// detect a flip and propagate the delta to ancestors via
-/// `blocking_descendant_count`.
 pub(crate) struct BlockingSample {
     thread_type: ThreadType,
     status: ThreadStatus,
@@ -30,6 +25,7 @@ pub(crate) struct BlockingSample {
     has_pending_changes: bool,
     is_external_repo: bool,
     is_stopped_child: bool,
+    is_held: bool,
 }
 
 impl BlockingSample {
@@ -51,11 +47,12 @@ impl BlockingSample {
             self.has_pending_changes,
             self.is_external_repo,
             self.is_stopped_child,
+            self.is_held,
         )
     }
 }
 
-/// Read the blocking- and attention-relevant columns for `thread_id`. Returns
+/// INVARIANT: Read the blocking- and attention-relevant columns for `thread_id`. Returns
 /// `Ok(None)` when the row doesn't exist (e.g. a thread-start event running
 /// before its own INSERT). The wrapper that calls this treats "no row" as
 /// "was not blocking", so the freshly-inserted row's first sample propagates
@@ -64,9 +61,9 @@ pub(crate) async fn load_blocking_sample(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     thread_id: Uuid,
 ) -> Result<Option<BlockingSample>, sqlx::Error> {
-    let row: Option<(bool, String, String, bool, bool, bool)> = sqlx::query_as(
+    let row: Option<(bool, String, String, bool, bool, bool, bool)> = sqlx::query_as(
         "SELECT is_coding_agent, status, archive_state, coding_agent_change_state = $2, \
-                coding_agent_is_external_repo, is_stopped_child \
+                coding_agent_is_external_repo, is_stopped_child, hold IS NOT NULL \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -81,6 +78,7 @@ pub(crate) async fn load_blocking_sample(
             is_proposed,
             coding_agent_is_external_repo,
             is_stopped_child,
+            is_held,
         )| {
             BlockingSample {
                 thread_type: if is_coding_agent {
@@ -93,15 +91,12 @@ pub(crate) async fn load_blocking_sample(
                 has_pending_changes: is_proposed,
                 is_external_repo: coding_agent_is_external_repo,
                 is_stopped_child,
+                is_held,
             }
         },
     ))
 }
 
-/// Sample of the `thread_summaries` columns the completed-sub-thread archive
-/// rule reads (`refuse_completed`). The projection loads it before and after
-/// an event. A change asks the engine to recount every ancestor's
-/// `archivable_sub_thread_count`, since this row counts toward each of them.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub(crate) struct ArchiveInputSample {
     parent_thread_id: Option<Uuid>,
@@ -116,9 +111,6 @@ pub(crate) struct ArchiveInputSample {
 }
 
 impl ArchiveInputSample {
-    /// The rows whose archivable count may have moved between `prev` and
-    /// `curr`: the parent before and after. Empty when nothing the rule reads
-    /// changed, unless `forced`, for an input stored outside the row.
     pub(crate) fn recount_anchors(
         prev: Option<&Self>,
         curr: Option<&Self>,
@@ -137,7 +129,6 @@ impl ArchiveInputSample {
     }
 }
 
-/// Read `thread_id`'s [`ArchiveInputSample`], or `None` before its row exists.
 pub(crate) async fn load_archive_input_sample(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     thread_id: Uuid,
@@ -154,7 +145,7 @@ pub(crate) async fn load_archive_input_sample(
     .await
 }
 
-/// Recompute the direct parent's `active_children_count` from children
+/// INVARIANT: Recompute the direct parent's `active_children_count` from children
 /// still in flight, per the shared `active_thread_statuses()` predicate.
 /// Returns the parent's `thread_id` when one exists (so the caller can
 /// rebroadcast the parent's aggregate over SSE), or `None` when
@@ -192,8 +183,6 @@ pub(crate) async fn reconcile_parent_active_children_count(
     Ok(Some(pid))
 }
 
-/// Recount `parent_id`'s `active_children_count` from its children. The caller
-/// holds the parent's recount lock.
 async fn recount_active_children(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     parent_id: Uuid,
@@ -217,11 +206,9 @@ async fn recount_active_children(
     Ok(())
 }
 
-/// Advisory-lock class for `hold_parent_recount_lock`. The two-key form keeps
-/// it apart from the one-key locks elsewhere in the engine.
 const PARENT_RECOUNT_LOCK_CLASS: i32 = 0x6368_6c64;
 
-/// Serialize recounts of one parent and return its id, or `None` for a top
+/// INVARIANT: Serialize recounts of one parent and return its id, or `None` for a top
 /// thread.
 ///
 /// **Take this before counting a parent's children.** Siblings emit in their
@@ -248,7 +235,6 @@ pub(crate) async fn hold_parent_recount_lock(
     Ok(Some(pid))
 }
 
-/// `child_id`'s parent, or `None` for a top thread or a missing row.
 pub(crate) async fn parent_of(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
@@ -262,8 +248,6 @@ pub(crate) async fn parent_of(
     )
 }
 
-/// Take `parent_id`'s recount lock. [`hold_parent_recount_lock`] says why, and
-/// when to take it.
 async fn lock_parent_recount(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     parent_id: Uuid,
@@ -276,13 +260,6 @@ async fn lock_parent_recount(
     Ok(())
 }
 
-/// Whether a row's parent waits on it, over the row's own columns, with the
-/// in-flight statuses bound as `$1` (ADR 0672). Its finish must wake the
-/// parent, so a `no-wake` child never counts. It must be unfinished: active,
-/// holding a live event wait, or awaiting a child of its own. That last clause
-/// makes the roll-up climb any depth.
-///
-/// The only definition. The live climb and the boot rebuild both use it.
 static AWAITED_BY_PARENT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "(parent_thread_id IS NOT NULL \
@@ -292,7 +269,7 @@ static AWAITED_BY_PARENT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
     )
 });
 
-/// Bring `thread_id`'s `awaited_by_parent` up to date, then climb: while a
+/// INVARIANT: Bring `thread_id`'s `awaited_by_parent` up to date, then climb: while a
 /// flag moved, recount its parent's `awaited_children_count`, and while that
 /// moved, refresh the parent's own flag. Returns every row that moved, for
 /// the SSE rebroadcast.
@@ -313,7 +290,6 @@ pub(crate) async fn reconcile_awaited_from(
         let Some(pid) = hold_parent_recount_lock(tx, row).await? else {
             break;
         };
-        // A cycle in `parent_thread_id` must not loop forever.
         if moved.contains(&pid) || !recount_awaited_children(tx, pid).await? {
             break;
         }
@@ -323,9 +299,6 @@ pub(crate) async fn reconcile_awaited_from(
     Ok(moved)
 }
 
-/// Recount `parent_id`'s `awaited_children_count`, for a write that changed
-/// who its children are, then climb from it as [`reconcile_awaited_from`]
-/// does. The caller holds the parent's recount lock.
 async fn recount_awaited_from_parent(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     parent_id: Uuid,
@@ -338,8 +311,6 @@ async fn recount_awaited_from_parent(
     Ok(moved)
 }
 
-/// Write `thread_id`'s `awaited_by_parent` from its own columns. True when
-/// the flag moved.
 async fn refresh_awaited_flag(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     thread_id: Uuid,
@@ -357,8 +328,6 @@ async fn refresh_awaited_flag(
     Ok(moved.is_some())
 }
 
-/// Recount `parent_id`'s `awaited_children_count` from its children's flags.
-/// True when the count moved. The caller holds the parent's recount lock.
 async fn recount_awaited_children(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     parent_id: Uuid,
@@ -379,16 +348,6 @@ async fn recount_awaited_children(
     Ok(moved.is_some())
 }
 
-/// The Apply/Discard reconcile, shared so the two proposal-end arms
-/// (`ChangeApplied`, `ChangeDiscarded`) stay in lockstep. It recounts the
-/// parent's `active_children_count` now, and names the parent in
-/// `descendant_recount_anchors`. The projection recomputes every ancestor's
-/// descendant counts from there, after the awaited climb.
-///
-/// Defense in depth: the function-boundary `propagate_blocking_change`
-/// already handles the child's own predicate flips. The full recompute catches
-/// drift from an earlier missed update, so resolving a proposal leaves every
-/// ancestor counter consistent without waiting for a restart.
 pub(crate) async fn reconcile_proposal_lifecycle_end(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
@@ -402,45 +361,6 @@ pub(crate) async fn reconcile_proposal_lifecycle_end(
     Ok(())
 }
 
-/// Arm the child's `parent_callback_pending` marker because a **start event**
-/// arrived: `MessageReceived`, `CodingAgentUserMessageSent`,
-/// `PromptInjected`, a non-empty `CodingAgentPromptSent`, or
-/// `ContinuationRequested`. That is the set `preserving_verdict`
-/// (`event_bus/mod.rs`) already names as "new work was actually requested".
-///
-/// The marker means "the parent has NOT yet been told about the child's
-/// **current** turn", so a start event owes the parent a fresh card while a
-/// mere extra `CodingAgentIdled` (auto-harden, a background agent) does not.
-/// Keeping that distinction is what leaves the dedup guard in
-/// `notify_parent_if_child` doing its stated job.
-///
-/// Deliberately NOT a start event: the **empty** `CodingAgentPromptSent`
-/// question-resume marker (`agent_question::emit_resume_marker_for_cc_answer`).
-/// It exists only so the timeline shows a Thinking step and asserts no new
-/// agent intent, which is why its own projection arm already skips the status
-/// write. Arming the marker there would re-open the parent callback after a
-/// card was already sent, so the very extra idle the dedup guard exists for
-/// would produce a spurious second card. Pinned by
-/// `an_empty_resume_marker_is_not_a_start_event`.
-///
-/// This is gated differently from the re-increment below, which is why the two
-/// are separate operations: the marker does not care whether the child was in
-/// flight, only that new work was requested. A parked child that receives a
-/// follow-up owes its parent a card for the resulting turn even though its
-/// place on the parent's counter was never given up.
-///
-/// `AND parent_thread_id IS NOT NULL` keeps the write off a parentless row,
-/// which under this polarity would otherwise be told it owes some parent a
-/// card. The storage default is FALSE for exactly that reason.
-///
-/// New work also ends a *stopped child*: the turn it starts is what will
-/// report, so `is_stopped_child` clears in the same write (ADR 0252).
-///
-/// A child that handed off to a successor owes its parent nothing more, so
-/// new work on it re-arms nothing: the successor reports in its place.
-///
-/// The new turn starts undecided too: `parent_wake_requested` goes back to
-/// NULL, so a no from an earlier turn never files this turn's report.
 pub(crate) async fn mark_parent_callback_pending(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
@@ -456,10 +376,6 @@ pub(crate) async fn mark_parent_callback_pending(
     Ok(())
 }
 
-/// Make `child_id` a *stopped child*, because a user Stop just ended its turn
-/// (ADR 0252). Only a child still owed a card qualifies: with the marker
-/// already clear, the parent has heard about this turn and is owed nothing.
-/// A top-thread never matches, having no parent.
 pub(crate) async fn mark_stopped_child(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
@@ -474,7 +390,7 @@ pub(crate) async fn mark_stopped_child(
     Ok(())
 }
 
-/// Settle what `child_id` owed its parent, because the parent's
+/// INVARIANT: Settle what `child_id` owed its parent, because the parent's
 /// `ChildThreadCompleted` or `ChildReportFiled` for it just landed. Clears the
 /// marker and `is_stopped_child`, and returns whether the child WAS stopped.
 ///
@@ -506,7 +422,7 @@ pub(crate) async fn settle_parent_callback(
     Ok(was_stopped.unwrap_or(false))
 }
 
-/// Bump the direct parent's `active_children_count` when an event flipped
+/// INVARIANT: Bump the direct parent's `active_children_count` when an event flipped
 /// `child_id` from a state outside the in-flight set back to
 /// `status='running'`. Returns `Some(parent_id)` when the bump happened (so the
 /// caller can add it to the SSE rebroadcast list), `None` when the child was
@@ -561,8 +477,6 @@ pub(crate) async fn reincrement_parent_active_count_if_revived(
     Ok(Some(pid))
 }
 
-/// `is_blocking` in SQL, over a descendant row aliased `d`. Shared by the
-/// in-tx reconcile and the boot rebuild, so the two cannot drift apart.
 static BLOCKING_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "d.status IN ({running},{waiting_for_user_answer}) \
@@ -574,10 +488,9 @@ static BLOCKING_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::Lazy
     )
 });
 
-/// `is_attention_needing` in SQL, over a descendant row aliased `d`.
 static ATTENTION_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "d.status = {waiting_for_user_answer} \
+        "(d.status = {waiting_for_user_answer} AND NOT d.is_held) \
          OR (d.archive_state <> 'archived' \
              AND ((d.is_proposed AND d.is_coding_agent \
                    AND NOT d.coding_agent_is_external_repo) \
@@ -586,7 +499,7 @@ static ATTENTION_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::Laz
     )
 });
 
-/// Recompute `blocking_descendant_count` AND `attention_descendant_count` for
+/// INVARIANT: Recompute `blocking_descendant_count` AND `attention_descendant_count` for
 /// `thread_id` and every ancestor, from each row's transitive descendants under
 /// the `is_blocking` and `is_attention_needing` predicates. Mirrors
 /// `rebuild_blocking_descendant_count` for both columns. Returns the rows it
@@ -611,13 +524,13 @@ pub(crate) async fn reconcile_descendant_counts_from(
          descendants AS ( \
             SELECT a.thread_id AS root_id, c.thread_id, c.status, c.archive_state, \
                    c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
-                   c.is_stopped_child \
+                   c.is_stopped_child, c.hold IS NOT NULL AS is_held \
             FROM ancestors a \
             JOIN thread_summaries c ON c.parent_thread_id = a.thread_id \
             UNION \
             SELECT d.root_id, c.thread_id, c.status, c.archive_state, \
                    c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
-                   c.is_stopped_child \
+                   c.is_stopped_child, c.hold IS NOT NULL AS is_held \
             FROM descendants d \
             JOIN thread_summaries c ON c.parent_thread_id = d.thread_id \
          ), \
@@ -649,22 +562,6 @@ pub(crate) async fn reconcile_descendant_counts_from(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Cut the edge from `parent_id` to `child_id`, for `ChildThreadDetached`
-/// (ADR 0278). Returns every row whose child counts moved, the child
-/// included, for the SSE rebroadcast. The caller recomputes descendant counts
-/// from `parent_id` after the awaited climb.
-///
-/// Returns nothing when `child_id` is not `parent_id`'s child, so an event
-/// applied twice changes nothing the second time.
-///
-/// The order is load-bearing:
-/// 1. The emit's Validate phase already locked the subtree, deepest first
-///    (`lock_edge_for_detach`). The parent's recount lock comes after, the
-///    order a child's own terminal takes them in.
-/// 2. Recount after the cut, anchored on the parent id. The child-anchored
-///    helpers find the parent from the child's row, which no longer names it.
-/// 3. Rebase `depth` over the whole subtree. The recursion guard reads it, so
-///    a stale depth would refuse spawns levels too early.
 pub(crate) async fn detach_child_from_parent(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     parent_id: Uuid,
@@ -702,7 +599,6 @@ pub(crate) async fn detach_child_from_parent(
         .await?;
     }
 
-    // A top thread is nobody's awaited child.
     refresh_awaited_flag(tx, child_id).await?;
 
     lock_parent_recount(tx, parent_id).await?;
@@ -721,22 +617,6 @@ pub(crate) async fn detach_child_from_parent(
     Ok(touched)
 }
 
-/// Walk ancestors of `thread_id` via `parent_thread_id` and apply the
-/// `blocking_delta` / `attention_delta` to their `blocking_descendant_count`
-/// and `attention_descendant_count` columns respectively. No-op when
-/// `thread_id` has no parent or when BOTH deltas are 0 (early exit avoids
-/// a pointless SQL roundtrip on the common case where the event leaves both
-/// predicates unchanged).
-///
-/// Returns the list of ancestor `thread_id`s whose row was touched. The
-/// caller uses this to rebroadcast each ancestor's aggregate over SSE after
-/// the transaction commits — without that, the DB columns move but the
-/// frontend's `meta.blockingDescendantCount` / `meta.attentionDescendantCount`
-/// stay stale until a full `/api/v1/threads` reload. Empty vec when both deltas
-/// are 0 (no SQL run) or the thread has no ancestors.
-///
-/// One SQL roundtrip, two column updates. Keeps both counters atomic: a
-/// crash mid-tx can't desync `blocking` and `attention`.
 pub(crate) async fn propagate_blocking_change(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     thread_id: Uuid,
@@ -772,12 +652,6 @@ pub(crate) async fn propagate_blocking_change(
 }
 
 impl EventBus {
-    /// Recount `thread_id`'s own child and descendant counts from ground truth,
-    /// then broadcast every row it touched, as an event's ancestors are.
-    ///
-    /// Archive runs it on a target already stored archived: such a thread sits in
-    /// Current only while a count says something under it is live. A drifted
-    /// count then heals at once on every device, not at the next boot.
     pub async fn recount_family_counts(
         &self,
         thread_id: Uuid,
@@ -804,10 +678,6 @@ impl EventBus {
         Ok(())
     }
 
-    /// Store each thread's `archivable_sub_thread_count`, then broadcast every
-    /// row that moved, as an event's ancestors are. The engine-tier recount
-    /// worker computes the counts, because the archive rule lives above this
-    /// crate. Returns the rows that moved.
     pub async fn store_archivable_sub_thread_counts(
         &self,
         counts: &[(Uuid, i64)],
@@ -841,7 +711,7 @@ impl EventBus {
         Ok(moved)
     }
 
-    /// Recompute every parent's `active_children_count`,
+    /// INVARIANT: Recompute every parent's `active_children_count`,
     /// `awaited_children_count` and `total_children_count` from ground truth,
     /// and every `awaited_by_parent`.
     ///
@@ -887,12 +757,6 @@ impl EventBus {
         .bind(&crate::core::store::active_thread_statuses()[..])
         .execute(pool)
         .await?;
-        // Reset a row that is nobody's parent any more. The UPDATE above only
-        // touches rows still named by some child, so a thread whose children
-        // were all deleted or moved to top level keeps its stale counts. A
-        // stale count of 1 leaves the parent's own Archive and Delete hidden
-        // for good. Mirrors the second statement in
-        // `rebuild_blocking_descendant_count`.
         sqlx::query(
             "UPDATE thread_summaries p \
              SET active_children_count = 0, total_children_count = 0 \
@@ -906,7 +770,7 @@ impl EventBus {
         Self::rebuild_awaited_children(pool).await
     }
 
-    /// Recompute every `awaited_by_parent` and `awaited_children_count`. A
+    /// INVARIANT: Recompute every `awaited_by_parent` and `awaited_children_count`. A
     /// row's flag reads its own count, and its count reads its children's
     /// flags. So it clears every flag, then recounts and sets flags in rounds
     /// until a round sets none.
@@ -952,7 +816,7 @@ impl EventBus {
         tx.commit().await
     }
 
-    /// Recompute `thread_summaries.blocking_descendant_count` AND
+    /// INVARIANT: Recompute `thread_summaries.blocking_descendant_count` AND
     /// `thread_summaries.attention_descendant_count` for every row from
     /// scratch via a recursive CTE that walks each thread's transitive
     /// descendants. Counts those matching `is_blocking` and
@@ -977,14 +841,16 @@ impl EventBus {
                 SELECT t.thread_id AS root_id, \
                        c.thread_id, c.status, c.archive_state, \
                        c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, \
-                       c.coding_agent_is_external_repo, c.is_stopped_child \
+                       c.coding_agent_is_external_repo, c.is_stopped_child, \
+                       c.hold IS NOT NULL AS is_held \
                 FROM thread_summaries t \
                 JOIN thread_summaries c ON c.parent_thread_id = t.thread_id \
                 UNION \
                 SELECT d.root_id, \
                        c.thread_id, c.status, c.archive_state, \
                        c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, \
-                       c.coding_agent_is_external_repo, c.is_stopped_child \
+                       c.coding_agent_is_external_repo, c.is_stopped_child, \
+                       c.hold IS NOT NULL AS is_held \
                 FROM descendants d \
                 JOIN thread_summaries c ON c.parent_thread_id = d.thread_id \
              ) \
@@ -1005,7 +871,7 @@ impl EventBus {
         ))
         .execute(pool)
         .await?;
-        // Reset any row that no longer appears as a root (e.g. all its
+        // INVARIANT: Reset any row that no longer appears as a root (e.g. all its
         // descendants got pruned). The UPDATE…FROM above only touches rows
         // with at least one descendant; rows with zero descendants must drop
         // their stale counts to 0 explicitly.
@@ -1025,9 +891,6 @@ impl EventBus {
 
 #[cfg(test)]
 mod tests {
-    //! Two siblings recounting their parent in overlapping transactions. The
-    //! later transaction must count after the earlier one commits, or it stores
-    //! a stale count over the right one.
 
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
@@ -1065,8 +928,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Run `first` in one transaction and hold it open. Start `second` in
-    /// another, give it time to reach the parent, then commit `first`.
     async fn overlap(
         pool: &sqlx::PgPool,
         first: &str,
@@ -1116,8 +977,6 @@ mod tests {
         b.await.unwrap();
     }
 
-    /// One child arms a wait while its sibling's wait ends. The truth is one
-    /// awaited child, and the parent must not read idle.
     #[tokio::test]
     async fn overlapping_wait_changes_leave_the_true_awaited_count() {
         let (pool, db_name) = setup_test_db().await;
@@ -1151,9 +1010,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A grandchild's finish climbs through its parent to the top thread while
-    /// the top thread's other child finishes. Both climbs reach the top's
-    /// count, child before parent, and the truth is nothing awaited.
     #[tokio::test]
     async fn a_climb_racing_a_sibling_terminal_leaves_the_true_awaited_count() {
         let (pool, db_name) = setup_test_db().await;
@@ -1189,22 +1045,11 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A stopped child's card lands on its running parent P while P's sibling
-    /// finishes. The card's projection rewrites the grandparent's descendant
-    /// counts, and its climb takes the grandparent's recount lock. The
-    /// sibling's recount holds that lock and then writes the grandparent row.
-    /// The projection must take the lock before it writes the row, or the two
-    /// deadlock and Postgres aborts one of the events.
-    ///
-    /// Deterministic: the sibling holds the lock until the card's projection
-    /// blocks on it.
     #[tokio::test]
     async fn a_stopped_childs_card_racing_an_uncles_terminal_does_not_deadlock() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
         let grandparent = insert_thread(&pool, None, "idle", 0).await;
-        // The parent's card already set it running, outside the projection,
-        // so its flag is stale until this event's climb.
         let parent = insert_thread(&pool, Some(grandparent), "running", 0).await;
         let stopped = insert_thread(&pool, Some(parent), "idle", 0).await;
         let uncle = insert_thread(&pool, Some(grandparent), "running", 0).await;
@@ -1275,7 +1120,6 @@ mod tests {
         uncle_tx.commit().await.unwrap();
         card.await.unwrap();
 
-        // The running parent is the one child still active and awaited.
         assert_eq!(counts(&pool, grandparent).await, (1, 1));
         let attention: i32 = sqlx::query_scalar(
             "SELECT attention_descendant_count FROM thread_summaries WHERE thread_id = $1",
@@ -1290,8 +1134,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Two running children finish at once. The truth is none active, and the
-    /// parent must not stay Waiting on a finished pair.
     #[tokio::test]
     async fn overlapping_terminals_leave_the_true_active_count() {
         let (pool, db_name) = setup_test_db().await;

@@ -1,27 +1,13 @@
-//! Is the running `.app` somewhere it can keep?
-//!
-//! Two places look like an install and are not. A mounted `.dmg` is read-only
-//! and disappears on eject. A Gatekeeper App Translocation copy is read-only
-//! and gets a fresh random path on every launch. From either one, the launchd
-//! service plist pins a path that vanishes, and the updater's first rename
-//! fails with EXDEV. ADR 0271 records why the client refuses to run there.
-
 use std::path::{Path, PathBuf};
 
-/// Where the running bundle lives, as far as keeping it goes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BundleLocation {
-    /// A normal install: `/Applications`, `~/Applications`, a writable disk.
     Stable,
-    /// A Gatekeeper App Translocation copy of a quarantined app.
     Translocated,
-    /// A read-only volume, which in practice is the mounted `.dmg`.
     ReadOnlyVolume,
 }
 
 impl BundleLocation {
-    /// Why this place is no good, as the opening of a sentence. `None` when
-    /// the bundle can stay where it is.
     fn problem(&self) -> Option<&'static str> {
         match self {
             Self::Stable => None,
@@ -36,13 +22,9 @@ impl BundleLocation {
     }
 }
 
-/// The launch refusal's instruction. Its dialog's own Quit button exits for
-/// real, so "Quit Lucidos" is true there.
 const QUIT_THEN_MOVE: &str =
     "Quit Lucidos, drag it into your Applications folder, and open it from there.";
 
-/// The update blocker's instruction. In a running app Cmd+Q only closes to the
-/// menu bar, and the service keeps running from the old path.
 fn stop_service_then_move() -> String {
     format!(
         "Choose \"{}\" from the Lucidos menu or the menu bar icon. Then drag Lucidos into \
@@ -51,11 +33,6 @@ fn stop_service_then_move() -> String {
     )
 }
 
-/// Classify a bundle path. Pure: the caller reads the mount flags, so every
-/// case is testable without a real mount.
-///
-/// Translocation wins over read-only, since a translocation mount is both and
-/// its message is the more specific.
 pub fn classify(bundle: &Path, read_only_volume: bool) -> BundleLocation {
     if bundle
         .components()
@@ -69,7 +46,6 @@ pub fn classify(bundle: &Path, read_only_volume: bool) -> BundleLocation {
     }
 }
 
-/// The launch dialog's body, or `None` for a stable location.
 pub fn launch_refusal(location: &BundleLocation) -> Option<String> {
     location.problem().map(|problem| {
         format!(
@@ -79,12 +55,6 @@ pub fn launch_refusal(location: &BundleLocation) -> Option<String> {
     })
 }
 
-/// Why an in-place update cannot work from here, or `None` when it can.
-///
-/// `same_device_as_temp` is the plugin's real precondition: it renames the
-/// bundle into a directory under `$TMPDIR`, and a rename cannot cross devices.
-/// That also catches a writable external disk, which is stable for the
-/// service but not updatable.
 pub fn update_blocker(location: &BundleLocation, same_device_as_temp: bool) -> Option<String> {
     let instruction = stop_service_then_move();
     if let Some(problem) = location.problem() {
@@ -100,13 +70,6 @@ pub fn update_blocker(location: &BundleLocation, same_device_as_temp: bool) -> O
     })
 }
 
-/// Why an update could not run with nobody at the Mac, or `None` when it can
-/// (ADR 0338). `install_blocker` is [`update_blocker`]'s answer.
-///
-/// It adds the one case a local click survives and a relayed install does not.
-/// The plugin moves the bundle out of its folder, and when it may not, it asks
-/// for an admin password. A person at the desk can answer that, and an empty
-/// desk leaves the install hanging.
 pub fn remote_install_blocker(
     install_blocker: Option<String>,
     writable_in_place: bool,
@@ -120,17 +83,12 @@ pub fn remote_install_blocker(
     })
 }
 
-/// Can this user move `bundle` out of its folder without asking anyone? Moving
-/// a directory to another parent needs write access to both the bundle and the
-/// folder it sits in. Fails closed: an answer we cannot read is a no.
 pub fn writable_in_place(bundle: &Path) -> bool {
     bundle
         .parent()
         .is_some_and(|parent| user_may_write(parent) && user_may_write(bundle))
 }
 
-/// `access(W_OK)`, which asks with this process's real user rather than
-/// guessing from mode bits.
 fn user_may_write(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
@@ -141,10 +99,6 @@ fn user_may_write(path: &Path) -> bool {
     unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
 }
 
-/// The bundle this process runs from, derived the way `tauri-plugin-updater`
-/// derives the path it swaps: its own `extract_path_from_executable` over
-/// `current_exe()`. `lib.rs` registers the plugin with no override, so the two
-/// cannot disagree. ADR 0073 records why a hardcoded path is wrong.
 pub fn bundle_path() -> Result<PathBuf, String> {
     let exe = tauri::utils::platform::current_exe()
         .map_err(|e| format!("cannot resolve this app's own executable: {e}"))?;
@@ -156,14 +110,10 @@ pub fn bundle_path() -> Result<PathBuf, String> {
     })
 }
 
-/// Classify the running bundle. Fails open: unreadable mount flags leave the
-/// path check alone to decide. A failed `statfs` must not lock anybody out of
-/// an app that works.
 pub fn current(bundle: &Path) -> BundleLocation {
     classify(bundle, is_read_only_volume(bundle).unwrap_or(false))
 }
 
-/// Is `path` on a volume mounted read-only?
 fn is_read_only_volume(path: &Path) -> Option<bool> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -180,8 +130,6 @@ fn is_read_only_volume(path: &Path) -> Option<bool> {
     Some(flags & libc::MNT_RDONLY as u32 != 0)
 }
 
-/// Are `a` and `b` on the same device? `None` when either cannot be read,
-/// which the caller treats as "don't know" and lets the plugin report.
 pub fn same_device(a: &Path, b: &Path) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
 
@@ -213,8 +161,6 @@ mod tests {
         );
     }
 
-    // The regression guard for every normal install. A false positive here
-    // refuses to launch an app that works.
     #[test]
     fn ordinary_installs_are_stable() {
         for path in [
@@ -230,8 +176,6 @@ mod tests {
         }
     }
 
-    // A folder merely NAMED like the translocation root is not one. Only a
-    // whole path component counts.
     #[test]
     fn a_lookalike_folder_name_is_not_translocation() {
         assert_eq!(
@@ -248,8 +192,6 @@ mod tests {
         assert_eq!(launch_refusal(&BundleLocation::Stable), None);
     }
 
-    // The launch dialog's own Quit button exits for real, so "Quit Lucidos" is
-    // true there.
     #[test]
     fn every_launch_refusal_ends_on_quit_then_move() {
         for location in [BundleLocation::Translocated, BundleLocation::ReadOnlyVolume] {
@@ -258,9 +200,6 @@ mod tests {
         }
     }
 
-    // A running app hears Cmd+Q as "Close to Menu Bar", and the service keeps
-    // running from the old path. So every update blocker names the menu item
-    // that really stops it.
     #[test]
     fn every_update_blocker_names_the_real_quit() {
         for (location, same_device) in [
@@ -291,8 +230,6 @@ mod tests {
         assert_eq!(update_blocker(&BundleLocation::Stable, true), None);
     }
 
-    // The writable external disk: fine for the service, but the plugin's rename
-    // into $TMPDIR would fail with EXDEV, so the update must stop up front.
     #[test]
     fn a_stable_bundle_on_another_disk_cannot_update() {
         let message = update_blocker(&BundleLocation::Stable, false).unwrap_or_default();
@@ -324,15 +261,12 @@ mod tests {
         assert_eq!(remote_install_blocker(None, true), None);
     }
 
-    // The admin-password case: fine for a click at the desk, a hang for a
-    // relayed install with nobody there.
     #[test]
     fn a_bundle_this_user_cannot_move_blocks_a_remote_install() {
         let message = remote_install_blocker(None, false).unwrap_or_default();
         assert!(message.contains("administrator password"), "{message}");
     }
 
-    // The local blocker is the more specific answer, so it wins.
     #[test]
     fn the_install_blocker_wins_over_the_writability_check() {
         let local = update_blocker(&BundleLocation::ReadOnlyVolume, true);

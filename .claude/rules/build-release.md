@@ -2,11 +2,13 @@
 paths:
   - "scripts/build*.sh"
   - "scripts/check-staged-copies.sh"
+  - "scripts/check-codegen-inputs.sh"
   - "scripts/check-crate-*.sh"
   - "scripts/lib/check_crate_*_test.sh"
   - "scripts/lib/crate_guardrails*.py"
   - "scripts/engine-module-graph.py"
   - "scripts/measure-engine-build.sh"
+  - "scripts/lib/lab_slot.sh"
   - "scripts/lib/measure_probe*.sh"
   - "scripts/lib/measure_rustc.sh"
   - "scripts/release*.sh"
@@ -21,8 +23,7 @@ paths:
   - "scripts/lib/service*.sh"
   - "scripts/lib/release_*.sh"
   - "scripts/lib/release_rc.sh"
-  - "scripts/lib/release_blockers.sh"
-  - "scripts/lib/release_blockers_test.sh"
+  - "scripts/lib/release_blockers*"
   - "scripts/lib/private_data_patterns*.sh"
   - "scripts/lib/github_auth*.sh"
   - "scripts/*onnxruntime*.sh"
@@ -45,8 +46,7 @@ paths:
   - ".github/workflows/e2e.yml"
   - "scripts/check-e2e-workflow.sh"
   - "scripts/lib/check_e2e_workflow_test.sh"
-  # The mirror's one-door gate (ADR 0462), described under "The mirror has one
-  # door" below. release_tree_push_test.sh matches scripts/lib/release_*.sh.
+  # The mirror's one-door gate: see "The mirror has one door" below.
   - "scripts/check-mirror-pushers.sh"
   - "scripts/mirror-push-gate.sh"
   - "scripts/lib/check_mirror_pushers_test.sh"
@@ -59,7 +59,7 @@ paths:
 
 # Build, Packaging & Installer
 
-See `docs/release-pipeline-notes.md`. Add new script paths above.
+See `docs/release-pipeline-notes.md`.
 
 ## Build
 
@@ -305,6 +305,6 @@ it, and Phase A runs it against the worktree after both bumps.
 
 ### A release tag needs a clean blocker ledger
 
-The gate reads the private ledger at main HEAD and checks fix ancestry against the cut.
-Never write a waiver unattended; the owner must authorize one version and its reason.
+The gate reads the ledger from the workspace event store and checks fix ancestry against the cut.
+Never write a waiver unattended; only a device tap counts.
 Format, retry state and audit records: `docs/release-pipeline-notes.md` § Release blockers.

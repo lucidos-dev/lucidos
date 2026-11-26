@@ -1,4 +1,4 @@
-/// The workspace repo lock. Every in-engine writer of the workspace repo holds
+/// INVARIANT: The workspace repo lock. Every in-engine writer of the workspace repo holds
 /// it across its whole read, file change and commit. A merge holds it across
 /// catch-up, sha read, ref move and the repo-root tree sync.
 ///
@@ -14,10 +14,6 @@
 /// `commit_all_dirty`. Lock order: [`MERGE_MUTEX`] first, then this.
 pub static WORKSPACE_REPO_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Proof that the holder owns the workspace repo lock. Only this module can mint
-/// one, so a write that takes `&WorkspaceRepoLock` cannot run without the lock.
-/// The guard is `'static` and `Send`, so it can move into a `spawn_blocking`
-/// closure. It is then released when the blocking work really ends.
 pub struct WorkspaceRepoLock {
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
@@ -26,11 +22,9 @@ pub async fn lock_workspace_repo() -> WorkspaceRepoLock {
     MAIN_LOCKS.lock_repo().await
 }
 
-/// One merge to `main` at a time. Taken before [`WORKSPACE_REPO_MUTEX`].
+/// INVARIANT: One merge to `main` at a time. Taken before [`WORKSPACE_REPO_MUTEX`].
 static MERGE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The two locks a merge to `main` takes, in this order. Production passes
-/// [`MAIN_LOCKS`]. A test passes a pair of its own, so no other test queues on it.
 pub struct MainLocks {
     merge: &'static tokio::sync::Mutex<()>,
     repo: &'static tokio::sync::Mutex<()>,
@@ -52,10 +46,6 @@ impl MainLocks {
         }
     }
 
-    /// Both locks, in order, for anything that moves `main` outside a merge:
-    /// a revert, or a commit on the repo root. A landing pass holds the merge
-    /// lock from reading `main` to moving it. So this keeps every other mover
-    /// out of that window (ADR 0463).
     pub async fn lock_main(&self) -> MainMoveLock {
         let merge = self.lock_merge().await;
         MainMoveLock {
@@ -69,7 +59,6 @@ impl MainLocks {
         self.repo.try_lock().is_err()
     }
 
-    /// A pair of locks nothing else queues on.
     #[cfg(any(test, feature = "test-support"))]
     pub fn private_for_test() -> &'static MainLocks {
         Box::leak(Box::new(MainLocks {
@@ -79,8 +68,6 @@ impl MainLocks {
     }
 }
 
-/// Proof that the holder owns both locks of [`MainLocks::lock_main`]. The repo
-/// lock is declared first, so it is released first.
 pub struct MainMoveLock {
     _repo: WorkspaceRepoLock,
     _merge: tokio::sync::MutexGuard<'static, ()>,
@@ -90,9 +77,6 @@ pub struct MainMoveLock {
 mod tests {
     use super::*;
 
-    /// Validates that MERGE_MUTEX serializes concurrent merge attempts.
-    /// Two tasks that both acquire the mutex should execute sequentially,
-    /// not concurrently -- the second task must wait for the first.
     #[tokio::test]
     async fn merge_mutex_serializes_concurrent_access() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -108,9 +92,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let _guard = MERGE_MUTEX.lock().await;
                 let active = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                // Track maximum concurrent holders
                 max_concurrent.fetch_max(active, Ordering::SeqCst);
-                // Simulate merge work
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 counter.fetch_sub(1, Ordering::SeqCst);
             }));
@@ -120,7 +102,6 @@ mod tests {
             h.await.unwrap();
         }
 
-        // At most 1 task should hold the mutex at any time
         assert_eq!(
             max_concurrent.load(Ordering::SeqCst),
             1,

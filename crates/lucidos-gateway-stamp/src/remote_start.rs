@@ -1,27 +1,14 @@
-//! The *remote start setting*, and the signed header that carries it to the
-//! target engine (ADR 0725).
-//!
-//! The receiving gateway decides whether an agent on a paired gateway may
-//! start a thread here, and refuses a Deny itself. It signs every other
-//! decision for the target workspace and the operation's nonce. The engine
-//! then parks an Ask start on its owner's card.
-
 use serde::{Deserialize, Serialize};
 
 use crate::{Claim, StampKey};
 
-/// The request header the gateway puts on every routed spawn. A spawn without
-/// a valid one never reaches a model.
 pub const HEADER_REMOTE_START: &str = "x-lucidos-remote-start";
 
-/// Whether agents on one incoming pairing may start threads here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteStartSetting {
     Allow,
-    /// The thread starts parked on a card. Its first turn waits for the owner.
     Ask,
-    /// A pairing recorded before the setting existed reads as Deny.
     #[default]
     Deny,
 }
@@ -36,7 +23,6 @@ impl RemoteStartSetting {
     }
 }
 
-/// The incoming pairing a spawn arrived through.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemotePairing {
@@ -44,8 +30,6 @@ pub struct RemotePairing {
     pub label: String,
 }
 
-/// What the gateway vouches for about one spawn. A spawn from this gateway's
-/// own workspaces, or through a return grant, names no pairing and is Allow.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteStart {
@@ -62,7 +46,6 @@ struct Wire {
 }
 
 impl RemoteStart {
-    /// A start the gateway admits with no question: local or return-routed.
     pub fn allowed() -> Self {
         Self {
             setting: RemoteStartSetting::Allow,
@@ -70,8 +53,6 @@ impl RemoteStart {
         }
     }
 
-    /// Only Allow and Ask reach an engine. Ask always names its pairing,
-    /// because the card asks about it.
     fn is_admissible(&self) -> bool {
         match self.setting {
             RemoteStartSetting::Allow => true,
@@ -94,8 +75,6 @@ impl RemoteStart {
         }
     }
 
-    /// The header value, signed for `target_workspace` and the operation's
-    /// `nonce`. Hex, because a pairing label may hold any character.
     pub fn header_value(&self, key: &StampKey, target_workspace: &str, nonce: &str) -> String {
         let wire = Wire {
             start: self.clone(),
@@ -104,8 +83,6 @@ impl RemoteStart {
         crate::hex(&serde_json::to_vec(&wire).expect("plain fields serialize"))
     }
 
-    /// The start a header vouches for, or `None` for a missing, altered,
-    /// expired or inadmissible one.
     pub fn from_header(
         value: &str,
         key: &StampKey,

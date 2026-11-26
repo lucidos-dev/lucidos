@@ -1,14 +1,3 @@
-//! The update relay (ADR 0338): how a session that cannot install gets the
-//! desktop client to install for it.
-//!
-//! The gateway only carries messages. The client's Rust side posts a heartbeat
-//! here, and the reply hands it a pending request. The install itself runs in
-//! the client and never here: ADR 0108 records why a gateway-spawned installer
-//! kills itself part way through.
-//!
-//! Memory only. A successful install restarts the service and this state with
-//! it, so the requesting session settles on the running version instead.
-
 use crate::release_check::ReleaseCheck;
 use lucidos_update_channel::is_upgrade;
 use serde::{Deserialize, Serialize};
@@ -17,62 +6,40 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// A client whose last heartbeat is older than this is not attached. Three
-/// missed beats at the client's idle cadence.
 pub const ATTACHED_WITHIN: Duration = Duration::from_secs(15);
 
-/// An unclaimed request older than this is dropped, so a client that attaches
-/// hours after the tap never installs out of the blue.
 pub const REQUEST_EXPIRES_AFTER: Duration = Duration::from_secs(120);
 
-/// A claimed request with no progress this long after the claim is dropped.
-/// The client sends its first frame the moment a run starts. So silence means
-/// the claim never reached it, such as a heartbeat reply it timed out on.
 pub const CLAIM_UNCONFIRMED_AFTER: Duration = Duration::from_secs(30);
 
-/// The progress phases after which a run is over without a restart. Mirrors
-/// the terminal arms of `AppUpdatePhase` in the client's `updater.rs`.
 const TERMINAL_PHASES: &[&str] = &["failed", "bundle-swap-failed", "cancelled"];
 
-/// One heartbeat from the desktop client.
 #[derive(Debug, Deserialize)]
 pub struct Heartbeat {
-    /// The client's own version.
     pub version: String,
-    /// Why an unattended install could not run here, or absent when it could.
     #[serde(default)]
     pub blocker: Option<String>,
-    /// The latest progress frame of a relayed run.
     #[serde(default)]
     pub progress: Option<RelayedProgress>,
 }
 
-/// A progress frame, tagged with the request it belongs to.
 #[derive(Debug, Deserialize)]
 pub struct RelayedProgress {
     pub request: String,
-    /// An `AppUpdateProgress` frame exactly as the client emits it to its own
-    /// webviews. Carried opaque, so the requesting session reads the same shape
-    /// the local dialog does.
     pub frame: Value,
 }
 
-/// A request, as handed to the client and returned to the requester.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Ticket {
     pub id: String,
-    /// The release the requester saw. The client installs whatever its updater
-    /// resolves, and its frames name that version.
     pub version: String,
 }
 
-/// Why a request was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
     NoClient,
     Blocked(String),
     NoNewerRelease,
-    /// The forced poll failed, so the gateway cannot say what is published.
     CheckFailed(String),
     InFlight,
 }
@@ -101,19 +68,15 @@ struct Client {
 
 enum Relay {
     Idle,
-    /// Waiting for the client's next heartbeat to claim it.
     Requested {
         ticket: Ticket,
         at: Instant,
     },
-    /// Claimed at `claimed`. `frame` is the latest progress, absent until the
-    /// first arrives.
     Running {
         ticket: Ticket,
         claimed: Instant,
         frame: Option<Value>,
     },
-    /// Over without a restart: failed, refused or cancelled.
     Ended {
         ticket: Ticket,
         frame: Value,
@@ -125,11 +88,8 @@ struct State {
     relay: Relay,
 }
 
-/// The gateway's one relay. Held on `GatewayInner`.
 pub struct UpdateRelay {
     state: Mutex<State>,
-    /// Ticket ids are `<boot>-<n>`, so a frame from a run before a gateway
-    /// restart can never match a ticket issued after it.
     boot: u128,
     next: AtomicU64,
 }
@@ -158,10 +118,6 @@ impl State {
             .filter(|c| now.saturating_duration_since(c.seen) < ATTACHED_WITHIN)
     }
 
-    /// Drop a relay nobody will finish: a request left unclaimed too long, a
-    /// claim the client never confirmed, or a run whose client stopped beating.
-    /// Either way the requester hears "did not run" rather than waiting on a
-    /// dead run, and the next request is not refused as in flight.
     fn settle(&mut self, now: Instant) {
         let dead = match &self.relay {
             Relay::Requested { at, .. } => {
@@ -189,8 +145,6 @@ fn is_terminal(frame: &Value) -> bool {
 }
 
 impl UpdateRelay {
-    /// Record a heartbeat, and hand back the pending request if there is one.
-    /// A request is handed out exactly once.
     pub fn heartbeat(&self, beat: Heartbeat, now: Instant) -> Option<Ticket> {
         let mut st = self.lock();
         st.client = Some(Client {
@@ -235,8 +189,6 @@ impl UpdateRelay {
         }
     }
 
-    /// Queue a request for the client, or say why not. `latest` is the release
-    /// check's newest published version.
     pub fn request(&self, latest: Option<&str>, now: Instant) -> Result<Ticket, Refusal> {
         let mut st = self.lock();
         st.settle(now);
@@ -263,13 +215,6 @@ impl UpdateRelay {
         Ok(ticket)
     }
 
-    /// [`Self::request`] against the release check's newest version, forcing one
-    /// poll first when that version is not newer than the client.
-    ///
-    /// The hourly poll lags a fresh release, and a phone cannot ask the gateway
-    /// to look again. Only `NoNewerRelease` polls, so a request with no client,
-    /// a blocker or a run in flight never reaches the origin. The check keeps
-    /// its own floor, so a refused request cannot hammer the origin either.
     pub async fn request_refreshing(
         &self,
         check: &ReleaseCheck,
@@ -289,9 +234,6 @@ impl UpdateRelay {
         }
     }
 
-    /// The wire shape on `gateway/status`. `client` is null when no client is
-    /// attached, and `relay` is null when nothing is pending, running or
-    /// recently ended.
     pub fn snapshot(&self, now: Instant) -> Value {
         let mut st = self.lock();
         st.settle(now);
@@ -316,8 +258,6 @@ impl UpdateRelay {
         json!({ "client": client, "request": request })
     }
 
-    /// A poisoned lock means a panic while holding it. Every write here is a
-    /// whole-value replace, so no half-written state can be left behind.
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }

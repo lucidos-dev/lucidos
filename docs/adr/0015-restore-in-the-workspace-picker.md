@@ -2,6 +2,7 @@
 
 - **Status** — Accepted
 - **Date** — 2026-06-17
+- **Amended by** — [0810](0810-restore-uploads-are-resumable.md): the archive arrives as a resumable chunked upload, then a JSON commit starts the restore.
 
 ## Context
 

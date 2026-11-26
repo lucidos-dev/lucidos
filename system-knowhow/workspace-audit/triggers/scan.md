@@ -151,6 +151,10 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
   Domain-event names are arbitrary by design, so read the `workspace` bucket first, and never call one a misspelling.
 
+  If an Apply attempt did not wake a trigger on `ChangeApplyRequested`, check
+  for `EventHookRefused` on the source thread. See
+  `system-knowhow/thread-events/concrete-payload-shapes-selected-3.md` § "Plan and implementation stages".
+
   Payload values are not event types. Keep-alive reasons belong to `CacheKeepAliveStatusChanged`, as `system-knowhow/thread-events.md` documents. Audit the subscription's event name separately from its payload filters.
 
   **Ask the tool. Never assemble the retired set by hand.** `retired` comes from `ThreadEvent::LEGACY_TYPE_NAME_ALIASES`, which a test holds to the names serde still accepts. A list built by eye from `thread-events.md` misses about half, and adds frontend-only names that were never event renames.

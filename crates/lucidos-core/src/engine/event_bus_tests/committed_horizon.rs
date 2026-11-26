@@ -1,29 +1,16 @@
-//! A watermark is a committed horizon: no events row at or below it commits
-//! after it was read (ADR 0364).
-//!
-//! Each test parks one append after it drew its sequence, then commits a later
-//! event past it. The parked row is a late commit. Below a watermark, no
-//! catch-up scan could ever see it.
-
 use super::*;
 use tokio::task::JoinHandle;
 
-/// How the outside transaction lets a parked append go.
 enum Release {
-    /// The append was waiting on a row lock, and proceeds.
     Commit,
-    /// The append was waiting on a conflicting insert, which vanishes.
     Rollback,
 }
 
-/// An events row the test can look for, as a `WHERE` clause over `$1`.
 struct ParkedRow {
     predicate: &'static str,
     key: String,
 }
 
-/// Hold `thread_id`'s summary row, so an emit on that thread parks in its
-/// projection, after its INSERT drew a sequence.
 async fn hold_summary_row(
     pool: &PgPool,
     thread_id: Uuid,
@@ -37,8 +24,6 @@ async fn hold_summary_row(
     holder
 }
 
-/// Spawn a message on `thread_id` with a known event id. Its projection parks
-/// it behind [`hold_summary_row`].
 fn spawn_parked_thread_emit(bus: &EventBus, thread_id: Uuid) -> (Uuid, JoinHandle<i64>) {
     let event_id = Uuid::new_v4();
     let BusEvent::Thread { event, meta, .. } = thread_message(thread_id, None, "parked") else {
@@ -62,15 +47,12 @@ fn spawn_parked_thread_emit(bus: &EventBus, thread_id: Uuid) -> (Uuid, JoinHandl
     (event_id, parked)
 }
 
-/// A thread with a summary row, ready to be held.
 async fn seeded_thread(bus: &EventBus) -> Uuid {
     let thread_id = Uuid::new_v4();
     emit_thread_message(bus, thread_id, None, "start").await;
     thread_id
 }
 
-/// Read the horizon in the background, and with it whether `row` was already
-/// visible when the read returned.
 fn spawn_horizon_read(pool: &PgPool, row: ParkedRow) -> JoinHandle<(i64, bool)> {
     let pool = pool.clone();
     tokio::spawn(async move {
@@ -88,11 +70,6 @@ fn spawn_horizon_read(pool: &PgPool, row: ParkedRow) -> JoinHandle<(i64, bool)> 
     })
 }
 
-/// The invariant, around an append the caller has already parked.
-///
-/// A later event commits first. The horizon read then runs, and only after
-/// that does the parked append go. The read must not return a horizon at or
-/// above the parked sequence while that row is still uncommitted.
 async fn assert_horizon_covers_parked_append(
     pool: &PgPool,
     bus: &EventBus,
@@ -109,7 +86,6 @@ async fn assert_horizon_covers_parked_append(
         .seq;
 
     let mut read = spawn_horizon_read(pool, row);
-    // The parked append is one lock waiter. A read waiting it out is the second.
     let early = tokio::select! {
         r = &mut read => Some(r.unwrap()),
         _ = wait_until_blocked_on_locks(pool, 2) => None,
@@ -135,8 +111,6 @@ async fn assert_horizon_covers_parked_append(
     );
 }
 
-/// A thread emit holds a lower sequence uncommitted while a later event
-/// commits. `MAX(sequence)` alone reads past it.
 #[tokio::test]
 async fn a_watermark_never_passes_an_uncommitted_thread_event() {
     let (pool, db_name) = setup_test_db().await;
@@ -164,8 +138,6 @@ async fn a_watermark_never_passes_an_uncommitted_thread_event() {
     teardown_test_db(&db_name).await;
 }
 
-/// A persisted system event is an append like any other. It parks in its
-/// projection on a `notifications` row an outside transaction is inserting.
 #[tokio::test]
 async fn a_watermark_never_passes_an_uncommitted_system_event() {
     let (pool, db_name) = setup_test_db().await;
@@ -219,8 +191,6 @@ async fn a_watermark_never_passes_an_uncommitted_system_event() {
     teardown_test_db(&db_name).await;
 }
 
-/// A historical replay draws a sequence too. It parks on an outside
-/// transaction inserting the same event id, which then rolls back.
 #[tokio::test]
 async fn a_watermark_never_passes_an_uncommitted_replay() {
     let (pool, db_name) = setup_test_db().await;
@@ -274,8 +244,6 @@ async fn a_watermark_never_passes_an_uncommitted_replay() {
     teardown_test_db(&db_name).await;
 }
 
-/// A horizon read waiting out one slow append stalls nobody else. Every other
-/// emit in the workspace still commits.
 #[tokio::test]
 async fn a_waiting_horizon_read_does_not_stall_other_emits() {
     let (pool, db_name) = setup_test_db().await;
@@ -313,7 +281,6 @@ async fn a_waiting_horizon_read_does_not_stall_other_emits() {
     teardown_test_db(&db_name).await;
 }
 
-/// The backend pid of the connection holding `tx`.
 async fn backend_pid(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut **tx)
@@ -321,9 +288,6 @@ async fn backend_pid(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>) -> i32
         .unwrap()
 }
 
-/// The holder pid behind the append the horizon read is waiting on now. The
-/// read is the one backend waiting on an advisory lock. The append it waits
-/// on is blocked, in turn, by exactly one holder.
 async fn holder_behind_the_read(pool: &PgPool) -> i32 {
     sqlx::query_scalar(
         "SELECT unnest(pg_blocking_pids(a.pid)) FROM pg_stat_activity a \
@@ -336,12 +300,6 @@ async fn holder_behind_the_read(pool: &PgPool) -> i32 {
     .unwrap()
 }
 
-/// A read that cannot outlast stuck appends fails loudly rather than guess.
-/// Both arming callers turn the error into a refusal they already report.
-///
-/// Two stuck appends share ONE deadline. Halfway through, the append the read
-/// waits on goes, so the read moves to the other one with half its time left.
-/// A fresh timeout per append would run half again as long.
 #[tokio::test]
 async fn a_horizon_read_gives_up_on_stuck_appends_within_one_deadline() {
     const TIMEOUT_MS: u64 = 4_000;
@@ -358,8 +316,6 @@ async fn a_horizon_read_gives_up_on_stuck_appends_within_one_deadline() {
     }
     wait_until_blocked_on_locks(&pool, 2).await;
 
-    // Its own pool: the holders and parked appends take four of the five
-    // shared connections, and the read must not queue for one.
     let reader_pool = PgPool::connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
@@ -371,8 +327,6 @@ async fn a_horizon_read_gives_up_on_stuck_appends_within_one_deadline() {
         }
     });
     wait_until_blocked_on_locks(&pool, 3).await;
-    // Looked up before the sleep: the read waits on this append until it is
-    // released, and a starved test task can oversleep the whole deadline.
     let behind = holder_behind_the_read(&pool).await;
     tokio::time::sleep(std::time::Duration::from_millis(TIMEOUT_MS / 2)).await;
     let at = holders.iter().position(|(pid, _)| *pid == behind).unwrap();

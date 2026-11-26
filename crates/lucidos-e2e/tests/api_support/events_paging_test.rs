@@ -1,16 +1,3 @@
-//! Paging on `GET /api/v1/threads/:id/events`.
-//!
-//! One reported thread held 12,982 events and answered with 7,446,426 bytes, to
-//! paint a tail the render had already windowed to about 0.12 MB. The endpoint
-//! now serves the newest page and a cursor, and the client backfills as the
-//! reader scrolls up.
-//!
-//! The invariant these guard is that a SHORT thread never notices. The median
-//! thread in the reporting workspace is 198 events, so the overwhelming
-//! majority arrive whole in one response, exactly as before.
-//!
-//! Plan: `docs/plans/2026-09-20-a-long-thread-opens-without-its-whole-history.md`.
-
 use crate::support::{base_url, db_url, http_client, seed_chat_thread_summary};
 use serde_json::Value;
 use uuid::Uuid;
@@ -21,7 +8,6 @@ async fn pool() -> sqlx::PgPool {
         .expect("Failed to connect to e2e DB")
 }
 
-/// A thread of `n` chat messages, one second apart so the clock orders them.
 async fn seed_thread(pool: &sqlx::PgPool, n: i32) -> Uuid {
     let thread_id = Uuid::new_v4();
     seed_chat_thread_summary(pool, thread_id, "idle").await;
@@ -41,9 +27,6 @@ async fn seed_thread(pool: &sqlx::PgPool, n: i32) -> Uuid {
     thread_id
 }
 
-/// The snapshot, with query params encoded by the client rather than by hand. A
-/// `created` timestamp carries a `+` offset, which a raw query string would
-/// deliver as a space.
 async fn snapshot(thread_id: Uuid, params: &[(&str, String)]) -> Value {
     let url = format!("{}/api/v1/threads/{}/events", base_url(), thread_id);
     let res = http_client()
@@ -60,8 +43,6 @@ async fn snapshot(thread_id: Uuid, params: &[(&str, String)]) -> Value {
     res.json().await.expect("snapshot json")
 }
 
-/// A thread shorter than the page is served whole, and says nothing remains.
-/// `hasMore` is skipped when false, so its absence IS the answer.
 #[tokio::test]
 async fn a_short_thread_is_served_whole_with_nothing_older() {
     let pool = pool().await;
@@ -77,8 +58,6 @@ async fn a_short_thread_is_served_whole_with_nothing_older() {
     );
 }
 
-/// The unpaged read is byte-identical to the paged one that covers a thread
-/// with no auxiliary captures, which only the unpaged read keeps.
 #[tokio::test]
 async fn a_short_thread_reads_the_same_paged_or_not() {
     let pool = pool().await;
@@ -92,7 +71,6 @@ async fn a_short_thread_reads_the_same_paged_or_not() {
     );
 }
 
-/// A long thread answers with the NEWEST page and says older ones remain.
 #[tokio::test]
 async fn a_long_thread_answers_with_its_newest_page() {
     let pool = pool().await;
@@ -102,13 +80,10 @@ async fn a_long_thread_answers_with_its_newest_page() {
     let events = body["events"].as_array().expect("events array");
     assert_eq!(events.len(), 4, "one page");
     assert_eq!(body["hasMore"], Value::Bool(true), "eight older remain");
-    // Oldest-first within the page, and it is the TAIL of the thread.
     assert_eq!(events[0]["payload"]["text"], "message 8");
     assert_eq!(events[3]["payload"]["text"], "message 11");
 }
 
-/// The cursor walks back with no overlap and no gap. An overlap would double a
-/// turn in the transcript; a gap would lose one.
 #[tokio::test]
 async fn the_cursor_walks_back_over_every_event_once() {
     let pool = pool().await;
@@ -151,8 +126,6 @@ async fn the_cursor_walks_back_over_every_event_once() {
     assert_eq!(seen, expected, "every event once, oldest to newest");
 }
 
-/// `after` walks forward and `limit` walks backward, so asking both is a caller
-/// bug rather than a combination to resolve.
 #[tokio::test]
 async fn after_and_limit_together_are_refused() {
     let pool = pool().await;
@@ -167,7 +140,6 @@ async fn after_and_limit_together_are_refused() {
     assert_eq!(res.status(), 400, "the two are mutually exclusive");
 }
 
-/// Half a cursor cannot order anything, because rows are ordered by the pair.
 #[tokio::test]
 async fn half_a_cursor_is_refused() {
     let pool = pool().await;
@@ -186,9 +158,6 @@ async fn half_a_cursor_is_refused() {
     );
 }
 
-/// A page cannot hold the event that stamped the thread's pair when it sits
-/// behind the page, so the snapshot carries its pair stamps. An unpaged read
-/// carries every event and sends none.
 #[tokio::test]
 async fn a_page_carries_the_pair_stamped_behind_it() {
     let pool = pool().await;
@@ -217,9 +186,6 @@ async fn a_page_carries_the_pair_stamped_behind_it() {
     assert!(unpaged.get("pairStamps").is_none(), "unpaged sends none");
 }
 
-/// A card size picked behind the page still sizes a later card of that widget
-/// instance, so the snapshot carries the thread's card sizes. An unpaged read
-/// sends none.
 #[tokio::test]
 async fn a_page_carries_the_card_size_picked_behind_it() {
     let pool = pool().await;

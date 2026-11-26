@@ -127,7 +127,6 @@ async fn local_feed_and_bundle_follow_each_routers_port() {
     let temp = tempfile::tempdir().unwrap();
     let state = GatewayState::for_tests_with_static_dir(Some(temp.path().into()));
     staged(&state);
-    // Two independently bound listeners over the same staged home.
     for _ in 0..2 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = listener.local_addr().unwrap();

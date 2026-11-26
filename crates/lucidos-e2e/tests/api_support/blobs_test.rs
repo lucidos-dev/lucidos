@@ -1,11 +1,3 @@
-//! E2E tests for the content-addressed blob store HTTP surface.
-//!
-//! Covers POST /api/v1/threads/:id/blobs (multipart upload, returns hash),
-//! GET /api/v1/blobs/:hash (streams original with immutable cache),
-//! and GET /api/v1/blobs/:hash/preview (downscaled JPEG for browser display).
-//!
-//! See `docs/plans/2026-05-07-image-blob-store-design.md`.
-
 use crate::support::{
     base_url, db_url, encoded_jpeg, png_bytes, sha256_hex, user_client, workspace_path,
 };
@@ -85,7 +77,6 @@ async fn post_blob_returns_hash_and_writes_file() {
     assert_eq!(body["mime"], "image/png");
     assert_eq!(body["byte_size"], bytes.len());
 
-    // Verify the blob exists on disk under the workspace's data/blobs/ tree.
     let blob_path = workspace_path()
         .join("data/blobs")
         .join(&expected_hash[..2])
@@ -158,15 +149,11 @@ async fn post_blob_rejects_non_image_with_unsupported_mime() {
     );
 }
 
-/// The 415 must say what these bytes turned out to be. Reciting the allowlist
-/// leaves the caller to guess, which is what the paste bug did to the user.
 #[tokio::test]
 async fn post_blob_names_the_uploaded_format_in_its_415() {
     let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
 
-    // A little-endian TIFF header. The declared mime is a lie the server
-    // ignores: it reads the bytes.
     let mut tiff = vec![0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
     tiff.resize(64, 0);
     let form = Form::new().part(
@@ -196,7 +183,6 @@ async fn post_blob_names_the_uploaded_format_in_its_415() {
     );
 }
 
-/// An empty upload is its own verdict, not "we could not recognize this".
 #[tokio::test]
 async fn post_blob_calls_an_empty_upload_empty() {
     let client = user_client().await;
@@ -246,7 +232,6 @@ async fn post_blob_rejects_missing_thread() {
 async fn post_blob_rejects_discarded_thread() {
     let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
-    // Discard it.
     let del = client
         .delete(format!("{}/api/v1/threads/{}", base_url(), thread_id))
         .send()
@@ -357,7 +342,6 @@ async fn get_blob_sets_immutable_cache_header() {
         .get("cache-control")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    // Content-addressed = immutable; max-age=1 year is the convention.
     assert!(
         cache.contains("immutable") && cache.contains("max-age=31536000"),
         "Cache-Control must declare immutable and 1y max-age, got: {cache:?}"
@@ -367,7 +351,6 @@ async fn get_blob_sets_immutable_cache_header() {
 #[tokio::test]
 async fn get_blob_returns_404_for_unknown_hash() {
     let client = user_client().await;
-    // Valid-shaped hash but unused.
     let bogus = "0".repeat(64);
     let resp = client
         .get(blob_url(&bogus))
@@ -380,7 +363,6 @@ async fn get_blob_returns_404_for_unknown_hash() {
 #[tokio::test]
 async fn get_blob_returns_404_for_malformed_hash() {
     let client = user_client().await;
-    // Path traversal attempt + short string — must not 200.
     let resp = client
         .get(blob_url("..%2F..%2Fetc%2Fpasswd"))
         .send()
@@ -399,8 +381,6 @@ async fn get_blob_returns_404_for_malformed_hash() {
 async fn get_blob_preview_downscales_large_image_to_jpeg() {
     let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
-    // 4000 long edge — exceeds the 2048-px preview cap, so the endpoint
-    // must serve a downscaled JPEG instead of the original.
     let bytes = encoded_jpeg(4000, 3000);
     let upload = client
         .post(blobs_url(&thread_id))
@@ -448,8 +428,6 @@ async fn get_blob_preview_downscales_large_image_to_jpeg() {
 async fn get_blob_preview_serves_original_when_image_within_cap() {
     let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
-    // 800×600 is well under the 2048-px cap — endpoint must serve the
-    // original bytes (and the original PNG mime, in this case).
     let bytes = png_bytes();
     let upload = client
         .post(blobs_url(&thread_id))
@@ -519,19 +497,12 @@ async fn get_blob_preview_sets_immutable_cache_header() {
         .get("cache-control")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    // Preview is content-addressed (deterministic from original + cap), so
-    // same immutable cache contract as the original.
     assert!(
         cache.contains("immutable") && cache.contains("max-age=31536000"),
         "Cache-Control must declare immutable and 1y max-age, got: {cache:?}"
     );
 }
 
-/// Regression: lazy preview generation took 16-25 s on first display for
-/// large iPhone JPEGs in dev. iOS Safari aborted the fetch and the page
-/// was left with broken `<img>` elements until reload. POST /blobs must
-/// pre-generate the preview in the background so the first display GET
-/// always hits the warm cache.
 #[tokio::test]
 async fn post_blob_pregenerates_preview_in_background_for_large_image() {
     let client = user_client().await;
@@ -562,8 +533,6 @@ async fn post_blob_pregenerates_preview_in_background_for_large_image() {
             lucidos_engine::core::blobs::PREVIEW_MAX_EDGE
         ));
 
-    // Background task starts after upload returns; poll for the cache file
-    // to appear within a generous window (debug build, Lanczos3 4k→2k).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if cache_path.exists() {
@@ -577,9 +546,6 @@ async fn post_blob_pregenerates_preview_in_background_for_large_image() {
     );
 }
 
-/// The pre-generation must NOT block the upload response — the user's
-/// upload latency stays bounded by network + multipart parse, never by
-/// decode + resize.
 #[tokio::test]
 async fn post_blob_returns_quickly_even_when_pregeneration_is_slow() {
     let client = user_client().await;
@@ -596,9 +562,6 @@ async fn post_blob_returns_quickly_even_when_pregeneration_is_slow() {
     let elapsed = start.elapsed();
     assert!(upload.status().is_success());
 
-    // Synchronous Lanczos3 4k→2k on a debug build is ~5-10 s. The upload
-    // response must come back well under that. 3 s leaves comfortable
-    // headroom for slow CI without masking a regression.
     assert!(
         elapsed < std::time::Duration::from_secs(3),
         "POST /blobs took {elapsed:?} — preview pre-generation must not block the response"
@@ -614,9 +577,6 @@ fn inline_image(bytes: &[u8]) -> serde_json::Value {
     json!({ "base64": base64::engine::general_purpose::STANDARD.encode(bytes) })
 }
 
-/// An inline image on `/chat/stream` is refused exactly as an upload of the
-/// same bytes is, and before any thread exists. A caller that cannot upload
-/// first, such as `lucidos spawn-thread --image`, sends images this way.
 #[tokio::test]
 async fn chat_stream_refuses_an_inline_tiff_like_an_upload_and_starts_nothing() {
     let client = user_client().await;
@@ -656,8 +616,6 @@ async fn chat_stream_refuses_an_inline_tiff_like_an_upload_and_starts_nothing() 
     assert_eq!(rows, 0, "a refused image must not leave a thread behind");
 }
 
-/// The engine sniffs an inline image, as it sniffs an upload, so the message
-/// records the stored blob and never the client's mislabel.
 #[tokio::test]
 async fn chat_stream_stores_an_inline_image_under_its_sniffed_format() {
     let client = user_client().await;

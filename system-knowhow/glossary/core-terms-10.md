@@ -86,7 +86,7 @@ A *sub-thread* that another agent started reports to that agent. When its report
 
 The sub-thread's own agent is told the same, so it decides the same way. A child spawned with `wake` or `wake-when-all-done` always learns that its parent acts on its report. One that decides its own wake learns it for the reports that wake the parent. A `no-wake` child and a top-level thread are not told, since you read their reports in the thread itself. A turn you open in the sub-thread is answered as usual (ADR 0607).
 
-A no changes nothing you see, and never clears an earlier read request you have not read yet. Answering a question the thread asked does clear it, since the question sits at the end of the reply, as sending a message does.
+A no changes nothing you see, and never clears an earlier read request you have not read yet. The exception is a sub-thread spawned with `wake` or `wake-when-all-done`: its parent already has the earlier report, so a later no clears it. A request from a turn you opened, answered a question in, or wrote into in that sub-thread stays (ADR 0417). Answering a question the thread asked does clear it, since the question sits at the end of the reply, as sending a message does.
 
 ### Wake mode
 What a *child thread*'s report does to its *parent thread*, declared by the spawn: `wake_mode` on `run_thread` and `run_coding_agent`, `--wake-mode` on `lucidos spawn-thread --relation child`.
@@ -141,16 +141,16 @@ What a *thread* is doing right now, as Lucidos reports it: one `state` plus the 
 |---|---|
 | `working` | A turn runs and was active within 10 minutes, or a successor session is about to start. |
 | `quiet` | A turn runs but nothing happened for 10 minutes or more. Not a verdict. |
-| `waiting_for_user_answer` | Parked on a question card. |
+| `waiting_for_user_answer` | Parked on a question card the owner is asked to answer. A held thread never reads this. |
 | `paused` | A version switch interrupted it, and Lucidos resumes it. |
 | `failed` | The last turn failed, and nothing started since. |
 | `queued` | The Thread Queue holds the thread until capacity frees. |
-| `held` | An owner Stop or a *hold* holds every wake. A Stop lifts with your next message, a hold only with Resume. |
+| `held` | An owner Stop or a *hold* holds every wake. A Stop lifts with your next message, a hold only with Resume. A held thread parked on a question reads `held` too: its card stays open, but nobody is asked to answer it. |
 | `stalled` | A *handoff* happened, and the successor session has not started for 2 minutes. |
 | `waiting` | No turn, but it wakes itself: an *event wait* or a sub-thread it waits on. |
 | `idle` | Nothing runs and nothing is owed. |
 
-Read what a thread is doing from `liveness.state`. The adjacent `status` is the *turn status*. `status: idle` means no turn is open, and `status: waiting` is a legacy value. A thread can have turn status `idle` while its liveness is `waiting`, `held` or `queued`.
+Read what a thread is doing from `liveness.state`. The adjacent `status` is the *turn status*. `status: idle` means no turn is open, and `status: waiting` is a legacy value. A thread can have turn status `idle` while its liveness is `waiting`, `held` or `queued`, and turn status `waiting_for_user_answer` while its liveness is `held`.
 
 Liveness gives the seconds since the last event and the current agent session's ordinal, opening and age. `handoff: "pending"` shows while a handoff waits, and `as_of` says when Lucidos looked. The following evidence appears when present.
 

@@ -1,12 +1,6 @@
 use super::super::*;
 use super::*;
 
-/// Regression for the bug fixed in commit 601224815: when the runtime
-/// out-of-tx decrement in `notify_parent_if_child` fails (transient error,
-/// or path skipped entirely), the parent's `active_children_count` stays
-/// non-zero. Pre-fix, ChangeApplied never touched the counter — the parent
-/// remained pinned in ACTIVE indefinitely even after the user clicked Apply.
-/// Post-fix, ChangeApplied recomputes the counter from ground truth.
 #[tokio::test]
 async fn test_change_applied_reconciles_parent_active_children_count() {
     let (pool, db_name) = setup_test_db().await;
@@ -16,9 +10,6 @@ async fn test_change_applied_reconciles_parent_active_children_count() {
     emit_cc_session_started(&bus, child_id).await;
     emit_cc_idle(&bus, child_id, true, None).await;
 
-    // Simulate the runtime drift: force parent's active_children_count back
-    // up to 1 (as if the CodingAgentIdled decrement failed). The reconcile on
-    // ChangeApplied must heal it.
     sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
         .bind(parent_id)
         .execute(&pool)
@@ -74,9 +65,6 @@ async fn test_change_applied_reconciles_parent_active_children_count() {
     teardown_test_db(&db_name).await;
 }
 
-/// Mirror of `test_change_applied_reconciles_parent_active_children_count`
-/// for the Discard path. The proposal lifecycle ends the same way whether
-/// the user accepts or rejects, so both events must reconcile the parent.
 #[tokio::test]
 async fn test_change_discarded_reconciles_parent_active_children_count() {
     let (pool, db_name) = setup_test_db().await;
@@ -86,7 +74,6 @@ async fn test_change_discarded_reconciles_parent_active_children_count() {
     emit_cc_session_started(&bus, child_id).await;
     emit_cc_idle(&bus, child_id, true, None).await;
 
-    // Seed the same drift as the Apply test.
     sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
         .bind(parent_id)
         .execute(&pool)
@@ -133,21 +120,6 @@ async fn test_change_discarded_reconciles_parent_active_children_count() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: when a CC child idles, the parent's `active_children_count`
-/// decrement runs OUT-OF-TX in `notify_parent_if_child` (separate UPDATE on
-/// the pool, then a fire-and-forget `ChildrenCountChanged` broadcast). The
-/// IN-TX broadcast that piggy-backs in the affected-ancestor loop carries
-/// the parent's aggregate captured BEFORE the out-of-tx decrement, so it
-/// reports `active=1` while the next broadcast reports `active=0`. If the
-/// post-tx broadcast is lost (iOS PWA SSE drop, page off, restart window),
-/// the page is stuck pulsing "waiting on children" until the next event with
-/// an ancestor refresh — or, in the user-reported case, until `ChangeApplied`
-/// runs `reconcile_parent_active_children_count` in-tx.
-///
-/// Contract: every `ChildrenCountChanged` broadcast for the parent that
-/// fires during the terminal-event emit MUST carry the post-decrement
-/// `active` value. The IN-TX aggregate is the only durable signal — the
-/// out-of-tx broadcast is best-effort and can be lost without recourse.
 #[tokio::test]
 async fn test_cc_idle_in_tx_broadcast_carries_decremented_parent_active() {
     let (pool, db_name) = setup_test_db().await;
@@ -158,7 +130,6 @@ async fn test_cc_idle_in_tx_broadcast_carries_decremented_parent_active() {
     emit_cc_session_started(&bus, child_id).await;
     assert_active_children(&pool, parent_id, 1, "child running, parent count = 1").await;
 
-    // Drain setup events so we only observe what the idle emit produces.
     while rx.try_recv().is_ok() {}
 
     emit_cc_idle(&bus, child_id, false, None).await;
@@ -195,23 +166,12 @@ async fn test_cc_idle_in_tx_broadcast_carries_decremented_parent_active() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression for the multi-sibling double-decrement: when the parent has
-/// 2+ running CC children and one of them idles, the in-tx
-/// `reconcile_parent_active_children_count` correctly recomputes the parent's
-/// `active_children_count` from ground truth (siblings still running), and
-/// the out-of-tx `update_parent_after_child_terminal` must NOT then subtract
-/// another 1 on top — otherwise the parent reports one fewer active child
-/// than reality. The single-child test
-/// `test_cc_idle_in_tx_broadcast_carries_decremented_parent_active` doesn't
-/// catch this because `GREATEST(0, 0 - 1) = 0` clamps the over-decrement to
-/// the same value the reconcile already wrote.
 #[tokio::test]
 async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let mut rx = bus.subscribe();
 
-    // Parent + two CC children sharing the same parent.
     let parent_id = Uuid::new_v4();
     let child_a = Uuid::new_v4();
     let child_b = Uuid::new_v4();
@@ -274,10 +234,8 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
     )
     .await;
 
-    // Drain setup events.
     while rx.try_recv().is_ok() {}
 
-    // Idle just child_a. Child_b is still running.
     emit_cc_idle(&bus, child_a, false, None).await;
 
     assert_active_children(
@@ -318,18 +276,6 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
     teardown_test_db(&db_name).await;
 }
 
-/// A child paused on a user question (`status='waiting_for_user_answer'`)
-/// is still in flight — the user owes an answer before the agent can
-/// resume. The `+1` from MessageReceived is never decremented on entry to
-/// WaitingForUserAnswer, and `reincrement_parent_active_count_if_revived`
-/// explicitly opts out of re-incrementing on UserQuestionAnswered, so the
-/// parent's counter is expected to stay bumped throughout the paused
-/// window. The in-tx `reconcile_parent_active_children_count` must match
-/// that semantic — counting WaitingForUserAnswer children as active —
-/// otherwise a sibling's terminal event silently zeroes the parent's
-/// counter while a paused child still owes work. (Same definition the
-/// sibling helper `reconcile_descendant_counts_from`
-/// uses at the `status IN ('running', 'waiting_for_user_answer')` filter.)
 #[tokio::test]
 async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
     let (pool, db_name) = setup_test_db().await;
@@ -398,8 +344,6 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
     )
     .await;
 
-    // child_paused asks a permission question → status='waiting_for_user_answer'.
-    // No reincrement / decrement on the parent; parent.count stays at 2.
     bus.emit(BusEvent::Thread {
         thread_id: child_paused,
         event: ThreadEvent::CodingAgentPermissionRequest {
@@ -432,9 +376,6 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
     )
     .await;
 
-    // Sibling idles. The in-tx reconcile must still count child_paused as in
-    // flight (the user owes an answer) — anything else silently drops the
-    // count below the true number of unfinished children.
     emit_cc_idle(&bus, child_running, false, None).await;
 
     assert_active_children(
@@ -453,9 +394,6 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
     teardown_test_db(&db_name).await;
 }
 
-/// Terminal-cause CC abort (SafetyNet / ProcessKilled) is unrecoverable
-/// without explicit user resume — must decrement (regression of 5a017815c
-/// otherwise: parent stays Active forever).
 #[tokio::test]
 async fn test_cc_child_terminal_abort_decrements_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -492,10 +430,6 @@ async fn test_cc_child_terminal_abort_decrements_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// If a CC sub-thread is canceled and a later CodingAgentIdled lands (e.g. a
-/// background Claude tick that fires after the cancel persisted), the parent
-/// must NOT be double-decremented. The cancel decrements once and marks the
-/// callback as sent; the late idle is a no-op.
 #[tokio::test]
 async fn test_cc_child_idle_after_cancel_does_not_double_decrement() {
     let (pool, db_name) = setup_test_db().await;
@@ -551,12 +485,6 @@ async fn test_cc_child_idle_after_cancel_does_not_double_decrement() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: a CC sub-thread that hits a stale resume must NOT decrement its
-/// parent's `active_children_count` or fire a completion callback. The chat
-/// handler is mid-retry against a fresh session — the real CodingAgentIdled
-/// (with results) lands seconds later, and decrementing now would orphan it
-/// (the second decrement clamps at 0; the second callback is suppressed by
-/// `parent_callback_pending`).
 #[tokio::test]
 async fn test_cc_child_stale_resume_does_not_decrement_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -585,8 +513,6 @@ async fn test_cc_child_stale_resume_does_not_decrement_parent() {
     .unwrap();
     assert_active_children(&pool, parent_id, 1, "parent should have 1 active child").await;
 
-    // Stale resume: SessionEnded { StaleResume } fires, then the chat handler
-    // retries with a fresh session.
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionEnded {

@@ -1,5 +1,3 @@
-//! Backup capture has no provider or encryption dependency. Its scratch
-//! directory belongs to the caller and remains alive through upload.
 use super::*;
 
 pub(super) fn capture_workspace_archive(
@@ -10,29 +8,21 @@ pub(super) fn capture_workspace_archive(
     ws_bytes: u64,
     progress: &dyn Fn(&str, usize, usize),
 ) -> Result<PathBuf, BoxError> {
-    // Load data/.backupignore once for this run — shared by the tar walk
-    // (the workspace can have tens of thousands of entries; never
-    // re-parse per file).
     let ignore = BackupIgnore::load(workspace);
 
-    // Phase weights from the size already computed for preflight.
     progress("estimating", 0, 100);
     let (dump_end, _, _) = estimate_weights(ws_bytes);
 
-    // Phase 1: pg_dump (0% → dump_end%)
     crate::log_legacy!("[Backup] Phase 1/4: pg_dump");
     progress("dumping_db", 1, 100);
     let dump_path = temp_path.join("lucidos_backup.dump");
     pg_dump(database_url, &dump_path)?;
-    // The dump holds sealed secrets, so the archive carries their key
-    // beside it, inside the same encryption (ADR 0509).
     let secret_key_path = temp_path.join(SECRET_STORE_KEY_ENTRY);
     lucidos_local_token::write_owner_only(
         &secret_key_path,
         &crate::core::secret_store::key()?.to_base64(),
     )?;
 
-    // Phase 2: tar + zstd compress (dump_end% → compress_end%)
     crate::log_legacy!("[Backup] Phase 2/4: tar + zstd compress");
     progress("compressing", dump_end, 100);
     let compressed_path = temp_path.join("backup.tar.zst");
@@ -47,7 +37,6 @@ pub(super) fn capture_workspace_archive(
     Ok(compressed_path)
 }
 
-/// Metadata read in the exact PostgreSQL snapshot imported by pg_dump.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DatabaseCapture {
     pub db_captured_at: DateTime<Utc>,
@@ -56,7 +45,7 @@ pub struct DatabaseCapture {
     pub secret_key_ids: std::collections::BTreeSet<String>,
 }
 
-/// Export a repeatable-read snapshot and keep its transaction alive until the
+/// INVARIANT: Export a repeatable-read snapshot and keep its transaction alive until the
 /// dump subprocess finishes. The pool must use the engine role.
 pub async fn capture_database(
     pool: &PgPool,
@@ -106,7 +95,6 @@ pub async fn capture_database(
                 format!("SELECT value FROM public.{table}, jsonb_each_text({column})")
             }
         };
-        // Values stay inside the engine and only their key ids leave this loop.
         let values: Vec<String> = sqlx::query_scalar(&query).fetch_all(&mut *tx).await?;
         for value in values {
             if let Some(id) = sealed_key_id(&value) {
@@ -133,8 +121,6 @@ fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// An index describes the bytes actually archived, including padding required
-/// when a live file shrinks during capture.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileIndexEntry {
     pub path: PathBuf,
@@ -153,7 +139,7 @@ pub struct FileCapture {
     pub tree_sha256: String,
 }
 
-/// Capture backup-scope workspace files only. Neither a database dump nor a
+/// INVARIANT: Capture backup-scope workspace files only. Neither a database dump nor a
 /// key-store key is added to this archive. Output belongs outside the workspace.
 pub fn capture_files(workspace: &Path, output: &Path) -> Result<FileCapture, BoxError> {
     use sha2::{Digest, Sha256};
@@ -197,7 +183,6 @@ pub fn capture_files(workspace: &Path, output: &Path) -> Result<FileCapture, Box
         }
     }
     builder.into_inner()?.finish()?;
-    // Index the archived bytes, rather than reading the live files twice.
     let decoder = zstd::Decoder::new(std::fs::File::open(&archive_path)?)?;
     let mut archive = tar::Archive::new(decoder);
     let mut index = zstd::Encoder::new(

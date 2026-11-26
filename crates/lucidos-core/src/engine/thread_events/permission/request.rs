@@ -1,5 +1,3 @@
-//! Word and append an engine-owned permission card.
-
 use uuid::Uuid;
 
 use super::batch;
@@ -9,14 +7,11 @@ use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Every permission request's card id starts with this, so a log line names
-/// what raised it.
 pub const CARD_ID_PREFIX: &str = "permission-request:";
 
-/// The heading over the agent's reason on a permission card.
 pub const REASON_HEADING: &str = "The agent's reason";
 
-/// Engine-worded text in the permission card shape: a bold question, then the
+/// INVARIANT: Engine-worded text in the permission card shape: a bold question, then the
 /// facts, any exact payload, and the agent's reason in its own quote.
 ///
 /// Every reason line, after `\n` or `\r`, starts with `>`, so the agent's
@@ -28,21 +23,18 @@ pub struct PermissionCardText {
 }
 
 impl PermissionCardText {
-    /// Start a card with its question. The caller escapes any name in it.
     pub fn new(question: &str) -> Self {
         Self {
             text: format!("**{question}**"),
         }
     }
 
-    /// A plain paragraph: a consequence the owner must know.
     pub fn paragraph(mut self, text: &str) -> Self {
         self.text.push_str("\n\n");
         self.text.push_str(text);
         self
     }
 
-    /// Exact items (programs, folders, files) as a bullet list of inline code.
     pub fn items<S: AsRef<str>>(mut self, items: impl IntoIterator<Item = S>) -> Self {
         let list: Vec<String> = items
             .into_iter()
@@ -55,8 +47,6 @@ impl PermissionCardText {
         self
     }
 
-    /// An exact payload the owner reads verbatim, in a code block whose fence
-    /// is longer than any backtick run inside it.
     pub fn payload(mut self, language: &str, body: &str) -> Self {
         let fence = "`".repeat(longest_backtick_run(body).saturating_add(1).max(3));
         self.text
@@ -64,7 +54,6 @@ impl PermissionCardText {
         self
     }
 
-    /// The finished text, with the agent's reason quoted under its heading.
     pub fn finish(mut self, reason: Option<&str>) -> String {
         if let Some(reason) = reason {
             self.text
@@ -79,8 +68,6 @@ impl PermissionCardText {
     }
 }
 
-/// `text` as inline code that no backtick in it can close. A line break shows
-/// as `\n` or `\r`, so it cannot end the list item.
 pub fn inline_code(text: &str) -> String {
     let flat = text.replace('\n', "\\n").replace('\r', "\\r");
     let ticks = "`".repeat(longest_backtick_run(&flat) + 1);
@@ -96,14 +83,12 @@ fn longest_backtick_run(text: &str) -> usize {
     text.split(|c| c != '`').map(str::len).max().unwrap_or(0)
 }
 
-/// One option the engine words for a request.
 pub struct RequestOption {
     pub label: String,
     pub description: String,
     pub choice: PermissionChoice,
 }
 
-/// What the engine asks: its words, and the typed request behind them.
 pub struct RequestCard {
     pub question: String,
     pub header: &'static str,
@@ -113,7 +98,6 @@ pub struct RequestCard {
     pub batch: Option<batch::Batch>,
 }
 
-/// The options the question parser makes of this card, with their ids.
 pub fn parsed_options(card: &PreparedCard) -> Vec<crate::engine::thread_events::QuestionOption> {
     crate::engine::question_parsing::parse_ask_user_question_inputs(
         &serde_json::json!({ "questions": card.questions() }),
@@ -123,8 +107,6 @@ pub fn parsed_options(card: &PreparedCard) -> Vec<crate::engine::thread_events::
 }
 
 impl RequestCard {
-    /// Split the card into its words and its typed request. Each choice is
-    /// keyed by the id the question parser gives its option.
     pub fn into_parts(self) -> (PreparedCard, PermissionRequest) {
         let words = PreparedCard {
             question: self.question,
@@ -156,9 +138,6 @@ impl RequestCard {
     }
 }
 
-/// Raise `card` on `thread_id` and return its id. The engine wrote every word,
-/// so no agent text reaches an option. Raised while a turn runs, the card
-/// queues and posts when the turn ends (ADR 0803).
 pub async fn raise_request(
     bus: &EventBus,
     thread_id: Uuid,
@@ -168,8 +147,6 @@ pub async fn raise_request(
     raise(bus, thread_id, card, channel, false).await
 }
 
-/// [`raise_request`] for a card a turn holds for: the caller polls for its
-/// answer, or parks its run on it with no terminal. It posts at once.
 pub async fn raise_turn_holding_request(
     bus: &EventBus,
     thread_id: Uuid,

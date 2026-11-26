@@ -1,7 +1,3 @@
-//! `GET` thread-listing handlers — the UI-shaped fetch, the projection
-//! summaries/count surface, the older-page paginator, and filter facets —
-//! plus the shared family-extension loader they build on.
-
 use crate::engine::chat::held_messages::HeldMessagesExt;
 use axum::{
     extract::{Path, Query, State},
@@ -19,25 +15,11 @@ use crate::core::store::{
 
 #[derive(Deserialize)]
 pub struct ListThreadsQuery {
-    /// Thread ID the frontend currently has focused — ensures it's included in the
-    /// response even if it's not in the recent/saved/active lists.
     pub focused: Option<String>,
 }
 
-/// Hard cap on how many family-extension threads `list_threads` and
-/// `get_older_threads` will pull in alongside the paginated base set. Without
-/// a cap, an archive page covering a pathological fan-out root (one chat
-/// spawning hundreds of coding-agent / trigger children) balloons the initial payload
-/// into the hundreds, and the frontend's drawer re-renders every row on each
-/// SSE flush. 100 is enough to render typical families completely; deeper
-/// families reveal themselves on scroll-pagination.
 const MAX_FAMILY_THREADS: i64 = 100;
 
-/// Collect the family extension for a base set of threads. Skips the SQL
-/// roundtrip entirely when no base thread has a parent or children — most
-/// chat-only workspaces never trigger the recursive CTE this way. Used by
-/// both `list_threads` and `get_older_threads`; the error mapping lives
-/// here so both call sites stay one-liners.
 async fn load_family_threads<'a>(
     store: &EventStore,
     base: impl Iterator<Item = &'a ThreadSummary>,
@@ -66,7 +48,6 @@ async fn load_family_threads<'a>(
         })
 }
 
-/// The home thread's summary, or `None` before one exists.
 async fn home_thread_summary(
     store: &EventStore,
     pool: &sqlx::PgPool,
@@ -91,14 +72,10 @@ async fn home_thread_summary(
     Ok(threads.pop())
 }
 
-/// GET /api/v1/threads — returns saved threads, recent archive, and active thread IDs
 pub(in crate::api) async fn list_threads(
     State(state): State<AppState>,
     Query(query): Query<ListThreadsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Active thread IDs — only threads with a live processing task (chat loop running).
-    // Coding-agent session existence no longer makes a thread "active" — the status column in
-    // thread_summaries handles that.
     let active_id_strings: Vec<String> = state
         .engine
         .processing_thread_ids()
@@ -106,7 +83,6 @@ pub(in crate::api) async fn list_threads(
         .map(|id| id.to_string())
         .collect();
 
-    // Run all DB queries in parallel
     let store = state.engine.event_store();
     let (
         saved_result,
@@ -117,18 +93,10 @@ pub(in crate::api) async fn list_threads(
         home_result,
     ) = tokio::join!(
         store.get_saved_threads(),
-        // Global newest-`created_at` archive slice (no longer per-source); 30 fills
-        // the initial Archive view comfortably before scroll-pagination takes over.
         store.get_recent_threads(30),
         store.get_threads_by_ids(&active_id_strings),
         store.get_composing_threads(),
-        // Unfiltered total for the first-paint badge; the frontend re-fetches a
-        // filter-scoped count via GET /threads/archived-count when a drawer
-        // filter is active (see `refreshArchivedCount`).
         store.count_archived_threads(None, None, None, None),
-        // The client's Home entries open the home thread whatever its age.
-        // The inbox lists only threads that have answered, so a new one needs
-        // its own read (ADR 0362).
         home_thread_summary(store, &state.pool),
     );
 
@@ -170,10 +138,6 @@ pub(in crate::api) async fn list_threads(
 
     let home_thread = home_result?;
 
-    // If the frontend has a focused thread, ensure it's in the response.
-    // The focused thread may fall outside the global newest-30 archive slice
-    // fetched above, not be saved, and not be actively processing. Without
-    // this, reload would lose it.
     let focused_thread = if let Some(ref focused_id) = query.focused {
         let already_included = saved.iter().any(|t| t.thread_id == *focused_id)
             || recent.iter().any(|t| t.thread_id == *focused_id)
@@ -198,7 +162,7 @@ pub(in crate::api) async fn list_threads(
         None
     };
 
-    // Load any family members (ancestors + descendants) of the base set
+    // INVARIANT: Load any family members (ancestors + descendants) of the base set
     // that aren't already in it. The drawer's family-aware routing
     // (ThreadDrawer.tsx → categorizeThreads) lifts a whole family to the
     // freshest member's recency and nests children under their parent;
@@ -216,9 +180,6 @@ pub(in crate::api) async fn list_threads(
     let mut response = serde_json::json!({
         "saved": saved,
         "archive": recent,
-        // Total archived-pile size (not just the loaded `archive` window) — the
-        // collapsed Archive section's count badge reads this so it reflects the
-        // true total instead of however many rows happen to be paginated in.
         "archive_count": archive_count,
         "active": active_id_strings,
         "active_threads": active_threads,
@@ -242,58 +203,26 @@ pub(in crate::api) async fn list_threads(
     Ok(Json(response))
 }
 
-/// Shared query parameters for `GET /api/v1/threads/list` and
-/// `GET /api/v1/threads/count` — the script/trigger/LLM-tool surface for
-/// querying thread summaries. Mirrors the CLI flags on `lucidos threads list`
-/// and the args on the `list_threads` LLM tool.
 #[derive(Deserialize)]
 pub struct ListThreadSummariesQuery {
-    /// The UNION of `running` and `waiting_for_user_answer`. `true` selects it,
-    /// `false` inverts it, omitting it filters nothing.
-    ///
-    /// For "is the workspace busy?", use `status=running` instead: a thread
-    /// awaiting a user answer is blocked on the human, not working, so it is in
-    /// this union while being the opposite of busy. `waiting` is in neither: it
-    /// means the coding agent stopped and proposed changes the user must act on.
-    ///
-    /// Mutually exclusive with `status`, which is the precise form of the same
-    /// question.
     #[serde(default)]
     pub active: Option<bool>,
-    /// Comma-separated status filter, naming exactly the statuses to keep, in
-    /// the same spelling every returned row's `status` field carries (the
-    /// kebab form `waiting-for-user-answer` is accepted too). Mutually
-    /// exclusive with `active`. An unrecognized or empty value is a 400, never
-    /// a silently empty or unfiltered result.
     #[serde(default)]
     pub status: Option<String>,
-    /// Comma-separated source filter: `chat`, `trigger`, `coding-agent`
-    /// (`claude_code` is accepted as a legacy alias).
     #[serde(default)]
     pub source: Option<String>,
-    /// Server clamps to 1..=1000. Default 100. Only consumed by the list
-    /// handler; the count handler ignores it.
     #[serde(default)]
     pub limit: Option<i64>,
-    /// Restrict to the direct children of this thread id. Always a literal
-    /// uuid: HTTP has no ambient caller, so there is no "self" to resolve. The
-    /// LLM tool's `my_children` argument is the surface that resolves the
-    /// caller's own id, from its ambient `thread_id`.
     #[serde(default)]
     pub parent: Option<String>,
-    /// `true` keeps threads holding an unsent draft, `false` keeps the rest.
     #[serde(default)]
     pub has_draft: Option<bool>,
-    /// Keeps coding-agent threads whose change state has this kind.
     #[serde(default)]
     pub change_state: Option<crate::engine::thread_lifecycle::ChangeStateKind>,
-    /// The retired filter `change_state` replaced. Read only to refuse it.
     #[serde(default)]
     pub has_diff: Option<String>,
 }
 
-/// Refuse the retired `has_diff` filter by name (ADR 0400). Ignoring it would
-/// answer an old caller with every thread.
 fn refuse_retired_filters(q: &ListThreadSummariesQuery) -> Result<(), (StatusCode, String)> {
     match q.has_diff {
         Some(_) => Err((
@@ -309,15 +238,6 @@ fn refuse_retired_filters(q: &ListThreadSummariesQuery) -> Result<(), (StatusCod
     }
 }
 
-/// Resolve the `active` / `status` query params into the single filter the
-/// store takes.
-///
-/// Sending both is a 400 rather than an intersection: they are two answers to
-/// one question, and quietly ANDing them would produce an empty result for
-/// `active=true&status=idle` and a redundant one for `active=true&status=running`,
-/// neither of which is what the caller asked. The message names the way out
-/// because the likely reason a caller reached for both is that `active` did not
-/// mean what they expected.
 fn parse_status_filter(
     q: &ListThreadSummariesQuery,
 ) -> Result<Vec<crate::engine::thread_lifecycle::ThreadStatus>, (StatusCode, String)> {
@@ -337,9 +257,6 @@ fn parse_status_filter(
     }
 }
 
-/// Build the store filter from the already-validated pieces. Kept separate
-/// from [`parse_status_filter`] because `StatusFilter::OneOf` borrows the
-/// parsed vector, which has to outlive the query.
 fn status_filter<'a>(
     active: Option<bool>,
     statuses: &'a [crate::engine::thread_lifecycle::ThreadStatus],
@@ -353,9 +270,6 @@ fn status_filter<'a>(
     }
 }
 
-/// Parse an optional thread-id query param (`parent`, `thread_id`). A
-/// malformed uuid is a 400 rather than a silent "no filter", which would
-/// quietly answer about the whole workspace.
 fn parse_thread_id_param(
     raw: &Option<String>,
     param: &str,
@@ -385,20 +299,12 @@ fn parse_source_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Map an optional comma-separated query param to the filter shape the store
-/// helpers expect.
 fn parse_source_filter(raw: &Option<String>) -> Option<Vec<String>> {
     raw.as_deref()
         .map(parse_source_csv)
         .filter(|v| !v.is_empty())
 }
 
-/// GET /api/v1/threads/list — script/trigger/LLM-tool surface. Returns a flat
-/// newest-first list of `ThreadSummary` rows from the projection, each with
-/// its reader fields (draft preview and thread link) and its liveness.
-///
-/// Distinct from `GET /api/v1/threads`, which is the UI-shaped fetch (returns
-/// a grouped saved / archive / active / composing / family payload).
 pub(in crate::api) async fn list_thread_summaries(
     State(state): State<AppState>,
     Query(q): Query<ListThreadSummariesQuery>,
@@ -432,21 +338,14 @@ pub(in crate::api) async fn list_thread_summaries(
     Ok(Json(summaries))
 }
 
-/// Query params for `GET /api/v1/threads/drafts`.
 #[derive(Deserialize)]
 pub struct DraftsQuery {
-    /// Server clamps to 1..=1000. Default 100, the same as `list`.
     #[serde(default)]
     pub limit: Option<i64>,
-    /// One thread's draft, with its whole text. A thread holding no draft is
-    /// a 404, never an empty draft.
     #[serde(default)]
     pub thread_id: Option<String>,
 }
 
-/// GET /api/v1/threads/drafts — every thread holding an unsent draft, newest
-/// edit first, each with a preview and its owning thread's link. With
-/// `thread_id`, that one draft with its whole text. Read-only.
 pub(in crate::api) async fn list_drafts(
     State(state): State<AppState>,
     Query(q): Query<DraftsQuery>,
@@ -481,16 +380,12 @@ pub(in crate::api) async fn list_drafts(
     }
 }
 
-/// Query params for `GET /api/v1/threads/held-messages`.
 #[derive(Deserialize)]
 pub struct HeldMessagesQuery {
-    /// Server clamps to 1..=1000. Default 100, the same as `list`.
     #[serde(default)]
     pub limit: Option<i64>,
 }
 
-/// GET /api/v1/threads/held-messages — every *held message* still waiting
-/// behind a human, newest first, with its owning thread's link. Read-only.
 pub(in crate::api) async fn list_held_messages(
     State(state): State<AppState>,
     Query(q): Query<HeldMessagesQuery>,
@@ -506,7 +401,7 @@ pub(in crate::api) async fn list_held_messages(
     Ok(Json(serde_json::json!(held)))
 }
 
-/// GET /api/v1/threads/:id — a single thread's summary by id (404 if the
+/// INVARIANT: GET /api/v1/threads/:id — a single thread's summary by id (404 if the
 /// id isn't in the projection). Registered on the same `/threads/:id` leaf as
 /// `delete_thread` (see `api::threads::router`), so the param name is `:id`. The
 /// lightweight by-id complement to `/api/v1/threads/list`: the message-route
@@ -540,8 +435,6 @@ pub(in crate::api) async fn get_thread_summary(
     }
 }
 
-/// GET /api/v1/threads/count — same filters as `/api/v1/threads/list`, returns
-/// `{ "count": N }`. Cheaper than fetching all rows to read `.length`.
 pub(in crate::api) async fn count_thread_summaries(
     State(state): State<AppState>,
     Query(q): Query<ListThreadSummariesQuery>,
@@ -553,9 +446,6 @@ pub(in crate::api) async fn count_thread_summaries(
     let count = state
         .engine
         .event_store()
-        // The count handler reuses `ThreadSummaryFilters` for signature
-        // symmetry with the list handler: `limit` is irrelevant for a
-        // COUNT(*) and the store helper ignores it.
         .count_thread_summaries(ThreadSummaryFilters {
             status: status_filter(q.active, &statuses),
             sources: sources.as_deref(),
@@ -575,9 +465,6 @@ pub(in crate::api) async fn count_thread_summaries(
     Ok(Json(serde_json::json!({ "count": count })))
 }
 
-/// Query params for `GET /api/v1/threads/archived-count` — the filter-scoped
-/// Archive-badge count. Mirrors [`OlderThreadsQuery`]'s facet params minus the
-/// pagination cursor (a `COUNT(*)` needs no `before`/`limit`).
 #[derive(Deserialize)]
 pub struct ArchivedCountQuery {
     pub sources: Option<String>,
@@ -586,14 +473,6 @@ pub struct ArchivedCountQuery {
     pub app_ids: Option<String>,
 }
 
-/// GET /api/v1/threads/archived-count?sources=&trigger_ids=&repo_ids=&app_ids=
-/// → `{ "count": N }`. True size of the archived pile MATCHING the active drawer
-/// filter, so the collapsed Archive badge reflects the filter and stays stable
-/// regardless of how many rows are paginated in. Same predicate as
-/// `/threads/older` (`channel_facet_filter_sql`): a `sources` channel gate
-/// ANDed with per-channel facet narrowing, so whole channels and facet ids
-/// compose (chat + coding-agent + one trigger counts the union, not the trigger
-/// alone).
 pub(in crate::api) async fn get_archived_count(
     State(state): State<AppState>,
     Query(q): Query<ArchivedCountQuery>,
@@ -626,19 +505,9 @@ pub(in crate::api) async fn get_archived_count(
 pub struct OlderThreadsQuery {
     pub before: String,
     pub limit: Option<i64>,
-    /// Comma-separated list of sources to filter by (e.g. "chat,coding-agent").
-    /// `claude_code` remains accepted as a legacy alias.
     pub sources: Option<String>,
-    /// Comma-separated list of trigger ids to filter by — narrows to
-    /// trigger-channel threads spawned by one of the given triggers.
     pub trigger_ids: Option<String>,
-    /// Comma-separated list of repository UUIDs to filter by — narrows to
-    /// coding-agent threads bound to one of the given repos. Composes with
-    /// `trigger_ids` via OR (see `EventStore::get_older_threads`).
     pub repo_ids: Option<String>,
-    /// Comma-separated list of app ids to filter by — narrows to app
-    /// coding-agent threads operating on one of the given `data/apps/<id>`
-    /// folders. Composes with `trigger_ids` / `repo_ids` via OR.
     pub app_ids: Option<String>,
 }
 
@@ -654,7 +523,6 @@ fn older_page_limit(requested: Option<i64>) -> i64 {
     requested.unwrap_or(15).clamp(1, 50)
 }
 
-/// GET /api/v1/threads/older?before=ISO8601&limit=15&sources=chat,coding-agent&trigger_ids=t1,t2&repo_ids=r1,r2
 pub(in crate::api) async fn get_older_threads(
     State(state): State<AppState>,
     Query(query): Query<OlderThreadsQuery>,
@@ -690,7 +558,7 @@ pub(in crate::api) async fn get_older_threads(
             )
         })?;
 
-    // `has_more` reflects only the BASE pagination — family extension
+    // INVARIANT: `has_more` reflects only the BASE pagination — family extension
     // never advances the cursor. Otherwise an eagerly-loaded family member
     // could push the count up to `limit` even when the natural page is
     // empty, locking the user in an infinite-scroll loop.
@@ -705,10 +573,6 @@ pub(in crate::api) async fn get_older_threads(
     })))
 }
 
-/// GET /api/v1/threads/filter-facets — distinct triggers / repos / apps that
-/// have at least one thread, powering the drawer "Show" dropdown's complete
-/// option lists. Repo and app facets carry their labels; trigger labels are
-/// resolved client-side.
 pub(in crate::api) async fn get_filter_facets(
     State(state): State<AppState>,
 ) -> Result<Json<FilterFacets>, (StatusCode, String)> {
@@ -800,8 +664,6 @@ mod tests {
         assert!(matches!(status_filter(None, &statuses), StatusFilter::Any));
     }
 
-    /// The union is what every pre-existing caller sends, and it has to keep
-    /// resolving to the same filter it always did.
     #[test]
     fn active_alone_still_resolves_to_the_union() {
         for want in [true, false] {
@@ -826,8 +688,6 @@ mod tests {
         }
     }
 
-    /// The whole point of the filter: `status=running` must not drag in the
-    /// question-parked thread that `active=true` would.
     #[test]
     fn running_is_reachable_without_waiting_for_user_answer() {
         let statuses = parse_status_filter(&query(None, Some("running"))).expect("valid");
@@ -835,9 +695,6 @@ mod tests {
         assert!(!statuses.contains(&ThreadStatus::WaitingForUserAnswer));
     }
 
-    /// Two answers to one question. Silently ANDing them would make
-    /// `active=true&status=idle` an empty result that looks like "nothing
-    /// matched" rather than "you asked two things".
     #[test]
     fn active_and_status_together_is_refused() {
         let (code, msg) = parse_status_filter(&query(Some(true), Some("running")))
@@ -850,8 +707,6 @@ mod tests {
         );
     }
 
-    /// A typo that silently returned zero rows would read as "the workspace is
-    /// quiet", which is the exact failure this filter exists to prevent.
     #[test]
     fn an_unknown_status_is_refused_with_the_valid_values() {
         let (code, msg) = parse_status_filter(&query(None, Some("runnign")))
@@ -864,8 +719,6 @@ mod tests {
         );
     }
 
-    /// An empty `status=` must not read as "no filter", which would answer a
-    /// question the caller did not ask with the whole workspace.
     #[test]
     fn an_empty_status_is_refused_rather_than_ignored() {
         for raw in ["", "  ", "running,"] {

@@ -1,9 +1,3 @@
-//! `/api/v1/widgets`: reusable widgets, a thread's widget card sizes and the
-//! two dashboards (ADRs 0402, 0496).
-//!
-//! The UI's widget menu and the `lucidos widgets` CLI both land here. The
-//! agent's grouped `widgets` tool runs the same checks in-process.
-
 use super::error::ApiError;
 use super::*;
 use crate::engine::tools::widgets::WidgetFitExt;
@@ -15,7 +9,6 @@ use crate::engine::thread_events::{ArrangedTile, Dashboard};
 use crate::engine::widget_fit::FitBoxReport;
 use crate::engine::widgets::{self, WidgetCheckFailed, WidgetInstance, WidgetInstanceArgs};
 
-/// A card size body: the thread, the widget instance and its size.
 #[derive(Debug, Deserialize)]
 pub(super) struct CardSizeBody {
     thread_id: Option<String>,
@@ -29,7 +22,6 @@ pub(super) struct WidgetBody {
     app_id: String,
 }
 
-/// A widget fit check: the widget, and the thread its request rides on.
 #[derive(Debug, Deserialize)]
 pub(super) struct FitBody {
     app_id: String,
@@ -38,7 +30,7 @@ pub(super) struct FitBody {
     device_id: Option<String>,
 }
 
-/// Register only under this thread's verified subprocess origin. The returned
+/// INVARIANT: Register only under this thread's verified subprocess origin. The returned
 /// secret belongs in launcher memory and an exact host-only report channel.
 #[derive(Deserialize)]
 struct FitSessionBody {
@@ -93,7 +85,6 @@ async fn register_fit_session(
     ))
 }
 
-/// A page's answer to a widget fit check: what each box measured.
 #[derive(Debug, Deserialize)]
 pub(super) struct FitReportBody {
     request_id: String,
@@ -101,7 +92,6 @@ pub(super) struct FitReportBody {
     boxes: Vec<FitBoxReport>,
 }
 
-/// An HTTP caller has no thread of its own, so it names one.
 fn required_thread(raw: Option<&str>) -> Result<uuid::Uuid, ApiError> {
     let raw = raw.ok_or_else(|| ApiError::bad_request("thread_id is required"))?;
     resolve_thread_id_arg(raw, None).map_err(ApiError::bad_request)
@@ -114,7 +104,6 @@ fn refusal(e: WidgetCheckFailed) -> ApiError {
     }
 }
 
-/// GET /api/v1/widgets - The reusable widgets.
 async fn list_reusable_widgets(State(state): State<AppState>) -> Result<Json<Vec<App>>, ApiError> {
     state
         .app_manager
@@ -123,8 +112,6 @@ async fn list_reusable_widgets(State(state): State<AppState>) -> Result<Json<Vec
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
-/// POST /api/v1/widgets/size - The size of a widget instance's cards in a
-/// thread. Writes one event, no file.
 async fn size_cards(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -172,7 +159,6 @@ async fn set_reusable(
     Ok(Json(serde_json::json!({ "commit": commit })))
 }
 
-/// POST /api/v1/widgets/make-reusable - Offer a widget to every thread.
 async fn make_reusable(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -181,7 +167,6 @@ async fn make_reusable(
     set_reusable(&state, &headers, &body.app_id, true).await
 }
 
-/// POST /api/v1/widgets/stop-reusing - Hand a widget back to its origin thread.
 async fn stop_reusing(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -195,8 +180,6 @@ pub(super) struct DashboardQuery {
     dashboard: Option<String>,
 }
 
-/// An add or remove body: the dashboard, and the widget instance. Only an
-/// add reads `size`.
 #[derive(Debug, Deserialize)]
 pub(super) struct DashboardChangeBody {
     dashboard: Option<String>,
@@ -212,7 +195,6 @@ pub(super) struct ArrangeBody {
     tiles: Vec<ArrangedTile>,
 }
 
-/// The named dashboard, else the one the calling device shows.
 async fn named_dashboard(
     state: &AppState,
     headers: &HeaderMap,
@@ -234,7 +216,6 @@ async fn read_dashboard(
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
-/// GET /api/v1/dashboard?dashboard= - One dashboard's tiles.
 async fn get_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -280,8 +261,6 @@ async fn change_dashboard(
     })))
 }
 
-/// POST /api/v1/widgets/dashboard-add - "Add to dashboard". A widget that
-/// belongs to a thread becomes reusable first.
 async fn add_to_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -291,7 +270,6 @@ async fn add_to_dashboard(
     change_dashboard(&state, &headers, change, body).await
 }
 
-/// POST /api/v1/widgets/dashboard-remove - "Remove from dashboard".
 async fn remove_from_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -300,8 +278,6 @@ async fn remove_from_dashboard(
     change_dashboard(&state, &headers, DashboardChange::Remove, body).await
 }
 
-/// POST /api/v1/widgets/arrange - Arrange one dashboard. Writes one
-/// `DashboardArranged` and answers the dashboard it gives.
 async fn arrange_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -318,9 +294,6 @@ async fn arrange_dashboard(
     read_dashboard(&state, which).await
 }
 
-/// POST /api/v1/widgets/fit - Render a widget at every size it declares in an
-/// open Lucidos window, and answer `{"note"}`: what each box cuts off. The
-/// caller's own window renders it when it is visible.
 async fn check_fit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -361,7 +334,7 @@ async fn submit_fit_report(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use crate::engine::pending_answers::{resolve_answer, AnswerRefusal};
     if let Some(credential) = headers.get(FIT_RENDERER_HEADER) {
-        // Keep the ordinary door credential and attribution gate. This fit
+        // INVARIANT: Keep the ordinary door credential and attribution gate. This fit
         // secret is never admitted as a general actor or owner credential.
         super::actor::require_user_actor(&headers, &state.pool, body.device_id.as_deref()).await?;
         let credential = credential
@@ -409,7 +382,6 @@ async fn submit_fit_report(
     }
 }
 
-/// Routes for the `/widgets` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/widgets", get(list_reusable_widgets))

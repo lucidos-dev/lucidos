@@ -1,12 +1,7 @@
-/// Verifies that `try_wait()` detects a dead child process even when
-/// the stdout pipe hasn't produced EOF. This is the watchdog that
-/// prevents threads from getting stuck in RUNNING state after the CC
-/// process is killed (e.g. macOS sleep killing the process).
 #[tokio::test]
 async fn try_wait_detects_dead_cc_process() {
     use tokio::process::Command;
 
-    // Spawn a short-lived process
     let mut child = Command::new("echo")
         .arg("done")
         .stdin(std::process::Stdio::piped())
@@ -14,14 +9,11 @@ async fn try_wait_detects_dead_cc_process() {
         .spawn()
         .expect("failed to spawn 'echo'");
 
-    // Take stdin/stdout (same as the real CC code does)
     let _stdin = child.stdin.take();
     let _stdout = child.stdout.take();
 
-    // Wait for process to exit (with explicit wait, not just sleep)
     let _ = child.wait().await;
 
-    // try_wait should report the exit status
     let status = child.try_wait().expect("try_wait should not error");
     assert!(
         status.is_some(),
@@ -33,8 +25,6 @@ async fn try_wait_detects_dead_cc_process() {
     );
 }
 
-/// Verifies that `try_wait()` returns None for a still-running process.
-/// This ensures the watchdog doesn't false-positive on healthy Claude Code sessions.
 #[tokio::test]
 async fn try_wait_returns_none_for_running_process() {
     use tokio::process::Command;
@@ -55,14 +45,9 @@ async fn try_wait_returns_none_for_running_process() {
         "try_wait must return None for a running process"
     );
 
-    // Clean up
     let _ = child.kill().await;
 }
 
-/// Integration: propose → apply → resume. The text handed to the resumed
-/// agent's input channel (built by `build_resume_prompt_text`, the spawn-path
-/// injection point used by both CC and Codex) must be prefixed with the
-/// applied-change note and end with the user's message.
 #[tokio::test]
 async fn resume_prompt_is_prefixed_with_applied_change_note() {
     use super::run::{build_resume_prompt_text, ResumeSpawnContext};
@@ -99,8 +84,6 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
 
     start_cc_session(&bus, thread_id, branch, None).await;
 
-    // The agent's prior turn: user message (MessageReceived, the real CC
-    // user-message event), then a proposed change.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: message_received("add the feature"),
@@ -132,7 +115,6 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
     .await
     .unwrap();
 
-    // The user clicks Apply: the change is merged to main.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
@@ -153,9 +135,6 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
     .await
     .unwrap();
 
-    // Resume with a non-empty user message. The engine persists the current
-    // turn's MessageReceived BEFORE building the prompt (see chat/process/run.rs
-    // "Emit MessageReceived FIRST"), so emit it and use its id as the origin.
     let user_message = "now also add tests";
     let origin_id = bus
         .emit(BusEvent::Thread {
@@ -167,7 +146,6 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
         .unwrap()
         .expect("emit produced no EmitResult")
         .event_id;
-    // No worktree/adoption notes here — we isolate the applied-change path.
     let final_text = build_resume_prompt_text(
         &pool,
         thread_id,
@@ -208,9 +186,6 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
     teardown_test_db(&db_name).await;
 }
 
-/// Integration: propose → discard → resume. The mirror of the applied-change
-/// case, and the gap this work closes: the replayed conversation still believes
-/// the change is pending, so the prompt must carry the discard note.
 #[tokio::test]
 async fn resume_prompt_is_prefixed_with_discarded_change_note() {
     use super::run::{build_resume_prompt_text, ResumeSpawnContext};
@@ -278,8 +253,6 @@ async fn resume_prompt_is_prefixed_with_discarded_change_note() {
     .await
     .unwrap();
 
-    // The user clicks Discard: the branch is reset to main HEAD and the
-    // worktree cleaned, so the change's commits are gone.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeDiscarded {
@@ -343,10 +316,6 @@ async fn resume_prompt_is_prefixed_with_discarded_change_note() {
     teardown_test_db(&db_name).await;
 }
 
-/// The regression. A note quoting "the composer's Diff is an icon" sat directly
-/// above "It needs more height. Three lines maybe?", and the pronoun bound to
-/// the note instead of to the glyph the user meant. So a non-empty block closes
-/// by disclaiming the topic, and a turn carrying no note gains nothing.
 #[tokio::test]
 async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
     use super::run::{build_resume_prompt_text, ResumeSpawnContext, RESUME_NOTE_REFERENT_GUARD};
@@ -363,9 +332,6 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
         session_branch: None,
     };
 
-    // One note is enough: the guard is a property of the block, not of which
-    // note filled it. An empty thread contributes no turn-gap note, and no
-    // worktree means no external-edit note.
     let noted = build_resume_prompt_text(
         &pool,
         Uuid::new_v4(),
@@ -378,9 +344,6 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
     )
     .await;
 
-    // Matched against the constant, not against a copy of its wording, so the
-    // guard can be reworded without breaking a test about where it sits. An
-    // emptied constant still fails: `find("")` returns 0, below `note_at`.
     let guard_at = noted
         .find(RESUME_NOTE_REFERENT_GUARD)
         .unwrap_or_else(|| panic!("note block must disclaim the topic: {noted}"));
@@ -399,8 +362,6 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
         "prompt must still end with the user message: {noted}"
     );
 
-    // Nothing happened in the gap, so there is no block and nothing to
-    // disclaim. The user's words reach the agent alone, as before.
     let bare = build_resume_prompt_text(
         &pool,
         Uuid::new_v4(),
@@ -419,11 +380,6 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// The reproduction, end to end on the path it took. A switch restarted the
-/// engine mid-build, and the spawn consumer resumed the session with the bare
-/// continue message. The agent answered "You've stopped a Rust build twice, so
-/// I won't start another one". The resumed prompt must name the real cause
-/// before it says to continue.
 #[tokio::test]
 async fn a_switch_resume_is_told_the_restart_stopped_the_call() {
     use super::run::{build_resume_prompt_text, ResumeSpawnContext, RESUME_NOTE_REFERENT_GUARD};
@@ -469,7 +425,6 @@ async fn a_switch_resume_is_told_the_restart_stopped_the_call() {
     .await
     .unwrap();
 
-    // The teardown boundary `abort_in_flight_for_restart` lands mid-build.
     emit_response_aborted(
         &bus,
         thread_id,
@@ -534,9 +489,6 @@ async fn a_switch_resume_is_told_the_restart_stopped_the_call() {
     teardown_test_db(&db_name).await;
 }
 
-/// A kept-alive session takes its next prompt without a respawn. A report its
-/// child filed during the previous turn rides that prompt, and no later one:
-/// not the next follow-up, and not the turn after the session ends.
 #[tokio::test]
 async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
     use super::run::RESUME_NOTE_REFERENT_GUARD;
@@ -590,7 +542,6 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         origin: None,
     };
-    // The agent's own report that it took an input in.
     let read = |input: Uuid| ThreadEvent::CodingAgentInputRead {
         input_event_id: input,
         started_turn: false,
@@ -611,7 +562,6 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
     })
     .await;
 
-    // The session is kept alive, so the follow-up is delivered in-session.
     let follow_up = "and Saturday?";
     let origin = emit(message_received(follow_up)).await;
     let sent = emit(prompt_sent(follow_up, origin)).await;
@@ -653,7 +603,6 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
         "the report rode the previous prompt, so this one goes bare"
     );
 
-    // The session ends, and the next message respawns it.
     let respawn = "one more thing";
     let origin = emit(message_received(respawn)).await;
     let text = build_resume_prompt_text(
@@ -676,8 +625,6 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// Which events bound a live session's note, per input. A forward that wrote a
-/// `CodingAgentPromptSent` ends at it; one that did not ends at its origin.
 #[test]
 fn a_follow_up_note_ends_at_its_delivery_when_it_has_one() {
     use super::run::followup_gap_bounds;
@@ -697,8 +644,6 @@ fn a_follow_up_note_ends_at_its_delivery_when_it_has_one() {
     assert_eq!(followup_gap_bounds(None, None), None);
 }
 
-/// An image-only follow-up has no text, but it still writes the boundary its
-/// note ends at. So it carries the note, or the gap is lost behind it.
 #[tokio::test]
 async fn an_image_only_follow_up_still_carries_the_note() {
     use super::run::build_followup_prompt_text;
@@ -769,8 +714,6 @@ async fn an_image_only_follow_up_still_carries_the_note() {
     teardown_test_db(&db_name).await;
 }
 
-/// The read of a forwarded input must name an event the turn gap checks: its
-/// origin, or for an engine prompt with none its `CodingAgentPromptSent`.
 #[test]
 fn a_forwarded_input_owes_its_read_to_its_origin_or_its_delivery() {
     use super::run::owed_input_event_ids;
@@ -787,7 +730,6 @@ fn a_forwarded_input_owes_its_read_to_its_origin_or_its_delivery() {
 use super::run::HeldBlocks;
 use crate::engine::agent_context::SentDeviceContexts;
 
-/// A conversation the engine has not seen `Init` name: it holds no block.
 fn held(sent: &SentDeviceContexts) -> HeldBlocks<'_> {
     HeldBlocks {
         sent,
@@ -796,8 +738,6 @@ fn held(sent: &SentDeviceContexts) -> HeldBlocks<'_> {
     }
 }
 
-/// Only Claude Code reports a compaction, so only its conversation can be
-/// trusted to still hold a block it was sent.
 #[test]
 fn only_a_claude_code_conversation_is_trusted_to_hold_the_block() {
     use crate::runtime::CodingAgent;
@@ -807,9 +747,6 @@ fn only_a_claude_code_conversation_is_trusted_to_hold_the_block() {
     assert_eq!(held_by(CodingAgent::Codex), None);
 }
 
-/// A thread whose next prompt has something to put in front of it: a device
-/// block (a stored preference) and a turn-gap note (a report filed after the
-/// last read). Returns the pool, the database name, the bus and the thread.
 async fn thread_with_context_to_prepend(
     branch: &str,
 ) -> (
@@ -895,9 +832,6 @@ async fn emit_on(
     .event_id
 }
 
-/// Claude Code runs a slash command only when the input starts with `/`. So
-/// a spawn's first prompt sends a command exactly as typed, with no note and no
-/// device block, while a prompt keeps both.
 #[tokio::test]
 async fn a_spawn_sends_a_slash_command_verbatim() {
     use super::run::{first_prompt_for_agent, PromptFor, ResumeSpawnContext};
@@ -926,7 +860,6 @@ async fn a_spawn_sends_a_slash_command_verbatim() {
     .text;
     assert_eq!(text, "/cost");
 
-    // A keep-alive's nudge carries no device block and no notes.
     let nudge = emit_on(&bus, thread_id, user_message("keep warm")).await;
     let text = first_prompt_for_agent(
         &pool,
@@ -964,7 +897,6 @@ async fn a_spawn_sends_a_slash_command_verbatim() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The same for a follow-up to a live session.
 #[tokio::test]
 async fn a_follow_up_sends_a_slash_command_verbatim() {
     use super::run::follow_up_for_agent;
@@ -1027,8 +959,6 @@ async fn a_follow_up_sends_a_slash_command_verbatim() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A `MessageReceived` opened by `origin`, as the standing-instruction gate
-/// weighs it.
 fn message_from(
     text: &str,
     mode: crate::engine::thread_events::ActorMode,
@@ -1051,7 +981,6 @@ fn message_from(
     }
 }
 
-/// The first prompt and a follow-up for a turn `origin` opened.
 async fn prompts_for_turns_opened_by(
     mode: crate::engine::thread_events::ActorMode,
     origin: crate::engine::thread_events::MessageOrigin,
@@ -1105,9 +1034,6 @@ async fn prompts_for_turns_opened_by(
     (first_text, follow_up_text)
 }
 
-/// A turn another thread opened learns the approval path before it asks, not
-/// from the 403. The note rides each such turn, follow-ups included: the
-/// system prompt is frozen at session start, so it cannot carry it (ADR 0491).
 #[tokio::test]
 async fn every_turn_another_thread_opened_carries_the_owner_approval_note() {
     use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
@@ -1124,17 +1050,13 @@ async fn every_turn_another_thread_opened_carries_the_owner_approval_note() {
             text.contains("THE OWNER DID NOT OPEN THIS TURN"),
             "{label}: {text}"
         );
-        // Pins the CLI contract the note must teach: the command and its 409.
         assert!(text.contains("lucidos ask-permission"), "{label}");
         assert!(text.contains("409"), "{label}");
-        // ADR 0475: a spawn is not among the acts it gates.
         assert!(!text.contains("create-top-thread"), "{label}");
         assert!(text.contains("needs no authority"), "{label}");
     }
 }
 
-/// A turn the owner opened already carries their instruction, so the note
-/// would only cost context.
 #[tokio::test]
 async fn no_turn_the_owner_opened_carries_the_owner_approval_note() {
     use crate::engine::thread_events::{ActorMode, MessageOrigin};
@@ -1155,8 +1077,6 @@ async fn no_turn_the_owner_opened_carries_the_owner_approval_note() {
     }
 }
 
-/// Once forwarded, the redelivery is withdrawable like any follow-up, and the
-/// agent's read names the original message, so its bubble clears truthfully.
 #[test]
 fn a_forwarded_redelivery_is_withdrawable_and_its_read_names_the_message() {
     use super::run::owed_input_event_ids;
@@ -1188,9 +1108,6 @@ fn a_forwarded_redelivery_is_withdrawable_and_its_read_names_the_message() {
     );
 }
 
-/// A redelivered follow-up tells the agent it is late and when the user sent
-/// it, in the note block above the message. A slash command still goes
-/// verbatim, or the note would turn it into a prompt.
 #[tokio::test]
 async fn a_redelivered_follow_up_tells_the_agent_it_is_late() {
     use super::run::{follow_up_for_agent, RESUME_NOTE_REFERENT_GUARD};
@@ -1260,9 +1177,6 @@ async fn a_redelivered_follow_up_tells_the_agent_it_is_late() {
 
 const DEVICE_BLOCK: &str = "[USER DEVICE & PREFERENCES]";
 
-/// I1 and I2 on the first prompt: a spawn always carries the block, and a
-/// resume carries it unless the conversation it reattaches already holds an
-/// equal one.
 #[tokio::test]
 async fn a_resume_skips_the_device_block_its_conversation_already_holds() {
     use super::run::{first_prompt_for_agent, PromptFor, ResumeSpawnContext};
@@ -1316,8 +1230,6 @@ async fn a_resume_skips_the_device_block_its_conversation_already_holds() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// I2 and I3 on a follow-up: the block rides until the agent has read it,
-/// then only a change brings it back. Compaction (I4) brings it back too.
 #[tokio::test]
 async fn a_follow_up_repeats_the_device_block_only_when_it_changed() {
     use super::run::follow_up_for_agent;
@@ -1393,12 +1305,9 @@ async fn a_follow_up_repeats_the_device_block_only_when_it_changed() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Order and shape rules of the run loop. The loop is one `select!` inside one
-/// async function, so only its source can say where a call sits.
 mod run_loop_rule_tests {
     const RUN_SRC: &str = include_str!("run_session/run.rs");
 
-    /// Where `needle` sits, which must be the only place.
     fn at(needle: &str) -> usize {
         let mut hits = RUN_SRC.match_indices(needle);
         let (first, _) = hits
@@ -1418,7 +1327,6 @@ mod run_loop_rule_tests {
                 .unwrap_or_else(|| panic!("`{needle}` no longer follows its anchor"))
     }
 
-    /// From the unique `from` up to the first `to` after it.
     fn slice(from: &str, to: &str) -> &'static str {
         let start = at(from);
         &RUN_SRC[start..after(start, to)]

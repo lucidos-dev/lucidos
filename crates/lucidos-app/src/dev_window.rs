@@ -1,15 +1,3 @@
-//! The development window, and how it follows a switch to a new version
-//! (ADR 0461).
-//!
-//! `scripts/tauri-dev.sh` runs this binary from its published launch binary in
-//! `.launch/`, and names the page to show in [`URL_ENV`]. The build that Apply
-//! starts may publish a newer one at the same path. The window moves to it only
-//! once the engine it shows has moved too, so it is never newer than the stack.
-//!
-//! Every start restores the windows the last one left, from the records the
-//! launcher keeps in the checkout (`window_persist::WindowRecords`). So a switch
-//! brings back every window, each at its frame and on its workspace.
-
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -17,38 +5,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager};
 
-/// The page the launcher wants the window on.
 pub const URL_ENV: &str = "LUCIDOS_DEV_WINDOW_URL";
 
-/// How long the window waits for its page's server before navigating anyway.
-/// The launcher starts the server first, so this covers only a slow start.
 const SERVER_WAIT: Duration = Duration::from_secs(30);
 const SERVER_POLL: Duration = Duration::from_millis(300);
 
-/// Which file a path named, told apart from any file published there later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileId {
     dev: u64,
     ino: u64,
 }
 
-/// What is published at a path now: which file, and when it was published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Published {
     id: FileId,
     at: SystemTime,
 }
 
-/// Where the launcher wants the page to reopen on, when the window exits to
-/// follow a switch. The launcher then starts the binary published at its path.
 pub const RELAUNCH_FILE_ENV: &str = "LUCIDOS_DEV_WINDOW_RELAUNCH_FILE";
 
-/// The checkout's own dir for the window records, so a dev window never
-/// shares the packaged client's. See `window_persist::WindowRecords`.
 pub const RECORDS_DIR_ENV: &str = "LUCIDOS_DEV_WINDOW_RECORDS_DIR";
 
-/// A window the launcher started: the binary it runs, the origin of the page it
-/// was pointed at, and where to hand the launcher a relaunch.
 struct LaunchedWindow {
     path: PathBuf,
     id: FileId,
@@ -56,16 +33,8 @@ struct LaunchedWindow {
     relaunch_file: PathBuf,
 }
 
-/// Set once, by [`launch`], and only for a window the launcher started.
 static LAUNCHED: OnceLock<LaunchedWindow> = OnceLock::new();
 
-/// Point the window at the page the launcher named, once its server answers,
-/// and reopen the other windows the last start left.
-///
-/// Without [`URL_ENV`] the window keeps `build.devUrl` and never follows a
-/// switch, which is what a bare `cargo run` gets. The page's origin gets the
-/// packaged gateway's IPC grant, because Tauri treats any origin but `devUrl`
-/// as remote (ADR 0028).
 pub fn launch(app: &AppHandle) {
     let Ok(url) = std::env::var(URL_ENV) else {
         return;
@@ -99,17 +68,12 @@ pub fn launch(app: &AppHandle) {
         if !wait_until_listening(&parsed, SERVER_WAIT) {
             eprintln!("[dev-window] nothing answers at {url} yet; showing it anyway");
         }
-        // The launcher's page is a packaged launch's notification tap. It wins
-        // `main`, and a switch names `main`'s own page, so `main` keeps its frame.
-        // A no-gateway launch has a records dir of its own, which holds no
-        // workspace windows (`dev_window_records_dir` in `workspace.sh`).
         let restore = crate::window_persist::resolve_window_session_plan();
         let plan = crate::desktop::launch_plan(Some(url), restore, &origin);
         crate::desktop::navigate_main_window(&handle, &plan.main);
         if plan.extra.is_empty() {
             return;
         }
-        // Building a window is a main-thread call.
         let windows = handle.clone();
         if let Err(e) = handle.run_on_main_thread(move || {
             crate::app_window::restore_extra_windows(&windows, &plan.extra);
@@ -119,17 +83,6 @@ pub fn launch(app: &AppHandle) {
     });
 }
 
-/// Move onto the window binary now published at this one's path, when the
-/// engine the page shows started after it was published. Returns whether it
-/// did; on success it never returns, since the window exits.
-///
-/// The page calls this with its engine's `started_at` on its first health
-/// answer and on every restart, so a switch from any device reaches it. Only a
-/// page on the launcher's origin counts. The launcher starts the new binary on
-/// `main`'s page, and that start restores the other windows from the records.
-///
-/// It never execs in place. macOS registers a self-exec'd app again with pid
-/// -1, and window managers such as Rectangle then cannot find the window.
 #[tauri::command]
 pub fn follow_engine_switch(
     webview: tauri::Webview,
@@ -163,18 +116,12 @@ pub fn follow_engine_switch(
             window.relaunch_file.display()
         )
     })?;
-    // The same exit as restart_app, so the new start finds every window recorded.
     crate::window_persist::persist_windows(app);
     crate::window_persist::begin_teardown();
     app.cleanup_before_exit();
     std::process::exit(0);
 }
 
-/// Whether the window should move onto what is published at its path.
-///
-/// Two things must hold. The file there is not the one this process runs, and
-/// the engine started after it was published. A switch publishes nothing, so
-/// an engine that started later already runs that build.
 fn should_follow(
     running: FileId,
     published: Option<Published>,
@@ -186,17 +133,11 @@ fn should_follow(
     }
 }
 
-/// The page the relaunched window opens on: `main`'s, whichever window's page
-/// noticed the switch. Every window asks, and an extra one may answer first.
-///
-/// `main` on another origin (still on `devUrl`) leaves the caller's page.
 fn relaunch_page(main: Option<tauri::Url>, caller: tauri::Url, origin: &str) -> tauri::Url {
     main.filter(|main| is_on_origin(main, origin))
         .unwrap_or(caller)
 }
 
-/// Whether `page` is on the launcher's origin. The window opens on `devUrl`
-/// before it navigates, and that page may be another workspace's engine.
 fn is_on_origin(page: &tauri::Url, origin: &str) -> bool {
     page.origin().ascii_serialization() == origin
 }
@@ -225,7 +166,6 @@ fn read_published(_path: &Path) -> Option<Published> {
     None
 }
 
-/// Wait until something accepts a TCP connection at the URL's host and port.
 fn wait_until_listening(url: &tauri::Url, timeout: Duration) -> bool {
     let addrs: Vec<SocketAddr> = match (url.host_str(), url.port_or_known_default()) {
         (Some(host), Some(port)) => (host, port)
@@ -269,7 +209,6 @@ mod tests {
 
     #[test]
     fn waits_while_the_engine_predates_the_new_binary() {
-        // The build published a window, and nobody has switched yet.
         assert!(!should_follow(RUNNING, published(NEWER, 100), at(99)));
         assert!(!should_follow(RUNNING, published(NEWER, 100), at(100)));
     }
@@ -322,9 +261,6 @@ mod tests {
         }
     }
 
-    // The reported defect: after a switch the dev window lost its size, and a
-    // second window on a remote workspace never came back. This is the record's
-    // whole trip through a switch, in a records dir of the dev window's own.
     #[test]
     fn a_switch_brings_back_every_window_at_its_frame() {
         let dir = tempfile::tempdir().unwrap();
@@ -343,7 +279,6 @@ mod tests {
         let plan = crate::desktop::launch_plan(Some(main_page.clone()), &restore, ORIGIN);
 
         assert_eq!(plan.main, main_page);
-        // The startup geometry step sizes `main` from the first restored window.
         assert!(restore[0].main_may_take());
         assert_eq!(
             restore[0].frame,
@@ -364,8 +299,6 @@ mod tests {
         );
     }
 
-    // The picker is on no workspace route, and once read as a bare engine
-    // origin. A switch from it then dropped every other window for good.
     #[test]
     fn a_switch_from_the_picker_still_brings_back_every_window() {
         let picker = format!("{ORIGIN}/~/");
@@ -388,8 +321,6 @@ mod tests {
         );
     }
 
-    // Every window asks on its engine's health answer. An extra window that
-    // answered first used to put `main` on its own page after the switch.
     #[test]
     fn the_relaunch_page_is_mains_whichever_window_asked() {
         let main: tauri::Url = format!("{ORIGIN}/dev/").parse().unwrap();
@@ -402,14 +333,11 @@ mod tests {
             relaunch_page(Some(main.clone()), main.clone(), ORIGIN),
             main
         );
-        // `main` still on `devUrl`, or gone, leaves the caller's page.
         let dev_url: tauri::Url = "http://localhost:5173/".parse().unwrap();
         assert_eq!(relaunch_page(Some(dev_url), extra.clone(), ORIGIN), extra);
         assert_eq!(relaunch_page(None, extra.clone(), ORIGIN), extra);
     }
 
-    /// The launcher sets the variables this module reads. Shell cannot import
-    /// the names, so the scripts are pinned to them here.
     #[test]
     fn the_scripts_name_the_variables_the_window_reads() {
         let launcher = include_str!("../../../scripts/lib/workspace.sh");
@@ -433,7 +361,6 @@ mod tests {
         let path = dir.path().join("lucidos-app");
         std::fs::write(&path, b"old").unwrap();
         let before = read_published(&path).unwrap();
-        // The publish writes a temp file and renames it over the old one.
         let tmp = dir.path().join("lucidos-app.tmp");
         std::fs::write(&tmp, b"new").unwrap();
         std::fs::rename(&tmp, &path).unwrap();
@@ -447,7 +374,6 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let url: tauri::Url = format!("http://127.0.0.1:{port}/dev/").parse().unwrap();
         assert!(wait_until_listening(&url, Duration::from_secs(1)));
-        // Binding port zero allocates another port, so zero cannot host a listener.
         let silent_url: tauri::Url = "http://127.0.0.1:0/dev/".parse().unwrap();
         let started = Instant::now();
         assert!(!wait_until_listening(

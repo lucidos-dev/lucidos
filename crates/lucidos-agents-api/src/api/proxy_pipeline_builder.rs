@@ -1,4 +1,4 @@
-//! Materializes a `Vec<Arc<dyn AuthLayer>>` from an on-disk
+//! INVARIANT: Materializes a `Vec<Arc<dyn AuthLayer>>` from an on-disk
 //! `PipelineConfig`. Called per-request so credential rotations + module
 //! reloads (`POST /api/v1/proxy-modules/reload`) are picked up without
 //! restarting the engine.
@@ -21,9 +21,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::Engine;
 
-/// Inputs every per-request pipeline build needs. Pulled out so the
-/// dispatch site (`proxy_handle_inner`) doesn't have to thread eight
-/// arguments through `build_pipeline`.
 pub struct PipelineBuildContext<'a> {
     pub pool: PgPool,
     pub workspace_path: Arc<PathBuf>,
@@ -34,15 +31,6 @@ pub struct PipelineBuildContext<'a> {
     pub wasm_engine: Arc<Engine>,
 }
 
-/// Translate a `PipelineConfig` into a `Vec<Arc<dyn AuthLayer>>`. The
-/// returned layers own everything they need (credential bytes, cache
-/// handles, compiled WASM modules) — the request handler only has to call
-/// `run_pipeline` against them.
-///
-/// **Building is not permission to send.** Every layer here declares its
-/// `scope_bindings`, and `proxy::ScopedPipeline::bind` checks them against the
-/// outbound URL before anything reaches the network. This module used to run
-/// that check per arm, and two arms went without (ADR 0144 decision 4).
 pub async fn build_pipeline(
     config: &PipelineConfig,
     ctx: &PipelineBuildContext<'_>,
@@ -71,9 +59,6 @@ pub async fn build_pipeline(
                         )
                     }
                     StaticKind::Basic => {
-                        // Convention: the credential's auth_value is
-                        // `user:password`. Split here so the layer holds
-                        // the encoded form.
                         let (user, pass) = value.split_once(':').ok_or_else(|| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -196,8 +181,6 @@ fn layer_namespace(idx: usize, layer: &LayerConfig) -> String {
     }
 }
 
-/// SecretResolver impl that pulls secret bytes from the credential store.
-/// Used by `WasmSignerLayer` at request time.
 pub struct PgPoolSecretResolver {
     pub pool: PgPool,
 }
@@ -205,8 +188,6 @@ pub struct PgPoolSecretResolver {
 #[async_trait]
 impl SecretResolver for PgPoolSecretResolver {
     async fn resolve(&self, credential_id: &str) -> Result<Vec<u8>, String> {
-        // Unwrap the (StatusCode, String) error into a plain string — the
-        // SecretResolver trait is platform-agnostic.
         let value = lookup_credential_value(&self.pool, credential_id)
             .await
             .map_err(|(_, msg)| msg)?;
@@ -217,10 +198,6 @@ impl SecretResolver for PgPoolSecretResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Wasmtime-`Engine`-creating tests for this module live in
-    // `crates/lucidos-agents-api/tests/proxy_wasm_engine.rs`. See the
-    // diagnostic block atop `engine::change_ops::tests` for why.
 
     #[test]
     fn layer_namespace_is_kind_alone_first_then_kind_and_position() {
@@ -237,7 +214,6 @@ mod tests {
 
     #[test]
     fn layer_namespace_is_unique_per_kind() {
-        // Two layers of different kinds → distinct namespaces.
         assert_eq!(
             layer_namespace(
                 0,

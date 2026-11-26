@@ -1,6 +1,3 @@
-//! `GET /api/v1/threads/:thread_id/liveness`: the thread's *thread liveness*,
-//! the object every thread-scoped agent read carries (ADR 0679).
-
 use axum::{
     extract::{Path, State},
     Json,

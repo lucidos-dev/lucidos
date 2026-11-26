@@ -1,7 +1,3 @@
-//! `POST /api/v1/chat/queued-message/remove` on a Lucidos Agent thread is a
-//! *consumption claim* (ADR 0706). A 200 means the message never reaches the
-//! agent. A message the agent already has answers 409 `already_read`.
-
 use crate::support::{base_url, db_url, seed_chat_thread_summary, user_client};
 use uuid::Uuid;
 
@@ -145,8 +141,6 @@ async fn removing_a_message_the_agent_already_has_answers_already_read() {
     assert_eq!(tombstones(&pool, thread_id, message).await, 0);
 }
 
-/// Fixtures represent durable acceptance without scheduling a real model call.
-/// Stop must work for an input that has no live handle and no message row yet.
 #[tokio::test]
 async fn cancel_takes_back_unstarted_inputs_and_returns_content_without_a_live_turn() {
     let pool = pool().await;

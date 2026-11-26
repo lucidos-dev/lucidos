@@ -1,18 +1,8 @@
-//! Shared fixtures + helpers for the plugin test suite. Split out of the
-//! monolithic `plugins_tests.rs`; the concern modules pull these in via
-//! `use super::helpers::*`.
-
 use std::path::PathBuf;
 
 use super::*;
 use std::io::Write;
 
-/// Install a plugin by source string (git URL, GitHub tree URL, or
-/// `.lucidos-plugin` archive path). Detects the shape, fetches into a temp
-/// dir, then delegates to `install_from_unpacked_with_bus`. Test-only entry
-/// point — production install runs through `prepare_install_request` +
-/// `confirm_pending_install`, which surfaces the user-confirm panel before
-/// any bytes touch `data/`.
 pub(super) async fn install_from_source_with_bus(
     workspace_path: &Path,
     bus: &dyn EventBusEmitter,
@@ -40,7 +30,6 @@ description = "test"
 source = "https://github.com/x/y"
 "#;
 
-/// The release staging checks an `engine` requirement against in production.
 pub(super) fn running() -> Result<semver::Version, String> {
     crate::engine::release_notices::running_release()
 }
@@ -92,16 +81,10 @@ pub(super) fn fresh_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().to_path_buf();
     std::fs::create_dir_all(p.join("data")).unwrap();
-    // Production workspaces are git repos rooted at the workspace dir (the
-    // ArtifactManager opens/inits one), and plugin install now commits the
-    // files it writes into `data/`. Init a repo here so the writer's commit
-    // step has somewhere to land — matching the real workspace layout.
     git2::Repository::init(&p).unwrap();
     (tmp, p)
 }
 
-/// Fetch the persisted payload(s) for an aggregate id, oldest first, so
-/// tests can index by emit order.
 pub(super) async fn read_events(
     pool: &sqlx::PgPool,
     event_type: &str,

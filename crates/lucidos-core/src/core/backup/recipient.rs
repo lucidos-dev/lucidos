@@ -1,4 +1,4 @@
-//! The backup recipient: the age public key every new archive is sealed to.
+//! INVARIANT: The backup recipient: the age public key every new archive is sealed to.
 //!
 //! The engine stores only this public half. The backup key, its private half,
 //! is shown to the user once and never written anywhere. So after the switch,
@@ -19,34 +19,24 @@ use crate::engine::thread_events::MessageOrigin;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// What the table holds, with ages measured by the database (ADR 0053).
 #[derive(Debug, Default, Clone, sqlx::FromRow)]
 pub struct RecipientState {
-    /// The recipient new archives are sealed to, once confirmed.
     pub recipient: Option<String>,
-    /// A minted recipient waiting for its backup key to be pasted back.
     pub pending_recipient: Option<String>,
-    /// Seconds since the user last proved they hold the backup key. `None`
-    /// until they have, as for a recipient they brought themselves.
     pub secs_since_verified: Option<i64>,
-    /// Seconds since the recipient was set.
     pub secs_since_set: Option<i64>,
 }
 
 impl RecipientState {
-    /// How long the backup key has gone unproven: since the last check, or
-    /// since the recipient was set when there never was one.
     pub fn secs_unproven(&self) -> Option<i64> {
         self.secs_since_verified.or(self.secs_since_set)
     }
 }
 
-/// How a pasted backup key compared with the recipient it should match.
 #[derive(Debug, PartialEq, Eq)]
 pub enum KeyCheck {
     Matches,
     Differs,
-    /// There was nothing to compare it with.
     NothingToCheck,
 }
 
@@ -62,8 +52,6 @@ pub async fn load(pool: &PgPool) -> Result<RecipientState, BoxError> {
     Ok(state.unwrap_or_default())
 }
 
-/// Mint a key pair and keep its recipient as pending. Returns the backup key,
-/// which the caller shows once and then drops.
 pub async fn start_setup(pool: &PgPool) -> Result<String, BoxError> {
     let (identity, recipient) = crypto::generate_key_pair();
     sqlx::query(
@@ -76,7 +64,7 @@ pub async fn start_setup(pool: &PgPool) -> Result<String, BoxError> {
     Ok(crypto::backup_key_text(&identity))
 }
 
-/// Promote the pending recipient when `pasted` is its backup key. The key is
+/// INVARIANT: Promote the pending recipient when `pasted` is its backup key. The key is
 /// compared and dropped, never stored.
 pub async fn confirm(
     pool: &PgPool,
@@ -110,7 +98,6 @@ pub async fn confirm(
     Ok(KeyCheck::Matches)
 }
 
-/// Set a recipient the user made themselves. Any pending minted pair goes.
 pub async fn use_own(
     pool: &PgPool,
     bus: &EventBus,
@@ -131,7 +118,6 @@ pub async fn use_own(
     Ok(())
 }
 
-/// Check that `pasted` still matches the recipient, and record when it does.
 pub async fn verify(pool: &PgPool, pasted: &age::x25519::Identity) -> Result<KeyCheck, BoxError> {
     let derived = pasted.to_public().to_string();
     let Some(recipient) = load(pool).await?.recipient else {
@@ -140,7 +126,7 @@ pub async fn verify(pool: &PgPool, pasted: &age::x25519::Identity) -> Result<Key
     if recipient != derived {
         return Ok(KeyCheck::Differs);
     }
-    // Stamp only the recipient just compared, so a rotation landing between
+    // INVARIANT: Stamp only the recipient just compared, so a rotation landing between
     // the read and this write is never marked as held.
     let stamped = sqlx::query(
         "UPDATE backup_recipient SET verified_at = now() WHERE singleton AND recipient = $1",
@@ -164,9 +150,6 @@ fn recipient_set(recipient: String, own_key: bool, actor: Option<MessageOrigin>)
     })
 }
 
-/// What seals the next archive: the recipient when one is set, else the
-/// legacy key of a workspace that has not switched. `None` means backups are
-/// not set up, and nothing may be sealed.
 pub async fn sealing_key(pool: &PgPool, workspace: &Path) -> Result<Option<SealingKey>, BoxError> {
     if let Some(recipient) = load(pool).await?.recipient {
         let recipient = recipient.parse().map_err(|e| {
@@ -179,8 +162,6 @@ pub async fn sealing_key(pool: &PgPool, workspace: &Path) -> Result<Option<Seali
         .map(SealingKey::Legacy))
 }
 
-/// After a switch, forget the legacy key: no new archive is sealed with it,
-/// and keeping it for old archives was always the user's job.
 pub fn forget_legacy_key(workspace: &Path) {
     match BackupKeyStore::for_engine(workspace).and_then(|keys| keys.delete()) {
         Ok(()) => log_legacy!("[Backup] Switched to the backup recipient; forgot the legacy key"),

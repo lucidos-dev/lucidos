@@ -66,6 +66,12 @@ export const NOT_READY_COPY: Record<StripReason, { label: string; hint: string; 
     detail:
       "This is an integrated sub-thread. Its work folds into its parent's branch, so Lucidos never proposes it here. The parent's agent merges this branch, and the parent's change carries the work to Apply.",
   },
+  hook_refused: {
+    label: 'Not ready: an event hook stopped it',
+    hint: "Ask the agent for the hook's reason. The next turn end asks again.",
+    detail:
+      'An event hook in this workspace refused to let Lucidos propose this work. This thread does not show its reason yet, but the agent can read the hook and its reason in the workspace events. Fix what the hook asks for, and the next turn end asks it again.',
+  },
 };
 
 type StripReason = Exclude<UnproposedReason, 'carried_by_successor'>;

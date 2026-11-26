@@ -89,19 +89,9 @@ async fn stop_restores_before_canceling_a_live_turn_and_still_cancels_on_restore
     teardown_test_db(&db).await;
 }
 
-// ── subprocess_chat_legitimate ──────────────────────────────────────
-//
-// Regression coverage for the cross-thread incident: an LLM agent in
-// thread A used `curl POST /api/v1/changes/<id>/apply` to act on thread B,
-// and the resulting event was misattributed as a "You" card. These
-// tests pin the chat-POST allow/deny matrix that prevents the
-// equivalent attack on `/api/v1/chat/stream` (where the impact would be
-// worse — kicking thread B's agentic loop under a false user identity).
-
 #[test]
 fn subprocess_chat_rejects_human_mode_targeting_any_thread() {
     let source = Some(Uuid::new_v4());
-    // Cross-thread human mode (the actual attack shape) — reject.
     let target_other = Some(Uuid::new_v4());
     assert!(!subprocess_chat_legitimate(
         ActorMode::Human,
@@ -110,8 +100,6 @@ fn subprocess_chat_rejects_human_mode_targeting_any_thread() {
         None,
         true,
     ));
-    // Same-thread human mode — also reject. A subprocess never *is*
-    // the user, even when targeting its own thread.
     assert!(!subprocess_chat_legitimate(
         ActorMode::Human,
         source,
@@ -119,7 +107,6 @@ fn subprocess_chat_rejects_human_mode_targeting_any_thread() {
         None,
         true,
     ));
-    // No target / no parent — reject (nothing to legitimise).
     assert!(!subprocess_chat_legitimate(
         ActorMode::Human,
         source,
@@ -131,8 +118,6 @@ fn subprocess_chat_rejects_human_mode_targeting_any_thread() {
 
 #[test]
 fn subprocess_chat_rejects_cross_thread_agent_post() {
-    // Agent mode targeting a thread the subprocess didn't spawn from
-    // and no parent claim — the canonical cross-thread injection.
     let source = Some(Uuid::new_v4());
     let target_other = Some(Uuid::new_v4());
     assert!(!subprocess_chat_legitimate(
@@ -154,9 +139,6 @@ fn subprocess_chat_rejects_cross_thread_agent_post() {
 #[test]
 fn subprocess_chat_allows_same_thread_agent_followup() {
     let source = Some(Uuid::new_v4());
-    // `target_thread_id == source_thread_id` — an agent posting back
-    // into its own loop (the channel `lucidos spawn-thread` uses on
-    // follow-ups within the same thread).
     assert!(subprocess_chat_legitimate(
         ActorMode::Agent,
         source,
@@ -175,9 +157,6 @@ fn subprocess_chat_allows_same_thread_agent_followup() {
 
 #[test]
 fn subprocess_chat_allows_spawn_with_matching_parent_thread() {
-    // The `lucidos spawn-thread` shape: target_thread_id = None
-    // (engine generates the new sub-thread), parent_thread_id =
-    // source — exactly the spawn graph the engine wants.
     let source = Some(Uuid::new_v4());
     assert!(subprocess_chat_legitimate(
         ActorMode::Agent,
@@ -190,9 +169,6 @@ fn subprocess_chat_allows_spawn_with_matching_parent_thread() {
 
 #[test]
 fn subprocess_chat_rejects_spawn_with_mismatched_parent_thread() {
-    // Agent mode claiming a parent_thread_id that doesn't match the
-    // subprocess's actual source — denied. A subprocess of thread A
-    // can't pretend to be spawning from thread C.
     let source = Some(Uuid::new_v4());
     let lied_parent = Some(Uuid::new_v4());
     assert!(!subprocess_chat_legitimate(
@@ -204,17 +180,6 @@ fn subprocess_chat_rejects_spawn_with_mismatched_parent_thread() {
     ));
 }
 
-/// Hazard 10(b) of the child-follow-up plan. `parent_matches_source` says
-/// "I am spawning a child"; nothing in that claim constrains the TARGET.
-/// Without the `!target_exists` conjunct, a subprocess of thread S could
-/// write into any existing thread by naming it as the target and naming
-/// itself as the parent, reaching the same cross-thread injection the
-/// `target_matches_source` arm refuses through the other arm.
-///
-/// After the origin token became thread-bound this was the last route by
-/// which an authenticated subprocess could write into a thread it does not
-/// own, and it would have made `POST /threads/:thread_id/follow-up`'s
-/// refusal ladder bypassable.
 #[test]
 fn parent_matches_source_requires_a_new_target() {
     let source = Some(Uuid::new_v4());
@@ -225,7 +190,6 @@ fn parent_matches_source_requires_a_new_target() {
             !subprocess_chat_legitimate(mode, source, someone_elses_thread, source, true),
             "{mode:?}: claiming parenthood must not open an EXISTING thread"
         );
-        // Same call, target does not exist yet: that is a spawn, and allowed.
         assert!(
             subprocess_chat_legitimate(mode, source, someone_elses_thread, source, false),
             "{mode:?}: a spawn naming its own new thread id stays allowed"
@@ -233,10 +197,6 @@ fn parent_matches_source_requires_a_new_target() {
     }
 }
 
-/// The regression the deferral asked for. `lucidos spawn-thread --relation
-/// child` pre-generates a client-side uuid and sends it together with
-/// `parent_thread_id`, so it hits the spawn arm with a target that provably
-/// does not exist. See `crates/lucidos-cli/src/spawn_thread.rs`.
 #[test]
 fn spawn_thread_with_a_pregenerated_id_is_still_allowed() {
     let source = Some(Uuid::new_v4());
@@ -250,9 +210,6 @@ fn spawn_thread_with_a_pregenerated_id_is_still_allowed() {
     ));
 }
 
-/// The tightening did not overreach: a subprocess following up on its OWN
-/// thread is allowed precisely because that thread exists, and it reaches
-/// the `target_matches_source` arm, which the new conjunct does not touch.
 #[test]
 fn target_matches_source_is_unaffected_by_the_new_conjunct() {
     let source = Some(Uuid::new_v4());
@@ -263,8 +220,6 @@ fn target_matches_source_is_unaffected_by_the_new_conjunct() {
         None,
         true,
     ));
-    // And still allowed with the parent claim alongside it, which is what a
-    // subprocess re-sending into its own thread with spawn context looks like.
     assert!(subprocess_chat_legitimate(
         ActorMode::Agent,
         source,
@@ -276,10 +231,6 @@ fn target_matches_source_is_unaffected_by_the_new_conjunct() {
 
 #[test]
 fn subprocess_chat_no_source_thread_still_rejects_cross_thread() {
-    // A thread-less subprocess: a scheduled script, whose origin token is
-    // minted against the no-thread sentinel. There is no source thread to
-    // compare against, so neither arm can match and any agent-mode post is
-    // rejected.
     let target_other = Some(Uuid::new_v4());
     assert!(!subprocess_chat_legitimate(
         ActorMode::Agent,
@@ -290,41 +241,23 @@ fn subprocess_chat_no_source_thread_still_rejects_cross_thread() {
     ));
 }
 
-// ── human_mode_is_attributed ────────────────────────────────────────
-//
-// Regression coverage for the 2026-08-06 incident: the Lucidos Agent shelled
-// out to `curl` and POSTed `mode: "human"` to /api/v1/chat/stream, and the
-// engine recorded it as a turn the user typed. The matrix above never saw the
-// request, because it only runs for a caller that PRESENTS an origin token,
-// and curl does not forward one. These tests pin the gate that runs for every
-// caller.
-
 #[test]
 fn unattributed_human_mode_is_refused() {
-    // The incident shape exactly: no device, no caller workspace.
     assert!(!human_mode_is_attributed(ActorMode::Human, false, false));
 }
 
 #[test]
 fn a_registered_device_attributes_a_human() {
-    // The user's own client: it sends `x-lucidos-device-id` on every mutating
-    // fetch, and the id resolves to a `devices` row.
     assert!(human_mode_is_attributed(ActorMode::Human, true, false));
 }
 
 #[test]
 fn a_cross_workspace_caller_may_still_speak_for_its_human() {
-    // The existing cross-workspace contract: the calling workspace vouches for
-    // its own user. Still only a display hint (`api::actor`), and deliberately
-    // not renegotiated by this gate.
     assert!(human_mode_is_attributed(ActorMode::Human, false, true));
 }
 
 #[test]
 fn agent_and_engine_modes_need_no_human_evidence() {
-    // They claim no human, so there is nothing to substantiate here.
-    // `validate_mode_and_spawn` requires their provenance and
-    // `subprocess_chat_legitimate` constrains their reach.
     for mode in [ActorMode::Agent, ActorMode::Engine] {
         assert!(
             human_mode_is_attributed(mode, false, false),
@@ -333,15 +266,6 @@ fn agent_and_engine_modes_need_no_human_evidence() {
     }
 }
 
-/// The root cause, pinned directly: **dropping the origin token must never buy
-/// more than presenting it.**
-///
-/// Before this gate, a subprocess that presented its token was held to
-/// `subprocess_chat_legitimate` (which refuses `mode: Human` outright), while
-/// the same subprocess shelling out to `curl` read as an ordinary external API
-/// client and was allowed. The constraint was opt-in by the party it
-/// constrained. For every unattributed body, the token-absent path must now be
-/// no more permissive than the token-present one.
 #[test]
 fn dropping_the_origin_token_never_buys_more_than_presenting_it() {
     let source = Uuid::new_v4();
@@ -373,8 +297,6 @@ fn dropping_the_origin_token_never_buys_more_than_presenting_it() {
 
 #[test]
 fn the_human_refusal_tells_the_agent_what_to_do_instead() {
-    // The incident's real failure was the agent not reporting that it was
-    // blocked, so the message has to carry the alternative, not just the "no".
     let msg = HUMAN_MODE_UNATTRIBUTED;
     assert!(
         msg.contains("registered device"),
@@ -390,14 +312,6 @@ fn the_human_refusal_tells_the_agent_what_to_do_instead() {
     );
 }
 
-// ── thread_target_is_addressable ────────────────────────────────────
-//
-// The other half of the incident: the POST hit the wrong engine, whose
-// `MessageReceived` projection is an upsert, so the six unknown thread ids were
-// materialized there instead of refused. Reading them back off the same wrong
-// engine then FOUND them, so the agent's own verification confirmed the
-// mistake.
-
 #[test]
 fn an_existing_thread_is_always_addressable() {
     assert!(thread_target_is_addressable(true, false, None, None, false));
@@ -408,7 +322,6 @@ fn an_unknown_thread_with_no_create_signal_is_refused() {
     assert!(!thread_target_is_addressable(
         false, false, None, None, false
     ));
-    // An explicit `false` is not a create signal either.
     assert!(!thread_target_is_addressable(
         false,
         false,
@@ -420,7 +333,6 @@ fn an_unknown_thread_with_no_create_signal_is_refused() {
 
 #[test]
 fn each_create_signal_admits_an_unknown_thread() {
-    // The frontend's raw new send, which mints its own uuid.
     assert!(thread_target_is_addressable(
         false,
         false,
@@ -428,8 +340,6 @@ fn each_create_signal_admits_an_unknown_thread() {
         None,
         false
     ));
-    // A same-workspace spawn with callback (`lucidos spawn-thread --relation
-    // child`), which is why that CLI needed no new flag.
     assert!(thread_target_is_addressable(
         false,
         false,
@@ -437,13 +347,9 @@ fn each_create_signal_admits_an_unknown_thread() {
         Some(Uuid::new_v4()),
         false
     ));
-    // A cross-workspace spawn (`workspace_client`, `spawn-thread --to`), same.
     assert!(thread_target_is_addressable(false, false, None, None, true));
 }
 
-/// The client sends a thread's second message once the first is acked, and
-/// the first may not be recorded yet. The thread then has an admitted input
-/// and no row, and the second send must order behind it, not 404 (ADR 0449).
 #[test]
 fn an_unknown_thread_with_an_admitted_input_is_addressable() {
     assert!(thread_target_is_addressable(false, true, None, None, false));
@@ -464,9 +370,6 @@ fn the_unknown_thread_refusal_points_at_the_wrong_engine() {
         "points at the way to check which engine answered: {msg}"
     );
 }
-
-// A create with nothing to say is refused before the thread exists. The caller
-// gets the error, not a link to a dead thread (ADR 0376).
 
 #[test]
 fn a_create_with_no_text_and_no_image_is_refused() {
@@ -502,10 +405,6 @@ fn a_drafts_first_send_is_a_create() {
 fn a_follow_up_is_not_judged_here() {
     assert!(require_input_to_create(true, "", &[]).is_ok());
 }
-
-// A new coding-agent thread's `cc_model` is checked against the backend's list,
-// by the same function the `run_coding_agent` tool uses. `lucidos spawn-thread`
-// reaches this route, and it ran any id before.
 
 #[test]
 fn a_new_coding_agent_thread_with_an_unoffered_model_is_refused() {
@@ -564,8 +463,6 @@ fn an_offered_or_absent_model_passes() {
     }
 }
 
-/// The tool, the route and the picker read one list. The refusal text names the
-/// offered ids in list order, and every picker row is one of them.
 #[test]
 fn the_tool_the_route_and_the_picker_share_one_list() {
     use crate::runtime::{coding_agent_model_options, validate_coding_agent_model, CodingAgent};
@@ -640,8 +537,6 @@ fn base_req(mode: ActorMode) -> ChatRequest {
     }
 }
 
-/// I9 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`: a wake
-/// mode rides only beside a parent, and names a real mode.
 #[test]
 fn a_wake_mode_needs_a_parent_and_a_known_name() {
     let mut req = base_req(ActorMode::Agent);
@@ -659,9 +554,6 @@ fn a_wake_mode_needs_a_parent_and_a_known_name() {
     assert_eq!(spawn_refusal(&top), StatusCode::BAD_REQUEST);
 }
 
-/// The status `validate_mode_and_spawn` refused with. It returns an `ApiError`,
-/// which carries a message and so is not comparable; every refusal below cares
-/// only about the status.
 fn spawn_refusal(request: &ChatRequest) -> StatusCode {
     validate_mode_and_spawn(request)
         .expect_err("expected a refusal")
@@ -758,9 +650,6 @@ fn chat_request_mode_field_deserializes() {
 
 #[test]
 fn chat_request_accepts_legacy_use_claude_code_alias() {
-    // Back-compat: payloads persisted / sent before the
-    // `use_claude_code` → `use_coding_agent` rename (queued ThreadQueueRequest
-    // rows, in-flight clients) must still deserialize via the serde alias.
     let body = serde_json::json!({
         "message": "spawned task",
         "mode": "agent",
@@ -788,8 +677,6 @@ fn caller_workspace_with_spawning_event_id_returns_400() {
 
 #[test]
 fn caller_thread_id_without_caller_workspace_returns_400() {
-    // caller_thread_id only meaningful in conjunction with caller_workspace —
-    // an orphan caller id is a malformed request, not a silent drop.
     let mut req = base_req(ActorMode::Human);
     req.caller_thread_id = Some(Uuid::new_v4().to_string());
     assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
@@ -820,8 +707,6 @@ fn caller_event_id_invalid_uuid_returns_400() {
 
 #[test]
 fn caller_workspace_with_only_workspace_field_is_valid() {
-    // Caller workspace alone is fine — caller_thread_id / caller_event_id
-    // are optional. Common case: human curl from another workspace.
     let mut req = base_req(ActorMode::Human);
     req.caller_workspace = Some("dev".into());
     let v = validate_mode_and_spawn(&req).unwrap();
@@ -837,13 +722,6 @@ fn caller_workspace_with_all_three_fields_is_valid() {
     req.caller_event_id = Some(Uuid::new_v4().to_string());
     assert!(validate_mode_and_spawn(&req).is_ok());
 }
-
-// ── the self-parent refusal ──────────────────────────────────────────
-//
-// A row whose `parent_thread_id` is its own `thread_id` is a one-node cycle
-// in the thread family. `POST /api/v1/chat/stream` is the one write path that
-// could produce it: Agent mode has to supply a parent, and nothing said the
-// parent must differ from the target.
 
 #[test]
 fn a_thread_may_not_be_its_own_parent() {
@@ -868,8 +746,6 @@ fn a_thread_may_not_be_its_own_parent() {
 
 #[test]
 fn the_self_parent_check_compares_uuids_not_strings() {
-    // Same id, different spelling. A string compare would let this through
-    // and write the poison row.
     let tid = Uuid::new_v4();
     let mut req = base_req(ActorMode::Agent);
     req.thread_id = Some(tid.to_string().to_uppercase());
@@ -879,8 +755,6 @@ fn the_self_parent_check_compares_uuids_not_strings() {
 
 #[test]
 fn a_parent_that_differs_from_the_target_is_still_accepted() {
-    // The ordinary spawn: `lucidos spawn-thread --relation child` sends a
-    // fresh target id plus the caller's id as parent.
     let tid = Uuid::new_v4();
     let parent = Uuid::new_v4();
     let mut req = base_req(ActorMode::Agent);
@@ -894,8 +768,6 @@ fn a_parent_that_differs_from_the_target_is_still_accepted() {
 
 #[test]
 fn a_target_with_no_parent_is_not_read_as_self_parented() {
-    // Both `None` compare equal, so the guard has to test for a parent
-    // first. Without that, every plain human send would 400.
     let mut req = base_req(ActorMode::Human);
     req.thread_id = None;
     req.parent_thread_id = None;
@@ -904,18 +776,13 @@ fn a_target_with_no_parent_is_not_read_as_self_parented() {
 
 #[test]
 fn a_malformed_target_thread_id_is_still_a_400() {
-    // The validator parses `thread_id` now, so it owns this refusal that
-    // the handlers used to make on their own.
     let mut req = base_req(ActorMode::Human);
     req.thread_id = Some("not-a-uuid".into());
     assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
-// -- validate_thread_continuity ---------------------------------------
-
 #[test]
 fn continuity_new_thread_is_always_ok() {
-    // No existing summary => new thread, anything goes
     assert!(validate_thread_continuity(None, None, None, None, None, None).is_ok());
     assert!(validate_thread_continuity(None, None, None, Some(true), Some("repo-a"), None).is_ok());
 }
@@ -985,8 +852,6 @@ fn continuity_cc_thread_rejects_different_repo() {
 
 #[test]
 fn continuity_cc_thread_with_no_request_repo_is_ok() {
-    // Request omits repo_id => frontend will inherit from the thread.
-    // Don't 409 just because the field is missing.
     assert!(validate_thread_continuity(
         Some("claude_code"),
         Some("repo-a"),
@@ -1000,9 +865,6 @@ fn continuity_cc_thread_with_no_request_repo_is_ok() {
 
 #[test]
 fn continuity_cc_thread_with_no_existing_repo_is_ok() {
-    // First Claude Code session bound but cc_repo_id wasn't recorded (e.g. older
-    // event before SessionStarted carried repo_id). Don't gate on a
-    // missing existing value — just let the request through.
     assert!(validate_thread_continuity(
         Some("claude_code"),
         None,
@@ -1016,7 +878,6 @@ fn continuity_cc_thread_with_no_existing_repo_is_ok() {
 
 #[test]
 fn continuity_cc_thread_rejects_backend_flip() {
-    // Thread locked to claude-code (explicit) — requesting codex must 409.
     let err = validate_thread_continuity(
         Some("claude_code"),
         None,
@@ -1030,7 +891,6 @@ fn continuity_cc_thread_rejects_backend_flip() {
     assert!(err.1.contains("codex"));
     assert!(err.1.contains("claude-code"));
 
-    // Legacy row (NULL stored backend) is a claude-code thread — same 409.
     let err = validate_thread_continuity(
         Some("claude_code"),
         None,
@@ -1054,8 +914,6 @@ fn continuity_cc_thread_accepts_matching_backend() {
         Some(crate::runtime::CodingAgent::Codex),
     )
     .is_ok());
-    // Omitted request backend always passes — the engine resolves from the
-    // stored value.
     assert!(validate_thread_continuity(
         Some("claude_code"),
         None,
@@ -1069,14 +927,10 @@ fn continuity_cc_thread_accepts_matching_backend() {
 
 #[test]
 fn continuity_trigger_thread_treated_as_chat() {
-    // Trigger threads aren't coding-agent threads, so use_coding_agent=true is
-    // a mode switch and must be rejected.
     let err = validate_thread_continuity(Some("trigger"), None, None, Some(true), None, None)
         .unwrap_err();
     assert_eq!(err.0, StatusCode::CONFLICT);
 }
-
-// ── drain_orphan_queue ──
 
 fn make_orphan(text: &str) -> InjectedPrompt {
     InjectedPrompt {
@@ -1150,15 +1004,8 @@ async fn drain_orphan_queue_keeps_an_engine_reentry_separate() {
     );
 }
 
-// Regression: a re-processed orphan whose own loop produces NEW orphans
-// (the in-the-wild thread 9b5a05aa scenario where the user sent two
-// follow-ups in quick succession during recovery) used to lose those
-// child orphans because the spawned task discarded the ProcessResult.
-// The chain must keep draining until every appended orphan is processed.
 #[tokio::test]
 async fn drain_orphan_queue_processes_orphans_of_orphans() {
-    // Orphan "a" produces orphan "b" when processed; orphan "b" produces
-    // nothing. Both must be processed.
     let initial = vec![make_orphan("a")];
     let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let processed_clone = processed.clone();
@@ -1181,7 +1028,6 @@ async fn drain_orphan_queue_processes_orphans_of_orphans() {
 
 #[tokio::test]
 async fn drain_orphan_queue_handles_deep_chains() {
-    // Each orphan produces one more orphan, four levels deep.
     let initial = vec![make_orphan("0")];
     let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let processed_clone = processed.clone();
@@ -1247,10 +1093,6 @@ async fn the_removal_lookup_finds_only_its_own_tombstone() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// ── announce_orphan_batch ──
-
-/// Persist a `MessageReceived` under a caller-chosen event id, so the test can
-/// build an orphan that names it via `injected_message_id`.
 async fn persist_message(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
@@ -1290,15 +1132,6 @@ fn orphan_naming(event_id: Uuid, text: &str) -> InjectedPrompt {
     }
 }
 
-/// The shape the user hit: message A starts a turn, message B lands while it is
-/// running (so it is injected, not queued behind a fresh turn), then the user's
-/// Stop terminates A. B is recovered as an orphan and re-submitted as a turn of
-/// its own, anchored on the `MessageReceived` that already exists for it.
-///
-/// Nothing else in that re-processed turn sets the thread back to `running`, so
-/// the batch announcement is what keeps the projection honest while the agent
-/// works. Before the fix the first orphan was skipped and the thread read
-/// `idle` for the whole turn.
 #[tokio::test]
 async fn announce_orphan_batch_revives_a_thread_the_cancel_left_idle() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1374,9 +1207,6 @@ async fn announce_orphan_batch_revives_a_thread_the_cancel_left_idle() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Every orphan in the batch is announced, not just the ones after the first.
-/// The batch is coalesced into ONE re-processed turn, so all of them anchor on
-/// the first message's request id while naming their own.
 #[tokio::test]
 async fn announce_orphan_batch_announces_every_orphan_in_the_batch() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1415,8 +1245,6 @@ async fn announce_orphan_batch_announces_every_orphan_in_the_batch() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An orphan the user took back after the chain filtered it is never
-/// announced, and the batch re-anchors on the first orphan still owed.
 #[tokio::test]
 async fn announce_orphan_batch_leaves_out_an_orphan_the_user_took_back() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1459,8 +1287,6 @@ async fn announce_orphan_batch_leaves_out_an_orphan_the_user_took_back() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An empty batch cannot happen through `process_orphan_chain` (the caller has
-/// already read `first`), but the helper must not panic if one ever reaches it.
 #[tokio::test]
 async fn announce_orphan_batch_is_a_noop_for_an_empty_batch() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1480,11 +1306,6 @@ async fn announce_orphan_batch_is_a_noop_for_an_empty_batch() {
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
-
-// ── resolve_file_ctx ────────────────────────────────────────────────
-//
-// Both file previews render the same line-numbered source view, so a workspace
-// data file carries a selected line range exactly as a repository file does.
 
 #[test]
 fn file_ctx_carries_a_data_file_line_range() {
@@ -1541,8 +1362,6 @@ fn file_ctx_wins_over_repo_file_ctx_and_neither_is_none() {
     assert_eq!(resolve_file_ctx(None, None), None);
 }
 
-// ── claimed_device_id / origin_agrees_with_mode ─────────────────────
-
 fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
     let mut h = axum::http::HeaderMap::new();
     for (k, v) in pairs {
@@ -1581,8 +1400,6 @@ fn the_body_device_id_wins_and_a_blank_one_falls_through_to_the_header() {
     );
 }
 
-/// A team send names its speaker by device, so the device the gateway
-/// authenticated wins over a body naming someone else's.
 #[test]
 fn a_team_send_takes_the_authenticated_device_over_the_body() {
     use crate::api::actor::authenticated_device_id;
@@ -1599,9 +1416,6 @@ fn a_team_send_takes_the_authenticated_device_over_the_body() {
     assert_eq!(authenticated_device_id(Some(" "), &none), None);
 }
 
-/// A window re-paired under an open page sends its old id in the body and the
-/// gateway's new, stamped id in the header. The send is the stamped device, on
-/// a single-user gateway too, and is never parked as an unattested caller.
 #[tokio::test]
 async fn a_stale_body_id_beside_a_stamped_header_is_the_stamped_device() {
     let (pool, db) = crate::test_support::setup_test_db().await;
@@ -1635,9 +1449,6 @@ async fn a_stale_body_id_beside_a_stamped_header_is_the_stamped_device() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// The gateway sends its own token beside the stamped device header. A device
-/// id in the header alone is recorded as that device, not as the engine's own
-/// machinery. Its mode agrees with the request.
 #[test]
 fn a_header_only_device_behind_the_gateway_is_recorded_as_that_device() {
     let token = crate::api::local_auth::publish_test_local_token();
@@ -1680,11 +1491,6 @@ fn a_mode_the_credential_contradicts_is_a_400_not_a_panic() {
     assert!(origin_agrees_with_mode(None, ActorMode::Human).is_ok());
 }
 
-// ── subprocess_gate_applies ─────────────────────────────────────────
-
-/// A token holder that adds `caller_workspace` keeps the gate for an existing
-/// thread and for `mode: human`. Only an agent's create skips it: a top-thread
-/// any caller may make (ADR 0475).
 #[test]
 fn caller_workspace_skips_the_subprocess_gate_only_for_a_create() {
     for mode in [ActorMode::Agent, ActorMode::Engine] {
@@ -1706,8 +1512,6 @@ fn caller_workspace_skips_the_subprocess_gate_only_for_a_create() {
     }
 }
 
-/// With the gate applied, the matrix refuses both shapes `caller_workspace`
-/// must not open: a post into an existing thread and a human create.
 #[test]
 fn a_token_holder_naming_another_workspace_cannot_post_into_an_existing_thread() {
     let source = Some(Uuid::new_v4());
@@ -1726,11 +1530,6 @@ fn a_token_holder_naming_another_workspace_cannot_post_into_an_existing_thread()
     ));
 }
 
-// ── refuse_unfit_integrated_spawn ────────────────────────────────────
-
-/// A `mode=human` spawn runs at once, outside the Thread Queue, and only the
-/// queued request carries `integrated`. So the pair is refused by name rather
-/// than starting an independent child.
 #[tokio::test]
 async fn an_integrated_spawn_in_human_mode_is_refused_by_name() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1777,8 +1576,6 @@ fn ordinary_wire_intent_normalizes_aliases_and_retains_context_and_selections() 
     );
 }
 
-/// A coding-agent orphan keeps its kind: a message re-runs as a message, so
-/// the run names it, and a re-entry stays a re-entry.
 #[test]
 fn a_coding_agent_orphan_re_runs_as_the_input_it_was() {
     use crate::engine::InjectedPromptKind;
@@ -1800,8 +1597,6 @@ fn a_coding_agent_orphan_re_runs_as_the_input_it_was() {
     assert_eq!(starter(InjectedPromptKind::SpokenContinuation), None);
 }
 
-/// A human follow-up drained from a coding-agent run, as the orphan chain
-/// receives it.
 fn human_orphan(text: &str, message_id: Uuid) -> InjectedPrompt {
     InjectedPrompt {
         text: text.into(),
@@ -1823,10 +1618,6 @@ async fn count_thread_events(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &
         .unwrap()
 }
 
-/// The reported incident. A run ended without reading a follow-up, and the
-/// orphan chain re-ran it as a Lucidos Agent turn on the coding-agent thread.
-/// That turn routed the coding agent's model through the chat registry. The
-/// follow-up must reach the coding agent instead, as the user's message.
 #[test]
 fn a_coding_agent_threads_orphan_reaches_its_coding_agent() {
     crate::test_support::run_on_engine_runtime(
@@ -1920,9 +1711,6 @@ async fn coding_agent_orphan_case() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// A thread whose lane cannot be read runs no turn at all. The Lucidos Agent
-/// is never the fallback: on a coding-agent thread it would spend a chat
-/// credential and answer in the coding agent's place.
 #[test]
 fn an_unknown_lane_runs_no_turn_and_says_so() {
     crate::test_support::run_on_engine_runtime(
@@ -1958,8 +1746,6 @@ async fn unknown_lane_case() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// Every caller gets the thread's lane, not only the orphan chain. A caller
-/// that passes no lane still reaches the coding agent on its thread.
 #[test]
 fn a_caller_without_a_lane_reaches_the_threads_coding_agent() {
     crate::test_support::run_on_engine_runtime(
@@ -1989,7 +1775,7 @@ async fn caller_without_a_lane_case() {
             None,
             None,
             None,
-            None, // use_coding_agent: the caller names no lane
+            None,
             None,
             Some(thread_id),
             None,

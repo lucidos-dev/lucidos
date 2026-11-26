@@ -265,6 +265,7 @@ worked example.
 | Symptom | Likely cause |
 |---|---|
 | `400` `{"error":"Change not found"}` | Wrong `change_id`, or change was discarded |
+| `400` `{"error":"The event hook '<slug>' stopped this: …"}` | An *event hook* armed on `ChangeApplyRequested` refused the Apply (ADR 0746). Nothing is recorded but `EventHookRefused` and `ChangeApplyFailed`, and nothing merges. Do what the reason asks, then apply again. |
 | `400` `{"error":"Change is already applied"}` | Stale UUID — the engine treats this as an error, not idempotent. The idempotent-applied path returns `200` with `status: "noop"`. |
 | `403` `{"error":"Thread … is out of your reach, so you cannot apply a change from it…"}` | The caller presents a *thread-bound origin token* and the change belongs outside its own subtree. Applying it is the *workspace owner*'s, so the caller needs their *standing instruction*: a turn they opened, or a trigger firing they authorized. A caller with no token is unaffected. |
 | `409` `{"error":"This change can't be applied in the thread's current state"}` | The owning thread doesn't currently offer Apply (e.g. mid-turn / Running). Mirrors the UI gate. Re-applying an *already-applied* change is exempt — that returns `200 noop`. |

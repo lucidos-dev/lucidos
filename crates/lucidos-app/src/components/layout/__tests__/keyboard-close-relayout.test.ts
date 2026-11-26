@@ -14,6 +14,7 @@ import {
   noteKeyboardClosed,
   keyboardCloseState,
   resetKeyboardCloseState,
+  relayoutShell,
 } from '../keyboardCloseRelayout';
 
 
@@ -435,6 +436,36 @@ describe('the shell hands its viewport reading over', () => {
     expect(body).toContain('if (vvLooksShrunk) noteKeyboardClosed();');
     expect(body).toContain('else noteWakeViewport(');
     expect(body.indexOf('noteKeyboardClosed(')).toBeGreaterThan(body.indexOf('setHeight('));
+  });
+});
+
+describe('relayoutShell: the nudge is two real layouts and a no-op scroll', () => {
+  it('forces a layout between the away write and the restore', () => {
+    const log: string[] = [];
+    const doc = globalThis.document as unknown as Record<string, unknown>;
+    doc.documentElement = {
+      get offsetHeight() {
+        log.push('layout');
+        return 0;
+      },
+      style: {
+        getPropertyValue: () => priorHeight,
+        setProperty: (name: string, value: string) => {
+          if (name === '--app-height') log.push(`write ${value}`);
+        },
+      },
+    };
+    expect(relayoutShell()).toBe(true);
+    expect(log).toEqual([`write ${FULL - 1}px`, 'layout', `write ${FULL}px`, 'layout']);
+  });
+
+  it('asks the browser for the scroll offset the page already holds', () => {
+    const asked: [number, number][] = [];
+    const g = globalThis as unknown as Record<string, unknown>;
+    g.scrollY = 240;
+    g.scrollTo = (x: number, y: number) => { asked.push([x, y]); };
+    relayoutShell();
+    expect(asked).toEqual([[0, 240]]);
   });
 });
 

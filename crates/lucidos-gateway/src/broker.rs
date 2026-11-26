@@ -1,13 +1,3 @@
-//! The workspace broker's gateway half: `/~/api/v1/control/broker/*`.
-//!
-//! An engine calls these routes for one of its agent threads, after it spent
-//! the user's Allow once for that verb and workspace. The gateway trusts no
-//! caller but a local process, and enforces the verb split itself: delete and
-//! Trash restore act only on a machine-made workspace, read under the
-//! workspace lock. Stop, start, autostart and rename reuse the ordinary control
-//! routes. On a machine-made workspace the engine calls those with no card.
-//! There is no restart route here, by design (ADR 0671).
-
 use crate::auth;
 use crate::error::ApiError;
 use crate::registry::{CreatedBy, WorkspaceOrigin};
@@ -51,7 +41,6 @@ struct ClassifyBody {
     origin: WorkspaceOrigin,
 }
 
-/// A local engine only: no paired device, no agent's own origin token.
 pub(crate) fn local_engine(
     local: Option<Extension<auth::AuthenticatedLocalProcess>>,
     headers: &HeaderMap,

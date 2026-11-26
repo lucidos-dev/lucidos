@@ -1,7 +1,5 @@
 use std::fmt;
 
-/// Implement only for types whose complete formatted value is shareable.
-/// Text, paths and error displays require [`private`].
 pub trait LogValue {
     fn is_private(&self) -> bool {
         false
@@ -66,7 +64,6 @@ impl<T: fmt::Debug> fmt::Debug for Private<T> {
     }
 }
 
-/// An error exposes its typed kind separately from its private display text.
 pub trait ErrorKind {
     type Kind: LogValue;
     fn log_kind(&self) -> Self::Kind;

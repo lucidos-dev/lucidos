@@ -1,13 +1,3 @@
-//! The engine's one unified-diff shape and one parser for it.
-//!
-//! Three surfaces render a diff and all three return this shape, so the
-//! frontend has a single `DiffFile` to draw with (`DiffView`,
-//! `InlineDiffList`): the repository diff and the change diff (both in
-//! `api::repositories`), and the command-checkpoint diff
-//! (`api::command_checkpoint`), which diffs a checkpoint's pre image against
-//! its post image. They differ only in which two revisions they hand to
-//! `git diff`; everything downstream of that is this module.
-
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -38,8 +28,6 @@ pub struct DiffLine {
     pub content: String,
 }
 
-/// Decode git's C-quoted path form (`"foo\360..."`) back to raw UTF-8.
-/// Returns `path` unchanged when not surrounded by `"`.
 fn unquote_git_path(path: &str) -> String {
     let bytes = path.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
@@ -86,9 +74,6 @@ fn unquote_git_path(path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Extract the b-side path from a `diff --git ...` header. Handles both bare
-/// (`a/X b/X`) and quoted (`"a/X" "b/X"`) forms. Empty string when nothing
-/// matches: never let the raw header bleed through as a filename.
 fn parse_diff_git_path(line: &str) -> String {
     if let Some(idx) = line.rfind(" \"b/") {
         let quoted = &line[idx + 1..];

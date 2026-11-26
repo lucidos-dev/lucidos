@@ -139,6 +139,24 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
           )}
         </section>
 
+        {req.hooks && req.hooks.length > 0 && (
+          <PluginSection
+            label="Can stop progress"
+            count={req.hooks.length}
+            defaultOpen
+            tone="danger"
+            note={isUpdate
+              ? 'Updating arms new hooks and hooks that change event type. Hooks on the same event keep your arming choice. Use Event Hooks in Settings to arm any retained edits.'
+              : 'Installing arms these hooks. Their scripts can stop the listed events.'}
+          >
+            <ul class="plugin-install-files">
+              {req.hooks.map((hook) => (
+                <li class="plugin-install-file" key={hook.slug}>{hook.name} · <code>{hook.event_type}</code></li>
+              ))}
+            </ul>
+          </PluginSection>
+        )}
+
         {localChanges.length > 0 && (
           <PluginSection
             label="Your edits"

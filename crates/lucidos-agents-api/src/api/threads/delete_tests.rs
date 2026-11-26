@@ -1,15 +1,3 @@
-// ── Thread delete ─────────────────────────────────────────────────────────
-//
-// The cascade GATE is tested in `family_tests.rs`, which archive and delete
-// share. What is tested here is the removal itself: what goes, in what order,
-// and what survives it.
-//
-// The handler needs a whole `LucidosEngine` (providers, embedder, scheduler),
-// which this harness does not stand up. So the tests drive
-// `delete_family_rows` against a real Postgres seeded through `EventBus`, which
-// is every destructive statement in the route. The caller gate is tested where
-// it lives, in `api/actor_tests.rs`.
-
 use super::*;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
@@ -17,12 +5,8 @@ use crate::memory::pgvector::{MemorySource, PgVectorIndex};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use sqlx::PgPool;
 
-/// A marker no other fixture writes, so an assertion that it is absent from the
-/// audit payload means the payload carries no thread content.
 const BODY_MARKER: &str = "zebra-quilt-marker";
 
-/// Seed one chat thread with a body carrying [`BODY_MARKER`], and return its id
-/// plus the id of its `MessageReceived`.
 async fn seed_thread(bus: &EventBus, parent: Option<uuid::Uuid>) -> (Uuid, Uuid) {
     let thread_id = Uuid::new_v4();
     let event_id = bus
@@ -67,7 +51,6 @@ async fn seed_thread(bus: &EventBus, parent: Option<uuid::Uuid>) -> (Uuid, Uuid)
     (thread_id, event_id)
 }
 
-/// Index one memory fact against `event_id`, the shape `memory_consumer` writes.
 async fn index_fact(index: &PgVectorIndex, event_id: Uuid, summary: &str) -> Uuid {
     let id = Uuid::new_v4();
     index
@@ -96,7 +79,6 @@ async fn count(pool: &PgPool, sql: &str, id: Uuid) -> i64 {
         .unwrap()
 }
 
-/// Run the whole transaction the way the handler does, and commit.
 async fn delete_family(pool: &PgPool, ids: &[Uuid]) -> DeletedCounts {
     let mut tx = pool.begin().await.unwrap();
     let counts = delete_family_rows(&mut tx, ids).await.unwrap();
@@ -104,11 +86,6 @@ async fn delete_family(pool: &PgPool, ids: &[Uuid]) -> DeletedCounts {
     counts
 }
 
-// ── I1: memory before events ──────────────────────────────────────────
-
-/// A `memory_entries` row's `source` is an event id, so the events are the only
-/// way to find one. The delete must take it, and must take it while the events
-/// it names are still there.
 #[tokio::test]
 async fn memory_rows_are_gone_after_a_delete() {
     let (pool, db_name) = setup_test_db().await;
@@ -135,10 +112,6 @@ async fn memory_rows_are_gone_after_a_delete() {
     teardown_test_db(&db_name).await;
 }
 
-/// The ordering is the invariant, not an implementation detail, and no
-/// behavioural test can see it: run the statements the other way round and this
-/// suite still passes, while every `memory_entries` row the thread sourced
-/// becomes an unreachable orphan. So the source is what is asserted.
 #[test]
 fn the_memory_statement_precedes_the_events_statement() {
     const SRC: &str = include_str!("delete.rs");
@@ -156,10 +129,6 @@ fn the_memory_statement_precedes_the_events_statement() {
     );
 }
 
-// ── I2: nothing survives ──────────────────────────────────────────────
-
-/// One assertion per table the cascade sweeps. A row left behind points at a
-/// thread nobody can open.
 #[tokio::test]
 async fn nothing_survives_a_delete() {
     let (pool, db_name) = setup_test_db().await;
@@ -170,7 +139,6 @@ async fn nothing_survives_a_delete() {
     let (child, _) = seed_thread(&bus, Some(parent)).await;
     index_fact(&index, parent_event, "something learned").await;
 
-    // A row in every other table the sweep names.
     sqlx::query(
         "INSERT INTO notifications (id, task_id, title, message, thread_id, event_id) \
          VALUES ($1, $2, 'test', 'a notification', $3, $4)",
@@ -256,16 +224,11 @@ async fn nothing_survives_a_delete() {
     teardown_test_db(&db_name).await;
 }
 
-/// A workspace whose pgvector extension never loaded has no `memory_entries`
-/// table, and inside a transaction a missing relation aborts everything after
-/// it. Without the guard, delete would fail on exactly the workspaces with no
-/// memory to delete.
 #[tokio::test]
 async fn a_workspace_with_no_memory_table_still_deletes() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let (thread_id, _) = seed_thread(&bus, None).await;
-    // Deliberately no `PgVectorIndex::new`, so the table is absent.
 
     let counts = delete_family(&pool, &[thread_id]).await;
     assert_eq!(counts.memory, 0);
@@ -274,13 +237,6 @@ async fn a_workspace_with_no_memory_table_still_deletes() {
     teardown_test_db(&db_name).await;
 }
 
-// ── I6: one transaction ───────────────────────────────────────────────
-
-/// Every destructive statement is in one transaction, so a failure anywhere
-/// leaves the family whole. The rollback is driven here rather than injected
-/// into the function, because a caller abandoning the transaction IS the
-/// production failure mode: any `?` in the handler between the first statement
-/// and the commit drops `tx` unclosed.
 #[tokio::test]
 async fn a_failed_delete_rolls_everything_back() {
     let (pool, db_name) = setup_test_db().await;
@@ -323,10 +279,6 @@ async fn a_failed_delete_rolls_everything_back() {
     teardown_test_db(&db_name).await;
 }
 
-// ── I3 and I4: the audit record ───────────────────────────────────────
-
-/// The payload is the only thing left, so it must not re-file what the delete
-/// removed. Ids and counts, and no text from the thread.
 #[tokio::test]
 async fn the_audit_record_carries_no_content() {
     let (pool, db_name) = setup_test_db().await;
@@ -367,9 +319,6 @@ async fn the_audit_record_carries_no_content() {
     teardown_test_db(&db_name).await;
 }
 
-/// The record sits on aggregate `ops` with `aggregate_id` `global`, and a thread
-/// sweep matches `aggregate = 'thread'` plus a `thread_id`. So deleting thread B
-/// cannot reach the record of deleting thread A.
 #[tokio::test]
 async fn a_later_delete_cannot_reach_an_earlier_record() {
     let (pool, db_name) = setup_test_db().await;
@@ -405,11 +354,6 @@ async fn a_later_delete_cannot_reach_an_earlier_record() {
     teardown_test_db(&db_name).await;
 }
 
-// ── The surviving parent ──────────────────────────────────────────────
-
-/// The cascade cuts exactly one edge: the target's link to a parent outside the
-/// family. That parent is read before the delete, because it lives on a row
-/// that is about to go.
 #[tokio::test]
 async fn the_surviving_parent_is_read_before_the_row_goes() {
     let (pool, db_name) = setup_test_db().await;
@@ -440,9 +384,6 @@ async fn the_surviving_parent_is_read_before_the_row_goes() {
     teardown_test_db(&db_name).await;
 }
 
-/// The counters a surviving ancestor holds for the subtree that just vanished.
-/// Nothing else repairs them: the projection's propagation keys on a live event,
-/// and a delete emits none on the threads it removes.
 #[tokio::test]
 async fn a_surviving_parent_stops_counting_the_deleted_subtree() {
     let (pool, db_name) = setup_test_db().await;
@@ -475,7 +416,6 @@ async fn a_surviving_parent_stops_counting_the_deleted_subtree() {
     .await
     .unwrap();
 
-    // The child is Running, so the parent counts it on both columns.
     let (blocking, active): (i32, i32) = sqlx::query_as(
         "SELECT blocking_descendant_count, active_children_count \
          FROM thread_summaries WHERE thread_id = $1",
@@ -513,11 +453,6 @@ async fn a_surviving_parent_stops_counting_the_deleted_subtree() {
     teardown_test_db(&db_name).await;
 }
 
-// ── The worktree and the branch ───────────────────────────────────────
-
-/// Decision 8, and the one place the reclamation rule is inverted. The owner
-/// asked for the thread and its work to be gone, so the branch goes even
-/// holding commits nothing merged.
 #[test]
 fn the_delete_asks_for_the_branch_whatever_it_holds() {
     const SRC: &str = include_str!("delete.rs");
@@ -533,10 +468,6 @@ fn the_delete_asks_for_the_branch_whatever_it_holds() {
     );
 }
 
-/// The branch is read from the events, so it MUST be read before they go. The
-/// cleanup worker can already have taken the worktree while keeping a branch
-/// that holds unmerged commits. The recorded name is then the only handle left
-/// on it.
 #[tokio::test]
 async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
     let (pool, db_name) = setup_test_db().await;
@@ -563,8 +494,6 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
     })
     .await
     .unwrap();
-    // A resume writes a second one. The newest wins, because that is the branch
-    // the session was last on.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
@@ -594,8 +523,6 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
         Some("lucidos-claude-code-second")
     );
 
-    // After the delete there is nothing left to read it from, which is why the
-    // handler reads it inside the same transaction.
     delete_family_rows(&mut tx, &[thread_id]).await.unwrap();
     let after = recorded_branches(&mut tx, &[thread_id]).await.unwrap();
     assert_eq!(after[0].branch, None, "the handle is gone with the events");
@@ -604,8 +531,6 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
     teardown_test_db(&db_name).await;
 }
 
-/// A chat thread with no session records no branch, and the reclaim has nothing
-/// to chase. Guards the `None` arm against a future change that unwraps it.
 #[tokio::test]
 async fn a_thread_that_never_started_a_session_records_no_branch() {
     let (pool, db_name) = setup_test_db().await;
@@ -620,9 +545,6 @@ async fn a_thread_that_never_started_a_session_records_no_branch() {
     teardown_test_db(&db_name).await;
 }
 
-/// A worktree the cleanup worker already reclaimed must not end the reclaim.
-/// Skipping there left a branch nothing could ever name again, which is the
-/// half of decision 8 the worktree alone does not cover.
 #[test]
 fn a_missing_worktree_still_chases_the_branch() {
     const SRC: &str = include_str!("delete.rs");
@@ -639,8 +561,6 @@ fn a_missing_worktree_still_chases_the_branch() {
     );
 }
 
-/// A test repo with a linked worktree on `thread-branch`, plus a
-/// `user-feature` branch nothing has checked out.
 fn repo_with_thread_worktree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -678,9 +598,6 @@ fn git(dir: &std::path::Path, args: &[&str]) {
     );
 }
 
-/// A coding agent can `git checkout` another branch inside its own tree. The
-/// delete takes the tree, but never the branch the tree happens to sit on: that
-/// one is the user's, and here it holds a commit nothing merged.
 #[tokio::test]
 async fn the_delete_never_takes_a_branch_the_agent_checked_out() {
     use crate::engine::worktree_cleanup::remove_worktree_and_optionally_delete_branch;
@@ -706,8 +623,6 @@ async fn the_delete_never_takes_a_branch_the_agent_checked_out() {
     git(&repo, &["rev-parse", "--verify", "refs/heads/user-feature"]);
 }
 
-/// The tree on its own branch is left attached, so the removal takes that
-/// branch with it as decision 8 requires.
 #[tokio::test]
 async fn a_tree_on_its_recorded_branch_stays_attached() {
     let (_tmp, _repo, worktree) = repo_with_thread_worktree();
@@ -724,9 +639,6 @@ async fn a_tree_on_its_recorded_branch_stays_attached() {
     );
 }
 
-/// The parent keeps a disclosure chevron gated on `total_children_count`, and
-/// no rebuild reduces it: until delete existed nothing removed a child. A count
-/// of one with no child left draws a chevron that expands to nothing.
 #[tokio::test]
 async fn a_surviving_parent_stops_counting_children_it_no_longer_has() {
     let (pool, db_name) = setup_test_db().await;
@@ -745,7 +657,6 @@ async fn a_surviving_parent_stops_counting_children_it_no_longer_has() {
     assert_eq!(before, 1, "the parent starts out counting it");
 
     delete_family(&pool, &[child]).await;
-    // The statement the handler runs, against the surviving parent.
     sqlx::query(
         "UPDATE thread_summaries p SET total_children_count = ( \
              SELECT COUNT(*) FROM thread_summaries c WHERE c.parent_thread_id = p.thread_id \
@@ -768,9 +679,6 @@ async fn a_surviving_parent_stops_counting_children_it_no_longer_has() {
     teardown_test_db(&db_name).await;
 }
 
-/// The two in-memory drops and the projection repair all have to land BEFORE
-/// the frame that tells every client to re-read. A client that re-reads first
-/// sees the stale counts, and nothing re-broadcasts afterwards.
 #[test]
 fn the_audit_frame_is_the_last_thing_the_handler_does() {
     const SRC: &str = include_str!("delete.rs");
@@ -794,10 +702,6 @@ fn the_audit_frame_is_the_last_thing_the_handler_does() {
     }
 }
 
-/// The drop must stay silent. Archive ends a subscription with an
-/// `EventWaitCanceled`, and delete cannot, because the thread has no rows
-/// left. A thread event on that id would re-insert an `events` row and raise a
-/// `thread_summaries` row through the projection's upsert.
 #[test]
 fn dropping_a_deleted_threads_waits_records_nothing() {
     const SRC: &str =
@@ -819,11 +723,6 @@ fn dropping_a_deleted_threads_waits_records_nothing() {
     );
 }
 
-// ── I9 of the tree memory plan: summary trees ─────────────────────────
-
-/// The route's one transaction purges the family from every summary tree:
-/// its own tree, its workspace leaves, and each workspace merge after them.
-/// Another thread's tree and the leaves before the family stay.
 #[tokio::test]
 async fn the_delete_purges_the_family_from_every_summary_tree() {
     use crate::engine::summary_tree::store::{insert_node, load_nodes, StoredNode};
@@ -903,8 +802,6 @@ fn position(body: &str, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("{needle} must still be called"))
 }
 
-/// Source shape: what a handler does first decides what a failure leaves behind,
-/// and no row-level test can see the order.
 #[test]
 fn the_delete_handler_orders_its_locks_checks_reads_and_best_effort_steps() {
     const SRC: &str = include_str!("delete.rs");

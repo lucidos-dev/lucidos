@@ -1,5 +1,3 @@
-//! Capture this process's fd 2, preserving the original host stream. The
-//! writer's own errors use the saved descriptor to avoid feeding back.
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
 
@@ -15,15 +13,11 @@ pub fn host_error(message: &str) {
     }
 }
 
-/// Install once, after starting the diagnostic writer. Uses POSIX descriptors
-/// on both shipped platforms, macOS and Linux. Children inherit fd 2 normally.
 #[cfg(unix)]
 pub fn install() -> io::Result<()> {
     install_stream(2, "Stderr", &INSTALLED, Some(&ORIGINAL))
 }
 
-/// The desktop shell also captures stdout, preserving its host stream. Other
-/// processes leave machine-readable stdout alone.
 #[cfg(unix)]
 pub fn install_stdout() -> io::Result<()> {
     install_stream(1, "Stdout", &STDOUT_INSTALLED, None)
@@ -94,8 +88,6 @@ pub fn install_stdout() -> io::Result<()> {
     ))
 }
 
-/// Drain a detached child's stream with the same bounded, sanitized framing.
-/// The caller owns its diagnostic sink; no raw host-log file is created.
 pub fn capture_reader(label: &'static str, reader: impl io::Read) {
     capture(reader, io::sink(), |bytes, overflow| {
         submit(label, bytes, overflow)
@@ -114,7 +106,6 @@ fn capture(mut reader: impl io::Read, mut host: impl Write, mut submit: impl FnM
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        // Always forward the bytes, including oversized and non-UTF8 output.
         let _ = host.write_all(&chunk[..n]);
         for &byte in &chunk[..n] {
             if byte == b'\n' {
@@ -135,7 +126,6 @@ fn capture(mut reader: impl io::Read, mut host: impl Write, mut submit: impl FnM
 
 fn submit(label: &'static str, bytes: &[u8], overflow: bool) {
     let message = if overflow {
-        // Do not retain a partial token from an overlong line.
         "<oversized stream line omitted>".into()
     } else {
         String::from_utf8_lossy(bytes).into_owned()

@@ -97,6 +97,9 @@ const NO_UI_STATE: Record<string, string> = {
     + 'shows the injects column either, and the Files panel banner moves on '
     + '`HandshakeScriptApproved`',
   EmailSent: 'an audit record of a send. No surface lists sent mail',
+  EventHookRefused:
+    'an audit record of a stopped event. The person sees the refusal as a toast, the '
+    + 'not-ready strip or the scheduler notice; no surface lists refusals yet',
   // Temporary measure: docs/temporary-measures.md, Diagnostic fault UI adoption.
   InternalFaultRecorded:
     'the engine persists the fault count for diagnostic snapshots; the shell has no fault-count state yet',

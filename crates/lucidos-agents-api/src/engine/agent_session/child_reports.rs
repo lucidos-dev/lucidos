@@ -13,9 +13,6 @@ use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::types::{WithdrawInputRequest, WithdrawPurpose};
 use crate::runtime::{AgentInput, InputWithdrawal, WithdrawRequest};
 
-/// Start taking every report `inputs` holds unread. Each withdraw joins
-/// `pending`, and the run loop settles it like any other. Once all have
-/// answered, the dropped reports arrive on `loop_end.settled_rx`.
 pub(crate) fn begin_take(
     inputs: &InputLedger,
     driver: &mpsc::UnboundedSender<WithdrawRequest>,
@@ -26,7 +23,6 @@ pub(crate) fn begin_take(
     pending: &mut PendingWithdraws,
 ) {
     if request.reply.is_closed() {
-        // The caller gave up, so nobody would read what a take withdrew.
         return;
     }
     let mut answers = Vec::new();
@@ -63,10 +59,6 @@ pub(crate) fn begin_take(
     });
 }
 
-/// Hand a take's withdrawn reports to its caller, and record each take. A
-/// caller that left gets nothing, so each report goes to the agent again on
-/// `agent_input_tx` and stays owed: it is read once either way. Returns each
-/// resent write as (withdrawn uuid, new uuid), for state keyed by the write.
 pub(crate) async fn settle_take(
     bus: &EventBus,
     thread_id: Uuid,
@@ -105,7 +97,6 @@ pub(crate) async fn settle_take(
     moved
 }
 
-/// The caller has the reports: nothing owes them now.
 async fn record_takes(
     bus: &EventBus,
     thread_id: Uuid,

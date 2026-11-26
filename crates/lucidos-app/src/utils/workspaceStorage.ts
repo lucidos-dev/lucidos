@@ -1,5 +1,7 @@
 
 import { peerPrefix, peerScopedKey } from '../../../../packages/lucidos-sdk/src/_peerScope';
+import type { AppStorageArea } from '@lucidos/sdk';
+import { postClientLog } from './clientLog';
 import { SPENT_KEY } from './pairingCodeSeed';
 import { REMOTE_WORKSPACES_CACHE_KEY } from './remoteWorkspaces';
 
@@ -66,21 +68,74 @@ export function migrateUnprefixedKeys(storage: Storage, ws: string, peer: string
 
 const INSTALLED = Symbol.for('lucidos.workspaceStorage.installed');
 
+const rawReaders = new WeakMap<object, Storage['getItem']>();
+
+export function storageUsage(storage: Storage) {
+  const read = rawReaders.get(Object.getPrototypeOf(storage)) ?? storage.getItem;
+  const usage = {
+    app: { entries: 0, codeUnits: 0 },
+    sdk: { entries: 0, codeUnits: 0 },
+    shell: { entries: 0, codeUnits: 0 },
+    other: { entries: 0, codeUnits: 0 },
+  };
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index);
+    if (key === null) continue;
+    const value = read.call(storage, key);
+    if (value === null) continue;
+    const name = key.replace(/^(?:peer:[^:]+:)?(?:ws:[^:]+:)?/, '');
+    const appSpace = /^appbridge:[^:]+:(app|sdk):/.exec(name)?.[1];
+    const bucket = appSpace === 'app' ? usage.app
+      : appSpace === 'sdk' ? usage.sdk
+      : name.startsWith('lucidos-') ? usage.shell : usage.other;
+    bucket.entries++;
+    bucket.codeUnits += key.length + value.length;
+  }
+  return usage;
+}
+
+const SAMPLE_INTERVAL_MS = 60_000;
+const lastSample: Partial<Record<AppStorageArea, number>> = {};
+
+export function isStorageQuotaError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'QuotaExceededError';
+}
+
+export function reportStoragePressure(area: AppStorageArea, storage: Storage): void {
+  const now = performance.now();
+  const previous = lastSample[area];
+  if (previous !== undefined && now - previous < SAMPLE_INTERVAL_MS) return;
+  lastSample[area] = now;
+  try {
+    postClientLog('storage-pressure', 'quota', { area, usage: storageUsage(storage) });
+  } catch {
+    postClientLog('storage-pressure', 'quota', { area, inventoryUnavailable: true });
+  }
+}
+
 export function installWorkspaceStorage(
-  storage: Storage,
+  localStore: Storage,
   ws: string | null,
   peer: string | null = null,
 ): void {
   if (!ws && !peer) return;
 
-  try {
-    if (ws) migrateUnprefixedKeys(storage, ws, peer);
+  if (ws) {
+    try {
+      migrateUnprefixedKeys(localStore, ws, peer);
+    } catch (err) {
+      if (isStorageQuotaError(err)) reportStoragePressure('local', localStore);
+      console.warn('[workspaceStorage] appearance migration failed', err);
+    }
+  }
 
-    const proto = Object.getPrototypeOf(storage) as Storage &
+  try {
+    const proto = Object.getPrototypeOf(localStore) as Storage &
       Partial<Record<typeof INSTALLED, boolean>>;
     if (proto[INSTALLED]) return;
 
     const rawGet = proto.getItem;
+    rawReaders.set(proto, rawGet);
     const rawSet = proto.setItem;
     const rawRemove = proto.removeItem;
     const mapKey = (key: string): string => rawStorageKey(key, ws, peer);
@@ -89,7 +144,14 @@ export function installWorkspaceStorage(
       return rawGet.call(this, mapKey(key));
     };
     proto.setItem = function (this: Storage, key: string, value: string) {
-      return rawSet.call(this, mapKey(key), value);
+      try {
+        return rawSet.call(this, mapKey(key), value);
+      } catch (err) {
+        if (isStorageQuotaError(err)) {
+          reportStoragePressure(this === localStore ? 'local' : 'session', this);
+        }
+        throw err;
+      }
     };
     proto.removeItem = function (this: Storage, key: string) {
       return rawRemove.call(this, mapKey(key));

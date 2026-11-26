@@ -1,20 +1,3 @@
-//! Chat message processing. The public entry points (`process_trigger`,
-//! `process_message_with_steps`) and the small `clean_response` /
-//! `describe_tool` helpers live here; the heavy internal pipeline is split by
-//! phase into child modules:
-//! - [`run`] — the `process_message_with_steps_internal` orchestrator.
-//! - [`system_prompt`] — system-prompt assembly + `ASK_USER_QUESTION_RULE`.
-//! - [`history`] — conversation history + resume context loading.
-//! - [`context_sections`] — per-turn context-section builders.
-//! - [`titles`] — title-emit orchestration.
-//! - [`context_build`] — pure capture-section / loaded-knowhow helpers.
-//! - [`context_mode`]: the self-curated context mode, in one place.
-//! - [`working_understanding`]: the model's own document, parsed out of its
-//!   reply and rendered back at the tail of every round.
-//! - [`turn_clock`]: the turn's time context, split across the two prompt tiers.
-//! - [`turn_tail`]: the engine build state and the client URL, split the same
-//!   way, plus the struct carrying all three tail blocks.
-
 use crate::engine::chat::process::run::ChatTurnRunExt;
 use crate::engine::thread_events::{ActorMode, EngineReason, MessageOrigin, TriggerInvocation};
 use crate::engine::types::*;
@@ -39,42 +22,27 @@ mod titles;
 mod turn_clock;
 mod turn_tail;
 pub(crate) mod working_understanding;
-// Crate-visible so the per-trigger knowhow listing in `chat::process_helpers`
-// shares its routing-description ceiling, and `widget_guidance` its app lines.
 pub(crate) mod workspace_prompt_footprint;
 
-// A `run_thread` child resolves its inherited route the way a turn does.
 pub(crate) use run::resolve_available_route_overrides;
 
-// Re-exported only for the colocated `process_tests` module, which reaches
-// these via `super::`. Non-test code imports them from the child modules
-// directly (run.rs uses `context_build::*`; system_prompt.rs uses the const
-// locally), so the re-exports are `cfg(test)`-gated to avoid unused warnings.
 #[cfg(test)]
 pub(crate) use context_build::{
     assemble_turn_text, build_capture_sections, build_knowhow_retention_block,
     build_loaded_knowhow_block, TurnSections,
 };
-// `PLUGIN_SETUP_RULE` also travels to `tools::plugins_tests`, whose seed test
-// pins the route against the two lines the engine actually sends.
 #[cfg(test)]
 pub(crate) use system_prompt::{ASK_USER_QUESTION_RULE, PLUGIN_SETUP_RULE, REPEATED_ACTION_RULE};
 #[cfg(test)]
 pub(crate) use turn_tail::TurnTail;
 
-/// The lane an orphaned input re-runs on.
 pub(crate) enum OrphanLane {
-    /// Keeps the admission the orphan chain already won, if any.
     LucidosAgent(Option<crate::engine::PreAdmission>),
     CodingAgent(Vec<crate::engine::AgentUserInput>),
 }
 
 #[easy_ext::ext(ChatProcessExt)]
 pub(crate) impl LucidosEngine {
-    /// Process a trigger prompt (emits TriggerStarted instead of MessageReceived).
-    /// `invocation` records which path fired this run (cron schedule or matched event).
-    /// `target` says whether the fire starts a thread or continues the open
-    /// thread holding its continue key (ADR 0623).
     #[allow(clippy::too_many_arguments)]
     async fn process_trigger(
         &self,
@@ -87,19 +55,12 @@ pub(crate) impl LucidosEngine {
         mcp_servers: Vec<String>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
-        // The backend this trigger pinned, or `None` to let the model's own
-        // preferred provider decide. A pin naming an unconfigured backend
-        // refuses the fire rather than running it somewhere else.
         provider: Option<&str>,
-        // See `TriggerContext::queue_entry_id`.
         queue_entry_id: Uuid,
         retry_of: Option<crate::engine::thread_events::RetryOf>,
         target: FireTarget,
         actor_email: Option<String>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
-        // A continuing fire is engine input on someone else's thread, so it
-        // names its trigger as the origin. A new thread's `TriggerStarted`
-        // stamps that origin itself.
         let (thread_id, continue_key, origin, mode) = match target {
             FireTarget::NewThread(claim) => (None, claim, None, ActorMode::Agent),
             FireTarget::Continue(thread_id) => {
@@ -111,7 +72,7 @@ pub(crate) impl LucidosEngine {
                 (Some(thread_id), None, Some(origin), ActorMode::Engine)
             }
         };
-        // The trigger's own model when it pinned one, else the account's
+        // INVARIANT: The trigger's own model when it pinned one, else the account's
         // trigger model, so a fire never starts on the chat default. The
         // resolver in `process_message_with_steps_internal` takes an explicit
         // value as the override, which is what makes a pinned trigger a pin.
@@ -142,14 +103,14 @@ pub(crate) impl LucidosEngine {
                         actor_email,
                     }),
                 }),
-                None, // app_context
-                None, // file_context
+                None,
+                None,
                 reasoning_effort,
                 provider,
-                None, // user_images
-                None, // device_id
-                None, // use_coding_agent
-                None, // event_id
+                None,
+                None,
+                None,
+                None,
                 thread_id,
                 None,
                 None,
@@ -170,7 +131,7 @@ pub(crate) impl LucidosEngine {
                 Vec::new(),
             )
             .await?;
-        // A continuing fire may coalesce into a live turn. Then the thread's
+        // INVARIANT: A continuing fire may coalesce into a live turn. Then the thread's
         // last `TriggerStarted` belongs to an earlier fire.
         match thread_id {
             None => trigger_process_result(&self.pool, result).await,
@@ -178,9 +139,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Carry on a trigger run that parked on a grant card, as a turn of the
-    /// same trigger: its model, its MCP servers and the trigger channel's
-    /// guard. `anchor` is the parked turn the resumed events join.
     async fn resume_trigger_turn(
         &self,
         config: &crate::triggers::TriggerConfig,
@@ -207,14 +165,14 @@ pub(crate) impl LucidosEngine {
                 mcp_servers: config.mcp_servers.clone(),
                 turn: TriggerTurn::Resume,
             }),
-            None, // app_context
-            None, // file_context
+            None,
+            None,
             config.reasoning_effort.as_deref(),
             config.provider.as_deref(),
-            None, // user_images
-            None, // device_id
-            None, // use_coding_agent
-            None, // event_id
+            None,
+            None,
+            None,
+            None,
             Some(thread_id),
             None,
             None,
@@ -237,9 +195,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    // Public chat entry — surface every per-request knob (model / context /
-    // images / steps_tx / cancel) at the call boundary so triggers and HTTP
-    // handlers can wire them through without re-creating a builder struct.
     #[allow(clippy::too_many_arguments)]
     async fn process_message_with_steps(
         &self,
@@ -248,8 +203,6 @@ pub(crate) impl LucidosEngine {
         app_context: Option<AppContext>,
         file_context: Option<String>,
         reasoning_effort: Option<&str>,
-        // Backend to serve the model. See the internal orchestrator's own
-        // parameter: honoured or refused, never substituted.
         provider_override: Option<&str>,
         images: Option<&[crate::engine::types::ChatImage]>,
         device_id: Option<&str>,
@@ -261,8 +214,6 @@ pub(crate) impl LucidosEngine {
         url_context: Option<crate::engine::types::UrlContext>,
         parent_thread_id: Option<Uuid>,
         spawning_event_id: Option<Uuid>,
-        // The child's wake mode, beside its parent link. `None` for every
-        // message but a child's spawning one.
         wake_mode: Option<crate::engine::thread_events::WakeMode>,
         mode: ActorMode,
         cc_model: Option<&str>,
@@ -270,20 +221,8 @@ pub(crate) impl LucidosEngine {
         pre_emitted_origin: Option<PreEmittedOrigin>,
         title: Option<&str>,
         origin: Option<MessageOrigin>,
-        // The *voice session* this message was spoken on. `None` is typed,
-        // which is every caller but the voice one. It rides beside `origin`
-        // because it answers the same question: how this message got here.
-        //
-        // Threaded even though the voice path normally pre-emits, so a
-        // pre-emit that failed still writes a message that says it was spoken.
         voice_session_id: Option<Uuid>,
-        // `Normal` for every caller but a child follow-up the parent marked
-        // urgent, which preempts the child's in-flight turn instead of queueing
-        // behind it. Named rather than a bare `bool` so the call sites stay
-        // readable in a column of `None`s.
         urgency: crate::engine::FollowUpUrgency,
-        // This input's place in its thread's input order, taken by the chat
-        // handler's admission. Other callers promise no order and pass `None`.
         input_turn: Option<crate::engine::InputTurn>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         self.process_message_with_steps_internal(
@@ -320,7 +259,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// Orphan-only entry, on the lane the thread's agent decides (ADR 0678).
     #[allow(clippy::too_many_arguments)]
     async fn process_orphan(
         &self,
@@ -445,6 +383,10 @@ mod context_release_tests;
 #[cfg(test)]
 #[path = "withdrawn_tests.rs"]
 mod withdrawn_tests;
+
+#[cfg(test)]
+#[path = "hook_refused_tests.rs"]
+mod hook_refused_tests;
 
 #[cfg(test)]
 #[path = "blocked_run_tests.rs"]

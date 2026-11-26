@@ -1,6 +1,6 @@
 import type { CodingAgent } from '../../api/types';
 import { ClaudeIcon, CodexIcon } from './icons';
-import { LucidosMark } from './LucidosMark';
+import { LucidosGlyph } from './LucidosMark';
 import { CategoryIcon } from './CategoryIcon';
 
 export function ThreadTypeIcon({ channel, codingAgent, size = '1rem' }: {
@@ -12,5 +12,5 @@ export function ThreadTypeIcon({ channel, codingAgent, size = '1rem' }: {
     return codingAgent === 'codex' ? <CodexIcon /> : <ClaudeIcon />;
   }
   if (channel === 'trigger') return <CategoryIcon category="triggers" />;
-  return <LucidosMark size={size} />;
+  return <LucidosGlyph size={size} />;
 }

@@ -1,12 +1,10 @@
-//! Coding-agent model and effort choices, including Claude Code discovery.
-
 use std::sync::Arc;
 
 use crate::core::coding_agent::CodingAgent;
 
 use super::intelligence_rungs::strip_version_pin;
 
-/// The Claude Code profile a thread is bound to: its *account pin*.
+/// INVARIANT: The Claude Code profile a thread is bound to: its *account pin*.
 ///
 /// Claude Code treats an unset `CLAUDE_CONFIG_DIR` as a different profile from
 /// one set to its default path. The two read different keychain entries and
@@ -15,17 +13,11 @@ use super::intelligence_rungs::strip_version_pin;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum AccountPin {
-    /// `CLAUDE_CONFIG_DIR` was unset. `dir` is Claude Code's default,
-    /// `$HOME/.claude`, where the transcripts live.
     DefaultConfigDir { dir: String },
-    /// `CLAUDE_CONFIG_DIR` was set to `dir`.
     ExplicitConfigDir { dir: String },
 }
 
 impl AccountPin {
-    /// The pin a thread's first session establishes: the live
-    /// `CLAUDE_CONFIG_DIR` when set, else Claude Code's default dir. `None`
-    /// only when there is neither, which means `$HOME` is unset.
     pub fn for_first_session(live: Option<String>, default_dir: Option<String>) -> Option<Self> {
         match live {
             Some(dir) => Some(Self::ExplicitConfigDir { dir }),
@@ -33,7 +25,7 @@ impl AccountPin {
         }
     }
 
-    /// Resolve a recorded pin.
+    /// INVARIANT: Resolve a recorded pin.
     ///
     /// `explicit` is `None` on rows written before the engine recorded it.
     /// Those rows stored `default_dir` for an unset variable too, so that one
@@ -55,7 +47,6 @@ impl AccountPin {
         }
     }
 
-    /// Where Claude Code keeps this profile's transcripts.
     pub fn dir(&self) -> &str {
         match self {
             Self::DefaultConfigDir { dir } | Self::ExplicitConfigDir { dir } => dir,
@@ -67,24 +58,16 @@ impl AccountPin {
     }
 }
 
-/// One `/model` or `/effort` picker entry. Claude Code's model rows come from
-/// discovery (`cc_model_discovery`) and `cc_menu_options.json`, merged by
-/// [`offered_cc_model_options`]. Codex's come from `codex_menu_options.json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct CcMenuOption {
     pub value: String,
-    /// The concrete model this row runs, when the backend said so. A session
-    /// reports this id at Init, and the thread records it, so a spawn must
-    /// accept it too. Only discovered Claude Code rows carry it.
     #[serde(default)]
     pub resolved_model: Option<String>,
     pub label: String,
     pub description: String,
-    /// Optional model compatibility metadata used by Codex reasoning efforts.
-    /// Claude Code and universally supported Codex options leave it absent.
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
-    /// The window a session on this model actually runs under, in tokens.
+    /// INVARIANT: The window a session on this model actually runs under, in tokens.
     ///
     /// Absent on almost every row, because it is an OVERRIDE of what
     /// `llm::model_registry::context_window_for` infers from the id. Declare it
@@ -97,18 +80,10 @@ pub struct CcMenuOption {
     /// own context mode, so nothing here bounds a prompt the engine packs.
     #[serde(default)]
     pub context_window: Option<usize>,
-    /// The tiers this model accepts, when the backend said so per model.
-    /// `None` derives them from the effort rows (`efforts_for_model`).
     #[serde(default)]
     pub reasoning_efforts: Option<Vec<String>>,
-    /// The effort a pick naming only this model runs at, when the backend
-    /// said so per model. Only the Codex menu file carries it: Claude Code's
-    /// answer comes from the model registry.
     #[serde(default)]
     pub default_effort: Option<String>,
-    /// Whether a new spawn may pick this row. A row with `offered: false` is
-    /// overlay only: it keeps its `context_window` for threads already on it,
-    /// and is neither listed nor accepted.
     #[serde(default = "offered_by_default")]
     pub offered: bool,
 }
@@ -130,8 +105,6 @@ static CC_MENU_OPTIONS: std::sync::LazyLock<CcMenuOptionsFile> = std::sync::Lazy
         .expect("cc_menu_options.json is malformed — see llm/cc_menu_options.json")
 });
 
-/// Every curated row in `cc_menu_options.json`, offered or not: the fallback
-/// list until discovery succeeds, and the overlay that declares context windows.
 pub fn curated_cc_model_options() -> &'static [CcMenuOption] {
     &CC_MENU_OPTIONS.models
 }
@@ -139,14 +112,12 @@ pub fn curated_cc_model_options() -> &'static [CcMenuOption] {
 static OFFERED_CURATED_CC_MODEL_OPTIONS: std::sync::LazyLock<std::sync::Arc<[CcMenuOption]>> =
     std::sync::LazyLock::new(|| offered_cc_model_options(None));
 
-/// The models a new Claude Code spawn may pick, and the picker's source: what
-/// discovery offers once Claude Code has answered, else the offered curated rows.
 pub fn cc_model_options() -> std::sync::Arc<[CcMenuOption]> {
     super::cc_model_discovery::offered_options()
         .unwrap_or_else(|| OFFERED_CURATED_CC_MODEL_OPTIONS.clone())
 }
 
-/// Claude Code's own rows first, then the offered curated rows it did not list.
+/// INVARIANT: Claude Code's own rows first, then the offered curated rows it did not list.
 ///
 /// A model Claude Code accepts through `--model` can be absent from its list, so
 /// the curated rows fill that gap. A discovered row wins on its value, which
@@ -172,7 +143,6 @@ pub fn offered_cc_model_options(
     kept.chain(unlisted).cloned().collect()
 }
 
-/// A model id without its `[1m]` window or `@` pin suffix.
 pub fn cc_model_base(id: &str) -> &str {
     id.split(['[', '@']).next().unwrap_or(id)
 }
@@ -203,12 +173,6 @@ pub fn codex_reasoning_effort_options() -> &'static [CcMenuOption] {
     &CODEX_MENU_OPTIONS.reasoning_efforts
 }
 
-/// The reasoning tiers `model` is offered, read out of the effort rows.
-///
-/// An effort with no `supported_models` is universal; one that names models is
-/// offered only to those. The `default` row matches nothing by name, so it
-/// takes the universal set. That is the right answer for a model the backend
-/// has not resolved yet.
 pub fn efforts_for_model(model: &str, efforts: &[CcMenuOption]) -> Vec<String> {
     efforts
         .iter()
@@ -221,10 +185,6 @@ pub fn efforts_for_model(model: &str, efforts: &[CcMenuOption]) -> Vec<String> {
         .collect()
 }
 
-/// The `/model` picker entries for one backend. Same data the frontend picker
-/// renders, reached without the caller having to know which module owns it.
-/// Claude Code's are its discovered rows once it has answered, then the offered
-/// curated rows it did not list.
 pub fn coding_agent_model_options(agent: CodingAgent) -> Arc<[CcMenuOption]> {
     match agent {
         CodingAgent::ClaudeCode => cc_model_options(),
@@ -235,9 +195,6 @@ pub fn coding_agent_model_options(agent: CodingAgent) -> Arc<[CcMenuOption]> {
 static CODEX_MODEL_OPTIONS: std::sync::LazyLock<Arc<[CcMenuOption]>> =
     std::sync::LazyLock::new(|| codex_model_options().into());
 
-/// Every hand-kept row for one backend, offered or not: the source of the
-/// offered rows Claude Code did not list, and the overlay that declares
-/// context windows.
 pub fn curated_coding_agent_model_options(agent: CodingAgent) -> &'static [CcMenuOption] {
     match agent {
         CodingAgent::ClaudeCode => curated_cc_model_options(),
@@ -245,7 +202,7 @@ pub fn curated_coding_agent_model_options(agent: CodingAgent) -> &'static [CcMen
     }
 }
 
-/// The context window a coding-agent session runs `model` under, when the
+/// INVARIANT: The context window a coding-agent session runs `model` under, when the
 /// backend's own window differs from what the model registry infers.
 ///
 /// `None` means nothing is declared, and the caller falls back to
@@ -273,7 +230,6 @@ pub fn coding_agent_context_window(agent: CodingAgent, model: &str) -> Option<us
         .and_then(|o| o.context_window)
 }
 
-/// The `/effort` picker entries for one backend.
 pub fn coding_agent_reasoning_effort_options(agent: CodingAgent) -> &'static [CcMenuOption] {
     match agent {
         CodingAgent::ClaudeCode => cc_reasoning_effort_options(),
@@ -281,10 +237,6 @@ pub fn coding_agent_reasoning_effort_options(agent: CodingAgent) -> &'static [Cc
     }
 }
 
-/// Validate a caller-supplied model id against the backend that will run it.
-///
-/// Rejects an unknown id so callers can trust the reported model choice.
-/// Previously `run_coding_agent` accepted the argument but used the settings default.
 pub fn validate_coding_agent_model(
     agent: CodingAgent,
     model: Option<&str>,
@@ -317,14 +269,6 @@ pub fn validate_model_against(
     ))
 }
 
-/// The picker row a caller's `model` names: the row with that value, else the
-/// first row that runs that concrete model.
-///
-/// The second arm is what a caller copying a thread's model needs. The picker
-/// sends `sonnet`, Claude Code reports `claude-sonnet-5[1m]` at Init, and the
-/// thread records that. The recorded id names a model the picker offers, so it
-/// must pass. Several rows can run one model (`default` and `opus` often do), and
-/// then the first one answers.
 pub fn offered_row<'a>(options: &'a [CcMenuOption], model: &str) -> Option<&'a CcMenuOption> {
     options.iter().find(|o| o.value == model).or_else(|| {
         options
@@ -333,8 +277,6 @@ pub fn offered_row<'a>(options: &'a [CcMenuOption], model: &str) -> Option<&'a C
     })
 }
 
-/// One row as a refusal lists it: the value, and the model it runs when that
-/// differs, so the caller sees the same pairing the picker shows.
 fn describe_row(option: &CcMenuOption) -> String {
     match option.resolved_model.as_deref() {
         Some(runs) if runs != option.value => format!("{} (runs {runs})", option.value),
@@ -342,7 +284,7 @@ fn describe_row(option: &CcMenuOption) -> String {
     }
 }
 
-/// The single offered id that is a close misspelling of a rejected `model`,
+/// INVARIANT: The single offered id that is a close misspelling of a rejected `model`,
 /// or `None` when no exactly-one candidate is close enough to name.
 ///
 /// Checked two ways, one at a time. First with a `@default` version pin
@@ -361,8 +303,6 @@ fn likely_intended_model<'a>(model: &str, options: &'a [CcMenuOption]) -> Option
     })
 }
 
-/// The one offered id whose value equals `strip(model)` once `strip` is
-/// applied to it too. `None` when zero or more than one candidate ties.
 fn unique_match_after<'a>(
     model: &str,
     options: &'a [CcMenuOption],
@@ -374,7 +314,7 @@ fn unique_match_after<'a>(
     matches.next().is_none().then_some(first.value.as_str())
 }
 
-/// Validate a caller-supplied reasoning effort against the backend AND the
+/// INVARIANT: Validate a caller-supplied reasoning effort against the backend AND the
 /// model that will run it. Refuses an out-of-vocabulary tier for the same
 /// reason [`validate_coding_agent_model`] refuses an unknown model.
 ///
@@ -401,10 +341,8 @@ pub fn validate_coding_agent_effort(
         return Ok(None);
     };
     let options = coding_agent_reasoning_effort_options(agent);
-    // An absent model and the `default` sentinel both mean "the backend's own
-    // config picks", and neither can match a name in `supported_models`.
     let model = model.map(str::trim).unwrap_or("");
-    // A discovered row names its own tiers, and the picker offers exactly
+    // INVARIANT: A discovered row names its own tiers, and the picker offers exactly
     // those. Refusing anything else keeps the spawn and the picker in step.
     let row_tiers = offered_row(&coding_agent_model_options(agent), model)
         .and_then(|o| o.reasoning_efforts.clone());
@@ -430,9 +368,6 @@ pub fn validate_coding_agent_effort(
             offered
         ));
     };
-    // A row with no `supported_models` was already admitted above, so reaching
-    // here means the tier names its models. Accept rather than render a refusal
-    // with an empty list, which would be the one message a caller cannot act on.
     let Some(runs_on) = row.supported_models.as_ref() else {
         return Ok(Some(effort.to_string()));
     };
@@ -445,7 +380,6 @@ pub fn validate_coding_agent_effort(
     ))
 }
 
-/// Accept `effort` only if `tiers`, the model row's own list, names it.
 pub fn effort_within_row_tiers(
     agent: CodingAgent,
     model: &str,

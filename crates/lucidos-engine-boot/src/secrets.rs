@@ -2,8 +2,6 @@ use lucidos_core::core::database_url;
 use lucidos_core::core::secret_store::{boot, key_store, SecretKey};
 use lucidos_core::log_legacy;
 
-/// `lucidos-engine secrets import-key --key-file <file>` or
-/// `lucidos-engine secrets discard`, against the database in `DATABASE_URL`.
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let _ = dotenvy::dotenv();

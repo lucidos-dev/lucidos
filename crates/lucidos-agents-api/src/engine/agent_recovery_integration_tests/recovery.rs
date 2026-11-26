@@ -86,10 +86,6 @@ async fn restored_worktree_recovery_requires_a_new_request_not_an_automatic_resu
     teardown_test_db(&db_name).await;
 }
 
-/// I4 at boot: a pending change marked incomplete came from an unfinished turn
-/// before ADR 0400. The first boot withdraws it and announces the work as
-/// withheld, so no pending row carries unfinished work. A clean pending row
-/// stays, and a second boot finds nothing to do.
 #[tokio::test]
 async fn boot_withdraws_a_pending_incomplete_change_once() {
     use crate::core::changes::ChangeStatus;
@@ -193,17 +189,6 @@ async fn boot_withdraws_a_pending_incomplete_change_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: when the user clicks Apply on a thread whose Claude Code
-/// session has cleanly exited at idle (the Phase 5.3 happy path), `apply_now`
-/// MUST apply the existing clean pending change directly. Re-proposing it
-/// would add a duplicate `ChangeProposed` to the timeline.
-///
-/// Two assertions:
-///   1. The projection contract apply_now's fast path relies on: a clean
-///      ChangeProposed lands as a pending row, visible via
-///      `pending_for_thread`.
-///   2. The apply_now source checks `pending_for_thread` on its
-///      no-live-session branch.
 #[tokio::test]
 async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
     let (pool, db_name) = setup_test_db().await;
@@ -239,7 +224,6 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
     .expect("session start emits")
     .expect("event persisted");
 
-    // The clean prior turn proposes a change.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
@@ -264,8 +248,6 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
     .expect("change proposed emits")
     .expect("event persisted");
 
-    // Assertion 1: the projection surfaces the clean change to apply_now's
-    // fast-path check.
     let pending = bus
         .changes_projection()
         .pending_for_thread(thread_id)
@@ -277,7 +259,6 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
         "apply_now's fast path queries pending_for_thread — must return the clean change"
     );
 
-    // Assertion 2: apply_now's no-live-session branch applies what is pending.
     let apply_now_src = include_str!("../agent_session/apply_now.rs");
     let read = apply_now_src
         .find("let pending = self.changes().pending_for_thread(thread_id).await?;")
@@ -291,23 +272,6 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: stale-session recovery must judge the prior turn by its actual
-/// terminal event, not assume it was cut short. Per the user's
-/// report on dev thread `183cf6f3-0cd1-406d-a1f9-40fad8010cb8` (2026-05-25):
-/// the original CC turn emitted `ResponseGenerated` + `CodingAgentIdled`
-/// cleanly with `has_changes=true`, but the per-idle `propose_change` never
-/// landed (at the time, the since-removed bg-bash gate held it back), so no
-/// `ChangeProposed` fired. Hours later the user clicked Archive; the
-/// archive cascade routed through `end_stale_waiting_session` →
-/// `propose_branch_changes`, which treated the finished work as a failed turn.
-///
-/// Three cases pinned:
-///   1. Latest terminal is `ResponseGenerated` → `last_turn_ended_cleanly`
-///      returns `true` → stale recovery proposes the work.
-///   2. Latest terminal is `ResponseAborted` / `ResponseCanceled` /
-///      `ResponseFailed` → returns `false` → stale recovery withholds it
-///      (ADR 0400).
-///   3. No terminal event at all → returns `false` → withheld.
 #[tokio::test]
 async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     use crate::engine::agent_recovery::last_turn_ended_cleanly;
@@ -320,7 +284,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
         ..EventMeta::NONE
     };
 
-    // Case 3 (no terminal yet): bare SessionStarted, nothing else.
     let no_terminal = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: no_terminal,
@@ -348,11 +311,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
         "no terminal event yet — must NOT be classified as clean (the work is withheld)"
     );
 
-    // Case 1 (clean): SessionStarted → ResponseGenerated → CodingAgentIdled.
-    // Mirrors the 183cf6f3 thread shape: CC produced a clean Generated terminal,
-    // CodingAgentIdled reported has_changes=true, no further turn ran. The
-    // per-idle `propose_change` never landed (e.g. the engine died between
-    // idle and proposal) but the work itself is complete.
     let clean = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: clean,
@@ -413,9 +371,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
          the stale-session recovery would otherwise withhold a finished turn's work"
     );
 
-    // Case 2a (aborted): ResponseAborted as latest terminal — engine-driven
-    // mid-turn kill (e.g. EngineShutdown, recovery_after_restart). Must NOT
-    // be clean — the work the user sees on the branch may be half-finished.
     let aborted = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: aborted,
@@ -458,7 +413,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
          the user-visible branch state may be mid-edit"
     );
 
-    // Case 2b (canceled): user clicked Stop. Same not-clean classification.
     let canceled = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: canceled,
@@ -500,8 +454,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
         "ResponseCanceled as latest terminal MUST classify as not-clean"
     );
 
-    // Case 2c (failed): turn ended with an error (mid-stream API drop, OOM,
-    // empty Result). Same not-clean classification.
     let failed = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: failed,
@@ -542,10 +494,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
         "ResponseFailed as latest terminal MUST classify as not-clean"
     );
 
-    // Case 1+2 combo: a clean Generated followed by a later Aborted. The
-    // LATEST terminal wins, so the work is withheld. This is the legitimate
-    // sequence the original hardcoded value was meant to catch (clean
-    // earlier turn, then a follow-up turn that crashed mid-stream).
     let clean_then_aborted = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: clean_then_aborted,
@@ -601,11 +549,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
          terminal is what reflects the branch's current trustworthiness"
     );
 
-    // Case 4 (cross-channel): CC turn died mid-stream (CC ResponseAborted),
-    // then chat agent ran later and produced a clean ResponseGenerated. The
-    // chat turn has no bearing on whether the CC branch is mid-edit. Without
-    // channel scoping the chat's clean Generated would shadow CC's Aborted
-    // and the stale-session recovery would propose CC's half-finished work.
     let chat_meta = EventMeta {
         channel: Some(EventChannel::Chat),
         ..EventMeta::NONE
@@ -635,7 +578,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     .await
     .expect("emit succeeds")
     .expect("event persisted");
-    // CC turn dies mid-stream — ResponseAborted on the CC channel.
     bus.emit(BusEvent::Thread {
         thread_id: cross_channel,
         event: ThreadEvent::ResponseAborted {
@@ -653,8 +595,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     .await
     .expect("emit succeeds")
     .expect("event persisted");
-    // Now the chat agent runs and produces a clean Generated on the chat
-    // channel — same thread, later sequence.
     bus.emit(BusEvent::Thread {
         thread_id: cross_channel,
         event: ThreadEvent::ResponseGenerated {
@@ -679,9 +619,6 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     teardown_test_db(&db_name).await;
 }
 
-/// O1 at boot: the held-back sweep settles what the live idle gate would. A
-/// clean turn finished; a user Stop, a failure and an abort did not (ADR 0400).
-/// A redirect or no terminal at all settles nothing.
 #[tokio::test]
 async fn last_turn_end_mirrors_the_idle_gate() {
     use crate::engine::agent_recovery::{last_turn_end, TurnEnd};
@@ -778,28 +715,6 @@ async fn last_turn_end_mirrors_the_idle_gate() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: a coding-agent turn the user **canceled** must classify as `idle`,
-/// not `running`, so the next engine restart leaves it alone.
-///
-/// Reported 2026-08-04: the user clicked Stop nine seconds into a turn, the
-/// timeline showed "Canceled" and a "Response canceled" panel, and then, at the
-/// next engine restart nearly four hours later, a "System / Response interrupted"
-/// panel with a **Continue** button appeared underneath it. You cannot interrupt
-/// a response that already ended.
-///
-/// Cause: [`BRANCH_CLASSIFICATION_SQL`]'s lifecycle scan only knew
-/// `SessionStarted / CodingAgentIdled / SessionEnded / ResponseGenerated`, so
-/// the newest *recognised* event on that thread stayed the `SessionStarted`
-/// from before the Stop. `recover_orphaned_worktrees` read that as "a turn was
-/// in flight when the engine died" and emitted the boundary
-/// `ResponseAborted{recovery_after_restart}` + `CodingAgentIdled{engine_restart_interrupt}`
-/// pair that renders the panel.
-///
-/// The cases below pin both directions: every way a turn can *end* classifies
-/// `idle`, and every way one can still be *in flight* classifies `running`.
-/// The `running` half matters as much as the `idle` half, because
-/// over-classifying as idle would silently kill crash recovery and the
-/// *Switch to new version* auto-resume.
 #[tokio::test]
 async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     use crate::engine::agent_recovery::BRANCH_CLASSIFICATION_SQL;
@@ -814,7 +729,6 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
         ..EventMeta::NONE
     };
 
-    // Start a CC session on `branch` and return its thread id.
     let start = |branch: &str| {
         let branch = branch.to_string();
         let bus = bus.clone();
@@ -867,12 +781,9 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
         cause: CancelCause::UserStop,
     };
 
-    // idle: the reported shape. Stop mid-turn, before CC ever reached an idle.
     let user_stopped = start("claude-code/user-stopped").await;
     emit(user_stopped, canceled_by_user.clone()).await;
 
-    // idle: same, but the turn failed instead of being canceled. Identical hole
-    // in the old scan set, identical nonsense panel.
     let failed = start("claude-code/failed").await;
     emit(
         failed,
@@ -885,9 +796,6 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     )
     .await;
 
-    // idle: a session that panicked and ended. `SessionEnded` was in the old
-    // scan set but matched NEITHER classification arm, and the caller treats
-    // "in neither set" as in-flight.
     let panicked = start("claude-code/panicked").await;
     emit(
         panicked,
@@ -897,15 +805,6 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     )
     .await;
 
-    // idle: the oldest rows carry no `reason` key at all. They deserialize as
-    // LegacyNonTerminal, which is terminal, and the classifier's reason filter
-    // must not silently drop them on three-valued logic (`NULL IN (...)`).
-    //
-    // Inserted raw rather than through the bus on purpose: `SessionEnded.reason`
-    // has `#[serde(default = ...)]`, not `skip_serializing_if`, so every event
-    // the bus can emit today carries the key. A reason-less row is only
-    // reachable as historical data, and this is the shape the query has to
-    // survive. (Same precedent as `worktree_cleanup_tests::insert_old_event`.)
     let legacy_no_reason = start("claude-code/legacy-no-reason").await;
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
@@ -917,13 +816,8 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     .await
     .expect("legacy reason-less SessionEnded row inserts");
 
-    // running: a turn genuinely in flight when the engine died (no terminal at
-    // all). This is what the interrupt panel + Continue exist for.
     start("claude-code/mid-turn").await;
 
-    // running: the *Switch to new version* teardown boundary. `ResponseAborted`
-    // must NOT count as turn-ended, or `switch_was_user_initiated` never gets
-    // the chance to auto-resume it.
     let switched = start("claude-code/switched").await;
     emit(
         switched,
@@ -937,8 +831,6 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     )
     .await;
 
-    // running: CC answered a stale `--resume` with an empty Result. The engine
-    // retries against a fresh session, so this SessionEnded is transient.
     let stale_resume = start("claude-code/stale-resume").await;
     emit(
         stale_resume,
@@ -948,11 +840,6 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     )
     .await;
 
-    // running: the switch teardown boundary followed by a shutdown-reason
-    // SessionEnded. No production site emits that pair today (teardown yields
-    // Aborted(EngineShutdown) and stops there), but the variant is live and it
-    // is the SessionEnded-shaped twin of the boundary: if it ever lands, it must
-    // not turn a resumable switch into an idle branch.
     let switched_then_session_ended = start("claude-code/switched-then-session-ended").await;
     emit(
         switched_then_session_ended,
@@ -973,8 +860,6 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     )
     .await;
 
-    // running: canceled, then the user sent a follow-up that was still running
-    // when the engine died. A terminal only ends the turn it terminates.
     let canceled_then_resumed = start("claude-code/canceled-then-resumed").await;
     emit(canceled_then_resumed, canceled_by_user).await;
     emit(
@@ -1062,14 +947,6 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: archiving a turn parked on a question ends that turn, so the
-/// next restart must not offer Continue on the archived thread.
-///
-/// The archive cancel-stamps the card and emits `ThreadArchived` as the turn's
-/// terminator (`archive_family`). The classifier missed that terminator, read
-/// the newest lifecycle event as the turn's `SessionStarted`, and classified the
-/// branch `running`. Recovery then recreated the reclaimed worktree and offered
-/// Continue, and Continue revived the archived thread.
 #[tokio::test]
 async fn archived_question_park_classifies_idle_so_restart_does_not_revive_it() {
     use crate::engine::agent_question::aq_test_helpers::emit_user_question;
@@ -1173,15 +1050,6 @@ async fn archived_question_park_classifies_idle_so_restart_does_not_revive_it() 
     teardown_test_db(&db_name).await;
 }
 
-/// A *Switch to new version* promises the interrupted thread a resume, and the
-/// UI withholds its Continue button on the strength of that promise. So a
-/// promise the boot cannot keep has to be WITHDRAWN before the API server opens,
-/// or the thread sits `paused` with no way forward.
-///
-/// The floor takes the resumed set BY ID rather than re-deriving it: a
-/// coding-agent resume has only emitted `ContinuationRequested` when this runs,
-/// and that type is deliberately absent from `THREAD_START_EVENTS_SQL`, so a
-/// query-only exclusion would re-abort a thread that is resuming correctly.
 #[tokio::test]
 async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
     use crate::engine::agent_recovery::settle_unresumed_switch_threads;
@@ -1194,14 +1062,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         device_id: "d1".into(),
     };
 
-    // Four threads interrupted by the same switch. One this boot resumed. One it
-    // silently declined, over the chat cap or on a failed resume. One archived
-    // while its turn was in flight. One carrying a pending change.
-    //
-    // The fourth is here because the floor is scoped `status = 'paused'`. An
-    // abort used to defer to a pending change and write `'waiting'`, and such a
-    // thread could not be selected at all. So a promise nobody kept was never
-    // withdrawn on it, and its Continue button never came back.
     let resumed = Uuid::new_v4();
     let declined = Uuid::new_v4();
     let archived = Uuid::new_v4();
@@ -1300,12 +1160,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         .expect("event persisted");
     }
 
-    // Archived DURING the turn, which is the only shape that reaches the floor:
-    // the Archive button's own `ThreadArchived` would settle the status and take
-    // the thread out of `paused` altogether. Neither resume drain selects an
-    // archived thread, so without the floor its switch abort stays the newest
-    // boundary forever and unarchiving surfaces a paused thread whose Continue
-    // button no later boot could restore.
     sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
         .bind(archived)
         .execute(&pool)
@@ -1325,10 +1179,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         }
     };
 
-    // Every thread carries the switch fingerprint (device actor + engine
-    // shutdown), so every one reads `paused`: nothing has gone wrong yet, the
-    // engine just went away and promised to come back. Including the one with a
-    // change pending, which is what makes it reachable below.
     for thread_id in [resumed, declined, archived, with_change] {
         assert_eq!(
             status_of(thread_id).await,
@@ -1379,12 +1229,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
          by keeping the row off 'paused', which is the one status this selects."
     );
 
-    // The withdrawal has to be VISIBLE, not just recorded. `recovery_after_restart`
-    // is not the switch fingerprint (which needs `engine_shutdown` AND a device),
-    // so the status follows the promise off `paused` and onto `failed`: the red
-    // dot, a slot in the needs-attention count, and the Continue button the
-    // withdrawal exists to hand back. Leaving these two on the reassuring pause
-    // glyph is exactly the state the user reported.
     for thread_id in [declined, archived, with_change] {
         assert_eq!(
             status_of(thread_id).await,
@@ -1393,18 +1237,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         );
     }
 
-    // ...and the CAUSE is what does that, not the actor. The withdrawal names
-    // the device that clicked switch, inherited from the abort it withdraws,
-    // because the restart it is reporting was that person's. Hardcoding
-    // `system` here is what made a user's own *Switch to new version* come back
-    // as "System / Response interrupted" over a red thread, and it is the
-    // fourth site of that bug rather than the first: see
-    // `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`
-    // for the three teardown emits swept two days after this floor was written.
-    //
-    // Asserted as "no boundary on this thread says system", not merely "the
-    // withdrawal says device", because the recurrence is always a NEW emit site
-    // appearing beside the fixed ones.
     for thread_id in [declined, archived, with_change] {
         let actors: Vec<Option<String>> = sqlx::query_scalar(
             "SELECT payload->'actor'->>'kind' FROM events \
@@ -1430,8 +1262,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
          way back, and nothing is being asked of the user"
     );
 
-    // The resumed thread's spawn lands its `ContinuationStarted`, which IS in
-    // `THREAD_START_EVENTS_SQL`, so from here on the query alone excludes it.
     bus.emit(BusEvent::Thread {
         thread_id: resumed,
         event: ThreadEvent::ContinuationStarted {
@@ -1446,11 +1276,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
     .expect("emit succeeds")
     .expect("event persisted");
 
-    // Idempotent: the withdrawal is itself a ResponseAborted, so the declined
-    // thread no longer matches "the newest abort is a switch abort". Without
-    // that clause the floor would re-fire on every boot forever, since nothing
-    // supersedes the original switch abort in the START-event sense. Run with an
-    // EMPTY resumed set so only the query's own guards can hold the line.
     settle_unresumed_switch_threads(&pool, &bus, &std::collections::HashSet::new()).await;
     assert_eq!(
         withdrawals(declined).await,
@@ -1468,26 +1293,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
     teardown_test_db(&db_name).await;
 }
 
-/// What one stray `ResponseCanceled` costs a switch, and why the fix belongs
-/// upstream of every read in this file.
-///
-/// The reported shape
-/// (`docs/plans/2026-08-06-a-session-that-registers-mid-teardown-is-shutting-down.md`):
-/// a *Switch to new version* landed 2 s into a coding-agent session's spawn. The
-/// teardown snapshot could not see a session that did not exist yet, so nothing
-/// set its `external_terminal_emitted` flag and its per-session `shutting_down`
-/// stayed `false`. When the session registered a second later and its
-/// `chat_cancel` arm fired on the already-cancelled handle token, it read that
-/// bare flag, classified an engine restart as a user Stop, and wrote
-/// `ResponseCanceled{user_stop}` on a turn nobody stopped.
-///
-/// Every recovery read below is correct and unchanged. They simply reached the
-/// right conclusion from a wrong input, which is why the plan's non-goals refuse
-/// to take `ResponseCanceled` out of `TURN_ENDED_EVENT_TYPES_SQL`: that list is
-/// right, and editing it would be a downstream filter over an upstream defect.
-///
-/// Both halves are asserted against the SAME seed minus that one event, so the
-/// test states the cost of the bug rather than merely the shape of the fix.
 #[tokio::test]
 async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
     use crate::engine::agent_recovery::{
@@ -1501,7 +1306,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
     let device = MessageOrigin::Device {
         device_id: "d1".into(),
     };
-    // `fixed` is what the engine now writes; `buggy` is what it wrote before.
     let fixed = Uuid::new_v4();
     let buggy = Uuid::new_v4();
     let branch_of = |thread_id: Uuid| format!("claude-code/{thread_id}");
@@ -1512,8 +1316,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
     };
 
     for thread_id in [fixed, buggy] {
-        // The user's message, which anchors the turn and is the newest start
-        // event, so the teardown abort below out-sequences it.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
@@ -1537,8 +1339,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
         .expect("emit succeeds")
         .expect("event persisted");
 
-        // The switch teardown boundary: device actor + engine shutdown, the
-        // fingerprint the whole auto-resume contract keys on.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ResponseAborted {
@@ -1557,8 +1357,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
         .expect("emit succeeds")
         .expect("event persisted");
 
-        // The session finally registers, AFTER the boundary. This is the whole
-        // race: `SessionStarted` is what leaves the branch classified `running`.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::SessionStarted {
@@ -1582,12 +1380,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
         .expect("event persisted");
     }
 
-    // The one event that differs: the phantom cancel the pre-fix engine wrote.
-    // Constructed directly rather than through `emit_response_canceled` on
-    // purpose: that helper's idempotency gate would recognise the abort above by
-    // request id and skip, which is exactly the suppression the pre-fix engine
-    // did NOT have on this path. Going through it would seed a shape the bug
-    // never produced.
     bus.emit(BusEvent::Thread {
         thread_id: buggy,
         event: ThreadEvent::ResponseCanceled {
@@ -1603,7 +1395,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
     .expect("emit succeeds")
     .expect("event persisted");
 
-    // Read 1: the branch classifier decides whether there is a turn to resume.
     let branch_status = |branch: String| {
         let pool = pool.clone();
         async move {
@@ -1630,9 +1421,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
          turn as finished and no resume is even attempted"
     );
 
-    // Read 2: the switch fingerprint itself is unharmed either way. The cancel
-    // does not retire the abort (it is not a start event), which is precisely
-    // why the damage is invisible at this layer and only shows up above.
     for thread_id in [fixed, buggy] {
         assert!(
             switch_was_user_initiated(&pool, thread_id).await,
@@ -1641,10 +1429,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
         );
     }
 
-    // Read 3: the promise as the user sees it. Neither thread was resumed by
-    // this boot, so the floor withdraws both; the point is that only `buggy`
-    // ever reaches this state in production, because `fixed` classifies
-    // `running` above and the resume drain claims it first.
     let status_of = |thread_id: Uuid| {
         let pool = pool.clone();
         async move {
@@ -1686,29 +1470,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
     teardown_test_db(&db_name).await;
 }
 
-/// A coding-agent thread does not get a fresh branch per turn: it applies a
-/// change and keeps working on the same one. So nothing the branch did on an
-/// EARLIER turn may reach the recovery gate, or the thread is retired from the
-/// first Apply onward and never auto-resumes again.
-///
-/// The reported shape (2026-08-09, thread "Persisting Thread Auto-Scroll to
-/// Bottom"): a change on the branch was applied at 16:55, the user sent a
-/// follow-up at 17:15, and at 17:21:54 they hit *Switch to new version* with
-/// the turn mid-flight. Boot classified the branch `running` and the switch
-/// fingerprint held, exactly as asserted below, and recovery skipped it anyway
-/// with "has no in-flight signal": `in_flight` also consulted
-/// `completed_change_branches`, `SELECT DISTINCT branch_name FROM changes WHERE
-/// status IN ('applied','discarded')`, which had held that branch since 16:55.
-/// No resume was actuated, `settle_unresumed_switch_threads` withdrew the
-/// promise, and "Paused by restart" became "System / Response interrupted"
-/// over a `failed` thread, reading to the user as a crash they had not caused.
-///
-/// So the assertions are deliberately spread across all three reads the resume
-/// decision is made from, not just the gate that carried the bug. The two DB
-/// reads were already correct in the report and are pinned here because the
-/// obvious wrong repair is to make one of them agree with the veto: adding
-/// `ChangeApplied` to `TURN_ENDED_EVENT_TYPES_SQL` would re-close the same hole
-/// from the other side, and it would look reasonable.
 #[tokio::test]
 async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume() {
     use crate::engine::agent_recovery::{
@@ -1730,7 +1491,6 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
         device_id: "d1".into(),
     };
 
-    // Turn 1: a session on the branch, a change, and the user applying it.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
@@ -1798,8 +1558,6 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     .expect("emit succeeds")
     .expect("event persisted");
 
-    // Turn 2 on the SAME branch: the follow-up, a fresh session, and the user's
-    // switch landing mid-turn.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::CodingAgentUserMessageSent {
@@ -1852,8 +1610,6 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     .expect("emit succeeds")
     .expect("event persisted");
 
-    // Precondition: the branch really does carry a completed change, so this is
-    // the seed the veto used to fire on rather than a shape it never saw.
     let completed: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM changes WHERE branch_name = $1 AND status = 'applied'",
     )
@@ -1867,8 +1623,6 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
          completed set the retired veto read"
     );
 
-    // Read 1: the branch classifier. `ChangeApplied` is not a lifecycle event,
-    // so turn 2's `SessionStarted` is still the newest one and the turn is open.
     let rows: Vec<(String, String)> = sqlx::query_as(&BRANCH_CLASSIFICATION_SQL)
         .fetch_all(&pool)
         .await
@@ -1883,15 +1637,12 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
         "an applied change from turn 1 must not read as turn 2 having ended"
     );
 
-    // Read 2: the switch fingerprint. The engine promised this turn a resume.
     assert!(
         switch_was_user_initiated(&pool, thread_id).await,
         "the teardown abort carries a device actor and EngineShutdown, so this \
          is a user switch and the boot owes it an auto-resume"
     );
 
-    // Read 3: the gate that broke. `idle_branches` is what read 1 feeds it, and
-    // turn 1's change is resolved so nothing is pending.
     let pending = bus
         .changes_projection()
         .get_pending_by_branch(&branch)
@@ -1912,22 +1663,6 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     teardown_test_db(&db_name).await;
 }
 
-/// Regression for the reported bug: a user switch left an **app** coding-agent
-/// thread on "Response interrupted" with a manual Continue, instead of
-/// resuming it.
-///
-/// The cause was upstream of every read below. `recover_orphaned_worktrees`
-/// scanned the Lucidos repo and the registered externals only. An app thread's
-/// worktree and branch belong to the workspace git, which no registry lists, so
-/// the sweep never saw the branch. The reads never ran and the thread fell
-/// through to `end_stuck_session`. The repo list is unit-tested in
-/// `agent_recovery::helpers`. This test pins the DB half for the app shape, so
-/// a later kind filter on any of these three cannot quietly undo the fix.
-///
-/// Seeded from the reported thread's real event sequence, trailing events
-/// included. Claude Code answered the pending permission prompt and streamed a
-/// final newline AFTER the teardown abort. Neither may retire the turn or
-/// consume the switch fingerprint.
 #[tokio::test]
 async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
     use crate::engine::agent_recovery::{
@@ -1968,7 +1703,6 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
     .expect("emit succeeds")
     .expect("event persisted");
 
-    // The switch teardown boundary: device actor plus EngineShutdown.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseAborted {
@@ -1989,8 +1723,6 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
     .expect("emit succeeds")
     .expect("event persisted");
 
-    // The dying subprocess's trailing output, which really does land after the
-    // boundary: the rejected permission prompt, then a last streamed newline.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::CodingAgentToolResult {
@@ -2019,8 +1751,6 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
     .expect("emit succeeds")
     .expect("event persisted");
 
-    // Read 1: the branch must classify `running`, or the sweep never opens the
-    // turn and the resume gate is never consulted.
     let rows: Vec<(String, String)> = sqlx::query_as(&BRANCH_CLASSIFICATION_SQL)
         .fetch_all(&pool)
         .await
@@ -2036,14 +1766,12 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
          still in flight when the next engine boots"
     );
 
-    // Read 2: the switch fingerprint, which decides resume against Continue.
     assert!(
         switch_was_user_initiated(&pool, thread_id).await,
         "the teardown abort carries a device actor and EngineShutdown, so this \
          app thread is owed an auto-resume rather than a Continue button"
     );
 
-    // Read 3: the app id, which decides the shape of a rebuilt worktree.
     assert_eq!(
         lookup_app_spawn_id(&pool, thread_id).await.as_deref(),
         Some(app_id),
@@ -2055,9 +1783,6 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// The same lookup for the other two kinds. `None` routes a rebuild to the
-/// ordinary full `worktree_add`, which is what a Lucidos-source or
-/// external-repo branch needs.
 #[tokio::test]
 async fn the_app_id_lookup_answers_none_for_a_non_app_thread() {
     use crate::engine::agent_recovery::lookup_app_spawn_id;
@@ -2108,13 +1833,6 @@ async fn the_app_id_lookup_answers_none_for_a_non_app_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// The other half of the resume contract, for the app shape. A crash emits no
-/// teardown boundary, so the thread keeps the manual Continue affordance and is
-/// never auto-resumed. Work that killed the engine must not loop (ADR 0045).
-///
-/// Scanning the workspace repo is what first brings app threads under these
-/// gates. So the crash case needs pinning at the same moment the switch case
-/// starts working.
 #[tokio::test]
 async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
     use crate::engine::agent_recovery::switch_was_user_initiated;
@@ -2128,8 +1846,6 @@ async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
         ..EventMeta::NONE
     };
 
-    // Identical to the switch seed minus the teardown abort: a crash gets no
-    // chance to emit one, and that absence is the whole fingerprint.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
@@ -2175,9 +1891,6 @@ async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// An app thread parked on an unanswered question is a stable checkpoint, not
-/// an interrupted turn. Recovery must preserve it across either restart cause:
-/// no abort, no idle, worktree intact, so the card on screen stays answerable.
 #[tokio::test]
 async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
     use crate::engine::question_park_sql::thread_has_unanswered_question;
@@ -2240,11 +1953,6 @@ async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// The boot drain for a coding-agent thread whose agent read nothing. The
-/// worktree scan cannot see one with no `SessionStarted`, the event that maps a
-/// branch to a thread. So `unengaged_switch_resume_candidates` is its only
-/// road to the auto-resume. Each case pins one side of the selection against
-/// the production SQL.
 mod unengaged_switch_resume {
     use uuid::Uuid;
 
@@ -2294,8 +2002,6 @@ mod unengaged_switch_resume {
         .await;
     }
 
-    /// The prompt, then the teardown abort. `actor` is the clicking device for
-    /// a switch and `None` for a crash.
     async fn seed_prompt_and_abort(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigin>) {
         emit(bus, thread_id, message_received("fix it"), cc_meta(None)).await;
         emit_teardown_abort(bus, thread_id, actor).await;
@@ -2335,8 +2041,6 @@ mod unengaged_switch_resume {
         teardown_test_db(&db_name).await;
     }
 
-    /// `SessionStarted` precedes the agent's first read, so a thread with a
-    /// session can still owe its prompt.
     #[tokio::test]
     async fn a_started_thread_whose_agent_read_nothing_is_a_candidate() {
         let (pool, db_name) = setup_test_db().await;
@@ -2381,7 +2085,6 @@ mod unengaged_switch_resume {
         teardown_test_db(&db_name).await;
     }
 
-    /// The loop-breaker: once a resume has begun, the abort stops counting.
     #[tokio::test]
     async fn a_thread_whose_resume_already_began_is_not_a_candidate() {
         let (pool, db_name) = setup_test_db().await;
@@ -2407,7 +2110,6 @@ mod unengaged_switch_resume {
         teardown_test_db(&db_name).await;
     }
 
-    /// A chat thread has its own drain (`switch_resume_candidates`).
     #[tokio::test]
     async fn a_chat_thread_is_not_a_candidate() {
         let (pool, db_name) = setup_test_db().await;

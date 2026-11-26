@@ -85,12 +85,6 @@ mod injection_coalescing_tests {
         }
     }
 
-    /// A mid-turn human message is an *interjection*, not automatically a
-    /// course change. The framing must tell the model to answer and then
-    /// resume, or a bare "status?" sent while the agent is working gets
-    /// answered and ends the turn, abandoning the work in progress. It must
-    /// still leave the redirect path open — only the user knows which they
-    /// meant.
     #[test]
     fn human_framing_says_resume_after_answering_and_still_allows_a_redirect() {
         let framed = framed_injected_prompt(
@@ -117,8 +111,6 @@ mod injection_coalescing_tests {
         );
     }
 
-    /// A message called a correction reads as a course change, so a bare
-    /// "status?" ends the turn. No framing may use the word.
     #[test]
     fn no_framing_calls_an_injected_message_a_correction() {
         for mode in [ActorMode::Human, ActorMode::Agent, ActorMode::Engine] {
@@ -134,8 +126,6 @@ mod injection_coalescing_tests {
         }
     }
 
-    /// Agent/engine-authored injections are not user turns — they feed the
-    /// response in progress and keep their own framing.
     #[test]
     fn non_human_framing_stays_a_system_update() {
         let mut p = prompt("build finished", InjectedPromptKind::UserText);
@@ -146,13 +136,6 @@ mod injection_coalescing_tests {
         assert!(framed.contains("build finished"));
     }
 
-    /// An orphan re-processed as its own turn has NO work in progress — the
-    /// turn it was sent during already terminated. Carrying the mid-turn
-    /// resume directive over would tell the model to pick work back up that no
-    /// longer exists, and not to end a turn whose only content is this
-    /// message. Both delivery paths are exercised here because the two callers
-    /// (`coalesced_user_text_message` vs `coalesced_user_text_for_reprocess`)
-    /// are what bind a delivery to a call site.
     #[test]
     fn new_turn_framing_carries_no_resume_directive() {
         for mode in [ActorMode::Human, ActorMode::Engine] {
@@ -226,8 +209,6 @@ mod injection_coalescing_tests {
         }
     }
 
-    /// An image sent mid-turn names its handle, as a turn-opening one does.
-    /// Unlabeled, the agent has to guess its `thread:N` to save or edit it.
     #[test]
     fn a_mid_turn_image_is_labeled_with_its_handle() {
         use base64::Engine as _;
@@ -239,7 +220,6 @@ mod injection_coalescing_tests {
             base64: base64::engine::general_purpose::STANDARD.encode(png),
             mime_type: "image/png".to_string(),
         };
-        // Stored as the mid-turn `MessageReceived` stores it, before injection.
         let images = std::slice::from_ref(&image);
         crate::engine::message_events::images_to_hashes(tmp.path(), Some(images));
         let handle = crate::engine::chat::current_image_handles(tmp.path(), images)

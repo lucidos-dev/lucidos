@@ -33,7 +33,6 @@ fn a_hidden_root_refuses_unix_socket_connects() {
     ));
 }
 
-/// A quote or backslash in a home path must not end the string literal.
 #[test]
 fn a_path_cannot_break_out_of_its_literal() {
     let text = profile(&Policy {
@@ -43,7 +42,6 @@ fn a_path_cannot_break_out_of_its_literal() {
     assert!(text.contains("(subpath \"/h/a\\\"b\\\\c\")"), "{text}");
 }
 
-/// A rule binds a path, so a folder above a fenced root must not move.
 #[test]
 fn every_folder_above_a_fenced_root_is_fixed_in_place() {
     let text = profile(&policy());

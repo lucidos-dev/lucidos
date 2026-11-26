@@ -104,17 +104,20 @@ agent sandbox, and the token never reaches you.
 
 ### `lucidos workspaces list [--json]`
 
-Print this machine's workspaces, one per line, tab-separated: slug, display
-name, port, health, autostart (`on` or `off`) and origin. Health is `healthy`,
+Use this gateway list as the workspace inventory. A scan of `~/workspaces` or
+the dev port registry can miss registered directories.
+
+Each tab-separated row gives the slug, display name, port, health, autostart
+(`on` or `off`), origin and resolved workspace directory. Health is `healthy`,
 `booting`, `restoring` or `unhealthy`; a stopped workspace reads `unhealthy`.
 Origin is who made it: `user`, `agent`, `demo`, `eval`, `e2e`, or `unknown`
-for a workspace made before the gateway recorded it. `--json` prints the rows
-with `path` and `machine_made` too. Over `GET /api/v1/workspaces`; needs no
+for a workspace made before the gateway recorded it. `--json` reports the
+directory as `path` and includes `machine_made`. Over `GET /api/v1/workspaces`; needs no
 approval.
 
 ```text
-demo-rig	Demo rig	5180	healthy	off	agent
-dev	Development	5173	healthy	on	user
+demo-rig	Demo rig	5180	healthy	off	agent	/home/user/workspaces/demo-rig
+dev	Development	5173	healthy	on	user	/home/user/workspaces/dev
 ```
 
 ### `lucidos workspaces targets [--via <gateway>]`

@@ -1,14 +1,3 @@
-//! E2E for the thread users routes (ADR 0623).
-//!
-//! What it pins, against a real engine:
-//!
-//! * `GET /api/v1/threads/:id/users` names the family root, and a 404 for an
-//!   unknown thread
-//! * Take and Watch either act as the caller's user or refuse a device no
-//!   user holds with a 409 `no_user`. Which one depends on whether the
-//!   run's gateway lists users, so both answers are pinned.
-//! * A repeat that changes nothing records nothing
-
 use crate::support::{
     base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client, with_pool_room,
 };
@@ -52,8 +41,6 @@ async fn thread_users_are_read_taken_and_watched_over_http() {
         .expect("request failed");
     assert_eq!(unknown.status(), 404);
 
-    // A human chat waits for a free pool slot before its thread row exists.
-    // The rest of the suite pins the pool at its ceiling.
     let client = user_client().await;
     with_pool_room(&client, async move { roles_round_trip(&pool).await }).await;
 }

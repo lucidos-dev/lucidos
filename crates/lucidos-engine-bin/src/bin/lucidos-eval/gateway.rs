@@ -1,17 +1,3 @@
-//! Register each arm with the workspace gateway, and read back its port.
-//!
-//! Registration and port discovery are best-effort. Before seeding, a
-//! configured gateway must prove the slug is not already registered.
-//! Without gateway configuration, evaluation can run unregistered. Registration
-//! and port-discovery failures are reported; port discovery falls back to a free
-//! port. A failed pre-seed observation stops before creating any arm resources.
-//!
-//! Registration is what makes an arm browsable. The gateway lists it in the
-//! picker, routes `/eval-<label>-<arm>-<repeat>/` to it, and derives its
-//! `lucidos_`-prefixed database from the same slug the harness seeded.
-//! Autostart stays off, so the gateway never spawns an arm engine of its own
-//! accord.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -19,25 +5,15 @@ use lucidos_local_token as local_token;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// How long a control call may take before the run stops waiting on it.
-///
-/// Short on purpose. The gateway is loopback and answers in milliseconds, and
-/// nothing here is worth delaying a seed for.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Where the gateway is, and the credential that reaches its control plane.
 pub struct Gateway {
     base_url: String,
     client: reqwest::Client,
-    /// The machine-local token, absent when there is no gateway on this
-    /// machine. Sent as `x-lucidos-local-token`, which is what proves a caller
-    /// is local: a loopback address does not, because `tailscale serve` proxies
-    /// remote requests from `127.0.0.1` too.
     token: Option<String>,
 }
 
 impl Gateway {
-    /// Read the configuration. `None` when nothing usable is set.
     pub fn from_env() -> Option<Gateway> {
         let base_url = std::env::var("LUCIDOS_EVAL_GATEWAY_URL")
             .ok()
@@ -65,10 +41,7 @@ impl Gateway {
         }
     }
 
-    /// Register `dir` as a workspace, answering with the port it holds.
     async fn adopt_call(&self, dir: &Path, slug: &str, name: &str) -> Fallible<u16> {
-        // Hold one generation lock from preflight through publication. A
-        // cleanup retry must take the same lock before archiving this file.
         let store = OwnerStore::lock(dir, slug)?;
         match std::fs::symlink_metadata(store.path()) {
             Ok(_) => {
@@ -80,8 +53,6 @@ impl Gateway {
         let body = serde_json::json!({
             "dir": dir,
             "name": name,
-            // The arms are a measurement, not a service. Nothing about them
-            // should come up on a gateway boot.
             "autostart": false,
             "origin": "eval",
             "ephemeral": true,
@@ -102,10 +73,6 @@ impl Gateway {
         Ok(port)
     }
 
-    /// Stop the gateway's own engine for `slug`, keeping the registry entry.
-    ///
-    /// 202 when it stopped one, and a 404 for a slug the gateway does not know.
-    /// Both are fine here, so only a transport failure is reported.
     async fn stop_call(&self, slug: &str) -> Fallible<()> {
         self.request(
             self.client
@@ -116,7 +83,6 @@ impl Gateway {
         Ok(())
     }
 
-    /// The port the registry holds for `slug`, if it is registered.
     async fn registered_port_call(&self, slug: &str) -> Fallible<Option<u16>> {
         let payload: serde_json::Value = self
             .request(self.client.get(self.control("workspaces")))
@@ -142,8 +108,6 @@ impl Gateway {
     }
 }
 
-/// Seeding cannot take over a registration, even if its directory is missing.
-/// An unavailable configured gateway leaves ownership unknown and refuses seed.
 pub async fn check_seed_registration(slug: &str) -> Fallible<()> {
     let Some(gateway) = Gateway::from_env() else {
         return Ok(());
@@ -160,18 +124,11 @@ impl Gateway {
     }
 }
 
-/// Register one arm with the gateway. Best-effort, and never a run's problem.
-///
-/// The port the gateway allocates is read back at run time by
-/// [`registered_port`], not carried from here: `seed` and `run` are separate
-/// invocations, so one path serves both.
 pub async fn register_arm(dir: &Path, slug: &str, display_name: &str) {
     let Some(gateway) = Gateway::from_env() else {
         println!("[eval] no LUCIDOS_EVAL_GATEWAY_URL, so '{slug}' stays unregistered");
         return;
     };
-    // An existing registration is not ours to retag, including a user who
-    // adopted the same directory. A failed observation never authorizes adopt.
     match gateway.registered_port_call(slug).await {
         Ok(Some(port)) => {
             println!("[eval] '{slug}' already registered on port {port}; protection unchanged");
@@ -189,8 +146,6 @@ pub async fn register_arm(dir: &Path, slug: &str, display_name: &str) {
     }
 }
 
-/// Read only the expected identity and credential; never put the response
-/// body in an error, since successful adoption carries a deletion secret.
 fn adoption<'a>(payload: &'a serde_json::Value, slug: &str) -> Fallible<(u16, &'a str)> {
     if payload["workspace"]["id"].as_str() != Some(slug) {
         return Err("gateway adoption returned a different workspace identity".into());
@@ -207,8 +162,6 @@ fn adoption<'a>(payload: &'a serde_json::Value, slug: &str) -> Fallible<(u16, &'
     Ok((port, token))
 }
 
-/// Serialize credential generations across seed, run and cleanup processes.
-/// The lock file is stable: never unlink or rename it when rotating secrets.
 struct OwnerStore {
     _lock: std::fs::File,
     folder: std::path::PathBuf,
@@ -236,8 +189,6 @@ impl OwnerStore {
             .create(true)
             .truncate(false)
             .open(folder.join(format!("{slug}.lock")))?;
-        // Fail promptly rather than blocking an async worker behind a process
-        // which could be waiting for this runtime's network response.
         lock.try_lock()
             .map_err(|_| "workspace ownership is busy; retry this operation")?;
         Ok(Self {
@@ -251,7 +202,6 @@ impl OwnerStore {
         self.folder.join(format!("{}.json", self.slug))
     }
 
-    /// Keep the secret outside the arm and never replace a generation.
     fn save(&self, dir: &Path, slug: &str, token: &str) -> Fallible<()> {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new_in(&self.folder)?;
@@ -271,8 +221,6 @@ impl OwnerStore {
     }
 }
 
-/// A run keeps its original cleanup authority even after a label is reused.
-/// Do not derive this again from the current workspace on resume.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunOwner {
@@ -364,7 +312,6 @@ pub fn pin_run_owner(
     Ok(pinned)
 }
 
-/// Publish an immutable retry checkpoint, refusing corruption or another identity.
 fn cleanup_checkpoint(path: &Path, pinned: &RunOwner, publish: bool) -> Fallible<bool> {
     let identity = serde_json::to_vec(&(1, &pinned.run_id, &pinned.workspace_id, &pinned.dir))?;
     match std::fs::read(path) {
@@ -405,7 +352,6 @@ impl Gateway {
             if current.as_ref() != Some(owner) {
                 return Err("cleanup owner generation changed; refusing deletion".into());
             }
-            // Names may change; the pinned token remains the only deletion authority.
             let payload: serde_json::Value = self
                 .request(self.client.get(self.control("workspaces")))
                 .send()
@@ -437,7 +383,6 @@ impl Gateway {
                 .send()
                 .await?;
             if response.status() != reqwest::StatusCode::NO_CONTENT {
-                // Never include a response body: it may contain credentials.
                 return Err(format!(
                     "cleanup refused ({}); original credential retained",
                     response.status()
@@ -446,8 +391,6 @@ impl Gateway {
             }
             cleanup_checkpoint(&succeeded, pinned, true)?;
         }
-        // The immutable run pin archives this generation. A successful old retry
-        // must leave a later adoption's credential alone, even after a crash.
         if current.as_ref() == Some(owner) {
             std::fs::remove_file(store.path())?;
             std::fs::File::open(&store.folder)?.sync_all()?;
@@ -456,7 +399,6 @@ impl Gateway {
     }
 }
 
-/// Cleanup only with the original binding; never discover replacement authority.
 pub async fn cleanup_arm(results: &Path, run: &str, dir: &Path, slug: &str) -> Fallible<()> {
     let pinned = pin_run_owner(results, run, dir, slug, true)?;
     if pinned.owner.is_none() {
@@ -467,15 +409,6 @@ pub async fn cleanup_arm(results: &Path, run: &str, dir: &Path, slug: &str) -> F
     gateway.cleanup_call(results, &pinned).await
 }
 
-/// Ask the gateway to stop any engine of its own on this arm's port.
-///
-/// Browsing an arm lazy-starts a gateway-owned engine, and nothing stops it
-/// again. The next run would find its port taken, so its own engine would fail
-/// to bind. `boot_engine` catches that, but a clear failure is still a failure:
-/// releasing first is what lets a run follow a browse.
-///
-/// Best-effort like the rest of this module. The engine the harness is about to
-/// start replaces whatever this stopped, and the gateway re-adopts it.
 pub async fn release_arm(slug: &str) {
     let Some(gateway) = Gateway::from_env() else {
         return;
@@ -485,11 +418,6 @@ pub async fn release_arm(slug: &str) {
     }
 }
 
-/// The port the gateway already holds for `slug`, if any.
-///
-/// `seed` and `run` are separate invocations, so the run cannot remember what
-/// the seed's adoption returned. Best-effort in the same way: an unregistered
-/// arm, or no gateway at all, falls back to a free port.
 pub async fn registered_port(slug: &str) -> Option<u16> {
     let gateway = Gateway::from_env()?;
     match gateway.registered_port_call(slug).await {
@@ -501,10 +429,6 @@ pub async fn registered_port(slug: &str) -> Option<u16> {
     }
 }
 
-/// What one arm's failed registration prints.
-///
-/// Registration may have reached the gateway before credential persistence
-/// failed. Do not claim the registry is unchanged in that case.
 fn unregistered(slug: &str, reason: &str) -> String {
     format!(
         "[eval] '{slug}' gateway registration incomplete: {reason}. \
@@ -613,7 +537,6 @@ mod tests {
             }
             outcome.unwrap();
             assert!(!OwnerStore::lock(&ws, "eval-test").unwrap().path().exists());
-            // A retry after label reuse must neither contact the server nor retire its credential.
             save_owner(&ws, "eval-test", "new-secret").unwrap();
             gateway.cleanup_call(&results, &pinned).await.unwrap();
             let current: Owner = serde_json::from_slice(
@@ -907,8 +830,6 @@ mod tests {
 
     #[test]
     fn a_failed_registration_says_the_run_is_unaffected() {
-        // The reader is mid-seed and has to decide whether to stop. Naming the
-        // cause without saying what it costs is what makes them stop.
         let line = unregistered("eval-lean-1", "error sending request");
         assert!(line.contains("eval-lean-1"), "{line}");
         assert!(line.contains("error sending request"), "{line}");
@@ -921,8 +842,6 @@ mod tests {
 
     #[test]
     fn a_gateway_needs_a_url_and_tolerates_a_trailing_slash() {
-        // Every call is built off `base_url`, so a pasted trailing slash would
-        // otherwise produce `//~/api/v1/...`, which the gateway does not route.
         temporarily(Some("https://localhost:5251/"), || {
             let gateway = Gateway::from_env().expect("a url is all it needs");
             assert_eq!(
@@ -937,10 +856,6 @@ mod tests {
         }
     }
 
-    /// Run `body` with the gateway URL set, then put it back.
-    ///
-    /// Tests share a process, so a variable left behind reaches the next one.
-    /// Serialized on a mutex for the same reason.
     fn temporarily(value: Option<&str>, body: impl FnOnce()) {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         const KEY: &str = "LUCIDOS_EVAL_GATEWAY_URL";

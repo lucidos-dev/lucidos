@@ -163,8 +163,9 @@ Every subprocess output is masked: an injected value, a token in the engine's ow
 
 ## Listing this machine's workspaces
 
-Run `lucidos workspaces list`. It prints one workspace per line: slug, name,
-port, health, autostart and origin, tab-separated; `--json` adds the folder.
+Run `lucidos workspaces list` to see the workspaces registered with the gateway.
+Each tab-separated row gives the slug, name, port, health, autostart, origin and
+resolved directory. With `--json`, read the directory from `path`.
 Health is `healthy`, `booting`, `restoring` or `unhealthy`; a stopped workspace
 reads `unhealthy`. To stop, start or create one, see `system-knowhow/lucidos-cli/waiting-through-an-engine-restart.md` § "The
 broker verbs".

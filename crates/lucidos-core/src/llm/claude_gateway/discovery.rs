@@ -1,6 +1,3 @@
-//! Reads the gateway's OAuth endpoints from its discovery document
-//! (RFC 8414), and refuses one that could send a token anywhere else.
-
 use serde::Deserialize;
 
 use super::token_endpoint::http_client;
@@ -8,19 +5,16 @@ use super::GatewayOrigin;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The only gateway protocol this client speaks.
 const GATEWAY_PROTOCOL_VERSION: u64 = 1;
 
-/// Where the discovery document lives, relative to the origin.
 const DISCOVERY_PATH: &str = "/.well-known/oauth-authorization-server";
 
-/// The gateway's OAuth endpoints. All lie on the gateway origin, so the
+/// INVARIANT: The gateway's OAuth endpoints. All lie on the gateway origin, so the
 /// device code and the tokens never leave it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayEndpoints {
     pub device_authorization: String,
     pub token: String,
-    /// Where sign-out revokes the tokens (RFC 7009), when the gateway offers it.
     pub revocation: Option<String>,
 }
 
@@ -33,10 +27,6 @@ struct DiscoveryDocument {
     gateway_protocol_version: Option<serde_json::Value>,
 }
 
-/// Fetch and check `origin`'s discovery document.
-///
-/// Refuses a document whose `issuer` is not `origin`, whose protocol version is
-/// not the one this client speaks, or whose endpoints lie on another origin.
 pub async fn discover(origin: &GatewayOrigin) -> Result<GatewayEndpoints, BoxError> {
     let url = format!("{origin}{DISCOVERY_PATH}");
     let resp = http_client()
@@ -92,9 +82,6 @@ fn check(origin: &GatewayOrigin, document: DiscoveryDocument) -> Result<GatewayE
     })
 }
 
-/// The revocation endpoint, when it lies on the gateway origin. One elsewhere
-/// is ignored rather than refused: revoking is best effort, and signing in
-/// does not need it.
 fn same_origin_revocation(origin: &GatewayOrigin, endpoint: Option<String>) -> Option<String> {
     let url = endpoint?;
     if origin.owns(&url) {
@@ -105,7 +92,6 @@ fn same_origin_revocation(origin: &GatewayOrigin, endpoint: Option<String>) -> O
 }
 
 #[cfg(any(test, feature = "test-support"))]
-/// The discovery document a well-formed gateway at `origin` serves.
 pub(crate) fn document(origin: &str) -> serde_json::Value {
     serde_json::json!({
         "issuer": origin,
@@ -149,8 +135,6 @@ mod tests {
         );
     }
 
-    /// Sign-out sends both tokens to the revocation endpoint, so one on
-    /// another origin is never used. Signing in still works without it.
     #[test]
     fn a_revocation_endpoint_on_another_origin_is_ignored() {
         let endpoints = checked("https://gateway.example", |d| {
@@ -165,8 +149,6 @@ mod tests {
         assert_eq!(none.revocation, None);
     }
 
-    /// RFC 8414 §3.3: the issuer must be the URL the document was read from.
-    /// A trailing slash or a case difference is the same origin.
     #[test]
     fn the_issuer_must_be_the_configured_origin() {
         assert!(checked("https://gateway.example", |d| d["issuer"] =
@@ -194,8 +176,6 @@ mod tests {
         }
     }
 
-    /// The device code and the refresh token go to these endpoints, so one on
-    /// another origin would carry them off the gateway.
     #[test]
     fn an_endpoint_on_another_origin_is_refused() {
         let err = checked("https://gateway.example", |d| {

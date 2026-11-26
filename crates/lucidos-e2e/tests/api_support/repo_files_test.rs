@@ -1,7 +1,6 @@
 use crate::support::{base_url, git, git_in, register_repo, user_client, workspace_path};
 use uuid::Uuid;
 
-/// Register the e2e workspace as a test repository, returning its ID.
 async fn register_test_repo(client: &reqwest::Client) -> String {
     register_repo(client, &workspace_path(), "e2e-repo").await
 }
@@ -23,7 +22,6 @@ async fn list_repo_files_returns_file_list() {
     assert_eq!(resp.status().as_u16(), 200);
     let files: Vec<String> = resp.json().await.expect("Invalid JSON");
     assert!(!files.is_empty(), "Expected at least one file");
-    // The e2e workspace should have .gitignore
     assert!(
         files.iter().any(|f| f == ".gitignore"),
         "Expected .gitignore in file list, got: {:?}",
@@ -164,7 +162,6 @@ async fn get_repo_diff_with_branch() {
     let wt_tmp = tempfile::tempdir().unwrap();
     let wt_dir = wt_tmp.path();
 
-    // Use a worktree to create the branch without touching the main working tree
     git(&[
         "worktree",
         "add",
@@ -202,7 +199,6 @@ async fn get_repo_diff_with_branch() {
         .unwrap();
     assert_eq!(diff_file["status"].as_str(), Some("added"));
 
-    // Cleanup
     let _ = std::process::Command::new("git")
         .args(["worktree", "remove", "--force", wt_dir.to_str().unwrap()])
         .current_dir(&ws)
@@ -213,9 +209,6 @@ async fn get_repo_diff_with_branch() {
         .output();
 }
 
-/// Set up a branch in the e2e workspace with a single file whose name contains
-/// an emoji. Returns `(branch, file, wt_dir)`. Caller is responsible for
-/// teardown via `cleanup_utf8_branch`.
 fn create_utf8_branch(name_prefix: &str) -> (String, String, tempfile::TempDir) {
     let suffix = &Uuid::new_v4().as_simple().to_string()[..8];
     let branch = format!("e2e-test/utf8-{}-{}", name_prefix, suffix);
@@ -249,11 +242,6 @@ fn cleanup_utf8_branch(branch: &str, wt_dir: &std::path::Path) {
         .output();
 }
 
-/// Regression: paths with non-ASCII bytes (emoji, accented letters) must come
-/// back as raw UTF-8, not git's default `"...\NNN..."` C-quoted form. Without
-/// `-c core.quotepath=false` on the underlying `git ls-tree` / `git diff`
-/// invocations the file tree renders folders like `"streamlit` and the diff
-/// row shows the raw `diff --git ...` header instead of the filename.
 #[tokio::test]
 async fn list_repo_files_returns_raw_utf8_paths() {
     let client = user_client().await;

@@ -1,6 +1,3 @@
-//! Moving a child thread to top level (ADR 0278): the ladder, the projection,
-//! and what the former parent no longer gets.
-
 use super::*;
 use crate::engine::chat::child_follow_up::ChildFollowUpExt;
 use crate::engine::event_bus::EventBus;
@@ -42,8 +39,6 @@ async fn spawn(bus: &EventBus, parent: Option<Uuid>, text: &str) -> Uuid {
     id
 }
 
-/// Emit the move exactly as `detach_child_thread` does. `None` means the bus
-/// dropped it.
 async fn detach(bus: &EventBus, parent: Uuid, child: Uuid) -> Option<Uuid> {
     bus.emit(BusEvent::Thread {
         thread_id: parent,
@@ -120,10 +115,6 @@ async fn authorize(
     LucidosEngine::authorize_child_detach(pool, caller, target).await
 }
 
-// --- the ladder ------------------------------------------------------------
-
-/// An agent moves only its own direct children. The user moves any thread that
-/// has a parent, however deep.
 #[tokio::test]
 async fn the_ladder_lets_an_agent_move_only_its_direct_children() {
     let (pool, db_name) = setup_test_db().await;
@@ -188,8 +179,6 @@ async fn the_ladder_lets_an_agent_move_only_its_direct_children() {
     teardown_test_db(&db_name).await;
 }
 
-// --- whose button it is ----------------------------------------------------
-
 async fn move_out(
     bus: &EventBus,
     caller: DetachCaller,
@@ -198,8 +187,6 @@ async fn move_out(
     LucidosEngine::move_child_to_top_level(bus, caller, target, EventMeta::NONE).await
 }
 
-/// An agent moves its own child in a turn nobody's device opened: creating a
-/// top-thread needs no owner authority (ADR 0475).
 #[tokio::test]
 async fn an_agent_moves_its_child_with_no_owner_turn() {
     let (pool, db_name) = setup_test_db().await;
@@ -217,7 +204,6 @@ async fn an_agent_moves_its_child_with_no_owner_turn() {
     teardown_test_db(&db_name).await;
 }
 
-/// The user's device moves a child with no owner turn anywhere.
 #[tokio::test]
 async fn the_user_moves_a_child_with_no_owner_turn() {
     let (pool, db_name) = setup_test_db().await;
@@ -250,11 +236,6 @@ fn every_refusal_maps_to_its_status() {
     }
 }
 
-// --- the projection ----------------------------------------------------------
-
-/// The move on a RUNNING child, so the counters are non-zero and the order of
-/// the reconcile is observable. The subtree moves as a unit and the former
-/// parent and its ancestor stop counting it.
 #[tokio::test]
 async fn moving_a_running_child_cuts_the_edge_and_reconciles_every_count() {
     let (pool, db_name) = setup_test_db().await;
@@ -296,8 +277,6 @@ async fn moving_a_running_child_cuts_the_edge_and_reconciles_every_count() {
     teardown_test_db(&db_name).await;
 }
 
-/// Applying the event a second time changes nothing, and the boot-time
-/// reconciles agree with what the projection left.
 #[tokio::test]
 async fn the_move_is_replay_safe_and_survives_the_boot_reconciles() {
     let (pool, db_name) = setup_test_db().await;
@@ -312,7 +291,6 @@ async fn the_move_is_replay_safe_and_survives_the_boot_reconciles() {
     assert_eq!(parent_once.active_children_count, 1);
     assert_eq!(parent_once.total_children_count, 1);
 
-    // Replay the event through the projection: it finds no edge to cut.
     let mut tx = pool.begin().await.unwrap();
     let (_, touched) = bus
         .update_thread_projection(
@@ -330,7 +308,6 @@ async fn the_move_is_replay_safe_and_survives_the_boot_reconciles() {
     assert!(touched.is_empty(), "a replay rebroadcasts nothing");
     assert_eq!(row(&pool, parent).await, parent_once);
     assert_eq!(row(&pool, child).await, child_once);
-    // And the bus refuses to record a second move of the same child.
     assert_eq!(detach(&bus, parent, child).await, None);
     assert_eq!(count_events(&pool, parent, "ChildThreadDetached").await, 1);
 
@@ -346,8 +323,6 @@ async fn the_move_is_replay_safe_and_survives_the_boot_reconciles() {
     teardown_test_db(&db_name).await;
 }
 
-/// Two moves of one child at once, as from two devices. One lands, the other
-/// is dropped, and neither deadlocks on the child's row.
 #[tokio::test]
 async fn two_moves_at_once_record_one() {
     let (pool, db_name) = setup_test_db().await;
@@ -369,8 +344,6 @@ async fn two_moves_at_once_record_one() {
     teardown_test_db(&db_name).await;
 }
 
-/// A former parent left with no children is reset at boot, so drift on it can
-/// never outlive a restart.
 #[tokio::test]
 async fn the_boot_reconcile_resets_a_childless_former_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -408,8 +381,6 @@ async fn the_boot_reconcile_resets_a_childless_former_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// A *stopped child* owes its parent a card, and lights the parent's attention
-/// count. Once moved it owes nothing, and the parent's count comes down.
 #[tokio::test]
 async fn moving_a_stopped_child_settles_what_it_owed() {
     let (pool, db_name) = setup_test_db().await;
@@ -440,10 +411,6 @@ async fn moving_a_stopped_child_settles_what_it_owed() {
     teardown_test_db(&db_name).await;
 }
 
-// --- what the former parent no longer gets -----------------------------------
-
-/// Move a child mid-turn, then let the turn finish. No card reaches the
-/// former parent, while a sibling still nested reports as before.
 #[tokio::test]
 async fn a_moved_child_finishing_its_turn_sends_no_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -469,8 +436,6 @@ async fn a_moved_child_finishing_its_turn_sends_no_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// The fan-in read the edge before the move committed, then emits its card
-/// afterwards. The bus drops that card.
 #[tokio::test]
 async fn a_card_arriving_after_the_move_is_dropped() {
     let (pool, db_name) = setup_test_db().await;
@@ -514,8 +479,6 @@ async fn a_card_arriving_after_the_move_is_dropped() {
     teardown_test_db(&db_name).await;
 }
 
-/// Moving child B out must not hide child A's unprocessed card from the boot
-/// sweep, or A's result is lost to a restart (ADR 0011).
 #[tokio::test]
 async fn moving_one_child_does_not_strand_a_siblings_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -535,7 +498,6 @@ async fn moving_one_child_does_not_strand_a_siblings_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// The former parent can no longer follow up on the moved child.
 #[tokio::test]
 async fn the_former_parent_loses_its_follow_up_authority() {
     let (pool, db_name) = setup_test_db().await;
@@ -562,9 +524,6 @@ async fn the_former_parent_loses_its_follow_up_authority() {
     teardown_test_db(&db_name).await;
 }
 
-/// A move never buys back a live child's slot, or it becomes a way round the
-/// cap (ADR 0278). Once the moved child finishes, it frees its slot like any
-/// other child.
 #[tokio::test]
 async fn a_moved_child_counts_against_the_cap_while_it_is_live() {
     use crate::engine::thread_queue::DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD as CAP;

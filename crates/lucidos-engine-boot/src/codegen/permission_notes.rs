@@ -1,5 +1,3 @@
-//! The app's copy of the notes a permission card shows (ADR 0368).
-
 use lucidos_core::engine::thread_events::UNPROVEN_WORKSPACE_DESTRUCTION_NOTE;
 
 use super::{quoted, REGENERATE};

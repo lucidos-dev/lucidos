@@ -1,6 +1,3 @@
-//! The request body and the response parse, both without a server. The
-//! fixtures copy the shapes a live call returned.
-
 use super::*;
 use crate::llm::judgment::NoulCriteria;
 
@@ -34,8 +31,6 @@ fn the_url_is_the_decisions_path_under_the_openai_root() {
     assert_eq!(decisions_url(), "https://api.openai.com/v1/decisions");
 }
 
-/// Every question travels in one body, named by the id the caller chose, in
-/// the order it was asked.
 #[test]
 fn every_question_travels_in_one_body_under_its_own_name() {
     let body = build_request_body(OPENAI_DECISIONS_MODEL, &json!({"a": 1}), &two_questions());
@@ -48,14 +43,12 @@ fn every_question_travels_in_one_body_under_its_own_name() {
     assert_eq!(questions[1]["name"], "lane");
 }
 
-/// A text state goes as itself, never as a quoted JSON string.
 #[test]
 fn a_text_state_travels_as_itself() {
     let body = build_request_body(OPENAI_DECISIONS_MODEL, &json!("line one\nline two"), &[]);
     assert_eq!(body["input"], "line one\nline two");
 }
 
-/// `input` refuses an object, so the state goes as its JSON text, unchanged.
 #[test]
 fn the_state_travels_as_its_json_text() {
     let state = json!({ "reply": "psql postgres://u:[REDACTED]@h/db" });
@@ -64,8 +57,6 @@ fn the_state_travels_as_its_json_text() {
     assert_eq!(serde_json::from_str::<Value>(input).unwrap(), state);
 }
 
-/// A `predicate` has no criteria field and refuses one, so both sides ride in
-/// the instructions.
 #[test]
 fn a_noul_carries_its_criteria_inside_its_instructions() {
     let body = build_request_body(OPENAI_DECISIONS_MODEL, &json!("x"), &two_questions());
@@ -114,8 +105,6 @@ fn a_response_reads_back_as_answers_usage_and_model() {
     assert_eq!(judgment.model.as_deref(), Some("gpt-6-luna"));
 }
 
-/// A refusal or any type this adapter does not know is a missing answer, and
-/// its siblings survive. The site then applies its safe default.
 #[test]
 fn a_refusal_is_a_missing_answer_and_its_siblings_survive() {
     let body = r#"{"answers":[

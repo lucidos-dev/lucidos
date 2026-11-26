@@ -1,18 +1,9 @@
-//! The Lucidos Agent's file tools against every data prefix, driven through a
-//! real agent turn by the mock's `MOCK_TOOL_CALL:` sentinel.
-//!
-//! The regression: `write_file` to `themes/<id>.json` landed at
-//! `data/artifacts/themes/<id>.json`, unvalidated, because the tools kept their
-//! own short copy of the data prefix list.
-
 use crate::support::{
     base_url, db_url, e2e_font_slug, poll_thread_summary_by_marker, unique_marker, user_client,
     workspace_path, workspace_tree_lock,
 };
 use serde_json::json;
 
-/// Run one agent turn that makes exactly one tool call, and return the text
-/// of its result.
 async fn call_tool(pool: &sqlx::PgPool, tool: &str, args: serde_json::Value) -> String {
     let client = user_client().await;
     let marker = unique_marker(&format!("api-file-tool-{tool}"));
@@ -63,7 +54,6 @@ async fn data_event_count(pool: &sqlx::PgPool, event_type: &str, path: &str) -> 
     .expect("DB query failed")
 }
 
-/// The commits that ever touched `repo_path` in the workspace repo.
 fn commits_touching(repo_path: &str) -> String {
     let out = std::process::Command::new("git")
         .args(["log", "--all", "--oneline", "--", repo_path])
@@ -161,9 +151,6 @@ async fn a_broken_theme_written_by_the_agent_is_refused_before_disk_or_git() {
     assert_eq!(data_event_count(&pool, "DataFileWritten", &rel).await, 0);
 }
 
-/// Every file tool announces a change outside `artifacts/`, once. An open
-/// preview of that file refreshes on the announcement alone, since the live
-/// tool call no longer carries the path it wrote.
 #[tokio::test]
 async fn every_file_tool_announces_a_knowhow_change_once() {
     let _tree = workspace_tree_lock().read().await;
@@ -212,8 +199,6 @@ async fn every_file_tool_announces_a_knowhow_change_once() {
     }
 }
 
-/// An `artifacts/` write keeps its own `Artifact*` event and gains no
-/// `DataFile*`, so the Files list and the preview see one announcement.
 #[tokio::test]
 async fn an_artifact_written_by_the_agent_announces_no_data_file_event() {
     let _tree = workspace_tree_lock().read().await;
@@ -243,8 +228,6 @@ async fn an_artifact_written_by_the_agent_announces_no_data_file_event() {
     assert_eq!(data_event_count(&pool, "DataFileDeleted", &rel).await, 0);
 }
 
-/// A workspace font's manifest is checked like a theme: refused before disk or
-/// git when invalid, announced when written, and never edited in place.
 #[tokio::test]
 async fn a_font_manifest_written_by_the_agent_is_checked_and_cannot_be_edited_in_place() {
     let _tree = workspace_tree_lock().read().await;
@@ -300,8 +283,6 @@ async fn a_font_manifest_written_by_the_agent_is_checked_and_cannot_be_edited_in
     assert_eq!(data_event_count(&pool, "DataFileDeleted", &rel).await, 1);
 }
 
-/// Removes the symlinks a test planted, even when an assertion fails, so the
-/// run leaves the workspace tree clean.
 struct PlantedLinks(Vec<std::path::PathBuf>);
 
 impl Drop for PlantedLinks {
@@ -312,8 +293,6 @@ impl Drop for PlantedLinks {
     }
 }
 
-/// No tool writes through a symlink to a file outside its tree: not a linked
-/// leaf, and not a new file under a linked directory (ADR 0051).
 #[cfg(unix)]
 #[tokio::test]
 async fn no_file_tool_writes_through_a_symlink_out_of_its_tree() {
@@ -381,8 +360,6 @@ async fn no_file_tool_writes_through_a_symlink_out_of_its_tree() {
     assert!(!outside.path().join("new.md").exists());
 }
 
-/// A `temp_path` naming a directory is refused before the request goes out,
-/// with a reason about the argument rather than the file tools.
 #[tokio::test]
 async fn a_temp_path_naming_a_directory_is_refused_for_what_it_is() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
@@ -400,8 +377,6 @@ async fn a_temp_path_naming_a_directory_is_refused_for_what_it_is() {
     }
 }
 
-/// An app file the agent writes is linted. The findings ride back in the tool
-/// result, and the write lands exactly as asked.
 #[tokio::test]
 async fn an_app_file_with_lint_findings_is_written_and_its_result_names_them() {
     let _tree = workspace_tree_lock().read().await;
@@ -450,16 +425,12 @@ async fn an_app_file_with_lint_findings_is_written_and_its_result_names_them() {
         deleted.contains(&format!("DELETED: {rel}")),
         "got: {deleted}"
     );
-    // Git tracks no directories, so the emptied app folder is no tree change.
-    // The delete may prune it already; one left behind must be empty.
     let app_dir = workspace_path().join("data").join(&dir);
     if app_dir.exists() {
         std::fs::remove_dir(&app_dir).unwrap();
     }
 }
 
-/// A write that leaves a knowhow file over the size cap lands, and its reply
-/// carries a warning: on the data route and in the agent's tool result.
 #[tokio::test]
 async fn a_knowhow_write_over_the_size_cap_lands_with_a_warning() {
     let tree = workspace_tree_lock().read().await;
@@ -507,7 +478,6 @@ async fn a_knowhow_write_over_the_size_cap_lands_with_a_warning() {
     let reply: serde_json::Value = small.json().await.unwrap();
     assert!(reply.get("warning").is_none(), "got: {reply}");
 
-    // The cleanup takes the tree lock itself.
     drop(tree);
     crate::support::remove_data_fixtures(&client, &dir, &[routed, tooled]).await;
 }

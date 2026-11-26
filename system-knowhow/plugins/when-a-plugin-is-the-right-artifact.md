@@ -33,13 +33,14 @@ Other workspaces install what you publish, so get the shape right before scaffol
 
 ## Plugin layout
 
-A plugin is a directory with `manifest.toml` at the root plus a subset of seven content directories. They mirror `data/` one-to-one: `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install.
+A plugin is a directory with `manifest.toml` at the root plus a subset of eight content directories. They mirror `data/` one-to-one: `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install.
 
 ```
 my-plugin/
   manifest.toml          # required, at root
   apps/                  # optional, mirrors data/apps/
   knowhow/               # optional, mirrors data/knowhow/
+  hooks/                 # optional, mirrors data/hooks/
   triggers/              # optional, mirrors data/triggers/
   scripts/               # optional, mirrors data/scripts/
   auth-modules/          # optional, mirrors data/auth-modules/
@@ -63,8 +64,8 @@ Install validates the tree (`crates/lucidos-core/src/core/plugins.rs::validate_t
 - `id` matches `[a-z0-9-]+`, non-empty, max 64 chars. Uppercase, underscore, dot all reject.
 - `version` parses as semver.
 - `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional: omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `plugins(action="update")` and `plugins(action="check_updates")` refuse a sourceless plugin with an explanatory error. Install and uninstall work fine.
-- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules, themes, fonts, media}`. `media/` is never content: it holds *plugin media* and counts toward nothing below. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (macOS Finder adds it when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`.
-- At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/`, `themes/`, `fonts/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
+- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, hooks, scripts, auth-modules, themes, fonts, media}`. `media/` is never content: it holds *plugin media* and counts toward nothing below. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (macOS Finder adds it when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`.
+- At least one of `apps/`, `knowhow/`, `triggers/`, `hooks/`, `scripts/`, `auth-modules/`, `themes/`, `fonts/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
 - Every file under `themes/` is `<id>.json` and a valid theme, with an id no built-in theme uses (`InvalidTheme` otherwise). The rules are in `themes.md`, theme parts included. A part value past a cap, or a part on a protected surface, fails staging with the field, the rule and the limit (`dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.`).
 - Every file under `fonts/` belongs to a valid workspace font: `fonts/<slug>/font.json` plus the font files it names (`InvalidFont` otherwise). A theme in the plugin may name a workspace font only if the plugin ships it. Install is refused when the plugin's new fonts would take the workspace past 100. The rules are in `workspace-fonts.md`.
 - The file walk silently skips hidden files (any path component starting with `.`), such as `.DS_Store` and editor swap files.
@@ -74,6 +75,21 @@ Install validates the tree (`crates/lucidos-core/src/core/plugins.rs::validate_t
 - No archive entry uses `..` or absolute paths (`/`, `\`): zip-slip protection.
 
 There is no separate install destination. `apps/foo/index.html` in the plugin lands at `data/apps/foo/index.html` in the workspace. Sub-trees (`triggers/foo/foo.md`, `apps/foo/sdk-prefs.js`) are preserved verbatim.
+
+### Shipping event hooks
+
+Put each definition in `hooks/<slug>/hook.toml`. Keep the script and its
+helpers in the hook folder so arming covers their content. To share an entry
+script from the plugin's `scripts/` folder, use a path such as
+`script = "scripts/check.py"`. If the script is absent in the hook folder,
+Lucidos copies the shipped script there at staging. Put any helpers it needs
+in the hook folder too.
+
+Give each hook its own workspace slug and use only the events Lucidos asks
+about. Keep installer data out of the definition. Use plugin setup for values
+that depend on the workspace. If a hook needs setup values, allow the setup
+thread to start before those values exist. See `system-knowhow/event-hooks`
+for hook definitions, arming and refusals.
 
 ## `manifest.toml` schema
 

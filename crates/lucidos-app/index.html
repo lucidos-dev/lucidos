@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" translate="no" data-theme-mode="dark">
 <head>
+    <meta name="lucidos-build-id" content="__LUCIDOS_BUILD_ID__">
     <!-- Capture before resource discovery and navigation scripts. Never send a launch credential in a manifest request. -->
     <script>
       (function () {
@@ -117,60 +118,58 @@
         } catch (e) { /* a missing API leaves the page where it is */ }
       })();
     </script>
-    <!--
-      PWA cold-start fast path (the load-bearing smoothness fix). When the picker
-      (server-stamped <base href="/~/">) would auto-open the last workspace, do the
-      redirect HERE — in <head>, before the bundle loads and before anything
-      paints — so the picker NEVER renders a splash and there is no
-      picker→workspace cross-document reload seam (the persistent cold-start
-      jank/flicker). The browser goes straight to /<slug>/, which plays the single
-      reveal. Skipped when `?pick` is present (the in-app "Manage workspaces"
-      escape), when pairing was captured, or when no workspace is remembered.
-      Reads the RAW device-global `lucidos-last-workspace` key (this runs before
-      workspaceStorage.install namespacing, matching how the picker writes it).
-      `location.replace` so the picker is not left in history. A since-deleted slug
-      is caught by the gateway, which 302s it to `/~/?pick` (server.rs) — `?pick`
-      then stands this redirect down, so there is no loop. Mirrors openWorkspace()
-      (`/${workspaceRouteUrlSegment(id)}/`).
-
-      PRESERVES `location.search` + `location.hash` through the redirect. A push
-      tap can cold-launch the PWA in picker context with a deep link on the URL
-      (`/?notification=…&thread=…&tap=…` when the push subscription scope is the
-      gateway root). Redirecting to a bare `/<slug>/` dropped those params before
-      the app ever booted — so every such tap landed on the workspace with the
-      deep link gone (`handle_hash_location {found:false}`), turning the flaky iOS
-      push tap into a consistent failure. Carrying search+hash forward lands
-      `/<slug>/?notification=…`, which `handleHashLocation` then dispatches. (`?pick`
-      already returned above, so it can't be carried into a loop.)
-    -->
+    <!-- Resume before the picker or the original workspace can paint.
+         Older gateway installs can still launch at their original workspace. -->
     <script>
       (function () {
         try {
           var base = document.querySelector('base');
-          if (!base || base.getAttribute('href') !== '/~/') return;
-          if (window.lucidosHistoryBounce) return;
-          // The pairing screen is the picker document, served in place at the
-          // url asked for (gateway `serve_pairing_shell`). So it wears the base
-          // this redirect keys on, and redirecting lands right back on it. The
-          // gateway stamps `PAIRING_SHELL_META` ahead of this script to say so.
-          if (document.querySelector('meta[name="lucidos-pairing"]')) return;
-          var search = new URLSearchParams(location.search);
-          if (search.has('pick')) return;
-          // Capture erased the credential before resources loaded. Keep this
-          // document for pairing and its install manifest even on invalid input.
-          if (window.lucidosPairingLaunch || search.has('pair') || new URLSearchParams(location.hash.slice(1)).has('pair')) return;
-          var slug = localStorage.getItem('lucidos-last-workspace');
-          // Preserve the deep link (notification/thread/tap query + any hash) so a
-          // push tap that cold-launches into the picker still reaches the workspace
-          // WITH its params, instead of a bare /<slug>/.
-          // `@` stays literal, as `workspaceRouteUrlSegment` keeps it: the
-          // gateway reads a remote route `<slug>@<name>` off the raw path.
-          if (slug) {
-            Promise.resolve(window.lucidosRemoteClientReady).then(function () {
-              location.replace('/' + encodeURIComponent(slug).replace('%40', '@') + '/' + location.search + location.hash);
-            }).catch(function () { /* boot reports retirement failure */ });
+          if (!base) return;
+          var baseHref = base.getAttribute('href');
+          var picker = baseHref === '/~/';
+          if (window.lucidosHistoryBounce ||
+              document.querySelector('meta[name="lucidos-pairing"]')) return;
+
+          var pwa = navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+          var gateway = picker || (baseHref !== '/' &&
+              document.querySelector('meta[name="lucidos-gateway-port"]'));
+          // Only build a same-origin path segment here. The gateway validates the route.
+          var routeSegment = /^[a-z0-9-]+(?:@[a-z0-9-]+)?$/;
+          var firstDocument = false;
+          if (pwa && gateway) {
+            try {
+              firstDocument = !sessionStorage.getItem('lucidos-pwa-workspace-session');
+              sessionStorage.setItem('lucidos-pwa-workspace-session', '1');
+            } catch (e) { /* without session storage, only the picker resumes */ }
           }
-        } catch (e) { /* fall through to the normal picker render */ }
+
+          var search = new URLSearchParams(location.search);
+          if (search.has('pick') || window.lucidosPairingLaunch || search.has('pair') ||
+              new URLSearchParams(location.hash.slice(1)).has('pair')) return;
+
+          var entry = firstDocument && performance.getEntriesByType('navigation')[0];
+          var legacyLaunch = entry && entry.type !== 'back_forward' &&
+              location.pathname === baseHref && !location.search && !location.hash && !document.referrer;
+          var slug = pwa && gateway && localStorage.getItem('lucidos-pwa-workspace');
+          if (!slug || !routeSegment.test(slug)) slug = localStorage.getItem('lucidos-last-workspace');
+          if ((picker || legacyLaunch) && slug && routeSegment.test(slug) && baseHref !== '/' + slug + '/') {
+            window.lucidosWorkspaceResume = true;
+            Promise.resolve(window.lucidosRemoteClientReady).then(function () {
+              location.replace('/' + slug + '/' + location.search + location.hash);
+            }).catch(function () { /* boot reports retirement failure */ });
+            return;
+          }
+
+          if (pwa && gateway && !picker) {
+            // The gateway shell shares only the route. Peer preferences keep their
+            // own namespace installed later by the bundle.
+            var saveRoute = localStorage.setItem.bind(localStorage, 'lucidos-pwa-workspace');
+            window.lucidosRememberPwaWorkspace = function (route) {
+              if (!routeSegment.test(route)) return;
+              try { saveRoute(route); } catch (e) { /* storage unavailable */ }
+            };
+          }
+        } catch (e) { /* storage unavailable */ }
       })();
     </script>
     <!--

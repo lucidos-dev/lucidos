@@ -1,9 +1,3 @@
-//! Archive all's decisions (ADR 0349): what the confirm counts, and which of
-//! the confirmed ids are still safe when the user presses it.
-//!
-//! Safe means exactly what triage's apply means for `archive`: nothing busy,
-//! nothing the user still has to do, and no pin. One rule, two callers.
-
 use crate::engine::archive_policy::PINNED_SUB_THREAD;
 use crate::engine::archive_policy::SAME_FAMILY;
 use std::collections::{BTreeMap, HashSet};
@@ -15,22 +9,12 @@ use super::facts::TriageRow;
 use super::{refuse_apply, refuse_completed, refuse_fresh, NeedFact, TriageAction};
 use crate::engine::thread_lifecycle::Blocker;
 
-/// A thread the confirm will archive.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SafeThread {
     pub(crate) thread_id: Uuid,
     pub(crate) title: String,
 }
 
-/// What the confirm says. It counts inbox threads, sub-threads included, as
-/// the Current badge does, so the two totals add up to that badge.
-///
-/// `safe` lists the family roots the press sends back; `safe_thread_count`
-/// counts every inbox thread their archives take. `kept` counts every inbox
-/// thread that stays, so its values add up to `kept_thread_count`. A kept
-/// family counts once under its first reason, and its other inbox threads
-/// under [`SAME_FAMILY`]. A pinned sub-thread of a safe family counts under
-/// [`PINNED_SUB_THREAD`], because the archive leaves it open.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ArchiveAllPreflight {
     pub(crate) safe: Vec<SafeThread>,
@@ -39,8 +23,6 @@ pub(crate) struct ArchiveAllPreflight {
     pub(crate) kept_thread_count: usize,
 }
 
-/// The slug a kept family's root is counted under in the confirm: busy first,
-/// then its first need. Its other threads count under [`SAME_FAMILY`]. Pinned rows never reach here.
 fn kept_slug(row: &TriageRow) -> &'static str {
     let facts = &row.facts;
     if facts.busy_reason().is_some() {
@@ -61,10 +43,6 @@ fn kept_slug(row: &TriageRow) -> &'static str {
     }
 }
 
-/// The confirm for the Current section, family by family as the drawer draws
-/// them. A family whose root is pinned sits in Pinned, so it is neither
-/// archived nor counted. A pinned root in a family that also holds an unpinned
-/// one renders in Current, so it is counted as kept.
 pub(crate) fn preflight(rows: &[TriageRow]) -> ArchiveAllPreflight {
     let current_families: HashSet<Uuid> = rows
         .iter()
@@ -108,9 +86,6 @@ pub(crate) fn preflight(rows: &[TriageRow]) -> ArchiveAllPreflight {
     }
 }
 
-/// A confirmed id Archive all did not archive, and why: `reason` in words for
-/// an agent, `slug` for the client to word as the confirm does.
-/// `thread_count` is the root plus its inbox sub-threads ([`TriageRow::counted_threads`]).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct KeptThread {
     pub(crate) thread_id: Uuid,
@@ -128,9 +103,6 @@ fn fresh_kept_slug(row: Option<&TriageRow>) -> &'static str {
     }
 }
 
-/// The slug for a family the archive cascade refused, from its refusal body: a
-/// thread gone or pinned since the confirm, else its `blocker`. Any other
-/// refusal, such as a change claim, is something still working.
 pub(crate) fn refusal_kept_slug(body: &serde_json::Value) -> &'static str {
     let field = |key: &str| body.get(key).and_then(|v| v.as_str());
     match field("reason") {
@@ -148,9 +120,6 @@ pub(crate) fn refusal_kept_slug(body: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Split the confirmed ids into the ones still safe and the ones that changed.
-/// `rows` is a fresh read of exactly `confirmed`. Nothing outside `confirmed`
-/// is ever returned as safe: the confirm is the ceiling.
 pub(crate) fn still_safe(rows: &[TriageRow], confirmed: &[Uuid]) -> (Vec<Uuid>, Vec<KeptThread>) {
     let mut safe = Vec::new();
     let mut kept = Vec::new();
@@ -169,7 +138,6 @@ pub(crate) fn still_safe(rows: &[TriageRow], confirmed: &[Uuid]) -> (Vec<Uuid>, 
     (safe, kept)
 }
 
-/// Scoped counts refer to individual threads, never overlapping cascades.
 pub(crate) fn completed_preflight(rows: &[TriageRow]) -> ArchiveAllPreflight {
     let safe: Vec<_> = rows
         .iter()

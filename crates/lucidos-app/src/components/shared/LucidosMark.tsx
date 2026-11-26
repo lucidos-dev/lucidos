@@ -1,4 +1,5 @@
 import { useId } from 'preact/hooks';
+import { LucidosMarkIcon } from './icons';
 
 
 const MARK_SCALE = 0.78;
@@ -72,5 +73,10 @@ export function LucidosMark({
 }
 
 export function LucidosGlyph({ size = 'var(--icon-size-sm)' }: { size?: string }) {
-  return <LucidosMark size={size} />;
+  return (
+    <>
+      <LucidosMarkIcon class="lucidos-agent-flat" size={size} />
+      <LucidosMark size={size} class="lucidos-agent-tile" />
+    </>
+  );
 }

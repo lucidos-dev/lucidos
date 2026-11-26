@@ -7,23 +7,17 @@ pub(crate) use crate::engine::session_queries::{
     lookup_latest_worktree_path, resolve_worktree_path,
 };
 
-/// Lifecycle events that close out a CC turn.
 pub(crate) const CC_TURN_CLOSER_EVENTS: &str =
     "'CodingAgentIdled', 'SessionEnded', 'ChangeApplied', 'ChangeDiscarded'";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IdleAnchor {
-    /// An idle recorded this sha.
     Found(String),
-    /// The query answered, and the thread has no idle carrying a sha.
     Absent,
-    /// The query failed. Nothing is known about the anchor.
     Unknown,
 }
 
 impl IdleAnchor {
-    /// The sha when there is one. `Absent` and `Unknown` collapse here, which
-    /// suits every caller that only skips work when no sha is available.
     pub(crate) fn found(&self) -> Option<&str> {
         match self {
             Self::Found(sha) => Some(sha.as_str()),
@@ -32,14 +26,6 @@ impl IdleAnchor {
     }
 }
 
-/// Look up the most-recent `CodingAgentIdled` event for a thread and return
-/// its `worktree_head_sha` payload field. Answers `Absent` for legacy events
-/// that predate the field (Phase 8.1), for the truly-first turn of a thread,
-/// and for idles emitted without a worktree.
-///
-/// Used by the spawn path to detect external user edits made between turns
-/// (see `external_edits::compute_external_edit_note`) and to anchor
-/// `external_edits::try_adopt_renegade_branch`.
 pub(crate) async fn lookup_latest_worktree_head_sha(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
@@ -149,7 +135,6 @@ pub(super) async fn resolve_resume_context(
         .pop()
         .map(|c| c.branch_name);
 
-    // A fresh session runs on the thread's own branch.
     if start_fresh {
         let branch = match open_branch {
             Some(branch) => Some(branch),
@@ -213,33 +198,22 @@ pub(super) async fn resolve_resume_context(
     (None, None)
 }
 
-/// Which session a run starts, for the handoff and resume decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RunKind {
-    /// A first message, a follow-up or a Continue: the thread's own next session.
     Ordinary,
-    /// A lane thread resolving its open batch. Its sessions are the thread's
-    /// own, so a pending handoff starts its successor session.
     Lane,
     Resolution,
 }
 
-/// What a run resumes, and the handoff or provider block its session starts
-/// from.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RunResume {
     pub pending_handoff: Option<crate::engine::pending_handoff::PendingHandoff>,
-    /// The policy that blocked an ordinary run's newest session
-    /// ([`blocking_policy`]). A pending handoff already starts fresh.
     pub blocking_policy: Option<&'static str>,
     pub session_id: Option<String>,
-    /// The branch an ordinary run's worktree resumes on.
     pub branch: Option<String>,
 }
 
 impl RunResume {
-    /// Whether the run's `SessionStarted` records its continuity whatever
-    /// its spawn did. A resumed spawn always records it.
     pub(super) fn records_continuity(&self, kind: RunKind) -> bool {
         kind == RunKind::Ordinary || self.pending_handoff.is_some()
     }
@@ -278,8 +252,6 @@ pub(super) async fn resolve_run_resume(
             )
             .await
         }
-        // A lane thread's successor session starts fresh in the lane's own
-        // worktree. Without a handoff it keeps its context.
         RunKind::Lane if pending_handoff.is_some() => (None, None),
         RunKind::Lane | RunKind::Resolution => (caller_session_id, None),
     };
@@ -291,13 +263,6 @@ pub(super) async fn resolve_run_resume(
     })
 }
 
-/// The reason OpenAI's safety systems blocked the thread's newest session, when
-/// the newest provider error since that session started was a policy block.
-/// A later failure with no provider error, such as a spawn that failed before
-/// its session began, leaves the block in place. The session that carried the
-/// block is never resumed: it would replay the history that tripped it. A newer
-/// `SessionStarted` clears the block, since its own id is the one to resume. A
-/// failed read answers `None`, which resumes as before.
 pub(crate) async fn blocking_policy(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
@@ -328,10 +293,6 @@ pub(crate) async fn blocking_policy(
         .policy_name()
 }
 
-/// `(repo_id, branch)` from the most recent `SessionStarted` event for the
-/// thread that recorded both. Pre-Mar-2026 SessionStarted payloads sometimes
-/// omitted `repo_id`; the filter skips those rather than returning a partial
-/// result, since both fields are needed to recover a diff.
 pub(crate) async fn lookup_latest_session_repo_and_branch(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
@@ -358,10 +319,6 @@ pub(crate) async fn lookup_latest_session_repo_and_branch(
     .flatten()
 }
 
-/// Event types that reset the transient-API-drop auto-resume budget. Either one
-/// means the thread made real progress since the last drop: the user asked for
-/// something new, or a turn actually completed. Kept as one SQL fragment so
-/// [`api_error_auto_resumes_spent`]'s two halves cannot drift.
 const API_ERROR_BUDGET_RESET_EVENTS: &str = "'MessageReceived', 'ResponseGenerated'";
 
 pub(crate) async fn api_error_auto_resumes_spent(
@@ -398,18 +355,13 @@ pub(crate) async fn api_error_auto_resumes_spent(
     }
 }
 
-/// A thread's account pin as its first session recorded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecordedAccountPin {
-    /// Where the transcripts live. Session ids are scoped by this path.
     pub dir: String,
-    /// Whether `CLAUDE_CONFIG_DIR` was set. `None` on rows from before it was
-    /// recorded.
     pub explicit: Option<bool>,
 }
 
 impl RecordedAccountPin {
-    /// The pin to replay, given the variables this spawn injects.
     pub(crate) fn resolve(&self, user_env_vars: &[(String, String)]) -> crate::runtime::AccountPin {
         crate::runtime::AccountPin::from_recorded(
             self.dir.clone(),
@@ -439,12 +391,6 @@ pub(crate) async fn lookup_pinned_cc_config_dir(
     Ok(pinned.map(|(dir, explicit)| RecordedAccountPin { dir, explicit }))
 }
 
-/// The newest `cc_session_id` recorded UNDER `config_dir` — the resume target
-/// scoped to the thread's pinned account. The `cc_session_id`↔`claude_config_dir`
-/// pairing lives only in the Init-time `CodingAgentSettingsChanged` (the sole
-/// event carrying both), so scope to that type. `None` when the pinned account
-/// has no recorded session — the caller then spawns fresh under the pinned dir
-/// rather than resuming a session that belongs to a different account.
 pub(crate) async fn lookup_latest_cc_session_id_for_config_dir(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,

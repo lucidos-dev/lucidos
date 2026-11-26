@@ -1,6 +1,3 @@
-//! The expected wake decision: each test pins one invariant of
-//! `docs/plans/2026-10-30-keep-alive-follows-the-expected-wake.md`.
-
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration as Span, Utc};
@@ -17,7 +14,6 @@ use crate::test_support::{setup_test_db, teardown_test_db};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A deadline no offline test reaches.
 const TEST_DEADLINE: Duration = Duration::from_secs(30);
 
 fn now() -> DateTime<Utc> {
@@ -44,7 +40,6 @@ fn pending(waits: Vec<PendingWait>) -> PendingWake {
     }
 }
 
-/// A choice answer naming `choice`, with `weights` per bucket label.
 fn answer(choice: &str, weights: &[(&str, f64)]) -> ChoiceAnswer {
     ChoiceAnswer {
         choice: choice.into(),
@@ -91,7 +86,6 @@ fn the_median_falls_inside_its_bucket() {
     assert_eq!(median_secs(&vec![0.0; BUCKET_EDGES_MINUTES.len()]), None);
 }
 
-/// A System One model answers with a probability per bucket, recorded whole.
 #[test]
 fn a_system_one_answer_records_its_distribution_and_its_median() {
     let labels = bucket_labels();
@@ -106,8 +100,6 @@ fn a_system_one_answer_records_its_distribution_and_its_median() {
     assert!((45.0..=60.0).contains(&median), "{median}");
 }
 
-/// The chat model answers with one bucket: a point at its middle, and no
-/// distribution, whatever weights its reply spread.
 #[test]
 fn a_chat_answer_is_one_bucket_at_its_middle() {
     let labels = bucket_labels();
@@ -124,7 +116,6 @@ fn a_chat_answer_is_one_bucket_at_its_middle() {
     assert!(wake_from_answer(&unknown, DecisionBackend::Chat, &pending(vec![]), now()).is_none());
 }
 
-/// A wait's timeout wakes the thread, so no estimate lands past it.
 #[test]
 fn no_estimate_lands_past_the_earliest_waits_timeout() {
     let labels = bucket_labels();
@@ -144,8 +135,6 @@ fn no_estimate_lands_past_the_earliest_waits_timeout() {
     );
 }
 
-/// The call reads what each item waits on, its progress, the reply, the
-/// history and its own earlier misses.
 #[test]
 fn the_state_carries_every_input() {
     let mut waiting = pending(vec![wait(60)]);
@@ -187,7 +176,6 @@ fn the_state_carries_every_input() {
     }
 }
 
-/// A backend that answers with a fixed result.
 struct Fixed(Result<Option<String>, &'static str>);
 
 #[async_trait::async_trait]
@@ -213,8 +201,6 @@ impl JudgmentProvider for Fixed {
     }
 }
 
-/// System One answers when it can, and the chat model fills in for a failed
-/// or empty System One call. With neither, there is no answer (I9).
 #[tokio::test]
 async fn the_chat_model_answers_without_system_one() {
     let capture = AuxCapture::discarding(ContextPurpose::ExpectedWakeDecision);
@@ -303,8 +289,6 @@ async fn state_wake(bus: &EventBus, thread_id: Uuid) {
         .unwrap();
 }
 
-/// Only the turn's own statement spares it the decision, for a Lucidos Agent
-/// turn and a coding-agent turn alike (I8).
 #[tokio::test]
 async fn only_a_statement_in_this_turn_spares_the_decision() {
     let (pool, db) = setup_test_db().await;
@@ -336,8 +320,6 @@ async fn only_a_statement_in_this_turn_spares_the_decision() {
     teardown_test_db(&db).await;
 }
 
-/// The decision records in the engine's name, sourced as a decision. A failed
-/// call records nothing, so the bare reread cap applies (I9).
 #[tokio::test]
 async fn the_decision_records_in_the_engines_name_and_a_failure_records_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -375,8 +357,6 @@ async fn the_decision_records_in_the_engines_name_and_a_failure_records_nothing(
     teardown_test_db(&db).await;
 }
 
-/// A read that fails reads as stated, so a decision never replaces a
-/// statement the read missed.
 #[tokio::test]
 async fn an_unreadable_answer_reads_as_stated() {
     let (pool, db) = setup_test_db().await;

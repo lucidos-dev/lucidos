@@ -362,7 +362,7 @@ impl LucidosEngine {
 
         if let Some(thread_id) = change.thread_id {
             if change.is_pending() {
-                crate::engine::thread_events::emit_change_apply_requested(
+                if let Err(refusal) = crate::engine::thread_events::emit_change_apply_requested(
                     &self.event_bus,
                     thread_id,
                     change_id,
@@ -370,7 +370,13 @@ impl LucidosEngine {
                     &change.repo_root,
                     actor.clone(),
                 )
-                .await;
+                .await
+                {
+                    let message = refusal.to_string();
+                    self.emit_apply_failed(thread_id, change_id, &message, actor)
+                        .await;
+                    return Err(message.into());
+                }
             }
         }
 

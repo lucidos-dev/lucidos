@@ -1,12 +1,7 @@
-//! The theme part catalog, rendered for the frontend, the SDK and app frames.
-
 use super::super::{ThemeMode, TokenMap};
 use super::*;
 use crate::core::codegen::REGENERATE;
 
-/// Where a generated stylesheet loads. App frames define and register only
-/// the frame colour tokens, so an app's `var(--token, fallback)` still falls
-/// back for the rest.
 #[derive(Clone, Copy)]
 enum Realm {
     Shell,
@@ -77,8 +72,6 @@ fn grammar_ts(grammar: &Grammar) -> String {
     }
 }
 
-/// What the apply-site twin needs: each property's grammar, each part
-/// token's part and property, the colour tokens and the named colours.
 pub fn render_ts() -> String {
     let mut out = header("//", "//");
     out.push_str("\nexport type PartUnit = 'em' | 'px';\n\n");
@@ -150,7 +143,7 @@ pub fn render_ts() -> String {
     out
 }
 
-/// A colour token's `@property` initial value: its dark default as a
+/// INVARIANT: A colour token's `@property` initial value: its dark default as a
 /// literal, since an initial value may not name another property. Base CSS
 /// sets every token on the root, so this paints only under a broken value.
 fn initial_value(token: &str) -> String {
@@ -167,7 +160,6 @@ fn declarations(out: &mut String, names: impl Iterator<Item = String>, value: &s
     }
 }
 
-/// The shell's part CSS, which Vite imports.
 pub fn render_shell_css() -> String {
     let mut out = header("/*", "  ");
     out.push_str("*/\n\n");
@@ -175,14 +167,10 @@ pub fn render_shell_css() -> String {
     out
 }
 
-/// The app frames' part CSS, which the engine appends to
-/// `/api/v1/sdk-iframe.css` at runtime.
 pub fn frame_css() -> String {
     part_css(Realm::Frame)
 }
 
-/// The same frame CSS as a generated file, for the frontend tests that parse
-/// every stylesheet an app frame receives.
 pub fn render_frame_css() -> String {
     let mut out = header("/*", "  ");
     out.push_str("*/\n\n");
@@ -190,7 +178,6 @@ pub fn render_frame_css() -> String {
     out
 }
 
-/// The part CSS for one realm. Consumers stay hand-written.
 fn part_css(realm: Realm) -> String {
     let mut out = String::new();
     out.push_str("/* Every colour token this realm defines is a <color>, so a var() in a part\n   value substitutes a computed colour, never text that could add a shadow\n   layer. */\n");

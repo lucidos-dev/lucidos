@@ -36,8 +36,6 @@ async fn captured_backup_round_trips_through_restore_archive_into() {
         &mut std::fs::File::create(&encrypted).unwrap(),
     )
     .unwrap();
-    // Restore terminates target connections. Close the pool first and reconnect
-    // afterwards; the key store resolves to TestKeyStore under cfg(test).
     target_pool.close().await;
     let destination = tempfile::tempdir().unwrap();
     let warnings = super::super::restore_archive_into(
@@ -151,10 +149,12 @@ async fn database_dump_matches_captured_counts_and_key_ids() {
         .secret_key_ids
         .contains(&crate::core::secret_store::key().unwrap().id()));
     let target_url = test_db_url(&target);
-    tokio::task::spawn_blocking(move || super::super::pg_restore(&target_url, &dump))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::task::spawn_blocking(move || {
+        super::super::pg_restore_with_checks(&target_url, &dump, "", "")
+    })
+    .await
+    .unwrap()
+    .unwrap();
     for (table, expected) in metadata.table_rows {
         let actual: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM public.{}",

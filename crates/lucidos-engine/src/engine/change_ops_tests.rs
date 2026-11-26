@@ -1327,3 +1327,63 @@ fn apply_result_wire_distinguishes_started_and_no_build() {
         assert_eq!(wire["deferred_coding_threads"], 0);
     }
 }
+
+/// How many `event_type` rows thread `thread_id` holds.
+async fn thread_rows(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = $2")
+        .bind(thread_id)
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A hook on `ChangeApplyRequested` stops an Apply before the request is
+/// recorded and before anything merges. The thread hears why, and the change
+/// stays pending.
+#[tokio::test]
+async fn a_refusing_hook_stops_an_apply_before_its_request_is_recorded() {
+    use crate::test_support::{
+        hook_refusals, install_refusing_hook, seed_pending_change, setup_test_db, teardown_test_db,
+    };
+    let (pool, db) = setup_test_db().await;
+    let (engine, _workspace) = crate::engine_test_support::boot_mock_engine(&db).await;
+    let thread_id = Uuid::new_v4();
+    let change_id =
+        seed_pending_change(&engine.event_bus, thread_id, "claude-code/gated-apply").await;
+    install_refusing_hook(
+        &engine.event_bus,
+        "require-a-plan",
+        "ChangeApplyRequested",
+        "No plan approved.",
+    )
+    .await;
+
+    let error = engine.apply_change(change_id, None).await.unwrap_err();
+
+    assert!(error.to_string().contains("No plan approved."), "{error}");
+    assert_eq!(
+        thread_rows(&pool, thread_id, "ChangeApplyRequested").await,
+        0
+    );
+    let announced: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'error' FROM events \
+         WHERE thread_id = $1 AND event_type = 'ChangeApplyFailed'",
+    )
+    .bind(thread_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(announced.len(), 1, "{announced:?}");
+    assert!(announced[0].contains("No plan approved."), "{announced:?}");
+    assert_eq!(hook_refusals(&pool, "require-a-plan").await, 1);
+    let change = engine
+        .changes()
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(change.is_pending(), "{:?}", change.state);
+
+    teardown_test_db(&db).await;
+}

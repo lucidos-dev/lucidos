@@ -1,11 +1,7 @@
-//! Durable gateway identity, disclosed only to authenticated pairing peers.
-
 use crate::BoxError;
 use std::io::{Read, Write};
 use std::path::Path;
 
-/// Publish a fully synced identity without overwriting a concurrent creator.
-/// Existing invalid state is an error, never permission to change identity.
 pub fn load_or_create(app_data: &Path) -> Result<String, BoxError> {
     let path = app_data.join("gateway-identity");
     match std::fs::read_to_string(&path) {
@@ -17,8 +13,6 @@ pub fn load_or_create(app_data: &Path) -> Result<String, BoxError> {
     let mut bytes = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let identity: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    // NamedTempFile is owner-only. Linking it into place is atomic and refuses
-    // an existing destination, so readers never observe a partially written id.
     let mut tmp = tempfile::NamedTempFile::new_in(app_data)?;
     tmp.write_all(identity.as_bytes())?;
     tmp.as_file().sync_all()?;

@@ -1,19 +1,9 @@
-//! E2E for *form requests*: `GET /api/v1/form-requests/pending` and
-//! `POST /api/v1/form-requests/{request_id}/cancel`, plus the credential save
-//! that answers one.
-//!
-//! A real request needs a model to call `request_credential`, so the request
-//! row is inserted directly. The handlers read it back from the events table,
-//! exactly as they read one the agentic loop wrote.
-
 use crate::support::{
     base_url, count_events_of_type, db_url, seed_chat_thread_summary, unique_marker, user_client,
 };
 use serde_json::json;
 use uuid::Uuid;
 
-/// A `CredentialRequested` for `service` on a fresh chat thread. Returns the
-/// thread and the request id.
 async fn insert_credential_request(pool: &sqlx::PgPool, service: &str) -> (Uuid, Uuid) {
     let thread_id = Uuid::new_v4();
     let request_id = Uuid::new_v4();
@@ -96,7 +86,6 @@ async fn an_open_request_is_listed_until_canceled_and_cancels_once() {
     );
     assert!(!pending_ids(&client).await.contains(&request_id.to_string()));
 
-    // A second Cancel (another device, a double tap) closes nothing new.
     let resp = cancel(&client, request_id).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(

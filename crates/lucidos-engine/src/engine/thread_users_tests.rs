@@ -451,6 +451,57 @@ async fn an_overdue_gate_escalates_once_and_the_driver_keeps_the_root_thread() {
     teardown_test_db(&db_name).await;
 }
 
+/// A held thread's open question waits on its hold, not on a user. So it is
+/// neither an overdue gate nor an open gate in the listing.
+#[tokio::test]
+async fn a_held_thread_with_an_old_question_is_no_open_gate() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let snapshot = team();
+    let root = Uuid::new_v4();
+    start_thread(&bus, root, device("sam-phone")).await;
+    ask(&bus, root, "gate-h").await;
+    sqlx::query(
+        "UPDATE events SET created = now() - interval '2 days' \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAsked'",
+    )
+    .bind(root)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        overdue_gates(&pool, 24.0, &snapshot).await.unwrap().len(),
+        1
+    );
+
+    record(
+        &bus,
+        root,
+        ThreadEvent::ThreadHoldPlaced {
+            reason: "Taken over".into(),
+            hold_id: Uuid::new_v4(),
+            root_thread_id: root,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(overdue_gates(&pool, 24.0, &snapshot)
+        .await
+        .unwrap()
+        .is_empty());
+    let items = list(&pool, &snapshot, None).await.unwrap();
+    let held = items
+        .iter()
+        .find(|i| i.root_thread_id == root)
+        .expect("listed");
+    assert!(!held.gate_open && !held.needs_team);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// A thread started with a user has its sender as requester, so it has a
 /// driver like any user-started root thread.
 #[tokio::test]

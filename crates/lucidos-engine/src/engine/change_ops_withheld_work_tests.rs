@@ -1033,3 +1033,73 @@ async fn a_hold_the_agent_will_reenter_announces_no_owner_action() {
     );
     teardown_test_db(&db).await;
 }
+
+/// A hook on `ChangeProposed` refuses a turn end's proposal before anything
+/// else moves. A pending sibling on another branch survives. The work is
+/// withheld as `hook_refused`, which withdraws the open change it moved past.
+#[tokio::test]
+async fn a_refusing_hook_withholds_a_proposal_and_keeps_its_sibling() {
+    use crate::engine::git_ops::{record_hardened, record_planned, HardenTier, PlanMarkerKind};
+    use crate::test_support::{hook_refusals, install_refusing_hook};
+
+    let (pool, db) = setup_test_db().await;
+    let (engine, _workspace) = crate::engine_test_support::boot_mock_engine(&db).await;
+    let bus = &engine.event_bus;
+    let (_tmp, repo, thread_id) = thread_with_work(bus).await;
+    let repo_str = repo.to_string_lossy().to_string();
+    record_planned(
+        &pool,
+        &repo,
+        BRANCH,
+        PlanMarkerKind::Planned,
+        None,
+        None,
+        &[],
+        "abc",
+    )
+    .await
+    .expect("mark planned");
+    record_hardened(&pool, &repo, BRANCH, "abc", HardenTier::Full)
+        .await
+        .expect("record the harden marker");
+    let sibling = Uuid::new_v4();
+    let mut on_sibling = proposed(sibling, "older", &files(&["old.txt"]), false);
+    if let ThreadEvent::ChangeProposed { branch_name, .. } = &mut on_sibling {
+        *branch_name = "claude-code/sibling".into();
+    }
+    emit(bus, thread_id, on_sibling).await;
+    let open = Uuid::new_v4();
+    emit(
+        bus,
+        thread_id,
+        proposed(open, "work", &files(&["a.txt"]), false),
+    )
+    .await;
+    let asker = install_refusing_hook(bus, "require-a-plan", "ChangeProposed", "No plan.").await;
+
+    let more = files(&["a.txt", "b.txt"]);
+    let mut asked_input = input(thread_id, &repo_str, "more", &more);
+    asked_input.hardened = true;
+    let outcome = engine
+        .propose_change(asked_input, HoldReentry::default())
+        .await
+        .expect("propose");
+
+    let ProposeOutcome::Refused(refusal) = outcome else {
+        panic!("a refusing hook stops the proposal: {outcome:?}");
+    };
+    assert_eq!(refusal.reason, "No plan.");
+    assert_eq!(asker.asked().len(), 1);
+    assert_eq!(payloads(&pool, thread_id, "ChangeProposed").await.len(), 2);
+    assert_eq!(status_of(&pool, sibling).await, ChangeStatus::Pending);
+    assert_eq!(status_of(&pool, open).await, ChangeStatus::Withdrawn);
+    let withheld = payloads(&pool, thread_id, "ProposalWithheld").await;
+    assert_eq!(
+        withheld.last().expect("announced")["reason"],
+        "hook_refused"
+    );
+    assert_eq!(hook_refusals(&pool, "require-a-plan").await, 1);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

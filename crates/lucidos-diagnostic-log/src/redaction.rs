@@ -22,16 +22,11 @@ const TOKEN_SHAPES: &[(&str, &str)] = &[
     ("glpat-", "[A-Za-z0-9_-]{20,}"),
     ("AKIA", r"[0-9A-Z]{16}\b"),
     ("AIza", "[0-9A-Za-z_-]{35}"),
-    // A 1Password service account token, which reads the user's vaults.
     ("ops_", "[A-Za-z0-9_+/=-]{20,}"),
-    // A gateway's pairing secrets, which pair a device or another gateway.
     (DEVICE_PAIRING_SECRET_PREFIX, "[a-z2-7]{20,}"),
     (GATEWAY_PAIRING_SECRET_PREFIX, "[a-z2-7]{20,}"),
 ];
 
-/// Mask every well-known token format in `text`, keeping its prefix for
-/// debugging: `ghp_[REDACTED]`. A token must start at a word edge, so a
-/// longer word that merely contains a prefix (`task-…`) stays whole.
 pub fn redact_known_token_shapes(text: &str) -> String {
     static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         let shapes: Vec<String> = TOKEN_SHAPES
@@ -69,14 +64,10 @@ pub fn is_secret_arg_name(name: &str) -> bool {
     SECRET_ARG_NAME_WORDS.iter().any(|word| name.contains(word))
 }
 
-/// Whether `arg` is a flag naming a secret that its next argument carries.
 fn is_secret_flag(arg: &str) -> bool {
     arg.starts_with('-') && !arg.contains('=') && is_secret_arg_name(arg.trim_start_matches('-'))
 }
 
-/// The secrets inside one argument: any URL credential, a secret-named
-/// header's value, and the value of a secret-named `--flag=`, env assignment
-/// or URL query key. A header may also sit after a `--flag=`.
 fn named_secret_values(arg: &str) -> impl Iterator<Item = String> + '_ {
     static USERINFO: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"[A-Za-z][A-Za-z0-9+.-]*://([^/?#@\s]+)@")
@@ -107,11 +98,6 @@ fn named_secret_values(arg: &str) -> impl Iterator<Item = String> + '_ {
     userinfo.chain(headers).chain(pairs)
 }
 
-/// Secret values following flags or embedded in named arguments.
-///
-/// A flag never counts as a value, since a secret-named flag may take none.
-/// Like any guessed secret, a value shorter than [`MIN_GUESSED_SECRET_LEN`]
-/// stays unmasked.
 pub fn argv_secret_values(args: &[String]) -> Vec<String> {
     let mut values = Vec::new();
     let mut follows_secret_flag = false;
@@ -138,26 +124,16 @@ pub fn redact_postgres_secrets(s: &str) -> String {
 
 pub const MIN_REDACTABLE_SECRET_LEN: usize = 4;
 
-/// What a redacted secret value reads as.
 pub const REDACTED_MARKER: &str = "[REDACTED]";
 
-/// Replace every occurrence of each known secret value in `text` with
-/// [`REDACTED_MARKER`]. Keeps credential material out of logs and error
-/// messages that untrusted code could otherwise echo.
 pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
     match redact_secret_bytes(text.as_bytes(), secrets) {
-        // A UTF-8 secret matches only on character boundaries, and the marker
-        // is ASCII, so the result stays UTF-8.
         Some(redacted) => String::from_utf8(redacted)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
         None => text.to_string(),
     }
 }
 
-/// [`redact_secret_values`] over raw bytes, for a body that need not be text.
-/// Returns `None` when no secret occurs, so the caller keeps its own bytes.
-/// Longest secrets are scrubbed first, so a secret that is a substring of
-/// another leaves no partial match behind.
 pub fn redact_secret_bytes(bytes: &[u8], secrets: &[String]) -> Option<Vec<u8>> {
     let mut ordered: Vec<&[u8]> = secrets
         .iter()
@@ -175,8 +151,6 @@ pub fn redact_secret_bytes(bytes: &[u8], secrets: &[String]) -> Option<Vec<u8>> 
     out
 }
 
-/// Every non-overlapping `needle` in `haystack` replaced by `with`, or `None`
-/// when `needle` does not occur. `needle` must not be empty.
 fn replace_all_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Option<Vec<u8>> {
     let find = |from: usize| {
         haystack[from..]

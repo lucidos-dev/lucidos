@@ -10,7 +10,6 @@ fn device(id: &str, credential: &str, last_seen_at: Option<&str>) -> PairedDevic
     }
 }
 
-/// Apply `events` live, and append them, the way the gateway does.
 fn record(
     log: &EventLog,
     directory: &mut Directory,
@@ -63,7 +62,6 @@ fn replaying_the_log_gives_the_live_state() {
 
 #[test]
 fn a_first_pairing_creates_the_first_user_and_later_ones_join_it() {
-    // A personal gateway never has to say whose device it is.
     let directory = Directory::default();
     let events = directory.pair("d1", "Phone", "x", None).unwrap();
     assert!(matches!(&events[0], GatewayEvent::UserAdded { name, .. } if name == FIRST_USER_NAME));
@@ -157,7 +155,6 @@ fn the_device_store_migrates_once_into_one_user() {
     let owner = &directory.users[0].id;
     assert_eq!(directory.devices_of(owner), vec!["d1", "d2"]);
 
-    // The store is never read again, so a downgrade cannot revive a revoke.
     assert!(!auth::paired_devices_path(dir.path()).exists());
     let (_, again, opened) = open(dir.path(), None).unwrap();
     assert_eq!(opened, Opened::Replayed);
@@ -205,7 +202,6 @@ fn a_torn_last_line_is_cut_off_and_the_rest_replays() {
     let (log, directory, opened) = open(dir.path(), None).unwrap();
     assert_eq!(opened, Opened::RepairedTornTail);
     assert_eq!(directory, live);
-    // The next append starts on a clean line.
     record(&log, &mut live, |d| d.revoke("d1"));
     assert_eq!(reopen(dir.path()), live);
 }
@@ -217,7 +213,6 @@ fn a_failed_append_leaves_no_partial_line_behind() {
     record(&log, &mut live, |d| {
         d.pair("d1", "Phone", "digest-1", None).unwrap()
     });
-    // A full disk: half a line lands, then the write fails.
     let mut file = open_owner_only(log.path(), false).unwrap();
     let failed = append_or_cut(&mut file, |file| {
         file.write_all(br#"{"at":"2026-09-01T00:00:00Z","event":{"type":"DeviceRev"#)?;
@@ -225,7 +220,6 @@ fn a_failed_append_leaves_no_partial_line_behind() {
     });
     assert!(failed.is_err());
 
-    // The next append lands on a clean line, so the log still replays.
     record(&log, &mut live, |d| d.revoke("d1"));
     let (_, directory, opened) = open(dir.path(), None).unwrap();
     assert_eq!(opened, Opened::Replayed);
@@ -335,7 +329,6 @@ fn only_a_seen_stamp_leaves_identity_alone() {
     .changes_identity());
 }
 
-/// A log as a gateway wrote it before the user rename (ADR 0655).
 const PRE_RENAME_LOG: &str = r#"
 {"at":"2026-08-17T00:00:00Z","event":{"type":"OperatorAdded","data":{"operator_id":"o1","name":"Owner"}}}
 {"at":"2026-08-17T00:00:01Z","event":{"type":"DevicePaired","data":{"device_id":"d1","label":"Phone","credential_digest":"x","operator_id":"o1"}}}
@@ -427,7 +420,6 @@ fn a_pre_rename_log_is_rewritten_once_and_replays_to_the_same_state() {
         .join(format!("{LOG_FILE}.{PRE_USER_RENAME_SUFFIX}"));
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), PRE_RENAME_LOG);
 
-    // A second open finds nothing to rename and leaves the file alone.
     assert_eq!(reopen(dir.path()), expected);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), rewritten);
 }
@@ -443,8 +435,6 @@ fn the_rename_keeps_a_torn_tail_for_the_repair_to_cut() {
     assert_eq!(directory.users.len(), 2);
 }
 
-/// Does a plain device cookie carrying `credential` authorize against
-/// `directory`?
 fn authorizes(directory: &Directory, credential: &str) -> bool {
     const NAME: &str = "lucidos_device_test";
     let mut headers = axum::http::HeaderMap::new();
@@ -508,7 +498,6 @@ fn the_device_cut_revokes_every_device_once_and_keeps_the_rest() {
         "the relay store is byte-identical"
     );
 
-    // A device paired after the cut is never cut again.
     record(&log, &mut live, |d| {
         d.pair("d3", "Tablet", &auth::digest("cred-3"), None)
             .unwrap()

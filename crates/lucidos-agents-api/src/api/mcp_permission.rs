@@ -1,9 +1,3 @@
-//! HTTP consent endpoint for the chat MCP permission lane — the MCP counterpart
-//! of `command_permission::submit_command_consent`. The `PermissionCard`
-//! rendered for an `McpPermissionRequested` event POSTs here; the handler wakes
-//! the in-process agentic loop blocked on the entry, records any "Always allow"
-//! as a *tool grant*, and emits the paired `McpPermissionResolved`.
-
 use super::*;
 use crate::engine::mcp_permission::resolve_mcp_permission;
 use crate::engine::permission::tool_grants::AnsweredBy;
@@ -13,21 +7,10 @@ use crate::engine::thread_events::AllowScope;
 pub(super) struct McpPermissionConsentRequest {
     pub request_id: String,
     pub allowed: bool,
-    /// When `Some(_)` and `allowed`, the engine records the derived
-    /// `Mcp(server:tool)` / `Mcp(server:*)` pattern as a *tool grant*, so
-    /// future matching calls skip the prompt: `session` held by the thread,
-    /// `narrow` / `broad` standing. Absent (Allow once) records nothing.
-    /// Unknown wire values 4xx via serde, matching the engine's typed enum.
     #[serde(default)]
     pub persist_scope: Option<AllowScope>,
 }
 
-/// POST /api/v1/mcp-permission/consent — resolve a chat MCP permission card.
-/// Mirrors the command-guard consent endpoint; the waiter is the in-process
-/// agentic loop (via the entry's broadcast).
-///
-/// Thin: resolving one is `mcp_permission::resolve_mcp_permission`, which a
-/// spoken answer reaches too. This adds the actor and the wire shape.
 pub(super) async fn submit_mcp_permission_consent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -61,7 +44,6 @@ pub(super) async fn submit_mcp_permission_consent(
     )
     .await;
     if !answered {
-        // Already resolved (superseded / orphan-recovery / canceled) or unknown.
         return (
             StatusCode::NOT_FOUND,
             "No pending MCP permission with that ID",
@@ -71,7 +53,6 @@ pub(super) async fn submit_mcp_permission_consent(
     StatusCode::OK.into_response()
 }
 
-/// Route for the chat MCP permission consent — chat mirror of `/mcp/consent`.
 pub(super) fn router() -> Router<AppState> {
     Router::new().route(
         "/mcp-permission/consent",
@@ -104,7 +85,6 @@ mod tests {
             serde_json::from_str(r#"{"request_id":"r","allowed":false}"#).unwrap();
         assert_eq!(body.persist_scope, None);
 
-        // Unknown wire value rejected at the boundary (would 400 in axum).
         assert!(serde_json::from_str::<McpPermissionConsentRequest>(
             r#"{"request_id":"r","allowed":true,"persist_scope":"yolo"}"#
         )

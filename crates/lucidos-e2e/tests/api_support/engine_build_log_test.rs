@@ -1,4 +1,3 @@
-//! Build diagnostics stay reachable through the workspace HTTP router.
 use crate::support::{base_url, http_client, user_client};
 
 #[tokio::test]
@@ -32,7 +31,6 @@ async fn engine_build_log_returns_bounded_text_or_explicit_absence() {
         assert_eq!(response.headers()["cache-control"], "no-store");
     }
     let text = response.text().await.unwrap();
-    // Wire contract: 64 KiB of source bytes; lossy UTF-8 can triple them.
     assert!(text.len() <= 3 * 64 * 1024);
     if status == reqwest::StatusCode::NOT_FOUND {
         assert_eq!(text, "Build output is not available yet.");

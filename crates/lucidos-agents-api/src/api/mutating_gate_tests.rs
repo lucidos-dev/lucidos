@@ -1,24 +1,6 @@
-//! Every mutating route is accounted for, checked against the router source.
-//!
-//! This is the structural half of ADR 0169's gate, and it replaces evidence the
-//! e2e suites used to give. A run that produced no 401 only said the routes
-//! exercised that day were fine. It said nothing about the next route, which is
-//! the one that breaks: the gate is a LAYER, so a new endpoint inherits it
-//! silently, and a caller that cannot present a credential finds out in
-//! production.
-//!
-//! So the inventory below is a ratchet. A new mutating route fails this test
-//! until its author picks a side. [`is_exempt`] carries the reason when the
-//! caller cannot identify itself.
-
 use super::*;
 use std::collections::BTreeSet;
 
-/// Mutating routes whose callers CAN identify themselves, so the layer refuses
-/// an unidentified one.
-///
-/// The default. A route only leaves this list for [`is_exempt`], and only with
-/// a reason recorded there.
 const GATED_ROUTES: &[&str] = &[
     "/workspace-operations",
     "/models/spend-cap-holds/:provider/clear",
@@ -180,7 +162,7 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/background-tasks",
     "/threads/:thread_id/background-tasks/:task_id/stop",
     "/threads/:thread_id/hold",
-    "/threads/:thread_id/automation-pause", // retired alias of /hold
+    "/threads/:thread_id/automation-pause", // INVARIANT: retired alias of /hold.
     "/threads/:thread_id/cache-keep-alive",
     "/threads/:thread_id/context-ceiling",
     "/threads/:thread_id/child-reports/take",
@@ -209,9 +191,6 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/wake-decision",
     "/threads/archive",
     "/threads/archive-all",
-    // Gated twice over. This layer refuses a caller with no credential at all.
-    // The handler then insists the one it did present is a registered device
-    // (ADR 0192).
     "/threads/delete",
     "/threads/drafts",
     "/threads/rename",
@@ -248,10 +227,8 @@ const GATED_ROUTES: &[&str] = &[
     "/workspaces/:id/restart",
 ];
 
-/// Methods that write. Mirrors [`method_mutates`], which takes a `Method`.
 const MUTATING: &[&str] = &["post", "put", "delete", "patch"];
 
-/// The two sides never overlap: a route is gated or exempt, never listed twice.
 #[test]
 fn no_route_is_both_gated_and_exempt() {
     for route in GATED_ROUTES {
@@ -278,12 +255,6 @@ fn reads_and_the_preflight_pass_and_everything_else_writes() {
     }
 }
 
-/// The whole exemption list, spelled the way axum actually hands it over.
-///
-/// This is the regression test for the shape that broke 215 e2e tests:
-/// `MatchedPath` reports the FULL nested path, so an `is_exempt` written
-/// against the module's own `/devices/register` matched nothing and the
-/// device bootstrap 401'd itself. Drive the whole check, mount and all.
 #[test]
 fn exactly_the_four_classes_are_exempt_as_axum_reports_them() {
     let exempt = [
@@ -309,9 +280,6 @@ fn exactly_the_four_classes_are_exempt_as_axum_reports_them() {
     }
 }
 
-/// The mount comes off exactly once, so a route that merely repeats it is
-/// a different route. Drives `mounted_route`, which is the half the
-/// exemption test above shares and the gated test below does not.
 #[test]
 fn the_mount_is_stripped_once_and_only_from_the_front() {
     let doubled = format!(
@@ -322,33 +290,24 @@ fn the_mount_is_stripped_once_and_only_from_the_front() {
         !is_exempt(mounted_route(&doubled)),
         "{doubled} is not the bootstrap route"
     );
-    // A path with no mount at all is already the module's own spelling.
     assert!(is_exempt(mounted_route("/devices/register")));
 }
 
-/// The near-misses, which are the ones a prefix match would let through.
 #[test]
 fn a_route_that_merely_looks_exempt_is_gated() {
     for route in [
-        // Lucidos verbs living under an exempt prefix.
         "/proxy-modules/reload",
         "/webhooks/:id",
         "/webhooks",
         "/devices/:device_id",
         "/devices/:device_id/name",
         "/chat/cancel",
-        // Sibling of the exempt `/notification/read`, and the page's own
-        // call, so it stays gated.
         "/notification/native-receipt",
         "/notifications",
         "/notifications/read-all",
         "/threads/:thread_id/continue",
-        // The build slot's own route, which is why the engine mints a token.
         "/events/emit",
-        // Telemetry-shaped, but it emits DeviceVisible and its caller is
-        // the page. It was taught the header rather than exempted.
         "/device-presence",
-        // A sample of the ordinary sweep.
         "/changes/:id/apply",
         "/triggers",
         "/preferences",
@@ -357,7 +316,6 @@ fn a_route_that_merely_looks_exempt_is_gated() {
     }
 }
 
-/// Socket routes that reach nothing, so a caller needs no name to open one.
 const READ_ONLY_SOCKET_ROUTES: &[&str] = &["/ws-echo"];
 
 fn voice_uri(ticket: Option<&str>) -> axum::http::Uri {
@@ -377,9 +335,6 @@ fn matched_voice() -> String {
     format!("{}/voice", crate::net_config::API_V1_PREFIX)
 }
 
-/// The finding this layer now closes. An upgrade is a GET, and the voice
-/// socket behind it writes, so a caller naming nobody is refused before the
-/// handler runs. An ordinary GET still passes untouched.
 #[tokio::test]
 async fn an_unidentified_voice_upgrade_is_refused_though_it_is_a_get() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -415,9 +370,6 @@ async fn an_unidentified_voice_upgrade_is_refused_though_it_is_a_get() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A browser socket cannot set a header, so with none the layer takes the
-/// device a live call ticket binds. It peeks rather than spends, so the handler
-/// can still redeem. A header is never overridden by a ticket.
 #[tokio::test]
 async fn a_voice_upgrade_is_named_by_its_ticket_but_never_over_the_header() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -466,12 +418,6 @@ async fn a_voice_upgrade_is_named_by_its_ticket_but_never_over_the_header() {
 mod guard_tests {
     use super::*;
 
-    /// Every mutating route the `api` modules register, read off the source.
-    ///
-    /// The scan is shared with *route reach*, which asks a different question of
-    /// the same files (`api::route_scan`). This half keeps the writes.
-    ///
-    /// `any(...)` counts: it answers every method, mutating ones included.
     fn registered_mutating_routes() -> BTreeSet<String> {
         crate::api::route_scan::scan_api_routes()
             .into_iter()
@@ -486,8 +432,6 @@ mod guard_tests {
             .collect()
     }
 
-    /// The scanner has to actually find routes, or every assertion below passes
-    /// vacuously and the ratchet protects nothing.
     #[test]
     fn the_route_scanner_reads_the_real_router() {
         let routes = registered_mutating_routes();
@@ -501,11 +445,6 @@ mod guard_tests {
         }
     }
 
-    /// Every mutating route is on exactly one side, and adding one is a decision.
-    ///
-    /// This is what the e2e legs used to prove by not 401ing, and it holds for a
-    /// route no test exercises. A new endpoint fails here until its author says
-    /// whether its caller can identify itself.
     #[test]
     fn every_mutating_route_is_gated_or_deliberately_exempt() {
         let registered = registered_mutating_routes();
@@ -529,11 +468,6 @@ mod guard_tests {
         );
     }
 
-    /// An exemption that names nothing is one nobody can see is dead.
-    ///
-    /// It fails LOUDLY on a rename, which is the case that matters. The route
-    /// carries on under its new name, silently gated, while the exemption sits
-    /// there still looking correct and its caller starts getting 401s.
     #[test]
     fn every_exemption_names_a_route_that_exists() {
         let registered = registered_mutating_routes();
@@ -545,11 +479,6 @@ mod guard_tests {
         }
     }
 
-    /// Every socket route is on exactly one side, and adding one is a decision.
-    ///
-    /// The voice socket slipped past [`every_mutating_route_is_gated_or_deliberately_exempt`]
-    /// because an upgrade is a GET. A file that takes a `WebSocketUpgrade` fails
-    /// here until each of its routes says whether its socket writes.
     #[test]
     fn every_socket_route_is_classified() {
         let api_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api");

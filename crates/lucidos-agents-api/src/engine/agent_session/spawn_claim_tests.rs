@@ -12,9 +12,6 @@ use crate::runtime::CodingAgent;
 
 type Sessions = Arc<Mutex<HashMap<Uuid, AgentSession>>>;
 
-/// Two spawns for one thread. Spawn A claims, then parks where the real spawn
-/// does its startup work (worktree, semaphore, process). Spawn B arrives in that
-/// gap. Before the claim inserted its entry, B found the thread free too.
 #[tokio::test]
 async fn a_spawn_that_has_not_started_yet_refuses_a_second_spawn() {
     let sessions: Sessions = Arc::default();
@@ -71,8 +68,6 @@ async fn a_claimed_entry_is_starting_and_owns_the_channel() {
     assert_eq!(session.coding_agent, CodingAgent::Codex);
 }
 
-/// The commands API reads a starting entry, so a request's pick shows from the
-/// claim on. A pick the request left out keeps the previous session's.
 #[tokio::test]
 async fn a_starting_entry_names_the_requested_model_and_keeps_the_rest() {
     let mut sessions = HashMap::new();
@@ -126,8 +121,6 @@ async fn a_running_session_takes_the_stop_as_an_interrupt() {
     assert!(interrupted.await.is_ok());
 }
 
-/// A recovery spawn (hardening, a merge session, a re-attached conflict duty)
-/// used to skip the check and insert over whatever held the thread.
 #[tokio::test]
 async fn no_spawn_replaces_a_live_session() {
     let mut sessions = HashMap::new();
@@ -149,9 +142,6 @@ async fn no_spawn_replaces_a_live_session() {
     ));
 }
 
-/// A real input never joins a hidden keep-alive turn. A live keep-alive run
-/// reads as a hold, so a real claim waits for it to end, and a second
-/// keep-alive skips.
 #[tokio::test]
 async fn a_live_keep_alive_run_holds_its_thread_against_real_input() {
     let mut sessions = HashMap::new();
@@ -184,8 +174,6 @@ async fn a_live_keep_alive_run_holds_its_thread_against_real_input() {
     assert!(!sessions[&thread].keep_alive);
 }
 
-/// `finalize_direct_agent` marks the process exited first, then works in the
-/// worktree. A spawn must wait for it to let go, not start beside it.
 #[tokio::test]
 async fn a_finishing_run_holds_its_thread_until_it_lets_go() {
     let mut sessions = HashMap::new();
@@ -221,9 +209,6 @@ async fn a_finishing_run_holds_its_thread_until_it_lets_go() {
     );
 }
 
-/// ADR 0249 accepted that a child's wake starts a turn in the worktree a
-/// Tier-2 apply is resetting. The apply now holds the thread, and the wake's
-/// claim waits until the apply lets go.
 #[tokio::test]
 async fn a_spawn_waits_while_an_apply_resets_the_worktree() {
     let mut sessions = HashMap::new();
@@ -262,8 +247,6 @@ async fn a_spawn_waits_while_an_apply_resets_the_worktree() {
     );
 }
 
-/// The apply's own merge session takes the thread over in one step. A spawn
-/// waiting on the hold wakes and finds a live run, so its input routes there.
 #[tokio::test]
 async fn an_apply_hands_the_thread_to_its_merge_session_without_a_gap() {
     let mut sessions = HashMap::new();
@@ -304,8 +287,6 @@ async fn an_apply_hands_the_thread_to_its_merge_session_without_a_gap() {
     ));
 }
 
-/// I4: only a real run settles the handoff a session past its ceiling owes.
-/// A keep-alive claim never does, so a beat never ends the session it keeps.
 #[test]
 fn only_a_run_claim_settles_an_owed_ceiling_handoff() {
     assert!(ClaimFor::Run.settles_owed_handoff());
@@ -313,8 +294,6 @@ fn only_a_run_claim_settles_an_owed_ceiling_handoff() {
     assert!(!ClaimFor::Apply.settles_owed_handoff());
 }
 
-/// I4: the claim settles the owed handoff before it reads the backend, which
-/// a pending handoff names.
 #[test]
 fn the_claim_settles_the_owed_handoff_before_it_reads_the_backend() {
     let src = include_str!("../../../../lucidos-engine/src/engine/session_claim.rs");
@@ -328,8 +307,6 @@ fn the_claim_settles_the_owed_handoff_before_it_reads_the_backend() {
     assert!(src[..settle].contains("if purpose.settles_owed_handoff() {"));
 }
 
-/// A Stop that cancels a spawn during startup ends the turn. At shutdown the
-/// sweep owns the terminal, so nothing is emitted.
 #[tokio::test]
 async fn a_stop_cancelled_startup_ends_the_turn_except_at_shutdown() {
     use super::SpawnClaimExt;

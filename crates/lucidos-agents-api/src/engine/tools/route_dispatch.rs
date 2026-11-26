@@ -1,15 +1,3 @@
-//! A *route-backed tool*: a manifest domain's grouped LLM tool that runs the
-//! route its CLI calls, rather than a hand-written handler (ADR 0751).
-//!
-//! The action becomes the request the generated `lucidos` command sends: the
-//! operation's method and path, its args in path, query or body. The request
-//! carries the origin token a `lucidos` command from this thread's bash tool
-//! would carry. So every gate on the route sees one caller for the tool and
-//! for the CLI, and the two cannot drift apart.
-//!
-//! The request runs in-process through the engine's own `/api/v1` router,
-//! with every layer a live request passes. There is no network hop.
-
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use serde_json::{Map, Value};
@@ -22,28 +10,21 @@ use crate::core::subprocess_origin::{
 };
 use crate::engine::LucidosEngine;
 
-/// The most of a route's answer a tool result carries.
 const ANSWER_LIMIT: usize = 4 * 1024 * 1024;
 
-/// The route-backed domain whose grouped tool is `tool_name`, if any.
 pub(crate) fn route_backed_domain(tool_name: &str) -> Option<&'static Domain> {
     domains()
         .iter()
         .find(|d| d.llm && d.tool_name == tool_name && d.llm_execution == LlmExecution::Route)
 }
 
-/// The request one tool action maps to, as the generated CLI would send it.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RouteRequest {
     pub(crate) method: Method,
-    /// Path and query after `/api/v1`.
     pub(crate) uri: String,
-    /// `None` on a `GET`. Every other method sends a JSON object.
     pub(crate) body: Option<Value>,
 }
 
-/// Map `args` onto the request for the action they name. A refusal is the
-/// tool's error text.
 pub(crate) fn route_request(domain: &Domain, args: &Value) -> Result<RouteRequest, String> {
     let action = args["action"].as_str().unwrap_or("").trim();
     let op = domain
@@ -97,7 +78,6 @@ fn unknown_action(domain: &Domain, action: &str) -> String {
     }
 }
 
-/// A path or query value as its text, or `None` when absent or null.
 fn scalar(arg: &Arg, value: &Value) -> Result<Option<String>, String> {
     match value {
         Value::Null => Ok(None),
@@ -115,9 +95,6 @@ fn body_value(arg: &Arg, value: &Value) -> Result<Value, String> {
     }
 }
 
-/// The headers a `lucidos` command run from `thread_id`'s bash tool carries:
-/// the thread-bound origin token, with the ambient trigger fire's depth and
-/// trigger, as `build_tool_env_vars` mints them.
 pub(crate) fn origin_headers(thread_id: uuid::Uuid) -> HeaderMap {
     let trigger = crate::scheduler::user_tasks::current_trigger_id();
     let depth = crate::scheduler::user_tasks::current_event_trigger_depth();
@@ -132,9 +109,6 @@ pub(crate) fn origin_headers(thread_id: uuid::Uuid) -> HeaderMap {
     headers
 }
 
-/// What the agent reads for a route's answer. A refusal that prepared a
-/// permission request tells it how to ask the owner. An `ApiResult` refusal
-/// is an error even under a 2xx status.
 pub(crate) fn tool_result(request: &RouteRequest, status: StatusCode, answer: &str) -> ToolOutcome {
     let answer = answer.trim();
     let json: Value = serde_json::from_str(answer).unwrap_or_default();
@@ -160,7 +134,6 @@ pub(crate) fn tool_result(request: &RouteRequest, status: StatusCode, answer: &s
     ))
 }
 
-/// How the Lucidos Agent asks for a permission a route prepared.
 fn permission_text(request_id: &str) -> String {
     format!(
         "Error: Nothing changed: this needs the owner's permission. Call {} with one \
@@ -190,7 +163,6 @@ fn http_request(request: &RouteRequest, headers: HeaderMap) -> Result<Request<Bo
     Ok(built)
 }
 
-/// Send `request` through `router` with `headers`, and read its answer.
 pub(crate) async fn send(
     router: axum::Router,
     request: &RouteRequest,
@@ -209,7 +181,6 @@ pub(crate) async fn send(
 
 #[easy_ext::ext(RouteDispatchExt)]
 pub(crate) impl LucidosEngine {
-    /// Run one action of a route-backed `domain` as `thread_id`'s CLI would.
     async fn execute_route_backed(
         &self,
         domain: &Domain,

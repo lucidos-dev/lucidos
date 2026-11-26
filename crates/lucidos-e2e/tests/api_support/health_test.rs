@@ -37,7 +37,6 @@ async fn health_has_expected_fields() {
         .await
         .expect("Invalid JSON");
 
-    // All required fields must be present and non-null
     for field in &[
         "status",
         "workspace",
@@ -46,15 +45,8 @@ async fn health_has_expected_fields() {
         "engine_version",
         "release",
         "release_dirty",
-        // packaged-mode signal — drives the frontend's Restart routing.
         "packaged",
-        // Is the workspace database answering? The client renders one degraded
-        // surface off this instead of inferring an outage from N failed loads
-        // (ADR 0037). Absent would read as "reachable" on the client, so its
-        // presence is the contract.
         "database_reachable",
-        // Why it is not: the slowness warning names a used-up pool apart from
-        // a stuck database (ADR 0301).
         "database_pool_exhausted",
     ] {
         assert!(
@@ -62,25 +54,14 @@ async fn health_has_expected_fields() {
             "Missing field: {field}"
         );
     }
-    // The e2e engine is built from the source checkout (it serves the built
-    // `dist/` via LUCIDOS_STATIC_DIR, but that is no longer the packaged signal —
-    // ADR 0014 makes dev engines set it too). `is_packaged()` keys off the
-    // presence of a source checkout, so a source-built engine is `false`.
     assert_eq!(
         body["packaged"], false,
         "e2e engine is not a packaged build"
     );
-    // The suite only runs against a booted engine, which by definition connected
-    // and migrated, so the honest value here is `true`. Asserting it also pins the
-    // type: the client treats anything other than an explicit `false` as reachable,
-    // so a stringly-typed "true" would silently mean the same thing and the
-    // degraded surface would never fire.
     assert_eq!(
         body["database_reachable"], true,
         "a booted e2e engine can reach its database"
     );
-    // Null where the host can sandbox agents, else the reason the sandbox
-    // banner quotes.
     let sandbox = &body["agent_sandbox_unavailable"];
     assert!(
         body.get("agent_sandbox_unavailable").is_some()

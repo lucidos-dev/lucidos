@@ -67,7 +67,6 @@ pub(crate) impl LucidosEngine {
                 let fit = self
                     .widget_fit_notes([manifest.as_str()], thread_id, device_id)
                     .await;
-                // A reply draws it, so the agent embeds it there (ADR 0466).
                 Ok(format!(
                     "Created widget '{name}' at {path} (commit: {commit}). Embed it in your \
                      reply to show it: ![{name}](app:{id}){lint}{fit}"
@@ -89,7 +88,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The `list_apps` tool's answer. Widgets are not apps here (ADR 0402).
 fn list_apps_text(
     app_manager: &crate::core::AppManager,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -106,14 +104,6 @@ fn list_apps_text(
         .join("\n"))
 }
 
-/// The `load_knowhow` tool's answer, given the thread's loaded knowhow.
-///
-/// The full formatted body, or the not-found sentinel for a miss. An id that
-/// names no doc falls back to an intent, so running an intent is loading it.
-/// A doc wins an id clash. A doc this turn's block already holds, unchanged on
-/// disk, gets the short kept result instead (ADR 0425). Either way the
-/// recorded pair is what the next turn's fold reads, so nothing else is
-/// written.
 pub(crate) fn load_knowhow_impl(
     kh_dirs: &crate::core::knowhow::KnowhowDirs,
     system_dir: Option<&std::path::Path>,
@@ -135,8 +125,6 @@ pub(crate) fn load_knowhow_impl(
     })
 }
 
-/// An intent as `load_knowhow` returns it: the intent body, then the docs its
-/// `knowhow:` names, then, for an app intent, every doc in its app's knowhow.
 fn load_intent_body(
     kh_dirs: &crate::core::knowhow::KnowhowDirs,
     system_dir: Option<&std::path::Path>,
@@ -163,7 +151,6 @@ fn load_intent_body(
     Some(body)
 }
 
-/// The `unload_knowhow` tool's answer. The recorded pair is the unload.
 pub(crate) fn unload_knowhow_impl(
     loaded: &[crate::engine::loaded_knowhow::LoadedKnowhow],
     args: &serde_json::Value,
@@ -220,7 +207,6 @@ mod tests {
         load_knowhow_impl(&dirs(local), None, local, &[], &json!({ "id": "my-doc" })).unwrap()
     }
 
-    /// A workspace `data/` dir whose knowhow dirs resolve app-scoped ids.
     struct DataDir {
         _tmp: tempfile::TempDir,
         data: std::path::PathBuf,
@@ -311,7 +297,6 @@ mod tests {
         assert!(crate::core::knowhow::is_not_found_body(&body), "{body}");
     }
 
-    /// An id that loads a doc today keeps loading that doc.
     #[test]
     fn a_knowhow_doc_wins_over_an_intent_with_the_same_id() {
         let ws = DataDir::new();
@@ -365,7 +350,6 @@ mod tests {
         }
     }
 
-    /// Keeping a doc the block already carries costs no body (ADR 0425).
     #[test]
     fn reloading_a_doc_the_block_holds_returns_the_kept_result() {
         let tmp = tempfile::tempdir().unwrap();
@@ -385,7 +369,6 @@ mod tests {
         );
     }
 
-    /// The agent must never get no body while none is in front of it.
     #[test]
     fn reloading_returns_the_body_when_the_block_does_not_hold_it() {
         let tmp = tempfile::tempdir().unwrap();

@@ -10,7 +10,6 @@ struct ScenarioFile {
 struct Scenario {
     name: String,
     thread_type: String,
-    // Deserialized for fixture readability; the test code never inspects it.
     #[allow(dead_code)]
     description: String,
     #[serde(default)]
@@ -131,7 +130,6 @@ mod guard_tests {
                     .as_ref()
                     .and_then(|e| e.expected_actions.as_ref())
                 {
-                    // Derive a reasonable status from thread state
                     let status = if current_section == ArchiveState::Inbox {
                         match thread_type {
                             ThreadType::CodingAgent => ThreadStatus::Waiting,
@@ -145,15 +143,11 @@ mod guard_tests {
                         status,
                         current_section,
                         has_pending_changes,
-                        false, // descendants_block_archive: the cross-validation contract exhausts
-                        // this axis; this scenario file covers no-blocking-descendants only
-                        false, // has_live_event_waits: no scenario parks on a subscription
-                        false, // has_unsent_draft: scenarios predate the draft layer
-                        false, // is_saved: scenarios assert the close set only
+                        false,
+                        false,
+                        false,
+                        false,
                     );
-                    // Scenarios assert the CLOSE set (archive/apply/discard). The
-                    // Save/Unsave toggle, the DiscardDraft layer and the standing
-                    // apply all postdate these fixtures, so the comparison drops them.
                     let action_strs: Vec<String> = actions
                         .iter()
                         .filter_map(|a| match a {
@@ -184,8 +178,6 @@ mod guard_tests {
             if let Some(inv) = &scenario.assert_invariant {
                 let tt = parse_thread_type(&inv.thread_type);
                 let forbidden = ArchiveState::parse(&inv.forbidden_section);
-                // "waiting" no longer exists as a section — parse maps it to Default.
-                // Only check invariants for sections that still exist.
                 if inv.forbidden_section == "waiting" {
                     continue;
                 }

@@ -1,9 +1,3 @@
-//! Runtime filesystem path helpers.
-//!
-//! Resolves the repo root from `current_exe()` instead of compile-time
-//! `CARGO_MANIFEST_DIR`, so a project rename after build doesn't strand
-//! script-spawns and asset reads at a path that no longer exists.
-
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -11,12 +5,12 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const REPO_MARKER: &str = "scripts/web-dev.sh";
 
-/// Where a workspace keeps its coding-agent worktrees, relative to its root.
+/// INVARIANT: Where a workspace keeps its coding-agent worktrees, relative to its root.
 /// The gateway's `stack::path_is_in_cc_worktree` and `scripts/lib/workspace.sh`
 /// spell the same two components and cannot import this.
 pub const WORKTREES_SUBPATH: &str = ".lucidos/worktrees";
 
-/// Does `path` lie inside a coding-agent worktree — one of the
+/// INVARIANT: Does `path` lie inside a coding-agent worktree — one of the
 /// `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
 /// coding-agent thread?
 ///
@@ -39,9 +33,6 @@ pub fn path_is_in_cc_worktree(path: &Path) -> bool {
     comps.windows(marker.len()).any(|w| w == marker.as_slice())
 }
 
-/// The per-user cache root every Lucidos engine on this machine shares:
-/// `$XDG_CACHE_HOME/lucidos`, else `$HOME/.cache/lucidos`. An empty value reads
-/// as unset. `None` when neither is usable, as under a bare service manager.
 pub fn user_cache_root_from(xdg_cache_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     let base = match xdg_cache_home.filter(|d| !d.is_empty()) {
         Some(dir) => PathBuf::from(dir),
@@ -50,9 +41,6 @@ pub fn user_cache_root_from(xdg_cache_home: Option<&str>, home: Option<&str>) ->
     Some(base.join("lucidos"))
 }
 
-/// [`user_cache_root_from`] over this process's environment, made a storage
-/// root. `None` also when it cannot be made owner-only, and every caller then
-/// runs without the shared cache, as it does with no root at all.
 pub fn user_cache_root() -> Option<PathBuf> {
     let root = user_cache_root_from(
         std::env::var("XDG_CACHE_HOME").ok().as_deref(),
@@ -67,8 +55,6 @@ pub fn user_cache_root() -> Option<PathBuf> {
     }
 }
 
-/// Every gateway data dir on this machine: each install the installs scan
-/// finds, plus the one this process's environment names.
 pub fn gateway_data_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<_> = lucidos_installs::scan_this_machine(None)
         .installs
@@ -81,8 +67,6 @@ pub fn gateway_data_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Every workspace root the gateway registries in `data_dirs` list. A registry
-/// that is missing or unreadable lists none.
 pub fn registered_workspace_dirs(data_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for data in data_dirs {
@@ -101,8 +85,6 @@ pub fn registered_workspace_dirs(data_dirs: &[PathBuf]) -> Vec<PathBuf> {
     roots
 }
 
-/// Resolve the Lucidos repo root from the running binary's path.
-/// Cached for the process lifetime; called from polled handlers (`health`).
 pub fn repo_root() -> Result<PathBuf, BoxError> {
     static CACHED: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     CACHED
@@ -124,23 +106,6 @@ fn compute_repo_root() -> Result<PathBuf, String> {
     })
 }
 
-/// The Lucidos repo root above `exe`, or `None` when there isn't one.
-///
-/// Walks ancestors rather than counting `..` hops, so it is independent of HOW
-/// DEEP the binary sits under the checkout AND of which top-level directory it
-/// sits in. That is load-bearing, not incidental: the dev launcher publishes the
-/// engine to `.launch/<profile>/<variant>/lucidos-engine` (ADR 0022, relocated
-/// out of `target/` so `cargo clean` cannot remove the running system's CLI),
-/// and every dev-mode resource lookup (`scripts/`, `system-knowhow/`, the SDK
-/// bundle) resolves through here. The walk is also exactly what makes that
-/// relocation safe: only "somewhere inside the checkout" is required, never a
-/// particular parent. An app bundle is a boundary even inside a checkout.
-/// Split out from [`compute_repo_root`] so the
-/// depth-independence is testable without touching `current_exe()`.
-///
-/// The gateway has a hand-synced copy (`crates/lucidos-gateway/src/build_id.rs`
-/// `repo_root_above`) — ADR 0014 §1 keeps it free of any dependency on the
-/// engine. Keep the two in step.
 pub(crate) fn repo_root_above(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
         .take_while(|a| a.extension().is_none_or(|ext| ext != "app"))
@@ -148,7 +113,7 @@ pub(crate) fn repo_root_above(exe: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Was this engine launched from a Lucidos **source checkout**?
+/// INVARIANT: Was this engine launched from a Lucidos **source checkout**?
 ///
 /// The one predicate for "can anything here edit the Lucidos platform's own
 /// code". A dev engine is built from source and resolves [`repo_root`]; a
@@ -174,7 +139,7 @@ pub fn has_lucidos_source() -> bool {
     repo_root().is_ok()
 }
 
-/// Root for startup and recovery: the runtime checkout when present, otherwise
+/// INVARIANT: Root for startup and recovery: the runtime checkout when present, otherwise
 /// this workspace. A build machine's compile-time source path is never authority.
 pub fn repo_or_workspace_root() -> PathBuf {
     repo_root().unwrap_or_else(|_| {
@@ -186,9 +151,6 @@ fn workspace_root_fallback(workspace: Option<PathBuf>) -> PathBuf {
     workspace.unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Path to a script under `<repo_root>/scripts/<name>`. Errors with the
-/// resolved path when the script is missing, so spawn failures surface a
-/// useful message rather than a bare `No such file or directory`.
 pub fn script(name: &str) -> Result<PathBuf, BoxError> {
     let path = repo_root()?.join("scripts").join(name);
     if !path.exists() {
@@ -219,15 +181,6 @@ mod tests {
         assert_eq!(workspace_root_fallback(None), PathBuf::from("."));
     }
 
-    /// The checkout is found by WALKING ancestors, at any depth and under any
-    /// top-level directory. The dev launcher publishes the engine three
-    /// directories below the checkout root, at `.launch/<profile>/<variant>/`
-    /// (ADR 0022, relocated out of `target/` by ADR 0063), and every
-    /// dev-mode resource lookup (`scripts/`, `system-knowhow/`, the SDK bundle)
-    /// hangs off this. A fixed-hop-count resolver would silently stop finding
-    /// the checkout, which is exactly how the SDK bundle fell back to its stub;
-    /// a resolver anchored on `target/` would have blocked the relocation that
-    /// keeps `cargo clean` from deleting the running system's `lucidos` CLI.
     #[test]
     fn repo_root_above_is_independent_of_binary_depth() {
         let scratch = tempfile::tempdir().unwrap();
@@ -270,25 +223,17 @@ mod tests {
         );
     }
 
-    /// Regression cover for the 2026-07-26 incident: the engine served a `dist/`
-    /// inside an orphaned coding-agent worktree, so the build-watch republished a
-    /// different directory and every frontend Apply silently did nothing.
     #[test]
     fn flags_coding_agent_worktree_paths() {
         for p in [
             "/w/dev/.lucidos/worktrees/thread-abc",
             "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist",
-            // The PUBLISHED launch path (ADR 0063). It moved out of `target/`
-            // so a `cargo clean` could not delete the CLI; the worktree
-            // refusal must not have moved with it.
             "/w/dev/.lucidos/worktrees/thread-abc/.launch/debug/plain/lucidos-engine",
         ] {
             assert!(path_is_in_cc_worktree(Path::new(p)), "{p}");
         }
     }
 
-    /// Must not fire on a real checkout, on a directory merely NAMED `worktrees`,
-    /// or on the engine's own `.lucidos/served-frontend` snapshot dir.
     #[test]
     fn leaves_other_paths_alone() {
         for p in [
@@ -301,8 +246,6 @@ mod tests {
         }
     }
 
-    /// Pure path test — an orphaned worktree is often already deleted, which is
-    /// exactly when the stranded-Apply explanation is still needed.
     #[test]
     fn does_not_require_the_path_to_exist() {
         assert!(path_is_in_cc_worktree(Path::new(

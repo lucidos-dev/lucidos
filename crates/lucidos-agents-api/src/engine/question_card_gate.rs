@@ -31,16 +31,12 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Starts every refusal, and is how the query knows one was already sent.
 const REFUSAL_MARKER: &str = "Question card not shown.";
 
-/// Follows the marker in an artifact refusal, so the query can tell it apart.
 const ARTIFACT_REFUSAL_LEAD: &str = "Since the user's last input you saved";
 
 const REFUSAL_WINDOW_CHARS: i32 = 200;
 
-/// Where a refusal sends content the user must read in full. Only the chat
-/// tool has the field, so every agent reads the condition.
 macro_rules! card_message_hint {
     () => {
         "in the card's `message` field if your tool has one"
@@ -49,10 +45,9 @@ macro_rules! card_message_hint {
 #[cfg(test)]
 const CARD_MESSAGE_HINT: &str = card_message_hint!();
 
-/// How much of what the user read a refusal quotes.
 const QUOTED_READ_CHARS: usize = 600;
 
-/// What every refusal says the user read since their last input: the words
+/// INVARIANT: What every refusal says the user read since their last input: the words
 /// themselves, or that they read nothing. The agent's own context holds more
 /// than that, since the API hands it back its hidden reasoning.
 fn what_they_read(words: &str) -> String {
@@ -68,8 +63,6 @@ fn what_they_read(words: &str) -> String {
     }
 }
 
-/// How a refusal ends. Each question is one the agent can answer from what the
-/// refusal quoted, never one about the user's screen.
 fn send_again_unchanged(words: &str) -> &'static str {
     if words.trim().is_empty() {
         "If they need nothing more from you, send the same question again unchanged: it will not \
@@ -80,31 +73,18 @@ fn send_again_unchanged(words: &str) -> &'static str {
     }
 }
 
-/// A refusal that quotes the user's input reads like news of a new message.
-/// An agent once asked the user to resend a reply it had already acted on.
 const NOTHING_NEW: &str = "Nothing new has arrived since. This is not a new message. Do not \
      ask the user to resend anything.";
 
-/// Long enough to recognise the input, short enough to stay one line.
 const QUOTED_INPUT_CHARS: usize = 200;
 
 const NOTE_SIZED_CHARS: usize = 600;
 
-/// Why a card is refused. Each reason carries its own tool result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// Tool work went unreported. `input` is the user's last input, quoted so
-    /// it never reads as new. `words` is all the user read since.
     OwesWords { input: LastInput, words: String },
-    /// The card points "above", and all the user read since their last input
-    /// is `words`, too short to hold what it points at.
     PointsAboveAtNothing { words: String },
-    /// The agent saved these artifacts since the user's last input, and
-    /// neither its words nor the card show or link them. `words` is all the
-    /// user read since.
     ArtifactNotShown { paths: Vec<String>, words: String },
-    /// The last words before the card were a progress note: `note` is all the
-    /// user read of what the agent wrote there.
     NoteShownAsSummary { note: String },
 }
 
@@ -197,8 +177,6 @@ impl Refusal {
     }
 }
 
-/// Everything the card renders, one field per line. `questions` is the
-/// tool's `questions` array.
 fn card_text(questions: &serde_json::Value) -> String {
     let input = serde_json::json!({ "questions": questions });
     let mut text = String::new();
@@ -216,8 +194,6 @@ fn card_text(questions: &serde_json::Value) -> String {
     text
 }
 
-/// The card's longest question text. Unlike an option, it reads like a reply.
-/// Several short questions never add up to one.
 fn longest_card_question(questions: &serde_json::Value) -> String {
     let input = serde_json::json!({ "questions": questions });
     crate::engine::question_parsing::parse_ask_user_question_inputs(&input)
@@ -227,8 +203,6 @@ fn longest_card_question(questions: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-/// Whether `card` says "above" as a whole word. "None of the above" points
-/// at the card's own options, so it never counts.
 fn says_above(card: &str) -> bool {
     card.to_lowercase()
         .replace("of the above", "")
@@ -236,8 +210,6 @@ fn says_above(card: &str) -> bool {
         .any(|word| word == "above")
 }
 
-/// A file saved as an artifact, the kind an agent saves for the user. An app
-/// asset under `apps/` is saved for the app, not for the chat.
 fn is_shown_artifact(path: &str) -> bool {
     path.starts_with("artifacts/")
 }
@@ -248,12 +220,6 @@ fn is_picture(path: &str) -> bool {
         .is_some_and(|(_, ext)| EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
 }
 
-/// Whether `text` holds a markdown target for `path`, as the CLI prints it or
-/// with the leading `data/` the renderer also accepts. A picture needs the
-/// image form, `![...](path)`: a plain link does not draw it. Any other file
-/// needs a link, `[...](path)`. A bare path counts for neither. A path with a
-/// space must be angle-bracketed, since markdown ends a bare target there. A
-/// fragment such as the CLI's image size hint may follow the path.
 fn shows_artifact(text: &str, path: &str) -> bool {
     let needs_image = is_picture(path);
     let bare_ok = !path.contains(char::is_whitespace);
@@ -276,9 +242,6 @@ fn shows_artifact(text: &str, path: &str) -> bool {
     })
 }
 
-/// For the `](` at byte `at` in `text`: `Some(true)` when it ends an image's
-/// `![...]`, `Some(false)` when it ends a link's `[...]`, `None` when no `[`
-/// opens it.
 fn target_kind(text: &str, at: usize) -> Option<bool> {
     text[..at]
         .rfind('[')
@@ -302,8 +265,6 @@ fn without_link_targets(field: &str) -> String {
     out
 }
 
-/// Tools whose calls are not work the user needs to hear about: the question
-/// tools themselves, and the todo list.
 fn not_work() -> Vec<&'static str> {
     let mut names = vec![
         crate::llm::tool_names::ASK_USER_QUESTION,
@@ -316,13 +277,9 @@ fn not_work() -> Vec<&'static str> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LastInput {
-    /// Nothing the user said is on the thread yet.
     None,
-    /// A message or an injected follow-up, with its text.
     Message(String),
-    /// A card answer that only picked options.
     Picked,
-    /// Text the user typed into a card, with or without a pick.
     Typed(String),
 }
 
@@ -338,7 +295,6 @@ impl LastInput {
         }
     }
 
-    /// The input named and quoted, for a refusal. `None` when it has no text.
     fn quoted(&self) -> Option<String> {
         match self {
             Self::Typed(text) if !text.trim().is_empty() => Some(format!(
@@ -353,7 +309,6 @@ impl LastInput {
     }
 }
 
-/// `text` on one line, cut to [`QUOTED_INPUT_CHARS`].
 fn quote(text: &str) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match line.char_indices().nth(QUOTED_INPUT_CHARS) {
@@ -362,31 +317,19 @@ fn quote(text: &str) -> String {
     }
 }
 
-/// What happened on the thread since the user's last input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SinceLastInput {
     pub(crate) last_input: LastInput,
-    /// Tool calls after the agent's last words, or after the input if it said
-    /// nothing. "Let me check the log" reports nothing the log said.
     pub(crate) unreported_tool_calls: i64,
-    /// A card was refused since that input, for any reason.
     pub(crate) refused: bool,
-    /// One of those refusals asked for an artifact.
     pub(crate) artifact_refused: bool,
-    /// Everything the agent wrote since that input: all the user has read.
     pub(crate) words: String,
-    /// Artifacts this thread saved through the data API since that input.
     pub(crate) saved_artifacts: Vec<String>,
-    /// The card carries a `message`, which the user reads in full above it.
     pub(crate) card_has_message: bool,
-    /// The progress note the user read last, when it is the latest of the
-    /// agent's words since that input.
     pub(crate) last_progress_note: Option<String>,
 }
 
 impl SinceLastInput {
-    /// Fold in the chat round's own text, which may not be in the events yet.
-    /// Words written after the tool work report it.
     fn with_round_text(mut self, round_text: &str) -> Self {
         if round_text.trim().is_empty() {
             return self;
@@ -406,8 +349,6 @@ impl SinceLastInput {
         self
     }
 
-    /// Fold in the chat round: its text, and its last progress note when the
-    /// text ends on it. Prose after the note is what the user read last.
     fn with_round(self, round: ChatRound<'_>) -> Self {
         let mut since = self.with_round_text(round.text);
         since.last_progress_note = round
@@ -418,8 +359,6 @@ impl SinceLastInput {
         since
     }
 
-    /// Fold in the card's `message`, which the user reads as a reply shown
-    /// just above the card. So the card may also point "above" at it.
     fn with_card_message(self, message: &str) -> Self {
         if message.trim().is_empty() {
             return self;
@@ -430,8 +369,6 @@ impl SinceLastInput {
         }
     }
 
-    /// A card `question` longer than any note reports the tool work before
-    /// it.
     fn with_card_question(mut self, question: &str) -> Self {
         if question.trim().chars().count() >= NOTE_SIZED_CHARS {
             self.unreported_tool_calls = 0;
@@ -480,7 +417,7 @@ pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
     })
 }
 
-/// The refusal for the card `tool_use_id` is about to raise on `thread_id`,
+/// INVARIANT: The refusal for the card `tool_use_id` is about to raise on `thread_id`,
 /// or `None` to show it. `questions` is the tool's `questions` array,
 /// `message` the chat card's `message`, and `round` whatever the chat round
 /// wrote before the call, with the progress notes among it.
@@ -523,8 +460,6 @@ pub(crate) async fn refuse_card(
     }
 }
 
-/// What the chat round wrote before its card. The text may not be in the
-/// events yet, and the progress notes among it are never marked there.
 #[derive(Clone, Copy)]
 pub(crate) struct ChatRound<'a> {
     pub(crate) text: &'a str,
@@ -543,7 +478,6 @@ pub(crate) async fn refuse_coding_agent_card(
     refuse_card(pool, thread_id, tool_use_id, questions, None, None).await
 }
 
-/// `None` when the card was already shown.
 async fn read_since_last_input(
     pool: &PgPool,
     thread_id: Uuid,

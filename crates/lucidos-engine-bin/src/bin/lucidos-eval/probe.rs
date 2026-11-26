@@ -1,38 +1,15 @@
-//! What a probe resolved to.
-//!
-//! Five values, and none of them names a mechanism (ADR 0110 decision 5). A
-//! probe passed, or it failed in one of three ways, or it measured nothing.
-//!
-//! The three failures are kept apart because they are not equally bad. An agent
-//! that asks costs a round. One that says out loud it no longer has the fact
-//! costs a round and some trust. One that gets it wrong and says nothing is the
-//! failure the whole benchmark exists to see.
-//!
-//! ADR 0087 split PASSING four ways as well, by the route that explained it:
-//! still in the prompt, read back from notes, fetched by a recovery call, or
-//! unattributable. That vocabulary is retired. Two of the four were arm labels
-//! rather than results. The other two had the harness guessing which tool call
-//! explained a pass, by matching a regex it wrote itself. The verbatim capture
-//! answers the same question exactly, by showing the call.
-
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Fact;
 
-/// The outcome vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
-    /// The fact survived, whatever route kept it there.
     Pass,
-    /// The agent asked the user instead of knowing. A visible failure.
     Asked,
-    /// The agent said it no longer had the fact. A visible failure.
     LostLoud,
-    /// Wrong, and silent about it. The failure that matters most.
     LostSilent,
-    /// An upstream task failed, so this probe measured nothing.
     Void,
 }
 
@@ -56,22 +33,14 @@ impl Outcome {
     }
 }
 
-/// Everything the resolution reads.
 pub struct ProbeInputs<'a> {
-    /// Set when a task this probe depends on failed, timed out or was voided.
     pub upstream_failed: bool,
-    /// Whether the probe's assertion, or its judge, said yes.
     pub passed: bool,
-    /// `None` for the probes that measure behaviour rather than a fact. Those
-    /// cannot resolve to `asked`, because there is no topic to have asked about.
     pub fact: Option<&'a Fact>,
-    /// Question text from every `ask_user_question` on the thread.
     pub questions: &'a [String],
-    /// Whether the judge found an explicit "I do not have" in the response.
     pub disclaimed: bool,
 }
 
-/// Resolve one probe. The first matching branch wins.
 pub fn resolve(inputs: &ProbeInputs) -> Outcome {
     if inputs.upstream_failed {
         return Outcome::Void;
@@ -147,7 +116,6 @@ mod tests {
         })
     }
 
-    /// I3: a failed upstream task voids the probe rather than failing it.
     #[test]
     fn a_failed_upstream_task_voids_and_never_reads_as_lost_silent() {
         let outcome = run(Inputs {
@@ -169,8 +137,6 @@ mod tests {
         assert_eq!(outcome, Outcome::Void);
     }
 
-    /// The whole point of retiring the routes: a pass is a pass, and nothing
-    /// about the configuration changes what it is called.
     #[test]
     fn a_pass_is_a_pass_whatever_kept_the_fact() {
         assert_eq!(run(Inputs::default()), Outcome::Pass);
@@ -207,8 +173,6 @@ mod tests {
         assert_eq!(outcome, Outcome::LostLoud);
     }
 
-    /// A probe with no fact has no topic, so asking about something cannot
-    /// excuse it. It still passes and fails like any other.
     #[test]
     fn a_probe_with_no_fact_still_passes_and_fails() {
         assert_eq!(

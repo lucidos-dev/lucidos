@@ -1170,3 +1170,31 @@
     vertical-align: middle;
     flex-shrink: 0;
 }
+
+.lucidos-agent-flat {
+    display: none;
+    flex-shrink: 0;
+    color: var(--agent-icon-flat);
+    transform: scale(1.55) translateX(-1.48%);
+}
+
+:root[data-agent-icon-colors="theme"] :is(.thread-row-agent, .response-executor-icon, .initiator-icon, .nav-history-icon, .lucidos-agent-flat) {
+    --agent-icon-flat: var(--agent-icon-theme);
+}
+
+:root[data-agent-icon-colors="muted"] :is(.thread-row-agent, .response-executor-icon, .initiator-icon, .nav-history-icon, .lucidos-agent-flat) {
+    --agent-icon-flat: var(--agent-icon-muted);
+}
+
+:root:is([data-agent-icon-colors="theme"], [data-agent-icon-colors="muted"]) :is(.thread-row-agent, .response-executor-icon, .initiator-icon, .nav-history-icon) {
+    --claude-mark: var(--agent-icon-flat);
+    --codex-mark: var(--agent-icon-flat);
+}
+
+:root:is([data-agent-icon-colors="theme"], [data-agent-icon-colors="muted"]) .lucidos-agent-flat {
+    display: inline-block;
+}
+
+:root:is([data-agent-icon-colors="theme"], [data-agent-icon-colors="muted"]) .lucidos-agent-tile {
+    display: none;
+}

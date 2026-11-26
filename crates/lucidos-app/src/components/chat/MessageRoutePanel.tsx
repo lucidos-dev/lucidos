@@ -578,6 +578,13 @@ export function renderChannelSection(
           <span>{origin.name}</span>
         </div>
       );
+    case 'event_hook':
+      return (
+        <div class="route-row">
+          <strong>Event hook</strong>
+          <span>{origin.slug}</span>
+        </div>
+      );
     case 'agent':
     case 'engine':
     case 'system':

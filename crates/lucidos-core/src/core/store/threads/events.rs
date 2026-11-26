@@ -5,7 +5,7 @@ use crate::engine::consumption_claim::{
 use uuid::Uuid;
 
 impl EventStore {
-    /// The last main-agent capture before a launch, with its backend session.
+    /// INVARIANT: The last main-agent capture before a launch, with its backend session.
     /// A settings binding cannot cross a process's `SessionStarted` boundary.
     pub async fn coding_agent_capture_before_launch(
         &self,
@@ -47,7 +47,7 @@ impl EventStore {
         .await
     }
 
-    /// When the newest event on a thread was recorded. `Ok(None)` for a thread
+    /// INVARIANT: When the newest event on a thread was recorded. `Ok(None)` for a thread
     /// with no events yet.
     ///
     /// The one caller is the chat turn resolving its clock
@@ -71,7 +71,7 @@ impl EventStore {
         .await
     }
 
-    /// Get all events for a specific thread, ordered chronologically.
+    /// INVARIANT: Get all events for a specific thread, ordered chronologically.
     ///
     /// `sequence` breaks a `created` tie, matching `get_thread_events_by_seq`
     /// and `get_recent_messages`. A burst inside one timestamp is common, and
@@ -96,8 +96,6 @@ impl EventStore {
         Ok(events)
     }
 
-    /// Model-visible events for a Tree snapshot. Held rows enter the log at
-    /// their receipt, keeping their original identity and payload.
     pub async fn model_thread_events(
         pool: &sqlx::PgPool,
         thread_id: Uuid,
@@ -119,7 +117,7 @@ impl EventStore {
         .await
     }
 
-    /// Resolve held messages in a Classic history read, bounded by the raw
+    /// INVARIANT: Resolve held messages in a Classic history read, bounded by the raw
     /// snapshot's last sequence. The caller also uses the raw read for image
     /// handles, whose ordinals are always in original event order.
     pub async fn project_permission_held_inputs(
@@ -166,9 +164,6 @@ impl EventStore {
         Ok(())
     }
 
-    /// The events a thread's loaded knowhow is folded from, in the order of
-    /// [`Self::get_thread_events`]: the knowhow tools' pairs and every
-    /// finished turn. For a caller with no reason to read the whole thread.
     pub async fn get_thread_knowhow_events(
         &self,
         thread_id: uuid::Uuid,
@@ -195,19 +190,6 @@ impl EventStore {
         Ok(events)
     }
 
-    /// The newest `limit` events on a thread, still ordered chronologically.
-    ///
-    /// For a caller that wants recent turns rather than the whole history, and
-    /// is on somebody's latency path. A voice session builds its resident block
-    /// while a person waits for the first word. Reading every event of a long
-    /// thread there costs the call its opening seconds.
-    ///
-    /// A window can start mid-exchange, so the fold over it may produce a
-    /// partial leading message. Size the window well above what you keep, and
-    /// take from the tail.
-    ///
-    /// Side-question rows are left out in SQL, so a burst of them can never
-    /// push real turns out of the window (ADR 0320).
     pub async fn get_recent_thread_events(
         &self,
         thread_id: uuid::Uuid,
@@ -233,7 +215,7 @@ impl EventStore {
         Ok(events)
     }
 
-    /// Get the content of the first user message in a thread (for title generation).
+    /// INVARIANT: Get the content of the first user message in a thread (for title generation).
     /// Returns (text, image_description, image_count) for the first user message in a thread.
     ///
     /// `image_description` resolves through the typed `ImageDescribed` event
@@ -281,9 +263,6 @@ impl EventStore {
             .get("user_image_hashes")
             .and_then(|v| v.as_array())
             .map_or(0, |a| a.len());
-        // Latest ImageDescribed for this MessageReceived (multiple hashes
-        // attached to the same message all carry the same description text;
-        // pick any of them).
         let described: Option<(String,)> = sqlx::query_as(
             "SELECT payload->>'description' \
              FROM events \
@@ -305,14 +284,6 @@ impl EventStore {
         Ok(Some((text, image_desc, image_count)))
     }
 
-    /// Returns recent `MessageReceived` / `ResponseGenerated` events from a thread,
-    /// formatted as oldest-first labeled lines for use as Gemini extraction context.
-    ///
-    /// Each line is `"User: <text>"` or `"Assistant: <text>"`. Lines are capped at
-    /// 500 chars to avoid blowing up the system prompt for long messages. Returns
-    /// empty string if the thread has no such events. The `exclude_event_id` is
-    /// for the live consumer / rebuild path: skip the event being extracted so it
-    /// doesn't appear in its own context.
     pub async fn recent_thread_messages_for_extraction(
         &self,
         thread_id: uuid::Uuid,
@@ -358,7 +329,6 @@ impl EventStore {
         Ok(lines.join("\n"))
     }
 
-    /// Get all messages for a specific thread, built from its events.
     pub async fn get_thread_messages(
         &self,
         thread_id: &str,
@@ -367,7 +337,6 @@ impl EventStore {
         Ok(self.build_messages_now(&events).await)
     }
 
-    /// Get timeline events for a thread (session lifecycle + change actions).
     pub async fn get_thread_timeline_events(
         &self,
         thread_id: &str,
@@ -393,8 +362,6 @@ impl EventStore {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            // Look up the description from the originating ChangeProposed
-            // event in the events table — same payload, no separate side table.
             let description = if let Some(ref cid) = change_id {
                 sqlx::query_scalar::<_, Option<String>>(
                     "SELECT payload->>'description' FROM events \
@@ -410,7 +377,6 @@ impl EventStore {
                 None
             };
 
-            // Convert PascalCase to snake_case for frontend
             let snake_type = match event_type.as_str() {
                 "SessionStarted" => "session_started",
                 "SessionEnded" => "session_ended",

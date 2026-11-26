@@ -1,13 +1,3 @@
-//! `lucidos confinement-tests run`: a coding agent's *confinement run*, the
-//! confinement tests run by the engine outside the session sandbox.
-//!
-//! The engine owns the command and the permission check, over
-//! `POST /api/v1/threads/<id>/confinement-tests`. With no permission it raises
-//! the owner's card. Any later step on the thread overtakes that card and drops
-//! its buttons. So this command holds its own tool call open, and asks again
-//! with the card's id until the owner answers. Once the run starts it follows
-//! the background task through the wait route and exits with its status.
-
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -16,14 +6,10 @@ use crate::background_task::{calling_thread, tasks_url, WAIT_RESPONSE_DEADLINE};
 use crate::http::{client as http_client, client_with_timeout, send_or_refusal};
 use crate::workspace::{BoxError, Workspace};
 
-/// `EX_TEMPFAIL`: nothing ran, and a later try may. No card answered, a card
-/// closed, or no permission and no card asked for.
 pub(crate) const NOT_RUN: u8 = 75;
 
-/// How often a held call asks whether the owner answered the card.
 const CARD_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// What the route's answer says to do next.
 #[derive(Debug, PartialEq)]
 enum Step {
     Follow { task_id: String },
@@ -55,8 +41,6 @@ fn step_for(answer: &Value) -> Result<Step, BoxError> {
     })
 }
 
-/// The task's own exit code, or 1 when it has none: killed, timed out, or
-/// ended by a signal.
 fn task_exit_code(record: &Value) -> u8 {
     match record["exit_code"].as_i64() {
         Some(0) => 0,
@@ -69,8 +53,6 @@ fn parse_json(url: &str, text: &str) -> Result<Value, BoxError> {
     serde_json::from_str(text).map_err(|e| format!("Unexpected response from {url}: {e}").into())
 }
 
-/// `hold_secs` 0 raises no card: a call that cannot hold one open must not
-/// leave the owner a card that dies under the next step.
 pub(crate) fn cmd_run(ws: &Workspace, hold_secs: u64) -> Result<u8, BoxError> {
     let thread_id = calling_thread()?;
     let url = format!(
@@ -113,7 +95,6 @@ pub(crate) fn cmd_run(ws: &Workspace, hold_secs: u64) -> Result<u8, BoxError> {
     }
 }
 
-/// Print the task's output as it arrives, until it finishes.
 fn follow(ws: &Workspace, thread_id: &str, task_id: &str) -> Result<u8, BoxError> {
     println!(
         "If this call ends first, the run goes on: follow it with \
@@ -140,8 +121,6 @@ fn follow(ws: &Workspace, thread_id: &str, task_id: &str) -> Result<u8, BoxError
     }
 }
 
-/// Each wait drains what arrived since the last one, so nothing repeats.
-/// A child report the wait carried prints too: the wait consumed it.
 fn print_output(record: &Value) {
     if let Some(out) = record["stdout"].as_str().filter(|s| !s.is_empty()) {
         print!("{out}");
@@ -158,7 +137,6 @@ fn print_output(record: &Value) {
 mod tests {
     use super::*;
 
-    /// Only a call that can hold the card open asks the owner.
     #[test]
     fn the_body_asks_the_owner_only_when_it_holds() {
         assert_eq!(
@@ -191,7 +169,6 @@ mod tests {
         );
     }
 
-    /// An earlier run already passed at this commit, so nothing needs to run.
     #[test]
     fn passed_exits_success_without_running() {
         let answer = json!({
@@ -200,7 +177,6 @@ mod tests {
         assert_eq!(step_for(&answer).unwrap(), Step::Stop(0));
     }
 
-    /// Nothing ran, so neither answer maps to success.
     #[test]
     fn closed_and_unpermitted_exit_not_run() {
         for state in ["closed", "unpermitted"] {
@@ -216,7 +192,6 @@ mod tests {
         assert!(step_for(&json!({})).is_err());
     }
 
-    /// A run that did not report success never exits 0.
     #[test]
     fn the_exit_code_follows_the_task() {
         assert_eq!(task_exit_code(&json!({ "exit_code": 0 })), 0);

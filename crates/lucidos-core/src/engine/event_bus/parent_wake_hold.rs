@@ -1,4 +1,4 @@
-//! The *parent wake hold*: parent wakes the child-to-parent fan-in produces
+//! INVARIANT: The *parent wake hold*: parent wakes the child-to-parent fan-in produces
 //! while the engine is recovering at boot or tearing down.
 //!
 //! Recovery emits real child terminals. A coding-agent child a crash cut gets a
@@ -20,22 +20,14 @@ use std::sync::{Arc, Mutex};
 
 use super::ParentCallback;
 
-/// The wakes queued since [`ParentWakeHold::engage`], or `None` when the hold is
-/// not engaged. `Clone` shares one register across every clone of the bus.
 #[derive(Clone, Default)]
 pub(crate) struct ParentWakeHold(Arc<Mutex<Option<Vec<ParentCallback>>>>);
 
 impl ParentWakeHold {
-    /// Start queueing wakes instead of sending them.
     pub(crate) fn engage(&self) {
         self.0.lock().unwrap().get_or_insert_with(Vec::new);
     }
 
-    /// Queue `callback` while the hold is engaged, and hand it back otherwise.
-    ///
-    /// One completion card is one wake. The boot refire re-reads every card
-    /// no parent reacted to, so it finds the cards recovery emitted this boot.
-    /// A second wake for a queued card is therefore dropped here.
     pub(crate) fn intercept(&self, callback: ParentCallback) -> Option<ParentCallback> {
         let mut held = self.0.lock().unwrap();
         let Some(queue) = held.as_mut() else {
@@ -50,7 +42,6 @@ impl ParentWakeHold {
         None
     }
 
-    /// Stop holding, and hand back every queued wake in arrival order.
     pub(crate) fn release(&self) -> Vec<ParentCallback> {
         self.0.lock().unwrap().take().unwrap_or_default()
     }
@@ -98,8 +89,6 @@ mod tests {
         );
     }
 
-    /// The boot refire finds the cards recovery just emitted, because their
-    /// parents have not reacted yet. Both must come to one turn.
     #[test]
     fn a_second_wake_for_the_same_card_is_dropped() {
         let hold = ParentWakeHold::default();

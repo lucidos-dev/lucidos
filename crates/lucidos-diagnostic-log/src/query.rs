@@ -1,7 +1,3 @@
-//! A bounded query over the diagnostic log: parse and check the parameters,
-//! scan both segments, and keep the newest matches within the line and byte
-//! budgets. Every message is sanitized again as it is read.
-
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
@@ -24,7 +20,6 @@ pub const DEFAULT_BYTE_LIMIT: usize = 64 * 1024;
 pub const MAX_BYTE_LIMIT: usize = 256 * 1024;
 const MAX_LINE_BYTES: u64 = 128 * 1024;
 
-/// A process whose diagnostic records can appear in the live timeline.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Source {
@@ -46,7 +41,6 @@ pub enum SourceStatus {
     Busy,
 }
 
-/// A checked query. Only [`parse`] builds one, so every bound holds.
 #[derive(Clone, Debug)]
 pub struct Query {
     source: Option<Source>,
@@ -75,7 +69,6 @@ impl Query {
         self.source == Some(Source::Engine)
     }
 
-    /// Forward relative times as absolute times so both processes scan the same window.
     pub fn forward_params(&self) -> Vec<(&'static str, String)> {
         let mut params = vec![
             ("since", self.since.to_rfc3339()),
@@ -109,7 +102,6 @@ impl Query {
         params
     }
 
-    /// The filters, for the route's one summary line. Never the lines served.
     pub fn summary(&self) -> String {
         format!(
             "since {} until {}, {} contains, regex {}, label {:?}, pid {:?}",
@@ -123,14 +115,10 @@ impl Query {
     }
 }
 
-/// Parse a raw query string. Unknown and repeated keys refuse, as does any
-/// value past its bound. `limit` and `byte_limit` clamp to their maximum,
-/// which only narrows the answer.
 pub fn parse(raw: Option<&str>, now: DateTime<Utc>) -> Result<Query, String> {
     parse_query(raw, now, true)
 }
 
-/// Parse filters for an inbox bundle, which has no live source selector.
 pub fn parse_inbox(raw: Option<&str>, now: DateTime<Utc>) -> Result<Query, String> {
     parse_query(raw, now, false)
 }
@@ -249,7 +237,6 @@ fn count(key: &str, value: &str, max: usize) -> Result<usize, String> {
     }
 }
 
-/// RFC 3339, or an age before `now` such as `90s`, `30m`, `2h` or `3d`.
 fn parse_time(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
     if let Ok(time) = DateTime::parse_from_rfc3339(value) {
         return Ok(time.with_timezone(&Utc));
@@ -291,22 +278,17 @@ impl QueryLine {
     }
 }
 
-/// What a query returns: the newest matches, oldest first.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueryResult {
     pub lines: Vec<QueryLine>,
     pub returned: usize,
-    /// Matches older than the returned lines that a budget left out.
     pub earlier_matches: usize,
-    /// True when `byte_limit` cut the answer short.
     pub truncated: bool,
     pub byte_size: usize,
-    /// The oldest record retained, or `None` for an empty log.
     pub coverage_starts_at: Option<String>,
     pub hint: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sources: BTreeMap<Source, SourceStatus>,
-    /// Newest line excluded by the byte budget. A merge must stop here too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     byte_cut: Option<TimelineKey>,
 }
@@ -341,7 +323,6 @@ pub fn machine_unavailable(query: &Query, status: SourceStatus) -> QueryResult {
     )
 }
 
-/// Query a live source, including its availability when the directory is missing.
 pub fn run_source(dir: &Path, query: &Query, source: Source) -> QueryResult {
     match run(dir, query, source) {
         Ok(answer) => answer,
@@ -355,14 +336,12 @@ pub fn run_source(dir: &Path, query: &Query, source: Source) -> QueryResult {
     }
 }
 
-/// Run over the segments in `dir`. Refuses a symlinked dir or segment.
 pub fn run(dir: &Path, query: &Query, source: Source) -> std::io::Result<QueryResult> {
     let mut scan = Scan::default();
     scan.read(dir, query, source)?;
     Ok(scan.finish(query, BTreeMap::from([(source, SourceStatus::Ok)])))
 }
 
-/// Apply the same checked filters and budgets to an already-rendered inbox timeline.
 pub fn run_records(
     query: &Query,
     records: impl IntoIterator<Item = Record>,
@@ -429,7 +408,6 @@ impl Scan {
     }
 }
 
-/// Merge bounded timelines and apply the same budgets to the combined answer.
 pub fn merge(query: &Query, results: impl IntoIterator<Item = QueryResult>) -> QueryResult {
     let mut lines = Vec::new();
     let mut earlier_matches = 0;
@@ -471,7 +449,6 @@ fn finish(
             break;
         }
         let key = line.key();
-        // Equal keys from a single source were retained ahead of its cut.
         let size = serde_json::to_vec(&line)
             .expect("query line serializes")
             .len()
@@ -517,10 +494,6 @@ fn finish(
     }
 }
 
-/// The text of each existing segment, oldest first.
-///
-/// The current segment opens first. A rotation before the rotated one opens
-/// makes both handles one file, which is then read once, so no segment is lost.
 fn read_segments(dir: &Path) -> std::io::Result<Vec<String>> {
     let directory = open_directory(dir)?;
     let current = open_segment(&directory, dir, writer::FILE_NAME)?;
@@ -547,8 +520,6 @@ fn open_directory(dir: &Path) -> std::io::Result<std::fs::File> {
     options.open(dir)
 }
 
-/// Open relative to the checked directory handle so a concurrent rename cannot
-/// redirect the scan. Nonblocking open lets us reject special files safely.
 #[cfg(unix)]
 fn open_segment(
     dir: &std::fs::File,
@@ -601,7 +572,6 @@ fn same_file(a: &std::fs::File, b: &std::fs::File) -> std::io::Result<bool> {
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
-/// Lucidos ships no Windows build. This arm only keeps the crate compiling.
 #[cfg(not(unix))]
 fn same_file(_: &std::fs::File, _: &std::fs::File) -> std::io::Result<bool> {
     Ok(false)
@@ -615,8 +585,6 @@ fn read_segment(file: std::fs::File) -> std::io::Result<String> {
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
-/// The record as a reader gets it, when it matches. The text filters run on
-/// the sanitized message, so no filter can probe a masked value.
 fn matching(
     query: &Query,
     ts: DateTime<Utc>,

@@ -123,24 +123,18 @@ async fn a_secret_seals_as_it_binds_and_opens_as_it_decodes() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Columns whose name looks like a secret's and whose value is not one.
 const NOT_SECRETS: &[(&str, &str)] = &[
-    // A header name such as `Authorization`, never its value.
     ("credentials", "auth_header"),
     ("credentials", "auth_type"),
     ("credentials", "env_var_name"),
     ("claude_gateway_accounts", "token_expiry"),
     ("chatgpt_plan_accounts", "token_expiry"),
     ("email_accounts", "oauth_account_id"),
-    // Variable name to credential name: a pointer, never the value.
     ("mcp_servers", "env_credentials"),
     ("oauth_accounts", "token_expiry"),
-    // A SHA-256 digest: the token is shown once and never stored.
     ("webhooks", "token_hash"),
 ];
 
-/// A new secret column must join [`SECRET_COLUMNS`], or be named here as not
-/// one. The name heuristic is what catches a table added on another branch.
 #[tokio::test]
 async fn every_column_named_like_a_secret_is_sealed_or_declared_not_one() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;

@@ -1,18 +1,3 @@
-//! Revealing a credential's plaintext to the Settings page, and to nothing
-//! else.
-//!
-//! `GET /api/v1/credential-value` used to return the stored secret to any
-//! caller. App UIs load at `/app/<id>/` on the engine's own origin, so an
-//! installed app's JS could list the credentials and read every one. That
-//! undercuts the premise of `api::proxy`, which exists so an iframe never sees
-//! a credential.
-//!
-//! A reveal is now two steps inside a 30-second one-shot window, refused from
-//! an app document, and audited. ADR 0117 states the full model, what it does
-//! not close, and why the two steps read `Referer` by different rules. The
-//! shared machinery lives in [`super::secret_reveal`], which the backup key
-//! uses too.
-
 use super::secret_reveal::{
     forbidden, reveal_request_allowed, token_required, RefererRule, RevealSubject,
     RevealTokenResponse,
@@ -20,19 +5,15 @@ use super::secret_reveal::{
 use super::*;
 use crate::core::{AuthType, CredentialStore};
 
-/// The route that mints a credential-reveal token, named in its own refusal.
 const MINT_ROUTE: &str = "/api/v1/credential-reveal-token";
 
-/// What the 403 calls the secret this module guards.
 const SUBJECT_LABEL: &str = "a credential value";
 
-/// What an agent is told by both steps. A credential reaches an agent's work
-/// through the proxy, which never shows it the value.
 const AGENT_REFUSAL: &str = "An agent cannot reveal a credential value. Call the API \
      through the credential proxy, which signs the request without showing the value, \
      or ask the user to copy it in Settings.";
 
-/// `POST /api/v1/credential-reveal-token`: mint a one-shot reveal token.
+/// INVARIANT: `POST /api/v1/credential-reveal-token`: mint a one-shot reveal token.
 ///
 /// Step one of two. The Settings page mints, then immediately spends. Splitting
 /// the read in half is what stops a scrape of reachable GET endpoints finding
@@ -48,8 +29,6 @@ pub(super) async fn mint_reveal_token(
     }
     crate::api::actor::require_attested_owner(&headers, AGENT_REFUSAL)
         .map_err(|e| (e.status, e.message))?;
-    // Refuse to mint against a row that does not exist, so a caller learns that
-    // here rather than after spending the token.
     match CredentialStore::get_by_id(&state.pool, query.id).await {
         Ok(Some(cred)) if cred.auth_type == AuthType::OnepasswordServiceAccount => {
             return Err(service_account_unrevealable())
@@ -73,11 +52,6 @@ pub(super) async fn mint_reveal_token(
     Ok(Json(RevealTokenResponse::new(token)))
 }
 
-/// Query for the reveal itself: the row, plus the token minted for it.
-///
-/// `token` is optional in the SHAPE so a caller that omits it meets the
-/// handler's own refusal, which names the route that mints one. Left required,
-/// axum answers a 400 that says only "failed to deserialize query string".
 #[derive(Deserialize)]
 pub(super) struct CredentialValueQuery {
     id: uuid::Uuid,
@@ -85,7 +59,7 @@ pub(super) struct CredentialValueQuery {
     token: Option<String>,
 }
 
-/// `GET /api/v1/credential-value`: the plaintext, for the Settings copy buttons
+/// INVARIANT: `GET /api/v1/credential-value`: the plaintext, for the Settings copy buttons
 /// and the edit form's prefill.
 ///
 /// By id, not name. `CredentialStore::get` is blind to `oauth_client` rows on
@@ -104,7 +78,7 @@ pub(super) async fn get_credential_value(
         log_legacy!("[Credentials] refused a credential-value read from an app document");
         return Err(forbidden(SUBJECT_LABEL));
     }
-    // Before the redeem, which is one-shot: a caller refused after it would
+    // INVARIANT: Before the redeem, which is one-shot: a caller refused after it would
     // have spent its token on a request that never saw the credential.
     crate::api::actor::require_attested_owner(&headers, AGENT_REFUSAL)
         .map_err(|e| (e.status, e.message))?;
@@ -123,8 +97,6 @@ pub(super) async fn get_credential_value(
         Ok(Some(cred)) if cred.auth_type == AuthType::OnepasswordServiceAccount => {
             Err(service_account_unrevealable())
         }
-        // The stored value, so a *secret reference* shows as the reference.
-        // Its value already sits in the user's 1Password.
         Ok(Some(cred)) => {
             state
                 .engine
@@ -153,8 +125,6 @@ pub(super) async fn get_credential_value(
     }
 }
 
-/// The refusal for a 1Password service account token, which only the `op`
-/// tool ever reads.
 fn service_account_unrevealable() -> (StatusCode, String) {
     (
         StatusCode::FORBIDDEN,
@@ -163,7 +133,6 @@ fn service_account_unrevealable() -> (StatusCode, String) {
     )
 }
 
-/// Routes for the two-step credential reveal.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/credential-reveal-token", post(mint_reveal_token))
@@ -174,9 +143,6 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    /// The refusal names the route that mints, and that route is the one the
-    /// router registers. A 403 pointing at a path nobody serves is a dead end
-    /// for any caller outside this repository.
     #[test]
     fn the_refusal_names_a_route_this_module_serves() {
         let (_, body) = token_required(MINT_ROUTE);

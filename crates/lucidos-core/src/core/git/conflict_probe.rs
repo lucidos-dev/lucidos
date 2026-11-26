@@ -1,8 +1,3 @@
-//! Whether merging a branch into `main` would conflict, asked without merging.
-//!
-//! `git merge-tree --write-tree` computes the merge in memory. It writes the
-//! result's objects to the object store and touches no ref, index or worktree.
-
 use super::git_cmd;
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,19 +5,16 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
-/// What a merge of one revision into another would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeProbe {
     Clean,
-    /// The paths that would conflict, each named once.
     Conflicts(Vec<String>),
-    /// git could not answer: it failed to run, timed out, or could not resolve
+    /// INVARIANT: git could not answer: it failed to run, timed out, or could not resolve
     /// a revision. Never read this as clean.
     Unknown,
 }
 
 impl MergeProbe {
-    /// The paths that would conflict. A clean or unknown merge names none.
     pub fn into_conflicts(self) -> Vec<String> {
         match self {
             MergeProbe::Conflicts(files) => files,
@@ -31,7 +23,6 @@ impl MergeProbe {
     }
 }
 
-/// Probe a merge of `theirs` into `ours`, run in `dir`.
 pub async fn probe_merge(dir: &Path, ours: &str, theirs: &str) -> MergeProbe {
     let args = [
         "merge-tree",
@@ -61,9 +52,6 @@ pub async fn probe_merge(dir: &Path, ours: &str, theirs: &str) -> MergeProbe {
     }
 }
 
-/// Read `merge-tree --write-tree --name-only --no-messages`: exit 0 is a clean
-/// merge, exit 1 a conflicted one, and anything else a failure. On a conflict
-/// the first stdout line is the result tree and each later line one path.
 fn classify_merge_tree(exit_code: Option<i32>, stdout: &str) -> MergeProbe {
     match exit_code {
         Some(0) => MergeProbe::Clean,
@@ -80,23 +68,15 @@ fn classify_merge_tree(exit_code: Option<i32>, stdout: &str) -> MergeProbe {
     }
 }
 
-/// Answers keyed by repo and the two commit shas. A sha names its content, so
+/// INVARIANT: Answers keyed by repo and the two commit shas. A sha names its content, so
 /// an entry is true for as long as it exists, and nothing invalidates it.
 type ProbeKey = (String, String, String);
 static PROBE_CACHE: LazyLock<Mutex<HashMap<ProbeKey, MergeProbe>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Enough for every pending change against a few recent `main` tips. Past it
-/// the cache starts over, since entries for an old `main` are never asked again.
 const PROBE_CACHE_CAPACITY: usize = 512;
 
-/// Would merging `branch` into `main` in `repo_root` conflict right now?
-///
-/// Resolves both tips first, so an answer is reused until either one moves.
-/// An `Unknown` is not cached: the next call asks git again.
 pub async fn predict_merge_into_main(repo_root: &Path, branch: &str) -> MergeProbe {
-    // The trailing `--` makes both names revisions, never paths, and is
-    // echoed back as a third line.
     let tips = git_cmd(&["rev-parse", "main", branch, "--"], repo_root).await;
     let (main_sha, branch_sha) = match tips {
         Ok(o) if o.status.success() => {

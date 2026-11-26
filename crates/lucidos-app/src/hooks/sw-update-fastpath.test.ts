@@ -64,10 +64,9 @@ describe('refreshClient — build-id fast path', () => {
   });
 
   function stubServedBuildId(id: string): void {
-    globalThis.fetch = vi.fn(() => Promise.resolve({
-      ok: true,
-      text: () => Promise.resolve(`const BUILD_ID = '${id}';`),
-    })) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(`<meta name="lucidos-build-id" content="${id}">`),
+    );
   }
 
   it('reloads cache-first (no SW round-trip, no cache bust) when already on the served build', async () => {

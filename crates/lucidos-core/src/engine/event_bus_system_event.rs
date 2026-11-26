@@ -1,7 +1,3 @@
-//! `SystemEvent` — the typed enum of every non-thread-scoped event that flows
-//! through `EventBus`, plus its variant-discriminator match-tables
-//! (`event_type`, `aggregate`, `aggregate_id`, `is_persisted`, `to_payload`).
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,12 +9,8 @@ use crate::engine::thread_events::notification::Tap;
 use crate::engine::thread_events::WidgetParams;
 use crate::engine::thread_events::{ArrangedTile, Dashboard, MessageOrigin};
 
-/// The `aggregate_id` of every ChatGPT plan event: a workspace has at most one
-/// sign-in, and its tokens have no shareable name.
 const CHATGPT_PLAN_AGGREGATE_ID: &str = "chatgpt-plan";
 
-/// Who wrote an artifact, resolved before the event is persisted. Workspace
-/// leafhood reads this value rather than mutable thread attendance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ArtifactWriter {
@@ -35,16 +27,13 @@ impl ArtifactWriter {
     }
 }
 
-/// System events — broadcast to SSE, selectively persisted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum SystemEvent {
-    /// An internal Lucidos defect, counted once per kind until the next sent
-    /// diagnostic bundle. Contains no message, user text or external failures.
     InternalFaultRecorded {
         kind: crate::internal_faults::FaultKind,
     },
-    /// The owner-approved diagnostic bundle was delivered. This is the durable
+    /// INVARIANT: The owner-approved diagnostic bundle was delivered. This is the durable
     /// boundary for the internal-fault count; failed sends never reset it.
     DiagnosticBundleSent {
         destination: String,
@@ -54,9 +43,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// One validated bundle arrived in the private Postgres inbox. Persisted
-    /// atomically by EventBus::receive_diagnostic_bundle. Aggregate is
-    /// diagnostic_bundle; aggregate_id is bundle_id. Ingress has no local actor.
     DiagnosticBundleReceived {
         bundle_id: Uuid,
         origin: String,
@@ -71,35 +57,16 @@ pub enum SystemEvent {
         task_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
-        /// Originating thread, when the notification has one. The notification
-        /// modal renders an "Open thread" button when set so the user can jump
-        /// to the conversation that produced the alert. Engine already passes
-        /// the same value to push payloads for deep-linking.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_id: Option<String>,
-        /// Specific event UUID inside `thread_id` to scroll/pulse on land.
-        /// Lets a notification deep-link to the exact event it was raised for
-        /// (e.g. the `UserQuestionAsked` row the user should answer). Ignored
-        /// when `thread_id` is unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         event_id: Option<String>,
-        /// Where a tap should land. Defaults to `Tap::Modal` (open the inbox).
-        /// `Tap::Navigate { to }` deep-links via the same router the
-        /// `navigate_ui` LLM tool uses. See [`Tap`] for the wire shape.
         #[serde(default)]
         tap: Tap,
-        /// Who emitted the notification. Set by HTTP handlers via
-        /// `user_actor`; engine-internal sources (LLM tool, scheduler,
-        /// worktree cleanup, backup) pass `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
-        /// The devices this notification is for, when its producer names
-        /// them: a root thread's role change tells one user (ADR 0623).
-        /// `None` lets the projection work it out from the thread it opens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<Vec<String>>,
-        /// The OS pushes this notification shares a tag with: the user-only
-        /// messages of one thread (ADR 0649). `None` is an ordinary one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         push_group: Option<crate::engine::thread_events::notification::PushGroup>,
     },
@@ -119,7 +86,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The user answered a *release notice*, by acting on it or by reading it.
+    /// INVARIANT: The user answered a *release notice*, by acting on it or by reading it.
     ///
     /// The cursor behind it is a silent preference, so this is the only durable
     /// trace of the answer. It also closes the modal on the user's other
@@ -135,44 +102,19 @@ pub enum SystemEvent {
         total: usize,
         percent: usize,
     },
-    /// The background embedding-model loader moved on: a download progress
-    /// frame, or a transition between downloading / loading / ready / waiting /
-    /// failed. TRANSIENT (never persisted) and high-frequency during a cold
-    /// first run, like `MemoryRebuildProgress` and `BackupProgress`.
-    ///
-    /// Fields mirror `memory::EmbeddingModelStatus` exactly, because
-    /// `GET /api/v1/memory/embedding-model-status` serves the same shape as a
-    /// snapshot: a client that loads mid-download must read what the stream
-    /// would have told it. Pinned by
-    /// `embedding_model_status_event_matches_the_rest_snapshot`.
     EmbeddingModelStatusChanged {
         model_id: String,
         load_state: crate::engine::thread_events::EmbeddingModelLoadState,
     },
-    /// The Tree memory module's backfill moved. The compactor seeded, an owed
-    /// scope started or built a node, a scope completed or started failing,
-    /// or the model wait changed. TRANSIENT,
-    /// like `MemoryRebuildProgress`. `progress` is the shape
-    /// `GET /api/v1/memory/tree-backfill` serves while the backfill runs.
     TreeBackfillProgressed {
         progress: crate::engine::thread_events::tree_backfill::BackfillProgress,
     },
-    /// The backfill set the ready flag: the workspace tree and the threads
-    /// active in the last 7 days are built, so turns now take the Tree path.
-    /// Older threads keep filling in. `total` counts the scopes it covers.
     TreeBackfillCompleted {
         total: usize,
-        /// What the backfill episode has spent so far, when one is open.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spent_usd: Option<f64>,
     },
-    /// A switch to Classic cleared a set ready flag. Coming back to Tree
-    /// backfills again before a turn reads the trees. It closes the
-    /// backfill episode.
     TreeBackfillReset {},
-    /// A backfill episode opened: the estimate for the compactor's model and
-    /// tier when it began, and the cap it pauses at. `actor` is whoever
-    /// switched the workspace to Tree, unset when the engine resumed one.
     TreeBackfillStarted {
         estimate: crate::engine::thread_events::tree_backfill::StartEstimate,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,30 +122,24 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The backfill spent its cap, so the compactor holds the work the
-    /// backfill owes until the user raises the cap or leaves Tree.
     TreeBackfillCapReached {
         spent_usd: f64,
         cap_usd: f64,
     },
-    /// The user moved the open episode's cap.
     TreeBackfillCapRaised {
         cap_usd: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Every tree is built, which closes the backfill episode. `spent_usd` is
-    /// its whole cost, absent for a model the catalog does not price.
     TreeBackfillEnded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spent_usd: Option<f64>,
     },
-    /// Broadcast only, so it is never read back from a row. That is why its
+    /// INVARIANT: Broadcast only, so it is never read back from a row. That is why its
     /// change lists skip deserializing.
     ChangesUpdated {
         #[serde(skip_deserializing)]
         pending: Vec<crate::core::changes::Change>,
-        /// Kept for later, newest first (ADR 0328).
         #[serde(skip_deserializing)]
         set_aside: Vec<crate::core::changes::Change>,
         #[serde(skip_deserializing)]
@@ -211,14 +147,11 @@ pub enum SystemEvent {
         total_pending: usize,
         restart_required: bool,
         apply_estimates: crate::engine::thread_events::apply::ApplyEstimates,
-        /// The landing lane as it stands: the open lane batch and what waits.
         #[serde(default)]
         landing_lane: crate::engine::thread_events::landing_lane::LaneSnapshot,
-        /// The main check as it stands.
         #[serde(default)]
         main_check: crate::engine::thread_events::main_check::MainCheckSnapshot,
     },
-    /// Transient capture/check activity. Subscribe to the terminal snapshot events.
     SnapshotProgress {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
@@ -227,14 +160,14 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Target-authorized restore, persisted before the gateway stops the engine.
+    /// INVARIANT: Target-authorized restore, persisted before the gateway stops the engine.
     SnapshotRestoreRequested {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
         restore_id: uuid::Uuid,
         actor: MessageOrigin,
     },
-    /// Verified restored log after no-replay settlement. Completion notification
+    /// INVARIANT: Verified restored log after no-replay settlement. Completion notification
     /// and external journal completion must follow before dispatch is admitted.
     WorkspaceRestored {
         workspace_id: String,
@@ -244,7 +177,7 @@ pub enum SystemEvent {
         retained_worktrees: Vec<String>,
         actor: MessageOrigin,
     },
-    /// A verified local capture was published. Persisted; no paths or key material.
+    /// INVARIANT: A verified local capture was published. Persisted; no paths or key material.
     SnapshotCreated {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
@@ -252,8 +185,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A capture failed or was interrupted. Persisted; reason is a fixed safe code,
-    /// plus the bytes to free for a disk floor refusal.
     SnapshotCaptureFailed {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
@@ -262,7 +193,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A full snapshot check finished. Persisted, including failed checks.
     SnapshotChecked {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
@@ -271,7 +201,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A snapshot's manual retention protection changed. Persisted for all clients.
     SnapshotKeepChanged {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
@@ -279,7 +208,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A snapshot was deleted manually or by retention. Persisted after each deletion.
     SnapshotDeleted {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
@@ -292,76 +220,40 @@ pub enum SystemEvent {
         progress: usize,
         total: usize,
     },
-    /// A backup run finished successfully. PERSISTED (unlike `BackupProgress`):
+    /// INVARIANT: A backup run finished successfully. PERSISTED (unlike `BackupProgress`):
     /// the events table is the durable history of every backup run (start /
     /// finish / size), queried by `core::backup::load_recent_runs` and surfaced
     /// by the `get_backup_status` tool.
     BackupCompleted {
         filename: String,
         size_bytes: u64,
-        /// When the backup pipeline started (RFC 3339).
         started_at: chrono::DateTime<chrono::Utc>,
-        /// When it finished (RFC 3339). Duration = `finished_at - started_at`.
         finished_at: chrono::DateTime<chrono::Utc>,
     },
-    /// A backup run failed. PERSISTED — see `BackupCompleted`.
+    /// INVARIANT: A backup run failed. PERSISTED — see `BackupCompleted`.
     BackupFailed {
         error: String,
-        /// When the backup pipeline started (RFC 3339).
         started_at: chrono::DateTime<chrono::Utc>,
-        /// When it failed (RFC 3339).
         finished_at: chrono::DateTime<chrono::Utc>,
     },
-    /// The workspace's legacy backup key was handed to a caller. PERSISTED.
-    ///
-    /// The key decrypts every `.enc` archive this workspace uploaded, so a
-    /// read of it is a bigger fact than a credential reveal. Same secrecy
-    /// contract as `CredentialRevealed`: the row records the act and the
-    /// actor, never the key. Rows from before the switch to age also carry a
-    /// `minted` flag, which nothing reads.
-    ///
-    /// The origin check in front of it is defense in depth, not a boundary
-    /// (ADR 0117, ADR 0144). So a reveal that should not have happened still
-    /// leaves a row somebody can find.
     BackupKeyRevealed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The workspace's backup recipient changed: every new archive is now
-    /// sealed to it. PERSISTED.
-    ///
-    /// The recipient is an age public key and not a secret. `own_key` is true
-    /// when the user brought it, false when Lucidos minted the pair and the
-    /// user pasted its backup key back.
     BackupRecipientSet {
         recipient: String,
         own_key: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The engine booted with entries in `data/config/apis.json` it refuses
-    /// to serve. PERSISTED, and emitted only when something is refused.
-    ///
-    /// The workspace stays up and every other provider keeps working. So
-    /// this event is the only thing standing between the user and a proxy
-    /// that silently 502s. A rejected entry used to abort the boot instead
-    /// (ADR 0135).
     ProxyConfigRejected {
         rejected: Vec<crate::engine::provider_rejection::RejectedProvider>,
     },
-    /// A provider answered that it does not serve the model an auxiliary call
-    /// ran on: retired, never enabled, or misspelled. PERSISTED, at most once
-    /// per provider, model and purpose within the window.
-    ///
-    /// Default selection reads these rows to pass over the model. A retired
-    /// default moves on by itself, and a stored pick fails visibly (ADR 0403).
-    /// The first billing refusal started one provider's background-call hold.
     ModelSpendCapReached {
         provider: String,
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
         held_until: chrono::DateTime<chrono::Utc>,
     },
-    /// A provider hold ended by reset, successful call, or the owner's clear.
     ModelSpendCapHoldEnded {
         provider: String,
         cause: crate::llm::spend_cap::SpendCapHoldEndCause,
@@ -370,38 +262,17 @@ pub enum SystemEvent {
     },
     ModelNotServedObserved {
         model: String,
-        /// The provider that answered, spelled as `ProviderKind::as_str`.
         provider: String,
         purpose: crate::engine::thread_events::ContextPurpose,
-        /// The provider's failure, rewritten into advice where we have one.
         message: String,
-        /// The model the call retried on, or `None` when it failed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         moved_to: Option<String>,
     },
-    /// The owner deleted a thread and its whole family. PERSISTED, and the only
-    /// trace left of them (ADR 0192).
-    ///
-    /// It sits on aggregate `ops` with `aggregate_id` `global` precisely so no
-    /// later delete can reach it: a thread sweep matches `aggregate = 'thread'`
-    /// and a `thread_id`, and this row carries neither.
-    ///
-    /// **The payload carries no content, and that is load-bearing.** Ids and
-    /// counts only. A title or a first message here would re-file the very text
-    /// the delete removed, under a row nothing can delete.
     ThreadsDeleted {
-        /// Every member of the deleted family, target first.
         thread_ids: Vec<Uuid>,
-        /// `events` rows removed.
         event_count: i64,
-        /// `memory_entries` rows removed, found by joining their `source` event
-        /// id against those events before either went.
         memory_count: i64,
-        /// Coding-agent worktrees removed after the commit. Best effort, so it
-        /// can be lower than the number of coding-agent members.
         worktrees_removed: usize,
-        /// The deleted threads' own widgets removed from `data/apps/` (ADR
-        /// 0402). Best effort, like the worktrees.
         #[serde(default)]
         widgets_removed: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,15 +282,12 @@ pub enum SystemEvent {
         completed: usize,
         total: usize,
     },
-    /// Extraction gave up on one source after retries or its deadline.
-    /// Emitted once per failed indexing operation, before fallback or artifact skipping.
     MemoryExtractionFailed {
         source: crate::engine::thread_events::MemorySource,
         model: String,
-        /// One of call_failed, unreadable_reply or timed_out.
         reason: String,
     },
-    /// The user corrected a long-term memory. The only durable record of the
+    /// INVARIANT: The user corrected a long-term memory. The only durable record of the
     /// correction: every memory rebuild replays these, so a wrong fact the
     /// extractor finds again in its source events is removed again.
     MemoryCorrected {
@@ -428,12 +296,7 @@ pub enum SystemEvent {
         removed: Vec<crate::engine::thread_events::CorrectedMemory>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correction: Option<String>,
-        /// The engine's clock at the correction. It stamps
-        /// `memory_entries.created_at` too, so a replay can tell a row that
-        /// came back from one that was already there.
         recorded_at: chrono::DateTime<chrono::Utc>,
-        /// Who asked, when the correction arrived over HTTP. The agent's own
-        /// tool passes none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -448,8 +311,6 @@ pub enum SystemEvent {
         commit_hash: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
-        /// The thread whose turn wrote it, when one did. Engine work that
-        /// reads the write later, such as a memory summary, bills that thread.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writer_thread_id: Option<uuid::Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,33 +350,25 @@ pub enum SystemEvent {
         trigger_id: String,
         payload: serde_json::Value,
     },
-    /// A user-visible folder that organizes triggers in the panel was created.
-    /// Pure label — has no schedule, runs no code, and does not coordinate trigger
-    /// firing. Each trigger may belong to at most one group via `group_id`;
-    /// ungrouped triggers render under an implicit "Ungrouped" section in the UI.
-    /// Payload: `{ group_id, name, order }`.
     TriggerGroupCreated {
         group_id: String,
         payload: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The display name of a trigger group changed. Payload: `{ group_id, name }`.
     TriggerGroupRenamed {
         group_id: String,
         payload: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The sort position of a trigger group changed. Payload: `{ group_id, order }`.
-    /// Batch reorders emit one event per moved group.
     TriggerGroupReordered {
         group_id: String,
         payload: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A trigger group was deleted. Only emitted when the group has no members —
+    /// INVARIANT: A trigger group was deleted. Only emitted when the group has no members —
     /// the HTTP handler rejects the delete with 409 otherwise so the LLM (or user)
     /// can self-correct. Payload: `{ group_id }`.
     TriggerGroupDeleted {
@@ -524,36 +377,37 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The workspace owner, or an agent they allowed once, armed the *event
-    /// hook* in `data/hooks/<slug>/` (ADR 0746). The latest arming event per
-    /// slug is its arming state, with no table beside it. No hook is ever
-    /// asked about this event.
     EventHookArmed {
         slug: String,
-        /// The hooked event's wire name, as the armed definition names it.
+        /// INVARIANT: The hooked event's wire name, as the armed definition names it.
         event_type: String,
-        /// The definition and script digest, from
-        /// [`HookListing::content_hash`](crate::core::event_hooks::HookListing::content_hash).
-        /// A hook whose content hashes otherwise is changed, not armed.
         content_hash: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The workspace owner, or an agent they allowed once, disarmed an armed
-    /// *event hook*. Its definition stays in `data/hooks/<slug>/`.
     EventHookDisarmed {
         slug: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The workspace owner, or an agent they allowed once, removed an *event
-    /// hook*: its folder left `data/hooks/`, and any arming of it ended.
     EventHookRemoved {
         slug: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Domain event emitted via emit_event (e.g. SlideTextEdited, SleepImported).
+    EventHookRefused {
+        slug: String,
+        event_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<uuid::Uuid>,
+        cause: crate::core::event_hooks::RefusalCause,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// INVARIANT: Domain event emitted via emit_event (e.g. SlideTextEdited, SleepImported).
     /// Persisted through EventBus with the inner `event_type` as the stored event type.
     /// Broadcast so the trigger subscriber can fire matching event-based triggers.
     /// `depth` tracks event-trigger recursion (A fires trigger → emits event → fires trigger…).
@@ -567,7 +421,7 @@ pub enum SystemEvent {
         depth: u32,
         #[serde(skip_serializing)]
         transient: bool,
-        /// Who emitted the domain event, as the engine established it. Every
+        /// INVARIANT: Who emitted the domain event, as the engine established it. Every
         /// live emit names one, through `LucidosEngine::emit_domain_event`.
         /// `None` is left to the backfill replay of a row the engine wrote.
         /// `to_payload` merges it into the wire payload and drops any `actor`
@@ -575,24 +429,18 @@ pub enum SystemEvent {
         #[serde(skip_serializing)]
         actor: Option<MessageOrigin>,
     },
-    /// A widget instance was added to one dashboard (ADR 0496). Persisted: the
-    /// dashboards fold these on read.
     DashboardTileAdded {
         dashboard: Dashboard,
         app_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params: Option<WidgetParams>,
-        /// The tile's label. Absent means the widget's name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
-        /// The tile's size, as picked on the card it came from. Absent means
-        /// the widget's default size.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<crate::core::apps::WidgetSize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A widget instance left one dashboard. No file changes.
     DashboardTileRemoved {
         dashboard: Dashboard,
         app_id: String,
@@ -601,7 +449,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// One dashboard's tiles in order, each at its size. The newest wins,
+    /// INVARIANT: One dashboard's tiles in order, each at its size. The newest wins,
     /// whole; a tile no longer on the dashboard is ignored.
     DashboardArranged {
         dashboard: Dashboard,
@@ -609,7 +457,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// App list-refresh hints. `AppCreated` and `AppUpdated` are
+    /// INVARIANT: App list-refresh hints. `AppCreated` and `AppUpdated` are
     /// broadcast-only, like `AppUiRefreshRequested`: the `appsList` is a
     /// disk-scan projection and these SSE signals keep it live. The durable
     /// record of an app change is the git commit.
@@ -627,9 +475,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Persisted, unlike its two siblings (ADR 0404): the `app_kinds`
-    /// projection keeps `kind`, so a removed widget still lists as a widget.
-    /// `kind` is read from the manifest before it goes; `None` means unread.
     AppDeleted {
         app_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,24 +482,17 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The user opened an app's UI (ADR 0413). Persisted: it is the only
-    /// evidence of use, which the workspace prompt footprint judges an app
-    /// unused by. A reload restore, a history step and an inline widget do not
-    /// emit it.
     AppOpened {
         app_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A knowhow doc was read through `GET /api/v1/knowhow/read`, which is
-    /// what `lucidos knowhow read` calls (ADR 0413). Persisted as use evidence
-    /// for the workspace prompt footprint, at most one per doc per day.
     KnowhowRead {
         knowhow_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An app's iframe-bundled files changed in a way the open iframes need
+    /// INVARIANT: An app's iframe-bundled files changed in a way the open iframes need
     /// to pick up. Emitted by the Apply path of an app coding-agent thread
     /// when any merged file under `data/apps/<id>/` is an HTML / CSS / JS /
     /// `manifest.json` / static asset (image, font, …). Transient — the SDK
@@ -666,7 +504,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A *frontend-only* Apply's in-process served-client advance was DEFERRED
+    /// INVARIANT: A *frontend-only* Apply's in-process served-client advance was DEFERRED
     /// because an engine version change is pending (a mixed change applied but
     /// not yet *Switched*) — see `engine::frontend_refresh` INV-A. The rebuilt
     /// `dist/` already holds a client built for the NEW engine, so it can't be
@@ -681,7 +519,7 @@ pub enum SystemEvent {
     FrontendUpdateDeferred {
         sent_at_ms: i64,
     },
-    /// A *frontend-only* Apply rebuilt fine but the engine's served client can
+    /// INVARIANT: A *frontend-only* Apply rebuilt fine but the engine's served client can
     /// never advance to it, because the `dist/` it serves is not the `dist/` the
     /// build-watch republishes. Distinct from `FrontendUpdateDeferred`, which
     /// means "queued, arrives on Switch" — here nothing is coming, so the two
@@ -700,20 +538,11 @@ pub enum SystemEvent {
     /// (`refresh_served_frontend_after_rebuild` early-returns when packaged).
     /// See `docs/plans/2026-07-26-worktree-pinned-stack-guard.md`.
     FrontendUpdateStranded {
-        /// Absolute path of the `dist/` this engine serves from.
         served_dir: String,
-        /// Whether that path lies inside a coding-agent worktree.
         served_in_worktree: bool,
-        /// What the build-watch last said went wrong, when it said anything.
-        ///
-        /// Read from its `.build-watch/status.json`. A failing build is the
-        /// other way an Apply strands, and until this field existed the message
-        /// could only guess at "is the build-watch running?" while the answer
-        /// sat in a log file. `None` when the status is missing, unreadable, or
-        /// reports a healthy build.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_error: Option<String>,
-        /// Whether the build-watch is positively known to have STOPPED.
+        /// INVARIANT: Whether the build-watch is positively known to have STOPPED.
         ///
         /// Read from the pidfile beside that status file, because the status
         /// alone cannot say: it records the last COMPLETED build, so a watch
@@ -725,7 +554,7 @@ pub enum SystemEvent {
         build_watch_stopped: bool,
         sent_at_ms: i64,
     },
-    /// A dev engine advanced its boot-pinned served-frontend snapshot to the
+    /// INVARIANT: A dev engine advanced its boot-pinned served-frontend snapshot to the
     /// checkout-shared `dist/`. Emitted on every swap, by the engine that applied
     /// a *frontend-only* change and by a peer workspace's periodic sync
     /// (`engine::frontend_refresh`,
@@ -739,7 +568,7 @@ pub enum SystemEvent {
     ServedFrontendAdvanced {
         sent_at_ms: i64,
     },
-    /// The supervised Vite dev server showing a coding-agent worktree's frontend
+    /// INVARIANT: The supervised Vite dev server showing a coding-agent worktree's frontend
     /// came up (`engine::frontend_preview`). Carries the **port**, never a URL:
     /// the same workspace is reached at `localhost` from the laptop and at a
     /// Tailscale name from the phone, and only the page knows which of those the
@@ -749,20 +578,14 @@ pub enum SystemEvent {
     FrontendPreviewStarted {
         thread_id: uuid::Uuid,
         port: u16,
-        /// Vite serves this machine alone, so only `localhost` reaches it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         loopback_only: bool,
         sent_at_ms: i64,
     },
-    /// The frontend preview stopped: explicitly, because its worktree was
-    /// reclaimed, or because another thread took the single slot. Transient and
-    /// dev-only for the same reasons as `FrontendPreviewStarted`.
     FrontendPreviewStopped {
         thread_id: uuid::Uuid,
         sent_at_ms: i64,
     },
-    /// The engine executable and initial frontend this workspace activated on
-    /// boot. Persisted once after the router selects the initial snapshot.
     EngineVersionActivated {
         build_id: String,
         engine_version: String,
@@ -770,47 +593,25 @@ pub enum SystemEvent {
         release_dirty: bool,
         frontend_source_commit: Option<String>,
     },
-    /// A snapshot swap started serving a different known frontend source SHA.
-    /// Persisted from the shared Apply and peer-sync swap path.
     ServedFrontendCommitChanged {
         previous_source_commit: Option<String>,
         source_commit: String,
     },
-    /// A source rebuild attempt ended, including delivery verification and any
-    /// internal retries. Persisted independently of the transient build state.
     EngineBuildCompleted {
-        /// `succeeded`, `failed`, or `skipped-locked`.
         outcome: String,
         duration_ms: u64,
-        /// Checkout HEAD targeted by the final delivery check or attempt.
-        /// It can differ from the executable's stamp and is null for a lock skip.
         built_head: Option<String>,
     },
-    /// The engine's dev background-rebuild `build_state` transitioned
-    /// (`idle`|`building`|`ready`|`failed`), emitted by `engine::background_build`
-    /// at build start (`building`) and completion (`ready`/`failed`, latest
-    /// generation only). A follow-up build after a join emits nothing new. A pure UI POKE so the connected client learns of a build
-    /// over the live SSE stream. The frontend handler re-runs the authoritative `checkEngineVersion`
-    /// GET rather than trusting `state` directly, so a stale/duplicate poke can
-    /// only trigger a harmless re-check, never a false spin. Transient (never
-    /// persisted — like `ServedFrontendAdvanced`) and dev-only by construction
-    /// (both rebuild entry points no-op packaged). `sent_at_ms` is
-    /// informational — the handler is idempotent, so no page-side freshness gate.
     EngineBuildStateChanged {
         state: String,
         sent_at_ms: i64,
     },
-    /// Semantic version status changed, including outside builds. Transient poke;
-    /// clients read version-status for the authoritative snapshot.
     EngineVersionStatusChanged {
         sent_at_ms: i64,
     },
-    /// This engine's served-frontend refresh started or ended. Transient poke;
-    /// clients re-read version-status for the authoritative snapshot.
     FrontendRefreshStateChanged {
         sent_at_ms: i64,
     },
-    /// The reported build-watch downtime changed. Transient poke to re-read version-status.
     FrontendBuildWatchStateChanged {
         sent_at_ms: i64,
     },
@@ -819,8 +620,6 @@ pub enum SystemEvent {
         commit: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
-        /// The thread whose turn wrote it, when one did. Engine work that
-        /// reads the write later, such as a memory summary, bills that thread.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writer_thread_id: Option<uuid::Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -831,7 +630,6 @@ pub enum SystemEvent {
         commit: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
-        /// See `ArtifactCreated`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writer_thread_id: Option<uuid::Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -861,7 +659,7 @@ pub enum SystemEvent {
         trigger_name: String,
         result_summary: String,
     },
-    /// Cron slots of one trigger passed with no run, past the catch-up grace.
+    /// INVARIANT: Cron slots of one trigger passed with no run, past the catch-up grace.
     /// One per trigger per gap, with a matching inbox notice. PERSISTED, so a
     /// trigger can react to it, and its `last_slot` keeps the next boot from
     /// reporting the same gap. Engine-driven, so it carries no actor.
@@ -875,20 +673,13 @@ pub enum SystemEvent {
     ChangeDiscarded {
         change_id: String,
     },
-    /// A device has at least one visible Lucidos tab (any view, not scoped to
-    /// a thread). Transient — projection lives in `device_presence`. Used by
-    /// cross-device push suppression: if any device is visible we skip the
-    /// push to ALL devices and rely on the active device's `NotificationCreated`
-    /// SSE channel to render the in-app toast.
     DeviceVisible {
         device_id: String,
     },
-    /// A device has no more visible Lucidos tabs (last one hidden / blurred /
-    /// unloaded). Transient — removes the projection row.
     DeviceHidden {
         device_id: String,
     },
-    /// SSE-only, never persisted. The engine asks every connected page what
+    /// INVARIANT: SSE-only, never persisted. The engine asks every connected page what
     /// it does with a new notification. See `system-knowhow/notifications.md`
     /// §3 (protocol, freshness gate) and §4 (the row matrix).
     ///
@@ -907,29 +698,15 @@ pub enum SystemEvent {
         event_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
-        /// Defaults to `Tap::Modal` (open inbox) so omitting it stays safe.
         #[serde(default)]
         tap: Tap,
         deadline_ms: u32,
         sent_at_ms: i64,
-        /// The devices the push is for, when it is about a root thread with a
-        /// driver (ADR 0623). A page outside it shows nothing and answers
-        /// `not_shown`. Absent means every device.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// SSE-only, never persisted. The desktop counterpart of the OS push,
-    /// emitted on the *push-allowed* branch, when no page handled the
-    /// [`Self::PresenceCheck`] in the app. A connected Tauri desktop app embeds a
-    /// WKWebView that can NOT receive Web Push, so it renders a NATIVE macOS
-    /// notification instead. Browser and PWA clients ignore it: they get the
-    /// real web push. A Tauri window brought forward since it answered shows
-    /// the in-app toast instead of the banner, so the frame always surfaces
-    /// (see `system-knowhow/notifications/1-conceptual-model.md` §1, `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4). It carries the
-    /// toast content so the page renders without a re-fetch; `sent_at_ms`
-    /// drives the page-side freshness gate.
     NativePushRequested {
         notification_id: Uuid,
         title: String,
@@ -940,50 +717,22 @@ pub enum SystemEvent {
         event_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
-        /// Defaults to `Tap::Modal` (open inbox) so omitting it stays safe.
         #[serde(default)]
         tap: Tap,
         sent_at_ms: i64,
-        /// The devices the banner is for, as on [`Self::PresenceCheck`].
-        /// Absent means every device.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<Vec<String>>,
     },
-    /// SSE-only, never persisted. The cross-device counterpart of a *read*: when
-    /// a notification is read on one device, the engine broadcasts this so a
-    /// connected Tauri desktop app REMOVES the already-delivered native macOS
-    /// banner(s) for it — `UNUserNotificationCenter.removeDeliveredNotifications`
-    /// (single) / `removeAllDeliveredNotifications` (all). This is the macOS-only
-    /// half of cross-device dismiss: the open web can't silently remove a Web
-    /// Push banner (Safari revokes a subscription after 3 silent pushes), so
-    /// browser / PWA pages ignore this event — see
-    /// `docs/plans/2026-05-18-cross-device-notification-dismiss-design.md` and
-    /// `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4. `notification_id = None` means
-    /// "dismiss all" (the mark-all-read path); `Some(id)` dismisses one.
-    /// `sent_at_ms` drives the page-side freshness gate, which drops a late
-    /// SSE-queue flush — bounding (not fully eliminating, since
-    /// `removeAllDeliveredNotifications` is blunt) the window in which a delayed
-    /// dismiss-all could clear a banner for a notification created after an
-    /// all-read.
     NativePushDismissRequested {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_id: Option<Uuid>,
         sent_at_ms: i64,
-        /// The reader's devices on a team gateway (ADR 0623): one user's
-        /// read dismisses that user's banners only. Absent means everyone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<Vec<String>>,
     },
-    /// The gateway changed its users: a user, an email or a device moved
-    /// (ADR 0623). Transient. Every page reloads its own user's devices,
-    /// which decide its Review group on a team gateway. Aggregate `user`,
-    /// id `all`.
     UsersChanged,
-    /// A pairing started or stopped waiting for a paired device's Allow. Transient.
-    /// The gateway posts `/api/v1/pairing-requests/changed`, and Settings, Access
-    /// re-reads its list. Aggregate `pairing`, id `all`.
     PairingRequestsChanged,
-    /// A plugin was installed (or updated — overwrite=true reuses this variant).
+    /// INVARIANT: A plugin was installed (or updated — overwrite=true reuses this variant).
     /// `manifest` carries the full parsed manifest so future fields are additive.
     /// `files` are paths under `data/` so a future tracked-uninstall can derive
     /// ownership without a schema change.
@@ -1013,14 +762,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A plugin was uninstalled. From v2 onwards the engine actually deletes
-    /// the recorded files from `data/` (gated by the user's confirm in the
-    /// uninstall panel). `files` is the full list recorded at install time,
-    /// `files_deleted` is the subset actually removed this turn, and
-    /// `files_missing` is the subset that had already been removed by hand
-    /// before this uninstall fired. The two new fields default to empty so
-    /// old DB rows from the v1 guide-only flow deserialize unchanged.
-    /// `affected_triggers` is as on `PluginInstalled`, over `files_deleted`.
     PluginUninstalled {
         id: String,
         version: String,
@@ -1034,7 +775,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An install met files the user had locally edited, and says what it did
+    /// INVARIANT: An install met files the user had locally edited, and says what it did
     /// with each. `merged` kept their edit alongside upstream's. `conflicted`
     /// could not. `replaced` was never mergeable: a trigger projection, a
     /// binary, or the panel's keep control switched off. `restored` is a file
@@ -1074,9 +815,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A pending plugin install (raised by `install_plugin` / `update_plugin`)
-    /// was canceled by the user from the install panel. Audit trail only —
-    /// no file writes happen on cancel; the staged temp dir is dropped.
     PluginInstallCanceled {
         id: String,
         version: String,
@@ -1085,30 +823,12 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A pending plugin uninstall was canceled from the uninstall panel.
-    /// Audit trail only — no files are touched on cancel; the pending entry
-    /// is just dropped.
     PluginUninstallCanceled {
         id: String,
         version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A plugin marketplace was registered, or an existing one re-registered
-    /// under a new name. One variant covers both because registration is an
-    /// **upsert**: `core::plugin_marketplaces::add_marketplace` keys on a hash
-    /// of the canonical source, so re-registering the same source rewrites the
-    /// existing entry's `name` (and its raw `source` string, which can differ
-    /// by a `.git` suffix or owner/repo casing while hashing the same) instead
-    /// of adding a second one. That is the rename path, and a `Renamed` variant
-    /// would misdescribe the source-only case. Same shape as `RepositoryAdded`
-    /// and `McpServerRegistered`, which are upserts for the same reason. The
-    /// payload carries the resulting `name` + `source`, so a reader sees what
-    /// the marketplace is now rather than what changed.
-    ///
-    /// Emitted from `engine::tools::plugins::marketplaces`, the single write
-    /// path both the HTTP handler and the `plugins` tool go through, so the
-    /// Plugins panel and Settings, Marketplaces refresh live from any origin.
     PluginMarketplaceRegistered {
         marketplace_id: String,
         name: String,
@@ -1116,49 +836,27 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A plugin marketplace was unregistered. Its already-installed plugins
-    /// stay on disk (the installed list is a separate projection), they just
-    /// stop appearing in the catalog scan.
     PluginMarketplaceRemoved {
         marketplace_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A marketplace scan began. Raises the Plugins panel's scanning state.
-    ///
-    /// TRANSIENT (never persisted), like `MemoryRebuildProgress`. The scan runs
-    /// at startup and every five minutes. Persisting it would add a heartbeat
-    /// row and say nothing an audit wants. What a marketplace IS stays audited
-    /// by `PluginMarketplaceRegistered` / `Removed`.
     PluginCatalogScanStarted {},
-    /// A marketplace scan ended, and the *plugin catalog cache* now holds its
-    /// result. Clients re-read `GET /api/v1/plugins/catalog`, which is a file
-    /// read rather than the clone pass it used to be.
-    ///
-    /// TRANSIENT, for the same reason as its sibling above. `failed` reports a
-    /// scan that could not complete at all, as opposed to the per-marketplace
-    /// failures the catalog carries in its `errors`.
     PluginCatalogScanned {
         failed: bool,
     },
-    /// A device pinned an app to its home / dock surface. Audit-worthy because
-    /// the pinned set is what powers the app launcher on that device.
     PinnedAppPinned {
         app_id: String,
         device_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A device unpinned an app. Symmetric to `PinnedAppPinned`.
     PinnedAppUnpinned {
         app_id: String,
         device_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A device registered with the engine for the first time. Persisted so
-    /// the timeline shows when each device became part of the workspace; the
-    /// `devices` table is the projection.
     DeviceRegistered {
         device_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1166,8 +864,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A device was renamed by the user. `name: None` clears back to the
-    /// `device-<short>` fallback.
     DeviceRenamed {
         device_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1181,15 +877,11 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A device row was deleted (typically the user revoked it from settings).
     DeviceDeleted {
         device_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// One device's whole row moved to a new id, keeping its push subscription
-    /// and its preferences. Emitted when a browser stops minting its own id and
-    /// takes the *workspace gateway*'s instead. `device_id` is where it landed.
     DeviceHandedOver {
         device_id: String,
         old_device_id: String,
@@ -1203,9 +895,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A repository left the registry. `name`, `root_path` and `description`
-    /// are what Undo re-registers it from (ADR 0623). They are `None` on an
-    /// identity collapse, which a re-registration causes, and on older rows.
     RepositoryRemoved {
         repo_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1217,7 +906,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A credential entry was created. **Never** carry the auth value here —
+    /// INVARIANT: A credential entry was created. **Never** carry the auth value here —
     /// the payload reaches every SSE subscriber on every connected device.
     /// The service identifier is the only public field.
     CredentialCreated {
@@ -1226,16 +915,13 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A credential's auth value was updated. Same secrecy contract as
+    /// INVARIANT: A credential's auth value was updated. Same secrecy contract as
     /// `CredentialCreated` — only the service id is broadcast.
     CredentialUpdated {
         service_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A credential entry was removed. `metadata` is everything but the value,
-    /// so Undo can restore the entry for someone to fill in again. `None` on
-    /// older rows.
     CredentialDeleted {
         service_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1243,42 +929,23 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A credential's plaintext was handed to a caller, through the Settings
-    /// copy buttons or the edit form's prefill.
-    ///
-    /// Same secrecy contract as its siblings: the service and its type, never
-    /// the value. What it adds is that a read is now on the record. The origin
-    /// check in front of it is defense in depth, not a boundary (ADR 0117). So
-    /// a reveal that should not have happened leaves a row somebody can find.
-    ///
-    /// `auth_type` is a plain `String` here, unlike `CredentialCreated`'s typed
-    /// field. The reveal route reads it off the stored row as its wire
-    /// spelling, and never parses it back.
     CredentialRevealed {
         service_name: String,
         auth_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A user-managed environment variable was created or updated (upsert).
-    /// Unlike credentials, these are **not** secret — the `value` is carried so
-    /// the settings UI can refresh live without an extra fetch, and it may
-    /// appear in logs / the event store. That is the whole point of the feature.
     EnvironmentVariableSet {
         name: String,
         value: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A user-managed environment variable was removed.
     EnvironmentVariableDeleted {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A chat-model registry entry was created (user-added via Settings →
-    /// Models). The id is the request value (e.g. `claude-fable-5`); `provider`
-    /// is the backend that serves it (`vertex` / `anthropic` / `openai`).
     ModelCreated {
         id: String,
         label: String,
@@ -1286,21 +953,17 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A model registry entry was edited (label/provider/sort/enabled, or a
-    /// builtin toggled enabled/disabled). Drives the model-registry reload.
     ModelUpdated {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A user-added model registry entry was removed (builtins are not
-    /// deletable, only disable-able).
     ModelDeleted {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A webhook was created. It opens a publicly reachable endpoint that emits
+    /// INVARIANT: A webhook was created. It opens a publicly reachable endpoint that emits
     /// a pinned domain event, so its birth belongs on the timeline. The payload
     /// carries the pinned `event_type` and whether a signature is configured,
     /// never the token and never a secret.
@@ -1312,10 +975,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A webhook's configuration changed. `enabled` is carried because turning
-    /// one off is the thing a reader most often wants to date. `signed` joins
-    /// it because a signature can be added, changed and removed, and this event
-    /// is the only record of when.
     WebhookUpdated {
         webhook_id: String,
         name: String,
@@ -1325,14 +984,13 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A webhook was deleted, so its URL answers nothing from now on.
     WebhookDeleted {
         webhook_id: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An address family stopped answering on the public webhook path.
+    /// INVARIANT: An address family stopped answering on the public webhook path.
     ///
     /// Emitted on the edge, after two consecutive cycles see the same failure.
     /// The engine reports and never repairs: a workspace trigger decides what
@@ -1341,39 +999,26 @@ pub enum SystemEvent {
     WebhookIngressDegraded {
         webhook_id: String,
         webhook_name: String,
-        /// The funnel hostname that was probed.
         host: String,
-        /// The public funnel port, not the loopback port behind it.
         port: u16,
-        /// Which families are down. A healthy sibling family does not save
+        /// INVARIANT: Which families are down. A healthy sibling family does not save
         /// them: senders reach one family each, and a dead one is an outage.
         degraded_families: Vec<Family>,
-        /// Both families, always, so a reader can tell healthy from never
-        /// asked.
         families: Vec<FamilyVerdict>,
-        /// Every address probed, with the stage each one reached.
         addresses: Vec<AddressProbe>,
     },
-    /// The public webhook path answers again on every family that was down.
-    ///
-    /// One clean cycle is enough. Being wrong in this direction costs a second
-    /// declaration, while waiting costs a workspace that thinks it is still
-    /// blind.
     WebhookIngressRecovered {
         webhook_id: String,
         webhook_name: String,
         host: String,
         port: u16,
-        /// Which families came back.
         recovered_families: Vec<Family>,
         families: Vec<FamilyVerdict>,
         addresses: Vec<AddressProbe>,
-        /// When the outage was declared, RFC 3339.
         down_since: String,
-        /// How long it lasted, in seconds.
         down_secs: i64,
     },
-    /// This computer slept while a webhook was on, so deliveries sent in that
+    /// INVARIANT: This computer slept while a webhook was on, so deliveries sent in that
     /// time never arrived.
     ///
     /// One per *sleep spell*, on the first clean ingress round after it, and
@@ -1381,65 +1026,42 @@ pub enum SystemEvent {
     /// one spell. It blames no funnel and no family, because none failed
     /// (`docs/adr/0367-a-sleeping-host-is-not-a-dead-ingress.md`).
     WebhookDeliveriesSleptThrough {
-        /// The hook the ingress round probed, as on the two events above.
         webhook_id: String,
         webhook_name: String,
         host: String,
         port: u16,
-        /// How long the computer slept, summed over the spell. Read off the
+        /// INVARIANT: How long the computer slept, summed over the spell. Read off the
         /// gap between the wall clock and the monotonic clock.
         slept_secs: u64,
     },
-    /// A webhook is turning away the deliveries it receives.
-    ///
-    /// The verification-layer sibling of `WebhookIngressDegraded`. That one
-    /// says a sender cannot reach the workspace. This one says a sender
-    /// reached it and had its delivery thrown away, which the ingress probe
-    /// cannot see: a 401 is the healthy answer there.
-    ///
-    /// Edge-triggered off the hook's own *refusal run*, so a standing fault
-    /// emits nothing per cycle. No actor, because the engine drove it.
     WebhookDeliveriesRefused {
         webhook_id: String,
         webhook_name: String,
-        /// Whether the hook is switched on. The user's one-click recovery for
-        /// the `disabled` cause is to turn it back on, so it is here.
         enabled: bool,
-        /// What is turning them away. `disabled` and `verification` want
-        /// different words and different actions.
         cause: RefusalCause,
-        /// How many deliveries have been turned away since the last one
-        /// verified.
         refusals: i64,
-        /// The run's breakdown by reason, keyed by `DeliveryRefusal::key`.
+        /// INVARIANT: The run's breakdown by reason, keyed by `DeliveryRefusal::key`.
         ///
         /// The whole evidence rather than the last line of it. A single
         /// diagnostic probe adds one to its own reason and erases nothing.
         reasons: std::collections::BTreeMap<String, i64>,
-        /// When the run started, RFC 3339.
+        /// INVARIANT: When the run started, RFC 3339.
         refusing_since: String,
-        /// How long it has been going, in seconds. Measured by Postgres beside
-        /// `refusing_since` (ADR 0053), never by the engine's own clock.
         refusing_secs: i64,
     },
-    /// A webhook stopped turning away the deliveries it receives.
+    /// INVARIANT: A webhook stopped turning away the deliveries it receives.
     ///
     /// `resolution` says which way out it took. Every way a hook can leave the
     /// refusing state has one, so a declaration cannot strand.
     WebhookDeliveriesRecovered {
         webhook_id: String,
         webhook_name: String,
-        /// What had been declared, so a reader can pair the two events.
         cause: RefusalCause,
         resolution: Resolution,
-        /// When the run that was declared started, RFC 3339.
         refusing_since: String,
-        /// How long the WHOLE run lasted, in seconds, not the part since it was
-        /// declared. Nothing is declared before the 30-minute floor, so the
-        /// declaring event's own age understates every outage.
         refusing_secs: i64,
     },
-    /// An MCP server was registered, or an existing one re-registered with a
+    /// INVARIANT: An MCP server was registered, or an existing one re-registered with a
     /// new command / args / env. The `mcp_servers` table drives which external
     /// tools the agent can call, so a registration changes the agent's own tool
     /// surface: it belongs on the timeline even though no UI lists it yet.
@@ -1454,15 +1076,13 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An MCP server's settings changed without re-registering it (today: the
-    /// auto-approve flag, which decides whether its tool calls prompt).
     McpServerUpdated {
         server_id: String,
         auto_approve: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Which of a server's tools are switched off changed. `disabled_tools` is
+    /// INVARIANT: Which of a server's tools are switched off changed. `disabled_tools` is
     /// the resulting set in full, by WIRE name, not a delta: the user picks a
     /// selection, and one event that states it is easier to read back than a
     /// pair of added/removed lists.
@@ -1481,22 +1101,17 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An MCP server was unregistered and its tools left the agent's surface.
     McpServerRemoved {
         server_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Someone stopped an MCP server: its process ended, and it is switched
-    /// off in every thread that had enabled it (ADR 0430). Engine shutdown
-    /// ends the processes too, but emits nothing, so threads keep what they
-    /// enabled across a restart.
     McpServerStopped {
         server_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Someone approved an MCP server's current launch line: its command,
+    /// INVARIANT: Someone approved an MCP server's current launch line: its command,
     /// args, env and spawn directory. With the command guard on, a start of a
     /// line nobody approved is refused. Emitted by
     /// `McpServerStore::approve_launch`, only for a new approval. Carries no
@@ -1506,7 +1121,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// One lane's standing tool grants changed: the *permission grants* the
+    /// INVARIANT: One lane's standing tool grants changed: the *permission grants* the
     /// `permissions` table holds for the workspace, one row per pattern.
     ///
     /// `patterns` carries the full resulting set. Legacy imports only add
@@ -1527,10 +1142,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An OAuth account was connected (or re-authorized with new scopes). The
-    /// counterpart of `OAuthAccountDeleted`: without it the Accounts list only
-    /// refreshed live on a disconnect, and connecting from one device left
-    /// every other one showing a stale list until a reload.
     OAuthAccountConnected {
         account_id: String,
         provider: String,
@@ -1539,14 +1150,11 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An OAuth account row was removed (revoke / delete from settings).
     OAuthAccountDeleted {
         account_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The workspace signed in to its Claude gateway, `issuer`, replacing any
-    /// earlier sign-in. Carries no token.
     ClaudeGatewaySignedIn {
         issuer: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1554,37 +1162,29 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The Claude gateway sign-in ended, for `reason`.
     ClaudeGatewaySignedOut {
         issuer: String,
         reason: ClaudeGatewaySignOutReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A device sign-in to the Claude gateway `issuer` began, waiting for the
-    /// user to approve its code. Carries neither the code nor any token.
     ClaudeGatewaySignInStarted {
         issuer: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A sign-in to the Claude gateway `issuer` in progress was stopped
-    /// before the user approved it. `actor` is who stopped it.
     ClaudeGatewaySignInCanceled {
         issuer: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A sign-in to the Claude gateway `issuer` ended without tokens: the code
-    /// expired, the user declined, or the gateway refused. `error` says which,
-    /// and `actor` is who started the sign-in.
     ClaudeGatewaySignInFailed {
         issuer: String,
         error: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The *gateway managed settings* `issuer` sets for the signed-in user
+    /// INVARIANT: The *gateway managed settings* `issuer` sets for the signed-in user
     /// changed. `policy` is false when the gateway now has none for them.
     /// `telemetry` says whether the policy asks for usage telemetry, and
     /// `available_models` is its model allowlist. Carries no other setting,
@@ -1596,54 +1196,37 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_models: Option<Vec<String>>,
     },
-    /// The workspace signed in with ChatGPT for the *ChatGPT plan provider*.
-    /// `email` names the account. Carries no token.
     ChatGptPlanSignedIn {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         email: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The ChatGPT plan sign-in ended, for `reason`. The registration stays,
-    /// so the next sign-in reuses the issued client id, unless `reason` is
-    /// `forgotten`.
     ChatGptPlanSignedOut {
         reason: ChatGptPlanSignOutReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A Sign in with ChatGPT attempt began, waiting for the browser to come
-    /// back. Carries no URL, `state` or token.
     ChatGptPlanSignInStarted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A Sign in with ChatGPT attempt was stopped before it finished. `actor`
-    /// is who stopped it.
     ChatGptPlanSignInCanceled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A Sign in with ChatGPT attempt ended without a sign-in: it timed out,
-    /// the user declined, or OpenAI refused. `error` says which, and `actor`
-    /// is who started it.
     ChatGptPlanSignInFailed {
         error: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The ChatGPT plan answered that its usage limit for Lucidos is spent.
+    /// INVARIANT: The ChatGPT plan answered that its usage limit for Lucidos is spent.
     /// Plan requests fail fast, with no request sent, until `paused_until`.
     /// Emitted once per pause. `paused_until` is Lucidos's own pause, never
     /// OpenAI's reset time.
     ChatGptPlanLimitReached {
         paused_until: chrono::DateTime<chrono::Utc>,
     },
-    /// A `PUT /api/v1/data/*path` write committed (file created or replaced).
-    /// `commit` is the resulting git sha when the path lives under `artifacts/`
-    /// (manager-committed); empty for non-artifact paths that bypass the
-    /// artifact-manager commit dance. The agent's `write_file` and `copy_file`
-    /// emit it too, with no actor, for a path outside `artifacts/`.
     DataFileWritten {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1651,8 +1234,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A `DELETE /api/v1/data/*path` removed a file. The agent's `delete_file`
-    /// emits it too, with no actor, for a path outside `artifacts/`.
     DataFileDeleted {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1660,7 +1241,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A `POST /api/v1/data/edit` ran one or more in-place operations
+    /// INVARIANT: A `POST /api/v1/data/edit` ran one or more in-place operations
     /// (JSON-path or text find/replace). `operations_count` records how many
     /// op-blocks were applied; the per-op detail isn't broadcast because the
     /// values may carry user data we don't want to fan out to every SSE
@@ -1672,32 +1253,23 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A thread's *compose report* (`docs/glossary.md`) after a change to its
-    /// draft. Broadcast to SSE for cross-device sync; intentionally NOT
-    /// persisted to the events table. The `thread_summaries` row holds the
-    /// current state, and keystroke history isn't audit-worthy. Receivers
-    /// order frames by `summary_version` (ADR 0437). Build one with
-    /// `ComposeReport::broadcast`.
     ThreadComposeChanged {
         id: Uuid,
         #[serde(default)]
         restorations: Vec<crate::core::store::ComposeRestoration>,
         text: String,
-        /// Content-addressed sha256 hashes of compose-draft image blobs.
-        /// Cross-device sync transmits ~80 bytes per attached image instead
-        /// of inflating each base64 payload over SSE on every keystroke.
         #[serde(default)]
         image_hashes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
-        /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
+        /// INVARIANT: Per-draft dropdown selections (target/scope, coding agent, Lucidos
         /// model + reasoning, coding-agent model + reasoning) as a partial
         /// `ComposeSelectionOverride`-shaped object. `None` = the PUT didn't
         /// touch the selection (COALESCE-preserve); receivers hydrate their
         /// per-draft store from it under the same origin/focus guards as text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection: Option<serde_json::Value>,
-        /// The thread's *compose epoch* after this change (`docs/glossary.md`):
+        /// INVARIANT: The thread's *compose epoch* after this change (`docs/glossary.md`):
         /// advanced by each submission or Stop restoration.
         /// Carried on every broadcast so a device always holds a value its next
         /// compose PUT can be fenced against, including the device whose own
@@ -1705,7 +1277,7 @@ pub enum SystemEvent {
         /// 0, which is also what a never-submitted thread stores.
         #[serde(default)]
         compose_epoch: i64,
-        /// The *compose revision*: the row's `summary_version` right after the
+        /// INVARIANT: The *compose revision*: the row's `summary_version` right after the
         /// statement that produced this report. A receiver ignores a frame at
         /// or below the revision it already holds.
         #[serde(default)]
@@ -1713,56 +1285,35 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_device_id: Option<String>,
     },
-    /// Apply All started. Persists the full list of change IDs so the
+    /// INVARIANT: Apply All started. Persists the full list of change IDs so the
     /// engine can resume the batch after a mid-flight conflict or an engine
     /// restart — the driver looks up the in-memory `ApplyAllRegistry`
     /// (recovered from this event on startup) when each member resolves.
     ApplyAllBatchStarted {
-        /// Engine-assigned batch identifier — used as `aggregate_id` so the
-        /// projection groups all events for one batch together.
         batch_id: Uuid,
-        /// Change IDs to apply, in pending-list order. The driver starts
-        /// members in this order.
         change_ids: Vec<Uuid>,
-        /// Who clicked Apply All. Stamps each per-change `apply_change` the
-        /// driver makes so the resulting `ChangeApplied` chip reads as the
-        /// user, not "Lucidos Engine".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Every member of an `ApplyAllBatchStarted` has resolved (applied or
+    /// INVARIANT: Every member of an `ApplyAllBatchStarted` has resolved (applied or
     /// failed). Closes the batch so projections and UI know the run is
     /// over. Emitted by the driver only — the canonical signal that batch
     /// state can be dropped from memory.
     ApplyAllBatchCompleted {
         batch_id: Uuid,
         applied: Vec<Uuid>,
-        /// Per-change failures in the order they landed. Empty when the
-        /// whole batch succeeded.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         failed: Vec<crate::engine::thread_events::apply::ApplyFailure>,
     },
-    /// The owner armed a *standing apply*: this thread's change is to be
-    /// applied once the thread settles (ADR 0168 clause 5). Re-arming the same
-    /// thread emits again, because the arm it replaces may have named a
-    /// different change.
     StandingApplyArmed {
         thread_id: Uuid,
-        /// The change the arm is bound to. `None` means the thread was still
-        /// working with nothing proposed, so the arm takes whatever it
-        /// proposes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         change_id: Option<Uuid>,
-        /// The Apply All sweep that armed this thread, when a sweep did.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A standing apply ended by firing: its thread settled and the engine
-    /// started applying `change_id`. `ChangeApplied` or `ChangeApplyFailed`
-    /// reports how the apply went. Every surface drawing the armed face clears
-    /// on this, exactly as on a drop.
     StandingApplyFired {
         thread_id: Uuid,
         change_id: Uuid,
@@ -1771,120 +1322,83 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A standing apply ended without applying, and this is its report. A
-    /// thread parked on a question, or whose turn failed, never settles by
-    /// itself, so the arm is dropped rather than left waiting. Also covers the
-    /// owner disarming it and the armed change disappearing.
     StandingApplyDropped {
         thread_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         change_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch_id: Option<Uuid>,
-        /// Why it ended, written for the owner to read in the morning.
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The landing lane set changes aside that would not merge cleanly onto
-    /// `main`, and they now resolve together as one *lane batch*. Each member
-    /// names the exact commit the lane lands. The *lane thread* resolves them
-    /// on the batch's integration branch.
     LaneBatchStarted {
         batch_id: Uuid,
         members: Vec<crate::engine::thread_events::landing_lane::LaneMember>,
-        /// `main` when the batch formed, where its integration branch starts.
         base_sha: String,
         lane_thread_id: Uuid,
     },
-    /// The lane batch landed whole, one landing merge per member. `pre_sha`
-    /// is `main` just before, and `post_sha` is `main` after.
     LaneBatchLanded {
         batch_id: Uuid,
         pre_sha: String,
         post_sha: String,
     },
-    /// A disjoint catch-up carried the lane's full hardening to its new head.
     HardenCertificateCarried {
         batch_id: Uuid,
         from_sha: String,
         to_sha: String,
     },
-    /// The lane batch failed as a whole. Every member stays pending and
-    /// apply-ready, and nothing queues it again by itself. `actor` is set for
-    /// a Cancel from the lane.
     LaneBatchFailed {
         batch_id: Uuid,
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The lander must publish failure results before closing the batch.
+    /// INVARIANT: The lander must publish failure results before closing the batch.
     LaneBatchFailureRequested {
         batch_id: Uuid,
         reason: String,
         actor: Option<MessageOrigin>,
     },
-    /// The lane batch's catch-up changed its hardened head, so it hardens
+    /// INVARIANT: The lane batch's catch-up changed its hardened head, so it hardens
     /// again. Until it lands or fails, or the cap passes, the lane queues
     /// clean arrivals instead of landing them, so `main` holds still.
     LaneArrivalsHeld {
         batch_id: Uuid,
     },
-    /// The hold on clean arrivals ended. `arrivals` are the changes it held,
-    /// in arrival order, which now land as they would have.
     LaneArrivalsReleased {
         batch_id: Uuid,
         cause: crate::engine::thread_events::landing_lane::LaneHoldRelease,
         arrivals: Vec<Uuid>,
     },
-    /// An Apply outside the landing lane moved `main`, but pushing it to
-    /// `origin` failed. `main` stays moved locally. `repo` names the
-    /// repository's root directory, and `reason` is git's answer (ADR 0589).
     MainPushFailed {
         repo: String,
         reason: String,
     },
-    /// Local `main` could not fast-forward to a newer `origin/main`, so it
-    /// stays where it was. Sent once per distinct reason. `repo` names the
-    /// repository's root directory (ADR 0589).
     MainFollowRefused {
         repo: String,
         reason: String,
     },
-    /// Local `main` fast-forwarded from `from_sha` to a newer `origin/main` at
-    /// `to_sha`, because another gateway landed. The main check reads it as a
-    /// landing. `repo` names the repository's root directory (ADR 0694).
     MainFollowed {
         repo: String,
         from_sha: String,
         to_sha: String,
     },
-    /// The lander published handed-off changes to origin/main.
     RemoteChangesLanded {
         repo: String,
         from_sha: String,
         to_sha: String,
     },
-    /// The *main check* started on GitHub against a stripped copy of
-    /// `to_sha`, covering what landed since `from_sha` (ADR 0464).
     MainCheckStarted {
         check_id: Uuid,
         from_sha: String,
         to_sha: String,
     },
-    /// The running main check's workflow run started: `run_url` is its page
-    /// and `branch` its mirror branch. A restart from here on reattaches to
-    /// the run instead of abandoning the check (ADR 0464).
     MainCheckRunLinked {
         check_id: Uuid,
         run_url: String,
         branch: String,
     },
-    /// The main check passed: `main` at its `to_sha` is green. `flaky` names
-    /// the tests that failed once and passed a retry. `flaky_fix_thread_id`
-    /// names the repair its flaky findings went to. `fix_thread_id` names the
-    /// repair this pass reports to: that one, or the red it closes.
     MainCheckPassed {
         check_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1896,9 +1410,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         flaky_fix_thread_id: Option<Uuid>,
     },
-    /// The main check failed. Unless superseded by a fix landing, main is red;
-    /// `fix_thread_id` names its repair owner. `failures` names each test with the head
-    /// of its error. `tail` is the end of the failing output.
     MainCheckFailed {
         check_id: Uuid,
         summary: String,
@@ -1912,8 +1423,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         superseded_by_fix: Option<Uuid>,
     },
-    /// A main repair was admitted. Persisted main_check aggregate, keyed by
-    /// check_id; actor is present only for the owner's Fix now.
     MainCheckRepairStarted {
         check_id: Uuid,
         fix_thread_id: Uuid,
@@ -1921,26 +1430,18 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The main check ended with no verdict: GitHub was down, the push was
-    /// refused, or the engine restarted mid-run. It starts nothing by itself.
     MainCheckAbandoned {
         check_id: Uuid,
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_url: Option<String>,
     },
-    /// A newer `main` at `to_sha` cancelled the running main check before its
-    /// first test job started. It is no verdict, and the next check starts on
-    /// the newer `main` at once (ADR 0694).
     MainCheckSuperseded {
         check_id: Uuid,
         to_sha: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_url: Option<String>,
     },
-    /// The red check closed: its fix landed, newer main passed, or the owner closed it.
-    /// `fix_thread_id` names the repair that owned it, absent on older rows.
-    /// `actor` is set for the maintainer's Close.
     MainCheckRedClosed {
         check_id: Uuid,
         reason: crate::engine::thread_events::main_check::RedCloseReason,
@@ -1949,7 +1450,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Bash supervisor (`scripts/lib/engine_supervisor.sh`) wrapped an
+    /// INVARIANT: Bash supervisor (`scripts/lib/engine_supervisor.sh`) wrapped an
     /// engine instance that died unexpectedly and is spawning its replacement.
     /// Graceful exits and the platform's SIGINT/SIGUSR1 stops are excluded. The
     /// supervisor writes a sidecar JSON file at
@@ -1965,91 +1466,49 @@ pub enum SystemEvent {
         died_at: chrono::DateTime<chrono::Utc>,
         supervisor_pid: u32,
     },
-    /// Outbound email was sent successfully via SMTP. Carries only
-    /// envelope metadata (account, recipients, subject, attachment
-    /// count) — the message body is user data and stays out of the
-    /// audit trail. Emitted by the `/api/v1/email/send` HTTP handler so
-    /// the timeline records who sent what, when.
     EmailSent {
-        /// Email account that performed the send (looked up in `email_accounts`).
         account: String,
-        /// Primary recipients.
         to: Vec<String>,
-        /// CC recipients. Empty when none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cc: Vec<String>,
-        /// BCC recipients. Empty when none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         bcc: Vec<String>,
-        /// Subject line. Body intentionally omitted (user data).
         subject: String,
-        /// How many files were attached. Body and contents intentionally omitted.
         attachment_count: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The on-disk WASM auth-modules directory was re-scanned and the
-    /// engine's compiled-module map was swapped atomically. Persisted
-    /// because the reload changes runtime behavior of every subsequent
-    /// proxy call — a post-mortem of a suddenly-broken sign-handshake
-    /// reads this row to see when the surface changed and to what.
     ProxyModulesReloaded {
-        /// Number of modules now loaded after the swap.
         count: usize,
-        /// Sorted list of module names now loaded.
         names: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A `script_handshake` script became runnable: its path and content hash
-    /// were recorded in `<workspace>/.lucidos/approved-handshake-scripts`
-    /// (ADR 0144). Persisted because it is the moment a file gained the right
-    /// to run as the engine user, and `source` says on whose authority.
     HandshakeScriptApproved {
-        /// Workspace-relative path, e.g. `data/scripts/auth/comfort-cloud.py`.
         path: String,
-        /// Authored by a file tool, named by the CLI, or seeded on first start.
         source: crate::core::handshake_approvals::ApprovalSource,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A `script_handshake` script that carried no scope was bound to one, so
-    /// the token it mints can only be sent there (ADR 0144). No stored
-    /// credential speaks for a minted token, and the record lives outside
-    /// `data/`. Once per script, on the first request that would use it.
     HandshakeScriptScopeBound {
-        /// Workspace-relative path, e.g. `data/scripts/auth/comfort-cloud.py`.
         path: String,
-        /// The one upstream this script's token may now be sent to.
         base_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A `script_handshake` script that carried no injected-secret set was
-    /// bound to one, so `apis.json` can no longer swap what it receives
-    /// (ADR 0144). The sibling of `HandshakeScriptScopeBound`, for the secrets
-    /// going IN rather than the token coming out. Once per script, on the first
-    /// request that would inject one.
     HandshakeScriptInjectsBound {
-        /// Workspace-relative path, e.g. `data/scripts/auth/comfort-cloud.py`.
         path: String,
-        /// What this script may now be handed, sorted. `c:<credential>` for a
-        /// stored credential, `o:<provider>` for a connected OAuth account.
         injects: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A credential that carried no `base_url` was bound to one, so the proxy's
-    /// scope check has something to enforce (ADR 0144). The scope comes from
-    /// the `apis.json` entry naming it. Once per credential, at startup.
     CredentialScopeInferred {
         service_name: String,
-        /// The scope now recorded on the credential.
         base_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An ordinary composer input was durably accepted, before execution.
+    /// INVARIANT: An ordinary composer input was durably accepted, before execution.
     /// Aggregate `thread`, identity `thread_id`. The immutable request and
     /// compose acknowledgement survive process loss. Recovery must retain
     /// user priority. This event is not a MessageReceived.
@@ -2063,12 +1522,6 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A saved draft was durably accepted (ADR 0651). Aggregate `thread`,
-    /// identity `receipt.thread_id`, so deleting the thread removes its saved
-    /// content and cascades its retry receipt. The projection records a permanent
-    /// retry receipt, recoverable queue membership, and consumption of the
-    /// exact draft revision in the same transaction. The snapshot and
-    /// authority evidence are immutable audit data; acceptance is not execution.
     DraftSubmissionAccepted {
         receipt: crate::core::draft_submission::DraftSubmissionReceipt,
         snapshot: crate::core::store::ComposeReport,
@@ -2077,43 +1530,22 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A background spawn entered the *Thread Queue* (admission control).
-    /// Emitted for EVERY background spawn — entries that fit capacity are
-    /// admitted immediately (a `ThreadQueueAdmitted` follows in the same
-    /// breath), entries over capacity wait in the queue. `requeued: true`
-    /// marks the boot sweep re-queuing an `admitted` entry whose work died
-    /// with the previous engine process. Projection: `thread_queue` row
-    /// upserted with status `'queued'`.
     ThreadQueued {
         entry_id: Uuid,
-        /// Capacity bucket: `event-trigger` | `cron` | `sub-thread` | `coding-agent`.
         kind: crate::engine::thread_events::queue::ThreadQueueKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_name: Option<String>,
-        /// Bound thread for sub-thread / coding-agent spawns (pre-allocated id).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_id: Option<Uuid>,
-        /// Human preview for the Thread Queue panel.
         summary: String,
-        /// Full re-executable spawn request (`ThreadQueueRequest` JSON).
         request: serde_json::Value,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         requeued: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A Thread Queue entry was admitted — capacity allowed it (or the user
-    /// clicked Run now; that path carries the `actor`). The entry's work is
-    /// now executing; the `thread_queue` row flips to `'admitted'` and is the
-    /// persisted active-session record until `ThreadQueueCompleted`.
-    ///
-    /// **A trigger fire emits this TWICE** (ADR 0133). The fire creates its
-    /// thread while it runs, so the admission emit carries no `thread_id` and
-    /// the fire re-emits with one (`ThreadQueue::record_entry_thread`). The
-    /// projection COALESCEs the id in and keeps the first `admitted_at`, so a
-    /// consumer counting admissions sees two rows per trigger fire.
     ThreadQueueAdmitted {
         entry_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2121,29 +1553,20 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A Thread Queue entry was dropped without running — user clicked Drop,
-    /// the per-trigger queue cap overflowed (capacity policy `drop-oldest`),
-    /// or the entry's trigger no longer exists. Projection: row deleted.
     ThreadQueueDropped {
         entry_id: Uuid,
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// An admitted Thread Queue entry's work finished (any outcome — the
+    /// INVARIANT: An admitted Thread Queue entry's work finished (any outcome — the
     /// thread's own terminal events carry success/failure). Frees the
     /// capacity slot; projection deletes the row.
     ThreadQueueCompleted {
         entry_id: Uuid,
     },
-    /// Transient panel-refresh signal — broadcast, never persisted, no
-    /// projection. Emitted when only the in-memory user-initiated occupants of
-    /// the shared pool change (a user response admitted / queued / released);
-    /// those are not persisted as `thread_queue` rows, so the panel refetches
-    /// and merges them on this. Background changes already fire the persisted
-    /// `ThreadQueue*` events.
     ThreadQueueChanged {},
-    /// The *capacity policy* governing the Thread Queue changed. Persisted —
+    /// INVARIANT: The *capacity policy* governing the Thread Queue changed. Persisted —
     /// the latest event IS the stored policy (reconstructed at boot); no
     /// separate config table.
     CapacityPolicyChanged {
@@ -2151,33 +1574,28 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// The user started Disk Usage's recommended cleanup. PERSISTED. The pass
+    /// INVARIANT: The user started Disk Usage's recommended cleanup. PERSISTED. The pass
     /// runs past any HTTP request, so it ends in exactly one
     /// `RecommendedCleanupCompleted` or `RecommendedCleanupFailed`.
     RecommendedCleanupStarted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// How many of its worktrees a recommended cleanup has dealt with.
-    /// TRANSIENT, one per worktree, like `BackupProgress`.
     RecommendedCleanupProgress {
         done: u32,
         total: u32,
     },
-    /// The recommended cleanup finished. PERSISTED.
     RecommendedCleanupCompleted {
         removed_count: u32,
         cleaned_count: u32,
         freed_bytes: u64,
     },
-    /// The recommended cleanup stopped before it finished. PERSISTED.
     RecommendedCleanupFailed {
         error: String,
     },
 }
 
 impl SystemEvent {
-    /// Build an ArtifactCreated or ArtifactUpdated event based on whether the file existed.
     pub fn artifact_change(
         file_exists: bool,
         artifact_path: String,
@@ -2205,16 +1623,6 @@ impl SystemEvent {
         }
     }
 
-    /// Wire-format `type` names the engine writes an `events` row for. One
-    /// list, two entry points: [`Self::is_persisted`] answers for a constructed
-    /// event, [`Self::is_persisted_type_name`] for a bare name.
-    ///
-    /// A persisted event is a durable fact, so it is also what an event wait
-    /// and a trigger may subscribe to (ADR 0113). That is why the name-keyed
-    /// form exists: validation holds a name, not an event.
-    ///
-    /// `DomainEvent` is deliberately absent. It is a transport variant, and its
-    /// row is stored under the inner event type, never that literal name.
     pub const PERSISTED_TYPE_NAMES: &'static [&'static str] = &[
         "EngineBuildCompleted",
         "EngineVersionActivated",
@@ -2246,6 +1654,7 @@ impl SystemEvent {
         "EventHookArmed",
         "EventHookDisarmed",
         "EventHookRemoved",
+        "EventHookRefused",
         "TriggerCompleted",
         "TriggerSlotsSkipped",
         "LanguageSet",
@@ -2378,10 +1787,6 @@ impl SystemEvent {
         "TreeBackfillEnded",
     ];
 
-    /// Whether this event writes a row to the `events` table.
-    ///
-    /// `DomainEvent` is the one variant whose answer depends on a field. Every
-    /// other one is decided by its name, so both forms read one list.
     pub fn is_persisted(&self) -> bool {
         match self {
             Self::DomainEvent { transient, .. } => !transient,
@@ -2389,7 +1794,7 @@ impl SystemEvent {
         }
     }
 
-    /// [`Self::is_persisted`] for a bare wire name, which is all a validator or
+    /// INVARIANT: [`Self::is_persisted`] for a bare wire name, which is all a validator or
     /// a stored row has in hand.
     ///
     /// This is NOT the emit guard. Waiting on a name and being allowed to POST
@@ -2450,6 +1855,7 @@ impl SystemEvent {
             Self::EventHookArmed { .. } => "EventHookArmed",
             Self::EventHookDisarmed { .. } => "EventHookDisarmed",
             Self::EventHookRemoved { .. } => "EventHookRemoved",
+            Self::EventHookRefused { .. } => "EventHookRefused",
             Self::TriggerGroupReordered { .. } => "TriggerGroupReordered",
             Self::TriggerGroupDeleted { .. } => "TriggerGroupDeleted",
             Self::AppCreated { .. } => "AppCreated",
@@ -2601,7 +2007,7 @@ impl SystemEvent {
         }
     }
 
-    /// The name this event is filed under: its `events.event_type` column, and
+    /// INVARIANT: The name this event is filed under: its `events.event_type` column, and
     /// the name a subscriber writes in an `on:` entry.
     ///
     /// Identical to [`Self::event_type`] for every variant but `DomainEvent`,
@@ -2617,7 +2023,7 @@ impl SystemEvent {
         }
     }
 
-    /// Wire-format `type` names that the engine emits as system frames
+    /// INVARIANT: Wire-format `type` names that the engine emits as system frames
     /// (every `SystemEvent` variant plus the `ThreadEvent` wrapper). The
     /// `emit_event` HTTP API rejects these so untrusted apps cannot forge
     /// frames such as a fake `NotificationCreated`. Keep in sync with the
@@ -2675,6 +2081,7 @@ impl SystemEvent {
         "EventHookArmed",
         "EventHookDisarmed",
         "EventHookRemoved",
+        "EventHookRefused",
         "AppCreated",
         "AppUpdated",
         "AppDeleted",
@@ -2887,6 +2294,7 @@ impl SystemEvent {
             Self::EventHookArmed { .. }
             | Self::EventHookDisarmed { .. }
             | Self::EventHookRemoved { .. } => crate::core::event_hooks::HOOK_AGGREGATE,
+            Self::EventHookRefused { .. } => crate::core::event_hooks::REFUSAL_AGGREGATE,
             Self::AppCreated { .. }
             | Self::AppUpdated { .. }
             | Self::AppDeleted { .. }
@@ -2904,15 +2312,13 @@ impl SystemEvent {
             | Self::PluginUninstalled { .. }
             | Self::PluginInstallCanceled { .. }
             | Self::PluginUninstallCanceled { .. } => "plugin",
-            // Its own aggregate, not "plugin": a marketplace is the source a
-            // plugin can be installed FROM, and registering one installs
-            // nothing.
             Self::PluginMarketplaceRegistered { .. }
             | Self::PluginMarketplaceRemoved { .. }
-            // A scan reports on the marketplaces, so it shares their aggregate.
             | Self::PluginCatalogScanStarted {}
             | Self::PluginCatalogScanned { .. } => "plugin_marketplace",
-            Self::ThreadComposeChanged { .. } | Self::DraftSubmissionAccepted { .. } | Self::OrdinarySubmissionAccepted { .. } => "thread",
+            Self::ThreadComposeChanged { .. }
+            | Self::DraftSubmissionAccepted { .. }
+            | Self::OrdinarySubmissionAccepted { .. } => "thread",
             Self::MemoryExtractionFailed { .. }
             | Self::MemoryCorrected { .. }
             | Self::TreeBackfillProgressed { .. }
@@ -2976,10 +2382,6 @@ impl SystemEvent {
             Self::ApplyAllBatchStarted { .. } | Self::ApplyAllBatchCompleted { .. } => {
                 "apply_all_batch"
             }
-            // A standing apply is armed for ONE thread, and that thread is what
-            // a reader follows. The sweep that armed it is a field, not the
-            // aggregate: cancelling a sweep drops many arms, each of which
-            // reports on its own thread.
             Self::StandingApplyArmed { .. }
             | Self::StandingApplyFired { .. }
             | Self::StandingApplyDropped { .. } => "standing_apply",
@@ -3001,7 +2403,9 @@ impl SystemEvent {
             | Self::MainCheckAbandoned { .. }
             | Self::MainCheckSuperseded { .. }
             | Self::MainCheckRedClosed { .. } => "main_check",
-            Self::InternalFaultRecorded { .. } | Self::DiagnosticBundleSent { .. } | Self::EngineSupervisorRespawned { .. }
+            Self::InternalFaultRecorded { .. }
+            | Self::DiagnosticBundleSent { .. }
+            | Self::EngineSupervisorRespawned { .. }
             | Self::FrontendUpdateDeferred { .. }
             | Self::FrontendUpdateStranded { .. }
             | Self::ServedFrontendAdvanced { .. }
@@ -3060,7 +2464,8 @@ impl SystemEvent {
             | Self::TriggerGroupDeleted { group_id, .. } => group_id.clone(),
             Self::EventHookArmed { slug, .. }
             | Self::EventHookDisarmed { slug, .. }
-            | Self::EventHookRemoved { slug, .. } => slug.clone(),
+            | Self::EventHookRemoved { slug, .. }
+            | Self::EventHookRefused { slug, .. } => slug.clone(),
             Self::AppCreated { app_id, .. }
             | Self::AppUpdated { app_id, .. }
             | Self::AppDeleted { app_id, .. }
@@ -3081,7 +2486,6 @@ impl SystemEvent {
             | Self::NativePushRequested {
                 notification_id, ..
             } => notification_id.to_string(),
-            // `None` = dismiss-all; there is no single notification to key on.
             Self::NativePushDismissRequested {
                 notification_id, ..
             } => notification_id
@@ -3103,9 +2507,6 @@ impl SystemEvent {
             | Self::PinnedAppUnpinned {
                 app_id, device_id, ..
             } => {
-                // Composite id: a single app can be pinned independently on
-                // many devices, so the (app_id, device_id) pair is what
-                // identifies the row, not just app_id.
                 format!("{}@{}", app_id, device_id)
             }
             Self::DeviceRegistered { device_id, .. }
@@ -3187,8 +2588,6 @@ impl SystemEvent {
             | Self::MainCheckSuperseded { check_id, .. }
             | Self::MainCheckRedClosed { check_id, .. } => check_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
-            // The preview is engine-level, but WHICH thread's worktree it shows
-            // is its identity: one preview per thread, one slot at a time.
             Self::FrontendPreviewStarted { thread_id, .. }
             | Self::FrontendPreviewStopped { thread_id, .. } => thread_id.to_string(),
             Self::ModelSpendCapReached { provider, .. }
@@ -3206,7 +2605,7 @@ impl SystemEvent {
 
     pub fn to_payload(&self) -> serde_json::Value {
         match self {
-            // TriggerExecuted is engine-driven and carries no actor field, so
+            // INVARIANT: TriggerExecuted is engine-driven and carries no actor field, so
             // its raw payload is the wire shape. The CRUD variants below DO
             // carry an `actor` (stamped by the HTTP handlers via
             // `require_user_actor`); they must merge it in so the persisted row
@@ -3225,7 +2624,7 @@ impl SystemEvent {
                 merge_actor(payload.clone(), actor)
             }
             Self::DomainEvent { payload, actor, .. } => domain_payload(payload.clone(), actor),
-            // This value is bound straight into the `events` INSERT, so a
+            // INVARIANT: This value is bound straight into the `events` INSERT, so a
             // silent `Null` here persists an event with no content: no
             // projection, no SSE detail, no trigger match, and nothing in the
             // log saying why. Same reasoning as the actor drop in
@@ -3246,28 +2645,18 @@ impl SystemEvent {
 }
 
 impl SystemEvent {
-    /// A stored row back as its typed event: the inverse of [`Self::to_payload`]
-    /// for every variant on its default arm. A trigger or domain row keeps a
-    /// bespoke payload, so it errors here.
     pub fn from_stored(
         payload: serde_json::Value,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(serde_json::from_value(payload)?)
     }
 
-    /// The payload key holding who emitted an event. A domain event's payload
+    /// INVARIANT: The payload key holding who emitted an event. A domain event's payload
     /// is written by its caller, so this key is the one field in it the engine
     /// owns.
     pub const ACTOR_KEY: &'static str = "actor";
 }
 
-/// A domain event's wire payload: the caller's fields, and the engine's actor.
-///
-/// **A caller's own `actor` never survives, even when the engine names none.**
-/// Trigger conditions and the event-wait loop cap read `actor` straight out of
-/// this payload, so a caller-written one would pass as the engine's word. An
-/// agent could then fire an `actor.kind = device` trigger as if a person had
-/// tapped. See ADR 0150's amendment.
 fn domain_payload(
     mut payload: serde_json::Value,
     actor: &Option<MessageOrigin>,
@@ -3278,7 +2667,7 @@ fn domain_payload(
     merge_actor(payload, actor)
 }
 
-/// Inject an `actor` key into the payload object when an actor is present.
+/// INVARIANT: Inject an `actor` key into the payload object when an actor is present.
 /// No-op for non-object payloads (domain events with primitive/array payloads)
 /// since `actor` is conventionally a top-level object field; callers that need
 /// to attribute a non-object payload should wrap it themselves. The drop is

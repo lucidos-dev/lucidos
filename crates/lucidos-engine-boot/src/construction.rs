@@ -3,8 +3,6 @@ use lucidos_engine::engine::{agent_host::AgentHost, LucidosEngine};
 use lucidos_engine::llm::ProviderBuildContext;
 use std::{path::PathBuf, sync::Arc};
 
-/// Constructs the engine after the executable acquires workspace ownership
-/// and verifies any restore capability.
 pub async fn construct_engine(
     workspace_path: PathBuf,
     database_url: &str,

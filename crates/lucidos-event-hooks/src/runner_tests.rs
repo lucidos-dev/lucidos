@@ -1,9 +1,6 @@
-//! The runner against real scripts, with no event bus and no database.
-
 use super::*;
-use crate::input::PendingEvent;
 use lucidos_core::core::agent_sandbox::SANDBOXED_ENV;
-use lucidos_core::core::event_hooks::{HOOKS_DIR, HOOK_DEFINITION_FILE};
+use lucidos_core::core::event_hooks::{PendingEvent, HOOKS_DIR, HOOK_DEFINITION_FILE};
 use lucidos_core::core::{DATA_DIR, LUCIDOS_DATABASE_URL};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -46,7 +43,6 @@ impl Fixture {
         self.workspace.join(DATA_DIR).join(HOOKS_DIR).join(SLUG)
     }
 
-    /// Write the hook `gate` with `script` holding `body`.
     fn hook(&self, script: &str, body: &str, timeout_secs: Option<u64>) -> HookDefinition {
         std::fs::create_dir_all(self.hook_dir()).unwrap();
         std::fs::write(self.hook_dir().join(script), body).unwrap();
@@ -76,7 +72,15 @@ impl Fixture {
             python: &self.python,
             env,
         };
-        run_hook(&self.workspace, SLUG, definition, input, &confinement).await
+        run_hook(
+            &self.workspace,
+            &self.hook_dir(),
+            SLUG,
+            definition,
+            input,
+            &confinement,
+        )
+        .await
     }
 
     async fn run(&self, definition: &HookDefinition) -> HookAnswer {
@@ -106,8 +110,6 @@ async fn a_hook_allows() {
     );
 }
 
-/// The script reads the hook's slug and the pending event on stdin, and runs
-/// in the workspace, as a trigger script does.
 #[tokio::test]
 async fn a_hook_reads_its_input_on_stdin() {
     let hooks = fixture();
@@ -127,7 +129,6 @@ async fn a_hook_reads_its_input_on_stdin() {
     );
 }
 
-/// An input larger than a pipe buffer cannot wedge a hook that never reads it.
 #[tokio::test]
 async fn a_hook_may_ignore_its_input() {
     let hooks = fixture();
@@ -183,8 +184,6 @@ async fn a_hook_returns_domain_events() {
     assert_eq!(events[0].event_type, "TicketLinked");
 }
 
-/// A hook cannot forge engine progress: an engine event name in an allow
-/// turns the whole answer into a refusal.
 #[tokio::test]
 async fn a_hook_returning_an_engine_event_is_refused() {
     let hooks = fixture();
@@ -202,7 +201,6 @@ async fn a_hook_returning_an_engine_event_is_refused() {
     assert!(refusal.reason.contains(SLUG), "{}", refusal.reason);
 }
 
-/// A crash refuses, even after the script printed an allow.
 #[tokio::test]
 async fn a_crash_refuses() {
     let hooks = fixture();
@@ -245,8 +243,6 @@ async fn an_answer_past_the_cap_refuses() {
     assert!(refusal.reason.contains("ran past"), "{}", refusal.reason);
 }
 
-/// The timeout refuses on time and kills the script, so it does no more work
-/// after its answer stopped mattering.
 #[tokio::test]
 async fn a_timeout_refuses_and_kills_the_script() {
     let hooks = fixture();
@@ -267,7 +263,6 @@ async fn a_timeout_refuses_and_kills_the_script() {
     );
 }
 
-/// The timeout kills a child the script started too, not just the script.
 #[tokio::test]
 async fn a_timeout_kills_what_the_script_started() {
     let hooks = fixture();
@@ -281,8 +276,6 @@ async fn a_timeout_kills_what_the_script_started() {
     );
 }
 
-/// A process the script left running holds its stdout open. The script's
-/// answer still counts, and arrives when the script exits.
 #[tokio::test]
 async fn a_process_left_holding_stdout_does_not_hold_the_answer() {
     let hooks = fixture();
@@ -297,16 +290,12 @@ async fn a_process_left_holding_stdout_does_not_hold_the_answer() {
     );
 }
 
-/// A fresh workspace builds its Python venv on the first `.py` run. That
-/// setup counts against the timeout, so a hook never holds its asker longer.
 #[tokio::test]
 async fn the_timeout_covers_python_setup() {
     let hooks = fixture();
     let definition = hooks.hook("check.py", "import time\ntime.sleep(3)\n", Some(1));
     let started = Instant::now();
     refusal(hooks.run(&definition).await, RefusalCause::TimedOut);
-    // Venv creation alone takes over a second, so the bound sits close to
-    // the timeout.
     assert!(
         started.elapsed() < Duration::from_millis(2000),
         "{:?}",
@@ -371,7 +360,6 @@ async fn a_hook_gets_the_environment_it_is_given() {
     assert_eq!(hooks.read("probe.txt"), "probe-value");
 }
 
-/// The script starts through the sandbox it is handed, never beside it.
 #[tokio::test]
 async fn a_hook_runs_in_its_sandbox() {
     let hooks = fixture();
@@ -386,8 +374,6 @@ async fn a_hook_runs_in_its_sandbox() {
     assert_eq!(hooks.read("sandboxed.txt"), "1");
 }
 
-/// A secret the script holds, such as its database handle, never leaves in
-/// its answer.
 #[tokio::test]
 async fn an_echoed_secret_is_masked() {
     let hooks = fixture();
@@ -411,7 +397,6 @@ async fn an_echoed_secret_is_masked() {
     );
 }
 
-/// The mask reaches every string a returned event carries, keys included.
 #[tokio::test]
 async fn a_secret_in_a_returned_event_is_masked() {
     let hooks = fixture();
@@ -434,7 +419,6 @@ async fn a_secret_in_a_returned_event_is_masked() {
     assert!(!payload.contains("pw-0123456789abcdef"), "{payload}");
 }
 
-/// A masked event type would name some other event, so it is no answer.
 #[tokio::test]
 async fn a_secret_in_an_event_type_refuses() {
     let hooks = fixture();

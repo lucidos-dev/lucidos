@@ -1,7 +1,3 @@
-//! The ledger decides who emits a delivery, inside the event's own
-//! transaction. So every test drives the real emit against a real database: a
-//! mock of the statement would only assert what the mock was written to say.
-
 use super::*;
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::MessageOrigin;
@@ -11,11 +7,8 @@ use crate::test_support::{
 use serde_json::json;
 
 const EVENT_TYPE: &str = "DeployFinished";
-/// The advisory key [`park_deliveries`] gates on.
 const GATE: i64 = 4242;
 
-/// A webhook to hang deliveries off. The ledger's foreign key needs a real
-/// row, and nothing here reads any other column.
 async fn seed_hook(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO webhooks (id, name, event_type, token_hash) VALUES ($1, $2, $3, 'x')")
@@ -72,7 +65,6 @@ async fn ledger_keys(pool: &PgPool) -> Vec<String> {
         .unwrap()
 }
 
-/// Age a row by rewriting its timestamp, so a window test needs no sleep.
 async fn backdate(pool: &PgPool, hook: Uuid, key: &str, secs: i64) {
     sqlx::query(
         "UPDATE webhook_deliveries SET created = NOW() - make_interval(secs => $3) \
@@ -86,8 +78,6 @@ async fn backdate(pool: &PgPool, hook: Uuid, key: &str, secs: i64) {
     .expect("backdate");
 }
 
-/// Park every delivery inside its transaction, after its ledger row and before
-/// its event row, until the returned connection unlocks [`GATE`].
 async fn park_deliveries(pool: &PgPool) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
     sqlx::query(&format!(
         "CREATE FUNCTION park_delivery() RETURNS trigger AS $$ BEGIN \
@@ -137,8 +127,6 @@ async fn a_first_delivery_emits_and_a_resend_reports_its_event() {
     teardown_test_db(&db_name).await;
 }
 
-/// The first copy's handler dies mid-emit: the client hung up, or the engine
-/// restarted. Its transaction rolls back, so the resend delivers.
 #[tokio::test]
 async fn a_delivery_whose_handler_died_leaves_its_key_free() {
     let (pool, db_name) = setup_test_db().await;
@@ -162,8 +150,6 @@ async fn a_delivery_whose_handler_died_leaves_its_key_free() {
     teardown_test_db(&db_name).await;
 }
 
-/// A second copy lands while the first is still in its transaction. It waits
-/// on the uncommitted key, then answers with the first copy's event.
 #[tokio::test]
 async fn a_copy_arriving_mid_emit_waits_for_the_first() {
     let (pool, db_name) = setup_test_db().await;
@@ -240,7 +226,6 @@ async fn one_hooks_delivery_says_nothing_about_another_hook() {
     let two = seed_hook(&pool, "github-mirror").await;
 
     emitted(deliver(&bus, one, "d-1", 3600).await.unwrap());
-    // Two hooks fed by one sender are two subscriptions, and both fire.
     emitted(deliver(&bus, two, "d-1", 3600).await.unwrap());
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -282,8 +267,6 @@ async fn prune_drops_what_is_past_the_horizon_and_keeps_the_rest() {
     teardown_test_db(&db_name).await;
 }
 
-/// The horizon and the configurable maximum are one constant. A horizon below
-/// the window would drop a row the ledger still owes an answer for.
 #[tokio::test]
 async fn a_row_at_the_maximum_window_survives_a_prune() {
     let (pool, db_name) = setup_test_db().await;

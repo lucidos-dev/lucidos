@@ -2,7 +2,7 @@ use super::*;
 use crate::core::{prefs, PreferenceStore};
 
 impl EventStore {
-    /// Recover `trigger_id`/`trigger_name` for trigger-source rows the
+    /// INVARIANT: Recover `trigger_id`/`trigger_name` for trigger-source rows the
     /// `20260429214800_addtriggeridtothreadsummaries.sql` migration left NULL.
     ///
     /// Why: the SQL backfill in that migration only reads `payload->>'trigger_id'`,
@@ -59,18 +59,6 @@ impl EventStore {
         Ok(updated)
     }
 
-    /// Rewrite legacy `thread_summaries.trigger_id` rows that hold the v5
-    /// task UUID (`trigger_id_to_uuid(config.id)`) back to the raw `config.id`.
-    ///
-    /// Why: pre-fix, the scheduler passed the v5 task UUID into TriggerStarted,
-    /// and the projection persisted it. The dropdown filter sends `config.id`
-    /// (from `/api/v1/triggers`), so the SQL filter never matched and live
-    /// triggers showed zero threads.
-    ///
-    /// Once-only — guarded by a marker in `preferences` so subsequent boots
-    /// don't re-scan `events`. Builds the {v5_hash → config.id} map from
-    /// `TriggerCreated` events and rewrites matching rows in a single UPDATE.
-    /// Returns the number of rows updated (0 on subsequent runs).
     pub async fn backfill_trigger_id_v5_to_config_id(
         &self,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -124,25 +112,6 @@ impl EventStore {
         Ok(updated)
     }
 
-    /// Recover a `repo_names` entry for repos that predate the `RepositoryAdded`
-    /// event, so the filter / thread rows stop showing their raw UUID.
-    ///
-    /// Why: the `repo_names` projection (migration `20260614162518`) and its
-    /// initial backfill draw the name from the live `repositories` registry and
-    /// the `RepositoryAdded` event log. But a repo added before that event was
-    /// wired up emits no `RepositoryAdded`, and once removed (`DELETE FROM
-    /// repositories`) it's absent from the registry too — so neither source
-    /// knows its name and the read path falls back to the UUID. The repo's
-    /// *path*, however, still lives in `changes.repo_root` (recorded per
-    /// proposed change), and a repo's name is conventionally the path's final
-    /// segment. This scavenges that basename as a last-resort name.
-    ///
-    /// `ON CONFLICT DO NOTHING` keeps the authoritative names (registry / event)
-    /// from the initial backfill untouched — this only fills genuine gaps. App
-    /// coding-agent threads record a *workspace* root in `repo_root` (whose
-    /// basename is the workspace, not a repo), so they're excluded. Once-only —
-    /// guarded by a marker; going forward `RepositoryAdded` keeps `repo_names`
-    /// current with the real user-chosen name.
     pub async fn backfill_repo_names_from_changes(
         &self,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -154,10 +123,6 @@ impl EventStore {
             return Ok(0);
         }
 
-        // Per repo, take the most-recent change's `repo_root` and reduce it to
-        // its final path segment (`^.*/` strips everything up to the last
-        // separator; `rtrim` drops a stray trailing slash first). The regex
-        // guards the `::uuid` cast against any malformed `cc_repo_id`.
         let inserted = sqlx::query(
             "INSERT INTO repo_names (id, name) \
              SELECT DISTINCT ON (ts.cc_repo_id) \
@@ -186,7 +151,7 @@ impl EventStore {
         Ok(inserted)
     }
 
-    /// Re-point coding-agent threads orphaned by the old random-UUID
+    /// INVARIANT: Re-point coding-agent threads orphaned by the old random-UUID
     /// `repositories` registry onto the default Lucidos repo's **deterministic**
     /// id (`uuidv5(namespace, root_commit_sha)`), passed in by the caller.
     ///

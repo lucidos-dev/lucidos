@@ -1,11 +1,3 @@
-//! Claude/Anthropic request dispatch for `VertexProvider`.
-//!
-//! The wire format (request building, cache-control, SSE parsing) is shared
-//! with the direct Anthropic provider and lives in [`crate::llm::anthropic_wire`].
-//! This file is the Vertex-specific transport: gcloud bearer auth, the
-//! `streamRawPredict` URL, the retry/auth-refresh loop, and the prefill beat
-//! on the same endpoint.
-
 use super::VertexProvider;
 use crate::llm::anthropic_wire::{
     build_claude_request, parse_claude_stream, parse_context_suffix, WireTarget,
@@ -27,8 +19,6 @@ impl VertexProvider {
         crate::llm::metered::check_provider(crate::llm::ProviderKind::Vertex).await?;
         let model = selection.model.unwrap_or(&self.model);
         let reasoning_effort = selection.reasoning_effort;
-        // Vertex carries the model in the URL, so strip the [1m] suffix for the
-        // endpoint; the request builder folds the 1M beta into the body.
         let (base_model, _) = parse_context_suffix(model);
         let url = self.endpoint_for_model(base_model);
 
@@ -58,7 +48,7 @@ impl VertexProvider {
 
         let mut access_token = self.get_access_token().await?;
 
-        // Retry loop for connection errors, retryable HTTP status codes, and
+        // INVARIANT: Retry loop for connection errors, retryable HTTP status codes, and
         // mid-stream overload errors. Content is accumulated internally by
         // parse_claude_stream, so retrying the full request is safe.
         let mut attempt = 0u32;
@@ -122,7 +112,7 @@ impl VertexProvider {
                     continue;
                 }
 
-                // A publisher-model 404 is the shape a fresh Vertex setup hits,
+                // INVARIANT: A publisher-model 404 is the shape a fresh Vertex setup hits,
                 // and Google's own sentence names no fix. The helper supplies
                 // one. Every other failure keeps its own wording.
                 //
@@ -143,7 +133,6 @@ impl VertexProvider {
                 );
             }
 
-            // Parse SSE stream — retry on overload errors
             match parse_claude_stream(resp, &on_token, display, "Vertex").await {
                 Ok(response) => {
                     return Ok(LlmResponse {
@@ -162,7 +151,6 @@ impl VertexProvider {
         }
     }
 
-    /// Send one prefill beat to the endpoint the turn used.
     pub(super) async fn prefill_claude(
         &self,
         body: &PrefillBody,

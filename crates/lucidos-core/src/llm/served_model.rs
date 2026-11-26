@@ -1,14 +1,5 @@
-//! The *served model*: the model id a provider's reply says answered a call.
-//!
-//! A provider can answer a request with a model other than the one asked for,
-//! for example by routing a retired id to its replacement. The reply names the
-//! model that really ran, so the capture records it and the router compares it
-//! with what it sent.
-
 use serde_json::Value;
 
-/// The model id a reply names: `model` (OpenAI, Anthropic, OpenRouter) or
-/// `modelVersion` (Gemini). `None` when it names neither, or an empty id.
 pub fn served_model_of(reply: &Value) -> Option<String> {
     ["model", "modelVersion"]
         .iter()
@@ -17,7 +8,7 @@ pub fn served_model_of(reply: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether a reply naming `served` answered a request that sent `sent`.
+/// INVARIANT: Whether a reply naming `served` answered a request that sent `sent`.
 ///
 /// Both ids drop a `vendor/` prefix and a `[1m]` suffix first. A Vertex `@`
 /// snapshot reads as `-`, so `x@20251101` and `x-20251101` are equal.
@@ -59,8 +50,6 @@ mod tests {
         assert_eq!(served_model_of(&json!({"id": "msg_1"})), None);
     }
 
-    /// Google routes a retired Gemini id to another model. That is the
-    /// silent reroute this check exists to catch.
     #[test]
     fn a_different_version_is_a_reroute() {
         assert!(!served_as_sent("gemini-3.5-flash", "gemini-3.6-flash"));

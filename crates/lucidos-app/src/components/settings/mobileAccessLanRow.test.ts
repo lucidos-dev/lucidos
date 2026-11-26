@@ -159,6 +159,14 @@ describe('tailnetConnectRows', () => {
     expect(rows[0].hint).toContain('HTTPS');
   });
 
+  it('scopes the gateway HTTPS origin to the workspace', () => {
+    const rows = tailnetConnectRows({
+      ...base,
+      gatewayHttps: 'https://mymac.tailnet-name.ts.net',
+    });
+    expect(rows.map((r) => r.url)).toEqual(['https://mymac.tailnet-name.ts.net/dev/']);
+  });
+
   it('publishes the HTTPS URL under the loopback default', () => {
     const rows = tailnetConnectRows({
       ...base,
@@ -166,6 +174,15 @@ describe('tailnetConnectRows', () => {
       workspaceServeUrl: 'https://mymac.tailnet-name.ts.net/dev/',
     });
     expect(rows.map((r) => r.url)).toEqual(['https://mymac.tailnet-name.ts.net/dev/']);
+    expect(rows[0].hint).toContain('HTTPS');
+  });
+
+  it('prints the verified URL as the engine spelled it, not rebuilt from the scope', () => {
+    const rows = tailnetConnectRows({
+      ...base,
+      workspaceServeUrl: 'https://mymac.tailnet-name.ts.net/dev',
+    });
+    expect(rows.map((r) => r.url)).toEqual(['https://mymac.tailnet-name.ts.net/dev']);
   });
 
   it('prefers the MagicDNS name for the plain-HTTP address', () => {

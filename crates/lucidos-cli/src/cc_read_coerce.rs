@@ -1,27 +1,3 @@
-//! PreToolUse hook for Claude Code's `Read` tool — coerces string-typed
-//! integer fields (`offset`, `limit`) to numbers before CC validates the
-//! input.
-//!
-//! Background: the model occasionally sends `"offset": "16384"` (string)
-//! instead of `"offset": 16384` (numeric). CC's input validator then
-//! returns `<tool_use_error>InputValidationError: The parameter 'offset'
-//! type is expected as 'number' but provided as 'string'</tool_use_error>`
-//! and the call wastes a turn. Workspace-learning observed this 6 times
-//! across 3 distinct threads in 24h, so it is a recurring model habit
-//! rather than a one-off — cheap to absorb on the engine side.
-//!
-//! The fix uses CC's PreToolUse `updatedInput` mechanism (v2.0.10+):
-//! this hook parses `tool_input` from stdin, coerces string-typed integers
-//! to numbers for the two known fields, and emits the corrected input as
-//! `updatedInput`. CC then runs Read with the corrected input. We only
-//! print the JSON envelope when at least one field was actually rewritten
-//! — well-behaved callers fall through with no overhead beyond the
-//! subprocess spawn and a single JSON parse.
-//!
-//! Wired into `<workspace>/.lucidos/cc-settings.json` via the engine's
-//! `cc_settings.rs`. Fails OPEN on parse / I/O errors so a hook bug can't
-//! brick every Read call.
-
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::Read;
@@ -32,13 +8,10 @@ use crate::workspace::BoxError;
 #[derive(Debug, Deserialize)]
 struct HookPayload {
     tool_input: Value,
-    /// The session's working directory, which Claude Code sends on every hook.
     #[serde(default)]
     cwd: Option<String>,
 }
 
-/// Parse `"[N]"` or `"[N, M]"` (with arbitrary whitespace). Returns
-/// `Some((start, end))` where `end` is `None` for the single-element form.
 fn parse_range_string(s: &str) -> Option<(u64, Option<u64>)> {
     let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
     let mut parts = inner.split(',').map(str::trim);
@@ -56,9 +29,6 @@ fn parse_range_string(s: &str) -> Option<(u64, Option<u64>)> {
     Some((start, end))
 }
 
-/// If `input[key]` is a numeric string, rewrite it as a JSON number and
-/// return true. Non-numeric strings, missing keys, and existing numbers
-/// pass through unchanged so CC's validator still surfaces real errors.
 fn coerce_numeric_string(input: &mut Value, key: &str) -> bool {
     let Some(s) = input.get(key).and_then(Value::as_str) else {
         return false;
@@ -70,18 +40,6 @@ fn coerce_numeric_string(input: &mut Value, key: &str) -> bool {
     true
 }
 
-/// Coerce string-typed integer values for `offset` and `limit` to numbers.
-/// Returns `(input, mutated)`. Non-numeric strings, missing fields, and
-/// already-numeric values pass through unchanged.
-///
-/// Two shapes are coerced for `offset`:
-///   1. Pure numeric string: `"123"` → `123`.
-///   2. Range string: `"[start]"` → `offset=start`; `"[start, end]"` →
-///      `offset=start, limit=end-start+1` (only when no explicit `limit`
-///      was supplied — an explicit limit overrides the derived one).
-///
-/// For `limit`, only the numeric string shape is recognised; a range
-/// string in `limit` has no obvious meaning, so it passes through.
 pub(crate) fn coerce(mut input: Value) -> (Value, bool) {
     let mut mutated = coerce_numeric_string(&mut input, "offset");
     if !mutated {
@@ -103,12 +61,6 @@ pub(crate) fn coerce(mut input: Value) -> (Value, bool) {
     (input, mutated)
 }
 
-/// The permission decision that carries the corrected input.
-///
-/// `allow` skips Claude Code's own permission check, so it is only safe for
-/// a read Claude Code would have allowed anyway: one inside the working
-/// directory. Anything else gets `ask`. Otherwise a string `offset` would read
-/// any file on the machine with no card, which a prompt injection can send.
 fn permission_decision(input: &Value, cwd: Option<&str>) -> &'static str {
     let inside = match (input.get("file_path").and_then(Value::as_str), cwd) {
         (Some(file), Some(cwd)) => path_is_inside(Path::new(file), Path::new(cwd)),
@@ -121,8 +73,6 @@ fn permission_decision(input: &Value, cwd: Option<&str>) -> &'static str {
     }
 }
 
-/// Is `path` lexically under `root`? A `..` anywhere answers no, because a
-/// lexical prefix test cannot see where it leads.
 fn path_is_inside(path: &Path, root: &Path) -> bool {
     let full = root.join(path);
     root.is_absolute()
@@ -214,9 +164,6 @@ mod tests {
 
     #[test]
     fn non_numeric_string_passes_through_unchanged() {
-        // Garbage string — CC's own validator should still surface this as
-        // an error so the model learns the schema. We only coerce when the
-        // string parses cleanly as an unsigned integer.
         let input = json!({"file_path": "/tmp/x", "offset": "not-a-number"});
         let (out, mutated) = coerce(input.clone());
         assert!(!mutated);
@@ -225,8 +172,6 @@ mod tests {
 
     #[test]
     fn negative_string_is_not_coerced() {
-        // Read offset/limit are unsigned integers. A negative value would
-        // be a model bug worth surfacing — don't silently coerce.
         let input = json!({"file_path": "/tmp/x", "offset": "-10"});
         let (out, mutated) = coerce(input);
         assert!(!mutated);
@@ -235,7 +180,6 @@ mod tests {
 
     #[test]
     fn other_string_fields_are_not_touched() {
-        // file_path is a string; coercion must be field-scoped to offset/limit.
         let input = json!({"file_path": "12345", "offset": 0});
         let (out, mutated) = coerce(input.clone());
         assert!(!mutated);
@@ -254,8 +198,6 @@ mod tests {
 
     #[test]
     fn a_coerced_read_outside_the_working_directory_asks() {
-        // `allow` skips the permission card, so fixing a type must not also
-        // approve a read the session would have been asked about.
         let decision = |file: &str, cwd: Option<&str>| {
             let input = json!({"file_path": file, "offset": 1});
             let out: Value = serde_json::from_str(&build_hook_output(&input, cwd)).unwrap();
@@ -286,8 +228,6 @@ mod tests {
 
     #[test]
     fn range_string_offset_keeps_explicit_limit() {
-        // Explicit limit overrides the derived one — model is allowed to
-        // override and we don't second-guess contradictory shapes.
         let input = json!({"file_path": "/tmp/x", "offset": "[235, 260]", "limit": 30});
         let (out, mutated) = coerce(input);
         assert!(mutated);
@@ -315,7 +255,6 @@ mod tests {
 
     #[test]
     fn range_string_with_inverted_bounds_passes_through() {
-        // end < start is meaningless; let CC's validator surface it.
         let input = json!({"file_path": "/tmp/x", "offset": "[60, 1]"});
         let (out, mutated) = coerce(input.clone());
         assert!(!mutated);
@@ -349,7 +288,6 @@ mod tests {
 
     #[test]
     fn range_string_on_limit_passes_through() {
-        // Range on limit has no obvious meaning; only numeric-string coercion applies.
         let input = json!({"file_path": "/tmp/x", "limit": "[10, 20]"});
         let (out, mutated) = coerce(input.clone());
         assert!(!mutated);
@@ -358,9 +296,6 @@ mod tests {
 
     #[test]
     fn coerced_envelope_round_trips_through_cc_validator_shape() {
-        // Sanity check: the exact failure shape from the report —
-        // string offset on a real file_path — must produce a numeric offset
-        // in the envelope's updatedInput.
         let raw = json!({"file_path": "/x/run_session.rs", "offset": "16384"});
         let (coerced, mutated) = coerce(raw);
         assert!(mutated);

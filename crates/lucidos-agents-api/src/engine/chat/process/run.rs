@@ -1,10 +1,3 @@
-//! The chat-turn orchestrator: `process_message_with_steps_internal`. Walks the
-//! per-turn pipeline — routing fast-paths, thread registration, the
-//! MessageReceived boundary, title emission, history + system-prompt + context
-//! assembly, and the agentic loop. The big sub-phases live in sibling modules
-//! (`titles`, `history`, `system_prompt`, `context_sections`); this file wires
-//! them together exactly as the original single function did.
-
 use crate::core::{prefs, PreferenceStore};
 use crate::engine::agent_session::spawn_gate::remote_start::{self, spend_is_held};
 use crate::engine::agentic_loop::run::AgenticLoopRunExt;
@@ -44,18 +37,8 @@ use super::context_build::{
 use super::PreEmittedOrigin;
 use crate::engine::message_events::{emit_routing_failure, make_message_received};
 
-/// How many times a follow-up alternates between "take the thread" and
-/// "inject into whoever holds it" before falling back to the queue.
-///
-/// Two, because only one interleaving needs a retry: admission refused, then
-/// the holder's turn ended before the inject landed. The queue below is the
-/// backstop for anything stranger, and it has its own timeout.
 const ADMISSION_ATTEMPTS: u32 = 2;
 
-/// The model override an intent trigger fires with: its own pin, else the
-/// stored `trigger_model`, else the catalog default. `None` when that default
-/// is on no configured backend. The fire then follows the chat resolver
-/// instead of failing on a model the workspace cannot reach.
 pub(super) async fn trigger_model_override(
     pool: &sqlx::PgPool,
     registry: &crate::llm::ModelRegistry,
@@ -73,7 +56,7 @@ pub(super) async fn trigger_model_override(
         .then(|| default.to_string())
 }
 
-/// Retain the batch until a claimed or live session owns its queued inputs.
+/// INVARIANT: Retain the batch until a claimed or live session owns its queued inputs.
 struct CodingAgentFollowups<'a> {
     engine: &'a LucidosEngine,
     thread_id: Option<Uuid>,
@@ -124,9 +107,6 @@ pub(super) async fn prepend_claimed_followups(
     }
 }
 
-/// Whether this input runs a coding agent. An existing coding-agent thread runs
-/// its coding agent whatever the caller asked (ADR 0678). A thread with no row
-/// yet keeps the caller's choice. `Err` means the lane is unknown.
 pub(super) async fn resolve_coding_agent_lane(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -143,8 +123,6 @@ pub(super) async fn resolve_coding_agent_lane(
     }
 }
 
-/// Resolve an input's settings separately from the live thread comparison.
-/// Saved chat inputs already carry the immutable accepted triple.
 pub(super) async fn resolve_input_settings(
     origin: Option<&MessageOrigin>,
     use_coding_agent: Option<bool>,
@@ -165,14 +143,10 @@ pub(super) async fn resolve_input_settings(
 pub(crate) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
     defaults: crate::core::ModelDefaults<'_>,
-    // Which backends the router holds, so the clamp measures the route the
-    // router will actually take.
     is_configured: impl Fn(crate::llm::ProviderKind) -> bool,
     use_coding_agent: Option<bool>,
     thread_id: Option<Uuid>,
     exclude_event_id: Option<Uuid>,
-    // What the caller asked for, per field. Each absent field is resolved
-    // below; the provider is honoured or refused, never substituted.
     overrides: crate::core::ResolvedModelSelection,
 ) -> crate::core::ResolvedModelSelection {
     if use_coding_agent == Some(true) {
@@ -182,10 +156,6 @@ pub(crate) async fn resolve_route_overrides(
         };
     }
 
-    // Chat: honor per-thread memory — a follow-up with no explicit override
-    // reuses the model/effort this thread last ran with. `exclude_event_id`
-    // drops the current turn's own MessageReceived when it was pre-emitted
-    // upstream, so the thread never reads itself as its "previous" value.
     let registry = defaults.registry;
     let fallback_model = defaults.fallback_model;
     let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
@@ -201,9 +171,6 @@ pub(crate) async fn resolve_route_overrides(
         reasoning_effort: effort,
         provider,
     } = resolved;
-    // A provider the model has no route on is not stamped. The router would
-    // treat it as stale and fall through, so stamping it would record a
-    // backend the turn never reached.
     let provider = provider.filter(|p| {
         crate::llm::ProviderKind::from_name(p).is_some_and(|kind| {
             crate::llm::model_registry::route_on(
@@ -237,7 +204,6 @@ pub(crate) async fn resolve_route_overrides(
     }
 }
 
-/// Resolve the same automatic pair as the served ladder, preserving explicit and remembered picks.
 pub(crate) async fn resolve_available_route_overrides(
     pool: &sqlx::PgPool,
     routes: &crate::runtime::intelligence_ladder::ModelRoutes,
@@ -302,11 +268,6 @@ pub(crate) impl LucidosEngine {
         {
             tools.push(crate::llm::tools::wake_parent_tool());
         }
-        // MCP server management is the grouped `mcp` manifest tool, one of
-        // `chat_tools`. The tools of the running servers this thread enabled
-        // join here (ADR 0430). The stamp rides with the tools so the loop
-        // can tell whether what it holds is still current. It is the only
-        // part of the array that can move mid-turn; see `TurnTools`.
         let mcp_char_ceiling = crate::mcp::mcp_tool_char_ceiling_for(model, context_window);
         let mcp_surface = self
             .mcp_manager
@@ -331,7 +292,6 @@ pub(super) fn message_can_answer_pending_question(
         && pre_emitted_origin.is_none()
 }
 
-/// Drop `excess` bytes from the end of `memory`, then back to the last whole line.
 pub(super) fn cut_memory_tail(memory: &mut String, excess: usize) {
     let cut = memory.floor_char_boundary(memory.len() - excess);
     memory.truncate(cut);
@@ -340,8 +300,6 @@ pub(super) fn cut_memory_tail(memory: &mut String, excess: usize) {
     }
 }
 
-/// A message the user took back ends its run quietly: nothing recorded, no
-/// failure. Any other error stands.
 fn withdrawn_or(
     error: Box<dyn std::error::Error + Send + Sync>,
     request_id: Uuid,
@@ -360,14 +318,42 @@ fn withdrawn_or(
     ))
 }
 
-/// The constant inputs the setup-cancel exit needs, built once before the
-/// turn's first phase so each cancel checkpoint in the setup is a one-liner.
-/// See `LucidosEngine::cancel_during_setup`.
+async fn refused_start(
+    bus: &crate::engine::event_bus::EventBus,
+    refusal: crate::engine::event_bus::HookRefusal,
+    is_trigger: bool,
+    mode: ActorMode,
+    request_id: Uuid,
+    thread_id: Uuid,
+) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+    log_legacy!("[Chat] Thread {thread_id} does not start: {refusal}");
+    if is_trigger {
+        return Err(Box::new(refusal));
+    }
+    if mode == ActorMode::Human {
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::Toast {
+                    message: refusal.to_string(),
+                    level: "error".to_string(),
+                },
+            ),
+            "[Chat] refused start Toast",
+        )
+        .await;
+    }
+    Ok(terminal_result(
+        String::new(),
+        vec![],
+        request_id,
+        thread_id,
+        false,
+    ))
+}
+
 pub(super) struct SetupCancel {
     thread_id: Uuid,
     request_id: Uuid,
-    /// The turn's response meta (`request_event_id` + channel), so the
-    /// terminator binds to the same exchange the loop's own cancel would.
     meta: crate::engine::thread_events::EventMeta,
     model: Option<String>,
     effort: Option<String>,
@@ -375,12 +361,6 @@ pub(super) struct SetupCancel {
 
 #[easy_ext::ext(ChatTurnRunExt)]
 pub(super) impl LucidosEngine {
-    /// Settle this turn's exchange as failed, run the shared turn tail, then
-    /// hand the error back so the caller can `return Err(..)` in one line.
-    ///
-    /// Idempotent: the gate skips the emit when a terminator already landed
-    /// for `anchor`. A run parked on the owner's card stays unsettled. A turn is finished either way by the time this returns,
-    /// which is the promise `process_message_with_steps` makes to its callers.
     async fn fail_turn(
         &self,
         thread_id: Uuid,
@@ -406,46 +386,39 @@ pub(super) impl LucidosEngine {
         error
     }
 
-    /// Internal: Process a message with optional trigger context
-    // Same wide signature as `process_message_with_steps` plus trigger context.
     #[allow(clippy::too_many_arguments)]
     async fn process_message_with_steps_internal(
         &self,
         user_message: &str,
         model_override: Option<&str>,
-        mut trigger: Option<TriggerContext>, // None for user-driven chat; Some when fired by the scheduler
-        app_context: Option<AppContext>,     // app context if chatting from within an app
-        file_context: Option<String>,        // file path if user is viewing a file
-        reasoning_effort: Option<&str>, // unified reasoning level: none/low/medium/high/xhigh/max
-        // Backend to serve the model, when it has more than one route. Honoured
-        // or refused, never substituted. `None` lets the row's own preferred
-        // provider decide, then its first configured route.
+        mut trigger: Option<TriggerContext>,
+        app_context: Option<AppContext>,
+        file_context: Option<String>,
+        reasoning_effort: Option<&str>,
         provider_override: Option<&str>,
-        user_images: Option<&[crate::engine::types::ChatImage]>, // base64-encoded images pasted by user
-        device_id: Option<&str>,                                 // device that sent this message
-        use_coding_agent: Option<bool>, // bypass LLM and spawn a coding agent directly
-        event_id: Option<&str>,         // client-generated UUID for reliable matching
-        thread_id: Option<Uuid>,        // None = new thread, Some = follow-up
-        conflict_change_id: Option<Uuid>, // change ID for merge conflict resolution
-        repo_id: Option<&str>,          // external repository ID for CC worktree
-        url_context: Option<crate::engine::types::UrlContext>, // webpage content from Tauri panel webview
-        parent_thread_id: Option<Uuid>, // parent thread if spawned by run_thread
-        spawning_event_id: Option<Uuid>, // event in parent thread that triggered the spawn (mode != Human only)
-        wake_mode: Option<crate::engine::thread_events::WakeMode>, // a child's spawning message only
+        user_images: Option<&[crate::engine::types::ChatImage]>,
+        device_id: Option<&str>,
+        use_coding_agent: Option<bool>,
+        event_id: Option<&str>,
+        thread_id: Option<Uuid>,
+        conflict_change_id: Option<Uuid>,
+        repo_id: Option<&str>,
+        url_context: Option<crate::engine::types::UrlContext>,
+        parent_thread_id: Option<Uuid>,
+        spawning_event_id: Option<Uuid>,
+        wake_mode: Option<crate::engine::thread_events::WakeMode>,
         mode: ActorMode,
-        cc_model: Option<&str>, // CC-specific model override (from compose view pre-session selection)
-        coding_agent: Option<crate::runtime::CodingAgent>, // backend for a NEW coding-agent thread; stored value wins on follow-ups
-        pre_emitted_origin: Option<PreEmittedOrigin>, // skip MessageReceived: the caller already persisted it
-        title: Option<&str>, // caller-provided title (skips async LLM title gen)
+        cc_model: Option<&str>,
+        coding_agent: Option<crate::runtime::CodingAgent>,
+        pre_emitted_origin: Option<PreEmittedOrigin>,
+        title: Option<&str>,
         origin: Option<MessageOrigin>,
-        voice_session_id: Option<Uuid>, // set when this message was spoken on a call
-        urgency: crate::engine::FollowUpUrgency, // child follow-up only: preempt the child's in-flight turn
-        input_turn: Option<crate::engine::InputTurn>, // released once this message is recorded and routed
+        voice_session_id: Option<Uuid>,
+        urgency: crate::engine::FollowUpUrgency,
+        input_turn: Option<crate::engine::InputTurn>,
         pre_admission: Option<crate::engine::PreAdmission>,
         coding_agent_followups: Vec<AgentUserInput>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Everything up to the release runs after every input admitted to this
-        // thread before it has been recorded and routed. Every return releases it.
         let mut coding_agent_followups = CodingAgentFollowups {
             engine: self,
             thread_id,
@@ -493,11 +466,9 @@ pub(super) impl LucidosEngine {
         };
         let urgent = urgency.is_urgent();
         let chat_start = std::time::Instant::now();
-        // Track whether a pending change was proposed during this request
-        // (set to true when Claude Code proposes changes, used to trigger SSE broadcast)
         let mut proposed_change = false;
 
-        // Mutable so the non-CC fast-path can mark the event as already on
+        // INVARIANT: Mutable so the non-CC fast-path can mark the event as already on
         // the wire when injection loses the race with a thread that completed
         // between the has_active check and the send — the slow path then
         // skips its own MessageReceived emit to avoid a duplicate.
@@ -505,7 +476,7 @@ pub(super) impl LucidosEngine {
 
         let is_trigger = trigger.is_some();
 
-        // For chat turns, `None` means "use the user's Lucidos chat defaults",
+        // INVARIANT: For chat turns, `None` means "use the user's Lucidos chat defaults",
         // not `LlmProvider::default_model()` (which drops `[1m]` and carries no
         // effort). For coding-agent turns, `None` must stay unset so the agent
         // path falls through to live/thread/backend settings instead of
@@ -550,7 +521,6 @@ pub(super) impl LucidosEngine {
         )
         .await?;
 
-        // Generate a per-request ID for ProcessResult tracking
         let request_id = Uuid::new_v4();
         let is_new_thread = thread_id.is_none();
         let thread_id = thread_id.unwrap_or(request_id);
@@ -562,7 +532,7 @@ pub(super) impl LucidosEngine {
                 .await;
         }
 
-        // AskUserQuestion free-form path: if the thread is currently waiting
+        // INVARIANT: AskUserQuestion free-form path: if the thread is currently waiting
         // on a `UserQuestionAsked` and the user typed instead of clicking an
         // option, route the message to the answer-question handler with
         // `FreeText` instead of creating a new exchange. Applies to BOTH chat
@@ -606,8 +576,6 @@ pub(super) impl LucidosEngine {
                     self.workspace_path(),
                     user_images,
                 );
-                // An image that could not be stored would reach the agent as an
-                // answer without it, or as an empty one it reads as unanswered.
                 if image_hashes.len() != user_images.map_or(0, <[_]>::len) {
                     emit_routing_failure(
                         &self.event_bus,
@@ -649,8 +617,6 @@ pub(super) impl LucidosEngine {
                             thread_id,
                             msg
                         );
-                        // The bus refuses an answer the user took back, and
-                        // that refusal is no failure to show.
                         let withdrawn = match event_id.and_then(|raw| Uuid::parse_str(raw).ok()) {
                             Some(id) => {
                                 crate::engine::consumption_claim::was_removed(
@@ -677,12 +643,6 @@ pub(super) impl LucidosEngine {
             }
         }
 
-        // Spawn the image description in the background, so it never blocks
-        // the turn. It sits after the answer path above, which reads none.
-        // It returns `(description, model)`, and the agentic loop emits
-        // `ImageDescribed { model, .. }` naming the model that described it.
-        // A coding agent reads the images itself and its lane never consumes
-        // this handle, so spawning for it would pay for a discarded call.
         let mut description_handle = match user_images {
             Some(imgs) if !imgs.is_empty() && use_coding_agent != Some(true) => 'describe: {
                 if spend_is_held(self.pool(), thread_id, origin.as_ref()).await {
@@ -690,9 +650,6 @@ pub(super) impl LucidosEngine {
                 }
                 let purpose = crate::engine::ContextPurpose::ImageDescribe;
                 let call = self.aux_call(purpose).await;
-                // A model that cannot read images would fail on every image,
-                // so it is refused before anything is spent. Settings shows
-                // the same refusal on the row (`GET /api/v1/models/background`).
                 if let Some(refusal) = call.selection().refusal() {
                     log_legacy!("[Chat] Image description refused: {}", refusal);
                     break 'describe None;
@@ -703,16 +660,12 @@ pub(super) impl LucidosEngine {
                 let imgs: Vec<crate::engine::types::ChatImage> = imgs.to_vec();
                 let capture = crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
                 Some(tokio::spawn(async move {
-                    // Under the purpose's whole-call deadline. The task is
-                    // detached, so nothing else would ever stop it.
                     let described = tokio::time::timeout(
                         deadline,
                         describe_images(provider.as_ref(), &imgs, effort.as_deref(), &capture),
                     )
                     .await;
                     match described {
-                        // Read after the call: a default can move off a
-                        // model its provider no longer serves (ADR 0403).
                         Ok(Ok(desc)) => Some((desc, provider.default_model().to_string())),
                         Ok(Err(e)) => {
                             log_legacy!("[Chat] Image description failed: {}", e);
@@ -728,8 +681,6 @@ pub(super) impl LucidosEngine {
             _ => None,
         };
 
-        // Held messages (ADR 0256). An agent-sent message waits while a human
-        // owes this thread a reply, so it cannot supersede their question.
         if use_coding_agent == Some(true)
             && !is_new_thread
             && !user_message.is_empty()
@@ -768,22 +719,11 @@ pub(super) impl LucidosEngine {
             ));
         }
 
-        // Permission supersede: if this CC thread is waiting on a permission
-        // card and the user typed a message instead of clicking a button,
-        // resolve the pending permission(s) as denied so the card's buttons
-        // stop dangling — otherwise the thread reads as stuck on the prompt
-        // while CC moves on, and clicking the (still-rendered) buttons 404s
-        // once CC interrupts and the in-memory waiter is gc'd. Unlike the
-        // question free-form path above, this does NOT consume the message —
-        // the typed text still routes to CC below as a normal follow-up.
-        // A keep-alive is invisible, so it must not move any card either.
         if use_coding_agent == Some(true)
             && !is_new_thread
             && !user_message.is_empty()
             && !keep_alive
         {
-            // An engine re-entry on a live session overtakes no card, so the
-            // user can still approve the request it would deny.
             if !super::super::process_helpers::reentry_reaches_live_session(
                 &self.agent_sessions,
                 thread_id,
@@ -801,7 +741,7 @@ pub(super) impl LucidosEngine {
                 .await;
             }
 
-            // Question supersede, the same move for the question lane. Getting
+            // INVARIANT: Question supersede, the same move for the question lane. Getting
             // here means the fast-path above did NOT consume this message as
             // the answer, so any question still open is one this follow-up
             // cannot answer: an agent-driven message, or a question the agent
@@ -833,17 +773,11 @@ pub(super) impl LucidosEngine {
                 .await;
             }
 
-            // A human message releases the held messages ahead of itself, so
-            // the agent reads them in send order (ADR 0256). After the
-            // supersedes, so the human is who resolved any open card.
             if mode == ActorMode::Human {
                 self.clone_arc().deliver_held_messages(thread_id).await;
             }
         }
 
-        // A delivery waits behind a question that outlived its turn (ADR 0321).
-        // With the turn live it injects below instead. The answer's resume
-        // carries it (`resume_chat_after_answer`).
         if use_coding_agent != Some(true) && !is_new_thread {
             let has_live_turn = crate::engine::has_other_live_turn(
                 &self.active_threads,
@@ -872,11 +806,6 @@ pub(super) impl LucidosEngine {
             }
         }
 
-        // Same supersede for the command-guard permission lane (ADR 0002): a
-        // chat thread parked on a `CommandPermissionRequested` whose user types
-        // a new message instead of clicking resolves the card as denied (which
-        // also unblocks the parked agentic loop). Chat-only — the command lane
-        // never fires on a CC thread.
         let chat_follow_up =
             use_coding_agent != Some(true) && !is_new_thread && !user_message.is_empty();
         let has_live_turn = crate::engine::has_other_live_turn(
@@ -895,10 +824,6 @@ pub(super) impl LucidosEngine {
                 origin.clone(),
             )
             .await;
-            // Same supersede for the chat MCP permission lane: a thread parked on
-            // an `McpPermissionRequested` whose user types a new message instead
-            // of clicking resolves the card as denied (and unblocks the parked
-            // agentic loop). Chat-only, same as the command lane.
             crate::engine::mcp_permission::resolve_pending_mcp_permissions_as_superseded(
                 self.pool(),
                 &self.event_bus,
@@ -908,9 +833,6 @@ pub(super) impl LucidosEngine {
             )
             .await;
         }
-        // And for an open form: the user answered in words instead. Only a
-        // person does, so a child's completion or a wait delivery re-entering
-        // the thread leaves the form open.
         if chat_follow_up && mode == ActorMode::Human {
             crate::engine::form_requests::supersede_on_user_message(
                 self.pool(),
@@ -921,7 +843,7 @@ pub(super) impl LucidosEngine {
             .await;
         }
 
-        // Fast-path for CC follow-ups: route via msg_tx BEFORE register_thread_queued
+        // INVARIANT: Fast-path for CC follow-ups: route via msg_tx BEFORE register_thread_queued
         // so a follow-up arriving during an active Claude Code session is picked up by the
         // running event loop instead of spawning a new Claude Code session (or blocking on
         // the prior turn's still-held ThreadGuard).
@@ -931,7 +853,7 @@ pub(super) impl LucidosEngine {
         let mut spawn_claim = None;
         if use_coding_agent == Some(true) {
             loop {
-                // One `agent_sessions` lock hold either claims the thread for
+                // INVARIANT: One `agent_sessions` lock hold either claims the thread for
                 // this message's spawn or finds the run that holds it. A
                 // follow-up during startup finds the starting run and queues.
                 let claim = if keep_alive {
@@ -951,7 +873,6 @@ pub(super) impl LucidosEngine {
                     spawn_claim = Some(claim);
                     break;
                 }
-                // Something else has the thread now, so this beat is skipped.
                 if keep_alive {
                     log_legacy!("[KeepAlive] Thread {thread_id} is busy, so this beat is skipped");
                     return Ok(terminal_result(
@@ -962,21 +883,12 @@ pub(super) impl LucidosEngine {
                         false,
                     ));
                 }
-                // Interrupt-and-redirect. Interrupt the live turn (it ends as a
-                // resumable Canceled boundary: no spurious ResponseGenerated,
-                // no change proposed for the redirected-away work), then fall
-                // through to route the follow-up as the next turn on the same
-                // thread, full context preserved. Never fires for a child-wake.
-                //
-                // Ordinary follow-ups steer a capable process. Urgent messages
-                // interrupt on both backends, as do plain Codex follow-ups when
-                // this process cannot steer. See `should_redirect_followup`.
                 let redirect_idle_notify = {
                     let mut sessions = self.agent_sessions.lock().await;
                     super::super::process_helpers::arm_followup_redirect(
                         &mut sessions,
                         thread_id,
-                        // Genuine user follow-up, not an engine-internal
+                        // INVARIANT: Genuine user follow-up, not an engine-internal
                         // child-wake. A pre-emitted USER message is still a
                         // user follow-up and must keep arming the redirect.
                         !pre_emitted_origin.is_some_and(PreEmittedOrigin::is_engine_reentry),
@@ -985,7 +897,7 @@ pub(super) impl LucidosEngine {
                     )
                 };
                 if let Some(idle_notify) = redirect_idle_notify {
-                    // Block until the interrupted turn reaches a boundary (idle
+                    // INVARIANT: Block until the interrupted turn reaches a boundary (idle
                     // or process exit) BEFORE emitting the follow-up's
                     // MessageReceived, so the turn's Canceled terminal is
                     // sequenced first (coding-agent exchanges group by sequence
@@ -1001,7 +913,7 @@ pub(super) impl LucidosEngine {
                     let redirect_deadline = std::time::Instant::now()
                         + super::super::process_helpers::REDIRECT_INTERRUPT_MAX_WAIT;
                     loop {
-                        // Construct the notify future before the state check.
+                        // INVARIANT: Construct the notify future before the state check.
                         // (tokio registers the waiter on first *poll* — inside
                         // the timeout await below, after the check — and the run
                         // loop signals via notify_waiters() with no stored
@@ -1039,7 +951,7 @@ pub(super) impl LucidosEngine {
                     }
                 }
 
-                // Emit MessageReceived FIRST — guarantees it gets a lower sequence
+                // INVARIANT: Emit MessageReceived FIRST — guarantees it gets a lower sequence
                 // number and earlier timestamp than CodingAgentPromptSent (emitted by
                 // the CC event loop when it picks up the message). Without this
                 // ordering, CodingAgentPromptSent can race ahead and end up in the
@@ -1059,41 +971,48 @@ pub(super) impl LucidosEngine {
                     (Some(pre.event_id()), kind)
                 } else {
                     use crate::engine::thread_events::EventMeta;
-                    // The live run's rung, which no pick changes mid-turn.
                     let coding_agent = self.thread_coding_agent(thread_id).await;
                     let (rung_model, rung_effort) = self
                         .coding_agent_rung(thread_id, coding_agent, None, None)
                         .await;
+                    let message = make_message_received(
+                        &self.workspace_path,
+                        user_message,
+                        user_images,
+                        device_id,
+                        parent_thread_id,
+                        spawning_event_id,
+                        wake_mode,
+                        mode,
+                        rung_model.as_deref(),
+                        rung_effort.as_deref(),
+                        None,
+                        origin.clone(),
+                        voice_session_id,
+                    );
+                    let meta = EventMeta {
+                        event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                        channel: Some(EventChannel::ClaudeCode),
+                        ..EventMeta::NONE
+                    };
+                    let asked = match self.event_bus.ask_hooks(thread_id, &message, &meta).await {
+                        Ok(asked) => asked,
+                        Err(refusal) => {
+                            return refused_start(
+                                &self.event_bus,
+                                refusal,
+                                is_trigger,
+                                mode,
+                                request_id,
+                                thread_id,
+                            )
+                            .await;
+                        }
+                    };
                     let emit_result = self
                         .event_bus
-                        .emit(crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: make_message_received(
-                                &self.workspace_path,
-                                user_message,
-                                user_images,
-                                device_id,
-                                parent_thread_id,
-                                spawning_event_id,
-                                wake_mode,
-                                mode,
-                                rung_model.as_deref(),
-                                rung_effort.as_deref(),
-                                None,
-                                origin.clone(),
-                                voice_session_id,
-                            ),
-                            meta: EventMeta {
-                                event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
-                                channel: Some(EventChannel::ClaudeCode),
-                                ..EventMeta::NONE
-                            },
-                        })
+                        .emit_asked(asked, thread_id, message, meta)
                         .await?;
-                    // Stash the emitted id so a lost race, which claims the thread
-                    // and takes the slow path, doesn't re-emit MessageReceived:
-                    // mirrors the non-CC injection fast-path. On the success path we return
-                    // before the slow path reads it, so this is harmless there.
                     if let Some(result) = emit_result {
                         pre_emitted_origin = Some(PreEmittedOrigin::Message(result.event_id));
                     }
@@ -1110,7 +1029,7 @@ pub(super) impl LucidosEngine {
                     let mut sessions = self.agent_sessions.lock().await;
                     if let Some(session) = sessions.get_mut(&thread_id) {
                         if session.is_live() {
-                            // The message is visible to the session's idle decision the
+                            // INVARIANT: The message is visible to the session's idle decision the
                             // moment it is in the channel (that decision reads
                             // `msg_rx` under this same lock), and the run loop records
                             // it as owed when it forwards it to the driver. Only a
@@ -1163,7 +1082,7 @@ pub(super) impl LucidosEngine {
                     ));
                 }
 
-                // The live session went away or is terminating between the
+                // INVARIANT: The live session went away or is terminating between the
                 // claim's look and the send, most commonly the idle exit. Don't
                 // emit a routing failure and don't drop the message. The next
                 // pass waits for that run to let go, then claims the thread. The
@@ -1177,7 +1096,7 @@ pub(super) impl LucidosEngine {
             }
         }
 
-        // The Lucidos Agent's half of interrupt-and-redirect. An injected
+        // INVARIANT: The Lucidos Agent's half of interrupt-and-redirect. An injected
         // prompt is only READ between loop iterations. A turn inside a long
         // tool call therefore sits on it for as long as that call runs. One
         // tool yields early (`bash_output(wait_secs=…)` parks on
@@ -1200,7 +1119,7 @@ pub(super) impl LucidosEngine {
             );
         }
 
-        // Single-flight admission for the Lucidos Agent lane.
+        // INVARIANT: Single-flight admission for the Lucidos Agent lane.
         //
         // `try_register_thread` asks whether a turn is already live here, and
         // installs this turn's handle, under one lock. Two wakes for one
@@ -1221,16 +1140,13 @@ pub(super) impl LucidosEngine {
                     admitted = Some(registration);
                     break;
                 }
-                // A turn that started after `chat_submit` checked may run another
-                // pair than this message asks for. Then the message queues and
-                // runs next on its own pair, rather than losing its override.
                 if requested != crate::core::ResolvedModelSelection::default()
                     && self.live_chat_pair(thread_id).await? != resolved
                 {
                     log_legacy!("[Chat] Thread {thread_id}: the live turn runs another pair, so this message queues");
                     break;
                 }
-                // Emit MessageReceived FIRST — same ordering guarantee as the CC
+                // INVARIANT: Emit MessageReceived FIRST — same ordering guarantee as the CC
                 // fast-path. The agentic loop emits PromptInjected when it
                 // picks up the injection; without this ordering, PromptInjected
                 // can race ahead and create a duplicate exchange boundary.
@@ -1246,9 +1162,6 @@ pub(super) impl LucidosEngine {
                 let inject_kind = if let Some(pre) = pre_emitted_origin {
                     pre.inject_kind()
                 } else {
-                    // The live turn answers this message, so it names that
-                    // turn's pair. `chat_submit` refused an override naming
-                    // another one before anything was recorded.
                     let live = self.live_chat_pair(thread_id).await?;
                     let live_anchor = self
                         .active_threads
@@ -1287,7 +1200,6 @@ pub(super) impl LucidosEngine {
                         Ok(result) => result,
                         Err(e) => return withdrawn_or(e, request_id, thread_id),
                     };
-                    // Stash the emit for the race-recovery handoff below.
                     if let Some(result) = emit_result {
                         pre_emitted_origin = Some(PreEmittedOrigin::Message(result.event_id));
                     }
@@ -1323,7 +1235,7 @@ pub(super) impl LucidosEngine {
                         "[Chat] Follow-up coalesced into the live turn on thread {}",
                         thread_id
                     );
-                    // This path returns to the HTTP caller right here, so the
+                    // INVARIANT: This path returns to the HTTP caller right here, so the
                     // injected message never reaches `run_agentic_loop`'s
                     // post-first-call emit — the handle would just be dropped.
                     // Detach the emit instead: without it an image that arrived
@@ -1357,11 +1269,6 @@ pub(super) impl LucidosEngine {
                     ));
                 }
 
-                // Refused admission AND unable to inject: the live turn dropped
-                // its injection receiver between the two. Ask again, since the
-                // thread it holds is about to be free. The retry is bounded, so
-                // a handle whose receiver is gone but whose guard has not
-                // dropped yet cannot spin here.
                 log_legacy!(
                     "[Chat] Thread {} neither admitted nor injectable (attempt {} of {})",
                     thread_id,
@@ -1371,14 +1278,8 @@ pub(super) impl LucidosEngine {
             }
         }
 
-        // Wait for any in-progress request on this thread to finish, then register.
-        // This queues follow-up messages instead of cancelling in-progress work.
-        // `guard` ensures the thread is unregistered on every exit path. Every
-        // return drops it via `finalize_turn_and_drain_injections`
-        // (remove-then-drain, see below). Only a panic falls back to its Drop impl.
         let (cancel_token, mut injection_rx, guard) = match admitted {
             Some(registration) => registration,
-            // A keep-alive never queues behind a turn, and never evicts one.
             None if keep_alive => match crate::engine::try_register_thread(
                 &self.active_threads,
                 &self.thread_completion,
@@ -1396,8 +1297,6 @@ pub(super) impl LucidosEngine {
                     ));
                 }
             },
-            // The wait can outlast a long turn, so the gate is free meanwhile.
-            // The pair resolves again under it once this turn owns the thread.
             None => match turn_start.take() {
                 Some(gate) => {
                     drop(gate);
@@ -1420,17 +1319,10 @@ pub(super) impl LucidosEngine {
         let provider_override = resolved.provider.as_deref();
         let chosen_provider = resolved.as_selection().provider;
 
-        // Persist + broadcast the exchange boundary event via EventBus.
-        // When pre_emitted_origin is set, MessageReceived was already emitted by
-        // spawn_thread — skip to avoid double-emitting (and double-incrementing
-        // the parent's active_children_count).
         use crate::engine::thread_events::EventMeta;
         let origin_id = if let Some(pre) = pre_emitted_origin {
             pre.event_id()
         } else {
-            // The selection is already resolved above (trigger pin, else
-            // account preference). The same three values the loop is about to
-            // call with, so the starter event records the actual run.
             let started = trigger
                 .as_ref()
                 .and_then(|tc| build_trigger_started_event(tc, user_message, &resolved));
@@ -1438,7 +1330,6 @@ pub(super) impl LucidosEngine {
                 started
             } else {
                 let is_cc = use_coding_agent == Some(true);
-                // A coding-agent turn names the rung its spawn will resolve.
                 let (req_model, req_effort) = match spawn_claim.as_ref().filter(|_| is_cc) {
                     Some(claim) => {
                         self.coding_agent_rung(
@@ -1482,16 +1373,32 @@ pub(super) impl LucidosEngine {
                 )
             };
 
-            let emitted = self
+            let asked = self
                 .event_bus
-                .emit(crate::engine::event_bus::BusEvent::Thread {
-                    thread_id,
-                    event: user_thread_event,
-                    meta: user_meta,
-                })
+                .ask_hooks(thread_id, &user_thread_event, &user_meta)
                 .await;
-            // No exchange exists yet, so there is nothing to settle. A
-            // follow-up injected since registration still needs its turn.
+            let emitted = match asked {
+                Ok(asked) => {
+                    self.event_bus
+                        .emit_asked(asked, thread_id, user_thread_event, user_meta)
+                        .await
+                }
+                Err(refusal) => {
+                    let orphans = self
+                        .drain_turn_orphans(thread_id, guard, &mut injection_rx)
+                        .await;
+                    self.resubmit_orphans_of_failed_turn(thread_id, orphans);
+                    return refused_start(
+                        &self.event_bus,
+                        refusal,
+                        is_trigger,
+                        mode,
+                        request_id,
+                        thread_id,
+                    )
+                    .await;
+                }
+            };
             let emit_result = match emitted {
                 Ok(result) => result.expect("persisted event must return EmitResult"),
                 Err(e) => {
@@ -1502,6 +1409,9 @@ pub(super) impl LucidosEngine {
                     return withdrawn_or(e, request_id, thread_id);
                 }
             };
+            if let Some(parent) = parent_thread_id {
+                self.mcp_manager.inherit_enabled(parent, thread_id).await;
+            }
             if let Some(tc) = trigger.as_ref() {
                 self.copy_trigger_ceiling(thread_id, &tc.trigger_id).await;
             }
@@ -1527,8 +1437,6 @@ pub(super) impl LucidosEngine {
                 })
                 .await
             {
-                // A message recorded as a follow-up, then taken back, never
-                // anchors a turn. Its exchange belongs to the turn it followed.
                 if crate::engine::consumption_claim::is_removed_refusal(&*error) {
                     let orphans = self
                         .drain_turn_orphans(thread_id, guard, &mut injection_rx)
@@ -1548,7 +1456,7 @@ pub(super) impl LucidosEngine {
                     .await);
             }
         }
-        // Recorded, and the thread is registered, so a later input now queues
+        // INVARIANT: Recorded, and the thread is registered, so a later input now queues
         // behind this turn rather than racing it. Release it, and the gate.
         // The thread now holds its continue key, so a racing fire finds it.
         drop(input_turn.take());
@@ -1557,8 +1465,6 @@ pub(super) impl LucidosEngine {
             drop(fire.continue_key.take());
         }
 
-        // Every error after the starter settles the exchange and hands off
-        // follow-ups, including a failed applied-settings stamp above.
         if let Err(e) = self
             .maybe_emit_titles(
                 thread_id,
@@ -1613,7 +1519,7 @@ pub(super) impl LucidosEngine {
         let user_message = resumed_text.as_str();
 
         if use_coding_agent == Some(true) {
-            // Returns straight out, so the post-loop net below never sees it.
+            // INVARIANT: Returns straight out, so the post-loop net below never sees it.
             // The branch emits its own terminator on most failures; the gate
             // in `fail_turn` makes this a no-op whenever it did.
             // The keep-alive holds the thread now, so its turn is the only
@@ -1656,7 +1562,6 @@ pub(super) impl LucidosEngine {
             return outcome;
         }
 
-        // A coding-agent run passes the same gate in its own spawn gate.
         if let Err(e) = remote_start::gate_remote_start(
             &self.event_bus,
             thread_id,
@@ -1676,7 +1581,7 @@ pub(super) impl LucidosEngine {
                 .await);
         }
 
-        // ── Turn setup ──────────────────────────────────────────────────────
+        // INVARIANT: ── Turn setup ──────────────────────────────────────────────────────
         //
         // Everything from here to `run_agentic_loop` assembles the turn's
         // context: history load, query classification (an LLM call), memory
@@ -1701,8 +1606,6 @@ pub(super) impl LucidosEngine {
                 channel: response_channel,
                 ..crate::engine::thread_events::EventMeta::NONE
             },
-            // Mirrors the agentic loop's own cancel arm: the turn's resolved
-            // model, or the provider default when the request carried none.
             model: {
                 let provider = self.current_provider();
                 let m = model_override.unwrap_or(provider.default_model());
@@ -1716,19 +1619,15 @@ pub(super) impl LucidosEngine {
                 .await);
         }
 
-        // Snapshot RwLock values once per request
         let user_timezone = self.user_timezone.read().await.clone();
         let user_language = self.user_language.read().await.clone();
         let user_profile = self.user_profile.snapshot().await;
 
-        // The classification *model selection*, read once for the call below.
-        // Fact extraction and history summarisation each resolve their own, one
-        // purpose per preference, which is why neither travels from here.
         let classification_call = self
             .aux_call(crate::engine::ContextPurpose::QueryClassification)
             .await;
 
-        // This turn's clock. Every reading the model sees derives from it,
+        // INVARIANT: This turn's clock. Every reading the model sees derives from it,
         // never from `Utc::now()`. The message array is rebuilt from events on
         // each request. A wall-clock reading inside it would differ on rebuild,
         // and cost the message tier the hit the system tier just gained.
@@ -1738,10 +1637,6 @@ pub(super) impl LucidosEngine {
         // `super::turn_clock`.
         let turn_started_at = self.turn_started_at(thread_id).await;
 
-        // This workspace's tool gates, read once and handed to every consumer:
-        // the tools array, the prompt's images clause, and its intent listing.
-        // A function of workspace configuration alone, so every thread here
-        // sees the same array and they share one cache entry (ADR 0088).
         let Some(capabilities) = until_canceled(&cancel_token, self.read_turn_capabilities()).await
         else {
             return Ok(self
@@ -1749,22 +1644,13 @@ pub(super) impl LucidosEngine {
                 .await);
         };
 
-        // ADR 0085's context mode, off the capability read above. The tools
-        // array, the system prompt and this turn's payload then answer from one
-        // snapshot. `super::context_mode` owns everything it changes.
         let context_mode = super::context_mode::ContextMode::from_capabilities(&capabilities.gates);
-        // ADR 0362: on the Tree memory module, with its trees ready, the memory
-        // views replace the history, its summariser and memory recall. Off,
-        // every line below runs exactly as before (I2).
         let memory_tree = capabilities.gates.memory_tree;
 
         if !memory_tree {
             self.note_history_read_begun(thread_id, guard.generation());
         }
 
-        // Resume tool blocks + conversation history + per-thread loaded
-        // knowhow, all derived from a single events fetch (see
-        // `load_chat_history`).
         let Some(history_load) = until_canceled(
             &cancel_token,
             self.load_chat_history(
@@ -1791,17 +1677,10 @@ pub(super) impl LucidosEngine {
             history_image_hashes,
         } = history_load;
 
-        // Build extraction context for tool execution (artifact writes, imports)
         let base_ctx = self.extraction_context_base().await;
         let extraction_ctx =
             Self::extraction_context_with_conversation(&base_ctx, &conversation_summary);
 
-        // Memory indexing is handled by the EventBus memory consumer —
-        // it reacts to persisted MessageReceived/ResponseGenerated events.
-
-        // A pinned classification answers before the model is asked, so the
-        // LLM call never happens. Off unless `LUCIDOS_FORCE_QUERY_CLASSIFICATION`
-        // is set, which leaves every ordinary turn on the path below.
         let classification = if let Some(pinned) = pinned_classification() {
             pinned
         } else {
@@ -1810,8 +1689,6 @@ pub(super) impl LucidosEngine {
             } else {
                 Some(conversation_summary.as_str())
             };
-            // The single slowest step of the setup on a warm thread: a
-            // full LLM round-trip before any of the turn's own events exist.
             let capture = crate::engine::AuxCapture::new(
                 &self.event_bus,
                 thread_id,
@@ -1825,8 +1702,6 @@ pub(super) impl LucidosEngine {
                         user_message,
                         ctx,
                         &classification_call,
-                        // A Tree turn retrieves no recall, so its queries
-                        // would go unread.
                         !memory_tree,
                         &capture,
                     ),
@@ -1842,7 +1717,6 @@ pub(super) impl LucidosEngine {
             classification
         };
 
-        // Retrieve relevant context from memory (skipped if classification says not needed)
         let response_meta = cancel_exit.meta.clone();
         let recall = async {
             if memory_tree {
@@ -1859,9 +1733,6 @@ pub(super) impl LucidosEngine {
                 .await);
         };
 
-        // Emit MemoryRecalled so the frontend can show the step. ADR 0109 ends
-        // the assembled body region, so nothing reads the id back any more: the
-        // recall rides in the message on both arms.
         if classification.needs_memory && !memory_tree {
             self.event_bus
                 .emit_or_log(
@@ -1881,19 +1752,11 @@ pub(super) impl LucidosEngine {
 
         let max_tool_calls = crate::core::PreferenceStore::max_tool_calls(&self.pool).await;
 
-        // Decision 3: the tool pairs are what the turn boundary drops. They
-        // still accumulate inside the turn, which the loop does below; what
-        // goes is the rebuilt tail of the turn that ENDED. That tail sits at
-        // messages[0] and rotates wholesale at every boundary, so dropping it
-        // removes the mutation rather than shrinking it.
-        //
-        // A loaded knowhow doc survives this. Its body rides in the
-        // `[LOADED KNOWHOW]` block on both arms.
         if context_mode.is_on() {
             resume_tool_blocks.clear();
         }
 
-        // The thread's checklist, read once per turn, on BOTH arms. Under the
+        // INVARIANT: The thread's checklist, read once per turn, on BOTH arms. Under the
         // mode it rides inside the working understanding at the tail, so the
         // loop needs the snapshot it starts from. With the mode off it becomes
         // the `[TODO LIST]` block below. That block is the only thing putting
@@ -1909,9 +1772,6 @@ pub(super) impl LucidosEngine {
         {
             Ok(found) => found,
             Err(e) => {
-                // Not a reason to fail the turn. The list is the model's
-                // own memo, so the honest degradation is a turn without
-                // it: that costs a re-derivation, never correctness.
                 log_legacy!(
                     "[Chat] todo list read failed for thread {}: {}. This turn carries no checklist",
                     thread_id,
@@ -1920,10 +1780,6 @@ pub(super) impl LucidosEngine {
                 None
             }
         };
-        // The two seeds stay gated on the mode, so an off turn hands the loop
-        // exactly what it handed it before. Every reader of these inside the
-        // loop sits behind `mode_on`, and an inert clone of up to 50 items per
-        // turn buys nothing.
         let todo_seed: Vec<crate::engine::thread_events::TodoItem> = todo_snapshot
             .as_ref()
             .filter(|_| context_mode.is_on())
@@ -1934,14 +1790,9 @@ pub(super) impl LucidosEngine {
             .filter(|_| context_mode.is_on())
             .and_then(|list| list.notes.clone());
 
-        // The `[TODO LIST]` block. Empty under the mode, and empty on any
-        // thread with nothing unfinished: `turn_start_block` owns both gates.
         let todo_list_block =
             crate::engine::tools::todo::turn_start_block(context_mode, todo_snapshot.as_ref());
 
-        // The working understanding, read once and rendered at the tail of
-        // every round. Same degradation as the checklist: a read that fails
-        // costs the turn its notes, never its correctness.
         let document = if context_mode.is_on() {
             match super::working_understanding::latest_document(&self.pool, thread_id).await {
                 Ok(found) => found.unwrap_or_default(),
@@ -2013,29 +1864,11 @@ pub(super) impl LucidosEngine {
             thread_depth_context,
         } = context_sections;
 
-        // The window the resolved model really has. It sizes the message budget
-        // below and the MCP slice of the tool array. It comes from the model's
-        // registry row when the row declares one. The id-shape fallback has no
-        // rule for OpenRouter / xAI / Gemini / local ids, and gives them 200k.
         let provider = self.current_provider();
         let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
         let context_window = self.context_window_for(resolved_model, chosen_provider);
         let budget_model = self.request_budget_model_for(resolved_model, chosen_provider);
 
-        // The setup awaits that are checkpointed rather than raced: starting
-        // the thread's MCP servers spawns processes, and dropping that half
-        // done is not the pure read the other phases are. So the checkpoint
-        // goes AFTER them, where it catches a Stop that landed meanwhile.
-        // Before them the check would be near-dead, since the preceding phase
-        // is raced and would already have exited. The two remaining awaits
-        // (the server list, the capture preference) are in-memory or
-        // single-row and are followed immediately by the loop's own check.
-        //
-        // Enabled survives a restart and running does not, so the setup
-        // starts this thread's enabled servers before it reads its slice
-        // (ADR 0430). A failure leaves the turn running without that server,
-        // and becomes that server's line in `[MCP SERVERS]`. A trigger fire
-        // first enables the servers its trigger lists, so round 1 has them.
         let mut mcp_start_failures = match &trigger {
             Some(tc) => {
                 self.mcp_manager
@@ -2059,11 +1892,6 @@ pub(super) impl LucidosEngine {
                 .await);
         }
 
-        // Budget for messages = model-derived total budget minus system prompt + tool
-        // definitions overhead. The budget scales with the resolved model's context
-        // window (e.g. ~1.49M chars for a 1M model vs ~288k chars for default
-        // 200k-token Claude), so a big-window turn isn't trimmed back to the
-        // smaller model's limit.
         let total_budget =
             crate::engine::context::agent_context_char_budget_for(&budget_model, context_window);
         let prompt_overhead: usize = system_prompt.len() + tools.defs_chars();
@@ -2093,23 +1921,13 @@ pub(super) impl LucidosEngine {
             super::memory_views::TurnMemoryViews::default()
         };
 
-        // `loaded_knowhow_docs` was already populated up in the follow-up
-        // branch (or left empty for triggers / new threads). Build the block
-        // here so its byte size counts against fixed_size below — knowhow
-        // bodies can be large and were previously un-budgeted.
-        //
-        // ADR 0109 ends the assembled body region, so a knowhow doc rides in
-        // this block in both arms. What the mode changes is the live tool
-        // results, which is where the bytes actually are.
         let loaded_knowhow_block = build_loaded_knowhow_block(&loaded_knowhow_docs);
         let knowhow_retention_block = build_knowhow_retention_block(&loaded_knowhow_docs);
 
-        // Built here for the same reason: it is unconditional, so it belongs in
-        // `fixed_size` rather than in the formatting slack.
         let current_time_block =
             super::turn_clock::current_time_block(turn_started_at, &user_timezone);
 
-        // The other readings the cached system block must not hold. Each is
+        // INVARIANT: The other readings the cached system block must not hold. Each is
         // read ONCE here, so every round of this turn sends the same bytes and
         // the message prefix stays cacheable (`super::turn_tail`).
         //
@@ -2142,9 +1960,6 @@ pub(super) impl LucidosEngine {
                 .await);
         };
 
-        // This trigger's own docs, and any a plugin removed. They ride in the
-        // fire's message rather than the system block so every fire and chat
-        // turn shares that block. Empty on a chat turn.
         let trigger_knowhow_context = match trigger.as_ref() {
             None => String::new(),
             Some(t) => {
@@ -2184,7 +1999,6 @@ pub(super) impl LucidosEngine {
             }
         };
 
-        // Trim expendable context sections if the initial message would exceed budget
         let fixed_size = profile_context.len()
             + device_preferences_context.len()
             + file_list_context.len()
@@ -2205,14 +2019,13 @@ pub(super) impl LucidosEngine {
             + trigger_knowhow_context.len()
             + user_message.len()
             + memory_views.bytes()
-            + 500; // 500 for formatting
+            + 500;
         let expendable_budget = message_budget.saturating_sub(fixed_size);
         let expendable_size = memory_context.len() + history_context.len();
         if expendable_size > expendable_budget {
             log_legacy!("[Chat] Initial context ({}KB) exceeds message budget ({}KB, prompt overhead {}KB), trimming",
                 (fixed_size + expendable_size) / 1024, message_budget / 1024, prompt_overhead / 1024);
             let mut excess = expendable_size - expendable_budget;
-            // Trim memory first (most expendable), then history from oldest (start)
             if memory_context.len() >= excess {
                 cut_memory_tail(&mut memory_context, excess);
                 excess = 0;
@@ -2221,28 +2034,10 @@ pub(super) impl LucidosEngine {
                 memory_context.clear();
             }
             if excess > 0 {
-                // Oldest history goes first, so recent turns survive. The budget
-                // floor, not a curation decision: it fires only when the turn
-                // would not fit at all, and both arms have always applied it.
                 trim_history_from_oldest(&mut history_context, excess);
             }
         }
 
-        // ADR 0109 ends the assembled body region. Memory, the history and the
-        // knowhow docs ride in block 0 in both arms, exactly as the control arm
-        // sends them. What the mode curates is the live tool results, which are
-        // 33.1% of the bill against the region's 16.3%.
-
-        // One line per configured MCP server, in this thread's own status, so
-        // the model knows what it can enable (ADR 0430). Always a `String`, so
-        // `build_capture_sections` below can borrow it; an empty one is
-        // filtered out of both the message text and the capture rows.
-        //
-        // Read once, and this block is fixed for the turn: rewriting it would
-        // forfeit the message-prefix cache. The tool array is NOT fixed (ADR
-        // 0195), so a server the agent enables mid-turn leaves this list
-        // wrong. The loop corrects it in the round's tail rather than here,
-        // via `agentic_loop::mcp_surface_correction`.
         let mcp_servers_context = super::workspace_prompt_footprint::build_mcp_servers_section(
             &self
                 .mcp_manager
@@ -2260,11 +2055,6 @@ pub(super) impl LucidosEngine {
             String::new()
         };
 
-        // The stable context block leads the message and the volatile text
-        // follows, ending with the request and the tail (`assemble_turn_text`
-        // owns the order). A Tree turn's recent workspace entries open the
-        // volatile text, right behind the view snapshot and the thread memory
-        // view (`TurnMemoryViews::lead`).
         let turn_text = assemble_turn_text(&TurnSections {
             recent: &memory_views.recent,
             profile: &profile_context,
@@ -2295,24 +2085,12 @@ pub(super) impl LucidosEngine {
             },
         });
 
-        // Attached images ride inline as base64 image blocks on the user message
+        // INVARIANT: Attached images ride inline as base64 image blocks on the user message
         // (`build_user_content_with_images` below) and stay visible for the whole
         // turn. No on-disk path annotation: the chat `read_file` tool is rooted at
         // `data/artifacts/`, so a `.lucidos/tmp/images/…` hint only sent the model
         // chasing a path it can't reach ("the bot can't see my attached image").
 
-        // Built with bodies. The loop drops them per round when
-        // `capture_context` is off. Body cap (8 KB) prevents a 100 KB system
-        // prompt from bloating every events row. The actual assembly —
-        // tagging each section with role + inner-tier group, plus the
-        // per-loaded-knowhow and per-resume-tool-pair rows — lives in
-        // `build_capture_sections` so it can be unit-tested without
-        // standing up a full engine.
-        // A section that became a body reports through the region's own rows
-        // instead, so it is passed as empty here. Two rows for one body would
-        // double its size in the viewer's budget bar and in the eval's read.
-        // A Tree turn reports its views where Classic reports recall and the
-        // history, so the context view shows what this turn carried.
         let workspace_view = memory_views.workspace();
         let (capture_memory, capture_history) = if memory_tree {
             (workspace_view.as_str(), memory_views.thread.text.as_str())
@@ -2363,18 +2141,12 @@ pub(super) impl LucidosEngine {
             ),
         );
 
-        // Prepend reconstructed (ToolUse, ToolResult) Message pairs for the
-        // most recent N tool calls (Phase 3), so the last turn's work does not
-        // collapse to the stringified `[tools: ...]` summary. A knowhow body
-        // rides in the `[LOADED KNOWHOW]` block instead. See
-        // `core::store::build_resume_tool_blocks_with_skip_ids`.
         let mut messages = resume_tool_blocks;
         messages.push(Message {
             role: "user".to_string(),
             content: user_content,
         });
 
-        // Run the agentic loop (LLM call → parse response → execute tools → repeat)
         let mut terminator_settled = false;
         let result = self
             .run_agentic_loop(
@@ -2384,8 +2156,6 @@ pub(super) impl LucidosEngine {
                 request_id,
                 thread_id,
                 response_channel,
-                // A trigger run has nobody waiting, so it is never sent back
-                // for a question card.
                 !is_trigger,
                 message_budget,
                 &extraction_ctx,
@@ -2394,8 +2164,6 @@ pub(super) impl LucidosEngine {
                 &mut proposed_change,
                 user_images,
                 device_id,
-                // The whole resolved selection, so the provider this turn was
-                // pinned to is the one the router honours or refuses.
                 resolved.as_selection(),
                 &cancel_token,
                 &mut injection_rx,
@@ -2416,7 +2184,7 @@ pub(super) impl LucidosEngine {
             )
             .await;
 
-        // Defensive: if the loop returned without emitting a terminator for
+        // INVARIANT: Defensive: if the loop returned without emitting a terminator for
         // this request, emit ResponseAborted so the UI's "running" state
         // clears. Skipped on the success path because the flag tracks every
         // emit site — the SQL existence check has no functional index on
@@ -2433,7 +2201,7 @@ pub(super) impl LucidosEngine {
             .await;
         }
 
-        // The turn is over and this thread may still own running background
+        // INVARIANT: The turn is over and this thread may still own running background
         // work. Only an event wait re-opens the thread when it completes. If the
         // model armed none, the finish lands with nobody watching and the
         // thread stops: the five-hour release stall behind this code. Arming
@@ -2466,7 +2234,7 @@ pub(super) impl LucidosEngine {
         }
     }
 
-    /// The turn tail EVERY exit shares, normal or cancelled.
+    /// INVARIANT: The turn tail EVERY exit shares, normal or cancelled.
     ///
     /// Recovers messages that the fast-path send landed on `injection_tx` after
     /// the loop's last try_recv() but before the turn went idle. Without this
@@ -2499,15 +2267,6 @@ pub(super) impl LucidosEngine {
             &self.pool, thread_id, orphans,
         )
         .await;
-        // A spoken aside is not a follow-up, so it is never re-submitted.
-        //
-        // It tells a RUNNING round what the talker said out loud. Landing in
-        // the teardown window means that round is over, and re-submitting
-        // would start a NEW turn out of the talker's own stall. That is the
-        // spurious wake voice's one tool exists to end (ADR 0164).
-        //
-        // Nothing is lost: `SpokenReplyGenerated` is in the thread already, so
-        // the next round reads it from history.
         let orphans: Vec<_> = orphans
             .into_iter()
             .filter(|p| p.kind.can_carry_a_turn())
@@ -2522,21 +2281,6 @@ pub(super) impl LucidosEngine {
         orphans
     }
 
-    /// A user Stop observed during the turn's SETUP phase, before the agentic
-    /// loop ever ran.
-    ///
-    /// Emits the same terminator the loop's pre-iteration cancel arm would have
-    /// (`ResponseCanceled`, empty body, cause and actor both drained from the
-    /// per-thread handle so the timeline records which device clicked Stop, and
-    /// so an urgent child follow-up that landed during setup is still labelled
-    /// a redirect rather than an abandonment), then runs the shared turn tail.
-    /// Setup is where the wait actually is on a
-    /// large thread: history load, query classification, memory retrieval and
-    /// context assembly can run for tens of seconds, and until 2026-08-04
-    /// nothing in there looked at the token, so "Canceling…" hung for the whole
-    /// of it and the terminator landed BELOW the follow-up the user had typed
-    /// meanwhile. See
-    /// `docs/plans/2026-08-04-chat-stop-honored-during-turn-setup.md`.
     async fn cancel_during_setup(
         &self,
         cancel: &SetupCancel,

@@ -1,17 +1,3 @@
-//! Grouped `env_vars` LLM tool (list / set / delete) — the manifest-declared
-//! surface for user-managed, non-secret environment variables (Settings → System
-//! → Environment variables). Mirrors `execute_notifications`: a dedicated handler
-//! that dispatches on the `action` discriminator, because the `list`/`delete`
-//! actions are brand-new (no retired flat predecessor) and so can't go through
-//! the `grouped_legacy_name` normalization path.
-//!
-//! `set_environment_variable` is the retired standalone tool; it stays wired in
-//! `execute_tool` as a back-compat alias and is treated here as `action = "set"`
-//! (the `read_notifications` → `list` precedent). All three actions go through
-//! `EnvironmentVariableStore` — the same source of truth the HTTP `/env-vars`
-//! routes use — and the mutating ones emit their audit events (actor `None`:
-//! agent-origin, no request headers in the tool path).
-
 use super::{LucidosEngine, ToolOutcome};
 use crate::core::environment_variables::validate_agent_name;
 use crate::core::EnvironmentVariableStore;
@@ -19,10 +5,7 @@ use crate::llm::tool_names as tn;
 
 #[easy_ext::ext(EnvVarsExt)]
 pub(crate) impl LucidosEngine {
-    /// Grouped `env_vars` tool dispatcher. `name` is the tool name as called so
-    /// the retired `set_environment_variable` alias can default its action.
     async fn execute_env_vars(&self, name: &str, args: &serde_json::Value) -> ToolOutcome {
-        // The retired flat tool only ever set, and callers pass no `action`.
         let default_action = if name == tn::SET_ENVIRONMENT_VARIABLE {
             "set"
         } else {
@@ -47,7 +30,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// `list` — every user env var as name+value pairs (non-secret by design).
     async fn env_vars_list(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let vars = match EnvironmentVariableStore::list(&self.pool).await {
             Ok(v) => v,
@@ -65,7 +47,7 @@ pub(crate) impl LucidosEngine {
             .iter()
             .map(|v| serde_json::json!({ "name": v.name, "value": v.value }))
             .collect();
-        // An empty string here would reach the LLM stamped as a successful
+        // INVARIANT: An empty string here would reach the LLM stamped as a successful
         // `list`, i.e. "no environment variables", which is the one answer that
         // is never true at this point.
         match serde_json::to_string(&items) {
@@ -78,9 +60,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// `delete` — remove one var by name. Mirrors the HTTP `delete_env_var`
-    /// handler (delete via the store, emit `EnvironmentVariableDeleted`); a
-    /// missing name is a clear no-op message, not an error.
     async fn env_vars_delete(
         &self,
         args: &serde_json::Value,
@@ -104,13 +83,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Handler for the `set` action (and the back-compat `set_environment_variable`
-    /// alias) — define a user environment variable. Validates the name (shape,
-    /// not engine-reserved, not code-injecting), upserts, and emits `EnvironmentVariableSet` (value
-    /// carried — these are non-secret). Takes effect on the next spawned
-    /// subprocess with no restart. The engine's own process env is a separate
-    /// consumer: `environment_variables::apply_to_process_env` loads it once at
-    /// startup, so a variable the engine itself reads needs an engine restart.
     async fn execute_environment_variable_tool(
         &self,
         args: &serde_json::Value,
@@ -119,8 +91,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The `set` body, apart from the engine so a test can drive it on a pool.
-/// The caller is always an agent, so the name passes [`validate_agent_name`].
 async fn set_env_var(
     pool: &sqlx::PgPool,
     event_bus: &crate::engine::event_bus::EventBus,

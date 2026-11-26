@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const [origin, cookie, credential, route, installedDir] = process.argv.slice(2);
-const workerFile = join(installedDir, 'sw.js');
-const installedWorker = readFileSync(workerFile, 'utf8');
+const shellFile = join(installedDir, 'index.html');
+const inventoryFile = join(installedDir, 'workspace-client-assets.json');
+const installedShell = readFileSync(shellFile, 'utf8');
+const installedInventory = readFileSync(inventoryFile, 'utf8');
 for (const [name, browserType] of [['chromium', chromium], ['mobile-webkit', webkit]]) {
   mkdirSync('.lucidos', {recursive: true});
   const profile = mkdtempSync(join('.lucidos', 'production-browser-'));
@@ -18,7 +20,8 @@ for (const [name, browserType] of [['chromium', chromium], ['mobile-webkit', web
     } : {}),
   });
   try {
-    writeFileSync(workerFile, installedWorker);
+    writeFileSync(shellFile, installedShell);
+    writeFileSync(inventoryFile, installedInventory);
     await context.addCookies([{name: cookie, value: credential, url: origin}]);
     const page = await context.newPage();
     const requests = [];
@@ -100,7 +103,6 @@ for (const [name, browserType] of [['chromium', chromium], ['mobile-webkit', web
     }
     assert.ok(requests.some(url => url.includes(`${route}/assets/`)), 'production hashed assets loaded');
     assert.ok(requests.some(url => url.includes(`${route}/api/v1/`) && url.includes('events')), 'remote event stream requested');
-    assert.ok(!requests.some(url => url === `${origin}${route}/sw.js`), 'remote worker never requested');
     assert.ok(requests.filter(url => new URL(url).pathname.includes('/api/v1/') && !new URL(url).pathname.startsWith('/~/')).every(url => new URL(url).pathname.startsWith(`${route}/api/v1/`)), 'workspace requests stay selected');
     const worker = await page.evaluate(async () => {
       const registration = await navigator.serviceWorker.ready;
@@ -108,16 +110,22 @@ for (const [name, browserType] of [['chromium', chromium], ['mobile-webkit', web
     });
     assert.equal(worker.scope, `${origin}${route}/`);
     assert.equal(worker.script, `${origin}/~/sw.js?workspace=${encodeURIComponent(route.slice(1))}`);
-    const nextBuild = createHash('sha256').update(installedWorker + name).digest('hex').slice(0, 12);
-    const advancedWorker = installedWorker.replace(/const BUILD_ID = '[^']+';/, `const BUILD_ID = '${nextBuild}';`);
-    assert.notEqual(advancedWorker, installedWorker);
-    writeFileSync(workerFile, advancedWorker);
+    const nextBuild = createHash('sha256').update(installedShell + name).digest('hex').slice(0, 12);
+    const advancedShell = installedShell.replace(/(<meta name="lucidos-build-id" content=")[^"]+"/, `$1${nextBuild}"`);
+    assert.notEqual(advancedShell, installedShell);
+    const inventory = JSON.parse(installedInventory);
+    inventory.files['index.html'] = createHash('sha256').update(advancedShell).digest('hex');
+    writeFileSync(shellFile, advancedShell);
+    writeFileSync(inventoryFile, JSON.stringify(inventory));
+    const requestCount = requests.length;
     await page.evaluate(() => window.dispatchEvent(new Event('focus')));
     await page.getByText('New version available — refresh to sync', {exact: true}).first().waitFor({timeout: 30000});
-    assert.ok(requests.includes(`${origin}/~/sw.js`), 'version check reads A installed generation');
+    assert.ok(requests.slice(requestCount).includes(`${origin}${route}/`), 'version check reads the route shell');
+    assert.ok(!requests.includes(`${origin}${route}/sw.js`), 'remote worker never requested');
     console.log(JSON.stringify({browser: name, productionClient: true, persistedRemoteMessage: true}));
   } finally {
-    writeFileSync(workerFile, installedWorker);
+    writeFileSync(shellFile, installedShell);
+    writeFileSync(inventoryFile, installedInventory);
     await context.close();
     rmSync(profile, {recursive: true, force: true});
   }

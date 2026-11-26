@@ -1,8 +1,8 @@
-import { uploadPluginArchive } from '../../api/client';
+import { uploadErrorMessage, uploadPluginArchive } from '../../api/client';
 import { showToast, showConfirm } from '../../store/store';
 import { uploadFiles } from '../../store/actions/artifacts';
 import { ensureFocusedComposeThread } from '../../store/actions/compose';
-import { attachPendingUpload, describeUploadFailure } from '../../store/actions/imageUploads';
+import { attachPendingUpload } from '../../store/actions/imageUploads';
 import { sendMessage } from '../../store/actions/chat';
 import { sniffImageBytes, imageRejectionMessage } from '../../utils/imageBytes';
 
@@ -60,7 +60,7 @@ export async function uploadAndInstallPluginArchive(file: File): Promise<void> {
   try {
     ({ path } = await uploadPluginArchive(file));
   } catch (err) {
-    showToast(`Plugin upload failed: ${describeUploadFailure(err)}`, 'error');
+    showToast(`Plugin upload failed: ${uploadErrorMessage(err)}`, 'error');
     return;
   }
   await sendMessage(`Install the plugin at ${path}`);

@@ -1,6 +1,3 @@
-//! The hold predicate, the collector the answer's resume reads, and the note it
-//! builds.
-
 use super::*;
 use crate::engine::agent_question::aq_test_helpers::{opt, seed_chat_thread};
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -65,8 +62,6 @@ async fn child_report(bus: &EventBus, thread_id: Uuid) -> Uuid {
     .await
 }
 
-/// A wait resolution and its re-entry anchor, the pair `emit_resolution`
-/// writes. Returns the anchor's id.
 async fn wait_delivery(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     let delivered = emit(
         bus,
@@ -128,8 +123,6 @@ async fn turn_activity(bus: &EventBus, thread_id: Uuid) {
     .await;
 }
 
-/// The reported shape. A restart dropped the question's turn, then the child
-/// reported and a wait delivered. Neither may start a turn over the card.
 #[tokio::test]
 async fn a_delivery_is_held_behind_a_question_with_no_live_turn() {
     let (pool, db_name) = setup_test_db().await;
@@ -154,8 +147,6 @@ async fn a_delivery_is_held_behind_a_question_with_no_live_turn() {
     teardown_test_db(&db_name).await;
 }
 
-/// A live question turn reads its injections after the answer (ADR 0255), so
-/// the gate stands aside and the delivery injects as before.
 #[tokio::test]
 async fn a_delivery_is_not_held_when_a_turn_is_live() {
     let (pool, db_name) = setup_test_db().await;
@@ -179,9 +170,6 @@ async fn a_delivery_is_not_held_when_a_turn_is_live() {
     teardown_test_db(&db_name).await;
 }
 
-/// Only a delivery nobody asked for is held. A Continue click and an answer's
-/// resume are engine re-entries on their own notes, and a message is the
-/// person's own words.
 #[tokio::test]
 async fn only_a_delivery_is_held() {
     let (pool, db_name) = setup_test_db().await;
@@ -218,7 +206,6 @@ async fn only_a_delivery_is_held() {
     teardown_test_db(&db_name).await;
 }
 
-/// No open question, or one already answered or overtaken, holds nothing.
 #[tokio::test]
 async fn a_delivery_is_not_held_without_an_active_question() {
     let (pool, db_name) = setup_test_db().await;
@@ -282,9 +269,6 @@ async fn a_delivery_is_not_held_without_an_active_question() {
     teardown_test_db(&db_name).await;
 }
 
-/// The resume carries every wait delivery held since the question, oldest
-/// first, and counts the child reports. A delivery from before the question
-/// was read by an earlier turn, so it stays out.
 #[tokio::test]
 async fn the_resume_collects_every_delivery_held_since_the_question() {
     let (pool, db_name) = setup_test_db().await;
@@ -324,9 +308,6 @@ async fn the_resume_collects_every_delivery_held_since_the_question() {
     teardown_test_db(&db_name).await;
 }
 
-/// Two waits resolving together write both resolutions before either anchor,
-/// and a child report can land in between. Every anchor is still carried, and
-/// a live turn's acknowledgement of an injected message is not.
 #[tokio::test]
 async fn the_resume_finds_an_anchor_its_resolution_does_not_precede() {
     let (pool, db_name) = setup_test_db().await;
@@ -388,8 +369,6 @@ async fn the_resume_finds_an_anchor_its_resolution_does_not_precede() {
     teardown_test_db(&db_name).await;
 }
 
-/// A delivery a turn already read, before the restart dropped it, is not
-/// carried twice.
 #[tokio::test]
 async fn the_resume_skips_a_delivery_a_turn_already_read() {
     let (pool, db_name) = setup_test_db().await;

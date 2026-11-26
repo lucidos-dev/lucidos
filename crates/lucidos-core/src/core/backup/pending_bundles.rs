@@ -1,12 +1,3 @@
-//! Git bundles of unresolved change branches, carried inside a backup.
-//!
-//! A change branch lives in the repository its coding agent worked in. For a
-//! workspace repository that is the workspace's own `.git`, which the tar
-//! already holds. Every other repository (the Lucidos source checkout, an
-//! external repo) sits outside the workspace, so the backup bundles its
-//! branches here. Each bundle takes `main` as its prerequisite, so it holds
-//! only the commits `main` lacks.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,13 +6,10 @@ use serde::{Deserialize, Serialize};
 use super::BoxError;
 use crate::core::git::{git_cmd, git_cmd_env_timeout};
 
-/// The archive directory holding the bundles and their manifest.
 pub const ARCHIVE_DIR: &str = "lucidos_pending_changes";
 const MANIFEST: &str = "manifest.json";
 const MAIN: &str = "refs/heads/main";
 
-/// A restore may fetch `origin` to supply missing prerequisites, and a large
-/// repository takes longer than the usual git ceiling.
 const ORIGIN_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,7 +20,6 @@ pub(crate) struct Manifest {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RepoBundle {
     pub repo_root: String,
-    /// The bundle's file name inside [`ARCHIVE_DIR`].
     pub bundle: String,
     pub branches: Vec<BundledBranch>,
 }
@@ -43,15 +30,6 @@ pub(crate) struct BundledBranch {
     pub tip: String,
 }
 
-/// Bundle every branch in `branches` that has commits `main` lacks, into
-/// `out_dir`, with a manifest beside them. Repositories inside `workspace` are
-/// skipped, since the tar carries their `.git`. Returns `false` when nothing
-/// needed bundling, and then writes nothing.
-///
-/// A branch that no longer exists is skipped: its change row outlived it. So
-/// is a path that is no longer a git checkout. A repository that git cannot
-/// read fails the backup, because a backup must never silently drop pending
-/// work.
 pub(crate) async fn write_bundles(
     workspace: &Path,
     branches: &[(String, String)],
@@ -63,7 +41,6 @@ pub(crate) async fn write_bundles(
         if is_inside(repo, workspace) {
             continue;
         }
-        // A checkout's `.git` is a directory, or a file in a linked worktree.
         if !repo.join(".git").exists() {
             crate::log_legacy!(
                 "[Backup] Skipping pending branches of {}: no git checkout is there",
@@ -120,7 +97,7 @@ pub(crate) async fn write_bundles(
     Ok(true)
 }
 
-/// Bring back every branch the bundles in `dir` hold, each into the repository
+/// INVARIANT: Bring back every branch the bundles in `dir` hold, each into the repository
 /// it came from. Returns one line per branch that could not come back. A
 /// missing repository or a refused branch never stops the others.
 ///
@@ -189,8 +166,6 @@ fn is_inside(repo: &Path, workspace: &Path) -> bool {
     canonical(repo).starts_with(canonical(workspace))
 }
 
-/// The commit `rev` names, `None` when it names nothing. `Err` when git could
-/// not answer, which a caller must not read as "no such branch".
 async fn rev_parse(repo: &Path, rev: &str) -> Result<Option<String>, BoxError> {
     let commit = format!("{rev}^{{commit}}");
     let out = git_cmd(&["rev-parse", "--verify", "--quiet", &commit], repo).await?;
@@ -228,7 +203,7 @@ async fn run(repo: &Path, args: &[&str]) -> Result<String, BoxError> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Fetch one branch from the bundle without `--force`, so git refuses
+/// INVARIANT: Fetch one branch from the bundle without `--force`, so git refuses
 /// anything but creating it or fast-forwarding it.
 async fn fetch_branch(repo: &Path, bundle: &Path, branch: &str) -> Result<(), String> {
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");

@@ -1,40 +1,18 @@
-//! Application Default Credentials (ADC) — Vertex auth without the `gcloud`
-//! binary.
-//!
-//! A packaged build ships no `gcloud` CLI, so the legacy paths
-//! (`gcloud auth application-default print-access-token` for the token and
-//! `gcloud config get-value project` for the project) can't run. But a user who
-//! has run `gcloud auth application-default login` already has an ADC file on
-//! disk and a default project in the gcloud config. This module reads BOTH
-//! directly and refreshes the OAuth token itself, so Vertex works in a packaged
-//! build with no binary and no service-account key — using the user's own
-//! identity (no enterprise org-policy fight over key creation).
-//!
-//! Only the `authorized_user` ADC type (what the login writes) is parsed here.
-//! Other types (`service_account` / `external_account` / `impersonated_service_account`)
-//! return `None` so the caller falls back to the `gcloud` subprocess.
-
 use serde::Deserialize;
 use std::path::PathBuf;
 
-/// Google's OAuth2 token endpoint (refresh-grant exchange).
 const GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 
-/// A parsed `authorized_user` ADC credential. All three fields are secrets and
-/// must never be logged — see the manual [`std::fmt::Debug`] below.
 #[derive(Clone)]
 pub struct AdcCredentials {
     client_id: String,
     client_secret: String,
     refresh_token: String,
-    /// Project carried by the ADC file (set via
-    /// `gcloud auth application-default set-quota-project`), if any.
     pub quota_project_id: Option<String>,
 }
 
 impl std::fmt::Debug for AdcCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never leak the OAuth secrets through `{:?}`.
         f.debug_struct("AdcCredentials")
             .field("client_id", &"<redacted>")
             .field("client_secret", &"<redacted>")
@@ -44,7 +22,6 @@ impl std::fmt::Debug for AdcCredentials {
     }
 }
 
-/// Raw ADC JSON shape — we only handle `type: "authorized_user"`.
 #[derive(Deserialize)]
 struct AdcFile {
     #[serde(rename = "type")]
@@ -56,8 +33,6 @@ struct AdcFile {
     quota_project_id: Option<String>,
 }
 
-/// The gcloud config dir: `$CLOUDSDK_CONFIG` if set, else `~/.config/gcloud`
-/// (the macOS/Linux default — the engine ships on those).
 fn gcloud_config_dir() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("CLOUDSDK_CONFIG") {
         let p = PathBuf::from(p);
@@ -69,9 +44,6 @@ fn gcloud_config_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config").join("gcloud"))
 }
 
-/// Locate the ADC file: `$GOOGLE_APPLICATION_CREDENTIALS`, else
-/// `<gcloud-config>/application_default_credentials.json`. Returns the first
-/// path that exists.
 pub fn adc_file_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS") {
         let p = PathBuf::from(p);
@@ -83,9 +55,6 @@ pub fn adc_file_path() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// Parse ADC JSON as an `authorized_user` credential. Pure (no fs) for testing.
-/// Returns `None` for any other ADC type or a malformed/missing-field file — the
-/// caller then falls back to the `gcloud` subprocess.
 pub fn parse_authorized_user(json: &str) -> Option<AdcCredentials> {
     let parsed: AdcFile = serde_json::from_str(json).ok()?;
     if parsed.cred_type.as_deref() != Some("authorized_user") {
@@ -99,7 +68,6 @@ pub fn parse_authorized_user(json: &str) -> Option<AdcCredentials> {
     })
 }
 
-/// Locate + load the `authorized_user` ADC credential, if present.
 pub fn load() -> Option<AdcCredentials> {
     let path = adc_file_path()?;
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -109,11 +77,9 @@ pub fn load() -> Option<AdcCredentials> {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    // `expires_in` is ignored — the shared token cache applies a fixed TTL below
-    // the ~3600s lifetime, same as the gcloud path.
 }
 
-/// Wall-clock budget for the token exchange. `reqwest` applies no timeout of its
+/// INVARIANT: Wall-clock budget for the token exchange. `reqwest` applies no timeout of its
 /// own, so a black-holed connection to the token endpoint (TCP established, no
 /// response) leaves `send().await` pending forever. That is not hypothetical
 /// here: this runs on the Vertex chat path every time the cached access token
@@ -124,9 +90,6 @@ struct TokenResponse {
 /// and on timeout `fetch_access_token` still falls back to the gcloud path.
 pub(crate) const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Exchange the refresh token for a fresh access token. Errors carry the HTTP
-/// status + Google's `error_description` body (which never contains the secrets
-/// we send), never the credential fields themselves.
 pub async fn refresh_access_token(
     creds: &AdcCredentials,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -152,9 +115,6 @@ pub async fn refresh_access_token(
     Ok(parsed.access_token)
 }
 
-/// Resolve the Vertex project WITHOUT the `gcloud` binary: the ADC file's
-/// `quota_project_id`, else the active gcloud configuration's `[core] project`.
-/// `None` if neither is available (caller falls back to `gcloud config`).
 pub fn project_from_files() -> Option<String> {
     if let Some(p) = load().and_then(|c| c.quota_project_id) {
         return Some(p);
@@ -162,9 +122,6 @@ pub fn project_from_files() -> Option<String> {
     project_from_gcloud_config()
 }
 
-/// Read `[core] project` from the active gcloud configuration file
-/// (`<config>/configurations/config_<active>`, where `<active>` comes from the
-/// `active_config` file, default `default`). No `gcloud` binary needed.
 fn project_from_gcloud_config() -> Option<String> {
     let dir = gcloud_config_dir()?;
     let active = std::fs::read_to_string(dir.join("active_config"))
@@ -177,8 +134,6 @@ fn project_from_gcloud_config() -> Option<String> {
     parse_ini_core_project(&raw)
 }
 
-/// Pull `project` out of the `[core]` section of a gcloud INI config. Pure for
-/// testing.
 fn parse_ini_core_project(ini: &str) -> Option<String> {
     let mut in_core = false;
     for line in ini.lines() {
@@ -237,8 +192,6 @@ mod tests {
 
     #[test]
     fn rejects_non_authorized_user_types() {
-        // A service_account ADC (or any other type) is not handled here — the
-        // caller falls back to gcloud.
         let sa = r#"{"type":"service_account","client_email":"x@y.iam","private_key":"-----BEGIN-----"}"#;
         assert!(parse_authorized_user(sa).is_none());
         let ext = r#"{"type":"external_account"}"#;
@@ -247,7 +200,6 @@ mod tests {
 
     #[test]
     fn rejects_authorized_user_missing_fields() {
-        // type matches but a required field is absent → None (fall back).
         let missing = r#"{"type":"authorized_user","client_id":"id"}"#;
         assert!(parse_authorized_user(missing).is_none());
     }

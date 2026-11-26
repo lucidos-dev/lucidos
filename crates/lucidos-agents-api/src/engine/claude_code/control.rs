@@ -18,17 +18,12 @@ pub enum RungPick {
     },
 }
 
-/// What [`LucidosEngine::record_rung_pick`] did with a pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RungPickOutcome {
-    /// Recorded. The thread's next spawn runs on it.
     Recorded,
-    /// Refused: a turn runs, and its rung stays fixed until it ends.
     TurnRunning,
 }
 
-/// How long a pick waits for a finished turn's idle exit, and how often it
-/// re-checks meanwhile. The exit usually lands within milliseconds.
 const IDLE_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const IDLE_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -40,11 +35,6 @@ fn turn_open(status: crate::engine::thread_lifecycle::ThreadStatus) -> bool {
     )
 }
 
-/// Whether a turn runs on a thread, so its rung is locked (ADR 0542). A turn
-/// runs while it starts, works, or waits on a question, which the status
-/// says. A live process counts too: a follow-up would reach it on its old
-/// rung. A cache keep-alive's hidden turn does not count, because it records
-/// no rung over the pick.
 pub(crate) fn rung_locked(
     status: crate::engine::thread_lifecycle::ThreadStatus,
     session: Option<&crate::engine::AgentSession>,
@@ -52,7 +42,7 @@ pub(crate) fn rung_locked(
     turn_open(status) || session.is_some_and(|s| s.is_live() && !s.keep_alive)
 }
 
-/// A live process a pick waits on before it refuses. The client frees the
+/// INVARIANT: A live process a pick waits on before it refuses. The client frees the
 /// rung at the turn's Result, but the run loop still finishes the turn and
 /// then runs the idle exit. Only that exit may end the process: it keeps it
 /// for an input the agent still owes. An apply holds the process, so no exit
@@ -61,8 +51,6 @@ pub(crate) fn awaits_idle_exit(session: &crate::engine::AgentSession) -> bool {
     session.is_live() && !session.keep_alive && session.change_claim.is_none()
 }
 
-/// The thread-less half of `stop_agent`: stop every session in the map that
-/// `stop_refusal` lets go. A request that stopped nothing reports the refusal.
 pub(crate) fn stop_every_session(
     sessions: &mut HashMap<Uuid, crate::engine::AgentSession>,
     reason: StopReason,
@@ -87,25 +75,15 @@ pub(crate) fn stop_every_session(
     }
 }
 
-/// What `interrupt_agent` does with the entry it found for a thread.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InterruptRoute {
-    /// A turn is in flight and a loop is listening: fire the interrupt.
     Interrupt,
-    /// The turn already reached its boundary: nothing to interrupt.
     AlreadyWaiting,
-    /// No loop is listening: the session is exiting, or a phantom. Take the
-    /// no-session fallback.
     NoLoop,
 }
 
-/// `is_waiting` alone cannot tell a live turn from an entry whose loop is gone,
-/// so the interrupt asks `is_in_flight`. A turn that reached its boundary stays
-/// "already waiting" whether or not its loop is still there: an interrupt
-/// would stop nothing either way.
 pub(crate) fn interrupt_route(session: &crate::engine::AgentSession) -> InterruptRoute {
     if matches!(session.phase, crate::engine::SessionPhase::Applying) {
-        // No turn runs while an apply holds the thread.
         return InterruptRoute::AlreadyWaiting;
     }
     if session.is_in_flight() {
@@ -170,11 +148,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Snapshot a session's `pending_stop` reason. Encapsulates the lock
-    /// acquisition so the run_session loop and its post-loop cleanup don't
-    /// have to know which field carries the stop reason — flipping `bool`
-    /// fields back and forth here used to be the source of the phantom
-    /// `ResponseCanceled` regressions.
     async fn pending_stop_reason(&self, thread_id: Uuid) -> Option<StopReason> {
         self.agent_sessions
             .lock()
@@ -183,8 +156,6 @@ pub(crate) impl LucidosEngine {
             .and_then(|s| s.pending_stop)
     }
 
-    /// The live session's question flushes, which a card's gate waits on.
-    /// `None` with no session: then no loop has text still on its way.
     async fn question_flushes(
         &self,
         thread_id: Uuid,
@@ -196,12 +167,6 @@ pub(crate) impl LucidosEngine {
             .map(|s| s.question_flushes.clone())
     }
 
-    /// Read and clear the device that clicked Cancel on a live session (stamped
-    /// by `interrupt_agent`). The run_session interrupt arm calls this so the
-    /// emitted `ResponseCanceled.actor` records the cancelling device. Drained
-    /// on read — a resumed session must not carry a stale actor into its next
-    /// turn. The `agent_sessions` analog of `take_cancel_actor` (the chat
-    /// path's `ThreadHandle.cancel_actor` slot in `active_threads`).
     async fn take_session_cancel_actor(&self, thread_id: Uuid) -> Option<MessageOrigin> {
         self.agent_sessions
             .lock()
@@ -210,11 +175,6 @@ pub(crate) impl LucidosEngine {
             .and_then(|s| s.cancel_actor.take())
     }
 
-    /// Read and clear the session's `redirect_cause`. The run_session interrupt
-    /// arm calls this so the interrupted turn's `ResponseCanceled` carries the
-    /// redirect's cause (neutral render) rather than `UserStop`. Drained on
-    /// read, so a resumed session carries no stale cause into its next turn.
-    /// The redirect analog of `take_session_cancel_actor`.
     async fn take_session_redirect_cause(
         &self,
         thread_id: Uuid,
@@ -226,36 +186,6 @@ pub(crate) impl LucidosEngine {
             .and_then(|s| s.redirect_cause.take())
     }
 
-    /// Interrupt a running Claude Code session — sends control_request:interrupt to stop
-    /// current work without killing the session (like pressing Esc in the CC terminal).
-    /// The CC process stays alive and enters waiting state.
-    ///
-    /// `actor` flows onto the `ResponseCanceled` emitted by the no-session
-    /// settle fallback so the panel reads "You" instead of "System".
-    ///
-    /// Fallbacks when no live Claude Code subprocess exists for `thread_id`:
-    ///   1. Cancel the in-process agentic loop via the `active_threads` token
-    ///      (handles run_thread-spawned chat threads and CC threads that are
-    ///      mid-startup, before SessionStarted has registered an agent_session).
-    ///      When the cancel lands, `run_session`'s `chat_cancel` arm emits the
-    ///      terminal `ResponseCanceled` — skip the settle to avoid double-emit.
-    ///   2. Only if the cancel had no entry to land on, settle so the UI
-    ///      unsticks. `terminal` picks the event: `CanceledQuestion` when this
-    ///      request cancel-stamped a pending question (the caller's own write
-    ///      is what put the row at `running`), `StuckProjection` otherwise.
-    ///      See [`SettleTerminal`].
-    ///
-    /// Unlike `stop_agent`, interrupt is always a real Cancel/Stop click — the
-    /// frontend offers no "interrupt for Apply/Discard/Archive" path.
-    ///
-    /// Returns `Ok(true)` when a live turn was interrupted, an in-process loop
-    /// canceled, or a stuck `running` projection settled — i.e. a terminal event
-    /// is on its way. `Ok(false)` when nothing was interruptible (the settle
-    /// found no stuck projection, or — for the thread-id-less variant — every
-    /// session was already waiting). The handler folds this into the
-    /// `{"canceled": bool}` response so the client can self-heal a stale view.
-    /// The `SESSION_ALREADY_WAITING` `Err` is preserved for the single-thread
-    /// idle-session race so the stop handler keeps its no-op-200 mapping.
     async fn interrupt_agent(
         &self,
         thread_id: Option<Uuid>,
@@ -265,7 +195,6 @@ pub(crate) impl LucidosEngine {
         let mut guard = self.agent_sessions.lock().await;
 
         if let Some(tid) = thread_id {
-            // An entry no loop listens to is no session at all.
             if let Some(session) = guard
                 .get_mut(&tid)
                 .filter(|s| interrupt_route(s) != InterruptRoute::NoLoop)
@@ -273,7 +202,7 @@ pub(crate) impl LucidosEngine {
                 if interrupt_route(session) == InterruptRoute::AlreadyWaiting {
                     return Err(SESSION_ALREADY_WAITING.into());
                 }
-                // Record who clicked Cancel BEFORE the signal so the interrupt
+                // INVARIANT: Record who clicked Cancel BEFORE the signal so the interrupt
                 // arm, or the canceled startup, can stamp `ResponseCanceled.actor`
                 // with the originating device (the popover's Device row).
                 session.cancel_actor = actor;
@@ -291,8 +220,6 @@ pub(crate) impl LucidosEngine {
                 let settled = self
                     .settle_unclaimed_running_thread(tid, actor.clone(), terminal)
                     .await?;
-                // No live session will settle what the stopped turn left, so
-                // this Stop withholds it (ADR 0400).
                 if settled && terminal == SettleTerminal::CanceledQuestion {
                     self.withhold_stopped_work(tid, actor).await;
                 }
@@ -313,11 +240,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// End the running turn on `thread_id` because a Hold reached it. The
-    /// turn ends as `CancelCause::Hold`, which leaves no Stop hold, and the
-    /// session stays resumable. Unlike Stop, it never settles a stale
-    /// projection: that would write a Stop the Resume could not lift.
-    /// `true` when a live turn or loop took the cancel.
     async fn stop_turn_for_hold(&self, thread_id: Uuid, actor: Option<MessageOrigin>) -> bool {
         let mut guard = self.agent_sessions.lock().await;
         if let Some(session) = guard
@@ -333,11 +255,6 @@ pub(crate) impl LucidosEngine {
         self.cancel_thread_for_hold(thread_id, actor)
     }
 
-    /// Record a rung pick on a started thread, unless a turn runs
-    /// ([`rung_locked`]). A finished turn's process gets [`IDLE_EXIT_WAIT`] to
-    /// exit first. The pick is a `CodingAgentSettingsChanged` with the user's
-    /// actor, which the next spawn reads through [`Self::cc_thread_settings`].
-    /// No running process ever receives it.
     async fn record_rung_pick(
         &self,
         thread_id: Uuid,
@@ -360,8 +277,6 @@ pub(crate) impl LucidosEngine {
                 .get(&thread_id)
                 .filter(|s| awaits_idle_exit(s))
                 .map(|s| s.idle_notify.clone());
-            // The status still reads running between the turn's Result and its
-            // idle event, so only a question park or a pause refuses at once.
             let parked = matches!(
                 status,
                 crate::engine::thread_lifecycle::ThreadStatus::WaitingForUserAnswer
@@ -369,7 +284,6 @@ pub(crate) impl LucidosEngine {
             );
             match exiting {
                 Some(idle_notify) if !parked && tokio::time::Instant::now() < deadline => {
-                    // Woken or timed out alike, the next pass re-reads both.
                     let woken = idle_notify.notified();
                     drop(sessions);
                     _ = tokio::time::timeout(IDLE_EXIT_POLL, woken).await;
@@ -391,8 +305,6 @@ pub(crate) impl LucidosEngine {
                     model,
                     reasoning_effort,
                     coding_agent,
-                    // A settings-only emit: the Init-time emit pins the
-                    // session id and config dir.
                     cc_session_id: None,
                     claude_config_dir: None,
                     claude_config_dir_explicit: None,
@@ -413,8 +325,6 @@ pub(crate) impl LucidosEngine {
         if let Some(s) = guard.get(&thread_id) {
             let has_active = s.is_live();
             let mut info = s.to_commands_info();
-            // Only a live real turn reports its own pair. After a keep-alive
-            // or an exit, a pick made since is what the next turn runs.
             let session_pair = (has_active && !s.keep_alive)
                 .then(|| (s.current_model.clone(), s.current_reasoning_effort.clone()));
             let repo_key = s
@@ -422,7 +332,6 @@ pub(crate) impl LucidosEngine {
                 .as_ref()
                 .map(|r| r.to_string_lossy().to_string());
             drop(guard);
-            // Session exists but Init hasn't arrived yet — use repo cache for commands
             if info.builtin_commands.is_empty() && info.skill_commands.is_empty() {
                 if let Some(repo_key) = repo_key {
                     let cache = self.cc_commands_cache.read().await;
@@ -444,7 +353,6 @@ pub(crate) impl LucidosEngine {
             };
         }
         drop(guard);
-        // No live session — get commands from repo cache, settings from thread events
         let repo_root: Option<String> = sqlx::query_scalar(
             "SELECT repo_root FROM changes WHERE thread_id = $1 \
              ORDER BY created_at DESC LIMIT 1",
@@ -466,7 +374,7 @@ pub(crate) impl LucidosEngine {
             let cache = self.cc_commands_cache.read().await;
             lookup_repo_commands_in_cache(&cache, &repo_key)
         } else {
-            // Thread has no recorded repo (no `changes` row yet) — return
+            // INVARIANT: Thread has no recorded repo (no `changes` row yet) — return
             // empty rather than leaking another repo's skills.
             CcCommandsInfo::default()
         };
@@ -479,9 +387,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Return cached commands for a specific repo path (for compose-view menu).
-    /// Empty result if the repo has never had a Claude Code session — never falls back
-    /// to another repo's cache.
     async fn cc_commands_for_repo(&self, repo_path: &Path) -> CcCommandsResult {
         let cache = self.cc_commands_cache.read().await;
         let info = lookup_repo_commands_in_cache(&cache, &repo_path.to_string_lossy());

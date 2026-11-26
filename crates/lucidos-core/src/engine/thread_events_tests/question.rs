@@ -52,8 +52,6 @@ fn user_question_asked_serialization() {
     assert_eq!(v["worktree_path"], "/tmp/cc-abc");
 }
 
-/// Events are immutable, so every card stored before `preview` existed must
-/// still decode.
 #[test]
 fn question_option_without_preview_still_decodes() {
     let option: QuestionOption =
@@ -61,8 +59,6 @@ fn question_option_without_preview_still_decodes() {
     assert_eq!(option.preview, None);
 }
 
-/// Every answer stored before answers carried images must still decode, and
-/// an imageless answer must serialize exactly as it did.
 #[test]
 fn answers_without_images_keep_their_old_shape() {
     let old_free: AnswerKind =
@@ -79,7 +75,6 @@ fn answers_without_images_keep_their_old_shape() {
     assert_eq!(old_multi.image_hashes(), &[] as &[String]);
 }
 
-/// Every side question stored before asks carried images must still decode.
 #[test]
 fn a_side_question_asked_without_images_still_decodes() {
     let raw = r#"{"type":"SideQuestionAsked","side_question_id":"7f1c1b1e-5e2a-4f3a-9d77-3c0f2b9a8a11","question":"q"}"#;
@@ -251,8 +246,6 @@ fn user_question_answered_multi_selected_serialization() {
 
 #[test]
 fn user_question_answered_multi_selected_with_text_serialization() {
-    // New shape: MultiSelected carrying the prompt textarea's contents
-    // alongside the toggled option ids. Round-trips with `text` present.
     let event = ThreadEvent::UserQuestionAnswered {
         compose: None,
         tool_use_id: "tu_2".into(),
@@ -299,7 +292,6 @@ fn user_question_answered_event_type() {
 
 #[test]
 fn user_question_round_trips_through_db_payload() {
-    // Old DB rows or fresh inserts must deserialize cleanly.
     let cases = [
         r#"{"type":"UserQuestionAsked","tool_use_id":"tu","cc_session_id":"s","question":"q"}"#,
         r#"{"type":"UserQuestionAsked","tool_use_id":"tu","cc_session_id":"s","question":"q","options":[{"id":"a","label":"A"}]}"#,
@@ -319,8 +311,6 @@ fn user_question_round_trips_through_db_payload() {
     }
 }
 
-/// Stored rows of the retired single-use card still read, though nothing
-/// emits them now (ADR 0387 history).
 #[test]
 fn retired_allow_once_rows_still_deserialize() {
     let thread = uuid::Uuid::new_v4();
@@ -348,7 +338,6 @@ fn retired_allow_once_rows_still_deserialize() {
     }
 }
 
-/// A stored thread card names no workspace or snapshot.
 #[test]
 fn legacy_owner_approval_decodes_without_snapshot_authority() {
     let old: OwnerApproval = serde_json::from_value(serde_json::json!({
@@ -359,8 +348,6 @@ fn legacy_owner_approval_decodes_without_snapshot_authority() {
     assert!(old.snapshot_handle.is_none());
 }
 
-/// The stored spellings of the retired verbs still read, so an old card's
-/// timeline still renders.
 #[test]
 fn a_retired_verb_still_reads_from_a_stored_card() {
     use crate::engine::thread_events::permission::Action;

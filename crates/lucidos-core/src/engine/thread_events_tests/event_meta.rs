@@ -32,7 +32,6 @@ fn event_meta_merges_into_payload() {
         "12345678-1234-1234-1234-123456789abc"
     );
     assert_eq!(payload["channel"], "claude_code");
-    // event_id is NOT merged into payload — it's used as the DB primary key
     assert!(payload.get("event_id").is_none());
 }
 
@@ -50,10 +49,6 @@ fn event_meta_none_adds_nothing() {
 
 #[test]
 fn event_meta_actor_merges_into_payload() {
-    // Auditability: every mutating endpoint stamps the event with who
-    // initiated it. EventMeta carries that across all ThreadEvent variants
-    // without per-variant struct churn or backward-compat churn for unit
-    // variants like ThreadSaved.
     let event = ThreadEvent::ThreadSaved;
     let meta = EventMeta {
         actor: Some(MessageOrigin::Device {
@@ -114,12 +109,6 @@ fn indexable_text_returns_content_for_chat_events() {
     assert_eq!(canceled.indexable_text(), Some("partial"));
 }
 
-/// An old row carries `spoken_secs_before`, and its meaning never changed:
-/// how long before the row the talker began those words.
-///
-/// ADR 0201 dropped the field and ADR 0206 restored it, so such a row is read
-/// again rather than ignored. It reads where it was said, as it did when it
-/// was written.
 #[test]
 fn a_reply_row_written_before_adr_0201_still_reads() {
     let legacy = serde_json::json!({
@@ -144,11 +133,6 @@ fn a_reply_row_written_before_adr_0201_still_reads() {
     }
 }
 
-/// What the caller SAID reaches memory, exactly as what they typed does.
-///
-/// A delegated utterance used to be written as a `MessageReceived`, so it was
-/// indexed through that arm. ADR 0201 stopped writing one, and without an arm
-/// of its own nothing anybody says on a call is recalled ever again.
 #[test]
 fn indexable_text_covers_what_the_caller_said_on_a_call() {
     let spoken = ThreadEvent::SpokenMessageReceived {
@@ -161,15 +145,6 @@ fn indexable_text_covers_what_the_caller_said_on_a_call() {
     );
 }
 
-/// A `PromptInjected` is indexable only when it carries ORIGINAL text.
-///
-/// With `injected_message_id` set it is an acknowledgement of a
-/// `MessageReceived` that is already persisted and already indexed, with the
-/// text copied verbatim, so indexing it too files the user's sentence into
-/// memory twice. Every mid-flight injection has that shape, and so does every
-/// orphan re-entry (`api::chat::announce_orphan_batch`). Without the id it is
-/// an engine-authored note (a continuation resume summary, a legacy
-/// child-thread callback) and is the only record of its own content.
 #[test]
 fn indexable_text_skips_an_injection_that_echoes_a_persisted_message() {
     let echo = ThreadEvent::PromptInjected {
@@ -199,11 +174,6 @@ fn indexable_text_skips_an_injection_that_echoes_a_persisted_message() {
     );
 }
 
-/// Image descriptions carry real content the user shared (a screenshot, a
-/// ticket, a photo). Memory indexing keys off `indexable_text()`, so the
-/// description must surface there — otherwise a "what's this?" + screenshot
-/// turn stores nothing about the image. The title path already folds the
-/// description in; memory must too.
 #[test]
 fn indexable_text_includes_image_description() {
     let described = ThreadEvent::ImageDescribed {

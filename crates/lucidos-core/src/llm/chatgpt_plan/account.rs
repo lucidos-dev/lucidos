@@ -1,4 +1,4 @@
-//! The workspace's Sign in with ChatGPT registration and sign-in: at most one
+//! INVARIANT: The workspace's Sign in with ChatGPT registration and sign-in: at most one
 //! row, in `chatgpt_plan_accounts`.
 //!
 //! The tokens stay out of `oauth_accounts` on purpose. Every reader of that
@@ -18,15 +18,10 @@ use crate::engine::thread_events::MessageOrigin;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// What a sign-in needs before it starts. It outlives a sign-out, and only
-/// [`ChatGptPlanAccountStore::forget_account`] clears it.
 #[derive(Clone)]
 pub struct Registration {
-    /// The `ext_agent_host_id`, a `urn:uuid:` that names no user.
     pub host_id: String,
-    /// The client id OpenAI issued, once the first sign-in completed.
     pub client_id: Option<String>,
-    /// The last `id_token`, sent back as `id_token_hint`.
     pub id_token: Option<String>,
 }
 
@@ -40,7 +35,6 @@ impl std::fmt::Debug for Registration {
     }
 }
 
-/// A signed-in account, tokens included. Engine-internal only.
 #[derive(Clone)]
 pub struct ChatGptPlanAccount {
     pub client_id: String,
@@ -67,9 +61,6 @@ impl std::fmt::Debug for ChatGptPlanAccount {
 }
 
 impl ChatGptPlanAccount {
-    /// Whether the token is due a refresh: at OpenAI's `earliest_refresh_at`,
-    /// else a minute before it expires. A token with neither is taken as
-    /// valid until OpenAI answers `401`.
     pub fn refresh_due(&self, now: DateTime<Utc>) -> bool {
         self.refresh_due_at
             .or_else(|| {
@@ -80,7 +71,6 @@ impl ChatGptPlanAccount {
     }
 }
 
-/// How long before its expiry a token with no `earliest_refresh_at` refreshes.
 const REFRESH_MARGIN_SECS: i64 = 60;
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ChatGptPlanAccount {
@@ -102,7 +92,6 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ChatGptPlanAccount {
     }
 }
 
-/// The sign-in as the API reports it: who, never a token.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ChatGptPlanAccountInfo {
     pub email: Option<String>,
@@ -120,7 +109,6 @@ impl From<&ChatGptPlanAccount> for ChatGptPlanAccountInfo {
 
 pub use crate::engine::provider_events::ChatGptPlanSignOutReason;
 
-/// A completed sign-in, ready to store.
 pub(super) struct CompletedSignIn {
     pub client_id: String,
     pub identity: Identity,
@@ -128,15 +116,12 @@ pub(super) struct CompletedSignIn {
     pub tokens: GrantedTokens,
 }
 
-/// The only access to `chatgpt_plan_accounts`. A sign-in and a sign-out
-/// announce themselves; minting the host id and a token refresh are silent.
 pub struct ChatGptPlanAccountStore;
 
 const ACCOUNT_COLUMNS: &str =
     "client_id, email, access_token, refresh_token, token_expiry, refresh_due_at, signed_in_at";
 
 impl ChatGptPlanAccountStore {
-    /// The registration, minting the host id on the first call.
     pub async fn registration(pool: &PgPool) -> Result<Registration, BoxError> {
         sqlx::query(
             "INSERT INTO chatgpt_plan_accounts (host_id) VALUES ($1)
@@ -158,7 +143,6 @@ impl ChatGptPlanAccountStore {
         })
     }
 
-    /// The signed-in account, if there is one.
     pub async fn get(pool: &PgPool) -> Result<Option<ChatGptPlanAccount>, sqlx::Error> {
         sqlx::query_as::<_, ChatGptPlanAccount>(&format!(
             "SELECT {ACCOUNT_COLUMNS} FROM chatgpt_plan_accounts WHERE access_token IS NOT NULL"
@@ -167,7 +151,6 @@ impl ChatGptPlanAccountStore {
         .await
     }
 
-    /// Whether a sign-in is stored, without opening a token.
     pub async fn is_signed_in(pool: &PgPool) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM chatgpt_plan_accounts WHERE access_token IS NOT NULL)",
@@ -176,7 +159,7 @@ impl ChatGptPlanAccountStore {
         .await
     }
 
-    /// Store a completed sign-in and announce it.
+    /// INVARIANT: Store a completed sign-in and announce it.
     ///
     /// Refused when the registration moved on since the sign-in began: another
     /// client id was stored, or the account is not the registered one.
@@ -231,9 +214,6 @@ impl ChatGptPlanAccountStore {
         Ok(())
     }
 
-    /// Clear the sign-in, keep the registration, and announce it. Returns
-    /// whether there was one. Its refresh token is then revoked at `auth` in
-    /// the background, best effort.
     pub async fn sign_out(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -248,11 +228,6 @@ impl ChatGptPlanAccountStore {
         Ok(true)
     }
 
-    /// Clear the sign-in AND the registration, and announce it. Returns what
-    /// ended, so the next sign-in registers afresh with any ChatGPT account.
-    /// A stored refresh token is revoked at `auth` in the background.
-    ///
-    /// The host id stays: it names no user.
     pub async fn forget_account(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -277,8 +252,6 @@ impl ChatGptPlanAccountStore {
         })
     }
 
-    /// Whether a registration from an earlier sign-in is kept, which only
-    /// that account may sign in with until it is forgotten.
     pub async fn is_registered(pool: &PgPool) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM chatgpt_plan_accounts WHERE client_id IS NOT NULL)",
@@ -287,7 +260,7 @@ impl ChatGptPlanAccountStore {
         .await
     }
 
-    /// Clear a sign-in whose refresh token OpenAI refused for good, and
+    /// INVARIANT: Clear a sign-in whose refresh token OpenAI refused for good, and
     /// announce it. A sign-in made since, with another token, is kept.
     pub(super) async fn forget_rejected(
         pool: &PgPool,
@@ -304,8 +277,6 @@ impl ChatGptPlanAccountStore {
         Ok(true)
     }
 
-    /// Whether the last sign-in ended because OpenAI refused it, with no
-    /// sign-in since. Read from the events, so it survives a restart.
     pub async fn rejected_last(pool: &PgPool) -> Result<bool, sqlx::Error> {
         let reason: Option<Option<String>> = sqlx::query_scalar(
             "SELECT payload->'data'->>'reason' FROM events
@@ -332,7 +303,7 @@ impl ChatGptPlanAccountStore {
             .await;
     }
 
-    /// Clear the tokens, only while the row holds `rejected` when one is
+    /// INVARIANT: Clear the tokens, only while the row holds `rejected` when one is
     /// given. Returns the ended sign-in.
     ///
     /// A sealed token carries a random nonce, so SQL cannot compare it. The
@@ -352,7 +323,7 @@ impl ChatGptPlanAccountStore {
             return Ok(None);
         };
         let refresh_token = secret_store::open(&ChatGptPlanRefreshToken::SPEC, &sealed);
-        // A token that does not open is not the one OpenAI refused: the
+        // INVARIANT: A token that does not open is not the one OpenAI refused: the
         // engine opened that one to present it.
         let holds_rejected = match (rejected, &refresh_token) {
             (None, _) => true,
@@ -376,8 +347,6 @@ impl ChatGptPlanAccountStore {
         }))
     }
 
-    /// Clear the registration and any sign-in. Returns the forgotten client id
-    /// and sealed refresh token, or `None` when nothing was registered.
     async fn clear_registration(
         pool: &PgPool,
     ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
@@ -403,7 +372,7 @@ impl ChatGptPlanAccountStore {
         Ok(Some(forgotten))
     }
 
-    /// Store refreshed tokens for the sign-in that held `spent_refresh_token`,
+    /// INVARIANT: Store refreshed tokens for the sign-in that held `spent_refresh_token`,
     /// all in one write. Returns `false` when that sign-in is gone, so a
     /// refresh racing a sign-out or a newer sign-in cannot overwrite it.
     pub(super) async fn update_tokens(
@@ -457,8 +426,6 @@ impl ChatGptPlanAccountStore {
 
 #[cfg(any(test, feature = "test-support"))]
 impl ChatGptPlanAccountStore {
-    /// Store a sign-in holding `access_token`, valid for an hour, for tests
-    /// outside this module.
     pub(crate) async fn seed_sign_in(pool: &PgPool, event_bus: &EventBus, access_token: &str) {
         Self::registration(pool).await.expect("mint the host id");
         let signed_in = CompletedSignIn {
@@ -483,21 +450,18 @@ impl ChatGptPlanAccountStore {
     }
 }
 
-/// What a sign-out ended, as the API reports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SignOutOutcome {
     pub signed_out: bool,
     pub account_forgotten: bool,
 }
 
-/// A sign-in that a sign-out ended.
 struct EndedSignIn {
     client_id: String,
     refresh_token: Result<String, BoxError>,
 }
 
 impl EndedSignIn {
-    /// Revoke the ended refresh token in the background, best effort.
     fn revoke_at(self, auth: &AuthServer) {
         match self.refresh_token {
             Ok(token) => {

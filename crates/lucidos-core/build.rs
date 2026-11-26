@@ -5,10 +5,6 @@ fn main() {
     check_migration_versions(Path::new("migrations"));
 }
 
-/// Fail the build if two migration files share the same `YYYYMMDDHHMMSS` version
-/// prefix. sqlx uses that prefix as the primary key in `_sqlx_migrations`, so a
-/// collision crashes the engine on startup with a non-obvious "duplicate key"
-/// error. Catching it at build time means the bad merge never makes it past CI.
 fn check_migration_versions(migrations_dir: &Path) {
     let entries = match fs::read_dir(migrations_dir) {
         Ok(e) => e,

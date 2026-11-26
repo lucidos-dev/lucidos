@@ -1,29 +1,15 @@
-//! On-disk shape for `data/config/apis.json`'s `auth.pipeline`. The
-//! engine deserializes `PipelineConfig` from the file, then
-//! `build_pipeline` materializes a `Vec<Arc<dyn AuthLayer>>` for the
-//! request handler.
-
 use serde::{Deserialize, Serialize};
 
-/// Auth pipeline for a single proxy provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     pub pipeline: Vec<LayerConfig>,
-    /// Capabilities granted to WASM signer modules in this pipeline.
-    /// Default empty = sign-only with opaque handles, no body replacement.
     #[serde(default)]
     pub granted_capabilities: Vec<String>,
 }
 
-/// On-disk shape for one layer in the pipeline. Mirrors what
-/// `proxy_migration` writes when upgrading legacy configs and what
-/// `proxy_pipeline_builder::build_pipeline` consumes per request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LayerConfig {
-    /// Bearer / ApiKey / Basic / QueryParam — all share a credential ref
-    /// and differ in `kind`. Distinguishing fields (header / param_name)
-    /// are optional and ignored when not relevant for the kind.
     StaticCredential {
         kind: StaticKind,
         credential: String,
@@ -32,16 +18,6 @@ pub enum LayerConfig {
         #[serde(default)]
         param_name: Option<String>,
     },
-    /// Long-lived cache layer: external script returns headers + TTL.
-    /// `credential` is OPTIONAL: when set, the named credential's
-    /// `CRED_<NAME>*` env vars are injected before the script runs; when
-    /// omitted, no credential env vars are injected from this layer — the
-    /// script is expected to source its secret by other means (e.g. reading
-    /// a rotating token from the OS keychain, or an OAuth-only exchange).
-    /// `oauth_providers` lists OAuth provider names whose access tokens
-    /// (and email, when known) get injected as `OAUTH_<UPPER>_ACCESS_TOKEN`
-    /// / `OAUTH_<UPPER>_EMAIL` env vars before the script runs — same name
-    /// rule as `engine::tools` subprocess injection. Default empty.
     ScriptHandshake {
         #[serde(default)]
         credential: Option<String>,
@@ -49,10 +25,6 @@ pub enum LayerConfig {
         #[serde(default)]
         oauth_providers: Vec<String>,
     },
-    /// HMAC over the canonical query string. Per-request compute, no
-    /// cache. `algorithm`, `signed_payload`, `signature_param`,
-    /// `timestamp_param`, `key_header` keep the same shape as the legacy
-    /// enum so the migration is a straight pass-through.
     HmacSigned {
         key_credential: String,
         secret_credential: String,
@@ -65,8 +37,6 @@ pub enum LayerConfig {
         #[serde(default)]
         timestamp_param: Option<String>,
     },
-    /// WASM signer module. `module` is the basename under
-    /// `data/auth-modules/<module>.wasm`.
     WasmSigner {
         module: String,
         #[serde(default)]
@@ -85,9 +55,7 @@ pub enum StaticKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialHandleConfig {
-    /// Logical name used by the module (must match its manifest).
     pub name: String,
-    /// `service_name` in the credential store.
     pub credential: String,
 }
 
@@ -201,9 +169,6 @@ mod tests {
 
     #[test]
     fn pipeline_config_parses_script_handshake_without_credential() {
-        // A handshake script that sources its secret elsewhere (OS keychain,
-        // OAuth-only exchange) may omit `credential` — it must parse as None,
-        // not error with a missing-field failure.
         let json = r#"{
             "pipeline": [
                 {"type": "script_handshake", "script": "scripts/auth/keychain-login.py"}
@@ -282,8 +247,6 @@ mod tests {
 
     #[test]
     fn pipeline_config_compose_script_handshake_then_wasm_signer() {
-        // Composition: a long-lived login-script handshake (cached
-        // headers) followed by a per-request HMAC signature.
         let json = r#"{
             "pipeline": [
                 {"type": "script_handshake", "credential": "comfort-pw", "script": "scripts/comfort-login.py"},

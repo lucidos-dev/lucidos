@@ -1,10 +1,3 @@
-//! A redirect cancel keeps the thread `running`
-//! (`docs/plans/2026-10-20-a-redirect-keeps-the-thread-running.md`).
-//!
-//! The engine interrupts the turn to carry the work on. The gap before the
-//! redirected turn starts is therefore not idle. A user Stop is the control:
-//! it ends the work and settles the thread.
-
 use super::*;
 use crate::engine::thread_events::{CancelCause, SessionEndReason};
 
@@ -46,7 +39,6 @@ async fn emit_continuation_requested(bus: &EventBus, thread_id: Uuid) {
     .unwrap();
 }
 
-/// A Claude Code thread mid-turn.
 async fn running_cc_thread(bus: &EventBus, pool: &PgPool) -> Uuid {
     let thread_id = Uuid::new_v4();
     emit_cc_message_received(bus, thread_id, None, "fix it").await;
@@ -55,8 +47,6 @@ async fn running_cc_thread(bus: &EventBus, pool: &PgPool) -> Uuid {
     thread_id
 }
 
-/// The effort-restart event order: cancel, the run's idle, the session end,
-/// then the resume. Each step before the resume must leave the thread working.
 #[tokio::test]
 async fn a_redirect_keeps_the_thread_running_until_the_redirected_turn_ends() {
     let (pool, db_name) = setup_test_db().await;
@@ -101,8 +91,6 @@ async fn a_redirect_keeps_the_thread_running_until_the_redirected_turn_ends() {
     teardown_test_db(&db_name).await;
 }
 
-/// A user Stop is not a redirect: the cancel settles the thread, and the idle
-/// after it keeps it settled.
 #[tokio::test]
 async fn a_user_stop_still_settles_the_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -127,8 +115,6 @@ async fn a_user_stop_still_settles_the_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// The hold lasts until the next start event. A user message that lands in the
-/// gap starts a turn of its own, and that turn's idle settles the thread.
 #[tokio::test]
 async fn a_start_event_ends_the_redirect_hold() {
     let (pool, db_name) = setup_test_db().await;

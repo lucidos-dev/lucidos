@@ -1,15 +1,3 @@
-//! Coverage for `POST /api/v1/threads/:thread_id/detach`, moving a child
-//! thread to top level (ADR 0278).
-//!
-//! This suite is the USER's path: a caller with a credential but no origin
-//! token may move any nested thread. The agent's narrower rule needs a
-//! thread-bound origin token, and an outside HTTP client cannot get one (see
-//! `follow_up_test.rs`). The engine's tests over `authorize_child_detach` and
-//! `move_child_to_top_level` cover that rule instead.
-//!
-//! Rows are seeded directly, as `cascade_archive_test.rs` does, so no LLM
-//! round-trip is needed to build a family.
-
 use crate::support::{base_url, count_events_of_type, db_url, http_client, user_client};
 use uuid::Uuid;
 
@@ -47,8 +35,6 @@ async fn post_detach(client: &reqwest::Client, thread: &str) -> reqwest::Respons
         .expect("detach request sends")
 }
 
-/// The user moves a grandchild of a top-level thread. The edge is cut on the
-/// row, and the move is recorded once, on the former parent.
 #[tokio::test]
 async fn the_user_moves_a_nested_thread_to_top_level() {
     let client = user_client().await;
@@ -82,7 +68,6 @@ async fn the_user_moves_a_nested_thread_to_top_level() {
         "the move lands on the former parent, never on the child"
     );
 
-    // A second move finds nothing to cut.
     assert_eq!(post_detach(&client, &child.to_string()).await.status(), 409);
 
     cleanup(&pool, &[root, parent, child]).await;
@@ -123,8 +108,6 @@ async fn the_route_refuses_what_it_cannot_move() {
     cleanup(&pool, &[top]).await;
 }
 
-/// A caller presenting no credential at all is refused before anything is
-/// read, like every mutating route (ADR 0169).
 #[tokio::test]
 async fn the_route_refuses_a_caller_with_no_credential() {
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");

@@ -1,7 +1,7 @@
-//! EmailClient (SMTP/IMAP) implementation, split out of email.rs.
+//! INVARIANT: EmailClient (SMTP/IMAP) implementation, split out of email.rs.
 use super::*;
 
-/// Hard wall-clock bound for one SMTP send (connect + handshake + auth + data).
+/// INVARIANT: Hard wall-clock bound for one SMTP send (connect + handshake + auth + data).
 /// lettre's async transport enforces its own 60s default only on the TCP
 /// connect; every later phase is unbounded, so without this outer bound a
 /// server that accepts the connection and stalls hangs the send forever.
@@ -15,18 +15,8 @@ use super::*;
 /// of a generic client-side "request timed out".
 const SMTP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(80);
 
-/// Hard wall-clock bound for one complete IMAP operation (session setup +
-/// examine + search/fetch + logout). `IMAP_CONNECT_TIMEOUT` (email.rs) bounds
-/// only session setup with a sharper error; async-imap's post-auth command
-/// phase is equally unbounded, so a server that stalls AFTER login would
-/// otherwise hang the calling chat turn indefinitely. Deliberately generous:
-/// the budget also covers a full RFC822 download (attachments run to ~25MB),
-/// so it's a stall backstop for the chat turn, not a UX-latency bound — no
-/// frontend request timeout depends on it.
 const IMAP_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Error for an IMAP operation that exceeded `IMAP_OP_TIMEOUT` — names the
-/// operation and endpoint per the errors-name-the-entity rule.
 fn imap_op_timed_out(account: &EmailAccount, op: &str) -> BoxError {
     format!(
         "IMAP {} via {}:{} did not complete within {}s — the server may be stalled, \
@@ -39,16 +29,11 @@ fn imap_op_timed_out(account: &EmailAccount, op: &str) -> BoxError {
     .into()
 }
 
-/// The full-message fetch. It MUST stay a `BODY.PEEK[]` fetch: per RFC 3501
+/// INVARIANT: The full-message fetch. It MUST stay a `BODY.PEEK[]` fetch: per RFC 3501
 /// §6.4.5, a plain `RFC822` or `BODY[]` fetch sets `\Seen` on the user's real
 /// mailbox, so reading a message would mark it read.
 const FULL_MESSAGE_FETCH: &str = "(UID BODY.PEEK[])";
 
-/// Download one complete message, without changing its flags.
-///
-/// Two guards keep a read from marking mail read. `EXAMINE` opens the folder
-/// read-only, and the fetch itself peeks. No caller changes flags or moves
-/// mail on this session, so the read-only open costs nothing.
 async fn fetch_raw_message(
     account: &EmailAccount,
     uid: u32,
@@ -66,12 +51,11 @@ async fn fetch_raw_message(
         .try_collect()
         .await?;
 
-    // Best-effort teardown: a `?` would discard the successful read above
+    // INVARIANT: Best-effort teardown: a `?` would discard the successful read above
     // when the server drops the connection instead of replying to LOGOUT
     // (rust.md cleanup).
     let _ = session.logout().await;
 
-    // The server answers `BODY.PEEK[]` as `BODY[]`, which `body()` returns.
     let fetch = fetches
         .first()
         .ok_or_else(|| format!("No message found with UID {}", uid))?;
@@ -79,8 +63,6 @@ async fn fetch_raw_message(
 }
 
 impl EmailClient {
-    /// Read email summaries from an IMAP folder.
-    /// If `oauth_access_token` is provided, uses XOAUTH2 instead of password login.
     pub async fn read_emails(
         account: &EmailAccount,
         folder: Option<&str>,
@@ -108,7 +90,7 @@ impl EmailClient {
         let folder = folder.unwrap_or("INBOX");
         let limit = limit.unwrap_or(20);
 
-        // Both raw IMAP fragments reach `uid_search` verbatim, which does not
+        // INVARIANT: Both raw IMAP fragments reach `uid_search` verbatim, which does not
         // validate them. Refuse a line break BEFORE connecting so an injected
         // second command can never reach the mailbox. See
         // `reject_imap_line_break`. (`folder` needs no check: `examine` runs
@@ -120,12 +102,9 @@ impl EmailClient {
             reject_imap_line_break("since", since)?;
         }
 
-        // `EXAMINE`, not `SELECT`: a listing never changes flags, so open the
-        // folder read-only. See `fetch_raw_message`.
         let mut session = imap_connect(account, oauth_access_token).await?;
         session.examine(folder).await?;
 
-        // Detect non-ASCII in search query (Exchange Online only supports US-ASCII IMAP SEARCH)
         let non_ascii_search = search.filter(|s| !s.is_ascii());
         let imap_search = if let Some(original) = non_ascii_search {
             let sanitized = sanitize_search_query(original);
@@ -149,17 +128,16 @@ impl EmailClient {
         let uids = session.uid_search(&query).await?;
         let mut uid_list: Vec<u32> = uids.into_iter().collect();
         uid_list.sort_unstable();
-        uid_list.reverse(); // newest first
+        uid_list.reverse();
 
         if uid_list.is_empty() {
-            // Best-effort teardown: a `?` would discard a successful read
+            // INVARIANT: Best-effort teardown: a `?` would discard a successful read
             // when the server drops the connection instead of replying to
             // LOGOUT (rust.md cleanup).
             let _ = session.logout().await;
             return Ok(Vec::new());
         }
 
-        // When client-side filtering will narrow results, fetch more candidates
         let fetch_limit = if non_ascii_search.is_some() {
             (limit * 3).max(60)
         } else {
@@ -173,7 +151,7 @@ impl EmailClient {
             .collect::<Vec<_>>()
             .join(",");
 
-        // PEEK is mandatory here too: a plain `BODY[...]` sets `\Seen` (RFC 3501).
+        // INVARIANT: PEEK is mandatory here too: a plain `BODY[...]` sets `\Seen` (RFC 3501).
         let fetch_stream = session
             .uid_fetch(&uid_set, "(UID BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.500>)")
             .await?;
@@ -188,9 +166,7 @@ impl EmailClient {
                 None => continue,
             };
 
-            // Parse header bytes with mail_parser
             let header_bytes = fetch.header().unwrap_or_default();
-            // Combine header + partial text for parsing
             let text_bytes = fetch.text().unwrap_or_default();
             let mut combined = Vec::with_capacity(header_bytes.len() + text_bytes.len());
             combined.extend_from_slice(header_bytes);
@@ -205,14 +181,12 @@ impl EmailClient {
                     let subject = msg.subject().unwrap_or("(no subject)").to_string();
                     let date = msg.date().map(|d| d.to_rfc3339()).unwrap_or_default();
 
-                    // Build preview from text body or HTML body
                     let preview = msg
                         .body_text(0)
                         .map(|t| t.to_string())
                         .or_else(|| msg.body_html(0).map(|h| strip_html_tags(&h)))
                         .unwrap_or_default();
 
-                    // Truncate preview to 200 chars
                     let preview = if preview.chars().count() > 200 {
                         let mut truncated: String = preview.chars().take(200).collect();
                         truncated.push_str("...");
@@ -242,16 +216,13 @@ impl EmailClient {
             });
         }
 
-        // Best-effort teardown: a `?` would discard the successful read above
+        // INVARIANT: Best-effort teardown: a `?` would discard the successful read above
         // when the server drops the connection instead of replying to LOGOUT
         // (rust.md cleanup).
         let _ = session.logout().await;
 
-        // Sort by UID descending (newest first)
         summaries.sort_by(|a, b| b.uid.cmp(&a.uid));
 
-        // When the original search had non-ASCII, the IMAP query was broadened
-        // (non-ASCII stripped). Now filter client-side against the original query.
         if let Some(original_search) = non_ascii_search {
             let before = summaries.len();
             summaries.retain(|email| matches_search_filter(email, original_search));
@@ -267,8 +238,6 @@ impl EmailClient {
         Ok(summaries)
     }
 
-    /// Read a single full email by UID.
-    /// If `oauth_access_token` is provided, uses XOAUTH2 instead of password login.
     pub async fn read_email(
         account: &EmailAccount,
         uid: u32,
@@ -300,14 +269,12 @@ impl EmailClient {
         let subject = parsed.subject().unwrap_or("(no subject)").to_string();
         let date = parsed.date().map(|d| d.to_rfc3339()).unwrap_or_default();
 
-        // Prefer plain text body, fall back to HTML with tag stripping
         let body = parsed
             .body_text(0)
             .map(|t| t.to_string())
             .or_else(|| parsed.body_html(0).map(|h| strip_html_tags(&h)))
             .unwrap_or_default();
 
-        // Extract attachment metadata
         let attachments = extract_attachment_info(&parsed);
 
         Ok(EmailMessage {
@@ -323,8 +290,6 @@ impl EmailClient {
         })
     }
 
-    /// Fetch a specific attachment's binary data by UID and attachment index.
-    /// Returns (filename, mime_type, data).
     pub async fn fetch_attachment(
         account: &EmailAccount,
         uid: u32,
@@ -376,9 +341,6 @@ impl EmailClient {
         Ok((filename, mime_type, data))
     }
 
-    /// Send an email via SMTP.
-    /// If `oauth_access_token` is provided, uses XOAUTH2 authentication instead of password.
-    /// If `attachments` is non-empty, builds a multipart/mixed MIME message.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_email(
         account: &EmailAccount,
@@ -406,7 +368,6 @@ impl EmailClient {
         .await
     }
 
-    /// `send_email` with an explicit wall-clock bound (tests pass a short one).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_email_with_timeout(
         account: &EmailAccount,
@@ -433,7 +394,6 @@ impl EmailClient {
             .from(from_mailbox)
             .subject(subject);
 
-        // Add To recipients
         for addr in to.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
             let mailbox: Mailbox = addr
                 .parse()
@@ -441,7 +401,6 @@ impl EmailClient {
             builder = builder.to(mailbox);
         }
 
-        // Add CC recipients
         if let Some(cc_str) = cc {
             for addr in cc_str
                 .split(',')
@@ -455,7 +414,6 @@ impl EmailClient {
             }
         }
 
-        // Add BCC recipients
         if let Some(bcc_str) = bcc {
             for addr in bcc_str
                 .split(',')
@@ -469,7 +427,6 @@ impl EmailClient {
             }
         }
 
-        // Add In-Reply-To header
         if let Some(reply_id) = in_reply_to {
             builder = builder.in_reply_to(reply_id.to_string());
         }
@@ -499,14 +456,12 @@ impl EmailClient {
             builder.multipart(multipart)?
         };
 
-        // Extract Message-ID from the built message
         let message_id = message
             .headers()
             .get_raw("Message-ID")
             .map(|v| v.to_string())
             .unwrap_or_default();
 
-        // Use XOAUTH2 with access token, or fall back to password-based auth
         let (creds, auth_mechanisms) = if let Some(token) = oauth_access_token {
             (
                 Credentials::new(account.username.clone(), token.to_string()),
@@ -523,7 +478,6 @@ impl EmailClient {
         };
 
         let transport = if account.smtp_port == 465 {
-            // Implicit TLS (port 465)
             let mut tb = AsyncSmtpTransport::<Tokio1Executor>::relay(&account.smtp_host)?
                 .port(account.smtp_port as u16)
                 .credentials(creds);
@@ -532,7 +486,6 @@ impl EmailClient {
             }
             tb.build()
         } else if account.use_tls {
-            // STARTTLS (port 587)
             let mut tb = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&account.smtp_host)?
                 .port(account.smtp_port as u16)
                 .credentials(creds);
@@ -541,7 +494,6 @@ impl EmailClient {
             }
             tb.build()
         } else {
-            // No TLS
             let mut tb =
                 AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&account.smtp_host)
                     .port(account.smtp_port as u16)
@@ -552,7 +504,7 @@ impl EmailClient {
             tb.build()
         };
 
-        // Outer wall-clock bound — see `SMTP_SEND_TIMEOUT`'s doc for why the
+        // INVARIANT: Outer wall-clock bound — see `SMTP_SEND_TIMEOUT`'s doc for why the
         // transport can't be trusted to time out on its own.
         tokio::time::timeout(send_timeout, transport.send(message))
             .await

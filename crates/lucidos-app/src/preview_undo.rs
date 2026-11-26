@@ -22,12 +22,6 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-/// Native undo or redo for a real Cmd+Z keydown that the page left alone.
-/// A synthetic keydown never undoes, as in Safari.
-///
-/// Runs in every frame, because an editor such as Google Docs takes its keys in
-/// an iframe and keydown does not cross frames. The check waits a task so it
-/// reads `defaultPrevented` after every page handler has run.
 #[cfg(target_os = "macos")]
 pub(crate) const NATIVE_UNDO_FALLBACK_JS: &str = r#"(function(){
     window.addEventListener('keydown',function(e){
@@ -38,22 +32,13 @@ pub(crate) const NATIVE_UNDO_FALLBACK_JS: &str = r#"(function(){
     },true);
 })()"#;
 
-/// Is this key the Edit menu's Undo (Cmd+Z) or Redo (Shift+Cmd+Z)?
-///
-/// `key` is AppKit's `charactersIgnoringModifiers`, which keeps Shift, so Redo
-/// arrives as `Z`. The letter follows the keyboard layout, as the menu's own
-/// key-equivalent match does.
 #[cfg(any(target_os = "macos", test))]
 fn is_undo_or_redo(key: &str, command: bool, control: bool, option: bool) -> bool {
     command && !control && !option && key.eq_ignore_ascii_case("z")
 }
 
-/// The native `WKWebView` of each preview that is up, keyed by its webview
-/// label. Stored as an address: the monitor only compares it with the first
-/// responder and its superviews, and never dereferences it.
 static PREVIEW_VIEWS: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
 
-/// Record `webview` as a preview whose keys the monitor may forward.
 pub(crate) fn register(webview: &tauri::Webview) {
     let label = webview.label().to_string();
     let recorded = webview.with_webview(move |platform| {
@@ -70,8 +55,6 @@ pub(crate) fn register(webview: &tauri::Webview) {
     }
 }
 
-/// Forget a preview before its webview closes, so a later view at the same
-/// address is never mistaken for it.
 pub(crate) fn unregister(label: &str) {
     PREVIEW_VIEWS
         .lock()
@@ -79,10 +62,6 @@ pub(crate) fn unregister(label: &str) {
         .remove(label);
 }
 
-/// Is `responder` a preview's webview, or a view inside one?
-///
-/// Walks the superview chain, so the match holds whichever view in the
-/// webview's tree WebKit makes first responder.
 #[cfg(target_os = "macos")]
 fn is_in_preview(responder: &objc2_app_kit::NSResponder) -> bool {
     let views = PREVIEW_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
@@ -100,7 +79,6 @@ fn is_in_preview(responder: &objc2_app_kit::NSResponder) -> bool {
     false
 }
 
-/// Install the key monitor, once, for the life of the process.
 #[cfg(target_os = "macos")]
 pub(crate) fn install_key_monitor() {
     use std::ptr::NonNull;
@@ -113,7 +91,6 @@ pub(crate) fn install_key_monitor() {
         // SAFETY: AppKit hands the monitor a live event for this call.
         let key_event = unsafe { event.as_ref() };
         let flags = key_event.modifierFlags();
-        // Most keydowns stop here, before the characters are copied out.
         if !flags.contains(NSEventModifierFlags::Command) {
             return event.as_ptr();
         }
@@ -148,7 +125,6 @@ pub(crate) fn install_key_monitor() {
         NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
     };
     match monitor {
-        // Never removed: the monitor lives as long as the app.
         Some(token) => std::mem::forget(token),
         None => eprintln!("[Tauri] Undo in the preview stays with the menu: no key monitor"),
     }

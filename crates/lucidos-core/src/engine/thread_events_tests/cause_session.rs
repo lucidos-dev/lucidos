@@ -1,11 +1,7 @@
 use super::*;
 
-/// Pin the contract that legacy DB rows without `cause` deserialize as
-/// `Unknown` rather than failing, and that fresh emissions round-trip
-/// the typed cause through serde.
 #[test]
 fn response_cancel_abort_cause_round_trip_and_legacy_default() {
-    // Legacy: no `cause` field on the wire → deserializes as Unknown.
     let legacy_canceled: ThreadEvent =
         serde_json::from_str(r#"{"type":"ResponseCanceled","text":"x"}"#).unwrap();
     match legacy_canceled {
@@ -27,10 +23,6 @@ fn response_cancel_abort_cause_round_trip_and_legacy_default() {
         _ => panic!("expected ResponseAborted"),
     }
 
-    // Removed cause string: `stale_settle` was a CancelCause variant in earlier
-    // builds before being moved to AbortCause. Old DB rows persisted while it
-    // was a cancel cause must replay cleanly via `#[serde(other)] Unknown`,
-    // not crash deserialization.
     let removed_cancel_cause: ThreadEvent =
         serde_json::from_str(r#"{"type":"ResponseCanceled","cause":"stale_settle"}"#).unwrap();
     match removed_cancel_cause {
@@ -44,8 +36,6 @@ fn response_cancel_abort_cause_round_trip_and_legacy_default() {
         _ => panic!("expected ResponseCanceled"),
     }
 
-    // Fresh emit with typed cause survives the serde round trip in both
-    // directions — the wire format uses snake_case strings.
     for cancel_cause in [
         CancelCause::UserStop,
         CancelCause::UserAction,
@@ -89,8 +79,6 @@ fn response_cancel_abort_cause_round_trip_and_legacy_default() {
     }
 }
 
-/// `CancelCause::as_str` names the stored string that SQL matches a redirect
-/// by, so it must equal the serde wire name for every variant.
 #[test]
 fn cancel_cause_as_str_is_the_wire_name() {
     for cause in CancelCause::ALL {
@@ -104,7 +92,6 @@ fn cancel_cause_as_str_is_the_wire_name() {
 
 #[test]
 fn session_ended_reason_serialization() {
-    // Each emit-able variant round-trips on the wire.
     for (reason, expected) in [
         (SessionEndReason::Shutdown, "shutdown"),
         (SessionEndReason::Panic, "panic"),
@@ -121,8 +108,6 @@ fn session_ended_reason_serialization() {
         );
     }
 
-    // Backwards compat: old DB rows without a `reason` field deserialize
-    // as `LegacyNonTerminal` via the serde default.
     let old: ThreadEvent = serde_json::from_str(r#"{"type":"SessionEnded"}"#).unwrap();
     match old {
         ThreadEvent::SessionEnded { reason } => {
@@ -131,10 +116,6 @@ fn session_ended_reason_serialization() {
         _ => panic!("wrong variant"),
     }
 
-    // Backwards compat: removed reasons (completed, changes_proposed,
-    // changes_applied, auto_ended, user_ended, discarded) on legacy rows
-    // deserialize via `#[serde(other)]` to `LegacyNonTerminal` so old data
-    // doesn't crash the engine.
     for legacy in [
         "completed",
         "user_ended",
@@ -158,24 +139,6 @@ fn session_ended_reason_serialization() {
     }
 }
 
-/// Every `AbortCause` paired with every kind of actor states which side of the
-/// verdict split it lands on, so neither a new cause variant nor a new actor
-/// case can inherit `failed` (or `paused`) by default. Adding one fails this
-/// test until its status is decided deliberately.
-///
-/// The three outcomes: `StaleSettle` uses the cancel-style mapping (nothing was
-/// running), a device-actor `EngineShutdown` is `paused` (the user's own *Switch
-/// to new version*, which the engine resumes by itself), everything else is
-/// `failed`. Note the two rows that make the rule narrow rather than
-/// cause-shaped: `EngineShutdown` with a SYSTEM actor is `failed`, and
-/// `RecoveryAfterRestart` is `failed` with EVERY actor, device included, since
-/// the boot floor's promise-withdrawal exists precisely to un-promise the
-/// resume.
-///
-/// The verdicts are bare literals, and the assertion at the end is what keeps
-/// them that way. A proposed-state branch here would produce a status
-/// nothing preserves, so the dying turn's trailing drain overwrites it. See
-/// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
 #[test]
 fn abort_status_verdict_keys_on_cause_and_actor() {
     const PAUSED: &str = "'paused'";
@@ -188,15 +151,12 @@ fn abort_status_verdict_keys_on_cause_and_actor() {
     let system = MessageOrigin::system();
 
     for (cause, actor, expected) in [
-        // The one shape the engine promised to resume.
         (AbortCause::EngineShutdown, Some(&device), PAUSED),
         (AbortCause::EngineShutdown, Some(&system), FAILED),
         (AbortCause::EngineShutdown, None, FAILED),
-        // The crash boundary, and the boot floor withdrawing a resume promise.
         (AbortCause::RecoveryAfterRestart, Some(&device), FAILED),
         (AbortCause::RecoveryAfterRestart, Some(&system), FAILED),
         (AbortCause::RecoveryAfterRestart, None, FAILED),
-        // Real failures, whoever happened to be attributed.
         (AbortCause::SafetyNet, Some(&device), FAILED),
         (AbortCause::SafetyNet, None, FAILED),
         (AbortCause::ProcessKilled, Some(&device), FAILED),
@@ -205,9 +165,6 @@ fn abort_status_verdict_keys_on_cause_and_actor() {
         (AbortCause::SessionDropped, None, FAILED),
         (AbortCause::Unknown, Some(&device), FAILED),
         (AbortCause::Unknown, None, FAILED),
-        // Cleanup of a row whose process was already gone. The device actor is
-        // the button that exposed it (Stop / Apply / Discard / Archive), which
-        // is exactly why a device actor alone cannot mean "switch".
         (AbortCause::StaleSettle, Some(&device), SETTLED),
         (AbortCause::StaleSettle, Some(&system), SETTLED),
         (AbortCause::StaleSettle, None, SETTLED),
@@ -230,11 +187,6 @@ fn abort_status_verdict_keys_on_cause_and_actor() {
     }
 }
 
-/// The `paused` verdict is DERIVED from `promises_auto_resume()`, not from a
-/// second list that could drift out of step with it. `paused` and "the engine
-/// will bring this turn back" must be the same statement, because the frontend
-/// withholds the Continue button on that same predicate: any drift tells the
-/// user the opposite of what they can do.
 #[test]
 fn paused_verdict_is_exactly_a_promised_auto_resume() {
     let device = MessageOrigin::Device {
@@ -251,10 +203,6 @@ fn paused_verdict_is_exactly_a_promised_auto_resume() {
         AbortCause::SessionDropped,
         AbortCause::Unknown,
     ] {
-        // `StaleSettle` is in the loop rather than skipped: it writes no verdict
-        // at all, so BOTH sides are false and the equivalence holds trivially.
-        // Excluding it would be excluding the one cause a device actor makes most
-        // tempting to read as a switch.
         for actor in [Some(&device), Some(&system), None] {
             assert_eq!(
                 cause.promises_auto_resume(actor),
@@ -267,14 +215,6 @@ fn paused_verdict_is_exactly_a_promised_auto_resume() {
     }
 }
 
-/// Every emitted `EventWaitCancelCause` round-trips, and the two arms that are
-/// only ever READ still deserialize.
-///
-/// `thread_canceled` is the load-bearing one. A thread-level Stop stopped
-/// producing it on 2026-08-07, but events are append-only, so every row written
-/// before that still carries the string. Dropping the arm would replay them
-/// through `#[serde(other)]` as `Unknown` and lose why those subscriptions
-/// ended.
 #[test]
 fn event_wait_cancel_causes_round_trip_including_the_retired_one() {
     for (cause, wire) in [
@@ -301,8 +241,6 @@ fn event_wait_cancel_causes_round_trip_including_the_retired_one() {
         }
     }
 
-    // An unrecognized cause from a future or older build replays rather than
-    // failing the whole read.
     let unknown: ThreadEvent = serde_json::from_str(
         r#"{"type":"EventWaitCanceled","wait_id":"00000000-0000-0000-0000-000000000001","cause":"who_knows"}"#,
     )

@@ -20,8 +20,6 @@ pub(super) struct AllowlistRequest {
     pub(super) contents: String,
 }
 
-/// GET /api/v1/cc-allowed-tools: this workspace's standing coding-agent grants,
-/// formatted as one pattern per line for the settings UI.
 pub(super) async fn get_cc_allowed_tools(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
@@ -50,8 +48,6 @@ fn lane_editor<E: std::fmt::Display>(
     }))
 }
 
-/// Make one lane's standing grants exactly the lines in `contents`. The change
-/// is a `PermissionGrantsChanged` with source `settings`.
 pub(super) async fn write_grant_lane(
     state: &AppState,
     headers: &HeaderMap,
@@ -95,13 +91,6 @@ pub(super) async fn write_grant_lane(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// PUT /api/v1/cc-allowed-tools: replace the standing coding-agent grants.
-///
-/// The engine's own permission gate reads the grants fresh on each prompt, so
-/// an ADDED pattern binds every live session at once (ADR 0125). A REMOVED one
-/// binds the gate just as fast. But an in-flight subprocess keeps its frozen
-/// `--allowedTools` flag until it respawns, and never asks the engine about a
-/// call that flag already covers.
 pub(super) async fn put_cc_allowed_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -116,17 +105,12 @@ pub(super) async fn put_cc_allowed_tools(
     .await
 }
 
-/// GET /api/v1/agent-allowed-commands: the Lucidos Agent's standing command
-/// grants (ADR 0002). The chat counterpart of `get_cc_allowed_tools`.
 pub(super) async fn get_agent_allowed_commands(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
     read_grant_lane(&state, GrantFile::AgentCommands).await
 }
 
-/// PUT /api/v1/agent-allowed-commands: replace the standing command grants. The
-/// command guard reads them fresh on each prompt, so an edit takes effect on
-/// the next gated command, with no restart.
 pub(super) async fn put_agent_allowed_commands(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -135,15 +119,12 @@ pub(super) async fn put_agent_allowed_commands(
     write_grant_lane(&state, &headers, GrantFile::AgentCommands, &body.contents).await
 }
 
-/// GET /api/v1/agent-denied-commands: the workspace's *standing denies*.
 pub(super) async fn get_agent_denied_commands(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
     read_grant_lane(&state, GrantFile::AgentDeniedCommands).await
 }
 
-/// PUT /api/v1/agent-denied-commands: replace the standing denies. Every lane
-/// reads them fresh on each command, so an edit binds the next one.
 pub(super) async fn put_agent_denied_commands(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -157,8 +138,6 @@ pub(super) async fn put_agent_denied_commands(
     )
     .await
 }
-
-// ===== Credential Endpoints =====
 
 pub(super) async fn list_credentials(
     State(state): State<AppState>,
@@ -184,7 +163,6 @@ fn credential_service_name(auth_type: AuthType, service_name: &str) -> String {
     }
 }
 
-/// Create or update a credential
 pub(super) async fn create_credential(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -195,8 +173,6 @@ pub(super) async fn create_credential(
         return ApiResult::err(SERVICE_ACCOUNT_IS_SETTINGS_ONLY.to_string());
     }
     let service_name = credential_service_name(auth_type, &request.service_name);
-    // Optional custom env var name — validated like a user env var (valid shape +
-    // not engine-reserved). Empty/whitespace → None (default CRED_<NAME>).
     let env_var_name = request
         .env_var_name
         .as_deref()
@@ -207,13 +183,6 @@ pub(super) async fn create_credential(
             return ApiResult::err(rejection.message(name));
         }
     }
-    // Refused here rather than at the proxy gate, which is where an unparseable
-    // scope would otherwise surface: far from this form, as a 502 on a call the
-    // user thought they had configured.
-    //
-    // A body naming NEITHER scope field is refused too. An empty list is a real
-    // answer (a `secret` goes nowhere), so it has to be written down rather
-    // than arrived at by omission.
     let Some(declared) = request.scope.declared() else {
         return ApiResult::err(
             "base_urls is required. Pass the API's base URL, or [] for a \
@@ -241,9 +210,6 @@ pub(super) async fn create_credential(
             return ApiResult::err(reason);
         }
     }
-    // `upsert` emits `Credential{Created,Updated}` itself, so this handler
-    // resolves the device actor up front and passes it down. The emit is not
-    // the caller's to make (see `CredentialStore`'s type doc).
     let actor = match crate::api::actor::require_user_actor(&headers, &state.pool, None).await {
         Ok(a) => Some(a),
         Err(e) => return ApiResult::err(e.message),
@@ -305,10 +271,6 @@ fn touches_service_account(auth_type: AuthType, stored: Option<AuthType>) -> boo
         || stored == Some(AuthType::OnepasswordServiceAccount)
 }
 
-/// Update an existing credential's editable fields. For an `email_password`
-/// credential the body can also carry the mailbox's server settings, which
-/// land on its `email_accounts` row. The password itself lives only in the
-/// credential.
 pub(super) async fn update_credential(
     State(state): State<AppState>,
     Query(query): Query<CredentialIdQuery>,
@@ -328,8 +290,6 @@ pub(super) async fn update_credential(
         Err(reason) => return ApiResult::err(reason),
     };
 
-    // Optional custom env var name — validated; empty/whitespace clears it back
-    // to the default CRED_<NAME>.
     let env_var_name = request
         .env_var_name
         .as_deref()
@@ -356,8 +316,6 @@ pub(super) async fn update_credential(
             .await
             .map(|account| account.map(|a| a.require_send_confirmation));
         if lowers_send_confirmation(email.require_send_confirmation, stored_flag) {
-            // A credential update carries a secret, so it cannot wait for
-            // the owner in the event log.
             if let Err(refusal) = crate::api::actor::require_attested_owner(
                 &headers,
                 "An agent cannot turn off email send confirmation. Only the user \
@@ -373,7 +331,6 @@ pub(super) async fn update_credential(
         {
             return ApiResult::err(reason);
         }
-        // No stored row means the update below writes nothing.
         if let (AuthType::OauthClient, Some(stored)) = (auth_type, &stored) {
             if let Err(reason) =
                 crate::core::oauth::check_client_endpoints(&stored.service_name, secret)
@@ -383,8 +340,6 @@ pub(super) async fn update_credential(
         }
     }
 
-    // Same as the create path: the store owns the `CredentialUpdated` emit, so
-    // resolve the device actor here and hand it over.
     let actor = crate::api::actor::user_actor(&headers, None);
     match CredentialStore::update(
         &state.pool,
@@ -399,10 +354,6 @@ pub(super) async fn update_credential(
     )
     .await
     {
-        // `update` hands back the row's service name, which for an
-        // `email_password` credential IS the `email_accounts.name` (the `email:`
-        // prefix that used to wrap it is gone). The id in the query cannot
-        // supply it, which is why the store returns it.
         Ok(Some(service_name)) => {
             if auth_type == AuthType::EmailPassword {
                 let account_name = EmailStore::account_name_for_credential(&service_name);
@@ -441,16 +392,6 @@ pub(in crate::api) fn lowers_send_confirmation(
     !requested && !matches!(stored, Ok(Some(false)))
 }
 
-/// Replace one credential's *credential scope*, the set of base URLs it may be
-/// presented to.
-///
-/// The verb behind `lucidos credentials set-base-urls`. It sits apart from the
-/// whole-row edit for one reason: that body names the auth type and defaults
-/// the auth header. A script widening a scope through it clobbers fields it
-/// never meant to touch.
-///
-/// It replaces rather than appends. The command therefore states the whole
-/// resulting set, and a reader of the shell history sees what it now covers.
 pub(super) async fn set_credential_base_urls(
     State(state): State<AppState>,
     Query(query): Query<CredentialIdQuery>,
@@ -461,7 +402,6 @@ pub(super) async fn set_credential_base_urls(
         Ok(urls) => urls,
         Err(reason) => return ApiResult::err(reason),
     };
-    // The store owns the `CredentialUpdated` emit, so resolve the actor here.
     let actor = crate::api::actor::user_actor(&headers, None);
     match CredentialStore::set_base_urls(
         &state.pool,
@@ -478,8 +418,6 @@ pub(super) async fn set_credential_base_urls(
     }
 }
 
-/// Get an email account's server settings (no password) so the settings UI can
-/// pre-fill the edit form for an `email_password` credential.
 pub(super) async fn get_email_account(
     State(state): State<AppState>,
     Query(query): Query<NameQuery>,
@@ -497,13 +435,11 @@ pub(super) async fn get_email_account(
     }
 }
 
-/// Delete a credential
 pub(super) async fn delete_credential(
     State(state): State<AppState>,
     Query(query): Query<CredentialIdQuery>,
     headers: HeaderMap,
 ) -> Json<ApiResult> {
-    // `delete` emits `CredentialDeleted` itself; resolve the device actor for it.
     let actor = crate::api::actor::user_actor(&headers, None);
     match CredentialStore::delete(&state.pool, &state.engine.event_bus, query.id, actor).await {
         Ok(true) => ApiResult::ok(),
@@ -511,12 +447,6 @@ pub(super) async fn delete_credential(
         Err(e) => ApiResult::err(format!("Failed to delete credential: {}", e)),
     }
 }
-
-// ===== Environment Variable Endpoints =====
-//
-// User-managed non-secret env vars (Settings → System → Environment variables).
-// Mirrors the credential CRUD shape, but the value IS broadcast in the
-// `EnvironmentVariableSet` event since these are deliberately not secret.
 
 #[derive(Serialize)]
 pub(super) struct EnvVarsListResponse {
@@ -543,8 +473,6 @@ fn validate_env_name_for(headers: &HeaderMap, name: &str) -> Result<(), NameReje
     }
 }
 
-/// The `/api/v1/env-vars` response for a refused name. A code-injecting name is
-/// 403: the agent identified itself, and the answer is still no.
 fn env_name_refusal(rejection: &NameRejection, name: &str) -> (StatusCode, String) {
     let status = match rejection {
         NameRejection::CodeInjecting => StatusCode::FORBIDDEN,
@@ -553,7 +481,6 @@ fn env_name_refusal(rejection: &NameRejection, name: &str) -> (StatusCode, Strin
     (status, rejection.message(name))
 }
 
-/// GET /api/v1/env-vars — list all user environment variables (name + value).
 pub(super) async fn list_env_vars(
     State(state): State<AppState>,
 ) -> Result<Json<EnvVarsListResponse>, (StatusCode, String)> {
@@ -568,9 +495,6 @@ pub(super) async fn list_env_vars(
     Ok(Json(EnvVarsListResponse { env_vars }))
 }
 
-/// POST /api/v1/env-vars — create (or replace) a variable. Validates the name
-/// shape and rejects engine-reserved names with 400, and an agent's
-/// code-injecting name with 403.
 pub(super) async fn create_env_var(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -578,9 +502,6 @@ pub(super) async fn create_env_var(
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
     validate_env_name_for(&headers, &request.name)
         .map_err(|rejection| env_name_refusal(&rejection, &request.name))?;
-    // The store emits `EnvironmentVariableSet` from inside its write path, so
-    // this handler resolves the device actor and hands it over rather than
-    // emitting afterwards (see `EnvironmentVariableStore`'s type doc).
     let actor = crate::api::actor::user_actor(&headers, None);
     if let Err(e) = EnvironmentVariableStore::upsert(
         &state.pool,
@@ -599,15 +520,12 @@ pub(super) async fn create_env_var(
     Ok(ApiResult::ok())
 }
 
-/// PUT /api/v1/env-vars?name=NAME — update an existing variable's value.
 pub(super) async fn update_env_var(
     State(state): State<AppState>,
     Query(query): Query<NameQuery>,
     headers: HeaderMap,
     Json(request): Json<UpdateEnvVarRequest>,
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
-    // A stored name is already valid, but re-checking keeps the contract honest
-    // if an out-of-band row ever sneaks in.
     validate_env_name_for(&headers, &query.name)
         .map_err(|rejection| env_name_refusal(&rejection, &query.name))?;
     let actor = crate::api::actor::user_actor(&headers, None);
@@ -632,7 +550,6 @@ pub(super) async fn update_env_var(
     }
 }
 
-/// DELETE /api/v1/env-vars?name=NAME — remove a variable.
 pub(super) async fn delete_env_var(
     State(state): State<AppState>,
     Query(query): Query<NameQuery>,
@@ -648,13 +565,6 @@ pub(super) async fn delete_env_var(
     }
 }
 
-// ===== Model Registry Endpoints =====
-
-/// Resolve a `preferred_provider` against the routes it will sit beside.
-///
-/// A pick naming a backend the row cannot serve is refused rather than stored.
-/// `resolve_route` would treat it as stale and fall through, so nothing breaks,
-/// but a stored pick nothing honours is a setting that silently does nothing.
 fn preferred_provider_error(preferred: Option<&str>, routes: &[Route]) -> Option<String> {
     let pick = preferred?;
     routes
@@ -663,11 +573,6 @@ fn preferred_provider_error(preferred: Option<&str>, routes: &[Route]) -> Option
         .then(|| format!("Model has no '{pick}' route to prefer"))
 }
 
-/// The route list a new model stores.
-///
-/// `routes` wins; `provider` + `context_window` is the single-route shorthand
-/// every existing caller sends. Neither is a refusal, since a row with no route
-/// reaches no backend at all.
 fn routes_for_create(
     routes: Option<Vec<Route>>,
     provider: Option<String>,
@@ -686,16 +591,6 @@ fn routes_for_create(
     Ok(routes)
 }
 
-/// Apply an edit to a stored model: the fields to store. `on_chat_ladder` is
-/// not a column, so `update_model_fields` applies it through
-/// `runtime::chat_ladder`.
-///
-/// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
-/// there. Routes, the preferred pick and the vision flag apply to every row.
-///
-/// `provider` and `context_window` apply to the FIRST route, which is what the
-/// single-route shorthand means. Neither is identity: a vendor can raise a
-/// window, and a seeded value can simply be wrong.
 fn apply_model_update(
     existing: &crate::core::Model,
     request: UpdateModelRequest,
@@ -714,9 +609,6 @@ fn apply_model_update(
         }
     }
     validate_routes(&routes)?;
-    // An explicit pick is checked below. A stored one the new routes no longer
-    // serve is dropped instead: removing a route must not be refused for a pick
-    // the caller never mentioned.
     let preferred_provider = match request.preferred_provider {
         Some(pick) => pick,
         None => existing
@@ -744,18 +636,6 @@ fn apply_model_update(
     })
 }
 
-/// GET /api/v1/models: the full registry, the catalogue the chat intelligence
-/// ladder picks from. Each row says whether a rung that is on runs it, which
-/// is what the chat picker filters on.
-///
-/// Each ROUTE carries the reasoning efforts its backend supports, derived here
-/// so the picker offers exactly what `RoutingProvider` will send. Per route
-/// rather than per row, because the answer depends on the backend: the same
-/// Claude id offers six efforts on Vertex and four through OpenRouter.
-///
-/// Derived per request rather than stored. It is a pure function of the route's
-/// provider and wire id. So a re-routed model is right immediately, and a user
-/// adding a local model is never asked to declare efforts they cannot know.
 pub(super) async fn list_models(
     State(state): State<AppState>,
 ) -> Result<Json<ModelsListResponse>, (StatusCode, String)> {
@@ -788,7 +668,6 @@ pub(super) async fn read_models(
     Ok(ModelsListResponse { models })
 }
 
-/// Serve one registry row, deriving each route's reasoning efforts.
 fn model_info(
     model: crate::core::Model,
     on_chat_ladder: bool,
@@ -833,16 +712,6 @@ fn route_info(
     }
 }
 
-/// GET /api/v1/response-styles: the merged *style library*.
-///
-/// Shipped styles first, then whatever the user added, each row saying whether
-/// it is shipped, overridden or their own. That is what decides whether the
-/// editor offers Reset or Delete.
-///
-/// A read-only route on purpose: the library is written by `PUT /preferences`
-/// on `response_styles`, where the one write chokepoint bounds-checks it. This
-/// exists so the shipped instructions have a single home in Rust. Mirrored into
-/// TypeScript, they would drift the first time either side was reworded.
 pub(super) async fn list_response_styles(
     State(state): State<AppState>,
 ) -> Json<ResponseStylesListResponse> {
@@ -851,7 +720,6 @@ pub(super) async fn list_response_styles(
     })
 }
 
-/// POST /api/v1/models — add a user model.
 pub(super) async fn create_model(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -869,7 +737,6 @@ pub(super) async fn create_model(
         Ok(routes) => routes,
         Err(err) => return ApiResult::err(err),
     };
-    // User models sort after the builtins by default.
     let sort_order = request.sort_order.unwrap_or(1000);
     let fields = ModelFields {
         label,
@@ -878,9 +745,6 @@ pub(super) async fn create_model(
         vision: request.vision,
         sort_order,
     };
-    // The store emits `ModelCreated` from inside its write path (the in-memory
-    // ModelRegistry reloads on it), so resolve the device actor and hand it over.
-    // A new model lists off the chat ladder until someone turns it on.
     let actor = crate::api::actor::user_actor(&headers, None);
     match ModelStore::create(&state.pool, &state.engine.event_bus, &id, &fields, actor).await {
         Ok(_) => ApiResult::ok(),
@@ -891,18 +755,6 @@ pub(super) async fn create_model(
     }
 }
 
-/// PUT /api/v1/models?id= to edit a model.
-///
-/// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
-/// there. They still accept `on_chat_ladder`, `routes`, `preferred_provider`
-/// and `vision`.
-///
-/// None of those is identity. Which backends serve a model is a fact that
-/// changes, and `preferred_provider` is the model picker's own write path.
-/// Refusing it on a builtin would pin every seeded model to whichever backend
-/// the migration listed first.
-///
-/// User models update any provided field.
 pub(super) async fn update_model(
     State(state): State<AppState>,
     Query(query): Query<ModelIdQuery>,
@@ -925,9 +777,6 @@ pub(super) async fn update_model(
     Ok(answer.into_response())
 }
 
-/// Gate a model route's chat-ladder edit. It continues with the once grant
-/// a refused edit gives back. An agent with no permission breaks with the
-/// prepared card quoting `reason`, and nothing changes.
 async fn chat_ladder_edit_gate(
     state: &AppState,
     headers: &HeaderMap,
@@ -942,8 +791,6 @@ async fn chat_ladder_edit_gate(
     })
 }
 
-/// Apply a model update. The flag says whether the chat ladder changed, so
-/// a failed update knows whether its ladder permission was used.
 async fn update_model_fields(
     state: &AppState,
     id: &str,
@@ -965,7 +812,6 @@ async fn update_model_fields(
         Ok(fields) => fields,
         Err(err) => return (ApiResult::err(err), false),
     };
-    // The store owns the `ModelUpdated` emit.
     let actor = crate::api::actor::user_actor(headers, None);
     if on_chat_ladder == Some(false) {
         if let Err(err) = set_on_chat_ladder(state, &existing.id, false, actor.clone()).await {
@@ -995,7 +841,6 @@ async fn update_model_fields(
     (ApiResult::ok(), on_chat_ladder.is_some())
 }
 
-/// Reads the routes at call time, so turning on sees an edit's new routes.
 async fn set_on_chat_ladder(
     state: &AppState,
     model: &str,
@@ -1050,7 +895,6 @@ pub(super) async fn delete_model(
         Ok(_) => Ok(ApiResult::ok().into_response()),
         Err(err) => {
             if let Some(spent) = spent {
-                // Still on the ladder: the refusal came before any ladder change.
                 if on_chat_ladder(&state, &existing.id).await {
                     spent.restore(&state).await?;
                 }
@@ -1060,7 +904,6 @@ pub(super) async fn delete_model(
     }
 }
 
-/// Whether a rung that is on the Lucidos Agent's ladder runs `model`.
 async fn on_chat_ladder(state: &AppState, model: &str) -> bool {
     crate::runtime::intelligence_ladder::load(
         &state.pool,
@@ -1071,9 +914,6 @@ async fn on_chat_ladder(state: &AppState, model: &str) -> bool {
     .lists_model(model)
 }
 
-// ===== OAuth Account Endpoints =====
-
-/// List all OAuth accounts (without tokens)
 pub(super) async fn list_oauth_accounts(
     State(state): State<AppState>,
 ) -> Result<Json<OAuthAccountsListResponse>, (StatusCode, String)> {
@@ -1086,7 +926,6 @@ pub(super) async fn list_oauth_accounts(
     Ok(Json(OAuthAccountsListResponse { accounts }))
 }
 
-/// Delete an OAuth account
 pub(super) async fn delete_oauth_account(
     State(state): State<AppState>,
     Query(query): Query<OAuthAccountQuery>,
@@ -1097,7 +936,6 @@ pub(super) async fn delete_oauth_account(
         Err(_) => return ApiResult::err("Invalid account ID"),
     };
 
-    // `delete` emits `OAuthAccountDeleted` itself; resolve the device actor.
     let actor = crate::api::actor::user_actor(&headers, None);
     match OAuthStore::delete(&state.pool, &state.engine.event_bus, id, actor).await {
         Ok(true) => ApiResult::ok(),
@@ -1106,7 +944,7 @@ pub(super) async fn delete_oauth_account(
     }
 }
 
-/// The *OAuth provider registry*: every provider whose endpoints Lucidos knows.
+/// INVARIANT: The *OAuth provider registry*: every provider whose endpoints Lucidos knows.
 ///
 /// Drives two things on Settings > Accounts that were hardcoded or absent
 /// before: the quick-provider buttons (previously a literal three-name array in
@@ -1120,16 +958,10 @@ pub(super) async fn list_known_oauth_providers(
     let providers = crate::core::oauth_registry::load_providers(state.engine.system_knowhow_dir());
     Json(serde_json::json!({
         "providers": providers,
-        // The exact loopback URI the flow will send, so the form can offer it
-        // for copying into the provider's console. It has to be registered
-        // character for character, and it is the engine's to state: only the
-        // host form is configurable, never the port or path.
         "default_redirect_uri": crate::core::oauth::default_redirect_uri(),
     }))
 }
 
-/// Start an OAuth flow: prepares the authorization URL and spawns a background
-/// listener for the callback. Returns `{ auth_url }` for the frontend to open.
 pub(super) async fn reauthorize_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1144,19 +976,11 @@ pub(super) async fn reauthorize_oauth(
         .unwrap_or_default()
         .trim()
         .to_string();
-    // A Connect press asks the engine to add the provider's sign-in scopes, so
-    // the purpose alone may be empty. Every other caller names its exact scopes.
     let sign_in = body["sign_in"].as_bool().unwrap_or(false);
     if requested_scopes.is_empty() && !sign_in {
         return ApiResult::err("scopes is required");
     }
 
-    // The OAuth client has to exist AND be able to drive a flow before the
-    // authorization starts. Both shortfalls resolve to the same answer: hand the
-    // modal a credential request prefilled from the registry. Reaching
-    // `prepare_oauth_flow` without them produces a bare "Missing auth_url in
-    // OAuth credentials" toast one screen away from anything the user can act
-    // on.
     let cred_service = crate::core::oauth::client_provider_name(&provider);
     let registry_row = crate::core::oauth_registry::find_provider(
         state.engine.system_knowhow_dir(),
@@ -1170,8 +994,6 @@ pub(super) async fn reauthorize_oauth(
         Ok(None) => return ApiResult::needs_credentials(&provider, &overrides),
         Err(e) => return ApiResult::err(format!("Failed to check credentials: {}", e)),
         Ok(Some(cred)) => {
-            // Asks which fields are filled in, so the stored value serves: a
-            // secret reference fills its field.
             let missing = crate::core::oauth::missing_flow_fields(cred.stored_value());
             if !missing.is_empty() {
                 let client_id = serde_json::from_str::<serde_json::Value>(cred.stored_value())
@@ -1221,8 +1043,6 @@ pub(super) async fn reauthorize_oauth(
         }
     };
 
-    // The device clicking Connect is the one to bring back to the front when the
-    // authorization lands, so it rides along to `OAuthAccountConnected`.
     let initiator = crate::api::actor::user_actor(&headers, None);
     let route = crate::core::oauth::CallbackRoute::for_browser(
         crate::core::oauth_callback::BrowserContext::from_headers(&headers),
@@ -1239,7 +1059,6 @@ pub(super) async fn reauthorize_oauth(
     {
         Ok(prepared) => {
             let auth_url = prepared.auth_url.clone();
-            // Store the receiver so /oauth/complete can await it
             state
                 .pending_oauth_flows
                 .lock()
@@ -1251,8 +1070,6 @@ pub(super) async fn reauthorize_oauth(
     }
 }
 
-/// Wait for a pending OAuth flow to complete (called after the frontend opens the auth URL).
-/// Blocks until the background listener receives the callback and finishes token exchange.
 pub(super) async fn complete_oauth(
     State(state): State<AppState>,
     Query(query): Query<ProviderQuery>,
@@ -1265,23 +1082,14 @@ pub(super) async fn complete_oauth(
         None => return ApiResult::err(format!("No pending OAuth flow for {}", provider)),
     };
 
-    // Wait up to 120s for the background task
     match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
         Ok(Ok(Ok(_))) => ApiResult::ok(),
         Ok(Ok(Err(e))) => ApiResult::err(format!("OAuth flow failed: {}", e)),
-        // The sender dropped without a result. Since the loopback callback port
-        // has one owner and a new authorization supersedes the previous one
-        // (`core::oauth::ACTIVE_CALLBACK_FLOW`), that is what this almost always
-        // is, and it is something the user did on purpose rather than an
-        // internal fault. Say so, and say how to get back.
         Ok(Err(_)) => ApiResult::err(crate::core::oauth::FLOW_SUPERSEDED_MSG),
         Err(_) => ApiResult::err("OAuth flow timed out after 120 seconds"),
     }
 }
 
-// ===== Preferences Endpoints =====
-
-/// Get all preferences (optionally merged with device-specific overrides)
 pub(super) async fn get_preferences(
     State(state): State<AppState>,
     Query(query): Query<PreferencesQuery>,
@@ -1291,7 +1099,6 @@ pub(super) async fn get_preferences(
         .map(Json)
 }
 
-/// The settings, with `device_id`'s own values over the shared ones.
 pub(super) async fn read_preferences(
     state: &AppState,
     device_id: Option<&str>,
@@ -1313,10 +1120,6 @@ pub(super) async fn read_preferences(
     })
 }
 
-/// Drop the engine's own bookkeeping rows from a preference map.
-///
-/// `GET /preferences` is an `App` route. Silent keys are not settings, so no
-/// client reads them.
 fn settings_only(
     mut preferences: std::collections::HashMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
@@ -1324,7 +1127,6 @@ fn settings_only(
     preferences.into_iter().collect()
 }
 
-/// Set a preference (optionally per-device)
 pub(super) async fn set_preference(
     State(state): State<AppState>,
     Query(query): Query<KeyQuery>,
@@ -1357,17 +1159,13 @@ pub(super) async fn set_preference(
     )
 }
 
-/// Delete a preference
 pub(super) async fn delete_preference(
     State(state): State<AppState>,
     Query(query): Query<KeyQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResult>, ApiError> {
     let key = query.key;
-    // Deleting a key restores its default, which is a write like any other.
     require_owner_for_human_only_preference(&headers, &key)?;
-    // `delete` emits the `PreferencesChanged` with `value: None` ("back to the
-    // default") itself; resolve the device actor for it.
     let actor =
         preference_write_actor(&headers, &state.pool, &state.engine.event_bus, &key, None).await?;
     Ok(
@@ -1379,8 +1177,6 @@ pub(super) async fn delete_preference(
     )
 }
 
-/// Restore policy writes require a registered owner device even for deletion.
-/// All other preferences retain their existing attribution and access rules.
 pub(in crate::api) async fn preference_write_actor(
     headers: &HeaderMap,
     pool: &sqlx::PgPool,
@@ -1417,13 +1213,6 @@ pub(in crate::api) fn require_owner_for_human_only_preference(
     }
 }
 
-// ===== Network access (per-workspace engine bind) =====
-
-/// GET response for the per-workspace Network access pane. `engine_bind` is this
-/// workspace's own `network_bind` preference; `inherit` + `gateway_bind` are read
-/// from the machine-global `~/.lucidos/network.toml` so the pane can grey out the
-/// engine field (showing the inherited value) when engines inherit the gateway
-/// bind. `detected_tailscale_ip` is a best-effort hint for the IP field.
 #[derive(Serialize)]
 pub(super) struct NetworkConfigResponse {
     engine_bind: String,
@@ -1437,8 +1226,6 @@ pub(super) struct SetNetworkConfigRequest {
     engine_bind: String,
 }
 
-/// GET /api/v1/network-config — the per-workspace engine bind + the inherited
-/// machine-global gateway bind, for Settings → Access → Network access.
 pub(super) async fn get_network_config(
     State(state): State<AppState>,
 ) -> Result<Json<NetworkConfigResponse>, (StatusCode, String)> {
@@ -1461,9 +1248,6 @@ pub(super) async fn get_network_config(
     }))
 }
 
-/// PUT /api/v1/network-config — set this workspace's engine bind. Validated
-/// server-side (loopback / all / a parseable IP); takes effect on the next
-/// engine restart (a live socket cannot be re-bound).
 pub(super) async fn put_network_config(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1474,16 +1258,12 @@ pub(super) async fn put_network_config(
     if let Err(msg) = crate::net_config::validate_bind_input(&request.engine_bind) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
-    // Normalize keyword case so the stored value is canonical (the resolver is
-    // case-insensitive, but a clean value reads better in the timeline / file).
     let value = match request.engine_bind.trim().to_ascii_lowercase().as_str() {
         "loopback" => "loopback".to_string(),
         "all" => "all".to_string(),
         _ => request.engine_bind.trim().to_string(),
     };
     let actor = super::actor::user_actor(&headers, None);
-    // Route through the single preference write chokepoint so it emits
-    // PreferencesChanged like every other settings write.
     match state
         .engine
         .apply_preference_write(crate::core::prefs::NETWORK_BIND.key(), &value, None, actor)
@@ -1494,14 +1274,9 @@ pub(super) async fn put_network_config(
     }
 }
 
-// ===== Tailnet status (this workspace's Tailscale URL) =====
-
-/// Bound on the round trip that proves the serve URL reaches this workspace.
-/// It leaves on the tailnet interface and comes straight back through the
-/// gateway. So this is a stall guard for a hop that is local in practice.
 const SERVE_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// How long an answer is reused before the probes run again.
+/// INVARIANT: How long an answer is reused before the probes run again.
 ///
 /// The endpoint needs no auth, like every other one here. Each miss asks
 /// Tailscale, which can mean a bounded `lsof` or CLI run, plus one outbound TLS
@@ -1512,34 +1287,17 @@ const SERVE_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// that run takes far longer than this, so the refetch still sees the new URL.
 const TAILNET_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The last answer and when it was produced. One engine serves one workspace,
+/// INVARIANT: The last answer and when it was produced. One engine serves one workspace,
 /// so a process-wide slot is per-workspace by construction. In-memory cache,
 /// which `CLAUDE.md` § Engine Statelessness allows: it is rebuilt by the next
 /// miss and holds nothing a restart would lose.
 static TAILNET_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, TailnetStatusResponse)>> =
     std::sync::Mutex::new(None);
 
-/// What this machine's tailnet looks like from the engine, for Settings →
-/// Access. Read over plain HTTP, so a phone browser gets the same answer the
-/// packaged desktop app does.
-///
-/// Deliberately NOT folded into [`NetworkConfigResponse`]. Both Access panes
-/// fetch that endpoint separately and read disjoint fields from it. That is
-/// safe only while it stays the cheap local call `SettingsView` documents.
-/// These fields cost asking Tailscale and a network round trip, and the bind
-/// editor reads none of them.
 #[derive(Serialize, Clone)]
 pub(super) struct TailnetStatusResponse {
-    /// The MagicDNS name Tailscale reports, no scheme. `None` off a tailnet,
-    /// and `None` while MagicDNS is off, which does not mean offline.
     magic_dns_name: Option<String>,
-    /// The `https://<name>[:<port>]/<slug>/` URL, set **only** once its origin
-    /// was answered by this engine's own gateway. The port is present whenever the
-    /// serve route is not on 443. See [`get_tailnet_status`] for why a listener
-    /// is not enough to publish it.
     workspace_serve_url: Option<String>,
-    /// Why this machine has no tailnet address, in one sentence. `None` when
-    /// it is joined.
     reason: Option<String>,
 }
 
@@ -1556,9 +1314,6 @@ pub(super) async fn get_tailnet_status() -> Json<TailnetStatusResponse> {
         crate::core::base_path::workspace_id(),
         crate::core::base_path::gateway_port(),
     ) {
-        // No certifiable name, or no gateway: there is no candidate URL to
-        // verify. A slugless engine is the direct-port dev mode, which no
-        // gateway path addresses.
         (Some(name), Some(slug), Some(gateway_port)) => {
             verified_workspace_serve_url(name, &slug, &gateway_port).await
         }
@@ -1573,7 +1328,6 @@ pub(super) async fn get_tailnet_status() -> Json<TailnetStatusResponse> {
     Json(answer)
 }
 
-/// The cached answer while it is inside [`TAILNET_STATUS_TTL`], else `None`.
 fn cached_tailnet_status() -> Option<TailnetStatusResponse> {
     lock_tailnet_cache()
         .as_ref()
@@ -1581,8 +1335,6 @@ fn cached_tailnet_status() -> Option<TailnetStatusResponse> {
         .map(|(_, answer)| answer.clone())
 }
 
-/// Take the cache lock, ignoring poisoning. Nothing under it can be left
-/// half-written: it holds one timestamped answer, replaced whole.
 fn lock_tailnet_cache(
 ) -> std::sync::MutexGuard<'static, Option<(std::time::Instant, TailnetStatusResponse)>> {
     TAILNET_STATUS_CACHE
@@ -1592,13 +1344,8 @@ fn lock_tailnet_cache(
 
 const SERVE_PORTS: [u16; 3] = [443, 8443, 10000];
 
-/// Bound on each loopback attempt to read our own gateway's identity.
 const OWN_GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Pure: the origin a serve route on `port` would publish.
-///
-/// 443 keeps the bare form, because that is the address a person retypes and
-/// every existing install already prints.
 fn serve_origin(magic_dns_name: &str, port: u16) -> String {
     match port {
         443 => format!("https://{magic_dns_name}"),
@@ -1606,7 +1353,6 @@ fn serve_origin(magic_dns_name: &str, port: u16) -> String {
     }
 }
 
-/// Pure: the URL a serve route on `port` would publish for this workspace.
 fn serve_candidate_url(magic_dns_name: &str, slug: &str, port: u16) -> String {
     format!("{}/{slug}/", serve_origin(magic_dns_name, port))
 }
@@ -1641,9 +1387,6 @@ async fn verified_workspace_serve_url(
     [first, second, third].into_iter().flatten().next()
 }
 
-/// The client for every tailnet probe. It validates TLS and carries no
-/// credential: a serve route can proxy anywhere, so a secret sent before the
-/// proof would go to whoever answers (ADR 0602).
 fn tailnet_probe_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(SERVE_VERIFY_TIMEOUT)
@@ -1653,12 +1396,10 @@ fn tailnet_probe_client() -> Option<reqwest::Client> {
         .ok()
 }
 
-/// Does the gateway answering at `origin` carry our gateway's `instance_id`?
 async fn reaches_our_gateway(client: &reqwest::Client, origin: &str, ours: &str) -> bool {
     gateway_instance(client, origin).await.as_deref() == Some(ours)
 }
 
-/// The `instance_id` in the public gateway health at `origin`, or `None`.
 async fn gateway_instance(client: &reqwest::Client, origin: &str) -> Option<String> {
     let path = lucidos_gateway_constants::GATEWAY_HEALTH_PATH;
     let response = client.get(format!("{origin}{path}")).send().await.ok()?;
@@ -1668,8 +1409,6 @@ async fn gateway_instance(client: &reqwest::Client, origin: &str) -> Option<Stri
     instance_id_of(&response.text().await.ok()?)
 }
 
-/// Pure: the `instance_id` a gateway health body names. Anything we cannot
-/// parse is `None`, so an unverified URL is never published.
 fn instance_id_of(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()?
@@ -1679,8 +1418,6 @@ fn instance_id_of(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Our own gateway's `instance_id`, read over loopback. Health is public, so
-/// this hop presents no credential either.
 async fn own_gateway_instance(gateway_port: &str) -> Option<String> {
     let client = lucidos_local_token::client::client_builder()
         .timeout(OWN_GATEWAY_TIMEOUT)
@@ -1688,8 +1425,6 @@ async fn own_gateway_instance(gateway_port: &str) -> Option<String> {
         .ok()?;
     gateway_instance(&client, &lucidos_local_token::client::origin(gateway_port)).await
 }
-
-// ===== Pinned App UIs Endpoints =====
 
 #[derive(Deserialize)]
 pub(super) struct PinnedAppsQuery {
@@ -1707,7 +1442,6 @@ pub(super) struct PinAppRequest {
     device_id: String,
 }
 
-/// GET /api/v1/pinned-apps?device_id=X — list pinned apps for a device
 pub(super) async fn get_pinned_apps(
     State(state): State<AppState>,
     Query(query): Query<PinnedAppsQuery>,
@@ -1715,8 +1449,6 @@ pub(super) async fn get_pinned_apps(
     read_pinned_apps(&state, &query).await.map(Json)
 }
 
-/// The query `GET /api/v1/pinned-apps` reads for `device_id`. Without a
-/// device it is the rejection that route answers a request naming none.
 pub(super) fn pinned_apps_query(
     device_id: Option<&str>,
 ) -> Result<PinnedAppsQuery, axum::extract::rejection::QueryRejection> {
@@ -1744,9 +1476,6 @@ pub(super) async fn read_pinned_apps(
     Ok(PinnedAppsResponse { entries })
 }
 
-/// POST /api/v1/pinned-apps — pin an app for a device. Idempotent in the DB;
-/// only emits `PinnedAppPinned` when the row was actually inserted (so
-/// re-clicks of an already-pinned tile don't append events).
 pub(super) async fn pin_app(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1773,8 +1502,6 @@ pub(super) struct ForgetBrowserLoginRequest {
     domain: String,
 }
 
-/// `POST /api/v1/browser/forget-login`: drop the record that the built-in
-/// browser is signed in to one domain, as the `browser_forget_login` tool does.
 pub(super) async fn forget_browser_login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1788,7 +1515,6 @@ pub(super) async fn forget_browser_login(
     crate::runtime::BrowserLogins::remove(&state.pool, domain)
         .await
         .map_err(ApiError::db)?;
-    // `browser_logins` announces nothing, so the log is where the caller shows.
     let caller = format!("{actor:?}");
     log!(
         "[Browser] Login for {} forgotten by {}",
@@ -1798,8 +1524,6 @@ pub(super) async fn forget_browser_login(
     Ok(ApiResult::ok())
 }
 
-/// DELETE /api/v1/pinned-apps — unpin an app for a device. Idempotent in the
-/// DB; only emits `PinnedAppUnpinned` when a row was actually removed.
 pub(super) async fn unpin_app(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1821,17 +1545,11 @@ pub(super) async fn unpin_app(
     }
 }
 
-// ===== Device Management Endpoints =====
-
 pub(super) async fn register_device(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<DeviceRegisterRequest>,
 ) -> Json<serde_json::Value> {
-    // The frontend calls this on every page load to refresh `last_seen_at`, so
-    // the upsert path is the steady state. `register` announces only a genuine
-    // first-touch insert, so the events table does not grow by a row per
-    // refresh (see `DeviceStore`'s type doc).
     let actor = super::actor::user_actor(&headers, Some(&request.device_id));
     match crate::core::DeviceStore::register(
         &state.pool,
@@ -1848,8 +1566,6 @@ pub(super) async fn register_device(
     }
 }
 
-/// The device id the caller asserts in `x-lucidos-device-id`, or `None` for a
-/// missing or blank header (the loopback case).
 fn asserted_device_id(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(crate::core::subprocess_origin::HEADER_DEVICE_ID)
@@ -1858,30 +1574,10 @@ fn asserted_device_id(headers: &HeaderMap) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Tell a page which device id the gateway asserts for it.
-///
-/// Behind a relay that id is `<pairing id>:<device id>` (ADR 0591), which the
-/// page cannot derive. Only the gateway on the workspace's own host knows it.
-/// Reads the header and nothing else, so a caller learns only its own id.
 pub(super) async fn caller_device(headers: HeaderMap) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "device_id": asserted_device_id(&headers) }))
 }
 
-/// Why this caller may not act for device `target`, or `None` when it may.
-///
-/// The rule is that a caller may only act for ITSELF. Behind the *workspace
-/// gateway* the `x-lucidos-device-id` header is gateway-asserted (ADR 0094's
-/// amendment), so requiring the body's device id to match it is free.
-/// Unchecked, a paired caller could move another device's row onto an id
-/// nobody will ever present. It could also point that device's push
-/// subscription at its own endpoint.
-///
-/// A missing or blank header is the loopback case and is not refused, matching
-/// every other endpoint here.
-///
-/// A hand-over asserts the id it is ADOPTING, which is what makes the rule
-/// satisfiable at all: the client still stores the old one when it asks. See
-/// `handOverDevice` in `api/client/settings.ts`.
 pub(super) fn claims_another_device(headers: &HeaderMap, target: &str) -> Option<String> {
     let asserted = asserted_device_id(headers)?;
     if asserted == target {
@@ -2004,8 +1700,6 @@ pub(super) async fn delete_device(
     }
 }
 
-// ===== Email Endpoints =====
-
 pub(super) async fn send_email_confirmed(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2019,7 +1713,6 @@ pub(super) async fn send_email_confirmed(
     Ok(send_confirmed_draft(&state, &headers, &body).await)
 }
 
-/// The send behind [`send_email_confirmed`], once an agent has been refused.
 async fn send_confirmed_draft(
     state: &AppState,
     headers: &HeaderMap,
@@ -2093,7 +1786,6 @@ async fn send_confirmed_draft(
         Err(e) => return Json(serde_json::json!({ "success": false, "error": format!("{}", e) })),
     };
 
-    // A refusal here is the send's refusal: see `linked_account_token`.
     let oauth_token =
         match crate::core::oauth::linked_account_token(&state.pool, account.oauth_account_id).await
         {
@@ -2113,7 +1805,6 @@ async fn send_confirmed_draft(
         Some(bcc.join(", "))
     };
 
-    // Read attachments from workspace
     let attachment_paths: Vec<String> = body
         .get("attachments")
         .and_then(|v| v.as_array())
@@ -2187,16 +1878,12 @@ async fn send_confirmed_draft(
     }
 }
 
-// ===== OAuth Access Token Endpoint =====
-
 #[derive(Serialize)]
 pub(super) struct OAuthAccessTokenResponse {
     pub access_token: String,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Core lookup + auto-refresh for `GET /api/v1/oauth/{provider}/access-token`.
-/// Pulled out of the axum handler so it can be unit-tested without HTTP plumbing.
 pub(super) async fn fetch_oauth_access_token(
     pool: &PgPool,
     provider: &str,
@@ -2221,10 +1908,6 @@ pub(super) async fn fetch_oauth_access_token(
     })
 }
 
-/// `GET /api/v1/oauth/{provider}/access-token` — returns a short-lived
-/// access token for an in-browser SDK (e.g. the Spotify Web Playback SDK)
-/// without exposing the refresh token. Auto-refreshes when the stored
-/// token is expired or expiring within 60s.
 pub(super) async fn get_oauth_access_token(
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -2389,16 +2072,12 @@ async fn update_private_paths(
     read_private_path_settings(&state).await
 }
 
-/// Routes for the settings-owned surfaces: credentials, model registry,
-/// OAuth accounts, preferences, tool allowlists, devices, pinned apps, and
-/// email send.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route(
             "/private-paths",
             get(private_path_settings).put(update_private_paths),
         )
-        // Credentials endpoints
         .route(
             "/credentials",
             get(list_credentials)
@@ -2408,8 +2087,6 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/credential-base-urls", put(set_credential_base_urls))
         .route("/email-account", get(get_email_account))
-        // User-managed non-secret environment variables
-        // (Settings → System → Environment variables).
         .route(
             "/env-vars",
             get(list_env_vars)
@@ -2417,20 +2094,11 @@ pub(super) fn router() -> Router<AppState> {
                 .put(update_env_var)
                 .delete(delete_env_var),
         )
-        // Per-workspace engine network bind (Settings → Access → Network
-        // access). The machine-global gateway bind + inherit toggle live on the
-        // gateway control plane (`/~/api/v1/control/network-config`).
         .route(
             "/network-config",
             get(get_network_config).put(put_network_config),
         )
-        // The MagicDNS name and the verified HTTPS URL for this workspace, for
-        // the Other addresses on that same page. Its own route rather than fields
-        // on `/network-config`, which the bind editor also fetches and which
-        // must stay a cheap local read.
         .route("/tailnet-status", get(get_tailnet_status))
-        // Model registry — the DB-backed chat model list (Settings → Models).
-        // Drives the Lucidos Agent picker + RoutingProvider provider selection.
         .route(
             "/models",
             get(list_models)
@@ -2439,7 +2107,6 @@ pub(super) fn router() -> Router<AppState> {
                 .delete(delete_model),
         )
         .route("/response-styles", get(list_response_styles))
-        // OAuth account endpoints
         .route(
             "/oauth/accounts",
             get(list_oauth_accounts).delete(delete_oauth_account),
@@ -2447,33 +2114,25 @@ pub(super) fn router() -> Router<AppState> {
         .route("/oauth/known-providers", get(list_known_oauth_providers))
         .route("/oauth/reauthorize", post(reauthorize_oauth))
         .route("/oauth/complete", post(complete_oauth))
-        // Short-lived OAuth access-token for in-browser SDKs (e.g. Spotify
-        // Web Playback SDK). Refresh token never leaves the engine.
         .route("/oauth/:provider/access-token", get(get_oauth_access_token))
-        // Preferences endpoints
         .route(
             "/preferences",
             get(get_preferences)
                 .put(set_preference)
                 .delete(delete_preference),
         )
-        // CC tool-permission allowlist
         .route(
             "/cc-allowed-tools",
             get(get_cc_allowed_tools).put(put_cc_allowed_tools),
         )
-        // Lucidos Agent command-guard allowlist
-        // (<workspace>/.lucidos/agent-allowed-commands, ADR 0002)
         .route(
             "/agent-allowed-commands",
             get(get_agent_allowed_commands).put(put_agent_allowed_commands),
         )
-        // Standing denies
         .route(
             "/agent-denied-commands",
             get(get_agent_denied_commands).put(put_agent_denied_commands),
         )
-        // Device endpoints
         .route("/devices/register", post(register_device))
         .route("/devices/hand-over", post(hand_over_device))
         .route("/devices/caller", get(caller_device))
@@ -2486,7 +2145,6 @@ pub(super) fn router() -> Router<AppState> {
             get(get_pinned_apps).post(pin_app).delete(unpin_app),
         )
         .route("/browser/forget-login", post(forget_browser_login))
-        // Email endpoints
         .route("/email/send", post(send_email_confirmed))
 }
 
@@ -2613,7 +2271,6 @@ mod tailnet_status_tests {
     use axum::http::StatusCode;
     use axum::routing::any;
 
-    /// A public gateway health body naming `instance_id`.
     fn gateway_health(instance_id: &str) -> String {
         serde_json::json!({
             "status": "ok",
@@ -2623,9 +2280,6 @@ mod tailnet_status_tests {
         .to_string()
     }
 
-    /// A stand-in for an authenticating gateway. Like `auth_api::enforce`, it
-    /// answers 401 to every path an unpaired caller asks for, except the
-    /// public gateway health, which answers `health`.
     fn stand_in_app(health: String) -> Router {
         Router::<()>::new()
             .route(
@@ -2640,7 +2294,6 @@ mod tailnet_status_tests {
             }))
     }
 
-    /// Serves [`stand_in_app`] over plain HTTP and returns its origin.
     async fn stand_in_gateway(health: String) -> String {
         let app = stand_in_app(health);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2659,9 +2312,6 @@ mod tailnet_status_tests {
 
     #[tokio::test]
     async fn an_authenticating_gateway_still_proves_it_is_ours() {
-        // The regression: the gateway 401s the workspace health to an unpaired
-        // caller, so the old workspace-path proof never passed again. The
-        // public gateway health still answers, and its id is the proof.
         let origin = stand_in_gateway(gateway_health("ours")).await;
         let refused = client()
             .get(format!("{origin}/dev/api/v1/health"))
@@ -2674,7 +2324,6 @@ mod tailnet_status_tests {
 
     #[tokio::test]
     async fn another_gateway_is_never_ours() {
-        // A two-gateway machine: the 443 route fronts the other gateway.
         let origin = stand_in_gateway(gateway_health("theirs")).await;
         assert!(!reaches_our_gateway(&client(), &origin, "ours").await);
     }
@@ -2727,9 +2376,6 @@ mod tailnet_status_tests {
 
     #[test]
     fn a_serve_route_off_443_carries_its_port_into_the_url() {
-        // The second gateway on a machine cannot have 443, so its serve route
-        // is on another port. Dropping that port published an address that
-        // reaches the OTHER gateway, or nothing at all.
         assert_eq!(
             serve_candidate_url("mymac.tailnet-name.ts.net", "dev", 10000),
             "https://mymac.tailnet-name.ts.net:10000/dev/"
@@ -2742,8 +2388,6 @@ mod tailnet_status_tests {
 
     #[test]
     fn the_443_url_keeps_the_bare_form_it_always_had() {
-        // What every single-gateway install already prints, and what a person
-        // retypes. An explicit `:443` would be correct and uglier.
         assert_eq!(
             serve_candidate_url("mymac.tailnet-name.ts.net", "dev", 443),
             "https://mymac.tailnet-name.ts.net/dev/"
@@ -2752,18 +2396,11 @@ mod tailnet_status_tests {
 
     #[test]
     fn every_port_tailscale_serve_can_bind_is_a_candidate() {
-        // Serve accepts exactly these three. Leaving one out makes a live route
-        // invisible, which is the bug: Other addresses fell back to the raw
-        // gateway port while a verified route answered on 10000.
         assert_eq!(SERVE_PORTS, [443, 8443, 10000]);
     }
 
     #[test]
     fn the_tailnet_probe_validates_tls_and_presents_no_credential() {
-        // Tailscale issues a real certificate for a `.ts.net` name, so there is
-        // nothing to work around, and the loopback carve-out in
-        // `.claude/rules/rust.md` does not reach here. A serve route can proxy
-        // anywhere, so a credential would go to whoever answers (ADR 0602).
         let source = include_str!("settings.rs");
         let tailnet_probe = [
             "async fn verified_workspace_serve_url",
@@ -2851,8 +2488,6 @@ mod oauth_access_token_tests {
 
     #[tokio::test]
     async fn response_serialization_omits_refresh_token() {
-        // Belt-and-braces: even if someone adds a refresh_token field later,
-        // the on-the-wire JSON shape must stay { access_token, expires_at }.
         let resp = OAuthAccessTokenResponse {
             access_token: "tok".into(),
             expires_at: Some(Utc::now()),
@@ -2869,10 +2504,6 @@ mod oauth_access_token_tests {
 
     #[tokio::test]
     async fn attempts_refresh_when_stored_token_is_expired() {
-        // When the stored access token is already expired but no client
-        // credentials are configured, refresh_oauth_if_needed errors out
-        // and the handler maps that to BAD_GATEWAY. This proves the
-        // refresh code path runs (rather than returning the stale token).
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let past = Utc::now() - Duration::seconds(120);
         crate::test_support::seed_oauth_account(
@@ -2933,8 +2564,6 @@ mod hand_over_guard_tests {
 
     #[test]
     fn a_caller_may_not_move_someone_elses_row() {
-        // The reason names both, so the client's own log says which two ids
-        // disagreed rather than only that something was refused.
         let reason = claims_another_device(&headers_with(Some("dev-a")), "dev-b")
             .expect("a caller that is not the target must be refused");
         assert!(reason.contains("dev-a"), "{reason}");
@@ -2943,8 +2572,6 @@ mod hand_over_guard_tests {
 
     #[test]
     fn the_client_asserting_the_id_it_adopts_is_the_case_that_must_pass() {
-        // What `handOverDevice` sends. Asserting the id it still STORES is the
-        // shape that stranded the migration, so pin both directions.
         assert_eq!(
             claims_another_device(&headers_with(Some("paired-device")), "paired-device"),
             None
@@ -2990,8 +2617,6 @@ mod hand_over_guard_tests {
 mod preferences_read_tests {
     use super::*;
 
-    /// An app reads `GET /preferences`, so engine bookkeeping must not ride
-    /// along. Every other row is a setting, and it still does.
     #[test]
     fn the_preference_read_leaves_out_engine_bookkeeping() {
         use crate::core::prefs;
@@ -3033,8 +2658,6 @@ mod model_update_tests {
         serde_json::from_value(body).unwrap()
     }
 
-    /// An edit that does not mention the flag keeps it, so renaming a model
-    /// never quietly takes image description away from it.
     #[test]
     fn an_edit_without_the_vision_flag_keeps_it() {
         let fields = apply_model_update(
@@ -3045,7 +2668,6 @@ mod model_update_tests {
         assert!(fields.vision);
     }
 
-    /// A seed can be wrong, so a builtin takes the flag like it takes routes.
     #[test]
     fn a_builtin_accepts_the_vision_flag() {
         let fields = apply_model_update(

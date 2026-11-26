@@ -1,34 +1,3 @@
-//! Backends for the `web_search` LLM tool, and the chain that picks one.
-//!
-//! # Why this is not routed by the chat model
-//!
-//! Web search is a *background capability*, like memory extraction — not a
-//! property of whichever model the user happens to be chatting with. So the
-//! chain resolves over the **set of configured providers**, in a fixed
-//! preference order, independent of `model_registry` routing.
-//!
-//! That is what makes the fallback work: a user chatting on OpenRouter (which
-//! has no search tool of its own) still gets web search as long as *some*
-//! search-capable provider is configured.
-//!
-//! # Why provider-native, and not a search vendor
-//!
-//! Two doors are deliberately closed (see
-//! `docs/plans/2026-07-27-web-search-provider-routing.md` for the evidence):
-//!
-//! - **Keyless scraping of a general engine** — tried and lost. Commit
-//!   `8b917c19b` replaced a DuckDuckGo backend with Gemini grounding because
-//!   DuckDuckGo served CAPTCHAs. General engines block unauthenticated
-//!   datacenter traffic by design; this would fail again.
-//! - **A dedicated search vendor** (Brave / Tavily / Exa / Google CSE) — would
-//!   force a credential *and a credit card and a per-search bill* on every user
-//!   for something their LLM provider already bundles. Google's Custom Search
-//!   JSON API is closed to new customers and shuts down 2027-01-01; Bing's was
-//!   retired in 2025; Brave dropped its free tier in 2026-02.
-//!
-//! The accepted cost: results are **not** uniform across users — a user on
-//! Anthropic gets Anthropic's index, one on Vertex gets Google's.
-
 mod anthropic;
 mod chatgpt_plan;
 pub(crate) mod openai;
@@ -47,32 +16,15 @@ use crate::llm::metered::CallToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// What one search answered, and what it cost.
 pub struct WebSearchResult {
-    /// The answer text, then a `Sources:` list.
     pub text: String,
-    /// What the backend reported, when it reported tokens.
     pub usage: Option<ApiUsage>,
-    /// The model that answered, for the cost row.
     pub model: String,
-    /// Billing proved by this backend's endpoint and authentication.
     pub provider: Option<crate::engine::thread_events::billing_provider::BillingProvider>,
 }
 
-/// One web-search backend. Implementations wrap whatever search facility a
-/// configured LLM provider exposes.
 #[async_trait]
 pub trait WebSearchProvider: Send + Sync {
-    /// Run a search and return a formatted result: the answer text, then a
-    /// `Sources:` list of at most `max_results` numbered entries.
-    ///
-    /// **`Ok` means the backend answered**, including a legitimate "no results
-    /// found" — [`WebSearchChain`] treats that as terminal. Reserve `Err` for
-    /// availability failures (transport error, auth rejection, model/endpoint
-    /// missing), which are what the chain falls through on.
-    ///
-    /// One billable call, recorded by the model call service that handed
-    /// over `call`.
     async fn search(
         &self,
         query: &str,
@@ -80,28 +32,21 @@ pub trait WebSearchProvider: Send + Sync {
         call: CallToken,
     ) -> Result<WebSearchResult, BoxError>;
 
-    /// Stable identifier for log lines and the exhausted-chain error. Never
+    /// INVARIANT: Stable identifier for log lines and the exhausted-chain error. Never
     /// contains any part of a credential.
     fn id(&self) -> &'static str;
 
-    /// The model this backend sends, when it has one. Surfaced so the boot log
-    /// says which model search runs on, and so the build path can be tested for
-    /// the property that matters: each backend must get a model valid for *its
-    /// own* provider, not whatever the user happens to chat with.
     fn model(&self) -> Option<&str> {
         None
     }
 }
 
-/// Instruction every backend gives its model: summarise what the search found,
-/// don't answer from memory. One copy — several near-identical prompts would drift
-/// into several subtly different search behaviors.
 pub(crate) const SEARCH_SYSTEM_PROMPT: &str =
     "You are a web search assistant. Search the web thoroughly and return comprehensive, \
      detailed results with sources. Focus on finding and presenting relevant information from \
      search results rather than answering from your own knowledge.";
 
-/// Render a backend's answer into the one shape every backend returns: the
+/// INVARIANT: Render a backend's answer into the one shape every backend returns: the
 /// answer text, then a numbered `Sources:` list of `(title, url)` pairs.
 ///
 /// Shared so the backends can't drift into several slightly different renderings
@@ -133,10 +78,6 @@ pub(super) fn format_search_result(answer: &str, sources: &[(String, String)]) -
     out
 }
 
-/// Message returned when no search-capable provider is configured. Names the
-/// providers that work and where to add one, so the failure is actionable wherever
-/// it surfaces — mirrors the `EMBEDDER_UNAVAILABLE` convention in
-/// `memory::embedder_slot`.
 pub const NO_SEARCH_BACKEND: &str = concat!(
     "web_search has no configured backend. It runs on whichever \
      LLM provider you have set up — Vertex AI (Gemini Google Search grounding), Anthropic (the \
@@ -146,7 +87,7 @@ pub const NO_SEARCH_BACKEND: &str = concat!(
      configuring one of the providers above is required even if you chat on another provider."
 );
 
-/// The configured backends in preference order, tried until one answers.
+/// INVARIANT: The configured backends in preference order, tried until one answers.
 ///
 /// Order is fixed rather than user-selectable (Vertex → Anthropic → OpenAI key → ChatGPT plan):
 /// Vertex first so existing workspaces see no change in behavior, then
@@ -162,20 +103,14 @@ impl WebSearchChain {
         Self { backends }
     }
 
-    /// An empty chain — no search-capable provider configured. Every search
-    /// returns [`NO_SEARCH_BACKEND`].
     pub fn empty() -> Self {
         Self::new(Vec::new())
     }
 
-    /// Ids of the configured backends, in order. For boot logging.
     pub fn backend_ids(&self) -> Vec<&'static str> {
         self.backends.iter().map(|b| b.id()).collect()
     }
 
-    /// `(id, model)` per backend, in order — the boot log's detail line, and
-    /// what lets a test assert each backend got a model its own provider can
-    /// actually serve.
     pub fn backend_models(&self) -> Vec<(&'static str, Option<&str>)> {
         self.backends.iter().map(|b| (b.id(), b.model())).collect()
     }
@@ -183,7 +118,7 @@ impl WebSearchChain {
 
 #[async_trait]
 impl WebSearchProvider for WebSearchChain {
-    /// Walk the backends in order, returning the first `Ok`.
+    /// INVARIANT: Walk the backends in order, returning the first `Ok`.
     ///
     /// Only an `Err` — an availability failure — advances to the next backend.
     /// A successful "no results found" answer stops here; falling through on it
@@ -202,8 +137,6 @@ impl WebSearchProvider for WebSearchChain {
             match backend.search(query, max_results, call).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    // Not silent: a backend dropping out is worth a log line
-                    // even when a later one rescues the search.
                     crate::log_legacy!(
                         "[Search] backend '{}' unavailable, trying the next: {}",
                         backend.id(),
@@ -234,8 +167,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Records how many times it was asked, so a test can prove a later backend
-    /// was never consulted.
     struct StubBackend {
         id: &'static str,
         outcome: Result<String, String>,
@@ -300,14 +231,11 @@ mod tests {
         assert!(out.contains("2. Second\n   https://b"), "{out}");
     }
 
-    /// Nothing at all renders as the shared "no results" line — the string the
-    /// chain treats as a terminal success rather than an availability failure.
     #[test]
     fn formatter_renders_the_no_results_line_when_wholly_empty() {
         assert_eq!(format_search_result("   ", &[]), "No search results found.");
     }
 
-    /// Sources with no answer text still render, without a leading blank line.
     #[test]
     fn formatter_handles_sources_without_answer_text() {
         let out = format_search_result("", &[("Only".to_string(), "https://a".to_string())]);
@@ -315,8 +243,6 @@ mod tests {
         assert!(out.contains("1. Only"), "{out}");
     }
 
-    /// The first configured backend wins — this is what keeps an existing
-    /// Vertex workspace on Vertex.
     #[tokio::test]
     async fn first_backend_wins() {
         let first = StubBackend::ok("vertex-grounding", "from vertex");
@@ -338,8 +264,6 @@ mod tests {
         );
     }
 
-    /// An availability failure falls through to the next backend — the fallback
-    /// that lets a search-incapable primary provider still serve search.
     #[tokio::test]
     async fn availability_failure_falls_through() {
         let first = StubBackend::err("vertex-grounding", "404 Not Found");
@@ -357,9 +281,6 @@ mod tests {
         assert_eq!(second.calls(), 1);
     }
 
-    /// A legitimate empty result is a SUCCESS and must stop the chain. Falling
-    /// through here would bill every configured provider for every zero-result
-    /// query.
     #[tokio::test]
     async fn no_results_is_terminal_not_a_fallthrough() {
         let first = StubBackend::ok("vertex-grounding", "No search results found for: xyzzy");
@@ -379,8 +300,6 @@ mod tests {
         );
     }
 
-    /// Nothing configured → one actionable error naming the providers and where
-    /// to add one. Never an empty string passed off as a result.
     #[tokio::test]
     async fn empty_chain_explains_what_to_configure() {
         let err = WebSearchChain::empty()
@@ -394,8 +313,6 @@ mod tests {
         }
     }
 
-    /// Every backend down → one error naming each one that was tried and why,
-    /// rather than only the last failure.
     #[tokio::test]
     async fn exhausted_chain_reports_every_backend() {
         let chain = WebSearchChain::new(vec![

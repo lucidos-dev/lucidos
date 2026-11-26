@@ -1,6 +1,3 @@
-//! Leaves the loopback CA signs: the gateway's, minted in memory, and the
-//! frontend preview's, written to disk for Vite.
-
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -17,19 +14,13 @@ use rustls::sign::CertifiedKey;
 
 use crate::LoopbackCa;
 
-/// How long a leaf is valid: well under Apple's 825-day cap. The resolver
-/// re-mints at half of it.
 pub const LEAF_LIFETIME: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
-/// How far `notBefore` lies in the past, so a client whose clock runs a little
-/// slow still accepts a fresh certificate.
 pub(crate) const BACKDATE: Duration = Duration::from_secs(60 * 60);
 
-/// The preview leaf's file names inside the directory it is written to.
 const PREVIEW_CERT_FILE: &str = "preview-cert.pem";
 const PREVIEW_KEY_FILE: &str = "preview-key.pem";
 
-/// A leaf for `localhost`, 127.0.0.1 and ::1.
 pub struct Leaf {
     pub cert_der: CertificateDer<'static>,
     pub cert_pem: String,
@@ -50,7 +41,6 @@ impl Leaf {
     }
 }
 
-/// Where a written preview leaf lives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviewLeaf {
     pub cert: PathBuf,
@@ -58,7 +48,6 @@ pub struct PreviewLeaf {
 }
 
 impl LoopbackCa {
-    /// A fresh leaf for every loopback name, valid from `now`.
     pub fn mint_leaf(&self, now: SystemTime) -> io::Result<Leaf> {
         let names = vec![
             SanType::DnsName("localhost".try_into().map_err(io::Error::other)?),
@@ -92,10 +81,6 @@ impl LoopbackCa {
         })
     }
 
-    /// Write a fresh leaf into `dir` for the frontend preview, and say where.
-    ///
-    /// The one leaf key on disk: Vite reads its certificate from files. The
-    /// key is 0600 from creation, inside a storage root.
     pub fn write_preview_leaf(&self, dir: &Path, now: SystemTime) -> io::Result<PreviewLeaf> {
         lucidos_home::ensure_storage_root(dir)?;
         let leaf = self.mint_leaf(now)?;
@@ -118,12 +103,6 @@ impl LoopbackCa {
 type Clock = Box<dyn Fn() -> SystemTime + Send + Sync>;
 type Report = Box<dyn Fn(&io::Error) + Send + Sync>;
 
-/// The gateway's loopback certificate, re-minted on the first handshake past
-/// half its life. No timer: a gateway that serves nobody mints nothing.
-///
-/// A failed re-mint keeps the current leaf until it expires, and reports the
-/// error. Past `notAfter` it serves nothing, so the handshake fails rather
-/// than presenting an expired certificate.
 pub struct LeafResolver {
     ca: LoopbackCa,
     clock: Clock,
@@ -138,7 +117,6 @@ struct Served {
 }
 
 impl LeafResolver {
-    /// Mint the first leaf now. `report` hears every later re-mint failure.
     pub fn new(
         ca: LoopbackCa,
         report: impl Fn(&io::Error) + Send + Sync + 'static,
@@ -156,7 +134,6 @@ impl LeafResolver {
         })
     }
 
-    /// The certificate a handshake gets now, renewing it when due.
     pub fn current(&self) -> Option<Arc<CertifiedKey>> {
         let now = (self.clock)();
         let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
@@ -186,8 +163,6 @@ impl std::fmt::Debug for LeafResolver {
 }
 
 impl LeafResolver {
-    /// A server config presenting this resolver's leaf, offering h2 and
-    /// http/1.1 as every TLS listener of the gateway does.
     pub fn into_server_config(self) -> io::Result<Arc<rustls::ServerConfig>> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut config = rustls::ServerConfig::builder_with_provider(provider)

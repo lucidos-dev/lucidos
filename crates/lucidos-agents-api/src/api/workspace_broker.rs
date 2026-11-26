@@ -1,24 +1,3 @@
-//! The *workspace broker*: routes an agent calls to manage workspaces on this
-//! machine (ADR 0671).
-//!
-//! Any workspace: create, stop, start, autostart, rename. A *machine-made
-//! workspace* only: delete, and restore from Trash. Nothing restarts.
-//!
-//! - **The token stays here.** The engine calls its gateway with the local
-//!   token. A refusal passes back only the gateway's message, redacted.
-//! - **Agents only.** A caller needs a thread-bound origin token. The owner
-//!   uses the picker.
-//! - **A machine-made workspace is the agent's.** Stop, start, autostart and
-//!   rename on one act at once, with no card. Each records
-//!   `MachineMadeWorkspaceChanged` on the caller's thread first.
-//! - **Every other call needs the user's permission.** It spends a live
-//!   permission for its verb and target. With none, it prepares a permission
-//!   request and refuses with `permission_required`, and the agent asks with
-//!   the request id. Create, delete and Trash restore always need one,
-//!   whoever made the workspace.
-//! - **The gateway decides.** The engine checks the target first, so the
-//!   user is never asked about an act the gateway would refuse.
-
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -108,7 +87,6 @@ async fn device_session(
         .await
 }
 
-/// One Trash row, projected: serde drops what the gateway knows beyond this.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct TrashRow {
     id: String,
@@ -119,24 +97,17 @@ struct TrashRow {
     machine_made: bool,
 }
 
-/// What a broker call came to.
 enum Outcome {
-    /// The gateway acted. Holds its success body.
     Done(String),
-    /// No live permission: the request is prepared under this id.
     NeedsPermission(String),
 }
 
-/// Who decides an agent's act on a workspace.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(super) enum Whose {
-    /// The workspace is the agent's: the call acts with no card.
     Agents,
     Users,
 }
 
-/// Only the reversible verbs on a machine-made workspace are the agent's. A
-/// snapshot restore is reversible: it saves a verified recovery snapshot first.
 pub(super) fn whose(verb: Action, machine_made: bool) -> Whose {
     let reversible = matches!(
         verb,
@@ -153,15 +124,12 @@ pub(super) fn whose(verb: Action, machine_made: bool) -> Whose {
     }
 }
 
-/// Where a broker call runs: the event bus, the gateway, and this engine's own
-/// workspace slug, which `created_by` and the delete caller name.
 struct Broker<'a> {
     bus: &'a EventBus,
     port: String,
     own: String,
 }
 
-/// One broker call's verb, target and the agent's reason.
 struct Call<'a> {
     verb: Action,
     target: &'a str,
@@ -188,7 +156,6 @@ impl<'a> Broker<'a> {
         serde_json::json!({ "workspace_id": self.own, "thread_id": caller.to_string() })
     }
 
-    /// A verb on a workspace the gateway lists. Delete also needs it machine-made.
     async fn on_listed(
         &self,
         headers: &HeaderMap,
@@ -360,7 +327,6 @@ impl<'a> Broker<'a> {
     }
 }
 
-/// Record an act on the agent's own workspace. A failed record refuses the act.
 pub(super) async fn record_agents_act(
     bus: &EventBus,
     caller: Uuid,
@@ -579,7 +545,6 @@ async fn restart() -> ApiError {
     ApiError::new(StatusCode::METHOD_NOT_ALLOWED, NO_RESTART)
 }
 
-/// The existing gateway control route each reused verb calls.
 fn control_suffix(verb: Action) -> &'static str {
     match verb {
         Action::StopWorkspace => "stop",
@@ -589,9 +554,6 @@ fn control_suffix(verb: Action) -> &'static str {
     }
 }
 
-/// The engine-side delete and restore check of the verb split; `whose` reads
-/// the same flag for the no-card verbs. The gateway's listing computes
-/// `machine_made`, so the four origins are never restated here.
 fn refuse_unless_machine_made(verb: Action, machine_made: bool) -> Result<(), ApiError> {
     if machine_made {
         return Ok(());
@@ -606,8 +568,6 @@ fn refuse_unless_machine_made(verb: Action, machine_made: bool) -> Result<(), Ap
     ))
 }
 
-/// Refuse a display name another workspace carries, matched as the gateway
-/// matches it, so the owner never allows a create or rename it would refuse.
 fn refuse_a_taken_name(
     listing: &[ListedWorkspace],
     name: &str,

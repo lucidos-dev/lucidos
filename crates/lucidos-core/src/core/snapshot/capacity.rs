@@ -1,13 +1,9 @@
-//! Conservative file-volume reservation before recovery capture and mutation.
 use super::{
     store::{check_floor, volume_space},
     BoxError,
 };
 use std::{collections::BTreeMap, os::unix::fs::MetadataExt, path::Path};
 
-/// Count a volume only once when the external store, workspace and linked data
-/// share it. Reserve enough for both forward and rollback staging; renaming
-/// retained originals into trash does not require another copy of their bytes.
 pub fn preflight(
     store: &Path,
     workspace: &Path,
@@ -32,7 +28,6 @@ pub(super) fn preflight_database(
         entry.1 = entry.1.checked_add(bytes).ok_or("snapshot_disk_floor")?;
         Ok(())
     };
-    // Unpacked archive staging plus a conservative uncompressed recovery copy.
     reserve(
         store,
         staging.checked_add(current).ok_or("snapshot_disk_floor")?,
@@ -46,8 +41,6 @@ pub(super) fn preflight_database(
     if let Some((database, url)) = database {
         reserve(store, database.recovery_bytes)?;
         if let Some(paths) = database.native_paths()? {
-            // One full replay reservation per distinct database volume. WAL
-            // and tablespaces may reside on different mounts.
             let mut devices = std::collections::BTreeSet::new();
             for path in paths {
                 if devices.insert(std::fs::metadata(path)?.dev()) {
@@ -59,7 +52,7 @@ pub(super) fn preflight_database(
                 sum.checked_add(*bytes).ok_or("snapshot_disk_floor")
             })?;
             database.check_docker(url, host_total, store)?;
-            // A Docker VM image can grow on any host volume. Without an
+            // INVARIANT: A Docker VM image can grow on any host volume. Without an
             // authoritative backing-file mapping, conservatively charge replay
             // to every involved host volume as well as the container volumes.
             for (_, bytes) in volumes.values_mut() {

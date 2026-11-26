@@ -2,7 +2,7 @@ import { PREF_EXTERNAL_LINK_TARGET, PREF_IMAGE_MODEL } from '@lucidos/preference
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { aliasRetiredSettingsAnchor, currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, settingsLinkedFragment, settingsSubviewLabel, repositories, knownOAuthProviders, oauthConnectPrefill, agentSandboxUnavailable, agentSandboxTruncationUnguarded, agentSandboxMetadataUnguarded } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { currentAgentBrandColours, setAgentBrandColours, setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCodingAgentAutoAnswer, setCodingAgentAutoAnswer, currentAgentsUnsandboxed, setAgentsUnsandboxed, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { currentAgentIconColors, setAgentIconColors, type AgentIconColors, setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCodingAgentAutoAnswer, setCodingAgentAutoAnswer, currentAgentsUnsandboxed, setAgentsUnsandboxed, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 
 import { openScaleModal } from '../shared/scaleModalState';
@@ -143,6 +143,12 @@ const THEME_MODE_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
   DEFAULT_THEME_MODE,
   ...THEME_MODES.filter((mode) => mode !== DEFAULT_THEME_MODE),
 ].map((mode) => ({ value: mode, label: THEME_MODE_LABELS[mode] }));
+
+const AGENT_ICON_COLOR_OPTIONS: Array<{ value: AgentIconColors; label: string }> = [
+  { value: 'brand', label: 'Brand' },
+  { value: 'theme', label: 'Theme' },
+  { value: 'muted', label: 'Muted' },
+];
 
 const MOTION_LABELS: Record<MotionPref, string> = {
   system: 'System',
@@ -1291,6 +1297,7 @@ export function SettingsView() {
     const motion = motionPreference.value;
     const themeEffects = themeEffectsPreference.value;
     const font = currentFontFamily();
+    const iconColors = currentAgentIconColors();
 
     return (
       <>
@@ -1326,17 +1333,32 @@ export function SettingsView() {
             </div>
           </div>
           <ThemePicker />
-          <div class="settings-row" data-search-anchor="appearance:agent-brand-colours">
-            <span class="settings-row-label">Agent brand colours</span>
-            <div class="segmented-control" role="group" aria-label="Agent brand colours">
-              {[true, false].map(enabled => (
+          <div class="settings-row" data-search-anchor="appearance:agent-icon-colors">
+            <span class="settings-row-label">
+              Agent icon colors
+              <Explainer title="Agent icon colors">
+                <p>
+                  How the Claude, Codex and Lucidos icons look in the thread
+                  drawer, the thread pane and navigation history on this
+                  device.
+                </p>
+                <p>
+                  Brand draws each agent in its own colors. Theme draws them
+                  all in the theme's accent color, and Muted in its muted text
+                  color. A theme can tune all three.
+                </p>
+              </Explainer>
+            </span>
+            <div class="segmented-control" role="group" aria-label="Agent icon colors">
+              {AGENT_ICON_COLOR_OPTIONS.map(option => (
                 <button
+                  key={option.value}
                   type="button"
-                  aria-pressed={currentAgentBrandColours() === enabled}
-                  class={`segmented-btn ${currentAgentBrandColours() === enabled ? 'active' : ''}`}
-                  onClick={() => void setAgentBrandColours(enabled)}
+                  aria-pressed={iconColors === option.value}
+                  class={`segmented-btn ${iconColors === option.value ? 'active' : ''}`}
+                  onClick={() => void setAgentIconColors(option.value)}
                 >
-                  {enabled ? 'On' : 'Off'}
+                  {option.label}
                 </button>
               ))}
             </div>

@@ -1,4 +1,3 @@
-//! Choose the direct owner path or the agent's bounded engine path once.
 use crate::{
     gateway, http,
     workspace::{self, BoxError},

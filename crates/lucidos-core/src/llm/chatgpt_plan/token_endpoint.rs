@@ -1,5 +1,3 @@
-//! OpenAI's token endpoint: the code exchange, the refresh, and revocation.
-
 use chrono::{DateTime, Utc};
 
 use super::auth_server::{http_client, AuthServer};
@@ -7,11 +5,8 @@ use crate::core::oauth::TokenResponse;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Longest raw body echoed into an error.
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
-/// The refresh error codes that end a sign-in. OpenAI's errors page lists
-/// them as "unusable refresh token": clear the tokens and sign in again.
 const SIGN_IN_ENDING_REFRESH_CODES: [&str; 6] = [
     "invalid_grant",
     "invalid_refresh_token",
@@ -21,14 +16,12 @@ const SIGN_IN_ENDING_REFRESH_CODES: [&str; 6] = [
     "refresh_token_reused",
 ];
 
-/// Tokens the token endpoint granted.
 #[derive(Clone)]
 pub(super) struct GrantedTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
     pub token_expiry: Option<DateTime<Utc>>,
-    /// OpenAI's `earliest_refresh_at`. A refresh waits for it.
     pub refresh_due_at: Option<DateTime<Utc>>,
 }
 
@@ -45,8 +38,6 @@ impl std::fmt::Debug for GrantedTokens {
     }
 }
 
-/// An error answer that names a code, in OAuth's shape (`"error": "code"`)
-/// or OpenAI's (`"error": {"code": ...}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TokenRefusal {
     pub status: u16,
@@ -74,8 +65,6 @@ impl TokenRefusal {
         })
     }
 
-    /// Whether a refresh refused with this code can never succeed, so the
-    /// tokens are cleared.
     pub fn ends_sign_in(&self) -> bool {
         SIGN_IN_ENDING_REFRESH_CODES.contains(&self.code.as_str())
     }
@@ -91,16 +80,12 @@ impl std::fmt::Display for TokenRefusal {
     }
 }
 
-/// What the token endpoint answered.
 #[derive(Debug)]
 pub(super) enum TokenReply {
     Granted(GrantedTokens),
     Refused(TokenRefusal),
 }
 
-/// POST `form` to the token endpoint. An answer naming an error code is
-/// [`TokenReply::Refused`]. A network failure or an answer with no code is
-/// an `Err`: temporary, so nothing is cleared for it.
 pub(super) async fn post_token_form(
     auth: &AuthServer,
     form: &[(&str, &str)],
@@ -149,7 +134,6 @@ fn granted_from(value: serde_json::Value) -> Result<GrantedTokens, BoxError> {
     })
 }
 
-/// Revoke `token` at OpenAI, best effort: a sign-out has already forgotten it.
 pub(super) async fn revoke(auth: AuthServer, client_id: String, token: String) {
     let form = [
         ("token", token.as_str()),
@@ -191,8 +175,6 @@ mod tests {
         assert!((granted.token_expiry.unwrap() - Utc::now()).num_seconds() > 3500);
     }
 
-    /// The errors page names the codes but not the body shape, so both the
-    /// OAuth shape and OpenAI's object shape are read.
     #[test]
     fn a_refusal_reads_its_code_from_either_shape() {
         let oauth = TokenRefusal::from_body(

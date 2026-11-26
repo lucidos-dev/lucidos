@@ -1,13 +1,3 @@
-//! Build the engine's active `Arc<dyn LlmProvider>` from current credentials,
-//! preferences, and env — the single construction path shared by startup
-//! (`main.rs`) and the runtime config subscriber (`spawn_provider_config_subscriber`).
-//!
-//! The decision of *which* provider to install lives in
-//! [`crate::llm::select_provider`] (unit-tested matrix); this module resolves
-//! that decision's boolean inputs from the DB + env and maps the chosen
-//! [`ProviderSelection`] onto a concrete provider. Factoring it out of `main.rs`
-//! means a runtime hot-swap produces a provider byte-identical to a fresh boot.
-
 use crate::core::prefs::{self, parse_flag, Flag, Pref};
 use crate::core::{AuthType, CredentialStore};
 use crate::llm::chatgpt_plan::{ChatGptPlanAccess, ChatGptPlanAccountStore};
@@ -27,18 +17,9 @@ use crate::llm::{
 use sqlx::PgPool;
 use std::sync::Arc;
 
-/// Credential service names that, when created/updated/deleted, change which LLM
-/// provider is installed. Vertex is env/gcloud-based (no credential) and
-/// hot-swaps its region via `spawn_vertex_region_subscriber` instead — so it is
-/// deliberately absent here. The credential subscriber filters on this set.
 pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
     ["openai", "anthropic", "openrouter", "xai", "local"];
 
-/// The eight per-provider enable switches, in the order [`ProviderSwitches`]
-/// declares them.
-///
-/// [`PROVIDER_PREFERENCE_KEYS`] is built from this list, so the config
-/// subscriber cannot end up watching a subset of it.
 pub const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 8] = [
     &prefs::PROVIDER_ENABLED_VERTEX,
     &prefs::PROVIDER_ENABLED_ANTHROPIC,
@@ -50,7 +31,7 @@ pub const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 8] = [
     &prefs::PROVIDER_ENABLED_CHATGPT_PLAN,
 ];
 
-/// Preference keys that, when changed, change which LLM provider is installed.
+/// INVARIANT: Preference keys that, when changed, change which LLM provider is installed.
 /// The same subscriber that watches [`PROVIDER_CREDENTIAL_SERVICES`] filters on
 /// this set, so a provider configured by a preference hot-swaps exactly like one
 /// configured by a credential. `opencode-free` has no credential at all, and the
@@ -71,7 +52,7 @@ pub const PROVIDER_PREFERENCE_KEYS: [&str; 11] = [
     PROVIDER_ENABLED_SWITCHES[7].key(),
 ];
 
-/// The per-provider enable switches, resolved from the `provider_enabled_*`
+/// INVARIANT: The per-provider enable switches, resolved from the `provider_enabled_*`
 /// preferences (Settings → Providers).
 ///
 /// A switch is a VETO over a provider that is otherwise configured. It never
@@ -108,7 +89,7 @@ impl Default for ProviderSwitches {
     }
 }
 
-/// Read the eight switches, defaulting any unreadable one to its default (on).
+/// INVARIANT: Read the eight switches, defaulting any unreadable one to its default (on).
 /// The handle read logs a failed read. Losing a provider over a transient query
 /// error is worse than honouring the veto one build late.
 pub async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
@@ -124,7 +105,7 @@ pub async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
     }
 }
 
-/// Inputs the active-provider build needs beyond the DB pool. Fixed at boot
+/// INVARIANT: Inputs the active-provider build needs beyond the DB pool. Fixed at boot
 /// (default model, mock flag, Vertex project id / region handle / token cache,
 /// and the shared model→provider registry) and
 /// reused verbatim by the runtime credential subscriber so a hot-swap is
@@ -134,7 +115,7 @@ pub async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
 #[derive(Clone)]
 pub struct ProviderBuildContext {
     pub default_model: String,
-    /// `LUCIDOS_MODEL == "mock"`. When true the subscriber is never spawned;
+    /// INVARIANT: `LUCIDOS_MODEL == "mock"`. When true the subscriber is never spawned;
     /// passing `false` (the subscriber always does) guarantees the build can
     /// never return [`ProviderSelection::Mock`].
     pub model_is_mock: bool,
@@ -142,34 +123,20 @@ pub struct ProviderBuildContext {
     pub vertex_location: crate::llm::vertex::LocationHandle,
     pub vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
     pub model_registry: crate::llm::model_registry::ModelRegistry,
-    /// The not-found answers the router has seen. A shared handle, so a
-    /// rebuilt router keeps the window.
     pub not_served: crate::llm::not_served::NotServedLedger,
-    /// Makes the Claude gateway access. `None` at boot, before the
+    /// INVARIANT: Makes the Claude gateway access. `None` at boot, before the
     /// event bus exists: a signed-in gateway then counts as configured but is
     /// left out, and the engine rebuilds once it can supply one.
     pub claude_gateway_access: Option<GatewayAccessFactory>,
-    /// The ChatGPT plan's token source and limit pause. `None` at boot, as
-    /// [`Self::claude_gateway_access`] is, for the same reason.
     pub chatgpt_plan_access: Option<ChatGptPlanAccess>,
 }
 
-/// Providers installed together at boot and on runtime configuration changes.
 pub struct ProviderBuildOutcome {
     pub llm: Arc<dyn LlmProvider>,
-    /// Search uses the same credentials and swaps in lockstep with chat.
     pub web_search: Arc<WebSearchChain>,
-    /// The selected provider kind, carried for logging.
     pub selection: ProviderSelection,
 }
 
-/// The direct providers resolved from credentials + env, plus the web-search
-/// backends built from the same material.
-///
-/// Search backends are produced *here*, alongside the credentials they need,
-/// rather than reconstructed later from the built providers — those keep their
-/// auth private, and adding getters to hand a key back out would widen the
-/// surface a secret travels across for no benefit.
 struct DirectProviders {
     openai: Option<OpenAiProvider>,
     anthropic: Option<AnthropicProvider>,
@@ -178,18 +145,15 @@ struct DirectProviders {
     opencode_free: Option<OpenAiProvider>,
     local: Option<OpenAiProvider>,
     claude_gateway: Option<AnthropicProvider>,
-    /// A signed-in gateway is configured, whether or not it could be built yet.
     claude_gateway_signed_in: bool,
-    /// The ChatGPT plan provider, sharing its access and pause with plan search.
     chatgpt_plan: Option<OpenAiProvider>,
-    /// A ChatGPT plan sign-in is stored, whether or not it could be built yet.
     chatgpt_plan_signed_in: bool,
-    /// Search backends in chain order: Anthropic, OpenAI key, then plan. Vertex is
+    /// INVARIANT: Search backends in chain order: Anthropic, OpenAI key, then plan. Vertex is
     /// prepended by the caller, which owns the Vertex config.
     search_backends: Vec<Arc<dyn WebSearchProvider>>,
 }
 
-/// A credential read that FAILED, as distinct from one that found nothing.
+/// INVARIANT: A credential read that FAILED, as distinct from one that found nothing.
 ///
 /// The two must never collapse into `None` unremarked. A failed read that
 /// falls through to the environment runs later turns on whatever account that
@@ -202,17 +166,11 @@ struct DirectProviders {
 /// key that was set. Loud and working beats silent either way.
 struct CredentialUnreadable;
 
-/// Read a provider credential as an `(auth_type, auth_value)` pair.
-///
-/// `Ok(None)` is "nothing stored". `Err` is "could not read", which the caller
-/// resolves from the environment while saying so. `display_name` names it.
 async fn read_credential_pair(
     pool: &PgPool,
     service: &str,
     display_name: &str,
 ) -> Result<Option<(AuthType, String)>, CredentialUnreadable> {
-    // A secret reference that cannot be read is a failed read too, never
-    // "nothing stored": it gets the same warning before the fallback.
     let read = match CredentialStore::get(pool, service).await {
         Ok(Some(c)) => match c.secret(pool).await {
             Ok(secret) => return Ok(Some((c.auth_type, secret))),
@@ -231,7 +189,7 @@ async fn read_credential_pair(
     Err(CredentialUnreadable)
 }
 
-/// The stored half of the provider material: credentials and preferences.
+/// INVARIANT: The stored half of the provider material: credentials and preferences.
 ///
 /// `switches` arrives as the user's vetoes, and leaves with `local` forced off
 /// if its base URL could not be read. Local is the one provider whose address
@@ -252,26 +210,17 @@ struct StoredInputs {
     local_base: Option<String>,
     local_key: Option<StoredLocalKey>,
     claude_gateway_url: Option<String>,
-    /// The gateway origin the stored sign-in came from.
     claude_gateway_issuer: Option<String>,
     chatgpt_plan_signed_in: bool,
     switches: ProviderSwitches,
 }
 
-/// The stored `local` key and the hosts it may be sent to.
-///
-/// `local_base_url` is a preference, not part of the credential, so the key
-/// must never follow it on trust (ADR 0144 decision 4).
 struct StoredLocalKey {
     value: String,
     base_urls: Vec<String>,
 }
 
-/// Read every stored credential and preference the build needs, in one place.
 async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> StoredInputs {
-    // An unreadable read leaves the field `None`, so the env fallback still
-    // applies. `read_credential_pair` has already logged which provider it
-    // was and that the account may differ.
     let mut stored = StoredInputs {
         anthropic: read_credential_pair(pool, "anthropic", "Anthropic")
             .await
@@ -288,12 +237,12 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
         ..StoredInputs::default()
     };
 
-    // OpenCode Free is a preference, not a credential. Nothing is read from the
+    // INVARIANT: OpenCode Free is a preference, not a credential. Nothing is read from the
     // credential store and nothing is sent as a bearer. An unreadable
     // preference costs the tier, never a key.
     stored.opencode_free_pref = prefs::OPENCODE_FREE_ENABLED.stored(pool).await;
 
-    // Local OpenAI-compatible: the `local_base_url` preference plus an optional
+    // INVARIANT: Local OpenAI-compatible: the `local_base_url` preference plus an optional
     // `local` credential. Either read failing drops the provider, because the
     // default base URL would send a stored key to another host.
     match prefs::LOCAL_BASE_URL.try_stored(pool).await {
@@ -326,7 +275,7 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
         }
     }
 
-    // The Claude gateway: its URL and the stored sign-in's issuer, never its
+    // INVARIANT: The Claude gateway: its URL and the stored sign-in's issuer, never its
     // tokens. Either read failing leaves the gateway out, with nothing sent.
     match prefs::CLAUDE_GATEWAY_URL.try_stored(pool).await {
         Ok(url) => stored.claude_gateway_url = url,
@@ -343,7 +292,6 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
         ),
     }
 
-    // The ChatGPT plan: whether a sign-in is stored, never its tokens.
     match ChatGptPlanAccountStore::is_signed_in(pool).await {
         Ok(signed_in) => stored.chatgpt_plan_signed_in = signed_in,
         Err(e) => crate::log_legacy!(
@@ -356,11 +304,6 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
     stored
 }
 
-/// Build a provider only when its switch is on.
-///
-/// The veto has to gate the BUILDER, not its result. `build_x(..).filter(..)`
-/// logs "provider configured" for a provider the router never receives. That
-/// is the line a user reads when a switch looks like it did nothing.
 fn if_enabled<T>(enabled: bool, build: impl FnOnce() -> Option<T>) -> Option<T> {
     if enabled {
         build()
@@ -369,35 +312,13 @@ fn if_enabled<T>(enabled: bool, build: impl FnOnce() -> Option<T>) -> Option<T> 
     }
 }
 
-/// The keys found outside the stored credentials, each below its stored one.
 #[derive(Default)]
 struct EnvFallbacks {
-    /// `OPENAI_API_KEY`.
     openai: Option<String>,
-    /// The Codex CLI's auth file (apikey login), below `OPENAI_API_KEY`.
     openai_codex: Option<String>,
-    /// `ANTHROPIC_API_KEY`.
     anthropic: Option<String>,
 }
 
-/// Resolve the direct (OpenAI-wire + Anthropic) providers from credentials +
-/// env. `pool == None` means the DB is unavailable (a degraded boot): the env
-/// fallbacks (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-/// `LUCIDOS_OPENROUTER_API_KEY`, `LUCIDOS_LOCAL_*`) and the Codex-detected
-/// OpenAI key all still apply, but stored credentials and the `local_base_url`
-/// preference can't be read. Every field degrades to `None` / an omitted
-/// backend on a BUILD error, so the engine still comes up on its other
-/// providers. A stored credential that cannot be READ is a different case. It
-/// falls through to the env fallback, with a log line: see
-/// [`CredentialUnreadable`].
-///
-/// ONE build path serves both. The degraded boot used to re-spell the seven
-/// builders, the search chain and the result literal. That chain's order is a
-/// cost decision, so a reorder could have reached one copy only.
-///
-/// `switches` vetoes a provider the user has switched off, and takes its
-/// credential's search backend down with it: a provider that is off must not
-/// keep answering `web_search` on the key that is off with it.
 async fn resolve_direct_providers(
     pool: Option<&PgPool>,
     default_model: &str,
@@ -426,33 +347,20 @@ async fn resolve_direct_providers(
         switches,
     } = match pool {
         Some(pool) => read_stored_inputs(pool, switches).await,
-        // No DB access, but the env-var + Codex fallbacks must still work. The
-        // switches live in the preferences table, so on this path they are the
-        // caller's all-on default and there is nothing stored to veto.
         None => StoredInputs {
             switches,
             ..StoredInputs::default()
         },
     };
 
-    // Anthropic: a stored `anthropic` credential wins; otherwise the env
-    // fallback. Resolved once and held past provider construction so the search
-    // backend is built from the same auth (`AnthropicProvider` keeps its copy
-    // private), which is also what stops the two disagreeing about which source
-    // won. The veto is applied to the resolved AUTH rather than to the built
-    // provider, so the search backend below drops with it.
     let anthropic_auth = resolve_anthropic_auth(anthropic_credential, anthropic_env_key)
         .filter(|_| switches.anthropic);
     let anthropic = build_anthropic_provider(anthropic_auth.clone(), default_model);
 
-    // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
-    // Resolved once and reused: the provider needs it, and so does the OpenAI
-    // search backend. Vetoed at the key, for the reason given above Anthropic's.
     let openai_key = resolve_openai_api_key(openai_credential, openai_env_key, openai_codex_key)
         .filter(|_| switches.openai);
     let openai = build_openai_provider(openai_key.clone(), default_model);
 
-    // OpenRouter and xAI: a stored credential wins; otherwise the env fallback.
     let openrouter = if_enabled(switches.openrouter, || {
         build_openrouter_provider(
             openrouter_credential,
@@ -470,13 +378,10 @@ async fn resolve_direct_providers(
 
     let opencode_free = build_opencode_free_provider(opencode_free_pref, default_model);
 
-    // Local OpenAI-compatible: base URL from the `local_base_url` pref (env /
-    // default applied inside the builder) and an optional `local` credential.
     let local = if_enabled(switches.local, || {
         build_local_provider(local_base, local_key, default_model)
     });
 
-    // The Claude gateway serves no web search: it promises no server tools.
     let claude_gateway_origin = if_enabled(switches.claude_gateway, || {
         signed_in_gateway(claude_gateway_url, claude_gateway_issuer)
     });
@@ -490,7 +395,7 @@ async fn resolve_direct_providers(
         build_chatgpt_plan_provider(chatgpt_plan_access, default_model)
     });
 
-    // Chain order: Anthropic before OpenAI, because Anthropic's server tool has
+    // INVARIANT: Chain order: Anthropic before OpenAI, because Anthropic's server tool has
     // no per-call fee while OpenAI's Responses web search bills per call on top
     // of the tokens the results consume.
     let mut search_backends: Vec<Arc<dyn WebSearchProvider>> =
@@ -529,7 +434,7 @@ async fn resolve_direct_providers(
     }
 }
 
-/// Last-resort search model per provider, used when the configured chat model
+/// INVARIANT: Last-resort search model per provider, used when the configured chat model
 /// belongs to a *different* provider. Small, current, broadly-available ids —
 /// the search call is a short summary over the results, so the cheapest capable
 /// model is the right tier. `gpt-6.2-sol` additionally satisfies OpenAI's
@@ -537,7 +442,7 @@ async fn resolve_direct_providers(
 const ANTHROPIC_FALLBACK_SEARCH_MODEL: &str = "claude-haiku-5-5";
 const OPENAI_FALLBACK_SEARCH_MODEL: &str = "gpt-6.2-sol";
 
-/// A model id valid for `provider`, for the one-shot search call.
+/// INVARIANT: A model id valid for `provider`, for the one-shot search call.
 ///
 /// Prefers the configured chat model, which is known to work for this user and
 /// keeps search on the tier they picked. **But only when that model has a route
@@ -573,9 +478,6 @@ fn search_model_for(
     }
 }
 
-/// The Anthropic search backend for resolved auth, or `None` when Anthropic is
-/// not configured. Shared by the DB-up and DB-down paths so both honor the
-/// `ANTHROPIC_API_KEY` fallback identically.
 fn anthropic_search_backend(
     resolved_auth: Option<(AnthropicAuth, AnthropicAuthSource)>,
     registry: &crate::llm::model_registry::ModelRegistry,
@@ -597,14 +499,6 @@ fn anthropic_search_backend(
     }
 }
 
-/// The model the OpenAI search backend runs on.
-///
-/// [`search_model_for`]'s value when it satisfies `uses_responses_api`, and
-/// the fallback constant otherwise. `web_search` exists ONLY on the Responses
-/// API. A reused Chat-Completions chat model such as `gpt-4o` would post the
-/// tool to `/responses` for a model the engine says is not served there. An
-/// OpenAI-only workspace has nothing behind it in the chain, which leaves the
-/// backend dead with no fallback.
 fn openai_search_model(
     registry: &crate::llm::model_registry::ModelRegistry,
     chat_model: &str,
@@ -612,7 +506,6 @@ fn openai_search_model(
     responses_search_model(registry, crate::llm::ProviderKind::OpenAi, chat_model)
 }
 
-/// Responses-only model selection shared by platform and plan search.
 fn responses_search_model(
     registry: &crate::llm::model_registry::ModelRegistry,
     provider: crate::llm::ProviderKind,
@@ -626,9 +519,6 @@ fn responses_search_model(
     }
 }
 
-/// The OpenAI search backend for a resolved key, or `None` when no key is
-/// configured. Shared by the DB-up and DB-down paths so both honor the
-/// `OPENAI_API_KEY` / Codex-CLI fallbacks identically.
 fn openai_search_backend(
     resolved_key: Option<(String, OpenAiKeySource)>,
     registry: &crate::llm::model_registry::ModelRegistry,
@@ -645,7 +535,7 @@ fn openai_search_backend(
     }
 }
 
-/// Build the active LLM provider from the current credentials/prefs + env,
+/// INVARIANT: Build the active LLM provider from the current credentials/prefs + env,
 /// mirroring the startup decision exactly (same [`select_provider`] branches).
 /// Used by `main.rs` at boot and by the runtime credential subscriber to
 /// hot-swap. `pool == None` is the degraded (DB-down) boot path — see
@@ -665,26 +555,16 @@ pub async fn build_active_provider(
             llm: Arc::new(crate::llm::mock::MockProvider::new(
                 ctx.default_model.clone(),
             )),
-            // Mock is the E2E opt-in; there is no credential to search with, so
-            // web_search reports the unconfigured error rather than reaching the
-            // network from a test run.
             web_search: Arc::new(WebSearchChain::empty()),
             selection: ProviderSelection::Mock,
         });
     }
 
-    // The user's per-provider switches, read once and applied to every provider
-    // this build resolves. Without a pool they are the all-on default, so a
-    // degraded boot keeps whatever the env configures.
     let switches = match pool {
         Some(p) => read_provider_switches(p).await,
         None => ProviderSwitches::default(),
     };
 
-    // Vertex (env/gcloud-based, not a credential). Reuse the engine's warm
-    // token cache so a rebuild doesn't discard cached access tokens; fall back
-    // to a fresh cache only when none exists (project configured but no cache —
-    // not reachable for a non-mock boot, defensive).
     let vertex_on = !ctx.vertex_project_id.is_empty() && switches.vertex;
     let vertex = if vertex_on {
         let cache = ctx
@@ -703,13 +583,10 @@ pub async fn build_active_provider(
 
     let env = EnvFallbacks {
         openai: std::env::var(crate::llm::OPENAI_API_KEY_ENV).ok(),
-        // Lowest-precedence OpenAI key: auto-detected from the Codex CLI's auth
+        // INVARIANT: Lowest-precedence OpenAI key: auto-detected from the Codex CLI's auth
         // file, the parallel of Vertex reading the gcloud ADC file. Read fresh
         // each build (boot + credential-subscriber hot-swap); never persisted.
         openai_codex: crate::llm::openai::codex_detect::load(),
-        // The Anthropic env fallback, below a stored `anthropic` credential.
-        // Read here (not inside the resolver) so the precedence stays pure over
-        // its inputs and unit-testable without touching process env.
         anthropic: std::env::var("ANTHROPIC_API_KEY").ok(),
     };
     let DirectProviders {
@@ -748,12 +625,12 @@ pub async fn build_active_provider(
         has_chatgpt_plan: chatgpt_plan_signed_in,
     });
 
-    // Vertex leads the chain so an existing Vertex workspace keeps the exact
+    // INVARIANT: Vertex leads the chain so an existing Vertex workspace keeps the exact
     // search behavior it had. Built from the engine's Vertex config rather than
     // from the `vertex` provider above, which is about to be moved into the
     // router — and which carries the chat model, not the grounding one.
     let mut backends: Vec<Arc<dyn WebSearchProvider>> = Vec::new();
-    // `vertex_on`, not the project id alone: a switched-off Vertex must not keep
+    // INVARIANT: `vertex_on`, not the project id alone: a switched-off Vertex must not keep
     // grounding web searches on the credentials it was switched off with.
     if vertex_on {
         let cache = ctx
@@ -776,9 +653,6 @@ pub async fn build_active_provider(
             "[Startup] No web search backend configured — web_search will report how to enable it"
         );
     } else {
-        // Log the model per backend: the cross-provider case silently picks a
-        // different model than the chat one, and that substitution should be
-        // visible when a search misbehaves.
         crate::log_legacy!(
             "[Startup] Web search backends: {}",
             web_search
@@ -794,8 +668,6 @@ pub async fn build_active_provider(
     }
 
     let llm: Arc<dyn LlmProvider> = match selection {
-        // Unreachable: `model_is_mock` is false here, and `select_provider` only
-        // returns Mock when that input is true. Guarded above regardless.
         ProviderSelection::Mock => {
             return Ok(ProviderBuildOutcome {
                 llm: Arc::new(crate::llm::mock::MockProvider::new(
@@ -837,13 +709,6 @@ pub async fn build_active_provider(
     })
 }
 
-/// Build the direct-Anthropic provider from already-resolved auth, logging
-/// which source it came from (the source name, never the secret) and degrading
-/// to `None` (rather than aborting) if the reqwest client can't be built.
-///
-/// Takes the resolved auth rather than resolving it, so the caller can hand the
-/// same auth to [`anthropic_search_backend`]: resolving twice would risk the
-/// provider and the search backend disagreeing about which source won.
 fn build_anthropic_provider(
     resolved_auth: Option<(AnthropicAuth, AnthropicAuthSource)>,
     default_model: &str,
@@ -864,7 +729,7 @@ fn build_anthropic_provider(
     }
 }
 
-/// The configured Claude gateway's origin, when Lucidos is signed in to it.
+/// INVARIANT: The configured Claude gateway's origin, when Lucidos is signed in to it.
 ///
 /// The `claude_gateway_url` preference must parse as a gateway origin, and the
 /// stored sign-in must come from that origin. A sign-in to another gateway is
@@ -898,8 +763,6 @@ fn signed_in_gateway(url: Option<String>, issuer: Option<String>) -> Option<Gate
     }
 }
 
-/// Build the Claude gateway provider for a signed-in `origin`. `None` while no
-/// gateway access can be made yet (the boot build), or if the client fails.
 fn build_claude_gateway_provider(
     origin: GatewayOrigin,
     access: Option<&GatewayAccessFactory>,
@@ -931,8 +794,6 @@ fn build_claude_gateway_provider(
     }
 }
 
-/// Build the ChatGPT plan provider for a stored sign-in. `None` while no
-/// plan access can be made yet (the boot build), or if the client fails.
 fn build_chatgpt_plan_provider(
     access: Option<&ChatGptPlanAccess>,
     default_model: &str,
@@ -957,13 +818,6 @@ fn build_chatgpt_plan_provider(
     }
 }
 
-/// Build the direct-OpenAI provider from an already-resolved key, logging where
-/// the key came from and degrading to `None` (rather than aborting) if the
-/// reqwest client can't be built.
-///
-/// Takes the resolved key rather than resolving it, so the caller can hand the
-/// same key to [`openai_search_backend`] — resolving twice would risk the
-/// provider and the search backend disagreeing about which key won.
 fn build_openai_provider(
     resolved_key: Option<(String, OpenAiKeySource)>,
     default_model: &str,
@@ -979,11 +833,6 @@ fn build_openai_provider(
     }
 }
 
-/// Build the OpenRouter provider — an [`OpenAiProvider`] pinned to OpenRouter's
-/// OpenAI-compatible Chat Completions endpoint — from a stored `openrouter`
-/// credential (Settings → Providers) with the `LUCIDOS_OPENROUTER_API_KEY` env
-/// var as a fallback. Sends OpenRouter's optional `HTTP-Referer` / `X-Title`
-/// attribution headers. `None` when no key is configured.
 fn build_openrouter_provider(
     credential: Option<(AuthType, String)>,
     env_key: Option<String>,
@@ -1006,13 +855,6 @@ fn build_openrouter_provider(
     )
 }
 
-/// Build the xAI provider: an [`OpenAiProvider`] pinned to xAI's
-/// OpenAI-compatible Chat Completions endpoint, serving Grok. The key comes
-/// from a stored `xai` credential (Settings → Providers), with
-/// `LUCIDOS_XAI_API_KEY` as the fallback. `None` when neither is configured.
-///
-/// Sends no extra headers: `HTTP-Referer` / `X-Title` are OpenRouter's own
-/// attribution convention, and xAI has no counterpart.
 fn build_xai_provider(
     credential: Option<(AuthType, String)>,
     env_key: Option<String>,
@@ -1029,19 +871,6 @@ fn build_xai_provider(
     )
 }
 
-/// The shared body behind [`build_openrouter_provider`] and
-/// [`build_xai_provider`]: a hosted OpenAI-compatible backend authenticated by a
-/// single bearer key, differing only in base URL, attribution headers and the
-/// name in the startup log.
-///
-/// `force_chat_completions` is always true here. Neither service implements
-/// OpenAI's Responses API, so a `gpt-5`-shaped id served by one must still take
-/// the Chat Completions path.
-///
-/// The named wrappers stay, because each carries what is provider-specific:
-/// which env var falls back, and why the headers are there or absent.
-/// [`build_local_provider`] deliberately does NOT route through here: it
-/// resolves its own base URL, tolerates an empty key, and logs that base.
 fn build_bearer_openai_compatible(
     provider_kind: crate::llm::ProviderKind,
     provider_label: &str,
@@ -1075,7 +904,7 @@ fn build_bearer_openai_compatible(
     }
 }
 
-/// The headers the keyless provider sends on every request.
+/// INVARIANT: The headers the keyless provider sends on every request.
 ///
 /// Attribution follows OpenRouter's convention, which the relay honours. The
 /// User-Agent names Lucidos: some free models are gated to another client's
@@ -1092,7 +921,7 @@ fn opencode_free_headers() -> Vec<(String, String)> {
     ]
 }
 
-/// Build the keyless OpenCode Free provider, or `None` when the tier is off.
+/// INVARIANT: Build the keyless OpenCode Free provider, or `None` when the tier is off.
 ///
 /// Opt-in through the `opencode_free_enabled` preference, with
 /// `LUCIDOS_OPENCODE_FREE` as the launch env fallback. Off by default, so a
@@ -1107,8 +936,6 @@ fn build_opencode_free_provider(
     enabled_pref: Option<String>,
     default_model: &str,
 ) -> Option<OpenAiProvider> {
-    // A stored row wins even when it is neither on nor off, so the env switch
-    // only speaks while the preference is unset.
     let enabled = enabled_pref
         .map(|v| prefs::OPENCODE_FREE_ENABLED.resolve(Some(v.as_str())))
         .or_else(|| {
@@ -1139,15 +966,6 @@ fn build_opencode_free_provider(
     }
 }
 
-/// Build the local OpenAI-compatible provider (Ollama / LM Studio / vLLM /
-/// llama.cpp). Opt-in: only built when the user signalled local use via the
-/// `local_base_url` preference (`base_url_pref`), a `local` credential
-/// (`stored_key`), or the `LUCIDOS_LOCAL_BASE_URL` / `LUCIDOS_LOCAL_API_KEY`
-/// env vars — otherwise `None`, so a default localhost backend isn't conjured
-/// for users who never asked for it (and the "no provider configured" guard
-/// stays honest). The base URL resolves pref → env → the catalog default;
-/// the key is optional (the `Authorization` header is omitted when empty), and
-/// is presented only inside its scope: see [`local_key_in_scope`].
 fn build_local_provider(
     base_url_pref: Option<String>,
     stored_key: Option<StoredLocalKey>,
@@ -1165,7 +983,7 @@ fn build_local_provider(
     if base_pref.is_none() && base_env.is_none() && stored_key.is_none() && env_key.is_none() {
         return None;
     }
-    // The write path refuses such a value, but one stored before that check
+    // INVARIANT: The write path refuses such a value, but one stored before that check
     // must not reach the provider either. Dropped, never swapped for the env
     // or default host, so the user sees local stop rather than move.
     if let Some(reason) = base_pref
@@ -1176,7 +994,7 @@ fn build_local_provider(
         return None;
     }
 
-    // An env key is pinned to the env base URL, or the default, never to the
+    // INVARIANT: An env key is pinned to the env base URL, or the default, never to the
     // preference. Same pairing as `api::proxy_builtin::resolve_local`.
     let env_key_host = base_env
         .clone()
@@ -1207,12 +1025,6 @@ fn build_local_provider(
     }
 }
 
-/// The `local` key the provider may present to `base`, if any.
-///
-/// A stored key goes only where its credential's scope covers `base`. An env
-/// key goes only to the host it is pinned to. Anything else is dropped with a
-/// log line, and the provider runs keyless. The stored key wins over the env
-/// one, as in `api::proxy_builtin::resolve_local`.
 fn local_key_in_scope(
     base: &str,
     stored_key: Option<StoredLocalKey>,
@@ -1260,8 +1072,6 @@ mod tests {
         seed_preference, setup_test_db, teardown_test_db,
     };
 
-    /// Build a non-mock context with no Vertex. `model_is_mock: false` is the load-
-    /// bearing bit: it proves the rebuild can never reach `MockProvider`.
     fn unconfigured_ctx() -> ProviderBuildContext {
         ProviderBuildContext {
             default_model: prefs::CHAT_MODEL.default_text().to_string(),
@@ -1280,7 +1090,6 @@ mod tests {
         (outcome.llm, outcome.selection)
     }
 
-    /// The installed web-search chain.
     fn installed_search(outcome: ProviderBuildOutcome) -> Arc<WebSearchChain> {
         outcome.web_search
     }
@@ -1292,7 +1101,6 @@ mod tests {
         })
     }
 
-    /// The key reaches the host the user saved it for.
     #[test]
     fn a_stored_local_key_is_sent_inside_its_scope() {
         let key = local_key_in_scope(
@@ -1303,8 +1111,6 @@ mod tests {
         assert_eq!(key.as_deref(), Some("local-secret"));
     }
 
-    /// `local_base_url` can move without the key being re-saved. Pointing it
-    /// at another host must not carry the stored key there.
     #[test]
     fn a_rewritten_base_url_does_not_carry_the_stored_local_key() {
         let key = local_key_in_scope(
@@ -1315,14 +1121,12 @@ mod tests {
         assert_eq!(key, None);
     }
 
-    /// An unscoped key goes nowhere, as it does on the proxy path.
     #[test]
     fn an_unscoped_stored_local_key_is_not_sent() {
         let key = local_key_in_scope("http://localhost:11434/v1", stored_local_key(&[]), None);
         assert_eq!(key, None);
     }
 
-    /// An env key follows the env base URL, never the preference.
     #[test]
     fn an_env_local_key_is_pinned_to_its_own_host() {
         let env = || {
@@ -1341,8 +1145,6 @@ mod tests {
         );
     }
 
-    /// A public host stored before the write path checked it must not become
-    /// the model the agent talks to. A loopback one still builds.
     #[test]
     fn a_stored_public_local_base_url_builds_no_provider() {
         let model = prefs::CHAT_MODEL.default_text();
@@ -1360,19 +1162,6 @@ mod tests {
         );
     }
 
-    /// Whether an ambient provider source could pre-configure a provider in this
-    /// process: the Anthropic / OpenAI / OpenRouter / xAI / local env fallbacks, OR a
-    /// Codex CLI `apikey` login on disk (`${CODEX_HOME:-~/.codex}/auth.json`),
-    /// which the OpenAI builder honors as its lowest-precedence fallback. On a
-    /// dev shell or CI runner that has any of these, the "no provider
-    /// configured" assertions below are not meaningful; seeding an `anthropic`
-    /// credential still selects `Real` either way, so that half of each test
-    /// runs unconditionally.
-    ///
-    /// Every non-credential source belongs here, not just the obvious env vars.
-    /// A developer logged into Codex, or one exporting `ANTHROPIC_API_KEY`,
-    /// would otherwise see `build_active_provider` return `Real` while this gate
-    /// reported false, breaking the `Unconfigured` assertions.
     fn ambient_provider_env() -> bool {
         std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var(crate::llm::OPENAI_API_KEY_ENV).is_ok()
@@ -1384,18 +1173,12 @@ mod tests {
             || crate::llm::openai::codex_detect::load().is_some()
     }
 
-    /// The core fix: with no credentials →
-    /// `Unconfigured`; adding the first provider credential → `Real` (configured,
-    /// NOT mock); removing it → back to `Unconfigured`. Mirrors what the runtime
-    /// credential subscriber does, proving the rebuild swaps the active provider
-    /// without a restart.
     #[tokio::test]
     async fn rebuild_swaps_unconfigured_to_real_and_back() {
         let (pool, db) = setup_test_db().await;
         let ctx = unconfigured_ctx();
         let ambient = ambient_provider_env();
 
-        // No credentials → Unconfigured (only when no ambient env provider).
         if !ambient {
             let (provider, selection) =
                 install(build_active_provider(Some(&pool), &ctx).await.unwrap());
@@ -1404,12 +1187,9 @@ mod tests {
                 !provider.is_configured(),
                 "no provider configured → llm_configured() must be false"
             );
-            // Unconfigured reports an empty set (not None) so the picker filters
-            // to nothing rather than skipping the filter.
             assert_eq!(provider.configured_providers(), Some(Vec::new()));
         }
 
-        // Add the first provider credential (anthropic — env-independent).
         seed_credential(
             &pool,
             "anthropic",
@@ -1419,7 +1199,6 @@ mod tests {
         )
         .await;
 
-        // Rebuild → Real, configured, and NEVER mock (model_is_mock is false).
         let (provider, selection) =
             install(build_active_provider(Some(&pool), &ctx).await.unwrap());
         assert_eq!(
@@ -1436,7 +1215,6 @@ mod tests {
             provider.is_configured(),
             "after adding a credential, llm_configured() must flip true"
         );
-        // The real provider reports its live backends — at least anthropic.
         assert!(
             provider
                 .configured_providers()
@@ -1445,10 +1223,6 @@ mod tests {
             "configured_providers must include the anthropic backend just added"
         );
 
-        // Remove it → back to Unconfigured (only meaningful with no ambient env).
-        // Through the test helper, not the store directly: the store's delete
-        // needs an EventBus for its CredentialDeleted emit, and `llm/` must not
-        // name `crate::engine` (llm_does_not_depend_on_engine).
         delete_credential(&pool, "anthropic").await;
         if !ambient {
             let (provider, selection) =
@@ -1464,20 +1238,10 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The ids of the resolved search backends, in chain order.
     fn backend_ids(providers: &DirectProviders) -> Vec<&'static str> {
         providers.search_backends.iter().map(|b| b.id()).collect()
     }
 
-    /// `ANTHROPIC_API_KEY` alone (no stored credential) configures the direct
-    /// Anthropic provider AND its search backend. The search half is the one
-    /// that silently goes missing: the auth is deliberately held past provider
-    /// construction so both are built from it, and an env path that reached only
-    /// the provider would give an env-configured user chat with no Anthropic
-    /// search backend.
-    ///
-    /// The env value is passed as an argument, never exported, so this cannot
-    /// race the rest of the binary.
     #[tokio::test]
     async fn anthropic_env_key_alone_builds_the_provider_and_its_search_backend() {
         let (pool, db) = setup_test_db().await;
@@ -1507,13 +1271,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The degraded (DB-down) boot honors the env fallback too, exactly as the
-    /// OpenAI env + Codex fallbacks already do there. Before this, that path
-    /// hardcoded `anthropic: None`, so a DB outage silently dropped Anthropic
-    /// even for a user whose key was in the environment all along.
-    ///
-    /// Needs no database (`pool == None`) and no process env: both key sources
-    /// are arguments, which makes the with/without pair deterministic.
     #[tokio::test]
     async fn db_down_boot_honors_the_anthropic_env_key() {
         let registry = crate::llm::model_registry::empty();
@@ -1558,7 +1315,6 @@ mod tests {
         );
     }
 
-    /// Disable every provider source, including ambient env and Codex auth.
     #[tokio::test]
     async fn no_provider_boots_unconfigured_without_opt_in() {
         let (pool, db) = setup_test_db().await;
@@ -1578,10 +1334,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A resolved Vertex project (from env / ADC / gcloud config — here injected
-    /// directly) builds the Vertex backend and reports it as configured, with no
-    /// credential and regardless of ambient env. Proves the build wiring; the
-    /// ADC token-minting itself is covered by `vertex::adc` unit tests + smoke.
     #[tokio::test]
     async fn resolved_vertex_project_builds_vertex_backend() {
         let (pool, db) = setup_test_db().await;
@@ -1603,8 +1355,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A stored `xai` credential alone configures the provider and reports it,
-    /// so the picker stops hiding every Grok row as "not set up".
     #[tokio::test]
     async fn an_xai_credential_configures_and_reports_the_xai_backend() {
         let (pool, db) = setup_test_db().await;
@@ -1631,15 +1381,11 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The keyless tier is installed by a preference alone, with no credential
-    /// anywhere. It is also the one provider that must never be reachable by
-    /// accident, so the off case is asserted in the same test.
     #[tokio::test]
     async fn the_free_tier_is_configured_by_its_preference_and_never_a_credential() {
         let (pool, db) = setup_test_db().await;
         let ctx = unconfigured_ctx();
 
-        // Default (unset) leaves it out of the configured set.
         let (provider, _) = install(build_active_provider(Some(&pool), &ctx).await.unwrap());
         assert!(
             !provider
@@ -1663,8 +1409,6 @@ mod tests {
             "the preference alone must build and report the keyless backend"
         );
 
-        // No credential service exists for it, so nothing can be stored and
-        // nothing can be sent as a bearer.
         assert!(
             !PROVIDER_CREDENTIAL_SERVICES.contains(&"opencode-free"),
             "the keyless tier must have no credential service"
@@ -1672,10 +1416,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Lucidos identifies itself and nobody else. The relay gates `big-pickle`
-    /// on the OpenCode CLI's own User-Agent, so the tempting fix for a 429 is
-    /// to borrow it. This pins the honest header instead, and pins that the
-    /// attribution list carries no credential.
     #[test]
     fn the_keyless_headers_name_lucidos_and_carry_no_credential() {
         let headers = opencode_free_headers();
@@ -1698,18 +1438,10 @@ mod tests {
         }
     }
 
-    /// Web search resolves over the CONFIGURED PROVIDER SET, not the chat
-    /// model's provider.
-    ///
-    /// This is the fallback that keeps OpenRouter and local-endpoint users from
-    /// dead-ending: neither exposes a web search tool, so a chain derived from
-    /// the chat model would leave them with nothing. Chatting on an OpenRouter
-    /// model while holding an Anthropic credential must still yield a backend.
     #[tokio::test]
     async fn search_chain_ignores_the_chat_models_provider() {
         let (pool, db) = setup_test_db().await;
         let ctx = ProviderBuildContext {
-            // Routes to OpenRouter, which has no search tool of its own.
             default_model: "z-ai/glm-5.2".to_string(),
             ..unconfigured_ctx()
         };
@@ -1728,10 +1460,6 @@ mod tests {
             "an Anthropic credential must supply search even when chat routes elsewhere: {:?}",
             chain.backend_ids()
         );
-        // Presence is not enough — the backend must also be given a model
-        // Anthropic can actually serve. Handing it the OpenRouter chat model id
-        // would make every cross-provider fallback fail at the API, i.e. exactly
-        // when the fallback matters.
         let model = chain
             .backend_models()
             .into_iter()
@@ -1749,14 +1477,9 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The chat model IS reused when it belongs to the provider — that keeps
-    /// search on the tier the user chose in the ordinary single-provider case,
-    /// and is why this isn't just a hardcoded model everywhere.
     #[test]
     fn search_model_prefers_the_chat_model_when_it_matches_the_provider() {
         let registry = crate::llm::model_registry::empty();
-        // `provider_kind_for` falls back to a prefix heuristic for ids with no
-        // registry row: `claude-*` → Vertex, `gpt-*` → OpenAI.
         assert_eq!(
             search_model_for(
                 &registry,
@@ -1768,16 +1491,9 @@ mod tests {
         );
     }
 
-    /// …but the `[1m]` suffix comes off first. It is a Lucidos marker for the
-    /// 1M-context beta, not part of a real model id, and the one-shot search
-    /// call has no beta to attach it to. `claude-fable-5[1m]` is a seeded
-    /// builtin that routes to direct Anthropic, so before this the whole
-    /// Anthropic search backend 404'd out of the chain for anyone using it.
     #[test]
     fn search_model_strips_the_lucidos_only_1m_suffix() {
         let registry = crate::llm::model_registry::empty();
-        // `claude-fable*` routes to Anthropic through the prefix heuristic, so
-        // this is the reuse branch, suffix and all.
         assert_eq!(
             search_model_for(
                 &registry,
@@ -1788,7 +1504,6 @@ mod tests {
             "claude-fable-5",
             "the [1m] marker must never reach a provider API"
         );
-        // A bare id is untouched.
         assert_eq!(
             search_model_for(
                 &registry,
@@ -1798,7 +1513,6 @@ mod tests {
             ),
             "claude-fable-5"
         );
-        // A point release keeps its trailing `-1` when the suffix comes off.
         assert_eq!(
             search_model_for(
                 &registry,
@@ -1810,9 +1524,6 @@ mod tests {
         );
     }
 
-    /// …and is replaced when it does not. Regression for the cross-provider bug:
-    /// every backend was handed the global chat model, so an OpenRouter or
-    /// Vertex chat model was sent to Anthropic / OpenAI and rejected.
     #[test]
     fn search_model_falls_back_when_the_chat_model_is_another_providers() {
         let registry = crate::llm::model_registry::empty();
@@ -1841,11 +1552,6 @@ mod tests {
         }
     }
 
-    /// A reused chat model must ALSO run on the Responses API.
-    ///
-    /// `web_search` exists nowhere else, so a `models` row like `gpt-4o` would
-    /// post the tool to `/responses` for a model the engine's own predicate
-    /// rejects. OpenAI is last in the chain, so there is nothing after it.
     #[test]
     fn a_chat_completions_chat_model_never_becomes_the_search_model() {
         let registry = crate::llm::model_registry::empty();
@@ -1854,21 +1560,13 @@ mod tests {
             OPENAI_FALLBACK_SEARCH_MODEL,
             "gpt-4o routes to OpenAI but not to the Responses API"
         );
-        // A Responses-API chat model is still reused, which is the whole point
-        // of preferring the tier the user picked.
         assert_eq!(openai_search_model(&registry, "gpt-5.6-sol"), "gpt-5.6-sol");
-        // Another provider's model still falls back, as before.
         assert_eq!(
             openai_search_model(&registry, "claude-opus-5"),
             OPENAI_FALLBACK_SEARCH_MODEL
         );
     }
 
-    /// The veto gates the BUILDER, not its result.
-    ///
-    /// Filtering afterwards logs "provider configured" for a provider the
-    /// router never receives. That is the line a user reads when a switch
-    /// looks like it did nothing.
     #[test]
     fn a_switched_off_provider_is_never_built() {
         let mut built = false;
@@ -1888,12 +1586,6 @@ mod tests {
         assert!(built, "an enabled provider still gets built");
     }
 
-    /// A credential the engine cannot READ omits its provider, rather than
-    /// falling through to the env key.
-    ///
-    /// Take a workspace with a stored `openai` credential for one account and
-    /// `OPENAI_API_KEY` for another. One transient pool error at boot would
-    /// otherwise put every later turn on the second account.
     #[tokio::test]
     async fn an_unreadable_credential_still_boots_on_the_environment_key() {
         let (pool, db) = setup_test_db().await;
@@ -1917,7 +1609,6 @@ mod tests {
             "the env key alone configures the provider while the read works"
         );
 
-        // Make every credential read fail, exactly as a pool error does.
         sqlx::query("DROP TABLE credentials CASCADE")
             .execute(&pool)
             .await
@@ -1949,13 +1640,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The OpenAI fallback must satisfy `uses_responses_api`, because the
-    /// `web_search` tool only exists on the Responses API — a Chat-Completions
-    /// id would make the backend dead on arrival.
-    ///
-    /// Calls the real predicate rather than re-spelling it. A copy of the rule
-    /// keeps passing after the rule itself narrows, which is exactly the drift
-    /// this test exists to catch.
     #[test]
     fn openai_fallback_search_model_routes_to_the_responses_api() {
         assert!(
@@ -1964,10 +1648,6 @@ mod tests {
         );
     }
 
-    /// Vertex leads the chain whenever it is configured, so an existing Vertex
-    /// workspace keeps the exact search behavior it had before the chain
-    /// existed. Asserts position, not set membership — ambient env may add an
-    /// OpenAI backend on a developer machine.
     #[tokio::test]
     async fn vertex_leads_the_chain_when_configured() {
         let (pool, db) = setup_test_db().await;
@@ -1999,16 +1679,9 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// No search-capable provider → an empty chain that reports how to enable
-    /// search, rather than a silently broken tool. `local` is deliberate: it is
-    /// a configured LLM provider that offers no search tool, so it proves the
-    /// chain tracks search capability rather than mere provider presence.
     #[tokio::test]
     async fn local_only_workspace_gets_an_empty_chain() {
         if ambient_provider_env() {
-            // A developer machine with ANTHROPIC_API_KEY / OPENAI_API_KEY / a
-            // Codex login would add a real backend and make this assertion
-            // meaningless.
             return;
         }
         let (pool, db) = setup_test_db().await;
@@ -2038,8 +1711,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    // ---- Claude gateway ----------------------------------------------------
-
     const GATEWAY: &str = "https://gateway.example";
 
     struct FixedTokens;
@@ -2067,7 +1738,6 @@ mod tests {
         }
     }
 
-    /// A context that can make a gateway access, as the engine's is.
     fn gateway_ctx() -> ProviderBuildContext {
         ProviderBuildContext {
             claude_gateway_access: Some(Arc::new(|_| Arc::new(FixedTokens))),
@@ -2085,8 +1755,6 @@ mod tests {
             .expect("a provider set is reported")
     }
 
-    /// The gateway serves once its URL is set and Lucidos is signed in to that
-    /// gateway. It adds no web search backend: it promises no server tools.
     #[tokio::test]
     async fn a_signed_in_claude_gateway_configures_and_reports_its_backend() {
         let (pool, db) = setup_test_db().await;
@@ -2106,7 +1774,6 @@ mod tests {
         assert_eq!(selection, ProviderSelection::Real);
         let providers = llm.configured_providers().expect("a provider set");
         assert!(providers.contains(&crate::llm::ProviderKind::ClaudeGateway));
-        // An ambient key on this machine adds its own backend and search.
         if !ambient_provider_env() {
             assert_eq!(providers, vec![crate::llm::ProviderKind::ClaudeGateway]);
             assert!(web_search.backend_ids().is_empty());
@@ -2114,8 +1781,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Each missing half leaves the gateway out: no sign-in, a sign-in from
-    /// another gateway, a URL that is not a gateway origin, or the switch off.
     #[tokio::test]
     async fn a_claude_gateway_missing_any_half_is_left_out() {
         let (pool, db) = setup_test_db().await;
@@ -2163,13 +1828,9 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The boot build has no gateway access yet. A signed-in gateway still counts
-    /// there, so a gateway-only workspace boots rather than failing fast. The
-    /// engine then rebuilds with the gateway in.
     #[tokio::test]
     async fn a_signed_in_gateway_counts_at_boot_before_it_can_be_built() {
         if ambient_provider_env() {
-            // An ambient key selects Real on its own, so it proves nothing here.
             return;
         }
         let (pool, db) = setup_test_db().await;
@@ -2188,7 +1849,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Hands out a fixed plan token.
     struct FixedPlanTokens;
 
     #[async_trait::async_trait]
@@ -2205,7 +1865,6 @@ mod tests {
         }
     }
 
-    /// A context that can make the plan access, as the engine's is.
     fn plan_ctx() -> ProviderBuildContext {
         ProviderBuildContext {
             chatgpt_plan_access: Some(ChatGptPlanAccess {
@@ -2216,7 +1875,6 @@ mod tests {
         }
     }
 
-    /// A stored ChatGPT sign-in configures plan chat and search without a platform key.
     #[tokio::test]
     async fn a_chatgpt_plan_sign_in_configures_only_its_backend() {
         let (pool, db) = setup_test_db().await;
@@ -2238,8 +1896,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// No sign-in, or the switch off, leaves the plan out. A workspace that
-    /// never signed in builds exactly as before.
     #[tokio::test]
     async fn a_chatgpt_plan_without_a_sign_in_or_switched_off_is_left_out() {
         let (pool, db) = setup_test_db().await;
@@ -2271,8 +1927,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The boot build has no plan access yet. A stored sign-in still counts,
-    /// so a plan-only workspace boots, and the engine rebuilds with it in.
     #[tokio::test]
     async fn a_chatgpt_plan_sign_in_counts_at_boot_before_it_can_be_built() {
         if ambient_provider_env() {
@@ -2290,11 +1944,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    // ---- Per-provider enable switches -------------------------------------
-
-    /// Absent means enabled, and only an explicit off turns a switch off. This
-    /// is the back-compat guarantee: a workspace that never opened the page has
-    /// no rows at all, and must resolve every provider it always did.
     #[test]
     fn a_switch_is_on_unless_it_explicitly_says_off() {
         for switch in PROVIDER_ENABLED_SWITCHES {
@@ -2309,23 +1958,17 @@ mod tests {
                     "{key}: {off} must read as disabled"
                 );
             }
-            // Neither vocabulary. Enabled, because a garbled value must not be
-            // the thing that quietly removes a working provider.
             assert!(switch.resolve(Some("maybe")), "{key}");
             assert!(switch.resolve(Some("")), "{key}");
         }
     }
 
-    /// The default is every switch on, which is what a DB-down boot resolves.
     #[test]
     fn default_switches_are_all_on() {
         let s = ProviderSwitches::default();
         assert!(s.vertex && s.anthropic && s.openai && s.openrouter && s.xai && s.local);
     }
 
-    /// A switched-off provider leaves the router AND takes its search backend
-    /// with it, while its stored credential stays exactly where it was. That
-    /// pairing is the whole point: the switch parks a key, it does not spend it.
     #[tokio::test]
     async fn switching_anthropic_off_drops_it_and_keeps_the_credential() {
         let (pool, db) = setup_test_db().await;
@@ -2385,8 +2028,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The switch is a veto, never an installer: turning one on for a provider
-    /// with no credential and no env key configures nothing.
     #[tokio::test]
     async fn a_switch_never_installs_an_unconfigured_provider() {
         let (pool, db) = setup_test_db().await;
@@ -2412,8 +2053,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The stored preferences reach the resolved switches, key by key. Reads
-    /// them through the real store so a misspelled constant cannot pass.
     #[tokio::test]
     async fn stored_preferences_resolve_to_the_switches() {
         let (pool, db) = setup_test_db().await;
@@ -2452,8 +2091,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A switch that needed a restart is a switch the user reads as broken, so
-    /// the config subscriber has to watch every one.
     #[test]
     fn every_switch_hot_swaps() {
         for switch in PROVIDER_ENABLED_SWITCHES {
@@ -2465,10 +2102,6 @@ mod tests {
         }
     }
 
-    /// The frontend mirrors this watch set, to re-probe `/health` on the same
-    /// preferences that rebuild the provider here. A key added on this side and
-    /// forgotten there leaves the model picker offering a provider the engine
-    /// has already dropped, with nothing failing.
     #[test]
     fn the_frontend_mirrors_the_provider_preference_keys() {
         let ts = include_str!("../../../lucidos-app/src/store/actions/entityReferences.ts");
@@ -2481,8 +2114,6 @@ mod tests {
         }
     }
 
-    /// The agent must not be able to switch a provider off: the provider it
-    /// switches off may be the one answering the turn.
     #[test]
     fn no_switch_is_agent_settable() {
         for switch in PROVIDER_ENABLED_SWITCHES {

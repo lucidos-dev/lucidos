@@ -1,7 +1,3 @@
-//! OpenAI Chat Completions API path (non-codex models) for `OpenAiProvider`.
-//! The struct, shared stream types, and dispatch live in the parent `openai`
-//! module.
-
 use crate::llm::anthropic_wire::{ephemeral_cache_marker, MAX_CACHE_BREAKPOINTS};
 use crate::llm::api_usage::ApiUsage;
 use crate::llm::cache_lifetime::CacheLifetime;
@@ -19,15 +15,11 @@ use super::{
     DEFAULT_MAX_COMPLETION_TOKENS, STREAM_LOG_TAG,
 };
 
-/// OpenRouter's namespace for Anthropic models. It is the one model family on
-/// this wire that caches only what carries a `cache_control` marker.
 const ANTHROPIC_NAMESPACE: &str = "anthropic/";
 
-/// What a text part is, for the cache marker's sake.
 #[derive(Clone, Copy, PartialEq)]
 enum PartKind {
     Body,
-    /// Volatile engine notes, rewritten every round. Never a marker anchor.
     Tail,
     View,
 }
@@ -46,13 +38,9 @@ impl TextPart {
     }
 }
 
-/// The text and image parts of one user or assistant wire message, kept apart
-/// so a cache marker can land on a single part. A `tool` message is never one:
-/// it takes a plain string.
 struct Parts {
     texts: Vec<TextPart>,
     images: Vec<serde_json::Value>,
-    /// Indexes into [`Parts::cacheable_texts`] that carry a marker.
     marks: BTreeSet<usize>,
 }
 
@@ -65,15 +53,10 @@ impl Parts {
         }
     }
 
-    /// The text parts the API accepts: it rejects an empty one.
     fn cacheable_texts(&self) -> Vec<&TextPart> {
         self.texts.iter().filter(|t| !t.text.is_empty()).collect()
     }
 
-    /// The part a message-level marker lands on: the last that is not a tail.
-    /// `None` for a message with nothing but tail text, such as the one left
-    /// when a round's tool results split off into `tool` messages. The marker
-    /// then goes to the message before it.
     fn anchor(&self) -> Option<usize> {
         self.cacheable_texts()
             .iter()
@@ -89,14 +72,10 @@ impl Parts {
             .collect()
     }
 
-    /// Mark one part. Returns whether a new marker landed, so a part marked
-    /// twice counts once against the cap.
     fn mark(&mut self, at: usize) -> bool {
         self.marks.insert(at)
     }
 
-    /// The content every model but Anthropic gets: the text joined into one
-    /// string, or one text part beside the images.
     fn joined_content(&self) -> Option<serde_json::Value> {
         let joined = (!self.texts.is_empty()).then(|| {
             self.texts
@@ -116,7 +95,7 @@ impl Parts {
         Some(serde_json::Value::Array(content))
     }
 
-    /// The content an Anthropic model gets: one part per text block, so a
+    /// INVARIANT: The content an Anthropic model gets: one part per text block, so a
     /// marker lands on exactly one block. The blocks stay the same with or
     /// without a marker, because a cache entry is keyed on them. One unmarked
     /// text stays a plain string, which renders as the same single block.
@@ -144,8 +123,6 @@ impl Parts {
     }
 }
 
-/// One Chat Completions wire message. `value` holds everything but the
-/// content of a message that has [`Parts`].
 struct ChatMessage {
     value: serde_json::Value,
     parts: Option<Parts>,
@@ -178,7 +155,7 @@ impl ChatMessage {
     }
 }
 
-/// Place cache markers on an Anthropic request, in the order
+/// INVARIANT: Place cache markers on an Anthropic request, in the order
 /// `anthropic_wire` uses: the last message that can hold one, the one before
 /// it, each memory view, then the system block. At most
 /// [`MAX_CACHE_BREAKPOINTS`]. Tool definitions and `tool` messages take none.
@@ -213,7 +190,7 @@ fn place_cache_markers(messages: &mut [ChatMessage], has_system: bool) -> bool {
     has_system && breakpoints < MAX_CACHE_BREAKPOINTS
 }
 
-/// The last memory view that took a marker, as `(message, part)`. Views sit
+/// INVARIANT: The last memory view that took a marker, as `(message, part)`. Views sit
 /// in fixed places, so the next turn marks the same one. The rolling marks
 /// on the last two messages move every turn, so they never end a stable cut.
 fn last_marked_view(messages: &[ChatMessage]) -> Option<(usize, usize)> {
@@ -235,11 +212,10 @@ fn last_marked_view(messages: &[ChatMessage]) -> Option<(usize, usize)> {
         })
 }
 
-/// The most output a Chat Completions prefill allows. Probe P4 found that
+/// INVARIANT: The most output a Chat Completions prefill allows. Probe P4 found that
 /// OpenRouter ignores `max_tokens: 0`, and honours 1.
 const CHAT_OUTPUT_CAP: u32 = 1;
 
-/// The pair a beat on a Chat Completions request sends, cut at `end`.
 fn prefill_pair(
     body: &serde_json::Value,
     end: StableEnd,
@@ -260,16 +236,12 @@ fn prefill_pair(
     )
 }
 
-/// A Chat Completions request, and where a beat's stable cut on it ends.
 struct ChatBody {
     body: serde_json::Value,
-    /// `None` where a beat may not go: a model outside the Anthropic
-    /// namespace, or a request with no marker to read.
     stable_end: Option<StableEnd>,
 }
 
 impl OpenAiProvider {
-    /// Convert internal messages to OpenAI Chat Completions format.
     fn convert_messages_chat(messages: &[Message]) -> Vec<ChatMessage> {
         let mut openai_messages: Vec<ChatMessage> = Vec::new();
 
@@ -289,8 +261,6 @@ impl OpenAiProvider {
 
                     for block in blocks {
                         match block {
-                            // A tail block is ordinary text here. Only the
-                            // engine and the cache markers care who wrote it.
                             ContentBlock::Text { text } | ContentBlock::StableContext { text } => {
                                 text_parts.push(TextPart::new(text, PartKind::Body));
                             }
@@ -337,8 +307,6 @@ impl OpenAiProvider {
 
                     let has_tool_calls = !tool_calls.is_empty();
 
-                    // 1. Assistant `tool_calls` message first — it owns any text
-                    //    as its `content` field.
                     if has_tool_calls {
                         let assistant_msg = serde_json::json!({
                             "role": "assistant",
@@ -354,7 +322,7 @@ impl OpenAiProvider {
                         });
                     }
 
-                    // 2. Tool-result `tool` messages MUST immediately follow the
+                    // INVARIANT: 2. Tool-result `tool` messages MUST immediately follow the
                     //    assistant `tool_calls` message — before any user
                     //    text/image content — or strict providers (Moonshot/Kimi,
                     //    OpenAI) reject with HTTP 400 "an assistant message with
@@ -373,9 +341,6 @@ impl OpenAiProvider {
                         })));
                     }
 
-                    // 3. Remaining user text/image content, AFTER the tool
-                    //    messages. Skipped when this block was an assistant
-                    //    `tool_calls` message (step 1 already consumed its text).
                     let has_user_content = !text_parts.is_empty() || !image_parts.is_empty();
                     if !has_tool_calls && has_user_content {
                         openai_messages.push(ChatMessage::with_parts(
@@ -390,7 +355,6 @@ impl OpenAiProvider {
         openai_messages
     }
 
-    /// Convert internal tool definitions to Chat Completions function tool format.
     fn convert_tools_chat(tools: &[ToolDefinition]) -> Option<Vec<serde_json::Value>> {
         if tools.is_empty() {
             return None;
@@ -412,7 +376,6 @@ impl OpenAiProvider {
         )
     }
 
-    /// The Chat Completions `tool_choice` that makes the model call `tool`.
     fn forced_tool_choice_chat(tool: &str) -> serde_json::Value {
         serde_json::json!({ "type": "function", "function": { "name": tool } })
     }
@@ -425,7 +388,7 @@ impl OpenAiProvider {
         system_prompt: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> ChatBody {
-        // OpenRouter caches an Anthropic model's prompt only where a text part
+        // INVARIANT: OpenRouter caches an Anthropic model's prompt only where a text part
         // carries `cache_control`. Every other model keeps its body as it was,
         // because a strict or local server can reject a key it does not know.
         let explicit_cache = model.starts_with(ANTHROPIC_NAMESPACE);
@@ -433,7 +396,6 @@ impl OpenAiProvider {
         let has_system_text = system_prompt.is_some_and(|s| !s.is_empty());
         let mark_system =
             explicit_cache && place_cache_markers(&mut chat_messages, has_system_text);
-        // Only an Anthropic model carries markers, so only it gets a cut.
         let system_offset = usize::from(system_prompt.is_some());
         let stable_end = match last_marked_view(&chat_messages) {
             Some((message, part)) => Some(StableEnd::Part {
@@ -468,7 +430,7 @@ impl OpenAiProvider {
         let mut body = serde_json::json!({
             "model": model,
             "stream": true,
-            // Ask OpenAI to append a final chunk carrying token usage so the
+            // INVARIANT: Ask OpenAI to append a final chunk carrying token usage so the
             // provider parser can populate `LlmResponse.usage`. Without it,
             // streaming Chat Completions silently drops usage, breaking
             // cross-provider cost analytics.
@@ -481,7 +443,7 @@ impl OpenAiProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
-        // Verbatim, deliberately. Which tiers this model supports is decided
+        // INVARIANT: Verbatim, deliberately. Which tiers this model supports is decided
         // once, in `llm::reasoning`, and enforced by `RoutingProvider`'s clamp.
         // This builder also serves OpenRouter and local servers, so it cannot
         // tell whose vocabulary applies from the model id alone: rewriting
@@ -494,7 +456,6 @@ impl OpenAiProvider {
         ChatBody { body, stable_end }
     }
 
-    /// Parse an SSE stream from the Chat Completions API.
     async fn parse_chat_stream(
         &self,
         response: reqwest::Response,
@@ -502,7 +463,6 @@ impl OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
-        // Bytes of a character the transport split across two chunks.
         let mut carry: Vec<u8> = Vec::new();
         let mut content = String::new();
         let mut tool_call_map: Vec<AccumulatedToolCall> = Vec::new();
@@ -564,7 +524,7 @@ impl OpenAiProvider {
                     })?;
                     if content.len() > prev_len {
                         if let Some(cb) = on_token {
-                            // Floor defensively — `prev_len` is a byte length
+                            // INVARIANT: Floor defensively — `prev_len` is a byte length
                             // captured before the chunk appended, so a future
                             // accumulator change could leave it mid-codepoint.
                             cb(&content[content.floor_char_boundary(prev_len)..]);
@@ -577,11 +537,6 @@ impl OpenAiProvider {
         Self::build_llm_response(content, tool_call_map, meta)
     }
 
-    /// Process a single Chat Completions SSE chunk. The final usage chunk
-    /// (requested via `stream_options.include_usage`) arrives with
-    /// `choices: []` and a top-level `usage` object — we extract token
-    /// counts from there. `finish_reason` rides the LAST per-choice chunk
-    /// alongside (or instead of) the delta payload.
     fn process_chat_chunk(
         provider: &str,
         data_str: &str,
@@ -595,11 +550,9 @@ impl OpenAiProvider {
             return Err(stream_error(provider, error).into());
         }
 
-        // Top-level usage object (final include_usage chunk has choices: []).
         if let Some(usage) = data.get("usage") {
             meta.absorb_usage(crate::llm::usage_wire::from_block(usage));
         }
-        // Every chunk names the model; the first one that does is kept.
         if meta.served_model.is_none() {
             meta.served_model = crate::llm::served_model::served_model_of(&data);
         }
@@ -614,8 +567,6 @@ impl OpenAiProvider {
             None => return Ok(()),
         };
 
-        // finish_reason rides on the final per-choice chunk. May coexist
-        // with an empty `delta` or a delta carrying only the role field.
         if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
             meta.stop_reason = Some(reason.to_string());
         }
@@ -639,7 +590,7 @@ impl OpenAiProvider {
             for tc in tc_array {
                 let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
 
-                // The index comes straight off provider JSON, and an
+                // INVARIANT: The index comes straight off provider JSON, and an
                 // OpenAI-compatible host (OpenRouter, a local server, the keyless
                 // relay) is untrusted. A huge index would grow `tool_call_map` to
                 // billions of empty entries and OOM the engine. Legitimate indexes
@@ -679,7 +630,6 @@ impl OpenAiProvider {
         Ok(())
     }
 
-    /// Chat Completions flow with retry logic.
     pub(super) async fn chat_completions(
         &self,
         messages: &[Message],
@@ -698,7 +648,6 @@ impl OpenAiProvider {
         if let Some(tool) = selection.forced_tool {
             body["tool_choice"] = Self::forced_tool_choice_chat(tool);
         }
-        // A marker with no `ttl` asks for Anthropic's 5-minute cache.
         let requested_ttl = stable_end.as_ref().map(|_| CacheLifetime::FiveMinutes);
         let prefill = stable_end.and_then(|end| {
             prefill_pair(
@@ -797,25 +746,12 @@ impl OpenAiProvider {
     }
 }
 
-/// Longest provider detail we append. The whole string lands in a
-/// `ResponseFailed` payload the UI renders, so an unbounded provider blob
-/// would be unreadable there.
 const PROVIDER_DETAIL_MAX: usize = 300;
 
-/// Upper bound on a streamed tool-call index before we treat the frame as
-/// malformed. Real turns emit a handful of tool calls. This sits far above any
-/// legitimate stream and exists only to stop an untrusted host OOMing the
-/// engine with a huge index.
 const MAX_STREAMED_TOOL_CALLS: usize = 1024;
 
-/// Read one Chat Completions SSE error frame as a [`ProviderError`].
-///
-/// This reader serves OpenRouter and local servers as well as OpenAI, and
-/// they disagree about which field names the failure. OpenAI sends `type`;
-/// OpenRouter sends `code` plus a `metadata` object and no `type` at all. The
-/// shared parser reads both. OpenRouter's upstream cause joins the message.
 fn stream_error(provider: &str, error: &serde_json::Value) -> ProviderError {
-    // A local OpenAI-compatible server often sends `{"error": "..."}` with no
+    // INVARIANT: A local OpenAI-compatible server often sends `{"error": "..."}` with no
     // object around it. Reading only `error.message` there discarded the only
     // text the frame had.
     let message = error
@@ -836,9 +772,6 @@ fn stream_error(provider: &str, error: &serde_json::Value) -> ProviderError {
     ProviderError::from_stream_error(provider, &frame)
 }
 
-/// The upstream cause OpenRouter tucks into `metadata`, as one bounded line.
-/// `raw` holds the provider's own error body, which is what explains a
-/// message as bare as "ERROR"; `provider_name` says who produced it.
 fn provider_detail(metadata: Option<&serde_json::Value>) -> Option<String> {
     let metadata = metadata?.as_object()?;
     let provider = metadata
@@ -856,7 +789,7 @@ fn provider_detail(metadata: Option<&serde_json::Value>) -> Option<String> {
     Some(truncate_detail(detail))
 }
 
-/// Flatten a `raw` value to one whitespace-normalised line. Providers send it
+/// INVARIANT: Flatten a `raw` value to one whitespace-normalised line. Providers send it
 /// as a string or as a nested object, and either can carry the newlines that
 /// would break the single-line error.
 ///
@@ -945,8 +878,6 @@ mod tests {
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
 
-        // A hostile OpenAI-compatible host sends a tool_call index near u32::MAX.
-        // Without the cap this grows `tools` to billions of entries and OOMs.
         let result = OpenAiProvider::process_chat_chunk(
             "OpenAI",
             r#"{"choices":[{"delta":{"tool_calls":[{"index":4000000000,"id":"x","function":{"name":"f","arguments":"{}"}}]}}]}"#,
@@ -958,19 +889,12 @@ mod tests {
         assert!(tools.is_empty(), "must not grow the tool-call map");
     }
 
-    /// The Chat Completions stream MUST surface `finish_reason` (from the
-    /// last per-choice chunk) and token usage (from the final empty-choices
-    /// chunk added by `stream_options.include_usage`). Without this, the
-    /// OpenAI provider was discarding both, breaking cost/context analytics
-    /// parity with Vertex (which captures the same data via `message_start`
-    /// / `message_delta`).
     #[test]
     fn chat_stream_captures_finish_reason_and_usage() {
         let mut content = String::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
 
-        // Mid-stream text chunk: no finish_reason yet, no usage.
         OpenAiProvider::process_chat_chunk(
             "OpenAI",
             r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
@@ -980,7 +904,6 @@ mod tests {
         )
         .unwrap();
 
-        // Per-choice terminal chunk: empty delta, finish_reason set.
         OpenAiProvider::process_chat_chunk(
             "OpenAI",
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
@@ -990,7 +913,6 @@ mod tests {
         )
         .unwrap();
 
-        // include_usage final chunk: empty choices, usage carried alone.
         OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"model":"google/gemini-3.8-flash","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49,"prompt_tokens_details":{"cached_tokens":12}}}"#,
             &mut content,
@@ -1001,8 +923,6 @@ mod tests {
 
         assert_eq!(content, "hi");
         assert_eq!(meta.stop_reason.as_deref(), Some("stop"));
-        // 42 processed, 12 of them a cache read. The two overlap, because a
-        // stored `input_tokens` is the whole prompt the model read.
         assert_eq!(meta.usage.map(|u| u.input_tokens), Some(42));
         assert_eq!(meta.usage.map(|u| u.output_tokens), Some(7));
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(12));
@@ -1013,7 +933,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.input_tokens), Some(42));
         assert_eq!(resp.usage.map(|u| u.output_tokens), Some(7));
         assert_eq!(resp.usage.map(|u| u.cache_read_tokens), Some(12));
-        // OpenAI doesn't separate cache writes from reads, so this stays zero.
         assert_eq!(resp.usage.map(|u| u.cache_creation_tokens), Some(0));
         assert_eq!(
             resp.served_model.as_deref(),
@@ -1021,9 +940,6 @@ mod tests {
         );
     }
 
-    /// The overlap, on its own, so it is not buried in a stream test. The
-    /// cached subset is recorded beside the prompt total, never out of it. That
-    /// is what makes the stored figure the size of the whole prompt.
     #[test]
     fn a_cached_prefix_overlaps_the_prompt_total_rather_than_reducing_it() {
         let mut content = String::new();
@@ -1040,8 +956,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(12));
     }
 
-    /// OpenRouter reports an Anthropic cache write beside the read, both
-    /// inside `prompt_tokens`. A zero write stays unset, like a zero read.
     #[test]
     fn a_cache_write_is_recorded_as_part_of_the_prompt_total() {
         let mut content = String::new();
@@ -1073,8 +987,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.cache_creation_tokens), Some(0));
     }
 
-    /// A prompt that read no cache leaves the count unset, so "read nothing"
-    /// stays distinct from "this server reports no cached count at all".
     #[test]
     fn a_prompt_with_no_cache_reports_no_cache_read() {
         let mut content = String::new();
@@ -1092,9 +1004,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(0));
     }
 
-    /// More cached than prompt is a corrupt block. The wire records what
-    /// arrived rather than repairing it, and the one consumer that subtracts
-    /// saturates there instead.
     #[test]
     fn a_cached_count_over_the_prompt_total_is_recorded_as_reported() {
         let mut content = String::new();
@@ -1111,9 +1020,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(99));
     }
 
-    /// Empty content with `finish_reason=length` is the truncation case. We
-    /// must surface it so the empty-completion diagnostic can distinguish
-    /// "the model said nothing" from "we hit max_completion_tokens".
     #[test]
     fn chat_stream_captures_truncation_when_content_empty() {
         let mut content = String::new();
@@ -1144,14 +1050,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
-    /// The incident this guard exists for: `finish_reason: stop`, no content,
-    /// no tool call, and no usage chunk at all. `include_usage` is
-    /// unconditional, so a compliant server always closes with usage. Its
-    /// absence means the terminal frame never arrived, which is ADR 0089's
-    /// truncation reached by a different signal than Claude's missing
-    /// `message_delta`. Without this the turn reached
-    /// `classify_empty_completion` as a clean stop with `output_tokens`
-    /// defaulted to 0, graded benign, and the thread ended Idle in silence.
     #[test]
     fn a_clean_stop_that_reported_no_usage_at_all_is_a_truncation() {
         let mut content = String::new();
@@ -1181,14 +1079,10 @@ mod tests {
         let err = OpenAiProvider::build_llm_response(content, tools, meta)
             .expect_err("a usage-less empty stream must not build a response")
             .to_string();
-        // The literal `is_transient_error` matches on, which is what routes
-        // this into the retry loop rather than failing the turn.
         assert!(err.contains("stream truncated"), "wording: {err}");
         assert!(crate::llm::is_retryable_error(&err), "wording: {err}");
     }
 
-    /// Text that has streamed, then a mid-stream `error` frame that reads as
-    /// retryable. A retry re-sends the whole request.
     const TEXT_THEN_SERVER_ERROR: &str = concat!(
         r#"data: {"choices":[{"delta":{"content":"Here is the plan."}}]}"#,
         "\n\n",
@@ -1200,8 +1094,6 @@ mod tests {
         reqwest::Response::from(axum::http::Response::new(reqwest::Body::from(body)))
     }
 
-    /// ADR 0089 on the OpenAI-compatible path: once text has rendered, a
-    /// retryable stream error stops the turn, or the retry renders it twice.
     #[tokio::test]
     async fn an_error_frame_after_streamed_text_reports_instead_of_retrying() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
@@ -1224,7 +1116,6 @@ mod tests {
         );
     }
 
-    /// With no callback nothing reached the user, so the same frame retries.
     #[tokio::test]
     async fn an_error_frame_with_nothing_rendered_still_retries() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
@@ -1239,10 +1130,6 @@ mod tests {
         );
     }
 
-    /// A stream that already streamed text stays a success even with no usage
-    /// chunk. The token callback has rendered that text to the frontend, so a
-    /// retry would render the answer twice. That is the alternative ADR 0089
-    /// rejected outright.
     #[test]
     fn a_stream_that_rendered_text_is_never_a_truncation() {
         let mut content = String::new();
@@ -1263,9 +1150,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.input_tokens), None);
     }
 
-    /// A stream that produced a tool call stays a success even with no usage
-    /// chunk. Retrying would run the tool a second time, and a side-effecting
-    /// tool cannot be replayed for free.
     #[test]
     fn a_stream_that_produced_a_tool_call_is_never_a_truncation() {
         let mut content = String::new();
@@ -1286,9 +1170,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.input_tokens), None);
     }
 
-    /// A server that reports only one half of the token pair is odd, not
-    /// truncated. Either count proves the terminal frame arrived, so this must
-    /// not retry every silent turn such a server produces.
     #[test]
     fn a_partial_usage_block_still_proves_the_stream_completed() {
         let mut content = String::new();
@@ -1322,9 +1203,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
-    /// The case ADR 0009 protects: the model finished cleanly and chose to say
-    /// nothing. The usage chunk arrived, so the stream completed. This stays a
-    /// benign empty completion and must not be dragged into a retry.
     #[test]
     fn an_empty_turn_that_reported_usage_stays_a_benign_completion() {
         let mut content = String::new();
@@ -1355,9 +1233,6 @@ mod tests {
         assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
-    /// Feed one SSE error frame through the chunk parser and return the
-    /// message it fails with. Every error-frame test goes through the real
-    /// entry point rather than calling the formatter directly.
     fn stream_error_for(frame: &str) -> String {
         stream_error_from(crate::llm::ProviderKind::OpenAi, frame)
     }
@@ -1377,10 +1252,6 @@ mod tests {
         .to_string()
     }
 
-    /// OpenRouter sends `code` and `metadata` and no `type`, so a
-    /// `type`-only reader called every one of its failures `[unknown]` and
-    /// threw away the upstream text. Label from `code`, and name the
-    /// provider that actually produced the error.
     #[test]
     fn an_openrouter_error_frame_labels_the_code_and_names_the_provider() {
         let msg = stream_error_from(
@@ -1395,9 +1266,6 @@ mod tests {
         );
     }
 
-    /// The frame that ended the diagnosed turn: a bare message, no `type`
-    /// and no `code`. It still reads `[unknown]`, because there is genuinely
-    /// nothing else in the frame to say.
     #[test]
     fn an_error_frame_with_no_type_and_no_code_stays_unknown() {
         let msg = stream_error_for(r#"{"error":{"message":"ERROR"}}"#);
@@ -1405,8 +1273,6 @@ mod tests {
         assert!(msg.contains("does not recognise"), "{msg}");
     }
 
-    /// Regression: OpenAI's own frames carry `type`, which still wins over
-    /// `code` when both are present.
     #[test]
     fn an_openai_error_frame_still_labels_the_type() {
         let msg = stream_error_for(
@@ -1419,9 +1285,6 @@ mod tests {
         );
     }
 
-    /// A provider can put its whole error body in `raw`, newlines and all.
-    /// The line stays one line and stays bounded, because this string is
-    /// persisted in a `ResponseFailed` payload and rendered in the UI.
     #[test]
     fn a_long_multiline_provider_detail_is_flattened_and_bounded() {
         let raw = format!("upstream said:\n{}", "x".repeat(1000));
@@ -1441,8 +1304,6 @@ mod tests {
         assert!(msg.starts_with("OpenAI error (502): Provider returned error (Chutes: "));
     }
 
-    /// An error frame carrying nothing usable must still fail the stream,
-    /// rather than being read as an ordinary empty chunk.
     #[test]
     fn an_empty_error_object_still_fails_the_stream() {
         let msg = stream_error_for(r#"{"error":{}}"#);
@@ -1452,9 +1313,6 @@ mod tests {
         );
     }
 
-    /// A local OpenAI-compatible server often sends the error as a bare
-    /// string. Reading only `error.message` threw away the only text the
-    /// frame carried.
     #[test]
     fn a_bare_string_error_keeps_its_text() {
         let msg = stream_error_for(r#"{"error":"context window exceeded"}"#);
@@ -1464,8 +1322,6 @@ mod tests {
         );
     }
 
-    /// A provider that failed with no body sends `raw: null`. Rendering that
-    /// appended a literal "(null)" to an otherwise clean error.
     #[test]
     fn a_null_provider_body_appends_nothing() {
         let msg = stream_error_for(
@@ -1478,8 +1334,6 @@ mod tests {
         );
     }
 
-    /// The numeric `code` an OpenRouter frame carries names the failure, so a
-    /// transient upstream status retries and a client error does not.
     #[test]
     fn a_transient_upstream_status_reaches_the_retry_classifier() {
         let retries = |frame: &str| {
@@ -1502,14 +1356,6 @@ mod tests {
         ));
     }
 
-    /// Regression: after a tool call the agentic loop packs the ToolResult and
-    /// a trailing instruction Text into ONE user `Message::Blocks`. The
-    /// serializer must emit the `tool` message IMMEDIATELY after the assistant
-    /// `tool_calls` message — never wedge the user text between them — or strict
-    /// providers (Moonshot/Kimi, OpenAI) reject with HTTP 400 "an assistant
-    /// message with 'tool_calls' must be followed by tool messages … the
-    /// following tool_call_ids did not have response messages: load_knowhow:0".
-    /// (Observed on moonshotai/kimi-k3 via OpenRouter, thread 85239abe.)
     #[test]
     fn tool_result_immediately_follows_assistant_tool_calls() {
         let messages = vec![
@@ -1541,8 +1387,6 @@ mod tests {
             .map(|message| message.into_value(false))
             .collect();
 
-        // Exactly three wire messages, in order:
-        //   assistant(tool_calls) → tool(result) → user(text)
         assert_eq!(
             wire.len(),
             3,
@@ -1559,8 +1403,6 @@ mod tests {
             .unwrap()
             .contains("Results above"));
 
-        // The tool response must be ADJACENT to the assistant tool_calls — no
-        // `user` message wedged between (that is the Moonshot/Kimi 400).
         let assistant_idx = wire.iter().position(|m| m["role"] == "assistant").unwrap();
         let tool_idx = wire
             .iter()
@@ -1573,9 +1415,6 @@ mod tests {
         );
     }
 
-    /// `stream_options.include_usage` must be present in the Chat
-    /// Completions request body. Without it, OpenAI never sends the final
-    /// usage chunk and `meta.usage` stays `None`.
     #[test]
     fn chat_body_requests_usage_in_stream() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
@@ -1626,7 +1465,6 @@ mod tests {
         body.to_string().matches("\"cache_control\"").count()
     }
 
-    /// The wire indexes of the messages whose content carries a marker.
     fn marked_messages(body: &serde_json::Value) -> Vec<usize> {
         body["messages"]
             .as_array()
@@ -1646,8 +1484,6 @@ mod tests {
         ]
     }
 
-    /// Every other model on this wire gets the body it always got. A strict or
-    /// local server can reject a key it does not know.
     #[test]
     fn a_model_outside_the_anthropic_namespace_gets_no_cache_control() {
         for model in [
@@ -1667,8 +1503,6 @@ mod tests {
         }
     }
 
-    /// Priority mirrors `anthropic_wire`: the last message, the one before it,
-    /// each memory view, then the system block.
     #[test]
     fn an_anthropic_request_marks_last_messages_views_then_system() {
         let body = body_for(CLAUDE, &history(), Some("system"));
@@ -1681,17 +1515,12 @@ mod tests {
             wire[2]["content"][0]["cache_control"], marker,
             "penultimate"
         );
-        // The last message is marked at its final non-tail part, and its view
-        // part holds a marker of its own.
         assert_eq!(wire[3]["content"][1]["text"], "second question");
         assert_eq!(wire[3]["content"][1]["cache_control"], marker, "last");
         assert_eq!(wire[3]["content"][0]["cache_control"], marker, "view");
         assert_eq!(marker_count(&body), 4);
     }
 
-    /// The stable context block is plain text on this wire (I8). A GPT model
-    /// gets it joined, and an Anthropic model gets a part of its own that
-    /// carries no marker.
     #[test]
     fn a_stable_context_block_is_plain_text_and_takes_no_marker() {
         let stable = ContentBlock::StableContext {
@@ -1708,8 +1537,6 @@ mod tests {
         assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
     }
 
-    /// A tail block carries the engine's volatile notes. It is rewritten every
-    /// round, so it never anchors a marker.
     #[test]
     fn an_engine_tail_never_anchors_a_marker() {
         let messages = vec![msg("user", vec![text("question"), tail("volatile note")])];
@@ -1720,9 +1547,6 @@ mod tests {
         assert_eq!(content[1]["text"], "volatile note");
     }
 
-    /// Tool results split off into `tool` messages, which take no marker. The
-    /// tail then sits alone in a user message, and the marker goes to the
-    /// message before the tool round instead.
     #[test]
     fn a_message_of_only_tail_text_takes_no_marker() {
         let messages = vec![
@@ -1770,8 +1594,6 @@ mod tests {
         }
         let body = body_for(CLAUDE, &messages, Some("system"));
         assert_eq!(marker_count(&body), 4, "{body}");
-        // The two newest messages hold two of them. The system block is last in
-        // priority, and the views spent the rest.
         let marked = marked_messages(&body);
         assert!(marked.contains(&12) && marked.contains(&11), "{marked:?}");
         assert!(
@@ -1780,9 +1602,6 @@ mod tests {
         );
     }
 
-    /// A tool round: the last wire message is a `tool` message, which takes
-    /// only a string. The marker walks back to the nearest message that can
-    /// hold one, and no part is empty.
     #[test]
     fn a_tool_round_marks_only_messages_that_take_a_part_array() {
         let messages = vec![
@@ -1819,7 +1638,6 @@ mod tests {
         assert!(!body.to_string().contains(r#""text":"""#), "{body}");
     }
 
-    /// An assistant message holding only `tool_calls` has no text to mark.
     #[test]
     fn a_message_with_no_text_is_not_marked() {
         let messages = vec![msg(
@@ -1835,7 +1653,6 @@ mod tests {
         assert_eq!(marker_count(&body), 0, "{body}");
     }
 
-    /// The tool result must still follow its assistant `tool_calls` message.
     #[test]
     fn an_anthropic_tool_round_keeps_the_result_adjacent() {
         let messages = vec![
@@ -1870,9 +1687,6 @@ mod tests {
         assert_eq!(body["messages"][2]["content"][0]["text"], "Results above.");
     }
 
-    /// A message keeps the same blocks with or without a marker. A cache entry
-    /// is keyed on them, so a message marked last round must not change shape
-    /// when it is plain this round.
     #[test]
     fn an_unmarked_message_renders_the_blocks_it_had_when_marked() {
         let mut messages = vec![msg("user", vec![text("context"), tail("volatile note")])];
@@ -1897,7 +1711,6 @@ mod tests {
         );
     }
 
-    /// Images ride beside the text parts, and a marker lands on text only.
     #[test]
     fn an_image_message_keeps_its_image_after_the_marked_text() {
         let messages = vec![msg(
@@ -1918,7 +1731,6 @@ mod tests {
         assert_eq!(marker_count(&body), 1);
     }
 
-    /// Chat Completions forces a call by naming the function.
     #[test]
     fn a_forced_call_names_its_function() {
         assert_eq!(
@@ -1927,14 +1739,6 @@ mod tests {
         );
     }
 
-    /// The effort reaches the body exactly as handed in, for every model.
-    ///
-    /// This builder also serves OpenRouter and local servers, so it cannot tell
-    /// whose vocabulary applies from the model id. It used to rewrite `max`
-    /// into `xhigh` whenever the id was not `gpt-5.6`, which sent an
-    /// OpenAI-proprietary tier to a local server that rejected it (400,
-    /// 2026-08-12). Deciding what a model supports belongs to `llm::reasoning`
-    /// and is enforced by `RoutingProvider`; a second rule here is drift.
     #[test]
     fn chat_body_sends_the_reasoning_effort_verbatim() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
@@ -1956,8 +1760,6 @@ mod tests {
         }
     }
 
-    /// No effort means no key at all, so the server applies its own default
-    /// rather than being told a value the caller never chose.
     #[test]
     fn chat_body_omits_reasoning_effort_when_none_is_given() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
@@ -1966,8 +1768,6 @@ mod tests {
             .body;
         assert!(body.get("reasoning_effort").is_none());
     }
-
-    // --- Prefill beats (ADR 0556) ---
 
     fn chat_body(model: &str, messages: &[Message], system: Option<&str>) -> ChatBody {
         OpenAiProvider::new("k".to_string(), model.to_string())
@@ -1987,7 +1787,6 @@ mod tests {
         serde_json::from_slice(bytes).expect("a body is JSON")
     }
 
-    /// `body` as a prefill: one output token, not streamed, no usage stream.
     fn as_prefill(body: &serde_json::Value) -> serde_json::Value {
         let mut value = body.clone();
         let object = value.as_object_mut().unwrap();
@@ -1998,8 +1797,6 @@ mod tests {
         value
     }
 
-    /// The whole cut keeps the turn's reasoning and tool choice. The stable
-    /// cut ends at the marked view, never at a rolling mark after it.
     #[test]
     fn an_openrouter_pair_cuts_at_the_last_marked_view() {
         let ChatBody {
@@ -2028,8 +1825,6 @@ mod tests {
         assert_eq!(pair.stable.output_cap, Some(CHAT_OUTPUT_CAP));
     }
 
-    /// The beat writes the bytes the turn writes: the same serializer over
-    /// the same body, edited only where a beat differs (ADR 0581).
     #[test]
     fn an_openrouter_beat_keeps_the_turns_bytes() {
         let ChatBody { body, stable_end } = chat_body(CLAUDE, &history(), Some("system"));
@@ -2045,8 +1840,6 @@ mod tests {
         assert_eq!(&*pair.stable.body, serde_json::to_vec(&whole).unwrap());
     }
 
-    /// With no view, a marked system block ends the cut, and a placeholder
-    /// message follows it.
     #[test]
     fn with_no_view_the_cut_keeps_the_marked_system_block() {
         let plain = vec![
@@ -2070,8 +1863,6 @@ mod tests {
         assert!(chat_body(CLAUDE, &plain, None).stable_end.is_none());
     }
 
-    /// A model outside the Anthropic namespace carries no marker, so a beat
-    /// would read nothing.
     #[test]
     fn a_model_outside_the_anthropic_namespace_gets_no_cut() {
         for model in ["gpt-5.4", "z-ai/glm-5.2", "google/gemini-3.8-flash"] {
@@ -2094,8 +1885,6 @@ mod tests {
 
     const PREFILL_REPLY: &str = r#"{"model":"anthropic/claude-haiku-5.5","choices":[],"usage":{"prompt_tokens":900,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":880}}}"#;
 
-    /// A turn hands back its pair, and the beat posts the stable cut to the
-    /// Chat Completions endpoint and reads the reply's usage.
     #[tokio::test]
     async fn a_turn_returns_a_pair_whose_beat_reads_the_turn() {
         let (base, bodies) =
@@ -2141,9 +1930,6 @@ mod tests {
         assert_eq!(beat_body, &json(&pair.stable.body));
     }
 
-    /// The first text or tool-call delta stamps the call trace, which is how a
-    /// reply's time to first token reaches its row. A chunk that carries no
-    /// content does not.
     #[tokio::test]
     async fn a_chat_stream_marks_its_first_content() {
         let feed = |chunk: &'static str| async move {

@@ -1,11 +1,3 @@
-//! A child that ends its turn holding an event wait has not finished
-//! (ADR 0254).
-//!
-//! The turn ends because arming a wait and finishing is the event-wait
-//! contract. The wait wakes the child for another turn, and that turn reports.
-//! Each test pins one invariant of the addendum in
-//! `docs/plans/2026-09-23-stopped-child.md`.
-
 use super::super::ChildSettle;
 use super::*;
 use crate::core::event_subscription::EventSubscription;
@@ -55,8 +47,6 @@ async fn emit_wait_canceled(
     .unwrap();
 }
 
-/// The wake an expiry or a delivery sends: the wait resolves, and the
-/// engine's re-entry prompt opens the next turn.
 async fn wake_from_wait(bus: &EventBus, thread_id: Uuid, wait_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -88,8 +78,6 @@ async fn callback_pending(pool: &PgPool, thread_id: Uuid) -> bool {
         .unwrap()
 }
 
-/// The reported shape. A coding-agent child arms a wait for a shared slot and
-/// idles. The idle must not reach the parent as a success.
 #[tokio::test]
 async fn a_child_that_idles_holding_a_wait_sends_no_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -111,8 +99,6 @@ async fn a_child_that_idles_holding_a_wait_sends_no_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// The wait fires, the child works another turn and finishes. That turn is
-/// the one the parent hears about, once.
 #[tokio::test]
 async fn the_turn_the_wait_wakes_reports_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -137,8 +123,6 @@ async fn the_turn_the_wait_wakes_reports_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// Stop waiting wakes nothing. With no wait left on an idle child, the card it
-/// held back is due now, or the parent never hears.
 #[tokio::test]
 async fn stopping_the_last_wait_on_an_idle_child_sends_the_held_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -170,10 +154,6 @@ async fn stopping_the_last_wait_on_an_idle_child_sends_the_held_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// The idle held its proposal while the wait was live (ADR 0395). So a child
-/// with branch work has no change yet when its last wait is stopped. The cancel
-/// defers its card to the branch-work net. The net reads the deferral, proposes
-/// the work, then sends one card that lists the change.
 #[tokio::test]
 async fn a_held_card_waits_for_the_proposal_and_lists_the_change() {
     let (pool, db_name) = setup_test_db().await;
@@ -221,8 +201,6 @@ async fn a_held_card_waits_for_the_proposal_and_lists_the_change() {
     teardown_test_db(&db_name).await;
 }
 
-/// An agent standing its own wait down mid-turn is not the end of anything:
-/// the running turn's own terminal reports.
 #[tokio::test]
 async fn a_stand_down_on_a_running_child_sends_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -253,8 +231,6 @@ async fn a_stand_down_on_a_running_child_sends_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// Archiving a child holding a wait ends it, so the parent gets the canceled card,
-/// even while the archive has not yet cancelled the child's wait.
 #[tokio::test]
 async fn archiving_a_waiting_child_sends_one_canceled_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -270,7 +246,6 @@ async fn archiving_a_waiting_child_sends_one_canceled_card() {
     assert_eq!(newest_completion_card(&pool, parent_id).await.0, "canceled");
     assert_eq!(drain_callbacks(&mut callback_rx), 1);
 
-    // The archive then stands the wait down. That owes nothing more.
     emit_wait_canceled(
         &bus,
         child_id,
@@ -284,8 +259,6 @@ async fn archiving_a_waiting_child_sends_one_canceled_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// A discard of the change on a child holding a wait does not end the child: the wait
-/// still wakes it, and that turn reports.
 #[tokio::test]
 async fn discarding_a_waiting_childs_change_sends_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -304,8 +277,6 @@ async fn discarding_a_waiting_childs_change_sends_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// A failed turn reports at once, wait or not: a failure is worth knowing
-/// whatever the wait brings later.
 #[tokio::test]
 async fn a_failed_turn_holding_a_wait_still_reports() {
     let (pool, db_name) = setup_test_db().await;
@@ -335,8 +306,6 @@ async fn a_failed_turn_holding_a_wait_still_reports() {
     teardown_test_db(&db_name).await;
 }
 
-/// A child that crashed while holding a wait is not idle. Ending its last
-/// wait must not report its crashed turn as a success.
 #[tokio::test]
 async fn stopping_the_last_wait_on_a_crashed_child_sends_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -366,7 +335,6 @@ async fn stopping_the_last_wait_on_a_crashed_child_sends_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// How many `ChildReportFiled` rows sit on `parent_id`.
 async fn count_filed_reports(pool: &PgPool, parent_id: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ChildReportFiled'",
@@ -377,8 +345,6 @@ async fn count_filed_reports(pool: &PgPool, parent_id: Uuid) -> i64 {
     .unwrap()
 }
 
-/// A `no-wake` child's held card is filed when its last wait ends: the parent
-/// declared at the spawn that it does not act on this child.
 #[tokio::test]
 async fn a_no_wake_childs_held_card_is_filed() {
     let (pool, db_name) = setup_test_db().await;
@@ -401,8 +367,6 @@ async fn a_no_wake_childs_held_card_is_filed() {
     teardown_test_db(&db_name).await;
 }
 
-/// Archiving a waiting `no-wake` child files its canceled card, and starts no
-/// parent turn.
 #[tokio::test]
 async fn archiving_a_waiting_no_wake_child_files_its_card() {
     let (pool, db_name) = setup_test_db().await;

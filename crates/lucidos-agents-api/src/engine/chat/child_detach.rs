@@ -1,59 +1,26 @@
-//! Moving a child thread to top level: the parent stops waiting for it
-//! (ADR 0278).
-//!
-//! The move is one event, `ChildThreadDetached`, on the **former parent**. Its
-//! projection arm cuts the edge. Nothing is stopped: a child mid-turn finishes
-//! that turn, keeps its work and proposes its change, and its result lands on
-//! its own timeline only.
-//!
-//! Two callers, told apart by what the engine verified about them:
-//!
-//! - **An agent** holds to ADR 0043's ladder. It moves only its own direct
-//!   children, and the caller is ambient, never a parameter. Nothing more is
-//!   asked: creating a top-thread needs no authority (ADR 0475).
-//! - **The user** moves any thread that has a parent. The route trusts an
-//!   untokened caller exactly as archive and discard do (ADR 0052).
-//!
-//! ## Why a typed error here
-//!
-//! For the reason `ChildFollowUpError` has one: the route maps each variant to
-//! a status, and the LLM tool turns each into its own actionable sentence.
-
 use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
-/// Who asked for the move, as the engine verified it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DetachCaller {
-    /// The user's own device, or the local API with no origin token.
     User,
-    /// A thread-bound caller: an LLM tool's ambient thread, or a verified
-    /// origin token. `None` is a verified subprocess with no thread of its own.
     Agent(Option<Uuid>),
 }
 
-/// Why a move to top level was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildDetachError {
-    /// No `thread_summaries` row for the target id.
     UnknownThread(Uuid),
-    /// The user asked to move a thread that is already top level.
     NotAChild(Uuid),
     NotYourChild(Uuid),
-    /// The target was thrown away by the user.
     Discarded(Uuid),
-    /// An agent addressed itself.
     SelfTarget(Uuid),
-    /// A verified subprocess with no thread, so it has no children.
     NoCaller,
-    /// The row read or the emit failed.
     Internal(String),
 }
 
 impl ChildDetachError {
-    /// HTTP status for `POST /api/v1/threads/:thread_id/detach`.
     pub(crate) fn status_code(&self) -> u16 {
         match self {
             Self::UnknownThread(_) => 404,
@@ -91,7 +58,6 @@ impl std::fmt::Display for ChildDetachError {
 
 impl std::error::Error for ChildDetachError {}
 
-/// What the caller gets back once the move is on the former parent's timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetachAck {
     pub child_thread_id: Uuid,
@@ -99,16 +65,10 @@ pub(crate) struct DetachAck {
     pub former_parent_id: Uuid,
 }
 
-/// The target's row as the ladder reads it:
-/// `(parent_thread_id, state, title, first_message)`.
 type TargetRow = (Option<Uuid>, Option<String>, Option<String>, Option<String>);
 
 #[easy_ext::ext(ChildDetachExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Load the target's row and run the refusal ladder. Pure: reads one row
-    /// and writes nothing, so it is testable without an engine.
-    ///
-    /// Returns the former parent and the child's label.
     async fn authorize_child_detach(
         pool: &sqlx::PgPool,
         caller: DetachCaller,
@@ -151,9 +111,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         ))
     }
 
-    /// Move `target` to top level on `caller`'s authority.
-    ///
-    /// `meta` carries the actor, so the event says who moved the thread.
     async fn detach_child_thread(
         &self,
         caller: DetachCaller,
@@ -163,8 +120,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         Self::move_child_to_top_level(&self.event_bus, caller, target, meta).await
     }
 
-    /// The move itself, over the bus alone so it is testable without an
-    /// engine. The route, the CLI and the LLM tool all arrive here.
     async fn move_child_to_top_level(
         bus: &EventBus,
         caller: DetachCaller,
@@ -174,8 +129,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         let (former_parent_id, child_title) =
             Self::authorize_child_detach(bus.pool(), caller, target).await?;
 
-        // Boxed: the emit reaches the fan-in, which can re-enter an agentic
-        // loop whose tool dispatch calls back into this function.
         let emitted = Box::pin(bus.emit(BusEvent::Thread {
             thread_id: former_parent_id,
             event: ThreadEvent::ChildThreadDetached {
@@ -186,7 +139,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         }))
         .await
         .map_err(|e| ChildDetachError::Internal(e.to_string()))?;
-        // The bus drops a move whose edge a concurrent move already cut.
         if emitted.is_none() {
             return Err(ChildDetachError::NotAChild(target));
         }

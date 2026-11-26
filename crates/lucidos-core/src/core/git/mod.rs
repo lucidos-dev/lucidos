@@ -1,5 +1,3 @@
-//! Git command primitives shared by the store and repository orchestration.
-
 mod conflict_probe;
 pub use conflict_probe::{predict_merge_into_main, probe_merge, MergeProbe};
 
@@ -8,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Canonical absolute repo root, as the DB key of a per-branch marker.
+/// INVARIANT: Canonical absolute repo root, as the DB key of a per-branch marker.
 ///
 /// Resolves symlinks, so the git hook and the engine produce the same row. The
 /// hook derives its path from `git rev-parse --git-common-dir`, which can
@@ -27,13 +25,9 @@ pub fn canonical_repo_root(repo_root: &Path) -> String {
         .to_string()
 }
 
-/// How long a single git invocation may run before the engine gives up on it.
-/// Generous, because it is a ceiling on a saturated host, not a latency target:
-/// while the e2e suite runs, ordinary `rev-parse` calls have been observed
-/// taking tens of seconds.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The git binary the engine launches, resolved once per process.
+/// INVARIANT: The git binary the engine launches, resolved once per process.
 ///
 /// On macOS `/usr/bin/git` is the `xcrun` shim, which launches the real git as
 /// a second process. Every launch costs tens of milliseconds there, so the shim
@@ -66,15 +60,13 @@ pub(crate) async fn git_program() -> &'static Path {
         .await
 }
 
-/// Only the `xcrun` shim is bypassed. Another `git` on PATH may be a wrapper
+/// INVARIANT: Only the `xcrun` shim is bypassed. Another `git` on PATH may be a wrapper
 /// that injects config, credentials or auditing. Launching the binary behind
 /// it would skip all of that.
 fn is_xcrun_git_shim(path_git: Option<&Path>, macos: bool) -> bool {
     macos && path_git == Some(Path::new("/usr/bin/git"))
 }
 
-/// `<exec-path>/git` when `git --exec-path` answered with a directory holding
-/// one, else bare `git`. A failed probe costs the shortcut, never a git call.
 fn git_program_from_exec_path(stdout: Option<&[u8]>) -> PathBuf {
     let dir = stdout.map(|s| String::from_utf8_lossy(s).trim().to_string());
     match dir.filter(|d| !d.is_empty()) {
@@ -83,21 +75,13 @@ fn git_program_from_exec_path(stdout: Option<&[u8]>) -> PathBuf {
     }
 }
 
-/// Run a git command with the [`GIT_TIMEOUT`] ceiling. Always prepends
+/// INVARIANT: Run a git command with the [`GIT_TIMEOUT`] ceiling. Always prepends
 /// `-c core.quotepath=false` so non-ASCII paths come back as raw UTF-8 instead
 /// of git's default `"...\NNN..."` form — every caller treats output as a path.
 pub async fn git_cmd(args: &[&str], dir: &Path) -> Result<std::process::Output, String> {
     git_cmd_env(args, dir, &[]).await
 }
 
-/// Run a git command that is expected to DO something, folding a non-zero exit
-/// into the same `Err` a spawn failure or the [`GIT_TIMEOUT`] produces.
-///
-/// [`git_cmd`] returning `Ok` says only that git ran, not that it did the
-/// thing. A caller who just needs "did it work, and if not why" otherwise
-/// writes that three-arm match out at every site. Use this for a mutating
-/// call. For a yes/no *question* reach for `git_answer` instead, which keeps
-/// "no" and "could not ask" apart.
 pub async fn git_ran_ok(args: &[&str], dir: &Path) -> Result<(), String> {
     match git_cmd(args, dir).await {
         Ok(o) if o.status.success() => Ok(()),
@@ -106,9 +90,6 @@ pub async fn git_ran_ok(args: &[&str], dir: &Path) -> Result<(), String> {
     }
 }
 
-/// The repo's shared `.git` directory, as an absolute path. Asked from a linked
-/// worktree, it names the main checkout's `.git`. A failed spawn, the timeout,
-/// a non-zero exit and an empty answer are all `Err`, never a guessed path.
 pub async fn git_common_dir(dir: &Path) -> Result<PathBuf, String> {
     let out = git_cmd(&["rev-parse", "--git-common-dir"], dir).await?;
     if !out.status.success() {
@@ -121,15 +102,9 @@ pub async fn git_common_dir(dir: &Path) -> Result<PathBuf, String> {
     if raw.is_empty() {
         return Err("git rev-parse --git-common-dir returned nothing".to_string());
     }
-    // Git may answer relative to `dir`. Joining an absolute answer returns it.
     Ok(dir.join(raw))
 }
 
-/// The repo's main working tree, asked from any worktree of it. Git lists it
-/// first in `git worktree list`, which holds for a submodule too. A bare repo
-/// has none. Nor does a `--separate-git-dir` clone asked from a linked
-/// worktree: git records no path for it and names the git dir instead. Both
-/// are `Err`, like every failure to ask.
 pub async fn git_main_worktree(dir: &Path) -> Result<PathBuf, String> {
     let out = git_cmd(&["worktree", "list", "--porcelain"], dir).await?;
     if !out.status.success() {
@@ -155,9 +130,6 @@ pub async fn git_main_worktree(dir: &Path) -> Result<PathBuf, String> {
     Ok(main)
 }
 
-/// The author and committer env for a commit Lucidos itself makes, so it
-/// works when the repo has no user.name/email in its config. The engine
-/// commits artifacts through git2 with a per-commit signature, not config.
 pub fn lucidos_identity_env() -> Vec<(&'static str, &'static OsStr)> {
     vec![
         ("GIT_AUTHOR_NAME", OsStr::new("Lucidos")),
@@ -167,9 +139,6 @@ pub fn lucidos_identity_env() -> Vec<(&'static str, &'static OsStr)> {
     ]
 }
 
-/// Like [`git_cmd`] but with extra environment variables. Used by the command
-/// checkpoint helpers, which set `GIT_INDEX_FILE` to a throwaway index so a
-/// snapshot/restore never disturbs the repo's real index or working tree.
 pub async fn git_cmd_env(
     args: &[&str],
     dir: &Path,
@@ -178,9 +147,6 @@ pub async fn git_cmd_env(
     git_cmd_env_timeout(args, dir, envs, GIT_TIMEOUT).await
 }
 
-/// [`git_cmd_env`] with an explicit ceiling. Tests use it to force the expiry
-/// branch. Production callers get [`GIT_TIMEOUT`], unless the command moves a
-/// whole repository's history, like a restore fetching `origin`.
 pub async fn git_cmd_env_timeout(
     args: &[&str],
     dir: &Path,
@@ -190,7 +156,7 @@ pub async fn git_cmd_env_timeout(
     git_cmd_spawn(args, dir, envs, timeout, false).await
 }
 
-/// [`git_cmd`] for a command the engine may SIGKILL the moment it stops
+/// INVARIANT: [`git_cmd`] for a command the engine may SIGKILL the moment it stops
 /// waiting. Opt-in, because leaving a timed-out process alone is the right
 /// default. Killing a half-written `commit` or `merge` strands a lock file over
 /// a command that would have finished.
@@ -208,7 +174,7 @@ pub async fn git_cmd_kill_on_timeout(
     git_cmd_spawn(args, dir, &[], GIT_TIMEOUT, true).await
 }
 
-/// Run `program`, falling back to PATH's `git` when `program` is gone.
+/// INVARIANT: Run `program`, falling back to PATH's `git` when `program` is gone.
 ///
 /// The resolved binary can vanish under a running engine: a Homebrew upgrade
 /// deletes the versioned keg its exec path named, while PATH's `git` follows
@@ -223,7 +189,7 @@ async fn run_git(
     let output = |program: &Path| {
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args).current_dir(dir).kill_on_drop(kill_on_drop);
-        // `git status` refreshes a stale index under `index.lock`. That lock
+        // INVARIANT: `git status` refreshes a stale index under `index.lock`. That lock
         // makes a concurrent `git add` or `git commit` in the same worktree
         // die. Mandatory locks are unaffected. `git diff` ignores this
         // setting, so a probe uses the plumbing `diff-files` instead.
@@ -241,9 +207,6 @@ async fn run_git(
     }
 }
 
-/// The one place a git command is spawned, through [`run_git`]. The only other
-/// launch is [`git_program`]'s one-time probe, which finds the binary this runs.
-/// `kill_on_timeout` decides whether giving up on the wait also kills the process.
 async fn git_cmd_spawn(
     args: &[&str],
     dir: &Path,
@@ -270,42 +233,32 @@ async fn git_cmd_spawn(
 #[cfg(test)]
 mod program_tests;
 
-/// Whether `path` (repo-relative) is a plan file: what the `implementation-plan`
+/// INVARIANT: Whether `path` (repo-relative) is a plan file: what the `implementation-plan`
 /// skill writes, and what the `cc-plan-gate` hook never blocks.
 pub fn is_plan_file(path: &str) -> bool {
     path.starts_with("docs/plans/")
 }
 
-/// Whether every file a branch would land is a plan file. An empty list is no
-/// evidence of a plan-only branch.
 pub fn lands_plan_files_only(landing: &[String]) -> bool {
     !landing.is_empty() && landing.iter().all(|f| is_plan_file(f))
 }
 
-/// Whether Lucidos-source work must run `/harden` before it may become a
-/// change or merge. A plan has no tests, so hardening runs on the branch that
-/// implements it.
 pub fn needs_hardening(hardened: bool, landing: &[String]) -> bool {
     !hardened && !lands_plan_files_only(landing)
 }
 
-/// Prefix of a lane batch's *integration branch* (ADR 0463).
 pub const LANE_BRANCH_PREFIX: &str = "lane/";
 
-/// The integration branch a lane batch's lane thread resolves on.
 pub fn lane_branch(batch_id: Uuid) -> String {
     format!("{LANE_BRANCH_PREFIX}{batch_id}")
 }
 
-/// The batch a lane branch belongs to. `None` for any other branch.
 pub fn lane_branch_batch(branch: &str) -> Option<Uuid> {
     branch
         .strip_prefix(LANE_BRANCH_PREFIX)
         .and_then(|id| Uuid::parse_str(id).ok())
 }
 
-/// Is this a lane batch's integration branch? Orphan recovery scans these
-/// beside the coding-agent branches, since a lane thread works on one.
 pub fn is_lane_branch(branch: &str) -> bool {
     lane_branch_batch(branch).is_some()
 }
@@ -316,7 +269,7 @@ pub const LANE_BRANCH_IS_NOT_A_CHANGE: &str =
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-/// Directories whose files feed the served client bundle. Mirrors `watchDirs`
+/// INVARIANT: Directories whose files feed the served client bundle. Mirrors `watchDirs`
 /// in `crates/lucidos-app/dev-build-watch.mjs`.
 pub const CLIENT_BUNDLE_DIRS: &[&str] = &[
     "crates/lucidos-app/src/",
@@ -325,7 +278,7 @@ pub const CLIENT_BUNDLE_DIRS: &[&str] = &[
     "packages/lucidos-sdk/src/",
 ];
 
-/// Single files that feed the served client bundle. Mirrors `watchFiles` in
+/// INVARIANT: Single files that feed the served client bundle. Mirrors `watchFiles` in
 /// `crates/lucidos-app/dev-build-watch.mjs`.
 pub const CLIENT_BUNDLE_FILES: &[&str] = &[
     "crates/lucidos-app/index.html",
@@ -335,10 +288,6 @@ pub const CLIENT_BUNDLE_FILES: &[&str] = &[
     "package-lock.json",
 ];
 
-/// True if any of `files` is an input the build-watch rebuilds the served
-/// client from. After a frontend-only Apply the engine waits for that rebuild,
-/// so a file the watch ignores (an e2e spec, a script) must not count: no
-/// build would run, and the wait would end in a false "not served yet" warning.
 pub fn files_have_client_update(files: &[String]) -> bool {
     files.iter().any(|f| {
         CLIENT_BUNDLE_FILES.contains(&f.as_str())

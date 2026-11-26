@@ -1,19 +1,3 @@
-//! A chat model answering the typed questions in [`super`] (ADR 0363).
-//!
-//! The questions travel as JSON, and the answer comes back through one tool
-//! whose schema the questions define. That is the structured output every
-//! provider here supports, and it needs no per-site prompt.
-//!
-//! **Rust reads the answer, not the model.** A Choice comes back as one number
-//! per option, and [`read_choice`] normalises them into a distribution. An
-//! answer that is missing, mistyped or out of range is dropped, never guessed.
-//! Each site then applies its own threshold to what survived, and reads a
-//! missing answer as its safe default. For the command guard that is
-//! `IrreversibleDanger` (I13).
-//!
-//! **An unreadable reply is not an error.** Only a failed call is. A reply was
-//! paid for, so the caller records its cost and reads the empty answer set.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,11 +7,8 @@ use serde_json::{json, Map, Value};
 use super::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentProvider, NoulAnswer, Question};
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent, ToolDefinition};
 
-/// The one tool the model answers through.
 pub(crate) const ANSWER_TOOL: &str = "submit_answers";
 
-/// The whole instruction. Every site's meaning rides in its questions, so this
-/// text never changes per site.
 const SYSTEM_PROMPT: &str = "You answer typed questions about a state, for software that \
 reads your answers as numbers. You never write prose.
 
@@ -44,14 +25,9 @@ than forcing one.
 Call the `submit_answers` tool exactly once, with an answer for every question id. Do not \
 answer in text.";
 
-/// A judgment provider backed by a chat model.
 pub struct ChatJudgmentProvider {
     provider: Arc<dyn LlmProvider>,
-    /// The effort half of the site's *model selection*.
     reasoning: Option<String>,
-    /// Whether the call forces the answer tool. A forced call cannot answer
-    /// in text and runs without thinking, and a model that always thinks
-    /// refuses it, which fails the call.
     forced: bool,
 }
 
@@ -64,7 +40,6 @@ impl ChatJudgmentProvider {
         }
     }
 
-    /// Force the answer tool, for a site whose every call must answer.
     pub fn forcing_the_answer(self) -> Self {
         Self {
             forced: true,
@@ -73,8 +48,6 @@ impl ChatJudgmentProvider {
     }
 }
 
-/// The state as the model reads it: a text state as itself, anything else as
-/// pretty JSON.
 pub(crate) fn state_text(state: &Value) -> String {
     match state {
         Value::String(text) => text.clone(),
@@ -82,7 +55,6 @@ pub(crate) fn state_text(state: &Value) -> String {
     }
 }
 
-/// The user message: the state, then the questions in the System One shape.
 pub(crate) fn user_message(state: &Value, questions: &[(String, Question)]) -> String {
     let questions: Map<String, Value> = questions
         .iter()
@@ -95,8 +67,6 @@ pub(crate) fn user_message(state: &Value, questions: &[(String, Question)]) -> S
     )
 }
 
-/// The answer tool, its schema built from the questions so the model sees
-/// every id and every option name it must answer.
 pub(crate) fn answer_tool(questions: &[(String, Question)]) -> ToolDefinition {
     let mut properties = Map::with_capacity(questions.len());
     for (id, question) in questions {
@@ -129,7 +99,6 @@ pub(crate) fn answer_tool(questions: &[(String, Question)]) -> ToolDefinition {
     }
 }
 
-/// The answers in one reply, keeping only those that read cleanly.
 pub(crate) fn read_answers(response: &LlmResponse, questions: &[(String, Question)]) -> Answers {
     let Some(object) = reply_object(response) else {
         return Answers::default();
@@ -153,8 +122,6 @@ pub(crate) fn read_answers(response: &LlmResponse, questions: &[(String, Questio
     Answers::new(answers)
 }
 
-/// The JSON object the model answered with: the tool call's arguments, or a
-/// bare object in the text when the model ignored the tool.
 fn reply_object(response: &LlmResponse) -> Option<Map<String, Value>> {
     if let Some(call) = response.tool_calls.iter().find(|c| c.name == ANSWER_TOOL) {
         return match &call.arguments {
@@ -166,7 +133,6 @@ fn reply_object(response: &LlmResponse) -> Option<Map<String, Value>> {
     object_in_text(response.content.as_deref().unwrap_or(""))
 }
 
-/// The outermost `{...}` in a text reply, fences and prose around it ignored.
 fn object_in_text(text: &str) -> Option<Map<String, Value>> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
@@ -179,17 +145,11 @@ fn object_in_text(text: &str) -> Option<Map<String, Value>> {
     }
 }
 
-/// A probability of yes, or `None` for anything outside 0 to 1.
 fn read_noul(value: &Value) -> Option<NoulAnswer> {
     let p = value.as_f64()?;
     (p.is_finite() && (0.0..=1.0).contains(&p)).then_some(NoulAnswer { noul: p })
 }
 
-/// One number per declared option, normalised to sum to 1.
-///
-/// An option the reply left out reads as zero, and a name it invented is
-/// ignored. A negative or non-numeric value, or no weight at all, drops the
-/// whole answer: nothing is inferred from a reply that broke the schema.
 pub(crate) fn read_choice(
     criteria: &[(String, Option<String>)],
     value: &Value,
@@ -211,7 +171,6 @@ pub(crate) fn read_choice(
         .iter()
         .map(|(name, w)| (name.clone(), w / total))
         .collect();
-    // Ties go to the option declared first, so the pick is deterministic.
     let mut choice = &weights[0];
     for candidate in &weights[1..] {
         if candidate.1 > choice.1 {
@@ -225,8 +184,6 @@ pub(crate) fn read_choice(
     })
 }
 
-/// How concentrated a distribution is, from 0 (uniform) to 1 (certain): one
-/// minus its entropy over the entropy of a uniform one.
 fn concentration(probabilities: impl Iterator<Item = f64>, options: usize) -> f64 {
     if options < 2 {
         return 1.0;

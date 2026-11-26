@@ -7,7 +7,6 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    // User sends message
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -41,7 +40,6 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
             .unwrap();
     assert_eq!(section, "inbox");
 
-    // ResponseAborted (engine crash recovery)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseAborted {
@@ -56,7 +54,6 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
     .await
     .unwrap();
 
-    // Verify thread is now in inbox
     let section: String =
         sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -68,7 +65,6 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
         "ResponseAborted should surface chat thread to inbox"
     );
 
-    // Verify has_response is true
     let has_response: bool =
         sqlx::query_scalar("SELECT has_response FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -90,7 +86,6 @@ async fn response_canceled_sets_has_response_true() {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    // User sends message — creates thread_summaries row with has_response=false
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -124,7 +119,6 @@ async fn response_canceled_sets_has_response_true() {
             .unwrap();
     assert!(!has_response, "has_response should start as false");
 
-    // User cancels the response
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseCanceled {
@@ -139,9 +133,6 @@ async fn response_canceled_sets_has_response_true() {
     .await
     .unwrap();
 
-    // has_response must be true — a canceled response is still a response.
-    // Without this, the thread won't appear in get_recent_threads (which
-    // filters has_response=TRUE) and becomes invisible after page reload.
     let has_response: bool =
         sqlx::query_scalar("SELECT has_response FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -163,7 +154,6 @@ async fn trigger_completed_sets_has_response_true() {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    // TriggerStarted creates the thread_summaries row
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
@@ -198,7 +188,6 @@ async fn trigger_completed_sets_has_response_true() {
         "has_response should start as false after TriggerStarted"
     );
 
-    // TriggerCompleted — the trigger ran and finished
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerCompleted {
@@ -211,8 +200,6 @@ async fn trigger_completed_sets_has_response_true() {
     .await
     .unwrap();
 
-    // has_response must be true — a completed trigger run should appear in
-    // get_recent_threads (which filters has_response=TRUE).
     let has_response: bool =
         sqlx::query_scalar("SELECT has_response FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)
@@ -280,7 +267,6 @@ async fn session_ended_sets_has_response_true() {
             .unwrap();
     assert!(!has_response, "has_response should start as false");
 
-    // Session ends terminally (e.g. shutdown, panic, or user closed thread).
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionEnded {

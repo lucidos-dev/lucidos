@@ -1,6 +1,3 @@
-//! The ChatGPT plan route through the router (ADR 0636): a plan failure never
-//! moves the call to the platform route, and a served call names the plan.
-
 use super::*;
 use crate::llm::chatgpt_plan::{ChatGptPlanAccess, ChatGptPlanTokens, LimitPause};
 use crate::llm::model_registry::ModelRouting;
@@ -36,8 +33,6 @@ impl ChatGptPlanTokens for FixedTokens {
     }
 }
 
-/// A plan backend listing only `SOL`, answering every Responses request with
-/// `status` and `body`.
 async fn plan_backend(status: u16, body: &'static str) -> OpenAiProvider {
     let app = axum::Router::new()
         .route(
@@ -70,7 +65,6 @@ async fn plan_backend(status: u16, body: &'static str) -> OpenAiProvider {
     OpenAiProvider::new_chatgpt_plan(access, SOL.into(), &format!("http://{addr}/v1")).unwrap()
 }
 
-/// A platform backend that counts every request and answers none usefully.
 async fn counting_openai() -> (OpenAiProvider, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = hits.clone();
@@ -93,7 +87,6 @@ async fn counting_openai() -> (OpenAiProvider, Arc<AtomicUsize>) {
     (provider, hits)
 }
 
-/// Every model routed plan first, then the platform key.
 fn plan_then_openai(router_backends: RoutingBackends) -> RoutingProvider {
     let row = || ModelRouting {
         routes: vec![
@@ -129,8 +122,6 @@ async fn ask(router: &RoutingProvider, model: &str) -> Result<LlmResponse, BoxEr
         .await
 }
 
-/// A plan limit, the pause after it, and a model the plan does not list all
-/// fail on the plan route. None of them sends a request on the API key.
 #[tokio::test]
 async fn a_plan_failure_never_moves_the_call_to_the_openai_route() {
     let (openai, hits) = counting_openai().await;
@@ -145,8 +136,6 @@ async fn a_plan_failure_never_moves_the_call_to_the_openai_route() {
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
 
-/// A served plan call names its route, which the cost capture records as
-/// the provider `chatgpt-plan`.
 #[tokio::test]
 async fn a_served_plan_call_names_the_plan_route() {
     let router = plan_then_openai(RoutingBackends {

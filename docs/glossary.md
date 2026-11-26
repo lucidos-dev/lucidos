@@ -21,9 +21,26 @@ A defect explicitly entered in the blocker ledger to refuse a release until
 fixed in its cut, withdrawn, or waived for that version.
 
 ### Blocker ledger
-The private, tracked `release-blockers.tsv` file at the repository root.
-The release gate reads main HEAD, rather than a workspace tracker or working copy.
-Rows retain fix commits and owner decisions after closure.
+The release blocker records for one repository, kept in the workspace event
+store and keyed by the repository's root commit. The Software Factory app writes
+them, and the release gate projects them into one row per blocker. A ledger
+counts once a paired device opens it. It replaced the tracked
+`release-blockers.tsv` file, whose git history stays the audit for its period.
+
+### Unconfirmed record
+A blocker ledger record of a device-only type (a ledger opening, withdrawal,
+waiver or void) that a non-device actor emitted. It changes nothing. The gate
+and the app list it until a tap on a paired device carries it out.
+
+### Void
+A `ReleaseBlockerRecordVoided` record from a device. It names one rejected
+record in its own ledger, and the projection then skips that record. A void
+that names any other record is itself an error.
+
+### Software Factory app
+The workspace app that holds the factory's own records. Today that is the
+blocker ledger: its view, its validating script and its knowhow, under
+`apps/software-factory/`. It owns the `ReleaseBlocker*` event types.
 
 ### Gate trailer
 The public `Release-Gate:` commit trailer recording the release gate verdict,
@@ -709,7 +726,7 @@ against it and none notices. The header's lead inset places the drawer toggle
 and leads the drawer row. The Canvas row floors at it, and so do the pane floors
 in `paneMinimums.ts`.
 
-Tauri 2.11.4 exposes no runtime setter, and the `main` window is
+Tauri 2.12.7 exposes no runtime setter, and the `main` window is
 config-declared. The dispatcher method exists a layer down, but nothing public
 wraps it. So the placement drives AppKit directly through `Window::ns_window()`.
 AppKit reverts it on **every** window resize, fullscreen enter and exit included,
@@ -1385,11 +1402,11 @@ Use it when one event records that another happened. As two emits, a failure bet
 ### Asking site
 An emit site that asks the *event hooks* before its act happens, so it can honour a refusal (ADR 0746). Every other emit site is a recording site. It writes a fact after the act, as `emit_or_log` does, and asks no hook. Arming a hook on a type with no asking site is refused.
 
-Sites are added by need. None asks yet. The first three are planned for a thread's start, a change proposal and an Apply request.
+Sites are added by need. Four ask today, one per type in `ASKED_EVENT_TYPES`: a thread's first message, a trigger fire's start, a change proposal and an Apply request.
 See also: *asked token*, *event hook*.
 
 ### Asked token
-The proof an *asking site* holds that it asked the *event hooks* about one pending event. The append of a hooked event type takes the token as an argument. So the compiler refuses a hooked append with no ask behind it. No append takes one yet: the token arrives with the first asking site.
+The proof an *asking site* holds that it asked the *event hooks* about one pending event. Only `EventBus::ask_hooks` mints one, and `EventBus::emit_asked` takes it. The compiler does not stop a plain `emit` of an asked type: that records unasked, as a recording site does. So a new asking site must call `ask_hooks` itself.
 See also: *asking site*, *append ticket*.
 
 ### Arming lookback
@@ -1614,6 +1631,12 @@ What answers a Claude Code *side question*: the thread's own `claude` command, r
 Codex side questions use the same resolved session settings with an ephemeral `thread/fork` in a short-lived app-server, including when the main session uses exec. They never resume the main rollout. Copy beats remain Claude Code only.
 
 Only the Lucidos tool guard and admin-managed hooks run in the fork. Before forking, `hooks/list` supplies keys for disabling non-managed hooks through `hooks.state`. After forking, verification rejects any enabled non-managed hook except the trusted guard before starting a turn. Failures ask the user to update Codex. See ADRs 0684, 0695 and `runtime/codex_side_question.rs`.
+
+### Session spawn gate
+
+The engine binary holds this gate before recovery and opens it after all configured API listeners bind.
+Claude Code and Codex wait at `spawn_or_resume` before their runtime starts a process.
+An engine that never holds the gate starts sessions immediately. See ADR 0814.
 
 ### Session continuity
 Whether a new coding-agent session carried the thread's earlier context. `SessionStarted.continuity` records it: `first` for the thread's first session, `resumed` when the agent took `--resume`, or `fresh` with a reason (`change-applied`, `change-discarded`, `session-ended`, `branch-gone`, `resume-failed`, `no-resumable-session`). The thread draws a fresh one as a "New session" event card. Rows from before the field carry none and draw nothing. Code: `SessionContinuity` in `engine/thread_events/session.rs`, resolved by `engine/agent_session/continuity.rs`.
@@ -2497,7 +2520,13 @@ Either a *scrollbar hold* or a *touch hold* on the transcript (`isScrollHeld` in
 A primary press on the transcript scroller's own box, from the `pointerdown` to its release. That box holds its classic gutter, and an overlay thumb, which sits inside the client box. Chromium puts its own drag position back while it lasts, and would undo an anchor write (ADR 0258). A pointerup ends it, as do a move with no button held, a real loss of focus and a teardown. One of the two *scroll holds*.
 
 ### Touch hold
-A finger scrolling the transcript, from its first `touchmove` until the momentum after the lift stops: no scroll event for `TOUCH_COAST_IDLE_MS`, capped at `TOUCH_COAST_MAX_MS` after the lift. The lift is that of the fingers that moved the transcript or rested on it, each named by touch identifier and start target. A finger resting in another pane does not delay the coast. iOS kills a fling on any `scrollTop` write, and a write built from an older reading snaps the reader back. A tap never starts one. One of the two *scroll holds*.
+A finger scrolling the transcript starts a hold on the first `touchmove`.
+If the lift goes missing, `TOUCH_COAST_MAX_MS` ends the hold. After a lift,
+the hold ends after `TOUCH_COAST_IDLE_MS` without a scroll event.
+
+The hold tracks fingers on the transcript by touch identifier and start
+target. A finger resting in another pane does not delay the coast. iOS kills
+a fling on a `scrollTop` write. A tap does not start a touch hold.
 
 ### Reader-input state
 What the reader's own input is doing to one scroll container (`components/chat/readerInput.ts`). Each container has exactly one: `idle`, `touching`, `coasting` or `scrollbar`. `touching` and `coasting` together are the *touch hold*, and a primary `scrollbar` press is the *scrollbar hold*. A wheel notch and a scroll key have no end event, so they are no state. They only stamp when the reader last moved the container, and that stamp ends by a movement tail of `USER_SCROLL_WINDOW_MS`. The scroll engine reads the stamp to tell the reader's scroll from the platform's (`readerGestureActive`).
@@ -2529,21 +2558,19 @@ Where the reader was, recorded while a read of older history is in flight, so th
 
 **It is advisory.** `requestBackfill` asks the store whether a read is running, rather than reading that off the hold. So a hold nothing consumed cannot refuse pages for the rest of a visit.
 
-### Arrival hold
-Where the reader has just ARRIVED, held where they came to rest (`_arrivalHold` in `components/chat/scrollState.ts`). Two arrivals take it: a *deep-link anchor* that has landed, and a restore that put the reader back on their saved place (`holdRestoredPlace`). After either, the turns above the target keep drawing, images decode, and older history folds in. None of it fires a scroll event, and WebKit implements no scroll anchoring. So without the hold the target slid away from a reader who had not moved. A reopened thread showed the saved place, then the reader's first scroll found them somewhere else.
+### Standing content hold
+While the reader owns the position and input is idle, a transcript resize
+keeps the *line block* at its last measured viewport offset. The next scroll
+records the reader's new line. If a reply replaces its block, the hold can
+use the containing turn until the reader moves again.
 
-**It puts the target back where it rested in the viewport**, on each growth round, never toward its landing line. Growth below the target therefore moves nobody, which is what keeps a landing clamped at the bottom from riding a streaming reply down (ADR 0064). A correction that already put the target back, such as a history fold's own hold, leaves it nothing to add.
-
-**It ends on anything the reader does**: a scroll gesture, a scroll key, focus on a transcript control outside the target, a turn-control press, a submit, or any other navigation. A ride taking the live edge ends it too, and so does the target leaving the DOM.
-
-**Otherwise it ends once the transcript settles**: after `ARRIVAL_HOLD_QUIET_MS` with no correction while no image above the target is still loading, or at `ARRIVAL_HOLD_MAX_MS`. Each correction that moves the transcript restarts the quiet window. A growth round at or before the hard ceiling corrects the target before testing settlement. A round after the ceiling releases without writing. A transcript image reserves no height, and on a phone the images above the target can keep decoding for seconds after the arrival.
-
-**A restored offset takes no hold.** An offset names no content, so there is nothing to keep on screen. A line, row or turn record holds the line block it put the reader on. It falls back to the turn once a re-set reply replaces that block.
-
-**Distinct from the *history hold***, which puts the reader back on their own turn across one fold. The arrival hold follows the target across every kind of growth.
+The standing hold waits through a finger drag, a coast, and a native
+scrollbar drag. A *history hold* or *turn-control anchor* can use the same
+scroll writer. A deferred correction adds its layout shift to the position
+where the reader rests. A later app write supersedes it.
 
 ### Line block
-The finest block on the reader's line: the turn at the container's top, then down through children while one straddles that top (`readLineBlock` in `components/chat/scrollAnchor.ts`). A *reading position* records it as a *line anchor*, the turn's id plus the child-index path to the block (`readLineAnchor`). A fingerprint of the element kinds along the path makes a path that now leads elsewhere count as unresolved. The *arrival hold* after a restore and the pane-resize correction both hold it, so growth inside the turn above the line moves nobody. A head-clamped or unnamed turn records no line anchor, since its child indices are not its own.
+The finest block on the reader's line: the turn at the container's top, then down through children while one straddles that top (`readLineBlock` in `components/chat/scrollAnchor.ts`). A *reading position* records it as a *line anchor*, the turn's id plus the child-index path to the block (`readLineAnchor`). A fingerprint of the element kinds along the path makes a path that now leads elsewhere count as unresolved. The *standing content hold* uses it to absorb growth earlier in the turn. A head-clamped or unnamed turn records no line anchor, since its child indices are not its own.
 
 ### Continuation fragment
 The exchange the fold opens to hold steps whose turn starts off the loaded page (`Exchange.continuationFragment`, written by `openContinuationFragment` in `store/thread-events/exchange-grouping.ts`). A long thread opens on its newest page, and that page routinely begins mid-turn. Without a fragment the fold drops every step ahead of the page's first boundary, and a page holding none draws nothing at all.
@@ -3958,6 +3985,12 @@ B's own client, served by A at A's origin for B's workspaces under a *trusted pa
 
 ### Relay probe cache
 A's memory of B's health and contract verdict per relayed workspace (`relay_probe_cache.rs`). One probe serves a burst of data requests for 30 seconds. A navigation always probes. A store write, B's refusal or a transport error drops the verdict. It holds no authorization: B checks the claim and the *contract binding* on every request. A B without `claim-bound-contract` gets a probe on every request.
+
+### Control hop
+A's forward of a device's picker action to a *remote gateway*'s control plane (ADR 0811). A serves `/~/api/v1/remote-gateways/<name>/control/*` and forwards to B's `/~/api/gateway/v1/control/*`. B serves an exact allow-list, and only while the pairing carries the *control grant*. Its claim names the fixed prefix `/~/control/`, so it never verifies on a relay or manage route. It shares `gateway_hop.rs` with the manage hop.
+
+### Restore upload session
+The gateway's on-disk half of a *restore upload* (ADR 0810), in `restore_upload.rs`. It keeps `archive.part` and `upload.json` (length, offset, filename, last write) in an owner-only directory under the gateway config dir. It answers the tus 1.0 subset and survives a gateway restart. The restore commit moves the file into the restore flow.
 
 ### Row stream
 The filtered mode of an engine's event stream, `GET /api/v1/events?aggregates=…` (ADR 0756). It sends the eight event types that move a picker row, plus the hello and the lagged frame. An event arrives as its type and aggregate, never its payload. It does not count as a page in `sse_connections`. An engine that serves it sets `event_filter: true` in its health body. `lucidos-gateway-stamp::row_stream` holds the names both sides use.
@@ -6927,10 +6960,7 @@ Of a change, the time from its first plan fact to Live, minus the waits on the u
 A per-round or per-build cost that barely depends on feature size: rounds per change, seconds per harden round, build slot wait and hold, engine build time. The *scoreboard* reports them (`scripts/scoreboard/unit-costs.mjs`).
 
 ### Stage rules
-The pure function from a change's events to its stage visits, waits and conditions (`scripts/scoreboard/stage-rules.mjs`). It names no Lucidos event: it reads a *stage map*.
-
-### Stage map
-The ordered stages of a repository's delivery, plus the rules naming the events that start them. Stages from engine facts work for any repository. Lucidos's map adds Hardening (`scripts/scoreboard/lucidos-stage-map.mjs`).
+The pure function from a change's events to its stage visits, waits and conditions (`scripts/scoreboard/stage-rules.mjs`). It names no Lucidos event: it reads a *stage map* (`system-knowhow/glossary/core-terms-12.md`). Lucidos's own map adds Hardening (`scripts/scoreboard/lucidos-stage-map.mjs`).
 
 ### Scoreboard
 The report of delivery measures that a loop run reads: *lead time* per change, stage times, waits and *unit costs*. `./scripts/scoreboard.sh` prints it as text, or JSON with `--json`.

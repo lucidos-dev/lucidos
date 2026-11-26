@@ -1,39 +1,12 @@
 use super::collect_dismissed_event_ids;
 use crate::core::EventRow;
 
-/// Number of recent (ToolCalled, ToolResult) pairs reconstructed verbatim as
-/// `Message::Blocks(...)` pairs on resume — see
-/// [`build_resume_tool_blocks_with_skip_ids`].
 pub const RESUME_VERBATIM_TOOL_TAIL: usize = 3;
 
-/// Render a `ToolCalled` event id as the `evt-<32 hex>` address the LLM sees.
-///
-/// One renderer for both places that address reaches the model, so the two
-/// cannot drift: the resumed pair's synthetic `tool_use_id` here, and the
-/// `[evt-…]` marker the live turn appends to every tool result
-/// (`agentic_loop::helpers::build_tool_result_blocks`). Deterministic, so the
-/// same event id always yields the same string.
-///
-/// Renders the full simple-form UUID. Every reader accepts this form and the
-/// bare hyphenated/simple UUID; the `events` tool's `event_id` argument is the
-/// live one, and the retired `dismiss_from_context` (ADR 0109) took the same
-/// shape. So the LLM can pass any address it saw straight back, with no
-/// truncation guessing.
 pub fn synthesize_tool_use_id(tool_called_event_id: &uuid::Uuid) -> String {
     format!("evt-{}", tool_called_event_id.simple())
 }
 
-/// Append the result's own event address. The model can then note a pointer
-/// to something the turn boundary is about to drop (ADR 0085 Decision 9).
-///
-/// One appender for every path that assembles a tool result, beside the one
-/// renderer, for the same reason. The address only works if it looks the same
-/// everywhere the model meets it.
-///
-/// Appended here rather than stored. The `ToolResult` event payload keeps
-/// exactly what it held before, so nothing is retained by this and the pair
-/// still vanishes at the boundary. The address costs a measured 24 tokens per
-/// call on Claude; see `docs/plans/2026-08-18-adr-0085-pointer-prerequisites.md`.
 pub fn with_event_address(content: String, event_id: Option<&uuid::Uuid>) -> String {
     match event_id {
         Some(id) => format!("{content}\n[{}]", synthesize_tool_use_id(id)),
@@ -41,24 +14,12 @@ pub fn with_event_address(content: String, event_id: Option<&uuid::Uuid>) -> Str
     }
 }
 
-/// Parse an address the LLM passed back, the inverse of
-/// [`synthesize_tool_use_id`]. Kept beside its renderer so what is accepted
-/// cannot drift from what is emitted.
-///
-/// Accepts the `evt-` form and a bare UUID, hyphenated or simple. `None` is a
-/// malformed address; each caller words its own refusal, because the argument
-/// it read differs.
 pub fn parse_event_address(raw: &str) -> Option<uuid::Uuid> {
     let trimmed = raw.trim();
     let stripped = trimmed.strip_prefix("evt-").unwrap_or(trimmed);
     uuid::Uuid::parse_str(stripped).ok()
 }
 
-/// The `ToolCalled` a `ToolResult` payload answers, when the row says so.
-///
-/// Every reader that pairs a result with its call asks this first. A parallel
-/// run answers in completion order, so position cannot pair it (ADR 0246).
-/// `None` is a legacy row, which keeps each reader's positional rule.
 pub fn tool_called_event_id_of(result_payload: &serde_json::Value) -> Option<uuid::Uuid> {
     result_payload
         .get("tool_called_event_id")
@@ -66,7 +27,7 @@ pub fn tool_called_event_id_of(result_payload: &serde_json::Value) -> Option<uui
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
 }
 
-/// One reconstructed `(ToolCalled, ToolResult)` pair, with the originating
+/// INVARIANT: One reconstructed `(ToolCalled, ToolResult)` pair, with the originating
 /// `ToolCalled` event id preserved so the caller can deduplicate the
 /// stringified `[tools: ...]` summary on the same assistant turn.
 ///
@@ -80,22 +41,13 @@ pub struct ResumeToolPair {
     pub tool_called_event_id: uuid::Uuid,
     pub tool_name: String,
     pub args: serde_json::Value,
-    /// `None` when the matching `ToolResult` event is missing — emit a
-    /// synthetic `[tool result unavailable: orphaned]` stub on the wire.
     pub result: Option<String>,
-    /// The `ToolResult`'s `success` flag. A row without one succeeded.
     pub succeeded: bool,
 }
 
-/// Synthetic stub body for orphan `ToolCalled` events (no matching
-/// `ToolResult` row). Single source of truth lives in
-/// [`crate::llm::validate::ORPHAN_TOOL_RESULT_STUB`] (called by the LLM
-/// provider layer's pre-flight pairing validator) — re-exported here so the
-/// resume-message assembler emits the same wording regardless of which layer
-/// caught the gap.
 pub(crate) use crate::llm::validate::ORPHAN_TOOL_RESULT_STUB;
 
-/// Walk events chronologically, pairing every `ToolCalled` with its matching
+/// INVARIANT: Walk events chronologically, pairing every `ToolCalled` with its matching
 /// `ToolResult` and surfacing any leftover `ToolCalled` as an orphan
 /// (`result == None`). Each call reserves a slot in chronological position
 /// so the downstream N-window logic sees the same ordering whether a slot
@@ -103,8 +55,6 @@ pub(crate) use crate::llm::validate::ORPHAN_TOOL_RESULT_STUB;
 /// [`crate::llm::validate::validate_tool_use_pairing`] for why.
 pub fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<ResumeToolPair> {
     let mut slots: Vec<ResumeToolPair> = Vec::new();
-    // Pending pairings: (slot_index, tool_name) — name is duplicated here so
-    // the rposition match doesn't have to dereference into `slots`.
     let mut pending: Vec<(usize, String)> = Vec::new();
 
     for event in events {
@@ -138,15 +88,12 @@ pub fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<ResumeToolPa
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let idx = match tool_called_event_id_of(&event.payload) {
-                    // A parallel run answers in completion order, so only the
+                    // INVARIANT: A parallel run answers in completion order, so only the
                     // id pairs it. An id whose call is not pending pairs
                     // nothing: guessing would hand it to another call.
                     Some(call_id) => pending
                         .iter()
                         .position(|(slot_idx, _)| slots[*slot_idx].tool_called_event_id == call_id),
-                    // Legacy rows carry no id. Pair with the most recent
-                    // pending ToolCalled of the same name, else the most
-                    // recent pending entry, as `build_session_messages_with` does.
                     None => pending
                         .iter()
                         .rposition(|(_, n)| n == result_name)
@@ -174,17 +121,9 @@ pub fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<ResumeToolPa
         }
     }
 
-    // `slots` is already in chronological call order. Any slot whose
-    // `result` is still `None` is an orphan — surfaced as a synthetic stub
-    // by `build_resume_tool_blocks_with_skip_ids`.
     slots
 }
 
-/// Return `(ToolCalled.event_id, tool_name)` for every `ToolCalled` whose
-/// matching `ToolResult` is missing in `events`. Single source of truth for
-/// the orphan-detection rule used both by the resume builder (which emits
-/// synthetic stubs in the LLM messages payload) and the startup recovery
-/// sweep (which writes a synthetic `ToolResult` event to settle the orphan).
 pub fn find_orphan_tool_called_ids(events: &[EventRow]) -> Vec<(uuid::Uuid, String)> {
     collect_tool_pairs_chronological(events)
         .into_iter()
@@ -193,30 +132,6 @@ pub fn find_orphan_tool_called_ids(events: &[EventRow]) -> Vec<(uuid::Uuid, Stri
         .collect()
 }
 
-/// Reconstruct verbatim `(ToolUse, ToolResult)` `Message` pairs for the most
-/// recent N tool calls — and the set of `ToolCalled` event ids those pairs
-/// derive from, so callers can skip the same tools in their stringified
-/// history summaries to avoid double-billing.
-///
-/// Every tool follows the N window, `load_knowhow` included (most recent N
-/// kept, older dropped: they keep their `[tools: ...]` summary in stringified
-/// history).
-///
-/// `ContextDismissed` records: any tool pair whose `tool_called_event_id`
-/// appears in the dismissed set is dropped from BOTH the rebuilt blocks and
-/// the skip set — the latter so the stringified `[tools: ...]` summary also
-/// stops rendering for the dismissed tool (the agent asked for the entry to
-/// be gone, not just shrunk).
-///
-/// `loaded_knowhow_ids` is the thread's loaded knowhow this turn. A resumed
-/// `load_knowhow` pair never carries a doc body (ADR 0425): a loaded doc's
-/// body is in the `[LOADED KNOWHOW]` block, and an unloaded one is a call
-/// away. So a successful result becomes a one-line stub saying which. A
-/// not-found answer stays verbatim, being short and still true.
-///
-/// Output ordering: chronological. Each pair emits an assistant `ToolUse`
-/// block followed by a user `ToolResult` block, matching the wire shape
-/// Anthropic and OpenAI providers expect.
 pub fn build_resume_tool_blocks_with_skip_ids(
     events: &[EventRow],
     n: usize,
@@ -245,7 +160,7 @@ pub fn build_resume_tool_blocks_with_skip_ids(
                 id: id.clone(),
                 name: p.tool_name.clone(),
                 input: p.args.clone(),
-                // Synthesized from the persisted ToolCalled event; the original
+                // INVARIANT: Synthesized from the persisted ToolCalled event; the original
                 // Gemini 3 thought signature is not stored in the event payload,
                 // so we omit it here. The model only enforces signatures within
                 // the active turn (newest user message → now), so older history
@@ -253,7 +168,7 @@ pub fn build_resume_tool_blocks_with_skip_ids(
                 thought_signature: None,
             }]),
         });
-        // Orphans (`result: None`) emit a synthetic stub so every assistant
+        // INVARIANT: Orphans (`result: None`) emit a synthetic stub so every assistant
         // tool_use block has its paired user tool_result on the wire.
         // Anthropic 400s otherwise — see thread b101c3d7 repro.
         let content = match &p.result {
@@ -267,7 +182,7 @@ pub fn build_resume_tool_blocks_with_skip_ids(
             content: crate::llm::MessageContent::Blocks(vec![
                 crate::llm::ContentBlock::ToolResult {
                     tool_use_id: id,
-                    // The trailer the live turn appends, on the rebuilt pair
+                    // INVARIANT: The trailer the live turn appends, on the rebuilt pair
                     // too. Without it the panel cannot see a resumed result.
                     // The model could then neither keep one open nor watch one
                     // expire, on any round after the first.
@@ -279,8 +194,6 @@ pub fn build_resume_tool_blocks_with_skip_ids(
     (messages, skip_ids)
 }
 
-/// The stub a resumed `load_knowhow` result shows instead of its doc body, or
-/// `None` for a pair that keeps its result verbatim.
 fn knowhow_body_stub(
     pair: &ResumeToolPair,
     result: &str,

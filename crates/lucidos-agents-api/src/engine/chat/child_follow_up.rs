@@ -1,70 +1,22 @@
-//! Parent to its own child: the one privileged cross-thread write.
-//!
-//! Child to parent already works end to end (ADR 0011): every child terminal
-//! fires a typed `ChildThreadCompleted` on the parent and a re-entry that
-//! resumes the parent's turn. This module is the other direction, and it is
-//! deliberately not an any-to-any address space. A thread can address its own
-//! **direct** children and nothing else: no sibling edge, no grandchild edge,
-//! no cross-workspace edge. The one exception is the *home thread*, which may
-//! address any thread in its workspace (`api::thread_reach::follow_up_reach`).
-//!
-//! The caller never states the relationship. It is looked up from the child's
-//! `thread_summaries` row and the caller identity is ambient, so on the
-//! shipping surface (the in-process LLM tool, whose `thread_id` comes from
-//! `execute_tool` and cannot be set by the model) the refusal ladder is a real
-//! authorization boundary.
-//!
-//! ## Why a typed error here
-//!
-//! `.claude/rules/rust.md` says boxed trait objects unless a typed error is
-//! consumed structurally. `ChildFollowUpError` is: `status_code()` is the HTTP
-//! mapping `api/threads/follow_up.rs` and `api/threads/archive.rs` use rather
-//! than re-deriving the taxonomy, and the LLM layer turns each variant into a
-//! distinct, actionable tool-error string. The caller never merely formats it
-//! into one message.
-//!
-//! ## The mirror image
-//!
-//! `notify_parent_of_child_completion` (`engine_impl/threads.rs`) is the same
-//! cross-thread delivery with the direction flipped, and the two should stay
-//! recognisably symmetric. One asymmetry is deliberate and load-bearing: that
-//! one **awaits** its `process_message_with_steps` because it runs on the
-//! ParentCallback listener task, and this one must NOT, because it runs inside
-//! the parent's own agentic loop. See the delivery half for what that costs.
-
 use crate::engine::chat::process::ChatProcessExt;
 use uuid::Uuid;
 
 pub(crate) use crate::api::thread_reach::FollowUpReach;
 use crate::engine::thread_lifecycle::ThreadStatus;
 
-/// Why a child follow-up was refused. Every branch is a refusal: no branch
-/// creates a thread, and no branch falls back to treating the call as a spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildFollowUpError {
-    /// No `thread_summaries` row for the target id.
     UnknownChild(Uuid),
     NotYourChild(Uuid),
-    /// The target was thrown away by the user.
     ChildDiscarded(Uuid),
     ChildIsDraft(Uuid),
-    /// The caller addressed itself.
     SelfTarget(Uuid),
-    /// No ambient caller identity, so there is no relationship to check.
     NoCaller,
-    /// The request carried `caller_workspace`. Cross-workspace spawns require
-    /// `relation = "top"` and therefore have `parent_thread_id = NULL` in the
-    /// receiving workspace, so no cross-workspace caller has a child to follow
-    /// up on. Refused explicitly rather than silently reinterpreted as a
-    /// same-workspace call.
     CrossWorkspaceUnsupported,
-    /// The row read or the delivery failed.
     Internal(String),
 }
 
 impl ChildFollowUpError {
-    /// HTTP status for the `/threads/follow-up` and `/threads/archive` routes.
-    /// Kept beside the taxonomy so the mapping cannot drift from it.
     pub fn status_code(&self) -> u16 {
         match self {
             Self::UnknownChild(_) => 404,
@@ -119,27 +71,14 @@ use crate::engine::FollowUpUrgency;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FollowUpDelivery {
-    /// Mid-turn, and the caller let the turn finish. The message queues behind
-    /// the current turn or steers it.
     Running,
-    /// Mid-turn, and the caller marked the follow-up urgent. The child's turn is
-    /// being interrupted and the follow-up runs as the next one.
     Interrupted,
-    /// Parked on a question or a permission card. The message does **not**
-    /// answer the question (that route requires `mode == Human`), so it sits in
-    /// the channel until a human answers.
     WaitingForUserAnswer,
-    /// A coding-agent child waiting on a human: an open question, or older
-    /// held messages. The message is held and delivered once a human replies.
     Held,
-    /// Not in flight. A fresh turn starts now.
     Revived,
 }
 
 impl FollowUpDelivery {
-    /// `urgency` only matters for a child that is actually mid-turn: there is
-    /// nothing to preempt on an idle child, and a question-parked child is
-    /// blocked on a human rather than on work, so urgency cannot unblock it.
     fn from_status(status: ThreadStatus, urgency: FollowUpUrgency) -> Self {
         match status {
             ThreadStatus::Running if urgency.is_urgent() => Self::Interrupted,
@@ -156,17 +95,12 @@ impl FollowUpDelivery {
     pub(crate) fn effective_urgency(&self) -> FollowUpUrgency {
         match self {
             Self::Interrupted => FollowUpUrgency::Urgent,
-            // Nothing to preempt (`Revived`), or preempting would break a
-            // promise (`WaitingForUserAnswer`), or the caller did not ask
-            // (`Running`).
             Self::Running | Self::WaitingForUserAnswer | Self::Held | Self::Revived => {
                 FollowUpUrgency::Normal
             }
         }
     }
 
-    /// One sentence for the LLM's tool result, so the model knows whether the
-    /// child is working on this now or waiting on a human first.
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Running => {
@@ -189,24 +123,14 @@ impl FollowUpDelivery {
     }
 }
 
-/// What the caller gets back the moment the message is on the child's timeline.
-/// Never the child's result: the child's turn is not awaited (see the delivery
-/// half), and its outcome arrives later as an ordinary `ChildThreadCompleted`.
 #[derive(Debug, Clone)]
 pub struct FollowUpAck {
     pub child_thread_id: Uuid,
-    /// How the caller reached it. Only [`FollowUpReach::OwnChild`] gets the
-    /// target's outcome back as a card.
     pub reach: FollowUpReach,
-    /// The child's human-meaningful handle. The tool's success text names the
-    /// child by this and never by uuid, so the model's prose stays uuid-free.
     pub child_title: String,
     pub delivered_to: FollowUpDelivery,
 }
 
-/// The child's `thread_summaries` row as it comes off the wire:
-/// `(parent_thread_id, source, state, status, title, first_message)`. Parsed
-/// straight into [`ChildRow`], which is what everything downstream reads.
 type ChildRowTuple = (
     Option<Uuid>,
     Option<String>,
@@ -216,8 +140,6 @@ type ChildRowTuple = (
     Option<String>,
 );
 
-/// The child's row, read once and reused by the ladder, the delivery sample and
-/// the derived routing.
 #[derive(Debug)]
 pub(crate) struct ChildRow {
     pub(crate) parent_thread_id: Option<Uuid>,
@@ -233,16 +155,11 @@ impl ChildRow {
         self.source.as_deref() == Some("claude_code")
     }
 
-    /// Title, falling back to the opening of the spawn prompt, falling back to
-    /// a generic label. Mirrors the label the fan-in puts on a completion card.
     pub(crate) fn label(&self) -> String {
         child_label(self.title.clone(), self.first_message.as_deref())
     }
 }
 
-/// A child's handle for the caller: its title, else the opening of its spawn
-/// prompt, else a generic label. Shared by the follow-up and the move to top
-/// level, so both name one child the same way.
 pub(crate) fn child_label(title: Option<String>, first_message: Option<&str>) -> String {
     title
         .or_else(|| first_message.map(|m| m.chars().take(80).collect()))
@@ -251,16 +168,6 @@ pub(crate) fn child_label(title: Option<String>, first_message: Option<&str>) ->
 
 #[easy_ext::ext(ChildFollowUpExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Load the child's row and run the refusal ladder. Pure: reads one row,
-    /// writes nothing, delivers nothing.
-    ///
-    /// Ladder order matters, and it is the order of the table in D2 of the
-    /// plan: a self-target is a self-target even if the caller has no children,
-    /// and a discarded child is reported as discarded rather than as unknown.
-    ///
-    /// Takes the pool rather than `&self` for the same reason
-    /// `check_thread_recursion_guard` does: the whole check is one query and a
-    /// ladder, so it is directly testable without standing up an engine.
     async fn authorize_child_follow_up(
         pool: &sqlx::PgPool,
         caller_thread_id: Option<Uuid>,
@@ -352,8 +259,6 @@ pub(crate) impl crate::engine::LucidosEngine {
             return Err(ChildFollowUpError::ChildIsDraft(child_thread_id));
         }
 
-        // The router holds this message for a coding-agent child waiting on a
-        // human (ADR 0256), so the ack has to say so.
         let held = row.uses_coding_agent()
             && super::held_messages::message_is_held(
                 pool,
@@ -399,9 +304,6 @@ pub(crate) fn build_follow_up_message(
     )
 }
 
-/// The `ThreadLink` a follow-up stamps on the child's message. Mirrors
-/// `MessageOrigin::thread_link_child`, which the fan-in uses in the other
-/// direction, so the two edges stay recognisably symmetric.
 pub(crate) fn parent_thread_link(
     parent_thread_id: Uuid,
     parent_title: Option<String>,
@@ -418,7 +320,7 @@ pub(crate) fn parent_thread_link(
 
 #[easy_ext::ext(ChildFollowUpDispatchExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Deliver a follow-up from a parent thread to one of its own children.
+    /// INVARIANT: Deliver a follow-up from a parent thread to one of its own children.
     ///
     /// Returns an **ack**, not the child's turn. The child's outcome arrives
     /// later, the way every child outcome does: as a `ChildThreadCompleted`
@@ -474,12 +376,6 @@ pub(crate) impl crate::engine::LucidosEngine {
     /// states the bound instead of deriving it, which cuts the cycle at this
     /// one edge. `run_thread` avoids the same recursion a different way, by
     /// handing its spawn to the Thread Queue's trait-object executor.
-    // Eight with `self`, one over clippy's threshold since `urgency` joined.
-    // Same allow, and the same reason, as the `process_message_with_steps` pair
-    // this delegates to: these are the per-request knobs surfaced at the call
-    // boundary on purpose, so a caller wires them through without re-creating a
-    // builder struct. Every one of them is load-bearing and named, and two
-    // (`caller_thread_id`, `caller_workspace`) exist only to be checked.
     #[allow(clippy::too_many_arguments)]
     fn follow_up_child_thread<'a>(
         self: &'a std::sync::Arc<Self>,
@@ -505,14 +401,6 @@ pub(crate) impl crate::engine::LucidosEngine {
             let caller_thread_id = caller_thread_id.expect("the ladder refuses a missing caller");
             let use_coding_agent = row.uses_coding_agent();
 
-            // The child's timeline attributes this to the parent thread, by title,
-            // with `direction: Parent`. That is what keeps the follow-up from
-            // rendering as "You" in the child's message-route panel.
-            // Not fatal if it fails: the route panel resolves the parent's title
-            // live from `threadMap` first and only falls back to this cached one,
-            // so a missing title costs nothing visible. Logged rather than
-            // swallowed, because a query error here means something is wrong with
-            // the projection read and nothing else would say so.
             let parent_title: Option<String> = match sqlx::query_scalar::<_, String>(
                 "SELECT COALESCE(title, first_message) FROM thread_summaries WHERE thread_id = $1",
             )
@@ -545,7 +433,7 @@ pub(crate) impl crate::engine::LucidosEngine {
                 use_coding_agent
             );
 
-            // Spawn, do not await. Everything the engine can derive it derives:
+            // INVARIANT: Spawn, do not await. Everything the engine can derive it derives:
             // `use_coding_agent` from the child's own row, and no mode / repo /
             // model from the caller at all.
             //
@@ -561,12 +449,12 @@ pub(crate) impl crate::engine::LucidosEngine {
             let message = text.to_string();
             let images = images.map(|i| i.to_vec());
             let spawn_origin = origin.clone();
-            // From the ack, never from the caller's raw flag: see
+            // INVARIANT: From the ack, never from the caller's raw flag: see
             // `FollowUpDelivery::effective_urgency`. A question-parked child
             // must not be preempted, and the ack has already promised it will
             // not be.
             let urgency = ack.delivered_to.effective_urgency();
-            // Type-erased before it reaches `tokio::spawn`, to break an auto-trait
+            // INVARIANT: Type-erased before it reaches `tokio::spawn`, to break an auto-trait
             // inference cycle: this spawns a turn, that turn can run an agentic
             // loop, that loop reaches `execute_tool`, and one of its arms calls
             // back into this function. Inferring `Send` for the spawned future
@@ -583,7 +471,7 @@ pub(crate) impl crate::engine::LucidosEngine {
                             None,
                             None,
                             None,
-                            None, // provider_override
+                            None,
                             images.as_deref(),
                             None,
                             Some(use_coding_agent),
@@ -607,7 +495,7 @@ pub(crate) impl crate::engine::LucidosEngine {
                         )
                         .await;
                     match result {
-                        // Drain the orphan chain, exactly as the other two spawn
+                        // INVARIANT: Drain the orphan chain, exactly as the other two spawn
                         // sites do (`api/chat.rs` for a chat send,
                         // `thread_queue/executor.rs` for a queued turn). This
                         // site did not, so a message injected into the turn this
@@ -625,7 +513,7 @@ pub(crate) impl crate::engine::LucidosEngine {
                             .await;
                         }
                         Ok(_) => {}
-                        // No terminator here: the turn settles its own
+                        // INVARIANT: No terminator here: the turn settles its own
                         // exchange, anchored. An unanchored copy is what the
                         // idempotency gate cannot match, so it double-fired.
                         Err(e) => crate::log_legacy!(
@@ -636,7 +524,7 @@ pub(crate) impl crate::engine::LucidosEngine {
                     }
                 });
             let handle = tokio::spawn(turn);
-            // Same panic monitoring `chat_submit` uses: a panicking child turn
+            // INVARIANT: Same panic monitoring `chat_submit` uses: a panicking child turn
             // emits ResponseFailed + SessionEnded instead of leaving the child
             // stuck in `running` and the parent waiting forever. Fire and forget,
             // exactly as there: dropping the JoinHandle detaches the watcher.
@@ -646,7 +534,7 @@ pub(crate) impl crate::engine::LucidosEngine {
         })
     }
 
-    /// Persist the follow-up's `MessageReceived` inline, iff the pre-emit rule
+    /// INVARIANT: Persist the follow-up's `MessageReceived` inline, iff the pre-emit rule
     /// says to. Returns the `PreEmittedOrigin` the spawned turn must carry so
     /// neither fast path emits the event a second time.
     ///
@@ -665,7 +553,7 @@ pub(crate) impl crate::engine::LucidosEngine {
         if !delivered_to.wants_pre_emit() {
             return Ok(None);
         }
-        // The child can start running between the row read and this emit. The
+        // INVARIANT: The child can start running between the row read and this emit. The
         // cost of losing that race is bounded (one mis-sequenced exchange
         // boundary in the child's timeline, never a lost message or a wrong
         // counter), but a live coding-agent session is the case where the

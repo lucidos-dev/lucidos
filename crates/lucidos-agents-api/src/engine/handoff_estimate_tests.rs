@@ -9,7 +9,6 @@ mod db {
 
     include!("../../../lucidos-engine/src/engine/handoff_estimate_capture_test.rs");
 
-    /// Backdate every capture of `thread_id`, so its prompt cache is cold.
     async fn go_cold(pool: &PgPool, thread_id: Uuid) {
         sqlx::query(
             "UPDATE events SET created = now() - interval '2 hours' \
@@ -31,8 +30,6 @@ mod db {
             .expect("a reading")
     }
 
-    /// I6: the card's verdict comes from the handoff estimate, on both cache
-    /// states, and the warm one names when it goes cold.
     #[tokio::test]
     async fn the_card_reads_both_cache_states_off_the_estimate() {
         let (pool, db) = setup_test_db().await;
@@ -52,8 +49,6 @@ mod db {
         let small = card(&pool, small).await;
         assert!(!small.warm && !small.cold, "never at the floor");
 
-        // A write with no split has no lifetime, so no time for the card to
-        // go cold. Its after-warm verdict claims no cold rewrite.
         let unknown = seed_coding_thread(&bus, None).await;
         sqlx::query(
             "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
@@ -74,7 +69,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I5: Stay here hides the card, and it returns past the hold.
     #[tokio::test]
     async fn a_decline_hides_the_card_until_the_thread_grows() {
         let (pool, db) = setup_test_db().await;
@@ -101,7 +95,6 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I6: a thread holding a pending change gets no card.
     #[tokio::test]
     async fn an_open_change_shows_no_card() {
         let (pool, db) = setup_test_db().await;

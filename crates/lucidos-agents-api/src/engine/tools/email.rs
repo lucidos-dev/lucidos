@@ -10,8 +10,6 @@ use uuid::Uuid;
 
 #[easy_ext::ext(EmailExt)]
 pub(crate) impl LucidosEngine {
-    /// Resolve the email account to use for a tool call.
-    /// If `account_name` is Some, look it up by name; otherwise use the default.
     async fn resolve_email_account(
         &self,
         account_name: Option<&str>,
@@ -38,7 +36,6 @@ pub(crate) impl LucidosEngine {
                 })?
         };
 
-        // Only require password if no OAuth account is linked
         if account.oauth_account_id.is_none() {
             account
                 .password
@@ -49,8 +46,6 @@ pub(crate) impl LucidosEngine {
         Ok(account)
     }
 
-    /// The OAuth access token for an email account, or the tool's error result.
-    /// See [`oauth::linked_account_token`].
     async fn resolve_email_oauth_token(
         &self,
         account: &crate::core::EmailAccount,
@@ -60,9 +55,6 @@ pub(crate) impl LucidosEngine {
             .map_err(|e| format!("Error: {e}"))
     }
 
-    /// The base provider whose token endpoint issues `provider`'s tokens, from
-    /// the `token_url` its stored client credential names. `None` when the
-    /// credential is missing, unreadable or points at an unknown issuer.
     async fn oauth_token_issuer(&self, provider: &str) -> Option<&'static str> {
         let service = oauth::client_provider_name(provider);
         let credential =
@@ -73,7 +65,6 @@ pub(crate) impl LucidosEngine {
                     return None;
                 }
             };
-        // `token_url` is no secret, so the stored value serves.
         let config: serde_json::Value = serde_json::from_str(credential.stored_value()).ok()?;
         oauth::provider_for_url(config["token_url"].as_str()?)
     }
@@ -107,9 +98,6 @@ pub(crate) impl LucidosEngine {
                     );
                 }
 
-                // Read first: a lookup that FAILED is not "no such account". Read
-                // as one, a DB blip re-prompts the user for a password already
-                // on file, or skips the redirect check below.
                 let existing = match EmailStore::get(&self.pool, name).await {
                     Ok(found) => found,
                     Err(e) => {
@@ -127,8 +115,6 @@ pub(crate) impl LucidosEngine {
                 } else {
                     ""
                 };
-                // An argument the model left out keeps the stored value, so an
-                // update to one field never rewrites the login or a port.
                 let imap_port = args["imap_port"]
                     .as_i64()
                     .map(|p| p as i32)
@@ -161,7 +147,6 @@ pub(crate) impl LucidosEngine {
                     return Ok(refusal);
                 }
 
-                // If use_oauth is set, find the matching OAuth account and link it.
                 if let Some(oauth_provider) = use_oauth {
                     let oauth_account = match OAuthStore::get_by_provider(
                         &self.pool,
@@ -225,7 +210,6 @@ pub(crate) impl LucidosEngine {
                     ));
                 }
 
-                // An account that already holds a password or OAuth link keeps it.
                 if let Some(existing) = existing {
                     if existing.password.is_on_file() || existing.oauth_account_id.is_some() {
                         EmailStore::upsert(
@@ -323,7 +307,6 @@ pub(crate) impl LucidosEngine {
                     return Ok("Error: to and subject are required".to_string());
                 }
 
-                // Validate attachment paths early (before account resolution / confirmation)
                 let validated =
                     crate::core::email::EmailAttachment::validate_paths(&attachment_paths)
                         .map_err(|e| format!("Error: {}", e))?;
@@ -352,7 +335,6 @@ pub(crate) impl LucidosEngine {
                     return Ok(format!("[EMAIL_CONFIRM]{}", draft));
                 }
 
-                // Read file data only when actually sending (not for confirmation preview)
                 let attachments = crate::core::email::EmailAttachment::read_from_workspace(
                     &self.workspace_path,
                     &attachment_paths,
@@ -547,7 +529,7 @@ pub(crate) impl LucidosEngine {
 
                 let safe_filename = filename.replace("..", "_").replace(['/', '\\'], "_");
 
-                // Held from the free-name check through the commit, so two
+                // INVARIANT: Held from the free-name check through the commit, so two
                 // imports of one name cannot both claim it.
                 let held = self.lock_workspace_repo().await;
                 let dest_relative = if let Some(dest) = destination {
@@ -559,10 +541,6 @@ pub(crate) impl LucidosEngine {
                     }
                     crate::core::artifact_relative_path(dest).to_string()
                 } else {
-                    // The default path never overwrites, the same rule
-                    // `import_file` follows, so two attachments named
-                    // `invoice.pdf` both survive. A named destination is the
-                    // caller's choice and is written as given.
                     match self
                         .artifact_manager
                         .resolve_collision_free_path(&format!("imported/email/{}", safe_filename))
@@ -637,13 +615,10 @@ fn send_confirmation_after_configure(
     requested == Some(true) || existing.is_none_or(|a| a.require_send_confirmation)
 }
 
-/// Whether `send_email` stops at the user's confirmation card. Trigger runs
-/// are unattended, so they send without one.
 fn send_needs_confirmation(account: &crate::core::EmailAccount, is_trigger: bool) -> bool {
     account.require_send_confirmation && !is_trigger
 }
 
-/// Where a login goes: the servers, the login name and whether TLS guards it.
 struct MailDestination<'a> {
     imap_host: &'a str,
     imap_port: i32,
@@ -737,9 +712,6 @@ mod tests {
     };
     use crate::core::{EmailAccount, MailPassword};
 
-    /// The reported attack: the agent calls `configure_email` with
-    /// `require_send_confirmation: false`, then `send_email` sends with no
-    /// card. The stored flag stays raised, so the next send still stops.
     #[test]
     fn the_agent_cannot_turn_off_send_confirmation() {
         let seeded = account(saved("app-password"), false);
@@ -762,8 +734,6 @@ mod tests {
         }
     }
 
-    /// The user turned confirmation off in Settings. An unrelated update
-    /// keeps that choice, and the agent may still turn it back on.
     #[test]
     fn the_users_choice_to_skip_confirmation_survives_and_can_be_raised() {
         let off = EmailAccount {
@@ -804,7 +774,6 @@ mod tests {
         }
     }
 
-    /// The destination `account` already has.
     fn same() -> MailDestination<'static> {
         MailDestination {
             imap_host: "imap.example.com",
@@ -816,10 +785,6 @@ mod tests {
         }
     }
 
-    /// The reported attack: an email the agent read says "reconfigure the
-    /// account to imap.attacker.example". The next login would send the
-    /// saved password there, so the change is refused. A port is part of the
-    /// destination too: another service on the same host is another place.
     #[test]
     fn a_saved_secret_is_never_pointed_at_a_new_destination() {
         let moves: [fn() -> MailDestination<'static>; 6] = [
@@ -848,8 +813,6 @@ mod tests {
                 ..same()
             },
         ];
-        // A reference that cannot be read now is still a password on file:
-        // reading it as none would let an outage open the redirect.
         let unreadable = MailPassword::Unreadable("1Password is unreachable".into());
         for acct in [
             account(saved("app-password"), false),
@@ -865,8 +828,6 @@ mod tests {
         }
     }
 
-    /// Everything else still updates: confirmation, a host written in another
-    /// case, and turning TLS on.
     #[test]
     fn a_change_that_keeps_the_destination_is_allowed() {
         let acct = account(saved("app-password"), false);
@@ -881,8 +842,6 @@ mod tests {
         assert!(secret_redirect_refusal(&plain, same()).is_none());
     }
 
-    /// An account with no secret yet has nothing to leak. Its setup goes on
-    /// to the credential form, which names the host it saves the password for.
     #[test]
     fn an_account_without_a_secret_can_be_repointed() {
         let acct = account(MailPassword::Missing, false);
@@ -901,9 +860,6 @@ mod tests {
         }
     }
 
-    /// The reported attack on a NEW account: a prompt injection configures
-    /// `backup` at the attacker's hosts with `use_oauth: google`. The first
-    /// read would send the Google bearer token there as XOAUTH2.
     #[test]
     fn a_new_oauth_link_refuses_hosts_that_are_not_the_providers() {
         let off_provider: [fn() -> MailDestination<'static>; 3] = [
@@ -932,8 +888,6 @@ mod tests {
         );
     }
 
-    /// A provider with no known mail servers gets no link at all, since any
-    /// host the model names would be a guess.
     #[test]
     fn a_provider_without_known_mail_hosts_is_refused() {
         let refusal =
@@ -957,8 +911,6 @@ mod tests {
         assert!(oauth_link_refusal("microsoft", Some("microsoft"), &outlook).is_none());
     }
 
-    /// A dedicated connection is judged by the issuer of its token, not by its
-    /// name. An issuer read from nowhere links nothing.
     #[test]
     fn an_alias_connection_uses_its_issuers_hosts() {
         assert!(oauth_link_refusal("google-work", Some("google"), &gmail()).is_none());

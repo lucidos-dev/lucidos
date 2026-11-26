@@ -1,20 +1,3 @@
-//! Single error-response shape for `/api/v1` handlers that return JSON
-//! errors: `{ "error": "<message>" }` with an appropriate HTTP status.
-//!
-//! Coverage is the converted modules, not (yet) the whole API surface: some
-//! handlers still hand-roll the same JSON tuple inline, and others
-//! deliberately return plain-text `(StatusCode, String)` errors — converting
-//! those would change response bytes, so they migrate opportunistically when
-//! their handlers are next touched.
-//!
-//! Before this type existed, several modules each rebuilt the same
-//! `(StatusCode, Json(json!({ "error": … })))` tuple under a private helper
-//! name (`bad_request` in notifications, `json_error` in backup,
-//! `internal_err` in changes / blobs / threads_compose). `ApiError` replaces
-//! those per-file helpers: handlers return `Result<_, ApiError>` and use `?`,
-//! and the `IntoResponse` impl produces the exact same wire bytes the helpers
-//! did.
-
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -23,9 +6,6 @@ use axum::Json;
 pub(crate) struct ApiError {
     pub status: StatusCode,
     pub message: String,
-    /// A machine-readable slug beside the message, for a refusal the client
-    /// must tell apart from its siblings. The body carries it only when set,
-    /// so every other error keeps its exact bytes.
     pub reason: Option<&'static str>,
 }
 
@@ -38,35 +18,28 @@ impl ApiError {
         }
     }
 
-    /// Attach the machine-readable `reason` slug.
     pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
         self.reason = Some(reason);
         self
     }
 
-    /// A status given as a bare number, the way an engine error type declares
-    /// it beside its taxonomy. A number that is no HTTP status becomes a 500.
     pub(crate) fn with_code(code: u16, message: impl Into<String>) -> Self {
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         Self::new(status, message)
     }
 
-    /// 400 Bad Request.
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
-    /// 500 Internal Server Error.
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 
-    /// 404 Not Found.
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
     }
 
-    /// 500 with the `DB error: <e>` message shape used by DB-backed handlers.
     pub(crate) fn db(e: sqlx::Error) -> Self {
         Self::internal(format!("DB error: {e}"))
     }
@@ -107,8 +80,6 @@ mod tests {
         );
     }
 
-    /// A reason slug rides beside the message only when a handler sets one.
-    /// Every other error body keeps its exact bytes.
     #[tokio::test]
     async fn a_reason_is_added_only_when_set() {
         assert_eq!(

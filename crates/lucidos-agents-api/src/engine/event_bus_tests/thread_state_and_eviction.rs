@@ -1,9 +1,6 @@
 use super::super::*;
 use super::*;
 
-/// A trigger firing represents prior activity, so the row must land as
-/// `Active`. Relying on the column default to reach `Active` means a future
-/// default change silently re-introduces phantom drafts.
 #[tokio::test]
 async fn trigger_started_creates_active_thread_not_composing() {
     use crate::engine::thread_state::ThreadState;
@@ -46,9 +43,6 @@ async fn trigger_started_creates_active_thread_not_composing() {
     teardown_test_db(&db_name).await;
 }
 
-/// `Discarded` is terminal — a stale or replayed `TriggerStarted` against a
-/// discarded thread must not resurrect it. The sibling MessageReceived and
-/// SessionStarted ON CONFLICT branches gate on the same invariant.
 #[tokio::test]
 async fn trigger_started_does_not_resurrect_discarded_thread() {
     use crate::engine::thread_state::ThreadState;
@@ -111,10 +105,6 @@ async fn trigger_started_does_not_resurrect_discarded_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// Discarding a draft must also flip `archive_state` from the default
-/// `'inbox'` to `'archived'` — otherwise the discarded row lingers in any
-/// inbox-scoped query (drawer REVIEW badge, post-archive sibling picker)
-/// even though the row has no events the user can interact with.
 #[tokio::test]
 async fn thread_discarded_sets_archive_state_to_archived() {
     let (pool, db_name) = setup_test_db().await;
@@ -162,10 +152,6 @@ async fn thread_discarded_sets_archive_state_to_archived() {
     teardown_test_db(&db_name).await;
 }
 
-/// A row in `thread_summaries` represents a thread with prior activity; only
-/// `ThreadStarted` creates a draft and sets state explicitly. The default
-/// must therefore be `Active` so any insert path that forgets to specify
-/// state can't conjure a phantom draft.
 #[tokio::test]
 async fn thread_summaries_state_column_defaults_to_active() {
     use crate::engine::thread_state::ThreadState;
@@ -190,10 +176,6 @@ async fn thread_summaries_state_column_defaults_to_active() {
     teardown_test_db(&db_name).await;
 }
 
-/// A composing thread that auto-archives without ever being sent must still
-/// surface its intended channel — otherwise the drawer renders it as
-/// "Lucidos" even when the user toggled CC. Source mirrors compose_mode for
-/// composing threads; later send events overwrite if they disagree.
 #[tokio::test]
 async fn thread_started_with_claude_code_mode_sets_source_to_claude_code() {
     let (pool, db_name) = setup_test_db().await;
@@ -226,9 +208,6 @@ async fn thread_started_with_claude_code_mode_sets_source_to_claude_code() {
     teardown_test_db(&db_name).await;
 }
 
-/// Lucidos mode maps to `source = 'chat'` so the drawer pill matches the
-/// table-default behaviour and the existing CASE branches in MessageReceived
-/// (which key off `source = 'chat'` to detect "no prior assertion").
 #[tokio::test]
 async fn thread_started_with_lucidos_mode_sets_source_to_chat() {
     let (pool, db_name) = setup_test_db().await;
@@ -260,21 +239,12 @@ async fn thread_started_with_lucidos_mode_sets_source_to_chat() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression for the "Failed to send message: 409" toast on a draft whose
-/// stale `source` no longer matches the actual send. A composing thread that
-/// toggled mode to CC and back to Lucidos lands in `thread_summaries` with
-/// `source='claude_code'` (PUT compose CASE writes it). When the user clicks
-/// Send the chat handler now (correctly) skips the continuity check for
-/// composing threads — but the projection still has to overwrite the lagged
-/// source, otherwise the thread renders as Claude Code in the drawer pill
-/// despite having been sent via Lucidos.
 #[tokio::test]
 async fn message_received_overrides_stale_compose_source_on_composing_to_active() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    // Draft toggled CC at some point — source now claims claude_code.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
@@ -299,8 +269,6 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
         "draft source seeded as claude_code"
     );
 
-    // User toggled back to Lucidos and sent — MessageReceived arrives on the
-    // chat channel. The projection must overwrite the stale source.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -342,14 +310,6 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: `register_thread_queued`'s 60s eviction used to leak a
-/// `ResponseCanceled` (no actor) onto the evicted thread because the
-/// downstream stop arm read `is_shutdown=false` and defaulted to
-/// "user-driven cancel" semantics. The frontend then rendered "Canceled"
-/// next to the affected exchange — misleading users into thinking they
-/// pressed Stop. The fix emits `ResponseAborted` with `actor=System`
-/// directly from the eviction path; this test pins the actor and event
-/// type the frontend needs to render "Aborted" instead.
 #[tokio::test]
 async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     let (pool, db_name) = setup_test_db().await;
@@ -358,8 +318,6 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     let thread_id = Uuid::new_v4();
     let request_id = Uuid::new_v4();
 
-    // Anchor the request: a chat MessageReceived stamps a row in events
-    // that latest_originating_event_id can find.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -386,11 +344,8 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     .await
     .unwrap();
 
-    // Empty agent_sessions — chat thread, no Claude Code session involved.
     let agent_sessions = tokio::sync::Mutex::new(std::collections::HashMap::new());
 
-    // Empty active_threads: no live handle, so the anchor comes from the
-    // `latest_originating_event_id` fallback this thread's events seed.
     let active_threads =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -420,23 +375,12 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     assert_eq!(event_type, "ResponseAborted");
     assert_eq!(actor_kind.as_deref(), Some("system"));
     assert_eq!(req_id.as_deref(), Some(request_id.to_string().as_str()));
-    // 'failed' (not 'idle') so the UI shows the error indicator — eviction is
-    // a hard failure, not a clean dismissal.
     assert_eq!(status, "failed");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: a chat thread re-entered from `ChildThreadCompleted` (parent reacting
-/// to a child's finish) carries the CTC's id as `request_event_id` on every
-/// event in that turn. The eviction/restart abort must stamp the same CTC id,
-/// not the most recent `MessageReceived` from a previous turn. Without this,
-/// the abort routes via `reqIdRedirect` into the WRONG (old, already-completed)
-/// exchange — `groupIntoExchanges` never pushes the abort into the active
-/// `UserQuestionAsked` exchange, so its status stays `awaiting-answer` and the
-/// question card looks pristine and clickable even though the response was
-/// killed by an engine restart.
 #[tokio::test]
 async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() {
     let (pool, db_name) = setup_test_db().await;
@@ -447,7 +391,6 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     let ctc_id = Uuid::new_v4();
     let child_thread_id = Uuid::new_v4();
 
-    // Older MessageReceived — the previous turn that completed cleanly.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -474,9 +417,6 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     .await
     .unwrap();
 
-    // Close out the old turn so the in-flight "thing being killed" is the CTC
-    // re-entry, not the MR. Without this the test would be ambiguous about which
-    // originating event the eviction should pick.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -494,10 +434,6 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     .await
     .unwrap();
 
-    // ChildThreadCompleted: the parent re-entered from a finished child. This is
-    // the originating event of the now-in-flight turn that the eviction is
-    // about to abort. Every event the chat agent emits in this turn carries
-    // `request_event_id = ctc_id`.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChildThreadCompleted {
@@ -518,11 +454,8 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     .await
     .unwrap();
 
-    // Empty agent_sessions — chat thread, not CC.
     let agent_sessions = tokio::sync::Mutex::new(std::collections::HashMap::new());
 
-    // Empty active_threads: no live handle, so the anchor comes from the
-    // `latest_originating_event_id` fallback this thread's events seed.
     let active_threads =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -557,15 +490,6 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     teardown_test_db(&db_name).await;
 }
 
-/// Sibling structural assertion for the CC branch. CC parents re-entered from a
-/// finished child carry `ChildThreadCompleted` as their turn's originating
-/// event (the `AgentUserInput { kind: ReentryFromEngine, origin_event_id: ctc_id }`
-/// flows into `run_session`'s `EventMeta::request_event_id`). The eviction
-/// CC branch and the post-restart recovery use `CC_ORIGINATING_EVENT_TYPES`
-/// — verifying the constant covers CTC keeps the CC-side mirror of the
-/// chat regression above structurally impossible. Without this and the chat
-/// pin together, an unrelated rename or refactor could drop CTC from one
-/// list and the bug regresses silently for that channel.
 #[test]
 fn originating_event_type_lists_include_child_thread_completed() {
     use crate::engine::thread_events::{CC_ORIGINATING_EVENT_TYPES, CHAT_ORIGINATING_EVENT_TYPES};
@@ -586,12 +510,6 @@ fn originating_event_type_lists_include_child_thread_completed() {
     );
 }
 
-/// I3: a child's `ResponseFailed` with a giant error string (panic + stack
-/// trace, hostile user input, etc.) must NOT propagate the full text into
-/// the parent's `ChildThreadCompleted.summary`. The failure path caps at
-/// 200 chars + "… (truncated)" — separate from the success path's 2000-char
-/// budget, because failures are usually noise we don't want dominating the
-/// parent's resume context.
 #[tokio::test]
 async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     let (pool, db_name) = setup_test_db().await;
@@ -600,7 +518,6 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Parent + chat child wired up so the fan-in path runs.
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
@@ -650,8 +567,6 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     .await
     .unwrap();
 
-    // 5000-char error — well over both the 200 (failure) and 2000 (success)
-    // caps. Should be truncated to ≤ ~213 chars (200 + ellipsis suffix).
     let huge_error = "X".repeat(5000);
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
@@ -691,23 +606,17 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
         status, "failure",
         "status must be failure for ResponseFailed"
     );
-    // 200 chars of payload + "… (truncated)" suffix.
     assert!(
         summary.ends_with("… (truncated)"),
         "long failure summary must carry the truncation marker, got len={}, summary={:?}",
         summary.len(),
         summary
     );
-    // Total length: 200 chars of "X" + the ellipsis suffix. The ellipsis is
-    // 13 chars but as bytes it's 15 (the "…" char takes 3 bytes). Assert
-    // the byte length is small enough that no stack-trace flooding is
-    // possible — << 250 bytes.
     assert!(
         summary.len() <= 250,
         "failure summary must be truncated at 200 chars (+ short suffix), got len={} bytes",
         summary.len()
     );
-    // And the prefix must be the original payload (not garbage).
     assert!(
         summary.starts_with("XXX"),
         "summary must keep the prefix of the original error, got: {:?}",
@@ -718,17 +627,6 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: a system-actor synthetic `ToolResult` (the recovery sweep's
-/// backfill that pairs an orphan `ToolCalled` so the next LLM call doesn't
-/// trip the Anthropic API's "tool_use without tool_result" rule) must NOT
-/// resurrect a terminated thread to `status='running'`. The activity-event
-/// arm's normal "bump to Running" exists as defense-in-depth against
-/// premature `CodingAgentIdled` drift on a *live* turn — system-stamped
-/// activity events arrive long after the turn is already settled (see
-/// `recover_orphan_tool_calls` in `engine/chat/recovery.rs`), so the bump is
-/// wrong for them. Without this guard, every engine restart that finds
-/// orphan ToolCalled events on already-terminated threads silently parks
-/// those threads in the Active section forever.
 #[tokio::test]
 async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -736,7 +634,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
 
     let thread_id = Uuid::new_v4();
 
-    // 1. Live exchange: user message arrives, thread goes Running.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -762,7 +659,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     .await
     .unwrap();
 
-    // 2. Engine crashes mid-tool: ToolCalled writes, ToolResult never does.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ToolCalled {
@@ -775,10 +671,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     .await
     .unwrap();
 
-    // 3. Engine restarts: the chat orphan-thread sweep emits ResponseAborted
-    //    (EngineShutdown) with a SYSTEM actor. Nobody promised to resume this
-    //    one, so for a chat thread (not proposed) it maps to
-    //    status='failed'.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseAborted {
@@ -805,10 +697,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
          thread with no proposed state settles at failed"
     );
 
-    // 4. Tool-orphan sweep emits the synthetic ToolResult (system actor) to
-    //    pair the orphan ToolCalled. This MUST NOT resurrect status to
-    //    'running' — the thread's last lifecycle event is still the abort
-    //    above; nothing has actually re-entered the LLM loop.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ToolResult {
@@ -837,10 +725,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
          The recovery backfill is not live activity."
     );
 
-    // 5. Sanity check: a live (no-actor) ToolResult arriving while the
-    //    thread is still Running keeps the existing "bump to running"
-    //    behavior. This guards against the fix accidentally killing the
-    //    defense-in-depth path the activity arm exists for.
     let live_thread = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: live_thread,
@@ -895,25 +779,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: an interrupted **coding-agent** thread must keep the red
-/// `failed` status dot for as long as an interrupted **Lucidos Agent** (chat)
-/// thread does. Before this guard only chat threads kept it.
-///
-/// The asymmetry was not in the abort itself — both channels emit the same
-/// `ResponseAborted` — but in what lands *after* it. A restart emits the
-/// boundary abort while the coding-agent subprocess is still alive, so its
-/// final buffered output arrives once the terminal event is already persisted:
-/// `external_terminal_emitted` suppresses the duplicate TERMINAL, not the
-/// activity stream, so `run_session` keeps forwarding
-/// `CodingAgentTextStreamed` / `CodingAgentToolResult` from the drain
-/// (observed in production ~13 ms after the abort). The activity arm's
-/// unconditional "bump back to running" then erased the verdict, and the
-/// `CodingAgentIdled` closing the turn — whose CASE only preserves a status
-/// that *still* reads 'failed' — settled the row to 'idle'. A chat thread's
-/// loop emits nothing after its own terminator, so it never lost the dot.
-///
-/// Runs both backends: the drain lives in the backend-agnostic
-/// `agent_session` layer, so Codex produces the identical shape.
 #[tokio::test]
 async fn interrupted_coding_agent_thread_keeps_paused_status() {
     let (pool, db_name) = setup_test_db().await;
@@ -943,7 +808,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
             ..EventMeta::NONE
         };
 
-        // 1. Live coding-agent turn.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
@@ -986,12 +850,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
         .await
         .unwrap();
 
-        // 2. User hits *Switch to new version*: the teardown emits the boundary
-        //    abort while the subprocess is still draining. The DEVICE actor is
-        //    half the switch fingerprint (`AbortCause::promises_auto_resume`),
-        //    and it is what makes this a paused turn rather than a failed one:
-        //    the same pair is what the resume gates key on, so a system-actor
-        //    abort here would be a turn nothing is coming back for.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ResponseAborted {
@@ -1019,8 +877,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
              the red failed"
         );
 
-        // 3. The dying subprocess's trailing output. Live activity (no actor),
-        //    so the System-actor recovery guard does not cover it.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::CodingAgentTextStreamed {
@@ -1053,7 +909,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
              to 'running'. The abort is the turn's verdict."
         );
 
-        // 4. The idle that closes the interrupted turn.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::CodingAgentIdled {
@@ -1079,7 +934,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
              turn's paused verdict to 'idle'"
         );
 
-        // 5. …nor may the session teardown that follows it.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::SessionEnded {
@@ -1096,7 +950,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
              paused verdict to 'idle'"
         );
 
-        // 6. The verdict is sticky, not wedged: resuming clears it.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ContinuationRequested {
@@ -1117,25 +970,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
     teardown_test_db(&db_name).await;
 }
 
-/// The sibling above with ONE extra fact: the thread already had a pending
-/// change when the switch tore it down. That fact was enough to lose the whole
-/// verdict. See
-/// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
-///
-/// `AbortCause::status_sql` used to answer `'waiting'` instead of the verdict
-/// whenever the thread was proposed, reasoning that a change to review
-/// outranks the interruption. But `'waiting'` is not a
-/// `PRESERVED_STATUS_VERDICTS` value, so the drain landing milliseconds later
-/// wrote `'running'` over it. Both such threads came back spinning, with
-/// transcripts reading "Paused by restart". The Review view dropped them too,
-/// since `threadInReview` excludes a running thread. The precedence was never
-/// the problem: `resolveVisualStatus` already ranks the verdicts above
-/// `changes`.
-///
-/// `ChangeProposed` is the second half. That teardown proposed on both threads
-/// well after their aborts, and that arm wrote `'idle'` over anything but
-/// `'running'` until it too became verdict-preserving. Both verdicts run here,
-/// because both arms carried the identical override.
 #[tokio::test]
 async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
     let (pool, db_name) = setup_test_db().await;
@@ -1159,8 +993,6 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         channel: Some(EventChannel::ClaudeCode),
         ..EventMeta::NONE
     };
-    // A change id is workspace-wide, so the two cases below must not share one:
-    // the second would land on the first's `changes` row.
     let propose = |thread_id: Uuid| ThreadEvent::ChangeProposed {
         content: Default::default(),
         change_id: test_change_id(thread_id).to_string(),
@@ -1215,8 +1047,6 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         .await
         .unwrap();
 
-        // The change the turn had already proposed before the switch. It leaves
-        // the thread running, and sets the flag the old override keyed on.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: propose(thread_id),
@@ -1254,7 +1084,6 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
              pending. The change surfaces through the proposed change state."
         );
 
-        // The dying subprocess's drain, the step that used to erase it.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::CodingAgentToolResult {
@@ -1287,7 +1116,6 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
              'running'. This is the spinner the user reported."
         );
 
-        // The proposal the teardown itself produced, on its way out.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: propose(thread_id),
@@ -1335,7 +1163,6 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
             "{case}: neither the idle nor the session teardown may downgrade it"
         );
 
-        // Still a verdict, not a wedge.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ContinuationRequested {
@@ -1369,12 +1196,6 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
     teardown_test_db(&db_name).await;
 }
 
-/// A proposal is bookkeeping, so it may not take a thread off a question the
-/// user can still answer. Recovery after a restart re-proposed a
-/// question-parked thread's change, and that proposal wrote `'idle'`. The
-/// thread then offered Apply, whose hardening run killed the question card,
-/// and the user's typed answer went to the wrong session. See
-/// `docs/plans/2026-09-26-a-proposed-change-keeps-the-open-question.md`.
 #[tokio::test]
 async fn a_proposal_keeps_the_thread_on_its_open_question() {
     let (pool, db_name) = setup_test_db().await;
@@ -1435,9 +1256,6 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         auto_compact_arm: None,
         continuity: None,
     };
-    // Recovery's proposal: engine-origin, and incomplete because the turn
-    // never ended cleanly. A branch holds one pending change, so each gets
-    // its own.
     let propose = |change_id: Uuid| ThreadEvent::ChangeProposed {
         content: Default::default(),
         change_id: change_id.to_string(),
@@ -1499,8 +1317,6 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         "Apply Now refuses on this predicate, so the proposal must not unpark it"
     );
 
-    // A row the old projection already wrote to 'idle' still owes the answer.
-    // Every Apply route refuses it, although its status grants Apply.
     let set_status = |status: &'static str| {
         let pool = pool.clone();
         async move {
@@ -1533,7 +1349,6 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
     );
     set_status("waiting_for_user_answer").await;
 
-    // Not a wedge: the answer moves the thread on, and the next idle parks it.
     emit(
         thread_id,
         ThreadEvent::UserQuestionAnswered {
@@ -1573,8 +1388,6 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         "nor does it block an Apply"
     );
 
-    // A permission card shares the status but is not a question. One left
-    // behind by an idled session is dead, so it must not hold the thread.
     let carded = Uuid::new_v4();
     emit(carded, session_started()).await;
     emit(
@@ -1597,24 +1410,6 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
     teardown_test_db(&db_name).await;
 }
 
-/// `paused` is the promise "the engine is bringing this turn back", so only the
-/// abort that carries such a promise may write it. Three shapes go through the
-/// real projection here, differing ONLY in the pair the verdict reads:
-///
-/// 1. `EngineShutdown` + device actor: the user's own *Switch to new version*,
-///    which both resume gates auto-resume. Paused.
-/// 2. `EngineShutdown` + system actor: a teardown nobody requested (`stop.sh`,
-///    an external SIGUSR1, ctrl-c). No gate picks it up. Note this is now the
-///    ONLY way to get this pair: since 2026-08-07 every emit in one teardown
-///    reads the same `LucidosEngine::teardown_actor`, so a user switch cannot
-///    produce it for a thread that merely started late.
-/// 3. `RecoveryAfterRestart` + system actor: the crash boundary, and the shape
-///    `settle_unresumed_switch_threads` emits to WITHDRAW a promise this boot
-///    could not keep. Withdrawing it behind a reassuring pause glyph, and out of
-///    the needs-attention count, is the bug this test pins shut.
-///
-/// The last two must read `failed`: each keeps its Continue button, and `failed`
-/// is what puts the thread where the user will look.
 #[tokio::test]
 async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
     let (pool, db_name) = setup_test_db().await;
@@ -1700,21 +1495,6 @@ async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: the shutdown sweep's phantom `ResponseCanceled` must not walk an
-/// interrupted **Lucidos Agent** thread's error status back to 'idle'.
-///
-/// `shutdown_active_threads` emits `ResponseAborted`, then cancels the loop,
-/// whose own `ResponseCanceled` follows. The sweep's docstring called the
-/// phantom harmless because "ResponseAborted takes precedence in status
-/// derivation", which is only true of the exchange label;
-/// `thread_summaries.status` is last-write-wins, so the cancel used to erase the
-/// verdict. `preserving_verdict` is what stops it.
-///
-/// The sweep anchors both emits on the in-flight turn now, so
-/// `emit_response_canceled`'s idempotency gate usually pairs them and no phantom
-/// is produced at all. This test deliberately reproduces the unpaired ordering
-/// anyway: the gate needs an anchor to match on, and a turn that never got far
-/// enough to record one still reaches this shape.
 #[tokio::test]
 async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     let (pool, db_name) = setup_test_db().await;
@@ -1759,8 +1539,6 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     .await
     .unwrap();
 
-    // The sweep's abort — note the absent `request_event_id`, which is exactly
-    // why the gate below can't suppress the loop's cancel.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseAborted {
@@ -1774,12 +1552,8 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     })
     .await
     .unwrap();
-    // System actor, so this is NOT the switch fingerprint: no resume gate will
-    // pick this thread up, and 'failed' is what keeps it in the attention count
-    // with its Continue button.
     assert_eq!(status_of(thread_id).await, "failed");
 
-    // `cancel_all_threads` wakes the agentic loop's cancel arm moments later.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseCanceled {
@@ -1800,8 +1574,6 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
          thread's status. The abort is the turn's verdict."
     );
 
-    // A cancel of a genuinely new turn still settles the thread: the start
-    // event clears the verdict first, so Stop behaves exactly as before.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -1850,8 +1622,6 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     teardown_test_db(&db_name).await;
 }
 
-/// The discard arm wipes `compose_selection` too — a discarded draft leaves no
-/// ghost dropdown picks behind for a replay/reload to resurrect.
 #[tokio::test]
 async fn thread_discarded_clears_compose_selection() {
     let (pool, db_name) = setup_test_db().await;
@@ -1903,9 +1673,6 @@ async fn thread_discarded_clears_compose_selection() {
     teardown_test_db(&db_name).await;
 }
 
-/// Seed an active thread parked on a question, with `draft` sitting in its
-/// compose fields — the shape a device leaves behind when the user typed into
-/// the composer while an `ask_user_question` was on screen.
 async fn seed_thread_awaiting_answer(bus: &EventBus, pool: &PgPool, draft: &str) -> Uuid {
     let thread_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
@@ -1950,7 +1717,6 @@ async fn seed_thread_awaiting_answer(bus: &EventBus, pool: &PgPool, draft: &str)
     thread_id
 }
 
-/// Read the compose fields the answer arm is allowed to touch.
 async fn read_compose(pool: &PgPool, thread_id: Uuid) -> (String, Option<serde_json::Value>) {
     sqlx::query_as(
         "SELECT compose_text, compose_selection FROM thread_summaries WHERE thread_id = $1",
@@ -1961,17 +1727,11 @@ async fn read_compose(pool: &PgPool, thread_id: Uuid) -> (String, Option<serde_j
     .unwrap()
 }
 
-/// A submission consumes the compose slot when the engine ACCEPTS it (ADR
-/// 0450), so no event the send emits afterwards may touch the draft. A
-/// coding-agent send emits `MessageReceived` and then `SessionStarted` after
-/// the ack, and a draft stored in between is the user's next message. A
-/// question answer is consumed by its endpoint the same way.
 #[tokio::test]
 async fn a_draft_written_after_the_accept_survives_the_sends_later_events() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = seed_thread_awaiting_answer(&bus, &pool, "the next message").await;
-    // The accept already consumed the slot once.
     sqlx::query("UPDATE thread_summaries SET compose_epoch = 1 WHERE thread_id = $1")
         .bind(thread_id)
         .execute(&pool)
@@ -2048,9 +1808,6 @@ async fn a_draft_written_after_the_accept_survives_the_sends_later_events() {
     teardown_test_db(&db_name).await;
 }
 
-/// A message that CREATES the thread announces nothing. There is no compose
-/// slot to consume, the epoch stays at its storage default, and no device has
-/// heard of the thread yet, so an SSE frame would reach nobody.
 #[tokio::test]
 async fn a_message_that_creates_the_thread_broadcasts_no_compose_change() {
     let (pool, db_name) = setup_test_db().await;
@@ -2070,9 +1827,6 @@ async fn a_message_that_creates_the_thread_broadcasts_no_compose_change() {
     teardown_test_db(&db_name).await;
 }
 
-/// A `ContinuationStarted` is not a submission. The user clicked Continue, they
-/// did not send, so their draft survives AND the epoch must stay put: bumping
-/// it would refuse the next perfectly good write for nothing.
 #[tokio::test]
 async fn a_chat_continue_leaves_the_compose_epoch_alone() {
     let (pool, db_name) = setup_test_db().await;
@@ -2125,8 +1879,6 @@ async fn a_chat_continue_leaves_the_compose_epoch_alone() {
     teardown_test_db(&db_name).await;
 }
 
-/// Recovery inserts the complete initial composer in the event transaction.
-/// A lost-response retry must preserve edits even after a mode/state change.
 #[tokio::test]
 async fn restored_draft_is_atomic_and_retry_preserves_newer_edits() {
     use crate::engine::thread_events::RecoveredCompose;

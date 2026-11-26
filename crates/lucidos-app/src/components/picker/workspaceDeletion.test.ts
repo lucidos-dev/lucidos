@@ -1,13 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { confirmCleanup, freezeWorkspaceDeletion } from '../../api/client/control';
-import { showConfirm, showToast } from '../../store/store';
+import { removeToast, showConfirm, showToast } from '../../store/store';
 import { deleteWorkspaces } from './workspaceDeletion';
 
 vi.mock('../../api/client/control', () => ({
   freezeWorkspaceDeletion: vi.fn(),
   confirmCleanup: vi.fn(),
 }));
-vi.mock('../../store/store', () => ({ showConfirm: vi.fn(), showToast: vi.fn() }));
+vi.mock('../../store/store', () => ({ showConfirm: vi.fn(), showToast: vi.fn(), removeToast: vi.fn() }));
 
 const batch = {
   id: 'batch-example',
@@ -34,7 +34,17 @@ describe('picker workspace deletion', () => {
       'Delete workspace "Example Workspace"?', 'Delete', { variant: 'danger' },
     );
     expect(confirmCleanup).toHaveBeenCalledExactlyOnceWith(batch.id, batch.phrase);
+    expect(showToast).toHaveBeenCalledWith('Deleting "Example Workspace"…', 'info', expect.objectContaining({ spinning: true }));
     expect(showToast).toHaveBeenCalledWith('Deleted "Example Workspace".', 'success');
+    expect(removeToast).toHaveBeenCalledWith('workspace-delete');
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('clears the progress toast and names a failed confirm', async () => {
+    vi.mocked(confirmCleanup).mockRejectedValue(new Error('Gateway timed out'));
+    await deleteWorkspaces(['example'], refresh);
+    expect(removeToast).toHaveBeenCalledWith('workspace-delete');
+    expect(showToast).toHaveBeenCalledWith('Could not delete workspace: Gateway timed out', 'error');
     expect(refresh).toHaveBeenCalledOnce();
   });
 

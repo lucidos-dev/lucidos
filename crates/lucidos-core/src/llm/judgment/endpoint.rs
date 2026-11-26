@@ -1,17 +1,3 @@
-//! The System One rows a judgment site can pick (ADR 0363).
-//!
-//! Five are seeded: TypeSafe's Jev, Jev through OpenRouter, Cloudflare's Clef
-//! and Clef-flash on Workers AI, and OpenAI's Decisions API. The sixth is a
-//! custom endpoint the user points at, such as a self-hosted open model.
-//!
-//! All but OpenAI speak TypeSafe's System One wire, so such a row is only a
-//! URL, a model name and where its key lives. OpenAI's row speaks its own
-//! Decisions API through [`super::openai_decisions`].
-//!
-//! Each provider has its own master switch, defaulting to on, like every
-//! other `provider_enabled_*` key. Clef and Clef-flash share Cloudflare's.
-//! OpenRouter and OpenAI share the switch and the key of their chat provider.
-
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -24,30 +10,18 @@ use crate::core::prefs::{self, Flag, Pref};
 use crate::core::{credential_scope_covers, CredentialStore};
 use crate::llm::{ProviderKind, OPENROUTER_API_KEY_ENV, OPENROUTER_BASE_URL};
 
-/// The launch environment's key, read when no `typesafe` credential is stored.
 pub const TYPESAFE_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 
-/// The credential service name holding TypeSafe's key.
 pub const TYPESAFE_CREDENTIAL_SERVICE: &str = "typesafe";
 
-/// The credential service name holding a Workers AI token.
-///
-/// Its scope URL carries the account, as
-/// `https://api.cloudflare.com/client/v4/accounts/<account id>/ai`, so one
-/// credential holds everything Clef needs.
 pub const CLOUDFLARE_WORKERS_AI_CREDENTIAL_SERVICE: &str = "cloudflare-workers-ai";
 
-/// The credential service name holding the custom endpoint's optional key.
 pub const SYSTEM_ONE_CUSTOM_CREDENTIAL_SERVICE: &str = "system-one-custom";
 
-/// The model OpenRouter's System One endpoint is asked for while
-/// `system_one_openrouter_model` names none: Jev's current version.
 pub const OPENROUTER_JEV_MODEL: &str = "~typesafe/jev-latest";
 
-/// What every Workers AI scope URL starts with, before the account id.
 pub const CLOUDFLARE_ACCOUNTS_PREFIX: &str = "https://api.cloudflare.com/client/v4/accounts/";
 
-/// One System One row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemOneEndpoint {
     Jev,
@@ -68,7 +42,6 @@ impl SystemOneEndpoint {
         Self::Custom,
     ];
 
-    /// The value a `judgment_*` preference stores to pick this row.
     pub const fn id(self) -> &'static str {
         match self {
             Self::Jev => "jev",
@@ -80,10 +53,6 @@ impl SystemOneEndpoint {
         }
     }
 
-    /// The row a stored value names, or `None`.
-    ///
-    /// Case and surrounding space are forgiven, because a human types this
-    /// value. Nothing else is: an unrecognized word is not a guess to resolve.
     pub fn from_id(value: &str) -> Option<Self> {
         let value = value.trim();
         Self::ALL
@@ -91,7 +60,6 @@ impl SystemOneEndpoint {
             .find(|endpoint| endpoint.id().eq_ignore_ascii_case(value))
     }
 
-    /// The name in a log line.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Jev => "TypeSafe (Jev)",
@@ -103,7 +71,6 @@ impl SystemOneEndpoint {
         }
     }
 
-    /// The master switch over this row's provider.
     pub const fn switch_key(self) -> &'static Pref<Flag> {
         match self {
             Self::Jev => &prefs::PROVIDER_ENABLED_TYPESAFE,
@@ -124,7 +91,6 @@ impl SystemOneEndpoint {
         }
     }
 
-    /// The chat provider whose key and switch this row reuses, if any.
     pub const fn chat_provider(self) -> Option<ProviderKind> {
         match self {
             Self::OpenRouter => Some(ProviderKind::OpenRouter),
@@ -133,7 +99,7 @@ impl SystemOneEndpoint {
         }
     }
 
-    /// Build this row's provider, or say what is missing.
+    /// INVARIANT: Build this row's provider, or say what is missing.
     ///
     /// The reason is for a log line, so it names where to fix it and never
     /// carries the key.
@@ -163,7 +129,6 @@ impl SystemOneEndpoint {
         Ok(Box::new(provider))
     }
 
-    /// A System One row's request URL, model and optional key.
     pub(crate) async fn system_one_request(
         self,
         pool: &PgPool,
@@ -226,8 +191,6 @@ impl SystemOneEndpoint {
                     .read(pool)
                     .await
                     .ok_or("the custom System One endpoint has no model set")?;
-                // The key goes only where its scope covers the URL, as the
-                // Local provider's does. A moved URL must not carry it along.
                 let key = stored_credential(pool, self.credential_service())
                     .await
                     .filter(|(c, _)| credential_scope_covers(&c.base_urls, &url))
@@ -238,13 +201,10 @@ impl SystemOneEndpoint {
     }
 }
 
-/// OpenRouter's System One request URL, under its chat API root.
 pub(crate) fn openrouter_system_one_url() -> String {
     format!("{OPENROUTER_BASE_URL}/systemone")
 }
 
-/// The OpenRouter key the chat provider uses: the stored `openrouter`
-/// credential, then [`OPENROUTER_API_KEY_ENV`].
 async fn openrouter_api_key(pool: &PgPool) -> Option<String> {
     let service = SystemOneEndpoint::OpenRouter.credential_service();
     let credential = match CredentialStore::get(pool, service).await {
@@ -265,8 +225,6 @@ async fn openrouter_api_key(pool: &PgPool) -> Option<String> {
     crate::llm::resolve_bearer_key(credential, std::env::var(OPENROUTER_API_KEY_ENV).ok())
 }
 
-/// The Clef request URL under one Workers AI scope URL, or `None` when the
-/// scope does not name an account.
 pub(crate) fn workers_ai_url(scope: &str, model: &str) -> Option<String> {
     let scope = scope.trim().trim_end_matches('/');
     let account = scope
@@ -276,10 +234,6 @@ pub(crate) fn workers_ai_url(scope: &str, model: &str) -> Option<String> {
     well_formed.then(|| format!("{scope}/run/@cf/cloudflare/{model}"))
 }
 
-/// The TypeSafe key, from the stored credential or the launch environment.
-///
-/// Returns `None` rather than an error, because no key is the ordinary state
-/// of a workspace and not a fault.
 pub(crate) async fn typesafe_api_key(pool: &PgPool) -> Option<String> {
     if let Some((_, key)) = stored_credential(pool, TYPESAFE_CREDENTIAL_SERVICE).await {
         return Some(key);
@@ -289,8 +243,6 @@ pub(crate) async fn typesafe_api_key(pool: &PgPool) -> Option<String> {
         .filter(|k| !k.trim().is_empty())
 }
 
-/// A stored credential and its non-blank secret, or `None`. A read error
-/// logs, and so does a secret reference that cannot be read.
 async fn stored_credential(
     pool: &PgPool,
     service: &str,

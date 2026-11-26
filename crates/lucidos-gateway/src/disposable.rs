@@ -1,4 +1,3 @@
-//! The disposable launch contract is selected by argv, never the environment.
 use crate::BoxError;
 use lucidos_home::disposable::Scope;
 
@@ -140,9 +139,14 @@ mod tests {
             "/~/api/v1/remote-gateways",
             "/~/api/v1/auth/pair",
             "/~/api/v1/control/workspaces/restore",
+            "/~/api/v1/control/restore-uploads",
         ] {
             assert!(!request_allowed("POST", path), "{path}");
         }
+        assert!(!request_allowed(
+            "PATCH",
+            "/~/api/v1/control/restore-uploads/00000000000000000000000000000000"
+        ));
         assert!(!request_allowed("GET", "/remote@example/api/v1/health"));
         assert!(request_allowed("POST", "/smoke/api/v1/triggers"));
     }

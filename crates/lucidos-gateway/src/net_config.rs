@@ -1,60 +1,20 @@
-//! Network bind resolution for the gateway + read/write of the machine-global
-//! `network.toml`, a private entry (`lucidos_home::private_entry`).
-//!
-//! The gateway is the network-facing process, so its bind is **machine-global**
-//! (it binds before any workspace is selected). Resolution precedence (highest
-//! wins):
-//!
-//!   1. `LUCIDOS_GATEWAY_BIND_ADDR` parses to an `IpAddr` → bind exactly that.
-//!      Set but unparseable → log a warning, ignore it, continue.
-//!   2. `LUCIDOS_GATEWAY_BIND_ALL` truthy → all interfaces (`[::]`, dual-stack).
-//!   3. `network.toml` `[gateway] bind` → `"loopback"|"all"|<IP>`
-//!      (invalid IP → warn + loopback).
-//!   4. loopback (the safe default — the gateway fronts every workspace API and
-//!      its own destructive control plane, so a default launch is never exposed).
-//!
-//! This file ALSO owns reading + writing `network.toml` (the picker's machine-
-//! global Network access control writes it through the gateway control plane),
-//! and resolving the *external address* stored beside the bind (ADR 0550).
-//! The per-workspace engine half — `[engine] inherit` and each engine's own
-//! `network_bind` preference — is resolved in
-//! `crates/lucidos-core/src/net_config.rs`. The **bind resolution** in the two
-//! `net_config` modules is deliberately duplicated rather than shared: the
-//! gateway has no dependency on `lucidos-engine` (ADR 0014 §1). Their
-//! **Tailscale** half is not duplicated any more, because keeping two copies in
-//! step is precisely what failed; it lives in the `lucidos-tailscale` crate,
-//! which is small enough for the gateway to depend on.
-
 use lucidos_home::private::{NETWORK_TOML, NETWORK_TOML_LOCK};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-/// The resolved bind scope for a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindChoice {
-    /// Loopback only (`127.0.0.1`) — the safe default.
     Loopback,
-    /// All interfaces (`[::]`, dual-stack).
     All,
-    /// A single explicit address (e.g. a Tailscale `100.x` tailnet IP).
     Address(IpAddr),
 }
 
-/// The machine-global `network.toml`, parsed with safe defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkToml {
-    /// `[gateway] bind` — `loopback` | `all` | `<IP>`. `None` = unset → loopback.
     pub gateway_bind: Option<String>,
-    /// `[engine] inherit` — true (default) = engines bind the gateway's bind;
-    /// false = each engine reads its own `network_bind` preference.
     pub engine_inherit: bool,
-    /// `[external_address]`: per gateway port, the origin other devices reach
-    /// that gateway at, through a route the user runs (ADR 0550). Keyed by
-    /// port because this file is machine-global and two gateways can run on
-    /// one machine: a QR aimed at the other one carries a code it never
-    /// minted. Every value is one [`valid_external_address`] accepted.
     pub external_addresses: BTreeMap<u16, String>,
 }
 
@@ -72,7 +32,6 @@ impl Default for NetworkToml {
 struct RawNetworkToml {
     gateway: Option<RawGateway>,
     engine: Option<RawEngine>,
-    /// Values stay untyped, so one bad entry drops itself and not the file.
     external_address: Option<BTreeMap<String, toml::Value>>,
 }
 
@@ -91,19 +50,14 @@ fn default_true() -> bool {
     true
 }
 
-/// The private entry `network.toml`. `None` only when `HOME` is unset.
 pub fn network_toml_path() -> Option<PathBuf> {
     lucidos_home::private_entry(NETWORK_TOML)
 }
 
-/// Does the machine-global config file exist? Used by the dev launch path /
-/// `spawn_engine` to decide whether to apply the dev all-interfaces default or
-/// step aside and let the resolvers + per-workspace prefs decide.
 pub fn network_toml_exists() -> bool {
     network_toml_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// Read + parse the machine-global config. Any failure yields safe defaults.
 pub fn read_network_toml() -> NetworkToml {
     match network_toml_path() {
         Some(path) => read_network_toml_at(&path),
@@ -123,10 +77,6 @@ fn read_network_toml_at(path: &Path) -> NetworkToml {
     }
 }
 
-/// The log line a failed read of `network.toml` deserves. `None` for an absent
-/// file: that is the normal case, and loopback is the right default for it. Any
-/// other failure hides a config the operator wrote, so the line names the path
-/// and the error.
 fn read_failure_warning(path: &Path, e: &std::io::Error) -> Option<String> {
     match e.kind() {
         std::io::ErrorKind::NotFound => None,
@@ -137,7 +87,6 @@ fn read_failure_warning(path: &Path, e: &std::io::Error) -> Option<String> {
     }
 }
 
-/// Pure parse of `network.toml` contents. Malformed → safe defaults + a warning.
 pub fn parse_network_toml(contents: &str) -> NetworkToml {
     match toml::from_str::<RawNetworkToml>(contents) {
         Ok(raw) => NetworkToml {
@@ -159,16 +108,9 @@ pub fn parse_network_toml(contents: &str) -> NetworkToml {
     }
 }
 
-/// Render the config file with explanatory comments (the `toml` crate's
-/// serializer drops comments, so we template it). An unset bind renders as
-/// loopback, which is what it resolves to.
-///
-/// `scripts/lib/service.sh` (`service_render_network_toml`) writes the same
-/// shape, so keep the two in step.
 pub fn render_network_toml(net: &NetworkToml) -> String {
     let gateway_bind = net.gateway_bind.as_deref().unwrap_or("loopback");
     let engine_inherit = net.engine_inherit;
-    // A validated origin holds no quote or backslash, so it needs no escaping.
     let external_table = if net.external_addresses.is_empty() {
         String::new()
     } else {
@@ -205,18 +147,12 @@ pub fn render_network_toml(net: &NetworkToml) -> String {
     )
 }
 
-/// Change `network.toml` in place, asserting its directory as a storage root
-/// first. Values are assumed already validated by [`validate_bind_input`]
-/// and [`valid_external_address`].
 pub fn update_network_toml(change: impl FnOnce(&mut NetworkToml)) -> std::io::Result<()> {
     let path = lucidos_home::ensure_private_entry(NETWORK_TOML)?;
     let dir = path.parent().expect("a private entry has a parent");
     update_network_toml_in(dir, change)
 }
 
-/// Two gateways share the file, so the read, the change and the write happen
-/// under one lock, or each could drop the other's entry. The write is atomic
-/// through a temp file of its own.
 fn update_network_toml_in(
     dir: &Path,
     change: impl FnOnce(&mut NetworkToml),
@@ -236,15 +172,8 @@ fn update_network_toml_in(
     Ok(())
 }
 
-/// The environment variable that sets the external address and locks it.
 pub const EXTERNAL_ADDRESS_ENV: &str = "LUCIDOS_EXTERNAL_ADDRESS";
 
-/// Accept `raw` as an external address, or say why not.
-///
-/// An origin only, by the same rule as a pairing QR origin
-/// ([`crate::pairing_qr::valid_origin`]). A loopback host is refused as well:
-/// it reaches this machine alone, so the probe would verify an address no
-/// other device can open.
 pub fn valid_external_address(raw: &str) -> Result<String, String> {
     let origin = crate::pairing_qr::valid_origin(raw).ok_or_else(|| {
         format!(
@@ -253,8 +182,6 @@ pub fn valid_external_address(raw: &str) -> Result<String, String> {
             raw.trim()
         )
     })?;
-    // Judge the host as the HTTP client will read it, so `127.1` or
-    // `[::ffff:127.0.0.1]` cannot pass as a name.
     let parsed = reqwest::Url::parse(origin)
         .map_err(|e| format!("'{origin}' is not an origin the gateway can open ({e})"))?;
     let host = parsed.host_str().unwrap_or_default();
@@ -272,8 +199,6 @@ pub fn valid_external_address(raw: &str) -> Result<String, String> {
             "'{origin}' only reaches this machine. Use an address other devices can open"
         ));
     }
-    // No VPN hands out these, and the save probe must not reach a cloud
-    // metadata service at 169.254.169.254.
     let unroutable = ip.is_some_and(|ip| match ip {
         IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
         IpAddr::V6(v6) => v6.is_unicast_link_local() || v6.is_unspecified(),
@@ -286,8 +211,6 @@ pub fn valid_external_address(raw: &str) -> Result<String, String> {
     Ok(origin.to_string())
 }
 
-/// One `[external_address]` entry, or `None` with a log line when the port or
-/// the origin is refused.
 fn parse_external_entry(port: &str, origin: &toml::Value) -> Option<(u16, String)> {
     let Ok(port) = port.parse::<u16>() else {
         crate::log_legacy!(
@@ -305,8 +228,6 @@ fn parse_external_entry(port: &str, origin: &toml::Value) -> Option<(u16, String
     Some((port, origin))
 }
 
-/// [`valid_external_address`] for a value read from `source`: a refused one is
-/// logged and reads as unset, like an invalid bind.
 fn external_address_or_warn(raw: &str, source: &str) -> Option<String> {
     if raw.trim().is_empty() {
         return None;
@@ -318,19 +239,14 @@ fn external_address_or_warn(raw: &str, source: &str) -> Option<String> {
         .ok()
 }
 
-/// Where the external address in effect came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExternalAddressSource {
-    /// Nothing sets one.
     Unset,
-    /// `network.toml`, which Settings and the CLI write.
     File,
-    /// [`EXTERNAL_ADDRESS_ENV`], which locks every writer out.
     Env,
 }
 
-/// The external address in effect, and who set it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAddress {
     pub origin: Option<String>,
@@ -338,17 +254,11 @@ pub struct ExternalAddress {
 }
 
 impl ExternalAddress {
-    /// The environment variable owns the value, so a write must be refused.
     pub fn locked(&self) -> bool {
         self.source == ExternalAddressSource::Env
     }
 }
 
-/// Resolve the external address. Pure: the caller supplies the environment
-/// value and the file's value.
-///
-/// A valid environment value wins and locks. An empty one is unset, and an
-/// invalid one is logged and ignored, as an invalid bind address is.
 pub fn resolve_external_address(env: Option<&str>, file: Option<&str>) -> ExternalAddress {
     if let Some(origin) = env.and_then(|raw| external_address_or_warn(raw, EXTERNAL_ADDRESS_ENV)) {
         return ExternalAddress {
@@ -368,8 +278,6 @@ pub fn resolve_external_address(env: Option<&str>, file: Option<&str>) -> Extern
     }
 }
 
-/// [`resolve_external_address`] for the gateway on `port`, over this
-/// process's environment and the current `network.toml`.
 pub fn external_address(port: u16) -> ExternalAddress {
     let net = read_network_toml();
     resolve_external_address(
@@ -378,7 +286,6 @@ pub fn external_address(port: u16) -> ExternalAddress {
     )
 }
 
-/// Map a config string to a [`BindChoice`]; unparseable → warn + loopback.
 pub fn parse_bind_value(value: &str) -> BindChoice {
     match value.trim().to_ascii_lowercase().as_str() {
         "loopback" | "" => BindChoice::Loopback,
@@ -399,38 +306,13 @@ fn truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "yes" | "on")
 }
 
-// ---------------------------------------------------------------------------
-// Wire scheme (http vs https): the gateway's copy of the ONE rule.
-// ---------------------------------------------------------------------------
-//
-// A Lucidos process serves TLS iff BOTH `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY`
-// point at non-empty paths. This mirrors `lucidos_engine::net_config`'s
-// `tls_scheme_from` exactly, and it has to: the gateway decides what scheme a
-// spawned engine's ports file names, while that engine decides what it SERVES
-// with the engine-side copy. A rule that differs here by so much as a
-// missing key is a scheme mismatch on a loopback hop, which is the recurring
-// `error sending request for url` bug (ADR 0014, `.claude/rules/rust.md`
-// § "Intra-host scheme"). Duplicated rather than shared because the gateway
-// links no engine code (ADR 0014 §1), so keep the two in step.
-
-/// Plain-HTTP scheme literal.
 pub const SCHEME_HTTP: &str = "http";
-/// TLS scheme literal.
 pub const SCHEME_HTTPS: &str = "https";
 
-/// Does a process configured with this cert/key pair serve TLS? True only when
-/// BOTH are present and non-empty: a set-but-empty value is how a launch script
-/// spells "unset", and treating it as TLS is what makes the two sides disagree.
 pub fn serves_tls(cert: Option<&str>, key: Option<&str>) -> bool {
     matches!((cert, key), (Some(c), Some(k)) if !c.trim().is_empty() && !k.trim().is_empty())
 }
 
-/// [`serves_tls`] reading `LUCIDOS_TLS_CERT` / `LUCIDOS_TLS_KEY` from the
-/// process environment: does THIS gateway serve TLS on its own port?
-///
-/// Every site that asks goes through here, so the listener and the cookie's
-/// `Secure` flag cannot answer it differently. Mirrors the engine's
-/// `net_config::tls_scheme`, which is the same wrapper over the same rule.
 pub fn serves_tls_from_env() -> bool {
     serves_tls(
         std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
@@ -438,8 +320,6 @@ pub fn serves_tls_from_env() -> bool {
     )
 }
 
-/// Validate a user-supplied bind value for the control endpoint (server-side
-/// mirror of the picker's client-side validation).
 pub fn validate_bind_input(value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     match trimmed.to_ascii_lowercase().as_str() {
@@ -450,8 +330,6 @@ pub fn validate_bind_input(value: &str) -> Result<(), String> {
     }
 }
 
-/// Resolve the gateway bind. See the module doc for the precedence. Pure — the
-/// caller supplies env values + the parsed `[gateway] bind`.
 pub fn resolve_gateway_bind(
     bind_addr_env: Option<&str>,
     bind_all_env: Option<&str>,
@@ -477,9 +355,6 @@ pub fn resolve_gateway_bind(
     }
 }
 
-/// The primary socket address for a resolved choice. `All` uses `[::]`
-/// (dual-stack). For an explicit `Address` this is the configured IP only — use
-/// [`bind_socket_addrs`] to also retain loopback.
 pub fn bind_socket_addr(choice: &BindChoice, port: u16) -> SocketAddr {
     match choice {
         BindChoice::Loopback => SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
@@ -488,15 +363,6 @@ pub fn bind_socket_addr(choice: &BindChoice, port: u16) -> SocketAddr {
     }
 }
 
-/// Every socket address the gateway must listen on for a resolved choice.
-///
-/// A specific `Address(ip)` binds a single socket to that one IP, which
-/// **excludes loopback** — but the dev launch scripts POST the gateway's control
-/// API over `localhost:<port>` (start/restart a workspace), and each spawned
-/// engine's Apply-restart callback hits `http://127.0.0.1:<port>/~/...`. So an
-/// `Address` ALSO binds IPv4 loopback; otherwise those co-located callers are
-/// refused (and a workspace can never be told to start). A choice that already
-/// covers loopback binds a single socket ([`covers_loopback`]). Never empty.
 pub fn bind_socket_addrs(choice: &BindChoice, port: u16) -> Vec<SocketAddr> {
     let primary = bind_socket_addr(choice, port);
     if covers_loopback(choice) {
@@ -506,11 +372,6 @@ pub fn bind_socket_addrs(choice: &BindChoice, port: u16) -> Vec<SocketAddr> {
     }
 }
 
-/// Whether the choice's one socket already accepts `127.0.0.1`.
-///
-/// `[::]` accepts IPv4 loopback as v4-mapped, and `0.0.0.0` accepts it outright.
-/// So does a wildcard `Address`, and Linux refuses a loopback socket beside it
-/// on the same port with `EADDRINUSE`.
 fn covers_loopback(choice: &BindChoice) -> bool {
     match choice {
         BindChoice::Loopback | BindChoice::All => true,
@@ -518,38 +379,12 @@ fn covers_loopback(choice: &BindChoice) -> bool {
     }
 }
 
-/// [`bind_socket_addrs`] split by what a bind failure MEANS, which is not the
-/// same question as which addresses to listen on.
-///
-/// `required` is the set the gateway cannot usefully run without: failing to
-/// bind one is fatal, exactly as every address was before this split existed.
-/// `optional` is the set that may simply not exist yet, so a failure there is
-/// retried in the background rather than taken as the end of the process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindPlan {
-    /// Fatal on failure. Never empty.
     pub required: Vec<SocketAddr>,
-    /// Retried on failure, forever, with backoff. Usually empty.
     pub optional: Vec<SocketAddr>,
 }
 
-/// Split the addresses for a resolved choice into fatal and retryable.
-///
-/// **Only a configured `Address(ip)` is optional**, and only the `ip` half of
-/// it: loopback stays required. That asymmetry is the whole point. A tailnet or
-/// LAN address is a *reachability addition* whose interface may not be up when
-/// launchd starts the service at boot (`tailscaled` assigns the `100.x` address
-/// well after login), and binding it then fails with `EADDRNOTAVAIL`. Before
-/// this split, that failure took the loopback listener down with it and the
-/// packaged window sat on its "Starting Lucidos…" splash for two minutes waiting
-/// for a gateway that had already exited. Loopback is what the desktop client,
-/// each engine's Apply-restart callback and the dev control POSTs actually
-/// speak, so a machine that can serve loopback can serve its user.
-///
-/// A single-socket choice keeps fail-fast: `Loopback`, `All` and a wildcard
-/// `Address`. An operator who asked to be reachable on all interfaces is owed
-/// an error when that cannot happen, not a quiet demotion. A failure there is a
-/// held port rather than an absent interface.
 pub fn bind_plan(choice: &BindChoice, port: u16) -> BindPlan {
     let addrs = bind_socket_addrs(choice, port);
     if covers_loopback(choice) {
@@ -563,12 +398,6 @@ pub fn bind_plan(choice: &BindChoice, port: u16) -> BindPlan {
     BindPlan { required, optional }
 }
 
-/// A side listener's port: `configured` when set, else the gateway's own plus
-/// `offset`, so dev and packaged gateways coexist.
-///
-/// `None` means no listener. That is what an explicit `0` asks for, and what an
-/// unparseable value gets: a listener on a port nobody meant to open is worse
-/// than none. `var` names the setting in that log line.
 pub fn side_port(
     var: &str,
     configured: Option<&str>,
@@ -590,12 +419,6 @@ pub fn side_port(
     }
 }
 
-/// A side listener's address: `configured` as an IP literal, else loopback.
-///
-/// Loopback is the default because funnel and `tailscale serve` proxy from
-/// this machine. A container sets an address so a Service at the pod IP can
-/// reach the listener (ADR 0624). An unparseable value stays on loopback and
-/// logs: a bad setting must never widen a bind. `var` names it in that line.
 pub fn side_bind_addr(var: &str, configured: Option<&str>, port: u16) -> SocketAddr {
     let ip = match configured.map(str::trim) {
         Some(raw) if !raw.is_empty() => raw.parse::<IpAddr>().unwrap_or_else(|_| {
@@ -609,8 +432,6 @@ pub fn side_bind_addr(var: &str, configured: Option<&str>, port: u16) -> SocketA
     SocketAddr::new(ip, port)
 }
 
-/// Human-readable scope for the startup log — reports the actual address chosen.
-/// A specific address notes the retained loopback (see [`bind_socket_addrs`]).
 pub fn bind_scope_label(choice: &BindChoice) -> String {
     match choice {
         BindChoice::Loopback => "loopback only".to_string(),
@@ -619,14 +440,6 @@ pub fn bind_scope_label(choice: &BindChoice) -> String {
     }
 }
 
-/// This machine's tailnet IPv4 as Tailscale reports it, for the picker's
-/// Network access hint. `None` when Tailscale is absent, not joined, or holds
-/// no such address on this host (userspace networking).
-///
-/// **A display hint only.** It never influences what this process binds to; the
-/// resolvers above own that, and they fail safe to loopback.
-///
-/// Asking Tailscale is bounded blocking I/O, so it runs off the async workers.
 pub async fn detect_tailscale_ipv4() -> Option<String> {
     tokio::task::spawn_blocking(lucidos_tailscale::bindable_tailnet_ipv4)
         .await
@@ -639,9 +452,6 @@ pub async fn detect_tailscale_ipv4() -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A synthetic address from the CGNAT range Tailscale hands out. Invented,
-    /// never captured: only "valid, and not loopback" is load-bearing here.
-    /// Same value as the engine's sibling test, so the two read alike.
     const TAILNET: &str = "100.64.0.1";
 
     #[test]
@@ -734,7 +544,6 @@ mod tests {
         assert!(!rendered.contains("\n[external_address]"), "{rendered}");
     }
 
-    /// Two gateways share this file, so each reads only its own port's entry.
     #[test]
     fn each_gateway_reads_only_its_own_external_address() {
         let parsed = parse_network_toml(
@@ -750,7 +559,6 @@ mod tests {
         assert_eq!(resolve_external_address(None, other).origin, None);
     }
 
-    /// A hand-edited entry that is not a string must not cost the bind.
     #[test]
     fn a_non_string_external_address_drops_only_itself() {
         let parsed = parse_network_toml(
@@ -764,8 +572,6 @@ mod tests {
         );
     }
 
-    /// Two gateways saving at once must each keep the other's entry. flock
-    /// binds to an open file, so threads stand in for processes here.
     #[test]
     fn concurrent_writers_keep_every_gateways_entry() {
         let home = tempfile::tempdir().unwrap();
@@ -805,7 +611,6 @@ mod tests {
                  5252 = \"{bad}\"\n5251 = \"https://lucidos.example.com\"\n"
             ));
             assert_eq!(parsed.external_addresses.get(&5252), None, "{bad}");
-            // The rest of the file still counts.
             assert_eq!(parsed.gateway_bind.as_deref(), Some("all"), "{bad}");
             assert!(parsed.external_addresses.contains_key(&5251), "{bad}");
         }
@@ -851,7 +656,6 @@ mod tests {
             "http://localhost:5252",
             "https://app.localhost",
             "http://[::1]:5252",
-            // The forms an HTTP client reads as 127.0.0.1.
             "http://127.1:5252",
             "http://2130706433:5252",
             "http://0x7f.1",
@@ -914,14 +718,8 @@ mod tests {
         assert_eq!(parse_network_toml("garbage = = ="), NetworkToml::default());
     }
 
-    /// A config the process cannot read must be told apart from one that is
-    /// simply absent. Both fall back to loopback, so the log line is the only
-    /// thing that tells an operator their tailnet bind was dropped. The engine
-    /// holds the same test over its own copy, which no gateway test can reach.
     #[test]
     fn an_unreadable_config_warns_while_an_absent_one_stays_silent() {
-        // Both errors come from a real read, so the split holds for what the
-        // OS returns, not for an invented kind.
         let tmp = tempfile::tempdir().expect("a writable temp directory");
         let dir = tmp.path();
 
@@ -930,8 +728,6 @@ mod tests {
         assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(read_failure_warning(&absent_path, &absent), None);
 
-        // A directory stands in for present-but-unreadable. It needs no chmod,
-        // so it fails the same way for a root test runner.
         let unreadable = std::fs::read_to_string(dir).expect_err("a directory is not a file");
         let warning = read_failure_warning(dir, &unreadable)
             .expect("an unreadable config must not fall back to loopback in silence");
@@ -939,30 +735,17 @@ mod tests {
         assert!(warning.contains(&unreadable.to_string()), "{warning}");
     }
 
-    /// Every cert/key pair the two mirrored copies must agree on, and the
-    /// verdict. ADR 0014 §1 forbids the gateway linking engine code, so this
-    /// table is the whole sync mechanism: it is the same table the engine's
-    /// `tls_scheme_from_requires_both_nonempty` asserts, and a row added
-    /// there is added here in the same change.
     const TLS_RULE_TABLE: &[(Option<&str>, Option<&str>, bool)] = &[
         (Some("/c.pem"), Some("/k.pem"), true),
-        // A cert alone is NOT TLS: the engine needs both, so it serves http.
         (Some("/c.pem"), None, false),
         (None, Some("/k.pem"), false),
         (None, None, false),
-        // Set-but-empty, or whitespace, is how a launch script spells "unset".
         (Some(""), Some("/k.pem"), false),
         (Some("/c.pem"), Some("  "), false),
-        // BOTH empty is the reported one. `export LUCIDOS_TLS_CERT="$UNSET"`
-        // produces it, and so does `scripts/lib/service_test.sh`.
         (Some(""), Some(""), false),
         (Some("   "), Some("   "), false),
     ];
 
-    /// The gateway's copy of the scheme rule must agree with the engine's
-    /// `tls_scheme_from` in every case, including the two that used to differ
-    /// here: a cert with no key, and a set-but-empty value. Disagreeing means
-    /// the gateway proxies https to an engine serving http.
     #[test]
     fn serves_tls_requires_both_cert_and_key_non_empty() {
         for (cert, key, expected) in TLS_RULE_TABLE {
@@ -972,17 +755,11 @@ mod tests {
                 "cert {cert:?} + key {key:?} must resolve to serves_tls={expected}"
             );
         }
-        // The two literals the caller picks between are the ones a peer speaks.
         assert_eq!((SCHEME_HTTP, SCHEME_HTTPS), ("http", "https"));
     }
 
-    /// The env wrapper must read the two names the rest of Lucidos writes, and
-    /// must answer them through [`serves_tls`]. A typo in either name would
-    /// otherwise put the gateway on http forever, silently.
     #[test]
     fn serves_tls_from_env_reads_the_two_tls_names() {
-        // These two names are process-global, and a dev shell really does
-        // export them, so put back whatever was there.
         let restore = |name: &str, was: Option<std::ffi::OsString>| match was {
             Some(v) => std::env::set_var(name, v),
             None => std::env::remove_var(name),
@@ -1004,14 +781,8 @@ mod tests {
         restore("LUCIDOS_TLS_KEY", had_key);
     }
 
-    /// `var_os` answers "is this name set", which is a different question from
-    /// "does this process serve TLS". Reaching for it is how both gateway
-    /// sites drifted from the rule, so no site outside this module may.
     #[test]
     fn no_gateway_site_asks_whether_a_tls_name_is_merely_set() {
-        // Reads the directory rather than naming files, so a module added
-        // later is covered without anyone remembering to list it. A hand-kept
-        // list that silently stops covering a file is the same as no list.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut scanned: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&src).expect("the gateway's own src directory") {
@@ -1020,8 +791,6 @@ mod tests {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // This module owns the rule, so it is the one place that may name
-            // the variables. Everything else asks it.
             if !name.ends_with(".rs") || name == "net_config.rs" {
                 continue;
             }
@@ -1034,8 +803,6 @@ mod tests {
             }
             scanned.push(name);
         }
-        // A scan that read the wrong tree, or nothing, must fail rather than
-        // pass vacuously.
         for expected in ["server.rs", "stack.rs", "auth_api.rs"] {
             assert!(
                 scanned.iter().any(|n| n == expected),
@@ -1053,14 +820,8 @@ mod tests {
         assert!(validate_bind_input("").is_err());
     }
 
-    // Tailscale detection and CLI resolution moved to the `lucidos-tailscale`
-    // crate, which owns their tests: one copy now covers the gateway, the
-    // engine and the desktop app, instead of three that could drift.
-
     #[test]
     fn bind_socket_addrs_specific_address_also_binds_loopback() {
-        // The gateway must stay reachable on 127.0.0.1 for the dev scripts' control
-        // POSTs + each engine's restart callback, even when bound to a tailnet IP.
         let addrs = bind_socket_addrs(&BindChoice::Address(TAILNET.parse().unwrap()), 5251);
         assert_eq!(
             addrs,
@@ -1094,8 +855,6 @@ mod tests {
 
     #[test]
     fn bind_plan_makes_only_the_configured_address_optional() {
-        // The failure this split exists for: the tailnet address is not up at
-        // boot, and loopback must serve anyway.
         let plan = bind_plan(&BindChoice::Address(TAILNET.parse().unwrap()), 5251);
         assert_eq!(
             plan.required,
@@ -1109,8 +868,6 @@ mod tests {
 
     #[test]
     fn bind_plan_keeps_loopback_and_all_fail_fast() {
-        // An operator who asked for all interfaces is owed an error, not a quiet
-        // demotion to loopback, so neither of these has anything retryable.
         for choice in [BindChoice::Loopback, BindChoice::All] {
             let plan = bind_plan(&choice, 5251);
             assert_eq!(plan.required, bind_socket_addrs(&choice, 5251));
@@ -1123,8 +880,6 @@ mod tests {
 
     #[test]
     fn a_wildcard_address_binds_one_required_socket() {
-        // A loopback socket beside a wildcard on the same port is EADDRINUSE on
-        // Linux, which left `0.0.0.0` retrying forever behind loopback.
         for ip in [
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -1180,8 +935,6 @@ mod tests {
 
     #[test]
     fn every_bind_plan_has_something_required() {
-        // A plan with an empty `required` would serve nothing at all while
-        // reporting success, which is worse than the fail-fast it replaced.
         for choice in [
             BindChoice::Loopback,
             BindChoice::All,
@@ -1197,11 +950,6 @@ mod tests {
 
     #[test]
     fn an_unassigned_address_fails_to_bind_while_loopback_succeeds() {
-        // Pins the OS behaviour the whole fix rests on, rather than assuming it:
-        // binding an address this machine does not hold fails with
-        // `AddrNotAvailable` (the `Os { code: 49 }` from the reported stall),
-        // and it fails INDEPENDENTLY of the loopback bind in the same plan.
-        // 192.0.2.1 is TEST-NET-1 (RFC 5737), assigned on no machine.
         let plan = bind_plan(&BindChoice::Address("192.0.2.1".parse().unwrap()), 0);
         let required = std::net::TcpListener::bind(plan.required[0]);
         assert!(

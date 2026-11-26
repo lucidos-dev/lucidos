@@ -2,67 +2,25 @@ use std::time::{Duration, Instant};
 
 use crate::workspace::BoxError;
 
-// Header + env-var names mirror the engine's `api::actor` consts. CLI can't
-// depend on the engine crate (no `lucidos-common`), so these literals
-// must be kept in lockstep with their counterparts there. A rename on
-// either side without the matching follow-up silently breaks subprocess
-// attribution. The tests below pin the CLI's own spelling only, so they cannot
-// catch an engine-side rename. What does is
-// `the_cli_carries_the_origin_token_the_engine_minted` in the e2e CLI suite:
-// it mints through the engine and reads the header back through
-// `build_message_origin`, so both spellings have to agree.
-//
-// The token's *value* is opaque here on purpose. The engine mints it bound
-// to the spawning thread, and its own prefix is what names that thread, so
-// the CLI never has to state who it is and there is no `--from` flag for it
-// to get wrong. There used to be a second `x-lucidos-source-thread-id`
-// header carrying the thread id; it was unverifiable (any subprocess could
-// claim any thread) and the engine no longer reads one.
 pub(crate) const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
 const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
 
-/// Does this process hold its thread's origin token, as a Lucidos-spawned
-/// subprocess does?
 pub(crate) fn has_origin_token() -> bool {
     std::env::var(ENV_AGENT_ORIGIN_TOKEN).is_ok_and(|token| !token.is_empty())
 }
 
-/// The *target workspace assertion*: which workspace this request is meant for.
-/// Mirrors `api::actor::HEADER_TARGET_WORKSPACE` under the same lockstep rule as
-/// the origin token above. The engine refuses with 409 when it names a
-/// workspace other than the one it serves, which is what stops a wrong port
-/// from being silently served by whichever engine is listening there.
+pub(crate) fn contains_engine_token(value: &str) -> bool {
+    [std::env::var(ENV_AGENT_ORIGIN_TOKEN).ok(), local_token()]
+        .into_iter()
+        .flatten()
+        .any(|token| !token.is_empty() && value.contains(&token))
+}
+
 pub(crate) const HEADER_TARGET_WORKSPACE: &str = "x-lucidos-target-workspace";
 const ENV_WORKSPACE: &str = "LUCIDOS_WORKSPACE";
 
-/// The *local token*: proof that this caller is a process on this machine.
-///
-/// Unlike the two headers above, this one is NOT hand-mirrored. It comes from
-/// `lucidos-local-token`, a crate with no dependencies. The gateway, the
-/// engine, the CLI and the app all take it, so the header name and the file
-/// path have exactly one home. Four hand-copies would drift, and a stale copy
-/// here is not a missing feature. It is a CLI that silently cannot
-/// authenticate.
 use lucidos_local_token::{read as local_token, HEADER_LOCAL_TOKEN};
 
-/// Default headers for a request to THIS workspace's engine:
-///
-/// - the thread-bound origin token, when the matching env var is in scope (that
-///   is, inside a Lucidos-spawned subprocess). The engine verifies it and
-///   stamps mutating events as Agent-origin instead of "You".
-/// - the target workspace assertion, derived from `$LUCIDOS_WORKSPACE`'s
-///   basename, so a subcommand that reached the wrong engine is refused rather
-///   than served.
-/// - the local token, when this machine has a gateway that minted one. It is
-///   what proves the caller is local, since a loopback peer address does not.
-///   The engine reads it twice: as the door's credential on a wide bind, and as
-///   the identity of a caller holding no origin token (ADR 0169). That second
-///   reading is what attributes the background rebuild's build slot.
-///
-/// A subcommand that deliberately targets ANOTHER workspace (`lucidos
-/// spawn-thread --to`) sets the assertion itself on the request builder, which
-/// wins: reqwest fills default headers into vacant entries only, so a
-/// per-request header is never overwritten by a default of the same name.
 fn default_headers_from_env() -> reqwest::header::HeaderMap {
     headers_from(
         std::env::var(ENV_AGENT_ORIGIN_TOKEN).ok().as_deref(),
@@ -71,12 +29,6 @@ fn default_headers_from_env() -> reqwest::header::HeaderMap {
     )
 }
 
-/// The pure half: exactly the headers these three inputs imply.
-///
-/// Split out because the local token comes from a FILE, not the environment.
-/// Every machine that has ever run a gateway has one. A test that set the two
-/// env vars and then asserted on the whole map was therefore asserting on
-/// whoever ran it. It failed on a developer machine and passed on a fresh one.
 fn headers_from(
     origin_token: Option<&str>,
     workspace_name: Option<&str>,
@@ -102,11 +54,6 @@ fn headers_from(
     h
 }
 
-/// Basename of `$LUCIDOS_WORKSPACE`, which the engine sets on every subprocess
-/// it spawns. `None` outside a spawned subprocess (a terminal user running
-/// `lucidos` by hand), where the CLI resolves its workspace by walking up for a
-/// ports file instead and has no name to assert at client-construction time.
-/// Absent asserts nothing, which is the documented no-op.
 fn self_workspace_name() -> Option<String> {
     let raw = std::env::var(ENV_WORKSPACE).ok()?;
     let name = std::path::Path::new(raw.trim())
@@ -119,10 +66,6 @@ fn self_workspace_name() -> Option<String> {
     Some(name)
 }
 
-/// Blocking HTTP client preconfigured for the local Lucidos engine, which is
-/// a loopback target. Auto-forwards the thread-bound origin token when the
-/// matching env var is present (i.e., we're inside a Lucidos-spawned
-/// subprocess).
 pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
     engine_client_builder()
         .build()
@@ -132,21 +75,10 @@ pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
 fn engine_client_builder() -> reqwest::blocking::ClientBuilder {
     lucidos_local_token::client::blocking_client_builder()
         .default_headers(default_headers_from_env())
-        // Only our pre-connection policy may replay a request. A redirect
-        // could otherwise fail to connect after the first server handled it.
         .retry(reqwest::retry::never())
         .redirect(reqwest::redirect::Policy::none())
 }
 
-/// Like [`client`] but with an explicit response deadline, replacing reqwest's
-/// 30s default.
-///
-/// For a caller whose deadline is not the default: `build-slot` announces
-/// contention with a short one while a build waits, and `lucidos proxy` waits
-/// past the engine's own proxy cap. It exists so no such caller has to
-/// hand-roll a third builder and drop the three default headers with it: a call
-/// carrying no credential at all cannot say who it is (ADR 0169), and one with
-/// no workspace assertion is served by whichever engine holds the port.
 pub(crate) fn client_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<reqwest::blocking::Client, BoxError> {
@@ -156,13 +88,6 @@ pub(crate) fn client_with_timeout(
         .map_err(|e| format!("Failed to build HTTP client: {}", e).into())
 }
 
-/// HTTP client for the MCP permission server. Disables reqwest's default 30s
-/// blocking timeout because `/api/v1/internal/permission-prompt` waits for the
-/// user's click. With the default timeout, every prompt fails after 30s and
-/// CC pivots to a `Bash` heredoc (in `--allowedTools`) that bypasses the
-/// gate entirely. Same origin-token forwarding as `client()`: the
-/// permission server is an engine endpoint and benefits from the same
-/// honest attribution.
 pub(crate) fn permission_prompt_client() -> Result<reqwest::blocking::Client, BoxError> {
     engine_client_builder()
         .timeout(None)
@@ -180,8 +105,6 @@ fn connect_wait() -> Duration {
         .unwrap_or(DEFAULT_CONNECT_WAIT)
 }
 
-/// Retry only failures proving that no connection was established.
-/// `is_connect()` alone also includes TLS failures on an established socket.
 fn retryable_connect_error(err: &reqwest::Error) -> bool {
     use std::error::Error;
     use std::io::ErrorKind;
@@ -206,18 +129,28 @@ fn retryable_connect_error(err: &reqwest::Error) -> bool {
 }
 
 pub(crate) trait ConnectRetry {
-    fn send_with_connect_retry(self) -> Result<reqwest::blocking::Response, reqwest::Error>;
+    fn send_with_connect_retry(self) -> Result<reqwest::blocking::Response, reqwest::Error>
+    where
+        Self: Sized,
+    {
+        self.send_with_connect_retry_within(connect_wait())
+    }
+
+    fn send_with_connect_retry_within(
+        self,
+        wait: Duration,
+    ) -> Result<reqwest::blocking::Response, reqwest::Error>;
 }
 
 impl ConnectRetry for reqwest::blocking::RequestBuilder {
-    fn send_with_connect_retry(self) -> Result<reqwest::blocking::Response, reqwest::Error> {
-        let wait = connect_wait();
+    fn send_with_connect_retry_within(
+        self,
+        wait: Duration,
+    ) -> Result<reqwest::blocking::Response, reqwest::Error> {
         let start = Instant::now();
         let mut delay = Duration::from_millis(100);
         let mut request = self;
         loop {
-            // Buffered bodies preserve their bytes and headers. A streaming
-            // body cannot be cloned, so it is sent only once.
             let next = request.try_clone();
             match request.send() {
                 Err(error) if retryable_connect_error(&error) => {
@@ -238,17 +171,6 @@ impl ConnectRetry for reqwest::blocking::RequestBuilder {
     }
 }
 
-/// Turn a `reqwest::Error` from `.send()` into a message the user can act on.
-/// The default `Display` impl is "error sending request for url (<url>)" with
-/// no hint about *what* failed — so a timeout, a refused connection, and a
-/// TLS handshake fault all look the same. We classify the common cases, add
-/// an actionable hint, and always include elapsed wall clock so a hang is
-/// distinguishable from an instant failure.
-///
-/// Note on ordering: `reqwest::Error::is_timeout()` is also true for
-/// *connect-phase* timeouts (DNS/TCP that never completed), so we check
-/// `is_connect()` first — otherwise a host-unreachable hang would tell the
-/// user the engine accepted the connection when no socket ever opened.
 pub(crate) fn format_request_error(
     method: &str,
     url: &str,
@@ -280,24 +202,12 @@ pub(crate) fn format_request_error(
     }
 }
 
-/// Does this root cause say "we spoke TLS and got plain HTTP back"?
-///
-/// Named because the raw text is unreadable. Rustls reports these two when it
-/// reads an HTTP status line as a TLS record header. Neither points at the
-/// scheme, the port, or the file that chose them.
-///
-/// Deliberately narrow. A certificate complaint is a different fault with a
-/// different remedy, and blaming `PROTO=` for one would send the reader to the
-/// wrong file.
 fn is_tls_against_plain_http(cause: &str) -> bool {
     let lower = cause.to_ascii_lowercase();
     lower.contains("record overflow") || lower.contains("invalidcontenttype")
 }
 
-/// Walk the error's `source()` chain to the leaf and render that. Avoids the
-/// double-URL noise from `reqwest::Error`'s `Display`, which embeds the URL
-/// the helper already prints (`"error sending request for url (...)"`).
-fn root_cause(err: &reqwest::Error) -> String {
+pub(crate) fn root_cause(err: &reqwest::Error) -> String {
     use std::error::Error;
     let mut last = err.to_string();
     let mut source: Option<&(dyn Error + 'static)> = err.source();
@@ -308,11 +218,8 @@ fn root_cause(err: &reqwest::Error) -> String {
     last
 }
 
-/// How many child reports wait unread for the calling agent's thread. Mirrors
-/// the engine's `api::threads::child_reports::HEADER_CHILD_REPORTS_WAITING`.
 const HEADER_CHILD_REPORTS_WAITING: &str = "lucidos-child-reports-waiting";
 
-/// The stderr line for a response announcing waiting child reports, if any.
 pub(crate) fn child_reports_note(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let waiting: u64 = headers
         .get(HEADER_CHILD_REPORTS_WAITING)?
@@ -330,12 +237,6 @@ pub(crate) fn child_reports_note(headers: &reqwest::header::HeaderMap) -> Option
     ))
 }
 
-/// Send `req`, fail on non-2xx, and return the response body.
-/// Shared error wording via `format_request_error` (timeouts and connect
-/// failures get actionable hints instead of reqwest's generic "error sending
-/// request"). Use this when the caller prints something OTHER than the raw
-/// body (`data write` prints a chat link); use `send_and_print` when the body
-/// itself is the output.
 pub(crate) fn send_expect_success(
     method: &str,
     url: &str,
@@ -344,9 +245,6 @@ pub(crate) fn send_expect_success(
     send_or_refusal(method, url, req)?
 }
 
-/// [`send_expect_success`], with a 4xx answer as the inner `Err`. The server
-/// read that request and refused it, so it did not land. The outer `Err` is a
-/// failure whose outcome is unknown.
 pub(crate) fn send_or_refusal(
     method: &str,
     url: &str,
@@ -355,8 +253,6 @@ pub(crate) fn send_or_refusal(
     Ok(send_or_refusal_with_headers(method, url, req)?.map(|(_, text)| text))
 }
 
-/// [`send_expect_success`], keeping the response headers for a caller that
-/// reads a side channel the body does not carry.
 pub(crate) fn send_expect_success_with_headers(
     method: &str,
     url: &str,
@@ -376,7 +272,6 @@ fn send_or_refusal_with_headers(
         .map_err(|e| format_request_error(method, url, &e, start.elapsed()))?;
     let status = resp.status();
     if let Some(note) = child_reports_note(resp.headers()) {
-        // A side channel for the agent reading this, beside the body it parses.
         eprintln!("{note}");
     }
     let headers = resp.headers().clone();
@@ -394,11 +289,6 @@ fn send_or_refusal_with_headers(
     }
 }
 
-/// [`send_expect_success`], then parse the body as JSON.
-///
-/// The engine answers every `/api/v1` route with JSON, so a body that will not
-/// parse means something else replied. One message for that, rather than a copy
-/// per subcommand.
 pub(crate) fn send_expect_json(
     method: &str,
     url: &str,
@@ -409,9 +299,6 @@ pub(crate) fn send_expect_json(
         .map_err(|e| format!("Unexpected response from {}: {}", url, e).into())
 }
 
-/// Send `req`, fail on non-2xx, and write the response body to stdout.
-/// Shared between subcommands that POST/GET JSON to the engine and surface
-/// the response body verbatim (`events`, `notify`, …).
 pub(crate) fn send_and_print(
     method: &str,
     url: &str,
@@ -432,8 +319,6 @@ mod tests {
         h
     }
 
-    /// The note names the command that reads the reports, and only shows when
-    /// one waits.
     #[test]
     fn a_waiting_child_report_is_noted() {
         let one = child_reports_note(&waiting("1")).expect("one waits");
@@ -512,15 +397,12 @@ mod tests {
 
     #[test]
     fn a_tls_handshake_on_a_plain_socket_is_recognised_and_named() {
-        // "record overflow" is what a caller saw when a workspace's ports file
-        // had lost its PROTO line. It names neither the scheme nor the file.
         assert!(is_tls_against_plain_http(
             "received corrupt message of type InvalidContentType: record overflow"
         ));
         assert!(is_tls_against_plain_http("Record overflow"));
         assert!(!is_tls_against_plain_http("connection refused"));
         assert!(!is_tls_against_plain_http("operation timed out"));
-        // A certificate complaint is a different fault, and PROTO= is not it.
         assert!(!is_tls_against_plain_http(
             "invalid peer certificate: Expired"
         ));
@@ -532,8 +414,6 @@ mod tests {
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buf = [0u8; 8192];
-            // Best-effort: drain whatever the client sent (typically a single
-            // GET line + headers). We don't care about the contents.
             let _ = stream.read(&mut buf);
             thread::sleep(delay);
             let body = b"{}";
@@ -549,9 +429,6 @@ mod tests {
         port
     }
 
-    /// Accept the connection, drain the request, then hold the socket open
-    /// indefinitely without writing a response. Simulates the engine hang the
-    /// CLI experienced on `proxy comfort-cloud` — TCP succeeds, HTTP stalls.
     fn spawn_silent_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
@@ -559,15 +436,12 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buf = [0u8; 8192];
             let _ = stream.read(&mut buf);
-            // Hold the connection — never respond. Drop after a long sleep
-            // so the test thread doesn't leak the socket beyond the suite.
             thread::sleep(Duration::from_secs(30));
             drop(stream);
         });
         port
     }
 
-    /// Accept one request, hand its raw text back, and answer 200.
     fn spawn_capturing_server() -> (u16, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
@@ -584,7 +458,6 @@ mod tests {
         (port, rx)
     }
 
-    /// Accept one request and answer it with `status_line`.
     fn spawn_status_server(status_line: &'static str) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
@@ -599,8 +472,6 @@ mod tests {
         port
     }
 
-    /// A 4xx is a refusal the server read, so it is the inner error. A 5xx
-    /// leaves the outcome unknown, so it is the outer one.
     #[test]
     fn a_client_error_is_a_refusal_and_a_server_error_is_unknown() {
         let send = |status_line| {
@@ -639,14 +510,6 @@ mod tests {
         );
     }
 
-    /// The deadline-carrying constructor sends the SAME two headers as the
-    /// other two, over the wire.
-    ///
-    /// It exists because a caller that wants a shorter timeout is exactly the
-    /// caller tempted to hand-roll its own builder. `build-slot`'s contention
-    /// announcement did, and shipped unattributed until review caught it: with
-    /// no origin token the engine stamps `Api { mode: Human }` (ADR 0050), and
-    /// with no workspace assertion a wrong port is served rather than refused.
     #[test]
     fn the_timeout_client_sends_the_same_headers_as_the_others() {
         let _guard = env_lock().lock().unwrap();
@@ -693,19 +556,11 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
     }
 
-    /// Shared serialization across the env-mutating tests below — they touch
-    /// the same two process-wide env vars and would race each other without
-    /// a single lock.
     fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         &LOCK
     }
 
-    /// Token env var set → the origin-token header is populated. This is
-    /// the agent path: the engine verifies the thread-bound token, stamps the
-    /// resulting event as `Api { mode: Agent, source_thread_id }` from the
-    /// token's own prefix, the UI says "Lucidos Agent" (not "You") and the
-    /// popover links back to the spawning thread.
     #[test]
     fn default_headers_from_env_forwards_the_origin_token() {
         let token = "00000000-0000-0000-0000-000000000abc.deadbeef";
@@ -719,9 +574,6 @@ mod tests {
         );
     }
 
-    /// The env var the token actually comes from, which the pure test above
-    /// cannot prove. Asserts the one header rather than the whole map, so a
-    /// machine that has a local token file does not fail it.
     #[test]
     fn the_origin_token_header_is_read_from_its_own_env_var() {
         let _guard = env_lock().lock().unwrap();
@@ -743,8 +595,6 @@ mod tests {
         );
     }
 
-    /// The local token rides along whenever this machine has one. It is what
-    /// proves the caller is local, since a loopback peer address does not.
     #[test]
     fn the_local_token_rides_along_and_is_marked_sensitive() {
         let headers = headers_from(None, None, Some("abc123"));
@@ -756,13 +606,8 @@ mod tests {
         );
     }
 
-    /// The token is forwarded VERBATIM. The CLI must not parse, re-derive or
-    /// otherwise touch it: its prefix is what authenticates the caller thread,
-    /// so any client-side rewriting would be the CLI stating who it is, which
-    /// is exactly the capability the thread binding removes.
     #[test]
     fn default_headers_from_env_does_not_rewrite_the_token() {
-        // Deliberately not a well-formed token. The CLI has no opinion.
         let opaque = "whatever.the.engine.minted";
         let headers = headers_from(Some(opaque), None, None);
         assert_eq!(
@@ -774,10 +619,6 @@ mod tests {
         assert_eq!(headers.len(), 1, "no second origin header may be sent");
     }
 
-    /// Env var unset means no origin header. A terminal user running `lucidos`
-    /// by hand still sends the local token, where the machine has one. The
-    /// engine reads that as its own machinery, never as the owner: a
-    /// machine-local token names a machine (ADR 0169).
     #[test]
     fn default_headers_from_env_yields_empty_when_env_unset() {
         let headers = headers_from(None, None, None);
@@ -787,10 +628,6 @@ mod tests {
         );
     }
 
-    /// Inside a spawned subprocess the CLI asserts which workspace it is
-    /// talking to, so a subcommand that reached the wrong engine (several run
-    /// on one machine, each on its own port) is refused with 409 instead of
-    /// being served by whichever one was listening.
     #[test]
     fn default_headers_from_env_asserts_the_target_workspace() {
         let _guard = env_lock().lock().unwrap();
@@ -812,9 +649,6 @@ mod tests {
         );
     }
 
-    /// A trailing slash is how a path shows up when it came from a shell
-    /// variable, and it must not turn the basename into something the engine
-    /// will not recognise.
     #[test]
     fn the_target_workspace_assertion_survives_a_trailing_slash() {
         let _guard = env_lock().lock().unwrap();
@@ -829,9 +663,6 @@ mod tests {
         assert_eq!(name.as_deref(), Some("dev"));
     }
 
-    /// Outside a spawned subprocess there is no workspace to name, and
-    /// asserting nothing is the documented no-op: the engine proceeds exactly
-    /// as it did before the header existed.
     #[test]
     fn no_workspace_env_asserts_nothing() {
         let headers = headers_from(None, None, None);
@@ -868,8 +699,6 @@ mod tests {
 
     #[test]
     fn format_request_error_classifies_connection_refused() {
-        // Bind + immediately drop to grab a port the kernel will refuse
-        // connections on. Tight race window but reliable on localhost.
         let port = {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().unwrap().port();
@@ -896,18 +725,11 @@ mod tests {
             msg.contains("engine running"),
             "msg must hint at engine status: {msg}"
         );
-        // A packaged install has no source checkout, so the hint names no
-        // repo script. A script trigger fired during a restart meets exactly
-        // this error, so the hint names that cause.
         assert!(
             !msg.contains("scripts/"),
             "the hint must work without a checkout: {msg}"
         );
         assert!(msg.contains("restarting"), "msg must name a restart: {msg}");
-        // Regression guard for the double-URL bug: reqwest's default Display
-        // embeds the URL in "error sending request for url (URL)"; if we
-        // included the raw err instead of root_cause(), the URL would
-        // appear twice.
         let occurrences = msg.matches(url.as_str()).count();
         assert_eq!(
             occurrences, 1,
@@ -917,10 +739,6 @@ mod tests {
 
     #[test]
     fn format_request_error_always_includes_method_and_url() {
-        // Regression guard: pre-fix `proxy.rs` formatted the error as
-        // "Failed to send request to <URL>: <reqwest err>" with the HTTP
-        // method dropped on the floor. Any error path — classified or
-        // fallback — must keep the method.
         let port = spawn_silent_server();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(120))

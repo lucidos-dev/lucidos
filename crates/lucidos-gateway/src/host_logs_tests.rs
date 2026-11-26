@@ -324,7 +324,6 @@ async fn transfer_requires_exact_manifest_and_is_not_replayed_after_failure() {
         load(root.path(), &prepared.id, &caller()).unwrap().state,
         Status::Prepared
     );
-    // Persisted in-flight status is uncertain after a crash, never replayable.
     let mut interrupted = prepared.clone();
     interrupted.state = Status::Transferring;
     save(root.path(), &interrupted).unwrap();

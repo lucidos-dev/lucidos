@@ -1,22 +1,3 @@
-//! Coding-agent spawn dispatcher.
-//!
-//! Every committed `ContinuationRequested` reaches this dispatcher on a
-//! directed channel the `EventBus` sends to after commit
-//! ([`EventBus::take_spawn_requests`]). The dispatcher claims the request's
-//! event id and forwards a [`SpawnRequest`] to the engine-side consumer, which
-//! calls `run_direct_agent` with `--resume` (ADR 0272).
-//!
-//! The bus creates the unbounded channel itself. So a request emitted before
-//! the dispatcher starts waits for it, and a broadcast lag never drops one.
-//!
-//! Idempotency is keyed on the trigger event id: [`SpawnDispatcher::dispatch_spawn`]
-//! gates the send on atomically claiming it. Two paths can see one request,
-//! the channel and the startup orphan scan, and the claim lets one through.
-//!
-//! The orphan scan (`redispatch_orphaned_continuations_on_startup`) is the
-//! durable floor for a request a previous process persisted and never actuated,
-//! on a thread still `running`.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -33,17 +14,9 @@ use crate::engine::continuation_queries::{
     continuation_superseded_events_sql, CC_LIFECYCLE_EVENTS_SQL,
 };
 
-/// Claims each spawn request once and forwards it to the engine-side consumer.
 pub struct SpawnDispatcher {
     pool: PgPool,
-    /// Outbound channel — the dispatcher sends [`SpawnRequest`]s here and a
-    /// receiver task on `LucidosEngine` calls `run_direct_agent` for each.
-    /// `Unbounded` because dropping a continuation request would leave a
-    /// thread stuck "Working" forever.
     spawn_tx: UnboundedSender<SpawnRequest>,
-    /// Trigger event ids the dispatcher has already acted on (or knows are
-    /// already covered by existing CC events). Survives the lifetime of the
-    /// dispatcher.
     spawned_for_event: Arc<Mutex<HashSet<Uuid>>>,
 }
 
@@ -56,12 +29,6 @@ impl SpawnDispatcher {
         }
     }
 
-    /// Take the bus's spawn requests, run the startup orphan scan, then drain
-    /// the requests on a tokio task. Returns the receiver end of the outbound
-    /// channel so the caller can wire it to the engine-side actuator.
-    ///
-    /// Panics when the bus's spawn requests were already taken: a second
-    /// dispatcher on one bus would split the requests between two claim sets.
     pub fn spawn(
         pool: PgPool,
         bus: Arc<EventBus>,
@@ -75,7 +42,6 @@ impl SpawnDispatcher {
         let (spawn_tx, spawn_rx) = tokio::sync::mpsc::unbounded_channel();
         let dispatcher = Self::new(pool, spawn_tx);
         let handle = tokio::spawn(async move {
-            // Best-effort: a failed scan must not disable the live channel.
             if let Err(e) = dispatcher
                 .redispatch_orphaned_continuations_on_startup()
                 .await
@@ -90,8 +56,6 @@ impl SpawnDispatcher {
         (handle, spawn_rx)
     }
 
-    /// Dispatch every request the bus sends. Lives for the duration of the
-    /// engine process.
     pub(crate) async fn run(self, mut requests: UnboundedReceiver<SpawnRequest>) {
         log_legacy!("[SpawnDispatcher] starting");
         while let Some(request) = requests.recv().await {
@@ -104,20 +68,12 @@ impl SpawnDispatcher {
         log_legacy!("[SpawnDispatcher] request channel closed");
     }
 
-    /// Returns true when a spawn for this trigger has already happened — either
-    /// dispatched by this process (in-memory set) or implied by a subsequent
-    /// CC lifecycle event in the DB.
     pub(crate) async fn already_spawned(&self, event_id: Uuid) -> bool {
-        // Fast path — in-memory cache.
         if self.spawned_for_event.lock().await.contains(&event_id) {
             return true;
         }
-        // Slow path — does the events table show a CC lifecycle event after
-        // this trigger? `CodingAgentIdled`/`SessionEnded`/`SessionStarted`
-        // imply CC was spawned in response.
         match has_cc_event_after(&self.pool, event_id).await {
             Ok(true) => {
-                // Cache so a second sighting skips the DB hit.
                 self.spawned_for_event.lock().await.insert(event_id);
                 true
             }
@@ -133,11 +89,6 @@ impl SpawnDispatcher {
         }
     }
 
-    /// Claim the request's event id and send it to the engine-side consumer.
-    ///
-    /// The insert into the idempotency set IS the claim. A request seen by
-    /// both the startup orphan scan and the live channel produces at most ONE
-    /// send, whichever path claims the id first.
     pub(crate) async fn dispatch_spawn(&self, request: SpawnRequest) {
         let SpawnRequest::Continue {
             thread_id,
@@ -147,8 +98,6 @@ impl SpawnDispatcher {
             return;
         }
         if let Err(e) = self.spawn_tx.send(request) {
-            // Receiver gone → engine is shutting down, or the receiver task
-            // died. The next boot's recovery owns the thread.
             log_legacy!(
                 "[SpawnDispatcher] failed to send Continue spawn request for thread={} event={}: {}",
                 thread_id, event_id, e
@@ -192,10 +141,6 @@ impl SpawnDispatcher {
             "[SpawnDispatcher] re-dispatching {} orphaned ContinuationRequested event(s)",
             rows.len()
         );
-        // No `already_spawned` pre-check: the scan's NOT-EXISTS set is a
-        // superset of `has_cc_event_after`'s, so the DB fallback is provably
-        // false for every row, and `dispatch_spawn`'s atomic insert is the
-        // claim that dedupes against the live channel.
         for (event_id, thread_id) in rows {
             self.dispatch_spawn(SpawnRequest::Continue {
                 thread_id,
@@ -207,10 +152,6 @@ impl SpawnDispatcher {
     }
 }
 
-/// Returns true when the events table contains a CC lifecycle event whose
-/// sequence is greater than the trigger event's sequence (same thread).
-/// Implies the trigger has already been picked up by an earlier dispatcher
-/// or the legacy direct-call path.
 async fn has_cc_event_after(pool: &PgPool, trigger_event_id: Uuid) -> Result<bool, sqlx::Error> {
     let row: Option<(bool,)> = sqlx::query_as(&format!(
         "SELECT EXISTS ( \

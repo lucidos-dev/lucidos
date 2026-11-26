@@ -1,5 +1,3 @@
-//! Fresh storage contract for the explicit disposable packaged-service role.
-
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -127,7 +125,6 @@ impl Scope {
         Ok(())
     }
 
-    /// Start with no inherited credentials, service controls or topology.
     pub fn command(&self, program: &Path) -> Command {
         let mut command = Command::new(program);
         command
@@ -136,13 +133,9 @@ impl Scope {
             .env("HOME", self.home())
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("TMPDIR", self.root())
-            // A signed .app normally uses the host Keychain. Disposable keys
-            // must stay under this scope's private directory, including backups.
             .env("LUCIDOS_SECRET_KEY_STORE", "file")
             .env("LUCIDOS_GATEWAY_DATA", self.app_data())
             .env("LUCIDOS_PRIVATE_DIR", self.private_dir());
-        // macOS cannot nest seatbelts. Keep the existing inherited-sandbox
-        // fact through every env_clear so engines select their inherited mode.
         if std::env::var("LUCIDOS_AGENT_SANDBOXED").as_deref() == Ok("1") {
             command.env("LUCIDOS_AGENT_SANDBOXED", "1");
         }

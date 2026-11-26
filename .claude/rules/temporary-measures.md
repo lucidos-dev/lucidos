@@ -34,8 +34,8 @@ never on its own evidence that a crutch is removable.
   the loophole where rewording a `TODO: remove after X` into a plain comment
   dodged tracking: the escape valve is to **register it**, not to launder the
   marker.
-- **Comment at the site**, pointing at the registry row, so a future reader knows
-  it's removable and why.
+- **An `INVARIANT:` comment at the site**, pointing at the registry row, so a
+  future reader knows it's removable and why. The marker survives the strip.
 - **State a concrete removal condition.** Exactly what has to be true to drop it,
   and how to verify that is safe. "Eventually" is not a condition.
 - **The condition must be checkable, never a scan of user data.** Verify it from

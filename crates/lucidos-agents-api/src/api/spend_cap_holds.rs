@@ -1,4 +1,3 @@
-//! Reload-safe provider hold status and an authenticated manual probe.
 use super::{error::ApiError, AppState};
 use crate::engine::model_call::spend_cap;
 use crate::llm::{spend_cap::SpendCapHold, ProviderKind};

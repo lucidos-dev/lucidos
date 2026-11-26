@@ -1,5 +1,3 @@
-//! The request body and the response parse, both without a server.
-
 use super::*;
 use crate::llm::judgment::NoulCriteria;
 
@@ -25,8 +23,6 @@ fn two_questions() -> Vec<(String, Question)> {
     ]
 }
 
-/// The one-request invariant, at the wire. Independent questions travel in one
-/// body, so the state is sent once and the backend answers them in parallel.
 #[test]
 fn every_question_travels_in_one_body_under_its_own_id() {
     let body = build_request_body(
@@ -42,9 +38,6 @@ fn every_question_travels_in_one_body_under_its_own_id() {
     assert_eq!(questions["lane"]["type"], "choice");
 }
 
-/// The state is passed through verbatim, and nothing here rewrites it. So the
-/// redaction a caller applied is the redaction that leaves the machine, and
-/// the caller owns that step. The command guard's own test pins it there.
 #[test]
 fn the_state_reaches_the_body_unchanged() {
     let state = json!({ "command": "psql postgres://u:[REDACTED]@h/db -c 'select 1'" });
@@ -105,9 +98,6 @@ fn a_response_reads_back_as_answers_and_usage() {
     assert_eq!(judgment.usage.map(|u| u.output_tokens), Some(48));
 }
 
-/// The request asks for an alias and the response names the version that
-/// answered. The caller records the version, so one model keeps one line in a
-/// cost rollup instead of opening a second under its alias.
 #[test]
 fn the_response_names_the_version_that_answered() {
     let body = r#"{"model":"jev-1.13.0","answers":{},"usage":{"input_tokens":5}}"#;
@@ -116,17 +106,12 @@ fn the_response_names_the_version_that_answered() {
     assert_ne!(judgment.model.as_deref(), Some(JEV_DEFAULT_MODEL));
 }
 
-/// A response naming no model leaves the caller to fall back to the alias it
-/// asked for. Inventing a version here would be a guess about what ran.
 #[test]
 fn a_response_naming_no_model_reads_as_none() {
     let judgment = parse_response(r#"{"answers":{}}"#).expect("a readable response");
     assert_eq!(judgment.model, None);
 }
 
-/// One answer the enum cannot read must not cost the caller the others. The
-/// caller sees the unreadable id as absent, which is the case it already
-/// handles.
 #[test]
 fn an_unreadable_answer_is_dropped_and_its_siblings_survive() {
     let body = r#"{
@@ -148,8 +133,6 @@ fn a_response_with_no_answers_object_is_an_error() {
     assert!(parse_response("not json at all").is_err());
 }
 
-/// Absent usage is no usage rather than a parse failure. The counts are for
-/// reporting, so a backend that stops sending them must not break a judgment.
 #[test]
 fn absent_usage_reads_as_none() {
     let judgment = parse_response(r#"{"answers":{}}"#).expect("a readable response");
@@ -157,8 +140,6 @@ fn absent_usage_reads_as_none() {
     assert!(judgment.answers.is_empty());
 }
 
-/// Cloudflare's REST API can wrap the System One body in a `result` envelope.
-/// The answers inside it read exactly as an unwrapped body does.
 #[test]
 fn a_cloudflare_result_envelope_reads_like_a_bare_body() {
     let body = r#"{

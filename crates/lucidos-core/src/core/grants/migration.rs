@@ -1,35 +1,14 @@
-//! One-time seed of each workspace's permission grants from the machine-global
-//! files they moved out of (ADR 0095).
-//!
-//! The split this implements is upgrade versus creation. An upgrade preserves
-//! what the user already has, because taking a grant away is a change they did
-//! not ask for and cannot see coming. A workspace created afterwards starts
-//! empty, because nobody has decided anything about it yet.
-//!
-//! Two records keep that true. A machine-wide one in the user dir says the seed
-//! has run, so a workspace created tomorrow is never visited. A per-workspace
-//! stamp says this workspace was seeded, so a re-run cannot resurrect a grant
-//! the user has since deleted.
-//!
-//! The originals are copied, never moved. A migration that deletes the only
-//! copy of a permission set is not worth the disk it saves.
-
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::{BoxError, GrantFile};
 
-/// Machine-wide record that the seed has run, written in the user dir beside
-/// the global files it is about. A readable record rather than a bare
-/// sentinel, so "why does my new workspace not have Slack?" has an answer on
-/// disk.
 const MACHINE_RECORD: &str = "grants-migrated-to-workspaces";
 
-/// Per-workspace stamp, claimed before anything is copied.
 const WORKSPACE_STAMP: &str = "grants-seeded";
 
-/// Seed every workspace that exists now, unless that has already happened.
+/// INVARIANT: Seed every workspace that exists now, unless that has already happened.
 ///
 /// Best-effort and quiet on the happy path. Every failure logs and leaves the
 /// machine record unwritten, so the next boot tries again.
@@ -43,14 +22,13 @@ pub fn run(user_dir: Option<&Path>, workspace_path: &Path) {
         return;
     }
     let Some(user_dir) = user_dir else {
-        // No user dir means no global files to inherit from.
         return;
     };
     let gateway_data = lucidos_home::gateway_data_dir_under(user_dir);
     seed_from(user_dir, &gateway_data, workspace_path);
 }
 
-/// The registry document, cut down to the one field this needs. Mirrors
+/// INVARIANT: The registry document, cut down to the one field this needs. Mirrors
 /// `Registry` in `lucidos-gateway/src/registry.rs`; a relative `dir` resolves
 /// against the gateway data dir, an absolute one is used as it stands.
 #[derive(serde::Deserialize)]
@@ -64,7 +42,7 @@ struct RegistryEntry {
     dir: String,
 }
 
-/// Every registered workspace directory.
+/// INVARIANT: Every registered workspace directory.
 ///
 /// An absent registry is `Ok(empty)`, the fresh-install and no-gateway case. A
 /// present but unparseable one is an error, never an empty list: reading it as
@@ -111,26 +89,18 @@ fn seed_from(user_dir: &Path, gateway_data: &Path, workspace_path: &Path) {
         }
     };
 
-    // The engine's own workspace is unioned in rather than assumed present. It
-    // exists by definition, and an engine can run with no gateway.
     let mut targets: BTreeSet<PathBuf> = registered.iter().map(|p| resolve(p)).collect();
     targets.insert(resolve(workspace_path));
 
     let mut seeded: Vec<PathBuf> = Vec::new();
     for workspace in &targets {
         if !workspace.is_dir() {
-            // A registered directory that is gone. Creating it here would
-            // resurrect a workspace the user deleted.
             crate::log_legacy!("[Grants] Skipping {}: not on disk", workspace.display());
             continue;
         }
         match seed_workspace(user_dir, workspace) {
             Ok(true) => seeded.push(workspace.clone()),
             Ok(false) => {}
-            // The stamp is already claimed, and the machine record below closes
-            // the door for good, so this workspace inherits nothing. Say so:
-            // the alternative is retrying, and a retry is what re-adds a grant
-            // the user deleted.
             Err(e) => crate::log_legacy!(
                 "[Grants] Seeding {} failed ({e}). It inherits no grants and asks on first use.",
                 workspace.display()
@@ -149,13 +119,11 @@ fn seed_from(user_dir: &Path, gateway_data: &Path, workspace_path: &Path) {
     );
 }
 
-/// The path a set can compare. Two registry spellings of one workspace must not
-/// seed it twice, and a path that cannot be canonicalized is used as it stands.
 fn resolve(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Copy the global grants into one workspace. `Ok(false)` means it was already
+/// INVARIANT: Copy the global grants into one workspace. `Ok(false)` means it was already
 /// stamped and nothing was touched.
 ///
 /// The stamp is claimed BEFORE anything is copied, which decides what a crash
@@ -189,9 +157,6 @@ fn seed_workspace(user_dir: &Path, workspace: &Path) -> Result<bool, BoxError> {
     Ok(true)
 }
 
-/// The global file's contents, when it holds at least one grant worth
-/// inheriting. Absent, unreadable and grant-free all read as nothing to copy,
-/// which is the ordinary fresh-install case rather than a failure.
 fn inheritable_global(user_dir: &Path, file: GrantFile) -> Option<String> {
     let path = user_dir.join(file.file_name());
     let body = match std::fs::read_to_string(&path) {
@@ -208,8 +173,6 @@ fn inheritable_global(user_dir: &Path, file: GrantFile) -> Option<String> {
     Some(body)
 }
 
-/// Prepended to a seeded file, so a later reader knows the grants were
-/// inherited rather than chosen here.
 fn origin_header(user_dir: &Path, file: GrantFile) -> String {
     format!(
         "# Inherited on {date} from {source}, when grants became per workspace.\n\

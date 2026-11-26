@@ -38,10 +38,9 @@ pub use {
 pub use {messages::collect_tool_pairs_chronological, messages::ResumeToolPair};
 pub use {threads::format_display_title, threads::is_thread_ancestor};
 
-/// The migration catalog shared by engine boot, restore, and test databases.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
-/// User-facing step label for a `ThreadEvent::MemoryRecalled`.
+/// INVARIANT: User-facing step label for a `ThreadEvent::MemoryRecalled`.
 ///
 /// Deliberately verb-first and free of the word "search". The `memory` tool's
 /// own step reads "Searching memory for ...", and until 2026-08-12 this one
@@ -62,7 +61,7 @@ pub(crate) fn memory_recalled_label(results: u64) -> String {
     }
 }
 
-/// Escape SQL LIKE / ILIKE metacharacters so user-typed `\` `%` `_` match
+/// INVARIANT: Escape SQL LIKE / ILIKE metacharacters so user-typed `\` `%` `_` match
 /// literally. Backslash is escaped first because it's the ESCAPE character
 /// — escaping it later would double-escape the inserted backslashes from
 /// `%` / `_`. Pair with `LIKE/ILIKE ... ESCAPE '\'` (or rely on the default
@@ -73,20 +72,8 @@ pub fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// Delimiters that terminate a screenshot path embedded in a tool result.
-///
-/// Includes `)` so that markdown link output like `[label](screenshots/foo.png)`
-/// truncates at the closing paren. Screenshot filenames never contain any of
-/// these characters, so widening the set is safe for the conversation
-/// time-travel view that reads it.
 const SCREENSHOT_PATH_DELIMS: &[char] = &['"', '\n', ' ', ')'];
 
-/// Extract the screenshot path from a `browser_screenshot` tool result.
-///
-/// Looks for the first `"screenshots/"` token in `result` and returns the
-/// substring up to (but not including) the first occurrence of any
-/// [`SCREENSHOT_PATH_DELIMS`] delimiter — or end-of-string if none is
-/// present. Returns `None` if `"screenshots/"` is absent.
 pub(crate) fn extract_screenshot_path(result: &str) -> Option<String> {
     let start = result.find("screenshots/")?;
     let path_part = &result[start..];
@@ -96,8 +83,6 @@ pub(crate) fn extract_screenshot_path(result: &str) -> Option<String> {
     Some(path_part[..end].to_string())
 }
 
-/// Generate a human-readable description for a tool call event.
-/// Prefers the stored `description` field (new events); falls back to computing it (old events).
 pub(super) fn describe_tool_event(event: &EventRow) -> (String, String) {
     let tool_name = event
         .payload
@@ -120,51 +105,26 @@ pub(super) fn describe_tool_event(event: &EventRow) -> (String, String) {
     (tool_name, description)
 }
 
-/// Filters for the paged event-query path, the events-side sibling of
-/// [`ThreadSummaryFilters`].
-///
-/// A struct rather than seven positional parameters because they are all
-/// optional and several share a type: `Option<Uuid>` appears three times
-/// (`before_event_id`, `after_event_id`, `thread_id`), and at the call site
-/// nothing but argument order would have distinguished them.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EventQueryFilters<'a> {
-    /// Exact `event_type` match. `None` queries every type, which is worth
-    /// avoiding on a busy workspace.
     pub event_type: Option<&'a str>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
-    /// Walk backward from this event, exclusive, under `(created, id)`
-    /// lexicographic order.
     pub before_event_id: Option<Uuid>,
-    /// Tail-follow forward from this event, exclusive.
     pub after_event_id: Option<Uuid>,
-    /// Restrict to one thread. `None` is every thread, which is what every
-    /// caller predating this field passes, so the filter can only narrow.
     pub thread_id: Option<Uuid>,
-    /// Resolve one event by primary key: the dereference half of a pointer the
-    /// agent noted earlier (ADR 0085). Distinct from the two cursors above,
-    /// which position a window rather than name a row. AND-ed with every other
-    /// filter, so a contradicting `event_type` yields nothing.
     pub event_id: Option<Uuid>,
 }
 
-/// Outcome of [`EventStore::query_events_paged`]. Kept separate from
-/// `sqlx::Error` so the HTTP layer can map a missing cursor to a 404 without
-/// string-matching error messages.
 #[derive(Debug)]
 pub enum QueryEventsResult {
     Events(Vec<EventRow>),
     CursorNotFound,
 }
 
-/// Internal three-way result of resolving an optional cursor uuid.
 enum CursorResolution {
-    /// Caller didn't pass a cursor.
     None,
-    /// Cursor exists; carries the `(created, id)` tuple used in WHERE clauses.
     Found((DateTime<Utc>, Uuid)),
-    /// Cursor uuid was passed but doesn't resolve to any event.
     Missing,
 }
 
@@ -199,7 +159,7 @@ impl EventStore {
         Self { pool }
     }
 
-    /// Query events with optional filters and a limit, no cursor paging.
+    /// INVARIANT: Query events with optional filters and a limit, no cursor paging.
     /// Used by App UIs and the LLM `query_events` tool to fetch domain events
     /// (e.g. GoogleDocEdited). Newest-first; rows sharing one timestamp tie-
     /// break on `id DESC` so the order is deterministic across calls.
@@ -217,20 +177,6 @@ impl EventStore {
         self.fetch_events(filters, None, None, limit).await
     }
 
-    /// The `ToolResult` a `ToolCalled` produced, or `None` for an orphan.
-    ///
-    /// The pairing lives in the result's `tool_called_event_id`. Every live
-    /// emit stamps it, and so does the recovery sweep's synthetic backfill, so
-    /// this is exact rather than positional. Scoped to the call's own thread,
-    /// which keeps it a short range scan under
-    /// `idx_events_thread_id_created_seq`. Unscoped it would walk every
-    /// `ToolResult` in the workspace.
-    ///
-    /// Exists because the address an agent notes names the CALL: that is the
-    /// form resumed blocks carry, and the form the retired
-    /// `dismiss_from_context` took (ADR 0109). The half it actually lost is the
-    /// result, so a read of the call has to be able to reach it (ADR 0085,
-    /// Decision 5).
     pub async fn tool_result_for_call(
         &self,
         tool_called_event_id: Uuid,
@@ -249,13 +195,6 @@ impl EventStore {
         .await
     }
 
-    /// Cursor-paged variant of [`Self::query_events`]. Pass `before_event_id`
-    /// to walk backward (strictly older than the cursor under
-    /// `(created, id)` lexicographic order) or `after_event_id` to
-    /// tail-follow. The HTTP layer rejects "both set" with 400; this method
-    /// AND's them together if both are passed. If a supplied cursor uuid
-    /// doesn't exist, returns [`QueryEventsResult::CursorNotFound`] instead
-    /// of silently returning the unfiltered history.
     pub async fn query_events_paged(
         &self,
         filters: EventQueryFilters<'_>,
@@ -277,9 +216,6 @@ impl EventStore {
         Ok(QueryEventsResult::Events(events))
     }
 
-    /// Project `get_event_by_id` to the `(created, id)` cursor tuple, with a
-    /// three-way result so the paged caller can distinguish "no cursor asked
-    /// for" from "cursor asked for but missing".
     async fn resolve_cursor(&self, id: Option<Uuid>) -> Result<CursorResolution, sqlx::Error> {
         match id {
             None => Ok(CursorResolution::None),
@@ -297,15 +233,6 @@ impl EventStore {
         after_cursor: Option<(DateTime<Utc>, Uuid)>,
         limit: i64,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
-        // `thread_id` is one more `IS NULL OR` in the same shape as every other
-        // filter, so omitting it returns exactly what it always returned. That
-        // matters: every existing caller (the CLI, triggers, the SDK) passes
-        // `None`, and a filter that narrowed by default would silently change
-        // all of them. It rides the `idx_events_thread_id_created_seq` index.
-        // `event_id` follows the same rule and hits the primary key.
-        //
-        // Side-question rows never come back, in any mode: this reader backs
-        // the agent's `query_events` tool, and no agent may see one (ADR 0320).
         sqlx::query_as::<_, EventRow>(
             "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
              WHERE ($1::text IS NULL OR event_type = $1) \
@@ -333,18 +260,6 @@ impl EventStore {
         .await
     }
 
-    /// Count events matching the same filters as [`Self::query_events`],
-    /// without materialising the payloads. Side-question rows are excluded
-    /// here too, as in every generic reader.
-    ///
-    /// Returns `(count, byte_total)` for the single-type filter; when
-    /// `event_type` is `None`, the caller should use
-    /// [`Self::count_events_by_type`] instead — this helper only collapses
-    /// to a scalar.
-    ///
-    /// `byte_total` is `SUM(octet_length(payload::text))` — the on-disk
-    /// JSON size of the payloads. It's a good proxy for token cost when
-    /// the LLM is deciding whether a sweep will fit in its context budget.
     pub async fn count_events(
         &self,
         event_type: Option<&str>,
@@ -370,11 +285,6 @@ impl EventStore {
         Ok((count, bytes.unwrap_or(0)))
     }
 
-    /// Per-`event_type` breakdown across the same time window as
-    /// [`Self::count_events`], ordered by count descending so the noisiest
-    /// types surface first. Used by the `count_events` LLM tool and the
-    /// `GET /api/v1/events/count` endpoint when no `event_type` filter is
-    /// passed.
     pub async fn count_events_by_type(
         &self,
         since: Option<DateTime<Utc>>,
@@ -403,7 +313,7 @@ impl EventStore {
             .collect())
     }
 
-    /// Return all distinct event_type values, ordered alphabetically, less
+    /// INVARIANT: Return all distinct event_type values, ordered alphabetically, less
     /// the side-question names no agent may see.
     ///
     /// A loose index scan, NOT `SELECT DISTINCT`, and the difference is the
@@ -437,7 +347,6 @@ impl EventStore {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
-    /// Get a single event by its ID
     pub async fn get_event_by_id(&self, id: Uuid) -> Result<Option<EventRow>, sqlx::Error> {
         let event = sqlx::query_as::<_, EventRow>(
             r#"
@@ -453,7 +362,7 @@ impl EventStore {
         Ok(event)
     }
 
-    /// What a conversation snapshot at `until` reads, oldest first: one
+    /// INVARIANT: What a conversation snapshot at `until` reads, oldest first: one
     /// thread's events, plus every artifact write, which the snapshot takes
     /// its commit from. Artifact events belong to no thread. A `None` thread
     /// reads the rows that belong to no thread.
@@ -478,9 +387,6 @@ impl EventStore {
         .await
     }
 
-    /// Every event of the given types, oldest first. Memory rebuild reads only
-    /// the types it indexes, which keeps the streaming rows that fill most of
-    /// the table out of memory.
     pub async fn events_of_types_chronological(
         &self,
         event_types: &[&str],
@@ -494,7 +400,6 @@ impl EventStore {
         .await
     }
 
-    /// Rebuild input for vector memory, with held messages ordered by delivery.
     pub async fn memory_index_events(&self, types: &[&str]) -> Result<Vec<EventRow>, sqlx::Error> {
         use crate::engine::consumption_claim::{model_delivery_join, model_event_visible};
         let delivery = model_delivery_join();
@@ -510,8 +415,6 @@ impl EventStore {
         .await
     }
 
-    /// Every event of one type, oldest first. Ties on `created` fall back to
-    /// insertion order, so a replay applies them in the order they happened.
     pub async fn events_of_type_chronological(
         &self,
         event_type: &str,
@@ -519,8 +422,6 @@ impl EventStore {
         self.events_of_types_chronological(&[event_type]).await
     }
 
-    /// Get thread events after a given sequence number (or all if None).
-    /// Returns rows ordered by sequence ASC for replay.
     pub async fn get_thread_events_by_seq(
         &self,
         thread_id: Uuid,
@@ -539,7 +440,7 @@ impl EventStore {
         .await
     }
 
-    /// The NEWEST `limit` drawable events of a thread, older than `before`.
+    /// INVARIANT: The NEWEST `limit` drawable events of a thread, older than `before`.
     ///
     /// Rows come back oldest-first, the order every reader already expects, so
     /// a page is prepended to what the client holds rather than reversed there.
@@ -570,7 +471,7 @@ impl EventStore {
             Some((created, seq)) => (Some(created), Some(seq)),
             None => (None, None),
         };
-        // One row beyond the page answers `has_more` without a second query,
+        // INVARIANT: One row beyond the page answers `has_more` without a second query,
         // and without a count that could disagree with the page it describes.
         // The watermark joins the page rather than riding on its rows, so a
         // page that skipped every row still carries it.
@@ -601,13 +502,12 @@ impl EventStore {
             .fetch_all(&self.pool)
             .await?;
 
-        // The join yields exactly one row with no event when the page is empty.
         let max_sequence = rows.first().and_then(|r| r.max_sequence);
         let mut events: Vec<ThreadEventRow> =
             rows.into_iter().filter_map(PagedEventRow::event).collect();
         let has_more = events.len() as i64 > limit;
         if has_more {
-            // The extra row is the OLDEST, because the page is ascending.
+            // INVARIANT: The extra row is the OLDEST, because the page is ascending.
             events.remove(0);
         }
         Ok(ThreadEventPage {
@@ -618,9 +518,6 @@ impl EventStore {
     }
 }
 
-/// A paged row, which carries the thread's watermark alongside itself so the
-/// two come from one statement. See `get_thread_events_page`. Every event
-/// column is absent on the one row an empty page returns.
 #[derive(sqlx::FromRow)]
 struct PagedEventRow {
     sequence: Option<i64>,
@@ -632,7 +529,6 @@ struct PagedEventRow {
 }
 
 impl PagedEventRow {
-    /// The event this row carries, or `None` for an empty page's row.
     fn event(self) -> Option<ThreadEventRow> {
         Some(ThreadEventRow {
             sequence: self.sequence?,
@@ -644,13 +540,10 @@ impl PagedEventRow {
     }
 }
 
-/// One page of a thread's events, and whether older ones remain behind it.
 pub struct ThreadEventPage {
-    /// Oldest-first, as every other read path returns them.
     pub events: Vec<ThreadEventRow>,
-    /// True when the thread holds drawable events older than `events[0]`.
     pub has_more: bool,
-    /// The highest `sequence` the whole thread holds, or `None` when it holds
+    /// INVARIANT: The highest `sequence` the whole thread holds, or `None` when it holds
     /// nothing. NOT derivable from the page: see `get_thread_events_page`.
     pub max_sequence: Option<i64>,
 }
@@ -659,7 +552,6 @@ pub struct ThreadEventPage {
 #[path = "mod_tests.rs"]
 mod mod_tests;
 
-/// Whether the workspace has the memory table created by the embedding index.
 pub async fn memory_table_exists<'e, E>(executor: E) -> Result<bool, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -669,19 +561,13 @@ where
         .await
 }
 
-/// Ensure the memory table exists before memory indexing starts.
 pub async fn ensure_memory_entries_table(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-    // The width only applies to a fresh table. Existing workspaces keep the
-    // width they were provisioned with, which the index checks at runtime.
     const VECTOR_DIM: i32 = 384;
 
-    // Enable pgvector extension
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
         .execute(pool)
         .await?;
 
-    // Fresh installs create the table with extractor_version.
-    // An idempotent migration adds the column on existing installs.
     sqlx::query(&format!(
         r#"
         CREATE TABLE IF NOT EXISTS memory_entries (

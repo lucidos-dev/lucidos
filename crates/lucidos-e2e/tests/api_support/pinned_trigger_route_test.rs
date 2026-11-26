@@ -1,13 +1,3 @@
-//! E2E for a pinned trigger's route reaching every turn it starts.
-//!
-//! A trigger pinned to one model once ran an intent on another: the intent
-//! sub-loop called the model with no selection, so it fell to the boot default.
-//! Here a pinned trigger's mock script loads an intent and spawns a child. Every
-//! turn in both threads must run on the pin.
-//!
-//! The mock answers any model it is asked for. So the test reads the route that
-//! each `ContextCaptured` row and the child's `MessageReceived` recorded.
-
 use crate::support::{
     db_url, remove_data_fixtures, unique_marker, user_client, write_data_fixture,
 };
@@ -15,26 +5,18 @@ use crate::trigger_run_test::{create_trigger, delete_trigger, run_trigger_with_a
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-/// A schedule that never fires inside a test run, so the off-schedule run is
-/// the only fire.
 const NEVER_SOON_CRON: &str = "0 0 3 1 1 *";
 
-/// The trigger's pin. Neither is the e2e engine's boot default, `mock`.
 const PINNED_MODEL: &str = "claude-sonnet-5";
 const PINNED_EFFORT: &str = "low";
 
-/// What the two threads recorded, read once both turns ended.
 #[derive(Debug)]
 struct Recorded {
-    /// `(model, reasoning_effort)` of every turn capture in both threads.
     turn_routes: Vec<(String, Option<String>)>,
-    /// `(model, reasoning_effort)` the child's first message was stamped with.
     child_message_route: (Option<String>, Option<String>),
-    /// Captures of the retired intent sub-loop, in either thread.
     intent_loop_captures: i64,
 }
 
-/// The fire's thread and its child, once both have ended a turn.
 async fn ended_threads(
     pool: &sqlx::PgPool,
     trigger_id: &str,
@@ -86,8 +68,6 @@ async fn ended_threads(
     }
 }
 
-/// Read what both threads recorded. Returns a `Result` so the caller can clean
-/// up before it unwraps.
 async fn read_recorded(trigger_id: &str) -> Result<Recorded, String> {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
@@ -177,8 +157,6 @@ async fn a_pinned_trigger_runs_its_intent_and_its_child_on_the_pin() {
         Err(e) => Err(e),
     };
 
-    // Every unwrap waits for the cleanup: a panic before it strands a trigger
-    // and its intent in the shared workspace.
     delete_trigger(&client, &id).await;
     remove_data_fixtures(&client, &format!("triggers/{intent_id}"), &[intent_file]).await;
 

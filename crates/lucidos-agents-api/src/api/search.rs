@@ -11,8 +11,6 @@ pub struct SearchQuery {
     pub q: Option<String>,
     #[serde(default = "default_category")]
     pub category: String,
-    /// Hits per category. Search Everywhere asks each category on its own,
-    /// for one past the All tab's cap, so a tab can say "5+".
     pub limit: Option<usize>,
 }
 
@@ -20,7 +18,6 @@ fn default_category() -> String {
     "all".to_string()
 }
 
-/// A category's own page is longer than its slice of the All tab.
 const ALL_TAB_LIMIT: usize = 5;
 const CATEGORY_LIMIT: usize = 50;
 
@@ -49,7 +46,6 @@ pub struct SearchResponse {
     pub results: HashMap<String, Vec<SearchResultItem>>,
 }
 
-/// GET /api/v1/search?q=<query>&category=all|threads|files|apps|triggers|settings|changes&limit=<1-50>
 pub(super) async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -60,8 +56,6 @@ pub(super) async fn search(
 
     let mut results: HashMap<String, Vec<SearchResultItem>> = HashMap::new();
 
-    // "settings" is filtered entirely from the frontend registry (see searchIndex.ts) — backend
-    // never returns settings results, so the labels stay co-located with the rendered UI strings.
     match category {
         "all" => {
             let (threads, files, apps, triggers, changes) = tokio::join!(
@@ -185,8 +179,6 @@ async fn search_threads_internal(
             .get_recent_threads(limit as i64)
             .await
             .map_err(|e| format!("Thread search failed: {}", e))?;
-        // get_recent_threads returns the global newest threads (inbox + the newest
-        // archived slice), so truncate to limit.
         return Ok(threads
             .into_iter()
             .take(limit)
@@ -198,7 +190,7 @@ async fn search_threads_internal(
         crate::engine::thread_search::combined_thread_search(&state.engine, query, limit as i64)
             .await
             .map_err(|e| format!("Thread search failed: {}", e))?;
-    // `limit` bounds each ARM inside the merge, not the merge, so two arms that
+    // INVARIANT: `limit` bounds each ARM inside the merge, not the merge, so two arms that
     // agree on nothing yield up to twice it and this category would out-fill
     // every sibling in the palette. Truncated here, like `files` / `apps` /
     // `triggers` / `changes` each do in their own `*_internal`. The merge has
@@ -227,8 +219,6 @@ fn file_hits(paths: Vec<String>, query: &str, limit: usize) -> Vec<SearchResultI
     let query_lower = query.to_lowercase();
     let matches = paths
         .into_iter()
-        // Vendored trees and build output are not the user's files, and a
-        // single `node_modules` would otherwise fill the category.
         .filter(|path| !is_build_output_path(path))
         .map(|path| {
             let filename = std::path::Path::new(&path)
@@ -261,7 +251,6 @@ async fn search_apps_internal(
     search_apps(&state.app_manager, query, limit)
 }
 
-/// Widgets are not apps here (ADR 0402): `list_apps` already leaves them out.
 fn search_apps(
     app_manager: &crate::core::AppManager,
     query: &str,
@@ -353,12 +342,11 @@ pub(super) struct TextSearchQuery {
     mode: TextSearchMode,
 }
 
-/// GET /api/v1/search/text?q=<query>&mode=preview|all
 pub(super) async fn search_text(
     State(state): State<AppState>,
     Query(query): Query<TextSearchQuery>,
 ) -> Result<Json<TextSearchResponse>, ApiError> {
-    // Axum drops the handler future when the client aborts, so a superseded
+    // INVARIANT: Axum drops the handler future when the client aborts, so a superseded
     // keystroke cancels the blocking scan it started.
     let cancelled = CancellationToken::new();
     let _cancel_on_drop = cancelled.clone().drop_guard();
@@ -373,7 +361,6 @@ pub(super) async fn search_text(
     Ok(Json(response))
 }
 
-/// Routes for the global `/search` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/search", get(search))

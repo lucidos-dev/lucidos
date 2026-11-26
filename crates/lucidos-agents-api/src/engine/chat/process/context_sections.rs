@@ -1,9 +1,3 @@
-//! Per-turn context-section builders: file list, user profile, credentials,
-//! email/oauth accounts, active app/file/url context, and thread-depth
-//! guidance. Each is an independent string block consumed by both the user
-//! message assembly and the capture sections. Split out of
-//! `process_message_with_steps_internal`.
-
 use crate::core::{CredentialStore, EmailStore, OAuthStore};
 use crate::engine::types::AppContext;
 use crate::engine::LucidosEngine;
@@ -12,9 +6,6 @@ use uuid::Uuid;
 use super::workspace_prompt_footprint as footprint;
 use crate::engine::child_limits::MAX_THREAD_DEPTH;
 
-/// The ten per-turn context-section strings produced by
-/// [`LucidosEngine::build_chat_context_sections`]. Empty strings mean the
-/// section does not apply this turn (callers filter them out).
 pub(super) struct ChatContextSections {
     pub file_list_context: String,
     pub profile_context: String,
@@ -28,17 +19,11 @@ pub(super) struct ChatContextSections {
     pub thread_depth_context: String,
 }
 
-/// Borrowed per-turn inputs to [`LucidosEngine::build_chat_context_sections`].
-/// Bundles the request context so the builder takes one argument instead of
-/// eight (the per-turn counterpart to the [`ChatContextSections`] output).
 pub(super) struct ChatContextInputs<'a> {
     pub classification: &'a crate::memory::QueryClassification,
     pub user_profile: &'a str,
     pub thread_id: Uuid,
-    /// The event that started this turn. An answer-driven resume passes the
-    /// interrupted turn's, so the answer counts toward the last used device.
     pub turn_anchor: Uuid,
-    /// The device the turn's own event came from. `None` on a resume.
     pub device_id: Option<&'a str>,
     pub app_context: Option<&'a AppContext>,
     pub file_context: Option<&'a str>,
@@ -48,8 +33,6 @@ pub(super) struct ChatContextInputs<'a> {
 
 #[easy_ext::ext(ContextSectionsExt)]
 pub(crate) impl LucidosEngine {
-    /// Build the per-turn context sections. Verbatim extraction of the inline
-    /// blocks from `process_message_with_steps_internal`.
     async fn build_chat_context_sections(
         &self,
         inputs: ChatContextInputs<'_>,
@@ -65,15 +48,10 @@ pub(crate) impl LucidosEngine {
             url_context,
             parent_thread_id,
         } = inputs;
-        // Include current file list so LLM doesn't need to call list_files
         let file_list_context = if !classification.needs_file_list {
             log_legacy!("[Chat] Skipping file list context (not needed for this query)");
             String::new()
         } else {
-            // A walk that FAILED is not a workspace with no files, and the
-            // section renders the two identically. The turn still goes out
-            // (the agent can fall back to `list_files`), but the reason has
-            // to reach the log.
             let all_files = match self.artifact_manager.list_artifacts() {
                 Ok(files) => files,
                 Err(e) => {
@@ -82,9 +60,8 @@ pub(crate) impl LucidosEngine {
                 }
             };
             footprint::build_file_list_section(&all_files)
-        }; // end file_list_context if/else
+        };
 
-        // Include user profile content so LLM doesn't need to read it
         let profile_context = footprint::build_user_profile_section(user_profile);
 
         let device_preferences_context =
@@ -97,7 +74,6 @@ pub(crate) impl LucidosEngine {
             .await
             .render();
 
-        // Include available API credentials so LLM knows which services are configured
         let credentials_context = if classification.needs_credentials {
             self.credentials_section().await
         } else {
@@ -109,8 +85,6 @@ pub(crate) impl LucidosEngine {
         let oauth_context =
             footprint::build_oauth_accounts_section(&self.oauth_accounts_for_prompt().await);
 
-        // The id comes off the request body and is joined into a path below, so
-        // a traversal id would list another directory's docs.
         let app_context = app_context.filter(|ctx| {
             let traversal = crate::core::is_path_traversal(&ctx.app_id);
             if traversal {
@@ -121,7 +95,6 @@ pub(crate) impl LucidosEngine {
             }
             !traversal
         });
-        // Active app context — tell the LLM which app UI is open so it can read files as needed
         let app_context_section = if let Some(ctx) = app_context {
             let app_name = self
                 .app_manager
@@ -140,14 +113,12 @@ pub(crate) impl LucidosEngine {
             String::new()
         };
 
-        // Handle file context when the user is viewing a specific file
         let file_context_section = if let Some(path) = file_context {
             active_file_context_section(path)
         } else {
             String::new()
         };
 
-        // Handle URL context when the user has a webpage open in the panel webview
         let url_context_section = if let Some(ctx) = url_context {
             let title_line = ctx
                 .title
@@ -155,7 +126,6 @@ pub(crate) impl LucidosEngine {
                 .map(|t| format!("Title: {}\n", t))
                 .unwrap_or_default();
             if ctx.content.trim().is_empty() {
-                // URL is open but content couldn't be extracted (cross-origin, CSP, etc.)
                 format!(
                     "[ACTIVE URL CONTEXT]\n\
 The user currently has a webpage open in the browser panel.\n\
@@ -166,7 +136,6 @@ Page content could not be extracted. If the user asks about this page, use brows
                     ctx.url, title_line
                 )
             } else {
-                // Truncate content to 100K chars for safety (frontend already caps, but belt-and-suspenders)
                 let content = if ctx.content.len() > 100_000 {
                     &ctx.content[..ctx.content.floor_char_boundary(100_000)]
                 } else {
@@ -188,8 +157,6 @@ URL: {}\n\
             String::new()
         };
 
-        // Thread depth context — tell child threads their position so they make
-        // better decisions about sub-threading
         let thread_depth_context = if let Some(pid) = parent_thread_id {
             let parent_depth: Result<Option<i32>, _> =
                 sqlx::query_scalar("SELECT depth FROM thread_summaries WHERE thread_id = $1")
@@ -198,7 +165,7 @@ URL: {}\n\
                     .await;
             let depth: i32 = match parent_depth {
                 Ok(Some(d)) => d + 1,
-                Ok(None) => 1, // parent not yet in projection — default to depth 1
+                Ok(None) => 1,
                 Err(e) => {
                     log_legacy!(
                         "[Chat] Failed to query parent thread depth for context: {}",
@@ -250,8 +217,6 @@ fn app_knowhow_summaries_in(
     )
 }
 
-/// The `[THREAD CONTEXT]` of a child thread at `depth` that owes `duty`: its
-/// place in the tree, and the read rule its parent's acting calls for.
 fn child_thread_context(
     depth: i32,
     duty: crate::engine::turn_end::wake_decision::WakeDuty,
@@ -278,10 +243,6 @@ fn child_thread_context(
     )
 }
 
-/// What the home thread's agent is told about the thread it runs in
-/// (ADR 0362). Only the home thread gets it, so every other thread's request
-/// is unchanged. A sub-thread is never the home thread, which keeps this and
-/// the depth notice apart.
 const HOME_THREAD_CONTEXT: &str = "[THREAD CONTEXT]\n\
      This is the workspace's home thread, where the user talks to you by \
      default. It never ends, and nobody can archive or delete it.\n\
@@ -309,8 +270,6 @@ const HOME_THREAD_CONTEXT: &str = "[THREAD CONTEXT]\n\
 
 #[easy_ext::ext(ContextSectionInputsExt)]
 pub(crate) impl LucidosEngine {
-    /// Whether `thread_id` is the home thread, for the context notice. A read
-    /// error only costs the notice, so it logs and answers no.
     async fn is_home_thread_for_context(&self, thread_id: Uuid) -> bool {
         crate::engine::home_thread::is_home_thread(&self.pool, thread_id)
             .await
@@ -320,8 +279,6 @@ pub(crate) impl LucidosEngine {
             })
     }
 
-    /// The credentials block as a turn that needs credentials carries it: the
-    /// stored list, then the builtin provider proxies.
     async fn credentials_section(&self) -> String {
         footprint::build_credentials_section(
             &self.stored_credentials_for_prompt().await,
@@ -333,17 +290,12 @@ pub(crate) impl LucidosEngine {
         app_knowhow_summaries_in(&self.workspace_path, app_id)
     }
 
-    /// The builtin provider proxies, sent on every turn. A builtin proxy is
-    /// neither a credential row nor an apis.json entry. Without this block the
-    /// agent asks the user for a key the engine already holds.
     async fn builtin_proxies_section(&self) -> String {
         crate::api::proxy_builtin::render_builtin_proxies_block(
             &crate::api::proxy_builtin::builtin_proxy_states(&self.clone_arc()).await,
         )
     }
 
-    /// The stored credentials a prompt names. A read that failed is not "no
-    /// credentials", and the prompt renders the two alike, so it says why here.
     async fn stored_credentials_for_prompt(&self) -> Vec<crate::core::CredentialInfo> {
         CredentialStore::list(&self.pool).await.unwrap_or_else(|e| {
             log_legacy!("[Chat] Cannot list credentials for the prompt: {}. The turn goes out as if none were configured", e);
@@ -351,7 +303,6 @@ pub(crate) impl LucidosEngine {
         })
     }
 
-    /// The email accounts a prompt names, with a failed read logged.
     async fn email_accounts_for_prompt(&self) -> Vec<crate::core::EmailAccountInfo> {
         EmailStore::list(&self.pool).await.unwrap_or_else(|e| {
             log_legacy!("[Chat] Cannot list email accounts for the prompt: {}. The turn goes out as if none were configured", e);
@@ -359,7 +310,6 @@ pub(crate) impl LucidosEngine {
         })
     }
 
-    /// The OAuth accounts a prompt names, with a failed read logged.
     async fn oauth_accounts_for_prompt(&self) -> Vec<crate::core::OAuthAccountInfo> {
         OAuthStore::list(&self.pool).await.unwrap_or_else(|e| {
             log_legacy!("[Chat] Cannot list OAuth accounts for the prompt: {}. The turn goes out as if none were connected", e);
@@ -368,17 +318,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Shared anchoring clause appended to the `[ACTIVE APP UI]` and
-/// `[ACTIVE FILE CONTEXT]` sections. It leans the chat agent toward treating
-/// what the user has OPEN as the default subject of an ambiguous request —
-/// without forbidding anything. The motivating failure: a user editing their
-/// own `lucidos-me` site (a landing page *about* Lucidos) asked to fix a "logo
-/// tooltip on the Conversation & Canvas mark"; the chat agent took the
-/// Lucidos-flavoured vocabulary as a cue to go hunt and edit Lucidos's own
-/// product source checkout (grepping `crates/lucidos-app/src`, ballooning
-/// context past 600k tokens) instead of the open artifact. The clause is a
-/// DEFAULT, not a lock: the agent must still do anything the user clearly asks
-/// for a different target (another app, Lucidos itself, a workspace task).
 const ANCHOR_DEFAULT_RULE: &str = " This is a DEFAULT, not a restriction — you \
 can still do anything the user clearly asks (edit another app, work on Lucidos \
 the product itself, run a workspace task) when their request names a different \
@@ -390,14 +329,6 @@ are NOT by themselves a signal to read or edit Lucidos's source code. When the \
 target is genuinely unclear, default to what's open and switch only if the user \
 indicates otherwise.";
 
-/// Build the `[ACTIVE APP UI]` context section for an open app. Pure so the
-/// prompt text (including [`ANCHOR_DEFAULT_RULE`]) is unit-testable without a
-/// `LucidosEngine`/DB.
-///
-/// `knowhow_listing` names the app's docs and their ids, and carries no doc
-/// bodies. It comes from
-/// [`super::workspace_prompt_footprint::build_app_knowhow_listing`], which owns the
-/// reasoning and the size rule.
 fn active_app_ui_section(app_name: &str, app_id: &str, knowhow_listing: &str) -> String {
     format!(
         "[ACTIVE APP UI]\n\
@@ -418,8 +349,6 @@ fn active_app_ui_section(app_name: &str, app_id: &str, knowhow_listing: &str) ->
     )
 }
 
-/// Build the `[ACTIVE FILE CONTEXT]` section for an open file/artifact. Pure
-/// (see [`active_app_ui_section`]).
 fn active_file_context_section(path: &str) -> String {
     format!(
         "[ACTIVE FILE CONTEXT]\n\
@@ -450,11 +379,8 @@ mod tests {
     use crate::engine::turn_end::wake_decision::WakeDuty;
     use std::path::Path;
 
-    /// The marker a body carries in these fixtures. It must never reach the
-    /// block: finding it there is the regression this file guards against.
     const BODY_MARKER: &str = "BODY-TEXT-THAT-MUST-NOT-BE-INJECTED";
 
-    /// A knowhow file with the frontmatter the loader expects.
     fn doc(name: &str, description: &str, body: &str) -> String {
         format!(
             "---\nname: {}\ndescription: {}\n---\n{}\n",
@@ -462,10 +388,6 @@ mod tests {
         )
     }
 
-    /// A workspace tree holding one app and its knowhow files, laid out the
-    /// way the engine reads them. An empty `docs` leaves the app with no
-    /// knowhow dir. That is the common case: 24 of 27 apps on the workspace
-    /// this was measured against. The caller keeps the tempdir alive.
     fn app_workspace(app_id: &str, docs: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("data/knowhow")).expect("local knowhow dir");
@@ -478,9 +400,6 @@ mod tests {
         dir
     }
 
-    /// The two-doc fixture the listing tests share. Both sit at the app's
-    /// knowhow root, which is where its docs live: the app is already the
-    /// group, so a folder inside that root holds one doc's references.
     fn two_doc_workspace() -> tempfile::TempDir {
         let reach = doc("Reach metrics", "Where the numbers come from.", "Body.");
         let deep = doc("Deep dive", "The long version.", "Body.");
@@ -490,7 +409,6 @@ mod tests {
         )
     }
 
-    /// The dirs a chat turn resolves an id against, rooted in the fixture.
     fn fixture_dirs(ws: &Path) -> KnowhowDirs {
         KnowhowDirs {
             shared: None,
@@ -500,16 +418,12 @@ mod tests {
         }
     }
 
-    /// Assemble the block the way a chat turn does: the production loader, the
-    /// production listing builder, the production template.
     fn render(ws: &Path, app_id: &str, app_name: &str) -> String {
         let summaries = app_knowhow_summaries_in(ws, app_id);
         let listing = build_app_knowhow_listing(app_id, &summaries);
         active_app_ui_section(app_name, app_id, &listing)
     }
 
-    /// Pull the ids back out of a rendered block. A test then asserts against
-    /// what the agent reads, rather than against a hand-written copy of it.
     fn listed_ids(section: &str) -> Vec<String> {
         section
             .lines()
@@ -523,25 +437,18 @@ mod tests {
     #[test]
     fn app_ui_section_anchors_on_open_app_without_forbidding_other_work() {
         let section = active_app_ui_section("Site publisher", "site-publisher", "");
-        // Identifies the open app + its folder.
         assert!(section.contains("[ACTIVE APP UI]"));
         assert!(section.contains("'Site publisher'"));
         assert!(section.contains("data/apps/site-publisher/"));
-        // Leans toward the open app as the default subject.
         assert!(section.contains("DEFAULT TO THIS APP"));
         assert!(section.contains("a tooltip"));
-        // Overlapping Lucidos vocabulary is explicitly NOT a cue to edit source.
         assert!(
             section.contains("NOT by themselves a signal to read or edit Lucidos's source code")
         );
-        // But it's a default, not a lock — other work stays possible.
         assert!(section.contains("DEFAULT, not a restriction"));
         assert!(section.contains("work on Lucidos the product itself"));
     }
 
-    /// Home starts threads for work, overriding only the general rule's
-    /// default of working inline. It still answers a question itself, and the
-    /// setup interview, which runs in Home (ADR 0411), stays there.
     #[test]
     fn home_starts_a_thread_for_work_and_answers_questions_itself() {
         assert!(HOME_THREAD_CONTEXT.contains("START A THREAD FOR WORK"));
@@ -552,8 +459,6 @@ mod tests {
         assert!(HOME_THREAD_CONTEXT.contains("run_thread, or run_coding_agent"));
     }
 
-    /// I12 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`: Home
-    /// knows its children default to no-wake, and how to ask for more.
     #[test]
     fn home_knows_its_children_default_to_no_wake() {
         assert!(HOME_THREAD_CONTEXT.contains("defaults to wake_mode 'no-wake'"));
@@ -562,8 +467,6 @@ mod tests {
         assert!(HOME_THREAD_CONTEXT.contains("A no-wake child's failure is filed too"));
     }
 
-    /// ADR 0473: work the user reads is a top-thread, so Home pays for no
-    /// report it would not act on.
     #[test]
     fn home_starts_work_the_user_reads_as_a_top_thread() {
         assert!(HOME_THREAD_CONTEXT.contains("Work the user reads goes in relation='top'"));
@@ -583,8 +486,6 @@ mod tests {
         );
     }
 
-    /// Most apps have no knowhow dir. They get the anchoring half and nothing
-    /// else: no header sentence left dangling over an empty list.
     #[test]
     fn app_ui_section_omits_the_listing_when_the_app_has_no_knowhow() {
         let ws = app_workspace("habit-tracker", &[]);
@@ -599,8 +500,6 @@ mod tests {
         );
     }
 
-    /// Every doc is named, with its id and description, and the listing sits
-    /// inside the block. Each id carries the app that scopes it.
     #[test]
     fn app_ui_section_lists_every_knowhow_doc_by_id_name_and_description() {
         let ws = two_doc_workspace();
@@ -630,8 +529,6 @@ mod tests {
         assert!(listing_start < end, "the listing sits inside the block");
     }
 
-    /// Today's behaviour, kept: the loader logs the file and moves on. One
-    /// unparseable doc must not cost the agent the docs beside it.
     #[test]
     fn a_doc_with_broken_frontmatter_is_skipped_rather_than_rendered() {
         let good = doc("Good", "A description.", "Body.");
@@ -656,9 +553,6 @@ mod tests {
         assert!(!section.contains("nameless"), "{section}");
     }
 
-    /// The guard that gives this change its point. A doc body of any size
-    /// renders the same block, because only the id, name and description are
-    /// billed. See `docs/adr/0111-app-know-how-is-a-pointer-not-a-body.md`.
     #[test]
     fn app_ui_section_carries_no_body_however_big_the_doc() {
         let tiny = doc("Reach metrics", "Where the numbers come from.", "x");
@@ -686,8 +580,6 @@ mod tests {
         assert!(big.chars().count() < 2_000, "{} chars", big.chars().count());
     }
 
-    /// A doc with no `description:` derives one from its body, so the body is
-    /// a size input on that path too. It is bounded, and stays bounded.
     #[test]
     fn a_derived_description_is_bounded_by_the_render_ceiling() {
         let body = format!(
@@ -716,9 +608,6 @@ mod tests {
         );
     }
 
-    /// Anti-drift, half one. Every id the block prints must be an id
-    /// `load_knowhow` resolves. The ids are parsed back out of the rendered
-    /// text, so a change to the line shape cannot slip past this.
     #[test]
     fn every_id_the_block_lists_resolves_the_way_load_knowhow_resolves_it() {
         let ws = two_doc_workspace();
@@ -738,8 +627,6 @@ mod tests {
         }
     }
 
-    /// A folder inside the app's knowhow root belongs to one doc. Its files
-    /// take no row of their own, and the doc that owns them loads them by id.
     #[test]
     fn a_reference_folder_takes_no_row_but_still_loads_by_id() {
         let reach = doc("Reach metrics", "Where the numbers come from.", "Body.");
@@ -769,8 +656,6 @@ mod tests {
         );
     }
 
-    /// Anti-drift, half two. The block and the Know-how routing list name the
-    /// same docs by the same id, because both build it with `app_scoped_id`.
     #[test]
     fn every_id_the_block_lists_also_appears_in_the_routing_list() {
         let ws = two_doc_workspace();
@@ -804,8 +689,6 @@ mod tests {
         );
     }
 
-    /// ADR 0607: a chat sub-thread reads the same rule as a coding agent's,
-    /// under the same duties.
     #[test]
     fn a_child_thread_context_carries_the_read_rule_by_wake_duty() {
         for duty in [

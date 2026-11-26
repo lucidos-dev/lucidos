@@ -1,14 +1,8 @@
-//! The `proposed` change state and `coding_agent_requires_restart` are a cache
-//! of the `changes` table: after every event they equal what the thread's
-//! pending changes say. The unproposed reason never outlives its state.
-
 use super::super::*;
 use super::*;
 use crate::core::changes_projection::ChangesProjection;
 use crate::engine::thread_events::UnproposedReason;
 
-/// The two cached facts, and what the thread's pending changes say they
-/// should be.
 async fn proposal_and_truth(pool: &PgPool, thread_id: Uuid) -> ((bool, bool), (bool, bool)) {
     let row: (bool, bool, bool, bool) = sqlx::query_as(
         "SELECT t.coding_agent_change_state = 'proposed', t.coding_agent_requires_restart, \
@@ -37,8 +31,6 @@ fn propose(change_id: Uuid, branch: &str, requires_restart: bool) -> ThreadEvent
     proposal(change_id.to_string(), None, branch, requires_restart, false)
 }
 
-/// What a Stop proposed before ADR 0400: the turn's work, marked incomplete.
-/// The event stays readable history, so the cache must still follow it.
 fn propose_legacy_incomplete(change_id: Uuid, branch: &str) -> ThreadEvent {
     proposal(change_id.to_string(), None, branch, false, true)
 }
@@ -73,7 +65,6 @@ fn idled(has_changes: bool) -> ThreadEvent {
     }
 }
 
-/// A legacy per-commit proposal: no change id, a commit sha.
 fn propose_per_commit(branch: &str, requires_restart: bool) -> ThreadEvent {
     proposal(
         String::new(),
@@ -133,7 +124,6 @@ fn discarded(change_id: Uuid) -> ThreadEvent {
     }
 }
 
-/// A small deterministic generator, so a failing sequence replays exactly.
 struct XorShift(u64);
 
 impl XorShift {
@@ -145,12 +135,6 @@ impl XorShift {
     }
 }
 
-/// The invariant from the plan, as a property over event sequences: every
-/// step is a proposal, a legacy per-commit proposal, an apply, a discard, an
-/// idle, a withholding, a withdrawal or an archive, on one of two changes.
-/// After each, the columns must equal the `changes` query. A refused event (an
-/// archived thread refusing a proposal, say) still has to leave the two in
-/// step.
 #[tokio::test]
 async fn the_proposal_columns_equal_the_pending_changes_after_every_event() {
     let (pool, db_name) = setup_test_db().await;
@@ -204,8 +188,6 @@ async fn the_proposal_columns_equal_the_pending_changes_after_every_event() {
     teardown_test_db(&db_name).await;
 }
 
-/// I6 and I8: each event moves the change state as the plan's table says, and
-/// the reason never outlives `unproposed`. Only `ProposalWithheld` sets it.
 #[tokio::test]
 async fn each_event_moves_the_change_state_and_the_reason_follows_it() {
     let (pool, db_name) = setup_test_db().await;
@@ -306,7 +288,6 @@ async fn each_event_moves_the_change_state_and_the_reason_follows_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// Apply and Discard clear withheld work along with its reason.
 #[tokio::test]
 async fn apply_and_discard_clear_withheld_work_and_its_reason() {
     let (pool, db_name) = setup_test_db().await;
@@ -337,9 +318,6 @@ async fn apply_and_discard_clear_withheld_work_and_its_reason() {
     teardown_test_db(&db_name).await;
 }
 
-/// Two pending changes on one thread: resolving one leaves the proposal up,
-/// carrying the survivor's restart flag. `ChangeApplied` used to clear both
-/// columns outright.
 #[tokio::test]
 async fn resolving_one_of_two_pending_changes_keeps_the_proposal() {
     let (pool, db_name) = setup_test_db().await;
@@ -388,8 +366,6 @@ async fn resolving_one_of_two_pending_changes_keeps_the_proposal() {
     teardown_test_db(&db_name).await;
 }
 
-/// A legacy per-commit `ChangeProposed` updates the pending row by branch. It
-/// used to leave the thread's restart flag behind the row's.
 #[tokio::test]
 async fn a_legacy_per_commit_proposal_moves_the_restart_flag_with_the_row() {
     let (pool, db_name) = setup_test_db().await;
@@ -420,9 +396,6 @@ async fn a_legacy_per_commit_proposal_moves_the_restart_flag_with_the_row() {
     teardown_test_db(&db_name).await;
 }
 
-/// A `changes` row lost and then rebuilt from its events brings the thread's
-/// proposal back with it. `rebuild_missing_from_events` used to recreate the
-/// row and leave the flag down.
 #[tokio::test]
 async fn a_change_rebuilt_from_events_raises_the_proposal_again() {
     let (pool, db_name) = setup_test_db().await;
@@ -439,7 +412,6 @@ async fn a_change_rebuilt_from_events_raises_the_proposal_again() {
     .await
     .unwrap();
 
-    // Lose the row, and let the cache follow the loss.
     sqlx::query("DELETE FROM changes WHERE id = $1")
         .bind(change_id)
         .execute(&pool)
@@ -461,9 +433,6 @@ async fn a_change_rebuilt_from_events_raises_the_proposal_again() {
     teardown_test_db(&db_name).await;
 }
 
-/// I12: the migration maps every combination of the three old booleans and
-/// the restart flag onto the one state. It runs here in a scratch schema
-/// holding the old columns, since the test database is already migrated.
 #[tokio::test]
 async fn the_change_state_migration_backfills_every_old_combination() {
     let (pool, db_name) = setup_test_db().await;

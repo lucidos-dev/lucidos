@@ -1,4 +1,3 @@
-//! Exercise the real process sink, macro wrappers, panic hook and fd-2 tee.
 use lucidos_diagnostic_log::{writer::Record, Destination};
 use std::process::Command;
 

@@ -1,16 +1,3 @@
-//! The inputs a coding-agent session forwarded to its agent that the agent has
-//! not read yet. See ADR 0268.
-//!
-//! An input is owed from the moment the run loop forwards it until the agent
-//! names it: read with `AgentEvent::InputRead`, or rejected with
-//! `AgentEvent::InputRejected`. A `Result` settles nothing. Claude Code runs an
-//! input that arrived after the turn's last tool call as a second turn, after
-//! the first turn's `Result`.
-//!
-//! An input can carry a completion sender. A read moves it to the turn that
-//! read it, and that turn's end answers it. So a caller waiting on its own
-//! prompt is never answered by a turn that was already running.
-
 use std::collections::{HashSet, VecDeque};
 
 use uuid::Uuid;
@@ -22,55 +9,35 @@ use crate::engine::InputAnswered;
 use crate::runtime::agent_runtime::forwards_verbatim;
 use crate::runtime::{AgentEvent, AgentInput};
 
-/// Owed inputs, oldest first.
 #[derive(Debug, Default)]
 pub(crate) struct InputLedger {
     unread: VecDeque<OwedInput>,
-    /// Every event this session forwarded, read or not. A withdraw for any
-    /// other input asks the store, since only a dead process could hold it.
     forwarded_here: HashSet<Uuid>,
-    /// Inputs the agent dropped whose `QueuedMessageRemoved` is not recorded
-    /// yet, by event id. A retry records it without asking the agent again.
     awaiting_tombstone: HashSet<Uuid>,
-    /// Completions of the inputs the current turn read, answered at its end.
     read_this_turn: Vec<InputCompletion>,
 }
 
 type InputCompletion = tokio::sync::oneshot::Sender<InputAnswered>;
 
-/// One event of an input the agent read.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReadInput {
     pub event_id: Uuid,
-    /// The input went verbatim (see [`forwards_verbatim`]), so it carried no
-    /// turn-gap note.
     pub verbatim: bool,
 }
 
-/// One write to the agent.
 #[derive(Debug)]
 struct OwedInput {
-    /// The events that carried it: its origin, or for an engine prompt with
-    /// none its `CodingAgentPromptSent`. Several for coalesced messages, and
-    /// none when no event was written.
     event_ids: Vec<Uuid>,
-    /// [`AgentInput::uuid`], the name the agent reads it by and a withdraw uses.
     uuid: Uuid,
-    /// Whether it went verbatim. The text the agent was sent decides it, so
-    /// the flag on its read cannot disagree with it.
     verbatim: bool,
     completion: Option<InputCompletion>,
-    /// The report, when this write is a child's report alone.
     child_report: Option<ChildReport>,
 }
 
-/// What one agent event settled.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Settled {
     Nothing,
-    /// The agent read an owed input, carried by these events.
     Read(Vec<ReadInput>),
-    /// The agent rejected an owed input. Nobody will ever read it.
     Rejected,
 }
 
@@ -79,9 +46,6 @@ impl InputLedger {
         Self::default()
     }
 
-    /// The run loop handed `input` to the agent. `input_event_ids` are the
-    /// events that carried it, such as its `MessageReceived`. `completion` is
-    /// answered when the turn that reads it ends.
     pub(crate) fn forwarded(
         &mut self,
         input_event_ids: Vec<Uuid>,
@@ -91,8 +55,6 @@ impl InputLedger {
         self.push(input_event_ids, input, completion, None);
     }
 
-    /// The run loop handed the agent a child's report, carried by `card_id`.
-    /// `text` is the report as the agent would read it.
     pub(crate) fn forwarded_child_report(
         &mut self,
         card_id: Uuid,
@@ -125,8 +87,6 @@ impl InputLedger {
         });
     }
 
-    /// The child reports the agent has not read, oldest first. Each one may
-    /// still be taken mid-turn.
     pub(crate) fn child_reports(&self) -> Vec<ChildReport> {
         self.unread
             .iter()
@@ -134,7 +94,6 @@ impl InputLedger {
             .collect()
     }
 
-    /// How many child reports the agent has not read.
     pub(crate) fn owed_child_reports(&self) -> usize {
         self.unread
             .iter()
@@ -142,16 +101,11 @@ impl InputLedger {
             .count()
     }
 
-    /// The agent took the report `card_id` carried. Nothing owes it now, and
-    /// no tombstone follows: the agent read it.
     pub(crate) fn child_report_taken(&mut self, card_id: Uuid) {
         self.unread
             .retain(|input| input.child_report.is_none() || input.event_ids != [card_id]);
     }
 
-    /// The uuid the agent knows `input_event_id`'s message by, while it is owed
-    /// and its write carried that message alone. A coalesced write cannot be
-    /// taken back one message at a time.
     pub(crate) fn withdrawable(&self, input_event_id: Uuid) -> Option<Uuid> {
         self.unread
             .iter()
@@ -159,26 +113,20 @@ impl InputLedger {
             .map(|input| input.uuid)
     }
 
-    /// Whether the agent has yet to read or reject the input named `uuid`.
     pub(crate) fn owes(&self, uuid: Uuid) -> bool {
         self.unread.iter().any(|owed| owed.uuid == uuid)
     }
 
-    /// Whether this session forwarded `input_event_id`'s input to its agent.
     pub(crate) fn forwarded_here(&self, input_event_id: Uuid) -> bool {
         self.forwarded_here.contains(&input_event_id)
     }
 
-    /// The agent dropped the input carrying `input_event_id`. It will never be
-    /// read, so nothing owes it now but its tombstone.
     pub(crate) fn withdrawn(&mut self, input_event_id: Uuid) {
         self.unread
             .retain(|input| input.event_ids != [input_event_id]);
         self.awaiting_tombstone.insert(input_event_id);
     }
 
-    /// Whether the agent dropped `input_event_id`'s input and its tombstone is
-    /// still unrecorded.
     pub(crate) fn awaits_tombstone(&self, input_event_id: Uuid) -> bool {
         self.awaiting_tombstone.contains(&input_event_id)
     }
@@ -187,8 +135,6 @@ impl InputLedger {
         self.awaiting_tombstone.remove(&input_event_id);
     }
 
-    /// Account for one agent event. Only an event naming an owed input's uuid
-    /// settles it, so a replay of Claude Code's own output reads nothing.
     pub(crate) fn observe(&mut self, event: &AgentEvent) -> Settled {
         let (named, read) = match event {
             AgentEvent::InputRead { input } => (input, true),
@@ -201,7 +147,6 @@ impl InputLedger {
         };
         if !read {
             if let Some(completion) = settled.completion {
-                // A caller that stopped waiting dropped its receiver.
                 let _ = completion.send(InputAnswered::Rejected);
             }
             return Settled::Rejected;
@@ -217,7 +162,6 @@ impl InputLedger {
         )
     }
 
-    /// The current turn reached its `Result`. Answers every input it read.
     pub(crate) fn turn_ended(&mut self) {
         for completion in self.read_this_turn.drain(..) {
             let _ = completion.send(InputAnswered::TurnEnded);
@@ -229,8 +173,6 @@ impl InputLedger {
     }
 }
 
-/// Record each input the agent read, so the transcript can mark it "Read".
-/// `started_turn` says the read opened a turn after the last one ended.
 pub(crate) async fn announce_reads(
     bus: &EventBus,
     thread_id: Uuid,

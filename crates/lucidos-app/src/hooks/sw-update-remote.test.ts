@@ -10,12 +10,12 @@ import { getServedBuildId, refreshClient } from './sw-update';
 
 afterEach(() => vi.unstubAllGlobals());
 
-it('checks A installed generation even when remote workers are unavailable', async () => {
+it('reads only the remote route shell when service workers are unavailable', async () => {
   vi.stubGlobal('navigator', {});
-  const fetch = vi.fn(async () => ({ ok: true, text: async () => "const BUILD_ID = 'trusted-a-build';" }));
+  const fetch = vi.fn(async () => new Response('<meta name="lucidos-build-id" content="peer-build">'));
   vi.stubGlobal('fetch', fetch);
-  expect(await getServedBuildId()).toBe('trusted-a-build');
-  expect(fetch).toHaveBeenCalledWith('/~/sw.js', { cache: 'no-store' });
+  expect(await getServedBuildId()).toBe('peer-build');
+  expect(fetch).toHaveBeenCalledExactlyOnceWith('/work@peer/', { cache: 'no-store', headers: { Accept: 'text/html' } });
 });
 
 it('refreshes a remote client without touching a foreign registration or shared caches', () => {

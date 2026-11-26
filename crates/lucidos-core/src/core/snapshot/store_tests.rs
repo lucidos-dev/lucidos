@@ -19,7 +19,6 @@ fn populated(store: &Store, key: &SecretKey) -> Manifest {
         bytes: files.bytes,
         tree_sha256: files.tree_sha256,
     };
-    // Unit tests cover publication/index integrity independently of PostgreSQL.
     std::fs::write(partial.join("db.dump"), b"synthetic dump").unwrap();
     for component in &mut manifest.components {
         (component.bytes, component.sha256) =
@@ -318,8 +317,6 @@ fn status_store_resolution_never_initializes_an_unused_registry() {
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
-/// A settled restore's staging trees go, but nothing a journal could name
-/// outside this store's own staging, and nothing an open restore still holds.
 #[test]
 fn settled_restore_staging_is_discarded_and_nothing_else() {
     use super::super::{

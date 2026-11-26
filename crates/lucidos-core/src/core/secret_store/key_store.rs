@@ -1,4 +1,4 @@
-//! Engine compatibility facade; unit tests never resolve production keys.
+//! INVARIANT: Engine compatibility facade; unit tests never resolve production keys.
 
 pub use lucidos_secret_store::key_store::*;
 
@@ -19,8 +19,6 @@ pub fn resolve() -> Result<Box<dyn KeyStore>, BoxError> {
 #[cfg(all(not(test), feature = "test-support"))]
 static USE_TEST_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Install the same fixed key as the engine unit-test harness. Integration
-/// binaries keep their normal store unless a fixture explicitly calls this.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn install_test_key_store() {
@@ -30,7 +28,6 @@ pub fn install_test_key_store() {
     USE_TEST_STORE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Answers every `get` with the shared unit-test key and stores nothing.
 #[cfg(any(test, feature = "test-support"))]
 pub struct TestKeyStore;
 

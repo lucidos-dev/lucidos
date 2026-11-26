@@ -1,5 +1,3 @@
-//! One-shot snapshot commands invoked by the gateway.
-
 use lucidos_core::core::snapshot::offline;
 
 pub use offline::Arguments;

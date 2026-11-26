@@ -1,15 +1,3 @@
-//! `POST /api/v1/voice/ticket`: the one-shot *call ticket* a voice socket
-//! presents.
-//!
-//! A browser sends no `Referer` on a socket handshake, so the upgrade alone
-//! cannot tell the shell from an app page on the same origin. The mint is a
-//! plain `fetch`, which carries one. So the mint runs the strict origin rule
-//! and every refusal a caller can act on. The upgrade only redeems what the
-//! mint issued (ADR 0598).
-//!
-//! A ticket binds one device to one thread, lives [`TICKET_TTL`], and spends
-//! once. It is kept in memory like a reveal token: a restart costs one retry.
-
 use crate::voice::QUERY_CALL_TICKET;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,12 +15,8 @@ use super::secret_reveal::{reveal_request_allowed, RefererRule};
 use super::AppState;
 use crate::engine::thread_events::MessageOrigin;
 
-/// How long a minted ticket stays usable. Long enough for the client to dial
-/// once the microphone is open, short enough that a leaked one is worthless.
 const TICKET_TTL: Duration = Duration::from_secs(30);
 
-/// What a mint refused on origin grounds is told. The caller may be the owner
-/// on a paired device whose browser withholds the page address.
 pub(super) const NOT_FROM_THE_SHELL: &str =
     "A call starts from the Lucidos page itself, never from an app \
      page. This request named an app page, or no page at all. If this is Lucidos, the browser \
@@ -45,7 +29,6 @@ struct CallTicket {
     generation: Option<Uuid>,
 }
 
-/// The live call tickets, keyed by ticket.
 #[derive(Clone, Default)]
 pub struct CallTickets {
     inner: Arc<Mutex<HashMap<String, CallTicket>>>,
@@ -56,10 +39,6 @@ impl CallTickets {
         Self::default()
     }
 
-    /// Mint a ticket that lets `device_id` call `thread_id`, once.
-    ///
-    /// Expired entries go on the way through, so unused tickets cannot
-    /// accumulate. A poisoned mutex answers `None` rather than panicking.
     pub(super) fn mint(
         &self,
         device_id: &str,
@@ -82,10 +61,6 @@ impl CallTickets {
         Some(ticket)
     }
 
-    /// The device a live ticket was minted by, without spending it.
-    ///
-    /// `api::mutating_gate` asks this to name an upgrade that carries no
-    /// device header. The handler then redeems.
     pub(super) fn peek_device(&self, ticket: &str, generation: Option<Uuid>) -> Option<String> {
         let guard = self.inner.lock().ok()?;
         guard
@@ -94,11 +69,6 @@ impl CallTickets {
             .map(|t| t.device_id.clone())
     }
 
-    /// Spend `ticket` on `thread_id`, answering the device it binds.
-    ///
-    /// The entry goes whichever way this lands. A ticket presented on the
-    /// wrong thread has been mishandled, and a second try is not a case to
-    /// support.
     pub(super) fn redeem(
         &self,
         ticket: &str,
@@ -113,7 +83,6 @@ impl CallTickets {
     }
 }
 
-/// The ticket an upgrade URI carries, if any.
 pub(super) fn ticket_in(uri: &Uri) -> Option<String> {
     let axum::extract::Query(mut query) =
         axum::extract::Query::<HashMap<String, String>>::try_from_uri(uri).ok()?;
@@ -151,7 +120,6 @@ async fn mint_call_ticket(
     }))
 }
 
-/// The mint, apart from its extractors so the tests can drive it.
 pub(super) async fn mint(
     pool: &sqlx::PgPool,
     event_bus: &crate::engine::event_bus::EventBus,
@@ -160,7 +128,7 @@ pub(super) async fn mint(
     headers: &HeaderMap,
     thread_id: Uuid,
 ) -> Result<String, ApiError> {
-    // The strict rule: a browser-shaped mint must name the page it came from,
+    // INVARIANT: The strict rule: a browser-shaped mint must name the page it came from,
     // and that page must not be an app. A `POST` passes the service worker
     // untouched, so the shell's own `Referer` always arrives.
     if !reveal_request_allowed(headers, RefererRule::Required) {
@@ -205,8 +173,6 @@ mod tests {
         );
     }
 
-    /// A ticket presented on another thread is spent by the attempt, so it
-    /// cannot then open the thread it was minted for.
     #[test]
     fn a_ticket_on_another_thread_is_refused_and_spent() {
         let tickets = CallTickets::new();

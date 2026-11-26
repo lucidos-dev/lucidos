@@ -97,6 +97,8 @@ The Lucidos tile, the Claude logo and the Codex logo, on the chat's actor chips 
 | `--lucidos-mark-fg` | The three squares and the spark on the Lucidos tile. |  |
 | `--claude-mark` | The Claude logo on the chat's actor chips and in navigation history. Follows --initiator-coding-agent by default. |  |
 | `--codex-mark` | The Codex logo's fill. Follows the primary text colour by default. |  |
+| `--agent-icon-theme` | Every agent icon in the drawer, the thread pane and navigation history when Agent icon colors is Theme. Follows the accent colour by default. |  |
+| `--agent-icon-muted` | Every agent icon in the drawer, the thread pane and navigation history when Agent icon colors is Muted. Follows the muted text colour by default. |  |
 
 ### Status
 

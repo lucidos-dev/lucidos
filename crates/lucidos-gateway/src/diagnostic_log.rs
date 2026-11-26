@@ -1,5 +1,3 @@
-//! This gateway's sanitized diagnostic sink. It never reads a host log or links
-//! the engine; the caller supplies the gateway's resolved private data dir.
 use axum::extract::{RawQuery, State};
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -110,8 +108,6 @@ pub fn start(app_data: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-// The gateway owns this policy independently of the engine's subprocess env.
-// Paths are configuration, while opaque credential values must be registered.
 fn secret_env_name(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     if matches!(
@@ -141,7 +137,6 @@ fn secret_env_name(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
-/// Register before returning a freshly minted or loaded credential to a caller.
 pub fn secret(value: String) -> String {
     shared::sanitize::register_secret_values([value.clone()]);
     value
@@ -158,24 +153,18 @@ pub fn legacy(message: String) {
 }
 
 pub fn boot_failure(message: &str) {
-    // Keep the exact marker the desktop shell parses, including raw host text.
     shared::record(
         "Gateway",
         shared::line!("boot failed: {}", shared::private(message)),
     );
     shared::flush(std::time::Duration::from_secs(1));
-    // The process may exit immediately: write to the saved host descriptor
-    // synchronously rather than queue the shell's boot marker through the tee.
     shared::stderr::host_error(message);
 }
 
-// Metadata probes are user-facing machine-readable stdout, deliberately outside
-// diagnostics. They return before the sink starts or any data directory opens.
 pub fn probe(value: std::fmt::Arguments<'_>) {
     output::probe(value);
 }
 
-// Test skip notices retain their original stderr text, outside the sink.
 #[cfg(test)]
 pub fn test_notice(value: std::fmt::Arguments<'_>) {
     shared::stderr::host_error(&value.to_string());
@@ -355,7 +344,11 @@ mod query_tests {
 
         let pairings = state.paired_gateways();
         let secret = pairings
-            .mint_secret(None, false, crate::pairing::Minter::LocalProcess)
+            .mint_secret(
+                None,
+                Default::default(),
+                crate::pairing::Minter::LocalProcess,
+            )
             .unwrap();
         let crate::gateway_protocol::GatewayRedemption::Paired { pairing_id, .. } = pairings
             .redeem(&secret, None, crate::pairing::OwnerGate::NoDevicePaired)

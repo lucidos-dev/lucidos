@@ -1,32 +1,15 @@
-//! The *widget embed* grammar (ADR 0415): `![label](app:<id>?params={...})`
-//! in markdown draws a widget wherever a picture draws.
-//!
-//! This is the Rust definition; the frontend's `utils/widgetEmbed.ts` is the
-//! TypeScript one. Both read `widget_embeds.fixture.json`, so an embed the
-//! engine accepts is one the frontend draws, and the reverse.
-//!
-//! The params are a JSON object, written raw or percent-encoded. Raw JSON may
-//! hold spaces and `)`, which a markdown link cannot, so this scans the text
-//! itself rather than trusting a markdown parser.
-
 use crate::engine::thread_events::WidgetParams;
 
 pub use crate::engine::thread_events::WidgetEmbed;
 
-/// The text that opens an embed's link: the image form with an `app:` URL.
 const OPEN: &str = "](app:";
 
-/// One embed found in markdown: where it sits, and what it says.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbedMatch {
-    /// Byte range of the whole `![…](app:…)` in the scanned text.
     pub range: std::ops::Range<usize>,
-    /// The embed, or why its syntax is broken.
     pub embed: Result<WidgetEmbed, String>,
 }
 
-/// Every embed in `text`, in order. An `app:` image whose id or params do not
-/// parse is still a match, carrying the reason, so a caller can refuse it.
 pub fn scan(text: &str) -> Vec<EmbedMatch> {
     let code = code_ranges(text);
     let mut found = Vec::new();
@@ -64,10 +47,6 @@ pub fn scan(text: &str) -> Vec<EmbedMatch> {
     found
 }
 
-/// The byte ranges of code in `text`: a run of backticks up to the next run
-/// of the same length, so an inline span and a fenced block alike. An embed
-/// inside code is an example, not an embed, as markdown draws no picture
-/// there. An unclosed run is not code.
 fn code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     let bytes = text.as_bytes();
     let run_at = |i: usize| bytes[i..].iter().take_while(|&&b| b == b'`').count();
@@ -104,17 +83,12 @@ fn code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
-/// Where the `![` before an `](app:` begins, if the label between them is a
-/// single line with no `]`.
 fn label_start(text: &str, open: usize) -> Option<usize> {
     let start = text[..open].rfind("![")?;
     let label = &text[start + 2..open];
     (!label.contains(']') && !label.contains('\n')).then_some(start)
 }
 
-/// Parse `<id>[?params=<json>])` after the `app:`. Returns the length up to
-/// and including the closing `)`. A failure still reports a length, so the
-/// scan moves past the broken embed.
 fn parse_target(rest: &str) -> Result<(usize, String, Option<WidgetParams>), (usize, String)> {
     let id_len = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
@@ -193,8 +167,6 @@ fn parse_target(rest: &str) -> Result<(usize, String, Option<WidgetParams>), (us
     ))
 }
 
-/// The length of the JSON object at the start of `s`, string-aware, or `None`
-/// when it never closes.
 fn balanced_object_len(s: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_string = false;
@@ -241,8 +213,6 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// `text` with the embeds in `matches` cut out and the ends trimmed. `None`
-/// when nothing else is left.
 pub fn without_embeds(text: &str, matches: &[EmbedMatch]) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
@@ -259,7 +229,6 @@ pub fn without_embeds(text: &str, matches: &[EmbedMatch]) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The shared fixture: the TypeScript definition reads the same file.
     #[test]
     fn the_shared_fixture_parses_as_written() {
         let raw = include_str!("widget_embeds.fixture.json");

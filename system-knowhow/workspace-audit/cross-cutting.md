@@ -32,6 +32,10 @@ scan retired-work-items "lucidos\.workItems|/api/v1/work-items" $all
   controls these rules. Flag recipes editing the mirror file as **broken**.
   See the *standing deny* entry in `system-knowhow/glossary.md`.
 
+- **A guard verification failure mistaken for a standing deny.** The hook
+  reports when it cannot verify standing denies. Check listener readiness
+  before treating that refusal as a stored permission rule.
+
 - **Apply mistaken for a live version.** Check version claims against `system-knowhow/glossary/core-terms-15.md` § Build deferral.
   Flag recipes claiming a held version is running as **stale**.
 
@@ -39,6 +43,10 @@ scan retired-work-items "lucidos\.workItems|/api/v1/work-items" $all
 - **Pairing mistaken for agent return authority.** An outgoing pairing alone never grants the peer access through its caller.
   Check routed recipes against `system-knowhow/lucidos-cli/waiting-through-an-engine-restart.md` § `lucidos workspaces targets` and `system-knowhow/remote-access/settings-access-2.md` § Agent return access.
   Flag credential copying, inferred return grants or remote child callbacks as **broken**.
+
+- **Pairing mistaken for workspace control.** A paired gateway acts on this gateway's workspaces only while its control grant is on.
+  Check recipes against `system-knowhow/remote-access/settings-access-2.md` § Control a remote gateway's workspaces.
+  Flag recipes that pass `lucidos pair --gateway --control` unasked, or expect a remote delete or rename, as **broken**.
 
 - **Direct spawns assumed to verify the calling workspace.** Check recipes against `system-knowhow/lucidos-cli/subcommands-4.md` § `lucidos spawn-thread`.
   Pair gateways to check future calls; retrying the same direct spawn does not establish its identity.
@@ -94,6 +102,9 @@ scan retired-work-items "lucidos\.workItems|/api/v1/work-items" $all
 - **Event query boundaries treated as inclusive.** CLI `events query` and `events count` use exclusive `since` and `until` bounds.
   Audit inventory windows against that contract before asserting event parity.
 
+- **Deferred labs counted as measurements.** Check `status` before comparing lab results.
+  Match host fingerprints and scenario settings using `system-knowhow/lucidos-cli/scoreboard-lab-results`.
+
 - **Restored billing matched across process boundaries.** Check against `system-knowhow/coding-agent-events/billing-evidence.md` § Billing evidence.
   Codex restored usage needs the latest prior main-session capture, an exact token vector and that process's persisted backend-session binding.
   Missing evidence stays unknown; a broader history search cannot supply it.
@@ -109,6 +120,7 @@ scan retired-work-items "lucidos\.workItems|/api/v1/work-items" $all
 
 - **Thread verdicts from history.** Read current `liveness` before calling a thread stalled, failed or done.
   Use the thread-scoped events header or a thread list/search row; see `system-knowhow/glossary/core-terms-10.md` § Thread liveness.
+  Flag recipes that count a held thread as waiting on the owner because its turn status still shows an open question.
 
 - **Red main mistaken for a check stop.** Checks continue while red; continued failures retain one repair owner.
   Check automation against the main repair contract in `system-knowhow/glossary.md`.

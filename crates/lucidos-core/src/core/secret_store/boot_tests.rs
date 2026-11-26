@@ -5,8 +5,6 @@ use crate::core::secret_store::{
 };
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// A database seeded with plain rows the way a pre-ADR-0509 workspace holds
-/// them.
 async fn plain_database() -> (PgPool, String) {
     let (pool, db_name) = setup_test_db().await;
     seed_before_sealing(
@@ -22,8 +20,6 @@ async fn plain_database() -> (PgPool, String) {
     (pool, db_name)
 }
 
-/// Run `statements` with the migration's CHECKs dropped, then put them back
-/// `NOT VALID`, which is the state the migration leaves an old database in.
 async fn seed_before_sealing(pool: &PgPool, statements: &[&str]) {
     let mut checks = Vec::new();
     for column in SECRET_COLUMNS {
@@ -110,7 +106,6 @@ async fn first_boot_mints_a_key_seals_every_plain_value_and_validates() {
         assert!(validated, "{} still NOT VALID", column.constraint());
     }
 
-    // A second boot is a no-op that keeps the key and the values.
     assert_eq!(ready(boot(&pool, &db_name, &store).await.unwrap()), key);
     assert_eq!(stored_auth_value(&pool).await, stored);
 
@@ -281,7 +276,6 @@ async fn discard_removes_only_what_the_key_cannot_open_then_boot_succeeds() {
     let (_dir, lost) = store();
     ready(boot(&pool, &db_name, &lost).await.unwrap());
 
-    // One value the surviving key can open, beside the lost key's values.
     let (_dir2, fresh) = store();
     let kept = SecretKey::generate();
     fresh.put(&db_name, &kept).unwrap();

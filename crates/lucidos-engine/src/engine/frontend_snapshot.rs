@@ -125,14 +125,10 @@ pub(crate) fn remove_snapshot_dir(dir: &Path) {
     }
 }
 
-/// The stamped `BUILD_ID` in `<dir>/sw.js`, or `None` if `sw.js` is missing /
-/// unstamped (the `__…__` dev placeholder is returned as-is; the caller treats a
-/// placeholder like any other value). Mirrors the frontend's `SW_BUILD_ID_RE`
-/// (`hooks/sw-update.ts`): `const BUILD_ID = '<hex>';`.
+/// Reads the build ID from `<dir>/sw.js` for snapshot selection.
+/// Returns the dev placeholder as-is and returns `None` for a missing stamp.
 pub(crate) fn read_build_id(dir: &Path) -> Option<String> {
     let sw = std::fs::read_to_string(dir.join("sw.js")).ok()?;
-    // `BUILD_ID = '<value>'` / `"<value>"`. Small hand-parse via split_once — no
-    // regex dep and no byte-index slicing (CLAUDE.md). Mirrors SW_BUILD_ID_RE.
     let after_eq = sw.split_once("BUILD_ID")?.1.split_once('=')?.1.trim_start();
     let mut chars = after_eq.chars();
     let quote = chars.next()?;

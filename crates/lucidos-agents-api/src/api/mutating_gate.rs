@@ -1,24 +1,3 @@
-//! Refuse a mutating request that said nothing about who is making it.
-//!
-//! Full design: `docs/plans/2026-08-30-a-thread-acts-in-its-own-subtree.md`
-//! § Phase 2b. The rule is ADR 0169: a caller presenting no credential is
-//! refused, never stamped as the user.
-//!
-//! # Why a layer and not seventy-seven handler edits
-//!
-//! The same reason [`crate::api::target_workspace`] is a layer. A write nobody
-//! can be attributed to is a hazard on every mutating endpoint, and a
-//! per-handler check is one the next endpoint can forget. Four routes drifted
-//! apart exactly that way before ADR 0083.
-//!
-//! The measured shape settled it. 77 handlers resolve an actor and refuse
-//! nobody, across 30 distinct return types, 33 of them infallible. A refusal
-//! rendered in each would be 33 signature changes before the first gate.
-//!
-//! Each exempt route is one a legitimate caller CANNOT identify itself on,
-//! never one that merely forgot to. [`is_exempt`] carries the list and the
-//! reason per entry.
-
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::Method;
 use axum::middleware::Next;
@@ -26,10 +5,6 @@ use axum::response::{IntoResponse, Response};
 
 use super::AppState;
 
-/// Does this method write?
-///
-/// GET and HEAD are reads, and OPTIONS is the CORS preflight, which carries no
-/// credential by design. Everything else changes something and owes a name.
 pub(super) fn method_mutates(method: &Method) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
@@ -40,7 +15,7 @@ pub(super) fn mounted_route(matched: &str) -> &str {
         .unwrap_or(matched)
 }
 
-/// Routes that must answer a caller holding none of the four credentials.
+/// INVARIANT: Routes that must answer a caller holding none of the four credentials.
 ///
 /// Matched on the ROUTE, never the request URI, so `/webhooks/:id/deliver` is
 /// one entry rather than a prefix comparison a real path could slip past. Four
@@ -61,43 +36,33 @@ pub(super) fn mounted_route(matched: &str) -> &str {
 /// `POST /device-presence` looks like that last class and is NOT here. Its
 /// caller is the page, so it was taught the header instead.
 pub(super) const EXEMPT_ROUTES: &[&str] = &[
-    // Identity in the body.
     "/chat/stream",
     "/threads/:thread_id/follow-up",
-    // Operation-bound gateway identity is verified from the body before dispatch.
     lucidos_gateway_stamp::workspace_operation::RECEIVE_ROUTE,
     lucidos_gateway_stamp::workspace_operation::RECEIVE_START_ROUTE,
-    // The device bootstrap.
     "/devices/register",
     "/devices/hand-over",
-    // Diagnostic ingress authenticates a purpose/body-bound starter stamp itself.
     "/diagnostic-bundles",
-    // Third-party ingress.
     "/webhooks/:id/deliver",
     "/proxy/:name",
     "/proxy/:name/",
     "/proxy/:name/*path",
-    // Worker callers, which cannot reach a device id.
     "/internal/client-log",
     "/internal/client-logs",
     "/presence-pong",
     "/notification/read",
 ];
 
-/// Is `route` on [`EXEMPT_ROUTES`]?
 fn is_exempt(route: &str) -> bool {
     EXEMPT_ROUTES.contains(&route)
 }
 
 pub(super) const MUTATING_SOCKET_ROUTES: &[&str] = &["/voice"];
 
-/// Does a request to `route` change something?
 pub(super) fn request_mutates(method: &Method, route: &str) -> bool {
     method_mutates(method) || MUTATING_SOCKET_ROUTES.contains(&route)
 }
 
-/// Refuse a mutating request to `matched` that names nobody. `Ok` for a read,
-/// an exempt route, and the fallback (`matched` is `None`).
 async fn refuse_unidentified(
     pool: &sqlx::PgPool,
     tickets: &super::voice_ticket::CallTickets,
@@ -139,7 +104,7 @@ async fn refuse_unidentified(
     Ok(())
 }
 
-/// Refuse a mutating request carrying no identity, before it reaches a handler.
+/// INVARIANT: Refuse a mutating request carrying no identity, before it reaches a handler.
 ///
 /// Layered inside [`crate::api::target_workspace::enforce_target_workspace`], so
 /// a mis-aimed write still gets the 409 naming the right engine rather than a

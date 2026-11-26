@@ -1,6 +1,5 @@
 use super::*;
 
-// 16. running_status_maps_to_current
 #[test]
 fn running_status_maps_to_current() {
     assert_eq!(
@@ -17,7 +16,6 @@ fn running_status_maps_to_current() {
     );
 }
 
-// 17. inbox_maps_to_current
 #[test]
 fn inbox_maps_to_current() {
     assert_eq!(
@@ -34,7 +32,6 @@ fn inbox_maps_to_current() {
     );
 }
 
-// 18. saved_default_idle_maps_to_saved
 #[test]
 fn saved_default_idle_maps_to_saved() {
     assert_eq!(
@@ -51,7 +48,6 @@ fn saved_default_idle_maps_to_saved() {
     );
 }
 
-// 19. saved_overrides_running — under the new routing saved wins everything
 #[test]
 fn saved_overrides_running_to_saved() {
     assert_eq!(
@@ -68,7 +64,6 @@ fn saved_overrides_running_to_saved() {
     );
 }
 
-// 20. archived_idle_not_saved_maps_to_archive
 #[test]
 fn archived_idle_not_saved_maps_to_archive() {
     assert_eq!(
@@ -85,7 +80,6 @@ fn archived_idle_not_saved_maps_to_archive() {
     );
 }
 
-// 21. active_children_idle_maps_to_current — running/waiting/delegated child work all surface in Current
 #[test]
 fn active_children_idle_maps_to_current() {
     assert_eq!(
@@ -102,7 +96,6 @@ fn active_children_idle_maps_to_current() {
     );
 }
 
-// 22. active_children_saved_still_saved — save overrides delegated work
 #[test]
 fn active_children_saved_still_saved() {
     assert_eq!(
@@ -119,7 +112,6 @@ fn active_children_saved_still_saved() {
     );
 }
 
-// 22a. running_with_active_children_stays_current
 #[test]
 fn running_with_active_children_stays_current() {
     assert_eq!(
@@ -136,7 +128,6 @@ fn running_with_active_children_stays_current() {
     );
 }
 
-// 22b. inbox_with_active_children_maps_to_current
 #[test]
 fn inbox_with_active_children_maps_to_current() {
     assert_eq!(
@@ -153,7 +144,6 @@ fn inbox_with_active_children_maps_to_current() {
     );
 }
 
-// 22c. inbox_idle_no_children_maps_to_current
 #[test]
 fn inbox_idle_no_children_maps_to_current() {
     assert_eq!(
@@ -170,10 +160,6 @@ fn inbox_idle_no_children_maps_to_current() {
     );
 }
 
-// 22d. archived_with_pending_changes_routes_to_current — pending changes
-//      outrank archive so users can never lose unresolved work behind the
-//      archive curtain. Once the user resolves all pending changes, the
-//      thread settles into Archive (covered by 20).
 #[test]
 fn archived_with_pending_changes_routes_to_current() {
     assert_eq!(
@@ -190,9 +176,6 @@ fn archived_with_pending_changes_routes_to_current() {
     );
 }
 
-// 22e. saved_overrides_pending — saving is still the strongest claim;
-//      a pending change on a saved thread surfaces via the Saved section's
-//      CTA badge, not by overriding routing.
 #[test]
 fn saved_overrides_pending() {
     assert_eq!(
@@ -209,8 +192,6 @@ fn saved_overrides_pending() {
     );
 }
 
-// 22f. running_overrides_pending — running keeps it in Current so live work isn't masked
-//      by a pending change row carried in from a previous turn.
 #[test]
 fn running_overrides_pending() {
     assert_eq!(
@@ -227,11 +208,6 @@ fn running_overrides_pending() {
     );
 }
 
-// 22g. attention_descendant_overrides_active — attention-bubble rule: if any
-//      descendant needs user attention (WFUA, or CC with pending changes),
-//      the parent surfaces in Current even when sibling work is still running
-//      locally OR via has_active_children. Otherwise the permission card
-//      would only be reachable via the child's own row.
 #[test]
 fn attention_descendant_overrides_active() {
     assert_eq!(
@@ -239,18 +215,15 @@ fn attention_descendant_overrides_active() {
             ArchiveState::Inbox,
             ThreadStatus::Idle,
             false,
-            true, // has_active_children
+            true,
             false,
-            true, // has_attention_descendants,
+            true,
             false
         ),
         DisplaySection::Current
     );
 }
 
-// 22h. attention_descendant_overrides_running — even when the thread is
-//      mid-turn (Running), an attention-needing descendant still bubbles
-//      to Current. Symmetric with 22g via the local-Running route.
 #[test]
 fn attention_descendant_overrides_running() {
     assert_eq!(
@@ -267,10 +240,6 @@ fn attention_descendant_overrides_running() {
     );
 }
 
-// 22i. attention_descendant_overrides_archive — same archive-curtain rule
-//      as has_pending_changes: a thread the user archived must still
-//      surface in Current while a descendant needs attention, so the
-//      attention card isn't lost behind the curtain.
 #[test]
 fn attention_descendant_overrides_archive() {
     assert_eq!(
@@ -287,16 +256,13 @@ fn attention_descendant_overrides_archive() {
     );
 }
 
-// 22j. attention_descendant_loses_to_saved — Saved still wins. The
-//      attention card surfaces via the saved section's CTA, not by
-//      overriding routing.
 #[test]
 fn attention_descendant_loses_to_saved() {
     assert_eq!(
         display_section(
             ArchiveState::Inbox,
             ThreadStatus::Idle,
-            true, // is_saved
+            true,
             false,
             false,
             true,
@@ -306,13 +272,8 @@ fn attention_descendant_loses_to_saved() {
     );
 }
 
-// ── is_attention_needing predicate ── pinned per branch so any future
-// rewrite (or any drift between this predicate and its SQL mirrors in
-// migrations / `event_bus_projection.rs`) fails here at the unit layer.
-
 #[test]
 fn is_attention_needing_wfua_is_attention_regardless_of_archive() {
-    // Mirror of `is_blocking`: WFUA always wins, even on an archived row.
     for archive in [ArchiveState::Inbox, ArchiveState::Archived] {
         for ttype in [ThreadType::Chat, ThreadType::CodingAgent] {
             assert!(
@@ -320,6 +281,7 @@ fn is_attention_needing_wfua_is_attention_regardless_of_archive() {
                     ttype,
                     ThreadStatus::WaitingForUserAnswer,
                     archive,
+                    false,
                     false,
                     false,
                     false,
@@ -333,20 +295,50 @@ fn is_attention_needing_wfua_is_attention_regardless_of_archive() {
 }
 
 #[test]
+fn a_held_waiting_thread_needs_no_attention_yet_still_blocks() {
+    for ttype in [ThreadType::Chat, ThreadType::CodingAgent] {
+        assert!(!is_attention_needing(
+            ttype,
+            ThreadStatus::WaitingForUserAnswer,
+            ArchiveState::Inbox,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(is_blocking(
+            ttype,
+            ThreadStatus::WaitingForUserAnswer,
+            ArchiveState::Inbox,
+            false,
+            false,
+        ));
+    }
+    assert!(
+        is_attention_needing(
+            ThreadType::CodingAgent,
+            ThreadStatus::WaitingForUserAnswer,
+            ArchiveState::Inbox,
+            true,
+            false,
+            false,
+            true,
+        ),
+        "a held thread's pending change still needs the owner"
+    );
+}
+
+#[test]
 fn is_attention_needing_archived_short_circuits_pending_changes() {
-    // Critical guard: an archived CC thread with pending changes is NOT
-    // attention-needing — `is_blocking` says the same (clause 2 returns
-    // false). The migration backfill SQL and the runtime SQL must agree
-    // — the drift caught by `/harden` was exactly this case missing in
-    // the migration's CTE filter.
     assert!(
         !is_attention_needing(
             ThreadType::CodingAgent,
             ThreadStatus::Idle,
             ArchiveState::Archived,
-            true,  // has_pending_changes
-            false, // is_external_repo
-            false, // is_stopped_child
+            true,
+            false,
+            false,
+            false,
         ),
         "Archived + pending_changes must return false — matches is_blocking"
     );
@@ -354,8 +346,6 @@ fn is_attention_needing_archived_short_circuits_pending_changes() {
 
 #[test]
 fn is_attention_needing_in_workspace_cc_pending_changes_is_attention() {
-    // Non-archived in-workspace CC with a pending change is the canonical
-    // REVIEW-bubble case: user must Apply or Discard.
     assert!(is_attention_needing(
         ThreadType::CodingAgent,
         ThreadStatus::Idle,
@@ -363,34 +353,17 @@ fn is_attention_needing_in_workspace_cc_pending_changes_is_attention() {
         true,
         false,
         false,
-    ));
-}
-
-#[test]
-fn is_attention_needing_external_repo_carve_out() {
-    // External-repo CC with pending changes is NOT attention-needing —
-    // the WaitingBanner shows Archive instead of Apply/Discard, so
-    // there's nothing for the user to resolve at the parent level.
-    // Mirrors `is_blocking` clause 3.
-    assert!(!is_attention_needing(
-        ThreadType::CodingAgent,
-        ThreadStatus::Idle,
-        ArchiveState::Inbox,
-        true, // has_pending_changes
-        true, // is_external_repo
         false,
     ));
 }
 
 #[test]
-fn is_attention_needing_chat_pending_changes_does_not_apply() {
-    // `has_pending_changes` is CC-only — a chat thread with the flag
-    // accidentally set (shouldn't happen, but the predicate is strict)
-    // does not bubble attention.
+fn is_attention_needing_external_repo_carve_out() {
     assert!(!is_attention_needing(
-        ThreadType::Chat,
+        ThreadType::CodingAgent,
         ThreadStatus::Idle,
         ArchiveState::Inbox,
+        true,
         true,
         false,
         false,
@@ -398,13 +371,25 @@ fn is_attention_needing_chat_pending_changes_does_not_apply() {
 }
 
 #[test]
+fn is_attention_needing_chat_pending_changes_does_not_apply() {
+    assert!(!is_attention_needing(
+        ThreadType::Chat,
+        ThreadStatus::Idle,
+        ArchiveState::Inbox,
+        true,
+        false,
+        false,
+        false,
+    ));
+}
+
+#[test]
 fn is_attention_needing_running_is_not_attention() {
-    // Running is delegated work (Active), not user attention (Review).
-    // This is the key distinction from `is_blocking`.
     assert!(!is_attention_needing(
         ThreadType::CodingAgent,
         ThreadStatus::Running,
         ArchiveState::Inbox,
+        false,
         false,
         false,
         false,
@@ -413,10 +398,6 @@ fn is_attention_needing_running_is_not_attention() {
 
 #[test]
 fn is_attention_needing_subset_of_is_blocking() {
-    // Invariant: `is_attention_needing` is a STRICT SUBSET of `is_blocking`,
-    // except for the stopped-child clause, which the next test pins apart.
-    // For every other combination: attention => blocking. Pinning this
-    // prevents drift across the two predicates as either evolves.
     for status in [
         ThreadStatus::Idle,
         ThreadStatus::Running,
@@ -426,8 +407,9 @@ fn is_attention_needing_subset_of_is_blocking() {
             for ttype in [ThreadType::Chat, ThreadType::CodingAgent] {
                 for pending in [false, true] {
                     for external in [false, true] {
-                        let attention =
-                            is_attention_needing(ttype, status, archive, pending, external, false);
+                        let attention = is_attention_needing(
+                            ttype, status, archive, pending, external, false, false,
+                        );
                         let blocking = is_blocking(ttype, status, archive, pending, external);
                         if attention {
                             assert!(
@@ -446,10 +428,6 @@ fn is_attention_needing_subset_of_is_blocking() {
 
 #[test]
 fn a_stopped_child_needs_attention_and_never_blocks() {
-    // ADR 0252: the user must continue, archive or discard a stopped child,
-    // but archiving its parent must stay possible. So the clause lives in
-    // `is_attention_needing` only, and an archived row drops it like the
-    // pending-change clause does.
     for ttype in [ThreadType::Chat, ThreadType::CodingAgent] {
         assert!(is_attention_needing(
             ttype,
@@ -458,6 +436,7 @@ fn a_stopped_child_needs_attention_and_never_blocks() {
             false,
             false,
             true,
+            false,
         ));
         assert!(!is_attention_needing(
             ttype,
@@ -466,6 +445,7 @@ fn a_stopped_child_needs_attention_and_never_blocks() {
             false,
             false,
             true,
+            false,
         ));
         assert!(!is_blocking(
             ttype,
@@ -476,17 +456,6 @@ fn a_stopped_child_needs_attention_and_never_blocks() {
         ));
     }
 }
-
-// ── available_thread_actions tests ──
-//
-// Returned in cascade priority order so the front-most close LAYER is
-// positional: [DiscardDraft?, Discard?, Apply?, Archive?, Unsave|Save].
-// The Save/Unsave retention toggle always appends exactly one entry for a
-// focused thread (matches the always-present prompt section toggle), so the
-// close set is the prefix before it.
-//
-// Args: (thread_type, status, stored_section, has_pending_changes,
-//        descendants_block_archive, has_unsent_draft, is_saved).
 
 #[test]
 fn chat_inbox_idle_shows_archive_then_save() {
@@ -520,7 +489,6 @@ fn chat_archived_idle_shows_only_save() {
 
 #[test]
 fn chat_running_shows_no_close_actions() {
-    // Live thread: no close actions (draft excluded here), Save still offered.
     let actions = available_thread_actions(
         ThreadType::Chat,
         ThreadStatus::Running,
@@ -574,9 +542,6 @@ fn cc_inbox_no_changes_shows_archive() {
 
 #[test]
 fn external_repo_cc_no_pending_change_shows_archive() {
-    // External repo threads: a proposed change state in thread_summaries but no
-    // pending row in the changes table (runtime skips propose_change).
-    // has_pending_changes=false → Archive, not Apply/Discard.
     let actions = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
@@ -611,10 +576,6 @@ fn cc_archived_no_changes_shows_only_save() {
 
 #[test]
 fn cc_archived_with_pending_changes_shows_apply_discard() {
-    // display_section surfaces archived+pending threads in Current specifically
-    // so the user can never lose unresolved work behind the archive curtain.
-    // available_thread_actions must keep the action set in sync — otherwise the
-    // user sees the thread in Current with dots but has no buttons to resolve it.
     let actions = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
@@ -676,8 +637,6 @@ fn cc_inbox_descendants_block_archive_hides_archive() {
 
 #[test]
 fn cc_inbox_pending_changes_still_show_apply_discard_when_descendants_block() {
-    // Pending changes outrank the descendants-block-archive gate: the user
-    // must resolve the change before the cascading-archive logic kicks in.
     let actions = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
@@ -699,11 +658,8 @@ fn cc_inbox_pending_changes_still_show_apply_discard_when_descendants_block() {
     );
 }
 
-// ── new axes: draft + save/unsave ──
-
 #[test]
 fn draft_is_front_most_close_layer() {
-    // DiscardDraft leads the close set; Archive still follows when archivable.
     let actions = available_thread_actions(
         ThreadType::Chat,
         ThreadStatus::Idle,
@@ -711,7 +667,7 @@ fn draft_is_front_most_close_layer() {
         false,
         false,
         false,
-        true, // has_unsent_draft
+        true,
         false,
     );
     assert_eq!(
@@ -726,8 +682,6 @@ fn draft_is_front_most_close_layer() {
 
 #[test]
 fn draft_discard_available_while_running() {
-    // A draft is orthogonal to run state — discardable even while the thread
-    // is live, when the close set is otherwise suppressed.
     let actions = available_thread_actions(
         ThreadType::Chat,
         ThreadStatus::Running,
@@ -735,7 +689,7 @@ fn draft_discard_available_while_running() {
         false,
         false,
         false,
-        true, // has_unsent_draft
+        true,
         false,
     );
     assert_eq!(
@@ -746,8 +700,6 @@ fn draft_discard_available_while_running() {
 
 #[test]
 fn full_cascade_draft_change_then_save() {
-    // Draft + pending change: DiscardDraft then Discard/Apply (the change layer
-    // suppresses Archive), then the Save toggle.
     let actions = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
@@ -755,7 +707,7 @@ fn full_cascade_draft_change_then_save() {
         true,
         false,
         false,
-        true, // has_unsent_draft
+        true,
         false,
     );
     assert_eq!(
@@ -770,8 +722,6 @@ fn full_cascade_draft_change_then_save() {
     );
 }
 
-/// A pinned thread always sits in the inbox (ADR 0312). So a settled one is
-/// offered Archive beside Unpin, and the user is never left with Unpin alone.
 #[test]
 fn saved_thread_shows_unsave_not_save() {
     let actions = available_thread_actions(
@@ -782,7 +732,7 @@ fn saved_thread_shows_unsave_not_save() {
         false,
         false,
         false,
-        true, // is_saved
+        true,
     );
     assert_eq!(actions, vec![ThreadAction::Archive, ThreadAction::Unsave]);
 }
@@ -797,7 +747,7 @@ fn saved_cc_pending_shows_unsave() {
         false,
         false,
         false,
-        true, // is_saved
+        true,
     );
     assert_eq!(
         actions,
@@ -810,16 +760,6 @@ fn saved_cc_pending_shows_unsave() {
     );
 }
 
-// ── a subscription is not a park ── a thread holding an *event wait* is
-// plain idle: it does not block, it needs no attention, and Archive stays
-// offered. That is the 2026-08-06 change (every wait is detached), and the
-// blocking predicate has two SQL mirrors
-// (`event_bus_projection_propagation.rs`), so pin the relation here.
-
-/// The documented relation in `is_attention_needing`'s doc comment, asserted
-/// across every status rather than trusted as prose. The stopped-child clause
-/// is the documented exception, pinned by
-/// `a_stopped_child_needs_attention_and_never_blocks`.
 #[test]
 fn blocking_equals_attention_or_running() {
     for status in [
@@ -835,8 +775,9 @@ fn blocking_equals_attention_or_running() {
                 for pending in [false, true] {
                     for external in [false, true] {
                         let blocking = is_blocking(ttype, status, archive, pending, external);
-                        let attention =
-                            is_attention_needing(ttype, status, archive, pending, external, false);
+                        let attention = is_attention_needing(
+                            ttype, status, archive, pending, external, false, false,
+                        );
                         let expected = attention || status == ThreadStatus::Running;
                         assert_eq!(
                             blocking, expected,
@@ -851,11 +792,6 @@ fn blocking_equals_attention_or_running() {
     }
 }
 
-/// A subscribed thread with nothing to resolve keeps the ordinary idle action
-/// set, Archive included. Archiving one is legitimate and is NOT a way to strand
-/// a subscription behind the archive curtain: the archive cancels every live wait
-/// on the thread (`EventWaitCancelCause::ThreadArchived`, applied off the bus in
-/// `event_wait::dispatcher::cancel_waits_ended_by`).
 #[test]
 fn a_subscribed_thread_is_idle_and_offers_archive() {
     let actions = available_thread_actions(
@@ -864,34 +800,22 @@ fn a_subscribed_thread_is_idle_and_offers_archive() {
         ArchiveState::Inbox,
         false,
         false,
-        true, // has_live_event_waits
+        true,
         false,
         false,
     );
     assert_eq!(actions, vec![ThreadAction::Archive, ThreadAction::Save]);
 }
 
-// ── a parked thread's change is not resolvable ── the thread wakes on its
-// delivery and commits on to the same branch. Apply would merge work still
-// being produced, so a live event wait leaves no close action behind. An active
-// sub-thread is not an input at all (ADR 0249); `api::threads::tests` pins that
-// a parent with a running child still reads Apply.
-
-/// The headline case: a coding-agent thread that proposed a change and then
-/// parked on an event wait.
-///
-/// It offers exactly what a Running thread offers: no close action, plus the
-/// standing apply. A wait ends by itself, so a standing apply waits it out
-/// rather than applying work the wake will extend (ADR 0266).
 #[test]
 fn a_parked_cc_thread_with_a_change_offers_what_a_running_one_does() {
     let parked = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Idle,
         ArchiveState::Inbox,
-        true,  // has_pending_changes
-        false, // descendants_block_archive
-        true,  // has_live_event_waits
+        true,
+        false,
+        true,
         false,
         false,
     );
@@ -917,8 +841,6 @@ fn a_parked_cc_thread_with_a_change_offers_what_a_running_one_does() {
     );
 }
 
-/// The way out before the 24 h ceiling. Stop waiting clears the subscription,
-/// and the same thread is immediately resolvable again.
 #[test]
 fn clearing_the_last_wait_restores_apply_and_discard() {
     let actions = available_thread_actions(
@@ -927,7 +849,7 @@ fn clearing_the_last_wait_restores_apply_and_discard() {
         ArchiveState::Inbox,
         true,
         false,
-        false, // the wait was stopped
+        false,
         false,
         false,
     );
@@ -942,7 +864,6 @@ fn clearing_the_last_wait_restores_apply_and_discard() {
     );
 }
 
-/// The draft layer is orthogonal to the gate, as it already is to `live`.
 #[test]
 fn a_parked_thread_can_still_discard_its_unsent_draft() {
     let actions = available_thread_actions(
@@ -952,7 +873,7 @@ fn a_parked_thread_can_still_discard_its_unsent_draft() {
         true,
         false,
         true,
-        true, // has_unsent_draft
+        true,
         false,
     );
     assert_eq!(
@@ -965,9 +886,6 @@ fn a_parked_thread_can_still_discard_its_unsent_draft() {
     );
 }
 
-/// A question card outranks a wait held beside it, and so does a failed turn.
-/// Neither settles by itself, so the standing apply is not offered: it would
-/// drop on its first look.
 #[test]
 fn a_live_wait_beside_a_question_or_a_failure_offers_no_standing_apply() {
     for status in [ThreadStatus::WaitingForUserAnswer, ThreadStatus::Failed] {
@@ -977,7 +895,7 @@ fn a_live_wait_beside_a_question_or_a_failure_offers_no_standing_apply() {
             ArchiveState::Inbox,
             true,
             false,
-            true, // has_live_event_waits
+            true,
             false,
             false,
         );
@@ -988,14 +906,13 @@ fn a_live_wait_beside_a_question_or_a_failure_offers_no_standing_apply() {
     }
 }
 
-/// A chat thread has no change to resolve, so parking changes nothing for it.
 #[test]
 fn a_parked_chat_thread_keeps_archive() {
     let actions = available_thread_actions(
         ThreadType::Chat,
         ThreadStatus::Idle,
         ArchiveState::Inbox,
-        true, // ignored off a coding-agent thread
+        true,
         false,
         true,
         false,
@@ -1028,4 +945,41 @@ fn a_pinned_thread_on_hold_stays_pinned() {
         ),
         DisplaySection::Saved
     );
+}
+
+#[test]
+fn awaits_owner_answer_matches_the_blocked_sections_question_arm() {
+    for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+        for section in [ArchiveState::Archived, ArchiveState::Inbox] {
+            for unattended in [false, true] {
+                let moved =
+                    resolve_transition("UserQuestionAsked", thread_type, section, unattended)
+                        .expect("a question is legal from any section");
+                assert_eq!(moved.new_section, Some(ArchiveState::Inbox));
+            }
+        }
+    }
+    for status in ThreadStatus::ALL {
+        for bits in 0..16u8 {
+            let [saved, children, pending, attention] = [0, 1, 2, 3].map(|i| bits & (1 << i) != 0);
+            for held in [false, true] {
+                let section = display_section(
+                    ArchiveState::Inbox,
+                    status,
+                    saved,
+                    children,
+                    pending,
+                    attention,
+                    held,
+                );
+                let lists_in_ongoing =
+                    !held && matches!(section, DisplaySection::Current | DisplaySection::Saved);
+                assert_eq!(
+                    awaits_owner_answer(status, held),
+                    status == ThreadStatus::WaitingForUserAnswer && lists_in_ongoing,
+                    "{status:?} held={held} section={section:?}"
+                );
+            }
+        }
+    }
 }

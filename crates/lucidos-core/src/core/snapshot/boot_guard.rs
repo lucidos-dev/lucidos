@@ -1,15 +1,14 @@
-//! Fail closed before normal boot can mutate an interrupted restore.
 use super::{store::Store, BoxError};
 use std::{io::ErrorKind, path::Path};
 
-/// No keys, database connection, directories or permission changes are needed.
+/// INVARIANT: No keys, database connection, directories or permission changes are needed.
 /// Recheck after taking the workspace owner lock: an offline worker may have
 /// changed the journal while normal startup waited for that lock.
 pub fn ensure_normal_boot(database_url: &str) -> Result<(), BoxError> {
     check_boot(database_url, false)
 }
 
-/// Admit only the restricted verifier at FilesRestored. This is not permission
+/// INVARIANT: Admit only the restricted verifier at FilesRestored. This is not permission
 /// to construct an engine: the owner-locked recheck must obtain RestoreBoot.
 pub fn ensure_boot_entry(database_url: &str) -> Result<(), BoxError> {
     check_boot(database_url, true)
@@ -40,7 +39,7 @@ fn check_at(root: &Path, identity: String, restricted: bool) -> Result<(), BoxEr
         }
         Ok(_) => {}
     }
-    // An existing store with an absent, redirected or unreadable journal is
+    // INVARIANT: An existing store with an absent, redirected or unreadable journal is
     // unknown state, never evidence that a restore finished.
     if !std::fs::symlink_metadata(root.join("journal"))?.is_dir() {
         return Err("snapshot journal is not a directory".into());

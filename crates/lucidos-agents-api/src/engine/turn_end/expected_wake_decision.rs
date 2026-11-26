@@ -1,21 +1,3 @@
-//! The *expected wake decision*: a turn that leaves its thread waiting and
-//! states no expected wake gets one from a single background call (ADR 0603).
-//!
-//! It runs at the turn end beside the read decision, and only where the
-//! keep-alive could plan pings from it ([`PendingWake`]). One choice question
-//! asks when the thread wakes, in the [`BUCKET_EDGES_MINUTES`] buckets.
-//!
-//! - **A System One model answers with a probability per bucket**, recorded as
-//!   the distribution. Its median is the expected wake.
-//! - **The chat model answers with one bucket**, its likeliest, recorded as a
-//!   point at the bucket's middle. So the decision never needs System One.
-//! - **A failed call records nothing.** The keep-alive then falls back to the
-//!   bare reread cap.
-//!
-//! No estimate lands past the earliest event wait's timeout, which wakes the
-//! thread too. A ping plan that runs out with no wake asks once more, from the
-//! keep-alive tick.
-
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -45,14 +27,10 @@ pub(crate) const BUCKET_EDGES_MINUTES: [i64; 11] = [
     MAX_TIMEOUT_SECS / 60,
 ];
 
-/// The id of the one question.
 const WAKE_QUESTION_ID: &str = "wake_within";
 
-/// The most bytes of the agent's reply the call reads.
 const REPLY_BYTES: usize = 6_000;
-/// The most bytes of a sub-thread's task the call reads.
 const TASK_BYTES: usize = 1_500;
-/// The most bytes of the recorded reason.
 const REASON_BYTES: usize = 300;
 
 const WAKE_INSTRUCTIONS: &str = "A thread is waiting, and its agent's turn just ended. When \
@@ -63,18 +41,15 @@ const WAKE_INSTRUCTIONS: &str = "A thread is waiting, and its agent's turn just 
     may differ. An earlier estimate that passed with no wake was too early, so look past it.\n\n\
     Give the probability that the thread wakes within each span of time, counted from now.";
 
-/// The reply a re-estimate reads: no turn ran since the last estimate.
 const RE_ESTIMATE_REPLY: &str = "(No new turn. The earlier estimate passed with no wake, so the \
     keep-alive asks again.)";
 
-/// Which backend answered, which decides how the answer reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecisionBackend {
     SystemOne,
     Chat,
 }
 
-/// A span of minutes as a bucket label reads it.
 fn minutes_label(minutes: i64) -> String {
     if minutes >= 120 && minutes % 60 == 0 {
         format!("{} h", minutes / 60)
@@ -83,7 +58,6 @@ fn minutes_label(minutes: i64) -> String {
     }
 }
 
-/// Each bucket's start and end, in seconds from now.
 fn bucket_spans_secs() -> impl Iterator<Item = (f64, f64)> {
     let starts = std::iter::once(0).chain(BUCKET_EDGES_MINUTES);
     starts
@@ -91,7 +65,6 @@ fn bucket_spans_secs() -> impl Iterator<Item = (f64, f64)> {
         .map(|(start, end)| (start as f64 * 60.0, end as f64 * 60.0))
 }
 
-/// Each bucket's option name, in order.
 pub(crate) fn bucket_labels() -> Vec<String> {
     std::iter::once(0)
         .chain(BUCKET_EDGES_MINUTES)
@@ -103,7 +76,6 @@ pub(crate) fn bucket_labels() -> Vec<String> {
         .collect()
 }
 
-/// The one question every backend answers.
 pub(crate) fn wake_questions() -> Vec<(String, Question)> {
     vec![(
         WAKE_QUESTION_ID.to_string(),
@@ -117,8 +89,6 @@ pub(crate) fn wake_questions() -> Vec<(String, Question)> {
     )]
 }
 
-/// The median of a distribution over the buckets, in seconds from now,
-/// interpolated inside its bucket. `None` when nothing carries weight.
 pub(crate) fn median_secs(probabilities: &[f64]) -> Option<f64> {
     let total: f64 = probabilities.iter().sum();
     if !total.is_finite() || total <= 0.0 {
@@ -135,8 +105,6 @@ pub(crate) fn median_secs(probabilities: &[f64]) -> Option<f64> {
     None
 }
 
-/// The answer's probabilities in bucket order. The chat model's pick is one
-/// bucket, so only its likeliest bucket carries weight.
 fn bucket_weights(answer: &ChoiceAnswer, backend: DecisionBackend) -> Vec<f64> {
     bucket_labels()
         .iter()
@@ -147,7 +115,6 @@ fn bucket_weights(answer: &ChoiceAnswer, backend: DecisionBackend) -> Vec<f64> {
         .collect()
 }
 
-/// Why the decision expects what it does: what the thread waits on.
 fn decision_reason(pending: &PendingWake) -> String {
     let items: Vec<&str> = pending
         .waits
@@ -166,8 +133,6 @@ fn decision_reason(pending: &PendingWake) -> String {
     crate::core::middle_truncate(&reason, REASON_BYTES)
 }
 
-/// The expected wake one answer stands for, or `None` when the answer names
-/// no bucket.
 pub(crate) fn wake_from_answer(
     answer: &ChoiceAnswer,
     backend: DecisionBackend,
@@ -201,12 +166,10 @@ pub(crate) fn wake_from_answer(
     })
 }
 
-/// A moment before `now`, as the call reads it.
 fn ago(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{} ago", describe_span((now - at).num_seconds() as f64))
 }
 
-/// The state the call judges.
 pub(crate) fn decision_state(
     pending: &PendingWake,
     reply: &str,
@@ -272,8 +235,6 @@ pub(crate) fn decision_state(
     })
 }
 
-/// Ask the System One model first, then the chat model, within one
-/// `deadline`. Returns the first readable answer and who gave it.
 pub(crate) async fn ask_for_buckets(
     system_one: Option<&dyn JudgmentProvider>,
     chat: &dyn JudgmentProvider,
@@ -307,8 +268,6 @@ pub(crate) async fn ask_for_buckets(
     None
 }
 
-/// Decide and record one expected wake for `thread_id`, in the engine's name.
-/// Records nothing when no backend answers.
 pub(crate) async fn decide_and_record(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
@@ -334,12 +293,9 @@ pub(crate) async fn decide_and_record(
     }
 }
 
-/// Where a turn began, so its own statement can be told from an earlier one.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TurnStart {
-    /// A chat or trigger turn, from the event that opened it.
     Opened(Uuid),
-    /// A coding-agent turn, from its session's previous idle.
     SinceLastIdle,
 }
 
@@ -379,8 +335,6 @@ pub(crate) async fn stated_this_turn(
     })
 }
 
-/// The expected wake decision's chat backend: the site's chat model, forced
-/// to answer, as the read decision's is.
 pub(crate) fn expected_wake_decision_chat_judge(
     provider: std::sync::Arc<dyn crate::llm::LlmProvider>,
     reasoning: Option<String>,
@@ -390,8 +344,6 @@ pub(crate) fn expected_wake_decision_chat_judge(
 
 #[easy_ext::ext(ExpectedWakeDecisionExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Make the expected wake decision a turn owes: one where the thread still
-    /// waits on something the keep-alive keeps warm, and the turn stated none.
     async fn force_expected_wake_decision(&self, thread_id: Uuid, start: TurnStart, reply: &str) {
         let Some(pending) = self.pending_wake(thread_id).await else {
             return;
@@ -402,8 +354,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         self.decide_expected_wake(thread_id, &pending, reply).await;
     }
 
-    /// Ask again after a ping plan ran out with no wake. The misses in the
-    /// pending work tell the call its earlier estimate was too early.
     async fn re_estimate_expected_wake(&self, thread_id: Uuid) {
         if let Some(pending) = self.pending_wake(thread_id).await {
             self.decide_expected_wake(thread_id, &pending, RE_ESTIMATE_REPLY)

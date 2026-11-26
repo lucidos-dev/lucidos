@@ -108,8 +108,6 @@ fn a_legacy_file_differing_from_the_store_keeps_both_keys() {
     );
 }
 
-/// Every read moves the file first, so a backup after an upgrade seals with
-/// the key the user saved.
 #[test]
 fn a_read_moves_the_legacy_file() {
     let fixture = Fixture::new();
@@ -137,7 +135,6 @@ fn an_unreadable_legacy_file_fails_reads() {
     assert!(fixture.legacy_file().exists());
 }
 
-/// A store that refuses to write. The legacy file must survive a failed move.
 struct ReadOnlyStore;
 
 impl KeyStore for ReadOnlyStore {
@@ -176,7 +173,6 @@ fn a_workspace_without_a_key_has_none() {
     assert_eq!(fixture.stored(), None);
 }
 
-/// The switch forgets every copy, so no later read moves a file's key back.
 #[test]
 fn delete_forgets_the_store_key_and_the_legacy_file() {
     let fixture = Fixture::new();

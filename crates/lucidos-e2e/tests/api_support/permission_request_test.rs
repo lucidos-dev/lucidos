@@ -1,18 +1,9 @@
-//! E2E for the two routes a *permission request* (ADR 0664) adds behaviour to.
-//!
-//! An external client cannot mint a thread-bound origin token, so the token
-//! paths (preparing the request, spending the grant) are tested in the engine.
-//! What a real engine must show from outside: a caller with no thread token
-//! cannot prepare one, and only the owner's registered device answers its card.
-
 use crate::support::{
     base_url, count_events_of_type, db_url, local_process_client, seed_cc_thread_summary,
     user_client,
 };
 use uuid::Uuid;
 
-/// A permission request card as the ask route stores it: the engine's
-/// question, the parser's option ids, and the typed request behind them.
 async fn insert_permission_request_card(pool: &sqlx::PgPool, thread_id: Uuid, tool_use_id: &str) {
     seed_cc_thread_summary(pool, thread_id, "waiting_for_user_answer").await;
     let payload = serde_json::json!({
@@ -58,8 +49,6 @@ fn answer_question_url(thread_id: Uuid) -> String {
     )
 }
 
-/// Preparing a request is an agent's act inside its own thread. The owner's
-/// own device presents no thread token, so it has no thread to ask on.
 #[tokio::test]
 async fn a_permission_request_needs_a_thread_token() {
     let resp = user_client()
@@ -78,8 +67,6 @@ async fn a_permission_request_needs_a_thread_token() {
     assert!(body.contains("ask-permission"), "{body}");
 }
 
-/// The machine's own token is a credential, but not a person: it may not
-/// answer a card whose Allow grants a permission. The owner's device may.
 #[tokio::test]
 async fn only_the_owners_device_answers_a_permission_request() {
     let pool = sqlx::PgPool::connect(&db_url())
@@ -91,7 +78,6 @@ async fn only_the_owners_device_answers_a_permission_request() {
         &Uuid::new_v4().as_simple().to_string()[..8]
     );
     insert_permission_request_card(&pool, thread_id, &tool_use_id).await;
-    // Canceled keeps the test hermetic: a cancel spawns no coding agent.
     let body = serde_json::json!({ "tool_use_id": tool_use_id, "answer": { "kind": "Canceled" } });
 
     let refused = local_process_client()

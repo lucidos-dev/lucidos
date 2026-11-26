@@ -47,8 +47,6 @@ mod serialize_messages_for_capture_tests {
 
     #[test]
     fn separates_messages_with_blank_line() {
-        // Boundaries between messages must be visible — without the blank
-        // separator the dump reads as one continuous blob.
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -64,7 +62,6 @@ mod serialize_messages_for_capture_tests {
     }
 }
 
-/// The one section whose two sizes disagree, and the reason both exist.
 mod conversation_section_tests {
     use super::super::{conversation_section, round_capture_sections};
     use crate::llm::{Message, MessageContent};
@@ -82,9 +79,6 @@ mod conversation_section_tests {
         ]
     }
 
-    /// The bundle is already inside `messages[0]`, so the delta counts only
-    /// what the loop added. Summing the true size instead would bill the
-    /// bundle twice against the headline estimate.
     #[test]
     fn the_delta_is_what_the_loop_added_and_never_the_whole_array() {
         let section = conversation_section(&turn(), 900, 1_500);
@@ -97,8 +91,6 @@ mod conversation_section_tests {
         );
     }
 
-    /// A round that added nothing floors at zero rather than going negative,
-    /// and the region size is unaffected by that floor.
     #[test]
     fn a_delta_floors_at_zero_while_the_region_keeps_its_size() {
         let section = conversation_section(&turn(), 5_000, 1_500);
@@ -106,8 +98,6 @@ mod conversation_section_tests {
         assert!(section.content_chars.expect("measured") > 1_000);
     }
 
-    /// Dropping the body is a persistence decision. It must not move the
-    /// number that says how big the region was.
     #[test]
     fn dropping_the_body_leaves_the_region_size_alone() {
         let section = conversation_section(&turn(), 900, 1_500);
@@ -122,9 +112,6 @@ mod conversation_section_tests {
         );
     }
 
-    /// The switch as read for the round decides every row, the turn's seed
-    /// included. A turn that waited on a question and resumes after the user
-    /// turned capture on records bodies from its next round.
     #[test]
     fn the_round_switch_decides_the_seed_rows_too() {
         let seed = vec![crate::engine::ContextSection {
@@ -149,11 +136,6 @@ mod conversation_section_tests {
         );
     }
 
-    /// Truncation is the same decision at a different size. A body cut head
-    /// and tail still reports the array it was cut from.
-    ///
-    /// Skipped under the eval's full capture, which is the one configuration
-    /// that lifts the cap this test is about (ADR 0110).
     #[test]
     fn a_truncated_body_still_reports_the_size_it_was_cut_from() {
         if crate::engine::eval_capture::body_cap(8_000).is_none() {
@@ -200,10 +182,6 @@ mod relation_tests {
 
     #[test]
     fn parse_relation_accepts_sub_as_back_compat_alias() {
-        // The wire string was `"sub"` before the glossary settled on
-        // *child thread* (direct descendant) vs *sub-thread* (transitive).
-        // Older LLM tool calls and persisted prompts may still send `"sub"`,
-        // so it must keep deserializing to Child.
         let args = json!({"prompt": "x", "relation": "sub"});
         assert!(matches!(
             parse_relation(&args, false),
@@ -230,8 +208,6 @@ mod relation_tests {
 
     #[test]
     fn parse_relation_rejects_non_string() {
-        // {"relation": 42} — wrong type. The parser must fail loudly so the
-        // LLM sees the contract violation instead of silently getting "child".
         let args = json!({"prompt": "x", "relation": 42});
         assert!(parse_relation(&args, false).is_err());
     }
@@ -273,7 +249,6 @@ mod relation_tests {
         assert!(text.contains(&child.to_string()));
     }
 
-    /// I7 and I9 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`.
     #[test]
     fn a_child_takes_its_parents_default_wake_mode_unless_it_declares_one() {
         let omitted = serde_json::json!({});

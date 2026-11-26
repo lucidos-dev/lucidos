@@ -16,10 +16,6 @@ pub use model_discovery::start_cc_model_discovery;
 pub(crate) use model_discovery::CcModelDiscoveryExt;
 pub(crate) mod spawn;
 
-/// Look up a repo's cached CC commands by its on-disk path.
-///
-/// Returns the cached entry for `repo_path`, or empty defaults on a miss. The
-/// compose menu only shows skills for the selected repository.
 pub(crate) fn lookup_repo_commands_in_cache(
     cache: &HashMap<String, CcCommandsInfo>,
     repo_path: &str,
@@ -32,8 +28,6 @@ pub(crate) const ENGINE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(lucidos expect-wake:*)",
 ];
 
-/// Resolve the comma-separated tool allowlist for `claude --allowedTools`:
-/// [`ENGINE_ALLOWED_TOOLS`], then the workspace's standing coding-agent grants.
 pub(crate) async fn cc_allowed_tools(bus: &EventBus) -> String {
     allowed_tools_flag(
         tool_grants::granted_lines(bus, GrantFile::CodingAgentTools, None)
@@ -42,8 +36,6 @@ pub(crate) async fn cc_allowed_tools(bus: &EventBus) -> String {
     )
 }
 
-/// [`ENGINE_ALLOWED_TOOLS`], then each of `grants` Claude Code may match
-/// itself, comma-separated.
 pub(crate) fn allowed_tools_flag(grants: Vec<String>) -> String {
     let grants = grants.into_iter().filter(|pattern| {
         let engine_only = only_the_engine_may_match(pattern);
@@ -67,9 +59,6 @@ fn only_the_engine_may_match(pattern: &str) -> bool {
     pattern == "Bash" || pattern.starts_with("Bash(")
 }
 
-/// A canceled Claude Code subprocess returns `Ok(_)`, so the inner future succeeding
-/// is not enough to prove `/harden` ran. The marker is the only signal that
-/// survives a kill — it's only written by the skill's final phase.
 pub(crate) fn hardening_succeeded(cancel_token_cancelled: bool, marker_present: bool) -> bool {
     !cancel_token_cancelled && marker_present
 }
@@ -84,17 +73,13 @@ pub(crate) use crate::engine::continuation_reason::STALE_RESUME_ERROR;
 
 pub(crate) use crate::engine::types::SpawnAgentThreadParams;
 
-/// Emit `ResponseFailed` for a background task that errored, but only if the
-/// projection still shows the thread as `running`. Prevents double-terminal
-/// in the common case where Stop/Discard already settled the thread; see
-/// `thread_is_running` for the race caveat.
 pub(crate) async fn emit_background_task_failure(
     engine: &Arc<LucidosEngine>,
     thread_id: Uuid,
     error: impl std::fmt::Display,
     label: &str,
 ) {
-    // A read that failed is not "the thread already settled". The conservative
+    // INVARIANT: A read that failed is not "the thread already settled". The conservative
     // side avoids a double terminal. It also drops the very failure this
     // function exists to report, so the reason has to reach the log.
     let still_running = match thread_is_running(engine.pool(), thread_id).await {
@@ -130,17 +115,10 @@ pub(crate) async fn emit_background_task_failure(
     }
 }
 
-/// Re-exported so call sites that already import from `claude_code` don't have
-/// to chase the enum into `types.rs`.
 pub use crate::engine::types::StopReason;
 
 pub use control::{RungPick, RungPickOutcome};
 
-/// Returned by [`LucidosEngine::interrupt_agent`] when the session is already
-/// idle/waiting — i.e. a Cancel (Stop) click that races a turn which already
-/// finished. Callers (the `/claude-code/stop` handler) treat it as a no-op
-/// (HTTP 200), not an error: there is nothing to interrupt. Lives here (not in
-/// the private `control` submodule) so the API handler can reference it.
 pub(crate) const SESSION_ALREADY_WAITING: &str = "Session is already waiting";
 
 use crate::engine::session_claim_refusal::SESSION_STOPPING_MESSAGE;
@@ -152,24 +130,19 @@ pub(crate) use crate::engine::session_claim_refusal::{
     APPLY_IN_PROGRESS_MESSAGE, DISCARD_IN_PROGRESS_MESSAGE,
 };
 
-/// Why Apply Now is refused while the thread is parked on a question. Applying
-/// would send a hardening or merge prompt that overtakes the question card.
 pub(crate) const QUESTION_OPEN_MESSAGE: &str =
     "This thread is waiting for your answer to its question. Answer it first, then apply";
 
-/// Why Apply Now is refused when it could not check for a parked question. An
+/// INVARIANT: Why Apply Now is refused when it could not check for a parked question. An
 /// unanswered check is not a "no".
 pub(crate) const QUESTION_UNKNOWN_MESSAGE: &str =
     "Could not check whether this thread is waiting for your answer. Try again";
 
-/// What an in-session Discard found for its thread.
 pub(crate) enum DiscardTarget {
-    /// No session: the stale-session teardown handles the Discard.
     NoSession,
-    /// The session, claimed for this Discard. Release it with `claimant`.
     Claimed {
         worktree: PathBuf,
-        /// The branch the reset may rewind. The worktree is reset only while
+        /// INVARIANT: The branch the reset may rewind. The worktree is reset only while
         /// it is still checked out on it.
         branch: String,
         claimant: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
@@ -212,14 +185,12 @@ pub(crate) fn stop_refusal(session: &crate::engine::AgentSession) -> Option<&'st
     session.change_claim.map(claim_refusal_message)
 }
 
-/// A Stop, Discard or Archive while an apply resets the thread's worktree. No
-/// loop listens to the entry, so a recorded stop would be lost.
 pub(crate) const THREAD_APPLYING_MESSAGE: &str =
     "An apply is merging this thread's work. Try again when it finishes.";
 
 pub use crate::engine::agent_host::SettleTerminal;
 
-/// Emit a terminal event for a thread that still reads `running` after its
+/// INVARIANT: Emit a terminal event for a thread that still reads `running` after its
 /// session or loop has gone away.
 ///
 /// A Stop or Cancel button passes the clicking device as `actor`. Automatic

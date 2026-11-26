@@ -1,10 +1,3 @@
-//! Every thread summary the API serves carries the row's `summary_version`,
-//! and the number grows whenever the row changes. The client refuses any
-//! summary older than the one it holds. A read path that dropped the field or
-//! served a stale number would let an old status back on screen.
-//!
-//! See ADR 0329.
-
 use crate::support::{base_url, db_url, http_client, seed_chat_thread_summary};
 use serde_json::Value;
 use uuid::Uuid;
@@ -33,7 +26,6 @@ async fn row_version(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
         .expect("read summary_version")
 }
 
-/// The version as the by-id read and the events read each report it.
 async fn served_versions(thread_id: Uuid) -> (i64, i64) {
     let summary = get_json(format!("/api/v1/threads/{thread_id}")).await;
     let snapshot = get_json(format!("/api/v1/threads/{thread_id}/events")).await;

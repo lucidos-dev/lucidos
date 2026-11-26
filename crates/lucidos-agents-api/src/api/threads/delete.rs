@@ -1,22 +1,3 @@
-//! Deleting a thread: the one sanctioned removal from the event log.
-//!
-//! ADR 0192 states the decision and what it deliberately leaves behind. The
-//! design is `docs/plans/2026-09-15-deleting-a-thread.md`. Three properties
-//! are load-bearing here, and each is the reason for a line of code below.
-//!
-//! **Only the owner's own device.** `require_owner_device` refuses a verified
-//! agent-origin token, the machine-local token, another workspace and an
-//! unregistered device id. It runs before anything is read or written.
-//!
-//! **Memory before events.** A `memory_entries` row's `source` is an event id,
-//! so the events are the only way to find one. Delete the events first and the
-//! rows are unreachable orphans forever.
-//!
-//! **One transaction.** Every destructive statement runs from
-//! [`delete_family_rows`], so a failure anywhere rolls the whole family back.
-//! What follows the commit (the audit event, the worktrees, the projection
-//! repair) is best effort and never rolled back: the data is already gone.
-
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
@@ -37,12 +18,8 @@ use crate::engine::archive_family_rules::{
     FamilyRow, FamilyVerb, HOME_THREAD,
 };
 
-/// A rejection body in the `{reason, ...}` shape archive already answers with,
-/// so one frontend formatter reads both.
 type Rejection = (StatusCode, Json<serde_json::Value>);
 
-/// Render an [`ApiError`] from the owner gate as this route's `{reason, message}`.
-/// Keep the gate's reason when it supplied one.
 fn gate_rejection(e: ApiError) -> Rejection {
     let reason = e.reason.unwrap_or(match e.status {
         StatusCode::UNAUTHORIZED => "unidentified_caller",
@@ -66,42 +43,29 @@ fn internal(e: impl std::fmt::Display) -> Rejection {
     )
 }
 
-/// One family member the cascade refuses to run over, for the dialog and for
-/// the 409 body.
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct BlockingMember {
     thread_id: Uuid,
     title: Option<String>,
-    /// `home_thread`, `running`, `waiting_for_user_answer`, `pending_change`
-    /// or `agent_session_live`. The first four are DB state; the last is the
-    /// in-memory session set, which no row records.
     reason: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct DeletePreflight {
-    /// Family size, target included.
     thread_count: usize,
-    /// Descendant titles, for the expandable list. The one content-bearing
-    /// field, and the user is already looking at those rows in the drawer.
     sub_thread_titles: Vec<String>,
-    /// `memory_entries` rows sourced to the family's events.
     memory_count: i64,
-    /// Model-written *summary tree* lines the delete sends back to the
-    /// compactor, each one background model call to rebuild.
     summary_rebuild_count: i64,
-    /// Any coding-agent member whose change state holds work, or a recorded
+    /// INVARIANT: Any coding-agent member whose change state holds work, or a recorded
     /// branch some repo still holds. Both halves are needed: `ThreadArchived`
     /// clears the branch work, so the state alone reads `none` for exactly the
     /// archived thread whose branch the delete is about to take.
     has_unapplied_branch_work: bool,
-    /// Any `changes` row for the family already at `applied`.
     has_applied_changes: bool,
-    /// A backup run has succeeded, so an archive taken earlier still holds this
+    /// INVARIANT: A backup run has succeeded, so an archive taken earlier still holds this
     /// thread. Deliberately NOT "a provider is configured": turning backups off
     /// yesterday does not unmake the five archives that already hold it.
     backups_present: bool,
-    /// Empty when the family is deletable.
     blocked_by: Vec<BlockingMember>,
 }
 
@@ -110,11 +74,6 @@ pub(in crate::api) struct PreflightQuery {
     thread_id: Uuid,
 }
 
-/// GET /api/v1/threads/delete-preflight?thread_id=<uuid>
-///
-/// Owner-gated like the delete itself. It carries sub-thread titles, so an
-/// agent that cannot delete must not be able to read the family through it
-/// either.
 pub(in crate::api) async fn delete_preflight(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -156,8 +115,6 @@ pub(in crate::api) async fn delete_preflight(
     let coding_agents = recorded_branches(&mut tx, &coding_agent_members(&family))
         .await
         .map_err(internal)?;
-    // Release the lock before the reads that do not need it: the in-memory
-    // session set, git, and the backup history on the `ops` aggregate.
     tx.commit().await.map_err(internal)?;
 
     let blocked_by = blocking_members(&state, &family, query.thread_id, &facts.titles).await;
@@ -165,7 +122,7 @@ pub(in crate::api) async fn delete_preflight(
         .await
         .map_err(internal)?
         .is_some();
-    // The change state alone under-reports, and it under-reports on the case
+    // INVARIANT: The change state alone under-reports, and it under-reports on the case
     // this feature exists for. `ThreadArchived` clears the branch work, so an
     // archived coding-agent thread always reads `none` while its branch may
     // still hold commits nothing merged. Ask git as well.
@@ -191,10 +148,6 @@ pub(in crate::api) async fn delete_preflight(
     }))
 }
 
-/// POST /api/v1/threads/delete, body `{ thread_id }`.
-///
-/// Response `{"deleted": [<uuid>, ...], "event_count": n, "memory_count": n}`.
-/// A refusal is 409 with `{reason, blocking}`, the shape archive answers with.
 pub(in crate::api) async fn delete_thread_family(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -243,10 +196,6 @@ pub(in crate::api) async fn delete_thread_family(
     let surviving_parent = parent_outside_family(&mut tx, thread_uuid)
         .await
         .map_err(internal)?;
-    // A deleted child that still owed its surviving parent a card settles it
-    // (ADR 0252, ADR 0254). Read now, while the row exists; delivered after
-    // the commit, because the card's projection writes the child's row, which
-    // this transaction holds locked.
     let owed_card = match surviving_parent {
         Some(_) => {
             state
@@ -303,10 +252,6 @@ pub(in crate::api) async fn delete_thread_family(
     })))
 }
 
-/// Remove the widgets these threads own: made in one of them and not reusable
-/// (ADR 0402). Reusable widgets, apps made from a widget, and other threads'
-/// widgets stay. One commit for all of them. Best effort like the worktrees,
-/// so a failure is logged and reported as a lower count.
 async fn remove_owned_widgets(
     state: &AppState,
     ids: &[Uuid],
@@ -332,8 +277,6 @@ async fn remove_owned_widgets(
     {
         Ok(removed) => removed.len(),
         Err(e) => {
-            // The ones removed before the failure are committed and announced,
-            // so the count reads back from disk rather than from the error.
             log_legacy!(
                 "[Delete] Could not remove every widget of {:?}: {}",
                 owned,
@@ -347,25 +290,11 @@ async fn remove_owned_widgets(
     }
 }
 
-/// How much the one transaction removed, for the audit record.
 struct DeletedCounts {
     events: i64,
     memory: i64,
 }
 
-/// Every destructive statement, in one transaction and run from one function.
-///
-/// Private on purpose. `core::announced_surfaces` allows a raw write to an
-/// announced table only from a declared owner file. It also forces a reachable
-/// writer to announce. Keeping this one unreachable is what makes the cascade's
-/// single `ThreadsDeleted` the honest record.
-///
-/// **Step 1 must stay first.** A `memory_entries` row is found only by joining
-/// its `source` event id against `events`, so deleting the events first strands
-/// every row it named.
-///
-/// `apply_all_batches` is deliberately untouched, and ADR 0192's Consequences
-/// lists it beside the other three things a delete leaves behind.
 async fn delete_family_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ids: &[Uuid],
@@ -373,9 +302,6 @@ async fn delete_family_rows(
     let event_ids = family_event_ids(tx, ids).await?;
     let event_id_texts: Vec<String> = event_ids.iter().map(|id| id.to_string()).collect();
 
-    // 1. Memory, first, and by the text form of the id: that is what
-    //    `memory_entries_source_event_id_idx` is an expression index on
-    //    (created at runtime in memory/pgvector.rs, since the table is).
     let memory = if PgVectorIndex::table_exists(&mut **tx).await? {
         sqlx::query(
             "DELETE FROM memory_entries \
@@ -389,21 +315,16 @@ async fn delete_family_rows(
         0
     };
 
-    // Notice intent may precede its event, so remove it by thread as well.
     let thread_texts: Vec<String> = ids.iter().map(ToString::to_string).collect();
     sqlx::query("DELETE FROM user_only_message_notices WHERE event_id = ANY($1) OR notice->>'thread_id' = ANY($2)")
         .bind(&event_ids).bind(&thread_texts).execute(&mut **tx).await?;
 
-    // 2. Notifications, by thread AND by the event they deep-link to. A row
-    //    naming a deleted event would open a thread that no longer exists.
     sqlx::query("DELETE FROM notifications WHERE thread_id = ANY($1) OR event_id = ANY($2)")
         .bind(ids)
         .bind(&event_ids)
         .execute(&mut **tx)
         .await?;
 
-    // 3. The change rows. An applied change's merge commit is untouched: it is
-    //    on main, and ADR 0192 says so out loud.
     sqlx::query("DELETE FROM changes WHERE thread_id = ANY($1)")
         .bind(ids)
         .execute(&mut **tx)
@@ -421,8 +342,6 @@ async fn delete_family_rows(
         .bind(ids)
         .execute(&mut **tx)
         .await?;
-    // A grant the family holds goes with it. A standing grant made in it
-    // stays, and its `granted_in_thread_id` turns NULL.
     sqlx::query("DELETE FROM permissions WHERE holder_kind = 'thread' AND holder_id = ANY($1)")
         .bind(&thread_texts)
         .execute(&mut **tx)
@@ -443,15 +362,11 @@ async fn delete_family_rows(
         .execute(&mut **tx)
         .await?;
 
-    // 5. The summary trees (I9): the family's own, its workspace leaves, and
-    //    every workspace merge those leaves shift. The compactor rebuilds the
-    //    merges once `ThreadsDeleted` reaches it.
     crate::engine::summary_tree::store::delete_family(tx, ids).await?;
 
     Ok(DeletedCounts { events, memory })
 }
 
-/// Thread ids as the text `events.aggregate_id` stores them.
 fn thread_id_texts(ids: &[Uuid]) -> Vec<String> {
     ids.iter().map(|id| id.to_string()).collect()
 }
@@ -487,7 +402,6 @@ async fn count_memory_rows(
     .await
 }
 
-/// The read-only half of the preflight, from the already-locked family.
 #[derive(Default)]
 struct PreflightFacts {
     titles: std::collections::HashMap<Uuid, String>,
@@ -522,7 +436,6 @@ async fn load_preflight_facts(
         has_applied_changes,
         ..Default::default()
     };
-    // Family order, so the dialog's list reads parent-first like the drawer.
     for id in ids {
         let Some((_, title, has_work)) = rows.iter().find(|(tid, _, _)| tid == id) else {
             continue;
@@ -537,9 +450,6 @@ async fn load_preflight_facts(
     Ok(facts)
 }
 
-/// The 409 for members whose agent session is live in memory. The classifier
-/// passed every row, so a live session is a turn still running: in the target,
-/// or in a sub-thread.
 fn live_session_body(live: Vec<BlockingMember>, target: Uuid) -> serde_json::Value {
     let blocker = if live.iter().any(|m| m.thread_id == target) {
         Blocker::Running
@@ -552,13 +462,6 @@ fn live_session_body(live: Vec<BlockingMember>, target: Uuid) -> serde_json::Val
     )
 }
 
-/// Which members refuse the cascade, with the reason, for the dialog and for
-/// the 409 body.
-///
-/// It re-derives what `classify_family` decides rather than reading its
-/// rejection body. The dialog wants every blocker at once, and the classifier
-/// short-circuits on the first. The live-session arm has no DB row at all,
-/// which is the other reason this is its own pass.
 async fn blocking_members(
     state: &AppState,
     family: &[FamilyRow],
@@ -569,9 +472,6 @@ async fn blocking_members(
 
     let mut blocked = Vec::new();
     for row in family {
-        // The target itself is judged as if it were in the inbox, exactly as
-        // `action_blocker` asks. A descendant keeps its real section, so an
-        // archived one holding a pending change does not block.
         let archive_state = if row.thread_id == target {
             ArchiveState::Inbox
         } else {
@@ -602,11 +502,6 @@ async fn blocking_members(
     blocked
 }
 
-/// One coding-agent member, and the branch its events recorded.
-///
-/// The branch is read from the newest `SessionStarted`, most-recent-wins, the
-/// way the recovery sweep reads it. `None` for a coding-agent thread that never
-/// started a session.
 struct CodingAgentMember {
     thread_id: Uuid,
     branch: Option<String>,
@@ -646,21 +541,6 @@ async fn drop_live_subscriptions(state: &AppState, ids: &[Uuid]) {
     }
 }
 
-/// Remove each coding-agent member's worktree and branch, and sweep the two
-/// build-gate marker rows keyed on that branch.
-///
-/// Best effort, and never rolled back. The data is already gone, so a stuck
-/// worktree is the lesser failure. It is also the only chance: once the events
-/// are removed, `lookup_thread_by_short` answers `NotFound` and the cleanup
-/// worker's orphan path keeps any tree whose branch has commits (ADR 0035).
-///
-/// **A missing worktree is not a skip.** The worker may already have reclaimed
-/// the tree and kept the branch, so the recorded branch is chased through
-/// [`branch_home`]. Skipping there left a branch nothing could ever name again.
-///
-/// The dirtiness gate every worker caller applies is deliberately skipped. The
-/// owner confirmed a destructive action naming this thread, and the cascade
-/// already refused while anything in the family was live.
 async fn reclaim_worktrees(state: &AppState, coding_agents: &[CodingAgentMember]) -> usize {
     use crate::engine::worktree_cleanup::{
         deterministic_worktree_for, remove_worktree_and_optionally_delete_branch,
@@ -686,7 +566,7 @@ async fn reclaim_worktrees(state: &AppState, coding_agents: &[CodingAgentMember]
                     continue;
                 }
             };
-        // `Some(0)` rather than `None`. Otherwise the helper walks the whole
+        // INVARIANT: `Some(0)` rather than `None`. Otherwise the helper walks the whole
         // tree to size it, synchronously on this request task. The log line
         // below is the only reader of that number.
         let Some(outcome) = remove_worktree_and_optionally_delete_branch(
@@ -736,8 +616,6 @@ async fn detach_unless_on_recorded_branch(
     }
 }
 
-/// Delete a recorded branch whose worktree is already gone, from whichever repo
-/// [`branch_home`] finds it in.
 async fn delete_orphaned_branch(state: &AppState, member: &CodingAgentMember) {
     use crate::engine::git_ops::git_cmd;
 
@@ -770,16 +648,6 @@ async fn delete_orphaned_branch(state: &AppState, member: &CodingAgentMember) {
     }
 }
 
-/// Which repo holds `member`'s recorded branch, if any still does.
-///
-/// The repo set is `recovery_repo_roots`, the same enumeration the orphan sweep
-/// walks, and the first repo whose refs hold the branch wins. That is the
-/// lost-branch fallback that helper documents, used here for the same reason:
-/// the thread's own row cannot say which repo it worked in any more.
-///
-/// Two callers ask the same question for opposite purposes. The preflight asks
-/// whether there is branch work left to warn about, and the reclaim asks where
-/// to delete it.
 async fn branch_home(state: &AppState, member: &CodingAgentMember) -> Option<std::path::PathBuf> {
     use crate::engine::git_ops::{git_answer, main_worktree};
 
@@ -796,7 +664,7 @@ async fn branch_home(state: &AppState, member: &CodingAgentMember) -> Option<std
         &external,
     );
     for (root, _) in roots {
-        // An unanswerable probe is not a yes, so an unreadable repo is skipped
+        // INVARIANT: An unanswerable probe is not a yes, so an unreadable repo is skipped
         // rather than being handed a `git branch -D`.
         let holds = git_answer(
             &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
@@ -811,14 +679,6 @@ async fn branch_home(state: &AppState, member: &CodingAgentMember) -> Option<std
     None
 }
 
-/// Drop the `hardened_branches` and `planned_branches` rows for a branch that
-/// no longer exists. Both are keyed `(repo_root, branch_name)` and hold nothing
-/// but build-gate bookkeeping, so this is hygiene rather than correctness.
-///
-/// The key goes through `canonical_repo_root`, the same way both markers are
-/// written. Their own writers canonicalize because the path is derived from
-/// `git rev-parse --git-common-dir`, which can answer relatively or through a
-/// symlink. Binding the raw path here would match nothing and log nothing.
 async fn sweep_branch_markers(state: &AppState, repo_root: &std::path::Path, branch: &str) {
     let key = crate::engine::git_ops::canonical_repo_root(repo_root);
     let statements = [
@@ -862,8 +722,6 @@ async fn parent_outside_family(
 }
 
 async fn repair_ancestor_counts(state: &AppState, surviving_parent: Uuid) {
-    // The child-count rebuild includes `total_children_count`. A count of one
-    // with no child left draws a chevron that expands to nothing.
     use crate::engine::event_bus::EventBus;
     if let Err(e) = EventBus::rebuild_children_counts(&state.pool).await {
         log_legacy!("[Delete] Could not rebuild the child counts: {}", e);

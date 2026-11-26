@@ -70,7 +70,7 @@ async fn a_sighting_is_recorded_once_per_request() {
 
     assert_eq!(see(&pool, &bus, thread_id).await, ReplySeen::NothingPending);
 
-    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested, false)
         .await
         .unwrap();
     assert_eq!(see(&pool, &bus, thread_id).await, ReplySeen::Cleared);
@@ -97,7 +97,7 @@ async fn a_sighting_older_than_a_new_request_clears_nothing() {
     let thread_id = Uuid::new_v4();
     start_chat_thread(&bus, thread_id).await;
 
-    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested, false)
         .await
         .unwrap();
     let seen_at = summary_version(&pool, thread_id).await;
@@ -114,7 +114,7 @@ async fn a_sighting_older_than_a_new_request_clears_nothing() {
     })
     .await
     .unwrap();
-    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested, false)
         .await
         .unwrap();
 
@@ -145,7 +145,7 @@ async fn a_request_names_the_asking_thread() {
     let thread_id = Uuid::new_v4();
     start_chat_thread(&bus, thread_id).await;
 
-    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested, false)
         .await
         .unwrap();
     let source: Option<String> = sqlx::query_scalar(
@@ -204,7 +204,7 @@ async fn a_person_sees_a_reply_for_themselves_only() {
     let sam_laptop = person("sam-laptop", &["sam-phone", "sam-laptop"]);
     let kim = person("kim-phone", &["kim-phone"]);
 
-    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested, false)
         .await
         .unwrap();
     assert_eq!(
@@ -229,7 +229,7 @@ async fn a_person_sees_a_reply_for_themselves_only() {
     );
 
     // A new request is unread for everyone again.
-    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested, false)
         .await
         .unwrap();
     assert_eq!(seen_devices(&pool, thread_id).await, (true, vec![]));

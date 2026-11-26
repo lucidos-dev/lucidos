@@ -1,29 +1,10 @@
-//! `lucidos await-event`: subscribe this coding-agent thread to an event.
-//!
-//! The coding-agent counterpart of the chat agent's `await_event` LLM tool, and
-//! deliberately the same registration underneath (`POST
-//! /api/v1/threads/<id>/event-waits`), so the caps, the subscribability gate
-//! and the refusal wording cannot drift between the two agents.
-//!
-//! It returns immediately. Nothing blocks, nothing is polled here: the engine
-//! re-opens the thread with a follow-up message when the subscription matches,
-//! or tells it the deadline passed. Finishing the session is the correct thing to
-//! do right after calling this.
-//!
-//! `$LUCIDOS_THREAD_ID` names the thread, the same way `spawn-thread` reads it.
-
 use serde_json::{json, Value};
 
 use crate::http::{client as http_client, send_and_print};
 use crate::workspace::{BoxError, Workspace};
 
 pub(crate) struct AwaitEventArgs<'a> {
-    /// Event names to watch for. Any match re-opens the thread (OR).
     pub on: &'a [String],
-    /// Optional payload filter, applied to EVERY name in `on`. The tool form
-    /// takes a condition per entry; a CLI caller almost always watches one
-    /// event, so one flag covers the real case without an argument shape that
-    /// pairs two lists positionally.
     pub condition: Option<&'a str>,
     pub timeout_secs: i64,
     pub reason: &'a str,

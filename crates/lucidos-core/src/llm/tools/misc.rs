@@ -1,21 +1,8 @@
-//! LLM-facing schemas for cross-cutting tools that do not belong to a
-//! single domain family: navigate_ui, git_clone, get_backup_status,
-//! request_credential, connect_oauth_account,
-//! ask_user_question, await_event, list_event_waits, cancel_event_wait,
-//! request_read, expect_wake, todo_write.
-//!
-//! (manage_repositories / manage_models moved to the capability parity manifest —
-//! domains `repositories` / `models` — and are built by `capability_manifest`.)
-
 use crate::engine::thread_events::CodingAgent;
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// Single source of truth for the `navigate_ui` `target` enum — the top-level
-/// navigation destinations. The SDK `NavigateTarget` type is GENERATED from this
-/// list into `packages/lucidos-sdk/src/generated/navigate-targets.ts`, so the
-/// LLM tool schema and the SDK can never drift. To change the set, edit here.
 const NAVIGATE_TARGETS: &[&str] = &[
     "dashboard",
     "files",
@@ -37,20 +24,6 @@ const NAVIGATE_TARGETS: &[&str] = &[
     "url",
 ];
 
-/// Single source of truth for the `navigate_ui` `settings_view` enum: the
-/// Settings sub-sections the agent may deep-link to. The SDK `SettingsViewTarget`
-/// type is GENERATED from this list (same generated file as `NAVIGATE_TARGETS`).
-/// Every value here must be a renderable subview in `SettingsView.renderSubview`,
-/// and a frontend Vitest cross-check pins that.
-///
-/// Nearly every top-level Settings category and System sub-page. It used to omit
-/// four categories for being platform-gated, which the LLM had no signal for.
-/// None is gated now, only rows inside one, so nothing has to be withheld. See
-/// `docs/plans/2026-08-05-settings-information-architecture.md`.
-///
-/// Three are still absent, because every value costs the always-loaded budget
-/// and nothing has asked to link these: `webhooks`, `event-hooks` and
-/// `communication-surfaces`.
 pub const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "providers",
     "models",
@@ -65,9 +38,6 @@ pub const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "devices",
     "users",
     "system",
-    // The Overview page: connection state, versions and maintenance. `system`
-    // above is the submenu listing the sub-pages. So that one answers "open
-    // System", and this one answers "what version is this".
     "system-overview",
     "appearance",
     "keyboard-shortcuts",
@@ -81,12 +51,9 @@ pub const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "debugging",
 ];
 
-/// The `device` argument of `navigate_ui` and `capture_app`, which one
-/// resolver settles (`engine/tools/navigate.rs`).
 pub(super) const DEVICE_ARG_DESCRIPTION: &str =
     "A Known devices id. Omit for the user's last used device.";
 
-/// Tool for navigating the Lucidos UI to a specific panel, app, or file.
 pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::NAVIGATE_UI.to_string(),
@@ -124,11 +91,6 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
                     "type": "integer",
                     "description": "Last line of the range, inclusive. Omit to highlight only 'line'. 'file' only."
                 },
-                // A thread's id takes the `current` alias or a uuid, and the
-                // handler refuses anything else. The refusal is what says so,
-                // not this description, which the always-loaded budget bills on
-                // every request. See
-                // docs/plans/2026-09-18-notification-tap-thread-id-is-a-uuid.md
                 "id": {
                     "type": "string",
                     "description": "Required when target is 'thread' or 'trigger'."
@@ -164,16 +126,9 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
     }
 }
 
-/// The registry row wrapping [`get_navigate_ui_tool`], so the chat tail is a
-/// gated table rather than a push.
 pub(super) fn navigate_ui_tools() -> Vec<ToolDefinition> {
     vec![get_navigate_ui_tool()]
 }
-
-// `manage_repositories` and `manage_models` are manifest-built grouped tools
-// (see `crate::capability_manifest`, domains `repositories` / `models`). Their
-// schemas come from the manifest. `execute_tool` runs `manage_repositories`
-// through its handler and `manage_models` through its CLI's route.
 
 pub(super) fn git_clone_tools() -> Vec<ToolDefinition> {
     vec![
@@ -212,11 +167,6 @@ pub(super) fn git_clone_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-/// Standalone `get_backup_status` (read-only status, distinct surface — NOT part
-/// of the grouped `preferences` tool). Environment-variable management moved to
-/// the grouped `env_vars` manifest tool (list/set/delete); the former
-/// `set_environment_variable` name stays wired as a back-compat alias to its
-/// `set` action in `execute_tool`.
 pub(super) fn backup_status_tools() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: tn::GET_BACKUP_STATUS.to_string(),
@@ -228,14 +178,6 @@ pub(super) fn backup_status_tools() -> Vec<ToolDefinition> {
     }]
 }
 
-/// The six OAuth endpoint properties `request_credential` and
-/// `connect_oauth_account` both take, filled from the same
-/// `system-knowhow/oauth-providers` row.
-///
-/// One copy, because the two had already drifted: only one of them named the
-/// `authorize_params` separator, so a model on the other path had to guess it.
-/// `prefix` leads every description on a tool that also accepts other auth
-/// types, which is how `request_credential` still says where they apply.
 fn oauth_endpoint_props(prefix: &str) -> serde_json::Map<String, serde_json::Value> {
     let text = |body: &str| json!({ "type": "string", "description": format!("{prefix}{body}") });
     [
@@ -267,9 +209,6 @@ fn oauth_endpoint_props(prefix: &str) -> serde_json::Map<String, serde_json::Val
     .collect()
 }
 
-/// A tool's own properties with the shared OAuth endpoint block merged in.
-/// The tool's own names win, so a tool can still describe one of the six
-/// differently without losing the other five.
 fn with_oauth_endpoints(properties: serde_json::Value, prefix: &str) -> serde_json::Value {
     let mut merged = oauth_endpoint_props(prefix);
     if let serde_json::Value::Object(own) = properties {
@@ -309,7 +248,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                         "description": "Extra env var besides CRED_<NAME>, given only to a command naming it (`gh pr list  # GITHUB_TOKEN`). Must match [A-Z_][A-Z0-9_]*, not engine-owned. Single-value auth types only."
                     }
                 }), "oauth_client: "),
-                // `base_urls` is required for every type but `secret`, which is
+                // INVARIANT: `base_urls` is required for every type but `secret`, which is
                 // sent nowhere. A JSON Schema cannot say that, so the handler
                 // enforces it and names the type in its refusal.
                 "required": ["service_name", "prompt", "auth_type"]
@@ -462,7 +401,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-/// The other two verbs on a thread's own subscriptions: read them, and stand
+/// INVARIANT: The other two verbs on a thread's own subscriptions: read them, and stand
 /// them down. Siblings of `await_event`, which arms them.
 ///
 /// Both are scoped to the calling thread and take no thread id, so an agent
@@ -504,11 +443,8 @@ pub(super) fn event_wait_agent_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-/// The argument `request_read` takes, and the read-request route's body field.
 pub const READ_ARG: &str = "read";
 
-/// The *read decision* (ADR 0409, ADR 0417). Scoped to the calling thread and
-/// takes no thread id, so an agent can only decide for its own reply.
 pub(super) fn request_read_tools() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: tn::REQUEST_READ.to_string(),
@@ -526,12 +462,9 @@ pub(super) fn request_read_tools() -> Vec<ToolDefinition> {
     }]
 }
 
-/// The arguments `expect_wake` takes.
 pub const EXPECT_WAKE_MINUTES_ARG: &str = "minutes";
 pub const EXPECT_WAKE_REASON_ARG: &str = "reason";
 
-/// The *expected wake* (ADR 0603). Scoped to the calling thread and takes no
-/// thread id, like `request_read`.
 pub(super) fn expect_wake_tools() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: tn::EXPECT_WAKE.to_string(),
@@ -553,11 +486,8 @@ pub(super) fn expect_wake_tools() -> Vec<ToolDefinition> {
     }]
 }
 
-/// The argument `wake_parent` takes, and the wake-decision route's body field.
 pub const WAKE_ARG: &str = "wake";
 
-/// The *wake decision*, for a thread with a parent it reports to. Scoped to the
-/// calling thread and takes no thread id, like `request_read`.
 pub fn wake_parent_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::WAKE_PARENT.to_string(),
@@ -575,13 +505,6 @@ pub fn wake_parent_tool() -> ToolDefinition {
     }
 }
 
-/// The todo list, everywhere the *self-curated context mode* is off.
-///
-/// Under the mode the checklist lives in the working understanding, under a
-/// `[TODO]` heading in the model's own reply. Offering this schema as well
-/// would be two write surfaces for one list, which is the cost bug twice over.
-/// So the mode-on array is a strict subset of the mode-off one, and the mode
-/// adds no tool at all.
 pub(super) fn todo_write_tools(caps: &crate::llm::ToolCapabilities) -> Vec<ToolDefinition> {
     if caps.context_mode {
         return Vec::new();
@@ -589,7 +512,7 @@ pub(super) fn todo_write_tools(caps: &crate::llm::ToolCapabilities) -> Vec<ToolD
     let parameters = json!({
         "type": "object",
         "properties": {
-            // `todos` is required to write and meaningless to read, which no
+            // INVARIANT: `todos` is required to write and meaningless to read, which no
             // JSON Schema can say. So it is absent from `required` below and
             // the handler enforces it, naming `read` in the refusal. Same
             // shape as `request_credential`'s `base_urls`.
@@ -641,10 +564,6 @@ mod oauth_endpoint_tests {
         tools.remove(0)
     }
 
-    /// Both OAuth-capable tools describe the same six endpoint properties, from
-    /// one source. The two hand-written copies had already drifted: only
-    /// `connect_oauth_account` named the `authorize_params` separator, so a
-    /// model taking the `request_credential` path had to guess it.
     #[test]
     fn both_oauth_tools_read_the_same_endpoint_block() {
         let request = only_tool(request_credential_tools());
@@ -678,10 +597,6 @@ mod oauth_endpoint_tests {
     }
 }
 
-/// The SDK's `NavigateUi` types, rendered from `NAVIGATE_TARGETS` and
-/// `NAVIGABLE_SETTINGS_VIEWS` into
-/// `packages/lucidos-sdk/src/generated/navigate-targets.ts`. Edit the consts
-/// above, never the output.
 pub mod navigate_targets_codegen {
     use super::*;
     use crate::core::codegen::REGENERATE;
@@ -741,8 +656,6 @@ pub mod navigate_targets_codegen {
     mod tests {
         use super::*;
 
-        /// The tool schema's enums are built FROM the consts, so this guards only the
-        /// wiring (a refactor that hardcodes an enum again would trip it).
         #[test]
         fn tool_schema_enums_match_consts() {
             let tool = get_navigate_ui_tool();
@@ -759,8 +672,6 @@ pub mod navigate_targets_codegen {
             );
         }
 
-        /// A new-chat navigate preselects the destination with the same field
-        /// names and backend values as `run_coding_agent`.
         #[test]
         fn new_chat_destination_args_match_run_coding_agent() {
             let navigate = get_navigate_ui_tool();

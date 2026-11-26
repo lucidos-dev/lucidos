@@ -1,4 +1,4 @@
-//! Common user-install bin dirs for spawned tools.
+//! INVARIANT: Common user-install bin dirs for spawned tools.
 //!
 //! A packaged engine (launchd LaunchAgent / systemd --user unit / the macOS
 //! `.app`) inherits the service manager's minimal PATH —
@@ -18,12 +18,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// Build a PATH with the common interpreter / package-manager bin dirs
-/// (Homebrew, `/usr/local/bin`, `~/.local/bin`, npm-global) prepended to
-/// `existing`, de-duplicated and order-preserving: dirs already present keep
-/// their position, and empty components (an empty PATH element means "current
-/// directory" — a security smell) are dropped. Pure (`home` injected) so it's
-/// unit-testable without touching process env.
 pub fn augmented_user_path(
     existing: Option<std::ffi::OsString>,
     home: Option<&Path>,
@@ -46,7 +40,7 @@ pub fn augmented_user_path(
         .unwrap_or(existing)
 }
 
-/// Apply `augmented_user_path` to the ENGINE'S OWN process PATH. Call once at
+/// INVARIANT: Apply `augmented_user_path` to the ENGINE'S OWN process PATH. Call once at
 /// startup, before anything spawns or probes tools (the git/python preflights
 /// included, so they see the same PATH later spawns will).
 pub fn augment_process_path() {
@@ -88,8 +82,6 @@ mod tests {
 
     #[test]
     fn augmented_user_path_dedupes_already_present_dirs() {
-        // /usr/local/bin is already on PATH → it must not be duplicated, and
-        // its existing position must win (dev PATH order is preserved).
         let path = augmented_user_path(Some("/usr/local/bin:/usr/bin".into()), None);
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
         assert_eq!(

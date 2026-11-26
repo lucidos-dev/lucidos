@@ -1,6 +1,3 @@
-//! The confinement run's gate: a run starts only under a live permission, a
-//! once grant runs once, and an inherited engine runs nothing.
-
 use super::*;
 use crate::engine::event_bus::BusEvent;
 use crate::engine::permission::menu::DONT_ALLOW_LABEL;
@@ -14,7 +11,6 @@ use crate::test_support::{
 };
 use std::path::{Path, PathBuf};
 
-/// The gate's decision, under `GATING` as the engine takes it.
 async fn gate(
     bus: &EventBus,
     machine: &Machine,
@@ -42,12 +38,10 @@ async fn gate_for(bus: &EventBus, thread: Uuid, card_id: Option<&str>) -> Confin
         .unwrap()
 }
 
-/// A worktree path with no repo behind it, so no evidence can apply.
 fn no_worktree() -> PathBuf {
     PathBuf::from("/nonexistent/worktree")
 }
 
-/// The card the gate raised, or the test fails.
 async fn asked(bus: &EventBus, thread: Uuid) -> String {
     match gate_for(bus, thread, None).await {
         ConfinementGate::Asked { card_id } => card_id,
@@ -55,8 +49,6 @@ async fn asked(bus: &EventBus, thread: Uuid) -> String {
     }
 }
 
-/// The owner taps the option labelled `label`, the way the card's buttons
-/// record it: the answer, then what it grants.
 async fn tap(bus: &EventBus, thread: Uuid, card_id: &str, label: &str) {
     let (request, answer) = record_answer(bus, thread, card_id, label).await;
     resolve_answer(
@@ -72,7 +64,6 @@ async fn tap(bus: &EventBus, thread: Uuid, card_id: &str, label: &str) {
     .unwrap();
 }
 
-/// The first half of a tap: the answer lands, and what it grants has not.
 async fn record_answer(
     bus: &EventBus,
     thread: Uuid,
@@ -118,8 +109,6 @@ fn permitted(gate: ConfinementGate) -> PermissionRow {
     }
 }
 
-/// No grant: the owner gets one card, and a second call joins it rather than
-/// raising another.
 #[tokio::test]
 async fn no_grant_asks_the_owner_once() {
     let (pool, db) = setup_test_db().await;
@@ -141,7 +130,6 @@ async fn no_grant_asks_the_owner_once() {
     teardown_test_db(&db).await;
 }
 
-/// A caller asking nobody raises no card, and a grant still runs it.
 #[tokio::test]
 async fn asking_nobody_raises_no_card() {
     let (pool, db) = setup_test_db().await;
@@ -166,8 +154,6 @@ async fn asking_nobody_raises_no_card() {
     teardown_test_db(&db).await;
 }
 
-/// A card Lucidos raised stays open after the agent moves on (ADR 0803). The
-/// next call joins it rather than raising a second card beside it.
 #[tokio::test]
 async fn a_card_the_agent_moved_past_is_still_joined() {
     let (pool, db) = setup_test_db().await;
@@ -195,7 +181,6 @@ async fn a_card_the_agent_moved_past_is_still_joined() {
     teardown_test_db(&db).await;
 }
 
-/// Allow once runs one run. The next call asks again.
 #[tokio::test]
 async fn a_once_grant_runs_once_then_asks_again() {
     let (pool, db) = setup_test_db().await;
@@ -211,8 +196,6 @@ async fn a_once_grant_runs_once_then_asks_again() {
     teardown_test_db(&db).await;
 }
 
-/// The answer and its grant are two emits. A poll between them keeps waiting
-/// rather than reading the granted card as closed.
 #[tokio::test]
 async fn a_grant_still_landing_keeps_the_caller_waiting() {
     let (pool, db) = setup_test_db().await;
@@ -245,7 +228,6 @@ async fn a_grant_still_landing_keeps_the_caller_waiting() {
     teardown_test_db(&db).await;
 }
 
-/// Always allow covers every run, from every thread, until revoked.
 #[tokio::test]
 async fn a_standing_grant_runs_every_time_until_revoked() {
     let (pool, db) = setup_test_db().await;
@@ -266,8 +248,6 @@ async fn a_standing_grant_runs_every_time_until_revoked() {
     teardown_test_db(&db).await;
 }
 
-/// Allow once belongs to the thread that asked. Another thread gets its own
-/// card.
 #[tokio::test]
 async fn a_once_grant_covers_only_its_own_thread() {
     let (pool, db) = setup_test_db().await;
@@ -282,7 +262,6 @@ async fn a_once_grant_covers_only_its_own_thread() {
     teardown_test_db(&db).await;
 }
 
-/// Don't allow closes the card the caller waits on, and runs nothing.
 #[tokio::test]
 async fn deny_closes_the_card_and_runs_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -299,7 +278,6 @@ async fn deny_closes_the_card_and_runs_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// An agent's answer grants nothing, even when it picks Always allow.
 #[tokio::test]
 async fn an_agents_answer_grants_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -322,7 +300,6 @@ async fn an_agents_answer_grants_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// An engine inside an inherited sandbox refuses, and raises no card.
 #[tokio::test]
 async fn an_inherited_engine_refuses_and_asks_nobody() {
     let (pool, db) = setup_test_db().await;
@@ -348,8 +325,6 @@ async fn an_inherited_engine_refuses_and_asks_nobody() {
     teardown_test_db(&db).await;
 }
 
-/// The owner asked that the card name the risk, so it never reads like a
-/// routine test step.
 #[test]
 fn the_card_names_the_risk() {
     let card = confinement_card(Uuid::new_v4());
@@ -374,7 +349,6 @@ fn the_card_names_the_risk() {
     ));
 }
 
-/// A confinement run the engine recorded: its start, and its end when given.
 async fn record_run(
     bus: &EventBus,
     thread: Uuid,
@@ -440,8 +414,6 @@ async fn nobody(bus: &EventBus, thread: Uuid, worktree: &std::path::Path) -> Con
         .unwrap()
 }
 
-/// A pass on the commit the clean worktree is at answers the no-card call,
-/// and spends nothing: a live once grant is still there afterwards.
 #[tokio::test]
 async fn a_pass_on_the_current_commit_certifies_and_spends_no_grant() {
     let (pool, db) = setup_test_db().await;
@@ -477,7 +449,6 @@ async fn a_pass_on_the_current_commit_certifies_and_spends_no_grant() {
     teardown_test_db(&db).await;
 }
 
-/// Only a pass that is the latest run, on exactly this clean commit, counts.
 #[tokio::test]
 async fn evidence_that_does_not_fit_certifies_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -534,7 +505,6 @@ async fn evidence_that_does_not_fit_certifies_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// A later run hides an earlier pass, whether it failed or still runs.
 #[tokio::test]
 async fn a_later_run_hides_an_earlier_pass() {
     let (pool, db) = setup_test_db().await;
@@ -563,7 +533,6 @@ async fn a_later_run_hides_an_earlier_pass() {
     teardown_test_db(&db).await;
 }
 
-/// A new commit, or an uncommitted edit, voids the evidence.
 #[tokio::test]
 async fn a_new_commit_or_an_edit_voids_the_evidence() {
     let (pool, db) = setup_test_db().await;
@@ -592,7 +561,6 @@ async fn a_new_commit_or_an_edit_voids_the_evidence() {
     teardown_test_db(&db).await;
 }
 
-/// A background task an agent started itself is no evidence, however it ended.
 #[tokio::test]
 async fn an_agent_started_task_is_not_evidence() {
     let (pool, db) = setup_test_db().await;
@@ -623,7 +591,6 @@ async fn an_agent_started_task_is_not_evidence() {
     teardown_test_db(&db).await;
 }
 
-/// A foreground call means "run it now", so evidence never answers it.
 #[tokio::test]
 async fn a_foreground_call_is_never_answered_from_evidence() {
     let (pool, db) = setup_test_db().await;
@@ -643,7 +610,6 @@ async fn a_foreground_call_is_never_answered_from_evidence() {
     teardown_test_db(&db).await;
 }
 
-/// Config that hides a path from `git status` cannot make a tree read clean.
 #[tokio::test]
 async fn git_config_cannot_hide_a_change_from_the_tree_state() {
     use crate::engine::git_ops::git_cmd;
@@ -670,7 +636,6 @@ async fn git_config_cannot_hide_a_change_from_the_tree_state() {
     }
 }
 
-/// A probe git cannot answer is unknown, never clean.
 #[tokio::test]
 async fn a_tree_git_cannot_read_is_unknown() {
     let not_a_repo = tempfile::tempdir().unwrap();
@@ -685,7 +650,6 @@ fn hides_paths_reads_the_skip_and_assume_tags() {
     assert!(!hides_paths(b""));
 }
 
-/// Only a clean tree's run names its commit, so the script can hold it there.
 #[test]
 fn only_a_clean_run_names_its_commit() {
     assert_eq!(

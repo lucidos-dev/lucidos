@@ -1,5 +1,3 @@
-//! Verified engine operations, directional peer hops and return callbacks.
-
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Request};
@@ -54,8 +52,6 @@ impl Drop for ReturnReceiptLease {
 }
 
 impl RoutingAuthority {
-    /// Re-read the authority, and the remote start it allows. A local or
-    /// return-routed start is always allowed: its own gateway's owner granted it.
     fn recheck(&self, state: &GatewayState) -> Result<RemoteStart, ApiError> {
         let start = match self {
             Self::Local => Some(RemoteStart::allowed()),
@@ -82,7 +78,6 @@ impl RoutingAuthority {
     }
 }
 
-/// Names the setting and where its owner changes it, so an agent can relay it.
 pub(crate) fn remote_start_denied(
     state: &GatewayState,
     pairing: Option<&RemotePairing>,
@@ -192,8 +187,6 @@ async fn forward(
                 "Update the routing gateway to establish its current process identity.",
             )
         })?;
-    // Bind the process inside the source's authoritative receipt, never in the
-    // untrusted callback hints. A routing restart cuts every pending receipt.
     let operation = serde_json::to_string(&ReturnOperation {
         envelope,
         routing_instance: routing_instance.into(),
@@ -227,9 +220,6 @@ async fn forward(
     Ok(crate::relay::streamed_response(response))
 }
 
-/// Names the one step the user takes, so an agent can relay it verbatim.
-/// A pairing without a route stores no gateway id, so "off" and "unpaired"
-/// look alike here, and the step covers both.
 fn no_single_route(selector: &str, matching_routes: usize) -> ApiError {
     if matching_routes > 1 {
         return ApiError::conflict(format!(
@@ -504,8 +494,6 @@ async fn dispatch(
             version != lucidos_gateway_stamp::workspace_operation::PROTOCOL_VERSION
         })
     {
-        // Only an engine that enforces the remote start setting serves the
-        // start route. An older one answered 404 and started nothing.
         return Err(ApiError::conflict(match kind {
             OperationKind::Spawn => format!(
                 "Gateway {} refused this start: the target workspace's engine predates the \

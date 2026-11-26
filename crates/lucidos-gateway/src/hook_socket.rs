@@ -1,26 +1,3 @@
-//! The hook socket: a second listener that answers webhook deliveries only.
-//!
-//! Full design:
-//! `docs/plans/2026-08-19-webhooks-and-engines-off-the-network.md`.
-//!
-//! # Why a separate socket rather than a path
-//!
-//! This is the one surface a user may deliberately expose to the open
-//! internet, with `tailscale funnel`. Funnel maps a port, not a path. So a
-//! public caller reaching this listener must be structurally unable to address
-//! the control plane or a workspace, whatever it sends.
-//!
-//! One route, and an explicit 404 for everything else. Nothing here shares a
-//! `Router` with the main surface, and the pairing middleware is deliberately
-//! absent: a webhook sender holds no device credential.
-
-//! # It forwards, it does not decide
-//!
-//! Auth is the engine's, because the secret is. This resolves a slug to an
-//! engine socket and streams the body through untouched. A signature is
-//! computed over exact bytes, so any reserialization here would break every
-//! signed sender.
-
 use crate::engine_hop::{self, Credential};
 use crate::registry::SIGIL;
 use crate::server::GatewayState;
@@ -32,29 +9,14 @@ use axum::Router;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Biggest delivery accepted. Generous for a JSON payload and small enough that
-/// a public endpoint cannot be used to fill memory.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// How long one delivery may take, engine hop included.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Deliveries in flight at once. A public port needs a ceiling, and a sender
-/// that exceeds it gets a 503 it will retry rather than an engine under load.
 const MAX_CONCURRENT_DELIVERIES: usize = 16;
 
-/// How far above the gateway's port the hook socket sits.
-///
-/// Derived rather than fixed, so dev (5251) and packaged (5252) get 5261 and
-/// 5262 and coexist exactly as their gateways do. `LUCIDOS_HOOK_PORT` overrides
-/// it, and `0` switches the socket off entirely.
 const HOOK_PORT_OFFSET: u16 = 10;
 
-/// Resolve the hook port from the environment and the gateway's own port.
-///
-/// `None` means no hook socket. That is what an explicit `0` asks for, and what
-/// an unparseable value gets: a listener on a port nobody meant to open is
-/// worse than none.
 pub fn hook_port(configured: Option<&str>, gateway_port: u16) -> Option<u16> {
     crate::net_config::side_port(
         "LUCIDOS_HOOK_PORT",
@@ -64,11 +26,6 @@ pub fn hook_port(configured: Option<&str>, gateway_port: u16) -> Option<u16> {
     )
 }
 
-/// The same answer, read from this process's environment.
-///
-/// The bind site and the engine spawn both need it, and they must agree. The
-/// engine probes its own public ingress against this port. A disagreement would
-/// send that probe at a port nothing listens on.
 pub fn resolved_hook_port(gateway_port: u16) -> Option<u16> {
     hook_port(
         std::env::var("LUCIDOS_HOOK_PORT").ok().as_deref(),
@@ -76,26 +33,15 @@ pub fn resolved_hook_port(gateway_port: u16) -> Option<u16> {
     )
 }
 
-/// The hook socket's router: one route, and 404 for all else.
 pub fn router(state: GatewayState) -> Router {
     let routes = Router::new()
         .route("/:slug/:hook_id", axum::routing::post(deliver))
-        // Everything the main surface answers, this one must not. An explicit
-        // fallback says so, rather than leaving it to the absence of a route.
         .fallback(|| async { StatusCode::NOT_FOUND })
-        // A wrong method on the delivery path answers 404 as well, not 405. On
-        // a public socket every refusal should look the same, so probing tells
-        // a caller nothing about which paths are real.
         .method_not_allowed_fallback(|| async { StatusCode::NOT_FOUND })
         .with_state(state);
     protect(routes)
 }
 
-/// The limits every request to this socket passes through.
-///
-/// Its own function so a test can drive the same stack over a route that
-/// misbehaves on purpose. Verifying panic containment against the real handler
-/// would mean giving that handler a way to panic on request.
 fn protect(routes: Router) -> Router {
     routes
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -106,23 +52,13 @@ fn protect(routes: Router) -> Router {
         .layer(tower::limit::ConcurrencyLimitLayer::new(
             MAX_CONCURRENT_DELIVERIES,
         ))
-        // The hook path shares this process with every workspace's supervisor.
-        // An unwinding panic here would take the gateway down with it, so it
-        // becomes a 500 instead.
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
 }
 
-/// The engine's delivery route for `hook_id`, without letting a decoded path
-/// capture become URL syntax.
 fn engine_delivery_path(hook_id: &str) -> Result<String, &'static str> {
-    // The URL standard treats these two complete segments as navigation, and
-    // `Url::path_segments_mut` therefore discards them. Refuse them instead of
-    // letting caller input remove a segment from the fixed engine route.
     if matches!(hook_id, "." | "..") {
         return Err("hook ID is a URL dot segment");
     }
-    // Only the path is sent, over the engine socket. The host just lets the
-    // URL parser do the segment encoding.
     let mut url =
         reqwest::Url::parse("http://engine/api/v1/webhooks/").map_err(|_| "invalid engine URL")?;
     url.path_segments_mut()
@@ -133,23 +69,16 @@ fn engine_delivery_path(hook_id: &str) -> Result<String, &'static str> {
     Ok(url.path().to_string())
 }
 
-/// Forward one delivery to the workspace's engine.
 async fn deliver(
     State(state): State<GatewayState>,
     Path((slug, hook_id)): Path<(String, String)>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // The sigil namespace is the gateway's own, and no workspace can be called
-    // it (a slug is `[a-z0-9-]`). Refusing it by name as well costs nothing and
-    // makes the intent readable.
     if slug.len() == 1 && slug.starts_with(SIGIL) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let Some(engine) = state.engine_address(&slug) else {
-        // A slug nobody registered and a workspace that is stopped answer
-        // alike. Neither can take a delivery, and distinguishing them tells a
-        // public caller which workspaces exist.
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -158,8 +87,6 @@ async fn deliver(
         return StatusCode::BAD_GATEWAY.into_response();
     };
     let mut request = axum::http::Request::post(path);
-    // The sender's headers ride along, because the signature was computed over
-    // some of them and this listener cannot know which.
     for (name, value) in &headers {
         if !forwarded_to_engine(name.as_str()) {
             continue;
@@ -171,13 +98,6 @@ async fn deliver(
         return StatusCode::BAD_GATEWAY.into_response();
     };
 
-    // The scope, presented by the hop and never forwarded. `forwarded_to_engine`
-    // drops every inbound `x-lucidos-*`, so a public sender cannot supply this
-    // or upgrade itself to the full-authority token beside it.
-    //
-    // It reaches exactly the delivery route on an engine that requires a
-    // credential (`lucidos_agents_api::api::local_auth`). That is what stops a
-    // funnel-exposed hook from becoming a workspace restart.
     let credential = Credential::HookSocket(state.hook_socket_token());
     match engine_hop::send(&engine, request, credential).await {
         Ok(upstream) => {
@@ -194,39 +114,15 @@ async fn deliver(
     }
 }
 
-/// May this header reach the engine from a public caller?
-///
-/// The default is yes. A signature may cover any header, and this listener
-/// holds no webhook config to tell which. Dropped instead is the set that MEANS
-/// something to the engine, and is therefore a lie in the hands of whoever
-/// posted the delivery. No signature scheme signs one of these, so dropping
-/// them breaks no sender.
-///
-/// Caller passes a lowercase name, which `HeaderName::as_str` guarantees.
 fn forwarded_to_engine(name_lower: &str) -> bool {
-    // Framing, which the engine hop sets for itself off the body it is given.
     let framing = matches!(name_lower, "host" | "content-length");
-    // Trust headers. `x-lucidos-local-token` proves a caller is a process on
-    // this machine. `x-lucidos-agent-origin-token` attributes a request to a
-    // spawning thread. `x-lucidos-target-workspace` can make the engine refuse
-    // the delivery outright. A cookie is the gateway's own credential shape.
     let ours = name_lower.starts_with("x-lucidos-") || name_lower == "cookie";
-    // Browser-origin metadata, which the engine's same-origin gate reads
-    // (`api::browser_origin`). A sender that happens to set `Origin` would
-    // otherwise be refused before reaching the webhook route at all.
     let browser =
         matches!(name_lower, "origin" | "referer") || name_lower.starts_with("sec-fetch-");
-    // The two forwarding headers the gateway owns on its proxy hop
-    // (`proxy::gateway_owns_header`). The engine reads `x-forwarded-prefix` as
-    // proof that a request came through that proxy
-    // (`api::base_path::arrived_through_gateway_proxy`), and that only holds
-    // because no client can supply one. This listener is the surface a user may
-    // put on the open internet, so it owes the same strip.
     let forwarding = matches!(name_lower, "x-forwarded-prefix" | "x-forwarded-host");
     !(framing || ours || browser || forwarding || is_hop_by_hop(name_lower))
 }
 
-/// Hop-by-hop headers per RFC 7230 §6.1.
 fn is_hop_by_hop(name_lower: &str) -> bool {
     matches!(
         name_lower,
@@ -241,18 +137,10 @@ fn is_hop_by_hop(name_lower: &str) -> bool {
     )
 }
 
-/// The address the hook socket binds.
-///
-/// Loopback by default. `tailscale funnel` proxies from this machine, so it
-/// reaches loopback, while nothing else on the network can address the socket
-/// directly. That is the same reasoning that makes a loopback peer address
-/// prove nothing about a caller (ADR 0094). `LUCIDOS_HOOK_BIND_ADDR` widens it
-/// for a container (ADR 0624).
 pub fn bind_addr(configured: Option<&str>, port: u16) -> SocketAddr {
     crate::net_config::side_bind_addr("LUCIDOS_HOOK_BIND_ADDR", configured, port)
 }
 
-/// The same answer, read from this process's environment.
 pub fn resolved_bind_addr(port: u16) -> SocketAddr {
     bind_addr(
         std::env::var("LUCIDOS_HOOK_BIND_ADDR").ok().as_deref(),
@@ -270,8 +158,6 @@ mod tests {
     #[test]
     fn the_hook_port_derives_from_the_gateway_port() {
         use lucidos_installs::{DEFAULT_DEV_GATEWAY_PORT as DEV, DEFAULT_GATEWAY_PORT as PACKAGED};
-        // 5261 and 5262 are a pin: `remote-access.md` tells users to funnel
-        // those exact ports.
         assert_eq!(hook_port(None, DEV), Some(5261));
         assert_eq!(hook_port(None, PACKAGED), Some(5262));
         assert_eq!(hook_port(Some(""), DEV), Some(5261));
@@ -287,7 +173,6 @@ mod tests {
 
     #[test]
     fn a_value_that_is_not_a_port_opens_nothing() {
-        // A listener on a port nobody meant to open is worse than no listener.
         assert_eq!(hook_port(Some("nonsense"), 5251), None);
         assert_eq!(hook_port(Some("70000"), 5251), None);
     }
@@ -326,12 +211,6 @@ mod tests {
         );
     }
 
-    /// The invariant this socket exists for: nothing but a delivery answers.
-    ///
-    /// Driven through the real `Router`, so it covers the route table rather
-    /// than a restatement of it. Every case uses a slug the empty test registry
-    /// does not know, since a registered one would reach the engine hop and
-    /// fail there instead.
     #[tokio::test]
     async fn no_gateway_or_workspace_path_answers_on_the_hook_socket() {
         let state = crate::server::GatewayState::for_tests();
@@ -346,7 +225,6 @@ mod tests {
             ("GET", "/dev/app/habit-tracker/"),
             ("GET", "/dev/"),
             ("GET", "/"),
-            // The delivery route's own shape, on every other method.
             ("GET", "/dev/some-hook-id"),
             ("PUT", "/dev/some-hook-id"),
             ("DELETE", "/dev/some-hook-id"),
@@ -371,8 +249,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_delivery_to_an_unknown_workspace_is_a_flat_404() {
-        // Not a 502, and not a message naming what is registered. A public
-        // caller learns nothing about which workspaces exist.
         let state = crate::server::GatewayState::for_tests();
         let response = router(state)
             .oneshot(
@@ -389,8 +265,6 @@ mod tests {
 
     #[test]
     fn a_signed_senders_headers_reach_the_engine() {
-        // The default, and the reason the filter is a denylist: any of these
-        // may be the header a signature covers.
         for name in [
             "authorization",
             "content-type",
@@ -408,8 +282,6 @@ mod tests {
 
     #[test]
     fn a_public_caller_cannot_hand_the_engine_a_trust_header() {
-        // Every one of these MEANS something to the engine, and on this
-        // listener it is written by whoever posted the delivery.
         for name in [
             "x-lucidos-local-token",
             "x-lucidos-hook-socket-token",
@@ -421,8 +293,6 @@ mod tests {
         ] {
             assert!(!forwarded_to_engine(name), "{name} must be dropped");
         }
-        // The two engine credentials by their real names, so a rename cannot
-        // quietly take either off the list above.
         for name in [
             crate::auth::HEADER_LOCAL_TOKEN,
             crate::auth::HEADER_HOOK_SOCKET_TOKEN,
@@ -433,20 +303,11 @@ mod tests {
 
     #[test]
     fn a_public_caller_cannot_claim_the_delivery_came_through_the_proxy() {
-        // `x-forwarded-prefix` is what the engine reads as proof a request
-        // crossed the gateway's browser-facing proxy
-        // (`api::base_path::arrived_through_gateway_proxy`). That proof rests on
-        // the proxy stripping any inbound one, and this listener is the surface
-        // a user may expose with `tailscale funnel`. `x-forwarded-host` rides
-        // along for the reason the proxy owns it: a forged value reaches an
-        // upstream that generates URLs from it.
         for name in ["x-forwarded-prefix", "x-forwarded-host"] {
             assert!(!forwarded_to_engine(name), "{name} must be dropped");
         }
     }
 
-    /// An upstream that records the raw bytes of the request it is handed.
-    /// The directory holds its engine socket, so the caller keeps it alive.
     async fn capturing_engine() -> (
         tempfile::TempDir,
         crate::engine_hop::EngineAddress,
@@ -473,8 +334,6 @@ mod tests {
         (dir, engine, captured)
     }
 
-    /// I1 on the hook path: a delivery bound for a stranger's engine socket
-    /// sends it nothing, not the hook socket token and not the signed body.
     #[tokio::test]
     async fn a_delivery_to_a_strangers_socket_sends_nothing() {
         let state = crate::server::GatewayState::for_tests();
@@ -501,8 +360,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_delivery_carries_the_hook_socket_scope_and_nothing_wider() {
-        // The scope in one test. The hop presents the narrow credential, and a
-        // sender that tried to send the wide one gets it dropped.
         let state = crate::server::GatewayState::for_tests();
         let (_dir, engine, captured) = capturing_engine().await;
         state.set_route_for_test("dev", engine);
@@ -533,7 +390,6 @@ mod tests {
             !got.contains("sender-forged-full-token"),
             "a sender must not hand the engine full authority; engine saw:\n{got}"
         );
-        // The signed material still arrives, which is what ADR 0097 protects.
         assert!(
             got.contains("x-hub-signature-256: sha256=deadbeef"),
             "a signature header must survive the hop; engine saw:\n{got}"
@@ -546,8 +402,6 @@ mod tests {
 
     #[test]
     fn browser_origin_metadata_is_dropped_so_a_delivery_is_not_refused_by_the_gate() {
-        // The engine's same-origin gate reads these. A sender that sets Origin
-        // would be 403'd before its delivery reached the webhook route.
         for name in ["origin", "referer", "sec-fetch-site", "sec-fetch-mode"] {
             assert!(!forwarded_to_engine(name), "{name} must be dropped");
         }
@@ -562,10 +416,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_on_the_hook_path_becomes_a_500_and_the_process_lives() {
-        // The hook socket shares this process with every workspace's
-        // supervisor, and the gateway unwinds rather than aborting. So a
-        // malformed delivery reaching a panic must not take the machine's only
-        // gateway down with it.
         async fn boom() -> StatusCode {
             panic!("a malformed delivery")
         }
@@ -579,8 +429,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_over_the_cap_is_refused_before_the_engine_hop() {
-        // The handler reads the body, exactly as `deliver` does. That is what
-        // the limit applies to: an extractor, not the route.
         async fn read_body(body: axum::body::Bytes) -> String {
             format!("read {} bytes", body.len())
         }

@@ -6,7 +6,7 @@
 # Read-only. It reads the complete history of each event it uses, page by
 # page. The database URL comes from LUCIDOS_DATABASE_URL and reaches psql as
 # PG* variables, never a command line. The stage rules live in
-# scripts/scoreboard/stage-rules.mjs.
+# scripts/scoreboard/stage-rules.mjs. See docs/scoreboard.md for lab runs.
 #
 #   ./scripts/scoreboard.sh              # changes that moved in the last 7 days
 #   ./scripts/scoreboard.sh --days 30

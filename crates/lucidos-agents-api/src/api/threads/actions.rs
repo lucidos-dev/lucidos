@@ -1,6 +1,3 @@
-//! Thread mutation handlers — answer-question, save/unsave, move to folder, rename, suggest
-//! title, continue — and the message-history fetch.
-
 use crate::engine::agent_recovery::orphaned_branch_work::OrphanedBranchWorkExt;
 use crate::engine::chat::held_messages::HeldMessageDeliveryExt;
 use crate::engine::chat::rerun::RerunExt;
@@ -21,8 +18,6 @@ use crate::engine::permission::Action;
 
 use super::{extract_thread_uuid, parse_thread_id};
 
-/// Whether the thread is saved, and its current `summary_version`, or `None`
-/// for a thread that does not exist.
 async fn thread_is_saved(
     state: &AppState,
     thread_id: Uuid,
@@ -43,11 +38,8 @@ async fn thread_is_saved(
 pub(in crate::api) struct AnswerThreadQuestionBody {
     tool_use_id: String,
     answer: crate::engine::thread_events::AnswerKind,
-    /// The client's id for this answer, recorded as the answer event's id.
     #[serde(default)]
     event_id: Option<Uuid>,
-    /// The sending page's *input chain* and this answer's *input sequence*,
-    /// as on `POST /api/v1/chat/stream` (ADR 0449). Both or neither.
     #[serde(default)]
     input_chain: Option<String>,
     #[serde(default)]
@@ -56,7 +48,7 @@ pub(in crate::api) struct AnswerThreadQuestionBody {
     compose_epoch: Option<i64>,
 }
 
-/// POST /api/v1/threads/:thread_id/answer-question — answer a pending question
+/// INVARIANT: POST /api/v1/threads/:thread_id/answer-question — answer a pending question
 /// on `thread_id`. Used by both the CC `AskUserQuestion` hook and the chat
 /// agent's in-process `ask_user_question` tool; `answer_pending_question`
 /// branches on the originating event's channel so chat threads skip the
@@ -90,9 +82,6 @@ pub(in crate::api) async fn answer_thread_question(
              follow-up itself.",
         ));
     }
-    // An answer is the user's own, so it is the owner's button wherever it
-    // lands outside the caller's subtree (ADR 0168 clause 4). Before the answer
-    // is recorded, so a refusal leaves the card live and answerable.
     refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -165,15 +154,10 @@ pub(in crate::api) async fn answer_thread_question(
         .map_err(|e| ApiError::internal(format!("The answer could not be dispatched: {e}")))?
 }
 
-/// The body a pin or unpin answers with: the row's `summary_version` once the
-/// write landed. The client holds its optimistic row until it sees that
-/// version (ADR 0437).
 fn summary_version_body(version: i64) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "summary_version": version }))
 }
 
-/// The version the emit's own aggregate carried. A thread event always has
-/// one, so a missing version is a projection bug, reported as such.
 fn emitted_version(
     emitted: Option<crate::engine::event_bus::EmitResult>,
 ) -> Result<i64, (StatusCode, String)> {
@@ -185,8 +169,6 @@ fn emitted_version(
     })
 }
 
-/// The custom folder a pin or move names, checked against the
-/// `thread_folders` list. A missing or null `folder` is plain Pinned.
 async fn requested_folder(
     state: &AppState,
     request: &serde_json::Value,
@@ -240,9 +222,6 @@ async fn emit_pin_event(
     emitted_version(emitted)
 }
 
-/// POST /api/v1/threads/save — pin a thread, into the custom folder `folder`
-/// names when the body carries one. Pinning a pinned thread with a folder
-/// moves it there; without one it changes nothing.
 pub(in crate::api) async fn save_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -258,8 +237,6 @@ pub(in crate::api) async fn save_thread(
     let actor = crate::api::actor::user_actor(&headers, None);
     let mut version = None;
     if !already_saved {
-        // The home thread sits in no drawer section, so a pin would move it
-        // nowhere (ADR 0362).
         let is_home = crate::engine::home_thread::is_home_thread(&state.pool, thread_uuid)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -280,7 +257,6 @@ pub(in crate::api) async fn save_thread(
             .await?,
         );
 
-        // Generate title in background — don't block the save response
         let engine = state.engine.clone();
         let tid = thread_uuid.to_string();
         tokio::spawn(async move {
@@ -305,7 +281,6 @@ pub(in crate::api) async fn save_thread(
             .await?,
         );
     }
-    // The early return above leaves a pin, a move, or both to emit.
     version.map(summary_version_body).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -314,9 +289,6 @@ pub(in crate::api) async fn save_thread(
     })
 }
 
-/// POST /api/v1/threads/move-to-folder — file a pinned thread in the custom
-/// folder `folder` names, or back in plain Pinned when it is null. Refuses an
-/// unpinned thread with 409, since a folder only files a pin.
 pub(in crate::api) async fn move_thread_to_folder(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -345,15 +317,12 @@ pub(in crate::api) async fn move_thread_to_folder(
     Ok(summary_version_body(version))
 }
 
-/// POST /api/v1/threads/unsave — unsave a thread
 pub(in crate::api) async fn unsave_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let thread_uuid = extract_thread_uuid(&request)?;
-    // Idempotent mirror of save: unsaving an already-unsaved thread is a 200
-    // no-op, not a 409.
     match thread_is_saved(&state, thread_uuid).await? {
         None => return Err((StatusCode::NOT_FOUND, "Thread not found".to_string())),
         Some((false, version)) => return Ok(summary_version_body(version)),
@@ -370,7 +339,6 @@ pub(in crate::api) async fn unsave_thread(
     Ok(summary_version_body(version))
 }
 
-/// POST /api/v1/threads/rename — rename a thread (user-initiated)
 pub(in crate::api) async fn rename_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -409,7 +377,6 @@ pub(in crate::api) async fn rename_thread(
     Ok(StatusCode::OK)
 }
 
-/// POST /api/v1/threads/suggest-title — generate a title suggestion for a thread
 pub(in crate::api) async fn suggest_title(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
@@ -420,7 +387,6 @@ pub(in crate::api) async fn suggest_title(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing thread_id".to_string()))?;
     let thread_uuid = uuid::Uuid::parse_str(thread_id).ok();
 
-    // Refused before the model call, so a stale menu spends nothing.
     if let Some(id) = thread_uuid {
         let home = crate::engine::home_thread::is_home_thread(&state.pool, id)
             .await
@@ -436,7 +402,6 @@ pub(in crate::api) async fn suggest_title(
         }
     }
 
-    // Get recent messages for context (last few messages give better titles than just the first)
     let messages = state
         .engine
         .event_store()
@@ -457,8 +422,6 @@ pub(in crate::api) async fn suggest_title(
         ));
     }
 
-    // Build a summary of the conversation for title generation,
-    // including image descriptions so visual context (screenshots, tickets, etc.) informs the title.
     let summary: String = messages
         .iter()
         .filter(|m| !m.content.is_empty() || m.image_description.is_some())
@@ -474,9 +437,6 @@ pub(in crate::api) async fn suggest_title(
         .join("\n---\n");
 
     let call = crate::engine::chat::title_call(&state.engine).await;
-    // A suggestion costs the same tokens an automatic title does, so it is
-    // captured the same way. An unparseable id records on the home thread,
-    // rather than refusing the call over bookkeeping.
     let capture = crate::engine::AuxCapture::for_thread_or_home(
         &state.engine.event_bus,
         thread_uuid,
@@ -495,7 +455,7 @@ pub(in crate::api) async fn suggest_title(
     Ok(Json(serde_json::json!({ "title": title })))
 }
 
-/// POST /api/v1/threads/:thread_id/continue — resume an interrupted thread.
+/// INVARIANT: POST /api/v1/threads/:thread_id/continue — resume an interrupted thread.
 ///
 /// Dispatches by thread type:
 ///
@@ -521,9 +481,6 @@ pub(in crate::api) async fn continue_thread(
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let thread_uuid = parse_thread_id(&thread_id)?;
-    // Restarting another thread's turn is nobody's answer to anything, which is
-    // why ADR 0168 puts it on clause 4. Before the emit, so a refusal starts no
-    // turn.
     refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -534,7 +491,6 @@ pub(in crate::api) async fn continue_thread(
     .map_err(|e| (e.status_code(), e.to_string()))?;
     let actor = crate::api::actor::user_actor(&headers, None);
 
-    // Decide which dispatch path to take based on the thread's recorded type.
     let is_coding_agent: bool =
         sqlx::query_scalar("SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_uuid)
@@ -572,13 +528,10 @@ pub(in crate::api) async fn continue_thread(
                     format!("Failed to emit ContinuationRequested: {}", e),
                 )
             })?;
-        // Continue is the user's reply too, so held agent messages follow it
-        // into the resumed session (ADR 0256).
         state.engine.spawn_held_message_release(thread_uuid);
         return Ok(StatusCode::OK);
     }
 
-    // Chat / trigger thread — route through chat::rerun.
     state
         .engine
         .continue_chat(thread_uuid, actor, Default::default())
@@ -598,19 +551,12 @@ pub(in crate::api) async fn continue_thread(
     Ok(StatusCode::OK)
 }
 
-/// POST /api/v1/threads/:thread_id/harden, the Not ready strip's **Harden**.
-///
-/// Starts the hardening run for a resting coding-agent thread whose turn end
-/// withheld its work as `hardening_missing`. Its turn end then proposes the
-/// change through the normal floor. Any other thread is refused with a 409,
-/// so the button can never start a turn the strip did not offer.
 pub(in crate::api) async fn harden_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let thread_uuid = parse_thread_id(&thread_id)?;
-    // Starting a turn on another thread is the same act as Continue.
     refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -637,13 +583,11 @@ pub(in crate::api) async fn harden_thread(
                 format!("Failed to start hardening: {}", e),
             )
         })?;
-    // Harden is the user's reply too, so held agent messages follow it into
-    // the resumed session, as they follow Continue (ADR 0256).
     state.engine.spawn_held_message_release(thread_uuid);
     Ok(StatusCode::OK)
 }
 
-/// POST /api/v1/threads/:thread_id/event-waits/:wait_id/cancel, the **Stop
+/// INVARIANT: POST /api/v1/threads/:thread_id/event-waits/:wait_id/cancel, the **Stop
 /// waiting** button on one subscription in the indicator.
 ///
 /// Cancels that wait and nothing else: a thread may hold several, and stopping
@@ -666,8 +610,6 @@ pub(in crate::api) async fn cancel_thread_event_wait(
     let thread_uuid = parse_thread_id(&thread_id)?;
     let wait_uuid = Uuid::parse_str(&wait_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid wait_id: {e}")))?;
-    // The path names the thread, and the caller picks the path. So an agent
-    // presenting its token is held to its own reach, as on every cancel route.
     refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -717,10 +659,6 @@ pub(super) fn refuse_event_waits_for_another_thread(
     )
 }
 
-/// Refuse a subprocess whose origin token names a thread other than
-/// `thread_id`, with `refusal` as the 403 body. The check behind every route
-/// that acts on the calling thread only. See
-/// [`refuse_event_waits_for_another_thread`] for who is in scope and why.
 pub(super) fn refuse_an_agent_from_another_thread(
     headers: &HeaderMap,
     thread_id: Uuid,
@@ -737,26 +675,6 @@ pub(super) fn refuse_an_agent_from_another_thread(
     }
 }
 
-/// POST /api/v1/threads/:thread_id/event-waits, the way a **coding agent**
-/// subscribes to an event.
-///
-/// The chat agent reaches the same registration through the `await_event` LLM
-/// tool, in process. A coding agent cannot: the engine does not own a Claude
-/// Code or Codex session's tool set, so its route in is the `lucidos
-/// await-event` CLI subcommand over this endpoint.
-///
-/// This is only possible because a subscription no longer holds a turn. The
-/// attached shape needed a dangling `tool_use` in a message array the engine
-/// controls, which is exactly what it does not have for a coding-agent session
-/// (S11 of `docs/plans/2026-08-05-a-thread-parks-on-an-event-wait.md` excluded
-/// them for that reason). Registration now returns immediately and the delivery
-/// arrives as an ordinary follow-up message, which the coding-agent lane
-/// already knows how to deliver.
-///
-/// The body is the same `{on, timeout_secs, reason}` the tool takes, so the
-/// caps, the subscribability gate and the duplicate refusal are one
-/// implementation rather than two. `tool_use_id` is synthesized here: there is
-/// no tool call to pair with, and the field is only an id the wait carries.
 pub(in crate::api) async fn register_thread_event_wait(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -766,7 +684,7 @@ pub(in crate::api) async fn register_thread_event_wait(
     let thread_uuid = parse_thread_id(&thread_id)?;
     refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
 
-    // The thread has to exist, and this is the one caller that can get it
+    // INVARIANT: The thread has to exist, and this is the one caller that can get it
     // wrong: the LLM tool takes its thread id from `execute_tool` and cannot
     // name another, while a CLI caller passes `$LUCIDOS_THREAD_ID` and could be
     // running outside a session or against a stale id. Arming a wait for a
@@ -787,9 +705,6 @@ pub(in crate::api) async fn register_thread_event_wait(
         ));
     }
 
-    // A refusal is the caller's own fault (a bad `on` entry, a cap it has hit),
-    // so it is a 400 carrying the same text the chat agent would read, not a
-    // 500. The two agents get the identical wording by construction.
     let synthetic_tool_use_id = format!("cli-{}", Uuid::new_v4());
     match state
         .engine
@@ -805,17 +720,6 @@ pub(in crate::api) async fn register_thread_event_wait(
     }
 }
 
-/// GET /api/v1/threads/:thread_id/event-waits, the read half of a **coding
-/// agent**'s subscription surface (`lucidos event-waits list`).
-///
-/// The chat agent reaches the same set through the `list_event_waits` LLM tool,
-/// in process. Both read the dispatcher's live cache rather than the event
-/// store, so neither can disagree with what will actually wake the thread.
-///
-/// Scoped to the calling thread by
-/// [`refuse_event_waits_for_another_thread`], which is what makes this route
-/// keep the promise the tool keeps structurally by taking no thread argument at
-/// all.
 pub(in crate::api) async fn list_thread_event_waits(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -830,19 +734,6 @@ pub(in crate::api) async fn list_thread_event_waits(
     })))
 }
 
-/// POST /api/v1/threads/:thread_id/event-waits/cancel, an **agent standing its
-/// own subscriptions down** (`lucidos event-waits cancel`).
-///
-/// Deliberately a separate route from the per-wait
-/// `.../event-waits/:wait_id/cancel`, which is the UI's **Stop waiting** button
-/// and stamps `UserStop`. The two differ in the cause they record and in what
-/// they can address: this one also takes `all`, and it never claims a person
-/// pressed anything. Folding them into one route would mean a body field
-/// deciding whose action the event log attributes it to, which is exactly the
-/// thing an actor must not be.
-///
-/// Body: `{"wait_id": "..."}`, `{"on": "EventType"}` or `{"all": true}`,
-/// exactly one.
 pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -852,8 +743,6 @@ pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
     let thread_uuid = parse_thread_id(&thread_id)?;
     refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
     let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-    // Trimmed and emptied by `resolve_cancel_target`, which is the one place
-    // that decides what counts as "an argument was passed" for all three.
     let on = args.get("on").and_then(|v| v.as_str());
     let wait_id = match args
         .get("wait_id")
@@ -870,9 +759,6 @@ pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
         None => None,
     };
 
-    // A refusal is the caller's own fault (both arguments, neither, or an id
-    // that is not live here), so it is a 400 carrying the same words the chat
-    // agent would read. The two agents get identical wording by construction.
     match state
         .engine
         .cancel_event_waits_for_agent(thread_uuid, wait_id, on, all)
@@ -887,7 +773,6 @@ pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
     }
 }
 
-/// GET /api/v1/threads/:thread_id/messages — get all messages for a thread
 pub(in crate::api) async fn get_thread_messages(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,

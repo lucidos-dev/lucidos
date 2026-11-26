@@ -1,14 +1,3 @@
-//! Coverage for `POST /api/v1/threads/:thread_id/archive`, archiving on the
-//! caller's own authority (ADR 0310).
-//!
-//! This suite is the USER's path: a caller with a credential but no origin
-//! token archives any thread, through the Archive button's cascade. The
-//! agent's narrower ladder needs a thread-bound origin token, which an outside
-//! HTTP client cannot get (see `follow_up_test.rs`). The engine's tests over
-//! `authorize_agent_archive` cover that ladder instead.
-//!
-//! Rows are seeded directly, as `cascade_archive_test.rs` does.
-
 use crate::support::{base_url, count_events_of_type, db_url, http_client, user_client};
 use uuid::Uuid;
 
@@ -54,8 +43,6 @@ async fn archive_state(pool: &sqlx::PgPool, thread: Uuid) -> String {
         .unwrap()
 }
 
-/// The user archives a child through the route. The cascade takes the child's
-/// own sub-thread with it, and the parent above it is left alone.
 #[tokio::test]
 async fn the_user_archives_a_thread_and_its_sub_threads() {
     let client = user_client().await;
@@ -87,8 +74,6 @@ async fn the_user_archives_a_thread_and_its_sub_threads() {
     cleanup(&pool, &[parent, child, grandchild]).await;
 }
 
-/// A thread waiting on the user is refused with the Archive route's own slug
-/// (ADR 0259), and the body says what to do.
 #[tokio::test]
 async fn a_waiting_thread_is_refused_like_the_archive_route() {
     let client = user_client().await;
@@ -126,8 +111,6 @@ async fn a_waiting_thread_is_refused_like_the_archive_route() {
     cleanup(&pool, &[waiting]).await;
 }
 
-/// `current` names the caller's own thread, and a caller with no origin token
-/// has none, so the alias is refused rather than guessed.
 #[tokio::test]
 async fn the_route_refuses_what_it_cannot_name() {
     let client = user_client().await;
@@ -141,8 +124,6 @@ async fn the_route_refuses_what_it_cannot_name() {
     );
 }
 
-/// A caller presenting no credential at all is refused before anything is
-/// read, like every mutating route (ADR 0169).
 #[tokio::test]
 async fn the_route_refuses_a_caller_with_no_credential() {
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");

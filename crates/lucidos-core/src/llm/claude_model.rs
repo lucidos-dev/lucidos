@@ -1,6 +1,4 @@
-//! Claude model classification shared by the wire formats and reasoning policy.
-
-/// Models that support extended thinking (reasoning goes to dedicated blocks
+/// INVARIANT: Models that support extended thinking (reasoning goes to dedicated blocks
 /// instead of polluting the text response).
 ///
 /// The Sonnet families need two rules. `claude-sonnet-4` covers 4.x
@@ -24,30 +22,22 @@ pub(crate) fn supports_extended_thinking(model: &str) -> bool {
         || model.contains("claude-fable-5")
 }
 
-/// What an adaptive-thinking model does when a request omits `thinking`, and
-/// whether it can be turned off at all. Effort `none` means something
-/// different in each case, so `thinking_config` branches on this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThinkingMode {
-    /// Omitting `thinking` runs the model without it.
     OffByDefault,
-    /// Omitting `thinking` still runs adaptive thinking, so turning it off
+    /// INVARIANT: Omitting `thinking` still runs adaptive thinking, so turning it off
     /// takes an explicit `{type: "disabled"}`.
     OnByDefault,
-    /// Thinking cannot be turned off: `{type: "disabled"}` is a 400. Effort is
-    /// the only control, and the model returns its notes between tool calls
-    /// as `thinking` blocks rather than `text`.
     AlwaysOn,
 }
 
-/// One adaptive-thinking Claude family. See [`ADAPTIVE_THINKING_MODELS`].
 pub(super) struct AdaptiveModel {
     pub(super) fragment: &'static str,
     pub(super) max_output_tokens: u32,
     pub(super) mode: ThinkingMode,
 }
 
-/// Adaptive-thinking Claude models, each with the ceiling the API accepts for
+/// INVARIANT: Adaptive-thinking Claude models, each with the ceiling the API accepts for
 /// its `max_tokens` and its [`ThinkingMode`].
 ///
 /// The first matching fragment wins, so a more specific id sits above the
@@ -115,15 +105,10 @@ pub(super) fn adaptive_model(model: &str) -> Option<&'static AdaptiveModel> {
         .find(|entry| model.contains(entry.fragment))
 }
 
-/// The [`ThinkingMode`] of an adaptive-thinking model, or `None` when the model
-/// is not one. `Some` means adaptive thinking only: no `budget_tokens`, no
-/// `temperature`/`top_p`/`top_k`, effort through `output_config.effort`.
-/// Sonnet 4.6 and older stay on the `budget_tokens` path.
 pub fn thinking_mode(model: &str) -> Option<ThinkingMode> {
     adaptive_model(model).map(|entry| entry.mode)
 }
 
-/// Whether Vertex uses the Claude request path for this model.
 pub fn is_vertex_claude_model(model: &str) -> bool {
     model.starts_with("claude")
 }

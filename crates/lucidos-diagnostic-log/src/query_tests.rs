@@ -61,7 +61,6 @@ fn times_take_rfc_3339_or_an_age() {
         "since=-2h",
         "since=h",
         "since=",
-        // A multibyte last character must refuse, not split mid-character.
         "since=2%C2%B5",
         "since=5%EF%BD%8D",
     ] {
@@ -120,7 +119,6 @@ fn an_unknown_or_repeated_parameter_refuses() {
     assert!(refused("since=1h&since=2h").contains("twice"));
 }
 
-/// A record as an older or a raw writer could have left it.
 fn line(ts: &str, pid: u32, label: &str, msg: &str) -> String {
     serde_json::json!({ "ts": ts, "pid": pid, "label": label, "msg": msg }).to_string()
 }
@@ -209,8 +207,6 @@ fn the_newest_matches_come_back_oldest_first_across_both_segments() {
     assert_eq!(outside.returned, 0);
 }
 
-/// A rotation between the two opens leaves both names on one file. That file
-/// is read once, not twice and not skipped.
 #[cfg(unix)]
 #[test]
 fn a_rotation_mid_scan_reads_the_rotated_file_once() {
@@ -297,8 +293,6 @@ fn a_missing_dir_is_an_error_and_an_empty_dir_is_an_empty_log() {
     assert_eq!((result.returned, result.coverage_starts_at), (0, None));
 }
 
-/// The whole write path, then a query: each secret class is masked in the
-/// file and in the answer.
 #[test]
 fn every_secret_class_is_masked_in_the_file_and_the_answer() {
     sanitize::register_secret_values(["registered-known-credential".to_string()]);
@@ -425,7 +419,6 @@ fn a_merged_byte_budget_keeps_a_suffix_even_when_a_source_could_not_return_its_n
     );
     let gateway = super::run(tmp.path(), &q, Source::Gateway).unwrap();
     assert!(gateway.lines.is_empty());
-    // Exercise the same wire hop that forwards the gateway's byte cutoff.
     let gateway = serde_json::from_slice(&serde_json::to_vec(&gateway).unwrap()).unwrap();
     segment(
         tmp.path(),

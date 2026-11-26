@@ -8,7 +8,7 @@ import {
   EVENT_RESOLVE_DEADLINE_MS,
   classifyScroll,
   hasPendingEventScroll,
-  holdRestoredPlace,
+  recordReadingLine,
   markNavigationScroll,
   onDeepLinkClaimed,
   onDeepLinkResolved,
@@ -18,8 +18,9 @@ import {
   type FollowResumeFrom,
   type ScrollClass,
 } from '../components/chat/scrollState';
+import { scrollPosition } from '../components/chat/scrollOwner';
 import { onClassifiedScroll } from '../components/chat/classifiedScroll';
-import { ANCHOR_ATTR, anchorRow, anchorTargetTop, anchorTurn, anchorTurnIsClamped, blockRelTop, lineBlockOf, lineTargetTop, readLineAnchor, readLineBlock, readRowAnchor, readScrollAnchor, rowTargetTop, type LineAnchor, type LineBlock, type RowAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
+import { ANCHOR_ATTR, anchorRow, anchorTargetTop, anchorTurn, anchorTurnIsClamped, lineBlockOf, lineTargetTop, readLineAnchor, readRowAnchor, readScrollAnchor, rowTargetTop, type LineAnchor, type RowAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
 import { onPageHide, onPageWake } from '../utils/pageVisit';
 import { postClientLog } from '../utils/clientLog';
 import { watchUserAction } from '../utils/userAction';
@@ -93,7 +94,8 @@ export function attachScrollMemory(
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let lastSaved: string | null = null;
   let hasWritten = false;
-  let restoring = true;
+  const restore = scrollPosition.beginRestore();
+  const writeRestore = (top: number) => restore.write(() => markNavigationScroll(el, top));
   let hasSettled = false;
   let observed: string | undefined;
   let contentObserver: MutationObserver | null = null;
@@ -129,7 +131,7 @@ export function attachScrollMemory(
   };
 
   const stopRestore = (settled = true) => {
-    restoring = false;
+    restore.finish();
     resizeObserver?.disconnect();
     resizeObserver = null;
     mutationObserver?.disconnect();
@@ -169,28 +171,20 @@ export function attachScrollMemory(
   };
 
   const placeFromRecord = (record: SavedScroll, top: number) => {
-    markNavigationScroll(el, top);
+    writeRestore(top);
     const target = record.kind === 'anchor' ? anchorTurn(el, record)
       : record.kind === 'row' ? anchorRow(el, record)
       : record.kind === 'line' ? lineBlockOf(el, record)
       : null;
     if (!target) return;
-    const line = readLineBlock(el);
-    holdRestoredPlace(el, line?.block ?? target, reportSettledDrift(record, line), line?.turn);
-  };
-
-  const reportSettledDrift = (record: SavedScroll, line: LineBlock | null) => () => {
-    if (!anchorsToContent || !line || (isCurrent && !isCurrent())) return;
-    const now = blockRelTop(el, line.block);
-    if (now === null) return;
-    postClientLog('scroll', 'restore', { outcome: 'settled', form: record.kind, drift: Math.round(now - line.relTop) });
+    recordReadingLine(el, target);
   };
 
   const positionFromRecord = () => {
     if (saved === null || saved.kind === 'live-edge') return;
     if (saved.kind === 'offset' && saved.top === 0) {
-      markNavigationScroll(el, 0);
-      restoring = false;
+      writeRestore(0);
+      restore.finish();
       reportRestore('landed');
       return;
     }
@@ -198,7 +192,7 @@ export function attachScrollMemory(
   };
 
   const tryRestore = (final = false) => {
-    if (!restoring || saved === null || saved.kind === 'live-edge') return;
+    if (!restore.waiting() || saved === null || saved.kind === 'live-edge') return;
     const placement = placementFor(saved);
     if (placement === null) {
       if (!final) keepWaitingForAnchor();
@@ -230,7 +224,7 @@ export function attachScrollMemory(
       return;
     }
     tryRestore(true);
-    if (restoring) reportRestore('gave-up');
+    if (restore.waiting()) reportRestore('gave-up');
     stopRestore();
   };
 
@@ -267,7 +261,7 @@ export function attachScrollMemory(
         } else if (rescue !== null) {
           placeFromRecord(rescue.record, rescue.top);
         } else if (resetOnEmpty) {
-          markNavigationScroll(el, 0);
+          writeRestore(0);
         }
       }, EVENT_RESOLVE_DEADLINE_MS + DEAD_DEEP_LINK_SLACK_MS);
     };
@@ -316,7 +310,7 @@ export function attachScrollMemory(
 
   const recordContentPlace = () => {
     if (observed === undefined) return;
-    if (restoring) return;
+    if (restore.waiting()) return;
     if (isCurrent && !isCurrent()) return;
     const next = currentPosition();
     if (next === null) return;
@@ -338,7 +332,7 @@ export function attachScrollMemory(
   };
 
   const onScroll = (scroll: ScrollClass) => {
-    if (restoring) return;
+    if (restore.waiting()) return;
     if (isCurrent && !isCurrent()) return;
     const next = currentPosition(scroll);
     if (next === null) return;
@@ -365,18 +359,18 @@ export function attachScrollMemory(
   } else if (saved === null) {
     const seeded = followsLiveEdge && applyFollowSeed(el);
     reportRestore(seeded ? 'follow-seed' : 'top');
-    if (!seeded && resetOnEmpty) markNavigationScroll(el, 0);
-    restoring = false;
+    if (!seeded && resetOnEmpty) writeRestore(0);
+    restore.finish();
   } else if (saved.kind === 'live-edge') {
     resumeFollowingBottom(el);
-    restoring = false;
+    restore.finish();
     reportRestore('live-edge');
   } else {
     positionFromRecord();
   }
 
-  if (restoring) {
-    if (resetOnEmpty) markNavigationScroll(el, 0);
+  if (restore.waiting()) {
+    if (resetOnEmpty) writeRestore(0);
     resizeObserver = new ResizeObserver(() => tryRestore());
     resizeObserver.observe(el);
     mutationObserver = new MutationObserver(() => tryRestore());
@@ -405,14 +399,14 @@ export function attachScrollMemory(
 
 
   const unsubscribeDeepLink = onDeepLinkClaimed(() => {
-    if (!restoring && deadlineTimer === null) return;
+    if (!restore.waiting() && deadlineTimer === null) return;
     if (openIsOurs()) return;
     standDownForDeepLink();
   });
 
   const unsubscribeDeepLinkResolved = onDeepLinkResolved(() => {
     if (openIsOurs()) return;
-    if (!restoring && deadlineTimer !== null) stopRestore();
+    if (!restore.waiting() && deadlineTimer !== null) stopRestore();
     recordDeepLinkLanding();
     settleRestore();
   });

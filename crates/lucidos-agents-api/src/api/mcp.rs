@@ -15,7 +15,7 @@ use axum::routing::patch;
 pub(super) struct McpConsentResponse {
     pub request_id: String,
     pub allowed: bool,
-    /// When `Some(_)` and `allowed == true`, the engine derives a pattern
+    /// INVARIANT: When `Some(_)` and `allowed == true`, the engine derives a pattern
     /// from the original prompt's tool_name + input and remembers it so
     /// future identical-pattern requests skip the prompt. Where the pattern
     /// is recorded as a *tool grant* depends on scope:
@@ -33,16 +33,6 @@ pub(super) struct McpConsentResponse {
     pub always_deny: bool,
 }
 
-/// POST /api/v1/mcp/consent — Respond to a coding-agent (Claude Code / Codex)
-/// permission prompt. Resolves the deduped, multi-listener entry in
-/// `pending_cc_permission` and owns the paired `CodingAgentPermissionResolved`
-/// event so it fires once per click rather than once per deduped HTTP listener.
-///
-/// The chat MCP permission lane has its own endpoint
-/// (`/api/v1/mcp-permission/consent`); this one is coding-agent-only.
-///
-/// Thin: resolving one is `cc_permission::resolve_coding_agent_permission`,
-/// which a spoken answer reaches too. This adds the actor and the wire shape.
 pub(super) async fn submit_mcp_consent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -102,7 +92,7 @@ pub(super) struct McpAutoApproveRequest {
     pub auto_approve: bool,
 }
 
-/// PUT /api/v1/mcp/auto-approve — Set auto-approve for an MCP server.
+/// INVARIANT: PUT /api/v1/mcp/auto-approve — Set auto-approve for an MCP server.
 ///
 /// The store emits `McpServerUpdated` from inside its write path. So this
 /// handler resolves the device actor and hands it over, the way every other
@@ -127,7 +117,7 @@ pub(super) async fn set_mcp_auto_approve(
     }
 }
 
-/// GET /api/v1/mcp/servers: list MCP servers with status and context cost.
+/// INVARIANT: GET /api/v1/mcp/servers: list MCP servers with status and context cost.
 ///
 /// Cost is computed here rather than client-side, through the same
 /// `tool_definitions_chars` and `estimate_tokens_from_chars` the request packer
@@ -149,8 +139,6 @@ pub(super) async fn list_mcp_servers(
         .map_err(|e| ApiError::internal(format!("Failed to list MCP servers: {e}")))?;
     let totals = McpCostTotals::of(&servers);
 
-    // The window the resolved model actually has, so the page can state the
-    // share of it these tools occupy.
     let (model, context_window) = state.engine.chat_model_and_window().await;
     let budget_model = state.engine.request_budget_model_for(&model, None);
     let budget = state
@@ -169,7 +157,7 @@ pub(super) async fn list_mcp_servers(
     })))
 }
 
-/// The registry row for `id`, or a 404.
+/// INVARIANT: The registry row for `id`, or a 404.
 ///
 /// Every per-server verb loads the row first. That is what separates "no such
 /// server" from a start that really failed. It also hands `start_loaded` the
@@ -182,7 +170,7 @@ async fn load_server(state: &AppState, id: &str) -> Result<McpServer, ApiError> 
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{id}' not found")))
 }
 
-/// The error for a server whose STORED id cannot ride a wire tool name, or
+/// INVARIANT: The error for a server whose STORED id cannot ride a wire tool name, or
 /// `None` when it can.
 ///
 /// 422 rather than the 502 a failed start gets, and the distinction is the
@@ -199,11 +187,6 @@ fn unusable_id_error(server: &McpServer) -> Option<ApiError> {
     })
 }
 
-/// The error for a start that reached the process and failed there.
-///
-/// 502, because the failure is the upstream server's: a missing binary, a bad
-/// command, an app that is not running. A 500 would read as an engine bug and
-/// hide the one line that says what to fix.
 fn start_failed_error(id: &str, e: impl std::fmt::Display) -> ApiError {
     ApiError::new(
         StatusCode::BAD_GATEWAY,
@@ -211,7 +194,7 @@ fn start_failed_error(id: &str, e: impl std::fmt::Display) -> ApiError {
     )
 }
 
-/// Record the owner's click as approval of `server`'s current launch line, so
+/// INVARIANT: Record the owner's click as approval of `server`'s current launch line, so
 /// the start gate lets it spawn whatever the command guard setting.
 ///
 /// Only the owner's registered device approves. Any other caller's start
@@ -244,8 +227,6 @@ async fn approve_launch_by_owner_click(
         })
 }
 
-/// POST /api/v1/mcp/servers/:id/start: start a registered server. The owner's
-/// click approves its launch line (ADR 0002, MCP addendum).
 pub(super) async fn start_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -279,11 +260,6 @@ pub(super) async fn start_mcp_server(
     })))
 }
 
-/// POST /api/v1/mcp/servers/:id/stop: stop a server, which switches it off
-/// in every thread (ADR 0430).
-///
-/// Stopping one that is already stopped is a 200, not an error: the caller
-/// asked for a state and got it. Only an unknown id is a 404.
 pub(super) async fn stop_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -304,7 +280,6 @@ pub(super) async fn stop_mcp_server(
     })))
 }
 
-/// A 404 unless `thread_id` names a thread.
 async fn require_thread(state: &AppState, thread_id: Uuid) -> Result<(), ApiError> {
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)")
@@ -319,9 +294,6 @@ async fn require_thread(state: &AppState, thread_id: Uuid) -> Result<(), ApiErro
     }
 }
 
-/// POST /api/v1/threads/:thread_id/mcp-servers/:id/enable: enable a server in
-/// one thread, starting it if it is not running (ADR 0430). The owner's click
-/// approves its launch line, as Start does.
 pub(super) async fn enable_thread_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -361,8 +333,6 @@ pub(super) async fn enable_thread_mcp_server(
     })))
 }
 
-/// POST /api/v1/threads/:thread_id/mcp-servers/:id/disable: disable a server
-/// in one thread. The process keeps running for the threads that use it.
 pub(super) async fn disable_thread_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -390,13 +360,12 @@ pub(super) async fn disable_thread_mcp_server(
     })))
 }
 
-/// DELETE /api/v1/mcp/servers/:id: remove a server, stopping it first.
 pub(super) async fn remove_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    // The store emits `McpServerRemoved` from inside its write path, so the
+    // INVARIANT: The store emits `McpServerRemoved` from inside its write path, so the
     // device actor is resolved up front and passed down.
     let actor = Some(super::actor::require_user_actor(&headers, &state.pool, None).await?);
     let removed = state
@@ -415,19 +384,10 @@ pub(super) async fn remove_mcp_server(
 
 #[derive(Deserialize)]
 pub(super) struct McpToolSwitchRequest {
-    /// The tool, by WIRE name (`mcp__<server>__<tool>`).
     wire_name: String,
-    /// True switches it off, false back on.
     disabled: bool,
 }
 
-/// PATCH /api/v1/mcp/servers/:id/disabled-tools: switch one tool off or back
-/// on, and answer with the stored set.
-///
-/// One tool per call, so two clients' switches commute rather than one
-/// whole-set write overwriting the other (ADR 0437). Names are not checked
-/// against the manifest. A stopped server may have none to check against, and
-/// a name matching no tool simply filters nothing.
 pub(super) async fn set_mcp_disabled_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -446,8 +406,6 @@ pub(super) async fn set_mcp_disabled_tools(
     Ok(Json(serde_json::json!({ "disabled_tools": stored })))
 }
 
-/// GET /api/v1/mcp-allowed-tools: this workspace's standing chat MCP grants.
-/// The MCP counterpart of the `cc-allowed-tools` pair in `api/settings.rs`.
 pub(super) async fn get_mcp_allowed_tools(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, ApiError> {
@@ -456,9 +414,6 @@ pub(super) async fn get_mcp_allowed_tools(
         .map_err(|(status, message)| ApiError::new(status, message))
 }
 
-/// PUT /api/v1/mcp-allowed-tools: replace the standing MCP grants. The gate
-/// reads them fresh on each prompt, so an edit takes effect on the next gated
-/// MCP call.
 pub(super) async fn put_mcp_allowed_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -469,11 +424,6 @@ pub(super) async fn put_mcp_allowed_tools(
         .map_err(|(status, message)| ApiError::new(status, message))
 }
 
-/// Routes for the `/mcp/*` surface, a thread's enabled servers, and the
-/// `mcp-allowed-tools` editor.
-///
-/// The per-server verbs take the id as a path param. `auto-approve` keeps its
-/// body form so the client that already calls it does not break.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/mcp/consent", post(submit_mcp_consent))
@@ -504,8 +454,6 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    /// An agent's `lucidos mcp start` reaches the same route as the Start
-    /// button. Only the button may approve the line.
     #[tokio::test]
     async fn only_the_owners_click_approves_a_launch_line() {
         use crate::core::subprocess_origin::{
@@ -582,7 +530,6 @@ mod tests {
             serde_json::from_str(r#"{"request_id":"r","allowed":true}"#).unwrap();
         assert_eq!(body.persist_scope, None);
 
-        // Unknown wire value rejected at the boundary (would 400 in axum).
         assert!(serde_json::from_str::<McpConsentResponse>(
             r#"{"request_id":"r","allowed":true,"persist_scope":"yolo"}"#
         )
@@ -604,17 +551,10 @@ mod tests {
         }
     }
 
-    /// The three per-server failures map to three different statuses, and the
-    /// page renders three different things. Collapsing the unusable id into the
-    /// start failure is what left the reported server showing a generic error
-    /// the user could only retry.
     #[test]
     fn the_three_per_server_failures_stay_distinct() {
-        // A usable id raises nothing, so the request proceeds to the process.
         assert!(unusable_id_error(&server_with_id("backstage")).is_none());
 
-        // A stored id that cannot ride a wire tool name is 422, not 502: no
-        // retry will ever help, and the message has to say so.
         let unusable =
             unusable_id_error(&server_with_id("back.stage")).expect("a dotted id is unusable");
         assert_eq!(unusable.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -625,21 +565,15 @@ mod tests {
             unusable.message
         );
 
-        // A start that reached the process and failed is 502, carrying the
-        // process error verbatim so the user can see what to fix.
         let failed = start_failed_error("slack", "Failed to spawn MCP server 'npx': not found");
         assert_eq!(failed.status, StatusCode::BAD_GATEWAY);
         assert!(failed.message.contains("not found"));
         assert!(failed.message.contains("slack"));
 
-        // And an unknown id is a 404, which is what stops a DELETE on nothing
-        // reporting success.
         let missing = ApiError::not_found(format!("MCP server '{}' not found", "gone"));
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
     }
 
-    /// An over-long id is refused for a different reason than a dotted one, and
-    /// both are the same class of unusable. Each message names its own cause.
     #[test]
     fn an_over_long_id_is_unusable_for_its_own_stated_reason() {
         let long = "a".repeat(crate::core::mcp_servers::MAX_SERVER_ID_LEN + 1);
@@ -648,8 +582,6 @@ mod tests {
         assert!(e.message.contains("characters"), "{}", e.message);
     }
 
-    /// A switch names one tool and which way it goes. Both fields are
-    /// required: a body missing `disabled` must not read as "back on".
     #[test]
     fn a_tool_switch_names_one_tool_and_its_direction() {
         let body: McpToolSwitchRequest =
@@ -662,18 +594,11 @@ mod tests {
         assert!(serde_json::from_str::<McpToolSwitchRequest>(r#"{"disabled":false}"#).is_err());
     }
 
-    /// The saved preference wins over the boot-time provider default, and the
-    /// `[1m]` marker it carries is what decides the window.
-    ///
-    /// The page named the provider default instead. A user on a `[1m]` model
-    /// was told their tools ate a share of 200k, against a request the packer
-    /// sizes at 1M.
     #[tokio::test]
     async fn the_page_names_the_saved_chat_model_not_the_boot_default() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
 
-        // Unset: the provider default is all there is to report.
         assert_eq!(
             crate::core::PreferenceStore::resolved_chat_model(&pool, "claude-opus-5").await,
             "claude-opus-5"
@@ -694,8 +619,6 @@ mod tests {
             "claude-opus-5[1m]"
         );
 
-        // Blank is unset, not a model id: a stored empty string must not name
-        // the page's model as "".
         let key = crate::core::prefs::CHAT_MODEL.key();
         crate::core::PreferenceStore::set(&pool, &bus, key, "  ", None)
             .await

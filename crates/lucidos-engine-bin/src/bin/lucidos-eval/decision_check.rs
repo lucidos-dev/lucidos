@@ -1,12 +1,3 @@
-//! What the two turn-end decision checks share: the backend a candidate runs
-//! on, the row each decision writes, and the table row a candidate scores.
-//! `read_decision` and `wake_decision` each own their labelled set and the
-//! engine entry point that decides one case.
-//!
-//! The number that decides first is a missed yes: a reply the user needed, or
-//! a report the parent had to act on. Noise, a yes the case did not need,
-//! decides second.
-
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,20 +12,13 @@ use serde::Serialize;
 use crate::candidate::{candidate, percentile, pinned_provider, provider_for};
 use crate::Fallible;
 
-/// The `--backend` value that asks chat models.
 pub const CHAT_BACKEND: &str = "chat";
 
-/// How long one System One call may take. Generous, so a slow answer is
-/// measured rather than cut.
 const SYSTEM_ONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The engine's chat backend for one decision, so the eval asks chat the way
-/// the gate does.
 pub(crate) type ChatJudge = fn(Arc<dyn LlmProvider>, Option<String>) -> ChatJudgmentProvider;
 
-/// What a check is called, and what its table calls a missed yes and noise.
 pub(crate) struct Check {
-    /// The subcommand, which also names the check's folder under `eval/`.
     pub(crate) command: &'static str,
     pub(crate) name: &'static str,
     pub(crate) chat_judge: ChatJudge,
@@ -43,32 +27,24 @@ pub(crate) struct Check {
 }
 
 impl Check {
-    /// The shipped labelled set, `eval/<command>/turns.toml`.
     pub(crate) fn shipped_set(&self) -> PathBuf {
         crate::eval_fixture_root()
             .join(self.command)
             .join("turns.toml")
     }
 
-    /// Where a run appends its decisions unless told otherwise.
     pub(crate) fn default_out(&self) -> PathBuf {
         PathBuf::from(format!("/tmp/{}-results.jsonl", self.command))
     }
 }
 
-/// One labelled case a check decides.
 pub(crate) trait Labelled {
-    /// The case's shape, for the per-kind breakdown.
     fn kind(&self) -> &str;
-    /// Whether the right answer is yes.
     fn expected(&self) -> bool;
-    /// Refuse a case the gate would never ask about, before any call.
     fn validate(&self) -> Fallible<()>;
-    /// Decide the case on `provider`, through the engine's entry point.
     async fn decide(&self, provider: &dyn JudgmentProvider) -> Fallible<Answer>;
 }
 
-/// One decision a backend gave.
 pub(crate) struct Answer {
     pub(crate) yes: bool,
     pub(crate) probability: Option<f64>,
@@ -76,8 +52,6 @@ pub(crate) struct Answer {
     pub(crate) output_tokens: u32,
 }
 
-/// What opened a turn, as a labelled set writes it: `user`, `child-report`,
-/// `trigger` or `agent`.
 pub(crate) fn opening_source(source: &str) -> Fallible<OpeningSource> {
     Ok(match source {
         "user" => OpeningSource::UserMessage,
@@ -88,16 +62,13 @@ pub(crate) fn opening_source(source: &str) -> Fallible<OpeningSource> {
     })
 }
 
-/// One decision, as written to the results file.
 #[derive(Debug, Serialize)]
 struct Decided<'a> {
     config: &'a str,
-    /// The case's position in its set, so repeat runs pair up by case.
     case: usize,
     kind: &'a str,
     expected: bool,
     answer: Option<bool>,
-    /// The probability of yes, so another threshold can be scored offline.
     probability: Option<f64>,
     error: Option<String>,
     latency_ms: u128,
@@ -105,7 +76,6 @@ struct Decided<'a> {
     output_tokens: u32,
 }
 
-/// The candidates `backend` names, each with the provider that answers it.
 async fn candidates(
     check: &Check,
     backend: &str,
@@ -124,10 +94,6 @@ async fn candidates(
     }
     let endpoint = SystemOneEndpoint::from_id(backend)
         .ok_or_else(|| format!("unknown backend {backend:?}: chat, or a System One row id"))?;
-    // The row's key resolves as the engine's does: the stored credential,
-    // then the environment. An agent's read-only `LUCIDOS_DATABASE_URL` names
-    // the workspace first: an agent's `DATABASE_URL` is the user's own project
-    // setting (ADR 0481). By hand, `DATABASE_URL` or libpq's `PG*` do.
     let url = std::env::var("LUCIDOS_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"));
     let options = match url {
         Ok(url) => url.parse()?,
@@ -139,8 +105,6 @@ async fn candidates(
     Ok(vec![(endpoint.id().to_string(), provider)])
 }
 
-/// Run every candidate `backend` names over `cases`, append each decision to
-/// `out` as JSON lines, and print the table.
 pub(crate) async fn run<C: Labelled>(
     check: &Check,
     cases: &[C],
@@ -192,8 +156,6 @@ pub(crate) async fn run<C: Labelled>(
     Ok(())
 }
 
-/// `kind wrong/all` for each kind among `rows` that answered wrong at least
-/// once.
 fn wrong_by_kind(rows: &[&Decided<'_>]) -> String {
     let mut kinds: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for r in rows {
@@ -209,7 +171,6 @@ fn wrong_by_kind(rows: &[&Decided<'_>]) -> String {
         .join(", ")
 }
 
-/// One table row for a candidate.
 fn summary_row(spec: &str, rows: &[Decided<'_>]) -> String {
     let answered: Vec<&Decided<'_>> = rows.iter().filter(|r| r.answer.is_some()).collect();
     let (yes, noise): (Vec<&Decided<'_>>, Vec<&Decided<'_>>) =
@@ -260,8 +221,6 @@ mod tests {
         }
     }
 
-    /// A missed yes and a passed noise case each count once, under their
-    /// kind, and an unanswered case counts in neither.
     #[test]
     fn the_row_counts_misses_and_noise_by_kind() {
         let rows = [

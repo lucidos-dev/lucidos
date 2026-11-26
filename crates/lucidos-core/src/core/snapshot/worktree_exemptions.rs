@@ -1,4 +1,4 @@
-//! Durable cleanup exemptions live outside the rewound database. No key lookup
+//! INVARIANT: Durable cleanup exemptions live outside the rewound database. No key lookup
 //! or initialization is needed to consult them before cleanup starts.
 use super::{store, BoxError};
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ pub fn read(root: &Path, workspace: &Path) -> Result<BTreeSet<PathBuf>, BoxError
     Ok(saved.paths)
 }
 
-/// Caller holds the archive lock. Extend rather than replace exemptions from
+/// INVARIANT: Caller holds the archive lock. Extend rather than replace exemptions from
 /// previous restores, including paths absent from the current database.
 pub fn preserve(root: &Path, workspace: &Path) -> Result<(), BoxError> {
     let workspace = workspace.canonicalize()?;

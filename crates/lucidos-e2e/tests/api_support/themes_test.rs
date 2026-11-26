@@ -1,13 +1,3 @@
-//! Themes over HTTP: the three read routes, and the data route's theme gate.
-//!
-//! `core/themes` unit tests cover validation and derivation. Only a booted
-//! engine shows three more things:
-//!
-//! - the routes are mounted;
-//! - a theme written through `PUT /api/v1/data/themes/<id>.json` is served back
-//!   resolved;
-//! - the data route refuses a bad theme before it reaches disk.
-
 use crate::support::{base_url, user_client, workspace_path, workspace_tree_lock};
 use lucidos_engine::core::prefs;
 
@@ -172,8 +162,6 @@ async fn a_theme_written_through_the_data_route_is_served_resolved() {
     assert_eq!(gone.status(), 404);
 }
 
-/// ADR 0309: the data route refuses a hostile theme with a reason its author
-/// can act on. A fair theme comes back with the clamped palette.
 #[tokio::test]
 async fn a_hostile_theme_is_refused_and_a_fair_one_carries_the_protected_palette() {
     let _tree = workspace_tree_lock().read().await;
@@ -240,8 +228,6 @@ async fn a_hostile_theme_is_refused_and_a_fair_one_carries_the_protected_palette
     client.delete(&path).send().await.unwrap();
 }
 
-/// ADR 0307: the part catalog is served, the data route refuses a bad part
-/// value with its reason, and a good one is served as part tokens.
 #[tokio::test]
 async fn theme_parts_are_served_refused_and_resolved() {
     let _tree = workspace_tree_lock().read().await;
@@ -310,8 +296,6 @@ async fn theme_parts_are_served_refused_and_resolved() {
     client.delete(&path).send().await.unwrap();
 }
 
-/// Any app can write `style_overrides`, so the preference write refuses a
-/// part token that breaks the part grammar (ADR 0307).
 #[tokio::test]
 async fn a_style_override_part_token_past_a_cap_is_refused() {
     let client = user_client().await;
@@ -337,9 +321,6 @@ async fn a_style_override_part_token_past_a_cap_is_refused() {
     );
 }
 
-/// ADR 0307: a frame gets part tokens only through SDK tags the app loads
-/// itself. The engine injects nothing into an app page that has none, so a
-/// plain app comes back as written, whatever theme is active.
 #[tokio::test]
 async fn a_plain_app_page_gets_no_part_tokens_and_no_injected_styling() {
     let _tree = workspace_tree_lock().read().await;
@@ -384,8 +365,6 @@ async fn a_plain_app_page_gets_no_part_tokens_and_no_injected_styling() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// POST /api/v1/themes/resolve answers what a draft would paint, or the
-/// refusal a save would give, and writes nothing (ADR 0307).
 #[tokio::test]
 async fn a_draft_theme_resolves_without_being_saved() {
     let client = user_client().await;
@@ -420,7 +399,6 @@ async fn a_draft_theme_resolves_without_being_saved() {
         "parts.chat-text.text-shadow: blur 2em is over the 0.6em cap."
     );
 
-    // A save refuses a workspace font that is not installed, so a draft does too.
     let missing_font = client
         .post(api("/themes/resolve"))
         .body(r#"{"name":"Draft","fonts":{"ui":"ws-not-installed"}}"#)
@@ -436,8 +414,6 @@ async fn a_draft_theme_resolves_without_being_saved() {
     );
 }
 
-/// A theme sets the drawer title weight as a string from 400 to 600. The API
-/// serves the cap, resolves the token and names the field it refuses.
 #[tokio::test]
 async fn a_drawer_title_weight_resolves_and_a_heavier_one_is_refused() {
     let client = user_client().await;
@@ -471,9 +447,6 @@ async fn a_drawer_title_weight_resolves_and_a_heavier_one_is_refused() {
     );
 }
 
-/// `theme` named the light/dark mode before the rename, so an older app still
-/// sends `theme=dark`. The write is refused with the key it meant. It is never
-/// stored as a theme id that silently paints the default.
 #[tokio::test]
 async fn a_theme_mode_written_to_the_theme_key_is_refused_with_the_key_it_meant() {
     let client = user_client().await;

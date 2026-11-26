@@ -1,29 +1,7 @@
-//! Verify the lazy-load contract for `ContextCaptured`:
-//!
-//! 1. `GET /api/v1/threads/:tid/events` strips `sections` + `tools` from
-//!    `ContextCaptured` payloads and stamps a `sections_stripped: true`
-//!    marker. Keeps the lightweight inline-chip fields.
-//! 2. `GET /api/v1/events/:eid/context` returns the original `sections` +
-//!    `tools` on demand.
-//! 3. `GET /api/v1/threads/:tid/events?include_context=true` opts back into
-//!    the full payload — the export-thread path uses this so bug-report
-//!    dumps stay complete.
-//!
-//! Together these stop a heavy chat thread (one captured prompt per turn,
-//! ~50 kB sections each) from shipping all snapshots up-front; the modal
-//! fetches the full breakdown only when the user opens it.
-
 use crate::support::{base_url, db_url, http_client, seed_chat_thread_summary, unique_marker};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Seed a chat thread + a ContextCaptured event with real `sections` and
-/// `tools` arrays. Returns `(thread_id, event_id)`.
-///
-/// The sections are written in the PRE-RENAME shape, spelling a section's
-/// budget delta `char_count`. That is what months of stored rows look like.
-/// The read paths serve them verbatim. So this fixture is what proves an old
-/// capture still reaches the Context Viewer with a size it can read.
 async fn seed_thread_with_capture(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
     let thread_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
@@ -31,8 +9,6 @@ async fn seed_thread_with_capture(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
 
     seed_chat_thread_summary(pool, thread_id, "idle").await;
 
-    // Seed a MessageReceived so the thread has at least one prior event,
-    // matching how real threads look on the snapshot endpoint.
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, created, aggregate_id, aggregate, thread_id) \
          VALUES ($1, 'MessageReceived', $2, NOW(), $3::text, 'thread', $3)",
@@ -81,7 +57,6 @@ async fn pool() -> sqlx::PgPool {
         .expect("Failed to connect to e2e DB")
 }
 
-/// Snapshot endpoint must omit `sections` + `tools` and stamp the marker.
 #[tokio::test]
 async fn snapshot_strips_context_capture_sections_and_tools() {
     let pool = pool().await;
@@ -115,7 +90,6 @@ async fn snapshot_strips_context_capture_sections_and_tools() {
         "tools should be stripped from snapshot payload, got: {payload}"
     );
     assert_eq!(payload["sections_stripped"], Value::Bool(true));
-    // Inline chip still needs these.
     assert_eq!(payload["producer"], "main_llm");
     assert_eq!(payload["model"], "claude-opus-4-7");
     assert_eq!(payload["context_window"], 200_000);
@@ -123,7 +97,6 @@ async fn snapshot_strips_context_capture_sections_and_tools() {
     assert!(payload["usage"].is_object(), "usage preserved for chip");
 }
 
-/// New endpoint returns the original `sections` + `tools` for the event.
 #[tokio::test]
 async fn context_endpoint_returns_full_sections_and_tools() {
     let pool = pool().await;
@@ -142,9 +115,6 @@ async fn context_endpoint_returns_full_sections_and_tools() {
     let sections = body["sections"].as_array().expect("sections array");
     assert_eq!(sections.len(), 2);
     assert_eq!(sections[0]["name"], "system");
-    // The stored key was `char_count`, and the endpoint serves sections
-    // verbatim, so nothing but the boundary rename puts it where the viewer
-    // reads it.
     assert_eq!(sections[0]["budget_delta_chars"], 12_345);
     assert!(
         sections[0].get("char_count").is_none(),
@@ -170,7 +140,6 @@ async fn context_endpoint_returns_full_sections_and_tools() {
     assert_eq!(tools[1], "edit_file");
 }
 
-/// Non-ContextCaptured event id → 404 (handler refuses to leak arbitrary event payloads).
 #[tokio::test]
 async fn context_endpoint_rejects_non_context_captured_event() {
     let pool = pool().await;
@@ -199,7 +168,6 @@ async fn context_endpoint_rejects_non_context_captured_event() {
     assert_eq!(resp.status(), 404);
 }
 
-/// Unknown event id → 404.
 #[tokio::test]
 async fn context_endpoint_404_on_unknown_event_id() {
     let _pool = pool().await;
@@ -214,8 +182,6 @@ async fn context_endpoint_404_on_unknown_event_id() {
     assert_eq!(resp.status(), 404);
 }
 
-/// `?include_context=true` opts back into full sections — covers the
-/// export-thread path so bug-report dumps stay complete after the strip.
 #[tokio::test]
 async fn snapshot_include_context_true_preserves_sections() {
     let pool = pool().await;
@@ -253,14 +219,10 @@ async fn snapshot_include_context_true_preserves_sections() {
         payload.get("sections_stripped").is_none(),
         "include_context=true must NOT stamp sections_stripped, got: {payload}"
     );
-    // Same boundary rename as the lazy fetch. A bug-report dump that spelled
-    // the size two ways depending on when the row was written is a dump
-    // nobody can read with one query.
     assert_eq!(payload["sections"][0]["budget_delta_chars"], 12_345);
     assert!(payload["sections"][0].get("char_count").is_none());
 }
 
-/// A capture written today passes through untouched, both keys intact.
 #[tokio::test]
 async fn context_endpoint_serves_both_sizes_of_a_current_capture() {
     let pool = pool().await;
@@ -304,8 +266,6 @@ async fn context_endpoint_serves_both_sizes_of_a_current_capture() {
     let sections = body["sections"].as_array().expect("sections array");
     assert_eq!(sections[0]["budget_delta_chars"], 900);
     assert_eq!(sections[0]["content_chars"], 900);
-    // The one row where the two part. The delta is what the loop added; the
-    // region is the whole message array.
     assert_eq!(sections[1]["budget_delta_chars"], 600);
     assert_eq!(sections[1]["content_chars"], 645_368);
 }

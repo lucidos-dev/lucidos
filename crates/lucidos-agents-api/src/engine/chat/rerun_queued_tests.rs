@@ -1,17 +1,3 @@
-//! A follow-up queued behind an interrupted turn survives the restart.
-//!
-//! Reported case, from the dev workspace event store: a `MessageReceived` at
-//! 08:57:40, an `engine_shutdown` abort five seconds later, then a resume that
-//! carried only the engine note. The message was named by no
-//! `PromptInjected`, no `QueuedMessageRemoved` and no response, so it sat
-//! as a "Queued" bubble nobody could clear but the user.
-//!
-//! These drive the two functions the resume is made of, against a bare
-//! `EventBus`. They pin the emitted-event surface and the prompt the loop is
-//! handed. That is the whole fix, short of the LLM call.
-//!
-//! Plan: `docs/plans/2026-09-21-a-queued-follow-up-survives-the-restart.md`.
-
 use super::*;
 use crate::engine::chat::queued_recovery::window_end_sequence;
 use crate::engine::event_bus::BusEvent;
@@ -78,8 +64,6 @@ async fn abort(bus: &EventBus, thread_id: Uuid, turn: Uuid) {
     .await;
 }
 
-/// One resume, in the production order: sample the fence, emit the anchor,
-/// ingest what is owed. The fence must be sampled first.
 async fn resume(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -87,7 +71,6 @@ async fn resume(
     anchor: ChatResumeAnchor,
     channel: EventChannel,
 ) -> (Uuid, Option<RecoveredMessages>) {
-    // Text-only fixtures reach no blob store.
     resume_in(
         bus,
         pool,
@@ -133,8 +116,6 @@ async fn resume_in(
     (anchor_event_id, recovered)
 }
 
-/// Every `PromptInjected` on the thread, oldest first, as
-/// `(injected_message_id, request_event_id, channel)`.
 async fn injections(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -164,8 +145,6 @@ async fn count_of(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &str) -> i64
     .expect("count")
 }
 
-/// The reported case. The queued follow-up reaches the resumed turn as real
-/// user text, and is announced so the pinned bubble stops reading as queued.
 #[tokio::test]
 async fn the_reported_case_answers_the_queued_message() {
     let (pool, db_name) = setup_test_db().await;
@@ -195,8 +174,6 @@ async fn the_reported_case_answers_the_queued_message() {
         recovered.text
     );
 
-    // The engine note is the boundary's own injection. The follow-up's names
-    // the message, which is what clears the bubble.
     let announced = injections(&pool, thread_id).await;
     assert_eq!(announced.len(), 2, "the note, then the recovered message");
     assert_eq!(announced[1].0, Some(queued));
@@ -210,8 +187,6 @@ async fn the_reported_case_answers_the_queued_message() {
     teardown_test_db(&db_name).await;
 }
 
-/// The engine note is read first. It reports what the aborted run already did,
-/// and the follow-ups were sent against that context.
 #[tokio::test]
 async fn two_queued_messages_are_ingested_in_order_after_the_note() {
     let (pool, db_name) = setup_test_db().await;
@@ -243,8 +218,6 @@ async fn two_queued_messages_are_ingested_in_order_after_the_note() {
     assert!(note_at < first_at, "the note is read before the follow-ups");
     assert!(first_at < second_at, "arrival order is kept");
 
-    // Coalesced into ONE turn, so the pair is answered together rather than
-    // opening a turn each.
     assert_eq!(
         prompt.matches("[Engine note]").count(),
         1,
@@ -255,8 +228,6 @@ async fn two_queued_messages_are_ingested_in_order_after_the_note() {
     teardown_test_db(&db_name).await;
 }
 
-/// A retraction beats a recovery, including one the user made while the engine
-/// was down.
 #[tokio::test]
 async fn a_retracted_queued_message_stays_retracted_across_a_restart() {
     let (pool, db_name) = setup_test_db().await;
@@ -302,8 +273,6 @@ async fn a_retracted_queued_message_stays_retracted_across_a_restart() {
     teardown_test_db(&db_name).await;
 }
 
-/// A message the loop took before the abort is already in the thread's history,
-/// so recovering it would say it twice.
 #[tokio::test]
 async fn a_message_ingested_before_the_abort_is_not_recovered() {
     let (pool, db_name) = setup_test_db().await;
@@ -351,9 +320,6 @@ async fn a_message_ingested_before_the_abort_is_not_recovered() {
     teardown_test_db(&db_name).await;
 }
 
-/// The first pass writes the marker the second pass reads, so two resumes that
-/// both pass the anchor ingest the message once. Neither claims an abort here,
-/// which isolates the marker from the anchor's own claim.
 #[tokio::test]
 async fn a_double_continue_ingests_the_queued_message_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -385,9 +351,6 @@ async fn a_double_continue_ingests_the_queued_message_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant I9: one abort is resumed at most once. Two Continue clicks race to
-/// the anchor, and whichever order they land in, the index lets one claim it.
-/// The loser emits nothing: no boundary, no engine note, no rerun.
 #[tokio::test]
 async fn two_concurrent_resumes_of_one_abort_claim_it_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -429,7 +392,6 @@ async fn two_concurrent_resumes_of_one_abort_claim_it_once() {
         "the loser writes no engine note"
     );
 
-    // The claim is per abort: the rerun's own interruption can be resumed.
     abort(&bus, thread_id, turn).await;
     let next_abort: Uuid = sqlx::query_scalar(
         "SELECT id FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseAborted' \
@@ -503,9 +465,6 @@ async fn an_unclaimed_boundary_after_an_abort_counts_as_resuming_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// An answer-driven resume was never aborted, so it must stay invisible. The
-/// recovered message's own announcement is correct and visible. A boundary
-/// panel is not.
 #[tokio::test]
 async fn existing_turn_recovers_without_opening_a_boundary() {
     let (pool, db_name) = setup_test_db().await;
@@ -547,9 +506,6 @@ async fn existing_turn_recovers_without_opening_a_boundary() {
     teardown_test_db(&db_name).await;
 }
 
-/// A trigger thread's resume must not be rewritten to chat. The
-/// `ContinuationStarted` projection arm writes `source = <channel>`, so a
-/// mis-stamped recovery would change what the thread IS.
 #[tokio::test]
 async fn a_trigger_thread_keeps_its_channel_through_the_recovery() {
     let (pool, db_name) = setup_test_db().await;
@@ -613,8 +569,6 @@ async fn a_trigger_thread_keeps_its_channel_through_the_recovery() {
     teardown_test_db(&db_name).await;
 }
 
-/// The legacy fallback carries no interrupted turn, so it recovers nothing. A
-/// recovery with no lower bound would sweep the whole thread.
 #[tokio::test]
 async fn an_anchor_without_an_interrupted_turn_recovers_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -642,11 +596,6 @@ async fn an_anchor_without_an_interrupted_turn_recovers_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// The bytes reach the resumed turn, not just the blob store.
-///
-/// Rebuilding the attachment and then handing the loop `None` was the shape
-/// this pins against: an image-only follow-up would reach the model with no
-/// user content at all.
 #[tokio::test]
 async fn a_recovered_attachment_reaches_the_resumed_turn() {
     let (pool, db_name) = setup_test_db().await;
@@ -705,9 +654,6 @@ async fn a_recovered_attachment_reaches_the_resumed_turn() {
     teardown_test_db(&db_name).await;
 }
 
-/// A retraction landing between two announcements still wins for the message
-/// it names. The check runs per message, immediately before its own emit, so
-/// the batch ahead of it does not carry the retracted one through.
 #[tokio::test]
 async fn a_retraction_mid_batch_still_beats_the_recovery() {
     let (pool, db_name) = setup_test_db().await;
@@ -719,8 +665,6 @@ async fn a_retraction_mid_batch_still_beats_the_recovery() {
     let second = emit(&bus, thread_id, message("never mind that")).await;
     abort(&bus, thread_id, turn).await;
 
-    // Stands in for the trash icon landing while the first message is being
-    // announced: the removal is already persisted when the loop reaches it.
     emit(
         &bus,
         thread_id,

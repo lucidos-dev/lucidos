@@ -23,14 +23,12 @@ async fn count(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &str) -> Vec<St
         .unwrap()
 }
 
-/// A pool for a test the store never answers, so it never connects.
 fn unused_pool() -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://unused@127.0.0.1:1/unused")
         .unwrap()
 }
 
-/// One session's run loop, as far as a take reaches.
 struct Session {
     bus: EventBus,
     pool: sqlx::PgPool,
@@ -68,7 +66,6 @@ impl Session {
         }
     }
 
-    /// Start a take, as the run loop's take arm does.
     fn take(&mut self) -> oneshot::Receiver<Vec<ChildReport>> {
         let (reply, taken) = oneshot::channel();
         begin_take(
@@ -83,7 +80,6 @@ impl Session {
         taken
     }
 
-    /// The driver answers the next withdraw, and the run loop settles it.
     async fn driver_answers(&mut self, expected: Uuid, outcome: InputWithdrawal) {
         let withdraw = self.driver_rx.recv().await.unwrap();
         assert_eq!(withdraw.input_uuid, expected);
@@ -92,7 +88,6 @@ impl Session {
         finish_withdraw(&self.bus, self.thread_id, &mut self.inputs, answered).await;
     }
 
-    /// The take's settle arm, once all its withdraws answered.
     async fn settle(&mut self) -> Vec<(Uuid, Uuid)> {
         let withdrawn =
             tokio::time::timeout(Duration::from_secs(10), self.loop_end.settled_rx.recv())
@@ -115,8 +110,6 @@ impl Session {
     }
 }
 
-/// A take asks the driver for each report alone. It hands back only what the
-/// driver dropped: a report the agent already read stays where it is.
 #[tokio::test]
 async fn a_take_hands_back_only_the_reports_the_driver_dropped() {
     let mut s = Session::new().await;
@@ -173,8 +166,6 @@ async fn a_take_hands_back_only_the_reports_the_driver_dropped() {
     s.close().await;
 }
 
-/// A caller that leaves while the withdraw is in flight loses nothing: the
-/// report goes back to the agent and stays owed, and no take is recorded.
 #[tokio::test]
 async fn a_report_taken_after_its_caller_left_goes_back_to_the_agent() {
     let mut s = Session::new().await;
@@ -218,7 +209,6 @@ async fn a_report_taken_after_its_caller_left_goes_back_to_the_agent() {
     s.close().await;
 }
 
-/// A take with nothing waiting answers at once, and asks the driver nothing.
 #[tokio::test]
 async fn a_take_with_nothing_waiting_answers_empty() {
     let inputs = InputLedger::new();
@@ -243,8 +233,6 @@ async fn a_take_with_nothing_waiting_answers_empty() {
     assert!(pending.is_empty());
 }
 
-/// A take whose caller already gave up withdraws nothing, so no report is
-/// taken with nobody left to read it.
 #[tokio::test]
 async fn a_take_nobody_waits_for_withdraws_nothing() {
     let mut inputs = InputLedger::new();
@@ -269,7 +257,6 @@ async fn a_take_nobody_waits_for_withdraws_nothing() {
     assert_eq!(inputs.owed_child_reports(), 1, "the report stays queued");
 }
 
-/// The watch moves with the ledger, and only when the count changes.
 #[test]
 fn publish_tracks_the_owed_reports() {
     let (handle, loop_end) = child_reports_channel();

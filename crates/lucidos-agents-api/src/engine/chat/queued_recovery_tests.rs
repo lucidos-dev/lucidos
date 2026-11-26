@@ -1,18 +1,8 @@
-//! One test per arm of [`STRANDED_QUEUED_MESSAGES_SQL`].
-//!
-//! The predicate is the whole fix, so it is driven directly here rather than
-//! only through its reader. Each arm is a separate reason a queued message is
-//! NOT owed an answer. Where an arm could pass for the wrong reason, the test
-//! asserts the decoy first: the same fixture without the excluding marker,
-//! which must come back.
-
 use super::*;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{AbortCause, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// No blob store is needed for a message with no attachments, and every
-/// fixture here is text.
 fn no_blobs() -> &'static Path {
     Path::new("/nonexistent-workspace")
 }
@@ -56,8 +46,6 @@ async fn emit_with_meta(
     .event_id
 }
 
-/// Announce `message_id` as consumed, exactly as the loop does when it drains
-/// an injection.
 async fn announce_injected(bus: &EventBus, thread_id: Uuid, message_id: Uuid) {
     emit(
         bus,
@@ -73,7 +61,6 @@ async fn announce_injected(bus: &EventBus, thread_id: Uuid, message_id: Uuid) {
     .await;
 }
 
-/// The window every test reads with: from `turn` to whatever exists now.
 async fn undrained(pool: &sqlx::PgPool, thread_id: Uuid, turn: Uuid) -> Vec<String> {
     let end = window_end_sequence(pool, thread_id)
         .await
@@ -86,9 +73,6 @@ async fn undrained(pool: &sqlx::PgPool, thread_id: Uuid, turn: Uuid) -> Vec<Stri
         .collect()
 }
 
-/// The reported shape. A turn is running, the user types a follow-up, the
-/// engine is torn down. The follow-up is owed an answer, and nothing in the
-/// event store says otherwise.
 #[tokio::test]
 async fn a_queued_follow_up_behind_an_aborted_turn_is_owed_an_answer() {
     let (pool, db_name) = setup_test_db().await;
@@ -116,9 +100,6 @@ async fn a_queued_follow_up_behind_an_aborted_turn_is_owed_an_answer() {
     teardown_test_db(&db_name).await;
 }
 
-/// The turn's OWN originating event is the lower bound, so a turn never
-/// recovers itself. Recovering it would re-ask what the interrupted run was
-/// already working on.
 #[tokio::test]
 async fn the_interrupted_turn_does_not_recover_its_own_message() {
     let (pool, db_name) = setup_test_db().await;
@@ -133,9 +114,6 @@ async fn the_interrupted_turn_does_not_recover_its_own_message() {
     teardown_test_db(&db_name).await;
 }
 
-/// A message the loop already took carries a `PromptInjected`. That marker
-/// is what makes a second pass a no-op, so this is the idempotency test at the
-/// predicate level.
 #[tokio::test]
 async fn an_announced_message_is_no_longer_owed() {
     let (pool, db_name) = setup_test_db().await;
@@ -162,8 +140,6 @@ async fn an_announced_message_is_no_longer_owed() {
     teardown_test_db(&db_name).await;
 }
 
-/// A retraction beats a recovery, including one made while the engine was down.
-/// The trash icon is the only thing that should decide this.
 #[tokio::test]
 async fn a_retracted_message_is_not_owed() {
     let (pool, db_name) = setup_test_db().await;
@@ -189,12 +165,6 @@ async fn a_retracted_message_is_not_owed() {
     teardown_test_db(&db_name).await;
 }
 
-/// A turn that is STILL RUNNING owns its message. The predicate asks whether
-/// anything picked the message up, not whether a turn finished.
-///
-/// Asking for a terminator alone was the earlier form, and this is the case it
-/// got wrong: Continue clicked over a live turn recovered the very message that
-/// turn was answering, so the user got two answers to one message.
 #[tokio::test]
 async fn a_message_a_running_turn_owns_is_not_owed() {
     let (pool, db_name) = setup_test_db().await;
@@ -210,7 +180,6 @@ async fn a_message_a_running_turn_owns_is_not_owed() {
         "decoy: before its turn does anything it IS owed"
     );
 
-    // One streamed token is enough: a turn has picked the message up.
     emit_with_meta(
         &bus,
         thread_id,
@@ -233,9 +202,6 @@ async fn a_message_a_running_turn_owns_is_not_owed() {
     teardown_test_db(&db_name).await;
 }
 
-/// The same arm from the settled end: a message its turn's terminator names.
-/// Every terminal type counts. A canceled turn settled the message as much as a
-/// generated one did, because the user saw it picked up.
 #[tokio::test]
 async fn a_message_with_a_terminator_is_not_owed() {
     let (pool, db_name) = setup_test_db().await;
@@ -287,10 +253,6 @@ async fn a_message_with_a_terminator_is_not_owed() {
     teardown_test_db(&db_name).await;
 }
 
-/// A message sent during a call is owed an answer like any other. Branching on
-/// that would let the doer answer the same question two ways by input channel,
-/// which is the failure ADR 0149 names. The channel drain does not branch on it
-/// either, so the two definitions of undrained agree.
 #[tokio::test]
 async fn a_message_sent_during_a_call_is_owed_like_any_other() {
     let (pool, db_name) = setup_test_db().await;
@@ -327,8 +289,6 @@ async fn a_message_sent_during_a_call_is_owed_like_any_other() {
     teardown_test_db(&db_name).await;
 }
 
-/// The fence. A message landing after the reader sampled its window belongs to
-/// whoever handles it next, so recovering it here would answer it twice.
 #[tokio::test]
 async fn a_message_past_the_window_end_is_left_alone() {
     let (pool, db_name) = setup_test_db().await;
@@ -354,8 +314,6 @@ async fn a_message_past_the_window_end_is_left_alone() {
     teardown_test_db(&db_name).await;
 }
 
-/// Oldest first, so the resumed turn reads what the user typed in the order
-/// they typed it.
 #[tokio::test]
 async fn owed_messages_come_back_oldest_first() {
     let (pool, db_name) = setup_test_db().await;
@@ -376,11 +334,6 @@ async fn owed_messages_come_back_oldest_first() {
     teardown_test_db(&db_name).await;
 }
 
-/// A recovered message carries the bytes it was sent with, not just its text.
-///
-/// An image-only follow-up is the case that decides it. The live injection path
-/// hands the model the bytes, so a recovery that dropped them would answer a
-/// different question than the user asked.
 #[tokio::test]
 async fn a_recovered_message_carries_its_attachment() {
     let (pool, db_name) = setup_test_db().await;
@@ -388,7 +341,6 @@ async fn a_recovered_message_carries_its_attachment() {
     let thread_id = Uuid::new_v4();
     let workspace = tempfile::tempdir().expect("temp workspace");
 
-    // Smallest thing `sniff_image_mime` accepts: a PNG signature plus IHDR.
     let png: Vec<u8> = vec![
         0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
         b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
@@ -436,8 +388,6 @@ async fn a_recovered_message_carries_its_attachment() {
     teardown_test_db(&db_name).await;
 }
 
-/// A hash whose blob is gone costs the attachment, never the message. The user
-/// still asked something, and dropping the whole follow-up would be worse.
 #[tokio::test]
 async fn a_missing_blob_does_not_cost_the_message() {
     let (pool, db_name) = setup_test_db().await;
@@ -481,9 +431,6 @@ async fn a_missing_blob_does_not_cost_the_message() {
     teardown_test_db(&db_name).await;
 }
 
-/// The rebuilt prompt carries the fields the live path would have carried. The
-/// announcement then names the right message, and the model is told who sent
-/// it.
 #[tokio::test]
 async fn the_rebuilt_prompt_keeps_the_message_identity() {
     let (pool, db_name) = setup_test_db().await;

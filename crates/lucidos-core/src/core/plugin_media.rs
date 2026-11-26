@@ -1,16 +1,3 @@
-//! *Plugin media*: a plugin's presentation files in its `media/` folder, named
-//! by the plugin manifest (ADR 0414).
-//!
-//! Media is never workspace content. A scan keeps a copy per marketplace,
-//! plugin and version under [`CACHE_DIR`], and install keeps one per plugin
-//! under `data/`[`INSTALLED_DIR`], which is gitignored. Each copy is a *media
-//! copy*: an `index.json` naming what it holds, plus the files under `files/`
-//! at their plugin-relative paths. The media route serves a path only when the
-//! index lists it.
-//!
-//! A media problem never blocks a scan or an install. The entry is dropped and
-//! named in [`MediaIndex::problems`], with the limit it broke.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,15 +8,11 @@ use sha2::{Digest, Sha256};
 use super::apps::{AppKind, AppManifest, APP_ICON_EXTENSIONS, APP_ICON_MAX_BYTES};
 use super::format_byte_size;
 
-/// The plugin root folder that holds media. Never merged into `data/`.
 pub const MEDIA_DIR: &str = "media";
-/// The long description, rendered as markdown on the plugin detail page.
 pub const README_PATH: &str = "media/README.md";
-/// Installed media, under `data/`. Engine-managed and gitignored.
 pub const INSTALLED_DIR: &str = "plugin-media";
-/// Catalog media, workspace-relative. Rebuilt by the next scan.
 pub const CACHE_DIR: &str = ".lucidos/plugin-media";
-/// The media route's two mounts, under `/api/v1`. The router and the URLs a
+/// INVARIANT: The media route's two mounts, under `/api/v1`. The router and the URLs a
 /// catalog row carries both read these.
 pub const CATALOG_ROUTE: &str = "/plugins/media/catalog";
 pub const INSTALLED_ROUTE: &str = "/plugins/media/installed";
@@ -39,7 +22,6 @@ pub const MAX_VIDEO_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_README_BYTES: u64 = 256 * 1024;
 pub const MAX_SCREENSHOTS: usize = 8;
 pub const MAX_VIDEOS: usize = 3;
-/// Every kept file of one plugin together.
 pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 const SCREENSHOT_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
@@ -47,11 +29,8 @@ const VIDEO_EXTENSIONS: [&str; 2] = ["mp4", "webm"];
 const INDEX_FILE: &str = "index.json";
 const FILES_DIR: &str = "files";
 
-/// One dropped media entry, and why, in words an author can act on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaProblem {
-    /// The plugin-relative path, or the manifest key for a value of the wrong
-    /// type.
     pub path: String,
     pub reason: String,
 }
@@ -65,18 +44,15 @@ impl MediaProblem {
     }
 }
 
-/// What the plugin manifest names, before any file is checked.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaDeclaration {
     pub icon: Option<String>,
     pub screenshots: Vec<String>,
     pub videos: Vec<String>,
-    /// Values of the wrong type: the key is named, and the value ignored.
     pub problems: Vec<MediaProblem>,
 }
 
 impl MediaDeclaration {
-    /// Read `icon`, `screenshots` and `videos` from a parsed manifest table.
     pub fn from_manifest(table: &toml::Table) -> Self {
         let mut out = Self::default();
         match table.get("icon") {
@@ -111,22 +87,17 @@ fn string_list(table: &toml::Table, key: &str, problems: &mut Vec<MediaProblem>)
     out
 }
 
-/// What a media copy holds. Every path is plugin-relative, and the media route
-/// serves exactly these.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaIndex {
-    /// The plugin icon. Falls back to the icon of the plugin's single app.
     pub icon: Option<String>,
     pub screenshots: Vec<String>,
     pub videos: Vec<String>,
     pub readme: Option<String>,
     pub problems: Vec<MediaProblem>,
-    /// SHA-256 per kept path, so a rescan of unchanged media writes nothing.
     pub digests: BTreeMap<String, String>,
 }
 
 impl MediaIndex {
-    /// Whether the media route may serve `path` from this copy.
     pub fn lists(&self, path: &str) -> bool {
         self.icon.as_deref() == Some(path)
             || self.readme.as_deref() == Some(path)
@@ -135,7 +106,6 @@ impl MediaIndex {
     }
 }
 
-/// The checked media of one plugin tree, ready to copy.
 #[derive(Debug)]
 pub struct ResolvedMedia {
     pub index: MediaIndex,
@@ -179,7 +149,6 @@ impl Kind {
     }
 }
 
-/// Collects the kept files and the running total for one plugin.
 struct Resolver<'a> {
     root: &'a Path,
     index: MediaIndex,
@@ -188,7 +157,6 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
-    /// Check one entry and keep it, or record why not.
     fn keep(&mut self, raw: &str, kind: Kind) -> Option<String> {
         match self.check(raw, kind) {
             Ok(path) => Some(path),
@@ -216,8 +184,6 @@ impl Resolver<'_> {
         self.admit(raw, source, kind)
     }
 
-    /// Size, total and digest checks shared by media entries and the app icon
-    /// fallback, which lives outside `media/`.
     fn admit(&mut self, path: &str, source: PathBuf, kind: Kind) -> Result<String, String> {
         if self.sources.iter().any(|(p, _)| p == path) {
             return Ok(path.to_string());
@@ -268,7 +234,6 @@ impl Resolver<'_> {
     }
 }
 
-/// The SHA-256 of a file, read in chunks so a video never sits whole in memory.
 fn sha256_of(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -283,16 +248,12 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
     Ok(crate::core::hex::hex_lower(&hasher.finalize()))
 }
 
-/// One path segment that names an entry inside its parent, and nothing else.
-/// Every folder name a media copy is joined from passes it.
 pub fn is_folder_name(segment: &str) -> bool {
     !segment.is_empty() && segment != "." && segment != ".." && !segment.contains(['/', '\\'])
 }
 
-/// The real file a plugin-relative media path names, refusing anything that
-/// leaves `media/` or passes through a symlink.
 fn media_file(root: &Path, raw: &str) -> Result<PathBuf, String> {
-    // Checked as written, segment by segment: `Path::components` drops a
+    // INVARIANT: Checked as written, segment by segment: `Path::components` drops a
     // `.` in the middle, and the URL would then name another path.
     let mut segments = raw.split('/');
     let under_media = segments.next() == Some(MEDIA_DIR);
@@ -312,8 +273,6 @@ fn media_file(root: &Path, raw: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Check the declared media of the plugin tree at `root`. Never fails: every
-/// problem lands in the index.
 pub fn resolve(root: &Path, declared: &MediaDeclaration) -> ResolvedMedia {
     let mut r = Resolver {
         root,
@@ -346,9 +305,6 @@ pub fn resolve(root: &Path, declared: &MediaDeclaration) -> ResolvedMedia {
     }
 }
 
-/// The icon of the plugin's one app, as `(plugin-relative path, file)`. A
-/// widget is not an app here, so a plugin with one app and its widgets still
-/// gets the app's icon.
 fn single_app_icon(root: &Path) -> Option<(String, PathBuf)> {
     let entries = std::fs::read_dir(root.join("apps")).ok()?;
     let mut apps = entries.flatten().filter_map(|entry| {
@@ -377,7 +333,6 @@ fn single_app_icon(root: &Path) -> Option<(String, PathBuf)> {
     is_plain_path(&path).then(|| (path, dir.join(icon)))
 }
 
-/// Where a scan keeps one plugin version's catalog media.
 pub fn cache_dir(
     workspace: &Path,
     marketplace_id: &str,
@@ -391,7 +346,6 @@ pub fn cache_dir(
         .join(version)
 }
 
-/// Where install keeps a plugin's media.
 pub fn installed_dir(workspace: &Path, plugin_id: &str) -> PathBuf {
     workspace
         .join(super::DATA_DIR)
@@ -399,13 +353,10 @@ pub fn installed_dir(workspace: &Path, plugin_id: &str) -> PathBuf {
         .join(plugin_id)
 }
 
-/// Read a media copy's index. `None` when there is no copy.
 pub fn read_index(copy: &Path) -> Option<MediaIndex> {
     load_index(copy).ok().flatten()
 }
 
-/// A media copy's index, telling no copy (`Ok(None)`) from one that cannot be
-/// read (`Err`), so a damaged copy can say why it shows nothing.
 pub fn load_index(copy: &Path) -> Result<Option<MediaIndex>, String> {
     let text = match std::fs::read_to_string(copy.join(INDEX_FILE)) {
         Ok(text) => text,
@@ -417,13 +368,10 @@ pub fn load_index(copy: &Path) -> Result<Option<MediaIndex>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Whether a plugin-relative path names a file by plain segments only: what
-/// a browser sends back unchanged in a URL.
 fn is_plain_path(path: &str) -> bool {
     path.split('/').all(is_folder_name)
 }
 
-/// The file the media route serves for `path`, when the copy lists it.
 pub fn listed_file(copy: &Path, path: &str) -> Option<PathBuf> {
     if !is_plain_path(path) {
         return None;
@@ -433,9 +381,6 @@ pub fn listed_file(copy: &Path, path: &str) -> Option<PathBuf> {
         .then(|| copy.join(FILES_DIR).join(path))
 }
 
-/// Make `copy` hold exactly `media`, replacing whatever it held as a whole.
-/// A copy whose index already matches is left alone, so a rescan of
-/// unchanged media writes nothing. No media at all leaves no copy.
 pub fn write_copy(media: &ResolvedMedia, copy: &Path) -> std::io::Result<()> {
     if media.index == MediaIndex::default() {
         return remove_copy(copy);
@@ -467,7 +412,6 @@ pub fn write_copy(media: &ResolvedMedia, copy: &Path) -> std::io::Result<()> {
     std::fs::rename(staging.keep(), copy)
 }
 
-/// Delete a media copy. A missing one is fine.
 pub fn remove_copy(copy: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(copy) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -475,8 +419,6 @@ pub fn remove_copy(copy: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Delete everything a scan cached for one marketplace. A missing folder is
-/// fine, and so is an id no folder could have.
 pub fn remove_marketplace_cache(workspace: &Path, marketplace_id: &str) -> std::io::Result<()> {
     if !is_folder_name(marketplace_id) {
         return Ok(());
@@ -484,11 +426,8 @@ pub fn remove_marketplace_cache(workspace: &Path, marketplace_id: &str) -> std::
     remove_copy(&workspace.join(CACHE_DIR).join(marketplace_id))
 }
 
-/// One catalog media copy, by its three folder names.
 pub type CacheKey = (String, String, String);
 
-/// Drop catalog media no scan row needs any more. A marketplace that failed
-/// this scan keeps what it had, and one no longer registered loses it all.
 pub fn prune_cache(
     workspace: &Path,
     registered: &BTreeSet<String>,
@@ -535,7 +474,6 @@ fn log_removal(path: &Path, result: std::io::Result<()>) {
     }
 }
 
-/// The media a Plugins panel row and the plugin detail page draw, as URLs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginMedia {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -550,7 +488,6 @@ pub struct PluginMedia {
     pub problems: Vec<MediaProblem>,
 }
 
-/// Which media copy a URL names.
 pub enum MediaSource<'a> {
     Catalog {
         marketplace_id: &'a str,
@@ -585,7 +522,6 @@ impl MediaSource<'_> {
         }
     }
 
-    /// The URLs for everything `index` lists.
     pub fn media(&self, index: &MediaIndex) -> PluginMedia {
         let prefix = self.url_prefix();
         let url = |path: &str| {

@@ -1,14 +1,3 @@
-//! The Claude gateway sign-in, for Settings and the `lucidos claude-gateway`
-//! CLI. The gateway URL itself is the `claude_gateway_url` preference.
-//!
-//! - `GET /api/v1/providers/claude-gateway`: the URL, the stored sign-in and
-//!   the sign-in in progress. Never a token.
-//! - `POST /api/v1/providers/claude-gateway/sign-in`: start a device sign-in
-//!   and answer with the code the user enters on the gateway's page. A `url`
-//!   in the body is stored as the preference first.
-//! - `POST /api/v1/providers/claude-gateway/sign-out`: stop any sign-in in
-//!   progress and forget the stored one.
-
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -54,8 +43,6 @@ async fn sign_in(
             &headers,
             prefs::CLAUDE_GATEWAY_URL.key(),
         )?;
-        // The shared preference write, so its check and the sign-out of an
-        // old gateway apply exactly as they do to a Settings save.
         state
             .engine
             .apply_preference_write(

@@ -1,14 +1,3 @@
-//! The client half of the update relay (ADR 0338): a session that cannot
-//! install asks the gateway, and this process runs the install for it.
-//!
-//! Its own thread, in Rust rather than in a webview. At login the window is
-//! hidden and shows the picker. A hidden WKWebView can also be suspended. So a
-//! relay living in a page would work only while a window happened to be awake.
-//!
-//! Each heartbeat carries this client's release, its remote install blocker,
-//! and the latest progress frame of a relayed run. The reply may hand it a
-//! request, which it runs through the same `run_app_update` a click runs.
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,29 +8,20 @@ use tauri::{AppHandle, Manager};
 
 const HEARTBEAT_PATH: &str = "/~/api/v1/control/desktop-client/heartbeat";
 
-/// The version a heartbeat reports. The gateway compares it against its newest
-/// release, so it must be the release and never the client build id.
 const HEARTBEAT_VERSION: &str = crate::LUCIDOS_RELEASE;
 
-/// Idle cadence. The gateway counts a client attached for three of these.
 const IDLE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Cadence while a relayed run is under way, so the requester's progress bar
-/// moves rather than jumping every five seconds.
 const RUN_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A progress frame waiting for the next heartbeat.
 #[derive(Debug, Clone, PartialEq)]
 struct Pending {
     request: String,
     frame: Value,
 }
 
-/// What the heartbeat thread and a relayed run share.
 #[derive(Default)]
 struct Feed {
-    /// The newest frame not yet delivered. Older ones are dropped on purpose:
-    /// the requester shows where the run is, not every step it took.
     pending: Mutex<Option<Pending>>,
     running: AtomicBool,
 }
@@ -55,7 +35,6 @@ impl Feed {
         lock(&self.pending).take()
     }
 
-    /// Put an undelivered frame back, unless a newer one has landed since.
     fn restore(&self, pending: Pending) {
         lock(&self.pending).get_or_insert(pending);
     }
@@ -73,13 +52,10 @@ impl Feed {
     }
 }
 
-/// A poisoned lock means a panic while holding it. Every write here is a
-/// whole-value replace, so no half-written state can be left behind.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Marks a run as relayed, and carries its frames back to the requester.
 #[derive(Clone)]
 pub struct RelayTag {
     request: String,
@@ -87,7 +63,6 @@ pub struct RelayTag {
 }
 
 impl RelayTag {
-    /// Queue a progress frame for the next heartbeat.
     pub fn publish(&self, frame: &impl Serialize) {
         if let Ok(frame) = serde_json::to_value(frame) {
             self.feed.publish(Pending {
@@ -98,7 +73,6 @@ impl RelayTag {
     }
 }
 
-/// A request the gateway handed this client.
 #[derive(Debug, Deserialize, PartialEq)]
 struct Ticket {
     id: String,
@@ -120,12 +94,10 @@ fn heartbeat_body(version: &str, blocker: Option<&str>, progress: Option<&Pendin
     .to_string()
 }
 
-/// The request in a heartbeat reply, if any. An unreadable reply is no request.
 fn requested(reply: &str) -> Option<Ticket> {
     serde_json::from_str::<HeartbeatReply>(reply).ok()?.request
 }
 
-/// Start the heartbeat thread. Packaged macOS only; `desktop::launch` calls it.
 pub fn start(app: AppHandle, port: u16) {
     let feed = Arc::new(Feed::default());
     let (nudge, nudged) = std::sync::mpsc::channel();
@@ -153,8 +125,6 @@ fn beat_forever(
                     run_relayed(&app, &feed, &nudge, ticket);
                 }
             }
-            // The gateway is restarting or not up yet. Keep the frame for the
-            // next beat.
             None => {
                 if let Some(progress) = progress {
                     feed.restore(progress);
@@ -168,9 +138,6 @@ fn beat_forever(
     }
 }
 
-/// Run a relayed request on the async runtime. A successful run never returns,
-/// since it relaunches this process. Any other ending wakes the heartbeat at
-/// once, so the requester hears the outcome without waiting a full beat.
 fn run_relayed(app: &AppHandle, feed: &Arc<Feed>, nudge: &Sender<()>, ticket: Ticket) {
     let tag = RelayTag {
         request: ticket.id,
@@ -217,8 +184,6 @@ mod tests {
         );
     }
 
-    // The gateway offers the relay only when its newest release is newer than
-    // this. A CalVer build id is never older than a release, so it hid the relay.
     #[test]
     fn a_heartbeat_reports_the_release_not_the_build_id() {
         let release = std::fs::read_to_string(
@@ -263,7 +228,6 @@ mod tests {
         assert_eq!(feed.take(), None);
     }
 
-    // A failed delivery must not overwrite a frame the run produced since.
     #[test]
     fn a_frame_that_failed_to_send_never_overwrites_a_newer_one() {
         let feed = Feed::default();

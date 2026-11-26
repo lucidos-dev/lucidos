@@ -24,14 +24,11 @@ fn open_bytes(key: &OpeningKey, sealed: &[u8]) -> Result<Vec<u8>, BoxError> {
     Ok(out)
 }
 
-/// An age pair, sealed to the recipient and opened with the identity.
 fn age_pair() -> (SealingKey, OpeningKey) {
     let (identity, recipient) = generate_key_pair();
     (SealingKey::Recipient(recipient), OpeningKey::Age(identity))
 }
 
-/// Where the age payload starts: after the header's `--- <mac>` line and the
-/// 16-byte stream nonce. Each payload chunk is 64 KiB plus a 16-byte tag.
 fn age_payload_start(sealed: &[u8]) -> usize {
     let mac_line = sealed
         .windows(5)
@@ -48,8 +45,6 @@ fn age_payload_start(sealed: &[u8]) -> usize {
 }
 const AGE_CHUNK: usize = 64 * 1024 + 16;
 
-// --- age ---
-
 #[test]
 fn an_age_archive_round_trips_through_the_backup_key_text() {
     let (identity, recipient) = generate_key_pair();
@@ -57,7 +52,6 @@ fn an_age_archive_round_trips_through_the_backup_key_text() {
     let sealed = seal_bytes(&SealingKey::Recipient(recipient), &plaintext);
     assert!(sealed.starts_with(b"age-encryption.org/v1\n"));
 
-    // What the user pasted back, not the in-memory identity.
     let pasted: OpeningKey = backup_key_text(&identity).parse().unwrap();
     assert!(matches!(pasted, OpeningKey::Age(_)));
     assert_eq!(open_bytes(&pasted, &sealed).unwrap(), plaintext);
@@ -97,7 +91,6 @@ fn an_age_archive_with_two_chunks_swapped_fails() {
 fn an_age_archive_with_a_flipped_header_byte_fails() {
     let (seal_key, open_key) = age_pair();
     let mut sealed = seal_bytes(&seal_key, b"header guarded");
-    // Inside the recipient stanza, past the version line.
     sealed[30] ^= 0x01;
     assert!(open_bytes(&open_key, &sealed).is_err());
 }
@@ -128,8 +121,6 @@ fn a_bad_key_error_never_repeats_the_pasted_text() {
     assert!(!err.contains("plainly"), "{err}");
 }
 
-/// The own-key step wants a public key. A backup key pasted there is told
-/// apart, and no message repeats the paste or a raw bech32 reason.
 #[test]
 fn a_bad_recipient_error_names_the_public_key_and_never_repeats_the_paste() {
     let (identity, recipient) = generate_key_pair();
@@ -206,10 +197,6 @@ fn each_key_kind_names_its_suffix() {
     assert_eq!(legacy_key().archive_suffix(), ".enc");
 }
 
-// --- legacy ---
-
-/// An archive the `LUCIDOS1` encoder wrote before age existed, with the
-/// all-sevens test key. Restore must keep opening archives like it.
 const LEGACY_FIXTURE: &str = "TFVDSURPUzFsekoputEYfCQAAABsc2JwDC3brTqQEveyGUVsHCp4Hz/ACPMdWcCpbGXzE8Itx/EuDcyFg7nOY21xOomUt3yOAAAAAA==";
 
 #[test]
@@ -235,7 +222,6 @@ fn test_encrypt_decrypt_roundtrip() {
     let plaintext = b"Hello, Lucidos backup encryption!";
     let encrypted = seal_bytes(&key, plaintext);
 
-    // Chunked format: MAGIC(8) + nonce_prefix(8) + chunk_len(4) + ciphertext+tag(32+16) + end_marker(4)
     assert_eq!(encrypted.len(), 8 + 8 + 4 + plaintext.len() + 16 + 4);
     assert_eq!(
         open_bytes(&opening_for(&key), &encrypted).unwrap(),
@@ -245,7 +231,6 @@ fn test_encrypt_decrypt_roundtrip() {
 
 #[test]
 fn test_decrypt_accepts_legacy_cognos_magic() {
-    // Pre-rebrand backups carry b"COGNOS01" in the first 8 bytes.
     let key = legacy_key();
     let mut encrypted = seal_bytes(&key, b"pre-rebrand backup");
     encrypted[..8].copy_from_slice(LEGACY_MAGIC);
@@ -258,7 +243,6 @@ fn test_decrypt_accepts_legacy_cognos_magic() {
 #[test]
 fn test_encrypt_decrypt_large_multi_chunk() {
     let key = legacy_key();
-    // 2.5 MB spans 3 chunks (1MB + 1MB + 0.5MB)
     let plaintext: Vec<u8> = (0..2_621_440).map(|i| (i % 251) as u8).collect();
     let encrypted = seal_bytes(&key, &plaintext);
     assert_eq!(
@@ -282,7 +266,6 @@ fn test_encrypt_decrypt_exact_chunk_boundary() {
 fn test_encrypt_decrypt_empty() {
     let key = legacy_key();
     let encrypted = seal_bytes(&key, b"");
-    // Just header + end marker
     assert_eq!(encrypted.len(), 8 + 8 + 4);
     assert!(open_bytes(&opening_for(&key), &encrypted)
         .unwrap()
@@ -300,7 +283,6 @@ fn test_decrypt_wrong_key_fails() {
 fn test_decrypt_corrupted_data_fails() {
     let key = legacy_key();
     let mut encrypted = seal_bytes(&key, b"important data");
-    // Corrupt a byte in the ciphertext (after header + nonce_prefix + chunk_len = 20 bytes)
     encrypted[22] ^= 0xFF;
     assert!(open_bytes(&opening_for(&key), &encrypted).is_err());
 }

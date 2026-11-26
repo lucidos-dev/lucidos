@@ -90,3 +90,25 @@ test('GitHub build jobs read this host timings log within the window', () => {
     'build-engine': { n: 1, tooFew: true },
   });
 });
+
+test('lab medians and counts are displayed per host and run', () => {
+  const report = {
+    ...buildScoreboard(fixture.events, { observedAt: fixture.observed_at, days: 7 }),
+    harden_suites: suiteTimings(fixture.events, { observedAt: fixture.observed_at, days: 7, cargoSuites: [] }),
+    main_check_seconds: {},
+    lane_batches: {},
+    github_build_seconds: { unavailable: 'no timings log' },
+    perf_samples: { unavailable: 'no diagnostic log', notes: [] },
+    lab_runs: [
+      { kind: 'build', at: '2026-11-22', status: 'completed', host: {
+        fingerprint: 'first-host', os: 'linux', architecture: 'arm64', cores: 10, memory_bytes: 48 * 1024 ** 3, toolchain: 'rustc 1',
+      }, measurements: { build: { median: 2, samples: [1, 2, 3], unit: 'seconds' } } },
+      { kind: 'app', at: '2026-11-22', status: 'deferred', host: {
+        fingerprint: 'second-host', os: 'darwin', architecture: 'arm64', cores: 8, memory_bytes: 32 * 1024 ** 3, toolchain: 'v24',
+      }, next_step: 'setup' },
+    ],
+  };
+  const text = formatText(report);
+  assert.match(text, /first-host.*linux arm64.*10 cores.*48 GiB.*rustc 1.*build.*2 seconds.*3/);
+  assert.match(text, /second-host.*darwin arm64.*8 cores.*32 GiB.*v24.*setup.*deferred/);
+});

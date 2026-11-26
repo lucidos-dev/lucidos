@@ -1,14 +1,8 @@
 use std::path::Path;
 use std::process::Command;
 
-/// The repo tracks `knowhow/` and nothing else. The directory also holds the
-/// local token and the paired devices. A staged blob copies a file without its
-/// permissions.
 const USER_DIR_GITIGNORE: &str = "/*\n!/.gitignore\n!/knowhow/\n";
 
-/// Ensure the user-level Lucidos directory is a git repo that tracks only
-/// `knowhow/`, with `.git` readable by its owner alone. A no-op when the
-/// directory does not exist.
 pub fn ensure_git_init(user_dir: &Path) {
     if !user_dir.exists() {
         return;
@@ -34,7 +28,6 @@ pub fn ensure_git_init(user_dir: &Path) {
             if user_dir.join("knowhow").is_dir() {
                 stage.push("knowhow");
             }
-            // Initial commit so there's a HEAD for subsequent auto_commit calls
             match Command::new("git")
                 .args(&stage)
                 .current_dir(user_dir)
@@ -68,7 +61,7 @@ pub fn ensure_git_init(user_dir: &Path) {
     }
 }
 
-/// Make `.git` owner-only. Git writes its objects world-readable, so this is
+/// INVARIANT: Make `.git` owner-only. Git writes its objects world-readable, so this is
 /// what keeps a secret an older engine already staged away from other accounts.
 #[cfg(unix)]
 fn restrict_git_dir(user_dir: &Path) {
@@ -85,9 +78,8 @@ fn restrict_git_dir(user_dir: &Path) {
 #[cfg(not(unix))]
 fn restrict_git_dir(_user_dir: &Path) {}
 
-/// Stage a file and commit in the user dir. Best-effort — logs errors but does not propagate.
 pub fn auto_commit(user_dir: &Path, relative_path: &str, message: &str) {
-    // `--` for the same reason the commit below has one: `relative_path` comes
+    // INVARIANT: `--` for the same reason the commit below has one: `relative_path` comes
     // from a model-supplied file tool path, and a name opening with `-` is read
     // as an option. `git add -A` would stage the whole tree instead of the one
     // file the caller asked for.
@@ -127,9 +119,6 @@ pub fn auto_commit(user_dir: &Path, relative_path: &str, message: &str) {
     }
 }
 
-/// Delete a file in the user dir and commit the removal. The delete fails
-/// loudly, so a caller never reports a file gone that is still there. The
-/// commit is best-effort, as in [`auto_commit`].
 pub fn remove_and_commit(
     user_dir: &Path,
     relative_path: &str,
@@ -157,8 +146,6 @@ mod tests {
         );
     }
 
-    /// The first boot ran `git add .` over the whole directory, which copied
-    /// the 0600 local token into a world-readable git object.
     #[test]
     #[cfg(unix)]
     fn ensure_git_init_never_stages_outside_knowhow() {
@@ -188,8 +175,6 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
     }
 
-    /// An older engine already staged everything. Making `.git` owner-only is
-    /// what closes those objects to other accounts.
     #[test]
     #[cfg(unix)]
     fn ensure_git_init_makes_an_existing_git_dir_owner_only() {
@@ -217,7 +202,6 @@ mod tests {
         ensure_git_init(&dir);
         assert!(dir.join(".git").exists());
 
-        // Second call should not fail
         ensure_git_init(&dir);
     }
 
@@ -228,7 +212,6 @@ mod tests {
         std::fs::create_dir_all(dir.join("knowhow")).unwrap();
         ensure_git_init(&dir);
 
-        // Write a file
         std::fs::write(
             dir.join("knowhow/test.md"),
             "---\nname: Test\n---\nContent.",
@@ -236,7 +219,6 @@ mod tests {
         .unwrap();
         auto_commit(&dir, "knowhow/test.md", "update knowhow: test");
 
-        // Check git log
         let output = std::process::Command::new("git")
             .args(["log", "--oneline", "-1"])
             .current_dir(&dir)

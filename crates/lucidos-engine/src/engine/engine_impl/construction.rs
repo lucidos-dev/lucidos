@@ -1649,6 +1649,7 @@ impl LucidosEngine {
             claude_gateway_sign_in: Arc::default(),
             chatgpt_plan_sign_in: Arc::default(),
             chatgpt_plan_access: plan_access,
+            event_hook_catalog: std::sync::OnceLock::new(),
             pending_installs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_uninstalls: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             frontend_origin: std::sync::Mutex::new(None),
@@ -1657,6 +1658,7 @@ impl LucidosEngine {
             apply_claims: Arc::default(),
             view_snapshots: Default::default(),
             find_cache: Default::default(),
+            session_spawn_gate: Default::default(),
             agent_runtimes: {
                 let mut m: HashMap<CodingAgent, Arc<dyn AgentRuntime>> = HashMap::new();
                 m.insert(CodingAgent::ClaudeCode, Arc::new(ClaudeCodeRuntime));

@@ -14,13 +14,6 @@ mod spoken_aside_tests {
         }
     }
 
-    /// The reported shape. A caller asked a second question mid-turn. The
-    /// talker answered that one alone, and `call.rs` offered its reply to the
-    /// running turn. The offer landed as the answer finished, so the turn
-    /// drafted a whole second answer to an aside that asked nothing.
-    ///
-    /// The caller pays that round twice over: once in latency, and once in a
-    /// rewritten answer that dropped every link the first one carried.
     #[test]
     fn a_spoken_aside_alone_leaves_a_finished_answer_alone() {
         assert!(!injections_reopen_a_finished_answer(&[prompt(
@@ -32,9 +25,6 @@ mod spoken_aside_tests {
         ]));
     }
 
-    /// Every other kind still reopens, which is what this path is FOR. A
-    /// follow-up sent mid-call would otherwise orphan into a turn of its own.
-    /// An engine re-entry would strand the work that woke it.
     #[test]
     fn a_real_follow_up_still_reopens_a_finished_answer() {
         for kind in [
@@ -49,9 +39,6 @@ mod spoken_aside_tests {
         }
     }
 
-    /// The rest of a spoken sentence reopens a finished answer. It reaches only
-    /// a turn whose history may have missed its row, so without the reopen the
-    /// caller hears an answer to half a question.
     #[test]
     fn the_rest_of_a_spoken_sentence_reopens_a_finished_answer() {
         assert!(injections_reopen_a_finished_answer(&[prompt(
@@ -59,8 +46,6 @@ mod spoken_aside_tests {
         )]));
     }
 
-    /// It still starts no turn of its own. Re-submitted from the teardown
-    /// window, it would make the caller hear a second answer.
     #[test]
     fn the_rest_of_a_spoken_sentence_carries_no_turn() {
         let kind = InjectedPromptKind::SpokenContinuation;
@@ -71,12 +56,6 @@ mod spoken_aside_tests {
         );
     }
 
-    /// An aside beside a real follow-up rides along rather than being dropped.
-    /// The round is reopening anyway, and telling it what the caller was just
-    /// told in its name is the whole point of offering the aside.
-    ///
-    /// Both orders, because the drain preserves arrival order and the answer
-    /// must not depend on which landed first.
     #[test]
     fn an_aside_rides_along_with_a_real_follow_up() {
         assert!(injections_reopen_a_finished_answer(&[
@@ -89,18 +68,13 @@ mod spoken_aside_tests {
         ]));
     }
 
-    /// The ordinary turn, where nothing was queued at all. It must fall through
-    /// to the checks below rather than pay a round.
     #[test]
     fn an_empty_drain_reopens_nothing() {
         assert!(!injections_reopen_a_finished_answer(&[]));
     }
 
-    /// The teardown drain re-submits only what can carry a turn. A kind that
-    /// reopens nothing here must not be re-submitted there either.
     #[test]
     fn a_kind_that_reopens_nothing_is_never_resubmitted_from_the_teardown_window() {
-        // Exhaustive on purpose: a new kind has to be placed here.
         let placed = |kind: &InjectedPromptKind| match kind {
             InjectedPromptKind::UserText
             | InjectedPromptKind::ReentryFromEngine

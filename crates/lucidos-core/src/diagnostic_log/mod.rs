@@ -1,21 +1,14 @@
-//! The diagnostic log: this engine's own `log!` lines, sanitized, in a
-//! rotated JSONL file under `<ws>/.lucidos/diagnostic-log/` (ADR 0667).
-//!
-//! It never reads the host log, a service log, journald or another workspace.
-//! Every path here derives from the workspace root alone.
-
 pub use lucidos_diagnostic_log::{query, sanitize, writer};
 
 use std::path::{Path, PathBuf};
 
 pub use sanitize::register_secret_values;
 
-/// Where a workspace keeps its diagnostic log.
 pub fn dir_for(workspace: &Path) -> PathBuf {
     workspace.join(".lucidos").join("diagnostic-log")
 }
 
-/// Start the writer thread for `workspace`. Call once, after the stored
+/// INVARIANT: Start the writer thread for `workspace`. Call once, after the stored
 /// environment variables reach the process env, so their secret values get
 /// masked. A later call changes nothing.
 pub fn start(workspace: &Path) -> std::io::Result<()> {
@@ -35,18 +28,15 @@ pub fn start(workspace: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Whether [`start`] succeeded in this process.
 pub fn started() -> bool {
     lucidos_diagnostic_log::started()
 }
 
-/// Hand one `log!` line to the writer. Returns at once, and does nothing
-/// when the sink never started (tests, other binaries).
 pub fn record(label: &'static str, msg: String) {
     lucidos_diagnostic_log::record_legacy(label, msg);
 }
 
-/// Max entries one batched `/internal/client-logs` request may carry, so a
+/// INVARIANT: Max entries one batched `/internal/client-logs` request may carry, so a
 /// misbehaving client can't flood the engine.log tail in a single POST. The
 /// frontend perf queue flushes well under this.
 pub const CLIENT_LOG_MAX_BATCH: usize = 100;

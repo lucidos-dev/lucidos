@@ -1,14 +1,3 @@
-//! Lowercase-hex byte encoding, shared by every engine module that renders
-//! bytes as text: digests, signatures and tokens, across `api`, `core`, `llm`
-//! and `runtime`.
-//!
-//! Centralised here so the encoding format stays consistent. Historically
-//! each proxy module grew its own near-identical helper (`hex_lower`,
-//! `hex_string`, `hex_to_string`) and a couple of inline `format!` loops in
-//! test code. It was `api/proxy_hex.rs` while the proxy was its only consumer;
-//! the origin token made that name untrue.
-
-/// Encode `bytes` as lowercase ASCII hex. Output length is `2 * bytes.len()`.
 pub fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -18,7 +7,7 @@ pub fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Decode an even-length ASCII hex string back to bytes; `None` on odd length
+/// INVARIANT: Decode an even-length ASCII hex string back to bytes; `None` on odd length
 /// or any non-hex character.
 ///
 /// The inverse of [`hex_lower`], added so a MAC that travels as hex can be
@@ -69,8 +58,6 @@ mod tests {
         assert_eq!(hex_decode("abc"), None, "odd length");
         assert_eq!(hex_decode("zz"), None, "non-hex characters");
         assert_eq!(hex_decode("0g"), None, "one non-hex nibble");
-        // `to_digit(16)` accepts uppercase, and a decoder that rejected it
-        // would be surprising. Encoding stays lowercase; decoding is lenient.
         assert_eq!(hex_decode("AB").as_deref(), Some(&[0xabu8][..]));
     }
 

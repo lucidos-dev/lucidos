@@ -1,11 +1,6 @@
 use super::super::*;
 use super::*;
 
-/// Regression for the cascading-archive bug on thread
-/// `0f547346-c63f-43af-b73a-6f36b12ca859`: parent's Archive button stuck
-/// disabled because `blocking_descendant_count = 3` while every descendant
-/// is idle. Root cause + fix: see `crates/lucidos-engine-bin/src/main.rs`
-/// (rebuild_blocking_descendant_count at startup).
 #[tokio::test]
 async fn startup_orphan_reset_drift_recovered_by_rebuild() {
     let (pool, db_name) = setup_test_db().await;
@@ -14,17 +9,11 @@ async fn startup_orphan_reset_drift_recovered_by_rebuild() {
     let (parent_id, children) = spawn_cc_parent_with_n_running_cc_children(&bus, 3).await;
     assert_eq!(read_blocking_descendant_count(&pool, parent_id).await, 3);
 
-    // Direct UPDATE that mirrors the orphan-running reset in `main.rs` —
-    // bypasses the projection's sampling wrapper, so no decrement reaches
-    // the parent's `blocking_descendant_count`.
     sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE status = 'running'")
         .execute(&pool)
         .await
         .unwrap();
 
-    // The recovery sweep that follows still emits through EventBus, but
-    // `prev_sample` already sees status='idle' (the UPDATE above landed
-    // first), so delta=0 and the count stays drifted at 3.
     for &child_id in &children {
         emit_cc_recovery_pair(&bus, child_id).await;
     }
@@ -48,20 +37,11 @@ async fn startup_orphan_reset_drift_recovered_by_rebuild() {
     teardown_test_db(&db_name).await;
 }
 
-/// Companion to `startup_orphan_reset_drift_recovered_by_rebuild`: drive the
-/// full restart→continue→respond→propose→apply lifecycle entirely through
-/// EventBus (no direct SQL), and assert the projection alone holds the count
-/// at 0. Failure here means the bug is in the projection itself, not the
-/// startup bypass — which would require a different fix than the rebuild.
 #[tokio::test]
 async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-    // Parent itself is a CC thread — production trace has `is_coding_agent=t`
-    // on the parent because the user typed into CC mode before sub-tasks
-    // spawned. Idle it before children spawn so its own MessageReceived
-    // doesn't leave it Running.
     let parent_id = Uuid::new_v4();
     emit_cc_message_received(&bus, parent_id, None, "parent").await;
     emit_cc_session_started(&bus, parent_id).await;
@@ -182,14 +162,6 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
     let headers =
         crate::api::gateway_stamp::test_support::stamped_device_headers("test-device-emit");
 
-    // `DataFileWritten` (rather than the spec's `AppDeleted`) so the
-    // assertion below can read the row back from the `events` table with the
-    // actor attached: App* variants are transient and never persisted, and
-    // Trigger* variants persist but their custom `to_payload` drops the
-    // actor. `DataFileWritten` uses the default `serde_json::to_value(self)`
-    // branch, which serializes the whole `#[serde(tag = "type", content =
-    // "data")]` shape — so `payload` is `{"type": "DataFileWritten",
-    // "data": {"path": …, "actor": {…}}}` and the actor round-trips.
     let actor = crate::api::actor::require_user_actor(&headers, &pool, None)
         .await
         .expect("a registered device identifies itself");
@@ -203,7 +175,6 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
     )
     .await;
 
-    // Find the emitted event in the events table.
     let row: (serde_json::Value,) = sqlx::query_as(
         "SELECT payload FROM events WHERE event_type = 'DataFileWritten' \
          AND payload->'data'->>'path' = 'artifacts/fixture.txt' \
@@ -230,32 +201,6 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
     teardown_test_db(&db_name).await;
 }
 
-// ---------------------------------------------------------------------------
-// Phase contract tests — codify the EventBus::emit pipeline.
-//
-// `EventBus::emit` is the single emission point for every domain event, but the
-// ordering of its internal steps used to be folkloric: validate-reads-projection,
-// project-cascades-into-parent, capture-aggregate-must-stay-in-tx, broadcast-
-// fires-only-after-commit. The two tests below pin both halves of the contract:
-//
-//   1. `emit_pipeline_has_six_named_phases_in_order` — a source-level check
-//      that the six `// === Phase: <Name> ===` banners exist inside
-//      `event_bus/mod.rs` in the documented order. Catches the case where someone
-//      adds a chunk of code outside a declared phase, or reorders the phases.
-//
-//   2. `subscriber_observes_event_with_committed_projection` — a behavioural
-//      check that a `bus.subscribe()` consumer sees the `EmittedEvent` after
-//      the projection row has been committed, and that the carried aggregate
-//      snapshot reflects the post-projection state. Catches the case where
-//      someone moves the broadcast send before `tx.commit()`, or captures the
-//      aggregate from a pre-projection read.
-// ---------------------------------------------------------------------------
-/// Parse `event_bus/mod.rs` at compile time and assert the six phase banners
-/// inside `EventBus::emit` appear in the documented order. Drift triggers
-/// here before the behavioural test or production code can mask it.
-///
-/// Adding a new phase: update both the source banners and `EXPECTED` here,
-/// and document the phase in the `EventBus` struct doc-comment.
 #[test]
 fn emit_pipeline_has_six_named_phases_in_order() {
     const SOURCE: &str = include_str!("../../../../lucidos-core/src/engine/event_bus/mod.rs");
@@ -291,19 +236,11 @@ fn emit_pipeline_has_six_named_phases_in_order() {
     );
 }
 
-/// Behavioural smoke test for the post-commit + read-your-write contract.
-///
-/// A subscriber receives an `EmittedEvent` after `tx.commit()`, and the
-/// carried `aggregate` snapshot reflects the just-committed projection state.
-/// Cross-checked against a direct DB query so a pre-commit broadcast (where
-/// the subscriber sees the event but no other connection sees the row) would
-/// fail loudly.
 #[tokio::test]
 async fn subscriber_observes_event_with_committed_projection() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-    // Subscribe before emit so we observe the very first broadcast.
     let mut rx = bus.subscribe();
 
     let thread_id = Uuid::new_v4();
@@ -324,10 +261,6 @@ async fn subscriber_observes_event_with_committed_projection() {
              — if the aggregate is None, CaptureAggregate either failed or wasn't run",
         );
 
-    // The aggregate must reflect the just-emitted event. `title` falls back to
-    // `first_message` when no ThreadTitleGenerated has fired; we verify both
-    // the message count and the title fallback to prove the projection ran
-    // before the aggregate was captured.
     assert_eq!(
         aggregate.message_count, 1,
         "EmittedEvent.aggregate must carry the post-projection message_count; \
@@ -343,10 +276,6 @@ async fn subscriber_observes_event_with_committed_projection() {
         message_text,
     );
 
-    // Cross-check: the projection row must be queryable from a separate
-    // connection via the pool. If the broadcast had fired pre-commit, the
-    // subscriber could observe the event before any other connection saw the
-    // row — this query would return None and fail the test.
     let committed_first_message: Option<String> =
         sqlx::query_scalar("SELECT first_message FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)

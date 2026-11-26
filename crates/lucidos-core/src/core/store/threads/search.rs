@@ -1,15 +1,15 @@
 use super::*;
 
-/// The text of a message event, exactly as `idx_events_message_text_trgm`
+/// INVARIANT: The text of a message event, exactly as `idx_events_message_text_trgm`
 /// indexes it. Any difference and the planner cannot use the index.
 const MESSAGE_TEXT: &str =
     "(COALESCE(e.payload->>'text', '') || ' ' || COALESCE(e.payload->>'content', ''))";
 
-/// The predicate of both partial message indexes, verbatim.
+/// INVARIANT: The predicate of both partial message indexes, verbatim.
 const IS_MESSAGE: &str =
     "e.event_type IN ('MessageReceived', 'ResponseGenerated') AND e.thread_id IS NOT NULL";
 
-/// A trigram index needs 3 characters to narrow a search. A shorter token
+/// INVARIANT: A trigram index needs 3 characters to narrow a search. A shorter token
 /// would make Postgres recheck every message.
 const MIN_INDEXED_TOKEN_CHARS: usize = 3;
 
@@ -17,31 +17,14 @@ fn is_indexable(token: &str) -> bool {
     token.chars().filter(|c| c.is_alphanumeric()).count() >= MIN_INDEXED_TOKEN_CHARS
 }
 
-/// Escape LIKE metacharacters (\ % _) so a token like "50%" matches the
-/// literal substring, not "anything containing 50". Backslash is LIKE's
-/// default escape character, so no ESCAPE clause is needed.
 fn contains_pattern(token: &str) -> String {
     format!("%{}%", super::super::escape_like(token))
 }
 
-/// Binds, in order:
-/// - $1 every token's pattern
-/// - $2 the limit
-/// - $3 the query as a phrase pattern
-/// - $4 the query as an exact pattern
-/// - $5 the long tokens' patterns
-/// - $6 the short tokens' patterns
-///
-/// `with_entities` adds the arm that reads `memory_entries`. Pass it only when
-/// that table exists, since naming a missing relation fails the whole query.
 pub(super) fn text_search_sql(with_entities: bool) -> String {
-    // The title the user sees, whitespace collapsed like `title_match` does.
     let shown_title =
         "btrim(regexp_replace(COALESCE(s.title, s.first_message, ''), '\\s+', ' ', 'g'))";
-    // Joins `best_scores b` against `thread_summaries s`, so the alias is `s`.
     let thread_cols_prefixed = thread_cols("s");
-    // Drive from memory_entries (the small side) and join into events by
-    // primary key. The CASE keeps the cast off non-event sources.
     let (entity_cte, entity_arm) = if with_entities {
         (
             format!(
@@ -68,8 +51,6 @@ pub(super) fn text_search_sql(with_entities: bool) -> String {
         (String::new(), "")
     };
 
-    // Message text: the long tokens find candidate threads through the trigram
-    // index. The short tokens are then checked only on those threads' messages.
     format!(
         "WITH title_matches AS (\
             SELECT thread_id, 1.0::float8 AS match_score FROM thread_summaries WHERE title ILIKE ALL($1::text[])\
@@ -108,7 +89,6 @@ pub(super) fn text_search_sql(with_entities: bool) -> String {
     )
 }
 
-/// One message event a text search matched.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MessageMatch {
     pub event_id: uuid::Uuid,
@@ -118,16 +98,6 @@ pub struct MessageMatch {
 }
 
 impl EventStore {
-    /// Search threads by text query (ILIKE on titles, message content and the
-    /// unsent draft).
-    /// Multi-token queries match per-token: every whitespace-separated token must
-    /// appear (case-insensitive) somewhere in the thread, in the title or any
-    /// message, but they need not appear together as a phrase. A query of only
-    /// short tokens skips message text, which no index can serve. A draft
-    /// matches only when it holds every token itself. Title-only
-    /// matches score 1.0; content and draft matches score 0.7. The `limit` cut keeps an
-    /// exact title first, then a title holding the query as a phrase. Those are
-    /// the tiers `thread_search::rank_order` ranks above every other hit.
     pub async fn search_threads_by_text(
         &self,
         query: &str,
@@ -137,7 +107,7 @@ impl EventStore {
         if tokens.is_empty() {
             return Ok(vec![]);
         }
-        // Each arm counts DISTINCT patterns against the token count, so a
+        // INVARIANT: Each arm counts DISTINCT patterns against the token count, so a
         // repeated token would make that count unreachable.
         let mut distinct: Vec<&str> = Vec::with_capacity(tokens.len());
         for token in &tokens {
@@ -180,10 +150,6 @@ impl EventStore {
             .collect()
     }
 
-    /// The newest message events holding every token of `query`, case
-    /// insensitive. The long tokens go through the trigram index; the short
-    /// ones are checked on the rows it finds. A query with no token of 3
-    /// characters is refused, since no index could serve it.
     pub async fn search_message_events(
         &self,
         query: &str,
@@ -222,8 +188,6 @@ impl EventStore {
             .await?)
     }
 
-    /// Search threads semantically using memory_entries vector search.
-    /// Accepts event IDs paired with their similarity scores.
     pub async fn search_threads_by_memory(
         &self,
         scored_event_ids: &[(uuid::Uuid, f64)],
@@ -235,7 +199,6 @@ impl EventStore {
 
         let event_ids: Vec<uuid::Uuid> = scored_event_ids.iter().map(|(id, _)| *id).collect();
 
-        // Build a map of event_id → best similarity score
         let mut event_scores: std::collections::HashMap<uuid::Uuid, f64> =
             std::collections::HashMap::new();
         for (id, score) in scored_event_ids {
@@ -245,7 +208,6 @@ impl EventStore {
             }
         }
 
-        // Find which thread each event belongs to
         let thread_event_rows = sqlx::query_as::<_, (String, uuid::Uuid)>(
             r#"
             SELECT DISTINCT thread_id::text, id
@@ -258,7 +220,6 @@ impl EventStore {
         .fetch_all(&self.pool)
         .await?;
 
-        // Build thread_id → best score
         let mut thread_scores: std::collections::HashMap<String, f64> =
             std::collections::HashMap::new();
         for (thread_id, event_id) in &thread_event_rows {
@@ -275,7 +236,7 @@ impl EventStore {
             .filter_map(|id| uuid::Uuid::parse_str(id).ok())
             .collect();
 
-        // No SQL LIMIT: the cut belongs after the score sort below. An
+        // INVARIANT: No SQL LIMIT: the cut belongs after the score sort below. An
         // unordered `LIMIT` here returns an arbitrary slice of the candidates,
         // so the best-scoring thread is dropped whenever Postgres did not
         // happen to return it. `thread_uuids` is already bounded by the

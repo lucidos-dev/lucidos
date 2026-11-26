@@ -1,24 +1,7 @@
-//! End-to-end API tests for deleting a thread.
-//!
-//! The transaction itself is covered in
-//! `crates/lucidos-agents-api/src/api/threads/delete_tests.rs`, and the caller gate
-//! in `api/actor_tests.rs`, where an origin token can be minted. What is tested
-//! here is the WIRING: real HTTP into a booted workspace, through the owner
-//! gate, the shared cascade classifier and the one destructive transaction.
-//!
-//! Two properties an external client is uniquely placed to prove. A caller with
-//! no credential really is refused at the boundary rather than somewhere
-//! deeper. And the cascade reaches a grandchild over real HTTP, not only in a
-//! hand-built family snapshot.
-//!
-//! Setup mirrors `cascade_archive_test.rs`: seed `thread_summaries` rows
-//! directly, so each scenario is fast and deterministic.
-
 use crate::support::{base_url, db_url, http_client, user_client};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Seed one family member, covering every column the cascade gate consults.
 pub(crate) async fn seed_thread(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -75,8 +58,6 @@ pub(crate) async fn cleanup(pool: &sqlx::PgPool, ids: &[Uuid]) {
         .await;
 }
 
-/// Three generations, deleted whole. Stop at the children and the grandchildren
-/// point at a parent that is gone. The design plan rejected that shape outright.
 #[tokio::test]
 async fn delete_cascades_over_three_generations() {
     let client = user_client().await;
@@ -121,8 +102,6 @@ async fn delete_cascades_over_three_generations() {
     assert_eq!(rows_left(&pool, "thread_summaries", &family).await, 0);
     assert_eq!(rows_left(&pool, "events", &family).await, 0);
 
-    // The audit record survives on the `ops` aggregate, naming the ids and
-    // nothing that was said.
     let payload: Option<serde_json::Value> = sqlx::query_scalar(
         "SELECT payload FROM events \
          WHERE event_type = 'ThreadsDeleted' AND aggregate = 'ops' \
@@ -143,13 +122,6 @@ async fn delete_cascades_over_three_generations() {
     pool.close().await;
 }
 
-/// The security boundary, from outside. An API caller presenting no credential
-/// at all is refused before anything is read, and the thread is still there
-/// afterwards.
-///
-/// The agent-origin-token half of the same rule is tested in the engine, where
-/// the per-startup secret can be installed and a token minted. An external
-/// client cannot mint one, which is itself the point.
 #[tokio::test]
 async fn delete_refuses_an_unattributed_caller() {
     let pool = sqlx::PgPool::connect(&db_url())
@@ -159,7 +131,6 @@ async fn delete_refuses_an_unattributed_caller() {
     let thread_id = Uuid::new_v4();
     seed_thread(&pool, thread_id, None, "idle").await;
 
-    // `http_client` sends no device header, which is what a bare curl is.
     let resp = http_client()
         .post(format!("{}/api/v1/threads/delete", base_url()))
         .json(&json!({ "thread_id": thread_id.to_string() }))
@@ -178,7 +149,6 @@ async fn delete_refuses_an_unattributed_caller() {
         "a refused delete must leave the thread alone"
     );
 
-    // The preflight leaks sub-thread titles, so it is gated the same way.
     let preflight = http_client()
         .get(format!(
             "{}/api/v1/threads/delete-preflight?thread_id={}",
@@ -198,8 +168,6 @@ async fn delete_refuses_an_unattributed_caller() {
     pool.close().await;
 }
 
-/// The refusal archive and delete share, over real HTTP. A running descendant
-/// blocks the whole family, and nothing is removed.
 #[tokio::test]
 async fn delete_refuses_a_running_descendant() {
     let client = user_client().await;
@@ -245,8 +213,6 @@ async fn delete_refuses_a_running_descendant() {
     pool.close().await;
 }
 
-/// A parent parked on a question needs the user, so delete and archive both
-/// refuse it (ADR 0259).
 #[tokio::test]
 async fn delete_refuses_a_parent_waiting_on_an_answer() {
     let client = user_client().await;

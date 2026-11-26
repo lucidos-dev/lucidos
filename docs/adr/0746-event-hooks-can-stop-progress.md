@@ -144,3 +144,131 @@ a changed hook means editing a gate never switches it off.
 - **Typed engine events for hardening and release.** Simpler for one app, but
   it hardcodes Lucidos's own process into every install.
 - **A hand-set stage with reminders.** It still goes stale, only more slowly.
+
+## Amendment, 2026-11-25: the ask, as built
+
+Plan W1.1 phase 4 built the ask. Decision 12 changes, and the build settled
+the points below. The knowhow is `system-knowhow/event-hooks.md`.
+
+### Decision 12 now reads
+
+**Arming binds to content.** The armed record names a hash of every file in
+the hook's folder, at any depth. A helper the script imports is content too.
+A link in the folder makes the hook invalid, since it could reach content the
+hash never sees. A changed armed hook refuses its events until the owner arms
+the new content or disarms it. No hook was armed before this change, because
+arming refused every type, so no stored hash needed a migration.
+
+### Where Lucidos asks
+
+- **Four types are asked**, all thread events: `MessageReceived`,
+  `TriggerStarted`, `ChangeProposed` and `ChangeApplyRequested`
+  (`ASKED_EVENT_TYPES`).
+- **`MessageReceived` is asked only for a thread's first message**: no earlier
+  `MessageReceived` or `TriggerStarted` row on the thread. The hook's view adds
+  `first_message: true`. Lucidos reads this only while a hook is armed on the
+  type.
+- **The ask runs just before the hooked event's own append**, outside every
+  transaction. Draft acceptance commits only its acceptance event, and the
+  executor records `MessageReceived` later. So the first message is asked
+  there, not in `accept_saved_draft`.
+- **Any message that could become a thread's first recorded message is
+  asked.** A Lucidos Agent turn holds the per-thread turn-start gate until its
+  starter is recorded. A second message waits behind the hook, then is asked as
+  a first message itself. A coding-agent run holds no such gate, so its
+  follow-up fast path asks too. The ask returns at once once the thread has a
+  recorded start.
+- **The queue skips its eager sub-thread message while a `MessageReceived`
+  hook is armed.** The sub-thread's own turn asks and records it. An admitted
+  queue entry cannot be cancelled cleanly, and a slow hook must not block the
+  parent's `run_thread` call.
+- **Every `propose_change` path asks**, as does the startup sweep of held-back
+  work. The ask comes before the sibling discard and before
+  `ChangeBroughtBack`, so a refusal moves nothing.
+- **Some records stay recording sites**, because stopping them would hide the
+  user's work or a failure:
+  - a correction to an emptied change;
+  - leftover work set aside after a thread ends;
+  - the debug-only seed route;
+  - the notice thread for a refused script run;
+  - a failed image input.
+
+### The token and the gate
+
+- **`Asked` is the proof.** Only `EventBus::ask_hooks` mints it, with the
+  event type, the thread and the returned events. `EventBus::emit_asked`
+  checks type and thread, then appends the event and the returned events in
+  one transaction (`ThreadAppendEffect::HookReturned`). Validate drops both
+  together.
+- **The gate lives on the bus.** It caches the armed hooks, loaded at boot, so
+  the unhooked path is one in-memory lookup. An arming event clears the cache.
+  With a hook armed and no runner installed, the ask refuses.
+- **No script runs before the engine serves.** Boot recovery reaches asking
+  sites: standing applies, Apply All batches, allowed starts, the queue and
+  the scheduler. A hook script may call the engine, so the runner waits for
+  the engine to listen before it starts one. Reordering boot instead would
+  break Apply All's order before the switch resumes. The inline held-back
+  sweep cannot wait, so boot defers it while a `ChangeProposed` hook is armed.
+- **Core owns the policy, the leaf crate the mechanics.** Core asks the armed
+  hooks in slug order, and the first refusal wins. The leaf asks one hook: it
+  checks the content hash, matches the condition, and only then runs the
+  script.
+- **The refusal causes** are `refused`, `crashed`, `timed-out`,
+  `invalid-answer`, `changed`, `missing-input` and `unavailable`. Until
+  declared arguments land, a `needs-input` answer refuses as `missing-input`.
+
+### The refusal
+
+- **`EventHookRefused` is a `SystemEvent`**, aggregate `event_hook_refusal`.
+  Aggregate `event_hook` would read a refusal as the latest arming state, and
+  aggregate `thread` would join every last-word query on a thread.
+- **Lucidos records it with an ordinary emit after the ask.** A failed record
+  is logged, and the event still stops.
+- **A person's refused first message** gets an error toast.
+- **A refused trigger start fails the fire.** The scheduler sends its failure
+  notice and records the run as failed, and the queue retries nothing. A
+  successful result would record a completed run on a thread with no events.
+- **A refused proposal is withheld as `hook_refused`**, through the same path
+  as the plan holds. An open change the branch moved past is withdrawn, or its
+  Apply would merge the commits the hook refused. The next turn end asks again.
+- **A refused Apply** records `ChangeApplyFailed` and fails with the reason.
+
+### A hook's own identity
+
+- **A hook's events carry `MessageOrigin::EventHook { slug }`**, mode Engine.
+  The ask never asks about an event whose actor is a hook. That one rule covers
+  returned events and anything a hook's process emits.
+- **The origin token carries the hook's claim**, as `thread@depth@hook@trigger`.
+  It names no thread, so the process never acts as the thread's agent. It is
+  minted at the asked event's chain depth, so the trigger chain limit cuts a
+  hook and trigger loop.
+- **A slug that cannot ride a header gets no token at all.** A token without
+  its claim would let the hook's emits escape the guard.
+- **An owner door reads a hook as an agent.** The agent arms then refuse,
+  because the token names no thread.
+- **No subprocess inherits the engine's own origin token or thread id.** An
+  engine started inside an agent session would otherwise hand them to a hook
+  with an unfit slug.
+
+### A private copy per ask
+
+Each ask copies the hook's folder under `.lucidos/hook-runs/`, then checks,
+hashes and runs only the copy. Hashing the folder and running from it left a
+window in which an agent could swap the script. `.lucidos/` is read-only to a
+sandboxed agent, and so is the copy. A hook keeps no state in its folder, and
+Python runs without writing its cache.
+
+### Known limits
+
+- With the agent sandbox off, an agent can write `.lucidos/`, so the swap
+  window reopens for that population.
+- With a hook armed, the gap between reading the open change and recording
+  the proposal lasts as long as the hook runs. A discard in that gap lets the
+  late `ChangeProposed` upsert the dead row's files. It never revives the row.
+- A refused first message leaves no notice in the thread. Phase 6 adds one.
+- While a `MessageReceived` hook is armed, a parent may read its sub-thread as
+  idle for a moment before the child's message appears.
+- An agent whose spawned sub-thread is refused gets no signal. Its
+  `run_thread` call already returned, so only `EventHookRefused` records it.
+- The scheduler reads a hook that timed out as a transient failure, because its
+  reason says "timed out".

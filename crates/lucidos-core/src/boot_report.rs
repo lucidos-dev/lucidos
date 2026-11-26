@@ -1,25 +1,5 @@
-//! Best-effort boot-phase reporting to the workspace gateway (ADR 0014 §11).
-//!
-//! A cold engine boot — migrations plus the recovery sweeps — keeps the
-//! gateway's boot splash up until our HTTP server binds. The gateway can't see
-//! *inside* our startup (our HTTP server isn't up yet), so we tell it which
-//! phase we're in by POSTing the gateway's boot-phase control endpoint. The
-//! gateway renders the matching label on the splash (see
-//! `lucidos-gateway/src/boot_phase.rs`). (The embedding model is NOT a boot
-//! phase — it loads in the background and never blocks boot; see
-//! `memory::EmbedderSlot`.)
-//!
-//! This is pure telemetry: fire-and-forget, short timeout, all errors swallowed,
-//! and a **no-op when not spawned by the gateway** (`LUCIDOS_GATEWAY_PORT` /
-//! `LUCIDOS_WORKSPACE_ID` unset — the `LUCIDOS_NO_GATEWAY` dev mode and the e2e
-//! direct-engine harness). It must never affect startup correctness or timing,
-//! so it never blocks the caller: the POST runs on a detached task.
-
 use std::time::{Duration, Instant};
 
-/// Wall-clock time per named boot stage, logged as one line when the engine
-/// binds. A slow boot then names its slow stage instead of leaving a gap
-/// between unrelated log lines.
 pub struct BootStageTimer {
     started: Instant,
     last_lap: Instant,
@@ -36,7 +16,6 @@ impl BootStageTimer {
         }
     }
 
-    /// Close the stage that ran since the previous lap, under `name`.
     pub fn lap(&mut self, name: &'static str) {
         let now = Instant::now();
         self.stages.push((name, now - self.last_lap));
@@ -56,23 +35,17 @@ fn format_stage_summary(total: Duration, stages: &[(&'static str, Duration)]) ->
     format!("{}ms total: {}", total.as_millis(), stages.join(", "))
 }
 
-/// Kebab-case phase wire values understood by the gateway
-/// (`BootPhase::from_wire`). Engine-reported phases only — the gateway sets the
-/// `provisioning-database` / `starting-engine` phases itself.
 pub const MIGRATING: &str = "migrating";
 pub const RECOVERING: &str = "recovering";
 
-/// Report the current cold-boot `phase` to the gateway, if we were spawned by
-/// one. Returns immediately; the POST runs detached so startup never waits on
-/// it. No-op outside a tokio runtime or when the gateway env vars are unset.
 pub fn report(phase: &str) {
     let (Ok(port), Ok(id)) = (
         std::env::var("LUCIDOS_GATEWAY_PORT"),
         std::env::var("LUCIDOS_WORKSPACE_ID"),
     ) else {
-        return; // not gateway-spawned (LUCIDOS_NO_GATEWAY / e2e) — nothing to report
+        return;
     };
-    // Detached so a slow/unreachable gateway can never stall the boot. We're
+    // INVARIANT: Detached so a slow/unreachable gateway can never stall the boot. We're
     // inside the async startup, so a runtime exists; guard anyway so a stray
     // call off-runtime is a no-op rather than a panic.
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -87,9 +60,6 @@ pub fn report(phase: &str) {
             Ok(c) => c,
             Err(_) => return,
         };
-        // Best-effort: the gateway's own health probe is the source of truth for
-        // readiness; a dropped phase report only costs a slightly less specific
-        // splash label, and the next phase (or the healthy probe) supersedes it.
         let url = format!(
             "{}/~/api/v1/control/workspaces/{id}/boot-phase",
             lucidos_local_token::client::origin(&port)

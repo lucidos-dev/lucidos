@@ -30,7 +30,6 @@ fn run_of(name: &str, is_newest: bool) -> Option<TriggerRun> {
     })
 }
 
-/// Each way a thread can need the user, applied to an otherwise idle thread.
 fn each_need() -> Vec<(NeedFact, TriageFacts)> {
     let with = |f: fn(&mut TriageFacts)| {
         let mut facts = idle_thread();
@@ -62,7 +61,6 @@ fn an_idle_thread_with_output_and_nothing_pending_is_archived() {
     assert_eq!(v.reason, "idle for 3 days, nothing pending");
 }
 
-/// The safety rule: every need fact lands under follow-up, with its words.
 #[test]
 fn every_need_fact_is_a_follow_up_naming_the_fact() {
     for (fact, facts) in each_need() {
@@ -82,8 +80,6 @@ fn a_sub_threads_need_makes_its_root_a_follow_up() {
     assert!(v.reason.starts_with("a sub-thread holds"), "{}", v.reason);
 }
 
-/// A need outranks the pin, the trigger grouping and the no-output rule. So
-/// nothing that needs the user is kept quietly or proposed for removal.
 #[test]
 fn a_need_outranks_every_put_away_rule() {
     for (fact, mut facts) in each_need() {
@@ -129,7 +125,6 @@ fn a_thread_that_never_produced_anything_is_a_delete_candidate() {
     facts.has_output = false;
     assert_eq!(classify(&facts).action, TriageAction::Delete);
 
-    // Children or a change are output of their own, so it is archived instead.
     let mut parent = facts.clone();
     parent.sub_thread_count = 1;
     assert_eq!(classify(&parent).action, TriageAction::Archive);
@@ -138,7 +133,6 @@ fn a_thread_that_never_produced_anything_is_a_delete_candidate() {
     assert_eq!(classify(&proposer).action, TriageAction::Archive);
 }
 
-/// Trigger runs group per trigger: the newest is kept, older ones go.
 #[test]
 fn the_newest_trigger_run_is_kept_and_older_runs_are_archived() {
     let mut newest = idle_thread();
@@ -159,9 +153,6 @@ fn the_newest_trigger_run_is_kept_and_older_runs_are_archived() {
     assert!(v.reason.starts_with("older run of Watch the inbox"));
 }
 
-/// An older run whose only open item is its own question is proposed for
-/// dismissal. Anything more stays a follow-up, and the newest run's question
-/// always does.
 #[test]
 fn an_older_runs_lone_question_is_proposed_for_dismissal() {
     let mut older = idle_thread();
@@ -182,8 +173,6 @@ fn an_older_runs_lone_question_is_proposed_for_dismissal() {
     assert_eq!(classify(&newest).action, TriageAction::FollowUp);
 }
 
-/// Apply re-checks fresh facts: a thread that needs the user is never
-/// archived, whatever the proposal said.
 #[test]
 fn archive_is_refused_for_any_thread_that_needs_the_user() {
     for (fact, facts) in each_need() {

@@ -5,11 +5,6 @@ use crate::support::{
 use serde_json::json;
 use uuid::Uuid;
 
-/// External-repo CC threads idled before the May-2026 cleanup consolidation
-/// kept their branch and a proposed change state after `agent_recovery` removed
-/// the worktree dir. The handler used to 404 with "Worktree not found on disk"
-/// even though the diff was still recoverable from `SessionStarted.repo_id` +
-/// `branch`.
 #[tokio::test]
 async fn cc_diff_falls_back_to_branch_when_worktree_missing() {
     let client = user_client().await;
@@ -34,9 +29,6 @@ async fn cc_diff_falls_back_to_branch_when_worktree_missing() {
 
     let repo_id = register_repo(&client, repo, "cc-diff-repo").await;
 
-    // Direct INSERT skips the EventBus precondition that the thread already be
-    // CC-classified in `thread_summaries` — the handler reads `events` only, so
-    // there's no need to spin up a real CC session for this read-side check.
     let thread_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
@@ -119,9 +111,6 @@ async fn cc_diff_falls_back_to_branch_when_worktree_missing() {
     );
 }
 
-/// The deterministic worktree directory for a thread, mirroring the engine's
-/// `agent_session::resume::deterministic_worktree_path`: the first 8 hex chars
-/// of the thread id under `<ws>/.lucidos/worktrees/`.
 fn deterministic_worktree(thread_id: Uuid) -> std::path::PathBuf {
     let short: String = thread_id.as_simple().to_string().chars().take(8).collect();
     workspace_path()
@@ -129,11 +118,6 @@ fn deterministic_worktree(thread_id: Uuid) -> std::path::PathBuf {
         .join(format!("thread-{}", short))
 }
 
-/// An app coding-agent thread commits during its FIRST turn. The post-commit
-/// hook lights the Diff button up, and the click used to answer 404: no
-/// `CodingAgentIdled` has recorded a worktree yet, and an app thread carries no
-/// `SessionStarted.repo_id` for the branch-ref fallback to work from. The
-/// worktree is at its deterministic path throughout.
 #[tokio::test]
 async fn cc_diff_finds_the_first_turn_worktree_of_an_app_thread() {
     let client = user_client().await;
@@ -146,9 +130,6 @@ async fn cc_diff_finds_the_first_turn_worktree_of_an_app_thread() {
     let branch = format!("lucidos-claude-code-app-{}", app_id);
     seed_app_cc_thread_summary(&pool, thread_id, &app_id, "running").await;
 
-    // An app spawn's SessionStarted: a branch, and deliberately no `repo_id`.
-    // Its presence is what makes the assertion below meaningful. The handler
-    // has a session to read and still cannot reach a repo from it.
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
          VALUES ($1, 'SessionStarted', $2::jsonb, $3, 'thread', $3::text)",
@@ -169,9 +150,6 @@ async fn cc_diff_finds_the_first_turn_worktree_of_an_app_thread() {
     .await
     .expect("insert SessionStarted failed");
 
-    // The worktree the running turn is writing in. `.lucidos/` is gitignored,
-    // and the commit lands on the branch only, so the workspace tree is
-    // untouched and no `workspace_tree_lock` guard is owed.
     let wt = deterministic_worktree(thread_id);
     git(&[
         "worktree",
@@ -201,7 +179,6 @@ async fn cc_diff_finds_the_first_turn_worktree_of_an_app_thread() {
     let status = resp.status().as_u16();
     let body_text = resp.text().await.expect("read body failed");
 
-    // Clean up before asserting, so a failure doesn't strand the worktree.
     let ws = workspace_path();
     let _ = std::process::Command::new("git")
         .args(["worktree", "remove", "--force", wt.to_str().unwrap()])

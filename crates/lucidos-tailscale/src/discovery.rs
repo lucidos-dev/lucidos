@@ -1,9 +1,3 @@
-//! Where to ask Tailscale, per platform.
-//!
-//! These are the lookups the Tailscale CLI itself makes (its `safesocket`
-//! package). Pure over a [`Platform`] and injected [`Probes`], so every
-//! platform's rules run as unit tests on any machine.
-
 use std::path::{Path, PathBuf};
 
 use crate::cli::{resolve_tailscale_binary, BARE_CLI, TAILSCALE_CANDIDATES};
@@ -30,33 +24,23 @@ impl Platform {
     }
 }
 
-/// One LocalAPI endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
-    /// `tailscaled`'s unix socket.
     Unix(PathBuf),
-    /// The macOS app's loopback port, with the token that proves same user.
     Tcp { port: u16, token: String },
 }
 
-/// What discovery may look at. The real one reads the filesystem and runs a
-/// bounded `lsof`; tests fake it.
 pub(crate) trait Probes {
     fn exists(&self, path: &Path) -> bool;
     fn read_link(&self, path: &Path) -> Option<PathBuf>;
     fn read_to_string(&self, path: &Path) -> Option<String>;
-    /// `lsof -F n` output for this user's `IPNExtension` processes.
     fn ipn_extension_files(&self) -> Option<String>;
-    /// `LUCIDOS_TAILSCALE_BIN`.
     fn cli_override(&self) -> Option<String>;
 }
 
 pub(crate) struct Discovery {
-    /// LocalAPI endpoints, in the order to try them.
     pub endpoints: Vec<Endpoint>,
-    /// The CLI to fall back on: a found path, or the bare name for `PATH`.
     pub cli: String,
-    /// Something on disk says Tailscale is installed, even if nothing answers.
     pub installed: bool,
 }
 
@@ -64,13 +48,9 @@ const LINUX_SOCKETS: &[&str] = &[
     "/var/run/tailscale/tailscaled.sock",
     "/run/tailscale/tailscaled.sock",
 ];
-/// The open-source `tailscaled` on macOS, as Homebrew installs it.
 const MACOS_SOCKET: &str = "/var/run/tailscaled.socket";
-/// The standalone app's port, as the target of this symlink.
 const MACOS_IPNPORT: &str = "/Library/Tailscale/ipnport";
 const MACOS_SAMEUSERPROOF_DIR: &str = "/Library/Tailscale";
-/// The App Store app's token file, as `lsof` lists it:
-/// `.../<group>.tailscale.ipn.macos/sameuserproof-<port>-<token>`.
 const APP_STORE_PROOF_MARKER: &str = ".tailscale.ipn.macos/sameuserproof-";
 const MACOS_APP_BUNDLE: &str = "/Applications/Tailscale.app";
 
@@ -91,7 +71,6 @@ pub(crate) fn discover(platform: Platform, probes: &impl Probes) -> Discovery {
             }
             installed = probes.exists(Path::new(MACOS_APP_BUNDLE));
         }
-        // Windows' LocalAPI is a named pipe; the CLI is the way in there.
         Platform::Windows | Platform::Other => {}
     }
     let cli = resolve_tailscale_binary(
@@ -266,7 +245,6 @@ pub(crate) mod tests {
 
     #[test]
     fn nothing_on_disk_is_not_installed_even_beside_another_vpn() {
-        // Another CGNAT VPN leaves no Tailscale socket, port or CLI behind.
         for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
             let found = discover(platform, &FakeProbes::default());
             assert!(found.endpoints.is_empty());

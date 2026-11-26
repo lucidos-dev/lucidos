@@ -1,10 +1,3 @@
-//! The boot check: find this database's key, or refuse to start (ADR 0509).
-//!
-//! The database says which key it needs: every sealed value carries its key
-//! id. So the check compares those ids against the key store and never
-//! guesses. A sealed database with no matching key never boots, and no path
-//! but `lucidos-engine secrets discard` drops a secret.
-
 use sqlx::{PgPool, Row};
 
 use super::key_store::{parked_key_name, secrets_key_name, KeyStore};
@@ -15,17 +8,12 @@ use super::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// What the boot check decided.
 #[derive(Debug)]
 pub enum Boot {
-    /// Install this key and serve.
     Ready(SecretKey),
-    /// Starting would lose secrets. The message says why and how to recover.
     Refused(String),
 }
 
-/// The engine's boot step: run [`boot`] against this engine's key store and
-/// install the key. `Some` is a refusal message for the boot-failure report.
 pub async fn load_workspace_key(
     pool: &PgPool,
     database_url: &str,
@@ -41,13 +29,10 @@ pub async fn load_workspace_key(
     }
 }
 
-/// The database a URL names: what the workspace key is filed under.
 pub fn database_name(database_url: &str) -> Result<String, BoxError> {
     Ok(lucidos_pg_url::PgUrl::parse(database_url)?.database)
 }
 
-/// Check the key, mint one for a database with nothing sealed yet, then seal
-/// every plain value and validate each column's `CHECK` constraint.
 pub async fn boot(pool: &PgPool, database: &str, store: &dyn KeyStore) -> Result<Boot, BoxError> {
     let name = secrets_key_name(database);
     let needed = sealed_key_ids(pool).await?;
@@ -80,7 +65,7 @@ pub async fn boot(pool: &PgPool, database: &str, store: &dyn KeyStore) -> Result
     Ok(Boot::Ready(key))
 }
 
-/// The key this database needs, when a restore or an import parked it. Two
+/// INVARIANT: The key this database needs, when a restore or an import parked it. Two
 /// workspaces on two clusters can share a key name, so the other one's restore
 /// parks this one's key. Only a database sealed with one key can name it.
 fn parked_key(
@@ -105,7 +90,7 @@ fn parked_key(
     Ok(key)
 }
 
-/// Mint a key, and use it only once it reads back equal. A store that drops
+/// INVARIANT: Mint a key, and use it only once it reads back equal. A store that drops
 /// writes must never leave secrets sealed with a lost key. A rival that minted
 /// first wins, and this call uses its key.
 fn mint(store: &dyn KeyStore, name: &str) -> Result<SecretKey, BoxError> {
@@ -137,7 +122,6 @@ fn refusal(needed: &[String], found: &str) -> String {
     )
 }
 
-/// Every key id a sealed value in the database names, sorted.
 pub async fn sealed_key_ids(pool: &PgPool) -> Result<Vec<String>, BoxError> {
     let mut ids = std::collections::BTreeSet::new();
     for column in present_secret_columns(pool).await? {
@@ -154,8 +138,6 @@ pub async fn sealed_key_ids(pool: &PgPool) -> Result<Vec<String>, BoxError> {
     Ok(ids.into_iter().collect())
 }
 
-/// Every secret column this database holds: [`SECRET_COLUMNS`], plus each
-/// [`MOVED_SECRET_COLUMNS`] entry that boot has not moved and dropped yet.
 async fn present_secret_columns(pool: &PgPool) -> Result<Vec<SecretColumnSpec>, BoxError> {
     let mut columns = SECRET_COLUMNS.to_vec();
     for column in MOVED_SECRET_COLUMNS {
@@ -166,7 +148,6 @@ async fn present_secret_columns(pool: &PgPool) -> Result<Vec<SecretColumnSpec>, 
     Ok(columns)
 }
 
-/// Whether `column` is still in the schema.
 pub(crate) async fn column_exists(
     pool: &PgPool,
     column: &SecretColumnSpec,
@@ -181,7 +162,6 @@ pub(crate) async fn column_exists(
     .await?)
 }
 
-/// A `FROM` clause yielding one `v` per stored value of `column`.
 fn values_of(column: &SecretColumnSpec) -> String {
     let (table, col) = (column.table, column.column);
     match column.shape {
@@ -190,11 +170,6 @@ fn values_of(column: &SecretColumnSpec) -> String {
     }
 }
 
-/// Seal every plain value in place, in one transaction. Returns how many.
-///
-/// Each row takes one `UPDATE` setting all its secret columns. Postgres checks
-/// every `CHECK` on the new row, so sealing one column while a sibling stays
-/// plain is refused.
 pub(crate) async fn seal_plain_values(pool: &PgPool, key: &SecretKey) -> Result<usize, BoxError> {
     let mut tx = pool.begin().await?;
     let mut sealed = 0;
@@ -243,7 +218,6 @@ pub(crate) async fn seal_plain_values(pool: &PgPool, key: &SecretKey) -> Result<
     Ok(sealed)
 }
 
-/// Every table holding a secret column, once each, in [`SECRET_COLUMNS`] order.
 fn secret_tables() -> Vec<&'static str> {
     let mut tables = Vec::new();
     for column in SECRET_COLUMNS {
@@ -267,12 +241,10 @@ fn joined(
         .join(separator)
 }
 
-/// A SQL condition, true when `column` holds a value still to seal.
 fn holds_plain(column: &SecretColumnSpec) -> String {
     let col = column.column;
     match column.shape {
         Shape::Text => {
-            // `''` is plain too where the column cannot read it as "none".
             let empty_is_plain = if column.empty_means_none {
                 "FALSE"
             } else {
@@ -287,7 +259,6 @@ fn holds_plain(column: &SecretColumnSpec) -> String {
     }
 }
 
-/// `stored` with every plain value in it sealed, and how many that was.
 fn seal_stored(
     key: &SecretKey,
     column: &SecretColumnSpec,
@@ -321,7 +292,7 @@ fn seal_stored(
     }
 }
 
-/// Validate each column's `CHECK`. The migration added it `NOT VALID`, so it
+/// INVARIANT: Validate each column's `CHECK`. The migration added it `NOT VALID`, so it
 /// bound new writes before the old rows were sealed.
 async fn validate_constraints(pool: &PgPool) -> Result<(), BoxError> {
     for column in SECRET_COLUMNS {
@@ -336,8 +307,6 @@ async fn validate_constraints(pool: &PgPool) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Install `key` for `database`, but only when every sealed value in it names
-/// that key, so the import never strands another one.
 pub async fn import_key(
     pool: &PgPool,
     database: &str,
@@ -368,8 +337,6 @@ pub async fn import_key(
     Ok(())
 }
 
-/// Remove every secret the workspace key cannot open, minting a key when
-/// there is none. Returns one line per column it changed.
 pub async fn discard(
     pool: &PgPool,
     database: &str,

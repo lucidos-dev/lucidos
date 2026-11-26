@@ -1,12 +1,3 @@
-//! Thread HTTP API handlers.
-//!
-//! Originally one large `api::threads` module; split by responsibility seam
-//! into child modules. This barrel re-exports the handler surface its own
-//! `router()`, `api/history.rs` (the four `/events/:event_id/*` routes) and
-//! `api/search.rs` consume, so every `api::threads::*` path resolves
-//! unchanged. The request/response shapes stay reachable at
-//! `api::threads::<child>::<Type>`.
-
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -39,7 +30,6 @@ mod switch_estimate;
 mod thread_hold;
 mod wake_decision;
 
-// Handler functions consumed by the router and the SearchEverywhere endpoint.
 pub(super) use actions::{
     answer_thread_question, continue_thread, get_thread_messages, harden_thread,
     move_thread_to_folder, rename_thread, save_thread, suggest_title, unsave_thread,
@@ -58,13 +48,10 @@ pub(super) use search::search_threads;
 #[cfg(test)]
 pub(crate) use submit_draft::tests::verify_submit_draft_transports;
 
-/// Parse a `:thread_id` path segment, refusing a malformed one with a 400.
 fn parse_thread_id(raw: &str) -> Result<Uuid, (StatusCode, String)> {
     Uuid::parse_str(raw).map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))
 }
 
-/// Extract a `thread_id` UUID from a JSON body that uses the
-/// `{"thread_id": "<uuid>"}` shape. Used by save/unsave/rename/archive handlers.
 fn extract_thread_uuid(request: &serde_json::Value) -> Result<Uuid, (StatusCode, String)> {
     let thread_id = request
         .get("thread_id")
@@ -88,7 +75,7 @@ struct ThreadActionFacts {
     compose_images: Option<serde_json::Value>,
 }
 
-/// Server-side mirror of the frontend's per-thread action availability: load
+/// INVARIANT: Server-side mirror of the frontend's per-thread action availability: load
 /// the DB-derivable facts from `thread_summaries` and run the same
 /// `available_thread_actions` the codegen'd frontend uses. Mutating handlers
 /// guard on this so a stale frontend or a raw API caller can't invoke an action
@@ -126,8 +113,6 @@ pub(in crate::api) async fn available_thread_actions_for(
             .unwrap_or(&serde_json::Value::Null),
     );
     let holds_live_wait = f.live_event_wait_count > 0;
-    // Held work outranks Archive the way a proposed change does (ADR 0395).
-    // An external repo never proposes, so its diff holds nothing back.
     let has_change_work = !f.coding_agent_is_external_repo
         && ChangeWork::of(f.coding_agent_change_state, holds_live_wait) != ChangeWork::None;
     Ok(available_thread_actions(
@@ -142,10 +127,6 @@ pub(in crate::api) async fn available_thread_actions_for(
     ))
 }
 
-/// Routes for the `/threads*` URL surface. Grouped by path, not handler
-/// location: compose / blob-upload / cc-diff / image handlers live in
-/// sibling modules, but their thread-shaped routes register here so a
-/// reader looking for `/threads/...` finds every route in one place.
 pub(super) fn router() -> Router<super::AppState> {
     Router::new()
         .route("/threads", get(list_threads))
@@ -174,10 +155,6 @@ pub(super) fn router() -> Router<super::AppState> {
         )
         .route("/threads/archive-all", post(archive_all::archive_all))
         .route("/threads/unarchive", post(archive_all::unarchive))
-        // The owner's delete, and the read that tells the confirmation what is
-        // true of this family. Both are refused to anything but a registered
-        // device (ADR 0192), which is stricter than the thread-reach ladder
-        // every other mutating thread route uses.
         .route("/threads/delete-preflight", get(delete::delete_preflight))
         .route("/threads/delete", post(delete::delete_thread_family))
         .route("/threads/suggest-title", post(suggest_title))
@@ -198,11 +175,6 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/event-waits",
             post(actions::register_thread_event_wait).get(actions::list_thread_event_waits),
         )
-        // An agent standing its own subscriptions down, which records
-        // `AgentStandDown`. Distinct from the per-wait route below, the UI's
-        // **Stop waiting** button, which records `UserStop`: the cause is what
-        // the two differ in, so it is decided by which route was called rather
-        // than by a body field.
         .route(
             "/threads/:thread_id/event-waits/cancel",
             post(actions::cancel_thread_event_waits_for_agent),
@@ -211,8 +183,6 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/event-waits/:wait_id/cancel",
             post(actions::cancel_thread_event_wait),
         )
-        // A coding agent asking for its own reply to be read (ADR 0409), and
-        // the drawer reporting that the user saw it.
         .route(
             "/threads/:thread_id/read-request",
             post(read_request::request_thread_read),
@@ -221,12 +191,10 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/read-request/seen",
             post(read_request::mark_thread_reply_seen),
         )
-        // A coding agent stating when it expects to wake (ADR 0603).
         .route(
             "/threads/:thread_id/expected-wake",
             post(expected_wake::record_thread_expected_wake),
         )
-        // A coding-agent child deciding whether its report wakes its parent.
         .route(
             "/threads/:thread_id/wake-decision",
             post(wake_decision::record_thread_wake_decision),
@@ -259,8 +227,6 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/follow-up",
             post(follow_up::follow_up_child),
         )
-        // Move a child to top level. `:thread_id` is the CHILD, and who may
-        // move it depends on whether the caller carries an origin token.
         .route("/threads/:thread_id/detach", post(detach::detach_thread))
         .route(
             "/threads/:thread_id/context",
@@ -285,7 +251,7 @@ pub(super) fn router() -> Router<super::AppState> {
         )
         // A one-release alias (docs/temporary-measures.md).
         .route(
-            "/threads/:thread_id/automation-pause", // retired name
+            "/threads/:thread_id/automation-pause", // INVARIANT: retired alias.
             post(thread_hold::hold).delete(thread_hold::resume),
         )
         .route(
@@ -312,9 +278,6 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/successor-offer/continue",
             post(successor::continue_in_successor),
         )
-        // Archive on the caller's own authority (ADR 0310). `:thread_id` is
-        // the target; an origin token limits it to the caller or one of its
-        // direct children.
         .route(
             "/threads/:thread_id/archive",
             post(archive::archive_thread_as_caller),
@@ -331,11 +294,6 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/images/:index",
             get(super::images::get_thread_image),
         )
-        // By-id summary GET shares the `/threads/:id` leaf with delete_thread.
-        // It MUST use the `:id` param name: only ONE bare `/threads/<param>`
-        // leaf may exist — a second one with a different param name makes
-        // matchit panic at router build. Same path + non-overlapping methods
-        // → axum merges GET+DELETE into one method router.
         .route(
             "/threads/:id",
             get(get_thread_summary).delete(super::threads_compose::delete_thread),

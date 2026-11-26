@@ -91,8 +91,6 @@ fn an_unknown_code_keeps_its_raw_text() {
     assert!(!error.kind.is_retryable());
 }
 
-/// A local server or proxy often sends a bare message with no code. Its words
-/// still decide the retry, as they did before the kind existed.
 #[test]
 fn an_unknown_kind_retries_on_transient_words() {
     let retries = |message: &str| {
@@ -201,10 +199,6 @@ fn an_empty_type_falls_through_to_the_code() {
     assert_eq!(error.kind, ProviderErrorKind::Internal);
 }
 
-/// Files under `llm/` that format an HTTP status into an error and are not a
-/// model call: sign-in, token refresh, discovery, model-list and telemetry
-/// endpoints, and the prefill probe, which has its own blessed type
-/// (`PrefillRefused`).
 const NOT_A_MODEL_CALL: &[&str] = &[
     "claude_gateway/",
     "chatgpt_plan/id_token.rs",
@@ -225,9 +219,6 @@ fn a_single_attempt_adds_no_attempt_count() {
 mod guard_tests {
     use super::*;
 
-    /// Default-deny: a model call turns a failed answer into a `ProviderError`
-    /// through `from_http` or `from_stream_error`. An error built from a status or
-    /// from "API error" wording in a `format!` is the shape this type replaced.
     #[test]
     fn no_model_call_formats_its_own_provider_error() {
         let llm = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/llm");

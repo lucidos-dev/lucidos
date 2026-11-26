@@ -435,6 +435,10 @@ pub enum MessageOrigin {
     /// and unauthenticated until the engine verifies it, so nothing here is
     /// ever an authorization input.
     Webhook { webhook_id: String, name: String },
+    /// An *event hook* caused this event: one it returned beside the event it
+    /// allowed, or one its script emitted (ADR 0746). No hook is asked about
+    /// an event a hook caused. Mode is Engine, as for a webhook.
+    EventHook { slug: String },
     /// The engine itself initiated this work (recovery, scheduler, retrigger).
     /// Implies `ActorMode::Engine`.
     Engine { reason: EngineReason },
@@ -523,7 +527,9 @@ impl MessageOrigin {
             Self::Api { mode, .. } | Self::UnattestedCaller { mode, .. } => *mode,
             Self::Workspace { mode, .. } | Self::ThreadLink { mode, .. } => *mode,
             Self::Agent { .. } => ActorMode::Agent,
-            Self::Webhook { .. } | Self::Engine { .. } | Self::System => ActorMode::Engine,
+            Self::Webhook { .. } | Self::EventHook { .. } | Self::Engine { .. } | Self::System => {
+                ActorMode::Engine
+            }
         }
     }
 

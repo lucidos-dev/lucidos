@@ -1,11 +1,3 @@
-//! E2E coverage for the prose-question nudge declined.
-//!
-//! A reply ending on a question with no card is sent back once. The draft has
-//! already streamed by then, so a model keeping its open-ended question must
-//! not show the user anything more: no justification, no second copy, and no
-//! Thinking row under the draft. The turn ends on the draft. Only the real
-//! agent loop streams, so only this reaches it.
-
 use crate::support::{base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client};
 use lucidos_engine::llm::mock::MOCK_PROSE_NUDGE_REASON;
 use serde_json::json;
@@ -63,8 +55,6 @@ async fn a_declined_prose_nudge_ends_on_the_draft_and_shows_nothing_more() {
         "the turn must end on the draft the user already saw"
     );
 
-    // `LlmCallRetried` lives on SSE only, so the nudge shows as a second
-    // round: one main-model capture per call.
     let rounds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM events \
           WHERE aggregate = 'thread' AND aggregate_id = $1 \
@@ -96,8 +86,6 @@ async fn a_declined_prose_nudge_ends_on_the_draft_and_shows_nothing_more() {
          ({MOCK_PROSE_NUDGE_REASON:?})"
     );
 
-    // Each `ThoughtStreamed` draws a Thinking row. One under the finished
-    // draft promises more, and the declined round delivers nothing.
     let thinking_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM events \
           WHERE aggregate = 'thread' AND aggregate_id = $1 \

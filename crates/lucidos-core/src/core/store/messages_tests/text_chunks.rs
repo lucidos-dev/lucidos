@@ -1,12 +1,8 @@
 use super::msg_helpers::*;
 use super::*;
 
-/// text_chunks should contain deltas (not overlapping full buffers)
-/// snapshotted at each ToolCalled boundary, plus the final text segment.
-/// Each chunk must be >= 80 chars to be snapshotted separately.
 #[test]
 fn text_chunks_contain_deltas_at_tool_boundaries() {
-    // Use long-enough text segments (>= 80 chars) so they produce separate chunks
     let chunk1 = "Analyzing the codebase structure and identifying the key patterns used throughout the project files...";
     let chunk2 = " Now editing the identified files to apply the requested changes across all matching locations in code...";
     let chunk3 = " Done. All requested changes have been applied successfully and the tests are passing without errors.";
@@ -79,7 +75,6 @@ fn text_chunks_contain_deltas_at_tool_boundaries() {
     assert_eq!(assistant.text_chunks[2], chunk3);
 }
 
-/// Small text before a tool call merges into the next chunk (no meaningless toggle).
 #[test]
 fn small_text_before_tool_merges_into_next_chunk() {
     let events = vec![
@@ -88,7 +83,6 @@ fn small_text_before_tool_merges_into_next_chunk() {
             json!({"text": "help", "request_id": "s1"}),
             0,
         ),
-        // Tiny text before tool call — should NOT create a separate chunk
         make_event(
             "TextStreamed",
             json!({"text": "Ok.", "request_id": "s1"}),
@@ -117,7 +111,6 @@ fn small_text_before_tool_merges_into_next_chunk() {
     ];
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
-    // "Ok." is only 3 chars — merged into a single chunk with the rest
     assert_eq!(
         assistant.text_chunks.len(),
         1,
@@ -126,10 +119,8 @@ fn small_text_before_tool_merges_into_next_chunk() {
     );
 }
 
-/// text_chunks work for regular (non-CC) text streaming too.
 #[test]
 fn text_chunks_regular_chat_deltas() {
-    // Use text segments >= 80 chars so they produce separate chunks
     let chunk1 = "Let me think about this carefully and analyze all the relevant information before responding...";
     let chunk2 = " Here's the detailed answer based on my thorough analysis of the question you asked about the topic.";
     let full = format!("{}{}", chunk1, chunk2);
@@ -180,8 +171,6 @@ fn text_chunks_regular_chat_deltas() {
     assert_eq!(assistant.text_chunks[1], chunk2);
 }
 
-/// TextStreamed with channel=claude_code (unified format) should be handled
-/// identically to the legacy CodingAgentTextStreamed event type.
 #[test]
 fn text_streamed_with_claude_code_channel_works() {
     let events = vec![
@@ -190,7 +179,6 @@ fn text_streamed_with_claude_code_channel_works() {
             json!({"text": "hello", "request_id": "s1"}),
             0,
         ),
-        // New format: TextStreamed with channel=claude_code
         {
             let mut e = make_event(
                 "TextStreamed",
@@ -218,14 +206,6 @@ fn text_streamed_with_claude_code_channel_works() {
     assert_eq!(msgs[1].completed, Some(true));
 }
 
-// ---------------------------------------------------------------
-// Chunk toggle rules (More/Less):
-//   - 0 chunks or 1 chunk -> no toggle
-//   - 2+ chunks -> toggle (collapsed = latest chunk, expanded = all)
-//   - Same behavior for: Done, Canceled, Continued Above, any state
-// ---------------------------------------------------------------
-
-/// No tool calls -> single text segment -> 1 chunk -> no More/Less toggle.
 #[test]
 fn single_chunk_no_toggle_done() {
     let events = vec![
@@ -236,7 +216,6 @@ fn single_chunk_no_toggle_done() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
     assert_eq!(assistant.completed, Some(true));
-    // Only 1 chunk -> no toggle
     assert!(
         assistant.text_chunks.len() <= 1,
         "single response without tools should have 0 or 1 chunks, got {:?}",
@@ -244,7 +223,6 @@ fn single_chunk_no_toggle_done() {
     );
 }
 
-/// No streaming at all, just a direct ResponseGenerated -> 0 chunks -> no toggle.
 #[test]
 fn no_streaming_no_chunks() {
     let events = vec![
@@ -256,7 +234,6 @@ fn no_streaming_no_chunks() {
     assert_eq!(assistant.text_chunks.len(), 0);
 }
 
-/// Two chunks (one tool call) -> More/Less toggle should appear.
 #[test]
 fn two_chunks_toggle_done() {
     let c1 = pad("Searching for results across the codebase", 100);
@@ -281,7 +258,6 @@ fn two_chunks_toggle_done() {
     assert_eq!(assistant.text_chunks[1], c2);
 }
 
-/// Three chunks (two tool calls) -> collapsed shows last chunk.
 #[test]
 fn three_chunks_collapsed_shows_last() {
     let c1 = pad("Step 1: Reading the file contents", 100);
@@ -315,7 +291,6 @@ fn three_chunks_collapsed_shows_last() {
     assert_eq!(joined, assistant.content);
 }
 
-/// Canceled exchange still has chunks -> toggle should work the same.
 #[test]
 fn chunks_on_canceled_exchange() {
     let c1 = pad("Working on the requested changes to the codebase", 100);
@@ -341,7 +316,6 @@ fn chunks_on_canceled_exchange() {
     assert_eq!(assistant.text_chunks[1], c2);
 }
 
-/// Interrupted exchange (continued above) still has chunks.
 #[test]
 fn chunks_on_interrupted_exchange() {
     let c1 = pad(
@@ -378,8 +352,6 @@ fn chunks_on_interrupted_exchange() {
     assert_eq!(interrupted.text_chunks[1], c2);
 }
 
-/// Canceled with empty content — no "Canceled by user" text stored.
-/// The canceled flag should still be set, and content should be empty.
 #[test]
 fn canceled_with_empty_content() {
     let events = vec![
@@ -394,7 +366,6 @@ fn canceled_with_empty_content() {
     assert_eq!(assistant.completed, Some(true));
 }
 
-/// Canceled with partial content — only the streamed text, no appended label.
 #[test]
 fn canceled_with_partial_content_no_label() {
     let partial = "I started working on the analysis";
@@ -407,11 +378,9 @@ fn canceled_with_partial_content_no_label() {
     let assistant = &msgs[1];
     assert!(assistant.canceled);
     assert_eq!(assistant.content, partial);
-    // No "Canceled by user" appended
     assert!(!assistant.content.contains("Canceled"));
 }
 
-/// Multiple exchanges — each has independent chunks.
 #[test]
 fn chunks_independent_per_exchange() {
     let c1 = pad("First chunk of text for exchange one with details", 100);
@@ -428,28 +397,25 @@ fn chunks_independent_per_exchange() {
         ),
         make_event("TextStreamed", json!({"text": c2}), 4),
         make_event("ResponseGenerated", json!({"text": full1}), 5),
-        // Exchange 2: 1 chunk (no toggle)
         make_event("MessageReceived", json!({"text": "second"}), 6),
         make_event("TextStreamed", json!({"text": "Simple answer"}), 7),
         make_event("ResponseGenerated", json!({"text": "Simple answer"}), 8),
     ];
     let msgs = build_session_messages(&events);
-    assert_eq!(msgs.len(), 4); // 2 user + 2 assistant
-    let a1 = &msgs[1]; // first assistant
+    assert_eq!(msgs.len(), 4);
+    let a1 = &msgs[1];
     assert_eq!(a1.text_chunks.len(), 2);
-    let a2 = &msgs[3]; // second assistant
+    let a2 = &msgs[3];
     assert!(
         a2.text_chunks.len() <= 1,
         "second exchange has no tools, should have 0 or 1 chunks"
     );
 }
 
-/// Tool call with no text before it -> no empty chunk created.
 #[test]
 fn no_empty_chunk_before_first_tool() {
     let events = vec![
         make_event("MessageReceived", json!({"text": "do it"}), 0),
-        // Tool called immediately, no text streamed first
         make_event("ToolCalled", json!({"name": "search", "args": {}}), 1),
         make_event(
             "ToolResult",
@@ -465,12 +431,10 @@ fn no_empty_chunk_before_first_tool() {
     ];
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
-    // Should have 1 chunk (text after tool), not an empty chunk before tool
     assert_eq!(assistant.text_chunks.len(), 1);
     assert_eq!(assistant.text_chunks[0], "Here are the results.");
 }
 
-/// Multiple consecutive small texts before multiple tools all merge into one chunk.
 #[test]
 fn multiple_small_texts_before_multiple_tools_merge() {
     let events = vec![
@@ -522,7 +486,6 @@ fn multiple_small_texts_before_multiple_tools_merge() {
     ];
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
-    // "Ok." (3) + " Let me check." (14) are both under 80 — everything merges into 1 chunk
     assert_eq!(
         assistant.text_chunks.len(),
         1,
@@ -532,7 +495,6 @@ fn multiple_small_texts_before_multiple_tools_merge() {
     assert_eq!(assistant.text_chunks[0], "Ok. Let me check. Here is a thorough and detailed answer to your question based on all the information I gathered.");
 }
 
-/// Small text before first tool, but large text before second tool -> 2 chunks.
 #[test]
 fn small_then_large_text_before_tools() {
     let small = "Ok.";
@@ -586,8 +548,6 @@ fn small_then_large_text_before_tools() {
     ];
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
-    // "Ok." merges forward (too small), then "Ok." + large = 95 chars -> chunk at tool 2.
-    // Tail becomes second chunk.
     assert_eq!(
         assistant.text_chunks.len(),
         2,
@@ -598,14 +558,12 @@ fn small_then_large_text_before_tools() {
     assert_eq!(assistant.text_chunks[1], tail);
 }
 
-/// Exact boundary: 80 chars creates a chunk, 79 does not.
 #[test]
 fn exact_80_char_boundary() {
     let exactly_80 = "A".repeat(80);
     let exactly_79 = "B".repeat(79);
     let tail = " Done with the full and complete response text here.";
 
-    // 80 chars -> should create a chunk
     let full80 = format!("{}{}", exactly_80, tail);
     let events80 = vec![
         make_event(
@@ -646,7 +604,6 @@ fn exact_80_char_boundary() {
         "80 chars should produce 2 chunks"
     );
 
-    // 79 chars -> should NOT create a chunk
     let full79 = format!("{}{}", exactly_79, tail);
     let events79 = vec![
         make_event(
@@ -688,7 +645,6 @@ fn exact_80_char_boundary() {
     );
 }
 
-/// Replay idempotency: calling build_session_messages on the same events always gives the same chunks.
 #[test]
 fn replay_idempotent() {
     let chunk1 = &pad("First chunk text", 80);

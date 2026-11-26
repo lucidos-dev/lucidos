@@ -10,13 +10,6 @@ import type { EventChannel, SessionEndReason } from './thread-lifecycle';
 
 export type { EventChannel, SessionEndReason };
 
-/** Why a `ResponseAborted` was emitted. Aborts are system-driven cleanup:
- *  the engine or the OS terminated the process, or the engine settled a
- *  projection whose live process was already gone. The actor on `EventMeta`
- *  records *who triggered* the cleanup (a user button can fire stale-settle),
- *  not who decided to terminate the work. That is always the system. New emit
- *  sites must specify the cause; `Unknown` only appears on legacy DB rows
- *  persisted before the field existed. */
 export type AbortCause =
   | 'engine_shutdown'
   | 'safety_net'
@@ -27,9 +20,6 @@ export type AbortCause =
   | 'snapshot_restored'
   | 'unknown';
 
-/** One action. As a clause-4 verb it names what a caller attempted. A refusal
- *  reads "you cannot cancel that thread", so the agent knows what it just tried.
- *  Full reasoning is on the Rust variant. */
 export type Action =
   | 'archive'
   | 'cancel'
@@ -88,8 +78,6 @@ export type ActorMode =
   | 'agent'
   | 'engine';
 
-/** A draft an agent created for the owner (ADR 0665). It seeds the composer
- *  once, when its thread is created, and never overwrites a later edit. */
 export interface AgentDraft {
   text: string;
   image_hashes: string[];
@@ -110,37 +98,25 @@ export type AgentParticipant =
       label: string;
     };
 
-/** What flipped a thread's *agent pause* (ADR 0649). */
 export type AgentPauseCause =
   | 'mention'
   | 'chip';
 
-/** Where a granted "Always allow" click is remembered.
- *  Full reasoning is on the Rust variant. */
 export type AllowScope =
   | 'narrow'
   | 'broad'
   | 'session';
 
-/** How the user answered a `UserQuestionAsked`. Tagged so the JSON payload
- *  is `{ "kind": "Selected", "option_id": "..." }` etc. */
 export type AnswerKind =
   | {
       kind: 'Selected';
       option_id: string;
     }
-  /** A reply typed in the composer. `image_hashes` names the blobs attached
-   *  to it, and `text` may be empty when the images are the answer. */
   | {
       kind: 'FreeText';
       text: string;
       image_hashes?: string[];
     }
-  /** Multi-select answer. `text` carries optional freetext typed alongside
-   *  the toggled options. The prompt textarea folds into the answer when a
-   *  multi-select question is pending, images included. Backend joins the
-   *  resolved labels and the freetext together when relaying to CC. Some
-   *  side must be present: see `validate_answer`. */
   | {
       kind: 'MultiSelected';
       option_ids: string[];
@@ -148,7 +124,7 @@ export type AnswerKind =
       image_hashes?: string[];
     }
   | { kind: 'Canceled' }
-  /** A follow-up arrived that could not be the answer, so it replaced the
+  /** INVARIANT: A follow-up arrived that could not be the answer, so it replaced the
    *  question instead. Two shapes reach here, both on coding-agent threads.
    *  An agent-driven message (a parent's instruction, a child-completion
    *  wake) is refused by the `mode == Human` guard. So is any message landing
@@ -158,62 +134,37 @@ export type AnswerKind =
    *  Full reasoning is on the Rust variant. */
   | { kind: 'Superseded' };
 
-/** Tokens one API call reported.
+/** INVARIANT: Tokens one API call reported.
  *  Full reasoning is on the Rust variant. */
 export interface ApiUsage {
-  /** The TOTAL, and it CONTAINS the two cache counts below. Derive fresh
-   *  input as `input_tokens - cache_read_tokens - cache_creation_tokens`,
-   *  saturating. Read as three classes, every cached token counts twice. */
   input_tokens: number;
-  /** May be zero on a snapshot emitted mid-stream, before the final delta. */
   output_tokens: number;
-  /** Set by both providers. */
   cache_read_tokens: number;
-  /** Anthropic, and OpenAI from GPT-5.6 on. Both bill a write above input. */
   cache_creation_tokens: number;
-  /** How the four counts above split across text, audio and image. Only a
-   *  realtime voice call reports one, so it is absent everywhere else and
-   *  every other producer writes the payload it always wrote. */
   modality?: ModalityUsage;
-  /** The tier that served the call, when not the provider's standard one.
-   *  Its rates differ, so a price reads it beside the four counts. */
   service_tier?: ServiceTier;
-  /** Part of `cache_creation_tokens`: the tokens written to the 1-hour
-   *  cache, billed at 2x base input rather than 1.25x. A Claude Code
-   *  session and a Claude chat call on Anthropic or Vertex split a write by
-   *  lifetime. The rest of the write went to the 5-minute cache.
-   *  `CacheTtl::of_write` reads the call's TTL from the split. */
   cache_creation_1h_tokens?: number;
-  /** Part of `cache_creation_tokens`: the tokens OpenAI's Responses API
-   *  wrote to its 30-minute cache. With the 12-hour part it covers the write. */
   cache_creation_30m_tokens?: number;
-  /** Part of `cache_creation_tokens`: the tokens OpenAI's Responses API
-   *  wrote to its 12-hour cache, billed above the 30-minute write. */
   cache_creation_12h_tokens?: number;
-  /** The cache lifetime the request asked for, where the response split
+  /** INVARIANT: The cache lifetime the request asked for, where the response split
    *  nothing. The router sets it only for a route probes showed honours it. */
   cache_creation_requested_ttl?: CacheLifetime;
 }
 
-/** How an Apply Now ended. Carried by `ApplyNowEnded`. */
 export type ApplyNowOutcome =
   | 'finished'
   | 'interrupted'
   | 'unknown';
 
-/** Which arm of the trial a session ran in. */
 export type AutoCompactArm =
   | 'control'
   | 'window'
   | 'override';
 
-/** Which owner act ended a retired *automation pause*. Read from stored
- *  events only. */
 export type AutomationUnpauseCause =
   | 'unpause'
   | 'archived';
 
-/** User-facing timing for an engine-owned background wait. */
 export type BackgroundWaitTiming =
   | { state: 'queued' }
   | {
@@ -332,7 +283,7 @@ export type BatchItemOutcome =
       reason: string;
     };
 
-/** Only allowlisted values survive parsing: no raw response, credential,
+/** INVARIANT: Only allowlisted values survive parsing: no raw response, credential,
  *  account identifier, email or endpoint is serializable through this type. */
 export type BillingAttribution =
   | {
@@ -346,19 +297,16 @@ export type BillingAttribution =
       source: BillingEvidenceSource;
     };
 
-/** The CLI response that supplied this observation. Never an auth file path. */
 export type BillingEvidenceSource =
   | 'claude-initialize'
   | 'codex-account'
   | 'unavailable';
 
-/** The billing basis, without asserting an invoice amount or remaining quota. */
 export type BillingMode =
   | 'token-metered'
   | 'plan'
   | 'unknown';
 
-/** The backend and billing contract, independently of the coding agent/model. */
 export type BillingProvider =
   | 'claude-gateway'
   | 'vertex'
@@ -505,15 +453,13 @@ export type CacheKeepAliveStatus =
       cap_source?: CapSource;
     };
 
-/** A lifetime a provider's cache offers. Every number a reader times or
- *  prices from lives here, so an Unknown TTL cannot reach one. */
 export type CacheLifetime =
   | '5m'
   | '30m'
   | '1h'
   | '12h';
 
-/** How a failed call failed, from what the trace saw. Never the message: a
+/** INVARIANT: How a failed call failed, from what the trace saw. Never the message: a
  *  provider's error body can echo request content. */
 export type CallFailure =
   | 'http'
@@ -522,7 +468,7 @@ export type CallFailure =
   | 'stream'
   | 'other';
 
-/** Why a `ResponseCanceled` was emitted. Cancellation is always a user-driven
+/** INVARIANT: Why a `ResponseCanceled` was emitted. Cancellation is always a user-driven
  *  action that interrupts a *real* in-flight response. The actor on
  *  `EventMeta` identifies the user, and this enum identifies what they did. New
  *  emit sites must specify the cause; `Unknown` only appears on legacy DB
@@ -578,33 +524,25 @@ export type CapSource =
       utc_offset_mins: number;
     };
 
-/** The file format a saved app capture is encoded in. The save path's
- *  extension picks it, and the app frame encodes the picture to match. */
 export type CaptureFormat =
   | 'png'
   | 'jpeg'
   | 'webp';
 
-/** A session's context reading past its effective ceiling, as
- *  `ContextCeilingReached` records it. */
 export interface CeilingCrossing {
   context_tokens: number;
-  /** The effective ceiling, in tokens. */
   ceiling: number;
   window?: number;
 }
 
-/** Where a thread's `ContextCeilingSet` came from. */
 export type CeilingSource =
   | 'thread'
   | 'trigger';
 
-/** Content of the actual proposed or landed diff. Historical events default to code. */
 export type ChangeContent =
   | 'code'
   | 'plan-only';
 
-/** How far a flow's work has come at a checkpoint: `done` units of `total`. */
 export interface CheckpointProgress {
   done: number;
   total: number;
@@ -631,35 +569,25 @@ export type ClassifiedOrigin =
   | 'e2e'
   | 'user';
 
-/** Identifier for the coding-agent backend. The engine maps each kind to a
- *  concrete `AgentRuntime` implementation in its agent registry. */
 export type CodingAgent =
   | 'claude-code'
   | 'codex';
 
-/** How a coding agent's process ended, carried on `ResponseFailed` so the card
- *  can say what happened. The CLI's own words travel in `error`. */
 export interface CodingAgentExit {
   stage: CodingAgentExitStage;
-  /** The process exit code. `None` when a signal ended it. */
   code?: number;
 }
 
-/** Where in its life a coding agent's process ended on its own. */
 export type CodingAgentExitStage =
   | 'startup'
   | 'mid_turn';
 
-/** The kind of coding-agent thread. Serialized on `SessionStarted` events and
- *  stored in `thread_summaries.coding_agent_kind`. */
 export type CodingAgentKind =
   | 'lucidos'
   | 'app'
   | 'external';
 
 export interface ComposeReport {
-  /** The row's `summary_version` right after the statement that produced
-   *  this report. It is the *compose revision*. */
   summary_version: number;
   compose_epoch: number;
   restorations?: ComposeRestoration[];
@@ -669,24 +597,18 @@ export interface ComposeReport {
   selection?: unknown;
 }
 
-/** Exact accepted additions. Epoch identifies each restoration within a thread. */
 export interface ComposeRestoration {
   epoch: number;
   text: string;
   image_hashes: string[];
 }
 
-/** CC can't expose its system prompt body or tool schemas via the
- *  stream-json envelope, only their token cost. The frontend uses this
- *  discriminant to know whether to expect a section breakdown body. */
 export type ContextProducer =
   | 'main_llm'
   | 'claude_code'
   | 'codex'
   | 'auxiliary';
 
-/** Which model call a `ContextCaptured` records.
- *  Full reasoning is on the Rust variant. */
 export type ContextPurpose =
   | 'turn'
   | 'title'
@@ -714,45 +636,33 @@ export type ContextPurpose =
   | 'cache_keep_alive'
   | 'prefill_probe';
 
-/** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
- *  in the LLM API call: the system prompt, prior messages (verbatim resume
- *  tool blocks), and this turn's user message. */
 export type ContextRole =
   | 'system'
   | 'prior_message'
   | 'user';
 
-/** `content` is `Option` so the modal can render section *shape* (name + the
- *  two sizes) without persisting the body when the `capture_context`
- *  preference is off. Old DB rows always have content and deserialize as
- *  `Some(_)`. */
 export interface ContextSection {
   name: string;
   content?: string;
-  /** Chars this section ADDS to the request, beyond what other sections
+  /** INVARIANT: Chars this section ADDS to the request, beyond what other sections
    *  already count. Sum it over a capture and you get the budget the
    *  request spent.
    *  Full reasoning is on the Rust variant. */
   budget_delta_chars: number;
-  /** True `chars().count()` of this section's own content, whatever the
+  /** INVARIANT: True `chars().count()` of this section's own content, whatever the
    *  persisted `content` shows. A dropped body (`capture_context` off) and a
    *  head-and-tail truncation both leave it untouched.
    *  Full reasoning is on the Rust variant. */
   content_chars?: number;
-  /** API role this section is sent under. Defaults to "user" for backward
+  /** INVARIANT: API role this section is sent under. Defaults to "user" for backward
    *  compat with persisted ContextCaptured events from before this change.
    *  Every previous section was actually part of either the system prompt
    *  (System Instructions) or the user message. The system row gets
    *  migrated by name in the viewer fallback. */
   role?: ContextRole;
-  /** Inner-group label used by the viewer to nest sections within the
-   *  user-message role. None for system-role sections, prior-message rows,
-   *  and legacy events. */
   group?: string;
 }
 
-/** One of the two dashboards. The phone's swipe layout shows `phone`; the
- *  split layout shows `desktop`, a tablet included. */
 export type Dashboard =
   | 'phone'
   | 'desktop';
@@ -874,20 +784,11 @@ export type EngineReason =
   /** The pre-rename name for `continuation_started`, carried by rows written before the rename. */
   | { kind: 'session_recovered' };
 
-/** One event a subscriber listens for, with an optional payload filter scoped
- *  to that event. A subscriber may carry several entries: it matches when an
- *  incoming event matches *any* entry's `event_type` AND that entry's
- *  condition (if set) evaluates true against the payload. Conditions are
- *  per-entry so a single subscriber can watch events with different payload
- *  shapes without one filter constraining the other. */
 export interface EventSubscription {
   event_type: string;
   condition?: Record<string, unknown>;
 }
 
-/** Why an `EventWaitCanceled` was emitted: how a *thread subscription* was
- *  stopped short of its own resolution.
- *  Full reasoning is on the Rust variant. */
 export type EventWaitCancelCause =
   | 'user_stop'
   | 'agent_stand_down'
@@ -902,7 +803,6 @@ export type EventWaitOutcome =
   | 'delivered'
   | 'expired';
 
-/** The durable retry decision reported on an interrupted fire. */
 export type FireRetry =
   | {
       kind: 'queued';
@@ -914,8 +814,6 @@ export type FireRetry =
       reason: RetrySkipReason;
     };
 
-/** How a *form request* was closed. Carried by `FormRequestResolved`.
- *  Full reasoning is on the Rust variant. */
 export type FormRequestOutcome =
   | 'completed'
   | 'canceled'
@@ -933,13 +831,9 @@ export type FreshSessionReason =
   | 'no-resumable-session'
   | 'provider-blocked';
 
-/** How far one granting option reaches within its action. */
 export type GrantBreadth =
-  /** The request's own breadth: the exact target it asked about. */
   | 'asked'
-  /** The whole action, whatever its target. */
   | 'any'
-  /** Same device and exact lifetime on targets created by this workspace. */
   | {
       'device-session': {
         creator_workspace: string;
@@ -948,37 +842,22 @@ export type GrantBreadth =
       };
     };
 
-/** One of the three persisted allowlists. Each gates a different caller, so the
- *  pattern languages are unrelated and a single merged file would be ambiguous:
- *  `Bash(git:*)` grants a command head, bare `Bash` grants every command
- *  after the engine's unconditional floor, and `Mcp(slack:*)` grants MCP tools.
- *  Full reasoning is on the Rust variant. */
 export type GrantFile =
   | 'agent-allowed-commands'
   | 'cc-allowed-tools'
   | 'mcp-allowed-tools'
   | 'agent-denied-commands';
 
-/** The patterns a historical grant-file review listed. */
 export interface GrantLines {
   grant_file: GrantFile;
   patterns: string[];
 }
 
-/** The grant patterns a permission card offers, one per "Always allow"-style
- *  button. A missing pattern means no such button. The engine stamps it on the
- *  request event, the card renders exactly these buttons, and a click stores
- *  exactly the stamped pattern (ADR 0571). */
 export interface GrantOffer {
-  /** The standing deny line the Remember menu can store. */
   deny?: string;
-  /** "Always allow": a persisted line, `Bash` or a bare tool name. */
   broad?: string;
-  /** "Always allow `<head>` commands": a persisted line such as `Bash(git:*)`. */
   narrow?: string;
-  /** "Allow for this thread": a pattern the thread holds. */
   session?: string;
-  /** Why the card offers no lasting grant at all, which it tells the owner. */
   withheld?: OfferWithheld;
 }
 
@@ -1001,19 +880,15 @@ export type HandoffOpening =
   | 'narrative'
   | 'brief';
 
-/** What a user typed at the *Successor card*, and who typed it. The successor
- *  session starts on it as that user's message. */
 export interface HandoffRequest {
   message: string;
   by: MessageOrigin;
 }
 
-/** What ended a *hold*. */
 export type HoldLiftCause =
   | 'resume'
   | 'archived';
 
-/** Who may use a permission. */
 export type Holder =
   | {
       kind: 'thread';
@@ -1034,14 +909,11 @@ export interface IntegratedBranch {
   head_sha: string;
 }
 
-/** One model at one effort. */
 export interface IntelligenceRung {
   model: string;
   effort: string;
 }
 
-/** One tile of a legacy `HomeBoardArranged`, written before the two
- *  dashboards had their own tiles. A hidden tile seeds nothing. */
 export interface LegacyArrangedTile {
   app_id: string;
   params?: Record<string, unknown>;
@@ -1049,13 +921,11 @@ export interface LegacyArrangedTile {
   hidden?: boolean;
 }
 
-/** Which card raised the request. */
 export type LegacyLane =
   | 'command'
   | 'coding_agent'
   | 'mcp';
 
-/** One of the buttons a tool-permission card draws. */
 export type LegacyPick =
   | 'once'
   | 'session'
@@ -1063,14 +933,12 @@ export type LegacyPick =
   | 'broad'
   | 'deny';
 
-/** How long a permission lasts. */
 export type Lifetime =
   | 'once'
   | 'this_thread'
   | 'until_plan_lands'
   | 'standing';
 
-/** Who enabled or disabled an MCP server in a thread. */
 export type McpEnablementSource =
   | 'agent'
   | 'user'
@@ -1205,6 +1073,13 @@ export type MessageOrigin =
       webhook_id: string;
       name: string;
     }
+  /** An *event hook* caused this event: one it returned beside the event it
+   *  allowed, or one its script emitted (ADR 0746). No hook is asked about
+   *  an event a hook caused. Mode is Engine, as for a webhook. */
+  | {
+      kind: 'event_hook';
+      slug: string;
+    }
   /** The engine itself initiated this work (recovery, scheduler, retrigger).
    *  Implies `ActorMode::Engine`. */
   | {
@@ -1219,114 +1094,72 @@ export type MessageOrigin =
    *  non-agent), but the chip label differentiates from engine-deliberate work. */
   | { kind: 'system' };
 
-/** How one call's tokens split across text, audio and image.
+/** INVARIANT: How one call's tokens split across text, audio and image.
  *  Full reasoning is on the Rust variant. */
 export interface ModalityUsage {
-  /** Part of `input_tokens`, with the audio and image counts below. */
   input_text_tokens: number;
-  /** Part of `input_tokens`. */
   input_audio_tokens: number;
-  /** Part of `input_tokens`. */
   input_image_tokens: number;
-  /** Part of `cache_read_tokens`, with the audio and image counts below. */
   cache_read_text_tokens: number;
-  /** Part of `cache_read_tokens`. */
   cache_read_audio_tokens: number;
-  /** Part of `cache_read_tokens`. */
   cache_read_image_tokens: number;
-  /** Part of `output_tokens`, with the audio count below. */
   output_text_tokens: number;
-  /** Part of `output_tokens`. */
   output_audio_tokens: number;
 }
 
-/** Why a card offers only Allow once and Deny. */
 export type OfferWithheld =
   | 'secret-read'
   | 'standing-deny-unavailable'
   | 'standing-deny-unavailable-secret-read'
   | 'unproven-workspace-destruction';
 
-/** The one clause-4 act the retired single-use Allow once card proposed
- *  (ADR 0387).
- *  Full reasoning is on the Rust variant. */
 export interface OwnerApproval {
   verb: Action;
-  /** The thread the act aims at. Workspace-scoped snapshot approvals use
-   *  explicit workspace and snapshot fields instead. */
   target_thread_id?: string;
   target_workspace_id?: string;
   snapshot_handle?: string;
 }
 
-/** What picking one option of a permission request does. */
 export type PermissionChoice =
   | {
       kind: 'grant';
       lifetime: Lifetime;
       holder: Holder;
-      /** A card asked before options had a breadth reads as the asked one. */
       breadth?: GrantBreadth;
     }
-  /** The Unpause option of a retired step card. Stored cards still carry
-   *  it, and picking it does nothing: the boot sweep retires such cards. */
   | { kind: 'unpause' }
   | { kind: 'refuse' }
-  /** Refuses, and refuses the same request from then on: a card's Always
-   *  deny. Only an engine-worded card offers it. */
   | { kind: 'refuse_standing' }
-  /** Historical option for revoking imported patterns. */
   | { kind: 'revoke' };
 
-/** The typed half of a *permission request*: the action it asks for, and what
- *  each of its options does. */
 export interface PermissionRequest {
   action: Action;
-  /** The exact target the request asks about, such as a workspace slug or
-   *  a command head. An option at [`GrantBreadth::Asked`] grants this one.
-   *  Absent asks about the whole action. */
   breadth?: string;
-  /** The id the agent asked its question tool with, when the agent prepared
-   *  this request. Its call waits for the answer. Absent, the engine raised
-   *  the card itself and no agent call waits. */
   prepared?: string;
-  /** What each option does, keyed by option id. */
   choices: Record<string, PermissionChoice>;
-  /** The items a *batch* carries. Only a [`Action::RunBatch`] request has
-   *  them. */
   batch?: Batch;
-  /** Historical grant-file review payload. Its choices no longer change grants. */
   lines?: GrantLines;
-  /** A turn holds for this card's answer: the call that raised it polls, or
-   *  the run parked on it writes no terminal. Such a card posts at once,
-   *  even mid-turn, since the turn it would wait for never ends first. */
   holds_a_turn?: boolean;
 }
 
-/** How the owner picked a permission request's option: the receipt half of a
- *  `PermissionGranted`. */
 export type PickedBy =
   | { kind: 'tap' }
-  /** Historical receipt for words the owner typed. */
   | {
       kind: 'typed';
       message_event_id: string;
     }
-  /** Words the owner said on a call. `message_event_id` names their
+  /** INVARIANT: Words the owner said on a call. `message_event_id` names their
    *  transcript row when the pick was judged from one. A pick the call's
    *  talker made names none, since its transcript can land after it. */
   | {
       kind: 'spoken';
       message_event_id?: string;
     }
-  /** The owner confirmed a *batch* that held this pick, spending
-   *  `permission_id`. */
   | {
       kind: 'batch';
       permission_id: string;
     };
 
-/** Evidence that opened the source-edit gate or approved a plan-only landing. */
 export type PlanApprovalKind =
   | 'design'
   | 'implementation'
@@ -1345,17 +1178,14 @@ export interface PlanBinding {
   digest: string;
 }
 
-/** The purpose of a plan, supplied explicitly when planning starts. */
 export type PlanKind =
   | 'design'
   | 'implementation';
 
-/** What the user's plan approval permits. */
 export type PlanScope =
   | 'implement'
   | 'plan-only';
 
-/** The expected wake a keep-alive run plans from, as its status shows it. */
 export interface PlannedWake {
   at: string;
   source: WakeSource;
@@ -1394,46 +1224,29 @@ export type PluginSetupOccasion =
       cause?: PluginSetupCause;
     };
 
-/** The words of a request an agent prepared: what its question tool shows. */
 export interface PreparedCard {
   question: string;
   header: string;
   options: PreparedOption[];
 }
 
-/** One option of a [`PreparedCard`], in the order the card shows it. */
 export interface PreparedOption {
   label: string;
   description: string;
 }
 
-/** The structured error code a provider attached to a failed turn, carried on
- *  `ResponseFailed` so the card can say why. The provider's own words travel in
- *  `error`, and its extra explanation, when it sends one, in `detail`.
- *  Full reasoning is on the Rust variant. */
 export interface ProviderError {
   code: string;
   detail?: string;
 }
 
-/** One option offered by CC's AskUserQuestion tool. Persisted inside
- *  `UserQuestionAsked` and looked up when the user picks one to send the
- *  matching `tool_result` back to CC. */
 export interface QuestionOption {
   id: string;
   label: string;
   description?: string;
-  /** Markdown the card shows under the option: a picture, or a short text
-   *  sample. Claude Code's native tool names it `preview`. */
   preview?: string;
-  /** The widget the option draws under its label row, lifted out of a
-   *  *widget embed* in its description or preview (ADR 0415). */
   widget?: WidgetEmbed;
-  /** A *quiet option*: picking it records the answer and ends the turn
-   *  without waking the agent. */
   quiet?: boolean;
-  /** The *quiet reply*: the fixed acknowledgement the thread shows when the
-   *  user picks this quiet option. Only a quiet option carries one. */
   quiet_reply?: string;
 }
 
@@ -1449,7 +1262,7 @@ export interface RecalledMemory {
   source: MemorySource;
 }
 
-/** Initial restored composer, inserted only when its fresh destination is absent.
+/** INVARIANT: Initial restored composer, inserted only when its fresh destination is absent.
  *  The generation fences requests delayed across another workspace restore. */
 export interface RecoveredCompose {
   generation: string;
@@ -1465,13 +1278,11 @@ export interface RemoteStartAsk {
   pairing_label: string;
 }
 
-/** Provenance and admission deadline for a fresh fire retrying an interrupted thread. */
 export interface RetryOf {
   thread_id: string;
   deadline: string;
 }
 
-/** The first eligibility rule that prevented an interrupted fire's retry. */
 export type RetrySkipReason =
   | 'already_retried'
   | 'fire_completed'
@@ -1490,7 +1301,6 @@ export type SandboxMode =
   | 'owner-opted-out'
   | 'permitted-outside';
 
-/** A provider's processing tier other than its standard one. */
 export type ServiceTier =
   | 'flex';
 
@@ -1529,13 +1339,6 @@ export type SessionStart =
   | 'after-this-turn'
   | 'on-next-input';
 
-/** The kind of irreversible real-world side-effect a command may perform. Only
- *  meaningful for [`RiskLane::IrreversibleDanger`]. The judge tags each
- *  irreversible command with a category, and the static fallback derives one
- *  for the shapes it recognises. An unattended *trigger* runs the command only
- *  when its declared **side-effect grant** contains that category (ADR 0002).
- *  A chat turn always asks the user, whatever the category.
- *  Full reasoning is on the Rust variant. */
 export type SideEffectCategory =
   | 'email'
   | 'external_api'
@@ -1557,7 +1360,7 @@ export type SpawnVerdict =
   /** An unattested caller started the calling thread. */
   | { kind: 'unattested' };
 
-/** A failed-turn notice; coding-agent notices never start engine holds. */
+/** INVARIANT: A failed-turn notice; coding-agent notices never start engine holds. */
 export interface SpendCapNotice {
   provider: string;
   resets_at: string | null;
@@ -1584,9 +1387,6 @@ export type ThreadDirection =
   | 'parent'
   | 'child';
 
-/** The size of any dashboard tile. A widget shows at one of its four
- *  `WidgetSize`s, and an *app shortcut* is always a quarter: half a small
- *  cell's edge on each side. */
 export type TileSize =
   | 'quarter'
   | 'small'
@@ -1594,20 +1394,12 @@ export type TileSize =
   | 'large'
   | 'xl';
 
-/** One row of a *Todo list*. `content` is the imperative form ("Run tests");
- *  `active_form` is the present-continuous form ("Running tests") shown only
- *  while the item is `InProgress`. Every other status renders `content`,
- *  including `Waiting`: a parked item is not being worked, so the
- *  present-continuous form would claim activity that stopped. */
 export interface TodoItem {
   content: string;
   active_form: string;
   status: TodoStatus;
 }
 
-/** Status of one *Todo item* (see `system-knowhow/glossary.md`). Item shape
- *  mirrors CC's `TodoWrite` so users see the same mental model across agents.
- *  Full reasoning is on the Rust variant. */
 export type TodoStatus =
   | 'pending'
   | 'in_progress'
@@ -1615,7 +1407,7 @@ export type TodoStatus =
   | 'waiting'
   | 'abandoned';
 
-/** One thread in a triage proposal: what was proposed, and why. `action` is a
+/** INVARIANT: One thread in a triage proposal: what was proposed, and why. `action` is a
  *  `TriageAction` wire name, kept as a string so old rows always decode. */
 export interface TriageProposalEntry {
   thread_id: string;
@@ -1623,12 +1415,9 @@ export interface TriageProposalEntry {
   reason: string;
 }
 
-/** Records *which path* fired a particular trigger run.
- *  Full reasoning is on the Rust variant. */
 export type TriggerInvocation =
-  /** Cron schedule fired this run. */
   | { kind: 'Schedule' }
-  /** A domain event fired this run. `event_type` is the matched event name;
+  /** INVARIANT: A domain event fired this run. `event_type` is the matched event name;
    *  `event_id` is the source `events.id` (when known) so the popover can
    *  deep-link back to the originating event row. `thread_id` is the thread
    *  the source event lives on (only set for thread-scoped events). It is
@@ -1643,31 +1432,20 @@ export type TriggerInvocation =
       thread_id?: string;
     };
 
-/** What a coding-agent turn end looked like, stored on `CodingAgentIdled`.
- *  Read it to tell which path ended a turn that ended early. Codex fills every
- *  field. The exec driver fills `status` only, and Claude Code sends none. */
 export interface TurnEndFacts {
   status: TurnEndStatus;
-  /** The turn completed a message that Codex marked as its final answer. */
   final_answer?: boolean;
-  /** The count of agent messages the turn completed. */
   agent_messages?: number;
-  /** The count of follow-up inputs Codex accepted into this turn as steers. */
   steered_inputs?: number;
-  /** The type of the last item the turn completed, in Codex's own words. */
   last_item?: string;
 }
 
-/** How the coding agent ended its turn, as its driver saw it. */
 export type TurnEndStatus =
   | 'completed'
   | 'interrupted'
   | 'failed'
   | 'synthesized';
 
-/** Why a turn end left work on its branch unproposed (ADR 0400). The hold
- *  variants are [`ProposalHold`]'s, mapped by the exhaustive `From` below, so a
- *  new hold cannot compile without a wire name. */
 export type UnproposedReason =
   | 'plan_missing'
   | 'plan_changed'
@@ -1679,9 +1457,9 @@ export type UnproposedReason =
   | 'turn_incomplete'
   | 'awaiting_landing'
   | 'integrated_into_parent'
-  | 'carried_by_successor';
+  | 'carried_by_successor'
+  | 'hook_refused';
 
-/** Why a change left the landing lane without landing. */
 export type UnqueueReason =
   | 'discarded'
   | 'set_aside'
@@ -1705,8 +1483,6 @@ export type VoiceSessionEndReason =
   | 'provider_failed'
   | 'engine_shutdown';
 
-/** One time bucket of an expected wake's distribution: the odds the thread
- *  wakes by `by`, and after the bucket before it. */
 export interface WakeBucket {
   by: string;
   probability: number;
@@ -1721,23 +1497,16 @@ export type WakeMode =
   | 'wake'
   | 'wake-when-all-done';
 
-/** Who stated an expected wake. */
 export type WakeSource =
   | 'agent'
   | 'decision';
 
-/** A *widget embed*, `![label](app:<id>?params={...})`, as the engine reads
- *  it: the widget, its params, and the alt text as its label. */
 export interface WidgetEmbed {
   app_id: string;
-  /** The instance's *widget params*. Absent means none. */
   params?: Record<string, unknown>;
-  /** The embed's alt text. Absent means the widget's name. */
   label?: string;
 }
 
-/** One of the four sizes a widget takes as a tile on a dashboard: one cell,
- *  two cells wide, two by two, or four by two (ADR 0432). */
 export type WidgetSize =
   | 'small'
   | 'medium'
@@ -1748,52 +1517,24 @@ export type ThreadEvent =
   | {
       type: 'MessageReceived';
       text: string;
-      /** Content-addressed sha256 hashes of user-attached image blobs.
-       *  Bytes live exactly once under `data/blobs/<hh>/<hash>.<ext>`;
-       *  the LLM call resolves hashes to bytes at send time. Old DB rows
-       *  migrate from `images: [{base64, mime_type}, ...]` via the
-       *  startup migration in `core::image_migration`. */
       user_image_hashes?: string[];
-      /** The device the message came from, by id only. A display resolves
-       *  its name; older rows also carry a `device` name, which is ignored. */
       device_id?: string;
       image_description?: string;
-      /** Set when this thread was spawned by another thread. Required when
-       *  `mode != Human` and the spawn originated from a parent thread. */
       parent_thread_id?: string;
-      /** Event in the parent thread that triggered this spawn (e.g. the
-       *  `ToolCalled` event for a `run_thread` invocation). Only set when
-       *  `mode != Human`. */
       spawning_event_id?: string;
-      /** The child's *wake mode*, set only beside `parent_thread_id` on a
-       *  child's spawning message. Absent on a spawn from before wake modes,
-       *  whose turns fall back to the wake decision. */
       wake_mode?: WakeMode;
-      /** Semantic mode of the actor that emitted this message. Required for
+      /** INVARIANT: Semantic mode of the actor that emitted this message. Required for
        *  new emissions (enforced at the API layer). The serde default exists
        *  only to replay old DB rows persisted before the `mode` field existed. */
       mode?: ActorMode;
-      /** Model the engine will use to answer this message. Stamped at request
-       *  time so the route tooltip can display it before ResponseGenerated
-       *  fires. A coding-agent turn stamps the rung its spawn resolves
-       *  (`coding_agent_rung`), which no pick changes mid-turn (ADR 0542). */
       model?: string;
-      /** Reasoning effort the engine will use to answer this message. */
       reasoning_effort?: string;
-      /** The backend this message was PINNED to: an explicit pick, or one
+      /** INVARIANT: The backend this message was PINNED to: an explicit pick, or one
        *  this thread remembered for the same model. Stamped beside the model
        *  so the pick outlives a later change to the model's *preferred
        *  provider*. `None` means nothing was pinned, so the row decides. */
       provider?: string;
-      /** Structured origin, captured from HTTP headers / device lookup at
-       *  the API boundary. Optional on the wire so old DB rows deserialize
-       *  cleanly; the frontend's `legacyOrigin()` synthesizes from the
-       *  legacy `device_id` / `parent_thread_id` fields when this is None. */
       origin?: MessageOrigin;
-      /** The *voice session* this message was spoken on, when it was spoken
-       *  rather than typed. Absent means typed, which is every message
-       *  written before voice existed.
-       *  Full reasoning is on the Rust variant. */
       voice_session_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -1802,16 +1543,14 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** User removed a queued chat follow-up before the agentic loop ingested it.
+  /** INVARIANT: User removed a queued chat follow-up before the agentic loop ingested it.
    *  The original `MessageReceived` stays in the append-only log. Renderers
    *  hide it while it is still stepless, and the agentic loop skips the
    *  matching injected prompt when it drains the queue. */
   | {
       type: 'QueuedMessageRemoved';
       removed_message_id: string;
-      /** Stop requests atomic restoration; trash and coding-agent withdrawals do not. */
       restore_to_compose?: boolean;
-      /** Result of atomic restoration, retained for projection replay. */
       compose?: ComposeReport;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -1820,11 +1559,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** An agent-sent message held back from a coding agent, because the thread
-   *  waits on a human: an open question, or older held messages. It stays
-   *  held until a human replies, and is released as an ordinary
-   *  `MessageReceived`. Unlike that event, it moves no status, so the
-   *  question stays answerable. See ADR 0256. */
   | {
       type: 'MessageHeld';
       text: string;
@@ -1838,7 +1572,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A `MessageHeld` was handed to the agent. Emitted just before its
+  /** INVARIANT: A `MessageHeld` was handed to the agent. Emitted just before its
    *  `MessageReceived`, so a message is released at most once. */
   | {
       type: 'HeldMessageReleased';
@@ -1876,7 +1610,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** One captured context per LLM call. `usage` is None pre-call and on
+  /** INVARIANT: One captured context per LLM call. `usage` is None pre-call and on
    *  providers that don't report it (OpenAI, Gemini). When present it
    *  reflects the real prompt-token cost from the provider's `usage`
    *  block. `estimated_total_tokens` is the engine's pre-call estimate
@@ -1894,70 +1628,32 @@ export type ThreadEvent =
       estimated_total_tokens: number;
       usage?: ApiUsage;
       trimmed?: boolean;
-      /** Which trim passes cut something, ascending. Empty when none did.
-       *  Full reasoning is on the Rust variant. */
       trim_passes?: number[];
-      /** Which call this records. Absent on every row written before the
-       *  field existed. Absent on every turn row since, so it defaults to
-       *  `Turn` and serializes only for an auxiliary call. */
       purpose?: ContextPurpose;
-      /** True when the row was rebuilt after the fact from other events
+      /** INVARIANT: True when the row was rebuilt after the fact from other events
        *  rather than recorded at the call. Its numbers are estimates, and
        *  it deliberately carries no `usage`, so a rollup that filters on a
        *  present `usage` block keeps reporting measured spend only. Written
        *  by `core::aux_context_backfill` and by nothing else. */
       reconstructed?: boolean;
-      /** The `Agent` call whose sub-agent made this call, so the capture
-       *  binds to that sub-agent's steps. Absent for every other capture. */
       parent_tool_use_id?: string;
-      /** The coding agent's id for this API call. Every
-       *  `CodingAgentToolCalled` the call produced carries the same id, so
-       *  the capture binds to each of them. Absent for every other capture. */
       api_call_id?: string;
-      /** The reasoning tier this call ran at, where the caller has one to
-       *  report. Set on a chat turn and on every metered chat call. Lets a
-       *  cost estimate split measured usage by tier instead of treating all
-       *  history as one baseline. */
       reasoning_effort?: string;
-      /** How long the call took, wall clock, where the caller timed it.
-       *  Set on a chat turn and on every metered chat call. It spans the
-       *  provider's retries, so `created` minus this is when the first
-       *  attempt started. The Tree backfill estimate reads it as a model's
-       *  seconds per call at a tier. */
       duration_ms?: number;
-      /** The *stable-prefix fingerprint* of a chat turn's first round, on
-       *  Anthropic and Vertex Claude. A later round of the same turn sends
-       *  the same prefix, so only round 1 carries it. */
       stable_prefix_fingerprint?: string;
-      /** The *served model*: the model id the provider's reply named,
-       *  verbatim. `model` is the one Lucidos asked for. Absent when the
-       *  reply named none, and on every row written before the field
-       *  existed. One that is neither `model` nor a dated snapshot of it
-       *  means another model answered: a provider reroute, or the router
-       *  sending a retired model's successor (ADR 0418). */
       served_model?: string;
-      /** The backend the router chose or the coding agent reported
+      /** INVARIANT: The backend the router chose or the coding agent reported
        *  (`claude-gateway`, `vertex`, ...). Coding-agent calls use `unknown`
        *  when unresolved; `CodingAgentBillingObserved` preserves why.
        *  Absent on older captures without provider attribution. Gateway
        *  telemetry selects engine-owned producers as well as this field. */
       provider?: string;
-      /** The caller ran in a CLI process that owns its telemetry. Engine
+      /** INVARIANT: The caller ran in a CLI process that owns its telemetry. Engine
        *  exporters must leave this capture to that process. Defaults false
        *  for older captures; producer-based exclusions still apply. */
       telemetry_owned_by_cli?: boolean;
-      /** Time to the first content delta of the stream that answered, from
-       *  the same start as `duration_ms`, so never above it. Absent when
-       *  no delta arrived or the provider's send loop does not trace it,
-       *  and on every row written before the field existed. */
       ttft_ms?: number;
-      /** The provider's id for the response that answered (the
-       *  `request-id` header). Absent when the response had none, and on
-       *  every row written before the field existed. */
       request_id?: string;
-      /** The thread's *agent session* the call ran in, counted from 1. The
-       *  event bus stamps it at append, so a producer leaves it `None`.
-       *  Absent on every row written before the field existed. */
       session?: number;
       /** Server dropped `sections` and `tools` here. The modal lazy-fetches them. */
       sections_stripped?: boolean;
@@ -1968,13 +1664,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Secret-free billing evidence observed from a coding-agent process.
+  /** INVARIANT: Secret-free billing evidence observed from a coding-agent process.
    *  Scoped to this launch, never a pin to replay as current auth on resume. */
   | {
       type: 'CodingAgentBillingObserved';
       coding_agent: CodingAgent;
-      /** Correlates observations from one spawned process, independently of
-       *  backend session ids that a resume may reuse. */
       launch_id: string;
       attribution: BillingAttribution;
       billing_mode?: BillingMode;
@@ -1985,28 +1679,21 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A metered chat call that failed. It is **never a `ContextCaptured`**: a
+  /** INVARIANT: A metered chat call that failed. It is **never a `ContextCaptured`**: a
    *  capture binds to a transcript step and every usage rollup sums it, while
    *  a failed call has no context to show and no spend. Written for any
    *  provider. The gateway telemetry exporter selects on `provider`.
    *  Full reasoning is on the Rust variant. */
   | {
       type: 'ModelCallFailed';
-      /** The model the call asked for. */
       model: string;
-      /** Which call this was. Absent for a turn, like `ContextCaptured`. */
       purpose?: ContextPurpose;
-      /** The backend the router sent the call to, when one chose. */
       provider?: string;
       reasoning_effort?: string;
-      /** How long the call ran before it failed, retries included. */
       duration_ms: number;
-      /** HTTP sends made across the call's retries and model fallback. */
       attempts: number;
       failure: CallFailure;
-      /** The last attempt's HTTP status, when a response arrived. */
       status_code?: number;
-      /** The `request-id` header of the failing response, when it had one. */
       request_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2015,16 +1702,10 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The engine's automatic pre-turn recall: `retrieve_context` vector-searched
-   *  long-term memory with classifier-derived `queries` and injected the hits
-   *  into the turn's context, before the model saw anything.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'MemoryRecalled';
       results?: number;
       queries?: string[];
-      /** The memories injected, in the order the model saw them, so
-       *  `memories.len() == results`. Absent on rows written before it. */
       memories?: RecalledMemory[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2053,12 +1734,6 @@ export type ThreadEvent =
       result?: string;
       images?: string[];
       success?: boolean;
-      /** Event id of the originating `ToolCalled`. Stamped on every live
-       *  emit by the chat agentic loop, and on synthetic backfills by the
-       *  recovery sweep (`recover_orphan_tool_calls`). The frontend's
-       *  `groupIntoExchanges` uses it (via `chatToolCallOwners`) to route
-       *  the result back to the call's exchange.
-       *  Full reasoning is on the Rust variant. */
       tool_called_event_id?: string;
       /** Server dropped `result` here. The step detail lazy-fetches it. */
       result_stripped?: boolean;
@@ -2069,18 +1744,9 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Lucidos Agent's current todo list, replaced wholesale on every
-   *  `todo_write` tool call. Sticky UI panel reads the latest of these per
-   *  thread; the empty list means the agent cleared the list. Not emitted
-   *  from coding-agent threads. CC's own `TodoWrite` continues to render
-   *  inline on the tool-call step. */
   | {
       type: 'TodoListWritten';
       items: TodoItem[];
-      /** *Todo notes*: free text the agent keeps beside the items, replaced
-       *  whole with them (ADR 0085). Absent on an older row and on a call
-       *  that passes none, so it is skipped when serializing and defaults
-       *  when read. */
       notes?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2089,17 +1755,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Background task spawned via `run_bash_background` (shell command) OR
-   *  `run_python_background` (venv-rooted python script: the engine
-   *  wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes through
-   *  the same `BackgroundBashRegistry`). The `command` field captures
-   *  the exact shell invocation, so a reader can tell which spawning
-   *  tool produced the row. Paired with a later `BackgroundBashCompleted`.
-   *  The two events are the durable audit trail of every long-running
-   *  background task. `bash_output` reads from the in-memory registry
-   *  while a task runs, and for the few minutes its completion is retained
-   *  there. It then falls back to the `BackgroundBashCompleted` payload,
-   *  whichever tool spawned it. */
   | {
       type: 'BackgroundBashStarted';
       task_id: string;
@@ -2116,35 +1771,19 @@ export type ThreadEvent =
   | {
       type: 'BackgroundBashCompleted';
       task_id: string;
-      /** Truncated to 200 chars for log readability; full command lives
-       *  on the paired `BackgroundBashStarted`. */
       command: string;
-      /** The child's normal exit status. `None` whenever there isn't one:
+      /** INVARIANT: The child's normal exit status. `None` whenever there isn't one:
        *  the child died on a signal (see `signal`), or the engine failed to
        *  reap it at all. Never a stand-in number: a reader that sees
        *  `exit_code: 0` can trust the command really exited 0. */
       exit_code: number;
-      /** Unix signal that terminated the child, when one did. 9 is SIGKILL
-       *  from the watchdog timeout or `bash_kill`, 11 is SIGSEGV, and 13 is
-       *  SIGPIPE from a `pipefail` pipeline. Mutually exclusive with
-       *  `exit_code`; both `None` means the status was unavailable.
-       *  Absent on rows written before the field existed. */
       signal?: number;
       stdout: string;
       stderr: string;
       started_at: string;
       finished_at: string;
-      /** Watchdog killed the task because `timeout_secs` elapsed. */
       timed_out?: boolean;
-      /** `bash_kill` killed the task explicitly. */
       killed?: boolean;
-      /** The engine that owned this task stopped while it was running, so the
-       *  child died with the process and nobody watched it exit. Distinct
-       *  from `killed`, which means a person or an agent cancelled the work:
-       *  a reader that conflates the two concludes the task was called off.
-       *  `exit_code` and `signal` are both `None` here, because no status was
-       *  ever reaped. Written by the teardown emit or by the boot sweep, in
-       *  `engine/tools/bash_background_recovery.rs`. */
       abandoned?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2153,7 +1792,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The engine started a *confinement run* as background task `task_id`,
+  /** INVARIANT: The engine started a *confinement run* as background task `task_id`,
    *  under permission `permission_id`. `revision` is the worktree's `HEAD`
    *  when the tree was clean, and absent when it was dirty. The paired
    *  `BackgroundBashCompleted` carries the result. A passing run certifies
@@ -2215,13 +1854,7 @@ export type ThreadEvent =
       type: 'ResponseFailed';
       error: string;
       spend_cap?: SpendCapNotice;
-      /** Set when the coding agent's process ended on its own and took the
-       *  turn with it. Absent on every other failure, and on stored events
-       *  from before it existed. */
       agent_exit?: CodingAgentExit;
-      /** The structured code the provider attached to the failed turn. A
-       *  policy block is never resumed. Absent when the provider sent no
-       *  code, and on stored events from before it existed. */
       provider_error?: ProviderError;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2233,20 +1866,9 @@ export type ThreadEvent =
   | {
       type: 'ContinuationStarted';
       branch?: string;
-      /** Engine-stamped origin so the route popover can render
-       *  "Engine · Auto-resumed after restart" for recovered sessions. */
       origin?: MessageOrigin;
-      /** Why the continuation opened, forwarded from the originating
-       *  `ContinuationRequested.reason`. The frontend reads it to label the
-       *  resume honestly: `user_clicked_continue` is genuinely a resume
-       *  after an engine restart, but `auto_recovery_after_hang` fires for a
-       *  hung subprocess OR a stray signal-kill (e.g. a cross-workspace
-       *  `cargo check` broad-kill) where NO engine restart happened.
-       *  Labeling those "Resumed after engine restart" misattributes a local
-       *  interruption to a restart. `None` for legacy rows and the chat
-       *  rerun path (which carries its own engine note instead). */
       reason?: string;
-      /** The `ResponseAborted` a chat or trigger Continue resumes. A unique
+      /** INVARIANT: The `ResponseAborted` a chat or trigger Continue resumes. A unique
        *  index lets one `ContinuationStarted` claim each abort, so a double
        *  Continue spawns one rerun. `None` on the coding-agent path, the
        *  answer-driven fallback and legacy rows. */
@@ -2260,47 +1882,17 @@ export type ThreadEvent =
     }
   | {
       type: 'SessionStarted';
-      /** The mode resolved for the spawned process. Absent on legacy rows. */
       sandbox?: SandboxMode;
       session_id: string;
       branch?: string;
-      /** External repository ID this session is bound to.
-       *  Persisted in thread_summaries so follow-ups reuse the same repo. */
       repo_id?: string;
-      /** What kind of coding-agent thread this is: `lucidos` (default,
-       *  edits Lucidos source), `app` (edits a `data/apps/<id>/` folder
-       *  in the workspace), or `external` (edits a registered external
-       *  repo). Default applies to legacy rows persisted before this
-       *  field existed; those are interpreted via `repo_id` (NULL ⇒
-       *  `lucidos`, set ⇒ `external`). */
       coding_agent_kind?: CodingAgentKind;
-      /** Canonical folder the user (or LLM) picked when spawning. For
-       *  `app` threads this is `<workspace>/data/apps/<id>/`. For
-       *  `lucidos` and `external` it equals the repo root. Empty for
-       *  legacy rows persisted before this field existed. */
       coding_agent_folder?: string;
-      /** App id when `coding_agent_kind == "app"`; `None` otherwise. */
       app_id?: string;
-      /** Which backend drives this thread (`claude-code` | `codex`).
-       *  The thread_summaries projection follows the newest SessionStarted,
-       *  so follow-ups and recovery resume on its backend. Only a successor
-       *  session can change backends. The default covers legacy rows, which
-       *  are all Claude Code. */
       coding_agent?: CodingAgent;
-      /** The thread is an *integrated sub-thread*: it folds into its
-       *  parent's branch, runs the fast tier of `/harden` and proposes
-       *  nothing. Locked in at the first session like the fields above.
-       *  Absent on every row written before integrated spawns existed,
-       *  which reads as independent. */
       integrated?: boolean;
-      /** The auto-compact window this session's process got, in tokens.
-       *  Absent when the trial is off, under `control`, and on Codex. */
       auto_compact_window?: number;
-      /** The auto-compact trial arm this session ran in. Absent when the
-       *  trial is off and on Codex. */
       auto_compact_arm?: AutoCompactArm;
-      /** Whether this session carried the thread's earlier context. Absent
-       *  on rows written before the field existed. */
       continuity?: SessionContinuity;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2311,7 +1903,7 @@ export type ThreadEvent =
     }
   | {
       type: 'SessionEnded';
-      /** Why the session ended. Always serialized, because the frontend reads
+      /** INVARIANT: Why the session ended. Always serialized, because the frontend reads
        *  `reason` to distinguish a normal completion from a system abort,
        *  and `Completed` must reach the wire as `"completed"`. The default
        *  applies only when reading old DB rows persisted before `reason`
@@ -2326,19 +1918,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Legacy: this thread handed off to a *legacy successor thread*, which carried
-   *  on with a fresh context. Lands on the OLD thread. The successor's
-   *  branch starts at `base_sha`, this thread's last commit at the handoff.
-   *  Nothing emits it now: a handoff starts a successor session instead. */
   | {
       type: 'SuccessorThreadSpawned';
       successor_thread_id: string;
       base_sha: string;
-      /** The successor was the builder of a retired *build chain*: a
-       *  `no-wake` child of this thread (ADR 0503). */
       starts_build_chain?: boolean;
-      /** The retired *handoff consent* that let a successor placed under a
-       *  parent start (ADR 0507). */
       handoff_consent?: HandoffConsent;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2347,31 +1931,19 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread handed off to a *successor session* in the same thread. The
-   *  current session ends at its turn end, and the next one starts fresh on
-   *  the same branch, with `message` as its first input. Pending until that
-   *  session's `SessionStarted`. */
   | {
       type: 'SessionHandedOff';
-      /** The repository-scoped branch marker at the handoff. */
       plan_path?: string;
       cause?: HandoffCause;
       starts?: SessionStart;
-      /** The ceiling the session crossed, on a `context-ceiling` handoff. */
       crossing?: CeilingCrossing;
       opening: HandoffOpening;
-      /** The opening itself: the *handoff narrative* or *handoff brief*,
-       *  framed for the new session. */
       message: string;
       checkpoint?: string;
       progress?: string;
-      /** The *implementer* the successor session runs on. */
       coding_agent: CodingAgent;
       coding_agent_model?: string;
       reasoning_effort?: string;
-      /** What the user typed at the *Successor card*, and who typed it. The
-       *  successor session starts on it as their message, and `message`
-       *  leaves it out. Older rows quote it inside `message` instead. */
       request?: HandoffRequest;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2380,9 +1952,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The agent ran a *handoff checkpoint* a flow names (ADR 0505). It
-   *  records what the *handoff estimate* read, so a later run of the same
-   *  checkpoint can pool on it. `offered` marks a `--ask` run. */
   | {
       type: 'HandoffCheckpointReached';
       name: string;
@@ -2391,13 +1960,9 @@ export type ThreadEvent =
       model?: string;
       reasoning_effort?: string;
       offered?: boolean;
-      /** The verdict. `None` when the engine could not make a reading. */
       pays?: boolean;
-      /** The run declared the *default floor*. */
       default_floor?: boolean;
-      /** The default rung the run offered, for a thread below it. */
       floor_rung?: IntelligenceRung;
-      /** The *risk rung* the run offered, just above the default. */
       risk_rung?: IntelligenceRung;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2406,9 +1971,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user chose *Stay here* on the Successor card. `input_tokens` is the
-   *  context size at that moment: the card stays hidden until the thread
-   *  holds 100k more. */
   | {
       type: 'SuccessorOfferDeclined';
       input_tokens: number;
@@ -2419,13 +1981,8 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user chose *Continue with context* while the prompt cache was warm,
-   *  so the agent writes the *handoff narrative*. The successor, once the
-   *  agent spawns it, opens with `message` and runs on the implementer named
-   *  here. Pending until the thread's turn ends. */
   | {
       type: 'SuccessorRequested';
-      /** The user's first request for the successor, when they typed one. */
       message?: string;
       coding_agent?: CodingAgent;
       coding_agent_model?: string;
@@ -2437,10 +1994,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread's *context ceiling* was set: on the thread itself, or copied
-   *  from its trigger at creation (ADR 0629). The newest one wins. A thread
-   *  with none inherits its parent's, else the workspace preference. The
-   *  actor rides the meta, and only a person raises a ceiling. */
   | {
       type: 'ContextCeilingSet';
       ceiling: string;
@@ -2452,16 +2005,10 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A live main-session capture crossed the context ceiling (ADR 0701).
-   *  Recorded once per session; re-entry waits for a safe boundary.
-   *  A session whose first capture already exceeds its ceiling is exempt. */
   | {
       type: 'ContextCeilingReached';
-      /** The session's context size at the crossing, in tokens. */
       context_tokens: number;
-      /** The effective ceiling it crossed, in tokens. */
       ceiling: number;
-      /** The window the cap read, absent when no capture recorded one. */
       window?: number;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2470,10 +2017,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A person chose *Return to the old session* on a pending ceiling
-   *  handoff (ADR 0629). The handoff no longer stands, and the thread's next
-   *  input resumes the old session. A raising `ContextCeilingSet` and a
-   *  `SuccessorOfferDeclined` at the session's size precede it. */
   | {
       type: 'SessionHandoffWithdrawn';
       /** Links this event back to the request that opened the turn. */
@@ -2483,15 +2026,10 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The coding agent compacted its own context mid-session: Claude Code's
-   *  `compact_boundary`. The context counter drops at this step. */
   | {
       type: 'CodingAgentCompacted';
-      /** Claude Code's word for what started it: `auto` or `manual`. */
       trigger: string;
-      /** The context size Claude Code measured before compacting, in tokens. */
       pre_tokens?: number;
-      /** The context size after compacting, when Claude Code reports it. */
       post_tokens?: number;
       coding_agent?: CodingAgent;
       /** Links this event back to the request that opened the turn. */
@@ -2501,14 +2039,9 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The coding agent ran another model than the pinned one the turn asked
-   *  for, because the account may not run it. Read off the agent's Init
-   *  line. The thread's current model is the served one from here on. */
   | {
       type: 'CodingAgentModelSubstituted';
-      /** The model id the spawn asked for. */
       requested: string;
-      /** The model id the agent reported running. */
       served: string;
       coding_agent: CodingAgent;
       /** Links this event back to the request that opened the turn. */
@@ -2522,11 +2055,7 @@ export type ThreadEvent =
       type: 'CodingAgentTextStreamed';
       text: string;
       coding_agent?: CodingAgent;
-      /** The `Agent` call whose sub-agent wrote this text. Such text is the
-       *  sub-agent's narration, never the session's reply. Absent otherwise. */
       parent_tool_use_id?: string;
-      /** The text is a *progress note*: the provider's summary of what the
-       *  agent wrote before a tool call. The agent itself read it in full. */
       progress_note?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2535,12 +2064,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Streamed reasoning from a coding agent, the coding-agent mirror
-   *  of the chat agent's `ThoughtStreamed`. Carries plaintext reasoning the
-   *  agent emitted before its visible output (CC's `thinking_delta`; Codex's
-   *  `item/reasoning/*Delta` / `reasoning` item). Per-token streamed, persisted,
-   *  rendered as the "Thinking" step's live content so a long reasoning pass
-   *  shows progress instead of a silent "Working" gap. */
   | {
       type: 'CodingAgentThoughtStreamed';
       text: string;
@@ -2558,16 +2081,12 @@ export type ThreadEvent =
       args?: unknown;
       description?: string;
       coding_agent?: CodingAgent;
-      /** Agent-issued identifier for this tool invocation, persisted so the
+      /** INVARIANT: Agent-issued identifier for this tool invocation, persisted so the
        *  matching `CodingAgentToolResult` can be paired with the call even
        *  when an `EXCHANGE_START_TYPES` event (e.g. permission prompt)
        *  splits them across exchanges. Empty for legacy DB rows. */
       tool_use_id?: string;
-      /** The `Agent` call whose sub-agent made this call. Absent for the
-       *  session's own calls and on rows written before the field existed. */
       parent_tool_use_id?: string;
-      /** The API call that made this tool call, matching that call's
-       *  `ContextCaptured`. Absent from Codex and on older rows. */
       api_call_id?: string;
       /** Server dropped `args` here. The step detail lazy-fetches them. `description` is filled from `describe_cc_tool` first, so the inline step label never waits on that fetch. */
       args_stripped?: boolean;
@@ -2580,19 +2099,10 @@ export type ThreadEvent =
     }
   | {
       type: 'CodingAgentToolResult';
-      /** The tool of the call this answers. Empty on older rows and for a
-       *  call the session never saw. */
       name: string;
-      /** The agent's whole output. Older rows kept only its first 200 chars.
-       *  The snapshot and the live stream both drop it; fetch it by event id. */
       result?: string;
       coding_agent?: CodingAgent;
-      /** Matches the originating `CodingAgentToolCalled.tool_use_id`.
-       *  Empty for legacy DB rows. */
       tool_use_id?: string;
-      /** The `Agent` call whose sub-agent made the call this answers. Absent
-       *  for the session's own calls and on rows written before the field
-       *  existed. */
       parent_tool_use_id?: string;
       /** Server dropped `result` here. The step detail lazy-fetches it. */
       result_stripped?: boolean;
@@ -2614,20 +2124,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A prompt forwarded to a coding agent: an automated one (conflict
-   *  resolution, hardening) or a user follow-up to a live session.
-   *  Persisted for audit trail but not rendered in the chat UI. */
   | {
       type: 'CodingAgentPromptSent';
       text: string;
       coding_agent?: CodingAgent;
-      /** Engine-stamped origin for prompts the engine itself synthesized
-       *  (orphan recovery, hardening retrigger, merge conflict). Surfaced in
-       *  the route popover so users can distinguish engine-driven prompts
-       *  from agent-driven ones. `None` for legacy DB rows and for prompts
-       *  that already carry their origin elsewhere in the chain. */
       origin?: MessageOrigin;
-      /** The event that carried the forwarded input, as on
+      /** INVARIANT: The event that carried the forwarded input, as on
        *  `CodingAgentInputRead`: the `MessageReceived` of a user follow-up.
        *  `None` for an engine prompt with no starter event. The turn gap
        *  counts this event as a boundary only once a `CodingAgentInputRead`
@@ -2640,21 +2142,10 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The coding agent read an input the engine forwarded to it. Until then
-   *  the input is owed, and the session keeps its subprocess (ADR 0268). */
   | {
       type: 'CodingAgentInputRead';
-      /** The event that carried the input: the `MessageReceived` for a
-       *  message, the `ChildThreadCompleted` for a child wake, the
-       *  `CodingAgentPromptSent` for an engine prompt with no starter event. */
       input_event_id: string;
-      /** The read opened a turn on a session whose last turn had already
-       *  ended, as when a queued message outlives a Stop. Such a read is a
-       *  start event: the thread runs again (ADR 0268). */
       started_turn?: boolean;
-      /** The input went to the agent exactly as typed, a slash command with
-       *  nothing in front. It carried no turn-gap note, so the turn gap does
-       *  not count it. */
       verbatim?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2663,13 +2154,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The coding agent took a child's report mid-turn, through its own
+  /** INVARIANT: The coding agent took a child's report mid-turn, through its own
    *  `lucidos` call, before its driver delivered the queued copy. The engine
    *  withdrew that copy, so the report reaches the agent once. Follows the
    *  card, so the boot refire treats the card as handled. */
   | {
       type: 'ChildReportTaken';
-      /** The `ChildThreadCompleted` card whose report the agent took. */
       input_event_id: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2678,13 +2168,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** An effort restart interrupted the turn before the coding agent read
+  /** INVARIANT: An effort restart interrupted the turn before the coding agent read
    *  the input that opened it, so the agent never will. The input stays
    *  owed until a later `CodingAgentInputRead` names it, and the next
    *  session to start delivers it (`agent_session::stranded_follow_ups`). */
   | {
       type: 'CodingAgentInputDiscarded';
-      /** The event that carried the input, as on `CodingAgentInputRead`. */
       input_event_id: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2693,15 +2182,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Emitted when the engine detects that a coding-agent session ended without
+  /** INVARIANT: Emitted when the engine detects that a coding-agent session ended without
    *  running the required hardening. A recovery hardening session is spawned
    *  automatically. This is NOT a completion event: the thread stays active
    *  until hardening finishes. */
   | {
       type: 'MissingHardeningDetected';
-      /** Engine-stamped origin (always `MessageOrigin::Engine { reason:
-       *  EngineReason::MissingHardening }` for new emits). Optional on the
-       *  wire so legacy DB rows decode cleanly. */
       origin?: MessageOrigin;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2717,7 +2203,7 @@ export type ThreadEvent =
       requires_restart?: boolean;
       cc_session_id?: string;
       coding_agent?: CodingAgent;
-      /** Optional short tag describing why this idle was emitted. Most idles
+      /** INVARIANT: Optional short tag describing why this idle was emitted. Most idles
        *  have no `reason` (the agent simply finished its turn). Recovery
        *  emits `Some("engine_restart_interrupt")` when a mid-turn-crashed
        *  session is surfaced to the UI as "interrupted, click to continue"
@@ -2726,34 +2212,9 @@ export type ThreadEvent =
        *  `"cache_keep_alive"` or `"ceiling_reentry"`, so no trigger or event
        *  wait reads its idle as the agent finishing. */
       reason?: string;
-      /** Absolute filesystem path of the worktree the agent ran in for this
-       *  turn. Phase 6.1 of the CC resume architecture: persisted so that
-       *  follow-up turns can look up the deterministic per-thread worktree
-       *  directly from the events stream instead of scanning
-       *  `git worktree list`. `None` on legacy rows that predate the field
-       *  and on out-of-band idles emitted without a worktree (e.g. the
-       *  "no branch" recovery path). */
       worktree_path?: string;
-      /** `git rev-parse HEAD` in the worktree at the moment the agent went
-       *  idle. Phase 8.1 of the CC resume architecture. The next spawn
-       *  diffs against this SHA and checks `git status`, to detect external
-       *  user edits made between turns. It then injects a note into the
-       *  resumed prompt. `None` on legacy rows, on idles emitted
-       *  without a worktree, or when `git rev-parse` fails (e.g. branch
-       *  has zero commits yet). */
       worktree_head_sha?: string;
-      /** True iff the agent went idle while the chat-agent's
-       *  `run_bash_background` tool still had a task running for this thread.
-       *  **Recorded history only.** As of the bg-bash-gate removal this no
-       *  longer drives any projection or UI. A live event wait, not a
-       *  background task, holds the idle proposal (ADR 0395), and the
-       *  chat-agent bash auto-resumes CC via
-       *  `spawn_bash_completion_watcher`. Kept on the event so the timeline
-       *  still records that an idle overlapped a background task. */
       bg_bash_pending?: boolean;
-      /** How the agent ended the turn this idle closes, as its driver saw it.
-       *  `None` from Claude Code, for an idle no agent turn closed, and on
-       *  rows written before the field existed. */
       turn_end?: TurnEndFacts;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2762,7 +2223,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Continuation requested, emitted when a CC turn that was interrupted
+  /** INVARIANT: Continuation requested, emitted when a CC turn that was interrupted
    *  (engine restart mid-turn, Q9a recovery path) needs to be resumed
    *  without a new user message. Four emit sites: HTTP `/continue`
    *  (user clicks Continue), the *in-loop watchdog* (10-min silence with
@@ -2821,9 +2282,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user filed a pinned thread in a custom folder, an id from the
-   *  `thread_folders` preference. `None` moves it back to plain Pinned.
-   *  Projects to `thread_summaries.pin_folder`. */
   | {
       type: 'ThreadMovedToFolder';
       folder?: string;
@@ -2843,9 +2301,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread's own agent asked to be archived once its turn ends (ADR 0310).
-   *  The actor names the agent thread. The archive request resolver runs the
-   *  Archive button's cascade after the settle; a newer message closes it. */
   | {
       type: 'ThreadArchiveRequested';
       /** Links this event back to the request that opened the turn. */
@@ -2855,8 +2310,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user took a thread back out of the archive: Archive all's Undo
-   *  (ADR 0349). Moves it to the inbox and bumps nothing else. */
   | {
       type: 'ThreadUnarchived';
       /** Links this event back to the request that opened the turn. */
@@ -2866,13 +2319,9 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread's own agent asked the user to read its latest reply (ADR
-   *  0409). Sets `read_requested`, which lists the thread in the drawer's
-   *  Review group once its turn ends, unless its change already lists it
-   *  (ADR 0421). The actor names the agent thread, and is absent when the
-   *  turn-end gate forced the decision. */
   | {
       type: 'ThreadReadRequested';
+      parent_report?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2880,12 +2329,9 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread's agent decided its reply needs no reading: the no half of
-   *  the turn's *read decision*. Projects nothing, so it never clears an
-   *  unseen request (ADR 0409). The actor names the agent thread, and is
-   *  absent when the turn-end gate forced the decision. */
   | {
       type: 'ThreadReadNotRequested';
+      supersedes_request?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2893,10 +2339,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The yes half of a child's *wake decision*: its parent must act on this
-   *  turn's report, so the report wakes it. Sets `parent_wake_requested`
-   *  TRUE until the child's next turn starts. The actor names the child's
-   *  agent, and is absent when the turn-end gate decided. */
   | {
       type: 'ParentWakeRequested';
       /** Links this event back to the request that opened the turn. */
@@ -2906,10 +2348,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The no half of a child's *wake decision*: its parent need not act now.
-   *  A clean finish then files the report on the parent as a
-   *  `ChildReportFiled`, which wakes nothing. Sets `parent_wake_requested`
-   *  FALSE until the child's next turn starts. */
   | {
       type: 'ParentWakeNotRequested';
       /** Links this event back to the request that opened the turn. */
@@ -2919,17 +2357,14 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user saw the reply a read request pointed at: its end stayed on
+  /** INVARIANT: The user saw the reply a read request pointed at: its end stayed on
    *  screen for the seen dwell. Clears `read_requested`, or with `personal`
    *  adds the actor's device to `reply_seen_devices`. Recorded only while
    *  the thread's summary still reads `seen_version`, so a duplicate or a
    *  sighting older than a newer request records nothing. */
   | {
       type: 'ThreadReplySeen';
-      /** The thread's `summary_version` when the client saw the reply. */
       seen_version: number;
-      /** Seen by one person on a team gateway, so the request stays for the
-       *  others (ADR 0623). Absent means seen for everyone. */
       personal?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2938,9 +2373,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The Lucidos Agent proposed a *thread triage* in this thread (ADR 0349).
-   *  `apply_triage` acts only on these entries, and only after the user
-   *  replied to this event. */
   | {
       type: 'ThreadTriageProposed';
       entries: TriageProposalEntry[];
@@ -2951,10 +2383,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Someone became the *driver* of this thread's family (ADR 0623), on its
-   *  root. The actor names them: a device, or a trigger fire whose
-   *  actor email a user holds. Recorded by Take, Take over, and by
-   *  answering a gate. Projects nothing: `engine::thread_users` folds it. */
   | {
       type: 'RootThreadDriverTaken';
       /** Links this event back to the request that opened the turn. */
@@ -2964,8 +2392,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The root thread's driver gave the role up, on its family root. It has
-   *  no driver until someone takes it. */
   | {
       type: 'RootThreadDriverReleased';
       /** Links this event back to the request that opened the turn. */
@@ -2975,12 +2401,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A gate waited on its driver past `driver_timeout_hours`, so it now
+  /** INVARIANT: A gate waited on its driver past `driver_timeout_hours`, so it now
    *  reaches the whole team. Recorded once per gate, on the family root.
    *  The driver keeps the root thread. */
   | {
       type: 'RootThreadGateEscalated';
-      /** The thread the question card is on: the root or a sub-thread. */
       gate_thread_id: string;
       tool_use_id: string;
       /** Links this event back to the request that opened the turn. */
@@ -2990,12 +2415,8 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Someone started watching this root thread: its gate pushes reach them
-   *  beside the driver. Recorded on the family root. */
   | {
       type: 'RootThreadWatched';
-      /** The person a *user mention* made a watcher (ADR 0649). Absent
-       *  means the actor's own person, who tapped Watch. */
       user_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3004,7 +2425,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The actor stopped watching this root thread, from any of their devices. */
   | {
       type: 'RootThreadUnwatched';
       /** Links this event back to the request that opened the turn. */
@@ -3014,19 +2434,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A person wrote to the other people in this thread, not to its agent: a
-   *  *user-only message* (ADR 0649). The meta actor names the sender.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'UserOnlyMessagePosted';
       text: string;
-      /** Blob hashes of attached images, as on `MessageReceived`. */
       user_image_hashes?: string[];
-      /** The device the message came from, by id only. */
       device_id?: string;
-      /** The users the message mentions. A user id, because that is
-       *  the only stable handle for a person. A removed user's id
-       *  resolves to nobody. */
       mentioned_user_ids?: string[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3035,8 +2447,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Typed messages in this thread stop waking its agent: the *agent pause*
-   *  (ADR 0649). A running turn carries on. The meta actor names who paused. */
   | {
       type: 'AgentPaused';
       cause: AgentPauseCause;
@@ -3047,7 +2457,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Typed messages in this thread wake its agent again. */
   | {
       type: 'AgentResumed';
       cause: AgentPauseCause;
@@ -3058,8 +2467,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The retired *automation pause*. It folds as a *hold* whose root is
-   *  this thread and whose id is this event's id. Never emitted. */
   | {
       type: 'AutomationPaused';
       reason: string;
@@ -3070,8 +2477,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The retired end of an automation pause. It folds as a lifted hold.
-   *  Never emitted. */
   | {
       type: 'AutomationUnpaused';
       cause: AutomationUnpauseCause;
@@ -3082,11 +2487,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** This thread is now *on hold*: Lucidos starts no turn here by itself.
-   *  `root_thread_id` is the thread the Hold was placed on, which is this
-   *  thread or an ancestor the Hold reached down from. Every thread one
-   *  Hold reached carries the same `hold_id`. The meta actor names who
-   *  placed it. */
   | {
       type: 'ThreadHoldPlaced';
       reason: string;
@@ -3099,7 +2499,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The hold `hold_id` on this thread ended. */
   | {
       type: 'ThreadHoldLifted';
       hold_id: string;
@@ -3111,7 +2510,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The owner's pick on a *permission request* granted a *permission*.
+  /** INVARIANT: The owner's pick on a *permission request* granted a *permission*.
    *  `request_tool_use_id` names the card, and `picked_by` says whether a tap,
    *  typed words or spoken words picked it. The meta actor is the owner's
    *  device. A tool card's "Allow for this thread" carries the grant file
@@ -3133,8 +2532,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A once permission covered the action it allowed, so it ended. A unique
-   *  index refuses a second spend. */
   | {
       type: 'PermissionSpent';
       permission_id: string;
@@ -3145,7 +2542,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The gateway explicitly refused without changing anything. Copy the spent
+  /** INVARIANT: The gateway explicitly refused without changing anything. Copy the spent
    *  once grant under a new id, keeping its original request and turn boundary.
    *  A unique index permits at most one restoration of each spend. */
   | {
@@ -3159,7 +2556,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Someone revoked a permission. The meta actor names who. */
   | {
       type: 'PermissionRevoked';
       permission_id: string;
@@ -3170,7 +2566,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** An agent prepared a *permission request* on its own thread, through
+  /** INVARIANT: An agent prepared a *permission request* on its own thread, through
    *  `POST /api/v1/permission-requests`. The engine wrote `card`. It shows
    *  when the agent asks its question tool with `request_id` as its only
    *  question. A request grants nothing until the owner picks an option. */
@@ -3186,9 +2582,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** One item of a confirmed *batch* ran, or was skipped because its
-   *  source changed. On the thread that raised the batch. `index` counts
-   *  from 0 in the batch's order, and `permission_id` is the spent grant. */
   | {
       type: 'BatchItemRan';
       permission_id: string;
@@ -3202,31 +2595,18 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A thread was created in `composing` state. Emitted by the first
-   *  successful POST /threads (debounced first user input: keystroke,
-   *  image attach, or mode toggle on a fresh compose). The thread can
-   *  be addressed by id immediately after this event lands. */
   | {
       type: 'ThreadStarted';
       recovered_compose?: RecoveredCompose;
-      /** Set only by the agent-draft service, never beside `recovered_compose`. */
+      /** INVARIANT: Set only by the agent-draft service, never beside `recovered_compose`. */
       agent_draft?: AgentDraft;
-      /** Initial mode the user opened compose with. Mutable while the
-       *  thread is `Composing`; locked on first `MessageReceived`. */
       mode: string;
-      /** Stamped by `api::actor::user_actor` so the timeline
-       *  shows which device started the draft thread. */
       actor?: MessageOrigin;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
     }
-  /** A thread in `composing` state was explicitly discarded. Emitted by
-   *  DELETE /threads/:id. Terminal: the state-machine guard rejects
-   *  every subsequent compose PUT and message POST with 410 Gone. That is
-   *  the "make impossible states impossible" lever that replaces the
-   *  old LWW + tombstone machinery. */
   | {
       type: 'ThreadDiscarded';
       actor?: MessageOrigin;
@@ -3235,10 +2615,6 @@ export type ThreadEvent =
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
     }
-  /** The workspace's *home thread* was created (ADR 0362): an active chat
-   *  thread titled "Home", with no message yet. `ensure_home_thread`
-   *  emits it once per workspace, at boot. The projection's unique marker
-   *  refuses a second one, which rolls the event back with it. */
   | {
       type: 'HomeThreadCreated';
       /** Links this event back to the request that opened the turn. */
@@ -3248,7 +2624,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A user attached an image to this thread's compose draft. Emitted by
+  /** INVARIANT: A user attached an image to this thread's compose draft. Emitted by
    *  POST /api/v1/threads/:id/blobs after the bytes are content-addressed
    *  to disk under `data/blobs/<hh>/<hash>.<ext>`. The `hash` is the sole
    *  identity used by every downstream consumer (compose payload, message
@@ -3270,25 +2646,14 @@ export type ThreadEvent =
     }
   | {
       type: 'TriggerStarted';
-      /** The interrupted fire this fresh thread retries. Absent on ordinary and legacy fires. */
       retry_of?: RetryOf;
       trigger_id: string;
       trigger_name?: string;
       prompt?: string;
-      /** Which path fired this run. `None` only on legacy DB rows persisted
-       *  before this field existed. New emissions always set it. */
       invocation?: TriggerInvocation;
-      /** Engine-stamped origin for scheduler-fired triggers, always set to
-       *  `Engine { Scheduler { trigger_id, trigger_name } }` so the route
-       *  popover can render "Engine · Scheduled · <name>". `None` only on
-       *  legacy DB rows persisted before this field existed. */
       origin?: MessageOrigin;
-      /** Snapshot of the firing trigger's `go_to_review` flag. When true,
-       *  the section transition logic treats this trigger thread as
-       *  top-level so its terminal event surfaces it in REVIEW. Defaults
-       *  to false for backward compat with pre-flag DB rows. */
       go_to_review?: boolean;
-      /** The model this fire actually ran on, resolved from the trigger's own
+      /** INVARIANT: The model this fire actually ran on, resolved from the trigger's own
        *  pin or the account chat preference. `TriggerStarted` is a trigger
        *  thread's STARTER event (it has no `MessageReceived`), so this is
        *  where the *per-thread model memory* reads from: without it the
@@ -3296,16 +2661,8 @@ export type ThreadEvent =
        *  used a different one, and a human follow-up would silently switch.
        *  `None` on legacy rows persisted before the field existed. */
       model?: string;
-      /** The reasoning effort this fire actually ran with. Same role and same
-       *  legacy-`None` caveat as [`Self::TriggerStarted::model`]. */
       reasoning_effort?: string;
-      /** The backend this fire was pinned to, from the trigger's own pin or
-       *  the thread's memory. `None` means nothing was pinned, so the row
-       *  decided. */
       provider?: string;
-      /** The *continue key* this fire claimed for a NEW thread. A later fire
-       *  with the same key continues this thread until it is archived.
-       *  `None` on an unkeyed fire, and on a fire that continued a thread. */
       continue_key?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3314,7 +2671,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Boot reported a restart-cut fire and its durable retry decision. */
   | {
       type: 'TriggerRunInterrupted';
       trigger_id: string;
@@ -3340,7 +2696,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Planning began, with an explicit purpose supplied by the planning skill.
+  /** INVARIANT: Planning began, with an explicit purpose supplied by the planning skill.
    *  Does not record approval or open the source edit gate. */
   | {
       type: 'PlanStarted';
@@ -3352,7 +2708,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A committed plan revision was submitted for approval. */
   | {
       type: 'PlanProposed';
       kind: PlanKind;
@@ -3366,7 +2721,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The engine approved a plan revision or recorded a fix marker. */
   | {
       type: 'PlanApproved';
       kind: PlanApprovalKind;
@@ -3384,7 +2738,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** An Apply route took up this change. This records evidence only. */
   | {
       type: 'ChangeApplyRequested';
       change_id: string;
@@ -3404,40 +2757,16 @@ export type ThreadEvent =
       description?: string;
       files?: string[];
       requires_restart?: boolean;
-      /** Engine-stamped origin for change proposals from engine-internal
-       *  recovery paths (stale-session cleanup, orphan worktree cleanup).
-       *  `None` for proposals authored by a live agent session. Those
-       *  inherit their origin from the surrounding `MessageReceived`.
-       *  Surfaced in the route popover so users can render
-       *  "Engine · Stale session cleanup" etc. */
       origin?: MessageOrigin;
-      /** Legacy: was set by the deleted post-commit git hook on per-commit
-       *  emits (empty `change_id`). Live aggregate emits always set `None`.
-       *  Historical rows still carry it; the projection treats per-commit
-       *  shape (empty `change_id`, `commit_sha: Some(_)`) as inert in
-       *  `thread_summaries` and UPDATE-only on `changes`. */
       commit_sha?: string;
-      /** Branch the change lives on. Stamped by the first
-       *  `ChangeProposed` per `change_id`; used by the projection to
-       *  reconstruct the row without consulting the legacy `changes` table. */
       branch_name?: string;
-      /** Repo root the change targets. Same lifetime/intent as `branch_name`. */
       repo_root?: string;
-      /** `true` if the originating commit landed on a hardened HEAD; surfaced
+      /** INVARIANT: `true` if the originating commit landed on a hardened HEAD; surfaced
        *  in the projection so the apply UI can short-circuit re-hardening.
        *  Stamped from `has_full_harden_marker` at end-of-turn aggregate
        *  emit; engine-internal recovery emits resolve it the same way. */
       hardened?: boolean;
-      /** `true` when nobody saw the work finish: the archive net's
-       *  set-aside proposals, and unmerged integrated work whose last turn
-       *  did not finish. A pending change is never incomplete (ADR 0400),
-       *  and older rows marked so are withdrawn at boot. */
       incomplete?: boolean;
-      /** `true` when the engine proposes the change straight into set-aside:
-       *  work found on an archived thread's branch (ADR 0328), or an
-       *  integrated sub-thread's work its parent's change landed without
-       *  (ADR 0465). It leaves the thread where it is instead of surfacing
-       *  it for review. */
       set_aside?: boolean;
       path?: string;
       diff?: string;
@@ -3454,25 +2783,12 @@ export type ThreadEvent =
       change_id?: string;
       requires_restart?: boolean;
       client_update?: boolean;
-      /** Commit subjects merged to main, oldest first. Empty for no-op applies.
-       *  Surfaced in the restart-required toast grouped by thread. */
       commits?: string[];
-      /** Title of the originating thread, included so the restart toast can
-       *  group entries without an extra lookup. */
       thread_title?: string;
-      /** Who applied the change, always the human/HTTP/SDK initiator
-       *  stamped by `api/actor::build_message_origin` from the originating
-       *  HTTP call. None on legacy DB rows, and when the conflict-resolution
-       *  ff-merge path runs. That path drops the original applier's actor
-       *  across the async gap, and the popover then renders "Unknown". */
       actor?: MessageOrigin;
-      /** SHA of `main` before the merge, paired with `post_merge_sha` to
-       *  give Revert the exact commit range to drop. `None` for events
-       *  emitted before the projection rewrite. */
       pre_merge_sha?: string;
-      /** SHA of `main` after the merge. */
       post_merge_sha?: string;
-      /** The *landing merge* the landing lane made for this change alone.
+      /** INVARIANT: The *landing merge* the landing lane made for this change alone.
        *  Revert undoes exactly this commit. `None` for an app change, and
        *  for every apply made before the lane. */
       landing_merge_sha?: string;
@@ -3492,13 +2808,9 @@ export type ThreadEvent =
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
     }
-  /** The change was kept for later: out of Review and every bulk path until
-   *  it is brought back (ADR 0328). The actor rides on `EventMeta`. */
   | {
       type: 'ChangeSetAside';
       change_id: string;
-      /** The *hold* that set it aside. Resume brings back only the changes
-       *  that name its hold. */
       hold_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3507,8 +2819,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A set-aside change returned to pending, by the user or because its
-   *  thread proposed new work on the same branch. */
   | {
       type: 'ChangeBroughtBack';
       change_id: string;
@@ -3519,9 +2829,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A pending or set-aside change went back to unproposed work, and its
-   *  branch kept every commit (ADR 0400). A turn that stopped committed past
-   *  it, or Bring back met work that never finished. */
   | {
       type: 'ChangeWithdrawn';
       change_id: string;
@@ -3532,14 +2839,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A turn end left work on the branch and proposed none of it (ADR 0400).
-   *  `files` is what a proposal would have carried. */
   | {
       type: 'ProposalWithheld';
       branch_name: string;
       files: string[];
       reason: UnproposedReason;
-      /** The engine will send the agent back, so the owner owes no action. */
       agent_returns?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3548,9 +2852,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Apply put the change in the *landing lane*. The lane lands exactly
-   *  `snapshot_sha`, the branch commit Apply read, whatever the branch does
-   *  next. */
   | {
       type: 'ChangeQueued';
       change_id: string;
@@ -3562,8 +2863,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The source reserved this queued snapshot for an origin hand-off before
-   *  trying to publish its queue ref. */
   | {
       type: 'ChangeHandoffStarted';
       change_id: string;
@@ -3574,8 +2873,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The change left the landing lane without landing. It stays where its
-   *  status puts it, and nothing queues it again until Apply is pressed. */
   | {
       type: 'ChangeUnqueued';
       change_id: string;
@@ -3602,7 +2899,7 @@ export type ThreadEvent =
       change_id?: string;
       error?: string;
       actor?: MessageOrigin;
-      /** A merge already landed, but recording its content failed. Retries use
+      /** INVARIANT: A merge already landed, but recording its content failed. Retries use
        *  this range instead of treating the landing as an empty no-op. */
       pre_merge_sha?: string;
       post_merge_sha?: string;
@@ -3612,9 +2909,6 @@ export type ThreadEvent =
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
     }
-  /** An Apply Now passed its refusals and began. Sets `apply_in_flight` TRUE
-   *  until the apply's own `ApplyNowEnded`, so every client reads one answer
-   *  to "is this thread applying" (ADR 0437). The actor is whoever clicked. */
   | {
       type: 'ApplyNowStarted';
       /** Links this event back to the request that opened the turn. */
@@ -3624,7 +2918,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The Apply Now that `ApplyNowStarted` began is over, whatever happened.
+  /** INVARIANT: The Apply Now that `ApplyNowStarted` began is over, whatever happened.
    *  Sets `apply_in_flight` FALSE. The apply task emits it on every exit, and
    *  engine startup emits it as `interrupted` for an apply a stop cut off. */
   | {
@@ -3641,9 +2935,6 @@ export type ThreadEvent =
       type: 'MergeConflictDetected';
       change_id?: string;
       files?: string[];
-      /** Engine-stamped origin (always `MessageOrigin::Engine { reason:
-       *  EngineReason::MergeConflict }` for new emits). Optional on the wire
-       *  so legacy DB rows decode cleanly. */
       origin?: MessageOrigin;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3652,7 +2943,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A merge-resolution worktree was set up for a change with conflicts.
+  /** INVARIANT: A merge-resolution worktree was set up for a change with conflicts.
    *  The projection treats this as the change's `merge_worktree_path` /
    *  `merge_temp_branch` until a `MergeResolutionCleared` arrives. Survives
    *  restart so startup cleanup can find dangling worktrees. */
@@ -3668,7 +2959,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The merge-resolution worktree was torn down (cleanup finished). */
   | {
       type: 'MergeResolutionCleared';
       change_id?: string;
@@ -3679,11 +2969,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A change's working tree was hardened (`/harden` marker stamped on
-   *  HEAD). Idempotent: re-emitting after an unrelated commit is fine,
-   *  the projection treats only the latest event per `change_id`.
-   *  Downgraded to false implicitly when a fresh `ChangeProposed` arrives
-   *  with `hardened: false`. */
   | {
       type: 'ChangeHardened';
       change_id?: string;
@@ -3693,10 +2978,6 @@ export type ThreadEvent =
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
     }
-  /** A model wrote the *change summary*: one line saying what a change of
-   *  several commits does. `description` is the commit list it summarized.
-   *  The projection keeps the summary only while that still equals the
-   *  change's description, so a summary of an older commit set never lands. */
   | {
       type: 'ChangeSummarized';
       change_id?: string;
@@ -3709,7 +2990,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Coding-agent session settings changed mid-session (model or reasoning
+  /** INVARIANT: Coding-agent session settings changed mid-session (model or reasoning
    *  effort). Persisted per-thread so settings survive idle exit and respawn.
    *  Older stored rows may also carry a `permission_mode` key, so this variant
    *  must keep ignoring unknown fields.
@@ -3720,7 +3001,7 @@ export type ThreadEvent =
       reasoning_effort?: string;
       coding_agent?: CodingAgent;
       cc_session_id?: string;
-      /** Absolute `CLAUDE_CONFIG_DIR` the session was created under, stamped
+      /** INVARIANT: Absolute `CLAUDE_CONFIG_DIR` the session was created under, stamped
        *  alongside `cc_session_id` at the Init emit. It is the authoritative
        *  session↔config-dir pairing. CC keys each session's transcript on this
        *  dir (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`). So a follow-up
@@ -3730,7 +3011,7 @@ export type ThreadEvent =
        *  on the pre-Init settings emit, and on mid-session settings-only emits
        *  (model/effort changes). The Init emit is the carrier. */
       claude_config_dir?: string;
-      /** Whether `CLAUDE_CONFIG_DIR` was actually set for that session, stamped
+      /** INVARIANT: Whether `CLAUDE_CONFIG_DIR` was actually set for that session, stamped
        *  beside `claude_config_dir`. `false` means it was unset and the dir is
        *  Claude Code's default. The two are different logins to Claude Code, so
        *  a resume must replay which one it was (`AccountPin`). `None` wherever
@@ -3743,7 +3024,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A resolved next-turn user pick, including mid-turn (ADR 0544). */
   | {
       type: 'ChatSettingsChanged';
       model: string;
@@ -3756,8 +3036,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The resolved pair applied when a Lucidos Agent turn is admitted.
-   *  `EventMeta::request_event_id` identifies its durable turn anchor. */
   | {
       type: 'ChatTurnSettingsResolved';
       model: string;
@@ -3784,8 +3062,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Credential form request. Resolved by the credential save or the form's
-   *  Cancel (`POST /api/v1/form-requests/{request_id}/cancel`). */
   | {
       type: 'CredentialRequested';
       request_id: string;
@@ -3797,11 +3073,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Plugin install request awaiting user confirmation. It carries the
-   *  JSON preview `install_plugin` emitted: manifest, file list, overwrites
-   *  and an optional `setup`. The frontend renders the install panel from
-   *  it. `request_id` is the preview's `install_id`.
-   *  Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm|cancel}`. */
   | {
       type: 'PluginInstallRequested';
       request_id: string;
@@ -3813,12 +3084,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Plugin uninstall request awaiting user confirmation. It carries the
-   *  JSON preview `uninstall_plugin` emitted: plugin name and version, plus
-   *  the file list split into still-on-disk and already-missing. The
-   *  frontend renders the uninstall panel from it. `request_id` is the
-   *  preview's `uninstall_id`. Resolved by
-   *  `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm|cancel}`. */
   | {
       type: 'PluginUninstallRequested';
       request_id: string;
@@ -3830,8 +3095,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Email send awaiting user confirmation. `payload` is the draft.
-   *  Resolved by `POST /api/v1/email/send` or the form's Cancel. */
   | {
       type: 'EmailConfirmRequested';
       request_id: string;
@@ -3843,10 +3106,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The provider's authorization page for `connect_oauth_account`.
-   *  `payload` is the `{target: "url", url, purpose: "oauth"}` navigation
-   *  the client opens, on the device the meta actor names. The flow's
-   *  listener resolves it when its wait ends. */
   | {
       type: 'OAuthAuthorizationRequested';
       request_id: string;
@@ -3858,7 +3117,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Closes the form request `request_id` names. Emitted once per request. */
   | {
       type: 'FormRequestResolved';
       request_id: string;
@@ -3889,12 +3147,7 @@ export type ThreadEvent =
       options?: QuestionOption[];
       worktree_path?: string;
       multi_select?: boolean;
-      /** Set only on the retired single-use Allow once card (ADR 0387): the
-       *  act it proposed. History only: nothing sets it now, and an engine
-       *  card carries `permission_request` instead. */
       owner_approval?: OwnerApproval;
-      /** Set only on a *permission request* the engine raised and worded:
-       *  what each option grants (`engine::permission`). */
       permission_request?: PermissionRequest;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3903,7 +3156,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A *queued card*: a `UserQuestionAsked` that arrived while the thread
+  /** INVARIANT: A *queued card*: a `UserQuestionAsked` that arrived while the thread
    *  already had an open card. The EventBus records it under this type, so
    *  no client, push or voice path sees it. `card_queue` posts it later as a
    *  `UserQuestionAsked` with the same `tool_use_id`. Same fields as that
@@ -3927,13 +3180,9 @@ export type ThreadEvent =
     }
   | {
       type: 'UserQuestionAnswered';
-      /** The atomic composer consumption, retained for projection rebuilds. */
       compose?: ComposeReport;
       tool_use_id: string;
       answer: AnswerKind;
-      /** The pick was a *quiet option*, so the turn ends without waking the
-       *  agent. The engine derives it from the asked options
-       *  (`agent_question::answer_is_quiet`); a client never sets it. */
       quiet?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3942,9 +3191,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A thread asked for the retired single-use Allow once card (ADR 0387).
-   *  History only: nothing emits it now. `PermissionRequestPrepared`
-   *  records the request that replaced it. */
   | {
       type: 'OwnerApprovalRequested';
       request_id: string;
@@ -3957,9 +3203,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A thread spent the retired single-use Allow once card on the act it
-   *  names (ADR 0387). History only: nothing emits it now, and
-   *  `PermissionSpent` records the spend that replaced it. */
   | {
       type: 'OwnerApprovalSpent';
       tool_use_id: string;
@@ -3974,7 +3217,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** An agent acted on a *machine-made workspace* with no card: the
+  /** INVARIANT: An agent acted on a *machine-made workspace* with no card: the
    *  workspace is the agent's. A stop, start, rename or autostart change
    *  comes from `api::workspace_broker`, and a snapshot restore from
    *  `api::snapshots`, which names the snapshot. Emitted before the act,
@@ -3992,22 +3235,13 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** CC requested permission for a tool call (e.g. Edit/Write/Bash on a path
-   *  outside cwd or under `.claude/`). Renders as a `PermissionCard` in the
-   *  thread; the user's answer resolves the deduped entry keyed by
-   *  `request_id` in `Engine.pending_cc_permission`. Persisted so the card
-   *  survives reload. */
   | {
       type: 'CodingAgentPermissionRequest';
       request_id: string;
       tool_use_id: string;
       tool_name: string;
-      /** The tool call's arguments, always a JSON object. */
       input: Record<string, unknown>;
       summary: string;
-      /** The grant each "Always allow"-style button stores (ADR 0571). `None`
-       *  on a card persisted before the engine stamped it, and on an
-       *  auto-deny, which renders already answered. */
       grant_offer?: GrantOffer;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4016,17 +3250,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** User answered (or system timed out) a `CodingAgentPermissionRequest`.
-   *  Emitted by the permission-prompt handler immediately after the oneshot
-   *  resolves, before returning to the MCP subprocess.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'CodingAgentPermissionResolved';
       request_id: string;
       allowed: boolean;
       reason?: string;
       persist_scope?: AllowScope;
-      /** The standing deny recorded by Always deny. */
       standing_deny?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4035,20 +3264,9 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The Lucidos Agent's command guard (ADR 0002) paused a bash/python tool
-   *  call to ask the user for permission: the `IrreversibleDanger` lane on a
-   *  `Chat` channel. The chat counterpart of `CodingAgentPermissionRequest`:
-   *  it renders the same `PermissionCard`, but the agent loop blocks
-   *  in-process on `Engine.pending_command_permission` (no MCP subprocess).
-   *  `tool_name` is one of the bash/python tools; `command` is the inspected
-   *  command text (the bash `command` or python `code`); `summary` is the
-   *  card's one-line description. Persisted so the card survives reload.
-   *  `grant_head` is the head a bash grant stores, after any leading `cd`
-   *  into the workspace root drops. The card cannot know the root, so it
-   *  labels its narrow and session buttons with it. `None` for python. */
   | {
       type: 'CommandPermissionRequested';
-      /** Deciding layer, static evidence and judge distribution. No command text. */
+      /** INVARIANT: Deciding layer, static evidence and judge distribution. No command text. */
       decision_trace?: string;
       request_id: string;
       tool_use_id: string;
@@ -4056,7 +3274,7 @@ export type ThreadEvent =
       command: string;
       summary: string;
       grant_head?: string;
-      /** The grants the card offers, which a click stores exactly. Absent on
+      /** INVARIANT: The grants the card offers, which a click stores exactly. Absent on
        *  a card raised before the engine stamped its offer. */
       grant_offer?: GrantOffer;
       /** Links this event back to the request that opened the turn. */
@@ -4066,20 +3284,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** User resolved a `CommandPermissionRequested` (or the engine resolved it
-   *  as superseded / orphaned). Chat counterpart of
-   *  `CodingAgentPermissionResolved`; `persist_scope` records the
-   *  "Always allow" / "Allow for this thread" scope the user picked so reload
-   *  reproduces the answered card. `None` covers Allow-once, Deny, and the
-   *  engine-emitted superseded/orphan resolutions. */
   | {
       type: 'CommandPermissionResolved';
       request_id: string;
       allowed: boolean;
       reason?: string;
       persist_scope?: AllowScope;
-      /** The *standing deny* line an Always deny click stored. `None` for
-       *  every other answer. */
       standing_deny?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4088,11 +3298,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The Lucidos Agent (chat) paused an MCP server tool call to ask the user
-   *  for permission, the chat counterpart of `CommandPermissionRequested` for
-   *  MCP tools. Renders the same `PermissionCard`; the agentic loop blocks
-   *  in-process on `Engine.pending_mcp_permission` until the user resolves it.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'McpPermissionRequested';
       request_id: string;
@@ -4108,14 +3313,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** User resolved an `McpPermissionRequested` (or the engine resolved it as
-   *  superseded / orphaned). Chat counterpart of `CommandPermissionResolved`;
-   *  `persist_scope` records which scope the user picked, so reload
-   *  reproduces the answered card. "Always allow this tool" is `narrow`
-   *  (`Mcp(server:tool)`), "Always allow this server" is `broad`
-   *  (`Mcp(server:*)`), and "Allow for this thread" is `session`.
-   *  `None` covers Allow-once,
-   *  Deny, and the engine-emitted superseded/orphan resolutions. */
   | {
       type: 'McpPermissionResolved';
       request_id: string;
@@ -4129,7 +3326,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The command guard bracketed a `ReversibleDanger` command (in-workspace
+  /** INVARIANT: The command guard bracketed a `ReversibleDanger` command (in-workspace
    *  destruction) with a snapshot of the workspace's git-visible content: ADR
    *  0002, Phase 4 and its counting addendum. The pre image lives on
    *  `refs/lucidos/command-checkpoints/<checkpoint_id>` and the post image on
@@ -4151,10 +3348,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user clicked Undo on a `CommandCheckpointed` card (or the engine
-   *  resolved it). The workspace working tree was restored from the checkpoint
-   *  ref and the ref deleted; the frontend renders the card as reverted.
-   *  Persisted so the reverted state survives reload. */
   | {
       type: 'CommandCheckpointReverted';
       checkpoint_id: string;
@@ -4165,11 +3358,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Worktree cleanup happened on this thread.
-   *  Tier 1 strips build artifacts. Tiers 0 and 2 remove the whole worktree.
-   *  `freed_bytes` is a best-effort sum and can be zero when metadata is missing.
-   *  Historical events can carry `branch_deleted: true` for a merged branch
-   *  removed during cleanup. Thread reclamation now keeps the branch. */
   | {
       type: 'WorktreeCleaned';
       tier: number;
@@ -4182,7 +3370,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A child thread spawned by `run_thread` / `run_coding_agent` finished its turn.
+  /** INVARIANT: A child thread spawned by `run_thread` / `run_coding_agent` finished its turn.
    *  Emitted on the **parent** thread by the EventBus fan-out fan-in path
    *  when the child reaches a terminal event (CC: `CodingAgentIdled` or
    *  `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`).
@@ -4192,22 +3380,9 @@ export type ThreadEvent =
       child_thread_id: string;
       child_thread_title?: string;
       status: ChildCompletionStatus;
-      /** Free-form summary: the prose body of the child's final
-       *  `ResponseGenerated` (truncated to 2000 chars), or the failure error
-       *  for `Failure`. Indexed by [`ThreadEvent::indexable_text`]. */
       summary: string;
-      /** IDs of changes the child left in `pending` state on its OWN branch.
-       *  Empty for chat children and for CC children that ended without
-       *  proposing anything. */
       pending_change_ids?: string[];
-      /** Pending changes held anywhere below the child: its sub-threads, at
-       *  any depth. Kept apart from `pending_change_ids` so the parent can
-       *  tell whose change is whose. An orchestrator's children hold the
-       *  changes while the orchestrator holds none. */
       sub_thread_pending_changes?: SubThreadPendingChange[];
-      /** The branch an integrated child hands up, for its parent's agent to
-       *  merge. Absent for an independent child, and for an integrated one
-       *  whose work is not hardened yet. */
       integrated_branch?: IntegratedBranch;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4216,13 +3391,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A child thread's report, filed on the **parent** without waking it.
-   *  A `no-wake` child files every report, whatever its status (ADR 0545).
-   *  Under another mode only a clean one files: an early batch report, or
-   *  one whose *wake decision* said the parent need not act now. Same
-   *  payload as `ChildThreadCompleted`, emitted by the same fan-in in its
-   *  place. It starts no turn and moves no status. The parent reads it on
-   *  its next turn. */
   | {
       type: 'ChildReportFiled';
       child_thread_id: string;
@@ -4239,11 +3407,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A user Stop ended a child thread's turn, and the child is now a
-   *  *stopped child*. Emitted on the **parent** by the same fan-in as
-   *  `ChildThreadCompleted`, in its place. It wakes nothing: the child is
-   *  alive, and the parent is still owed the `ChildThreadCompleted` that
-   *  settles it (ADR 0252). */
   | {
       type: 'ChildThreadStopped';
       child_thread_id: string;
@@ -4255,10 +3418,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A child thread was moved to top level: it is no longer this thread's
-   *  child. Emitted on the **former parent**, never on the child, so ADR
-   *  0011's "latest event is a card" predicates stay true on the child.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'ChildThreadDetached';
       child_thread_id: string;
@@ -4270,9 +3429,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The agent (LLM) asked to drop a prior `ToolCalled` (and its matching
-   *  `ToolResult`) or `ChildThreadCompleted` from future resume context.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'ContextDismissed';
       dismissed_event_id: string;
@@ -4283,7 +3439,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The agent asked to set one tool result's clock back to zero, by writing
+  /** INVARIANT: The agent asked to set one tool result's clock back to zero, by writing
    *  its address under `[KEEP OPEN]` in its working understanding.
    *  Full reasoning is on the Rust variant. */
   | {
@@ -4296,8 +3452,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The model's picture of the job, as it wrote it in its own reply.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'WorkingUnderstandingWritten';
       document: string;
@@ -4308,25 +3462,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A background Flash call produced a text description for one of the
-   *  images attached to a `MessageReceived`. Emitted from the agentic loop
-   *  after iteration 1 of a chat turn, one event per attached image hash,
-   *  all carrying the same description text. Gated by
-   *  `is_bad_image_description` so non-descriptions ("I don't see any
-   *  image") never persist.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'ImageDescribed';
-      /** The `MessageReceived` event id this description applies to. */
       source_event_id: string;
-      /** Sha256 hash of the described blob (matches one entry in
-       *  `MessageReceived.user_image_hashes`). */
       hash: string;
-      /** Flash output, post `is_bad_image_description` filter. */
       description: string;
-      /** The model that produced the description (e.g. `claude-haiku-4-5`,
-       *  `gemini-2.5-flash`). Backfilled rows carry the literal `"backfill"`
-       *  because the original model identity wasn't recorded. */
       model: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4335,18 +3475,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** An auxiliary model compressed this thread's older assistant turns into
-   *  one paragraph. Cached here so a later turn reuses it (ADR 0102).
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'ConversationSummarized';
-      /** The paragraph, exactly as the history block renders it. */
       summary: string;
-      /** The newest assistant turn this paragraph accounts for. */
       covers_through_event_id: string;
-      /** How many assistant turns went into it. */
       covered_count: number;
-      /** The model that produced it. */
       model: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4355,30 +3488,16 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread registered an **event wait**. Emitted by the `await_event`
-   *  tool between its `ToolCalled` and that call's `ToolResult`, and it is the
-   *  SOURCE OF TRUTH for the wait. There is no `thread_event_waits` table.
-   *  The dispatcher's live set is a cache rebuilt from these events at
-   *  boot (ADR 0011's shape applied to a new wake).
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'EventWaitStarted';
       wait_id: string;
-      /** The `await_event` call this wait is the other half of. */
       tool_use_id: string;
-      /** What the thread is watching for. Same shape and same matcher as a
-       *  trigger's `on:` list (`core::event_subscription`), per-entry OR. */
       on: EventSubscription[];
-      /** The model's own words for why it is waiting. Shown in the
-       *  waiting indicator and the thread card, so the user can tell an
-       *  asleep thread from a stalled one. */
       reason: string;
-      /** When the subscription was armed.
-       *  Full reasoning is on the Rust variant. */
       armed_at?: string;
       expires_at: string;
       background_timing?: BackgroundWaitTiming;
-      /** The event `sequence` at registration. Both the registration path and
+      /** INVARIANT: The event `sequence` at registration. Both the registration path and
        *  the boot rebuild scan forward from here. One mechanism therefore
        *  closes the restart gap and the live race between this emit and
        *  the cache insert. */
@@ -4390,7 +3509,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A background task changed its build-slot queue state or run deadline. */
   | {
       type: 'EventWaitTimingUpdated';
       wait_id: string;
@@ -4404,18 +3522,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A matching event resolved the wait. Carries the event so the delivery is
-   *  self-contained on replay rather than a reference that can dangle. */
   | {
       type: 'EventWaitDelivered';
       wait_id: string;
-      /** The `events` row that matched, for the card's deep-link. */
       event_id: string;
       event_type: string;
       payload: unknown;
-      /** Which `on:` entry matched. A wait is a rendezvous, not a stream, so
-       *  naming the entry is how the model learns which of several
-       *  subscriptions fired. */
       matched_index: number;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4424,7 +3536,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The wait passed its deadline. **Wakes the thread** with an explanatory
+  /** INVARIANT: The wait passed its deadline. **Wakes the thread** with an explanatory
    *  message rather than dropping it: a silently dropped wait is a
    *  permanently stalled thread, which is strictly worse than the polling it
    *  replaces. */
@@ -4438,7 +3550,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The subscription was stopped short of its own resolution. Note what is
+  /** INVARIANT: The subscription was stopped short of its own resolution. Note what is
    *  NOT a cause: neither an ordinary message into a subscribed thread nor a
    *  thread-level Stop disturbs a subscription, so neither a passing "how's
    *  it going?" nor stopping an unrelated turn can silently throw away a long
@@ -4457,13 +3569,8 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The *cache keep-alive status* of this thread changed. Only the
-   *  keep-alive tick writes it, and only on a change. It projects into
-   *  `thread_summaries.cache_keep_alive_status`, opens no turn, wakes
-   *  nobody and moves no recency (ADR 0529). */
   | {
       type: 'CacheKeepAliveStatusChanged';
-      /** Absent once the thread has nothing to keep warm. */
       status: CacheKeepAliveStatus;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4472,9 +3579,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user turned the cache keep-alive off for this thread (ADR 0554).
-   *  It projects into `thread_summaries.cache_keep_alive_off_at`, and holds
-   *  until the thread's next real request. Metadata: it moves nothing. */
   | {
       type: 'CacheKeepAliveTurnedOff';
       /** Links this event back to the request that opened the turn. */
@@ -4484,8 +3588,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user turned the cache keep-alive back on for this thread. It clears
-   *  `thread_summaries.cache_keep_alive_off_at`. */
   | {
       type: 'CacheKeepAliveTurnedOn';
       /** Links this event back to the request that opened the turn. */
@@ -4495,16 +3597,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread's *expected wake*: when it expects to wake next, from any
-   *  event wait or child it holds (ADR 0603). The newest one stands, and
-   *  the keep-alive plans its pings from it. Metadata: it moves nothing. */
   | {
       type: 'WakeExpected';
       at: string;
-      /** The odds per time bucket, when a System One model estimated it. */
       distribution?: WakeBucket[];
       source: WakeSource;
-      /** What the thread waits for, and why it should come by `at`. */
       reason: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4513,8 +3610,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A voice session opened on this thread (ADR 0148).
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'VoiceSessionStarted';
       session_id: string;
@@ -4525,14 +3620,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The voice session closed, and why.
+  /** INVARIANT: The voice session closed, and why.
    *  Full reasoning is on the Rust variant. */
   | {
       type: 'VoiceSessionEnded';
       session_id: string;
       reason: VoiceSessionEndReason;
-      /** How long the call lasted. Zero on a sweep-settled row, where the
-       *  engine that held the clock is gone. */
       duration_secs: number;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4541,19 +3634,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The talker said something out loud, and this is what it said.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'SpokenReplyGenerated';
       session_id: string;
       text: string;
-      /** The caller took the floor back, so only this much was heard. The
-       *  doer's own answer is in the thread in full either way.
-       *  Full reasoning is on the Rust variant. */
       interrupted: boolean;
-      /** How long the talker had been saying these words when the row was
-       *  written, so the transcript can read the row where they BEGAN.
-       *  Full reasoning is on the Rust variant. */
       spoken_secs_before?: number;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4562,8 +3647,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The caller said something on a call.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'SpokenMessageReceived';
       session_id: string;
@@ -4575,13 +3658,9 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The talker asked for the doer, and this is why.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'WorkDelegated';
       session_id: string;
-      /** The talker's own few words on what the caller wants.
-       *  Full reasoning is on the Rust variant. */
       reason: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4590,13 +3669,10 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user asked a side question.
-   *  Full reasoning is on the Rust variant. */
   | {
       type: 'SideQuestionAsked';
       side_question_id: string;
       question: string;
-      /** Blobs the user attached to the question. */
       image_hashes?: string[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4605,7 +3681,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The thread's agent answered the side question with this id. */
   | {
       type: 'SideQuestionAnswered';
       side_question_id: string;
@@ -4617,8 +3692,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The side question with this id got no answer. Startup recovery writes
-   *  one for every ask a restart left unsettled. */
   | {
       type: 'SideQuestionFailed';
       side_question_id: string;
@@ -4630,8 +3703,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user dismissed the card for this side question. The card collapses
-   *  to a row and can be reopened, so the ask stays recorded. */
   | {
       type: 'SideQuestionDismissed';
       side_question_id: string;
@@ -4642,15 +3713,10 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A widget instance was shown at this point in the thread (ADRs 0402,
-   *  0407, 0415). Nothing writes it any more: a reply embeds the widget
-   *  instead (ADR 0466). An old row still draws as an inline widget here. */
   | {
       type: 'WidgetShown';
       app_id: string;
-      /** The instance's *widget params*. Absent means none. */
       params?: Record<string, unknown>;
-      /** The instance's card label. Absent means the widget's name. */
       label?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4659,16 +3725,11 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Legacy: a widget instance was pinned to the thread's shelf, which is
-   *  gone. Nothing writes it any more. Only the dashboard seed reads it, for
-   *  Home's old pins (ADR 0496). */
   | {
       type: 'WidgetPinned';
       app_id: string;
       params?: Record<string, unknown>;
       label?: string;
-      /** The event whose reply drew the widget. Absent when the pin came
-       *  from nowhere in the thread. */
       shown_event_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4677,9 +3738,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Legacy: a widget instance was unpinned from the thread's shelf, which
-   *  is gone. Nothing writes it any more. Only the dashboard seed reads it,
-   *  for Home's old pins (ADR 0496). */
   | {
       type: 'WidgetUnpinned';
       app_id: string;
@@ -4692,9 +3750,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user or the agent picked the size of a widget instance's cards in
-   *  this thread. The newest one wins, and a card with none starts at the
-   *  widget's default size. No file changes. */
   | {
       type: 'InlineWidgetSized';
       app_id: string;
@@ -4707,9 +3762,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** This thread switched an MCP server on for itself, so its requests now
-   *  carry the server's tools (ADR 0430). Projected into
-   *  `thread_summaries.enabled_mcp_servers`. */
   | {
       type: 'ThreadMcpServerEnabled';
       server_id: string;
@@ -4721,8 +3773,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** This thread switched an MCP server off for itself. The process keeps
-   *  running for the threads that still use it. */
   | {
       type: 'ThreadMcpServerDisabled';
       server_id: string;
@@ -4734,9 +3784,6 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Legacy, read only: the home thread's arrangement of one layout, from
-   *  before each dashboard had its own tiles (ADR 0432). Nothing writes it
-   *  now. With Home's old pins it seeds each dashboard (ADR 0496). */
   | {
       type: 'HomeBoardArranged';
       layout: Dashboard;
@@ -4861,8 +3908,6 @@ export type TransientEvent =
       type: 'AppUiCaptureRequested';
       app_id: string;
       request_id: string;
-      /** Set when the agent saves the capture as a file. The frame then
-       *  renders at the device pixel ratio, in this format. */
       save_format?: CaptureFormat;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -4871,19 +3916,14 @@ export type TransientEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A *widget fit check*. The chosen page renders the widget at each size,
-   *  on the desk tile and the phone column, at `ui_scale`. It answers with
-   *  `POST /api/v1/widgets/fit-report`. */
   | {
       type: 'WidgetFitRequested';
       app_id: string;
       request_id: string;
       sizes: WidgetSize[];
       ui_scale: number;
-      /** The device that uses `ui_scale`, so the frames' first paint
-       *  carries it. Absent when the workspace-wide scale is the largest. */
       scale_device_id?: string;
-      /** Public selection handle, never the renderer credential. Its actor
+      /** INVARIANT: Public selection handle, never the renderer credential. Its actor
        *  is the verified source thread, rather than an impersonated Device. */
       renderer_session_id?: string;
       renderer_device_id?: string;

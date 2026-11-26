@@ -11,7 +11,7 @@
 //! For a frontend-only change the engine binary is unchanged, so a newer client
 //! built from that diff IS compatible. This module waits for the build-watch to
 //! republish `dist/`, re-snapshots it into a fresh generation, and atomically
-//! swaps what `api::serve_frontend` serves — so the served `sw.js` BUILD_ID
+//! swaps what `api::serve_frontend` serves — so the served shell's build ID
 //! advances and the EXISTING client-update surface (`syncClientUpdateFromBuild`
 //! → badge + Refresh toast) fires, with no engine respawn. Mixed changes still go
 //! through the Switch flow (`join_or_start_background_rebuild`), which re-snapshots at
@@ -464,7 +464,7 @@ impl LucidosEngine {
     /// After a *frontend-only* Apply (engine binary unchanged), wait for the
     /// build-watch to republish `dist/`, then re-snapshot it into a fresh
     /// generation and atomically swap what the engine serves — so the served
-    /// `sw.js` BUILD_ID advances and the client refresh badge/toast surface
+    /// shell's build ID advances and the client refresh badge and toast surface
     /// WITHOUT an engine respawn. The caller must only invoke this for a
     /// frontend-only, Lucidos-source change, which keeps INV-A.
     ///

@@ -127,7 +127,8 @@ on arrival.
 big card), type the digits, or open the address. The cards are alternatives, so
 each after the first says "Or". The digits are always there, large enough to
 read across a desk. On your own network or tailnet, typing them works when a
-scan fails. Through a tunnel, open the address instead.
+scan fails. Through a tunnel or proxy, open the address or paste it into
+**Pairing secret or link** on the new device.
 
 The two fallbacks
 carry a Copy button, hidden where the browser has no clipboard (a plain-HTTP
@@ -190,14 +191,15 @@ fail, and each failure spends part of the gateway's wrong-guess budget for the
 minute. After the first attempt, the app treats the launch as carrying no code.
 
 **An app already on the home screen cannot be reached that way**, since its
-launch URL is fixed. The pairing screen inside the app offers three ways
-across:
+launch URL is fixed. Use the pairing screen inside the app:
 
 - **From the browser on the same phone.** It is a separate device with its own
   credential, so it is often still paired when the app is not. Open the same
   address there and mint a code under Settings → Access. The screen says so
   when it runs as an installed app.
 - **Paste code.** The browser screen offers Copy, and the pasteboard is shared.
+- **Pairing secret or link.** Paste the copied address or a secret from
+  `lucidos pair`, then tap **Pair**.
 - **Scan QR.** The app opens its own camera and reads the QR off the host's
   screen. It shows on a phone over HTTPS, where a camera can open at all. An
   expired code leaves no QR, so the host makes a fresh one first.
@@ -209,8 +211,7 @@ copy on every page load. If one is lost anyway, the device still shows under
 Settings → Devices. Pairing again adds a second row rather than repairing the
 first, so revoke the older one.
 
-Typing the eight digits still works everywhere, and is what a desktop browser
-does.
+On the local network or tailnet, you can also type the eight digits.
 
 ### The list of devices lives in Settings → Devices
 
@@ -225,7 +226,7 @@ Access adds a device. **Settings → Devices** lists every device and holds
 | **Revoke** | the whole machine | Stops this device reaching Lucidos, on every workspace. |
 | **Remove** | this workspace | Forgets its push subscription and its preferences here, and leaves it paired. |
 
-Device preferences include **Agent brand colours** in **Settings → Appearance & Behavior**.
+Device preferences include **Agent icon colors** in **Settings → Appearance & Behavior**.
 Removing a device forgets that choice here along with its other preferences.
 
 Both halves key on the id the gateway minted at pairing, so each device has one

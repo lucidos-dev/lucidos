@@ -1,6 +1,3 @@
-//! API e2e for the *intelligence ladder* (ADR 0500, ADR 0525): the route that
-//! serves each *ladder surface*, and the refusal of an agent's pick off it.
-
 use crate::support::{as_stamped_workspace_call, base_url, local_process_client, user_client};
 use lucidos_engine::engine::thread_events::SpawnVerdict;
 use serde_json::json;
@@ -20,8 +17,6 @@ async fn get_ladder_at(route: &str, query: &str) -> serde_json::Value {
     resp.json().await.expect("ladder response was not JSON")
 }
 
-/// The shipped Claude Code ladder serves every shipped pair, the ones that
-/// are on matching the shipped list, and the default rung reads 1.0×.
 #[tokio::test]
 async fn the_route_serves_the_claude_code_ladder_with_its_default_rung() {
     let ladder = get_ladder("?surface=claude-code").await;
@@ -61,7 +56,6 @@ async fn the_route_serves_the_claude_code_ladder_with_its_default_rung() {
     assert_eq!(default["time"]["label"], "1.0×", "{default}");
 }
 
-/// Codex ships its own default, so its bands compare against it.
 #[tokio::test]
 async fn the_codex_ladder_compares_against_its_own_default() {
     let ladder = get_ladder("?surface=codex").await;
@@ -69,8 +63,6 @@ async fn the_codex_ladder_compares_against_its_own_default() {
     assert_eq!(ladder["reference"], ladder["default_rung"], "{ladder}");
 }
 
-/// The old route and its `coding_agent` parameter still serve the same
-/// ladder.
 #[tokio::test]
 async fn the_coding_agent_route_still_serves_the_ladder() {
     let old = get_ladder_at("coding-agent/intelligence-ladder", "?coding_agent=codex").await;
@@ -78,9 +70,6 @@ async fn the_coding_agent_route_still_serves_the_ladder() {
     assert_eq!(get_ladder("?coding_agent=codex").await["surface"], "codex");
 }
 
-/// The chat ladder names no backend. Its bands count from the account's chat
-/// default when that has an estimate, else from Claude Code's default rung.
-/// Every served pair has one row.
 #[tokio::test]
 async fn the_route_serves_the_chat_ladder() {
     let ladder = get_ladder("?surface=chat").await;
@@ -95,7 +84,6 @@ async fn the_route_serves_the_chat_ladder() {
             "one row per model and effort: {ladder}"
         );
     }
-    // The e2e engine runs the mock model, which has no row and so no estimate.
     let default_estimated = rungs
         .iter()
         .any(|r| r["is_default"] == true && r["estimated"] == true);
@@ -109,7 +97,6 @@ async fn the_route_serves_the_chat_ladder() {
 
 const TRIGGER_NAME: &str = "ladder e2e off-ladder trigger";
 
-/// The owner may pin a trigger to a pair off the chat ladder.
 #[tokio::test]
 async fn a_persons_off_ladder_trigger_model_is_not_refused() {
     let client = user_client().await;
@@ -150,9 +137,6 @@ async fn a_persons_off_ladder_trigger_model_is_not_refused() {
         .expect("DELETE /triggers failed");
 }
 
-/// A coding-agent spawn whose repo does not exist, so no request here starts
-/// a thread: a refusal before the repo check is the ladder's, after it the
-/// repo's.
 fn off_ladder_spawn(mode: &str) -> serde_json::Value {
     json!({
         "message": "test",
@@ -189,9 +173,6 @@ async fn send_chat(
     )
 }
 
-/// An agent's pick off the ladder is refused, naming the ladder. An agent
-/// request needs attested provenance, here a stamped cross-workspace caller:
-/// an unstamped one is refused earlier, as unattested.
 #[tokio::test]
 async fn an_agents_off_ladder_pick_is_refused() {
     let mut spawn = off_ladder_spawn("agent");
@@ -215,7 +196,6 @@ async fn an_agents_off_ladder_pick_is_refused() {
     );
 }
 
-/// The same pick from a person passes the ladder and stops at the repo.
 #[tokio::test]
 async fn a_persons_off_ladder_pick_is_not_refused_for_the_ladder() {
     let (status, body) = post_chat(&user_client().await, off_ladder_spawn("human")).await;
@@ -223,8 +203,6 @@ async fn a_persons_off_ladder_pick_is_not_refused_for_the_ladder() {
     assert_ne!(body["reason"], "off-intelligence-ladder", "{body}");
 }
 
-/// An agent starting a chat thread on a pair off the Lucidos Agent's ladder is
-/// refused, naming its rungs.
 #[tokio::test]
 async fn an_agents_off_ladder_chat_pick_is_refused() {
     let spawn = json!({
@@ -245,10 +223,6 @@ async fn an_agents_off_ladder_chat_pick_is_refused() {
     );
 }
 
-/// Copy from Lucidos Agent writes a coding agent's override, so it refuses the
-/// chat surface itself, which would copy the ladder onto its own source. The
-/// write itself is covered in `runtime::chat_ladder`, since a copy here would
-/// change the Claude Code ladder the tests above read.
 #[tokio::test]
 async fn copy_from_chat_refuses_the_chat_surface() {
     let resp = user_client()
@@ -271,8 +245,6 @@ async fn copy_from_chat_refuses_the_chat_surface() {
     );
 }
 
-/// Sort by intelligence on a ladder that already climbs restates the shipped
-/// rungs, so it stores nothing and the ladder stays uncustomised.
 #[tokio::test]
 async fn sorting_a_climbing_ladder_restates_it_and_stores_nothing() {
     let before = get_ladder("?surface=claude-code").await;
@@ -291,7 +263,6 @@ async fn sorting_a_climbing_ladder_restates_it_and_stores_nothing() {
     assert_eq!(after["climbs"], true, "{after}");
 }
 
-/// A thread's alternative ladders use its reference and never repeat its backend.
 #[tokio::test]
 async fn thread_ladder_serves_other_installed_backends_on_a_common_reference() {
     let pool = sqlx::PgPool::connect(&crate::support::db_url())

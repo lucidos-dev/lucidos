@@ -55,8 +55,6 @@ pub(crate) struct QueryFilters<'a> {
     pub until: Option<&'a str>,
     pub before_event_id: Option<&'a str>,
     pub after_event_id: Option<&'a str>,
-    /// One thread only. Absent is every thread, which is what this command
-    /// always sent before the filter existed.
     pub thread_id: Option<&'a str>,
     pub limit: Option<u32>,
 }
@@ -76,7 +74,6 @@ pub(crate) struct CountFilters<'a> {
     pub event_type: Option<&'a str>,
     pub since: Option<&'a str>,
     pub until: Option<&'a str>,
-    /// One thread only. Absent is every thread.
     pub thread_id: Option<&'a str>,
 }
 
@@ -91,9 +88,6 @@ pub(crate) fn cmd_count(ws: &Workspace, filters: CountFilters<'_>) -> Result<(),
     send_and_print("GET", &url, req)
 }
 
-/// Print one thread's liveness on stderr, so stdout stays parseable JSON. A
-/// failed read, or an engine without the route, prints nothing: an absent
-/// header claims nothing.
 fn print_liveness_header(ws: &Workspace, thread_id: Option<&str>) {
     let Some(thread_id) = thread_id else {
         return;
@@ -105,12 +99,10 @@ fn print_liveness_header(ws: &Workspace, thread_id: Option<&str>) {
         .filter(|response| response.status().is_success())
         .and_then(|response| response.json::<Value>().ok());
     if let Some(line) = liveness.as_ref().and_then(liveness_header_line) {
-        // User-facing CLI output on stderr, beside the JSON on stdout.
         eprintln!("{line}");
     }
 }
 
-/// `# thread: working · running · session 2 (handoff, 9 min) · active 4 s ago`.
 pub(crate) fn liveness_header_line(liveness: &Value) -> Option<String> {
     let mut parts = vec![
         liveness.get("state")?.as_str()?.to_string(),
@@ -189,10 +181,6 @@ pub(crate) fn build_count_params(filters: &CountFilters<'_>) -> Vec<(&'static st
     params
 }
 
-/// Build the query-string params for `cmd_query`. Extracted so we can unit
-/// test that `--before-event-id` / `--after-event-id` reach the server as
-/// `before_event_id` / `after_event_id` (snake_case — the engine doesn't
-/// accept the kebab form).
 pub(crate) fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(t) = filters.event_type {
@@ -332,9 +320,6 @@ mod tests {
         assert_eq!(obj["summary"], Value::String("new".into()));
     }
 
-    /// `--before-event-id` and `--after-event-id` must reach the engine as
-    /// `before_event_id` / `after_event_id` (snake_case). Clap kebab-cases
-    /// the flags, so we have to translate ourselves.
     #[test]
     fn build_query_params_serializes_cursor_flags_as_snake_case() {
         let params = build_query_params(&QueryFilters {

@@ -1,6 +1,3 @@
-//! The stored archivable sub-thread count against the press's own preflight,
-//! and the projection's recount requests.
-
 use super::*;
 use crate::engine::event_bus::{BusEvent, EmittedEvent};
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
@@ -36,7 +33,6 @@ async fn spawn(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
     id
 }
 
-/// Leave a row as a finished turn does, then apply `set`.
 async fn settle(pool: &PgPool, id: Uuid, set: &str) {
     for sql in [
         "UPDATE thread_summaries SET status = 'idle', has_response = TRUE, \
@@ -96,7 +92,6 @@ fn drain(requests: &mut UnboundedReceiver<Uuid>) -> Vec<Uuid> {
     out
 }
 
-/// The threads a `ChildrenCountChanged` rebroadcast named, with their count.
 fn rebroadcast(events: &mut Receiver<EmittedEvent>) -> Vec<(Uuid, i64)> {
     let mut out = Vec::new();
     while let Ok(e) = events.try_recv() {

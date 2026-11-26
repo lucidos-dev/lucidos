@@ -3,6 +3,7 @@
 //! Part of the `LucidosEngine` inherent impl, split from engine_impl.rs.
 
 use super::super::*;
+use crate::core::subprocess_origin::subprocess_origin_env_vars;
 
 /// Wall-clock budget for a scheduled `.sh` task: the tool call limit, which the Seatbelt watcher covers.
 const SHELL_SCRIPT_TIMEOUT_SECS: u64 = crate::llm::tools::MAX_TIMEOUT_SECS;
@@ -86,11 +87,11 @@ impl LucidosEngine {
     ) -> ScriptEnv {
         let mut env = named_secret_env_vars(&self.pool, mentions).await;
         let mut vars = self
-            .build_env_without_secrets(
+            .build_env_without_secrets(subprocess_origin_env_vars(
                 thread_id,
                 crate::scheduler::user_tasks::current_event_trigger_depth(),
                 emitting_trigger_id,
-            )
+            ))
             .await;
         vars.append(&mut env.vars);
         env.vars = vars;
@@ -113,7 +114,7 @@ impl LucidosEngine {
         let depth =
             crate::scheduler::user_tasks::chain_depth_for_thread(thread_id).unwrap_or_default();
         let mut env_vars = self
-            .build_env_without_secrets(Some(thread_id), depth, None)
+            .build_env_without_secrets(subprocess_origin_env_vars(Some(thread_id), depth, None))
             .await;
         env_vars.extend(
             crate::runtime::spawn_env::agent_compile_env(sandbox, worktree)
@@ -130,12 +131,25 @@ impl LucidosEngine {
         Ok(env_vars)
     }
 
+    /// Env for the event hook `slug`'s script: what a trigger script gets, but
+    /// never a secret, and the hook's own origin token.
+    pub async fn build_event_hook_env_vars(
+        &self,
+        chain_depth: u32,
+        slug: &str,
+    ) -> Vec<(String, String)> {
+        self.build_env_without_secrets(crate::core::subprocess_origin::event_hook_origin_env_vars(
+            chain_depth,
+            slug,
+        ))
+        .await
+    }
+
     /// Everything a Lucidos-spawned subprocess gets except the secrets.
+    /// `origin` is its [`subprocess_origin_env_vars`] or a hook's token.
     async fn build_env_without_secrets(
         &self,
-        thread_id: Option<Uuid>,
-        chain_depth: u32,
-        emitting_trigger_id: Option<&str>,
+        origin: Vec<(&'static str, String)>,
     ) -> Vec<(String, String)> {
         use crate::core::EnvironmentVariableStore;
 
@@ -152,9 +166,7 @@ impl LucidosEngine {
         env_vars.extend(engine_owned_script_env(
             self.workspace_path(),
             ps_shim_dir.as_deref(),
-            thread_id,
-            chain_depth,
-            emitting_trigger_id,
+            origin,
         ));
         env_vars
     }
@@ -566,9 +578,7 @@ pub async fn mask_stored_events(
 fn engine_owned_script_env(
     workspace: &std::path::Path,
     ps_shim_dir: Option<&std::path::Path>,
-    thread_id: Option<Uuid>,
-    chain_depth: u32,
-    emitting_trigger_id: Option<&str>,
+    origin: Vec<(&'static str, String)>,
 ) -> Vec<(String, String)> {
     use crate::runtime::lucidos_cli::{lucidos_cli_dir, workspace_script_env_vars};
 
@@ -587,24 +597,14 @@ fn engine_owned_script_env(
     // string must reach nothing (ADR 0481).
     env_vars.extend(crate::core::lucidos_database_url_env());
 
-    // Subprocess-origin env (token + optional source thread id), from the one
-    // definition in `api::actor::subprocess_origin_env_vars`. So a future
-    // subprocess surface (MCP child, signer host, …) cannot ship without
-    // origin attribution, the failure mode that grew the original incident.
+    // The origin token, and the source thread when there is one. Every script
+    // env takes it as an argument, so a future subprocess surface cannot ship
+    // without origin attribution. That gap grew the original incident.
     //
-    // The depth is read by the caller, inline, because a script trigger
-    // builds its env inside the fire's own scope. It is what lets the
-    // script's `lucidos events emit` stay on the fire's chain instead of
-    // restarting it at 0 on the axum request task.
-    env_vars.extend(
-        crate::core::subprocess_origin::subprocess_origin_env_vars(
-            thread_id,
-            chain_depth,
-            emitting_trigger_id,
-        )
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v)),
-    );
+    // The caller reads the depth inline, because a script trigger builds its
+    // env inside the fire's own scope. So the script's `lucidos events emit`
+    // stays on the fire's chain instead of restarting at 0.
+    env_vars.extend(origin.into_iter().map(|(k, v)| (k.to_string(), v)));
 
     // Host-process kill-guard env (LUCIDOS_HOST_PID + optional
     // FRONTEND_PID + optional API_PORT), from one definition too. Without it,
@@ -683,7 +683,11 @@ mod tests {
     fn a_script_env_gets_the_read_only_handle_and_no_libpq_defaults() {
         crate::test_support::install_agent_database_url();
         let workspace = tempfile::TempDir::new().expect("tempdir");
-        let env = engine_owned_script_env(workspace.path(), None, Some(Uuid::new_v4()), 0, None);
+        let env = engine_owned_script_env(
+            workspace.path(),
+            None,
+            subprocess_origin_env_vars(Some(Uuid::new_v4()), 0, None),
+        );
         for name in [
             "PGUSER",
             "PGPASSWORD",
@@ -890,8 +894,11 @@ mod tests {
         fn script_environment_handles_stay_reachable_in_the_sandbox() {
             crate::test_support::install_agent_database_url();
             let workspace = tempfile::tempdir().unwrap();
-            let env =
-                engine_owned_script_env(workspace.path(), None, Some(Uuid::new_v4()), 0, None);
+            let env = engine_owned_script_env(
+                workspace.path(),
+                None,
+                subprocess_origin_env_vars(Some(Uuid::new_v4()), 0, None),
+            );
             crate::runtime::agent_sandbox::env_guard_tests::assert_spawn_env_reachable(
                 workspace.path(),
                 env,

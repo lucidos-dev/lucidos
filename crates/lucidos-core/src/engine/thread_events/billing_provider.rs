@@ -1,4 +1,4 @@
-//! Secret-free evidence of the backend a coding-agent process reports.
+//! INVARIANT: Secret-free evidence of the backend a coding-agent process reports.
 //!
 //! Model ids, account directories and the engine's own provider settings are
 //! deliberately not inputs. A caller must bind observations to the process
@@ -7,7 +7,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The backend and billing contract, independently of the coding agent/model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BillingProvider {
@@ -35,14 +34,11 @@ impl BillingProvider {
         }
     }
 
-    /// Plan-backed usage must be presented as list-price equivalent, rather
-    /// than claiming that the token estimate was an additional charge.
     pub fn is_plan(self) -> bool {
         matches!(self, Self::AnthropicSubscription | Self::ChatgptPlan)
     }
 }
 
-/// The billing basis, without asserting an invoice amount or remaining quota.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BillingMode {
@@ -52,7 +48,6 @@ pub enum BillingMode {
     Unknown,
 }
 
-/// The CLI response that supplied this observation. Never an auth file path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BillingEvidenceSource {
@@ -71,7 +66,6 @@ pub enum UnresolvedBillingReason {
     ConflictingEvidence,
 }
 
-/// Sanitized config evidence; a sparse config needs the typed provider report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexEndpointConfig {
     Unknown,
@@ -79,7 +73,6 @@ pub enum CodexEndpointConfig {
     BuiltinCompatible,
 }
 
-/// `modelProvider/list` distinguishes builtin routing from arbitrary providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexProviderEndpoints {
     Unavailable,
@@ -135,7 +128,7 @@ impl CodexProviderEndpoints {
         let [provider] = openai.as_slice() else {
             return Self::Other;
         };
-        // The typed builtin has no auth or routing settings. Its null baseUrl
+        // INVARIANT: The typed builtin has no auth or routing settings. Its null baseUrl
         // selects the auth-dependent builtin endpoint, not a missing report.
         if response["defaultProviderId"] == "openai"
             && provider["settings"] == serde_json::json!({"type": "openai"})
@@ -153,7 +146,7 @@ impl CodexProviderEndpoints {
     }
 }
 
-/// Only allowlisted values survive parsing: no raw response, credential,
+/// INVARIANT: Only allowlisted values survive parsing: no raw response, credential,
 /// account identifier, email or endpoint is serializable through this type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
@@ -178,7 +171,7 @@ impl Default for BillingAttribution {
 }
 
 impl BillingAttribution {
-    /// The complete status section is built inside the serving CLI, after
+    /// INVARIANT: The complete status section is built inside the serving CLI, after
     /// wrapper and managed settings. Endpoint overrides appear as base URL
     /// rows. Missing/changed schemas fail closed; no URL is retained.
     pub fn claude_default_endpoint(status: &Value) -> bool {
@@ -234,8 +227,6 @@ impl BillingAttribution {
             Self::Known { .. } => BillingMode::TokenMetered,
         }
     }
-    /// Config and account are read from the same running app-server. A custom
-    /// endpoint must not inherit the builtin provider's name or billing mode.
     pub fn codex_endpoint_checked(self, config_is_default: bool) -> Self {
         if !config_is_default && matches!(self, Self::Known { .. }) {
             Self::unresolved(
@@ -247,7 +238,7 @@ impl BillingAttribution {
         }
     }
 
-    // Older servers can omit inherited endpoint overrides from config/read.
+    // INVARIANT: Older servers can omit inherited endpoint overrides from config/read.
     // Absence is not evidence of default routing.
     pub fn codex_default_endpoints(response: &Value) -> bool {
         let config = &response["config"];
@@ -283,7 +274,7 @@ impl BillingAttribution {
         Self::Unresolved { reason, source }
     }
 
-    /// The account in the *running process's* initialize control reply.
+    /// INVARIANT: The account in the *running process's* initialize control reply.
     /// Third-party transport wins over account/key fields: managed policy can
     /// override a key or subscription present in the same environment.
     pub fn claude_initialize(body: &Value) -> Self {
@@ -306,7 +297,7 @@ impl BillingAttribution {
                     {
                         P::AnthropicSubscription
                     }
-                    // `none` alone also describes an unknown bearer token;
+                    // INVARIANT: `none` alone also describes an unknown bearer token;
                     // apiKeyHelper may front an arbitrary endpoint.
                     _ => {
                         return Self::unresolved(UnresolvedBillingReason::UnknownAuthMethod, Source)
@@ -319,9 +310,6 @@ impl BillingAttribution {
         Self::known(provider, Source)
     }
 
-    /// Combine the effective thread provider with account/read from the same
-    /// app-server. `openai` in a transcript alone does not distinguish a key
-    /// from a ChatGPT plan. Unknown/custom providers are never called OpenAI.
     pub fn codex_account(model_provider: Option<&str>, body: &Value) -> Self {
         use BillingEvidenceSource::CodexAccount as Source;
         use UnresolvedBillingReason as R;

@@ -3,7 +3,6 @@ use std::{borrow::Cow, fmt};
 pub const BETA_FEED_URL: &str = "https://updates.lucidos.dev/beta/latest.json";
 pub const NIGHTLY_FEED_URL: &str = "https://updates.lucidos.dev/nightly/latest.json";
 
-/// A validated name, kept separately from the `custom:` wire prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomName(String);
 
@@ -60,7 +59,6 @@ impl Channel {
         }
     }
 
-    /// Lower ranks are more stable. Local and Custom have no stability promise.
     pub fn stability_rank(&self) -> Option<u8> {
         match self {
             Self::Stable => Some(0),
@@ -70,7 +68,6 @@ impl Channel {
         }
     }
 
-    /// Nightly stays reserved until a later decision builds and publishes it.
     pub fn serves(&self, install_shape: Option<InstallShape>) -> bool {
         match self {
             Self::Stable | Self::Custom(_) => true,
@@ -86,12 +83,9 @@ impl fmt::Display for Channel {
     }
 }
 
-/// How this install takes an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallShape {
-    /// The macOS `.app`, updated in place by the client's Tauri updater.
     DesktopApp,
-    /// A headless tarball install, updated by re-running `install.sh`.
     InstallerRerun,
 }
 

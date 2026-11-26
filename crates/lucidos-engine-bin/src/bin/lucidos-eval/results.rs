@@ -1,10 +1,3 @@
-//! The results file: append-only JSONL, one file per invocation, three row
-//! kinds.
-//!
-//! Append-only is what makes a run resumable. A repeat whose rows are already
-//! present and complete is skipped, so an interrupted night continues rather
-//! than restarting and paying twice.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -19,43 +12,21 @@ use crate::probe::Outcome;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The projection's word for a thread doing nothing right now.
 pub const IDLE_STATUS: &str = "idle";
 
-/// A thread that parked on an event wait, woke, and then finished.
-///
-/// Its own word, because the projection calls both the park and the finish
-/// `idle`. Only the driver watched the wake happen, so only the driver can
-/// write this down.
 pub const WOKEN_STATUS: &str = "idle-after-wake";
 
-/// A thread still holding an event wait when its deadline arrived.
 pub const PARKED_STATUS: &str = "parked";
 
-/// A thread whose every attempt at a turn came back with no text and no tool
-/// call, so it never started its task.
-///
-/// Its own word for the same reason a park has one. The projection calls this
-/// thread `idle` too, and recording that would hide the whole defect: a thread
-/// that did nothing read as a task that was attempted and did not deliver.
 pub const EMPTY_STATUS: &str = "empty-completion";
 
-/// Row statuses that mean the task ran to the end.
 pub const FINISHED_STATUSES: [&str; 2] = [IDLE_STATUS, WOKEN_STATUS];
 
-/// How big a run was meant to be. A label, and nothing reads it as a gate.
-///
-/// It gated the retired verdict, which only a `confirmatory` run could print.
-/// ADR 0110 leaves it as what a reader calls the run in the report's first
-/// line. A resume still refuses to change it under you.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunConfig {
-    /// A few tasks, one repeat, to debug the harness.
     Smoke,
-    /// The whole task set, one or a few repeats.
     Pilot,
-    /// The sized run, whose numbers are meant to be read.
     Confirmatory,
 }
 
@@ -87,20 +58,11 @@ pub enum ResultRow {
     Completion(CompletionRow),
 }
 
-/// What one task's completion probe resolved to.
-///
-/// Three values, and none of them is a *probe outcome*. Delivery and fidelity
-/// are separate axes, so they share no vocabulary and no rate. `Void` means the
-/// same thing here as there: this measured nothing, and it is never a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompletionOutcome {
-    /// The deliverable is there and is right.
     Pass,
-    /// The task ran and did not deliver.
     Fail,
-    /// An upstream task failed, or the pair measured something other than the
-    /// configuration, so delivery was not asked.
     Void,
 }
 
@@ -110,7 +72,6 @@ impl CompletionOutcome {
     }
 }
 
-/// One task's delivery, in one arm of one repeat.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompletionRow {
     pub run_id: String,
@@ -129,41 +90,18 @@ pub struct RunRow {
     pub model: String,
     pub fixture_hash: String,
     pub guidance_hash: String,
-    /// I8: the price table is part of what makes a cost figure reproducible.
     pub prices_hash: String,
-    /// Precondition P3. A run without read-by-id is a pilot at best.
     pub read_by_id: bool,
     pub config: RunConfig,
     pub repeats: u32,
     pub tasks: Vec<String>,
     pub arms: Vec<Arm>,
-    /// The context window this run declared, in tokens (ADR 0110 decision 9).
-    ///
-    /// Part of the configuration, so a budget sweep can pool several runs and
-    /// still tell them apart. Defaulted, so a run recorded before the sweep
-    /// existed reads zero and groups on its own.
     #[serde(default)]
     pub context_window: i64,
-    /// What this run's arm workspaces and databases were named after.
-    ///
-    /// `eval-<run_label>-<arm>-<repeat>`, so a reader of the file can find the
-    /// databases again and a concurrent run against another provider never
-    /// collides with this one. Defaulted, so a run recorded before the label
-    /// existed reads empty, which is what its unlabelled names were.
     #[serde(default)]
     pub run_label: String,
-    /// How old a result got before a sweep could take it, in rounds.
-    ///
-    /// This and the interval below are the schedule the lean arm ran at, and
-    /// two schedules are two designs. `guidance_hash` covers them only while
-    /// the prompt quotes both. It also names nothing a reader can act on when
-    /// it differs, so the numbers are recorded beside it.
-    ///
-    /// Defaulted, so a run recorded before the schedule was stamped reads
-    /// zero. No run can pin zero, so it reads as unrecorded.
     #[serde(default)]
     pub expire_after_rounds: usize,
-    /// How often the sweep ran, in rounds.
     #[serde(default)]
     pub sweep_every_rounds: usize,
 }
@@ -178,149 +116,61 @@ pub struct ThreadRow {
     pub rounds: i64,
     pub cache_creation: i64,
     pub cache_read: i64,
-    /// Everything the model processed on input, cached tokens INCLUDED. Split
-    /// it with [`ThreadRow::input_split`] before pricing any of it.
     #[serde(alias = "input_tokens")]
     pub input_total: i64,
     pub output_tokens: i64,
-    /// The part of the four counts above spent on auxiliary work.
-    ///
-    /// The title, the memory extractor and the summariser, which run on a
-    /// cheaper model than the one under test. Recorded because an arm making
-    /// more auxiliary calls should be readable as such. Defaulted, so a run
-    /// recorded before the split existed reads zero.
     #[serde(default)]
     pub auxiliary_tokens: TokenCounts,
-    /// Whether the thread had stopped writing when it was snapshotted.
-    ///
-    /// Auxiliary work runs detached, so a snapshot taken the moment the driver
-    /// leaves can miss it. `false` says the harness waited and the log was
-    /// still growing, which puts every count on this row in doubt.
-    ///
-    /// Named for the log rather than for the auxiliary work, because the log is
-    /// what was watched. A call in flight writes nothing, so `true` is elapsed
-    /// quiet and not a completion the harness could join.
-    ///
-    /// `None` on a run recorded before the harness waited at all. Those runs
-    /// snapshotted at once, so a late title landed after the row was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_log_settled: Option<bool>,
     pub todo_writes: i64,
-    /// Replies that carried a working-understanding span.
-    ///
-    /// This and the two below are defaulted, so a run recorded before they
-    /// existed still parses. [`crate::metrics::DocumentWrites`] carries why
-    /// they are the three worth counting.
     #[serde(default)]
     pub document_writes: i64,
-    /// Writes that shared their reply with a tool call. Moving the document out
-    /// of a tool call worked only if this tracks the line above.
     #[serde(default)]
     pub writes_with_a_tool_call: i64,
-    /// Addresses the model held open, over the whole thread.
     #[serde(default)]
     pub items_held_open: i64,
     pub recovery_calls: BTreeMap<String, i64>,
     pub wall_secs: i64,
-    /// Every dollar the thread caused, each model at its own pinned rate.
     pub usd: f64,
-    /// The part of `usd` spent on auxiliary work, at the auxiliary model's rate.
-    ///
-    /// Defaulted, so a run recorded before the split existed reads zero. Such a
-    /// run priced every token at the main model's rate, which is the defect
-    /// this field exists to make visible.
     #[serde(default)]
     pub usd_auxiliary: f64,
     pub status: String,
     pub unscripted_answers: u32,
-    /// When the task's first round was captured. I7 reads this to prove the
-    /// arms interleaved.
     pub started: Option<DateTime<Utc>>,
-    /// T12's handover length, recorded as a covariate so a long document
-    /// cannot score by accident without a reader noticing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handover_lines: Option<i64>,
-    /// Whether the engine retrieved memory on this thread at all.
-    ///
-    /// The query classifier decides that, and it is an LLM call. When the two
-    /// arms disagree on one task, the pair measures the classifier rather than
-    /// the flag, and `analyse` voids it. The field defaults, because a run
-    /// recorded before it existed must still parse. Both arms then read false,
-    /// which is agreement and voids nothing.
     #[serde(default)]
     pub memory_recalled: bool,
-    /// Recovery calls after round 2 that re-fetch a handle the thread already
-    /// fetched. Defaulted, so a run recorded before it existed still parses.
     #[serde(default)]
     pub repeat_recoveries: i64,
-    /// Rounds where the engine trimmed the context to fit the budget.
-    ///
-    /// The only field that says whether this thread reached the ceiling at all.
-    /// Defaulted, so a run recorded before it existed reads zero, which is what
-    /// those runs measured.
     #[serde(default)]
     pub trimmed_rounds: i64,
-    /// The largest request this thread sent, in the engine's own token
-    /// estimate. The peak is what decides whether a thread ever felt its
-    /// budget, so it is recorded per thread rather than averaged away.
     #[serde(default)]
     pub peak_request_tokens: i64,
-    /// The mean request over this thread's rounds, in the same units.
-    ///
-    /// Reported beside the peak because the two say different things. A high
-    /// mean is a thread that carried a lot all along. A high peak over a low
-    /// mean is one round that spiked.
     #[serde(default)]
     pub mean_request_tokens: i64,
-    /// The context window the engine resolved for this thread's model.
-    ///
-    /// Read off the thread's own captures, not from the run row. A mis-seeded
-    /// window then shows up as a thread disagreeing with its own run.
     #[serde(default)]
     pub context_window: i64,
-    /// Turns the model ended with no text and no tool call, every attempt
-    /// counted. Above zero with a finished status, a re-post recovered it.
     #[serde(default)]
     pub empty_completions: i64,
-    /// Prompts the driver re-posted to recover one of those turns.
     #[serde(default)]
     pub empty_retries: i64,
-    /// Turns the provider refused with no output, every attempt counted.
-    /// Above zero with a finished status, a re-post recovered it.
     #[serde(default)]
     pub refusals: i64,
-    /// Prompts the driver re-posted to recover one of those turns.
     #[serde(default)]
     pub refusal_retries: i64,
-    /// Sequence of the prompt that opened turn two, as the driver posted it.
-    ///
-    /// Recorded rather than counted, because a re-posted turn leaves more than
-    /// one prompt behind it. Absent on a one-turn task, and on a run recorded
-    /// before the driver wrote it: the scorer falls back to counting there,
-    /// which is what those runs meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followup_sequence: Option<i64>,
-    /// Whether a Tree arm's compactor had caught up when this row was written.
-    ///
-    /// A Tree arm waits for it once the thread settles. The next task then
-    /// reads the trees it was designed to read, and this row prices the
-    /// compactor's calls. `false` says the bound arrived first. `None` on a
-    /// Classic arm, which runs no compactor, so a Classic row keeps its bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_caught_up: Option<bool>,
 }
 
 impl ThreadRow {
-    /// Whether the driver saw this task through to the end, a wake included.
-    ///
-    /// The scoring layer voids every probe of a thread that did not finish.
-    /// Reading the status by hand would void a woken thread's whole task, which
-    /// is the measurement this change exists to keep.
     pub fn finished(&self) -> bool {
         FINISHED_STATUSES.contains(&self.status.as_str())
     }
 
-    /// Take the cached parts out of the input total.
     pub fn input_split(&self) -> InputSplit {
         InputSplit::from_total(self.input_total, self.cache_read, self.cache_creation)
     }
@@ -340,13 +190,11 @@ pub struct ProbeRow {
     pub outcome: Outcome,
 }
 
-/// Append-only writer over one run's file.
 pub struct ResultsFile {
     path: PathBuf,
 }
 
 impl ResultsFile {
-    /// Path of the results file for a run id, under the results directory.
     pub fn path_for(results_dir: &Path, run_id: &str) -> PathBuf {
         results_dir.join(format!("{run_id}.jsonl"))
     }
@@ -362,10 +210,6 @@ impl ResultsFile {
         &self.path
     }
 
-    /// Append one row and flush it.
-    ///
-    /// Flushed per row on purpose. A killed run must leave every completed
-    /// repeat on disk, or the resume skips nothing and the night is paid twice.
     pub fn append(&self, row: &ResultRow) -> Fallible<()> {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -381,10 +225,6 @@ impl ResultsFile {
     }
 }
 
-/// Read every row of a results file, refusing a line that does not parse.
-///
-/// A silently skipped line would drop a repeat from the analysis, which reads
-/// as a smaller sample rather than as a broken file.
 pub fn read_rows(path: &Path) -> Fallible<Vec<ResultRow>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -403,11 +243,6 @@ pub fn read_rows(path: &Path) -> Fallible<Vec<ResultRow>> {
     Ok(rows)
 }
 
-/// Refuse a resume whose arguments contradict the run already in the file.
-///
-/// The recorded row is what the analysis reads, and it is written once. A
-/// resume under a different config, task set, model or fixture would append
-/// rows the analysis then reports under the first run's metadata.
 pub fn check_resume_matches(recorded: &RunRow, wanted: &RunRow) -> Fallible<()> {
     let differences: Vec<String> = [
         ("config", recorded.config.as_str(), wanted.config.as_str()),
@@ -419,9 +254,6 @@ pub fn check_resume_matches(recorded: &RunRow, wanted: &RunRow) -> Fallible<()> 
             &wanted.guidance_hash,
         ),
         ("prices_hash", &recorded.prices_hash, &wanted.prices_hash),
-        // The label decides which databases the rows came out of. Resuming
-        // under a different one reads a different set of workspaces and files
-        // the result under this run's metadata.
         ("run_label", &recorded.run_label, &wanted.run_label),
     ]
     .into_iter()
@@ -434,9 +266,6 @@ pub fn check_resume_matches(recorded: &RunRow, wanted: &RunRow) -> Fallible<()> 
             wanted.tasks.join(",")
         )
     }))
-    // The window and the arms are the rest of the configuration, and the
-    // analysis groups on them. Resuming under either changed would append rows
-    // the report then files under the first run's configuration.
     .chain((recorded.context_window != wanted.context_window).then(|| {
         format!(
             "the context window was {} and is now {}",
@@ -456,8 +285,6 @@ pub fn check_resume_matches(recorded: &RunRow, wanted: &RunRow) -> Fallible<()> 
             names(&wanted.arms)
         )
     }))
-    // The schedule is the rest of the design. Resuming under a different one
-    // appends rows swept at a schedule the run row does not name.
     .chain(schedule_change(recorded, wanted))
     .collect();
     if differences.is_empty() {
@@ -472,10 +299,6 @@ pub fn check_resume_matches(recorded: &RunRow, wanted: &RunRow) -> Fallible<()> 
     .into())
 }
 
-/// How the sweep schedule moved between the recorded run and this one.
-///
-/// One sentence covering both numbers, because they are one schedule and a
-/// reader comparing two runs wants to see the pair.
 fn schedule_change(recorded: &RunRow, wanted: &RunRow) -> Option<String> {
     let both = |run: &RunRow| format!("{}/{}", run.expire_after_rounds, run.sweep_every_rounds);
     (recorded.expire_after_rounds != wanted.expire_after_rounds
@@ -489,23 +312,13 @@ fn schedule_change(recorded: &RunRow, wanted: &RunRow) -> Option<String> {
         })
 }
 
-/// How far one repeat got, read off the rows earlier invocations wrote.
 #[derive(Debug, Default, PartialEq)]
 pub struct RepeatProgress {
-    /// How many of the run's tasks, from the first, every arm has a verdict on.
     pub reached: usize,
-    /// Per arm, the reached tasks that did not finish. They void the tasks
-    /// below them exactly as they did in the invocation that ran them.
     pub failed: BTreeMap<Arm, BTreeSet<String>>,
-    /// Per arm, the last thread it drove. Its workspace must still hold it.
     pub last_threads: BTreeMap<Arm, Uuid>,
 }
 
-/// Where a resume picks this repeat up, at a task boundary.
-///
-/// A task is reached once every arm has its completion row, which the pair
-/// verdict writes last. Rows for a task short of that mean an invocation died
-/// inside it. Its workspaces then hold half a task, so this refuses the resume.
 pub fn repeat_progress(rows: &[ResultRow], run: &RunRow, repeat: u32) -> Fallible<RepeatProgress> {
     let mut verdicts: BTreeSet<(Arm, &str)> = BTreeSet::new();
     let mut threads: BTreeMap<(Arm, &str), &ThreadRow> = BTreeMap::new();
@@ -558,7 +371,6 @@ pub fn repeat_progress(rows: &[ResultRow], run: &RunRow, repeat: u32) -> Fallibl
                         failed.insert(task.clone());
                     }
                 }
-                // No thread row is a task this arm was blocked from running.
                 None => {
                     failed.insert(task.clone());
                 }
@@ -568,11 +380,6 @@ pub fn repeat_progress(rows: &[ResultRow], run: &RunRow, repeat: u32) -> Fallibl
     Ok(progress)
 }
 
-/// Repeats already finished in these rows, so a resume can skip them.
-///
-/// Complete means [`repeat_progress`] reached every task the run declared, so
-/// one rule decides both a skip and a continuation. A **voided** task counts as
-/// reached: its pair verdict still writes a completion row per arm.
 pub fn completed_repeats(rows: &[ResultRow]) -> BTreeSet<u32> {
     let Some(run) = rows.iter().find_map(|row| match row {
         ResultRow::Run(run) => Some(run),
@@ -683,8 +490,6 @@ mod tests {
         }
     }
 
-    /// The file is append-only and older runs must keep parsing. A row from
-    /// before the field reads as no retrieval, which is agreement in both arms.
     #[test]
     fn a_thread_row_written_before_the_retrieval_field_still_parses() {
         let mut row: serde_json::Value =
@@ -700,9 +505,6 @@ mod tests {
         }
     }
 
-    /// Same append-only rule for the utilisation fields. A run recorded before
-    /// they existed reads zero, which is honestly what it measured: nobody was
-    /// recording how full those requests were.
     #[test]
     fn a_thread_row_written_before_the_utilisation_fields_still_parses() {
         let mut row: serde_json::Value =
@@ -728,10 +530,6 @@ mod tests {
         }
     }
 
-    /// A run recorded before per-model pricing reads no auxiliary split.
-    ///
-    /// That is honest about what it measured. Such a run priced every token at
-    /// the main model's rate, so it could not tell auxiliary spend apart.
     #[test]
     fn a_thread_row_written_before_the_auxiliary_split_still_parses() {
         let mut row: serde_json::Value =
@@ -752,7 +550,6 @@ mod tests {
         }
     }
 
-    /// Rows written before `input_tokens` was renamed still load.
     #[test]
     fn the_old_input_field_name_still_reads() {
         let mut row: serde_json::Value =
@@ -768,8 +565,6 @@ mod tests {
         }
     }
 
-    /// A woken thread ran its task to the end, so its probes must still score.
-    /// A park, a timeout and an empty thread did not, and theirs are voided.
     #[test]
     fn a_thread_that_woke_and_finished_counts_as_finished() {
         let row = |status: &str| ThreadRow {
@@ -787,9 +582,6 @@ mod tests {
         assert!(!row("failed").finished());
     }
 
-    /// A run recorded before the re-posts existed reads as no empty completions,
-    /// no refusals and no boundary. That is what those runs measured: one prompt
-    /// per turn, and no re-post to move it.
     #[test]
     fn a_thread_row_written_before_the_repost_fields_still_parses() {
         let mut row: serde_json::Value =
@@ -801,7 +593,6 @@ mod tests {
         for field in ["empty_retries", "refusals", "refusal_retries"] {
             object.remove(field).expect("the field is written");
         }
-        // The boundary is skipped when absent, so an old row looks the same.
         assert!(!object.contains_key("followup_sequence"));
 
         let parsed: ResultRow = serde_json::from_value(row).unwrap();
@@ -816,8 +607,6 @@ mod tests {
         }
     }
 
-    /// A run recorded before the harness waited reads as unrecorded, never as
-    /// a boundary that was reached. Those runs snapshotted at once.
     #[test]
     fn a_thread_row_written_before_the_settle_wait_reads_as_unrecorded() {
         let mut row: serde_json::Value =
@@ -856,7 +645,6 @@ mod tests {
         );
     }
 
-    /// A void measured nothing. Pass and fail are the two that count.
     #[test]
     fn only_a_scored_completion_outcome_counts() {
         assert!(CompletionOutcome::Pass.is_scored());
@@ -864,8 +652,6 @@ mod tests {
         assert!(!CompletionOutcome::Void.is_scored());
     }
 
-    /// The file is append-only, so a run recorded before completion probes
-    /// existed still reads. It simply says nothing about delivery.
     #[test]
     fn a_results_file_written_before_completion_rows_still_parses() {
         let rows = [run_row(), thread_row(1, Arm::LEAN, "T01"), probe_row()];
@@ -931,8 +717,6 @@ mod tests {
         assert!(err.contains("config was smoke and is now confirmatory"));
     }
 
-    /// The label decides which databases the rows are read out of, so resuming
-    /// under a new one measures a different set of workspaces.
     #[test]
     fn a_resume_that_changed_the_run_label_is_refused() {
         let wanted = RunRow {
@@ -949,8 +733,6 @@ mod tests {
         );
     }
 
-    /// A run recorded before the label existed still parses, and reads as the
-    /// unlabelled workspaces it actually created.
     #[test]
     fn a_run_recorded_before_the_run_label_parses_as_unlabelled() {
         let line = r#"{"kind":"run","run_id":"abc","started":"2026-01-01T00:00:00Z",
@@ -962,8 +744,6 @@ mod tests {
             ResultRow::Run(run) => {
                 assert!(run.run_label.is_empty());
                 assert_eq!(run.context_window, 0);
-                // Zero is no schedule, so it reads as unrecorded rather than
-                // as a run that swept every zero rounds.
                 assert_eq!(run.expire_after_rounds, 0);
                 assert_eq!(run.sweep_every_rounds, 0);
             }
@@ -971,8 +751,6 @@ mod tests {
         }
     }
 
-    /// Two schedules are two designs, and the rows do not say which they were
-    /// swept at. Pooling them into one file reports a design nothing ran.
     #[test]
     fn a_resume_that_changed_the_sweep_schedule_is_refused() {
         for wanted in [
@@ -993,7 +771,6 @@ mod tests {
         }
     }
 
-    /// The refusal quotes both numbers, so an operator can see which moved.
     #[test]
     fn the_schedule_refusal_names_the_pair_on_both_sides() {
         let wanted = RunRow {
@@ -1022,9 +799,6 @@ mod tests {
         }
     }
 
-    /// A voided task leaves probe rows, a void verdict and no thread row. The
-    /// repeat is still finished, and re-running it would pay for a whole
-    /// sequence run twice.
     #[test]
     fn a_repeat_whose_last_task_was_voided_is_still_complete() {
         let mut rows = vec![run_row()];
@@ -1045,8 +819,6 @@ mod tests {
         assert!(completed_repeats(&rows).contains(&1));
     }
 
-    /// The last task's thread rows landed and its verdict rows did not. That
-    /// repeat is cut off, not finished, so it is never skipped.
     #[test]
     fn a_repeat_missing_its_last_verdict_is_not_complete() {
         let mut rows = vec![run_row()];
@@ -1068,7 +840,6 @@ mod tests {
         })
     }
 
-    /// Both arms ran `task` to the end and got a verdict.
     fn finished_task(repeat: u32, task: &str) -> Vec<ResultRow> {
         let mut rows = Vec::new();
         for arm in [Arm::CONTROL, Arm::LEAN] {
@@ -1088,8 +859,6 @@ mod tests {
         assert!(progress.failed.values().all(BTreeSet::is_empty));
     }
 
-    /// The chunked run: an invocation stopped after T01, so the next one
-    /// continues at T02 in the same workspaces.
     #[test]
     fn a_repeat_stopped_at_a_task_boundary_continues_after_it() {
         let mut rows = vec![run_row()];
@@ -1100,8 +869,6 @@ mod tests {
         assert!(progress.failed.values().all(BTreeSet::is_empty));
     }
 
-    /// The failure set is what voids downstream tasks, so a resume must rebuild
-    /// it exactly: an arm that timed out failed, and so did one never let run.
     #[test]
     fn a_resume_rebuilds_which_tasks_failed_in_each_arm() {
         let mut rows = vec![run_row()];
@@ -1113,7 +880,6 @@ mod tests {
             ..timed_out
         }));
         rows.push(verdict_row(1, Arm::CONTROL, "T01", CompletionOutcome::Fail));
-        // Blocked: void probe rows and a void verdict, and no thread.
         rows.push(verdict_row(1, Arm::LEAN, "T01", CompletionOutcome::Void));
         let progress = repeat_progress(&rows, &bare_run_row(), 1).unwrap();
         assert_eq!(progress.reached, 1);
@@ -1123,8 +889,6 @@ mod tests {
         assert!(!progress.last_threads.contains_key(&Arm::LEAN));
     }
 
-    /// Rows for a task with no verdict from every arm mean an invocation died
-    /// inside it. The resume refuses to drive the next task onto half a task.
     #[test]
     fn a_repeat_cut_off_inside_a_task_is_refused() {
         let mut rows = vec![run_row()];
@@ -1156,7 +920,6 @@ mod tests {
     #[test]
     fn a_written_file_reads_back_as_the_rows_that_went_in() {
         let dir = tempfile::tempdir().unwrap();
-        // A results dir that does not exist yet, as on a first run.
         let file = ResultsFile::open(&dir.path().join("results"), "abc").unwrap();
         let written = vec![run_row(), thread_row(1, Arm::LEAN, "T01"), probe_row()];
         for row in &written {

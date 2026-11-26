@@ -1,5 +1,6 @@
 use super::*;
-use crate::engine::event_bus::EventBus;
+use crate::engine::event_bus::{Asked, EventBus, HookRefusal};
+use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
 /// Hold kinds this caller will send the agent back for.
 #[derive(Debug, Default, Clone, Copy)]
@@ -21,7 +22,7 @@ impl HoldReentry {
 }
 
 /// What a turn end did with the branch's work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProposeOutcome {
     /// The change is pending under this id.
     Proposed(Uuid),
@@ -33,6 +34,27 @@ pub enum ProposeOutcome {
     /// The thread's change waits in the landing lane under this id. It is
     /// frozen, so the turn's work stays unproposed until it lands or fails.
     AwaitingLanding(Uuid),
+    /// An event hook refused the proposal, so the work stays unproposed as
+    /// `hook_refused` (ADR 0746).
+    Refused(HookRefusal),
+}
+
+/// A proposal read against the branch's open change, before it is asked about.
+enum Proposal {
+    /// Nothing to record: the open change under this id already says it, or
+    /// it is set aside and no new work arrived.
+    Unchanged(Uuid),
+    Record(Box<ProposalRecord>),
+}
+
+struct ProposalRecord {
+    change_id: Uuid,
+    /// The open change is set aside: bring it back, then record.
+    brought_back: Option<(ThreadEvent, EventMeta)>,
+    /// An open change already existed, so the changes list must refresh.
+    reproposed: bool,
+    event: ThreadEvent,
+    meta: EventMeta,
 }
 
 /// What withholding a turn end's work did with the branch's open change.
@@ -375,17 +397,20 @@ impl LucidosEngine {
             }
         }
 
-        let ProposeChangeInput {
-            thread_id,
-            branch_name,
-            repo_root,
-            description,
-            files,
-            requires_restart,
-            channel,
-            hardened,
-            origin,
-        } = input;
+        // Asked before anything moves: a refusal must not discard a sibling
+        // change or bring back a set-aside one (ADR 0746).
+        let proposal = self.prepare_proposal(&input).await?;
+        let asked = match &proposal {
+            Proposal::Unchanged(_) => None,
+            Proposal::Record(record) => match self
+                .event_bus
+                .ask_hooks(input.thread_id, &record.event, &record.meta)
+                .await
+            {
+                Ok(asked) => Some(asked),
+                Err(refusal) => return self.withhold_refused_proposal(&input, refusal).await,
+            },
+        };
 
         // Reconcile the "a coding-agent thread has at most one open change"
         // invariant BEFORE proposing on this branch: discard any open change
@@ -396,30 +421,50 @@ impl LucidosEngine {
         // state this proposal is about to set. Same-branch
         // multi-change is preserved (keep = same branch). See
         // docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
-        self.discard_open_changes_for_thread_except(thread_id, origin.clone(), |c| {
-            c.branch_name == branch_name
+        self.discard_open_changes_for_thread_except(input.thread_id, input.origin.clone(), |c| {
+            c.branch_name == input.branch_name
         })
         .await;
 
-        self.emit_change_proposed(ProposeChangeInput {
-            thread_id,
-            branch_name,
-            repo_root,
-            description,
-            files,
-            requires_restart,
-            channel,
-            hardened,
-            origin,
-        })
-        .await
-        .map(ProposeOutcome::Proposed)
+        let change_id = match proposal {
+            Proposal::Unchanged(change_id) => change_id,
+            Proposal::Record(record) => self.record_proposal(input.thread_id, *record, asked).await,
+        };
+        Ok(ProposeOutcome::Proposed(change_id))
     }
 
-    /// The emit half of [`propose_change`], WITHOUT its sibling-discard
-    /// reconcile. If an open change already exists for this branch, reuse its
-    /// `change_id` and re-emit `ChangeProposed`; otherwise mint a new one. New
-    /// work on a set-aside change brings it back first (ADR 0328).
+    /// Withhold work an event hook refused to see proposed, as a proposal hold
+    /// withholds it: an open change the branch moved past is withdrawn.
+    async fn withhold_refused_proposal(
+        &self,
+        input: &ProposeChangeInput<'_>,
+        refusal: HookRefusal,
+    ) -> Result<ProposeOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        log_legacy!(
+            "[Changes] Not proposing branch {} for thread {}: {}",
+            input.branch_name,
+            input.thread_id,
+            refusal
+        );
+        let moved = branch_moved_since_last_idle(
+            &self.pool,
+            input.thread_id,
+            Path::new(input.repo_root),
+            input.branch_name,
+        )
+        .await;
+        let reason = Some(UnproposedReason::HookRefused);
+        if withhold_work(&self.event_bus, input, moved, reason, false).await?
+            == OpenChangeAfterHold::Withdrawn
+        {
+            self.broadcast_changes_updated().await;
+        }
+        Ok(ProposeOutcome::Refused(refusal))
+    }
+
+    /// Record a correction to the branch's open change, WITHOUT the sibling
+    /// discard or the hook ask of [`propose_change`]. A correction proposes
+    /// nothing new, so it is a recording site (ADR 0746).
     ///
     /// Split out because `reconcile_emptied_pending_change` must correct a row
     /// without resolving anything: routing it through `propose_change` would
@@ -429,17 +474,30 @@ impl LucidosEngine {
     /// exactly the "engine never resolves a change on the user's behalf" rule
     /// (`cca058432`) this feature is built around. The sibling discard belongs
     /// to a genuinely NEW proposal, not to a correction.
-    ///
-    /// The `needs_emit` guard short-circuits when no field changed — without
-    /// it, every CC end-of-turn would re-emit identical events and inflate
-    /// history. A proposal is always finished work, so it clears an
-    /// `incomplete` mark a row from before ADR 0400 still carries.
-    async fn emit_change_proposed(
+    async fn emit_change_correction(
         &self,
         input: ProposeChangeInput<'_>,
     ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(match self.prepare_proposal(&input).await? {
+            Proposal::Unchanged(change_id) => change_id,
+            Proposal::Record(record) => self.record_proposal(input.thread_id, *record, None).await,
+        })
+    }
+
+    /// Read `input` against the branch's open change. Reuse its `change_id`
+    /// when there is one, otherwise mint a new one. New work on a set-aside
+    /// change brings it back first (ADR 0328).
+    ///
+    /// Unchanged when no field differs. Without that, every CC end-of-turn
+    /// would re-emit identical events and inflate history. A proposal is always
+    /// finished work, so it clears an `incomplete` mark a row from before ADR
+    /// 0400 still carries.
+    async fn prepare_proposal(
+        &self,
+        input: &ProposeChangeInput<'_>,
+    ) -> Result<Proposal, Box<dyn std::error::Error + Send + Sync>> {
         let ProposeChangeInput {
-            thread_id,
+            thread_id: _,
             branch_name,
             repo_root,
             description,
@@ -447,8 +505,8 @@ impl LucidosEngine {
             requires_restart,
             channel,
             hardened,
-            origin,
-        } = input;
+            ref origin,
+        } = *input;
 
         let existing = self
             .changes()
@@ -474,60 +532,92 @@ impl LucidosEngine {
         let set_aside = existing
             .as_ref()
             .is_some_and(|e| e.status() == ChangeStatus::SetAside);
-        if set_aside && !new_work {
-            return Ok(change_id);
+        if !needs_emit || (set_aside && !new_work) {
+            return Ok(Proposal::Unchanged(change_id));
         }
+        Ok(Proposal::Record(Box::new(ProposalRecord {
+            change_id,
+            brought_back: set_aside.then(|| {
+                (
+                    ThreadEvent::ChangeBroughtBack {
+                        change_id: change_id.to_string(),
+                    },
+                    EventMeta::with_actor(origin.clone()),
+                )
+            }),
+            reproposed: existing.is_some(),
+            event: ThreadEvent::ChangeProposed {
+                content: crate::engine::thread_events::ChangeContent::from_files(files),
+                change_id: change_id.to_string(),
+                description: Some(description.to_string()),
+                files: files.to_vec(),
+                requires_restart,
+                origin: origin.clone(),
+                commit_sha: None,
+                branch_name: branch_name.to_string(),
+                repo_root: repo_root.to_string(),
+                hardened,
+                incomplete: false,
+                set_aside: false,
+                path: String::new(),
+                diff: String::new(),
+            },
+            meta: EventMeta {
+                channel: Some(channel),
+                ..EventMeta::NONE
+            },
+        })))
+    }
 
-        if needs_emit {
-            if set_aside {
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ChangeBroughtBack {
-                                change_id: change_id.to_string(),
-                            },
-                            meta: crate::engine::thread_events::EventMeta::with_actor(
-                                origin.clone(),
-                            ),
-                        },
-                        "[Changes] ChangeBroughtBack (new work)",
-                    )
-                    .await;
-            }
+    /// Record a prepared proposal. `asked` is the hooks' leave, `None` only for
+    /// a correction. A failed record is logged, as a lost re-emit always was.
+    async fn record_proposal(
+        &self,
+        thread_id: Uuid,
+        record: ProposalRecord,
+        asked: Option<Asked>,
+    ) -> Uuid {
+        use crate::engine::event_bus::BusEvent;
+        if let Some((event, meta)) = record.brought_back {
             self.event_bus
                 .emit_or_log(
-                    crate::engine::event_bus::BusEvent::Thread {
+                    BusEvent::Thread {
                         thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ChangeProposed {
-                            content: crate::engine::thread_events::ChangeContent::from_files(files),
-                            change_id: change_id.to_string(),
-                            description: Some(description.to_string()),
-                            files: files.to_vec(),
-                            requires_restart,
-                            origin,
-                            commit_sha: None,
-                            branch_name: branch_name.to_string(),
-                            repo_root: repo_root.to_string(),
-                            hardened,
-                            incomplete: false,
-                            set_aside: false,
-                            path: String::new(),
-                            diff: String::new(),
-                        },
-                        meta: crate::engine::thread_events::EventMeta {
-                            channel: Some(channel),
-                            ..crate::engine::thread_events::EventMeta::NONE
-                        },
+                        event,
+                        meta,
                     },
-                    "[Changes] ChangeProposed",
+                    "[Changes] ChangeBroughtBack (new work)",
                 )
                 .await;
-            if existing.is_some() {
-                self.broadcast_changes_updated().await;
-            }
         }
-        Ok(change_id)
+        let (event, meta) = (record.event, record.meta);
+        let recorded = match asked {
+            Some(asked) => {
+                self.event_bus
+                    .emit_asked(asked, thread_id, event, meta)
+                    .await
+            }
+            None => {
+                self.event_bus
+                    .emit(BusEvent::Thread {
+                        thread_id,
+                        event,
+                        meta,
+                    })
+                    .await
+            }
+        };
+        if let Err(e) = recorded {
+            log_legacy!(
+                "[Changes] ChangeProposed emit failed for {}: {}",
+                thread_id,
+                e
+            );
+        }
+        if record.reproposed {
+            self.broadcast_changes_updated().await;
+        }
+        record.change_id
     }
 
     /// Whether an open change already names `branch_name`. An unanswered read
@@ -621,12 +711,12 @@ impl LucidosEngine {
             existing.id,
             existing.file_count
         );
-        // `emit_change_proposed`, NOT `propose_change`: the latter first
+        // `emit_change_correction`, NOT `propose_change`: the latter first
         // discards every other pending change the thread holds, which would
         // turn this correction into a resolution of a sibling change that may
         // still hold real work. It broadcasts the corrected row itself.
         if let Err(e) = self
-            .emit_change_proposed(ProposeChangeInput {
+            .emit_change_correction(ProposeChangeInput {
                 thread_id,
                 branch_name,
                 repo_root: &repo_root.to_string_lossy(),

@@ -1,18 +1,3 @@
-//! Handler for the grouped `notifications` tool — the agent-facing path to the
-//! notification inbox (list / mark_read / mark_all_read). Schema is built from
-//! the capability parity manifest (`capability_manifest::build_llm_tool`); this
-//! is the in-process handler the schema dispatches to.
-//!
-//! Sending a notification stays on the separate `send_notification` tool (its
-//! rich `tap` schema is a poor fit for the grouped union). The pre-consolidation
-//! flat `read_notifications` tool name still dispatches here (action defaults to
-//! `list`) so cached prompts/threads keep working — see `Domain::llm_aliases`.
-//!
-//! Mutating actions emit `NotificationRead` / `NotificationsAllRead` with
-//! `actor: None`: the agent is the actor and attribution flows via the
-//! surrounding `MessageReceived` / `ToolCalled` events, exactly as
-//! `execute_emit_event` does.
-
 use uuid::Uuid;
 
 use super::{LucidosEngine, ToolOutcome};
@@ -23,11 +8,7 @@ use crate::scheduler::NotificationStore;
 
 #[easy_ext::ext(NotificationsExt)]
 pub(crate) impl LucidosEngine {
-    /// Dispatch a grouped `notifications` tool call. `name` is the invoked tool
-    /// name so the legacy `read_notifications` alias can default `action` to
-    /// `list`.
     async fn execute_notifications(&self, name: &str, args: &serde_json::Value) -> ToolOutcome {
-        // The retired flat tool only ever listed, and callers pass no `action`.
         let default_action = if name == tn::READ_NOTIFICATIONS {
             "list"
         } else {
@@ -170,9 +151,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Action discriminator values the grouped handler recognises. A unit test
-/// asserts this matches the notifications domain's manifest actions, so adding a
-/// manifest operation without a handler arm (or vice-versa) fails `cargo test`.
 #[cfg(test)]
 pub(crate) fn recognized_actions() -> Vec<&'static str> {
     vec!["list", "mark_read", "mark_all_read"]

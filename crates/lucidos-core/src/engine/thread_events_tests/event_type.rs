@@ -1,15 +1,6 @@
 use super::*;
 use serde_json::json;
 
-/// Drift guard: `RESERVED_TYPE_NAMES` must list every variant.
-///
-/// The truth comes from serde, which defines the wire names, rather than from a
-/// hand-written sample of 85 constructors that can itself go stale. Feed an
-/// internally tagged enum an unknown tag and it names every variant it would
-/// have accepted. That list is what the const has to cover.
-///
-/// A miss means `emit_event` would let an app write a permanent domain row
-/// under that thread-event name.
 #[test]
 fn reserved_type_names_cover_every_variant() {
     let err = serde_json::from_value::<ThreadEvent>(json!({ "type": "NoSuchVariant" }))
@@ -48,9 +39,6 @@ fn reserved_type_names_cover_every_variant() {
     }
 }
 
-/// Every name in `INDEXABLE_EVENT_TYPES` reaches an arm of `indexable_text`.
-/// The list gates that match, so a listed type with no arm would load rows
-/// into a memory rebuild only to index none of them.
 #[test]
 fn every_indexable_event_type_indexes_text() {
     for name in ThreadEvent::INDEXABLE_EVENT_TYPES {
@@ -71,8 +59,6 @@ fn every_indexable_event_type_indexes_text() {
     }
 }
 
-/// A row the rename migration never reached still reads back under the new
-/// name, and writes back under it.
 #[test]
 fn a_user_prompt_injected_row_reads_back_as_prompt_injected() {
     let event: ThreadEvent = serde_json::from_value(json!({
@@ -491,12 +477,6 @@ fn transient_event_serializes() {
     );
 }
 
-/// Legacy persisted-row replay: any row written under a name we have since
-/// renamed must still deserialize via the `#[serde(alias)]` declarations on the
-/// new variant names, and must report the CANONICAL name from `event_type()` so
-/// every downstream list keyed on that string keeps matching. Most of these
-/// come from the T7 rename batch; `MemorySearched` is the 2026-08-12 split of
-/// the automatic pre-turn recall away from the `memory` tool's own search.
 #[test]
 fn legacy_event_names_deserialize_via_alias() {
     let cases: &[(&str, &str)] = &[
@@ -567,10 +547,7 @@ fn legacy_event_names_deserialize_via_alias() {
 
 #[test]
 fn all_db_event_types_have_variants() {
-    // Every known DB event_type string must round-trip through serde deserialization.
-    // Old format (unit variants) and new format (struct variants) must both work.
     let known_types = vec![
-        // Chat
         r#"{"type":"MessageReceived","text":"hi"}"#,
         r#"{"type":"TextStreamed","text":"t"}"#,
         r#"{"type":"Thinking","text":"hmm"}"#,
@@ -581,24 +558,14 @@ fn all_db_event_types_have_variants() {
         r#"{"type":"MemoryRecalled","results":1,"queries":["birthday"],"memories":[{"id":"00000000-0000-0000-0000-000000000001","topic":"family","summary":"Birthday is in May","src_created_at":"2026-01-02T03:04:05Z","source":{"type":"event","id":"00000000-0000-0000-0000-000000000002"}}]}"#,
         r#"{"type":"ToolCalled","name":"x","args":{}}"#,
         r#"{"type":"ToolResult","name":"x","result":"ok"}"#,
-        // TodoListWritten — empty + full list, all three statuses
         r#"{"type":"TodoListWritten","items":[]}"#,
         r#"{"type":"TodoListWritten","items":[{"content":"Run tests","active_form":"Running tests","status":"in_progress"}]}"#,
         r#"{"type":"TodoListWritten","items":[{"content":"a","active_form":"doing a","status":"pending"},{"content":"b","active_form":"doing b","status":"completed"}]}"#,
-        // Legacy event types (ContextAssembled, ContextTokensMeasured) retired
-        // — the test below covers ContextCaptured. Old DB rows replay through
-        // the frontend's `synthesizeContextCapture` shim, not via
-        // `ThreadEvent` deserialization.
-        // Old format (unit) — must still deserialize
         r#"{"type":"ResponseGenerated"}"#,
         r#"{"type":"ResponseCanceled"}"#,
-        // New format (struct)
         r#"{"type":"ResponseGenerated","text":"answer","images":["img.png"]}"#,
         r#"{"type":"ResponseCanceled","text":"partial","images":[]}"#,
-        // With typed cause (new wire field)
         r#"{"type":"ResponseCanceled","text":"partial","cause":"user_stop"}"#,
-        // Legacy CancelCause `stale_settle` (now an AbortCause) — old DB rows
-        // must still deserialize via `#[serde(other)] Unknown` fallback.
         r#"{"type":"ResponseCanceled","cause":"stale_settle"}"#,
         r#"{"type":"ResponseAborted"}"#,
         r#"{"type":"ResponseAborted","text":"partial","images":[]}"#,
@@ -606,21 +573,16 @@ fn all_db_event_types_have_variants() {
         r#"{"type":"ResponseAborted","cause":"safety_net"}"#,
         r#"{"type":"ResponseAborted","cause":"stale_settle"}"#,
         r#"{"type":"ResponseFailed","error":"e"}"#,
-        // Resume-after-abort boundary
         r#"{"type":"ContinuationStarted","branch":"claude-code/20260318"}"#,
         r#"{"type":"ContinuationStarted"}"#,
-        // Legacy: old events stored as SessionRecovered / SessionResumed must
-        // still deserialize via the serde aliases on ContinuationStarted.
         r#"{"type":"SessionRecovered","branch":"claude-code/20260318"}"#,
         r#"{"type":"SessionRecovered"}"#,
         r#"{"type":"SessionResumed","branch":"claude-code/20260318"}"#,
         r#"{"type":"SessionResumed"}"#,
         r#"{"type":"SessionStarted","session_id":"s"}"#,
         r#"{"type":"SessionStarted","session_id":"s","branch":"claude-code/20260318"}"#,
-        // New format with repo_id for external repo binding
         r#"{"type":"SessionStarted","session_id":"s","branch":"claude-code/20260318","repo_id":"550e8400-e29b-41d4-a716-446655440000"}"#,
         r#"{"type":"SessionEnded"}"#,
-        // New format with reason
         r#"{"type":"SessionEnded","reason":"user_ended"}"#,
         r#"{"type":"SessionEnded","reason":"changes_proposed"}"#,
         r#"{"type":"SessionEnded","reason":"changes_applied"}"#,
@@ -631,23 +593,16 @@ fn all_db_event_types_have_variants() {
         r#"{"type":"CodingAgentUserMessageSent","text":"t"}"#,
         r#"{"type":"MissingHardeningDetected"}"#,
         r#"{"type":"CodingAgentIdled"}"#,
-        // New format with has_changes
         r#"{"type":"CodingAgentIdled","has_changes":true}"#,
-        // Thread lifecycle
         r#"{"type":"ThreadTitleGenerated","title":"t"}"#,
         r#"{"type":"ThreadTitleRenamed","title":"new title"}"#,
         r#"{"type":"ThreadSaved"}"#,
         r#"{"type":"ThreadUnsaved"}"#,
         r#"{"type":"ThreadArchived"}"#,
-        // EventMeta.actor merged into payload — must round-trip on unit and
-        // struct variants alike. Internally-tagged enums tolerate extra
-        // fields by default, but make it a regression test so a future
-        // `#[serde(deny_unknown_fields)]` flip would fail loudly here.
         r#"{"type":"ThreadSaved","actor":{"kind":"device","device_id":"d","label":"Chrome"}}"#,
         r#"{"type":"ThreadUnsaved","actor":{"kind":"api","user_agent":"curl/8"}}"#,
         r#"{"type":"ThreadArchived","actor":{"kind":"workspace","workspace":"dev"}}"#,
         r#"{"type":"ThreadTitleRenamed","title":"x","actor":{"kind":"device","device_id":"d","label":"l"}}"#,
-        // Triggers — minimal + full + legacy task_id alias on the renamed variant
         r#"{"type":"TriggerStarted","trigger_id":"id"}"#,
         r#"{"type":"TriggerStarted","trigger_id":"id","trigger_name":"daily","prompt":"run","invocation":{"kind":"Schedule"}}"#,
         r#"{"type":"TriggerStarted","trigger_id":"id","trigger_name":"sleep-import","invocation":{"kind":"Event","event_type":"DataImported","event_id":"00000000-0000-0000-0000-000000000001"}}"#,
@@ -655,18 +610,15 @@ fn all_db_event_types_have_variants() {
         r#"{"type":"TriggerCompleted","trigger_id":"id"}"#,
         r#"{"type":"TriggerCompleted","trigger_id":"id","trigger_name":"daily","result_summary":"done"}"#,
         r#"{"type":"TriggerCompleted","task_id":"id","task_name":"legacy"}"#,
-        // Changes — old format (path/diff)
         r#"{"type":"ChangeProposed","path":"p","diff":"d"}"#,
         r#"{"type":"ChangeApplied","path":"p"}"#,
         r#"{"type":"ChangeDiscarded","path":"p"}"#,
         r#"{"type":"ChangeReverted","path":"p"}"#,
-        // Changes — new format (change_id)
         r#"{"type":"ChangeProposed","change_id":"c-1","description":"fix","files":["a.rs"],"requires_restart":true}"#,
         r#"{"type":"ChangeApplied","change_id":"c-1","requires_restart":false}"#,
         r#"{"type":"ChangeDiscarded","change_id":"c-1"}"#,
         r#"{"type":"ChangeReverted","change_id":"c-1"}"#,
         r#"{"type":"ChangeApplyFailed","change_id":"c-1","error":"merge conflict"}"#,
-        // Interactive
         r#"{"type":"CredentialRequested","request_id":"00000000-0000-0000-0000-000000000000","payload":"{}"}"#,
         r#"{"type":"FormRequestResolved","request_id":"00000000-0000-0000-0000-000000000000","outcome":"canceled"}"#,
         r#"{"type":"McpConsentRequested","tool":"t","args":{}}"#,
@@ -697,7 +649,6 @@ fn to_payload_removes_type_tag() {
     assert_eq!(payload["name"], "read_file");
     assert_eq!(payload["args"]["path"], "test.txt");
 
-    // ResponseGenerated with empty text — should produce empty object (skip_serializing_if)
     let event2 = ThreadEvent::ResponseGenerated {
         text: String::new(),
         images: vec![],
@@ -711,7 +662,6 @@ fn to_payload_removes_type_tag() {
         "empty ResponseGenerated should produce {{}}"
     );
 
-    // ResponseGenerated with content
     let event3 = ThreadEvent::ResponseGenerated {
         text: "answer".into(),
         images: vec!["img.png".into()],

@@ -1,6 +1,3 @@
-//! What a coding-agent session still owes its agent, driven by the agent's own
-//! event stream.
-
 use super::*;
 use crate::engine::agent_session::lifecycle::{terminate_decision, TerminateDecision};
 
@@ -31,7 +28,6 @@ fn tool_result() -> AgentEvent {
     }
 }
 
-/// The input the agent was sent.
 fn sent(text: &str) -> AgentInput {
     AgentInput {
         defer_on_steer_failure: false,
@@ -41,18 +37,14 @@ fn sent(text: &str) -> AgentInput {
     }
 }
 
-/// The agent's read of `input`: Claude Code's replay under its uuid, or Codex
-/// starting its turn.
 fn read(input: &AgentInput) -> AgentEvent {
     AgentEvent::InputRead { input: input.uuid }
 }
 
-/// What a read of inputs that did not go verbatim settles: one entry per event.
 fn read_of(event_ids: &[Uuid]) -> Settled {
     read_flagged(event_ids, false)
 }
 
-/// What a read of a slash command settles: it went verbatim.
 fn verbatim_read_of(event_ids: &[Uuid]) -> Settled {
     read_flagged(event_ids, true)
 }
@@ -66,7 +58,6 @@ fn read_flagged(event_ids: &[Uuid], verbatim: bool) -> Settled {
     )
 }
 
-/// A replay of Claude Code's own output, under a uuid no input has.
 fn replay_of_its_own_output() -> AgentEvent {
     AgentEvent::InputRead {
         input: Uuid::new_v4(),
@@ -83,17 +74,10 @@ fn result() -> AgentEvent {
     }
 }
 
-/// The idle decision with no message waiting in the channel and no redirect
-/// armed, so only what the agent still owes decides it.
 fn at_idle(ledger: &InputLedger) -> TerminateDecision {
     terminate_decision(0, ledger.owed(), false, false)
 }
 
-/// The held-message repro. A parent's follow-up was held behind the child's
-/// question (ADR 0256). The human answered in band, and the release forwarded
-/// the message right after the answer's tool result. The agent then wrote its
-/// closing text with no further tool call, so Claude Code ran the message as a
-/// second turn. The session must survive the first turn's `Result` for it.
 #[test]
 fn a_message_released_after_an_in_band_answer_is_read_as_the_next_turn() {
     let [prompt_id, released_id] = [Uuid::new_v4(), Uuid::new_v4()];
@@ -123,9 +107,6 @@ fn a_message_released_after_an_in_band_answer_is_read_as_the_next_turn() {
     assert_eq!(prompt_read, read_of(&[prompt_id]));
 }
 
-/// Claude Code folds inputs that arrive before a later tool call into the
-/// running turn and replays each one there. That turn's `Result` then leaves
-/// nothing owed, so the subprocess exits at idle as before.
 #[test]
 fn inputs_folded_into_one_turn_leave_nothing_owed_at_its_result() {
     let [prompt_id, second_id, third_id] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
@@ -144,9 +125,6 @@ fn inputs_folded_into_one_turn_leave_nothing_owed_at_its_result() {
     assert_eq!(at_idle(&ledger), TerminateDecision::Terminate);
 }
 
-/// The probed queue behind a busy turn. Claude Code replays each queued input
-/// under its own uuid, then replays all of them joined under the last one's.
-/// Every input is read once, and the joined replay reads nothing twice.
 #[test]
 fn queued_inputs_are_each_read_by_their_own_replay() {
     let [prompt_id, a_id, b_id, c_id] = [
@@ -171,9 +149,6 @@ fn queued_inputs_are_each_read_by_their_own_replay() {
     assert_eq!(at_idle(&ledger), TerminateDecision::Terminate);
 }
 
-/// Recovery resumes with the continuation as the first prompt, keyed on its
-/// `ContinuationRequested`. Its read settles that entry alone, so a follow-up
-/// forwarded during the continuation turn stays owed.
 #[test]
 fn a_continuation_read_settles_only_the_continuation() {
     let [continuation_id, follow_up_id] = [Uuid::new_v4(), Uuid::new_v4()];
@@ -194,9 +169,6 @@ fn a_continuation_read_settles_only_the_continuation() {
     ));
 }
 
-/// A local command such as `/cost` answers with no model turn. Claude Code
-/// still replays it under its uuid, so it is read like any input and the
-/// session exits at idle.
 #[test]
 fn a_local_command_is_read_by_its_own_replay() {
     let cost_id = Uuid::new_v4();
@@ -208,9 +180,6 @@ fn a_local_command_is_read_by_its_own_replay() {
     assert_eq!(at_idle(&ledger), TerminateDecision::Terminate);
 }
 
-/// The probed `/compact`. Claude Code replays its stdout under a uuid of its
-/// own, then replays the command itself. Neither may read the follow-up queued
-/// behind it, or the idle reads nothing owed and kills the follow-up's turn.
 #[test]
 fn a_compaction_never_reads_the_input_queued_behind_it() {
     let [compact_id, follow_up_id] = [Uuid::new_v4(), Uuid::new_v4()];
@@ -229,10 +198,6 @@ fn a_compaction_never_reads_the_input_queued_behind_it() {
     assert_eq!(ledger.owed(), 1, "the follow-up is still unread");
 }
 
-/// The slow-hook window. Claude Code reads an input only after its
-/// `UserPromptSubmit` hook returns, and says nothing the engine parses while
-/// the hook runs. Nothing settles the input meanwhile, so the idle keeps the
-/// subprocess, and the late read lands on its input.
 #[test]
 fn a_read_that_follows_a_slow_hook_still_reads_its_input() {
     let follow_up_id = Uuid::new_v4();
@@ -252,8 +217,6 @@ fn a_read_that_follows_a_slow_hook_still_reads_its_input() {
     );
 }
 
-/// An engine re-entry, such as a child's completion, is owed like any input,
-/// but carries no message to mark read.
 #[test]
 fn an_input_with_nothing_to_acknowledge_is_still_owed() {
     let wake = sent("child finished");
@@ -265,9 +228,6 @@ fn an_input_with_nothing_to_acknowledge_is_still_owed() {
     assert_eq!(ledger.owed(), 0);
 }
 
-/// The run loop can forward an input and only then receive a `Result` the agent
-/// produced before the input arrived. No ordering guess is needed: the input is
-/// owed until it is read.
 #[test]
 fn a_result_buffered_before_a_forward_settles_nothing() {
     let prompt = sent("prompt");
@@ -282,8 +242,6 @@ fn a_result_buffered_before_a_forward_settles_nothing() {
     ));
 }
 
-/// A read settles the input it names and no other, even an older one still
-/// owed: nothing is inferred from the order Claude Code consumed them in.
 #[test]
 fn a_read_settles_only_the_input_it_names() {
     let [first_id, second_id] = [Uuid::new_v4(), Uuid::new_v4()];
@@ -295,8 +253,6 @@ fn a_read_settles_only_the_input_it_names() {
     assert_eq!(ledger.owed(), 1, "the first is still owed");
 }
 
-/// A read says whether its input went verbatim, so the turn gap knows the
-/// command carried no note. Every event of a coalesced write shares its flag.
 #[test]
 fn a_read_says_whether_its_input_went_verbatim() {
     let [command, leader, follower] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
@@ -308,9 +264,6 @@ fn a_read_says_whether_its_input_went_verbatim() {
     assert_eq!(ledger.observe(&read(&framed)), read_of(&[leader, follower]));
 }
 
-/// Codex runs one turn per input and reports each read when that turn starts.
-/// After the first turn's `Result` the queued input is still unread, so the
-/// driver must stay up to run it.
 #[test]
 fn codex_keeps_the_driver_up_for_a_queued_turn() {
     let [prompt_id, queued_id] = [Uuid::new_v4(), Uuid::new_v4()];
@@ -330,8 +283,6 @@ fn codex_keeps_the_driver_up_for_a_queued_turn() {
     assert_eq!(at_idle(&ledger), TerminateDecision::Terminate);
 }
 
-/// Codex rejected the turn that carried an input. Nobody will ever read it, so
-/// it leaves the ledger unread and the idle that follows owes nothing.
 #[test]
 fn a_rejected_input_leaves_unread() {
     let rejected = sent("prompt");
@@ -347,8 +298,6 @@ fn a_rejected_input_leaves_unread() {
     assert_eq!(at_idle(&ledger), TerminateDecision::Terminate);
 }
 
-/// Messages sent before a session starts are coalesced into its first prompt.
-/// The agent reads them in one write, so one read marks every one of them.
 #[test]
 fn coalesced_messages_are_all_read_with_the_first_prompt() {
     let [leader, follower] = [Uuid::new_v4(), Uuid::new_v4()];
@@ -359,8 +308,6 @@ fn coalesced_messages_are_all_read_with_the_first_prompt() {
     assert_eq!(ledger.owed(), 0);
 }
 
-/// A withdrawn input leaves the ledger, so a later read reads the input it
-/// names and never the withdrawn one.
 #[test]
 fn a_withdrawn_input_is_never_read_in_place_of_a_later_one() {
     let [a, b, c] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
@@ -382,8 +329,6 @@ fn a_withdrawn_input_is_never_read_in_place_of_a_later_one() {
     assert_eq!(ledger.observe(&read(&c_input)), read_of(&[c]));
 }
 
-/// Only an owed input can be withdrawn, and only when its write carried that
-/// message alone: a coalesced write cannot be taken back one message at a time.
 #[test]
 fn only_an_owed_input_written_alone_is_withdrawable() {
     let [read_id, leader, follower, never_sent] = [
@@ -403,8 +348,6 @@ fn only_an_owed_input_written_alone_is_withdrawable() {
     assert_eq!(ledger.withdrawable(never_sent), None, "never forwarded");
 }
 
-/// A withdrawal waits for its tombstone. Until it is recorded, a retry must be
-/// able to record it again, so the ledger keeps asking for it.
 #[test]
 fn a_withdrawal_awaits_its_tombstone_until_recorded() {
     let id = Uuid::new_v4();
@@ -421,9 +364,6 @@ fn a_withdrawal_awaits_its_tombstone_until_recorded() {
     assert!(!ledger.awaits_tombstone(id));
 }
 
-/// Invariant I10: Apply's wait ends only when the turn that read its prompt
-/// ends. The prompt lands while a turn is running, and Claude Code reads it as
-/// the next turn. The running turn's `Result` must not answer it.
 #[test]
 fn a_prompt_sent_mid_turn_is_answered_by_the_turn_that_read_it() {
     let (completion, mut answered) = tokio::sync::oneshot::channel();
@@ -452,8 +392,6 @@ fn a_prompt_sent_mid_turn_is_answered_by_the_turn_that_read_it() {
     assert_eq!(answered.try_recv(), Ok(InputAnswered::TurnEnded));
 }
 
-/// A prompt the agent rejects is never read, so its waiter hears the
-/// rejection rather than waiting for a turn that will not come.
 #[test]
 fn a_rejected_prompt_answers_its_waiter() {
     let (completion, mut answered) = tokio::sync::oneshot::channel();
@@ -468,8 +406,6 @@ fn a_rejected_prompt_answers_its_waiter() {
     assert_eq!(answered.try_recv(), Ok(InputAnswered::Rejected));
 }
 
-/// A session that ends with the prompt unanswered drops its ledger, and the
-/// waiter reads the session as gone rather than hanging.
 #[test]
 fn a_session_that_ends_first_closes_the_waiter() {
     let (completion, mut answered) = tokio::sync::oneshot::channel();
@@ -485,8 +421,6 @@ fn a_session_that_ends_first_closes_the_waiter() {
     );
 }
 
-/// Only a child report is takeable. A user follow-up and an engine prompt owed
-/// beside it stay owed.
 #[test]
 fn only_a_child_report_is_takeable() {
     let mut inputs = InputLedger::new();
@@ -510,8 +444,6 @@ fn only_a_child_report_is_takeable() {
     assert_eq!(inputs.owed(), 2, "the follow-up and the prompt stay owed");
 }
 
-/// A taken report is never read again: the driver's late read names nothing
-/// owed.
 #[test]
 fn a_taken_report_settles_nothing_later() {
     let mut inputs = InputLedger::new();
@@ -526,7 +458,6 @@ fn a_taken_report_settles_nothing_later() {
     assert_eq!(inputs.owed(), 0);
 }
 
-/// A report the agent already read is never handed back.
 #[test]
 fn a_read_report_is_not_takeable() {
     let mut inputs = InputLedger::new();

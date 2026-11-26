@@ -1,10 +1,3 @@
-//! OpenAI's auth host on loopback, for tests: discovery, the key set, a token
-//! endpoint answering from a script, and revocation.
-//!
-//! Like OpenAI, it refuses a refresh token it already rotated away with
-//! `refresh_token_reused`.
-
-// Some inspection helpers are only used by this crate's own tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,7 +13,6 @@ use super::id_token::test_support::test_jwks;
 
 type Replies = Arc<Mutex<VecDeque<(StatusCode, serde_json::Value)>>>;
 
-/// Every form posted, with the endpoint it went to.
 type Forms = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
 
 pub struct MockAuth {
@@ -92,17 +84,14 @@ impl MockAuth {
         }
     }
 
-    /// Queue the token endpoint's next answer.
     pub fn reply_to_token(&self, status: StatusCode, body: serde_json::Value) {
         self.token_replies.lock().unwrap().push_back((status, body));
     }
 
-    /// The forms posted to the token endpoint, oldest first.
     pub(crate) fn token_forms(&self) -> Vec<HashMap<String, String>> {
         self.forms_to("token")
     }
 
-    /// The forms posted to the revocation endpoint, oldest first.
     pub(crate) fn revoke_forms(&self) -> Vec<HashMap<String, String>> {
         self.forms_to("revoke")
     }

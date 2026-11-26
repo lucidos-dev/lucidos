@@ -17,26 +17,12 @@ pub(crate) impl LucidosEngine {
                 .get(&thread_id)
                 .and_then(|s| s.backend_session_id.clone())
         };
-        // Phase 8.1: snapshot the worktree's HEAD SHA so that the next spawn
-        // can detect external user edits made between turns. `git rev-parse`
-        // is best-effort — failures (e.g. zero-commit branch, missing
-        // worktree on disk) leave the field as `None`.
         let worktree_head_sha = match snapshot.worktree_path {
             Some(p) if snapshot.turn != IdleTurn::KeepAlive => {
                 external_edits::git_head_sha(p).await
             }
             _ => None,
         };
-        // Clear any permission card still dangling at this turn boundary. A live
-        // card blocks the turn (so idle can't fire during a genuine wait); by
-        // the time we idle the session is done and any unresolved
-        // `CodingAgentPermissionRequest` is orphaned — e.g. a workflow whose
-        // parallel subagent's card outlived the main turn. Without this the card
-        // sits clickable on a finished thread, and a later click resurrected the
-        // thread into a dead `running` (fixed alongside the non-resurrecting
-        // resolution projection —
-        // `docs/plans/2026-07-02-cc-permission-card-zombie-running.md`). Engine-
-        // driven, so no user actor. No-op when nothing is pending.
         crate::engine::cc_permission::resolve_pending_permissions_as_session_ended(
             self.pool(),
             &self.event_bus,
@@ -71,8 +57,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Per-emit snapshot of the worktree/CC state that `emit_coding_agent_idled`
-/// stamps onto a `CodingAgentIdled` event.
 pub(super) struct CodingAgentIdleSnapshot<'a> {
     pub(super) has_changes: bool,
     pub(super) is_external_repo: bool,
@@ -80,17 +64,13 @@ pub(super) struct CodingAgentIdleSnapshot<'a> {
     pub(super) bg_bash_pending: bool,
     pub(super) worktree_path: Option<&'a std::path::Path>,
     pub(super) turn: IdleTurn,
-    /// How the agent ended the turn, when an agent turn closed here.
     pub(super) turn_end: Option<crate::engine::thread_events::TurnEndFacts>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum IdleTurn {
     Agent,
-    /// A *cache keep-alive*. Its idle also carries no HEAD, so the next real
-    /// turn still diffs against the last real idle.
     KeepAlive,
-    /// A *ceiling re-entry* (ADR 0629).
     CeilingReentry,
 }
 

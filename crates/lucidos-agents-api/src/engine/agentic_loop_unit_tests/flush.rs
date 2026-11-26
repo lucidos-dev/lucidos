@@ -1,8 +1,6 @@
 mod should_flush_tests {
     use super::super::{is_bad_image_description, should_flush};
 
-    // --- Paragraph breaks ---
-
     #[test]
     fn flushes_on_double_newline() {
         assert!(should_flush("Hello world\n\n"));
@@ -23,8 +21,6 @@ mod should_flush_tests {
         assert!(should_flush("First paragraph.\n\nSecond paragraph.\n\n"));
     }
 
-    // --- Code fence close ---
-
     #[test]
     fn flushes_on_code_fence_close() {
         assert!(should_flush("```rust\nfn main() {}\n```\n"));
@@ -39,8 +35,6 @@ mod should_flush_tests {
     fn no_flush_on_code_fence_without_trailing_newline() {
         assert!(!should_flush("```rust\ncode\n```"));
     }
-
-    // --- Heading after newline ---
 
     #[test]
     fn flushes_on_heading_followed_by_newline() {
@@ -59,11 +53,8 @@ mod should_flush_tests {
 
     #[test]
     fn flushes_on_first_line_heading() {
-        // A complete heading line should always flush
         assert!(should_flush("# Title\n"));
     }
-
-    // --- Horizontal rules ---
 
     #[test]
     fn flushes_on_dash_horizontal_rule() {
@@ -79,8 +70,6 @@ mod should_flush_tests {
     fn no_flush_on_partial_horizontal_rule() {
         assert!(!should_flush("Some text\n---"));
     }
-
-    // --- Edge cases ---
 
     #[test]
     fn no_flush_on_empty_string() {
@@ -110,8 +99,6 @@ mod should_flush_tests {
         assert!(!should_flush(&text));
     }
 
-    // --- Combinations ---
-
     #[test]
     fn flushes_code_block_then_paragraph() {
         assert!(should_flush("```\ncode\n```\n\nNext paragraph\n\n"));
@@ -122,8 +109,6 @@ mod should_flush_tests {
         assert!(should_flush("First part\n## Section\n"));
     }
 
-    // --- List items (should NOT flush) ---
-
     #[test]
     fn no_flush_on_list_item() {
         assert!(!should_flush("- item 1\n"));
@@ -133,8 +118,6 @@ mod should_flush_tests {
     fn no_flush_on_numbered_list() {
         assert!(!should_flush("1. item\n"));
     }
-
-    // --- is_bad_image_description ---
 
     #[test]
     fn rejects_gemini_no_image_response() {
@@ -177,8 +160,6 @@ mod classify_empty_completion_tests {
         classify_empty_completion, declined_partway_error, normalize_finish_reason, FinishClass,
     };
 
-    /// A refusal can arrive after some text streamed. That text is a fragment,
-    /// so the turn fails instead of completing as a whole answer.
     #[test]
     fn a_refusal_after_partial_text_fails_the_turn() {
         for reason in ["refusal", "SAFETY", "content_filter"] {
@@ -187,8 +168,6 @@ mod classify_empty_completion_tests {
         }
     }
 
-    /// Every other ending keeps its text as the answer, truncation included:
-    /// that path is unchanged here.
     #[test]
     fn a_turn_with_text_that_was_not_declined_is_an_answer() {
         for reason in [Some("end_turn"), Some("STOP"), Some("max_tokens"), None] {
@@ -196,18 +175,8 @@ mod classify_empty_completion_tests {
         }
     }
 
-    // Background: when the LLM call returns no text and no tool calls, the
-    // engine classifies *why* it was empty — uniformly across providers and
-    // thread types. A clean model-decided stop is benign intentional silence
-    // (emit an empty ResponseGenerated, render a neutral note); truncation,
-    // safety blocks, dropped output, and unrecognised stops are genuine
-    // failures (ResponseFailed). These tests pin the benign/error split and the
-    // cross-provider stop-reason vocabulary — the trap that made an empty
-    // Gemini `STOP` indistinguishable from a `MAX_TOKENS` cutoff.
-
     #[test]
     fn clean_stop_is_benign_across_providers() {
-        // Anthropic end_turn, Gemini STOP, OpenAI stop/completed — all clean.
         for reason in ["end_turn", "STOP", "stop", "completed"] {
             let class = classify_empty_completion(reason, 5, false, 0);
             assert!(
@@ -225,8 +194,6 @@ mod classify_empty_completion_tests {
 
     #[test]
     fn truncation_is_error_across_providers() {
-        // Anthropic max_tokens, Gemini MAX_TOKENS, OpenAI length /
-        // max_output_tokens — all truncation, regardless of case.
         for reason in ["max_tokens", "MAX_TOKENS", "length", "max_output_tokens"] {
             let class = classify_empty_completion(reason, 8192, false, 0);
             assert!(class.is_error, "{reason} must be an error");
@@ -240,7 +207,6 @@ mod classify_empty_completion_tests {
 
     #[test]
     fn safety_block_is_error_across_providers() {
-        // Anthropic refusal, Gemini SAFETY/RECITATION, OpenAI content_filter.
         for reason in ["refusal", "SAFETY", "RECITATION", "content_filter"] {
             let class = classify_empty_completion(reason, 207, false, 0);
             assert!(class.is_error, "{reason} must be an error");
@@ -249,8 +215,6 @@ mod classify_empty_completion_tests {
                 "{reason} must say the model declined, got: {}",
                 class.hint
             );
-            // Must NOT misattribute a safety block to a parser / stream-shape
-            // change — the misleading message the 2026-06-02 report saw.
             assert!(
                 !class.hint.contains("couldn't classify"),
                 "{reason} must NOT blame the parser, got: {}",
@@ -261,8 +225,6 @@ mod classify_empty_completion_tests {
 
     #[test]
     fn safety_block_wins_even_with_zero_output_tokens() {
-        // A block that withholds everything before any tokens are billed must
-        // still be reported as declined, not as intentional silence.
         let class = classify_empty_completion("refusal", 0, false, 0);
         assert!(class.is_error);
         assert!(class.hint.contains("declined"), "got: {}", class.hint);
@@ -270,9 +232,6 @@ mod classify_empty_completion_tests {
 
     #[test]
     fn dropped_output_with_unknown_shapes_is_error() {
-        // 2222 output tokens, nothing captured, SSE accumulator flagged unknown
-        // shapes — error, and the hint must call them out (Anthropic-only
-        // signal; clean stop_reason does NOT make it benign).
         let class = classify_empty_completion("end_turn", 2222, false, 3);
         assert!(class.is_error, "dropped output must be an error");
         assert!(
@@ -284,8 +243,6 @@ mod classify_empty_completion_tests {
 
     #[test]
     fn dropped_output_without_unknown_shapes_is_error() {
-        // Tokens billed but nothing captured and no unknowns flagged — a known
-        // block carried an unexpected payload shape. Still an error.
         let class = classify_empty_completion("end_turn", 2222, false, 0);
         assert!(class.is_error, "dropped output must be an error");
         assert!(
@@ -297,8 +254,6 @@ mod classify_empty_completion_tests {
 
     #[test]
     fn thinking_only_clean_stop_is_benign() {
-        // Model thought (visibly) but produced no text on a clean stop — benign
-        // intentional silence, with a hint that distinguishes it.
         let class = classify_empty_completion("end_turn", 100, true, 0);
         assert!(
             !class.is_error,
@@ -311,10 +266,6 @@ mod classify_empty_completion_tests {
         );
     }
 
-    /// Opus 5.5 and Fable 5.x return thinking blocks with empty text, so a
-    /// thinking-only turn bills output with zero thinking characters. The
-    /// blocks are the proof it thought, so the turn is benign silence and not
-    /// a parser miss.
     #[test]
     fn thinking_blocks_without_thinking_text_are_still_a_thought() {
         let class = classify_empty_completion("end_turn", 2222, true, 0);
@@ -324,9 +275,6 @@ mod classify_empty_completion_tests {
 
     #[test]
     fn unknown_stop_reason_is_error_failsafe() {
-        // A reason we don't recognise (future provider value, stop_sequence,
-        // the "unknown" sentinel for a null stop_reason) is failed-safe to an
-        // error so a genuinely broken turn still surfaces.
         for reason in ["some_future_reason", "stop_sequence", "unknown", "other"] {
             let class = classify_empty_completion(reason, 0, false, 0);
             assert!(class.is_error, "{reason} must fail-safe to an error");

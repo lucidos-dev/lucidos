@@ -179,7 +179,7 @@ describe('a turn control holds its control across a clamp', () => {
 
   it('keeps no cross-press state in the module', () => {
     const source = readFileSync(
-      resolve(dirname(fileURLToPath(import.meta.url)), '../CreateThreadView.tsx'),
+      resolve(dirname(fileURLToPath(import.meta.url)), '../scrollHold.ts'),
       'utf8',
     );
     expect(source).toMatch(
@@ -187,7 +187,7 @@ describe('a turn control holds its control across a clamp', () => {
     );
     expect(source).toMatch(/if \(settledScrollTop\(container\) !== target\.scrollTop\)/);
     for (const symbol of ['anchorDebt', 'carriedAnchorDebt', 'rememberAnchorDebt', 'landingScrollTop']) {
-      expect(source, `${symbol} is back in CreateThreadView.tsx`).not.toContain(symbol);
+      expect(source, `${symbol} is back in scrollHold.ts`).not.toContain(symbol);
     }
   });
 });

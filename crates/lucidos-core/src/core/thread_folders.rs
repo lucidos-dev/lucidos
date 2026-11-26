@@ -1,22 +1,10 @@
-//! The user's **custom folders**: named sections of the thread drawer's Folders
-//! grouping that split Pinned. The list lives in the workspace-wide
-//! `thread_folders` preference, in display order. Which folder a thread sits
-//! in is `ThreadMovedToFolder`, projected to `thread_summaries.pin_folder`.
-//!
-//! A pin whose folder the list no longer holds lists in plain Pinned, so a
-//! deleted folder never unpins anything. See
-//! `docs/plans/2026-11-24-custom-folders-for-pinned-threads.md`.
-
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::core::prefs;
 
-/// Longest folder id. The app mints a 36-char UUID.
 pub const MAX_ID_CHARS: usize = 40;
-/// Longest folder name. It renders as a drawer section title.
 pub const MAX_NAME_CHARS: usize = 40;
-/// Most folders one workspace may hold.
 pub const MAX_FOLDERS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +21,6 @@ fn is_valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Parse and bounds-check a `thread_folders` document. Every writer passes
-/// here, and a document is wholly accepted or wholly refused.
 pub fn validate_document(raw: &str) -> Result<Vec<ThreadFolder>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -71,8 +57,6 @@ pub fn validate_document(raw: &str) -> Result<Vec<ThreadFolder>, String> {
     Ok(folders)
 }
 
-/// This workspace's folders. An unreadable row reads as no folders, so every
-/// pin lists in plain Pinned rather than the drawer failing.
 pub async fn list(pool: &PgPool) -> Vec<ThreadFolder> {
     let Some(raw) = prefs::THREAD_FOLDERS.stored(pool).await else {
         return Vec::new();

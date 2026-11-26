@@ -48,7 +48,6 @@ fn sorted_lines_keeps_two_concurrent_appends_in_number_order() {
 
 #[test]
 fn sorted_lines_keeps_one_copy_of_a_line_both_sides_hold_at_different_places() {
-    // Union merge duplicated exactly this: one side had re-sorted already.
     let out = run_merge(
         Kind::SortedLines,
         &index(&["0437", "0438"]),
@@ -102,7 +101,6 @@ const PRIORS_BASE: &str = "# Priors\n\nIntro.\n\n## Rust engine\n\n- **Old entry
 
 #[test]
 fn blocks_keeps_both_entries_added_at_the_top_of_one_section() {
-    // The hot anchor: every agent adds its prior right under the heading.
     let ours = PRIORS_BASE.replace("## Rust engine\n", "## Rust engine\n\n- **Ours.** New.\n");
     let theirs = PRIORS_BASE.replace("## Rust engine\n", "## Rust engine\n\n- **Theirs.** New.\n");
     let out = clean(run_merge(Kind::Blocks, PRIORS_BASE, &ours, &theirs));
@@ -136,7 +134,6 @@ fn blocks_conflicts_only_on_the_entry_both_sides_edited() {
 
 #[test]
 fn blocks_merges_edits_to_different_lines_of_one_entry() {
-    // docs/system-events.md shape: two threads each add a sub-bullet to one long entry.
     let base =
         "## Events\n\n- **Changes:** a list.\n  - first\n  - second\n  - third\n  - fourth\n";
     let ours = base.replace("  - first\n", "  - first\n  - ours\n");
@@ -168,7 +165,6 @@ fn blocks_drops_an_entry_one_side_deleted_and_the_other_left_alone() {
 
 #[test]
 fn blocks_keys_bullets_by_the_full_heading_path() {
-    // CHANGELOG repeats `### Added` under every version.
     let base = "# Changelog\n\n## v2\n\n### Added\n\n- Two.\n\n## v1\n\n### Added\n\n- One.\n";
     let ours = base.replace("- Two.\n", "- Two.\n- Two more.\n");
     let theirs = base.replace("- One.\n", "- One.\n- One more.\n");
@@ -182,7 +178,6 @@ fn blocks_keys_bullets_by_the_full_heading_path() {
 
 #[test]
 fn blocks_keeps_each_new_entry_in_the_section_its_side_put_it_in() {
-    // Both sides opened `## Unreleased`; theirs also carries a release cut on main.
     let base = "# C\n\n## v2\n\n- old\n";
     let ours = "# C\n\n## Unreleased\n\n### Changed\n\n- ours change\n\n### Fixed\n\n- ours fix\n\n## v2\n\n- old\n";
     let theirs = "# C\n\n## Unreleased\n\n### Changed\n\n- theirs change\n\n### Fixed\n\n- theirs fix\n\n## v3\n\n- v3 fix\n\n## v2\n\n- old\n";
@@ -383,10 +378,6 @@ fn run_exits_2_when_an_input_is_missing() {
     );
 }
 
-/// Every keep / edit / delete / add combination over three entries, checked
-/// against the textbook rule: a side that did not change an entry yields to
-/// the side that did, and two different changes conflict. The output must
-/// also re-parse to exactly the expected entries.
 #[test]
 fn blocks_matches_the_three_way_rule_for_every_combination() {
     #[derive(Clone, Copy)]
@@ -440,8 +431,6 @@ fn blocks_matches_the_three_way_rule_for_every_combination() {
                         expected.push((format!("b:## List{KEY_SEP}{name}"), line.clone()));
                     }
                 }
-                // Gone from both sides beside a new entry: refused, since it
-                // may be a rename (`renamed_on_both_sides`).
                 let gone_from_both = names.iter().any(|n| {
                     base_state[*n].is_some()
                         && ours_state[*n].is_none()
@@ -461,7 +450,6 @@ fn blocks_matches_the_three_way_rule_for_every_combination() {
                             "missed a conflict:\n{base}\n{ours}\n{theirs}"
                         );
                         let doc = parse_blocks(std::str::from_utf8(&out).unwrap()).unwrap();
-                        // The first bullet carries the blank line under the heading.
                         let mut got: Vec<(String, String)> = doc.entries[2..]
                             .iter()
                             .map(|(k, t)| (k.clone(), t.trim_start_matches('\n').to_string()))
@@ -485,9 +473,6 @@ fn blocks_matches_the_three_way_rule_for_every_combination() {
     assert_eq!(checked, 8 * 64 * 64);
 }
 
-/// Pins the kind names three places spell: this enum, the registration list
-/// in shell, and `.gitattributes`. A name only one of them knows merges as
-/// plain text without a word.
 #[test]
 fn the_registration_and_gitattributes_name_only_these_kinds() {
     let kinds: Vec<String> = Kind::value_variants()

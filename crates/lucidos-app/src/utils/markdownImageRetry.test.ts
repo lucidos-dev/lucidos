@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { installMarkdownImageRetry, isImageRetryPending } from './markdownImageRetry';
+import { installMarkdownImageRetry } from './markdownImageRetry';
 import { MAX_ATTEMPTS, retryDelayMs } from './imageRetry';
 
 const SRC = '/dev/data/artifacts/shot.png';
@@ -115,12 +115,4 @@ describe('installMarkdownImageRetry', () => {
     stop = installMarkdownImageRetry();
   });
 
-  it('says a retry is pending from the failure until the re-request goes out', () => {
-    const img = mountImage(SRC);
-    expect(isImageRetryPending(img)).toBe(false);
-    fail(img);
-    expect(isImageRetryPending(img)).toBe(true);
-    vi.advanceTimersByTime(retryDelayMs(0));
-    expect(isImageRetryPending(img)).toBe(false);
-  });
 });

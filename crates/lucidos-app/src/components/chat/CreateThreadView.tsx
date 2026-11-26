@@ -14,9 +14,8 @@ import {
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
 import { homeThreadId } from '../../store/actions/homeThread';
-import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
 import { onClassifiedScrollAsEngine } from './classifiedScroll';
-import { awayFromBottom, showScrollToBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
+import { awayFromBottom, showScrollToBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, makeScrollObservers } from './scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
 import { ChatExchange } from './ChatExchange';
 import type { ProposedChangeSeed } from './ChatExchange';
@@ -27,11 +26,6 @@ import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange, StoredEvent } from '../../store/thread-events';
 import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, sessionCodingAgents, exchangeKey, continuableAbortIndex, queuedFollowupRun, readMarkers, isChangeLifecycleEvent, restartPauseFoldsInto, opensAwaitingAnswer, agentWorkedSince, threadFlagsChangeDrawing } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
-import { forceWebKitRepaint, settledScrollTop } from '../../utils/webkitRepaint';
-import { opensSoftwareKeyboard } from '../../utils/dom';
-import { nowMs } from '../../utils/scrollActivity';
-import { scaledDurationMs } from '../../utils/motion';
-import { DISCLOSURE_MAX_MS } from '../../utils/disclosureMotion';
 
 export function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, ProposedChangeSeed> {
   const map = new Map<string, ProposedChangeSeed>();
@@ -270,85 +264,7 @@ export function renderExchanges(
 }
 
 
-function contentOffsetTop(container: HTMLElement, el: HTMLElement): number {
-  return el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-}
-
-const ANCHOR_SETTLE_FRAMES = 12;
-
-const ROLL_SETTLE_SLACK_MS = 50;
-
-export function withScrollAnchor(anchor: Element | null | undefined, fn: () => void) {
-  const container = anchor?.closest('.thread-content') as HTMLElement | null;
-  if (!container || !anchor) { fn(); return; }
-
-  const focused = document.activeElement;
-  if (focused instanceof HTMLElement && container.contains(focused) && opensSoftwareKeyboard(focused)) {
-    focused.blur();
-  }
-
-  const held = anchor as HTMLElement;
-  const offsetBefore = contentOffsetTop(container, held);
-  const scrollBefore = settledScrollTop(container);
-  const overflowBefore = container.style.overflow;
-  const pressedAt = nowMs();
-  let restored = false;
-
-  container.style.overflow = 'hidden';
-  const offsetFrozen = contentOffsetTop(container, held);
-
-  const restore = () => {
-    if (restored) return;
-    restored = true;
-    observer.disconnect();
-    container.style.overflow = overflowBefore;
-
-    const anchored = held.isConnected;
-    const targetNow = (): { scrollTop: number; spacer: number } => {
-      const offset = contentOffsetTop(container, held);
-      return splitAnchorCorrection(scrollBefore + (offset - anchorSpacer(container) - offsetBefore));
-    };
-    const wanted = anchored ? targetNow() : { scrollTop: container.scrollTop, spacer: anchorSpacer(container) };
-    setAnchorSpacer(container, wanted.spacer);
-    markAnchorScroll(container, wanted.scrollTop);
-
-    forceWebKitRepaint(container);
-
-    honourAnchoredMutation(container);
-
-    if (anchored) {
-      let framesLeft = ANCHOR_SETTLE_FRAMES;
-      const rollsLandAt = nowMs() + scaledDurationMs(DISCLOSURE_MAX_MS) + ROLL_SETTLE_SLACK_MS;
-      let lastFrameAt = -Infinity;
-      const reassert = (frameAt: number) => {
-        if (!held.isConnected || isOtherNavigationScroll(container)) return;
-        if (readerGestureSince(container, pressedAt)) return;
-        const target = targetNow();
-        setAnchorSpacer(container, target.spacer);
-        if (settledScrollTop(container) !== target.scrollTop) {
-          markAnchorScroll(container, target.scrollTop);
-          honourAnchoredMutation(container);
-        }
-        const rolling = frameAt > lastFrameAt && frameAt < rollsLandAt;
-        lastFrameAt = frameAt;
-        if (--framesLeft <= 0 && !rolling) return;
-        requestAnimationFrame(reassert);
-      };
-      requestAnimationFrame(reassert);
-    }
-  };
-
-  const observer = new MutationObserver(() => restore());
-  observer.observe(container, { childList: true, subtree: true });
-
-  fn();
-
-  if (!restored && contentOffsetTop(container, held) !== offsetFrozen) restore();
-
-  queueMicrotask(() => queueMicrotask(restore));
-
-  requestAnimationFrame(restore);
-}
+export { withScrollAnchor } from './scrollHold';
 
 export function useScrollObservers(ref: preact.RefObject<HTMLDivElement>, ready: boolean) {
   const listenerRef = useRef<{ el: HTMLDivElement; cleanup: () => void } | null>(null);

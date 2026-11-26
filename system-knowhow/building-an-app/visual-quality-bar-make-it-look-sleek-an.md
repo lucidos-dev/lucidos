@@ -37,6 +37,7 @@ A "no" on any line means the app is not finished:
 - Does **every** `.action-btn-confirm` / `.action-btn-danger` / `.action-btn-secondary` still carry the base `.action-btn`?
 - Does a **view switch, sort or filter** show its current choice with `.action-btn` variants? → use `.segmented-btn.active`, or `.pill-bar-btn` with `aria-pressed`.
 - Is **every `:hover`** you wrote inside `@media (hover: hover)`?
+- Any **left-edge stripe** on a card, callout, banner or notice? That means a coloured `border-left`, a `::before` bar or an inset `box-shadow`. It is forbidden. Use bold text, a raised `--bg-tertiary` surface, spacing or an inline icon.
 - For a **widget**: does it fit one phone screen, with about 5 rows, one control row and the rest behind "Show more"? Does it lead with one shape instead of a table, with no title and no border inside it?
 - Any **magic font-size number** (`0.95rem`, `0.78rem`, `18px`) instead of a `--font-size-*` token? → snap it to the nearest scale step.
 - Any **`font-family`** declaration whose value isn't a token? → delete it. Keep one only for a deliberately different face, set to `var(--font-mono)` or `var(--font-ui)`.

@@ -1,24 +1,9 @@
-//! Users, as the gateway that spawned this engine knows them (ADR 0623).
-//!
-//! A *user* is a user the gateway knows: a name, emails, and the paired
-//! devices they hold.
-//! The gateway keeps them in its event log. This engine reads the list at boot
-//! and again whenever the gateway signals an identity change, and keeps
-//! the last answer in memory. Events store device ids or an actor email only,
-//! so every attribution resolves through [`current`] at read time.
-//!
-//! **A user is identity without authority.** No handler may branch on it
-//! to allow or refuse an action.
-//!
-//! A test must never read a real gateway, so the fetch runs only once
-//! [`enable`] has, which `main` calls for a gateway-spawned engine.
-
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-/// The gateway route every engine reads, under its auth mount.
+/// INVARIANT: The gateway route every engine reads, under its auth mount.
 const USERS_PATH: &str = "/~/api/v1/auth/users";
 // An older gateway serves this name. See "User rename wire aliases" in
 // docs/temporary-measures.md.
@@ -28,11 +13,8 @@ const GATEWAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 static GATEWAY_PORT: OnceLock<String> = OnceLock::new();
 
-/// The gateway's first answer, so boot can wait for it.
 static FIRST_ANSWER: FirstAnswer = FirstAnswer::new();
 
-/// Whether the gateway has answered yet, and whether that answer changed the
-/// user list the engine held until then.
 struct FirstAnswer {
     answered: AtomicBool,
     changed: AtomicBool,
@@ -58,8 +40,6 @@ impl FirstAnswer {
         self.arrived.notify_waiters();
     }
 
-    /// Wait for the answer, however long it takes. Returns whether it changed
-    /// the user list.
     async fn changed(&self) -> bool {
         loop {
             let arrived = self.arrived.notified();
@@ -71,7 +51,6 @@ impl FirstAnswer {
     }
 }
 
-/// One user, with the devices they hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
@@ -82,8 +61,6 @@ pub struct User {
     pub device_ids: Vec<String>,
 }
 
-/// A device relayed through a gateway pairing, with the other gateway's
-/// user for it. `via` is that gateway's label, not a device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayedUser {
     pub device_id: String,
@@ -91,32 +68,23 @@ pub struct RelayedUser {
     pub user_id: String,
     pub name: String,
     pub via: String,
-    /// The emails the other gateway holds for the user. A relayed user
-    /// with an email a local user holds is that local user.
     #[serde(default)]
     pub emails: Vec<String>,
 }
 
-/// Who an actor turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UserRef {
     pub id: String,
-    /// "Sam", or "Sam (A)" for a relayed user another user shares a name with.
     pub name: String,
 }
 
-/// One user this gateway knows, for a picker such as the composer's mention
-/// list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UserListing {
     pub id: String,
-    /// "Sam", or "Sam (A)" for a relayed user another user shares a name with.
     pub name: String,
-    /// False for a user known only by email. No push reaches them.
     pub has_device: bool,
 }
 
-/// The gateway's answer to `GET /~/api/v1/auth/users`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSnapshot {
     #[serde(default, alias = "operators")]
@@ -126,7 +94,6 @@ pub struct UserSnapshot {
 }
 
 impl UserSnapshot {
-    /// The user holding a device, local or relayed.
     pub fn user_of_device(&self, device_id: &str) -> Option<UserRef> {
         if let Some(user) = self
             .users
@@ -145,7 +112,7 @@ impl UserSnapshot {
         })
     }
 
-    /// How a relayed user reads: the local name once merged by email, else
+    /// INVARIANT: How a relayed user reads: the local name once merged by email, else
     /// their own name. The gateway label joins it, "Sam (A)", only when
     /// another distinct user holds the same name (trimmed, any case).
     /// `gateway_user_names.json` pins this rule for the frontend copy.
@@ -169,9 +136,6 @@ impl UserSnapshot {
         }
     }
 
-    /// The local user a relayed user is: the one holding an email the
-    /// other gateway signed for any of that user's devices. So one human
-    /// paired to two gateways counts once.
     fn local_of_relayed(&self, relayed: &RelayedUser) -> Option<&User> {
         let emails: std::collections::BTreeSet<String> = self
             .relayed
@@ -184,13 +148,11 @@ impl UserSnapshot {
             .find(|o| o.emails.iter().any(|e| emails.contains(&e.to_lowercase())))
     }
 
-    /// The user id a relayed device counts under.
     fn relayed_user_id<'a>(&'a self, relayed: &'a RelayedUser) -> &'a str {
         self.local_of_relayed(relayed)
             .map_or(relayed.user_id.as_str(), |o| o.id.as_str())
     }
 
-    /// The id of every user this gateway knows, local and relayed.
     pub fn user_ids(&self) -> std::collections::BTreeSet<&str> {
         self.users
             .iter()
@@ -199,8 +161,6 @@ impl UserSnapshot {
             .collect()
     }
 
-    /// The user holding an email, matched without regard to case. An email
-    /// no user holds is a stranger's.
     pub fn user_of_email(&self, email: &str) -> Option<UserRef> {
         let email = email.trim().to_lowercase();
         self.users
@@ -212,8 +172,6 @@ impl UserSnapshot {
             })
     }
 
-    /// The user a user id names, local or relayed, as a device of
-    /// theirs would name them. A removed user's id names nobody.
     pub fn user_of_id(&self, user_id: &str) -> Option<UserRef> {
         if let Some(user) = self.users.iter().find(|o| o.id == user_id) {
             return Some(UserRef {
@@ -228,8 +186,6 @@ impl UserSnapshot {
         self.user_of_device(&relayed.device_id)
     }
 
-    /// The user behind an event origin: a device's holder, or the user
-    /// holding a trigger fire's actor email. Every other origin is nobody.
     pub fn user_of_origin(
         &self,
         origin: &crate::engine::thread_events::MessageOrigin,
@@ -248,15 +204,10 @@ impl UserSnapshot {
         }
     }
 
-    /// How many users this gateway knows, local and relayed. Routing among
-    /// users means something only from two.
     pub fn user_count(&self) -> usize {
         self.user_ids().len()
     }
 
-    /// The name an agent reads a user's typed message under: the device's
-    /// holder on a team gateway. A personal gateway, and a sender no user
-    /// holds, keep "User".
     pub fn speaker_of_device(&self, device_id: Option<&str>) -> String {
         device_id
             .filter(|_| self.user_count() >= 2)
@@ -264,7 +215,6 @@ impl UserSnapshot {
             .map_or_else(|| "User".to_string(), |o| o.name)
     }
 
-    /// Every user this gateway knows, local and relayed, each once.
     pub fn listings(&self) -> Vec<UserListing> {
         self.user_ids()
             .into_iter()
@@ -279,8 +229,6 @@ impl UserSnapshot {
             .collect()
     }
 
-    /// The devices a user holds, local and relayed. Empty for an unknown
-    /// user.
     pub fn devices_of(&self, user_id: &str) -> Vec<&str> {
         let local = self
             .users
@@ -296,14 +244,9 @@ impl UserSnapshot {
     }
 }
 
-/// Whose read state a caller reads and writes: Notifications and Review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reader {
-    /// The shared read state. A gateway with fewer than two users, and any
-    /// caller no user holds, read as one team, as before users.
     Team,
-    /// One user on a team gateway: the device reading, and every device
-    /// that user holds. A read on one is a read on all.
     User {
         device_id: String,
         devices: Vec<String>,
@@ -311,7 +254,6 @@ pub enum Reader {
 }
 
 impl Reader {
-    /// The reader behind a request's actor.
     pub fn of(
         actor: Option<&crate::engine::thread_events::MessageOrigin>,
         snapshot: &UserSnapshot,
@@ -336,7 +278,6 @@ impl Reader {
         }
     }
 
-    /// The user's devices, for a query parameter. `None` is the team.
     pub fn devices(&self) -> Option<&[String]> {
         match self {
             Self::Team => None,
@@ -350,7 +291,6 @@ fn snapshot_slot() -> &'static RwLock<Arc<UserSnapshot>> {
     SLOT.get_or_init(RwLock::default)
 }
 
-/// The last user list the gateway gave. Empty with no gateway.
 pub fn current() -> Arc<UserSnapshot> {
     snapshot_slot()
         .read()
@@ -358,7 +298,7 @@ pub fn current() -> Arc<UserSnapshot> {
         .unwrap_or_default()
 }
 
-/// The user list, or `None` while the gateway has not answered yet. Until
+/// INVARIANT: The user list, or `None` while the gateway has not answered yet. Until
 /// then a team reads as one user, so a decision that differs between the
 /// two must wait. An engine with no gateway knows its list: it is empty.
 pub fn known() -> Option<Arc<UserSnapshot>> {
@@ -372,9 +312,6 @@ fn install(snapshot: UserSnapshot) {
     }
 }
 
-/// Read users from the gateway that spawned this engine. No-op without
-/// one. Reads in the background, retrying until the gateway answers: until
-/// then a team gateway would read as one user.
 pub fn enable() {
     let Ok(port) = std::env::var("LUCIDOS_GATEWAY_PORT") else {
         return;
@@ -388,8 +325,6 @@ pub fn enable() {
     });
 }
 
-/// Read the list until the gateway answers, waiting longer after each
-/// failure. Returns whether the answer differs from the last one.
 async fn read_until_answered(port: &str) -> bool {
     let mut wait = Duration::from_secs(1);
     loop {
@@ -406,7 +341,7 @@ async fn read_until_answered(port: &str) -> bool {
     }
 }
 
-/// Wait for the gateway's first answer, at most one gateway timeout, so the
+/// INVARIANT: Wait for the gateway's first answer, at most one gateway timeout, so the
 /// engine does not serve a team as one user while it boots. Returns at once
 /// without a gateway. Past the timeout the retry goes on in the background.
 ///
@@ -425,17 +360,15 @@ pub async fn await_first_answer() -> bool {
     in_time
 }
 
-/// The first answer of a gateway that was late with it. Returns whether it
+/// INVARIANT: The first answer of a gateway that was late with it. Returns whether it
 /// changed the user list. The engine served the earlier list meanwhile, so a
 /// change is one every reader must hear.
 pub async fn late_first_answer() -> bool {
     FIRST_ANSWER.changed().await
 }
 
-/// The longest pause between two reads of a gateway that does not answer.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
-/// Read the list and keep it. Returns whether it differs from the last one.
 async fn read_and_install(port: &str) -> Result<bool, String> {
     let snapshot = fetch(port).await?;
     let changed = *current() != snapshot;
@@ -443,9 +376,6 @@ async fn read_and_install(port: &str) -> Result<bool, String> {
     Ok(changed)
 }
 
-/// Read the list again, retrying until the gateway answers, so a signal is
-/// never lost to one failed read. Returns whether the answer differs from the
-/// last one.
 pub async fn refresh() -> bool {
     match GATEWAY_PORT.get() {
         Some(port) => read_until_answered(port).await,
@@ -481,8 +411,6 @@ async fn fetch(port: &str) -> Result<UserSnapshot, String> {
 mod tests {
     use super::*;
 
-    /// A waiter hears the answer whether it started before or after it, and
-    /// learns whether the list changed.
     #[tokio::test]
     async fn a_late_first_answer_reports_whether_the_list_changed() {
         let late = std::sync::Arc::new(FirstAnswer::new());
@@ -630,8 +558,6 @@ mod tests {
         assert_eq!(Reader::of(Some(&device("d1")), &alone), Reader::Team);
     }
 
-    /// One user who pairs their own two gateways: the laptop relays Sam and
-    /// signs Sam's email, which the server's Sam holds.
     #[test]
     fn a_relayed_user_with_a_local_email_is_that_user() {
         use crate::engine::thread_events::MessageOrigin;
@@ -647,8 +573,6 @@ mod tests {
         );
         assert_eq!(solo.devices_of("op-1"), vec!["d1", "d2", "pair:d9"]);
 
-        // A phone that relayed before the email was added merges too: the
-        // emails of every device of that user count.
         let mut phone = solo.relayed[0].clone();
         phone.device_id = "pair:d8".into();
         phone.emails.clear();

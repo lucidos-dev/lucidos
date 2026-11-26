@@ -1,14 +1,3 @@
-//! `lucidos build-slot`: run a heavy build under a *build slot*.
-//!
-//! The pool itself lives in `lucidos-build-slot`; this is its user-facing
-//! door. Wrap a command and it waits for a free slot. The build then runs as a
-//! child, at a lower priority and with a share of the host's cores. The slot
-//! frees when the child exits, or when this process dies.
-//!
-//! Everything here fails OPEN. A pool that cannot be opened, an engine that is
-//! down, an announcement that does not send: none of them may be the reason a
-//! build does not happen.
-
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -24,20 +13,12 @@ use lucidos_build_slot::{
 
 use crate::workspace::{resolve_from_env, BoxError, Workspace};
 
-/// Exit code when `--max-wait` elapsed with no slot free. 75 is the
-/// `EX_TEMPFAIL` convention `scripts/lib/host_load_guard.sh` already uses for
-/// backpressure, so an orchestrator can tell it from a failing build.
 const WAIT_TIMEOUT_EXIT: u8 = 75;
 
-/// How often the wait prints a progress line. Polling is far more frequent;
-/// this only governs what a human sees.
 const PROGRESS_EVERY: Duration = Duration::from_secs(15);
 
-/// Ceiling on an announcement's round trip. An engine that is hung must delay
-/// a build by seconds, never by the client's default half-minute.
 const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Longest label recorded in slot metadata and carried on an event.
 const LABEL_CHARS: usize = 120;
 
 const ENV_REQUEST_ID: &str = "LUCIDOS_BUILD_SLOT_REQUEST_ID";
@@ -66,8 +47,6 @@ pub(crate) fn run(args: BuildSlotArgs) -> Result<u8, BoxError> {
     cmd_wrap(args)
 }
 
-// ── set-capacity ────────────────────────────────────────────────────────
-
 fn cmd_set_capacity(value: usize) -> Result<u8, BoxError> {
     let pool = BuildSlotPool::open()?;
     pool.set_capacity(value)?;
@@ -79,8 +58,6 @@ fn cmd_set_capacity(value: usize) -> Result<u8, BoxError> {
     println!("Every build on this machine reads it, so set it once, not per workspace.");
     Ok(0)
 }
-
-// ── status ──────────────────────────────────────────────────────────────
 
 fn cmd_status() -> Result<u8, BoxError> {
     let pool = BuildSlotPool::open()?;
@@ -128,8 +105,6 @@ fn fmt_secs(total: u64) -> String {
     }
     format!("{}m{:02}s", total / 60, total % 60)
 }
-
-// ── wrapping a command ──────────────────────────────────────────────────
 
 fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
     if args.command.is_empty() {
@@ -185,8 +160,6 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
 fn cmd_lease(args: BuildSlotArgs) -> Result<u8, BoxError> {
     let parent = parent_pid();
     if let Ok(owner) = std::env::var("LUCIDOS_BUILD_SLOT_LEASE_OWNER") {
-        // The launch shell may have died during the wrapper's bootstrap.
-        // Its adopted child must never take a slot on its behalf.
         if owner.parse::<u32>().ok() != Some(parent) {
             return Ok(0);
         }
@@ -243,8 +216,6 @@ fn parent_pid() -> u32 {
 }
 
 fn wait_for_lease_release(parent: u32) -> io::Result<Option<u8>> {
-    // The shell opens the FIFO read-write. Its death may leave inherited
-    // writers open, so stdin alone cannot tell us when to release.
     let (done, release) = std::sync::mpsc::channel();
     std::thread::Builder::new().spawn(move || {
         let mut line = Vec::new();
@@ -302,7 +273,6 @@ fn acquire(
         acquired_at,
     };
     let index = hold.guard.index().to_string();
-    // Decided with the slot already in hand, so the share counts this holder.
     let caller_jobs = std::env::var(ENV_CARGO_JOBS).ok();
     let nice_raw = std::env::var(ENV_NICE).ok();
     let limits = pool.granted_limits(
@@ -330,10 +300,7 @@ impl SlotHold {
     fn release(self, label: &str, exit_code: Option<u8>) {
         let index = self.guard.index().to_string();
         let hold_ms = self.acquired_at.elapsed().as_millis();
-        // Free the slot before announcing so a woken waiter finds it free.
         drop(self.guard);
-        // Unconditional: the subscriber this event wakes has already given up
-        // and exited, so its waiting flag is gone (ADR 0070).
         announce(
             "BuildSlotReleased",
             &format!("A build slot freed up after `{label}`"),
@@ -351,8 +318,6 @@ impl SlotHold {
     }
 }
 
-/// The class the enclosing acquisition was granted, as that acquisition
-/// reported it. Unknown or missing values stay unknown, never a guess.
 fn granted_class() -> Option<SlotClass> {
     SlotClass::parse(&std::env::var(ENV_GRANTED_CLASS).ok()?)
 }
@@ -365,13 +330,6 @@ fn command_outcome(exit_code: Option<u8>) -> &'static str {
     }
 }
 
-/// The slot label: `--label` when given, else the program's file name alone.
-///
-/// Never the arguments. The label persists in the slot file and on every
-/// `BuildSlot*` event, so a token passed on the command line would outlive
-/// the build. The program word is cut at the first space or `=` BEFORE the
-/// file name is taken. So a whole command quoted as one word, or a leading
-/// `KEY=value`, leaves nothing of its value behind, even past a `/`.
 fn default_label(label: Option<&str>, command: &[String]) -> String {
     let label = label.unwrap_or_else(|| {
         let first = command.first().map(String::as_str).unwrap_or_default();
@@ -387,8 +345,6 @@ fn default_label(label: Option<&str>, command: &[String]) -> String {
     label.chars().take(LABEL_CHARS).collect()
 }
 
-/// Block until a slot frees, reporting progress. `None` means `--max-wait`
-/// elapsed, which is the only way this returns without a slot.
 fn wait_for_slot(
     pool: &BuildSlotPool,
     label: &str,
@@ -415,13 +371,8 @@ fn wait_for_slot(
     let max_wait = max_wait_secs.map(Duration::from_secs);
     let guard = pool.acquire(label, max_wait, class, |waited| {
         if lease_parent.is_some_and(|parent| parent_pid() != parent) {
-            // Still queued. Process exit drops the kernel's waiter locks.
             std::process::exit(0);
         }
-        // Announced from inside the wait, not before it. `acquire` raises the
-        // waiting flag before this first runs. So a holder releasing during
-        // the announcement's own round trip already sees a queued build, and
-        // emits its release. Announcing first left that window silent.
         if !announced {
             announced = true;
             #[cfg(unix)]
@@ -478,8 +429,6 @@ fn wait_for_slot(
     }
 }
 
-/// One line saying what the slot imposed, so a build that is slower than the
-/// last one says why rather than reading as a mystery.
 fn describe_limits(index: &str, capacity: usize, limits: &BuildLimits) -> String {
     let priority = match limits.nice {
         0 => "priority unchanged".to_string(),
@@ -492,19 +441,6 @@ fn describe_limits(index: &str, capacity: usize, limits: &BuildLimits) -> String
     format!("lucidos build-slot: slot {index} of {capacity}, {priority}, {cores}")
 }
 
-/// Lower this process's scheduling priority, so the build it is about to spawn
-/// inherits it.
-///
-/// On OURSELVES rather than through a `pre_exec` hook on the child. A nice
-/// value survives fork and exec, so inheritance covers every `rustc` in the
-/// tree either way. A `pre_exec` closure would also cost std's fast
-/// `posix_spawn` path, and this process only waits for the child afterwards.
-///
-/// `nice(2)` adds to the current value and a non-root process cannot subtract
-/// again. So the increment lands once, at the grant, and a caller who already
-/// lowered this tree keeps that on top. The result is ignored, like every
-/// other failure here: a limiter must never be the reason a build does not
-/// run.
 #[cfg(unix)]
 fn lower_own_priority(increment: i32) {
     if increment <= 0 {
@@ -519,19 +455,6 @@ fn lower_own_priority(increment: i32) {
 #[cfg(not(unix))]
 fn lower_own_priority(_increment: i32) {}
 
-/// Run the wrapped command with the slot marked in its environment, inheriting
-/// stdio so the build looks exactly as it would unwrapped.
-///
-/// The core share goes in the same way, and only when the slot granted one:
-/// [`BuildLimits::NONE`] leaves `CARGO_BUILD_JOBS` exactly as the caller left
-/// it, which is what an explicit value and a nested run both resolve to.
-///
-/// Deliberately NOT in a process group of its own. Staying in ours is what
-/// makes a group signal reach the build too: a terminal Ctrl-C, and the
-/// engine's `BuildProcessGroupGuard`, which SIGKILLs the whole group when an
-/// explicit Rebuild restarts the build. Calling `process_group` here would orphan the build.
-/// It would then compile on with its slot already freed (ADR 0070, and the
-/// "orphaned build outlives its wrapper" row in `docs/code-review-priors.md`).
 fn spawn_child(
     command: &[String],
     slot: Option<&str>,
@@ -552,8 +475,6 @@ fn spawn_child(
     } else {
         cmd.env_remove(ENV_REQUEST_ID);
     }
-    // The class that governs admission belongs to this acquisition, not to the
-    // tree it admits. The tree only learns which class was granted.
     match granted_class {
         Some(class) => cmd.env(ENV_GRANTED_CLASS, class.as_str()),
         None => cmd.env_remove(ENV_GRANTED_CLASS),
@@ -570,9 +491,6 @@ fn spawn_child(
     Ok(exit_code(status))
 }
 
-/// The child's exit code, as this process's own. A signalled child reports
-/// `128 + signal`, the shell convention, so a killed build never reads as a
-/// pass.
 fn exit_code(status: std::process::ExitStatus) -> u8 {
     if let Some(code) = status.code() {
         return u8::try_from(code).unwrap_or(1);
@@ -587,12 +505,6 @@ fn exit_code(status: std::process::ExitStatus) -> u8 {
     1
 }
 
-// ── announcing ──────────────────────────────────────────────────────────
-
-/// Emit a domain event, best effort.
-///
-/// Post failures never affect the build's result. The HTTP timeout caps the
-/// wait when an engine accepts the request but does not answer.
 fn announce(event_type: &str, summary: &str, mut payload: serde_json::Value) {
     let Ok(ws) = resolve_from_env() else {
         return;
@@ -608,8 +520,6 @@ fn post_event(
     event_type: &str,
     payload: &serde_json::Value,
 ) -> Result<(), BoxError> {
-    // Through the shared constructor, so the announcement carries the same
-    // origin token and workspace assertion as every other CLI call.
     let client = crate::http::client_with_timeout(ANNOUNCE_TIMEOUT)?;
     let url = format!("{}/api/v1/events/emit", ws.base_url());
     client
@@ -687,8 +597,6 @@ mod tests {
 
     #[test]
     fn a_holder_that_recorded_nothing_still_renders() {
-        // Metadata is written just after the lock is taken, so a probe can
-        // land on a slot that is held but not yet described.
         let held = describe_slot(&SlotState {
             index: 2,
             holder: Some(SlotHolder::default()),
@@ -714,8 +622,6 @@ mod tests {
 
     #[test]
     fn imposing_nothing_says_so_rather_than_claiming_a_limit() {
-        // What an opted-out priority and a caller-set `CARGO_BUILD_JOBS` both
-        // produce. Reading "nice +0, 0 cores" would be a lie in both halves.
         let inert = describe_limits("0", 1, &BuildLimits::NONE);
         assert!(inert.contains("priority unchanged"), "{inert}");
         assert!(inert.contains("cores unchanged"), "{inert}");
@@ -723,7 +629,6 @@ mod tests {
 
     #[test]
     fn an_ordinary_exit_code_passes_through() {
-        // A failing `make lint` must fail the wrapper, or the gate is useless.
         let status = std::process::Command::new("sh")
             .args(["-c", "exit 7"])
             .status()

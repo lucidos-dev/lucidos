@@ -1,12 +1,7 @@
-//! Version 1 diagnostic bundle: a single zstd-compressed JSON object.
-//! Only destination-rendered messages cross this boundary. Classified source
-//! records, cached messages, source paths and raw event payloads are excluded.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MAX_COMPRESSED_BYTES: usize = 32 * 1024 * 1024;
-/// Hard ceiling before JSON parsing, also enforced by the producer. Bounds
-/// expansion of repetitive logs independently of the compressed upload limit.
 pub const MAX_EXPANDED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

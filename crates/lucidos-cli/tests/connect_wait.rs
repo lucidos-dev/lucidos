@@ -1,17 +1,11 @@
-//! Exercise restart recovery through the installed command's HTTP path.
+#[path = "support/connect.rs"]
+mod connect;
 
-use std::io::{Read, Write};
+use connect::{serve_once, unused_address};
 use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
-
-fn unused_address() -> std::net::SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
 
 fn command(address: std::net::SocketAddr) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lucidos"));
@@ -23,47 +17,6 @@ fn command(address: std::net::SocketAddr) -> Command {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn serve_once(listener: TcpListener, response: &'static [u8]) -> String {
-    listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "CLI never connected");
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("accept: {error}"),
-        }
-    };
-    // On macOS an accepted stream inherits the listener's non-blocking mode.
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut request = Vec::new();
-    let mut buffer = [0; 4096];
-    loop {
-        let read = stream.read(&mut buffer).unwrap();
-        assert!(read > 0, "request ended early");
-        request.extend_from_slice(&buffer[..read]);
-        if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-            let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length: "))
-                .unwrap_or("0")
-                .parse()
-                .unwrap();
-            if request.len() >= end + 4 + length {
-                break;
-            }
-        }
-    }
-    stream.write_all(response).unwrap();
-    String::from_utf8(request).unwrap()
 }
 
 #[test]
@@ -97,7 +50,6 @@ fn commands_survive_connection_refused_until_the_engine_returns() {
         let mut command = command(address);
         command.args(&args);
         let child = thread::spawn(move || command.output().unwrap());
-        // Nothing is listening while the command makes its initial attempt.
         thread::sleep(Duration::from_millis(600));
         let request = serve_once(
             TcpListener::bind(address).unwrap(),

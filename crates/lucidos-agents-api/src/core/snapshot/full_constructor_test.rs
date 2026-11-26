@@ -2,8 +2,6 @@ use super::*;
 use crate::engine::chat::recovery::ChatRecoveryExt;
 use crate::{core::secret_store::key_store::TestKeyStore, test_support::*};
 
-/// HOME is scoped to a new executable, never changed in the test runner.
-/// This includes archive recovery and all startup wiring after completion.
 #[tokio::test]
 async fn full_constructor_completes_restore_in_isolated_process() {
     crate::core::secret_store::key_store::install_test_key_store();
@@ -40,7 +38,6 @@ async fn full_constructor_completes_restore_in_isolated_process() {
             .await
             .expect("constructor must finish without archive-lock deadlock")
             .expect("spawn isolated constructor");
-        // Scan before formatting failed subprocess output into the test log.
         assert_redacted(&output.stdout, None);
         assert_redacted(&output.stderr, None);
         assert!(
@@ -135,7 +132,6 @@ async fn full_constructor_completes_restore_in_isolated_process() {
             .fetch_all(&pool)
             .await
             .unwrap();
-    // This tree did not exist at capture time and has uncommitted work.
     let dirty_tree = workspace
         .join(crate::paths::WORKTREES_SUBPATH)
         .join("thread-post-snapshot");

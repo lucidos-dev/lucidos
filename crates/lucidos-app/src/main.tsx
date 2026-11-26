@@ -133,7 +133,13 @@ function stayOnStartingSplash(): void {
 }
 
 async function boot() {
-  await (window as Window & { lucidosRemoteClientReady?: Promise<void> }).lucidosRemoteClientReady;
+  const launch = window as Window & {
+    lucidosRemoteClientReady?: Promise<void>;
+    lucidosWorkspaceResume?: boolean;
+    lucidosRememberPwaWorkspace?: (route: string) => void;
+  };
+  await launch.lucidosRemoteClientReady;
+  if (launch.lucidosWorkspaceResume) return;
   if (IS_PICKER && location.pathname === OUTBOX_IMPORT_PATH) {
     handOverBootOwnership();
     startOutboxImportPage({
@@ -174,7 +180,10 @@ async function boot() {
   }
 
   if (!recoverFromBrokenContext()) {
-    if (!IS_PICKER && WORKSPACE_ID) rememberLastWorkspace(WORKSPACE_ID);
+    if (!IS_PICKER && WORKSPACE_ID) {
+      rememberLastWorkspace(WORKSPACE_ID);
+      if (!isTauri()) launch.lucidosRememberPwaWorkspace?.(WORKSPACE_ID);
+    }
     if (!IS_PICKER) {
       import('./utils/perfProbe')
         .then(({ startPerfProbe }) => startPerfProbe())

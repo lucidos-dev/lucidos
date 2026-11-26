@@ -1,12 +1,3 @@
-//! Fixture-tree tests for the peer lookup, and stand-in gateways for the probe.
-//!
-//! Every lookup case builds a throwaway `$HOME` and scans that, so nothing here
-//! reads the machine it runs on. The developer running these has a real bundle
-//! and a real dev gateway, and either would otherwise answer for a fixture.
-//!
-//! The probe trusts only a leaf the loopback CA issued, so the foreign-cert
-//! case is the load-bearing one: a squatter on the port is not a gateway.
-
 use super::*;
 use crate::registry::Workspace;
 use axum::{routing::get, Router};
@@ -14,22 +5,16 @@ use lucidos_installs::{RunningProcess, ScanRoots};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-// ── Fixture tree ───────────────────────────────────────────────────────────
-
-/// A throwaway `$HOME`, removed when the test ends.
 struct Fixture {
     home: PathBuf,
     _tmp: tempfile::TempDir,
 }
 
-/// One registry entry, as `(slug, display name)`.
 type Entry<'a> = (&'a str, &'a str);
 
 impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        // macOS puts the temp dir behind a symlink, and an un-canonicalised
-        // root makes every `starts_with` on a resolved path miss.
         let home = std::fs::canonicalize(tmp.path()).unwrap();
         Fixture { home, _tmp: tmp }
     }
@@ -38,13 +23,10 @@ impl Fixture {
         ScanRoots::under(&self.home)
     }
 
-    /// Scan the fixture as the source checkout at `ours`, on the dev port.
     fn locate_from(&self, ours: &Path, name: &str) -> Located {
         self.locate_as(ours, lucidos_installs::DEFAULT_DEV_GATEWAY_PORT, name)
     }
 
-    /// Scan the fixture as a process belonging to the install at `ours`, whose
-    /// gateway is configured for `own_port`.
     fn locate_as(&self, ours: &Path, own_port: u16, name: &str) -> Located {
         let running = RunningProcess {
             exe: None,
@@ -57,8 +39,6 @@ impl Fixture {
         )
     }
 
-    /// The packaged bundle, its data dir registered with `entries`. Returns the
-    /// data dir, which is what tells one install from another.
     fn desktop_app(&self, entries: &[Entry]) -> PathBuf {
         std::fs::create_dir_all(self.home.join("Applications/Lucidos.app/Contents")).unwrap();
         let data = self
@@ -68,14 +48,12 @@ impl Fixture {
         data
     }
 
-    /// The dev source checkout, its data dir registered with `entries`.
     fn source_checkout(&self, entries: &[Entry]) -> PathBuf {
         let data = self.home.join(".lucidos/private/gateway");
         self.register(&data, entries);
         data
     }
 
-    /// One `install.sh` instance on `port`, registered with `entries`.
     fn instance(&self, slug: &str, port: u16, entries: &[Entry]) -> PathBuf {
         let data = self.home.join(".lucidos").join(slug);
         std::fs::create_dir_all(&data).unwrap();
@@ -84,7 +62,6 @@ impl Fixture {
         data
     }
 
-    /// Write a gateway registry holding `entries` under `data`.
     fn register(&self, data: &Path, entries: &[Entry]) {
         std::fs::create_dir_all(data).unwrap();
         let registry = Registry {
@@ -106,8 +83,6 @@ impl Fixture {
     }
 }
 
-// ── Locating a workspace ───────────────────────────────────────────────────
-
 #[test]
 fn a_workspace_on_the_other_install_is_found() {
     let fx = Fixture::new();
@@ -124,8 +99,6 @@ fn a_workspace_on_the_other_install_is_found() {
     assert!(peer.install.contains("Lucidos.app"), "{}", peer.install);
 }
 
-/// The caller already searched its own gateway, through the live control
-/// listing. Answering with ourselves would send the page back here.
 #[test]
 fn our_own_install_is_never_a_peer() {
     let fx = Fixture::new();
@@ -147,7 +120,6 @@ fn a_display_name_resolves_to_its_slug() {
     assert_eq!(peer.slug, "my-space");
 }
 
-/// The second arm: a name nobody displays, which slugifies onto a real slug.
 #[test]
 fn a_slug_resolves_even_when_no_display_name_matches() {
     let fx = Fixture::new();
@@ -173,8 +145,6 @@ fn two_installs_carrying_the_name_are_ambiguous() {
     assert_eq!(peers.len(), 2);
 }
 
-/// One install found twice is not two installs. Two bundles in two application
-/// directories share one data dir, so they carry one registry between them.
 #[test]
 fn one_install_found_twice_is_not_ambiguous() {
     let fx = Fixture::new();
@@ -210,9 +180,6 @@ fn one_install_found_twice_is_not_ambiguous() {
     ));
 }
 
-/// Two OTHER installs on one port address neither of them. Only one bound it,
-/// nothing on disk says which, and the registry that matched belongs to the
-/// install that may have lost. Naming it navigates the user to a stranger.
 #[test]
 fn a_hit_on_a_port_two_other_installs_contend_for_is_dropped() {
     let fx = Fixture::new();
@@ -227,9 +194,6 @@ fn a_hit_on_a_port_two_other_installs_contend_for_is_dropped() {
     assert_eq!(fx.locate_from(&ours, "work"), Located::Nowhere);
 }
 
-/// Two distinct installs on one port, both carrying the slug, are not one
-/// install found twice. Keyed on the port and the slug, the dedupe collapsed
-/// them into a single hit and inventory order silently picked the winner.
 #[test]
 fn two_installs_sharing_a_port_and_a_slug_never_pick_a_winner() {
     let fx = Fixture::new();
@@ -244,16 +208,12 @@ fn two_installs_sharing_a_port_and_a_slug_never_pick_a_winner() {
     assert_eq!(fx.locate_from(&ours, "shared"), Located::Nowhere);
 }
 
-/// An install contending for OUR port is skipped, whoever owns it. Only one of
-/// the two binds the port (ADR 0189). If that one is us, the peer's URL lands
-/// here, on a slug we do not serve.
 #[test]
 fn an_install_contending_for_our_own_port_is_not_a_peer() {
     let fx = Fixture::new();
     fx.desktop_app(&[("work", "work")]);
     let ours = fx.source_checkout(&[]);
 
-    // The same fixture resolves normally from a gateway on another port.
     assert!(matches!(
         fx.locate_as(&ours, lucidos_installs::DEFAULT_DEV_GATEWAY_PORT, "work"),
         Located::One(_)
@@ -264,8 +224,6 @@ fn an_install_contending_for_our_own_port_is_not_a_peer() {
     );
 }
 
-/// The name is matched against parsed registry contents, never joined into a
-/// path, so a traversal reads as an ordinary miss.
 #[test]
 fn a_traversal_shaped_name_is_a_miss() {
     let fx = Fixture::new();
@@ -289,14 +247,10 @@ fn an_install_with_no_registry_is_skipped() {
     assert_eq!(fx.locate_from(&ours, "work"), Located::Nowhere);
 }
 
-// ── Probing a peer ─────────────────────────────────────────────────────────
-
-/// A stand-in gateway's health body.
 fn gateway_body() -> Value {
     json!({"status": "ok", "role": "gateway", "release": "0.0.0"})
 }
 
-/// A server answering `GATEWAY_HEALTH_PATH` with `body`, and nothing else.
 fn stand_in_router(body: Value) -> Router {
     Router::new().route(
         GATEWAY_HEALTH_PATH,
@@ -307,8 +261,6 @@ fn stand_in_router(body: Value) -> Router {
     )
 }
 
-/// Serve `body` over plain http on a free loopback port, the way a gateway
-/// from before loopback TLS did.
 async fn http_stand_in(body: Value) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -318,8 +270,6 @@ async fn http_stand_in(body: Value) -> u16 {
     port
 }
 
-/// Serve `body` over https behind a self-signed cert the loopback CA never
-/// issued: a squatter on a gateway's port.
 async fn foreign_https_stand_in(body: Value) -> u16 {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -346,15 +296,12 @@ async fn a_peer_serving_the_loopback_ca_leaf_answers_as_gateway() {
     assert!(answers_as_gateway(&probe_client(), peer.port()).await);
 }
 
-/// Loopback is https on every gateway now, so plain http is not one of ours.
 #[tokio::test]
 async fn a_plaintext_peer_does_not_answer_as_gateway() {
     let port = http_stand_in(gateway_body()).await;
     assert!(!answers_as_gateway(&probe_client(), port).await);
 }
 
-/// A squatter can claim the role in its body, but not present a leaf the
-/// loopback CA issued.
 #[tokio::test]
 async fn a_peer_with_a_foreign_cert_does_not_answer_as_gateway() {
     let port = foreign_https_stand_in(gateway_body()).await;
@@ -363,7 +310,6 @@ async fn a_peer_with_a_foreign_cert_does_not_answer_as_gateway() {
 
 #[tokio::test]
 async fn nothing_listening_does_not_answer_as_gateway() {
-    // Bind and drop, so the port is free and almost certainly still unclaimed.
     let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = free.local_addr().unwrap().port();
     drop(free);
@@ -371,8 +317,6 @@ async fn nothing_listening_does_not_answer_as_gateway() {
     assert!(!answers_as_gateway(&probe_client(), port).await);
 }
 
-/// The port is a well-known number and anything may hold it, so the answer has
-/// to say it came from a gateway.
 #[tokio::test]
 async fn something_else_on_the_port_does_not_answer_as_gateway() {
     let other = lucidos_local_token::test_support::serve_https(stand_in_router(

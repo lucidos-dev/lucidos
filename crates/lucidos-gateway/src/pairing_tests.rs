@@ -21,8 +21,6 @@ fn gateway() -> PendingPairings {
     PendingPairings::new(PairingKind::Gateway)
 }
 
-/// A wrong long secret of `kind` that still has the minted shape, so the test
-/// exercises the compare rather than the grammar.
 fn wrong_secret(kind: PairingKind, n: u32) -> String {
     let body: String = format!("{n:026}")
         .bytes()
@@ -37,8 +35,6 @@ fn short(minted: &MintedPairing) -> &str {
         .as_deref()
         .expect("a device pairing has a short code")
 }
-
-// ── Shapes ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn a_minted_secret_is_its_prefix_and_26_base32_characters() {
@@ -63,8 +59,6 @@ fn a_secret_of_one_kind_is_not_a_secret_of_the_other() {
 
 #[test]
 fn the_readers_refuse_anything_that_could_escape_a_json_string() {
-    // A device token is echoed into the manifest's `start_url`, so the grammar
-    // is the whole defence. Each of these is a caller's to send.
     let long = wrong_secret(PairingKind::Device, 1);
     for raw in [
         "",
@@ -90,8 +84,6 @@ fn the_readers_refuse_anything_that_could_escape_a_json_string() {
     assert_eq!(valid_device_pairing_token("  01234567 "), Some("01234567"));
     assert_eq!(valid_device_pairing_token(&long), Some(long.as_str()));
 }
-
-// ── Redemption ──────────────────────────────────────────────────────────────
 
 #[test]
 fn a_long_secret_redeems_once_on_any_channel() {
@@ -183,10 +175,6 @@ fn a_pairing_expires() {
     );
 }
 
-// ── Floods ──────────────────────────────────────────────────────────────────
-
-/// Invariant: an unlimited distributed flood of wrong secrets cannot stop a
-/// correct long secret from pairing, for device and gateway pairing alike.
 #[test]
 fn a_distributed_flood_never_stops_a_correct_long_secret() {
     for kind in [PairingKind::Device, PairingKind::Gateway] {
@@ -224,7 +212,6 @@ fn a_distributed_flood_never_stops_a_correct_long_secret() {
     }
 }
 
-/// Invariant: with no pairing pending, a redemption counts nothing.
 #[test]
 fn a_flood_with_nothing_pending_costs_the_next_pairing_nothing() {
     let mut pending = device();
@@ -241,7 +228,6 @@ fn a_flood_with_nothing_pending_costs_the_next_pairing_nothing() {
     );
 }
 
-/// Invariant: a junk flood from X cannot block a correct short code from Y.
 #[test]
 fn one_local_source_spends_only_its_own_budget() {
     let mut pending = device();
@@ -301,8 +287,6 @@ fn an_ipv6_host_cannot_rotate_its_way_to_a_fresh_budget() {
     );
 }
 
-/// Every tailnet node shares one /64, and the control server assigns each its
-/// address. So a tailnet peer keeps a budget of its own.
 #[test]
 fn one_tailnet_device_cannot_spend_another_ones_budget() {
     let mut pending = device();
@@ -400,8 +384,6 @@ fn a_correct_short_code_clears_its_source_and_the_window_refills() {
     );
 }
 
-// ── The owner's answer ──────────────────────────────────────────────────────
-
 fn minted_by(minter: Minter) -> PairingIntent {
     PairingIntent {
         minter,
@@ -413,7 +395,6 @@ const OWNER: OwnerGate<'static> = OwnerGate::DevicePaired {
     asking_as: "My iPhone",
 };
 
-/// The one request waiting, answered by id the way a paired device would.
 fn only_request(pending: &mut PendingPairings) -> PairingRequest {
     let requests = pending.requests();
     assert_eq!(requests.len(), 1, "{requests:?}");
@@ -425,7 +406,6 @@ fn a_pairing_counts_as_a_local_process_s_unless_a_device_minted_it() {
     assert_eq!(PairingIntent::default().minter, Minter::LocalProcess);
 }
 
-/// Invariant 9: with no device paired, a local process's code redeems at once.
 #[test]
 fn a_local_process_s_code_redeems_at_once_with_no_device_paired() {
     for kind in [PairingKind::Device, PairingKind::Gateway] {
@@ -442,7 +422,6 @@ fn a_local_process_s_code_redeems_at_once_with_no_device_paired() {
     }
 }
 
-/// Invariant 9: a paired device's own code never waits.
 #[test]
 fn a_paired_device_s_code_redeems_at_once() {
     for kind in [PairingKind::Device, PairingKind::Gateway] {
@@ -456,13 +435,11 @@ fn a_paired_device_s_code_redeems_at_once() {
     }
 }
 
-/// Invariant 9: with a device paired, a local process's code waits for Allow.
 #[test]
 fn a_local_process_s_code_waits_for_allow_then_redeems() {
     for kind in [PairingKind::Device, PairingKind::Gateway] {
         let mut pending = PendingPairings::new(kind);
         let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
-        // Only the first redeem starts the wait, so the owner hears it once.
         for started in [true, false, false] {
             assert_eq!(
                 pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
@@ -575,8 +552,6 @@ fn an_unknown_request_id_answers_nothing() {
     assert!(!pending.answer("no-such-request", PairingAnswer::Allow));
 }
 
-/// Revoking every device reopens the free pass, as the owner settled
-/// (plan § Phase 6 Design). A request already waiting then redeems.
 #[test]
 fn a_waiting_code_redeems_once_no_device_is_paired() {
     let mut pending = device();
@@ -594,8 +569,6 @@ fn a_waiting_code_redeems_once_no_device_is_paired() {
         Redemption::Redeemed(minted_by(Minter::LocalProcess))
     );
 }
-
-// ── Channels ────────────────────────────────────────────────────────────────
 
 const TAILNET_SELF: IpAddr = IpAddr::V4(Ipv4Addr::new(100, 100, 1, 1));
 
@@ -622,9 +595,6 @@ fn channel(peer: Option<Peer>, pairs: &[(&str, &str)]) -> PairingChannel {
     classify(peer, &headers(pairs), |ip| ip == TAILNET_SELF)
 }
 
-/// Invariant: a loopback peer is refused a short code, whatever its headers.
-/// cloudflared, `tailscale serve`, `ssh -L` and a raw TCP forward all connect
-/// from loopback, and a raw forward passes any `Host` its caller chose.
 #[test]
 fn every_loopback_request_is_public() {
     for (remote, local) in [
@@ -644,8 +614,6 @@ fn every_loopback_request_is_public() {
     }
 }
 
-/// Invariant: a forwarder on this machine aimed at its own LAN or tailnet
-/// address connects from that address, so it is public too.
 #[test]
 fn a_caller_on_this_machine_is_public_on_every_address() {
     for addr in ["192.168.1.5", "100.100.1.1", "[fd12::5]"] {
@@ -695,8 +663,6 @@ fn a_peer_arriving_on_a_tailnet_address_of_this_machine_is_local() {
     ));
 }
 
-/// Invariant: a spoofed forwarding header from an untrusted hop earns no
-/// budget and still marks the request public.
 #[test]
 fn a_spoofed_forwarding_header_neither_spends_nor_earns_a_budget() {
     let mut pending = device();

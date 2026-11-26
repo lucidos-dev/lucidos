@@ -1789,15 +1789,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `@lucidos/<name>` alias. Re-flag only when `index.ts` re-exports the symbol,
   or `system-knowhow/js-sdk.md` documents it.
 
-- **The arrival hold ignores every `loading="lazy"` image, and that is
-  enough.** A reviewer reports that a lazy image already loading above the
-  target is not waited for (`imageAboveStillLoading` in
-  `components/chat/scrollState.ts`). The only lazy transcript image is
-  `GeneratedImage`, whose source is an inline base64 `data:` URI. Nothing is
-  fetched, so once in view it decodes in milliseconds, well inside the quiet
-  window. A dormant lazy image far above would pin the hold to its cap. Re-flag
-  only when a lazy transcript image with a network source appears.
-
 - **`whenLoaded`'s document `pointerdown` listener is not a hand-rolled
   dismiss.** `utils/lazyComponent.tsx` adds a capture listener while a surface
   waits on its chunk. A reviewer reads it against the frontend rule that every
@@ -2652,7 +2643,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `engineVersionPlugin` (removed) and conclude this reverted the `addWatchFile` fix in
   e337cc980. Neither holds. The web client has no version of its own: the only thing
   identifying it is `CLIENT_BUILD_ID`, which is also the exact value the refresh badge
-  compares against the served `sw.js` build id, so the row and the badge agree by
+  compares against the build id in the served HTML shell, so the row and the badge agree by
   construction. Baking the engine's VERSION in instead produced a value frozen at
   bundle-build time that drifted on every engine-only Apply (nothing rebuilds the
   frontend when only `VERSION` changes), showing two disagreeing numbers no reload
@@ -5043,6 +5034,16 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag if the boot path gains a storage fallback, or if the site runs in an
   app iframe or another realm the host boot does not cover.
+
+- **Storage pressure counts stay in the owning workspace's diagnostic log.**
+  The browser reports counts and sizes by fixed category without sending
+  storage keys or values. The generic client log accepts arbitrary payloads,
+  so it treats every payload as private even when the category is known.
+  A maintainer export can show that quota was reached. Reading the inventory
+  requires access to the owning workspace's log.
+
+  Re-flag if the inventory is missing there or exposes keys or values.
+  (`crates/lucidos-agents-api/src/api/internal.rs`.)
 
 - **A device-id adoption that finishes after its boot deadline is meant to.**
   A reviewer notes that `withDeadline` stops waiting but does not cancel

@@ -148,7 +148,7 @@ pub struct ThreadUsersSummary {
     pub last_activity: chrono::DateTime<chrono::Utc>,
     #[serde(flatten)]
     pub roles: ThreadUsers,
-    /// A thread in its family waits on a question.
+    /// A thread in its family, not held, waits on a question.
     pub gate_open: bool,
     /// One of its open gates waited past the team's timeout.
     pub escalated: bool,
@@ -182,7 +182,8 @@ pub async fn list(
 
     let waiting: Vec<Uuid> = sqlx::query_scalar(
         "SELECT thread_id FROM thread_summaries \
-         WHERE status = 'waiting_for_user_answer' AND archive_state <> 'archived'",
+         WHERE status = 'waiting_for_user_answer' AND hold IS NULL \
+           AND archive_state <> 'archived'",
     )
     .fetch_all(pool)
     .await?;
@@ -283,7 +284,7 @@ pub(crate) struct OverdueGate {
 }
 
 /// Open gates asked more than `hours` ago whose root thread has a driver and
-/// that never escalated.
+/// that never escalated. A held thread's gate waits on its hold, not a user.
 pub(crate) async fn overdue_gates(
     pool: &PgPool,
     hours: f64,
@@ -297,7 +298,8 @@ pub(crate) async fn overdue_gates(
                WHERE a.thread_id = q.thread_id AND a.event_type = 'UserQuestionAnswered' \
                  AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id') \
            AND EXISTS (SELECT 1 FROM thread_summaries s \
-               WHERE s.thread_id = q.thread_id AND s.status = 'waiting_for_user_answer') \
+               WHERE s.thread_id = q.thread_id AND s.status = 'waiting_for_user_answer' \
+                 AND s.hold IS NULL) \
          ORDER BY q.created",
     )
     .bind(hours * 3600.0)

@@ -72,7 +72,6 @@ async fn receipt_and_event_are_atomic_deduplicated_across_buses_and_restart() {
     .await
     .unwrap();
     assert_eq!((stored, events), (1, 1));
-    // Exactly one bus publishes; a retry publishes neither.
     let published = rx.try_recv().is_ok() as usize + other_rx.try_recv().is_ok() as usize;
     assert_eq!(published, 1);
     assert!(rx.try_recv().is_err());

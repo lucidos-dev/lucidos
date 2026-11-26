@@ -8,6 +8,8 @@ export function isFirstRun(list: Loadable<WorkspaceStatus[]>): boolean {
   return list.status === 'loaded' && list.data.length === 0;
 }
 
+export type NamedWorkspace = Pick<WorkspaceStatus, 'id' | 'name'>;
+
 export interface RestoreDraft {
   file: File | null;
   key: string;
@@ -16,9 +18,30 @@ export interface RestoreDraft {
 
 export const EMPTY_RESTORE_DRAFT: RestoreDraft = { file: null, key: '', name: '' };
 
+export type RestoreUpload =
+  | { kind: 'idle' }
+  | { kind: 'uploading'; sentBytes: number; totalBytes: number }
+  | { kind: 'retrying'; attempt: number; maxAttempts: number; reason: string; sentBytes: number; totalBytes: number }
+  | { kind: 'starting' };
+
+export const IDLE_RESTORE_UPLOAD: RestoreUpload = { kind: 'idle' };
+
+export function restoreButtonLabel(upload: RestoreUpload): string {
+  switch (upload.kind) {
+    case 'idle': return 'Restore';
+    case 'uploading': return `Uploading ${uploadPercent(upload.sentBytes, upload.totalBytes)}%`;
+    case 'retrying': return `Retrying ${upload.attempt}/${upload.maxAttempts}`;
+    case 'starting': return 'Starting…';
+  }
+}
+
+function uploadPercent(sent: number, total: number): number {
+  return total > 0 ? Math.min(100, Math.floor((sent / total) * 100)) : 0;
+}
+
 export type RestoreBlocker =
   | { kind: 'file' | 'key' | 'name'; message: string }
-  | { kind: 'collision'; message: string; existing: WorkspaceStatus };
+  | { kind: 'collision'; message: string; existing: NamedWorkspace };
 
 export function workspaceAddress(slug: string): string {
   return `/${slug}/`;
@@ -26,22 +49,22 @@ export function workspaceAddress(slug: string): string {
 
 export function nameTakenBy(
   name: string,
-  workspaces: readonly WorkspaceStatus[],
+  workspaces: readonly NamedWorkspace[],
   exceptId?: string,
-): WorkspaceStatus | null {
+): NamedWorkspace | null {
   const wanted = name.trim().toLowerCase();
   if (!wanted) return null;
   return workspaces.find((w) => w.id !== exceptId && w.name.trim().toLowerCase() === wanted) ?? null;
 }
 
-export function nameTakenMessage(existing: WorkspaceStatus): string {
+export function nameTakenMessage(existing: NamedWorkspace): string {
   return `You already have a workspace called “${existing.name}”. Choose a different name.`;
 }
 
 export function collidingWorkspace(
   name: string,
-  workspaces: readonly WorkspaceStatus[],
-): WorkspaceStatus | null {
+  workspaces: readonly NamedWorkspace[],
+): NamedWorkspace | null {
   const trimmed = name.trim();
   if (!trimmed) return null;
   const slug = slugifyWorkspaceName(trimmed);
@@ -50,7 +73,7 @@ export function collidingWorkspace(
 
 export function restoreBlocker(
   draft: RestoreDraft,
-  workspaces: readonly WorkspaceStatus[],
+  workspaces: readonly NamedWorkspace[],
 ): RestoreBlocker | null {
   if (!draft.file) {
     return { kind: 'file', message: 'Choose the .age or .enc backup file to restore.' };
@@ -90,7 +113,7 @@ export function applyRestoreFile(current: RestoreDraft, file: File | null | unde
 
 export type CreateNote = { message: string; blocking: boolean } | null;
 
-export function createNote(name: string, workspaces: readonly WorkspaceStatus[]): CreateNote {
+export function createNote(name: string, workspaces: readonly NamedWorkspace[]): CreateNote {
   const taken = nameTakenBy(name, workspaces);
   if (taken) return { message: nameTakenMessage(taken), blocking: true };
   const existing = collidingWorkspace(name, workspaces);

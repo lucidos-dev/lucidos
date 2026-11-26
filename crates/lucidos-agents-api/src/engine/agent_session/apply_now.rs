@@ -60,8 +60,6 @@ impl Drop for ChangeClaimGuard {
         let Some(sessions) = self.sessions.take() else {
             return;
         };
-        // Outside a runtime the map dies with the process, so nothing is left
-        // to release.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -91,10 +89,6 @@ pub(crate) fn apply_inactivity_timeout_minutes(
     }
 }
 
-/// Wait until the turn that read a [`send_awaited_prompt`] prompt ends.
-///
-/// A turn already running when the prompt was sent ends first, and does not
-/// answer it (ADR 0268). A session that ends first drops the sender.
 pub(crate) async fn wait_for_prompt_turn(
     answered: tokio::sync::oneshot::Receiver<InputAnswered>,
     context: &str,
@@ -126,29 +120,12 @@ async fn commit_after_prompt_turn(
     })
 }
 
-/// What an Apply with nothing pending and no proposal hold answers (ADR 0400).
 pub(crate) const NOTHING_PROPOSED_REFUSAL: &str =
     "Nothing is proposed on this thread, so there is nothing to apply. A turn that \
      finishes proposes its work.";
 
 #[easy_ext::ext(ApplyNowExt)]
 pub(crate) impl LucidosEngine {
-    /// Apply Now: keep the existing Claude Code session alive and use it for review/conflict resolution.
-    /// Only kills CC after the merge succeeds. With no live session it applies
-    /// the pending change directly. Either way it needs a proposal: with
-    /// nothing pending it refuses (ADR 0400).
-    ///
-    /// Runs as a background task (tokio::spawn). Steps:
-    /// 1. Auto-commit in worktree
-    /// 2. Review if needed (send follow-up to existing CC)
-    /// 3. Refresh the pending change to the branch head
-    /// 4. Try merge (clean / trivial / CC-assisted conflict resolution)
-    /// 5. On success: kill CC + clean up. On failure: CC stays alive for retry.
-    ///
-    /// An apply that passes its refusals is bracketed by `ApplyNowStarted` and
-    /// `ApplyNowEnded`, which project `apply_in_flight` (ADR 0437). Returns the
-    /// thread's summary version once the call's own events landed, so the
-    /// caller can hold its "requesting" state until the row reaches it.
     async fn apply_now(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -183,16 +160,9 @@ pub(crate) impl LucidosEngine {
             }
         }
 
-        // Extract session metadata — if no live session, fall back to stale handling
         let (worktree_path, branch_name, repo_root, msg_tx, last_event_at) = {
             let mut guard = self.agent_sessions.lock().await;
             match guard.get_mut(&thread_id) {
-                // `is_live` gates the claim for the same reason
-                // `decide_in_place_merge_claim` does: driving a phantom (or an
-                // exited) session means sending the review/merge prompt into a
-                // dead `msg_tx` and failing the apply with "Session channel
-                // closed", when falling through to the no-live-session path
-                // below would have applied the pending change cleanly.
                 Some(session)
                     if session.is_live()
                         && session.worktree_path.is_some()
@@ -225,12 +195,6 @@ pub(crate) impl LucidosEngine {
                 _ => {
                     drop(guard);
 
-                    // No live session: apply the pending change directly.
-                    // Coding-agent sessions exit at a clean idle, so this is
-                    // the usual state of a thread the user returns to apply.
-                    // A pending row needs no re-proposal, which would only
-                    // add a duplicate `ChangeProposed` to the timeline. See
-                    // `apply_now_no_live_session_fast_path_preserves_clean_pending_change`.
                     let pending = self.changes().pending_for_thread(thread_id).await?;
                     if !pending.is_empty() {
                         let engine = self.clone_arc();
@@ -257,9 +221,6 @@ pub(crate) impl LucidosEngine {
                             .map_err(|e| format!("Apply task for {thread_id} failed: {e}"))?;
                     }
 
-                    // Nothing is pending, so nothing is Apply's to land
-                    // (ADR 0400). A stale session's work is proposed by its
-                    // own recovery, never by an Apply.
                     let error = self.nothing_proposed_refusal(thread_id).await;
                     log_legacy!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
                     let refused = self
@@ -298,20 +259,12 @@ pub(crate) impl LucidosEngine {
                 .emit_apply_now_started(thread_id, actor.clone())
                 .await;
             let refused = started.is_err();
-            // The receiver is gone only when the request was dropped, and the
-            // apply goes on without it.
             let _ = started_tx.send(started);
             if refused {
                 release_change_claim(&mut *engine.agent_sessions.lock().await, thread_id, &msg_tx);
                 return;
             }
             let panic_result = std::panic::AssertUnwindSafe(async {
-                // Liveness-based timeout: abort only if CC hasn't emitted any
-                // events for 10 minutes (not wall-clock — active sessions can
-                // run as long as they keep producing output). The clock is
-                // anchored to apply-start (not just CC's last event) so a long
-                // pre-apply idle gap can't trip an instant false timeout — see
-                // `apply_inactivity_timeout_minutes`.
                 let inactivity_limit_ms: i64 = 600_000;
                 let apply_started_ms = now_epoch_millis();
                 let inner_fut = engine.apply_now_inner(
@@ -328,7 +281,6 @@ pub(crate) impl LucidosEngine {
                     match tokio::time::timeout(Duration::from_secs(30), &mut inner_fut).await {
                         Ok(result) => break result,
                         Err(_) => {
-                            // Check liveness: has CC emitted an event recently?
                             let last_ms = last_event_at.load(std::sync::atomic::Ordering::Relaxed);
                             if let Some(minutes) = apply_inactivity_timeout_minutes(
                                 now_epoch_millis(),
@@ -342,7 +294,6 @@ pub(crate) impl LucidosEngine {
                                 )
                                 .into());
                             }
-                            // Still alive — keep waiting
                         }
                     }
                 }
@@ -354,13 +305,10 @@ pub(crate) impl LucidosEngine {
                     Err(_) => Err("apply_now_inner panicked".into()),
                 };
 
-            // Always clear the in-progress flag — runs after normal completion,
-            // timeout, error, or panic.
             release_change_claim(&mut *engine.agent_sessions.lock().await, thread_id, &msg_tx);
 
             if let Err(e) = result {
                 log_legacy!("[ApplyNow] Failed for thread {}: {}", thread_id, e);
-                // Tell the user why. `ApplyNowEnded` below ends the apply.
                 engine
                     .event_bus
                     .emit_or_log(
@@ -380,9 +328,6 @@ pub(crate) impl LucidosEngine {
                     )
                     .await;
             }
-            // Every exit reaches here, panic and timeout included, and only
-            // after the claim is released: a client that sees the apply end
-            // can start the next one.
             engine
                 .emit_apply_now_ended(thread_id, ApplyNowOutcome::Finished)
                 .await;
@@ -393,8 +338,6 @@ pub(crate) impl LucidosEngine {
             .map_err(|_| format!("The apply task for {thread_id} ended before it started"))?
     }
 
-    /// Apply each pending change in turn, for an Apply Now with no live
-    /// session.
     async fn apply_pending_now(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -412,16 +355,12 @@ pub(crate) impl LucidosEngine {
                 change.id,
                 thread_id
             );
-            // Log only: `apply_change` announces this failure itself, and a
-            // second emit draws the same card twice. The two errors it leaves
-            // unannounced mean the row it was just handed no longer reads.
             if let Err(e) = self.apply_change(change.id, actor.clone()).await {
                 log_legacy!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
             }
         }
     }
 
-    /// Announce that an Apply Now began, and return the row's version after it.
     async fn emit_apply_now_started(
         &self,
         thread_id: Uuid,
@@ -438,9 +377,6 @@ pub(crate) impl LucidosEngine {
         Ok(emitted.and_then(|r| r.summary_version))
     }
 
-    /// Announce that the Apply Now on this thread is over, and return the row's
-    /// version after it. A failed emit leaves the flag for the next startup's
-    /// `end_interrupted_applies`.
     async fn emit_apply_now_ended(&self, thread_id: Uuid, outcome: ApplyNowOutcome) -> Option<i64> {
         emit_apply_now_ended(&self.event_bus, thread_id, outcome).await
     }
@@ -454,7 +390,6 @@ pub(crate) impl LucidosEngine {
         commit_after_prompt_turn(answered, worktree_path, context).await
     }
 
-    /// Inner implementation for apply_now — runs in a background task.
     async fn apply_now_inner(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -467,8 +402,6 @@ pub(crate) impl LucidosEngine {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
-        // Apply acts only on a proposal (ADR 0400). Work no change carries is
-        // never Apply's to propose. An unanswered read refuses too.
         let pending = match self.changes().get_pending_by_branch(branch_name).await {
             Ok(row) => row.is_some(),
             Err(e) => {
@@ -494,7 +427,6 @@ pub(crate) impl LucidosEngine {
             return Ok(());
         }
 
-        // Step 1: Auto-commit in worktree (preserves harden marker if fresh)
         auto_commit_preserving_marker(
             &self.pool,
             worktree_path,
@@ -506,8 +438,6 @@ pub(crate) impl LucidosEngine {
 
         let kind_ctx =
             crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id)).await;
-        // Before hardening, so a held branch never spends a suite run on a
-        // change that cannot land. Both gates judge what will land.
         let landing = self.landing_files(repo_root, branch_name).await;
         let floor = self
             .plan_floor(&kind_ctx, repo_root, branch_name)
@@ -523,9 +453,6 @@ pub(crate) impl LucidosEngine {
             .await;
             return Ok(());
         }
-        // Before hardening too: an integrated sub-thread's work never lands
-        // on its own, so a full suite run here would buy nothing. A plan
-        // alone is the exception, as in the proposal hold.
         if !lands_plan_files_only(landing.as_deref().unwrap_or_default())
             && crate::engine::integrated::thread_is_integrated(&self.pool, thread_id).await
         {
@@ -539,8 +466,6 @@ pub(crate) impl LucidosEngine {
             return Ok(());
         }
 
-        // The same hardening gate as `change_ops::apply_change`. Apps own
-        // their hardening, so their marker is never probed.
         let mut hardened = !kind_ctx.is_app()
             && branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await;
         if apply_must_harden(&kind_ctx, hardened, landing.as_deref()) {
@@ -602,7 +527,6 @@ pub(crate) impl LucidosEngine {
             return Ok(());
         }
 
-        // Step 3: Check for commits
         let has_commits = has_branch_commits(repo_root, branch_name).await;
 
         if !has_commits {
@@ -634,7 +558,7 @@ pub(crate) impl LucidosEngine {
                 None => None,
             };
             if let Some((change, claim)) = pending_change {
-                crate::engine::thread_events::emit_change_apply_requested(
+                if let Err(refusal) = crate::engine::thread_events::emit_change_apply_requested(
                     &self.event_bus,
                     thread_id,
                     change.id,
@@ -642,7 +566,12 @@ pub(crate) impl LucidosEngine {
                     &change.repo_root,
                     actor.clone(),
                 )
-                .await;
+                .await
+                {
+                    self.emit_apply_failed(thread_id, change.id, &refusal.to_string(), actor)
+                        .await;
+                    return Ok(());
+                }
                 let already_on_main = change.files.is_empty()
                     || crate::engine::git_ops::main_history_touches_files(repo_root, &change.files)
                         .await;
@@ -656,8 +585,8 @@ pub(crate) impl LucidosEngine {
                         .emit_change_applied(
                             &claim,
                             thread_id,
-                            false, // no-op: the work is already on main, nothing to restart now
-                            false, // client_update
+                            false,
+                            false,
                             Vec::new(),
                             change.thread_title.clone(),
                             actor.clone(),
@@ -668,10 +597,6 @@ pub(crate) impl LucidosEngine {
                         log_legacy!("[ApplyNow] Could not record merged change: {}", error);
                         return Ok(());
                     }
-                    // The branch is reset for reuse below. `emit_change_applied`
-                    // cleared the applied change's branch markers. Make sure the
-                    // already-merged main reaches the remote: the abandoned
-                    // apply that merged it may never have pushed.
                     self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
                         .await;
                     push_main_in_background(repo_root, &self.event_bus);
@@ -680,13 +605,10 @@ pub(crate) impl LucidosEngine {
                 }
             }
 
-            // Genuinely nothing to apply (empty branch, no pending change, or a
-            // declared-files-but-no-commits mismatch that recovery refused).
             log_legacy!(
                 "[ApplyNow] No commits on branch {} — nothing to apply",
                 branch_name
             );
-            // Emit ChangeApplyFailed so frontend clears the "Applying..." state
             self.event_bus
                 .emit_or_log(
                     BusEvent::Thread {
@@ -709,7 +631,7 @@ pub(crate) impl LucidosEngine {
             return Ok(());
         }
 
-        // Step 4: Propose change
+        // INVARIANT: Recovery tests use this boundary: // Step 4: Propose change
         let changed_files = branch_changed_files(repo_root, branch_name).await;
         let requires_restart = files_require_restart(&changed_files);
         let base = default_local_branch(repo_root).await;
@@ -717,7 +639,6 @@ pub(crate) impl LucidosEngine {
         let description =
             describe_branch_changes(repo_root, &log_range, "Applied changes", None).await;
 
-        // Hardened: we just ran hardening or it was already hardened.
         let repo_root_str = repo_root.to_string_lossy();
         let outcome = self
             .propose_change(
@@ -730,8 +651,6 @@ pub(crate) impl LucidosEngine {
                     requires_restart,
                     channel: EventChannel::ClaudeCode,
                     hardened,
-                    // Apply-now proposes within a live agent flow. Origin is
-                    // carried by the surrounding MessageReceived.
                     origin: None,
                 },
                 crate::engine::change_ops::HoldReentry::default(),
@@ -739,7 +658,6 @@ pub(crate) impl LucidosEngine {
             .await?;
         let change_id = match outcome {
             ProposeOutcome::Proposed(id) => id,
-            // The marker went away after the check above.
             ProposeOutcome::Held(hold) => {
                 self.refuse_apply_now_for_hold(thread_id, worktree_path, hold, actor)
                     .await;
@@ -748,7 +666,11 @@ pub(crate) impl LucidosEngine {
             ProposeOutcome::Unfinished => {
                 return Err("propose_change never withholds a finished turn".into());
             }
-            // Already in the landing lane: the lane answers for it below.
+            ProposeOutcome::Refused(refusal) => {
+                self.refuse_apply_now(thread_id, worktree_path, &refusal.to_string(), actor)
+                    .await;
+                return Ok(());
+            }
             ProposeOutcome::AwaitingLanding(id) => id,
         };
         let Some(claim) = self.claim_pending_change(change_id).await? else {
@@ -758,7 +680,7 @@ pub(crate) impl LucidosEngine {
             );
             return Ok(());
         };
-        crate::engine::thread_events::emit_change_apply_requested(
+        if let Err(refusal) = crate::engine::thread_events::emit_change_apply_requested(
             &self.event_bus,
             thread_id,
             change_id,
@@ -766,9 +688,13 @@ pub(crate) impl LucidosEngine {
             &repo_root_str,
             actor.clone(),
         )
-        .await;
+        .await
+        {
+            self.emit_apply_failed(thread_id, change_id, &refusal.to_string(), actor)
+                .await;
+            return Ok(());
+        }
 
-        // Step 5: Check main repo for uncommitted changes
         self.commit_dirty_logged("Coding agent changes", "apply_now auto-commit")
             .await;
         let dirty = {
@@ -779,7 +705,6 @@ pub(crate) impl LucidosEngine {
             let msg = "Cannot merge: the repository has uncommitted changes. Commit or stash them first, then try again.";
             self.emit_apply_failed(thread_id, change_id, msg, actor.clone())
                 .await;
-            // CC stays alive for retry
             return Ok(());
         }
 
@@ -798,20 +723,17 @@ pub(crate) impl LucidosEngine {
                     );
                     self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
                         .await;
-                    // CC stays alive so the session can widen the bound or plan.
                     return Ok(());
                 }
             }
         }
 
-        // Only the landing lane moves `main` for Lucidos source (ADR 0463).
         if crate::engine::landing_lane::takes_landing_lane(&kind_ctx, repo_root, self.repo_root()) {
             self.apply_now_through_lane(thread_id, claim, worktree_path, branch_name, actor)
                 .await;
             return Ok(());
         }
 
-        // Step 6: Merge main into CC worktree and ff main to the branch
         match self
             .merge_via_cc_session(
                 thread_id,
@@ -847,17 +769,12 @@ pub(crate) impl LucidosEngine {
             Err(e) => {
                 self.emit_apply_failed(thread_id, change_id, &e.to_string(), actor.clone())
                     .await;
-                // CC stays alive for retry
             }
         }
 
         Ok(())
     }
 
-    /// The landing-lane half of Apply Now. This apply holds the idle session,
-    /// so once the lane has landed everything on the branch, the worktree
-    /// resets to `main` as after any apply. A change still queued leaves the
-    /// worktree alone. Every failure was announced by the lane.
     async fn apply_now_through_lane(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -908,10 +825,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Merge main into a CC worktree and fast-forward main to the branch.
-    /// Fast path: try ff directly. If main diverged, send CC a single prompt
-    /// to merge, resolve conflicts, harden, and test — then ff again.
-    /// Returns (pre_sha, post_sha) on success.
     async fn merge_via_cc_session(
         &self,
         thread_id: Uuid,
@@ -921,7 +834,6 @@ pub(crate) impl LucidosEngine {
         repo_root: &Path,
         msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        // Fast path: if branch already includes main, just ff
         if let Ok(shas) = catchup_and_ff_to_main(repo_root, worktree_path, branch_name).await {
             log_legacy!("[MergeViaCC] Fast path succeeded for {}", branch_name);
             return Ok(shas);
@@ -938,12 +850,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// The CC-assisted (slow) half of `merge_via_cc_session`: `main` has
-    /// diverged, so drive the live session through a merge + conflict
-    /// resolution, then ff main to the branch. Split out so the `apply_change`
-    /// Tier-1 path can run the fast ff inline (synchronous, sub-second) and
-    /// hand only this slow half to a background task — keeping the parent
-    /// thread's turn free instead of blocking it for the whole resolution.
     async fn cc_assisted_merge_then_ff(
         &self,
         thread_id: Uuid,
@@ -953,21 +859,12 @@ pub(crate) impl LucidosEngine {
         repo_root: &Path,
         msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        // Main has diverged — CC handles the merge. Files are populated by a
-        // probe merge so the panel can list which files actually conflict
-        // (empty list = clean merge that just needs a merge commit).
         let conflict_files = probe_merge_conflicts(worktree_path).await;
         log_legacy!(
             "[MergeViaCC] Fast path failed — delegating merge to CC for {} ({} conflicting file(s))",
             branch_name,
             conflict_files.len()
         );
-        // Bind the session to this resolution at the same moment the pairing
-        // opens, so the merge-ownership guard (ADR 0060) can name the resolver.
-        // The detached Tier-2 / Tier-3 spawns get their binding at session
-        // registration instead, because their session does not exist yet when
-        // they open the pairing; Tier 1 injects the prompt into a session that
-        // is already running, so the binding belongs here.
         self.bind_session_to_conflict_resolution(thread_id, change_id)
             .await;
         let main_at_start = branch_head_sha(repo_root, "main").await;
@@ -991,8 +888,6 @@ pub(crate) impl LucidosEngine {
             );
         }
 
-        // Verify CC completed the merge it was asked for. Changes that landed
-        // on main since are the catch-up's to merge, below.
         if !resolution_merged_main(repo_root, main_at_start.as_deref(), branch_name).await {
             return Err(
                 "Coding agent session ended without completing the merge. Try applying again."
@@ -1000,8 +895,6 @@ pub(crate) impl LucidosEngine {
             );
         }
 
-        // A leftover edit that fails to commit fails the apply before `main`
-        // moves. Fast-forwarding anyway publishes only the committed part.
         commit_worktree_or_err(
             worktree_path,
             "Coding agent changes (post-merge auto-commit)",
@@ -1009,7 +902,7 @@ pub(crate) impl LucidosEngine {
         .await
         .map_err(|e| format!("Could not commit the leftover merge edits: {e}"))?;
 
-        // The resolving session edited after the apply-time bound check, so
+        // INVARIANT: The resolving session edited after the apply-time bound check, so
         // this rechecks a bounded security fix, as Tiers 2 and 3 do. Both
         // callers treat an `Err` as a failed apply, never as a cue to escalate.
         if let Some(refusal) = self
@@ -1024,19 +917,6 @@ pub(crate) impl LucidosEngine {
             .map_err(|e| format!("ff-merge to main failed after CC merge: {}", e).into())
     }
 
-    /// Run the CC-assisted conflict merge as a guarded background task and
-    /// finalize, then return immediately. This is the async counterpart of the
-    /// `apply_now` spawn: same liveness-timeout (abort if CC goes silent for 10
-    /// minutes), panic guard, and always-clear of `change_claim`.
-    ///
-    /// The caller (`apply_change` Tier 1) has already claimed the session via
-    /// `begin_in_place_merge` and run the fast-forward inline; this handles only
-    /// the slow divergent-`main` path. On success it emits `ChangeApplied` (via
-    /// `apply_now_success`); on failure it emits `ChangeApplyFailed` and leaves
-    /// the session alive for retry. Either way, when the session reaches its
-    /// terminal event the EventBus parent-callback fan-out wakes the parent
-    /// thread with a `ChildThreadCompleted` — so the parent gets a fresh
-    /// follow-up turn instead of a turn frozen for the whole resolution.
     #[allow(clippy::too_many_arguments)]
     fn spawn_in_place_conflict_recovery(
         self: &Arc<Self>,
@@ -1059,9 +939,6 @@ pub(crate) impl LucidosEngine {
                 last_event_at,
             } = session;
 
-            // Liveness-based timeout mirrors `apply_now`: abort only if CC has
-            // emitted no events for 10 minutes (not wall-clock — an active
-            // conflict resolution can run as long as it keeps producing output).
             let panic_result = std::panic::AssertUnwindSafe(async {
                 let inactivity_limit_ms: i64 = 600_000;
                 let recovery_started_ms = now_epoch_millis();
@@ -1102,7 +979,6 @@ pub(crate) impl LucidosEngine {
                     Err(_) => Err("cc_assisted_merge_then_ff panicked".into()),
                 };
 
-            // Always clear the in-progress claim — normal, timeout, error, panic.
             release_change_claim(&mut *engine.agent_sessions.lock().await, thread_id, &msg_tx);
 
             match result {
@@ -1143,8 +1019,6 @@ pub(crate) impl LucidosEngine {
         });
     }
 
-    /// Helper: kill Claude Code session and clean up after a successful apply.
-    /// Returns merged commit subjects and the requested build outcome for the API response.
     #[allow(clippy::too_many_arguments)]
     async fn apply_now_success(
         self: &Arc<Self>,
@@ -1162,8 +1036,6 @@ pub(crate) impl LucidosEngine {
     {
         let change_id = claim.change_id();
         let commits = commits_in_range(repo_root, pre_sha, post_sha).await;
-        // Title is best-effort metadata for the ChangeApplied event payload —
-        // a DB lookup error shouldn't block the apply that just succeeded.
         let thread_title = sqlx::query_scalar::<_, String>(
             "SELECT title FROM thread_summaries WHERE thread_id = $1",
         )
@@ -1192,31 +1064,10 @@ pub(crate) impl LucidosEngine {
                 )),
             )
             .await?;
-        // Apply-time net for the "≤1 pending change per thread" invariant: now
-        // that this change landed, drop any stale pending change the thread
-        // still holds on another branch so it can't keep blocking Archive.
-        // `propose_change` is the primary guard; this is the apply-side backstop.
-        // See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
         self.discard_orphaned_pending_siblings(thread_id, change_id, actor.clone())
             .await;
-        // Refresh entity caches (apps, artifacts) for SSE subscribers — the
-        // CC worktree wrote files directly into `data/apps/<id>/...` /
-        // `data/artifacts/...`, so the only signal the frontend gets is
-        // ChangeApplied unless we ladder up to per-entity events here. See
-        // `emit_entity_events_for_change_apply` for the detection rules.
-        //
-        // A silent miss here resurrects the exact bug this path was added to
-        // fix ("no app with id" after Apply when CC created the app), so log
-        // any DB failure or missing-row case so it's greppable in
-        // `[ApplyNow]` traces.
         match self.changes().get_by_id(change_id).await {
             Ok(Some(change)) => {
-                // App coding-agent thread: reload open iframes of this app
-                // so the user sees the merged CSS/JS/HTML immediately. The
-                // sibling apply paths in `change_ops::apply_change` all
-                // pair `maybe_emit_app_ui_refresh` next to `emit_change_applied`
-                // — this in-CC in-place merge path used to skip it, leaving
-                // the iframe stale after a same-thread Apply.
                 let kind_ctx =
                     crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
                         .await;
@@ -1230,10 +1081,6 @@ pub(crate) impl LucidosEngine {
                     Some(change.thread_id.unwrap_or(thread_id)),
                 )
                 .await;
-                // The dev post-apply refresh (background engine rebuild /
-                // served-dist re-snapshot) is NOT done here — `emit_change_applied`
-                // above owns it for every merge path. See
-                // `change_ops_emitters::post_apply_dev_refresh`.
             }
             Ok(None) => {
                 log_legacy!(
@@ -1250,8 +1097,6 @@ pub(crate) impl LucidosEngine {
             }
         }
 
-        // The branch is reset for reuse below. `emit_change_applied` cleared
-        // the applied change's branch markers, so new work re-triggers both.
         self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
             .await;
         push_main_in_background(repo_root, &self.event_bus);
@@ -1260,8 +1105,6 @@ pub(crate) impl LucidosEngine {
         Ok((commits, build_request))
     }
 
-    /// Refuse an Apply Now the proposal hold keeps. The branch keeps its work
-    /// and the session stays alive to clear the hold.
     async fn refuse_apply_now_for_hold(
         &self,
         thread_id: Uuid,
@@ -1273,8 +1116,6 @@ pub(crate) impl LucidosEngine {
             .await;
     }
 
-    /// Refuse an Apply Now with `error`. The branch keeps its work and the
-    /// session stays alive.
     async fn refuse_apply_now(
         &self,
         thread_id: Uuid,
@@ -1306,8 +1147,6 @@ pub(crate) impl LucidosEngine {
         self.mark_session_idle(thread_id, worktree_path).await;
     }
 
-    /// What an Apply with nothing pending answers. The proposal hold names
-    /// itself; otherwise the work waits on a turn that finishes.
     async fn nothing_proposed_refusal(&self, thread_id: Uuid) -> &'static str {
         match self.branch_work_hold(thread_id).await {
             Some(hold) => hold.apply_refusal(),
@@ -1315,13 +1154,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Reset worktree to main and re-enter idle state.
-    ///
-    /// Used after apply, discard, and no-commits to keep the session alive.
-    /// ONLY safe when the branch's work is already on main (or there is no
-    /// work). On a path where the change is still pending, call
-    /// [`Self::mark_session_idle`] instead. See
-    /// [`reset_session_worktree_to_main`] for the branch check.
     async fn reset_worktree_and_idle(
         &self,
         thread_id: Uuid,
@@ -1356,11 +1188,6 @@ pub(crate) impl LucidosEngine {
                         coding_agent,
                         reason: None,
                         worktree_path: Some(worktree_path.to_string_lossy().into_owned()),
-                        // Apply-now exits the loop with the worktree at the
-                        // post-apply state (branch reset to main HEAD).
-                        // Recording the SHA on the next real idle is enough;
-                        // here we leave it None so legacy-deserialize stays
-                        // the canonical "no recorded SHA" sentinel.
                         worktree_head_sha: None,
                         bg_bash_pending: false,
                         turn_end: None,
@@ -1402,10 +1229,6 @@ async fn reset_session_worktree_to_main(worktree_path: &Path, session_branch: &s
     }
 }
 
-/// The paths a merge of `main` into the worktree's HEAD would conflict on, for
-/// the conflict prompt and panel. Empty for a clean merge, and for a probe git
-/// could not answer: the merge session runs either way and finds the conflicts
-/// itself, so an unknown list costs only the preview.
 pub(crate) async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
     crate::engine::git_ops::probe_merge(worktree_path, "HEAD", "main")
         .await
@@ -1420,11 +1243,6 @@ mod tests {
     use crate::engine::AgentSession;
     use tokio::sync::mpsc;
 
-    /// Build a minimal `AgentSession` for claim-decision tests. `worktree` and
-    /// `process_exited` / `change_claim` are the fields the claim state
-    /// machine reads; everything else is inert defaults. The receiver comes back
-    /// with it — drop it and the session is a phantom, which the claim treats as
-    /// no live session (see `AgentSession::is_live`).
     fn claim_test_session(
         process_exited: bool,
         worktree: Option<&str>,
@@ -1466,9 +1284,6 @@ mod tests {
 
     #[test]
     fn claim_already_in_progress_when_flag_set() {
-        // A live session already mid-apply must not be claimed again — this is
-        // the guard against the LLM calling `apply_change` twice and starting
-        // two in-place merges on one session.
         for holder in [ChangeClaim::Apply, ChangeClaim::Discard] {
             let (s, _msg_rx) = claim_test_session(false, Some("/wt"), Some(holder));
             assert_eq!(
@@ -1488,9 +1303,6 @@ mod tests {
         );
     }
 
-    /// A Stop has been accepted and the loop has not broken out yet, so the
-    /// session still reads live. An apply claiming it now would merge on a
-    /// session whose teardown is under way, and a Discard deletes the branch.
     #[test]
     fn claim_refused_while_a_stop_is_pending() {
         use crate::engine::StopReason;
@@ -1505,9 +1317,6 @@ mod tests {
         }
     }
 
-    /// An apply task outlives the session it claimed: the session ended, and a
-    /// replacement registered and took its own claim. The old task's release
-    /// must not clear the replacement's, or a second apply merges beside it.
     #[test]
     fn an_old_apply_task_leaves_a_replacements_claim_alone() {
         let thread_id = uuid::Uuid::new_v4();
@@ -1527,10 +1336,6 @@ mod tests {
         assert!(sessions[&thread_id].change_claim.is_none());
     }
 
-    /// An in-session Discard awaits inside its HTTP request. A client that
-    /// disconnects mid-reset drops that future before its release line runs.
-    /// The guard must free the claim anyway, or every Apply, Discard and Stop
-    /// on the thread answers 409 until the session ends.
     #[tokio::test]
     async fn a_dropped_change_claim_guard_still_releases_the_claim() {
         let thread_id = uuid::Uuid::new_v4();
@@ -1553,7 +1358,6 @@ mod tests {
         }
         assert!(sessions.lock().await[&thread_id].change_claim.is_none());
 
-        // Cancelled while `release` waits for a busy map: `Drop` must still free it.
         sessions
             .lock()
             .await
@@ -1590,10 +1394,6 @@ mod tests {
         );
     }
 
-    /// Apply Now asks about a parked question before either branch can prompt
-    /// the agent. Checked after the claim or the fast path, a hardening run
-    /// could already be on its way. The predicate itself is pinned by
-    /// `a_proposal_keeps_the_thread_on_its_open_question`.
     #[test]
     fn apply_now_refuses_a_parked_question_before_it_prompts_anything() {
         let src = include_str!("apply_now.rs");
@@ -1617,9 +1417,6 @@ mod tests {
         }
     }
 
-    /// `apply_in_flight` follows the bracket: `ApplyNowStarted` sets it and
-    /// `ApplyNowEnded` clears it. Startup ends an apply a stop cut off, and
-    /// leaves one that already ended alone (ADR 0437).
     #[tokio::test]
     async fn an_apply_cut_off_by_a_stop_is_ended_at_startup() {
         use crate::engine::event_bus::{BusEvent, EventBus};
@@ -1690,10 +1487,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// Every apply that passes its refusals is bracketed, inside a task of its
-    /// own so a dropped request cannot cut it. The live task announces the end
-    /// on every exit: after `catch_unwind`, so a panic still reaches it, and
-    /// after the claim is released. The no-live task brackets its loop.
     #[test]
     fn every_apply_now_is_bracketed_by_its_start_and_end() {
         let src = include_str!("apply_now.rs");
@@ -1734,10 +1527,6 @@ mod tests {
         );
     }
 
-    /// Apply needs a proposal (ADR 0400). With no live session and nothing
-    /// pending, Apply refuses: it never recovers the stale session, which
-    /// would propose the branch. The live path checks for the pending change
-    /// before it commits, prompts or merges anything.
     #[test]
     fn apply_now_refuses_rather_than_proposes_when_nothing_is_pending() {
         let src = include_str!("apply_now.rs");
@@ -1773,10 +1562,6 @@ mod tests {
         }
     }
 
-    /// Step 1's auto-commit only logs a failure, so a branch can sit under a
-    /// worktree still holding uncommitted work, with or without earlier
-    /// commits. The dirtiness gate has to run before the first reset on every
-    /// path, or Apply wipes that work.
     #[test]
     fn a_failed_auto_commit_is_caught_before_any_merge_or_reset() {
         let src = include_str!("apply_now.rs");
@@ -1801,9 +1586,6 @@ mod tests {
         );
     }
 
-    /// Regression: the Tier 1 resolution session edits after the apply-time
-    /// bound check, and its work was fast-forwarded to main unchecked. Tiers
-    /// 2 and 3 recheck the bound there, so a bounded fix could widen only here.
     #[test]
     fn the_tier1_resolution_rechecks_the_bound_before_main_moves() {
         let src = include_str!("apply_now.rs");
@@ -1831,7 +1613,6 @@ mod tests {
         &src[..src.find("\n#[cfg(test)]").unwrap()]
     }
 
-    /// The text from `start` up to the next `end`, so a check reads one function.
     fn source_between(start: &str, end: &str) -> &'static str {
         let production = production_source();
         let from = production
@@ -1848,9 +1629,6 @@ mod tests {
             .unwrap_or_else(|| panic!("the checked function no longer contains {needle:?}"))
     }
 
-    /// A conflict resolution in flight owns the merge. Apply Now asks first, or
-    /// the live branch sends the resolver a second merge prompt and fast-forwards
-    /// under it.
     #[test]
     fn apply_now_refuses_while_a_resolver_owns_the_merge_before_it_claims_anything() {
         let body = source_between("async fn apply_now(", "async fn apply_pending_now(");
@@ -1867,8 +1645,6 @@ mod tests {
         }
     }
 
-    /// `Ok` from the wait-and-commit step is the proof a snapshot was committed
-    /// before hardening or the merge. A commit that fails must come back `Err`.
     #[tokio::test]
     async fn a_commit_failure_after_the_prompt_turn_is_an_err_not_an_ok() {
         let not_a_repo = tempfile::tempdir().unwrap();
@@ -1885,8 +1661,6 @@ mod tests {
         );
     }
 
-    /// A thread that handed off lands nothing itself. The check runs before the
-    /// auto-commit, so the old branch stays at the commit its successor carried.
     #[test]
     fn a_handed_off_thread_is_refused_before_its_branch_is_auto_committed() {
         let body = source_between(
@@ -1904,9 +1678,6 @@ mod tests {
         );
     }
 
-    /// A canceled `/harden` ends its turn too, so the marker proves hardening,
-    /// not the wait returning. A refusal there must leave the branch alone:
-    /// resetting would move it to main and destroy the pending change's work.
     #[test]
     fn a_hardening_turn_without_a_marker_refuses_and_keeps_the_branch() {
         let body = source_between(
@@ -1926,9 +1697,6 @@ mod tests {
         );
     }
 
-    /// The already-merged recovery for an empty branch only reads main's
-    /// history. It never deletes the live session's branch, and it logs a failed
-    /// pending read instead of defaulting it to an empty list.
     #[test]
     fn the_no_commits_recovery_is_read_only_and_keeps_the_live_branch() {
         let body = source_between(
@@ -1952,8 +1720,6 @@ mod tests {
         assert!(recovery.contains(".unwrap_or_else(|e| {"));
     }
 
-    /// The dirty check and its safe-file commit run under both of `main`'s
-    /// locks. A concurrent merge then lands wholly before or after the check.
     #[test]
     fn the_main_dirty_check_runs_under_both_main_locks() {
         let body = source_between(
@@ -1967,9 +1733,6 @@ mod tests {
         assert!(lock < position(body, "auto_commit_safe_files_if_dirty(repo_root)"));
     }
 
-    /// Apply Now is a second route to main, so the bounded-security-fix bound is
-    /// checked here too, before the lane or the merge. A breach is a clean
-    /// refusal that keeps the session alive, never an `Err` that escalates.
     #[test]
     fn apply_now_checks_the_security_bound_before_main_moves_and_refuses_cleanly() {
         let body = source_between(
@@ -1989,8 +1752,39 @@ mod tests {
         );
     }
 
-    /// Only a yes from the ancestor probe authorizes the worktree reset, so an
-    /// unanswered probe must default to no.
+    #[test]
+    fn apply_now_asks_the_hooks_before_main_moves_and_refuses_cleanly() {
+        let body = source_between(
+            "async fn apply_now_inner(",
+            "async fn apply_now_through_lane(",
+        );
+        let ask =
+            "if let Err(refusal) = crate::engine::thread_events::emit_change_apply_requested(";
+        let no_commits = position(body, ask);
+        assert!(no_commits < position(body, ".emit_change_applied("));
+        let proposed = position(
+            body,
+            "let Some(claim) = self.claim_pending_change(change_id)",
+        );
+        let after_claim = &body[proposed..];
+        let asked = position(after_claim, ask);
+        for mover in [
+            "commit_dirty_logged(",
+            "takes_landing_lane(",
+            "merge_via_cc_session(",
+        ] {
+            assert!(
+                asked < position(after_claim, mover),
+                "{mover} runs before the ask"
+            );
+        }
+        for at in [&body[no_commits..], &after_claim[asked..]] {
+            let refusal = &at[..position(at, "return Ok(());")];
+            assert!(refusal.contains("self.emit_apply_failed("), "{refusal}");
+            assert!(!refusal.contains("return Err"), "{refusal}");
+        }
+    }
+
     #[test]
     fn an_unanswered_ancestor_probe_does_not_authorize_the_lane_reset() {
         let body = source_between(
@@ -2002,8 +1796,6 @@ mod tests {
         assert!(!body.contains(".or_unknown(true)"));
     }
 
-    /// The conflict recovery's inactivity clock starts when the recovery does,
-    /// so a thread idle before the apply cannot trip an instant false timeout.
     #[test]
     fn the_conflict_recovery_anchors_its_inactivity_clock_to_its_own_start() {
         let body = source_between(
@@ -2015,9 +1807,6 @@ mod tests {
         assert!(call[..200].contains("recovery_started_ms"));
     }
 
-    /// Marking a session idle only announces it. Only the run loop writes
-    /// `is_waiting`, so a Discard landing on a mid-turn session must not make
-    /// that turn read idle.
     #[tokio::test]
     async fn marking_a_mid_turn_session_idle_leaves_its_phase_alone() {
         let (pool, db) = crate::test_support::setup_test_db().await;
@@ -2061,9 +1850,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// The reset base stays the literal `main`, as the apply pipeline publishes
-    /// to `main`. Resolving the repo's default here would rewind the session
-    /// branch off the work just applied.
     #[test]
     fn the_session_reset_base_is_the_literal_main() {
         let body = source_between(
@@ -2076,8 +1862,6 @@ mod tests {
 
     const SESSION_BRANCH: &str = "lucidos-claude-code-repo-lucidos-reset-gate";
 
-    /// A real repo on `main` with a linked worktree on [`SESSION_BRANCH`]
-    /// holding one commit, the way an applied or discarded session finds it.
     async fn session_worktree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
@@ -2108,8 +1892,6 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// The reset the session paths depend on still happens on the session's
-    /// own branch: the branch is rewound to main and untracked files go.
     #[tokio::test]
     async fn the_reset_rewinds_the_session_branch_it_can_name() {
         let (_tmp, repo, wt) = session_worktree().await;
@@ -2123,10 +1905,6 @@ mod tests {
         assert!(!wt.join("scratch.txt").exists());
     }
 
-    /// **Regression.** The agent ran `git checkout -b` mid-session, then the
-    /// user clicked Discard. The reset moved the OTHER branch's ref to main and
-    /// `clean -fd` wiped its untracked files. A worktree on another branch is
-    /// not the session's to reset.
     #[tokio::test]
     async fn the_reset_leaves_a_worktree_the_agent_moved_to_another_branch() {
         let (_tmp, repo, wt) = session_worktree().await;
@@ -2160,7 +1938,6 @@ mod tests {
         );
     }
 
-    /// A detached HEAD names no branch, so it is not a positive match either.
     #[tokio::test]
     async fn the_reset_leaves_a_detached_worktree() {
         let (_tmp, repo, wt) = session_worktree().await;
@@ -2177,9 +1954,6 @@ mod tests {
         assert!(wt.join("scratch.txt").exists());
     }
 
-    /// The other direction: a Stop, Discard or Archive is refused while an apply
-    /// holds the claim. A Discard would otherwise wake the apply task's idle
-    /// wait with `Ok`, and the task would merge a branch Discard is deleting.
     #[test]
     fn a_stop_is_refused_while_an_apply_holds_the_claim() {
         use crate::engine::claude_code::{
@@ -2200,18 +1974,11 @@ mod tests {
 
     const TEN_MIN_MS: i64 = 600_000;
 
-    /// Regression: a thread that sat idle longer than the inactivity limit
-    /// BEFORE the user clicked Apply must NOT trip an instant false timeout on
-    /// the first poll. `last_event_at` is 11 minutes stale (CC alive but quiet),
-    /// but the apply only just started — so the clock anchored to apply-start
-    /// reports no timeout. Against the old `now - last_event_at` math this
-    /// returned `Some(11)`, which is exactly the "Apply timed out — no CC
-    /// activity for 10 minutes" the user saw without 10 minutes having elapsed.
     #[test]
     fn inactivity_timeout_ignores_pre_apply_idle_gap() {
-        let now = 100 * 60_000; // t = 100 min
-        let last_event = now - 11 * 60_000; // CC last spoke 11 min ago
-        let apply_started = now; // apply just kicked off
+        let now = 100 * 60_000;
+        let last_event = now - 11 * 60_000;
+        let apply_started = now;
         assert_eq!(
             apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
             None,
@@ -2219,48 +1986,39 @@ mod tests {
         );
     }
 
-    /// One poll-interval after a fresh apply on a long-idle thread is still well
-    /// under the limit — no timeout.
     #[test]
     fn inactivity_timeout_holds_through_early_polls() {
         let apply_started = 100 * 60_000;
-        let last_event = apply_started - 30 * 60_000; // 30 min stale baseline
-        let now = apply_started + 30_000; // 30s into the apply
+        let last_event = apply_started - 30 * 60_000;
+        let now = apply_started + 30_000;
         assert_eq!(
             apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
             None
         );
     }
 
-    /// Genuine mid-apply silence still fires: both CC's last event and
-    /// apply-start are now older than the limit, so the timeout reports the
-    /// real minutes of silence.
     #[test]
     fn inactivity_timeout_fires_on_genuine_silence() {
         let apply_started = 100 * 60_000;
-        let last_event = apply_started + 60_000; // CC spoke 1 min into the apply
-        let now = last_event + 12 * 60_000; // then went silent for 12 min
+        let last_event = apply_started + 60_000;
+        let now = last_event + 12 * 60_000;
         assert_eq!(
             apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
             Some(12)
         );
     }
 
-    /// CC activity advances the clock past apply-start: a recent event keeps the
-    /// timeout from firing even when apply-start is ancient.
     #[test]
     fn inactivity_timeout_respects_recent_cc_event() {
         let apply_started = 100 * 60_000;
-        let now = apply_started + 60 * 60_000; // an hour-long active apply
-        let last_event = now - 60_000; // but CC spoke 1 min ago
+        let now = apply_started + 60 * 60_000;
+        let last_event = now - 60_000;
         assert_eq!(
             apply_inactivity_timeout_minutes(now, last_event, apply_started, TEN_MIN_MS),
             None
         );
     }
 
-    /// Liveness-based timeout: a future that keeps emitting events should not
-    /// be killed, but one that goes silent should time out.
     #[tokio::test]
     async fn liveness_timeout_does_not_fire_while_events_arrive() {
         use std::sync::atomic::{AtomicI64, Ordering};
@@ -2268,7 +2026,6 @@ mod tests {
         let last_event_at = Arc::new(AtomicI64::new(now_epoch_millis()));
         let last_event_clone = last_event_at.clone();
 
-        // Simulate a long-running inner future that emits events every 50ms
         let inner = async move {
             for _ in 0..10 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2278,8 +2035,6 @@ mod tests {
         };
         tokio::pin!(inner);
 
-        // Use a very short inactivity limit (200ms) — the future takes ~500ms
-        // but events keep arriving so it should NOT time out
         let inactivity_limit_ms: i64 = 200;
         let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = loop {
             match tokio::time::timeout(std::time::Duration::from_millis(30), &mut inner).await {
@@ -2299,22 +2054,18 @@ mod tests {
         );
     }
 
-    /// Liveness-based timeout fires when CC stops emitting events.
     #[tokio::test]
     async fn liveness_timeout_fires_when_events_stop() {
         use std::sync::atomic::{AtomicI64, Ordering};
 
-        // Set last_event_at to 1 second ago — already stale
         let last_event_at = Arc::new(AtomicI64::new(now_epoch_millis() - 1000));
 
-        // Inner future that never completes (simulates stuck CC)
         let inner = async {
             tokio::time::sleep(std::time::Duration::from_secs(999)).await;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         };
         tokio::pin!(inner);
 
-        // Inactivity limit: 100ms (already exceeded since last_event_at is 1s ago)
         let inactivity_limit_ms: i64 = 100;
         let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = loop {
             match tokio::time::timeout(std::time::Duration::from_millis(30), &mut inner).await {
@@ -2336,8 +2087,6 @@ mod tests {
     }
 
     mod guard_tests {
-        /// Every production release goes through `release_change_claim`, so none
-        /// can clear a replacement's claim by thread id alone.
         #[test]
         fn the_apply_claim_is_released_in_one_place() {
             let writers: Vec<(String, usize)> =

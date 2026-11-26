@@ -9,10 +9,7 @@ use crate::engine::thread_events::MessageOrigin;
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Device {
     pub id: String,
-    /// The name someone typed on the Devices row.
     pub name: Option<String>,
-    /// The name the device was given when it paired, as the workspace gateway
-    /// forwards it. `None` for a client that never came through a gateway.
     pub pairing_label: Option<String>,
     pub user_agent: Option<String>,
     pub push_enabled: bool,
@@ -20,32 +17,22 @@ pub struct Device {
     pub created_at: DateTime<Utc>,
 }
 
-/// A device as the Devices list shows it. See [`DeviceStore::list`].
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceListing {
     #[serde(flatten)]
     pub device: Device,
-    /// Every id a hand-over replaced with this one. A turn recorded under one
-    /// of them is named by this device.
     pub replaced_ids: Vec<String>,
 }
 
-/// A device as the agent context lists it. See [`DeviceStore::recently_seen`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeenDevice {
     pub id: String,
-    /// The name Settings → Devices shows.
     pub label: String,
-    /// Browser and OS, parsed from the user agent.
     pub details: Option<String>,
     pub seen_secs_ago: i64,
-    /// A visible heartbeat within `PRESENCE_STALE_AFTER`.
     pub visible_now: bool,
 }
 
-/// "Seen" is the newer of the last page load (`last_seen_at`) and the last
-/// visible heartbeat (`device_presence.visible_at`). `$1` is the presence
-/// window in seconds. Ages use the database clock (ADR 0053).
 const SEEN_DEVICE_SELECT: &str = "SELECT d.id, d.name, d.pairing_label, d.user_agent, \
         EXTRACT(EPOCH FROM now() - s.seen)::bigint AS seen_secs_ago, \
         COALESCE(p.visible_at > now() - make_interval(secs => $1), false) AS visible_now \
@@ -84,52 +71,27 @@ impl From<SeenDeviceRow> for SeenDevice {
     }
 }
 
-/// How many hand-overs a name lookup follows from an old id. It bounds the
-/// walk even if a chain loops.
 const MAX_ALIAS_HOPS: i32 = 32;
 
-/// What a hand-over did, so the caller can answer without guessing.
-///
-/// `AlreadyDone` and `NoSuchDevice` are both ordinary outcomes rather than
-/// errors. A client retries the call on a later load, and by then the first
-/// attempt has usually landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HandOver {
-    /// Every row moved from the old id to the new one, merging into the new
-    /// id's row when it already had one.
     Moved,
-    /// The two ids are the same, so there is nothing to move.
     AlreadyDone,
-    /// The old id has no row. Nothing to hand over.
     NoSuchDevice,
 }
 
-/// What the rows already filed under a hand-over's new id are. Each store
-/// that keys rows by device id reads it to decide which side wins a clash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewIdRows {
-    /// The new id has no `devices` row, so its rows belong to no device.
-    /// Clear them, then move the old id's rows.
     Orphans,
-    /// The new id is a registered device. Keep its rows, and drop only the
+    /// INVARIANT: The new id is a registered device. Keep its rows, and drop only the
     /// old id's rows that would clash with them.
     Live,
 }
 
-/// The registry of devices that have connected to this workspace.
-///
-/// **No caller can skip the event.** [`Self::register`], [`Self::rename`],
-/// [`Self::set_push_enabled`], [`Self::delete`], [`Self::remove_one_off`] and
-/// [`Self::hand_over`] are the only reachable mutators; the raw row writes are
-/// private to this module. `Device{Registered,Renamed,PushChanged,Deleted,
-/// HandedOver}` is what reloads the Settings devices list on every other device.
-///
-/// Same shape as `RepositoryStore`; see `core::announced_surfaces`.
 pub struct DeviceStore;
 
 impl DeviceStore {
-    /// Registered native clients, identified by the desktop registration token.
     pub async fn native_push_devices(pool: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar("SELECT id FROM devices WHERE position($1 in user_agent) > 0")
             .bind(DESKTOP_APP_UA_TOKEN)
@@ -137,7 +99,7 @@ impl DeviceStore {
             .await
     }
 
-    /// Register or update a device (upsert by id). Returns `(device, inserted)`
+    /// INVARIANT: Register or update a device (upsert by id). Returns `(device, inserted)`
     /// where `inserted` is true iff a new row was created (false on
     /// last-seen-at refresh).
     ///
@@ -179,7 +141,7 @@ impl DeviceStore {
         Ok((row.device, row.inserted))
     }
 
-    /// Does a row exist for this device id?
+    /// INVARIANT: Does a row exist for this device id?
     ///
     /// The *attribution* probe, distinct from [`Self::friendly_name`] on purpose.
     /// `friendly_name` collapses "no such device" and "the database is down"
@@ -200,7 +162,7 @@ impl DeviceStore {
             .await
     }
 
-    /// The row a device id names for display: its own row, else the row its
+    /// INVARIANT: The row a device id names for display: its own row, else the row its
     /// alias chain ends at. See [`Self::hand_over`].
     ///
     /// For display only. An alias never makes an id registered, stamped or the
@@ -225,7 +187,7 @@ impl DeviceStore {
         .await
     }
 
-    /// The id a device answers to now: its own when it has a row, else the id
+    /// INVARIANT: The id a device answers to now: its own when it has a row, else the id
     /// its alias chain ends at. `None` when neither has a row.
     ///
     /// For addressing a device, such as a navigation target. Like
@@ -234,11 +196,6 @@ impl DeviceStore {
         Ok(Self::display_row(pool, id).await?.map(|d| d.id))
     }
 
-    /// What to call a device, read from its row. See [`friendly_device_name`].
-    ///
-    /// An id a hand-over replaced gets the name of the device it became.
-    /// Always answers. A device with no row, or a failed read, gets the short-id
-    /// name, since a label is display metadata and must never fail an action.
     pub async fn friendly_name(pool: &PgPool, id: &str) -> String {
         let device = match Self::display_row(pool, id).await {
             Ok(d) => d,
@@ -258,9 +215,6 @@ impl DeviceStore {
         }
     }
 
-    /// Build a rich tooltip string for a device: name + user agent summary.
-    /// Resolves a replaced id like [`Self::friendly_name`]. DB errors are
-    /// logged and treated as "device not found", so the caller gets `None`.
     pub async fn tooltip_info(pool: &PgPool, id: &str) -> Option<String> {
         let device = match Self::display_row(pool, id).await {
             Ok(d) => d,
@@ -283,8 +237,6 @@ impl DeviceStore {
         }
     }
 
-    /// List all devices ordered by last_seen_at descending, each with the ids
-    /// it replaced. An id resolves the way [`Self::display_row`] resolves it.
     pub async fn list(
         pool: &PgPool,
     ) -> Result<Vec<DeviceListing>, Box<dyn std::error::Error + Send + Sync>> {
@@ -323,9 +275,6 @@ impl DeviceStore {
             .collect())
     }
 
-    /// The devices seen most recently, newest first, at most `limit` of them
-    /// and none unseen for `within_days`. The agent context lists these.
-    /// See [`SEEN_DEVICE_SELECT`] for what "seen" means.
     pub async fn recently_seen(
         pool: &PgPool,
         limit: i64,
@@ -345,8 +294,6 @@ impl DeviceStore {
         Ok(rows.into_iter().map(SeenDevice::from).collect())
     }
 
-    /// The user agent a device registered with. `None` when no such device
-    /// exists, or it registered none.
     pub async fn user_agent(pool: &PgPool, id: &str) -> Result<Option<String>, sqlx::Error> {
         Ok(
             sqlx::query_scalar::<_, Option<String>>("SELECT user_agent FROM devices WHERE id = $1")
@@ -357,8 +304,6 @@ impl DeviceStore {
         )
     }
 
-    /// One device, seen the same way as [`Self::recently_seen`]. `None` when
-    /// no such device exists.
     pub async fn seen(pool: &PgPool, id: &str) -> Result<Option<SeenDevice>, sqlx::Error> {
         let row: Option<SeenDeviceRow> =
             sqlx::query_as(&format!("{SEEN_DEVICE_SELECT} WHERE d.id = $2"))
@@ -369,9 +314,6 @@ impl DeviceStore {
         Ok(row.map(SeenDevice::from))
     }
 
-    /// Record that a device was seen now. Called when a device hides Lucidos:
-    /// the hide deletes its presence row, and without this stamp its age would
-    /// fall back to its last page load.
     pub async fn mark_seen(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE devices SET last_seen_at = NOW() WHERE id = $1")
             .bind(id)
@@ -380,7 +322,6 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// Rename a device row. **Private on purpose**: [`Self::rename`] emits.
     async fn rename_row(
         pool: &PgPool,
         id: &str,
@@ -394,18 +335,6 @@ impl DeviceStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete a device and everything scoped to it, inside the caller's
-    /// transaction. **Private on purpose**: [`Self::delete`] and
-    /// [`Self::remove_one_off`] emit.
-    ///
-    /// The cascade (per-device preferences, push subscriptions, pinned apps,
-    /// presence) is deliberately silent. `DeviceDeleted` is the announcement for
-    /// all of it: the device is gone, so a `PreferencesChanged` or
-    /// `PinnedAppUnpinned` per row would describe changes to a device no client
-    /// still tracks.
-    ///
-    /// The children go first: `push_subscriptions.device_id` is a foreign key
-    /// onto `devices(id)`.
     async fn delete_device_rows(
         conn: &mut sqlx::PgConnection,
         id: &str,
@@ -427,7 +356,7 @@ impl DeviceStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete one device and its per-device state in one transaction.
+    /// INVARIANT: Delete one device and its per-device state in one transaction.
     ///
     /// Locks the device row before touching its children, the order
     /// [`Self::remove_one_off`] takes. The opposite order deadlocks against it.
@@ -445,7 +374,7 @@ impl DeviceStore {
         Ok(removed)
     }
 
-    /// Set push_enabled on a device row. **Private on purpose**:
+    /// INVARIANT: Set push_enabled on a device row. **Private on purpose**:
     /// [`Self::set_push_enabled`] emits.
     ///
     /// Returns `None` when no such device exists, `Some(changed)` otherwise.
@@ -470,13 +399,6 @@ impl DeviceStore {
         Ok(changed)
     }
 
-    /// Register a device and announce it. The only way to add one.
-    ///
-    /// `pairing_label` is stored when present and kept when absent, so a
-    /// request that did not come through the gateway never erases it.
-    ///
-    /// `DeviceRegistered` fires only on a genuinely new device, never on the
-    /// last-seen-at refresh every page load performs.
     pub async fn register(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -501,7 +423,6 @@ impl DeviceStore {
         Ok((device, inserted))
     }
 
-    /// Rename a device and announce it. Announces only when a row existed.
     pub async fn rename(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -525,13 +446,6 @@ impl DeviceStore {
         Ok(renamed)
     }
 
-    /// Flip a device's push flag and announce it.
-    ///
-    /// Returns whether the device exists (the HTTP handler reports "Device not
-    /// found" on `false`), but announces only when the flag actually MOVED.
-    /// The stale-device prune already avoided no-op announcements by filtering
-    /// `push_enabled = true` at its SELECT; enforcing it in the write path
-    /// covers the HTTP handler too, which has no such filter.
     pub async fn set_push_enabled(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -555,9 +469,6 @@ impl DeviceStore {
         Ok(outcome.is_some())
     }
 
-    /// Delete a device and announce it. The only way to remove one; the
-    /// per-device cascade rides along under this single event (see
-    /// [`Self::delete_row`]).
     pub async fn delete(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -579,7 +490,7 @@ impl DeviceStore {
         Ok(removed)
     }
 
-    /// Remove every *one-off device* and announce each removal. Returns the
+    /// INVARIANT: Remove every *one-off device* and announce each removal. Returns the
     /// removed ids, oldest first.
     ///
     /// A one-off device was created more than `older_than_days` ago and never
@@ -633,7 +544,7 @@ impl DeviceStore {
         Ok(ids)
     }
 
-    /// Move every trace of `old_id` onto `new_id`, and announce the result.
+    /// INVARIANT: Move every trace of `old_id` onto `new_id`, and announce the result.
     ///
     /// The one migration path off the `localStorage` device id. A browser now
     /// takes its id from the *workspace gateway*. Without this it arrives as a
@@ -667,7 +578,6 @@ impl DeviceStore {
         }
         let mut tx = pool.begin().await?;
 
-        // Locks the old row, so two hand-overs of one id cannot both move it.
         let old_row: Option<String> =
             sqlx::query_scalar("SELECT id FROM devices WHERE id = $1 FOR UPDATE")
                 .bind(old_id)
@@ -676,7 +586,7 @@ impl DeviceStore {
         if old_row.is_none() {
             return Ok(HandOver::NoSuchDevice);
         }
-        // Under READ COMMITTED a concurrent `register(new_id)` can commit
+        // INVARIANT: Under READ COMMITTED a concurrent `register(new_id)` can commit
         // after this read. The `devices` primary key then fails the copy below,
         // and the transaction aborts to a 500 the client retries as a merge.
         let new_rows = if Self::is_registered_in(&mut tx, new_id).await? {
@@ -689,16 +599,11 @@ impl DeviceStore {
             NewIdRows::Live => Self::merge_row_into(&mut tx, old_id, new_id).await?,
         }
         Self::move_preferences(&mut tx, old_id, new_id, new_rows).await?;
-        // Keyed by endpoint, so no subscription can clash with the new id's.
         sqlx::query("UPDATE push_subscriptions SET device_id = $2 WHERE device_id = $1")
             .bind(old_id)
             .bind(new_id)
             .execute(&mut *tx)
             .await?;
-        // Through their owning stores, matching what `delete_row` does with its
-        // own cascade. `core::announced_surfaces` is the reason: this module owns
-        // neither table. A module writing another's table behind its back is
-        // exactly what that registry exists to refuse.
         PinnedAppStore::move_device(&mut tx, old_id, new_id, new_rows).await?;
         DevicePresenceStore::move_device(&mut tx, old_id, new_id, new_rows).await?;
 
@@ -709,8 +614,6 @@ impl DeviceStore {
         Self::record_alias(&mut tx, old_id, new_id).await?;
         tx.commit().await?;
 
-        // One event for the whole move, matching `delete`'s cascade rule. The
-        // per-row changes describe a device no client tracks any more.
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::DeviceHandedOver {
@@ -734,7 +637,6 @@ impl DeviceStore {
             .await
     }
 
-    /// The new id gets a copy of the old row. Part of [`Self::hand_over`].
     async fn copy_row_forward(
         conn: &mut sqlx::PgConnection,
         old_id: &str,
@@ -752,7 +654,7 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// The new row keeps what it has and takes what it lacks from the old
+    /// INVARIANT: The new row keeps what it has and takes what it lacks from the old
     /// row. Part of [`Self::hand_over`].
     ///
     /// Push stays on when either row had it: the old row's subscriptions move
@@ -780,11 +682,6 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// Repoint the old id's per-device preferences. Part of [`Self::hand_over`].
-    ///
-    /// `preferences` carries no foreign key, so a client that wrote one before
-    /// registering can leave rows under an id with no device. Those are
-    /// cleared. A live device's own value for a key always wins.
     async fn move_preferences(
         conn: &mut sqlx::PgConnection,
         old_id: &str,
@@ -818,10 +715,6 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// File `old_id` as an alias of `new_id`. Part of [`Self::hand_over`].
-    ///
-    /// The new id holds a row, so it stops being anyone's alias. That keeps
-    /// the chain free of cycles when an id comes back.
     async fn record_alias(
         conn: &mut sqlx::PgConnection,
         old_id: &str,
@@ -842,13 +735,6 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// List IDs of currently push-enabled devices whose `last_seen_at` is
-    /// older than `cutoff_days` days. Used by the daily prune to flip them
-    /// to `push_enabled = false`, stopping push fan-out to phantom
-    /// subscriptions (typically PWA reinstalls whose Apple/Google endpoint
-    /// hasn't 410'd yet). Filtered to push-enabled at the SELECT layer so
-    /// the caller never emits a no-op `DevicePushChanged` for rows already
-    /// disabled.
     pub async fn list_stale_push_enabled(
         pool: &PgPool,
         cutoff_days: i64,
@@ -866,7 +752,7 @@ impl DeviceStore {
     }
 }
 
-/// What to call a device: the one rule every engine surface names it by.
+/// INVARIANT: What to call a device: the one rule every engine surface names it by.
 ///
 /// The order: the typed name, then the pairing label, then the browser and
 /// machine the user-agent names. That last one carries the short id, as in
@@ -893,7 +779,7 @@ pub(crate) fn friendly_device_name(
     }
 }
 
-/// A name read off a device's stored user-agent, for a device nobody named.
+/// INVARIANT: A name read off a device's stored user-agent, for a device nobody named.
 /// Mirrors `userAgentDeviceLabel` and `suggestDeviceLabel` in the frontend's
 /// `utils/deviceLabel.ts`: Chromium forks are asked about before Chrome, and
 /// Safari last, since every browser above it also says Safari.
@@ -944,7 +830,7 @@ fn user_agent_device_label(ua: &str) -> Option<String> {
     }
 }
 
-/// Product token the Tauri native desktop client appends to its registered
+/// INVARIANT: Product token the Tauri native desktop client appends to its registered
 /// user-agent string (see `registrationUserAgent` in
 /// `crates/lucidos-app/src/utils/platform.ts`). The WKWebView's real UA is
 /// indistinguishable from Safari, so this token is the only signal that lets the
@@ -952,10 +838,6 @@ fn user_agent_device_label(ua: &str) -> Option<String> {
 /// in sync with the frontend constant.
 const DESKTOP_APP_UA_TOKEN: &str = "Lucidos-Desktop";
 
-/// Parse a raw user-agent string into a short "Browser/Version on OS" summary.
-/// A user-agent carrying the [`DESKTOP_APP_UA_TOKEN`] is rendered as the Lucidos
-/// native desktop app instead of a browser, so the agent gives native-OS (not
-/// browser-permission) notification advice in the desktop client.
 fn parse_user_agent(ua: &str) -> String {
     let os = parse_os(ua);
 
@@ -982,7 +864,6 @@ fn parse_user_agent(ua: &str) -> String {
     format!("{} on {}", browser, os)
 }
 
-/// Map a raw user-agent to a short OS label.
 fn parse_os(ua: &str) -> &'static str {
     if ua.contains("iPhone") {
         "iOS"
@@ -1008,9 +889,6 @@ mod tests {
 
     #[test]
     fn parse_user_agent_renders_desktop_token_as_lucidos_desktop_app() {
-        // The Tauri client registers a Safari-like UA with the desktop-app token
-        // appended; it must read as the desktop app, NOT Safari, so the agent
-        // gives native-OS notification advice instead of browser-permission advice.
         let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
                   (KHTML, like Gecko) Version/18.0 Safari/605.1.15 Lucidos-Desktop";
         assert_eq!(parse_user_agent(ua), "Lucidos desktop app on macOS");
@@ -1018,7 +896,6 @@ mod tests {
 
     #[test]
     fn parse_user_agent_leaves_browsers_unchanged() {
-        // A real browser / PWA UA (no token) keeps the "Browser/Version on OS" shape.
         assert_eq!(
             parse_user_agent(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
@@ -1061,8 +938,6 @@ mod tests {
         );
     }
 
-    /// A device nobody named and nothing paired is called by what its
-    /// user-agent says, with the short id so two alike stay apart.
     #[test]
     fn friendly_device_name_falls_back_to_the_user_agent_before_the_id() {
         let id = "109371a3-ee53-42fa-b34b-c168237467b7";
@@ -1107,8 +982,6 @@ mod tests {
         );
     }
 
-    /// A paired device nobody renamed is called by its pairing label, and a
-    /// typed name still wins over it.
     #[tokio::test]
     async fn friendly_name_uses_the_pairing_label_and_keeps_it_and_the_typed_name() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1129,7 +1002,6 @@ mod tests {
             "Safari on iPhone"
         );
 
-        // A later request that did not come through the gateway carries no label.
         DeviceStore::register(&pool, &bus, "phone-1", Some("UA"), None, None)
             .await
             .unwrap();
@@ -1176,9 +1048,6 @@ mod tests {
             .unwrap();
     }
 
-    /// The agent's Known devices list reads the two records the engine already
-    /// keeps: the page-load `last_seen_at` and the visible heartbeat. The newer
-    /// one orders the list, and a device unseen past the window is left out.
     #[tokio::test]
     async fn recently_seen_orders_by_the_newer_record_and_drops_stale_devices() {
         use crate::test_support::seed_device;
@@ -1191,7 +1060,6 @@ mod tests {
         backdate_last_seen(&pool, "laptop", 2).await;
         backdate_last_seen(&pool, "phone", 1).await;
         backdate_last_seen(&pool, "tablet", 40).await;
-        // The laptop has not reloaded in two days, but it is showing Lucidos.
         DevicePresenceStore::record_visible(&pool, "laptop")
             .await
             .unwrap();
@@ -1227,8 +1095,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Hiding Lucidos deletes the presence row. The device was still seen at
-    /// that moment, so its age must not fall back to a page load days ago.
     #[tokio::test]
     async fn a_device_that_hides_lucidos_stays_seen_at_the_hide() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1264,11 +1130,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// The load-bearing guarantee: a device write and its announcement are one
-    /// operation, so the Settings devices list on every OTHER device reloads.
-    /// The one write that must stay silent is the last-seen-at refresh the
-    /// frontend performs on every page load: announcing it would append an
-    /// events row per navigation.
     #[tokio::test]
     async fn register_announces_a_new_device_but_not_a_last_seen_refresh() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1307,9 +1168,6 @@ mod tests {
             .unwrap();
         assert_eq!(emitted(&pool, "DevicePushChanged").await, 1);
 
-        // Re-asserting the current value still reports the device exists (the
-        // HTTP handler renders `false` as "Device not found"), but announces
-        // nothing.
         assert!(DeviceStore::set_push_enabled(&pool, &bus, "d1", true, None)
             .await
             .unwrap());
@@ -1331,9 +1189,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Deleting a device takes its pins with it under the single DeviceDeleted
-    /// event. A PinnedAppUnpinned per app would describe a device no client
-    /// still tracks, so the cascade is deliberately silent.
     #[tokio::test]
     async fn delete_cascades_pins_silently_under_device_deleted() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1369,8 +1224,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Seed one row in every table the hand-over must move. A table added to
-    /// the schema and forgotten here shows up as a surviving old-id row.
     async fn seed_device_state(pool: &PgPool, bus: &EventBus, id: &str) {
         DeviceStore::register(pool, bus, id, Some("UA"), Some("Safari on iPhone"), None)
             .await
@@ -1429,8 +1282,6 @@ mod tests {
         "push_subscriptions",
     ];
 
-    /// The whole point of the migration: a browser that changed id keeps its
-    /// push subscription, its name and its device-scoped preferences.
     #[tokio::test]
     async fn hand_over_moves_every_table_and_leaves_nothing_behind() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1465,7 +1316,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// One event for the whole move, matching the `DeviceDeleted` cascade rule.
     #[tokio::test]
     async fn hand_over_announces_once() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1504,8 +1354,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A window that registered fresh before it could hand over keeps what it
-    /// set, and gains everything the old row had.
     #[tokio::test]
     async fn hand_over_onto_a_registered_id_merges_and_the_new_id_wins() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1601,8 +1449,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// History recorded under a replaced id shows the device's current name,
-    /// through any number of re-pairs. The alias grants nothing else.
     #[tokio::test]
     async fn a_replaced_id_resolves_to_the_current_name_through_a_chain() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1652,7 +1498,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// An id handed back to an earlier id must not loop the name lookup.
     #[tokio::test]
     async fn an_id_that_comes_back_is_no_longer_an_alias() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1677,8 +1522,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Re-pairs recorded before the table existed resolve too. The migration
-    /// is idempotent, so running it again replays its backfill.
     #[tokio::test]
     async fn the_alias_migration_backfills_past_hand_overs() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1734,9 +1577,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// An orphan preference under the target id would collide with the
-    /// `(key, COALESCE(device_id, ''))` unique index, aborting the whole move.
-    /// It belongs to a device that does not exist, so it is cleared.
     #[tokio::test]
     async fn hand_over_clears_orphan_rows_sitting_under_the_new_id() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1784,7 +1624,6 @@ mod tests {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-        // Push-enabled + old → returned
         DeviceStore::register(&pool, &bus, "old-on", Some("UA"), None, None)
             .await
             .unwrap();
@@ -1793,7 +1632,6 @@ mod tests {
             .unwrap();
         backdate_last_seen(&pool, "old-on", 45).await;
 
-        // Push-enabled + recent → excluded (last_seen is today)
         DeviceStore::register(&pool, &bus, "fresh-on", Some("UA"), None, None)
             .await
             .unwrap();
@@ -1801,13 +1639,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Push-disabled + old → excluded (filtered at SELECT to avoid no-op events)
         DeviceStore::register(&pool, &bus, "old-off", Some("UA"), None, None)
             .await
             .unwrap();
         backdate_last_seen(&pool, "old-off", 45).await;
 
-        // One day short of the 30-day cutoff (29 days) → excluded
         DeviceStore::register(&pool, &bus, "almost-on", Some("UA"), None, None)
             .await
             .unwrap();
@@ -1843,7 +1679,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Ages a device: created `created_hours_ago`, last seen `seen_hours_ago`.
     async fn age_device(pool: &PgPool, id: &str, created_hours_ago: i32, seen_hours_ago: i32) {
         sqlx::query(
             "UPDATE devices SET created_at = now() - make_interval(hours => $2), \
@@ -1861,7 +1696,6 @@ mod tests {
     const DESKTOP_SAFARI: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
         AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
-    /// Registers a device that was used for 20 hours a month ago, then never again.
     async fn seed_one_off(pool: &PgPool, bus: &EventBus, id: &str) {
         DeviceStore::register(pool, bus, id, Some(DESKTOP_SAFARI), None, None)
             .await
@@ -1869,9 +1703,6 @@ mod tests {
         age_device(pool, id, MONTH_HOURS, MONTH_HOURS - 20).await;
     }
 
-    /// Only a device never seen past its first day, old enough, and holding no
-    /// name, pairing or push is removed. The user agent plays no part: the
-    /// removed row claims to be desktop Safari.
     #[tokio::test]
     async fn remove_one_off_takes_only_unclaimed_devices_never_seen_after_their_first_day() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1938,8 +1769,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Each removal announces once, unattributed, and takes the device's state
-    /// with it. A re-run finds nothing, and the device can still come back.
     #[tokio::test]
     async fn remove_one_off_announces_once_and_clears_the_device_state() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1998,8 +1827,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// The Remove button clears the same state the sweep does, presence
-    /// included: `device_presence` has no foreign key to cascade it.
     #[tokio::test]
     async fn delete_clears_every_per_device_table() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;

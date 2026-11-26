@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts, llmConfigured, selectedCodingAgent, threadMap, lastSuccessfulBackup } from '../store';
 import { makeThreadState } from './threads-test-helpers';
 import { getComposeSelectionOverride, resolveCodingAgent, _resetComposeSelectionsForTesting } from '../composeSelections';
-import { preferencesSlice, currentAgentBrandColours, setAgentBrandColours, applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
+import { preferencesSlice, currentAgentIconColors, setAgentIconColors, applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
 import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
 import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, backupIsConfigured, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupBanner, backupBannerIn, backupOverdueHiddenByDismissal, dismissBackupOverdueReminder, BACKUP_OVERDUE_SNOOZE_MS, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule, appearanceVersion, currentResponseStyle, currentChatModel, currentOpenCodeFreeEnabled, storedVoiceTalkerModel } from './preferences';
 import { motionPreference } from '../../utils/motion';
@@ -2213,32 +2213,37 @@ describe('the resident-block sections a call opens with', () => {
 });
 
 
-describe('agent brand colours', () => {
-  it('keeps a saved Off choice during reload and a failed preference fetch', async () => {
+describe('agent icon colors', () => {
+  it('keeps a saved Muted choice during reload and a failed preference fetch', async () => {
     vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
-    await setAgentBrandColours(false);
+    await setAgentIconColors('muted');
     preferences.value = { status: 'loading' };
-    expect(currentAgentBrandColours()).toBe(false);
+    expect(currentAgentIconColors()).toBe('muted');
     vi.spyOn(apiClient, 'getPreferences').mockRejectedValue(new Error('offline'));
     await loadPreferences();
-    expect(currentAgentBrandColours()).toBe(false);
+    expect(currentAgentIconColors()).toBe('muted');
   });
 
   it('repaints shared marks when preferences refresh', () => {
     const stamp = vi.spyOn(document.documentElement, 'setAttribute');
-    preferences.value = { status: 'loaded', data: { 'agent-brand-colours': 'false' } };
-    expect(stamp).toHaveBeenLastCalledWith('data-agent-brand-colours', 'off');
+    preferences.value = { status: 'loaded', data: { 'agent-icon-colors': 'theme' } };
+    expect(stamp).toHaveBeenLastCalledWith('data-agent-icon-colors', 'theme');
     preferences.value = { status: 'loaded', data: {} };
-    expect(stamp).toHaveBeenLastCalledWith('data-agent-brand-colours', 'on');
+    expect(stamp).toHaveBeenLastCalledWith('data-agent-icon-colors', 'brand');
   });
 
   it('loads a saved choice and restores the default after reset', async () => {
-    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { 'agent-brand-colours': 'false' } });
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { 'agent-icon-colors': 'muted' } });
     await loadPreferences();
-    expect(currentAgentBrandColours()).toBe(false);
+    expect(currentAgentIconColors()).toBe('muted');
     vi.mocked(apiClient.getPreferences).mockResolvedValue({ preferences: {} });
     await loadPreferences();
-    expect(currentAgentBrandColours()).toBe(true);
+    expect(currentAgentIconColors()).toBe('brand');
+  });
+
+  it('ignores a stored value outside the three looks', () => {
+    preferences.value = { status: 'loaded', data: { 'agent-icon-colors': 'false' } };
+    expect(currentAgentIconColors()).toBe('brand');
   });
 
   beforeEach(() => {
@@ -2248,15 +2253,15 @@ describe('agent brand colours', () => {
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it('defaults to normal colours', () => {
-    expect(currentAgentBrandColours()).toBe(true);
+  it('defaults to brand colors', () => {
+    expect(currentAgentIconColors()).toBe('brand');
   });
 
   it('persists a device choice through the preference pipeline', async () => {
     const save = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
-    await setAgentBrandColours(false);
-    expect(currentAgentBrandColours()).toBe(false);
-    expect(save).toHaveBeenCalledWith('agent-brand-colours', 'false', expect.any(String));
+    await setAgentIconColors('theme');
+    expect(currentAgentIconColors()).toBe('theme');
+    expect(save).toHaveBeenCalledWith('agent-icon-colors', 'theme', expect.any(String));
   });
 });
 

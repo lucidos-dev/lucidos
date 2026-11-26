@@ -1,13 +1,3 @@
-//! A Tree turn's *memory views* (ADR 0362), in the order the request sends
-//! them: the view snapshot, the thread memory view, then the recent workspace
-//! entries. A Classic turn has no views, so only [`TurnMemoryViews::lead`]
-//! reaches it.
-//!
-//! Both views lead the message in blocks of a few lines. A later request can
-//! read the prompt cache up to any block end. Each block that takes a cache
-//! mark is a memory view block. The stable context block sits between the two
-//! views.
-
 use uuid::Uuid;
 
 use crate::engine::summary_tree::module::{Surface, ViewBudgets};
@@ -15,7 +5,6 @@ use crate::engine::summary_tree::view::{self, ViewBlocks};
 use crate::engine::LucidosEngine;
 use crate::llm::provider::{ContentBlock, MessageContent};
 
-/// One turn's views. Each is framed, or empty.
 #[derive(Debug, Default)]
 pub(crate) struct TurnMemoryViews {
     pub(crate) snapshot: ViewBlocks,
@@ -28,7 +17,6 @@ impl TurnMemoryViews {
         self.snapshot.text.len() + self.thread.text.len() + self.recent.len()
     }
 
-    /// The workspace half, snapshot then recent block, for the context view.
     pub(crate) fn workspace(&self) -> String {
         [self.snapshot.text.as_str(), self.recent.as_str()]
             .into_iter()
@@ -58,7 +46,6 @@ impl TurnMemoryViews {
 
 #[easy_ext::ext(MemoryViewsExt)]
 pub(crate) impl LucidosEngine {
-    /// The surface a chat thread's turn reads its workspace view at.
     async fn chat_surface(&self, thread_id: Uuid, is_trigger: bool) -> Surface {
         if is_trigger {
             return Surface::Trigger;
@@ -77,9 +64,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// The views for one turn, together at most `limit` bytes. A read that
-    /// fails leaves its view empty and says so in the log: a turn never fails
-    /// over its memory.
     async fn turn_memory_views(
         &self,
         thread_id: Uuid,
@@ -124,7 +108,6 @@ pub(crate) impl LucidosEngine {
 mod tests {
     use super::*;
 
-    /// A view of `text`, cut where the `ends` lines start, marked where the `marks` lines start.
     fn blocks(text: &str, ends: &[&str], marks: &[&str]) -> ViewBlocks {
         let at = |line: &&str| text.find(line).expect("the line is in the text");
         ViewBlocks {
@@ -163,7 +146,6 @@ mod tests {
         assert!(matches!(led, MessageContent::Text(text) if text == "rest"));
     }
 
-    /// Classic: no views, so the stable block alone leads the message.
     #[test]
     fn a_classic_message_leads_with_the_stable_block() {
         let led =
@@ -177,12 +159,6 @@ mod tests {
         );
     }
 
-    /// Every view block is its own content block, snapshot first, so each
-    /// block end is a boundary the cache lookback can find. Only the marked
-    /// ones are memory view blocks; the rest, which moves every turn, is text.
-    /// The stable block sits between the two views: the snapshot stays first so
-    /// every thread shares it (I3), and the thread view's rungs read the stable
-    /// block through their own prefix.
     #[test]
     fn each_view_block_leads_as_its_own_block_and_the_marked_ones_are_memory_views() {
         let snapshot =
@@ -211,8 +187,6 @@ mod tests {
         );
     }
 
-    /// A new thread has an empty thread view: the stable block follows the
-    /// snapshot directly.
     #[test]
     fn an_empty_thread_view_leaves_the_stable_block_behind_the_snapshot() {
         let snapshot = "[WORKSPACE MEMORY VIEW]\n[w/0+4] a\n[END WORKSPACE MEMORY VIEW]\n";

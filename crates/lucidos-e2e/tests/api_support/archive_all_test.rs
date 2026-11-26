@@ -1,18 +1,7 @@
-//! End-to-end API tests for Archive all and its Undo (ADR 0349).
-//!
-//! The decisions are unit-tested in the engine (`engine::thread_triage`). What
-//! is tested here is the WIRING: real HTTP through the owner gate into the
-//! Archive button's own cascade, and the unarchive that Undo calls.
-//!
-//! Setup mirrors `delete_thread_test.rs`: seed `thread_summaries` rows
-//! directly. The workspace may hold other threads, so every assertion looks
-//! only at the ids it seeded.
-
 use crate::support::{base_url, db_url, http_client, user_client};
 use serde_json::json;
 use uuid::Uuid;
 
-/// Seed one idle inbox thread. `set` adjusts the row after the insert.
 async fn seed(pool: &sqlx::PgPool, id: Uuid, parent: Option<Uuid>, set: &str) {
     sqlx::query(
         "INSERT INTO thread_summaries (\
@@ -72,9 +61,6 @@ fn ids_in(body: &serde_json::Value, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// The safety net end to end. The confirm lists the safe root and not the one
-/// holding a draft. The press archives the root, leaves its pinned sub-thread
-/// open, and keeps the drafted root. Undo puts the batch back.
 #[tokio::test]
 async fn archive_all_takes_only_what_is_safe_and_undo_restores_it() {
     let client = user_client().await;
@@ -159,8 +145,6 @@ async fn archive_all_takes_only_what_is_safe_and_undo_restores_it() {
     pool.close().await;
 }
 
-/// All three routes are the owner's buttons. A caller with no credential is
-/// refused at the boundary and the thread stays where it was.
 #[tokio::test]
 async fn archive_all_refuses_an_unattributed_caller() {
     let pool = sqlx::PgPool::connect(&db_url())
@@ -200,8 +184,6 @@ async fn archive_all_refuses_an_unattributed_caller() {
     pool.close().await;
 }
 
-/// Scope is recursive, never includes the parent or siblings, and a cascade
-/// cannot take unfinished or newly-created work outside the counted targets.
 #[tokio::test]
 async fn archive_completed_sub_threads_is_scoped_and_rechecks_safety() {
     let client = user_client().await;
@@ -242,7 +224,6 @@ async fn archive_completed_sub_threads_is_scoped_and_rechecks_safety() {
         .execute(&pool)
         .await
         .unwrap();
-    // Include overlapping ids and deliberately out-of-scope ids in the press.
     let mut confirmed = safe;
     confirmed.extend([nested.to_string(), parent.to_string(), sibling.to_string()]);
     let response = client

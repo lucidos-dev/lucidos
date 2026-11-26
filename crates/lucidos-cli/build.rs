@@ -1,6 +1,3 @@
-//! Renders the manifest-generated subcommands into `OUT_DIR`, from the
-//! `lucidos-capabilities` leaf crate. `main.rs` includes them as `mod generated`.
-
 fn main() {
     let out = std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR for a build script");
     let path = std::path::Path::new(&out).join("cli_commands.rs");

@@ -3,38 +3,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-/// One row of the `events` table, and the **wire shape** of every event the
-/// workspace-facing read surface returns: `GET /api/v1/events/query`,
-/// `GET /api/v1/events/:event_id/{context,tool-result}`, the `events` LLM
-/// tool's `query` action, and `lucidos events query`.
-///
-/// `ThreadEvent` rows and `SystemEvent` rows (including workspace-emitted
-/// `DomainEvent`s) share this one table and this one shape. The `aggregate` /
-/// `aggregate_id` columns exist on the table but are deliberately NOT selected
-/// by `EventStore::fetch_events`, so they never reach the wire. See
-/// `system-knowhow/thread-events/one-table-two-enums.md` § "One table, two enums".
-///
-/// The JS SDK mirrors this as `LucidosEvent` in
-/// `packages/lucidos-sdk/src/events.ts` (documented in
-/// `system-knowhow/js-sdk/lucidos-media.md` § `lucidos.events`). Adding, removing or
-/// renaming a field here means updating both, and
-/// `serialized_key_set_is_the_documented_sdk_wire_shape` fails until you do.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EventRow {
     pub id: Uuid,
     pub event_type: String,
     pub payload: serde_json::Value,
     pub created: DateTime<Utc>,
-    /// The thread this row belongs to. `EventBus::persist` sets it exactly for
-    /// `aggregate = 'thread'` rows, which is every `ThreadEvent` and no
-    /// `SystemEvent` the engine persists today (domain events carry
-    /// `aggregate = 'domain'`). NULL there means the key is ABSENT from the
-    /// JSON rather than null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<Uuid>,
-    /// Monotonic insertion order (`events.sequence`, a NOT NULL bigserial).
-    /// Always present on a row read back from the database; `None` only on an
-    /// in-memory [`EventRow::new`] that was never persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<i64>,
 }
@@ -52,38 +28,26 @@ impl EventRow {
     }
 }
 
-/// Default mime for generated images stored inline in event payloads.
-/// User images live in the blob store and use their sniffed mime instead.
 pub const GENERATED_IMAGE_MIME: &str = "image/jpeg";
 
-/// Metadata-only entry yielded by `walk_thread_images_meta`. Cheap — no
-/// blob bytes are read.
 pub struct ThreadImageMeta {
     pub index: usize,
     pub source: &'static str,
     pub mime_type: String,
-    /// Position-free address, see [`image_handle`].
     pub handle: String,
 }
 
-/// A single image found while walking thread events. The `base64` field is
-/// only populated by the bytes-reading walker (`walk_thread_images`); the
-/// `walk_thread_images_meta` API endpoint uses `ThreadImageMeta` instead.
 pub struct ThreadImage {
     pub index: usize,
     pub source: &'static str,
     pub base64: String,
     pub mime_type: String,
-    /// Position-free address, see [`image_handle`].
     pub handle: String,
 }
 
-/// Hex characters of the content hash carried by an `img-` handle. 16 is 64
-/// bits, far past accidental collision inside one thread, and short enough
-/// that printing it beside `thread:N` costs about 8 tokens.
 const IMAGE_HANDLE_HEX: usize = 16;
 
-/// The stable, position-free address of a thread image: `img-<16 hex>`.
+/// INVARIANT: The stable, position-free address of a thread image: `img-<16 hex>`.
 ///
 /// `thread:N` renumbers whenever an earlier image appears, so a number the
 /// agent noted in one turn can name a different picture in the next. This is
@@ -96,7 +60,6 @@ const IMAGE_HANDLE_HEX: usize = 16;
 /// to the same picture, which is the right answer.
 pub fn image_handle(image_ref: ImageRef<'_>) -> String {
     let hex = match image_ref {
-        // Already the sha256 of the bytes, so there is nothing to rehash.
         ImageRef::BlobHash(hash) => hash.to_string(),
         ImageRef::InlineBase64(b64) => crate::core::blobs::compute_hash(b64.as_bytes()),
     };
@@ -107,8 +70,6 @@ pub fn image_handle(image_ref: ImageRef<'_>) -> String {
 pub trait HasEventPayload {
     fn event_type(&self) -> &str;
     fn payload(&self) -> &serde_json::Value;
-    /// Mutable access, so a read path can rewrite an oversized payload before
-    /// serving it without caring which of the two row types it holds.
     fn payload_mut(&mut self) -> &mut serde_json::Value;
 }
 
@@ -124,7 +85,7 @@ impl HasEventPayload for EventRow {
     }
 }
 
-/// The thread images one event adds, in order, with their source.
+/// INVARIANT: The thread images one event adds, in order, with their source.
 ///
 /// The single rule for what counts as a thread image. The walkers below and
 /// the history's message builder both read it, so `thread:N` names the same
@@ -154,7 +115,6 @@ pub fn thread_image_refs_of<'a>(
         .unwrap_or_default()
 }
 
-/// Every image in the thread, in `thread:N` order.
 fn walk_thread_image_refs<E: HasEventPayload>(
     events: &[E],
 ) -> impl Iterator<Item = (&'static str, ImageRef<'_>)> + '_ {
@@ -163,24 +123,19 @@ fn walk_thread_image_refs<E: HasEventPayload>(
         .flat_map(|event| thread_image_refs_of(event.event_type(), event.payload()))
 }
 
-/// The handle of every image in the thread, in `thread:N` order: entry `i`
-/// is `thread:{i+1}`. Reads no file.
 pub fn walk_thread_image_handles<E: HasEventPayload>(events: &[E]) -> Vec<String> {
     walk_thread_image_refs(events)
         .map(|(_, image_ref)| image_handle(image_ref))
         .collect()
 }
 
-/// Where one thread image's bytes live: the blob store, keyed by content
-/// hash, for a user upload; inline base64 in the event payload for a
-/// generated one.
 #[derive(Clone, Copy)]
 pub enum ImageRef<'a> {
     BlobHash(&'a str),
     InlineBase64(&'a str),
 }
 
-/// Metadata-only walk for endpoints that just need (index, source, mime).
+/// INVARIANT: Metadata-only walk for endpoints that just need (index, source, mime).
 /// One `metadata` syscall per user image, zero reads. Missing blobs still
 /// occupy an index — the index matches `walk_thread_images` and
 /// `walk_thread_image_handles`. The API serves a 404 for the missing entry.
@@ -207,7 +162,7 @@ pub fn walk_thread_images_meta<E: HasEventPayload>(
         .collect()
 }
 
-/// Bytes-loading walk for tool resolution and thread-image GET. Missing
+/// INVARIANT: Bytes-loading walk for tool resolution and thread-image GET. Missing
 /// blobs yield an entry with empty base64 + the placeholder mime so the
 /// index matches `walk_thread_images_meta` and `walk_thread_image_handles`. A
 /// callable `thread:N` whose blob is gone reaches the LLM as zero bytes
@@ -246,9 +201,6 @@ pub fn walk_thread_images<E: HasEventPayload>(
 mod tests {
     use super::*;
 
-    /// A response's `images` field lists browser screenshot artifact paths,
-    /// not image bytes. Counted as images, each one took a `thread:N` slot
-    /// that resolved to nothing.
     #[test]
     fn a_responses_screenshot_paths_are_not_thread_images() {
         let events = vec![
@@ -274,8 +226,6 @@ mod tests {
         );
     }
 
-    /// A generated image is inline base64 on its `ToolResult`, and it takes a
-    /// slot between the user images either side of it.
     #[test]
     fn a_generated_image_takes_its_slot_in_the_walk() {
         let events = vec![
@@ -320,22 +270,6 @@ mod tests {
         assert_eq!(event.id, parsed.id);
     }
 
-    /// Drift guard for the workspace-facing event read surface.
-    ///
-    /// `EventRow` IS the JSON `/api/v1/events/query` returns, and the JS SDK
-    /// hand-declares that shape as `LucidosEvent` in
-    /// `packages/lucidos-sdk/src/events.ts` (mirrored in
-    /// `system-knowhow/js-sdk/lucidos-media.md` § `lucidos.events`). Nothing else held the
-    /// two together, and they drifted: the SDK declared `aggregate?` /
-    /// `aggregate_id?`, which this endpoint never returns (the columns exist
-    /// on the table but `EventStore::fetch_events` does not select them), and
-    /// omitted `thread_id` / `sequence`, which it always does. An app reading
-    /// `e.thread_id` worked at runtime and failed `tsc`, which is what made
-    /// "an app cannot see a child thread's outcome" look true.
-    ///
-    /// Both shapes are asserted because both reach real clients: a
-    /// `ThreadEvent` row carries `thread_id`, a `SystemEvent` / domain-event
-    /// row has a NULL `thread_id` column and so drops the key entirely.
     #[test]
     fn serialized_key_set_is_the_documented_sdk_wire_shape() {
         fn keys(row: &EventRow) -> Vec<String> {
@@ -350,7 +284,6 @@ mod tests {
             k
         }
 
-        // A thread-scoped row, as returned for e.g. ChildThreadCompleted.
         let thread_row = EventRow {
             thread_id: Some(Uuid::new_v4()),
             sequence: Some(42),
@@ -371,8 +304,6 @@ mod tests {
              block in system-knowhow/js-sdk/lucidos-media.md § lucidos.events in the same change.",
         );
 
-        // A workspace-emitted domain event: aggregate = 'domain', so the
-        // thread_id column is NULL and `skip_serializing_if` drops the key.
         let domain_row = EventRow {
             sequence: Some(7),
             ..EventRow::new("HabitCompleted", serde_json::json!({"summary": "x"}))

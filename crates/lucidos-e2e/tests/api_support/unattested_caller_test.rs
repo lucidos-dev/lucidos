@@ -1,10 +1,3 @@
-//! An unattested caller against the real engine: invariants 1 and 3 of
-//! `docs/plans/2026-11-10-unattested-callers-and-gateway-stamps.md`.
-//!
-//! The harness starts the e2e engine with a stamp key, so [`user_client`]
-//! proves its device the way a gateway does. [`unattested_user_client`] names
-//! the same registered device with no stamp, which any local process can do.
-
 use crate::support::{
     as_stamped_device, base_url, db_url, http_client, register_device, seed_chat_thread_summary,
     unattested_user_client, unique_marker, user_client, E2E_DEVICE_ID,
@@ -20,7 +13,6 @@ async fn pool() -> sqlx::PgPool {
         .expect("Failed to connect to E2E workspace database")
 }
 
-/// The origin of the chat message carrying `marker`.
 async fn message_origin(pool: &sqlx::PgPool, marker: &str) -> Value {
     for _ in 0..50 {
         let origin: Option<Value> = sqlx::query_scalar(
@@ -50,8 +42,6 @@ async fn post_chat(builder: reqwest::RequestBuilder, body: Value) -> Value {
     resp.json().await.expect("chat reply is JSON")
 }
 
-/// Invariant 1: every claim a `curl` can make, stacked, builds no owner
-/// origin. The same device with a real stamp is the device.
 #[tokio::test]
 async fn a_forged_curl_shaped_request_is_an_unattested_caller() {
     register_device(E2E_DEVICE_ID).await;
@@ -101,10 +91,6 @@ async fn a_forged_curl_shaped_request_is_an_unattested_caller() {
     assert_eq!(origin["device_id"], E2E_DEVICE_ID, "{origin}");
 }
 
-/// A window re-paired under an open page: the body keeps its old id and the
-/// gateway stamps a new one the workspace has no row for. The send is the
-/// stamped device, and an owner door registers it and admits it. See
-/// `docs/plans/2026-11-21-owner-gate-registers-a-stamped-device.md`.
 #[tokio::test]
 async fn a_re_paired_window_sends_as_its_stamped_device_and_is_admitted_at_an_owner_door() {
     register_device(E2E_DEVICE_ID).await;
@@ -128,8 +114,6 @@ async fn a_re_paired_window_sends_as_its_stamped_device_and_is_admitted_at_an_ow
     assert_eq!(origin["kind"], "device", "{origin}");
     assert_eq!(origin["device_id"], new_id.as_str(), "{origin}");
 
-    // An owner-gated read from the same window registers the stamped id and is
-    // admitted, so no request path needs a client round trip first.
     let admitted = as_stamped_device(
         http_client().get(format!(
             "{}/api/v1/threads/archive-all-preflight",
@@ -149,8 +133,6 @@ async fn a_re_paired_window_sends_as_its_stamped_device_and_is_admitted_at_an_ow
     assert_eq!(rows, 1, "the owner gate registers the stamped device");
 }
 
-/// The gateway's stamp is what registers a device. The same request with a
-/// typed id and no stamp is refused and leaves no row.
 #[tokio::test]
 async fn a_typed_device_id_is_refused_at_an_owner_door_and_gains_no_row() {
     let pool = pool().await;
@@ -178,8 +160,6 @@ async fn a_typed_device_id_is_refused_at_an_owner_door_and_gains_no_row() {
     assert_eq!(rows, 0, "an unstamped id never registers a device");
 }
 
-/// One owner-only request. `marker` rides in its query, so the card it parks
-/// on can be found.
 struct Door {
     name: &'static str,
     method: reqwest::Method,
@@ -226,13 +206,8 @@ async fn get_json(client: &reqwest::Client, path: &str) -> Value {
         .expect("read is JSON")
 }
 
-/// The part of the workspace a door's act would change. Other tests write the
-/// same endpoints concurrently, so a landing reads only what this test's
-/// doors alone write.
 enum Landing {
-    /// The one preference a door writes.
     Preference(&'static str),
-    /// Whether a value only this test writes appears in a read.
     Mentions { read: &'static str, value: String },
 }
 
@@ -252,8 +227,6 @@ impl Landing {
     }
 }
 
-/// Invariant 3: each owner-only door refuses and acts on nothing.
-/// The before and after reads show the act did not land.
 #[tokio::test]
 async fn every_owner_only_door_refuses_an_unattested_caller() {
     use reqwest::Method;
@@ -266,7 +239,6 @@ async fn every_owner_only_door_refuses_an_unattested_caller() {
     let doomed = Uuid::new_v4();
     seed_chat_thread_summary(&pool, doomed, "idle").await;
     let trigger_name = unique_marker("e2e-unattested-grant");
-    // No other test binds this address or grants this tool.
     let engine_bind = "100.64.0.99";
     let granted_tool = "Bash(e2e-unattested:*)";
     let landings = [
@@ -360,7 +332,6 @@ async fn every_owner_only_door_refuses_an_unattested_caller() {
         assert_eq!(message, NOT_ATTESTED_AS_OWNER, "{}", door.name);
     }
 
-    // The first doors write the landings, in order.
     for (door, (landing, before)) in doors.iter().zip(landings.iter().zip(before)) {
         assert_eq!(
             landing.observe(&owner).await,
@@ -369,7 +340,6 @@ async fn every_owner_only_door_refuses_an_unattested_caller() {
             door.name
         );
     }
-    // The refused acts leave the seeded thread and its event stream untouched.
     let (rows, events): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM thread_summaries WHERE thread_id = $1), \
                 (SELECT COUNT(*) FROM events WHERE thread_id = $1)",
@@ -414,8 +384,6 @@ async fn an_unattested_caller_cannot_start_a_coding_agent() {
     assert!(!recorded, "the refused start records no user message");
 }
 
-/// Invariant 3: a door that cannot wait refuses an unattested caller outright,
-/// and lets the same device through once stamped.
 #[tokio::test]
 async fn a_reveal_refuses_an_unattested_caller_and_passes_a_stamped_one() {
     let path = format!(
@@ -446,8 +414,6 @@ async fn a_reveal_refuses_an_unattested_caller_and_passes_a_stamped_one() {
     );
 }
 
-/// Invariant 3: only the owner answers a card, so an unattested answer is
-/// refused, and the stamped device's answer lands.
 #[tokio::test]
 async fn an_unattested_caller_cannot_answer_a_card() {
     let pool = pool().await;

@@ -15,9 +15,10 @@ lucidos.preferences.set(key: string, value: string, deviceId?: string): Promise<
 ```
 
 `get()` defaults to the device the app runs on, so it sees the same merged view
-as the shell. Theme, font, scale and `agent-brand-colours` are device-scoped.
-Agent brand colours default On in the thread drawer. Off preserves the existing appearance, including the flat Lucidos mark.
-Other surfaces and status indicators stay unchanged.
+as the shell. Theme, font, scale and `agent-icon-colors` are device-scoped.
+`agent-icon-colors` colors the agent icons in the thread drawer, the thread pane
+and navigation history: `brand` (the default), `theme` or `muted`.
+Status indicators stay unchanged.
 
 A read naming no
 device gets only the global rows. The device id is per-workspace, and an app
@@ -182,9 +183,15 @@ would still forget its state.
 `valueMax` characters long. A write past either throws a `QuotaExceededError`
 `DOMException` at once, as `localStorage` does, and stores nothing.
 
-**A write the host refuses later**, such as when the browser's storage is full,
-is rolled back and passed to every `onError` handler. The user also sees a toast
-naming the app. With no handler the console logs it.
+**A write the host refuses later** rolls back in the frame and reaches every
+`onError` handler. With no handler, the SDK logs it to the console.
+The host toast names the app and gives recovery steps for full or blocked
+browser storage. Both storage areas share browser capacity with other apps
+and shell state in the same area.
+
+**When a store fills**, remove only known keys the app can rebuild. Keep
+preferences and drafts. A full store can reject a small write from any app,
+so the app named in the toast did not necessarily fill it.
 
 **What it is not:**
 

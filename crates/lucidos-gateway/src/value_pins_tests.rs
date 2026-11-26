@@ -1,12 +1,3 @@
-//! Pins every copy of a gateway or `lucidos-installs` value that cannot import
-//! it (ADR 0368). Shell cannot read a Rust constant, `install.sh` runs alone
-//! under `curl | sh`, and `tauri.conf.json` is config. So each copy is read here
-//! and compared with the constant, rendered from the constant itself.
-//!
-//! `scripts/lib/harden_suites.sh` selects this test when one of these files
-//! changes. Its `HS_GATEWAY_PINNED` list must name every `file` below, and
-//! `harden_suites_test.sh` checks that it does.
-
 use crate::postgres::{
     PG_IMAGE, PG_MAX_CONNECTIONS, PG_SHM_SIZE, PG_USER, SHARED_DOCKER_CONTAINER,
     SHARED_DOCKER_VOLUME,
@@ -15,8 +6,6 @@ use lucidos_installs::{BUNDLE_IDENTIFIER, DEFAULT_DEV_GATEWAY_PORT, DEFAULT_GATE
 use lucidos_local_token::{MINT_LOCK_SUFFIX, SHARED_PG_PASSWORD_FILE, TOKEN_BYTES};
 use std::path::Path;
 
-/// One copy of a value. Every place `file` says `before`, then a slot, then
-/// `after` must hold `value` in the slot, and at least one place must exist.
 struct Pin {
     file: &'static str,
     before: String,
@@ -26,7 +15,6 @@ struct Pin {
 
 const CONSTANTS_SH: &str = "scripts/lib/workspace_constants.sh";
 
-/// A `NAME="value"` line in a sourced constants file.
 fn shell_const(file: &'static str, name: &str, value: impl ToString) -> Pin {
     Pin {
         file,
@@ -123,11 +111,8 @@ fn pins() -> Vec<Pin> {
     ]
 }
 
-/// The longest slot read as a copy. A longer gap between `before` and `after`
-/// is unrelated text that happens to share the prefix.
 const SLOT_CHARS: usize = 40;
 
-/// Every slot `text` fills between `before` and `after`.
 fn slots<'a>(text: &'a str, before: &str, after: &str) -> Vec<&'a str> {
     let mut found = Vec::new();
     let mut rest = text;

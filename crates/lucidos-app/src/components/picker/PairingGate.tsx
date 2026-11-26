@@ -306,6 +306,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
   const [scanned] = useState(() => takeUnspentPairingCodeFromUrl());
   const [onPhoneSource] = useState(() => onPhoneCodeSource(isStandalone()));
   const [code, setCode] = useState(scanned && !isPairingSecret(scanned) ? scanned : '');
+  const [secretText, setSecretText] = useState('');
   const [label, setLabel] = useState(() => suggestDeviceLabelHere() ?? '');
   const [error, setError] = useState<string | null>(notice ?? null);
   const [busy, setBusy] = useState(false);
@@ -352,14 +353,28 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
     }
   };
 
+  const enterShortCode = (digits: string) => {
+    setSecretText('');
+    setCode(digits);
+  };
+
   const adopt = (token: string) => {
     if (isPairingSecret(token)) void redeem(token);
-    else setCode(token);
+    else enterShortCode(token);
   };
 
   const submit = (e: Event) => {
     e.preventDefault();
-    void redeem(code);
+    if (secretText.trim()) {
+      const token = pairingCodeFromText(secretText);
+      if (!token) {
+        setError('Paste a valid pairing secret or pairing link.');
+        return;
+      }
+      void redeem(token);
+    } else if (code.length === PAIRING_CODE_DIGITS) {
+      void redeem(code);
+    }
   };
 
   useEffect(() => {
@@ -436,7 +451,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
             id="pairing-code"
             class="pairing-code-entry"
             value={code}
-            onInput={(e) => setCode(applyCodeInput(e.target as HTMLInputElement))}
+            onInput={(e) => enterShortCode(applyCodeInput(e.target as HTMLInputElement))}
             onFocus={caretToEnd}
             onClick={caretToEnd}
             inputMode="numeric"
@@ -459,6 +474,21 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
             )}
           </div>
         )}
+        <label class="pairing-label" for="pairing-secret">
+          Pairing secret or link
+        </label>
+        <input
+          id="pairing-secret"
+          class="pairing-input"
+          value={secretText}
+          onInput={(e) => {
+            setCode('');
+            setSecretText((e.target as HTMLInputElement).value);
+          }}
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck={false}
+        />
         <label class="pairing-label" for="pairing-label">
           Name this device <span class="pairing-optional">(optional)</span>
         </label>
@@ -468,11 +498,11 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
           value={label}
           onInput={(e) => setLabel((e.target as HTMLInputElement).value)}
         />
-        {error && <p class="pairing-error">{error}</p>}
+        {error && <p class="pairing-error" role="alert">{error}</p>}
         <button
           class="pairing-submit"
           type="submit"
-          disabled={busy || code.length < PAIRING_CODE_DIGITS}
+          disabled={busy || (!secretText.trim() && code.length < PAIRING_CODE_DIGITS)}
         >
           {busy ? 'Pairing…' : 'Pair'}
         </button>

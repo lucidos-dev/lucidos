@@ -3,7 +3,6 @@ use std::time::Duration;
 
 #[easy_ext::ext(WebExt)]
 pub(crate) impl LucidosEngine {
-    /// `thread_id` anchors the cost row a web search records.
     async fn execute_web_tool(
         &self,
         name: &str,
@@ -36,9 +35,7 @@ pub(crate) impl LucidosEngine {
                 let gdelt_url = format!(
                     "https://api.gdeltproject.org/api/v2/doc/doc?query={}&mode=artlist&maxrecords={}&format=json&sort=datedesc",
                     urlencoding::encode(topic),
-                    // Saturating: the arg carries no cap, and a plain `+ 5` on
-                    // a model-supplied `usize::MAX` wraps to 4 in release.
-                    max_articles.saturating_add(5) // A few extra, in case of duplicates
+                    max_articles.saturating_add(5)
                 );
 
                 match client.get(&gdelt_url).send().await {
@@ -76,8 +73,6 @@ pub(crate) impl LucidosEngine {
                     ))
                 } else {
                     let shown: Vec<String> = all_articles.into_iter().take(max_articles).collect();
-                    // Counted, not re-derived from the rendered text: a title
-                    // carrying the `**[` marker inflated the reported total.
                     let count = shown.len();
                     Ok(format!(
                         "Found {} articles about '{}':\n\n{}",
@@ -98,7 +93,7 @@ pub(crate) impl LucidosEngine {
                     return Ok("Error: query is required".to_string());
                 }
 
-                // Resolved over the configured provider set — NOT over the chat
+                // INVARIANT: Resolved over the configured provider set — NOT over the chat
                 // model's provider, so a user whose chat provider has no search
                 // tool still searches via another configured one. The chain
                 // itself owns backend selection, fallthrough, and the
@@ -119,19 +114,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Render the articles a `fetch_news` response body carries, newest first.
-///
-/// An empty or whitespace body is the genuine no-results answer GDELT gives a
-/// query nothing matched, so it yields an empty list. Every other body must
-/// parse AND carry an `articles` list.
-///
-/// A body that parsed into some other shape is an upstream problem, so it is an
-/// error here rather than an empty list. An empty list reaches the model as "no
-/// news on this topic". It then states that to the user as a fact about the
-/// world, when it is a fact about the search.
-///
-/// The error text carries no `Error:` prefix. The caller adds it, so the tool's
-/// failure shape stays stated in one place.
 fn parse_gdelt_articles(body: &str, max_articles: usize) -> Result<Vec<String>, String> {
     if body.trim().is_empty() {
         return Ok(Vec::new());
@@ -148,7 +130,6 @@ fn parse_gdelt_articles(body: &str, max_articles: usize) -> Result<Vec<String>, 
         .collect())
 }
 
-/// One article as the tool result shows it: source, title, date and URL.
 fn render_article(article: &serde_json::Value) -> String {
     let title = article["title"].as_str().unwrap_or("Untitled");
     let url = article["url"].as_str().unwrap_or("");
@@ -163,9 +144,6 @@ fn render_article(article: &serde_json::Value) -> String {
     )
 }
 
-/// The `YYYYMMDD` head of a GDELT `seendate`, rendered with dashes. A value too
-/// short to hold one is passed through: showing the raw form beats inventing a
-/// day.
 fn gdelt_date(seendate: &str) -> String {
     let head: Vec<char> = seendate.chars().take(8).collect();
     if head.len() < 8 {
@@ -183,9 +161,6 @@ fn gdelt_date(seendate: &str) -> String {
 mod tests {
     use super::*;
 
-    /// THE regression. A body that parsed into another shape used to fall
-    /// through to the tool's "No news articles found" line. The model then told
-    /// the user nothing had been published on their topic.
     #[test]
     fn a_body_with_no_articles_list_is_an_error_not_an_empty_result() {
         for body in [
@@ -199,8 +174,6 @@ mod tests {
         }
     }
 
-    /// The one body that really does mean no results. GDELT answers a query
-    /// nothing matched with nothing at all.
     #[test]
     fn an_empty_body_is_a_genuine_no_results_answer() {
         assert_eq!(parse_gdelt_articles("", 5), Ok(Vec::new()));

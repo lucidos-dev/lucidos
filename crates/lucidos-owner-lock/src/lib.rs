@@ -1,41 +1,19 @@
-//! The *owner lock*: an exclusive flock a process holds for its whole life.
-//!
-//! A pidfile says who owned something once. The kernel drops a flock the
-//! moment its holder dies, so a held owner lock says who owns it now. Checking
-//! ownership and taking it are one call, which is what a pidfile check followed
-//! by a spawn never was. Why: ADR 0438.
-//!
-//! Three rules keep it sound:
-//!
-//! - **Never delete a lock file.** A second opener would create a new inode and
-//!   lock that one, so two processes would each hold "the" lock.
-//! - **Only the holder publishes its pid** ([`OwnerLock::publish_pid`]). A
-//!   reader trusts the pid only while the lock is held ([`live_pid`]).
-//! - **A child keeps the lock only until it execs.** Rust opens every file
-//!   close-on-exec, so a subprocess that outlives its parent cannot keep the
-//!   parent "alive". Between fork and exec, though, the child holds a copy. A
-//!   freshly copied binary can take macOS a while to exec, so a release is
-//!   observed promptly, not instantly. A lock is never observed free early.
-
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::path::Path;
 
-/// A held owner lock. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct OwnerLock {
     _file: File,
 }
 
 impl OwnerLock {
-    /// Take the lock, waiting for the current holder to exit.
     pub fn acquire(path: &Path) -> std::io::Result<OwnerLock> {
         let file = open_lock_file(path)?;
         fs2::FileExt::lock_exclusive(&file)?;
         Ok(OwnerLock { _file: file })
     }
 
-    /// Take the lock if nobody holds it. `None` means another process does.
     pub fn try_acquire(path: &Path) -> std::io::Result<Option<OwnerLock>> {
         let file = open_lock_file(path)?;
         match fs2::FileExt::try_lock_exclusive(&file) {
@@ -45,10 +23,6 @@ impl OwnerLock {
         }
     }
 
-    /// Take the lock through a file this process already has open, such as one
-    /// inherited across `exec`. An open file that already holds the lock takes
-    /// it again at once, whatever other copies of the descriptor exist.
-    /// `None` means another open file holds it.
     pub fn adopt(file: File) -> std::io::Result<Option<OwnerLock>> {
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(OwnerLock { _file: file })),
@@ -57,10 +31,6 @@ impl OwnerLock {
         }
     }
 
-    /// Write this process's pid to `pid_path`, whole or not at all.
-    ///
-    /// A temp file renamed into place, so a reader never sees a partial pid.
-    /// Taking `&self` is the point: only the holder can name itself.
     pub fn publish_pid(&self, pid_path: &Path) -> std::io::Result<()> {
         let name = pid_path
             .file_name()
@@ -81,11 +51,6 @@ impl std::os::fd::AsRawFd for OwnerLock {
     }
 }
 
-/// Whether some process holds the lock at `path` right now.
-///
-/// A missing lock file is "not held": nobody ever took it. The probe briefly
-/// takes a SHARED lock, so it can make a concurrent [`OwnerLock::try_acquire`]
-/// fail. Probe only locks whose owner claims with [`OwnerLock::acquire`].
 pub fn is_held(path: &Path) -> std::io::Result<bool> {
     let file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
@@ -99,11 +64,6 @@ pub fn is_held(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// The pid at `pid_path`, but only while the lock at `lock_path` is held.
-///
-/// `None` covers every reason not to signal: no holder, no pidfile, or a file
-/// that does not parse. A probe error also answers `None`, since a pid nobody
-/// can vouch for must never be signalled.
 pub fn live_pid(lock_path: &Path, pid_path: &Path) -> Option<u32> {
     if !is_held(lock_path).ok()? {
         return None;
@@ -111,7 +71,6 @@ pub fn live_pid(lock_path: &Path, pid_path: &Path) -> Option<u32> {
     read_pid(pid_path)
 }
 
-/// The pid a pidfile holds, with no claim that it is alive.
 fn read_pid(pid_path: &Path) -> Option<u32> {
     std::fs::read_to_string(pid_path)
         .ok()?
@@ -121,20 +80,12 @@ fn read_pid(pid_path: &Path) -> Option<u32> {
         .filter(|&pid| pid > 1)
 }
 
-/// A *consumer lock*: a shared flock a consumer of something holds for its
-/// whole life.
-///
-/// Many consumers hold it at once. Whoever would take the shared thing away
-/// asks with one exclusive, non-blocking try. Granted means no consumer is
-/// left, and none can register until it lets go. So a consumer arriving cannot
-/// split the decision from the act.
 #[derive(Debug)]
 pub struct ConsumerLock {
     _file: File,
 }
 
 impl ConsumerLock {
-    /// Register as a consumer, waiting out a teardown that holds the lock.
     pub fn acquire(path: &Path) -> std::io::Result<ConsumerLock> {
         let file = open_lock_file(path)?;
         fs2::FileExt::lock_shared(&file)?;
@@ -142,7 +93,6 @@ impl ConsumerLock {
     }
 }
 
-/// A workspace engine's lock and pidfile, inside its workspace directory.
 pub mod engine {
     use std::path::{Path, PathBuf};
 
@@ -154,8 +104,6 @@ pub mod engine {
         workspace.join(".lucidos/engine.pid")
     }
 
-    /// Held by an engine that is waiting for [`lock_path`], so a stop can find
-    /// a successor before it owns the workspace.
     pub fn successor_lock_path(workspace: &Path) -> PathBuf {
         workspace.join(".lucidos/engine.successor.lock")
     }
@@ -164,7 +112,6 @@ pub mod engine {
         workspace.join(".lucidos/engine.successor.pid")
     }
 
-    /// The pid of an engine waiting to own this workspace, while it waits.
     pub fn waiting_pid(workspace: &Path) -> Option<u32> {
         super::live_pid(
             &successor_lock_path(workspace),
@@ -188,7 +135,6 @@ pub mod engine {
     }
 }
 
-/// A gateway's lock and pidfile, inside its data directory.
 pub mod gateway {
     use std::path::{Path, PathBuf};
 
@@ -201,11 +147,6 @@ pub mod gateway {
     }
 }
 
-/// The packaged desktop client's lock and pidfile, inside its app-data dir.
-///
-/// The client claims with [`super::OwnerLock::try_acquire`], so never probe
-/// this lock with [`super::is_held`]. The probe can make a starting client
-/// lose its try and refuse to start.
 pub mod client {
     use std::path::{Path, PathBuf};
 
@@ -217,30 +158,20 @@ pub mod client {
         app_data.join("client.pid")
     }
 
-    /// The pid the holder published, for a process that just lost the try.
-    ///
-    /// Unvouched: a holder that has not published yet leaves the previous
-    /// client's pid. Use it to name the holder, never to signal it.
     pub fn published_pid(app_data: &Path) -> Option<u32> {
         super::read_pid(&pid_path(app_data))
     }
 }
 
-/// A checkout's shared build-watch, under `<app>/.build-watch/`, where `<app>`
-/// is the directory holding the served `dist/`. The shell side is
-/// `start_frontend_built` in `scripts/lib/workspace.sh`.
 pub mod build_watch {
     use std::path::{Path, PathBuf};
 
-    /// The watch script. Its presence beside `dist/` marks a dev checkout.
     pub const SCRIPT: &str = "dev-build-watch.mjs";
 
     pub fn dir(app: &Path) -> PathBuf {
         app.join(".build-watch")
     }
 
-    /// The watcher's owner lock. The watcher takes it blocking, so probing it
-    /// with [`super::is_held`] is sound.
     pub fn watch_lock_path(app: &Path) -> PathBuf {
         dir(app).join("watch.lock")
     }
@@ -249,12 +180,10 @@ pub mod build_watch {
         dir(app).join("pid")
     }
 
-    /// The [`super::ConsumerLock`] every engine serving `<app>/dist` holds.
     pub fn consumers_lock_path(app: &Path) -> PathBuf {
         dir(app).join("consumers.lock")
     }
 
-    /// The watcher's pid, while a watcher runs.
     pub fn live_pid(app: &Path) -> Option<u32> {
         super::live_pid(&watch_lock_path(app), &pid_path(app))
     }
@@ -294,9 +223,6 @@ mod tests {
         assert!(OwnerLock::try_acquire(&path).unwrap().is_some());
     }
 
-    /// The successor's whole contract: it gets the lock exactly when the
-    /// predecessor lets go, and not before. Synchronised by channels and the
-    /// lock itself, never by a sleep.
     #[test]
     fn acquire_waits_for_the_holder_to_let_go() {
         let tmp = tempfile::tempdir().unwrap();
@@ -344,9 +270,6 @@ mod tests {
         assert_eq!(live_pid(&path, &pid_path), None);
     }
 
-    /// An engine from before the lock wrote no lock file, and is still
-    /// stoppable by its pid. Once any lock-aware engine has run, the lock
-    /// decides.
     #[test]
     fn a_workspace_no_lock_aware_engine_ran_in_keeps_its_pidfile() {
         let tmp = tempfile::tempdir().unwrap();
@@ -369,8 +292,6 @@ mod tests {
         );
     }
 
-    /// A teardown's exclusive try is refused while any consumer is registered,
-    /// and a consumer arriving during a teardown waits for it to finish.
     #[test]
     fn consumers_hold_off_an_exclusive_try_and_wait_out_one() {
         let tmp = tempfile::tempdir().unwrap();

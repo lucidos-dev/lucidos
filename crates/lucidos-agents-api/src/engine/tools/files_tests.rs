@@ -1,6 +1,5 @@
 use super::*;
 
-/// An app manager with no built-in widgets, for the read-only checks.
 fn no_apps() -> crate::core::AppManager {
     let ws = tempfile::tempdir().unwrap();
     crate::core::AppManager::new(ws.path()).unwrap()
@@ -24,10 +23,8 @@ fn read_only_reason_blocks_a_built_in_widget_and_nothing_else() {
         let reason = read_only_reason(p, &apps).expect(p);
         assert!(reason.contains("built-in"), "got: {reason}");
     }
-    // A NEW app may not take the reserved prefix, through any write.
     let reason = read_only_reason("apps/lucidos-new/manifest.json", &apps).unwrap();
     assert!(reason.contains("reserved"), "got: {reason}");
-    // A workspace app that already holds such an id stays writable.
     let mine = ws.path().join("data/apps/lucidos-mine");
     std::fs::create_dir_all(&mine).unwrap();
     std::fs::write(mine.join("manifest.json"), r#"{"name":"Mine"}"#).unwrap();
@@ -42,9 +39,6 @@ fn read_only_reason_blocks_system_knowhow() {
 
 #[test]
 fn read_only_reason_blocks_ephemeral_scratch() {
-    // The silent half of the .lucidos/tmp bug: these used to normalize to
-    // `artifacts/.lucidos/tmp/…` and get git-committed into the tracked
-    // artifacts repo while reporting "[ACTION COMPLETED] CREATED".
     for p in [
         ".lucidos/tmp/scratch.py",
         ".lucidos/tmp/changelog-v0.15.0.md",
@@ -59,7 +53,6 @@ fn read_only_reason_blocks_ephemeral_scratch() {
 
 #[test]
 fn scratch_refusal_names_run_python() {
-    // A refusal is only useful if it says what to do instead.
     let reason = read_only_reason(".lucidos/tmp/scratch.py", &no_apps()).unwrap();
     assert!(reason.contains("run_python"), "got: {reason}");
     assert!(reason.contains("workspace root"), "got: {reason}");
@@ -72,7 +65,6 @@ fn data_path_app_id_extracts_id_under_apps() {
         Some("demo-director")
     );
     assert_eq!(data_path_app_id("apps/foo/scripts/x.py"), Some("foo"));
-    // Not an app path / no id segment → None.
     assert_eq!(data_path_app_id("artifacts/notes.md"), None);
     assert_eq!(data_path_app_id("apps/"), None);
     assert_eq!(data_path_app_id("apps"), None);
@@ -80,23 +72,19 @@ fn data_path_app_id_extracts_id_under_apps() {
 
 #[test]
 fn data_path_app_manifest_id_only_matches_the_manifest() {
-    // Only apps/<id>/manifest.json triggers an App* event.
     assert_eq!(
         data_path_app_manifest_id("apps/demo-director/manifest.json"),
         Some("demo-director")
     );
-    // Any other app file (the bulk of writes during a build) → no event.
     assert_eq!(
         data_path_app_manifest_id("apps/demo-director/index.html"),
         None
     );
     assert_eq!(data_path_app_manifest_id("apps/foo/scripts/x.py"), None);
-    // A manifest.json nested below the app root is not the app manifest.
     assert_eq!(
         data_path_app_manifest_id("apps/foo/sub/manifest.json"),
         None
     );
-    // Non-app paths and malformed paths.
     assert_eq!(data_path_app_manifest_id("artifacts/manifest.json"), None);
     assert_eq!(data_path_app_manifest_id("apps/manifest.json"), None);
     assert_eq!(data_path_app_manifest_id("apps/foo"), None);
@@ -108,15 +96,11 @@ fn app_lifecycle_event_is_birth_and_death_only() {
     let delete = ManifestOp::Delete {
         kind_before: Some(AppKind::Widget),
     };
-    // Manifest newly appeared → AppCreated (the load-bearing case).
     assert!(matches!(
         app_lifecycle_event("a", name, true, false, ManifestOp::Write),
         Some(SystemEvent::AppCreated { .. })
     ));
-    // Manifest edited (existed before, still exists) → None: AppUpdated is
-    // emitted once per turn by the agentic loop, not per write.
     assert!(app_lifecycle_event("a", name, true, true, ManifestOp::Write).is_none());
-    // Manifest removed (existed before) → AppDeleted, carrying the kind it had.
     assert!(matches!(
         app_lifecycle_event("a", name, false, true, delete),
         Some(SystemEvent::AppDeleted {
@@ -124,13 +108,11 @@ fn app_lifecycle_event_is_birth_and_death_only() {
             ..
         })
     ));
-    // Delete against an app that never existed → nothing.
     assert!(app_lifecycle_event("a", name, false, false, delete).is_none());
 }
 
 #[test]
 fn a_file_tool_announces_every_data_change_outside_artifacts() {
-    // An open preview of any of these files refreshes only on this event.
     for path in [
         "knowhow/cooking/bread.md",
         "apps/habit-tracker/index.html",
@@ -180,8 +162,6 @@ fn read_only_reason_allows_user_paths() {
     assert!(read_only_reason("knowhow/lucidos/best-practices.md", &no_apps()).is_none());
     assert!(read_only_reason("apps/foo/index.html", &no_apps()).is_none());
     assert!(read_only_reason("triggers/daily/check.md", &no_apps()).is_none());
-    // The scratch guard matches a path prefix, not a name prefix: an artifact
-    // that merely starts with the same letters stays writable.
     assert!(read_only_reason("artifacts/.lucidosrc", &no_apps()).is_none());
 }
 
@@ -203,7 +183,6 @@ fn test_image_content_marker_format() {
     let b64_data = "iVBORw0KGgo=";
     let marker = format!("[IMAGE_CONTENT:{}]\n{}", media_type, b64_data);
 
-    // Verify parsing matches agentic_loop logic
     let rest = marker.strip_prefix("[IMAGE_CONTENT:").unwrap();
     let end_bracket = rest.find("]\n").unwrap();
     let parsed_media = &rest[..end_bracket];
@@ -215,8 +194,6 @@ fn test_image_content_marker_format() {
 
 #[test]
 fn test_image_size_guard() {
-    // 25 MB outer safety bound — normal iPhone photos (3–12 MB) stay well under it
-    // and are downsampled-on-read rather than rejected.
     assert_eq!(IMAGE_MAX_BYTES, 25 * 1024 * 1024);
     const { assert!(12 * 1024 * 1024 < IMAGE_MAX_BYTES) };
 }
@@ -225,14 +202,12 @@ fn test_image_size_guard() {
 fn test_read_image_file_returns_base64_marker() {
     let dir = tempfile::tempdir().unwrap();
     let img_path = dir.path().join("test.png");
-    // Minimal valid PNG (1x1 transparent pixel)
     let png_bytes: Vec<u8> = vec![
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
-        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
-        0x41, 0x54, 0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC,
-        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+        0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
     std::fs::write(&img_path, &png_bytes).unwrap();
 
@@ -243,7 +218,6 @@ fn test_read_image_file_returns_base64_marker() {
     let result = format!("[IMAGE_CONTENT:{}]\n{}", media_type, b64);
 
     assert!(result.starts_with("[IMAGE_CONTENT:image/png]\n"));
-    // Verify round-trip: decode the base64 back
     let rest = result.strip_prefix("[IMAGE_CONTENT:image/png]\n").unwrap();
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(rest.trim())
@@ -273,11 +247,9 @@ fn strip_image_content_marker_jpeg() {
 
 #[test]
 fn strip_image_content_marker_includes_size_label() {
-    // 4 base64 chars = ~3 decoded bytes
     let stub_small = strip_image_content_marker("[IMAGE_CONTENT:image/png]\nABCD").unwrap();
     assert!(stub_small.contains("bytes"), "{}", stub_small);
 
-    // ~1.4 MB of base64 → ~1 MB decoded
     let big_b64 = "A".repeat(1_400_000);
     let stub_big =
         strip_image_content_marker(&format!("[IMAGE_CONTENT:image/png]\n{}", big_b64)).unwrap();
@@ -292,16 +264,12 @@ fn strip_image_content_marker_returns_none_for_plain_text() {
 
 #[test]
 fn strip_image_content_marker_returns_none_for_malformed() {
-    // Missing the closing `]\n` separator
     assert!(strip_image_content_marker("[IMAGE_CONTENT:image/png ABCDEFGH").is_none());
-    // Has prefix but no body separator
     assert!(strip_image_content_marker("[IMAGE_CONTENT:image/png]ABCDEFGH").is_none());
 }
 
 #[test]
 fn strip_image_content_marker_strips_real_size() {
-    // Sanity: a 2 MB base64 string should produce a stub under 100 bytes — the whole
-    // point of the helper. This is the behaviour the bugfix relies on.
     let huge = "A".repeat(2 * 1024 * 1024);
     let input = format!("[IMAGE_CONTENT:image/png]\n{}", huge);
     let stub = strip_image_content_marker(&input).unwrap();
@@ -311,7 +279,7 @@ fn strip_image_content_marker_strips_real_size() {
 
 #[test]
 fn test_large_image_error_message() {
-    let size: u64 = 30 * 1024 * 1024; // 30 MB — over the 25 MB outer cap
+    let size: u64 = 30 * 1024 * 1024;
     assert!(size > IMAGE_MAX_BYTES);
     let mb = size as f64 / (1024.0 * 1024.0);
     let msg = format!(
@@ -328,15 +296,10 @@ fn test_large_image_error_message() {
 
 #[test]
 fn read_oversized_image_is_downsampled_not_rejected() {
-    // Regression: a moderately large image whose base64 payload exceeds the LLM
-    // target (MAX_IMAGE_BASE64_BYTES) but is under the 25 MB outer cap must be
-    // downsampled-on-read, not rejected. Generate a noisy PNG (noise resists PNG
-    // compression, so the encoded file stays large).
     let (w, h) = (1600u32, 1600u32);
     let mut buf = image::RgbImage::new(w, h);
     let mut state: u32 = 0x9E3779B9;
     let mut next = || {
-        // xorshift32 — incompressible pseudo-noise
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
@@ -351,8 +314,6 @@ fn read_oversized_image_is_downsampled_not_rejected() {
         .unwrap();
     let png_bytes = png.into_inner();
 
-    // Fixture sanity: over the LLM target (so downsampling is exercised) and under
-    // the 25 MB outer cap (so the read path accepts it).
     let raw_b64_len = base64::engine::general_purpose::STANDARD
         .encode(&png_bytes)
         .len();
@@ -369,14 +330,12 @@ fn read_oversized_image_is_downsampled_not_rejected() {
     );
     let (media_type, b64) =
         parse_image_content_marker(&result).expect("result is a valid IMAGE_CONTENT sentinel");
-    // compress() re-encodes to JPEG, so the sentinel names the actual bytes' type.
     assert_eq!(media_type, "image/jpeg");
     assert!(
         b64.len() <= crate::engine::types::MAX_IMAGE_BASE64_BYTES,
         "downsampled payload must fit the LLM target, got {} base64 bytes",
         b64.len()
     );
-    // The returned base64 decodes to a valid image.
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .expect("returned base64 decodes");
@@ -385,10 +344,6 @@ fn read_oversized_image_is_downsampled_not_rejected() {
 
 #[test]
 fn read_undecodable_oversized_image_reports_clear_error() {
-    // A file with an image extension whose bytes aren't a decodable image and whose
-    // base64 payload exceeds the LLM target: compress() can't shrink it (decode fails,
-    // returns the input unchanged), so the read path must fail fast with a clear
-    // message rather than emit an oversized IMAGE_CONTENT block the model would reject.
     let bytes: Vec<u8> = (0..4 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
     assert!(
         base64::engine::general_purpose::STANDARD
@@ -410,8 +365,6 @@ fn read_undecodable_oversized_image_reports_clear_error() {
 
 #[test]
 fn read_small_image_is_not_recompressed() {
-    // A small image stays in its original format/media type — compression only
-    // kicks in when the payload would exceed the LLM target.
     let png_bytes: Vec<u8> = vec![
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
@@ -430,10 +383,6 @@ fn read_small_image_is_not_recompressed() {
 
 #[test]
 fn a_jpeg_saved_with_a_png_extension_is_sent_as_jpeg() {
-    // A JPEG renamed to `.png` used to be sent as `image/png`. Vertex
-    // rejects the whole request when the stated type disagrees with the
-    // bytes. The fallback here is what the extension would have claimed,
-    // so this only passes if the sniff wins.
     let jpeg_bytes: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
     let result = encode_image_for_read(jpeg_bytes, "image/png");
     assert!(
@@ -459,8 +408,6 @@ fn a_real_png_still_reports_as_png() {
 
 #[test]
 fn an_unrecognized_blob_falls_back_to_the_extension() {
-    // Bytes matching none of the sniffed formats (a corrupt file that still
-    // carries an image extension) keep the extension-derived media type.
     let unknown_bytes: Vec<u8> = vec![0x00, 0x01, 0x02, 0x03, 0x04];
     let result = encode_image_for_read(unknown_bytes, "image/webp");
     assert!(
@@ -472,9 +419,7 @@ fn an_unrecognized_blob_falls_back_to_the_extension() {
 
 #[test]
 fn test_svg_not_treated_as_image() {
-    // SVG should not match image_media_type — it's text-based
     assert_eq!(image_media_type("svg"), None);
-    // SVG is also not in is_binary_extension, so it goes through text path
     assert!(!crate::core::is_binary_extension("svg"));
 }
 
@@ -599,7 +544,6 @@ fn test_dot_path_to_pointer_quoted_key_with_dot() {
 
 #[test]
 fn test_dot_path_to_pointer_quoted_key_pointer_escapes() {
-    // RFC 6901: '~' → '~0', '/' → '~1'.
     assert_eq!(dot_path_to_pointer(r#"data["a/b"]"#), "/data/a~1b");
     assert_eq!(dot_path_to_pointer(r#"data["a~b"]"#), "/data/a~0b");
 }
@@ -644,8 +588,6 @@ fn test_json_set_value_root() {
     assert_eq!(doc, new_val);
 }
 
-// --- slice_lines ------------------------------------------------------
-
 #[test]
 fn slice_lines_full_content_when_unbounded() {
     assert_eq!(slice_lines("a\nb\nc", 1, None), "a\nb\nc");
@@ -682,8 +624,6 @@ fn slice_lines_single_line_no_trailing_newline() {
     assert_eq!(slice_lines("only", 1, Some(1)), "only");
 }
 
-// --- split_archive_path -----------------------------------------------
-
 #[test]
 fn split_archive_path_lucidos_plugin() {
     assert_eq!(
@@ -708,7 +648,6 @@ fn split_archive_path_zip() {
 
 #[test]
 fn split_archive_path_no_inner_returns_none() {
-    // Just the archive itself — caller wants the bytes, not unzip semantics.
     assert_eq!(
         split_archive_path("artifacts/plugins/foo.lucidos-plugin"),
         None
@@ -724,14 +663,11 @@ fn split_archive_path_regular_path_returns_none() {
 
 #[test]
 fn split_archive_path_first_archive_wins_for_nested() {
-    // We don't recurse into nested archives; first-match wins.
     assert_eq!(
         split_archive_path("artifacts/a.zip/b.zip/c.txt"),
         Some(("artifacts/a.zip".to_string(), "b.zip/c.txt".to_string()))
     );
 }
-
-// --- read_text_from_zip -----------------------------------------------
 
 #[test]
 fn read_text_from_zip_returns_entry_content() {
@@ -757,9 +693,6 @@ fn read_text_from_zip_returns_entry_content() {
 
 #[test]
 fn read_text_from_zip_rejects_oversized_entry() {
-    // Zip-bomb defense: an inner entry whose uncompressed size exceeds the cap
-    // is rejected before we allocate the buffer for it. Test uses a tiny cap so
-    // the fixture stays small.
     use std::io::Write as _;
     let dir = tempfile::tempdir().unwrap();
     let zip_path = dir.path().join("big.zip");
@@ -777,7 +710,6 @@ fn read_text_from_zip_rejects_oversized_entry() {
         "oversized entry must be rejected with a size hint, got: {}",
         err
     );
-    // Cap is reported so the LLM knows the limit.
     assert!(
         err.contains("100"),
         "error should mention the cap, got: {}",
@@ -785,7 +717,6 @@ fn read_text_from_zip_rejects_oversized_entry() {
     );
 }
 
-/// An entry claiming 10 bytes but inflating to 1000 must fail during decompression.
 #[test]
 fn read_text_from_zip_refuses_an_entry_whose_header_understates_its_size() {
     use std::io::Write as _;
@@ -799,8 +730,6 @@ fn read_text_from_zip_refuses_an_entry_whose_header_understates_its_size() {
     zw.write_all(&[b'a'; 1000]).unwrap();
     zw.finish().unwrap();
 
-    // Overwrite the uncompressed size in the local header (offset 22) and the
-    // central directory header (offset 24).
     let mut raw = std::fs::read(&zip_path).unwrap();
     let mut patch = |signature: &[u8; 4], offset: usize| {
         let at = raw
@@ -819,8 +748,6 @@ fn read_text_from_zip_refuses_an_entry_whose_header_understates_its_size() {
         "an entry exceeding its declared size must be refused, got: {err}"
     );
 }
-
-// --- line_window_from_args -------------------------------------------
 
 #[test]
 fn line_window_none_when_no_args() {
@@ -890,7 +817,6 @@ fn archive_entry_unsupported_binary_extensions_return_message() {
             hint,
             msg
         );
-        // Must mention the inner path so the LLM knows what was rejected.
         assert!(
             msg.contains(inner),
             "message for '{}' should name the entry, got: {}",
@@ -902,9 +828,6 @@ fn archive_entry_unsupported_binary_extensions_return_message() {
 
 #[test]
 fn read_text_from_zip_rejects_empty_inner_path() {
-    // Empty inner names are rejected by validate_archive_entry_path itself
-    // (see core::plugins::tests::rejects_empty_path), surfaced here via the
-    // shared "rejected zip entry" wrapper.
     use std::io::Write as _;
     let dir = tempfile::tempdir().unwrap();
     let zip_path = dir.path().join("test.zip");
@@ -926,8 +849,6 @@ fn read_text_from_zip_rejects_empty_inner_path() {
 
 #[test]
 fn read_text_from_zip_rejects_zip_slip_inner_path() {
-    // Zip-slip defense: an inner path with `..` or a leading slash must be rejected
-    // before we even hash-lookup the entry, matching what extract_zip enforces.
     use std::io::Write as _;
     let dir = tempfile::tempdir().unwrap();
     let zip_path = dir.path().join("test.zip");
@@ -978,11 +899,6 @@ fn read_text_from_zip_missing_entry_errors() {
     );
 }
 
-// --- edit_file: the replacement count, and the repo target ---
-
-/// The silent partial edit this count exists to expose: without `replace_all`
-/// the file keeps three of its four occurrences, and the old result said only
-/// "UPDATED".
 #[test]
 fn a_partial_text_edit_reports_both_counts_and_names_replace_all() {
     let content = "a\nfoo\nb\nfoo\nc\nfoo\nd\nfoo\n";
@@ -1039,8 +955,6 @@ fn a_single_occurrence_reports_one_of_one() {
     assert!(msg.contains("1 of 1 occurrences replaced"), "got: {msg}");
 }
 
-/// The counts describe the write, so they have to be derived from the content
-/// the edit actually produced, not from the caller's intent.
 #[test]
 fn the_reported_counts_match_the_written_content() {
     for (content, replace_all, expect_replaced, expect_found) in [
@@ -1081,14 +995,10 @@ fn json_mode_reports_no_occurrence_count() {
 
 #[test]
 fn a_missing_old_string_still_errors_by_its_recognised_phrase() {
-    // The dispatch keys its "here is the current content" recovery arm off
-    // this exact substring.
     let err = apply_text_edit("nothing here", "absent", "x", false, "x.md").unwrap_err();
     assert!(err.contains("old_string not found"), "got: {err}");
 }
 
-/// A repo edit's result must not look like a committed one. It carries no sha,
-/// and it says where the change is instead.
 #[test]
 fn a_repo_edit_result_says_uncommitted_and_carries_no_sha() {
     let msg = FileEditResult {
@@ -1110,9 +1020,7 @@ fn a_repo_edit_result_says_uncommitted_and_carries_no_sha() {
 
 #[test]
 fn commit_pairing_accepts_only_the_two_honest_combinations() {
-    // A data/ edit commits, and says nothing about it.
     assert!(check_commit_pairing(false, None).is_ok());
-    // A repo edit states that it does not.
     assert!(check_commit_pairing(true, Some(false)).is_ok());
 }
 
@@ -1129,8 +1037,6 @@ fn commit_pairing_refuses_a_repo_edit_that_stays_silent() {
     assert!(err.contains("commit: false"), "got: {err}");
 }
 
-/// `commit: false` on a `data/` path would mean an uncommitted workspace write,
-/// which is exactly the contract ADR 0051 refused to break.
 #[test]
 fn commit_pairing_refuses_an_uncommitted_workspace_write() {
     let err = check_commit_pairing(false, Some(false)).unwrap_err();
@@ -1138,10 +1044,6 @@ fn commit_pairing_refuses_an_uncommitted_workspace_write() {
     assert!(err.contains("run_python"), "got: {err}");
 }
 
-/// An empty `old_string` matches at every character boundary in Rust, so a
-/// replace would interleave the replacement through the whole file. Against a
-/// registered repository that write is uncommitted, so there is nothing to
-/// recover from.
 #[test]
 fn an_empty_old_string_is_refused_rather_than_matching_everywhere() {
     for (new, replace_all) in [("x", true), ("x", false), ("", false)] {
@@ -1154,22 +1056,16 @@ fn an_empty_old_string_is_refused_rather_than_matching_everywhere() {
     }
 }
 
-/// The rule that decides whether a write can make a handshake script runnable
-/// (ADR 0144). Both halves matter, and the second is the one a refactor could
-/// lose without any test noticing.
 #[test]
 fn only_an_in_process_write_under_data_scripts_records_authorship() {
     assert!(records_script_authorship(
         WriteAuthorship::InProcessTool,
         "data/scripts/auth/comfort-cloud.py"
     ));
-    // The HTTP data surface, which an app UI reaches with the user's
-    // authority. It may write the file; it may not bless it.
     assert!(!records_script_authorship(
         WriteAuthorship::ApiCaller,
         "data/scripts/auth/comfort-cloud.py"
     ));
-    // Nothing outside the tree the runner reads is a handshake script.
     for elsewhere in [
         "data/artifacts/notes.md",
         "data/config/apis.json",
@@ -1183,10 +1079,6 @@ fn only_an_in_process_write_under_data_scripts_records_authorship() {
     }
 }
 
-// --- change_owner --------------------------------------------------------
-
-/// `delete_file` resolved a shared knowhow file into the user dir, then
-/// deleted on the workspace path, so the shared file survived every delete.
 #[test]
 fn a_file_resolved_into_the_shared_user_dir_is_owned_by_it() {
     let user_dir = Path::new("/home/user/.lucidos");
@@ -1226,8 +1118,6 @@ fn a_workspace_file_is_owned_by_its_app_or_the_workspace() {
     );
 }
 
-/// The shared arm end to end: the owner `change_owner` names is the repo the
-/// file leaves, and the removal lands as a commit there.
 #[test]
 fn deleting_a_shared_file_removes_it_from_the_shared_repo() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1258,10 +1148,6 @@ fn deleting_a_shared_file_removes_it_from_the_shared_repo() {
     );
 }
 
-// --- is_same_file --------------------------------------------------------
-
-/// `copy_file` onto its own source emptied the file: the copy truncates the
-/// destination before it reads. Every path that reaches the source counts.
 #[test]
 fn a_copy_onto_its_own_source_is_recognised() {
     let dir = tempfile::tempdir().unwrap();
@@ -1279,8 +1165,6 @@ fn a_copy_onto_its_own_source_is_recognised() {
     assert!(!is_same_file(&a, &dir.path().join("new.md")));
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "x");
 }
-
-// --- engine-backed file tool rules ---------------------------------------
 
 async fn engine_on(db: &str, workspace: &Path) -> crate::engine::LucidosEngine {
     crate::engine::LucidosEngine::new(
@@ -1303,7 +1187,6 @@ async fn engine_on(db: &str, workspace: &Path) -> crate::engine::LucidosEngine {
     .unwrap()
 }
 
-/// The app lifecycle events are broadcast-only, so a test reads them off the bus.
 struct BroadcastLog {
     rx: tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
     seen: Vec<&'static str>,
@@ -1462,9 +1345,6 @@ async fn a_failed_glob_reaches_the_model_with_the_error_prefix() {
 }
 
 mod guard_tests {
-    /// The HTTP layer must never claim in-process authorship. The compiler forces
-    /// every call site to name one, so what is left to protect is which one the
-    /// API surface names.
     #[test]
     fn no_http_handler_claims_in_process_authorship() {
         let offenders: Vec<String> = crate::test_support::source_scan::production_sources()

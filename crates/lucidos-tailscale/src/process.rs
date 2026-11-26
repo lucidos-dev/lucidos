@@ -1,17 +1,12 @@
-//! Running a subprocess with a hard deadline.
-
 use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-/// Stdout beyond this is dropped. Status and `lsof` output fit with room to spare.
 const MAX_STDOUT: u64 = 1 << 20;
 
 #[derive(Debug)]
 pub(crate) enum RunError {
-    /// The program could not start: not installed, or not on `PATH`.
     Spawn,
-    /// It ran past its deadline and was killed.
     TimedOut,
 }
 
@@ -20,9 +15,6 @@ pub(crate) struct Ran {
     pub stdout: String,
 }
 
-/// Run `cmd`, killing it at `timeout`. Stdout is drained on a thread while the
-/// child runs, so a full pipe can never stall it; stderr is discarded. The
-/// deadline also covers stdout's EOF, which a lingering grandchild can hold.
 pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<Ran, RunError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -33,7 +25,6 @@ pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<Ran, Ru
     std::thread::spawn(move || {
         let mut out = Vec::new();
         let _ = (&mut stdout).take(MAX_STDOUT).read_to_end(&mut out);
-        // Keep draining, or a child writing past the cap dies on a broken pipe.
         let _ = std::io::copy(&mut stdout, &mut std::io::sink());
         let _ = sender.send(String::from_utf8_lossy(&out).into_owned());
     });
@@ -44,7 +35,6 @@ pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<Ran, Ru
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            // Overran, or cannot be waited on: either way it is stopped here.
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();

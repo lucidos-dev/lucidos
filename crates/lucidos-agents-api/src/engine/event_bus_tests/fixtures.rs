@@ -1,7 +1,3 @@
-/// Spawn a CC parent + N running CC children. Each child is at
-/// `status='running'` post-`SessionStarted` — the parent's
-/// `blocking_descendant_count` equals `n` on return. Used by the
-/// blocking-count regression tests below.
 async fn spawn_cc_parent_with_n_running_cc_children(bus: &EventBus, n: usize) -> (Uuid, Vec<Uuid>) {
     let parent_id = Uuid::new_v4();
     emit_cc_message_received(bus, parent_id, None, "parent").await;

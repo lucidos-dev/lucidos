@@ -76,12 +76,14 @@ fn shown_root_sql() -> String {
 }
 
 /// A question card the thread asked and nobody answered, live or orphaned.
-const PENDING_QUESTION_SQL: &str = "(t.status = 'waiting_for_user_answer' OR EXISTS ( \
+/// A held thread asks the owner nothing, as `thread_lifecycle::awaits_owner_answer` says.
+const PENDING_QUESTION_SQL: &str =
+    "(t.hold IS NULL AND (t.status = 'waiting_for_user_answer' OR EXISTS ( \
      SELECT 1 FROM events q WHERE q.thread_id = t.thread_id \
        AND q.event_type = 'UserQuestionAsked' \
        AND NOT EXISTS (SELECT 1 FROM events a WHERE a.thread_id = q.thread_id \
          AND a.event_type = 'UserQuestionAnswered' \
-         AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id')))";
+         AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id'))))";
 
 /// One member's flags, read only while it is open: an archived member holds
 /// nothing the user must act on, and the scans behind these are the costly part.

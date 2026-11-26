@@ -1,17 +1,6 @@
-//! E2E coverage for the Connect flow's HTTP surface: the *OAuth provider
-//! registry* endpoint, and what `reauthorize` answers for a registration that
-//! is missing or that cannot drive a flow.
-//!
-//! The second half is the reported bug's whole shape. A user typed a provider
-//! name, pressed Connect, was handed a credential form with an empty endpoint
-//! section, saved a client with no `auth_url` because nothing enforced one, and
-//! got "Missing auth_url in OAuth credentials" on the next press: an error one
-//! screen away from its cause, with no way forward.
-
 use crate::support::{base_url, unique_marker, user_client};
 use serde_json::{json, Value};
 
-/// The registry the Connect form autofills from.
 #[tokio::test]
 async fn known_providers_are_served_with_the_redirect_uri_to_register() {
     let client = user_client().await;
@@ -42,9 +31,6 @@ async fn known_providers_are_served_with_the_redirect_uri_to_register() {
         }
     }
 
-    // The form offers this for copying into the provider's console, where it has
-    // to be registered character for character. The engine owns the port and
-    // path, so it is the engine that states it.
     let redirect = body["default_redirect_uri"].as_str().unwrap_or_default();
     assert!(
         redirect.contains("/oauth/callback"),
@@ -52,8 +38,6 @@ async fn known_providers_are_served_with_the_redirect_uri_to_register() {
     );
 }
 
-/// No registration yet: the form opens PREFILLED for a provider the registry
-/// knows, so the user enters only a Client ID.
 #[tokio::test]
 async fn connecting_a_known_provider_with_no_client_prefills_its_endpoints() {
     let client = user_client().await;
@@ -79,17 +63,11 @@ async fn connecting_a_known_provider_with_no_client_prefills_its_endpoints() {
     let request = &body["credential_request"];
     assert_eq!(request["auth_type"], "oauth_client");
     assert_eq!(request["service"], id);
-    // The whole point of the registry. Before it, this block was absent and the
-    // modal made the user type a provider's own URLs by hand.
     assert_eq!(request["defaults"]["auth_url"], known["auth_url"]);
     assert_eq!(request["defaults"]["token_url"], known["token_url"]);
-    // A one-member scope: a registration names the provider's own API host, and
-    // `base_urls` is the spelling every layer uses (ADR 0161).
     assert_eq!(request["base_urls"], serde_json::json!([known["base_url"]]));
 }
 
-/// A registration that exists but cannot drive a flow reopens the SAME form,
-/// prefilled, targeted at the row it must repair.
 #[tokio::test]
 async fn an_endpointless_client_reopens_the_form_instead_of_failing_later() {
     let client = user_client().await;
@@ -97,11 +75,8 @@ async fn an_endpointless_client_reopens_the_form_instead_of_failing_later() {
 
     let known = first_known_provider(&client, &api).await;
     let base_provider = known["id"].as_str().unwrap();
-    // A derived name, so this test owns its own credential row and cannot
-    // disturb a real one. It resolves to no registry row on purpose.
     let provider = unique_marker("e2e-oauth").to_lowercase();
 
-    // Exactly the credential the old form allowed: a client id, no endpoints.
     let resp = client
         .post(format!("{}/api/v1/credentials", api))
         .json(&json!({
@@ -132,16 +107,12 @@ async fn an_endpointless_client_reopens_the_form_instead_of_failing_later() {
         "an incomplete client must reopen the form, not fail with a bare toast: {body}"
     );
 
-    // Targeted at the existing row. Creating instead would make a SECOND
-    // oauth_client for one provider, and a name plus an auth type is the
-    // credential's identity, so that pair is a duplicate.
     let existing = request["existing_credential_id"].as_str();
     assert!(
         existing.is_some_and(|s| !s.is_empty()),
         "the repair must name the credential it updates: {request}"
     );
 
-    // Says what was wrong, and keeps the value the user already supplied.
     let missing: Vec<&str> = request["missing"]
         .as_array()
         .expect("a repair names the missing fields")
@@ -158,11 +129,8 @@ async fn an_endpointless_client_reopens_the_form_instead_of_failing_later() {
     );
     assert_eq!(request["defaults"]["client_id"], "abc");
 
-    // An unknown provider has no row to prefill from, which is the whole reason
-    // the form asks which known provider a derived name runs on.
     assert_ne!(provider, base_provider);
 
-    // Clean up: registry-style rows are shared state within a run.
     let id = existing.unwrap();
     client
         .delete(format!("{}/api/v1/credentials", api))
@@ -172,9 +140,6 @@ async fn an_endpointless_client_reopens_the_form_instead_of_failing_later() {
         .expect("delete failed");
 }
 
-/// The first row of the shipped registry, whatever it is. Naming a provider here
-/// would put a provider-specific expectation in the test suite, which is the
-/// thing the registry exists to avoid.
 async fn first_known_provider(client: &reqwest::Client, api: &str) -> Value {
     let body: Value = client
         .get(format!("{}/api/v1/oauth/known-providers", api))
@@ -191,9 +156,6 @@ async fn first_known_provider(client: &reqwest::Client, api: &str) -> Value {
         .expect("the shipped registry must list at least one provider")
 }
 
-/// An OAuth client whose token endpoint is plain http on a remote host would
-/// send its client secret and every refresh token in cleartext. Both save
-/// paths refuse it, name the credential, and echo no secret.
 #[tokio::test]
 async fn saving_a_client_with_a_cleartext_token_url_is_refused() {
     const SECRET: &str = "e2e-client-secret-value";

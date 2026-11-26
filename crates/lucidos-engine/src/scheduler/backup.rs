@@ -75,17 +75,12 @@ pub async fn run_backup(
     // `load_recent_runs`).
     let started_at = chrono::Utc::now();
     let monotonic_start = std::time::Instant::now();
-    // A backup that cannot list pending work fails rather than omit it.
-    let result = match crate::core::changes::unresolved_change_branches(pool).await {
-        Ok(branches) => {
-            backup::create_backup(workspace, database_url, &branches, key, provider, progress).await
-        }
-        Err(e) => Err(format!("could not list the pending changes to back up: {e}").into()),
-    };
+    let result =
+        backup::create_backup(pool, workspace, database_url, key, provider, progress).await;
     let finished_at = chrono::Utc::now();
 
     match result {
-        Ok(entry) => {
+        Ok((entry, origin)) => {
             log_legacy!(
                 "[Backup] Completed: {} ({:.1} MB)",
                 entry.filename,
@@ -115,11 +110,9 @@ pub async fn run_backup(
             // successful backup cleans up.
             match backup::get_retention_count(pool).await {
                 Ok(keep) => {
-                    // Scope pruning to THIS workspace's archives so a shared
-                    // cloud backup folder (multiple workspaces, one account)
-                    // never has one workspace evict another's backups.
                     let workspace_name = backup::workspace_archive_name(workspace);
-                    if let Err(e) = backup::prune_old_backups(provider, workspace_name, keep).await
+                    if let Err(e) =
+                        backup::prune_old_backups(provider, workspace_name, &origin, keep).await
                     {
                         log_legacy!("[Backup] Pruning failed (non-fatal): {}", e);
                     }

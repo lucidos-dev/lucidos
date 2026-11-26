@@ -1,11 +1,3 @@
-//! Every model call an arm's workspace made, by why it was made.
-//!
-//! A thread row prices what its own thread had captured when it settled. This
-//! reads the whole arm database at report time instead. So work that landed
-//! later or on another thread counts too: the compactor, a sub-thread, a
-//! trigger run. ADR 0362 asks what the Tree memory module costs in model
-//! calls, compactor calls included, and this is that number for every arm.
-
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
@@ -14,13 +6,10 @@ use crate::metrics::{self, TokenCounts};
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The purpose a capture without one records: the agent's own round trip.
 pub const TURN_PURPOSE: &str = "turn";
 
-/// One purpose and model's calls over a whole arm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PurposeCalls {
-    /// The engine's `ContextPurpose`, snake_case on the wire.
     pub purpose: String,
     pub model: String,
     pub calls: i64,
@@ -28,21 +17,13 @@ pub struct PurposeCalls {
     pub usd: f64,
 }
 
-/// Summary tree nodes, by whether a model wrote them.
-///
-/// A node whose source already fit is stored verbatim with no call. So the
-/// written count is a floor on compactor calls. The captured calls are the
-/// exact figure wherever a thread anchored them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeNodes {
     pub written: i64,
     pub free: i64,
 }
 
-/// Every capture in the arm's database, grouped by purpose and model, priced.
 pub async fn by_purpose(pool: &PgPool, prices: &[ModelPrice]) -> Fallible<Vec<PurposeCalls>> {
-    // `sum()` over bigint returns NUMERIC, so each total is cast back, as in
-    // `metrics::thread_tokens`.
     let rows = sqlx::query(
         "SELECT COALESCE(payload->>'purpose', $1)                                 AS purpose, \
                 COALESCE(payload->>'model', '')                                   AS model, \
@@ -81,7 +62,6 @@ pub async fn by_purpose(pool: &PgPool, prices: &[ModelPrice]) -> Fallible<Vec<Pu
         .collect()
 }
 
-/// The arm's summary tree nodes, written and free.
 pub async fn tree_nodes(pool: &PgPool) -> Fallible<TreeNodes> {
     let row = sqlx::query(
         "SELECT count(*) FILTER (WHERE model IS NOT NULL)::int8 AS written, \
@@ -96,7 +76,6 @@ pub async fn tree_nodes(pool: &PgPool) -> Fallible<TreeNodes> {
     })
 }
 
-/// Every call outside the agent's own turns.
 pub fn auxiliary(calls: &[PurposeCalls]) -> impl Iterator<Item = &PurposeCalls> {
     calls.iter().filter(|group| group.purpose != TURN_PURPOSE)
 }

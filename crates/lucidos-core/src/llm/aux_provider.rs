@@ -1,6 +1,3 @@
-//! The provider one *auxiliary model call* runs on: the router, with the
-//! call's model and attempt cap pinned (`engine::aux_purpose`).
-
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -13,32 +10,18 @@ use crate::llm::provider::{
 };
 use crate::llm::ModelNotServed;
 
-/// Told when a model answered not-found, and where the call went next.
 #[async_trait]
 pub trait NotServedReport: Send + Sync {
-    /// `moved_to` names the model the call retried on, or `None` when it
-    /// failed for good.
     async fn not_served(&self, model: &str, refusal: &ModelNotServed, moved_to: Option<&str>);
 }
 
-/// One auxiliary call's model, pinned over a provider that can serve it.
-///
-/// Every request goes out on the pinned model with the purpose's attempt cap.
-/// The effort stays the caller's. `default_model` names the model that ran,
-/// so a cost record names it too.
-///
-/// An unset default carries a `fallback`. When the pinned model answers
-/// not-found, the request retries once on it, and every later request goes
-/// there directly (ADR 0403). A stored pick carries none.
 pub struct AuxProvider {
     inner: Arc<dyn LlmProvider>,
     model: String,
     fallback: Option<String>,
-    /// The fallback, once the pinned model answered not-found.
     moved: OnceLock<String>,
     report: Option<Arc<dyn NotServedReport>>,
     attempt_timeout: Duration,
-    /// How far the router may move each request within its model's lineage.
     generation_rule: GenerationRule,
 }
 
@@ -55,14 +38,11 @@ impl AuxProvider {
         }
     }
 
-    /// Let the router move each request only as far as `rule` allows. A
-    /// default never steps back to an older generation (ADR 0403).
     pub fn with_generation_rule(mut self, rule: GenerationRule) -> Self {
         self.generation_rule = rule;
         self
     }
 
-    /// Report each not-found answer to `report`, and retry once on `fallback`.
     pub fn reporting(mut self, report: Arc<dyn NotServedReport>, fallback: Option<String>) -> Self {
         self.report = Some(report);
         self.fallback = fallback;
@@ -73,8 +53,6 @@ impl AuxProvider {
         self.moved.get().unwrap_or(&self.model)
     }
 
-    /// The caller's selection, sent on `model` with the purpose's attempt cap
-    /// and generation rule.
     fn pinned<'a>(&self, model: &'a str, selection: ModelSelection<'a>) -> ModelSelection<'a> {
         ModelSelection {
             model: Some(model),
@@ -170,10 +148,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// The model, effort and attempt cap one request reached the provider with.
     type Seen = (Option<String>, Option<String>, Option<Duration>);
 
-    /// Records the selection each request reached it with.
     #[derive(Default)]
     struct Recorder(Mutex<Vec<Seen>>);
 
@@ -197,8 +173,6 @@ mod tests {
         }
     }
 
-    /// The pinned model and cap reach the provider below, whatever the caller
-    /// passed, and the caller's effort survives.
     #[tokio::test]
     async fn every_request_carries_the_pinned_model_and_cap() {
         let recorder = Arc::new(Recorder::default());

@@ -1,11 +1,3 @@
-//! Vertex AI backend for `web_search` — Gemini with Google Search grounding.
-//!
-//! The incumbent backend, and first in the chain so existing workspaces see no
-//! change in behavior. Owns its own [`VertexProvider`] built from the engine's
-//! Vertex config, because web search and memory extraction are unrelated
-//! capabilities. Sharing one provider is what once left every non-Vertex user
-//! with no search at all.
-
 use async_trait::async_trait;
 
 use super::{WebSearchProvider, WebSearchResult};
@@ -17,7 +9,7 @@ pub struct VertexGroundingSearch {
 }
 
 impl VertexGroundingSearch {
-    /// Build from the engine's resolved Vertex config. Shares the caller's
+    /// INVARIANT: Build from the engine's resolved Vertex config. Shares the caller's
     /// [`TokenCache`] so this backend doesn't mint its own access tokens, and
     /// the live [`LocationHandle`] so it stays consistent with the rest of the
     /// Vertex surface — note the *grounding request itself* ignores that

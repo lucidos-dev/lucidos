@@ -40,3 +40,4 @@ Settings\s*(?:→|->|>|,)\s*People\b	Settings → Users	docs/adr/0655-user-renam
 \bautomation[\s-]+pause[sd]?\b	hold, or thread on hold	docs/adr/0805-hold-replaces-the-automation-pause.md
 \*\*(?-i:Set aside)\*\*	Hold (a change is set aside only with its thread)	docs/adr/0805-hold-replaces-the-automation-pause.md
 \*\*(?-i:Bring back)\*\*	Resume, or Unarchive for archived work	docs/adr/0805-hold-replaces-the-automation-pause.md
+\bagent[ -]brand[ -]colou?rs\b	agent icon colors (`agent-icon-colors`: brand, theme or muted)	docs/plans/2026-11-25-agent-icon-colors.md

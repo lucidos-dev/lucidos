@@ -1,5 +1,3 @@
-//! Real CLI subprocesses keep their origin token on the source-engine hop.
-
 use axum::http::HeaderMap;
 use lucidos_gateway_stamp::workspace_operation::{PROTOCOL_HEADER, PROTOCOL_VERSION};
 use serde_json::{json, Value};
@@ -241,8 +239,6 @@ async fn a_routed_spawn_refusal_is_not_retried_or_posted_directly() {
     let output = cli(port, dir.path())
         .args([
             "spawn-thread",
-            "--via",
-            "routing-gateway",
             "--to",
             "target@cloud",
             "--message",

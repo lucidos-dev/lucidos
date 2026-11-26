@@ -1,19 +1,3 @@
-//! The Claude gateway: the Anthropic Messages API behind an OAuth device-code
-//! sign-in, run by an organisation for its members. Lucidos signs in as its
-//! own public client. It reaches the gateway as `ProviderKind::ClaudeGateway`,
-//! apart from direct Anthropic, so each credential stays on its own host.
-//! Design: `docs/plans/2026-10-17-claude-gateway-provider.md`.
-//!
-//! The sign-in is the OAuth device-code flow (RFC 8628) as a public client:
-//! [`discovery`] finds the endpoints, [`device_flow`] gets the tokens,
-//! [`account`] stores them and [`tokens`] presents them, refreshed.
-//! [`revocation`] revokes them at sign-out. [`telemetry`] reports usage
-//! where the gateway's managed settings ask.
-//! [`served_models`] reads which models the gateway serves this account.
-//! [`machine_managed_settings`] reads the gateway Claude Code is told to use
-//! on this machine. [`gateway_managed_settings`] fetches the policy the gateway
-//! itself sets for the signed-in user.
-
 pub mod account;
 pub mod device_flow;
 pub mod discovery;
@@ -33,10 +17,8 @@ use std::sync::Arc;
 
 use crate::llm::ANTHROPIC_API_BASE_URL;
 
-/// Where the user signs in to the Claude gateway, as every error names it.
 pub(crate) const SIGN_IN_LOCATION: &str = providers_settings!();
 
-/// The error for a gateway `401`, which names the way to recover.
 pub(crate) fn unauthorized(error_body: &str) -> String {
     format!(
         "Claude gateway 401: sign in to the Claude gateway again in {SIGN_IN_LOCATION}. A gateway \
@@ -45,24 +27,15 @@ pub(crate) fn unauthorized(error_body: &str) -> String {
     )
 }
 
-/// What a Claude gateway request needs from the stored sign-in: its bearer,
-/// and the gateway's managed settings for the user.
-///
-/// The bearer is valid when returned: an expired token is refreshed first. An
-/// error reaches the user as the turn's failure, so it says how to recover.
 #[async_trait::async_trait]
 pub trait GatewayAccess: Send + Sync {
     async fn bearer(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// A new bearer after the gateway answered `401` to `rejected`, which
-    /// happens when it ends a token before the stated expiry, or states none.
     async fn renew_rejected(
         &self,
         rejected: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// The gateway's managed settings for the signed-in user, or `None` when
-    /// it set no policy for them.
     async fn managed_settings(
         &self,
     ) -> Result<
@@ -71,13 +44,9 @@ pub trait GatewayAccess: Send + Sync {
     >;
 }
 
-/// Makes the gateway access for a configured gateway origin.
-///
-/// The engine supplies it once its event bus exists, because a gateway access
-/// announces a sign-in the gateway rejected. The boot build has none yet.
 pub type GatewayAccessFactory = Arc<dyn Fn(GatewayOrigin) -> Arc<dyn GatewayAccess> + Send + Sync>;
 
-/// A validated Claude gateway origin, such as `https://gateway.example`.
+/// INVARIANT: A validated Claude gateway origin, such as `https://gateway.example`.
 ///
 /// The only way to name a gateway host. It uses `https`, or plain `http` on a
 /// loopback host for tests. It carries no path, query or credentials. It is
@@ -86,7 +55,6 @@ pub type GatewayAccessFactory = Arc<dyn Fn(GatewayOrigin) -> Arc<dyn GatewayAcce
 pub struct GatewayOrigin(String);
 
 impl GatewayOrigin {
-    /// Parse and validate `url`, or say why it cannot be a gateway origin.
     pub fn parse(url: &str) -> Result<Self, String> {
         let url = url.trim();
         let refuse = |why: &str| Err(format!("Claude gateway URL '{url}' {why}"));
@@ -118,18 +86,15 @@ impl GatewayOrigin {
         Ok(Self(format!("{}://{host}{port}", parsed.scheme())))
     }
 
-    /// The origin with no trailing slash, as the gateway's discovery document
-    /// names its `issuer`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// The Messages API root on this gateway (`{base}/messages`).
     pub fn api_base_url(&self) -> String {
         format!("{}/v1", self.0)
     }
 
-    /// Whether `url` lies on this origin, so a token sent there stays on the
+    /// INVARIANT: Whether `url` lies on this origin, so a token sent there stays on the
     /// gateway.
     pub fn owns(&self, url: &str) -> bool {
         let Ok(parsed) = reqwest::Url::parse(url) else {
@@ -178,8 +143,6 @@ mod tests {
         assert_eq!(with_port.as_str(), "https://gateway.example:8443");
     }
 
-    /// A bearer credential never travels over plain http, except to a loopback
-    /// host, where the tests run their mock gateway.
     #[test]
     fn plain_http_is_refused_except_on_loopback() {
         assert!(GatewayOrigin::parse("http://gateway.example").is_err());
@@ -190,8 +153,6 @@ mod tests {
         assert!(GatewayOrigin::parse("ftp://gateway.example").is_err());
     }
 
-    /// The direct Anthropic host is never a gateway, so the gateway bearer
-    /// cannot be sent there.
     #[test]
     fn the_direct_anthropic_host_is_refused() {
         let err = GatewayOrigin::parse("https://api.anthropic.com").unwrap_err();

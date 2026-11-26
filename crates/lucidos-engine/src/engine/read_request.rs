@@ -7,7 +7,8 @@
 //! `ThreadReplySeen` once the user has seen the reply. A human message or an
 //! archive also clears a request, in the projection, with no event of its
 //! own. A change that already lists the thread clears and blocks one, by a
-//! database trigger (ADR 0421). A no clears nothing.
+//! database trigger (ADR 0421). A no clears one only in a sub-thread whose
+//! parent acts on its reports (ADR 0417).
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -53,10 +54,17 @@ impl ReadDecision {
             })
     }
 
-    fn event(self) -> ThreadEvent {
+    /// `parent_carries`: the parent agent carries the read (ADR 0417). A yes
+    /// is then a `parent_report`, and a no supersedes the unseen request,
+    /// which was one.
+    fn event(self, parent_carries: bool) -> ThreadEvent {
         match self {
-            Self::Requested => ThreadEvent::ThreadReadRequested,
-            Self::NotRequested => ThreadEvent::ThreadReadNotRequested,
+            Self::Requested => ThreadEvent::ThreadReadRequested {
+                parent_report: parent_carries,
+            },
+            Self::NotRequested => ThreadEvent::ThreadReadNotRequested {
+                supersedes_request: parent_carries,
+            },
         }
     }
 
@@ -82,12 +90,14 @@ pub async fn record_agent_read_decision(
     bus: &EventBus,
     thread_id: Uuid,
     decision: ReadDecision,
+    parent_carries: bool,
 ) -> Result<(), BoxError> {
     record_read_decision(
         bus,
         thread_id,
         decision,
         Some(agent_thread_actor(thread_id)),
+        parent_carries,
     )
     .await
 }
@@ -99,10 +109,11 @@ pub async fn record_read_decision(
     thread_id: Uuid,
     decision: ReadDecision,
     actor: Option<MessageOrigin>,
+    parent_carries: bool,
 ) -> Result<(), BoxError> {
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: decision.event(),
+        event: decision.event(parent_carries),
         meta: EventMeta::with_actor(actor),
     })
     .await?;

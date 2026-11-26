@@ -25,8 +25,6 @@ fn checks_require_counts_and_quote_identifiers() {
 async fn replay_carries_current_access_and_failed_checks_roll_back_everything() {
     let (pool, database) = setup_test_db().await;
     let url = test_db_url(&database);
-    // An archive from before additive access migrations must retain newer
-    // access values through replay and the normal first-boot migration path.
     sqlx::raw_sql("ALTER TABLE devices DROP COLUMN pairing_label; ALTER TABLE push_subscriptions DROP COLUMN scope_url; DELETE FROM _sqlx_migrations WHERE version IN (20260926192138, 20260621193600)")
         .execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO devices (id) VALUES ('revoked-device')")
@@ -34,6 +32,12 @@ async fn replay_carries_current_access_and_failed_checks_roll_back_everything() 
         .await
         .unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    sqlx::raw_sql(
+        "DROP TABLE backup_origin; DELETE FROM _sqlx_migrations WHERE version = 20261125170055",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let root = tempfile::tempdir().unwrap();
     let session = std::sync::Arc::new(
         service::Session::open(
@@ -62,6 +66,9 @@ async fn replay_carries_current_access_and_failed_checks_roll_back_everything() 
         .await
         .unwrap();
     crate::core::store::MIGRATOR.run(&pool).await.unwrap();
+    let origin = crate::core::backup::resolve_backup_origin(&pool, workspace.path())
+        .await
+        .unwrap();
     sqlx::raw_sql("DELETE FROM devices; INSERT INTO devices (id) VALUES ('current-device'); INSERT INTO device_presence (device_id) VALUES ('current-device'); INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id) VALUES ('https://push.example.test', 'test-public-key', 'lsec1:test-key:test-ciphertext', 'current-device'); INSERT INTO preferences (key,value) VALUES ('restore-test', 'current')")
         .execute(&pool).await.unwrap();
     sqlx::raw_sql("UPDATE devices SET pairing_label = 'current label'; UPDATE push_subscriptions SET scope_url = 'https://scope.example.test/'")
@@ -81,7 +88,6 @@ async fn replay_carries_current_access_and_failed_checks_roll_back_everything() 
         .execute(&pool)
         .await
         .unwrap();
-    // Cleanup must roll back together with a failed row-count check.
     assert!(restore(&url, &dump, &invalid).is_err());
     let table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('public.post_snapshot_table')::text")
@@ -96,20 +102,22 @@ async fn replay_carries_current_access_and_failed_checks_roll_back_everything() 
             .unwrap();
     assert_eq!(value, "current");
     restore(&url, &dump, &manifest.table_rows).unwrap();
-    // No archived grant is exposed while the engine is still offline.
     let access_count: i64 = sqlx::query_scalar("SELECT count(*) FROM devices")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(access_count, 0);
     assert!(finish_access_after_migrations(&pool).await.is_err());
-    // A rollback/retry after a crash must keep the authoritative staged rows,
-    // even though public access tables were emptied by the first replay.
     restore(&url, &dump, &manifest.table_rows).unwrap();
     crate::core::store::MIGRATOR.run(&pool).await.unwrap();
     finish_access_after_migrations(&pool).await.unwrap();
-    // First boot can crash after access installation, before marker removal.
     finish_access_after_migrations(&pool).await.unwrap();
+    assert_eq!(
+        crate::core::backup::read_backup_origin(&pool, workspace.path())
+            .await
+            .unwrap(),
+        Some(origin)
+    );
     let label: String = sqlx::query_scalar("SELECT pairing_label FROM devices")
         .fetch_one(&pool)
         .await
@@ -164,8 +172,6 @@ async fn replay_carries_current_access_and_failed_checks_roll_back_everything() 
     teardown_test_db(&database).await;
 }
 
-/// The restore policy decides who may restore this workspace, so a restore
-/// must never bring back an archived value (ADR 0612 decision 9).
 #[tokio::test]
 async fn replay_carries_the_current_restore_policy_forward() {
     let (pool, database) = setup_test_db().await;
@@ -227,7 +233,6 @@ async fn replay_carries_the_current_restore_policy_forward() {
     finish_access_after_migrations(&pool).await.unwrap();
     assert_eq!(policy_rows().await, ["ask"]);
 
-    // No current row means the default, never the archived 'allow'.
     sqlx::query("DELETE FROM preferences WHERE key = $1")
         .bind(policy)
         .execute(&pool)
@@ -237,6 +242,92 @@ async fn replay_carries_the_current_restore_policy_forward() {
     crate::core::store::MIGRATOR.run(&pool).await.unwrap();
     finish_access_after_migrations(&pool).await.unwrap();
     assert!(policy_rows().await.is_empty());
+    drop(session);
+    pool.close().await;
+    teardown_test_db(&database).await;
+}
+
+#[tokio::test]
+async fn a_cluster_outside_utc_still_carries_current_access() {
+    carries_current_access_on_a_cluster_outside_utc(false).await;
+}
+
+#[tokio::test]
+async fn staging_an_older_build_wrote_outside_utc_still_carries_current_access() {
+    carries_current_access_on_a_cluster_outside_utc(true).await;
+}
+
+async fn carries_current_access_on_a_cluster_outside_utc(restage_as_older_build: bool) {
+    let (pool, database) = setup_test_db().await;
+    let url = test_db_url(&database);
+    sqlx::raw_sql(&format!(
+        "ALTER DATABASE \"{database}\" SET TimeZone = 'Pacific/Auckland'"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    crate::test_support::seed_device(&pool, "current-device", Some("Mozilla/5.0"), None).await;
+    let access = || async {
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT to_jsonb(d) FROM devices d ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+    };
+    let current = access().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let session = std::sync::Arc::new(
+        service::Session::open(
+            store::Store::at(root.path().into(), "demo").unwrap(),
+            &ArchiveJobSlot::default(),
+            ArchiveJobKind::SnapshotRestore,
+            &TestKeyStore,
+            &database,
+        )
+        .unwrap(),
+    );
+    let manifest = session
+        .clone()
+        .capture_recovery(
+            &pool,
+            &url,
+            workspace.path(),
+            service::RecoveryRequest {
+                restore_id: uuid::Uuid::new_v4(),
+                workspace_name: "demo".into(),
+                actor: MessageOrigin::Device {
+                    device_id: "current-device".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let dump = root.path().join(manifest.handle.as_str()).join("db.dump");
+
+    restore(&url, &dump, &manifest.table_rows).unwrap();
+    if restage_as_older_build {
+        let staged = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT value::text FROM snapshot_restore_access.rows ORDER BY table_name, value::text",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        let in_utc = staged().await;
+        let mut restage = String::from("BEGIN; SET LOCAL TimeZone = 'Pacific/Auckland';");
+        for table in ACCESS_TABLES {
+            restage.push_str(&format!(
+                "UPDATE snapshot_restore_access.rows SET value = to_jsonb(jsonb_populate_record(NULL::public.{table}, value)) WHERE table_name = '{table}';"
+            ));
+        }
+        restage.push_str("COMMIT;");
+        sqlx::raw_sql(&restage).execute(&pool).await.unwrap();
+        assert_ne!(staged().await, in_utc);
+    }
+    crate::core::store::MIGRATOR.run(&pool).await.unwrap();
+    finish_access_after_migrations(&pool).await.unwrap();
+    assert_eq!(access().await, current);
     drop(session);
     pool.close().await;
     teardown_test_db(&database).await;

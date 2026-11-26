@@ -1,20 +1,6 @@
-//! Coverage for `GET /api/v1/threads/list` and `GET /api/v1/threads/count` —
-//! the script/trigger/LLM-tool surface for querying thread summaries.
-//!
-//! The strategy seeds rows directly into `thread_summaries` with a unique
-//! marker title, then asserts the new endpoints surface them with the right
-//! shape and the active filter behaves correctly. Going through the chat
-//! endpoint would have to wait for an LLM round-trip and would race other
-//! parallel tests; seeding the projection row is the contract surface the
-//! endpoints actually read.
-
 use crate::support::{base_url, db_url, http_client, unique_marker};
 use lucidos_engine::engine::thread_lifecycle::ThreadStatus;
 
-/// Insert a `thread_summaries` row with controlled `status` / `source` /
-/// title for assertion. Returns the seeded `thread_id`. Takes
-/// `ThreadStatus` (not a bare string) so a future variant rename breaks
-/// this test at compile time instead of producing silently empty filters.
 async fn seed_summary_row(
     pool: &sqlx::PgPool,
     title: &str,
@@ -38,8 +24,6 @@ async fn seed_summary_row(
     id
 }
 
-/// Look up our seeded summaries inside the response by title prefix —
-/// other parallel tests' rows must not pollute the assertions.
 fn rows_with_title_prefix<'a>(
     body: &'a serde_json::Value,
     prefix: &str,
@@ -94,8 +78,6 @@ async fn list_returns_seeded_threads_with_full_shape() {
     let ours = rows_with_title_prefix(&body, &marker);
     assert_eq!(ours.len(), 2, "both seeded rows should appear");
 
-    // Spot-check the full ThreadSummary shape — every field the projection
-    // populates must serialise into the wire response.
     let row = ours
         .iter()
         .find(|r| r["title"].as_str() == Some(&format!("{marker}-running")))
@@ -116,8 +98,6 @@ async fn list_returns_seeded_threads_with_full_shape() {
         "state",
         "compose_text",
         "compose_images",
-        // The client echoes this back on every compose PUT, so a summary that
-        // omits it leaves every write unfenced.
         "compose_epoch",
     ] {
         assert!(
@@ -171,8 +151,6 @@ async fn list_active_filter_excludes_idle_and_failed() {
         ThreadStatus::WaitingForUserAnswer,
     )
     .await;
-    // `waiting` (CC proposed changes — loop has stopped) is NOT active per
-    // the canonical definition.
     let _waiting = seed_summary_row(
         &pool,
         &format!("{marker}-waiting"),
@@ -296,7 +274,6 @@ async fn count_matches_list_length_under_same_filter() {
     .await;
     let _idle = seed_child_row(&pool, &format!("{marker}-i"), parent, ThreadStatus::Idle).await;
 
-    // Scope both reads to our children so parallel tests cannot change the count.
     let list_url = format!(
         "{}/api/v1/threads/list?parent={parent}&active=true&limit=1000",
         base_url()
@@ -328,7 +305,6 @@ async fn count_matches_list_length_under_same_filter() {
 
     assert_eq!(list_len, count_val, "list and count filters must agree");
 
-    // Our seeded active rows must be counted.
     let ours = rows_with_title_prefix(&list_body, &marker);
     assert_eq!(
         ours.len(),
@@ -340,8 +316,6 @@ async fn count_matches_list_length_under_same_filter() {
 
 #[tokio::test]
 async fn list_limit_clamps_to_max_1000() {
-    // The handler clamps `limit` to 1..=1000. Passing 999999 must NOT 500;
-    // it should silently clamp and return success.
     let client = http_client();
     let url = format!("{}/api/v1/threads/list?limit=999999", base_url());
     let resp = client.get(&url).send().await.expect("oversized limit req");
@@ -354,9 +328,6 @@ async fn list_limit_clamps_to_max_1000() {
 
 #[tokio::test]
 async fn get_by_id_returns_the_seeded_thread_summary() {
-    // `GET /api/v1/threads/:thread_id` — the by-id complement to `/list`, used
-    // by the message-route popover to resolve a cross-workspace Origin's thread
-    // name from the source workspace's engine.
     let client = http_client();
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
     let marker = unique_marker("api-threads-get-by-id");
@@ -394,7 +365,6 @@ async fn get_by_id_returns_404_for_unknown_thread() {
     );
 }
 
-/// Seed a `thread_summaries` row that is a child of `parent`.
 async fn seed_child_row(
     pool: &sqlx::PgPool,
     title: &str,
@@ -418,10 +388,6 @@ async fn seed_child_row(
     id
 }
 
-/// The read side of a parent orchestrating its own fan-out. Without it the
-/// model's only recovery from losing a child's `thread_id` (history trimming
-/// drops the oldest tool results first, so a fan-out orchestrator's spawn
-/// results are the first to go) is to spawn a duplicate child.
 #[tokio::test]
 async fn list_parent_filter_returns_only_that_parents_direct_children() {
     let client = http_client();
@@ -500,7 +466,6 @@ async fn list_parent_filter_returns_only_that_parents_direct_children() {
          other parent's child, and not the parent itself"
     );
 
-    // Composes with the other filters rather than replacing them.
     let url = format!(
         "{}/api/v1/threads/list?parent={parent}&active=true&limit=1000",
         base_url()
@@ -565,8 +530,6 @@ async fn count_honours_the_parent_filter() {
     );
 }
 
-/// A malformed `parent` is a 400, never a silent "no filter" that would return
-/// the whole workspace when the caller asked for one thread's children.
 #[tokio::test]
 async fn list_rejects_a_malformed_parent() {
     let client = http_client();
@@ -579,12 +542,6 @@ async fn list_rejects_a_malformed_parent() {
     );
 }
 
-/// The reason the `status` filter exists. `active=true` is the union of
-/// `running` and `waiting_for_user_answer`, so an idle detector gated on it
-/// stays silent for as long as anybody is parked on an unanswered question. On
-/// 2026-08-07 that hid four pending changes for three hours. `status=running`
-/// is the same question asked precisely, and it must not pick up the parked
-/// thread.
 #[tokio::test]
 async fn status_running_excludes_a_thread_parked_on_a_question() {
     let client = http_client();
@@ -631,8 +588,6 @@ async fn status_running_excludes_a_thread_parked_on_a_question() {
     );
 }
 
-/// The other direction of the same split: "is anything waiting on me?" must
-/// not count the thread that is busy working.
 #[tokio::test]
 async fn status_waiting_for_user_answer_excludes_a_running_thread() {
     let client = http_client();
@@ -678,8 +633,6 @@ async fn status_waiting_for_user_answer_excludes_a_running_thread() {
     );
 }
 
-/// A list can be filtered client-side; a count cannot. `count` is the surface
-/// an idle detector actually calls, so it has to honour `status` too.
 #[tokio::test]
 async fn count_honours_the_status_filter() {
     let client = http_client();
@@ -710,7 +663,6 @@ async fn count_honours_the_status_filter() {
         .await;
     }
 
-    // Scoped to one parent so parallel tests' rows cannot move the number.
     let count = |status: &str| {
         let url = format!(
             "{}/api/v1/threads/count?parent={parent}&status={status}",
@@ -761,8 +713,6 @@ async fn count_honours_the_status_filter() {
     );
 }
 
-/// Two answers to one question. Silently intersecting them would make
-/// `active=true&status=idle` an empty result that reads as "nothing matched".
 #[tokio::test]
 async fn active_and_status_together_is_rejected() {
     let client = http_client();
@@ -780,8 +730,6 @@ async fn active_and_status_together_is_rejected() {
     }
 }
 
-/// A typo that silently returned zero rows would read as "the workspace is
-/// quiet", which is the failure this filter exists to prevent.
 #[tokio::test]
 async fn an_unknown_status_is_rejected_rather_than_matching_nothing() {
     let client = http_client();

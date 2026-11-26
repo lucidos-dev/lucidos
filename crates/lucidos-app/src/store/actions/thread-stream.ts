@@ -67,7 +67,12 @@ const drain = () => {
   try {
     while (pending.length) pending.shift()!(sink);
   } catch (error) {
-    showToast(`Live updates could not be applied: ${errorDetail(error)}`, 'error', {
+    const storageQuotaExceeded = error instanceof DOMException && error.name === 'QuotaExceededError';
+    const message = storageQuotaExceeded
+      ? 'Lucidos reached a storage limit on this device. Some threads may be out of date. Try reconnecting to refresh them.'
+      : `Live updates could not be applied: ${errorDetail(error)}`;
+    showToast(message, 'error', {
+      title: storageQuotaExceeded ? 'Live updates interrupted' : undefined,
       key: 'event-dispatch-error', action: { label: 'Reconnect', onClick: retryEventStreamNow },
     });
   } finally { draining = false; }

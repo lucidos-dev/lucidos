@@ -1,4 +1,4 @@
-//! Snapshot identity follows the gateway registry slug. An engine launched
+//! INVARIANT: Snapshot identity follows the gateway registry slug. An engine launched
 //! without a gateway has no slug; its database name is its stable local identity.
 //! The colon namespace cannot collide with gateway slugs (`[a-z0-9-]`).
 use super::BoxError;

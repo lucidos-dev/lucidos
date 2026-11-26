@@ -1,4 +1,4 @@
-//! The *card slot*: one open card per thread. The Validate phase consults it
+//! INVARIANT: The *card slot*: one open card per thread. The Validate phase consults it
 //! under the per-thread append lock, so "is a card open?" cannot race.
 
 use sqlx::PgConnection;
@@ -7,8 +7,6 @@ use uuid::Uuid;
 use crate::engine::question_park_sql::open_card_exists;
 use crate::engine::thread_events::ThreadEvent;
 
-/// Validate refused an agent permission prompt because another card is open.
-/// The prompt site waits for a free slot and emits again.
 #[derive(Debug)]
 pub struct CardSlotTaken;
 
@@ -20,7 +18,6 @@ impl std::fmt::Display for CardSlotTaken {
 
 impl std::error::Error for CardSlotTaken {}
 
-/// The `request_id` of an agent permission prompt request.
 pub(super) fn prompt_request_id(event: &ThreadEvent) -> Option<&str> {
     match event {
         ThreadEvent::CodingAgentPermissionRequest { request_id, .. }
@@ -30,7 +27,6 @@ pub(super) fn prompt_request_id(event: &ThreadEvent) -> Option<&str> {
     }
 }
 
-/// The `request_id` an agent permission prompt resolution closes.
 pub fn prompt_resolution_id(event: &ThreadEvent) -> Option<&str> {
     match event {
         ThreadEvent::CodingAgentPermissionResolved { request_id, .. }
@@ -40,34 +36,19 @@ pub fn prompt_resolution_id(event: &ThreadEvent) -> Option<&str> {
     }
 }
 
-/// What a `UserQuestionAsked` on a thread becomes.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CardAdmission {
-    /// The slot is free, or the card re-raises one already posted: record it.
     Post,
-    /// Record it as a *queued card*, for the card queue to post later.
     Queue(QueueReason),
-    /// A release of a queued card that cannot post now: the slot is taken, a
-    /// turn still runs, or the card was already posted or retired. Record
-    /// nothing.
     Drop,
 }
 
-/// Why a card queued.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum QueueReason {
-    /// Another card is open.
     CardOpen,
-    /// Lucidos raised the card while a turn runs, and no call holds for it.
-    /// It posts when the turn ends.
     TurnRunning,
 }
 
-/// Decide what a `UserQuestionAsked` carrying `tool_use_id` becomes.
-/// `waits_for_turn_end` says the card may not post while a turn runs.
-///
-/// A card already queued under the same `tool_use_id` makes this emit a
-/// *release*. A release never queues a second copy.
 pub(super) async fn admit_question(
     tx: &mut PgConnection,
     thread_id: Uuid,
@@ -97,9 +78,6 @@ pub(super) async fn admit_question(
     Ok(CardAdmission::Post)
 }
 
-/// Whether a turn runs on the thread, read from its summary row inside the
-/// append transaction. The terminal's projection writes the row in its own
-/// transaction, so the card queue's release after it sees the turn ended.
 async fn turn_runs(tx: &mut PgConnection, thread_id: Uuid) -> Result<bool, sqlx::Error> {
     let status: Option<String> =
         sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
@@ -109,7 +87,7 @@ async fn turn_runs(tx: &mut PgConnection, thread_id: Uuid) -> Result<bool, sqlx:
     Ok(status.as_deref() == Some(crate::engine::thread_lifecycle::ThreadStatus::Running.as_str()))
 }
 
-/// Whether the card `tool_use_id` names is queued and never posted. The owner
+/// INVARIANT: Whether the card `tool_use_id` names is queued and never posted. The owner
 /// has not seen such a card, so no answer of theirs may land on it.
 pub(crate) async fn is_queued_unposted(
     tx: &mut PgConnection,

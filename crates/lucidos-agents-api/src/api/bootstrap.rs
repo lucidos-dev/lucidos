@@ -1,10 +1,3 @@
-//! `GET /api/v1/bootstrap`: the *bootstrap snapshot*, the workspace-wide state
-//! a shell draws outside any one thread, in one read (`docs/glossary.md`).
-//!
-//! Each slice is the body of one narrow route, read through that route's own
-//! read function. The route below calls no handler module: only the table
-//! rows do.
-
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -27,8 +20,6 @@ use super::{AppState, ChangesListQuery, NotificationsListQuery};
 use crate::core::subprocess_origin::HEADER_DEVICE_ID;
 use crate::runtime::intelligence_ladder::LadderSurface;
 
-/// How many slice reads one snapshot runs at once. It bounds slices, not
-/// connections: one read can hold several, as `changes::read_changes` does.
 pub(crate) const BOOTSTRAP_READ_CONCURRENCY: usize = 8;
 
 const CACHE_CONTROL: &str = "private, no-cache";
@@ -42,8 +33,6 @@ macro_rules! slice {
     };
 }
 
-/// The slices whose handlers stay in this crate when the threads API leaves
-/// it. Each row names the fixed request its slice stands for.
 const API_SLICES: &[SliceReader] = &[
     slice!("preferences", |context| SliceResult::of(
         settings::read_preferences(&context.state, context.device_id()).await
@@ -139,8 +128,6 @@ const API_SLICES: &[SliceReader] = &[
     .await),
 ];
 
-/// The slices whose handlers move to the threads API crate. Kept apart so the
-/// split lifts these rows out without touching the route.
 const THREADS_API_SLICES: &[SliceReader] = &[
     slice!("filter_facets", |context| SliceResult::of(
         threads::read_filter_facets(&context.state).await
@@ -163,7 +150,6 @@ fn slice_readers() -> impl Iterator<Item = &'static SliceReader> {
     API_SLICES.iter().chain(THREADS_API_SLICES)
 }
 
-/// Every slice of one read, in table order.
 struct Snapshot(Vec<(&'static str, SliceResult)>);
 
 impl Serialize for Snapshot {
@@ -176,13 +162,10 @@ impl Serialize for Snapshot {
     }
 }
 
-/// Read every slice `readers` names. A reader that fails or panics answers
-/// its own error slice, so every key is present whatever the readers do.
 async fn read_snapshot(
     context: &SliceContext,
     readers: impl Iterator<Item = &'static SliceReader>,
 ) -> Snapshot {
-    // Queued, not started: `buffered` polls at most the bound at a time.
     let mut reads = Vec::new();
     for reader in readers {
         reads.push(read_slice(context, reader).boxed());
@@ -201,7 +184,6 @@ async fn read_slice(
     let slice = AssertUnwindSafe(async { (reader.read)(context).await })
         .catch_unwind()
         .await
-        // The panic hook has already logged the panic and where it rose.
         .unwrap_or_else(|_| SliceResult::reader_panicked());
     (reader.key, slice)
 }
@@ -227,7 +209,6 @@ fn snapshot_response(body: Vec<u8>, request_headers: &HeaderMap) -> Response {
     if let Ok(etag) = HeaderValue::from_str(&format!("W/{opaque_tag}")) {
         headers.insert(header::ETAG, etag);
     }
-    // The field may arrive as several lines, which form one list.
     let held = request_headers
         .get_all(header::IF_NONE_MATCH)
         .iter()

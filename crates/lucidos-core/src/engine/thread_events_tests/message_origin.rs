@@ -28,22 +28,12 @@ fn message_origin_engine_serializes_with_kind_engine() {
     assert_eq!(json["reason"]["kind"], "continuation_started");
 }
 
-/// `EngineReason` legacy serde alias: old DB rows persisted with
-/// `{"kind":"session_recovered"}` (and the even older
-/// `{"kind":"session_resumed"}` if any survive) must still deserialize as the
-/// renamed `ContinuationStarted` variant. Without the alias the projection
-/// crashes on any historical row using the old name.
 #[test]
 fn engine_reason_continuation_started_accepts_legacy_session_recovered_alias() {
     let v: EngineReason = serde_json::from_str(r#"{"kind":"session_recovered"}"#).unwrap();
     assert_eq!(v, EngineReason::ContinuationStarted);
 }
 
-/// `MessageOrigin::System` serializes as `{"kind":"system"}` with NO
-/// other fields. The frontend's MessageOrigin union has `{ kind: 'system' }`
-/// (no reason / no metadata) — adding fields here would break that contract.
-/// Distinct from Engine: System means the host killed the process; Engine
-/// means the engine deliberately took an action.
 #[test]
 fn message_origin_system_serializes_with_kind_system_no_other_fields() {
     let origin = MessageOrigin::System;
@@ -51,17 +41,11 @@ fn message_origin_system_serializes_with_kind_system_no_other_fields() {
     assert_eq!(json, serde_json::json!({"kind": "system"}));
 }
 
-/// System is intrinsically engine-mode (deterministic, non-human, non-agent).
-/// Mirrors `MessageOrigin::Engine`'s mode — the chip differentiates via
-/// label override (System vs Lucidos Engine), not via mode.
 #[test]
 fn message_origin_system_mode_is_engine() {
     assert_eq!(MessageOrigin::System.mode(), ActorMode::Engine);
 }
 
-/// `MessageOrigin::system()` is the canonical constructor — emit sites use
-/// it for the "host killed the process" attribution (orphan recovery,
-/// shutdown, safety net, post-restart abort marker).
 #[test]
 fn message_origin_system_constructor() {
     assert!(matches!(MessageOrigin::system(), MessageOrigin::System));
@@ -159,9 +143,6 @@ fn message_origin_thread_link_defaults_mode_to_agent_when_missing() {
     }
 }
 
-/// Historical DB rows persisted under the old variant name. The
-/// `serde(alias = "parent_thread")` + default `direction` keep them
-/// readable as `ThreadLink { direction: Parent }`.
 #[test]
 fn message_origin_legacy_parent_thread_kind_deserializes_as_thread_link() {
     let json = r#"{
@@ -269,9 +250,6 @@ fn message_origin_mode_reads_field_for_workspace_and_thread_link() {
     assert_eq!(tl.mode(), ActorMode::Engine);
 }
 
-/// The wire shape the frontend union mirrors (ADR 0150). A guest carries its
-/// speaker label, because that is the only thing distinguishing two agents on
-/// one thread.
 #[test]
 fn message_origin_agent_serializes_with_its_participant() {
     let ours = MessageOrigin::Agent {
@@ -292,8 +270,6 @@ fn message_origin_agent_serializes_with_its_participant() {
     );
 }
 
-/// A payload naming the origin without naming a participant reads as the
-/// Lucidos Agent, which is what a single-agent thread's events were.
 #[test]
 fn message_origin_agent_defaults_its_participant_to_the_lucidos_agent() {
     let decoded: MessageOrigin = serde_json::from_str(r#"{"kind":"agent"}"#).unwrap();
@@ -306,8 +282,6 @@ fn message_origin_agent_defaults_its_participant_to_the_lucidos_agent() {
     assert_eq!(AgentParticipant::default(), AgentParticipant::LucidosAgent);
 }
 
-/// An agent origin means an LLM decided, so its mode is intrinsic. Nothing
-/// carries a mode field that could disagree.
 #[test]
 fn message_origin_agent_mode_is_agent() {
     let origin = MessageOrigin::Agent {
@@ -318,8 +292,6 @@ fn message_origin_agent_mode_is_agent() {
     assert_eq!(origin.mode(), ActorMode::Agent);
 }
 
-/// `agent()` answers "which agent wrote this", and answers `None` for every
-/// origin that names a way in rather than an author.
 #[test]
 fn only_an_agent_origin_names_an_authoring_agent() {
     let authored = MessageOrigin::Agent {
@@ -336,8 +308,6 @@ fn only_an_agent_origin_names_an_authoring_agent() {
     );
 }
 
-/// Our own agent keeps `Assistant`, the word every existing transcript uses.
-/// A guest speaks under its own name, which is the whole point of the variant.
 #[test]
 fn a_guest_speaks_under_its_own_name_and_our_agent_stays_assistant() {
     assert_eq!(AgentParticipant::LucidosAgent.speaker_label(), "Assistant");
@@ -350,8 +320,6 @@ fn a_guest_speaks_under_its_own_name_and_our_agent_stays_assistant() {
     );
 }
 
-/// A device actor stores the id alone. Older rows also stored the device's name
-/// as `label`; they must still load, and the name is dropped rather than read.
 #[test]
 fn a_device_origin_stores_the_id_only_and_old_rows_with_a_name_still_load() {
     let origin = MessageOrigin::Device {
@@ -367,8 +335,6 @@ fn a_device_origin_stores_the_id_only_and_old_rows_with_a_name_still_load() {
     assert_eq!(old, origin);
 }
 
-/// A stored `MessageReceived` carrying a legacy `device` name still loads,
-/// keeping the id.
 #[test]
 fn an_old_message_received_with_a_stored_device_name_still_loads() {
     let event: ThreadEvent = serde_json::from_value(serde_json::json!({
@@ -387,8 +353,6 @@ fn an_old_message_received_with_a_stored_device_name_still_loads() {
     }
 }
 
-/// Only the origin token names a local source thread. A cross-workspace
-/// caller's `thread_id` lives in another workspace, so it never answers.
 #[test]
 fn only_a_verified_subprocess_names_a_source_thread() {
     let thread = uuid::Uuid::new_v4();

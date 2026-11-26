@@ -1105,6 +1105,24 @@ describe('cold store dispatch behind eager restore admission', () => {
     expect(processSSEForReferences.mock.calls[0][2]).toBe('waiting');
   });
 
+  it('explains a browser storage quota failure and offers Reconnect', async () => {
+    processSSEForReferences.mockImplementationOnce(() => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    });
+    connectThreadEvents();
+    opened!.handlers.onFrame(frame('storage-failure'));
+    await idleSinks[idleSinks.length - 1]!.preload();
+
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('storage limit on this device'),
+      'error',
+      expect.objectContaining({
+        title: expect.any(String),
+        action: expect.objectContaining({ label: 'Reconnect' }),
+      }),
+    );
+  });
+
   it('rejects late dispatch from a disconnected connection', async () => {
     let finish!: (loaded: boolean) => void;
     sinkPreload.mockImplementationOnce(() => new Promise<boolean>((resolve) => { finish = resolve; }));

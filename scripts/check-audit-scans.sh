@@ -92,6 +92,12 @@ ready-signal hit lucidos.ui.ready()
 app-icon hit "icon": "icon.svg",
 widget-tile hit "sizes": ["1x1", "2x1"],
 touch-hover hit .card:hover {
+left-stripe hit .notice { border-left: 0.25rem solid var(--accent-red); }
+left-stripe hit .callout { border-inline-start-color: var(--accent); }
+left-stripe hit .card { box-shadow: inset 0.2rem 0 0 var(--accent); }
+left-stripe miss .panel { border: 1px solid var(--border-color); }
+left-stripe miss .card { border-top-left-radius: var(--radius-surface); margin-left: auto; }
+left-stripe miss .card { box-shadow: var(--shadow-sm); }
 state-as-action hit btn.classList.toggle("action-btn-danger")
 state-as-action hit <button class="action-btn-secondary">
 tap-strings hit "tap": "modal",

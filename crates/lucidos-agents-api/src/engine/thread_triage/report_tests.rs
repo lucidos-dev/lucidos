@@ -45,8 +45,6 @@ fn link(id: Uuid) -> String {
     format!("[thread](thread:ws/{id})")
 }
 
-/// Trigger runs form one group per trigger with the newest run first. Every
-/// other thread lands in one closing group, and the counts add up.
 #[test]
 fn the_report_groups_trigger_runs_per_trigger_newest_first() {
     let older = row(|f| f.trigger = run("Watch", false));
@@ -91,8 +89,6 @@ fn request(row: &TriageRow, action: TriageAction) -> ApplyRequest {
     }
 }
 
-/// Apply runs only proposed threads, once each, and re-judges each against
-/// its fresh facts. A thread that gained a question since is not archived.
 #[test]
 fn apply_runs_only_proposed_threads_that_are_still_safe() {
     let idle = row(|_| {});

@@ -33,7 +33,6 @@ pub(in crate::api) struct HoldResponse {
     changed: bool,
 }
 
-/// What an agent reads when it may not resume.
 const AGENT_RESUME_REFUSAL: &str = "Only the owner resumes a thread on hold. Its own agent \
      may resume it only inside a turn the owner's own message started there. Ask the owner \
      to press Resume on the hold strip.";

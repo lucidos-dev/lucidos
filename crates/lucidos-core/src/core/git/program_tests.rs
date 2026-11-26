@@ -1,8 +1,3 @@
-//! The resolved git binary ([`super::git_program`]).
-//!
-//! Two properties: it runs the same git bare `git` would, and a probe that
-//! answers nothing usable falls back to bare `git` rather than breaking calls.
-
 use super::*;
 
 #[tokio::test]

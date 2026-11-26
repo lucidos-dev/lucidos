@@ -4,24 +4,14 @@ use std::path::{Path, PathBuf};
 
 use crate::core::system_knowhow::SystemKnowhowStore;
 
-/// Prefix that routes a knowhow ID to engine-shipped reference knowhow at
-/// `<repo>/system-knowhow/`. IDs without this prefix come from the
-/// workspace-local or shared user-curated knowhow dirs.
 pub const SYSTEM_KNOWHOW_PREFIX: &str = "system-knowhow/";
 
-/// The most bytes one knowhow file may hold. A coding agent reads knowhow
-/// through a shell, and Claude Code keeps about 30 KB of one command's output.
-/// A larger doc becomes a short index plus a folder of parts
-/// (`system-knowhow/building-knowhow.md` § Size).
 pub const KNOWHOW_MAX_BYTES: usize = 24 * 1024;
 
-/// Whether a knowhow body is over [`KNOWHOW_MAX_BYTES`].
 pub fn knowhow_is_oversized(body: &str) -> bool {
     body.len() > KNOWHOW_MAX_BYTES
 }
 
-/// Whether a `data/`-rooted path is a knowhow file: a `.md` under `knowhow/`,
-/// or under an app's or a trigger's own `knowhow/` folder.
 pub fn is_knowhow_data_path(path: &str) -> bool {
     if !path.ends_with(".md") {
         return false;
@@ -36,8 +26,6 @@ pub fn is_knowhow_data_path(path: &str) -> bool {
     )
 }
 
-/// The warning for a write that leaves a knowhow file over the cap, or `None`.
-/// The write still lands: a refusal would lose an edit in progress.
 pub fn knowhow_size_warning(data_path: &str, bytes: u64) -> Option<String> {
     if !is_knowhow_data_path(data_path) || bytes <= KNOWHOW_MAX_BYTES as u64 {
         return None;
@@ -51,18 +39,12 @@ pub fn knowhow_size_warning(data_path: &str, bytes: u64) -> Option<String> {
     ))
 }
 
-/// Test-only helper: write a single knowhow file with the YAML frontmatter
-/// (`name: ...`) the loader expects. Shared by `core::knowhow::tests` so all
-/// knowhow fixtures share one definition.
 #[cfg(any(test, feature = "test-support"))]
 pub fn write_knowhow_file(path: &std::path::Path, name: &str, body: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, format!("---\nname: {}\n---\n{}", name, body)).unwrap();
 }
 
-/// Test-only helper: a shipped doc's text followed by its parts', for a test
-/// that reads one doc's content. A doc over [`KNOWHOW_MAX_BYTES`] keeps its
-/// parts in `<doc>/`. `rel` is repo-relative, such as `system-knowhow/js-sdk.md`.
 #[cfg(any(test, feature = "test-support"))]
 pub fn doc_family_text(repo: &Path, rel: &str) -> String {
     let doc = repo.join(rel);
@@ -82,7 +64,7 @@ pub fn doc_family_text(repo: &Path, rel: &str) -> String {
     text
 }
 
-/// Bundles the user-curated knowhow search directories.
+/// INVARIANT: Bundles the user-curated knowhow search directories.
 /// Priority (highest wins): local > shared > apps > triggers.
 ///
 /// `apps` is the workspace's `data/apps/` root. App-scoped knowhow ids of the
@@ -116,7 +98,6 @@ pub struct Knowhow {
 }
 
 impl Knowhow {
-    /// Format as a tagged section for LLM context injection.
     pub fn format_section(&self) -> String {
         format!(
             "[KNOW-HOW: {}]\n{}\n[END KNOW-HOW]",
@@ -134,14 +115,6 @@ pub struct KnowhowSummary {
 
 pub struct KnowhowStore;
 
-/// Parse knowhow frontmatter: extracts name, description, and body.
-/// If `description:` is present in frontmatter, uses that.
-/// Otherwise derives a description from the name + first paragraph of body.
-///
-/// Kept separate from `super::parse_md_frontmatter` because that helper
-/// extracts a list field (e.g. `knowhow: [a, b]`), while knowhow files use
-/// a scalar `description:` with a derive-from-body fallback. The shared
-/// `---\n...\n---\n` header split is factored out into `split_md_frontmatter`.
 fn parse_frontmatter(text: &str) -> Option<(String, String, String)> {
     let (frontmatter, body) = super::split_md_frontmatter(text)?;
 
@@ -167,7 +140,6 @@ fn parse_frontmatter(text: &str) -> Option<(String, String, String)> {
     Some((name, description, body))
 }
 
-/// Derive a semantic description from name + first substantive paragraph of body.
 fn derive_description(name: &str, body: &str) -> String {
     let first_line = body
         .lines()
@@ -185,27 +157,13 @@ fn derive_description(name: &str, body: &str) -> String {
     }
 }
 
-/// How deep a listing scan descends under a knowhow root.
-///
-/// Listing is what puts a doc in a thread's Know-how routing list, so every
-/// listed file costs tokens on every turn of every thread. A file below the
-/// cap is a *reference*: it belongs to the doc above it, and that doc names
-/// it. Resolution ignores the cap, so a reference still loads by its full id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KnowhowListDepth {
-    /// `<name>.md` only, for `data/apps/<id>/knowhow/`,
-    /// `data/triggers/<slug>/knowhow/` and the engine-shipped
-    /// `system-knowhow/`. The app, the trigger or the doc above it is already
-    /// the group, so a folder inside those roots holds references.
     FilesOnly,
-    /// `<name>.md` and `<group>/<name>.md`, for `data/knowhow/` and the shared
-    /// `~/.lucidos/knowhow/`. One group folder deep is still a doc.
     FilesAndGroups,
 }
 
 impl KnowhowListDepth {
-    /// Path components a listed file may have below the root, its own name
-    /// included. So 1 is the files sitting directly in the root.
     fn levels(self) -> usize {
         match self {
             Self::FilesOnly => 1,
@@ -214,15 +172,13 @@ impl KnowhowListDepth {
     }
 }
 
-/// Every `.md` under `dir`, at any depth. A caller building a *listing* takes
+/// INVARIANT: Every `.md` under `dir`, at any depth. A caller building a *listing* takes
 /// [`collect_md_files_within`] instead, so a doc's supporting references never
 /// take a row of their own.
 pub(crate) fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
     collect_md_files_within(dir, usize::MAX)
 }
 
-/// Every `.md` within `levels` path components of `dir`, its own name
-/// included. `levels` of 1 collects the files sitting directly in `dir`.
 fn collect_md_files_within(dir: &Path, levels: usize) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let entries = match std::fs::read_dir(dir) {
@@ -257,7 +213,6 @@ fn collect_md_files_within(dir: &Path, levels: usize) -> Vec<PathBuf> {
     files
 }
 
-/// e.g., `knowhow/weather/api.md` → `weather/api`
 pub(crate) fn id_from_path(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     let without_ext = rel.with_extension("");
@@ -266,9 +221,6 @@ pub(crate) fn id_from_path(root: &Path, path: &Path) -> Option<String> {
 }
 
 impl KnowhowStore {
-    /// Load name + description for the docs a root lists (cheap, loaded at
-    /// startup). `depth` states which files that root counts as docs; see
-    /// [`KnowhowListDepth`].
     pub fn load_summaries(knowhow_dir: &Path, depth: KnowhowListDepth) -> Vec<KnowhowSummary> {
         let mut summaries = Vec::new();
 
@@ -307,24 +259,11 @@ impl KnowhowStore {
         summaries
     }
 
-    /// Load know-how summaries for one trigger from
-    /// `<triggers_dir>/<slug>/knowhow/`. Returns empty if no knowhow dir
-    /// exists for the slug. IDs are bare filenames (no slug prefix in
-    /// the id; the trigger system prompt section labels them by slug
-    /// separately, mirroring `load_app_summaries`).
-    ///
-    /// The trigger is already the group, so a folder in its knowhow dir holds
-    /// a doc's references and is not listed.
     pub fn load_trigger_summaries(triggers_dir: &Path, slug: &str) -> Vec<KnowhowSummary> {
         let kh_dir = triggers_dir.join(slug).join("knowhow");
         Self::load_summaries(&kh_dir, KnowhowListDepth::FilesOnly)
     }
 
-    /// Load know-how summaries from all app knowhow/ subdirectories.
-    /// Returns (app_id, summary) pairs for each app that has knowhow files.
-    ///
-    /// The app is already the group, so a folder in its knowhow dir holds a
-    /// doc's references and is not listed.
     pub fn load_app_summaries(apps_dir: &Path) -> Vec<(String, KnowhowSummary)> {
         let mut results = Vec::new();
         if !apps_dir.exists() {
@@ -357,7 +296,7 @@ impl KnowhowStore {
         results
     }
 
-    /// Load summaries from shared and local directories, deduplicating by ID.
+    /// INVARIANT: Load summaries from shared and local directories, deduplicating by ID.
     /// Priority (highest wins): local > shared.
     ///
     /// Both are top-level roots, so a group folder inside them still holds
@@ -383,14 +322,6 @@ impl KnowhowStore {
         result
     }
 
-    /// Load full content for a specific know-how file.
-    /// Priority (highest wins): local > shared > app-scoped > trigger-scoped.
-    /// App-scoped: an id of the form `<app_id>/<rest>` falls back to
-    /// `<apps>/<app_id>/knowhow/<rest>.md`.
-    /// Trigger-scoped: an id of the form `triggers/<slug>/<rest>` falls back
-    /// to `<triggers>/<slug>/knowhow/<rest>.md`. The `triggers/` prefix
-    /// disambiguates from the `<app>/<rest>` namespace; both are consulted
-    /// only if no top-level file matched, so a same-shaped local entry wins.
     pub fn load_with_fallback(dirs: &KnowhowDirs, id: &str) -> Option<Knowhow> {
         Self::load(&dirs.local, id)
             .or_else(|| {
@@ -408,8 +339,6 @@ impl KnowhowStore {
             })
     }
 
-    /// Load full content for a specific know-how file.
-    /// The id may contain forward slashes for files in subdirectories (e.g., "weather/api").
     pub fn load(knowhow_dir: &Path, id: &str) -> Option<Knowhow> {
         if !is_safe_id(id) {
             log_legacy!("[Knowhow] Invalid id (path traversal): {}", id);
@@ -420,9 +349,6 @@ impl KnowhowStore {
     }
 }
 
-/// Read+parse a single knowhow file at `path` and stamp `id` onto the result.
-/// Used by both the dir+id path ([`KnowhowStore::load`]) and the app-scoped
-/// fallback that resolves to a fully built path with a different id-shape.
 fn read_knowhow_file(path: &Path, id: &str) -> Option<Knowhow> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -449,23 +375,16 @@ fn read_knowhow_file(path: &Path, id: &str) -> Option<Knowhow> {
     })
 }
 
-/// Same path-traversal guard as [`KnowhowStore::load`]; ids that fail this
-/// can never resolve to a real file regardless of which dir we look in.
-/// Delegates to the canonical [`crate::core::is_path_traversal`] so the rule can
-/// never drift from the engine-wide guard.
 fn is_safe_id(id: &str) -> bool {
     !crate::core::is_path_traversal(id)
 }
 
-/// Resolve `<app_id>/<rest>` to `<apps>/<app_id>/knowhow/<rest>.md`. Returns
-/// `None` for ids that aren't app-scoped (no `/`), have empty segments, or
-/// fail [`is_safe_id`]. Existence is NOT checked — callers do that.
 pub fn app_scoped_knowhow_path(apps_dir: &Path, id: &str) -> Option<PathBuf> {
     if !is_safe_id(id) {
         return None;
     }
     let (app_id, rest) = id.split_once('/')?;
-    // `rest` must also pass the path-traversal guard: an absolute or
+    // INVARIANT: `rest` must also pass the path-traversal guard: an absolute or
     // backslash-prefixed `rest` would let `Path::join` replace the apps_dir
     // prefix and escape to the filesystem root (e.g. `foo//bar` splits to
     // ("foo", "/bar"), and `apps_dir.join("/bar.md")` becomes `/bar.md`).
@@ -480,18 +399,13 @@ pub fn app_scoped_knowhow_path(apps_dir: &Path, id: &str) -> Option<PathBuf> {
     )
 }
 
-/// Resolve `triggers/<slug>/<rest>` to `<triggers>/<slug>/knowhow/<rest>.md`.
-/// Mirrors [`app_scoped_knowhow_path`] one level deeper — the leading
-/// `triggers/` prefix disambiguates the trigger namespace from the bare
-/// `<app>/<rest>` namespace. Returns `None` for ids that aren't trigger-scoped,
-/// have empty segments, or fail the same path-traversal guards.
 fn trigger_scoped_knowhow_path(triggers_dir: &Path, id: &str) -> Option<PathBuf> {
     if !is_safe_id(id) {
         return None;
     }
     let stripped = id.strip_prefix("triggers/")?;
     let (slug, rest) = stripped.split_once('/')?;
-    // Same guard as the app-scoped helper: an absolute / backslash-prefixed
+    // INVARIANT: Same guard as the app-scoped helper: an absolute / backslash-prefixed
     // `rest` would let `Path::join` escape the triggers_dir prefix.
     if slug.is_empty() || rest.is_empty() || !is_safe_id(rest) {
         return None;
@@ -504,13 +418,6 @@ fn trigger_scoped_knowhow_path(triggers_dir: &Path, id: &str) -> Option<PathBuf>
     )
 }
 
-/// Load referenced know-how for LLM context.
-///
-/// IDs prefixed with `system-knowhow/` resolve against the engine-shipped
-/// reference dir (`<repo>/system-knowhow/`) and are tagged `[SYSTEM-KNOWHOW: ...]`.
-/// Bare IDs resolve via shared+local user knowhow with local taking priority and
-/// are tagged `[KNOW-HOW: ...]`. Returns formatted sections joined for prompt
-/// injection, or empty string if nothing matched.
 pub fn load_knowhow_sections_merged(
     dirs: &KnowhowDirs,
     system_dir: Option<&Path>,
@@ -543,12 +450,6 @@ pub fn load_knowhow_sections_merged(
     }
 }
 
-/// Load and format a single know-how section by id.
-///
-/// `Some` of a formatted `[KNOW-HOW: ...]` or `[SYSTEM-KNOWHOW: ...]` block,
-/// or `None` if the id resolves to nothing. The `load_knowhow` LLM tool
-/// handler is implemented on top of this helper so any future callers get
-/// identical formatted output.
 pub fn load_one_knowhow_section(
     dirs: &KnowhowDirs,
     system_dir: Option<&Path>,
@@ -562,7 +463,7 @@ pub fn load_one_knowhow_section(
     KnowhowStore::load_with_fallback(dirs, id).map(|kh| kh.format_section())
 }
 
-/// Format the "knowhow not found" message that the `load_knowhow` LLM tool
+/// INVARIANT: Format the "knowhow not found" message that the `load_knowhow` LLM tool
 /// surfaces to the model when an id doesn't resolve. Centralized so any
 /// future callers stay byte-identical with the LLM tool's miss path.
 pub fn knowhow_not_found_body(id: &str) -> String {
@@ -579,7 +480,7 @@ pub fn knowhow_not_found_body(id: &str) -> String {
     }
 }
 
-/// True iff `body` is one of the not-found sentinels produced by
+/// INVARIANT: True iff `body` is one of the not-found sentinels produced by
 /// [`knowhow_not_found_body`]. The `load_knowhow` tool handler uses this to
 /// avoid persisting miss responses into the per-thread loaded set — only
 /// real docs belong there. Real hit bodies are formatted `[KNOW-HOW: …]` /
@@ -591,7 +492,7 @@ pub fn is_not_found_body(body: &str) -> bool {
         && body.contains("' not found.")
 }
 
-/// Load all know-how files from an app's knowhow/ subdirectory (recursively).
+/// INVARIANT: Load all know-how files from an app's knowhow/ subdirectory (recursively).
 /// Returns formatted sections, or an empty string if none found.
 ///
 /// Recursive on purpose. This returns bodies with an app intent that

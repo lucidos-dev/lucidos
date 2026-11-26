@@ -1,10 +1,3 @@
-//! Where a slow relayed request spent its time, on both gateways.
-//!
-//! Measurement only (`docs/plans/2026-11-19-gateway-relay-request-queue.md`,
-//! Phase 1). Nothing here changes how a request is served. A line names no
-//! workspace, gateway or path: a route appears as a hash keyed per process,
-//! so lines from one route still group.
-
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
@@ -20,11 +13,8 @@ use axum::http::Version;
 use axum::response::Response;
 use lucidos_diagnostic_log::{line, Line, LogValue};
 
-/// A relayed request slower than this writes one line.
 pub const SLOW_RELAY: Duration = Duration::from_millis(200);
 
-/// A stage's end, measured from the request's arrival, or `-` when the request
-/// never reached it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StageMs(Option<Duration>);
 
@@ -38,7 +28,6 @@ impl fmt::Display for StageMs {
 }
 impl LogValue for StageMs {}
 
-/// A fixed word in a line, such as a request kind or an HTTP version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Label(pub &'static str);
 
@@ -60,13 +49,10 @@ fn http_version(version: Version) -> Label {
     })
 }
 
-/// A's stage clock for one relayed request. `kind` says what A did once both
-/// probes passed: `shell`, `data`, or `-` when it never got that far.
 #[derive(Clone, Debug)]
 pub struct RelayClock {
     arrived: Instant,
     version: Label,
-    /// The client's peer port: one key per browser connection.
     port: Option<u16>,
     pub kind: Label,
     pub health: StageMs,
@@ -87,14 +73,11 @@ impl RelayClock {
         }
     }
 
-    /// The time since arrival, to store as a stage's end.
     pub fn mark(&self) -> StageMs {
         StageMs(Some(self.arrived.elapsed()))
     }
 }
 
-/// A's line for one slow relayed request. `end` is the response end, or `-`
-/// for an event stream, whose line fires at first byte.
 pub fn slow_relay_line(
     route: u64,
     clock: &RelayClock,
@@ -118,7 +101,6 @@ pub fn slow_relay_line(
     )
 }
 
-/// B's stage clock for one request a paired gateway relayed.
 #[derive(Clone, Debug)]
 pub struct ReceiveClock {
     arrived: Instant,
@@ -137,12 +119,10 @@ impl ReceiveClock {
         }
     }
 
-    /// The time since arrival, to store as a stage's end.
     pub fn mark(&self) -> StageMs {
         StageMs(Some(self.arrived.elapsed()))
     }
 
-    /// Write B's line when the request was slow, and hand `response` back.
     pub fn finish(self, response: Response) -> Response {
         let total = self.arrived.elapsed();
         if total > SLOW_RELAY {
@@ -162,28 +142,22 @@ impl ReceiveClock {
     }
 }
 
-/// Relayed requests in flight on A, per route.
 #[derive(Default)]
 pub struct RelayTraffic {
     routes: Mutex<HashMap<String, RouteTraffic>>,
-    /// Keys the route numbers, so a number names no route outside this process.
     numbers: RandomState,
 }
 
 #[derive(Default)]
 struct RouteTraffic {
-    /// In-flight requests per client peer address.
     peers: HashMap<SocketAddr, usize>,
     in_flight: usize,
     streams: usize,
 }
 
-/// One route's traffic at one moment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrafficSummary {
-    /// Distinct client connections with a relayed request in flight.
     pub connections: usize,
-    /// Relayed event streams held open.
     pub streams: usize,
 }
 
@@ -197,7 +171,6 @@ impl RouteTraffic {
 }
 
 impl RelayTraffic {
-    /// Count a relayed request on `route` until the returned guard drops.
     pub fn enter(self: &Arc<Self>, route: &str, peer: Option<SocketAddr>) -> InFlight {
         let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
         let traffic = routes.entry(route.to_string()).or_default();
@@ -244,7 +217,6 @@ impl RelayTraffic {
     }
 }
 
-/// One relayed request, counted on its route until it drops.
 pub struct InFlight {
     traffic: Arc<RelayTraffic>,
     route: String,
@@ -258,7 +230,6 @@ impl InFlight {
         self.traffic.summary(&self.route)
     }
 
-    /// Count this request as an open event stream, and log the new count.
     pub fn hold_stream(&mut self) {
         if self.stream {
             return;
@@ -293,8 +264,6 @@ fn stream_line(route: u64, opened: bool, summary: TrafficSummary) -> Line {
     )
 }
 
-/// `response` with its body timed: A's line, when slow, fires as the body
-/// ends or drops. An event stream's line fires now, at first byte.
 pub fn timed_response(mut clock: RelayClock, mut flight: InFlight, response: Response) -> Response {
     clock.first_byte = clock.mark();
     let event_stream = response
@@ -325,9 +294,6 @@ pub fn timed_response(mut clock: RelayClock, mut flight: InFlight, response: Res
     })
 }
 
-/// Releases the request's count as it drops. With a clock, it first writes
-/// the line a slow request owes. An event stream has none: its line fired at
-/// first byte.
 struct Finish {
     clock: Option<RelayClock>,
     flight: InFlight,
@@ -348,8 +314,6 @@ impl Drop for Finish {
     }
 }
 
-/// A body that runs `finish` once it ends or drops. Size hint and end of
-/// stream pass through, so the response frames as it did untimed.
 struct Timed {
     body: Body,
     finish: Option<Finish>,

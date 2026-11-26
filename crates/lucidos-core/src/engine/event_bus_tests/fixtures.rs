@@ -16,7 +16,6 @@ async fn assert_children_counters(
     assert_eq!(total, expected_total, "{} — total_children_count", msg);
 }
 
-/// Read `blocking_descendant_count` for `thread_id`.
 async fn read_blocking_descendant_count(pool: &PgPool, thread_id: Uuid) -> i32 {
     sqlx::query_scalar(
         "SELECT blocking_descendant_count FROM thread_summaries WHERE thread_id = $1",
@@ -27,10 +26,6 @@ async fn read_blocking_descendant_count(pool: &PgPool, thread_id: Uuid) -> i32 {
     .unwrap()
 }
 
-/// Drain all SSE broadcasts the bus has accumulated since subscription,
-/// returning a flat list of `(thread_id, event_type, aggregate)` tuples.
-/// Caller filters by `thread_id` / aggregate presence to find specific
-/// rebroadcasts. Ignores system events.
 fn drain_aggregate_broadcasts(
     rx: &mut tokio::sync::broadcast::Receiver<EmittedEvent>,
 ) -> Vec<(Uuid, String, Option<crate::core::store::ThreadAggregate>)> {

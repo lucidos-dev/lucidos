@@ -1,10 +1,3 @@
-//! Workspace fonts over HTTP (ADR 0308): the data route's gate, the listing,
-//! the `/data` mount serving the face, and a theme naming the font.
-//!
-//! `core/workspace_fonts` unit tests cover every rule. Only a booted engine
-//! shows that the routes agree: a font written through `PUT /api/v1/data` is
-//! listed by `GET /api/v1/fonts`, and its face path loads from `/data`.
-
 use crate::support::{
     base_url, e2e_font_slug, http_client, user_client, workspace_path, workspace_tree_lock,
 };
@@ -13,7 +6,6 @@ fn api(path: &str) -> String {
     format!("{}/api/v1{}", base_url(), path)
 }
 
-/// Enough bytes to pass the engine's check. No browser parses them here.
 const FAKE_WOFF2: &[u8] = b"wOF2 not a real font, only its magic number";
 
 #[tokio::test]
@@ -24,7 +16,6 @@ async fn a_workspace_font_is_gated_listed_served_and_nameable_from_a_theme() {
     let id = format!("ws-{slug}");
     let dir = workspace_path().join("data/fonts").join(&slug);
 
-    // Refused before anything reaches disk.
     for (file, body) in [
         ("index.html", b"<script>alert(1)</script>".as_slice()),
         ("a.woff2", b"<html>not a font".as_slice()),
@@ -44,7 +35,6 @@ async fn a_workspace_font_is_gated_listed_served_and_nameable_from_a_theme() {
         assert!(!dir.join(file).exists(), "{file} reached disk");
     }
 
-    // The face first, then the manifest.
     let face = client
         .put(api(&format!("/data/fonts/{slug}/Brand.woff2")))
         .body(FAKE_WOFF2.to_vec())
@@ -84,7 +74,6 @@ async fn a_workspace_font_is_gated_listed_served_and_nameable_from_a_theme() {
     let path = font["faces"][0]["path"].as_str().unwrap().to_string();
     assert_eq!(path, format!("fonts/{slug}/Brand.woff2"));
 
-    // The face loads from the workspace, as an app frame's font load asks.
     let resp = http_client()
         .get(format!("{}/data/{path}", base_url()))
         .header("origin", "null")
@@ -104,7 +93,6 @@ async fn a_workspace_font_is_gated_listed_served_and_nameable_from_a_theme() {
     );
     assert_eq!(resp.bytes().await.unwrap().as_ref(), FAKE_WOFF2);
 
-    // A theme may name it in both slots, and never a font that is not installed.
     let theme_id = format!("e2e-theme-{}", uuid::Uuid::new_v4().simple());
     let theme_path = api(&format!("/data/themes/{theme_id}.json"));
     let missing = client
@@ -138,7 +126,6 @@ async fn a_workspace_font_is_gated_listed_served_and_nameable_from_a_theme() {
         .unwrap()
         .starts_with(&format!("'{id}'")));
 
-    // Removing the font drops it from the list and from the theme.
     for file in ["font.json", "Brand.woff2"] {
         let resp = client
             .delete(api(&format!("/data/fonts/{slug}/{file}")))

@@ -12,10 +12,8 @@ use tower::ServiceExt as _;
 use super::acceptor::{accept_at, MaybeTlsStream, Tagged};
 use super::*;
 
-/// A name that matches no known tailnet suffix: nothing may depend on its shape.
 const NAME: &str = "node-7.some-base.example";
 
-/// A documentation address (RFC 5737), standing in for a tailnet one.
 const REMOTE_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
 
 struct Pem {
@@ -32,12 +30,10 @@ fn mint(name: &str) -> Pem {
     }
 }
 
-/// The loopback CA's config, here the test CA the loopback client trusts.
 fn loopback() -> LoopbackTls {
     lucidos_local_token::test_support::server_config()
 }
 
-/// A store holding `pem`, with [`REMOTE_IP`] as the node's tailnet address.
 async fn store_holding(pem: &Pem) -> Arc<CertStore> {
     let store = Arc::new(CertStore::default());
     store
@@ -48,8 +44,6 @@ async fn store_holding(pem: &Pem) -> Arc<CertStore> {
     store
 }
 
-/// Serves every connection as if it arrived on [`REMOTE_IP`], so a loopback
-/// test socket exercises the non-loopback path.
 #[derive(Clone)]
 struct RemoteAcceptor(ListenerTls);
 
@@ -67,7 +61,6 @@ impl<S: Send + 'static> axum_server::accept::Accept<TcpStream, S> for RemoteAcce
     }
 }
 
-/// Answers every path with the request's [`Connection`], behind the gate.
 fn echo_router() -> Router {
     let echo = |connection: Connection| async move { format!("{connection:?}") };
     Router::new()
@@ -102,12 +95,10 @@ where
     port
 }
 
-/// A client that trusts only `pem` and reaches [`NAME`] on loopback.
 fn client_trusting(pem: &Pem, port: u16) -> reqwest::Client {
     client_for(pem, NAME, port)
 }
 
-/// A client that trusts only `pem` and reaches `name` on loopback.
 fn client_for(pem: &Pem, name: &str, port: u16) -> reqwest::Client {
     reqwest::Client::builder()
         .use_rustls_tls()
@@ -194,8 +185,6 @@ async fn direct_plain_http_on_loopback_reaches_only_the_hand_off() {
     assert!(cross.headers().get("clear-site-data").is_none());
 }
 
-/// `tailscale serve` proxies to plain loopback and names the client in
-/// `X-Forwarded-For`. Its hop reaches the router as before.
 #[tokio::test]
 async fn a_proxied_hop_on_plain_loopback_reaches_the_router() {
     let port = serve(GatewayAcceptor::new(ListenerTls::Managed(
@@ -243,7 +232,6 @@ async fn remote_plain_http_is_redirected_to_the_cert_s_own_origin() {
         .send()
         .await
         .unwrap();
-    // A 308, so a POST stays a POST.
     assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
     assert_eq!(
         response.headers()[reqwest::header::LOCATION],
@@ -268,8 +256,6 @@ async fn a_remote_connection_stays_plain_until_a_cert_is_held() {
     assert_eq!(body(response).await, "Plain");
 }
 
-/// A LAN or other-VPN address is not the node's tailnet address. Its plain
-/// HTTP must keep working, never redirect to a name it cannot resolve.
 #[tokio::test]
 async fn an_address_tailscaled_did_not_report_stays_plain() {
     let pem = mint(NAME);
@@ -294,8 +280,6 @@ async fn a_dual_stack_listener_matches_an_ipv4_mapped_tailnet_address() {
     assert!(store.serving(REMOTE_IP).is_none());
 }
 
-/// The first client trusts only the old cert, so its second request can only
-/// succeed on the connection it already holds.
 #[tokio::test]
 async fn a_cert_swap_leaves_open_connections_serving_and_reaches_new_ones() {
     let old = mint(NAME);
@@ -342,8 +326,6 @@ async fn a_pair_that_will_not_parse_leaves_the_current_cert_serving() {
     assert_eq!(store.current().unwrap().name, NAME);
 }
 
-/// A dev gateway with an operator certificate speaks the loopback CA's leaf on
-/// loopback, the same certificate as a packaged one.
 #[tokio::test]
 async fn an_operator_listener_serves_the_loopback_ca_on_loopback() {
     let pem = mint(NAME);
@@ -364,8 +346,6 @@ async fn an_operator_listener_serves_the_loopback_ca_on_loopback() {
     assert_eq!(body(response).await, "Tls");
 }
 
-/// An operator certificate that does not cover the tailnet name serves every
-/// other name. The tailnet name gets the managed certificate.
 #[tokio::test]
 async fn an_operator_listener_picks_the_certificate_by_name() {
     const OPERATOR_NAME: &str = "gateway.example";

@@ -4074,7 +4074,7 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
 
   it('only the follow toggle and the resume arm the follow', () => {
     const here = dirname(fileURLToPath(import.meta.url));
-    const source: string = readFileSync(resolve(here, '../scrollState.ts'), 'utf8');
+    const source: string = readFileSync(resolve(here, '../scrollRide.ts'), 'utf8');
 
     const armers: string[] = [];
     const re = /\bfunction (\w+)\s*\(/g;
@@ -4098,7 +4098,7 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
   it('only the reading position records and resumes a follow', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const SRC_DIR = resolve(here, '../../..');
-    const DEFINED_IN = 'components/chat/scrollState.ts';
+    const DEFINED_IN = 'components/chat/scrollRide.ts';
     const ALLOWED_CALLER = 'hooks/useScrollMemory.ts';
 
     const found: Record<string, string[]> = { resumeFollowingBottom: [], onFollowRideStarted: [] };

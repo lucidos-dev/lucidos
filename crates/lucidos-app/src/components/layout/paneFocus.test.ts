@@ -6,7 +6,7 @@ import {
   shouldReconcilePaneFocus, PANE_FOCUS_REGION,
   isContentPaneIframeFocus, navigationFocusTarget,
   visibleFocusables, focusIntoPane, tabTargetWithin,
-  installPaneFocusTracking, handlePaneTab,
+  installPaneFocusTracking, handlePaneTab, focusPaneMainControl,
 } from './paneFocus';
 
 function stubVisible(el: HTMLElement): void {
@@ -394,5 +394,76 @@ describe('visibleFocusables', () => {
     container.appendChild(cover);
 
     expect(visibleFocusables(container)).toEqual([live]);
+  });
+});
+
+const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+
+describe('focusPaneMainControl', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+    document.documentElement.removeAttribute('data-overlay-open');
+    focusedPane.value = 'thread';
+  });
+
+  it('moves the focus marker onto the pane it forces focus into, at once', () => {
+    document.body.innerHTML = '<div class="thread-drawer"><button>See all</button></div>';
+    stubVisible(document.querySelector<HTMLElement>('button')!);
+    focusedPane.value = 'content';
+    focusPaneMainControl('drawer');
+    expect(focusedPane.value).toBe('drawer');
+  });
+
+  it('lands in its pane even while an overlay still marks the page open', async () => {
+    document.body.innerHTML = '<div class="pane-content"><button data-id="pin">Pin</button></div>';
+    stubVisible(document.querySelector<HTMLElement>('button')!);
+    document.documentElement.setAttribute('data-overlay-open', '');
+    focusPaneMainControl('content');
+    await nextFrame();
+    expect(document.activeElement).toBe(document.querySelector('[data-id="pin"]'));
+  });
+
+  it('does not fall back to the prompt while a real thread transcript cannot take focus', async () => {
+    document.body.innerHTML = `
+      <div class="pane-thread"><div class="thread-view">
+        <div class="thread-content"></div>
+        <textarea data-role="prompt-input"></textarea>
+      </div></div>`;
+    for (const el of document.querySelectorAll<HTMLElement>('.thread-content, textarea')) stubVisible(el);
+    focusPaneMainControl('thread');
+    for (let i = 0; i < 40; i++) await nextFrame();
+    expect(document.activeElement).not.toBe(document.querySelector('[data-role="prompt-input"]'));
+  });
+});
+
+describe('handlePaneTab after a pane click', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+    focusedPane.value = 'thread';
+  });
+
+  it('cycles the focused pane, not the pane DOM focus is still in', () => {
+    document.body.innerHTML = `
+      <div class="pane-thread"><button data-id="thread">Option</button></div>
+      <div class="pane-content"><button data-id="pin">Pin</button><button data-id="menu">Actions</button></div>`;
+    for (const el of document.querySelectorAll<HTMLElement>('button')) stubVisible(el);
+    document.querySelector<HTMLElement>('[data-id="menu"]')!.focus();
+    focusedPane.value = 'thread';
+    expect(handlePaneTab(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(true);
+    expect(document.activeElement).toBe(document.querySelector('[data-id="thread"]'));
+  });
+});
+
+describe('PANE_FOCUS_REGION thread surface', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('matches a real thread transcript and never the compose view transcript', () => {
+    document.body.innerHTML = `
+      <div class="pane-thread"><div class="thread-content" data-id="compose"></div></div>
+      <div class="pane-thread"><div class="thread-view"><div class="thread-content" data-id="thread"></div></div></div>`;
+    expect(document.querySelector(PANE_FOCUS_REGION.thread))
+      .toBe(document.querySelector('[data-id="thread"]'));
   });
 });

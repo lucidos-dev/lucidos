@@ -1,4 +1,4 @@
-//! Colour evaluation for themes: a token's CSS value to sRGB, so the engine can
+//! INVARIANT: Colour evaluation for themes: a token's CSS value to sRGB, so the engine can
 //! measure contrast and clamp the protected palette (`protected.rs`).
 //!
 //! It reads the forms themes use: hex, `rgb()`, `hsl()`, `oklch()`, `oklab()`,
@@ -9,11 +9,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// How deep `var()` may chain before evaluation gives up. It also stops a
-/// cycle such as `--a: var(--b); --b: var(--a)`.
 const MAX_VAR_DEPTH: usize = 16;
 
-/// A gamma-encoded sRGB colour, every channel in `0.0..=1.0`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgba {
     pub r: f64,
@@ -45,7 +42,6 @@ impl Rgba {
         }
     }
 
-    /// This colour painted over `backdrop`, the way the browser composites it.
     pub fn over(self, backdrop: Rgba) -> Rgba {
         let a = self.a + backdrop.a * (1.0 - self.a);
         if a == 0.0 {
@@ -60,7 +56,6 @@ impl Rgba {
         }
     }
 
-    /// WCAG 2 relative luminance of the colour's own channels.
     pub fn luminance(self) -> f64 {
         let [r, g, b] = self.linear();
         0.2126 * r + 0.7152 * g + 0.0722 * b
@@ -98,8 +93,6 @@ impl Rgba {
         (c.clamp(0.0, 1.0) * 255.0).round() as u8
     }
 
-    /// `weight` of `self` mixed into `other` in sRGB, as `color-mix(in srgb)`
-    /// does for two opaque colours.
     pub fn mix(self, weight: f64, other: Rgba) -> Rgba {
         let lerp = |a: f64, b: f64| a * weight + b * (1.0 - weight);
         Rgba::opaque(
@@ -109,13 +102,11 @@ impl Rgba {
         )
     }
 
-    /// The opaque colour `to_hex` writes, so a check runs on what is emitted.
     pub fn quantised(self) -> Rgba {
         let q = |c: f64| f64::from(Self::channel_byte(c)) / 255.0;
         Rgba::opaque(q(self.r), q(self.g), q(self.b))
     }
 
-    /// `#rrggbb`, ignoring alpha. Callers composite first.
     pub fn to_hex(self) -> String {
         format!(
             "#{:02x}{:02x}{:02x}",
@@ -125,7 +116,6 @@ impl Rgba {
         )
     }
 
-    /// `rgba(r, g, b, a)`, alpha rounded to two places.
     pub fn to_rgba_css(self) -> String {
         format!(
             "rgba({}, {}, {}, {})",
@@ -158,7 +148,6 @@ impl Rgba {
         ]
     }
 
-    /// An OKLab colour, clipped into the sRGB gamut channel by channel.
     fn from_oklab(lab: [f64; 3], alpha: f64) -> Rgba {
         Rgba::from_linear(Rgba::oklab_to_linear(lab), alpha)
     }
@@ -175,7 +164,6 @@ impl Rgba {
     }
 }
 
-/// OKLCH: perceptual lightness `0..=1`, chroma, and hue in degrees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Oklch {
     pub l: f64,
@@ -184,7 +172,7 @@ pub struct Oklch {
 }
 
 impl Oklch {
-    /// The sRGB colour, with chroma reduced until it fits the gamut. Reducing
+    /// INVARIANT: The sRGB colour, with chroma reduced until it fits the gamut. Reducing
     /// chroma keeps the hue, where clipping each channel would shift it.
     pub fn to_rgba(self) -> Rgba {
         let (sin, cos) = self.h.to_radians().sin_cos();
@@ -208,14 +196,11 @@ impl Oklch {
     }
 }
 
-/// The WCAG 2 contrast ratio of two opaque colours, `1.0..=21.0`.
 pub fn contrast(a: Rgba, b: Rgba) -> f64 {
     let (la, lb) = (a.luminance(), b.luminance());
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// Evaluate a CSS colour value. `lookup` gives the value a custom property
-/// holds, for `var()`.
 pub fn evaluate(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<Rgba> {
     eval(value.trim(), lookup, 0).filter(|c| [c.r, c.g, c.b, c.a].iter().all(|ch| ch.is_finite()))
 }
@@ -242,7 +227,6 @@ fn eval(value: &str, lookup: &dyn Fn(&str) -> Option<String>, depth: usize) -> O
     }
 }
 
-/// `name(args)` when the whole value is one call, else `None`.
 pub(super) fn function_call(value: &str) -> Option<(&str, &str)> {
     let open = value.find('(')?;
     let inner = value[open + 1..].strip_suffix(')')?;
@@ -259,7 +243,6 @@ pub(super) fn function_call(value: &str) -> Option<(&str, &str)> {
     (balanced && named).then_some((name, inner))
 }
 
-/// Split at `sep` characters outside parentheses, dropping empty pieces.
 pub fn split_top_level(value: &str, sep: impl Fn(char) -> bool) -> Vec<&str> {
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0i32, 0);
@@ -293,7 +276,6 @@ fn eval_var(args: &str, lookup: &dyn Fn(&str) -> Option<String>, depth: usize) -
     }
 }
 
-/// One `color-mix()` input: a colour and its optional percentage.
 fn mix_input<'a>(arg: &'a str) -> Option<(String, Option<f64>)> {
     let pieces = split_top_level(arg, char::is_whitespace);
     let mut pct = None;
@@ -378,13 +360,10 @@ fn parse_hex(hex: &str) -> Option<Rgba> {
     })
 }
 
-/// A finite number. Rust also parses `nan`, `inf` and `1e999`, and a NaN
-/// channel would never settle the palette's lightness walk.
 fn finite(text: &str) -> Option<f64> {
     text.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
-/// A numeric component: `(value, is_percentage)`. `none` reads as zero.
 fn number(token: &str) -> Option<(f64, bool)> {
     if token == "none" {
         return Some((0.0, false));
@@ -395,8 +374,6 @@ fn number(token: &str) -> Option<(f64, bool)> {
     finite(token.strip_suffix("deg").unwrap_or(token)).map(|v| (v, false))
 }
 
-/// The three channels and optional alpha of a colour function, in legacy
-/// comma or modern slash syntax. A nested call makes the value unevaluable.
 fn components(args: &str) -> Option<([(f64, bool); 3], f64)> {
     if args.contains('(') {
         return None;
@@ -445,7 +422,6 @@ fn parse_hsl(args: &str) -> Option<Rgba> {
     })
 }
 
-/// OKLab lightness: a number, or a percentage of 1.
 fn ok_lightness((v, pct): (f64, bool)) -> f64 {
     if pct {
         v / 100.0
@@ -454,7 +430,6 @@ fn ok_lightness((v, pct): (f64, bool)) -> f64 {
     }
 }
 
-/// OKLab chroma and axes: a number, or a percentage of 0.4.
 fn ok_axis((v, pct): (f64, bool)) -> f64 {
     if pct {
         v / 100.0 * 0.4
@@ -482,7 +457,6 @@ fn parse_oklab(args: &str) -> Option<Rgba> {
     ))
 }
 
-/// The CSS named colours, as `name rrggbb` pairs.
 const NAMED_COLOURS: &str = "aliceblue f0f8ff antiquewhite faebd7 aqua 00ffff aquamarine 7fffd4 \
 azure f0ffff beige f5f5dc bisque ffe4c4 black 000000 blanchedalmond ffebcd blue 0000ff \
 blueviolet 8a2be2 brown a52a2a burlywood deb887 cadetblue 5f9ea0 chartreuse 7fff00 \
@@ -518,13 +492,10 @@ static NAMED: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     words.chunks(2).map(|pair| (pair[0], pair[1])).collect()
 });
 
-/// Whether `name` is a CSS named colour. `transparent` is not one here.
 pub fn is_named_colour(name: &str) -> bool {
     NAMED.contains_key(name)
 }
 
-/// Every CSS named colour, for the generated TypeScript twin of the part
-/// grammar.
 pub fn named_colours() -> impl Iterator<Item = &'static str> {
     NAMED_COLOURS.split_whitespace().step_by(2)
 }

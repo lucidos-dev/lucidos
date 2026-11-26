@@ -1,28 +1,9 @@
-//! LLM-facing schemas for the thread tools a parent uses to run its own
-//! fan-out: the two spawn tools (run_thread, run_coding_agent) and the
-//! follow-up that redirects a child already spawned
-//! (follow_up_child_thread). All three are standalone per the
-//! hot-single-purpose guardrail asserted in `llm/tools/tests.rs`.
-//!
-//! Thread INTROSPECTION (list_threads / count_threads) is the grouped `threads`
-//! manifest tool (built from `crate::capability_manifest`); the flat names stay
-//! wired as back-compat aliases in `execute_tool`.
-
 use crate::engine::thread_events::CodingAgent;
 use crate::engine::thread_events::WakeMode;
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// The `reasoning_effort` values `run_coding_agent` advertises: the union of
-/// what the two backends offer, in ladder order.
-///
-/// A union rather than one backend's list, because the tool serves both and the
-/// two vocabularies can drift apart at any time. Advertising the union keeps a
-/// value that IS valid somewhere out of the schema's way, and per-backend
-/// validation at the spawn boundary rejects it by name for the backend that
-/// does not take it. That is the same split the `model` argument uses: the
-/// schema describes the surface, the spawn enforces the backend.
 fn coding_agent_effort_vocabulary() -> Vec<&'static str> {
     let offered = |agent| {
         crate::llm::coding_agent_models::coding_agent_reasoning_effort_options(agent)
@@ -39,8 +20,6 @@ fn coding_agent_effort_vocabulary() -> Vec<&'static str> {
         .collect()
 }
 
-/// The `wake_mode` argument both spawn tools take: what a child's clean finish
-/// does to the spawning thread (ADR 0451).
 fn wake_mode_property() -> serde_json::Value {
     json!({
         "type": "string",
@@ -107,7 +86,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Basename of a workspace on THIS install; omit for this one. Needs `relation=\"top\"`; resolves `folder` there. Another install: `lucidos spawn-thread --to <absolute path>`."
                     },
-                    // No `allowed_tools` and no `append_system_prompt` here, on
+                    // INVARIANT: No `allowed_tools` and no `append_system_prompt` here, on
                     // purpose. Both were declared for a year and neither ever
                     // reached the spawn: `run_session` overwrites the allowlist
                     // from the user's `cc-allowed-tools` file and composes the
@@ -123,12 +102,6 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "A picker id or a thread's reported model. With reasoning_effort, one rung of the backend's intelligence ladder; an off-ladder pick is REFUSED, listing the rungs. Omit both if unsure. Settled: lower; hard: higher."
                     },
-                    // Deliberately silent about the per-model restriction on a
-                    // tier. `validate_coding_agent_effort` refuses the pairing
-                    // and its message names the models that do offer it, which
-                    // teaches the caller in the turn it matters. Saying it here
-                    // instead is billed on every request of every thread, and
-                    // `always_loaded_context_stays_under_budget` has no room.
                     "reasoning_effort": {
                         "type": "string",
                         "enum": coding_agent_effort_vocabulary(),
@@ -178,8 +151,6 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-/// Kept out of the `vec!` so the invariants below can assert on it by name
-/// rather than by digging the tool back out of the list.
 const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
     "Send a follow-up to a child thread YOU already spawned: redirect one going the wrong ",
     "way, hand it something a sibling learned, or tell a stalled one to continue. The ",
@@ -223,7 +194,6 @@ mod tests {
         );
     }
 
-    /// Both spawn tools take the wake mode, with exactly the engine's values.
     #[test]
     fn both_spawn_tools_declare_the_wake_mode() {
         let tools = spawn_tools();
@@ -243,8 +213,6 @@ mod tests {
         }
     }
 
-    /// ADR 0473: both spawn tools advise a top-thread for a result the caller
-    /// will not act on.
     #[test]
     fn both_spawn_tools_advise_top_when_no_report_is_needed() {
         let tools = spawn_tools();
@@ -260,11 +228,6 @@ mod tests {
         }
     }
 
-    /// The tool exposes NO caller-thread argument. The caller is
-    /// `execute_tool`'s ambient `thread_id`, which the model cannot set, and
-    /// that is the whole reason the authorization ladder is a real boundary
-    /// rather than an accounting one: the model picks which child to address,
-    /// never who it is.
     #[test]
     fn follow_up_tool_exposes_no_caller_thread_argument() {
         let tools = spawn_tools();
@@ -291,10 +254,6 @@ mod tests {
         );
     }
 
-    /// `urgent` ends the child's current turn, so the model has to be told both
-    /// what it costs and that the cost is real on only two of the three
-    /// backends. A model that reads it as a free "please hurry" would spend it
-    /// on every steer.
     #[test]
     fn follow_up_tool_states_what_urgent_costs_and_where_it_is_a_no_op() {
         let tools = spawn_tools();
@@ -322,8 +281,6 @@ mod tests {
         );
     }
 
-    /// Three side effects the model has to know about before it redirects a
-    /// child, all user-visible and none of them obvious from the verb.
     #[test]
     fn follow_up_tool_description_warns_about_its_side_effects() {
         let tools = spawn_tools();
@@ -360,8 +317,6 @@ mod tests {
         );
     }
 
-    /// The title is the handle a parent uses to refer to a child later, so both
-    /// spawn tools have to say so rather than calling it merely "Recommended".
     #[test]
     fn both_spawn_tools_say_the_title_is_how_you_refer_to_the_child() {
         for name in [tn::RUN_THREAD, tn::RUN_CODING_AGENT] {
@@ -380,10 +335,6 @@ mod tests {
         }
     }
 
-    /// Both route pins are optional and neither may join `required`: a caller
-    /// that names only one still inherits the other from its own turn.
-    /// The effort enum is the ladder itself rather than a copy, so the schema
-    /// cannot offer a tier `validate_trigger_reasoning_effort` would reject.
     #[test]
     fn run_thread_offers_optional_model_and_reasoning_effort_pins() {
         let tools = spawn_tools();
@@ -411,12 +362,6 @@ mod tests {
         );
     }
 
-    /// The `folder`-less form means "edit Lucidos itself", which only exists on
-    /// an install launched from a source checkout. The description used to
-    /// assert it unconditionally, and a packaged install's agent believed it —
-    /// claiming to have read `crates/lucidos-engine/…`, spawning a session, and
-    /// telling the user to Apply and rebuild. Both places that mention omitting
-    /// `folder` must carry the precondition.
     #[test]
     fn omitting_folder_is_documented_as_needing_a_source_checkout() {
         let tools = spawn_tools();
@@ -443,18 +388,6 @@ mod tests {
         );
     }
 
-    /// The schema may only advertise an argument the spawn path actually reads.
-    ///
-    /// `model`, `allowed_tools` and `append_system_prompt` were declared here
-    /// and read by nothing: `ThreadQueueRequest::CodingAgent` had no field for
-    /// any of them, so every session ran on the backend default while
-    /// the tool result came back a plain success. An agent told to match model
-    /// to task obeyed, reported "I picked Sonnet", and ran Opus every time.
-    ///
-    /// So the rule this test pins is not "declare these three": it is that the
-    /// declared set and the honoured set are the SAME set. `model` and
-    /// `reasoning_effort` are now honoured, so they are declared. The other two
-    /// are owned elsewhere and refused at the boundary, so they are not.
     #[test]
     fn the_coding_agent_schema_declares_only_arguments_the_spawn_honours() {
         let tools = spawn_tools();
@@ -481,11 +414,6 @@ mod tests {
         }
     }
 
-    /// The effort enum is built from the backends' own pickers, so a tier added
-    /// to either `cc_menu_options.json` or `codex_menu_options.json` shows up
-    /// here without anyone remembering to edit this file. A hand-copied list is
-    /// how the CC alias tables went stale before (three `wontfix` rows in the
-    /// tracker say so).
     #[test]
     fn the_effort_enum_is_the_union_of_what_the_backends_offer() {
         let vocabulary = coding_agent_effort_vocabulary();
@@ -504,7 +432,6 @@ mod tests {
                 );
             }
         }
-        // Ladder order, not insertion order: the model reads this as a scale.
         let ladder: Vec<&str> = crate::llm::EFFORT_LADDER
             .iter()
             .copied()
@@ -513,9 +440,6 @@ mod tests {
         assert_eq!(vocabulary, ladder, "the enum must read low-to-high");
     }
 
-    /// Claude Code's picker is discovered per workspace, so no schema can list
-    /// it. An enum here would also bill every picker row on every chat request.
-    /// The spawn refuses an unknown id by name instead.
     #[test]
     fn the_model_argument_is_a_string_the_spawn_checks() {
         let tool = spawn_tools()

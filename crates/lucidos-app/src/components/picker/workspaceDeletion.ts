@@ -1,6 +1,7 @@
 import { confirmCleanup, freezeWorkspaceDeletion } from '../../api/client/control';
 import { showConfirm, showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
+import { withProgressToast } from './progressToast';
 
 export async function deleteWorkspaces(ids: string[], onChanged: () => Promise<void>): Promise<void> {
   let confirming = false;
@@ -25,7 +26,8 @@ export async function deleteWorkspaces(ids: string[], onChanged: () => Promise<v
     } : undefined;
     if (!await showConfirm(title, 'Delete', { variant: 'danger', ...(details && { details }) })) return;
     confirming = true;
-    const { results } = await confirmCleanup(batch.id, batch.phrase);
+    const progress = ids.length === 1 ? `Deleting "${names[0]}"…` : `Deleting ${ids.length} workspaces…`;
+    const { results } = await withProgressToast('workspace-delete', progress, confirmCleanup(batch.id, batch.phrase));
     const resultsById = new Map(results.map((result) => [result.id, result]));
     const deleted = [];
     for (const [index, id] of ids.entries()) {

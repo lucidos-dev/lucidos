@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { effect } from '@preact/signals';
 import {
   splitRatio, SPLIT_RATIO_KEY, threadDrawerOpen, threadDrawerWidth, THREAD_DRAWER_WIDTH_KEY,
 } from '../../store/store';
@@ -8,7 +9,7 @@ import { DASHBOARD_RAIL_SHOWN_KEY, DASHBOARD_RAIL_WIDTH_KEY } from '../../store/
 import { paneFloors, dividerBandPx } from '../../store/paneMinimums';
 import {
   beginPaneResize, drawnDrawerShown, drawnDrawerWidth, drawnRailShown, drawnRailWidth, drawnSplitRatio,
-  endPaneResize, dashboardRailCanShow, layoutGeometry, splitFitsBoth, threadListCanShow,
+  endPaneResize, dashboardRailCanShow, layoutGeometry, measureLayout, splitFitsBoth, threadListCanShow,
 } from './drawnLayout';
 
 const FLOORS = paneFloors();
@@ -146,6 +147,56 @@ describe('the drawn layout signals', () => {
     endPaneResize();
     expect(document.querySelector('.split-layout')!.classList.contains('pane-animate')).toBe(true);
     document.body.innerHTML = '';
+  });
+
+  it('puts the animate class on before the yield redraws the panes', () => {
+    document.body.innerHTML = '<div class="split-layout"></div>';
+    store(true, true);
+    beginPaneResize();
+    resize(BOTH - 100);
+    const animatingAtRedraw: boolean[] = [];
+    const initial = drawnRailShown.value;
+    const stop = effect(() => {
+      if (drawnRailShown.value !== initial) {
+        animatingAtRedraw.push(document.querySelector('.split-layout')!.classList.contains('pane-animate'));
+      }
+    });
+    try {
+      endPaneResize();
+      expect(animatingAtRedraw).toEqual([true]);
+    } finally {
+      stop();
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('does not animate the first measure, which draws the layout as it stands', () => {
+    document.body.innerHTML = '<div class="split-layout"></div>';
+    const innerWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    Object.defineProperty(window, 'innerWidth', { value: BOTH_SIDES - 1, configurable: true });
+    try {
+      store(true, true);
+      layoutGeometry.value = null;
+      measureLayout();
+      expect(layoutGeometry.value).not.toBeNull();
+      expect(document.querySelector('.split-layout')!.classList.contains('pane-animate')).toBe(false);
+    } finally {
+      if (innerWidth) Object.defineProperty(window, 'innerWidth', innerWidth);
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('re-asks the fit questions when the split ratio changes under a render', () => {
+    resize(ROOMY);
+    let runs = 0;
+    const dispose = effect(() => {
+      threadListCanShow();
+      runs += 1;
+    });
+    const before = runs;
+    splitRatio.value = 0.3;
+    expect(runs).toBeGreaterThan(before);
+    dispose();
   });
 
   it('animates a side pane that yields for room at release, as the Canvas does', () => {

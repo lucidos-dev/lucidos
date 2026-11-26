@@ -1,4 +1,4 @@
-//! One-shot, idempotent backfill of `ContextCaptured` for *auxiliary model
+//! INVARIANT: One-shot, idempotent backfill of `ContextCaptured` for *auxiliary model
 //! calls* the engine made before it started recording them.
 //!
 //! Every row is a *reconstructed capture*: `reconstructed: true`, no `usage`
@@ -26,18 +26,13 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Shared with `image_described_backfill`: one of the four built-in v5
-/// namespaces, so the derivation is reproducible without inventing a private
-/// one. The purpose in the key is what keeps two purposes over one source
-/// event from colliding.
 const BACKFILL_NAMESPACE: Uuid = Uuid::NAMESPACE_OID;
 
-/// Model name for a call whose model nobody wrote down. Never a guess from
+/// INVARIANT: Model name for a call whose model nobody wrote down. Never a guess from
 /// today's preference, which would be wrong for every row predating the last
 /// time it changed.
 const UNKNOWN_MODEL: &str = "unknown";
 
-/// One auxiliary call to rebuild.
 struct Reconstruction {
     source_event_id: Uuid,
     thread_id: Uuid,
@@ -46,7 +41,7 @@ struct Reconstruction {
     model: String,
 }
 
-/// The stable id for one reconstruction, so a rerun collides instead of
+/// INVARIANT: The stable id for one reconstruction, so a rerun collides instead of
 /// duplicating.
 ///
 /// The key embeds the purpose's `Debug` name, which couples the id to that
@@ -58,25 +53,7 @@ pub fn derive_backfill_id(source_event_id: Uuid, purpose: ContextPurpose) -> Uui
     Uuid::new_v5(&BACKFILL_NAMESPACE, key.as_bytes())
 }
 
-/// The instant live capture began. Only calls before it are history.
-///
-/// **Without this the pass reconstructs calls the live paths already
-/// captured.** A live capture carries a random event id, which the
-/// derived-id check in `write_missing` cannot see. Every title, description,
-/// extraction and image made after this release would then gain a spurious
-/// twin on the next restart. The reconstructions are exactly the rows an aux
-/// call count reads, so that doubles what this feature exists to report.
-///
-/// The earliest live auxiliary capture is when recording began. With none
-/// yet, the whole store predates recording and `now()` bounds it: a call made
-/// during this boot is captured live, whether or not this pass has reached
-/// its source event.
-///
-/// Resolved entirely on the database clock (ADR 0053). A host-computed
-/// instant compared against `events.created` puts two clocks either side of
-/// one `<`, and a drifted DB clock would silently disable the bound.
 async fn history_ends_at(pool: &PgPool) -> Result<DateTime<Utc>, sqlx::Error> {
-    // LEAST ignores NULL, so the no-live-captures case yields `now()`.
     sqlx::query_scalar(
         "SELECT LEAST((SELECT min(created) FROM events \
                         WHERE event_type = 'ContextCaptured' \
@@ -87,13 +64,6 @@ async fn history_ends_at(pool: &PgPool) -> Result<DateTime<Utc>, sqlx::Error> {
     .await
 }
 
-/// Rebuild every auxiliary call the three sources can account for. Returns
-/// how many rows were written. A rerun returns 0.
-///
-/// The sources are independent, so one that fails is logged and skipped
-/// rather than costing the others. This is a background accounting pass with
-/// no user-facing surface to fail into, and a partial reconstruction beats
-/// none.
 pub async fn backfill_auxiliary_captures(
     pool: &PgPool,
     event_bus: &EventBus,
@@ -105,7 +75,7 @@ pub async fn backfill_auxiliary_captures(
             ContextPurpose::ImageDescribe,
             image_describe_calls(pool, until).await,
         ),
-        // No `ConversationSummary` arm, deliberately. Every historical
+        // INVARIANT: No `ConversationSummary` arm, deliberately. Every historical
         // summariser call really was stamped `memory`, so reconstructing one
         // under the newer purpose would relabel the past.
         (ContextPurpose::Memory, memory_calls(pool, until).await),
@@ -135,11 +105,6 @@ pub async fn backfill_auxiliary_captures(
     Ok(total)
 }
 
-/// Write the reconstructions that are not already present.
-///
-/// The existence check is one primary-key lookup over the derived ids, rather
-/// than an anti-join per source. The ids are deterministic, so asking about
-/// them directly is cheaper and simpler than matching on payload shape.
 async fn write_missing(
     pool: &PgPool,
     event_bus: &EventBus,
@@ -170,7 +135,6 @@ async fn write_missing(
             purpose,
             &call.model,
             call.request_chars,
-            // No usage, ever. See this module's header.
             None,
             true,
         );
@@ -182,8 +146,6 @@ async fn write_missing(
                 event_type: "ContextCaptured",
                 payload: &event.to_payload(&EventMeta::NONE),
                 thread_id: Some(call.thread_id),
-                // The source event's own timestamp, so a reconstruction lands
-                // on the day the call happened, not the day this pass ran.
                 created: Some(call.created),
                 broadcast: false,
             })
@@ -195,14 +157,6 @@ async fn write_missing(
     Ok(written)
 }
 
-/// One description call per source message, NOT per `ImageDescribed` row.
-/// The live path emits one row per attached image from a single call, so
-/// counting rows would multiply calls by the attachment count.
-///
-/// The estimate is a floor: the images are not recoverable. This is also the
-/// only source that recorded its model. The literal `"backfill"` is what the
-/// earlier `ImageDescribed` backfill stamped for an unknown model, and it
-/// stays unknown here.
 async fn image_describe_calls(
     pool: &PgPool,
     until: DateTime<Utc>,
@@ -239,15 +193,6 @@ async fn image_describe_calls(
         .collect())
 }
 
-/// One extraction per source event, however many facts it produced. An
-/// extraction that returned nothing wrote no row and is invisible here.
-///
-/// The request size is the source event's payload plus the extraction
-/// instruction. The payload is a superset of the extracted text, so this one
-/// slightly over-counts where every other unknown under-counts.
-///
-/// A workspace with no `memory_entries` table made no memory calls, which is
-/// not a failure.
 async fn memory_calls(
     pool: &PgPool,
     until: DateTime<Utc>,
@@ -280,7 +225,7 @@ async fn memory_calls(
         .collect())
 }
 
-/// One image per SUCCEEDED `generate_image` tool call. These carry no tokens
+/// INVARIANT: One image per SUCCEEDED `generate_image` tool call. These carry no tokens
 /// at all, which is why the row matters: without it the call leaves no trace
 /// in the ledger whatsoever.
 ///
@@ -373,8 +318,6 @@ mod tests {
         .expect("insert source event");
     }
 
-    /// One image-description call, as the live path records it: one
-    /// `ImageDescribed` per attached image, all naming the same source.
     async fn describe_call(
         pool: &PgPool,
         thread: Uuid,
@@ -398,8 +341,6 @@ mod tests {
         .await;
     }
 
-    /// Rebuilt rows only. A live capture carries the same purpose, so a test
-    /// that seeds one would otherwise count it as a reconstruction.
     async fn reconstructions(pool: &PgPool, purpose: &str) -> Vec<(Value, DateTime<Utc>)> {
         sqlx::query_as(
             "SELECT payload, created FROM events \
@@ -419,9 +360,6 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// The shape every reconstructed row must have: an auxiliary producer, no
-    /// usage block, and the reconstructed marker. The missing usage is what
-    /// keeps these estimates out of a rollup that reports measured spend.
     #[tokio::test]
     async fn a_reconstruction_carries_no_usage() {
         let (pool, db_name) = setup_test_db().await;
@@ -454,9 +392,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A reconstruction is dated when the call happened. Without this every
-    /// row would file into the day the backfill ran, which for a cost report
-    /// is a spike that never occurred.
     #[tokio::test]
     async fn a_reconstruction_keeps_the_original_timestamp() {
         let (pool, db_name) = setup_test_db().await;
@@ -470,8 +405,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The pass runs on every engine start, so a rerun writing anything would
-    /// duplicate the whole history once per boot.
     #[tokio::test]
     async fn a_rerun_writes_nothing() {
         let (pool, db_name) = setup_test_db().await;
@@ -506,8 +439,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A `ThreadTitleGenerated` says nothing about whether a model ran, so no
-    /// title is ever reconstructed. Three of its four emitters call none.
     #[tokio::test]
     async fn a_title_is_never_reconstructed() {
         let (pool, db_name) = setup_test_db().await;
@@ -541,9 +472,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// One call described every image on the message, so the row count is
-    /// per source message. Counting `ImageDescribed` rows instead would
-    /// multiply the call count by the attachment count.
     #[tokio::test]
     async fn a_multi_image_message_is_one_description_call() {
         let (pool, db_name) = setup_test_db().await;
@@ -566,8 +494,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The earlier `ImageDescribed` backfill stamped a literal `"backfill"`
-    /// where the model was unknown. That is not a model name.
     #[tokio::test]
     async fn a_backfilled_description_model_reads_as_unknown() {
         let (pool, db_name) = setup_test_db().await;
@@ -584,22 +510,13 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A call the live paths already captured must not be reconstructed too.
-    ///
-    /// The live capture carries a random event id, so the derived-id check
-    /// cannot see it. Without the cutoff, every auxiliary call after this
-    /// release gained a spurious twin on the next restart. That doubles the
-    /// very count these rows exist to report.
     #[tokio::test]
     async fn a_call_already_captured_live_is_not_reconstructed() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _cb) = EventBus::new(pool.clone());
         let thread = Uuid::new_v4();
 
-        // History: described before recording began.
         describe_call(&pool, thread, Uuid::new_v4(), "m", day(8)).await;
-        // Recording begins: a live capture, random id and no reconstructed
-        // marker, exactly as `AuxCapture::record` writes one.
         insert_event(
             &pool,
             Uuid::new_v4(),
@@ -618,7 +535,6 @@ mod tests {
             day(9),
         )
         .await;
-        // The description that live capture belongs to.
         describe_call(&pool, thread, Uuid::new_v4(), "m", day(9)).await;
 
         assert_eq!(
@@ -634,8 +550,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// With no live capture yet the whole store is history, bounded by the
-    /// database's own clock rather than the engine host's (ADR 0053).
     #[tokio::test]
     async fn everything_before_now_is_history_until_recording_begins() {
         let (pool, db_name) = setup_test_db().await;
@@ -650,10 +564,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A `generate_image` call that never reached the provider cost nothing.
-    ///
-    /// Four checks refuse before the provider runs, and each still leaves a
-    /// `ToolCalled` behind. Reconstructing those invents billed images.
     #[tokio::test]
     async fn a_failed_image_call_is_not_reconstructed() {
         let (pool, db_name) = setup_test_db().await;
@@ -661,7 +571,6 @@ mod tests {
         let thread = Uuid::new_v4();
 
         let call = json!({ "name": "generate_image", "args": { "prompt": "a red car" } });
-        // Refused by the vision-misuse guard: no provider request happened.
         insert_event(
             &pool,
             Uuid::new_v4(),
@@ -680,7 +589,6 @@ mod tests {
             day(8),
         )
         .await;
-        // A real one, later in the same thread.
         insert_event(&pool, Uuid::new_v4(), thread, "ToolCalled", call, day(9)).await;
         insert_event(
             &pool,
@@ -705,8 +613,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// An image call with no result at all cannot be confirmed. The engine may
-    /// have died after paying, but under-counting beats inventing.
     #[tokio::test]
     async fn an_image_call_with_no_result_is_not_reconstructed() {
         let (pool, db_name) = setup_test_db().await;
@@ -727,11 +633,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A result-less call must not borrow the NEXT call's success.
-    ///
-    /// Taking the first later result is not enough on its own: with a second
-    /// call in between, that result belongs to the second one. The pairing
-    /// stops at the next `generate_image` call for exactly this shape.
     #[tokio::test]
     async fn a_result_less_call_does_not_borrow_the_next_call() {
         let (pool, db_name) = setup_test_db().await;
@@ -739,7 +640,6 @@ mod tests {
         let thread = Uuid::new_v4();
         let call = json!({ "name": "generate_image", "args": { "prompt": "a red car" } });
 
-        // First call: the engine died before any result.
         insert_event(
             &pool,
             Uuid::new_v4(),
@@ -749,7 +649,6 @@ mod tests {
             day(8),
         )
         .await;
-        // Second call, with its own success.
         insert_event(&pool, Uuid::new_v4(), thread, "ToolCalled", call, day(9)).await;
         insert_event(
             &pool,
@@ -772,9 +671,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// An explicitly paired result wins over chronology. The recovery sweep
-    /// backfills a synthetic result that can land after later calls, which is
-    /// the whole reason `tool_called_event_id` exists.
     #[tokio::test]
     async fn an_explicitly_paired_result_is_used() {
         let (pool, db_name) = setup_test_db().await;
@@ -784,7 +680,6 @@ mod tests {
         let call = json!({ "name": "generate_image", "args": { "prompt": "a red car" } });
 
         insert_event(&pool, orphan, thread, "ToolCalled", call.clone(), day(8)).await;
-        // A later call sits between the orphan and its recovered result.
         insert_event(&pool, Uuid::new_v4(), thread, "ToolCalled", call, day(9)).await;
         insert_event(
             &pool,
@@ -820,8 +715,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A legacy `ToolResult` predating the `success` field reads as success,
-    /// matching the event's own serde default.
     #[tokio::test]
     async fn a_legacy_image_result_without_success_counts_as_one() {
         let (pool, db_name) = setup_test_db().await;
@@ -852,7 +745,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Two purposes over one source event must not collide on the derived id.
     #[test]
     fn the_derived_id_separates_purposes() {
         let source = Uuid::new_v4();

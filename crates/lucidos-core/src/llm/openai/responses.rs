@@ -1,7 +1,3 @@
-//! OpenAI Responses API path (GPT-5+ / codex models) for `OpenAiProvider`.
-//! The struct, shared stream types, and dispatch live in the parent `openai`
-//! module.
-
 use crate::llm::chatgpt_plan::{ChatGptPlanError, ChatGptPlanFailure, TOOL_NAMESPACE};
 use crate::llm::openai_wire::MAX_EXPLICIT_BREAKPOINTS;
 use crate::llm::prefill::{pair_of, BeatShape, PrefillPair, StableEnd, TurnRoute};
@@ -19,17 +15,6 @@ use super::{
 };
 
 impl OpenAiProvider {
-    /// Convert internal messages to Responses API input items.
-    ///
-    /// Responses API uses a flat array of typed items:
-    /// - `{"role": "user"|"assistant", "content": "..."}`, or typed
-    ///   `input_text` / `input_image` parts when the message holds an image
-    ///   or a cache mark
-    /// - `{"type": "function_call", "id": "...", "call_id": "...", "name": "...", "arguments": "..."}`
-    /// - `{"type": "function_call_output", "call_id": "...", "output": "..."}`
-    ///
-    /// `breakpoints` is how many marks the request may carry, or `None` for
-    /// a model that takes none ([`super::takes_cache_breakpoints`]).
     fn convert_messages_responses(
         messages: &[Message],
         breakpoints: Option<usize>,
@@ -66,9 +51,6 @@ impl OpenAiProvider {
 
                     for block in blocks {
                         match block {
-                            // A tail block is ordinary text here. Only the
-                            // engine and the Anthropic cache anchor care who
-                            // wrote it.
                             ContentBlock::Text { text }
                             | ContentBlock::EngineTail { text }
                             | ContentBlock::MemoryView { text }
@@ -82,10 +64,6 @@ impl OpenAiProvider {
                                 ..
                             } => {
                                 pending.flush(&mut input, "assistant");
-                                // Responses API requires function_call "id" to start
-                                // with "fc_".  Our internal ToolUse.id stores the
-                                // call_id from the API (starts with "call_"), so
-                                // derive an fc-prefixed item id for the "id" field.
                                 let item_id = if id.starts_with("fc_") {
                                     id.clone()
                                 } else {
@@ -130,12 +108,6 @@ impl OpenAiProvider {
         input
     }
 
-    /// Convert internal tool definitions to Responses API format (flat, no "function" wrapper).
-    /// Explicitly sets `strict: false` because our schemas have optional parameters and
-    /// freeform objects (e.g. http_request headers) that aren't compatible with strict mode
-    /// (which requires `additionalProperties: false` and all properties in `required`).
-    /// The Responses API defaults `strict` to `true`, so without this the API rejects our
-    /// tool schemas with a 400 error and the model never sees the tools.
     fn convert_tools_responses(tools: &[ToolDefinition]) -> Option<Vec<serde_json::Value>> {
         if tools.is_empty() {
             return None;
@@ -156,13 +128,10 @@ impl OpenAiProvider {
         )
     }
 
-    /// The Responses API `tool_choice` that makes the model call `tool`.
     fn forced_tool_choice_responses(tool: &str) -> serde_json::Value {
         serde_json::json!({ "type": "function", "name": tool })
     }
 
-    /// The plan route's tool list: every function inside one namespace, as
-    /// its docs require.
     fn namespaced_tools(functions: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         vec![serde_json::json!({
             "type": "namespace",
@@ -172,16 +141,6 @@ impl OpenAiProvider {
         })]
     }
 
-    /// `model` is the one sent, already resolved. The rest of the request's
-    /// options come from `selection`.
-    ///
-    /// The plan endpoint sends its own profile (ADR 0636): no output cap, no
-    /// tier, no cache marks, and tools in a namespace. Each field it drops is
-    /// one the plan route refuses or the docs say to omit.
-    ///
-    /// A forced tool keeps its tools top-level, which the plan route accepts.
-    /// A `tool_choice` has no namespace field, so it may not name a function
-    /// inside one.
     pub(super) fn build_responses_body(
         &self,
         model: &str,
@@ -200,7 +159,6 @@ impl OpenAiProvider {
         );
         let mut input = Self::convert_messages_responses(messages, breakpoints);
         if namespaced {
-            // A replayed call names the namespace its function lives in.
             for item in input.iter_mut().filter(|i| i["type"] == "function_call") {
                 item["namespace"] = TOOL_NAMESPACE.into();
             }
@@ -210,7 +168,7 @@ impl OpenAiProvider {
             "model": model,
             "stream": true,
             "input": input,
-            // Opt out of OpenAI's server-side response storage: the Responses
+            // INVARIANT: Opt out of OpenAI's server-side response storage: the Responses
             // API defaults to `store: true` and keeps the response object
             // (prompt and output alike) for at least 30 days. We are stateless
             // by construction, since `convert_messages_responses` rebuilds the
@@ -239,7 +197,7 @@ impl OpenAiProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
-        // Verbatim, deliberately. Which tiers this model supports is decided
+        // INVARIANT: Verbatim, deliberately. Which tiers this model supports is decided
         // once, in `llm::reasoning`, and enforced by `RoutingProvider`'s clamp;
         // a second per-model rule here is what let the picker and the wire
         // disagree (see `llm/reasoning.rs`).
@@ -258,15 +216,6 @@ impl OpenAiProvider {
         body
     }
 
-    /// Parse an SSE stream from the Responses API.
-    ///
-    /// Responses API SSE format uses `event: <type>` + `data: <json>` pairs.
-    /// Key events:
-    /// - `response.output_text.delta` — text content
-    /// - `response.output_item.added` (function_call) — new tool call
-    /// - `response.function_call_arguments.delta` — streaming args
-    /// - `response.function_call_arguments.done` — finalized args
-    /// - `response.completed` / `response.failed` — stream end
     async fn parse_responses_stream(
         &self,
         response: reqwest::Response,
@@ -274,7 +223,6 @@ impl OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
-        // Bytes of a character the transport split across two chunks.
         let mut carry: Vec<u8> = Vec::new();
         let chunk_timeout = Duration::from_secs(CHUNK_TIMEOUT_SECS);
 
@@ -339,12 +287,11 @@ impl OpenAiProvider {
                             on_token.is_some() && prev_len > 0,
                             STREAM_LOG_TAG,
                         ),
-                        // Kept typed, so the limit pause can read it.
                         Ok(plan) => plan,
                     })?;
                     if content.len() > prev_len {
                         if let Some(cb) = on_token {
-                            // Floor defensively — `prev_len` is a byte length
+                            // INVARIANT: Floor defensively — `prev_len` is a byte length
                             // captured before the chunk appended, so a future
                             // accumulator change could leave it mid-codepoint.
                             cb(&content[content.floor_char_boundary(prev_len)..]);
@@ -361,7 +308,6 @@ impl OpenAiProvider {
         Self::build_llm_response(content, tool_calls, meta)
     }
 
-    /// Finds an announced call by its item id, then by its call id.
     fn find_call(
         tool_calls: &[AccumulatedToolCall],
         item_id_map: &HashMap<String, usize>,
@@ -380,8 +326,6 @@ impl OpenAiProvider {
             .filter(|&idx| idx < tool_calls.len())
     }
 
-    /// Applies a finished frame: its arguments replace the streamed ones and
-    /// its name fills a blank one.
     fn settle_call(tc: &mut AccumulatedToolCall, name: Option<&str>, arguments: Option<&str>) {
         if let Some(args) = arguments.filter(|a| !a.is_empty()) {
             tc.arguments_json = args.to_string();
@@ -391,7 +335,6 @@ impl OpenAiProvider {
         }
     }
 
-    /// Process a single Responses API SSE event. Returns `true` when the stream is done.
     fn process_responses_chunk(
         provider: &str,
         event_type: &str,
@@ -457,8 +400,6 @@ impl OpenAiProvider {
                 }
             }
 
-            // The finished frames carry the full arguments and are
-            // authoritative over any delta that was missed.
             "response.function_call_arguments.done" => {
                 let item_id = data.get("item_id").and_then(|i| i.as_str()).unwrap_or("");
                 let call_id = data.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
@@ -495,7 +436,7 @@ impl OpenAiProvider {
                 }
             }
 
-            // Both terminal events carry the full Response object with its
+            // INVARIANT: Both terminal events carry the full Response object with its
             // usage block and a status. `response.incomplete` adds the
             // `incomplete_details` reason, such as `max_output_tokens`. Missing
             // it read a cut-off turn as a truncated stream, and retried it.
@@ -506,8 +447,6 @@ impl OpenAiProvider {
                 return Ok(true);
             }
 
-            // A top-level `error` event carries `code` and `message` on the
-            // event itself.
             "response.failed" | "error" => {
                 let error_object = data
                     .pointer("/response/error")
@@ -525,7 +464,6 @@ impl OpenAiProvider {
         Ok(false)
     }
 
-    /// Responses API flow with retry logic.
     pub(super) async fn chat_responses(
         &self,
         messages: &[Message],
@@ -549,7 +487,6 @@ impl OpenAiProvider {
             },
         );
 
-        // Debug: log tool count and names
         if let Some(tools_arr) = body.get("tools").and_then(|t| t.as_array()) {
             let names: Vec<&str> = tools_arr
                 .iter()
@@ -675,7 +612,7 @@ impl OpenAiProvider {
                     });
                 }
                 Err(e) => {
-                    // A mid-stream plan failure may follow rendered text, so it
+                    // INVARIANT: A mid-stream plan failure may follow rendered text, so it
                     // ends the turn rather than re-sending.
                     if let Some(plan_error) = e.downcast_ref::<ChatGptPlanError>() {
                         self.observe_plan_failure(plan_error).await;
@@ -692,7 +629,6 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// Log a plan failure, and pause plan requests when it is the limit.
     pub(super) async fn observe_plan_failure(&self, error: &ChatGptPlanError) {
         log_legacy!("[OpenAI] ChatGPT plan error: {}", error.log_line());
         if let Some(access) = self.plan_access() {
@@ -701,17 +637,14 @@ impl OpenAiProvider {
     }
 }
 
-/// What the retry loop does after an HTTP error status.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum HttpFailureStep {
-    /// Refresh the plan token, then send again.
     Refresh,
-    /// Back off, then send again.
     Backoff,
     Fail,
 }
 
-/// The step after an HTTP error. `plan_failure` is the classified body on the
+/// INVARIANT: The step after an HTTP error. `plan_failure` is the classified body on the
 /// plan endpoint.
 ///
 /// The platform keeps its old rule. The plan route never retries a 429 in
@@ -742,20 +675,10 @@ pub(super) fn http_failure_step(
     }
 }
 
-/// Explicit breakpoints a request may carry. A request writes the cache at
-/// most four times, and the default mode spends one at the end of the latest
-/// message.
 pub(crate) const MAX_BREAKPOINTS: usize = 3;
 
-/// The most output a Responses prefill allows: the API's minimum
-/// `max_output_tokens`. Probe P5 settled that a beat capped there reads.
 const RESPONSES_OUTPUT_CAP: u32 = 16;
 
-/// The pair a beat on a Responses request sends. The stable cut ends at the
-/// last part that carries a breakpoint, where the turn wrote an entry.
-///
-/// `None` when no part carries one: a model before GPT-5.6, or a request with
-/// no memory view. A cut there would make the beat write, not read.
 fn prefill_pair(body: &serde_json::Value, route: TurnRoute<'_>) -> Option<PrefillPair> {
     let input = body.get("input")?.as_array()?;
     let end = input.iter().enumerate().rev().find_map(|(item, value)| {
@@ -778,7 +701,7 @@ fn prefill_pair(body: &serde_json::Value, route: TurnRoute<'_>) -> Option<Prefil
     )
 }
 
-/// A user message holding memory view blocks, as typed text parts. Each
+/// INVARIANT: A user message holding memory view blocks, as typed text parts. Each
 /// memory view block takes a breakpoint, so a later request that marks the
 /// same place reads the cache up to there. A read needs a breakpoint in the
 /// very same place, which is why the view marks fixed places.
@@ -819,7 +742,6 @@ fn marked_parts(
         .collect()
 }
 
-/// A block's non-empty text, and whether it is a memory view block.
 fn marked_text(block: &ContentBlock) -> Option<(&str, bool)> {
     let (text, marked) = match block {
         ContentBlock::MemoryView { text } => (text, true),
@@ -831,7 +753,6 @@ fn marked_text(block: &ContentBlock) -> Option<(&str, bool)> {
     (!text.is_empty()).then_some((text.as_str(), marked))
 }
 
-/// An image as a Responses `input_image` part, inlined as a data URL.
 fn input_image(media_type: &str, data: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "input_image",
@@ -840,13 +761,11 @@ fn input_image(media_type: &str, data: &str) -> serde_json::Value {
     })
 }
 
-/// The text and images of one message item, gathered in block order. A label
+/// INVARIANT: The text and images of one message item, gathered in block order. A label
 /// between two images must stay between them.
 #[derive(Default)]
 struct PendingMessage {
-    /// Adjacent text not yet folded into `parts`.
     texts: Vec<String>,
-    /// Typed parts so far. Stays empty for a message with no image.
     parts: Vec<serde_json::Value>,
 }
 
@@ -856,7 +775,6 @@ impl PendingMessage {
         self.parts.push(input_image(media_type, data));
     }
 
-    /// Fold the adjacent text into one `input_text` part.
     fn fold_text(&mut self) {
         let text = self.texts.join("\n");
         self.texts.clear();
@@ -866,8 +784,6 @@ impl PendingMessage {
         }
     }
 
-    /// Push what was gathered as one message item, and start over. Text alone
-    /// stays one joined string.
     fn flush(&mut self, input: &mut Vec<serde_json::Value>, role: &str) {
         let content = if !self.parts.is_empty() {
             self.fold_text();
@@ -926,9 +842,6 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// An attached image reaches the model as an `input_image` part after the
-    /// text. Which models read images is the vision flag's call, not this
-    /// wire's.
     #[test]
     fn an_attached_image_travels_as_an_input_image_part() {
         let input = OpenAiProvider::convert_messages_responses(
@@ -949,8 +862,6 @@ mod tests {
         );
     }
 
-    /// A tool's image rides after its function call output, in a user
-    /// message, so the output still directly follows its call.
     #[test]
     fn a_tool_image_follows_the_function_call_output() {
         let input = OpenAiProvider::convert_messages_responses(
@@ -972,8 +883,6 @@ mod tests {
         assert_eq!(images[0]["image_url"], "data:image/png;base64,BBBB");
     }
 
-    /// A message marked for the cache keeps its image, and the image takes no
-    /// breakpoint.
     #[test]
     fn a_marked_message_keeps_its_image_unmarked() {
         let input = OpenAiProvider::convert_messages_responses(
@@ -987,8 +896,6 @@ mod tests {
         assert_eq!(parts.last().unwrap()["type"], "input_image");
     }
 
-    /// A label between two images stays between them, on both paths, so the
-    /// "[Below: image attached to current message]" label names the right one.
     #[test]
     fn a_label_between_images_keeps_its_place() {
         let blocks = || {
@@ -1039,9 +946,6 @@ mod tests {
         );
     }
 
-    /// A memory view block is a cache mark on this wire too: it travels as its
-    /// own part with a breakpoint, so a later request marking the same place
-    /// reads up to it.
     #[test]
     fn a_memory_view_block_takes_a_breakpoint() {
         let input = OpenAiProvider::convert_messages_responses(
@@ -1061,8 +965,6 @@ mod tests {
         assert_eq!(joined, "<chat>\na\nb\nc\n</chat>\nthe task");
     }
 
-    /// The stable context block is plain text here, with or without
-    /// breakpoints: this wire never marks it (I8).
     #[test]
     fn a_stable_context_block_is_plain_text_on_this_wire() {
         let stable = || ContentBlock::StableContext {
@@ -1082,8 +984,6 @@ mod tests {
         assert_eq!(joined[0]["content"], "profile\nthe task");
     }
 
-    /// A message with no memory view block, which is every Classic message,
-    /// keeps its one joined string.
     #[test]
     fn a_message_with_no_memory_view_block_stays_one_string() {
         let input = OpenAiProvider::convert_messages_responses(
@@ -1093,8 +993,6 @@ mod tests {
         assert_eq!(input[0]["content"], "a\nb");
     }
 
-    /// A model before GPT-5.6 refuses a breakpoint with a 400, so a message
-    /// holding a memory view block goes to it as one joined string.
     #[test]
     fn a_model_without_breakpoints_gets_the_joined_string() {
         assert!(!super::super::takes_cache_breakpoints("gpt-5.5"));
@@ -1108,8 +1006,6 @@ mod tests {
         assert_eq!(input[0]["content"], "<chat>\na\n\nthe task");
     }
 
-    /// Breakpoints stop at three, since the default mode writes at the end of
-    /// the latest message too and a request allows four writes.
     #[test]
     fn a_request_carries_at_most_three_breakpoints() {
         let blocks = (0..5).map(|i| view(&format!("block {i}\n"))).collect();
@@ -1124,10 +1020,6 @@ mod tests {
         assert_eq!(marked, MAX_BREAKPOINTS);
     }
 
-    /// The Responses API retains response objects for at least 30 days under
-    /// its `store: true` default. We rebuild the full history as `input` on
-    /// every turn and never read a stored response back, so every request must
-    /// carry the opt-out.
     #[test]
     fn responses_body_opts_out_of_server_side_storage() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
@@ -1147,9 +1039,6 @@ mod tests {
         assert_eq!(body["store"], false);
     }
 
-    /// Explicit mode turns off the write at the end and frees its slot for a
-    /// fourth mark. A turn keeps implicit mode, since its next request reads
-    /// what that end write stored.
     #[test]
     fn explicit_mode_writes_only_at_the_marks() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-6.1-sol".to_string()).unwrap();
@@ -1186,8 +1075,6 @@ mod tests {
         );
     }
 
-    /// Flex goes on the body only when the selection asks for it, so every
-    /// other call keeps OpenAI's standard tier.
     #[test]
     fn responses_body_asks_for_flex_only_when_selected() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-6.1-sol".to_string()).unwrap();
@@ -1204,8 +1091,6 @@ mod tests {
         assert_eq!(body["service_tier"], "flex");
     }
 
-    /// The completed response names the tier that served it, which the
-    /// capture records so the call is priced at that tier's rate.
     #[test]
     fn the_served_tier_is_read_from_the_completed_response() {
         let mut content = String::new();
@@ -1236,8 +1121,6 @@ mod tests {
         assert_eq!(meta.service_tier, None, "the standard tier records nothing");
     }
 
-    /// The Responses API names the function at the top level, unlike Chat
-    /// Completions.
     #[test]
     fn a_forced_call_names_its_function() {
         assert_eq!(
@@ -1246,10 +1129,6 @@ mod tests {
         );
     }
 
-    /// Sibling of `chat_body_sends_the_reasoning_effort_verbatim`: the two
-    /// builders shared the per-model rewrite, so they must both stay verbatim
-    /// or they drift apart again. `llm::reasoning` decides the tiers;
-    /// `RoutingProvider` enforces them.
     #[test]
     fn responses_body_sends_the_reasoning_effort_verbatim() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
@@ -1265,10 +1144,6 @@ mod tests {
         }
     }
 
-    /// The Responses API `response.completed` terminal event carries the
-    /// full Response object (usage + status). We must absorb both into the
-    /// per-turn meta so codex-model traffic has stop_reason + token parity
-    /// with Chat Completions.
     #[test]
     fn responses_stream_captures_completion_usage_and_status() {
         let mut content = String::new();
@@ -1276,7 +1151,6 @@ mod tests {
         let mut item_id_map: HashMap<String, usize> = HashMap::new();
         let mut meta = StreamMeta::default();
 
-        // Mid-stream text delta.
         OpenAiProvider::process_responses_chunk(
             "OpenAI",
             "response.output_text.delta",
@@ -1288,7 +1162,6 @@ mod tests {
         )
         .unwrap();
 
-        // Terminal event — `meta` populated from the embedded Response.
         let done = OpenAiProvider::process_responses_chunk("OpenAI", 
             "response.completed",
             r#"{"response":{"status":"completed","model":"gpt-5.6-luna-2026-04-01","usage":{"input_tokens":11,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}}"#,
@@ -1301,8 +1174,6 @@ mod tests {
         assert!(done, "response.completed must terminate the stream");
 
         assert_eq!(content, "ok");
-        // 11 processed, 4 of them a cache read. `input_tokens` already covers
-        // `input_tokens_details.cached_tokens`, so the two overlap.
         assert_eq!(meta.usage.map(|u| u.input_tokens), Some(11));
         assert_eq!(meta.usage.map(|u| u.output_tokens), Some(3));
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(4));
@@ -1313,9 +1184,6 @@ mod tests {
         );
     }
 
-    /// The overlap, on its own, matching the Chat Completions case exactly.
-    /// One convention across both APIs, or a cost figure depends on which one
-    /// the request happened to take.
     #[test]
     fn a_cached_prefix_overlaps_the_input_total_rather_than_reducing_it() {
         let mut content = String::new();
@@ -1335,8 +1203,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(12));
     }
 
-    /// GPT-5.6 on reports what it wrote to the cache, also as a part of the
-    /// input total. It costs more than plain input, so it is recorded.
     #[test]
     fn a_cache_write_is_recorded_as_part_of_the_input_total() {
         let mut content = String::new();
@@ -1357,8 +1223,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(0));
     }
 
-    /// The `response.completed` data of one live turn, with `usage` details
-    /// and the response's `prompt_cache_options` echo.
     fn completed_response(details: &str, echo: &str) -> LlmResponse {
         let mut content = String::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
@@ -1380,7 +1244,6 @@ mod tests {
         OpenAiProvider::build_llm_response("ok".to_string(), tools, meta).unwrap()
     }
 
-    /// Probe A1 and A3: the write splits by lifetime, and the TTL is reported.
     #[test]
     fn a_responses_write_split_by_lifetime_is_reported() {
         let response = completed_response(
@@ -1398,7 +1261,6 @@ mod tests {
         );
     }
 
-    /// With no split, the echoed TTL names the whole write's lifetime.
     #[test]
     fn the_echoed_ttl_names_the_lifetime_of_a_write_with_no_split() {
         let response = completed_response(
@@ -1415,8 +1277,6 @@ mod tests {
         );
     }
 
-    /// A split whose parts each fit but together claim more than the write is
-    /// dropped, echo or not, so nothing records tokens nobody wrote.
     #[test]
     fn an_over_summed_split_is_dropped() {
         let response = completed_response(
@@ -1434,7 +1294,6 @@ mod tests {
         );
     }
 
-    /// A write with neither a split nor an echo has no known TTL.
     #[test]
     fn a_responses_write_with_no_split_and_no_echo_is_unknown() {
         let response = completed_response(r#"{"cached_tokens":0,"cache_write_tokens":880}"#, "");
@@ -1448,7 +1307,6 @@ mod tests {
         );
     }
 
-    /// A response that read no cache leaves the count unset.
     #[test]
     fn an_input_total_with_no_cache_reports_no_cache_read() {
         let mut content = String::new();
@@ -1469,9 +1327,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(0));
     }
 
-    /// `incomplete_details.reason` takes precedence over `status` when both
-    /// are present — that's where "max_output_tokens" / "content_filter"
-    /// surface for cut-short responses.
     #[test]
     fn responses_stream_prefers_incomplete_reason_over_status() {
         let mut content = String::new();
@@ -1495,8 +1350,6 @@ mod tests {
         assert_eq!(meta.usage.map(|u| u.output_tokens), Some(4096));
     }
 
-    /// A top-level `error` event surfaces its own message, never the generic
-    /// truncation error.
     #[test]
     fn responses_stream_error_event_carries_its_message() {
         let mut content = String::new();
@@ -1520,7 +1373,6 @@ mod tests {
         assert!(err.contains("The server had an error"), "got: {err}");
     }
 
-    /// Feeds `(event, data)` pairs through the parser and returns the calls.
     fn tool_calls_from(events: &[(&str, &str)]) -> Vec<AccumulatedToolCall> {
         let mut content = String::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
@@ -1566,8 +1418,6 @@ mod tests {
         assert_eq!(tools[0].arguments_json, r#"{"id":"x"}"#);
     }
 
-    /// The Responses API keys `function_call_arguments.done` by `item_id`
-    /// and sends no `call_id`.
     #[test]
     fn the_arguments_done_event_is_found_by_item_id() {
         let tools = tool_calls_from(&[
@@ -1649,8 +1499,6 @@ mod tests {
         assert!(tools.is_empty());
     }
 
-    // --- Prefill beats (ADR 0556) ---
-
     const SOL: &str = "gpt-6.1-sol";
 
     fn route(model: &str) -> TurnRoute<'_> {
@@ -1665,8 +1513,6 @@ mod tests {
         serde_json::from_slice(bytes).expect("a body is JSON")
     }
 
-    /// A Tree turn: two memory view blocks and the task, an answer, then a
-    /// follow-up with no view.
     fn tree_turn() -> Vec<Message> {
         vec![
             user(vec![
@@ -1694,9 +1540,6 @@ mod tests {
         body
     }
 
-    /// The whole cut is the turn capped at the API's minimum output and not
-    /// streamed, with its reasoning and tool choice. The stable cut ends at
-    /// the last breakpoint.
     #[test]
     fn a_responses_pair_caps_output_and_cuts_at_the_last_breakpoint() {
         let body = turn_body(SOL, &tree_turn());
@@ -1724,8 +1567,6 @@ mod tests {
         }
     }
 
-    /// The beat writes the bytes the turn writes: the same serializer over
-    /// the same body, edited only where a beat differs (ADR 0581).
     #[test]
     fn a_responses_beat_keeps_the_turns_bytes() {
         let body = turn_body(SOL, &tree_turn());
@@ -1742,8 +1583,6 @@ mod tests {
         assert_eq!(&*pair.stable.body, serde_json::to_vec(&whole).unwrap());
     }
 
-    /// No breakpoint means no entry a beat could read: a model before
-    /// GPT-5.6 takes none, and a Classic turn has no memory view.
     #[test]
     fn a_request_with_no_breakpoint_gets_no_pair() {
         assert!(prefill_pair(&turn_body("gpt-5.5", &tree_turn()), route("gpt-5.5")).is_none());
@@ -1762,8 +1601,6 @@ mod tests {
 
     const PREFILL_REPLY: &str = r#"{"model":"gpt-6.1-sol","status":"incomplete","usage":{"input_tokens":900,"output_tokens":16,"input_tokens_details":{"cached_tokens":880}}}"#;
 
-    /// A turn hands back its pair, and the beat posts the stable cut to the
-    /// Responses endpoint and reads the reply's usage.
     #[tokio::test]
     async fn a_turn_returns_a_pair_whose_beat_reads_the_turn() {
         let (base, bodies) =
@@ -1808,7 +1645,6 @@ mod tests {
         assert_eq!(beat_body, &json(&pair.stable.body));
     }
 
-    /// A history that touches every item kind the Responses wire writes.
     fn every_item_kind() -> Vec<Message> {
         vec![
             user(vec![
@@ -1849,8 +1685,6 @@ mod tests {
             .collect()
     }
 
-    /// A Responses server that records each request's raw bytes and answers
-    /// with one completed turn. Returns the base URL a provider takes.
     async fn serve_raw() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = bodies.clone();
@@ -1867,10 +1701,6 @@ mod tests {
         (format!("http://{addr}/v1"), bodies)
     }
 
-    /// The platform body is byte for byte what the build before the ChatGPT
-    /// plan endpoint sent: a turn with a forced tool and flex, and an
-    /// explicit-mode call. The fixture was written by that build, so
-    /// regenerating it to pass is the failure.
     #[tokio::test]
     async fn the_platform_body_is_byte_identical_to_the_pre_plan_build() {
         let (base, bodies) = serve_raw().await;
@@ -1914,13 +1744,10 @@ mod tests {
         assert_eq!(snapshot, include_str!("responses_platform_body.json"));
     }
 
-    // --- The ChatGPT plan endpoint (ADR 0636) ---
-
     use crate::llm::openai::plan_test_support::{
         plan_provider, plan_refusal, serve_plan, FakeTokens,
     };
 
-    /// Every option the platform would turn into a refused field.
     fn everything_selected() -> ModelSelection<'static> {
         ModelSelection::model(SOL)
             .with_effort(Some("high"))
@@ -1946,9 +1773,6 @@ mod tests {
             })
     }
 
-    /// A plan body carries no refused field, keeps the effort and the
-    /// required `store` and `stream`, and puts tools in the namespace. A
-    /// replayed call names that namespace.
     #[test]
     fn the_plan_body_follows_the_plan_profile() {
         let provider = plan_provider("http://127.0.0.1:9/v1", Default::default());
@@ -1981,8 +1805,6 @@ mod tests {
             .all(|item| item["role"] != "system"));
     }
 
-    /// A forced tool on the plan route keeps its tools top-level, where the
-    /// `tool_choice` can name one, and its replayed calls name no namespace.
     #[test]
     fn a_forced_tool_on_the_plan_route_keeps_tools_top_level() {
         let provider = plan_provider("http://127.0.0.1:9/v1", Default::default());
@@ -2004,8 +1826,6 @@ mod tests {
             .all(|item| item.get("namespace").is_none()));
     }
 
-    /// A plan turn reaches a strict mock with the plan token as its bearer,
-    /// and nothing it sends draws a refusal.
     #[tokio::test]
     async fn a_plan_turn_sends_the_plan_token_and_passes_a_strict_mock() {
         let (base, requests) = serve_plan(|_| (200, COMPLETED_TURN)).await;
@@ -2021,7 +1841,6 @@ mod tests {
 
     const LIMIT_BODY: &str = r#"{"error":{"message":"You have hit your usage limit.","type":"usage_limit","param":null,"code":"subscription_sharing_usage_limit_exceeded"}}"#;
 
-    /// A plan 429 is sent once and fails typed, never retried in place.
     #[tokio::test]
     async fn a_plan_limit_is_not_retried_in_place() {
         let (base, requests) = serve_plan(|_| (429, LIMIT_BODY)).await;
@@ -2032,7 +1851,6 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
-    /// A limit that arrives as `response.failed` mid-stream fails typed too.
     #[tokio::test]
     async fn a_mid_stream_plan_limit_fails_typed() {
         const FAILED: &str = concat!(
@@ -2048,8 +1866,6 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
-    /// After a limit answer the next plan turn fails fast, typed, with no
-    /// request sent.
     #[tokio::test]
     async fn a_plan_limit_pauses_the_next_turn_with_no_request() {
         let (base, requests) = serve_plan(|_| (429, LIMIT_BODY)).await;
@@ -2060,8 +1876,6 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
-    /// A usage limit on the model listing fails typed and starts the pause,
-    /// so the next turn asks nothing.
     #[tokio::test]
     async fn a_limit_on_the_model_listing_fails_typed_and_pauses() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -2092,8 +1906,6 @@ mod tests {
         assert_eq!(listed.load(SeqCst), 1);
     }
 
-    /// A model the plan does not list is refused as not served before any
-    /// request spends the plan. So is a hidden one.
     #[tokio::test]
     async fn a_model_the_plan_does_not_list_is_not_served() {
         let (base, requests) = serve_plan(|_| (200, COMPLETED_TURN)).await;
@@ -2120,7 +1932,6 @@ mod tests {
 
     const INVALID_USER_BODY: &str = r#"{"error":{"message":"invalid user","type":"invalid_request_error","param":null,"code":"subscription_sharing_invalid_user"}}"#;
 
-    /// A rejected token is refreshed once, and the retry carries the new one.
     #[tokio::test]
     async fn a_rejected_plan_token_is_refreshed_once() {
         let (base, requests) = serve_plan(|index| match index {
@@ -2142,8 +1953,6 @@ mod tests {
         assert_eq!(*tokens.rejections.lock().unwrap(), ["plan-token-1"]);
     }
 
-    /// A second rejection after the refresh fails, telling the user to sign
-    /// in again.
     #[tokio::test]
     async fn a_second_rejection_fails() {
         let (base, requests) = serve_plan(|_| (401, INVALID_USER_BODY)).await;
@@ -2155,8 +1964,6 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
-    /// The step table: the platform keeps retrying 429 and 5xx, and the plan
-    /// route backs off only on a passing unavailability or a plain 5xx.
     #[test]
     fn the_plan_route_never_backs_off_on_a_429() {
         use HttpFailureStep::*;
@@ -2186,8 +1993,6 @@ mod tests {
         }
     }
 
-    /// A plan provider refuses a keep-alive beat without sending it: a beat
-    /// spends the user's weekly limit.
     #[tokio::test]
     async fn a_plan_provider_refuses_a_prefill() {
         let (base, requests) = serve_plan(|_| (200, COMPLETED_TURN)).await;
@@ -2204,8 +2009,6 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
     }
 
-    /// The first text or tool-call delta stamps the call trace. A chunk that
-    /// carries no content does not.
     #[tokio::test]
     async fn a_responses_stream_marks_its_first_content() {
         let feed = |event: &'static str, chunk: &'static str| async move {

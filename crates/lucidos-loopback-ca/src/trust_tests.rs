@@ -5,7 +5,6 @@ use std::process::ExitStatus;
 use super::*;
 use crate::LoopbackCa;
 
-/// Records every command and answers each with `answer`.
 struct Fake<F: Fn(&Argv) -> io::Result<Output>> {
     ran: RefCell<Vec<Argv>>,
     answer: F,
@@ -48,7 +47,6 @@ struct Setup {
     stores: Stores,
 }
 
-/// A CA, and a home with a user NSS database and one Firefox profile.
 fn setup(platform: Platform) -> Setup {
     let scratch = tempfile::tempdir().unwrap();
     let ca_dir = CaDir::at(scratch.path().join("ca"));
@@ -73,7 +71,6 @@ fn setup(platform: Platform) -> Setup {
     }
 }
 
-/// Every argument of every command, as text.
 fn every_arg(ran: &[Argv]) -> Vec<String> {
     ran.iter()
         .flat_map(|a| a.args.iter().map(|s| s.to_string_lossy().into_owned()))
@@ -286,8 +283,6 @@ fn a_listing_holds_the_certificate_whatever_its_wrapping() {
     assert!(!holds(b"", pem));
 }
 
-/// A Mac whose login keychain answers `find-certificate` with `found`, and
-/// whose trust commands exit with `remove` and `verify`.
 fn mac(found: String, remove: i32, verify: i32) -> impl Fn(&Argv) -> io::Result<Output> {
     move |argv| match first_arg(argv).as_str() {
         "login-keychain" => output(0, "\"/Users/me/login.keychain-db\"", ""),

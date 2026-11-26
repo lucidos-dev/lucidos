@@ -1,8 +1,6 @@
 use super::msg_helpers::*;
 use super::*;
 
-/// Normal flow: user message -> streaming -> ResponseGenerated.
-/// The response should have completed = Some(true), not interrupted.
 #[test]
 fn completed_response_not_interrupted() {
     let events = vec![
@@ -29,8 +27,6 @@ fn completed_response_not_interrupted() {
     assert_eq!(msgs[1].completed, Some(true));
 }
 
-/// Interruption: user sends follow-up while CC is still streaming.
-/// The interrupted response should have completed = Some(false).
 #[test]
 fn followup_mid_stream_marks_interrupted() {
     let events = vec![
@@ -44,7 +40,6 @@ fn followup_mid_stream_marks_interrupted() {
             json!({"text": "partial response", "request_id": "s1"}),
             1,
         ),
-        // User sends follow-up before ResponseGenerated
         make_event(
             "MessageReceived",
             json!({"text": "actually do this instead", "request_id": "s1"}),
@@ -63,7 +58,6 @@ fn followup_mid_stream_marks_interrupted() {
     ];
     let msgs = build_session_messages(&events);
 
-    // Expected: user, assistant(interrupted), user, assistant(completed)
     assert_eq!(msgs.len(), 4);
     assert_eq!(msgs[0].role, "user");
     assert_eq!(msgs[0].content, "do something");
@@ -83,8 +77,6 @@ fn followup_mid_stream_marks_interrupted() {
     assert_eq!(msgs[3].completed, Some(true));
 }
 
-/// Still-in-progress: streaming text exists but no ResponseGenerated yet
-/// (session still active or engine crashed). Should be completed = None, NOT false.
 #[test]
 fn trailing_buffer_not_marked_interrupted() {
     let events = vec![
@@ -98,7 +90,6 @@ fn trailing_buffer_not_marked_interrupted() {
             json!({"text": "still working...", "request_id": "s1"}),
             1,
         ),
-        // No ResponseGenerated — session still active
     ];
     let msgs = build_session_messages(&events);
     assert_eq!(msgs.len(), 2);
@@ -110,8 +101,6 @@ fn trailing_buffer_not_marked_interrupted() {
     );
 }
 
-/// Two exchanges: first interrupted, second still in progress (trailing buffer).
-/// Only the first should be marked as interrupted.
 #[test]
 fn interrupted_then_trailing_buffer() {
     let events = vec![
@@ -125,7 +114,6 @@ fn interrupted_then_trailing_buffer() {
             json!({"text": "response1", "request_id": "s1"}),
             1,
         ),
-        // Follow-up interrupts
         make_event(
             "MessageReceived",
             json!({"text": "msg2", "request_id": "s1"}),
@@ -136,12 +124,10 @@ fn interrupted_then_trailing_buffer() {
             json!({"text": "response2", "request_id": "s1"}),
             3,
         ),
-        // No ResponseGenerated — second exchange still in progress
     ];
     let msgs = build_session_messages(&events);
     assert_eq!(msgs.len(), 4);
 
-    // First response: interrupted (flushed by MessageReceived)
     assert_eq!(msgs[1].role, "assistant");
     assert_eq!(
         msgs[1].completed,
@@ -149,7 +135,6 @@ fn interrupted_then_trailing_buffer() {
         "first response was interrupted"
     );
 
-    // Second response: still in progress (trailing buffer)
     assert_eq!(msgs[3].role, "assistant");
     assert_eq!(
         msgs[3].completed, None,
@@ -157,8 +142,6 @@ fn interrupted_then_trailing_buffer() {
     );
 }
 
-/// Follow-up after idle: user sends a second message after the first response
-/// completed normally. Neither response should be marked as interrupted.
 #[test]
 fn followup_after_completed_not_interrupted() {
     let events = vec![
@@ -177,7 +160,6 @@ fn followup_after_completed_not_interrupted() {
             json!({"text": "resp1", "channel": "claude_code", "request_id": "s1"}),
             2,
         ),
-        // Second message after completion
         make_event(
             "MessageReceived",
             json!({"text": "msg2", "request_id": "s1"}),
@@ -208,7 +190,6 @@ fn followup_after_completed_not_interrupted() {
     );
 }
 
-/// TextStreamed (non-CC) interruption: same semantics apply to regular chat.
 #[test]
 fn text_streamed_followup_mid_stream_marks_interrupted() {
     let events = vec![
@@ -222,7 +203,6 @@ fn text_streamed_followup_mid_stream_marks_interrupted() {
             json!({"text": "partial", "request_id": "s1"}),
             1,
         ),
-        // Follow-up interrupts
         make_event(
             "MessageReceived",
             json!({"text": "q2", "request_id": "s1"}),
@@ -249,8 +229,6 @@ fn text_streamed_followup_mid_stream_marks_interrupted() {
     assert_eq!(msgs[3].completed, Some(true));
 }
 
-/// ResponseFailed should produce an assistant message with [ERROR] prefix
-/// so the frontend can detect it as an error and show a retry button.
 #[test]
 fn response_failed_produces_error_message() {
     let events = vec![
@@ -270,15 +248,11 @@ fn response_failed_produces_error_message() {
     assert_eq!(msgs[1].completed, Some(true));
 }
 
-/// ResponseFailed should prefer request_event_id from payload over positional tracking,
-/// just like ResponseGenerated does. This matters when events from concurrent
-/// requests are interleaved (e.g., scheduled trigger + user message).
 #[test]
 fn response_failed_prefers_payload_request_event_id() {
     let user1_id = Uuid::new_v4();
     let user2_id = Uuid::new_v4();
     let events = vec![
-        // First user message
         EventRow {
             id: user1_id,
             event_type: "MessageReceived".to_string(),
@@ -287,7 +261,6 @@ fn response_failed_prefers_payload_request_event_id() {
             thread_id: None,
             sequence: None,
         },
-        // Second user message (positional tracker now points here)
         EventRow {
             id: user2_id,
             event_type: "MessageReceived".to_string(),
@@ -296,7 +269,6 @@ fn response_failed_prefers_payload_request_event_id() {
             thread_id: None,
             sequence: None,
         },
-        // ResponseFailed for the FIRST message (explicit request_event_id)
         EventRow {
             id: Uuid::new_v4(),
             event_type: "ResponseFailed".to_string(),
@@ -307,7 +279,6 @@ fn response_failed_prefers_payload_request_event_id() {
         },
     ];
     let msgs = build_session_messages(&events);
-    // The ResponseFailed should link to user1, not user2
     let failed = msgs
         .iter()
         .find(|m| m.role == "assistant" && m.content.contains("API error"))

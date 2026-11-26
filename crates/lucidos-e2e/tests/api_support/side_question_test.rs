@@ -1,10 +1,3 @@
-//! E2E coverage for `POST /api/v1/side-questions` (ADR 0320), and for `/btw`
-//! text on the chat route, which is an ordinary message.
-//!
-//! A Lucidos Agent thread is answered here by the mock model. Every Claude
-//! Code case is a refusal the engine gives before any Claude Code runs, so it
-//! needs no real session. Each refusal also checks that nothing was recorded.
-
 use crate::support::{
     base_url, db_url, seed_cc_thread_summary, seed_chat_thread_summary, user_client,
 };
@@ -35,8 +28,6 @@ async fn ask(thread_id: &str, question: &str) -> (u16, Value) {
     post("side-questions", body).await
 }
 
-/// The seed helpers leave a row at the column default, a started thread. Only
-/// `ThreadStarted` records a composing draft, so a draft is marked explicitly.
 async fn mark_composing(pool: &sqlx::PgPool, thread_id: Uuid) {
     sqlx::query("UPDATE thread_summaries SET state = 'composing' WHERE thread_id = $1")
         .bind(thread_id)
@@ -64,7 +55,6 @@ async fn a_malformed_thread_id_is_refused() {
     assert_eq!(error_of(&body), "Invalid thread_id");
 }
 
-/// The side-question event types recorded on a thread, oldest first.
 async fn recorded_types(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
     sqlx::query_scalar("SELECT event_type FROM events WHERE thread_id = $1 ORDER BY sequence")
         .bind(thread_id)
@@ -73,8 +63,6 @@ async fn recorded_types(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
         .expect("read events")
 }
 
-/// A Lucidos Agent thread answers from its own model. The ask and the answer
-/// are recorded as a card with the cost beside it, and never as a turn.
 #[tokio::test]
 async fn a_lucidos_agent_thread_answers_a_side_question() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
@@ -106,8 +94,6 @@ async fn a_lucidos_agent_thread_answers_a_side_question() {
     assert_eq!(purpose, "side_question");
 }
 
-/// A draft still composing has not started, so it takes no side question,
-/// and nothing is recorded on it.
 #[tokio::test]
 async fn a_composing_draft_is_refused() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
@@ -124,8 +110,6 @@ async fn a_composing_draft_is_refused() {
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 
-/// An ask naming an image the workspace never received is refused by name,
-/// before anything is recorded.
 #[tokio::test]
 async fn a_side_question_naming_an_unknown_image_is_refused() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
@@ -186,8 +170,6 @@ async fn a_claude_code_thread_with_no_session_yet_is_refused_without_spawning() 
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 
-/// Only a recorded ask can be dismissed, and a refused dismissal records
-/// nothing.
 #[tokio::test]
 async fn dismissing_a_side_question_nobody_asked_is_not_found() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
@@ -204,7 +186,6 @@ async fn dismissing_a_side_question_nobody_asked_is_not_found() {
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 
-/// The chat route sends `/btw` text as an ordinary message.
 #[tokio::test]
 async fn the_chat_route_sends_btw_text_as_an_ordinary_message() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();

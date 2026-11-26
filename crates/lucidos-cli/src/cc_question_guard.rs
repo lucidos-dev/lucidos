@@ -1,24 +1,9 @@
-//! PreToolUse hook on every Claude Code tool: while the agent's own question
-//! is open, its other tool calls are refused (ADR 0803).
-//!
-//! The question is open from its `tool_use` until its `tool_result` or the
-//! turn's end, read from the session transcript. Claude Code writes each block
-//! to the transcript before it runs that block's tool. So a sibling that runs
-//! beside the question always finds the question there, and no engine call is
-//! needed. A sibling streamed before the question ran before it was asked.
-//!
-//! The engine passes the refusal and the question tool names as arguments, so
-//! each keeps one definition. Fails OPEN on any parse or I/O error: a hook bug
-//! must not brick every tool call.
-
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::workspace::BoxError;
 
-/// How much of the transcript's end the guard reads. A turn's open question
-/// sits in its last few blocks, far inside this.
 const TAIL_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -60,16 +45,12 @@ fn read_tail(path: &str) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    // A cut first line is a fragment, never a whole block.
     Ok(match (start > 0, text.split_once('\n')) {
         (true, Some((_, rest))) => rest.to_string(),
         _ => text,
     })
 }
 
-/// Whether a question tool call in `transcript` has no result yet, in the
-/// current turn, other than `own_id`. A typed user prompt starts a new turn,
-/// which closes every earlier question.
 fn question_open(transcript: &str, question_tools: &[String], own_id: &str) -> bool {
     let mut open: HashSet<String> = HashSet::new();
     for line in transcript.lines() {
@@ -155,8 +136,6 @@ mod tests {
         lines.join("\n")
     }
 
-    /// The sibling race: the question streamed first and runs, then a sibling
-    /// streams and starts beside it. Its hook finds the question unanswered.
     #[test]
     fn a_sibling_after_an_unanswered_question_is_refused() {
         let t = transcript(&[
@@ -167,8 +146,6 @@ mod tests {
         assert!(question_open(&t, &tools(), "r1"));
     }
 
-    /// Each block is its own transcript line in one message, or one line with
-    /// both blocks: either way the sibling is refused.
     #[test]
     fn a_sibling_in_the_same_line_is_refused() {
         let t = transcript(&[assistant_uses(&[
@@ -178,7 +155,6 @@ mod tests {
         assert!(question_open(&t, &tools(), "r1"));
     }
 
-    /// A sibling streamed before the question started before it was asked.
     #[test]
     fn a_sibling_before_the_question_runs() {
         let t = transcript(&[prompt("go"), assistant_uses(&[("r1", "Read")])]);
@@ -195,7 +171,6 @@ mod tests {
         assert!(!question_open(&t, &tools(), "b1"));
     }
 
-    /// A question left unanswered by an ended turn closes with that turn.
     #[test]
     fn a_new_turn_closes_an_earlier_question() {
         let t = transcript(&[
@@ -206,7 +181,6 @@ mod tests {
         assert!(!question_open(&t, &tools(), "b1"));
     }
 
-    /// A meta row Claude Code adds mid-turn is not the owner's prompt.
     #[test]
     fn a_meta_row_keeps_the_question_open() {
         let meta = serde_json::json!({"type": "user", "isMeta": true,

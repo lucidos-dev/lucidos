@@ -1,4 +1,3 @@
-//! Closed SFTP adapter. No shell, caller executable, SSH config or captured output.
 use super::*;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -43,7 +42,6 @@ fn command(recipient: &Recipient, cwd: &Path, max_file: u64) -> tokio::process::
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    // The owner's SSH agent is a credential provider, never a command/config.
     if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
         cmd.env("SSH_AUTH_SOCK", socket);
     }
@@ -68,7 +66,6 @@ fn command(recipient: &Recipient, cwd: &Path, max_file: u64) -> tokio::process::
 struct ProcessGroup(u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        // The group is created by our child, never a shared host process group.
         unsafe {
             libc::kill(-(self.0 as i32), libc::SIGKILL);
         }
@@ -116,8 +113,6 @@ async fn send_with(root: &Path, operation: &Operation, sftp: &impl Sftp) -> Resu
     let dir = operation_dir(root, &operation.id)?;
     let snapshot = dir.join("snapshot");
     let remote = format!("{}/{}", operation.recipient.directory, operation.id);
-    // mkdir is mandatory (no '-' error suppression). An existing path aborts
-    // the batch before any put, preserving every previous attempt/evidence.
     let mut script = format!("mkdir {remote}\nchmod 700 {remote}\n");
     let manifest_bytes = serde_json::to_vec_pretty(operation)?;
     let (path, bytes) = (snapshot.join("manifest.json"), manifest_bytes.clone());
@@ -146,8 +141,6 @@ async fn send_with(root: &Path, operation: &Operation, sftp: &impl Sftp) -> Resu
             .prefix("verify-")
             .tempdir_in(&dir)?;
         std::fs::set_permissions(verify.path(), std::fs::Permissions::from_mode(0o700))?;
-        // Only one bounded download exists at a time: staging <= 2 * MAX_BYTES
-        // plus the bounded manifest. No output or error stream is retained.
         let mut expected: Vec<_> = operation
             .files
             .iter()
@@ -295,7 +288,6 @@ mod roundtrip_tests {
             );
             if !corrupt && !fail {
                 let before = fake.remote.borrow().clone();
-                // Remove the local manifest solely to exercise the remote mkdir guard.
                 std::fs::remove_file(
                     operation_dir(root.path(), &captured.id)
                         .unwrap()

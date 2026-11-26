@@ -7,29 +7,6 @@ use crate::engine::LucidosEngine;
 
 #[easy_ext::ext(ChatSpawnExt)]
 pub(crate) impl LucidosEngine {
-    /// Spawn a regular Lucidos thread, optionally as a child of the given
-    /// parent (a `relation: "top"` spawn passes no parent and is nobody's
-    /// child; it still records its spawning thread in `origin`).
-    ///
-    /// Non-async to avoid Send issues with `&self` across await points in
-    /// nested spawn contexts.
-    ///
-    /// `caller_title`: Some(non-empty) becomes the thread's name and keeps the
-    /// title model out. None leaves the naming to the model.
-    /// `pre_emitted_origin` — Some skips re-emitting MessageReceived (the
-    /// caller already emitted it and incremented active_children_count).
-    /// `route`: the model, effort and provider the child runs on, already
-    /// resolved by the spawning tool. A `None` field resolves as a fresh chat
-    /// turn's would.
-    /// `origin`: who launched this thread, for the route popover. Only used on
-    /// the fallback path where the eager emit failed and this call emits the
-    /// MessageReceived itself, so it must match what the eager emit would have
-    /// stamped. Independent of `parent_thread_id`: a `relation: "top"` spawn
-    /// carries an origin with no linkage.
-    ///
-    /// Returns the child thread id plus the processing task's `JoinHandle` —
-    /// the Thread Queue executor awaits it so the spawn's capacity slot is
-    /// held until the sub-thread finishes its turn.
     #[allow(clippy::too_many_arguments)]
     fn spawn_thread(
         &self,
@@ -43,10 +20,6 @@ pub(crate) impl LucidosEngine {
         route: crate::core::ResolvedModelSelection,
         origin: Option<MessageOrigin>,
     ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
-        // `process_message_with_steps` does the naming, once the child's row
-        // exists to hold it. The placeholder is dropped: a chat child has no
-        // parent-side row to render before it is real, and the thread list
-        // shows its first message until a title lands.
         let caller_title = super::spawn_naming(caller_title, prompt).caller_title;
 
         let mode = MessageOrigin::mode_or(origin.as_ref(), ActorMode::Agent);
@@ -78,9 +51,6 @@ pub(crate) impl LucidosEngine {
                         mode,
                         None,
                         None,
-                        // The Thread Queue executor persists the child's
-                        // MessageReceived at admission time; it is a real message,
-                        // just one this task didn't emit.
                         pre_emitted_origin.map(PreEmittedOrigin::Message),
                         caller_title.as_deref(),
                         origin,

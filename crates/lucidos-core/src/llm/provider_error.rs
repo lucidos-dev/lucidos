@@ -1,45 +1,22 @@
-//! A model provider's failure, typed by what it means for us.
-//!
-//! Every provider formats its errors differently (`api_error`, `server_error`,
-//! `INTERNAL`, a bare status). One [`ProviderErrorKind`] names what each means,
-//! so the retry loops branch on the kind and never on the wording. A code the
-//! table does not know lands in [`ProviderErrorKind::Unknown`] with its raw
-//! text, and the rendered message always shows the provider's own words first.
-
 use std::fmt;
 
 use serde_json::Value;
 
-/// What a provider failure means. One variant per row of the meaning table in
-/// [`ProviderErrorKind::meaning`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderErrorKind {
-    /// The provider failed on its side (HTTP 500, 502, 503, `api_error`).
     Internal,
-    /// The provider has no capacity right now (HTTP 529, `overloaded_error`).
     Overloaded,
-    /// This account sent too many requests or tokens (HTTP 429).
     RateLimited,
-    /// The provider gave up waiting (HTTP 408 and 504).
     Timeout,
-    /// The request is larger than the provider accepts (HTTP 413).
     RequestTooLarge,
-    /// The provider refused the request body (HTTP 400).
     InvalidRequest,
-    /// The credential was rejected (HTTP 401).
     Authentication,
-    /// The credential may not do this (HTTP 403).
     Permission,
-    /// The model or resource does not exist (HTTP 404).
     NotFound,
-    /// A code this table does not name. Holds the provider's raw code text.
     Unknown(String),
 }
 
 impl ProviderErrorKind {
-    /// The kind a provider's own error code names, from Anthropic's `type`,
-    /// OpenAI's `type` and `code`, or Gemini's `status`. `None` for a code the
-    /// table does not know.
     fn from_code(code: &str) -> Option<Self> {
         Some(match code {
             "api_error" | "server_error" | "internal_error" | "INTERNAL" => Self::Internal,
@@ -59,7 +36,6 @@ impl ProviderErrorKind {
         })
     }
 
-    /// The kind an HTTP status names, when the body names nothing better.
     fn from_status(status: u16) -> Option<Self> {
         Some(match status {
             400 => Self::InvalidRequest,
@@ -75,7 +51,6 @@ impl ProviderErrorKind {
         })
     }
 
-    /// Whether the same request may succeed after a backoff.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -83,7 +58,7 @@ impl ProviderErrorKind {
         )
     }
 
-    /// One plain sentence on what the failure means and what to do about it.
+    /// INVARIANT: One plain sentence on what the failure means and what to do about it.
     /// The retryable rows keep the phrases `is_transient_error` matches, so a
     /// rendered failure still reads as transient to the notification dedup.
     fn meaning(&self, provider: &str) -> String {
@@ -122,7 +97,7 @@ impl ProviderErrorKind {
     }
 }
 
-/// A model provider's failure: its own words, and what they mean.
+/// INVARIANT: A model provider's failure: its own words, and what they mean.
 ///
 /// Built through [`ProviderError::from_http`] or
 /// [`ProviderError::from_stream_error`], so every provider reads its failures
@@ -130,20 +105,15 @@ impl ProviderErrorKind {
 /// [`ProviderErrorKind::is_retryable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderError {
-    /// How the user knows the provider, such as `Anthropic` or `OpenAI`.
     pub provider: String,
     pub kind: ProviderErrorKind,
-    /// The provider's raw code, when it sent one.
     pub code: Option<String>,
     pub message: String,
     pub status: Option<u16>,
-    /// How many sends it took to give up. Zero until the retry loop ends.
     pub attempts: u32,
 }
 
 impl ProviderError {
-    /// Classify an HTTP error response. The body may be the provider's JSON
-    /// error envelope or plain text.
     pub fn from_http(provider: &str, status: u16, body: &str) -> Self {
         let mut error = match serde_json::from_str::<Value>(body) {
             Ok(value) => match error_object(&value) {
@@ -163,7 +133,6 @@ impl ProviderError {
         error
     }
 
-    /// An explicit tool-support refusal can be retried with a text-only request.
     pub fn tools_unsupported(&self) -> bool {
         let message = self.message.to_ascii_lowercase();
         if matches!(self.status, Some(400 | 500))
@@ -202,7 +171,6 @@ impl ProviderError {
                     || (message.contains("support") && message.contains("tool_choice"))))
     }
 
-    /// Classify the `error` object of a mid-stream error frame.
     pub fn from_stream_error(provider: &str, error: &Value) -> Self {
         let mut parsed = Self::from_error_value(provider, error);
         if matches!(parsed.kind, ProviderErrorKind::Unknown(_)) {
@@ -213,7 +181,6 @@ impl ProviderError {
         parsed
     }
 
-    /// Record how many sends it took, once the retry loop gives up.
     pub fn with_attempts(mut self, attempts: u32) -> Self {
         self.attempts = attempts;
         self
@@ -235,9 +202,6 @@ impl ProviderError {
         }
     }
 
-    /// Read a provider's `error` object. Anthropic names the failure in
-    /// `type`, OpenAI in `code` (a number on an OpenRouter relay) beside `type`,
-    /// and Gemini in `status` beside a numeric `code`.
     fn from_error_value(provider: &str, error: &Value) -> Self {
         let text = |key: &str| {
             error
@@ -273,9 +237,6 @@ impl ProviderError {
     }
 }
 
-/// The `error` object inside a provider's JSON envelope: Anthropic and OpenAI
-/// nest it under `error`, and Gemini may wrap that in an array. Any other shape
-/// is read as plain text.
 fn error_object(value: &Value) -> Option<&Value> {
     let value = match value {
         Value::Array(items) => items.first()?,

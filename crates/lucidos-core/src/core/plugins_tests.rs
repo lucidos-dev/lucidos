@@ -23,8 +23,6 @@ fn tmpdir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, p)
 }
 
-// --- parse_manifest ---
-
 #[test]
 fn parses_valid_manifest() {
     let m = parse_manifest(VALID_MANIFEST).unwrap();
@@ -33,8 +31,6 @@ fn parses_valid_manifest() {
     assert_eq!(m.name, "Browser Skills");
     assert_eq!(m.source.as_deref(), Some("https://github.com/x/y"));
 }
-
-// --- check_engine_requirement ---
 
 fn manifest_with_engine(engine_line: &str) -> serde_json::Value {
     parse_manifest(&format!("{VALID_MANIFEST}{engine_line}\n"))
@@ -397,8 +393,6 @@ source = "bare-string"
     ));
 }
 
-// --- validate_tree ---
-
 #[test]
 fn validates_well_formed_tree() {
     let (_tmp, dir) = tmpdir("ok");
@@ -429,8 +423,6 @@ fn rejects_unexpected_top_level_dir() {
     }
 }
 
-/// Themes were called looks, and a plugin built then ships `looks/`. It is
-/// refused like any unknown folder, but told which name to use instead.
 #[test]
 fn a_legacy_looks_folder_is_refused_naming_themes() {
     let (_tmp, dir) = tmpdir("legacylooks");
@@ -568,8 +560,6 @@ fn rejects_a_theme_that_fails_validation() {
     }
 }
 
-/// ADR 0309: a plugin's hostile theme fails staging with the reason, so the
-/// user sees why at install time rather than a theme that never shows.
 #[test]
 fn rejects_a_hostile_theme_with_its_reason() {
     for (file, body, reason) in [
@@ -609,7 +599,6 @@ fn rejects_a_hostile_theme_with_its_reason() {
     }
 }
 
-/// A plugin shipping `fonts/<slug>/` with the given manifest and files.
 fn plugin_with_font(
     name: &str,
     manifest: &str,
@@ -666,7 +655,6 @@ fn rejects_a_font_that_fails_validation() {
     }
 }
 
-/// A plugin is self-contained: it cannot lean on a font the user installed.
 #[test]
 fn rejects_a_theme_naming_a_workspace_font_the_plugin_does_not_ship() {
     let (_tmp, dir) = plugin_with_theme(
@@ -684,8 +672,6 @@ fn rejects_a_theme_naming_a_workspace_font_the_plugin_does_not_ship() {
         other => panic!("expected InvalidTheme, got {other:?}"),
     }
 }
-
-// --- validate_archive_entry_path (zip-slip) ---
 
 #[test]
 fn rejects_parent_traversal() {
@@ -718,15 +704,11 @@ fn accepts_safe_relative() {
 
 #[test]
 fn rejects_empty_path() {
-    // Empty inner names produce an opaque "not found" downstream — reject at the
-    // validator instead of expecting every caller to add a separate guard.
     assert!(matches!(
         validate_archive_entry_path(""),
         Err(ValidationError::UnsafePath(_))
     ));
 }
-
-// --- plan_files / detect_conflicts ---
 
 #[test]
 fn plans_files_under_known_dirs_only() {
@@ -735,7 +717,6 @@ fn plans_files_under_known_dirs_only() {
     let triggers = dir.join("triggers/morning");
     fs::create_dir_all(&triggers).unwrap();
     fs::write(triggers.join("morning.md"), "x").unwrap();
-    // Hidden files skipped
     fs::write(dir.join("knowhow/.DS_Store"), "x").unwrap();
 
     let planned = plan_files(&dir);
@@ -787,8 +768,6 @@ fn detects_conflicts_against_data_dir() {
     assert!(conflicts2.is_empty());
 }
 
-/// Install copies a plugin's files past the write-time check, so the font
-/// cap is asked here, against the fonts already installed.
 #[test]
 fn refuses_a_plugin_font_that_would_pass_the_workspace_cap() {
     use crate::core::workspace_fonts::MAX_FONTS;
@@ -803,18 +782,14 @@ fn refuses_a_plugin_font_that_would_pass_the_workspace_cap() {
     }
     let err = check_font_room(&planned, &data_dir).unwrap_err();
     assert!(err.contains("at most"), "{err}");
-    // Replacing a font the workspace already has needs no room.
     fs::rename(data_dir.join("fonts/f000"), data_dir.join("fonts/brand")).unwrap();
     assert!(check_font_room(&planned, &data_dir).is_ok());
 }
-
-// --- symlink safety ---
 
 #[cfg(unix)]
 #[test]
 fn plan_files_never_follows_a_symlink_out_of_the_tree() {
     use std::os::unix::fs::symlink;
-    // A host secret and a host directory the plugin's symlinks would reach.
     let (_tmp, outside) = tmpdir("plan_symlink_outside");
     let secret = outside.join("id_rsa");
     fs::write(&secret, "PRIVATE KEY").unwrap();
@@ -824,12 +799,9 @@ fn plan_files_never_follows_a_symlink_out_of_the_tree() {
 
     let (_tmp, dir) = tmpdir("plan_symlink");
     write_valid_plugin(&dir);
-    // A file symlink and a dir symlink inside a content dir, both aimed outside.
     symlink(&secret, dir.join("knowhow/leak.md")).unwrap();
     symlink(&outside_dir, dir.join("knowhow/escape")).unwrap();
 
-    // Only the real file is planned. Neither symlink is, and the dir symlink is
-    // not walked, so nothing behind them can be copied into `data/`.
     let planned = plan_files(&dir);
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert_eq!(paths, vec!["knowhow/a.md"]);
@@ -844,8 +816,6 @@ fn validate_tree_rejects_a_top_level_symlink_named_as_a_content_dir() {
 
     let (_tmp, dir) = tmpdir("validate_symlink");
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
-    // A symlink named `knowhow` (a content dir) pointing at a real directory
-    // outside the tree. `is_dir()` would follow and accept it; no-follow rejects.
     symlink(&outside, dir.join("knowhow")).unwrap();
 
     match validate_tree(&dir) {
@@ -891,7 +861,6 @@ fn read_manifest_keeps_a_linked_file_out_of_its_error() {
 #[test]
 fn validate_tree_never_reads_a_symlinked_widget_manifest() {
     use std::os::unix::fs::symlink;
-    // Read, this widget manifest would fail: it names no origin plugin.
     let (_tmp, outside) = tmpdir("validate_widget_outside");
     fs::write(
         outside.join("manifest.json"),
@@ -935,8 +904,6 @@ fn clone_subpath_root_refuses_a_symlink_on_the_way() {
     }
 }
 
-// --- compare_versions ---
-
 #[test]
 fn compare_versions_update_when_remote_newer() {
     assert_eq!(compare_versions("0.1.0", "0.2.0"), UpdateDecision::Update);
@@ -963,8 +930,6 @@ fn compare_versions_treats_garbage_as_update() {
     assert_eq!(compare_versions("garbage", "1.0.0"), UpdateDecision::Update);
 }
 
-// --- categories (controlled vocabulary) ---
-
 #[test]
 fn parses_categories_normalized_and_deduped() {
     let toml = format!(
@@ -972,8 +937,6 @@ fn parses_categories_normalized_and_deduped() {
         VALID_MANIFEST
     );
     let m = parse_manifest(&toml).unwrap();
-    // Lowercased + trimmed + de-duplicated; unknown values are NOT rejected at
-    // parse (they're filtered + flagged at scan time).
     assert_eq!(m.categories, vec!["finance", "health", "made-up"]);
 }
 
@@ -989,7 +952,7 @@ fn partition_categories_splits_known_from_unknown() {
         "finance".to_string(),
         "made-up".to_string(),
         "health".to_string(),
-        "finance".to_string(), // dup known
+        "finance".to_string(),
         "nonsense".to_string(),
     ];
     let (known, unknown) = partition_categories(&input);
@@ -1005,8 +968,6 @@ fn every_known_category_passes_is_valid() {
     assert!(!is_valid_category("not-a-category"));
 }
 
-/// Invariant I15: a plugin ships a widget only as a reusable one that names
-/// this plugin. Every other shape fails validation, naming the folder.
 #[test]
 fn validate_tree_refuses_a_widget_a_plugin_cannot_ship() {
     let shapes = [
@@ -1059,8 +1020,6 @@ fn validate_tree_refuses_a_widget_a_plugin_cannot_ship() {
     }
 }
 
-/// A plugin's app may not carry a widget's tile fields: the installer runs the
-/// same shared check as the loader and `create_app` (ADR 0432).
 #[test]
 fn validate_tree_refuses_sizes_on_an_app() {
     let (_tmp, dir) = tmpdir("app_sizes");

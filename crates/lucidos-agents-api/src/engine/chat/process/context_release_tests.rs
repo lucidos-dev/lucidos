@@ -1,9 +1,3 @@
-//! The swept window, driven through a round the way the loop drives it.
-//!
-//! The unit-level sweep tests live beside the pass in `context_mode_tests.rs`.
-//! What these add is the ORDER inside a round, which is where a cache anchor is
-//! kept or destroyed.
-
 use super::context_mode::{sweep_expired_pairs, SweepSchedule};
 use super::working_understanding as wu;
 use crate::llm::{ContentBlock, Message, MessageContent};
@@ -39,9 +33,6 @@ fn holds(messages: &[Message], byte: u8) -> bool {
     })
 }
 
-/// Everything the loop does to the array at the top of a round, in the order
-/// `agentic_loop::run` does it. The trim is left out: it fires on the budget,
-/// in both modes, and the anchor makes no promise about it.
 fn mode_round(
     messages: &mut Vec<Message>,
     first_seen: &mut HashMap<String, usize>,
@@ -81,7 +72,6 @@ fn mode_round(
     panel::append_to_tail(messages, document);
 }
 
-/// What the model says back, and what its call returns.
 fn reply(messages: &mut Vec<Message>, round: usize, byte: u8) {
     messages.push(Message {
         role: "assistant".to_string(),
@@ -107,11 +97,6 @@ fn shape(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-/// The prefix a request's anchor breakpoint covers, message by message.
-///
-/// `anthropic_wire::apply_cache_control_to_penultimate_message` marks the end of
-/// `messages[len - 2]`, so the cached prefix is everything up to and including
-/// it. `None` on round 1, which has no message in front of its tail.
 fn anchored_prefix(messages: &[Message]) -> Option<Vec<String>> {
     let anchor = messages.len().checked_sub(2)?;
     Some(shape(&messages[..=anchor]))
@@ -124,7 +109,6 @@ fn start() -> Vec<Message> {
     }]
 }
 
-/// Two rounds of the mode, and the array as each one sent it.
 fn two_rounds() -> (Vec<Message>, Vec<Message>) {
     let schedule = SweepSchedule::default();
     let mut messages = start();
@@ -139,11 +123,6 @@ fn two_rounds() -> (Vec<Message>, Vec<Message>) {
     (round_2, messages)
 }
 
-/// The invariant the wire's fourth breakpoint rests on.
-///
-/// Round 3 rewrites the message round 2 sent last, because that is where round
-/// 2 appended its panel and where the results it read arrived. Round 2's anchor
-/// sits one message in front of that, so the prefix it cached survives.
 #[test]
 fn the_next_round_leaves_the_anchored_prefix_alone() {
     let (round_2, round_3) = two_rounds();
@@ -155,8 +134,6 @@ fn the_next_round_leaves_the_anchored_prefix_alone() {
     );
 }
 
-/// The other half, so the test above cannot pass by the mutations doing nothing
-/// at all. What round 2 sent last really is rewritten by round 3.
 #[test]
 fn the_next_round_does_rewrite_the_previous_tail() {
     let (round_2, round_3) = two_rounds();
@@ -168,7 +145,6 @@ fn the_next_round_does_rewrite_the_previous_tail() {
     );
 }
 
-/// Every tool result still in the array, in order, exactly as it reads.
 fn results(messages: &[Message]) -> Vec<String> {
     let mut out = Vec::new();
     for message in messages {
@@ -184,9 +160,6 @@ fn results(messages: &[Message]) -> Vec<String> {
     out
 }
 
-/// Invariant 5. A round that is not a sweep removes nothing and rewrites no
-/// result. What it does rewrite is the previous tail's own appends, which the
-/// anchored-prefix test above bounds.
 #[test]
 fn an_ordinary_round_moves_no_result() {
     let schedule = SweepSchedule::default();
@@ -210,9 +183,6 @@ fn an_ordinary_round_moves_no_result() {
     assert!(holds(&messages, 2));
 }
 
-/// Invariant 4, driven through the loop. A result appended during round N is
-/// first SEEN at the top of round N+1. Its age at the sweep is therefore one
-/// less than the round it was produced on.
 #[test]
 fn the_sweep_round_takes_everything_past_expiry() {
     let schedule = SweepSchedule::default();
@@ -233,8 +203,6 @@ fn the_sweep_round_takes_everything_past_expiry() {
     assert!(holds(&messages, 9));
 }
 
-/// Invariant 25 and 26, driven through the loop. A keep written in round N is
-/// in force at the top of round N+1, before the pass that drops pairs.
 #[test]
 fn a_keep_written_in_the_document_survives_the_next_sweep() {
     let schedule = SweepSchedule::default();
@@ -245,8 +213,6 @@ fn a_keep_written_in_the_document_survives_the_next_sweep() {
         reply(&mut messages, round, round as u8);
     }
 
-    // The model writes its keep in round 9's reply, which the loop applies the
-    // moment the reply lands.
     let written = format!(
         "{}\n[KEEP OPEN]\n{}\n{}",
         wu::OPEN_REPLACE,
@@ -265,8 +231,6 @@ fn a_keep_written_in_the_document_survives_the_next_sweep() {
     assert!(!holds(&messages, 2), "everything else still went");
     assert!(!holds(&messages, 3));
 
-    // Invariant 33: the clock moved, it did not stop. The item goes at the
-    // sweep after the one it was held past.
     for round in 11..=19 {
         mode_round(&mut messages, &mut first_seen, round, schedule);
     }
@@ -274,9 +238,6 @@ fn a_keep_written_in_the_document_survives_the_next_sweep() {
     assert!(!holds(&messages, 1), "a keep is not a pin");
 }
 
-/// Invariant 24, at the loop's own resolution step. `panel_first_seen` keeps an
-/// address forever, so a keep on something a sweep already took would report
-/// success and hold nothing. What the request is CARRYING is the answer.
 #[test]
 fn a_keep_on_a_swept_address_resolves_to_nothing() {
     let schedule = SweepSchedule::default();
@@ -289,8 +250,6 @@ fn a_keep_on_a_swept_address_resolves_to_nothing() {
     mode_round(&mut messages, &mut first_seen, 10, schedule);
     assert!(!holds(&messages, 1), "the sweep took it");
 
-    // The map still knows it, which is exactly the trap. `is_resident` is what
-    // the loop asks, so resolving against the map instead fails here.
     assert!(first_seen.contains_key(&address(1)));
     assert!(
         !super::context_panel::carries_address(&messages, &address(1)),
@@ -302,8 +261,6 @@ fn a_keep_on_a_swept_address_resolves_to_nothing() {
     );
 }
 
-/// A result with no address is not addressable, so no sweep can take it: there
-/// would be no way back.
 #[test]
 fn a_result_with_no_address_is_never_swept() {
     let mut messages = vec![Message {

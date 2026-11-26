@@ -1,6 +1,3 @@
-//! The row subscription against a stand-in engine: what a hello, an event, a
-//! lagged frame and a dropped stream each do to the picker row.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,18 +14,12 @@ use crate::notification_count_tests::{listing, seed_device};
 use crate::server::GatewayState;
 use crate::stack::{Health, StackRuntime};
 
-/// A stand-in engine: the row stream, fed by the test, and the two snapshot
-/// routes, each counting its requests.
 struct Engine {
     address: EngineAddress,
-    /// Push one frame's JSON, or `None` to close the stream from the engine.
     frames: mpsc::UnboundedSender<Option<String>>,
-    /// The shared count the engine answers with.
     unread: Arc<AtomicU64>,
-    /// The count it answers a named device with.
     device_unread: Arc<AtomicU64>,
     stream_requests: Arc<AtomicU64>,
-    /// While set, a stream request gets no answer at all.
     unanswered: Arc<std::sync::atomic::AtomicBool>,
     shared_reads: Arc<AtomicU64>,
     device_reads: Arc<AtomicU64>,
@@ -39,7 +30,6 @@ impl Engine {
     fn serve() -> Self {
         let dir = test_engine::scratch();
         let (frames, rx) = mpsc::unbounded_channel::<Option<String>>();
-        // One stream at a time takes the feed, as one gateway holds one.
         let feed = Arc::new(AsyncMutex::new(rx));
         let unread = Arc::new(AtomicU64::new(0));
         let device_unread = Arc::new(AtomicU64::new(0));
@@ -115,7 +105,6 @@ impl Engine {
     }
 }
 
-/// A gateway with one healthy stack, `dev`, and no row subscription yet.
 async fn gateway(engine: &Engine) -> (GatewayState, tempfile::TempDir) {
     let root = tempfile::tempdir().unwrap();
     let state = GatewayState::for_tests_with_static_dir(Some(root.path().to_path_buf()));
@@ -133,7 +122,6 @@ async fn probe(state: &GatewayState, engine: &Engine, event_filter: bool) {
     s.keep_row_subscription(event_filter, &stack, &engine.address);
 }
 
-/// Wait until `seen` holds of the stack, or fail after a generous budget.
 async fn until(state: &GatewayState, what: &str, seen: impl Fn(&StackRuntime) -> bool) {
     let stack = state.stack_for_test("dev").await;
     for _ in 0..500 {
@@ -152,8 +140,6 @@ async fn device_count(state: &GatewayState) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-/// INV-3: an engine that does not advertise the filter gets no stream
-/// request, a blank row, and no device count.
 #[tokio::test]
 async fn an_engine_without_the_filter_is_never_subscribed_to() {
     let engine = Engine::serve();
@@ -169,16 +155,12 @@ async fn an_engine_without_the_filter_is_never_subscribed_to() {
     assert_eq!(device_count(&state).await, serde_json::Value::Null);
     assert_eq!(engine.device_reads.load(Ordering::SeqCst), 0);
 
-    // The dock total asks such an engine directly, as it did before the row
-    // stream: its count must not drop out while it waits to go idle.
     engine.unread.store(4, Ordering::SeqCst);
     assert_eq!(state.shared_unread_total().await, 4);
     assert_eq!(engine.shared_reads.load(Ordering::SeqCst), 1);
     assert_eq!(engine.stream_requests.load(Ordering::SeqCst), 0);
 }
 
-/// An engine older than the row stream is seen once and respawned at most
-/// once. A restart onto a build that serves the stream starts over.
 #[tokio::test]
 async fn an_engine_without_the_stream_is_noted_once_and_respawned_once() {
     let mut row = crate::row_subscription::RowSubscription::live_for_test();
@@ -187,7 +169,6 @@ async fn an_engine_without_the_stream_is_noted_once_and_respawned_once() {
     assert!(!row.note_engine_stream(false), "the next pass is not");
     assert!(row.engine_lacks_stream() && row.stream_respawn_owed());
 
-    // The state outlives the stop a respawn makes.
     row.note_stream_respawn();
     row.stop();
     assert!(!row.note_engine_stream(false));
@@ -202,8 +183,6 @@ async fn an_engine_without_the_stream_is_noted_once_and_respawned_once() {
     );
 }
 
-/// INV-4: the hello brings the first snapshot, an accepted event the next,
-/// and a frame the stream never sends brings none.
 #[tokio::test]
 async fn a_hello_and_each_accepted_event_read_the_snapshot_again() {
     let engine = Engine::serve();
@@ -219,9 +198,7 @@ async fn a_hello_and_each_accepted_event_read_the_snapshot_again() {
     assert_eq!(engine.shared_reads.load(Ordering::SeqCst), 1);
     assert_eq!(state.shared_unread_total().await, 4);
 
-    // A second healthy probe keeps the live stream and reads nothing.
     probe(&state, &engine, true).await;
-    // Neither a thread event nor a native push is a frame the stream sends.
     engine.send(json!({"type": "ThreadEvent", "data": {"event": {"text": "private"}}}));
     engine.event("NativePushRequested", "notification");
     engine.unread.store(3, Ordering::SeqCst);
@@ -232,13 +209,10 @@ async fn a_hello_and_each_accepted_event_read_the_snapshot_again() {
     .await;
     assert_eq!(engine.stream_requests.load(Ordering::SeqCst), 1);
     assert_eq!(engine.shared_reads.load(Ordering::SeqCst), 2);
-    // The dock total is the same memory: it asks no engine.
     assert_eq!(state.shared_unread_total().await, 3);
     assert_eq!(engine.shared_reads.load(Ordering::SeqCst), 2);
 }
 
-/// INV-4 and INV-5: a dropped stream blanks the row at once, and the next
-/// healthy probe subscribes again and converges on the engine's routes.
 #[tokio::test]
 async fn a_dropped_stream_blanks_the_row_until_the_next_snapshot() {
     let engine = Engine::serve();
@@ -253,7 +227,6 @@ async fn a_dropped_stream_blanks_the_row_until_the_next_snapshot() {
     assert_eq!((row.unread_count, row.last_successful_backup), (None, None));
     assert_eq!(state.shared_unread_total().await, 0);
 
-    // The engine restarted with a different count, missing every event.
     engine.unread.store(2, Ordering::SeqCst);
     probe(&state, &engine, true).await;
     until(&state, "the row after a restart", |s| {
@@ -263,10 +236,6 @@ async fn a_dropped_stream_blanks_the_row_until_the_next_snapshot() {
     assert_eq!(engine.stream_requests.load(Ordering::SeqCst), 2);
 }
 
-/// A device's own count is read once and held, until a frame that could move
-/// it. A notification event, a deleted thread, a users change and a lagged
-/// frame each drop it and read the shared count again. The end of the stream
-/// drops it too. A backup event does not.
 #[tokio::test]
 async fn a_device_count_is_held_between_the_frames_that_could_move_it() {
     let engine = Engine::serve();
@@ -312,8 +281,6 @@ async fn a_device_count_is_held_between_the_frames_that_could_move_it() {
         assert_eq!(reads(), 2 + step as u64);
     }
 
-    // With the stream gone a held count has nothing to drop it, so the
-    // listing shows none and asks no engine.
     engine.frames.send(None).unwrap();
     until(&state, "the stream's end", |s| {
         !s.row_subscription.is_live()
@@ -323,8 +290,6 @@ async fn a_device_count_is_held_between_the_frames_that_could_move_it() {
     assert_eq!(reads(), 5);
 }
 
-/// A stream that goes silent past the limit is dropped, with the row blank,
-/// and the next healthy probe subscribes again and converges.
 #[tokio::test]
 async fn a_stalled_stream_is_dropped_and_subscribed_to_again() {
     let engine = Engine::serve();
@@ -340,7 +305,6 @@ async fn a_stalled_stream_is_dropped_and_subscribed_to_again() {
     probe(&state, &engine, true).await;
     until(&state, "the first snapshot", |s| s.last_unread == Some(7)).await;
 
-    // A frame inside the limit counts as life: the stream stays.
     tokio::time::sleep(limit / 3).await;
     engine.unread.store(6, Ordering::SeqCst);
     engine.event("NotificationRead", "notification");
@@ -350,8 +314,6 @@ async fn a_stalled_stream_is_dropped_and_subscribed_to_again() {
     .await;
     assert_eq!(engine.stream_requests.load(Ordering::SeqCst), 1);
 
-    // The engine now sends nothing and never closes. The count it would
-    // have announced is missed, so the row must not keep the old one.
     engine.unread.store(2, Ordering::SeqCst);
     until(&state, "a blank row", |s| !s.row_subscription.is_live()).await;
     let row = &state.list_status().await[0];
@@ -365,8 +327,6 @@ async fn a_stalled_stream_is_dropped_and_subscribed_to_again() {
     assert_eq!(engine.stream_requests.load(Ordering::SeqCst), 2);
 }
 
-/// The limit also covers an engine that never answers the stream request.
-/// The task must end, or no later probe could subscribe again.
 #[tokio::test]
 async fn an_unanswered_stream_request_is_dropped_and_sent_again() {
     let engine = Engine::serve();
@@ -393,8 +353,6 @@ async fn an_unanswered_stream_request_is_dropped_and_sent_again() {
     .await;
 }
 
-/// A count read before a frame dropped the held ones must not be stored
-/// after it: the frame may be the very change the read missed.
 #[tokio::test]
 async fn a_read_that_started_before_a_drop_is_not_held() {
     let mut row = crate::row_subscription::RowSubscription::live_for_test();

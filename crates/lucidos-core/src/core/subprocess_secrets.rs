@@ -1,25 +1,9 @@
-//! What a subprocess may inherit of the engine's secrets, and the masks over
-//! what it prints.
-//!
-//! Three layers, one per way a secret reaches a child's output:
-//! - the secrets the spawn injects (credentials, OAuth tokens, the database
-//!   handle, the origin token);
-//! - secret-shaped variables the child inherits from the engine's own env, or
-//!   gets from an `environment_variables` row;
-//! - well-known token formats, whatever their source.
-//!
-//! A chat or script subprocess is stripped of the inherited ones as well. A
-//! coding agent keeps them, since it may authenticate through one, and only
-//! its output is masked.
-
 use std::sync::OnceLock;
 
 use super::{
     mask_json_strings, redact_postgres_secrets, redact_secret_values, LUCIDOS_DATABASE_URL,
 };
 
-/// Name endings that mark an env variable as a secret. `_KEY` also covers
-/// `_API_KEY`, `_ACCESS_KEY` and `_PRIVATE_KEY`.
 const SECRET_NAME_SUFFIXES: &[&str] = &[
     "_TOKEN",
     "_SECRET",
@@ -30,13 +14,11 @@ const SECRET_NAME_SUFFIXES: &[&str] = &[
     "_CREDENTIALS",
 ];
 
-/// Well-known secrets whose names no suffix catches.
 const SECRET_NAMES: &[&str] = &["PGPASSWORD"];
 
-/// Well-known names that a suffix catches but that hold a path a child needs.
 const PATH_NAMES: &[&str] = &["GOOGLE_APPLICATION_CREDENTIALS"];
 
-/// Whether `name` is shaped like a secret's env variable.
+/// INVARIANT: Whether `name` is shaped like a secret's env variable.
 ///
 /// In the engine-owned `LUCIDOS_` namespace only an `_API_KEY` matches, such
 /// as `LUCIDOS_XAI_API_KEY`. Its other `_KEY` names are paths a child needs,
@@ -56,11 +38,9 @@ pub fn is_secret_env_name(name: &str) -> bool {
             .any(|suffix| name.ends_with(suffix))
 }
 
-/// Shortest value a name heuristic masks. A short value under a guessed name,
-/// such as `true`, stays unmasked rather than hiding that word everywhere.
 const MIN_GUESSED_SECRET_LEN: usize = 8;
 
-/// The secret-shaped variables of the engine's own env, as it started.
+/// INVARIANT: The secret-shaped variables of the engine's own env, as it started.
 ///
 /// Captured before the stored `environment_variables` rows are copied in, so
 /// it holds only what the engine inherited from whoever launched it. A
@@ -69,7 +49,6 @@ const MIN_GUESSED_SECRET_LEN: usize = 8;
 pub struct InheritedSecretEnv(Vec<(String, String)>);
 
 impl InheritedSecretEnv {
-    /// The secret-shaped, non-empty entries of `vars`.
     pub fn capture(vars: impl IntoIterator<Item = (String, String)>) -> Self {
         Self(
             vars.into_iter()
@@ -89,7 +68,7 @@ impl InheritedSecretEnv {
 
 static INHERITED_SECRET_ENV: OnceLock<InheritedSecretEnv> = OnceLock::new();
 
-/// The engine's [`InheritedSecretEnv`], captured on first use.
+/// INVARIANT: The engine's [`InheritedSecretEnv`], captured on first use.
 ///
 /// `apply_to_process_env` calls this before it copies the stored rows into the
 /// process env, which makes the first use the startup one.
@@ -101,19 +80,13 @@ pub fn inherited_secret_env() -> &'static InheritedSecretEnv {
     })
 }
 
-/// Whether a spawn keeps the secret-shaped variables it inherits from the
-/// engine. Every spawn through `apply_to_subprocess_env` states it.
 #[derive(Debug, Clone, Copy)]
 pub enum InheritedSecrets<'a> {
-    /// A coding agent, which may authenticate through an inherited provider
-    /// key. Its output is masked instead.
     Keep,
-    /// A chat or script subprocess. Each name in the snapshot is removed
-    /// unless the spawn's own pairs set it.
     Strip(&'a InheritedSecretEnv),
 }
 
-/// The secret VALUES a subprocess can print, ready for
+/// INVARIANT: The secret VALUES a subprocess can print, ready for
 /// [`redact_subprocess_output`]. `env_vars` is the env the spawn injects.
 ///
 /// Every caller handing a child's output on masks with this, except
@@ -149,35 +122,25 @@ pub fn subprocess_secret_values(
         .collect()
 }
 
-/// The names the engine itself injects with a secret value.
 fn is_injected_secret(name: &str) -> bool {
     (name.starts_with("CRED_") && !name.ends_with("_USERNAME"))
         || (name.starts_with("OAUTH_") && name.ends_with("_ACCESS_TOKEN"))
-        // Engine-minted, thread-bound, and accepted on every mutating route,
-        // so it is a credential in the sense that matters here.
         || name == crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN
         || name == LUCIDOS_DATABASE_URL
 }
 
 pub use lucidos_diagnostic_log::redaction::{argv_secret_values, redact_known_token_shapes};
 
-/// The one mask over a subprocess's output: the known secret values, then the
-/// token shapes, then any Postgres URL password.
 pub fn redact_subprocess_output(text: &str, secrets: &[String]) -> String {
     redact_postgres_secrets(&redact_known_token_shapes(&redact_secret_values(
         text, secrets,
     )))
 }
 
-/// `args` joined for a log line, with every secret masked.
 pub fn redact_argv(args: &[String]) -> String {
     redact_subprocess_output(&args.join(" "), &argv_secret_values(args))
 }
 
-/// [`redact_subprocess_output`] over every string in a JSON value, object keys
-/// included, such as a tool call's input or a stored event payload. A command
-/// can carry a token its author read from env, and an app can key a payload
-/// by a credential.
 pub fn redact_subprocess_output_in_json(value: &mut serde_json::Value, secrets: &[String]) {
     mask_json_strings(value, &|s| {
         let masked = redact_subprocess_output(s, secrets);
@@ -297,10 +260,6 @@ mod tests {
         );
     }
 
-    /// Masking by value is safe only while the value is unique to the secret.
-    /// Every dev and e2e workspace uses the literal Postgres password
-    /// `lucidos`, as do the user, the database and every path. Masking it
-    /// turned `ls ~/workspaces/dev` into a listing of `[REDACTED]`.
     #[test]
     fn the_database_handle_is_masked_whole_and_its_parts_survive() {
         let handle = format!(
@@ -324,8 +283,6 @@ mod tests {
         );
     }
 
-    /// A tool result that echoed an injected secret must not reach the event
-    /// store carrying it. `curl -v`, `env` and `set -x` all do this.
     #[test]
     fn an_echoed_credential_does_not_survive_into_the_tool_result() {
         let env = pairs(&[
@@ -407,8 +364,6 @@ mod tests {
         );
     }
 
-    /// An app or trigger can key a payload by a stored credential, so a key
-    /// reaches every reader exactly as a value does.
     #[test]
     fn a_secret_used_as_an_object_key_is_masked_at_any_depth() {
         let secrets = vec![OPAQUE.to_string()];
@@ -428,9 +383,6 @@ mod tests {
         );
     }
 
-    /// Two secret keys mask to the same string, and a literal key may already
-    /// hold it. Each value survives: a plain key keeps its name, and a masked
-    /// one takes the first free numbered name.
     #[test]
     fn keys_that_mask_alike_keep_every_value() {
         let secrets = vec![
@@ -460,8 +412,6 @@ mod tests {
         args.iter().map(|arg| arg.to_string()).collect()
     }
 
-    /// The value is opaque on purpose: no token shape catches it, so only
-    /// the name it travels under can mask it.
     const OPAQUE: &str = "opaque-secret-value";
 
     #[test]
@@ -531,8 +481,6 @@ mod tests {
         assert_eq!(redact_argv(&args), args.join(" "));
     }
 
-    /// `--oauth` names a secret word but takes no value, so the flag after
-    /// it must still mark its own value.
     #[test]
     fn a_boolean_secret_flag_does_not_swallow_the_next_flag() {
         assert_eq!(
@@ -562,8 +510,6 @@ mod tests {
         }
     }
 
-    /// A short value under a guessed name would otherwise hide that word in
-    /// every stderr line the server prints.
     #[test]
     fn a_short_value_under_a_guessed_name_is_not_a_secret() {
         assert!(argv_secret_values(&argv(&["--auth", "true", "--author=bob"])).is_empty());

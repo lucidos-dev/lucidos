@@ -1,14 +1,9 @@
-//! `retire_model`, the SQL function a migration calls when a provider retires
-//! a model (ADR 0418). These tests seed every store it must rewrite, and pin
-//! each call's tier list to the Rust ladders it mirrors.
-
 use super::*;
 use crate::core::prefs;
 use crate::llm::reasoning::{clamp_effort, supported_efforts, EFFORT_LADDER};
 use crate::llm::ProviderKind;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// One `SELECT retire_model(...)` a migration makes.
 #[derive(Debug)]
 struct Retirement {
     old: String,
@@ -16,7 +11,6 @@ struct Retirement {
     accepted: Vec<String>,
 }
 
-/// A call starts its line, so the example in a comment is not one.
 fn retire_call() -> regex::Regex {
     regex::Regex::new(r"(?m)^SELECT retire_model\('([^']+)',\s*'([^']+)',\s*ARRAY\[([^\]]*)\]\);")
         .unwrap()
@@ -38,19 +32,12 @@ const SEED_SUCCESSORS: &str = include_str!(
 const RETIRE_SUPERSEDED: &str = include_str!(
     "../../migrations/20261018074151_retire_superseded_models_and_seed_their_successors.sql"
 );
-/// Every later migration that changes a successor's row, in order. A workspace
-/// that lost the rows runs them after the retirement migration too.
 const LATER_ROUTE_MIGRATIONS: &[&str] = &[include_str!(
     "../../migrations/20261109174659_add_chatgpt_plan_routes_to_gpt_models.sql"
 )];
 
-/// The newest migration whose successors another migration seeds. Later ones
-/// seed their own. It and older ones are applied history, and sqlx refuses
-/// to boot on an edited applied migration.
 const LAST_UNSELF_SEEDED_MIGRATION: &str = "20261018074151";
 
-/// Each successor `sql` retires to before an `INSERT INTO models` in `sql`
-/// seeds it.
 fn unseeded_successors(sql: &str) -> Vec<String> {
     retire_call()
         .captures_iter(sql)
@@ -74,16 +61,11 @@ fn unseeded_successors_finds_a_retirement_with_no_seed_before_it() {
 const RETIRE_TWINS: &str =
     include_str!("../../migrations/20261019180742_retire_the_redundant_1m_twins.sql");
 
-/// The twins of the models that only run at 1M retire to their bare rows.
-/// Every bare route then declares 1M, a route's own window survives, and a
-/// cost row naming a twin learns the id the provider answered with.
 #[tokio::test]
 async fn the_1m_twins_retire_to_bare_rows_that_keep_a_1m_window() {
     let (pool, db_name) = setup_test_db().await;
     let bare = ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"];
 
-    // The state a live workspace had: bare Fable 5.1 declared no window, and
-    // one Opus 5.5 route carries a window of its own.
     sqlx::raw_sql(
         "UPDATE models SET routes = '[{\"provider\": \"anthropic\"}, \
            {\"provider\": \"claude-gateway\"}]'::jsonb WHERE id = 'claude-fable-5-1'; \
@@ -147,7 +129,6 @@ async fn the_1m_twins_retire_to_bare_rows_that_keep_a_1m_window() {
 mod guard_tests {
     use super::*;
 
-    /// Every migration as (file name, SQL), in migration order.
     fn migrations() -> Vec<(String, String)> {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
         let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -164,7 +145,6 @@ mod guard_tests {
             .collect()
     }
 
-    /// Every retirement any migration declares, in migration order.
     fn retirements() -> Vec<Retirement> {
         let call = retire_call();
         migrations()
@@ -184,8 +164,6 @@ mod guard_tests {
             .collect()
     }
 
-    /// The retirement in force for each model: a later migration may re-point a
-    /// model an earlier one retired.
     fn latest_retirements() -> Vec<Retirement> {
         let mut latest: Vec<Retirement> = Vec::new();
         for r in retirements() {
@@ -205,9 +183,6 @@ mod guard_tests {
         assert_eq!(gemini.successor, "gemini-3.8-flash");
     }
 
-    /// `retire_model` raises on a missing successor, and a raise in a migration
-    /// stops the engine at boot. A workspace can lack a row an older migration
-    /// seeded, so each migration seeds every successor before retiring to it.
     #[test]
     fn every_migration_seeds_each_successor_before_retiring_to_it() {
         for (name, sql) in migrations() {
@@ -220,8 +195,6 @@ mod guard_tests {
         assert_eq!(unseeded_successors(&applied_in_order), Vec::<String>::new());
     }
 
-    /// A workspace that lost successor rows still migrates, and gets back the
-    /// exact rows the earlier seeds and route migrations produced.
     #[tokio::test]
     async fn the_retirement_migration_restores_successors_the_workspace_lost() {
         let (pool, db_name) = setup_test_db().await;
@@ -279,7 +252,6 @@ mod guard_tests {
             .unwrap();
         assert_eq!(fable.successor.as_deref(), Some("claude-fable-5-1"));
 
-        // A database that applied the retirement first runs the seed after it.
         sqlx::raw_sql(SEED_SUCCESSORS).execute(&pool).await.unwrap();
         assert_eq!(snapshot(pool.clone(), successors).await, before);
 
@@ -320,9 +292,6 @@ mod guard_tests {
         }
     }
 
-    /// The tier list a migration passes must be exactly what EVERY route of the
-    /// successor accepts, so a snapped effort is one each route takes. Where all
-    /// routes agree, the SQL snap must also land where `clamp_effort` does.
     #[tokio::test]
     async fn each_retirement_snaps_efforts_the_way_the_router_does() {
         let (pool, db_name) = setup_test_db().await;
@@ -389,7 +358,6 @@ mod guard_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The startup fallback list must not offer a model the registry retired.
     #[test]
     fn the_frontend_model_list_offers_no_retired_model() {
         let models_ts = std::fs::read_to_string(concat!(
@@ -406,9 +374,6 @@ mod guard_tests {
         }
     }
 
-    /// A coding agent's settings name its own lineup, which still offers ids the
-    /// registry retires, so none of them moves. A list already naming the
-    /// successor keeps the user's own entry and drops the retired one.
     #[tokio::test]
     async fn retire_model_leaves_coding_agents_alone_and_never_duplicates_a_pair() {
         let (pool, db_name) = setup_test_db().await;
@@ -533,9 +498,6 @@ mod guard_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Every live setting moves to the successor at an effort it takes. Every
-    /// record of what happened, and every id that only starts like the retired
-    /// one, stays as it was. A second run changes nothing.
     #[tokio::test]
     async fn retire_model_moves_every_live_setting_and_leaves_history() {
         let (pool, db_name) = setup_test_db().await;
@@ -667,12 +629,10 @@ mod guard_tests {
             text(pref(caps)).await.as_deref(),
             Some("gemini-3.8-flash=40000")
         );
-        // A value that is not a model setting is not rewritten.
         assert_eq!(
             text(pref("a_note")).await.as_deref(),
             Some("gemini-3.5-flash")
         );
-        // An id that only starts like the retired one is another model.
         assert_eq!(
             text(pref(judge)).await.as_deref(),
             Some("gemini-3.5-flash-lite")
@@ -717,7 +677,6 @@ mod guard_tests {
                 "TriggerUpdated",
                 r#"{"id": "t1", "model": "gemini-3.8-flash", "reasoning_effort": null}"#,
             ),
-            // History: these record which model answered and what it cost.
             ("ResponseGenerated", r#"{"model": "gemini-3.5-flash"}"#),
             ("ContextCaptured", r#"{"model": "gemini-3.5-flash"}"#),
         ] {
@@ -732,9 +691,6 @@ mod guard_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The chat ladder moves each retired rung to the successor at a tier it
-    /// takes, beside the successor's own rungs. A rung it would duplicate is
-    /// dropped, so the override still parses.
     #[tokio::test]
     async fn retire_model_moves_chat_ladder_rungs_without_duplicating_one() {
         let (pool, db_name) = setup_test_db().await;

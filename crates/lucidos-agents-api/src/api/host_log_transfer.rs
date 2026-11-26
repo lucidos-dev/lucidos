@@ -1,4 +1,3 @@
-//! Owner-approved host-owned transfer. This module never reads raw host logs.
 use super::{
     error::ApiError,
     permission_requests::{self, Spent},
@@ -51,7 +50,7 @@ async fn hop(path: &str, body: Value) -> Result<Value, ApiError> {
 }
 
 async fn hop_with(port: &str, path: &str, body: Value) -> Result<Value, ApiError> {
-    // Never retry an uncertain act or expose arbitrary gateway/transport errors.
+    // INVARIANT: Never retry an uncertain act or expose arbitrary gateway/transport errors.
     let text = tokio::time::timeout(
         std::time::Duration::from_secs(225),
         crate::engine::gateway_control::post_control(
@@ -104,7 +103,6 @@ async fn prepare(
     Json(body): Json<Prepare>,
 ) -> Result<Json<Value>, ApiError> {
     let (thread, caller) = caller(&headers)?;
-    // Validate the reason before allocating bounded gateway storage.
     permission_requests::host_log_ask(&"0".repeat(64), "", &body.reason)?;
     let operation = hop("prepare", json!({"caller":caller, "recipient":{"user":body.user, "host":body.host, "directory":body.directory}})).await?;
     let ask = ask(&operation, &body.reason)?;
@@ -118,7 +116,7 @@ fn ask(operation: &Value, reason: &str) -> Result<permission_requests::Ask, ApiE
         .as_str()
         .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| ApiError::internal("Invalid host-log consent manifest"))?;
-    // JSON escapes control characters in installation/file metadata. Card text
+    // INVARIANT: JSON escapes control characters in installation/file metadata. Card text
     // is host-authored; no raw content and no agent-provided permission wording.
     permission_requests::host_log_ask(
         digest,
@@ -159,7 +157,7 @@ async fn execute_with(
     if operation["state"] != "prepared" {
         return Ok(Json(operation));
     }
-    // The gateway refuses an expired operation, so spending the grant first
+    // INVARIANT: The gateway refuses an expired operation, so spending the grant first
     // would waste the owner's approval.
     unexpired(&operation)?;
     match permission_requests::spend_or_prepare(bus, thread, ask(&operation, reason)?).await? {

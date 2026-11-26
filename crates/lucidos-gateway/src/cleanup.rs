@@ -1,5 +1,3 @@
-//! Read-only cleanup discovery. Uncertain observations never authorize deletion.
-
 use crate::registry::Workspace;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -8,23 +6,17 @@ use std::path::{Path, PathBuf};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Read peer files strictly: Registry::load's first-run default is unsafe when
-/// deciding whether a database belongs to another install.
 pub(crate) struct RegisteredResources {
     pub database_names: BTreeSet<String>,
     pub directories: Vec<PathBuf>,
 }
 
 impl RegisteredResources {
-    /// The caller excludes the selected registration, so any remaining owner
-    /// protects the resource even when two installs reuse the same workspace id.
     pub fn require_unowned(&self, directory: &Path, database: &str) -> Result<(), BoxError> {
         self.require_unowned_database(database)?;
         self.require_unowned_directory(directory)
     }
 
-    /// Database ownership comes from registry ids, never directory basenames.
-    /// A database-only candidate does not need a fabricated directory.
     pub fn require_unowned_database(&self, database: &str) -> Result<(), BoxError> {
         if self.database_names.contains(database) {
             return Err("database is registered by another workspace or install".into());
@@ -32,9 +24,6 @@ impl RegisteredResources {
         Ok(())
     }
 
-    /// A recovery target is absent; resolve its parent without following a
-    /// replacement at the final component. Existing targets still fail the
-    /// exclusive publication in Trash recovery.
     pub fn require_unowned_destination(&self, directory: &Path) -> Result<(), BoxError> {
         let directory = directory
             .parent()
@@ -50,8 +39,6 @@ impl RegisteredResources {
         Ok(())
     }
 
-    /// A folder-only candidate does not imply ownership of any database.
-    /// Missing registered folders still reserve their resolved location.
     pub fn require_unowned_directory(&self, directory: &Path) -> Result<(), BoxError> {
         let directory = std::fs::canonicalize(directory)?;
         for registered in &self.directories {
@@ -64,8 +51,6 @@ impl RegisteredResources {
     }
 }
 
-// Preserve missing registrations' path claims without blocking unrelated resources.
-// Existing symlinks must resolve; a dangling link is not proof of an absent folder.
 fn reserved_directory(path: &Path) -> Result<PathBuf, BoxError> {
     match std::fs::canonicalize(path) {
         Ok(path) => Ok(path),
@@ -92,8 +77,6 @@ pub(crate) fn registered_resources(
     let mut ids: BTreeSet<String> = own.iter().map(|w| w.id.clone()).collect();
     let mut directories: Vec<_> = own.iter().map(|w| w.resolve_dir(app_data)).collect();
     for path in peers {
-        // Registry's defaulted workspaces field is useful at first run but
-        // cannot prove ownership when a peer document is incomplete.
         #[derive(Deserialize)]
         struct PeerRegistry {
             workspaces: Vec<Workspace>,
@@ -157,12 +140,10 @@ fn sibling_workspaces(registered: &[PathBuf]) -> Result<Vec<PathBuf>, BoxError> 
     Ok(found.into_iter().collect())
 }
 
-/// Allocated blocks, counting hard links once and never following symlinks.
 pub(crate) fn allocated_bytes(root: &Path) -> Result<u64, BoxError> {
     allocated_bytes_many([root])
 }
 
-/// A selection may contain hard links across different Trash entries.
 pub(crate) fn allocated_bytes_many<'a>(
     roots: impl IntoIterator<Item = &'a Path>,
 ) -> Result<u64, BoxError> {
@@ -267,8 +248,6 @@ pub fn fingerprint(
     ))?))
 }
 
-/// A registered workspace needs both resources observed successfully. Bind the
-/// full database observation and allocated folder bytes to the frozen selection.
 pub fn observed_workspace_fingerprint(
     ws: &Workspace,
     dir: &Path,
@@ -344,7 +323,6 @@ impl ReviewCache {
     }
 }
 
-/// This entire scan runs on a blocking gateway job, outside the request path.
 pub fn scan(own: Vec<Workspace>, app_data: &Path, peers: Vec<PathBuf>) -> Review {
     let dirs: Vec<_> = own.iter().map(|w| w.resolve_dir(app_data)).collect();
     let mut report = Review {
@@ -741,8 +719,6 @@ mod tests {
         own.dir = own_dir.to_string_lossy().into_owned();
         let peer_data = root.path().join("peer-install");
         std::fs::create_dir_all(peer_data.join("config")).unwrap();
-        // Relative registrations resolve against the owning install, and aliases
-        // must protect the same folder as its canonical spelling.
         std::os::unix::fs::symlink(&peer_dir, peer_data.join("alias")).unwrap();
         let mut peer = Workspace::gateway_provisioned("peer".into(), "Peer".into(), 9101);
         peer.dir = "alias".into();
@@ -761,8 +737,6 @@ mod tests {
             siblings[0].directory,
             std::fs::canonicalize(orphan_dir).unwrap()
         );
-        // An absent registration reserves its own path. It does not establish
-        // an alias to another existing sibling after the symlink disappears.
         std::fs::remove_file(peer_data.join("alias")).unwrap();
         let report = scan(vec![own.clone()], root.path(), vec![registry_path.clone()]);
         assert_eq!(

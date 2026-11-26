@@ -1,7 +1,3 @@
-//! What the turn's tool array does when its thread gains or loses an MCP
-//! server mid-turn. The loop's half is the generation check; this is the swap
-//! itself (ADR 0195, ADR 0430).
-
 use crate::engine::agentic_loop::{mcp_dropped_correction, mcp_surface_correction, TurnTools};
 use crate::llm::provider::ToolDefinition;
 use crate::mcp::McpToolSurface;
@@ -27,8 +23,6 @@ fn surface(names: &[&str], generation: u64) -> McpToolSurface {
     }
 }
 
-/// The turn as it stood before the model started anything: engine-authored
-/// families only.
 fn engine_only() -> TurnTools {
     TurnTools::new(
         vec![tool("read_file"), tool("run_bash"), tool("mcp")],
@@ -61,12 +55,6 @@ fn a_server_started_mid_turn_lands_in_the_array() {
     );
 }
 
-/// The `mcp` management tool is not an MCP tool. Dropping it on a refresh
-/// would take away the only tool that could stop the server again.
-///
-/// Threads with different enabled sets share the head through the prompt
-/// cache. So a thread that enabled a server carries it byte for byte like
-/// one that did not (ADR 0430).
 #[test]
 fn the_engine_authored_head_survives_byte_for_byte_and_in_order() {
     let mut tools = engine_only();
@@ -86,10 +74,6 @@ fn the_engine_authored_head_survives_byte_for_byte_and_in_order() {
     );
 }
 
-/// The invariant "a thread's array changes only when its own slice changes".
-/// Another thread's enable moves the workspace generation. This thread then
-/// recomputes, finds the same slice, and must neither rewrite its array nor
-/// owe the model a correction.
 #[test]
 fn a_moved_generation_with_the_same_slice_rewrites_nothing() {
     let mut tools = engine_only();
@@ -118,15 +102,12 @@ fn a_stopped_server_leaves_the_array() {
     let mut tools = engine_only();
     tools.refresh_mcp(surface(&["mcp__slack__search", "mcp__slack__post"], 8));
 
-    // What a Stop leaves behind: no running server offers anything.
     tools.refresh_mcp(surface(&[], 9));
 
     assert_eq!(tools.names(), ["read_file", "run_bash", "mcp"]);
     assert_eq!(tools.mcp_generation(), 9);
 }
 
-/// One server stopping must not take the other one's tools with it, because
-/// the refresh replaces the whole slice rather than removing one server's.
 #[test]
 fn one_server_stopping_leaves_the_other_one_offered() {
     let mut tools = engine_only();
@@ -140,9 +121,6 @@ fn one_server_stopping_leaves_the_other_one_offered() {
     );
 }
 
-/// The schemas ride every request, so the budget the trimmer works against is
-/// derived from this figure. A stale one lets the array and the messages
-/// together overflow the context window.
 #[test]
 fn the_schema_size_tracks_what_the_array_actually_holds() {
     let mut tools = engine_only();
@@ -164,16 +142,6 @@ fn the_schema_size_tracks_what_the_array_actually_holds() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The tail correction
-// ---------------------------------------------------------------------------
-//
-// `[MCP SERVERS]` is assembled once, into the first message, which the turn
-// never rewrites. So the round that moves this thread's servers owes the model
-// one line saying which ones moved.
-
-/// The reported failure: round 1 enables `slack`, round 2 carries its tools,
-/// and the first message still tells the model to enable it.
 #[test]
 fn a_server_enabled_mid_turn_is_named_as_callable_in_the_correction() {
     let mut tools = engine_only();
@@ -211,9 +179,6 @@ fn a_server_stopped_mid_turn_is_named_as_gone() {
     );
 }
 
-/// Switching one tool off bumps the generation and rebuilds the array, but the
-/// server list is unchanged. A line saying so would bill every request for
-/// news the first message never contradicted.
 #[test]
 fn a_refresh_that_moved_no_server_says_nothing() {
     let mut tools = engine_only();
@@ -228,8 +193,6 @@ fn a_refresh_that_moved_no_server_says_nothing() {
     );
 }
 
-/// A round can see both halves at once: the user stops one server from
-/// Settings while the model starts another.
 #[test]
 fn one_line_carries_both_halves() {
     let mut tools = engine_only();
@@ -247,8 +210,6 @@ fn one_line_carries_both_halves() {
     assert_eq!(correction.lines().count(), 1, "{correction}");
 }
 
-/// The setup's ceiling is what a mid-turn refresh fits under, and what the
-/// surface left out reaches the model as one line.
 #[test]
 fn the_array_keeps_its_ceiling_and_says_what_the_surface_left_out() {
     let mut tools = engine_only();
@@ -273,8 +234,6 @@ fn the_array_keeps_its_ceiling_and_says_what_the_surface_left_out() {
     assert_eq!(tools.mcp_dropped_notice(), None);
 }
 
-/// The first message keeps the setup's notice for the whole turn. So every
-/// change to what is left out owes a line, a cleared set included.
 #[test]
 fn a_moved_dropped_set_owes_a_line_and_an_unchanged_one_does_not() {
     assert_eq!(mcp_dropped_correction(None, None), None);

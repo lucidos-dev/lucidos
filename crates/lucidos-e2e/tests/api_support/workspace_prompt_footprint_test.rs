@@ -1,10 +1,3 @@
-//! End-to-end API tests for the workspace prompt footprint (ADR 0413).
-//!
-//! - `POST /api/v1/app/opened` identifies its caller before it records, and
-//!   records one `AppOpened` per call for a real app only.
-//! - `GET /api/v1/workspace-prompt-footprint` reports every registry section
-//!   and judges the app it was just told was opened as used.
-
 use crate::support::{
     base_url, db_url, http_client, remove_data_fixtures, user_client, workspace_tree_lock,
     write_data_fixture,

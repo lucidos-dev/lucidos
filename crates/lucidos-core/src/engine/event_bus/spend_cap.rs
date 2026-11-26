@@ -1,4 +1,3 @@
-//! Serialize provider hold transitions with their event announcements.
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::llm::spend_cap::{
@@ -83,8 +82,6 @@ pub async fn failed(bus: &EventBus, error: &(dyn std::error::Error + Send + Sync
         let bus = bus.clone();
         tokio::spawn(async move {
             tokio::time::sleep((until - chrono::Utc::now()).to_std().unwrap_or_default()).await;
-            // Expire even in an idle workspace, so open settings receive the
-            // end event without needing a new model call or page refresh.
             status(&bus).await;
         });
     }

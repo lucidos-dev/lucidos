@@ -1,5 +1,3 @@
-//! Workspace-client compatibility, independent of transport protocol and build ids.
-//! Breaking API/client semantics bump VERSION. Additive changes keep it.
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 1;
@@ -10,11 +8,7 @@ const ENGINE: &[&str] = &["workspace-api-v1"];
 /// (docs/temporary-measures.md, "Respawn engines older than the https loopback").
 /// Optional, so a peer gateway still serves an older engine.
 pub const LOOPBACK_TLS: &str = "loopback-tls";
-/// The gateway checks a relayed request's signed contract binding itself, so
-/// its peer may skip the per-request probes. Optional: older gateways lack it.
 pub const CLAIM_BOUND_CONTRACT: &str = "claim-bound-contract";
-/// The gateway serves its own workspace client to a relayed device request, so
-/// a peer with trusted pairing on may run it. Optional: older gateways lack it.
 pub const PEER_SERVED_CLIENT: &str = "peer-served-client";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

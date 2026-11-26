@@ -2,8 +2,6 @@ use super::*;
 use crate::diagnostic_bundles::Incoming;
 
 impl EventBus {
-    /// Store and announce one receipt atomically, across retries and restarts.
-    /// The immutable event retains its identity after inbox expiry/deletion.
     pub async fn receive_diagnostic_bundle(
         &self,
         incoming: &Incoming,
@@ -48,13 +46,11 @@ impl EventBus {
         .bind(incoming.payload())
         .execute(&mut *append.tx)
         .await?;
-        // An arrival is ingress, even when fetch was run by a cron trigger.
         self.append_system_event(append, incoming.id(), event, 0, None)
             .await?;
         Ok(incoming.id())
     }
 
-    /// Retention is expiry of previously announced ingress, not a new choice.
     pub async fn expire_diagnostic_bundles(
         &self,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {

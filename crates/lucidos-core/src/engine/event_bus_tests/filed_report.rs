@@ -1,9 +1,3 @@
-//! Filed reports: I1, I2 and I3 of
-//! `docs/plans/2026-10-11-sub-threads-wake-parents-only-when-needed.md`.
-//!
-//! A clean finish whose child said its parent need not act lands on the parent
-//! as a `ChildReportFiled`, which starts no turn. Every other finish wakes.
-
 use super::super::parent_callback::Delivery;
 use super::*;
 use crate::engine::thread_events::{AbortCause, CancelCause, ChildCompletionStatus};
@@ -39,7 +33,6 @@ async fn count_on(pool: &PgPool, thread_id: Uuid, event_type: &str) -> i64 {
     .unwrap()
 }
 
-/// What a wake would change on the parent's row.
 async fn wake_columns(
     pool: &PgPool,
     thread_id: Uuid,
@@ -62,7 +55,6 @@ async fn callback_pending(pool: &PgPool, thread_id: Uuid) -> bool {
         .unwrap()
 }
 
-/// I3 as a table: only a clean finish with an explicit no is filed.
 #[test]
 fn only_a_clean_finish_the_child_declined_is_filed() {
     use ChildCompletionStatus::*;
@@ -82,7 +74,6 @@ fn only_a_clean_finish_the_child_declined_is_filed() {
     }
 }
 
-/// I1: a filed report starts no turn and leaves the parent's row alone.
 #[tokio::test]
 async fn a_declined_chat_report_is_filed_without_waking_the_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -137,7 +128,6 @@ async fn a_report_the_child_wants_acted_on_still_wakes() {
     teardown_test_db(&db_name).await;
 }
 
-/// I4 at the fan-in: a turn that never decided wakes, as every child did.
 #[tokio::test]
 async fn an_undecided_report_wakes() {
     let (pool, db_name) = setup_test_db().await;
@@ -153,7 +143,6 @@ async fn an_undecided_report_wakes() {
     teardown_test_db(&db_name).await;
 }
 
-/// I3: a no never quiets a finish that is not clean.
 #[tokio::test]
 async fn a_declined_report_still_wakes_for_every_unclean_finish() {
     let unclean = [
@@ -193,7 +182,6 @@ async fn a_declined_report_still_wakes_for_every_unclean_finish() {
     }
 }
 
-/// I3: a restart that cut the turn with no resume promised wakes over a no.
 #[tokio::test]
 async fn a_declined_report_cut_by_a_crash_still_wakes() {
     let (pool, db_name) = setup_test_db().await;
@@ -232,7 +220,6 @@ async fn a_declined_coding_agent_idle_is_filed_with_its_status() {
 
     emit(&bus, child_id, ThreadEvent::ParentWakeNotRequested).await;
     emit_cc_idled(&bus, child_id, false, None).await;
-    // A second idle for the same turn owes the parent nothing more.
     emit_cc_idled(&bus, child_id, false, None).await;
 
     let status: String = sqlx::query_scalar(
@@ -381,8 +368,6 @@ async fn an_unchanged_integrated_report_files_without_waking_again() {
     teardown_test_db(&db_name).await;
 }
 
-/// I1 across a restart: a filed report that is a parent's last word is not
-/// a lost wake, so the boot sweep re-fires nothing.
 #[tokio::test]
 async fn the_boot_sweep_never_refires_a_filed_report() {
     let (pool, db_name) = setup_test_db().await;
@@ -400,8 +385,6 @@ async fn the_boot_sweep_never_refires_a_filed_report() {
     teardown_test_db(&db_name).await;
 }
 
-/// I2: a filed report after an unprocessed card is no reaction to it, so the
-/// card's lost wake is still re-fired.
 #[tokio::test]
 async fn a_filed_report_does_not_hide_an_earlier_unprocessed_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -426,9 +409,6 @@ async fn a_filed_report_does_not_hide_an_earlier_unprocessed_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// I5: a decision governs the one report it was made for. A chat child woken
-/// by its own child's card starts its next turn with no start event, so it
-/// must not reuse the spent no.
 #[tokio::test]
 async fn a_spent_no_never_files_the_next_report() {
     let (pool, db_name) = setup_test_db().await;
@@ -439,7 +419,6 @@ async fn a_spent_no_never_files_the_next_report() {
     emit(&bus, child_id, reply("Waiting on my own child.")).await;
     assert_eq!(count_on(&pool, parent_id, "ChildReportFiled").await, 1);
 
-    // The grandchild's card wakes the child, which writes no start event.
     emit(&bus, child_id, reply("Here is the combined result.")).await;
 
     assert_eq!(count_completion_cards(&pool, parent_id).await, 1);
@@ -454,8 +433,6 @@ async fn a_spent_no_never_files_the_next_report() {
     teardown_test_db(&db_name).await;
 }
 
-/// A parent on hold is not woken, whatever its kind. Each report is filed,
-/// so the parent's next turn reads it, and nothing asks the owner.
 #[tokio::test]
 async fn a_held_parent_files_reports_and_asks_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -479,8 +456,6 @@ async fn a_held_parent_files_reports_and_asks_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// A card open on a coding-agent parent holds the report's wake (ADR 0803).
-/// The report is filed, so the turn after the card's close reads it.
 #[tokio::test]
 async fn an_open_card_on_the_parent_files_the_report_and_wakes_nothing() {
     use crate::engine::thread_events::permission::request::{raise_request, RequestCard};

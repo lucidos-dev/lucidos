@@ -1,26 +1,3 @@
-//! Shared Postgres provisioning for the gateway.
-//!
-//! ADR 0014 §6/§7 moved the gateway from "one Postgres cluster per workspace"
-//! to one shared cluster with one database per workspace:
-//!
-//! * **Docker** (dev): one durable `lucidos-pg-shared` container/volume, on
-//!   loopback TCP with a minted password.
-//! * **Embedded** (packaged): one bundled cluster under `<app-data>/pgdata`.
-//!   It has no TCP listener. Its one socket sits in the owner-only cluster
-//!   socket directory `<run directory>/pg-<digest>` (ADR 0452). The
-//!   superuser signs in with a password kept beside the socket, which an
-//!   agent's sandbox cannot read (ADR 0645).
-//! * Each workspace gets its own database, `lucidos_<workspace-id>`, and the
-//!   engine still receives a normal single-tenant `DATABASE_URL`.
-//! * A legacy registry `database_url` is treated only as a migration source. If
-//!   the shared workspace database does not exist yet, the gateway attempts a
-//!   `pg_dump`/`pg_restore` migration from that URL; if the shared database
-//!   already exists, the legacy URL is ignored so decommissioned old clusters do
-//!   not break future starts.
-//!
-//! The gateway deliberately does not link sqlx (ADR 0014 §1). All database
-//! management is done with PostgreSQL command-line tools and readiness probes.
-
 use crate::cleanup_process::CleanupCommand;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -32,35 +9,18 @@ use lucidos_pg_url::{redact, Host, PgUrl, PG_MAX_IDENTIFIER_BYTES};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-// The dev scripts start this same cluster, so `scripts/lib/workspace_constants.sh`
-// carries a copy of each `pub(crate)` value below. `value_pins_tests` pins them.
 pub(crate) const PG_USER: &str = "lucidos";
 const PG_ADMIN_DATABASE: &str = "postgres";
-// Server-side bounds also stop SQL inside Docker if its CLI disconnects.
 const PG_BULK_OPTIONS: &str = "-c statement_timeout=0 -c lock_timeout=10000";
 const PG_QUERY_OPTIONS: &str = "-c statement_timeout=60000 -c lock_timeout=10000";
 pub(crate) const PG_IMAGE: &str = "pgvector/pgvector:pg18";
 pub(crate) const SHARED_DOCKER_CONTAINER: &str = "lucidos-pg-shared";
 pub(crate) const SHARED_DOCKER_VOLUME: &str = "lucidos-pg-data-shared";
 
-/// The Docker cluster's `/dev/shm`. pgvector builds the HNSW index with
-/// parallel maintenance workers backed by POSIX shared memory there. Docker's
-/// 64m default overflows on a workspace with a sizeable memory_entries table.
-/// The migration or restore then aborts with "could not resize shared memory
-/// segment ... No space left on device".
 pub(crate) const PG_SHM_SIZE: &str = "1g";
 
-/// ONE shared cluster serves every workspace (ADR 0014 §6/§7), and each engine
-/// opens a pool of up to 50 connections (construction.rs). Postgres' default
-/// 100 is exhausted by two busy workspaces. Every new connection then fails
-/// with "sorry, too many clients already", including the sandbox's
-/// authentication probe. 500 fits about 10 concurrent engines. Both the Docker
-/// and the bundled backend start with it.
 pub(crate) const PG_MAX_CONNECTIONS: u32 = 500;
 
-/// Which shared-cluster backend the gateway uses. Selected once from the
-/// environment at gateway start (`LUCIDOS_GATEWAY_PG_BACKEND`): dev → Docker,
-/// packaged → Embedded.
 #[derive(Clone, Debug)]
 pub enum PgBackend {
     Docker,
@@ -68,9 +28,6 @@ pub enum PgBackend {
 }
 
 impl PgBackend {
-    /// Resolve the backend from the environment. `LUCIDOS_GATEWAY_PG_BACKEND` is
-    /// `docker` (default) or `embedded`; embedded reads `LUCIDOS_PG_BIN_DIR` and
-    /// `LUCIDOS_PG_LIB_DIR` for the bundled binaries.
     pub fn from_env() -> Result<Self, BoxError> {
         match std::env::var("LUCIDOS_GATEWAY_PG_BACKEND")
             .unwrap_or_else(|_| "docker".to_string())
@@ -85,11 +42,6 @@ impl PgBackend {
                 let lib = std::env::var_os("LUCIDOS_PG_LIB_DIR")
                     .map(PathBuf::from)
                     .ok_or("LUCIDOS_PG_LIB_DIR required for embedded Postgres backend")?;
-                // The vars being SET is not enough — a mis-staged / quarantined
-                // `postgres/` resource makes the first `<bin>/postgres --version`
-                // (or `initdb`) fail with a raw `os error 2` (no path), which then
-                // surfaces as the boot-splash hang. Validate the bundled tree
-                // exists here so the failure is a path-bearing boot error instead.
                 validate_embedded_pg_dirs(&bin, &lib)?;
                 Ok(PgBackend::Embedded { bin, lib })
             }
@@ -98,13 +50,6 @@ impl PgBackend {
     }
 }
 
-/// Validate the bundled relocatable-PostgreSQL tree referenced by
-/// `LUCIDOS_PG_BIN_DIR` (`<postgres>/bin`) + `LUCIDOS_PG_LIB_DIR`
-/// (`<postgres>/lib`): the `postgres` server binary must exist, `lib` must be a
-/// dir, and the sibling `share/` (the bootstrap `postgres.bki`, timezone data,
-/// and config templates `initdb` resolves via `bin/../share`) must exist —
-/// otherwise first-ever `initdb` fails with PG's opaque "could not find … share".
-/// Path-bearing errors so a packaging regression is diagnosable from the boot log.
 fn validate_embedded_pg_dirs(bin: &Path, lib: &Path) -> Result<(), BoxError> {
     let postgres = bin.join("postgres");
     if !postgres.is_file() {
@@ -121,8 +66,6 @@ fn validate_embedded_pg_dirs(bin: &Path, lib: &Path) -> Result<(), BoxError> {
         )
         .into());
     }
-    // `share/` is resolved relative to the binary (`bin/../share`); the bundle
-    // stages bin/lib/share together, so derive it from the bin dir's parent.
     if let Some(share) = bin.parent().map(|p| p.join("share")) {
         if !share.is_dir() {
             return Err(format!(
@@ -136,30 +79,12 @@ fn validate_embedded_pg_dirs(bin: &Path, lib: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Whether a provisioning failure can plausibly clear on its own.
-///
-/// The gateway supervisor reads this to decide between retrying the workspace
-/// and latching it as dead. Getting it wrong in the `Terminal` direction is the
-/// expensive mistake: it makes a workspace permanently unopenable for the
-/// lifetime of the gateway process, which is why [`ProvisionError`]'s
-/// `From<BoxError>` conversion defaults every unclassified failure to
-/// `Transient`. Retrying is bounded and backed off, so a wrong `Transient`
-/// costs a couple of minutes and then says the same thing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProvisionErrorKind {
-    /// An environment condition that can clear with nobody doing anything: the
-    /// Docker daemon still starting (the 2026-08-03 login race), a cluster that
-    /// has not finished coming up, an image pull failing on a flaky network.
     Transient,
-    /// A condition no retry can change: an invalid workspace id, a `docker`
-    /// command that is not installed, a mis-staged bundled Postgres tree, a
-    /// data dir from another Postgres major.
     Terminal,
 }
 
-/// A provisioning failure plus the verdict on whether retrying it is worth
-/// anything. `message` is user-facing: it reaches the boot splash and the
-/// picker's health-dot tooltip, not just the log.
 #[derive(Debug)]
 pub struct ProvisionError {
     pub kind: ProvisionErrorKind,
@@ -167,7 +92,6 @@ pub struct ProvisionError {
 }
 
 impl ProvisionError {
-    /// A failure worth retrying (see [`ProvisionErrorKind::Transient`]).
     pub fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: ProvisionErrorKind::Transient,
@@ -175,7 +99,6 @@ impl ProvisionError {
         }
     }
 
-    /// A failure retrying cannot fix (see [`ProvisionErrorKind::Terminal`]).
     pub fn terminal(message: impl Into<String>) -> Self {
         Self {
             kind: ProvisionErrorKind::Terminal,
@@ -192,22 +115,14 @@ impl std::fmt::Display for ProvisionError {
 
 impl std::error::Error for ProvisionError {}
 
-/// Every unclassified provisioning failure is [`ProvisionErrorKind::Transient`].
-/// This is what makes the classification safe to add incrementally: a `?` on any
-/// helper that has not been classified yet gets the retryable verdict, and only
-/// the provably-hopeless sites opt into `Terminal`.
 impl From<BoxError> for ProvisionError {
     fn from(e: BoxError) -> Self {
         Self::transient(e.to_string())
     }
 }
 
-/// A handle to a provisioned workspace database, used on workspace delete.
 #[derive(Clone, Debug)]
 pub enum PgHandle {
-    /// The gateway provisioned no database here. Three cases: a stack whose
-    /// provisioning failed, one that never started, and an adopted external
-    /// engine, whose database came from whoever launched it.
     External,
     Docker {
         container: String,
@@ -222,9 +137,6 @@ pub enum PgHandle {
 }
 
 impl PgHandle {
-    /// Drop this workspace's database on workspace delete. Best-effort. The
-    /// shared cluster/container is intentionally left running for peer
-    /// workspaces.
     pub fn teardown(&self) {
         match self {
             PgHandle::External => {}
@@ -246,15 +158,12 @@ impl PgHandle {
     }
 }
 
-/// The outcome of [`ensure`]: the single-tenant engine URL plus the delete
-/// handle for this workspace database.
 pub struct Provisioned {
     pub database_url: String,
     pub handle: PgHandle,
 }
 
 impl Provisioned {
-    /// Only the bundled backend controls authentication throughout the engine's lifetime.
     pub fn is_managed(&self) -> bool {
         matches!(self.handle, PgHandle::Embedded { .. })
     }
@@ -294,24 +203,12 @@ mod provenance_tests {
     }
 }
 
-/// Ensure the shared cluster is running and this workspace's database exists.
-///
-/// `legacy_url`, when present, is a migration source from the old
-/// per-workspace-cluster topology. The old cluster is never modified or stopped;
-/// the gateway dumps it into the shared database and then starts the engine on
-/// the shared URL. If the shared database already exists, the legacy URL is not
-/// consulted, so an explicit later decommission is safe.
-///
-/// Failures carry a [`ProvisionErrorKind`] so the caller can tell an environment
-/// condition that will clear (Docker still starting) from one that never will
-/// (an invalid workspace id). See ADR 0014, 2026-08-03 addendum.
 pub async fn ensure(
     backend: &PgBackend,
     ws_id: &str,
     app_data: &Path,
     legacy_url: Option<&str>,
 ) -> Result<Provisioned, ProvisionError> {
-    // A malformed workspace id cannot become valid by waiting.
     let database = database_name(ws_id).map_err(|e| ProvisionError::terminal(e.to_string()))?;
     match backend {
         PgBackend::Docker => ensure_docker(&database, legacy_url).await,
@@ -321,8 +218,6 @@ pub async fn ensure(
     }
 }
 
-/// Secure a bundled cluster before adopting engines left by another gateway.
-/// This never starts, stops or replaces a cluster or an engine.
 pub fn secure_running_cluster(backend: &PgBackend, app_data: &Path) -> Result<(), ProvisionError> {
     let PgBackend::Embedded { bin, lib } = backend else {
         return Ok(());
@@ -335,13 +230,6 @@ pub fn secure_running_cluster(backend: &PgBackend, app_data: &Path) -> Result<()
     converge_running_auth(bin, lib, &data, &socket_dir)
 }
 
-/// Drop a workspace database by id, without requiring a running stack handle.
-///
-/// This is used by workspace delete for registered-but-stopped workspaces and
-/// for unhealthy stacks that failed after database creation but before a
-/// [`PgHandle`] was stored. It never creates a missing Docker cluster; if the
-/// shared Docker container is absent there is nothing to drop. Embedded clusters
-/// must already be running; teardown never starts or provisions them.
 pub async fn teardown_workspace(
     backend: &PgBackend,
     ws_id: &str,
@@ -350,7 +238,6 @@ pub async fn teardown_workspace(
     teardown_named_database(backend, &database_name(ws_id)?, app_data).await
 }
 
-/// Delete exactly an observed cleanup database, without deriving a workspace id.
 pub async fn teardown_named_database(
     backend: &PgBackend,
     database: &str,
@@ -365,16 +252,10 @@ pub async fn teardown_named_database(
     }
 }
 
-/// Stable workspace database name. Workspace ids are registry slugs
-/// (`[a-z0-9-]`); Postgres accepts hyphens in database names when quoted, and
-/// URLs accept them in the path.
 pub fn database_name(ws_id: &str) -> Result<String, BoxError> {
     lucidos_gateway_constants::workspace_database_name(ws_id)
 }
 
-/// Cleanup names come from the cluster inventory, including legacy names that
-/// are not registry slugs. Preserve them exactly and quote at the SQL boundary.
-/// PostgreSQL truncates identifiers beyond 63 bytes, so reject those outright.
 pub(crate) fn validate_cleanup_database(database: &str) -> Result<(), BoxError> {
     if !database.starts_with("lucidos_")
         || database.len() <= "lucidos_".len()
@@ -386,7 +267,6 @@ pub(crate) fn validate_cleanup_database(database: &str) -> Result<(), BoxError> 
     Ok(())
 }
 
-/// Write a custom-format recovery dump without provisioning or changing a cluster.
 pub fn cleanup_dump(
     backend: &PgBackend,
     app_data: &Path,
@@ -445,7 +325,6 @@ fn cleanup_query(backend: &PgBackend, app_data: &Path, sql: &str) -> Result<Stri
     cleanup_query_database(backend, app_data, PG_ADMIN_DATABASE, sql)
 }
 
-/// A successful catalog observation only. Errors never prove that DROP finished.
 pub(crate) fn cleanup_database_exists(
     backend: &PgBackend,
     app_data: &Path,
@@ -554,8 +433,6 @@ fn validate_cleanup_operation(operation: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// A present original is reusable only with this journal's deletion marker.
-/// Absence means the drop committed and the dump must be restored instead.
 fn cleanup_original_with(
     target: &str,
     operation: Option<&str>,
@@ -581,9 +458,6 @@ fn cleanup_original_with(
     Ok(marker.trim() == format!("lucidos-trash:{operation}:deleting"))
 }
 
-/// Restore a Trash dump into an operation-specific staging database. A durable
-/// database comment distinguishes a completed rename from an unrelated target
-/// after a gateway crash. Never uses --clean or drops the destination database.
 pub fn cleanup_restore(
     backend: &PgBackend,
     app_data: &Path,
@@ -656,8 +530,6 @@ pub fn cleanup_restore_named(
     )
 }
 
-/// Explicit recovery abandons an unmarked staging name; never mutates that database.
-/// A published target or an owned staging database must use ordinary restore.
 pub(crate) fn cleanup_rotate_restore(
     backend: &PgBackend,
     home: &Path,
@@ -691,7 +563,6 @@ fn cleanup_rotate_restore_with(
     if !cleanup_database_exists_with(&staging, &mut query)? {
         return Err("restore staging is absent; retry ordinary restore".into());
     }
-    // JSON distinguishes an actually empty comment from a malformed query reply.
     let marker = query(&format!("SELECT to_json(COALESCE(shobj_description(oid, 'pg_database'), '')) FROM pg_database WHERE datname={}", sql_string_literal(&staging)))?;
     if !serde_json::from_str::<String>(marker.trim())?.is_empty() {
         return Err("restore staging has an ownership marker; keep its recovery identity".into());
@@ -746,8 +617,6 @@ fn cleanup_restore_with(
     restore: impl FnOnce(&str) -> Result<(), BoxError>,
 ) -> Result<(), BoxError> {
     validate_cleanup_database(target)?;
-    // The journal allocates and persists this random operation identity before
-    // calling us. Restrict it to an identifier-sized, unambiguous alphabet.
     if operation.len() != 32 || !operation.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid Trash restore operation".into());
     }
@@ -760,7 +629,6 @@ fn cleanup_restore_with(
         sql_string_literal(name)
     )
     };
-    // Return existence separately: a database with an empty comment is occupied.
     let exists = |name: &str| {
         format!(
             "SELECT 1 FROM pg_database WHERE datname={}",
@@ -780,8 +648,6 @@ fn cleanup_restore_with(
         if marker.trim() == ready {
             staged_ready = true;
         } else if marker.trim() == preparing {
-            // A failed pg_restore may have committed a prefix. Only our marked
-            // staging database can be discarded and rebuilt on retry.
             query(&format!("DROP DATABASE {}", quote_ident(&staging)))?;
         } else {
             return Err("restore staging database is occupied".into());
@@ -804,8 +670,6 @@ fn cleanup_restore_with(
             sql_string_literal(&ready)
         ))?;
     }
-    // ALTER DATABASE refuses a destination created since our observation. Its
-    // database comment moves with it, making a lost response safe to retry.
     query(&format!(
         "ALTER DATABASE {} RENAME TO {}",
         quote_ident(&staging),
@@ -814,7 +678,6 @@ fn cleanup_restore_with(
     Ok(())
 }
 
-/// Observation only: never creates a cluster, database, or workspace.
 pub fn cleanup_observations(
     backend: &PgBackend,
     app_data: &Path,
@@ -824,8 +687,6 @@ pub fn cleanup_observations(
     })
 }
 
-/// Observe just the registered database, keeping picker deletion independent of
-/// any other workspace's event history or database size.
 pub fn cleanup_workspace_observation(
     backend: &PgBackend,
     app_data: &Path,
@@ -886,14 +747,7 @@ fn cleanup_observations_with(
 
 use lucidos_gateway_constants::WORKSPACE_DATABASE_PREFIX as DATABASE_PREFIX;
 
-/// The longest id a NEW workspace may take. Past it, Postgres cuts the database
-/// name: two long ids sharing a prefix then share one database, and an id past
-/// 64 bytes fails `is_valid_id` and cannot be deleted. Every path that mints an
-/// id checks this. `is_valid_id` keeps 64, so an id registered before stays
-/// addressable.
 pub const MAX_NEW_WORKSPACE_ID_BYTES: usize = PG_MAX_IDENTIFIER_BYTES - DATABASE_PREFIX.len();
-
-// ── Docker backend (dev) ────────────────────────────────────────────────────
 
 async fn ensure_docker(
     database: &str,
@@ -952,38 +806,18 @@ fn docker_container_name() -> String {
         .unwrap_or_else(|| SHARED_DOCKER_CONTAINER.to_string())
 }
 
-/// Whether the Docker daemon is answering right now.
 #[derive(Debug, PartialEq, Eq)]
 enum DaemonState {
-    /// The daemon answered the probe.
     Ready,
-    /// The CLI ran but could not reach the daemon: Docker Desktop still
-    /// starting, the socket absent, the daemon stopped. Carries the CLI's own
-    /// stderr for the log (never for classification).
     Unreachable(String),
-    /// The `docker` executable is not on this process's PATH.
     CliMissing,
 }
 
-/// The Docker daemon's user-facing state when it is not up yet. A boot-splash
-/// sentence, not a CLI error: the stderr goes to the gateway log.
 const DOCKER_NOT_RUNNING: &str = "The Docker daemon is not running yet.";
-/// No `docker` on PATH. Waiting cannot fix this one, so it latches.
 const DOCKER_CLI_MISSING: &str =
     "Docker is not installed, or the docker command is not on the PATH this gateway was \
      launched with.";
 
-/// Ask the Docker CLI whether the daemon answers.
-///
-/// Provisioning checks the daemon first so an unavailable daemon gets the
-/// boot-splash retry verdict rather than an inventory or launch error. Container
-/// inventory also refuses failed observations independently, since teardown
-/// calls it without this provisioning probe.
-///
-/// `docker version --format {{.Server.Version}}` is the probe because its
-/// **exit status** answers the question: the server half of `docker version` can
-/// only be filled in by a daemon that responded. Classification therefore never
-/// reads an error message, which would break the moment Docker rewords one.
 fn docker_daemon_state() -> DaemonState {
     classify_daemon_probe(
         Command::new("docker")
@@ -992,24 +826,18 @@ fn docker_daemon_state() -> DaemonState {
     )
 }
 
-/// The pure half of [`docker_daemon_state`]: exit status and spawn-error kind in,
-/// verdict out. Split so the classification is unit-tested without a daemon.
 fn classify_daemon_probe(probe: std::io::Result<std::process::Output>) -> DaemonState {
     match probe {
         Ok(out) if out.status.success() => DaemonState::Ready,
         Ok(out) => {
             DaemonState::Unreachable(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
-        // The binary itself is missing, which is a different problem from a
-        // daemon that has not started, and is not one that fixes itself.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DaemonState::CliMissing,
         Err(e) => DaemonState::Unreachable(e.to_string()),
     }
 }
 
 async fn ensure_docker_cluster(container: &str, password: &str) -> Result<u16, ProvisionError> {
-    // Establish that the daemon is up BEFORE interpreting any container state:
-    // every `docker` call below reads a down daemon as some other failure.
     match docker_daemon_state() {
         DaemonState::Ready => {}
         DaemonState::Unreachable(detail) => {
@@ -1044,17 +872,12 @@ async fn ensure_docker_cluster(container: &str, password: &str) -> Result<u16, P
     Ok(host_port)
 }
 
-/// The dev cluster's password: `~/.lucidos/` [`SHARED_PG_PASSWORD_FILE`],
-/// minted on first use. See that constant for why dev needs one.
 fn shared_pg_password() -> Result<String, BoxError> {
     Ok(crate::diagnostic_log::secret(
         lucidos_local_token::ensure_named(SHARED_PG_PASSWORD_FILE)?,
     ))
 }
 
-/// `docker run` for the shared cluster. It names `POSTGRES_PASSWORD` without a
-/// value, so Docker reads it from the environment. The secret stays out of
-/// argv, where `ps` shows it to every local user.
 fn docker_run_args(container: &str, port: u16) -> Vec<String> {
     [
         "run",
@@ -1083,11 +906,6 @@ fn docker_run_args(container: &str, port: u16) -> Vec<String> {
     .to_vec()
 }
 
-/// Set the role's password to the minted secret, on every start.
-///
-/// A cluster created before the secret existed still holds the old public
-/// password, and the image applies `POSTGRES_PASSWORD` only on first init. The
-/// statement goes in on stdin, so the secret never reaches argv.
 fn set_password_docker(container: &str, password: &str) -> Result<(), BoxError> {
     use std::io::Write as _;
     use std::process::Stdio;
@@ -1169,8 +987,6 @@ fn classify_container_state(
         )
         .into());
     }
-    // A successful inventory, rather than an inspect error, establishes absence.
-    // Docker's name filter is a substring match, so compare exact names here.
     let text = std::str::from_utf8(&out.stdout)?;
     let mut result = ContainerState::Absent;
     let mut found = false;
@@ -1194,7 +1010,6 @@ fn classify_container_state(
     Ok(result)
 }
 
-/// Read the loopback host port Docker published for the container's 5432.
 fn docker_published_port(container: &str) -> Result<u16, BoxError> {
     let out = Command::new("docker")
         .args(["port", container, "5432/tcp"])
@@ -1280,7 +1095,6 @@ fn drop_database_docker(container: &str, database: &str) -> Result<(), BoxError>
     psql_query_docker(container, PG_ADMIN_DATABASE, &drop_agent_role(database)).map(|_| ())
 }
 
-/// The database's agent role goes with it. The engine created it at boot.
 fn drop_agent_role(database: &str) -> String {
     format!(
         "DROP ROLE IF EXISTS {}",
@@ -1297,8 +1111,6 @@ fn verify_database_docker(container: &str, database: &str) -> Result<(), BoxErro
     }
 }
 
-// ── Embedded backend (packaged) ─────────────────────────────────────────────
-
 async fn ensure_embedded(
     bin: &Path,
     lib: &Path,
@@ -1307,8 +1119,6 @@ async fn ensure_embedded(
     legacy_url: Option<&str>,
 ) -> Result<Provisioned, ProvisionError> {
     let data = embedded_data_dir(app_data);
-    // The socket directory is named after the canonical data dir, so the data
-    // dir must exist first. initdb takes an existing empty directory.
     std::fs::create_dir_all(&data)
         .map_err(|e| ProvisionError::transient(format!("cannot create {}: {e}", data.display())))?;
     let socket_dir = embedded_socket_dir(&data)?;
@@ -1362,41 +1172,10 @@ fn teardown_embedded_workspace_with(
     socket: impl FnOnce(&Path) -> Result<PathBuf, ProvisionError>,
 ) -> Result<(), BoxError> {
     let data = embedded_data_dir(app_data);
-    // Cleanup must observe the existing cluster, never provision or repair it.
-    // A missing version file does not establish database absence: a repair
-    // could `initdb` an empty cluster and "delete" from it while the original
-    // database still exists elsewhere. An unavailable cluster leaves the recovery journal for a later retry.
     let socket_dir = socket(&data).map_err(|e| -> BoxError { Box::new(e) })?;
     drop_database_embedded(bin, lib, &socket_dir, database)
 }
 
-/// Ensure a usable embedded cluster runs at `data`, reachable on `socket_dir`
-/// alone.
-///
-/// The cluster has no TCP listener. Its one socket sits in `socket_dir`, which
-/// only this user can enter. Role [`PG_USER`] signs in with the password kept
-/// beside it ([`embedded_password`]), so this user's sandboxed agents cannot.
-///
-/// Both auth files and the password are set before every start. So a cluster
-/// an older build made with trust or peer auth converges here, data intact.
-/// An adopted cluster converges in place, with a reload.
-///
-/// The lifecycle is **self-healing** where healing loses nothing, so a stale or
-/// orphaned same-major cluster never blocks a fresh start:
-///
-///  * **Foreign-major data dir**: the bundled binaries cannot open a data dir
-///    from another PostgreSQL major, and no cross-major path exists. So this
-///    refuses it, terminally, and leaves it exactly as found (ADR 0626).
-///  * **Adopt only when safe** — a reported-running cluster is adopted ONLY when
-///    a real connection on `socket_dir` succeeds AND its major version matches
-///    the bundled binaries. A cluster an older build started answers on TCP and
-///    in `/tmp`, never here, so it is stopped and restarted like a wedged one.
-///  * **Stale lock** — a leftover `postmaster.pid` from an unclean stop is
-///    cleared via the same robust teardown before a fresh start.
-///
-/// Teardown only ever targets THIS data dir (`pg_ctl -D <data>`) or the single
-/// PID recorded in its `postmaster.pid` — never a broad kill, so concurrent
-/// workspace engines and other-version bundles on the machine are untouched.
 fn ensure_embedded_cluster(
     bin: &Path,
     lib: &Path,
@@ -1405,27 +1184,18 @@ fn ensure_embedded_cluster(
 ) -> Result<(), ProvisionError> {
     let bundled = bundled_major(bin, lib)?;
 
-    // Only a dir with no PG_VERSION gets initdb, and the major check below
-    // never refuses one.
     if !data.join("PG_VERSION").exists() {
         initdb_cluster(bin, lib, data)?;
     }
 
-    // The `credentials` table sits in here in plaintext (ADR 0153). A
-    // file-level copy of a live cluster is a torn read anyway, and the copy
-    // that restores is the workspace's own `pg_dump`-backed backup. This runs
-    // on every start, so a cluster older than the ADR converges on its next.
-    // It sets an attribute and reads no data, so a refused dir gets it too.
     crate::file_backup::exclude(data, "Postgres data dir");
 
-    // This check runs before any stop or start on `data`.
     if let Some(data_major) = read_data_dir_major(data).filter(|&m| m != bundled) {
         let refusal = foreign_major_refusal(data, data_major, bundled);
         crate::log_legacy!("[Gateway] {}", refusal.message);
         return Err(refusal);
     }
 
-    // Adopt an already-running cluster ONLY if it is reachable AND version-matched.
     if pg_ctl_status(bin, lib, data) {
         if should_adopt(probe_running_major(bin, lib, socket_dir), bundled) {
             crate::log_legacy!(
@@ -1444,24 +1214,18 @@ fn ensure_embedded_cluster(
         );
         stop_cluster_robustly(bin, lib, data);
     } else if data.join("postmaster.pid").exists() {
-        // Not running, but a leftover lock from an unclean stop — clear it.
         stop_cluster_robustly(bin, lib, data);
     }
 
-    // The cluster socket directory outlives a reboot, unlike `/tmp`, so the
-    // lock Postgres keeps beside its socket can be stale the same way.
     remove_lock_naming_another_program(&embedded_socket_lock(socket_dir));
     set_password_single_user(bin, lib, data, &embedded_password(socket_dir)?)?;
     write_auth_files(data)?;
     let log = data.join("server.log");
     let log_s = log.to_string_lossy().to_string();
     let opts = embedded_start_options(socket_dir);
-    // `-w` returns once the postmaster accepts connections, so no poll follows.
     pg_ctl(bin, lib, data, &["-l", &log_s, "-o", &opts, "-w", "start"]).map_err(|e| {
         ProvisionError::transient(format!("{e}. The server log is {}", log.display()))
     })?;
-    // Single-user mode reports a failed statement on stderr, not in its exit
-    // status. A sign-in with the password is the proof it took.
     psql_query_embedded(bin, lib, socket_dir, PG_ADMIN_DATABASE, "SELECT 1")
         .map(|_| ())
         .map_err(|e| {
@@ -1471,9 +1235,6 @@ fn ensure_embedded_cluster(
         })
 }
 
-/// Set [`PG_USER`]'s password while the cluster at `data` is stopped, through
-/// single-user mode. It needs no sign-in, so it works whatever the auth files
-/// said before. The statement goes on stdin, never argv.
 fn set_password_single_user(
     bin: &Path,
     lib: &Path,
@@ -1509,9 +1270,6 @@ fn set_password_single_user(
     Ok(())
 }
 
-/// An adopted cluster keeps the connection ceiling it started with until its
-/// next restart. Restarting it here would cut every running engine off, so
-/// the gateway only says so.
 fn warn_on_low_connection_ceiling(bin: &Path, lib: &Path, socket_dir: &Path) {
     match psql_query_embedded(bin, lib, socket_dir, PG_ADMIN_DATABASE, "SHOW max_connections")
         .map(|value| value.trim().parse::<u32>())
@@ -1528,8 +1286,6 @@ fn warn_on_low_connection_ceiling(bin: &Path, lib: &Path, socket_dir: &Path) {
     }
 }
 
-/// Converge an adopted cluster: set the password over a connection the
-/// rules in force admit, then write password-only auth and reload on every retry.
 fn converge_running_auth(
     bin: &Path,
     lib: &Path,
@@ -1542,31 +1298,19 @@ fn converge_running_auth(
             "setting the embedded Postgres password failed: {e}"
         ))
     })?;
-    // Matching files do not prove a previous reload succeeded. Always reload.
     write_auth_files(data)?;
     pg_ctl(bin, lib, data, &["reload"])
         .map_err(|e| ProvisionError::transient(format!("reloading embedded Postgres: {e}")))
 }
 
-/// The embedded cluster's port. Each cluster has its own socket directory, so
-/// the port need not be unique. libpq's default lets a bare `psql -h <dir>` in.
 const EMBEDDED_PORT: u16 = lucidos_pg_url::DEFAULT_PORT;
 
-/// The name of the cluster socket directory under the run directory.
 const EMBEDDED_SOCKET_PREFIX: &str = "pg";
 
-/// The superuser password's file, in the cluster socket directory.
 const EMBEDDED_PASSWORD_FILE: &str = "superuser-password";
 
-/// The libpq password file for the superuser, beside the password.
 const EMBEDDED_PASSFILE: &str = "superuser.pgpass";
 
-/// The superuser password of the cluster whose socket sits in `socket_dir`,
-/// minted on first use.
-///
-/// Kept beside the socket it opens, so every cluster has its own, and a
-/// test's cluster never touches the machine's. The socket directory is in the
-/// private subtree, which an agent's sandbox denies (ADR 0645).
 fn embedded_password(socket_dir: &Path) -> Result<String, ProvisionError> {
     lucidos_local_token::ensure_at(&socket_dir.join(EMBEDDED_PASSWORD_FILE))
         .map(crate::diagnostic_log::secret)
@@ -1578,11 +1322,6 @@ fn embedded_password(socket_dir: &Path) -> Result<String, ProvisionError> {
         })
 }
 
-/// The libpq password file signing [`PG_USER`] in to the cluster on
-/// `socket_dir`, rewritten from the password whenever it differs.
-///
-/// Clients get its path, never the password. On macOS any same-user process
-/// reads another's environment, sandboxed or not (ADR 0645).
 fn embedded_passfile(socket_dir: &Path) -> Result<PathBuf, ProvisionError> {
     let path = socket_dir.join(EMBEDDED_PASSFILE);
     let line = lucidos_pg_url::passfile_line(PG_USER, &embedded_password(socket_dir)?);
@@ -1600,25 +1339,19 @@ fn embedded_passfile(socket_dir: &Path) -> Result<PathBuf, ProvisionError> {
     Ok(path)
 }
 
-/// The socket file Postgres binds in the cluster socket directory.
 fn embedded_socket_name() -> String {
     format!(".s.PGSQL.{EMBEDDED_PORT}")
 }
 
-/// The lock file Postgres keeps beside its socket in `socket_dir`.
 fn embedded_socket_lock(socket_dir: &Path) -> PathBuf {
     socket_dir.join(format!("{}.lock", embedded_socket_name()))
 }
 
-/// The cluster socket directory for the data dir `data`, which must exist:
-/// `<run directory>/pg-<digest>`, owner-only.
 fn embedded_socket_dir(data: &Path) -> Result<PathBuf, ProvisionError> {
     lucidos_engine_socket::owner_only_subdir(EMBEDDED_SOCKET_PREFIX, data, &embedded_socket_name())
         .map_err(|e| {
             let message = format!("the Postgres socket directory cannot be used: {e}");
             match e.kind() {
-                // A loose or foreign directory, or a path past the kernel
-                // limit, stays that way until a person changes it.
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput => {
                     ProvisionError::terminal(message)
                 }
@@ -1628,8 +1361,6 @@ fn embedded_socket_dir(data: &Path) -> Result<PathBuf, ProvisionError> {
         .and_then(require_utf8_socket_dir)
 }
 
-/// Refuse a socket directory that is not UTF-8. The start options and the URL
-/// are both text, so a lossy copy would name a directory that does not exist.
 fn require_utf8_socket_dir(dir: PathBuf) -> Result<PathBuf, ProvisionError> {
     if dir.to_str().is_some() {
         return Ok(dir);
@@ -1640,12 +1371,6 @@ fn require_utf8_socket_dir(dir: PathBuf) -> Result<PathBuf, ProvisionError> {
     )))
 }
 
-/// The postmaster options `pg_ctl -o` passes on. No TCP listener, one
-/// owner-only socket in `socket_dir`, and the shared connection ceiling.
-///
-/// `pg_ctl` hands the string to `/bin/sh`, so each argument is shell-quoted.
-/// The directory is also double-quoted inside the setting, which Postgres
-/// reads as a comma-separated list.
 fn embedded_start_options(socket_dir: &Path) -> String {
     let dir = socket_dir.to_string_lossy().replace('"', "\"\"");
     [
@@ -1666,12 +1391,10 @@ fn embedded_start_options(socket_dir: &Path) -> String {
     .join(" ")
 }
 
-/// `arg` as one `/bin/sh` word.
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-/// Write password-only local authentication before startup or reload.
 fn write_auth_files(data: &Path) -> Result<(), ProvisionError> {
     for (name, body) in [
         ("pg_hba.conf", pg_hba_conf()),
@@ -1688,7 +1411,6 @@ fn write_auth_files(data: &Path) -> Result<(), ProvisionError> {
 const AUTH_FILE_HEADER: &str =
     "# Written by the Lucidos gateway before every start. Edits here are lost.\n";
 
-/// Agent roles and the superuser always need their own passwords.
 fn pg_hba_conf() -> String {
     let agents = lucidos_pg_url::AGENT_ROLE_GROUP;
     format!(
@@ -1697,8 +1419,6 @@ fn pg_hba_conf() -> String {
     )
 }
 
-/// `initdb` a fresh cluster at `data` (UTF-8, every sign-in rejected), on
-/// first run only. [`write_auth_files`] opens it before the first start.
 fn initdb_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<(), BoxError> {
     std::fs::create_dir_all(data)?;
     let mut cmd = Command::new(bin.join("initdb"));
@@ -1717,7 +1437,6 @@ fn initdb_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Major version of the bundled PostgreSQL binaries (`postgres --version`).
 fn bundled_major(bin: &Path, lib: &Path) -> Result<u16, BoxError> {
     let mut cmd = Command::new(bin.join("postgres"));
     with_pg_libpath(&mut cmd, lib);
@@ -1740,15 +1459,10 @@ fn bundled_major(bin: &Path, lib: &Path) -> Result<u16, BoxError> {
     })
 }
 
-/// Major version recorded in the data dir's `PG_VERSION` file (the authoritative
-/// on-disk catalog major), or `None` when the dir is not yet initialized.
 fn read_data_dir_major(data: &Path) -> Option<u16> {
     parse_pg_major(&std::fs::read_to_string(data.join("PG_VERSION")).ok()?)
 }
 
-/// Probe a running cluster on `socket_dir` with a real query
-/// (`SHOW server_version_num`). Returns its major version, or `None` when
-/// unreachable — so a single call proves BOTH reachability and version.
 fn probe_running_major(bin: &Path, lib: &Path, socket_dir: &Path) -> Option<u16> {
     let version = psql_query_embedded(
         bin,
@@ -1760,16 +1474,10 @@ fn probe_running_major(bin: &Path, lib: &Path, socket_dir: &Path) -> Option<u16>
     parse_pg_major(&version.ok()?)
 }
 
-/// Whether a reachable running cluster should be adopted: reachable AND its major
-/// matches the bundled binaries. `None` (unreachable) never adopts.
 fn should_adopt(reachable_major: Option<u16>, bundled_major: u16) -> bool {
     reachable_major == Some(bundled_major)
 }
 
-/// The terminal refusal for a data dir from another Postgres major. Its message
-/// reaches the boot splash, so it says what to do and that nothing was lost.
-/// Newer data came from a newer Lucidos release, which the user can reinstall.
-/// Older data did not, since no shipped release bundled a major below 18.
 fn foreign_major_refusal(data: &Path, data_major: u16, bundled_major: u16) -> ProvisionError {
     let way_back = if data_major > bundled_major {
         format!(
@@ -1790,9 +1498,6 @@ fn foreign_major_refusal(data: &Path, data_major: u16, bundled_major: u16) -> Pr
     ))
 }
 
-/// Parse a PostgreSQL major version from any of the shapes we read:
-/// `postgres (PostgreSQL) 18.4` → 18, a `PG_VERSION` body `18` → 18, and a
-/// `server_version_num` `180004` → 18 (values ≥ 10000 are the numeric form).
 fn parse_pg_major(s: &str) -> Option<u16> {
     let digits: String = s
         .chars()
@@ -1804,14 +1509,7 @@ fn parse_pg_major(s: &str) -> Option<u16> {
     u16::try_from(major).ok()
 }
 
-/// Stop the cluster at `data` as robustly as possible, only ever targeting THIS
-/// data dir or the single PID recorded in its `postmaster.pid`. Best-effort:
-/// graceful (`-m fast`) → immediate (`-m immediate`) → kill the recorded PID →
-/// remove the stale lock file. Every fallback is logged; never a broad kill.
 pub(crate) fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
-    // An unclean stop (a crash, a power loss) leaves `postmaster.pid` behind,
-    // and after a reboot its pid may belong to an unrelated app. `pg_ctl` and
-    // the fallback below would both signal it, so drop the lock instead.
     let postmaster_pid = data.join("postmaster.pid");
     if remove_lock_naming_another_program(&postmaster_pid) {
         return;
@@ -1822,8 +1520,6 @@ pub(crate) fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
     if pg_ctl(bin, lib, data, &["-m", "immediate", "-w", "stop"]).is_ok() {
         return;
     }
-    // pg_ctl could not stop it (foreign binaries, or a wedged/half-dead
-    // postmaster). Fall back to signalling the single PID from postmaster.pid.
     if let Some(pid) = read_postmaster_pid(data) {
         crate::log_legacy!(
             "[Gateway] pg_ctl stop failed for {} — killing recorded postmaster pid {}",
@@ -1835,12 +1531,6 @@ pub(crate) fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
     remove_stale_lock(&postmaster_pid);
 }
 
-/// Remove `lock`, a Postgres lock file, when the pid in it provably runs some
-/// other program. Returns whether it did.
-///
-/// An unclean stop leaves the lock behind, and after a reboot its pid may
-/// belong to an unrelated app of this user. Postgres then refuses to start, and
-/// `pg_ctl` would signal that app.
 fn remove_lock_naming_another_program(lock: &Path) -> bool {
     let Some(exe) = lock_names_another_program(lock) else {
         return false;
@@ -1854,7 +1544,6 @@ fn remove_lock_naming_another_program(lock: &Path) -> bool {
     true
 }
 
-/// Remove a stale lock file, so a fresh start is not blocked by it.
 fn remove_stale_lock(lock: &Path) {
     if lock.exists() {
         if let Err(e) = std::fs::remove_file(lock) {
@@ -1863,7 +1552,6 @@ fn remove_stale_lock(lock: &Path) {
     }
 }
 
-/// The program the lock file `lock` names, when that is provably not Postgres.
 #[cfg(unix)]
 fn lock_names_another_program(lock: &Path) -> Option<PathBuf> {
     let pid = u32::try_from(read_lock_pid(lock)?).ok()?;
@@ -1875,17 +1563,14 @@ fn lock_names_another_program(_lock: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The embedded cluster's data directory, shared by every workspace.
 pub(crate) fn embedded_data_dir(app_data: &Path) -> PathBuf {
     app_data.join("pgdata")
 }
 
-/// First line of `postmaster.pid` — the postmaster PID.
 pub(crate) fn read_postmaster_pid(data: &Path) -> Option<i32> {
     read_lock_pid(&data.join("postmaster.pid"))
 }
 
-/// First line of a Postgres lock file: the pid of the process holding it.
 fn read_lock_pid(lock: &Path) -> Option<i32> {
     std::fs::read_to_string(lock)
         .ok()?
@@ -1896,12 +1581,8 @@ fn read_lock_pid(lock: &Path) -> Option<i32> {
         .ok()
 }
 
-/// SIGTERM a single PID, wait briefly, then SIGKILL if still alive. Targets only
-/// the given PID (read from this cluster's postmaster.pid); never a broad kill.
 #[cfg(unix)]
 fn kill_pid_graceful_then_force(pid: i32) {
-    // A corrupt lock naming 0 or a negative pid would make `kill` signal a
-    // whole process group, or every process this user owns.
     if pid <= 0 {
         return;
     }
@@ -1912,7 +1593,7 @@ fn kill_pid_graceful_then_force(pid: i32) {
     for _ in 0..20 {
         // SAFETY: signal 0 performs an existence check without delivering a signal.
         if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-            return; // exited
+            return;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1925,12 +1606,6 @@ fn kill_pid_graceful_then_force(pid: i32) {
 #[cfg(not(unix))]
 fn kill_pid_graceful_then_force(_pid: i32) {}
 
-/// The engine's URL for `database` on the socket in `socket_dir`. The port is
-/// spelled out, since sqlx and libpq would otherwise take an inherited
-/// `PGPORT`. Everything sits in the query, since sqlx refuses an empty host.
-///
-/// It names the `passfile`, never the password, because the URL reaches the
-/// engine through its environment. The engine reads the file at boot.
 fn embedded_database_url(socket_dir: &Path, database: &str, passfile: &Path) -> String {
     let enc = |path: &Path| urlencoding::encode(&path.to_string_lossy()).into_owned();
     format!(
@@ -1940,8 +1615,6 @@ fn embedded_database_url(socket_dir: &Path, database: &str, passfile: &Path) -> 
     )
 }
 
-/// The bundled client `tool`, signed in to the cluster on `socket_dir` as
-/// [`PG_USER`] through its password file, never `PGPASSWORD`.
 fn embedded_client(
     bin: &Path,
     lib: &Path,
@@ -2062,8 +1735,6 @@ fn with_pg_libpath(cmd: &mut Command, lib: &Path) {
     cmd.env("LD_LIBRARY_PATH", lib);
 }
 
-// ── Legacy URL migration ───────────────────────────────────────────────────
-
 #[derive(Clone)]
 enum Toolchain {
     Host,
@@ -2098,8 +1769,6 @@ where
 {
     let source = PgUrl::parse(source_url)?;
     let target = PgUrl::parse(target_url)?;
-    // pg_dump writes a plaintext dump under the umask, so it goes in an
-    // owner-only directory that is removed with the dump on every return.
     let dump_dir = tempfile::Builder::new()
         .prefix("lucidos-gateway-migrate-")
         .tempdir()?;
@@ -2168,8 +1837,6 @@ fn command_output(mut cmd: Command, label: &str) -> Result<String, BoxError> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Point a PostgreSQL client tool at `url` through libpq's `PG*` env, so the
-/// password stays out of argv.
 fn apply_pg_env(cmd: &mut Command, url: &PgUrl) {
     for (key, value) in url.env() {
         cmd.env(key, value);
@@ -2184,12 +1851,6 @@ fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-// ── Readiness ───────────────────────────────────────────────────────────────
-
-/// Poll until the Docker cluster's `host:port` accepts a TCP connection, or the
-/// deadline passes. A TCP connect proves the postmaster is listening; the engine
-/// then runs its own pooled connect + migrations (which retry/fail loudly).
-/// The embedded cluster needs none: `pg_ctl -w start` returns once it is ready.
 async fn wait_for_pg(url: &str, timeout: Duration) -> Result<(), BoxError> {
     let parsed = PgUrl::parse(url)?;
     let Host::Tcp(host) = parsed.host else {
@@ -2211,8 +1872,6 @@ async fn wait_for_pg(url: &str, timeout: Duration) -> Result<(), BoxError> {
     }
 }
 
-/// One TCP connect attempt with a short per-attempt timeout, off the async
-/// reactor's critical path via `spawn_blocking` (DNS + connect can block).
 async fn tcp_connect(host: &str, port: u16) -> Result<(), String> {
     let host = host.to_string();
     tokio::task::spawn_blocking(move || {
@@ -2312,7 +1971,6 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         std::fs::write(data.join("PG_VERSION"), "1\n").unwrap();
         let psql = root.path().join("psql");
-        // Only the SQL client exists. Any lifecycle probe, init or start fails.
         std::fs::write(&psql, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.calls\"\n").unwrap();
         std::fs::set_permissions(&psql, std::fs::Permissions::from_mode(0o700)).unwrap();
         super::teardown_embedded_workspace_with(
@@ -2607,8 +2265,6 @@ mod tests {
     }
     use super::*;
 
-    /// Build a fake relocatable-PG tree (bin/postgres, lib/, share/) under a temp
-    /// dir; returns (root, bin, lib).
     fn fake_pg_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let bin = root.path().join("bin");
@@ -2645,25 +2301,15 @@ mod tests {
 
     #[test]
     fn validate_embedded_pg_dirs_rejects_missing_share() {
-        // The relocatable-PG share/ dependency (#11): initdb resolves bin/../share.
         let (root, bin, lib) = fake_pg_tree();
         std::fs::remove_dir_all(root.path().join("share")).unwrap();
         let err = validate_embedded_pg_dirs(&bin, &lib).expect_err("missing share must error");
         assert!(err.to_string().contains("share"), "{err}");
     }
 
-    // ── Provisioning-failure classification ──────────────────────────────────
-    // A workspace whose provisioning failed once is retried unless the failure
-    // is provably hopeless (ADR 0014, 2026-08-03). These pin which is which, and
-    // pin that the Docker verdict comes from an EXIT STATUS rather than the text
-    // of an error message.
-
-    /// Build a fake `docker version` result with the given exit code.
     fn probe_exit(code: i32, stderr: &str) -> std::io::Result<std::process::Output> {
         use std::os::unix::process::ExitStatusExt;
         Ok(std::process::Output {
-            // `from_raw` takes a wait(2) status: the exit code sits in the high
-            // byte, so code 1 is 0x0100.
             status: std::process::ExitStatus::from_raw(code << 8),
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
@@ -2698,10 +2344,7 @@ mod tests {
 
     #[test]
     fn daemon_probe_reads_the_exit_status_not_the_message() {
-        // Exit 0: the daemon filled in the server half of `docker version`.
         assert_eq!(classify_daemon_probe(probe_exit(0, "")), DaemonState::Ready);
-        // Non-zero: unreachable, whatever the wording. The stderr is carried for
-        // the log only, so a Docker release that rewords it changes nothing.
         assert_eq!(
             classify_daemon_probe(probe_exit(1, "failed to connect to the docker API")),
             DaemonState::Unreachable("failed to connect to the docker API".to_string())
@@ -2714,8 +2357,6 @@ mod tests {
 
     #[test]
     fn missing_docker_binary_is_distinct_from_a_down_daemon() {
-        // Spawn-level NotFound means no `docker` on PATH, which waiting cannot
-        // fix; anything else the spawn can fail with is treated as unreachable.
         assert_eq!(
             classify_daemon_probe(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
             DaemonState::CliMissing
@@ -2732,9 +2373,6 @@ mod tests {
 
     #[test]
     fn unclassified_provisioning_failures_default_to_transient() {
-        // The safety property behind incremental classification: a `?` on any
-        // helper that has not been classified is retryable, so no unclassified
-        // failure can latch a workspace dead.
         let e: ProvisionError = (Box::from("psql failed: connection reset") as BoxError).into();
         assert_eq!(e.kind, ProvisionErrorKind::Transient);
         assert_eq!(e.to_string(), "psql failed: connection reset");
@@ -2746,11 +2384,6 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_workspace_id_is_terminal() {
-        // A malformed id cannot become valid by waiting, so it must NOT spend
-        // the retry budget. Reached before any backend call, so no daemon or
-        // bundled cluster is needed.
-        // Matched rather than `expect_err`, which would need `Provisioned: Debug`
-        // and so put a password-bearing database URL one derive away from a log.
         let Err(err) = ensure(&PgBackend::Docker, "../bad", Path::new("/tmp"), None).await else {
             panic!("an invalid workspace id must fail");
         };
@@ -2758,11 +2391,6 @@ mod tests {
         assert!(err.to_string().contains("../bad"), "{err}");
     }
 
-    /// The real `docker` CLI, pointed at a socket that does not exist, must
-    /// classify as `Unreachable` (the 2026-08-03 login race). Skips when the CLI
-    /// is absent, like the gated embedded-cluster tests below. `DOCKER_HOST` is
-    /// set on THIS command only, never on the process env, so a parallel test
-    /// cannot see it.
     #[test]
     fn gated_real_docker_cli_with_no_daemon_is_unreachable() {
         let probe = Command::new("docker")
@@ -2781,9 +2409,6 @@ mod tests {
         );
     }
 
-    /// The secret reaches `docker run` through the environment. A value in
-    /// argv would show in `ps` to every local user. The PGDATA mount stays a
-    /// named volume at the parent PG 18 relocated it under.
     #[test]
     fn docker_run_names_the_password_and_never_its_value() {
         let args = docker_run_args(SHARED_DOCKER_CONTAINER, 5435);
@@ -2842,32 +2467,23 @@ mod tests {
 
     #[test]
     fn parse_pg_major_handles_every_shape_we_read() {
-        // `postgres --version` output.
         assert_eq!(parse_pg_major("postgres (PostgreSQL) 18.4"), Some(18));
         assert_eq!(parse_pg_major("postgres (PostgreSQL) 17.2\n"), Some(17));
-        // `PG_VERSION` file body.
         assert_eq!(parse_pg_major("18\n"), Some(18));
         assert_eq!(parse_pg_major("17"), Some(17));
-        // `SHOW server_version_num` (numeric form, ≥ 10000 → divide).
         assert_eq!(parse_pg_major("180004"), Some(18));
         assert_eq!(parse_pg_major("170002"), Some(17));
-        // Garbage / empty.
         assert_eq!(parse_pg_major(""), None);
         assert_eq!(parse_pg_major("not a version"), None);
     }
 
     #[test]
     fn should_adopt_only_when_reachable_and_version_matched() {
-        // Reachable + same major → adopt.
         assert!(should_adopt(Some(18), 18));
-        // Reachable but foreign major → do not adopt.
         assert!(!should_adopt(Some(17), 18));
-        // Unreachable (probe returned None) → never adopt.
         assert!(!should_adopt(None, 18));
     }
 
-    /// A `bin` dir whose every Postgres tool appends its name and args to
-    /// `calls`. Only `postgres --version` answers, as v18.
     fn logging_pg_bin(dir: &Path) -> PathBuf {
         let bin = dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -2887,8 +2503,6 @@ mod tests {
         bin
     }
 
-    /// No cross-major path exists, so a data dir from another major is refused
-    /// and left exactly as found: no stop, no rename, no `initdb` (ADR 0626).
     #[test]
     fn ensure_embedded_cluster_refuses_a_foreign_major_data_dir_and_touches_nothing() {
         for (data_major, way_back) in [(17, "from a backup"), (19, "bundles Postgres 19")] {
@@ -2938,14 +2552,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        // No files yet → None (first run / no running cluster).
         assert_eq!(read_data_dir_major(dir), None);
         assert_eq!(read_postmaster_pid(dir), None);
 
         std::fs::write(dir.join("PG_VERSION"), "18\n").unwrap();
         assert_eq!(read_data_dir_major(dir), Some(18));
 
-        // postmaster.pid: line 1 = pid, line 2 = data dir, line 4 = port.
         std::fs::write(
             dir.join("postmaster.pid"),
             "4242\n/some/data\n1700000000\n5599\n127.0.0.1\n",
@@ -2954,10 +2566,6 @@ mod tests {
         assert_eq!(read_postmaster_pid(dir), Some(4242));
     }
 
-    // ── The socket-only embedded cluster, without binaries ───────────────────
-
-    /// A directory with a space (`Application Support`) and an `@` (a home
-    /// named after an email address) survives the URL both ways.
     #[test]
     fn the_embedded_url_names_the_socket_directory_and_its_passfile() {
         let dir = Path::new("/Users/me.x@example.com/.lucidos/run/pg x");
@@ -2972,8 +2580,6 @@ mod tests {
         assert_eq!(parsed.database, "lucidos_myws");
     }
 
-    /// The URL an engine boots with resolves to the cluster's password, and
-    /// the file is owner-only.
     #[test]
     fn the_passfile_signs_in_with_the_cluster_password() {
         let dir = tempfile::tempdir().unwrap();
@@ -2989,8 +2595,6 @@ mod tests {
         assert_eq!(embedded_passfile(dir.path()).unwrap(), passfile);
     }
 
-    /// `pg_ctl` runs `-o` through `/bin/sh`, so the real shell reads the
-    /// options back here. A quote or space in `HOME` must not split a word.
     #[test]
     fn the_start_options_survive_the_shell_with_any_directory() {
         let dir = Path::new("/home/u'x \"y\"/.lucidos/run/pg-0123");
@@ -3027,8 +2631,6 @@ mod tests {
         text.lines().filter(|l| !l.starts_with('#')).collect()
     }
 
-    /// The literals pin the file format Postgres reads, so they are spelled out.
-    /// No peer rule: it would admit an agent's subprocess (ADR 0645).
     #[test]
     fn the_auth_files_admit_password_holders_over_the_socket_alone() {
         assert_eq!(
@@ -3040,7 +2642,6 @@ mod tests {
         );
     }
 
-    /// Each cluster mints its own password, beside its socket, at 0600.
     #[test]
     fn the_password_is_minted_once_beside_the_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -3064,20 +2665,15 @@ mod tests {
         assert_eq!(require_utf8_socket_dir(good.clone()).unwrap(), good);
     }
 
-    /// A crash leaves the socket lock behind, and the directory outlives a
-    /// reboot. A lock naming a live program that is not Postgres is stale.
     #[test]
     fn a_socket_lock_naming_another_program_is_removed() {
         let dir = tempfile::tempdir().unwrap();
         let lock = embedded_socket_lock(dir.path());
-        // This test binary is alive and is not Postgres.
         std::fs::write(&lock, format!("{}\n/data\n", std::process::id())).unwrap();
         assert!(remove_lock_naming_another_program(&lock));
         assert!(!lock.exists());
     }
 
-    /// A pid nobody holds is Postgres's own case: it removes such a lock
-    /// itself. The gateway only removes what it can prove is stale.
     #[test]
     fn a_socket_lock_naming_no_live_program_is_left_to_postgres() {
         let dir = tempfile::tempdir().unwrap();
@@ -3087,29 +2683,12 @@ mod tests {
         assert!(lock.exists());
     }
 
-    // ── Gated embedded-cluster integration tests ─────────────────────────────
-    //
-    // These drive `ensure_embedded_cluster` against REAL bundled PostgreSQL
-    // binaries, so they need `LUCIDOS_PG_BIN_DIR` + `LUCIDOS_PG_LIB_DIR` (the
-    // relocatable bundle, as set in packaged builds / `build-dmg.sh`). The
-    // standard test env (`test-engine.sh`'s Docker PG) ships no such binaries, so
-    // they GRACEFULLY SKIP when the env is absent — never red the suite — the same
-    // resilience pattern as the `real-embedder-tests` gate. Run them with the
-    // binaries present to exercise the lifecycle wiring end-to-end.
-
-    /// Bundled PG dirs for the gated tests, or `None` to skip.
     fn gated_pg_dirs() -> Option<(PathBuf, PathBuf)> {
         let bin = std::env::var_os("LUCIDOS_PG_BIN_DIR")?;
         let lib = std::env::var_os("LUCIDOS_PG_LIB_DIR")?;
         Some((PathBuf::from(bin), PathBuf::from(lib)))
     }
 
-    /// A throwaway cluster: a parent dir holding `pgdata`, so any sibling a
-    /// repair might create lands inside it, and a cluster socket directory.
-    ///
-    /// The run directory stands in for the real one. It sits in `/tmp` to
-    /// fit `sun_path`. Its name holds a space and a quote, which the shell and
-    /// Postgres's directory list must both carry through.
     struct GatedCluster {
         parent: tempfile::TempDir,
         _run: tempfile::TempDir,
@@ -3152,13 +2731,11 @@ mod tests {
 
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// Line `n` (from 1) of `postmaster.pid`.
     fn postmaster_pid_line(data: &Path, n: usize) -> String {
         let text = std::fs::read_to_string(data.join("postmaster.pid")).unwrap();
         text.lines().nth(n - 1).unwrap_or("").trim().to_string()
     }
 
-    /// Whether `pid` holds any TCP socket, by `lsof`. `None` without `lsof`.
     fn process_has_tcp_socket(pid: i32) -> Option<bool> {
         let out = Command::new("lsof")
             .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP"])
@@ -3167,8 +2744,6 @@ mod tests {
         Some(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
     }
 
-    /// I1, I2 and I3: no TCP listener, one owner-only socket in the cluster
-    /// socket directory, and password-only authentication files.
     #[test]
     fn gated_the_cluster_listens_on_its_owner_only_socket_alone() {
         let Some((bin, lib)) = gated_pg_dirs() else {
@@ -3214,9 +2789,6 @@ mod tests {
         stop_cluster_robustly(&bin, &lib, &c.data);
     }
 
-    /// The socket invariant (ADR 0645): this OS user, presenting no password,
-    /// does not get a session as [`PG_USER`]. An agent's subprocess is
-    /// exactly that caller.
     fn assert_refuses_the_passwordless(bin: &Path, lib: &Path, socket_dir: &Path) {
         let out = passwordless_sign_in(bin, lib, socket_dir);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -3224,12 +2796,10 @@ mod tests {
         assert!(stderr.contains("password"), "{stderr}");
     }
 
-    /// Whether this OS user, presenting no password, gets a session.
     fn admits_the_passwordless(bin: &Path, lib: &Path, socket_dir: &Path) -> bool {
         passwordless_sign_in(bin, lib, socket_dir).status.success()
     }
 
-    /// `psql` as [`PG_USER`] with no password from anywhere, never prompting.
     fn passwordless_sign_in(bin: &Path, lib: &Path, socket_dir: &Path) -> std::process::Output {
         let mut psql = Command::new(bin.join("psql"));
         with_pg_libpath(&mut psql, lib);
@@ -3243,8 +2813,6 @@ mod tests {
         psql.output().unwrap()
     }
 
-    /// An adopted peer cluster converges even when disk already says password-only.
-    /// This reproduces a failed reload followed by another provisioning attempt.
     #[test]
     fn gated_a_running_peer_cluster_converges_in_place() {
         let Some((bin, lib)) = gated_pg_dirs() else {
@@ -3262,7 +2830,6 @@ mod tests {
             initdb.output().unwrap().status.success(),
             "old-style initdb"
         );
-        // Reproduce the previous release's peer-only cluster.
         let os_user = Command::new("id").arg("-un").output().unwrap();
         assert!(os_user.status.success());
         let os_user = String::from_utf8(os_user.stdout).unwrap();
@@ -3295,11 +2862,9 @@ mod tests {
         )
         .unwrap();
 
-        // Disk matches the desired config, but Postgres still enforces peer.
         write_auth_files(&c.data).unwrap();
         assert!(admits_the_passwordless(&bin, &lib, &c.socket_dir));
 
-        // Adoption calls this convergence with the existing cluster's socket.
         converge_running_auth(&bin, &lib, &c.data, &c.socket_dir).unwrap();
 
         assert_eq!(
@@ -3308,7 +2873,6 @@ mod tests {
             "adopted, not restarted"
         );
         assert_refuses_the_passwordless(&bin, &lib, &c.socket_dir);
-        // Repeated provisioning, including after gateway adoption, cannot downgrade auth.
         ensure_embedded_cluster(&bin, &lib, &c.data, &c.socket_dir).unwrap();
         assert_refuses_the_passwordless(&bin, &lib, &c.socket_dir);
         assert!(database_exists_embedded(&bin, &lib, &c.socket_dir, "lucidos_gated").unwrap());
@@ -3316,8 +2880,6 @@ mod tests {
         stop_cluster_robustly(&bin, &lib, &c.data);
     }
 
-    /// I4: a cluster an older build made (trust auth, loopback TCP, still
-    /// running) converges on the next ensure, its data intact.
     #[test]
     fn gated_an_old_trust_cluster_converges_with_its_data() {
         let Some((bin, lib)) = gated_pg_dirs() else {
@@ -3401,8 +2963,6 @@ mod tests {
         stop_cluster_robustly(&bin, &lib, &c.data);
     }
 
-    /// Stale lock (unclean stop) must recover by restarting the SAME data dir —
-    /// no wipe — with the prior data intact.
     #[test]
     fn gated_stale_lock_recovers_and_preserves_data() {
         let Some((bin, lib)) = gated_pg_dirs() else {
@@ -3414,7 +2974,6 @@ mod tests {
         let c = gated_cluster();
         let socket = &c.socket_dir;
 
-        // First start: real cluster + a marker row in a workspace database.
         ensure_embedded_cluster(&bin, &lib, &c.data, socket).unwrap();
         create_database_embedded(&bin, &lib, socket, "lucidos_gated").unwrap();
         psql_query_embedded(
@@ -3426,8 +2985,6 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate an orphan / unclean stop: SIGKILL the postmaster, leaving its
-        // stale postmaster.pid behind.
         let pid = read_postmaster_pid(&c.data).expect("postmaster.pid");
         // SAFETY: SIGKILL to this test cluster's own recorded postmaster pid.
         unsafe {
@@ -3435,12 +2992,10 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(300));
 
-        // Recover: restart the SAME data dir (crash recovery), row survives.
         ensure_embedded_cluster(&bin, &lib, &c.data, socket).unwrap();
         let got =
             psql_query_embedded(&bin, &lib, socket, "lucidos_gated", "SELECT x FROM t").unwrap();
         assert_eq!(got.trim(), "7", "data must survive a stale-lock recovery");
-        // The data dir was NOT moved aside.
         assert!(
             !sibling_foreign_dir_exists(c.parent.path()),
             "same-version recovery must not move the data dir aside"
@@ -3449,8 +3004,6 @@ mod tests {
         stop_cluster_robustly(&bin, &lib, &c.data);
     }
 
-    /// After an unclean stop and a reboot, both lock files can name a pid the
-    /// OS has handed to another program of this user. The cluster still starts.
     #[test]
     fn gated_locks_naming_a_reused_pid_do_not_block_the_next_start() {
         let Some((bin, lib)) = gated_pg_dirs() else {
@@ -3466,9 +3019,6 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(300));
 
-        // A `sleep` stands in for the app that took the pid. Not this test
-        // binary: `pg_ctl` names its caller as the postmaster's grandparent,
-        // and Postgres ignores a lock naming that pid.
         let mut app = Command::new("sleep").arg("60").spawn().unwrap();
         let reused = app.id().to_string();
         for lock in [
@@ -3489,8 +3039,6 @@ mod tests {
         stop_cluster_robustly(&bin, &lib, &c.data);
     }
 
-    /// A real cluster forged to a foreign major is refused, stays in place with
-    /// its data, and opens again once its major matches.
     #[test]
     fn gated_foreign_version_is_refused_and_left_in_place() {
         let Some((bin, lib)) = gated_pg_dirs() else {
@@ -3533,7 +3081,6 @@ mod tests {
         assert_eq!(kept.unwrap(), "1", "the original cluster's data survived");
     }
 
-    /// Whether a `*.foreign-*` sibling of the data dir exists under `parent`.
     fn sibling_foreign_dir_exists(parent: &Path) -> bool {
         std::fs::read_dir(parent)
             .map(|rd| {

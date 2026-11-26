@@ -3,10 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::*;
 use crate::tests::{fresh_ca, verify};
 
-/// Apple's cap on a TLS server certificate's validity.
 const APPLE_MAX_LEAF: Duration = Duration::from_secs(825 * 24 * 60 * 60);
 
-/// A clock a test moves by hand, in seconds past `start`.
 fn manual_clock(start: SystemTime) -> (Arc<AtomicU64>, Clock) {
     let offset = Arc::new(AtomicU64::new(0));
     let read = offset.clone();
@@ -60,7 +58,6 @@ fn nothing_is_served_past_not_after() {
     let start = SystemTime::now();
     let (offset, clock) = manual_clock(start);
     let resolver = LeafResolver::with_clock(ca, clock, Box::new(|_| {})).unwrap();
-    // A renewal that never happened: the leaf minted at start is still held.
     resolver.current.lock().unwrap().renew_at = start + LEAF_LIFETIME * 10;
 
     offset.store(LEAF_LIFETIME.as_secs() - 1, Ordering::SeqCst);
@@ -91,7 +88,6 @@ fn the_preview_leaf_is_owner_only_and_chains_to_the_ca() {
     KeyPair::from_pem(&std::fs::read_to_string(&written.key).unwrap()).unwrap();
 }
 
-/// Answer one request on `listener` over TLS from `config`, with a fixed body.
 async fn answer_once(listener: tokio::net::TcpListener, config: Arc<rustls::ServerConfig>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (stream, _) = listener.accept().await.unwrap();

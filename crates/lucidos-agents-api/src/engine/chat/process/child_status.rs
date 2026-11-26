@@ -1,16 +1,3 @@
-//! The *child-status block*: each direct child thread's liveness, read at the
-//! start of the turn and carried in the turn tail (ADR 0679).
-//!
-//! A parent learns about a child from its reports (`CHILD_REPORT_EVENT_TYPES`). When
-//! the user carries on in the child directly, no new report arrives, and the
-//! parent's newest fact goes stale without looking stale. This block puts the
-//! child's state now beside the age of its newest report, so a stale claim
-//! contradicts something the agent can see.
-//!
-//! The guidance is [`CHILD_STATUS_POINTER`], a `const` for the cached system
-//! block. The reading varies per thread and per turn, so it rides in the tail
-//! like the rest of [`super::turn_tail`].
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -20,10 +7,8 @@ use crate::engine::thread_events::WakeSource;
 use crate::engine::thread_liveness::{liveness_for_threads, LivenessHold, ThreadLiveness};
 use crate::engine::widget_guidance::truncate_on_word_boundary;
 
-/// The most children the block lists. The rest collapse into one count line.
 pub(super) const CHILD_STATUS_ROWS: usize = 8;
 
-/// The turn tail carries previews. A thread read gives the full evidence.
 const WAIT_DETAIL_CHARS: usize = 120;
 
 pub(super) const CHILD_STATUS_POINTER: &str = "\n\nCHILD THREADS:\n\
@@ -31,16 +16,13 @@ pub(super) const CHILD_STATUS_POINTER: &str = "\n\nCHILD THREADS:\n\
      thread's state NOW and its last report to you. It beats any earlier report \
      or message of yours.";
 
-/// One child, as the block renders it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ChildStatus {
     pub title: Option<String>,
     pub liveness: ThreadLiveness,
-    /// Age of the child's newest report on this thread, woken or filed.
     pub report_age_secs: Option<i64>,
 }
 
-/// The listed children, newest activity first, and how many more there are.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct ChildStatuses {
     pub listed: Vec<ChildStatus>,
@@ -55,7 +37,6 @@ struct ChildRow {
     total: i64,
 }
 
-/// The block for `thread_id`, empty when it has no unarchived children.
 pub(super) async fn child_status_block(pool: &PgPool, thread_id: Uuid) -> String {
     let read = read_child_statuses(pool, thread_id).await;
     if let Err(e) = &read {
@@ -109,8 +90,6 @@ async fn read_child_statuses(pool: &PgPool, thread_id: Uuid) -> Result<ChildStat
     })
 }
 
-/// The block text. A failed read says so, rather than vanishing, so the agent
-/// knows it has no reading and must look before claiming a state.
 pub(super) fn render_child_status(read: Result<&ChildStatuses, ()>) -> String {
     let body = match read {
         Err(()) => "Unreadable this turn. Read a child's liveness before stating it.".to_string(),

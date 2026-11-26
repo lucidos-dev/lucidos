@@ -1,8 +1,3 @@
-//! The *standing apply* over HTTP: arm, read back, disarm.
-//!
-//! ADR 0168 clause 5. The engine-side verdict is unit-tested in
-//! `engine::standing_apply`; this covers the surface the buttons press.
-
 use crate::support::{base_url, db_url, http_client, seed_cc_thread_summary, user_client};
 use serde_json::json;
 use uuid::Uuid;
@@ -41,9 +36,6 @@ async fn armed_threads(client: &reqwest::Client) -> Vec<String> {
         .collect()
 }
 
-/// The round trip: arm a working thread, see it in the changes payload, take it
-/// back. That payload is what every surface reads to draw the armed face, so a
-/// silent omission there is an armed thread nobody can disarm.
 #[tokio::test]
 async fn arming_a_standing_apply_shows_up_and_can_be_taken_back() {
     let client = user_client().await;
@@ -108,9 +100,6 @@ async fn arming_a_standing_apply_shows_up_and_can_be_taken_back() {
     );
 }
 
-/// An arm names a change, and that change must be the named thread's own.
-/// Binding one thread's arm to another's change would apply, on this thread's
-/// settle, work the owner never looked at.
 #[tokio::test]
 async fn an_arm_refuses_a_change_belonging_to_another_thread() {
     let client = user_client().await;
@@ -151,10 +140,6 @@ async fn an_arm_refuses_a_change_belonging_to_another_thread() {
     );
 }
 
-/// A standing apply is an Apply, one settle later, so it is offered exactly
-/// where Apply is. Lucidos never merges into an external repo. Such a thread
-/// proposes nothing either, so an arm on one waits for a change that never
-/// comes.
 #[tokio::test]
 async fn an_arm_refuses_a_repo_lucidos_never_applies_into() {
     let client = user_client().await;
@@ -193,11 +178,6 @@ async fn an_arm_refuses_a_repo_lucidos_never_applies_into() {
     );
 }
 
-/// The workspace-scope off, for the prompt and the CLI. It takes back every arm
-/// here, whether a sweep set it or the owner armed one change.
-///
-/// Both threads must leave `standing_apply_thread_ids`, because that payload is
-/// the only armed signal any surface reads.
 #[tokio::test]
 async fn the_workspace_off_takes_back_every_arm() {
     let client = user_client().await;
@@ -255,8 +235,6 @@ async fn the_workspace_off_takes_back_every_arm() {
     );
 }
 
-/// A caller presenting no credential cannot cancel the owner's instruction.
-/// `api::mutating_gate` answers before the handler (ADR 0169).
 #[tokio::test]
 async fn an_unidentified_disarm_is_refused() {
     let client = http_client();
@@ -277,8 +255,6 @@ async fn an_unidentified_disarm_is_refused() {
     }
 }
 
-/// Disarming a thread that carries nothing is a 404, not a silent success. The
-/// caller asked to take back an instruction that was not there.
 #[tokio::test]
 async fn disarming_an_unarmed_thread_is_a_not_found() {
     let client = user_client().await;

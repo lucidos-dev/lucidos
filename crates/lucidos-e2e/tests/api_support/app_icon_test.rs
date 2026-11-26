@@ -1,10 +1,3 @@
-//! An app icon reaches the apps list only as a path inside the app folder.
-//! The app file route then serves it (ADR 0414, invariants I1 and I2).
-//!
-//! `core/apps.rs` covers every refused shape. Only a booted engine shows the
-//! list and the route agree: the URL the frontend builds from `icon` loads, and
-//! an icon that points out of the folder never reaches the list at all.
-
 use crate::support::{
     base_url, remove_data_fixtures, unique_marker, user_client, workspace_tree_lock,
     write_data_fixture,
@@ -30,8 +23,6 @@ async fn listed_icon(client: &reqwest::Client, app_id: &str) -> Option<String> {
     app["icon"].as_str().map(str::to_string)
 }
 
-/// One test, because it writes into the workspace tree and holds its lock for
-/// the whole sequence.
 #[tokio::test]
 async fn a_listed_icon_loads_and_an_escaping_one_is_never_listed() {
     let client = user_client().await;

@@ -1,30 +1,17 @@
-//! This node's TLS certificate, fetched from tailscaled.
-//!
-//! tailscaled gets the certificate from its control server, which issues one
-//! only for the node's own name. So the caller passes the name tailscaled
-//! itself reported ([`crate::TailnetNode::https_name`]), and this module never
-//! builds or guesses one.
-
 use std::time::Duration;
 
 use crate::discovery::{discover, Endpoint, Platform};
 use crate::{localapi, Answer, SystemProbes};
 
-/// A first issuance waits on the control server's ACME order, which can take
-/// tens of seconds. A cached certificate comes back at once.
 const CERT_TIMEOUT: Duration = Duration::from_secs(90);
 
 const CERT_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 
-/// A certificate chain and its private key, both PEM.
 pub struct CertPair {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
 }
 
-/// Ask tailscaled for the certificate of `name`, this node's own name.
-/// Blocking, for up to a minute and a half; call it off any async worker.
-/// `Err` is one sentence for the user on what went wrong.
 pub fn cert_pair(name: &str) -> Result<CertPair, String> {
     let found = discover(Platform::current(), &SystemProbes);
     fetch(&found.endpoints, name, |endpoint, path| {
@@ -63,7 +50,6 @@ fn fetch(
     })
 }
 
-/// tailscaled's own reason, plus the fix when it is a permission refusal.
 fn refusal(status_line: &str, body: &str) -> String {
     let reason = match body.trim() {
         "" => status_line,
@@ -79,7 +65,6 @@ fn refusal(status_line: &str, body: &str) -> String {
     sentence
 }
 
-/// `type=pair` answers with the key PEM, then the certificate chain PEM.
 fn split_pair(body: &str) -> Result<CertPair, String> {
     let split = body
         .find(CERT_BEGIN)
@@ -94,7 +79,6 @@ fn split_pair(body: &str) -> Result<CertPair, String> {
     })
 }
 
-/// Letters, digits, hyphens and dots only: the name goes into a URL path.
 fn is_dns_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 253

@@ -1,10 +1,6 @@
 use super::super::*;
 use super::*;
 
-/// Legacy per-commit ChangeProposed (empty change_id, populated commit_sha)
-/// must stay inert. Immediate Diff-button visibility comes from the
-/// coding-agent post-commit hook refreshing the branch work directly, not
-/// from creating a partial proposal event.
 #[tokio::test]
 async fn per_commit_change_proposed_does_not_change_the_change_state() {
     let (pool, db_name) = setup_test_db().await;
@@ -95,8 +91,6 @@ async fn branch_work_refresh_sets_unproposed_and_broadcasts_aggregate() {
     teardown_test_db(&db_name).await;
 }
 
-/// The post-commit hook never touches a proposal: a pending change owns the
-/// `proposed` state, and an empty branch fact cannot clear it.
 #[tokio::test]
 async fn branch_work_refresh_leaves_a_proposed_thread_alone() {
     let (pool, db_name) = setup_test_db().await;
@@ -119,7 +113,6 @@ async fn branch_work_refresh_leaves_a_proposed_thread_alone() {
     teardown_test_db(&db_name).await;
 }
 
-/// Seed branch work, emit `event`, and return the change state it leaves.
 async fn state_after_clearing_event(event: ThreadEvent) -> CodingAgentChangeState {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -147,8 +140,6 @@ async fn state_after_clearing_event(event: ThreadEvent) -> CodingAgentChangeStat
     state
 }
 
-/// ChangeApplied clears the state: the merge resolved everything to main, so
-/// `git diff main..branch` is now empty.
 #[tokio::test]
 async fn change_applied_clears_the_change_state() {
     let state = state_after_clearing_event(ThreadEvent::ChangeApplied {
@@ -168,8 +159,6 @@ async fn change_applied_clears_the_change_state() {
     assert_eq!(state, CodingAgentChangeState::None);
 }
 
-/// ChangeDiscarded clears the state: the branch is being thrown away, so even
-/// a non-empty diff surfaces no Diff button.
 #[tokio::test]
 async fn change_discarded_clears_the_change_state() {
     let state = state_after_clearing_event(ThreadEvent::ChangeDiscarded {
@@ -181,19 +170,12 @@ async fn change_discarded_clears_the_change_state() {
     assert_eq!(state, CodingAgentChangeState::None);
 }
 
-/// ThreadArchived clears the state: the thread is leaving the inbox, so the
-/// Diff button should not surface for it.
 #[tokio::test]
 async fn thread_archived_clears_the_change_state() {
     let state = state_after_clearing_event(ThreadEvent::ThreadArchived).await;
     assert_eq!(state, CodingAgentChangeState::None);
 }
 
-/// Regression: `POST /api/v1/events/emit` used to drop the request actor on the
-/// floor — every persisted DomainEvent row landed with no `actor` field, so
-/// the UI couldn't attribute the emit to a device. EventBus now merges the
-/// actor into the inner payload so a SELECT on the persisted row sees the
-/// same shape as every other actor-bearing event.
 #[tokio::test]
 async fn domain_event_persisted_payload_carries_actor_when_provided() {
     let (pool, db_name) = setup_test_db().await;
@@ -234,9 +216,6 @@ async fn domain_event_persisted_payload_carries_actor_when_provided() {
     teardown_test_db(&db_name).await;
 }
 
-/// Engine-internal callers (LLM tool, scheduler) pass `actor: None`. The
-/// persisted payload must be unchanged — adding a `null` actor key would
-/// litter every existing domain event consumer with a useless field.
 #[tokio::test]
 async fn domain_event_persisted_payload_unchanged_when_actor_none() {
     let (pool, db_name) = setup_test_db().await;
@@ -269,12 +248,6 @@ async fn domain_event_persisted_payload_unchanged_when_actor_none() {
     teardown_test_db(&db_name).await;
 }
 
-/// Wave-4 actor-stamped mutating endpoints: each new `SystemEvent` variant
-/// must be `is_persisted=true` so it lands in the events table, must round-trip
-/// through serde (`to_payload` produces a JSON object the projection can
-/// store), and must carry the `actor` field through to the persisted row.
-/// One test covers all 15 variants — exhaustive enum match keeps the list
-/// honest when a future variant is added.
 #[tokio::test]
 async fn wave4_mutating_endpoint_events_persist_with_actor() {
     let (pool, db_name) = setup_test_db().await;
@@ -284,9 +257,6 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
         device_id: "dev-wave4".to_string(),
     };
 
-    // Construct one of every new variant. Exhaustive enum match below
-    // catches drift: any new variant that's not listed here forces the
-    // author to make a deliberate choice about whether it needs a test row.
     let variants: Vec<SystemEvent> = vec![
         SystemEvent::PinnedAppPinned {
             app_id: "habit-tracker".into(),
@@ -377,9 +347,6 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
             .unwrap()
             .expect("persisted SystemEvent must return EmitResult");
 
-        // Query the most recent row of this event_type and assert the
-        // actor field is populated. event_type uniqueness across variants
-        // in this test makes the latest-row lookup deterministic.
         let payload: serde_json::Value = sqlx::query_scalar(
             "SELECT payload FROM events WHERE event_type = $1 ORDER BY sequence DESC LIMIT 1",
         )
@@ -388,9 +355,6 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
         .await
         .unwrap_or_else(|e| panic!("{event_type} missing from events table: {e}"));
 
-        // System-event payloads use serde's tagged-enum shape
-        // (`{"type": "...", "data": {...}}` via `#[serde(tag="type",
-        // content="data")]`), so the actor field lands inside `data`.
         let inner = payload.get("data").unwrap_or(&payload);
         let payload_actor = inner
             .get("actor")
@@ -410,9 +374,6 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
     teardown_test_db(&db_name).await;
 }
 
-/// Per-commit ChangeProposed (empty change_id, commit_sha set) is inert in
-/// the projection: must NOT flip the chip, touch status, or insert into
-/// `changes`. Aggregate end-of-turn emit is the sole writer.
 #[tokio::test]
 async fn per_commit_change_proposed_does_not_flip_chip() {
     let (pool, db_name) = setup_test_db().await;
@@ -438,8 +399,6 @@ async fn per_commit_change_proposed_does_not_flip_chip() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    // SessionStarted left status='running'; a per-commit emit must NOT touch
-    // it (no promotion to 'waiting', no demotion to 'idle' — it's inert).
     assert_eq!(
         status, "running",
         "per-commit ChangeProposed must NOT change status (it's inert)"
@@ -450,7 +409,6 @@ async fn per_commit_change_proposed_does_not_flip_chip() {
          only the aggregate end-of-turn emit means 'real finished work'"
     );
 
-    // Also verify nothing landed in the `changes` table (no aggregate row).
     let changes_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM changes WHERE thread_id = $1")
             .bind(thread_id)
@@ -466,9 +424,6 @@ async fn per_commit_change_proposed_does_not_flip_chip() {
     teardown_test_db(&db_name).await;
 }
 
-/// `proposed` is a cache of the `changes` table. The next sync corrects a
-/// `proposed` thread with no pending row to where it lands, restart cleared.
-/// A thread whose pending change is real stays `proposed`.
 #[tokio::test]
 async fn the_proposal_sync_clears_an_orphan_proposed_state() {
     let (pool, db_name) = setup_test_db().await;

@@ -33,7 +33,6 @@ fn row(f: impl FnOnce(&mut TriageFacts)) -> TriageRow {
     }
 }
 
-/// A family of `open` inbox sub-threads, `pinned` of them pinned.
 fn family(open: usize, pinned: usize, f: impl FnOnce(&mut TriageFacts)) -> TriageRow {
     let mut row = row(f);
     row.facts.sub_thread_count = open as i64;
@@ -42,8 +41,6 @@ fn family(open: usize, pinned: usize, f: impl FnOnce(&mut TriageFacts)) -> Triag
     row
 }
 
-/// The confirm archives the safe rows, counts the rest once each by their
-/// first reason, and ignores pinned rows: they live in Pinned, not Current.
 #[test]
 fn the_preflight_counts_what_stays_and_skips_pinned_rows() {
     let rows = vec![
@@ -72,9 +69,6 @@ fn the_preflight_counts_what_stays_and_skips_pinned_rows() {
     assert!(p.safe.iter().all(|s| s.thread_id != pinned));
 }
 
-/// The confirm counts inbox threads as the Current badge does, so what goes and
-/// what stays add up to it. A kept family counts once under its reason and
-/// its other threads beside it. A pinned sub-thread stays open.
 #[test]
 fn the_preflight_counts_every_inbox_thread_in_a_family() {
     let rows = vec![
@@ -100,9 +94,6 @@ fn the_preflight_counts_every_inbox_thread_in_a_family() {
     assert_eq!(p.safe_thread_count + p.kept_thread_count, current_badge);
 }
 
-/// Archive all follows the drawer's families. A root under a pinned family is
-/// in Pinned, so it is neither archived nor counted. A pinned root in a family
-/// Current shows renders in Current and stays open, so it counts as kept.
 #[test]
 fn the_preflight_follows_the_drawers_families() {
     let top = Uuid::new_v4();
@@ -137,8 +128,6 @@ fn the_preflight_follows_the_drawers_families() {
     assert_eq!(p.kept_thread_count, 0, "alone, its family sits in Pinned");
 }
 
-/// A kept entry carries how many inbox threads stayed with it, so the result
-/// toast counts threads like the confirm did.
 #[test]
 fn a_kept_entry_counts_the_threads_that_stayed() {
     let asking = family(2, 0, |f| f.has_pending_question = true);
@@ -157,8 +146,6 @@ fn a_kept_entry_counts_the_threads_that_stayed() {
     assert_eq!(count(gone), 1);
 }
 
-/// The confirm is the ceiling: an id is archived only if the user confirmed
-/// it and it is still safe now.
 #[test]
 fn only_confirmed_ids_that_are_still_safe_are_archived() {
     let safe = row(|_| {});
@@ -194,8 +181,6 @@ fn only_confirmed_ids_that_are_still_safe_are_archived() {
     assert_eq!(reason(gone), "it no longer exists");
 }
 
-/// Each id that changed since the confirm carries a slug the client words as
-/// the confirm does, naming the refusal that fired.
 #[test]
 fn a_changed_id_carries_the_slug_of_its_refusal() {
     let now_asking = row(|f| f.has_pending_question = true);
@@ -223,7 +208,6 @@ fn a_changed_id_carries_the_slug_of_its_refusal() {
     assert_eq!(slugs, ["question", "busy", "pinned", "archived", "gone"]);
 }
 
-/// A row with several reasons gets the slug of the one `refuse_fresh` names.
 #[test]
 fn a_row_with_several_reasons_is_slugged_by_the_refusal_that_fires() {
     let pinned_and_asking = row(|f| {
@@ -252,8 +236,6 @@ fn a_row_with_several_reasons_is_slugged_by_the_refusal_that_fires() {
     assert_eq!(slugs, ["question", "busy", "archived"]);
 }
 
-/// A family the cascade refused is counted by its blocker, a sub-thread's
-/// included; anything else it refuses is still working.
 #[test]
 fn a_refused_cascade_is_counted_by_its_blocker() {
     use crate::engine::thread_lifecycle::Blocker;
@@ -300,7 +282,6 @@ fn completed_selection_requires_output_and_reuses_every_safety_refusal() {
     );
 }
 
-/// A pinned parent keeps itself open, not its finished sub-threads.
 #[test]
 fn completed_selection_ignores_a_pin_inherited_from_the_family_root() {
     let mut inherited = row(|_| {});

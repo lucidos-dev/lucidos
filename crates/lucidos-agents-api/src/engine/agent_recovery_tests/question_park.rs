@@ -1,20 +1,3 @@
-//! Tests for the preserve predicate: `thread_has_unanswered_question` and the
-//! `unanswered_question_exists_sql` fragment behind it.
-//!
-//! "Parked on a question" is what every restart-abort path keys on to decide
-//! whether a thread is a resumable checkpoint (leave it alone, the card stays
-//! answerable) or an interrupted turn (abort it, surface Continue). Getting the
-//! boundary wrong is expensive in both directions, so each event class that can
-//! land after a `UserQuestionAsked` gets a case here.
-//!
-//! Regression driving the progression half (2026-08-01): the teardown Esc'd a
-//! session parked on an unanswered `AskUserQuestion`, so Claude Code recorded a
-//! rejection the user never made as a `CodingAgentToolResult` and raced past the
-//! question. The predicate was terminals-only, so it still reported the thread as
-//! preserved. Recovery skipped it, no terminator ever landed, and the thread read
-//! "Working" forever with a struck-through card the user could not answer. See
-//! `docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`.
-
 use std::collections::HashSet;
 
 use crate::engine::agent_question::aq_test_helpers::{emit_user_question, seed_cc_thread};
@@ -29,8 +12,6 @@ use crate::runtime::CodingAgent;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
-/// Seed a question-parked coding-agent thread, emit `after` (if any), and return
-/// whether the predicate still reports the thread as parked.
 async fn parked_after(after: Option<ThreadEvent>) -> bool {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -85,9 +66,6 @@ async fn answer_ends_the_park() {
     );
 }
 
-/// The reproduction. Claude Code's canned message for a refused tool: the Esc at
-/// teardown cancelled the pending `AskUserQuestion`, and by the time this lands
-/// the card on screen is already struck through.
 #[tokio::test]
 async fn rejected_tool_result_ends_the_park() {
     assert!(
@@ -106,8 +84,6 @@ async fn rejected_tool_result_ends_the_park() {
     );
 }
 
-/// A command started before the question can finish while the question is open.
-/// That result completes an older call, so the card is still live.
 #[tokio::test]
 async fn a_late_result_of_an_earlier_call_keeps_the_park() {
     assert!(
@@ -157,10 +133,6 @@ async fn terminal_ends_the_park() {
     );
 }
 
-/// `docs/code-review-priors.md`: recovery re-emits the pending change as
-/// `incomplete` BEFORE consulting the preserve guard, deliberately. That re-emit
-/// must NOT read as the agent racing past the question, or the guard would
-/// defeat itself on every parked thread that has a pending change.
 #[tokio::test]
 async fn pending_change_reemit_keeps_the_park() {
     assert!(
@@ -185,10 +157,6 @@ async fn pending_change_reemit_keeps_the_park() {
     );
 }
 
-/// The turn-moved-on list is the shared overtaken set plus exactly two turn
-/// ends. An answer ends the park only when it pairs with the card's own
-/// `tool_use_id`, so it is not in the list. Asserting the whole set catches a
-/// hand-edit of the SQL: a dropped name widens the preserve guard.
 #[test]
 fn park_ends_on_a_moved_on_turn_or_the_cards_own_answer() {
     let sql = unanswered_question_exists_sql("$1");
@@ -215,9 +183,6 @@ fn park_ends_on_a_moved_on_turn_or_the_cards_own_answer() {
         "an answer closes only its own card"
     );
 
-    // The pre-2026-08-01 terminals-only list must remain a subset: widening the
-    // guard must never DROP a terminal, or an aborted thread would read as
-    // preserved and never be settled.
     for terminal in [
         "ResponseAborted",
         "CodingAgentIdled",
@@ -230,15 +195,9 @@ fn park_ends_on_a_moved_on_turn_or_the_cards_own_answer() {
         );
     }
 
-    // `ChangeProposed` is deliberately absent (see
-    // `pending_change_reemit_keeps_the_park` and `docs/code-review-priors.md`).
     assert!(!listed.contains("ChangeProposed"));
 }
 
-/// `preserve_question_park_at_shutdown` is the one decision both teardown sites
-/// make: `shutdown_agent_sessions` (skip the Esc) and `run_session`'s stop /
-/// chat-cancel arms (skip the terminal and the text flush). Its two halves are
-/// the cause gate and the shared predicate, and both are load-bearing.
 mod preserve_at_shutdown {
     use super::*;
 
@@ -273,9 +232,6 @@ mod preserve_at_shutdown {
         );
     }
 
-    /// The cause gate. A user Stop / Apply / Discard / Archive with a question on
-    /// screen is a deliberate end-of-turn, and those paths cancel-stamp the card
-    /// themselves. Dropping the gate would silently swallow their terminal.
     #[tokio::test]
     async fn does_not_preserve_a_user_stop() {
         let preserved = with_parked_thread(|pool, tid| async move {
@@ -288,8 +244,6 @@ mod preserve_at_shutdown {
         );
     }
 
-    /// A session mid-work at teardown is an interrupted turn: it keeps today's
-    /// graceful Esc and its boundary terminal, so the user gets Continue.
     #[tokio::test]
     async fn does_not_preserve_a_working_session() {
         let (pool, db_name) = setup_test_db().await;
@@ -306,10 +260,6 @@ mod preserve_at_shutdown {
         teardown_test_db(&db_name).await;
     }
 
-    /// The reproduction, from the teardown's point of view. Once the agent has
-    /// raced past the question there is nothing left to preserve, so the teardown
-    /// must fall through to the normal abort path rather than leave the turn with
-    /// no terminator at all.
     #[tokio::test]
     async fn does_not_preserve_an_overtaken_question() {
         let (pool, db_name) = setup_test_db().await;
@@ -345,19 +295,8 @@ mod preserve_at_shutdown {
     }
 }
 
-/// Wiring tripwire. There is no test harness that can construct a
-/// `LucidosEngine`, so the two teardown call sites cannot be driven end to end
-/// from a unit test. Pin them by source instead: dropping either call silently
-/// restores the 2026-08-01 bug (an Esc'd question, or a terminal / text flush
-/// landing after it), and every behavioural test above would still pass because
-/// they exercise the guard directly.
 #[test]
 fn both_teardown_sites_consult_the_preserve_guard() {
-    // Each needle matches the CALL, not the bare name: both files also mention
-    // the guard in prose (a doc link, and the comment block explaining why the
-    // Esc is skipped). A substring check on the name alone would stay green if
-    // someone deleted the call and left the comment that explains it, which is
-    // the likeliest accidental regression of the two.
     for (label, source, needles) in [
         (
             "shutdown_agent_sessions (skips Claude Code's Esc)",
@@ -367,13 +306,6 @@ fn both_teardown_sites_consult_the_preserve_guard() {
         (
             "emit_stop_terminal (skips the terminal and the text flush)",
             include_str!("../agent_session/runtime_helpers.rs"),
-            // The second needle pins the WIDENING, which the guard depends on
-            // and does not perform: the parameter arrives as the PER-SESSION
-            // flag, which reads `false` for a session inserted after
-            // `shutdown_agent_sessions` took its pass, and un-widened it would
-            // un-guard the very race the guard's doc names. Every behavioural
-            // test would still pass, because they drive the guard directly
-            // rather than through this call site.
             &[
                 "question_park_sql::preserve_question_park_at_shutdown(",
                 "let is_shutdown = self.session_is_shutting_down(is_shutdown);",
@@ -389,13 +321,6 @@ fn both_teardown_sites_consult_the_preserve_guard() {
         }
     }
 
-    // The needles above prove the widening EXISTS and the guard is CALLED. They
-    // do not, on their own, prove the guard is handed the widened value: moving
-    // the rebinding below the call, or passing the raw parameter while keeping
-    // the shadow for `stop_terminal_kind`, would satisfy both and silently
-    // restore the race. Before 2026-08-06 the second needle was the call's own
-    // argument expression, so it carried that proof; the named accessor moved
-    // the widening onto its own line and cost it. Pin the ORDER back.
     let source = include_str!("../agent_session/runtime_helpers.rs");
     let widen_at = source
         .find("let is_shutdown = self.session_is_shutting_down(is_shutdown);")
@@ -409,8 +334,6 @@ fn both_teardown_sites_consult_the_preserve_guard() {
          reads it, or the guard runs on the per-session flag alone and a session \
          registered after the teardown snapshot loses its question park"
     );
-    // And the guard must actually receive that binding rather than some other
-    // expression. The call spans a few lines, so look at its argument list.
     let guard_call = &source[guard_at..(guard_at + 240).min(source.len())];
     assert!(
         guard_call.contains("is_shutdown,"),
@@ -419,9 +342,6 @@ fn both_teardown_sites_consult_the_preserve_guard() {
     );
 }
 
-/// The row half of the predicate, for a reader that needs the question rather
-/// than a yes or no. A *voice session* opens with it, and the talker holds no
-/// tools, so a question absent from that block is one it cannot look up.
 #[tokio::test]
 async fn the_open_question_reads_back_with_its_choices() {
     let (pool, db_name) = setup_test_db().await;
@@ -443,8 +363,6 @@ async fn the_open_question_reads_back_with_its_choices() {
     teardown_test_db(&db_name).await;
 }
 
-/// It shares the park predicate with the bool guard, so an answer closes both.
-/// Reading out a settled question is the failure this prevents.
 #[tokio::test]
 async fn an_answered_question_reads_back_as_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -477,8 +395,6 @@ async fn an_answered_question_reads_back_as_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// A thread nobody asked anything has no open question, and the reader says so
-/// rather than erroring. Every call on an ordinary thread takes this path.
 #[tokio::test]
 async fn a_thread_with_no_question_reads_back_as_nothing() {
     let (pool, db_name) = setup_test_db().await;

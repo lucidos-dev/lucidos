@@ -3,7 +3,11 @@ import { chainTo, srcPath, staticGraph } from './staticImportGraph';
 
 describe('the entry chunk leaves the scroll engine to the shell', () => {
   const graph = staticGraph(srcPath('main.tsx'));
-  const engineModules = ['scrollState.ts', 'readerInput.ts', 'scrollLedger.ts', 'classifiedScroll.ts'].map((name) => srcPath(`components/chat/${name}`));
+  const engineModules = [
+    'scrollState', 'readerInput', 'scrollLedger', 'classifiedScroll', 'scrollOwner',
+    'scrollSurface', 'scrollNavigation', 'scrollHold', 'scrollRide', 'scrollLink',
+    'scrollLanding', 'scrollObservers',
+  ].map((name) => srcPath(`components/chat/${name}.ts`));
 
   it('reaches the store and the handle, so the walk itself works', () => {
     expect(graph.has(srcPath('store/actions/threads.ts'))).toBe(true);

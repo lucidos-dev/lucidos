@@ -1,9 +1,3 @@
-//! Real children under the real sandbox: the seatbelt on macOS, Landlock on
-//! Linux. Linux runs it in a container, as a non-root user, from a static
-//! binary that any image runs. Build it with
-//! `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo test
-//! --target aarch64-unknown-linux-musl --no-run`.
-
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::path::{Path, PathBuf};
@@ -42,7 +36,6 @@ impl Tree {
         }
     }
 
-    /// Whether `script` succeeds as a sandboxed `sh -c`.
     fn sandboxed(&self, script: &str) -> bool {
         self.sandboxed_under(&self.policy(), script)
     }
@@ -61,8 +54,6 @@ impl Tree {
         out.status.success()
     }
 
-    /// The tree's policy narrowed to a trigger's write scope: `scope/` and
-    /// `/dev`.
     fn trigger_policy(&self) -> Policy {
         std::fs::create_dir_all(self.top.join("scope")).unwrap();
         Policy {
@@ -76,8 +67,6 @@ impl Tree {
     }
 }
 
-/// A confinement test never passes without the real sandbox, so a failed
-/// probe fails the test rather than skipping it.
 fn require_sandbox() {
     if let Availability::Unavailable(why) = probe() {
         panic!("the real sandbox is unavailable: {why}");
@@ -98,8 +87,6 @@ fn a_hidden_file_cannot_be_read_written_or_replaced() {
     assert_eq!(std::fs::read_to_string(&secret).unwrap(), "s3cret");
 }
 
-/// Renaming a folder above a fenced root would carry the root out from under
-/// a rule that binds its path.
 #[test]
 #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
 fn a_folder_above_a_fenced_root_cannot_be_moved() {
@@ -326,7 +313,6 @@ fn one_hidden_socket_connects_without_opening_its_folder() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Linux does not gate pathname-socket connects, even inside hidden folders.
     #[cfg(target_os = "macos")]
     assert!(!connect(&sibling).status.success());
     for (program, path) in [
@@ -348,9 +334,6 @@ fn one_hidden_socket_connects_without_opening_its_folder() {
     }
 }
 
-/// A trigger's write scope: outside it, neither contents nor metadata change.
-/// Metadata needs the read-only mounts on Linux; under Landlock alone the
-/// sandbox reports that gap through `guards_metadata`.
 #[test]
 #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
 fn a_write_scope_refuses_outside_changes_including_metadata() {
@@ -395,8 +378,6 @@ fn a_write_scope_refuses_outside_changes_including_metadata() {
         "printf '' > /dev/null && printf '' > /dev/stderr && printf '' > /dev/fd/2".to_string(),
         "if [ -d /dev/shm ]; then echo x > /dev/shm/lucidos-scope-$$ && rm /dev/shm/lucidos-scope-$$; fi"
             .to_string(),
-        // The working directory is a write root, reached through a relative
-        // path after the mounts move.
         "mkdir rel && echo x > rel/f".to_string(),
     ] {
         let out = command("/bin/sh", &policy)
@@ -414,9 +395,6 @@ fn a_write_scope_refuses_outside_changes_including_metadata() {
     }
 }
 
-/// The mode the sandbox reports is the mode a child gets: a trigger child
-/// has its own mount namespace exactly when `guards_metadata` says so, and
-/// a child without a write scope never has one.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
@@ -444,8 +422,6 @@ fn only_a_write_scope_enters_a_mount_namespace_and_the_report_matches() {
     );
 }
 
-/// A missing tool exits 0, so the refusal assertion fails loudly rather
-/// than passing on a command that never ran.
 fn set_xattr(path: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("xattr -w com.example.lucidos x '{path}'")

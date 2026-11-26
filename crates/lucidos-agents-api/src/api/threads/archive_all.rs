@@ -1,12 +1,3 @@
-//! Archive all, and the unarchive its Undo calls (ADR 0349).
-//!
-//! All three routes are the owner's own buttons: `require_owner_device` runs
-//! first, so no agent reaches them. An agent puts threads away through
-//! triage, which needs the user's reply.
-//!
-//! The decisions live in `engine::thread_triage::archive_all`. Here they meet
-//! the cascade: every archive is `archive_family`, leaving pinned members open.
-
 use crate::engine::archive_policy::MAX_IDS;
 use axum::{
     extract::{Query, State},
@@ -33,8 +24,6 @@ pub(in crate::api) struct ThreadIdsRequest {
     thread_ids: Vec<Uuid>,
     #[serde(default)]
     parent_thread_id: Option<Uuid>,
-    /// Unarchive only: bring each thread's sub-threads back too, as the thread
-    /// menu's Move to Current does. Undo leaves it off and names every id.
     #[serde(default)]
     with_sub_threads: bool,
 }
@@ -58,8 +47,6 @@ pub(in crate::api) struct ArchiveScope {
     parent_thread_id: Option<Uuid>,
 }
 
-/// GET /api/v1/threads/archive-all-preflight: what Archive all would put away
-/// from Current, and what stays, counted by reason.
 pub(in crate::api) async fn archive_all_preflight(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -140,7 +127,7 @@ pub(in crate::api) async fn archive_all(
     ))
 }
 
-/// Execute the counted ceiling. Fresh scope rejects forged or detached ids;
+/// INVARIANT: Execute the counted ceiling. Fresh scope rejects forged or detached ids;
 /// the archive path checks again while holding its family locks.
 async fn archive_completed(
     state: &AppState,
@@ -188,8 +175,6 @@ async fn archive_completed(
     ))
 }
 
-/// POST /api/v1/threads/unarchive `{thread_ids, with_sub_threads?}`: move
-/// archived threads back to the inbox. Answers `{unarchived: [...]}`.
 pub(in crate::api) async fn unarchive(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -230,12 +215,9 @@ pub(in crate::api) async fn unarchive(
     Ok(Json(serde_json::json!({ "unarchived": unarchived })))
 }
 
-/// Which threads an unarchive moves back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnarchiveScope {
-    /// Exactly the ids given: Undo names every member of its batch.
     Exactly,
-    /// The ids and every sub-thread under them, mirroring Archive's cascade.
     WithSubThreads,
 }
 

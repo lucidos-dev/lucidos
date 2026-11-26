@@ -1,23 +1,3 @@
-//! What a plugin update does to the files on disk: a three-way merge against
-//! the user's local edits, and the removal of files the new version dropped.
-//!
-//! An update overwrites every file the plugin ships. When the user has edited
-//! one of those files, the three inputs a merge needs are all in hand at
-//! staging time: **base** is the file at the install commit, **ours** is what
-//! is on disk now, and **theirs** is the staged new version.
-//!
-//! A file the previous version recorded, and the new one no longer ships, is
-//! removed. A moved file then leaves no stale copy behind. An edited one is
-//! saved aside first.
-//!
-//! What counts as "modified" is not decided here. This consumes
-//! [`registry::modification_status_for`], the same function behind the Plugins
-//! list's Modified badge, so the two cannot drift.
-//!
-//! The plan is computed in full before the writer touches a byte. That is what
-//! lets the panel state a per-file outcome, and lets a failure leave nothing
-//! half-written.
-
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -29,22 +9,10 @@ use crate::engine::pending_plugins::{
 
 use super::registry::{modification_status_for, PluginBaseline};
 
-/// Above this, on any side, a file is replaced rather than merged. A plugin
-/// ships prose, markup and small scripts. Anything at this scale was not
-/// hand-edited, and holding three copies of it for the staging TTL is not worth
-/// the merge.
 const MAX_MERGE_BYTES: usize = 1024 * 1024;
 
 pub(crate) const SAVED_CHANGES_ROOT: &str = "artifacts/plugin-local-changes";
 
-/// Write every local edit this confirm is about to discard, before anything is
-/// overwritten. Each one is saved twice: the whole file, and a patch against
-/// the version it was written on. Returns the `data/`-relative paths written,
-/// for the caller to commit and announce.
-///
-/// A conflict, an unmergeable file, a switched-off keep control and an edited
-/// file the new version dropped all land here. A clean merge does not: the edit
-/// survives in the file itself, so a copy would be clutter.
 pub(crate) fn save_discarded(
     workspace_path: &Path,
     plugin_id: &str,
@@ -87,16 +55,12 @@ fn free_save_dir(data_dir: &Path, plugin_id: &str, version: &str) -> String {
     if !data_dir.join(&base).exists() {
         return base;
     }
-    // Unbounded on purpose: it lands on `-2` in practice, and any cap would
-    // need a fallback that overwrites, which is the thing being prevented.
     (2u32..)
         .map(|n| format!("{}-{}", base, n))
         .find(|candidate| !data_dir.join(candidate).exists())
         .unwrap_or(base)
 }
 
-/// The note that sits beside a saved-aside edit, so the folder explains itself
-/// months later without the user having to remember this feature exists.
 fn saved_changes_readme(plugin_id: &str, version: &str, dir: &str) -> String {
     format!(
         "# Local changes to {plugin_id}, kept from the update to v{version}\n\
@@ -137,8 +101,6 @@ pub(crate) fn local_patch(workspace_path: &Path, baseline: &PluginBaseline) -> O
 
     let mut out = String::new();
     for rel in &status.modified_paths {
-        // A trigger definition is engine-generated, so its diff describes the
-        // serializer rather than anything the user wrote.
         if super::plugin_trigger_slug(rel).is_some() {
             continue;
         }
@@ -159,8 +121,6 @@ pub(crate) fn local_patch(workspace_path: &Path, baseline: &PluginBaseline) -> O
     (!out.is_empty()).then_some(out)
 }
 
-/// The version on disk, opened for reading: its install commit's tree, and the
-/// paths the user has changed since.
 struct OpenedBaseline<'r> {
     repo: &'r git2::Repository,
     tree: git2::Tree<'r>,
@@ -200,13 +160,6 @@ pub(crate) fn plan_update(
     plan
 }
 
-/// Classify every path the update would overwrite, merging the ones the user
-/// has edited.
-///
-/// Two questions per path, not one. "Did this change since the install
-/// commit?" makes it a candidate; "is ours already theirs?" drops it again. A
-/// user who published their own edit upstream meets the second on every file
-/// they sent.
 fn plan_shipped(
     workspace_path: &Path,
     baseline: &OpenedBaseline<'_>,
@@ -271,13 +224,10 @@ fn plan_dropped(
         let Some(ours_oid) = hash_on_disk(&live) else {
             continue;
         };
-        // Only a committed copy makes a removal undoable. So the bytes on disk
-        // must be the install commit's, not merely absent from the Modified set.
         if baseline.is_some_and(|b| oid_at(&b.tree, rel) == Some(ours_oid)) {
             plan.removals.push((rel.clone(), ours_oid));
             continue;
         }
-        // No baseline means no diff, so the whole-file copy is the only one.
         let patch = baseline.and_then(|b| {
             let base = blob_at(b.repo, &b.tree, rel);
             patch_of(rel, base.as_deref(), read_mergeable(&live).as_deref())
@@ -292,7 +242,6 @@ fn plan_dropped(
     }
 }
 
-/// The install commit's tree, or `None` when the commit no longer resolves.
 fn install_tree<'r>(repo: &'r git2::Repository, commit: &str) -> Option<git2::Tree<'r>> {
     repo.revparse_single(commit)
         .and_then(|obj| obj.peel_to_commit())
@@ -300,27 +249,23 @@ fn install_tree<'r>(repo: &'r git2::Repository, commit: &str) -> Option<git2::Tr
         .ok()
 }
 
-/// The blob id the install commit recorded for a `data/`-relative path.
 fn oid_at(tree: &git2::Tree<'_>, data_relative: &str) -> Option<git2::Oid> {
     tree.get_path(Path::new(&format!("{}/{}", DATA_DIR, data_relative)))
         .ok()
         .map(|entry| entry.id())
 }
 
-/// The bytes the install commit recorded for a `data/`-relative path.
 fn blob_at(repo: &git2::Repository, tree: &git2::Tree<'_>, data_relative: &str) -> Option<Vec<u8>> {
     oid_at(tree, data_relative)
         .and_then(|id| repo.find_blob(id).ok())
         .map(|blob| blob.content().to_vec())
 }
 
-/// The patch filed beside a saved-aside copy, when both sides are text.
 fn patch_of(data_relative: &str, base: Option<&[u8]>, ours: Option<&[u8]>) -> Option<String> {
     ours.filter(|o| diffable(o, base))
         .and_then(|o| unified_diff(data_relative, base, o))
 }
 
-/// Decide one path's outcome, and produce the merged bytes when it merges.
 fn classify(
     repo: &git2::Repository,
     pf: &PlannedFile,
@@ -329,23 +274,12 @@ fn classify(
     theirs: Option<&[u8]>,
     live_exists: bool,
 ) -> (LocalChangeOutcome, Option<Vec<u8>>) {
-    // A trigger definition is a re-serialized projection the engine rewrites
-    // after every install (ADR 0019), so its bytes never match the shipped
-    // authored bytes. Text-merging it would report a conflict for every plugin
-    // trigger on every update. `resync_plugin_triggers` regenerates the file
-    // from the event anyway, so a merged one would not survive the install.
     if super::plugin_trigger_slug(&pf.data_relative).is_some() {
         return (LocalChangeOutcome::Replaced, None);
     }
-    // Gone from disk: the user deleted it and upstream still ships it, so it
-    // comes back. Told apart from the unreadable and oversized cases below,
-    // because there is no content to save aside for a deletion.
     if !live_exists {
         return (LocalChangeOutcome::Restored, None);
     }
-    // Present, but no side to merge: unreadable, or too big to hold
-    // (`read_mergeable` refuses those without reading them). Upstream's copy
-    // lands, which is what an update has always done.
     let (Some(ours), Some(theirs)) = (ours, theirs) else {
         return (LocalChangeOutcome::Replaced, None);
     };
@@ -357,9 +291,6 @@ fn classify(
         return (LocalChangeOutcome::Replaced, None);
     }
 
-    // libgit2 merges blobs, so each side is written to the object database
-    // first. An abandoned staging leaves those unreferenced, which is ordinary
-    // loose-object garbage that `git gc` reclaims.
     let empty: &[u8] = b"";
     let Ok(ids) = [base.unwrap_or(empty), ours, theirs]
         .iter()
@@ -380,7 +311,6 @@ fn classify(
             (LocalChangeOutcome::Merged, Some(result.content().to_vec()))
         }
         Ok(_) => (LocalChangeOutcome::Conflict, None),
-        // A merge libgit2 refused to attempt is not one to guess at.
         Err(e) => {
             log_legacy!(@Plugins, "merge {} failed, replacing instead: {}", pf.data_relative, e);
             (LocalChangeOutcome::Replaced, None)
@@ -388,20 +318,15 @@ fn classify(
     }
 }
 
-/// Text small enough to merge. A NUL byte is git's own binary heuristic, and a
-/// binary three-way merge is meaningless whatever the size.
 fn is_mergeable_text(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_MERGE_BYTES && !bytes.contains(&0)
 }
 
-/// Whether a unified diff between these two sides would say anything useful.
-/// Both must be text: a diff of binary content prints "Binary files differ",
-/// which cannot be re-applied and only pads the saved-aside folder.
 fn diffable(ours: &[u8], base: Option<&[u8]>) -> bool {
     is_mergeable_text(ours) && base.is_none_or(is_mergeable_text)
 }
 
-/// Read a file only when it is small enough to be worth merging.
+/// INVARIANT: Read a file only when it is small enough to be worth merging.
 ///
 /// The size is checked by `metadata` first, so an oversized file is never read
 /// into memory at all. That matters because the caller runs over paths the user
@@ -413,12 +338,6 @@ fn read_mergeable(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-/// A unified diff from the installed version to the user's copy.
-///
-/// Labelled `data/<path>`, i.e. relative to the workspace repo root, not to
-/// `data/`. That is the root `git apply` resolves against, so the patch lands
-/// with no `-p` juggling. An absent `base` is an add: the diff is then against
-/// nothing, which is still the right patch to hand back.
 fn unified_diff(data_relative: &str, base: Option<&[u8]>, ours: &[u8]) -> Option<String> {
     let repo_relative = format!("{}/{}", DATA_DIR, data_relative);
     let path = Path::new(&repo_relative);

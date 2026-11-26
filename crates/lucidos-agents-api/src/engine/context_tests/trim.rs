@@ -1,9 +1,6 @@
 use super::*;
 use crate::llm::{ContentBlock, Message, MessageContent};
 
-/// Nothing protected and nothing held open, which is every workspace with the
-/// self-curated context mode off. That arm's stub names its own way back, so
-/// `RecoveryClause::State` is the control-arm shape these tests measure.
 static NOTHING: std::sync::LazyLock<ProtectedAddresses> =
     std::sync::LazyLock::new(ProtectedAddresses::new);
 
@@ -81,16 +78,6 @@ fn capture_app_result_msg(tool_use_id: &str, image_kb: usize) -> Message {
     }
 }
 
-/// Regression: the agent called `view_image` twice on the same reference. After
-/// subsequent calls it still told the user it could not see the image.
-///
-/// The next tool call used to replace the unpinned `view_image` result with
-/// `[image from earlier in conversation]`. Pinning keeps a requested image
-/// visible across calls.
-///
-/// Asserts the whole chain the loop relies on: the built message is recognised
-/// as holding an explicitly-requested image, and once pinned its bytes survive
-/// several later tool pairs.
 #[test]
 fn test_view_image_result_stays_visible_across_later_tool_calls() {
     use crate::engine::agentic_loop::holds_explicitly_requested_image;
@@ -102,8 +89,6 @@ fn test_view_image_result_stays_visible_across_later_tool_calls() {
     ];
     let view_idx = messages.len() - 1;
 
-    // The loop derives the pin from the built blocks — assert that link holds,
-    // otherwise the pin below is testing a fiction.
     let MessageContent::Blocks(blocks) = &messages[view_idx].content else {
         panic!("expected Blocks content for the view_image result");
     };
@@ -112,7 +97,6 @@ fn test_view_image_result_stays_visible_across_later_tool_calls() {
         "the loop must recognise a view_image result as an explicitly-requested image"
     );
 
-    // Several more tool calls, so the view_image result is far from last.
     for i in 0..4 {
         let id = format!("later{}", i);
         messages.push(tool_use_msg(
@@ -137,9 +121,6 @@ fn test_view_image_result_stays_visible_across_later_tool_calls() {
     );
 }
 
-/// Ambient `capture_app` screenshots stay unpinned and age out after one call.
-/// Keeping them could let the model reason about UI state that has since
-/// changed.
 #[test]
 fn test_capture_app_result_is_not_pinned() {
     use crate::engine::agentic_loop::holds_explicitly_requested_image;
@@ -170,7 +151,6 @@ fn test_capture_app_result_is_not_pinned() {
     ));
     messages.push(tool_result_msg("c2", "match"));
 
-    // Pinning only the user message — exactly what the loop does for a capture.
     trim_context_if_needed(&mut messages, 500_000, Some(0), &[0], plain());
 
     let MessageContent::Blocks(blocks) = &messages[capture_idx].content else {

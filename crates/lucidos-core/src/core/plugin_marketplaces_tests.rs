@@ -405,8 +405,6 @@ fn requiring(mut plugin: MarketplacePlugin, engine: &str) -> MarketplacePlugin {
     plugin
 }
 
-/// No "update available" notification for a version this release cannot
-/// install. A lower version it can install still counts.
 #[test]
 fn update_candidates_skip_a_version_the_running_release_cannot_install() {
     let catalog = MarketplaceCatalog {
@@ -486,8 +484,6 @@ fn engine_compatibility_overlay_fills_the_catalog_row_fields() {
     assert!(plain.engine_compatible);
     assert_eq!(plain.engine_incompatible_reason, None);
 
-    // The same rows re-served by a newer engine flip back, so a verdict stored
-    // in the cache can never outlive an upgrade.
     apply_engine_compatibility_to_catalog(&mut catalog, &Ok(semver::Version::new(0, 46, 1)));
     assert!(catalog.plugins[0].engine_compatible);
     assert_eq!(catalog.plugins[0].engine_incompatible_reason, None);
@@ -514,9 +510,6 @@ fn engine_compatibility_fields_are_on_the_wire() {
     );
 }
 
-/// A row with no `engine` carries no `engine_requirement`, and still installs.
-/// A malformed value counts as declared, so it is refused and never shown as
-/// "no version requirement".
 #[test]
 fn engine_requirement_is_absent_only_when_the_manifest_declares_none() {
     let running = Ok(semver::Version::new(0, 46, 0));
@@ -534,10 +527,6 @@ fn engine_requirement_is_absent_only_when_the_manifest_declares_none() {
     assert!(!malformed.engine_compatible);
 }
 
-/// Install state is live, never cached. The *plugin catalog cache* holds rows
-/// scanned minutes ago, so a plugin installed since then still reads
-/// `Available` in the cache. Serving that unchanged puts an Install button on a
-/// plugin already on disk, for as long as the TTL lasts.
 mod installed_state_overlay {
     use super::*;
 
@@ -608,8 +597,6 @@ mod installed_state_overlay {
         assert_eq!(row.modified_paths, vec!["apps/an-app/index.html"]);
     }
 
-    /// An older install against a newer catalog row is an update, not a plain
-    /// install: the card offers Update rather than Install.
     #[test]
     fn an_older_install_reads_as_an_update() {
         let mut catalog = catalog_of(vec![cached_row("browser-learning", "0.2.0")]);
@@ -626,8 +613,6 @@ mod installed_state_overlay {
         );
     }
 
-    /// The overlay also has to CLEAR state, not only set it. A cache written
-    /// while the plugin was installed must not keep saying so after uninstall.
     #[test]
     fn a_plugin_uninstalled_since_the_scan_goes_back_to_available() {
         let mut stale = cached_row("browser-learning", "0.1.0");
@@ -649,8 +634,6 @@ mod installed_state_overlay {
     }
 }
 
-/// Invariant I19: catalog media is a cache. A scan fills it, and the next scan
-/// rebuilds it once `.lucidos/` is cleared.
 #[test]
 fn a_scan_caches_media_and_rebuilds_it_after_a_wipe() {
     let workspace = tempfile::tempdir().unwrap();
@@ -690,7 +673,6 @@ fn a_scan_caches_media_and_rebuilds_it_after_a_wipe() {
     let catalog = scan();
     assert!(plugin_media::listed_file(&copy, "media/a.png").is_some());
 
-    // Publishing a catalog without the marketplace drops its media.
     prune_media_for(
         workspace.path(),
         &MarketplaceCatalog {

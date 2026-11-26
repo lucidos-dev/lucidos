@@ -1,10 +1,3 @@
-//! The models a Claude gateway serves this account: its managed settings'
-//! `availableModels` when they set one, else its `GET /v1/models` listing.
-//!
-//! A gateway allows each access group its own list of models. Lucidos sends
-//! only an id the gateway allows, so a model outside the list is "not served"
-//! before any request reaches the Messages API.
-
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -17,18 +10,12 @@ use crate::llm::ModelNotServed;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// How long one listing answers before the gateway is asked again. An access
-/// group's list changes rarely, and a stale one costs one refused turn.
 const LISTING_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// Ids asked for per page, the Models API maximum.
 const PAGE_LIMIT: &str = "1000";
 
-/// Pages read before the listing stops. A gateway that never stops paging
-/// would otherwise hold the turn forever.
 const MAX_PAGES: usize = 10;
 
-/// The gateway's listing, read on first use and kept for [`LISTING_TTL`].
 pub struct ServedModels {
     origin: GatewayOrigin,
     listing: tokio::sync::Mutex<Option<Listing>>,
@@ -60,14 +47,6 @@ impl ServedModels {
         }
     }
 
-    /// The id to send for `model`, or [`ModelNotServed`] when the gateway
-    /// does not serve it. `policy` is the gateway's managed settings, whose
-    /// `availableModels` replaces the listing when set. Also answers the
-    /// bearer to send, renewed once when the listing rejected the first.
-    ///
-    /// The `[1m]` suffix is Lucidos's own, so it is matched without and kept on
-    /// the answer. A model listed only as a dated snapshot is sent as that
-    /// snapshot, which is the name the gateway listed.
     pub async fn wire_id(
         &self,
         model: &str,
@@ -98,9 +77,6 @@ impl ServedModels {
         Ok((wire_id, bearer))
     }
 
-    /// The listed ids, read again once the kept listing is older than
-    /// [`LISTING_TTL`]. A `401` renews `bearer` once, as a `401` from the
-    /// Messages API does.
     async fn ids(
         &self,
         access: &dyn GatewayAccess,
@@ -131,8 +107,6 @@ impl ServedModels {
     }
 }
 
-/// `model` itself when listed, else its latest dated snapshot
-/// (`{model}-YYYYMMDD`), else `None`.
 fn listed_id<'a>(ids: &'a [String], model: &str) -> Option<&'a str> {
     if let Some(exact) = ids.iter().find(|id| *id == model) {
         return Some(exact);
@@ -148,14 +122,11 @@ fn listed_id<'a>(ids: &'a [String], model: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-/// What one read of the listing found.
 enum Listed {
     Ids(Vec<String>),
-    /// The gateway answered `401`, with this body.
     Rejected(String),
 }
 
-/// Read every page of the gateway's `GET /v1/models`.
 async fn read_listing(origin: &GatewayOrigin, bearer: &str) -> Result<Listed, BoxError> {
     let url = format!("{}/models", origin.api_base_url());
     let mut ids = Vec::new();
@@ -205,7 +176,6 @@ mod tests {
     use super::*;
     use crate::llm::claude_gateway::mock_gateway::MockGateway;
 
-    /// Presents `gw-token`, and renews a rejected one as `gw-token-2`.
     struct FixedBearer;
 
     #[async_trait::async_trait]
@@ -242,8 +212,6 @@ mod tests {
         );
     }
 
-    /// Only an eight-digit date is a snapshot. `claude-opus-5-5` is a newer
-    /// model than `claude-opus-5`, not a snapshot of it.
     #[test]
     fn another_model_sharing_the_prefix_is_not_a_snapshot() {
         let listed = ids(&["claude-opus-5-5", "claude-opus-5-20261001x"]);
@@ -266,8 +234,6 @@ mod tests {
         );
     }
 
-    /// The listing names what the account may use, so an unlisted model is
-    /// refused as not served, naming what the gateway does serve.
     #[tokio::test]
     async fn an_unlisted_model_is_not_served() {
         let gateway = MockGateway::start().await;
@@ -281,8 +247,6 @@ mod tests {
         assert!(err.to_string().contains("claude-haiku-5-5"), "{err}");
     }
 
-    /// Every page is read, each with the bearer and the Lucidos `User-Agent`,
-    /// and one listing serves later calls.
     #[tokio::test]
     async fn the_listing_reads_every_page_once() {
         let gateway = MockGateway::start().await;
@@ -310,8 +274,6 @@ mod tests {
         }
     }
 
-    /// A policy allowlist replaces the listing: the gateway is not asked,
-    /// and a model outside the allowlist is not served even when listed.
     #[tokio::test]
     async fn a_policy_allowlist_replaces_the_listing() {
         let gateway = MockGateway::start().await;
@@ -355,8 +317,6 @@ mod tests {
         assert!(err.to_string().contains("which models it serves"), "{err}");
     }
 
-    /// A `401` on the listing renews the bearer once, and the call goes on
-    /// with the renewed one.
     #[tokio::test]
     async fn a_rejected_listing_renews_the_bearer() {
         let gateway = MockGateway::start().await;

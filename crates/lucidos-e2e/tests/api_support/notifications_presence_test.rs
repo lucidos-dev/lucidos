@@ -1,12 +1,3 @@
-//! Integration tests for the §2/§3 PresenceCheck fan-out flow in
-//! `system-knowhow/notifications.md`. Booted against the e2e workspace
-//! (engine built with `--features e2e-test-hooks` — see
-//! `scripts/lib/e2e.sh`'s `ENGINE_BUILD_FEATURES`).
-//!
-//! Unit tests in `crates/lucidos-engine` cover the decision functions
-//! (`decide_push_allowed`, `PresenceTracker`); these tests cover the
-//! wiring: HTTP → EventBus emit → SSE broadcast → push_log writer.
-
 use crate::support::{base_url, db_url, http_client, register_device, unique_marker, user_client};
 use futures::StreamExt;
 use std::sync::OnceLock;
@@ -15,18 +6,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tokio_util::io::StreamReader;
 
-/// Both fan-out tests mutate `device_presence` and `push_log`. Cargo runs
-/// integration tests in parallel; let them race on that state and the
-/// "no candidates" / "expects PresenceCheck" branches flip non-deterministically.
-/// Serialize them through this lock.
 static FAN_OUT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 fn fan_out_test_lock() -> &'static Mutex<()> {
     FAN_OUT_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Cleanup helper — wipe presence + push_log rows so the test starts
-/// from a known state. The e2e workspace is throwaway, so destructive
-/// SQL is fine here.
 async fn reset_presence_state() {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
@@ -42,25 +26,11 @@ async fn reset_presence_state() {
     pool.close().await;
 }
 
-/// Register a device with push_enabled=true and attach a fake push
-/// subscription so the engine has someone to push to. The endpoint URL is
-/// never hit — under `e2e-test-hooks` the transport writes to push_log
-/// instead. Returns the device_id.
-///
-/// Both prerequisites matter: `push_subscriptions.device_id` has a FK
-/// to `devices(id)`, so subscribing without registering first fails the
-/// insert silently (subscribe handler returns 200 with an error body via
-/// `ApiResult`); and `PushSubscriptionStore::get_push_enabled` filters on
-/// `devices.push_enabled = true`, so a registered-but-push-disabled
-/// device gets filtered out of the fan-out.
 async fn register_test_subscription(suffix: &str) -> String {
     let device_id = format!("presence-test-{}", suffix);
 
     register_device(&device_id).await;
 
-    // Registered above, so from here the device speaks for itself: the header
-    // is what `api::mutating_gate` reads to record who is acting. Its own id
-    // rather than `user_client`'s, since these calls ARE this device acting.
     let resp = http_client()
         .put(format!("{}/api/v1/devices/{}/push", base_url(), device_id))
         .header("x-lucidos-device-id", &device_id)
@@ -108,10 +78,6 @@ async fn create_notification(title: &str, message: &str) -> String {
 
 #[tokio::test]
 async fn s3_presence_pong_endpoint_accepts_valid_payload() {
-    // Spec §3 — endpoint always ACKs 200, even for a notification id the
-    // engine isn't tracking (stray pongs from a closed-out PresenceCheck
-    // are normal). The body shape is what the SDK
-    // (presence-pong.ts) sends.
     let resp = http_client()
         .post(format!("{}/api/v1/presence-pong", base_url()))
         .json(&serde_json::json!({
@@ -129,16 +95,6 @@ async fn s3_presence_pong_endpoint_accepts_valid_payload() {
 async fn s3_notification_with_no_candidates_sends_push_immediately() {
     let _guard = fan_out_test_lock().lock().await;
 
-    // Spec §2 Step A — with no candidate AND no other reachable page, the
-    // engine skips the PresenceCheck and decides push_allowed=true directly,
-    // so a push subscription should see a push_log row. This test never opens
-    // its own SSE connection, so its OWN gate input is zero — but other tests
-    // in this binary run concurrently and may hold an SSE connection open,
-    // which makes the engine run the PresenceCheck for THIS notification too.
-    // No active pong arrives for it (those pages pong for their own checks, or
-    // don't pong at all), so the decision still resolves to push — just after
-    // up to DEADLINE_MS instead of instantly. The deadline below covers that
-    // worst case so the assertion stays robust to test concurrency.
     reset_presence_state().await;
     let suffix = unique_marker("no-candidates");
     let device_id = register_test_subscription(&suffix).await;
@@ -146,8 +102,6 @@ async fn s3_notification_with_no_candidates_sends_push_immediately() {
     let notification_id =
         create_notification(&format!("Test no-candidates {}", suffix), "body").await;
 
-    // Allow up to 5s (> DEADLINE_MS) for the spawned fan-out task to write to
-    // push_log — see the concurrency note above.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     loop {
@@ -177,25 +131,9 @@ async fn s3_notification_with_no_candidates_sends_push_immediately() {
 async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check() {
     let _guard = fan_out_test_lock().lock().await;
 
-    // Spec §3 — the PresenceCheck must run whenever a page is connected via
-    // SSE, NOT only when a `device_presence` heartbeat row is fresh. iOS
-    // suspends the 30s heartbeat while the PWA is foregrounded, so the
-    // device_presence row ages out even though the EventSource is still open
-    // and the page would pong `shown`. Gating purely on heartbeat
-    // freshness skipped the check → the OS push fired on top of an active
-    // foreground PWA (the "push while active for a while" report). This test
-    // pins the live-SSE-connection gate: with ZERO device_presence candidates
-    // but an open SSE connection, NotificationCreated still broadcasts a
-    // PresenceCheck.
-    //
-    // Pre-fix this fails: the empty-candidates branch set push_allowed=true
-    // directly and never emitted a PresenceCheck.
     reset_presence_state().await;
     let suffix = unique_marker("sse-no-candidate");
 
-    // The SSE subscriber IS the "connected page" — opening it is what makes
-    // the live-connection count non-zero. It never POSTs device-presence, so
-    // candidates() stays empty.
     let sse_handle: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
         let resp = http_client()
             .get(format!("{}/api/v1/events", base_url()))
@@ -216,11 +154,6 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
-                    // Collect for the full window — do NOT break on the first
-                    // PresenceCheck. The SSE stream is global, so the first frame
-                    // may belong to another notification (a sibling fan-out test
-                    // whose async PresenceCheck lands here). The assertion below
-                    // selects the frame carrying THIS notification's id.
                     Ok(Some(line)) => collected.push(line),
                     Ok(None) | Err(_) => break,
                 },
@@ -230,13 +163,8 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
         collected
     });
 
-    // Give the SSE subscriber time to register so the live-connection count
-    // is non-zero before the notification fans out.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // A push subscription so the fan-out doesn't short-circuit on "nobody to
-    // push to" before it ever reaches the gate. NOTE: registering a device
-    // does NOT mark it visible — `device_presence` stays empty.
     let _device_id = register_test_subscription(&suffix).await;
 
     let notification_id = create_notification(
@@ -247,8 +175,6 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
 
     let lines = sse_handle.await.expect("SSE task panicked");
 
-    // Select the PresenceCheck for THIS notification specifically — the global
-    // SSE stream may also carry a sibling notification's frame.
     lines
         .iter()
         .find(|l| l.contains("\"type\":\"PresenceCheck\"") && l.contains(&notification_id))
@@ -267,17 +193,9 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
 async fn s3_notification_with_visible_device_emits_presence_check_sse() {
     let _guard = fan_out_test_lock().lock().await;
 
-    // Spec §3 — when at least one device pinged visible recently,
-    // emitting NotificationCreated triggers a SystemEvent::PresenceCheck
-    // broadcast carrying the notification's id. Verifies that the
-    // PresenceCheck arrives on the SSE channel with the expected
-    // wire shape.
     reset_presence_state().await;
     let suffix = unique_marker("emits-check");
 
-    // Subscribe to SSE in the background so we don't miss the
-    // PresenceCheck. The handle returns lines seen until the marker
-    // matches or the deadline fires.
     let sse_handle: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
         let resp = http_client()
             .get(format!("{}/api/v1/events", base_url()))
@@ -298,11 +216,6 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
-                    // Collect for the full window — do NOT break on the first
-                    // PresenceCheck. The SSE stream is global, so the first frame
-                    // may belong to another notification (a sibling fan-out test
-                    // whose async PresenceCheck lands here). The assertion below
-                    // selects the frame carrying THIS notification's id.
                     Ok(Some(line)) => collected.push(line),
                     Ok(None) | Err(_) => break,
                 },
@@ -312,15 +225,8 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
         collected
     });
 
-    // Give the SSE subscriber a moment to register before producing the
-    // candidate row + notification.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Mark a device visible so candidates() is non-empty → fan-out runs
-    // the PresenceCheck protocol.
-    // Registered, unlike the sibling test's, which comes back from
-    // `register_test_subscription` already in the table. An id naming no device
-    // is a header rather than identity, so the post would be refused.
     let device_id = format!("presence-visible-{}", suffix);
     register_device(&device_id).await;
     let resp = http_client()
@@ -332,9 +238,6 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
         .expect("device-presence post");
     assert_eq!(resp.status(), 200);
 
-    // Push subscription so the fan-out has someone to push to (the
-    // presence check fires regardless, but registering the sub keeps the
-    // test realistic).
     let _device_id = register_test_subscription(&suffix).await;
 
     let notification_id = create_notification(
@@ -345,8 +248,6 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
 
     let lines = sse_handle.await.expect("SSE task panicked");
 
-    // Find the PresenceCheck frame for THIS notification — the global SSE
-    // stream may also carry a sibling notification's frame, so match by id.
     let presence_check_line = lines
         .iter()
         .find(|l| {
@@ -372,18 +273,11 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
     );
 }
 
-/// Register a pushable device, mark it visible, and answer the PresenceCheck
-/// for one new notification with `outcome`, as a page does once it has acted.
-/// Returns the device id, the notification id and the check's SSE line.
-///
-/// The reader matches the check by the unique suffix in its title. So a
-/// sibling test's check on the same stream is ignored.
 async fn answer_presence_check(outcome: &str) -> (String, String, String) {
     reset_presence_state().await;
     let suffix = unique_marker(&format!("ack-{outcome}"));
     let device_id = register_test_subscription(&suffix).await;
 
-    // Mark the same device visible so it's the lone PresenceCheck candidate.
     let resp = http_client()
         .post(format!("{}/api/v1/device-presence", base_url()))
         .header("x-lucidos-device-id", &device_id)
@@ -416,8 +310,6 @@ async fn answer_presence_check(outcome: &str) -> (String, String, String) {
             tokio::select! {
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
-                        // The tracker slot exists by now: the engine emits the
-                        // PresenceCheck right after expect().
                         if line.contains("\"type\":\"PresenceCheck\"") && line.contains(&reader_suffix) {
                             let nid = extract_notification_id(&line).expect("notification_id on the check");
                             let resp = http_client()
@@ -441,8 +333,6 @@ async fn answer_presence_check(outcome: &str) -> (String, String, String) {
         }
     });
 
-    // Give the SSE subscriber a moment to register before producing the
-    // notification.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let notification_id =
@@ -473,8 +363,6 @@ async fn push_log_rows(notification_id: &str, device_id: &str) -> i64 {
 async fn s4_a_shown_ack_suppresses_the_push_and_the_check_carries_the_toast() {
     let _guard = fan_out_test_lock().lock().await;
 
-    // Spec §3/§4. The page puts the toast on screen from the check itself and
-    // then reports it shown. That report, and only that, suppresses the push.
     let (device_id, notification_id, check_line) = answer_presence_check("shown").await;
 
     assert!(
@@ -482,8 +370,6 @@ async fn s4_a_shown_ack_suppresses_the_push_and_the_check_carries_the_toast() {
         "the PresenceCheck must carry the toast for notification={notification_id}; line was: {check_line}",
     );
 
-    // Give any (erroneous) fan-out a generous window to have written before we
-    // assert its absence. A shown ack settles the decision at once.
     tokio::time::sleep(Duration::from_millis(700)).await;
     let push_count = push_log_rows(&notification_id, &device_id).await;
     assert_eq!(
@@ -497,8 +383,6 @@ async fn s4_a_shown_ack_suppresses_the_push_and_the_check_carries_the_toast() {
 async fn s4_a_not_shown_ack_leaves_the_push_to_the_os() {
     let _guard = fan_out_test_lock().lock().await;
 
-    // The page answered, but its shell was not in front, so it showed nothing.
-    // An answer alone suppresses nothing: the push goes out.
     let (device_id, notification_id, _) = answer_presence_check("not_shown").await;
 
     let mut push_count = 0;
@@ -520,28 +404,8 @@ async fn s4_a_not_shown_ack_leaves_the_push_to_the_os() {
 async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscription() {
     let _guard = fan_out_test_lock().lock().await;
 
-    // Spec §1/§4 — the native desktop surface. On the push-ALLOWED branch (no
-    // page handled the check) the engine emits a NativePushRequested SSE so a
-    // connected Tauri app can render a native macOS banner — it can't receive
-    // the web push (WKWebView has no service-worker push).
-    //
-    // This test deliberately registers NO push subscription: it pins the
-    // relaxed early-return. Pre-change, `send_push_to_all_with_app` bailed the
-    // instant `push_subscriptions` was empty, so a desktop-only workspace got
-    // neither the decision nor any SSE — the connected page's only signal was a
-    // silent bell-badge bump. Now an open SSE connection alone keeps the
-    // decision alive, and push-allowed broadcasts NativePushRequested.
-    //
-    // The SSE reader never pongs, so it counts toward `expected_pongs` but
-    // reports nothing → after DEADLINE_MS the engine decides
-    // push_allowed=true and emits the native frame.
     reset_presence_state().await;
     let suffix = unique_marker("native-push");
-    // The reader breaks only on OUR notification's frame, matched by the unique
-    // suffix carried in its title. A sibling fan-out test emits its own
-    // NativePushRequested ~DEADLINE_MS after it releases the shared lock — i.e.
-    // after this test has already started — so a stale frame for a different
-    // notification can land on this stream first; matching the suffix ignores it.
     let reader_suffix = suffix.clone();
 
     let sse_handle: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
@@ -578,7 +442,6 @@ async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscriptio
         collected
     });
 
-    // Let the SSE subscriber register so the live-connection gate is non-zero.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let notification_id = create_notification(
@@ -589,8 +452,6 @@ async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscriptio
 
     let lines = sse_handle.await.expect("SSE task panicked");
 
-    // Match OUR notification's native frame specifically — a stale sibling frame
-    // may also sit in `collected` (see reader_suffix above), so filter by id.
     lines
         .iter()
         .find(|l| l.contains("\"type\":\"NativePushRequested\"") && l.contains(&notification_id))
@@ -605,10 +466,6 @@ async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscriptio
         });
 }
 
-/// POST a notification with an arbitrary body and read the stored row back.
-///
-/// The list endpoint is the only place the persisted `tap` is observable over
-/// HTTP, which is what the derived-default tests below need to see.
 async fn create_and_read_back(body: serde_json::Value) -> serde_json::Value {
     let resp = user_client()
         .await
@@ -640,11 +497,6 @@ async fn create_and_read_back(body: serde_json::Value) -> serde_json::Value {
         .clone()
 }
 
-/// Seed one event row and return its id. `None` seeds a workspace domain
-/// event, which lives in no thread.
-///
-/// The engine refuses an event its thread does not hold. So a test expecting
-/// the write to succeed needs a real row to point at.
 async fn seed_event(event_type: &str, thread: Option<uuid::Uuid>) -> uuid::Uuid {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
@@ -665,8 +517,6 @@ async fn seed_event(event_type: &str, thread: Option<uuid::Uuid>) -> uuid::Uuid 
     event
 }
 
-/// A tapless notification that names a source event deep-links to it, so one
-/// tap lands on the event instead of on the inbox card.
 #[tokio::test]
 async fn a_tapless_notification_with_an_event_navigates_to_it() {
     let thread_id = uuid::Uuid::new_v4();
@@ -688,8 +538,6 @@ async fn a_tapless_notification_with_an_event_navigates_to_it() {
     assert_eq!(row["tap"]["to"]["event_id"], event);
 }
 
-/// A thread with no event is provenance, not a destination: the engine stamps
-/// one on every `send_notification`. That case keeps opening the card.
 #[tokio::test]
 async fn a_tapless_notification_without_an_event_opens_the_card() {
     let row = create_and_read_back(serde_json::json!({
@@ -702,8 +550,6 @@ async fn a_tapless_notification_without_an_event_opens_the_card() {
     assert_eq!(row["tap"]["kind"], "modal", "tap was {}", row["tap"]);
 }
 
-/// An explicit tap always wins, even where the derivation would have picked
-/// something else.
 #[tokio::test]
 async fn an_explicit_tap_survives_the_derivation() {
     let thread = uuid::Uuid::new_v4();
@@ -720,8 +566,6 @@ async fn an_explicit_tap_survives_the_derivation() {
     assert_eq!(row["tap"]["kind"], "modal", "tap was {}", row["tap"]);
 }
 
-/// POST a notification expected to be refused, and answer with the status and
-/// the engine's reason. Nothing is created, so there is no row to read back.
 async fn create_expecting_refusal(body: serde_json::Value) -> (u16, String) {
     let resp = user_client()
         .await
@@ -735,9 +579,6 @@ async fn create_expecting_refusal(body: serde_json::Value) -> (u16, String) {
     (status, reason)
 }
 
-/// A domain event lives in no thread, so no transcript can show it. A trigger
-/// fired by one used to pass its id, and the tap then reported "That event is
-/// not shown in this thread". The engine refuses it while the caller can fix it.
 #[tokio::test]
 async fn a_domain_event_anchor_is_refused() {
     let event = seed_event("E2ETestsPassed", None).await;
@@ -755,7 +596,6 @@ async fn a_domain_event_anchor_is_refused() {
     );
 }
 
-/// An event from another thread cannot render in the one the tap opens either.
 #[tokio::test]
 async fn an_event_from_another_thread_is_refused() {
     let elsewhere = uuid::Uuid::new_v4();
@@ -774,9 +614,6 @@ async fn an_event_from_another_thread_is_refused() {
     );
 }
 
-/// A tap whose thread id names no thread is a dead deep link. The reader meets
-/// it as `Thread "<id>" no longer exists`, on a device that cannot repair
-/// anything. Refuse the write instead, while the caller can still fix it.
 #[tokio::test]
 async fn a_tap_thread_id_that_is_not_a_uuid_is_refused() {
     for bad in ["t-9", "current", "the release thread"] {
@@ -794,9 +631,6 @@ async fn a_tap_thread_id_that_is_not_a_uuid_is_refused() {
     }
 }
 
-/// `current` is an agent's word for "the thread I am in". A script POSTing here
-/// has no such thread, so resolving it would name whichever one the engine
-/// happened to serve. It is refused rather than guessed.
 #[tokio::test]
 async fn the_current_alias_has_no_meaning_over_http() {
     let (status, reason) = create_expecting_refusal(serde_json::json!({
@@ -813,8 +647,6 @@ async fn the_current_alias_has_no_meaning_over_http() {
     );
 }
 
-/// A thread tap with no id at all is the same dead banner, with a different
-/// error string. This row is stored and pushed before anyone sees it.
 #[tokio::test]
 async fn a_thread_tap_with_no_id_is_refused() {
     let (status, reason) = create_expecting_refusal(serde_json::json!({
@@ -827,9 +659,6 @@ async fn a_thread_tap_with_no_id_is_refused() {
     assert!(reason.contains("has none"), "got: {reason}");
 }
 
-/// `POST /api/v1/ui/navigate` is the SDK's `lucidos.ui.navigate`, and it emits
-/// the same NavigationRequested payload the `navigate_ui` tool does. An app has
-/// no thread of its own, so the alias is refused here like any other non-uuid.
 #[tokio::test]
 async fn the_sdk_navigate_bridge_refuses_a_thread_id_that_names_nothing() {
     for bad in serde_json::json!(["current", "t-9", 7]).as_array().unwrap() {
@@ -852,7 +681,6 @@ async fn the_sdk_navigate_bridge_refuses_a_thread_id_that_names_nothing() {
     }
 }
 
-/// The same bridge still passes a real thread id, and every other target.
 #[tokio::test]
 async fn the_sdk_navigate_bridge_still_passes_a_real_target() {
     for params in [
@@ -875,9 +703,6 @@ async fn the_sdk_navigate_bridge_still_passes_a_real_target() {
     }
 }
 
-/// A `repo:` locator naming an unregistered repository reached the page as a
-/// bare uuid parse error. The bridge now refuses it and names what was asked.
-/// A malformed one still passes, since the page reads it as an artifact path.
 #[tokio::test]
 async fn the_sdk_navigate_bridge_refuses_a_repository_nobody_registered() {
     let file_path = format!("repo:{}:file:README.md", unique_marker("unregistered-repo"));
@@ -909,8 +734,6 @@ async fn the_sdk_navigate_bridge_refuses_a_repository_nobody_registered() {
     assert_eq!(resp.status(), 200, "a malformed locator still navigates");
 }
 
-/// The guard is scoped to a thread target. An app id is a directory name and a
-/// panel target carries no id at all.
 #[tokio::test]
 async fn a_tap_that_names_no_thread_is_untouched() {
     let row = create_and_read_back(serde_json::json!({
@@ -930,8 +753,6 @@ async fn a_tap_that_names_no_thread_is_untouched() {
     assert_eq!(row["tap"]["to"]["target"], "changes");
 }
 
-/// Pull `data.notification_id` out of an SSE `data: {json}` line. Returns None
-/// if the line isn't JSON or lacks the field.
 fn extract_notification_id(line: &str) -> Option<String> {
     let json_part = line.strip_prefix("data:").unwrap_or(line).trim();
     let v: serde_json::Value = serde_json::from_str(json_part).ok()?;

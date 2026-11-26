@@ -1,7 +1,3 @@
-//! The *apply estimate* over HTTP: what the apply toasts read from
-//! `GET /api/v1/changes`. The estimator and the probe are unit-tested in the
-//! engine; this covers the payload a reloaded page rehydrates from.
-
 use crate::support::{base_url, db_url, seed_cc_thread_summary, user_client};
 use serde_json::json;
 use uuid::Uuid;
@@ -34,9 +30,6 @@ async fn seed_resolving_change(pool: &sqlx::PgPool, change_id: Uuid, thread_id: 
     .expect("seed the conflict event");
 }
 
-/// A reload must keep the elapsed time, so the row says when its conflict
-/// resolution began. A repo git cannot read predicts `unknown`, never clean.
-/// The response always carries both estimate slots.
 #[tokio::test]
 async fn a_pending_change_carries_its_phase_start_and_conflict_prediction() {
     let client = user_client().await;

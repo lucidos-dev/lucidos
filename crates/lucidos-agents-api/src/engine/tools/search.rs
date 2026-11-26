@@ -1,69 +1,30 @@
-//! Pure search helpers for `glob_files` and `grep_files` tools.
-//!
-//! Each tool comes in two forms. `glob_files` / `grep_files` walk the
-//! workspace's `data/` directory, scoped to the subdirectories `list_files`
-//! walks (artifacts, apps, knowhow, triggers). Patterns are relative to `data/`,
-//! so the LLM can use the paths it sees in `list_files` output (e.g.
-//! `apps/**/index.html`).
-//!
-//! `glob_entries` / `grep_entries` take the file list instead, which is how a
-//! registered repository is searched (`engine::tools::repo_files`). Everything
-//! that matters lives below that split: the brace expansion, the match caps,
-//! the binary sniff and the context window are shared, and only the source of
-//! the paths differs.
-
 use super::ClampBounds;
 use crate::engine::file_text::{cap_chars, looks_binary};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-/// Default + clamp bounds for `glob_files`'s `limit` arg. An absent arg
-/// resolves to the default (200); any supplied value is clamped into
-/// `[1, 1000]`. Owning both the default and the bounds in one `ClampBounds`
-/// here is the single source of truth: the dispatch handler in `files.rs`
-/// forwards the raw `Option<usize>` and never re-states the default.
 pub(crate) const GLOB_LIMIT: ClampBounds<usize> = ClampBounds {
     default: 200,
     min: 1,
     max: 1000,
 };
 
-/// Default + clamp bounds for `grep_files`'s `max_matches` arg: default 100,
-/// clamped into `[1, 500]`. Same single-source-of-truth rule as `GLOB_LIMIT`.
 pub(crate) const GREP_MAX_MATCHES: ClampBounds<usize> = ClampBounds {
     default: 100,
     min: 1,
     max: 500,
 };
 
-/// Default + clamp bounds for `grep_files`'s `context_lines` arg: default 0
-/// (no surrounding context), clamped into `[0, 5]`. The cap keeps a wide
-/// context window from dumping unbounded text per match.
 pub(crate) const GREP_CONTEXT_LINES: ClampBounds<usize> = ClampBounds {
     default: 0,
     min: 0,
     max: 5,
 };
-/// Per-line truncation cap. Files like PDF text dumps or single-line JSON have
-/// individual lines of many KB; without a cap the matched line + context window
-/// can dump megabytes of text into the LLM context.
 pub const GREP_MAX_LINE_CHARS: usize = 300;
-/// Hard ceiling on the serialized text content (matched line + context lines)
-/// across all returned matches. ~50 KB ≈ ~12k tokens — comfortably under any
-/// model's context budget for a single tool result.
 pub const GREP_MAX_TOTAL_BYTES: usize = 50 * 1024;
-/// Cap on the patterns one brace expansion may produce. Nesting multiplies, so
-/// nine two-way groups already reach 512, and each alternative costs a compile
-/// plus one comparison per file walked. The widest pattern a month of workspace
-/// traffic produced listed five directories. 256 sits far above that and low
-/// enough to keep the walk cheap.
 const MAX_BRACE_ALTERNATIVES: usize = 256;
-/// Skip files larger than this when grepping — keeps a single pathological log
-/// file from OOM-ing the engine. Glob walk is metadata-only so doesn't need it.
 const GREP_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// The `data/` file list both tools walk, in the `(relative, absolute)` shape
-/// the entries-taking bodies consume.
 pub(super) fn data_entries(workspace_path: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     crate::core::list_searchable_data_files(workspace_path)
         .map_err(|e| format!("Failed to list workspace files: {}", e))
@@ -92,10 +53,6 @@ pub struct GrepResult {
     pub truncated: bool,
 }
 
-/// Reject patterns that try to escape `data/` — matches the policy that
-/// every other file tool applies via `resolve_data_path`. Even though the
-/// matcher only sees `data/`-relative strings, accepting `..`-style patterns
-/// silently returns empty and trains the LLM to think files are missing.
 fn validate_pattern(label: &str, pattern: &str) -> Result<(), String> {
     if crate::core::is_path_traversal(pattern) {
         Err(format!(
@@ -107,16 +64,11 @@ fn validate_pattern(label: &str, pattern: &str) -> Result<(), String> {
     }
 }
 
-/// End index of the `[...]` class opening at `start`, or `None` when no `]`
-/// closes it. `glob::Pattern` rejects an unterminated class, so we scan past
-/// the `[` and leave the compile to report it. A `]` in the first position is
-/// a class member, which is what the matcher does too.
 fn class_end(chars: &[char], start: usize) -> Option<usize> {
     let mut i = start + 1;
     if chars.get(i) == Some(&'!') {
         i += 1;
     }
-    // The first member, even when it is `]`.
     i += 1;
     chars[i.min(chars.len())..]
         .iter()
@@ -124,9 +76,6 @@ fn class_end(chars: &[char], start: usize) -> Option<usize> {
         .map(|offset| i + offset)
 }
 
-/// Read the brace group opening at `open` into its top-level alternatives,
-/// with the index of the closing `}`. `None` means the group is not one:
-/// either nothing closes it, or it holds no top-level comma.
 fn parse_group(chars: &[char], open: usize) -> Option<(Vec<String>, usize)> {
     let mut alternatives: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -164,9 +113,6 @@ fn parse_group(chars: &[char], open: usize) -> Option<(Vec<String>, usize)> {
     None
 }
 
-/// Split a pattern at its first brace group, into the text before it, its
-/// alternatives, and the text after it. `None` means the pattern holds no
-/// group left to expand.
 fn split_first_group(pattern: &str) -> Option<(String, Vec<String>, String)> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0;
@@ -201,9 +147,6 @@ fn expand_braces(pattern: &str) -> Result<Vec<String>, String> {
                 }
             }
         }
-        // Each pending entry yields at least one pattern, so this sum is a
-        // floor on the final count. Testing it every round stops a nested
-        // pattern here rather than once the queue holds thousands of strings.
         if expanded.len() + pending.len() > MAX_BRACE_ALTERNATIVES {
             return Err(format!(
                 "expands past {} alternatives: narrow the braces, or search in more than one call",
@@ -214,10 +157,6 @@ fn expand_braces(pattern: &str) -> Result<Vec<String>, String> {
     Ok(expanded)
 }
 
-/// Compile a `data/`-relative pattern into one matcher per brace alternative.
-/// A path matches when ANY of them matches. Both tools compile through here,
-/// so a pattern cannot come to mean one thing to `glob_files` and another to
-/// `grep_files`'s `path_glob`.
 fn compile_pattern(label: &str, pattern: &str) -> Result<Vec<glob::Pattern>, String> {
     validate_pattern(label, pattern)?;
     let expanded = expand_braces(pattern).map_err(|e| format!("{} '{}' {}", label, pattern, e))?;
@@ -231,11 +170,6 @@ fn compile_pattern(label: &str, pattern: &str) -> Result<Vec<glob::Pattern>, Str
         .collect()
 }
 
-/// Match files under `data/` against a glob pattern (relative to `data/`).
-///
-/// `limit` is `None` when the caller omitted the arg (→ [`GLOB_LIMIT`]'s
-/// default) and `Some(n)` otherwise; either way it is resolved through
-/// `GLOB_LIMIT.apply`, so the default and the clamp live in one place.
 #[cfg(test)]
 fn glob_files(
     workspace_path: &Path,
@@ -245,10 +179,6 @@ fn glob_files(
     glob_entries(data_entries(workspace_path)?, pattern, limit)
 }
 
-/// [`glob_files`] over a caller-supplied file list. A walk of something other
-/// than `data/` reuses the matching, the brace expansion and the limit rather
-/// than reimplementing them. `engine::tools::repo_files` supplies a registered
-/// repository's entries.
 pub fn glob_entries(
     entries: Vec<(String, PathBuf)>,
     pattern: &str,
@@ -279,12 +209,6 @@ pub fn glob_entries(
     })
 }
 
-/// Search file contents for a regex pattern. Walks the same directories as
-/// `list_files` / `glob_files` and stops as soon as `max_matches` is reached.
-///
-/// `max_matches` / `context_lines` are `None` when the caller omitted the arg
-/// (→ each bound's default) and `Some(n)` otherwise; both are resolved through
-/// their [`ClampBounds`] so the defaults and clamps live in one place.
 #[cfg(test)]
 fn grep_files(
     workspace_path: &Path,
@@ -304,9 +228,6 @@ fn grep_files(
     )
 }
 
-/// [`grep_files`] over a caller-supplied file list. Same reason as
-/// [`glob_entries`]: the caps, the binary sniff and the context window are the
-/// valuable part and must not be reimplemented per file source.
 pub fn grep_entries(
     entries: Vec<(String, PathBuf)>,
     pattern: &str,
@@ -344,7 +265,7 @@ pub fn grep_entries(
             }
         }
 
-        // An unstattable file is skipped, not read. Under `if let Ok` an
+        // INVARIANT: An unstattable file is skipped, not read. Under `if let Ok` an
         // unknown size was the one case with no cap, so the read below pulled
         // the whole file into memory.
         let Ok(meta) = std::fs::metadata(&abs) else {
@@ -394,8 +315,6 @@ pub fn grep_entries(
                     context_after,
                 });
                 total_bytes += match_bytes;
-                // Soft cap: check after pushing so we always include the match
-                // that trips it — otherwise a single huge match could return zero.
                 if total_bytes >= GREP_MAX_TOTAL_BYTES {
                     truncated = true;
                     break 'outer;
@@ -419,10 +338,8 @@ mod tests {
         for sub in ["artifacts", "apps", "knowhow", "triggers", "postgres"] {
             fs::create_dir_all(data.join(sub)).unwrap();
         }
-        // .lucidos must NOT be searched
         fs::create_dir_all(dir.path().join(".lucidos/exhaust")).unwrap();
         fs::write(dir.path().join(".lucidos/exhaust/cache.txt"), "secret").unwrap();
-        // postgres must NOT be searched even though it's under data/
         fs::write(data.join("postgres/pg_stuff.txt"), "secret pg").unwrap();
         dir
     }
@@ -432,8 +349,6 @@ mod tests {
         fs::create_dir_all(full.parent().unwrap()).unwrap();
         fs::write(full, content).unwrap();
     }
-
-    // -------- glob_files --------
 
     #[test]
     fn glob_matches_simple_pattern() {
@@ -489,7 +404,6 @@ mod tests {
     #[test]
     fn glob_skips_postgres_and_lucidos() {
         let ws = make_workspace();
-        // No matches under artifacts/apps/knowhow/triggers — only postgres and .lucidos
         let r = glob_files(ws.path(), "**/*.txt", Some(200)).unwrap();
         assert!(
             r.paths.is_empty(),
@@ -515,7 +429,6 @@ mod tests {
     fn glob_clamps_limit_above_max() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "x");
-        // limit > GLOB_LIMIT.max should be clamped, not error
         let r = glob_files(ws.path(), "**/*.md", Some(GLOB_LIMIT.max * 5)).unwrap();
         assert_eq!(r.paths, vec!["artifacts/a.md".to_string()]);
     }
@@ -544,8 +457,6 @@ mod tests {
 
     #[test]
     fn glob_skips_symlinks_to_outside() {
-        // Symlinks to anywhere — even valid dirs — must be skipped so we
-        // can't be tricked into walking outside data/ or into a loop.
         #[cfg(unix)]
         {
             let ws = make_workspace();
@@ -593,10 +504,6 @@ mod tests {
             ]
         );
     }
-
-    // -------- brace alternation --------
-    // `glob::Pattern` matches `{` literally, so before expansion every one of
-    // these returned an empty list that reads exactly like "no such file".
 
     #[test]
     fn glob_expands_braces_to_the_union_of_the_arms() {
@@ -660,7 +567,6 @@ mod tests {
         let ws = make_workspace();
         write(ws.path(), "artifacts/{one}.md", "x");
         write(ws.path(), "artifacts/one.md", "y");
-        // Bash reads `{one}` as three literal characters, and so do we.
         let r = glob_files(ws.path(), "artifacts/{one}.md", Some(200)).unwrap();
         assert_eq!(r.paths, vec!["artifacts/{one}.md".to_string()]);
     }
@@ -686,11 +592,9 @@ mod tests {
         write(ws.path(), "artifacts/a,b.md", "y");
         write(ws.path(), "artifacts/c.md", "z");
 
-        // `[{]` is the matcher's own escape for a literal brace.
         let escaped = glob_files(ws.path(), "artifacts/[{]a,b[}].md", Some(200)).unwrap();
         assert_eq!(escaped.paths, vec!["artifacts/{a,b}.md".to_string()]);
 
-        // A comma inside a class belongs to the class, not to the alternation.
         let inside = glob_files(ws.path(), "artifacts/{a[,]b,c}.md", Some(200)).unwrap();
         assert_eq!(
             inside.paths,
@@ -701,7 +605,6 @@ mod tests {
     #[test]
     fn glob_rejects_expansion_past_the_alternative_cap() {
         let ws = make_workspace();
-        // Nine two-way groups multiply out to 512, past MAX_BRACE_ALTERNATIVES.
         let pattern = format!("artifacts/{}.md", "{a,b}".repeat(9));
         let err = glob_files(ws.path(), &pattern, Some(200)).unwrap_err();
         assert!(
@@ -714,12 +617,9 @@ mod tests {
     #[test]
     fn glob_brace_alternative_cannot_escape_data() {
         let ws = make_workspace();
-        // The raw pattern passes the traversal guard; one expansion does not.
         let err = glob_files(ws.path(), "{/etc,artifacts}/**", Some(200)).unwrap_err();
         assert!(err.contains("rejected"), "got: {}", err);
     }
-
-    // -------- grep_files --------
 
     #[test]
     fn grep_finds_simple_match() {
@@ -818,7 +718,6 @@ mod tests {
     #[test]
     fn grep_skips_binary_files() {
         let ws = make_workspace();
-        // Binary file with null byte and the search pattern in it
         let mut binary: Vec<u8> = b"hello before".to_vec();
         binary.push(0);
         binary.extend_from_slice(b"hello after");
@@ -848,7 +747,6 @@ mod tests {
     fn grep_clamps_max_matches_above_limit() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "x");
-        // Should clamp without erroring
         let r = grep_files(
             ws.path(),
             "x",
@@ -906,7 +804,6 @@ mod tests {
             content.push_str(&format!("after{}\n", i));
         }
         write(ws.path(), "artifacts/a.md", &content);
-        // request 50 — should clamp to GREP_CONTEXT_LINES.max (5)
         let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(50)).unwrap();
         let m = &r.matches[0];
         assert_eq!(m.context_before.len(), GREP_CONTEXT_LINES.max);
@@ -916,7 +813,6 @@ mod tests {
     #[test]
     fn grep_skips_postgres_and_lucidos_dirs() {
         let ws = make_workspace();
-        // Contents are set up by make_workspace; nothing under artifacts/apps/knowhow/triggers
         let r = grep_files(ws.path(), "secret", None, false, Some(100), Some(0)).unwrap();
         assert!(
             r.matches.is_empty(),
@@ -964,7 +860,6 @@ mod tests {
     #[test]
     fn grep_truncates_long_match_line() {
         let ws = make_workspace();
-        // PDF-style dump: one giant line containing the match.
         let prefix = "x".repeat(GREP_MAX_LINE_CHARS + 500);
         let line = format!("{}MATCH{}", prefix, "y".repeat(500));
         write(ws.path(), "artifacts/a.md", &line);
@@ -1033,8 +928,6 @@ mod tests {
     #[test]
     fn grep_stops_at_total_bytes_cap() {
         let ws = make_workspace();
-        // Each line ~250 chars + "MATCH" — under per-line cap, but stacking
-        // many of them blows past the total cap quickly.
         let mut content = String::new();
         for _ in 0..1000 {
             content.push_str("MATCH ");
@@ -1053,8 +946,6 @@ mod tests {
                     + m.context_after.iter().map(|s| s.len()).sum::<usize>()
             })
             .sum();
-        // Some overshoot expected (we always include the match that trips the cap),
-        // but the result must stay within an order of magnitude of the limit.
         assert!(
             total_bytes <= GREP_MAX_TOTAL_BYTES * 2,
             "total bytes {} should be near the cap of {}",
@@ -1071,9 +962,6 @@ mod tests {
     #[test]
     fn grep_total_bytes_cap_always_returns_first_match() {
         let ws = make_workspace();
-        // Single line just under the per-line cap and over the total cap on its own
-        // (after per-line truncation it's still well within total cap; this just
-        // verifies we don't drop the first match even if it would push us over).
         let line = format!("{} MATCH", "p".repeat(GREP_MAX_LINE_CHARS - 10));
         write(ws.path(), "artifacts/a.md", &line);
         let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(0)).unwrap();
@@ -1083,7 +971,6 @@ mod tests {
     #[test]
     fn grep_truncation_handles_multibyte_chars() {
         let ws = make_workspace();
-        // Mix of multi-byte chars to ensure we don't slice mid-codepoint.
         let prefix = "ñ".repeat(GREP_MAX_LINE_CHARS + 100);
         let line = format!("{}MATCH", prefix);
         write(ws.path(), "artifacts/a.md", &line);
@@ -1097,18 +984,11 @@ mod tests {
         );
     }
 
-    // -------- default resolution (None → ClampBounds default) --------
-    // These guard the unification: the default for an absent arg now lives in
-    // the pure fn (via ClampBounds), not in the dispatch handler. None must
-    // resolve to the documented default, not the clamp minimum.
-
     #[test]
     fn glob_none_limit_resolves_to_default() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "x");
         write(ws.path(), "artifacts/b.md", "y");
-        // Absent arg (None) must behave like an explicit Some(default): return
-        // the whole small set without truncating to the clamp minimum.
         let none = glob_files(ws.path(), "artifacts/*.md", None).unwrap();
         let default = glob_files(ws.path(), "artifacts/*.md", Some(GLOB_LIMIT.default)).unwrap();
         assert_eq!(none.paths, default.paths);
@@ -1120,8 +1000,6 @@ mod tests {
     fn grep_none_args_resolve_to_defaults() {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "before\nMATCH\nafter");
-        // Absent max_matches/context_lines (None) must resolve to the defaults
-        // (100 matches, 0 context lines), matching an explicit Some(default).
         let none = grep_files(ws.path(), "MATCH", None, false, None, None).unwrap();
         let default = grep_files(
             ws.path(),
@@ -1134,7 +1012,6 @@ mod tests {
         .unwrap();
         assert_eq!(none.matches.len(), 1);
         assert_eq!(none.matches.len(), default.matches.len());
-        // context_lines default is 0 → no surrounding context captured.
         assert!(none.matches[0].context_before.is_empty());
         assert!(none.matches[0].context_after.is_empty());
     }

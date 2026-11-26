@@ -28,7 +28,6 @@ fn problem_for<'a>(index: &'a MediaIndex, path: &str) -> &'a str {
         .reason
 }
 
-/// A value of the wrong type is named and ignored, never a parse failure.
 #[test]
 fn a_wrong_type_in_the_manifest_is_a_problem_not_a_failure() {
     let declared =
@@ -40,8 +39,6 @@ fn a_wrong_type_in_the_manifest_is_a_problem_not_a_failure() {
     assert_eq!(keys, vec!["icon", "screenshots", "videos"]);
 }
 
-/// Invariant I9: a missing, oversize, wrong-type or misplaced entry is dropped
-/// and named, and the rest of the media is still kept.
 #[test]
 fn a_bad_entry_is_dropped_with_its_reason() {
     let tree = tempfile::tempdir().unwrap();
@@ -81,7 +78,6 @@ screenshots = ["media/ok.png", "media/anim.gif", "media/huge.png", "media/gone.p
     }
 }
 
-/// Invariant I12: the count and total caps hold, and say which limit.
 #[test]
 fn the_count_and_total_caps_hold() {
     let tree = tempfile::tempdir().unwrap();
@@ -146,8 +142,6 @@ fn write_app(root: &Path, id: &str, kind: Option<&str>, icon: bool) {
     );
 }
 
-/// With no plugin icon, the icon of the plugin's single app stands in. Its
-/// widgets do not count as apps.
 #[test]
 fn the_single_app_icon_stands_in() {
     let tree = tempfile::tempdir().unwrap();
@@ -164,7 +158,6 @@ fn the_single_app_icon_stands_in() {
     assert_eq!(media.index.icon, None, "two apps have no single icon");
 }
 
-/// A symlinked app manifest is never read, so its app lends no icon.
 #[cfg(unix)]
 #[test]
 fn a_symlinked_app_manifest_lends_no_icon() {
@@ -183,7 +176,6 @@ fn a_symlinked_app_manifest_lends_no_icon() {
     assert_eq!(media.index.icon, None);
 }
 
-/// Invariant I13: a copy serves only what its index lists.
 #[test]
 fn a_copy_serves_only_listed_files() {
     let tree = tempfile::tempdir().unwrap();
@@ -202,8 +194,6 @@ fn a_copy_serves_only_listed_files() {
     assert_eq!(listed_file(&copy, "../p/index.json"), None);
 }
 
-/// Invariant I11: a new copy replaces the old one whole, so no stale
-/// screenshot survives an update, and no media at all leaves no copy.
 #[test]
 fn a_new_copy_replaces_the_old_one_whole() {
     let tree = tempfile::tempdir().unwrap();
@@ -233,7 +223,6 @@ fn a_new_copy_replaces_the_old_one_whole() {
     assert!(!copy.exists());
 }
 
-/// A rescan of unchanged media leaves the copy untouched.
 #[test]
 fn unchanged_media_is_not_rewritten() {
     let tree = tempfile::tempdir().unwrap();
@@ -262,8 +251,6 @@ fn unchanged_media_is_not_rewritten() {
     );
 }
 
-/// Invariant I19: the cache keeps what the scan needs, drops the rest, and
-/// leaves a failed marketplace alone.
 #[test]
 fn pruning_keeps_what_the_scan_needs() {
     let workspace = tempfile::tempdir().unwrap();
@@ -317,7 +304,6 @@ fn urls_name_the_copy_and_encode_each_segment() {
     );
 }
 
-/// Invariant I8: installed media stays out of the workspace's git history.
 #[test]
 fn installed_media_is_gitignored() {
     let entry = format!("{}/{}/", crate::core::DATA_DIR, INSTALLED_DIR);
@@ -335,7 +321,6 @@ fn removing_a_marketplace_cache_takes_only_that_marketplace() {
     assert!(cache_dir(workspace.path(), "m2", "q", "1.0.0").exists());
 }
 
-/// Tests that read a shipped doc at run time.
 mod guard_tests {
     use super::*;
 
@@ -344,8 +329,6 @@ mod guard_tests {
         crate::core::knowhow::doc_family_text(&repo, "system-knowhow/plugins.md")
     }
 
-    /// Plugin media goes public, so the agent must never capture the user's real
-    /// data for it. `plugins.md` is the only place that tells it so.
     #[test]
     fn the_plugins_knowhow_requires_demo_data_in_media() {
         let doc = plugins_doc();
@@ -358,8 +341,6 @@ mod guard_tests {
         }
     }
 
-    /// `plugins.md` states the limits to authors. It restates these constants, so
-    /// this pins the copy (`.claude/rules/one-definition-per-value.md`).
     #[test]
     fn the_plugins_knowhow_states_the_limits() {
         let doc = plugins_doc();

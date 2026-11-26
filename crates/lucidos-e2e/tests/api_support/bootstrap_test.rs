@@ -1,18 +1,9 @@
-//! `GET /api/v1/bootstrap` over real HTTP: the *bootstrap snapshot* with every
-//! layer a live request passes, compression among them.
-//!
-//! The engine suite compares all 25 slices with their routes on a private
-//! fixture. This workspace is shared with every other test, so it pins what
-//! only the wire shows: the headers, the validator and the envelope.
-
 use reqwest::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, ETAG, IF_NONE_MATCH, VARY,
 };
 
 use crate::support::{base_url, user_client};
 
-/// How many slices the snapshot carries. The client's `BootstrapSnapshot`
-/// type lists the same number.
 const SLICE_COUNT: usize = 25;
 
 fn bootstrap_url() -> String {
@@ -47,8 +38,6 @@ async fn the_snapshot_answers_every_slice_as_data_or_as_an_error() {
     }
 }
 
-/// Gateway users change only when the gateway's user list does, so these two
-/// slices hold still while other tests write to the workspace.
 #[tokio::test]
 async fn a_slice_is_the_body_its_narrow_route_answers() {
     let client = user_client().await;
@@ -73,9 +62,6 @@ async fn a_slice_is_the_body_its_narrow_route_answers() {
     }
 }
 
-/// `If-None-Match: *` holds whatever the workspace answers, so the check does
-/// not wait for a quiet moment on a workspace every other test writes to.
-/// That the validator matches the body's own tag is the engine suite's job.
 #[tokio::test]
 async fn a_held_validator_gets_a_bodiless_not_modified_even_compressed() {
     let client = user_client().await;

@@ -1,8 +1,6 @@
-//! Event persistence, stores, model providers, and shared engine types.
-
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-/// The Providers page as copy names it: the one definition for engine strings.
+/// INVARIANT: The Providers page as copy names it: the one definition for engine strings.
 /// A macro, not a `const`, so `concat!` can take it in `const` strings and
 /// `match` arms. The frontend's twin is `PROVIDERS_SETTINGS_PATH`.
 #[macro_export]
@@ -12,7 +10,6 @@ macro_rules! providers_settings {
     };
 }
 
-/// Typed logging preserves host output and stores classified diagnostic values.
 #[macro_export]
 macro_rules! log {
     (@$label:ident, $($arg:tt)*) => {
@@ -31,7 +28,6 @@ pub fn typed_log_line(label: &'static str, line: lucidos_diagnostic_log::Line) {
     lucidos_diagnostic_log::record(label, line);
 }
 
-// All host printing is confined to this logging module.
 #[allow(clippy::print_stdout)]
 mod log_output {
     pub fn host(label: &str, msg: &str) {
@@ -43,10 +39,6 @@ mod log_output {
     }
 }
 
-/// Legacy log with auto-derived module label, printed to stdout and
-/// handed to the diagnostic log.
-/// - `log_legacy!("message")` → auto module from `module_path!()`
-/// - `log_legacy!(@Push, "message")` → explicit label override
 #[macro_export]
 macro_rules! log_legacy {
     (@$label:ident, $($arg:tt)*) => {
@@ -57,14 +49,11 @@ macro_rules! log_legacy {
     };
 }
 
-/// The body of [`log_legacy!`]: one stdout line, then the same message to the
-/// diagnostic log, which never blocks.
 pub fn log_line(label: &'static str, msg: String) {
     log_output::host(label, &msg);
     diagnostic_log::record(label, msg);
 }
 
-/// The current local time, formatted to start a log line.
 pub fn log_stamp() -> impl std::fmt::Display {
     chrono::Local::now().format(lucidos_gateway_constants::LOG_STAMP_FORMAT)
 }

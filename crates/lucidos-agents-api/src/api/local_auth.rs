@@ -1,67 +1,17 @@
-//! The engine's own door: who may call this engine when it faces a network.
-//!
-//! Full design: `docs/plans/2026-08-29-the-engine-has-its-own-door.md`.
-//!
-//! # Two questions, two modules
-//!
-//! [`crate::api::browser_origin`] asks *which document sent this*, which is a
-//! CSRF question. This module asks *who is calling*, which is authentication.
-//! Browser metadata cannot answer the second: any client may omit every header,
-//! so an absent `Sec-Fetch-Site` proves nothing about a caller.
-
-//! # Why the bind decides whether the door is locked
-//!
-//! On a loopback bind, reaching the socket BY A LOOPBACK NAME proves the
-//! caller is a local process. The engine's whole contract rests on that. The
-//! frontend, every app iframe, the CLI and both e2e suites call in freely.
-//! Locking that door would break all of them for nothing.
-//!
-//! The name matters because of DNS rebinding. A page on `attacker.example`
-//! whose DNS answer flips to `127.0.0.1` reaches this socket as its own origin.
-//! The browser then sends `Sec-Fetch-Site: same-origin`, which passes
-//! [`crate::api::browser_origin`]. Only its `Host` gives it away. So the open
-//! door still refuses, with 421, any `Host` or URI authority that is not a
-//! loopback IP literal or `localhost` (ADR 0601).
-//!
-//! A wide bind retires the premise. The caller may now be anyone on the LAN or
-//! the tailnet, and nothing else stands behind this. So the door locks, and the
-//! only callers left are processes that can read a mode 0600 file.
-//!
-//! A browser is not one of those, deliberately. A phone reaches a workspace
-//! through the gateway at `/<slug>/`, which authenticates it by pairing (ADR
-//! 0094, ADR 0096). The gateway then proves ITSELF on the proxy hop.
-
-//! # A loopback peer address proves nothing
+//! INVARIANT: # A loopback peer address proves nothing
 //!
 //! [`presented_scope`] takes no peer address, exactly as the gateway's
 //! `authorize` does not. `tailscale serve` proxies from this machine, so a
 //! phone's request arrives with a loopback source. Trusting the source address
 //! would trust the whole tailnet.
 
-//! # Why the whole surface, not just the mutating half
+//! INVARIANT: # Why the whole surface, not just the mutating half
 //!
 //! Splitting reads from writes would leave every thread, artifact and revealed
 //! credential open. `/data` alone serves the workspace's files off disk. So the
 //! gate wraps the OUTERMOST router, covering `/api/v1`, `/app`, `/data` and the
 //! frontend fallback. `/api/v1/health` is the single exemption, because the
 //! gateway health-probes it before it can prove anything.
-
-//! # The same token also answers a second question, on every bind
-//!
-//! [`is_local_process`] asks whether a caller is a process on this machine, for
-//! ATTRIBUTION rather than for the door. `api::actor` reads it to name a caller
-//! with no other credential, such as the build-watch and the release scripts
-//! (ADR 0169). [`local_process_origin`] builds that name.
-//!
-//! It answers on a loopback bind too, where [`EngineAuth::is_required`] is
-//! false and nothing is refused. The door and the name are separate questions,
-//! which is the split this module's header opens with.
-//!
-//! **The answer names a machine, never a person.** So it can never be the
-//! evidence ADR 0168's clause 4 asks for. Every subprocess runs as the owner
-//! and can read the token, so it does not prove the owner either. The caller
-//! is an `UnattestedCaller` until the OS sandbox lands
-//! ([`LOCAL_TOKEN_PROVES_OWNER`]).
 
 use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::net_config::BindChoice;
@@ -70,16 +20,13 @@ use axum::response::{IntoResponse, Response};
 use lucidos_local_token as local_token;
 use std::sync::OnceLock;
 
-/// What a presented credential authorizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineScope {
-    /// The machine-local token: every route.
     Full,
-    /// The hook socket token: one route, the delivery hop.
     WebhookDelivery,
 }
 
-/// The credentials this engine accepts, and whether it checks them at all.
+/// INVARIANT: The credentials this engine accepts, and whether it checks them at all.
 ///
 /// Read ONCE at startup rather than per request. The read is a file read, and
 /// this sits in front of every request including the SSE stream. The engine
@@ -88,14 +35,13 @@ pub enum EngineScope {
 /// value, whichever of the two booted first.
 #[derive(Debug, Clone)]
 pub struct EngineAuth {
-    /// False on a loopback bind, where reaching it by a loopback name is the proof.
     required: bool,
     local: Option<String>,
     hook_socket: Option<String>,
 }
 
 impl EngineAuth {
-    /// Resolve the door for an engine bound as `choice` says.
+    /// INVARIANT: Resolve the door for an engine bound as `choice` says.
     ///
     /// A wide bind that can read neither token authenticates nobody. That is
     /// logged at boot rather than discovered one 401 at a time. It is not
@@ -117,9 +63,6 @@ impl EngineAuth {
                 "no webhook delivery can reach this engine on a wide bind",
             ),
         };
-        // One file read serves both questions. Publishing here rather than
-        // reading again keeps the door and the attribution answer from ever
-        // disagreeing about what the token is.
         publish_local_token(auth.local.clone());
         crate::diagnostic_log::register_secret_values(
             auth.local.iter().chain(&auth.hook_socket).cloned(),
@@ -139,7 +82,6 @@ impl EngineAuth {
         auth
     }
 
-    /// A door that checks nothing, for a test driving the loopback posture.
     #[cfg(test)]
     pub fn open_for_tests() -> Self {
         EngineAuth {
@@ -149,7 +91,6 @@ impl EngineAuth {
         }
     }
 
-    /// A locked door holding exactly these two secrets.
     #[cfg(test)]
     pub fn locked_for_tests(local: Option<&str>, hook_socket: Option<&str>) -> Self {
         EngineAuth {
@@ -159,13 +100,12 @@ impl EngineAuth {
         }
     }
 
-    /// Does this engine check credentials at all?
     pub fn is_required(&self) -> bool {
         self.required
     }
 }
 
-/// The named token, minting it when no gateway has yet.
+/// INVARIANT: The named token, minting it when no gateway has yet.
 ///
 /// The gateway mints before it spawns any engine, so a fronted engine finds
 /// that value and this writes nothing. Two engines mint anyway:
@@ -201,11 +141,6 @@ pub fn auth_required(choice: &BindChoice) -> bool {
     }
 }
 
-/// May this path be served with no credential?
-///
-/// Exact-matched, never prefix-matched, so a future `/api/v1/health/secrets`
-/// cannot inherit its parent's exemption. Mirrors the gateway's
-/// `auth_api::is_public_path`, which carries the same reasoning.
 pub fn is_public_path(path: &str) -> bool {
     if path.split('/').any(|seg| seg == ".." || seg == ".") {
         return false;
@@ -213,10 +148,6 @@ pub fn is_public_path(path: &str) -> bool {
     path == "/api/v1/health"
 }
 
-/// What a request proved, or `None`.
-///
-/// Takes no peer address, on purpose: see the module note. The local token is
-/// checked first, so a caller holding both gets the wider scope.
 pub fn presented_scope(headers: &HeaderMap, auth: &EngineAuth) -> Option<EngineScope> {
     if let Some(expected) = auth.local.as_deref() {
         if presented(headers, local_token::HEADER_LOCAL_TOKEN)
@@ -235,30 +166,17 @@ pub fn presented_scope(headers: &HeaderMap, auth: &EngineAuth) -> Option<EngineS
     None
 }
 
-/// The machine-local token, published by [`EngineAuth::resolve`] at startup.
-///
-/// `None` before the router is built, and `Some(None)` on a machine with no
-/// gateway to mint one. Both mean the same thing to [`is_local_process`]: no
-/// caller can prove it is a local process, so none is attributed as one.
 static LOCAL_TOKEN: OnceLock<Option<String>> = OnceLock::new();
 
-/// Publish the token for [`is_local_process`]. First writer wins, matching the
-/// production invariant that one engine startup builds one router.
 fn publish_local_token(token: Option<String>) {
     let _ = LOCAL_TOKEN.set(token);
 }
 
-/// The machine-local token, for a caller deriving a key from it rather than
-/// checking a credential against it.
-///
-/// One reader today: [`super::frame_capability`], which derives the key an app
-/// frame's URL pass is signed with. The gateway derives the same key from the
-/// same file, which is what lets it verify with no handshake.
 pub(super) fn machine_local_token() -> Option<&'static str> {
     LOCAL_TOKEN.get().and_then(Option::as_deref)
 }
 
-/// Is this caller a process on this machine, running as this user?
+/// INVARIANT: Is this caller a process on this machine, running as this user?
 ///
 /// Attribution only. See the module note: it is asked on every bind, including
 /// the loopback one where nothing is refused, and it names a machine rather
@@ -277,16 +195,10 @@ pub fn is_local_process(headers: &HeaderMap) -> bool {
 /// [`local_process_origin`].
 const LOCAL_TOKEN_PROVES_OWNER: bool = false;
 
-/// The actor for a caller whose only credential is the machine-local token.
 pub(crate) fn local_process_origin(user_agent: Option<String>) -> MessageOrigin {
     local_process_origin_under(LOCAL_TOKEN_PROVES_OWNER, user_agent)
 }
 
-/// [`local_process_origin`] with the switch as an argument, so a test covers
-/// both positions.
-///
-/// Both keep `Engine` mode, so flipping the switch moves the spawn-gate root
-/// and the owner-only doors and nothing else.
 fn local_process_origin_under(proves_owner: bool, user_agent: Option<String>) -> MessageOrigin {
     if proves_owner {
         MessageOrigin::Api {
@@ -307,11 +219,6 @@ fn local_process_origin_under(proves_owner: bool, user_agent: Option<String>) ->
     }
 }
 
-/// The pure half of [`is_local_process`], so the comparison is testable without
-/// the process-wide token.
-///
-/// No expected token means nobody qualifies. That is the fail-closed direction:
-/// an absent secret must not make every caller local.
 fn carries_local_token(headers: &HeaderMap, expected: Option<&str>) -> bool {
     expected.is_some_and(|want| {
         presented(headers, local_token::HEADER_LOCAL_TOKEN)
@@ -319,11 +226,6 @@ fn carries_local_token(headers: &HeaderMap, expected: Option<&str>) -> bool {
     })
 }
 
-/// Publish a known token so a test can drive [`is_local_process`]. Idempotent,
-/// and every caller installs the same value, so parallel tests agree.
-///
-/// No unit test builds a router, so nothing else writes [`LOCAL_TOKEN`] in the
-/// test binary.
 #[cfg(test)]
 pub fn publish_test_local_token() -> &'static str {
     const TEST_TOKEN: &str = "test-machine-local-token";
@@ -331,7 +233,6 @@ pub fn publish_test_local_token() -> &'static str {
     TEST_TOKEN
 }
 
-/// A header read as a trimmed, non-empty value.
 fn presented<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(name)
@@ -340,14 +241,6 @@ fn presented<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// May a caller holding `scope` reach `path`?
-///
-/// [`EngineScope::WebhookDelivery`] reaches exactly
-/// `/api/v1/webhooks/<id>/deliver`. That is the hop the gateway's hook socket
-/// makes, and a hook socket is what `tailscale funnel` may expose to the open
-/// internet (ADR 0097). Every other route is off limits to it. So a delivery
-/// cannot become a workspace restart, a data write, or a credentialed upstream
-/// call on the user's own API accounts.
 pub fn scope_allows(scope: EngineScope, path: &str) -> bool {
     match scope {
         EngineScope::Full => true,
@@ -355,10 +248,6 @@ pub fn scope_allows(scope: EngineScope, path: &str) -> bool {
     }
 }
 
-/// Is `path` exactly the webhook delivery route?
-///
-/// Segment-matched rather than compared with `starts_with`, so neither a dot
-/// segment nor a longer sibling route can wear the shape.
 fn is_webhook_delivery_path(path: &str) -> bool {
     let mut segments = path.split('/').filter(|s| !s.is_empty());
     let head = [segments.next(), segments.next(), segments.next()];
@@ -386,7 +275,6 @@ fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
 }
 
-/// Does `authority` (a `Host` value or a URI authority) name this machine?
 fn is_loopback_authority(authority: &str) -> bool {
     if authority.contains('@') {
         return false;
@@ -408,7 +296,7 @@ fn foreign_authority(req: &axum::extract::Request) -> Option<String> {
         .find(|authority| !is_loopback_authority(authority))
 }
 
-/// Refuse a request that proved nothing, or that reached past its scope.
+/// INVARIANT: Refuse a request that proved nothing, or that reached past its scope.
 ///
 /// Layered on the OUTERMOST router, so it runs before routing and before any
 /// handler resolves a credential or touches the database.
@@ -439,8 +327,6 @@ pub async fn enforce(
     match presented_scope(req.headers(), &auth) {
         Some(scope) if scope_allows(scope, path) => next.run(req).await,
         Some(scope) => {
-            // Naming the scope is safe and is the point: the caller knows which
-            // credential it sent, and a silent 403 here is undebuggable.
             crate::log_legacy!("[API] refused {path}: a {scope:?} credential does not reach it");
             (
                 StatusCode::FORBIDDEN,
@@ -466,8 +352,6 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    /// A synthetic address from the CGNAT range Tailscale hands out. Invented,
-    /// never captured: only "valid, and not loopback" is load-bearing.
     const TAILNET: &str = "100.64.0.1";
 
     fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -481,9 +365,6 @@ mod tests {
         h
     }
 
-    /// Invariant 10 of the unattested-callers plan. Off, the local token is an
-    /// unattested caller. On, it is the engine's own machinery, which the spawn
-    /// gate roots at the owner. The mode and the user agent never move.
     #[test]
     fn the_local_token_switch_changes_only_the_origin() {
         let off = local_process_origin_under(false, Some("lucidos-cli".into()));
@@ -511,8 +392,6 @@ mod tests {
         assert_eq!(off.mode(), on.mode());
     }
 
-    /// The switch stays off until the OS sandbox stops subprocesses reading
-    /// the token. Flipping it is that plan's change, never a drive-by.
     #[test]
     fn the_local_token_does_not_prove_the_owner_today() {
         assert!(matches!(
@@ -545,10 +424,6 @@ mod tests {
 
     #[test]
     fn a_specific_address_locks_its_retained_loopback_socket_too() {
-        // `bind_socket_addrs` keeps loopback beside a configured address, and
-        // one router serves both. A caller arriving on the loopback socket of a
-        // tailnet-bound engine is not thereby local: `tailscale serve` proxies
-        // from this machine, which is the whole reason ADR 0094 exists.
         let choice = BindChoice::Address(TAILNET.parse().unwrap());
         let addrs = crate::net_config::bind_socket_addrs(&choice, 5173);
         assert!(
@@ -575,8 +450,6 @@ mod tests {
         assert!(!is_public_path("/api/v1/./health"));
     }
 
-    /// The attribution half, which the bind does not decide. Reading a mode
-    /// 0600 file is the thing a remote caller cannot do.
     #[test]
     fn the_local_token_names_a_local_process() {
         let h = hm(&[(local_token::HEADER_LOCAL_TOKEN, "local-secret")]);
@@ -584,9 +457,6 @@ mod tests {
         assert!(!carries_local_token(&h, Some("other-secret")));
     }
 
-    /// Fail closed on both halves of the pair. A machine with no gateway has
-    /// no token, and a caller that sends nothing proves nothing. Neither may
-    /// read as local: that would attribute every stranger to this machine.
     #[test]
     fn nobody_is_local_without_both_a_secret_and_a_header() {
         let with = hm(&[(local_token::HEADER_LOCAL_TOKEN, "local-secret")]);
@@ -594,14 +464,10 @@ mod tests {
         assert!(!carries_local_token(&with, None));
         assert!(!carries_local_token(&without, Some("local-secret")));
         assert!(!carries_local_token(&without, None));
-        // An empty header is an absent one, per `presented`.
         let blank = hm(&[(local_token::HEADER_LOCAL_TOKEN, "   ")]);
         assert!(!carries_local_token(&blank, Some("local-secret")));
     }
 
-    /// The hook socket token reaches one route and names no local process. Its
-    /// holder is whatever `tailscale funnel` exposed, so reading it as local
-    /// would hand the open internet the engine's own identity.
     #[test]
     fn the_hook_socket_token_never_names_a_local_process() {
         let h = hm(&[(local_token::HEADER_HOOK_SOCKET_TOKEN, "hook-secret")]);
@@ -631,14 +497,9 @@ mod tests {
         for (name, value) in [
             (local_token::HEADER_LOCAL_TOKEN, "nope"),
             (local_token::HEADER_LOCAL_TOKEN, "   "),
-            // Presenting one secret under the OTHER name must not work, or the
-            // scope would be the caller's to choose.
             (local_token::HEADER_LOCAL_TOKEN, "hook-secret"),
             (local_token::HEADER_HOOK_SOCKET_TOKEN, "local-secret"),
             (local_token::HEADER_HOOK_SOCKET_TOKEN, ""),
-            // The header's name before the rename, pinned as a wire literal.
-            // An older gateway still sends it. It must grant nothing, even
-            // carrying the current secret.
             ("x-lucidos-webhook-token", "hook-secret"),
         ] {
             assert_eq!(
@@ -652,8 +513,6 @@ mod tests {
 
     #[test]
     fn a_credential_the_engine_does_not_hold_authenticates_nobody() {
-        // The no-gateway machine. An absent secret must never compare equal to
-        // an absent header, which is the classic fail-open here.
         let auth = EngineAuth::locked_for_tests(None, None);
         assert_eq!(presented_scope(&hm(&[]), &auth), None);
         for name in [
@@ -667,7 +526,6 @@ mod tests {
 
     #[test]
     fn a_device_id_header_authorizes_nothing_here_either() {
-        // ADR 0050: the device id names who to credit, never what they may do.
         let auth = EngineAuth::locked_for_tests(Some("local-secret"), None);
         let h = hm(&[("x-lucidos-device-id", "some-real-device-id")]);
         assert_eq!(presented_scope(&h, &auth), None);
@@ -693,7 +551,6 @@ mod tests {
             "/api/v1/webhooks/01990ce2-fbed-7fd1-85de-dbc8000418c8/deliver"
         ));
 
-        // The whole point of the scope: none of these is a delivery.
         for path in [
             "/api/v1/threads/list",
             "/api/v1/webhooks",
@@ -765,20 +622,6 @@ mod tests {
         }
     }
 
-    // ── The middleware, driven through a router ─────────────────────────────
-    //
-    // The pure helpers above answer the policy. These answer whether axum
-    // composes it the way the policy assumes: before routing, over every mount,
-    // and with the response codes the two refusals promise.
-    //
-    // What they deliberately do NOT prove is WHERE `create_router` applies the
-    // layer. That needs a database, so it is covered by reading the one call
-    // site and by the e2e suites, which drive a real engine.
-
-    /// The engine's four mount points, as `create_router` nests them.
-    ///
-    /// `/app` and `/data` are the reason the layer sits outside the `/api/v1`
-    /// nest: they are its siblings, so a gate inside it would miss them.
     const MOUNTS: &[&str] = &[
         "/api/v1/threads/list",
         "/app/habit-tracker/",
@@ -786,8 +629,6 @@ mod tests {
         "/",
     ];
 
-    /// A router shaped like the engine's, behind the real middleware. The inner
-    /// handler answers a teapot, so seeing one means the gate let it through.
     fn gated(auth: EngineAuth) -> axum::Router {
         axum::Router::new()
             .fallback(|| async { StatusCode::IM_A_TEAPOT })
@@ -816,8 +657,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_loopback_engine_asks_nobody_for_anything() {
-        // The migration invariant. Every shipped topology binds loopback, so
-        // this is the path that must be indistinguishable from before.
         for path in MOUNTS {
             assert_eq!(
                 call(EngineAuth::open_for_tests(), path, &[]).await,
@@ -829,8 +668,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_wide_engine_refuses_every_mount_to_a_caller_with_no_credential() {
-        // The hole this closes. `/data` is the sharpest of the four: it serves
-        // the workspace's files off disk and sits outside the origin gate.
         for path in MOUNTS {
             assert_eq!(
                 call(locked(), path, &[]).await,
@@ -842,7 +679,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_wide_engine_still_answers_its_health_probe() {
-        // The gateway probes this before the engine can prove anything to it.
         assert_eq!(
             call(locked(), "/api/v1/health", &[]).await,
             StatusCode::IM_A_TEAPOT
@@ -867,14 +703,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_open_door_streams_a_body_instead_of_collecting_it() {
-        // This layer sits in front of `/api/v1/events`, an SSE stream that
-        // never ends. A middleware that collected the body would hold every
-        // transient event forever. The first casualty would be a test waiting
-        // on `AppUiRefreshRequested`.
-        //
-        // Driven with a body that yields one chunk and then blocks, so a
-        // collecting layer cannot reach the assertion at all: it would still be
-        // waiting for a second chunk that only arrives after the assertion.
         use futures::StreamExt as _;
 
         let (release, released) = tokio::sync::oneshot::channel::<()>();
@@ -884,8 +712,6 @@ mod tests {
                 Ok::<_, std::io::Error>("second")
             }),
         );
-        // An axum handler must be callable more than once, so the one-shot body
-        // is handed over rather than captured.
         let body = std::sync::Arc::new(std::sync::Mutex::new(Some(axum::body::Body::from_stream(
             stream,
         ))));
@@ -918,8 +744,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // The head arrived while the body was still open, which is the
-        // property the SSE contract rests on.
         let mut chunks = response.into_body().into_data_stream();
         let first = tokio::time::timeout(std::time::Duration::from_secs(5), chunks.next())
             .await
@@ -935,9 +759,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_hook_socket_token_delivers_and_can_do_nothing_else() {
-        // `t3-inbound-auth-scopes` in one test: the delivery lands, and the
-        // same credential is refused everywhere else. 403 rather than 401,
-        // because the caller DID authenticate. It just cannot reach this.
         let hdr = &[(local_token::HEADER_HOOK_SOCKET_TOKEN, "hook-secret")];
         assert_eq!(
             call(locked(), "/api/v1/webhooks/abc/deliver", hdr).await,
@@ -952,7 +773,6 @@ mod tests {
         }
     }
 
-    /// What a DNS-rebound page sends: its own name, and a same-origin fetch.
     const REBOUND: &[(&str, &str)] = &[
         ("host", "rebind.example:5251"),
         ("sec-fetch-site", "same-origin"),
@@ -998,7 +818,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_foreign_uri_authority_is_refused_beside_a_loopback_host() {
-        // HTTP/2's `:authority` and an absolute-form target land in the URI.
         let uri = "http://rebind.example:5251/api/v1/threads/list";
         assert_eq!(
             call(

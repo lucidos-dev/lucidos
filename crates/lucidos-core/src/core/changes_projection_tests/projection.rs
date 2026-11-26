@@ -10,13 +10,6 @@ async fn empty_projection_has_no_pending_changes() {
     teardown_test_db(&db).await;
 }
 
-/// Closing the pool forces every subsequent query to error with
-/// `sqlx::Error::PoolClosed`. Pre-fix, `list_pending` swallowed the error
-/// and returned `Vec::new()` — indistinguishable from a healthy empty
-/// projection. Post-fix, the error propagates so the HTTP layer can
-/// surface a 500 instead of pretending the DB is fine. Anchors the
-/// `-> Result<Vec<Change>, sqlx::Error>` contract for every read method on
-/// `ChangesProjection`.
 #[tokio::test]
 async fn list_pending_propagates_db_error_instead_of_returning_empty() {
     let (pool, db) = setup_test_db().await;
@@ -92,10 +85,6 @@ async fn aggregate_change_proposed_inserts_pending_change() {
     teardown_test_db(&db).await;
 }
 
-/// Re-emit with `description: None` must preserve the existing description
-/// (matches the in-memory contract `if let Some(d) = description { ... }`).
-/// Pre-fix the ON CONFLICT clause overwrote with EXCLUDED.description, so
-/// `unwrap_or("")` blanked the description on every None re-emit.
 #[tokio::test]
 async fn re_emit_with_none_description_preserves_existing() {
     let (pool, db) = setup_test_db().await;
@@ -147,13 +136,6 @@ async fn re_emit_with_none_description_preserves_existing() {
     teardown_test_db(&db).await;
 }
 
-/// `incomplete: true` from a `ChangeProposed` proposed by a CC turn that
-/// ended in `ResponseFailed` must round-trip to the `changes.incomplete`
-/// column so the apply UI can surface the confirm-before-Apply warning.
-/// A subsequent re-emit with `incomplete: false` (e.g. a follow-up
-/// successful turn against the same branch) must clear the flag — without
-/// this the confirm dialog would shadow every Apply on a once-failed
-/// branch even after the user retried successfully.
 #[tokio::test]
 async fn incomplete_flag_round_trips_and_clears_on_re_emit() {
     let (pool, db) = setup_test_db().await;
@@ -162,7 +144,6 @@ async fn incomplete_flag_round_trips_and_clears_on_re_emit() {
     let change_id = Uuid::new_v4();
     start_cc_thread(&bus, thread).await;
 
-    // First emit: turn ended in ResponseFailed → incomplete=true.
     emit(
         &bus,
         thread,
@@ -192,7 +173,6 @@ async fn incomplete_flag_round_trips_and_clears_on_re_emit() {
         "incomplete must round-trip to the projection column"
     );
 
-    // Re-emit on the same branch with incomplete=false (successful follow-up).
     emit(
         &bus,
         thread,
@@ -559,12 +539,6 @@ async fn per_commit_event_without_aggregate_is_noop() {
     teardown_test_db(&db).await;
 }
 
-/// The reconcile path re-emits the aggregate `ChangeProposed` for the SAME
-/// change id with an empty file list. The row must follow git: zero files, no
-/// restart, still `pending` (the engine never resolves a change on the user's
-/// behalf — commit `cca058432`), and the description refreshed. Pre-fix the row
-/// kept its snapshot, so the card read "1 file · Requires engine restart" while
-/// the Diff button rendered "No changes" (change `2cc8391f`).
 #[tokio::test]
 async fn empty_files_re_emit_zeroes_the_row_but_keeps_it_pending() {
     let (pool, db) = setup_test_db().await;
@@ -590,7 +564,6 @@ async fn empty_files_re_emit_zeroes_the_row_but_keeps_it_pending() {
     assert_eq!(before.file_count, 1);
     assert!(before.requires_restart);
 
-    // The branch's commits cancelled out — reconcile.
     let mut emptied = aggregate_proposed(change_id, "branch-a", "/repo");
     if let ThreadEvent::ChangeProposed {
         ref mut files,
@@ -621,9 +594,6 @@ async fn empty_files_re_emit_zeroes_the_row_but_keeps_it_pending() {
     teardown_test_db(&db).await;
 }
 
-/// I7: an emptied pending change keeps the thread `proposed`. The old pair
-/// could say "proposed, branch empty"; that bit now lives on the change row's
-/// file list. The Diff button reads it, so the row must say it is empty.
 #[tokio::test]
 async fn an_emptied_pending_change_stays_proposed_and_its_row_reads_empty() {
     let (pool, db) = setup_test_db().await;

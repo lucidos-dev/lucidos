@@ -121,6 +121,22 @@ describe('MCP tool switches', () => {
     expect(switched()).toEqual(['a:off', 'b:off']);
   });
 
+  it('sends one tool a switch at a time, and its latest once the first lands', async () => {
+    const first = deferred<{ disabled_tools: string[] }>();
+    (client.setMcpToolDisabled as Mock)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ disabled_tools: [] });
+
+    await flip('a', false);
+    await flip('a', true);
+    expect(switched()).toEqual(['a:off']);
+
+    first.resolve({ disabled_tools: ['mcp__slack__a'] });
+    await settled();
+
+    expect(switched()).toEqual(['a:off', 'a:on']);
+  });
+
   it('a refused switch shows the engine set again and says why', async () => {
     (client.setMcpToolDisabled as Mock).mockRejectedValueOnce(new Error('request timed out'));
     (client.fetchMcpServers as Mock).mockResolvedValue(served());

@@ -1,18 +1,3 @@
-//! Inbound webhooks: configuration, and the verification a delivery must pass.
-//!
-//! Full design:
-//! `docs/plans/2026-08-19-webhooks-and-engines-off-the-network.md`.
-//!
-//! # Signature checking is data, not code
-//!
-//! [`HmacConfig`] describes a sender's scheme in fields: which header carries
-//! the signature, how to pull it out, what string is signed, and how the digest
-//! is encoded. GitHub, Stripe and Slack are all expressible, so none of the
-//! three needs engine code, and a fourth sender is a config change.
-//!
-//! The secret is never here. `credential` names a row in the `credentials`
-//! table, which stays the only home for the value.
-
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -23,8 +8,6 @@ use crate::core::webhook_refusal::RefusalCause;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
-/// One configured webhook, as stored. Never carries a secret: `token_hash` is a
-/// digest, and [`HmacConfig::credential`] is a name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Webhook {
     pub id: Uuid,
@@ -33,29 +16,20 @@ pub struct Webhook {
     #[serde(skip_serializing)]
     pub token_hash: Option<String>,
     pub hmac: Option<HmacConfig>,
-    /// `None` means the hook does not dedupe, which is the default. Every
-    /// arrival then emits, so the log keeps the sender's retries.
     pub dedupe: Option<DedupeConfig>,
-    /// Request headers copied into the event payload. An allow-list, because
+    /// INVARIANT: Request headers copied into the event payload. An allow-list, because
     /// the events table is append-only and a carried secret is a permanent one.
     pub headers: Vec<String>,
     pub enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
-    /// When a delivery last verified and emitted.
     pub last_accepted_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// When a delivery last arrived and was turned away.
-    ///
-    /// This is the diagnostic half. Silence alone cannot tell a rotated secret
-    /// from a dead ingress, and a refusal can.
     pub last_refused_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// What [`DeliveryRefusal::reason`] said about that refusal.
     pub last_refusal_reason: Option<String>,
-    /// Every refusal since the last acceptance, tallied by reason.
     pub refusal_run: RefusalRun,
 }
 
-/// What a webhook has been turning away since it last accepted anything.
+/// INVARIANT: What a webhook has been turning away since it last accepted anything.
 ///
 /// The three columns above hold the LAST refusal, which one diagnostic probe
 /// overwrites. This holds the whole run, so a stray probe adds one to its own
@@ -70,40 +44,23 @@ pub struct Webhook {
 /// hook works, and it is the only thing that produces it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefusalRun {
-    /// How many deliveries have been turned away since the run started.
     pub refusals: i64,
-    /// When the run started. `None` when there is no run.
     pub since: Option<chrono::DateTime<chrono::Utc>>,
-    /// Which fault the run is evidence of. `None` for a run whose stored cause
-    /// this engine cannot read, which judges nothing rather than guessing.
     pub cause: Option<RefusalCause>,
-    /// How the run breaks down, keyed by [`DeliveryRefusal::key`].
-    ///
-    /// A `BTreeMap` so the JSON a reader sees is ordered, and so two runs with
-    /// the same contents compare equal.
     pub reasons: std::collections::BTreeMap<String, i64>,
-    /// How long the run has been going, in seconds. **Measured by Postgres**
-    /// (ADR 0053), because the timestamp above is a database clock reading and
-    /// the engine's own clock is a different one.
     pub run_secs: Option<i64>,
-    /// How long since the last refusal, in seconds, also measured by Postgres.
+    /// INVARIANT: How long since the last refusal, in seconds, also measured by Postgres.
     /// A run nothing has added to for a fortnight stops being news.
     pub quiet_secs: Option<i64>,
 }
 
 impl RefusalRun {
-    /// Is any delivery being turned away right now?
+    /// INVARIANT: Is any delivery being turned away right now?
     pub fn is_running(&self) -> bool {
         self.refusals > 0
     }
 }
 
-/// Everything about a webhook except its identity: how it authenticates, and
-/// what it does with a delivery once one arrives.
-///
-/// Grouped because the three travel together and are the whole of what
-/// distinguishes one hook from another. Separately they push `create` past the
-/// argument count anyone can read at a call site.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct WebhookConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,16 +71,6 @@ pub struct WebhookConfig {
     pub headers: Vec<String>,
 }
 
-/// A change to an existing webhook. Every field is optional, and `None` keeps
-/// the stored value.
-///
-/// `dedupe` needs no "clear it" variant, so it stays free of the
-/// `Option<Option<_>>` an optional JSONB column otherwise wants: a config with
-/// `window_secs: 0` switches deduping off.
-///
-/// `hmac` has no such off value, so it takes a named three-state instead. The
-/// same reasoning, one step further: a shape nobody has to decode beats a
-/// nested option.
 #[derive(Debug, Clone, Default)]
 pub struct WebhookPatch {
     pub name: Option<String>,
@@ -134,7 +81,7 @@ pub struct WebhookPatch {
     pub headers: Option<Vec<String>>,
 }
 
-/// What an update does to a hook's signature config.
+/// INVARIANT: What an update does to a hook's signature config.
 ///
 /// # A hook carries one verifier kind, so a change to either moves both
 ///
@@ -154,19 +101,12 @@ pub struct WebhookPatch {
 /// The minted token is returned once, on the contract `create` already has.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum HmacChange {
-    /// Keep the stored config, whatever it is.
     #[default]
     Keep,
-    /// Sign from now on, with this config.
     Set(HmacConfig),
-    /// Stop signing, and go back to a bearer token.
     Clear,
 }
 
-/// Absent keeps, an object sets, and `null` clears.
-///
-/// Hand-written so the request DTO needs no `Option<Option<_>>` either.
-/// `#[serde(default)]` answers the absent case, and this answers the other two.
 impl<'de> Deserialize<'de> for HmacChange {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(match Option::<HmacConfig>::deserialize(deserializer)? {
@@ -176,19 +116,10 @@ impl<'de> Deserialize<'de> for HmacChange {
     }
 }
 
-/// How a hook recognises a delivery it has already emitted.
-///
-/// Named as data, the same shape [`HmacConfig`] uses: the sender says which
-/// header carries its delivery id, and no provider needs engine code.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DedupeConfig {
-    /// Header carrying the sender's own delivery id, such as
-    /// `X-GitHub-Delivery`. Absent here, or absent from a given request, and
-    /// the key is a digest of the body instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
-    /// How long a delivery's key dedupes a resend. `0` switches deduping off, which is also
-    /// how `update` clears the setting.
     #[serde(default = "default_window_secs")]
     pub window_secs: i64,
 }
@@ -197,7 +128,7 @@ fn default_window_secs() -> i64 {
     3600
 }
 
-/// The key a delivery is deduped on.
+/// INVARIANT: The key a delivery is deduped on.
 ///
 /// A digest either way, so the ledger stores one fixed-length value rather than
 /// whatever a public caller put in a header. The two sources are prefixed
@@ -213,7 +144,6 @@ pub fn dedupe_key(header_value: Option<&str>, body: &str) -> String {
     }
 }
 
-/// Which digest a sender signs with.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HmacAlgorithm {
@@ -222,7 +152,6 @@ pub enum HmacAlgorithm {
     Sha1,
 }
 
-/// How the digest is written into the header.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DigestEncoding {
@@ -231,55 +160,32 @@ pub enum DigestEncoding {
     Base64,
 }
 
-/// A sender's signature scheme, in fields.
-///
-/// Worked examples, all three real:
-///
-/// | Sender | header | prefix / key | template |
-/// |---|---|---|---|
-/// | GitHub | `X-Hub-Signature-256` | `prefix: "sha256="` | `{body}` |
-/// | Slack | `X-Slack-Signature` | `prefix: "v0="` | `v0:{timestamp}:{body}` |
-/// | Stripe | `Stripe-Signature` | `signature_key: "v1"` | `{timestamp}.{body}` |
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HmacConfig {
-    /// The credential's `service_name`. The secret itself lives there.
     pub credential: String,
-    /// Header carrying the signature.
     pub signature_header: String,
     #[serde(default)]
     pub algorithm: HmacAlgorithm,
     #[serde(default)]
     pub encoding: DigestEncoding,
-    /// Literal prefix to strip off the header value, such as `sha256=`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
-    /// Key to read out of a comma-separated `k=v` header, such as Stripe's
-    /// `v1`. Mutually useful with `prefix`, and checked first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_key: Option<String>,
-    /// Header carrying the signed timestamp, when the scheme has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_header: Option<String>,
-    /// Key holding the timestamp inside the SIGNATURE header, for a sender that
-    /// packs both into one, as Stripe does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_key: Option<String>,
-    /// The string that gets signed. `{body}` and `{timestamp}` are substituted.
-    /// Defaults to the body alone.
     #[serde(default = "default_template")]
     pub template: String,
-    /// How far the signed timestamp may be from now, in seconds. Read it
-    /// through [`Self::replay_tolerance_secs`], which fills in the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tolerance_secs: Option<i64>,
 }
 
-/// The replay window for a template that signs `{timestamp}` and names none.
-/// Slack and Stripe both document five minutes.
 pub const DEFAULT_REPLAY_TOLERANCE_SECS: i64 = 300;
 
 impl HmacConfig {
-    /// The window [`verify`] enforces, `None` only for a scheme that signs no
+    /// INVARIANT: The window [`verify`] enforces, `None` only for a scheme that signs no
     /// timestamp.
     ///
     /// A signed timestamp exists only to bound replay. With no window, a
@@ -298,7 +204,7 @@ fn default_template() -> String {
     "{body}".to_string()
 }
 
-/// Why a delivery was refused. Every arm answers 401, so the sender learns
+/// INVARIANT: Why a delivery was refused. Every arm answers 401, so the sender learns
 /// nothing; this is what the log, the row and the refusal run record instead.
 ///
 /// [`verify`] produces five of these. `api::webhooks::deliver` produces the
@@ -307,24 +213,16 @@ fn default_template() -> String {
 /// [`Self::examined_the_delivery`] can classify every one of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryRefusal {
-    /// The webhook is switched off, so nothing was read.
     Disabled,
-    /// The body is not UTF-8, so no scheme we express could have signed it.
     BodyNotUtf8,
-    /// No bearer token, or the wrong one.
     Token,
-    /// The signature header is missing or unparseable.
     SignatureMissing,
-    /// The signature did not match.
     SignatureMismatch,
-    /// The signed timestamp is outside the configured tolerance.
     TimestampOutsideTolerance,
-    /// The named credential does not exist, so nothing can be verified.
     CredentialMissing,
 }
 
 impl DeliveryRefusal {
-    /// Every arm, so a test can walk them.
     #[cfg(test)]
     pub const ALL: [DeliveryRefusal; 7] = [
         Self::Disabled,
@@ -336,7 +234,7 @@ impl DeliveryRefusal {
         Self::CredentialMissing,
     ];
 
-    /// What to write in the log. Never returned to the caller: a public
+    /// INVARIANT: What to write in the log. Never returned to the caller: a public
     /// endpoint that says WHY it refused is a hint to whoever is guessing.
     pub fn reason(&self) -> &'static str {
         match self {
@@ -350,7 +248,7 @@ impl DeliveryRefusal {
         }
     }
 
-    /// How a [`RefusalRun`] keys this reason.
+    /// INVARIANT: How a [`RefusalRun`] keys this reason.
     ///
     /// Stable and kebab-case, because the tally is stored JSON and reaches the
     /// wire. The log string above is prose and may be reworded; this may not.
@@ -366,24 +264,10 @@ impl DeliveryRefusal {
         }
     }
 
-    /// Did this refusal look at the delivery at all?
-    ///
-    /// One arm answers no, and it is the whole reason a switched-off hook gets
-    /// its own words. `deliver` checks `enabled` first, before it reads the
-    /// body or looks up the credential. So that 401 is a configuration fact,
-    /// and it says nothing about the signature or the secret.
-    ///
-    /// The mirror of `Stage::measured_the_ingress` in `core/webhook_ingress.rs`
-    /// (ADR 0172): one predicate, read by every consumer, so a reading that
-    /// measured nothing cannot be reported as a measurement.
     pub fn examined_the_delivery(&self) -> bool {
         !matches!(self, Self::Disabled)
     }
 
-    /// Which fault this refusal is evidence of.
-    ///
-    /// Derived from the predicate above and nothing else, so the two can never
-    /// disagree about which arm gets its own words.
     pub fn cause(&self) -> RefusalCause {
         if self.examined_the_delivery() {
             RefusalCause::Verification
@@ -393,23 +277,15 @@ impl DeliveryRefusal {
     }
 }
 
-/// Lowercase-hex SHA-256 of `value`, the form `token_hash` stores.
 pub fn digest(value: &str) -> String {
     use sha2::{Digest as _, Sha256};
     crate::core::hex::hex_lower(&Sha256::digest(value.as_bytes()))
 }
 
-/// A fresh webhook token: 32 bytes of entropy, lowercase hex.
-///
-/// Both this and [`ct_eq`] come from `lucidos-local-token` rather than being
-/// written again here. That crate exists because four hand-copies of a secret's
-/// minting and comparison drifted, and a stale copy is a caller that silently
-/// cannot authenticate.
 pub fn mint_token() -> std::io::Result<String> {
     lucidos_local_token::mint_hex(32)
 }
 
-/// The bearer token a request presented, if it presented one properly.
 pub fn presented_bearer(authorization: Option<&str>) -> Option<&str> {
     let value = authorization?.trim();
     let (scheme, token) = value.split_once(' ')?;
@@ -420,7 +296,7 @@ pub fn presented_bearer(authorization: Option<&str>) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Pull the signature out of a header value, per the configured scheme.
+/// INVARIANT: Pull the signature out of a header value, per the configured scheme.
 ///
 /// `signature_key` wins when set, for a sender packing several fields into one
 /// header. Otherwise a `prefix` is stripped, and a value that lacks the prefix
@@ -439,8 +315,6 @@ pub fn extract_signature<'a>(cfg: &HmacConfig, header_value: &'a str) -> Option<
     .filter(|s| !s.is_empty())
 }
 
-/// The timestamp a request signed, from its own header or from a key inside the
-/// signature header.
 pub fn extract_timestamp<'a>(
     cfg: &HmacConfig,
     signature_header_value: &'a str,
@@ -454,7 +328,6 @@ pub fn extract_timestamp<'a>(
         .filter(|s| !s.is_empty())
 }
 
-/// One value out of a comma-separated `k=v` list, matched on the whole key.
 fn field_from_pairs<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
     raw.split(',')
         .filter_map(|pair| pair.split_once('='))
@@ -463,15 +336,12 @@ fn field_from_pairs<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
-/// Build the string the sender signed.
 pub fn canonical_string(template: &str, timestamp: Option<&str>, body: &str) -> String {
     template
         .replace("{timestamp}", timestamp.unwrap_or_default())
         .replace("{body}", body)
 }
 
-/// Compute the expected signature for `canonical`, encoded as the sender writes
-/// it.
 pub fn sign(cfg: &HmacConfig, secret: &str, canonical: &str) -> String {
     use base64::Engine as _;
     use hmac::{Hmac, Mac};
@@ -495,7 +365,7 @@ pub fn sign(cfg: &HmacConfig, secret: &str, canonical: &str) -> String {
     }
 }
 
-/// Is a signed timestamp close enough to now?
+/// INVARIANT: Is a signed timestamp close enough to now?
 ///
 /// A missing tolerance means the scheme signs no timestamp, so there is
 /// nothing to check. A tolerance with an unparseable timestamp is a refusal:
@@ -513,8 +383,6 @@ pub fn timestamp_within_tolerance(
     let Some(tolerance) = tolerance_secs else {
         return true;
     };
-    // A negative tolerance admits nothing, and saying so here keeps the
-    // comparison below in one unsigned domain.
     let Ok(tolerance) = u64::try_from(tolerance) else {
         return false;
     };
@@ -524,21 +392,14 @@ pub fn timestamp_within_tolerance(
     now_unix.abs_diff(parsed) <= tolerance
 }
 
-/// Everything a delivery presented, gathered before any of it is trusted.
 pub struct PresentedDelivery<'a> {
     pub authorization: Option<&'a str>,
     pub signature_header: Option<&'a str>,
     pub timestamp_header: Option<&'a str>,
-    /// The request body, verbatim. Signed as-is, so it is never reserialized.
     pub body: &'a str,
     pub now_unix: i64,
 }
 
-/// Decide whether a delivery may emit this webhook's event.
-///
-/// Every configured verifier must pass, and a webhook always has at least one
-/// (the table's CHECK constraint is the floor). `secret` is the resolved
-/// credential value, `None` when the named credential is gone.
 pub fn verify(
     hook: &Webhook,
     presented: &PresentedDelivery<'_>,
@@ -570,16 +431,8 @@ pub fn verify(
     Ok(())
 }
 
-/// The header Slack's v0 scheme signs with. A hook verifying with it is a Slack
-/// hook by construction, which is what gates [`slack_url_verification`].
 pub const SLACK_SIGNATURE_HEADER: &str = "X-Slack-Signature";
 
-/// The challenge to echo when Slack verifies a Request URL, else `None`.
-///
-/// Slack posts `{"type":"url_verification","challenge":"..."}` when a user
-/// saves the URL, and refuses the URL unless the response echoes the value.
-/// Call this only after [`verify`] passed, so a forged challenge never echoes.
-/// Every other hook, and every other body, returns `None` (ADR 0624).
 pub fn slack_url_verification(hook: &Webhook, body: &str) -> Option<String> {
     let cfg = hook.hmac.as_ref()?;
     if !cfg
@@ -596,13 +449,6 @@ pub fn slack_url_verification(hook: &Webhook, body: &str) -> Option<String> {
     value.get("challenge")?.as_str().map(str::to_string)
 }
 
-/// The columns every read selects, plus the two ages Postgres measures.
-///
-/// **The ages are computed in SQL on purpose** (ADR 0053). The engine's clock
-/// and the database's are different clocks, and in dev the database's runs in a
-/// VM that drifts. Subtract one from the other and a run reads as negative
-/// seconds old. Every hook would then judge `Clear` for good, silencing the
-/// exact outage this feature exists to catch.
 const WEBHOOK_COLUMNS: &str = "id, name, event_type, token_hash, hmac, dedupe, headers, \
                                enabled, created_at, updated_at, last_accepted_at, \
                                last_refused_at, last_refusal_reason, refusal_run_count, \
@@ -612,10 +458,6 @@ const WEBHOOK_COLUMNS: &str = "id, name, event_type, token_hash, hmac, dedupe, h
                                EXTRACT(EPOCH FROM now() - last_refused_at)::bigint \
                                    AS refusal_quiet_secs";
 
-/// One row as read, before the JSON columns are decoded.
-///
-/// A struct rather than a tuple, so a column added in the middle of
-/// [`WEBHOOK_COLUMNS`] cannot silently shift every field after it.
 #[derive(sqlx::FromRow)]
 struct WebhookRow {
     id: Uuid,
@@ -661,9 +503,6 @@ fn row_to_webhook(row: WebhookRow) -> Result<Webhook, Box<dyn std::error::Error 
                 .refusal_run_cause
                 .as_deref()
                 .and_then(RefusalCause::parse),
-            // A tally that will not parse costs the breakdown alone. The count,
-            // the start and the cause still say what the run is, which is what
-            // decides whether the hook is refusing at all.
             reasons: serde_json::from_value(row.refusal_run_reasons).unwrap_or_default(),
             run_secs: row.refusal_run_secs,
             quiet_secs: row.refusal_quiet_secs,
@@ -671,11 +510,6 @@ fn row_to_webhook(row: WebhookRow) -> Result<Webhook, Box<dyn std::error::Error 
     })
 }
 
-/// The registry of inbound webhooks.
-///
-/// **No caller can skip the event.** Create, update and delete each emit from
-/// here rather than from their call sites, so every mutation path announces by
-/// construction. Registered in `core::announced_surfaces`.
 pub struct WebhookStore;
 
 impl WebhookStore {
@@ -703,7 +537,7 @@ impl WebhookStore {
         row.map(row_to_webhook).transpose()
     }
 
-    /// Create a webhook, and mint a token for it unless it signs instead.
+    /// INVARIANT: Create a webhook, and mint a token for it unless it signs instead.
     ///
     /// **A signed hook gets no token, and that is what makes it usable.** A
     /// sender like GitHub cannot attach one, so a hook holding both verifiers
@@ -758,11 +592,6 @@ impl WebhookStore {
         Ok((hook, token))
     }
 
-    /// Change a webhook. `Ok(None)` means no webhook has that id.
-    ///
-    /// The token comes back for the one update that mints one, which is the
-    /// clear described on [`HmacChange`]. Every other update returns `None`
-    /// beside the hook, since no token changed hands.
     pub async fn update(
         pool: &PgPool,
         bus: &EventBus,
@@ -779,15 +608,12 @@ impl WebhookStore {
             headers,
         } = patch;
         let dedupe_json = dedupe.as_ref().map(serde_json::to_value).transpose()?;
-        // The verifier moves as one. A single flag writes `hmac` and
-        // `token_hash` together, so no combination of arguments can leave a row
-        // carrying both verifiers or neither.
         let (verifier_moves, hmac_json, token) = match &hmac {
             HmacChange::Keep => (false, None, None),
             HmacChange::Set(cfg) => (true, Some(serde_json::to_value(cfg)?), None),
             HmacChange::Clear => (true, None, Some(mint_token()?)),
         };
-        // **Moving the enabled flag ends the run**, in the same statement, the
+        // INVARIANT: **Moving the enabled flag ends the run**, in the same statement, the
         // way an acceptance does. A run is homogeneous in its cause. The flag
         // is one of the two causes, so a run that outlived a switch describes
         // a fault that is over.
@@ -842,7 +668,7 @@ impl WebhookStore {
         Ok(Some((hook, token)))
     }
 
-    /// Stamp that a delivery verified and emitted, and end any refusal run.
+    /// INVARIANT: Stamp that a delivery verified and emitted, and end any refusal run.
     ///
     /// An observation, so it emits nothing. `updated_at` stays where it is:
     /// nobody changed the hook, and moving it would make every delivery look
@@ -866,7 +692,7 @@ impl WebhookStore {
         Ok(())
     }
 
-    /// Stamp that a delivery arrived and was turned away, and why.
+    /// INVARIANT: Stamp that a delivery arrived and was turned away, and why.
     ///
     /// Takes the refusal rather than a string, so the tally keys on
     /// [`DeliveryRefusal::key`]'s closed set and no caller can invent a reason.
@@ -909,7 +735,6 @@ impl WebhookStore {
         Ok(())
     }
 
-    /// Delete a webhook. `Ok(false)` means no webhook had that id.
     pub async fn delete(
         pool: &PgPool,
         bus: &EventBus,

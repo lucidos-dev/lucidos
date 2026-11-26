@@ -21,8 +21,6 @@ struct InvalidCase {
     error: String,
 }
 
-/// The same fixture drives `themeParts.test.ts`, so the engine and every apply
-/// site accept, refuse and canonicalise alike.
 #[test]
 fn the_grammar_matches_the_shared_fixture() {
     let cases: Cases = serde_json::from_str(include_str!("theme-part-cases.json")).unwrap();
@@ -56,8 +54,6 @@ fn a_canonical_value_is_its_own_canonical_form() {
         );
     }
 }
-
-// --- The catalog ---
 
 #[test]
 fn every_part_property_is_declared_and_named_by_its_token() {
@@ -104,8 +100,6 @@ fn a_parent_is_a_shell_part_the_child_sits_inside() {
     }
 }
 
-/// `filter` makes its element a stacking context and the containing block of
-/// fixed descendants, so it goes on icons only.
 #[test]
 fn filter_sits_on_leaf_icons_only() {
     for (part, usage) in CATALOG.tokens() {
@@ -119,8 +113,6 @@ fn filter_sits_on_leaf_icons_only() {
     }
 }
 
-/// `font-weight` inherits, so a part that sets it sits on a leaf element:
-/// nothing below it can reach a protected surface.
 #[test]
 fn font_weight_sits_on_leaf_selectors_only() {
     let mut seen = 0;
@@ -139,14 +131,11 @@ fn font_weight_sits_on_leaf_selectors_only() {
     assert!(seen > 0, "no part takes font-weight");
 }
 
-/// A weight is not an effect, so `theme-effects: reduce` keeps it.
 #[test]
 fn font_weight_is_not_an_effect() {
     assert!(!CATALOG.property("font-weight").effect);
 }
 
-/// The header and the composer can overlap scrolled content. The header takes
-/// no box shadow, and the composer takes inset shadows only.
 #[test]
 fn a_part_that_can_overlap_content_takes_no_outer_shadow() {
     for (part, usage) in CATALOG.tokens() {
@@ -171,8 +160,6 @@ fn every_alias_is_a_catalog_token_and_every_target_takes_its_property() {
     }
 }
 
-/// A theme names catalog tokens only, so its largest map is the catalog, the
-/// protected palette and every part token. That must fit the apply-site cap.
 #[test]
 fn the_largest_resolved_map_fits_the_apply_cap() {
     let largest = TOKENS.tokens.len() + PROTECTED_TOKENS.len() + 1 + CATALOG.tokens().count();
@@ -180,8 +167,6 @@ fn the_largest_resolved_map_fits_the_apply_cap() {
 }
 
 use super::super::protected::PROTECTED_TOKENS;
-
-// --- A theme's parts ---
 
 fn resolved(json: &str) -> (TokenMap, TokenMap) {
     let def = parse_definition(json.as_bytes()).expect("valid theme");
@@ -421,8 +406,6 @@ fn a_colour_token_must_hold_a_colour() {
     }
 }
 
-// --- The --text-glow alias ---
-
 const TEXT_GLOW_TARGETS: [&str; 4] = [
     "--part-chat-text-text-shadow",
     "--part-actor-label-text-shadow",
@@ -481,10 +464,6 @@ fn a_part_colour_its_background_hides_is_refused() {
     );
 }
 
-// --- Retro parts (ADR 0313) ---
-
-/// The screen part paints on the fills that hold the whole shell, protected
-/// surfaces included, so nothing it sets may inherit into them.
 #[test]
 fn the_screen_part_takes_no_inherited_property() {
     let screen = CATALOG.part("screen").expect("the screen part");
@@ -507,7 +486,6 @@ fn scanlines_that_pull_page_text_under_the_floor_are_refused() {
 
 #[test]
 fn scanlines_that_pull_a_part_colour_under_the_floor_are_refused() {
-    // #666666 clears 3:1 on the black page, but not on a pale band.
     let message = refusal(
         r##"{"name":"x","dark":{"--bg-primary":"#000000"},
             "parts":{"chat-text":{"color":"#666666"},
@@ -534,13 +512,8 @@ fn a_phosphor_theme_with_every_retro_part_resolves() {
     assert!(dark["--part-screen-background-image"].starts_with("repeating-linear-gradient("));
 }
 
-/// A protected surface draws no fill of its own, so its text may sit on a
-/// scanline band. The clamp keeps every protected text colour at 4.5:1 there.
 #[test]
 fn protected_text_clears_every_scanline_band() {
-    // Muted text at the page floor, and pale bands that pull the page
-    // toward it: without the bands in the clamp, protected text drops to
-    // about 3.6:1 on them.
     let (dark, _) = resolved(
         r##"{"name":"x","dark":{"--bg-primary":"#000000","--text-primary":"#767676","--text-secondary":"#767676"},
             "parts":{"screen":{"background-image":"repeating-linear-gradient(rgba(118, 118, 118, 0.25) 0, rgba(118, 118, 118, 0.25) 2px)"}}}"##,
@@ -606,8 +579,6 @@ fn a_text_glow_past_the_part_caps_is_refused() {
     );
 }
 
-// --- Style overrides ---
-
 #[test]
 fn a_style_override_part_token_must_pass_the_grammar() {
     use super::super::validate_style_overrides;
@@ -633,9 +604,6 @@ fn a_style_override_part_token_must_pass_the_grammar() {
     );
 }
 
-// --- Docs and fixtures ---
-
-/// The browser specs use these, never a shipped theme (ADR 0307).
 #[test]
 fn the_browser_fixture_themes_are_valid_and_every_cap_sets_every_part() {
     let every_cap = parse_definition(include_bytes!(
@@ -661,7 +629,6 @@ fn the_browser_fixture_themes_are_valid_and_every_cap_sets_every_part() {
     .expect("retro-phosphor.json is a valid theme");
 }
 
-/// Tests that read a shipped doc at run time.
 mod guard_tests {
     use super::*;
 

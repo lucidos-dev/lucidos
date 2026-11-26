@@ -1,5 +1,3 @@
-//! LLM-facing schemas for web tools (web_search, fetch_news).
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

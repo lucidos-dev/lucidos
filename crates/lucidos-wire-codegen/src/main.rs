@@ -1,7 +1,3 @@
-//! Writes `thread-event-wire.ts` at its repository path below `--out <dir>`,
-//! reading the Rust source under `--repo-root <dir>`. It compiles no engine
-//! crate.
-
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: lucidos-wire-codegen --out <dir> --repo-root <dir>";

@@ -15,35 +15,19 @@ use std::sync::Arc;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Every backend a [`RoutingProvider`] can hold, each present only when
-/// configured. One field per [`ProviderKind`].
 #[derive(Default)]
 pub struct RoutingBackends {
     pub vertex: Option<Arc<dyn LlmProvider>>,
     pub openai: Option<Arc<dyn LlmProvider>>,
     pub anthropic: Option<Arc<dyn LlmProvider>>,
-    /// OpenRouter — an `OpenAiProvider` pointed at `openrouter.ai/api/v1`.
     pub openrouter: Option<Arc<dyn LlmProvider>>,
-    /// xAI, an `OpenAiProvider` pointed at `api.x.ai/v1`, serving Grok.
     pub xai: Option<Arc<dyn LlmProvider>>,
-    /// OpenCode's keyless free tier, an `OpenAiProvider` pointed at
-    /// `opencode.ai/zen/v1` with no credential. Present only when the user
-    /// turned it on.
     pub opencode_free: Option<Arc<dyn LlmProvider>>,
-    /// A generic OpenAI-compatible local server — an `OpenAiProvider` pointed
-    /// at the configured local base URL (default Ollama).
     pub local: Option<Arc<dyn LlmProvider>>,
-    /// A Claude gateway, an `AnthropicProvider` on the gateway's origin with
-    /// its signed-in bearer.
     pub claude_gateway: Option<Arc<dyn LlmProvider>>,
-    /// The ChatGPT plan, an `OpenAiProvider` on its plan endpoint.
     pub chatgpt_plan: Option<Arc<dyn LlmProvider>>,
 }
 
-/// Routes LLM requests to the correct provider for the requested model. The
-/// model → provider mapping comes from the database-backed [`ModelRegistry`]
-/// (Settings → Models), with a prefix-heuristic fallback for ids not in the
-/// table. Holds whichever providers are configured.
 pub struct RoutingProvider {
     backends: RoutingBackends,
     registry: ModelRegistry,
@@ -61,18 +45,13 @@ impl RoutingProvider {
         }
     }
 
-    /// Route around the not-found answers in `ledger`, and record new ones
+    /// INVARIANT: Route around the not-found answers in `ledger`, and record new ones
     /// there. A shared ledger outlives this router, so a rebuild keeps it.
     pub fn observing(mut self, ledger: NotServedLedger) -> Self {
         self.not_served = ledger;
         self
     }
 
-    /// The backend instance serving `kind`, or `None` when it is not configured.
-    ///
-    /// The single place that maps a [`ProviderKind`] onto a provider, so
-    /// [`Self::is_configured`], [`Self::configured_providers`] and the routing
-    /// itself cannot disagree about what this router holds.
     fn backend(&self, kind: ProviderKind) -> Option<&dyn LlmProvider> {
         match kind {
             ProviderKind::Vertex => self.backends.vertex.as_deref(),
@@ -91,7 +70,7 @@ impl RoutingProvider {
         self.backend(kind).is_some()
     }
 
-    /// Snap a reasoning effort onto the closest tier the route's backend
+    /// INVARIANT: Snap a reasoning effort onto the closest tier the route's backend
     /// actually supports.
     ///
     /// **This is the chokepoint** for effort clamping. The registry route
@@ -114,7 +93,7 @@ impl RoutingProvider {
         let effort = effort.or_else(|| default_effort(&self.registry, model))?;
         let model = route.wire_id.as_str();
         let Some(clamped) = clamp_effort(effort, route.provider, model) else {
-            // Not one of our tiers at all, so there is nothing to snap it onto.
+            // INVARIANT: Not one of our tiers at all, so there is nothing to snap it onto.
             // Send no effort and let the provider default apply, rather than
             // guessing a tier a typo would then be billed for.
             crate::log_legacy!(
@@ -135,13 +114,6 @@ impl RoutingProvider {
         Some(clamped)
     }
 
-    /// `messages` as `model` may see them. A row whose *vision flag* is off
-    /// gets a note in place of each image, so it is never sent one it would
-    /// refuse. A model with no row keeps its images, and its provider decides
-    /// (ADR 0504).
-    ///
-    /// **This is the chokepoint** for every image producer: a chat turn's
-    /// attachments and history, tool results, and special-tool answers.
     fn messages_for_model(&self, model: &str, mut messages: Vec<Message>) -> Vec<Message> {
         if vision_flag(&self.registry, model) != Some(false) {
             return messages;
@@ -167,7 +139,7 @@ impl RoutingProvider {
         messages
     }
 
-    /// Resolve which backend serves `model` and what id to send it, or say what
+    /// INVARIANT: Resolve which backend serves `model` and what id to send it, or say what
     /// the user has to configure.
     ///
     /// `chosen` is the turn's own provider pick, which outranks the row's
@@ -185,7 +157,6 @@ impl RoutingProvider {
     }
 }
 
-/// The model a call is sent as, how it relates to the named one, and its route.
 struct Resolved {
     model: String,
     generation: Generation,
@@ -193,15 +164,10 @@ struct Resolved {
 }
 
 impl RoutingProvider {
-    /// The model a selection is sent as, and the route that serves it: the
-    /// newest reachable generation in the named model's *lineage*. A retired
-    /// model goes out as its successor wherever the successor answers (ADR
-    /// 0418), and never as an id its successor's provider has refused.
     fn resolve(&self, selection: &ModelSelection<'_>) -> Result<Resolved, BoxError> {
         self.resolve_refusing(selection, None)
     }
 
-    /// [`Self::resolve`], as if `also_refused` had answered not-found too.
     fn resolve_refusing(
         &self,
         selection: &ModelSelection<'_>,
@@ -228,7 +194,6 @@ impl RoutingProvider {
         })
     }
 
-    /// Say why a call goes out on another model than the one it named.
     fn log_generation(named: &str, resolved: &Resolved) {
         let model = &resolved.model;
         match &resolved.generation {
@@ -245,7 +210,6 @@ impl RoutingProvider {
         }
     }
 
-    /// One request to the leaf serving `resolved`.
     async fn send(
         &self,
         resolved: &Resolved,
@@ -257,14 +221,9 @@ impl RoutingProvider {
     ) -> Result<LlmResponse, BoxError> {
         let Resolved { model, route, .. } = resolved;
         crate::llm::metered::check_provider(route.provider).await?;
-        // `route_for` already refused an unconfigured backend, so the miss here
-        // is unreachable. It resolves through the same `backend`, and saying
-        // what to configure beats an `expect` if the two ever part company.
         let provider = self
             .backend(route.provider)
             .ok_or_else(|| unconfigured_message(route.provider))?;
-        // The leaf serves ONE backend, so it is handed the resolved route: its
-        // own wire id, and the effort snapped onto what that backend accepts.
         let leaf = ModelSelection::model(&route.wire_id)
             .with_effort(self.effort_for_route(model, route, selection.reasoning_effort))
             .with_attempt_timeout(selection.attempt_timeout)
@@ -279,8 +238,6 @@ impl RoutingProvider {
         outcome.map_err(|err| self.record_refusal(err, route.provider, model))
     }
 
-    /// Mark a not-found answer in the ledger and stamp who refused it. Any
-    /// other error passes through untouched.
     fn record_refusal(&self, err: BoxError, provider: ProviderKind, model: &str) -> BoxError {
         match err.downcast::<ModelNotServed>() {
             Ok(refusal) => {
@@ -292,7 +249,7 @@ impl RoutingProvider {
     }
 }
 
-/// What the user has to set up for `kind` to serve a turn.
+/// INVARIANT: What the user has to set up for `kind` to serve a turn.
 ///
 /// The Vertex project id is an ALREADY-RESOLVED value. It comes from
 /// `VERTEX_PROJECT_ID`, then the ADC `quota_project_id` or gcloud config file,
@@ -348,9 +305,6 @@ impl LlmProvider for RoutingProvider {
         let named = selection.model.unwrap_or(&self.default_model);
         let first = self.resolve(&selection)?;
         Self::log_generation(named, &first);
-        // A retry needs the request again. Keep a copy only when a refusal
-        // here would resolve to another model, so a turn's images are cloned
-        // only when they could be resent.
         let retry_on = self
             .resolve_refusing(&selection, Some((first.route.provider, &first.model)))
             .ok()
@@ -378,7 +332,7 @@ impl LlmProvider for RoutingProvider {
             (Err(err), Some(request))
                 if err.is::<ModelNotServed>() && !streamed.load(Ordering::SeqCst) =>
             {
-                // The ledger now holds the refusal, so this resolves afresh.
+                // INVARIANT: The ledger now holds the refusal, so this resolves afresh.
                 let next = self.resolve(&selection)?;
                 if next.model == first.model {
                     return Err(err);
@@ -406,7 +360,6 @@ impl LlmProvider for RoutingProvider {
         let mut response = outcome?;
         let route = resolved.route;
         response.provider = Some(route.provider);
-        // Probes showed only OpenRouter keeps a marker's TTL (ADR 0575).
         if route.provider != ProviderKind::OpenRouter {
             if let Some(usage) = response.usage.as_mut() {
                 usage.cache_creation_requested_ttl = None;
@@ -427,7 +380,6 @@ impl LlmProvider for RoutingProvider {
         Ok(response)
     }
 
-    /// Send the beat to the backend that served its turn, never another.
     async fn prefill(
         &self,
         body: &crate::llm::prefill::PrefillBody,
@@ -482,8 +434,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::RwLock;
 
-    /// A provider-less router: the clamp reads only the registry, so no backend
-    /// needs configuring to exercise it.
     fn router(rows: &[(&str, ProviderKind)]) -> RoutingProvider {
         let registry: ModelRegistry = Arc::new(RwLock::new(
             rows.iter()
@@ -498,12 +448,6 @@ mod tests {
     }
 
     impl RoutingProvider {
-        /// Clamp `effort` for `model` against the route the registry names,
-        /// ignoring what this router has configured.
-        ///
-        /// The clamp itself reads only the route, so the tests below exercise it
-        /// on a provider-less router. `chat` resolves against the configured set
-        /// first, and refuses before reaching the clamp when nothing serves.
         fn effort_for_model<'a>(&self, model: &str, effort: Option<&'a str>) -> Option<&'a str> {
             let route = resolve_route(&self.registry, model, None, |_| true)
                 .expect("every provider counts as configured here");
@@ -511,9 +455,6 @@ mod tests {
         }
     }
 
-    /// The chokepoint. Each model's effort is snapped using the provider its
-    /// registry row names, not the shape of its id, so the same effort resolves
-    /// differently per backend.
     #[test]
     fn effort_is_clamped_against_the_registry_provider() {
         let router = router(&[
@@ -524,11 +465,7 @@ mod tests {
             ("muse-glimmer:30b-mlx", ProviderKind::Local),
             ("z-ai/glm-5.2", ProviderKind::OpenRouter),
             ("grok-4.6", ProviderKind::XAi),
-            // Grok through OpenRouter is a different row on a different
-            // backend, and must keep resolving there.
             ("x-ai/grok-4.6", ProviderKind::OpenRouter),
-            // The free tier splits per model: Ox Alpha keeps `max`, and every
-            // other free id snaps to the conservative ceiling.
             ("x-preview-f-free", ProviderKind::OpenCodeFree),
             ("laguna-s-2.1-free", ProviderKind::OpenCodeFree),
         ]);
@@ -552,10 +489,6 @@ mod tests {
         }
     }
 
-    /// The regression, at the layer that prevents it. A turn on a server that is
-    /// not OpenAI's must never carry the OpenAI-proprietary `xhigh`, whichever
-    /// tier the caller asked for. The local model is the case that failed; xAI
-    /// is the same shape, an OpenAI-compatible third party.
     #[test]
     fn a_third_party_model_never_leaves_the_chokepoint_carrying_xhigh() {
         let router = router(&[
@@ -570,9 +503,6 @@ mod tests {
         }
     }
 
-    /// With the free tier off, its models are neither offered nor silently
-    /// routed somewhere else. The picker filters on `configured_providers`, and
-    /// a turn that gets through anyway is told where the switch is.
     #[test]
     fn a_free_model_is_hidden_and_actionable_while_the_tier_is_off() {
         let router = router(&[("laguna-s-2.1-free", ProviderKind::OpenCodeFree)]);
@@ -610,8 +540,6 @@ mod tests {
         }
     }
 
-    /// A router holding only a Claude gateway, for a Claude model routed to
-    /// Vertex, direct Anthropic and the gateway, in that order.
     fn gateway_only_router() -> RoutingProvider {
         let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
             "claude-opus-5-5".to_string(),
@@ -643,8 +571,6 @@ mod tests {
         )
     }
 
-    /// With only the gateway signed in, a Claude model runs there. Pinned to
-    /// direct Anthropic, the turn is refused naming Anthropic, never moved.
     #[test]
     fn a_claude_model_runs_on_the_gateway_and_a_pin_elsewhere_is_refused() {
         let router = gateway_only_router();
@@ -662,8 +588,6 @@ mod tests {
         assert!(err.to_string().contains("Anthropic credential"), "{err}");
     }
 
-    /// A turn pinned to the gateway while it is not signed in says where to
-    /// sign in, rather than running on another configured backend.
     #[test]
     fn a_pin_to_a_gateway_not_signed_in_says_where_to_sign_in() {
         let router = router(&[("claude-opus-5-5", ProviderKind::ClaudeGateway)]);
@@ -679,11 +603,6 @@ mod tests {
         );
     }
 
-    /// The honoured-or-refused rule, at the layer that enforces it.
-    ///
-    /// A model routed to both Vertex and Anthropic, with only Anthropic
-    /// configured, runs on Anthropic. Pin it to Vertex and the turn is REFUSED,
-    /// naming Vertex, rather than quietly leaving for the other vendor.
     #[test]
     fn a_pinned_provider_is_honoured_or_refused_but_never_substituted() {
         let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
@@ -714,22 +633,16 @@ mod tests {
             "claude-opus-5".to_string(),
         );
 
-        // No pick: the first CONFIGURED route wins, so Vertex being listed
-        // first does not strand a workspace holding only an Anthropic key.
         let route = router
             .route_for("claude-opus-5", None)
             .expect("anthropic serves it");
         assert_eq!(route.provider, ProviderKind::Anthropic);
 
-        // Pinned to the parked backend: refused, and the message names it.
         let Err(err) = router.route_for("claude-opus-5", Some(ProviderKind::Vertex)) else {
             panic!("a pin to an unconfigured backend must refuse");
         };
         assert!(err.to_string().contains("Vertex AI"), "{err}");
 
-        // The same refusal through `chat`, fed the owned selection a turn
-        // resolves and stamps. That is the seam a turn crosses, so a provider
-        // dropped on the way would run this turn on Anthropic instead.
         let resolved = crate::core::ResolvedModelSelection {
             model: Some("claude-opus-5".to_string()),
             reasoning_effort: None,
@@ -749,9 +662,6 @@ mod tests {
         assert!(err.to_string().contains("Vertex AI"), "{err}");
     }
 
-    /// An auxiliary call's attempt cap crosses the router and bounds the leaf's
-    /// request. The backend accepts and never answers, so without the cap each
-    /// attempt would wait out the 120s header bound.
     #[tokio::test]
     async fn the_attempt_cap_crosses_the_router_to_the_leaf() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -792,7 +702,6 @@ mod tests {
             None,
             crate::llm::metered::CallToken::for_test(),
         );
-        // Every attempt is capped, so the call ends after the retries' backoff.
         let backoff: std::time::Duration = (1..=crate::llm::MAX_RETRIES)
             .map(|attempt| crate::llm::retry_delay(attempt, 1))
             .sum();
@@ -803,8 +712,6 @@ mod tests {
         assert!(outcome.is_err(), "the backend never answers");
     }
 
-    /// An OpenAI-compatible backend at a local port that answers every request
-    /// with `status` and `body`, and counts the requests it saw.
     async fn answering_backend(
         status: &'static str,
         body: &'static str,
@@ -839,8 +746,6 @@ mod tests {
         (provider, hits)
     }
 
-    /// The response names the backend the router chose, so the capture can
-    /// record which backend served the call.
     #[tokio::test]
     async fn the_response_names_the_route_that_served_it() {
         let (local, _hits) = answering_backend(
@@ -882,9 +787,6 @@ mod tests {
         );
     }
 
-    /// A marked request asks for a 5-minute cache, and only OpenRouter has
-    /// shown it honours that. The same request on any other route records no
-    /// requested TTL, so its TTL stays Unknown.
     #[tokio::test]
     async fn a_requested_ttl_survives_only_on_a_route_that_honours_it() {
         const MODEL: &str = "anthropic/claude-opus-5-5";
@@ -951,9 +853,6 @@ mod tests {
         }
     }
 
-    /// A beat goes to the backend its body names, and nowhere else. A body
-    /// naming none, or an unconfigured backend, sends nothing. The local
-    /// backend's reply here carries no usage block, so its beat fails.
     #[tokio::test]
     async fn a_beat_goes_only_to_the_backend_that_served_its_turn() {
         let (local, hits) = answering_backend("200 OK", "{}").await;
@@ -991,8 +890,6 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// An OpenAI backend at a local port that records each request it is sent
-    /// and refuses it, which ends the call.
     async fn recording_openai() -> (OpenAiProvider, tokio::sync::mpsc::UnboundedReceiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1024,7 +921,6 @@ mod tests {
         (openai, bodies)
     }
 
-    /// A user message carrying one image, the shape a chat turn sends.
     fn message_with_an_image() -> Message {
         Message {
             role: "user".to_string(),
@@ -1041,7 +937,6 @@ mod tests {
         }
     }
 
-    /// The request body `router` sends for one image-bearing turn on `model`.
     async fn body_sent(
         router: &RoutingProvider,
         bodies: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -1061,8 +956,6 @@ mod tests {
         bodies.recv().await.expect("the leaf sent a request")
     }
 
-    /// A router over one recording OpenAI backend, holding `rows` as
-    /// `(id, vision, successor)`.
     async fn vision_router(
         rows: &[(&str, bool, Option<&str>)],
     ) -> (
@@ -1097,9 +990,6 @@ mod tests {
         request.contains(r#""type":"image_url""#) && request.contains("iVBORw0KGgo")
     }
 
-    /// The vision flag decides, at the router, whether a model sees images. A
-    /// text-only row gets the note in each image's place. A flagged row and a
-    /// model with no row keep the image, and the provider decides.
     #[tokio::test]
     async fn only_a_text_only_row_has_its_images_withheld() {
         let (router, mut bodies) = vision_router(&[
@@ -1125,9 +1015,6 @@ mod tests {
         );
     }
 
-    /// The gate reads the model the call is SENT as. A retired text-only model
-    /// whose successor reads images keeps its images, and the reverse loses
-    /// them.
     #[tokio::test]
     async fn the_gate_reads_the_successor_not_the_retired_id() {
         let (router, mut bodies) = vision_router(&[
@@ -1147,9 +1034,6 @@ mod tests {
         );
     }
 
-    /// The router rebuilds the selection for the leaf field by field, so a
-    /// requested service tier and cache mode must cross it. The backend
-    /// records the body it was sent and refuses, which ends the call.
     #[tokio::test]
     async fn the_service_tier_and_cache_mode_cross_the_router_to_the_leaf() {
         let (openai, mut bodies) = recording_openai().await;
@@ -1189,9 +1073,6 @@ mod tests {
         );
     }
 
-    /// A not-found answer on the first route ends the call there (ADR 0247).
-    /// The second route belongs to another vendor, so moving the turn to it
-    /// would send the user's data somewhere they never chose.
     #[tokio::test]
     async fn a_not_served_model_never_moves_to_the_next_route() {
         let (openrouter, refused) = answering_backend(
@@ -1262,9 +1143,6 @@ mod tests {
         seen.lock().unwrap().clone()
     }
 
-    /// The reported failure: the successor answers not-found and the retired
-    /// model still serves. The call retries once on the retired model and
-    /// stays whole, and the next call skips the successor inside the window.
     #[tokio::test]
     async fn a_refused_successor_falls_back_within_the_call_and_is_then_skipped() {
         let (router, seen) = lineage_router(&["new"]).await;
@@ -1282,7 +1160,6 @@ mod tests {
             .refused(ProviderKind::Local, "new"));
     }
 
-    /// A reachable successor still wins (ADR 0418).
     #[tokio::test]
     async fn a_reachable_successor_still_wins() {
         let (router, seen) = lineage_router(&[]).await;
@@ -1292,8 +1169,6 @@ mod tests {
         assert_eq!(requests(&seen), ["new"]);
     }
 
-    /// A stored pick on the successor steps back to the model it replaced. A
-    /// default never does, and its refusal names who refused.
     #[tokio::test]
     async fn only_a_stored_pick_steps_back() {
         let (router, seen) = lineage_router(&["new"]).await;
@@ -1313,8 +1188,6 @@ mod tests {
         assert_eq!(requests(&seen), ["new", "old"]);
     }
 
-    /// A call retries at most once, and the refusal names the model the
-    /// retry was sent, never the one the caller named.
     #[tokio::test]
     async fn a_call_retries_at_most_once() {
         let (router, seen) = lineage_router(&["new", "old"]).await;
@@ -1328,8 +1201,6 @@ mod tests {
         assert_eq!(requests(&seen), ["new", "old"]);
     }
 
-    /// A retired model is sent as its successor, at an effort the successor
-    /// takes. Gemini 3.5 Flash took `none`; 3.8 Flash refuses it.
     #[test]
     fn a_retired_model_is_sent_as_its_successor() {
         let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([
@@ -1367,8 +1238,6 @@ mod tests {
         assert_eq!(router.effort_sent(&selection).as_deref(), Some("low"));
     }
 
-    /// The wire carries the ROUTE's id, not the row's. That is what lets a row
-    /// keep one identity while a backend spelling it differently still works.
     #[test]
     fn the_route_decides_the_id_on_the_wire() {
         let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
@@ -1406,33 +1275,25 @@ mod tests {
             .route_for("claude-opus-5-5", None)
             .expect("openrouter serves it");
         assert_eq!(route.wire_id, "anthropic/claude-opus-5-5");
-        // And the effort clamp reads that id's backend, so OpenAI's own
-        // `xhigh` is never offered on a third-party server.
         assert_eq!(
             router.effort_for_route("claude-opus-5-5", &route, Some("xhigh")),
             Some("high")
         );
     }
 
-    /// A model with no registry row falls back to the same prefix heuristic
-    /// routing uses, so its clamp matches the provider it will actually reach.
     #[test]
     fn an_unregistered_model_clamps_against_its_heuristic_provider() {
         let router = router(&[]);
-        // `gpt-` → OpenAI, which tops out at xhigh below 5.6.
         assert_eq!(
             router.effort_for_model("gpt-5.4", Some("max")),
             Some("xhigh")
         );
-        // Non-fable `claude-` → Vertex Claude, adaptive, so max survives.
         assert_eq!(
             router.effort_for_model("claude-opus-5", Some("max")),
             Some("max")
         );
     }
 
-    /// The cost record names the tier the router sent: filled from the
-    /// default effort, and snapped onto the route.
     #[test]
     fn the_effort_sent_is_the_routed_one() {
         let local = OpenAiProvider::new_with_base_url(
@@ -1463,9 +1324,6 @@ mod tests {
         assert_eq!(sent(Some("max")).as_deref(), Some("high"));
     }
 
-    /// No effort runs a model at its default effort. A model with none stays
-    /// without one, so its provider decides, rather than the router inventing
-    /// a tier.
     #[test]
     fn no_effort_runs_the_default_effort_or_stays_absent() {
         let router = router(&[
@@ -1490,15 +1348,6 @@ mod tests {
         );
     }
 
-    /// A string that is not one of our tiers is dropped here rather than
-    /// guessed at, so the provider applies its own default.
-    ///
-    /// It really does reach this point: only the `preferences` LLM tool
-    /// validates against the ladder, while `PUT /api/v1/preferences` and the
-    /// `reasoning_effort` on `POST /api/v1/chat/stream` do not. Before the
-    /// clamp existed such a value went to the wire and the provider rejected
-    /// it, so the one thing this must NOT do is quietly promote it to a real
-    /// tier the user then pays for.
     #[test]
     fn an_unrecognised_effort_is_dropped_not_promoted() {
         let router = router(&[("gpt-5.4", ProviderKind::OpenAi)]);
@@ -1512,8 +1361,6 @@ mod tests {
     }
 }
 
-/// A real router over a local stub backend, for tests across the crate that
-/// need the router's lineage resolution and ledger.
 #[cfg(any(test, feature = "test-support"))]
 pub mod lineage_stub {
     use super::*;
@@ -1522,8 +1369,6 @@ pub mod lineage_stub {
     use std::collections::HashMap;
     use std::sync::RwLock;
 
-    /// A local backend that answers not-found for the models in `refused` and
-    /// streams a reply for any other. It records the model of each request.
     pub(crate) async fn lineage_backend(
         refused: &'static [&'static str],
     ) -> (OpenAiProvider, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -1579,7 +1424,6 @@ pub mod lineage_stub {
         (provider, seen)
     }
 
-    /// A router over [`lineage_backend`], holding `old` retired to `new`.
     pub async fn lineage_router(
         refused: &'static [&'static str],
     ) -> (RoutingProvider, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -1595,8 +1439,6 @@ pub mod lineage_stub {
         (router, seen)
     }
 
-    /// A registry holding the local model `old`, retired to `new`. A clone
-    /// shares nothing with the router's, but resolves the same way.
     pub fn lineage_registry() -> ModelRegistry {
         Arc::new(RwLock::new(HashMap::from([
             (

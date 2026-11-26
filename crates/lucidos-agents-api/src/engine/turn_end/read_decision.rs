@@ -1,20 +1,3 @@
-//! The *read decision* turn-end requirement: a turn that ended without one is
-//! decided by one judgment call (ADR 0417), at `JudgmentSite::ReadDecision`.
-//!
-//! Every thread kind takes the same path. One yes/no question reads the turn's
-//! opening message, labelled by who sent it, and its reply. A question the
-//! user answered inside the turn shows between the two. A turn that ends with
-//! work still in flight says so, so a progress report reads as one (ADR 0424).
-//! An agent-opened turn says when its report wakes the parent agent, so a
-//! routine report to that agent reads as one (ADR 0446). A turn that already
-//! notified the user names the notification, and the notification replaces
-//! the read unless the reply holds a failure it does not mention.
-//!
-//! The site's chat model answers, unless the user picked a System One row
-//! (ADR 0472). The reply is never changed. A failed call or a missing answer
-//! records a read request, so a report never hides. A coding-agent turn whose
-//! change already lists the thread is a no, with no call (ADR 0421).
-
 use crate::engine::turn_end::expected_wake_decision::ExpectedWakeDecisionExt;
 use crate::engine::turn_end::wake_decision::WakeDecisionExt;
 use std::time::Duration;
@@ -22,7 +5,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::expected_wake_decision::TurnStart;
-use super::wake_decision::{OwedReport, TurnFinish};
+use super::wake_decision::{OwedReport, TurnFinish, WakeDuty};
 use crate::engine::model_call::AuxCapture;
 use crate::engine::read_request::{record_agent_read_decision, record_read_decision, ReadDecision};
 use crate::engine::thread_events::{
@@ -36,14 +19,10 @@ use crate::llm::judgment::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The id of the one question. A chat model sees it as its answer's key.
 pub(crate) const READ_QUESTION_ID: &str = "read";
 
 pub(crate) const READ_THRESHOLD: f64 = 0.5;
 
-/// What still makes a report to a parent agent worth the user's read. The
-/// judge's instructions and a sub-thread's own read rule share it, so the two
-/// cannot disagree about what the parent's reply drops.
 macro_rules! must_see_criteria {
     () => {
         "a failure, a gap the user must know about, or something only the user can do or \
@@ -51,7 +30,6 @@ macro_rules! must_see_criteria {
     };
 }
 
-/// The sentences of a sub-thread's own read rule, after its heading.
 macro_rules! parent_acts_read_guidance {
     () => {
         concat!(
@@ -65,19 +43,18 @@ macro_rules! parent_acts_read_guidance {
     };
 }
 
-/// The read rule of a sub-thread whose spawn declared a wake mode that wakes
-/// its parent, so every report reaches the parent agent (ADR 0607).
-pub(crate) const PARENT_ACTS_READ_RULE: &str =
-    concat!("SUB-THREAD READ DECISION: ", parent_acts_read_guidance!());
+pub(crate) const PARENT_ACTS_READ_RULE: &str = concat!(
+    "SUB-THREAD READ DECISION: ",
+    parent_acts_read_guidance!(),
+    " Your no also clears an earlier yes the user has not read yet, so say yes again while \
+     that earlier item still needs the user."
+);
 
-/// The read rule of a sub-thread that decides its own wake. It acts on the
-/// reports that wake the parent, and the rest are filed.
 pub(crate) const PARENT_MAY_ACT_READ_RULE: &str = concat!(
     "SUB-THREAD READ DECISION, only when you wake your parent: ",
     parent_acts_read_guidance!()
 );
 
-/// What the question asks. The turn arrives as the state.
 pub(crate) const READ_DECISION_INSTRUCTIONS: &str = concat!(
     "Should the user read the agent's reply? \
     The state is one turn.\n\n\
@@ -109,13 +86,11 @@ pub(crate) const READ_DECISION_INSTRUCTIONS: &str = concat!(
     exception is a failure the notification does not mention."
 );
 
-/// What a yes means.
 const READ_YES: &str = "The reply holds findings, research, an answer to the user's question, \
     a draft they asked for, a new finding from a trigger run that the user would otherwise \
     miss, a failure, or a decision only the user can make. Also yes when the user said they would read \
     it later.";
 
-/// What a no means.
 const READ_NO: &str = "The reply only confirms or carries out what the user just said or \
     picked. Also no for small talk, an acknowledgement, a plain \"done\", a run that found \
     nothing, and a kickoff that only says work started and will report back. Also no for a \
@@ -125,16 +100,11 @@ const READ_NO: &str = "The reply only confirms or carries out what the user just
     Also no when a closing note says the turn already sent the user a notification, unless the \
     reply holds a failure the notification does not mention.";
 
-/// The most bytes of the opening message the call reads.
 const MESSAGE_BYTES: usize = 4_000;
-/// The most bytes of the reply the call reads.
 const REPLY_BYTES: usize = 8_000;
-/// The most bytes of a push's title the call reads.
 const PUSH_TITLE_BYTES: usize = 200;
-/// The most bytes of a push's message the call reads.
 pub(crate) const PUSH_MESSAGE_BYTES: usize = 1_500;
 
-/// Who the text that opened a turn speaks for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OpeningSource {
     #[default]
@@ -145,7 +115,6 @@ pub enum OpeningSource {
 }
 
 impl OpeningSource {
-    /// The source of an opening event, from its type and its sender's mode.
     pub(crate) fn from_event(event_type: &str, mode: Option<ActorMode>) -> Self {
         match (event_type, mode) {
             ("ChildThreadCompleted", _) => Self::ChildThreadReport,
@@ -155,8 +124,6 @@ impl OpeningSource {
         }
     }
 
-    /// Read the columns an opener query selects. An unknown mode reads as a
-    /// human, and says so in the log.
     fn from_columns(event_type: Option<&str>, mode: Option<String>) -> Self {
         let mode = mode.and_then(|m| {
             serde_json::from_value(serde_json::Value::String(m.clone()))
@@ -178,44 +145,30 @@ impl OpeningSource {
     }
 }
 
-/// One turn, as the read decision sees it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnRead {
-    /// Whether the turn already recorded a read decision.
     pub decided: bool,
-    /// The message that opened the turn.
     pub message: String,
-    /// Who sent the opening message.
     pub source: OpeningSource,
-    /// Whether a child report or event wait woke this trigger run.
     pub continues_trigger_run: bool,
-    /// The user's latest answer inside the turn. It resumed the turn, so the
-    /// reply speaks to it rather than to the opener.
     pub answered: Option<AnsweredQuestion>,
-    /// The turn's final reply.
     pub reply: String,
-    /// Whether the thread's change already lists it, in Review or Blocked, so
-    /// a read request would only outlive the change. The database function
-    /// `change_replaces_read_request` defines it (ADR 0421).
     pub change_replaces_read_request: bool,
-    /// What the thread still waits on as the turn ends.
     pub in_flight: InFlight,
-    /// Whether the wake rules call for a parent turn. The fan-in can still
-    /// file a repeat. The prompt adds a note only for agent-driven turns.
     pub report_wakes_parent: bool,
-    /// The notifications the turn delivered before its reply. A notification
-    /// replaces the read, unless the reply holds a failure it does not mention.
     pub pushed: Vec<PushedNotification>,
+    pub user_wrote_in_turn: bool,
 }
 
 impl TurnRead {
-    /// Whether the user opened this turn, or resumed it with an answer, so the
-    /// reply speaks to them whoever else reads it.
     pub(crate) fn opened_by_the_user(&self) -> bool {
         self.source == OpeningSource::UserMessage || self.answered.is_some()
     }
 
-    /// The closing note for a report that could wake the parent agent.
+    pub(crate) fn reply_is_the_users(&self) -> bool {
+        self.opened_by_the_user() || self.user_wrote_in_turn
+    }
+
     fn parent_note(&self) -> Option<&'static str> {
         (self.report_wakes_parent && !self.opened_by_the_user()).then_some(
             "Closing note: this reply is the thread's report to the parent agent that started \
@@ -225,7 +178,6 @@ impl TurnRead {
     }
 }
 
-/// A question the agent asked inside the turn, and the user's answer as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnsweredQuestion {
     pub question: String,
@@ -233,9 +185,6 @@ pub struct AnsweredQuestion {
 }
 
 impl AnsweredQuestion {
-    /// The latest answered question on `thread_id` after event `after_sequence`.
-    /// A cancelled or superseded card is no answer. An unreadable row reads as
-    /// none, and the log records the error.
     async fn latest(pool: &sqlx::PgPool, thread_id: Uuid, after_sequence: i64) -> Option<Self> {
         type Row = (
             Option<String>,
@@ -272,7 +221,6 @@ impl AnsweredQuestion {
     }
 }
 
-/// A `send_notification` the turn delivered: its title and message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct PushedNotification {
     pub title: String,
@@ -280,9 +228,6 @@ pub struct PushedNotification {
 }
 
 impl PushedNotification {
-    /// The notifications `thread_id` delivered after event `after_sequence`,
-    /// oldest first. A call whose result failed reached nobody, so it is not
-    /// one. An unreadable row reads as none, and the log records the error.
     async fn delivered(pool: &sqlx::PgPool, thread_id: Uuid, after_sequence: i64) -> Vec<Self> {
         sqlx::query_as::<_, (String, String)>(
             "SELECT COALESCE(c.payload->'args'->>'title', ''), \
@@ -309,7 +254,6 @@ impl PushedNotification {
         .collect()
     }
 
-    /// The closing note for what the user already got, or `None` without one.
     fn note(pushed: &[Self]) -> Option<String> {
         let what = match pushed.len() {
             0 => return None,
@@ -334,25 +278,17 @@ impl PushedNotification {
     }
 }
 
-/// What a thread still waits on when its turn ends: the facts behind the
-/// drawer's Waiting dot. A turn that ends in flight is a step, not the end.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InFlight {
-    /// Awaited sub-threads: direct children whose finish will wake this
-    /// thread and that are unfinished, at any depth (ADR 0672).
     pub sub_threads: i64,
-    /// The thread's own live event waits.
     pub event_waits: i64,
-    /// This turn handed its work to a successor session.
     pub successor_session: bool,
 }
 
-/// The `InFlight` columns of a thread summary aliased `t`.
 const IN_FLIGHT_COLUMNS_SQL: &str = "t.awaited_children_count::bigint, \
      t.live_event_wait_count::bigint";
 
 impl InFlight {
-    /// The closing note the decision reads, or `None` once nothing waits.
     fn note(self) -> Option<String> {
         let counted = |n: i64, noun: &str| match n {
             0 => None,
@@ -379,8 +315,6 @@ impl InFlight {
         Some(note)
     }
 
-    /// Read a thread's summary. An unreadable row reads as settled: the prompt
-    /// gets no closing note, and the log records the error.
     async fn of_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Self {
         sqlx::query_as::<_, (i64, i64)>(&format!(
             "SELECT {IN_FLIGHT_COLUMNS_SQL} FROM thread_summaries t WHERE t.thread_id = $1"
@@ -405,16 +339,31 @@ impl InFlight {
     }
 }
 
-/// A turn's opening event as three columns: its text (a message, a prompt, or
-/// a finished child's summary), its type, and its sender's mode. An engine
-/// prompt to a coding agent carries no mode, only an engine origin.
 const OPENING_COLUMNS_SQL: &str = "COALESCE(payload->>'text', payload->>'prompt', \
      payload->>'summary', '') AS text, event_type, \
      COALESCE(payload->>'mode', \
               CASE WHEN payload->'origin'->>'kind' = 'engine' THEN 'engine' END) AS mode";
 
-/// The events that can open a coding-agent turn: every originating event, and
-/// an engine prompt such as a re-entry, an event-wait delivery or a resume.
+async fn human_input_after(pool: &sqlx::PgPool, thread_id: Uuid, after_sequence: i64) -> bool {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM ( \
+           SELECT {OPENING_COLUMNS_SQL} FROM events \
+            WHERE thread_id = $1 AND sequence > $2 AND event_type = ANY($3)) input \
+          WHERE input.mode IS NULL OR input.mode NOT IN ('agent', 'engine'))"
+    ))
+    .bind(thread_id)
+    .bind(after_sequence)
+    .bind(HUMAN_INPUT_EVENT_TYPES)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| {
+        crate::log_legacy!("[TurnEnd] Input to thread {} unreadable: {}", thread_id, e);
+        true
+    })
+}
+
+const HUMAN_INPUT_EVENT_TYPES: &[&str] = &["MessageReceived", "PromptInjected"];
+
 fn coding_agent_turn_openers() -> Vec<&'static str> {
     crate::engine::thread_events::CC_ORIGINATING_EVENT_TYPES
         .iter()
@@ -423,9 +372,6 @@ fn coding_agent_turn_openers() -> Vec<&'static str> {
         .collect()
 }
 
-/// Read a coding-agent turn from its events. The turn is everything since the
-/// previous `CodingAgentIdled`, so a follow-up that lands mid-turn moves
-/// nothing: its decision, its first opener, its latest reply, and its handoff.
 pub(crate) async fn coding_agent_turn_read(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -502,12 +448,28 @@ pub(crate) async fn coding_agent_turn_read(
             successor_session: handoff_start.is_some_and(|start| start.0.is_unprompted()),
             ..InFlight::of_thread(pool, thread_id).await
         },
+        user_wrote_in_turn: human_input_after(pool, thread_id, turn_start).await,
         ..TurnRead::default()
     })
 }
 
-/// Read a chat or trigger turn: the event that opened it, the reply it ends
-/// on, the notifications it delivered, and what the thread still waits on.
+pub(crate) async fn coding_agent_reply_is_the_users(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    let coding_agent: bool =
+        sqlx::query_scalar("SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or_else(|e| {
+                crate::log_legacy!("[TurnEnd] Kind of thread {} unreadable: {}", thread_id, e);
+                None
+            })
+            .unwrap_or(false);
+    !coding_agent
+        || coding_agent_turn_read(pool, thread_id, None)
+            .await
+            .map_or(true, |turn| turn.reply_is_the_users())
+}
+
 pub(crate) async fn chat_turn_read(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -515,12 +477,13 @@ pub(crate) async fn chat_turn_read(
     reply: &str,
 ) -> TurnRead {
     let opening = Opening::read(pool, thread_id, origin_id).await;
-    let (answered, pushed) = match opening.sequence {
+    let (answered, pushed, user_wrote_in_turn) = match opening.sequence {
         Some(sequence) => tokio::join!(
             AnsweredQuestion::latest(pool, thread_id, sequence),
             PushedNotification::delivered(pool, thread_id, sequence),
+            human_input_after(pool, thread_id, sequence - 1),
         ),
-        None => (None, Vec::new()),
+        None => (None, Vec::new(), true),
     };
     TurnRead {
         message: opening.text,
@@ -530,22 +493,17 @@ pub(crate) async fn chat_turn_read(
         reply: reply.to_string(),
         in_flight: InFlight::of_thread(pool, thread_id).await,
         pushed,
+        user_wrote_in_turn,
         ..TurnRead::default()
     }
 }
 
-/// The decision for one undecided turn, on the site's provider.
 pub(crate) struct ForcedReadDecision<'a> {
     pub(crate) provider: &'a dyn JudgmentProvider,
-    /// Bounds the call and its chat fallback together.
     pub(crate) deadline: Duration,
     pub(crate) capture: &'a AuxCapture,
 }
 
-/// The turn as the call reads it: the opening message under a heading naming
-/// its sender, the user's answer when one resumed the turn, and the reply.
-/// Closing notes follow when work is still in flight, when the parent agent
-/// acts on the reply, and when the turn already notified the user.
 pub(crate) fn read_decision_prompt(turn: &TurnRead) -> String {
     let answered = turn
         .answered
@@ -576,17 +534,10 @@ pub(crate) fn read_decision_prompt(turn: &TurnRead) -> String {
     .fold(prompt, |prompt, note| format!("{prompt}\n\n{note}"))
 }
 
-/// Whether a turn owing its parent a report settles the wake decision before
-/// the read decision. Only a forced read decision on a turn the user did not
-/// open reads where the report goes. Every other turn runs both at once.
 pub(crate) fn wake_settles_first(read_decided: bool, turn: &TurnRead) -> bool {
     !read_decided && !turn.opened_by_the_user()
 }
 
-/// The read decision's chat backend: the site's chat model, forced to answer.
-///
-/// Forced, so every reply carries the answer and runs without thinking, as
-/// ADR 0426 measured.
 pub fn read_decision_chat_judge(
     provider: std::sync::Arc<dyn crate::llm::LlmProvider>,
     reasoning: Option<String>,
@@ -594,7 +545,6 @@ pub fn read_decision_chat_judge(
     ChatJudgmentProvider::new(provider, reasoning).forcing_the_answer()
 }
 
-/// The one question every backend answers.
 fn read_question() -> Vec<(String, Question)> {
     vec![(
         READ_QUESTION_ID.to_string(),
@@ -608,7 +558,6 @@ fn read_question() -> Vec<(String, Question)> {
     )]
 }
 
-/// The decision the answers make. A missing answer asks to be read.
 pub(crate) fn decision_from(answers: &Answers) -> ReadDecision {
     match answers.noul(READ_QUESTION_ID) {
         Some(p) if p < READ_THRESHOLD => ReadDecision::NotRequested,
@@ -617,8 +566,6 @@ pub(crate) fn decision_from(answers: &Answers) -> ReadDecision {
 }
 
 impl ForcedReadDecision<'_> {
-    /// Decide one turn. A thread whose change already lists it, or an empty
-    /// reply, is a no without a call.
     pub(crate) async fn decide(&self, turn: &TurnRead) -> Result<ReadDecision, BoxError> {
         if turn.change_replaces_read_request || turn.reply.trim().is_empty() {
             return Ok(ReadDecision::NotRequested);
@@ -636,18 +583,13 @@ impl ForcedReadDecision<'_> {
     }
 }
 
-/// One read decision, as `lucidos-eval read-decision` scores it.
 pub struct EvalReadDecision {
     pub read: bool,
-    /// The probability of yes, or `None` when the backend gave no answer.
     pub probability: Option<f64>,
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
 
-/// One read decision for `lucidos-eval`'s read-decision check: the gate's own
-/// state, question and threshold over `provider`, recording nothing. The eval
-/// hands in its own token, since no engine source may mint one.
 #[doc(hidden)]
 pub async fn decide_read_for_eval(
     provider: &dyn JudgmentProvider,
@@ -671,8 +613,6 @@ pub async fn decide_read_for_eval(
 
 #[easy_ext::ext(ReadDecisionExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Make the read decision a turn ended without, and record it in the
-    /// engine's name. A failed call records a read request, never a no.
     async fn force_read_decision(&self, thread_id: Uuid, turn: &TurnRead) -> ReadDecision {
         let call = self.aux_call(ContextPurpose::ReadDecision).await;
         let system_one = self
@@ -686,13 +626,22 @@ pub(crate) impl crate::engine::LucidosEngine {
             deadline: call.deadline(),
             capture: &capture,
         };
-        record_forced_decision(&self.event_bus, thread_id, forced.decide(turn).await).await
+        record_forced_decision(
+            &self.pool,
+            &self.event_bus,
+            thread_id,
+            Some(turn),
+            forced.decide(turn).await,
+        )
+        .await
     }
 }
 
 pub(crate) async fn record_forced_decision(
+    pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
+    turn: Option<&TurnRead>,
     outcome: Result<ReadDecision, BoxError>,
 ) -> ReadDecision {
     let decision = outcome.unwrap_or_else(|e| {
@@ -703,7 +652,9 @@ pub(crate) async fn record_forced_decision(
         );
         ReadDecision::Requested
     });
-    if let Err(e) = record_read_decision(bus, thread_id, decision, None).await {
+    let reply_is_the_users = async { turn.is_none_or(TurnRead::reply_is_the_users) };
+    let parent_carries = parent_carries_read(pool, thread_id, decision, reply_is_the_users).await;
+    if let Err(e) = record_read_decision(bus, thread_id, decision, None, parent_carries).await {
         crate::log_legacy!(
             "[TurnEnd] Recording the read decision for thread {} failed: {}",
             thread_id,
@@ -713,14 +664,63 @@ pub(crate) async fn record_forced_decision(
     decision
 }
 
-/// The event that opened a chat or trigger turn.
+pub(crate) async fn parent_carries_read(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    decision: ReadDecision,
+    reply_is_the_users: impl std::future::Future<Output = bool>,
+) -> bool {
+    match decision {
+        ReadDecision::Requested => {
+            WakeDuty::of_thread(pool, thread_id).await.parent_acts()
+                && unseen_request(pool, thread_id).await != UnseenRequest::Users
+                && !reply_is_the_users.await
+        }
+        ReadDecision::NotRequested => {
+            unseen_request(pool, thread_id).await == UnseenRequest::ParentReport
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UnseenRequest {
+    None,
+    ParentReport,
+    Users,
+}
+
+async fn unseen_request(pool: &sqlx::PgPool, thread_id: Uuid) -> UnseenRequest {
+    match sqlx::query_scalar::<_, bool>(UNSEEN_PARENT_REPORT_SQL)
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(None) => UnseenRequest::None,
+        Ok(Some(true)) => UnseenRequest::ParentReport,
+        Ok(Some(false)) => UnseenRequest::Users,
+        Err(e) => {
+            crate::log_legacy!(
+                "[TurnEnd] Read request of thread {} unreadable: {}",
+                thread_id,
+                e
+            );
+            UnseenRequest::Users
+        }
+    }
+}
+
+const UNSEEN_PARENT_REPORT_SQL: &str = "\
+    SELECT COALESCE(( \
+             SELECT (e.payload->>'parent_report')::boolean FROM events e \
+              WHERE e.thread_id = $1 AND e.event_type = 'ThreadReadRequested' \
+              ORDER BY e.sequence DESC LIMIT 1), FALSE) \
+      FROM thread_summaries WHERE thread_id = $1 AND read_requested";
+
 #[derive(Default)]
 struct Opening {
     text: String,
     source: OpeningSource,
     continues_trigger_run: bool,
-    /// Where the turn starts in the event log. `None` when the event is
-    /// unreadable, and then no answer is read either.
     sequence: Option<i64>,
 }
 
@@ -729,10 +729,24 @@ impl Opening {
         self.source == OpeningSource::TriggerRun || self.continues_trigger_run
     }
 
+    async fn reply_is_the_users(&self, pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+        let Some(sequence) = self.sequence else {
+            return true;
+        };
+        let (answered, user_wrote_in_turn) = tokio::join!(
+            AnsweredQuestion::latest(pool, thread_id, sequence),
+            human_input_after(pool, thread_id, sequence - 1),
+        );
+        TurnRead {
+            source: self.source,
+            answered,
+            user_wrote_in_turn,
+            ..TurnRead::default()
+        }
+        .reply_is_the_users()
+    }
+
     async fn read(pool: &sqlx::PgPool, thread_id: Uuid, origin_id: Uuid) -> Self {
-        // Ordinary user and agent input opens on MessageReceived. Input
-        // coalesced into an active turn names that turn's request id. If the
-        // input later opens its own turn, that turn stamps its settings.
         sqlx::query_as::<_, (String, String, Option<String>, i64, bool)>(&format!(
             "SELECT {OPENING_COLUMNS_SQL}, sequence,
                 CASE WHEN event_type IN ('ChildThreadCompleted', 'ContinuationStarted')
@@ -784,8 +798,6 @@ impl Opening {
 
 #[easy_ext::ext(TurnEndDecisionExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Handle the chat agent's read decision. A trigger turn's yes leaves
-    /// the decision to the judge, and the returned flag stays false.
     async fn decide_chat_agent_read(
         &self,
         thread_id: Uuid,
@@ -793,20 +805,20 @@ pub(crate) impl crate::engine::LucidosEngine {
         args: &serde_json::Value,
     ) -> Result<(bool, &'static str), String> {
         let decision = ReadDecision::from_tool_args(args)?;
-        if decision == ReadDecision::Requested
-            && Opening::read(&self.pool, thread_id, origin_id)
-                .await
-                .belongs_to_trigger_run()
-        {
+        let opening = Opening::read(&self.pool, thread_id, origin_id).await;
+        if decision == ReadDecision::Requested && opening.belongs_to_trigger_run() {
             return Ok((false, "The engine will decide at the end of the turn."));
         }
-        record_agent_read_decision(&self.event_bus, thread_id, decision)
+        let reply_is_the_users = opening.reply_is_the_users(&self.pool, thread_id);
+        let parent_carries =
+            parent_carries_read(&self.pool, thread_id, decision, reply_is_the_users).await;
+        record_agent_read_decision(&self.event_bus, thread_id, decision, parent_carries)
             .await
             .map_err(|e| format!("Error: recording the read decision failed: {e}"))?;
         Ok((true, decision.ack()))
     }
 
-    /// The chat turn end's gate, just before `ResponseGenerated`: force the
+    /// INVARIANT: The chat turn end's gate, just before `ResponseGenerated`: force the
     /// read decision when the turn made none, and the wake decision when the
     /// thread owes its parent a report without one. Beside them runs the
     /// expected wake decision. `reply` is the draft the turn ends on, and it
@@ -833,11 +845,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         tokio::join!(decisions, expected_wake);
     }
 
-    /// The coding-agent turn end's gate, before `CodingAgentIdled`: force the
-    /// read decision and the wake decision the turn did not make, with the
-    /// expected wake decision beside them. A coding agent cannot be forced
-    /// inside its own session, so all three read the turn's events.
-    /// `has_changes` is the idle's own, which names the report's status.
     async fn gate_coding_agent_turn_end(
         &self,
         thread_id: Uuid,
@@ -851,9 +858,16 @@ pub(crate) impl crate::engine::LucidosEngine {
             let turn = match turn {
                 Ok(turn) => turn,
                 Err(e) => {
-                    // The wake decision stays unset, which wakes the parent.
+                    // INVARIANT: The wake decision stays unset, which wakes the parent.
                     let unread = format!("the turn's events were unreadable: {e}");
-                    record_forced_decision(&self.event_bus, thread_id, Err(unread.into())).await;
+                    record_forced_decision(
+                        &self.pool,
+                        &self.event_bus,
+                        thread_id,
+                        None,
+                        Err(unread.into()),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -877,8 +891,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         tokio::join!(decisions, expected_wake);
     }
 
-    /// Force whichever of the two decisions `turn` lacks. They run
-    /// concurrently, unless the read decision needs the wake decision's result.
     async fn force_turn_end_decisions(
         &self,
         thread_id: Uuid,

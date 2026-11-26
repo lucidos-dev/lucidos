@@ -221,6 +221,10 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     }
     case 'PluginInstalled':
     case 'PluginUninstalled':
+      if ([data.files, data.files_removed].some((files) => Array.isArray(files)
+        && files.some((path) => typeof path === 'string' && path.startsWith('hooks/')))) {
+        eventHooksVersion.value++;
+      }
       if (appsList.value.status === 'loaded') void loadApps();
       if (triggers.value.status === 'loaded') void loadTriggers();
       if (installedPlugins.value.status === 'loaded') void loadInstalledPlugins();

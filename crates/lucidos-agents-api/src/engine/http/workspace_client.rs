@@ -1,16 +1,3 @@
-//! Outbound HTTP from one Lucidos workspace to another.
-//!
-//! Merges `caller_workspace` / `caller_thread_id` / `caller_event_id` / `mode`
-//! into the JSON body of the outbound POST so the receiving engine can build
-//! a `MessageOrigin::Workspace` and the route panel can show "from workspace
-//! 'myws'" with traceable IDs back to the source thread / event.
-//!
-//! The fields alone are claims any process could type. A call goes through
-//! this engine's gateway when it can ([`post_through_gateway`]): the engine
-//! signs the caller, its thread and its spawn-gate verdict, and the gateway
-//! stamps the same claim for the target. Otherwise the call goes straight to
-//! the target's port and lands there as an unattested caller.
-
 use crate::engine::http::workspace_resolver::CrossWorkspaceTarget;
 use crate::engine::thread_events::{ActorMode, SpawnVerdict};
 use reqwest::Client;
@@ -19,30 +6,18 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Per-request timeout for cross-workspace POSTs. A peer engine that accepts
+/// INVARIANT: Per-request timeout for cross-workspace POSTs. A peer engine that accepts
 /// the connection and never responds would otherwise pin the calling thread
 /// until the surrounding turn is canceled. Generous enough to cover a peer
 /// under load setting up a `/api/v1/chat/stream` response, but bounded.
 const CROSS_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Build the reqwest client used for cross-workspace POSTs. Extracted so tests
-/// can verify the timeout fires against a hung peer without paying the
-/// production 30-second cost.
-///
-/// Every target here is `localhost`, so it is the loopback client. The timeout
-/// bounds each request so a hung peer can't pin the calling thread.
 pub(crate) fn build_cross_workspace_client(timeout: Duration) -> reqwest::Result<Client> {
     lucidos_local_token::client::client_builder()
         .timeout(timeout)
         .build()
 }
 
-/// Shared HTTP client for cross-workspace POSTs. Lazily built once so
-/// repeated calls reuse the connection pool and the rustls context —
-/// `Client::builder().build()` is non-trivial. Production callers (chat
-/// `run_coding_agent` cross-workspace spawn, in-tree tests against a local
-/// axum listener) all go through this so any TLS / timeout policy lives in
-/// one place. See `build_cross_workspace_client` for the knobs.
 pub fn cross_workspace_http_client() -> &'static Client {
     static CLIENT: LazyLock<Client> = LazyLock::new(|| {
         build_cross_workspace_client(CROSS_WORKSPACE_TIMEOUT)
@@ -51,27 +26,14 @@ pub fn cross_workspace_http_client() -> &'static Client {
     &CLIENT
 }
 
-/// Source context for an outbound workspace call. The receiving engine uses
-/// these to populate `MessageOrigin::Workspace` on the resulting
-/// `MessageReceived` event.
 #[derive(Debug, Clone)]
 pub struct WorkspaceCallCtx {
-    /// Name of the calling workspace (e.g. "dev", "myws").
     pub self_workspace: String,
-    /// Thread in the calling workspace that initiated this call.
     pub source_thread_id: Option<Uuid>,
-    /// Event in the calling workspace that initiated this call (e.g. the
-    /// `ToolCalled` event for a cross-workspace `lucidos spawn-thread`).
     pub source_event_id: Option<Uuid>,
-    /// Upstream actor mode (Human/Agent/Engine). Becomes the `mode` field on
-    /// the receiving `MessageOrigin::Workspace`.
     pub mode: ActorMode,
 }
 
-/// Merge the `caller_*` + `mode` fields into a JSON object body.
-///
-/// Body must serialize to a JSON object (top-level `{...}`); panics otherwise
-/// — cross-workspace POSTs always send objects.
 pub(crate) fn merge_caller_fields(mut body: Value, ctx: &WorkspaceCallCtx) -> Value {
     let obj = body
         .as_object_mut()
@@ -90,15 +52,6 @@ pub(crate) fn merge_caller_fields(mut body: Value, ctx: &WorkspaceCallCtx) -> Va
     body
 }
 
-/// POST `body` as JSON to `url`, merging the caller_* fields from `ctx` into
-/// the body so the receiver can capture a `MessageOrigin::Workspace`, and
-/// asserting `target_workspace` so a stale or mis-resolved port cannot land
-/// this write on somebody else's engine (`api::target_workspace`).
-///
-/// The assertion is a required parameter rather than something the one caller
-/// remembers to add, because forgetting it fails silently in exactly the way
-/// the header exists to prevent: the request succeeds against the wrong
-/// workspace and looks like a delivery.
 pub async fn workspace_post<B: serde::Serialize>(
     client: &Client,
     url: &str,
@@ -119,8 +72,6 @@ pub async fn workspace_post<B: serde::Serialize>(
         .await?)
 }
 
-/// The target's answer to a call through the gateway, read in full. A
-/// cross-workspace spawn answers with a short JSON body, never a stream.
 #[derive(Debug)]
 pub(crate) struct GatewayReply {
     pub(crate) status: reqwest::StatusCode,
@@ -128,22 +79,12 @@ pub(crate) struct GatewayReply {
     pub(crate) body: bytes::Bytes,
 }
 
-/// What became of a call through this engine's gateway.
 #[derive(Debug)]
 pub(crate) enum ThroughGateway {
-    /// The gateway carried the call, and this is the answer.
     Replied(GatewayReply),
-    /// No gateway carries it: `reason` is a `lucidos_gateway_stamp`
-    /// `REASON_*` slug. The caller may post to the target directly.
     Unavailable { reason: &'static str },
 }
 
-/// POST `body` into `target_workspace`'s `/api/v1/chat/stream` through the
-/// gateway on `gateway_port`, signed with `verdict` for the thread in `ctx`.
-/// Production passes `core::base_path::gateway_port()`.
-///
-/// `ctx.self_workspace` gives way to this workspace's own id, since that is
-/// the name the gateway checks the signature against.
 pub(crate) async fn post_through_gateway(
     gateway_port: Option<&str>,
     target_workspace: &str,
@@ -178,7 +119,6 @@ pub(crate) async fn post_through_gateway(
     post_signed_call(&client, &url, target_workspace, body, ctx, signed).await
 }
 
-/// [`post_through_gateway`] once the call is signed.
 async fn post_signed_call(
     client: &Client,
     url: &str,
@@ -231,31 +171,16 @@ async fn post_signed_call(
     }))
 }
 
-/// The user-facing parameters for spawning a coding-agent thread in another
-/// workspace: the prompt plus the optional title / target folder / backend /
-/// model / effort. Grouped because they always travel together from the caller
-/// down to the request-body builder; passing them as a unit keeps the spawn
-/// helper under clippy's argument-count limit without an artificial wrapper.
 pub struct CrossWorkspaceSpawn<'a> {
-    /// The instruction sent to the spawned coding-agent thread.
     pub prompt: &'a str,
-    /// Optional thread title; omitted from the body when `None`/empty.
     pub title: Option<&'a str>,
-    /// Canonical target folder for the spawn: `data/apps/<id>/`, a repo root, or
-    /// a registered repo name (the receiver resolves it, see `api/chat.rs`).
     pub folder: Option<&'a str>,
-    /// Which backend drives the thread; receiver defaults to Claude Code.
     pub coding_agent: Option<crate::runtime::CodingAgent>,
-    /// Model pin, already validated against `coding_agent`'s picker by the
-    /// caller. Sent as `cc_model`, the field the receiving engine's
-    /// `ChatRequest` reads for a coding-agent thread. Omitted when `None`, so
-    /// the receiver applies its own default.
     pub model: Option<&'a str>,
-    /// Thinking-budget pin, sent as `reasoning_effort`. Omitted when `None`.
     pub reasoning_effort: Option<&'a str>,
 }
 
-/// Build the `/api/v1/chat/stream` body for a cross-workspace coding-agent spawn.
+/// INVARIANT: Build the `/api/v1/chat/stream` body for a cross-workspace coding-agent spawn.
 ///
 /// Pre-generates `thread_id` (caller-supplied) so the caller can return a
 /// workspace-qualified link without a second request. Mirrors the body shape of
@@ -291,7 +216,7 @@ pub(crate) fn build_cross_workspace_coding_agent_body(
     body
 }
 
-/// Spawn a coding-agent thread in another workspace.
+/// INVARIANT: Spawn a coding-agent thread in another workspace.
 ///
 /// POSTs to the target workspace's `/api/v1/chat/stream` with `use_coding_agent:
 /// true` and the caller_* / mode fields merged in, through the gateway with
@@ -318,9 +243,6 @@ pub async fn spawn_coding_agent_in_workspace(
 ) -> Result<Uuid, String> {
     let cc_thread_id = Uuid::new_v4();
     let body = build_cross_workspace_coding_agent_body(cc_thread_id, spawn);
-    // Assert the workspace this spawn is FOR, taken from the resolved target's
-    // own path rather than from anything the caller typed, so the assertion and
-    // the port it was resolved alongside always name the same workspace.
     let target_workspace = target
         .workspace_path
         .file_name()
@@ -347,9 +269,6 @@ pub async fn spawn_coding_agent_in_workspace(
         "{}://localhost:{}/api/v1/chat/stream",
         scheme, target.api_port
     );
-    // A transport failure names the assumption when the scheme was a guess. A
-    // bare "record overflow" is a TLS handshake meeting a plain-http socket.
-    // Nothing in it points at the ports file that failed to say so.
     let resp = workspace_post(client, &url, &body, ctx, &target_workspace)
         .await
         .map_err(|e| {
@@ -399,7 +318,6 @@ mod tests {
             "00000000-0000-0000-0000-000000000000"
         );
         assert_eq!(merged["mode"], "human");
-        // Existing fields preserved.
         assert_eq!(merged["message"], "hi");
     }
 
@@ -421,8 +339,6 @@ mod tests {
 
     #[test]
     fn merge_overwrites_existing_mode_field() {
-        // The caller's `mode` is authoritative — even if the body already
-        // contained a different mode, the ctx wins.
         let body = serde_json::json!({"message": "hi", "mode": "human"});
         let ctx = WorkspaceCallCtx {
             self_workspace: "dev".into(),
@@ -512,8 +428,6 @@ mod tests {
             },
         );
         assert_eq!(body["message"], "do the thing");
-        // `cc_model`, never `model`: the receiver reads the latter as the CHAT
-        // model, which a coding-agent thread never uses.
         assert_eq!(body["cc_model"], "gpt-5.6-luna");
         assert_eq!(body["reasoning_effort"], "low");
         assert!(
@@ -588,7 +502,6 @@ mod tests {
             "folder must be omitted when unset: {:?}",
             body
         );
-        // Empty strings are treated as absent so the receiver doesn't see "".
         let body = build_cross_workspace_coding_agent_body(
             tid,
             &CrossWorkspaceSpawn {
@@ -619,10 +532,6 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_coding_agent_in_workspace_posts_body_with_caller_context() {
-        // End-to-end shape check: the helper must POST to <port>/api/v1/chat/stream
-        // with use_coding_agent=true and the caller_* + mode fields merged in.
-        // Without these, the receiving engine rejects Agent-mode messages
-        // with 400 (no provenance).
         use std::sync::{Arc, Mutex};
         let captured: Arc<Mutex<Option<(String, Value)>>> = Arc::new(Mutex::new(None));
         let captured_for_handler = captured.clone();
@@ -690,16 +599,10 @@ mod tests {
         assert_eq!(body["title"], "Add feature X");
         assert_eq!(body["folder"], "data/apps/habit-tracker");
         assert!(body.get("repo_id").is_none());
-        // Cross-workspace provenance: receiver MUST see caller_workspace +
-        // mode=agent or it rejects the request as malformed.
         assert_eq!(body["caller_workspace"], "dev");
         assert_eq!(body["mode"], "agent");
     }
 
-    /// The spawn must assert WHICH workspace it is for, taken from the resolved
-    /// target's own path. Without it, a stale or mis-resolved port lands the
-    /// spawn on a different workspace's engine and looks like a success:
-    /// `api::target_workspace` can only refuse an assertion that was made.
     #[tokio::test]
     async fn spawn_coding_agent_in_workspace_asserts_the_target_workspace() {
         use std::sync::{Arc, Mutex};
@@ -728,9 +631,6 @@ mod tests {
         });
 
         let target = CrossWorkspaceTarget {
-            // The assertion comes off this path's basename, never off anything
-            // the caller typed, so it always names the workspace whose ports
-            // file supplied the port beside it.
             workspace_path: std::path::PathBuf::from("/tmp/workspaces/myws"),
             api_port: port,
             proto: "http".to_string(),
@@ -770,8 +670,6 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_coding_agent_in_workspace_propagates_http_error_with_status_and_body() {
-        // 4xx/5xx from the receiver must surface as Err so the LLM sees the
-        // failure instead of the helper falsely reporting success.
         let app = axum::Router::new().route(
             "/api/v1/chat/stream",
             axum::routing::post(|| async {
@@ -820,24 +718,10 @@ mod tests {
         );
     }
 
-    /// Regression guard for `harden-engine-workspace-client-no-timeout`.
-    /// Before the fix, `cross_workspace_http_client` built its reqwest client
-    /// without a timeout; a peer workspace that accepted the TCP connection
-    /// and never wrote a response would pin the calling thread until the
-    /// surrounding turn was canceled.
-    ///
-    /// We exercise `build_cross_workspace_client` directly with a short
-    /// timeout against a `TcpListener` that accepts and holds the connection
-    /// without responding — the production path uses the same builder, just
-    /// with `CROSS_WORKSPACE_TIMEOUT`. The assertion: the request errors out
-    /// within twice the configured timeout and the error reports a timeout.
     #[tokio::test]
     async fn build_cross_workspace_client_times_out_against_hung_peer() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // Accept connections but hold the stream so the OS doesn't see a
-        // graceful close (which would surface as `Connection reset` /
-        // `IncompleteMessage` instead of a timeout).
         tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
@@ -854,9 +738,6 @@ mod tests {
         let elapsed = start.elapsed();
 
         let err = result.expect_err("hung peer must surface as Err");
-        // The boxed error's outer Display just says "error sending request for
-        // url (…)"; the timeout indicator lives on the wrapped reqwest::Error
-        // (via source() chain). Walk the chain so we catch both formats.
         let mut chain: Vec<String> = Vec::new();
         let mut current: Option<&dyn std::error::Error> = Some(err.as_ref());
         while let Some(e) = current {
@@ -879,8 +760,6 @@ mod tests {
 
     type Seen = std::sync::Arc<std::sync::Mutex<Option<(axum::http::HeaderMap, Value)>>>;
 
-    /// A stand-in gateway that records the call and answers `status` with
-    /// `answer`. Returns its base URL.
     async fn stand_in_gateway(status: u16, answer: Value) -> (String, Seen) {
         let seen: Seen = Default::default();
         let record = seen.clone();
@@ -911,8 +790,6 @@ mod tests {
         .expect("the test stamp key is installed")
     }
 
-    /// The call names this workspace by the id it signed under, carries the
-    /// claim headers, and asserts the target.
     #[tokio::test]
     async fn a_signed_call_carries_its_claim_and_the_signing_id() {
         let (base, seen) = stand_in_gateway(200, serde_json::json!({"ok": true})).await;
@@ -955,8 +832,6 @@ mod tests {
         );
     }
 
-    /// A gateway that does not serve the target hands the call back, so the
-    /// caller can post directly. Any other refusal is the target's answer.
     #[tokio::test]
     async fn only_a_target_elsewhere_hands_the_call_back() {
         let thread = Uuid::new_v4();
@@ -998,7 +873,6 @@ mod tests {
         );
     }
 
-    /// No gateway port means no gateway: the call is handed back unsent.
     #[tokio::test]
     async fn with_no_gateway_the_call_is_handed_back() {
         let outcome = post_through_gateway(
@@ -1020,7 +894,6 @@ mod tests {
 
     #[test]
     fn cross_workspace_http_client_returns_static_client_with_production_timeout() {
-        // Smoke test: the LazyLock initializer doesn't panic.
         let _ = cross_workspace_http_client();
     }
 }

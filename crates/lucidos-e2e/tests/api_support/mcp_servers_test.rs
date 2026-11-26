@@ -1,22 +1,6 @@
-//! E2E coverage for the `/api/v1/mcp` control surface.
-//!
-//! Why over HTTP rather than in-engine: the point of these routes is the status
-//! code. A Backstage server with an unusable id locked a workspace out of chat.
-//! The only removal path was the chat tool that server had killed. A DELETE
-//! answering 200 for an id it never found would leave the page unable to say
-//! anything useful. The engine-side unit tests cover the mapping; these check
-//! the bytes actually sent.
-//!
-//! Registering a server is deliberately not reachable over HTTP, since it needs
-//! a command and args and spawns a process. So most of these tests exercise the
-//! unknown-id lane plus the read surfaces. The per-thread lane (ADR 0430) needs
-//! a live process, so it writes a stub server's row straight into the table.
-
 use crate::support::{base_url, unique_marker, user_client};
 use serde_json::json;
 
-/// An id no server holds. Every verb below has to say "not found" rather than
-/// report success against nothing.
 fn missing_id() -> String {
     unique_marker("e2e-absent-mcp")
 }
@@ -33,8 +17,6 @@ async fn delete_on_an_unknown_server_is_404() {
         .await
         .expect("delete failed");
 
-    // The regression this guards: `remove_server` used to return
-    // `Ok("... not found")`, which behind a route is a 200 that did nothing.
     assert_eq!(
         resp.status(),
         404,
@@ -79,8 +61,6 @@ async fn switching_a_tool_on_an_unknown_server_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
-/// The page reads cost off this response, so the shape is the contract: every
-/// figure is engine-computed, and the model's window comes with it.
 #[tokio::test]
 async fn listing_servers_carries_totals_and_the_resolved_window() {
     let client = user_client().await;
@@ -115,18 +95,12 @@ async fn listing_servers_carries_totals_and_the_resolved_window() {
         );
     }
 
-    // The model name can legitimately be empty, since a workspace with no
-    // provider configured resolves to none. The window cannot: it is what the
-    // request packer would size against either way, and a share of zero is
-    // meaningless.
     assert!(body["model"].is_string(), "model: {body}");
     assert!(
         body["context_window"].as_u64().unwrap_or(0) > 0,
         "context_window: {body}"
     );
 
-    // The share is stated against the request's own char budget, and the MCP
-    // ceiling is a part of it.
     let budget = &body["budget"];
     let request_chars = budget["request_chars"].as_u64().unwrap_or(0);
     let ceiling = budget["mcp_ceiling_chars"].as_u64().unwrap_or(0);
@@ -148,8 +122,6 @@ async fn listing_servers_carries_totals_and_the_resolved_window() {
         "budget.warning: {budget}"
     );
 
-    // The counts have to agree with the array, or the header contradicts the
-    // rows it sits above.
     let servers = body["servers"].as_array().unwrap();
     assert_eq!(totals["servers"].as_u64().unwrap(), servers.len() as u64);
 
@@ -163,8 +135,6 @@ async fn listing_servers_carries_totals_and_the_resolved_window() {
     }
 }
 
-/// The MCP allowlist editor, the pair `cc-allowed-tools` already had. Without a
-/// route the file was editable only by hand on the host.
 #[tokio::test]
 async fn mcp_allowed_tools_round_trips_over_http() {
     let client = user_client().await;
@@ -204,7 +174,6 @@ async fn mcp_allowed_tools_round_trips_over_http() {
         "the written pattern should read back"
     );
 
-    // Put it back, so a rerun starts from the same file.
     client
         .put(&url)
         .json(&json!({ "contents": before }))
@@ -213,14 +182,8 @@ async fn mcp_allowed_tools_round_trips_over_http() {
         .expect("restore failed");
 }
 
-// ---------------------------------------------------------------------------
-// Enabled per thread (ADR 0430)
-// ---------------------------------------------------------------------------
-
 use crate::support::{db_url, poll_thread_summary_by_marker};
 
-/// A stdio MCP server in a few lines of shell: it answers the handshake, lists
-/// one tool and runs it. The engine tests' `StubServer` speaks the same lines.
 const STUB_SERVER: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -238,9 +201,6 @@ while IFS= read -r line; do
 done
 "#;
 
-/// A registered stub server, and the directory holding its script, which the
-/// caller keeps alive while the server runs. Registration has no HTTP route
-/// (see the module doc), so the row goes straight into `mcp_servers`.
 async fn register_stub(pool: &sqlx::PgPool) -> (String, tempfile::TempDir) {
     let id = unique_marker("e2e-stub");
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -264,7 +224,6 @@ async fn register_stub(pool: &sqlx::PgPool) -> (String, tempfile::TempDir) {
     (id, dir)
 }
 
-/// How many turns on `thread_id` have ended, by their terminators.
 async fn ended_turns(pool: &sqlx::PgPool, thread_id: uuid::Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type IN \
@@ -276,7 +235,6 @@ async fn ended_turns(pool: &sqlx::PgPool, thread_id: uuid::Uuid) -> i64 {
     .unwrap()
 }
 
-/// Block until `thread_id` has ended `turns` turns.
 async fn await_ended_turns(pool: &sqlx::PgPool, thread_id: uuid::Uuid, turns: i64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while ended_turns(pool, thread_id).await < turns {
@@ -288,8 +246,6 @@ async fn await_ended_turns(pool: &sqlx::PgPool, thread_id: uuid::Uuid, turns: i6
     }
 }
 
-/// A fresh chat thread, opened by a real message whose turn has ended, so a
-/// later capture can only be a later turn's.
 async fn open_thread(client: &reqwest::Client, pool: &sqlx::PgPool) -> uuid::Uuid {
     let marker = unique_marker("e2e-mcp-thread");
     let resp = client
@@ -306,8 +262,6 @@ async fn open_thread(client: &reqwest::Client, pool: &sqlx::PgPool) -> uuid::Uui
     thread_id
 }
 
-/// Send one follow-up to `thread_id`, wait for its turn to end, and return the
-/// tool names that turn's last main capture carries.
 async fn tools_of_next_turn(
     client: &reqwest::Client,
     pool: &sqlx::PgPool,
@@ -384,10 +338,6 @@ async fn enable_and_disable_name_the_unknown_server_or_thread() {
     }
 }
 
-/// The whole lane against a real process: one thread enables the stub and its
-/// next turn carries the stub's tool, another thread's turn does not. A
-/// disable leaves the process to others, and a stop switches it off in every
-/// thread and records `McpServerStopped`.
 #[tokio::test]
 async fn a_server_enabled_in_one_thread_reaches_only_that_threads_turns() {
     let client = user_client().await;
@@ -492,8 +442,6 @@ async fn a_server_enabled_in_one_thread_reaches_only_that_threads_turns() {
     assert_eq!(resp.status(), 204);
 }
 
-/// The id and `mcp_servers` of the trigger named `name`, polled until the
-/// list endpoint shows it. The scheduler projection it reads trails the write.
 async fn trigger_named(client: &reqwest::Client, name: &str) -> (String, Vec<String>) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -530,8 +478,6 @@ async fn trigger_named(client: &reqwest::Client, name: &str) -> (String, Vec<Str
     }
 }
 
-/// A trigger's `mcp_servers` round-trips the HTTP API: trimmed and kept once
-/// on create, replaced on update, and cleared by an empty list.
 #[tokio::test]
 async fn a_trigger_lists_its_mcp_servers_through_the_api() {
     let client = user_client().await;
@@ -586,17 +532,11 @@ async fn a_trigger_lists_its_mcp_servers_through_the_api() {
         .await;
 }
 
-/// The invariant "a trigger that lists a server has its schemas from round
-/// 1": the fire's first turn capture already carries the stub's tool, and the
-/// fire enabled it as the trigger's, not mid-turn by the agent.
 #[tokio::test]
 async fn a_trigger_listing_a_server_has_its_tools_from_the_first_round() {
     let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect");
     let (id, _dir) = register_stub(&pool).await;
-    // Approve this disposable stub's launch through the owner's normal API.
-    // Other tests may enable the workspace command guard. Stop it again so
-    // the trigger still has to start its listed server during turn setup.
     for action in ["start", "stop"] {
         let response = client
             .post(format!("{}/api/v1/mcp/servers/{id}/{action}", base_url()))

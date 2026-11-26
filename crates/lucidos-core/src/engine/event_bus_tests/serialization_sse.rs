@@ -24,7 +24,6 @@ fn bus_event_variants_are_constructable() {
     };
     assert!(matches!(thread_event, BusEvent::Thread { .. }));
 
-    // Transient events use the same Thread variant with is_persisted() == false
     let transient = BusEvent::Thread {
         thread_id: Uuid::new_v4(),
         event: ThreadEvent::CumulativeTextUpdated {
@@ -141,9 +140,6 @@ fn consumers_can_pattern_match_bus_events() {
     }
 }
 
-// -----------------------------------------------------------------------
-// to_sse_json — SSE JSON shape tests
-// -----------------------------------------------------------------------
 #[test]
 fn thread_event_sse_json_has_seq_and_event_id() {
     let tid = Uuid::new_v4();
@@ -426,12 +422,10 @@ fn system_changes_updated_matches_server_event_shape() {
             "resolving_conflict": { "typical_secs": 1080, "runs": 32 },
         })
     );
-    // Pins the wire key the client's `landingLane` signal reads.
     assert_eq!(
         json["data"]["landing_lane"],
         serde_json::json!({ "open_batch": null, "waiting": [], "gathering": false, "setting": "here" })
     );
-    // Pins the wire key the client's `mainCheck` signal reads.
     assert_eq!(
         json["data"]["main_check"],
         serde_json::json!({ "state": "idle" })
@@ -459,11 +453,6 @@ fn system_memory_rebuild_progress_matches_server_event_shape() {
     assert_eq!(json["data"]["percent"], 50);
 }
 
-/// The `EmbeddingModelStatusChanged` payload and the
-/// `GET /api/v1/memory/embedding-model-status` snapshot are ONE shape by
-/// contract: a client that arrives mid-download (the normal case on a fresh
-/// workspace) reads the snapshot, and must not have to translate it into what
-/// the stream would have told it. Pin the two serializations against each other.
 #[test]
 fn embedding_model_status_event_matches_the_rest_snapshot() {
     let status = crate::engine::thread_events::EmbeddingModelStatus {
@@ -495,8 +484,6 @@ fn embedding_model_status_event_matches_the_rest_snapshot() {
     );
 }
 
-/// The `kind` discriminator and its kebab-case values are what the frontend
-/// switches on, so they are wire contract, not an implementation detail.
 #[test]
 fn embedding_model_load_state_wire_tags_are_stable() {
     use crate::engine::thread_events::EmbeddingModelLoadState as S;
@@ -523,9 +510,6 @@ fn embedding_model_load_state_wire_tags_are_stable() {
         assert_eq!(json["kind"], expected, "wire tag drifted for {state:?}");
     }
 
-    // The payload fields each variant carries, spot-checked where the UI reads
-    // them: the progress bar needs both byte counts on the same object as the
-    // tag (no nesting), and a terminal failure has to carry its reason.
     let downloading = serde_json::to_value(S::Downloading {
         downloaded_bytes: 7,
         total_bytes: 9,
@@ -634,12 +618,6 @@ fn system_backup_failed_matches_server_event_shape() {
     assert_eq!(event.aggregate(), "ops");
 }
 
-/// Regression test: domain events emitted via `lucidos.events.emit()` must
-/// be broadcast on SSE with the inner event_type as the wire `type`, so
-/// that frontend listeners (`lucidos.sse.on('SlidePresenterState', ...)`)
-/// fire. Otherwise the SDK only sees the wrapper `"DomainEvent"` and
-/// per-type subscribers never get called — breaking app-to-app comms
-/// (e.g. Super Slides presenter ↔ remote).
 #[test]
 fn domain_event_sse_json_uses_inner_event_type() {
     let emitted = EmittedEvent {
@@ -680,10 +658,6 @@ fn domain_event_sse_json_uses_inner_event_type() {
     );
 }
 
-/// Drift guard: every `SystemEvent` variant's `event_type()` must appear
-/// in `RESERVED_TYPE_NAMES`. If a new variant is added but missed here,
-/// the `emit_event` HTTP guard would silently let untrusted apps spoof
-/// it on the SSE wire.
 #[test]
 fn reserved_type_names_match_event_type() {
     use SystemEvent::*;
@@ -844,7 +818,7 @@ fn reserved_type_names_match_event_type() {
             commit_hash: "c".into(),
             summary: None,
             writer_thread_id: None,
-            writer: None, // Legacy event fixture.
+            writer: None,
         },
         TriggerCreated {
             trigger_id: "t".into(),
@@ -902,14 +876,14 @@ fn reserved_type_names_match_event_type() {
             commit: "c".into(),
             source: None,
             writer_thread_id: None,
-            writer: None, // Legacy event fixture.
+            writer: None,
         },
         ArtifactUpdated {
             artifact_path: "p".into(),
             commit: "c".into(),
             source: None,
             writer_thread_id: None,
-            writer: None, // Legacy event fixture.
+            writer: None,
         },
         ArtifactDeleted {
             artifact_path: "p".into(),
@@ -983,7 +957,6 @@ fn reserved_type_names_match_event_type() {
     );
 }
 
-/// The live frame of one thread event, as `to_sse_json` puts it on the wire.
 fn live_event_json(event: ThreadEvent) -> serde_json::Value {
     let emitted = EmittedEvent {
         event_id: Uuid::new_v4(),
@@ -1085,8 +1058,6 @@ fn a_live_generate_image_call_keeps_the_prompt_its_image_is_described_by() {
     assert!(event.get("args_stripped").is_none());
 }
 
-/// A `MainCheckFailed` stored before `failures` existed still deserializes, and
-/// a red with none serializes without the field.
 #[test]
 fn a_main_check_failed_row_without_failures_still_reads() {
     let old = serde_json::json!({

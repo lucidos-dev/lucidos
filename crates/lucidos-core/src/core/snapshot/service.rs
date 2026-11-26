@@ -1,4 +1,4 @@
-//! The credential boundary shared by snapshot callers. Detailed errors from
+//! INVARIANT: The credential boundary shared by snapshot callers. Detailed errors from
 //! archive primitives never leave here, including on join errors. Each one is
 //! logged redacted, and callers see only a slug.
 use super::{
@@ -22,7 +22,6 @@ use chrono::Utc;
 use sqlx::PgPool;
 use std::path::Path;
 
-/// Log a failed step's cause, redacted, and return the slug callers see.
 fn step_failed<E: std::fmt::Display>(
     step: &'static str,
     slug: &'static str,
@@ -36,7 +35,6 @@ fn step_failed<E: std::fmt::Display>(
     }
 }
 
-/// A floor refusal tells the user how much to free. Any other error stays opaque.
 fn capture_failure(error: &BoxError) -> super::jobs::Failure {
     match error.downcast_ref::<store::DiskFloorRefused>() {
         Some(refusal) => super::jobs::Failure::DiskFloor {
@@ -46,7 +44,7 @@ fn capture_failure(error: &BoxError) -> super::jobs::Failure {
     }
 }
 
-/// Own both locks for the entire operation, including MAC key creation.
+/// INVARIANT: Own both locks for the entire operation, including MAC key creation.
 /// Capture tasks retain ownership if their caller stops waiting.
 pub struct Session {
     store: Store,
@@ -77,16 +75,12 @@ pub struct CaptureRequest {
     pub running_threads: u64,
 }
 
-/// A request whose target identity and display name came from the gateway registry.
-/// The offline command must also verify that registry's directory/database binding.
 pub struct OfflineRestoreRequest {
     pub restore_id: uuid::Uuid,
     pub gateway_slug: String,
     pub workspace_name: String,
 }
 
-/// Only the offline restore runner may request this, after stopping the engine.
-/// Handles are minted internally so recovery cannot overwrite a caller's snapshot.
 pub struct RecoveryRequest {
     pub restore_id: uuid::Uuid,
     pub workspace_name: String,
@@ -100,13 +94,11 @@ enum CaptureMode {
 }
 
 impl Session {
-    /// Attach announcements and retention policy before sharing the session.
     pub fn with_events(mut self, events: super::events::JobEvents) -> Self {
         self.events = Some(events);
         self
     }
 
-    /// Bind online job creation and restart discovery to the durable log identity.
     pub fn with_restore_generation(mut self, generation: Option<uuid::Uuid>) -> Self {
         self.restore_generation = generation;
         self
@@ -158,7 +150,7 @@ impl Session {
         Ok(job)
     }
 
-    /// Run before accepting archive requests. An unused store creates no key or directory.
+    /// INVARIANT: Run before accepting archive requests. An unused store creates no key or directory.
     pub async fn recover_at_boot(
         database_url: &str,
         gateway_slug: Option<String>,
@@ -192,7 +184,7 @@ impl Session {
         .await
         .map_err(|_| "snapshot_job_recovery_failed")??;
         if let Some((_session, jobs)) = recovered {
-            // Keep both locks through announcements, before accepting new work.
+            // INVARIANT: Keep both locks through announcements, before accepting new work.
             // Boot only announces and never prunes, so retention is the default.
             let events = super::events::JobEvents {
                 bus,
@@ -207,7 +199,7 @@ impl Session {
         Ok(())
     }
 
-    /// Shared initialization for engine callers. Call on a blocking worker:
+    /// INVARIANT: Shared initialization for engine callers. Call on a blocking worker:
     /// store setup and key resolution may touch the filesystem or OS key store.
     pub fn open_for_database(
         database_url: &str,
@@ -225,7 +217,7 @@ impl Session {
         Self::open(store, slots, kind, keys.as_ref(), &database)
     }
 
-    /// Run an already-persisted job in an owned worker. Canceling the waiter
+    /// INVARIANT: Run an already-persisted job in an owned worker. Canceling the waiter
     /// retains both locks through capture and the final result write.
     /// The persisted job supplies the authoritative handle and actor.
     pub async fn run_capture_job(
@@ -352,7 +344,7 @@ impl Session {
             .map_err(|_| "snapshot_job_update_failed".into())
     }
 
-    /// Boot recovery must run before accepting new archive requests.
+    /// INVARIANT: Boot recovery must run before accepting new archive requests.
     pub fn recover_jobs(&self) -> Result<Vec<super::jobs::Job>, BoxError> {
         let settled = super::jobs::settle(
             self.store.root(),
@@ -360,7 +352,6 @@ impl Session {
             self.restore_generation,
         )
         .map_err(|_| "snapshot_job_recovery_failed")?;
-        // Leftover trees cost disk, never correctness, so they never stop boot.
         if let Err(error) = self.store.clean_partial(Utc::now(), &self._lock) {
             crate::log_legacy!("[Snapshots] Partial capture cleanup failed: {error}");
         }
@@ -427,7 +418,6 @@ impl Session {
             .map_err(|_| "snapshot_delete_refused".into())
     }
 
-    /// Own deletion and its announcement through caller cancellation.
     pub async fn delete_announced(
         self: std::sync::Arc<Self>,
         handle: Handle,
@@ -460,7 +450,7 @@ impl Session {
         .map_err(|_| "snapshot_delete_failed")?
     }
 
-    /// Internal retention operation. Store protections still apply, including
+    /// INVARIANT: Internal retention operation. Store protections still apply, including
     /// the newest recovery snapshot. The caller persists SnapshotDeleted with
     /// reason `retention` before we attempt the next deletion. Run this from an
     /// owned job worker so caller cancellation cannot skip that announcement.
@@ -519,7 +509,7 @@ impl Session {
             .await
     }
 
-    /// Capture recovery and durably journal its handle before permitting staging.
+    /// INVARIANT: Capture recovery and durably journal its handle before permitting staging.
     /// The persisted request supplies identity and attribution. An interrupted
     /// waiter retains both archive locks until the journal write finishes.
     pub async fn prepare_recovery(
@@ -577,7 +567,7 @@ impl Session {
         .map_err(|_| "snapshot_recovery_failed")?
     }
 
-    /// Capture and fully verify the stopped workspace before any restore mutation.
+    /// INVARIANT: Capture and fully verify the stopped workspace before any restore mutation.
     /// The caller must durably reference this handle in its journal before advancing.
     pub async fn capture_recovery(
         self: std::sync::Arc<Self>,
@@ -615,7 +605,7 @@ impl Session {
         let pool = pool.clone();
         let database_url = database_url.to_owned();
         let workspace = workspace.to_owned();
-        // Dropping a JoinHandle detaches rather than aborts. In particular,
+        // INVARIANT: Dropping a JoinHandle detaches rather than aborts. In particular,
         // pg_dump and spawn_blocking file capture must retain both locks when
         // an HTTP caller disconnects. The durable job worker waits for this.
         let worker = self.clone();
@@ -628,7 +618,6 @@ impl Session {
                 .capture_inner(&pool, &database_url, &workspace, request, mode)
                 .await?;
             if matches!(mode, CaptureMode::Recovery(_)) {
-                // Keep both locks through verification even if the caller disconnects.
                 #[cfg(test)]
                 worker.fault("recovery-verify")?;
                 tokio::task::spawn_blocking(move || worker.check(&manifest.handle, &database_url))
@@ -655,8 +644,6 @@ impl Session {
         request: CaptureRequest,
         mode: CaptureMode,
     ) -> Result<Manifest, BoxError> {
-        // Include the database in the disk estimate; file bytes alone can be
-        // negligible for a workspace whose history is mostly in PostgreSQL.
         let db_bytes: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
             .fetch_one(pool)
             .await
@@ -684,7 +671,7 @@ impl Session {
             .capture_into(pool, database_url, workspace, &partial, request, mode)
             .await;
         if captured.is_err() {
-            // The disk floor never counts a failed capture's bytes, and boot
+            // INVARIANT: The disk floor never counts a failed capture's bytes, and boot
             // clears only partials an hour old, so remove them now.
             match std::fs::remove_dir_all(&partial) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {

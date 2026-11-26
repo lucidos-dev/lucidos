@@ -1,5 +1,3 @@
-//! Plugin trigger auto-registration validation (ADR 0019).
-
 use super::{plugin_trigger_slug, validate_plugin_triggers_event_driven};
 use crate::core::plugins::PlannedFile;
 use std::path::PathBuf;
@@ -17,7 +15,6 @@ fn plugin_trigger_slug_matches_only_trigger_toml() {
         plugin_trigger_slug("triggers/daily-reflect/trigger.toml"),
         Some("daily-reflect")
     );
-    // Not a trigger.toml / wrong depth / other content dirs → None.
     assert_eq!(
         plugin_trigger_slug("triggers/daily-reflect/knowhow/a.md"),
         None
@@ -84,6 +81,5 @@ fn non_trigger_files_are_ignored_by_validation() {
         source: PathBuf::from("/nonexistent/does-not-matter"),
         data_relative: "knowhow/notes.md".to_string(),
     }];
-    // No trigger.toml → no read attempted → Ok even though the path is bogus.
     assert!(validate_plugin_triggers_event_driven(&planned).is_ok());
 }

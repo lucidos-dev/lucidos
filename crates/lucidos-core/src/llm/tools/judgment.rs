@@ -1,4 +1,4 @@
-//! The LLM-facing schema for `judge`, a typed judgment the agent asks for
+//! INVARIANT: The LLM-facing schema for `judge`, a typed judgment the agent asks for
 //! itself.
 //!
 //! Gated on [`crate::llm::tools::Gate::JudgmentProvider`], so a workspace with

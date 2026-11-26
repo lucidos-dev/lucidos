@@ -1,10 +1,3 @@
-//! E2E API integration tests for Lucidos.
-//!
-//! These tests hit a running Lucidos workspace booted by `./scripts/e2e-api.sh`.
-//! Run via:
-//!   ./scripts/e2e-api.sh
-//! which boots the e2e-test workspace and runs `cargo test -p lucidos-e2e --test api`.
-
 #[path = "api_support/mod.rs"]
 mod support;
 

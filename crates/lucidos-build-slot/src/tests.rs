@@ -6,8 +6,6 @@ fn pool(dir: &tempfile::TempDir, capacity: usize) -> BuildSlotPool {
     BuildSlotPool::with_capacity(dir.path().to_path_buf(), capacity).expect("open pool")
 }
 
-// ── capacity resolution ─────────────────────────────────────────────────
-
 #[test]
 fn the_env_var_beats_the_file_and_the_file_beats_host_ram() {
     let from_env = resolve_capacity(Some("7"), Some("3"), Some(48 * GB));
@@ -25,9 +23,6 @@ fn the_env_var_beats_the_file_and_the_file_beats_host_ram() {
 
 #[test]
 fn zero_and_junk_are_ignored_rather_than_honoured() {
-    // A capacity of 0 would freeze every build on the host, including the
-    // engine's own rebuild, with no way back. Each of these must fall through
-    // to the next source instead of being taken at face value.
     for bad in ["0", "", "   ", "two", "-1", "3.5"] {
         let resolved = resolve_capacity(Some(bad), None, Some(48 * GB));
         assert_eq!(
@@ -41,8 +36,6 @@ fn zero_and_junk_are_ignored_rather_than_honoured() {
 
 #[test]
 fn a_capacity_file_with_surrounding_whitespace_still_parses() {
-    // `set_capacity` writes a trailing newline, and a human editing the file
-    // by hand leaves whatever their editor leaves.
     let resolved = resolve_capacity(None, Some(" 4\n"), Some(48 * GB));
     assert_eq!(resolved.value, 4);
     assert_eq!(resolved.source, CapacitySource::File);
@@ -63,7 +56,6 @@ fn host_ram_derivation_has_a_floor_of_one_and_a_ceiling() {
 #[test]
 fn host_ram_derivation_matches_common_mac_and_linux_sizes() {
     let cases = [
-        // macOS reports nominal RAM.
         (16, 1),
         (24, 1),
         (32, 2),
@@ -71,7 +63,6 @@ fn host_ram_derivation_matches_common_mac_and_linux_sizes() {
         (48, 3),
         (64, 4),
         (128, 8),
-        // Linux MemTotal is lower than nominal RAM.
         (15, 1),
         (23, 1),
         (31, 1),
@@ -156,8 +147,6 @@ fn set_capacity_refuses_zero() {
     assert!(pool(&dir, 1).set_capacity(0).is_err());
 }
 
-// ── the ceiling ─────────────────────────────────────────────────────────
-
 #[test]
 fn never_more_than_n_slots_are_held_at_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -220,13 +209,8 @@ fn a_waiter_acquires_once_the_holder_releases() {
     assert!(got.is_some(), "the waiter must take the freed slot");
 }
 
-// ── nothing stale can wedge the pool ────────────────────────────────────
-
 #[test]
 fn holder_metadata_from_a_dead_process_does_not_reserve_the_slot() {
-    // The kernel's flock is the only thing that says a slot is taken. Recorded
-    // metadata is forensics, never state we consult to decide freeness, which
-    // is exactly what the `mkdir` lock got wrong.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 1);
     std::fs::write(
@@ -239,8 +223,6 @@ fn holder_metadata_from_a_dead_process_does_not_reserve_the_slot() {
         "a slot whose recorded holder is long gone must be free"
     );
 }
-
-// ── waiting flag ────────────────────────────────────────────────────────
 
 #[test]
 fn nobody_waiting_on_an_idle_pool_and_somebody_waiting_while_a_flag_is_held() {
@@ -257,8 +239,6 @@ fn nobody_waiting_on_an_idle_pool_and_somebody_waiting_while_a_flag_is_held() {
 
 #[test]
 fn two_waiters_can_hold_the_flag_at_once() {
-    // It is a shared lock, so a second waiter must not be excluded by the
-    // first: both are queued and both need the announcement.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 1);
     let first = p.mark_waiting().expect("first waiter");
@@ -269,8 +249,6 @@ fn two_waiters_can_hold_the_flag_at_once() {
     drop(second);
     assert!(!p.anyone_waiting());
 }
-
-// ── priority ────────────────────────────────────────────────────────────
 
 #[test]
 fn an_ordinary_build_leaves_a_freed_slot_to_a_waiting_priority_build() {
@@ -294,8 +272,6 @@ fn an_ordinary_build_leaves_a_freed_slot_to_a_waiting_priority_build() {
 
 #[test]
 fn an_ordinary_attempt_holds_the_gate_so_no_priority_waiter_arrives_mid_attempt() {
-    // Check-then-acquire must be one step. While an ordinary build holds its
-    // turn, the priority flag cannot go up underneath it.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 1);
     let turn = match p.ordinary_turn() {
@@ -366,7 +342,6 @@ fn priority_never_takes_a_slot_beyond_capacity() {
 
 #[test]
 fn a_broken_priority_flag_reads_as_nobody_waiting() {
-    // Fail open: a flag that cannot be opened must not stall every build.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 1);
     std::fs::create_dir(dir.path().join(PRIORITY_FILE)).unwrap();
@@ -458,8 +433,6 @@ fn a_priority_build_runs_un_niced_unless_told_otherwise() {
     assert_eq!(resolve_nice(Some("junk"), SlotClass::Priority), 0);
 }
 
-// ── status ──────────────────────────────────────────────────────────────
-
 #[test]
 fn status_reports_holders_without_taking_a_slot() {
     let dir = tempfile::tempdir().unwrap();
@@ -481,7 +454,6 @@ fn status_reports_holders_without_taking_a_slot() {
         "only the held slot reports a holder"
     );
 
-    // Probing must not have consumed the free slot.
     assert!(
         p.try_acquire("second").is_some(),
         "status must leave the remaining slot acquirable"
@@ -511,8 +483,6 @@ fn holder_metadata_parses_and_tolerates_gaps() {
     assert_eq!(full.cwd, "/tmp/x");
     assert_eq!(full.started_epoch, Some(1700));
 
-    // An unknown key is ignored and a missing one leaves its field empty. A
-    // slot written by an older build still reports what it did record.
     let partial = SlotHolder::parse("PID=7\nFUTURE_KEY=whatever\nnot a pair\n");
     assert_eq!(partial.pid, Some(7));
     assert_eq!(partial.label, "");
@@ -520,16 +490,10 @@ fn holder_metadata_parses_and_tolerates_gaps() {
     assert_eq!(partial.held_secs(), None);
 }
 
-// ── the share of the host a slot carries ────────────────────────────────
-
-/// Pinned rather than read from the machine, so every expectation below is an
-/// exact number on any host that runs the suite.
 const TEST_NCPU: usize = 18;
 
 #[test]
 fn the_share_is_the_host_divided_by_its_holders() {
-    // The reported case: 18 cores, capacity 3. Solo keeps the machine, a
-    // second build gets half, and the third sits at the guaranteed share.
     assert_eq!(cpu_share(TEST_NCPU, 1, 3), 18);
     assert_eq!(cpu_share(TEST_NCPU, 2, 3), 9);
     assert_eq!(cpu_share(TEST_NCPU, 3, 3), 6);
@@ -537,16 +501,11 @@ fn the_share_is_the_host_divided_by_its_holders() {
 
 #[test]
 fn the_guaranteed_share_is_a_floor_a_holder_never_drops_below() {
-    // Holders are counted out of the pool's own slots, so the allocation can
-    // never fall under the guarantee on its own. The clamp is what keeps that
-    // true if a caller ever counts differently.
     assert_eq!(cpu_share(TEST_NCPU, 9, 3), 6);
 }
 
 #[test]
 fn the_share_never_drops_below_one_core() {
-    // More holders than cores: the division floors to zero, and cargo rejects
-    // a job count of zero outright.
     assert_eq!(cpu_share(2, 3, 4), 1);
     assert_eq!(cpu_share(1, 1, 8), 1);
     assert_eq!(cpu_share(0, 0, 0), 1);
@@ -554,9 +513,6 @@ fn the_share_never_drops_below_one_core() {
 
 #[test]
 fn a_solo_build_keeps_every_core_and_the_share_falls_as_the_pool_fills() {
-    // Against real locks, which is also what proves a holder counts itself:
-    // the probe opens its own descriptor, so `flock` reports our own slot as
-    // taken rather than free.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 3);
 
@@ -595,8 +551,6 @@ fn a_solo_build_keeps_every_core_and_the_share_falls_as_the_pool_fills() {
 
 #[test]
 fn an_explicit_caller_value_is_left_alone() {
-    // `scripts/lib/e2e.sh` caps its release build at half the cores, after a
-    // host hang. That number is the caller's, so the broker exports nothing.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 3);
     let _held = p.try_acquire("e2e release build").expect("slot");
@@ -608,15 +562,12 @@ fn an_explicit_caller_value_is_left_alone() {
         "opting out of the share is not opting out of the priority"
     );
 
-    // Blank is not a value. `e2e.sh` reads its own variable the same way.
     let blank = p.granted_limits(Some(TEST_NCPU), Some("  "), None, SlotClass::Ordinary);
     assert_eq!(blank.jobs, Some(18));
 }
 
 #[test]
 fn an_unreadable_core_count_exports_nothing() {
-    // Fail open. The build then runs at cargo's own default, exactly as it did
-    // before a slot governed cores at all.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 3);
     let _held = p.try_acquire("holder").expect("slot");
@@ -628,9 +579,6 @@ fn an_unreadable_core_count_exports_nothing() {
 
 #[test]
 fn a_nested_acquisition_is_left_alone() {
-    // `test-engine.sh` runs inside `make test`'s slot. The outer wrapper
-    // already niced that tree and already divided its cores. A second pass
-    // would halve the share again and stack an increment nothing can undo.
     let dir = tempfile::tempdir().unwrap();
     let p = pool(&dir, 3);
     let _held = p.try_acquire("make test").expect("slot");
@@ -673,12 +621,8 @@ fn the_nice_increment_falls_back_rather_than_failing() {
     }
 }
 
-// ── re-entrancy and pool location ───────────────────────────────────────
-
 #[test]
 fn an_inherited_slot_is_read_from_the_environment() {
-    // The value is whatever the wrapper exported; only presence decides that a
-    // nested acquisition passes through.
     assert_eq!(ENV_HELD, "LUCIDOS_BUILD_SLOT_HELD");
     assert!(
         std::env::var(ENV_HELD).is_err() || inherited_slot().is_some(),

@@ -46,6 +46,8 @@ Queued chat requests retain the submitting turn's app, resolved file or reposito
 
 Queued chat dispatch errors release membership only when the exact input and its anchored terminal outcome are durable. Unrecorded or unsettled failures retain membership for recovery. A coding-agent start that the spawn gate parks on the owner's Allow once card completes its entry and sends no recovery notice: the card holds the turn, and Allow resumes the thread outside the queue. For requests with a message identity, startup hands off to thread recovery only after recording that exact input. An existing thread does not prove its follow-up ran. Legacy chat requests without an identity keep the thread-existence fallback.
 
+An admitted sub-thread records its first message at once, so its parent sees it start. The exception is an *event hook* armed on `MessageReceived`. The message then waits for the sub-thread's own turn, which asks the hook first (`system-knowhow/event-hooks`). So the parent's `run_thread` call never waits on a slow hook.
+
 An agent's message to a thread with any open card waits in the executor until the card closes, including the agent's own question (ADR 0803). Only the owner's typed message supersedes that question. A permission card still holds the owner's typed message. The queue reads that card as open by the card slot's own rule, and admits the message when the card closes.
 
 Not gated at all: engine recovery resumes, and mid-flight injections into an

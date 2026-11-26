@@ -1,11 +1,3 @@
-//! A throwaway loopback CA for tests, one per process.
-//!
-//! With the `test-support` feature, [`crate::client`] trusts this CA instead
-//! of the user's. A stand-in listener serves its leaf through
-//! [`server_config`] or [`serve_https`]. So a test exercises the real TLS path
-//! without the user's CA key. The crate-graph gate (ADR 0738) keeps the CA
-//! crate itself out of most test graphs, hence this copy.
-
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
@@ -50,13 +42,10 @@ fn test_ca() -> &'static TestCa {
     })
 }
 
-/// The test CA's certificate, the one root a loopback client trusts here.
 pub fn ca_pem() -> &'static str {
     &test_ca().ca_pem
 }
 
-/// A server config presenting the test leaf for `localhost`, 127.0.0.1 and
-/// ::1, offering h2 and http/1.1.
 pub fn server_config() -> Arc<rustls::ServerConfig> {
     static CONFIG: OnceLock<Arc<rustls::ServerConfig>> = OnceLock::new();
     CONFIG
@@ -76,8 +65,6 @@ pub fn server_config() -> Arc<rustls::ServerConfig> {
         .clone()
 }
 
-/// A stand-in listener serving the test leaf. It runs until the runtime ends
-/// or [`StandIn::abort`] stops it.
 pub struct StandIn {
     pub addr: SocketAddr,
     handle: axum_server::Handle,
@@ -88,14 +75,11 @@ impl StandIn {
         self.addr.port()
     }
 
-    /// Stop serving, dropping every open connection.
     pub fn abort(&self) {
         self.handle.shutdown();
     }
 }
 
-/// Serve `router` over TLS on `listener`, a bound loopback socket, inside the
-/// current runtime.
 pub fn serve_https_on(listener: std::net::TcpListener, router: axum::Router) -> StandIn {
     listener
         .set_nonblocking(true)
@@ -110,7 +94,6 @@ pub fn serve_https_on(listener: std::net::TcpListener, router: axum::Router) -> 
     StandIn { addr, handle }
 }
 
-/// Serve `router` over TLS on a fresh `127.0.0.1` port.
 pub fn serve_https(router: axum::Router) -> StandIn {
     let listener =
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a loopback port");

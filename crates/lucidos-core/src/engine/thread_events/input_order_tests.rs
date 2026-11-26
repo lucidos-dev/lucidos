@@ -1,9 +1,6 @@
-//! A thread's admitted inputs keep the order admission gave them.
-
 use super::*;
 use std::time::Duration;
 
-/// Long enough for a released waiter to run, short enough to keep the suite fast.
 const SETTLE: Duration = Duration::from_millis(50);
 
 fn tails(order: &InputOrder) -> usize {
@@ -100,7 +97,6 @@ async fn turns_run_in_the_order_they_joined() {
     let turns: Vec<InputTurn> = (0..3).map(|_| order.join(thread)).collect();
     let log = Arc::new(Mutex::new(Vec::new()));
 
-    // Started newest first, so any turn that did not wait would log early.
     let mut tasks = Vec::new();
     for (sent, mut turn) in turns.into_iter().enumerate().rev() {
         let log = log.clone();
@@ -128,8 +124,6 @@ async fn a_dropped_turn_releases_its_successor() {
     assert!(is_released(&mut second).await);
 }
 
-/// The second input's task died while it waited. The third must still
-/// wait for the first, or it would overtake it.
 #[tokio::test]
 async fn a_turn_dropped_while_waiting_keeps_the_order() {
     let order = InputOrder::default();
@@ -308,8 +302,6 @@ mod admission {
         .await
         .unwrap();
         assert_eq!(staged, 2);
-        // A later acceptance write fails: neither the chain tail nor its
-        // runtime place may survive the caller's rollback and drop.
         assert!(sqlx::query("SELECT 1/0").execute(&mut *tx).await.is_err());
         tx.rollback().await.unwrap();
         drop(admission);
@@ -355,8 +347,6 @@ mod admission {
             .unwrap()
     }
 
-    /// The straggler of a send the client gave up on reaches the engine after
-    /// the next one. It is refused, and the tail stays where the later one put it.
     #[tokio::test]
     async fn a_straggler_is_refused_after_its_successor() {
         let (pool, db) = setup_test_db().await;
@@ -377,8 +367,6 @@ mod admission {
         teardown_test_db(&db).await;
     }
 
-    /// A quiet retry, or a retry after a restart lost the first attempt, is the
-    /// same input at the same place.
     #[tokio::test]
     async fn the_same_input_is_admitted_again() {
         let (pool, db) = setup_test_db().await;
@@ -432,8 +420,6 @@ mod admission {
         teardown_test_db(&db).await;
     }
 
-    /// An admitted input holds its place: the next one admitted to the thread
-    /// sees it ahead, until it is released.
     #[tokio::test]
     async fn an_admitted_input_holds_its_place_in_the_order() {
         let (pool, db) = setup_test_db().await;
@@ -461,8 +447,6 @@ mod admission {
         teardown_test_db(&db).await;
     }
 
-    /// Admission takes the thread append lock, so it waits for an append in
-    /// progress on the thread. The test holds the lock as the sync point.
     #[tokio::test]
     async fn admission_waits_for_the_thread_append_lock() {
         let (pool, db) = setup_test_db().await;
@@ -487,7 +471,6 @@ mod admission {
                     .map(|admission| is_admitted(&admission))
             })
         };
-        // The sync point: admission is blocked on the held lock.
         loop {
             let waiting: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",

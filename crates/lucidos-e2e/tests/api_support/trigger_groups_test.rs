@@ -1,8 +1,3 @@
-//! E2E coverage for the `/api/v1/trigger-groups` HTTP surface and the trigger
-//! `group_id` field, exercising the engine's in-memory invariants over real
-//! HTTP — unique-name, unknown-id rejection, delete-when-empty, and the
-//! denormalized `member_count` projection.
-
 use crate::support::{base_url, unique_marker, user_client};
 use lucidos_engine::core::prefs;
 use serde_json::json;
@@ -72,7 +67,6 @@ async fn create_rejects_duplicate_name_case_insensitive() {
     let group = create_group(&client, &name, None).await;
     let group_id = group["id"].as_str().unwrap().to_string();
 
-    // Same name, different case — engine must reject as duplicate.
     let upper = name.to_uppercase();
     let resp = client
         .post(format!("{}/api/v1/trigger-groups", base_url()))
@@ -89,23 +83,11 @@ async fn create_rejects_duplicate_name_case_insensitive() {
     delete_group(&client, &group_id).await;
 }
 
-/// Regression: N parallel POSTs with the same group name must produce exactly
-/// one row in the projection. Before the create-path lock was added, two POSTs
-/// could both pass the read-time dedup check and both apply, leaving the
-/// in-memory registry with duplicate `name` values that violate the
-/// unique-name invariant the rest of the system assumes.
 #[tokio::test]
 async fn concurrent_creates_with_same_name_yield_one_group() {
     let client = user_client().await;
-    // Append a uuid so two concurrent test-runner invocations (or rapid
-    // re-runs landing on the same millisecond) can't share the marker and
-    // poison each other's win/conflict counts.
     let name = format!("{}-{}", unique_marker("race-group"), uuid::Uuid::new_v4());
 
-    // 8 racing POSTs is enough to reliably reproduce the bug pre-fix: with
-    // sub-millisecond LAN latency the read-lock dedup window opens for every
-    // request before any of them emits, so multiple inserts land. Holding the
-    // write lock across read + emit + apply makes the dedup atomic.
     let mut tasks = Vec::new();
     for _ in 0..8 {
         let client = client.clone();
@@ -140,8 +122,6 @@ async fn concurrent_creates_with_same_name_yield_one_group() {
     );
     assert_eq!(conflict, 7, "All other POSTs must return 409");
 
-    // Projection must agree: only one group with that name (the api-level
-    // counts above can lie if both writers think they're the winner).
     let listed = list_groups(&client).await;
     let matching: Vec<_> = listed["groups"]
         .as_array()
@@ -165,7 +145,6 @@ async fn concurrent_creates_with_same_name_yield_one_group() {
 #[tokio::test]
 async fn unknown_group_id_on_trigger_create_is_rejected() {
     let client = user_client().await;
-    // Make sure timezone is set so create_trigger doesn't reject for that reason.
     let _ = client
         .put(format!("{}/api/v1/preferences", base_url()))
         .json(&json!({ "key": prefs::TIMEZONE.key(), "value": "UTC" }))
@@ -209,7 +188,6 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
     let group = create_group(&client, &group_name, None).await;
     let group_id = group["id"].as_str().unwrap().to_string();
 
-    // Create a trigger inside the group.
     let trigger_body = json!({
         "name": unique_marker("group-member"),
         "run": { "type": "intent", "intent": "noop" },
@@ -229,11 +207,6 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
         res
     );
 
-    // Find the trigger id via the list endpoint so we can clean up afterwards.
-    // POST /triggers returns once the event is persisted; the list-endpoint
-    // projection is updated asynchronously. Poll briefly so a slow projection
-    // under parallel load (the API e2e suite runs all 145 tests concurrently)
-    // doesn't flake the test before the new row materialises.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let trigger_id = loop {
         let triggers: serde_json::Value = client
@@ -260,8 +233,6 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
 
-    // Member-count badge should reflect the new member. Same projection
-    // race as above — poll until the count catches up.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let listed = list_groups(&client).await;
@@ -282,7 +253,6 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Delete must refuse with 409 + structured body listing the member.
     let resp = delete_group(&client, &group_id).await;
     assert_eq!(resp.status().as_u16(), 409);
     let body: serde_json::Value = resp.json().await.expect("Invalid JSON");
@@ -290,7 +260,6 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
     assert_eq!(body["member_count"], 1);
     assert_eq!(body["member_trigger_ids"][0], trigger_id);
 
-    // Move trigger out of the group via PUT /triggers, then retry delete.
     let resp = client
         .put(format!("{}/api/v1/triggers?id={}", base_url(), trigger_id))
         .json(&json!({ "group_id": null }))
@@ -304,14 +273,6 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
         res
     );
 
-    // Clearing group_id rides the same async projection as the create above:
-    // PUT /triggers returns once the TriggerUpdated event is persisted, but the
-    // in-memory trigger registry the delete handler reads is updated by the
-    // EventBus subscriber asynchronously. Poll the delete until the membership
-    // drop has propagated (204) instead of asserting on the first attempt — a
-    // single shot races the subscriber under parallel load and flakes with 409.
-    // Delete is a safe retry: a 409 emits nothing, so re-issuing is a no-op
-    // until the registry catches up.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let resp = delete_group(&client, &group_id).await;
@@ -327,8 +288,6 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Cleanup: delete the trigger so other tests' /triggers polls aren't
-    // polluted by stale entries.
     let _ = client
         .delete(format!("{}/api/v1/triggers?id={}", base_url(), trigger_id))
         .send()
@@ -343,7 +302,6 @@ async fn reorder_endpoint_updates_panel_order() {
     let a_id = a["id"].as_str().unwrap().to_string();
     let b_id = b["id"].as_str().unwrap().to_string();
 
-    // Flip their order.
     let resp = client
         .post(format!("{}/api/v1/trigger-groups/reorder", base_url()))
         .json(&json!({

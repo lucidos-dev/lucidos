@@ -1,9 +1,5 @@
-//! Parsers for model-specific preferences.
-
 use super::reasoning::EFFORT_LADDER;
 
-/// Parse comma-separated `model=value` pairs, the shape of the per-model
-/// preferences. `unit` names the value in errors, and `parse` reads one value.
 pub(crate) fn parse_model_pairs<'a, T>(
     value: &'a str,
     unit: &str,
@@ -27,7 +23,6 @@ pub(crate) fn parse_model_pairs<'a, T>(
         .collect()
 }
 
-/// Parse `model=tier` pairs, each tier on the ladder.
 pub fn parse_model_efforts(value: &str) -> Result<Vec<(&str, &'static str)>, String> {
     parse_model_pairs(value, "tier", |raw| {
         crate::llm::reasoning::tier(raw)
@@ -35,9 +30,6 @@ pub fn parse_model_efforts(value: &str) -> Result<Vec<(&str, &'static str)>, Str
     })
 }
 
-/// Parse an *intelligence ladder*: `model=effort` rungs in order. Refuses an
-/// empty list, a tier outside `efforts`, and a rung named twice. A `[1m]`
-/// twin is the same rung as its base model.
 pub fn parse_intelligence_ladder<'a>(
     value: &'a str,
     efforts: &'static [&'static str],

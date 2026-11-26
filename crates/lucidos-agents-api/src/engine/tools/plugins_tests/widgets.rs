@@ -1,5 +1,3 @@
-//! Plugin widgets through install and uninstall (ADR 0414).
-
 use super::helpers::*;
 use super::*;
 use crate::engine::event_bus::MockEventBus;
@@ -13,8 +11,6 @@ description = "test"
 
 const WIDGET: &[u8] = br#"{"name": "Board", "kind": "widget", "reusable": true, "origin_plugin_id": "habit-tracker"}"#;
 
-/// Invariant I14: install lands a widget its plugin owns, and uninstall takes
-/// it away with the rest of the plugin.
 #[tokio::test]
 async fn uninstall_removes_the_plugins_widget() {
     let (_tmp, scratch) = fresh_workspace();
@@ -48,11 +44,12 @@ async fn uninstall_removes_the_plugins_widget() {
         plugin_id: "habit-tracker".into(),
         plugin_version: "1.0.0".into(),
         plugin_name: "Habit Tracker".into(),
+        hooks: Vec::new(),
         files_present: write.installed_files,
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, &[], None)
+    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, &[], None, vec![])
         .await
         .expect("uninstall");
     assert!(!scratch.join("data/apps/board").exists());

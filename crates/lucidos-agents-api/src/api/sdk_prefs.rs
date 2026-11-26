@@ -1,4 +1,4 @@
-//! Per-iframe synchronous prefs script — `GET /api/v1/sdk-prefs.js`.
+//! INVARIANT: Per-iframe synchronous prefs script — `GET /api/v1/sdk-prefs.js`.
 //!
 //! Apps opt into FOUC-free theme by adding the script tag *before* their
 //! stylesheet:
@@ -41,23 +41,13 @@ use super::*;
 
 use crate::core::{prefs, PreferenceStore};
 
-/// The appearance FOUC script, built from `packages/lucidos-sdk/src/boot/` into
+/// INVARIANT: The appearance FOUC script, built from `packages/lucidos-sdk/src/boot/` into
 /// the SDK's `dist/`. The app shell inlines the sibling `host` bundle into its
 /// own `<head>`, so the two documents run ONE program. What the bundle says is
 /// tested where it is built, in
 /// `packages/lucidos-sdk/src/boot/iframeBundle.test.ts`.
 static SDK_PREFS_JS: BuiltSdkFile = BuiltSdkFile::new(APPEARANCE_BOOT_FILE);
 
-/// The preference keys an app frame needs before anything async can answer, in
-/// the order the SDK resolves them. The appearance keys paint the first frame.
-/// `text-size` and `font-size` are the pre-grid aliases for `ui-scale`, carried
-/// so this script and the live `ui.applyPreferences` pick the same scale.
-/// `autocorrect` is read by the SDK's field stamp, which must answer before a
-/// field's first focus (ADR 0262). `motion` resolves `data-motion` before the
-/// first frame can animate. `theme-effects` sets `data-theme-effects` before a
-/// theme's glow can paint. [`THEME_RESOLVED_SEED_KEY`] carries the active
-/// theme's resolved token maps, which the engine alone can compute.
-/// [`WORKSPACE_FONT_SEED_KEY`] carries the workspace font `font-family` names.
 const SEED_KEYS: [&str; 11] = [
     prefs::THEME_MODE.key(),
     prefs::FONT_FAMILY.key(),
@@ -74,20 +64,15 @@ const SEED_KEYS: [&str; 11] = [
 
 const THEME_RESOLVED_SEED_KEY: &str = "theme_resolved";
 
-/// Not a preference: the workspace font the device's `font-family` names, as
-/// JSON, so the boot script can register its faces (ADR 0308). The theme's own
-/// workspace fonts ride inside [`THEME_RESOLVED_SEED_KEY`].
 const WORKSPACE_FONT_SEED_KEY: &str = "workspace_font";
 
 const SEED_GLOBAL: &str = "__lucidosPrefs";
 
-/// Query for the prefs script: which device is asking.
 #[derive(Debug, Deserialize)]
 pub(super) struct SdkPrefsQuery {
     device: Option<String>,
 }
 
-/// GET /api/v1/sdk-prefs.js, the synchronous first-paint appearance script.
 pub(super) async fn serve_sdk_prefs_js(
     State(state): State<AppState>,
     Query(query): Query<SdkPrefsQuery>,
@@ -96,8 +81,6 @@ pub(super) async fn serve_sdk_prefs_js(
         return SDK_PREFS_JS.missing();
     };
     let Some(device) = query.device.as_deref() else {
-        // No device named, so the body is the bundle every caller shares and
-        // stays cacheable exactly as it was.
         return (
             [
                 (
@@ -159,9 +142,6 @@ fn with_resolved_theme(
     }
 }
 
-/// Replace whatever sits under [`WORKSPACE_FONT_SEED_KEY`] with the workspace
-/// font the `font-family` preference names. A catalog font or a font that is
-/// not installed seeds nothing.
 fn with_workspace_font(
     prefs: &mut std::collections::HashMap<String, String>,
     data_dir: &std::path::Path,
@@ -186,11 +166,6 @@ fn seeded_script(prefs: &std::collections::HashMap<String, String>, script: &str
     format!("{}{script}", seed_line(prefs))
 }
 
-/// The `window.__lucidosPrefs = {…};` line prepended to the bundle, or an empty
-/// string when nothing is stored.
-///
-/// A BTreeMap so the output is ordered, which lets a test compare the whole
-/// line rather than parse it back.
 fn seed_line(prefs: &std::collections::HashMap<String, String>) -> String {
     let seed: std::collections::BTreeMap<&str, &str> = SEED_KEYS
         .iter()
@@ -210,7 +185,6 @@ fn escape_for_script(json: &str) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-/// Route for the `/sdk-prefs.js` asset.
 pub(super) fn router() -> Router<AppState> {
     Router::new().route("/sdk-prefs.js", get(serve_sdk_prefs_js))
 }
@@ -219,8 +193,6 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    /// A stored preference map. The expected seed lines below spell their keys
-    /// out, because that JSON is the wire format the boot script reads.
     fn stored(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs
             .iter()
@@ -241,8 +213,6 @@ mod tests {
 
     #[test]
     fn the_seed_line_carries_the_autocorrect_switch() {
-        // An isolated frame reads none of the shell's storage, so the seed is
-        // its only synchronous source for the stamp's first value.
         assert_eq!(
             seed_line(&stored(&[(prefs::AUTOCORRECT.key(), "true")])),
             "window.__lucidosPrefs={\"autocorrect\":\"true\"};\n"
@@ -259,8 +229,6 @@ mod tests {
 
     #[test]
     fn the_seed_line_carries_motion() {
-        // Without it an isolated frame paints its first frame from the OS
-        // switch alone, and a device that chose Reduce sees motion.
         assert_eq!(
             seed_line(&stored(&[(prefs::MOTION.key(), "reduce")])),
             "window.__lucidosPrefs={\"motion\":\"reduce\"};\n"
@@ -289,8 +257,6 @@ mod tests {
         assert!(line.contains("theme_resolved"), "{line}");
         assert!(line.contains("--bg-primary"), "{line}");
 
-        // A forged value under the seed key never survives, and the default
-        // theme seeds nothing to apply.
         let mut forged = stored(&[
             (prefs::THEME.key(), "lucidos"),
             ("theme_resolved", "{\"dark\":{}}"),
@@ -317,7 +283,6 @@ mod tests {
         assert!(line.contains("workspace_font"), "{line}");
         assert!(line.contains("fonts/brand/a.woff2"), "{line}");
 
-        // A forged entry never survives, and a font that is gone seeds nothing.
         for pick in ["ws-gone", "fira-code"] {
             let mut forged = stored(&[(prefs::FONT_FAMILY.key(), pick), ("workspace_font", "{}")]);
             with_workspace_font(&mut forged, dir.path());
@@ -332,9 +297,6 @@ mod tests {
 
     #[test]
     fn the_seed_cannot_end_the_script_early() {
-        // `style_overrides` is a map any app may write through
-        // `lucidos.preferences.set`, and it is served as JavaScript. `serde_json`
-        // escapes the quote, so the value stays one string literal.
         let line = seed_line(&stored(&[(
             "style_overrides",
             "{\"--x\":\"\";window.stolen=1;//\"}",
@@ -399,7 +361,6 @@ mod tests {
     mod guard_tests {
         use super::*;
 
-        /// The boot script and the SDK read the seed key this route writes.
         #[test]
         fn the_theme_seed_key_the_sdk_reads_is_the_one_this_route_writes() {
             let source = std::fs::read_to_string(
@@ -413,9 +374,6 @@ mod tests {
             );
         }
 
-        /// The boot script reads the global this route prepends. Two halves of one
-        /// contract in two languages, so a rename on either side has to be a rename
-        /// on both.
         #[test]
         fn the_seed_the_script_reads_is_the_one_this_route_writes() {
             let source = std::fs::read_to_string(

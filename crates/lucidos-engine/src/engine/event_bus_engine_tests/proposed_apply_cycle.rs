@@ -472,40 +472,6 @@ async fn change_applied_persists_device_actor_in_payload() {
     teardown_test_db(&db_name).await;
 }
 
-/// Seed a real pending `changes` row by replaying the production CC lifecycle
-/// (session → aggregate `ChangeProposed`) with a valid-UUID change_id so the
-/// projection's `write_proposed_aggregate` actually inserts the row. The
-/// shared `emit_change_proposed` helper builds a non-UUID id that
-/// `parse_change_id` rejects, so it can't be used when a test needs a real
-/// row to claim. Returns the change_id.
-async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> Uuid {
-    start_cc_session(bus, thread_id, branch, None).await;
-    let change_id = Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::ChangeProposed {
-            content: Default::default(),
-            change_id: change_id.to_string(),
-            description: Some("Fix".into()),
-            files: vec!["src/main.rs".into()],
-            requires_restart: false,
-            origin: None,
-            commit_sha: None,
-            branch_name: branch.into(),
-            repo_root: "/tmp".into(),
-            hardened: false,
-            incomplete: false,
-            set_aside: false,
-            path: String::new(),
-            diff: String::new(),
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-    change_id
-}
-
 /// Two engines on one database each hold their own apply claims, so the claim
 /// cannot stop both from applying one change. The database refuses the second
 /// `ChangeApplied` (ADR 0442).

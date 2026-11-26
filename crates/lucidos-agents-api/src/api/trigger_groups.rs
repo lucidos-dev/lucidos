@@ -1,13 +1,3 @@
-//! HTTP handlers for `/trigger-groups` — CRUD and atomic batch reorder for the
-//! user-visible folder concept that organizes triggers in the panel.
-//!
-//! Groups are first-class, event-sourced, in-memory entities; the engine holds
-//! the registry under `LucidosEngine.trigger_groups` (same Arc the scheduler
-//! shares for replay). These handlers emit `TriggerGroup*` events through
-//! EventBus; the scheduler's subscriber updates the registry, and SSE
-//! consumers see the change live. A reorder applies to the registry inline as
-//! well, so the next `GET` cannot answer with the old order.
-
 use super::*;
 
 use crate::engine::event_bus::SystemEvent;
@@ -21,9 +11,6 @@ pub struct TriggerGroupInfo {
     pub name: String,
     pub order: i32,
     pub created: String,
-    /// Number of triggers whose `group_id` references this group. Computed at
-    /// response time from the in-memory trigger registry — no projection table.
-    /// The panel uses it to show the "(N)" badge on each section header.
     pub member_count: usize,
 }
 
@@ -35,8 +22,6 @@ pub struct TriggerGroupsListResponse {
 #[derive(Deserialize)]
 pub struct CreateTriggerGroupRequest {
     pub name: String,
-    /// Optional sort position; defaults to `max(existing.order) + 10` so a
-    /// fresh group sinks to the bottom without renumbering anything.
     #[serde(default)]
     pub order: Option<i32>,
 }
@@ -65,9 +50,6 @@ pub(super) struct TriggerGroupIdQuery {
     id: String,
 }
 
-/// Body returned by `DELETE /api/v1/trigger-groups?id=` when the group still has
-/// member triggers. The LLM reads `member_count` and `member_trigger_ids` to
-/// self-correct (move or delete the members first, then retry).
 #[derive(Serialize)]
 struct DeleteBlockedResponse {
     error: &'static str,
@@ -125,7 +107,6 @@ fn member_trigger_ids(state: &AppState, group_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// `GET /api/v1/trigger-groups`: groups sorted by `order` asc, `created` asc.
 pub(super) async fn list_trigger_groups(
     State(state): State<AppState>,
 ) -> Json<TriggerGroupsListResponse> {
@@ -146,8 +127,6 @@ pub(super) fn read_trigger_groups(state: &AppState) -> TriggerGroupsListResponse
     TriggerGroupsListResponse { groups }
 }
 
-/// `POST /api/v1/trigger-groups`: create a group. Rejects empty and duplicate
-/// names.
 pub(super) async fn create_trigger_group(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -192,7 +171,7 @@ pub(super) async fn create_trigger_group(
     }
 }
 
-/// `PUT /api/v1/trigger-groups?id=`: partial update of name and/or order.
+/// INVARIANT: `PUT /api/v1/trigger-groups?id=`: partial update of name and/or order.
 ///
 /// Rename goes through the serialized helper, so the unique-name invariant
 /// survives a parallel rename or create against the same target name. Reorder
@@ -404,10 +383,6 @@ pub(super) async fn reorder_trigger_groups(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Routes for the `/trigger-groups*` surface — user-visible folders that
-/// organize triggers in the panel. Pure label, no firing. The reorder
-/// endpoint is a batch op so the panel can persist a drag-to-reorder with
-/// one round-trip.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -438,9 +413,6 @@ mod tests {
         Arc::new(RwLock::new(projection))
     }
 
-    /// Read-your-writes. The single-group `PUT` used to emit and stop there. A
-    /// `GET` right after it could still answer the pre-move order, and the
-    /// panel re-rendered the group where it started.
     #[tokio::test]
     async fn a_single_group_reorder_reaches_the_registry() {
         let (pool, db_name) = setup_test_db().await;

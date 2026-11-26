@@ -1,20 +1,3 @@
-//! `lucidos data write` resolves the PARENT workspace and hands the content to
-//! that workspace's engine.
-//!
-//! Originally this asserted the file landed at `<parent>/data/artifacts/...`
-//! after a direct `std::fs::write`. That write announced nothing: no
-//! `DataFileWritten`, no `Artifact*`, no git commit, so a file written this way
-//! was invisible to the Files panel, the memory index and `on_event` triggers,
-//! and the chat link the command prints reloaded the whole workspace on click
-//! (the artifact rewriter could not resolve a path the cache had never heard
-//! of). The write now goes through the engine's `PUT /api/v1/data/*path`, the
-//! announced write path (ADR 0032).
-//!
-//! So the parent-resolution invariant is asserted where it now lives: the
-//! REQUEST. The port comes from the parent's `.lucidos/ports` and the path is
-//! the normalized store path, neither of which a worktree-rooted resolution
-//! could produce.
-
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -29,15 +12,11 @@ use axum::Router;
 
 const LUCIDOS: &str = env!("CARGO_BIN_EXE_lucidos");
 
-/// One captured `PUT /api/v1/data/*path`.
 struct Captured {
     path: String,
     body: Vec<u8>,
 }
 
-/// A stub engine that answers the data-write route. Returns the bound port and
-/// a receiver the test drains after running the CLI. `status` is what the stub
-/// answers with, so the failure path can be driven too.
 fn spawn_stub_engine(status: StatusCode) -> (u16, Receiver<Captured>) {
     let body = if status.is_success() {
         r#"{"success":true}"#
@@ -47,7 +26,6 @@ fn spawn_stub_engine(status: StatusCode) -> (u16, Receiver<Captured>) {
     spawn_stub_engine_replying(status, body)
 }
 
-/// [`spawn_stub_engine`] with a chosen response body.
 fn spawn_stub_engine_replying(status: StatusCode, body: &'static str) -> (u16, Receiver<Captured>) {
     let (tx, rx) = mpsc::channel();
     let tx = Arc::new(Mutex::new(tx));
@@ -96,8 +74,6 @@ async fn capture(
 fn write_ports(workspace: &std::path::Path, port: u16) {
     let lucidos = workspace.join(".lucidos");
     fs::create_dir_all(&lucidos).unwrap();
-    // `http` so the CLI's blocking client talks plain HTTP to the stub, which
-    // serves no TLS. A real engine writes `PROTO=https` here in dev.
     fs::write(
         lucidos.join("ports"),
         format!("API_PORT={}\nVITE_PORT={}\nPROTO=http\n", port, port),
@@ -113,8 +89,6 @@ fn write_from_worktree_targets_the_parent_workspace_engine() {
     let workspace = tmp.path().join("ws");
     write_ports(&workspace, port);
 
-    // Mirror the engine's worktree layout so the walk-up logic gets exercised
-    // exactly the way it would at runtime.
     let worktree = workspace.join(".lucidos/worktrees/abc123");
     fs::create_dir_all(&worktree).unwrap();
 
@@ -136,25 +110,17 @@ fn write_from_worktree_targets_the_parent_workspace_engine() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // The write reached the PARENT workspace's engine (its port, from its
-    // ports file) at the normalized store path. A worktree-rooted resolution
-    // could produce neither.
     let req = requests
         .recv()
         .expect("engine must have received the write");
     assert_eq!(req.path, "artifacts/ua/test.txt");
     assert_eq!(req.body, b"hello world");
 
-    // stdout carries the ready-to-paste clickable chat link: basename label,
-    // bare store-path target (no scheme, since a scheme would dead-end on
-    // click). Unchanged by the move to HTTP.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "[test.txt](artifacts/ua/test.txt)"
     );
 
-    // stderr carries the resolved absolute path under the PARENT workspace, so
-    // `… 2>/tmp/path` keeps working.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.trim().ends_with("ws/data/artifacts/ua/test.txt"),
@@ -170,9 +136,6 @@ fn write_from_worktree_targets_the_parent_workspace_engine() {
     );
 }
 
-/// An agent saved a picture, told the user "I've drawn out the options", and
-/// pasted no image line. Saving a picture must say it is not shown yet, while
-/// stdout stays the paste-ready line and the path stays stderr's last line.
 #[test]
 fn write_of_a_picture_says_the_user_cannot_see_it_yet() {
     let (port, _requests) = spawn_stub_engine(StatusCode::OK);
@@ -227,7 +190,6 @@ fn write_falls_back_to_env_when_pwd_outside_workspace() {
     let workspace = tmp.path().join("ws");
     write_ports(&workspace, port);
 
-    // PWD is unrelated to the workspace. Resolution must fall through to env.
     let unrelated = tmp.path().join("elsewhere");
     fs::create_dir_all(&unrelated).unwrap();
 
@@ -267,8 +229,6 @@ fn write_normalizes_and_encodes_the_request_path() {
     let src = tmp.path().join("input.txt");
     fs::write(&src, b"data").unwrap();
 
-    // A loose name gets the `artifacts/` prefix, and a space in the filename
-    // must survive the URL round-trip rather than producing an invalid URL.
     let out = Command::new(LUCIDOS)
         .args(["data", "write", "quarterly report.md", "--from"])
         .arg(&src)
@@ -283,12 +243,10 @@ fn write_normalizes_and_encodes_the_request_path() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Axum percent-decodes, so the engine sees the original name back.
     let req = requests
         .recv()
         .expect("engine must have received the write");
     assert_eq!(req.path, "artifacts/quarterly report.md");
-    // Markdown ends a bare target at the space, so the link is bracketed.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "[quarterly report.md](<artifacts/quarterly report.md>)"
@@ -319,8 +277,6 @@ fn write_fails_loudly_when_the_engine_rejects_it() {
         !out.status.success(),
         "a rejected write must exit non-zero, got success"
     );
-    // No chat link for a write that did not land: printing one would hand the
-    // agent a link to a file the workspace does not have.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "",
@@ -335,13 +291,9 @@ fn write_fails_loudly_when_the_engine_rejects_it() {
         stderr.contains("disk on fire"),
         "stderr must carry the engine's message, got: {stderr}"
     );
-    // The request really was attempted (the failure is the engine's answer, not
-    // the CLI declining to try).
     assert!(requests.recv().is_ok());
 }
 
-/// Run `lucidos data write <path>` against the workspace, with `content` on
-/// stdin, the way `system-knowhow/themes/switch-themes.md` § "Make a theme" documents it.
 fn data_write_from_stdin(workspace: &std::path::Path, path: &str, content: &str) -> Output {
     let mut child = Command::new(LUCIDOS)
         .args(["data", "write", path])
@@ -362,8 +314,6 @@ fn data_write_from_stdin(workspace: &std::path::Path, path: &str, content: &str)
     child.wait_with_output().expect("lucidos should exit")
 }
 
-/// A theme under `artifacts/themes/` is a file the themes platform never reads,
-/// and the engine checks theme rules only under `themes/`.
 #[test]
 fn the_documented_theme_command_writes_under_themes() {
     let (port, requests) = spawn_stub_engine(StatusCode::OK);
@@ -398,7 +348,6 @@ fn the_documented_theme_command_writes_under_themes() {
 
 #[test]
 fn a_refused_theme_exits_non_zero_with_the_engines_reason() {
-    // The body `write_data` answers for a theme that breaks a rule.
     const REFUSAL: &str = r#"{"error":"`dark`: the value of --accent is empty, longer than 256 characters, or uses a banned form (url(), ;, braces, @, backslash, a comment)"}"#;
     let (port, requests) = spawn_stub_engine_replying(StatusCode::UNPROCESSABLE_ENTITY, REFUSAL);
 
@@ -427,7 +376,6 @@ fn a_refused_theme_exits_non_zero_with_the_engines_reason() {
 
 #[test]
 fn write_reports_an_unreachable_engine_actionably() {
-    // Bind then drop to get a port nothing is listening on.
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let p = l.local_addr().unwrap().port();
@@ -468,8 +416,6 @@ fn data_path_prints_resolved_path_with_normalization() {
     let worktree = workspace.join(".lucidos/worktrees/foo");
     fs::create_dir_all(&worktree).unwrap();
 
-    // Loose name → prefixed with artifacts/. `data path` is a pure local path
-    // helper: it contacts no engine, so the dead port above is fine.
     let out = Command::new(LUCIDOS)
         .args(["data", "path", "report.html"])
         .current_dir(&worktree)
@@ -480,9 +426,6 @@ fn data_path_prints_resolved_path_with_normalization() {
     assert!(out.status.success());
     let printed = String::from_utf8(out.stdout).unwrap();
     let printed = printed.trim();
-    // macOS symlinks /var → /private/var, so the child's current_dir() resolves
-    // through the symlink. Canonicalize the workspace root and assert the
-    // printed path ends with the right suffix relative to it.
     let ws_canon = fs::canonicalize(&workspace).unwrap();
     let expected = ws_canon.join("data/artifacts/report.html");
     assert_eq!(std::path::PathBuf::from(printed), expected);

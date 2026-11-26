@@ -1,6 +1,3 @@
-//! A side question is a card beside the thread, never a turn (ADR 0320). Its
-//! four events persist and change no column of the thread's summary row.
-
 use super::super::*;
 use super::*;
 
@@ -106,9 +103,6 @@ async fn a_side_question_changes_no_column_of_an_archived_idle_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// The boot sweep re-fires a completion card that is the parent's last word.
-/// A side question after it is no reaction to the child, so the card stays
-/// unprocessed and is re-fired.
 #[tokio::test]
 async fn a_side_question_does_not_hide_an_unprocessed_card_from_the_boot_sweep() {
     let (pool, db_name) = setup_test_db().await;

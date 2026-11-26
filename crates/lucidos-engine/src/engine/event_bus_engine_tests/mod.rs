@@ -10,7 +10,7 @@ pub use crate::engine::thread_events::{
 };
 pub use crate::engine::thread_lifecycle::CodingAgentChangeState;
 pub use crate::test_support::{
-    read_change_state, setup_test_db, start_cc_session, teardown_test_db,
+    read_change_state, seed_pending_change, setup_test_db, start_cc_session, teardown_test_db,
     wait_until_blocked_on_locks,
 };
 use chrono::Utc;

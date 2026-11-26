@@ -42,7 +42,6 @@ fn domain_event_to_payload_skips_actor_when_none() {
 
 #[test]
 fn domain_event_to_payload_with_api_actor_keeps_mode_and_user_agent() {
-    // Smoke check that non-device actor variants survive the merge.
     let evt = SystemEvent::DomainEvent {
         event_type: "Test".into(),
         payload: serde_json::json!({"x": 1}),
@@ -63,9 +62,6 @@ fn domain_event_to_payload_with_api_actor_keeps_mode_and_user_agent() {
 
 #[test]
 fn presence_check_serializes_with_type_tag() {
-    // Wire shape consumed by the page's PresenceCheck handler
-    // (crates/lucidos-app/src/store/actions/presence-pong.ts). It carries the
-    // toast, so a page can act on it before it answers (system-knowhow/notifications/3-the-presencecheck-protocol.md §3).
     let nid = Uuid::nil();
     let tid = Uuid::nil();
     let e = SystemEvent::PresenceCheck {
@@ -89,9 +85,7 @@ fn presence_check_serializes_with_type_tag() {
     assert_eq!(json["data"]["thread_id"], tid.to_string());
     assert_eq!(json["data"]["deadline_ms"], 250);
     assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
-    // Tap::Modal is the serde default: present and shaped {"kind":"modal"}.
     assert_eq!(json["data"]["tap"], serde_json::json!({"kind": "modal"}));
-    // None optionals stay omitted.
     assert!(json["data"].get("event_id").is_none());
     assert!(json["data"].get("app_id").is_none());
     assert!(json["data"].get("actor").is_none());
@@ -100,7 +94,6 @@ fn presence_check_serializes_with_type_tag() {
 
 #[test]
 fn presence_check_is_transient_not_persisted() {
-    // Spec §3 — PresenceCheck is broadcast, never written to events.
     let e = SystemEvent::PresenceCheck {
         notification_id: Uuid::nil(),
         title: String::new(),
@@ -121,10 +114,6 @@ fn presence_check_is_transient_not_persisted() {
 
 #[test]
 fn native_push_requested_serializes_with_type_tag() {
-    // §4 native desktop surface trigger — emitted on the push-ALLOWED branch
-    // so a connected Tauri app shows a native macOS banner. Carries the same
-    // toast content as PresenceCheck, consumed by the native-push handler.
-    // `sent_at_ms` drives the page-side freshness gate.
     let nid = Uuid::nil();
     let tid = Uuid::nil();
     let e = SystemEvent::NativePushRequested {
@@ -148,14 +137,11 @@ fn native_push_requested_serializes_with_type_tag() {
     assert_eq!(json["data"]["tap"], serde_json::json!({"kind": "modal"}));
     assert!(json["data"].get("event_id").is_none());
     assert!(json["data"].get("app_id").is_none());
-    // No audience means every device, so the field stays off the wire.
     assert!(json["data"].get("audience").is_none());
 }
 
 #[test]
 fn native_push_requested_is_transient_on_notification_aggregate() {
-    // Transient UI signal: broadcast to SSE, never written to events. Lives on
-    // the `notification` aggregate alongside NotificationCreated and Read.
     let e = SystemEvent::NativePushRequested {
         notification_id: Uuid::nil(),
         title: String::new(),
@@ -175,10 +161,6 @@ fn native_push_requested_is_transient_on_notification_aggregate() {
 
 #[test]
 fn frontend_update_deferred_is_transient_on_engine_aggregate() {
-    // Transient UI hint — broadcast to SSE, never written to events. Emitted
-    // when a frontend-only Apply's served-client advance is deferred because an
-    // engine version change is pending (INV-A); the page renders a keyed toast.
-    // Lives on the `engine` aggregate alongside EngineSupervisorRespawned.
     let e = SystemEvent::FrontendUpdateDeferred {
         sent_at_ms: 1_700_000_000_000,
     };
@@ -186,7 +168,6 @@ fn frontend_update_deferred_is_transient_on_engine_aggregate() {
     assert_eq!(e.aggregate(), "engine");
     assert_eq!(e.event_type(), "FrontendUpdateDeferred");
     assert_eq!(e.aggregate_id(), "global");
-    // Standard SystemEvent wire shape: `{type, data:{sent_at_ms}}`.
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["type"], "FrontendUpdateDeferred");
     assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
@@ -194,9 +175,6 @@ fn frontend_update_deferred_is_transient_on_engine_aggregate() {
 
 #[test]
 fn frontend_update_stranded_is_transient_on_engine_aggregate() {
-    // Sibling of FrontendUpdateDeferred, and deliberately NOT the same event: a
-    // stranded Apply is never arriving, so it must not reuse a message that
-    // promises "on Switch". Transient, `engine` aggregate, same wire shape.
     let e = SystemEvent::FrontendUpdateStranded {
         served_dir: "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist".into(),
         served_in_worktree: true,
@@ -210,23 +188,17 @@ fn frontend_update_stranded_is_transient_on_engine_aggregate() {
     assert_eq!(e.aggregate_id(), "global");
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["type"], "FrontendUpdateStranded");
-    // The page needs BOTH the path and the cause flag to give correct advice.
     assert_eq!(
         json["data"]["served_dir"],
         "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist"
     );
     assert_eq!(json["data"]["served_in_worktree"], true);
     assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
-    // Omitted rather than null when the build-watch said nothing, so a client
-    // that never heard of the field sees exactly the body it always did.
     assert!(json["data"].get("build_error").is_none());
 }
 
 #[test]
 fn a_failing_build_rides_along_with_the_stranded_signal() {
-    // The other way an Apply strands. Until this field existed the message
-    // could only ask "is the build-watch running?", while the real answer sat
-    // in a log file nobody reads.
     let e = SystemEvent::FrontendUpdateStranded {
         served_dir: "/w/dev/crates/lucidos-app/dist".into(),
         served_in_worktree: false,
@@ -243,9 +215,6 @@ fn a_failing_build_rides_along_with_the_stranded_signal() {
 
 #[test]
 fn a_stopped_build_watch_rides_along_with_the_stranded_signal() {
-    // The third way an Apply strands, and the one the status file cannot
-    // report: a watch that died leaves its last healthy build behind, so the
-    // engine saw no error and called the wait recoverable.
     let e = SystemEvent::FrontendUpdateStranded {
         served_dir: "/w/dev/crates/lucidos-app/dist".into(),
         served_in_worktree: false,
@@ -256,10 +225,6 @@ fn a_stopped_build_watch_rides_along_with_the_stranded_signal() {
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["data"]["build_watch_stopped"], true);
 
-    // Always serialized, unlike `build_error`. A bool that vanishes when false
-    // reads exactly like one an older engine never sent. The page has to treat
-    // those two the same way regardless, so there is nothing to save by hiding
-    // it.
     let running = SystemEvent::FrontendUpdateStranded {
         served_dir: "/w/dev/crates/lucidos-app/dist".into(),
         served_in_worktree: false,
@@ -273,11 +238,6 @@ fn a_stopped_build_watch_rides_along_with_the_stranded_signal() {
 
 #[test]
 fn served_frontend_advanced_is_transient_on_engine_aggregate() {
-    // Transient UI signal — broadcast to SSE, never written to events. Emitted
-    // when a dev engine advances its served-frontend snapshot to the shared dist/
-    // after a PEER workspace's frontend-only Apply (INV-A-gated). The connected
-    // client re-runs syncClientUpdateFromBuild. Lives on the `engine` aggregate
-    // alongside FrontendUpdateDeferred.
     let e = SystemEvent::ServedFrontendAdvanced {
         sent_at_ms: 1_700_000_000_000,
     };
@@ -285,7 +245,6 @@ fn served_frontend_advanced_is_transient_on_engine_aggregate() {
     assert_eq!(e.aggregate(), "engine");
     assert_eq!(e.event_type(), "ServedFrontendAdvanced");
     assert_eq!(e.aggregate_id(), "global");
-    // Standard SystemEvent wire shape: `{type, data:{sent_at_ms}}`.
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["type"], "ServedFrontendAdvanced");
     assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
@@ -293,10 +252,6 @@ fn served_frontend_advanced_is_transient_on_engine_aggregate() {
 
 #[test]
 fn frontend_preview_events_are_transient_and_keyed_by_thread() {
-    // Transient UI signals for the supervised Vite dev server showing a
-    // coding-agent worktree (engine::frontend_preview). On the `engine`
-    // aggregate alongside ServedFrontendAdvanced, but UNLIKE its neighbours they
-    // are keyed by thread: one preview per thread, one slot at a time.
     let thread_id = uuid::Uuid::parse_str("2951200f-0652-4ee2-baa3-433d608983d8").unwrap();
     let started = SystemEvent::FrontendPreviewStarted {
         thread_id,
@@ -313,8 +268,6 @@ fn frontend_preview_events_are_transient_and_keyed_by_thread() {
     assert_eq!(json["data"]["port"], 6173);
     assert_eq!(json["data"]["loopback_only"], true);
     assert_eq!(json["data"]["thread_id"], thread_id.to_string());
-    // The port travels, never a URL: only the page knows whether the user is on
-    // localhost or a Tailscale name, so it composes the href itself.
     assert!(
         json["data"].get("url").is_none(),
         "the event must not carry a URL the engine cannot know"
@@ -336,11 +289,6 @@ fn frontend_preview_events_are_transient_and_keyed_by_thread() {
 
 #[test]
 fn engine_build_state_changed_is_transient_on_engine_aggregate() {
-    // Transient UI POKE — broadcast to SSE, never written to events. Emitted on
-    // every dev background-rebuild state transition so the connected client learns
-    // of a build over the live stream instead of the throttled version-status
-    // poll. The page handler re-runs the authoritative checkEngineVersion GET.
-    // Lives on the `engine` aggregate alongside ServedFrontendAdvanced.
     let e = SystemEvent::EngineBuildStateChanged {
         state: "building".to_string(),
         sent_at_ms: 1_700_000_000_000,
@@ -349,7 +297,6 @@ fn engine_build_state_changed_is_transient_on_engine_aggregate() {
     assert_eq!(e.aggregate(), "engine");
     assert_eq!(e.event_type(), "EngineBuildStateChanged");
     assert_eq!(e.aggregate_id(), "global");
-    // Standard SystemEvent wire shape: `{type, data:{state, sent_at_ms}}`.
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["type"], "EngineBuildStateChanged");
     assert_eq!(json["data"]["state"], "building");
@@ -358,8 +305,6 @@ fn engine_build_state_changed_is_transient_on_engine_aggregate() {
 
 #[test]
 fn frontend_refresh_state_changed_is_transient_on_engine_aggregate() {
-    // The frontend twin of EngineBuildStateChanged: a pure poke, so the page
-    // re-reads version-status for `frontend_refresh_elapsed_ms`.
     let e = SystemEvent::FrontendRefreshStateChanged {
         sent_at_ms: 1_700_000_000_000,
     };
@@ -389,9 +334,6 @@ fn frontend_build_watch_state_changed_is_transient_on_engine_aggregate() {
 
 #[test]
 fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
-    // Transient cross-device dismiss signal — broadcast to SSE, never written to
-    // events. `Some(id)` removes one delivered native banner on connected Tauri
-    // apps; `None` removes all. Lives on the `notification` aggregate.
     let one = SystemEvent::NativePushDismissRequested {
         notification_id: Some(Uuid::nil()),
         sent_at_ms: 0,
@@ -408,10 +350,8 @@ fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
         audience: None,
     };
     assert!(!all.is_persisted());
-    // `None` (dismiss-all) keys on the sentinel "all" rather than a single id.
     assert_eq!(all.aggregate_id(), "all");
 
-    // Wire shape: `None` omits the field; `Some` carries it.
     let json_all = serde_json::to_value(&all).unwrap();
     assert_eq!(json_all["type"], "NativePushDismissRequested");
     assert!(json_all["data"].get("notification_id").is_none());
@@ -424,10 +364,6 @@ fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
     );
 }
 
-/// `PERSISTED_TYPE_NAMES` is the one list behind both `is_persisted` and
-/// `is_persisted_type_name`, so a typo in it silently stops an event being
-/// written. Every entry must be a real wire name, which `RESERVED_TYPE_NAMES`
-/// already enumerates and `reserved_type_names_match_event_type` already pins.
 #[test]
 fn every_persisted_name_is_a_real_reserved_name() {
     for name in SystemEvent::PERSISTED_TYPE_NAMES {
@@ -446,9 +382,6 @@ fn persisted_type_names_holds_no_duplicates() {
     }
 }
 
-/// `DomainEvent` is a transport variant: no row is ever stored under that
-/// literal name, so nothing may wait on it. Its persistence is decided by the
-/// `transient` field instead, which is the one field-dependent answer.
 #[test]
 fn domain_event_is_not_a_persisted_name_but_a_persisted_event() {
     assert!(!SystemEvent::is_persisted_type_name("DomainEvent"));
@@ -472,8 +405,6 @@ fn domain_event_is_not_a_persisted_name_but_a_persisted_event() {
     assert!(!ephemeral.is_persisted());
 }
 
-/// The subscribe side reads the same answer as the write side. A backup
-/// completion is a durable fact, its progress tick is a UI frame.
 #[test]
 fn the_name_keyed_predicate_agrees_with_the_event_keyed_one() {
     assert!(SystemEvent::is_persisted_type_name("BackupCompleted"));
@@ -483,8 +414,6 @@ fn the_name_keyed_predicate_agrees_with_the_event_keyed_one() {
     assert!(!SystemEvent::is_persisted_type_name("NotAnEventAtAll"));
 }
 
-/// A lag replay reads an artifact write back from its row, so the stored
-/// payload must give back the event that wrote it.
 #[test]
 fn a_default_shaped_row_gives_back_its_event() {
     let written = SystemEvent::ArtifactCreated {
@@ -492,7 +421,7 @@ fn a_default_shaped_row_gives_back_its_event() {
         commit: "abc123".into(),
         source: Some("chat".into()),
         writer_thread_id: Some(uuid::Uuid::new_v4()),
-        writer: None, // Legacy event fixture.
+        writer: None,
     };
     let read = SystemEvent::from_stored(written.to_payload()).expect("round trip");
     assert_eq!(
@@ -501,7 +430,6 @@ fn a_default_shaped_row_gives_back_its_event() {
     );
 }
 
-/// A trigger row stores its raw payload, so it does not read back as typed.
 #[test]
 fn a_bespoke_row_is_refused_rather_than_misread() {
     let trigger = SystemEvent::TriggerExecuted {

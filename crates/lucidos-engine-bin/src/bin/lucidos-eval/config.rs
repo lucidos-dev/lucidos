@@ -1,29 +1,3 @@
-//! Load and validate the checked-in fixture: tasks, facts, probes, completion
-//! probes, answers and prices.
-//!
-//! Everything the measurement depends on is a file, and every file is hashed
-//! onto the result rows. `fixture_hash` covers the five that define what is
-//! measured, so a run with an edited probe is distinguishable from a run with
-//! revised guidance (I6).
-//!
-//! One validation rule is newer than the rest and is the reason this file has a
-//! banned-token list. ADR 0110 decision 5: no criterion may name an internal of
-//! the context mode. It is checked rather than remembered, because ADR 0087
-//! wrote the same rule down and eleven probes still shipped scoring a spelling.
-//!
-//! Validation is strict and runs before anything is seeded. A probe naming a
-//! missing fact is a broken measurement, and so is one carrying both an
-//! assertion and a judge flag. Finding either mid-run would void a repeat.
-//!
-//! Every table below denies an unknown key. A misspelled one would otherwise
-//! deserialize to its default, silently, and `fixture_hash` would then stamp a
-//! measurement nobody wrote as the pre-registered one.
-//!
-//! One exception, and it is the gap worth knowing about. [`Assertion`] is an
-//! internally tagged enum. The attribute is not safe to add there unverified,
-//! so a misspelled key inside an `assert` block still defaults in silence.
-//! Tracked as `harden-0819-eval-assertion-unknown-keys` in the work tracker.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -35,11 +9,8 @@ use crate::assertions::Assertion;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The seed tree, relative to the fixture root. The harness copies it over the
-/// arm's `data/`, so a path in it is a path an assertion reads.
 pub const SEED_TREE: &str = "fixtures/workspace";
 
-/// The files `fixture_hash` covers, in the order it hashes them.
 pub const HASHED_FIXTURE_FILES: [&str; 5] = [
     "tasks.toml",
     "facts.toml",
@@ -51,8 +22,6 @@ pub const HASHED_FIXTURE_FILES: [&str; 5] = [
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TasksFile {
-    /// Appended to every prompt in both arms. See the file's own header for
-    /// why it is central rather than repeated per task.
     pub scope_rule: String,
     pub task: Vec<Task>,
 }
@@ -62,25 +31,12 @@ pub struct TasksFile {
 pub struct Task {
     pub id: String,
     pub title: String,
-    /// Sent verbatim, with `{marker}` replaced per run.
     pub prompt: String,
-    /// The whole task's budget, both turns of a two-turn task included.
     pub timeout_minutes: u64,
-    /// A second user message, sent into the same thread once turn one has
-    /// genuinely finished.
-    ///
-    /// It is what makes a task measure a turn boundary. The engine trims
-    /// context between turns by dropping history from the oldest end, and it
-    /// says nothing when it does. What survives into turn two is the question.
-    /// The driver holds the follow-up back until turn one is idle and holds no
-    /// event wait. Posted mid-round it would blur the two turns into one.
     #[serde(default)]
     pub followup: Option<String>,
-    /// Tasks whose failure voids this one's probes. Transitively closed by
-    /// [`TaskGraph`], so a task names only its direct dependencies.
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Checked before the task is sent. A failure voids the task itself.
     #[serde(default)]
     pub preconditions: Vec<Assertion>,
 }
@@ -90,20 +46,10 @@ impl Task {
         std::time::Duration::from_secs(self.timeout_minutes * 60)
     }
 
-    /// The prompt with its run marker substituted and the scope rule appended.
-    ///
-    /// One place, so the rule cannot drift per task. It goes last, because a
-    /// standing instruction ahead of the request would read as part of it.
     pub fn rendered_prompt(&self, marker: &str, scope_rule: &str) -> String {
         render(&self.prompt, marker, scope_rule)
     }
 
-    /// The follow-up, rendered exactly as the first prompt is.
-    ///
-    /// The scope rule goes on both turns rather than on turn one alone. The
-    /// cross-turn trim drops the oldest history first. So a rule carried only
-    /// by turn one is a rule the context ceiling can take away, in one arm and
-    /// not the other. That is the asymmetry the central rule exists to prevent.
     pub fn rendered_followup(&self, marker: &str, scope_rule: &str) -> Option<String> {
         self.followup
             .as_deref()
@@ -130,37 +76,15 @@ pub struct FactsFile {
 pub struct Fact {
     pub id: String,
     pub statement: String,
-    /// The register's canonical tier. A probe may override it, since
-    /// one fact is tier 4 in the turn that states it and tier 3 afterwards.
     pub tier: u8,
     pub established_in: String,
-    /// How the establishing task puts the fact in front of the model.
-    ///
-    /// Validation reads it to pick the haystack, so a probed fact nobody
-    /// states is refused rather than run.
     #[serde(default)]
     pub established_by: Established,
-    /// What counts as stating the fact, with its specific value, in T12's
-    /// handover. This is the primary endpoint's whole definition.
     pub census_regex: String,
-    /// The loose form of the fact, read to prove the establishing task said it.
-    ///
-    /// A prompt states the fact, and `census_regex` wants the exact value the
-    /// model works out from it. T02 lists eight builds and never says 37.5%, so
-    /// the strict regex would refuse a fact the prompt plainly establishes.
     pub stated_regex: String,
-    /// What an `ask_user_question` must be about for the `asked` outcome.
     pub topic_regex: String,
 }
 
-/// The route by which a fact reaches the model in the task that establishes it.
-///
-/// Four routes, and the register declares which one. `Prompt` is the common
-/// case and the default. `Answer` is a scripted reply to `ask_user_question`,
-/// so the fact arrives mid-thread. `Work` is a fact the thread establishes by
-/// doing the task at all, such as a script failing or an event being emitted.
-/// `Seed` is a fact written in a seeded document, which the task asks the agent
-/// to read: no prompt states it, and unlike `Work` there is text to check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Established {
@@ -183,23 +107,15 @@ pub struct ProbesFile {
 pub struct Probe {
     pub id: String,
     pub task: String,
-    /// `None` for the probes that measure behaviour rather than a fact.
     #[serde(default)]
     pub fact: Option<String>,
     #[serde(default)]
     pub tier: Option<u8>,
-    /// The tempting alternative an agent without the fact reaches for. Prose,
-    /// recorded so a reader can tell a probe from a loudness test.
     pub wrong_default: String,
     #[serde(default)]
     pub assert: Option<Assertion>,
-    /// Names a rubric in `[judge.rubric]`. Mutually exclusive with `assert`.
     #[serde(default)]
     pub judge: Option<String>,
-    /// Which judge answer counts as this probe passing.
-    ///
-    /// A rubric asks one question, and the probe says which answer it wants.
-    /// P05.5 asks whether an intent carries procedure, and passes on `no`.
     #[serde(default)]
     pub judge_passes_when: JudgeAnswer,
 }
@@ -210,33 +126,14 @@ pub struct CompletionFile {
     pub completion: Vec<CompletionProbe>,
 }
 
-/// One task's completion probe: did the job get done.
-///
-/// Deliberately NOT a [`Probe`]. A probe asks whether the agent still knew a
-/// fact, which measures the mode. This asks whether the deliverable exists and
-/// is right, which measures the agent. The missing fields are the point: no
-/// `fact` and no `tier`, so a completion outcome cannot
-/// reach a retention rate or the tier breakdown.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompletionProbe {
     pub id: String,
     pub task: String,
-    /// What the task's deliverable IS, in the task's own terms.
-    ///
-    /// Stands where a probe's `wrong_default` stands, and for the same reason:
-    /// a scorer nobody can read is a scorer nobody can check. There is no
-    /// tempting wrong answer to name here, so this names the right one.
     pub deliverable: String,
     #[serde(default)]
     pub assert: Option<Assertion>,
-    /// Accepted so the refusal can explain itself, and never scored.
-    ///
-    /// A judged probe is scored by `score`, after the run. A completion probe
-    /// is scored the moment its own task ends, because every later task
-    /// rewrites the tree. Nothing can be both, so this is a hard refusal rather
-    /// than a gap to fill later. All fourteen deliverables are expressible as
-    /// assertions, so nothing is lost.
     #[serde(default)]
     pub judge: Option<String>,
 }
@@ -250,7 +147,6 @@ pub enum JudgeAnswer {
 }
 
 impl JudgeAnswer {
-    /// Whether a judge verdict means this probe passed.
     pub fn passed(self, judge_said_yes: bool) -> bool {
         match self {
             JudgeAnswer::Yes => judge_said_yes,
@@ -262,13 +158,9 @@ impl JudgeAnswer {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JudgeConfig {
-    /// Must not be the model under test. Checked against the run's model.
     pub model: String,
-    /// How many shuffled calls vote on a judged probe.
     pub votes: u32,
-    /// Above this disagreement rate the probe leaves the primary analysis.
     pub disagreement_ceiling: f64,
-    /// Fraction of threads the triage pass selects for the human read.
     pub triage_fraction: f64,
     pub rubric: BTreeMap<String, String>,
 }
@@ -290,10 +182,7 @@ pub struct TaskAnswers {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptedAnswer {
-    /// Regex the question text must match for this reply to be the answer.
     pub matches: String,
-    /// The reply. Matched against the offered option labels first, and sent as
-    /// free text when none of them fit.
     pub answer: String,
 }
 
@@ -303,15 +192,8 @@ pub struct PricesFile {
     pub model: Vec<ModelPrice>,
 }
 
-/// Preferences naming a model the eval's own workload runs on.
-///
-/// The seed writes `chat_model`, pins the memory tasks to
-/// `prefs::BACKGROUND_MODEL`, and deletes every other preference row. So each
-/// of these falls back to the catalog's default. `model_image_description` is
-/// deliberately absent: it fires on an upload no task makes.
 const AUXILIARY_MODELS: [&Pref<Text>; 1] = [&prefs::MODEL_TITLE];
 
-/// Per-million-token prices for one model, pinned so a result is reproducible.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelPrice {
@@ -322,36 +204,20 @@ pub struct ModelPrice {
     pub cache_creation_per_mtok: f64,
 }
 
-/// The whole loaded fixture, validated.
 #[derive(Debug, Clone)]
 pub struct Fixture {
     pub tasks: Vec<Task>,
     pub facts: Vec<Fact>,
     pub probes: Vec<Probe>,
-    /// One per task, in `completion.toml`. Kept apart from `probes` because a
-    /// completion outcome measures the agent and a probe measures the mode.
     pub completion: Vec<CompletionProbe>,
     pub judge: JudgeConfig,
     pub answers: Vec<TaskAnswers>,
-    /// Appended to every prompt, in both arms.
     pub scope_rule: String,
     pub prices: Vec<ModelPrice>,
-    /// Every file in the seed tree, as a path relative to the arm's `data/`.
-    /// Validation reads it to tell a precondition on a seeded input from one on
-    /// a behaviour a probe scores.
     pub seed_files: Vec<String>,
-    /// Where those paths resolve, so validation can read a seeded document and
-    /// not just name it.
     pub seed_root: PathBuf,
-    /// Covers tasks, facts, probes and answers together.
     pub fixture_hash: String,
-    /// Covers the engine's own `NOTE_GUIDANCE`, read out of the checkout.
-    ///
-    /// It hashed `eval/context-mode/guidance.md` until ADR 0109 moved the text
-    /// into the engine. That file is now deleted: a hash over a copy no model
-    /// reads labels nothing. See `crate::guidance`.
     pub guidance_hash: String,
-    /// Covers `prices.toml` alone (I8).
     pub prices_hash: String,
 }
 
@@ -363,9 +229,6 @@ impl Fixture {
         let answers: AnswersFile = read_toml(&root.join("answers.toml"))?;
         let completion: CompletionFile = read_toml(&root.join("completion.toml"))?;
         let prices: PricesFile = read_toml(&root.join("prices.toml"))?;
-        // ADR 0109: the engine owns the guidance it delivers, so the hash
-        // covers what shipped rather than the fixture's stale copy. See
-        // `crate::guidance`.
         let guidance = crate::guidance::guidance_for_this_build()?;
 
         let mut hasher = Sha256::new();
@@ -396,15 +259,6 @@ impl Fixture {
         Ok(fixture)
     }
 
-    /// Refuse a run whose spend the price table cannot express (I8).
-    ///
-    /// `metrics::usd` refuses an unpriced model too, but it first runs once a
-    /// task has been driven, so the run dies having already spent. Asked here,
-    /// before anything boots, the same question costs nothing.
-    ///
-    /// The auxiliary models come from the engine's own catalog, not a list kept
-    /// here. A changed default then reaches the harness with the engine that
-    /// changed it.
     pub fn check_models_priced(&self, under_test: &str) -> Fallible<()> {
         let mut wanted = BTreeSet::from([under_test.to_string()]);
         for pref in AUXILIARY_MODELS {
@@ -439,24 +293,10 @@ impl Fixture {
         self.probes.iter().filter(move |p| p.task == task)
     }
 
-    /// The one completion probe for a task. Validation guarantees it is there.
     pub fn completion_for(&self, task: &str) -> Option<&CompletionProbe> {
         self.completion.iter().find(|c| c.task == task)
     }
 
-    /// The census probes, derived from the fact register rather than restated.
-    ///
-    /// The primary endpoint is one probe per fact against T12's handover, and
-    /// each fact already carries the regex that defines "stated with its
-    /// specific value". Declaring them in `probes.toml` too would be two
-    /// sources for one number.
-    ///
-    /// Only facts the census task could know reach it: those established in a
-    /// task it depends on, plus its own. A fact established downstream is a
-    /// probe neither arm can pass. It would scale the primary endpoint's
-    /// denominator while measuring nothing. The scope is structural rather than
-    /// a per-fact opt-out. A flag on a pre-registered endpoint is a lever
-    /// somebody can pull once they have seen the result.
     pub fn census_probes(&self, handover_path: &str) -> Vec<Probe> {
         let graph = TaskGraph::new(&self.tasks);
         let mut known = graph.upstream_of(crate::analyse::CENSUS_TASK);
@@ -480,11 +320,6 @@ impl Fixture {
             .collect()
     }
 
-    /// Every string a human reads as a criterion, so one scan covers them all.
-    ///
-    /// Task prompts and the scope rule are in here on purpose. A prompt naming
-    /// a verb would teach the agent to use it, which is the same defect as a
-    /// probe scoring it, one step earlier.
     fn criterion_texts(&self) -> Vec<(String, String)> {
         let mut texts: Vec<(String, String)> =
             vec![("the scope rule".to_string(), self.scope_rule.clone())];
@@ -532,31 +367,11 @@ impl Fixture {
     }
 }
 
-/// An assertion as one scannable string, or nothing when it does not render.
-///
-/// Serialized rather than walked, so a new variant is covered the day it is
-/// added. A variant that cannot serialize is not silently skipped: the loader
-/// already refuses an invalid assertion, and this reads the same tree.
 fn rendered_assertion(label: &str, assertion: Option<&Assertion>) -> Option<(String, String)> {
     let rendered = serde_json::to_string(assertion?).ok()?;
     Some((label.to_string(), rendered))
 }
 
-/// Words no criterion may contain (ADR 0110 decision 5).
-///
-/// Every one names an internal of the context mode or the Tree memory module:
-/// a verb, a surface it renders, or a route the retired outcome vocabulary
-/// attributed a pass to. A criterion that says any of them is scoring the
-/// mechanism rather than the work. It stops meaning anything the day the
-/// mechanism changes.
-///
-/// Matched case-insensitively, and deliberately as PHRASES where the bare word
-/// is ordinary English. The seeded corpus lives in `artifacts/ledger-migration`
-/// and several probes name its paths, so `ledger` alone would refuse the
-/// fixture for saying where a document is.
-/// A RETIRED internal stays on the list. A criterion naming one scores a
-/// mechanism that is gone, so it reads 0 for every arm. The run then reports
-/// a difference nobody made.
 pub const BANNED_MECHANISM_TOKENS: [&str; 18] = [
     "keep open",
     "keep_open",
@@ -579,7 +394,6 @@ pub const BANNED_MECHANISM_TOKENS: [&str; 18] = [
 ];
 
 impl Fixture {
-    /// Criteria that name an internal of the mode, described.
     fn mechanism_in_a_criterion(&self) -> Vec<String> {
         let mut problems = Vec::new();
         for (where_it_is, text) in self.criterion_texts() {
@@ -597,7 +411,6 @@ impl Fixture {
         problems
     }
 
-    /// Every structural rule the fixture has to satisfy before a run starts.
     pub fn validate(&self) -> Fallible<()> {
         let mut problems = Vec::new();
         let task_ids: BTreeSet<&str> = self.tasks.iter().map(|t| t.id.as_str()).collect();
@@ -666,7 +479,6 @@ impl Fixture {
                     ));
                 }
             }
-            // I9: a probe declares exactly one scorer.
             match (&probe.assert, &probe.judge) {
                 (Some(_), Some(_)) => problems.push(format!(
                     "probe {} declares both `assert` and `judge`. I9: the judge never scores \
@@ -694,9 +506,6 @@ impl Fixture {
             }
         }
 
-        // Exactly one per task, both directions. With none, the task's delivery
-        // goes unmeasured and the completion rate's denominator quietly stops
-        // being the task count. With two, it is counted twice.
         let mut seen_completion = BTreeSet::new();
         let mut covered: BTreeSet<&str> = BTreeSet::new();
         for completion in &self.completion {
@@ -718,9 +527,6 @@ impl Fixture {
                     completion.task
                 ));
             }
-            // One scorer, and it is an assertion. A judged probe is scored
-            // after the run. A completion probe is scored the moment its own
-            // task ends, so a judged one could never be right.
             if completion.judge.is_some() {
                 problems.push(format!(
                     "completion probe {} names a judge rubric. A completion probe is scored \
@@ -767,8 +573,6 @@ impl Fixture {
             }
         }
 
-        // The scope rule reaches every prompt, so a fact in it reaches every
-        // probe. That would turn the register into reading comprehension.
         if self.scope_rule.trim().is_empty() {
             problems.push("tasks.toml declares an empty scope_rule".to_string());
         }
@@ -784,9 +588,6 @@ impl Fixture {
             }
         }
 
-        // A probe on a fact nobody stated measures nothing, because the model
-        // cannot lose what it was never told. F05 was probed on three tasks and
-        // said in none, and the pilot read the misses as retention.
         let probed: BTreeSet<&str> = self
             .probes
             .iter()
@@ -846,12 +647,6 @@ impl Fixture {
 }
 
 impl Fixture {
-    /// Whether some seeded document states the fact, with its value.
-    ///
-    /// The census regex is the strict one, and a seeded fact is checked against
-    /// it rather than against the looser note regex. The document is the only
-    /// place the value is written. A corpus that merely names the topic leaves
-    /// every probe on the fact measuring the model's prior.
     fn stated_in_seed_tree(&self, fact: &Fact) -> bool {
         let Ok(pattern) = regex::Regex::new(&fact.census_regex) else {
             return false;
@@ -862,26 +657,6 @@ impl Fixture {
         })
     }
 
-    /// Preconditions that gate on something the fixture cannot deliver.
-    ///
-    /// A precondition may read the task's INPUTS and nothing else: a file the
-    /// seed tree lays down, or a deliverable a task it depends on asserts on
-    /// completion. Gate on anything else and the task is voided exactly when
-    /// the miss is the interesting result, asymmetrically between arms. T06 and
-    /// T08 gated on a knowhow file the T05 agent chooses to write and P05.4
-    /// scores, so one arm declining voided four tasks. What this catches is a
-    /// path or an event type that no seed file and no depended-on completion
-    /// assertion supplies.
-    ///
-    /// What it does not catch, all deliberate. Two different globs are never
-    /// compared, so a precondition spells its path as the completion probe
-    /// does. An `any` on the guarantee side promises nothing, so a completion
-    /// probe written that way gates nothing downstream. Counts are compared on
-    /// neither side, so a precondition wanting eight events or three files
-    /// passes on a probe asserting one. Existence is the only question, so a
-    /// gate saying a file must NOT be there reads here as no gate at all.
-    /// Nothing asks whether a probe SCORES the path, only whether the fixture
-    /// can produce it.
     fn unsatisfiable_preconditions(&self) -> Vec<String> {
         let graph = TaskGraph::new(&self.tasks);
         let mut problems = Vec::new();
@@ -921,7 +696,6 @@ impl Fixture {
     }
 }
 
-/// Which tasks a set of failures voids, transitively (I3).
 #[derive(Debug, Clone)]
 pub struct TaskGraph {
     edges: BTreeMap<String, Vec<String>>,
@@ -937,7 +711,6 @@ impl TaskGraph {
         }
     }
 
-    /// Every task the given one depends on, directly or through another.
     pub fn upstream_of(&self, task: &str) -> BTreeSet<String> {
         let mut found = BTreeSet::new();
         let mut pending = vec![task.to_string()];
@@ -951,16 +724,11 @@ impl TaskGraph {
         found
     }
 
-    /// Whether any task this one depends on is in `failed`.
     pub fn is_voided_by(&self, task: &str, failed: &BTreeSet<String>) -> bool {
         self.upstream_of(task).iter().any(|up| failed.contains(up))
     }
 }
 
-/// Every file under the seed tree, as a path relative to it.
-///
-/// The harness copies the tree over the arm's `data/`, so these are exactly the
-/// paths an assertion sees before the first prompt is sent.
 fn seed_files(root: &Path) -> Fallible<Vec<String>> {
     if !root.is_dir() {
         return Err(format!("the fixture has no seed tree at {}", root.display()).into());
@@ -975,13 +743,6 @@ fn seed_files(root: &Path) -> Fallible<Vec<String>> {
         .collect()
 }
 
-/// The paths and event types one assertion PROVES are there, split by which.
-///
-/// Only a leaf whose success proves the resource exists counts. A `glob_count`
-/// with no `min`, an `event_count` of zero, an empty `event_payloads_cover`, a
-/// table-width check and a `file_not_matches` all hold over an empty tree. Each
-/// therefore promises nothing as a guarantee, and gates on nothing as a
-/// precondition.
 #[derive(Default)]
 struct Reads<'a> {
     paths: Vec<&'a str>,
@@ -989,11 +750,6 @@ struct Reads<'a> {
 }
 
 impl<'a> Reads<'a> {
-    /// Read one assertion, descending only into `All`.
-    ///
-    /// `Any` is skipped on purpose. On the guarantee side it promises no single
-    /// branch. On the precondition side nothing but a leaf gets here, because
-    /// [`unsatisfiable_leaf`] takes both `all` and `any` itself.
     fn of(assertion: &'a Assertion) -> Reads<'a> {
         let mut reads = Reads::default();
         reads.walk(assertion);
@@ -1038,24 +794,11 @@ impl<'a> Reads<'a> {
     }
 }
 
-/// Whether a completion probe's path guarantees a file the precondition matches.
-///
-/// Two forms, and both are exact rather than clever. The same pattern on both
-/// sides is the common case. A concrete path on the guarantee side is checked
-/// against the precondition's glob. Two DIFFERENT globs are not compared,
-/// because deciding whether one glob's language sits inside another's is not
-/// worth faking. Write the precondition's path as the completion probe writes it.
 fn guarantees_path(guarantee: &str, wanted: &str) -> bool {
     guarantee == wanted
         || (!guarantee.contains('*') && crate::assertions::glob_match(wanted, guarantee))
 }
 
-/// The first leaf of a precondition that nothing can satisfy, described.
-///
-/// This owns both combinators, so a nested one still reaches its own arm. An
-/// `all` fails on its first failing branch. An `any` holds as soon as one branch
-/// does. So it fails only when every branch fails, and it then reports itself
-/// rather than an arbitrary branch.
 fn unsatisfiable_leaf(
     precondition: &Assertion,
     seed_files: &[String],
@@ -1107,13 +850,10 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The checked-in fixture's directory, which several tests load.
     fn fixture_root() -> std::path::PathBuf {
         crate::eval_fixture_root().join("context-mode")
     }
 
-    /// The row the price table is missing would otherwise surface from
-    /// `metrics::usd`, one driven task into a run that had already spent.
     #[test]
     fn the_checked_in_prices_cover_the_model_under_test_and_the_auxiliaries() {
         Fixture::load(&fixture_root())
@@ -1122,7 +862,6 @@ mod tests {
             .expect("prices.toml prices every model a default run bills");
     }
 
-    /// A model nobody priced fails before the boot, and the refusal names it.
     #[test]
     fn an_unpriced_model_under_test_is_refused_by_name() {
         let error = Fixture::load(&fixture_root())
@@ -1134,8 +873,6 @@ mod tests {
         assert!(error.contains("prices.toml has no row"), "{error}");
     }
 
-    /// Each auxiliary default names a model of its own. One that came to
-    /// inherit another key would price that key's model under this one's name.
     #[test]
     fn every_auxiliary_model_key_still_names_a_model() {
         for pref in AUXILIARY_MODELS {
@@ -1148,9 +885,6 @@ mod tests {
         }
     }
 
-    /// The memory tasks resolve their default from the host's providers, so the
-    /// seed pins each one, by key, to the priced background model. SQL cannot
-    /// import the catalog, so this pins the spelling: a renamed key unpins it.
     #[test]
     fn the_seed_pins_every_memory_task_to_the_background_model() {
         let seed = std::fs::read_to_string(fixture_root().join("fixtures/seed.sql"))
@@ -1200,11 +934,6 @@ mod tests {
         );
     }
 
-    /// One place, both arms, every task. Fourteen copies could drift, and a rule
-    /// that reached one arm only would be the asymmetry it exists to remove.
-    ///
-    /// A follow-up carries it too. The cross-turn trim drops the oldest history
-    /// first, so a rule sent only in turn one can be evicted before turn two.
     #[test]
     fn every_task_gets_the_same_scope_rule_appended() {
         let fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1232,8 +961,6 @@ mod tests {
         }
     }
 
-    /// The rule reaches every prompt, so a fact in it answers every probe on
-    /// that fact before the agent starts.
     #[test]
     fn a_scope_rule_stating_a_fact_is_refused() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1246,7 +973,6 @@ mod tests {
         );
     }
 
-    /// The checked-in rule is clean, which is the direction that matters.
     #[test]
     fn the_checked_in_scope_rule_states_no_fact() {
         Fixture::load(&fixture_root()).expect("the fixture validates, scope rule included");
@@ -1270,7 +996,6 @@ mod tests {
         assert!(upstream.contains("T04"));
     }
 
-    /// I3, the graph half: T02 failing reaches T05.
     #[test]
     fn a_failed_upstream_task_voids_the_tasks_below_it() {
         let graph = TaskGraph::new(&tasks());
@@ -1286,7 +1011,6 @@ mod tests {
         assert_eq!(tasks()[0].timeout().as_secs(), 600);
     }
 
-    /// Borrow the register's entry for a fact, to doctor it in place.
     fn fact_mut<'a>(fixture: &'a mut Fixture, id: &str) -> &'a mut Fact {
         fixture
             .facts
@@ -1295,16 +1019,6 @@ mod tests {
             .expect("the register carries it")
     }
 
-    /// The check that would have caught F05 the day it was written.
-    ///
-    /// F05 was probed on three tasks and stated in none. A probe on a fact
-    /// nobody said measures nothing, because the model cannot lose what it was
-    /// never told. T11 then hid the hole behind a memory precondition, so the
-    /// pilot reported a void rather than a defect.
-    ///
-    /// The predicate is `stated_regex`, the loose form of the fact. A prompt
-    /// states the fact, and `census_regex` wants the exact value the model
-    /// works out from it.
     #[test]
     fn a_probed_fact_the_establishing_prompt_never_states_is_refused() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1314,8 +1028,6 @@ mod tests {
         assert!(err.contains("in its prompt"), "{err}");
     }
 
-    /// F18 arrives as the scripted reply to T09's question, not in the prompt.
-    /// So the haystack is the answer, and a wrong answer is refused too.
     #[test]
     fn an_answer_established_fact_is_read_from_the_scripted_reply() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1333,9 +1045,6 @@ mod tests {
         assert!(err.contains("in a scripted answer"), "{err}");
     }
 
-    /// Some facts are established by doing the task: a script fails, an event
-    /// lands, a knowhow file gets written. Nobody says them, and the register
-    /// declares that rather than the check pretending otherwise.
     #[test]
     fn a_work_established_fact_has_no_text_to_check() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1347,14 +1056,6 @@ mod tests {
             .expect("the work states it, not a prompt");
     }
 
-    /// The whole checked-in fixture has to load and validate.
-    ///
-    /// This is what makes I9 a running check rather than an intention: every
-    /// probe in `probes.toml` goes through the one-scorer rule on the way in.
-    ///
-    /// The census is twenty of twenty-three facts, and the gap is the point.
-    /// F21 to F23 are established in T13 and T14, which T12 does not depend on,
-    /// so the handover has no route to them.
     #[test]
     fn the_checked_in_fixture_loads_and_validates() {
         let root = fixture_root();
@@ -1373,12 +1074,6 @@ mod tests {
         );
     }
 
-    /// The census covers what the handover could carry, and stops there.
-    ///
-    /// T11 is the one task T12 does not depend on, so a fact established there
-    /// is one the handover has no route to. Left in, it is a probe both arms
-    /// fail. The primary endpoint's denominator would then grow with the
-    /// fixture rather than with what is measured.
     #[test]
     fn a_fact_the_census_task_cannot_know_is_left_out() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1393,9 +1088,6 @@ mod tests {
             .any(|probe| probe.fact.as_deref() == Some("F03")));
     }
 
-    /// One completion probe per task, both directions, over the real fixture.
-    /// A task with none leaves its delivery unmeasured, which is the whole gap
-    /// this file was added to close.
     #[test]
     fn every_task_has_exactly_one_completion_probe() {
         let fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1435,8 +1127,6 @@ mod tests {
         assert!(err.contains("declares no `assert`"));
     }
 
-    /// A judged probe is scored after the run, and a completion probe is
-    /// scored when its own task ends. Nothing can be both.
     #[test]
     fn a_judged_completion_probe_is_refused() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1445,7 +1135,6 @@ mod tests {
         assert!(err.contains("names a judge rubric"));
     }
 
-    /// Borrow a task, to doctor its preconditions in place.
     fn task_mut<'a>(fixture: &'a mut Fixture, id: &str) -> &'a mut Task {
         fixture
             .tasks
@@ -1454,11 +1143,6 @@ mod tests {
             .expect("the task set carries it")
     }
 
-    /// The defect this check exists for, in the shape it shipped in.
-    ///
-    /// T06 gated on a knowhow file. F14 marks it `established_by = "work"`, so
-    /// the T05 agent chooses whether to write it, and P05.4 scores that choice.
-    /// The gate voided T06, T07, T08 and T10 for an arm that declined.
     #[test]
     fn a_precondition_on_a_scored_behaviour_is_refused() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1475,8 +1159,6 @@ mod tests {
         assert!(err.contains("never on a behaviour a probe scores"), "{err}");
     }
 
-    /// The event half of the same rule. Nothing seeds events, so the only route
-    /// is a depended-on task's completion assertion.
     #[test]
     fn a_precondition_on_an_unproduced_event_is_refused() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1490,10 +1172,6 @@ mod tests {
         );
     }
 
-    /// A precondition on a task's real input passes, by both routes.
-    ///
-    /// The seed tree lays down the collect scripts. T04's completion probe
-    /// asserts the collected files, and T06 depends on T04.
     #[test]
     fn a_precondition_on_a_seeded_or_asserted_input_is_accepted() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1512,8 +1190,6 @@ mod tests {
             .expect("both gate on inputs the fixture delivers");
     }
 
-    /// The guarantee has to come from a task this one DEPENDS on. Only C07
-    /// asserts `weekly.md`, and T04 runs long before T07 does.
     #[test]
     fn a_precondition_guaranteed_only_by_a_task_downstream_is_refused() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1527,10 +1203,6 @@ mod tests {
         );
     }
 
-    /// Wrapping the same gate in `all` and `any` must not smuggle it past.
-    ///
-    /// The combinators nest, so a check that read only the outermost one would
-    /// hand the author a one-word way around it.
     #[test]
     fn a_scored_behaviour_nested_under_a_combinator_is_still_refused() {
         let knowhow = Assertion::GlobCount {
@@ -1563,7 +1235,6 @@ mod tests {
             );
         }
 
-        // One satisfiable branch is all an `any` needs.
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
         task_mut(&mut fixture, "T06").preconditions = vec![Assertion::Any {
             of: vec![knowhow, seeded],
@@ -1571,7 +1242,6 @@ mod tests {
         fixture.validate().expect("the seeded branch carries it");
     }
 
-    /// Borrow a completion probe, to doctor its assertion in place.
     fn completion_mut<'a>(fixture: &'a mut Fixture, id: &str) -> &'a mut CompletionProbe {
         fixture
             .completion
@@ -1580,11 +1250,6 @@ mod tests {
             .expect("the completion set carries it")
     }
 
-    /// A completion probe that passes over an empty tree guarantees nothing.
-    ///
-    /// Each form below holds with no file and no event, so reading one as a
-    /// guarantee would wave through the precondition it appears to cover. The
-    /// task would then be voided at run time, which is the whole failure.
     #[test]
     fn a_vacuous_completion_assertion_guarantees_nothing() {
         let collected = "artifacts/build-health/*-collected.json".to_string();
@@ -1614,7 +1279,6 @@ mod tests {
             );
         }
 
-        // The event half: a count of zero passes with no event at all.
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
         completion_mut(&mut fixture, "C05").assert = Some(Assertion::EventCount {
             event_type: "TriggerCreated".to_string(),
@@ -1627,8 +1291,6 @@ mod tests {
         );
     }
 
-    /// A concrete completion path satisfies a precondition's glob over it. T03
-    /// gates on `*-health.md`, and C02 asserts `2026-01-05-health.md`.
     #[test]
     fn a_concrete_completion_path_satisfies_a_glob_precondition() {
         assert!(guarantees_path(
@@ -1639,14 +1301,12 @@ mod tests {
             "artifacts/build-health/*-collected.json",
             "artifacts/build-health/*-collected.json"
         ));
-        // Two different globs are not compared, which the doc comment says.
         assert!(!guarantees_path(
             "artifacts/build-health/*-health.md",
             "artifacts/**/*.md"
         ));
     }
 
-    /// The seed tree is read, and `.gitkeep` is not a knowhow entry.
     #[test]
     fn the_seed_tree_is_read_and_carries_no_knowhow_entry() {
         let fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1662,15 +1322,8 @@ mod tests {
         );
     }
 
-    /// ADR 0110 decision 5, from the failing direction, on every surface.
-    ///
-    /// A criterion naming a verb, a surface or a retired route is scoring the
-    /// mechanism rather than the work. The rule was written down once before
-    /// and eleven probes still shipped scoring a spelling, which is why it is
-    /// a check.
     #[test]
     fn a_criterion_naming_a_mode_internal_is_refused() {
-        /// Where the offending text goes, and the doctoring that puts it there.
         type Case = (&'static str, &'static dyn Fn(&mut Fixture));
 
         let cases: [Case; 5] = [
@@ -1708,7 +1361,6 @@ mod tests {
         }
     }
 
-    /// An assertion is scanned too, so a regex cannot smuggle a verb past.
     #[test]
     fn an_assertion_naming_a_mode_internal_is_refused() {
         let mut fixture = Fixture::load(&fixture_root()).unwrap();
@@ -1719,9 +1371,6 @@ mod tests {
         assert!(err.contains("assertion names `keep open`"), "{err}");
     }
 
-    /// The corpus lives in `artifacts/ledger-migration`, and several probes
-    /// name its paths. A bare `ledger` in the list would refuse the fixture for
-    /// saying where a document is, so the token is the two-word phrase.
     #[test]
     fn the_seeded_corpus_path_is_not_mistaken_for_a_mode_internal() {
         assert!(BANNED_MECHANISM_TOKENS.contains(&"context ledger"));
@@ -1729,7 +1378,6 @@ mod tests {
         Fixture::load(&fixture_root()).expect("the checked-in fixture names no mode internal");
     }
 
-    /// I9, from the failing direction.
     #[test]
     fn a_probe_declaring_both_scorers_is_refused() {
         let root = fixture_root();
@@ -1758,11 +1406,6 @@ mod tests {
         assert!(err.contains("declares neither"));
     }
 
-    /// The ceiling is crossed by material, not by how much the model writes.
-    ///
-    /// The engine reserves the response and converts the rest at 1.5 chars per
-    /// token, leaving roughly 172,700 chars for messages. This corpus exceeds
-    /// that on its own, so the claim is checkable rather than asserted.
     #[test]
     fn the_ceiling_corpus_can_fill_the_context_window() {
         const CORPUS: &str = "artifacts/ledger-migration";
@@ -1792,8 +1435,6 @@ mod tests {
             ]
         );
 
-        // `read_file` truncates at 50,000 bytes, so a document near that cap
-        // would lose its tail and take a planted fact with it.
         for (name, size) in &docs {
             assert!(
                 *size < MAX_BYTES,
@@ -1807,11 +1448,6 @@ mod tests {
         );
     }
 
-    /// A lost fact must be answered by a guess, never by a misread.
-    ///
-    /// Each phrase is the round number a model reaches for when the document
-    /// is gone: a day, five hundred, half an hour. None of them is seeded
-    /// anywhere, so a probe matching one is measuring the model's prior.
     #[test]
     fn no_seeded_file_states_a_plausible_wrong_default() {
         const WRONG: [&str; 5] = ["24 hour", "24-hour", "500 record", "30 minute", "30-minute"];

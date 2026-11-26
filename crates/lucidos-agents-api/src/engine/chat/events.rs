@@ -8,10 +8,6 @@ use crate::engine::thread_events::{ActorMode, ThreadDirection};
 #[cfg(test)]
 use uuid::Uuid;
 
-/// Generate a brief description of user-attached images using Flash.
-/// Standalone function so it can be spawned into a background task.
-///
-/// `capture` makes the call and records it for token accounting.
 pub(super) async fn describe_images(
     provider: &dyn crate::llm::provider::LlmProvider,
     images: &[crate::engine::types::ChatImage],
@@ -24,8 +20,6 @@ pub(super) async fn describe_images(
         text: IMAGE_DESCRIPTION_PROMPT.to_string(),
     }];
     for img in images {
-        // Fit each image to the LLM size target (compress only if over) so the
-        // description pass can't trip the provider's per-image limit either.
         blocks.push(super::images::image_content_block(
             img.clone().fit_for_llm(),
         ));
@@ -51,7 +45,6 @@ pub(super) async fn describe_images(
         .ok_or_else(|| "No description returned".into())
 }
 
-/// Format a duration as a human-readable relative age (e.g., "2h ago", "3d ago").
 pub(super) fn format_relative_age(duration: chrono::Duration) -> String {
     let secs = duration.num_seconds();
     if secs < 60 {
@@ -149,7 +142,6 @@ mod origin_invariants {
 
     #[test]
     fn api_origin_with_agent_mode_ok() {
-        // Third-party SDK identifying as an agent (LLM acting on user's behalf).
         let origin = MessageOrigin::Api {
             user_agent: Some("MyApp/1.0".into()),
             mode: ActorMode::Agent,
@@ -179,7 +171,6 @@ mod origin_invariants {
 
     #[test]
     fn api_origin_with_engine_mode_ok() {
-        // External engine code making deterministic API calls.
         let origin = MessageOrigin::Api {
             user_agent: Some("ScriptRunner/2.0".into()),
             mode: ActorMode::Engine,
@@ -206,7 +197,6 @@ mod origin_invariants {
 
     #[test]
     fn api_origin_with_mismatched_mode_rejected() {
-        // The `mode` field on Api must match the request's claimed mode.
         let origin = MessageOrigin::Api {
             user_agent: None,
             mode: ActorMode::Agent,
@@ -399,11 +389,6 @@ mod origin_invariants {
         assert!(res.is_err(), "Engine origin must reject non-Engine mode");
     }
 
-    /// Regression: child threads spawned by the LLM `run_thread` tool call this
-    /// helper with `mode = Agent`, `parent_thread_id = Some(_)`, and
-    /// `explicit_origin = None`. The synthesized origin must be
-    /// `ThreadLink { direction: Parent, mode: Agent }` — without it, downstream
-    /// consumers can't attribute the spawn to the parent agent run.
     #[test]
     fn synthesizes_thread_link_parent_origin_for_agent_spawn() {
         let parent_id = Uuid::new_v4();
@@ -447,10 +432,6 @@ mod origin_invariants {
         }
     }
 
-    /// Regression: parent threads receiving a child's "[Child thread completed]"
-    /// callback now stamp `ThreadLink { direction: Child, mode: Agent }` at the
-    /// emit site. This test covers the validation path — the explicit
-    /// child-direction origin must validate OK with `mode = Agent`.
     #[test]
     fn thread_link_child_direction_with_agent_mode_ok() {
         let origin = MessageOrigin::ThreadLink {
@@ -514,11 +495,6 @@ mod origin_invariants {
         assert!(res2.is_ok());
     }
 
-    /// A spoken message names its *voice session*, and a typed one names none.
-    ///
-    /// The field is the whole of how the transcript tells the two apart. Voice
-    /// is a mode of a thread (ADR 0148), so a typed message sits between the
-    /// same pair of session events a spoken one does.
     #[test]
     fn a_spoken_message_is_marked_and_a_typed_one_is_not() {
         let session_id = Uuid::new_v4();
@@ -570,7 +546,6 @@ mod origin_invariants {
         assert_eq!(on_typed, None);
     }
 
-    /// Every row written before voice existed still decodes, and reads typed.
     #[test]
     fn a_row_from_before_voice_decodes_as_typed() {
         let legacy = serde_json::json!({
@@ -592,8 +567,6 @@ mod origin_invariants {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- format_relative_age tests ---
 
     #[test]
     fn relative_age_just_now() {
@@ -628,8 +601,6 @@ mod tests {
         assert_eq!(format_relative_age(chrono::Duration::days(4)), "4d ago");
     }
 
-    // --- emit_routing_failure tests ---
-
     use crate::engine::event_bus::{BusEvent, MockEventBus};
     use crate::engine::thread_events::ThreadEvent;
 
@@ -659,11 +630,6 @@ mod tests {
         }
     }
 
-    /// `emit_routing_failure` must return `Ok` after a successful emit so
-    /// the chat handler chain doesn't double-emit. The outer `api::chat`
-    /// handler catches every `Err` from `process_message` and emits its own
-    /// `ResponseFailed` — an `Err` here would land a second terminator on
-    /// top of the one this function already emitted.
     #[tokio::test]
     async fn routing_failure_returns_ok_after_emit() {
         let mock = MockEventBus::new();
@@ -696,9 +662,6 @@ mod tests {
              SHOULD emit its own ResponseFailed in that case (the in-flight \
              routing terminator never landed, so no double-emit risk)"
         );
-        // The error message must surface the bus failure, not the original
-        // routing-message — the upper layers log on Err and the bus failure
-        // is the more actionable diagnostic.
         assert!(
             result.unwrap_err().to_string().contains("db down"),
             "bus-emit Err must propagate so post-mortem can find the bus cause",

@@ -1,24 +1,9 @@
-//! End-to-end tests for the WASM signer layer against real, checked-in
-//! signer source. These tests load actual `.wasm` artifacts produced by
-//! `./signers/build-all.sh` (compiled from `signers/binance-hmac/` and
-//! `signers/test-echo/` with the `wasm32-unknown-unknown` target) and run
-//! them through `WasmSignerLayer::apply`.
-//!
-//! The artifacts are gitignored — they only exist after the build script
-//! has run. `./scripts/e2e-wasm.sh` does the build then invokes this test
-//! binary. Skipping the build before running means `load_signer` panics
-//! with a clear "did you run `./signers/build-all.sh`?" message.
-
 use lucidos_engine::__wasm_test_internals::*;
 
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Walk up from CWD to find `signers/<name>/<name>.wasm`, copy the wasm and
-/// manifest into a tempdir, and load the resulting module via
-/// `load_wasm_modules`. Both files must exist on disk — i.e.
-/// `./signers/build-all.sh <name>` must have been run first.
 fn load_signer(name: &str) -> (Arc<Engine>, Arc<CompiledModule>) {
     let wasm_rel = format!("signers/{name}/{name}.wasm");
     let workspace_root = std::env::current_dir()

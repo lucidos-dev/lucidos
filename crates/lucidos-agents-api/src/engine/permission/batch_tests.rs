@@ -15,7 +15,6 @@ fn device() -> MessageOrigin {
     }
 }
 
-/// Ask a card on `thread` with these labels, and return its id and options.
 async fn ask(bus: &EventBus, thread: Uuid, labels: &[&str]) -> (String, Vec<QuestionOption>) {
     ask_with(bus, thread, labels, false).await
 }
@@ -57,15 +56,12 @@ async fn ask_with(
     (tool_use_id, parsed.options)
 }
 
-/// A create-workspace permission request the agent on `thread` prepared and
-/// asked, as its question tool raises it.
 async fn ask_create(bus: &EventBus, thread: Uuid, slug: &str) -> AskedCard {
     let ask = workspace_ask(Action::CreateWorkspace, slug, "A film take needs it.").unwrap();
     let request_id = prepare(bus, thread, ask).await.unwrap();
     ask_prepared(bus, thread, &request_id).await
 }
 
-/// Existing execution tests ask through the same prepared-request swap.
 async fn ask_batch(
     bus: &EventBus,
     triggers: &Triggers,
@@ -129,9 +125,6 @@ fn refusal(result: Result<Batch, BatchError>) -> String {
     }
 }
 
-/// A batch carries exact picks from sub-threads at any depth: each card's id,
-/// the picked option's id and label, and the card's digest. Its own digest
-/// hashes the items (I5).
 #[tokio::test]
 async fn a_batch_holds_exact_picks_from_its_sub_threads() {
     let (pool, db) = setup_test_db().await;
@@ -177,8 +170,6 @@ async fn a_batch_holds_exact_picks_from_its_sub_threads() {
     teardown_test_db(&db).await;
 }
 
-/// Each batch rule refuses the whole batch, names the item, and writes
-/// nothing (I13, I15).
 #[tokio::test]
 async fn a_batch_refuses_what_breaks_a_rule_and_writes_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -237,8 +228,6 @@ async fn a_batch_refuses_what_breaks_a_rule_and_writes_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// The engine words the card: one line per item and the two options, and
-/// only the owner's Run all grants (I3, I15).
 #[tokio::test]
 async fn a_raised_batch_is_engine_worded_and_only_the_owner_runs_it() {
     let (pool, db) = setup_test_db().await;
@@ -319,8 +308,6 @@ async fn a_raised_batch_is_engine_worded_and_only_the_owner_runs_it() {
     teardown_test_db(&db).await;
 }
 
-/// A plan repo: `branch` carries a committed plan, and `thread`'s session
-/// works it with a proposed marker.
 struct PlanRepo {
     _dir: tempfile::TempDir,
     repo: std::path::PathBuf,
@@ -388,9 +375,6 @@ impl PlanRepo {
     }
 }
 
-/// An approving pick on a thread with a proposed plan binds the committed
-/// text. The approval gate accepts that pick while the text stands, refuses
-/// it once the text changes, and a re-mark needs a new yes (I16).
 #[tokio::test]
 async fn a_batch_pick_binds_the_plan_text_it_showed() {
     use crate::engine::git_ops::{user_approved_plan, PlanApprovalError};
@@ -509,9 +493,6 @@ async fn tap(bus: &EventBus, thread: Uuid, tool_use_id: &str, option_id: &str) {
     .unwrap();
 }
 
-/// Only a pick on the plan card itself approves. A tap on an engine card
-/// never does. A batch that skipped its item binds nothing, so the owner's
-/// later direct tap approves the plan as it stands.
 #[tokio::test]
 async fn only_a_pick_on_the_plan_card_itself_approves() {
     use crate::engine::git_ops::{user_approved_plan, PlanApprovalError};
@@ -574,8 +555,6 @@ async fn only_a_pick_on_the_plan_card_itself_approves() {
     teardown_test_db(&db).await;
 }
 
-/// A drifted item reads as skipped with its reason: a closed card, changed
-/// options, a changed plan, and a re-marked plan (I5).
 #[tokio::test]
 async fn an_item_whose_source_changed_is_named_as_drifted() {
     let (pool, db) = setup_test_db().await;
@@ -673,7 +652,6 @@ async fn in_engine_child(test: &str) -> bool {
     crate::test_support::in_engine_child(&format!("engine::permission::batch::tests::{test}")).await
 }
 
-/// Each `BatchItemRan` on `raiser`: its index and outcome, in order.
 async fn receipts(pool: &sqlx::PgPool, raiser: Uuid) -> Vec<(i64, serde_json::Value)> {
     sqlx::query_as(
         "SELECT (payload->>'index')::bigint, payload->'outcome' FROM events \
@@ -685,7 +663,6 @@ async fn receipts(pool: &sqlx::PgPool, raiser: Uuid) -> Vec<(i64, serde_json::Va
     .unwrap()
 }
 
-/// The receipts on `raiser`, once all `count` of them have landed.
 async fn receipts_once(
     pool: &sqlx::PgPool,
     raiser: Uuid,
@@ -703,10 +680,6 @@ async fn receipts_once(
     ran
 }
 
-/// The engine's answer path, end to end (I5). The owner's Run all spends the
-/// grant once and answers each intact card as the owner. A card that closed
-/// meanwhile is skipped, every item gets a receipt, and a second run does
-/// nothing.
 #[tokio::test]
 async fn a_confirmed_batch_runs_once_and_skips_what_changed() {
     use crate::engine::agent_question::answer_pending_question;
@@ -803,9 +776,6 @@ async fn a_confirmed_batch_runs_once_and_skips_what_changed() {
     teardown_test_db(&db).await;
 }
 
-/// A restart can cut a batch off: before its spend, or between items. Boot
-/// names every item that never ran, spends a dangling confirm, and a second
-/// boot adds nothing (I10).
 #[tokio::test]
 async fn boot_names_the_items_a_restart_cut_off() {
     let (pool, db) = setup_test_db().await;
@@ -827,7 +797,6 @@ async fn boot_names_the_items_a_restart_cut_off() {
                 .find(|(_, c)| matches!(c, PermissionChoice::Grant { .. }))
                 .map(|(id, _)| id.clone())
                 .unwrap();
-            // The answer lands first, so the next batch card posts.
             tap(bus, raiser, &card, &run).await;
             let Resolution::Granted(id) = resolve_answer(
                 bus,
@@ -911,7 +880,6 @@ async fn boot_names_the_items_a_restart_cut_off() {
     teardown_test_db(&db).await;
 }
 
-/// An intent trigger `id` that runs `intent` with the `slack` MCP server.
 fn trigger(id: &str, intent: &str) -> TriggerConfig {
     TriggerConfig::from_created_payload(&serde_json::json!({
         "trigger_id": id,
@@ -937,9 +905,6 @@ fn grant_on(trigger: &str, side_effects: &[&str], coding_agents: bool) -> BatchI
     }
 }
 
-/// A batch carries grants across several triggers, by id or slug. Each item
-/// binds the trigger's definition digest and adds only what it lacks. The card
-/// shows each trigger's intent, digest, grants and MCP servers (I17).
 #[tokio::test]
 async fn a_batch_carries_trigger_grants_bound_to_each_definition() {
     let (pool, db) = setup_test_db().await;
@@ -1004,7 +969,6 @@ async fn a_batch_carries_trigger_grants_bound_to_each_definition() {
     teardown_test_db(&db).await;
 }
 
-/// A retired category, an empty grant or an unknown trigger refuses the batch.
 #[tokio::test]
 async fn a_trigger_grant_refuses_retired_categories_and_writes_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -1045,8 +1009,6 @@ async fn a_trigger_grant_refuses_retired_categories_and_writes_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// A trigger item runs only on the definition it showed. A changed or deleted
-/// trigger skips the item. The grant lands as the confirming owner (I5, I17).
 #[tokio::test]
 async fn a_trigger_grant_runs_only_on_the_definition_it_showed() {
     use crate::engine::trigger_writes::TriggerRegistryWriter;
@@ -1113,8 +1075,6 @@ async fn a_trigger_grant_runs_only_on_the_definition_it_showed() {
     teardown_test_db(&db).await;
 }
 
-/// A Lucidos Agent thread below `parent`. Only a chat thread asks a
-/// command-guard card.
 async fn seed_chat_child(bus: &EventBus, parent: Uuid) -> Uuid {
     let thread = Uuid::new_v4();
     let mut message = crate::test_support::message_received("work");
@@ -1137,7 +1097,6 @@ async fn seed_chat_child(bus: &EventBus, parent: Uuid) -> Uuid {
     thread
 }
 
-/// Ask a command-guard card on `thread`, as the Lucidos Agent's guard does.
 async fn ask_command(bus: &EventBus, thread: Uuid, request_id: &str) {
     bus.emit(BusEvent::Thread {
         thread_id: thread,
@@ -1163,9 +1122,6 @@ async fn ask_command(bus: &EventBus, thread: Uuid, request_id: &str) {
     .unwrap();
 }
 
-/// A tool-permission card joins a batch as one exact pick among its own
-/// buttons. An Always allow never does, and a card that closed drifts (I9,
-/// I15).
 #[tokio::test]
 async fn a_batch_picks_a_tool_card_button_but_never_an_always_allow() {
     let (pool, db) = setup_test_db().await;
@@ -1229,7 +1185,6 @@ async fn a_batch_picks_a_tool_card_button_but_never_an_always_allow() {
             refusal(build_batch(&pool, &no_triggers, raiser, &[answer_on(child, &label)]).await);
         assert!(why.contains("never a batch item"), "{why}");
     }
-    // The ask queued behind the open prompt, so the batch sees only the prompt.
     let why = refusal(build_batch(&pool, &no_triggers, raiser, &[answer_on(both, "Go")]).await);
     assert!(why.contains("offers no option \"Go\""), "{why}");
     let twice = [answer_on(child, "Allow once"), answer_on(child, "Deny")];
@@ -1258,10 +1213,6 @@ async fn a_batch_picks_a_tool_card_button_but_never_an_always_allow() {
     teardown_test_db(&db).await;
 }
 
-/// A permission request joins a batch at Allow once or Allow for this thread,
-/// worded from its typed request and never from the card's question. Always
-/// allow and a host-log transfer card stay out
-/// (invariant 7).
 #[tokio::test]
 async fn a_batch_answers_a_permission_request_but_never_an_always_allow_or_a_host_log_transfer() {
     let (pool, db) = setup_test_db().await;
@@ -1332,8 +1283,6 @@ async fn a_batch_answers_a_permission_request_but_never_an_always_allow_or_a_hos
     assert!(!question.contains("A film take needs it"), "{question}");
     assert!(!question.contains("any target"), "{question}");
 
-    // Allow for this thread grants any slug, so the line must say so. This
-    // card queues behind the first, with the same words.
     let card = ask_batch(
         &bus,
         &no_triggers,
@@ -1357,8 +1306,6 @@ async fn a_batch_answers_a_permission_request_but_never_an_always_allow_or_a_hos
     teardown_test_db(&db).await;
 }
 
-/// A batch item that names a standing grant grants nothing at resolve time,
-/// even if it slipped past the build (invariant 7).
 #[tokio::test]
 async fn a_batch_pick_of_an_always_allow_grants_nothing() {
     let (pool, db) = setup_test_db().await;
@@ -1403,9 +1350,6 @@ async fn a_batch_pick_of_an_always_allow_grants_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// A confirmed batch answers a tool card through its own resolver. It answers
-/// a permission request as the owner's device, so the grant it records is
-/// live for the asking thread (invariant 5).
 #[tokio::test]
 async fn a_confirmed_batch_answers_tool_cards_and_permission_requests_as_the_owner() {
     use crate::engine::agent_question::answer_pending_question;
@@ -1530,13 +1474,10 @@ fn classify_on(workspaces: &[&str], origin: &str, evidence: &str) -> BatchItemRe
     .unwrap()
 }
 
-/// A pool that never connects: classification items read nothing from it.
 fn idle_pool() -> sqlx::PgPool {
     sqlx::PgPool::connect_lazy("postgres://127.0.0.1:1/never").unwrap()
 }
 
-/// I7: the card shows one line per group, with count, slugs, origin and the
-/// agent's evidence, never one line per workspace.
 #[tokio::test]
 async fn a_classification_batch_shows_one_line_per_group() {
     let (pool, raiser, triggers) = (idle_pool(), Uuid::new_v4(), Triggers::default());
@@ -1651,7 +1592,6 @@ async fn a_workspace_deletion_batch_runs_only_on_confirm_and_reports_each_refusa
         ),
     );
     let port = lucidos_local_token::test_support::serve_https(gateway).port();
-    // This test runs in its own engine child.
     std::env::set_var("LUCIDOS_GATEWAY_PORT", port.to_string());
     std::env::set_var("LUCIDOS_WORKSPACE_ID", "rig");
     let workspaces = ["personal", "stale", "rig", "demo"];
@@ -1742,7 +1682,6 @@ async fn a_device_session_batch_line_names_the_exact_scope() {
     assert!(word_permission_request(&pool, &request).await.is_err());
 }
 
-/// A batch can answer a secret-read card once, but cannot invent a grant.
 #[tokio::test]
 async fn a_batch_offers_no_unstamped_scope_for_a_secret_read() {
     use crate::engine::thread_events::{GrantOffer, OfferWithheld};
@@ -1791,10 +1730,6 @@ async fn a_batch_offers_no_unstamped_scope_for_a_secret_read() {
     teardown_test_db(&db).await;
 }
 
-/// Both blocking question routes swap the batch in, and a re-ask carries no
-/// consent until the owner taps its own card. The agent asks right after its
-/// prepare call, with no words between, and the question card gate lets the
-/// engine's card through.
 #[tokio::test]
 async fn prepared_batches_run_on_both_question_routes() {
     use crate::api::permission_requests::tests::{
@@ -1870,7 +1805,6 @@ async fn prepared_batches_run_on_both_question_routes() {
             })
             .await
             .unwrap();
-            // A second card has no grant of its own. Declining it cannot run again.
             let label = if attempt == 0 {
                 RUN_LABEL
             } else {

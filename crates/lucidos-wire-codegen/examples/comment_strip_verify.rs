@@ -1,21 +1,3 @@
-//! The second proof for a Rust comment strip (`scripts/comment-strip/`).
-//!
-//! It lexes both versions of a file with `proc-macro2` and compares the token
-//! streams with doc attributes dropped. A doc comment on an item that derives
-//! a `clap-derive` kept class is `--help` text, so it is compared too. So is
-//! one inside a macro's input, unless a `macro-doc` class names the macro.
-//!
-//! Rust has no line-terminator rule to check. What a removed comment can
-//! change is whether two punctuation characters join, as in `&&`. The lexer
-//! reports that as spacing, and spacing is compared.
-//!
-//! ```text
-//! comment_strip_verify --kept-classes <tsv> <orig-root> <new-root>
-//! ```
-//!
-//! Paths arrive on stdin, relative to both roots. It prints
-//! `DIFF<TAB>path<TAB>reason` for each differing file and exits 1.
-
 use std::io::Read as _;
 use std::path::Path;
 use std::process::ExitCode;
@@ -34,7 +16,6 @@ enum Token {
 
 struct Proof {
     clap_derives: Vec<String>,
-    /// Macros that only forward a doc comment in their input.
     forwarding_macros: Vec<String>,
 }
 
@@ -47,8 +28,6 @@ impl Proof {
     }
 }
 
-/// The names in every row of one kind. The pattern column must read
-/// `^(A|B)$`, since this side has no regex engine.
 fn names_of_kind(kept_classes: &str, kind: &str) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for line in kept_classes.lines() {
@@ -134,9 +113,6 @@ impl Proof {
         }
     }
 
-    /// Whether the group at `i` is the input of a macro that can read a doc
-    /// comment: `name ! (..)` or `name ! word (..)`, for a name no `macro-doc`
-    /// class lists. `if !(a)` reads as one too, which only compares more.
     fn is_doc_reading_input(&self, trees: &[TokenTree], i: usize) -> bool {
         if !matches!(trees[i], TokenTree::Group(_)) {
             return false;
@@ -153,7 +129,6 @@ impl Proof {
         }
     }
 
-    /// Whether the outer attributes that start here include a clap derive.
     fn run_derives_clap(&self, trees: &[TokenTree]) -> bool {
         let mut i = 0;
         while is_punct(trees.get(i), '#') {
@@ -166,9 +141,7 @@ impl Proof {
         false
     }
 
-    /// Push one whole item with its doc attributes, and return the index after it.
     fn push_item(&self, trees: &[TokenTree], mut i: usize, out: &mut Vec<Token>) -> usize {
-        // A brace inside generics is a const default, not the item's body.
         let mut angles = 0usize;
         while i < trees.len() {
             self.push(&trees[i], true, out);
@@ -209,7 +182,6 @@ impl Proof {
         }
     }
 
-    /// Why `after` is not `before` minus comments, or `None` when it is.
     fn compare(&self, before: &str, after: &str) -> Option<String> {
         let lexed = |text: &str| without_shebang(text).parse::<TokenStream>();
         let (Ok(a), Ok(b)) = (lexed(before), lexed(after)) else {
@@ -227,7 +199,6 @@ impl Proof {
     }
 }
 
-/// `proc-macro2` does not lex a shebang line. An inner attribute is not one.
 fn without_shebang(text: &str) -> &str {
     if text.starts_with("#!") && !text.starts_with("#![") {
         text.split_once('\n').map_or("", |(_, rest)| rest)

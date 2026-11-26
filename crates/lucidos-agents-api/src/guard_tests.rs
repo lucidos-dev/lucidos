@@ -1,5 +1,3 @@
-/// Stop ends the turn and leaves the thread’s subscriptions armed.
-/// The event-wait E2E test also checks this behavior through the API.
 #[test]
 fn stopping_a_turn_never_reaches_the_thread_s_subscriptions() {
     const CANCEL_CHAT_SRC: &str = include_str!("api/chat.rs");
@@ -7,7 +5,6 @@ fn stopping_a_turn_never_reaches_the_thread_s_subscriptions() {
         .split_once("pub(super) async fn cancel_chat(")
         .expect("cancel_chat still lives in api/chat.rs")
         .1;
-    // Comments can name both symbols. Check for the call and construction.
     assert!(
         !body.contains("cancel_event_waits_for_thread("),
         "cancel_chat must not cancel the thread's subscriptions: Stop ends the turn"
@@ -18,8 +15,6 @@ fn stopping_a_turn_never_reaches_the_thread_s_subscriptions() {
     );
 }
 
-/// The step row renders its description as well as its arguments.
-/// Both emitters must redact before describing so the row cannot leak secrets.
 #[test]
 fn both_tool_call_emit_sites_redact_before_describing() {
     for (label, src, redact_call, describe_call) in [

@@ -1,14 +1,3 @@
-//! `lucidos ps`: the *ps stand-in* for a sandboxed macOS agent.
-//!
-//! macOS refuses to exec a setuid binary from a seatbelt sandbox, and `/bin/ps`
-//! is setuid root (ADR 0645). This reads the same kernel facts through libproc
-//! and sysctl, which need no privilege for this user's processes. The engine
-//! puts a `ps` shim that runs it first on a sandboxed agent's `PATH`.
-//!
-//! A process guard reads its answer, so a fact the kernel withholds is never
-//! guessed. Unreadable argv prints as `(comm)`. An unreadable number prints
-//! as 0. An option or field outside the list in `HELP` exits 2.
-
 use std::fmt::Write as _;
 use std::io::Write as _;
 
@@ -56,7 +45,6 @@ pub(crate) fn run(args: PsArgs) -> Result<u8, BoxError> {
     Ok(if rows.is_empty() { 1 } else { 0 })
 }
 
-/// `ps aux | head` closes the pipe early, and `/bin/ps` exits quietly then.
 fn print_all(text: &str) -> Result<(), BoxError> {
     match std::io::stdout().lock().write_all(text.as_bytes()) {
         Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
@@ -71,23 +59,17 @@ fn refuse(message: &str) -> u8 {
     2
 }
 
-/// One process, as the kernel reports it.
-// Only the macOS reader builds these; elsewhere `kernel` refuses.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Row {
     pub(crate) pid: u32,
     pub(crate) ppid: u32,
     pub(crate) pgid: u32,
-    /// The effective user, which `-u` and the default selection match.
     pub(crate) uid: u32,
     pub(crate) user: String,
-    /// The real user, which `-U` matches.
     pub(crate) ruid: u32,
     pub(crate) ruser: String,
-    /// `ttys003`, or `??` without a terminal device.
     pub(crate) tty: String,
-    /// Holds a controlling terminal, which selection without `x` requires.
     pub(crate) controlled: bool,
     pub(crate) started: i64,
     pub(crate) rss_kb: u64,
@@ -105,8 +87,6 @@ pub(crate) struct Row {
 #[cfg(any(target_os = "macos", test))]
 const NO_TTY: &str = "??";
 
-/// The caller's effective user, for the default selection.
-// Only the macOS reader builds these; elsewhere `kernel` refuses.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Me {
@@ -183,7 +163,6 @@ impl Field {
         })
     }
 
-    /// The header `/bin/ps` prints for the field.
     fn header(self) -> &'static str {
         match self {
             Field::Pid => "PID",
@@ -261,23 +240,17 @@ fn named_column(field: Field, header: &str) -> Column {
     }
 }
 
-/// Which processes a command line names, by the rules of macOS `ps.c`.
 #[derive(Debug, Default)]
 struct Selection {
-    /// `-a`, `-A` or `-e`: every user, not only the caller.
     all_users: bool,
-    /// `x`, `-A` or `-e`: processes without a controlling terminal too.
     with_ttyless: bool,
     pids: Vec<u32>,
-    /// `-u`, matched against the effective user.
     users: Vec<String>,
-    /// `-U`, matched against the real user.
     real_users: Vec<String>,
 }
 
 impl Selection {
     fn matches(&self, row: &Row, me: &Me) -> bool {
-        // A listed pid shows whatever its terminal.
         if self.pids.contains(&row.pid) {
             return true;
         }
@@ -312,7 +285,6 @@ impl Spec {
         let mut i = 0;
         while i < argv.len() {
             let arg = &argv[i];
-            // The first word may be BSD style (`aux`), with no dash.
             let (dashed, flags) = match arg.strip_prefix('-') {
                 Some(flags) if !flags.is_empty() => (true, flags),
                 _ if i == 0 && !arg.is_empty() => (false, arg.as_str()),
@@ -456,7 +428,6 @@ fn jobs_columns() -> Vec<Column> {
     .collect()
 }
 
-/// `/bin/ps` formats times in the user's locale, and so must its stand-in.
 fn strftime(format: &str, secs: i64) -> String {
     let Ok(format) = std::ffi::CString::new(format) else {
         return String::new();
@@ -480,7 +451,6 @@ fn use_locale_time() {
     }
 }
 
-/// `[[dd-]hh:]mm:ss`
 fn clock(secs: i64) -> String {
     let secs = secs.max(0);
     let (days, hours, mins, secs) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
@@ -491,7 +461,6 @@ fn clock(secs: i64) -> String {
     }
 }
 
-/// `M:SS.cc`, minutes unbounded, as `/bin/ps` prints CPU time.
 fn cpu_clock(cpu_ns: u64) -> String {
     let hundredths = cpu_ns / 10_000_000;
     format!(
@@ -502,8 +471,6 @@ fn cpu_clock(cpu_ns: u64) -> String {
     )
 }
 
-/// `/bin/ps`'s STARTED rule: a clock time within a day, a weekday and hour
-/// within a week, else a date.
 fn started(secs: i64, now: i64) -> String {
     let age = now - secs;
     let format = if age < 86_400 {
@@ -521,7 +488,6 @@ fn percent_cpu(row: &Row, now: i64) -> f64 {
     row.cpu_ns as f64 / 1e9 / elapsed * 100.0
 }
 
-/// One line per process: a control character prints as `?`, as `/bin/ps` does.
 fn flatten(words: &[String]) -> String {
     words
         .join(" ")
@@ -570,7 +536,6 @@ fn cell(field: Field, row: &Row, now: i64) -> String {
     }
 }
 
-/// `ttys003` prints as `s003` and `console` as `con` under `TT`.
 fn short_tty(tty: &str) -> String {
     match tty {
         "console" => "con".to_string(),
@@ -578,8 +543,6 @@ fn short_tty(tty: &str) -> String {
     }
 }
 
-/// `/bin/ps` cuts COMM to the kernel's 16-character name length, except as
-/// the last column.
 const COMM_WIDTH: usize = 16;
 
 fn render(spec: &Spec, rows: &[&Row], now: i64) -> String {
@@ -615,8 +578,6 @@ fn render(spec: &Spec, rows: &[&Row], now: i64) -> String {
             } else {
                 0
             };
-            // `/bin/ps` lets a long value overflow a fixed column, and only
-            // COMM and COMMAND take the width of their content.
             let content = match c.field {
                 Field::Comm | Field::Command => content,
                 _ => 0,
@@ -629,7 +590,6 @@ fn render(spec: &Spec, rows: &[&Row], now: i64) -> String {
         for (at, text) in texts.iter().enumerate() {
             if at > 0 {
                 out.push(' ');
-                // `/bin/ps` leaves one more space after the TT column.
                 if spec.columns[at - 1].field == Field::Tt {
                     out.push(' ');
                 }
@@ -671,21 +631,15 @@ mod kernel {
 
     use super::{Me, Row, Snapshot, NO_TTY};
 
-    /// Process states from `<sys/proc.h>`.
     const SIDL: u8 = 1;
     const SRUN: u8 = 2;
     const SSLEEP: u8 = 3;
     const SSTOP: u8 = 4;
     const SZOMB: u8 = 5;
-    /// `p_flag` and `e_flag` bits from `<sys/proc.h>` and `<sys/sysctl.h>`.
     const P_CONTROLT: i32 = 0x2;
     const EPROC_SLEADER: i32 = 0x2;
     const NODEV: i32 = -1;
 
-    /// `sizeof(struct kinfo_proc)` on LP64, and the offsets of the fields
-    /// read below. libc does not define the struct, and `sysctl` hands back
-    /// raw bytes, so each field is read at its offset. The live tests compare
-    /// every one against `/bin/ps`.
     const KINFO_SIZE: usize = 648;
     const OFF_STARTED_SEC: usize = 0;
     const OFF_FLAG: usize = 32;
@@ -714,8 +668,6 @@ mod kernel {
         fn mach_timebase_info(info: *mut [u32; 2]) -> c_int;
     }
 
-    /// One process from `sysctl kern.proc.all`, which names every process to
-    /// any user, root's included.
     struct Kinfo {
         pid: i32,
         ppid: i32,
@@ -765,8 +717,6 @@ mod kernel {
 
     fn all_procs() -> Result<Vec<Kinfo>, String> {
         let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
-        // A process can start between the size query and the read, so leave
-        // room and retry when the kernel still says the buffer is short.
         for _ in 0..4 {
             let mut size: usize = 0;
             // SAFETY: a null buffer asks for the size.
@@ -861,7 +811,6 @@ mod kernel {
         }
     }
 
-    /// argv from `KERN_PROCARGS2`, or `None` when the kernel withholds it.
     fn proc_args(pid: i32, max: usize) -> Option<Vec<String>> {
         if max == 0 {
             return None;
@@ -925,7 +874,6 @@ mod kernel {
             .clone()
     }
 
-    /// `/dev/console` is device 0, so only `NODEV` means no terminal.
     fn tty_name(dev: i32) -> String {
         if dev == NODEV {
             return NO_TTY.to_string();
@@ -937,7 +885,6 @@ mod kernel {
             return NO_TTY.to_string();
         }
         let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
-        // devname_r answers `#C<major>:<minor>` when the node is unknown.
         if name.is_empty() || name.starts_with('#') {
             NO_TTY.to_string()
         } else {
@@ -945,10 +892,6 @@ mod kernel {
         }
     }
 
-    /// The first stat letter, then `<` or `N` for nice, `s` for a session
-    /// leader and `+` for the foreground process group. The first letter
-    /// needs the task's thread count, which the kernel withholds for another
-    /// user's process, so it prints as `?` there.
     fn state(info: &Kinfo, task: Option<&libc::proc_taskinfo>) -> String {
         let letter = match info.status {
             SIDL => 'I',
@@ -976,8 +919,6 @@ mod kernel {
         out
     }
 
-    /// The mach time ratio, as (numerator, denominator) of nanoseconds per
-    /// tick. Apple Silicon ticks are not nanoseconds.
     fn nanos_per_tick() -> (u64, u64) {
         let mut base = [0u32; 2];
         // SAFETY: `base` is the two-word `mach_timebase_info` out parameter.
@@ -1159,7 +1100,6 @@ mod tests {
         assert!(Spec::parse(&args(&["e"])).is_err());
     }
 
-    /// Each expectation was checked against macOS `/bin/ps`.
     #[test]
     fn selection_follows_macos_ps() {
         let mine = row(10, 501, "ttys001");
@@ -1167,7 +1107,6 @@ mod tests {
         let other_user = row(12, 0, "ttys001");
         let daemon = row(13, 0, "??");
         let my_daemon = row(14, 501, "??");
-        // Started by 501, running as root, as a setuid helper does.
         let mut setuid = row(15, 0, "??");
         setuid.ruid = 501;
         setuid.ruser = "user501".to_string();
@@ -1275,9 +1214,6 @@ mod tests {
     }
 }
 
-/// Compares the stand-in with the real `/bin/ps` on live processes. Each test
-/// skips itself where `/bin/ps` cannot run, which is inside the very sandbox
-/// this stand-in exists for.
 #[cfg(all(test, target_os = "macos"))]
 mod live_tests {
     use super::*;
@@ -1324,8 +1260,6 @@ mod live_tests {
 
     #[test]
     fn the_stat_modifiers_match_bin_ps() {
-        // The first letter is a live thread count that can change between the
-        // two reads, so compare what follows it.
         for pid in live_pids() {
             let Some(real) = bin_ps(&["-o", "stat=", "-p", &pid]) else {
                 return;
@@ -1349,15 +1283,12 @@ mod live_tests {
             &["-U", &user],
         ] {
             let words: Vec<&str> = selection.iter().copied().chain(["-o", "pid="]).collect();
-            // No answer means a sandbox, or nothing selected, which exits 1.
             let Some(real) = bin_ps(&words) else {
                 continue;
             };
             let ours = stand_in(&words);
             let ours: std::collections::HashSet<&str> = ours.lines().collect();
             let real: std::collections::HashSet<&str> = real.lines().collect();
-            // A process can start or end between the two reads. A host with
-            // no terminals selects only a few, so one of them may differ.
             let common = real.intersection(&ours).count();
             let larger = real.len().max(ours.len());
             assert!(
@@ -1376,8 +1307,6 @@ mod live_tests {
             return;
         };
         let ours = stand_in(&["-A", "-o", fields]);
-        // A process can start or end between the two reads, so compare the
-        // lines both runs saw.
         let ours: std::collections::HashSet<&str> = ours.lines().collect();
         let common = real.lines().filter(|line| ours.contains(line)).count();
         assert!(

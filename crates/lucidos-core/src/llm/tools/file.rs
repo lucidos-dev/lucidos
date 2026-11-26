@@ -1,13 +1,7 @@
-//! LLM-facing schemas for workspace file tools (read/write/edit, search,
-//! import). Handlers live in `engine::tools::files`.
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// The `repo` argument, spelled once for every tool that can address a
-/// registered repository. Written once because each schema is billed on every
-/// request of every thread, and because four hand-copied descriptions drift.
 fn repo_arg() -> serde_json::Value {
     json!({
         "type": "string",

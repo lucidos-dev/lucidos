@@ -2,16 +2,6 @@ use super::msg_helpers::*;
 use super::*;
 use crate::core::changes::ChangeStatus;
 
-// ----------------------------------------------------------------------------
-// build_resume_tool_blocks_with_skip_ids — Phase 3 of the
-// trigger-knowhow-discovery plan.
-//
-// On resume, the most recent N (ToolCalled, ToolResult) pairs are
-// reconstructed as full Message::Blocks(...) pairs prepended to the LLM
-// messages vec. `load_knowhow` follows the same window, with no body in it
-// (ADR 0425).
-// ----------------------------------------------------------------------------
-
 #[test]
 fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
     use crate::core::EventRow;
@@ -96,8 +86,6 @@ fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
     }
 }
 
-/// A thread from before `execute_intent` was retired still resumes: its stored
-/// pair replays as a ToolUse and its result, though no array offers the tool.
 #[test]
 fn a_retired_execute_intent_pair_still_replays_on_resume() {
     use crate::core::EventRow;
@@ -115,12 +103,12 @@ fn a_retired_execute_intent_pair_still_replays_on_resume() {
         row("MessageReceived", json!({"text": "Check my calendar."}), 1),
         row(
             "ToolCalled",
-            json!({"name": "execute_intent", "args": {"intent_id": "calendar/check"}}), // Retired compatibility.
+            json!({"name": "execute_intent", "args": {"intent_id": "calendar/check"}}),
             2,
         ),
         row(
             "ToolResult",
-            json!({"name": "execute_intent", "result": "Calendar is clear.", "success": true}), // Retired compatibility.
+            json!({"name": "execute_intent", "result": "Calendar is clear.", "success": true}),
             3,
         ),
         row(
@@ -144,7 +132,7 @@ fn a_retired_execute_intent_pair_still_replays_on_resume() {
     };
     assert!(
         matches!(&call[0], ContentBlock::ToolUse { name, input, .. }
-            if name == "execute_intent" && input["intent_id"] == "calendar/check"), // Retired compatibility.
+            if name == "execute_intent" && input["intent_id"] == "calendar/check"),
         "{call:?}"
     );
     let MessageContent::Blocks(result) = &blocks[1].content else {
@@ -181,7 +169,6 @@ fn build_resume_tool_blocks_returns_empty_when_no_tools() {
 
 #[test]
 fn build_resume_tool_blocks_caps_at_n() {
-    // 5 unrelated tool calls, N=2 -> 2 most recent emitted
     use crate::core::EventRow;
     use chrono::Utc;
     let now = Utc::now();
@@ -227,7 +214,6 @@ fn build_resume_tool_blocks_drop_an_old_load_knowhow_like_any_tool() {
     use chrono::Utc;
     let now = Utc::now();
     let mut events = Vec::new();
-    // load_knowhow first (oldest)
     events.push(EventRow {
         id: uuid::Uuid::new_v4(),
         event_type: "ToolCalled".into(),
@@ -244,7 +230,6 @@ fn build_resume_tool_blocks_drop_an_old_load_knowhow_like_any_tool() {
         thread_id: None,
         sequence: Some(2),
     });
-    // 5 unrelated tool calls after
     for i in 0..5_i64 {
         events.push(EventRow {
             id: uuid::Uuid::new_v4(),
@@ -264,7 +249,6 @@ fn build_resume_tool_blocks_drop_an_old_load_knowhow_like_any_tool() {
         });
     }
 
-    // N=2: the older load_knowhow falls out of the window like any tool.
     let (blocks, _skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
         &events,
         2,
@@ -300,12 +284,6 @@ fn build_resume_tool_blocks_drop_an_old_load_knowhow_like_any_tool() {
     );
 }
 
-/// The skip set returned alongside the resume blocks must contain ONLY the
-/// `ToolCalled` event ids that were emitted as full Message::Blocks pairs —
-/// older tools must NOT be in it, so their `[tools: ...]` summary
-/// in stringified history survives. Without this, suppressing the summary
-/// for the wrong rows would silently strip the orchestrator's older tool
-/// context twice over (once dropped from blocks, once dropped from summary).
 #[test]
 fn build_resume_tool_blocks_skip_set_contains_only_emitted_pairs() {
     use crate::core::EventRow;
@@ -338,22 +316,14 @@ fn build_resume_tool_blocks_skip_set_contains_only_emitted_pairs() {
         2,
         &std::collections::HashSet::new(),
     );
-    // N=2 -> last two tool_called event ids only (tool_3, tool_4)
     assert_eq!(skip_ids.len(), 2);
     assert!(skip_ids.contains(&tool_called_ids[3].to_string()));
     assert!(skip_ids.contains(&tool_called_ids[4].to_string()));
-    // Older tools NOT in the skip set — they keep their [tools: ...] summary
     assert!(!skip_ids.contains(&tool_called_ids[0].to_string()));
     assert!(!skip_ids.contains(&tool_called_ids[1].to_string()));
     assert!(!skip_ids.contains(&tool_called_ids[2].to_string()));
 }
 
-/// Two tools called back-to-back before either result arrives, then results
-/// arrive in same call order. Exercises the `rposition`-by-name fallback
-/// path in `collect_tool_pairs_chronological`: each `ToolResult` must be
-/// paired with the `ToolCalled` of the same `name` (not blindly with the
-/// most recent pending call), so the synthesized `tool_use_id` on the
-/// reconstructed `ToolUse` matches its `ToolResult`'s `tool_use_id`.
 #[test]
 fn build_resume_tool_blocks_pairs_interleaved_tools_correctly() {
     use crate::core::EventRow;
@@ -378,8 +348,6 @@ fn build_resume_tool_blocks_pairs_interleaved_tools_correctly() {
             thread_id: None,
             sequence: Some(2),
         },
-        // Result for tool_a arrives FIRST despite being called first
-        // (interleaved — tool_b is still in flight).
         EventRow {
             id: uuid::Uuid::new_v4(),
             event_type: "ToolResult".into(),
@@ -402,10 +370,8 @@ fn build_resume_tool_blocks_pairs_interleaved_tools_correctly() {
         5,
         &std::collections::HashSet::new(),
     );
-    // Expect 4 messages (2 pairs).
     assert_eq!(blocks.len(), 4);
     use crate::llm::{ContentBlock, MessageContent};
-    // First pair should be tool_a (ToolUse + ToolResult must reference same id).
     let (use_a_id, use_a_input) = match &blocks[0].content {
         MessageContent::Blocks(b) => match &b[0] {
             ContentBlock::ToolUse {
@@ -433,7 +399,6 @@ fn build_resume_tool_blocks_pairs_interleaved_tools_correctly() {
         _ => panic!("expected Blocks"),
     };
     assert_eq!(use_a_id, result_a_id, "tool_a's use+result must share id");
-    // Second pair: tool_b
     match &blocks[2].content {
         MessageContent::Blocks(b) => match &b[0] {
             ContentBlock::ToolUse { name, input, .. } => {
@@ -445,20 +410,6 @@ fn build_resume_tool_blocks_pairs_interleaved_tools_correctly() {
         _ => panic!("expected Blocks"),
     }
 }
-
-// ----------------------------------------------------------------------------
-// dismiss_from_context — Phase 4 of the trigger-knowhow-discovery plan.
-//
-// `ContextDismissed` records produced by the `dismiss_from_context` tool let
-// the agent prune individual `(ToolCalled, ToolResult)` pairs and
-// `ChildThreadCompleted` blocks from its future resume context. The pruning
-// happens in two layers:
-// - `build_resume_tool_blocks_with_skip_ids` drops tool pairs (so they vanish
-//   from BOTH the rebuilt verbatim blocks AND the stringified `[tools: ...]`
-//   summary).
-// - `build_session_messages` drops `ChildThreadCompleted` projections (so the
-//   structured user-channel block stops appearing in history).
-// ----------------------------------------------------------------------------
 
 #[test]
 fn build_resume_tool_blocks_with_skip_ids_excludes_dismissed_tool_pair() {
@@ -503,9 +454,6 @@ fn build_resume_tool_blocks_with_skip_ids_excludes_dismissed_tool_pair() {
     );
 }
 
-/// Two tool calls, only one dismissed — the other still appears in both
-/// rebuilt blocks and skip_ids. Distinguishes "dismissal works" from
-/// "dismissal is overzealous".
 #[test]
 fn build_resume_tool_blocks_with_skip_ids_keeps_undismissed_tool_pair() {
     use chrono::Utc;
@@ -559,7 +507,6 @@ fn build_resume_tool_blocks_with_skip_ids_keeps_undismissed_tool_pair() {
         5,
         &std::collections::HashSet::new(),
     );
-    // tool_b survives → 2 messages (ToolUse + ToolResult).
     assert_eq!(blocks.len(), 2, "undismissed pair should survive");
     assert_eq!(skip_ids.len(), 1, "skip set has only the surviving pair");
     assert!(
@@ -574,9 +521,6 @@ fn build_resume_tool_blocks_with_skip_ids_keeps_undismissed_tool_pair() {
     );
 }
 
-/// Dismissal is order-independent — emitting the `ContextDismissed` BEFORE
-/// the `ToolCalled` it targets (e.g. on a fresh resume reading a backfilled
-/// out-of-order stream) still drops the pair. The set is collected up-front.
 #[test]
 fn build_resume_tool_blocks_with_skip_ids_dismissal_works_regardless_of_order() {
     use chrono::Utc;
@@ -617,10 +561,6 @@ fn build_resume_tool_blocks_with_skip_ids_dismissal_works_regardless_of_order() 
     assert!(skip_ids.is_empty());
 }
 
-/// `build_session_messages` drops a dismissed `ChildThreadCompleted` event
-/// from history projection. The agent asked the structured callback to be
-/// gone from its future resume context — keeping it in `messages[]` would
-/// undo the dismissal at the projection layer.
 #[test]
 fn build_session_messages_excludes_dismissed_child_thread_completed() {
     use chrono::Utc;
@@ -668,8 +608,6 @@ fn build_session_messages_excludes_dismissed_child_thread_completed() {
     );
 }
 
-/// Sanity: an undismissed `ChildThreadCompleted` IS projected as a
-/// user-channel block. Pairs with the dismissal test above.
 #[test]
 fn build_session_messages_projects_undismissed_child_thread_completed() {
     use chrono::Utc;
@@ -700,18 +638,12 @@ fn build_session_messages_projects_undismissed_child_thread_completed() {
     assert!(cc.content.contains("Nightly"));
     assert!(cc.content.contains("all green"));
     assert!(cc.content.contains("change-1"));
-    // C1: the EVENT id (not the child_thread_id) must be surfaced as an
-    // `event_id: <uuid>` line so the LLM can pass it to dismiss_from_context.
     let expected = format!("event_id: {}", cc_event_id);
     assert!(
         cc.content.contains(&expected),
         "projection must surface the event_id; got:\n{}",
         cc.content
     );
-    // The "session can finish refers to child only" guard rail lives
-    // inside this projection (not the wake-up signal — there is no
-    // wake_text after the child-completion-card refactor). Keep a narrow
-    // assertion so the rule stays load-bearing.
     assert!(
         cc.content.contains("session can finish") && cc.content.contains("child subprocess"),
         "projection must carry the 'session can finish' guard rail; got:\n{}",
@@ -719,9 +651,6 @@ fn build_session_messages_projects_undismissed_child_thread_completed() {
     );
 }
 
-/// ADR 0252: a user Stop reaches a chat parent as a `[CHILD THREAD STOPPED]`
-/// block. Its words are the fix, so pin them: the child is alive, what comes
-/// next, and what not to do. The incident's parent rolled back live work.
 #[test]
 fn build_session_messages_projects_child_thread_stopped_as_alive() {
     use chrono::Utc;
@@ -760,9 +689,6 @@ fn build_session_messages_projects_child_thread_stopped_as_alive() {
     }
 }
 
-/// I6: a filed report reaches a chat parent on its next turn. It carries the
-/// waking card's block and a note that it woke nothing. Its change
-/// counts as reported, so the block names what became of it.
 #[test]
 fn build_session_messages_projects_a_filed_report_with_its_note() {
     use chrono::Utc;
@@ -803,9 +729,6 @@ fn build_session_messages_projects_a_filed_report_with_its_note() {
     }
 }
 
-/// ADR 0278: a child moved to top level reaches a chat parent as a
-/// `[CHILD THREAD MOVED OUT]` block, so the parent stops waiting for it rather
-/// than respawning it.
 #[test]
 fn build_session_messages_projects_child_thread_detached_as_moved_out() {
     use chrono::Utc;
@@ -841,8 +764,6 @@ fn build_session_messages_projects_child_thread_detached_as_moved_out() {
     }
 }
 
-/// A canceled card now comes only from Archive or Discard, so it reads as
-/// final and no longer says "user stop".
 #[test]
 fn a_canceled_card_reads_as_the_users_final_word() {
     use chrono::Utc;
@@ -864,19 +785,12 @@ fn a_canceled_card_reads_as_the_users_final_word() {
     assert!(!card.contains("user stop"), "got:\n{card}");
 }
 
-/// Engine-core audit finding 3: a rebuilt result reaches the model with the
-/// same `[evt-<hex>]` trailer the live turn appends. Without it the context
-/// panel cannot address a resumed result. From the second round on, the model
-/// can then neither keep one open nor see one expire.
 #[test]
 fn every_rebuilt_tool_result_carries_its_event_address() {
     use crate::core::EventRow;
     use crate::llm::{ContentBlock, MessageContent};
     use chrono::Utc;
     let now = Utc::now();
-    // Three shapes the builder produces: a plain result, an orphan stub, and
-    // a load_knowhow body swapped for the pointer stub. All three are results
-    // the panel has to be able to name.
     let plain_id = uuid::Uuid::new_v4();
     let orphan_id = uuid::Uuid::new_v4();
     let knowhow_id = uuid::Uuid::new_v4();
@@ -951,7 +865,6 @@ fn every_rebuilt_tool_result_carries_its_event_address() {
         );
     }
 
-    // The stub swap and the orphan stub keep their own body above the trailer.
     let bodies: Vec<String> = blocks
         .iter()
         .filter_map(|m| match &m.content {
@@ -969,9 +882,6 @@ fn every_rebuilt_tool_result_carries_its_event_address() {
     assert!(bodies.iter().any(|c| c.contains("file body")));
 }
 
-/// An orchestrator's children held every change, so its own line read "none"
-/// and the parent never knew work waited below. The sub-threads' changes get
-/// their own section, apart from the child's own, each naming its owner.
 #[test]
 fn child_completed_block_lists_sub_thread_changes_apart_from_its_own() {
     use chrono::Utc;
@@ -1024,7 +934,6 @@ fn child_completed_block_lists_sub_thread_changes_apart_from_its_own() {
         "got:\n{block}"
     );
 
-    // A card with nothing below it reads exactly as before.
     let plain = format_child_thread_completed_block(
         &row(json!({
             "child_thread_id": Uuid::new_v4().to_string(),
@@ -1036,8 +945,6 @@ fn child_completed_block_lists_sub_thread_changes_apart_from_its_own() {
     assert!(!plain.contains("sub-threads"), "got:\n{plain}");
 }
 
-/// An integrated child's report names its branch and head, and tells the
-/// parent to merge it. A report without one reads as before.
 #[test]
 fn child_completed_block_names_the_branch_an_integrated_child_hands_up() {
     let block = format_child_thread_completed_block(
@@ -1082,10 +989,6 @@ fn child_report_row(payload: serde_json::Value) -> EventRow {
     }
 }
 
-/// A parent said a change "still waits for your Apply" two days after the
-/// user applied it. The card froze the change list as the child left it, and
-/// every resume rebuilt it that way. The card now names what became of each
-/// change since, and says that any later "pending" is out of date.
 #[test]
 fn child_completed_block_names_what_became_of_each_change_since() {
     let (applied, waiting, discarded) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
@@ -1127,7 +1030,6 @@ fn child_completed_block_names_what_became_of_each_change_since() {
         "the card overrides the summary's stale claim; got:\n{block}"
     );
 
-    // Nothing resolved since: the card reads exactly as the child left it.
     let unchanged = format_child_thread_completed_block(&report, &ChangeStatuses::new());
     assert!(
         unchanged.contains(&format!("Pending changes: {applied}, {waiting}\n")),
@@ -1140,9 +1042,6 @@ fn child_completed_block_names_what_became_of_each_change_since() {
     );
 }
 
-/// The store reads each reported change's status from the `changes` table.
-/// A resume then sees the change as it is now, including one whose row a
-/// thread delete removed.
 #[tokio::test]
 async fn store_built_messages_read_each_reported_change_as_it_is_now() {
     use crate::test_support::{setup_test_db, teardown_test_db};

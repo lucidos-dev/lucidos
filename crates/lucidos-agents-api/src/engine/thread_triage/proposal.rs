@@ -1,16 +1,9 @@
-//! The triage proposal and the gate in front of `apply_triage` (ADR 0349).
-//!
-//! `triage` records what it proposed as a `ThreadTriageProposed` event on the
-//! calling thread. `apply_triage` then needs two facts the engine can read:
-//! that proposal, and a reply from the user after it in the same thread.
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent, TriageProposalEntry};
 
-/// Record a proposal on the calling thread, with the agent as its actor.
 pub(crate) async fn record_proposal(
     bus: &EventBus,
     caller: Uuid,
@@ -27,12 +20,9 @@ pub(crate) async fn record_proposal(
     Ok(())
 }
 
-/// Why `apply_triage` may not run at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovalRefusal {
-    /// No `triage` ran in this thread.
     NoProposal,
-    /// The user has not replied since the newest proposal.
     NoReply,
 }
 
@@ -53,7 +43,7 @@ impl std::fmt::Display for ApprovalRefusal {
     }
 }
 
-/// A user reply over `events e`: their answer to a question card, or their
+/// INVARIANT: A user reply over `events e`: their answer to a question card, or their
 /// message once the agent has read it. Both carry a `Device` actor.
 ///
 /// A follow-up typed mid-turn is persisted before the agent reads it, so the
@@ -70,7 +60,6 @@ const USER_REPLY_SQL: &str =
            OR (c.event_type = 'PromptInjected' \
                AND c.payload->>'injected_message_id' = e.id::text)))))";
 
-/// The newest proposal's entries, when the user replied after it.
 pub(crate) async fn approved_proposal(
     pool: &PgPool,
     caller: Uuid,

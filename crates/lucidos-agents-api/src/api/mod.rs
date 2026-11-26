@@ -123,9 +123,6 @@ mod workspace_operations;
 mod workspace_prompt_footprint;
 mod ws_echo;
 
-/// The `apis.json` read, re-exported because the engine binary reads it at
-/// startup and `SystemEvent::ProxyConfigRejected` carries the refusals. The
-/// rest of `proxy` stays crate-internal.
 pub use proxy::{load_proxy_config, InsecureTransport, ProxyConfigLoad, RejectedProvider};
 
 use axum::{
@@ -168,15 +165,9 @@ use crate::scheduler::{Notification, PushSubscription, SchedulerManager};
 
 pub(crate) use error::ApiError;
 
-/// Pending OAuth flows keyed by provider name, each awaiting token exchange completion.
 type PendingOAuthFlows =
     Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Receiver<OAuthFlowResult>>>>;
 
-/// Reject upload filenames that would escape their destination directory.
-/// Multipart `Content-Disposition` filenames are attacker-controlled — without
-/// this guard, a name like `../../etc/passwd` slipped into `dir.join(name)` or
-/// `format!("imported/{name}")` would write outside the intended subtree.
-/// Trims surrounding whitespace; the leaf invariant is what matters.
 pub(super) fn sanitize_leaf_filename(name: &str) -> Option<String> {
     let trimmed = name.trim();
     if trimmed.is_empty()
@@ -197,11 +188,6 @@ pub(super) fn parse_optional_uuid(opt: Option<&str>) -> Result<Option<Uuid>, Sta
         .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
-/// Trim-then-parse for an optional UUID coming from a JSON body or LLM tool
-/// argument. Treats `None` / empty / whitespace-only as `Ok(None)`; otherwise
-/// returns the parsed UUID or `Err(raw)` carrying the offending input so the
-/// caller can build a context-appropriate error message (the HTTP handler
-/// returns 400 with the value; the LLM tool returns it in a tool-error).
 pub(crate) fn parse_optional_uuid_trimmed(opt: Option<&str>) -> Result<Option<Uuid>, String> {
     match opt.map(str::trim) {
         None | Some("") => Ok(None),
@@ -209,7 +195,7 @@ pub(crate) fn parse_optional_uuid_trimmed(opt: Option<&str>) -> Result<Option<Uu
     }
 }
 
-/// Settle the `id` of a `NavigationRequested` payload that targets a thread.
+/// INVARIANT: Settle the `id` of a `NavigationRequested` payload that targets a thread.
 ///
 /// Two surfaces emit that event and both come through here: the `navigate_ui`
 /// LLM tool, which passes its calling thread, and the SDK's
@@ -244,7 +230,7 @@ pub(crate) fn resolve_thread_id_in_nav_payload(
     Ok(())
 }
 
-/// Settle the repository a `NavigationRequested` file locator names.
+/// INVARIANT: Settle the repository a `NavigationRequested` file locator names.
 ///
 /// A `file_path` of `repo:<repo>:<mode>:<path>` opens a file in a registered
 /// repository clone (codec: `store/repoPath.ts`). The page reads `<repo>` as a
@@ -286,7 +272,7 @@ pub(crate) async fn resolve_repo_in_nav_payload(
     Ok(())
 }
 
-/// The id of the one repository `reference` names: by id, then by exact name,
+/// INVARIANT: The id of the one repository `reference` names: by id, then by exact name,
 /// then by name in any case. The first tier with a hit decides, and two hits in
 /// one tier are refused, since names are not unique. The same tiers as
 /// `matchRepository` in `store/actions/repoFileLink.ts`, so a link and a
@@ -318,7 +304,7 @@ pub(crate) fn match_repository(
     ))
 }
 
-/// A well-formed `repo:` locator's repository, mode and path segments, or
+/// INVARIANT: A well-formed `repo:` locator's repository, mode and path segments, or
 /// `None`. The same rules as `parseRepoPath` in `store/repoPath.ts`: every
 /// segment non-empty, mode `file` or `diff`, and a `#` qualifier non-empty.
 /// Everything after the second colon is the path, since a ref cannot hold a
@@ -340,7 +326,6 @@ pub(super) fn is_dangerous_git_ref(s: &str) -> bool {
     s.is_empty() || s.starts_with('-') || s.contains("..") || s.contains(';') || s.contains('|')
 }
 
-/// Map a file extension to its MIME content type.
 fn content_type_for_ext(ext: &str) -> &'static str {
     match ext {
         "html" | "htm" => "text/html",
@@ -369,7 +354,6 @@ fn content_type_for_ext(ext: &str) -> &'static str {
     }
 }
 
-/// Application state containing engine and shared read-only resources.
 #[derive(Clone)]
 pub struct AppState {
     pub engine: SharedEngine,
@@ -381,30 +365,19 @@ pub struct AppState {
     pub app_manager: Arc<AppManager>,
     pub scheduler: Arc<tokio::sync::Mutex<SchedulerManager>>,
     pub started_at: chrono::DateTime<chrono::Utc>,
-    /// Pending OAuth flows keyed by provider — the receiver resolves when the
-    /// background listener receives the callback and completes token exchange.
     pub pending_oauth_flows: PendingOAuthFlows,
-    /// Live one-shot secret-reveal tokens, shared by the credential reveal and
-    /// the backup key. Ephemeral by design; see `api::secret_reveal`.
     pub reveal_tokens: secret_reveal::RevealTokens,
-    /// Live one-shot call tickets, the voice socket's caller proof.
-    /// Ephemeral by design; see `api::voice_ticket`.
     pub call_tickets: voice_ticket::CallTickets,
-    /// The event hook feature, which a leaf crate implements (ADR 0746).
     pub event_hooks: Arc<dyn crate::core::event_hooks::EventHooks>,
 }
 
-/// File context sent when a file preview window is focused
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileContext {
     pub path: String,
-    /// Inclusive 1-based line range the user has selected in the preview, when
-    /// they picked one. Same shape and meaning as `RepoFileContext::lines`.
     #[serde(default)]
     pub lines: Option<(u32, u32)>,
 }
 
-/// Repo file context sent when the user is viewing a file from a registered repo
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoFileContext {
     pub repo_id: String,
@@ -416,22 +389,15 @@ pub struct RepoFileContext {
 #[derive(Debug, Deserialize)]
 pub struct AppCaptureRequest {
     pub request_id: String,
-    /// The answering page's device, as a chat send names it. It wins over the
-    /// header, so the check compares the id the turn recorded.
     #[serde(default)]
     pub device_id: Option<String>,
-    pub screenshot: String, // base64-encoded image (JPEG from the SDK capture; format sniffed downstream)
+    pub screenshot: String,
     pub dom: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
-    /// Mandatory. Semantic mode of the actor that authored this message —
-    /// `"human"` (a real person, the default for typical chat), `"agent"`
-    /// (LLM-driven, e.g. one thread spawning another via the `run_thread`
-    /// tool or a cross-workspace agent call), or `"engine"` (engine-internal,
-    /// e.g. recovery / scheduler).
     pub mode: crate::engine::thread_events::ActorMode,
     #[serde(default)]
     pub model: Option<String>,
@@ -445,26 +411,24 @@ pub struct ChatRequest {
     pub repo_file_context: Option<RepoFileContext>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    /// Backend to serve the model on this turn, when it has more than one
+    /// INVARIANT: Backend to serve the model on this turn, when it has more than one
     /// route. Honoured or refused, never substituted: a value naming an
     /// unconfigured backend errors rather than running somewhere else. Absent
     /// lets the model's own preferred provider decide.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Images sent inline, for a caller that cannot upload first. A
+    /// INVARIANT: Images sent inline, for a caller that cannot upload first. A
     /// cross-workspace spawn is one, since the mutating gate refuses it the
     /// upload route. Each is stored exactly as an upload is, and a refused one
     /// fails the request with the upload's 415. Ignored when `image_hashes` is
     /// set.
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
-    /// Hashes of images already uploaded through `POST /threads/:id/blobs`,
-    /// the app's path. It keeps this body small even on cellular.
     #[serde(default)]
     pub image_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub device_id: Option<String>,
-    /// True when this request spawns / continues a *coding-agent thread* (any
+    /// INVARIANT: True when this request spawns / continues a *coding-agent thread* (any
     /// backend), as opposed to a chat thread answered by the Lucidos Agent.
     /// The `coding_agent` field below picks the backend. Aliased to the legacy
     /// `use_claude_code` key so payloads persisted before the rename (queued
@@ -473,28 +437,21 @@ pub struct ChatRequest {
     pub use_coding_agent: Option<bool>,
     #[serde(default)]
     pub cc_model: Option<String>,
-    /// Which coding-agent backend a NEW coding-agent thread should run on
-    /// (`claude-code` | `codex`). Requires `use_coding_agent: true`; ignored
-    /// on follow-ups — the thread's stored backend wins (locked at first
-    /// SessionStarted).
     #[serde(default)]
     pub coding_agent: Option<crate::runtime::CodingAgent>,
     #[serde(default, alias = "message_id")]
     pub event_id: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
-    /// The sending page's *input chain* and this input's *input sequence* on
-    /// the thread. Both or neither, and they need `event_id`. The engine
-    /// refuses an input a later one from the same chain overtook (ADR 0449).
     #[serde(default)]
     pub input_chain: Option<String>,
     #[serde(default)]
     pub input_seq: Option<i64>,
-    /// Compose epoch captured with the device's send intent. An accepted
+    /// INVARIANT: Compose epoch captured with the device's send intent. An accepted
     /// retry retains this value; it is never refreshed from today's draft.
     #[serde(default)]
     pub compose_epoch: Option<i64>,
-    /// `true` when `thread_id` names a thread that is EXPECTED not to exist yet,
+    /// INVARIANT: `true` when `thread_id` names a thread that is EXPECTED not to exist yet,
     /// because this request is the one creating it.
     ///
     /// A thread has no creation event: it exists because an event exists on its
@@ -512,92 +469,40 @@ pub struct ChatRequest {
     /// cross-workspace client need no flag.
     #[serde(default)]
     pub new_thread: Option<bool>,
-    /// Required when `mode` is `"agent"` or `"engine"`: the thread that is
-    /// spawning this new thread (e.g. the Claude Code session whose `spawn-thread` skill
-    /// is making this call). Must be `null` when `mode` is `"human"`. The
-    /// `spawn-thread` skill reads `$LUCIDOS_THREAD_ID` and forwards it here.
     #[serde(default)]
     pub parent_thread_id: Option<String>,
-    /// The specific event in the parent thread that triggered this spawn —
-    /// e.g. the `ToolCalled` event for a `run_thread` tool invocation, or
-    /// the `CodingAgentToolCalled` event for a Bash call that ran the
-    /// `spawn-thread` skill. Allowed only when `mode` is `"agent"` or
-    /// `"engine"`. Lets audits trace exactly which step in the parent thread
-    /// caused this spawn.
     #[serde(default)]
     pub spawning_event_id: Option<String>,
-    /// The child's *wake mode*: `no-wake`, `wake` or `wake-when-all-done`.
-    /// Allowed only beside `parent_thread_id`. Omitted, a spawn takes its
-    /// parent's default: `no-wake` under the home thread, else `wake`.
     #[serde(default)]
     pub wake_mode: Option<String>,
-    /// Cross-workspace origin: name of the calling workspace (e.g. `"dev"`,
-    /// `"myws"`). When set, the receiver constructs
-    /// `MessageOrigin::Workspace` from the three `caller_*` fields. Mutually
-    /// exclusive with `parent_thread_id` / `spawning_event_id` — those are
-    /// for *same-workspace* parent-child spawns (with callback). Cross-workspace
-    /// is fire-and-forget; no callback path exists, so "parent" wording would
-    /// be misleading.
     #[serde(default)]
     pub caller_workspace: Option<String>,
-    /// Cross-workspace origin: UUID of the thread in the calling workspace
-    /// that initiated this POST. Allowed only when `caller_workspace` is set.
     #[serde(default)]
     pub caller_thread_id: Option<String>,
-    /// Cross-workspace origin: UUID of the event in the calling workspace
-    /// that triggered this POST (e.g. the `ToolCalled` event for a
-    /// `lucidos spawn-thread` invocation). Allowed only when `caller_workspace`
-    /// is set. Often `None` from Claude Code subprocesses, which lack access to their
-    /// own tool-call event id.
     #[serde(default)]
     pub caller_event_id: Option<String>,
     #[serde(default)]
     pub conflict_change_id: Option<String>,
     #[serde(default)]
     pub repo_id: Option<String>,
-    /// Scope-picker payload: an absolute path, a workspace-relative path
-    /// (`data/apps/<id>`), or a registered repo name/UUID. Resolved via the
-    /// shared `coding_agent_kind` pipeline to one of `lucidos | app | external`
-    /// and translated to (repo_id, app stash) by the chat handler. Mutually
-    /// exclusive with `repo_id`; supplying both is a 400. Frontend sends this
-    /// going forward; `repo_id` stays accepted for back-compat (CLI, older
-    /// frontends). An empty / missing folder falls through to today's default
-    /// (Lucidos when `repo_id` is also empty / missing).
     #[serde(default)]
     pub folder: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
-    /// Spawn an *integrated sub-thread*: a Lucidos-source coding-agent child
-    /// that folds into its Lucidos-source coding-agent parent's branch. It
-    /// runs the fast tier of `/harden` and proposes nothing. Absent means
-    /// independent. `lucidos spawn-thread --integrated` sets it. A
-    /// `mode=human` send cannot carry it and gets a 400.
     #[serde(default)]
     pub integrated: bool,
-    /// *User mentions*, by user id (ADR 0649). A message mentioning only
-    /// users pauses the agent and starts no turn. A gateway with fewer than
-    /// two users refuses a non-empty list.
     #[serde(default)]
     pub mentions: Vec<String>,
-    /// The *agent mention*: the message wakes the thread's agent, and resumes
-    /// it when paused.
     #[serde(default)]
     pub agent_mentioned: bool,
 }
 
-/// Body of the default (Stop) mode of `POST /api/v1/claude-code/stop`.
-/// `canceled = true` when the call canceled
-/// live work, settled a stuck `running` projection, or cancel-stamped a pending
-/// question — i.e. a status-changing event is on its way over SSE. `false` when
-/// the server had nothing to cancel: the client's optimistic "canceling" state
-/// is stale and it must re-sync the thread (the uncancelable-thread wedge fix).
-/// HTTP status stays 200 either way — the bool is additive.
 #[derive(Serialize)]
 pub struct CancelResponse {
     pub canceled: bool,
 }
 
-/// Chat Stop persists unread-input take-backs before canceling the live turn.
+/// INVARIANT: Chat Stop persists unread-input take-backs before canceling the live turn.
 /// `canceled` describes the live cancellation only; an input taken back with
 /// no live turn still needs an immediate client re-sync. Returned content lets
 /// another device restore inputs absent from its local timeline.
@@ -627,18 +532,11 @@ pub struct UploadResponse {
     pub error: Option<String>,
 }
 
-// Credentials types
 #[derive(Serialize)]
 pub struct CredentialsListResponse {
     pub credentials: Vec<CredentialInfo>,
 }
 
-/// The *credential scope* a create or update body declares.
-///
-/// `base_urls` is the field. `base_url` is permanent back-compat for a caller
-/// written before the scope became a set, and [`RequestedScope::declared`]
-/// folds it into the list. Both present is not an error: the singular joins the
-/// set, which is what adding a host to an old body means.
 #[derive(Deserialize, Default)]
 pub struct RequestedScope {
     #[serde(default)]
@@ -648,7 +546,7 @@ pub struct RequestedScope {
 }
 
 impl RequestedScope {
-    /// Every base URL the body asked for, or `None` when it named NEITHER
+    /// INVARIANT: Every base URL the body asked for, or `None` when it named NEITHER
     /// field.
     ///
     /// The distinction is load-bearing on the update verb, where absence has to
@@ -675,22 +573,12 @@ pub struct CreateCredentialRequest {
     pub auth_value: String,
     #[serde(default)]
     pub auth_header: Option<String>,
-    /// Optional custom env var name for the injected secret (e.g. `GITHUB_TOKEN`
-    /// instead of `CRED_<NAME>`). Validated like a user env var name.
     #[serde(default)]
     pub env_var_name: Option<String>,
-    /// The credential *form request* this save answers, when a request opened
-    /// the form. Any save also answers every open request for its service.
     #[serde(default)]
     pub form_request_id: Option<uuid::Uuid>,
 }
 
-/// Body of `PUT /api/v1/credential-base-urls?id=<uuid>`, which replaces one
-/// credential's scope and nothing else.
-///
-/// Narrow on purpose. The whole-row edit needs the auth type, and it defaults
-/// the auth header. So a script widening a scope through it can clobber fields
-/// it never meant to name.
 #[derive(Deserialize)]
 pub struct SetCredentialBaseUrlsRequest {
     pub base_urls: Vec<String>,
@@ -703,27 +591,19 @@ pub struct UpdateCredentialRequest {
     pub auth_type: String,
     #[serde(default)]
     pub auth_header: Option<String>,
-    /// New secret. `None` / empty string keeps the currently-stored secret —
-    /// lets the user edit non-secret fields without re-entering it.
     #[serde(default)]
     pub auth_value: Option<String>,
-    /// Editable email server settings, present only when editing an
+    /// INVARIANT: Editable email server settings, present only when editing an
     /// `email_password` credential. The credential's `email_accounts` row is
     /// the source of truth for IMAP/SMTP, so it must be kept in sync here.
     #[serde(default)]
     pub email: Option<EmailAccountSettings>,
-    /// Optional custom env var name for the injected secret. `None`/empty clears
-    /// it back to the default `CRED_<NAME>` form. Validated like a user env var.
     #[serde(default)]
     pub env_var_name: Option<String>,
-    /// The credential *form request* this save answers: a widening or a repair
-    /// that reopened this row.
     #[serde(default)]
     pub form_request_id: Option<uuid::Uuid>,
 }
 
-/// Email server settings carried by an `UpdateCredentialRequest` for
-/// `email_password` credentials. Mirrors the columns `configure_email` writes.
 #[derive(Deserialize)]
 pub struct EmailAccountSettings {
     pub email_address: String,
@@ -736,12 +616,6 @@ pub struct EmailAccountSettings {
     pub require_send_confirmation: bool,
 }
 
-/// Deserialize an `Option<T>` field into `Option<Option<T>>` so a handler can
-/// tell "key absent" (`None`) from "key present and null" (`Some(None)`).
-///
-/// `#[serde(default)]` alone collapses both to `None`. Pair this with
-/// `#[serde(default)]` on a nullable PATCH field whose `null` must mean *clear
-/// it* rather than *leave it alone*.
 pub fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
@@ -750,33 +624,14 @@ where
     Option::deserialize(deserializer).map(Some)
 }
 
-// Model registry types
-
-/// One of a model's routes, plus what the engine derives about it.
-///
-/// `reasoning_efforts` exists so the Lucidos Agent picker filters against the
-/// efforts the engine will actually send rather than deriving its own answer
-/// from the model id. Both used to derive it separately and disagreed, which is
-/// how a local model was offered a tier its server rejected. See
-/// `llm::reasoning::supported_efforts`, the single source of truth.
-///
-/// It sits on the ROUTE because the answer depends on the backend as much as on
-/// the model. The same Claude id offers six efforts on Vertex and four through
-/// OpenRouter, whose server has no `xhigh`.
 #[derive(Serialize)]
 pub struct RouteInfo {
     pub provider: String,
-    /// The id this route puts on the wire, always spelled out here even when
-    /// the stored route leaves it to default. A client comparing routes should
-    /// not have to re-derive it.
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i32>,
     pub reasoning_efforts: &'static [&'static str],
-    /// Runtime configuration, or null when the backend cannot report it.
     pub configured: Option<bool>,
-    /// A supported app request protocol through a builtin proxy, independent
-    /// of whether the user has configured its credentials.
     pub proxy: Option<ModelProxyInfo>,
 }
 
@@ -794,11 +649,10 @@ pub enum ModelProxyProtocol {
 pub struct ModelProxyInfo {
     pub name: String,
     pub protocol: ModelProxyProtocol,
-    /// Wire defaults indexed by offered effort; the empty key means provider default.
     pub request_defaults: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-/// A registry row as the API serves it: its own fields, with `routes` replaced
+/// INVARIANT: A registry row as the API serves it: its own fields, with `routes` replaced
 /// by the derived [`RouteInfo`] list.
 ///
 /// Spelled out rather than flattened over `Model`, because the served `routes`
@@ -810,14 +664,10 @@ pub struct ModelInfo {
     pub routes: Vec<RouteInfo>,
     pub preferred_provider: Option<String>,
     pub vision: bool,
-    /// The *default effort*; `None` means the engine sends no effort.
     pub default_effort: Option<String>,
-    /// The model this one was retired to; `None` for a current model.
     pub successor: Option<String>,
     pub sort_order: i32,
     pub source: String,
-    /// Whether a rung that is on the chat intelligence ladder runs this
-    /// model, which is what puts it in the chat picker.
     pub on_chat_ladder: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -827,7 +677,7 @@ pub struct ModelsListResponse {
     pub models: Vec<ModelInfo>,
 }
 
-/// The merged *style library*, shipped rows first. Read-only: the library is
+/// INVARIANT: The merged *style library*, shipped rows first. Read-only: the library is
 /// written through `PUT /api/v1/preferences` on `response_styles`, so that the
 /// one write chokepoint bounds-checks every edit.
 #[derive(Serialize)]
@@ -838,41 +688,20 @@ pub struct ResponseStylesListResponse {
 #[derive(Deserialize)]
 pub struct CreateModelRequest {
     pub id: String,
-    /// Display name. An absent or empty label defaults to the id, so the
-    /// `lucidos models add` CLI and the `manage_models` tool may omit it. The
-    /// Settings UI always sends one.
     #[serde(default)]
     pub label: String,
-    /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
-    /// "openrouter" | "xai" | "opencode-free" | "local" | "claude-gateway" |
-    /// "chatgpt-plan". Validated by `core::validate_routes`.
-    ///
-    /// The single-route shorthand, and what nearly every caller sends. With
-    /// `routes` given it is ignored; with neither, the request is refused.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Display order; omitted user models sort after the builtins.
     #[serde(default)]
     pub sort_order: Option<i32>,
-    /// Context window in tokens. Omit to let the engine infer it from the model
-    /// id — only worth setting for ids the id-shape fallback gets wrong (every
-    /// OpenRouter / xAI / Gemini / local model, which otherwise takes 200k).
-    /// The other half of the single-route shorthand, ignored with `routes`.
     #[serde(default)]
     pub context_window: Option<i32>,
-    /// Every backend that can serve this model, in priority order. Use it for a
-    /// model reachable more than one way, such as a Claude id served by both
-    /// Vertex and the direct Anthropic API.
     #[serde(default)]
     pub routes: Option<Vec<Route>>,
-    /// The *vision flag*: whether the model reads images. Omitted means it
-    /// does not, so image description neither offers nor calls it.
     #[serde(default)]
     pub vision: bool,
 }
 
-/// PUT body for a model. A builtin row ignores `label` and `sort_order`.
-/// Omitted fields keep their value.
 #[derive(Deserialize)]
 pub struct UpdateModelRequest {
     #[serde(default)]
@@ -881,25 +710,13 @@ pub struct UpdateModelRequest {
     pub provider: Option<String>,
     #[serde(default)]
     pub sort_order: Option<i32>,
-    /// Turn the model on the chat intelligence ladder at the rung it joins
-    /// at, or turn off every rung that runs it. Absent leaves the ladder.
     #[serde(default)]
     pub on_chat_ladder: Option<bool>,
-    /// Context window in tokens. Absent keeps the stored value; an explicit
-    /// `null` CLEARS it, handing the model back to the id-shape fallback. The
-    /// double `Option` is what distinguishes those two cases — serde maps a
-    /// missing key to `None` and a literal `null` to `Some(None)`.
-    ///
-    /// Applies to the row's FIRST route, which is the single-route shorthand.
-    /// A row with several routes sets a window per route through `routes`.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub context_window: Option<Option<i32>>,
-    /// Replace the whole route list, in priority order. Accepted on a builtin
-    /// too: which backends serve a model is a fact the vendor can change, like
-    /// `context_window`, not part of the row's engine-owned identity.
     #[serde(default)]
     pub routes: Option<Vec<Route>>,
-    /// The provider to remember for this model. Absent keeps the stored pick;
+    /// INVARIANT: The provider to remember for this model. Absent keeps the stored pick;
     /// an explicit `null` clears it back to the first configured route. Must
     /// name one of the row's routes.
     ///
@@ -907,34 +724,19 @@ pub struct UpdateModelRequest {
     /// Refusing it there would leave every seeded model stuck on one backend.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub preferred_provider: Option<Option<String>>,
-    /// The *vision flag*. Absent keeps the stored value. Accepted on a builtin
-    /// too, like `routes`: whether a model reads images is a fact a seed can
-    /// get wrong, not identity.
     #[serde(default)]
     pub vision: Option<bool>,
-    /// Why an agent turns the model on or off the Lucidos Agent's ladder.
-    /// The owner's card quotes it when the agent holds no permission.
     #[serde(default)]
     pub reason: String,
 }
 
-/// The engine's read-back on a trigger's cron after a create or update: the fire
-/// times it computed, plus any non-fatal advice. Set only by the trigger write
-/// endpoints. A schedule that can never fire is a hard error instead, so a
-/// preview with an empty `next_runs` means the trigger has no cron at all.
 #[derive(Serialize)]
 pub struct CronPreview {
-    /// The next few upcoming fire times (RFC3339, in the trigger's timezone),
-    /// merged across the whole expression array under OR semantics.
     pub next_runs: Vec<String>,
-    /// Non-fatal warnings, e.g. the day-of-month/day-of-week AND footgun.
     pub warnings: Vec<String>,
 }
 
 impl CronPreview {
-    /// Project the engine's validation result onto the wire shape. Lives here
-    /// rather than on `ValidatedCron` so the scheduler stays unaware of the HTTP
-    /// layer.
     pub(crate) fn from_validated(validated: &crate::scheduler::cron_rules::ValidatedCron) -> Self {
         Self {
             next_runs: validated.next_runs_rfc3339(),
@@ -943,30 +745,17 @@ impl CronPreview {
     }
 }
 
-/// Generic success/error response used by credential, preference, and trigger endpoints.
-///
-/// `Default` is what the constructors below build on, so a new optional field
-/// costs one line here instead of an edit to every one of them.
 #[derive(Serialize, Default)]
 pub struct ApiResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// When set, the frontend should open the credential request form with this data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_request: Option<serde_json::Value>,
-    /// When set, the frontend should open this URL for OAuth authorization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
-    /// When set, the next fire times and cron warnings for the trigger this call
-    /// just wrote. Trigger create / update only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cron_preview: Option<CronPreview>,
-    /// Non-fatal notes about the write that just succeeded. Today: an event
-    /// type in a trigger's `on` list that this workspace has never emitted.
-    ///
-    /// Separate from `cron_preview.warnings`, which is about the schedule. A
-    /// trigger with no cron has no preview to hang these on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
 }
@@ -978,11 +767,6 @@ impl ApiResult {
             ..Default::default()
         })
     }
-    /// Success for a trigger write, carrying both read-backs the caller should
-    /// surface: the cron preview, and any event-type warnings.
-    ///
-    /// One constructor rather than two, so an update that only rewrote the
-    /// `on:` list cannot drop its warnings for want of a cron preview.
     fn ok_for_trigger(preview: Option<CronPreview>, warnings: Vec<String>) -> Json<Self> {
         Json(Self {
             success: true,
@@ -1004,14 +788,6 @@ impl ApiResult {
             ..Default::default()
         })
     }
-    /// No OAuth client registered yet: hand the modal a request, prefilled from
-    /// the *OAuth provider registry* when the provider is a known one.
-    ///
-    /// `overrides` used to be `OAuthClientOverrides::default()` unconditionally,
-    /// which is what made the Settings Connect button strictly worse than asking
-    /// the *Lucidos Agent*: the agent looked the endpoints up in knowhow and
-    /// passed them, while this path emitted no `defaults` block at all and left
-    /// the user to type a provider's authorization and token URLs by hand.
     fn needs_credentials(
         provider: &str,
         overrides: &crate::core::oauth::OAuthClientOverrides,
@@ -1028,8 +804,6 @@ impl ApiResult {
         })
     }
 
-    /// An OAuth client exists but cannot drive a flow. Same modal, targeted at
-    /// the existing row so the save repairs it instead of creating a duplicate.
     fn needs_credential_repair(provider: &str, request: serde_json::Value) -> Json<Self> {
         Json(Self {
             error: Some(format!(
@@ -1042,7 +816,6 @@ impl ApiResult {
     }
 }
 
-// OAuth account types
 #[derive(Serialize)]
 pub struct OAuthAccountsListResponse {
     pub accounts: Vec<OAuthAccountInfo>,
@@ -1053,7 +826,6 @@ pub struct OAuthAccountQuery {
     pub id: String,
 }
 
-// Device types
 #[derive(Deserialize)]
 pub struct DeviceRegisterRequest {
     pub device_id: String,
@@ -1070,11 +842,6 @@ pub struct DevicePushRequest {
     pub push_enabled: bool,
 }
 
-/// Claim that this caller used to be `old_device_id`.
-///
-/// `device_id` is where it is now. The client sends both because it is the only
-/// party that can see both at once, for the one page load that spans the
-/// change. See `core::devices::DeviceStore::hand_over`.
 #[derive(Deserialize)]
 pub struct DeviceHandOverRequest {
     pub old_device_id: String,
@@ -1086,10 +853,8 @@ pub struct DevicesListResponse {
     pub devices: Vec<crate::core::devices::DeviceListing>,
 }
 
-// Preferences types
 #[derive(Serialize)]
 pub struct PreferencesResponse {
-    /// Ordered, so an unchanged set of settings serializes to the same bytes.
     pub preferences: std::collections::BTreeMap<String, String>,
 }
 
@@ -1110,7 +875,6 @@ struct PreferencesQuery {
 pub struct EmitEventRequest {
     pub event_type: String,
     pub payload: serde_json::Value,
-    /// When true, broadcast on SSE but skip the events table write.
     #[serde(default)]
     pub transient: bool,
 }
@@ -1135,18 +899,6 @@ pub struct PushUnsubscribeRequest {
     pub endpoint: String,
 }
 
-// Query param structs for routes migrated from path params
-
-/// Addresses one credential row by its primary key.
-///
-/// The credential verbs that act on an EXISTING row (copy-value, update,
-/// delete) take this rather than a service name, because a name stopped being a
-/// unique handle when `auth_type` became the discriminator
-/// (`20260805134838_drop_credential_name_prefixes_use_auth_type.sql`): an
-/// `oauth_client` registration may share a name with an API key. Update needs
-/// the id for a sharper reason still, since the edit form can change
-/// `auth_type`, so even `(name, type)` cannot name the row being edited. Create
-/// stays name-keyed: it is an upsert, and the row has no id yet.
 #[derive(Deserialize)]
 struct CredentialIdQuery {
     id: uuid::Uuid,
@@ -1167,16 +919,11 @@ struct ProviderQuery {
     provider: String,
 }
 
-/// `?id=<model-id>` for the model-registry PUT/DELETE routes. The id is the
-/// model string (e.g. `claude-fable-5`), not a UUID — distinct from
-/// `NotificationQuery`.
 #[derive(Deserialize)]
 pub(super) struct ModelIdQuery {
     pub id: String,
 }
 
-/// `DELETE /api/v1/models` query. Deleting a laddered model edits the
-/// Lucidos Agent's ladder, so the owner's card quotes an agent's `reason`.
 #[derive(Deserialize)]
 pub(super) struct DeleteModelQuery {
     pub id: String,
@@ -1202,15 +949,11 @@ fn default_notif_limit() -> i64 {
 struct NotificationsListQuery {
     #[serde(default = "default_notif_limit")]
     limit: i64,
-    /// Unix-timestamp cursor for pagination (created_at < before)
     before: Option<f64>,
-    /// "all" (default) or "unread"
     #[serde(default)]
     filter: Option<String>,
 }
 
-/// Parse a Unix timestamp (with sub-second precision) into a `DateTime<Utc>`.
-/// Used by paginated query endpoints that accept a `before` cursor.
 fn parse_unix_ts(ts: f64) -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     let secs = ts as i64;
@@ -1224,9 +967,7 @@ fn parse_unix_ts(ts: f64) -> chrono::DateTime<chrono::Utc> {
 #[derive(Deserialize)]
 struct ChangesListQuery {
     limit: Option<i64>,
-    /// Unix-timestamp cursor for pagination (resolved_at < before)
     before: Option<f64>,
-    /// Narrow `pending` to changes held by this thread's sub-threads.
     sub_threads_of: Option<Uuid>,
 }
 
@@ -1240,7 +981,6 @@ struct SessionMessagesQuery {
     id: String,
 }
 
-/// Git version information for an app commit
 #[derive(Serialize)]
 struct GitVersion {
     commit: String,
@@ -1251,8 +991,6 @@ struct GitVersion {
     paths: Option<Vec<String>>,
 }
 
-/// Log every API request with method, path, status, and duration.
-/// Skips noisy endpoints (health checks, the SSE stream) to keep logs readable.
 async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     let uri_path = req.uri().path();
     let should_log = match uri_path {
@@ -1275,40 +1013,22 @@ async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     response
 }
 
-/// Serve the built frontend (`dist/`) for an unmatched request.
-///
-/// Real bundled files (`/assets/*`, `/sw.js`, `/manifest.json`, `/favicon*`, …)
-/// stream straight from disk via `ServeDir`. The SPA shell — `/`, `/index.html`,
-/// or any navigation that doesn't resolve to a file — is served as `index.html`
-/// with `<base href>` stamped from `X-Forwarded-Prefix` (ADR 0014 §4), so the
-/// bundle's relative refs resolve under the workspace prefix behind the gateway.
 async fn serve_frontend(static_dir: PathBuf, req: axum::extract::Request) -> Response {
-    // The SPA shell and static assets are only ever served for read requests.
-    // A non-GET/HEAD request that reaches this fallback hit no API/app/data route,
-    // so the path simply doesn't exist — return 404. Without this gate the request
-    // falls through to `ServeDir`, which answers any non-GET with 405 Method Not
-    // Allowed, leaking a misleading "method not allowed" for an unknown path (e.g.
-    // a stray `POST /api/internal/...` that dropped the `/v1/`).
     if req.method() != Method::GET && req.method() != Method::HEAD {
         return StatusCode::NOT_FOUND.into_response();
     }
 
     let prefix = base_path::forwarded_prefix(req.headers());
-    // Own the path because `ServeDir::oneshot` consumes the request before the
-    // missing-asset branch decides whether SPA fallback is legal.
     let path = req.uri().path().to_string();
 
     if path.starts_with("/api/") {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // The shell: root or an explicit index request → stamped index.html.
     if path == "/" || path == "/index.html" {
         return serve_shell(&static_dir, &prefix);
     }
 
-    // Otherwise try the path as a real asset; a 404 means it's a client-side
-    // route (hash routing keeps these rare) → fall back to the stamped shell.
     let service = ServeDir::new(&static_dir);
     match service.oneshot(req).await {
         Ok(resp) if resp.status() != StatusCode::NOT_FOUND => resp.map(axum::body::Body::new),
@@ -1317,11 +1037,6 @@ async fn serve_frontend(static_dir: PathBuf, req: axum::extract::Request) -> Res
     }
 }
 
-/// Read `index.html` from `static_dir`, stamp `<base href>` for `prefix` and the
-/// gateway port (when behind a gateway), return it as `text/html`. The gateway
-/// port lets a page served on the engine's own port (direct access) build an
-/// absolute URL to the gateway picker — its origin differs from the engine's, so
-/// the relative `/~/` route can't reach it (ADR 0014).
 fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
     let index = static_dir.join("index.html");
     match std::fs::read_to_string(&index) {
@@ -1341,16 +1056,10 @@ fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
     }
 }
 
-/// The largest request body any `/api/v1` route buffers.
 pub(crate) const API_BODY_LIMIT: usize = 100 * 1024 * 1024;
 
-// Top-level wiring helper that takes every engine subsystem the router needs;
-// reducing it would force the call site to thread the same set into a holder.
-/// The `/api/v1` router, unnested, with every layer a live request passes.
-/// `create_router` mounts it, and registers it on the engine for in-process
-/// callers. A test builds the same router from its own state.
 pub(crate) fn api_routes(state: &AppState) -> Router {
-    // ALL routes live under `/api/v1/`: see `.claude/rules/rust.md`
+    // INVARIANT: ALL routes live under `/api/v1/`: see `.claude/rules/rust.md`
     // § API URL Conventions.
     // Convention: query params for identifiers, path segments only for file paths.
     //
@@ -1439,29 +1148,13 @@ pub(crate) fn api_routes(state: &AppState) -> Router {
         .merge(handshake_scripts::router())
         .merge(proxy::router())
         .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
-        // Axum's 2 MiB default rejects mobile screenshots in chat/app-capture
+        // INVARIANT: Axum's 2 MiB default rejects mobile screenshots in chat/app-capture
         // bodies — and large `PUT /api/v1/data/*path` binary writes — with
         // "Failed to buffer the request body". `Router::layer` only covers
         // routes registered before the call, so this is applied after every
         // domain merge to guarantee it reaches all routes.
         .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
-        // Compress JSON responses (br/gzip per Accept-Encoding). The thread
-        // events snapshot (`GET /threads/:id/events`) ships the full event
-        // history uncompressed today — a heavy coding-agent thread is multiple
-        // MB on every open, dominating load latency over Tailscale / on mobile.
-        // The default predicate leaves the SSE stream untouched: it excludes
-        // `text/event-stream` (the plain SSE path) and skips responses that
-        // already carry `content-encoding` (the hand-rolled gzipped SSE in
-        // `history.rs`), so the existing streaming transport is unchanged.
-        // `compression_predicate` extends it to leave media alone, which is what
-        // keeps `Accept-Ranges` on a data-file response.
         .layer(CompressionLayer::new().compress_when(compression_predicate()))
-        // Refuse a mutating request carrying no identity (401). Layered here
-        // for the same reason the workspace check below is: a write nobody can
-        // be attributed to is a hazard on every mutating endpoint, and a
-        // per-handler check is one the next endpoint can forget. It reads the
-        // MATCHED route, so it must sit inside the nest where routing happened.
-        // See `api::mutating_gate`, and ADR 0169 for the rule.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             mutating_gate::enforce_caller_identified,
@@ -1470,23 +1163,15 @@ pub(crate) fn api_routes(state: &AppState) -> Router {
             state.clone(),
             restore_generation::enforce,
         ))
-        // Tell a coding agent, on any call it makes, that a child report waits
-        // for it (`api::threads::child_reports`).
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             threads::child_reports::note_waiting_child_reports,
         ))
-        // Refuse a request an app stamped itself on, to a route apps may not
-        // reach (403). The host bridge already refused it, and this is the
-        // second answer: see `api::app_reach` and ADR 0231. It reads the
-        // MATCHED route, so it sits inside the nest, beside the gate above.
         .layer(axum::middleware::from_fn(app_reach::enforce_app_reach))
-        // Remember the prefix each device reached us under, so an agent-started
-        // OAuth flow can route its callback back (`core::oauth_callback`).
         .layer(axum::middleware::from_fn(
             crate::core::oauth_callback::note_browser_context,
         ))
-        // Refuse a request that named a DIFFERENT workspace than this engine
+        // INVARIANT: Refuse a request that named a DIFFERENT workspace than this engine
         // serves (409). Layered here rather than per-handler because a
         // mis-aimed write is a hazard on every mutating endpoint, and a
         // per-handler check is one a new endpoint can forget. Applied after
@@ -1497,7 +1182,7 @@ pub(crate) fn api_routes(state: &AppState) -> Router {
             state.clone(),
             target_workspace::enforce_target_workspace,
         ))
-        // Read a gateway stamp's age before any body arrives
+        // INVARIANT: Read a gateway stamp's age before any body arrives
         // (`api::gateway_stamp::note_arrival`).
         .layer(axum::middleware::from_fn(gateway_stamp::note_arrival))
         .layer(axum::middleware::from_fn_with_state(
@@ -1517,33 +1202,20 @@ pub fn create_router(
     workspace_path: PathBuf,
     scheduler: Arc<tokio::sync::Mutex<SchedulerManager>>,
     started_at: chrono::DateTime<chrono::Utc>,
-    // What this engine is about to bind. It decides whether callers must
-    // present a credential, so it is resolved before the router is built rather
-    // than at listen time. See `api::local_auth`.
     bind_choice: &crate::net_config::BindChoice,
     event_hooks: Arc<dyn crate::core::event_hooks::EventHooks>,
 ) -> Router {
-    // The engine's own, so the routes see the built-in widgets it resolved.
     let app_manager = engine.shared_app_manager();
 
-    // Resolve + pin the served frontend (dev) BEFORE `engine` is moved into
-    // `AppState`. The served dir lives behind a swappable handle. A
-    // frontend-only Apply then re-snapshots `dist/` and advances what we serve
-    // in-process, with no respawn. See `frontend_snapshot` and
-    // `engine::frontend_refresh`. `None` when there's no `LUCIDOS_STATIC_DIR`
-    // (headless API-only).
     let served_frontend_handle: Option<Arc<std::sync::RwLock<PathBuf>>> =
         std::env::var_os("LUCIDOS_STATIC_DIR").map(|static_dir| {
-            // Dev pins a private snapshot of `dist/`. The running engine then
+            // INVARIANT: Dev pins a private snapshot of `dist/`. The running engine then
             // serves only the client it was built against, even on a hard
             // reload, never a newer and possibly incompatible one. Packaged
             // serves the bundled Resources dir unchanged. See `frontend_snapshot`.
             let source = PathBuf::from(&static_dir);
             let served = frontend_snapshot::resolve_served_dir(source.clone(), &workspace_path);
             let handle = Arc::new(std::sync::RwLock::new(served));
-            // Register the handle + source on the engine so a frontend-only Apply
-            // can swap it. No-op registration in packaged (the engine's refresh
-            // path gates on `!is_packaged()` and never swaps).
             engine.init_served_frontend(handle.clone(), source);
             handle
         });
@@ -1564,19 +1236,17 @@ pub fn create_router(
         event_hooks,
     };
 
-    // Serve static files from the data/ tree. One mount covers every
+    // INVARIANT: Serve static files from the data/ tree. One mount covers every
     // subdirectory, gated by the same read allowlist `GET /api/v1/data/*path`
     // applies. See `data_api::serve_workspace_data`.
     let serve_data = data_api::static_mount(workspace_path.join(crate::core::DATA_DIR));
 
-    // Clone for the top-level app-UI router; the /api/v1 router below
-    // consumes `state` directly.
     let app_ui_state = state.clone();
 
     let api_routes = api_routes(&state);
     state.engine.set_api_router(api_routes.clone());
 
-    // Refuse a browser request that came from another origin (403), in front of
+    // INVARIANT: Refuse a browser request that came from another origin (403), in front of
     // everything. An engine binds loopback, so its remaining browser-shaped
     // exposure is a page on some other origin driving this port out of the
     // user's own browser. Layered last, which makes it OUTERMOST, so it runs
@@ -1594,9 +1264,6 @@ pub fn create_router(
         api_routes.layer(axum::middleware::from_fn(browser_origin::enforce))
     };
 
-    // An app frame's own files: its bundle and the workspace's `data/` tree.
-    // Only these two load a font or a module script across the frame's opaque
-    // origin. See `api::frame_file_cors`.
     let frame_files = Router::new()
         .nest("/app", apps::ui_router().with_state(app_ui_state))
         .nest_service("/data", serve_data)
@@ -1608,18 +1275,6 @@ pub fn create_router(
         .nest(API_V1_PREFIX, api_routes)
         .merge(frame_files);
 
-    // Unmatched (non-API, non-/app, non-/data) requests resolve the frontend
-    // from the pre-built `dist/` at LUCIDOS_STATIC_DIR — the SAME serving path
-    // in dev and packaged (ADR 0014 §4/§5; the dev Vite reverse-proxy is gone).
-    // Real bundled assets stream straight from disk; the SPA shell (`/`,
-    // `/index.html`, and any non-file navigation) is served with `<base href>`
-    // stamped from the gateway's `X-Forwarded-Prefix` so the bundle's relative
-    // asset refs resolve back through the gateway to this workspace. With no
-    // header (direct hit / `LUCIDOS_NO_GATEWAY`) the base is `/`, identical to
-    // before. No LUCIDOS_STATIC_DIR → keep the default 404 (headless API-only).
-    // The served dir was resolved + pinned above (`served_frontend_handle`); read
-    // the CURRENT snapshot per request so a frontend-only Apply that swapped in a
-    // newer, engine-compatible generation is picked up without a respawn.
     let router = if let Some(handle) = served_frontend_handle {
         router.fallback(move |req: axum::extract::Request| {
             let static_dir = handle.read().unwrap().clone();
@@ -1629,17 +1284,12 @@ pub fn create_router(
         router
     };
 
-    // Prevent heuristic caching on ALL engine responses. `no-cache` means
-    // "always revalidate with the server" — the browser still gets 304s when
-    // files haven't changed, but never serves stale data after edits.
-    // `if_not_present` preserves explicit headers (e.g. no-store on app UIs,
-    // max-age on immutable static assets).
     let router = router
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         ))
-        // Who is calling. Layered out here rather than inside the `/api/v1`
+        // INVARIANT: Who is calling. Layered out here rather than inside the `/api/v1`
         // nest. `/app`, `/data` and the frontend fallback are siblings of that
         // nest, so a gate inside it would miss all three. `/data` serves the
         // workspace's files straight off disk, which would be the whole leak.
@@ -1657,7 +1307,7 @@ pub fn create_router(
             Arc::new(local_auth::EngineAuth::resolve(bind_choice)),
             local_auth::enforce,
         ))
-        // A request the credentialed proxy forwarded is never the shell, so
+        // INVARIANT: A request the credentialed proxy forwarded is never the shell, so
         // it is refused before any credential is read. See
         // `proxy::refuse_proxied_request`.
         .layer(axum::middleware::from_fn(proxy::refuse_proxied_request))
@@ -1670,7 +1320,7 @@ pub fn create_router(
     }
 }
 
-/// Compress text-shaped payloads only. Already-compressed media gains nothing
+/// INVARIANT: Compress text-shaped payloads only. Already-compressed media gains nothing
 /// and loses two headers it needs.
 ///
 /// tower-http strips `Accept-Ranges` from every response it compresses, and
@@ -1724,11 +1374,6 @@ mod tests {
         }
     }
 
-    /// Absence and emptiness are different answers, and the update verb acts on
-    /// the difference. A body that names no scope leaves the stored one alone;
-    /// one that names `[]` clears it. Without the distinction, a `PUT` changing
-    /// only the auth header emptied the set and every call through the
-    /// credential started failing.
     #[test]
     fn a_body_naming_no_scope_is_told_apart_from_one_naming_an_empty_scope() {
         let parse = |body: &str| {
@@ -1753,9 +1398,6 @@ mod tests {
         );
     }
 
-    /// The singular field is permanent back-compat, and it JOINS the set rather
-    /// than replacing it. A caller written before the scope became a set adds a
-    /// host by sending both.
     #[test]
     fn the_old_singular_field_joins_the_set() {
         let both: RequestedScope = serde_json::from_str(
@@ -1780,11 +1422,8 @@ mod tests {
         );
     }
 
-    /// Compressing a media response would strip `Accept-Ranges`, so the
-    /// exclusion list is what makes the data route seekable in a browser.
     #[test]
     fn compression_skips_media_and_still_covers_json() {
-        // Above `SizeAbove`'s 32-byte floor, so content type is what decides.
         let probe = |content_type: &str| {
             let body = axum::body::Body::from(vec![b'x'; 4096]);
             let response = Response::builder()
@@ -1860,9 +1499,7 @@ mod tests {
     fn small_image_compressed_to_jpeg() {
         let img = make_test_image(100, 100);
         let result = img.compress();
-        // Always converts to JPEG
         assert_eq!(result.mime_type, "image/jpeg");
-        // Result is valid base64 that decodes to a JPEG
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&result.base64)
             .unwrap();
@@ -1873,13 +1510,11 @@ mod tests {
     fn large_dimensions_capped() {
         let img = make_test_image(4000, 3000);
         let result = img.compress();
-        // Verify the result is under the limit
         assert!(
             result.base64.len() <= MAX_IMAGE_BASE64_BYTES,
             "must be under limit: {} bytes",
             result.base64.len()
         );
-        // Verify dimensions were reduced
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&result.base64)
             .unwrap();
@@ -1894,49 +1529,27 @@ mod tests {
         );
     }
 
-    /// Pins the security contract of the canonical traversal guard used by every
-    /// path-accepting endpoint (data_api, proxy script runner, script triggers,
-    /// import/image/email tools, …). A regression here is a path-escape bug.
     #[test]
     fn is_path_traversal_pins_security_contract() {
-        // Plain relative paths within the tree are allowed.
         assert!(!is_path_traversal("scripts/auth/handshake.py"));
         assert!(!is_path_traversal("foo.py"));
         assert!(!is_path_traversal("a/b/c/d.txt"));
 
-        // Parent-dir escapes are blocked.
         assert!(is_path_traversal("../escape"));
         assert!(is_path_traversal("../../etc/passwd"));
 
-        // Absolute paths are blocked (Unix `/` and Windows-style `\`): joining
-        // an absolute path onto the workspace root discards the prefix, so
-        // `workspace.join("/etc/passwd")` would resolve to `/etc/passwd`.
         assert!(is_path_traversal("/etc/passwd"));
         assert!(is_path_traversal("\\windows\\system32"));
 
-        // An embedded `..` segment is blocked even though it might normalize
-        // back inside the tree — the guard fails closed on any `..` rather than
-        // resolving the path first.
         assert!(is_path_traversal("foo/../bar"));
 
-        // Conservative by design: `..` anywhere in the string blocks, including
-        // a legitimate-looking filename like `a..b` (a false positive, but it
-        // fails closed, which is safe). Pinned so the over-broad behavior stays
-        // a deliberate contract rather than something a future refactor
-        // "tightens" into a vulnerability.
         assert!(is_path_traversal("weird..name.txt"));
 
-        // The guard operates on the raw string and does NOT percent-decode, so
-        // a URL-encoded `%2e%2e` is a literal directory name, not `..`. That is
-        // correct here: callers (e.g. the proxy script path from `apis.json`)
-        // never percent-decode before this check, so `%2e%2e` resolves to a real
-        // (non-existent) directory rather than an escape.
         assert!(!is_path_traversal("%2e%2e/escape"));
     }
 
     #[test]
     fn oversized_image_compressed_under_limit() {
-        // Create a large image that will produce > 5 MB base64
         let img = make_test_image(5000, 4000);
         assert!(
             img.base64.len() > MAX_IMAGE_BASE64_BYTES,
@@ -1965,7 +1578,6 @@ mod tests {
 
     #[test]
     fn fit_for_llm_passes_small_image_through_untouched() {
-        // Under the per-image target → no re-encode, original bytes + mime kept.
         let img = ChatImage {
             base64: "AAAA".to_string(),
             mime_type: "image/png".to_string(),
@@ -1975,7 +1587,6 @@ mod tests {
         assert_eq!(result.mime_type, "image/png");
     }
 
-    /// A single-colour PNG: a page background compresses to very few bytes.
     fn make_flat_png(width: u32, height: u32) -> ChatImage {
         let flat: ImageBuffer<Rgba<u8>, Vec<u8>> =
             ImageBuffer::from_pixel(width, height, Rgba([240, 240, 240, 255]));
@@ -1992,7 +1603,6 @@ mod tests {
 
     #[test]
     fn fit_for_llm_keeps_an_image_the_provider_accepts_byte_identical() {
-        // Over the 2048 px compress cap, but within Claude's limits.
         let img = make_flat_png(3000, 7900);
         let original = img.base64.clone();
         let result = img.fit_for_llm();
@@ -2002,7 +1612,6 @@ mod tests {
 
     #[test]
     fn fit_for_llm_downscales_a_tall_image_that_is_small_in_bytes() {
-        // A full-page screenshot: few bytes, but taller than Claude's 8000 px limit.
         let img = make_flat_png(1485, 8420);
 
         let result = img.fit_for_llm();
@@ -2019,11 +1628,6 @@ mod tests {
 
     #[test]
     fn fit_for_llm_compresses_oversized_image() {
-        // A large image (base64 over the target) is downscaled + JPEG-re-encoded
-        // until it fits, so it can never reach a provider's hard size limit.
-        // Noise resists PNG compression (a smooth gradient would shrink below the
-        // target and not exercise the compress path), so paint per-pixel from a
-        // coordinate hash to keep the encoded payload large.
         let img_buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(1400, 1400, |x, y| {
             let mut h = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(2_246_822_519);
             h ^= h >> 15;
@@ -2054,11 +1658,7 @@ mod tests {
         assert_eq!(result.mime_type, "image/jpeg");
     }
 
-    /// Build a minimal JPEG with an EXIF APP1 segment containing the given
-    /// orientation tag. The pixel data is a landscape `width`×`height` image,
-    /// but EXIF orientation tells viewers to rotate it.
     fn make_jpeg_with_exif_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
-        // Encode a landscape image as raw JPEG first (RGB — JPEG doesn't support alpha)
         let img_buf: ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             ImageBuffer::from_fn(width, height, |x, y| {
                 image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
@@ -2069,36 +1669,31 @@ mod tests {
             .unwrap();
         let jpeg_bytes = jpeg_buf.into_inner();
 
-        // Build EXIF APP1 segment with orientation tag (little-endian TIFF)
         let orient_lo = (orientation & 0xFF) as u8;
         let orient_hi = ((orientation >> 8) & 0xFF) as u8;
         #[rustfmt::skip]
         let exif_payload: Vec<u8> = vec![
-            // "Exif\0\0"
             0x45, 0x78, 0x69, 0x66, 0x00, 0x00,
-            // TIFF header: little-endian
-            0x49, 0x49, // "II" = little-endian
-            0x2A, 0x00, // TIFF magic (42)
-            0x08, 0x00, 0x00, 0x00, // offset to first IFD (8 bytes from TIFF start)
-            // IFD0
-            0x01, 0x00, // 1 entry
-            // Entry: Orientation (tag 0x0112)
-            0x12, 0x01, // tag
-            0x03, 0x00, // type: SHORT
-            0x01, 0x00, 0x00, 0x00, // count: 1
-            orient_lo, orient_hi, 0x00, 0x00, // value
-            0x00, 0x00, 0x00, 0x00, // next IFD offset (none)
+            0x49, 0x49,
+            0x2A, 0x00,
+            0x08, 0x00, 0x00, 0x00,
+            0x01, 0x00,
+            0x12, 0x01,
+            0x03, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            orient_lo, orient_hi, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
         ];
 
-        let app1_len = (exif_payload.len() + 2) as u16; // +2 for the length field itself
+        let app1_len = (exif_payload.len() + 2) as u16;
         let mut result = Vec::new();
-        result.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        result.extend_from_slice(&[0xFF, 0xD8]);
         result.push(0xFF);
-        result.push(0xE1); // APP1 marker
+        result.push(0xE1);
         result.push((app1_len >> 8) as u8);
         result.push((app1_len & 0xFF) as u8);
         result.extend_from_slice(&exif_payload);
-        result.extend_from_slice(&jpeg_bytes[2..]); // skip SOI from original JPEG
+        result.extend_from_slice(&jpeg_bytes[2..]);
         result
     }
 
@@ -2132,21 +1727,18 @@ mod tests {
 
     #[test]
     fn compress_applies_exif_orientation() {
-        // Orientation 6 (rotate 90° CW): 200×100 landscape → 100×200 portrait
         assert_compressed_dimensions(
             make_exif_chat_image(200, 100, 6),
             100,
             200,
             "EXIF orientation 6",
         );
-        // Orientation 8 (rotate 270° CW): same result
         assert_compressed_dimensions(
             make_exif_chat_image(200, 100, 8),
             100,
             200,
             "EXIF orientation 8",
         );
-        // Orientation 3 (rotate 180°): dimensions unchanged
         assert_compressed_dimensions(
             make_exif_chat_image(200, 100, 3),
             200,
@@ -2220,8 +1812,6 @@ mod tests {
         );
     }
 
-    // ---- resolve_thread_id_in_nav_payload ----
-
     fn nav(target: &str, id: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "target": target, "id": id })
     }
@@ -2237,8 +1827,6 @@ mod tests {
         }
     }
 
-    /// An app iframe writes this through the SDK and has no thread of its own.
-    /// Resolving would name whichever thread the engine happened to serve.
     #[test]
     fn a_nav_payload_alias_is_refused_without_a_caller() {
         let mut payload = nav("thread", serde_json::json!("current"));
@@ -2246,8 +1834,6 @@ mod tests {
         assert!(err.contains("surface has none"), "got: {err}");
     }
 
-    /// Matched on the VALUE. Read through `as_str()` a non-string looks absent,
-    /// and rides the event to a page that dereferences whatever arrives.
     #[test]
     fn a_non_string_nav_thread_id_is_refused_rather_than_read_as_absent() {
         for bad in [
@@ -2261,8 +1847,6 @@ mod tests {
             assert!(err.contains("must be a string"), "{bad} gave: {err}");
         }
     }
-
-    // ---- split_repo_locator ----
 
     #[test]
     fn a_repo_locator_splits_at_the_first_two_colons() {
@@ -2305,8 +1889,6 @@ mod tests {
         );
     }
 
-    /// Names are not unique. A navigate that picked one of two would open the
-    /// wrong clone without a word; a link click refuses the same name.
     #[test]
     fn a_name_two_repositories_share_is_refused_but_an_exact_match_wins() {
         let (upper, lower) = (repo("App"), repo("app"));
@@ -2318,8 +1900,6 @@ mod tests {
         assert!(err.contains("no registered repository"), "{err}");
     }
 
-    /// A malformed locator is the page's artifact path, as the SDK docs promise
-    /// apps, so the resolver leaves it alone rather than refusing it.
     #[test]
     fn a_malformed_repo_locator_is_not_one() {
         for not_one in [
@@ -2335,8 +1915,6 @@ mod tests {
         }
     }
 
-    /// An absent id is the page-side router's to report, unlike a stored tap's:
-    /// this event is transient, so its toast reaches the same person right now.
     #[test]
     fn a_nav_payload_leaves_other_targets_and_an_absent_id_alone() {
         let mut idless = serde_json::json!({ "target": "thread" });

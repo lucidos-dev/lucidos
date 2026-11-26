@@ -1,9 +1,3 @@
-//! The engine's own answer to a request an app stamped itself on.
-//!
-//! The host bridge is the boundary (ADR 0231). This is the second answer, and
-//! it is the half a unit test cannot show: the layer only sees a route once
-//! axum has matched one, so the gate has to be exercised over real HTTP.
-
 use crate::support::{base_url, user_client};
 
 const APP_ID_HEADER: &str = "x-lucidos-app-id";
@@ -31,8 +25,6 @@ async fn a_stamped_call_to_a_host_route_is_refused() {
 
 #[tokio::test]
 async fn the_same_route_answers_the_shell() {
-    // No stamp, so the gate stands aside. This is what makes the test above a
-    // statement about the stamp rather than about the route being broken.
     let client = user_client().await;
     let res = client
         .get(format!("{}/api/v1/credentials", base_url()))
@@ -60,7 +52,6 @@ async fn a_stamped_call_to_an_app_route_goes_through() {
 
 #[tokio::test]
 async fn a_stamped_call_is_refused_per_method() {
-    // The model registry reads, and never writes, from an app.
     let client = user_client().await;
     let read = client
         .get(format!("{}/api/v1/models", base_url()))
@@ -113,8 +104,6 @@ async fn a_stamped_call_is_refused_per_method() {
 
 #[tokio::test]
 async fn an_unmatched_route_still_answers_404() {
-    // A stamped request to nothing is a 404, not a refusal. Answering with a
-    // refusal would point the caller at the wrong problem.
     let client = user_client().await;
     let res = client
         .get(format!("{}/api/v1/no-such-route", base_url()))

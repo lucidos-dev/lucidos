@@ -1,22 +1,11 @@
-//! Resolving the workspace's [`ToolCapabilities`], the gate inputs the tool
-//! registry reads (ADR 0088).
-//!
-//! One resolver, read once per turn. It reads workspace configuration and
-//! nothing thread-shaped, which is what keeps every thread in the workspace on
-//! one byte-identical tools array.
-
 use crate::core::{EmailStore, Intent, IntentStore};
 use crate::engine::tools::image::ImageExt;
 use crate::engine::LucidosEngine;
 use crate::llm::ToolCapabilities;
 
-/// One turn's capability read: the gates the tool registry needs, and the
-/// intent snapshot the prompt's "Available Intents" listing renders.
 pub(crate) struct TurnCapabilities {
     pub gates: ToolCapabilities,
     pub intents: Vec<Intent>,
-    /// When results leave, read beside the mode's own flag so the prompt, the
-    /// panel and the sweep all quote one pair of numbers.
     pub schedule: crate::engine::SweepSchedule,
 }
 
@@ -37,7 +26,7 @@ pub(crate) impl LucidosEngine {
         let data_dir = self.workspace_path.join(crate::core::DATA_DIR);
         let intents = IntentStore::load_all(&data_dir);
 
-        // The self-curated context mode. Read here rather than beside its own
+        // INVARIANT: The self-curated context mode. Read here rather than beside its own
         // consumers so the tools array, the system prompt and the turn's
         // payload all answer from ONE read: a mid-turn Settings change cannot
         // then leave the prompt describing a mode the payload is not in.
@@ -45,8 +34,6 @@ pub(crate) impl LucidosEngine {
         let context_mode = crate::core::prefs::SELF_CURATED_CONTEXT_MODE
             .read(&self.pool)
             .await;
-        // Two more rows, and only where they are read. An off workspace pays
-        // no query for a schedule nothing consults.
         let schedule = if context_mode {
             crate::core::PreferenceStore::self_curated_context_schedule(&self.pool).await
         } else {
@@ -73,8 +60,6 @@ mod tests {
     use crate::engine::LucidosEngine;
     use crate::test_support::{setup_test_db, teardown_test_db, test_db_url};
 
-    /// With the database unreachable, the email gate stays open and the memory
-    /// tree gate stays closed on Classic.
     #[tokio::test]
     async fn an_unreadable_database_opens_the_email_gate_and_closes_the_memory_tree() {
         let (pool, db) = setup_test_db().await;

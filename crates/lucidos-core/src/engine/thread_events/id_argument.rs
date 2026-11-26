@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-/// What an agent writes for "the thread I am in", instead of an id it has to go
+/// INVARIANT: What an agent writes for "the thread I am in", instead of an id it has to go
 /// and look up. Matched case-insensitively, after a trim.
 ///
 /// Private on purpose: [`resolve_thread_id_arg`] is the only door. A second
@@ -8,7 +8,7 @@ use uuid::Uuid;
 /// next one only ignores it. That is the bug that shipped.
 const CURRENT_THREAD_ALIASES: [&str; 2] = ["current", "this"];
 
-/// Resolve a thread id an agent or a script wrote into the uuid it names.
+/// INVARIANT: Resolve a thread id an agent or a script wrote into the uuid it names.
 ///
 /// `caller` is the thread the call runs in, for a surface that has one. That is
 /// what an alias resolves to, so the writer cannot aim it at somebody else's
@@ -33,9 +33,6 @@ pub fn resolve_thread_id_arg(raw: &str, caller: Option<Uuid>) -> Result<Uuid, St
             )
         });
     }
-    // The advice fits the surface that asked. Only a caller with an ambient
-    // thread can spend the alias, so offering it to one that cannot is a
-    // second dead end.
     Uuid::parse_str(raw).map_err(|_| match caller {
         Some(_) => format!(
             "thread id '{raw}' is not a uuid. Pass 'current' for this thread. For \

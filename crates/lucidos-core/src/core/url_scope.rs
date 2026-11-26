@@ -1,4 +1,4 @@
-//! Whether a URL's path stays under a configured path prefix.
+//! INVARIANT: Whether a URL's path stays under a configured path prefix.
 //!
 //! The one place a path scope is judged. `api::proxy` asks it before it
 //! forwards a request with its credentials. `core::credentials` asks it before
@@ -13,26 +13,15 @@
 
 use reqwest::Url;
 
-/// How many decode layers the probe chases before it refuses.
-/// Real upstreams decode once or twice; the cap bounds what one request costs.
 pub const MAX_DECODE_ROUNDS: usize = 8;
 
-/// Why a path is out of scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathEscape {
-    /// The path as parsed already leaves the prefix.
     Parsed(String),
-    /// A deeper decoded reading leaves the prefix. Holds that reading's path.
     Decoded(String),
-    /// The path still changes after [`MAX_DECODE_ROUNDS`] rounds.
     TooDeep,
 }
 
-/// `Ok` when `target`'s path, and every deeper decoded reading of it, is
-/// `base_path` itself or sits under it.
-///
-/// `base_path` carries no trailing slash. An empty one means no prefix, so
-/// nothing is out of scope. The caller checks the origin.
 pub fn check_path_within(base_path: &str, target: &Url) -> Result<(), PathEscape> {
     if base_path.is_empty() {
         return Ok(());
@@ -40,14 +29,14 @@ pub fn check_path_within(base_path: &str, target: &Url) -> Result<(), PathEscape
     if !path_is_within(base_path, target.path()) {
         return Err(PathEscape::Parsed(target.path().to_string()));
     }
-    // Decode only what follows the prefix. The prefix is compared as written,
+    // INVARIANT: Decode only what follows the prefix. The prefix is compared as written,
     // so decoding it too would refuse a scope like `/projects/group%2Fproj`.
     let Some(suffix) = target.path().strip_prefix(base_path) else {
         return Err(PathEscape::Parsed(target.path().to_string()));
     };
     let readings = decoded_readings(suffix).ok_or(PathEscape::TooDeep)?;
     for reading in readings {
-        // `set_path` runs the parser's path rules again, so a decoded `..`,
+        // INVARIANT: `set_path` runs the parser's path rules again, so a decoded `..`,
         // `%2e%2e` or `\` pops a segment exactly as an upstream would. It also
         // re-escapes a decoded `?` or `#`, which keeps them inside the path.
         let mut probe = target.clone();
@@ -59,11 +48,6 @@ pub fn check_path_within(base_path: &str, target: &Url) -> Result<(), PathEscape
     Ok(())
 }
 
-/// True when `target_path` is `base_path` itself or sits under it.
-///
-/// An empty `base_path` means no prefix, so nothing is out of bounds. The
-/// boundary is a segment, never a string prefix, so `/safe-prefix-evil` does
-/// not count as inside `/safe-prefix`.
 pub fn path_is_within(base_path: &str, target_path: &str) -> bool {
     base_path.is_empty()
         || target_path == base_path
@@ -72,7 +56,7 @@ pub fn path_is_within(base_path: &str, target_path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Every deeper reading of `path`, one per decode layer. For the containment
+/// INVARIANT: Every deeper reading of `path`, one per decode layer. For the containment
 /// probe, never for sending.
 ///
 /// A round is one full percent-decode. Like a lenient upstream decoder, it
@@ -118,23 +102,15 @@ mod tests {
             decoded_readings("..%5cadmin"),
             Some(vec!["..\\admin".to_string()])
         );
-        // An escape that is not valid as written survives the round it is in.
         assert_eq!(
             decoded_readings("%2%65"),
             Some(vec!["%2e".to_string(), ".".to_string()])
         );
-        // Nothing to decode means no extra probe to run.
         assert_eq!(decoded_readings("items/42"), Some(Vec::new()));
     }
 
-    /// Regression: one round peels a single `%25`, so `%` followed by `25` k
-    /// times took k rounds and kept every reading. A path near the URI limit
-    /// held about a gigabyte of strings, and a few such requests could OOM the
-    /// engine.
     #[test]
     fn a_deeply_nested_path_is_refused_without_peeling_every_layer() {
-        // Each `25` after the `%` is one more layer, and the final `%2f` takes
-        // one more round to become `/`.
         let at_cap = format!("%{}2fadmin", "25".repeat(MAX_DECODE_ROUNDS - 1));
         assert_eq!(
             decoded_readings(&at_cap).map(|r| r.len()),
@@ -180,8 +156,6 @@ mod tests {
         assert_eq!(check("/safe", "https://h.test/safe/a%20b%3fc"), Ok(()));
     }
 
-    /// Regression: decoding the prefix too refused every request under a scope
-    /// whose own path holds an encoded slash.
     #[test]
     fn a_prefix_with_an_encoded_slash_is_compared_as_written() {
         let base = "/api/projects/group%2Fproj";
@@ -196,7 +170,6 @@ mod tests {
             ),
             Err(PathEscape::Decoded("/api/projects/other".to_string()))
         );
-        // No prefix means nothing is out of scope.
         assert_eq!(check("", "https://h.test/%2e%2e%2fadmin"), Ok(()));
     }
 }

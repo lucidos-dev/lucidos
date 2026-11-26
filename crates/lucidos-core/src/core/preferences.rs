@@ -8,7 +8,7 @@ use crate::core::preference_catalog::{
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
-/// Serialize seed changes against draft creation and selection replacement.
+/// INVARIANT: Serialize seed changes against draft creation and selection replacement.
 /// Shared holders may edit separate drafts concurrently; a seed change pins
 /// inherited selections while holding the exclusive form of this lock.
 pub async fn lock_compose_agent_seed(
@@ -24,7 +24,7 @@ pub async fn lock_compose_agent_seed(
     Ok(())
 }
 
-/// Why `url` cannot be the `local_base_url` preference, or `None` when it can.
+/// INVARIANT: Why `url` cannot be the `local_base_url` preference, or `None` when it can.
 ///
 /// The host must be on this machine or the user's own network: loopback, a
 /// private or tailnet address, or a name public DNS cannot answer. A public
@@ -62,8 +62,6 @@ pub fn local_base_url_rejection(url: &str) -> Option<String> {
     }
 }
 
-/// Loopback, RFC 1918, the tailnet range, IPv6 unique-local, or the unspecified
-/// address, which connects to this machine.
 fn ip_is_on_own_network(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     let v4 = |ip: std::net::Ipv4Addr| {
@@ -81,7 +79,7 @@ fn ip_is_on_own_network(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// `localhost`, or a name under a suffix reserved for private use, so no public
+/// INVARIANT: `localhost`, or a name under a suffix reserved for private use, so no public
 /// DNS answer can point it elsewhere: `.localhost` (RFC 6761), `.local` (mDNS,
 /// RFC 6762) and `.home.arpa` (RFC 8375). Not `.internal`: cloud hosts answer
 /// `metadata.google.internal` with the link-local metadata address.
@@ -93,7 +91,7 @@ fn name_is_on_own_network(host: &str) -> bool {
             .any(|suffix| host.ends_with(suffix))
 }
 
-/// Store for managing user preferences in the database.
+/// INVARIANT: Store for managing user preferences in the database.
 ///
 /// **Announcing is the default, and the silent door is guarded.**
 /// [`Self::set`], [`Self::set_for_device`] and [`Self::delete`] emit
@@ -114,24 +112,14 @@ fn name_is_on_own_network(host: &str) -> bool {
 /// See `core::announced_surfaces`.
 pub struct PreferenceStore;
 
-/// The *model selection* a turn resolved to, owned.
-///
-/// The same three fields as the borrowed `llm::ModelSelection` that goes to the
-/// wire. This form crosses an await and is stamped on a starter event. So it
-/// holds `String`s, and names its provider by the registry's own value.
-///
-/// The model resolves on its own. The effort and the provider resolve for that
-/// model, so neither follows a thread onto another model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedModelSelection {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
-    /// The backend to serve it. `None` lets the model's own *preferred
-    /// provider* decide, then its first configured route.
     pub provider: Option<String>,
 }
 
-/// Pair stamps include starters, next-turn picks and applied turn settings.
+/// INVARIANT: Pair stamps include starters, next-turn picks and applied turn settings.
 /// Both pair queries
 /// bind this list, so a new stamping type reaches them together.
 const PAIR_STAMPING_EVENT_TYPES: [&str; 4] = [
@@ -141,8 +129,6 @@ const PAIR_STAMPING_EVENT_TYPES: [&str; 4] = [
     "ChatTurnSettingsResolved",
 ];
 
-/// One pair stamp, as a paged thread snapshot carries it. An empty field means
-/// the event stamped none, and an empty `model` groups the model-less stamps.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PairStamp {
     pub sequence: i64,
@@ -153,21 +139,15 @@ pub struct PairStamp {
     pub provider: String,
 }
 
-/// The one chat tier every model shared before ADR 0390. Read only to move it
-/// onto `chat_reasoning_efforts` (`PreferenceStore::move_legacy_chat_effort`).
 const LEGACY_CHAT_EFFORT_KEY: &str = "chat_reasoning_effort";
 
-/// Where an unpinned effort comes from when nothing stored names one: the
-/// registry's *default effort*, for the model a turn runs on.
 #[derive(Clone, Copy)]
 pub struct ModelDefaults<'a> {
     pub registry: &'a crate::llm::ModelRegistry,
-    /// The model the router runs when nothing names one.
     pub fallback_model: &'a str,
 }
 
 impl ResolvedModelSelection {
-    /// Borrow this into the wire-side selection the provider trait takes.
     pub fn as_selection(&self) -> crate::llm::ModelSelection<'_> {
         crate::llm::ModelSelection {
             model: self.model.as_deref(),
@@ -176,23 +156,17 @@ impl ResolvedModelSelection {
                 .provider
                 .as_deref()
                 .and_then(crate::llm::model_registry::ProviderKind::from_name),
-            // A turn: never capped, so a long valid stream runs to its end.
+            // INVARIANT: A turn: never capped, so a long valid stream runs to its end.
             attempt_timeout: None,
             forced_tool: None,
             service_tier: None,
-            // A turn's next request reads what its end write stored.
             cache_mode: crate::llm::CacheMode::Implicit,
-            // A turn's model may step back within its lineage.
             generation_rule: crate::llm::model_registry::GenerationRule::AnyGeneration,
         }
     }
 }
 
 impl PreferenceStore {
-    /// Write a global preference row with no announcement.
-    ///
-    /// Tests only. The announcing [`Self::set`] needs an `EventBus`, and a test
-    /// arranging a precondition has nothing to announce it to.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn set_row_for_test(
         pool: &PgPool,
@@ -202,10 +176,6 @@ impl PreferenceStore {
         Self::set_row(pool, key, value).await
     }
 
-    /// Set a global preference (insert or update, device_id IS NULL).
-    ///
-    /// **Private on purpose**: [`Self::set`] and [`Self::set_silent`] are the
-    /// reachable mutators, and the first of them emits.
     async fn set_row<'e>(
         executor: impl sqlx::Executor<'e, Database = Postgres>,
         key: &str,
@@ -228,10 +198,6 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Set a per-device preference (insert or update).
-    ///
-    /// **Private on purpose**: [`Self::set_for_device`] is the reachable
-    /// mutator, and it emits.
     async fn set_for_device_row(
         pool: &PgPool,
         key: &str,
@@ -256,10 +222,6 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Get a global preference by key (device_id IS NULL).
-    ///
-    /// **Private on purpose**: a reader goes through a typed [`Pref`] handle,
-    /// which resolves an unset key to its catalog default.
     async fn get(pool: &PgPool, key: &str) -> Result<Option<String>, sqlx::Error> {
         let result = sqlx::query_scalar::<_, String>(
             "SELECT value FROM preferences WHERE key = $1 AND device_id IS NULL",
@@ -271,7 +233,6 @@ impl PreferenceStore {
         Ok(result)
     }
 
-    /// When the global row for `key` was last written. Private like [`Self::get`].
     async fn get_written_at(
         pool: &PgPool,
         key: &str,
@@ -284,14 +245,11 @@ impl PreferenceStore {
         .await
     }
 
-    /// Get a preference for a specific device, falling back to the global value.
-    /// Private for the same reason as [`Self::get`].
     async fn get_for_device(
         pool: &PgPool,
         key: &str,
         device_id: &str,
     ) -> Result<Option<String>, sqlx::Error> {
-        // Try device-specific first
         let result = sqlx::query_scalar::<_, String>(
             "SELECT value FROM preferences WHERE key = $1 AND device_id = $2",
         )
@@ -304,11 +262,9 @@ impl PreferenceStore {
             return Ok(result);
         }
 
-        // Fall back to global
         Self::get(pool, key).await
     }
 
-    /// Get all global preferences as a HashMap
     pub async fn get_all(pool: &PgPool) -> Result<HashMap<String, String>, sqlx::Error> {
         let results = sqlx::query_as::<_, (String, String)>(
             "SELECT key, value FROM preferences WHERE device_id IS NULL ORDER BY key ASC",
@@ -319,15 +275,12 @@ impl PreferenceStore {
         Ok(results.into_iter().collect())
     }
 
-    /// Get merged preferences for a device: global values overridden by device-specific ones
     pub async fn get_all_for_device(
         pool: &PgPool,
         device_id: &str,
     ) -> Result<HashMap<String, String>, sqlx::Error> {
-        // Start with global preferences
         let mut map = Self::get_all(pool).await?;
 
-        // Override with device-specific preferences
         let device_results = sqlx::query_as::<_, (String, String)>(
             "SELECT key, value FROM preferences WHERE device_id = $1 ORDER BY key ASC",
         )
@@ -342,8 +295,6 @@ impl PreferenceStore {
         Ok(map)
     }
 
-    /// Every registered device's own row for `key`, as `(device_id, value)`.
-    /// A row left under a removed device is not anyone's setting.
     pub async fn device_values(
         pool: &PgPool,
         key: &str,
@@ -358,8 +309,6 @@ impl PreferenceStore {
         .await
     }
 
-    /// Delete a global preference row. **Private on purpose**:
-    /// [`Self::delete`] is the reachable mutator, and it emits.
     async fn delete_row<'e>(
         executor: impl sqlx::Executor<'e, Database = Postgres>,
         key: &str,
@@ -386,7 +335,7 @@ impl PreferenceStore {
         }
     }
 
-    /// Write a global preference and announce it.
+    /// INVARIANT: Write a global preference and announce it.
     ///
     /// Announces unconditionally, including when the value is unchanged: a
     /// preference write is a deliberate user action, and `PreferencesChanged`
@@ -414,7 +363,6 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Write a per-device preference override and announce it.
     pub async fn set_for_device(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -428,8 +376,6 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Delete a global preference and announce it. Announces only when a row
-    /// existed; `value: None` on the event means "back to the default".
     pub async fn delete(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -453,19 +399,8 @@ impl PreferenceStore {
         Ok(removed)
     }
 
-    /// Write a preference key that is engine bookkeeping rather than a setting,
-    /// without announcing.
-    ///
-    /// **Rejects any key that is not a `PrefAccess::Engine` catalog spec**
-    /// (`preference_catalog::is_silent_key`), which is what stops this from
-    /// becoming the easy way to skip an announcement. Reach for [`Self::set`]
-    /// for anything a user can see. A genuinely internal key takes an `Engine`
-    /// spec with its reason.
     pub async fn set_silent(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
         if !crate::core::preference_catalog::is_silent_key(key) {
-            // A protocol violation by the caller, not a database failure. sqlx's
-            // error type has no variant for that, so `Protocol` carries the
-            // message: the alternative is a second error type for one call site.
             return Err(sqlx::Error::Protocol(format!(
                 "'{key}' is not an engine-internal preference key, so it must be written through \
                  PreferenceStore::set (which announces PreferencesChanged). Give it a \
@@ -475,7 +410,6 @@ impl PreferenceStore {
         Self::set_row(pool, key, value).await
     }
 
-    /// Update an engine-internal preference only if its stored value still matches.
     pub async fn compare_set_silent(
         pool: &PgPool,
         key: &str,
@@ -510,8 +444,6 @@ impl PreferenceStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// One place the three announcing paths share, so a write and a delete
-    /// cannot drift in what they say.
     async fn announce(
         event_bus: &EventBus,
         key: &str,
@@ -530,12 +462,6 @@ impl PreferenceStore {
             .await;
     }
 
-    /// The pair of numbers that schedules the self-curated context sweep.
-    ///
-    /// Returns the schedule itself rather than a pair of bare `usize`. The two
-    /// numbers are adjacent and interchangeable to the compiler. A
-    /// transposition at the call site would run the whole workspace on the
-    /// wrong schedule and say nothing.
     pub async fn self_curated_context_schedule(
         pool: &PgPool,
     ) -> super::sweep_schedule::SweepSchedule {
@@ -551,22 +477,15 @@ impl PreferenceStore {
         )
     }
 
-    /// The per-turn tool-call cap for one turn. Total, because it is the
-    /// loop's runaway backstop: an absent, unparseable or unreadable row runs
-    /// the turn at the catalog default rather than refusing it.
     pub async fn max_tool_calls(pool: &PgPool) -> usize {
         prefs::MAX_TOOL_CALLS.read(pool).await as usize
     }
 
-    /// The account's chat model, for code paths that start a chat without an
-    /// explicit user request (spawn_thread, process_trigger). `None` while
-    /// unset, because the provider layers `LUCIDOS_MODEL` over the catalog
-    /// default at boot.
     pub async fn user_chat_model(pool: &PgPool) -> Option<String> {
         prefs::CHAT_MODEL.stored(pool).await
     }
 
-    /// The model a new Lucidos Agent thread would run with: the account's
+    /// INVARIANT: The model a new Lucidos Agent thread would run with: the account's
     /// `chat_model` preference, else the provider default.
     ///
     /// Mirrors the chat path's own order, so a report states the window the
@@ -581,8 +500,6 @@ impl PreferenceStore {
             .unwrap_or_else(|| provider_default.to_string())
     }
 
-    /// The tier the account stored for chatting on `model`, if any. A model
-    /// with none runs at its *default effort*.
     pub async fn user_chat_effort(pool: &PgPool, model: &str) -> Option<String> {
         let stored = prefs::CHAT_REASONING_EFFORTS.read(pool).await?;
         let pairs = prefs::parse_model_efforts(&stored).ok()?;
@@ -593,11 +510,6 @@ impl PreferenceStore {
             .map(|(_, tier)| tier.to_string())
     }
 
-    /// Move a stored `chat_reasoning_effort`, the one tier every model shared
-    /// before ADR 0390, onto the model the workspace chats with. That is its
-    /// `chat_model`, else `fallback_model`, the router's own. A tier already
-    /// stored for that model wins. The old row goes either way, so a re-run
-    /// does nothing.
     pub async fn move_legacy_chat_effort(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -639,9 +551,6 @@ impl PreferenceStore {
         }
     }
 
-    /// Rewrite each stored model id its provider retired onto its replacement
-    /// (`prefs::RETIRED_VALUES`), announcing and logging each one. A re-run
-    /// finds nothing retired. Every key in the table is global.
     pub async fn replace_retired_values(pool: &PgPool, event_bus: &EventBus) {
         let keys: std::collections::BTreeSet<&str> = prefs::RETIRED_VALUES
             .iter()
@@ -676,7 +585,7 @@ impl PreferenceStore {
         }
     }
 
-    /// Read the model + reasoning effort a thread last ran with — the values
+    /// INVARIANT: Read the model + reasoning effort a thread last ran with — the values
     /// stamped on the thread's most recent starter event that carried them.
     /// This is the per-thread memory: a follow-up with no explicit override
     /// reuses these instead of snapping back to the account default,
@@ -720,15 +629,13 @@ impl PreferenceStore {
             })
     }
 
-    /// The same per-thread memory read, preserving store failures so acceptance
-    /// can refuse rather than silently substituting account defaults.
     pub async fn try_last_thread_chat_settings(
         pool: &PgPool,
         thread_id: Uuid,
         exclude_event_id: Option<Uuid>,
         model_override: Option<&str>,
     ) -> Result<ResolvedModelSelection, sqlx::Error> {
-        // These thread-event payloads are flat (see `ThreadEvent::to_payload`),
+        // INVARIANT: These thread-event payloads are flat (see `ThreadEvent::to_payload`),
         // so `payload->>'model'` reads the field directly on every stamping variant.
         // `aggregate_id` is text; bind the thread id as its string.
         //
@@ -782,13 +689,6 @@ impl PreferenceStore {
         })
     }
 
-    /// The thread's **pair stamps**: the fewest stamping events that answer
-    /// every question `last_thread_chat_settings` asks of the whole history.
-    ///
-    /// A paged snapshot cannot carry the event that stamped the pair when it
-    /// sits behind the page. These rows stand in for it: the newest stamp
-    /// naming a model, then per model the newest naming an effort and the
-    /// newest naming a provider. An empty model means none, and groups apart.
     pub async fn thread_pair_stamps(
         pool: &PgPool,
         thread_id: Uuid,
@@ -841,7 +741,7 @@ impl PreferenceStore {
             .collect())
     }
 
-    /// Resolve the *model selection* stamped on a chat exchange when the caller
+    /// INVARIANT: Resolve the *model selection* stamped on a chat exchange when the caller
     /// did not fully specify it, honoring per-thread memory.
     ///
     /// The model: explicit caller override → the thread's last recorded model
@@ -877,8 +777,6 @@ impl PreferenceStore {
         })
     }
 
-    /// Resolve the same composer defaults without hiding failed reads or
-    /// malformed stored effort selections. Use this path for durable acceptance.
     pub async fn try_resolve_chat_overrides_for_thread(
         pool: &PgPool,
         defaults: ModelDefaults<'_>,
@@ -917,8 +815,6 @@ impl PreferenceStore {
                 provider: provider_override,
             });
         }
-        // Per-thread memory: reuse what this thread last ran with. Only worth a
-        // query for a follow-up (a new thread has no prior message).
         let remembered = match thread_id {
             Some(tid) => reads.resolve(
                 Self::try_last_thread_chat_settings(
@@ -933,8 +829,6 @@ impl PreferenceStore {
         };
         let (model, remembered_effort) = match model_override.or(remembered.model) {
             Some(model) => (Some(model), remembered.reasoning_effort),
-            // The thread named no model, so it ran on the router's. Its tier
-            // stays there, and never carries onto a `chat_model` set since.
             None => match reads.resolve(prefs::CHAT_MODEL.try_stored(pool).await)? {
                 Some(model) => (Some(model), None),
                 None => (None, remembered.reasoning_effort),
@@ -992,7 +886,6 @@ impl SettingsReads {
     }
 }
 
-/// Logs a failed read, for a handle read that then falls back to its default.
 fn log_read_failure(key: &str, e: &sqlx::Error) {
     log_legacy!(
         "[Preferences] Failed to read {}: {}. Using its default",
@@ -1001,7 +894,6 @@ fn log_read_failure(key: &str, e: &sqlx::Error) {
     );
 }
 
-/// A stored value trimmed, with a blank one read as unset.
 fn nonblank(stored: Option<String>) -> Option<String> {
     stored
         .map(|v| v.trim().to_string())
@@ -1009,13 +901,10 @@ fn nonblank(stored: Option<String>) -> Option<String> {
 }
 
 impl<K> Pref<K> {
-    /// The stored global row, untouched. `Ok(None)` when no row exists.
     pub async fn try_stored(&self, pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
         PreferenceStore::get(pool, self.key()).await
     }
 
-    /// When the stored global row was last written, on the database clock.
-    /// `Ok(None)` when no row exists.
     pub async fn try_stored_written_at(
         &self,
         pool: &PgPool,
@@ -1023,7 +912,6 @@ impl<K> Pref<K> {
         PreferenceStore::get_written_at(pool, self.key()).await
     }
 
-    /// [`Self::try_stored`], with a failed read logged and read as unset.
     pub async fn stored(&self, pool: &PgPool) -> Option<String> {
         self.try_stored(pool).await.unwrap_or_else(|e| {
             log_read_failure(self.key(), &e);
@@ -1031,7 +919,6 @@ impl<K> Pref<K> {
         })
     }
 
-    /// The stored row for `device_id`, else the global one.
     pub async fn try_stored_for_device(
         &self,
         pool: &PgPool,
@@ -1042,8 +929,6 @@ impl<K> Pref<K> {
 }
 
 impl Pref<Flag> {
-    /// `stored` read as a switch, or the default when absent or neither on nor
-    /// off.
     pub fn resolve(&self, stored: Option<&str>) -> bool {
         stored
             .and_then(prefs::parse_flag)
@@ -1054,16 +939,12 @@ impl Pref<Flag> {
         Ok(self.resolve(self.try_stored(pool).await?.as_deref()))
     }
 
-    /// Total: a failed read is logged and resolves to the default.
     pub async fn read(&self, pool: &PgPool) -> bool {
         self.resolve(self.stored(pool).await.as_deref())
     }
 }
 
 impl Pref<Number> {
-    /// `stored` parsed, or the default when it is absent, not a number, or
-    /// outside the spec's bounds. An out-of-range value is not a setting at
-    /// all, so it reads as unset like any other value the catalog refuses.
     pub fn resolve(&self, stored: Option<&str>) -> f64 {
         let (min, max) = self.bounds();
         stored
@@ -1076,14 +957,11 @@ impl Pref<Number> {
         Ok(self.resolve(self.try_stored(pool).await?.as_deref()))
     }
 
-    /// Total: a failed read is logged and resolves to the default.
     pub async fn read(&self, pool: &PgPool) -> f64 {
         self.resolve(self.stored(pool).await.as_deref())
     }
 }
 
-/// `spec`'s value: the stored row when it is valid, else its default,
-/// following an inherited default to the spec that holds the value.
 async fn resolve_text(pool: &PgPool, spec: &PrefSpec) -> Result<String, sqlx::Error> {
     let stored = nonblank(PreferenceStore::get(pool, spec.key).await?)
         .filter(|v| prefs::validate(spec, v).is_ok());
@@ -1100,7 +978,7 @@ async fn resolve_text(pool: &PgPool, spec: &PrefSpec) -> Result<String, sqlx::Er
 }
 
 impl Pref<Text> {
-    /// `stored` when it is a valid value, else the default. Only for a spec
+    /// INVARIANT: `stored` when it is a valid value, else the default. Only for a spec
     /// whose default is a value: an inherited default needs the database, so
     /// it goes through [`Self::try_read`].
     pub fn resolve(&self, stored: Option<&str>) -> String {
@@ -1115,7 +993,6 @@ impl Pref<Text> {
         resolve_text(pool, &self.spec).await
     }
 
-    /// Total: a failed read is logged and resolves to the default.
     pub async fn read(&self, pool: &PgPool) -> String {
         self.try_read(pool).await.unwrap_or_else(|e| {
             log_read_failure(self.key(), &e);
@@ -1123,7 +1000,7 @@ impl Pref<Text> {
         })
     }
 
-    /// The first value stored along the inheritance chain, without the
+    /// INVARIANT: The first value stored along the inheritance chain, without the
     /// chain's final default. For a reader whose unset case means something
     /// other than that default: an unset background model resolves against
     /// the configured providers (`engine::aux_purpose`).
@@ -1146,7 +1023,6 @@ impl Pref<Text> {
         }
     }
 
-    /// The device's value, else the global one, else the default.
     pub async fn read_for_device(&self, pool: &PgPool, device_id: &str) -> String {
         let stored = self
             .try_stored_for_device(pool, device_id)
@@ -1160,12 +1036,10 @@ impl Pref<Text> {
 }
 
 impl Pref<Optional> {
-    /// The stored value trimmed, `None` while unset or blank.
     pub async fn try_read(&self, pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
         Ok(nonblank(self.try_stored(pool).await?))
     }
 
-    /// Total: a failed read is logged and reads as unset.
     pub async fn read(&self, pool: &PgPool) -> Option<String> {
         nonblank(self.stored(pool).await)
     }
@@ -1352,8 +1226,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The real local setups keep working: Ollama and LM Studio on loopback, a
-    /// LAN box on an RFC 1918 address, a tailnet box, and a private-use name.
     #[test]
     fn a_local_base_url_on_this_machine_or_own_network_is_accepted() {
         for url in [
@@ -1374,8 +1246,6 @@ mod tests {
         }
     }
 
-    /// A host the user's network does not own would receive every prompt.
-    /// Link-local is refused for the metadata endpoint it holds.
     #[test]
     fn a_local_base_url_off_the_own_network_is_refused() {
         for url in [
@@ -1397,8 +1267,6 @@ mod tests {
         }
     }
 
-    /// The override triple a caller passes in. The cases below only ever pin
-    /// a model or an effort, so the provider stays unset.
     fn overrides(model: Option<&str>, effort: Option<&str>) -> ResolvedModelSelection {
         ResolvedModelSelection {
             model: model.map(str::to_string),
@@ -1415,13 +1283,6 @@ mod tests {
             .unwrap()
     }
 
-    /// The load-bearing guarantee. `PreferencesChanged` is a MECHANISM here,
-    /// not just a notification: the scheduler re-registers the backup cron off
-    /// it and the frontend live-applies theme / font / scale, so a preference
-    /// written without it silently fails to take effect.
-    ///
-    /// A same-value write still announces. The event re-applies the setting, so
-    /// suppressing it would skip the re-application the user asked for.
     #[tokio::test]
     async fn every_preference_write_announces_including_a_same_value_rewrite() {
         let (pool, db_name) = setup_test_db().await;
@@ -1463,7 +1324,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Upgrade resets both cache preferences, including already-migrated dev values.
     #[tokio::test]
     async fn cache_preferences_upgrade_turns_every_enabled_value_off() {
         const MODE_MERGE: &str =
@@ -1521,11 +1381,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The theme rename moves every stored appearance choice to its new key,
-    /// global and per device, so no device paints a default after the upgrade.
-    ///
-    /// The migrations already ran on this database, so the test seeds the old
-    /// keys and runs the files again, in order. Each is written to re-run.
     #[tokio::test]
     async fn the_theme_rename_keeps_every_stored_choice() {
         const THEME_TO_THEME_MODE: &str = include_str!(
@@ -1619,8 +1474,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The dynamic bars rename keeps every stored choice with the polarity
-    /// flipped, so a device that had unpinned its header still hides it.
     #[tokio::test]
     async fn the_dynamic_bars_rename_flips_every_stored_choice() {
         const STICKY_TO_DYNAMIC_BARS: &str = include_str!(
@@ -1675,9 +1528,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The silent door is guarded, which is what stops it from becoming the
-    /// easy way to skip an announcement. A listed engine-internal key writes
-    /// quietly; anything else is refused rather than written.
     #[tokio::test]
     async fn set_silent_writes_internal_keys_and_refuses_real_preferences() {
         let (pool, db_name) = setup_test_db().await;
@@ -1714,9 +1564,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// On an empty table every read is the catalog's default, and nothing
-    /// else: a text handle follows an inherited default to its source, and an
-    /// optional handle reads as unset.
     #[tokio::test]
     async fn every_handle_reads_its_catalog_default_on_an_empty_table() {
         use crate::core::preference_catalog::{PrefValue, CATALOG};
@@ -1755,8 +1602,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// I1 of the command-guard plan: no row runs guarded, and only an explicit
-    /// `false` turns the guard off.
     #[tokio::test]
     async fn the_command_guard_is_on_without_a_row_and_off_only_when_stored_off() {
         let (pool, db_name) = setup_test_db().await;
@@ -1813,10 +1658,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    // Pins the row-absent-vs-error distinction in one place: splitting the
-    // two assertions across separate tests would let a regression that
-    // collapses both branches back into the same `Ok(false)` (the original
-    // bug) pass each test individually.
     #[tokio::test]
     async fn capture_context_distinguishes_error_from_unset() {
         let (unset_pool, unset_db) = setup_test_db().await;
@@ -1841,14 +1682,6 @@ mod tests {
         );
     }
 
-    // --- Per-turn tool-call cap
-    // (docs/plans/2026-08-03-configurable-max-tool-calls.md) ---
-
-    /// One case per resolution branch, in one test: the reader is total, so the
-    /// property worth pinning is that EVERY input lands on a usable cap. Split
-    /// across separate tests, a regression that collapsed the branches into a
-    /// single `unwrap_or(default)` (losing the floor, or losing large values)
-    /// would still pass most of them.
     #[tokio::test]
     async fn max_tool_calls_resolves_every_input_to_a_usable_cap() {
         let (pool, db_name) = setup_test_db().await;
@@ -1897,10 +1730,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A DB error must not fail the turn. Unlike `capture_context`, which
-    /// propagates `Err` so a caller can render a failed state, this read has no
-    /// caller that could do anything useful with the error: the loop needs a
-    /// number to run at all.
     #[tokio::test]
     async fn max_tool_calls_falls_back_to_the_default_on_a_db_error() {
         let (pool, db_name) = setup_test_db().await;
@@ -1914,7 +1743,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Each model keeps its own stored tier, and an unlisted one has none.
     #[tokio::test]
     async fn the_account_stores_a_tier_per_model() {
         let (pool, db_name) = setup_test_db().await;
@@ -1940,8 +1768,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The upgrade keeps the tier a workspace stored, on the model it chats
-    /// with, and leaves no trace of the old key. A re-run changes nothing.
     #[tokio::test]
     async fn the_legacy_chat_tier_moves_onto_the_chat_model() {
         let (pool, db_name) = setup_test_db().await;
@@ -1970,8 +1796,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// With no `chat_model` stored the workspace chats on the router's own
-    /// model, so the tier lands there. A tier already stored for it wins.
     #[tokio::test]
     async fn the_legacy_chat_tier_follows_the_router_model_and_never_overwrites() {
         let (pool, db_name) = setup_test_db().await;
@@ -2002,8 +1826,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Boot moves a stored retired model onto its replacement, and a mini
-    /// choice stays mini. A live value stays put, and a re-run writes nothing.
     #[tokio::test]
     async fn the_startup_rewrite_moves_each_retired_model_onto_its_replacement() {
         let (pool, db_name) = setup_test_db().await;
@@ -2054,8 +1876,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A retired row that escaped the rewrite, say from a restored backup,
-    /// must not dial a dead model. It reads as the default instead.
     #[tokio::test]
     async fn a_retired_model_that_escaped_the_rewrite_reads_as_the_default() {
         let (pool, db_name) = setup_test_db().await;
@@ -2085,7 +1905,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The router's own model, standing in for an unset `chat_model`.
     const FALLBACK_MODEL: &str = "router-default";
 
     async fn seed_chat_prefs(pool: &PgPool, model: &str, effort: &str) {
@@ -2101,8 +1920,6 @@ mod tests {
         .unwrap();
     }
 
-    // The thread-less resolution path (thread_id = None): caller override →
-    // account preference, no per-thread lookup.
     #[tokio::test]
     async fn resolve_chat_overrides_falls_back_to_prefs_when_none() {
         let (pool, db_name) = setup_test_db().await;
@@ -2145,8 +1962,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A model named without a tier takes its own tier, never the account
-    /// model's: the stored one, else its default effort, else none.
     #[tokio::test]
     async fn a_model_override_takes_that_models_own_tier() {
         let (pool, db_name) = setup_test_db().await;
@@ -2188,7 +2003,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// With nothing stored, the router's own model runs at its default effort.
     #[tokio::test]
     async fn an_unset_chat_runs_the_fallback_model_at_its_default_effort() {
         let (pool, db_name) = setup_test_db().await;
@@ -2219,12 +2033,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    // --- Per-thread model/effort memory
-    // (docs/plans/2026-07-03-per-thread-model-memory.md) ---
-
-    /// Insert a flat `MessageReceived` events row the way `ThreadEvent::to_payload`
-    /// serializes it (model/effort at the top level), so the resolution query is
-    /// tested against the real payload shape. Returns the event id (`events.id`).
     async fn insert_message_received(
         pool: &PgPool,
         thread_id: Uuid,
@@ -2234,7 +2042,6 @@ mod tests {
         insert_starter(pool, thread_id, model, effort, None).await
     }
 
-    /// A starter that also carries the backend the turn was pinned to.
     async fn insert_starter(
         pool: &PgPool,
         thread_id: Uuid,
@@ -2411,8 +2218,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A remembered tier belongs to the model it ran with. A thread that moved
-    /// to another model forgets it, and finds it again on switching back.
     #[tokio::test]
     async fn a_remembered_effort_never_outlives_its_model() {
         let (pool, db_name) = setup_test_db().await;
@@ -2429,8 +2234,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A thread whose starters stamped no model (an unset `chat_model`) still
-    /// remembers its tier, since it stays on the same unnamed model.
     #[tokio::test]
     async fn a_thread_with_no_stamped_model_keeps_its_tier() {
         let (pool, db_name) = setup_test_db().await;
@@ -2446,8 +2249,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The reduced stamps must answer exactly what full history answers: the
-    /// newest model, and per model its own newest effort and provider.
     #[tokio::test]
     async fn pair_stamps_keep_each_models_own_effort_and_provider() {
         let (pool, db_name) = setup_test_db().await;
@@ -2495,8 +2296,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A model-less thread ran on the router's model, so its tier does not
-    /// follow it onto a `chat_model` the account set since.
     #[tokio::test]
     async fn a_model_less_thread_tier_stops_at_a_named_chat_model() {
         let (pool, db_name) = setup_test_db().await;
@@ -2526,7 +2325,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A rung pick between turns, as `record_chat_settings` writes it.
     async fn insert_chat_settings_changed(
         pool: &PgPool,
         thread_id: Uuid,
@@ -2547,7 +2345,6 @@ mod tests {
         .await;
     }
 
-    /// The next turn runs the recorded pick, however it starts.
     #[tokio::test]
     async fn a_recorded_pick_wins_over_the_last_starter() {
         let (pool, db_name) = setup_test_db().await;
@@ -2562,8 +2359,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A pick's effort and provider stay with its model, and a later starter
-    /// on another model supersedes the pick.
     #[tokio::test]
     async fn a_picked_effort_stays_tied_to_its_model() {
         let (pool, db_name) = setup_test_db().await;
@@ -2584,8 +2379,6 @@ mod tests {
 
     #[tokio::test]
     async fn last_thread_chat_settings_excludes_in_flight_event() {
-        // The current turn's own MessageReceived (pre-emitted upstream) must not
-        // be read as its own "previous" value.
         let (pool, db_name) = setup_test_db().await;
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("prior-model"), Some("low")).await;
@@ -2627,7 +2420,6 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
-        // Override the model only → the thread's tier stays with its old model.
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             ModelDefaults {
@@ -2649,7 +2441,6 @@ mod tests {
     async fn resolve_for_thread_falls_back_to_preference_without_thread_record() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "pref-model", "low").await;
-        // A brand-new thread (no messages) → account preference.
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             ModelDefaults {
@@ -2663,7 +2454,6 @@ mod tests {
         .await;
         assert_eq!(resolved.model.as_deref(), Some("pref-model"));
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
-        // Thread-less resolve behaves the same (caller override → preference).
         let threadless = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             ModelDefaults {
@@ -2688,7 +2478,6 @@ mod tests {
         let tid = Uuid::new_v4();
         insert_starter(&pool, tid, Some("opus"), Some("high"), Some("vertex")).await;
 
-        // The same model keeps the backend it was pinned to.
         let same = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             ModelDefaults {
@@ -2702,7 +2491,6 @@ mod tests {
         .await;
         assert_eq!(same.provider.as_deref(), Some("vertex"));
 
-        // Switching the model drops it, so the new model's row decides.
         let switched = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             ModelDefaults {
@@ -2716,13 +2504,11 @@ mod tests {
         .await;
         assert_eq!(switched.provider, None);
 
-        // A later turn on the new model reads no pick either.
         insert_starter(&pool, tid, Some("sonnet"), Some("high"), None).await;
         let later = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
         assert_eq!(later.model.as_deref(), Some("sonnet"));
         assert_eq!(later.provider, None);
 
-        // Switching back finds the pick recorded with that model.
         let back = PreferenceStore::last_thread_chat_settings(&pool, tid, None, Some("opus")).await;
         assert_eq!(back.provider.as_deref(), Some("vertex"));
         pool.close().await;

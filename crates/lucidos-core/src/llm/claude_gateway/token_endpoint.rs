@@ -1,6 +1,3 @@
-//! The HTTP side of the gateway's OAuth endpoints: one client, and one reader
-//! of a token endpoint's answer, shared by the device flow and the refresh.
-
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -11,11 +8,9 @@ use crate::core::oauth::TokenResponse;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Longest raw body echoed into an error. A proxy in front of the gateway can
-/// answer with a whole HTML page.
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
-/// The client for every gateway call but the Messages stream. It names Lucidos
+/// INVARIANT: The client for every gateway call but the Messages stream. It names Lucidos
 /// in `User-Agent`, and it follows no redirect: a `307` would resend a token
 /// to whichever host the redirect named.
 pub(super) fn http_client() -> &'static reqwest::Client {
@@ -25,19 +20,17 @@ pub(super) fn http_client() -> &'static reqwest::Client {
             .user_agent(crate::llm::lucidos_user_agent())
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            // Only fails on TLS-backend init.
             .expect("Claude gateway HTTP client builder")
     });
     &CLIENT
 }
 
-/// Tokens the gateway granted, as Lucidos stores them.
 #[derive(Clone)]
 pub struct GrantedTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub token_expiry: Option<DateTime<Utc>>,
-    /// The account that approved the sign-in, shown in Settings and never used
+    /// INVARIANT: The account that approved the sign-in, shown in Settings and never used
     /// to decide anything. The token response's own `email` extension, else
     /// the ID token's claim, else the access token's.
     pub email: Option<String>,
@@ -57,7 +50,6 @@ impl std::fmt::Debug for GrantedTokens {
     }
 }
 
-/// An OAuth error answer (RFC 6749 §5.2), such as `authorization_pending`.
 #[derive(Debug, Deserialize)]
 pub(super) struct OAuthRefusal {
     pub error: String,
@@ -73,16 +65,12 @@ impl std::fmt::Display for OAuthRefusal {
     }
 }
 
-/// What a token endpoint answered.
 #[derive(Debug)]
 pub(super) enum TokenReply {
     Granted(GrantedTokens),
     Refused(OAuthRefusal),
 }
 
-/// POST a form to a token endpoint. An OAuth error comes back as
-/// [`TokenReply::Refused`], so the caller can act on its code. Anything else
-/// that is not a grant is an `Err`.
 pub(super) async fn post_token_form(
     token_url: &str,
     form: &[(&str, &str)],
@@ -106,7 +94,6 @@ pub(super) async fn post_token_form(
     }
 }
 
-/// The start of a raw error body, short enough to echo into an error.
 pub(super) fn excerpt(body: &str) -> &str {
     let body = body.trim();
     &body[..body.floor_char_boundary(MAX_ERROR_BODY_CHARS)]
@@ -130,7 +117,7 @@ fn granted_from(value: serde_json::Value) -> Result<GrantedTokens, BoxError> {
     })
 }
 
-/// The `email` claim of a token the gateway issued, ID or access. The signature
+/// INVARIANT: The `email` claim of a token the gateway issued, ID or access. The signature
 /// is not checked: the token came straight from the token endpoint over TLS
 /// (OIDC Core §3.1.3.7), and the claim is only displayed.
 pub(super) fn jwt_email(token: &str) -> Option<String> {
@@ -141,7 +128,7 @@ pub(super) fn jwt_email(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The claims of a JWT, unverified, or `None` for a token that is not one.
+/// INVARIANT: The claims of a JWT, unverified, or `None` for a token that is not one.
 /// Only for reading what the gateway itself issued over TLS.
 pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     let payload = token.split('.').nth(1)?;
@@ -157,7 +144,6 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 pub(super) mod tests {
     use super::*;
 
-    /// An unsigned ID token carrying `claims`, as a test gateway issues it.
     pub(crate) fn id_token(claims: serde_json::Value) -> String {
         let encode = |v: &serde_json::Value| {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
@@ -185,8 +171,6 @@ pub(super) mod tests {
         assert!(left.num_seconds() > 3500, "{left}");
     }
 
-    /// The protocol's `email` extension names the approving account, ahead of
-    /// the ID token. A blank one is no answer.
     #[test]
     fn the_email_extension_wins_over_the_id_token() {
         let id_token = id_token(serde_json::json!({"email": "claim@example.com"}));
@@ -206,8 +190,6 @@ pub(super) mod tests {
         assert_eq!(blank.email.as_deref(), Some("claim@example.com"));
     }
 
-    /// A gateway that sends neither the extension nor an ID token may still
-    /// name the account in its access token, as telemetry reads it.
     #[test]
     fn the_access_token_names_the_account_last() {
         let access = id_token(serde_json::json!({"email": "access@example.com"}));
@@ -221,8 +203,6 @@ pub(super) mod tests {
         assert_eq!(with_id.email.as_deref(), Some("claim@example.com"));
     }
 
-    /// An empty refresh token is not a token, so a refresh keeps the stored
-    /// one rather than erasing it.
     #[test]
     fn an_empty_refresh_token_is_none() {
         let granted =

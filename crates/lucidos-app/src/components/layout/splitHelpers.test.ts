@@ -1,5 +1,9 @@
-import { describe, it, expect } from 'vitest';
+// @vitest-environment jsdom
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { animationSpeed, scaledDurationMs } from '../../store/store';
 import {
+  PANE_TRANSITION_MS,
+  triggerPaneAnimate,
   clampToRange,
   clampSplitRatio,
   computeDrawnLayout,
@@ -401,5 +405,25 @@ describe('computeDrawnLayout: the Conversation is never squeezed below its floor
     expect(sidePanesFit(room(RAIL_ONLY), false, true)).toBe(true);
     expect(sidePanesFit(room(RAIL_ONLY - 1), false, true)).toBe(false);
     expect(sidePanesFit(room(FLOORS.minContentPx + FLOORS.railPx, FLOORS, 0), false, true)).toBe(true);
+  });
+});
+
+describe('triggerPaneAnimate holds the transition class at the animation speed', () => {
+  afterEach(() => {
+    animationSpeed.value = 0;
+    vi.useRealTimers();
+    document.body.innerHTML = '';
+  });
+
+  it('keeps pane-animate for the scaled transition, and drops it after the unscaled slack', () => {
+    vi.useFakeTimers();
+    animationSpeed.value = 10;
+    document.body.innerHTML = '<div class="split-layout"></div>';
+    const layout = document.querySelector<HTMLElement>('.split-layout')!;
+    triggerPaneAnimate();
+    vi.advanceTimersByTime(scaledDurationMs(PANE_TRANSITION_MS) + 50);
+    expect(layout.classList.contains('pane-animate')).toBe(true);
+    vi.advanceTimersByTime(60);
+    expect(layout.classList.contains('pane-animate')).toBe(false);
   });
 });

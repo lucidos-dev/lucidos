@@ -8,7 +8,6 @@ pub(super) struct MemoryEntriesQuery {
     offset: Option<i64>,
     source_type: Option<String>,
     sort: Option<String>,
-    /// Comma-separated importance levels: low,medium,high,critical
     importance: Option<String>,
 }
 
@@ -26,14 +25,7 @@ pub(super) struct MemorySourceQuery {
     commit: Option<String>,
 }
 
-/// A memory list page's `LIMIT` and `OFFSET` from the query string: 50 a page
-/// by default, at most 200, never negative.
 fn page_bounds(limit: Option<i64>, offset: Option<i64>) -> (i64, i64) {
-    // `clamp`, not `min`: both values are bound straight into `LIMIT $1 OFFSET
-    // $2`, and Postgres rejects a negative one, so `?limit=-1` would be a 500
-    // rather than an empty page. Every sibling list endpoint clamps
-    // (`changes.rs`, `notifications.rs`, `history.rs`). Limit floors at 1
-    // because no memory list has a count-only caller.
     (
         limit.unwrap_or(50).clamp(1, 200),
         offset.unwrap_or(0).max(0),
@@ -94,11 +86,6 @@ pub(super) async fn get_memory_entries(
             )
         })?;
 
-    // `offset` comes straight off the query string, so a caller-supplied
-    // `?offset=9223372036854775807` overflows a plain `offset + limit`: a panic
-    // in a debug build, a wrap to a negative (and a wrong `has_more: true`) in a
-    // release one. Saturating keeps the comparison honest at the top of the range
-    // and is identical to `+` for every reachable page.
     let has_more = offset.saturating_add(limit) < total;
     Ok(Json(serde_json::json!({
         "entries": entries,
@@ -107,10 +94,6 @@ pub(super) async fn get_memory_entries(
     })))
 }
 
-/// `GET /api/v1/memory/search?q=<query>&limit=<n>`: the HTTP face of the
-/// agent's memory search. The ranking lives on the engine
-/// (`engine::memory::read`), shared with the `memory` tool's `search` action so
-/// the two can never disagree about an order.
 pub(super) async fn search_memory(
     State(state): State<AppState>,
     Query(query): Query<MemorySearchQuery>,
@@ -141,8 +124,6 @@ pub(super) async fn get_memory_source(
                 "source_id required for event source".to_string(),
             ))?)
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid UUID".to_string()))?;
-            // Shared with the `memory` tool's `source` action: one place decides
-            // that either id resolves and that the event carries its thread_id.
             state
                 .engine
                 .memory_source(id)
@@ -160,7 +141,6 @@ pub(super) async fn get_memory_source(
                 "commit required for artifact source".to_string(),
             ))?;
 
-            // Get the artifact content at that commit
             let artifact_manager =
                 ArtifactManager::new(state.workspace_path.clone()).map_err(|e| {
                     (
@@ -172,7 +152,6 @@ pub(super) async fn get_memory_source(
                 .read_artifact_at_commit_string(path, commit)
                 .map_err(|e| (StatusCode::NOT_FOUND, format!("Artifact not found: {}", e)))?;
 
-            // Get all memory entries from this source
             let source_json =
                 serde_json::json!({"type": "artifact", "path": path, "commit": commit});
             let entries = index.entries_for_source(&source_json).await.map_err(|e| {
@@ -199,12 +178,6 @@ pub(super) async fn get_memory_source(
     }
 }
 
-/// Trigger a memory rebuild in the background.
-/// Query params:
-///   `force=true` clears all entries first (full rebuild); default is resume/incremental.
-///   `re_extract_stale=true` (incremental only) deletes entries written by an older
-///   `EXTRACTOR_VERSION` so the incremental walk re-extracts them with the current
-///   extractor — without paying for a full rebuild.
 pub(super) async fn rebuild_memory(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -215,11 +188,6 @@ pub(super) async fn rebuild_memory(
             Json(serde_json::json!({ "status": "already_running" })),
         );
     }
-    // The embedding model loads in the background (see `memory::EmbedderSlot`). A
-    // rebuild clears entries before re-indexing, so running it before the model
-    // lands would wipe memory it can't re-index. Refuse with a clear message
-    // instead of spawning a destructive no-op (the engine-side rebuild enforces
-    // the same floor).
     if !state.engine.embedder().is_ready() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -271,7 +239,7 @@ pub(super) async fn cancel_rebuild_memory(
     )
 }
 
-/// Snapshot of where the background embedding-model loader has got to.
+/// INVARIANT: Snapshot of where the background embedding-model loader has got to.
 ///
 /// The live signal is the `EmbeddingModelStatusChanged` SSE frame, but a client
 /// that loads DURING a cold first-run download (the normal case on a fresh
@@ -288,8 +256,6 @@ pub(super) fn read_embedding_model_status(state: &AppState) -> crate::memory::Em
     state.embedder.status()
 }
 
-/// Where the Tree memory module's backfill has got. The live signal is the
-/// `TreeBackfill*` SSE frames; this is the snapshot a page opens on.
 pub(super) async fn get_tree_backfill(
     State(state): State<AppState>,
 ) -> Result<Json<crate::engine::summary_tree::TreeBackfill>, ApiError> {
@@ -299,8 +265,6 @@ pub(super) async fn get_tree_backfill(
         .map_err(|e| ApiError::internal(format!("Could not read the Tree backfill: {e}")))
 }
 
-/// What a Tree backfill of this workspace would cost: calls, tokens, time,
-/// and a price per compactor model. Read before the user confirms Tree.
 pub(super) async fn get_tree_backfill_estimate(
     State(state): State<AppState>,
 ) -> Result<Json<crate::engine::summary_tree::TreeBackfillEstimate>, ApiError> {
@@ -312,11 +276,10 @@ pub(super) async fn get_tree_backfill_estimate(
 
 #[derive(Deserialize)]
 pub(super) struct RaiseTreeBackfillCap {
-    /// The cap the user saw when pressing Continue.
     from_cap_usd: f64,
 }
 
-/// `POST /api/v1/memory/tree-backfill/cap`: Continue a backfill held at its
+/// INVARIANT: `POST /api/v1/memory/tree-backfill/cap`: Continue a backfill held at its
 /// spending cap. The cap moves one step, which the engine sets, and the
 /// compactor picks the raise up from its event. A press against a cap that
 /// has moved since, a second click or another device, is refused.
@@ -331,7 +294,7 @@ pub(super) async fn raise_tree_backfill_cap(
         .await
         .map_err(ApiError::db)?
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "No Tree memory backfill is running"))?;
-    // The compactor's running total can read held a little before the events
+    // INVARIANT: The compactor's running total can read held a little before the events
     // do, so either counts: a refusal there would leave a held backfill stuck.
     let held = episode.held()
         || state
@@ -379,9 +342,6 @@ pub(super) struct SummaryTreeQuery {
     thread: Option<Uuid>,
 }
 
-/// `GET /api/v1/memory/tree?thread=<uuid>`: the top of a summary tree, the
-/// workspace's with no `thread`. A browser opens its lines with
-/// `/api/v1/recall/zoom`.
 pub(super) async fn get_summary_tree(
     State(state): State<AppState>,
     Query(query): Query<SummaryTreeQuery>,
@@ -402,8 +362,6 @@ pub(super) struct SummaryTreeThreadsQuery {
     offset: Option<i64>,
 }
 
-/// `GET /api/v1/memory/tree/threads`: the threads with summary trees, the most
-/// recently active first, paged like `/api/v1/memory/entries`.
 pub(super) async fn get_summary_tree_threads(
     State(state): State<AppState>,
     Query(query): Query<SummaryTreeThreadsQuery>,
@@ -424,11 +382,6 @@ pub(super) async fn get_summary_tree_threads(
     })))
 }
 
-/// `POST /api/v1/memory/correct-by-id`: delete one memory entry and record the
-/// correction, as the `correct_memory_by_id` tool does. The body is the tool's
-/// arguments, and `result` is the sentence the tool answers with. A correction
-/// that changed nothing answers with an error status, so a script's command
-/// fails.
 pub(super) async fn correct_memory_by_id(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -449,7 +402,6 @@ pub(super) async fn correct_memory_by_id(
     }
 }
 
-/// Routes for the `/memory/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/memory/correct-by-id", post(correct_memory_by_id))

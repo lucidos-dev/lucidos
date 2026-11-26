@@ -4,8 +4,6 @@ use crate::engine::thread_events::{EventMeta, McpEnablementSource};
 use crate::engine::tool_arguments::McpSetupRequest;
 use crate::mcp::McpStopOutcome;
 
-/// A server's launch line, whether it is approved, and what the guard's static
-/// pass makes of it, as one `list_mcp_servers` line. `line` is masked.
 fn launch_audit_line(line: Option<&str>, approved: bool, root: &std::path::Path) -> String {
     let Some(line) = line else {
         return "  Launch: unknown, the engine's working directory is unknown\n".to_string();
@@ -33,8 +31,6 @@ fn launch_audit_line(line: Option<&str>, approved: bool, root: &std::path::Path)
 
 #[easy_ext::ext(McpExt)]
 pub(crate) impl LucidosEngine {
-    /// `thread_id` is the calling thread: `enable`, `disable`, `start` and
-    /// `setup` act on its own enabled servers (ADR 0430).
     async fn execute_mcp_management_tool(
         &self,
         name: &str,
@@ -91,8 +87,6 @@ pub(crate) impl LucidosEngine {
                         self.workspace_path(),
                     ));
 
-                    // Wire names, because that is what a call has to use. The
-                    // server's own spelling is shown only where it differs.
                     let prefix = format!("mcp__{}__", s.id);
                     let offered: Vec<String> = s
                         .tools
@@ -107,9 +101,6 @@ pub(crate) impl LucidosEngine {
                         })
                         .collect();
                     if !offered.is_empty() {
-                        // Only a thread that enables a server pays for its
-                        // tools (ADR 0430). The source says how old the list is,
-                        // since a cached one can be stale.
                         let cost = if s.running {
                             format!("live, ~{} tokens in each thread that enables it", s.tokens)
                         } else {
@@ -146,8 +137,6 @@ pub(crate) impl LucidosEngine {
                 Ok(output)
             }
 
-            // `start` from a thread enables the server there too, so the
-            // agent's habit of starting what it needs keeps working.
             "start_mcp_server" | "enable_mcp_server" => {
                 let id = args["id"].as_str().unwrap_or("");
                 if id.is_empty() {
@@ -268,7 +257,6 @@ mod tests {
             (setup.id, setup.name, setup.command),
             ("fs", "Files", "npx")
         );
-        // A non-string argument is dropped, by the guard and the spawn alike.
         assert_eq!(setup.args, ["-y", "server"]);
         assert_eq!(setup.env.len(), 1);
     }

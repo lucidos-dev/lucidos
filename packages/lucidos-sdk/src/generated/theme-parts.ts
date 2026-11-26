@@ -111,6 +111,8 @@ export const COLOUR_TOKENS: readonly string[] = [
   '--lucidos-mark-fg',
   '--claude-mark',
   '--codex-mark',
+  '--agent-icon-theme',
+  '--agent-icon-muted',
   '--accent-green',
   '--accent-green-soft',
   '--accent-yellow',

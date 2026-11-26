@@ -1,4 +1,4 @@
-//! Bounded private evidence for the gateway bundle builder. Never a send path.
+//! INVARIANT: Bounded private evidence for the gateway bundle builder. Never a send path.
 use super::{ApiError, AppState};
 use axum::{
     extract::State,
@@ -19,8 +19,6 @@ use lucidos_diagnostic_log::snapshot::{
 };
 
 fn event_record(id: uuid::Uuid, ts: DateTime<Utc>, kind: &str, payload: String) -> Record {
-    // SQL's fixed event vocabulary supplies the kind. Unknown future callers
-    // cannot turn arbitrary text into a shareable fragment.
     let kind = FAILURE_TYPES
         .iter()
         .copied()
@@ -69,7 +67,7 @@ pub(super) async fn snapshot(
 }
 
 async fn collect(state: &AppState) -> Result<Snapshot, Box<dyn std::error::Error + Send + Sync>> {
-    // Bound each payload in SQL before materializing it; even the owner's copy
+    // INVARIANT: Bound each payload in SQL before materializing it; even the owner's copy
     // must not read an unbounded conversation/tool payload into this response.
     let rows = evidence_rows(&state.pool).await?;
     let mut snapshot = Snapshot {
@@ -85,8 +83,6 @@ async fn collect(state: &AppState) -> Result<Snapshot, Box<dyn std::error::Error
             row.try_get("payload")?,
         );
         if kind == "InternalFaultRecorded" {
-            // Preserve the closed fault kind for maintainer diagnosis; no event
-            // payload string is declared shareable.
             let payload: String = row.try_get("payload")?;
             if let Ok(crate::engine::event_bus::SystemEvent::InternalFaultRecorded { kind }) =
                 serde_json::from_str::<crate::engine::event_bus::SystemEvent>(&payload)

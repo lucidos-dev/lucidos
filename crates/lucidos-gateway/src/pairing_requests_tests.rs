@@ -1,7 +1,3 @@
-//! Plan invariant 9, through the real gateway router: once any device is
-//! paired, a local process's pairing redeems only after a paired device's
-//! Allow.
-
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
@@ -19,15 +15,12 @@ enum Caller {
     Nobody,
 }
 
-/// A gateway whose stores live in a directory of its own, so a gateway
-/// pairing can save.
 fn gateway() -> (GatewayState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
     (state, dir)
 }
 
-/// A gateway with one paired device, which [`Caller::PairedDevice`] reaches.
 fn with_a_paired_device() -> (GatewayState, tempfile::TempDir) {
     let (state, dir) = gateway();
     state
@@ -79,7 +72,6 @@ async fn call(
     )
 }
 
-/// Which pairing a test drives: a device's or a gateway's.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Device,
@@ -170,7 +162,6 @@ async fn a_local_process_s_code_waits_for_a_paired_device_s_allow() {
         assert_eq!(waiting[0]["label"], json!("New phone"));
         let id = waiting[0]["id"].as_str().unwrap();
 
-        // The local process cannot answer its own request.
         assert_eq!(
             answer(&state, Caller::LocalProcess, id, "allow").await,
             StatusCode::FORBIDDEN,
@@ -243,8 +234,6 @@ async fn nobody_unpaired_reads_or_answers_the_requests() {
     );
 }
 
-/// Both ends hear it: a started wait tells each routed engine who waits, so it
-/// notifies the owner's devices, and an answer refreshes their list.
 #[tokio::test]
 async fn the_engines_hear_a_started_wait_and_its_answer() {
     let (state, dir) = with_a_paired_device();
@@ -277,7 +266,6 @@ async fn the_engines_hear_a_started_wait_and_its_answer() {
         json!({ "raised": { "kind": "device", "label": "New phone" } })
     );
 
-    // Asking again is the same wait, so the owner is not told twice.
     assert_eq!(
         Kind::Device.redeem(&state, &secret).await.0,
         StatusCode::ACCEPTED

@@ -1,7 +1,3 @@
-//! A prepared permission request shows the engine's card on the agent's own
-//! question tool. It offers its action's menu, and grants only on the owner's
-//! pick (ADR 0664).
-
 use super::*;
 use crate::core::subprocess_origin::{
     init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
@@ -35,7 +31,6 @@ pub(crate) fn owner_device() -> MessageOrigin {
     }
 }
 
-/// Open a turn on `thread_id`, as `origin` would.
 pub(crate) async fn open_turn(bus: &EventBus, thread_id: Uuid, origin: MessageOrigin) {
     let mode = match origin {
         MessageOrigin::Device { .. } => ActorMode::Human,
@@ -67,7 +62,6 @@ pub(crate) async fn open_turn(bus: &EventBus, thread_id: Uuid, origin: MessageOr
     .unwrap();
 }
 
-/// The chat turn on `thread_id` ends.
 pub(crate) async fn end_chat_turn(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -86,8 +80,6 @@ pub(crate) async fn end_chat_turn(bus: &EventBus, thread_id: Uuid) {
     .unwrap();
 }
 
-/// A thread whose turn another thread opened, so it carries no standing
-/// instruction.
 pub(crate) async fn agent_thread(bus: &EventBus) -> Uuid {
     let thread = Uuid::new_v4();
     open_turn(
@@ -105,8 +97,6 @@ pub(crate) async fn agent_thread(bus: &EventBus) -> Uuid {
     thread
 }
 
-/// A card the agent asked with a prepared request's id, as the question walk
-/// raises it.
 pub(crate) struct AskedCard {
     pub(crate) tool_use_id: String,
     pub(crate) request: PermissionRequest,
@@ -130,8 +120,6 @@ impl AskedCard {
     }
 }
 
-/// Ask the question tool with `request_id`, as the agent does: the swap, then
-/// the card the walk raises.
 pub(crate) async fn ask_prepared(bus: &EventBus, thread_id: Uuid, request_id: &str) -> AskedCard {
     let ask = serde_json::json!([{ "question": request_id }]);
     let PreparedAsk::Request { request, questions } =
@@ -170,7 +158,6 @@ pub(crate) async fn ask_prepared(bus: &EventBus, thread_id: Uuid, request_id: &s
     }
 }
 
-/// Resolve `answer` on `card` as a tap from `actor`.
 pub(crate) async fn tap(
     bus: &EventBus,
     thread_id: Uuid,
@@ -191,8 +178,6 @@ pub(crate) async fn tap(
     .unwrap()
 }
 
-/// [`tap`] from the owner's device, after the answer lands as on the answer
-/// path. That closes the card, so the thread's next card posts.
 pub(crate) async fn answer_and_tap(
     bus: &EventBus,
     thread_id: Uuid,
@@ -214,8 +199,6 @@ pub(crate) async fn answer_and_tap(
     tap(bus, thread_id, card, answer, Some(owner_device())).await
 }
 
-/// Prepare `ask` on `thread_id`, ask it, and pick `label` from the owner's
-/// device.
 pub(crate) async fn grant(bus: &EventBus, thread_id: Uuid, ask: Ask, label: &str) {
     let request_id = prepare(bus, thread_id, ask).await.unwrap();
     let card = ask_prepared(bus, thread_id, &request_id).await;
@@ -241,8 +224,6 @@ async fn live_create(bus: &EventBus, thread_id: Uuid, slug: &str) -> Option<Perm
     .unwrap()
 }
 
-/// The agent's ask shows the engine's card: the regular scopes and the
-/// request's exact target.
 #[tokio::test]
 async fn an_ask_naming_a_prepared_request_shows_the_engines_card() {
     let (pool, db) = setup_test_db().await;
@@ -267,8 +248,6 @@ async fn an_ask_naming_a_prepared_request_shows_the_engines_card() {
     teardown_test_db(&db).await;
 }
 
-/// Only a lone question naming a request on this thread is swapped. An
-/// unknown id, or an id among other questions, is refused.
 #[tokio::test]
 async fn a_prepared_ask_is_refused_unless_it_names_this_threads_request_alone() {
     let (pool, db) = setup_test_db().await;
@@ -291,8 +270,6 @@ async fn a_prepared_ask_is_refused_unless_it_names_this_threads_request_alone() 
     teardown_test_db(&db).await;
 }
 
-/// Always allow on a create covers any slug for any thread, so the next film
-/// take needs no card.
 #[tokio::test]
 async fn always_allow_on_a_create_covers_every_later_create() {
     let (pool, db) = setup_test_db().await;
@@ -311,7 +288,6 @@ async fn always_allow_on_a_create_covers_every_later_create() {
     teardown_test_db(&db).await;
 }
 
-/// Allow for this thread on a create covers any slug, on this thread only.
 #[tokio::test]
 async fn allow_for_this_thread_stays_on_the_asking_thread() {
     let (pool, db) = setup_test_db().await;
@@ -333,7 +309,6 @@ async fn allow_for_this_thread_stays_on_the_asking_thread() {
     teardown_test_db(&db).await;
 }
 
-/// Allow once covers the asked slug only, and one act.
 #[tokio::test]
 async fn allow_once_covers_the_asked_target_once() {
     let (pool, db) = setup_test_db().await;
@@ -351,8 +326,6 @@ async fn allow_once_covers_the_asked_target_once() {
     teardown_test_db(&db).await;
 }
 
-/// An agent's pick, Don't allow, and an option the card never offered all
-/// grant nothing.
 #[tokio::test]
 async fn nothing_but_the_owners_pick_of_an_offered_option_grants() {
     let (pool, db) = setup_test_db().await;
@@ -391,8 +364,6 @@ async fn nothing_but_the_owners_pick_of_an_offered_option_grants() {
     teardown_test_db(&db).await;
 }
 
-/// A once grant ends at its thread's next turn start, and a card asked before
-/// that start never grants a live one. An engine resume and a wake keep it.
 #[tokio::test]
 async fn a_once_grant_ends_at_the_next_turn_start() {
     let (pool, db) = setup_test_db().await;
@@ -445,7 +416,6 @@ async fn a_once_grant_ends_at_the_next_turn_start() {
     teardown_test_db(&db).await;
 }
 
-/// A lasting grant outlives a turn start.
 #[tokio::test]
 async fn a_lasting_grant_outlives_a_turn_start() {
     let (pool, db) = setup_test_db().await;
@@ -466,9 +436,7 @@ async fn a_lasting_grant_outlives_a_turn_start() {
     teardown_test_db(&db).await;
 }
 
-/// Seed a restore boundary above every event so far.
 pub(crate) async fn seed_restore_boundary(pool: &sqlx::PgPool) {
-    // Test-only observed-boundary fixture. Production writes are journal-bound.
     sqlx::query(
         "INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) \
          SELECT $1, $2, now(), COALESCE(MAX(sequence),0) FROM events",
@@ -480,8 +448,6 @@ pub(crate) async fn seed_restore_boundary(pool: &sqlx::PgPool) {
     .unwrap();
 }
 
-/// Synthetic grant for the combined real-archive restore test: a standing
-/// create, which only the restore can end.
 pub(crate) async fn seed_snapshot_grant(bus: &EventBus) -> Uuid {
     let thread = agent_thread(bus).await;
     grant(bus, thread, create("tour-film-a"), ALWAYS_ALLOW_LABEL).await;
@@ -492,8 +458,6 @@ pub(crate) async fn assert_snapshot_grant_expired(bus: &EventBus, thread: Uuid) 
     assert!(live_create(bus, thread, "tour-film-a").await.is_none());
 }
 
-/// A snapshot restore ends every grant from before it, and every request
-/// prepared before it. A grant made after it holds.
 #[tokio::test]
 async fn a_snapshot_restore_ends_every_earlier_grant() {
     let (pool, db) = setup_test_db().await;
@@ -518,7 +482,6 @@ async fn a_snapshot_restore_ends_every_earlier_grant() {
     teardown_test_db(&db).await;
 }
 
-/// Only an agent inside its own thread prepares a request.
 #[test]
 fn only_an_agent_inside_its_own_thread_prepares_a_request() {
     assert!(calling_agent_thread(&HeaderMap::new()).is_err());
@@ -530,7 +493,6 @@ fn only_an_agent_inside_its_own_thread_prepares_a_request() {
     );
 }
 
-/// A workspace request names one valid target and quotes the reason inert.
 #[test]
 fn a_workspace_request_names_one_valid_target() {
     let ask = workspace_ask(
@@ -579,7 +541,6 @@ fn device_session_cards_name_and_bind_every_mint_parameter() {
     }
 }
 
-/// Whether `text` holds a uuid in its hyphenated form.
 pub(crate) fn holds_uuid(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.windows(36).any(|w| {
@@ -590,8 +551,6 @@ pub(crate) fn holds_uuid(text: &str) -> bool {
     })
 }
 
-/// Every engine-worded card puts its question first, in bold, and shows no
-/// raw id.
 #[test]
 fn every_engine_card_leads_with_its_question_and_shows_no_raw_id() {
     let session = device_session_target("demo", "page", 120).unwrap();
@@ -616,7 +575,6 @@ fn every_engine_card_leads_with_its_question_and_shows_no_raw_id() {
     assert!(holds_uuid(&Uuid::new_v4().to_string()));
 }
 
-/// A snapshot request names one snapshot in one other workspace.
 #[test]
 fn a_snapshot_request_names_one_snapshot_in_another_workspace() {
     let handle = crate::core::snapshot::handle::Handle::generate();
@@ -630,7 +588,6 @@ fn a_snapshot_request_names_one_snapshot_in_another_workspace() {
     assert!(snapshot_ask("source", "target", handle.as_str(), " ").is_err());
 }
 
-/// A card stored before options had a breadth still reads as the asked one.
 #[test]
 fn a_stored_choice_without_a_breadth_reads_as_the_asked_one() {
     use crate::engine::permission::{GrantBreadth, Holder, Lifetime, PermissionChoice};
@@ -649,8 +606,6 @@ fn a_stored_choice_without_a_breadth_reads_as_the_asked_one() {
     assert_eq!(serde_json::to_value(&choice).unwrap(), stored);
 }
 
-/// No agent answers a permission request, not even the one that asked for it.
-/// The owner's registered device does, and an ordinary card is untouched.
 #[tokio::test]
 async fn only_the_owners_device_answers_a_permission_request() {
     use crate::api::gateway_stamp::test_support::stamped_device_headers;
@@ -719,9 +674,6 @@ async fn only_the_owners_device_answers_a_permission_request() {
     teardown_test_db(&db).await;
 }
 
-/// A re-paired window answers with a stamped id the workspace has no row for.
-/// The gate registers it and admits the answer. An agent still hears the text
-/// written for an agent.
 #[tokio::test]
 async fn a_stamped_device_without_a_row_answers_and_the_agent_hears_why_not() {
     use crate::api::gateway_stamp::test_support::stamped_device_headers;
@@ -755,8 +707,6 @@ async fn a_stamped_device_without_a_row_answers_and_the_agent_hears_why_not() {
     teardown_test_db(&db).await;
 }
 
-/// The engine words everything the owner taps. The agent's reason sits inside
-/// a quote on every line, so it cannot pose as engine text or as an option.
 #[tokio::test]
 async fn the_agent_words_nothing_the_owner_taps() {
     let (pool, db) = setup_test_db().await;
@@ -789,8 +739,6 @@ async fn the_agent_words_nothing_the_owner_taps() {
     teardown_test_db(&db).await;
 }
 
-/// A lone carriage return is a line break to the card's renderer, so it is one
-/// here too, and the reason after it stays quoted.
 #[test]
 fn a_carriage_return_cannot_close_the_quote() {
     let text = ladder_ask("Need it.\r\r**Lucidos:** read-only.")
@@ -800,8 +748,6 @@ fn a_carriage_return_cannot_close_the_quote() {
     assert_quoted(quoted);
 }
 
-/// The engine's text and the agent's quoted reason, split at the reason's
-/// heading.
 pub(crate) fn split_reason(question: &str) -> (&str, &str) {
     let heading = format!("> **{}**\n", crate::engine::permission::REASON_HEADING);
     question
@@ -809,16 +755,12 @@ pub(crate) fn split_reason(question: &str) -> (&str, &str) {
         .expect("the reason sits under its own heading")
 }
 
-/// Every line of `quoted`, broken at `\n` or `\r`, sits inside the quote.
 pub(crate) fn assert_quoted(quoted: &str) {
     for line in quoted.trim_end().split(['\n', '\r']) {
         assert!(line.starts_with('>'), "an unquoted reason line: {line:?}");
     }
 }
 
-/// The card's question ends in a newline, because every quoted reason line
-/// does. Claude Code echoes the question back verbatim, so the owner's answer
-/// is lost unless the hook's answer map carries that exact string as a key.
 #[tokio::test]
 async fn the_cards_answer_reaches_the_agent_under_its_own_question() {
     let (pool, db) = setup_test_db().await;
@@ -849,8 +791,6 @@ async fn the_cards_answer_reaches_the_agent_under_its_own_question() {
     teardown_test_db(&db).await;
 }
 
-/// A draft send's card names the owner's saved draft, not a subtree, and
-/// declining it keeps the draft.
 #[tokio::test]
 async fn declining_a_draft_send_keeps_the_draft() {
     let (pool, db) = setup_test_db().await;
@@ -873,8 +813,6 @@ async fn declining_a_draft_send_keeps_the_draft() {
     teardown_test_db(&db).await;
 }
 
-/// A retired verb, an answer to another card, a missing target and an empty
-/// reason all prepare no request.
 #[tokio::test]
 async fn only_a_proposable_verb_at_its_target_with_a_reason_is_asked() {
     let (pool, db) = setup_test_db().await;
@@ -908,8 +846,6 @@ async fn only_a_proposable_verb_at_its_target_with_a_reason_is_asked() {
     teardown_test_db(&db).await;
 }
 
-/// The owner's pick on an ordinary card, such as a plan card, grants no
-/// permission. Only a permission request's own pick does.
 #[tokio::test]
 async fn a_plan_card_pick_grants_nothing() {
     use crate::api::thread_reach::refuse_without_authority;
@@ -982,8 +918,6 @@ async fn a_plan_card_pick_grants_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// The internal card routes refuse a token naming another thread, and leave a
-/// caller with no origin token as it was.
 #[test]
 fn a_thread_raises_cards_on_itself_only() {
     let mine = Uuid::new_v4();
@@ -995,7 +929,6 @@ fn a_thread_raises_cards_on_itself_only() {
     assert!(!asks(&HeaderMap::new(), theirs));
 }
 
-/// Exercise the coding-agent question route with the engine's real state.
 pub(crate) async fn ask_batch_on_coding_route(
     engine: crate::engine::types::SharedEngine,
     workspace_path: std::path::PathBuf,
@@ -1093,7 +1026,6 @@ pub(crate) async fn permission_test_state(
     }
 }
 
-/// Prepare through the HTTP batch route, including its response contract.
 pub(crate) async fn prepare_batch_on_route(
     engine: crate::engine::types::SharedEngine,
     workspace_path: std::path::PathBuf,
@@ -1164,7 +1096,6 @@ async fn durable_device_scope_matches_future_targets_but_no_other_device_or_life
             allowed
         );
     }
-    // Direct preparation has no gateway eligibility, so it stays exact and once-only.
     let target = device_session_target("take-three", "page", 120).unwrap();
     let ask = workspace_ask(Action::GrantDeviceSession, &target, "No provenance.").unwrap();
     assert!(matches!(
@@ -1302,15 +1233,11 @@ async fn trigger_program_grant_uses_only_observed_calls_and_asks_in_the_callers_
     asked_ahead_program_card(ALWAYS_ALLOW_LABEL, false).await;
 }
 
-/// Always deny on the asked-ahead card denies exactly the shown program for
-/// that trigger. It grants nothing, and writes no standing deny.
 #[tokio::test]
 async fn always_deny_on_the_asked_ahead_program_card_denies_only_the_shown_program() {
     asked_ahead_program_card(ALWAYS_DENY_LABEL, false).await;
 }
 
-/// A deny only takes power away, so an edit to the trigger between the card
-/// and the answer does not drop the owner's Always deny.
 #[tokio::test]
 async fn always_deny_survives_an_edit_to_the_trigger_before_the_answer() {
     asked_ahead_program_card(ALWAYS_DENY_LABEL, true).await;
@@ -1737,7 +1664,6 @@ async fn trigger_grant_requested_at_creation_commits_with_its_answer() {
     .await
     .unwrap();
     assert!(created.success, "{:?}", created.error);
-    // The caller's turn still runs, so the card queues until it ends.
     let (queued_in, asked_seq): (Uuid, i64) = sqlx::query_as(
         "SELECT thread_id, sequence FROM events WHERE event_type = 'UserQuestionQueued'",
     )
@@ -1795,7 +1721,6 @@ async fn trigger_grant_requested_at_creation_commits_with_its_answer() {
         .values()
         .all(|config| { config.folder_grants.is_empty() && config.program_grants.is_empty() }));
 
-    // Fail the grant append after the answer has entered its transaction.
     sqlx::query(
         "ALTER TABLE events ADD CONSTRAINT test_grant_append_fails
                  CHECK (event_type <> 'TriggerUpdated')",
@@ -1877,8 +1802,6 @@ async fn trigger_grant_requested_at_creation_commits_with_its_answer() {
     teardown_test_db(&db).await;
 }
 
-/// A trigger grant card asked before Allow once left it still shows Allow
-/// once. Picking it there saves nothing, because a saved grant would last.
 #[tokio::test]
 async fn allow_once_on_an_older_trigger_grant_card_saves_nothing() {
     use crate::engine::agent_question::{answer_pending_question, AnswerResult};
@@ -1889,7 +1812,6 @@ async fn allow_once_on_an_older_trigger_grant_card_saves_nothing() {
     let (pool, db) = setup_test_db().await;
     let (engine, workspace) = boot_mock_engine(&db).await;
     let caller = agent_thread(&engine.event_bus).await;
-    // The turn is over, so each grant card posts at once.
     end_chat_turn(&engine.event_bus, caller).await;
     let state = permission_test_state(engine.clone(), workspace.path().to_owned()).await;
     let Json(created) = super::super::triggers::create_trigger(
@@ -1951,7 +1873,6 @@ async fn allow_once_on_an_older_trigger_grant_card_saves_nothing() {
         AnswerResult::Resumed
     ));
 
-    // The card as it was asked before, when the menu still offered Allow once.
     let older_id = raise_request(
         &engine.event_bus,
         caller,

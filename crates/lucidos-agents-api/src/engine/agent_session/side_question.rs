@@ -1,12 +1,3 @@
-//! Side questions: a quick question answered from a thread's context,
-//! beside any running turn, with no tools. A Claude Code thread asks a copy of
-//! its session; a Codex thread asks an ephemeral fork. A Lucidos Agent thread asks its own model once
-//! (`chat::process::side_question`).
-//!
-//! Each ask is recorded as side-question thread events, so its card survives a
-//! reload and shows on every device. No agent ever reads them: every generic
-//! event reader excludes them (ADR 0320).
-
 use crate::engine::chat::process::side_question::ProcessSideQuestionExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -20,7 +11,6 @@ use crate::engine::types::ChatImage;
 use crate::engine::LucidosEngine;
 use crate::runtime::CodingAgent;
 
-/// What startup recovery records for an ask a restart left unanswered.
 pub(crate) const INTERRUPTED_BY_RESTART: &str = "Interrupted by a restart. Ask again.";
 
 pub(crate) const EMPTY_QUESTION: &str = "Type the side question first.";
@@ -28,15 +18,12 @@ pub(crate) const NO_SUCH_THREAD: &str = "Side questions work once this thread ha
 const NO_SESSION_YET: &str =
     "This thread has no coding-agent session yet. Wait for its first reply, then ask again.";
 
-/// How many Claude Code spawn prompts the engine remembers. Each is a whole
-/// appended system prompt, so the cap bounds memory on a long-running engine.
 const REMEMBERED_CC_PROMPTS: usize = 128;
 
-/// Serializes the duplicate-id check with the ask's record. Held only for
+/// INVARIANT: Serializes the duplicate-id check with the ask's record. Held only for
 /// those two quick writes, never across the answer.
 static ASK_ADMISSION: Mutex<()> = Mutex::const_new(());
 
-/// Which agent answers a thread's side questions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SideQuestionAgent {
     ClaudeCode,
@@ -44,11 +31,8 @@ pub(crate) enum SideQuestionAgent {
     Lucidos,
 }
 
-/// A thread's `thread_summaries` row: `(source, coding_agent, state)`.
 type ThreadRow = (String, Option<String>, String);
 
-/// The agent for a thread, from its row, or the refusal when it takes no side
-/// question. A draft still composing has not started, so it takes none.
 fn agent_for(row: Option<ThreadRow>) -> Result<SideQuestionAgent, &'static str> {
     match row {
         None => Err(NO_SUCH_THREAD),
@@ -77,8 +61,6 @@ async fn check_thread(
     agent_for(row).map_err(SideQuestionFailure::Refused)
 }
 
-/// Refuse an ask naming an image this workspace never received. Only a stat
-/// per image, so a refused ask never reads the bytes.
 fn check_images(workspace: &std::path::Path, hashes: &[String]) -> Result<(), SideQuestionFailure> {
     match hashes
         .iter()
@@ -91,8 +73,6 @@ fn check_images(workspace: &std::path::Path, hashes: &[String]) -> Result<(), Si
     }
 }
 
-/// Read every attached image from the blob store. `check_images` has already
-/// found each one, so a miss means it was deleted since.
 fn load_images(
     workspace: &std::path::Path,
     hashes: &[String],
@@ -111,7 +91,6 @@ fn load_images(
         .collect()
 }
 
-/// Whether a side question with this id was already asked on the thread.
 async fn was_asked(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -133,9 +112,6 @@ async fn was_asked(
     .map_err(|e| SideQuestionFailure::Failed(format!("Could not read the thread: {e}")))
 }
 
-/// Whether an ask under this id may run: never asked, or every ask failed and
-/// none was answered. A retry re-asks under the card's own id, so the card
-/// keeps its place. One still running stays refused.
 async fn may_ask(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -158,7 +134,6 @@ async fn may_ask(
     .map_err(|e| SideQuestionFailure::Failed(format!("Could not read the thread: {e}")))
 }
 
-/// Record one side-question event on its thread.
 async fn record(
     bus: &EventBus,
     thread_id: Uuid,
@@ -175,7 +150,6 @@ async fn record(
     .map_err(|e| SideQuestionFailure::Failed(format!("Could not record the side question: {e}")))
 }
 
-/// The event that settles an ask, from how it ended.
 fn settled_event(
     side_question_id: Uuid,
     outcome: &Result<String, SideQuestionFailure>,
@@ -200,14 +174,12 @@ fn settled_event(
     }
 }
 
-/// Record a failure for every ask no answer or failure settled. Run once at
+/// INVARIANT: Record a failure for every ask no answer or failure settled. Run once at
 /// startup, since the process that would have settled them is gone.
 pub(crate) async fn fail_unsettled_side_questions(
     pool: &sqlx::PgPool,
     bus: &EventBus,
 ) -> Result<usize, sqlx::Error> {
-    // Counted, not matched: a retry asks again under an id whose first ask
-    // already failed, so one settlement does not settle every ask.
     let unsettled: Vec<(String, String)> = sqlx::query_as(
         "SELECT aggregate_id, payload->>'side_question_id'
            FROM events
@@ -250,9 +222,6 @@ pub async fn recover_unsettled_side_questions(engine: &LucidosEngine) {
 
 #[easy_ext::ext(AgentSessionSideQuestionExt)]
 pub(crate) impl LucidosEngine {
-    /// Ask a side question and record it: the ask, then its answer or
-    /// failure. A refused thread, an empty question, an unknown image or an id
-    /// still running or answered records nothing, since no card is owed.
     async fn ask_side_question(
         &self,
         thread_id: Uuid,
@@ -314,7 +283,6 @@ pub(crate) impl LucidosEngine {
         outcome
     }
 
-    /// Whether the thread has a saved session for its coding agent.
     async fn has_session(
         &self,
         thread_id: Uuid,
@@ -341,9 +309,6 @@ pub(crate) impl LucidosEngine {
         )
     }
 
-    /// Record the system prompt a Claude Code spawn appended, for the thread's
-    /// session copies. At most `REMEMBERED_CC_PROMPTS` are kept. An evicted
-    /// thread asks uncached and without that prompt until its next spawn.
     fn remember_cc_system_prompt(&self, thread_id: Uuid, prompt: &str) {
         let mut prompts = self
             .cc_system_prompts
@@ -357,8 +322,6 @@ pub(crate) impl LucidosEngine {
         prompts.insert(thread_id, prompt.to_string());
     }
 
-    /// Startup recovery: fail every ask the previous process left unanswered,
-    /// so no card waits forever.
     async fn recover_unsettled_side_questions(&self) {
         match fail_unsettled_side_questions(self.pool(), &self.event_bus).await {
             Ok(0) => {}
@@ -373,7 +336,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Record that the user dismissed a side question's card.
     async fn dismiss_side_question(
         &self,
         thread_id: Uuid,
@@ -393,8 +355,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// Answer a side question in a Claude Code thread, from a copy of its
-    /// session that shares the session's prompt prefix.
     async fn answer_claude_code_side_question(
         &self,
         thread_id: Uuid,
@@ -408,7 +368,6 @@ pub(crate) impl LucidosEngine {
             crate::runtime::claude_code::ask_side_question(args, question, images, deadline)
                 .await
                 .map_err(|e| SideQuestionFailure::Failed(e.to_string()))?;
-        // The copy is a real model call, so its cost is recorded like any other.
         crate::engine::AuxCapture::new(
             &self.event_bus,
             thread_id,
@@ -465,11 +424,6 @@ pub(crate) impl LucidosEngine {
         reply.answer.map_err(SideQuestionFailure::Failed)
     }
 
-    /// Resolve the thread's session the way a follow-up spawn would.
-    ///
-    /// The cwd is the thread's worktree while it exists. Claude Code finds a
-    /// session by id from any cwd, so a cleaned-up worktree falls back to the
-    /// workspace.
     async fn session_copy(&self, thread_id: Uuid) -> Result<SessionCopy, SideQuestionFailure> {
         self.session_copy_for(thread_id, CodingAgent::ClaudeCode)
             .await
@@ -515,7 +469,7 @@ pub(crate) impl LucidosEngine {
             .cloned();
         let user_env =
             crate::core::EnvironmentVariableStore::spawn_pairs(pool, "SideQuestion").await;
-        // Computed from the same cwd as the session's own spawn, so both name
+        // INVARIANT: Computed from the same cwd as the session's own spawn, so both name
         // the same directories and share one prompt prefix.
         let additional_directories =
             crate::engine::repo_directory_grants::resolve(&cwd, self.workspace_path()).await;

@@ -1,11 +1,3 @@
-//! The Tree backfill read and its estimate (ADR 0362).
-//!
-//! Settings → System → Memory draws both. The estimate is read before anything
-//! is spent. The backfill read is the snapshot the progress bar opens on, and
-//! the `TreeBackfill*` SSE frames move it after that. The e2e engine runs on
-//! the mock model, which the compactor uses too, so choosing Tree here costs
-//! nothing and finishes.
-
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -22,9 +14,6 @@ async fn backfill() -> Value {
     resp.json().await.expect("Invalid JSON")
 }
 
-/// Off, on Classic. `started` says whether any summary is stored, which
-/// depends on what the workspace held before this test, so only its type is
-/// pinned.
 fn assert_off(body: &Value) {
     assert_eq!(body["state"], "off", "{body}");
     assert!(body["started"].is_boolean(), "{body}");
@@ -95,8 +84,6 @@ async fn the_estimate_prices_a_backfill_before_anything_is_spent() {
         row("high")["backfill_usd"]["high"].as_f64().unwrap() >= high_usd,
         "a higher reasoning tier must not cost less: {by_effort:?}"
     );
-    // Each tier carries its own time, and Gemini 3.8 Flash's seeded medium
-    // tier is slower and dearer than its low tier.
     for effort in ["low", "medium", "high"] {
         for field in ["usable_secs", "complete_secs"] {
             let bounds = &row(effort)[field];
@@ -105,7 +92,6 @@ async fn the_estimate_prices_a_backfill_before_anything_is_spent() {
         }
     }
     let central = |effort: &str| row(effort)["backfill_usd_central"].as_f64().unwrap();
-    // A fresh workspace may have nothing left to build, which prices at zero.
     if central("low") > 0.0 {
         assert!(central("medium") > central("low"), "{by_effort:?}");
     }
@@ -115,8 +101,6 @@ async fn the_estimate_prices_a_backfill_before_anything_is_spent() {
         "{by_effort:?}"
     );
 
-    // A turn costs money even with nothing to build: the memory choice shows
-    // a fresh workspace this price.
     let turn_calls = &body["turn_calls"];
     let (calls_low, calls_high) = (
         turn_calls["low"].as_f64().unwrap(),
@@ -136,7 +120,6 @@ async fn the_estimate_prices_a_backfill_before_anything_is_spent() {
     );
 }
 
-/// Off on Classic, running then ready on Tree, off again on Classic.
 #[tokio::test]
 async fn the_backfill_read_follows_the_module_to_ready() {
     set_memory_module("classic").await;
@@ -177,9 +160,6 @@ async fn get_json(path: &str) -> (u16, Value) {
     (status, resp.json().await.expect("Invalid JSON"))
 }
 
-/// The summary tree browser's two reads answer on any workspace, built or not:
-/// the top of a tree, and the threads that have one. A thread's top names
-/// lines in that thread's tree, which `/api/v1/recall/zoom` opens.
 #[tokio::test]
 async fn the_tree_browser_reads_a_top_and_the_threads_with_trees() {
     let (status, top) = get_json("/memory/tree").await;
@@ -214,9 +194,6 @@ async fn the_tree_browser_reads_a_top_and_the_threads_with_trees() {
     assert_eq!(status, 400, "an unknown thread is refused: {body}");
 }
 
-/// Continue raises only a backfill that has a cap. The e2e compactor runs on
-/// the mock model, which the catalog does not price, so no backfill here has
-/// one: the raise is refused and records nothing.
 #[tokio::test]
 async fn raising_the_cap_of_an_uncapped_backfill_is_refused() {
     let resp = user_client()

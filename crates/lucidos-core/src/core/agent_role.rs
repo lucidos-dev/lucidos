@@ -1,25 +1,9 @@
-//! The agent role: the database role behind `LUCIDOS_DATABASE_URL` (ADR 0509).
-//!
-//! Agents, scripts and triggers sign in as their workspace's agent role, never
-//! as the engine. It reads metadata but cannot read secret columns or raw
-//! diagnostic inbox payloads (which require a bounded query), and can connect
-//! to no other database. It creates nothing in the schema. It writes no table,
-//! unless the gateway marks the workspace as machine-made: a direct write
-//! announces nothing (ADR 0760).
-//! The engine sets it up at every boot, so a new table or secret column gets
-//! the right grants on the next start.
-
 use sqlx::PgPool;
 
 use crate::core::secret_store::{MOVED_SECRET_COLUMNS, SECRET_COLUMNS};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Tables an agent may read but never write. An agent that could write the
-/// backup recipient could seal every later backup to a key of its own. One
-/// that could write a mailbox's hosts could send its password to a server of
-/// its own at the next login. One that could clear the restore boundary could
-/// spend a permission the restore expired (ADR 0612).
 const READ_ONLY_TABLES: &[&str] = &[
     "_sqlx_migrations",
     "backup_recipient",
@@ -32,9 +16,6 @@ fn is_machine_made(origin: Option<&str>) -> bool {
     matches!(origin, Some("agent" | "demo" | "eval" | "e2e"))
 }
 
-/// A role, database, table or column name, quoted for SQL. Postgres cannot
-/// bind an identifier. A workspace database name holds a hyphen, so quoting,
-/// not a plain-name check, is what keeps the name whole and safe.
 fn ident(name: &str) -> Result<String, BoxError> {
     if name.is_empty() || name.len() > lucidos_pg_url::PG_MAX_IDENTIFIER_BYTES {
         return Err(format!("{name:?} cannot name a database object").into());
@@ -42,8 +23,6 @@ fn ident(name: &str) -> Result<String, BoxError> {
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
 
-/// Create or refresh the agent role for the database `database_url` names,
-/// with a new password, and return the read-only URL that signs in as it.
 pub async fn provision(
     pool: &PgPool,
     database_url: &str,
@@ -64,7 +43,7 @@ pub async fn provision(
         ident(&url.database)?,
     );
 
-    // Two engines booting at once may both create the group or a role; the
+    // INVARIANT: Two engines booting at once may both create the group or a role; the
     // loser's duplicate is the state it wanted.
     for statement in [
         format!(
@@ -82,12 +61,12 @@ pub async fn provision(
         format!("GRANT {group} TO {role_ident}"),
         format!("REVOKE ALL ON DATABASE {database} FROM PUBLIC"),
         format!("GRANT CONNECT, TEMPORARY ON DATABASE {database} TO {role_ident}"),
-        // A role that creates a relation owns it and can grant on it.
+        // INVARIANT: A role that creates a relation owns it and can grant on it.
         "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_string(),
         format!("REVOKE CREATE ON SCHEMA public FROM {role_ident}"),
         format!("GRANT USAGE ON SCHEMA public TO {role_ident}"),
         format!("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role_ident}"),
-        // `nextval` is a write, so only a role that inserts gets USAGE.
+        // INVARIANT: `nextval` is a write, so only a role that inserts gets USAGE.
         format!("GRANT {sequence_rights} ON ALL SEQUENCES IN SCHEMA public TO {role_ident}"),
     ] {
         sqlx::query(&statement).execute(pool).await?;
@@ -128,7 +107,7 @@ pub async fn provision(
 
 const SCRAM_ITERATIONS: u32 = 4096;
 
-/// The SCRAM-SHA-256 verifier Postgres stores for `password` (RFC 5802). A
+/// INVARIANT: The SCRAM-SHA-256 verifier Postgres stores for `password` (RFC 5802). A
 /// failed `ALTER ROLE` lands in the server log whole, so the statement carries
 /// this verifier, which signs nobody in, never the password itself.
 fn scram_verifier(password: &str) -> String {
@@ -147,7 +126,6 @@ fn scram_verifier(password: &str) -> String {
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
 
-    // PBKDF2-HMAC-SHA-256 with one output block, the length SCRAM needs.
     let mut block = hmac(password.as_bytes(), &[&salt, &1u32.to_be_bytes()]);
     let mut salted = block;
     for _ in 1..SCRAM_ITERATIONS {
@@ -166,7 +144,7 @@ fn scram_verifier(password: &str) -> String {
     )
 }
 
-/// The relations in `public` that `role` can still write, and the sequences it
+/// INVARIANT: The relations in `public` that `role` can still write, and the sequences it
 /// can advance. A grant to PUBLIC or to a group counts, which a revoke naming
 /// the role cannot remove. A relation the role owns is left out: it holds no
 /// Lucidos state, and its owner can always grant on it again. A materialized
@@ -189,7 +167,7 @@ async fn write_privileges(pool: &PgPool, role: &str) -> Result<Vec<String>, sqlx
     .await
 }
 
-/// Read every table, leaving secrets and bounded-query-only payloads out. Only
+/// INVARIANT: Read every table, leaving secrets and bounded-query-only payloads out. Only
 /// a machine-made workspace writes, and never a read-only table. Tables holding
 /// hidden columns get only column-level reads.
 async fn grant_tables(pool: &PgPool, role: &str, machine_made: bool) -> Result<(), BoxError> {
@@ -205,7 +183,7 @@ async fn grant_tables(pool: &PgPool, role: &str, machine_made: bool) -> Result<(
         sqlx::query(&format!("REVOKE ALL ON {table_ident} FROM {role}"))
             .execute(&mut *tx)
             .await?;
-        // A moved column still holds sealed values until the boot step drops
+        // INVARIANT: A moved column still holds sealed values until the boot step drops
         // it, so it stays hidden for as long as it exists.
         let secret: Vec<&str> = SECRET_COLUMNS
             .iter()
@@ -253,7 +231,7 @@ async fn grant_tables(pool: &PgPool, role: &str, machine_made: bool) -> Result<(
     Ok(())
 }
 
-/// Refuse an agent-role write to a preference the catalog keeps from agents.
+/// INVARIANT: Refuse an agent-role write to a preference the catalog keeps from agents.
 ///
 /// `set_preference` and the HTTP route refuse these keys already, but the
 /// handed database credential reached them directly. One of them,

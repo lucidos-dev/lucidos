@@ -1,19 +1,9 @@
-//! Write-time lint for an app or widget file. It finds three mistakes that
-//! look right in a desktop preview and read wrong on a phone. The file tools
-//! append the findings to their result, so the agent fixes them in the same
-//! turn. It never refuses or changes a write.
-//!
-//! The rules are documented for app authors in
-//! `system-knowhow/building-an-app/scaffolding-defaults.md` § Scaffolding defaults.
-
 use std::ops::Range;
 use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// The most findings one note lists. A file past it gets a count of the rest,
-/// so a stylesheet full of ungated hovers cannot flood the context.
 const MAX_LISTED_FINDINGS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,7 +15,6 @@ pub(crate) enum AppLintRule {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AppLintFinding {
-    /// 1-based, in the file as written.
     pub line: usize,
     pub rule: AppLintRule,
 }
@@ -58,8 +47,6 @@ enum FileKind {
     Js,
 }
 
-/// What a file under `apps/<id>/` holds, by extension. `None` for any other
-/// path, and for app files the lint does not read (`manifest.json`, images).
 fn app_file_kind(data_path: &str) -> Option<FileKind> {
     let (id, file) = data_path.strip_prefix("apps/")?.split_once('/')?;
     if id.is_empty() || file.is_empty() {
@@ -74,8 +61,6 @@ fn app_file_kind(data_path: &str) -> Option<FileKind> {
     }
 }
 
-/// The note a file tool appends to its result, or `None` when the path is no
-/// app file or the file is clean.
 pub(crate) fn app_lint_note(data_path: &str, content: &str) -> Option<String> {
     let findings = lint_app_file(data_path, content);
     if findings.is_empty() {
@@ -98,9 +83,6 @@ pub(crate) fn app_lint_note(data_path: &str, content: &str) -> Option<String> {
     Some(note)
 }
 
-/// The note for a file a tool has just written under `data_dir`, read back
-/// from disk. For a tool that does not hold the final content in hand: an edit
-/// or a script's output.
 pub(crate) fn app_lint_note_on_disk(data_dir: &Path, data_path: &str) -> Option<String> {
     app_file_kind(data_path)?;
     match std::fs::read_to_string(data_dir.join(data_path)) {
@@ -132,7 +114,6 @@ pub(crate) fn lint_app_file(data_path: &str, content: &str) -> Vec<AppLintFindin
             findings.push(source.finding(offset, AppLintRule::VariantWithoutBase { variant }));
         }
     }
-    // Line first, then rule, so every duplicate sits beside its twin.
     findings.sort();
     findings.dedup();
     findings
@@ -142,7 +123,6 @@ struct Source {
     text: String,
     css: Vec<Range<usize>>,
     js: Vec<Range<usize>>,
-    /// The offset of every `\n`, so a finding finds its line by binary search.
     newlines: Vec<usize>,
 }
 
@@ -173,8 +153,6 @@ impl Source {
                 (css, js)
             }
         };
-        // Blanking replaces whole comments, delimiters included, and every
-        // delimiter is ASCII, so no multibyte character is ever split.
         let text = String::from_utf8(bytes).expect("blanking keeps UTF-8 intact");
         let newlines = text.match_indices('\n').map(|(i, _)| i).collect();
         Self {
@@ -220,8 +198,6 @@ fn blank_html_comments(bytes: &mut [u8]) {
     }
 }
 
-/// Blanks `/* … */` comments, stepping over quoted strings so a `/*` inside
-/// one stays.
 fn blank_css_comments(bytes: &mut [u8], range: Range<usize>) {
     let mut i = range.start;
     while i < range.end {
@@ -237,8 +213,6 @@ fn blank_css_comments(bytes: &mut [u8], range: Range<usize>) {
     }
 }
 
-/// Blanks `// …` and `/* … */` comments, stepping over quoted and template
-/// strings so the `//` of a URL in a string stays.
 fn blank_js_comments(bytes: &mut [u8], range: Range<usize>) {
     let mut i = range.start;
     while i < range.end {
@@ -262,8 +236,6 @@ fn blank_js_comments(bytes: &mut [u8], range: Range<usize>) {
     }
 }
 
-/// The index just past the string opening at `start`, honouring backslash
-/// escapes. An unterminated string runs to `end`.
 fn skip_string(bytes: &[u8], start: usize, end: usize) -> usize {
     let quote = bytes[start];
     let mut i = start + 1;
@@ -285,8 +257,6 @@ fn find(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|p| from + p)
 }
 
-/// Offsets of every style rule whose selector holds `:hover` with no enclosing
-/// `@media` that requires a hover-capable pointer.
 fn ungated_hover_offsets(css: &str) -> Vec<usize> {
     let bytes = css.as_bytes();
     let mut gates: Vec<bool> = Vec::new();
@@ -328,23 +298,18 @@ fn ungated_hover_offsets(css: &str) -> Vec<usize> {
     offsets
 }
 
-/// Whether a media condition holds only where the pointer can hover. Matches
-/// `(hover: hover)` and `(any-hover: hover)`, alone or joined with `and`.
 fn is_hover_gate(condition: &str) -> bool {
     let compact: String = condition
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase();
-    // A comma or `or` joins alternatives, and any one of them may match a
-    // touch screen. So every alternative has to require hover.
     compact
         .replace(")or(", "),(")
         .split(',')
         .all(|query| query.contains("hover:hover)") && !query.starts_with("not"))
 }
 
-/// A JS string literal: single, double or backtick quoted.
 const STRING_LITERAL: &str = r#"'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`"#;
 
 static CLASSLIST_SWAP: LazyLock<Regex> = LazyLock::new(|| {
@@ -360,9 +325,6 @@ static CLASS_NAME_ASSIGNMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"className\s*=\s*({STRING_LITERAL})")).unwrap());
 static STRING_LITERALS: LazyLock<Regex> = LazyLock::new(|| Regex::new(STRING_LITERAL).unwrap());
 static BRANCH_KEYWORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(?:if|else)\b").unwrap());
-/// A condition that reads as "is this the current choice". Without it, a
-/// ternary picking a variant from data (`b.primary ? … : …`) is a legitimate
-/// mix of primary and secondary buttons, not a selection.
 static SELECTION_CONDITION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)==|active|selected|current|sort|filter|view|mode|tab|picked|chosen|checked|pressed",
@@ -374,7 +336,6 @@ const BASE_CLASS: &str = "action-btn";
 const SECONDARY_CLASS: &str = "action-btn-secondary";
 const VARIANT_CLASSES: [&str; 3] = [SECONDARY_CLASS, "action-btn-confirm", "action-btn-danger"];
 
-/// The class tokens a string literal or attribute value names.
 fn class_tokens(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .filter(|t| !t.is_empty())
@@ -384,9 +345,6 @@ fn names_class(text: &str, class: &str) -> bool {
     class_tokens(text).any(|t| t == class)
 }
 
-/// Offsets of JS that shows a selected state by swapping `.action-btn`
-/// variants: a `classList` toggle, remove or replace of the base or the
-/// secondary class, or a selection-reading branch that picks the secondary.
 fn action_btn_state_offsets(js: &str) -> Vec<usize> {
     let mut offsets = Vec::new();
     for c in CLASSLIST_SWAP.captures_iter(js) {
@@ -422,13 +380,11 @@ fn action_btn_state_offsets(js: &str) -> Vec<usize> {
     offsets
 }
 
-/// The text from the start of `offset`'s line up to `offset`.
 fn line_before(text: &str, offset: usize) -> &str {
     let start = text[..offset].rfind('\n').map_or(0, |p| p + 1);
     &text[start..offset]
 }
 
-/// The text from `count` lines above `offset`'s line up to `offset`.
 fn lines_before(text: &str, offset: usize, count: usize) -> &str {
     let mut start = offset;
     for _ in 0..=count {
@@ -443,9 +399,6 @@ fn lines_before(text: &str, offset: usize, count: usize) -> &str {
 static CLASS_ATTRIBUTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
 
-/// Offsets of class lists naming an `.action-btn` variant without the base
-/// class: a `class="…"` attribute (in markup or a template string) or a
-/// `className = "…"` assignment.
 fn variant_without_base(text: &str) -> Vec<(usize, String)> {
     let attributes = CLASS_ATTRIBUTE
         .captures_iter(text)
@@ -466,8 +419,6 @@ fn variant_without_base(text: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// Whether the `class=` at `offset` sits inside `[…]`: a selector that matches
-/// elements, as in CSS or `querySelector`, rather than a class list it sets.
 fn is_attribute_selector(text: &str, offset: usize) -> bool {
     text[..offset].trim_end().ends_with('[')
 }

@@ -1,5 +1,3 @@
-//! Offline restore file staging. Callers authenticate the manifest against the
-//! workspace before invoking these helpers. Nothing here mutates the live tree.
 use super::{check, manifest::Manifest, BoxError};
 use crate::core::backup::capture::FileIndexEntry;
 use std::{
@@ -9,7 +7,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-/// Shared by archive checking and extraction: even an authenticated archive
+/// INVARIANT: Shared by archive checking and extraction: even an authenticated archive
 /// must never replace runtime state, worktrees, or physical PostgreSQL data.
 pub(super) fn restorable_path(path: &Path) -> bool {
     if path.as_os_str().is_empty()
@@ -28,7 +26,7 @@ pub(super) fn restorable_path(path: &Path) -> bool {
     )
 }
 
-/// `destination` must not exist. It belongs to this attempt only after the
+/// INVARIANT: `destination` must not exist. It belongs to this attempt only after the
 /// exclusive mkdir succeeds. Failed staging is retained for diagnosis; no
 /// failure path recursively deletes a directory supplied by a caller.
 pub fn stage(directory: &Path, manifest: &Manifest, destination: &Path) -> Result<(), BoxError> {
@@ -56,9 +54,6 @@ pub fn stage(directory: &Path, manifest: &Manifest, destination: &Path) -> Resul
     verify_tree(directory, manifest, destination)
 }
 
-/// Verify the installed bytes and modes against the authenticated index, and
-/// refuse extra files or links. Intended for staging; a live workspace also
-/// contains excluded paths and needs a separate preservation-aware walk.
 pub fn verify_tree(directory: &Path, manifest: &Manifest, tree: &Path) -> Result<(), BoxError> {
     check::verify_components(directory, manifest)?;
     if !std::fs::symlink_metadata(tree)?.is_dir() {

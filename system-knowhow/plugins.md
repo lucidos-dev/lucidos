@@ -7,7 +7,7 @@ description: Use when the user wants to author, package, publish, share, install
 
 # Plugins
 
-How to package a coherent bundle of workspace content (apps, knowhow, triggers, scripts) so another workspace installs it as a unit. It also covers distribution, updates and uninstall. The v1 design is `docs/plans/2026-04-29-plugins-v1-design.md`. For setup right after install, see `plugin-setup.md`.
+How to package a coherent bundle of workspace content (apps, knowhow, triggers, event hooks, scripts) so another workspace installs it as a unit. It also covers distribution, updates and uninstall. The v1 design is `docs/plans/2026-04-29-plugins-v1-design.md`. For setup right after install, see `plugin-setup.md`.
 
 ## Parts
 
@@ -15,7 +15,7 @@ This doc is split into parts so each one fits a coding agent's tool output. Load
 
 | Part | Covers |
 |---|---|
-| `system-knowhow/plugins/when-a-plugin-is-the-right-artifact` | When a plugin is the right artifact; Questions to settle with the user before bundling; Plugin layout; `manifest.toml` schema; Plugin media |
+| `system-knowhow/plugins/when-a-plugin-is-the-right-artifact` | When a plugin is the right artifact; Questions to settle with the user before bundling; Plugin layout; Shipping event hooks; `manifest.toml` schema; Plugin media |
 | `system-knowhow/plugins/shipping-widgets` | Shipping widgets; Artifact provenance; Install confirmation panel (A release can ask for setup to run again) |
 | `system-knowhow/plugins/the-plugins-panel-and-marketplaces` | The Plugins panel and marketplaces |
 | `system-knowhow/plugins/authoring-a-marketplace` | Authoring a marketplace (Repo layout and how the scanner finds plugins; Install URLs are generated, not authored; Registering and the scan cycle; Private and internal repos; Org permissions can block repo creation independently); Shipping triggers (auto-registration); What doesn't belong in a plugin; Where a plugin keeps its runtime state |

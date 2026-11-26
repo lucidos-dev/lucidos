@@ -1,4 +1,3 @@
-//! Reload-safe hold status and the authenticated manual clear contract.
 use crate::support::{base_url, http_client, user_client};
 
 #[tokio::test]
@@ -14,7 +13,6 @@ async fn spend_cap_status_and_clear_require_a_known_provider_and_actor() {
         assert!(hold["held_until"].is_string());
         assert!(hold["message"].is_string());
     }
-    // Clearing an idle provider is idempotent and emits no invented hold end.
     let response = client
         .post(format!("{base}/local/clear"))
         .send()

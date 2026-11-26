@@ -15,7 +15,6 @@ fn all_agents_take_side_questions() {
         agent_for(row("claude_code", Some("claude-code"))),
         Ok(SideQuestionAgent::ClaudeCode)
     );
-    // Rows from before the column existed were all Claude Code.
     assert_eq!(
         agent_for(row("claude_code", None)),
         Ok(SideQuestionAgent::ClaudeCode)
@@ -26,13 +25,10 @@ fn all_agents_take_side_questions() {
     );
     assert_eq!(agent_for(row("chat", None)), Ok(SideQuestionAgent::Lucidos));
     assert_eq!(agent_for(None), Err(NO_SUCH_THREAD));
-    // A draft still composing has not started.
     let draft = Some(("chat".to_string(), None, "composing".to_string()));
     assert_eq!(agent_for(draft), Err(NO_SUCH_THREAD));
 }
 
-/// An ask naming a blob the workspace never received is refused before
-/// anything is recorded, and the refusal names the hash.
 #[test]
 fn an_unknown_image_is_refused_by_name() {
     let workspace = tempfile::tempdir().unwrap();
@@ -92,7 +88,6 @@ async fn a_codex_thread_is_accepted_without_recording_during_admission() {
     teardown_test_db(&db_name).await;
 }
 
-/// The side-question event types recorded on a thread, oldest first.
 async fn recorded_types(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT event_type FROM events WHERE thread_id = $1 \
@@ -104,7 +99,6 @@ async fn recorded_types(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
     .unwrap()
 }
 
-/// An ask is recorded, and its id then counts as asked on that thread only.
 #[tokio::test]
 async fn a_recorded_ask_is_known_by_its_id_on_its_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -175,8 +169,6 @@ fn an_ask_settles_as_its_answer_or_its_failure() {
     );
 }
 
-/// A restart kills the process an answer was on its way to. Recovery fails
-/// every unsettled ask once, and leaves settled ones alone.
 #[tokio::test]
 async fn recovery_fails_only_the_asks_nothing_settled() {
     let (pool, db_name) = setup_test_db().await;
@@ -218,7 +210,6 @@ async fn recovery_fails_only_the_asks_nothing_settled() {
     teardown_test_db(&db_name).await;
 }
 
-/// Record one side-question event on a test thread.
 async fn record_event(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
     record(bus, thread_id, event, EventMeta::NONE)
         .await
@@ -240,8 +231,6 @@ fn failed(side_question_id: Uuid) -> ThreadEvent {
     }
 }
 
-/// A retry re-asks under the card's own id, so an id may be asked again once
-/// every ask failed. One still running, or answered, may not.
 #[tokio::test]
 async fn an_id_may_be_asked_again_only_after_every_ask_failed() {
     let (pool, db_name) = setup_test_db().await;
@@ -275,8 +264,6 @@ async fn an_id_may_be_asked_again_only_after_every_ask_failed() {
     teardown_test_db(&db_name).await;
 }
 
-/// A restart during a retry leaves the re-ask unsettled, though an earlier
-/// ask under the same id already failed. Recovery fails the re-ask too.
 #[tokio::test]
 async fn recovery_fails_a_retry_a_restart_interrupted() {
     let (pool, db_name) = setup_test_db().await;
@@ -303,7 +290,6 @@ async fn recovery_fails_a_retry_a_restart_interrupted() {
     teardown_test_db(&db_name).await;
 }
 
-/// Exercise session resolution, the runtime fork and the real auxiliary capture together.
 #[tokio::test]
 async fn codex_side_question_records_its_resolved_model_and_cost() {
     use crate::llm::ProviderBuildContext;
@@ -425,8 +411,6 @@ done
     teardown_test_db(&db).await;
 }
 
-/// An ask that waits on the admission lock must re-check the id after it
-/// gets the lock, so an ask recorded meanwhile refuses it.
 #[tokio::test]
 async fn an_ask_waiting_for_admission_rechecks_the_id_once_admitted() {
     if !crate::test_support::in_engine_child(

@@ -15,10 +15,12 @@ const pickerCss: string = readFileSync(
   'utf-8',
 );
 
+const NOTE = `<p class={w.delete_interrupted ? 'ws-picker-row-note ws-picker-row-note-soft' : 'ws-picker-row-note'}>`;
+
 describe('the fault note is wired to the one state that is a fault', () => {
   it('reads the shared predicate rather than testing the state word again', () => {
     expect(source).toContain('workspaceFaultNote(w)');
-    expect(source).toContain('<p class="ws-picker-row-note">{fault}</p>');
+    expect(source).toContain(`${NOTE}{fault}</p>`);
   });
 });
 
@@ -42,7 +44,7 @@ describe('the note takes its own line, on the name column', () => {
   it('is the second box in the row column, never an item in the line', () => {
     expect(decl(block(pickerCss, '.ws-picker-open {'), 'flex-direction')).toBe('column');
 
-    const to = source.indexOf('{fault && <p class="ws-picker-row-note">');
+    const to = source.indexOf(`{fault && ${NOTE}`);
     expect(to, 'the note is gone').toBeGreaterThanOrEqual(0);
     const from = source.lastIndexOf('<div class="ws-picker-line">', to);
     expect(from, 'the row line is gone').toBeGreaterThanOrEqual(0);

@@ -1,5 +1,3 @@
-//! Identified callers share the snapshot service. Owned workers bridge request
-//! cancellation across job publication/scheduling and deletion/announcement.
 use super::*;
 use crate::core::{
     prefs,
@@ -25,7 +23,6 @@ struct Create {
 }
 
 fn failure(error: snapshot::BoxError) -> ApiError {
-    // Service errors are fixed slugs. Never propagate a primitive error here.
     let slug = error.to_string();
     match slug.as_str() {
         "archive_job_busy" => {
@@ -59,7 +56,7 @@ async fn worker<T: Send + 'static>(
 }
 
 async fn open(state: &AppState, kind: ArchiveJobKind) -> Result<Arc<Session>, ApiError> {
-    // Preference failure refuses the operation rather than authorizing pruning
+    // INVARIANT: Preference failure refuses the operation rather than authorizing pruning
     // using defaults when the configured retention is unknown.
     let manual_retention = prefs::SNAPSHOT_RETENTION
         .try_read(&state.pool)
@@ -293,7 +290,6 @@ fn restore_caller_proof(
     Ok((thread, workspace()?))
 }
 
-/// The target engine must use the gateway's answer, never a body origin hint.
 async fn restore_caller(headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
     let (thread, workspace) = restore_caller_proof(&headers, restore_workspace_identity)?;
     Ok(Json(
@@ -301,8 +297,6 @@ async fn restore_caller(headers: HeaderMap) -> Result<Json<serde_json::Value>, A
     ))
 }
 
-/// A gateway slug must name the database this engine actually serves. A bare
-/// engine cannot request or authorize a restore, even with inherited hints.
 pub(super) fn restore_workspace_identity() -> Result<String, ApiError> {
     let refuse = || ApiError::new(StatusCode::FORBIDDEN, "snapshot_restore_caller_unverified");
     let workspace = crate::core::base_path::workspace_id().ok_or_else(refuse)?;
@@ -323,10 +317,8 @@ struct RestoreTarget {
     snapshot_handle: Handle,
 }
 
-/// The event's reason for a restore: the CLI's `--reason` goes to the target.
 const RESTORE_REASON: &str = "The agent asked to restore a snapshot of its machine-made workspace.";
 
-/// This POST is source-side authorization, not a restore of this engine.
 async fn spend_restore_permission(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -565,9 +557,6 @@ mod tests {
             .unwrap()
         }
 
-        /// Invariants 1 and 2: the agent's workspace records one act and needs
-        /// no card. A user's workspace, a missing row and the source itself
-        /// spend a card, and with none they refuse.
         #[tokio::test]
         async fn only_the_agents_workspace_restores_with_no_card() {
             let (pool, db) = setup_test_db().await;
@@ -600,8 +589,6 @@ mod tests {
             teardown_test_db(&db).await;
         }
 
-        /// A user's workspace restores on Allow once for that exact snapshot,
-        /// once. Another snapshot, or another thread, holds nothing.
         #[tokio::test]
         async fn allow_once_restores_one_snapshot_of_a_users_workspace_once() {
             use crate::api::permission_requests::snapshot_ask;
@@ -634,7 +621,6 @@ mod tests {
             teardown_test_db(&db).await;
         }
 
-        /// Invariant 3: with no listing, even the agent's workspace refuses.
         #[tokio::test]
         async fn an_unreadable_listing_refuses_and_records_nothing() {
             let (pool, db) = setup_test_db().await;

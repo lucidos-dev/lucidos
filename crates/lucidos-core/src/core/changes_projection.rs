@@ -1,11 +1,3 @@
-//! The `changes` Postgres table is the projection of change-lifecycle events.
-//! Reads are SQL queries returning [`Change`]; writes (`write_*`) are called
-//! by `event_bus::update_thread_projection` inside the same transaction as the
-//! `thread_summaries` update — write-through keeps the table current with the
-//! events stream. [`ChangesProjection::rebuild_missing_from_events`] is an
-//! idempotent safety net invoked at startup; it recovers rows for any
-//! change_id present in `events` but absent from `changes`.
-
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -13,27 +5,15 @@ use uuid::Uuid;
 use crate::core::changes::{Change, ChangeStatus, RestartGroup};
 use crate::engine::thread_lifecycle::ChangeStateKind;
 
-/// Column projection used by every `query_as::<_, Change>` call. The table has
-/// no `thread_title` column — it's enriched per-response from `thread_summaries`
-/// (see `crate::core::changes::enrich_thread_titles`).
 const SELECT_CHANGE: &str =
     "SELECT id, request_id, thread_id, branch_name, repo_root, description, \
      file_count, files, requires_restart, status, created_at, resolved_at, \
      merge_worktree_path, merge_temp_branch, hardened, pre_merge_sha, \
      post_merge_sha, NULL::text AS thread_title, commits, summary, incomplete FROM changes";
 
-/// Event types whose latest occurrence per change decides whether that
-/// change's conflict-resolution pairing is open (`MergeConflictDetected`
-/// latest) or closed (any of the others latest). Shared by the two pairing
-/// queries below so the closing set can't drift between them.
 const MERGE_PAIRING_EVENT_TYPES: &str = "'MergeConflictDetected','MergeResolutionCleared',\
      'ChangeApplyFailed','ChangeApplied','ChangeDiscarded'";
 
-/// Of the given `(thread_id, change_id)` pairs, the changes whose
-/// conflict-resolution pairing is open, each with when it opened. A pairing is
-/// open when the change's latest merge-lifecycle event is
-/// `MergeConflictDetected`. One batch query, and the single definition of an
-/// open pairing. It does not check the row is pending; callers do.
 pub async fn open_conflict_pairings(
     pool: &PgPool,
     pairs: &[(Uuid, Uuid)],
@@ -70,11 +50,6 @@ pub struct ChangesProjection {
     pool: PgPool,
 }
 
-/// Parse change_id silently. Real emit paths always pass a valid UUID; tests
-/// frequently pass throwaway strings ("c1") whose target row doesn't exist —
-/// the matching SQL helper then no-ops. Diagnostics for "id parsed but no
-/// such row" live on the helpers that care (e.g. `write_status` /
-/// `write_applied`) via a `rows_affected() == 0` check.
 fn parse_change_id(change_id: &str) -> Option<Uuid> {
     Uuid::parse_str(change_id).ok()
 }
@@ -84,9 +59,7 @@ impl ChangesProjection {
         Self { pool }
     }
 
-    // --- Write API (called from event_bus inside the event commit tx) ---
-
-    /// Recompute a thread's change state and `coding_agent_requires_restart`
+    /// INVARIANT: Recompute a thread's change state and `coding_agent_requires_restart`
     /// from its pending changes. `proposed` is a cache of this table, and
     /// nothing else writes it. Every write below calls this in its transaction
     /// when it moves a change in or out of `pending`, or flips a restart flag.
@@ -133,11 +106,6 @@ impl ChangesProjection {
         Ok(())
     }
 
-    /// Insert (or update on re-emit) the row for an aggregate `ChangeProposed`.
-    /// `status` applies to an insert only: a re-emit never moves a row's
-    /// status, which belongs to the status events.
-    /// `request_id` is `Uuid::nil()` — the event payload doesn't carry it; auto-apply
-    /// correlation is dead code today. Revive: extend the event variant first.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_proposed_aggregate(
         tx: &mut Transaction<'_, Postgres>,
@@ -155,7 +123,7 @@ impl ChangesProjection {
         let Some(id) = parse_change_id(change_id) else {
             return Ok(());
         };
-        // description bound as Option<&str>: COALESCE on insert defaults to ''
+        // INVARIANT: description bound as Option<&str>: COALESCE on insert defaults to ''
         // (column is NOT NULL); COALESCE on update preserves the existing
         // description when the re-emit carries None — matches the in-memory
         // contract `if let Some(d) = description { existing.description = d }`.
@@ -192,10 +160,6 @@ impl ChangesProjection {
         Self::sync_thread_proposal(&mut **tx, thread_id, landing_after(status)).await
     }
 
-    /// Per-commit `ChangeProposed` (empty change_id, commit_sha set): bump
-    /// description, OR the restart flag, and invalidate the harden marker on
-    /// the still-pending row matched by branch. Replay-only — no live
-    /// emitter — and UPDATE-only so replay can never create a row.
     pub(crate) async fn write_proposed_per_commit(
         tx: &mut Transaction<'_, Postgres>,
         branch_name: &str,
@@ -313,9 +277,6 @@ impl ChangesProjection {
         Ok(())
     }
 
-    /// Store a change summary, but only while `description` (the commit list
-    /// it summarized) is still the change's description. A summary of an older
-    /// commit set arriving late is dropped.
     pub(crate) async fn write_summary(
         tx: &mut Transaction<'_, Postgres>,
         change_id: &str,
@@ -372,13 +333,6 @@ impl ChangesProjection {
         Ok(())
     }
 
-    // --- Read API ---
-    //
-    // Every read returns `Result<_, sqlx::Error>` so a DB outage is
-    // distinguishable from "no rows". Degradation lives at the call site,
-    // not in the projection.
-
-    /// All pending changes, ordered by created_at ASC.
     pub async fn list_pending(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = $1 ORDER BY created_at ASC"
@@ -388,7 +342,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Get a single change by id.
     pub async fn get_by_id(&self, id: Uuid) -> sqlx::Result<Option<Change>> {
         sqlx::query_as(&format!("{SELECT_CHANGE} WHERE id = $1"))
             .bind(id)
@@ -396,7 +349,6 @@ impl ChangesProjection {
             .await
     }
 
-    /// All set-aside changes, most recently created first.
     pub async fn list_set_aside(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = $1 ORDER BY created_at DESC"
@@ -406,7 +358,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Get the pending change for a given branch, if one exists.
     pub async fn get_pending_by_branch(&self, branch_name: &str) -> sqlx::Result<Option<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE branch_name = $1 AND status = $2 LIMIT 1"
@@ -417,7 +368,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// The open change (pending or set aside) for a branch, if one exists.
     pub async fn get_open_by_branch(&self, branch_name: &str) -> sqlx::Result<Option<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE branch_name = $1 AND status IN ($2, $3) \
@@ -430,8 +380,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Whether a `changes` row someone decided names this branch: any status
-    /// but `withdrawn`, which hands the work back undecided (ADR 0400).
     pub async fn branch_has_decided_change(&self, branch_name: &str) -> sqlx::Result<bool> {
         sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM changes WHERE branch_name = $1 AND status <> $2)",
@@ -442,10 +390,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// [`Self::branch_has_decided_change`] for the residue after `thread_id`
-    /// handed off to a *legacy successor thread*. A closed row counts only when it
-    /// was recorded after the handoff: a decision before it says nothing about
-    /// the residue. An open row counts at any age, since a branch holds one.
     pub async fn branch_has_decided_change_since_handoff(
         &self,
         branch_name: &str,
@@ -465,7 +409,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// All pending changes for a specific thread.
     pub async fn pending_for_thread(&self, thread_id: Uuid) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = $2 AND thread_id = $1 ORDER BY created_at ASC"
@@ -476,7 +419,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// A thread's open changes: pending or set aside.
     pub async fn open_for_thread(&self, thread_id: Uuid) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status IN ($2, $3) AND thread_id = $1 ORDER BY created_at ASC"
@@ -488,33 +430,10 @@ impl ChangesProjection {
         .await
     }
 
-    /// The thread's in-flight conflict-resolution duty, if any: a pending
-    /// change whose latest merge-lifecycle event is an unpaired
-    /// `MergeConflictDetected` — i.e. a conflict-resolution session was
-    /// started (any tier) and no closing event (`MergeResolutionCleared`,
-    /// `ChangeApplyFailed`, `ChangeApplied`, `ChangeDiscarded`) has landed
-    /// since.
-    ///
-    /// Event-sourced on purpose: the duty survives engine restarts (for the
-    /// Tier-2 shape — the thread's own worktree; a Tier-3 temp-worktree merge
-    /// is instead torn down by the boot-time stale-merge cleanup, whose
-    /// `MergeResolutionCleared` closes the pairing) and every recovery-shaped
-    /// continuation flavor. The completion hand-off
-    /// (`ConflictResolutionCleanupAction::HandOff`) skips the failure emits
-    /// precisely so this pairing stays open for the continuation to find;
-    /// a real abort emits the closing pair, which makes this return `None`.
-    ///
-    /// When more than one pairing is open (an older one stranded by a crash),
-    /// the NEWEST wins — the continuation that just fired belongs to the most
-    /// recently started merge, and binding the oldest would ff-merge the
-    /// wrong change on a clean turn end.
     pub async fn pending_conflict_change_for_thread(
         &self,
         thread_id: Uuid,
     ) -> sqlx::Result<Option<Change>> {
-        // One query: latest merge-lifecycle event per change_id on this
-        // thread, keeping only ids whose latest is MergeConflictDetected,
-        // newest pairing first.
         let open_ids: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT change_id FROM ( \
                 SELECT DISTINCT ON (payload->>'change_id') \
@@ -544,12 +463,6 @@ impl ChangesProjection {
         Ok(None)
     }
 
-    /// Change-scoped twin of [`Self::pending_conflict_change_for_thread`]:
-    /// is THIS change's conflict-resolution pairing still open (and the row
-    /// still pending)? Callers that already know the change (the Tier-2
-    /// apply result path, the Continue consumer's failure backstop) use this
-    /// instead of the thread-scoped lookup so an unrelated open pairing on
-    /// the same thread can't mislabel their change.
     pub async fn conflict_pairing_open(
         &self,
         thread_id: Uuid,
@@ -565,7 +478,6 @@ impl ChangesProjection {
             .is_some_and(|c| c.is_pending()))
     }
 
-    /// Whether any OTHER open change (pending or set aside) names the branch.
     pub async fn other_open_for_branch(
         &self,
         branch_name: &str,
@@ -583,8 +495,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Recently applied or reverted changes, newest `resolved_at` first.
-    /// `before`: only items with `resolved_at < before`. `limit`: max count.
     pub async fn list_recently_applied(
         &self,
         limit: i64,
@@ -603,11 +513,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Pending + recently applied/reverted changes for a single repo.
-    /// Returns `(pending, applied, has_more)` — fetches `applied_limit + 1`
-    /// internally so `has_more` reflects whether more applied items exist.
-    /// A failure on either query fails the whole call: partial results would
-    /// silently underreport `has_more` or hide pending changes.
     pub async fn list_for_repo(
         &self,
         repo_root: &str,
@@ -648,8 +553,6 @@ impl ChangesProjection {
         Ok((pending, applied, has_more))
     }
 
-    /// Whether any restart-required change has been applied since `since`.
-    /// Used to derive the in-app "restart required" toast from durable state.
     pub async fn requires_restart_since(&self, since: DateTime<Utc>) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes \
@@ -661,9 +564,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Whether any applied change since `since` touches an input of the served
-    /// client bundle, by the same rule the Apply path uses
-    /// (`files_have_client_update`).
     pub async fn client_update_since(&self, since: DateTime<Utc>) -> sqlx::Result<bool> {
         let files: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT f FROM changes c, unnest(c.files) AS f \
@@ -676,10 +576,6 @@ impl ChangesProjection {
         Ok(super::git::files_have_client_update(&files))
     }
 
-    /// Restart groups (one per originating thread) for restart-required
-    /// applied changes since `since`. Commits from multiple changes on the
-    /// same thread are merged in apply order. `thread_title` is left `None`;
-    /// callers enrich via `thread_summaries` if needed.
     pub async fn restart_groups_since(
         &self,
         since: DateTime<Utc>,
@@ -713,8 +609,6 @@ impl ChangesProjection {
         Ok(groups)
     }
 
-    /// Pending changes that have an active merge worktree (used for
-    /// startup cleanup of stale merge dirs).
     pub async fn with_merge_worktree(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = $1 AND merge_worktree_path IS NOT NULL"
@@ -724,10 +618,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Recover change rows referenced by `events` but missing from `changes`
-    /// by replaying their lifecycle into one synthesized row per gap.
-    /// Idempotent (`ON CONFLICT (id) DO NOTHING`); a healthy projection
-    /// returns 0. Backed by `events_change_id_idx` for the seed scan.
     pub async fn rebuild_missing_from_events(&self) -> sqlx::Result<usize> {
         let missing_ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT DISTINCT (payload->>'change_id')::uuid AS change_id
@@ -765,9 +655,6 @@ impl ChangesProjection {
     }
 }
 
-/// Returns `true` on insert, `false` if the change has no aggregate
-/// `ChangeProposed` to seed from. `ON CONFLICT (id) DO NOTHING` so a
-/// concurrent normal write or a re-run is safe.
 async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result<bool> {
     let rows: Vec<(String, serde_json::Value, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT event_type, payload, thread_id, created
@@ -785,7 +672,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     .fetch_all(pool)
     .await?;
 
-    // Per-commit ChangeProposed emits carry an empty change_id (filtered out
+    // INVARIANT: Per-commit ChangeProposed emits carry an empty change_id (filtered out
     // upstream by the uuid regex), so any ChangeProposed reaching us here is
     // an aggregate. The `commit_sha` guard is defense in depth.
     let is_aggregate_proposed = |r: &(String, serde_json::Value, Option<Uuid>, DateTime<Utc>)| {
@@ -799,10 +686,6 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         );
         return Ok(false);
     };
-    // Latest aggregate ChangeProposed wins for description/files/restart/hardened.
-    // Invariant: the forward `find` above returned Some, so the same predicate
-    // applied in reverse over the same `rows` slice must also match — the last
-    // matching row (= the "latest" we want here) is therefore guaranteed.
     let latest = rows
         .iter()
         .rev()
@@ -838,8 +721,6 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
             hardened = true;
         }
     }
-    // The same guard `write_summary` applies: only a summary of the commit
-    // list the row ends up with.
     let summary = rows
         .iter()
         .rev()
@@ -848,9 +729,6 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         .map(|r| str_field(&r.1, "summary"))
         .filter(|s| !s.is_empty());
 
-    // The latest status-moving event decides. Bringing a change back returns
-    // it to pending, the same as having no status event at all. A proposal
-    // made straight into set-aside counts as a set-aside.
     let proposed_set_aside = |r: &(String, serde_json::Value, Option<Uuid>, DateTime<Utc>)| {
         is_aggregate_proposed(r) && bool_field(&r.1, "set_aside")
     };
@@ -871,7 +749,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         })
         .filter(|r| r.0 != "ChangeBroughtBack");
 
-    // Active merge worktree state: the latest unpaired MergeResolutionStarted.
+    // INVARIANT: Active merge worktree state: the latest unpaired MergeResolutionStarted.
     // Without this, a recovered change with a half-finished merge is invisible
     // to with_merge_worktree() and the on-disk worktree leaks.
     let (merge_worktree_path, merge_temp_branch) = {
@@ -953,7 +831,6 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     .execute(pool)
     .await?;
 
-    // ON CONFLICT skip means a concurrent write beat us — don't claim recovery.
     if res.rows_affected() == 0 {
         return Ok(false);
     }
@@ -963,9 +840,6 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     Ok(true)
 }
 
-/// Where a thread lands when a change leaves `pending` for `status`. Apply,
-/// Discard and Revert leave no work on the branch to speak of, while Set aside
-/// and Withdraw keep it there unproposed (ADR 0400).
 pub(crate) fn landing_after(status: ChangeStatus) -> ChangeStateKind {
     match status {
         ChangeStatus::Applied | ChangeStatus::Discarded | ChangeStatus::Reverted => {

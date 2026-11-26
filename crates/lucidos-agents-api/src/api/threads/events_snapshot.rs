@@ -1,12 +1,3 @@
-//! Thread events snapshot endpoint, the lazy-fetch context-capture,
-//! tool-result and tool-args endpoints, and the payload-stripping helpers the
-//! snapshot uses to keep heavy threads loadable.
-//!
-//! Every strip has a paired lazy fetch, and both sides ask the same predicate
-//! which event types they cover (`is_tool_result_event`, `is_tool_call_event`).
-//! A strip whose fetch does not recognise the type it stripped serves a 404
-//! where the modal expects content.
-
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -22,45 +13,27 @@ use crate::core::ThreadEventRow;
 #[derive(Deserialize)]
 pub struct ThreadEventsQuery {
     pub after: Option<i64>,
-    /// When true, the snapshot keeps both `ContextCaptured.sections` +
-    /// `tools` AND `ToolResult.result` inline instead of stripping them. The
-    /// modal lazy-load is the default caller; `exportThread.ts` opts in so
-    /// bug-report dumps stay complete.
     #[serde(default)]
     pub include_context: bool,
-    /// Serve only the newest `limit` drawable events: a page skips auxiliary
-    /// captures, which the transcript never draws. Absent means the whole
-    /// history, auxiliary captures included, which the export path asks for.
-    ///
-    /// A thread shorter than one page fits, with `has_more` false. It reads as
-    /// the unpaged response does, less its auxiliary captures.
     pub limit: Option<i64>,
     pub before_created: Option<chrono::DateTime<chrono::Utc>>,
     pub before_seq: Option<i64>,
 }
 
-/// Largest page a caller may ask for, so one request cannot re-create the
-/// unbounded read paging exists to end.
 const MAX_EVENTS_PAGE: i64 = 2_000;
 
-/// Response shape for `GET /api/v1/threads/:thread_id/events`. Wraps the event
-/// rows with a `current_aggregate` snapshot of `thread_summaries` so the
-/// frontend's historical-replay path applies meta from a fetched snapshot
-/// — same source-of-truth model as live SSE's per-event aggregate.
 #[derive(serde::Serialize)]
 pub struct ThreadEventsSnapshot {
     pub events: Vec<ThreadEventRow>,
     #[serde(rename = "currentAggregate")]
     pub current_aggregate: Option<crate::core::store::ThreadAggregate>,
-    /// Whether older drawable events remain behind `events[0]`. Always false for an
-    /// unpaged read, which by definition carries them all.
     #[serde(
         rename = "hasMore",
         default,
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub has_more: bool,
-    /// The highest `sequence` the whole thread holds, sent only for a PAGE.
+    /// INVARIANT: The highest `sequence` the whole thread holds, sent only for a PAGE.
     ///
     /// A page cannot supply it. A sequence is allocated globally and can run
     /// against the clock, so the newest row by clock often does not hold the
@@ -69,13 +42,13 @@ pub struct ThreadEventsSnapshot {
     /// refetch history and replay it through the live path.
     #[serde(rename = "maxSequence", skip_serializing_if = "Option::is_none")]
     pub max_sequence: Option<i64>,
-    /// The thread's pair stamps, sent only for a PAGE. The event that stamped
+    /// INVARIANT: The thread's pair stamps, sent only for a PAGE. The event that stamped
     /// the model, effort or provider may sit behind the page. The chat rung
     /// pill reads the pair from these, not the account default. An unpaged
     /// read carries every event, so it sends none.
     #[serde(rename = "pairStamps", skip_serializing_if = "Option::is_none")]
     pub pair_stamps: Option<Vec<crate::core::PairStamp>>,
-    /// The thread's card sizes, sent only for a PAGE, for the same reason: the
+    /// INVARIANT: The thread's card sizes, sent only for a PAGE, for the same reason: the
     /// pick that sized a widget instance's cards may sit behind the page.
     #[serde(rename = "cardSizes", skip_serializing_if = "Option::is_none")]
     pub card_sizes: Option<Vec<crate::engine::widgets::CardSize>>,
@@ -97,8 +70,6 @@ pub(super) fn before_cursor(
     }
 }
 
-/// GET /api/v1/threads/:thread_id/events — snapshot of persisted thread events,
-/// plus the current `thread_summaries` projection snapshot.
 pub(in crate::api) async fn get_thread_events_snapshot(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -107,9 +78,6 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
 
-    // A page and a delta are different questions, so asking both is a caller
-    // bug rather than a combination to resolve. `after` walks forward from what
-    // the client already holds; `limit` walks backward from the newest.
     if query.limit.is_some() && query.after.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -117,9 +85,6 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         ));
     }
     let before = before_cursor(query.before_created, query.before_seq)?;
-    // A cursor says where to start, and not how much to take. The unpaged read
-    // would ignore it and serve the whole history, which is the opposite of
-    // what such a caller asked for. Refusing is how they find out.
     if before.is_some() && query.limit.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -127,7 +92,6 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         ));
     }
 
-    // Independent fetches against the same pool — run in parallel.
     let pool = state.engine.pool();
     let (events_res, aggregate_res, pair_stamps_res, card_sizes_res) = tokio::join!(
         read_events(&state, thread_uuid, &query, before),
@@ -158,7 +122,6 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         log_legacy!("[API] Failed to get thread events: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
-    // Missing stamps would silently show the account default on the rung pill.
     let pair_stamps = pair_stamps_res.map_err(|e| {
         log_legacy!(
             "[API] Failed to read pair stamps for {}: {}",
@@ -167,7 +130,6 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         );
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
-    // Missing sizes would silently draw a later card at the widget's default.
     let card_sizes = card_sizes_res.map_err(|e| {
         log_legacy!("[API] Failed to read card sizes for {}: {}", thread_uuid, e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -183,8 +145,6 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         rename_legacy_section_size_in_row(row);
     }
 
-    // Aggregate fetch is best-effort — absence just means no snapshot to apply
-    // (frontend logs a warning).
     let current_aggregate = aggregate_res.unwrap_or_else(|e| {
         log_legacy!(
             "[API] Failed to fetch ThreadAggregate for {}: {}",
@@ -213,19 +173,12 @@ pub(super) fn rename_legacy_section_size_in_row(row: &mut ThreadEventRow) {
     }
 }
 
-/// What `read_events` returns. On an unpaged read, whose rows are the whole
-/// history, `has_more` is false and `max_sequence` is `None`.
 struct EventsRead {
     events: Vec<ThreadEventRow>,
     has_more: bool,
     max_sequence: Option<i64>,
 }
 
-/// The events half of the snapshot, paged or whole.
-///
-/// Split out so the unpaged path keeps calling the query it always called. A
-/// `limit` of none is not a page of everything: it is the original read, which
-/// is what keeps a short thread's response identical.
 async fn read_events(
     state: &AppState,
     thread_uuid: Uuid,
@@ -237,7 +190,6 @@ async fn read_events(
             .event_store
             .get_thread_events_by_seq(thread_uuid, query.after)
             .await?;
-        // An unpaged read carries every row, so its own rows ARE the watermark.
         return Ok(EventsRead {
             events,
             has_more: false,
@@ -256,27 +208,14 @@ async fn read_events(
     })
 }
 
-/// The two event types carrying a tool's OUTPUT, one per channel. Every read
-/// path that rewrites a `result` asks here rather than naming a type inline.
-///
-/// One predicate, because the chat channel's name was the only one the strips
-/// knew for months. So the shape they never fired on was the coding-agent
-/// thread, the heaviest a workspace holds. A third channel joins in one place.
 pub(super) fn is_tool_result_event(event_type: &str) -> bool {
     matches!(event_type, "ToolResult" | "CodingAgentToolResult")
 }
 
-/// The event types carrying a tool's INPUT, one per channel.
 pub(super) fn is_tool_call_event(event_type: &str) -> bool {
     matches!(event_type, "CodingAgentToolCalled" | "ToolCalled")
 }
 
-/// Rewrite a tool result's `result` in place when `strip` recognises its
-/// sentinel. A no-op for any other event type, a missing `result`, or
-/// unrecognised text.
-///
-/// Generic over `HasEventPayload` because the two read paths hold different row
-/// types: the snapshot serves `ThreadEventRow`, the lazy fetch serves `EventRow`.
 fn rewrite_tool_result<E: HasEventPayload>(row: &mut E, strip: impl Fn(&str) -> Option<String>) {
     if !is_tool_result_event(row.event_type()) {
         return;
@@ -289,9 +228,6 @@ fn rewrite_tool_result<E: HasEventPayload>(row: &mut E, strip: impl Fn(&str) -> 
     }
 }
 
-/// Replace `[IMAGE_CONTENT:...]\n<base64>` payloads in `ToolResult.result` with a small stub.
-/// Rescues legacy threads (pre-write-time-strip) where `read_file` of an image inlined the
-/// full base64 into the event payload. Those threads are otherwise unloadable on mobile.
 pub(super) fn strip_image_content_in_tool_result<E: HasEventPayload>(row: &mut E) {
     rewrite_tool_result(row, crate::engine::tools::files::strip_image_content_marker);
 }
@@ -300,24 +236,17 @@ pub(super) fn strip_app_capture_in_tool_result<E: HasEventPayload>(row: &mut E) 
     rewrite_tool_result(row, crate::engine::agentic_loop::strip_app_capture_marker);
 }
 
-/// Both inline-image rescues in one call. Read paths should use this rather
-/// than picking a stripper: the app-capture half was missed for months
-/// precisely because it was a separate decision at each call site.
 pub(super) fn strip_inline_image_payloads<E: HasEventPayload>(row: &mut E) {
     strip_image_content_in_tool_result(row);
     strip_app_capture_in_tool_result(row);
 }
 
-/// How many chars of a coding agent's output older rows kept. The writer cut
-/// every result to this length, silently, until it began storing the whole.
 const LEGACY_CODING_AGENT_PREVIEW_CHARS: usize = 200;
 
-/// The note a served old coding-agent result carries, since its row cannot say
-/// it was cut. Hedged: a whole output of exactly 200 chars reads the same.
 pub(super) const LEGACY_PREVIEW_NOTE: &str = "\n\n[Older records kept only the first 200 \
      characters of a coding agent's output. This one may be cut short.]";
 
-/// Label an old coding-agent result on the way out, never in the store.
+/// INVARIANT: Label an old coding-agent result on the way out, never in the store.
 pub(super) fn label_legacy_coding_agent_preview<E: HasEventPayload>(row: &mut E) {
     if row.event_type() != "CodingAgentToolResult" {
         return;
@@ -328,15 +257,13 @@ pub(super) fn label_legacy_coding_agent_preview<E: HasEventPayload>(row: &mut E)
     });
 }
 
-/// Lazy-fetch payload returned by `GET /events/:event_id/context` — the
-/// pieces of a `ContextCaptured` event that the snapshot endpoint strips.
 #[derive(serde::Serialize)]
 pub struct ContextCapturePayload {
     pub sections: serde_json::Value,
     pub tools: serde_json::Value,
 }
 
-/// GET /api/v1/events/:event_id/context — returns the `sections` and `tools`
+/// INVARIANT: GET /api/v1/events/:event_id/context — returns the `sections` and `tools`
 /// for one `ContextCaptured` event. The snapshot endpoint strips these because
 /// a single capture can be ~50 kB and a heavy thread carries hundreds; the
 /// step-detail modal fetches them on demand instead.
@@ -423,7 +350,6 @@ pub(super) fn rename_legacy_section_size(sections: &mut serde_json::Value) {
     }
 }
 
-/// [`rename_legacy_section_size`] applied to an event payload's `sections`.
 pub(super) fn rename_legacy_section_size_in_payload(payload: &mut serde_json::Value) {
     let Some(sections) = payload.get_mut("sections") else {
         return;
@@ -431,13 +357,6 @@ pub(super) fn rename_legacy_section_size_in_payload(payload: &mut serde_json::Va
     rename_legacy_section_size(sections);
 }
 
-/// Drop `sections` (and `tools`) from `ContextCaptured` payloads on the snapshot
-/// path and stamp a `sections_stripped: true` marker so the frontend knows to
-/// lazy-fetch via `GET /events/:event_id/context` when the user opens the
-/// step-detail modal. A single section can be ~50 kB; a heavy thread can carry
-/// 500+ captures = many MB of JSON that the events list never renders (only the
-/// modal does). Keeping `producer / model / context_window /
-/// estimated_total_tokens / usage / trimmed` preserves the inline budget chip.
 pub(super) fn strip_context_capture_sections(row: &mut ThreadEventRow) {
     if row.event_type != "ContextCaptured" {
         return;
@@ -453,16 +372,6 @@ pub(super) fn strip_context_capture_sections(row: &mut ThreadEventRow) {
     );
 }
 
-/// Drop `result` from a tool result's payload on the snapshot path and stamp a
-/// `result_stripped: true` marker so the frontend knows to lazy-fetch via
-/// `GET /events/:event_id/tool-result` when the user opens the step-detail
-/// modal. A `result` is rendered ONLY inside the modal
-/// (`StepDetailModal.tsx`'s `<pre class="step-detail-result">{step.result}</pre>`)
-/// — never inline in the chat exchange. A single bash-output result can be
-/// 150 kB+, and a busy coding-agent thread carries hundreds of them = ~2 MB of
-/// JSON that the events list never renders. Keeping `name`, `images` and
-/// `tool_use_id` preserves the inline step row, the generated-image rendering
-/// paths, and the pairing the coding-agent arm settles its step by.
 pub(super) fn strip_tool_result_content(row: &mut ThreadEventRow) {
     if !is_tool_result_event(&row.event_type) {
         return;
@@ -473,8 +382,6 @@ pub(super) fn strip_tool_result_content(row: &mut ThreadEventRow) {
     crate::engine::thread_events::ThreadEvent::strip_result_text(obj);
 }
 
-/// Drop `args` from a tool call on the snapshot path, as the live stream does.
-/// The shape lives in `ThreadEvent::strip_tool_call_args`.
 pub(super) fn strip_tool_call_args(row: &mut ThreadEventRow) {
     if !is_tool_call_event(&row.event_type) {
         return;
@@ -484,22 +391,11 @@ pub(super) fn strip_tool_call_args(row: &mut ThreadEventRow) {
     }
 }
 
-/// Lazy-fetch payload returned by `GET /events/:event_id/tool-result` — the
-/// stripped `result` field of one `ToolResult` event.
 #[derive(serde::Serialize)]
 pub struct ToolResultPayload {
-    /// Original `result` string. `null` for image-only tool results (no
-    /// textual result was ever written); the modal renders the inline
-    /// images and elides the `<pre>` block in that case.
     pub result: serde_json::Value,
 }
 
-/// GET /api/v1/events/:event_id/tool-result — returns the `result` field for
-/// one `ToolResult` event. The snapshot endpoint strips this because a single
-/// bash result can be 150 kB+ and a heavy CC thread carries hundreds; the
-/// step-detail modal fetches it on demand instead.
-///
-/// Keyed on `event_id` only — same routing contract as `get_context_capture`.
 pub(in crate::api) async fn get_tool_result(
     State(state): State<AppState>,
     Path(event_id): Path<String>,
@@ -524,10 +420,6 @@ pub(in crate::api) async fn get_tool_result(
         ));
     }
 
-    // The modal renders this in a `<pre>`, so an inlined image is unreadable
-    // noise at best. Legacy rows predate the write-time stubs and can be
-    // multi-megabyte; this endpoint applied no stripping at all until now, so
-    // it was the one read path still shipping them in full.
     strip_inline_image_payloads(&mut row);
     label_legacy_coding_agent_preview(&mut row);
 
@@ -538,8 +430,6 @@ pub(in crate::api) async fn get_tool_result(
         )
     })?;
 
-    // `result` may legitimately be absent (image-only tool results); return
-    // null so the modal can render its image-only state without 404-ing.
     let result = payload_obj
         .get("result")
         .cloned()
@@ -547,21 +437,11 @@ pub(in crate::api) async fn get_tool_result(
     Ok(Json(ToolResultPayload { result }))
 }
 
-/// Lazy-fetch payload returned by `GET /events/:event_id/tool-args`, carrying
-/// the stripped `args` field of one coding-agent tool call.
 #[derive(serde::Serialize)]
 pub struct ToolArgsPayload {
-    /// Original `args` value. `null` for a call that recorded none, where the
-    /// modal renders its label alone and elides the command block.
     pub args: serde_json::Value,
 }
 
-/// GET /api/v1/events/:event_id/tool-args: the `args` for one coding-agent
-/// tool call. A single `Write` carries a whole file and a heavy thread carries
-/// hundreds, so the snapshot strips it. The step-detail modal fetches it on
-/// demand instead.
-///
-/// Keyed on `event_id` only, the same routing contract as `get_tool_result`.
 pub(in crate::api) async fn get_tool_args(
     State(state): State<AppState>,
     Path(event_id): Path<String>,
@@ -593,9 +473,6 @@ pub(in crate::api) async fn get_tool_args(
         )
     })?;
 
-    // Absent is a real answer, not a missing one: a tool can be called with no
-    // arguments. Serving null lets the modal draw its label-only state rather
-    // than a failure.
     let args = payload_obj
         .get("args")
         .cloned()
@@ -603,31 +480,11 @@ pub(in crate::api) async fn get_tool_args(
     Ok(Json(ToolArgsPayload { args }))
 }
 
-/// Where one event lives, returned by `GET /events/:event_id/location`.
-///
-/// `thread_id` is `None` for an event that belongs to no conversation, i.e.
-/// anything whose `aggregate` is not `thread` (a workspace *domain event*, an
-/// app event, a trigger event). That is a real answer, not a missing one: the
-/// events insert derives the column as
-/// `CASE WHEN aggregate = 'thread' THEN aggregate_id ELSE NULL END`
-/// (`engine/event_bus`), so a null here means "nowhere in any transcript"
-/// rather than "not recorded". An event id with no row at all is a 404, so the
-/// caller can tell the two apart.
 #[derive(serde::Serialize)]
 pub struct EventLocation {
     pub thread_id: Option<Uuid>,
 }
 
-/// GET /api/v1/events/:event_id/location: the thread one event belongs to.
-///
-/// Exists for the *event wait* step's "show it". An `EventWaitDelivered`
-/// carries the matched event's id, type and payload, but not its thread, and
-/// the whole point of a wait is that the match usually happened somewhere else.
-/// Without this the card could only search the open thread's DOM, which is the
-/// one place the event reliably is not.
-///
-/// Keyed on `event_id` only, the same routing contract as
-/// `get_context_capture` and `get_tool_result`.
 pub(in crate::api) async fn get_event_location(
     State(state): State<AppState>,
     Path(event_id): Path<String>,

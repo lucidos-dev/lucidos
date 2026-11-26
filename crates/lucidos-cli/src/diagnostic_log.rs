@@ -33,7 +33,6 @@ pub(crate) fn cmd_query(
     Ok(())
 }
 
-/// Clap kebab-cases `--byte-limit`, and the route takes `byte_limit`.
 fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     let mut push = |key, value: Option<String>| {
@@ -55,7 +54,6 @@ fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)>
     params
 }
 
-/// Print the timeline, then report retention, budget cuts and unavailable sources.
 fn render(body: &Value) -> String {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
     let mut out = String::new();
@@ -95,10 +93,7 @@ fn render(body: &Value) -> String {
     out
 }
 
-/// The CLI prints the engine's request id. The agent must pass it, unchanged,
-/// to its question tool; it cannot answer or synthesize the owner event.
 pub(crate) fn cmd_host_transfer(ws: &Workspace, path: &str, body: Value) -> Result<(), BoxError> {
-    // Block path/query injection before attaching the thread-bound credential.
     if path != "prepare" {
         let (id, suffix) = path.split_once('/').ok_or("Invalid host-log operation")?;
         if !id.starts_with("transfer-")

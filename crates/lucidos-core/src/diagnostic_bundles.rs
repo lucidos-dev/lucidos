@@ -1,5 +1,3 @@
-//! Private, bounded diagnostic inbox. No bundle file is exposed to agents.
-
 use crate::diagnostic_log::{query as log_query, writer::Record};
 use lucidos_diagnostic_log::bundle::{Bundle, MAX_COMPRESSED_BYTES, MAX_EXPANDED_BYTES};
 use sha2::{Digest, Sha256};
@@ -18,7 +16,7 @@ fn decode_with_limits(bytes: &[u8], compressed: usize, expanded: usize) -> Resul
     }
     let mut json = Vec::new();
     let mut decoder = zstd::stream::read::Decoder::new(bytes)?;
-    // The producer uses zstd's ordinary small window. Bound decoder memory as
+    // INVARIANT: The producer uses zstd's ordinary small window. Bound decoder memory as
     // well as output; a hostile frame must not request a multi-gigabyte window.
     decoder.window_log_max(23)?;
     decoder.take(expanded as u64 + 1).read_to_end(&mut json)?;
@@ -40,7 +38,7 @@ fn decode_with_limits(bytes: &[u8], compressed: usize, expanded: usize) -> Resul
     Ok(bundle)
 }
 
-/// A validated delivery. The stable identity is scoped by authenticated origin,
+/// INVARIANT: A validated delivery. The stable identity is scoped by authenticated origin,
 /// so two senders using the same delivery key cannot overwrite one another.
 pub struct Incoming {
     id: Uuid,
@@ -73,7 +71,6 @@ impl Incoming {
             return Err("Invalid diagnostic delivery identity".into());
         }
         let bundle = decode(bytes)?;
-        // Drop unknown JSON fields: the inbox stores only the shared contract.
         let json = serde_json::to_vec(&bundle)?;
         let digest = format!("{:x}", Sha256::digest(&json));
         let payload = zstd::stream::encode_all(json.as_slice(), 3)?;
@@ -110,13 +107,12 @@ pub fn query(bundle: Bundle, query: &log_query::Query) -> std::io::Result<log_qu
     )
 }
 
-/// Reads only a live receipt, with the same bounded filters as diagnostic-log.
 pub async fn query_received(
     pool: &sqlx::PgPool,
     id: Uuid,
     filter: &log_query::Query,
 ) -> Result<Option<log_query::QueryResult>, Error> {
-    // Bound retained compressed payloads and expanded parsing together. A
+    // INVARIANT: Bound retained compressed payloads and expanded parsing together. A
     // bounded response must not permit unbounded concurrent inbox scans.
     static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let permit = SCANS
@@ -126,7 +122,7 @@ pub async fn query_received(
         .bind(id).fetch_optional(pool).await?;
     let filter = filter.clone();
     tokio::task::spawn_blocking(move || {
-        // A canceled HTTP future cannot release the slot while parsing lives.
+        // INVARIANT: A canceled HTTP future cannot release the slot while parsing lives.
         let _permit = permit;
         payload
             .map(|bytes| query(decode(&bytes)?, &filter).map_err(Into::into))

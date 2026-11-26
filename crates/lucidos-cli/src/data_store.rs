@@ -1,12 +1,3 @@
-//! `lucidos data-store add <name> <source-dir>`
-//!
-//! Moves an existing directory to `~/.lucidos/data/<name>/` and prints the
-//! resolved absolute path on stdout. Used to promote bulk reference corpora
-//! out of a workspace's `data/artifacts/` into a persistent, cross-workspace
-//! location (see system-knowhow/best-practices rule 8).
-//!
-//! This is a pure filesystem helper — does not talk to the engine.
-
 use std::path::{Path, PathBuf};
 
 use crate::workspace::BoxError;
@@ -19,9 +10,6 @@ pub(crate) fn cmd_add(name: &str, source_dir: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Pure helper — takes the target root explicitly so tests don't need to mutate
-/// the process-global `HOME` env var. Returns the absolute path of the moved
-/// directory on success.
 fn move_into_root(name: &str, source: &Path, target_root: &Path) -> Result<PathBuf, BoxError> {
     let name = name.trim();
     if name.is_empty() {

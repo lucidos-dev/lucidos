@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use crate::llm::vertex::{LocationHandle, TokenCache};
 
-/// Image size presets that map to provider-specific dimensions.
 #[derive(Debug, Clone, Copy)]
 pub enum ImageSize {
     Square,
@@ -26,32 +25,20 @@ impl ImageSize {
     }
 }
 
-/// Result from an image generation/editing call.
 pub struct ImageResult {
-    /// Raw image bytes (PNG or JPEG).
     pub bytes: Vec<u8>,
-    /// MIME type of the image.
     pub mime_type: String,
-    /// Tokens the provider billed, when it says. OpenAI's image endpoints
-    /// report a `usage` block; Imagen prices per image and reports none, so
-    /// it leaves these `None`. Shaped as flat options to match `LlmResponse`.
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
-    /// The model id that served this call, for `ContextCaptured.model`, which
+    /// INVARIANT: The model id that served this call, for `ContextCaptured.model`, which
     /// means the serving model everywhere it appears. It rides on the result
     /// rather than the provider because Imagen picks its model per call:
     /// generating and editing hit different ones.
     pub model: String,
 }
 
-/// Trait for image generation providers.
 #[async_trait]
 pub trait ImageProvider: Send + Sync {
-    /// Generate or edit an image.
-    /// - `prompt`: text describing what to generate or how to edit
-    /// - `input_images`: optional existing images to edit (as raw bytes)
-    /// - `size`: desired output size
-    /// - `call`: from the model call service, which records the call
     async fn generate(
         &self,
         prompt: &str,
@@ -60,16 +47,10 @@ pub trait ImageProvider: Send + Sync {
         call: crate::llm::metered::CallToken,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Whether this provider supports multiple input images for editing.
     fn supports_multi_image(&self) -> bool;
 
-    /// Provider display name.
     fn name(&self) -> &str;
 }
-
-// ---------------------------------------------------------------------------
-// OpenAI gpt-image-* provider
-// ---------------------------------------------------------------------------
 
 pub struct OpenAiImageProvider {
     api_key: String,
@@ -103,13 +84,6 @@ impl OpenAiImageProvider {
         }
     }
 
-    /// Read one image response into an [`ImageResult`]. `call` names the
-    /// endpoint in every error, and is the only thing generation and editing
-    /// differ by once the response is in hand.
-    ///
-    /// The MIME type is `image/png` for both, which is what the generation
-    /// request asks for. The edit request omits `output_format`, so it takes
-    /// OpenAI's default; that predates this helper and is unchanged here.
     async fn read_image_response(
         &self,
         resp: reqwest::Response,
@@ -159,8 +133,6 @@ impl OpenAiImageProvider {
 #[derive(Deserialize)]
 struct OpenAiImageResponse {
     data: Vec<OpenAiImageData>,
-    /// Present on the `gpt-image-*` models, absent on older ones. Optional so
-    /// a model that reports nothing still parses.
     #[serde(default)]
     usage: Option<OpenAiImageUsage>,
 }
@@ -178,8 +150,6 @@ struct OpenAiImageUsage {
     output_tokens: Option<u32>,
 }
 
-/// Split an OpenAI image `usage` block into the two counts `ImageResult`
-/// carries. Absent block means the model reported nothing.
 fn usage_tokens(usage: &Option<OpenAiImageUsage>) -> (Option<u32>, Option<u32>) {
     match usage {
         Some(u) => (u.input_tokens, u.output_tokens),
@@ -200,7 +170,6 @@ impl ImageProvider for OpenAiImageProvider {
         let size_str = Self::openai_size(size);
 
         let (call, resp) = if input_images.is_empty() {
-            // Text-to-image generation
             let body = serde_json::json!({
                 "model": self.model,
                 "prompt": prompt,
@@ -219,7 +188,6 @@ impl ImageProvider for OpenAiImageProvider {
                 .await?;
             ("generation", resp)
         } else {
-            // Image editing with multipart form
             let mut form = reqwest::multipart::Form::new()
                 .text("model", self.model.clone())
                 .text("prompt", prompt.to_string())
@@ -254,10 +222,6 @@ impl ImageProvider for OpenAiImageProvider {
         &self.name
     }
 }
-
-// ---------------------------------------------------------------------------
-// Vertex AI Imagen 4 provider
-// ---------------------------------------------------------------------------
 
 pub struct VertexImagenProvider {
     project_id: String,
@@ -315,7 +279,6 @@ impl ImageProvider for VertexImagenProvider {
         let location = self.current_location();
 
         let (model, url, body) = if input_images.is_empty() {
-            // Text-to-image generation
             let url = format!(
                 "https://{}/v1/projects/{}/locations/{}/publishers/google/models/imagen-4.0-generate-001:predict",
                 crate::llm::vertex::vertex_host(&location), self.project_id, location
@@ -330,7 +293,7 @@ impl ImageProvider for VertexImagenProvider {
             });
             ("imagen-4.0-generate-001", url, body)
         } else {
-            // Image editing uses imagen-3.0-capability-001 with REFERENCE_TYPE_RAW
+            // INVARIANT: Image editing uses imagen-3.0-capability-001 with REFERENCE_TYPE_RAW
             // (instruct customization). imagen-4.0-generate-001 does not support referenceImages.
             let img_b64 = base64::engine::general_purpose::STANDARD.encode(&input_images[0]);
             let url = format!(
@@ -394,7 +357,6 @@ impl ImageProvider for VertexImagenProvider {
         Ok(ImageResult {
             bytes,
             mime_type: "image/png".to_string(),
-            // Imagen prices per image and reports no token usage.
             input_tokens: None,
             output_tokens: None,
             model: model.to_string(),
@@ -410,7 +372,7 @@ impl ImageProvider for VertexImagenProvider {
     }
 }
 
-/// Resolve the configured image provider from the live `image_model`
+/// INVARIANT: Resolve the configured image provider from the live `image_model`
 /// preference. Constructed fresh per call so Settings changes take effect
 /// without an engine restart; cost is dwarfed by the image-API roundtrip.
 pub async fn build_image_provider(
@@ -454,18 +416,12 @@ pub async fn build_image_provider(
     };
 
     match model {
-        // The catalog enum limits what is stored, so the prefix names exactly
-        // the OpenAI ids it offers.
         openai if openai.starts_with("gpt-image-") => match openai_api_key {
             Some(key) => {
                 crate::log_legacy!("[Image] Using OpenAI {}", model);
                 build_openai(key, model)
             }
             None => {
-                // `openai_api_key` is the ALREADY-RESOLVED key from
-                // `resolve_openai_api_key` (stored credential › OPENAI_API_KEY
-                // › Codex CLI), so naming only the env var sends the user to
-                // fix the wrong thing when they configured it in Settings.
                 crate::log_legacy!(
                     concat!(
                         "[Image] {} selected but no OpenAI key is configured (",
@@ -479,10 +435,6 @@ pub async fn build_image_provider(
         },
         "imagen-4" => {
             if vertex_project_id.is_empty() {
-                // Same already-resolved-chain caveat as the OpenAI key above:
-                // `vertex_project_id` comes from `VERTEX_PROJECT_ID` › the ADC
-                // file › gcloud config, so pointing only at the env var
-                // misdirects a user who authenticated with ADC.
                 crate::log_legacy!(
                     "[Image] imagen-4 selected but no Google Cloud project is configured (set VERTEX_PROJECT_ID or run `gcloud auth application-default login`)"
                 );
@@ -566,12 +518,6 @@ mod tests {
         assert_eq!(OpenAiImageProvider::openai_size(ImageSize::Auto), "auto");
     }
 
-    /// Compile-checks that the constructors return Result (the error path
-    /// is propagated via `?`, never `.expect`). reqwest::Client::builder()
-    /// with a 120s timeout and no other config succeeds in the test env, so
-    /// the OK arm is the only one we can exercise — but the *signature*
-    /// being Result is what removes the implicit panic on a future rustls /
-    /// feature-flag flip that makes the builder fallible in a new way.
     #[test]
     fn image_provider_constructors_return_result() {
         type BoxErr = Box<dyn std::error::Error + Send + Sync>;
@@ -650,7 +596,6 @@ mod tests {
         let location = crate::llm::vertex::location_handle("us-central1".into());
         let token_cache: Option<TokenCache> = Some(Arc::new(std::sync::Mutex::new(None)));
 
-        // No preference set → auto. Vertex configured → Imagen.
         let p1 = build_image_provider(
             &pool,
             Some("sk-test"),
@@ -664,15 +609,12 @@ mod tests {
             "Vertex AI Imagen 4"
         );
 
-        // Auto with no Vertex falls back to OpenAI. OpenAI shuts gpt-image-1
-        // down, so this pins the current model by name.
         let p2 = build_image_provider(&pool, Some("sk-test"), "", &location, &token_cache).await;
         assert_eq!(
             p2.expect("provider should be built").name(),
             "OpenAI gpt-image-2.5-flare"
         );
 
-        // Auto with no credentials at all → None.
         let p3 = build_image_provider(&pool, None, "", &location, &token_cache).await;
         assert!(p3.is_none(), "no credentials → no provider");
 
@@ -680,8 +622,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Every OpenAI id the picker offers reaches OpenAI under that id. An id
-    /// the provider match misses would read as auto and run another model.
     #[tokio::test]
     async fn every_offered_openai_model_builds_under_its_own_id() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;

@@ -1,13 +1,3 @@
-//! A thread's agent asks the user to read its latest reply (ADR 0409).
-//!
-//! `ThreadReadRequested` sets `read_requested`. A sighting, a human message, a
-//! human answer or an archive clears it, and so does a change that lists the thread
-//! elsewhere: a `ThreadReadNotRequested`
-//! projects nothing. Each test pins one invariant of
-//! `docs/plans/2026-10-10-agent-read-request.md`,
-//! `docs/plans/2026-10-10-turn-end-gate-enforces-valid-states.md` or
-//! `docs/plans/2026-10-10-read-request-yields-to-change.md`.
-
 use super::*;
 
 async fn read_requested(pool: &PgPool, thread_id: Uuid) -> bool {
@@ -52,11 +42,17 @@ fn prompt(mode: ActorMode) -> ThreadEvent {
     }
 }
 
-/// A chat thread whose turn asked to be read and then ended.
 async fn requested_chat_thread(bus: &EventBus) -> Uuid {
     let thread_id = Uuid::new_v4();
     emit_thread_message(bus, thread_id, None, "write me the report").await;
-    emit(bus, thread_id, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     emit_reply(bus, thread_id, "Here is the report.").await;
     thread_id
 }
@@ -137,9 +133,6 @@ async fn emit_answer(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigi
     .unwrap();
 }
 
-/// The question card ends the reply, so a user's answer reads it, as a typed
-/// message does. A turn that asked to be read and then asked a question must
-/// not stay in Review after the user answered.
 #[tokio::test]
 async fn a_human_answer_clears_it_and_an_agent_or_engine_answer_does_not() {
     let (pool, db_name) = setup_test_db().await;
@@ -165,7 +158,14 @@ async fn a_human_answer_clears_it_and_an_agent_or_engine_answer_does_not() {
     emit_answer(&bus, thread_id, Some(device.clone()), false).await;
     assert!(!read_requested(&pool, thread_id).await);
 
-    emit(&bus, thread_id, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     emit_answer(&bus, thread_id, Some(device), true).await;
     assert!(
         !read_requested(&pool, thread_id).await,
@@ -176,8 +176,6 @@ async fn a_human_answer_clears_it_and_an_agent_or_engine_answer_does_not() {
     teardown_test_db(&db_name).await;
 }
 
-/// A later turn that does not ask leaves an unseen request in place: the user
-/// still has not read the reply that asked.
 #[tokio::test]
 async fn a_later_turn_end_leaves_it() {
     let (pool, db_name) = setup_test_db().await;
@@ -191,17 +189,26 @@ async fn a_later_turn_end_leaves_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// A later turn's no leaves an unseen request in place too, and counts as no
-/// attention for the parent.
+fn no(supersedes_request: bool) -> ThreadEvent {
+    ThreadEvent::ThreadReadNotRequested { supersedes_request }
+}
+
 #[tokio::test]
 async fn a_later_no_leaves_it_and_needs_no_attention() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let (parent, child) = spawn_parent_child(&bus, EventChannel::Chat).await;
-    emit(&bus, child, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        child,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     emit_reply(&bus, child, "Findings attached.").await;
-    emit(&bus, child, ThreadEvent::ThreadReadNotRequested).await;
+    emit(&bus, child, no(false)).await;
     emit_reply(&bus, child, "A second reply, decided no.").await;
 
     assert!(read_requested(&pool, child).await);
@@ -212,6 +219,54 @@ async fn a_later_no_leaves_it_and_needs_no_attention() {
 }
 
 #[tokio::test]
+async fn a_superseding_no_clears_it() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let (_parent, child) = spawn_parent_child(&bus, EventChannel::Chat).await;
+    emit(
+        &bus,
+        child,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
+    emit_reply(&bus, child, "Blocked: the shell refuses every command.").await;
+    emit(&bus, child, no(true)).await;
+    emit_reply(&bus, child, "The shell works again.").await;
+
+    assert!(!read_requested(&pool, child).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn empty_read_decision_payloads_read_as_unflagged() {
+    let event: ThreadEvent =
+        serde_json::from_value(serde_json::json!({"type": "ThreadReadNotRequested"})).unwrap();
+    assert!(matches!(
+        event,
+        ThreadEvent::ThreadReadNotRequested {
+            supersedes_request: false
+        }
+    ));
+    assert_eq!(
+        serde_json::to_value(no(false)).unwrap(),
+        serde_json::json!({"type": "ThreadReadNotRequested"})
+    );
+    let yes: ThreadEvent =
+        serde_json::from_value(serde_json::json!({"type": "ThreadReadRequested"})).unwrap();
+    assert!(matches!(
+        yes,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false
+        }
+    ));
+}
+
+#[tokio::test]
 async fn a_coding_agent_user_message_or_human_prompt_clears_it_and_an_engine_prompt_does_not() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -219,7 +274,14 @@ async fn a_coding_agent_user_message_or_human_prompt_clears_it_and_an_engine_pro
     let (_parent, child) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
     emit_cc_session_started(&bus, child).await;
 
-    emit(&bus, child, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        child,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     emit(&bus, child, prompt(ActorMode::Engine)).await;
     assert!(
         read_requested(&pool, child).await,
@@ -229,7 +291,14 @@ async fn a_coding_agent_user_message_or_human_prompt_clears_it_and_an_engine_pro
     emit(&bus, child, prompt(ActorMode::Human)).await;
     assert!(!read_requested(&pool, child).await);
 
-    emit(&bus, child, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        child,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     emit(
         &bus,
         child,
@@ -258,15 +327,20 @@ async fn an_archive_dismisses_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// A read request is never something a thread is blocked on, so a child that
-/// asks adds nothing to its parent's attention roll-up.
 #[tokio::test]
 async fn a_child_request_never_counts_as_attention() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let (parent, child) = spawn_parent_child(&bus, EventChannel::Chat).await;
-    emit(&bus, child, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        child,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     emit_reply(&bus, child, "Findings attached.").await;
 
     assert!(read_requested(&pool, child).await);
@@ -276,14 +350,17 @@ async fn a_child_request_never_counts_as_attention() {
     teardown_test_db(&db_name).await;
 }
 
-// ---- a change that lists the thread replaces the request ----
-
-/// A coding-agent child that asked to be read before its turn's work became a
-/// change.
 async fn requested_coding_agent_thread(bus: &EventBus, pool: &PgPool) -> Uuid {
     let (_parent, child) = spawn_parent_child(bus, EventChannel::ClaudeCode).await;
     emit_cc_session_started(bus, child).await;
-    emit(bus, child, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        bus,
+        child,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     assert!(read_requested(pool, child).await);
     child
 }
@@ -300,7 +377,14 @@ async fn a_proposed_change_drops_the_request_and_blocks_a_new_one() {
         "the change asks for the look, so Apply must not leave an unread dot"
     );
 
-    emit(&bus, child, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        child,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     assert!(!read_requested(&pool, child).await);
 
     pool.close().await;
@@ -316,8 +400,6 @@ fn withheld(reason: crate::engine::thread_events::UnproposedReason) -> ThreadEve
     }
 }
 
-/// Work held for a missing harden lists the thread in Blocked, so it replaces
-/// the request too.
 #[tokio::test]
 async fn work_held_for_a_harden_drops_the_request() {
     let (pool, db_name) = setup_test_db().await;
@@ -336,8 +418,6 @@ async fn work_held_for_a_harden_drops_the_request() {
     teardown_test_db(&db_name).await;
 }
 
-/// Other held work lists the thread in neither Review nor Blocked. Dropping
-/// the request would hide the reply, so it stays.
 #[tokio::test]
 async fn work_held_for_any_other_reason_keeps_the_request() {
     let (pool, db_name) = setup_test_db().await;
@@ -398,8 +478,6 @@ async fn archive_state(pool: &PgPool, thread_id: Uuid) -> String {
         .unwrap()
 }
 
-/// An unattended trigger run stays archived, unless it asked to be read. Then
-/// its turn end lands it in the inbox, where Review lists it.
 #[tokio::test]
 async fn a_trigger_run_that_asks_lands_in_the_inbox() {
     let (pool, db_name) = setup_test_db().await;
@@ -407,13 +485,20 @@ async fn a_trigger_run_that_asks_lands_in_the_inbox() {
 
     let quiet = Uuid::new_v4();
     start_trigger_run(&bus, quiet).await;
-    emit(&bus, quiet, ThreadEvent::ThreadReadNotRequested).await;
+    emit(&bus, quiet, no(false)).await;
     emit_reply(&bus, quiet, "Nothing new today.").await;
     assert_eq!(archive_state(&pool, quiet).await, "archived");
 
     let found = Uuid::new_v4();
     start_trigger_run(&bus, found).await;
-    emit(&bus, found, ThreadEvent::ThreadReadRequested).await;
+    emit(
+        &bus,
+        found,
+        ThreadEvent::ThreadReadRequested {
+            parent_report: false,
+        },
+    )
+    .await;
     emit_reply(&bus, found, "Three new invoices arrived.").await;
     assert_eq!(archive_state(&pool, found).await, "inbox");
     assert!(read_requested(&pool, found).await);

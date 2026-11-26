@@ -1,6 +1,3 @@
-//! The bounded channel from `log!` to the writer thread, and the two rotated
-//! segments the thread appends to.
-
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,23 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use super::{sanitize, Line};
 
-/// Lines waiting for the writer. A full channel drops the line rather than
-/// block the logger.
 pub const CHANNEL_CAPACITY: usize = 4096;
 
-/// A segment rotates before it would pass this size.
 pub const SEGMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The segment the writer appends to.
 pub const FILE_NAME: &str = "diagnostic-log.jsonl";
 
-/// The one older segment kept.
 pub const ROTATED_FILE_NAME: &str = "diagnostic-log.jsonl.1";
 
-/// The label of a record the writer adds itself.
 const OWN_LABEL: &str = "DiagnosticLog";
 
-/// One `log!` call, on its way to the writer.
 pub enum Entry {
     Record(Pending),
     Flush(std::sync::mpsc::Sender<()>),
@@ -64,10 +54,8 @@ impl Pending {
     }
 }
 
-/// One line of the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
-    /// RFC 3339 in UTC, to the millisecond.
     pub ts: String,
     pub pid: u32,
     pub label: String,
@@ -96,14 +84,12 @@ impl Record {
     }
 }
 
-/// The logger's end of the channel.
 pub struct Sink {
     tx: SyncSender<Entry>,
     dropped: Arc<AtomicU64>,
 }
 
 impl Sink {
-    /// Wait only for already queued records, bounded even if the disk stalls.
     pub fn flush(&self, timeout: std::time::Duration) -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
         self.tx.try_send(Entry::Flush(tx)).is_ok() && rx.recv_timeout(timeout).is_ok()
@@ -116,8 +102,6 @@ impl Sink {
         }
     }
 
-    /// Hand a line to the writer without waiting, bounded first so the queue
-    /// stays bounded in bytes too. A full channel counts the line as dropped.
     pub fn record(&self, label: &'static str, msg: String) {
         let (msg, cut) = sanitize::bound_raw(msg);
         let entry = Entry::Record(Pending {
@@ -133,7 +117,6 @@ impl Sink {
     }
 }
 
-/// A sink and the receiver its writer drains.
 pub fn channel(capacity: usize) -> (Sink, Receiver<Entry>, Arc<AtomicU64>) {
     let (tx, rx) = sync_channel(capacity);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -144,7 +127,6 @@ pub fn channel(capacity: usize) -> (Sink, Receiver<Entry>, Arc<AtomicU64>) {
     (sink, rx, dropped)
 }
 
-/// Create `dir` if needed, and refuse it when it is a symlink or no directory.
 pub fn ensure_real_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     if std::fs::symlink_metadata(dir)?.is_dir() {
@@ -157,7 +139,6 @@ pub fn ensure_real_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Open a file without following a symlink at its last component.
 pub fn open_no_follow(path: &Path, options: &mut std::fs::OpenOptions) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -178,7 +159,6 @@ fn open_for_append(path: &Path) -> io::Result<File> {
     open_no_follow(path, &mut options)
 }
 
-/// The current segment, open for appending, and the rotation into `.1`.
 pub struct Segments {
     dir: PathBuf,
     file: File,
@@ -197,8 +177,6 @@ impl Segments {
         })
     }
 
-    /// Append one classified record synchronously. The caller must have
-    /// exclusive ownership of the segments, including during `open`.
     pub fn append_line(&mut self, label: &'static str, line: Line) -> io::Result<()> {
         let record = Pending::classified(label, line).into_record();
         let mut bytes = serde_json::to_vec(&record)?;
@@ -218,22 +196,17 @@ impl Segments {
         Ok(())
     }
 
-    /// Whether someone deleted the open segment, so appends would land where
-    /// no reader looks.
     #[cfg(unix)]
     fn unlinked(&self) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
         Ok(self.file.metadata()?.nlink() == 0)
     }
 
-    /// Lucidos ships no Windows build. This arm only keeps the crate compiling.
     #[cfg(not(unix))]
     fn unlinked(&self) -> io::Result<bool> {
         Ok(false)
     }
 
-    /// Rename replaces a symlink at `.1` rather than writing through it. A
-    /// segment already gone needs no rename.
     fn rotate(&mut self) -> io::Result<()> {
         ensure_real_dir(&self.dir)?;
         match std::fs::rename(self.dir.join(FILE_NAME), self.dir.join(ROTATED_FILE_NAME)) {
@@ -251,8 +224,6 @@ impl Segments {
     }
 }
 
-/// The writer thread's loop: sanitize, serialize and append each entry until
-/// every sink is gone. A count of dropped lines goes in before the next entry.
 pub fn drain(rx: Receiver<Entry>, mut segments: Segments, dropped: &AtomicU64) {
     let mut failing = false;
     for entry in rx {
@@ -276,8 +247,6 @@ pub fn drain(rx: Receiver<Entry>, mut segments: Segments, dropped: &AtomicU64) {
         records.push(entry.into_record());
         let mut bytes = Vec::new();
         for record in &records {
-            // A `Record` holds only strings and a number, so it always
-            // serializes.
             if serde_json::to_writer(&mut bytes, record).is_ok() {
                 bytes.push(b'\n');
             }
@@ -286,8 +255,6 @@ pub fn drain(rx: Receiver<Entry>, mut segments: Segments, dropped: &AtomicU64) {
             Ok(()) => failing = false,
             Err(e) if !failing => {
                 failing = true;
-                // Raw stderr, not `log!`: a `log!` here would feed the
-                // failing writer its own error. Once per failure streak.
                 crate::stderr::host_error(&format!(
                     "[DiagnosticLog] cannot append to the diagnostic log: {e}"
                 ));

@@ -1,13 +1,7 @@
-//! *Built-in widgets*: the reusable widgets Lucidos ships in `system-widgets/`
-//! (ADR 0415). Read-only from every surface, resolved and staged like
-//! `system-knowhow/`, and updated with each release.
-
 use std::path::{Path, PathBuf};
 
 use crate::core::shipped_dir::{resolve_shipped_dir, ShippedDir};
 
-/// The literal behind [`BUILT_IN_WIDGET_PREFIX`], for messages built with
-/// `concat!`.
 macro_rules! built_in_widget_prefix {
     () => {
         "lucidos-"
@@ -15,11 +9,8 @@ macro_rules! built_in_widget_prefix {
 }
 pub(crate) use built_in_widget_prefix;
 
-/// Every built-in widget's id starts with this, and no workspace app may take
-/// a new id that does.
 pub const BUILT_IN_WIDGET_PREFIX: &str = built_in_widget_prefix!();
 
-/// The shipped `system-widgets/` directory, as a bundle resource.
 pub const SYSTEM_WIDGETS_DIR: ShippedDir = ShippedDir {
     name: "system-widgets",
     env_var: "LUCIDOS_SYSTEM_WIDGETS_DIR",
@@ -27,8 +18,6 @@ pub const SYSTEM_WIDGETS_DIR: ShippedDir = ShippedDir {
     degrades: "every built-in widget is missing (a lucidos- widget answers \"No widget exists\")",
 };
 
-/// Resolve the shipped `system-widgets/` directory at boot. See
-/// [`resolve_shipped_dir`] for the order and the warnings.
 pub fn resolve_system_widgets_dir(
     env_value: Option<&str>,
     repo_root: &Path,
@@ -37,7 +26,6 @@ pub fn resolve_system_widgets_dir(
     resolve_shipped_dir(&SYSTEM_WIDGETS_DIR, env_value, repo_root, is_packaged)
 }
 
-/// Whether an id has the shape of a built-in widget's.
 pub fn has_built_in_prefix(app_id: &str) -> bool {
     app_id.starts_with(BUILT_IN_WIDGET_PREFIX)
 }
@@ -47,7 +35,6 @@ mod tests {
     use super::*;
     use crate::core::{AppKind, AppManager};
 
-    /// The `#rrggbb` colours an SVG names.
     fn hex_colours(svg: &str) -> std::collections::BTreeSet<&str> {
         svg.match_indices("\"#")
             .filter_map(|(at, _)| svg.get(at + 1..at + 8))
@@ -71,8 +58,6 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../system-widgets")
         }
 
-        /// What ships must load as what the ADR promises: a reusable widget under
-        /// a `lucidos-` id, with an `index.html` to serve.
         #[test]
         fn every_shipped_built_in_is_a_reusable_widget_with_a_prefixed_id() {
             let ws = tempfile::tempdir().unwrap();
@@ -102,8 +87,6 @@ mod tests {
             }
         }
 
-        /// Every built-in draws its icon in the host glyph style that
-        /// `.claude/rules/system-widgets.md` sets out, in one hue they all share.
         #[test]
         fn every_built_in_icon_follows_the_host_glyph_style() {
             let ws = tempfile::tempdir().unwrap();

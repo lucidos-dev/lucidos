@@ -441,7 +441,7 @@
       "group": "marks",
       "kind": "color",
       "label": "Claude mark",
-      "description": "The Claude logo on chat actor chips, in navigation history and in drawer rows with agent brand colours On. Follows --initiator-coding-agent by default.",
+      "description": "The Claude logo on chat actor chips, in navigation history and and in drawer rows when Agent icon colors is Brand. Follows --initiator-coding-agent by default.",
       "frames": false,
       "default": {
         "dark": "var(--initiator-coding-agent)",
@@ -453,11 +453,35 @@
       "group": "marks",
       "kind": "color",
       "label": "Codex mark",
-      "description": "The Codex logo on chat actor chips, in navigation history and in drawer rows with agent brand colours On. Follows the primary text colour by default.",
+      "description": "The Codex logo on chat actor chips, in navigation history and and in drawer rows when Agent icon colors is Brand. Follows the primary text colour by default.",
       "frames": false,
       "default": {
         "dark": "var(--text-primary)",
         "light": "var(--text-primary)"
+      }
+    },
+    {
+      "name": "--agent-icon-theme",
+      "group": "marks",
+      "kind": "color",
+      "label": "Agent icon, Theme look",
+      "description": "Every agent icon in the drawer, the thread pane and navigation history when Agent icon colors is Theme. Follows the accent colour by default.",
+      "frames": false,
+      "default": {
+        "dark": "var(--accent)",
+        "light": "var(--accent)"
+      }
+    },
+    {
+      "name": "--agent-icon-muted",
+      "group": "marks",
+      "kind": "color",
+      "label": "Agent icon, Muted look",
+      "description": "Every agent icon in the drawer, the thread pane and navigation history when Agent icon colors is Muted. Follows the muted text colour by default.",
+      "frames": false,
+      "default": {
+        "dark": "var(--text-muted)",
+        "light": "var(--text-muted)"
       }
     },
     {

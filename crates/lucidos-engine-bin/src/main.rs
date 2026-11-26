@@ -12,17 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 
-/// How long a stopping engine may take before it exits regardless.
-///
-/// Its owner lock holds every successor until this process is gone, so a hung
-/// teardown must not last forever. Past the shell launcher's 15 s force-kill,
-/// which therefore still decides on that path.
 const TEARDOWN_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Run `on_expiry` once `deadline` has passed since the stop signal.
-///
-/// A plain thread rather than a tokio task, so a wedged runtime cannot hold it
-/// back. Exit code 0, because the engine was asked to stop and is stopping.
 fn arm_teardown_deadline(deadline: Duration, on_expiry: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
         std::thread::sleep(deadline);
@@ -34,12 +25,10 @@ fn arm_teardown_deadline(deadline: Duration, on_expiry: impl FnOnce() + Send + '
     });
 }
 
-/// How long open HTTP connections get to finish once the engine stops
-/// serving, on the TCP listeners and the engine socket alike.
 const HTTP_DRAIN: Duration = Duration::from_secs(10);
 
 async fn shutdown_signal(
-    handle: axum_server::Handle,
+    handles: Vec<axum_server::Handle>,
     socket_drain: tokio::sync::watch::Sender<bool>,
     engine: SharedEngine,
     scheduler: Arc<tokio::sync::Mutex<SchedulerManager>>,
@@ -50,9 +39,6 @@ async fn shutdown_signal(
             .expect("failed to install Ctrl+C handler");
     };
 
-    // Legitimate stop signal. SIGUSR1 rather than SIGTERM, so a stray `kill`
-    // from a coding-agent subprocess test cannot take the engine down. Every
-    // legitimate stop path (web-dev.sh, stop.sh, /api/v1/restart) sends SIGUSR1.
     #[cfg(unix)]
     let usr1 = async {
         signal::unix::signal(signal::unix::SignalKind::user_defined1())
@@ -64,10 +50,6 @@ async fn shutdown_signal(
     #[cfg(not(unix))]
     let usr1 = std::future::pending::<()>();
 
-    // SIGTERM ignorer. With no installed handler the kernel takes the default
-    // action, so a test script that `xargs kill`s the engine's pid still kills
-    // it. This handler logs and loops instead. Leaked deliberately: it must
-    // live for the rest of the process.
     #[cfg(unix)]
     let _sigterm_ignorer = tokio::spawn(async {
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -90,70 +72,29 @@ async fn shutdown_signal(
     log_legacy!("\n[Shutdown] Shutting down gracefully...");
     arm_teardown_deadline(TEARDOWN_DEADLINE, || std::process::exit(0));
 
-    // Open the teardown. Two things happen here, and both must happen before
-    // any cleanup event is emitted:
-    //
-    // 1. The engine is marked shutting down, which stops every trigger fire
-    //    from starting and stops an event-wait resolution opening a new turn.
-    //    The sweeps below emit terminator events that fan out to triggers,
-    //    and a cron slot can come due mid-teardown. Either fire's script
-    //    would then call back into the HTTP API being torn down.
-    // 2. The teardown's ACTOR is decided once, for every emit inside it. A
-    //    device actor means a user asked for this, and yields "You"
-    //    attribution plus auto-resume on the next boot. `None` means nobody
-    //    did, and yields System attribution plus a manual Continue.
     let teardown_actor = engine.begin_teardown();
 
-    // The main check's child runs in its own process group, so nothing else
-    // here stops it. Its cleanup cancels a GitHub run and deletes a branch,
-    // which takes seconds, so it starts now and runs beside the sweeps below.
-    // The next start abandons the check it was running.
     let main_check_stopped = {
         let engine = engine.clone();
         tokio::spawn(async move { engine.stop_main_check().await })
     };
 
-    // Emit the boundary "Switched to new version" and abort events at real
-    // teardown, never at switch-request time. Nothing may show "Switched" while
-    // the old engine is still alive through a dev rebuild.
-    //
-    // Runs BEFORE the session sweeps, so its `external_terminal_emitted` flags
-    // suppress their duplicate emits. Those sweeps read the same actor back off
-    // the engine, so a thread that became in-flight after this snapshot gets
-    // the same verdict.
     engine.abort_in_flight_for_restart(teardown_actor).await;
 
-    // Record every background task this process is about to kill, while its
-    // buffered output still exists. `is_shutting_down` already holds, set by
-    // `begin_teardown` above, so the event-wait dispatcher declines to open a
-    // turn on an engine that is leaving.
-    //
-    // AFTER the boundary emits, not before, because this one blocks: it kills
-    // each child and waits for the reap. The supervisor force-kills the whole
-    // shutdown at 15 s, and a device-attributed `ResponseAborted` that misses
-    // that window costs every in-flight thread its auto-resume. The tail of a
-    // background log is not worth that, so the durable emits go first.
-    //
-    // The boot sweep is the floor under this, for the deaths no hook sees.
     engine.settle_running_background_tasks_at_teardown().await;
 
-    // Must happen before HTTP shutdown, so the event bus can still persist the
-    // CodingAgentIdled events that carry each session id.
     engine.shutdown_agent_sessions().await;
     engine.shutdown_active_threads().await;
 
-    handle.graceful_shutdown(Some(HTTP_DRAIN));
+    for handle in handles {
+        handle.graceful_shutdown(Some(HTTP_DRAIN));
+    }
     socket_drain.send_replace(true);
 
-    // Avoid orphaning Chrome.
     engine.shutdown_browser().await;
 
-    // Same reason, for the frontend preview's Vite. It has its own process
-    // group, so nothing else on this path reaches it, and a leaked one holds
-    // its port against the successor's preview.
     engine.stop_frontend_preview().await;
 
-    // And for the MCP server children, which nothing else on this path stops.
     shutdown_mcp_servers(&engine).await;
 
     if let Err(e) = main_check_stopped.await {
@@ -167,17 +108,6 @@ async fn shutdown_signal(
     log_legacy!("[Shutdown] Shutdown complete.");
 }
 
-/// Stop every running MCP server child, so none of them outlives this engine.
-///
-/// The only other teardown is `Drop for McpClient`, and the supervisor's 15 s
-/// force-kill runs no destructor. An orphaned server then keeps its memory and
-/// its upstream connections, and the successor engine starts a second copy of
-/// it, once per restart. The Chrome and Vite sweeps beside the call site cover
-/// their children for the same reason.
-///
-/// Concurrent, because one stop waits out a 3 s grace for the server's process
-/// group, then up to 3 s more on the server itself. Run in turn, a few servers
-/// would spend the whole shutdown budget.
 async fn shutdown_mcp_servers(engine: &SharedEngine) {
     let running: Vec<String> = match engine.mcp_manager.list_servers().await {
         Ok(servers) => servers
@@ -205,11 +135,8 @@ async fn shutdown_mcp_servers(engine: &SharedEngine) {
     .await;
 }
 
-// Machine-readable version/build probes are the CLI output exception.
 #[allow(clippy::print_stdout)]
 fn metadata_probe() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Handled before any heavy startup. Bare `println!` rather than `log!`,
-    // because tooling parses this and the `log!` prefix would break callers.
     if std::env::args()
         .skip(1)
         .any(|a| a == "--version" || a == "-V")
@@ -222,12 +149,6 @@ fn metadata_probe() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         return Ok(true);
     }
 
-    // A running engine forks the on-disk binary with this flag to compare build
-    // ids, which is the dev "new version available" check. Bare `println!`:
-    // machine-read stdout, so no `log!` prefix.
-    //
-    // `--source-state` rides on `--build-id` so a binary that predates it
-    // prints its id and exits, rather than booting an engine on an unknown flag.
     if std::env::args().skip(1).any(|a| a == "--build-id") {
         if std::env::args().skip(1).any(|a| a == "--source-state") {
             let state = build_runtime()?
@@ -254,11 +175,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Packaging gate, run by the DMG build against the just-signed binary. It
-    // compiles a tiny Wasm module and calls it. That call is what the macOS
-    // hardened runtime kills when the engine may not execute code it compiled
-    // itself. Exits before any engine construction, so it needs no database, no
-    // workspace and no network.
     if std::env::args().skip(1).any(|a| a == "--wasm-selftest") {
         return match build_runtime()?.block_on(lucidos_engine::jit_selftest()) {
             Ok(()) => {
@@ -269,25 +185,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
     }
 
-    // The workspace gateway is the standalone `lucidos-gateway` binary (ADR
-    // 0014 §1). A stray `--gateway` flag is a misconfiguration: fail loudly,
-    // rather than silently booting one engine on the gateway's port.
     if std::env::args().skip(1).any(|a| a == "--gateway") {
         return Err("`--gateway` was removed from lucidos-engine; run the \
                     `lucidos-gateway` binary instead (ADR 0014)"
             .into());
     }
 
-    // One-shot restore subcommand. The gateway cannot link the engine crate
-    // (ADR 0014 §1). It shells out to this binary instead, to restore a local
-    // backup archive into a workspace it already provisioned. The engine it
-    // then spawns runs migrations at construction, upgrading an older-schema
-    // restore.
     if std::env::args().nth(1).as_deref() == Some("restore-archive") {
         return build_runtime()?.block_on(lucidos_engine_boot::restore_archive::run());
     }
 
-    // Offline snapshot installation never constructs an Engine or dispatches work.
     {
         use lucidos_engine_boot::snapshot::{Arguments, Command};
 
@@ -304,25 +211,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // The two ways out of a boot the secret store refused (ADR 0509).
     if std::env::args().nth(1).as_deref() == Some("secrets") {
         return build_runtime()?.block_on(lucidos_engine_boot::secrets::run());
     }
 
-    // Boots this binary against a copy of the workspace database. The dev
-    // build runs it before publishing the binary.
     if std::env::args().nth(1).as_deref() == Some("preflight") {
         return build_runtime()?.block_on(run_preflight());
     }
 
-    // Before the runtime starts any thread: this edits the environment.
     lucidos_agents_api::api::gateway_stamp::take_stamp_key_from_starter();
     build_runtime()?.block_on(run())
 }
 
-/// `lucidos-engine preflight`, against the database in `DATABASE_URL` and the
-/// workspace in `LUCIDOS_WORKSPACE`. Exits non-zero, with the reason on stderr,
-/// when a boot of this binary on that data would fail.
 async fn run_preflight() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use lucidos_engine::core::secret_store::key_store;
 
@@ -342,35 +242,12 @@ async fn run_preflight() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     Ok(())
 }
 
-/// What this engine will bind, resolved from env, `network.toml` and the
-/// per-workspace preference.
-///
-/// SECURITY: the bind resolves loopback-first, and `net_config` owns the whole
-/// precedence order. With nothing set the default is loopback-only. A malformed
-/// value fails safe to loopback, never to all-interfaces.
-///
-/// The all-interfaces case binds `[::]`, and macOS defaults IPV6_V6ONLY=0 so
-/// that serves IPv4 too. A packaged gateway engine sets
-/// `LUCIDOS_BIND_LOOPBACK=1`, pinning it to loopback behind the proxy.
-///
-/// Called before the router is built, because the answer decides whether that
-/// router requires a credential (`api::local_auth`). A wide bind no longer
-/// means an unauthenticated API. It does mean a browser must come through the
-/// gateway rather than straight to this port.
 async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
     let loopback_signal = std::env::var("LUCIDOS_BIND_LOOPBACK")
         .is_ok_and(|v| lucidos_engine::core::prefs::env_switch_is_on(&v));
     let bind_addr_env = std::env::var("LUCIDOS_BIND_ADDR").ok();
     let bind_all_env = std::env::var("LUCIDOS_BIND_ALL").ok();
     let net = net_config::read_network_toml();
-    // The per-workspace bind only matters when engines do NOT inherit the
-    // gateway bind; read it from this workspace's DB then.
-    //
-    // A read that could not RUN is not the same answer as an unset setting, the
-    // same distinction the Vertex startup preference read makes. Both fall back the same
-    // way, and only one of them says so. A silent fallback reads as "you never
-    // chose a bind". A transient DB error then sends the user hunting a
-    // connection refused on the address they did choose.
     let per_workspace_bind = if !loopback_signal && !net.engine_inherit {
         match lucidos_engine::core::prefs::NETWORK_BIND
             .try_stored(engine.pool())
@@ -399,17 +276,6 @@ async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
     )
 }
 
-/// Become this workspace's one engine, waiting for any predecessor to exit.
-///
-/// The owner lock is the whole mechanism. A respawn signals the old engine and
-/// spawns this one at once. So the old one may still be emitting its teardown
-/// boundary and draining its sessions. The kernel releases its lock only when
-/// its process is gone. So no migration, listener, relay or recovery here can
-/// overlap it, however slow its drain (ADR 0438).
-///
-/// Only the holder publishes `engine.pid`, which is what lets every reader trust
-/// the pid while the lock is held. While it waits, this engine names itself
-/// under the successor lock instead, so a stop that lands mid-respawn finds it.
 async fn own_workspace(
     workspace: &std::path::Path,
 ) -> std::io::Result<lucidos_owner_lock::OwnerLock> {
@@ -428,8 +294,6 @@ async fn own_workspace(
                 OwnerLock::acquire(&lock_path)?
             }
         };
-        // Named as the owner before the successor lock lets go, so no stop
-        // landing in between finds neither.
         lock.publish_pid(&engine::pid_path(&workspace))?;
         drop(successor);
         log_legacy!("[Startup] Acquired the workspace's owner lock");
@@ -440,13 +304,9 @@ async fn own_workspace(
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // First, before any wait: it names the binary this engine started from, the
-    // baseline the CLI pin checks a later publish against.
     let launched_as = lucidos_engine::runtime::lucidos_cli::launch_file_id();
-    // Before any TLS use, and before anything that might reach the network.
     lucidos_engine::net_config::install_crypto_provider();
 
-    // Before anything spawns: no child may inherit the engine's database.
     lucidos_engine::core::load_database_environment();
 
     lucidos_engine_boot::host_setup::prepare();
@@ -468,13 +328,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
     lucidos_home::ensure_storage_root(&workspace_path)?;
     log_legacy!("[Startup] Using workspace: {}", workspace_path.display());
-    // Before the wait for a predecessor, which still holds its own consumer
-    // lock, so the build-watch never sees a moment with no consumer.
     if let Some(static_dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
         lucidos_engine::engine::register_as_build_watch_consumer(std::path::Path::new(&static_dir));
     }
-    // Held as a `run()` local for this engine's whole life. Nothing stateful
-    // may run before it: see `own_workspace`.
     let _owner_lock = own_workspace(&workspace_path).await?;
     let boot_database_url = lucidos_engine::core::database_url();
     let restore_boot =
@@ -483,9 +339,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         {
             None
         } else {
-            // Resolve registry authority before opening even a restricted pool.
-            // The capability borrows workspace ownership and retains the archive
-            // lock through verification, generation installation and settlement.
             let guard = lucidos_engine::core::snapshot::first_boot::RestoreBoot::acquire(
                 &_owner_lock,
                 &workspace_path,
@@ -499,34 +352,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             pool.close().await;
             Some(verified)
         };
-    // Eager, so the CLI is fixed before the first spawn and a publish minutes
-    // later cannot give subprocesses a newer CLI than this engine.
     lucidos_engine::runtime::lucidos_cli::pin_cli_for_workspace(&workspace_path, launched_as);
-    // Resolved now, while the workspace path is at hand, and bound only once
-    // the router can answer: a socket bound early would queue the gateway's
-    // requests against an engine still booting, instead of refusing them.
     let socket_path = lucidos_engine_socket::path_for(&workspace_path).inspect_err(|e| {
         log_legacy!("[Startup] this workspace has no engine socket: {e}");
     })?;
-    // Names the keep-awake assertion, so `pmset -g assertions` tells one
-    // workspace's engine from another's.
     if let Some(name) = workspace_path.file_name().and_then(|n| n.to_str()) {
         lucidos_engine::core::keep_awake::set_workspace(name);
     }
 
-    // Point the embedding-model cache at the shared per-user directory unless
-    // something already chose one. See ADR 0061. Runs BEFORE
-    // `apply_to_process_env` below, so a value the user stored in Settings
-    // still wins.
     lucidos_engine::memory::apply_default_cache_dir(&workspace_path);
 
-    // Every price the engine reads merges this workspace's override.
     lucidos_engine::llm::model_prices::read_overrides_from(workspace_path.clone());
 
-    // Upgrade a legacy `apis.json` to the pipeline shape. Idempotent, and it
-    // writes a backup first. NOT fatal: an `Err` here is the filesystem or
-    // the JSON parser saying no, and the config load below reports what it
-    // then refuses. See ADR 0135.
     match lucidos_agents_api::api::proxy_migration::migrate_apis_json_if_needed(&workspace_path) {
         Ok(lucidos_agents_api::api::proxy_migration::MigrationOutcome::Migrated {
             backup_path,
@@ -540,14 +377,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => log_legacy!("[Startup] apis.json migration skipped: {}", e),
     }
 
-    // Read the config once here so a refused entry is named in the startup
-    // log, then hand the list on. The proxy routes re-read the same file per
-    // request, so this call adds no authority, only timing. The announce
-    // cannot happen yet: there is no EventBus until `LucidosEngine::new`.
     let proxy_load = lucidos_agents_api::api::load_proxy_config(&workspace_path);
-    // Trust on first sight, once per workspace: a handshake that worked before
-    // ADR 0144 keeps working, and every later start refuses a script nobody
-    // authored. `seed_if_absent` will not run twice.
     let seeded_handshake_scripts = match lucidos_engine::core::handshake_approvals::seed_if_absent(
         &workspace_path,
         &proxy_load.handshake_seed_entries(),
@@ -564,8 +394,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             path
         );
     }
-    // Read before `rejected` is moved out below: only the map is kept, not the
-    // whole config.
     let configured_credential_scopes = proxy_load.credential_scopes();
     let proxy_config_rejections = proxy_load.rejected;
     for rejected in &proxy_config_rejections {
@@ -591,11 +419,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let provider_ctx =
         lucidos_engine_boot::provider_context::build_provider_context(&database_url).await;
 
-    // Deliberately NO catch-all boot-failure report here. A reported failure is
-    // terminal and stops the gateway respawning, while construction fails for
-    // plenty of transient reasons the supervisor's retry recovers from. Only a
-    // CLASSIFIED-terminal failure reports, from the site that can classify it:
-    // see `boot_failure::terminal_migration_message`.
     let agent_host = Arc::new(lucidos_agents_api::engine::agent_recovery::EngineAgentHost);
     let engine = lucidos_engine_boot::construction::construct_engine(
         workspace_path.clone(),
@@ -609,17 +432,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log_legacy!("[Startup] PostgreSQL connected");
     boot_stages.lap("engine setup");
 
-    // Retire the legacy per-workspace `data/.env` into the
-    // environment_variables table. Needs the DB and its migrations, and is
-    // self-idempotent because the file is gone afterwards.
     lucidos_engine::core::environment_variables::migrate_env_file_to_db(
         engine.pool(),
         &engine.event_bus,
         &workspace_path,
     )
     .await;
-    // Move the pre-ADR-0390 chat tier onto the model the workspace chats with.
-    // Rust rather than SQL, since an unset `chat_model` runs `LUCIDOS_MODEL`.
     lucidos_engine::core::PreferenceStore::move_legacy_chat_effort(
         engine.pool(),
         &engine.event_bus,
@@ -629,27 +447,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::core::PreferenceStore::replace_retired_values(engine.pool(), &engine.event_bus)
         .await;
     engine.upgrade_chat_ladder_from_enabled().await;
-    // Apply stored env vars to the engine's OWN process env, so every
-    // engine-internal shell-out that inherits it sees them. Runs after the
-    // migration, so just-migrated vars are included. Reserved names are
-    // filtered, so engine-critical process vars are never clobbered.
     lucidos_engine::core::environment_variables::apply_to_process_env(engine.pool()).await;
-    // After the stored vars reach the env, so the sink masks their values. A
-    // failure leaves the query route answering `diagnostic_log_unavailable`.
     if let Err(e) = lucidos_engine::diagnostic_log::start(&workspace_path) {
         log_legacy!("[Startup] diagnostic log not started: {e}");
     }
 
-    // Tell the workspace about any `apis.json` entry the load refused above.
-    // The read happened before the DB was up, so this is the first point with
-    // an EventBus to announce it on. Silent when nothing was refused.
-    //
-    // TWO surfaces, because the SSE one cannot reach anybody from here. This
-    // runs long before `axum_server::bind`, and `/api/v1/events` hands a client
-    // the LIVE broadcast with no replay. So the event alone is sent to zero
-    // subscribers on every ordinary boot. The notification is the guaranteed
-    // half: the bus projects it into `notifications`, which the client polls
-    // whenever it connects. See ADR 0135.
     if !proxy_config_rejections.is_empty() {
         let summary = proxy_config_rejections
             .iter()
@@ -694,9 +496,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await;
     }
 
-    // Say once, loudly, which providers the engine will not vouch for. Same two
-    // surfaces and same reasoning as the rejection announce above: nothing is
-    // subscribed to SSE this early, so the notification is the half that lands.
     if !proxy_insecure_transports.is_empty() {
         let summary = proxy_insecure_transports
             .iter()
@@ -729,8 +528,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await;
     }
 
-    // A credential stored before the proxy checked scopes gets the one its own
-    // entry uses, once per workspace, and says so (ADR 0144).
     match lucidos_engine::core::CredentialStore::infer_undeclared_scopes(
         engine.pool(),
         &engine.event_bus,
@@ -746,9 +543,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => log_legacy!("[Startup] could not infer credential scopes: {}", e),
     }
 
-    // Same two surfaces as the rejection announce above, and for the same
-    // reason: nothing is subscribed to SSE this early, so the notification is
-    // the half that reaches the user. Silent when nothing was seeded.
     if !seeded_handshake_scripts.is_empty() {
         for path in &seeded_handshake_scripts {
             engine
@@ -795,18 +589,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await;
     }
 
-    // Extracted before the engine is wrapped in an Arc.
     let event_store = engine.event_store().clone();
     let embedder = engine.embedder().clone();
     let memory_index = engine.memory_index().clone();
 
     let shared_engine: SharedEngine = Arc::new(engine);
     shared_engine.set_self_arc(&shared_engine);
+    shared_engine.session_spawn_gate.hold();
+    let serving = shared_engine.session_spawn_gate.subscribe();
+    let event_hooks = Arc::new(lucidos_event_hooks::WorkspaceHooks);
+    let _ = shared_engine.event_hook_catalog.set(event_hooks.clone());
+    let asker = Arc::new(lucidos_event_hooks::WorkspaceHookAsker::new(
+        &shared_engine,
+        serving.clone(),
+    ));
+    if let Err(e) = shared_engine
+        .event_bus
+        .install_event_hook_asker(asker)
+        .await
+    {
+        log_legacy!("[Boot] The armed event hooks were not preloaded: {e}");
+    }
     lucidos_engine::engine::user_only_message_delivery::start(&shared_engine);
-    // Recovery below emits child terminals, and the fan-in turns each into a
-    // parent wake. Queue them until recovery is over, or the woken turn races
-    // the sweeps, which read it as a dead one. Released after the event-wait
-    // rebuild.
     shared_engine.event_bus.hold_parent_wakes();
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
@@ -817,65 +621,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_main_check_driver();
     shared_engine.start_standing_apply_resolver();
     lucidos_agents_api::engine::agent_recovery::start_archive_request_resolver(&shared_engine);
-    // The slot boots empty and the model is installed live once it lands, so
-    // boot never waits on a multi-hundred-MB download.
     shared_engine.spawn_embedder_load();
-    // The recovery sweeps below run before the HTTP server binds, so narrate
-    // them on the boot splash.
     lucidos_engine::boot_report::report(lucidos_engine::boot_report::RECOVERING);
     boot_stages.lap("pre-recovery setup");
 
-    // A respawn sidecar means the previous engine died unexpectedly, so record
-    // it in the audit timeline. Emits before recovery, so the timeline reads
-    // "supervisor respawn, then recovery". A missing sidecar is the common case.
     lucidos_engine::engine::supervisor_respawn_sidecar::emit_if_present(
         &workspace_path,
         &shared_engine.event_bus,
     )
     .await;
 
-    // Consume legacy grant files before a resumed session can spawn and
-    // freeze its `--allowedTools`.
     lucidos_engine::engine::permission::tool_grants::import_legacy_files(
         &shared_engine.event_bus,
         &shared_engine.grants_dir(),
     )
     .await;
-    // Auto-resolve permission cards orphaned by the previous engine's death.
-    // Must run before recovery: emitting Resolved flips status to 'running',
-    // which the recovery sweeps and the final settle then resolve.
     lucidos_agents_api::engine::agent_recovery::recover_orphan_cc_permission_requests(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
     .await;
-    // Same for the command-guard permission lane (ADR 0002): a chat turn parked
-    // on a CommandPermissionRequested is dead after restart, so clear the card.
     lucidos_engine::engine::command_permission::recover_orphan_command_permission_requests(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
     .await;
-    // Same for the chat MCP permission lane: a chat turn parked on an
-    // McpPermissionRequested is dead after restart, so clear the card.
     lucidos_engine::engine::mcp_permission::recover_orphan_mcp_permission_requests(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
     .await;
-    // A side question's answer was on its way to the previous process, so an
-    // ask it left unsettled can never be answered now.
     lucidos_agents_api::engine::agent_recovery::recover_unsettled_side_questions(&shared_engine)
         .await;
-    // Plugin staging and OAuth listeners lived in the previous engine's memory,
-    // so a form request resting on one can no longer be answered.
     lucidos_engine::engine::form_requests::expire_memory_backed_requests(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
     .await;
-    // A voice session died with the process holding its socket, so every
-    // unpaired start belongs to a call that is already over.
     lucidos_engine::voice::recovery::settle_orphan_voice_sessions(
         shared_engine.pool(),
         &shared_engine.event_bus,
@@ -883,10 +665,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     boot_stages.lap("orphan requests");
 
-    // Reset coding-agent threads stuck in 'waiting' with no pending proposal.
-    // Their sessions are dead after a restart, so there is nothing for the user
-    // to act on. Chat threads cannot reach 'waiting', so the
-    // `source='claude_code'` scope is defensive.
     if let Err(e) = sqlx::query(&format!(
         "UPDATE thread_summaries SET status = {}, coding_agent_is_external_repo = FALSE \
          WHERE status = {} AND coding_agent_change_state <> '{}' AND source = 'claude_code'",
@@ -900,8 +678,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log_legacy!("[Startup] Failed to reset orphaned waiting threads: {}", e);
     }
 
-    // One home thread per workspace, created before the router serves, so a
-    // client's first thread list already carries it (ADR 0411).
     if let Err(e) = lucidos_engine::engine::home_thread::ensure_home_thread(
         &shared_engine.event_bus,
         shared_engine.pool(),
@@ -911,28 +687,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log_legacy!("[Startup] Failed to create the home thread: {}", e);
     }
 
-    // Started BEFORE the recovery sweep below. Recovery broadcasts terminators
-    // this consumer must see to flip abandoned todos, and a tokio broadcast
-    // channel does not replay history for a late subscriber.
     lucidos_engine::engine::todo_consumer::spawn(shared_engine.clone());
     boot_stages.lap("summary resets");
 
-    // Before recovery spawns a session that writes a new one.
     lucidos_engine::runtime::claude_code::sweep_stale_session_files(shared_engine.workspace_path());
 
-    // Recover worktrees whose in-flight session an engine crash interrupted. An
-    // idle session stays idle, shown in the waiting UI for the user to act on.
     let recovering_threads =
         lucidos_agents_api::engine::agent_recovery::recover_orphaned_worktrees(&shared_engine)
             .await;
     boot_stages.lap("worktree recovery");
 
-    // Recover orphan `ToolCalled` events, left by an engine that died mid-tool.
-    // Without this the thread's next LLM call rebuilds an assistant `tool_use`
-    // block whose pair is missing, and the provider rejects the request.
-    //
-    // BEFORE the chat sweep: an archived thread qualifies only while it is
-    // still `running`, and the sweep's abort moves it off `running`.
     lucidos_agents_api::engine::agent_recovery::recover_orphan_tool_calls(&shared_engine).await;
     boot_stages.lap("orphan tool calls");
 
@@ -943,12 +707,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     boot_stages.lap("chat recovery");
 
-    // Settle every thread still `running`, now that each recovery sweep has
-    // had its turn. A turn the restart interrupted gets an abort event, and
-    // anything else goes to idle. No live turn exists yet, so nothing
-    // legitimate is settled: event-wait re-entries, the held child-completion
-    // wakes and switch resumes all start below. No thread leaves boot idle over a
-    // dead turn with no terminator, the state the client read as a crash.
     lucidos_agents_api::engine::agent_recovery::settle_orphaned_running_threads(
         shared_engine.pool(),
         &shared_engine.event_bus,
@@ -956,20 +714,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
-    // Then the trigger runs a restart cut off before any activity, whose
-    // `running` an event-less write already turned to `idle`. The settle above
-    // never sees them, and without an abort they stay in Current for good.
     lucidos_agents_api::engine::agent_recovery::settle_stranded_trigger_runs(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
     .await;
 
-    // Reconcile the three child counts in either drift direction. After the
-    // settle above, because a status write the settle makes directly reaches no
-    // in-tx reconcile, and this is what drops a dead child out.
-    // The query and its reasons live with the in-tx reconcile it must agree
-    // with, so the two cannot drift apart on what "in flight" means.
     if let Err(e) =
         lucidos_engine::engine::event_bus::EventBus::rebuild_children_counts(shared_engine.pool())
             .await
@@ -977,10 +727,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log_legacy!("[Startup] Failed to reconcile the child counts: {}", e);
     }
 
-    // Reconcile blocking_descendant_count, for the settle's direct `idle`
-    // writes and the `waiting` reset above, which bypass the projection's
-    // sampling wrapper. Without it a parent's Archive button can stay disabled
-    // forever, and its cascade never runs.
     if let Err(e) = lucidos_engine::engine::event_bus::EventBus::rebuild_blocking_descendant_count(
         shared_engine.pool(),
     )
@@ -992,21 +738,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    // A pending change from an unfinished turn goes back to unproposed work
-    // (ADR 0400). Before the two sweeps below: the reconcile then drops work
-    // whose worktree is gone, and the held-back sweep finds the reason set.
     lucidos_agents_api::engine::agent_recovery::withdraw_incomplete_pending_changes_on_startup(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
     .await;
 
-    // Reconcile each thread's branch work against on-disk git
-    // for every active coding-agent thread. Live updates flow through the
-    // change projection handlers, but a mid-turn commit does not, so this
-    // sweep is the authoritative reconciliation. It runs before the HTTP server
-    // serves SSE, because the Diff button must reflect git from the first
-    // connection.
     lucidos_agents_api::engine::agent_recovery::refresh_branch_work_on_startup(
         shared_engine.pool(),
         shared_engine.workspace_path(),
@@ -1014,38 +751,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     boot_stages.lap("has-diff sweep");
 
-    // Propose changes never surfaced at idle: an idle coding-agent thread with
-    // a committed branch diff but no pending change, or announce why not. A
-    // safety net for any missed idle settle, and a no-op in steady state,
-    // because `idle_change_write` already fires for every turn end.
-    lucidos_agents_api::engine::agent_recovery::propose_held_back_changes_on_startup(
-        shared_engine.pool(),
-        &shared_engine.event_bus,
-        shared_engine.workspace_path(),
-    )
-    .await;
+    let held_back_sweep_waits = !matches!(
+        shared_engine
+            .event_bus
+            .hooks_armed_on("ChangeProposed")
+            .await,
+        Ok(false)
+    );
+    if !held_back_sweep_waits {
+        lucidos_agents_api::engine::agent_recovery::propose_held_back_changes_on_startup(
+            shared_engine.pool(),
+            &shared_engine.event_bus,
+            shared_engine.workspace_path(),
+        )
+        .await;
+    }
 
-    // The mirror of the sweep above: a pending change that still EXISTS but
-    // whose branch diff has gone empty, so its card advertises files the Diff
-    // button no longer shows. The live idle path handles these as they happen;
-    // this catches rows that went stale while no session was running.
-    //
-    // Runs after the two sweeps above, so it sees rows they just refreshed, and
-    // before the HTTP server, so the first SSE payload is honest.
     lucidos_agents_api::engine::agent_recovery::reconcile_emptied_changes_on_startup(
         &shared_engine,
     )
     .await;
     boot_stages.lap("change reconcile");
 
-    // A batch a restart cut off between items names the items it never ran.
     lucidos_engine::engine::permission::batch::close_cut_off_batches_on_startup(
         &shared_engine.event_bus,
     )
     .await;
 
-    // Archived threads whose branch still holds work no change carries: set it
-    // aside so it stays reachable (ADR 0328). Git work, so off the boot path.
     {
         let engine = shared_engine.clone();
         tokio::spawn(async move {
@@ -1056,110 +788,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // A live thread with a change set aside before Hold existed goes on hold
-    // (ADR 0805).
     lucidos_engine::engine::thread_hold::hold_set_aside_changes(&shared_engine.event_bus, None)
         .await;
 
-    // Re-deliver parent-resume re-entries lost to the restart (ADR 0011). The
-    // in-memory channel was recreated empty above. So a blocking child that
-    // completed while the engine was down left a persisted ChildThreadCompleted
-    // with no resume fired.
-    //
-    // This re-injects those through the live path, into the parent wake hold,
-    // which drops a second wake for a card recovery already queued. Runs after
-    // the recovery sweeps, so a parent mid-resume when the engine died is
-    // recovered there rather than double-fired here.
     shared_engine
         .event_bus
         .refire_unprocessed_child_completions()
         .await;
 
-    // The event-wait dispatcher (ADR 0047). Order inside this block is
-    // load-bearing and each step is documented on its own method:
-    //
-    // 0. The re-entry consumer first of all: every path below hands its turn to
-    //    this task rather than awaiting it, so nothing resumes until it runs.
-    // 1. The subscriber next, so an event landing during the rebuild is either
-    //    matched live or caught by a watermark scan. Started after, it could be
-    //    missed by both.
-    // 2. The lost-re-entry sweep BEFORE the rebuild, and this order is
-    //    load-bearing rather than tidy. The sweep looks for a resolution whose
-    //    only successor is its own anchor, which is exactly the shape the
-    //    rebuild's catch-up scan *creates*: it persists the pair and hands the
-    //    turn to a task that will not write anything for hundreds of
-    //    milliseconds. Run after, the sweep re-drives every re-entry the rebuild
-    //    just queued and each recovered thread runs two turns. Run first, it sees
-    //    only the genuinely stranded resolutions from the previous process.
-    // 3. The rebuild last: re-derive every live wait from the event store
-    //    (there is no table) and run each catch-up scan. A match that landed
-    //    while the engine was down then still reaches its thread. A deadline
-    //    that passed expires loudly on the next sweep tick.
-    // 4. The abandoned-background-task sweep between steps 2 and 3, for the
-    //    reason stated at its own call site below.
-    // Recovery has read the keep-alive flags, and the dispatcher below starts
-    // the beats that set them again.
     shared_engine.event_bus.reset_keep_alive_turns().await;
     shared_engine.start_wait_reentry_consumer();
     shared_engine.start_event_wait_dispatcher();
     lucidos_agents_api::engine::agent_recovery::start_background_task_reaper(&shared_engine);
     shared_engine.refire_unresolved_wait_reentries().await;
 
-    // Settle the background tasks the last engine took down with it. A thread
-    // that ended a turn with background work running is subscribed to that
-    // task's `BackgroundBashCompleted`, and no process will ever emit it now.
-    //
-    // Wedged between the two steps around it, and both sides are load-bearing.
-    // AFTER the lost-re-entry sweep, whose predicate is "the anchor is the last
-    // event on this thread". This appends one, so running it first buries a
-    // stranded re-entry and the thread never runs its turn. BEFORE the rebuild,
-    // because its catch-up scan reads forward from each wait's watermark. That
-    // scan is what re-opens the thread at boot instead of at its own deadline.
-    //
-    // The dispatcher above cannot match this live: the rebuild has not run, so
-    // the cache holds no wait yet.
     shared_engine.settle_abandoned_background_tasks().await;
 
     shared_engine.rebuild_event_waits().await;
     boot_stages.lap("event waits");
 
-    // Recovery is over, so the parent wakes held since boot may run. After the
-    // rebuild on purpose: a parent that was itself waiting for the child has
-    // just had that wait resolved, and the fan-in then stands down for it.
     let released = shared_engine.event_bus.release_held_parent_wakes();
     if released > 0 {
         log_legacy!("[Startup] Released {released} parent wake(s) held during recovery");
     }
 
-    // A remote start the owner allowed whose turn never began. After the
-    // settles above, whose abort for a still-running thread must not hide it.
     lucidos_agents_api::engine::agent_recovery::begin_allowed_starts_on_startup(&shared_engine)
         .await;
 
-    // Rebuild the Apply-All batch registry from the durable table and resolve
-    // any batch the previous process abandoned mid-flight. Runs AFTER the agent
-    // recovery above and BEFORE `resume_pending_switches` below. A resume spawns
-    // asynchronously, so recovery reads the switch-resume queue to see that a
-    // member's conflict resolution is about to resume. After the drain the
-    // queue is empty and recovery would merge that resolution unfinished.
-    //
-    // Without it the registry comes back empty, no batch matches the eventual
-    // terminal event, and the frontend's "Applying changes" toast never clears.
     shared_engine.recover_apply_all_batches().await;
 
-    // Rebuild the landing lane's queue and resolving batch from events, and
-    // heal a landing a crash cut off. Same ordering rule as the batch recovery
-    // above: a member whose resume is queued is left to that resume.
     shared_engine.recover_landing_lane().await;
 
-    // Rebuild the main check from events. A check this restart cut off is
-    // abandoned, and a red's fix thread that never got its prompt gets it.
-    // The driver started earlier holds every landing until this arrives.
     shared_engine.recover_main_check();
 
-    // Re-take every standing apply's verdict against current state. A thread
-    // that settled while the engine was down gets its apply now, and one that
-    // failed gets its report. Same ordering rule as the batch recovery above.
     shared_engine.recover_standing_applies().await;
     boot_stages.lap("apply recovery");
 
@@ -1170,21 +831,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     lucidos_engine::engine::change_summary_consumer::spawn(shared_engine.clone());
     lucidos_engine::engine::pending_change_watch::spawn(shared_engine.clone());
-    // After permission and agent recovery, so its boot sweep sees which
-    // cards those sweeps closed.
     lucidos_engine::engine::card_queue::spawn(shared_engine.clone());
     lucidos_engine::engine::permission::words::spawn(shared_engine.clone());
     lucidos_engine::engine::summary_tree::spawn(shared_engine.clone());
     lucidos_agents_api::engine::agent_recovery::spawn_branch_work_net(shared_engine.clone());
-    // A handoff this engine's predecessor recorded and never acted on.
     lucidos_agents_api::engine::successor::start_pending_successor_sessions(shared_engine.clone())
         .await;
 
-    // Serve the last discovered Claude Code model list, and refresh it in the
-    // background when it is missing or stale.
     lucidos_agents_api::engine::agent_recovery::start_cc_model_discovery(&shared_engine).await;
 
-    // See `engine::worktree_cleanup` module docs.
     let cleanup_wake = std::sync::Arc::new(tokio::sync::Notify::new());
     lucidos_engine::engine::worktree_cleanup::WorktreeCleanup::spawn(
         shared_engine.pool().clone(),
@@ -1193,16 +848,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shared_engine.worktree_cleanup_active_threads(),
         cleanup_wake.clone(),
     );
-    // Its own task, so a stalled database cannot delay the low-disk alert.
     lucidos_engine::engine::worktree_cleanup::DiskMonitor::spawn(
         std::sync::Arc::new(shared_engine.event_bus.clone()),
         workspace_path.clone(),
         cleanup_wake,
     );
 
-    // The coding-agent spawn dispatcher. Every ContinuationRequested reaches it
-    // on the bus's directed channel, which exists from the bus's creation. Its
-    // outbound channel is what `start_spawn_request_consumer` below drains.
     let (_dispatcher_handle, spawn_request_rx) =
         lucidos_agents_api::engine::agent_recovery::SpawnDispatcher::spawn(
             shared_engine.pool().clone(),
@@ -1210,71 +861,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     shared_engine.start_spawn_request_consumer(spawn_request_rx);
 
-    // Keeps each summary's archivable sub-thread count current. Its first
-    // full recount runs on its own task, so boot does not wait for it.
     lucidos_agents_api::engine::agent_recovery::ArchivableCountWorker::spawn(
         shared_engine.pool().clone(),
         std::sync::Arc::new(shared_engine.event_bus.clone()),
     );
 
-    // Auto-resume the coding-agent threads recovery flagged for a user-initiated
-    // Switch to new version.
-    //
-    // A request emitted here waits on the bus's directed channel until the
-    // dispatcher drains it, so it cannot be lost to ordering.
-    //
-    // Crash-interrupted threads were NOT queued, so this never re-runs work
-    // that may have crashed the engine. The returned ids are what
-    // `settle_unresumed_switch_threads` must NOT touch, so they are held until
-    // that floor runs at the end of boot.
-    //
-    // This drains the queue, so `recover_apply_all_batches` and
-    // `recover_landing_lane` must stay above it.
     let mut resumed_switch_threads: std::collections::HashSet<uuid::Uuid> = shared_engine
         .resume_pending_switches()
         .await
         .into_iter()
         .collect();
 
-    // Scans agent_sessions from outside any per-thread `select!`, so a wedged
-    // event handler cannot starve it the way it starves the in-loop watchdog.
-    // Emits ContinuationRequested rather than ResponseAborted, so the
-    // dispatcher above auto-resumes with no user-visible "Aborted" terminal.
-    // See `engine::agent_session::external_watchdog`.
     let _watchdog_handle =
         lucidos_agents_api::engine::agent_recovery::spawn_external_watchdog(&shared_engine);
 
-    // Rebuild the Thread Queue's in-memory state BEFORE the scheduler starts.
-    // The scheduler is the first submission path to come alive, so loading the
-    // persisted backlog first keeps per-trigger FIFO intact across a restart.
-    // An admitted row whose thread already materialized hands off to the
-    // recovery above; an unbound trigger entry re-queues at most once.
     shared_engine.thread_queue.begin_boot_recovery();
     shared_engine.thread_queue.recover_persisted_entries().await;
 
-    // Admission reads user occupancy itself (ADR 0443). This subscriber only
-    // drains, and refreshes the panel, when a user thread starts or stops
-    // running, so a freed slot admits waiting work at once.
     shared_engine.thread_queue.spawn_drain_hint_subscriber();
 
-    // Chat parity of `resume_pending_switches` above: auto-resume the chat /
-    // trigger threads a user-initiated Switch to new version interrupted. Same
-    // cause gate as the coding-agent half (a device-attributed EngineShutdown
-    // teardown abort), so a crash still falls back to the manual Continue.
-    //
-    // It must follow `recover_orphan_tool_calls`, or the re-entered turn
-    // rebuilds an unpaired `tool_use` block.
     resumed_switch_threads.extend(
         lucidos_agents_api::engine::agent_recovery::resume_pending_chat_switches(&shared_engine)
             .await,
     );
 
-    // Boot floor (ADR 0045). Every *Switch to new version* promises the
-    // interrupted thread a resume, and the UI withholds its Continue button on
-    // the strength of that promise. Both drains above have had their turn, so
-    // anything still holding an unkept promise has it WITHDRAWN here, which
-    // hands the Continue affordance back. Runs before the API server accepts
-    // traffic, so the user never sees the gap.
     lucidos_agents_api::engine::agent_recovery::settle_agent_switch_threads(
         &shared_engine,
         &resumed_switch_threads,
@@ -1295,14 +905,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
-    // Only now: draining consults trigger pause and deletion state, which the
-    // scheduler's event replay just loaded.
     shared_engine.thread_queue.start_draining();
     boot_stages.lap("scheduler");
 
-    // Resolved BEFORE the router is built, because it decides whether the
-    // router carries a door (`api::local_auth`). The port it will be paired
-    // with is read further down, where the listener is set up.
     let bind_choice = resolve_bind_choice(&shared_engine).await;
 
     let started_at = chrono::Utc::now();
@@ -1316,31 +921,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         scheduler.clone(),
         started_at,
         &bind_choice,
-        Arc::new(lucidos_event_hooks::WorkspaceHooks),
+        event_hooks,
     );
     shared_engine.record_engine_version_activated().await;
-    // Dev-only: advance this engine's served-frontend snapshot to the
-    // checkout-shared `dist/` when that is safe. A PEER workspace then picks up
-    // another workspace's frontend-only Apply without a manual restart.
-    // Spawned after `create_router`, so the served handle is registered before
-    // the first tick. See
-    // `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
     let _served_frontend_sync = shared_engine.spawn_served_frontend_sync();
     let _version_status_watch = shared_engine.spawn_version_status_watch();
-    // Dev-only: reap a frontend preview a SIGKILLed predecessor left running,
-    // since that child outlives the engine that spawned it. Then watch for its
-    // worktree being reclaimed. See `engine::frontend_preview`.
     shared_engine.init_frontend_preview();
-    // Keep `/api/v1/health`'s `database_reachable` honest. An engine outlives
-    // its database, and without this the endpoint keeps reporting a healthy
-    // engine while every other request fails. Not dev-only: a packaged
-    // install's bundled Postgres can die too. See ADR 0037.
     let _db_health_probe = lucidos_engine_boot::db_health_probe::spawn(shared_engine.clone());
-    // One-shot, idempotent: rebuild `ContextCaptured` rows for the auxiliary
-    // model calls the engine made before it recorded them. Spawned rather
-    // than awaited, unlike the backfills above. Nothing reads these rows
-    // synchronously, so boot must not grow with the size of the events table.
-    // See `core::aux_context_backfill`.
     let aux_backfill = shared_engine.clone();
     tokio::spawn(async move {
         match lucidos_engine::core::aux_context_backfill::backfill_auxiliary_captures(
@@ -1357,11 +944,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err(e) => log_legacy!("[AuxContextBackfill] failed: {}", e),
         }
     });
-    // An unparseable value says so before falling back, the way a malformed
-    // `LUCIDOS_BIND_ADDR` does. Silently binding 3000 sends the user hunting a
-    // "connection refused" on the port they set. Blank counts as unset, as in
-    // `api::base_path::api_port`: a launcher exporting an empty shell variable
-    // asserted nothing.
     let api_port_env = std::env::var("LUCIDOS_API_PORT").ok();
     let api_port_raw = api_port_env
         .as_deref()
@@ -1374,17 +956,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         None => 3000,
     };
-    // Every address to listen on. A specific `Address` ALSO binds loopback, so
-    // the gateway probe, the dev scripts and the engine's own restart callback
-    // keep working over `127.0.0.1`. `addr` is the primary, used only for the
-    // startup log, and `bind_label` already notes the retained loopback.
     let addrs = net_config::bind_socket_addrs(&bind_choice, api_port);
-    let addr = addrs[0];
     let bind_label = net_config::bind_scope_label(&bind_choice);
 
     if !lucidos_engine::gateway_users::await_first_answer().await {
-        // Serving starts before the gateway named its users, so the list that
-        // arrives later is a change every reader must hear.
         let engine = shared_engine.clone();
         tokio::spawn(async move {
             lucidos_agents_api::api::announce_users_if_changed(
@@ -1395,10 +970,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // The gateway reaches this engine here, never on the TCP port (ADR 0445).
-    // Bound well after the owner lock, so removing a stale socket file can
-    // never unlink a live engine's. A failure stops the boot: a gateway could
-    // not reach an engine without it.
     let socket_listener = lucidos_engine_socket::bind(&socket_path).inspect_err(|e| {
         log_legacy!("[Startup] cannot bind the engine socket: {e}");
     })?;
@@ -1412,21 +983,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         HTTP_DRAIN,
     );
 
-    let handle = axum_server::Handle::new();
+    let handles: Vec<_> = addrs.iter().map(|_| axum_server::Handle::new()).collect();
+    if held_back_sweep_waits {
+        let engine = shared_engine.clone();
+        let mut serving = serving.clone();
+        tokio::spawn(async move {
+            if serving.wait_for(|serving| *serving).await.is_ok() {
+                lucidos_agents_api::engine::agent_recovery::propose_held_back_changes_on_startup(
+                    engine.pool(),
+                    &engine.event_bus,
+                    engine.workspace_path(),
+                )
+                .await;
+            }
+        });
+    }
     let shutdown = tokio::spawn(shutdown_signal(
-        handle.clone(),
+        handles.clone(),
         socket_drain,
         shared_engine.clone(),
         scheduler,
     ));
 
-    // The http/https decision is resolved in ONE place,
-    // `net_config::tls_scheme_from`. The branch below only loads the cert paths
-    // that decision implies.
-    //
-    // Trimmed at the read, because `tls_scheme_from` trims before deciding and
-    // `from_pem_file` does not. A padded path would otherwise pick https and
-    // then abort the boot on a file the user does have.
     let tls_cert = std::env::var("LUCIDOS_TLS_CERT")
         .ok()
         .map(|v| v.trim().to_string());
@@ -1437,52 +1015,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     boot_stages.lap("router");
     log_legacy!("[Startup] Boot stages: {}", boot_stages.summary());
 
-    // Serve every resolved address concurrently, sharing the one graceful-shutdown
-    // `Handle` so a single shutdown stops all sockets. A bind failure on any
-    // address fails fast (same as the prior single-bind semantics).
+    let gate = shared_engine.session_spawn_gate.clone();
+    let readiness_handles = handles.clone();
+    let readiness = tokio::spawn(async move {
+        let bound =
+            futures::future::join_all(readiness_handles.iter().map(axum_server::Handle::listening))
+                .await;
+        if let Some(bound) = bound.into_iter().collect::<Option<Vec<_>>>() {
+            log_legacy!(
+                "[Startup] API server listening on {}://{}  ({})",
+                scheme,
+                bound[0],
+                bind_label
+            );
+            gate.open();
+        }
+    });
+
+    let listeners = addrs.into_iter().zip(handles);
     if scheme == net_config::SCHEME_HTTPS {
-        // An https scheme means both paths are present and non-empty.
         let (cert_path, key_path) = (tls_cert.unwrap_or_default(), tls_key.unwrap_or_default());
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
-        log_legacy!(
-            "[Startup] API server listening on {}://{}  (HTTP/2 + TLS, {})",
-            scheme,
-            addr,
-            bind_label
-        );
-        let tcp = futures::future::try_join_all(addrs.into_iter().map(|a| {
-            axum_server::bind_rustls(a, tls_config.clone())
-                .handle(handle.clone())
+        let tcp = futures::future::try_join_all(listeners.map(|(addr, handle)| {
+            axum_server::bind_rustls(addr, tls_config.clone())
+                .handle(handle)
                 .serve(app.clone().into_make_service())
         }));
         serve_until_shutdown(tcp, socket_server).await?;
     } else {
-        log_legacy!(
-            "[Startup] API server listening on {}://{}  ({})",
-            scheme,
-            addr,
-            bind_label
-        );
-        let tcp = futures::future::try_join_all(addrs.into_iter().map(|a| {
-            axum_server::bind(a)
-                .handle(handle.clone())
+        let tcp = futures::future::try_join_all(listeners.map(|(addr, handle)| {
+            axum_server::bind(addr)
+                .handle(handle)
                 .serve(app.clone().into_make_service())
         }));
         serve_until_shutdown(tcp, socket_server).await?;
     }
+    readiness.abort();
 
-    // The listeners stop partway through the teardown, before Chrome, the
-    // preview and the MCP children are stopped. Returning now would drop the
-    // runtime and cancel that cleanup, orphaning them.
     if let Err(e) = shutdown.await {
         log_legacy!("[Shutdown] teardown task failed: {e}");
     }
     Ok(())
 }
 
-/// Run the TCP listeners and the engine socket until both have drained. A TCP
-/// bind failure returns at once, as it did before the socket existed.
 async fn serve_until_shutdown<T, E>(
     tcp: impl std::future::Future<Output = Result<T, E>>,
     socket: impl std::future::Future<Output = ()>,
@@ -1506,8 +1082,6 @@ mod ownership_tests {
     use super::{arm_teardown_deadline, own_workspace};
     use std::time::Duration;
 
-    /// A teardown that never finishes still ends the process. The expiry is
-    /// observed through a channel, so the test waits on the event itself.
     #[test]
     fn a_teardown_that_never_finishes_still_expires() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1515,7 +1089,6 @@ mod ownership_tests {
         rx.recv().expect("the deadline fired");
     }
 
-    /// The deadline only bounds a teardown if the stop path arms it.
     #[test]
     fn the_stop_signal_arms_the_teardown_deadline() {
         let source = include_str!("main.rs");
@@ -1534,8 +1107,6 @@ mod ownership_tests {
         );
     }
 
-    /// The workspace root is a storage root before anything opens it. Pinned
-    /// on the source, like the owner-lock order below.
     #[test]
     fn the_workspace_is_a_storage_root_before_it_is_owned() {
         let source = include_str!("main.rs");
@@ -1552,8 +1123,6 @@ mod ownership_tests {
         );
     }
 
-    /// Nothing stateful may run before the workspace is owned. Pinned on the
-    /// source, because the property is an ordering inside one long function.
     #[test]
     fn the_owner_lock_comes_before_anything_stateful() {
         let source = include_str!("main.rs");
@@ -1575,8 +1144,6 @@ mod ownership_tests {
         }
     }
 
-    /// The successor's half of the respawn: it owns the workspace, and names
-    /// itself, only once the predecessor has let go.
     #[tokio::test]
     async fn a_successor_owns_the_workspace_only_after_its_predecessor() {
         let dir = tempfile::tempdir().unwrap();
@@ -1587,7 +1154,6 @@ mod ownership_tests {
 
         let workspace = dir.path().to_path_buf();
         let successor = tokio::spawn(async move { own_workspace(&workspace).await });
-        // A stop must find the waiting successor. Wait on that event itself.
         while lucidos_owner_lock::engine::waiting_pid(dir.path()).is_none() {
             tokio::task::yield_now().await;
         }

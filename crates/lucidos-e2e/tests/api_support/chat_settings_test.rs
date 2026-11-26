@@ -1,6 +1,3 @@
-//! `POST /api/v1/chat/settings` records a rung pick on a Lucidos Agent thread.
-//! A pick during a turn is saved for its next turn.
-
 use crate::support::{base_url, db_url, seed_chat_thread_summary, user_client};
 use serde_json::{json, Value};
 use uuid::Uuid;

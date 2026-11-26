@@ -1,21 +1,13 @@
-//! Trigger provenance shared by scheduling and event emission.
-
 tokio::task_local! {
-    /// Trigger UUID of the currently executing trigger. Used by the
-    /// scheduling-tool guard to identify the running trigger.
     pub static ACTIVE_TRIGGER_ID: String;
-    /// Current recursion depth for event-triggered chains.
+    /// INVARIANT: Current recursion depth for event-triggered chains.
     /// Set by `fire_matching_triggers` before spawning; read by `emit_domain_event`
     /// to propagate depth in the `DomainEvent` broadcast.
     pub static EVENT_TRIGGER_DEPTH: u32;
-    /// Thread ID of the event that fired the currently executing trigger
-    /// (set only when the trigger was matched on a `BusEvent::Thread`).
-    /// Read by `execute_send_notification` so a push tap can deep-link back
-    /// to the originating thread instead of the trigger's own LLM thread.
     pub static ORIGIN_THREAD_ID: uuid::Uuid;
 }
 
-/// How deep in an event-trigger chain the current task is running.
+/// INVARIANT: How deep in an event-trigger chain the current task is running.
 ///
 /// Zero outside any trigger fire, which is what an ordinary user turn, an HTTP
 /// handler and a cron fire all are. Inside a fire it is the depth the queue
@@ -30,7 +22,7 @@ pub fn current_event_trigger_depth() -> u32 {
     EVENT_TRIGGER_DEPTH.try_with(|d| *d).unwrap_or(0)
 }
 
-/// Chain depth per thread, for background work whose events are emitted from
+/// INVARIANT: Chain depth per thread, for background work whose events are emitted from
 /// tasks no scope can reach.
 ///
 /// The task-local above covers work that stays on one await chain. A
@@ -52,14 +44,8 @@ pub fn current_event_trigger_depth() -> u32 {
 static CHAIN_DEPTHS: std::sync::LazyLock<std::sync::RwLock<ChainDepthOwners>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Thread id to the live `(queue entry, depth)` bindings on it.
 type ChainDepthOwners = std::collections::HashMap<uuid::Uuid, Vec<(uuid::Uuid, u32)>>;
 
-/// Bind `thread_id`'s events to `depth`, on behalf of queue entry `owner`.
-///
-/// Depth 0 registers nothing: it is the answer an unregistered thread already
-/// gives, and a row per ordinary chat thread would grow without bound.
-/// Re-registering the same owner replaces its row rather than stacking one.
 pub fn register_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid, depth: u32) {
     if depth == 0 {
         return;
@@ -73,8 +59,6 @@ pub fn register_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid, depth: u32
     }
 }
 
-/// Drop `owner`'s binding when the work that owned it finishes. Another entry's
-/// binding on the same thread is left alone.
 pub fn forget_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid) {
     if let Ok(mut map) = CHAIN_DEPTHS.write() {
         let empty = match map.get_mut(&thread_id) {
@@ -90,7 +74,7 @@ pub fn forget_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid) {
     }
 }
 
-/// The chain depth bound to `thread_id`, if it is background chain work.
+/// INVARIANT: The chain depth bound to `thread_id`, if it is background chain work.
 ///
 /// The DEEPEST of the live bindings, matching how `EventBus::emit` ranks this
 /// against the task-local. Under-counting re-opens the loop silently, and
@@ -108,7 +92,7 @@ pub fn chain_depth_for_thread(thread_id: uuid::Uuid) -> Option<u32> {
         .max()
 }
 
-/// Which trigger's fire the current task is running, if any.
+/// INVARIANT: Which trigger's fire the current task is running, if any.
 ///
 /// `None` outside a fire, which is what an ordinary user turn and an HTTP
 /// handler both are. Inside one it is the id the queue executor scoped.
@@ -125,34 +109,23 @@ pub fn current_trigger_id() -> Option<String> {
     ACTIVE_TRIGGER_ID.try_with(|id| id.clone()).ok()
 }
 
-/// True when the currently running trigger is deleting itself: the LLM
-/// called `delete_trigger` with its own trigger ID. Config reconciliation
-/// reads this event flag to skip nudging the thread performing the deletion.
-/// Scheduler cancellation is independent: every deletion stops scheduling
-/// while leaving any admitted run alone.
 pub fn is_self_deleting_trigger(trigger_id: &str) -> bool {
     ACTIVE_TRIGGER_ID
         .try_with(|active| *active == trigger_id)
         .unwrap_or(false)
 }
 
-/// Namespace UUID for deriving trigger UUIDs via v5 (SHA-1).
+/// INVARIANT: Namespace UUID for deriving trigger UUIDs via v5 (SHA-1).
 /// The historical bytes spell "cognos-trigger-n" and form part of the hash input.
 /// Keep them stable so existing trigger ids keep the same UUID.
 const TRIGGER_UUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
     0x63, 0x6f, 0x67, 0x6e, 0x6f, 0x73, 0x2d, 0x74, 0x72, 0x69, 0x67, 0x67, 0x65, 0x72, 0x2d, 0x6e,
-]); // "cognos-trigger-n" — frozen for v5 namespace stability; see doc above.
+]); // INVARIANT: "cognos-trigger-n" — frozen for v5 namespace stability; see doc above.
 
-/// Derive a deterministic UUID from a trigger ID string (uuid v5 / SHA-1).
 pub fn trigger_id_to_uuid(trigger_id: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(&TRIGGER_UUID_NAMESPACE, trigger_id.as_bytes())
 }
 
-/// Outcome of a trigger's most recent completed firing. Surfaced on the
-/// trigger row (OK / failed) so a threadless (script) trigger's health is
-/// visible without opening its event stream. Wire values are `"ok"` /
-/// `"failed"`; `None` on the config means "never run / legacy" (a
-/// pre-status-field `TriggerExecuted` event carries no outcome).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TriggerRunStatus {
@@ -161,7 +134,6 @@ pub enum TriggerRunStatus {
 }
 
 impl TriggerRunStatus {
-    /// Map a run outcome (`execute_user_task`'s `Result`) to a status.
     pub fn from_success(success: bool) -> Self {
         if success {
             Self::Ok
@@ -170,7 +142,6 @@ impl TriggerRunStatus {
         }
     }
 
-    /// Wire string used in the `TriggerExecuted` payload and the trigger-list API.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",

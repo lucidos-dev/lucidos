@@ -1,7 +1,3 @@
-//! The one sanitizer over a diagnostic log message. It runs when a line is
-//! written and again when it is read, so a redactor improvement also reaches
-//! lines already on disk. Every step is idempotent.
-
 use std::sync::{LazyLock, RwLock};
 
 use crate::redaction::{
@@ -9,23 +5,16 @@ use crate::redaction::{
     redact_secret_values,
 };
 
-/// The longest message a record stores.
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 
-/// The longest raw message the writer accepts. It bounds the queue's memory
-/// and the sanitizer's work.
 const MAX_RAW_BYTES: usize = MAX_MESSAGE_BYTES * 4;
 
 const TRUNCATED_MARKER: &str = " [truncated]";
 
 const QUERY_MARKER: &str = "[query omitted]";
 
-/// The credential values registered so far: the engine's secret-shaped env at
-/// boot and its local tokens. A value outside it is masked only by shape or
-/// by name.
 static KNOWN_SECRETS: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
-/// Add credential values for every later sanitize call to mask.
 pub fn register_secret_values(values: impl IntoIterator<Item = String>) {
     let mut known = KNOWN_SECRETS.write().unwrap_or_else(|e| e.into_inner());
     for value in values {
@@ -35,9 +24,6 @@ pub fn register_secret_values(values: impl IntoIterator<Item = String>) {
     }
 }
 
-/// The steps both the write and the read run, in order: known credential
-/// values, token shapes, Postgres passwords, secret-named pairs and bearer
-/// values, then every URL query string.
 pub fn sanitize(text: &str) -> String {
     let known = KNOWN_SECRETS.read().unwrap_or_else(|e| e.into_inner());
     let text = redact_secret_values(text, &known);
@@ -47,8 +33,6 @@ pub fn sanitize(text: &str) -> String {
     omit_url_queries(&text)
 }
 
-/// A raw message bounded to [`MAX_RAW_BYTES`], and whether it was cut. The
-/// cut falls before a whitespace, so no token is left too short for its shape.
 pub fn bound_raw(mut msg: String) -> (String, bool) {
     if msg.len() <= MAX_RAW_BYTES {
         return (msg, false);
@@ -59,11 +43,7 @@ pub fn bound_raw(mut msg: String) -> (String, bool) {
     (msg, true)
 }
 
-/// A message as a record stores it: sanitized, then capped at
-/// [`MAX_MESSAGE_BYTES`]. `cut` says [`bound_raw`] already shortened it.
 pub fn for_write(msg: &str, cut: bool) -> String {
-    // Sanitize before the final cut, so the cut cannot leave a token too
-    // short for its shape.
     let clean = sanitize(msg);
     if clean.len() <= MAX_MESSAGE_BYTES && !cut {
         return clean;
@@ -72,10 +52,6 @@ pub fn for_write(msg: &str, cut: bool) -> String {
     format!("{}{TRUNCATED_MARKER}", &clean[..keep])
 }
 
-/// A stored message as a reader gets it: sanitized with the current rules,
-/// with newlines and carriage returns made visible and every other control
-/// character except tab removed. One record then prints as one line, and no
-/// terminal escape survives.
 pub fn for_read(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     for c in sanitize(msg).chars() {
@@ -90,16 +66,11 @@ pub fn for_read(msg: &str) -> String {
     out
 }
 
-/// Mask values that travel under a secret name (`--token x`, `apiKey=x`,
-/// `x-api-key: x`, `"token":"x"`, `api_key: Some("x")`), and every `Bearer`
-/// or `Basic` credential.
 fn redact_named_secrets(text: &str) -> String {
     static SCHEME: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
             .expect("auth scheme regex must compile")
     });
-    // A name, its optional quote, a `:` or `=`, then an optionally quoted or
-    // `Some(`-wrapped value. `[` never starts a value, so a mask stays put.
     static FIELD: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
             r#"([A-Za-z_][A-Za-z0-9_.-]*)(["']?\s*[:=]\s*(?:Some\()?["']?)([^\s"',;&(){}\[\]]{8,})"#,
@@ -118,7 +89,6 @@ fn redact_named_secrets(text: &str) -> String {
     SCHEME.replace_all(&fields, "$1 [REDACTED]").into_owned()
 }
 
-/// Replace every URL's query string with `?[query omitted]`.
 fn omit_url_queries(text: &str) -> String {
     static URL_QUERY: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#"([A-Za-z][A-Za-z0-9+.-]*://[^\s?#"'<>]*)\?([^\s#"'<>]*)"#)
@@ -276,8 +246,6 @@ mod tests {
 
     #[test]
     fn the_raw_cut_never_splits_a_token() {
-        // A long query collapses, so the sanitized text fits the record. A
-        // token across the raw limit must still go whole or not at all.
         let query = format!("https://x.example/p?{}", "q".repeat(MAX_RAW_BYTES - 40));
         let msg = format!("{query} {GH_TOKEN} tail");
         let (bounded, cut) = bound_raw(msg);

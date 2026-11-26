@@ -1,20 +1,10 @@
-//! `lucidos external-address`: read or change the gateway's *external
-//! address*, the origin other devices reach it at through a route the user runs
-//! (ADR 0550).
-//!
-//! Each gateway has its own, so this acts on one gateway, chosen like
-//! `lucidos pair` chooses. A set goes through the gateway, which probes the
-//! address and refuses it only when another gateway answers there.
-
 use serde_json::{json, Value};
 
 use crate::gateway;
 use crate::workspace::BoxError;
 
-/// The gateway control route for the setting.
 pub(crate) const EXTERNAL_ADDRESS_PATH: &str = "/~/api/v1/control/external-address";
 
-/// What the command was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Show,
@@ -58,8 +48,6 @@ pub fn cmd_external_address(action: &Action, port: Option<u16>) -> Result<(), Bo
     Ok(())
 }
 
-/// The external address stored for the gateway at `base`, for `lucidos pair`.
-/// `None` when unset, or when the gateway is too old to have one.
 pub(crate) fn stored(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -78,8 +66,6 @@ pub(crate) fn stored(
         .map(str::to_string)
 }
 
-/// The PUT body for a change, or `None` for `show`. The gateway validates the
-/// value, so its own sentence explains a refusal.
 fn request_body(action: &Action) -> Result<Option<Value>, BoxError> {
     match action {
         Action::Show => Ok(None),
@@ -91,7 +77,6 @@ fn request_body(action: &Action) -> Result<Option<Value>, BoxError> {
     }
 }
 
-/// What a person reads, from the gateway's answer.
 fn describe(body: &Value) -> String {
     let address = body.get("external_address").and_then(Value::as_str);
     let env_var = body

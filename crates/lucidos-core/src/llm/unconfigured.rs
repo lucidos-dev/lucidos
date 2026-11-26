@@ -3,20 +3,13 @@ use crate::llm::provider::{
 };
 use async_trait::async_trait;
 
-/// The clear, actionable error a no-provider chat returns. Surfaced to the user
-/// as a `ThreadEvent::ResponseFailed` (see `engine/agentic_loop/run.rs`), so the
-/// wording is user-facing. Must never be mistaken for real or mock output.
-///
-/// No "restart" instruction: configuring a provider in Settings →
-/// Providers now takes effect at runtime (the config subscriber hot-swaps the
-/// active provider, see `spawn_provider_config_subscriber`).
 pub const NO_PROVIDER_MESSAGE: &str = concat!(
     "No LLM provider configured. Add one in ",
     providers_settings!(),
     "."
 );
 
-/// Sentinel LLM provider for the "booted before any provider is configured"
+/// INVARIANT: Sentinel LLM provider for the "booted before any provider is configured"
 /// state.
 ///
 /// Every launch mode boots before the user has entered any provider credential.
@@ -64,7 +57,7 @@ impl LlmProvider for UnconfiguredProvider {
         false
     }
 
-    /// No provider is configured — report an empty set (not `None`) so the model
+    /// INVARIANT: No provider is configured — report an empty set (not `None`) so the model
     /// picker filters to nothing rather than skipping the filter.
     fn configured_providers(&self) -> Option<Vec<crate::llm::model_registry::ProviderKind>> {
         Some(Vec::new())
@@ -95,7 +88,6 @@ mod tests {
             .await;
         let err = result.expect_err("unconfigured provider must error, never return content");
         let msg = err.to_string();
-        // Clear + actionable: names the problem AND where to fix it.
         assert!(
             msg.contains("No LLM provider configured"),
             "error must name the problem: {msg}"
@@ -104,7 +96,6 @@ mod tests {
             msg.contains(providers_settings!()),
             "error must point to the fix: {msg}"
         );
-        // Must NEVER be the mock pangram — that is the entire bug this fixes.
         assert!(
             !msg.contains(crate::llm::mock::MOCK_RESPONSE),
             "unconfigured error must never carry mock output"

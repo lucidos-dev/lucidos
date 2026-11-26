@@ -11,8 +11,6 @@ mod turn_end_decisions_tests {
         }
     }
 
-    /// Only a round whose calls are all turn-end decisions can end the turn on
-    /// its text. Any other call still needs its result read.
     #[test]
     fn only_a_decision_only_round_qualifies() {
         assert!(calls_only_turn_end_decisions(&[call("request_read")]));

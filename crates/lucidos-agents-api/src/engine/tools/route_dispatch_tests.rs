@@ -111,8 +111,6 @@ fn query_args_ride_the_query_and_absent_ones_stay_off() {
     assert_eq!(bare.uri, "/things");
 }
 
-/// A path arg fills its segment. A body arg rides as given, an explicit null
-/// included, and a JSON arg sent as a string is parsed, as the CLI parses it.
 #[test]
 fn path_and_body_args_ride_as_the_cli_sends_them() {
     let args = json!({
@@ -139,7 +137,6 @@ fn path_and_body_args_ride_as_the_cli_sends_them() {
     );
 }
 
-/// A fixed value rides every call, and the caller cannot override it.
 #[test]
 fn a_fixed_body_value_rides_whatever_the_caller_sends() {
     let request = route_request(
@@ -175,8 +172,6 @@ fn a_bad_action_or_arg_is_refused_before_any_request() {
     assert!(err.contains("limit takes one value"), "{err}");
 }
 
-/// The tool presents exactly the origin token a `lucidos` command from the
-/// same thread's bash tool would.
 #[test]
 fn the_tool_carries_the_clis_origin_token() {
     init_agent_origin_secret("route-dispatch-test-secret".into());
@@ -191,8 +186,6 @@ fn the_tool_carries_the_clis_origin_token() {
     assert_eq!(headers.len(), 1, "no other credential: {headers:?}");
 }
 
-/// A route sees the tool's call as the calling thread's agent, never as the
-/// owner and never as an unattested caller.
 #[tokio::test]
 async fn a_route_sees_an_agent_from_the_calling_thread() {
     use crate::api::actor::{owner_attestation, OwnerAttestation};

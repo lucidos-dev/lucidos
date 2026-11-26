@@ -1,6 +1,3 @@
-//! A child's *wake decision* on its row: I5 of
-//! `docs/plans/2026-10-11-sub-threads-wake-parents-only-when-needed.md`.
-
 use super::*;
 
 async fn parent_wake_requested(pool: &PgPool, thread_id: Uuid) -> Option<bool> {
@@ -53,9 +50,6 @@ async fn wake_mode(pool: &PgPool, thread_id: Uuid) -> Option<String> {
         .unwrap()
 }
 
-/// I8 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`: the
-/// spawning message writes the mode with the parent link, and a follow-up,
-/// which carries none, leaves it alone.
 #[tokio::test]
 async fn the_spawning_message_stores_the_wake_mode_for_the_childs_life() {
     let (pool, db_name) = setup_test_db().await;

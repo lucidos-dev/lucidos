@@ -22,22 +22,11 @@ struct PermissionPromptResponse {
     reason: Option<String>,
 }
 
-/// Tools the engine handles before CC's permission gate can render a card.
-/// A question tool is intercepted in `agent_session::run_session` (which
-/// renders a `QuestionCard` from the `UserQuestionAsked` this module's
-/// `ask_user_question` handler emits); routing it through the permission tool
-/// would surface a redundant "Allow?" card stacked on top of the question
-/// itself. Auto-approve at this gate so the user only sees the question.
-///
-/// The names come from [`crate::runtime::is_user_question_tool`], shared with
-/// the tool-call suppression in `run_session` so the two gates cannot know
-/// different sets. They did, and CC reaching the question tool over MCP fell
-/// through both: see that function.
 fn should_auto_allow(tool_name: &str) -> bool {
     crate::runtime::is_user_question_tool(tool_name)
 }
 
-/// POST /api/v1/internal/permission-prompt — invoked by the lucidos-cli
+/// INVARIANT: POST /api/v1/internal/permission-prompt — invoked by the lucidos-cli
 /// `mcp-permission-server` subprocess (spawned by CC) when CC asks for
 /// tool-call permission.
 ///
@@ -61,7 +50,7 @@ pub(super) async fn permission_prompt(
         Ok(id) => id,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
     };
-    // An "Allow for this thread" here widens what that thread's agent may do,
+    // INVARIANT: An "Allow for this thread" here widens what that thread's agent may do,
     // so another thread must not raise the card.
     if asks_for_another_thread(&headers, thread_id) {
         crate::log_legacy!(
@@ -87,8 +76,6 @@ pub(super) async fn permission_prompt(
         .into_response();
     }
 
-    // A file write landing inside this thread's own worktree skips the card —
-    // resolve the root the same way the Codex bridge does.
     let worktree_path = crate::engine::cc_permission::lookup_session_worktree(
         &state.engine.agent_sessions,
         thread_id,
@@ -118,7 +105,7 @@ pub(super) async fn permission_prompt(
     .into_response()
 }
 
-/// POST /api/v1/internal/restart-intent: the workspace gateway telling this
+/// INVARIANT: POST /api/v1/internal/restart-intent: the workspace gateway telling this
 /// engine that a HUMAN asked for the teardown it is about to signal, and which
 /// device they were on. Called immediately before the picker's Restart / Stop
 /// sends `SIGUSR1` (`lucidos-gateway` `server.rs`, `notify_restart_intent`).
@@ -169,7 +156,7 @@ pub(super) async fn restart_intent(
         )
             .into_response();
     };
-    // First writer wins: an in-workspace *Switch* stashed its own actor before it
+    // INVARIANT: First writer wins: an in-workspace *Switch* stashed its own actor before it
     // asked the gateway for this respawn, and that one is the click's.
     let stashed = state.engine.stash_restart_actor(Some(actor));
     crate::log_legacy!(
@@ -179,15 +166,6 @@ pub(super) async fn restart_intent(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// GET /api/v1/internal/oauth/callback: the gateway forwarding a provider's
-/// redirect, which it caught on the loopback callback port it owns.
-///
-/// Answers with the browser page, which the gateway passes through. A 404
-/// means no open flow here owns the `state`, so the gateway may try a peer.
-///
-/// Reachable only from this engine's own gateway, by the same test as the
-/// marker writes: a local process on a hop that did not come through the
-/// proxy. A device or an app document always arrives through the proxy.
 pub(super) async fn oauth_callback(
     headers: HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
@@ -228,7 +206,7 @@ pub(super) struct ClientLogRequest {
 const CLIENT_LOG_MAX_FIELD_LEN: usize = 256;
 const CLIENT_LOG_MAX_DATA_LEN: usize = 4096;
 
-/// Validate one breadcrumb's caps, returning its serialized `data` on success.
+/// INVARIANT: Validate one breadcrumb's caps, returning its serialized `data` on success.
 /// `Err(reason)` on a cap violation (the caller maps it to a 400). Pure — does
 /// NOT log, so a batch can validate every entry before committing any line.
 fn validate_client_entry(entry: &ClientLogRequest) -> Result<String, &'static str> {
@@ -241,7 +219,6 @@ fn validate_client_entry(entry: &ClientLogRequest) -> Result<String, &'static st
     {
         return Err("category/message too long");
     }
-    // Value's Display is infallible — it serializes through a String buffer.
     let data_str = entry.data.to_string();
     if data_str.len() > CLIENT_LOG_MAX_DATA_LEN {
         return Err("data too large");
@@ -249,7 +226,7 @@ fn validate_client_entry(entry: &ClientLogRequest) -> Result<String, &'static st
     Ok(data_str)
 }
 
-/// Only this closed vocabulary can cross the maintainer boundary. A client
+/// INVARIANT: Only this closed vocabulary can cross the maintainer boundary. A client
 /// cannot mark arbitrary strings shareable by choosing a JSON field name.
 /// Unknown/older codes remain useful to the owner as private values.
 enum ClientToken<'a> {
@@ -312,9 +289,11 @@ const CLIENT_CATEGORIES: &[&str] = &[
     "composer-typing",
     "app-link",
     "app-fullscreen",
+    "storage-pressure",
 ];
 
 const CLIENT_CODES: &[&str] = &[
+    "quota",
     "uncaught",
     "unhandledrejection",
     "startup",
@@ -396,9 +375,6 @@ fn user_agent(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
-/// POST /api/v1/internal/client-log — fire-and-forget breadcrumb channel for
-/// browser-side telemetry that needs engine-log persistence. Body capped at
-/// 4KB so the engine.log tail isn't drowned by a misbehaving client.
 pub(super) async fn client_log(
     headers: HeaderMap,
     Json(body): Json<ClientLogRequest>,
@@ -415,12 +391,6 @@ pub(super) async fn client_log(
     }
 }
 
-/// POST /api/v1/internal/client-logs — batched variant of `client-log` so a
-/// client-side queue (e.g. the perf instrumentation) can flush many breadcrumbs
-/// in one request instead of one POST per sample. Each valid entry is logged as
-/// its own `[Client/<category>]` line; the array length and per-entry sizes are
-/// capped. Validation is atomic — if any entry is over-cap the whole batch is
-/// rejected (400) and nothing is logged.
 pub(super) async fn client_logs(
     headers: HeaderMap,
     Json(body): Json<Vec<ClientLogRequest>>,
@@ -447,16 +417,12 @@ pub(super) struct MarkHardenedRequest {
     pub repo_root: String,
     pub branch_name: String,
     pub head_sha: String,
-    /// `fast` or `full`. Absent means `full`, which is every marker a CLI
+    /// INVARIANT: `fast` or `full`. Absent means `full`, which is every marker a CLI
     /// predating the tier writes.
     #[serde(default)]
     pub tier: Option<String>,
 }
 
-/// Why a mark of `requested` is refused for a branch that expects `expected`,
-/// or `None` when it may be written. On a branch that needs the full run, a
-/// fast marker reads as missing everywhere. So it is refused while the agent
-/// can still run the rest.
 fn tier_refusal(
     requested: crate::engine::git_ops::HardenTier,
     expected: crate::engine::git_ops::HardenTier,
@@ -481,7 +447,7 @@ struct CodingAgentDiffRefreshResponse {
     changed: bool,
 }
 
-/// Whether `branch_name` carries un-applied work, for the durable change
+/// INVARIANT: Whether `branch_name` carries un-applied work, for the durable change
 /// state.
 ///
 /// `Err` means git could not answer: a spawn failure, the 30s timeout, or a
@@ -504,7 +470,7 @@ async fn probe_branch_has_diff(
     Ok(!files.is_empty())
 }
 
-/// POST /api/v1/internal/coding-agent-diff-refresh — invoked by the
+/// INVARIANT: POST /api/v1/internal/coding-agent-diff-refresh — invoked by the
 /// coding-agent worktree's git post-commit hook via `lucidos
 /// coding-agent-diff-hook`.
 ///
@@ -586,7 +552,7 @@ pub(super) async fn coding_agent_diff_refresh(
     }
 }
 
-/// Whether this caller may write the hardening marker or the plan marker,
+/// INVARIANT: Whether this caller may write the hardening marker or the plan marker,
 /// which the Harden and Apply gates read.
 ///
 /// Two credentials qualify, and each proves a process on this machine:
@@ -612,7 +578,6 @@ fn may_write_markers(headers: &HeaderMap) -> bool {
         && crate::api::local_auth::is_local_process(headers)
 }
 
-/// The 403 for a caller [`may_write_markers`] refuses, or `None` to proceed.
 fn marker_write_refusal(headers: &HeaderMap) -> Option<axum::response::Response> {
     (!may_write_markers(headers)).then(|| {
         (
@@ -625,7 +590,6 @@ fn marker_write_refusal(headers: &HeaderMap) -> Option<axum::response::Response>
     })
 }
 
-/// The thread a Lucidos-spawned process signed its request for, if any.
 fn caller_thread(headers: &HeaderMap) -> Option<String> {
     match crate::core::subprocess_origin::subprocess_origin(headers) {
         crate::core::subprocess_origin::SubprocessOrigin::Subprocess {
@@ -635,8 +599,6 @@ fn caller_thread(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-/// The 409 for a plan marker on a branch the caller's Apply never lands, or
-/// `None` to proceed. See [`crate::engine::git_ops::tracked_branch_elsewhere`].
 async fn off_tracked_branch_refusal(
     state: &AppState,
     repo_root: &std::path::Path,
@@ -679,15 +641,6 @@ async fn off_tracked_branch_refusal(
     )
 }
 
-/// POST /api/v1/internal/mark-hardened, invoked by `lucidos hardened mark`,
-/// which `/harden` Phase 5 runs once every phase completes. Replaces
-/// the prior worktree-keyed file marker, which was lost when stale-session
-/// recovery removed the worktree before the apply check ran.
-///
-/// Called from a thread, the marker is that thread declaring itself finished.
-/// So it stops the thread's leftover background tasks, which started before
-/// the certification and cannot change it, and names every wait still live
-/// (ADR 0369).
 pub(super) async fn mark_hardened(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -756,7 +709,6 @@ pub(super) async fn mark_hardened(
     }
 }
 
-/// The thread a marker write came from, when a thread's own subprocess sent it.
 fn calling_thread(headers: &HeaderMap) -> Option<uuid::Uuid> {
     use crate::core::subprocess_origin::{subprocess_origin, SubprocessOrigin};
     match subprocess_origin(headers) {
@@ -767,12 +719,9 @@ fn calling_thread(headers: &HeaderMap) -> Option<uuid::Uuid> {
     }
 }
 
-/// What recording the marker did to the calling thread, for `lucidos hardened
-/// mark` to print. Empty for a caller with no thread.
 #[derive(Debug, Default)]
 struct HardenedReport {
     stopped_background_tasks: Vec<crate::engine::event_wait::StoppedTask>,
-    /// Every wait still live on the thread, by its reason.
     still_waiting_on: Vec<String>,
 }
 
@@ -801,20 +750,11 @@ pub(super) struct QueryHardenedQuery {
 
 #[derive(Serialize)]
 struct QueryHardenedResponse {
-    /// The marker's state for the tier this branch needs. A fast marker on a
-    /// branch that needs the full run is `MISSING`. `NOT_NEEDED` replaces
-    /// `STALE` and `MISSING` on a branch that lands plan files only, which
-    /// Apply never hardens.
     state: &'static str,
-    /// The HEAD the last `/harden` recorded, of either tier. Absent with no
-    /// marker at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     head_sha: Option<String>,
-    /// The recorded marker's tier, `fast` or `full`. Absent with no marker.
     #[serde(skip_serializing_if = "Option::is_none")]
     tier: Option<&'static str>,
-    /// The tier `/harden` runs on this branch: `fast` for an integrated
-    /// sub-thread, `full` for every other.
     expected_tier: &'static str,
 }
 
@@ -823,7 +763,6 @@ struct IntegratedHeadsResponse {
     heads: Vec<String>,
 }
 
-/// The skill declares its planning purpose before writing a plan.
 #[derive(serde::Deserialize)]
 pub(super) struct StartPlanRequest {
     #[serde(default)]
@@ -856,12 +795,6 @@ pub(super) async fn start_plan(
     }
 }
 
-/// Body for `POST /api/v1/internal/mark-planned`. `state` is `"proposed"` (a
-/// plan was written and awaits the user's approval — what the skill records),
-/// `"planned"` (legacy/approved), `"acknowledged_simple"` (local fix), or
-/// `"bounded_security_fix"` (an unattended run's scoped security fix).
-/// `plan_path` accompanies the plan states, `reason` the other two, and `files`
-/// the bounded fix alone (each ignored for the kinds it does not belong to).
 #[derive(Deserialize)]
 pub(super) struct MarkPlannedRequest {
     pub repo_root: String,
@@ -874,13 +807,10 @@ pub(super) struct MarkPlannedRequest {
     pub plan_path: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
-    /// Repo-relative paths a `bounded_security_fix` is confined to. Must be
-    /// empty for every other state.
     #[serde(default)]
     pub files: Vec<String>,
 }
 
-/// Record fix evidence beside the marker when a coding-agent thread calls the CLI.
 #[allow(clippy::too_many_arguments)]
 async fn record_fix_marker(
     bus: &crate::engine::event_bus::EventBus,
@@ -935,7 +865,7 @@ async fn record_fix_marker(
     Ok(())
 }
 
-/// POST /api/v1/internal/mark-planned — invoked by `lucidos planned mark` from
+/// INVARIANT: POST /api/v1/internal/mark-planned — invoked by `lucidos planned mark` from
 /// inside a coding-agent subprocess (and by the `implementation-plan` skill
 /// after it writes the plan file). Records the durable Planned marker that the
 /// `cc-plan-gate` PreToolUse hook and the Apply floor read. Mirrors
@@ -955,7 +885,7 @@ pub(super) async fn mark_planned(
         return refusal;
     }
     let repo_root = std::path::PathBuf::from(&body.repo_root);
-    // Strict on the WRITE path. The lenient `parse` reads an unknown value as
+    // INVARIANT: Strict on the WRITE path. The lenient `parse` reads an unknown value as
     // `planned`, which on a write would record "a human approved this" for a
     // typo. `bounded-security-fix` is the one that matters.
     let Some(kind) = PlanMarkerKind::parse_strict(&body.state) else {
@@ -1057,11 +987,6 @@ pub(super) async fn mark_planned(
     }
 }
 
-/// GET /api/v1/internal/planned-state?repo_root=...&branch_name=... — invoked by
-/// `lucidos planned state` (printing) and the `cc-plan-gate` hook (deciding).
-/// The hook uses `state` to choose the next step for a blocked edit.
-/// `kind` reports the marker kind when present. Apply enforces the file
-/// bound for a bounded security fix.
 pub(super) async fn query_planned(
     State(state): State<AppState>,
     Query(q): Query<QueryHardenedQuery>,
@@ -1088,7 +1013,6 @@ struct QueryPlannedResponse {
     kind: Option<&'static str>,
 }
 
-/// Body for `POST /api/v1/internal/approve-plan`.
 #[derive(Deserialize)]
 pub(super) struct ApprovePlanRequest {
     pub repo_root: String,
@@ -1099,15 +1023,13 @@ pub(super) struct ApprovePlanRequest {
 
 #[derive(Serialize)]
 struct ApprovePlanResponse {
-    /// Whether a proposed marker transitioned to the approved scope.
     approved: bool,
     plan_only: bool,
-    /// The flipped plan's file, for the CLI to mark `Approved`.
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_path: Option<String>,
 }
 
-/// Approve the recorded plan for the scope the user's answer grants.
+/// INVARIANT: Approve the recorded plan for the scope the user's answer grants.
 /// Design approvals always stay plan-only. A missing approval returns 409
 /// `no-plan-approval`; a changed batch binding returns 409 `plan-changed`.
 /// An unreadable answer returns 500. Off-branch writes return 409
@@ -1173,7 +1095,7 @@ pub(super) async fn approve_plan(
     }
 }
 
-/// GET /api/v1/internal/hardened-state?repo_root=...&branch_name=... — invoked by
+/// INVARIANT: GET /api/v1/internal/hardened-state?repo_root=...&branch_name=... — invoked by
 /// `lucidos hardened query` so the `harden.md` skill and `pre-push.sh` hook
 /// share the DB-backed marker that `mark-hardened` writes. `lucidos hardened
 /// sha`, `tier` and `expected-tier` read the same answer.
@@ -1187,7 +1109,7 @@ pub(super) async fn query_hardened(
     let expected =
         crate::engine::integrated::expected_harden_tier(state.engine.pool(), &q.branch_name).await;
     let marker_state = marker.state_for(expected);
-    // Unknown landing files read as code to harden, never as a plan.
+    // INVARIANT: Unknown landing files read as code to harden, never as a plan.
     let plan_only = !matches!(marker_state, HardenMarkerState::Fresh)
         && lands_plan_files_only(
             &state
@@ -1216,7 +1138,7 @@ pub(super) async fn query_hardened(
     .into_response()
 }
 
-/// GET /api/v1/internal/integrated-heads?repo_root=...&branch_name=..., invoked
+/// INVARIANT: GET /api/v1/internal/integrated-heads?repo_root=...&branch_name=..., invoked
 /// by `lucidos hardened integrated-heads`. Lists the heads the `/harden` runs
 /// of the branch's integrated children certified, which `/harden` Phase 0.4
 /// hands to `scripts/harden-scope.sh` as already reviewed.
@@ -1248,41 +1170,10 @@ pub(super) struct SeedChangeForTestRequest {
     pub requires_restart: bool,
     #[serde(default)]
     pub hardened: bool,
-    /// Whether to also record a Planned marker for the seeded branch. Defaults
-    /// to `true` (omitted) so existing apply tests — which target the harden
-    /// gate or apply mechanics, not the plan floor — keep passing. The negative
-    /// plan-floor test passes `false` to exercise the block.
     #[serde(default)]
     pub planned: Option<bool>,
 }
 
-/// POST /api/v1/internal/seed-change-for-test — emit an aggregate `ChangeProposed`
-/// directly via the live EventBus, populating the `ChangesProjection` (and the
-/// `changes` table row inside the same commit tx) without going through the
-/// agent session lifecycle. The aggregate emit flow (`propose_change`) requires
-/// a live `agent_sessions` entry, which integration tests can't set up from
-/// outside the engine process.
-///
-/// Used only by the api e2e tests in `crates/lucidos-e2e/tests/api_support/changes_test.rs`.
-/// Production code emits the aggregate `ChangeProposed` exclusively via the
-/// agent session's end-of-turn aggregation (`propose_change`, gated by
-/// `idle_change_write`). This endpoint exists so those tests can
-/// exercise the apply endpoint against a real projection-resident change
-/// without recreating the entire CC turn flow.
-///
-/// Hardened so it can't be abused on a production instance:
-/// 1. Refuses unless the build is a dev build (`debug_assertions`) OR was compiled
-///    with the `e2e-test-hooks` cargo feature — the feature the e2e harness passes
-///    (`scripts/lib/e2e.sh` `ENGINE_BUILD_FEATURES`), so a RELEASE e2e engine can
-///    still seed. This mirrors the `#[cfg(feature = "e2e-test-hooks")]` gating on
-///    `api/notifications.rs`'s test endpoints. A prod/packaged build
-///    (`cargo tauri build`, no feature) sets neither flag, so the guard returns
-///    404. The route stays mounted unconditionally so a release build doesn't
-///    silently miss it.
-/// 2. Path-validates `repo_root`, `branch_name`, and every entry of `files`
-///    against `..`, leading `/`, and leading `\` per the rust.md path-validation
-///    rule, so even a dev-build instance reachable from the network can't be
-///    coaxed into running git ops outside a sane path.
 pub(super) async fn seed_change_for_test(
     State(state): State<AppState>,
     Json(body): Json<SeedChangeForTestRequest>,
@@ -1298,9 +1189,6 @@ pub(super) async fn seed_change_for_test(
     if Uuid::parse_str(&body.change_id).is_err() {
         return (StatusCode::BAD_REQUEST, "Invalid change_id").into_response();
     }
-    // repo_root may be absolute (it's a filesystem path to a git repo), but
-    // must not contain `..` segments. branch_name and per-file paths are
-    // relative-ish — reject absolute and traversal both.
     if body.repo_root.is_empty() || body.repo_root.split(['/', '\\']).any(|seg| seg == "..") {
         return (StatusCode::BAD_REQUEST, "repo_root: empty or contains '..'").into_response();
     }
@@ -1313,7 +1201,6 @@ pub(super) async fn seed_change_for_test(
         }
     }
 
-    // Capture the marker key before `body` fields are moved into the event.
     let repo_root_for_marker = body.repo_root.clone();
     let branch_for_marker = body.branch_name.clone();
     let record_marker = body.planned != Some(false);
@@ -1346,11 +1233,6 @@ pub(super) async fn seed_change_for_test(
         })
         .await;
 
-    // Record a Planned marker for the seeded branch unless explicitly opted
-    // out (the negative plan-floor test). Mirrors how `hardened` lets seeded
-    // changes satisfy the harden gate — seeded "ready to apply" changes would
-    // carry a marker in reality. `record_planned` canonicalizes `repo_root` the
-    // same way the Apply floor does, so the lookup matches.
     if record_marker {
         if let Err(e) = state
             .engine
@@ -1389,9 +1271,6 @@ pub(super) async fn seed_change_for_test(
     }
 }
 
-/// Reject relative paths that escape their parent (`..`), are absolute
-/// (leading `/` or `\`), or are empty. For values like branch names and
-/// per-file paths inside a repo. Returns the rejection reason or `None`.
 fn reject_unsafe_relative(path: &str) -> Option<&'static str> {
     if path.is_empty() {
         return Some("empty");
@@ -1410,23 +1289,15 @@ pub(super) struct AskUserQuestionRequest {
     pub thread_id: String,
     pub tool_use_id: String,
     pub session_id: String,
-    /// Pass-through of CC's `tool_input.questions` array. The endpoint stores
-    /// nothing beyond the lifetime of this handler call; the CC hook will POST
-    /// it again on engine restart (crash recovery).
     pub questions: serde_json::Value,
 }
 
 #[derive(Serialize)]
 struct AskUserQuestionResponse {
-    /// Echoed verbatim into the hook's `updatedInput.questions`.
     questions: serde_json::Value,
-    /// `{question_text: chosen_label}` — the hook's `updatedInput.answers`.
     answers: serde_json::Value,
-    /// Set when the card was refused and never shown. The CLI hands it back
-    /// to the agent as a denied tool call. See `engine::question_card_gate`.
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal: Option<String>,
-    /// Every pick was a *quiet option*: the CLI ends the agent's turn.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     quiet: bool,
 }
@@ -1442,22 +1313,6 @@ pub(in crate::api) fn asks_for_another_thread(
     )
 }
 
-/// POST /api/v1/internal/ask-user-question — two callers, same contract:
-/// the lucidos-cli `ask-user-question-hook` subcommand (from inside a Claude
-/// Code subprocess when CC fires the `AskUserQuestion` PreToolUse hook) and
-/// the lucidos-cli `mcp-permission-server`'s `ask_user_question` MCP tool
-/// (from inside a Codex session — one question per call, answer returned as
-/// the MCP tool result so the turn continues in place).
-///
-/// CC's tool schema accepts 1–4 questions per call. Lucidos renders them
-/// **one at a time** so the user only ever sees a single question card on
-/// screen — see `synth_question_id` for the per-question key scheme.
-/// The handler walks the question list sequentially: register a waiter for
-/// question `i`, fast-path return any prior `UserQuestionAnswered` from a
-/// pre-restart session, otherwise emit `UserQuestionAsked` and long-poll
-/// until the user picks. Once every question has an answer (or one was
-/// canceled and we short-circuit), the combined `{question_text: label}`
-/// map goes back to CC as a single tool result — CC sees one tool call.
 pub(super) async fn ask_user_question(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1485,13 +1340,10 @@ pub(super) async fn ask_user_question(
         .into_response();
     }
 
-    // Taken now, so an MCP ask refused below still takes its ordinal.
+    // INVARIANT: Taken now, so an MCP ask refused below still takes its ordinal.
     let flushes = state.engine.question_flushes(thread_id).await;
     let ask = flushes.as_ref().map(|f| f.ask(&body.tool_use_id));
 
-    // An ask naming a prepared permission request shows the engine's card in
-    // its place. Everything below then reads that card, exactly as it would
-    // read the agent's own question. Only the card gate reads the ask itself.
     let asked = body.questions.clone();
     let refuse = |questions, refusal| {
         Json(AskUserQuestionResponse {
@@ -1534,7 +1386,6 @@ pub(super) async fn ask_user_question(
     };
 
     let text_persisted = async move {
-        // No session loop means no text still on its way.
         if let (Some(flushes), Some(ask)) = (flushes, ask) {
             flushes.wait_for(ask).await;
         }
@@ -1579,7 +1430,7 @@ pub(super) async fn ask_user_question(
     let (answer_kinds, quiet) = match outcome {
         Ok(o) => (o.answer_kinds, o.quiet),
         Err(e) => {
-            // Both callers turn a 500 into a failed tool call carrying this
+            // INVARIANT: Both callers turn a 500 into a failed tool call carrying this
             // text. It tells the agent to ask again with the tool
             // (`card_not_shown_reason` in lucidos-cli).
             crate::log_legacy!(
@@ -1590,9 +1441,6 @@ pub(super) async fn ask_user_question(
         }
     };
 
-    // Empty answers — CC sent zero questions. Return the empty map; CC
-    // will read the tool result and decide what to do (typically: reissue
-    // with a real question).
     if answer_kinds.is_empty() {
         crate::log_legacy!(
             "[AskUserQuestion] CC sent zero questions for {thread_id}/{}",
@@ -1625,23 +1473,10 @@ pub(super) async fn ask_user_question(
 pub(super) struct RequestAppCaptureForTest {
     pub thread_id: String,
     pub app_id: String,
-    /// The device the capture names, as a turn's last used device would.
-    /// Absent, the request names none, as in a background turn.
     pub device_id: Option<String>,
-    /// The tool's `save_as_artifact`, so a spec can drive a saved capture.
     pub save_as_artifact: Option<String>,
 }
 
-/// POST /api/v1/internal/request-app-capture-for-test: run a `capture_app`
-/// request against the pages connected right now, and return the tool result.
-///
-/// A browser spec cannot make the agent call `capture_app`, so this drives the
-/// same engine function with a named device instead. Everything past it is
-/// real: the event, each page's device test, the frame's own capture, and the
-/// answer through `/api/v1/app-capture`.
-///
-/// Gated like `seed_change_for_test`: a production build sets neither flag,
-/// so it answers 404.
 pub(super) async fn request_app_capture_for_test(
     State(state): State<AppState>,
     Json(body): Json<RequestAppCaptureForTest>,
@@ -1676,8 +1511,6 @@ pub(super) async fn request_app_capture_for_test(
     Json(serde_json::json!({ "result": result })).into_response()
 }
 
-/// Routes for the `/internal/*` surface (engine-internal hooks used by CC
-/// sessions and the e2e harness).
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/internal/permission-prompt", post(permission_prompt))
@@ -1791,8 +1624,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A fast marker is refused where the full run is needed. A full one is
-    /// always welcome, an integrated sub-thread's included.
     #[test]
     fn a_fast_mark_is_refused_on_a_branch_that_needs_the_full_run() {
         use crate::engine::git_ops::HardenTier::{Fast, Full};
@@ -1804,14 +1635,6 @@ mod tests {
 
     #[test]
     fn every_question_tool_is_auto_allowed_to_avoid_redundant_card() {
-        // The engine intercepts a question tool in run_session and renders the
-        // QuestionCard directly; routing it through the permission gate would
-        // stack a redundant "Allow?" card on top of the question.
-        //
-        // BOTH names CC can reach, not just its native one. The MCP tool is
-        // advertised to CC by the very permission server this endpoint serves,
-        // so a question raised through it used to ask the user for permission
-        // to ask them a question.
         for tool in [
             crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL,
             crate::runtime::CC_MCP_ASK_USER_QUESTION_TOOL,
@@ -1825,10 +1648,6 @@ mod tests {
 
     #[test]
     fn other_tools_are_not_auto_allowed() {
-        // Bash, Edit, Write, etc. must continue to render permission cards so
-        // the user can deny them. `approve` is the sharpest case: it is the
-        // OTHER tool on the same MCP server, and auto-allowing by server rather
-        // than by tool would nullify the permission gate entirely.
         for tool in [
             "Edit",
             "Bash",
@@ -1862,9 +1681,6 @@ mod tests {
             .expect("secret installed at least once")
     }
 
-    /// A request on the engine port with no Lucidos credential must not write a
-    /// marker. A device id is no credential here, because any loopback caller
-    /// can register one.
     #[test]
     fn a_plain_loopback_caller_cannot_write_a_marker() {
         crate::api::local_auth::publish_test_local_token();
@@ -1893,8 +1709,6 @@ mod tests {
         )])));
     }
 
-    /// `lucidos` from a coding-agent session carries a thread-bound token, and
-    /// from an engine-spawned script a thread-less one. Both are subprocesses.
     #[test]
     fn a_lucidos_spawned_process_may_write_a_marker() {
         for thread in [Some(Uuid::new_v4()), None] {
@@ -1909,8 +1723,6 @@ mod tests {
         }
     }
 
-    /// The local shell and the e2e suite hold the machine-local token and reach
-    /// the engine port directly.
     #[test]
     fn a_local_process_on_the_direct_hop_may_write_a_marker() {
         let local = crate::api::local_auth::publish_test_local_token();
@@ -1920,8 +1732,6 @@ mod tests {
         )])));
     }
 
-    /// Only the engine's own gateway delivers an OAuth callback. A device or an
-    /// app document arrives through the proxy, which adds its local token too.
     #[test]
     fn only_the_gateway_hop_may_deliver_an_oauth_callback() {
         let local = crate::api::local_auth::publish_test_local_token();
@@ -1935,8 +1745,6 @@ mod tests {
         assert!(!may_deliver_oauth_callback(&marker_headers(&[])));
     }
 
-    /// Only a thread's own subprocess makes the marker stop anything (ADR
-    /// 0369). A thread-less script, the user's shell and e2e stop nothing.
     #[test]
     fn only_a_thread_bound_caller_names_a_thread_to_stop_work_on() {
         let thread = Uuid::new_v4();
@@ -1966,8 +1774,6 @@ mod tests {
         );
     }
 
-    /// The shape `lucidos hardened mark` parses: both keys always present, so
-    /// a caller with no thread reads two empty lists rather than a missing key.
     #[test]
     fn the_hardened_report_carries_both_lists_even_when_empty() {
         assert_eq!(
@@ -1993,8 +1799,6 @@ mod tests {
         );
     }
 
-    /// The gateway adds its own local token and the device it authenticated to
-    /// every proxied request. That shape is a browser, so it must not qualify.
     #[test]
     fn a_request_through_the_gateway_proxy_cannot_write_a_marker() {
         let local = crate::api::local_auth::publish_test_local_token();
@@ -2130,7 +1934,6 @@ mod tests {
         let line = client_line(&e, "null", "");
         assert!(!line.render(Destination::Maintainer).contains("PRIVATE_"));
         assert!(line.render(Destination::Owner).contains("PRIVATE_CODE"));
-        // Older pages have no code field: their message stays private.
         let e = entry("error", "PRIVATE_LEGACY_MESSAGE", serde_json::Value::Null);
         assert!(!client_line(&e, "null", "")
             .render(Destination::Maintainer)
@@ -2151,7 +1954,6 @@ mod tests {
         );
     }
 
-    /// A temp git repo holding one commit on `main`.
     async fn repo_on_main() -> (tempfile::TempDir, std::path::PathBuf) {
         use crate::engine::git_ops::git_cmd;
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2171,7 +1973,6 @@ mod tests {
         (tmp, repo)
     }
 
-    /// Commit `file` on a fresh branch cut from `main`, then return to `main`.
     async fn commit_on_branch(repo: &std::path::Path, branch: &str, file: &str) {
         use crate::engine::git_ops::git_cmd;
         git_cmd(&["checkout", "-q", "-b", branch], repo)
@@ -2185,12 +1986,6 @@ mod tests {
         git_cmd(&["checkout", "-q", "main"], repo).await.unwrap();
     }
 
-    /// The handler WRITES this answer into `thread_summaries` and broadcasts
-    /// it, so a git call that could not run must not report "no diff". A ref
-    /// git cannot resolve is the same failure shape the 30s timeout takes.
-    ///
-    /// The second assertion is the bug: the old probe read the identical
-    /// situation as a confident false, which cleared the Diff button.
     #[tokio::test]
     async fn a_diff_probe_git_cannot_answer_is_unknown_rather_than_no_diff() {
         let (_tmp, repo) = repo_on_main().await;
@@ -2211,8 +2006,6 @@ mod tests {
         );
     }
 
-    /// The two answers the probe is allowed to write: real work on the branch,
-    /// and a branch carrying nothing ahead of `main`.
     #[tokio::test]
     async fn the_diff_probe_answers_yes_for_committed_work_and_no_for_a_bare_branch() {
         use crate::engine::git_ops::git_cmd;

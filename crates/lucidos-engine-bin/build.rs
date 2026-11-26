@@ -30,8 +30,6 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    // Only the executable gets per-commit metadata. Embedding these values
-    // in the library's code would invalidate its incremental codegen.
     let build_id = compute_build_id(root);
     let release_dirty =
         git_output(root, &["rev-parse", "HEAD"]).is_some_and(|head| is_release_dirty(root, &head));
@@ -39,26 +37,17 @@ fn main() {
     println!("cargo:rustc-env=LUCIDOS_RELEASE_DIRTY={release_dirty}");
 }
 
-/// Compute the deterministic-per-source engine build id. Mirrors
-/// `crates/lucidos-gateway/build.rs::compute_build_id`, scoped to engine paths.
 fn compute_build_id(project_root: &Path) -> String {
     match git_output(project_root, &["rev-parse", "--short", "HEAD"]) {
         Some(sha) => match engine_diff(project_root) {
             Some(diff) if !diff.trim().is_empty() => format!("{sha}-{:016x}", hash_str(&diff)),
-            // Clean tree (or git couldn't diff) → the commit alone identifies it.
             _ => sha,
         },
-        // No git (shipped build) → hash the crate source so it's stable per tree.
         None => format!("src-{:016x}", hash_sources(project_root)),
     }
 }
 
-/// Uncommitted changes (staged + unstaged) to engine-relevant paths. `None` when
-/// git fails — the caller then treats the tree as clean rather than inventing a
-/// dirty marker. A byte-identical rebuild therefore yields the same id.
 fn engine_diff(project_root: &Path) -> Option<String> {
-    // `--no-optional-locks`: a plain `git diff` rewrites a stale index, and a
-    // build must not take the index lock under a concurrent git command.
     let out = Command::new("git")
         .args(["--no-optional-locks", "diff", "HEAD", "--", "Cargo.lock"])
         .args(ENGINE_INVENTORY_INPUTS)
@@ -77,7 +66,6 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-/// Fall back to source contents when building without git history.
 fn hash_sources(root: &Path) -> u64 {
     let mut entries: Vec<_> = ENGINE_INVENTORY_INPUTS
         .iter()
@@ -122,10 +110,6 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// True if HEAD is not the commit that last modified RELEASE — meaning there
-/// are commits since the umbrella release was bumped. Returns false when git
-/// can't tell us (no history for RELEASE, command failure) so we default to
-/// "clean" rather than displaying a misleading asterisk.
 fn is_release_dirty(project_root: &Path, head: &str) -> bool {
     git_output(project_root, &["log", "-1", "--format=%H", "--", "RELEASE"])
         .is_some_and(|commit| commit != head)

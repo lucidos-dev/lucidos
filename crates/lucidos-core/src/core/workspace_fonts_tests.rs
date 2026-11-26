@@ -15,7 +15,6 @@ fn manifest(group: &str, files: &[&str]) -> String {
     )
 }
 
-/// Write a font directory under `root` with a manifest and the given files.
 fn install(root: &Path, slug: &str, manifest: &str, files: &[(&str, &[u8])]) {
     let dir = root.join(slug);
     std::fs::create_dir_all(&dir).unwrap();
@@ -36,10 +35,6 @@ fn reason_for(fonts: &WorkspaceFonts, id: &str) -> String {
         .clone()
 }
 
-// --- No third-party request ---
-
-/// A face is a leaf file name, so nothing in a manifest can point anywhere
-/// but the font's own directory on the local engine.
 #[test]
 fn a_face_file_can_name_nothing_but_a_leaf_font_file() {
     for file in [
@@ -72,7 +67,6 @@ fn a_face_file_can_name_nothing_but_a_leaf_font_file() {
     }
 }
 
-/// A URL has nowhere to go in a manifest.
 #[test]
 fn a_manifest_refuses_any_field_it_does_not_define() {
     let json = r#"{"label":"x","group":"sans","faces":[{"file":"a.woff2"}],"url":"https://cdn.example.com/a.woff2"}"#;
@@ -81,10 +75,6 @@ fn a_manifest_refuses_any_field_it_does_not_define() {
     assert!(parse_manifest(json.as_bytes()).is_err());
 }
 
-// --- No user CSS ---
-
-/// The stack is laid as a theme token, so it must pass the token value gate at
-/// the longest slug, for every group.
 #[test]
 fn every_stack_passes_the_theme_token_gate_at_the_longest_slug() {
     let dir = tempfile::tempdir().unwrap();
@@ -125,8 +115,6 @@ fn a_hostile_label_stays_out_of_the_stack() {
     );
 }
 
-// --- The group decides the slots ---
-
 #[test]
 fn sans_and_serif_are_ui_fonts_and_mono_fits_both() {
     let dir = tempfile::tempdir().unwrap();
@@ -146,8 +134,6 @@ fn sans_and_serif_are_ui_fonts_and_mono_fits_both() {
     assert_eq!(fonts.find("ws-serif").unwrap().group, FontGroup::Serif);
     assert!(fonts.find("ws-mono").unwrap().stack.ends_with("monospace"));
 }
-
-// --- Listing is the authority ---
 
 #[test]
 fn a_valid_font_lists_with_its_faces_as_data_paths() {
@@ -251,8 +237,6 @@ fn an_oversize_face_file_is_refused() {
     assert!(reason_for(&fonts, "ws-big").contains("MiB"));
 }
 
-/// Removing a font's files leaves its directory behind. That is no font at
-/// all, not a broken one.
 #[test]
 fn an_empty_or_hidden_directory_is_not_a_font() {
     let dir = tempfile::tempdir().unwrap();
@@ -319,8 +303,6 @@ fn a_missing_fonts_directory_holds_no_fonts() {
     assert_eq!(list(dir.path()), WorkspaceFonts::default());
 }
 
-// --- The manifest's own rules ---
-
 #[test]
 fn a_manifest_checks_its_label_weights_and_faces() {
     let refused = [
@@ -349,8 +331,6 @@ fn a_manifest_checks_its_label_weights_and_faces() {
     assert_eq!(parsed.faces[0].style, FaceStyle::Normal);
 }
 
-// --- Ids ---
-
 #[test]
 fn a_workspace_id_is_the_prefix_and_a_slug() {
     assert!(is_workspace_id("ws-brand"));
@@ -370,8 +350,6 @@ fn a_workspace_id_is_the_prefix_and_a_slug() {
     assert!(is_workspace_id(&longest));
     assert!(!is_workspace_id(&format!("{longest}a")));
 }
-
-// --- The data route's write gate ---
 
 #[test]
 fn the_write_gate_accepts_only_a_manifest_or_a_font_file() {
@@ -396,8 +374,6 @@ fn the_write_gate_accepts_only_a_manifest_or_a_font_file() {
     }
 }
 
-/// Either sfnt outline type may sit behind either extension, as browsers
-/// load them. Only the container must match.
 #[test]
 fn a_ttf_or_otf_may_hold_either_outline_type() {
     assert!(validate_write("brand/a.otf", TTF).is_ok());
@@ -440,8 +416,6 @@ fn a_symlinked_or_oversize_manifest_is_refused_before_it_is_read() {
     assert!(reason_for(&fonts, "ws-big").contains("larger than"));
 }
 
-/// A new font past the cap is refused where it is written, so it can never
-/// push an installed font out of the list. Editing an installed one still works.
 #[test]
 fn a_new_manifest_is_refused_once_the_workspace_is_full() {
     let data = tempfile::tempdir().unwrap();
@@ -461,8 +435,6 @@ fn a_new_manifest_is_refused_once_the_workspace_is_full() {
     assert!(validate_data_write(data.path(), "fonts/aaa/a.woff2", WOFF2).is_ok());
 }
 
-/// Several fonts arriving together, as a plugin brings them, need room for
-/// every new one. A font already installed is a replacement and takes none.
 #[test]
 fn room_counts_only_the_fonts_not_yet_installed() {
     let data = tempfile::tempdir().unwrap();
@@ -481,8 +453,6 @@ fn room_counts_only_the_fonts_not_yet_installed() {
     assert!(err.contains("remove 1"), "{err}");
 }
 
-/// Bold is judged on upright faces: a bold italic alone would still leave
-/// upright bold text to be smeared.
 #[test]
 fn only_an_upright_bold_face_counts_as_bold() {
     let font = |faces: &[(&str, FaceStyle)]| WorkspaceFont {

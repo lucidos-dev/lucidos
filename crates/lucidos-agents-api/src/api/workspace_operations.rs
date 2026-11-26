@@ -1,5 +1,3 @@
-//! Typed cross-workspace operations always enter through their source engine.
-
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Request, StatusCode};
@@ -14,12 +12,10 @@ use super::{actor, error::ApiError, AppState};
 use crate::engine::thread_events::{ActorMode, RemoteStartAsk};
 use lucidos_gateway_stamp::remote_start::{RemoteStart, RemoteStartSetting, HEADER_REMOTE_START};
 
-/// What the verified operation says about its route, for the handler it reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RoutedOrigin {
     pub(super) caller_gateway: String,
     pub(super) routing_gateway: String,
-    /// The pairing whose setting is Ask, when the start waits for the owner.
     pub(super) remote_start: Option<Box<RemoteStartAsk>>,
 }
 
@@ -31,7 +27,6 @@ pub(super) fn routed_origin() -> Option<RoutedOrigin> {
     ROUTED_ORIGIN.try_with(Clone::clone).ok()
 }
 
-/// The pairing an Ask start waits on. An Allow start waits on nobody.
 fn awaited_pairing(start: Option<RemoteStart>) -> Option<Box<RemoteStartAsk>> {
     let start = start?;
     let pairing = start.pairing?;
@@ -43,7 +38,6 @@ fn awaited_pairing(start: Option<RemoteStart>) -> Option<Box<RemoteStartAsk>> {
     })
 }
 
-/// The ack field that tells the sending agent how its start went.
 const ACK_REMOTE_START: &str = "remote_start";
 
 fn validate_spawn_body(body: &serde_json::Map<String, serde_json::Value>) -> Result<(), ApiError> {
@@ -97,8 +91,6 @@ fn validate_spawn_body(body: &serde_json::Map<String, serde_json::Value>) -> Res
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/workspace-operations", post(outbound))
-        // Literal, so the route guards can read them. A test pins both to the
-        // stamp crate's RECEIVE_ROUTE and RECEIVE_START_ROUTE.
         .route("/workspace-operations/receive", post(receive_read))
         .route("/workspace-operations/receive-start", post(receive_start))
         .layer(axum::middleware::map_response(
@@ -278,8 +270,6 @@ async fn receive_read(
     receive(state, headers, signed).await
 }
 
-/// A gateway sends every start here. Serving this route is how an engine shows
-/// it enforces the remote start setting, so a start never reaches the read route.
 async fn receive_start(
     state: State<AppState>,
     headers: HeaderMap,
@@ -379,8 +369,6 @@ async fn receive(
         .body(body)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     request.headers_mut().extend(headers);
-    // The closed operation chose the path above; these are the existing handlers,
-    // invoked in-process, with no arbitrary HTTP surface exposed to the caller.
     let app = Router::new()
         .nest(
             "/api/v1",
@@ -554,6 +542,9 @@ mod tests {
             MessageOrigin::Webhook {
                 webhook_id: "fixture-hook".into(),
                 name: "Fixture hook".into(),
+            },
+            MessageOrigin::EventHook {
+                slug: "fixture-gate".into(),
             },
         ] {
             let thread = uuid::Uuid::new_v4();

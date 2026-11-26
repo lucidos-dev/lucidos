@@ -1,6 +1,3 @@
-//! `submit_as_agent` resolves the caller's owner authority itself (ADR 0651).
-//! These tests drive it on a bare bus and pool, as the acceptance tests do.
-
 use super::*;
 
 use crate::engine::event_bus::BusEvent;
@@ -56,8 +53,6 @@ impl Bench {
         teardown_test_db(&self.db).await;
     }
 
-    /// A saved chat draft on a new thread, optionally a child of `parent`.
-    /// Its tokens are read back from the stored row.
     async fn draft(&self, parent: Option<Uuid>) -> SubmitDraftRequest {
         let thread = Uuid::new_v4();
         sqlx::query(
@@ -90,7 +85,6 @@ impl Bench {
         SavedDraftSnapshot::try_from(raw).unwrap()
     }
 
-    /// Open a turn on `caller`. A `Device` origin is the owner's own turn.
     async fn open_turn(&self, caller: Uuid, origin: MessageOrigin) {
         self.bus
             .emit(BusEvent::Thread {
@@ -119,8 +113,6 @@ impl Bench {
             .unwrap();
     }
 
-    /// The owner grants `caller` a once permission to send `target`'s draft,
-    /// through the engine's own card. Returns the permission's id.
     async fn allow_send(&self, caller: Uuid, target: Uuid) -> Uuid {
         use crate::api::permission_requests::{tests::grant, thread_ask};
         use crate::engine::permission::menu::ALLOW_ONCE_LABEL;
@@ -138,8 +130,6 @@ impl Bench {
         .unwrap()
     }
 
-    /// Raise an agent-worded card on `caller` and answer it Allow once from a
-    /// device. `legacy_card` marks it a pre-permission approval for `target`.
     async fn allow(&self, caller: Uuid, legacy_card: Option<Uuid>) -> String {
         let parsed = crate::engine::question_parsing::parse_ask_user_question_inputs(&json!({
             "questions": [{"question":"Submit the saved draft?", "options":[
@@ -189,7 +179,6 @@ impl Bench {
         tool_use_id
     }
 
-    /// Receipts, queue entries and acceptance events, in that order.
     async fn counts(&self) -> (i64, i64, i64) {
         sqlx::query_as(
             "SELECT (SELECT count(*) FROM draft_submissions), (SELECT count(*) FROM thread_queue), \
@@ -249,7 +238,6 @@ async fn an_owner_opened_turn_submits_and_a_retry_returns_its_receipt() {
         bench.recorded_authority(&receipt).await["kind"],
         "standing-instruction"
     );
-    // The instruction ends with the owner's turn, yet the receipt stands.
     bench
         .open_turn(caller, agent_thread_actor(Uuid::new_v4()))
         .await;
@@ -274,7 +262,6 @@ async fn an_owner_opened_turn_submits_and_a_retry_returns_its_receipt() {
     bench.close().await;
 }
 
-/// I7: activity on the target after the read leaves its draft revision alone.
 #[tokio::test]
 async fn activity_on_the_target_after_the_read_does_not_make_it_stale() {
     let bench = Bench::new().await;
@@ -299,8 +286,6 @@ async fn activity_on_the_target_after_the_read_does_not_make_it_stale() {
     bench.close().await;
 }
 
-/// I7: a permission card on the draft's own thread moves that row before the
-/// acceptance consumes the draft. The consumption must still land.
 #[tokio::test]
 async fn a_permission_on_the_drafts_own_thread_consumes_the_draft() {
     let bench = Bench::new().await;
@@ -317,8 +302,6 @@ async fn a_permission_on_the_drafts_own_thread_consumes_the_draft() {
     bench.close().await;
 }
 
-/// A fresh key on a sent draft refuses as stale, not unauthorized. The caller
-/// rereads instead of asking the owner for a second card.
 #[tokio::test]
 async fn a_stale_draft_refuses_before_authority_is_looked_up() {
     let bench = Bench::new().await;
@@ -366,7 +349,6 @@ async fn a_live_permission_submits_once_and_a_retry_survives_the_spend() {
             .unwrap(),
         receipt
     );
-    // The spent grant sends no second draft, even on the same target.
     sqlx::query("UPDATE thread_summaries SET compose_text = 'second text' WHERE thread_id = $1")
         .bind(request.thread_id)
         .execute(&bench.pool)
@@ -400,14 +382,10 @@ async fn subtree_ordinary_cards_legacy_cards_and_other_targets_grant_nothing() {
     let caller = Uuid::new_v4();
     bench.open_turn(caller, agent_thread_actor(caller)).await;
 
-    // The caller's own child: reach is not owner authority.
     let child = bench.draft(Some(caller)).await;
-    // An ordinary card answered with the same label.
     bench.allow(caller, None).await;
-    // A permission naming another thread.
     let other = bench.draft(None).await;
     bench.allow_send(caller, other.thread_id).await;
-    // A pre-permission approval card naming this very draft.
     let legacy = bench.draft(None).await;
     bench.allow(caller, Some(legacy.thread_id)).await;
 
@@ -425,7 +403,6 @@ async fn subtree_ordinary_cards_legacy_cards_and_other_targets_grant_nothing() {
         );
         assert_eq!(bench.snapshot(request.thread_id).await, before);
     }
-    // Spawn provenance is no instruction either: a turn the parent opened.
     let spawned = Uuid::new_v4();
     bench.open_turn(spawned, agent_thread_actor(caller)).await;
     let request = bench.draft(None).await;
@@ -472,8 +449,6 @@ async fn a_stale_revision_or_epoch_refuses_without_mutation() {
     bench.close().await;
 }
 
-/// No text is no draft, as the drafts read says. Whitespace is a draft the
-/// drafts read lists, so it refuses as one the owner must fix.
 #[tokio::test]
 async fn an_empty_draft_is_missing_and_a_blank_one_is_not_sendable() {
     let bench = Bench::new().await;

@@ -1,6 +1,3 @@
-//! A thread's own events project its enabled MCP servers. A stop or a remove
-//! switches a server off in every thread (ADR 0430).
-
 use super::*;
 use crate::engine::thread_events::McpEnablementSource;
 
@@ -61,8 +58,6 @@ async fn enabling_adds_the_id_once_and_disabling_removes_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// The invariant "stop reaches every thread": two threads enabled one server,
-/// and one stop empties both, while a third server stays where it was.
 #[tokio::test]
 async fn a_stop_or_a_remove_switches_the_server_off_in_every_thread() {
     let (pool, db_name) = setup_test_db().await;
@@ -95,7 +90,6 @@ async fn a_stop_or_a_remove_switches_the_server_off_in_every_thread() {
     teardown_test_db(&db_name).await;
 }
 
-/// Enabling is bookkeeping: it moves no status, section or recency.
 #[tokio::test]
 async fn enabling_leaves_the_thread_where_it_was() {
     let (pool, db_name) = setup_test_db().await;

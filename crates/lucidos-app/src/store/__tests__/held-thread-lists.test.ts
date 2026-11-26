@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { makeThread } from './thread-flows-helpers';
-import { listsInOngoing, threadInReview, threadIsBlocked } from '../store';
+import { listsInOngoing, threadAwaitsOwnerAnswer, threadInReview, threadIsBlocked } from '../store';
 import { threadIsInFlight } from '../../components/drawer/family-graph';
 import type { ThreadState } from '../thread-events';
 
@@ -34,6 +34,15 @@ describe('a thread on hold and the Ongoing tiles', () => {
     const thread = liveThread('failed');
     expect(threadIsBlocked(thread)).toBe(true);
     hold(thread);
+    expect(threadIsBlocked(thread)).toBe(false);
+  });
+
+  it('takes a thread parked on a question out of Blocked', () => {
+    const thread = liveThread('waiting_for_user_answer');
+    expect(threadAwaitsOwnerAnswer(thread)).toBe(true);
+    expect(threadIsBlocked(thread)).toBe(true);
+    hold(thread);
+    expect(threadAwaitsOwnerAnswer(thread)).toBe(false);
     expect(threadIsBlocked(thread)).toBe(false);
   });
 

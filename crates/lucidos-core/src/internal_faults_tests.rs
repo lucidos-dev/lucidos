@@ -66,7 +66,6 @@ async fn internal_faults_dedupe_across_buses_restart_and_reset_on_sent() {
     .unwrap();
     let (restarted, _) = EventBus::new(pool.clone());
     assert_eq!(count(&restarted).await.unwrap(), 0);
-    // The worker committed but died before acknowledging its marker.
     restarted
         .emit_internal_fault(receipt, FaultKind::Panic)
         .await

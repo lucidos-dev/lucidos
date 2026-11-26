@@ -1,16 +1,3 @@
-//! E2E for the *read decision* routes (ADR 0409, ADR 0417): a coding agent
-//! decides through `lucidos request-read yes|no`, and the drawer reports that
-//! the user saw the reply.
-//!
-//! What it pins, against a real engine:
-//!
-//! * `POST .../read-request` refuses a body without `read` with a 400
-//! * `{"read": false}` records `ThreadReadNotRequested` and sets nothing
-//! * `{"read": true}` sets `read_requested` and records
-//!   `ThreadReadRequested`, and refuses an unknown thread with a 404
-//! * `POST .../read-request/seen` clears it once, records one
-//!   `ThreadReplySeen`, and answers `seen: false` when nothing is pending
-
 use crate::support::{base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client};
 use uuid::Uuid;
 
@@ -44,8 +31,6 @@ async fn post(url: String, body: serde_json::Value) -> reqwest::Response {
         .expect("request failed")
 }
 
-/// Wait until the chat turn has recorded its response, and with it the turn's
-/// own read decision.
 async fn wait_for_turn_end(pool: &sqlx::PgPool, thread_id: Uuid) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while count_events(pool, thread_id, "ResponseGenerated").await == 0 {
@@ -57,7 +42,6 @@ async fn wait_for_turn_end(pool: &sqlx::PgPool, thread_id: Uuid) {
     }
 }
 
-/// Report a sighting as the drawer does: with the summary version it saw.
 async fn see(pool: &sqlx::PgPool, thread_id: Uuid, url: &str) -> reqwest::Response {
     let summary_version: i64 =
         sqlx::query_scalar("SELECT summary_version FROM thread_summaries WHERE thread_id = $1")

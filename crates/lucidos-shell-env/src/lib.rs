@@ -1,23 +1,3 @@
-//! Hydrate the user's login-shell environment for a service launch.
-//!
-//! A process started by launchd or systemd inherits the service manager's
-//! environment, not the user's. `~/.zprofile` and `~/.zshrc` never ran, so
-//! nothing exported there exists, and PATH is a bare system one. That breaks
-//! two things:
-//!
-//!  * **Provider discovery.** The engine and the coding agents it spawns
-//!    resolve their credentials from environment variables. Keys in a shell
-//!    profile hit the no-provider wall.
-//!  * **Tool resolution.** `claude`, `codex`, `git` and `npx` installed via
-//!    Homebrew, nvm, asdf, mise or volta are all off the service PATH.
-//!
-//! **Why the gateway.** It is the root both shipped installs share: the `.app`
-//! runs it under `Lucidos --service`, the headless install runs it directly.
-//! Every engine and coding agent inherits its environment (ADR 0326).
-//!
-//! The engine's `core::user_path` is a floor for the common install dirs. This
-//! reads the PATH the user actually has, and the two compose.
-
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
@@ -25,30 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The variables carried over from the login shell, and the ONLY ones.
-///
-/// An allowlist rather than a wholesale copy, on purpose. This process is the
-/// root of the packaged stack: the gateway, every workspace engine and every
-/// coding agent inherit whatever lands here. Copying wholesale would let a
-/// developer's `~/.zshrc` silently redefine the packaged app's topology.
-///
-/// So membership is narrow. A variable belongs here when it decides whether a
-/// provider or a tool can be REACHED AT ALL. It must also be absent only
-/// because the profile never ran. Credentials, the paths they live at, and PATH.
-///
-/// Deliberately absent:
-///
-///  * **Behavior selectors** such as `LUCIDOS_MODEL` or `HF_HOME`. They pick
-///    behavior, not reachability, and they have a Settings UI.
-///  * **Proxy variables.** Needed behind a corporate proxy, but a hydrated
-///    proxy also sits in front of the gateway-to-engine loopback hops.
-///
-/// PATH is in the list but is NOT applied by the same rule: see [`merged_path`].
 const HYDRATED_VARS: &[&str] = &[
-    // Tool resolution for everything spawned below this process.
     "PATH",
-    // Provider credentials the engine reads (`llm/`) and the ones the coding
-    // agents read for themselves.
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "LUCIDOS_OPENROUTER_API_KEY",
@@ -57,62 +15,23 @@ const HYDRATED_VARS: &[&str] = &[
     "LUCIDOS_LOCAL_API_KEY",
     "VERTEX_PROJECT_ID",
     "VERTEX_REGION",
-    // Where a credential lives, rather than the credential itself: the gcloud
-    // ADC file the Vertex provider reads, and the config dirs holding the two
-    // coding agents' own logins.
     "GOOGLE_APPLICATION_CREDENTIALS",
     "CLOUDSDK_CONFIG",
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
 ];
 
-/// Fallback login shell when `$SHELL` says nothing usable. macOS has defaulted
-/// to zsh since Catalina. Linux guarantees only `/bin/sh`.
 #[cfg(target_os = "macos")]
 const DEFAULT_SHELL: &str = "/bin/zsh";
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_SHELL: &str = "/bin/sh";
 
-/// Printed by the login shell immediately before the environment dump, so a
-/// profile that greets the user cannot be mistaken for the payload. Everything
-/// up to and including the first occurrence is discarded. See
-/// [`env_after_marker`].
 const MARKER: &str = "__LUCIDOS_SHELL_ENV__";
 
-/// How long the login shell gets to answer.
-///
-/// A profile can hang outright: a slow nvm or mise init, a network call, a
-/// prompt framework waiting on something. A service can also start at login,
-/// before the profile is comfortable to run. This runs before the gateway
-/// serves anything, so a hung shell must cost a bounded delay and nothing
-/// else. Five seconds is generous for a real profile and invisible against the
-/// gateway-health budget.
-/// A shell that cannot answer within it is hung rather than slow.
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the shell's output may still be arriving AFTER the shell itself has
-/// exited. Separate from [`SHELL_TIMEOUT`] on purpose: see the call site in
-/// [`read_stdout_bounded`].
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
-/// Resolve the login shell's environment and apply the allowlisted parts to
-/// THIS process, so everything below it inherits them. Every failure is logged
-/// and swallowed, since no shell problem may keep the gateway from starting.
-///
-/// # Safety contract
-///
-/// Calls `std::env::set_var`, so it must run while the process is still
-/// single-threaded. Two things establish that, and both are load-bearing:
-///
-///  * The one call site is in the gateway's `boot()`, above the tokio runtime
-///    build. A test in the gateway's `main.rs` pins that order.
-///  * [`read_stdout_bounded`], which this calls first, does spawn a reader
-///    thread. It hands back output only where it has joined that thread. Every
-///    path that leaves the thread running returns `Err`, which returns from
-///    here before any `set_var`.
-///
-/// Anything added between them has to preserve that, which is why it is spelled
-/// out rather than left as "it is early in `main`".
 pub fn hydrate_login_shell_env(log: impl Fn(String)) {
     let packaged = std::env::var_os("LUCIDOS_PACKAGED");
     let shlvl = std::env::var_os("SHLVL");
@@ -156,8 +75,6 @@ pub fn hydrate_login_shell_env(log: impl Fn(String)) {
             shell.display()
         ));
     } else {
-        // NAMES only. Several of these are API keys, and this line lands in the
-        // service log.
         let names: Vec<&str> = plan.iter().map(|(name, _)| name.as_str()).collect();
         log(format!(
             "[shell-env] hydrated from {}: {}",
@@ -167,18 +84,6 @@ pub fn hydrate_login_shell_env(log: impl Fn(String)) {
     }
 }
 
-/// Does this gateway need its environment hydrated from a login shell?
-///
-/// Two signals, both required:
-///
-///  * **`LUCIDOS_PACKAGED=1`.** Both shipped installs set it, and the dev
-///    gateway never does, so dev behaviour cannot change.
-///  * **No `SHLVL`.** Every POSIX shell sets and exports it, and launchd and
-///    systemd set nothing of the kind. A present `SHLVL` means the environment
-///    already came through a shell, as in `install.sh`'s foreground launch.
-///
-/// Pure over its inputs, so the decision is testable without touching process
-/// env.
 fn should_hydrate(packaged: Option<&OsStr>, shlvl: Option<&OsStr>) -> bool {
     is_packaged(packaged) && shlvl.is_none()
 }
@@ -187,9 +92,6 @@ fn is_packaged(packaged: Option<&OsStr>) -> bool {
     packaged == Some(OsStr::new("1"))
 }
 
-/// The user's login shell: `$SHELL` when it says something usable, else
-/// [`DEFAULT_SHELL`]. Blank and whitespace-only values are treated as unset,
-/// since a service environment can carry an empty one.
 fn login_shell(shell: Option<OsString>) -> PathBuf {
     shell
         .filter(|s| !s.to_string_lossy().trim().is_empty())
@@ -197,20 +99,6 @@ fn login_shell(shell: Option<OsString>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SHELL))
 }
 
-/// The command that asks a login shell for its environment.
-///
-/// `-i` as well as `-l`: `~/.zshrc` and `~/.bashrc` are sourced only for
-/// INTERACTIVE shells, which is where most people put their exports. A
-/// login-only shell would miss the common case entirely.
-///
-/// `env -0` rather than a bare `env`, because environment values legitimately
-/// contain newlines. Splitting on them would corrupt every multi-line value and
-/// invent junk entries from the pieces. `/usr/bin/env` by absolute path, so a
-/// profile's `env` function or alias cannot stand in for it.
-///
-/// stdin and stderr are `/dev/null`. stdin because a profile that reads from it
-/// would block against a pipe nobody writes to. stderr because its content is
-/// the user's profile noise, which we must not risk logging.
 fn login_shell_command(shell: &Path) -> Command {
     let mut cmd = Command::new(shell);
     cmd.arg("-ilc")
@@ -221,8 +109,6 @@ fn login_shell_command(shell: &Path) -> Command {
     cmd
 }
 
-/// Run the login shell and return its raw stdout, or an error message naming
-/// what went wrong.
 fn read_login_shell_env(shell: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
     read_stdout_bounded(
         login_shell_command(shell),
@@ -231,12 +117,6 @@ fn read_login_shell_env(shell: &Path, timeout: Duration) -> Result<Vec<u8>, Stri
     )
 }
 
-/// SIGKILL an entire process group. `pid` must be the group leader, which
-/// `process_group(0)` in [`read_stdout_bounded`] guarantees for the child it
-/// spawns.
-///
-/// Signalling the GROUP rather than the one process is what makes the deadline
-/// real: see the pipe-lifetime paragraph on [`read_stdout_bounded`].
 fn kill_process_group(pid: u32) {
     // SAFETY: a negative pid is POSIX for "every process in group |pid|". The
     // group is the one we created for our own child, so nothing outside this
@@ -246,33 +126,12 @@ fn kill_process_group(pid: u32) {
     }
 }
 
-/// Run `cmd` to completion and return its stdout, killing it if it overruns
-/// `timeout`. Split out from [`read_login_shell_env`] so the bound can be
-/// tested against a child that really hangs.
-///
-/// **stdout is drained on a thread WHILE the child runs**, not after it exits.
-/// A full environment can exceed the 64 KiB pipe buffer, and a child blocked
-/// writing into a pipe nobody reads never exits. So a wait-for-exit-then-read
-/// helper would deadlock on exactly the large environments this must handle.
-///
-/// **Nothing waits on that thread without a deadline, and the child gets its
-/// own process group.** Both exist for the same subtle reason. A pipe reaches
-/// EOF only when the LAST write end closes, and every descendant the shell
-/// spawned inherited one. So a profile that backgrounds anything leaves the
-/// read blocked long after the shell is gone, and a plain `join()` would sail
-/// past the deadline. `process_group(0)` lets the timeout take the whole tree
-/// down, and the result comes back over a channel.
-///
-/// `label` names the child in every error message. It must never be built from
-/// anything the environment dump contained.
 fn read_stdout_bounded(
     mut cmd: Command,
     label: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + timeout;
-    // Make the child its own process-group leader, so `kill_process_group` can
-    // reach whatever it spawned.
     cmd.process_group(0);
     let mut child = cmd
         .spawn()
@@ -287,8 +146,6 @@ fn read_stdout_bounded(
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        // The receiver is gone on the timeout path; that send failing is the
-        // normal way this thread ends there.
         let _ = done.send(buf);
     });
 
@@ -296,17 +153,9 @@ fn read_stdout_bounded(
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
-                // The group kill already covers the child, since it leads the
-                // group. Signalling it directly as well is what makes the
-                // `wait` below unconditionally safe: `wait` blocks until the
-                // child is gone, so it must never be reachable with the child
-                // still alive, whatever the group call did.
                 let _ = child.kill();
                 kill_process_group(pid);
                 let _ = child.wait();
-                // `{:?}` rather than `as_secs()`, which truncates a sub-second
-                // budget to "within 0s". That reads as a bug in the caller
-                // rather than a hung shell.
                 return Err(format!(
                     "{label} did not answer within {timeout:?} and was stopped"
                 ));
@@ -316,47 +165,17 @@ fn read_stdout_bounded(
         }
     }
 
-    // The shell exited, so its output is already written and the reader has
-    // normally finished draining it before we get here. It still gets a bound,
-    // for the case where a background descendant is holding the pipe open: we
-    // would rather launch un-hydrated than wait on a daemon the user's profile
-    // started. Deliberately NOT a group kill here, unlike the path above: the
-    // shell answered, so anything still running is something the profile meant
-    // to leave running.
-    //
-    // [`DRAIN_GRACE`] rather than what is left of `deadline`, because the child
-    // can exit in the last poll tick and leave nothing at all. Draining a pipe
-    // whose writer has exited is a memcpy, so the grace never makes a launch
-    // slow. A zero budget would blame a descendant for a shell that answered.
     match output.recv_timeout(DRAIN_GRACE) {
-        // Its blocking read is done and it has already sent, so this join only
-        // waits for the thread to return and exit. That matters beyond
-        // tidiness: `hydrate_login_shell_env` calls `std::env::set_var` on what
-        // we return, which is sound only while the process is single-threaded,
-        // so this is where that promise is actually kept.
         Ok(buf) => {
             let _ = reader.join();
             Ok(buf)
         }
-        // Abandoned rather than joined. The thread is parked on a read a live
-        // descendant can hold open indefinitely. Joining it is exactly the
-        // unbounded wait this function exists to prevent. It costs one parked
-        // thread and its buffer, once per service start. No `set_var` follows
-        // an `Err`, so the single-threaded promise above still holds.
         Err(_) => Err(format!(
             "{label} answered but something it started still held its output open"
         )),
     }
 }
 
-/// The environment payload: everything after the FIRST [`MARKER`], or `None`
-/// when the marker never appeared (a shell that failed to start, a profile that
-/// exited early).
-///
-/// First occurrence rather than last. Only profile chatter is guaranteed to
-/// precede the real marker, while a marker-shaped string inside a later value
-/// is not something to guess about. A profile that printed the marker itself
-/// leaves noise in the payload, which parses into entries with no `=`.
 fn env_after_marker(stdout: &[u8]) -> Option<&[u8]> {
     let marker = MARKER.as_bytes();
     let start = stdout
@@ -366,17 +185,6 @@ fn env_after_marker(stdout: &[u8]) -> Option<&[u8]> {
     Some(&stdout[start..])
 }
 
-/// Parse `env -0` output into `(name, value)` pairs.
-///
-/// Splitting on NUL is what makes this safe. A value containing a NEWLINE
-/// survives whole, and so does one containing `=`, since the name is taken up
-/// to the FIRST `=` only. Entries that are not valid UTF-8 are dropped rather
-/// than lossily mangled, as are entries with no `=` or an empty name.
-///
-/// Only NUL-TERMINATED entries count. `env -0` terminates every entry it emits,
-/// including the last, so an unterminated tail means the dump was cut short.
-/// Dropping it stops half an API key being applied as if it were whole. That
-/// would fail authentication in a way that looks nothing like a truncated read.
 fn parse_null_delimited(payload: &[u8]) -> Vec<(String, String)> {
     payload
         .split_inclusive(|b| *b == 0)
@@ -388,24 +196,6 @@ fn parse_null_delimited(payload: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Which of the shell's variables to apply, given what is already set here.
-///
-/// Two filters, in this order:
-///
-///  * **The allowlist** ([`HYDRATED_VARS`]), so nothing else in the user's shell
-///    can reach the packaged stack.
-///  * **Never override.** A name already present in this process wins. An
-///    explicitly passed variable, a plist entry or a Lucidos-managed value is
-///    a deliberate decision, which a shell profile may not quietly outrank.
-///
-/// PATH is excluded here and handled by [`merged_path`] instead: the service
-/// manager always sets one, so the never-override rule alone would mean PATH
-/// never hydrates.
-/// Empty values are dropped, since an exported-but-empty key is not a
-/// credential and would only mask the fallbacks below it.
-///
-/// `already_set` is injected so the rule is testable without mutating real
-/// process env.
 fn variables_to_apply(
     shell_env: &[(String, String)],
     already_set: impl Fn(&str) -> bool,
@@ -420,12 +210,6 @@ fn variables_to_apply(
         .collect()
 }
 
-/// Everything to set on this process, in order: the allowlisted variables from
-/// [`variables_to_apply`], then PATH merged by [`merged_path`] when the shell
-/// reported one.
-///
-/// `inherited` reads a variable from this process. It is injected so the whole
-/// plan is testable without mutating real process env.
 fn hydration_plan(
     shell_env: &[(String, String)],
     inherited: impl Fn(&str) -> Option<OsString>,
@@ -442,19 +226,6 @@ fn hydration_plan(
     plan
 }
 
-/// Merge the login shell's PATH over the inherited one: the shell's directories
-/// first, then any inherited directory not already among them, in order.
-///
-/// PATH is the one allowlisted variable that overrides what the process already
-/// has, and it has to be. launchd and systemd hand every service a minimal
-/// PATH, so it is never absent and a strict never-override rule would skip it.
-///
-/// Merged rather than replaced so the service manager's floor cannot be lost: a
-/// login shell that somehow omits `/usr/bin` still leaves the engine able to
-/// find `git`. Duplicates keep their first position, and empty components are
-/// dropped because an empty PATH element means the current directory. Same
-/// shape as the engine's `core::user_path::augmented_user_path`, which the
-/// gateway cannot reuse because it does not link the engine (ADR 0014 §1).
 fn merged_path(shell_path: &OsStr, inherited: Option<&OsStr>) -> OsString {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -471,8 +242,6 @@ fn merged_path(shell_path: &OsStr, inherited: Option<&OsStr>) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── When hydration runs at all ──────────────────────────────────────────
 
     fn os(s: &str) -> Option<&OsStr> {
         Some(OsStr::new(s))
@@ -510,8 +279,6 @@ mod tests {
         assert!(!should_hydrate(os(""), None));
         assert!(!should_hydrate(os("true"), None));
     }
-
-    // ── Which shell we ask ──────────────────────────────────────────────────
 
     #[test]
     fn the_fallback_shell_exists_on_this_platform() {
@@ -553,8 +320,6 @@ mod tests {
         );
     }
 
-    // ── Finding the payload ─────────────────────────────────────────────────
-
     #[test]
     fn marker_discards_whatever_the_profile_printed_first() {
         let raw = format!("Welcome back!\nnvm: v20.11.0\n{MARKER}A=1\0");
@@ -573,8 +338,6 @@ mod tests {
             "a shell that never reached the dump must not look like an empty environment"
         );
     }
-
-    // ── Parsing the payload ─────────────────────────────────────────────────
 
     #[test]
     fn a_value_containing_a_newline_survives_whole() {
@@ -607,7 +370,6 @@ mod tests {
 
     #[test]
     fn junk_entries_are_dropped_rather_than_guessed_at() {
-        // No '=', an empty name, an empty trailing chunk, and invalid UTF-8.
         let mut payload: Vec<u8> = b"no equals here\0=orphan value\0GOOD=y\0".to_vec();
         payload.extend_from_slice(b"BAD=\xff\xfe\0");
         assert_eq!(
@@ -629,8 +391,6 @@ mod tests {
             "half a key applied as if it were whole would fail auth for no visible reason"
         );
     }
-
-    // ── Choosing what to apply ──────────────────────────────────────────────
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -728,8 +488,6 @@ mod tests {
         );
     }
 
-    // ── PATH ────────────────────────────────────────────────────────────────
-
     #[test]
     fn merged_path_puts_the_shells_dirs_first_and_keeps_the_inherited_tail() {
         let merged = merged_path(
@@ -776,8 +534,6 @@ mod tests {
         );
     }
 
-    // ── The bounded read ────────────────────────────────────────────────────
-
     #[test]
     fn a_real_shell_answers_with_a_marked_null_delimited_environment() {
         let stdout = read_login_shell_env(Path::new("/bin/sh"), Duration::from_secs(10))
@@ -793,11 +549,6 @@ mod tests {
 
     #[test]
     fn a_login_shell_with_a_version_manager_on_path_hydrates_the_plan() {
-        // The headless-install regression end to end, short of `set_var`: the
-        // real command, reader, parser and plan. The exports live in the
-        // `~/.profile` of a throwaway HOME, the way a version manager installs
-        // itself. A login shell reads it after `/etc/profile`, which on Debian
-        // overwrites PATH outright.
         let nvm_bin = "/home/u/.nvm/versions/node/v22.3.0/bin";
         let home_dir = tempfile::tempdir().expect("temp HOME");
         let home = home_dir.path();
@@ -852,14 +603,12 @@ mod tests {
         }
     }
 
-    /// A child that never returns, standing in for a wedged `.zshrc`.
     fn a_child_that_hangs() -> Command {
         let mut cmd = Command::new("/bin/sleep");
         cmd.arg("30").stdin(Stdio::null()).stdout(Stdio::piped());
         cmd
     }
 
-    /// A `/bin/sh` running `script`, wired up the way the real login shell is.
     fn a_shell_running(script: &str) -> Command {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
@@ -892,10 +641,6 @@ mod tests {
 
     #[test]
     fn the_timeout_takes_the_shells_descendants_with_it() {
-        // A profile that backgrounds something and then hangs. The background
-        // child would touch the marker file half a second in, so its absence
-        // afterwards proves the whole process GROUP was killed. Killing only
-        // the shell would leave that child holding the stdout pipe.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("descendant");
         let script = format!("( sleep 0.5; touch '{}' ) & sleep 30", marker.display());
@@ -921,17 +666,6 @@ mod tests {
 
     #[test]
     fn a_descendant_holding_the_pipe_after_the_shell_exits_cannot_outlast_the_deadline() {
-        // The shell answers and exits immediately, but something it started in
-        // the background still holds the write end, so the pipe never reaches
-        // EOF. Reading to EOF is then unbounded, and the launch must not be.
-        //
-        // The timeout here is deliberately GENEROUS, and is not what is under
-        // test. The subject is the drain grace that runs after the shell exits,
-        // which is only reached when the shell exits before the deadline. A
-        // tight deadline races the shell's own startup instead. On a loaded
-        // machine the deadline arm then wins, and the assertion fails against
-        // "did not answer" rather than the descendant. `SHELL_TIMEOUT` is the
-        // real budget this call gets in production, so use exactly that.
         let started = Instant::now();
         let err = read_stdout_bounded(
             a_shell_running("printf hello; sleep 30 & exit 0"),
@@ -943,9 +677,6 @@ mod tests {
             err.contains("held its output open"),
             "the failure must name the actual cause: {err}"
         );
-        // The whole point: bounded by the drain grace, NOT by the shell timeout
-        // the descendant would otherwise run out. Comfortably under
-        // `SHELL_TIMEOUT` so the assertion distinguishes the two paths.
         assert!(
             started.elapsed() < SHELL_TIMEOUT,
             "an exited shell with a live descendant must not stall the launch; took {:?}",

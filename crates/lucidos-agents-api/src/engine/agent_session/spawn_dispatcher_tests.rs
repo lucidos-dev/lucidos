@@ -62,8 +62,6 @@ fn continuation(reason: &str) -> ThreadEvent {
     }
 }
 
-/// Emit the system-attributed teardown `ResponseAborted` recovery uses to mark a
-/// crash-interrupted turn (via the typed helper, per the emit rule).
 async fn abort_as_system(bus: &EventBus, thread_id: Uuid) {
     crate::engine::thread_events::emit_response_aborted(
         bus,
@@ -96,7 +94,6 @@ async fn emit_cc_thread(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> 
     res.event_id
 }
 
-/// A coding-agent thread with one `ContinuationRequested`. Returns the request.
 async fn requested_thread(bus: &EventBus, reason: &str) -> SpawnRequest {
     let thread_id = Uuid::new_v4();
     start_cc_session(bus, thread_id, "claude-code/cont", None).await;
@@ -107,14 +104,11 @@ async fn requested_thread(bus: &EventBus, reason: &str) -> SpawnRequest {
     }
 }
 
-/// Build a dispatcher with a fresh outbound channel. Returns the dispatcher
-/// and the receiver so tests can assert what (if anything) was sent.
 fn make_dispatcher(pool: sqlx::PgPool) -> (SpawnDispatcher, UnboundedReceiver<SpawnRequest>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (SpawnDispatcher::new(pool, tx), rx)
 }
 
-/// The next request the dispatcher sends. The timeout only bounds a failure.
 async fn next_sent(spawn_rx: &mut UnboundedReceiver<SpawnRequest>) -> SpawnRequest {
     tokio::time::timeout(Duration::from_secs(5), spawn_rx.recv())
         .await
@@ -122,9 +116,6 @@ async fn next_sent(spawn_rx: &mut UnboundedReceiver<SpawnRequest>) -> SpawnReque
         .expect("channel must yield a SpawnRequest")
 }
 
-/// Emit a request on a fresh thread and assert it is the NEXT one sent. The
-/// dispatcher handles requests in order, after its startup scan, so any send
-/// owed before the barrier has already arrived when the barrier does.
 async fn assert_nothing_else_sent(bus: &EventBus, spawn_rx: &mut UnboundedReceiver<SpawnRequest>) {
     let barrier = requested_thread(bus, AUTO_RESUME_AFTER_SWITCH_REASON).await;
     assert_eq!(
@@ -134,8 +125,6 @@ async fn assert_nothing_else_sent(bus: &EventBus, spawn_rx: &mut UnboundedReceiv
     );
 }
 
-/// Every committed `ContinuationRequested` reaches the dispatcher, and the
-/// dispatcher forwards it to the engine-side consumer.
 #[tokio::test]
 async fn continuation_requested_produces_spawn_request() {
     let (pool, db_name) = setup_test_db().await;
@@ -151,8 +140,6 @@ async fn continuation_requested_produces_spawn_request() {
     teardown_test_db(&db_name).await;
 }
 
-/// The bus sends only `ContinuationRequested`, and it sends synchronously in
-/// PostCommit, so nothing else is on the channel when `emit` returns.
 #[tokio::test]
 async fn only_a_continuation_request_reaches_the_channel() {
     let (pool, db_name) = setup_test_db().await;
@@ -215,8 +202,6 @@ async fn dispatcher_does_not_double_spawn_for_same_trigger() {
     let SpawnRequest::Continue { event_id, .. } = request;
     assert!(!dispatcher.already_spawned(event_id).await);
 
-    // The insert into the idempotency set is the atomic claim: two
-    // dispatches, one SpawnRequest.
     dispatcher.dispatch_spawn(request.clone()).await;
     dispatcher.dispatch_spawn(request.clone()).await;
     assert!(dispatcher.already_spawned(event_id).await);
@@ -233,8 +218,6 @@ async fn dispatcher_does_not_double_spawn_for_same_trigger() {
     teardown_test_db(&db_name).await;
 }
 
-/// A trigger already followed by a CC lifecycle event counts as spawned, so
-/// the run loop never re-fires it.
 #[tokio::test]
 async fn dispatcher_skips_trigger_already_followed_by_cc_event() {
     let (pool, db_name) = setup_test_db().await;
@@ -254,9 +237,6 @@ async fn dispatcher_skips_trigger_already_followed_by_cc_event() {
     teardown_test_db(&db_name).await;
 }
 
-/// I12: a broadcast lag never drops a spawn request. The request is persisted,
-/// then the broadcast overflows before the dispatcher starts. The request still
-/// arrives, because the dispatcher reads the bus's directed channel.
 #[tokio::test]
 async fn a_lagged_broadcast_never_drops_a_continuation() {
     use crate::engine::event_bus::{SystemEvent, BUS_CAPACITY};
@@ -285,11 +265,6 @@ async fn a_lagged_broadcast_never_drops_a_continuation() {
     teardown_test_db(&db_name).await;
 }
 
-// -- Startup delivery guarantees (live channel + orphan net) ------------------
-
-/// A request emitted before the dispatcher starts waits on the bus's channel.
-/// The startup orphan scan also sees the same persisted row, and the claim
-/// collapses the two paths to one send.
 #[tokio::test]
 async fn a_continuation_emitted_before_the_dispatcher_starts_is_sent_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -307,9 +282,6 @@ async fn a_continuation_emitted_before_the_dispatcher_starts_is_sent_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// A `ContinuationRequested` a previous process persisted but never actuated
-/// (the thread is a `running` zombie) is re-dispatched exactly once at
-/// dispatcher startup. It is not on this bus's channel: only the scan sees it.
 #[tokio::test]
 async fn orphaned_continuation_is_redispatched_exactly_once_on_startup() {
     let (pool, db_name) = setup_test_db().await;
@@ -328,8 +300,6 @@ async fn orphaned_continuation_is_redispatched_exactly_once_on_startup() {
     teardown_test_db(&db_name).await;
 }
 
-/// Supersession: when a thread carries TWO unactuated `ContinuationRequested`
-/// events from a previous process, only the newest drives a spawn.
 #[tokio::test]
 async fn only_newest_unactuated_continuation_is_redispatched() {
     let (pool, db_name) = setup_test_db().await;
@@ -368,15 +338,11 @@ async fn only_newest_unactuated_continuation_is_redispatched() {
     teardown_test_db(&db_name).await;
 }
 
-/// Settled threads stay settled: a `ContinuationRequested` that was actuated
-/// (lifecycle event followed) or terminally settled (a `ResponseAborted`
-/// landed after it) is NOT re-dispatched at startup.
 #[tokio::test]
 async fn actuated_and_settled_continuations_are_not_redispatched() {
     let (pool, db_name) = setup_test_db().await;
     let (previous, _rx) = EventBus::new(pool.clone());
 
-    // Actuated: the request was followed by an idle — the resume ran.
     let actuated = Uuid::new_v4();
     start_cc_session(&previous, actuated, "claude-code/act", None).await;
     emit_cc_thread(
@@ -387,10 +353,6 @@ async fn actuated_and_settled_continuations_are_not_redispatched() {
     .await;
     emit_cc_thread(&previous, actuated, agent_idled("sid-act", None)).await;
 
-    // Actuation marker only: the spawn consumer emits ContinuationStarted
-    // BEFORE run_direct_agent, so a request followed by just that marker was
-    // actuated (the resume died mid-cold-start). Re-driving it would defeat
-    // the crash loop-breaker — next boot's recovery owns this thread.
     let started = Uuid::new_v4();
     start_cc_session(&previous, started, "claude-code/started", None).await;
     emit_cc_thread(
@@ -411,8 +373,6 @@ async fn actuated_and_settled_continuations_are_not_redispatched() {
     )
     .await;
 
-    // Settled: something terminal landed after the request (e.g. the
-    // orphaned-running settle sweep) — the manual Continue affordance stands.
     let settled = Uuid::new_v4();
     start_cc_session(&previous, settled, "claude-code/set", None).await;
     emit_cc_thread(
@@ -434,10 +394,6 @@ async fn actuated_and_settled_continuations_are_not_redispatched() {
     teardown_test_db(&db_name).await;
 }
 
-/// Crash contract: a crash-interrupted thread gets NO `ContinuationRequested`
-/// — recovery emits a system-attributed `ResponseAborted` plus
-/// `CodingAgentIdled{engine_restart_interrupt}` and keeps the manual Continue
-/// affordance. The startup safety net must not invent a resume for it.
 #[tokio::test]
 async fn crash_interrupted_thread_is_not_auto_resumed_on_startup() {
     let (pool, db_name) = setup_test_db().await;
@@ -464,9 +420,6 @@ async fn crash_interrupted_thread_is_not_auto_resumed_on_startup() {
     teardown_test_db(&db_name).await;
 }
 
-/// The predicate `resume_pending_switches` uses to avoid stacking a second
-/// request event id onto a thread whose existing request the startup orphan
-/// re-dispatch already owns.
 #[tokio::test]
 async fn thread_has_unactuated_continuation_tracks_request_lifecycle() {
     let (pool, db_name) = setup_test_db().await;
@@ -500,8 +453,6 @@ async fn thread_has_unactuated_continuation_tracks_request_lifecycle() {
     teardown_test_db(&db_name).await;
 }
 
-/// A lookup that fails must read as "not spawned yet", so the trigger is
-/// dispatched rather than dropped.
 #[tokio::test]
 async fn an_unreadable_events_table_does_not_hide_a_trigger() {
     let (pool, db_name) = setup_test_db().await;
@@ -513,8 +464,6 @@ async fn an_unreadable_events_table_does_not_hide_a_trigger() {
     teardown_test_db(&db_name).await;
 }
 
-/// Every orphan is re-dispatched however many there are: the startup scan
-/// has no row cap.
 #[tokio::test]
 async fn startup_redispatches_every_orphan_however_many() {
     const ORPHANS: usize = 110;

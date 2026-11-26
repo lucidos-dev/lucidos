@@ -1,14 +1,3 @@
-//! The provider one site asks: its System One pick with its chat model behind
-//! it, or the chat model alone.
-//!
-//! The fallback is generic, one for every site (ADR 0363). It catches a failed
-//! call only. An answer the System One model did give is final, missing ids
-//! included.
-//!
-//! **The caller's deadline bounds both attempts together.** Each site wraps
-//! [`JudgmentProvider::ask`] in its own deadline, so a slow primary leaves the
-//! fallback only what remains of it, never a fresh one.
-
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -16,7 +5,6 @@ use super::{ChatJudgmentProvider, Judgment, JudgmentProvider, Question};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Ask `primary`, and `fallback` when that call fails.
 pub(crate) struct WithFallback<P, F> {
     primary: P,
     fallback: F,
@@ -47,8 +35,6 @@ impl<P: JudgmentProvider, F: JudgmentProvider> JudgmentProvider for WithFallback
     }
 }
 
-/// The provider for one site: the row [`super::system_one_for`] picked, with
-/// the chat model behind it, or the chat model alone.
 pub fn for_site(
     system_one: Option<Box<dyn JudgmentProvider>>,
     chat: ChatJudgmentProvider,
@@ -81,7 +67,6 @@ mod tests {
         }
     }
 
-    /// Answers with one noul, so a test can tell which provider spoke.
     struct Answering(f64);
 
     #[async_trait]

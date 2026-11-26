@@ -1,10 +1,9 @@
-//! Small journal projection only. Keys and archive verification stay in the
-//! offline engine, preserving ADR 0014's gateway dependency boundary.
 use super::*;
 use serde::{Deserialize, Serialize};
 
 const RESTORE_FAILURE: &str =
     "Snapshot restore needs attention. The workspace remains blocked to protect its data.";
+pub(super) const CLEANUP_INTERRUPTED: &str = "Delete interrupted. Finish or restore it in Trash.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -24,9 +23,6 @@ pub(super) enum Phase {
 }
 
 impl Phase {
-    /// Phases only the offline restore child runs in. It holds the owner lock
-    /// but publishes no pid, so the pidfile names a stopped engine whose pid
-    /// the system may have reused.
     fn offline_child_owns(self) -> bool {
         matches!(
             self,
@@ -46,7 +42,6 @@ impl Phase {
     }
 }
 
-/// Deliberately omits actor, reason, filesystem policy and all archive metadata.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Status {
     restore_id: String,
@@ -172,11 +167,6 @@ impl GatewayState {
                     let active = records.iter().position(|s| s.phase.active());
                     active.map(|i| records.remove(i)).or_else(|| records.pop())
                 };
-                // A failed offline attempt may not have reached a journal
-                // write. Expose the observed failure, without rewriting the
-                // journal or treating process exit as completion proof.
-                // Startup reconstructs this cache by recovering the still
-                // active journal before allowing an engine to start.
                 if let Some(status) = selected.as_mut() {
                     if status.phase.active()
                         && self.boot_failure(id) == Some(BootFailure::terminal(RESTORE_FAILURE))
@@ -204,14 +194,12 @@ impl GatewayState {
     pub(super) fn cleanup_failure(&self, id: &str) -> Option<&'static str> {
         match crate::trash::blocks(&self.app_data().join("deleted"), id) {
             Ok(false) => None,
-            Ok(true) => Some("Workspace cleanup was interrupted. Open the workspace picker and recover this entry from Trash before opening the workspace."),
+            Ok(true) => Some(CLEANUP_INTERRUPTED),
             Err(_) => Some("Workspace cleanup records could not be read. Recovery is required before opening the workspace to protect its data."),
         }
     }
 
     pub(crate) fn snapshot_restore_blocks(&self, id: &str) -> bool {
-        // Recovery may have returned the directory but not yet republished its
-        // registration. The durable journal still owns this identity.
         if self.cleanup_failure(id).is_some() {
             return true;
         }
@@ -225,8 +213,6 @@ impl GatewayState {
                 .unwrap_or(true)
     }
 
-    /// Only the authenticated local engine submits a journal after enforcing
-    /// restore authority. A browser cannot substitute a journal or an archive.
     pub(crate) async fn begin_snapshot_restore(
         &self,
         id: &str,
@@ -266,8 +252,6 @@ impl GatewayState {
 
     async fn execute_snapshot_restore(&self, id: &str, restore_id: &str, recovering: bool) {
         let result = self.snapshot_offline(id, restore_id, recovering).await;
-        // Process exit and output are observations, never completion proof.
-        // The same offline recovery path also settles pre-mutation failures.
         if result.is_err()
             && !recovering
             && self.snapshot_offline(id, restore_id, true).await.is_err()
@@ -277,7 +261,6 @@ impl GatewayState {
             );
         }
         if result.is_err() {
-            // Never include child stderr, a URL or a journal's user text.
             crate::log_legacy!(
                 "[Gateway] snapshot restore for '{id}' needs journal reconciliation"
             );
@@ -333,15 +316,11 @@ impl GatewayState {
             .get(id)
             .cloned()
             .ok_or("workspace not found")?;
-        // No restart-intent device attribution: a restore must never gain the
-        // automatic-resume semantics of a user's binary switch.
         self.stop_for_snapshot(id, None)
             .await
             .map_err(|_| "workspace stop failed")?;
         let dir = ws.resolve_dir(self.app_data());
         let deadline = Instant::now() + Duration::from_secs(60);
-        // A gateway that died mid-restore may leave its offline child running.
-        // Signalling the pidfile's pid then could stop another workspace.
         let child_may_run = recovering
             && self
                 .snapshot_restore_status_for(id, Some(restore_id))
@@ -349,8 +328,6 @@ impl GatewayState {
                 .flatten()
                 .is_some_and(|status| status.phase.offline_child_owns());
         if !child_may_run {
-            // Also covers a detached engine not yet adopted by the gateway. The
-            // offline runner independently requires the workspace owner lock.
             stack::reclaim_stale_engine(&dir);
             while stack::live_engine_pid(&dir).is_some() {
                 if Instant::now() >= deadline {
@@ -359,8 +336,6 @@ impl GatewayState {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        // A gateway crash can leave the old offline child alive. Observe its
-        // owner lock before launching recovery; never compete with its replay.
         loop {
             if let Some(owner) = lucidos_owner_lock::OwnerLock::try_acquire(
                 &lucidos_owner_lock::engine::lock_path(&dir),
@@ -436,8 +411,6 @@ impl GatewayState {
     }
 }
 
-// Replaces only external process execution in the startup ordering test.
-// The actual startup scan, admission, reconciliation and spawn decision run.
 #[cfg(test)]
 pub(super) struct OrderingProbe {
     pub entered: tokio::sync::Notify,
@@ -457,9 +430,6 @@ mod tests {
         assert!(serde_json::from_str::<Phase>("\"future-phase\"").is_err());
     }
 
-    /// Only phases the engine never runs in may skip reclaiming the pidfile's
-    /// engine. A requested restore still has a live engine to stop, and a
-    /// restored engine's restricted boot publishes its own pid.
     #[test]
     fn only_offline_phases_skip_engine_reclaim() {
         for phase in [
@@ -547,8 +517,6 @@ mod lifecycle_tests {
         let restore_id = write(&root, "requested");
         let journal = root.join("journal").join(format!("{restore_id}.json"));
         let before = std::fs::read(&journal).unwrap();
-        // An unusable workspace directory makes both offline attempts fail
-        // before provisioning or changing a journal. No shared service is used.
         let workspace = state
             .inner
             .registry
@@ -580,8 +548,6 @@ mod lifecycle_tests {
             .as_ref()
             .unwrap()
             .contains("needs attention"));
-        // A retained completed journal must never inherit the failure of a
-        // different active restore, nor become evidence that it completed.
         let older = "12345678-1234-1234-1234-123456789abd";
         std::fs::write(
             root.join("journal").join(format!("{older}.json")),
@@ -807,8 +773,6 @@ mod lifecycle_tests {
         assert!(state
             .snapshot_restore_status_for("other", Some(&older))
             .is_err());
-        // Exact lookup still refuses a corrupt sibling rather than concealing
-        // an ambiguous or unreadable workspace restore state.
         std::fs::write(root.join("journal").join(format!("{newer}.json")), "{}").unwrap();
         assert!(state
             .snapshot_restore_status_for("snapshot-demo", Some(&older))

@@ -1,24 +1,17 @@
-/// Validates that idle_notify (using notify_waiters) wakes a registered waiter.
-/// The chat follow-up redirect depends on it: the Result handler calls
-/// idle_notify.notify_waiters(), so a task waiting on idle_notify.notified()
-/// wakes up.
 #[tokio::test]
 async fn idle_notify_wakes_registered_waiter() {
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let notify2 = notify.clone();
 
-    // Register a waiter BEFORE the notification, as the redirect does.
     let waiter = tokio::spawn(async move {
         match tokio::time::timeout(std::time::Duration::from_secs(2), notify2.notified()).await {
-            Ok(()) => true,  // Woken by notify_waiters
-            Err(_) => false, // Timed out — notify_waiters was never called
+            Ok(()) => true,
+            Err(_) => false,
         }
     });
 
-    // Give the waiter time to register
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Simulate the Result handler firing idle_notify
     notify.notify_waiters();
 
     let woken = waiter.await.unwrap();
@@ -29,18 +22,12 @@ async fn idle_notify_wakes_registered_waiter() {
     );
 }
 
-/// Validates that notify_waiters does NOT store a permit — calling it
-/// BEFORE a waiter registers means the waiter misses the notification.
-/// This is why bare `idle_notify.notified().await` (without a poll loop)
-/// is dangerous: if the notification fires before the await starts, it's lost.
 #[tokio::test]
 async fn notify_waiters_does_not_store_permit() {
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
-    // Fire notification BEFORE any waiter is registered
     notify.notify_waiters();
 
-    // Now try to wait — should NOT wake up (permit not stored)
     let result =
         tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
 
@@ -48,9 +35,6 @@ async fn notify_waiters_does_not_store_permit() {
                                    bare .notified().await after a missed notification hangs forever");
 }
 
-/// Validates the resume branch reuse logic: when a branch exists,
-/// `git worktree add` should use the existing branch (no -b flag)
-/// instead of creating a new one.
 #[tokio::test]
 async fn resume_branch_reuses_existing_branch() {
     use crate::engine::git_ops::git_cmd;
@@ -58,14 +42,12 @@ async fn resume_branch_reuses_existing_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
-    // Set up a git repo with an initial commit
     let _ = git_cmd(&["init"], repo).await;
     let _ = git_cmd(&["checkout", "-b", "main"], repo).await;
     let _ = tokio::fs::write(repo.join("file.txt"), "initial").await;
     let _ = git_cmd(&["add", "."], repo).await;
     let _ = git_cmd(&["commit", "-m", "init"], repo).await;
 
-    // Create a branch with a commit (simulating a previous Claude Code session)
     let branch_name = "claude-code/20260326-test";
     let _ = git_cmd(&["checkout", "-b", branch_name], repo).await;
     let _ = tokio::fs::write(repo.join("change.txt"), "cc changes").await;
@@ -73,14 +55,12 @@ async fn resume_branch_reuses_existing_branch() {
     let _ = git_cmd(&["commit", "-m", "cc work"], repo).await;
     let _ = git_cmd(&["checkout", "main"], repo).await;
 
-    // Verify the branch exists
     let exists = git_cmd(&["rev-parse", "--verify", branch_name], repo)
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
     assert!(exists, "Test branch should exist");
 
-    // Create a worktree from the existing branch (no -b flag)
     let wt_path = tmp.path().join("worktree-resume");
     let result = git_cmd(
         &["worktree", "add", wt_path.to_str().unwrap(), branch_name],
@@ -92,7 +72,6 @@ async fn resume_branch_reuses_existing_branch() {
         "Should create worktree from existing branch"
     );
 
-    // The worktree should have the CC changes
     let content = tokio::fs::read_to_string(wt_path.join("change.txt"))
         .await
         .unwrap();
@@ -101,7 +80,6 @@ async fn resume_branch_reuses_existing_branch() {
         "Resumed worktree should contain previous CC changes"
     );
 
-    // Clean up
     let _ = git_cmd(
         &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
         repo,
@@ -109,10 +87,6 @@ async fn resume_branch_reuses_existing_branch() {
     .await;
 }
 
-/// When a worktree already exists for the resume branch (e.g. left over from
-/// a previous engine session), `parse_worktree_list` should detect it so the
-/// caller can reuse the existing worktree instead of failing with
-/// "branch is already used by worktree at ...".
 #[tokio::test]
 async fn resume_reuses_existing_worktree_for_branch() {
     use crate::engine::git_ops::{git_cmd, parse_worktree_list};
@@ -120,14 +94,12 @@ async fn resume_reuses_existing_worktree_for_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
-    // Set up a git repo with an initial commit
     let _ = git_cmd(&["init"], repo).await;
     let _ = git_cmd(&["checkout", "-b", "main"], repo).await;
     let _ = tokio::fs::write(repo.join("file.txt"), "initial").await;
     let _ = git_cmd(&["add", "."], repo).await;
     let _ = git_cmd(&["commit", "-m", "init"], repo).await;
 
-    // Create a branch and a worktree for it (simulating a previous Claude Code session)
     let branch_name = "claude-code/20260326-leftover";
     let _ = git_cmd(&["checkout", "-b", branch_name], repo).await;
     let _ = tokio::fs::write(repo.join("change.txt"), "cc changes").await;
@@ -146,7 +118,6 @@ async fn resume_reuses_existing_worktree_for_branch() {
         "Setup: should create initial worktree"
     );
 
-    // Now verify that parse_worktree_list detects the existing worktree
     let list_output = git_cmd(&["worktree", "list", "--porcelain"], repo)
         .await
         .unwrap();
@@ -159,7 +130,6 @@ async fn resume_reuses_existing_worktree_for_branch() {
         branch_name
     );
 
-    // Verify it points to the correct path
     let found_path = found.unwrap();
     let canonical_expected = wt_path.canonicalize().unwrap();
     let canonical_found = found_path.canonicalize().unwrap();
@@ -171,7 +141,6 @@ async fn resume_reuses_existing_worktree_for_branch() {
         canonical_found.display()
     );
 
-    // Trying to create a SECOND worktree for the same branch should fail
     let wt_path_new = tmp.path().join("new-worktree");
     let fail_result = git_cmd(
         &[
@@ -188,7 +157,6 @@ async fn resume_reuses_existing_worktree_for_branch() {
         "git worktree add should fail when branch already checked out in another worktree"
     );
 
-    // Verify the original worktree content is still intact
     let content = tokio::fs::read_to_string(wt_path.join("change.txt"))
         .await
         .unwrap();
@@ -197,7 +165,6 @@ async fn resume_reuses_existing_worktree_for_branch() {
         "Existing worktree should preserve CC changes"
     );
 
-    // Clean up
     let _ = git_cmd(
         &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
         repo,
@@ -205,7 +172,6 @@ async fn resume_reuses_existing_worktree_for_branch() {
     .await;
 }
 
-/// When the resume branch no longer exists, a fresh branch should be created.
 #[tokio::test]
 async fn resume_falls_back_when_branch_deleted() {
     use crate::engine::git_ops::git_cmd;
@@ -213,14 +179,12 @@ async fn resume_falls_back_when_branch_deleted() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
-    // Set up a git repo
     let _ = git_cmd(&["init"], repo).await;
     let _ = git_cmd(&["checkout", "-b", "main"], repo).await;
     let _ = tokio::fs::write(repo.join("file.txt"), "initial").await;
     let _ = git_cmd(&["add", "."], repo).await;
     let _ = git_cmd(&["commit", "-m", "init"], repo).await;
 
-    // Verify a non-existent branch
     let branch_name = "claude-code/20260326-deleted";
     let exists = git_cmd(&["rev-parse", "--verify", branch_name], repo)
         .await
@@ -228,7 +192,6 @@ async fn resume_falls_back_when_branch_deleted() {
         .unwrap_or(false);
     assert!(!exists, "Deleted branch should not exist");
 
-    // The code should fall back to creating a new branch
     let new_branch = crate::engine::git_ops::allocate_coding_agent_branch(
         repo,
         crate::runtime::CodingAgent::ClaudeCode,
@@ -256,7 +219,6 @@ async fn resume_falls_back_when_branch_deleted() {
         "Should create worktree with fresh branch"
     );
 
-    // Clean up
     let _ = git_cmd(
         &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
         repo,
@@ -264,10 +226,6 @@ async fn resume_falls_back_when_branch_deleted() {
     .await;
 }
 
-/// Test helper: create an `AgentSession` with sensible defaults. Only `msg_tx`
-/// and `is_waiting` vary across tests. The caller owns the channel pair, so it
-/// is responsible for keeping `msg_rx` alive — a dropped receiver makes the
-/// session a phantom (`AgentSession::is_live`).
 fn make_test_session(
     msg_tx: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
     is_waiting: bool,
@@ -277,9 +235,6 @@ fn make_test_session(
     s
 }
 
-/// Validates that when a Claude Code session is idle (is_waiting=true), a follow-up
-/// message is routed via msg_tx instead of being rejected with
-/// "A coding agent is already running".
 #[tokio::test]
 async fn idle_session_routes_followup_via_msg_tx() {
     use crate::engine::AgentUserInput;
@@ -287,11 +242,9 @@ async fn idle_session_routes_followup_via_msg_tx() {
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
     let session = make_test_session(msg_tx, true);
 
-    // Simulate single-lock routing logic from run_direct_agent
     assert!(!session.process_exited);
     assert!(session.is_waiting);
 
-    // Route via msg_tx (same as production code)
     assert!(
         session
             .msg_tx
@@ -312,8 +265,6 @@ async fn idle_session_routes_followup_via_msg_tx() {
     assert_eq!(received.text, "Follow-up message");
 }
 
-/// Validates that when a Claude Code session is actively working (is_waiting=false),
-/// the follow-up is rejected (not routed via msg_tx).
 #[tokio::test]
 async fn busy_session_rejects_followup() {
     use crate::engine::AgentUserInput;
@@ -328,8 +279,6 @@ async fn busy_session_rejects_followup() {
     );
 }
 
-/// Validates that when the msg_tx channel is closed (receiver dropped),
-/// send returns Err — production code should propagate the error.
 #[tokio::test]
 async fn closed_channel_returns_error() {
     use crate::engine::AgentUserInput;
@@ -337,7 +286,6 @@ async fn closed_channel_returns_error() {
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
     let session = make_test_session(msg_tx, true);
 
-    // Drop the receiver to simulate CC process exit
     drop(msg_rx);
 
     let result = session.msg_tx.send(AgentUserInput {
@@ -350,11 +298,6 @@ async fn closed_channel_returns_error() {
     assert!(result.is_err(), "send should fail when receiver is dropped");
 }
 
-/// Idle Claude Code session (waiting for next prompt, process alive) must NOT be
-/// reported as in-flight. Regression: `abort_in_flight_for_restart` used
-/// to filter only on `!process_exited`, so every idle Claude Code session got a
-/// `ResponseAborted` on `/api/v1/restart` — rendering as "Response Interrupted"
-/// with a Continue button on every restart.
 #[tokio::test]
 async fn is_in_flight_false_for_idle_session() {
     let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -377,35 +320,21 @@ async fn is_in_flight_false_for_exited_session() {
     assert!(!session.is_in_flight());
 }
 
-/// Idle-termination follow-up race contract (the `:31` regression).
-///
-/// At idle the run loop's `ExitSubprocess` arm now sets `process_exited = true`
-/// (under the `agent_sessions` lock) BEFORE `agent_cancel.cancel()`, so a
-/// follow-up landing during the ~3s graceful-shutdown window is declined by the
-/// chat fast-path instead of being sent on `msg_tx` into a dying subprocess.
-/// This pins both halves of that fast-path gate (`chat/process/run.rs`): the
-/// `has_session` predicate (`map(|s| !s.process_exited)`) and the send-step
-/// guard (`if !session.process_exited`). When the gate declines, the follow-up
-/// falls through to the slow `--resume` path and is never dropped.
 #[tokio::test]
 async fn exited_mark_declines_fast_path_followup_route() {
     let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut session = make_test_session(msg_tx, true);
 
-    // Before the idle-terminate mark: an idle session accepts the fast-path.
     let has_session_before = !session.process_exited;
     assert!(
         has_session_before,
         "an idle, alive session must be eligible for the msg_tx fast-path"
     );
 
-    // The Terminate arm marks the session exited as it cancels the subprocess.
     session.process_exited = true;
 
-    // Both fast-path gates now decline → caller falls through to the slow
-    // (`--resume`) path rather than routing into the terminating subprocess.
-    let has_session_after = !session.process_exited; // chat fast-path has_session
-    let send_step_allows = !session.process_exited; // chat fast-path send guard
+    let has_session_after = !session.process_exited;
+    let send_step_allows = !session.process_exited;
     assert!(
         !has_session_after,
         "a session marked process_exited at idle-terminate must NOT pass has_session"
@@ -416,19 +345,6 @@ async fn exited_mark_declines_fast_path_followup_route() {
     );
 }
 
-// Regression coverage for the "ResponseCanceled is missing device" gap on a
-// LIVE Claude Code session: `POST /api/v1/claude-code/stop` (UserStop) resolves
-// the actor from the request headers and `interrupt_agent` stamps it on the
-// session's `cancel_actor` field before firing the `interrupt` notify. The
-// run_session interrupt arm drains it (`take_session_cancel_actor`) into
-// `meta.actor` so the emitted `ResponseCanceled` records WHICH device clicked
-// Cancel — the Initiator popover's Device row. These tests exercise the field's
-// stamp-and-drain contract in isolation (a full `LucidosEngine` isn't built
-// here; the integration through `interrupt_agent` / `take_session_cancel_actor`
-// is identical, just behind the `agent_sessions` map lock).
-
-/// `interrupt_agent` stamps then the run loop drains; the second drain is empty
-/// so a resumed turn on the same session can't inherit a stale device.
 #[tokio::test]
 async fn cancel_actor_field_stores_and_drains() {
     use crate::engine::thread_events::MessageOrigin;
@@ -442,29 +358,22 @@ async fn cancel_actor_field_stores_and_drains() {
          must not inherit a phantom device"
     );
 
-    // Stamp (mirrors interrupt_agent's live-session branch).
     let actor = MessageOrigin::Device {
         device_id: "ios-1".into(),
     };
     session.cancel_actor = Some(actor.clone());
 
-    // First drain returns the stamped actor (what take_session_cancel_actor does).
     assert_eq!(
         session.cancel_actor.take(),
         Some(actor),
         "first take must return the device that clicked Cancel"
     );
-    // One-shot: a resumed turn must not re-stamp the same device.
     assert!(
         session.cancel_actor.take().is_none(),
         "second take must be empty"
     );
 }
 
-/// Stop on an entry no loop is listening to must not report "a terminal is
-/// coming". The entry of a session that is exiting mid-turn outlives its loop
-/// for a moment, and a phantom's for longer. Both take the no-session
-/// fallback, which settles a stuck turn.
 #[tokio::test]
 async fn stop_on_an_entry_no_loop_listens_to_takes_the_no_session_fallback() {
     use super::control::{interrupt_route, InterruptRoute};
@@ -491,8 +400,6 @@ async fn stop_on_an_entry_no_loop_listens_to_takes_the_no_session_fallback() {
     );
 }
 
-/// A turn runs while it starts, works, or waits on a question, and a pick
-/// waits for it to end (ADR 0542). Between turns a pick is free.
 #[test]
 fn the_rung_locks_while_a_turn_runs() {
     use super::control::{awaits_idle_exit, rung_locked};
@@ -544,7 +451,6 @@ fn the_rung_locks_while_a_turn_runs() {
     );
 }
 
-/// A spawn still starting runs a turn, so its rung is locked too.
 #[test]
 fn a_starting_session_locks_the_rung() {
     use super::control::rung_locked;
@@ -564,10 +470,6 @@ fn a_starting_session_locks_the_rung() {
     ));
 }
 
-/// The control endpoint's body: the two picks the picker offers, and nothing
-/// else. A mode switch or an interrupt sent over HTTP never parses. A model
-/// pick carries its effort, so a turn starting between two requests cannot
-/// split the pair.
 #[test]
 fn a_rung_pick_parses_only_a_model_or_an_effort() {
     use super::control::RungPick;
@@ -606,9 +508,6 @@ fn a_rung_pick_parses_only_a_model_or_an_effort() {
     }
 }
 
-/// A stop request with no thread id reaches every session. One that a change
-/// claim holds must be refused like a single-thread stop, or a Discard deletes the
-/// branch that apply is merging. The others still stop.
 #[test]
 fn a_thread_less_stop_skips_a_claimed_session() {
     use super::control::stop_every_session;
@@ -638,10 +537,6 @@ fn a_thread_less_stop_skips_a_claimed_session() {
     );
 }
 
-/// An in-session Discard releases the lock before it resets the worktree, so
-/// it holds the session's change claim across the reset. Otherwise an apply
-/// from another device, or from the parent's `apply_change`, claims the
-/// session in between and merges work the user just discarded.
 #[test]
 fn an_in_session_discard_holds_the_claim_an_apply_needs() {
     use super::{claim_for_discard, DiscardTarget};
@@ -686,9 +581,6 @@ fn an_in_session_discard_holds_the_claim_an_apply_needs() {
     );
 }
 
-/// A Discard landing while a stop is ending the session would reset the tree
-/// under finalize. A missing session and a session with no worktree or branch
-/// stay distinct: only the first takes the stale-session teardown.
 #[test]
 fn an_in_session_discard_refuses_a_stopping_session_and_a_missing_worktree() {
     use super::{claim_for_discard, DiscardTarget, SESSION_STOPPING_MESSAGE};
@@ -760,11 +652,6 @@ fn is_engine_injected_path_matches_excluded_paths_only() {
         ".claude/skills/lucidos-cli"
     ));
 
-    // App coding-agent threads run CC inside `<wt>/data/apps/<id>/`, so the
-    // engine-injected lucidos-cli skill lands at `data/apps/<id>/.claude/...`
-    // (place_lucidos_cli_skill writes relative to CC's cwd, not the
-    // worktree root). Must match the same as the root-level path or the
-    // skill folder shows up as a pending change every app spawn.
     assert!(crate::engine::worktree_artifacts::is_engine_injected_path(
         "data/apps/habit-tracker/.claude/skills/lucidos-cli/SKILL.md"
     ));
@@ -775,9 +662,6 @@ fn is_engine_injected_path_matches_excluded_paths_only() {
         "data/apps/habit-tracker/.claude/skills/lucidos-cli"
     ));
 
-    // Sibling paths must NOT match — false positives would hide unrelated
-    // user files (e.g. a user-named `.lucidos-workspace-archive` or a
-    // `.claude/skills/lucidos-cli-helper/` skill).
     assert!(!crate::engine::worktree_artifacts::is_engine_injected_path(
         ".lucidos-workspace-archive"
     ));
@@ -796,7 +680,6 @@ fn is_engine_injected_path_matches_excluded_paths_only() {
     assert!(!crate::engine::worktree_artifacts::is_engine_injected_path(
         "src/main.rs"
     ));
-    // Sibling under the deep app path must also stay visible.
     assert!(!crate::engine::worktree_artifacts::is_engine_injected_path(
         "data/apps/habit-tracker/.claude/skills/lucidos-cli-helper/SKILL.md"
     ));
@@ -805,26 +688,6 @@ fn is_engine_injected_path_matches_excluded_paths_only() {
     ));
 }
 
-/// Regression guard for the Tier-2 merge-conflict bug.
-///
-/// `run_merge_session_tier2` is the Tier-2 entry point — dead Claude Code session +
-/// orphan worktree on disk — and historically shipped the merge prompt to
-/// CC via `build_merge_prompt` + `emit_automated_prompt` **without** first
-/// emitting `MergeConflictDetected`. That bug starved the chat-exchange
-/// panel (nothing to render) and the SSE consumers
-/// (`applyingChangeIds`, conflict toast).
-///
-/// The fix routes the function through `start_merge_and_get_prompt`, which
-/// bundles the boundary emit with the prompt build so the two cannot be
-/// separated.
-///
-/// We assert on source text rather than runtime behavior because nothing
-/// in this crate constructs a live `LucidosEngine` outside `main.rs` —
-/// the same constraint that drives the compile-only signature pins in
-/// `change_ops_engine_origin_stamping_tests.rs`. Source-text is brittle
-/// to formatting but resilient to behavioral regressions: if a future
-/// refactor moves the function back to bare `build_merge_prompt`, this
-/// test fails loudly.
 #[test]
 fn run_merge_session_tier2_routes_through_start_merge_and_get_prompt() {
     let source = include_str!("../claude_code/merge_session.rs");
@@ -832,9 +695,6 @@ fn run_merge_session_tier2_routes_through_start_merge_and_get_prompt() {
     let start = source
         .find(needle)
         .expect("run_merge_session_tier2 must exist in claude_code/merge_session.rs");
-    // Slice from the signature to the next top-level item start. The body
-    // ends well before the next `async fn`/`pub fn`/`fn ` at the module
-    // level — taking a generous window avoids brittle brace-matching.
     let tail = &source[start..];
     let end = tail
         .find("\n    async fn ")
@@ -867,11 +727,6 @@ fn run_merge_session_tier2_routes_through_start_merge_and_get_prompt() {
 }
 
 mod guard_tests {
-    /// Only the run loop writes the shared `is_waiting`, and it keeps its own
-    /// local copy in step. A write from outside desyncs the two. A Discard once
-    /// wrote `true` on a mid-turn session. Until the next `Result`, Stop then
-    /// answered "already waiting", redirects stopped arming and the watchdog
-    /// skipped the session.
     #[test]
     fn only_the_run_loop_writes_the_session_phase() {
         let writers: Vec<String> = crate::test_support::source_scan::production_sources()
@@ -949,7 +804,6 @@ mod guard_tests {
     }
 }
 
-/// The control endpoint's pick names are the picker's own subtypes and param keys.
 #[test]
 fn every_control_the_picker_offers_parses_as_a_rung_pick() {
     use super::control::RungPick;

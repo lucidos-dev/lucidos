@@ -1,9 +1,6 @@
 use super::test_helpers::*;
 use super::*;
 
-/// Multi-token text queries must match threads where every token appears
-/// somewhere — title or any event payload — even if no single string contains
-/// the full phrase.
 #[tokio::test]
 async fn search_threads_by_text_matches_per_token_across_events() {
     let (pool, db) = setup_test_db().await;
@@ -87,9 +84,6 @@ async fn search_threads_by_text_matches_per_token_across_events() {
     teardown_test_db(&db).await;
 }
 
-/// The `limit` cut keeps the tiers ranking puts first: an exact title, then a
-/// title holding the query as a phrase. Newer threads in a lower tier must not
-/// push an old one out, or the hit the user most likely meant never shows.
 #[tokio::test]
 async fn search_threads_by_text_cuts_by_title_tier_before_recency() {
     let (pool, db) = setup_test_db().await;
@@ -143,8 +137,6 @@ async fn search_threads_by_text_cuts_by_title_tier_before_recency() {
     teardown_test_db(&db).await;
 }
 
-/// LIKE metacharacters in the query must be escaped, otherwise a token like
-/// `foo_bar` matches `fooXbar` and `50%` matches everything starting with 50.
 #[tokio::test]
 async fn search_threads_by_text_treats_wildcards_as_literals() {
     let (pool, db) = setup_test_db().await;
@@ -174,9 +166,6 @@ async fn search_threads_by_text_treats_wildcards_as_literals() {
     teardown_test_db(&db).await;
 }
 
-/// A thread should match a multi-token query when its `memory_entries.entities`
-/// cover all tokens, even when no event payload text contains them — entity
-/// extraction adds linkages the raw payload doesn't have.
 #[tokio::test]
 async fn search_threads_by_text_matches_via_entities() {
     let (pool, db) = setup_test_db().await;
@@ -222,9 +211,6 @@ async fn search_threads_by_text_matches_via_entities() {
     teardown_test_db(&db).await;
 }
 
-/// A workspace whose pgvector extension will not load boots with no
-/// `memory_entries` table. Text search must still find titles and messages
-/// there; only the entity arm has nothing to read.
 #[tokio::test]
 async fn text_search_works_without_a_memory_entries_table() {
     let (pool, db) = setup_test_db().await;
@@ -250,8 +236,6 @@ async fn text_search_works_without_a_memory_entries_table() {
     teardown_test_db(&db).await;
 }
 
-/// A short token is checked only inside threads a long token matched. It must
-/// still be found in a different message from the long one.
 #[tokio::test]
 async fn a_short_token_matches_in_another_message_of_the_long_tokens_thread() {
     let (pool, db) = setup_test_db().await;
@@ -276,8 +260,6 @@ async fn a_short_token_matches_in_another_message_of_the_long_tokens_thread() {
     teardown_test_db(&db).await;
 }
 
-/// Each arm counts distinct patterns, so a repeated token must not raise the
-/// count a thread has to reach.
 #[tokio::test]
 async fn a_repeated_token_still_matches_message_text() {
     let (pool, db) = setup_test_db().await;
@@ -298,8 +280,6 @@ async fn a_repeated_token_still_matches_message_text() {
     teardown_test_db(&db).await;
 }
 
-/// No index can serve a 1 or 2 character token over every message, so a query
-/// made only of them skips message bodies. Titles still match it.
 #[tokio::test]
 async fn a_query_of_only_short_tokens_matches_titles_but_not_message_bodies() {
     let (pool, db) = setup_test_db().await;
@@ -319,17 +299,11 @@ async fn a_query_of_only_short_tokens_matches_titles_but_not_message_bodies() {
     teardown_test_db(&db).await;
 }
 
-/// The message-text arm must reach `events` through the trigram index and the
-/// entity arm through the primary key. Either falling back to a scan of every
-/// message is what timed Search Everywhere out on a large workspace. Checked
-/// on the generic plan, since sqlx reuses prepared statements.
 #[tokio::test]
 async fn text_search_reaches_events_through_its_indexes() {
     let (pool, db) = setup_test_db().await;
     initialize_memory_entries(&pool).await;
 
-    // Enough messages, of a real length, that a pass over all of them costs
-    // more than the index, as on a real workspace.
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
          SELECT gen_random_uuid(), 'MessageReceived', \
@@ -345,7 +319,6 @@ async fn text_search_reaches_events_through_its_indexes() {
         "EXPLAIN (GENERIC_PLAN) {}",
         super::search::text_search_sql(true)
     );
-    // The simple protocol, because a generic plan leaves `$n` unbound.
     let plan = sqlx::raw_sql(&explain)
         .fetch_all(&pool)
         .await
@@ -366,17 +339,6 @@ async fn text_search_reaches_events_through_its_indexes() {
     teardown_test_db(&db).await;
 }
 
-// ── Archive stayed searchable ─────────────────────────────────────────
-//
-// Decision 1 of `docs/plans/2026-09-15-deleting-a-thread.md`: archive is "put
-// down for now" and delete is "gone", and only delete changed. An archive
-// filter appearing in either search arm would quietly turn the softer action
-// into the harsher one.
-
-/// The tester's report that started the delete work said archived threads felt
-/// retrievable. They ARE, and that is the decision: this pins it, so the
-/// obvious follow-up ("while we are here, hide archived from search") cannot
-/// land by accident.
 #[tokio::test]
 async fn an_archived_thread_is_still_returned_by_text_search() {
     let (pool, db) = setup_test_db().await;
@@ -402,9 +364,6 @@ async fn an_archived_thread_is_still_returned_by_text_search() {
     teardown_test_db(&db).await;
 }
 
-/// The memory arm needs an embedder, so it is asserted at the source. Both
-/// queries read `thread_summaries`, so either could grow the filter, and only
-/// one of the two is reachable from a test without a model.
 #[test]
 fn neither_search_arm_filters_on_archive_state() {
     const SRC: &str = include_str!("../threads/search.rs");

@@ -119,6 +119,7 @@ function EventHookRow({ hook, onChanged = () => {} }: { hook?: EventHook; onChan
               <span>{hookState(hook)}</span>
               {eventType && <span>{eventType}</span>}
               <span><code>{hook.slug}</code></span>
+              {hook.plugin_id && <span>From {hook.plugin_id}</span>}
             </>
           )}
         </SkText>

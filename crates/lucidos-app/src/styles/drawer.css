@@ -408,33 +408,8 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     flex-shrink: 0;
 }
 
-.thread-row-agent .codex-icon {
-    fill: currentColor;
-}
-
-.thread-row-agent[data-glyph="lucidos"] .lucidos-mark {
-    display: none;
-    transform: none;
-}
-
-.thread-row-agent[data-glyph="lucidos"] .lucidos-mark-icon {
-    transform: scale(1.55) translateX(-1.48%);
-}
-
-:root:not([data-agent-brand-colours="off"]) .thread-row-agent .claude-icon {
+.thread-row-agent .claude-icon {
     color: var(--claude-mark);
-}
-
-:root:not([data-agent-brand-colours="off"]) .thread-row-agent .codex-icon {
-    fill: var(--codex-mark);
-}
-
-:root:not([data-agent-brand-colours="off"]) .thread-row-agent .lucidos-mark-icon {
-    display: none;
-}
-
-:root:not([data-agent-brand-colours="off"]) .thread-row-agent[data-glyph="lucidos"] .lucidos-mark {
-    display: block;
 }
 
 .thread-row-agent[data-glyph="trigger"] svg {

@@ -1,13 +1,3 @@
-//! `lucidos merge-driver`: git merge drivers for files that a text merge gets
-//! wrong. A `.gitattributes` line `merge=lucidos-<kind>` picks one, and
-//! `scripts/merge-drivers.sh` registers them.
-//!
-//! The contract with the registered command: write the result over the ours
-//! file, then exit 0 for a clean merge or 1 for a conflict. Any other exit
-//! means the driver did not merge. The ours file is then untouched, and the
-//! registered command merges the path without the driver: as plain text, or
-//! by union for the ADR index (`scripts/lib/merge_drivers.sh`).
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -23,16 +13,13 @@ pub(crate) enum Kind {
     Blocks,
 }
 
-/// What a merge produced.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Merge {
     Clean(Vec<u8>),
     Conflicted(Vec<u8>),
-    /// The driver cannot key this file, so git's text merge decides.
     Unkeyable(String),
 }
 
-/// Exit status meaning "the driver did not merge; merge without it".
 const NOT_MERGED: u8 = 2;
 
 pub(crate) fn run(kind: Kind, base: &Path, ours: &Path, theirs: &Path, marker_size: usize) -> u8 {
@@ -62,8 +49,6 @@ pub(crate) fn run(kind: Kind, base: &Path, ours: &Path, theirs: &Path, marker_si
     }
 }
 
-/// Write beside the target, then rename over it. A failure leaves the ours
-/// file exactly as git wrote it, which the plain-text merge then reads.
 fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".lucidos-merge");
@@ -128,7 +113,6 @@ impl Markers {
     }
 }
 
-/// A file split into keyed entries, in file order.
 #[derive(Debug, Default)]
 pub(crate) struct Doc {
     entries: Vec<(String, String)>,
@@ -158,14 +142,9 @@ impl Doc {
     }
 }
 
-/// Separates the parts of a heading path inside a key.
 const KEY_SEP: char = '\u{1f}';
-/// The text before the first entry.
 const PREAMBLE: &str = "\u{0}preamble";
 
-/// The ADR index shape: a preamble, then only `- ` lines, each carrying a
-/// number. The key is the first number, so two branches adding different
-/// numbers never collide, and one number added twice is a conflict.
 pub(crate) fn parse_sorted_lines(text: &str) -> Result<Doc, String> {
     let mut doc = Doc::default();
     let mut preamble = String::new();
@@ -195,14 +174,6 @@ fn first_number(s: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// Markdown split at every heading and every top-level bullet, outside code
-/// fences. A heading's key is its heading path, and a bullet's is that path
-/// plus its bold label or first line. Blank lines before a block belong to
-/// it, so an entry added at the end of a list brings its own separator.
-///
-/// An unindented paragraph after a list is a block of its own, keyed like a
-/// bullet. Inside the last bullet, it would move into every bullet appended
-/// after it, and two such appends would write it twice.
 pub(crate) fn parse_blocks(text: &str) -> Result<Doc, String> {
     let mut doc = Doc::default();
     let mut key = PREAMBLE.to_string();
@@ -294,12 +265,6 @@ fn bullet_label(line: &str) -> Option<String> {
     Some(label.to_string())
 }
 
-/// A key is an entry's first line, so editing that line is a delete plus an
-/// add. An entry gone from both sides may be renamed twice. It may be renamed
-/// on one side, directly or through its heading, and deleted on the other. It
-/// may be trailing text, such as a closing `---`, that each side carried past
-/// its own appended entry. Keying would keep both, so the file goes to the
-/// merge without the driver.
 fn renamed_on_both_sides(base: &Doc, ours: &Doc, theirs: &Doc) -> Option<String> {
     let (b, o, t) = (base.map(), ours.map(), theirs.map());
     let added = ours.keys().chain(theirs.keys()).any(|k| !b.contains_key(k));
@@ -314,24 +279,16 @@ fn renamed_on_both_sides(base: &Doc, ours: &Doc, theirs: &Doc) -> Option<String>
     })
 }
 
-/// One key's merged state.
 #[derive(Debug, PartialEq, Eq)]
 enum Slot {
     Clean(String),
-    /// Git's line merge of one entry, conflict markers included.
     Marked(String),
-    /// `None` is a side that deleted the entry.
     Conflict {
         ours: Option<String>,
         theirs: Option<String>,
     },
 }
 
-/// The standard three-way rule, per key. A deletion is a change, so a key
-/// deleted on one side and edited on the other is a conflict. An entry both
-/// sides edited gets git's line merge, so edits to different lines still
-/// merge. Leading blank lines move with an entry's position, so they never
-/// count as an edit.
 fn three_way(base: &Doc, ours: &Doc, theirs: &Doc, marker_size: usize) -> HashMap<String, Slot> {
     let (b, o, t) = (base.map(), ours.map(), theirs.map());
     let keys: HashSet<&str> = base
@@ -378,8 +335,6 @@ fn three_way(base: &Doc, ours: &Doc, theirs: &Doc, marker_size: usize) -> HashMa
     slots
 }
 
-/// Two different edits of a one-line entry always conflict, so git's line
-/// merge has nothing to add there.
 fn is_one_line(text: &str) -> bool {
     without_leading_blank_lines(text).trim_end().lines().count() <= 1
 }
@@ -389,8 +344,6 @@ enum LineMerge {
     Conflicted(String),
 }
 
-/// `git merge-file` over one entry's three texts. `None` when git could not
-/// run, which leaves the whole entry as a conflict.
 fn line_merge(base: &str, ours: &str, theirs: &str, marker_size: usize) -> Option<LineMerge> {
     let dir = tempfile::Builder::new()
         .prefix("lucidos-merge-")
@@ -442,10 +395,6 @@ fn sorted_order(slots: &HashMap<String, Slot>) -> Vec<String> {
     keys.into_iter().cloned().collect()
 }
 
-/// Order the merged entries. The spine is the side that reordered existing
-/// entries, else ours. Each new entry of the other side goes after its
-/// nearest placed predecessor. It lands behind the spine's new entries in
-/// that section, and never past a heading.
 fn anchored_order(
     base: &Doc,
     ours: &Doc,
@@ -505,8 +454,6 @@ fn anchored_order(
     Ok(order)
 }
 
-/// Every entry must sit under the headings its key names. A merge that would
-/// move one under another heading is refused, never written.
 fn check_sections(order: &[String]) -> Result<(), String> {
     let mut current: Vec<&str> = Vec::new();
     for key in order {
@@ -537,10 +484,6 @@ fn check_sections(order: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Leading blank lines belong to an entry's position. A bullet with a new
-/// neighbour above takes the spacing its section already uses. So a tight
-/// list stays tight and a loose one stays loose. A bullet whose neighbour
-/// above is unchanged keeps its text exactly.
 fn respace(order: &[String], slots: &mut HashMap<String, Slot>, docs: [&Doc; 3]) {
     let above = |doc: &Doc| -> HashMap<String, String> {
         doc.entries
@@ -549,7 +492,6 @@ fn respace(order: &[String], slots: &mut HashMap<String, Slot>, docs: [&Doc; 3])
             .collect()
     };
     let aboves = docs.map(above);
-    // The blank lines a section puts between two bullets, and under its heading.
     let mut between: HashMap<&str, usize> = HashMap::new();
     let mut under: HashMap<&str, usize> = HashMap::new();
     for doc in docs.iter().rev() {
@@ -595,7 +537,6 @@ fn respace(order: &[String], slots: &mut HashMap<String, Slot>, docs: [&Doc; 3])
     }
 }
 
-/// The heading path a bullet key names.
 fn bullet_section(key: &str) -> Option<&str> {
     let bullet = key.strip_prefix("b:")?;
     Some(
@@ -615,8 +556,6 @@ fn render(order: &[String], slots: &HashMap<String, Slot>, markers: &Markers) ->
     let mut out = String::new();
     let mut conflicted = false;
     for key in order {
-        // An entry that ended its file may lack a newline. It must not join
-        // the line of whatever the merge put after it.
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }

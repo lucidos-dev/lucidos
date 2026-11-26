@@ -1,16 +1,6 @@
-//! `lucidos expect-wake <duration> --reason <text>`: when this thread expects
-//! to wake next, from the waits and children it leaves pending.
-//!
-//! The coding-agent counterpart of the chat agent's `expect_wake` LLM tool,
-//! over `POST /api/v1/threads/<id>/expected-wake`, which records the same
-//! `WakeExpected` (ADR 0603). `$LUCIDOS_THREAD_ID` names the thread and there
-//! is no `--thread` flag, so a session can only state its own wake.
-
 use crate::http::{client as http_client, send_and_print};
 use crate::workspace::{BoxError, Workspace};
 
-/// Parse a span such as `90s`, `45m`, `2h` or `1h30m` into seconds. A bare
-/// number is refused, so a unit is never guessed.
 pub(crate) fn parse_duration_secs(text: &str) -> Result<u64, String> {
     let refuse = || {
         format!(

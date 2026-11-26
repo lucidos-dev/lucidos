@@ -1,14 +1,10 @@
 use lucidos_core::log_legacy;
 
-/// Prepare the host for normal engine startup after loading the database environment.
 pub fn prepare() {
-    // macOS defaults to 256, too low for concurrent coding-agent sessions, SSE
-    // streams, the DB pool and static file serving.
     raise_fd_limit();
 
     log_legacy!(@Engine, "[Startup] Lucidos Engine starting...");
 
-    // Log the supervisor chain for post-mortems. The log prefix includes our PID.
     #[cfg(unix)]
     {
         // SAFETY: getppid / getpgrp / getsid are async-signal-safe and take no
@@ -19,9 +15,6 @@ pub fn prepare() {
         log_legacy!(@Engine, "[Startup] ppid={} pgid={} sid={}", ppid, pgid, sid);
     }
 
-    // Prepend the common user-install bin dirs before anything spawns or probes
-    // a tool. A packaged engine inherits its service manager's minimal PATH,
-    // which ENOENTs bare-name tools that resolve fine in a dev shell.
     lucidos_core::core::user_path::augment_process_path();
 
     git_preflight();
@@ -42,11 +35,6 @@ fn raise_fd_limit() {
     }
 }
 
-/// One-time `git --version` boot preflight.
-///
-/// Coding agents, Apply and worktrees require Git. Chat can still start without it.
-/// On macOS, launchd may resolve Git to the Command Line Tools shim even when
-/// the tools are missing. Warn so a chat-only install can start without a respawn loop.
 fn git_preflight() {
     match std::process::Command::new("git").arg("--version").output() {
         Ok(out) if out.status.success() => {
@@ -67,11 +55,6 @@ fn git_preflight() {
     }
 }
 
-/// One-time `python3 --version` boot preflight, [`git_preflight`]'s sibling.
-///
-/// `python3` backs the `run_python` tool and nothing else, so a missing
-/// interpreter is a loud boot warning rather than a fatal exit. Same
-/// Command-Line-Tools shim story as git.
 fn python_preflight() {
     match std::process::Command::new("python3")
         .arg("--version")

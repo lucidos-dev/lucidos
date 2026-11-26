@@ -6,49 +6,24 @@ use crate::llm::{ContentBlock, Message, MessageContent};
 
 pub(crate) const PANEL_SECTION: &str = "Context Panel";
 
-/// What the panel's block opens with.
-///
-/// A heading for the model to read, and nothing else keys off it.
-/// [`ContentBlock::EngineTail`] carries which blocks the engine wrote. So
-/// neither the fold below nor the wire layer's cache anchor guesses from text.
 pub(crate) const PANEL_MARKER: &str = "[CONTEXT PANEL]";
 
-/// Rows below this size are counted rather than listed.
-///
-/// Not a silent cap: the panel states how many were elided and what they weigh.
-/// Nothing here gates an eviction. Expiry is uniform, so a small item leaves on
-/// the same schedule whether or not it has a row. What a row buys is a keep,
-/// and holding 500 chars open is never worth the line.
 const ROW_MIN_CHARS: usize = 500;
 
-/// The most rows the panel lists, largest first.
 const MAX_ROWS: usize = 20;
 
-/// One addressable thing in the request, as the panel names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PanelItem {
-    /// The `evt-<32 hex>` form, which is what a keep takes.
     pub(crate) address: String,
     pub(crate) label: String,
-    /// What it costs the request right now. For a stub that is the stub.
     pub(crate) chars: usize,
-    /// What it cost before a budget pass cut it, when one did.
-    ///
-    /// Shown beside `chars` so the model can price a re-fetch. Without it a
-    /// stubbed row reads as 12 tokens and says nothing about the 16,000 the
-    /// address would bring back.
     pub(crate) original_chars: Option<usize>,
-    /// Rounds since it entered the prompt. Zero is this round.
     pub(crate) age_rounds: usize,
-    /// Rounds until the sweep that takes it. Every item sharing that sweep
-    /// reports the same number, because one pass takes them together.
     pub(crate) leaves_in: usize,
-    /// Whether a budget pass already cut the body away.
     pub(crate) stubbed: bool,
 }
 
 impl PanelItem {
-    /// Whether the request is still carrying this item's own bytes.
     fn is_resident(&self) -> bool {
         !self.stubbed
     }
@@ -99,12 +74,6 @@ pub(crate) fn tool_result_items(
     items
 }
 
-/// Every addressable tool result in the array, by address alone.
-///
-/// Held apart from [`tool_result_items`] because the two callers want different
-/// things. Ages want only the addresses. Building a whole [`PanelItem`] for
-/// them counts the characters of every result body in the request, then throws
-/// the count away.
 pub(crate) fn addresses_in(messages: &[Message]) -> impl Iterator<Item = &str> {
     messages
         .iter()
@@ -139,22 +108,12 @@ pub(crate) fn hold_open(first_seen: &mut HashMap<String, usize>, address: &str, 
     first_seen.insert(address.to_string(), round);
 }
 
-/// What the panel says about the request's fixed half.
-///
-/// Held apart from [`PanelItem`] because no keep reaches these. Naming them
-/// anyway is what stops the model reading the addressable total as the whole
-/// bill, and concluding it has more room than it has.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FixedRegions {
     pub(crate) system_chars: usize,
     pub(crate) tool_defs_chars: usize,
 }
 
-/// Everything the panel says that does not depend on its own size.
-///
-/// One struct rather than seven arguments, because `used_chars`, `budget_chars`
-/// and `round` are adjacent bare `usize`. Transposing two of them compiles
-/// clean and silently misreports the headline the model steers by.
 pub(crate) struct PanelView<'a> {
     pub(crate) items: &'a [PanelItem],
     pub(crate) fixed: FixedRegions,
@@ -165,12 +124,6 @@ pub(crate) struct PanelView<'a> {
 }
 
 impl PanelView<'_> {
-    /// Render the panel, given the chars everything ELSE in the request takes.
-    ///
-    /// Two passes, because the panel is part of the request it measures. The
-    /// first learns its own length and the second states the true total. Every
-    /// figure is a fixed-width field, so the two passes are the same length and
-    /// the total is exact rather than an estimate.
     pub(crate) fn render(&self, other_chars: usize) -> String {
         let probe = self.render_at(0);
         self.render_at(other_chars + probe.chars().count())
@@ -211,17 +164,11 @@ impl PanelView<'_> {
             field(tokens(budget_chars)),
             pad(share(used_chars), 3)
         ));
-        // The subtotal the model steers by. The headline includes the fixed half
-        // and this turn's prose, neither of which it can move. This is the part it
-        // is still carrying and could still act on.
         block.push_str(&format!(
             "Still resident:  {} tokens across {} addressable items.\n",
             grouped(tokens(resident_chars)),
             resident.len()
         ));
-        // No cap on what is held. A cap would make the engine choose which keeps to
-        // honour, which is selective eviction in a new place. The bill is stated
-        // instead, so the model sees the cost of its own keeping every round.
         if !held.is_empty() {
             let held_chars: usize = held.iter().map(|item| item.chars).sum();
             block.push_str(&format!(
@@ -248,7 +195,6 @@ impl PanelView<'_> {
             grouped(tokens(fixed.system_chars)),
             grouped(tokens(fixed.tool_defs_chars))
         ));
-        // The one fact a per-item remainder cannot carry, so it is stated once.
         let until = schedule.rounds_to_next_sweep(round);
         block.push_str(&format!(
         "The next sweep is in {until} round(s). One runs every {} rounds, and takes everything \
@@ -271,9 +217,6 @@ impl PanelView<'_> {
             ));
             }
         }
-        // Three lines at most, and none of them repeats the standing instructions.
-        // The panel rides in front of the cache mark, so every word here is
-        // re-sent at write price on every round of the turn.
         block.push_str(
         "Doing nothing holds a result until then. Name an address under a [KEEP OPEN] heading to \
          reset its clock. The leaves-in column shows which one needs it.\n",
@@ -303,11 +246,6 @@ impl PanelView<'_> {
             }
         }
         if !elided.is_empty() {
-            // Two reasons an item is not listed, and they mean opposite things.
-            // Under ROW_MIN_CHARS it is not worth acting on. Over it, the row cap
-            // ran out, and those are the ones where letting go pays MOST. Saying
-            // "each is under 500 chars" about the second kind sends the model away
-            // from its biggest wins.
             let (small, capped): (Vec<&PanelItem>, Vec<&PanelItem>) =
                 elided.iter().partition(|item| item.chars < ROW_MIN_CHARS);
             if !small.is_empty() {
@@ -333,10 +271,6 @@ impl PanelView<'_> {
     }
 }
 
-/// The rows worth listing, and the ones only worth counting.
-///
-/// Largest first for the choice, then back into arrival order for the render,
-/// so age reads down the column.
 fn select_rows(items: &[PanelItem]) -> (Vec<PanelItem>, Vec<PanelItem>) {
     let mut by_size: Vec<(usize, &PanelItem)> = items.iter().enumerate().collect();
     by_size.sort_by_key(|(index, item)| (std::cmp::Reverse(item.chars), *index));
@@ -357,7 +291,6 @@ fn select_rows(items: &[PanelItem]) -> (Vec<PanelItem>, Vec<PanelItem>) {
     (listed, elided)
 }
 
-/// A count right-aligned in a fixed field, so two renders are the same length.
 fn field(n: usize) -> String {
     format!("{:>11}", grouped(n))
 }
@@ -366,8 +299,6 @@ fn pad(n: usize, width: usize) -> String {
     format!("{:>width$}", n, width = width)
 }
 
-/// `12345` as `12,345`. A bare digit run is where a size gets misread by an
-/// order of magnitude, and the panel exists to be read accurately.
 fn grouped(n: usize) -> String {
     let digits = n.to_string();
     let len = digits.len();
@@ -381,13 +312,6 @@ fn grouped(n: usize) -> String {
     out
 }
 
-/// What a superseded ENGINE-WRITTEN tail block collapses to, by its marker.
-///
-/// The panel and the document are both rewritten every round, so without this a
-/// 75-round turn carries 75 of each. Neither is a `ToolResult`, so no trim pass
-/// can reach them: pass 2 is assistant-only and passes 1, 3 and 4 match tool
-/// blocks. They would be the fastest-growing thing in the prompt, and the only
-/// thing the model cannot address.
 const SUPERSEDED: [(&str, &str); 2] = [
     (
         PANEL_MARKER,
@@ -399,7 +323,7 @@ const SUPERSEDED: [(&str, &str); 2] = [
     ),
 ];
 
-/// Collapse the superseded panels and documents in the array.
+/// INVARIANT: Collapse the superseded panels and documents in the array.
 ///
 /// Two cases, selected by BLOCK TYPE rather than by marker string. An
 /// engine-written block holds nothing but itself, so it is overwritten whole.
@@ -447,7 +371,7 @@ pub(crate) fn collapse_tail_blocks(messages: &mut [Message], fold_assistant_span
     collapsed
 }
 
-/// Both blocks the loop appends are ones the fold above knows how to shrink.
+/// INVARIANT: Both blocks the loop appends are ones the fold above knows how to shrink.
 ///
 /// A tail block missing from [`SUPERSEDED`] is never folded, so a 75-round turn
 /// carries 75 copies of it. Nothing else ties the appenders to the table.
@@ -501,11 +425,6 @@ pub(crate) fn append_to_tail(messages: &mut [Message], panel: String) -> bool {
     true
 }
 
-/// A tail block's capture row, so the Context Viewer and the eval both see it.
-///
-/// One builder for both blocks. Nothing else counts their bytes, so a delta is
-/// the block's own size. The two must be grouped and billed alike, or the
-/// viewer and the eval disagree about which one grew.
 pub(crate) fn tail_block_section(name: &str, block: &str) -> crate::engine::ContextSection {
     let chars = block.chars().count();
     crate::engine::ContextSection {
@@ -518,7 +437,6 @@ pub(crate) fn tail_block_section(name: &str, block: &str) -> crate::engine::Cont
     }
 }
 
-/// The panel's own row.
 pub(crate) fn panel_section(panel: &str) -> crate::engine::ContextSection {
     tail_block_section(PANEL_SECTION, panel)
 }

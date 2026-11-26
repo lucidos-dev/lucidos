@@ -10,7 +10,7 @@ async fn return_routes_and_receipts_require_the_current_pairing() {
     let (state, _dir) = gateway();
     let store = state.paired_gateways();
     let secret = store
-        .mint_secret(None, false, Minter::PairedDevice)
+        .mint_secret(None, Default::default(), Minter::PairedDevice)
         .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
@@ -87,14 +87,12 @@ async fn return_routes_and_receipts_require_the_current_pairing() {
         .is_err());
 }
 
-/// A gateway with a store of its own, so parallel tests never share a file.
 fn gateway() -> (GatewayState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
     (state, dir)
 }
 
-/// Send one request through the router the process serves.
 async fn call(
     state: &GatewayState,
     method: &str,
@@ -105,7 +103,6 @@ async fn call(
     call_from(state, None, method, path, headers, body).await
 }
 
-/// [`call`], as if the acceptor had stamped `peer` on the request.
 async fn call_from(
     state: &GatewayState,
     peer: Option<pairing::Peer>,
@@ -152,11 +149,14 @@ fn pairing_path() -> String {
     format!("{GATEWAY_API_PREFIX}{PAIRING_PATH}")
 }
 
-/// Mint a gateway code on `state` and redeem it as a remote gateway would.
 async fn pair_a_gateway(state: &GatewayState) -> PairAnswer {
     let code = state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let (status, body) = call(
         state,
@@ -236,7 +236,7 @@ async fn the_label_on_the_code_wins_over_the_one_the_gateway_offers() {
         .paired_gateways()
         .mint_secret(
             Some("cloud box".to_string()),
-            false,
+            Default::default(),
             crate::pairing::Minter::PairedDevice,
         )
         .unwrap();
@@ -270,7 +270,6 @@ async fn a_device_code_never_pairs_a_gateway() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(state.paired_gateways().list().is_empty());
 
-    // Still a good device code: the gateway path never spent it.
     let (status, _) = call(
         &state,
         "POST",
@@ -287,7 +286,11 @@ async fn a_gateway_code_never_pairs_a_device() {
     let (state, _dir) = gateway();
     let gateway_code = state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let (status, _) = call(
         &state,
@@ -316,7 +319,11 @@ async fn a_gateway_code_works_once() {
     let (state, _dir) = gateway();
     let code = state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let path = pair_path();
     let pair = || call(&state, "POST", &path, &[], Some(json!({ "code": code })));
@@ -427,8 +434,6 @@ async fn an_ended_pairing_takes_its_relayed_users() {
     assert!(state.directory().relayed.is_empty());
 }
 
-/// The unpair saved, then the forget failed: the retry answers 404 for the
-/// pairing and still forgets its users.
 #[tokio::test]
 async fn a_retried_unpair_still_forgets_the_relayed_users() {
     let (state, _dir) = gateway();
@@ -536,15 +541,17 @@ async fn an_unrouted_gateway_call_is_a_404_not_the_picker() {
     }
 }
 
-/// A redemption whose save fails pairs nobody. The caller never got the
-/// credential, so a pairing kept in memory could only confuse the list.
 #[test]
 fn a_failed_save_records_no_pairing() {
     use crate::remote_gateways::tests::ReadOnlyDir;
     let dir = tempfile::tempdir().unwrap();
     let store = PairedGatewayStore::load(paired_gateways_path(dir.path())).unwrap();
     let code = store
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     {
         let _locked = ReadOnlyDir::new(dir.path());
@@ -554,8 +561,6 @@ fn a_failed_save_records_no_pairing() {
     }
     assert!(store.list().is_empty());
 }
-
-// ── Pairing secrets and channels ────────────────────────────────────────────
 
 const DEVICE_PAIR: &str = "/~/api/v1/auth/pair";
 
@@ -592,8 +597,6 @@ fn wrong_short(code: &str) -> &'static str {
     }
 }
 
-/// Invariant: a request from 127.0.0.1 carrying a tunnel header is refused a
-/// typed code, and so is any request on the public listener.
 #[tokio::test]
 async fn a_typed_code_through_a_tunnel_is_refused_and_spends_nothing() {
     let (state, _dir) = gateway();
@@ -644,10 +647,20 @@ async fn a_typed_code_through_a_tunnel_is_refused_and_spends_nothing() {
         StatusCode::OK,
         "the long secret pairs through a tunnel"
     );
+
+    let (status, body) = call_from(
+        &state,
+        loopback,
+        "POST",
+        DEVICE_PAIR,
+        &[("host", "lucidos.example.com"), ("cf-ray", "test")],
+        Some(json!({ "code": secret })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], crate::auth_api::REJECTED_PAIRING_SECRET);
 }
 
-/// Invariant: a raw forward to the main port, which a caller can give any
-/// `Host`, is refused a typed code. This machine pairs by the secret instead.
 #[tokio::test]
 async fn a_typed_code_pairs_on_the_lan_and_never_from_loopback() {
     let (state, _dir) = gateway();
@@ -663,7 +676,6 @@ async fn a_typed_code_pairs_on_the_lan_and_never_from_loopback() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // A gateway with no device yet, so the local mint needs no Allow.
     let (state, _dir) = gateway();
     let (code, secret) = mint_device(&state).await;
     let loopback = peer_at("127.0.0.1:50000", false);
@@ -693,7 +705,6 @@ async fn a_typed_code_pairs_on_the_lan_and_never_from_loopback() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// Invariant: a junk flood from X cannot block a correct typed code from Y.
 #[tokio::test]
 async fn one_lan_device_flooding_costs_another_nothing() {
     let (state, _dir) = gateway();
@@ -724,16 +735,17 @@ async fn one_lan_device_flooding_costs_another_nothing() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// Invariant: a flood of wrong secrets from many sources cannot stop a correct
-/// long secret, for device and gateway pairing alike. The full 100,000-guess
-/// run is `pairing::tests`; this drives the routes the process serves.
 #[tokio::test]
 async fn a_flood_through_the_routes_never_refuses_a_correct_secret() {
     let (state, _dir) = gateway();
     let (code, device_secret) = mint_device(&state).await;
     let gateway_secret = state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     for n in 0..1_000u32 {
         let remote = format!("10.0.{}.{}:4000", n / 250, n % 250);
@@ -778,7 +790,6 @@ async fn a_flood_through_the_routes_never_refuses_a_correct_secret() {
     assert_eq!(status, StatusCode::OK, "the gateway secret paired");
 }
 
-/// Invariant: with nothing pending, a flood counts nothing.
 #[tokio::test]
 async fn a_flood_before_any_code_is_minted_costs_the_first_code_nothing() {
     let (state, _dir) = gateway();
@@ -832,7 +843,11 @@ fn rotation_survives_reload_and_first_new_use_revokes_overlap() {
     let path = paired_gateways_path(dir.path());
     let store = PairedGatewayStore::load(path.clone()).unwrap();
     let code = store
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired { credential, .. } = store
         .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
@@ -847,7 +862,6 @@ fn rotation_survives_reload_and_first_new_use_revokes_overlap() {
     };
     let candidate = auth::mint_credential().unwrap();
     store.rotate(&headers(&credential), &candidate).unwrap();
-    // Lost responses can repeat the same intent without creating another key.
     store.rotate(&headers(&credential), &candidate).unwrap();
     let store = PairedGatewayStore::load(path.clone()).unwrap();
     assert!(store.authorize(&headers(&credential)).unwrap().is_some());
@@ -864,7 +878,11 @@ fn rotation_expiry_revocation_and_persistence_failure_fail_closed() {
     let path = paired_gateways_path(dir.path());
     let store = PairedGatewayStore::load(path.clone()).unwrap();
     let code = store
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired {
         credential,
@@ -897,7 +915,6 @@ fn rotation_expiry_revocation_and_persistence_failure_fail_closed() {
         })
         .unwrap();
     assert!(store.authorize(&headers(&credential)).unwrap().is_none());
-    // Old overlap expiry cannot strand A: its durable candidate still works.
     assert!(store.authorize(&headers(&candidate)).unwrap().is_some());
     store
         .write(|data| data.gateways[0].last_used_at = None)
@@ -922,7 +939,11 @@ async fn rotation_route_authenticates_without_consuming_the_overlap() {
     let (state, _dir) = gateway();
     let code = state
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired { credential, .. } = state
         .paired_gateways()
@@ -961,7 +982,11 @@ fn recent_gateway_use_does_not_rewrite_the_store() {
     let path = paired_gateways_path(dir.path());
     let store = PairedGatewayStore::load(path.clone()).unwrap();
     let code = store
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired { credential, .. } = store
         .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)

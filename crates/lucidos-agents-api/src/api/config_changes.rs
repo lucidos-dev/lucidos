@@ -1,5 +1,3 @@
-//! Undo for a config change (ADR 0623).
-
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -16,9 +14,6 @@ pub(super) fn router() -> Router<AppState> {
     Router::new().route("/config-changes/:event_id/undo", post(undo))
 }
 
-/// POST /api/v1/config-changes/:event_id/undo: write the inverse of the config
-/// change that event recorded, as the caller. 404 for an event that records
-/// no config change. 409 when it cannot be undone, or the config has moved on.
 async fn undo(
     State(state): State<AppState>,
     Path(event_id): Path<Uuid>,

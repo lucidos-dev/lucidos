@@ -1,43 +1,13 @@
-//! The **known event names** a subscription can ever match, and the near-miss
-//! matcher that tells a misspelled engine name from a workspace domain event.
-//!
-//! Both halves of the corpus are DERIVED. The thread half is
-//! `all_persisted_event_types()` filtered by `classify_event`, the exact
-//! expression that generates `EVENT_CLASSIFICATION` in the frontend's
-//! `thread-lifecycle.ts`. The system half is
-//! [`SystemEvent::PERSISTED_TYPE_NAMES`]. Nothing here restates a name.
-//!
-//! That is the whole point. Two renames have already broken live subscriptions
-//! silently (`MemorySearched` to `MemoryRecalled`, `ClaudeCodeIdled` to
-//! `CodingAgentIdled`), and a hand-copied list would have been the third.
-//!
-//! [`SystemEvent::PERSISTED_TYPE_NAMES`]: crate::engine::event_bus::SystemEvent::PERSISTED_TYPE_NAMES
-
 use std::collections::HashMap;
 
 use super::{SubscriptionSurface, EVENT_WAIT_EVENT_TYPES, PER_TOKEN_STREAMING_EVENT_TYPES};
 
-/// How close a name must sit to a known one before Rule A calls it a misspelling.
 const SUBJECT_MATCH_MAX_RATIO: f64 = 0.45;
 
-/// The same threshold for Rule B, which has only the first token to go on and
-/// so has to be stricter.
 const FIRST_TOKEN_MATCH_MAX_RATIO: f64 = 0.30;
 
-/// How many near matches an error message names.
 const MAX_SUGGESTIONS: usize = 3;
 
-/// **Every name a subscription on `surface` can match**, derived from the two
-/// enumerations the engine already keeps.
-///
-/// The per-token streaming and side-question families are dropped at both
-/// surfaces, because [`super::validate_subscribable_event_type`] refuses each
-/// with a message of its own. Suggesting one would trade a silent failure for a loud wrong answer.
-/// The `EventWait*` family is dropped at the wait surface only.
-///
-/// **This is the one list.** It answers the near-match heuristic, it seeds the
-/// trigger form's dropdown, and the `event_types` tool action returns it. A
-/// name the agent reads off that action therefore always validates.
 pub fn subscribable_event_type_names(surface: SubscriptionSurface) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = crate::engine::thread_lifecycle::all_persisted_event_types()
         .into_iter()
@@ -54,11 +24,6 @@ pub fn subscribable_event_type_names(surface: SubscriptionSurface) -> Vec<&'stat
     names
 }
 
-/// Split a PascalCase name into its words. `CredentialStored` becomes
-/// `["Credential", "Stored"]`.
-///
-/// A run of capitals stays one token (`AppUI` yields `App` then `UI`), which is
-/// what keeps `AppUiCaptureRequested` and `CaptureAppUI` from looking alike.
 pub fn pascal_tokens(name: &str) -> Vec<String> {
     let chars: Vec<char> = name.chars().collect();
     let mut tokens = Vec::new();
@@ -79,7 +44,6 @@ pub fn pascal_tokens(name: &str) -> Vec<String> {
     tokens
 }
 
-/// Levenshtein edit distance between two names.
 pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let b_chars: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
@@ -95,8 +59,6 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     prev[b_chars.len()]
 }
 
-/// Edit distance scaled by the longer name's length, so a one-letter slip in a
-/// short name and in a long one are comparable.
 fn distance_ratio(a: &str, b: &str) -> f64 {
     let longest = a.chars().count().max(b.chars().count());
     if longest == 0 {
@@ -105,13 +67,11 @@ fn distance_ratio(a: &str, b: &str) -> f64 {
     levenshtein(a, b) as f64 / longest as f64
 }
 
-/// Everything but the last token, joined. The **subject** of an event name:
-/// `CredentialStored` is about a credential, `ThreadFinished` about a thread.
 fn subject(tokens: &[String]) -> Option<String> {
     (tokens.len() >= 2).then(|| tokens[..tokens.len() - 1].concat())
 }
 
-/// **Is `name` a misspelling of an engine event, or a workspace domain event?**
+/// INVARIANT: **Is `name` a misspelling of an engine event, or a workspace domain event?**
 ///
 /// A verdict only. What to suggest is [`suggest_event_types`]'s question, and
 /// it ranks by a different measure.
@@ -149,15 +109,6 @@ pub fn is_near_miss(name: &str) -> bool {
         })
 }
 
-/// The known names closest to `name`, best first, at most
-/// [`MAX_SUGGESTIONS`] of them.
-///
-/// Ranked by edit distance, then pulled towards names that share a **rare**
-/// token. Rarity is what makes a rename findable: only `CodingAgentIdled`
-/// contains `Idled`, so it outranks every name that merely looks like
-/// `ClaudeCodeIdled` letter by letter.
-///
-/// Drawn from the wait corpus, so every suggestion is usable at either surface.
 pub fn suggest_event_types(name: &str) -> Vec<&'static str> {
     let corpus = subscribable_event_type_names(SubscriptionSurface::Wait);
     let mut token_frequency: HashMap<String, usize> = HashMap::new();
@@ -191,8 +142,6 @@ pub fn suggest_event_types(name: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// The `Did you mean` clause for an error message, empty when the corpus offers
-/// nothing.
 pub fn did_you_mean(name: &str) -> String {
     let suggestions = suggest_event_types(name);
     match suggestions.as_slice() {
@@ -222,8 +171,6 @@ mod tests {
         assert_eq!(levenshtein("", "abc"), 3);
     }
 
-    /// Rule A catches a swapped last word. Rule B catches a name whose subject
-    /// grew a token, which is what `CredentialRequestResolved` did.
     #[test]
     fn the_two_rules_catch_the_engine_near_misses() {
         for name in [
@@ -240,8 +187,6 @@ mod tests {
         }
     }
 
-    /// The corpus is derived, so it has to be big and it has to hold names from
-    /// both halves.
     #[test]
     fn the_corpus_is_derived_from_both_enumerations() {
         let names = subscribable_event_type_names(SubscriptionSurface::Wait);
@@ -255,9 +200,6 @@ mod tests {
         assert_eq!(sorted.len(), names.len(), "the two halves overlap");
     }
 
-    /// The two surfaces differ by exactly one family, in one direction. Pinned
-    /// because the near-match heuristic reads the narrower set and relies on
-    /// the containment.
     #[test]
     fn the_trigger_corpus_is_the_wait_corpus_plus_the_event_wait_family() {
         let wait = subscribable_event_type_names(SubscriptionSurface::Wait);

@@ -29,8 +29,6 @@ async fn seq_of_last_row(pool: &PgPool) -> i64 {
         .unwrap()
 }
 
-/// A replay position at this floor with no append in flight, for the tests
-/// that need no database.
 fn at_floor(floor: i64) -> LagReplay {
     LagReplay::opened(
         ReplayScope::Workspace,
@@ -44,7 +42,6 @@ fn at_floor(floor: i64) -> LagReplay {
     )
 }
 
-/// A window over `(after, through]` with nothing skipped or owed.
 fn window(after: i64, through: i64) -> ReplayWindow {
     ReplayWindow {
         after,
@@ -78,8 +75,6 @@ async fn a_replay_returns_the_rows_the_subscriber_never_saw() {
     teardown_test_db(&db).await;
 }
 
-/// The memory index bills one extraction per event, and the voice call speaks
-/// one answer per event. So a row acted on live must not come back.
 #[tokio::test]
 async fn a_replay_skips_what_was_acted_on_live_and_live_skips_what_was_replayed() {
     let (pool, db) = setup_test_db().await;
@@ -139,8 +134,6 @@ async fn a_thread_scoped_replay_reads_only_its_thread_and_its_types() {
     teardown_test_db(&db).await;
 }
 
-/// The branch-work net reads `actor` and the memory indexer reads `channel`
-/// off the frame, so both must survive the round trip through the row.
 #[tokio::test]
 async fn a_replayed_frame_carries_the_meta_it_was_emitted_with() {
     let (pool, db) = setup_test_db().await;
@@ -172,8 +165,6 @@ async fn a_replayed_frame_carries_the_meta_it_was_emitted_with() {
     teardown_test_db(&db).await;
 }
 
-/// A replayed frame dispatches as its live frame did, so the trigger matcher
-/// reads the same chain depth and drops the same emitting trigger.
 #[tokio::test]
 async fn a_replayed_frame_carries_its_stored_depth_and_emitting_trigger() {
     let (pool, db) = setup_test_db().await;
@@ -229,8 +220,6 @@ async fn a_row_that_does_not_read_back_is_skipped_and_the_rest_still_replay() {
     teardown_test_db(&db).await;
 }
 
-/// A failed read is not a retry: nothing runs on its own. It only keeps the
-/// floor, so the next lag's replay covers both windows.
 #[tokio::test]
 async fn a_failed_read_keeps_the_floor_for_the_next_replay() {
     let (pool, db) = setup_test_db().await;
@@ -248,8 +237,6 @@ async fn a_failed_read_keeps_the_floor_for_the_next_replay() {
     teardown_test_db(&db).await;
 }
 
-/// I2. A row the bus sent before the subscription never reached this
-/// subscriber, so no replay offers it.
 #[tokio::test]
 async fn a_row_sent_before_subscribing_is_never_replayed() {
     let (pool, db) = setup_test_db().await;
@@ -267,8 +254,6 @@ async fn a_row_sent_before_subscribing_is_never_replayed() {
     teardown_test_db(&db).await;
 }
 
-/// The one loop shape every replaying subscriber runs: a live frame passes
-/// once, a lag hands back what it dropped, and a closed bus ends the loop.
 #[tokio::test]
 async fn a_read_passes_live_frames_once_and_turns_a_lag_into_the_dropped_rows() {
     let (pool, db) = setup_test_db().await;
@@ -296,16 +281,13 @@ async fn a_read_passes_live_frames_once_and_turns_a_lag_into_the_dropped_rows() 
     teardown_test_db(&db).await;
 }
 
-/// A system row that has committed and not yet broadcast, as an append sits
-/// between its commit and its send. A default-shaped variant, so the replay
-/// reads it back as its event.
 async fn commit_unsent_row(bus: &EventBus) -> super::super::CommittedSystemEvent {
     let event = SystemEvent::ArtifactCreated {
         artifact_path: "notes.md".into(),
         commit: "abc123".into(),
         source: None,
         writer_thread_id: None,
-        writer: None, // Legacy event fixture.
+        writer: None,
     };
     let append = bus.begin_append().await.unwrap();
     bus.commit_system_event(append, Uuid::new_v4(), event, 0, None)
@@ -313,9 +295,6 @@ async fn commit_unsent_row(bus: &EventBus) -> super::super::CommittedSystemEvent
         .unwrap()
 }
 
-/// I1. The row committed before the subscription opened, so it sits at or
-/// below the subscription's floor. Its frame still reached this subscriber,
-/// so the lag that dropped it owes it.
 #[tokio::test]
 async fn a_row_committed_before_subscribing_and_sent_after_is_replayed() {
     let (pool, db) = setup_test_db().await;
@@ -334,8 +313,6 @@ async fn a_row_committed_before_subscribing_and_sent_after_is_replayed() {
     teardown_test_db(&db).await;
 }
 
-/// I3. A row still unsent when a lag comes is not owed yet: it arrives live,
-/// once, and a later lag does not replay it.
 #[tokio::test]
 async fn an_unsent_row_is_not_replayed_and_arrives_live_once() {
     let (pool, db) = setup_test_db().await;
@@ -360,8 +337,6 @@ async fn an_unsent_row_is_not_replayed_and_arrives_live_once() {
     teardown_test_db(&db).await;
 }
 
-/// I3. A row the replay returned is skipped when its own frame arrives late
-/// from the buffer.
 #[tokio::test]
 async fn an_owed_row_the_replay_returned_is_skipped_when_it_arrives_late() {
     let (pool, db) = setup_test_db().await;
@@ -382,8 +357,6 @@ async fn an_owed_row_the_replay_returned_is_skipped_when_it_arrives_late() {
     teardown_test_db(&db).await;
 }
 
-/// Read until the frame of the row at `seq` has passed, and return every frame
-/// handed on along the way.
 async fn drain_to(
     rx: &mut broadcast::Receiver<EmittedEvent>,
     replay: &mut LagReplay,
@@ -401,8 +374,6 @@ async fn drain_to(
     }
 }
 
-/// I5. A subscription opened before the bus learned any sequence owes every
-/// row the bus sends, so its first lag replays them all.
 #[tokio::test]
 async fn a_first_lag_with_no_starting_position_replays_what_it_dropped() {
     let (pool, db) = setup_test_db().await;
@@ -475,8 +446,6 @@ fn a_covered_window_marks_late_frames_and_keeps_what_lies_above() {
     assert_eq!(replay.floor, Some(21), "21 sits right above the new floor");
 }
 
-/// A row that reached the subscriber live is not offered again, so a replay
-/// never re-decides an event against a registry that changed since.
 #[tokio::test]
 async fn a_window_skips_rows_received_live() {
     let (pool, db) = setup_test_db().await;
@@ -496,8 +465,6 @@ async fn a_window_skips_rows_received_live() {
     teardown_test_db(&db).await;
 }
 
-/// A backfill row the bus wrote without a broadcast was never meant to reach
-/// a subscriber, so a replay does not offer it either.
 #[tokio::test]
 async fn a_window_skips_rows_written_without_a_broadcast() {
     let (pool, db) = setup_test_db().await;
@@ -543,8 +510,6 @@ async fn an_uncovered_window_is_read_again_by_the_next_lag() {
     teardown_test_db(&db).await;
 }
 
-/// A floor set at the first lag keeps what arrived live before it. Nothing
-/// was replayed, so no late frame may be skipped as covered.
 #[tokio::test]
 async fn a_floor_set_at_the_first_lag_skips_live_rows_and_covers_none() {
     let (pool, db) = setup_test_db().await;
@@ -559,8 +524,6 @@ async fn a_floor_set_at_the_first_lag_skips_live_rows_and_covers_none() {
     teardown_test_db(&db).await;
 }
 
-/// I6. A failed read keeps a known floor and the appends still owed, so the
-/// next lag replays both windows.
 #[tokio::test]
 async fn a_failed_read_keeps_a_known_floor_and_what_is_owed() {
     let (pool, db) = setup_test_db().await;
@@ -588,8 +551,6 @@ async fn a_failed_read_keeps_a_known_floor_and_what_is_owed() {
     teardown_test_db(&db).await;
 }
 
-/// I5. A thread-scoped subscription opened before the bus learned anything
-/// sets its floor from a workspace horizon, and replays its thread's rows.
 #[tokio::test]
 async fn a_thread_scoped_first_lag_replays_what_it_dropped() {
     let (pool, db) = setup_test_db().await;
@@ -609,7 +570,6 @@ async fn a_thread_scoped_first_lag_replays_what_it_dropped() {
     teardown_test_db(&db).await;
 }
 
-/// I6. A horizon read that fails never advances the floor.
 #[tokio::test]
 async fn a_failed_horizon_read_keeps_the_floor() {
     let (pool, db) = setup_test_db().await;
@@ -623,8 +583,6 @@ async fn a_failed_horizon_read_keeps_the_floor() {
     teardown_test_db(&db).await;
 }
 
-/// A frame still buffered from before the first window was never replayed,
-/// so it is not skipped as covered when it arrives.
 #[test]
 fn a_frame_below_the_first_window_is_not_covered() {
     let mut replay = at_floor(10);
@@ -633,8 +591,6 @@ fn a_frame_below_the_first_window_is_not_covered() {
     assert!(replay.is_covered(Some(11)));
 }
 
-/// I10. A replay that stopped among the owed rows below the floor keeps the
-/// floor, and owes the rest to the next lag.
 #[test]
 fn a_partial_replay_among_owed_rows_keeps_the_floor() {
     let mut replay = at_floor(10);
@@ -654,8 +610,6 @@ fn a_partial_replay_among_owed_rows_keeps_the_floor() {
     assert_eq!(replay.floor, Some(10));
 }
 
-/// I3. A live frame at or below the opening floor is an in-flight append's
-/// row. The subscriber acts on it once, and no lag owes it afterwards.
 #[test]
 fn a_live_row_below_the_opening_floor_is_acted_on_once_and_not_owed() {
     let (event_tx, _keep_open) = broadcast::channel(16);
@@ -680,9 +634,6 @@ fn a_live_row_below_the_opening_floor_is_acted_on_once_and_not_owed() {
     assert!(!replay.live(&row_frame(9)), "and only once");
 }
 
-/// I5. An append can draw a lower sequence and learn it after another
-/// append's higher one. So a floor set at the first lag never sits above the
-/// committed horizon, and that lower row stays owed.
 #[test]
 fn a_floor_set_at_the_first_lag_never_sits_above_the_committed_horizon() {
     let (event_tx, _keep_open) = broadcast::channel(16);
@@ -702,7 +653,6 @@ fn a_floor_set_at_the_first_lag_never_sits_above_the_committed_horizon() {
     assert_eq!(replay.floor, Some(10));
 }
 
-/// The gaps a window skips between the owed rows and the floor.
 #[test]
 fn the_rows_between_owed_rows_and_the_floor_are_skipped() {
     assert_eq!(gaps_between(6, &[7, 9], 10), vec![8..=8, 10..=10]);
@@ -710,8 +660,6 @@ fn the_rows_between_owed_rows_and_the_floor_are_skipped() {
     assert_eq!(gaps_between(3, &[4], 8), vec![5..=8]);
 }
 
-/// A replay that stopped part way covers only what it offered, and the next
-/// lag reads the rest.
 #[test]
 fn a_partial_replay_covers_only_what_it_offered() {
     let mut replay = at_floor(10);
@@ -722,8 +670,6 @@ fn a_partial_replay_covers_only_what_it_offered() {
     assert_eq!(replay.floor, Some(15));
 }
 
-/// A fresh bus has no append tickets for archived history. Restore's durable
-/// floor still bounds both read shapes, including after another process crash.
 #[tokio::test]
 async fn restore_floor_bounds_workspace_and_thread_lag_replay() {
     let (pool, db) = setup_test_db().await;

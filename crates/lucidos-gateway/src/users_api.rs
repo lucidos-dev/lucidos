@@ -1,14 +1,3 @@
-//! HTTP surface for users, under `/~/api/v1/auth` (ADR 0623).
-//!
-//! Settings → Users calls these from a paired device, and every engine this
-//! gateway spawns reads `GET /users` with the local token. Each change is
-//! a [`crate::gateway_event_log`] event, and [`signal_engines`] tells every
-//! routed engine to read again.
-//!
-//! Nothing here allows or refuses anything by user. These routes sit
-//! behind the same gate as the device list, and every paired device may call
-//! them.
-
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -97,7 +86,6 @@ pub(crate) fn requested_user<'a>(
     Ok(user.or(legacy))
 }
 
-/// One user, with the devices they hold.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserRow {
     pub id: String,
@@ -106,19 +94,16 @@ pub struct UserRow {
     pub device_ids: Vec<String>,
 }
 
-/// A device relayed through a gateway pairing. `via` is that gateway's label.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayedRow {
     pub device_id: String,
     pub user_id: String,
     pub name: String,
     pub via: String,
-    /// The emails the other gateway holds for the user.
     #[serde(default)]
     pub emails: Vec<String>,
 }
 
-/// What `GET /users` answers. Engines parse the same shape.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsersBody {
     pub users: Vec<UserRow>,
@@ -177,7 +162,6 @@ struct MoveBody {
     operator_id: Option<String>,
 }
 
-/// Record a decision and answer the users as they now stand.
 fn record_and_list(
     state: &GatewayState,
     decide: impl FnOnce(&Directory) -> Result<Vec<GatewayEvent>, Refusal>,
@@ -204,8 +188,6 @@ async fn rename(
     record_and_list(&state, |d| d.rename_user(&id, &body.name))
 }
 
-/// Remove a user and revoke their devices. When the caller is one of them,
-/// the same response clears its cookie, as revoking its own device does.
 async fn remove(
     State(state): State<GatewayState>,
     connection: lucidos_gateway_tls::Connection,
@@ -255,7 +237,6 @@ async fn move_device(
     record_and_list(&state, |d| d.move_device(&id, user))
 }
 
-/// Tell every routed engine the users changed.
 pub fn signal_engines(state: &GatewayState) {
     crate::engine_signal::signal_engines(state, ENGINE_USERS_CHANGED_PATH, None, "users");
 }

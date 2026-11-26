@@ -1,15 +1,5 @@
-//! Coverage for `POST /api/v1/threads/drafts`, an agent creating a draft for
-//! the owner (ADR 0665).
-//!
-//! The route needs a thread-bound origin token, which only a subprocess the
-//! engine spawned holds. So, as in `follow_up_test`, this suite covers what a
-//! caller outside the engine reaches: the refusal, the mount and the CLI loop.
-//! The engine's `agent_drafts` tests cover a created draft.
-
 use crate::support::{base_url, unique_marker, user_client};
 
-/// A device has no origin token, so no thread to name the draft by. It is
-/// refused before the body is read, and no draft appears.
 #[tokio::test]
 async fn create_draft_refuses_a_caller_outside_a_thread() {
     let client = user_client().await;
@@ -45,7 +35,6 @@ async fn create_draft_refuses_a_caller_outside_a_thread() {
     );
 }
 
-/// The CLI reaches the route and surfaces its refusal.
 #[test]
 fn cli_create_draft_reaches_the_route() {
     let out = crate::lucidos_cli_test::lucidos_cmd()

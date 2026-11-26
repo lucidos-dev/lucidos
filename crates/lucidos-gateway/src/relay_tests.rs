@@ -31,7 +31,6 @@ fn claim(prefix: &str, issued_at: i64, device: Option<AuthenticatedDevice>) -> R
     }
 }
 
-/// Headers carrying `claim`, signed with `key`.
 fn signed(claim: &RelayClaim, key: &str) -> HeaderMap {
     let raw = claim.encode();
     let mut headers = HeaderMap::new();
@@ -39,8 +38,6 @@ fn signed(claim: &RelayClaim, key: &str) -> HeaderMap {
     headers.insert(HEADER_RELAY_SIGNATURE, sign(key, &raw).parse().unwrap());
     headers
 }
-
-// ── Routes never collide ────────────────────────────────────────────────────
 
 #[test]
 fn a_remote_route_needs_a_slug_and_a_name() {
@@ -57,8 +54,6 @@ fn a_remote_route_needs_a_slug_and_a_name() {
         assert_eq!(remote_route(not_remote), None, "{not_remote}");
     }
 }
-
-// ── The claim ───────────────────────────────────────────────────────────────
 
 #[test]
 fn a_claim_survives_its_header_encoding() {
@@ -166,15 +161,11 @@ fn a_device_id_that_would_break_the_namespace_is_refused() {
     }
 }
 
-// ── End to end: A relays to B over https ────────────────────────────────────
-
-/// What B's fake engine saw: each request's target and headers, lowercased.
 pub(crate) type Seen = Arc<Mutex<Vec<String>>>;
 
 const PAGE: &str = "<!doctype html><html><head><base href=\"/dev/\"></head><body>B</body></html>";
 const GZIP_BYTES: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef];
 
-/// Response headers that would set state for A's whole origin.
 const ORIGIN_STATE_HEADERS: &[(&str, &str)] = &[
     ("set-cookie", "lucidos_device_x=planted; Path=/"),
     ("clear-site-data", "\"cookies\""),
@@ -185,12 +176,9 @@ const ORIGIN_STATE_HEADERS: &[(&str, &str)] = &[
     ("access-control-allow-origin", "*"),
 ];
 
-/// B's engine for `dev`: records every request, and serves a page, a gzip
-/// body, a two-chunk SSE stream held between chunks, and a font.
 fn engine(seen: Seen, held: tokio::sync::oneshot::Receiver<()>) -> axum::Router {
     let held = Arc::new(Mutex::new(Some(held)));
     let record = move |req: Request| {
-        // The gateway's own signal that users changed, not a relayed call.
         if matches!(
             req.uri().path(),
             "/api/v1/users/changed" | "/api/v1/operators/changed"
@@ -253,7 +241,6 @@ fn engine(seen: Seen, held: tokio::sync::oneshot::Receiver<()>) -> axum::Router 
     })
 }
 
-/// Gateway A, paired with gateway B as `cloud`, B serving `dev`.
 pub(crate) struct Paired {
     pub(crate) a: GatewayState,
     pub(crate) b: GatewayState,
@@ -315,7 +302,11 @@ async fn paired_with_engine_token(
 
     let code = b
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
@@ -381,8 +372,6 @@ impl Paired {
         format!("{}=cred-abc", self.a.device_cookie_name())
     }
 
-    /// A paired device after trusted client retirement, plus `extra` headers.
-    /// Migration regressions build a request explicitly without that marker.
     async fn device_get(&self, path: &str, extra: &[(&str, &str)]) -> Response {
         let mut builder = axum::http::Request::builder().uri(path).header(
             header::COOKIE,
@@ -483,7 +472,6 @@ async fn bs_response_cannot_set_state_on_as_origin() {
     let p = paired().await;
     let response = p.device_get("/dev@cloud/api/v1/origin-state", &[]).await;
     assert_eq!(response.status(), StatusCode::OK);
-    // A may refresh its own device cookie, so the check is B's values.
     for (name, value) in ORIGIN_STATE_HEADERS {
         let arrived = response
             .headers()
@@ -587,9 +575,6 @@ async fn a_posted_body_streams_through() {
     assert!(seen.contains("content-length: 2\n"), "{seen}");
 }
 
-/// "Switch to new version" in a relayed workspace is B's own page posting
-/// B's restart route. B's engine names the tap's device, so the restart
-/// counts as user-initiated there.
 #[tokio::test]
 async fn switch_reaches_bs_engine_as_the_tapping_device() {
     let p = paired().await;
@@ -709,9 +694,6 @@ async fn a_local_workspace_of_the_same_name_keeps_its_route() {
     assert_eq!(local_seen.lock().unwrap().len(), 1);
 }
 
-// ── B's side: only paired gateways, revocation, one-way ─────────────────────
-
-/// A request straight to B's relay call, as some caller might send it.
 async fn to_b(p: &Paired, path: &str, headers: HeaderMap) -> reqwest::StatusCode {
     let client = lucidos_local_token::client::client_builder()
         .build()
@@ -752,8 +734,6 @@ async fn b_refuses_a_relay_without_a_current_pairings_credential() {
     assert_eq!(to_b(&p, path, right).await, 200);
 }
 
-/// Trusted pairing on A fetches B's own client through the relay. So B serves
-/// its shell and assets to a relayed device, under A's outside prefix.
 #[tokio::test]
 async fn b_serves_its_own_client_shell_and_assets_to_a_relayed_device() {
     let p = paired().await;
@@ -813,8 +793,6 @@ async fn unpair_on_b_refuses_the_very_next_relayed_request() {
     assert!(p.last_seen().is_none());
 }
 
-/// A request that passed auth just before the unpair must not bring back a
-/// user the unpair forgot.
 #[tokio::test]
 async fn an_ended_pairing_records_no_relayed_user() {
     let p = paired().await;
@@ -823,6 +801,7 @@ async fn an_ended_pairing_records_no_relayed_user() {
         pairing_id: p.pairing_id.clone(),
         label: "laptop".into(),
         may_manage: false,
+        may_control: false,
         remote_starts: Default::default(),
     };
     let device = AuthenticatedDevice {
@@ -894,7 +873,6 @@ async fn a_relayed_callback_whose_state_names_another_workspace_reaches_nothing(
 #[tokio::test]
 async fn the_relay_is_one_way_a_credential_opens_nothing_on_its_holder() {
     let p = paired().await;
-    // A holds the credential. Presented to A, it is no device and no gateway.
     for path in [
         "/dev@cloud/api/v1/threads/list",
         "/~/api/gateway/v1/pairing",
@@ -934,11 +912,8 @@ fn a_remote_frame_capability_is_passed_on_by_shape_alone() {
     assert!(!carries_a_remote_frame_capability(&req("GET", &dotted)));
 }
 
-// ── The local-browser stamp crosses the relay signed ────────────────────────
-
 const LOCAL_STAMP: &str = "x-lucidos-local-browser: 1\n";
 
-/// A paired device's request to A over loopback, from a browser on A's machine.
 fn local_device_request(p: &Paired, path: &str) -> axum::http::Request<Body> {
     let mut req = axum::http::Request::builder()
         .uri(path)
@@ -1007,8 +982,6 @@ async fn b_honours_a_local_browser_stamp_only_under_the_pairing_credential() {
     assert!(p.last_seen().unwrap().contains(LOCAL_STAMP));
 }
 
-// ── A's user crosses the relay signed ───────────────────────────────────
-
 #[tokio::test]
 async fn a_relayed_device_arrives_with_as_user() {
     let p = paired().await;
@@ -1024,7 +997,6 @@ async fn a_relayed_device_arrives_with_as_user() {
     assert!(relayed[0]
         .user_id
         .starts_with(&format!("{}:", p.pairing_id)));
-    // The engine never sees the user headers: B's own log is the record.
     let seen = p.last_seen().unwrap();
     assert!(!seen.contains(HEADER_RELAY_USER), "{seen}");
 }
@@ -1062,8 +1034,6 @@ async fn an_unsigned_or_forged_user_names_nobody() {
     assert_eq!(p.b.directory().relayed[0].emails, vec!["sam@example.com"]);
 }
 
-/// An A older than the user rename sends the operator pair. B records the
-/// user anyway, so "Sam via A" survives B upgrading first.
 #[tokio::test]
 async fn an_older_a_with_the_operator_header_still_names_its_user() {
     let p = paired().await;
@@ -1090,8 +1060,6 @@ async fn an_older_a_with_the_operator_header_still_names_its_user() {
     assert!(!seen.contains(LEGACY_HEADER_RELAY_OPERATOR), "{seen}");
 }
 
-/// A B older than the user rename reads only the operator pair. A new A
-/// signs it beside the user pair, so "Sam via A" survives A upgrading first.
 #[tokio::test]
 async fn a_new_a_also_signs_the_operator_header_for_an_older_b() {
     let p = paired().await;
@@ -1113,8 +1081,6 @@ async fn a_new_a_also_signs_the_operator_header_for_an_older_b() {
     );
 }
 
-/// The new pair signed with the old binding is a forgery: a header name
-/// never picks the binding it is checked against.
 #[test]
 fn a_user_header_signed_with_the_operator_binding_names_nobody() {
     let claim = fresh(Some(device("device-1"))).encode();
@@ -1139,8 +1105,6 @@ fn a_user_round_trips_its_emails_and_an_older_shape_has_none() {
     assert!(older.emails.is_empty(), "an older gateway signs no emails");
 }
 
-/// Paired, with B's engine counting its contract probes. Setting the flag
-/// adds a capability to the engine's contract.
 async fn counted() -> (Paired, Arc<AtomicUsize>, Arc<AtomicBool>) {
     let (probes, changed) = (
         Arc::new(AtomicUsize::new(0)),

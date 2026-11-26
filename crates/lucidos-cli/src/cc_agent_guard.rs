@@ -1,20 +1,3 @@
-//! PreToolUse hook for Claude Code's `Agent` tool. Refuses a subagent that
-//! would run in the background.
-//!
-//! Claude Code runs an `Agent` launch in the background unless the call sets
-//! `run_in_background: false`. It also does so whatever the call says when
-//! the agent's definition sets `background: true` or `isolation: remote`. In a
-//! Lucidos session that subagent cannot report back: the engine kills the
-//! whole Claude Code process when the turn ends
-//! (`agent_session::lifecycle::terminate_decision`), and the subagent lives
-//! inside it. A model that launches one and ends its turn with "I'll report
-//! back" leaves the thread done with no changes. The engine prompt already
-//! says this, and models still did it, so this hook enforces it.
-//!
-//! Wired into `<workspace>/.lucidos/cc-settings.json` via the engine's
-//! `cc_settings.rs`. Fails OPEN on parse / I/O errors so a hook bug can't
-//! brick every subagent.
-
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -46,18 +29,12 @@ fn definition_refusal(agent_type: &str, setting: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct HookPayload {
     tool_input: Value,
-    /// The session's working directory, where project agents live.
     cwd: Option<PathBuf>,
 }
 
-/// The Claude Code env switches that change how a subagent runs.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Switches {
-    /// `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`: nothing runs in the background,
-    /// not even an agent whose definition sets `background: true`.
     background_tasks_disabled: bool,
-    /// `CLAUDE_CODE_FORK_SUBAGENT`: a call with no `subagent_type` forks the
-    /// parent, which has no definition to read.
     fork_subagent: bool,
 }
 
@@ -70,16 +47,11 @@ impl Switches {
         }
     }
 
-    /// Either switch makes Claude Code drop `run_in_background` from the
-    /// `Agent` schema, and a call without it then runs in the foreground.
-    /// Refusing a missing flag there would block every call, with no flag the
-    /// model could add.
     fn schema_has_background_flag(self) -> bool {
         !(self.background_tasks_disabled || self.fork_subagent)
     }
 }
 
-/// The same values Claude Code reads as "on".
 fn env_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -87,7 +59,6 @@ fn env_truthy(value: &str) -> bool {
     )
 }
 
-/// The agent type the call launches, or `None` for a fork.
 fn requested_agent_type(tool_input: &Value, switches: Switches) -> Option<&str> {
     match tool_input.get("subagent_type").and_then(Value::as_str) {
         Some(agent_type) => Some(agent_type),
@@ -95,10 +66,6 @@ fn requested_agent_type(tool_input: &Value, switches: Switches) -> Option<&str> 
     }
 }
 
-/// The refusal for a call that would run in the background, or `None` to let
-/// it through. `definition` is the agent the call resolves to, if the guard
-/// could read it. With the flag in the schema, only an explicit `false` runs
-/// in the foreground: a missing flag means Claude Code's background default.
 pub(crate) fn refusal(
     tool_input: &Value,
     definition: Option<&AgentDefinition>,
@@ -109,7 +76,6 @@ pub(crate) fn refusal(
         return Some(REMOTE_REFUSAL.to_string());
     }
     if let Some(definition) = definition {
-        // The call's own isolation replaces the definition's.
         if isolation.is_none() && definition.remote_isolation {
             return Some(definition_refusal(
                 &definition.agent_type,
@@ -172,7 +138,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Neither env switch set: the schema has the flag.
     const DEFAULT: Switches = Switches {
         background_tasks_disabled: false,
         fork_subagent: false,
@@ -198,8 +163,6 @@ mod tests {
         refusal(input, definition, switches).is_some()
     }
 
-    /// The call that stranded a thread: no flag, so Claude Code's background
-    /// default.
     #[test]
     fn an_agent_call_without_the_flag_is_refused() {
         let input = json!({"description": "Explore", "prompt": "…", "subagent_type": "Explore"});
@@ -226,8 +189,6 @@ mod tests {
         );
     }
 
-    /// Only a real boolean `false` is the foreground. A string would not
-    /// pass Claude Code's own validator, so it must not pass here either.
     #[test]
     fn a_string_false_is_not_the_foreground() {
         let input = json!({"run_in_background": "false"});
@@ -237,8 +198,6 @@ mod tests {
         );
     }
 
-    /// With either switch on the schema has no flag to set, and a call
-    /// without it already runs in the foreground.
     #[test]
     fn a_missing_flag_passes_when_the_schema_has_none() {
         for switches in [TASKS_DISABLED, FORK] {
@@ -246,7 +205,6 @@ mod tests {
         }
     }
 
-    /// Remote isolation runs in the background whatever the flag says.
     #[test]
     fn a_remote_subagent_is_refused_even_in_the_foreground() {
         let input = json!({"isolation": "remote", "run_in_background": false});
@@ -260,8 +218,6 @@ mod tests {
         );
     }
 
-    /// Both remote refusals fire with background tasks disabled too, where
-    /// the flag is not in the schema and naming it would fail the retry.
     #[test]
     fn a_remote_refusal_never_asks_for_the_background_flag() {
         let far = definition("far", false, true);
@@ -280,8 +236,6 @@ mod tests {
         assert_eq!(refusal(&input, None, DEFAULT), None);
     }
 
-    /// The case this guard missed: the call asks for the foreground, and the
-    /// definition sends the agent to the background anyway.
     #[test]
     fn a_background_definition_is_refused_even_in_the_foreground() {
         let input = json!({"subagent_type": "scout", "run_in_background": false});
@@ -292,7 +246,6 @@ mod tests {
         assert!(reason.contains("another subagent_type"), "{reason}");
     }
 
-    /// Fork mode leaves `background: true` in force.
     #[test]
     fn a_background_definition_is_refused_in_fork_mode() {
         let input = json!({"subagent_type": "scout"});
@@ -303,7 +256,6 @@ mod tests {
         ));
     }
 
-    /// Claude Code ignores `background: true` with background tasks disabled.
     #[test]
     fn a_background_definition_passes_with_background_tasks_disabled() {
         let input = json!({"subagent_type": "scout"});

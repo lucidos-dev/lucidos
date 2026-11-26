@@ -1,5 +1,3 @@
-//! Place workspaces in the release notice sequence on startup.
-
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -9,18 +7,11 @@ use lucidos_engine::engine::release_notices::{
 use lucidos_engine::triggers::TriggerConfig;
 use sqlx::PgPool;
 
-/// Place a workspace in the sequence, on the first boot that finds it outside.
-///
-/// Runs once per boot. The running release determines how far a workspace
-/// without threads or retired trigger grants can start in the sequence.
-/// An existing usable cursor stays in place.
 pub async fn seed_cursor_at_startup(
     pool: &PgPool,
     trigger_configs: &RwLock<HashMap<String, TriggerConfig>>,
 ) {
     let notices = all();
-    // Retired grants are existing workspace content even before any trigger
-    // has run.
     if has_legacy_trigger_grants(trigger_configs) {
         return;
     }

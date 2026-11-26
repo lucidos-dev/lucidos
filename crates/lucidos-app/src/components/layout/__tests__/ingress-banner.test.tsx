@@ -126,4 +126,14 @@ describe('ingressBannerBody renders the bar', () => {
   it('renders nothing when there is no outage to report', () => {
     expect(body(null)).toBeNull();
   });
+
+  it('lands the measured ref on the bar itself, the box the shell lays out', () => {
+    const ref = { current: null };
+    const node = ingressBannerBody({
+      layout: 'desktop', outage: outage(), onOpenWebhooks: () => {}, onDiscuss: () => {}, elRef: ref,
+    });
+    const [bar] = findByClass(node, 'ingress-banner');
+    expect(bar.ref).toBe(ref);
+    expect(findByClass(node, 'ingress-banner-text')[0].ref).toBeUndefined();
+  });
 });

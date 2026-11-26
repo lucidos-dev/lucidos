@@ -1,14 +1,6 @@
-//! E2E coverage for clearing a trigger's model, reasoning effort and provider
-//! pins over `PUT /api/v1/triggers`.
-//!
-//! Both null spellings must clear: JSON null, and the string `"null"`. The
-//! string is the exact body `lucidos triggers update --model null` sends, since
-//! a CLI flag can only carry a string.
-
 use crate::support::{base_url, unique_marker, user_client};
 use serde_json::json;
 
-/// A schedule that never fires inside a test run, so the intent never runs.
 const NEVER_SOON_CRON: &str = "0 0 3 1 1 *";
 
 const PINS: [&str; 3] = ["model", "reasoning_effort", "provider"];
@@ -78,7 +70,6 @@ async fn both_null_spellings_clear_every_pin() {
         .expect("trigger id")
         .to_string();
 
-    // Absent: a rename-only update keeps the pins.
     let renamed = format!("{name} renamed");
     let resp = update(&client, &id, json!({ "name": renamed })).await;
     assert_eq!(resp["success"], true, "rename failed: {resp}");
@@ -86,7 +77,6 @@ async fn both_null_spellings_clear_every_pin() {
     assert_eq!(trigger["model"], "claude-sonnet-5", "{trigger}");
     assert_eq!(trigger["reasoning_effort"], "low", "{trigger}");
 
-    // The string "null", as the CLI sends it.
     let resp = update(
         &client,
         &id,
@@ -96,7 +86,6 @@ async fn both_null_spellings_clear_every_pin() {
     assert_eq!(resp["success"], true, "string null refused: {resp}");
     assert_unpinned(&client, &renamed, "the string \"null\"").await;
 
-    // JSON null.
     let resp = update(
         &client,
         &id,

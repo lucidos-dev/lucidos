@@ -68,7 +68,6 @@ pub struct Verification {
     pub at: DateTime<Utc>,
 }
 
-/// Caller-safe metadata. Keys, database URLs and local paths have no fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -121,7 +120,6 @@ impl<'de> Deserialize<'de> for AuthenticatedManifest {
     }
 }
 
-/// Object keys sort recursively, independent of serde_json's map backend.
 pub fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, BoxError> {
     fn sorted(value: &serde_json::Value) -> serde_json::Value {
         match value {
@@ -258,7 +256,6 @@ mod tests {
             let mut edited = value.clone();
             edited[field] = serde_json::Value::Null;
             if let Ok(edited) = serde_json::from_value::<AuthenticatedManifest>(edited) {
-                // Null only constitutes an edit for a non-null original field.
                 if !value[field].is_null() {
                     assert!(edited.verify(&key, &id, &handle).is_err());
                 }

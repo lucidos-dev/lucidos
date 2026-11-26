@@ -1,13 +1,7 @@
-//! `GET /api/v1/hooks` lists the workspace's event hooks with their arming,
-//! and the owner arms or removes one (ADR 0746).
-//!
-//! Only a live request proves the wiring: the engine executable hands the
-//! leaf crate's loader to the router, and a unit test never sees that.
-
 use crate::support::{base_url, http_client, unique_marker, workspace_path};
 
-/// One test, because it writes into the workspace tree and holds its lock for
-/// the whole sequence.
+const UNASKED: &str = "ThreadArchived";
+
 #[tokio::test]
 async fn the_hook_list_shows_definitions_and_the_owner_removes_one() {
     let client = http_client();
@@ -20,7 +14,7 @@ async fn the_hook_list_shows_definitions_and_the_owner_removes_one() {
     std::fs::create_dir_all(&valid_dir).unwrap();
     std::fs::write(
         valid_dir.join("hook.toml"),
-        "name = \"Gate\"\nevent_type = \"MessageReceived\"\nscript = \"check.py\"\n",
+        format!("name = \"Gate\"\nevent_type = \"{UNASKED}\"\nscript = \"check.py\"\n"),
     )
     .unwrap();
     std::fs::write(valid_dir.join("check.py"), "print('allow')\n").unwrap();
@@ -83,11 +77,10 @@ async fn the_hook_list_shows_definitions_and_the_owner_removes_one() {
         "{invalid_row}"
     );
 
-    // No asking site asks about any event yet, so even the owner's arm is refused.
     assert!(
         valid_row["arm_refusal"]
             .as_str()
-            .is_some_and(|r| r.contains("MessageReceived")),
+            .is_some_and(|r| r.contains(UNASKED)),
         "{valid_row}"
     );
     assert_eq!(arm_status, 409);

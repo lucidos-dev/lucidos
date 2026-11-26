@@ -1,22 +1,9 @@
-//! A thread's human inputs record in the order the engine admitted them.
-//!
-//! `POST /api/v1/chat/stream` and `POST /api/v1/threads/:id/answer-question`
-//! admit an input before they ack. *Admission* checks the page's *input
-//! sequence* under the thread append lock and joins the thread's *input order*
-//! in the same step. A message then waits for the input admitted before it.
-//! It releases the next once it is recorded, and a coding-agent message once
-//! it is routed too. A card answer records at once, since the turn ahead may be
-//! blocked on that very question. ADR 0449 widened ADR 0281's coding-agent
-//! follow-up chain to every admitted input.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-/// Where a page puts one input in its run of inputs to a thread: the page's
-/// *input chain* and the input's *input sequence*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputPosition {
     pub(crate) chain: Uuid,
@@ -24,8 +11,6 @@ pub struct InputPosition {
 }
 
 impl InputPosition {
-    /// Read the two wire fields. They come together or not at all, and a
-    /// position names the input it places, so it needs the event id too.
     pub fn from_wire(
         chain: Option<&str>,
         seq: Option<i64>,
@@ -49,16 +34,12 @@ impl InputPosition {
     }
 }
 
-/// The last input a chain admitted to a thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChainTail {
     pub(crate) seq: i64,
     pub(crate) event_id: Uuid,
 }
 
-/// May an input at `seq`, named `event_id`, follow `tail`? Past it, yes. At
-/// it, only as a repeat of the tail itself: a quiet retry, or a retry after a
-/// restart lost the first attempt.
 pub(crate) fn admits(tail: Option<ChainTail>, seq: i64, event_id: Uuid) -> bool {
     match tail {
         None => true,
@@ -66,11 +47,8 @@ pub(crate) fn admits(tail: Option<ChainTail>, seq: i64, event_id: Uuid) -> bool 
     }
 }
 
-/// The refusal slug an overtaken input answers with.
 pub const OVERTAKEN_REASON: &str = "overtaken";
 
-/// Why an overtaken input was refused. The client already shows it as not
-/// sent, so this only has to say why it stays that way.
 pub fn overtaken_message(thread_id: Uuid) -> String {
     format!(
         "A later input from this page reached thread {thread_id} first, so this one was not \
@@ -78,28 +56,22 @@ pub fn overtaken_message(thread_id: Uuid) -> String {
     )
 }
 
-/// What admission decided.
 pub enum InputAdmission {
-    /// The input holds its place. Dropping the turn releases the next input.
     Admitted(InputTurn),
-    /// A later input from the same chain was admitted first. This one must
+    /// INVARIANT: A later input from the same chain was admitted first. This one must
     /// never be recorded.
     Overtaken,
 }
 
-/// Every thread's order of admitted inputs still in flight. A thread with
-/// none holds no entry.
 #[derive(Clone, Default)]
 pub struct InputOrder {
     threads: Arc<Mutex<Threads>>,
-    /// Coalesced hint for the queue to reconsider inputs behind a released turn.
     pub successor_released: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
 struct Threads {
     next_turn: u64,
-    /// The newest turn of each thread. A new turn waits on its `done`.
     tails: HashMap<Uuid, ThreadTail>,
 }
 
@@ -110,13 +82,6 @@ struct ThreadTail {
 }
 
 impl InputOrder {
-    /// Admit one input to `thread_id`, and take its place in the order.
-    ///
-    /// A positioned input is checked against its chain's tail and advances it,
-    /// all under the thread append lock (ADR 0360). The join happens before
-    /// the commit, so two admissions join in the order the lock let them check.
-    /// An input with no position (agent mode, the CLI, another workspace, a
-    /// stale client) is never refused and writes no row.
     pub async fn admit(
         &self,
         pool: &sqlx::PgPool,
@@ -131,12 +96,11 @@ impl InputOrder {
         let admission = self
             .admit_in_transaction(&mut tx, thread_id, position, event_id)
             .await?;
-        // Dropped on a failed commit, which releases the place it took.
         tx.commit().await?;
         Ok(admission)
     }
 
-    /// Join admission to the caller's durable acceptance transaction. The
+    /// INVARIANT: Join admission to the caller's durable acceptance transaction. The
     /// caller retains the returned turn through commit, or drops it on error.
     /// Acquire any append-horizon lock before calling this method: it takes
     /// the thread append lock even for an input without a page position.
@@ -178,7 +142,7 @@ impl InputOrder {
         Ok(InputAdmission::Admitted(self.join(thread_id)))
     }
 
-    /// Has any page admitted an input to `thread_id`? A thread whose first
+    /// INVARIANT: Has any page admitted an input to `thread_id`? A thread whose first
     /// input is admitted but not yet recorded has no row of its own yet.
     pub async fn thread_has_admitted_input(
         pool: &sqlx::PgPool,
@@ -190,12 +154,10 @@ impl InputOrder {
             .await
     }
 
-    /// Take the next place in `thread_id`'s order. Never waits.
     pub fn join(&self, thread_id: Uuid) -> InputTurn {
         self.join_input(thread_id, None)
     }
 
-    /// Add a recording barrier belonging to an existing input's routing turn.
     pub(crate) fn join_recording_barrier(&self, routing: &InputTurn) -> InputTurn {
         self.join_input(routing.thread_id, Some(routing.input))
     }
@@ -229,8 +191,6 @@ impl InputOrder {
     }
 }
 
-/// One input's place in its thread's order. Dropping it releases the next
-/// input, but never before this one's own predecessor is done.
 pub struct InputTurn {
     threads: Arc<Mutex<Threads>>,
     successor_released: Arc<tokio::sync::Notify>,
@@ -238,30 +198,25 @@ pub struct InputTurn {
     turn: u64,
     input: u64,
     predecessor: Option<oneshot::Receiver<()>>,
-    /// Dropped to release the successor. Nothing is ever sent on it.
     done: Option<oneshot::Sender<()>>,
 }
 
 impl InputTurn {
-    /// Wait until every input admitted before this one is released.
+    /// INVARIANT: Wait until every input admitted before this one is released.
     /// Cancellation-safe: a cancelled wait keeps the predecessor to wait on.
     pub async fn wait_for_predecessor(&mut self) {
         if let Some(predecessor) = self.predecessor.as_mut() {
-            // A closed channel is the release: the sender is only ever dropped.
             let _ = predecessor.await;
             self.predecessor = None;
         }
     }
 
-    /// Is an input admitted before this one still unreleased? An input that
-    /// records before its ack may do so only when none is.
     pub fn has_input_ahead(&mut self) -> bool {
         let Some(predecessor) = self.predecessor.as_mut() else {
             return false;
         };
         match predecessor.try_recv() {
             Err(oneshot::error::TryRecvError::Empty) => true,
-            // Closed is the release; nothing is ever sent.
             _ => {
                 self.predecessor = None;
                 false
@@ -272,9 +227,6 @@ impl InputTurn {
 
 impl Drop for InputTurn {
     fn drop(&mut self) {
-        // A paired recording barrier often outlives an already-released turn.
-        // Observe that closure now so rollback/terminal cleanup releases it
-        // synchronously instead of leaving a needless task between successors.
         self.has_input_ahead();
         let release = Release {
             threads: self.threads.clone(),
@@ -284,7 +236,7 @@ impl Drop for InputTurn {
             input: self.input,
             done: self.done.take(),
         };
-        // A turn dropped before its predecessor finished must not let its
+        // INVARIANT: A turn dropped before its predecessor finished must not let its
         // successor overtake that predecessor, so it hands the wait on.
         match (
             self.predecessor.take(),
@@ -320,7 +272,7 @@ impl Release {
         }
         drop(threads);
         drop(self.done);
-        // Close the predecessor channel before the queue checks it. With no
+        // INVARIANT: Close the predecessor channel before the queue checks it. With no
         // successor there is no newly admissible input to drain.
         if has_successor_input {
             self.successor_released.notify_one();
@@ -328,7 +280,6 @@ impl Release {
     }
 }
 
-/// The map holds no invariant a panicking holder could break halfway.
 fn lock(threads: &Mutex<Threads>) -> MutexGuard<'_, Threads> {
     threads
         .lock()

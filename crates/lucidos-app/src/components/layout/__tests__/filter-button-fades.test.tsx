@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
-import { FilterButtonGlyph, ThreadsPaneTitle, titleFits, groupingButtonBadgeCount, groupingButtonLabel, otherGrouping } from '../ThreadsHeaderControls';
+import { FilterButtonGlyph, ThreadFilterButton, ThreadsPaneTitle, titleFits, groupingButtonBadgeCount, groupingButtonLabel, otherGrouping } from '../ThreadsHeaderControls';
 import { FILTER_BUTTON_GLYPHS, type FilterGlyph } from '../ThreadFilterPanel';
 import { openThreadFilterPanel, closeThreadFilterPanel } from '../../../store/threadFilterPanel';
 import { setDrawerGrouping } from '../../../store/store';
@@ -102,5 +102,34 @@ describe('the grouping button', () => {
     expect(groupingButtonLabel('folders', 0)).toBe('Show Ongoing');
     expect(groupingButtonLabel('folders', 2)).toBe('Show Ongoing (2 blocked)');
     expect(groupingButtonLabel('ongoing', 0)).toBe('Show Folders');
+  });
+});
+
+describe('the header Filter button', () => {
+  const mount = () => act(() => { render(<ThreadFilterButton />, host); });
+  const button = () => host.querySelector<HTMLButtonElement>('button')!;
+  const slot = () => host.querySelector<HTMLElement>('.filter-slot')!;
+
+  afterEach(() => {
+    closeThreadFilterPanel();
+    setDrawerGrouping('folders');
+  });
+
+  it('keeps the name Filter threads, and says which way a press goes', () => {
+    act(() => setDrawerGrouping('folders'));
+    mount();
+    expect(button().getAttribute('aria-label')).toBe('Filter threads');
+    expect(button().getAttribute('aria-expanded')).toBe('false');
+    act(() => openThreadFilterPanel());
+    expect(button().getAttribute('aria-label')).toBe('Filter threads');
+    expect(button().getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('is out of the tab order and the accessibility tree under Ongoing', () => {
+    act(() => setDrawerGrouping('ongoing'));
+    mount();
+    expect(slot().hasAttribute('inert')).toBe(true);
+    act(() => setDrawerGrouping('folders'));
+    expect(slot().hasAttribute('inert')).toBe(false);
   });
 });

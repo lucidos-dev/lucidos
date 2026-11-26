@@ -1,21 +1,7 @@
-//! LLM-facing schemas for email tools (configure/send/read/save attachment).
-//! Handlers live in `core::email` + `engine::tools`.
-//!
-//! Two families, not one, and the split is a capability gate rather than a
-//! grouping: see [`configure_email_tools`].
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// Setting an account up, which a workspace with no account still needs.
-///
-/// Split from [`mailbox_tools`] because this is the only writer of the first
-/// `email_accounts` row. The settings UI reaches `EmailStore::upsert` only
-/// when EDITING an existing `email_password` credential, and the create path
-/// runs a bare `UPDATE` that touches nothing. So gating this on having an
-/// account makes email permanently unreachable, which is not what ADR 0088
-/// gates: it gates offers the engine would refuse.
 pub(super) fn configure_email_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -71,9 +57,6 @@ pub(super) fn configure_email_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-/// Everything that operates on an account that already exists. Offered only
-/// where the workspace has one (ADR 0088), since every one of these resolves
-/// an account first and errors without one.
 pub(super) fn mailbox_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {

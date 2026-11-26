@@ -71,14 +71,16 @@ lucidos pair --label "My iPhone"    # name the device in the paired list.
 lucidos pair --port 5300            # a gateway on an unusual port.
 lucidos pair --gateway              # a secret for another gateway instead.
 lucidos pair --gateway --manage     # ...that may also manage users and devices here.
+lucidos pair --gateway --control    # ...that may also create and restore workspaces here.
 ```
 
 Run it in a terminal on the machine Lucidos runs on, then type the code into the
 device you want to let in. It works once and expires in five minutes.
 
 **The typed code works only from another device on the LAN or the tailnet.** On
-this machine, and through a tunnel or proxy, Lucidos refuses it. Open the printed
-link or paste the printed *pairing secret* there instead (ADR 0615).
+this machine, and through a tunnel or proxy, Lucidos refuses it (ADR 0615).
+On the new device, open the printed link. You can also paste the link or
+*pairing secret* into **Pairing secret or link**.
 New device links carry credentials in `/~/#pair=` fragments. Ordinary printed links prefer the configured external address, with loopback as fallback.
 
 **`--gateway` lets another gateway in, not a device.** It mints a *gateway
@@ -91,8 +93,10 @@ address it says what to set up: `tailscale serve`, or an external address.
 `--qr` and
 `--host` do not combine with it. `--manage` starts the pairing with the
 *manage grant* on, so devices on the other gateway may manage this gateway's
-users and devices (ADR 0656). Without it the grant is off, and the Paired
-gateways row turns it on later.
+users and devices (ADR 0656). `--control` starts it with the *control grant*
+on, so they may create, start, stop and restore this gateway's workspaces (ADR
+0811). Without a flag its grant is off, and the Paired gateways row turns it
+on later.
 
 **With two gateways running it refuses rather than guessing.** A device pairs to
 a gateway, so a code only works on the one that minted it (ADR 0132). This

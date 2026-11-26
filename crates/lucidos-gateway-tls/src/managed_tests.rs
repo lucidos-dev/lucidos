@@ -5,12 +5,9 @@ use lucidos_tailscale::TailnetNode;
 
 use super::*;
 
-/// A name that matches no known tailnet suffix: nothing may depend on its shape.
 const NAME: &str = "node-7.some-base.example";
-/// The name a node reports after it moves to another tailnet.
 const OTHER_NAME: &str = "node-7.other-base.example";
 const TAILNET_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(100, 70, 0, 1));
-/// A documentation address (RFC 5737), standing in for a LAN one.
 const LAN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
 
 fn listening_on(listeners: Vec<IpAddr>) -> CertStore {
@@ -19,7 +16,6 @@ fn listening_on(listeners: Vec<IpAddr>) -> CertStore {
     store
 }
 
-/// A store whose gateway listens on the node's tailnet address.
 fn listening() -> CertStore {
     listening_on(vec![TAILNET_IP])
 }
@@ -38,7 +34,6 @@ fn mint(name: &str) -> Pem {
     }
 }
 
-/// A CA standing in for a public one. A test passes it as the trusted roots.
 struct TestCa {
     cert: rcgen::Certificate,
     key: rcgen::KeyPair,
@@ -53,7 +48,6 @@ fn test_ca() -> TestCa {
 }
 
 impl TestCa {
-    /// A server certificate for `names`, as PEM.
     fn issue(&self, names: &[&str]) -> Vec<u8> {
         let names = names
             .iter()
@@ -73,7 +67,6 @@ impl TestCa {
     }
 }
 
-/// A store listening on the tailnet address, with an operator certificate.
 fn with_operator(chain_pem: &[u8], roots: Arc<rustls::RootCertStore>) -> CertStore {
     let store = listening();
     store.set_operator(OperatorCert::new(chain_pem, roots));
@@ -89,7 +82,6 @@ fn joined(name: Option<&str>, certifiable: bool) -> TailnetState {
     })
 }
 
-/// Answers with a fixed state and pair, and records every name asked for.
 struct FakeTailnet {
     state: TailnetState,
     pair: Result<Pem, String>,
@@ -365,8 +357,6 @@ async fn a_listener_that_stops_covering_the_tailnet_withdraws_the_certificate() 
     assert_eq!(store.state().source, TlsSource::None);
 }
 
-/// A tailnet address the OS will not bind, as under userspace networking,
-/// never counts as a listener. Only a bound one does.
 #[tokio::test]
 async fn an_optional_tailnet_address_counts_only_while_bound() {
     let dir = tempfile::tempdir().unwrap();
@@ -550,8 +540,6 @@ async fn a_trusted_operator_certificate_for_the_name_serves_it_with_no_fetch() {
     );
 }
 
-/// An mkcert certificate made for an old name and address, as on a machine
-/// that moved tailnets. A phone would refuse it for the current name.
 #[tokio::test]
 async fn an_operator_certificate_with_stale_names_gets_a_tailnet_one_beside_it() {
     let dir = tempfile::tempdir().unwrap();

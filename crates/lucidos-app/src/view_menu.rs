@@ -1,16 +1,3 @@
-//! The View menu's Show/Hide item per pane: Thread Drawer, Thread Pane,
-//! Content Pane and Dashboard.
-//!
-//! The page owns the state and the menu mirrors it. Each app window's page
-//! derives every item from the layout it draws and pushes it with
-//! [`set_view_menu_state`]. macOS has one menu for the whole app, so the shell
-//! keeps the last push per window and shows the FOCUSED window's. It re-applies
-//! on each push from that window and on every focus change.
-//!
-//! A click goes back to the focused window only, as one
-//! [`VIEW_MENU_ITEM_CLICKED_EVENT`] carrying the pane id. That page decides
-//! what showing or hiding the pane means in its layout.
-
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -20,12 +7,8 @@ use tauri::{Emitter, Manager};
 
 use crate::app_window;
 
-/// The Tauri event a page hears when one of its View menu items is clicked.
-/// Its payload is the pane id. Mirrored in `utils/tauri.ts`.
 pub(crate) const VIEW_MENU_ITEM_CLICKED_EVENT: &str = "view-menu-item-clicked";
 
-/// A pane with a View menu item. The serde id is the menu item id, the click
-/// event's payload and the page's key, all at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ViewMenuPane {
@@ -36,8 +19,6 @@ pub(crate) enum ViewMenuPane {
 }
 
 impl ViewMenuPane {
-    /// Menu order, top to bottom. `VIEW_MENU_PANES` in `utils/tauri.ts` lists
-    /// the same ids in the same order.
     pub(crate) const ALL: [Self; 4] = [
         Self::ThreadDrawer,
         Self::ThreadPane,
@@ -54,7 +35,6 @@ impl ViewMenuPane {
         }
     }
 
-    /// The pane's canonical name (`system-knowhow/glossary.md`), in title case.
     fn title(self) -> &'static str {
         match self {
             Self::ThreadDrawer => "Thread Drawer",
@@ -69,20 +49,15 @@ impl ViewMenuPane {
     }
 }
 
-/// One item as the page last described it.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ViewMenuItemState {
     pane: ViewMenuPane,
-    /// The pane is on screen, so the item offers to hide it.
     shown: bool,
-    /// The window has room to show the pane.
     enabled: bool,
-    /// The pane's current shortcut in muda's syntax, such as `Ctrl+Shift+1`.
     accelerator: Option<String>,
 }
 
-/// What a menu item displays.
 #[derive(Debug, PartialEq, Eq)]
 struct Rendered {
     text: String,
@@ -90,8 +65,6 @@ struct Rendered {
     accelerator: Option<String>,
 }
 
-/// The item for `pane`, given what its window last pushed. A window that has
-/// pushed nothing gets a disabled item: no page is there to hear a click.
 fn render(pane: ViewMenuPane, pushed: Option<&[ViewMenuItemState]>) -> Rendered {
     let state = pushed.and_then(|items| items.iter().find(|item| item.pane == pane));
     let verb = if state.is_some_and(|s| s.shown) {
@@ -106,16 +79,12 @@ fn render(pane: ViewMenuPane, pushed: Option<&[ViewMenuItemState]>) -> Rendered 
     }
 }
 
-/// The menu items and every window's last push. Managed state.
 #[derive(Default)]
 pub(crate) struct ViewMenu {
-    /// In [`ViewMenuPane::ALL`] order. Unset where the shell builds no View
-    /// menu items, which makes every apply a no-op.
     items: OnceLock<Vec<MenuItem<tauri::Wry>>>,
     pushed: Mutex<BTreeMap<String, Vec<ViewMenuItemState>>>,
 }
 
-/// Build the items, disabled until a page pushes, and keep their handles.
 #[cfg(target_os = "macos")]
 pub(crate) fn build_items(app: &tauri::App) -> tauri::Result<Vec<MenuItem<tauri::Wry>>> {
     let items = ViewMenuPane::ALL
@@ -129,7 +98,6 @@ pub(crate) fn build_items(app: &tauri::App) -> tauri::Result<Vec<MenuItem<tauri:
     Ok(items)
 }
 
-/// Show `label`'s last push on the menu.
 pub(crate) fn apply_for(app: &tauri::AppHandle, label: &str) {
     let view_menu = app.state::<ViewMenu>();
     let Some(items) = view_menu.items.get() else {
@@ -149,20 +117,16 @@ pub(crate) fn apply_for(app: &tauri::AppHandle, label: &str) {
     }
 }
 
-/// A window is gone for good, so drop its last push.
 pub(crate) fn forget(app: &tauri::AppHandle, label: &str) {
     app.state::<ViewMenu>().pushed.lock().unwrap().remove(label);
 }
 
-/// Send a click to the focused app window, the one whose state the menu shows.
 pub(crate) fn route_click(app: &tauri::AppHandle, pane: ViewMenuPane) {
     if let Some(webview) = app_window::source_webview(app) {
         let _ = app.emit_to(webview.label(), VIEW_MENU_ITEM_CLICKED_EVENT, pane);
     }
 }
 
-/// Record the CALLING window's View menu state, and show it now if that window
-/// is the one the menu speaks for.
 #[tauri::command]
 pub(crate) fn set_view_menu_state(window: tauri::Window, items: Vec<ViewMenuItemState>) {
     let app = window.app_handle();
@@ -257,8 +221,6 @@ mod tests {
         assert!(!render(ViewMenuPane::Dashboard, Some(&items)).enabled);
     }
 
-    /// The page spells the pane ids and the event name as its own literals.
-    /// A rename on one side must fail here, not leave a silent menu.
     #[test]
     fn the_typescript_mirror_matches() {
         let ts =

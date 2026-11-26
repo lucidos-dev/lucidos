@@ -1,8 +1,5 @@
-//! Checkpoint progress recorded by thread events.
-
 use serde::{Deserialize, Serialize};
 
-/// How far a flow's work has come at a checkpoint: `done` units of `total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointProgress {
     pub done: u32,
@@ -10,7 +7,6 @@ pub struct CheckpointProgress {
 }
 
 impl CheckpointProgress {
-    /// Parse `<done>/<total>`, with `total >= 1` and `done <= total`.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let parsed = raw.split_once('/').and_then(|(done, total)| {
             Some((done.trim().parse().ok()?, total.trim().parse().ok()?))
@@ -28,7 +24,6 @@ impl CheckpointProgress {
     }
 }
 
-/// The wire form `parse` reads: `<done>/<total>`.
 impl std::fmt::Display for CheckpointProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.done, self.total)

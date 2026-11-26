@@ -102,6 +102,14 @@ call, and setting `engine` in an authored tree is an inline edit.
 - **Updates stage the confirm panel, never confirm themselves.** `plugins(action="update", ...)` opens the usual update panel. This audit turn stops there; the user clicks **Update**.
 - **Never edit the installed copy** under `data/`, for the reason § Checks gives. Fix the plugin's own source tree, or propose the change upstream.
 
+### Event hooks
+
+Use `lucidos hooks list` to check which hooks a plugin owns. The install
+record provides the plugin id. A changed armed hook refuses its events.
+Ask the owner to review its content in **Settings > Event Hooks**. To remove
+the hook with its plugin, stage the uninstall panel for the owner.
+If the owner sees a stale uninstall error, stage it again.
+
 ## Diagnostic evidence
 
 When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.

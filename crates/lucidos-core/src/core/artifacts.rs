@@ -8,20 +8,8 @@ use super::ARTIFACTS_DIR;
 use crate::core::repository_lock::WorkspaceRepoLock;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 
-/// Subdirectories under `data/` that browseable workspace tools (list_files,
-/// glob_files, grep_files) walk. Anything outside these — postgres event
-/// store, .lucidos/ runtime cache, etc. — is intentionally excluded.
 pub const BROWSEABLE_DATA_SUBDIRS: &[&str] = &["artifacts", "apps", "knowhow", "triggers"];
 
-/// Directory names holding vendored dependencies or build output. **The single
-/// source of truth for that list**: anything that needs to tell the user's own
-/// files apart from machine-generated ones reads this, so a second copy
-/// somewhere else is a drift bug rather than a convenience.
-///
-/// There was nothing to reuse when this was written. The workspace has no
-/// `.gitignore` parsing at all, and `WORKSPACE_GITIGNORE_ENTRIES` describes
-/// what the workspace repo tracks (`.lucidos/`, `data/postgres/`,
-/// `data/blobs/`, `data/.env`), not what a walk returns.
 pub const VENDORED_DIR_NAMES: &[&str] = &[
     "node_modules",
     ".git",
@@ -36,7 +24,7 @@ pub const VENDORED_DIR_NAMES: &[&str] = &[
     "out",
 ];
 
-/// True when any DIRECTORY segment of `data_relative` (a path in the shape
+/// INVARIANT: True when any DIRECTORY segment of `data_relative` (a path in the shape
 /// [`list_searchable_data_files`] returns, e.g.
 /// `apps/demo/remotion/node_modules/x.js`) names a vendored or build
 /// directory. Every segment is tested, not just the first: a workspace's
@@ -56,11 +44,8 @@ pub fn is_vendored_path(data_relative: &str) -> bool {
     dirs.split('/').any(|seg| VENDORED_DIR_NAMES.contains(&seg))
 }
 
-/// Extensions of build output that lands beside its source, outside any
-/// [`VENDORED_DIR_NAMES`] directory: Python bytecode.
 const BUILD_OUTPUT_FILE_EXTENSIONS: &[&str] = &["pyc", "pyo"];
 
-/// True when the file name alone marks build output, wherever it sits.
 pub fn is_build_output_file(file_name: &str) -> bool {
     Path::new(file_name)
         .extension()
@@ -68,14 +53,12 @@ pub fn is_build_output_file(file_name: &str) -> bool {
         .is_some_and(|ext| BUILD_OUTPUT_FILE_EXTENSIONS.contains(&ext))
 }
 
-/// True when `data_relative` is machine-generated: a file under a vendored
-/// directory, or a build-output file anywhere.
 pub fn is_build_output_path(data_relative: &str) -> bool {
     let file_name = data_relative.rsplit('/').next().unwrap_or(data_relative);
     is_vendored_path(data_relative) || is_build_output_file(file_name)
 }
 
-/// Walk the four browseable data/ subdirs and return each file as
+/// INVARIANT: Walk the four browseable data/ subdirs and return each file as
 /// `(data-relative path, absolute path)`, sorted lexicographically.
 /// Shared by `ArtifactManager::list_artifacts` and the search tools so
 /// the ignore policy stays consistent. Symlinks are intentionally skipped:
@@ -87,10 +70,6 @@ pub fn list_searchable_data_files(
     walk_data_files(workspace_path, false)
 }
 
-/// [`list_searchable_data_files`] without build output, the same set as
-/// filtering it by [`is_build_output_path`]. Vendored directories are pruned
-/// during the walk rather than filtered after it, since they often hold most
-/// of a workspace's files.
 pub fn list_user_data_files(
     workspace_path: &Path,
 ) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
@@ -128,7 +107,6 @@ fn walk_data_files(
                     out.push((format!("{}/{}", prefix, rel.to_string_lossy()), path));
                 }
             }
-            // symlinks (and other special entries) are intentionally ignored
         }
         Ok(())
     }
@@ -148,9 +126,6 @@ pub struct ArtifactChange {
     pub timestamp: DateTime<Utc>,
 }
 
-/// `Result`-returning wrapper around the canonical `crate::core::is_path_traversal`
-/// guard so the commit helpers can use `?` directly; `delete_data_path_and_commit`'s
-/// `Box<dyn Error>` accepts the `git2::Error` via `From`.
 fn reject_path_traversal(p: &str) -> Result<(), git2::Error> {
     if crate::core::is_path_traversal(p) {
         return Err(git2::Error::from_str(&format!(
@@ -161,23 +136,13 @@ fn reject_path_traversal(p: &str) -> Result<(), git2::Error> {
     Ok(())
 }
 
-/// What a `data/` write announces.
-///
-/// Every writer has to pick one. There is no "no event" option that is not
-/// spelled out, which is the whole point: the failure this guards against is a
-/// write whose announcement was simply forgotten, and an omission is not
-/// expressible here.
 pub enum WriteAnnouncement {
-    /// The default. `ArtifactCreated` or `ArtifactUpdated`, decided from whether
-    /// the file existed before this write. `source` labels who wrote it
-    /// (`"http_request"`, `"run_python"`, …) or `None` for a plain write.
-    /// `writer_thread_id` is the thread whose turn wrote it, when one did.
     Entity {
         source: Option<String>,
         writer: crate::core::artifact_writer::ArtifactWriterOrigin,
         writer_thread_id: Option<uuid::Uuid>,
     },
-    /// The caller emits a RICHER event that stands in for the entity event on
+    /// INVARIANT: The caller emits a RICHER event that stands in for the entity event on
     /// this write, and the entity event must be suppressed rather than added.
     ///
     /// The case this exists for is `ArtifactImported`: it carries the source and
@@ -190,23 +155,6 @@ pub enum WriteAnnouncement {
     SupersededBy(&'static str),
 }
 
-/// The `data/` git store: writes a file under the workspace `data/` tree and
-/// commits it.
-///
-/// **The write path owns the announcement.** [`Self::write_and_commit`] and
-/// [`Self::delete_data_path_and_commit`] emit the matching entity event
-/// themselves, so a caller cannot land a file in `data/artifacts/` that no list
-/// refreshes on and the memory index never sees. That was not hypothetical: the
-/// image tool wrote generated and saved images through the raw writer and
-/// emitted nothing, so they appeared in no artifact list until a reload and
-/// were never indexed.
-///
-/// It also moves the Created-vs-Updated decision to the one place that can get
-/// it right. Every caller used to capture `artifact_exists` BEFORE its own
-/// write and pass the flag to `SystemEvent::artifact_change`; that helper exists
-/// only because the decision was duplicated five times.
-///
-/// See `core::announced_surfaces` for the registry entry and the exemptions.
 pub struct ArtifactManager {
     workspace_path: PathBuf,
     repo: Arc<Mutex<Repository>>,
@@ -228,7 +176,7 @@ impl ArtifactManager {
             }
         };
 
-        // Ensure .gitignore exists and contains all engine-managed entries.
+        // INVARIANT: Ensure .gitignore exists and contains all engine-managed entries.
         // Idempotent across boots — appends new entries when the engine adds
         // them (e.g. data/blobs/) without rewriting historical lines. When
         // the file is newly created or modified, also commit it to the
@@ -261,13 +209,6 @@ impl ArtifactManager {
         })
     }
 
-    /// The shared repo handle, for tests that need to stall a commit in flight.
-    /// Every commit method below locks it, so holding it parks an in-flight
-    /// snapshot exactly where two concurrent artifact commits park each other,
-    /// with no test-only branch in the production path. Used by
-    /// `a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish`
-    /// to keep [`Self::commit_all_dirty`]'s blocking closure running after its
-    /// caller has walked away.
     #[cfg(any(test, feature = "test-support"))]
     pub fn repo_handle_for_test(&self) -> Arc<Mutex<Repository>> {
         self.repo.clone()
@@ -278,7 +219,7 @@ impl ArtifactManager {
         relative_path: &str,
         content: impl AsRef<[u8]>,
     ) -> Result<PathBuf, std::io::Error> {
-        // Defence-in-depth: API/data_api validates already, but artifact writes
+        // INVARIANT: Defence-in-depth: API/data_api validates already, but artifact writes
         // also reach here from LLM tool handlers (`engine/tools/import.rs`,
         // `image.rs`, `http.rs`, `email.rs`, memory consumer) that pass paths
         // assembled from LLM-provided arguments. A `..` segment would otherwise
@@ -304,11 +245,6 @@ impl ArtifactManager {
         Ok(full_path)
     }
 
-    /// Write an artifact, commit it, and announce it.
-    ///
-    /// Created-vs-Updated is decided from whether the file existed BEFORE this
-    /// write, checked here so no caller has to sequence that itself. See
-    /// [`WriteAnnouncement`] for the one case that suppresses the entity event.
     pub async fn write_and_commit(
         &self,
         held: &WorkspaceRepoLock,
@@ -350,7 +286,6 @@ impl ArtifactManager {
         Ok(commit_sha)
     }
 
-    /// Write multiple artifacts and commit them all in one operation
     pub async fn write_batch_and_commit(
         &self,
         held: &WorkspaceRepoLock,
@@ -369,8 +304,6 @@ impl ArtifactManager {
         .map_err(Into::into)
     }
 
-    /// Stage a single artifact file and commit.
-    /// `artifact_path` is relative to data/artifacts/ (e.g., "user_profile.md").
     pub async fn commit(
         &self,
         _held: &WorkspaceRepoLock,
@@ -382,8 +315,6 @@ impl ArtifactManager {
         self.commit_repo_path(&repo_path, message).await
     }
 
-    /// Stage multiple artifact files and commit in one operation (for batch imports).
-    /// Each path is relative to data/artifacts/.
     pub(crate) async fn commit_batch(
         &self,
         _held: &WorkspaceRepoLock,
@@ -415,8 +346,6 @@ impl ArtifactManager {
         .unwrap()
     }
 
-    /// Stage a data-relative path (e.g., "scripts/foo.py", "knowhow/bar.md") and commit.
-    /// Path is relative to `data/` — any known subdirectory works.
     pub async fn commit_data_path(
         &self,
         _held: &WorkspaceRepoLock,
@@ -428,8 +357,6 @@ impl ArtifactManager {
         self.commit_repo_path(&repo_path, message).await
     }
 
-    /// Stage multiple data-relative paths and commit in one operation.
-    /// Each path is relative to `data/` (e.g., "artifacts/report.csv", "knowhow/guide.md").
     pub async fn commit_data_paths(
         &self,
         _held: &WorkspaceRepoLock,
@@ -461,11 +388,6 @@ impl ArtifactManager {
         .unwrap()
     }
 
-    /// Delete a data-relative file, commit the deletion, and announce it.
-    ///
-    /// Emits `ArtifactDeleted` for a path under `artifacts/`, which is the only
-    /// `data/` subtree with a list that reloads on an entity event. Other
-    /// subtrees commit silently, matching their registry classification.
     pub async fn delete_data_path_and_commit(
         &self,
         _held: &WorkspaceRepoLock,
@@ -493,7 +415,7 @@ impl ArtifactManager {
         Ok(commit_id)
     }
 
-    /// Delete a data-relative folder, commit the deletion and emit `announce`,
+    /// INVARIANT: Delete a data-relative folder, commit the deletion and emit `announce`,
     /// the event that names what the folder was. A link in its place is
     /// removed itself, never what it points at.
     pub async fn delete_data_dir_and_commit(
@@ -519,7 +441,7 @@ impl ArtifactManager {
         Ok(commit_id)
     }
 
-    /// Commit the removal of a data-relative path already gone from disk.
+    /// INVARIANT: Commit the removal of a data-relative path already gone from disk.
     ///
     /// The removal stays outside the retry closure, so a retried attempt only
     /// re-stages an already-absent path onto the winner's head. Staging is
@@ -553,7 +475,6 @@ impl ArtifactManager {
         .unwrap()
     }
 
-    /// Stage a single repo-relative path (e.g., "data/artifacts/X" or "data/apps/Y") and commit.
     async fn commit_repo_path(
         &self,
         repo_path: &str,
@@ -578,7 +499,7 @@ impl ArtifactManager {
         .unwrap()
     }
 
-    /// Stage and commit all dirty files under data/ (artifacts, apps, etc.).
+    /// INVARIANT: Stage and commit all dirty files under data/ (artifacts, apps, etc.).
     /// Returns Some(commit_sha) if there were changes, None if clean.
     ///
     /// Holds the workspace repo lock for the real lifetime of the snapshot.
@@ -598,11 +519,11 @@ impl ArtifactManager {
         let repo = self.repo.clone();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            // Rebound so it is captured by the closure and dropped when the
+            // INVARIANT: Rebound so it is captured by the closure and dropped when the
             // closure returns, on every path out of it. That drop point is the
             // whole guarantee.
             let _held = held;
-            // The lock excludes the engine's own writers, not a git process
+            // INVARIANT: The lock excludes the engine's own writers, not a git process
             // outside it. That process can still lock the index, or move HEAD
             // between the parent read and the commit. See
             // `retry_while_repo_contended`.
@@ -611,16 +532,14 @@ impl ArtifactManager {
                 let mut index = repo.index()?;
                 let base = super::reset_index_to_head(&repo, &mut index)?;
 
-                // Add all changes under data/ (artifacts, apps, and any other data subdirs)
                 index.add_all([super::DATA_DIR], git2::IndexAddOption::DEFAULT, None)?;
                 index.write()?;
 
-                // Check if there's anything to commit
                 let tree_id = index.write_tree()?;
                 if let Ok(head) = repo.head() {
                     if let Ok(head_commit) = head.peel_to_commit() {
                         if head_commit.tree()?.id() == tree_id {
-                            return Ok(None); // No changes
+                            return Ok(None);
                         }
                     }
                 }
@@ -640,32 +559,16 @@ impl ArtifactManager {
         full_path.exists()
     }
 
-    /// Resolve `relative_path` to the next non-colliding artifact path,
-    /// Finder/browser style: if a file already exists at that path, insert a
-    /// numeric suffix before the final extension (`Brev.pdf` → `Brev (1).pdf`
-    /// → `Brev (2).pdf`; `README` → `README (1)`). Only the final extension is
-    /// preserved, matching `Path::file_stem`/`Path::extension`
-    /// (`archive.tar.gz` → `archive.tar (1).gz`). Returns the original path
-    /// unchanged when there is no collision; never overwrites an existing file.
-    ///
-    /// Existence is checked against the real on-disk artifact path (the same
-    /// root `write_artifact` writes to), so both import entry points stay
-    /// consistent. The loop is bounded so a pathological directory can't spin
-    /// forever — it errors instead of looping past `MAX_COLLISION_SUFFIX`.
     pub fn resolve_collision_free_path(
         &self,
         relative_path: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        /// Upper bound on suffix attempts. Far beyond any realistic number of
-        /// same-name imports; exists only to make the search terminate.
         const MAX_COLLISION_SUFFIX: usize = 10_000;
 
         if !self.artifact_exists(relative_path) {
             return Ok(relative_path.to_string());
         }
 
-        // Keep the directory prefix (with trailing '/') and split the leaf with
-        // Path semantics so only the final extension is preserved.
         let (dir_prefix, leaf) = match relative_path.rfind('/') {
             Some(idx) => (&relative_path[..=idx], &relative_path[idx + 1..]),
             None => ("", relative_path),
@@ -695,8 +598,6 @@ impl ArtifactManager {
         .into())
     }
 
-    /// Delete an artifact and commit the deletion. Announces through
-    /// [`Self::delete_data_path_and_commit`].
     pub async fn delete_and_commit(
         &self,
         held: &WorkspaceRepoLock,
@@ -716,8 +617,6 @@ impl ArtifactManager {
             .collect())
     }
 
-    /// Read an artifact file at a specific git commit
-    /// Returns the file content as bytes, or an error if not found
     pub fn read_artifact_at_commit(
         &self,
         relative_path: &str,
@@ -726,24 +625,19 @@ impl ArtifactManager {
         reject_path_traversal(relative_path)?;
         let repo = self.repo.lock().unwrap();
 
-        // Parse the commit hash
         let oid = git2::Oid::from_str(commit_hash)?;
         let commit = repo.find_commit(oid)?;
         let tree = commit.tree()?;
 
-        // Build the path within the repo (data/artifacts/relative_path)
         let full_path = format!("{}/{}", ARTIFACTS_DIR, relative_path);
 
-        // Find the entry in the tree
         let entry = tree.get_path(Path::new(&full_path))?;
 
-        // Get the blob
         let blob = repo.find_blob(entry.id())?;
 
         Ok(blob.content().to_vec())
     }
 
-    /// Read an artifact file at a specific git commit as a string
     pub fn read_artifact_at_commit_string(
         &self,
         relative_path: &str,
@@ -753,21 +647,17 @@ impl ArtifactManager {
         String::from_utf8(bytes).map_err(|_| git2::Error::from_str("File is not valid UTF-8"))
     }
 
-    /// List artifacts at a specific git commit
     pub fn list_artifacts_at_commit(&self, commit_hash: &str) -> Result<Vec<String>, git2::Error> {
         let repo = self.repo.lock().unwrap();
 
-        // Parse the commit hash
         let oid = git2::Oid::from_str(commit_hash)?;
         let commit = repo.find_commit(oid)?;
         let tree = commit.tree()?;
 
         let mut paths = Vec::new();
 
-        // Try to find the artifacts subtree
         if let Ok(artifacts_entry) = tree.get_path(Path::new(ARTIFACTS_DIR)) {
             if let Ok(artifacts_tree) = repo.find_tree(artifacts_entry.id()) {
-                // Walk the artifacts tree recursively
                 fn walk_tree(
                     repo: &Repository,
                     tree: &git2::Tree,
@@ -803,11 +693,9 @@ impl ArtifactManager {
         Ok(paths)
     }
 
-    /// Find the most recent commit at or before a given Unix timestamp
     pub fn find_commit_at_timestamp(&self, timestamp: i64) -> Result<String, git2::Error> {
         let repo = self.repo.lock().unwrap();
 
-        // Get the HEAD commit and walk backwards
         let head = repo.head()?.peel_to_commit()?;
         let mut revwalk = repo.revwalk()?;
         revwalk.push(head.id())?;
@@ -818,13 +706,11 @@ impl ArtifactManager {
             let commit = repo.find_commit(oid)?;
             let commit_time = commit.time().seconds();
 
-            // Find the first commit that's at or before the target timestamp
             if commit_time <= timestamp {
                 return Ok(oid.to_string());
             }
         }
 
-        // If no commit found before timestamp, return the oldest commit
         let mut revwalk = repo.revwalk()?;
         revwalk.push(head.id())?;
         revwalk.set_sorting(git2::Sort::TIME | git2::Sort::REVERSE)?;
@@ -836,7 +722,6 @@ impl ArtifactManager {
         Err(git2::Error::from_str("No commits found"))
     }
 
-    /// Walk git history and collect all artifact file changes (adds/modifies) in chronological order.
     pub fn walk_artifact_history(&self) -> Result<Vec<ArtifactChange>, git2::Error> {
         let repo = self.repo.lock().unwrap();
 
@@ -848,9 +733,9 @@ impl ArtifactManager {
 
         let mut revwalk = repo.revwalk()?;
         revwalk.push(head.id())?;
-        revwalk.set_sorting(git2::Sort::TIME | git2::Sort::REVERSE)?; // oldest first
+        revwalk.set_sorting(git2::Sort::TIME | git2::Sort::REVERSE)?;
 
-        // Collect OIDs first to avoid borrow conflict with repo
+        // INVARIANT: Collect OIDs first to avoid borrow conflict with repo
         // One unreadable commit is skipped, not fatal: the caller rebuilds
         // memory from this list, and an error here would drop every artifact.
         let oids: Vec<git2::Oid> = revwalk
@@ -886,7 +771,7 @@ impl ArtifactManager {
                     let is_content_change =
                         matches!(delta.status(), git2::Delta::Added | git2::Delta::Modified);
                     if !is_content_change {
-                        return true; // skip deletes, renames, etc.
+                        return true;
                     }
 
                     if let Some(path_str) = delta.new_file().path().and_then(|p| p.to_str()) {
@@ -974,8 +859,6 @@ mod tests {
         assert_eq!(read_back(&manager, "test.txt"), "hello world");
     }
 
-    /// Every artifact writer funnels through here, so a link in `artifacts/`
-    /// must not let any of them write a host file.
     #[cfg(unix)]
     #[test]
     fn an_artifact_write_never_follows_a_symlink_out_of_artifacts() {
@@ -1020,7 +903,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
 
-        // Nothing on disk yet — the path is returned unchanged.
         assert_eq!(
             manager
                 .resolve_collision_free_path("imported/Brev.pdf")
@@ -1034,7 +916,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
 
-        // First collision → "(1)".
         manager
             .write_artifact("imported/Brev.pdf", "first")
             .unwrap();
@@ -1045,7 +926,6 @@ mod tests {
             "imported/Brev (1).pdf"
         );
 
-        // "(1)" also taken → "(2)".
         manager
             .write_artifact("imported/Brev (1).pdf", "second")
             .unwrap();
@@ -1076,7 +956,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
 
-        // Only the final extension is preserved, per Path semantics.
         manager
             .write_artifact("imported/archive.tar.gz", "x")
             .unwrap();
@@ -1088,16 +967,6 @@ mod tests {
         );
     }
 
-    /// Mirrors what `import_file_from_path` does: resolve a collision-free dest,
-    /// then write+commit to it. Three same-name imports must land at the base
-    /// name, "(1)", and "(2)" with every earlier file preserved untouched.
-    /// The load-bearing guarantee for the `data/` half: a write announces, and
-    /// Created-vs-Updated is decided from the state BEFORE the write.
-    ///
-    /// The second half is why the decision moved in here. Every caller used to
-    /// capture `artifact_exists` itself and pass the flag along, which is easy
-    /// to sequence wrong and easy to skip entirely: the image tool skipped it,
-    /// so a generated image reached no artifact list and no memory index.
     #[tokio::test]
     async fn write_and_commit_announces_created_then_updated() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1155,8 +1024,6 @@ mod tests {
             serde_json::to_value(crate::engine::event_bus::ArtifactWriter::Person).unwrap();
         assert_eq!(writers, vec![expected.clone(), expected]);
 
-        // A caller with a richer event of its own suppresses the entity event
-        // rather than adding to it, so an import is not double-announced.
         manager
             .write_and_commit(
                 &crate::core::repository_lock::lock_workspace_repo().await,
@@ -1202,30 +1069,24 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
 
-        // First import: lands at the base name.
         let dest1 = manager
             .resolve_collision_free_path("imported/Brev.pdf")
             .unwrap();
         assert_eq!(dest1, "imported/Brev.pdf");
-        // The subject is collision-free naming, so the raw writer is enough:
-        // the next `resolve_collision_free_path` only needs the file on disk.
         manager.write_artifact(&dest1, "first").unwrap();
 
-        // Second import, same source name: auto-suffixed to "(1)".
         let dest2 = manager
             .resolve_collision_free_path("imported/Brev.pdf")
             .unwrap();
         assert_eq!(dest2, "imported/Brev (1).pdf");
         manager.write_artifact(&dest2, "second").unwrap();
 
-        // Third import: "(2)".
         let dest3 = manager
             .resolve_collision_free_path("imported/Brev.pdf")
             .unwrap();
         assert_eq!(dest3, "imported/Brev (2).pdf");
         manager.write_artifact(&dest3, "third").unwrap();
 
-        // All three exist; earlier files were never overwritten.
         assert_eq!(read_back(&manager, "imported/Brev.pdf"), "first");
         assert_eq!(read_back(&manager, "imported/Brev (1).pdf"), "second");
         assert_eq!(read_back(&manager, "imported/Brev (2).pdf"), "third");
@@ -1310,8 +1171,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A file or a link where a folder belongs is a path entry, so a
-    /// directory removal would leave it tracked and the tree dirty.
     #[cfg(unix)]
     #[tokio::test]
     async fn deleting_a_file_or_link_in_place_of_a_data_folder_commits_it_gone() {
@@ -1357,10 +1216,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// `index.add_path` stages whatever it is handed, ignore rules included.
-    /// So a `run_python` script writing `data/.env`, the documented route for
-    /// a loose data-root file, put the workspace secrets into the tracked
-    /// repo. The real output beside it must still commit.
     #[tokio::test]
     async fn committing_a_gitignored_data_path_stages_nothing() {
         let dir = tempdir().unwrap();

@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { pickerFooter, type FooterMode, type PickerFooterProps } from '../PickerFooter';
 import type { WorkspaceStatus } from '../../../api/client/control';
-import { restoreBlocker, EMPTY_RESTORE_DRAFT, type RestoreDraft } from '../workspaceForms';
+import { restoreBlocker, EMPTY_RESTORE_DRAFT, IDLE_RESTORE_UPLOAD, type RestoreDraft } from '../workspaceForms';
 import { EMPTY_REMOTE_GATEWAY_DRAFT, TRUST_NOTE } from '../../settings/remoteGatewayForm';
 
 function isClosedDisclosure(v: VNode<Record<string, unknown>>): boolean {
@@ -41,14 +41,15 @@ function ws(id: string, name = id): WorkspaceStatus {
   return { id, name, port: 5000, health: 'healthy', autostart: true };
 }
 
-function render(over: Partial<PickerFooterProps> = {}): string {
+function footer(over: Partial<PickerFooterProps> = {}): VNode {
   const draft = over.draft ?? EMPTY_RESTORE_DRAFT;
-  return vnodeToText(
-    pickerFooter({
+  return pickerFooter({
       mode: 'none',
       onMode: NOOP,
       busy: false,
       restoreRunning: false,
+      target: null,
+      targetBlocker: null,
       name: '',
       onName: NOOP,
       onCreate: NOOP,
@@ -59,6 +60,7 @@ function render(over: Partial<PickerFooterProps> = {}): string {
       draft,
       onDraft: NOOP,
       onPickFile: NOOP,
+      restoreUpload: IDLE_RESTORE_UPLOAD,
       onRestore: NOOP,
       onCancelRestore: NOOP,
       blocker: restoreBlocker(draft, []),
@@ -66,8 +68,11 @@ function render(over: Partial<PickerFooterProps> = {}): string {
       onDeleteColliding: NOOP,
       ...REMOTE_DEFAULTS,
       ...over,
-    }),
-  );
+    });
+}
+
+function render(over: Partial<PickerFooterProps> = {}): string {
+  return vnodeToText(footer(over));
 }
 
 const MODES: FooterMode[] = ['none', 'create', 'restore', 'remote'];
@@ -157,6 +162,37 @@ describe('the restore form explains itself', () => {
   });
 });
 
+describe('the restore button follows the upload, not the promise', () => {
+  const draft: RestoreDraft = { file: new File([], 'b.age'), key: 'k', name: 'myws' };
+
+  it('idle shows Restore and Cancel, with no progress bar', () => {
+    const text = render({ mode: 'restore', draft });
+    expect(text).toContain('>Restore</button>');
+    expect(text).toContain('>Cancel</button>');
+    expect(text).not.toContain('ProgressBar');
+  });
+
+  it('uploading shows the percentage, a progress bar and Cancel upload', () => {
+    const text = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'uploading', sentBytes: 1, totalBytes: 4 } });
+    expect(text).toContain('Uploading 25%');
+    expect(text).toContain('<ProgressBar>');
+    expect(text).toContain('>Cancel upload</button>');
+  });
+
+  it('a sent body shows Starting until the gateway answers', () => {
+    const text = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'starting' } });
+    expect(text).toContain('Starting…');
+    expect(text).not.toContain('<ProgressBar>');
+  });
+
+  it('a sent commit can no longer be cancelled', () => {
+    const starting = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'starting' } });
+    expect(starting).toMatch(/<button[^>]*disabled[^>]*>Cancel upload<\/button>/);
+    const uploading = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'uploading', sentBytes: 1, totalBytes: 4 } });
+    expect(uploading).not.toMatch(/<button[^>]*disabled[^>]*>Cancel upload<\/button>/);
+  });
+});
+
 describe('a collision offers the workspace holding the address', () => {
   const renamed = [ws('personal', 'personaal')];
   const colliding: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'personal' };
@@ -179,6 +215,8 @@ describe('a collision offers the workspace holding the address', () => {
       onMode: NOOP,
       busy: false,
       restoreRunning: false,
+      target: null,
+      targetBlocker: null,
       name: '',
       onName: NOOP,
       onCreate: NOOP,
@@ -189,6 +227,7 @@ describe('a collision offers the workspace holding the address', () => {
       draft: colliding,
       onDraft: NOOP,
       onPickFile: NOOP,
+      restoreUpload: IDLE_RESTORE_UPLOAD,
       onRestore: NOOP,
       onCancelRestore: NOOP,
       blocker: restoreBlocker(colliding, renamed),
@@ -233,6 +272,37 @@ function findButton(node: ComponentChildren, label: string): VNode<Record<string
   return findButton(v.props?.children, label);
 }
 
+describe('a remote gateway picked in the switcher', () => {
+  it('names the gateway the footer acts on', () => {
+    const text = render({ target: 'lab' });
+    expect(text).toContain('+ New workspace on lab');
+    expect(text).toContain('Restore onto lab');
+    expect(text).toContain('Add a remote gateway');
+  });
+
+  it('disables New and Restore and says why when the gateway cannot act', () => {
+    const node = footer({ target: 'lab', targetBlocker: 'lab needs an update.' });
+    expect(findButton(node, '+ New workspace on lab')?.props.disabled).toBe(true);
+    expect(findButton(node, 'Restore onto lab')?.props.disabled).toBe(true);
+    expect(findButton(node, 'Add a remote gateway')?.props.disabled).toBeFalsy();
+    expect(render({ target: 'lab', targetBlocker: 'lab needs an update.' })).toContain('lab needs an update.');
+  });
+
+  it('offers no delete for a name taken on the remote gateway', () => {
+    const taken = [ws('personal', 'personaal')];
+    const colliding: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'personal' };
+    const text = render({
+      mode: 'restore',
+      target: 'lab',
+      draft: colliding,
+      blocker: restoreBlocker(colliding, taken),
+      onDeleteColliding: null,
+    });
+    expect(text).toContain('/personal/');
+    expect(text).not.toContain('Delete “personaal”…');
+  });
+});
+
 describe('Enter cannot do what the button refuses', () => {
   function pressEnter(over: Partial<PickerFooterProps>, onSubmit: () => void): boolean {
     let fired = false;
@@ -241,6 +311,8 @@ describe('Enter cannot do what the button refuses', () => {
       onMode: NOOP,
       busy: false,
       restoreRunning: false,
+      target: null,
+      targetBlocker: null,
       name: '',
       onName: NOOP,
       onCreate: () => { fired = true; onSubmit(); },
@@ -251,6 +323,7 @@ describe('Enter cannot do what the button refuses', () => {
       draft: EMPTY_RESTORE_DRAFT,
       onDraft: NOOP,
       onPickFile: NOOP,
+      restoreUpload: IDLE_RESTORE_UPLOAD,
       onRestore: () => { fired = true; onSubmit(); },
       onCancelRestore: NOOP,
       blocker: null,
@@ -328,6 +401,8 @@ function propsFor(mode: FooterMode): PickerFooterProps {
     onMode: NOOP,
     busy: false,
     restoreRunning: false,
+    target: null,
+    targetBlocker: null,
     name: '',
     onName: NOOP,
     onCreate: NOOP,
@@ -338,6 +413,7 @@ function propsFor(mode: FooterMode): PickerFooterProps {
     draft: EMPTY_RESTORE_DRAFT,
     onDraft: NOOP,
     onPickFile: NOOP,
+    restoreUpload: IDLE_RESTORE_UPLOAD,
     onRestore: NOOP,
     onCancelRestore: NOOP,
     blocker: null,

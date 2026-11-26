@@ -1,6 +1,3 @@
-//! A workspace call: only a calling engine's own signature passes, and the
-//! target hears the same claim under its own key.
-
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -70,7 +67,6 @@ fn a_call_for_another_target_or_verdict_or_key_does_not_verify() {
     assert_eq!(verified_call(TARGET, &headers, |_| None), None);
 }
 
-/// The proxy stamps the verified claim for the target, under the target's key.
 #[test]
 fn the_forwarded_claim_is_stamped_for_the_target() {
     let call = AttestedWorkspaceCall {
@@ -94,8 +90,6 @@ fn the_forwarded_claim_is_stamped_for_the_target() {
 
 type Seen = Arc<Mutex<Option<(HeaderMap, String)>>>;
 
-/// A gateway serving `CALLER` and `TARGET`, both keyed, with `TARGET`'s
-/// engine recording what reaches it. The target's directory is `target_dir`.
 fn gateway(
     target_dir: &str,
 ) -> (
@@ -181,7 +175,6 @@ async fn a_signed_call_reaches_the_target_stamped_under_its_key() {
     );
 }
 
-/// A caller knows its target by directory name, which may differ from the id.
 #[tokio::test]
 async fn a_target_named_by_its_directory_resolves_to_its_id() {
     let (state, caller_key, target_key, seen, _dir) = gateway("/tmp/lucidos-call-test/second-ws");
@@ -241,7 +234,6 @@ async fn a_target_this_gateway_does_not_serve_hands_the_call_back() {
     assert!(seen.lock().unwrap().is_none());
 }
 
-/// A paired device is not an engine: it holds no stamp key to sign with.
 #[tokio::test]
 async fn only_a_local_process_may_place_a_call() {
     let (state, caller_key, _, seen, _dir) = gateway("/tmp/lucidos-call-test/work2");
@@ -258,8 +250,6 @@ async fn only_a_local_process_may_place_a_call() {
     assert!(seen.lock().unwrap().is_none());
 }
 
-/// A call relayed from a paired gateway verifies only under that pairing's
-/// credential, for its own fields, within the relay's clock skew.
 #[test]
 fn a_relayed_call_verifies_only_as_signed() {
     let call = AttestedWorkspaceCall {
@@ -309,15 +299,12 @@ fn a_relayed_call_verifies_only_as_signed() {
     }
 }
 
-/// Gateway A pairs with gateway B, and B serves the target `dev`.
 mod across_gateways {
     use super::*;
     use crate::relay::tests::{paired, Paired};
 
     const REMOTE: &str = "dev";
 
-    /// `p` with B registering `dev` under a stamp key, and A holding the
-    /// calling engine's key. Returns the caller's and B's engine's keys.
     fn keyed(p: &Paired) -> (StampKey, StampKey) {
         p.b.register_for_test(Workspace {
             id: REMOTE.into(),
@@ -337,7 +324,6 @@ mod across_gateways {
         (caller, engine)
     }
 
-    /// What B's engine heard on its chat route, one lowercase line per header.
     fn heard(p: &Paired) -> Option<String> {
         p.seen
             .lock()
@@ -377,7 +363,6 @@ mod across_gateways {
         assert!(engine.verify_now(stamp, claim), "{line}");
         assert!(!caller.verify_now(stamp, claim));
         assert_eq!(header_in(&line, HEADER_CALLER_VERDICT), Some(VERDICT));
-        // An engine's own call, so no restore generation fences it.
         assert_eq!(
             header_in(&line, crate::proxy::HEADER_CALLER_KIND),
             Some("local-process")
@@ -393,8 +378,6 @@ mod across_gateways {
         }
     }
 
-    /// A relayed call starts a thread, so a pairing that does not allow
-    /// starts refuses it. This route has no card, so Ask refuses too.
     #[tokio::test]
     async fn a_relayed_call_starts_nothing_unless_the_pairing_allows_starts() {
         let p = paired().await;
@@ -434,7 +417,6 @@ mod across_gateways {
         assert!(heard(&p).is_none());
     }
 
-    /// B's half, called directly with the pairing's credential, as A's gateway calls it.
     async fn to_b(
         p: &Paired,
         method: reqwest::Method,
@@ -510,7 +492,6 @@ mod across_gateways {
         let (_, engine) = keyed(&p);
         let delivery = DiagnosticDelivery::new(CALLER, "once", &"a".repeat(64)).unwrap();
         let now = chrono::Utc::now().timestamp();
-        // Pin the relay wire contract independently of the receiving helper.
         let text = [
             "diagnostic-delivery/v1",
             &now.to_string(),

@@ -1,17 +1,8 @@
-//! The table answers for every route, and keeps the decisions ADR 0231 made.
-
 use super::*;
 use crate::app_reach_policy::{entry_for, Reach, Reach::App, ROUTE_REACH};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-/// A route-registering function that is NOT part of the `/api/v1` router.
-///
-/// Every other one must be a `router()` that `create_router` merges, and the
-/// scan below fails on anything it cannot place. That is what stops a new
-/// router escaping classification by not looking like the others.
-///
-/// The third column is prose for a reader: nothing keys on it.
 const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
     (
         "internal_faults.rs",
@@ -51,21 +42,8 @@ const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Routes whose path is built at registration, so no literal exists to put in
-/// `ROUTE_REACH`.
-///
-/// Each row names the file, the function, and the answer. The scan refuses a
-/// computed route absent from here, so this is a declaration rather than a way
-/// around the question. It lives beside the scan because the scan is its only
-/// reader: the running gate matches on the route axum reports, which is the
-/// built string.
 const COMPUTED_ROUTE_REACH: &[(&str, &str, Reach)] = &[
-    // The OAuth callback delivery, shared with the gateway as a constant. Only
-    // the gateway calls it, so like the rest of the `/internal/` tree no app
-    // frame may.
     ("internal.rs", "router", Reach::Agent),
-    // The outbound workspace call, its path shared with the stamp crate. Only
-    // a thread's own subprocess holding an origin token may call it.
     ("workspace_calls.rs", "router", Reach::Agent),
 ];
 
@@ -73,9 +51,7 @@ const COMPUTED_ROUTE_REACH: &[(&str, &str, Reach)] = &[
 fn an_unclassified_route_is_denied() {
     assert_eq!(entry_for("/not-a-route"), None);
     assert!(!app_may_call("/not-a-route", "GET"));
-    // A real route the table denies answers the same way to a caller.
     assert!(!app_may_call("/credential-value", "GET"));
-    // And a method the row does not list is denied on an allowed route.
     assert!(app_may_call("/models", "GET"));
     assert!(!app_may_call("/models", "DELETE"));
 }
@@ -110,20 +86,14 @@ fn a_denied_route_lists_no_methods() {
     }
 }
 
-/// The omissions ADR 0231 names as the safety property.
-///
-/// Each was a decision the SDK made by leaving something out, and a generic
-/// hatch re-opens all of them. A later widening argues with this test.
 #[test]
 fn the_deliberate_omissions_stay_denied() {
     let denied: &[(&str, &str)] = &[
-        // The user sends their own prompt, always.
         ("/chat/stream", "POST"),
         ("/threads", "POST"),
         ("/threads/:thread_id/continue", "POST"),
         ("/threads/:thread_id/follow-up", "POST"),
         ("/threads/:id/compose", "PUT"),
-        // Never answer as the user.
         ("/threads/:thread_id/answer-question", "POST"),
         ("/internal/ask-user-question", "POST"),
         ("/internal/approve-plan", "POST"),
@@ -132,10 +102,8 @@ fn the_deliberate_omissions_stay_denied() {
         ("/mcp/consent", "POST"),
         ("/mcp/auto-approve", "PUT"),
         ("/command-checkpoint/undo", "POST"),
-        // The credential never enters the iframe.
         ("/credential-value", "GET"),
         ("/credential-reveal-token", "POST"),
-        // A call speaks as the owner.
         ("/voice/ticket", "POST"),
         ("/credential-base-urls", "PUT"),
         ("/credentials", "GET"),
@@ -147,7 +115,6 @@ fn the_deliberate_omissions_stay_denied() {
         ("/oauth/accounts", "GET"),
         ("/oauth/complete", "POST"),
         ("/oauth/reauthorize", "POST"),
-        // A thread's contents, and the workspace's memory.
         ("/messages", "GET"),
         ("/history", "GET"),
         ("/threads/:thread_id/messages", "GET"),
@@ -159,14 +126,12 @@ fn the_deliberate_omissions_stay_denied() {
         ("/blobs/:hash", "GET"),
         ("/events/:event_id/tool-args", "GET"),
         ("/events/:event_id/tool-result", "GET"),
-        // The device id the isolation keeps from the frame.
         ("/devices", "GET"),
         ("/devices/register", "POST"),
         ("/devices/hand-over", "POST"),
         ("/devices/caller", "GET"),
         ("/device-presence", "POST"),
         ("/push/subscribe", "POST"),
-        // Changing the platform.
         ("/changes/:id/apply", "POST"),
         ("/changes/apply-all", "POST"),
         ("/claude-code/control", "POST"),
@@ -178,14 +143,11 @@ fn the_deliberate_omissions_stay_denied() {
         ("/thread-queue/policy", "PUT"),
         ("/proxy-modules/reload", "POST"),
         ("/handshake-scripts/approve", "POST"),
-        // Outside the workspace.
         ("/browse-directories", "GET"),
         ("/repositories", "GET"),
         ("/repositories/:id/file", "GET"),
         ("/workspaces", "GET"),
         ("/webhooks", "GET"),
-        // A sibling app's source, and a capture or fit report the host did
-        // not ask for.
         ("/app/:app_id/source", "GET"),
         ("/app-capture", "POST"),
         ("/widgets/fit-report", "POST"),
@@ -198,21 +160,6 @@ fn the_deliberate_omissions_stay_denied() {
     }
 }
 
-/// An app reads the env vars and never writes them.
-///
-/// `build_script_env_vars` puts every user env var into `run_bash` and
-/// `run_python`. `RESERVED_EXACT` guards the names the engine owns, and an
-/// interpreter's loader hooks are not among them. So a writable `/env-vars`
-/// was app authority converted into host code execution. `PYTHONPATH` names a
-/// directory the app wrote through `/data/*path`, and a `sitecustomize.py`
-/// there runs on the next Python tool call.
-///
-/// That is the chain ADR 0144 closed for `scripts/`, through a door ADR 0231
-/// never argued for: it names `/env-vars` as a READ, in its context and in its
-/// plan, and the write verbs carried no reasoning.
-///
-/// The read stays. It is the gap ADR 0231 exists to close, and it hands an app
-/// no name the engine spawns anything with.
 #[test]
 fn an_app_cannot_write_an_env_var_the_agent_will_run_under() {
     assert!(app_may_call("/env-vars", "GET"));
@@ -226,10 +173,6 @@ fn an_app_cannot_write_an_env_var_the_agent_will_run_under() {
     }
 }
 
-/// Everything a shipped SDK namespace calls stays reachable.
-///
-/// The bridge reads the generated copy of this table, so a row changed here
-/// would break `lucidos.data.read` in every app with nothing else failing.
 #[test]
 fn the_shipped_sdk_surface_stays_reachable() {
     let allowed: &[(&str, &str)] = &[
@@ -267,14 +210,6 @@ fn the_shipped_sdk_surface_stays_reachable() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The layer, driven over a real router
-// ---------------------------------------------------------------------------
-
-/// A router shaped like the engine's: the same mount, the same layer.
-///
-/// The layer reads `MatchedPath`, which exists only once axum has routed. A
-/// direct call would prove nothing about what runs in production.
 fn gated_router() -> axum::Router {
     let inner = axum::Router::new()
         .route("/env-vars", axum::routing::get(|| async { "ok" }))
@@ -320,8 +255,6 @@ async fn a_stamped_call_to_a_denied_route_is_refused() {
 
 #[tokio::test]
 async fn an_unstamped_call_is_untouched() {
-    // The shell, the CLI and a standalone app tab carry no stamp. The gate has
-    // nothing to say about any of them.
     assert_eq!(
         status_of("GET", "/api/v1/credentials", None).await,
         axum::http::StatusCode::OK
@@ -344,10 +277,6 @@ async fn a_stamped_call_is_refused_per_method() {
     );
 }
 
-/// `/preferences` is an `App` route, yet a key the agent may not write is
-/// refused to an app too. Otherwise an app turns the command guard off, raises
-/// the tool-call cap, or opens the engine bind that `/network-config` keeps
-/// host-only.
 #[tokio::test]
 async fn a_stamped_write_of_a_human_only_preference_is_refused() {
     use axum::http::StatusCode;
@@ -372,11 +301,6 @@ async fn a_stamped_write_of_a_human_only_preference_is_refused() {
     }
 }
 
-/// The coding-agent binary paths choose what a session spawns, and the
-/// permission mode chooses what it may do unasked. Say an app sets the Codex
-/// path to `/bin/sh` and writes `apps/<id>/app-server`. The next Codex thread
-/// on that app then runs the app's script as the user. The agent may still set
-/// these keys, so they are refused to an app alone.
 #[tokio::test]
 async fn a_stamped_write_of_a_coding_agent_spawn_preference_is_refused() {
     use axum::http::StatusCode;
@@ -410,9 +334,6 @@ async fn a_stamped_write_of_a_coding_agent_spawn_preference_is_refused() {
     );
 }
 
-/// `opencode_free_enabled` sends chat to an anonymous relay whose free models
-/// may train on it. ADR 0104 makes that the human's informed opt-in, so an app
-/// may not flip it. Settings still writes it.
 #[tokio::test]
 async fn a_stamped_write_of_the_opencode_free_switch_is_refused() {
     use axum::http::StatusCode;
@@ -439,8 +360,6 @@ async fn a_stamped_write_of_the_opencode_free_switch_is_refused() {
     );
 }
 
-/// `local_base_url` chooses where local-model chat goes. An app setting it to
-/// its own host would read every prompt. Settings still writes it.
 #[tokio::test]
 async fn a_stamped_write_of_the_local_model_host_is_refused() {
     use axum::http::StatusCode;
@@ -461,8 +380,6 @@ async fn a_stamped_write_of_the_local_model_host_is_refused() {
     );
 }
 
-/// `backup_last_run` is the engine's record of the last backup. An app
-/// replacing it would misreport backups on every device.
 #[tokio::test]
 async fn a_stamped_write_of_engine_bookkeeping_is_refused() {
     use axum::http::StatusCode;
@@ -484,8 +401,6 @@ async fn a_stamped_write_of_engine_bookkeeping_is_refused() {
     }
 }
 
-/// The bridge stamps the decoded app id, and `fetch` sends a Latin-1 character
-/// as one raw byte. A stamp that is not ASCII is still a stamp.
 #[tokio::test]
 async fn a_stamp_that_is_not_ascii_is_still_refused() {
     use tower::ServiceExt as _;
@@ -544,20 +459,12 @@ fn form_decode_agrees_with_axum_query() {
 
 #[tokio::test]
 async fn an_unmatched_route_answers_404_rather_than_a_refusal() {
-    // No `MatchedPath`, so the request never routed. A refusal here would
-    // point the caller at the wrong problem.
     assert_eq!(
         status_of("GET", "/api/v1/no-such-route", Some("habit-tracker")).await,
         axum::http::StatusCode::NOT_FOUND
     );
 }
 
-/// The three routes with live breakage, which ADR 0231 opens.
-///
-/// All three broke on a READ, which is what the ADR names: an app rendering
-/// "Unavailable in the shell" for `/env-vars`, a raw model id for `/models`,
-/// and a notification it could not raise. The write half of `/env-vars` is
-/// refused, for the reason beside its row.
 #[test]
 fn the_routes_that_motivated_the_hatch_are_open() {
     assert!(app_may_call("/env-vars", "GET"));
@@ -572,11 +479,6 @@ mod guard_tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api")
     }
 
-    /// Every route the `/api/v1` router serves, with the methods each answers.
-    ///
-    /// Built from the shared scan, filtered to the functions this mount owns. A
-    /// registering function that is neither merged here nor declared above is a
-    /// panic. Skipping one silently is how a route would reach an app unasked.
     fn scan_routes() -> BTreeMap<String, BTreeSet<String>> {
         let mod_src =
             std::fs::read_to_string(api_dir().join("mod.rs")).expect("api/mod.rs is readable");
@@ -616,8 +518,6 @@ mod guard_tests {
     #[test]
     fn every_api_route_states_whether_an_app_may_reach_it() {
         let scanned = scan_routes();
-        // The check can say no. Without this, an empty or broken scan would pass
-        // every loop below while proving nothing.
         assert!(
             scanned.len() > 150 && scanned.contains_key("/data/*path"),
             "the route scan found {} routes, so it is not reading the routers",

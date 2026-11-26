@@ -1,4 +1,4 @@
-//! Transactional acceptance primitive. The submission service authenticates
+//! INVARIANT: Transactional acceptance primitive. The submission service authenticates
 //! the caller and resolves the send before constructing `PreparedDraftSubmission`.
 //! This primitive rechecks owner authority on its transaction. No HTTP caller
 //! can supply this structure. Dispatch happens only after this commits.
@@ -21,7 +21,7 @@ pub struct PreparedDraftSubmission {
 }
 
 impl EventBus {
-    /// Read a prior acceptance before resolving today's draft or settings.
+    /// INVARIANT: Read a prior acceptance before resolving today's draft or settings.
     /// `actor` must come from authenticated transport provenance. This only
     /// returns existing work belonging to that submitter; it grants no authority
     /// for a new acceptance. A miss must still pass the transactional replay
@@ -34,7 +34,7 @@ impl EventBus {
         read_saved_draft_receipt(&self.pool, request, actor).await
     }
 
-    /// Authorize and commit a resolved saved send. The append horizon
+    /// INVARIANT: Authorize and commit a resolved saved send. The append horizon
     /// lock precedes the thread lock, and the draft row stays locked through
     /// receipt, queue and compose projection. A replay consults the immutable
     /// receipt before examining today's draft, so later edits survive retries.
@@ -53,7 +53,7 @@ impl EventBus {
             .ok_or("draft_submitter_unattributed")?;
         let depth = current_event_trigger_depth();
         let emitting_trigger_id = current_trigger_id();
-        // A permission's spend lands on the thread that granted it.
+        // INVARIANT: A permission's spend lands on the thread that granted it.
         let granting_thread = match &prepared.authority {
             DraftSubmissionAuthority::Permission { permission_id } => Some(
                 crate::engine::thread_events::permission::permission_row(
@@ -67,7 +67,7 @@ impl EventBus {
             _ => None,
         };
         let mut append = self.begin_append().await?;
-        // Caller authority and target compose state share one lock ordering.
+        // INVARIANT: Caller authority and target compose state share one lock ordering.
         // Opposite-direction sends must not each hold the other's thread.
         let mut threads = vec![caller, prepared.request.thread_id];
         threads.extend(granting_thread);
@@ -76,7 +76,7 @@ impl EventBus {
         for thread in threads {
             Self::lock_thread_append(&mut append.tx, thread).await?;
         }
-        // A retry key is workspace-wide. Different target locks must not let
+        // INVARIANT: A retry key is workspace-wide. Different target locks must not let
         // concurrent reuse race past the receipt check.
         sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
             .bind(0x6472_6166_i32)
@@ -146,7 +146,7 @@ impl EventBus {
                     .as_deref()
                     .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil())) =>
             {
-                // Defaults are resolved by the service; explicit saved picks
+                // INVARIANT: Defaults are resolved by the service; explicit saved picks
                 // must survive preparation unchanged. Coding effort shares
                 // the wire field with chat effort, but uses its own selection.
                 let coding = *use_coding_agent == Some(true);
@@ -194,7 +194,7 @@ impl EventBus {
                 if coding {
                     let backend = coding_agent.ok_or("draft_coding_backend_missing")?;
                     let bound = if active {
-                        // NULL alone is the legacy Claude Code binding. Unknown
+                        // INVARIANT: NULL alone is the legacy Claude Code binding. Unknown
                         // stored values must not inherit parse()'s tolerant fallback.
                         Some(match bound_backend.as_deref() {
                             None | Some("claude-code") => {
@@ -209,7 +209,7 @@ impl EventBus {
                     if bound.is_some_and(|bound| bound != backend) {
                         return Err("draft_coding_backend_locked".into());
                     }
-                    // A Rust-only prepared payload still cannot smuggle a pick
+                    // INVARIANT: A Rust-only prepared payload still cannot smuggle a pick
                     // the runtime would replace, trim, or silently discard.
                     current.resolve_coding_selection(bound, backend)?;
                 }
@@ -232,7 +232,7 @@ impl EventBus {
             }
             DraftSubmissionAuthority::Permission { permission_id } => {
                 use crate::engine::thread_events::permission::{live_permission, Action, Lifetime};
-                // Only a once grant sends a draft, so the spend below ends it.
+                // INVARIANT: Only a once grant sends a draft, so the spend below ends it.
                 let permission = live_permission(
                     &mut *append.tx,
                     &crate::engine::thread_events::permission::thread_user(caller),
@@ -291,7 +291,7 @@ impl EventBus {
                 submitted_by_thread_id: caller,
             });
         }
-        // Join while the target append lock still serializes ordinary and
+        // INVARIANT: Join while the target append lock still serializes ordinary and
         // saved acceptance. Rollback drops this place without publishing it.
         let registration = self.register_accepted_input_turn(
             receipt.queue_entry_id,

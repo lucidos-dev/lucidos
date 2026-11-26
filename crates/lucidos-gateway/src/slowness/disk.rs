@@ -1,21 +1,10 @@
-//! Free space on the volumes Lucidos writes to, read so that it can never hang
-//! the slowness sampler (ADR 0301).
-//!
-//! A statfs on a local disk returns at once, full or not. A hung network mount
-//! can block it for good. So each read runs on its own thread under a ceiling,
-//! and only one read is ever in flight.
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-/// Below this much free space, the disk is the reason Lucidos is slow. A
-/// fixed amount, apart from the engine's cleanup thresholds, because this
-/// claims the disk is the cause, not that it needs tidying.
 const CRITICAL_FREE_BYTES: u64 = 2_000_000_000;
 
-/// How long a sample waits for a reading.
 const READ_CEILING: Duration = Duration::from_secs(1);
 
 pub fn is_critical(free_bytes: u64) -> bool {
@@ -28,8 +17,6 @@ pub struct DiskReader {
 }
 
 impl DiskReader {
-    /// The least free space among `volumes`. `None` when none could be read in
-    /// time, or an earlier read has not returned yet.
     pub fn lowest_free_bytes(&self, volumes: &[PathBuf]) -> Option<u64> {
         self.read_bounded(volumes.to_vec(), READ_CEILING, |volumes| {
             volumes
@@ -39,9 +26,6 @@ impl DiskReader {
         })
     }
 
-    /// Run `read` on a thread of its own and wait at most `ceiling`. A read that
-    /// outlives the ceiling keeps the guard until it returns, so a hung volume
-    /// holds one thread, never one per sample.
     fn read_bounded<F>(&self, volumes: Vec<PathBuf>, ceiling: Duration, read: F) -> Option<u64>
     where
         F: FnOnce(&[PathBuf]) -> Option<u64> + Send + 'static,
@@ -56,7 +40,6 @@ impl DiskReader {
             .spawn(move || {
                 let free = read(&volumes);
                 in_flight.store(false, Ordering::Release);
-                // The sample may have stopped waiting. Nothing is lost then.
                 let _ = tx.send(free);
             });
         if spawned.is_err() {
@@ -117,12 +100,10 @@ mod tests {
         assert_eq!(first, None);
         assert!(started.elapsed() < Duration::from_millis(300));
 
-        // The first read still holds the guard, so this one never starts.
         let second = reader.read_bounded(vec![], Duration::from_millis(50), hung(calls.clone()));
         assert_eq!(second, None);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Once it returns, reads start again.
         std::thread::sleep(Duration::from_millis(500));
         let third = reader.read_bounded(vec![], READ_CEILING, |_| Some(5));
         assert_eq!(third, Some(5));

@@ -1,14 +1,3 @@
-//! Handler for the `manage_repositories` tool: the agent-facing path to the
-//! registered-repository registry (Settings → Coding Agents). Wraps
-//! `RepositoryStore` and emits the same `Repository{Added,Removed}` events the
-//! HTTP CRUD does (`api::repositories`), so the durable `repo_names` projection
-//! stays current and every open client refreshes its repository list over SSE
-//! instead of sitting stale until a page reload.
-//!
-//! Factored out of the `LucidosEngine` impl as a free function so the tests
-//! below can drive every action against a real Postgres pool + EventBus without
-//! booting the full engine, the same shape as `query_events_impl`.
-
 use uuid::Uuid;
 
 use super::{agent_tool_actor, ToolOutcome};
@@ -77,7 +66,6 @@ async fn add_repository(
 
     let expanded = crate::core::home_path::expand(path);
 
-    // Validate path exists and is a git repo
     if !std::path::Path::new(&expanded).exists() {
         return Err(format!(
             "Error: path does not exist: {}",
@@ -102,8 +90,6 @@ async fn add_repository(
     }
 
     let desc = args.get("description").and_then(|v| v.as_str());
-    // Deterministic identity from the repo's root-commit SHA (read
-    // from disk); None (no commits) → path-derived id inside `add`.
     let root_commit_sha =
         crate::engine::git_ops::root_commit_sha(std::path::Path::new(&expanded)).await;
     match RepositoryStore::register(
@@ -117,9 +103,6 @@ async fn add_repository(
     )
     .await
     {
-        // `~/…`, for the same reason `list_repositories` abbreviates. The raw
-        // path can carry a home dir named `<username>@<employer-domain>`, and
-        // this result reaches the model provider and the persisted event.
         Ok(repo) => Ok(format!(
             "Repository '{}' registered at `{}`",
             repo.name,
@@ -170,8 +153,6 @@ mod tests {
     use crate::engine::thread_events::{ActorMode, MessageOrigin};
     use crate::test_support::{setup_test_db, teardown_test_db};
 
-    /// A committed git repo on disk. `add` reads the root-commit SHA from it to
-    /// derive the deterministic repo id.
     fn init_git_repo(dir: &std::path::Path) {
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")
@@ -202,12 +183,8 @@ mod tests {
         })
     }
 
-    /// The persisted event types for a repo id, oldest first.
     async fn repo_event_types(pool: &sqlx::PgPool, repo_id: &str) -> Vec<String> {
         sqlx::query_scalar(
-            // `SystemEvent` is `#[serde(tag = "type", content = "data")]`, so
-            // the persisted payload is the tagged envelope and the fields sit
-            // under `data`. `sequence` is the bigserial emit order.
             "SELECT event_type FROM events \
              WHERE event_type IN ('RepositoryAdded', 'RepositoryRemoved') \
                AND payload->'data'->>'repo_id' = $1 \
@@ -227,10 +204,6 @@ mod tests {
             .unwrap()
     }
 
-    /// The agent tool must go through the EventBus, not straight to the table:
-    /// the `RepositoryAdded` event is what feeds the durable `repo_names`
-    /// projection and the SSE arm that refreshes every open client's repository
-    /// list. Before this, an agent-registered repo only appeared after a reload.
     #[tokio::test]
     async fn add_emits_repository_added_and_projects_the_name() {
         let (pool, db_name) = setup_test_db().await;
@@ -260,8 +233,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// `list` shows a path under the home directory as `~/...`, never raw.
-    /// A home directory named for a person or an employer stays off the wire.
     #[tokio::test]
     async fn list_abbreviates_a_path_under_the_home_directory() {
         let home = std::env::var("HOME").expect("HOME is set for the test run");
@@ -293,8 +264,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// `list` names each repository's id. A `repo:` locator takes it, and an
-    /// agent had to shell out to the CLI to find it.
     #[tokio::test]
     async fn list_names_each_repository_id() {
         let (pool, db_name) = setup_test_db().await;
@@ -325,8 +294,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The emit carries an Agent actor deep-linking the thread whose agent ran
-    /// the tool, so the route popover can't mislabel it as a direct user action.
     #[tokio::test]
     async fn add_stamps_the_agent_thread_as_actor() {
         let (pool, db_name) = setup_test_db().await;
@@ -362,8 +329,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Remove emits too, so the list refreshes live on every client. The
-    /// projected name deliberately survives (see `repo_names` in `docs/database-schema-notes.md`).
     #[tokio::test]
     async fn remove_emits_repository_removed_and_retains_the_projected_name() {
         let (pool, db_name) = setup_test_db().await;
@@ -406,13 +371,11 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A rejected mutation must not emit: a refused path leaves no trace for
-    /// SSE consumers to act on.
     #[tokio::test]
     async fn rejected_add_emits_nothing() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
-        let tmp = tempfile::tempdir().unwrap(); // exists, but is not a git repo
+        let tmp = tempfile::tempdir().unwrap();
 
         let err = manage_repositories_impl(&pool, &bus, &add_args(tmp.path()), Uuid::new_v4())
             .await
@@ -429,7 +392,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// `remove` of an unknown name is an error, not a silent no-op emit.
     #[tokio::test]
     async fn rejected_remove_emits_nothing() {
         let (pool, db_name) = setup_test_db().await;

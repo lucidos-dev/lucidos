@@ -45,7 +45,6 @@ pub async fn add_repository(
 ) -> Result<(StatusCode, Json<Repository>), (StatusCode, String)> {
     let expanded_path = crate::core::home_path::expand(&req.path);
 
-    // Validate path exists
     let path = std::path::Path::new(&expanded_path);
     require_public_repo(&state.workspace_path, path).map_err(|e| (e.status, e.message))?;
     if !path.exists() {
@@ -55,7 +54,6 @@ pub async fn add_repository(
         ));
     }
 
-    // Validate it's a git repo
     let git_check = tokio::process::Command::new("git")
         .args(["rev-parse", "--git-dir"])
         .current_dir(path)
@@ -75,9 +73,6 @@ pub async fn add_repository(
         ));
     }
 
-    // Intrinsic identity comes from the repo's root-commit SHA (read from disk),
-    // so re-registering the same history is idempotent. None (no commits) falls
-    // back to a path-derived id inside `add`.
     let root_commit_sha = crate::engine::git_ops::root_commit_sha(path).await;
 
     let actor = Some(
@@ -123,7 +118,6 @@ pub async fn remove_repository(
     }
 }
 
-// Registered repositories publish past and present versions of their files.
 fn require_public_repo(
     workspace: &std::path::Path,
     root: &std::path::Path,
@@ -143,8 +137,6 @@ fn require_public_repo(
     }
     Ok(())
 }
-
-// --- Repo File Explorer endpoints ---
 
 #[derive(Deserialize)]
 pub struct RepoFilesQuery {
@@ -283,10 +275,6 @@ pub async fn get_repo_diff(
         return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
     }
 
-    // Resolve the real default branch (`origin/<default>` / `main` / `master` /
-    // `HEAD`), never a hardcoded `main` — external repos legitimately use a
-    // different default, and diffing against a phantom `main` 400s with
-    // "unknown revision". Mirrors `get_change_diff` / `get_thread_cc_diff`.
     let base = crate::engine::git_ops::default_diff_base(std::path::Path::new(&repo.path)).await;
     let range = format!("{}...{}", base, query.branch);
     let output = crate::engine::git_ops::git_cmd(
@@ -317,15 +305,6 @@ fn discarded_change_has_no_diff(id: Uuid) -> (StatusCode, String) {
     )
 }
 
-/// GET /api/v1/changes/:id/diff — compute diff for any change (pending or applied)
-///
-/// Mirrors `get_thread_cc_diff` for app coding-agent changes: resolves the
-/// pending base via `default_diff_base` (the workspace's actual default branch,
-/// not a hardcoded `main`) and scopes the diff to `data/apps/<id>/` via
-/// `lookup_app_pathspec`, so the change-row Diff matches the thread-level Diff
-/// and never leaks files the agent touched outside the app folder. Registered
-/// Lucidos-source / external changes resolve `default_diff_base` to their
-/// `main` / `origin/main`, so their diff is unchanged.
 pub async fn get_change_diff(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
@@ -365,9 +344,6 @@ pub async fn get_change_diff(
         ChangeStatusData::Discarded => return Err(discarded_change_has_no_diff(id)),
     };
 
-    // App coding-agent changes live under `data/apps/<id>/` in the workspace
-    // repo; scope the diff there. None for Lucidos-source / external changes
-    // (and for changes with no thread_id), leaving the diff unscoped as before.
     let pathspec = match change.thread_id {
         Some(thread_id) => lookup_app_pathspec(&state.pool, thread_id).await?,
         None => None,
@@ -384,26 +360,10 @@ pub struct ThreadCcDiff {
     pub base_ref: String,
 }
 
-/// GET /api/v1/threads/:thread_id/cc-diff: a 3-dot diff of the coding agent's
-/// branch against the repo's default branch. This is what the Diff button reads
-/// for every coding-agent thread: app, Lucidos-source and external-repo alike.
-///
-/// Falls back to the registered repo + branch ref when no worktree is left on
-/// disk. Pre-May-2026 `agent_recovery` removed worktrees for idle external-repo
-/// sessions without emitting `WorktreeCleaned`. The historical state is
-/// therefore a pending change + branch alive + worktree dir missing.
-/// That fallback needs a `SessionStarted.repo_id`, which only an external-repo
-/// thread carries. Finding the worktree is the only way an app or
-/// Lucidos-source thread ever gets a diff.
 pub async fn get_thread_cc_diff(
     State(state): State<AppState>,
     axum::extract::Path(thread_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ThreadCcDiff>, (StatusCode, String)> {
-    // For app coding-agent threads the worktree's git root is the workspace
-    // and the relevant changes live under `data/apps/<id>/`. Scoping the diff
-    // to that pathspec keeps stray writes outside the app folder out of the
-    // Diff button's response — the user asked for the diff scoped to the
-    // app, not to whatever the agent happened to touch.
     let app_pathspec = lookup_app_pathspec(&state.pool, thread_id).await?;
     let live_worktree = {
         let sessions = state.engine.agent_sessions.lock().await;
@@ -430,12 +390,6 @@ pub async fn get_thread_cc_diff(
         .map(Json)
 }
 
-/// The worktree a live session is working the THREAD's own branch in.
-///
-/// A detached conflict-resolution spawn (Tier 2 / Tier 3) runs in the merge
-/// worktree on a temp branch. That tree belongs to the merge, so the Diff
-/// button answers from the thread's own worktree while one runs. A Tier-1
-/// in-place merge never leaves the thread's own worktree.
 pub(in crate::api) fn live_thread_worktree(
     session: Option<&crate::engine::types::AgentSession>,
 ) -> Option<std::path::PathBuf> {
@@ -445,26 +399,12 @@ pub(in crate::api) fn live_thread_worktree(
         .and_then(|s| s.worktree_path.clone())
 }
 
-/// The worktree to diff, or `None` when the thread has none left on disk.
-///
-/// Three sources, most current first. The recorded idle used to be the only
-/// one, which left the Diff button dead for a thread's whole FIRST turn. No
-/// `CodingAgentIdled` exists yet, so the handler fell through to a branch-ref
-/// fallback an app or Lucidos-source thread can never satisfy. The button
-/// lights up mid-turn, from the worktree's post-commit hook. So the window it
-/// answered with a 404 is the window the user has work to look at.
-///
-/// The read-side sibling of `resume::resolve_worktree_path`, which answers the
-/// spawn-side question: where to PUT a worktree. That one invents a path when
-/// none is there, so it can never say "gone". This one has to.
 pub(in crate::api) async fn resolve_diff_worktree(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     live_session: Option<std::path::PathBuf>,
     workspace_path: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    // A running turn holds the ground truth: the tree the agent is writing to,
-    // recorded nowhere else until the turn ends.
     if let Some(path) = live_session.filter(|p| p.exists()) {
         return Some(path);
     }
@@ -474,10 +414,6 @@ pub(in crate::api) async fn resolve_diff_worktree(
     {
         return Some(path);
     }
-    // Every thread's worktree lands at this one path, so a thread whose idle
-    // recorded none (a crash, a legacy row) is still findable. Gated on the
-    // thread being real, because this path is derived from the id alone: see
-    // `thread_owns_a_coding_agent_worktree`.
     if !thread_owns_a_coding_agent_worktree(pool, thread_id).await {
         return None;
     }
@@ -506,21 +442,6 @@ async fn thread_owns_a_coding_agent_worktree(pool: &sqlx::PgPool, thread_id: Uui
     .unwrap_or(false)
 }
 
-/// Look up the in-app pathspec for an app coding-agent thread, e.g.
-/// `data/apps/habit-tracker`. Returns None for Lucidos-source and
-/// external-repo threads (and for legacy app rows with a NULL folder, in
-/// which case the unscoped diff is the best we can do).
-///
-/// Validates the folder shape matches `<…>/data/apps/<id>` exactly — same
-/// contract the frontend's `appIdFromFolder` enforces. Without this, a
-/// corrupted row with `kind = 'app'` but `folder = '/ws/projects/foo'`
-/// would silently scope the diff to a phantom `data/apps/foo` and the
-/// user would see an empty diff with no error.
-///
-/// A query that could not run is an error, never a `None`. `None` means "not
-/// scoped", which both callers read as "diff the whole repo". So a pool
-/// timeout used to answer 200 with every file the agent touched anywhere in
-/// the workspace. Same reasoning as `thread_owns_a_coding_agent_worktree`.
 async fn lookup_app_pathspec(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -554,10 +475,6 @@ async fn lookup_app_pathspec(
     Ok(Some(format!("data/apps/{app_id}")))
 }
 
-/// Extract the app id from a `coding_agent_folder` value. Mirrors the
-/// frontend's `appIdFromFolder` validation: requires the folder to end in
-/// `…/data/apps/<id>` with a non-empty, non-traversal id, with `data`
-/// immediately before `apps`.
 fn extract_app_id(folder: &str) -> Option<String> {
     let segments: Vec<&str> = folder.split('/').filter(|s| !s.is_empty()).collect();
     let apps_idx = segments.iter().rposition(|s| *s == "apps")?;
@@ -665,20 +582,6 @@ async fn diff_via_branch_ref(
     })
 }
 
-/// The branch to diff when there is no worktree left to ask.
-///
-/// `SessionStarted.branch` is a spawn-time snapshot, and the branch belongs to
-/// git inside a worktree the coding agent can write to: a skill running
-/// `git branch -m` leaves the recorded name pointing at a ref that no longer
-/// exists. Every live path re-reads the worktree instead (`diff_via_worktree`
-/// above diffs `base...HEAD`, and the idle adopts the real branch), but this
-/// fallback runs precisely when the worktree has been reclaimed, so it has to
-/// find the work another way: the thread's last known commit, and the branch
-/// that still contains it.
-///
-/// Without this the Diff button answered a renamed thread with git's raw
-/// `fatal: ambiguous argument 'main...<gone-ref>'` as a 400, for a branch that
-/// was sitting right there under its new name.
 async fn resolve_recorded_branch(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -692,10 +595,6 @@ async fn resolve_recorded_branch(
     {
         return Ok(recorded);
     }
-    // The 404 below states a fact about the user's data, so only an ANSWERED
-    // lookup may produce it. A dropped connection reporting "recorded no
-    // commit" would deny a thread that has commits, which is the same
-    // discipline as the `or_unknown(true)` above.
     let head_sha = match crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
         pool, thread_id,
     )
@@ -721,11 +620,6 @@ async fn resolve_recorded_branch(
             ))
         }
     };
-    // Exclude the diff base AND the local default: `base_ref` is
-    // `origin/<default>` whenever the local default has diverged, and
-    // `for-each-ref refs/heads/` never lists a remote-tracking ref, so on its
-    // own it would leave the local default a candidate for work that was merged
-    // and whose branch was then deleted.
     let local_default = crate::engine::git_ops::default_local_branch(repo_root).await;
     match crate::engine::git_ops::sole_branch_containing(
         repo_root,
@@ -780,9 +674,6 @@ async fn run_git_diff(
     Ok(parse_diff_output(&String::from_utf8_lossy(&output.stdout)))
 }
 
-/// Resolve the main worktree's working-tree root for a (possibly linked)
-/// worktree. `git worktree list --porcelain` always lists the main worktree
-/// first, so we read the first `worktree <path>` line.
 async fn resolve_worktree_repo_root(
     worktree_path: &std::path::Path,
 ) -> Result<Option<String>, String> {
@@ -805,8 +696,6 @@ pub struct ChangeFileQuery {
     pub path: String,
 }
 
-/// GET /api/v1/changes/:id/file?path=X — fetch the full "after" version of a file
-/// at the change's branch (pending) or post-merge SHA (applied).
 pub async fn get_change_file(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
@@ -917,10 +806,6 @@ pub async fn browse_directories(
     }))
 }
 
-/// Routes for the `/repositories*` and `/browse-directories` surfaces. The
-/// change- and thread-shaped diff routes this module also implements
-/// register under `changes::router()` / `threads::router()` — grouped by
-/// URL surface, not handler location.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/repositories", get(list_repositories).post(add_repository))

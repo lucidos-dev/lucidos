@@ -1,28 +1,3 @@
-//! The *wake decision* turn-end requirement: a child thread says whether its
-//! parent must act on this turn's report.
-//!
-//! The child decides with the `wake_parent` tool or `lucidos wake-parent`. A
-//! turn that ends owing its parent a card and holding no decision is decided
-//! here, by one call to the `WakeDecision` judgment site. The decision lands
-//! on the child as `ParentWakeRequested` or `ParentWakeNotRequested`, before
-//! its terminal event, so the fan-in reads it.
-//!
-//! It defaults to OpenAI Decisions while the chat provider serves OpenAI,
-//! unless the user picked a backend or pinned `model_wake_decision` (ADRs 0435,
-//! 0472). A failed OpenAI call falls back to chat.
-//! Chat runs forced, and unpinned only on a model `lucidos-eval wake-decision`
-//! cleared (ADR 0448).
-//!
-//! A child whose spawn declared a *wake mode* makes no decision: the mode
-//! decides at the fan-in, with no model call (ADR 0451). The engine still
-//! records a wake for its cut-short turn or empty reply.
-//!
-//! **Every doubt wakes.** A failed call, a missing answer, an empty reply, a
-//! turn the engine cut short, an unreadable row and no measured model all wake
-//! the parent. Only a confident no files the report, and only a clean finish
-//! ever consults it.
-//! The call's one output is that yes or no: it has no tool and no side effect.
-
 use uuid::Uuid;
 
 use super::read_decision::{TurnRead, PARENT_ACTS_READ_RULE, PARENT_MAY_ACT_READ_RULE};
@@ -41,24 +16,16 @@ use crate::llm::tools::WAKE_ARG;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The lowest probability of "the parent must act" that still wakes it. Below
-/// it the report is filed, so the model has to be fairly sure of a no.
 const WAKE_THRESHOLD: f64 = 0.3;
 
-/// The id of the one question the gate asks.
 const WAKE_QUESTION_ID: &str = "parent_must_act";
 
-/// The most bytes of a message the call reads.
 const MESSAGE_BYTES: usize = 4_000;
-/// The most bytes of the child's reply the call reads.
 const REPLY_BYTES: usize = 8_000;
 
-/// A child's yes or no about waking its parent for this turn's report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeDecision {
-    /// The parent must act now, so the report wakes it.
     Requested,
-    /// The parent need not act now. A clean finish files the report.
     NotRequested,
 }
 
@@ -71,13 +38,10 @@ impl WakeDecision {
         }
     }
 
-    /// The `parent_wake_requested` value this decision projects to.
     fn wake(self) -> bool {
         self == Self::Requested
     }
 
-    /// Read `wake_parent`'s arguments. A missing or non-boolean `wake` is an
-    /// error the model reads back, never a default.
     pub(crate) fn from_tool_args(args: &serde_json::Value) -> Result<Self, String> {
         args[WAKE_ARG]
             .as_bool()
@@ -97,7 +61,6 @@ impl WakeDecision {
         }
     }
 
-    /// What the agent reads back after deciding, from the tool and the CLI.
     pub(crate) fn ack(self) -> &'static str {
         match self {
             Self::Requested => {
@@ -112,8 +75,6 @@ impl WakeDecision {
         }
     }
 
-    /// What a child whose parent declared its wake mode reads back from the
-    /// tool or the CLI. It records nothing.
     pub(crate) fn declared_ack(mode: WakeMode) -> String {
         let effect = match mode {
             WakeMode::Wake => "Your clean report wakes it.",
@@ -136,8 +97,6 @@ impl WakeDecision {
         )
     }
 
-    /// The decision a probability of "the parent must act" stands for. An
-    /// absent answer wakes.
     fn from_probability(must_act: Option<f64>) -> Self {
         match must_act {
             Some(p) if p < WAKE_THRESHOLD => Self::NotRequested,
@@ -146,8 +105,6 @@ impl WakeDecision {
     }
 }
 
-/// Record a wake decision on `thread_id`, by `actor`. `None` is the engine
-/// deciding at the turn end.
 pub(crate) async fn record_wake_decision(
     bus: &EventBus,
     thread_id: Uuid,
@@ -163,7 +120,6 @@ pub(crate) async fn record_wake_decision(
     Ok(())
 }
 
-/// Record the calling thread's own agent's wake decision.
 pub(crate) async fn record_agent_wake_decision(
     bus: &EventBus,
     thread_id: Uuid,
@@ -178,22 +134,15 @@ pub(crate) async fn record_agent_wake_decision(
     .await
 }
 
-/// What a thread owes its parent about waking it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeDuty {
-    /// No parent, or an unreadable row. The gate then decides for the turn.
     NoParent,
-    /// The spawn declared a wake mode, which decides at the fan-in.
     Declared(WakeMode),
-    /// A parent and no mode: each turn makes a wake decision.
     Decide,
 }
 
 impl WakeDuty {
     pub(crate) async fn of_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Self {
-        // A thread whose handoff is pending reports at its successor
-        // session's end. One that handed off to a legacy successor thread reports
-        // through it. Neither owes a decision of its own now.
         let row = sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(&format!(
             "SELECT CASE WHEN successor_thread_id IS NULL AND NOT {} THEN parent_thread_id END, \
                     wake_mode \
@@ -216,51 +165,42 @@ impl WakeDuty {
         }
     }
 
-    /// The read rule a session of this duty is told, or empty. Only a child
-    /// whose report reaches a parent agent that acts on it gets one: a
-    /// `no-wake` child's report is read in the child (ADR 0607).
     pub(crate) fn read_rule(self) -> &'static str {
         match self {
-            Self::Declared(WakeMode::Wake | WakeMode::WakeWhenAllDone) => PARENT_ACTS_READ_RULE,
             Self::Decide => PARENT_MAY_ACT_READ_RULE,
-            Self::Declared(WakeMode::NoWake) | Self::NoParent => "",
+            duty if duty.parent_acts() => PARENT_ACTS_READ_RULE,
+            _ => "",
         }
     }
 
-    /// Whether the thread is offered `wake_parent` and told the wake rule.
+    pub(crate) fn parent_acts(self) -> bool {
+        matches!(
+            self,
+            Self::Declared(WakeMode::Wake | WakeMode::WakeWhenAllDone)
+        )
+    }
+
     pub(crate) async fn owes_a_decision(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
         Self::of_thread(pool, thread_id).await == Self::Decide
     }
 }
 
-/// How a turn ended, as the wake decision needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnFinish {
     Finished(ChildCompletionStatus),
-    /// The engine ended the turn short: a cap or a broken loop. It wakes under
-    /// every mode but `no-wake`.
     CutShort,
 }
 
-/// What the gate reads about a child whose turn still owes its parent a card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OwedReport {
     parent_id: Uuid,
-    /// The wake decision this turn already recorded, if any.
     decision: Option<WakeDecision>,
-    /// The wake mode the spawn declared, which then decides instead.
     wake_mode: Option<WakeMode>,
-    /// Whether another child of its `wake-when-all-done` batch still works.
     batch_still_working: bool,
-    /// The child ends its turn holding an event wait, so the card waits too.
-    /// That held card wakes under every mode but `no-wake`.
     holds_live_wait: bool,
 }
 
 impl OwedReport {
-    /// The report `thread_id` owes its parent for this turn, or `None` when it
-    /// owes none. An unreadable row reads as none: the decision stays unset,
-    /// which wakes.
     pub(crate) async fn of_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Self> {
         let sql = format!(
             "SELECT c.parent_thread_id, c.parent_wake_requested, c.wake_mode, \
@@ -291,12 +231,8 @@ impl OwedReport {
             )
     }
 
-    /// Whether the wake rules would start a parent turn.
-    /// The fan-in can still file an unchanged integrated report.
     pub(crate) fn wakes_parent(&self, finish: TurnFinish, decision: Option<WakeDecision>) -> bool {
         match finish {
-            // The fan-in holds the card until the wait ends, so this turn end
-            // delivers nothing.
             _ if self.holds_live_wait => false,
             TurnFinish::CutShort => self.wake_mode != Some(WakeMode::NoWake),
             TurnFinish::Finished(status) => {
@@ -311,8 +247,6 @@ impl OwedReport {
     }
 }
 
-/// What the call reads besides the child's turn: what the parent last said,
-/// and how many of its other children are still working.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParentView {
     pub latest_reply: String,
@@ -320,8 +254,6 @@ pub struct ParentView {
 }
 
 impl ParentView {
-    /// Read `parent_id` around its child `child_id`. Unreadable parts read as
-    /// empty, and the log records the error.
     async fn read(pool: &sqlx::PgPool, parent_id: Uuid, child_id: Uuid) -> Self {
         let sql = format!(
             "SELECT (SELECT e.payload->>'text' FROM events e \
@@ -350,7 +282,6 @@ impl ParentView {
     }
 }
 
-/// The state the call judges.
 pub(crate) fn wake_state(
     turn: &TurnRead,
     status: ChildCompletionStatus,
@@ -367,7 +298,6 @@ pub(crate) fn wake_state(
     })
 }
 
-/// The parent's other children still working, in words.
 fn siblings_note(running: i64) -> String {
     match running {
         0 => "This child is the last of the parent's children to report. No other child is \
@@ -378,7 +308,6 @@ fn siblings_note(running: i64) -> String {
     }
 }
 
-/// The one question the call answers.
 pub(crate) fn wake_questions() -> Vec<(String, Question)> {
     vec![(
         WAKE_QUESTION_ID.to_string(),
@@ -409,7 +338,6 @@ pub(crate) fn wake_questions() -> Vec<(String, Question)> {
     )]
 }
 
-/// The decision one judgment answers. A missing answer wakes.
 pub(crate) fn read_wake_answer(answers: &Answers) -> WakeDecision {
     WakeDecision::from_probability(answers.noul(WAKE_QUESTION_ID))
 }
@@ -421,10 +349,8 @@ pub fn wake_decision_chat_judge(
     ChatJudgmentProvider::new(provider, reasoning).forcing_the_answer()
 }
 
-/// One wake decision, as `lucidos-eval wake-decision` scores it.
 pub struct EvalWakeDecision {
     pub wake: bool,
-    /// The probability of yes, or `None` when the backend gave no answer.
     pub probability: Option<f64>,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -449,11 +375,6 @@ pub async fn decide_wake_for_eval(
     })
 }
 
-/// The provider the gate asks, or `None` when nothing measured can answer.
-///
-/// `chat` is absent when no model the eval cleared is reachable and none is
-/// pinned. A System One pick then answers alone, and without one the parent
-/// wakes with no call (ADR 0448).
 pub(crate) fn wake_judge(
     system_one: Option<Box<dyn JudgmentProvider>>,
     chat: Option<ChatJudgmentProvider>,
@@ -465,7 +386,6 @@ pub(crate) fn wake_judge(
     }
 }
 
-/// Ask `provider` once, within `deadline`. A failed or timed-out call wakes.
 pub(crate) async fn decide_with(
     provider: &dyn JudgmentProvider,
     capture: &AuxCapture,
@@ -485,20 +405,13 @@ pub(crate) async fn decide_with(
     }
 }
 
-/// What the gate does for one owed report, before any call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeStep {
-    /// Record this decision in the engine's name, with no call.
     Record(WakeDecision),
-    /// Record nothing: the turn decided, its card waits on an event wait, or
-    /// its declared wake mode decides at the fan-in.
     Skip,
-    /// Ask the `WakeDecision` judgment site.
     Ask(ChildCompletionStatus),
 }
 
-/// The gate's choice for `owed`, given the turn's reply and how it ended. Only
-/// an undeclared child that finished with a reply is ever asked.
 pub(crate) fn wake_step(owed: &OwedReport, reply: &str, finish: TurnFinish) -> WakeStep {
     match finish {
         TurnFinish::CutShort => WakeStep::Record(WakeDecision::Requested),
@@ -513,7 +426,7 @@ pub(crate) fn wake_step(owed: &OwedReport, reply: &str, finish: TurnFinish) -> W
 
 #[easy_ext::ext(WakeDecisionExt)]
 pub(crate) impl crate::engine::LucidosEngine {
-    /// Make the wake decision `owed` still lacks, and record it in the
+    /// INVARIANT: Make the wake decision `owed` still lacks, and record it in the
     /// engine's name. Run before the turn's terminal event. Returns the
     /// decision the fan-in reads, which is `None` while it stays unset.
     async fn force_wake_decision(
@@ -541,7 +454,6 @@ pub(crate) impl crate::engine::LucidosEngine {
         }
     }
 
-    /// One call to the `WakeDecision` judgment site.
     async fn judge_wake(
         &self,
         thread_id: Uuid,

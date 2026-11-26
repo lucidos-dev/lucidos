@@ -1,6 +1,3 @@
-//! The recovery `impl LucidosEngine` block: stale-waiting-session
-//! settlement and orphaned-worktree recovery.
-
 use super::super::change_ops::{branch_is_hardened, ProposeOutcome};
 use super::super::git_ops::{
     add_paths_to_worktree_exclude, commit_worktree_or_err, default_local_branch,
@@ -25,14 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// What a proposal says about a branch's work beyond its files.
 pub(super) struct BranchProposalDetails {
     pub description: String,
     pub hardened: bool,
     pub requires_restart: bool,
 }
 
-/// What a proposal says about a branch's work beyond its files.
 pub(super) async fn branch_proposal_details(
     pool: &sqlx::PgPool,
     changes: &crate::core::changes_projection::ChangesProjection,
@@ -53,8 +48,6 @@ pub(super) async fn branch_proposal_details(
     }
 }
 
-/// The prefix a discovered worktree path must start with to belong to this
-/// workspace, ending in a separator.
 fn worktrees_scan_prefix(workspace: &Path) -> String {
     let mut prefix = worktrees_dir(workspace).to_string_lossy().to_string();
     if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
@@ -76,12 +69,6 @@ pub async fn settle_agent_switch_threads(
 
 #[easy_ext::ext(AgentRecoveryExt)]
 pub(crate) impl LucidosEngine {
-    /// Gather branch metadata and propose a Change record. Callers must pass a
-    /// non-empty `changed_files` list, so this never creates a phantom `changes`
-    /// row with `file_count=0`.
-    ///
-    /// `origin` reaches the emitted `ChangeProposed`, so the route popover can
-    /// name which engine path proposed the change.
     async fn propose_branch_changes(
         &self,
         thread_id: Uuid,
@@ -102,8 +89,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// Settle a branch's committed work as its turn ended: propose it if the
-    /// turn finished, withhold it if not (ADR 0400).
     async fn propose_branch_work(
         &self,
         thread_id: Uuid,
@@ -144,9 +129,6 @@ pub(crate) impl LucidosEngine {
         .await
     }
 
-    /// Decide again what a branch's work is: re-read its files, then propose
-    /// or withhold it as `finished` says. `Ok(None)` when the branch holds no
-    /// proposable work.
     async fn redecide_branch_work(
         &self,
         thread_id: Uuid,
@@ -163,12 +145,6 @@ pub(crate) impl LucidosEngine {
             .map(Some)
     }
 
-    /// `thread_summaries.coding_agent_is_external_repo`, failing open to
-    /// `false` on a read error, as this read always has.
-    ///
-    /// Fail-open only mis-routes a legacy external thread whose event carries
-    /// no kind. That lands on the Lucidos repo: today's behavior, where the
-    /// branch is absent and every command fails harmlessly.
     async fn projection_says_external_repo(&self, thread_id: Uuid) -> bool {
         match self.is_external_repo_thread(thread_id).await {
             Ok(v) => v,
@@ -183,9 +159,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Settle the stale branch's committed work. Thin wrapper so the settle's
-    /// own body stays one decision per line; `propose_branch_changes` above
-    /// does the work.
     async fn propose_stale_branch(
         &self,
         thread_id: Uuid,
@@ -212,7 +185,8 @@ pub(crate) impl LucidosEngine {
             Ok(
                 ProposeOutcome::Held(_)
                 | ProposeOutcome::Unfinished
-                | ProposeOutcome::AwaitingLanding(_),
+                | ProposeOutcome::AwaitingLanding(_)
+                | ProposeOutcome::Refused(_),
             ) => {}
             Err(e) => {
                 log_legacy!(
@@ -223,12 +197,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// End a stale waiting Claude Code session (no live process) after an engine
-    /// restart.
-    ///
-    /// `actor` is who initiated it. HTTP entry points plumb the user's device
-    /// through, so any resulting change event stamps the real actor rather than
-    /// the "Lucidos Engine" chip. Engine-internal recovery callers pass `None`.
     async fn end_stale_waiting_session(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -271,10 +239,6 @@ pub(crate) impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
                                 has_changes: false,
-                                // Read back rather than hardcoded: this field
-                                // is authoritative for the projection column,
-                                // so a literal `false` would clear an external
-                                // thread's flag instead of preserving it.
                                 is_external_repo: self
                                     .projection_says_external_repo(thread_id)
                                     .await,
@@ -302,10 +266,6 @@ pub(crate) impl LucidosEngine {
             branch_name
         );
 
-        // Route by the kind this thread's own session recorded. An app thread's
-        // worktree and branch live in the WORKSPACE git. Asking the Lucidos repo
-        // about them left every app thread settling with no Apply card, for work
-        // already committed on its branch.
         let repo = stale_session_repo(
             session_kind.as_deref(),
             self.projection_says_external_repo(thread_id).await,
@@ -314,8 +274,6 @@ pub(crate) impl LucidosEngine {
         );
         let is_external = matches!(repo, StaleSessionRepo::External);
 
-        // The idle below reports the branch's work whether a change carries
-        // it or a hold withheld it, so withheld work stays visible.
         let mut branch_has_work = false;
         match &repo {
             StaleSessionRepo::External => {
@@ -329,11 +287,7 @@ pub(crate) impl LucidosEngine {
                 settle_stale_worktree(repo_root, &branch_name, thread_id, discard, lookup).await;
 
                 if !discard {
-                    // `Some(files)` only when the branch has commits AND a
-                    // non-empty net diff, so commits that cancel out read as a
-                    // no-op branch.
                     match proposal_files_for_branch(repo_root, &branch_name).await {
-                        // The successor session carries the work and decides it.
                         Some(_) if crate::engine::pending_handoff::handoff_pending(self.pool(), thread_id).await => {
                             branch_has_work = true;
                             match crate::engine::change_ops::withhold_handed_off_work(
@@ -388,9 +342,6 @@ pub(crate) impl LucidosEngine {
             }
         }
 
-        // `SessionEnded` is terminal-only, so mark the orphaned turn as ended
-        // with `CodingAgentIdled` instead. The change events emitted above
-        // already drive the panel state.
         let coding_agent = self.thread_coding_agent(thread_id).await;
         self.event_bus
             .emit_or_log(
@@ -398,22 +349,12 @@ pub(crate) impl LucidosEngine {
                     thread_id,
                     event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
                         has_changes: branch_has_work,
-                        // Authoritative for
-                        // `thread_summaries.coding_agent_is_external_repo`, so a
-                        // hardcoded `false` here cleared the flag on an external
-                        // thread's Stop. Derived from the resolved repo instead.
                         is_external_repo: is_external,
                         requires_restart: false,
                         cc_session_id: None,
                         coding_agent,
                         reason: None,
-                        // Discard removes the tree above, so this path may or
-                        // may not still exist. Recording it either way misleads
-                        // the resolver, so leave it None and let the next spawn
-                        // look the worktree up itself.
                         worktree_path: None,
-                        // No worktree, so no SHA. External-edit detection stays
-                        // off until a real turn populates the field.
                         worktree_head_sha: None,
                         bg_bash_pending: false,
                         turn_end: None,
@@ -424,17 +365,11 @@ pub(crate) impl LucidosEngine {
             )
             .await;
 
-        // No auto-apply tail: a pending change is the user's to resolve from
-        // Review. Apply Now chains its own apply call once the proposal lands
-        // over SSE.
-
         self.broadcast_changes_updated().await;
 
         Ok(())
     }
 
-    /// End lane duty without proposing work. Preserve historical ordinary
-    /// sessions separately from the integration tree the lane cleans up.
     async fn end_stale_lane_thread(
         &self,
         thread_id: Uuid,
@@ -494,8 +429,6 @@ pub(crate) impl LucidosEngine {
         settle_unresumed_switch_threads(self.pool(), &self.event_bus, resumed).await;
     }
 
-    /// Detect orphaned coding-agent worktrees from a previous engine run and
-    /// start new coding-agent sessions on them instead of proposing pending changes.
     async fn recover_orphaned_worktrees(self: &Arc<Self>) -> Vec<uuid::Uuid> {
         #[derive(sqlx::FromRow)]
         struct BranchThread {
@@ -524,9 +457,6 @@ pub(crate) impl LucidosEngine {
         let ws_id = self.workspace_path.to_string_lossy().to_string();
         let ws_worktrees_prefix = worktrees_scan_prefix(self.workspace_path());
 
-        // A registry read that failed degrades to "no external repos". The two
-        // engine-owned roots are still scanned, so a Lucidos or app thread
-        // recovers even when the registry is unreadable.
         let external_repos = crate::core::repositories::RepositoryStore::list(self.pool())
             .await
             .unwrap_or_else(|e| {
@@ -536,7 +466,6 @@ pub(crate) impl LucidosEngine {
         let repos_to_scan =
             recovery_repo_roots(&lucidos_repo_root, self.workspace_path(), &external_repos);
 
-        // (worktree_path, branch_name, repo_id, repo_root)
         let mut to_recover: Vec<(PathBuf, String, Option<String>, PathBuf)> = Vec::new();
 
         let worktree_lists: Vec<_> = {
@@ -576,11 +505,6 @@ pub(crate) impl LucidosEngine {
                     branch = Some(b.to_string());
                 } else if line.is_empty() {
                     if let (Some(ref wt), Some(ref br)) = (&worktree_path, &branch) {
-                        // A lane thread works on its batch's integration
-                        // branch, and recovers like any coding-agent thread.
-                        // A worktree outside this workspace's worktrees dir
-                        // cannot be ours, so skip the marker read. That read
-                        // dominates the scan in multi-workspace setups.
                         if (crate::engine::git_ops::is_coding_agent_branch(br)
                             || crate::engine::git_ops::is_lane_branch(br))
                             && wt.starts_with(&ws_worktrees_prefix)
@@ -621,8 +545,6 @@ pub(crate) impl LucidosEngine {
 
         let pool = self.pool();
         let proj = self.changes();
-        // Best-effort: a DB error degrades to "nothing pending" rather than
-        // blocking boot, and is logged so the partial sweep is visible.
         let pending_changes_list = proj.list_pending().await.unwrap_or_else(|e| {
             log_legacy!(
                 "[Recovery] list_pending: {} — recovery proceeds without pending change context",
@@ -665,8 +587,6 @@ pub(crate) impl LucidosEngine {
             ).fetch_all(pool),
         );
 
-        // An empty set from a failed query silently misclassifies every branch,
-        // so log the error even though recovery proceeds with degraded data.
         fn unwrap_logged<T: Default, E: std::fmt::Display>(label: &str, r: Result<T, E>) -> T {
             r.unwrap_or_else(|e| {
                 log_legacy!("[Recovery] {} query failed: {}", label, e);
@@ -730,11 +650,6 @@ pub(crate) impl LucidosEngine {
             idle_branches.len(),
             actively_running_branches.len());
 
-        // DB-based discovery for lost worktrees. The scan above sees only
-        // branches whose worktree directory still exists, so a running session
-        // whose directory was cleaned up is invisible to it. Find those in the
-        // DB and create fresh worktrees, so they enter the normal pipeline.
-        // Owned set, because the loop below pushes to `to_recover`.
         let discovered_branches: std::collections::HashSet<String> =
             to_recover.iter().map(|(_, br, _, _)| br.clone()).collect();
 
@@ -742,10 +657,6 @@ pub(crate) impl LucidosEngine {
             let bus = engine.event_bus.clone();
             let engine = engine.clone();
             async move {
-                // Same preserve rule as the loop below. The `CodingAgentIdled`
-                // this closure emits is park-ending, so idling here would expire
-                // a live question card. Answering still resumes, even with the
-                // worktree unrecoverable.
                 if thread_has_unanswered_question(engine.pool(), thread_id).await {
                     log_legacy!(
                         "[Recovery] Preserving stuck thread {} — parked on an unanswered question (no idle emitted)",
@@ -754,8 +665,6 @@ pub(crate) impl LucidosEngine {
                     return;
                 }
                 let coding_agent = engine.thread_coding_agent(thread_id).await;
-                // Read back, as the no-branch idle above does: this field
-                // overwrites the projection column.
                 let is_external_repo = engine.projection_says_external_repo(thread_id).await;
                 bus.emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
@@ -767,11 +676,7 @@ pub(crate) impl LucidosEngine {
                             cc_session_id: None,
                             coding_agent,
                             reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
-                            // No worktree to record: this path fires when
-                            // recovery cannot locate one at all. The next spawn
-                            // resolves a path itself.
                             worktree_path: None,
-                            // No worktree, so no SHA to snapshot.
                             worktree_head_sha: None,
                             bg_bash_pending: false,
                             turn_end: None,
@@ -785,8 +690,6 @@ pub(crate) impl LucidosEngine {
         };
 
         for branch in &actively_running_branches {
-            // A lane worktree lives at its batch's own path, and the lane
-            // thread's next run recreates it there.
             if discovered_branches.contains(branch)
                 || crate::engine::git_ops::is_lane_branch(branch)
             {
@@ -806,19 +709,6 @@ pub(crate) impl LucidosEngine {
                         self.workspace_path(),
                         branch_to_thread.get(branch).copied(),
                     );
-                    // NEVER delete a valid worktree here: reclamation belongs to
-                    // the cleanup worker alone (ADR 0035). A deterministic
-                    // `thread-<short>` dir on disk is one of four things:
-                    //
-                    // * a live worktree ON THIS BRANCH, or on a side branch the
-                    //   agent cut from it: reuse it as-is. A partial-setup
-                    //   leftover is repaired below, not deleted.
-                    // * a live worktree on a DIFFERENT branch: skip it. Reusing
-                    //   it resumes against the wrong checkout, and deleting it
-                    //   destroys the other branch's work.
-                    // * a stranded dir whose git admin is gone: cleared by
-                    //   `clear_stranded_worktree_dir` so the add can recreate it.
-                    // * absent: created by the add.
                     let is_live_worktree =
                         matches!(tokio::fs::try_exists(&wt_path).await, Ok(true))
                             && crate::engine::git_ops::is_live_worktree_at(&wt_path).await;
@@ -841,9 +731,6 @@ pub(crate) impl LucidosEngine {
                         };
 
                     if is_live_worktree && !on_our_branch {
-                        // The shared path is occupied by another branch's live
-                        // worktree, so skip it. The occupant recovers on its own
-                        // pass.
                         log_legacy!(
                             "[Recovery] Skipping lost branch {} — shared worktree {} is live on a different branch (not reused, not deleted)",
                             branch,
@@ -860,14 +747,8 @@ pub(crate) impl LucidosEngine {
                         );
                         true
                     } else {
-                        // Absent, or present but stranded.
-                        // `clear_stranded_worktree_dir` removes the dir only
-                        // when the git admin is gone.
                         crate::engine::git_ops::clear_stranded_worktree_dir(&repo_root, &wt_path)
                             .await;
-                        // The rebuilt worktree must have the shape the spawn
-                        // path gave it. `Some` is an app thread, and takes the
-                        // sparse cone over its own app folder.
                         let app_spawn_id = match branch_to_thread.get(branch) {
                             Some(&tid) => lookup_app_spawn_id(self.pool(), tid).await,
                             None => None,
@@ -914,8 +795,6 @@ pub(crate) impl LucidosEngine {
                                 e
                             );
                         }
-                        // Exclude engine-injected paths, so an external repo does
-                        // not see them as untracked and commit them.
                         add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
                         to_recover.push((wt_path, branch.clone(), repo_id, repo_root));
                     } else if let Some(&thread_id) = branch_to_thread.get(branch) {
@@ -941,8 +820,6 @@ pub(crate) impl LucidosEngine {
                                     branch,
                                     thread_id
                                 );
-                                // `marker_repo_id` is only logged; repo selection
-                                // uses `repo_root`.
                                 to_recover.push((wt_path, branch.clone(), None, repo_root));
                             }
                             None => {
@@ -963,16 +840,9 @@ pub(crate) impl LucidosEngine {
         for (wt_path, branch_name, marker_repo_id, repo_root) in to_recover {
             if let Some(pending_change) = pending_by_branch.get(&branch_name) {
                 if actively_running_branches.contains(&branch_name) {
-                    // The session was running at shutdown, so the pending row
-                    // may not cover the commits its turn made. Withdraw it
-                    // without asking git, which a busy boot can time out, then
-                    // withhold the branch's work (ADR 0400).
                     log_legacy!("[Recovery] Resuming active session with pending change {} for branch {} — withdrawing it and withholding its unfinished work", pending_change.id, branch_name);
                     let tid = branch_to_thread.get(&branch_name).copied();
                     if let Some(tid) = tid {
-                        // A queued change is frozen (ADR 0463), and an
-                        // unanswered read keeps it too. The re-decide still
-                        // runs: it withholds the newer work as awaiting landing.
                         let queued = crate::engine::landing_lane::queued_snapshot(
                             self.pool(),
                             tid,
@@ -1018,10 +888,6 @@ pub(crate) impl LucidosEngine {
                     continue;
                 }
             }
-            // A completed prior recovery settles only the turn it recovered, and
-            // the set stays true forever once a thread has been resumed once. So
-            // a live classification outranks it: an in-flight turn at boot has no
-            // live subprocess, whoever recovered the last one.
             if !actively_running_branches.contains(&branch_name)
                 && already_recovered.contains(&branch_name)
             {
@@ -1063,8 +929,6 @@ pub(crate) impl LucidosEngine {
                 continue;
             }
 
-            // Prevent duplicate recovery for the same thread (e.g., two branches
-            // mapping to the same thread_id from stale resume retries).
             if !recovering_threads.insert(thread_id) {
                 log_legacy!("[Recovery] Skipping duplicate recovery for thread {} (branch {}) — already recovering", thread_id, branch_name);
                 cleanup_stale_worktree(&wt_path).await;
@@ -1085,8 +949,6 @@ pub(crate) impl LucidosEngine {
                 marker_repo_id.as_ref().map(|r| format!(", repo {}", r)).unwrap_or_default(),
                 cc_session_id.as_deref().unwrap_or("none"));
 
-            // Compute requires_restart from the branch's actual files so the
-            // Apply button shows the correct label even before CC re-enters.
             let requires_restart = proposal_files_for_branch(&repo_root, &branch_name)
                 .await
                 .map(|files| files_require_restart(&files))
@@ -1097,10 +959,6 @@ pub(crate) impl LucidosEngine {
                 channel: Some(EventChannel::ClaudeCode),
                 ..crate::engine::thread_events::EventMeta::NONE
             };
-            // Emit the boundary `ResponseAborted` FIRST, so the UI shows the
-            // "Response interrupted" panel above the synthetic idle. The
-            // dispatcher classifies on `CodingAgentIdled.reason`, so the order
-            // does not affect spawn decisions.
             if !boundary_abort_already_emitted(self.pool(), thread_id).await {
                 let originating_event_id =
                     crate::engine::session_queries::latest_originating_event_id(
@@ -1112,8 +970,6 @@ pub(crate) impl LucidosEngine {
                 let abort_meta = crate::engine::thread_events::EventMeta {
                     channel: Some(EventChannel::ClaudeCode),
                     request_event_id: originating_event_id,
-                    // The host killed the previous turn; recovery only marks it.
-                    // Engine-deliberate work uses `Engine { .. }` instead.
                     actor: Some(MessageOrigin::system()),
                     ..crate::engine::thread_events::EventMeta::NONE
                 };
@@ -1154,8 +1010,6 @@ pub(crate) impl LucidosEngine {
                                 coding_agent,
                                 reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
                                 worktree_path: Some(wt_path.to_string_lossy().into_owned()),
-                                // Snapshot HEAD, so the next spawn can detect
-                                // edits made while the engine was down.
                                 worktree_head_sha:
                                     crate::engine::agent_session::external_edits_for_recovery_head_sha(&wt_path).await,
                                 bg_bash_pending: false,
@@ -1191,14 +1045,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Commit whatever the dead session left uncommitted, so it reaches the Apply
-/// card. `proposal_files_for_branch` reads committed state only, so an
-/// un-rescued edit is invisible to the proposal.
-///
-/// **The worktree stays.** Removing it here would be a session teardown
-/// reclaiming a worktree, which has exactly one owner (ADR 0035), and nothing
-/// downstream needs it gone. A failed commit is logged and nothing else: the
-/// branch is still proposed from whatever did land.
 pub(crate) async fn rescue_stale_worktree(wt: &Path) {
     if let Err(e) = commit_worktree_or_err(wt, "Coding agent changes (auto-committed)").await {
         log_legacy!(
@@ -1209,7 +1055,6 @@ pub(crate) async fn rescue_stale_worktree(wt: &Path) {
     }
 }
 
-/// Rescue historical ordinary work without offering a second landing.
 async fn preserve_historical_lane_session<'a>(
     bus: &crate::engine::event_bus::EventBus,
     repo: &Path,
@@ -1262,12 +1107,6 @@ pub(crate) async fn settle_stale_worktree(
     }
 }
 
-/// Remove the worktree of a session the user has just DISCARDED.
-///
-/// Load-bearing rather than reclamation: git refuses to delete a branch that a
-/// worktree still has checked out, so the `git branch -D` that follows cannot
-/// run until this does. ADR 0035 names this removal as one the session path
-/// keeps.
 pub(crate) async fn remove_discarded_stale_worktree(repo_root: &Path, wt: &Path) {
     let Some(wt_str) = wt.to_str() else {
         log_legacy!(
@@ -1296,29 +1135,9 @@ pub(crate) fn branch_awaits_recovery(
     idle_branches: &std::collections::HashSet<String>,
     has_pending_change: bool,
 ) -> bool {
-    // Pending change wins over an idle classification: the agent reached its
-    // idle and then waited for Apply, so the branch is settled only once the
-    // user resolves the change.
     has_pending_change || !idle_branches.contains(branch)
 }
 
-/// True when the newest `ResponseAborted` after the thread's last start is an
-/// **engine-shutdown teardown carrying a device actor**: the fingerprint of a
-/// user-initiated *Switch to new version*. A crash emits no teardown boundary,
-/// so this is false and the thread keeps the manual Continue affordance instead
-/// of auto-resuming (ADR 0045).
-///
-/// **Both halves of the fingerprint are load-bearing.** The device actor alone
-/// is not enough: `AbortCause::StaleSettle` deliberately carries the actor of
-/// the user button that exposed a stuck row. An actor-only predicate would read
-/// a user *Stop* as a *Switch* and resume work the user just abandoned.
-///
-/// The start set includes the resume starts, so once a switch abort has been
-/// consumed by a resume it stops counting. That is the loop-breaker: an
-/// auto-resume that crashes the engine again before emitting anything leaves the
-/// resume start newer than the abort, so the next boot offers manual Continue.
-///
-/// Shared with the chat resume gate, so the two definitions cannot drift.
 pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS ( \
@@ -1333,19 +1152,6 @@ pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uu
     .unwrap_or(false)
 }
 
-/// True when a `ResponseAborted` already covers the thread's **current** turn, so
-/// the recovery pass must not emit a second boundary over the top of it.
-///
-/// `/api/v1/restart` pre-emits a `ResponseAborted { actor: device }` for
-/// in-flight coding-agent threads BEFORE shutdown, so the post-restart timeline
-/// reads "Paused by restart". Emitting again here would double-render the abort
-/// panel and bury that device attribution under the system actor.
-///
-/// "Current turn" is the load-bearing half. It is why this shares
-/// [`after_latest_thread_start_sql`] with the switch fingerprint rather than
-/// spelling out a start set of its own. An abort older than the thread's newest
-/// start belongs to a turn a later resume superseded. It says nothing about
-/// whether THIS turn was interrupted.
 pub(crate) async fn boundary_abort_already_emitted(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS ( \
@@ -1357,8 +1163,6 @@ pub(crate) async fn boundary_abort_already_emitted(pool: &sqlx::PgPool, thread_i
     .bind(thread_id.to_string())
     .fetch_one(pool)
     .await
-    // A probe that could not run is UNKNOWN. Fall back to emitting: a duplicate
-    // boundary is cosmetic noise, a missing one hides a real interruption.
     .unwrap_or(false)
 }
 
@@ -1382,16 +1186,6 @@ pub(crate) async fn boundary_abort_covers_turn(
     .unwrap_or(false)
 }
 
-/// The coding-agent threads a user-initiated *Switch to new version* interrupted
-/// before their agent read anything, and that nothing has resumed since.
-///
-/// The worktree scan in `recover_orphaned_worktrees` cannot see a thread with no
-/// `SessionStarted`: it maps a branch to a thread through that event. Every
-/// other clause is the chat drain's, from the same shared fragments, so the
-/// definitions of "a live switch abort" cannot drift.
-///
-/// A thread whose agent started but read nothing is also selected, though the
-/// scan queues it too: `enqueue_switch_resume` keeps it queued once.
 fn unengaged_switch_resume_candidates_sql() -> String {
     format!(
         "SELECT e.aggregate_id::uuid AS thread_id \
@@ -1411,8 +1205,6 @@ fn unengaged_switch_resume_candidates_sql() -> String {
     )
 }
 
-/// Run [`unengaged_switch_resume_candidates_sql`]. An error yields an empty
-/// list (logged): the affected threads keep their manual Continue.
 pub(crate) async fn unengaged_switch_resume_candidates(pool: &sqlx::PgPool) -> Vec<Uuid> {
     match sqlx::query_scalar::<_, Uuid>(&unengaged_switch_resume_candidates_sql())
         .fetch_all(pool)
@@ -1430,24 +1222,6 @@ pub(crate) async fn unengaged_switch_resume_candidates(pool: &sqlx::PgPool) -> V
     }
 }
 
-/// Threads still holding an UNKEPT resume promise: a switch-teardown abort that
-/// is the thread's newest `ResponseAborted`, with no start event after it, on a
-/// thread the projection still shows `paused`. ADR 0045 records why the engine
-/// discharges its own promise, and which paths leave one unkept.
-///
-/// Three clauses, each load-bearing:
-///
-/// * `t.status = 'paused'` scopes the sweep to threads still on the interruption.
-/// * `t.state = 'active'` is the compose lifecycle, NOT the archive curtain. A
-///   composing row is a draft and a discarded one a tombstone.
-/// * [`switch_abort_unsuperseded_sql`], shared with both resume gates. Its
-///   newest-abort half is the idempotency guard: the withdrawal emits a
-///   `RecoveryAfterRestart` abort, so the thread stops matching on the next boot.
-///
-/// **Archived threads are deliberately INCLUDED**, unlike the resume drains:
-/// this revives nothing, it corrects a promise the engine could not keep. The
-/// withdrawal inherits the abort's `request_event_id` AND its `actor`, the only
-/// surviving record of who clicked switch.
 fn unresumed_switch_threads_sql() -> String {
     format!(
         "SELECT e.aggregate_id::uuid AS thread_id, \
@@ -1467,26 +1241,6 @@ fn unresumed_switch_threads_sql() -> String {
     )
 }
 
-/// Withdraw every resume promise this boot did not keep. It emits the
-/// crash-shaped `ResponseAborted { RecoveryAfterRestart }` boundary that
-/// `chat::recovery::recover_orphaned_threads` already uses for an interrupted
-/// turn nobody is resuming. The frontend's newest-abort scan then re-arms
-/// Continue on its own, because that boundary is not a switch abort (ADR 0045).
-///
-/// `resumed` is the union of what the two resume drains actuated, passed BY ID
-/// rather than re-derived from the events table. A coding-agent resume has only
-/// emitted `ContinuationRequested` by then, and that type is deliberately absent
-/// from [`THREAD_START_EVENTS_SQL`]. A query-only exclusion would therefore
-/// re-abort a thread that is resuming perfectly well.
-///
-/// Best-effort, like every boot sweep: a DB error degrades to "nothing to
-/// withdraw" rather than blocking boot. Every withdrawal is logged by id, so the
-/// sweep can never read as "resumed everything" when it did not.
-///
-/// Runs LAST in the boot sequence, after both drains: only then can it tell a
-/// broken promise from a kept one. The boundary is crash-SHAPED, not
-/// crash-ATTRIBUTED. The actor is carried over from the switch abort by
-/// [`unresumed_switch_threads_sql`].
 pub(crate) async fn settle_unresumed_switch_threads(
     pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,
@@ -1517,13 +1271,6 @@ pub(crate) async fn settle_unresumed_switch_threads(
              Withdrawing the resume promise so its Continue affordance returns",
             thread_id
         );
-        // Both fields are inherited from the switch abort rather than invented.
-        // The id keeps the two panels in one exchange, and the actor keeps them
-        // naming the same person.
-        //
-        // The fallback is unreachable, since the selection matches only a device
-        // actor. Log it rather than silently attributing the user's restart to
-        // the host.
         let actor = switch_actor
             .and_then(|v| match serde_json::from_value::<MessageOrigin>(v) {
                 Ok(origin) => Some(origin),
@@ -1539,8 +1286,6 @@ pub(crate) async fn settle_unresumed_switch_threads(
             })
             .unwrap_or_else(MessageOrigin::system);
         let meta = crate::engine::thread_events::EventMeta {
-            // `.ok()` is safe: an unparseable value only costs grouping, and the
-            // engine wrote the field itself.
             request_event_id: request_event_id.as_deref().and_then(|s| s.parse().ok()),
             actor: Some(actor),
             ..crate::engine::thread_events::EventMeta::NONE
@@ -1560,7 +1305,6 @@ pub(crate) async fn settle_unresumed_switch_threads(
     }
 }
 
-/// The events that start a turn, as an SQL list, for the two boot settles.
 macro_rules! turn_start_events {
     () => {
         "'MessageReceived','TriggerStarted','ChildThreadCompleted',\
@@ -1591,20 +1335,6 @@ const INTERRUPTED_TURN_START_SQL: &str = concat!(
            OR s.event_type <> 'ChildThreadCompleted')"
 );
 
-/// The boot step that settles every thread still `running`, once recovery has
-/// had its turn. Only [`settle_stranded_trigger_runs`] runs after it. No turn
-/// runs at boot, so each one is either a turn the restart interrupted or a
-/// status write no event backs.
-///
-/// - **An interrupted turn** gets `ResponseAborted { RecoveryAfterRestart }`,
-///   what the chat sweep emits, so it reads "Response interrupted" with a
-///   Continue. That includes a message the crash dropped before its first
-///   token, and a `ContinuationRequested` the previous process never started.
-/// - **Anything else** goes straight to `idle`. An ended turn's `running` came
-///   from the event-less parent wake, and a pending child completion runs
-///   later in boot. An abort for either would record one that never happened.
-///
-/// `recovering` holds threads the coding-agent pass is about to resume.
 pub async fn settle_orphaned_running_threads(
     pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,
@@ -1684,17 +1414,6 @@ async fn settle_one_orphaned_running_thread(
     Ok(())
 }
 
-/// Trigger roots left `idle` in the inbox over a bare `TriggerStarted`: the
-/// latest turn start, with nothing after it that ends the run. `$1` is the
-/// idle status and `$2` the inbox state.
-///
-/// Every filter keeps a decision out of the sweep's hands:
-///
-/// - `idle` skips a thread parked on the user (ADR 0259). The running settle
-///   has already ended every `running` row.
-/// - The inbox skips a thread the user archived, since an abort moves a
-///   thread to the inbox.
-/// - `TriggerCompleted` counts as an end: the run recorded its completion.
 const STRANDED_TRIGGER_RUNS_SQL: &str = concat!(
     "SELECT ts.thread_id, s.id, s.channel FROM thread_summaries ts \
      CROSS JOIN LATERAL ( \
@@ -1717,14 +1436,6 @@ const STRANDED_TRIGGER_RUNS_SQL: &str = concat!(
     ",'TriggerCompleted'))"
 );
 
-/// Settle the trigger runs a restart cut off before any activity, whose
-/// `running` an event-less write already turned to `idle`. The running settle
-/// never sees them, and the chat sweep needs activity after the start.
-///
-/// Each gets the running settle's `ResponseAborted { RecoveryAfterRestart }`.
-/// The lifecycle contract then picks the section: an unattended run archives,
-/// while a review run or a pinned one stays in the inbox (ADR 0312). Nothing
-/// resumes the run, so a crash cannot loop.
 pub async fn settle_stranded_trigger_runs(
     pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,
@@ -1774,10 +1485,6 @@ pub async fn settle_stranded_trigger_runs(
 mod open_request_tests {
     use crate::engine::open_question::OpenRequest;
 
-    /// An agent's prepared request parks its question tool. One the engine
-    /// raised parks nobody, and a plain question is no request. Words answer
-    /// only an engine-raised request that offers choices and that no
-    /// unattested caller waits on.
     #[test]
     fn a_request_is_awaited_only_when_an_agent_prepared_it() {
         let card = |request: serde_json::Value| {

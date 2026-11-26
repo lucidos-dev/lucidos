@@ -41,11 +41,9 @@ pub(crate) use external_edits::worktree_serves_branch;
 pub(crate) use reconstruct::prepend_reconstruction;
 pub(crate) use resume::{blocking_policy, lookup_pinned_cc_config_dir};
 
-// Test-only re-exports — non-test callers reach these via super::* inside agent_session.
 #[cfg(test)]
 pub(crate) use resume::CC_TURN_CLOSER_EVENTS;
 
-// Phase 7 regression: cancel = turn boundary, not terminal event.
 #[cfg(test)]
 #[path = "cancel_lifecycle_tests.rs"]
 mod cancel_lifecycle_tests;

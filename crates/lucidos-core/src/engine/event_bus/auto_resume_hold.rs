@@ -1,4 +1,4 @@
-//! The *auto-resume hold*: which children the child-to-parent fan-in must stay
+//! INVARIANT: The *auto-resume hold*: which children the child-to-parent fan-in must stay
 //! quiet about, because the engine has already decided to resume them.
 //!
 //! A coding-agent turn that dies on a transient upstream `API Error` emits a
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-/// Children whose current terminal the engine is about to auto-resume, keyed by
+/// INVARIANT: Children whose current terminal the engine is about to auto-resume, keyed by
 /// thread id. The value is the terminal's error text, which
 /// `EventBus::announce_withheld_completion` needs to announce the failure if the
 /// resume turns out not to happen.
@@ -40,21 +40,14 @@ use uuid::Uuid;
 pub struct AutoResumeHolds(Arc<Mutex<HashMap<Uuid, String>>>);
 
 impl AutoResumeHolds {
-    /// Withhold the parent's completion card for this child's current terminal.
-    ///
-    /// Re-taking a hold overwrites the previous error, because a hold describes
-    /// ONE terminal and a second call can only be a later one.
     pub fn hold(&self, thread_id: Uuid, error: String) {
         self.0.lock().unwrap().insert(thread_id, error);
     }
 
-    /// Is the fan-in standing down for this child?
     pub(crate) fn is_held(&self, thread_id: Uuid) -> bool {
         self.0.lock().unwrap().contains_key(&thread_id)
     }
 
-    /// Stop withholding, and hand back the error the held terminal carried.
-    /// `None` when nothing was held, which is every ordinary turn.
     pub fn release(&self, thread_id: Uuid) -> Option<String> {
         self.0.lock().unwrap().remove(&thread_id)
     }
@@ -91,9 +84,6 @@ mod tests {
         );
     }
 
-    /// One child's hold must not silence another's terminal. Several children of
-    /// one parent routinely fail together, which is what a network drop looks
-    /// like from here.
     #[test]
     fn a_hold_silences_only_the_child_it_names() {
         let holds = AutoResumeHolds::default();
@@ -105,8 +95,6 @@ mod tests {
         assert!(!holds.is_held(other));
     }
 
-    /// A second terminal on the same child replaces the first. The register
-    /// answers for the turn that is live, never for one already settled.
     #[test]
     fn re_holding_a_child_keeps_the_newer_error() {
         let holds = AutoResumeHolds::default();

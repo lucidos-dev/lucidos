@@ -1,25 +1,12 @@
-//! What this process was started to be, decided from argv before any Tauri or
-//! AppKit init.
-//!
-//! The one place the bundle binary reads its own flags. Anything it does not
-//! recognise is a client, so a flag that should exit early has to be named
-//! here. ADR 0471.
-
 use std::ffi::{OsStr, OsString};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LaunchRole {
-    /// `--version` / `-V`: print [`version_line`] and exit, touching nothing.
     Version,
-    /// `--service`: the headless launchd role (`desktop::run_service`).
     Service,
-    /// Fresh, bounded packaged smoke service.
     DisposableService(Vec<OsString>),
-    /// Detached relaunch diagnostics, with no Tauri or client lock.
     CaptureClientRelaunchLog,
-    /// One outcome from the detached relaunch watcher.
     RecordClientRelaunch(RelaunchOutcome),
-    /// Every other launch: the GUI client.
     Client,
 }
 
@@ -46,13 +33,7 @@ impl RelaunchOutcome {
     }
 }
 
-/// Decide the role from a full argv, executable path included.
-///
-/// Version wins over service, because a version query must never boot
-/// anything.
 pub fn launch_role(args: impl IntoIterator<Item = OsString>) -> LaunchRole {
-    // argv[0] is the executable, and a bundle could live under a directory
-    // named like a flag.
     let flags: Vec<OsString> = args.into_iter().skip(1).collect();
     let has = |flag: &str| flags.iter().any(|a| a == OsStr::new(flag));
     if has("--version") || has("-V") {
@@ -73,7 +54,6 @@ pub fn launch_role(args: impl IntoIterator<Item = OsString>) -> LaunchRole {
     }
 }
 
-/// The `--version` answer: one bare line on stdout, the gateway's shape.
 pub fn version_line() -> String {
     format!(
         "Lucidos {} (lucidos-app {})",
@@ -155,7 +135,6 @@ mod tests {
     fn every_other_launch_is_a_client() {
         assert_eq!(launch_role(argv(&[])), LaunchRole::Client);
         assert_eq!(launch_role(argv(&["--login"])), LaunchRole::Client);
-        // Not a prefix match.
         assert_eq!(launch_role(argv(&["--versions"])), LaunchRole::Client);
     }
 

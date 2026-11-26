@@ -1,5 +1,3 @@
-//! Fence browser mutations against the durable restore boundary before dispatch.
-//! Identity exemptions are deliberately independent of generation admission.
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
@@ -19,7 +17,6 @@ fn browser_shaped(headers: &HeaderMap) -> bool {
 }
 
 fn requires_generation(headers: &HeaderMap, route: &str, local: bool) -> bool {
-    // Device bootstrap establishes identity, never dispatches archived intent.
     if matches!(route, "/devices/register" | "/devices/hand-over") {
         return false;
     }

@@ -1,9 +1,3 @@
-//! Durable inputs for scoring and reporting after an eval arm is removed.
-//!
-//! One immutable file publishes the database observations and data tree together.
-//! Readers reject corrupt or mismatched snapshots instead of falling back to a
-//! potentially reused live workspace. No engine or model is invoked here.
-
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 

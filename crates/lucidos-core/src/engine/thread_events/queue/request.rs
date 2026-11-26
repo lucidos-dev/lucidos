@@ -1,4 +1,4 @@
-//! [`ThreadQueueRequest`] — the serializable description of one background
+//! INVARIANT: [`ThreadQueueRequest`] — the serializable description of one background
 //! spawn. Persisted verbatim in the `ThreadQueued` event payload and the
 //! `thread_queue.request` column so a restart can re-fire entries that never
 //! ran to completion. Images travel as content-addressed blob hashes, never
@@ -15,13 +15,8 @@ fn default_coding_agent() -> CodingAgent {
     CodingAgent::ClaudeCode
 }
 
-/// Truncation width for panel summaries.
 const SUMMARY_MAX_CHARS: usize = 120;
 
-/// Truncate a string to [`SUMMARY_MAX_CHARS`] characters for a Thread Queue
-/// panel summary, appending `…` when it was cut. Char-based (never byte-slices,
-/// so multi-byte text can't panic). Shared by [`ThreadQueueRequest::summary`]
-/// and the user-slot acquire path so the width lives in one place.
 pub fn truncate_summary(text: &str) -> String {
     let truncated: String = text.chars().take(SUMMARY_MAX_CHARS).collect();
     if text.chars().count() > SUMMARY_MAX_CHARS {
@@ -34,9 +29,6 @@ pub fn truncate_summary(text: &str) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ThreadQueueRequest {
-    /// A trigger matched a domain/thread event (`scheduler::task_runner::
-    /// fire_matching_triggers`). The trigger config is re-read at execution
-    /// time; only the firing context is captured here.
     EventTrigger {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_of: Option<RetryOf>,
@@ -49,29 +41,20 @@ pub enum ThreadQueueRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_event_id: Option<Uuid>,
     },
-    /// A trigger's cron schedule fired (`run_task_loop` / missed-grace
-    /// catch-up). Config re-read at execution time.
     Cron {
         trigger_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_of: Option<RetryOf>,
     },
-    /// `run_thread` LLM tool — chat sub-thread spawn.
     SubThread {
         prompt: String,
         child_thread_id: Uuid,
-        /// Event-trigger chain depth this spawn belongs to. Stamped by
-        /// [`ThreadQueueRequest::stamp_caller_depth`] from the submitting task,
-        /// so construction sites pass 0 and the queue fills it in (same shape
-        /// as `pre_emitted_origin` below). See the field on `EventTrigger`.
         #[serde(default)]
         depth: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_event_id: Option<Uuid>,
-        /// The child's wake mode, already resolved. Absent on a top spawn, and
-        /// on a request queued before wake modes, which stays undeclared.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wake_mode: Option<WakeMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,17 +63,11 @@ pub enum ThreadQueueRequest {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        /// The backend the child runs on, inherited from the caller's turn.
-        /// Absent on a request queued before the field existed, which lets
-        /// the model's own preferred provider decide.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
-        /// Set by the executor's prepare step once the eager
-        /// `MessageReceived` is emitted (admission time), so execution does
-        /// not re-emit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_emitted_origin: Option<Uuid>,
-        /// Who launched this thread, for the message route popover. Carried
+        /// INVARIANT: Who launched this thread, for the message route popover. Carried
         /// separately from `parent_thread_id` because a `relation: "top"`
         /// spawn has an origin but deliberately no callback linkage (see
         /// `agentic_loop_special_tool::spawn_origin`). Persisted with the
@@ -105,11 +82,9 @@ pub enum ThreadQueueRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
     },
-    /// `run_coding_agent` LLM tool — coding-agent thread spawn.
     CodingAgent {
         prompt: String,
         cc_thread_id: Uuid,
-        /// Chain depth, stamped by the queue. See `SubThread::depth`.
         #[serde(default)]
         depth: u32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -120,8 +95,6 @@ pub enum ThreadQueueRequest {
         parent_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_event_id: Option<Uuid>,
-        /// The child's wake mode, already resolved. Absent on a top spawn, and
-        /// on a request queued before wake modes, which stays undeclared.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wake_mode: Option<WakeMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,38 +105,22 @@ pub enum ThreadQueueRequest {
         app_id: Option<String>,
         #[serde(default = "default_coding_agent")]
         coding_agent: CodingAgent,
-        /// Backend model the session runs on, already validated against that
-        /// backend's picker at the tool boundary. `None` inherits the backend
-        /// default (for Claude Code, whatever its own settings resolve to).
-        ///
-        /// Persisted with the request so a spawn that queues across a restart
-        /// re-fires on the model the caller asked for. Absent on rows written
-        /// before the field existed, which is exactly the old behaviour.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
-        /// Thinking budget for the session, validated with `model` above.
-        /// `None` inherits the backend default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        /// Who launched this thread. Same split as `SubThread::origin`:
+        /// INVARIANT: Who launched this thread. Same split as `SubThread::origin`:
         /// attribution for the popover, independent of the callback linkage
         /// above. MUST be Agent-mode: `run_agent_thread_spawn` stamps
         /// `ActorMode::Agent`, and its only caller is the `run_coding_agent` tool.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
     },
-    /// Agent/Engine-mode `POST /api/v1/chat/stream` that starts a NEW thread:
-    /// cross-workspace task POSTs and `lucidos spawn-thread` CLI calls.
-    /// Executed through `process_message_with_steps` with the captured
-    /// `origin`; counts as `sub-thread` or `coding-agent` depending on
-    /// `use_coding_agent`.
     AgentChat {
         message: String,
-        /// Validated at acceptance; routing and pause reads remain execution-time work.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_addressing: Option<Box<UserAddressing>>,
         thread_id: Uuid,
-        /// Chain depth, stamped by the queue. See `SubThread::depth`.
         #[serde(default)]
         depth: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,7 +129,7 @@ pub enum ThreadQueueRequest {
         image_hashes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
-        /// Per-turn context, resolved by the submitting handler and retained
+        /// INVARIANT: Per-turn context, resolved by the submitting handler and retained
         /// verbatim across admission waits and restart recovery.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_context: Option<AppContext>,
@@ -186,7 +143,7 @@ pub enum ThreadQueueRequest {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        /// The backend this turn was pinned to, carried so a queued turn
+        /// INVARIANT: The backend this turn was pinned to, carried so a queued turn
         /// re-executes on the one it was submitted for. Dropping it here would
         /// substitute the model's own preferred provider on a requeue, which is
         /// the silent move the honoured-or-refused rule exists to prevent.
@@ -213,27 +170,20 @@ pub enum ThreadQueueRequest {
         parent_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_event_id: Option<Uuid>,
-        /// The child's wake mode, already resolved. Absent on a top spawn, and
-        /// on a request queued before wake modes, which stays undeclared.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wake_mode: Option<WakeMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
-        /// An *integrated sub-thread* spawn. Persisted with the request, so a
+        /// INVARIANT: An *integrated sub-thread* spawn. Persisted with the request, so a
         /// spawn that queues across a restart still folds into its parent.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         integrated: bool,
-        /// The trigger whose fire asked for this thread: a script fire's
-        /// `lucidos spawn-thread`, read off its verified origin token. Cost
-        /// attribution reads it from the `ThreadQueued` payload. It marks no
-        /// event, so the spawn still wakes the trigger (ADR 0137).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_trigger_id: Option<String>,
     },
 }
 
 impl ThreadQueueRequest {
-    /// Capacity bucket this request counts against.
     pub fn kind(&self) -> ThreadQueueKind {
         match self {
             Self::EventTrigger { .. } => ThreadQueueKind::EventTrigger,
@@ -252,7 +202,7 @@ impl ThreadQueueRequest {
         }
     }
 
-    /// The event-trigger chain depth this work runs at.
+    /// INVARIANT: The event-trigger chain depth this work runs at.
     ///
     /// A spawn does NOT consume a hop: work a fire hands off runs at the fire's
     /// own depth. A hop is a trigger fire, counted once in
@@ -271,7 +221,7 @@ impl ThreadQueueRequest {
         }
     }
 
-    /// Record the submitting task's chain depth on a spawn request.
+    /// INVARIANT: Record the submitting task's chain depth on a spawn request.
     ///
     /// Called once, by `ThreadQueue::submit` or durable saved-draft
     /// acceptance, awaited inline from the submitting task. Centralising it
@@ -290,13 +240,6 @@ impl ThreadQueueRequest {
         }
     }
 
-    /// Whether the thread this spawn starts can say who started it.
-    ///
-    /// A spawn's first `MessageReceived` takes its attribution from `origin`,
-    /// or synthesizes one from the parent linkage. A device does not count:
-    /// every spawn kind runs in Agent or Engine mode, where a device id
-    /// synthesizes nothing. Trigger kinds answer `true`, because a fire opens
-    /// with `TriggerStarted`, which names its trigger.
     pub fn is_attributed(&self) -> bool {
         match self {
             Self::SubThread {
@@ -318,7 +261,6 @@ impl ThreadQueueRequest {
         }
     }
 
-    /// The owning trigger, for per-trigger caps and FIFO.
     pub fn trigger_id(&self) -> Option<&str> {
         match self {
             Self::EventTrigger { trigger_id, .. } | Self::Cron { trigger_id, .. } => {
@@ -328,8 +270,6 @@ impl ThreadQueueRequest {
         }
     }
 
-    /// Pre-allocated thread id for spawn kinds; trigger kinds bind none
-    /// (each fire creates its own thread at execution).
     pub fn thread_id(&self) -> Option<Uuid> {
         match self {
             Self::SubThread {
@@ -341,9 +281,6 @@ impl ThreadQueueRequest {
         }
     }
 
-    /// Human preview shown in the Thread Queue panel. `trigger_name` is the
-    /// submit-time config name (configs can be renamed while queued; the
-    /// panel shows the name as of enqueue).
     pub fn summary(&self, trigger_name: Option<&str>) -> String {
         let truncate = truncate_summary;
         match self {
@@ -452,8 +389,6 @@ mod tests {
         assert_eq!(mk(true).kind(), ThreadQueueKind::CodingAgent);
     }
 
-    /// A request queued before integrated spawns existed carries no flag,
-    /// and re-fires as an independent spawn.
     #[test]
     fn an_old_agent_chat_row_reads_as_independent() {
         let row = serde_json::json!({
@@ -496,8 +431,6 @@ mod tests {
 
     #[test]
     fn request_serde_roundtrips_through_jsonb_shape() {
-        // The request column / event payload must survive a serialize →
-        // deserialize cycle byte-exactly enough to re-fire after restart.
         let req = ThreadQueueRequest::EventTrigger {
             retry_of: None,
             trigger_id: "trig-1".into(),
@@ -525,9 +458,6 @@ mod tests {
         }
     }
 
-    /// A queued spawn can wait behind capacity and be re-fired after a restart,
-    /// so the attribution has to survive the jsonb round-trip. Both spawn kinds,
-    /// in the top-relation shape: origin present, callback linkage absent.
     #[test]
     fn spawn_requests_round_trip_attribution_without_linkage() {
         use crate::engine::thread_events::ThreadDirection;
@@ -600,11 +530,6 @@ mod tests {
         }
     }
 
-    /// A queued spawn that crosses a restart must re-fire on the model the
-    /// caller asked for. The request is persisted verbatim in `ThreadQueued`
-    /// and in `thread_queue.request`, so a pin that does not survive this
-    /// round-trip becomes a spawn that quietly runs on the backend default
-    /// after a restart, which is the original bug wearing a different hat.
     #[test]
     fn the_model_and_effort_pins_survive_the_persistence_round_trip() {
         let cc = ThreadQueueRequest::CodingAgent {
@@ -639,9 +564,6 @@ mod tests {
         }
     }
 
-    /// A row queued before the fields existed must still deserialize, and must
-    /// come back UNPINNED rather than failing the requeue. Same back-compat
-    /// rule the `origin` field follows below.
     #[test]
     fn a_coding_agent_row_without_the_pin_fields_still_deserializes() {
         let json = serde_json::json!({
@@ -663,8 +585,6 @@ mod tests {
         }
     }
 
-    /// A spawn queued before wake modes reads as undeclared, so its child
-    /// falls back to the wake decision. A declared one survives the round trip.
     #[test]
     fn a_spawn_keeps_its_wake_mode_and_an_old_row_reads_as_undeclared() {
         for kind in ["sub-thread", "coding-agent", "agent-chat"] {
@@ -702,8 +622,6 @@ mod tests {
         }
     }
 
-    /// Rows written before the field existed must still deserialize, falling
-    /// back to the linkage-derived origin rather than failing the requeue.
     #[test]
     fn a_request_without_the_origin_field_still_deserializes() {
         let json = serde_json::json!({
@@ -735,10 +653,6 @@ mod tests {
         }
     }
 
-    /// The guard `submit` asserts. A spawn with neither an origin nor a parent
-    /// starts a thread whose first message reads Origin "Unknown". A device
-    /// does not rescue it: spawns run in Agent or Engine mode, where a device
-    /// id synthesizes no origin.
     #[test]
     fn a_spawn_is_attributed_only_by_an_origin_or_a_parent() {
         use crate::engine::thread_events::EngineReason;
@@ -777,8 +691,6 @@ mod tests {
         .is_attributed());
     }
 
-    /// A queued setup spawn can cross a restart, so its typed origin has to
-    /// survive the jsonb round-trip in every occasion.
     #[test]
     fn a_plugin_setup_origin_round_trips_through_the_request() {
         use crate::engine::thread_events::{EngineReason, PluginSetupCause, PluginSetupOccasion};

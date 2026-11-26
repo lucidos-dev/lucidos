@@ -1,16 +1,3 @@
-//! Engine-shipped reference knowhow about how Lucidos itself works.
-//!
-//! Sourced from the engine-shipped `system-knowhow/` reference set — the staged
-//! `LUCIDOS_SYSTEM_KNOWHOW_DIR` on packaged builds, `<repo>/system-knowhow/` on
-//! a dev checkout (see [`resolve_system_knowhow_dir`]) — never overrideable by a
-//! workspace's local `data/knowhow/` or the shared `~/.lucidos/knowhow/`. The
-//! LLM sees these with a `[SYSTEM-KNOWHOW: ...]` tag (vs. `[KNOW-HOW: ...]`
-//! for user-curated knowhow) so it knows the source is authoritative.
-//!
-//! On-disk format and loading match knowhow exactly, so this module reuses
-//! `KnowhowStore` for parsing and only adds the system-knowhow tag + the
-//! [`is_system_knowhow_path`] predicate that gates read-only enforcement.
-
 use std::path::{Path, PathBuf};
 
 use crate::core::knowhow::{Knowhow, KnowhowListDepth, KnowhowStore, KnowhowSummary};
@@ -19,9 +6,6 @@ use crate::core::shipped_dir::{resolve_shipped_dir, ShippedDir};
 pub struct SystemKnowhowStore;
 
 impl SystemKnowhowStore {
-    /// The top-level docs of the shipped tree: what the System Knowhow
-    /// routing list names on every turn. A file in a folder is a reference.
-    /// Its top-level doc names its id, and it costs no routing line (ADR 0413).
     pub fn load_summaries(dir: &Path) -> Vec<KnowhowSummary> {
         KnowhowStore::load_summaries(dir, KnowhowListDepth::FilesOnly)
     }
@@ -30,7 +14,6 @@ impl SystemKnowhowStore {
         KnowhowStore::load(dir, id)
     }
 
-    /// Format a knowhow entry with the `[SYSTEM-KNOWHOW: ...]` tag for LLM context injection.
     pub fn format_section(doc: &Knowhow) -> String {
         format!(
             "[SYSTEM-KNOWHOW: {}]\n{}\n[END SYSTEM-KNOWHOW]",
@@ -39,12 +22,10 @@ impl SystemKnowhowStore {
     }
 }
 
-/// Whether a workspace-relative data path refers to engine-shipped read-only knowhow.
 pub fn is_system_knowhow_path(data_path: &str) -> bool {
     data_path.starts_with("system-knowhow/")
 }
 
-/// The engine-shipped `system-knowhow/` reference set, as a bundle resource.
 pub const SYSTEM_KNOWHOW_DIR: ShippedDir = ShippedDir {
     name: "system-knowhow",
     env_var: "LUCIDOS_SYSTEM_KNOWHOW_DIR",
@@ -53,8 +34,6 @@ pub const SYSTEM_KNOWHOW_DIR: ShippedDir = ShippedDir {
                GET /api/v1/knowhow, and the data-API read path all degrade)",
 };
 
-/// Resolve the engine-shipped `system-knowhow/` directory at boot. See
-/// [`resolve_shipped_dir`] for the order and the warnings.
 pub fn resolve_system_knowhow_dir(
     env_value: Option<&str>,
     repo_root: &Path,
@@ -90,8 +69,6 @@ mod tests {
         assert!(ids.contains(&"lucidos-cli".to_string()));
     }
 
-    /// The shipped corpus lists docs only, like an app's knowhow root. A file
-    /// in a folder is a reference that still loads by its full id.
     #[test]
     fn load_summaries_lists_top_level_docs_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -147,14 +124,11 @@ mod tests {
         assert!(!is_system_knowhow_path("knowhow/lucidos/best-practices.md"));
     }
 
-    // ── resolve_system_knowhow_dir (INV-3, INV-4) ────────────────────────────
-
     #[test]
     fn resolve_prefers_the_env_var_when_the_dir_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let staged = tmp.path().join("resources/system-knowhow");
         std::fs::create_dir_all(&staged).unwrap();
-        // A repo_root that ALSO has a system-knowhow — the env var must still win.
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(repo.join("system-knowhow")).unwrap();
 
@@ -167,10 +141,9 @@ mod tests {
     #[test]
     fn resolve_env_set_but_missing_is_unavailable_and_warns_never_falls_back() {
         let tmp = tempfile::tempdir().unwrap();
-        // repo_root HAS a system-knowhow, proving we do NOT silently fall back to it.
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(repo.join("system-knowhow")).unwrap();
-        let missing = tmp.path().join("resources/system-knowhow"); // never created
+        let missing = tmp.path().join("resources/system-knowhow");
 
         let (dir, warning) =
             resolve_system_knowhow_dir(Some(missing.to_str().unwrap()), &repo, true);
@@ -184,8 +157,6 @@ mod tests {
 
     #[test]
     fn resolve_env_unset_uses_repo_root_and_is_quiet() {
-        // The dev/source-checkout path: env unset, repo_root has the dir.
-        // Byte-identical to the pre-change behavior, and no warning either way.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("system-knowhow")).unwrap();
 
@@ -211,9 +182,6 @@ mod tests {
         assert_eq!(warning, None);
     }
 
-    /// The env path is used with its original bytes — trimming is only for the
-    /// blank-detection above, so a dir whose real path carries edge whitespace
-    /// still resolves.
     #[test]
     fn resolve_preserves_whitespace_in_env_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -230,9 +198,7 @@ mod tests {
 
     #[test]
     fn resolve_unavailable_is_quiet_in_dev_but_loud_when_packaged() {
-        // No env var and no repo-root dir: dev stays silent (expected), packaged
-        // warns loudly naming the env var (INV-4).
-        let empty = tempfile::tempdir().unwrap(); // no system-knowhow subdir
+        let empty = tempfile::tempdir().unwrap();
 
         let (dev_dir, dev_warning) = resolve_system_knowhow_dir(None, empty.path(), false);
         assert_eq!(dev_dir, None);
@@ -247,22 +213,6 @@ mod tests {
     mod guard_tests {
         use super::*;
 
-        /// A system-knowhow `description:` is a ROUTING signal, not a summary. The
-        /// engine matches the user's message against it to decide which doc to
-        /// offer. Every one sits in the prompt of every turn, loaded or not.
-        ///
-        /// So it carries what the doc covers and the phrases a user might say that
-        /// should reach it, and nothing else. The doc body, one `load_knowhow`
-        /// away, carries the conclusions, the worked examples and the caveats.
-        ///
-        /// The ceiling is per-file rather than a total, because a total lets one
-        /// runaway description hide behind twenty short ones. Same reasoning as
-        /// `PER_TOOL_SCHEMA_CEILING_CHARS`.
-        ///
-        /// A RATCHET, set just above where the last trim landed: 24 files, 6,584
-        /// characters of description, mean 274, largest 362 (`thread-events`). At
-        /// 700 a description could carry a summary rather than a route. Raising it
-        /// means a description has earned the room, in a change that says why.
         #[test]
         fn system_knowhow_descriptions_stay_routing_sized() {
             const MAX_DESCRIPTION_CHARS: usize = 400;
@@ -299,9 +249,6 @@ mod tests {
             );
         }
 
-        /// Files without `---\nname: ...\n---` are silently dropped at load time,
-        /// so `load_knowhow("system-knowhow/<id>")` returns missing and the LLM
-        /// concludes the file doesn't exist.
         #[test]
         fn shipped_system_knowhow_files_all_parse() {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
@@ -319,9 +266,6 @@ mod tests {
             );
         }
 
-        /// The Workspace Prompt Footprint page's Run audit button sends a sentence
-        /// as an ordinary message. The audit root must route on its words, or the
-        /// button starts a general chat instead of the audit.
         #[test]
         fn the_footprint_page_prompt_routes_to_the_audit_root() {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
@@ -348,9 +292,6 @@ mod tests {
             }
         }
 
-        /// A shipped file in a folder is in no routing list. Only its parent doc
-        /// (`a/b.md` for `a/b/c.md`) can tell the agent the id exists. One its
-        /// parent does not name is unreachable: it ships and nothing loads it.
         #[test]
         fn every_nested_shipped_file_is_named_by_its_parent_doc() {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
@@ -438,9 +379,6 @@ mod tests {
             );
         }
 
-        /// A coding agent reads knowhow through a shell that keeps about 30 KB
-        /// of output. A shipped file over the cap is cut before the agent sees
-        /// its end. Split it into an index plus a folder of parts.
         #[test]
         fn no_shipped_knowhow_file_exceeds_the_cap() {
             use crate::core::knowhow::{knowhow_is_oversized, KNOWHOW_MAX_BYTES};

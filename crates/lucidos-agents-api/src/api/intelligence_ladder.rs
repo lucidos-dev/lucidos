@@ -1,14 +1,3 @@
-//! `GET /api/v1/intelligence-ladder`: one *ladder surface*'s effective
-//! *intelligence ladder*, and where a coding-agent thread stands on it (ADR
-//! 0500, ADR 0525). `/coding-agent/intelligence-ladder` is its old name.
-//! `POST /api/v1/intelligence-ladder/copy-from-chat` is Copy from Lucidos Agent.
-//! `POST /api/v1/intelligence-ladder/sort` is Sort by intelligence.
-//! `POST /api/v1/intelligence-ladder/default`, `/rungs` and `/remove-model`
-//! set the default rung, the rungs that are on, and take a model off.
-//!
-//! Every edit route passes the owner. An agent edits only by spending the
-//! owner's `edit-intelligence-ladder` permission (ADR 0500).
-
 use axum::{
     extract::{Query, State},
     http::HeaderMap,
@@ -38,22 +27,16 @@ use crate::runtime::CodingAgent;
 pub(super) struct LadderQuery {
     #[serde(default)]
     surface: Option<LadderSurface>,
-    /// The old name for a coding-agent `surface`.
     #[serde(default)]
     coding_agent: Option<CodingAgent>,
-    /// A coding-agent thread whose backend and current rung to report. Its
-    /// backend wins over `surface`.
     #[serde(default)]
     thread_id: Option<String>,
 }
 
-/// The implementer a thread's sessions last recorded.
 #[derive(Debug, Serialize)]
 struct CurrentIntelligenceRung {
     model: String,
     effort: String,
-    /// Index into `rungs`, whose entry says whether the pair is on. `None`
-    /// when no served rung names the pair.
     position: Option<usize>,
 }
 
@@ -61,7 +44,6 @@ struct CurrentIntelligenceRung {
 pub(super) struct LadderResponse {
     #[serde(flatten)]
     ladder: IntelligenceLadder,
-    /// Absent without a thread, or when it recorded no model and effort.
     current: Option<CurrentIntelligenceRung>,
     other_backend_ladders: Vec<IntelligenceLadder>,
 }
@@ -82,8 +64,6 @@ async fn intelligence_ladder_route(
     Ok(Json(read_ladder(&state, surface, thread_id).await))
 }
 
-/// The ladder of `surface`. A thread adds its current rung and the ladders
-/// of the other backends.
 pub(super) async fn read_ladder(
     state: &AppState,
     surface: LadderSurface,
@@ -119,9 +99,6 @@ pub(super) async fn read_ladder(
     }
 }
 
-/// Whether a request comes from an agent rather than a person: a Lucidos
-/// subprocess, or an origin that declares agent mode. Only an agent's pick
-/// is held to the ladder.
 pub(crate) fn is_agent_caller(
     headers: &HeaderMap,
     origin: Option<&crate::engine::thread_events::MessageOrigin>,
@@ -132,7 +109,6 @@ pub(crate) fn is_agent_caller(
     ) || origin.is_some_and(|o| o.mode() == crate::engine::thread_events::ActorMode::Agent)
 }
 
-/// [`intelligence_ladder::check_agent_pick`] as an HTTP refusal.
 pub(crate) async fn refuse_off_ladder(
     state: &AppState,
     surface: LadderSurface,
@@ -150,32 +126,25 @@ pub(crate) async fn refuse_off_ladder(
     .map_err(|e| ApiError::bad_request(e).with_reason(intelligence_ladder::OFF_LADDER_REASON))
 }
 
-/// Who may edit a ladder: the owner, or an agent that spends the owner's
-/// `edit-intelligence-ladder` permission (ADR 0750).
 pub(crate) enum LadderEditGate {
     Act {
         actor: MessageOrigin,
-        /// An agent's spent once grant, which a refused edit gives back.
         spent: Option<SpentOnce>,
     },
-    /// An agent in this thread holds no live permission.
     NeedsPermission(uuid::Uuid),
 }
 
-/// A once grant an agent's thread spent on a ladder edit.
 pub(crate) struct SpentOnce {
     thread: uuid::Uuid,
     permission: uuid::Uuid,
 }
 
 impl SpentOnce {
-    /// Give the grant back: the edit it paid for changed nothing.
     pub(crate) async fn restore(self, state: &AppState) -> Result<(), ApiError> {
         restore_spent(&state.engine.event_bus, self.thread, self.permission).await
     }
 }
 
-/// Gate one ladder edit. An unattested caller waits on the owner's card.
 pub(crate) async fn ladder_edit_gate(
     state: &AppState,
     headers: &HeaderMap,
@@ -206,10 +175,6 @@ pub(crate) async fn ladder_edit_gate(
     }
 }
 
-/// Run one ladder edit behind [`ladder_edit_gate`], answering its result as
-/// JSON. An agent with no permission gets a prepared card quoting `reason`,
-/// and runs its command again once the owner allows it. A refused edit
-/// changes nothing, so it gives back the once grant it spent.
 async fn gated_edit<T, F, Fut>(
     state: &AppState,
     headers: &HeaderMap,
@@ -235,8 +200,6 @@ where
     }
 }
 
-/// Prepare the owner's ladder card quoting `reason`, and answer the request
-/// id the caller asks with. Nothing changes until the owner allows it.
 pub(crate) async fn ask_to_edit_ladder(
     state: &AppState,
     caller: uuid::Uuid,
@@ -248,7 +211,6 @@ pub(crate) async fn ask_to_edit_ladder(
 
 #[derive(Debug, Serialize)]
 struct IntelligenceRungsNowOn {
-    /// The rungs now on, least to most intelligent.
     #[serde(rename = "rungs")]
     intelligence_rungs: Vec<IntelligenceRung>,
 }
@@ -261,14 +223,11 @@ impl From<Vec<IntelligenceRung>> for IntelligenceRungsNowOn {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CopyFromChatRequest {
-    /// The coding-agent surface whose override the copy writes.
     surface: LadderSurface,
-    /// Why an agent edits. The owner's card quotes it.
     #[serde(default)]
     reason: String,
 }
 
-/// `POST /api/v1/intelligence-ladder/copy-from-chat`: Copy from Lucidos Agent.
 async fn copy_from_chat_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -290,13 +249,11 @@ async fn copy_from_chat_route(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SortRequest {
-    /// The surface whose rungs to sort.
     surface: LadderSurface,
     #[serde(default)]
     reason: String,
 }
 
-/// `POST /api/v1/intelligence-ladder/sort`: Sort by intelligence.
 async fn sort_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -325,7 +282,6 @@ struct SetDefaultRequest {
     reason: String,
 }
 
-/// `POST /api/v1/intelligence-ladder/default`: set the default rung.
 async fn set_default_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -349,14 +305,12 @@ async fn set_default_route(
 #[derive(Debug, Deserialize)]
 struct SetIntelligenceRungsRequest {
     surface: LadderSurface,
-    /// Exactly the rungs to turn on, least to most intelligent.
     #[serde(rename = "rungs")]
     intelligence_rungs: Vec<IntelligenceRung>,
     #[serde(default)]
     reason: String,
 }
 
-/// `POST /api/v1/intelligence-ladder/rungs`: turn on exactly these rungs.
 async fn set_intelligence_rungs_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -385,8 +339,6 @@ struct RemoveModelRequest {
     reason: String,
 }
 
-/// `POST /api/v1/intelligence-ladder/remove-model`: turn off every rung that
-/// runs one model.
 async fn remove_model_route(
     State(state): State<AppState>,
     headers: HeaderMap,

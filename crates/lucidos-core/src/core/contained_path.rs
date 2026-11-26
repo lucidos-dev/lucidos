@@ -1,19 +1,11 @@
-//! Symlink containment for a path joined under a mount root.
-//!
-//! [`crate::core::is_path_traversal`] is a string check. It refuses `..` and an
-//! absolute path, but it cannot see a symlink, so `artifacts/leak -> ~/.ssh/id`
-//! passes it. These helpers resolve the path on disk and refuse one that lands
-//! outside its root.
-
 use std::path::{Path, PathBuf};
 
-/// `root.join(rel)`, or `None` when that path resolves outside `root`.
 pub fn join_contained(root: &Path, rel: &str) -> Option<PathBuf> {
     let path = root.join(rel);
     (!resolves_outside(root, &path)).then_some(path)
 }
 
-/// `data_dir.join(rel)`, or `None` when a symlink carries it out of the
+/// INVARIANT: `data_dir.join(rel)`, or `None` when a symlink carries it out of the
 /// top-level tree it is filed under. A link in `artifacts/` must reach neither
 /// a host file nor `data/.env`. The tree itself must not link out of `data/`:
 /// only the whole `data/` moves, never one tree alone.
@@ -29,21 +21,8 @@ pub fn join_data_contained(data_dir: &Path, rel: &str) -> Option<PathBuf> {
     join_contained(&tree_root, within)
 }
 
-/// How many dangling links one check follows before it calls the path an
-/// escape. A loop of links never resolves, so it needs a bound.
 const MAX_DANGLING_HOPS: u8 = 8;
 
-/// Whether `path`, a path under `root`, reaches outside `root` once every
-/// symlink on it resolves.
-///
-/// The deepest part of `path` that exists decides. So a write target with
-/// missing directories is judged by the directory it would land in. A link
-/// that does not resolve is judged by where it points, since a write would
-/// follow it there.
-///
-/// Both sides resolve, because the workspace itself may sit behind a symlink
-/// (`/var` is `/private/var` on macOS). A root that does not exist holds
-/// nothing to escape through, unless the root itself is a dangling link.
 pub fn resolves_outside(root: &Path, path: &Path) -> bool {
     let Ok(canonical_root) = root.canonicalize() else {
         return std::fs::symlink_metadata(root).is_ok();
@@ -52,7 +31,7 @@ pub fn resolves_outside(root: &Path, path: &Path) -> bool {
 }
 
 fn escapes(canonical_root: &Path, path: &Path, hops_left: u8) -> bool {
-    // A trailing `/` or `/.` would make the lstat below follow a final link.
+    // INVARIANT: A trailing `/` or `/.` would make the lstat below follow a final link.
     let path: PathBuf = path.components().collect();
     let path = path.as_path();
     if climbs_out_of_missing_dir(path) {
@@ -78,9 +57,6 @@ fn escapes(canonical_root: &Path, path: &Path, hops_left: u8) -> bool {
     true
 }
 
-/// Whether a `..` follows a directory that does not exist yet. Nothing can
-/// resolve it now, and `create_dir_all` would build the missing part and
-/// then climb out of it. Only a link target carries `..` this far.
 fn climbs_out_of_missing_dir(path: &Path) -> bool {
     let mut prefix = PathBuf::new();
     let mut missing = false;
@@ -152,7 +128,6 @@ mod tests {
         assert!(join_contained(&f.root, "shot.png").is_none());
     }
 
-    /// A missing file is not a security error, even behind a link.
     #[test]
     fn a_dangling_link_that_stays_inside_the_root_is_allowed() {
         let f = fixture();
@@ -194,7 +169,6 @@ mod tests {
         assert!(join_contained(&f.root, "alias.md").is_some());
     }
 
-    /// The root resolving elsewhere must not make every file look outside.
     #[test]
     fn a_root_behind_a_symlink_still_serves_its_own_files() {
         let f = fixture();

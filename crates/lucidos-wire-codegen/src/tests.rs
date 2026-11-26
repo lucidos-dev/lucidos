@@ -9,10 +9,6 @@ mod guard_tests {
         super::super::load_ir(&repo_root().join(SOURCE_ROOT))
     }
 
-    // ---------------------------------------------------------------------------
-    // Unit tests over the reader
-    // ---------------------------------------------------------------------------
-
     mod unit {
         use super::*;
 
@@ -30,9 +26,6 @@ mod guard_tests {
                 .unwrap_or_else(|| panic!("no `{name}` field on `{}`", v.name))
         }
 
-        /// The one rule the whole generator turns on. The wire omits a key when
-        /// serde may skip it, and an old row predates any field carrying a
-        /// `default`. Both read as absent, so both are `?`.
         #[test]
         fn optionality_follows_the_serde_attributes() {
             let ir = load_ir();
@@ -52,7 +45,6 @@ mod guard_tests {
             );
         }
 
-        /// `Option<T>` is `T`, and the property carries the absence instead.
         #[test]
         fn option_never_becomes_a_nullable_type() {
             let ir = load_ir();
@@ -81,13 +73,6 @@ mod guard_tests {
             assert!(rendered.contains("  resets_at: string | null;"));
         }
 
-        /// A field the snapshot endpoint drops has to be optional on the wire. Rust
-        /// requires it, but the lazy-fetch path would read a promise nobody keeps.
-        ///
-        /// Driven off `STRIPPED_FIELDS` rather than a hand-listed few, so a strip
-        /// added to that table cannot arrive uncovered. `variant` and `field` panic
-        /// on a name that resolves to nothing, which is the other half: an entry
-        /// naming a field no variant has fails here rather than generating quietly.
         #[test]
         fn stripped_fields_are_optional_despite_being_required_in_rust() {
             let ir = load_ir();
@@ -101,9 +86,6 @@ mod guard_tests {
             }
         }
 
-        /// A stamped marker is optional too, and belongs to a variant that exists.
-        /// Its own field is absent from Rust by definition, so `wire_fields` is
-        /// what has to carry it.
         #[test]
         fn stamped_markers_reach_the_wire_as_optional_fields() {
             let ir = load_ir();
@@ -122,8 +104,6 @@ mod guard_tests {
             }
         }
 
-        /// Every variant carries the three `EventMeta` fields, including one with
-        /// no `actor` of its own.
         #[test]
         fn every_wire_member_carries_the_meta_fields() {
             let ir = load_ir();
@@ -142,8 +122,6 @@ mod guard_tests {
             assert!(actor.optional, "a merged meta field is always optional");
         }
 
-        /// A variant that declares `actor` itself keeps its own, rather than
-        /// gaining a second copy from the meta merge.
         #[test]
         fn a_variant_with_its_own_actor_is_not_given_a_second_one() {
             let ir = load_ir();
@@ -155,7 +133,6 @@ mod guard_tests {
             );
         }
 
-        /// Renaming rules produce the wire strings the frontend already reads.
         #[test]
         fn rename_all_rules_match_the_wire() {
             let snake = apply_rename_all("MainLlm", Some("snake_case")).unwrap();
@@ -170,8 +147,6 @@ mod guard_tests {
             assert!(apply_rename_all("X", Some("Train-Case")).is_err());
         }
 
-        /// The transient split is read from `is_persisted`, so the two cannot
-        /// disagree about which events the DB keeps.
         #[test]
         fn the_transient_set_comes_from_is_persisted() {
             let ir = load_ir();
@@ -186,9 +161,6 @@ mod guard_tests {
             );
         }
 
-        /// An unregistered payload type must fail loudly. It is the only thing
-        /// standing between a new supporting type and a frontend that cannot name
-        /// it.
         #[test]
         fn an_unregistered_type_fails_the_generator() {
             let ty: syn::Type = syn::parse_str("Option<SomeBrandNewThing>").unwrap();
@@ -232,8 +204,6 @@ mod guard_tests {
         assert!(parse_enum(&item).is_err());
     }
 
-    /// A `#[serde(skip)]` variant has no wire form, so no generated union lists
-    /// it. `SideEffectCategory::SecretRead` is the case that must never reach TS.
     #[test]
     fn a_skipped_variant_never_reaches_the_wire_union() {
         let unit: syn::ItemEnum = syn::parse_str(
@@ -256,8 +226,6 @@ mod guard_tests {
         assert_eq!(names, ["Kept"]);
     }
 
-    /// `./scripts/codegen.sh` is defined once, in the core crate. The header
-    /// names whatever that constant says.
     #[test]
     fn the_header_names_the_core_regenerate_command() {
         let ir = load_ir();
@@ -265,8 +233,6 @@ mod guard_tests {
         assert!(generate_typescript(&ir).contains(&format!("// Regenerate: {}\n", ir.regenerate)));
     }
 
-    /// Rendering wire types must compile no workspace crate. A path dependency
-    /// here would also put the reader under ADR 0738's dependent rules.
     #[test]
     fn the_reader_depends_on_no_workspace_crate() {
         let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))

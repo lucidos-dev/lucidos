@@ -8,15 +8,19 @@ import { TrashSection, useTrashInventory } from './TrashSection';
 
 vi.mock('../../api/client/control', () => ({
   listTrash: vi.fn(), restoreTrash: vi.fn(), abandonTrashStaging: vi.fn(),
-  freezeEmptyTrash: vi.fn(), confirmEmptyTrash: vi.fn(),
+  freezeEmptyTrash: vi.fn(), confirmEmptyTrash: vi.fn(), finishTrashDelete: vi.fn(),
 }));
 vi.mock('../../store/store', () => ({
-  showConfirm: vi.fn(), showToast: vi.fn(), scaledDurationMs: (ms: number) => ms,
+  showConfirm: vi.fn(), showToast: vi.fn(), removeToast: vi.fn(), scaledDurationMs: (ms: number) => ms,
 }));
 
 const archive: api.TrashEntry = {
   id: 'archive', name: 'Archived workspace', status: 'restoring',
-  bytes: 4096, restore_available: true, warning: 'Restore interrupted',
+  bytes: 4096, restore_available: true, finish_available: false, database_backup: true, warning: 'Restore interrupted',
+};
+const interrupted: api.TrashEntry = {
+  id: 'workspace-personal', name: 'personal', status: 'prepared',
+  bytes: 4096, restore_available: true, finish_available: true, database_backup: true, warning: null,
 };
 const changed = vi.fn().mockResolvedValue(undefined);
 let host: HTMLDivElement;
@@ -86,5 +90,45 @@ it('sends the frozen Empty Trash phrase and reports skipped entries', async () =
   await click('Empty Trash');
   expect(showConfirm).toHaveBeenCalledWith(expect.any(String), 'Empty Trash', expect.objectContaining({ variant: 'danger' }));
   expect(api.confirmEmptyTrash).toHaveBeenCalledWith(batch.id, batch.phrase);
-  expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Archive changed'), 'error');
+  await vi.waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Archive changed'), 'error'));
+});
+
+it('finishes an interrupted delete only after a danger confirmation and names the result', async () => {
+  vi.mocked(api.listTrash).mockResolvedValue([interrupted]);
+  await mount();
+  vi.mocked(showConfirm).mockResolvedValueOnce(false);
+  await click('Finish delete');
+  expect(api.finishTrashDelete).not.toHaveBeenCalled();
+  expect(showConfirm).toHaveBeenLastCalledWith(expect.any(String), 'Finish delete', expect.objectContaining({ variant: 'danger' }));
+
+  await click('Finish delete');
+  expect(api.finishTrashDelete).toHaveBeenCalledWith('workspace-personal');
+  await vi.waitFor(() => expect(showToast).toHaveBeenCalledWith('Deleted "personal".', 'success'));
+
+  vi.mocked(api.finishTrashDelete).mockRejectedValueOnce(new Error('could not copy the database, so nothing was dropped'));
+  await click('Finish delete');
+  await vi.waitFor(() => expect(showToast).toHaveBeenCalledWith('could not copy the database, so nothing was dropped', 'error'));
+});
+
+it('says Finish delete keeps no database copy when the workspace has no backup', async () => {
+  vi.mocked(api.listTrash).mockResolvedValue([{ ...interrupted, database_backup: false }]);
+  await mount();
+  vi.mocked(showConfirm).mockResolvedValueOnce(false);
+  await click('Finish delete');
+  expect(showConfirm).toHaveBeenLastCalledWith(expect.stringContaining('no copy'), 'Finish delete', expect.anything());
+});
+
+it('says Finish delete keeps a database copy when the workspace has one', async () => {
+  vi.mocked(api.listTrash).mockResolvedValue([interrupted]);
+  await mount();
+  vi.mocked(showConfirm).mockResolvedValueOnce(false);
+  await click('Finish delete');
+  expect(showConfirm).toHaveBeenLastCalledWith(expect.stringContaining('keeps a copy'), 'Finish delete', expect.anything());
+});
+
+it('offers Finish delete only for an interrupted delete', async () => {
+  vi.mocked(api.listTrash).mockResolvedValue([archive]);
+  await mount();
+  await vi.waitFor(() => expect(host.textContent).toContain('Archived workspace'));
+  expect(host.textContent).not.toContain('Finish delete');
 });

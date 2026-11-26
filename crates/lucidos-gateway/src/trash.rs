@@ -1,18 +1,18 @@
-//! Durable delete journal. A directory move must succeed before database teardown.
 use crate::{cleanup_process::CleanupCommand, registry::Workspace, BoxError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Safe projection: the stored Workspace also carries credentials and must
-/// never be serialized directly to the picker.
 #[derive(Serialize)]
 pub struct Listing {
     pub id: String,
     pub name: String,
     pub status: String,
     pub restore_available: bool,
-    /// The journaled workspace is machine-made, so an agent may restore it.
     pub machine_made: bool,
+    /// An interrupted workspace delete that "Finish delete" can complete.
+    pub finish_available: bool,
+    /// Whether Trash holds, or "Finish delete" will make, a database copy.
+    pub database_backup: bool,
     pub bytes: Option<u64>,
     pub warning: Option<String>,
 }
@@ -45,6 +45,8 @@ pub fn list(app_data: &Path) -> Result<Vec<Listing>, BoxError> {
                 status: "legacy".into(),
                 restore_available: false,
                 machine_made: false,
+                finish_available: false,
+                database_backup: false,
                 bytes: None,
                 warning: None,
             };
@@ -119,10 +121,20 @@ pub fn list(app_data: &Path) -> Result<Vec<Listing>, BoxError> {
                                 }
                                 warning.push_str("Linked worktrees restore with detached HEADs at saved commits; reattach branches explicitly. Archives without saved commits require manual recovery.");
                             }
+                            row.finish_available = entry.workspace.is_some()
+                                && matches!(
+                                    entry.phase,
+                                    Phase::Prepared | Phase::Moved | Phase::DatabaseDropped
+                                );
                             row.machine_made = entry
                                 .workspace
                                 .as_ref()
                                 .is_some_and(|ws| ws.cleanup.origin.is_machine_made());
+                            row.database_backup = entry.dump_ready
+                                || entry.workspace.as_ref().is_some_and(|ws| {
+                                    ws.cleanup.backs_up_database_on_delete()
+                                        && matches!(entry.phase, Phase::Prepared | Phase::Moved)
+                                });
                             row.name = entry
                                 .workspace
                                 .as_ref()
@@ -204,8 +216,6 @@ pub struct Recovery {
     snapshots: Option<(u64, u64)>,
 }
 
-/// Never replace even an empty destination directory. Both supported platforms
-/// provide an atomic exclusive rename; ordinary rename overwrites empty dirs.
 pub(crate) fn rename_exclusive(source: &Path, target: &Path) -> Result<(), BoxError> {
     use std::os::unix::ffi::OsStrExt;
     let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
@@ -228,8 +238,6 @@ pub(crate) fn rename_exclusive(source: &Path, target: &Path) -> Result<(), BoxEr
     Ok(())
 }
 
-// Probe the exact rename primitive before publishing a journal or touching a database.
-// Cross-device and unsupported filesystems refuse cleanup while the original stays usable.
 fn preflight_folder_move(source: &Path, trash: &Path) -> Result<(), BoxError> {
     let parent = source.parent().ok_or("workspace has no parent")?;
     let mount = cleanup_mount_identity(source)?;
@@ -258,8 +266,6 @@ fn cleanup_mount_identity(path: &Path) -> Result<u64, BoxError> {
 fn cleanup_mount_identity(path: &Path) -> Result<u64, BoxError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    // O_PATH pins the kernel-resolved mount, including stacked and bind mounts.
-    // fdinfo predates statx mount IDs and needs no filesystem file-handle support.
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
@@ -292,8 +298,6 @@ fn folder_identity(path: &Path) -> Result<(u64, u64), BoxError> {
 }
 
 impl Entry {
-    /// An active journal owns a registration until explicit recovery or completion.
-    /// Match the registration, not the new caller: retries retain the original actor.
     pub(crate) fn find_workspace(
         parent: &Path,
         workspace: &Workspace,
@@ -331,7 +335,6 @@ impl Entry {
         Ok(found)
     }
 
-    /// Locate the original attempt rather than preparing another journal after a crash.
     pub(crate) fn find_audit(
         parent: &Path,
         audit: &crate::cleanup_audit::Audit,
@@ -362,8 +365,6 @@ impl Entry {
         Ok(found)
     }
 
-    /// Prove the rename succeeded, including a crash before saving Moved.
-    /// Never create the original path while inspecting an interrupted deletion.
     pub(crate) fn reconcile_moved(&mut self, root: &Path) -> Result<(), BoxError> {
         if !matches!(
             self.phase,
@@ -387,17 +388,12 @@ impl Entry {
         Ok(())
     }
 
-    /// While Prepared is durable, deletion has not touched the database or snapshots.
-    /// Only the exact original folder can cancel this preparation. Retain all
-    /// partial recovery artifacts for inspection and explicit Empty Trash.
     pub fn cancel_prepared(&mut self, root: &Path) -> Result<(), BoxError> {
         if self.phase != Phase::Prepared || self.source_identity.is_none() {
             return Err("prepared deletion no longer has its original folder".into());
         }
         match std::fs::symlink_metadata(root.join("workspace")) {
             Ok(_) => {
-                // A crash can land between the rename and saving Moved. No
-                // database or snapshot operation can have begun at this point.
                 if self.source_identity != Some(folder_identity(&root.join("workspace"))?) {
                     return Err("prepared Trash folder identity changed".into());
                 }
@@ -441,8 +437,6 @@ impl Entry {
         ))
     }
 
-    /// Persist identity before database work or folder publication. Retrying a
-    /// rename is allowed only for the exact inode frozen before that rename.
     pub fn begin_recovery(&mut self, root: &Path) -> Result<(), BoxError> {
         if !self.source_repositories.is_empty() {
             let output = cleanup_git_command()?
@@ -549,8 +543,6 @@ impl Entry {
         repair_audit(root, &self.phase, self.audit.as_ref())
     }
 
-    /// The dump callback must succeed before any move. Its output is synced
-    /// before returning, so a committed move never outruns its recovery copy.
     pub fn prepare(
         parent: &Path,
         workspace: &Workspace,
@@ -615,17 +607,37 @@ impl Entry {
         std::fs::File::open(parent)?.sync_all()?;
         entry.backup_worktree_records(&root)?;
         dump(&root.join("database.dump"))?;
+        entry.record_dump(&root)?;
+        Ok((entry, root))
+    }
+
+    /// Commit `database.dump` when present. Absence means no copy was wanted.
+    fn record_dump(&mut self, root: &Path) -> Result<(), BoxError> {
         match std::fs::symlink_metadata(root.join("database.dump")) {
             Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
                 std::fs::File::open(root.join("database.dump"))?.sync_all()?;
-                entry.dump_ready = true;
-                entry.save(&root)?;
+                self.dump_ready = true;
+                self.save(root)
             }
-            Ok(_) => return Err("invalid database recovery copy".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+            Ok(_) => Err("invalid database recovery copy".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
         }
-        Ok((entry, root))
+    }
+
+    /// Commit a fresh dump of the still-present database in place of a copy
+    /// an interrupted delete never committed.
+    pub fn adopt_dump(&mut self, root: &Path, fresh: &Path) -> Result<(), BoxError> {
+        if self.dump_ready || !matches!(self.phase, Phase::Prepared | Phase::Moved) {
+            return Err("this Trash entry cannot take a new database recovery copy".into());
+        }
+        std::fs::rename(fresh, root.join("database.dump"))?;
+        std::fs::File::open(root)?.sync_all()?;
+        self.record_dump(root)?;
+        if !self.dump_ready {
+            return Err("invalid database recovery copy".into());
+        }
+        Ok(())
     }
 
     pub fn move_folder(&mut self, root: &Path) -> Result<(), BoxError> {
@@ -635,7 +647,6 @@ impl Entry {
             return Err("workspace changed after deletion preparation".into());
         }
         rename_exclusive(&self.original_dir, &root.join("workspace"))?;
-        // Sync both sides before allowing a database drop.
         std::fs::File::open(root)?.sync_all()?;
         if let Some(parent) = self.original_dir.parent() {
             std::fs::File::open(parent)?.sync_all()?;
@@ -644,9 +655,23 @@ impl Entry {
         self.save(root)
     }
 
-    /// Preserve indexes, HEADs and reflogs before Git prunes administrative
-    /// records. The directory layout is git-worktrees/<repository index>/<id>;
-    /// repository indexes refer to the journal's frozen source_repositories.
+    /// Redo a worktree backup an interrupted delete left without its
+    /// `complete` marker. Only a Prepared entry still has the folder in place.
+    pub fn complete_worktree_backup(&self, root: &Path) -> Result<(), BoxError> {
+        let backup = root.join("git-worktrees");
+        if self.source_repositories.is_empty() || backup.join("complete").is_file() {
+            return Ok(());
+        }
+        if self.phase != Phase::Prepared {
+            return Err("worktree recovery copy is incomplete".into());
+        }
+        match std::fs::remove_dir_all(&backup) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            other => other?,
+        }
+        self.backup_worktree_records(root)
+    }
+
     fn backup_worktree_records(&self, root: &Path) -> Result<(), BoxError> {
         if self.source_repositories.is_empty() {
             return Ok(());
@@ -685,17 +710,12 @@ impl Entry {
             }
             std::fs::File::open(&destination)?.sync_all()?;
         }
-        // A partial copy must never authorize pruning after recovery.
         std::fs::File::create(backup.join("complete"))?.sync_all()?;
         std::fs::File::open(&backup)?.sync_all()?;
         std::fs::File::open(root)?.sync_all()?;
         Ok(())
     }
 
-    /// Replay administrative records only after the workspace folder has been
-    /// returned to its original location, detaching HEAD at the archived commit.
-    /// Never reset branches or replace an occupied record. Keep the original
-    /// symbolic HEAD in the archive until the user explicitly empties Trash.
     pub fn restore_worktrees(&self, root: &Path) -> Result<(), BoxError> {
         if self.source_repositories.is_empty() {
             return Ok(());
@@ -723,8 +743,6 @@ impl Entry {
                     return Err("invalid worktree recovery record".into());
                 }
                 let destination = repository.join("worktrees").join(record.file_name());
-                // Validate and detach before publication. Git's branch check is
-                // not serialized with another checkout, so never replay a symref.
                 let staging = tempfile::tempdir()?;
                 let staged = staging.path().join("record");
                 copy_git_record(&record.path(), &staged)?;
@@ -736,8 +754,6 @@ impl Entry {
                 }
                 std::fs::write(staged.join("HEAD"), &commit)?;
                 std::fs::File::open(staged.join("HEAD"))?.sync_all()?;
-                // Archive metadata must not become live Git administration:
-                // a later cleanup needs to create its own saved identity.
                 std::fs::remove_file(staged.join("lucidos-recovery-head"))?;
                 match std::fs::symlink_metadata(&destination) {
                     Ok(_) => {
@@ -779,8 +795,6 @@ impl Entry {
             }
             let parent = destination.parent().ok_or("missing worktree parent")?;
             std::fs::create_dir_all(parent)?;
-            // create_dir is exclusive: a concurrent Git operation wins rather
-            // than having its administration replaced by our recovery copy.
             let staging = tempfile::tempdir_in(parent)?;
             let staged = staging.path().join("record");
             copy_git_record(&saved, &staged)?;
@@ -795,9 +809,6 @@ impl Entry {
         Ok(())
     }
 
-    /// Git only removes stale administrative records here. Branch refs and
-    /// their unique commits remain available for recovery; prepare also saves
-    /// the records needed to recover staged changes.
     pub fn prune_worktrees(&self, root: &Path) -> Result<(), BoxError> {
         if self.phase != Phase::DatabaseDropped {
             return Err("worktree pruning requires completed database teardown".into());
@@ -830,8 +841,6 @@ impl Entry {
     }
 }
 
-/// Preserve the resolved HEAD with its history and every index conflict stage.
-/// Gitlinks refer to another repository and are not local blob objects.
 fn backup_index_objects(record: &Path, destination: &Path) -> Result<(), BoxError> {
     use std::io::Write;
     let head = cleanup_git_command()?
@@ -955,7 +964,6 @@ fn copy_git_record(source: &Path, destination: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Packaged gateways may start without the user's shell PATH.
 fn cleanup_git_command() -> Result<std::process::Command, BoxError> {
     let path = resolve_cleanup_git(std::env::var_os("PATH").as_deref())?;
     Ok(std::process::Command::new(path))
@@ -998,8 +1006,6 @@ fn resolve_cleanup_git_in(
         })
 }
 
-/// Branches whose linked checkout records will be archived and pruned.
-/// Read Git's administrative HEAD rather than infer a ref from the folder name.
 pub(crate) fn retained_branches(workspace: &Path) -> Result<Vec<String>, BoxError> {
     use std::os::unix::ffi::OsStringExt;
     let repositories = source_repositories(workspace)?;
@@ -1037,8 +1043,6 @@ pub(crate) fn retained_branches(workspace: &Path) -> Result<Vec<String>, BoxErro
     Ok(branches.into_iter().collect())
 }
 
-/// Read git's own common-directory identity before moving linked worktrees.
-/// Never guess an external repository from a workspace name or branch prefix.
 fn source_repositories(workspace: &Path) -> Result<Vec<PathBuf>, BoxError> {
     use std::os::unix::ffi::OsStringExt;
     let mut candidates = vec![workspace.to_owned()];
@@ -1077,8 +1081,6 @@ fn source_repositories(workspace: &Path) -> Result<Vec<PathBuf>, BoxError> {
             bytes.pop();
         }
         let repository = PathBuf::from(std::ffi::OsString::from_vec(bytes)).canonicalize()?;
-        // Internal repositories move into Trash; external ones stay in place.
-        // Relative paths preserve the identity across the move.
         let workspace = workspace.canonicalize()?;
         repositories.insert(
             repository
@@ -1106,8 +1108,6 @@ fn publish_prepared_entry(pending: tempfile::TempDir) -> Result<PathBuf, BoxErro
     Ok(root)
 }
 
-// Legacy deletions used <workspace-id>-YYYYMMDD-HHMMSS without journals.
-// Only that explicit shape may bypass modern journal validation.
 pub(crate) fn legacy_folder(parent: &Path, name: &str) -> Result<bool, BoxError> {
     let mut parts = name.rsplitn(3, '-');
     let time = parts.next().unwrap_or("");
@@ -1133,12 +1133,8 @@ struct BlockedIndex {
     resources: BlockedResources,
 }
 
-// A gateway exclusively owns its app-data directory. Journals remain authoritative;
-// writers serialize cache invalidation with readers, including failed writes.
 static BLOCKED_RESOURCES: std::sync::Mutex<Option<BlockedIndex>> = std::sync::Mutex::new(None);
 
-/// Interrupted deletions block engine startup and id reuse until recovered.
-/// Malformed journals fail closed rather than recreate an empty database.
 pub fn blocks(parent: &Path, id: &str) -> Result<bool, BoxError> {
     use std::os::unix::fs::MetadataExt;
     let mut cache = BLOCKED_RESOURCES.lock().unwrap();
@@ -1197,7 +1193,6 @@ fn scan_blocked_resources(parent: &Path) -> Result<BlockedResources, BoxError> {
             continue;
         }
         let path = item.path().join("entry.json");
-        // Older deleted folders predate the journal format.
         if !path.try_exists()? {
             continue;
         }
@@ -1478,7 +1473,6 @@ mod tests {
             std::fs::read_to_string(source.join("retained")).unwrap(),
             "data"
         );
-        // Simulate the folder publication landing before the journal write.
         entry.phase = Phase::Prepared;
         entry.save(&root).unwrap();
         entry.cancel_prepared(&root).unwrap();
@@ -1778,6 +1772,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(entry.source_repositories.len(), 1);
+        std::fs::remove_dir_all(root.join("git-worktrees")).unwrap();
+        std::fs::create_dir_all(root.join("git-worktrees/0")).unwrap();
+        entry.complete_worktree_backup(&root).unwrap();
+        assert!(root.join("git-worktrees/complete").is_file());
         entry.move_folder(&root).unwrap();
         assert!(
             entry.prune_worktrees(&root).is_err(),
@@ -1809,8 +1807,6 @@ mod tests {
             std::fs::read(root.join("workspace/.lucidos/worktrees/scratch/staged.txt")).unwrap(),
             b"unstaged version"
         );
-        // Replaying the saved administration after returning the folder can
-        // recover both versions without checking out or resetting a branch.
         std::fs::rename(root.join("workspace"), &entry.original_dir).unwrap();
         let repo = if internal {
             entry.original_dir.clone()
@@ -1847,7 +1843,6 @@ mod tests {
             "HEAD\n"
         );
         assert_eq!(git(&occupied, &["rev-parse", "HEAD"]), advanced);
-        // Exact replay is idempotent; a changed record is never overwritten.
         assert!(entry.restore_worktrees(&root).is_ok());
         std::fs::write(repo.join(".git/worktrees/scratch/HEAD"), "occupied").unwrap();
         assert!(entry.restore_worktrees(&root).is_err());
@@ -1858,7 +1853,6 @@ mod tests {
         .unwrap();
         let blob = blob.trim();
         let loose = repo.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
-        // Simulate GC of an object no longer reachable from a live index.
         std::fs::rename(loose, temp.path().join("removed-blob")).unwrap();
         let tip = tip.trim();
         let loose_commit = repo.join(".git/objects").join(&tip[..2]).join(&tip[2..]);
@@ -1867,8 +1861,6 @@ mod tests {
         assert_eq!(git(&linked, &["status", "--porcelain"]), "AM staged.txt\n");
         assert_eq!(git(&linked, &["show", ":staged.txt"]), "staged version");
         assert_eq!(git(&repo, &["rev-parse", "keep-work"]), advanced);
-        // A restored checkout can be archived again without colliding with
-        // recovery-only metadata from the previous deletion.
         Entry::prepare(
             &temp.path().join("deleted-again"),
             &workspace(),
@@ -2030,7 +2022,6 @@ mod tests {
     }
 }
 
-/// A database-only deletion has no folder or registration identity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DatabaseEntry {
     #[serde(default)]
@@ -2039,8 +2030,6 @@ pub struct DatabaseEntry {
     pub phase: Phase,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub dump_ready: bool,
-    /// None preserves conservative recovery of journals predating this checkpoint.
-    /// False proves that no database DROP was attempted by this operation.
     #[serde(default)]
     pub drop_started: Option<bool>,
     pub deletion_operation: String,
@@ -2049,8 +2038,6 @@ pub struct DatabaseEntry {
     pub abandoned_staging: Vec<String>,
 }
 impl DatabaseEntry {
-    /// Find the journal already bound to a frozen member. Never mint a second
-    /// deletion attempt after an external effect may have succeeded.
     pub(crate) fn find_audit(
         parent: &Path,
         audit: &crate::cleanup_audit::Audit,
@@ -2247,9 +2234,6 @@ mod database_journal_tests {
     }
 }
 
-/// A terminal journal is proof of successful effects. Recreate its immutable
-/// completion before its last recovery copy can be purged. Nonterminal journals
-/// never claim success; their external effects require explicit reconciliation.
 fn repair_audit(
     root: &Path,
     phase: &Phase,
@@ -2317,7 +2301,6 @@ mod database_completion_tests {
         );
         let (mut duplicate, _) = DatabaseEntry::prepare(&parent, "lucidos_scratch").unwrap();
         duplicate.audit = Some(audit.clone());
-        // Persist a conflicting second journal without repairing a completion.
         let second = std::fs::read_dir(&parent)
             .unwrap()
             .map(|item| item.unwrap().path())

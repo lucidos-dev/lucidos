@@ -1,12 +1,6 @@
-//! The SDK's copy of the routes an app may reach, which the bridge reads.
-
 use crate::codegen::REGENERATE;
 use lucidos_engine::app_reach_policy::{Reach::App, ROUTE_REACH};
 
-/// The `App` rows, and only those.
-///
-/// Emitting the denials as well would ship a map of the engine to every app,
-/// and the client needs none of it: absence already means refused.
 pub(crate) fn render() -> String {
     let mut out = String::new();
     out.push_str("// AUTO-GENERATED. Do not edit by hand.\n");

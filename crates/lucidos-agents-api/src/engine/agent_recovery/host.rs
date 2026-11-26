@@ -1,5 +1,3 @@
-//! Adapter from lower engine services to the agent implementation.
-
 use crate::engine::agent_recovery::recovery::AgentRecoveryExt;
 use crate::engine::agent_session::apply_now::ApplyNowExt;
 use crate::engine::agent_session::background_task::BackgroundTaskExt;

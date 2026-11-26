@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 
 use crate::core::{plugins::PluginManifest, DATA_DIR};
 
-/// One plugin uninstall awaiting user confirmation. A flat file list is
-/// sufficient because there are no source bytes to stage.
+/// One plugin uninstall awaiting user confirmation.
 pub struct PendingUninstall {
     pub plugin_id: String,
     pub plugin_version: String,
     pub plugin_name: String,
+    /// The installed hook scope when the uninstall was staged.
+    pub hooks: Vec<PluginHook>,
     /// Recorded files that exist on disk at prepare time. Confirm attempts
     /// to delete each; any that disappear before confirm fold into the
     /// resulting event's `files_missing`.
@@ -35,6 +36,8 @@ pub struct PendingInstall {
     /// decides from it whether a Lucidos Agent thread walks the user through
     /// the author's setup instructions.
     pub setup: StagedSetup,
+    pub hooks: Vec<PluginHook>,
+    pub prior_hooks: Vec<PluginHook>,
     /// What this install would do to the user's edited files, and which files
     /// it would remove. Decided at staging time, so the confirm panel can state
     /// it per file. Empty for a fresh install.
@@ -43,6 +46,14 @@ pub struct PendingInstall {
     /// when they could not be read. See `check_records_still_match`.
     pub recorded_files: Option<RecordedFiles>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PluginHook {
+    pub slug: String,
+    pub name: String,
+    pub event_type: String,
+    pub content_hash: String,
 }
 
 /// Recorded paths per installed plugin id: `InstalledPlugins::files`.

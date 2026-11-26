@@ -1,17 +1,9 @@
-//! `lucidos intelligence-ladder`: a *ladder surface*'s *intelligence
-//! ladder*, as the engine serves it. Also how a plan card and a refusal show
-//! it. The CLI keeps no copy of the ordering: every rung and band comes from
-//! `GET /api/v1/intelligence-ladder` (ADR 0500, ADR 0525).
-
 use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 use serde_json::Value;
 
-/// The reason slug the engine puts on a pick off the ladder.
 pub(crate) const OFF_LADDER_REASON: &str = "off-intelligence-ladder";
 
-/// One intelligence rung that is on, with its bands as the engine labels
-/// them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IntelligenceRung {
     pub(crate) model: String,
@@ -23,20 +15,12 @@ pub(crate) struct IntelligenceRung {
     pub(crate) is_default: bool,
 }
 
-/// A surface's effective ladder, least to most intelligent, and where the
-/// calling thread stands on it. Rungs that are off stay out: no agent may
-/// pick them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Ladder {
-    /// `chat`, `claude-code` or `codex`.
     pub(crate) surface: String,
     pub(crate) intelligence_rungs: Vec<IntelligenceRung>,
-    /// The thread's rung, when it recorded one on the ladder.
     pub(crate) current: Option<usize>,
-    /// The actual current pair, including when it is not an enabled choice.
     pub(crate) current_pair: Option<String>,
-    /// The rung the bands compare against, as `model at effort`. Codex
-    /// compares against Claude Code's default while it has none of its own.
     pub(crate) reference: Option<String>,
     pub(crate) other_backend_ladders: Vec<Ladder>,
 }
@@ -88,15 +72,11 @@ impl Ladder {
         })
     }
 
-    /// Whether a raise has somewhere to go: a rung above the thread's own
-    /// that is not the top, which a builder never takes. Unknown when the
-    /// thread is off the ladder or recorded nothing.
     pub(crate) fn has_higher_intelligence_rung(&self) -> bool {
         self.current
             .is_some_and(|p| p + 2 < self.intelligence_rungs.len())
     }
 
-    /// The surface as the UI names it: the Lucidos Agent for `chat`.
     fn surface_name(&self) -> &str {
         if self.surface == CHAT_SURFACE {
             "Lucidos Agent"
@@ -105,8 +85,6 @@ impl Ladder {
         }
     }
 
-    /// The ladder as numbered lines, with the default and the thread's rung
-    /// marked.
     pub(crate) fn render(&self) -> String {
         let mut out = self.render_own();
         for other in &self.other_backend_ladders {
@@ -173,8 +151,6 @@ impl Ladder {
         out
     }
 
-    /// How a pick names `step`: spawn flags for a coding agent, the
-    /// `model=effort` pair a chat pick takes.
     fn pick_hint(&self, step: &IntelligenceRung) -> String {
         if self.surface == CHAT_SURFACE {
             format!("{}={}", step.model, step.effort)
@@ -187,16 +163,12 @@ impl Ladder {
     }
 }
 
-/// The wire name of the Lucidos Agent's surface.
 const CHAT_SURFACE: &str = "chat";
 
-/// A band label, or why there is none.
 fn band(label: Option<&str>) -> &str {
     label.unwrap_or("not estimated")
 }
 
-/// GET the ladder route on `base_url`. `target_workspace` asserts another
-/// workspace than the caller's own, as `spawn-thread --to` does.
 fn fetch(
     base_url: &str,
     query: &[(&str, &str)],
@@ -219,8 +191,6 @@ fn fetch(
         .map_err(|e| format!("GET {url} returned a non-JSON body: {e}").into())
 }
 
-/// The calling thread's ladder, with its rung marked. `None` when the engine
-/// cannot be asked, which a card reports rather than guesses around.
 pub(crate) fn read_own(ws: &Workspace) -> Option<Ladder> {
     let thread_id = std::env::var("LUCIDOS_THREAD_ID").ok()?;
     fetch(&ws.base_url(), &[("thread_id", &thread_id)], None)
@@ -229,8 +199,6 @@ pub(crate) fn read_own(ws: &Workspace) -> Option<Ladder> {
         .and_then(Ladder::parse)
 }
 
-/// The rendered ladder of `surface` to print under an
-/// `off-intelligence-ladder` refusal, read from the engine that refused.
 pub(crate) fn render_for_refusal(
     base_url: &str,
     target_workspace: Option<&str>,
@@ -246,8 +214,6 @@ pub(crate) fn render_for_refusal(
         .map(|ladder| ladder.render())
 }
 
-/// `lucidos intelligence-ladder`: print the ladder. Inside a thread, its own
-/// backend and rung unless `--surface` names another surface.
 pub(crate) fn cmd(
     ws: &Workspace,
     surface: Option<crate::CliLadderSurface>,
@@ -330,7 +296,6 @@ pub(crate) struct EditArgs {
     reason: String,
 }
 
-/// Read `model=effort`.
 fn parse_intelligence_rung(text: &str) -> Result<(String, String), String> {
     match text.split_once('=') {
         Some((model, effort)) if !model.is_empty() && !effort.is_empty() => {
@@ -340,7 +305,6 @@ fn parse_intelligence_rung(text: &str) -> Result<(String, String), String> {
     }
 }
 
-/// The route and body one edit posts.
 fn edit_request(edit: &EditCmd) -> (&'static str, Value) {
     let intelligence_rung_json = |(model, effort): &(String, String)| serde_json::json!({ "model": model, "effort": effort });
     let (path, args, mut body) = match edit {
@@ -368,7 +332,6 @@ fn edit_request(edit: &EditCmd) -> (&'static str, Value) {
     (path, body)
 }
 
-/// Run one edit and return the exit code: 0 done, 2 waiting on the owner.
 pub(crate) fn cmd_edit(ws: &Workspace, edit: &EditCmd) -> Result<u8, BoxError> {
     let (path, body) = edit_request(edit);
     let url = format!("{}/api/v1/intelligence-ladder/{path}", ws.base_url());

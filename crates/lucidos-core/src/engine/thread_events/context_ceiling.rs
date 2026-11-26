@@ -1,52 +1,35 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Context size, in input tokens, at or under which a handoff never pays.
-/// Estimates are noisy there, and a context this small still works well.
 pub const HANDOFF_FLOOR_TOKENS: u64 = 100_000;
 
-/// The current *agent session*'s context reading, the one definition of a
-/// thread's context size. `None` fields are unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionReading {
-    /// The latest `usage.input_tokens` of the session's own turns. A later
-    /// `CodingAgentCompacted` replaces it with `post_tokens`, unknown when
-    /// Claude Code did not report it. A fresh session has none yet.
     pub tokens: Option<u64>,
-    /// The context window of the newest capture that records one.
     pub window: Option<u64>,
 }
 
-/// The share of the recorded window no ceiling goes above, in percent.
 const WINDOW_CAP_PERCENT: u64 = 75;
 
-/// A session's context reading past its effective ceiling, as
-/// `ContextCeilingReached` records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CeilingCrossing {
     pub context_tokens: u64,
-    /// The effective ceiling, in tokens.
     pub ceiling: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
 }
 
-/// The largest size a ceiling names, in thousands of tokens.
 const MAX_THOUSANDS: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextCeiling {
-    /// No ceiling: the session grows until its backend compacts.
     Off,
-    /// A size in tokens.
     Tokens(u64),
-    /// A share of the session's recorded window, in percent.
     WindowShare(u8),
 }
 
 impl ContextCeiling {
     const OFF: &'static str = "off";
 
-    /// Parse the text form: `off`, `<N>k`, or `<P>%`.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
         let refused = || {
@@ -73,8 +56,6 @@ impl ContextCeiling {
             .ok_or_else(refused)
     }
 
-    /// The ceiling in tokens for a session whose newest capture records
-    /// `window`. `None` when it never fires: `off`, or a share with no window.
     pub fn effective(self, window: Option<u64>) -> Option<u64> {
         let window = window.filter(|w| *w > 0);
         let value = match self {
@@ -89,8 +70,6 @@ impl ContextCeiling {
         Some(capped.max(HANDOFF_FLOOR_TOKENS))
     }
 
-    /// The crossing `reading` makes of this ceiling, if it tops it. An unknown
-    /// reading never does, and neither does a ceiling with no effective size.
     pub fn crossed_by(self, reading: SessionReading) -> Option<CeilingCrossing> {
         let context_tokens = reading.tokens?;
         let ceiling = self.effective(reading.window)?;
@@ -101,7 +80,7 @@ impl ContextCeiling {
         })
     }
 
-    /// Whether `self` lets a session grow past where `from` stops it. A
+    /// INVARIANT: Whether `self` lets a session grow past where `from` stops it. A
     /// comparison the window cannot settle reads as a raise, since an unknown
     /// never authorizes.
     pub fn raises(self, from: Self, window: Option<u64>) -> bool {
@@ -140,12 +119,9 @@ impl<'de> Deserialize<'de> for ContextCeiling {
     }
 }
 
-/// Where a thread's `ContextCeilingSet` came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CeilingSource {
-    /// Set on the thread itself, by a person or an agent.
     Thread,
-    /// Copied from the trigger that fired the thread.
     Trigger,
 }

@@ -1,53 +1,21 @@
-//! Condition evaluator for event subscriptions.
-//!
-//! Evaluates a JSON condition against an event payload.
-//! Operators: $eq, $ne, $lt, $lte, $gt, $gte, $in, $nin, $regex.
-//! A bare value (no operator) is treated as $eq.
-//! A key names a *field path*, so `workflow_run.event` reads one level down.
-//! `$or` in key position takes a list of conditions and ORs them.
-//!
-//! **One predicate language, two consumers.** This lived under `triggers/` when
-//! a trigger was the only thing that could subscribe to an event. A thread's
-//! *event wait* subscribes with the same shape, so the evaluator moved here
-//! rather than being duplicated: a `condition` that matches for a trigger must
-//! match for a wait, and the only way to guarantee that is one function. See
-//! [`super::EventSubscription::matches`], which is the sole caller both
-//! dispatch paths go through.
-
 use regex::Regex;
 use serde_json::Value;
 
-/// The combinator, and the only key that is read as one rather than as a field
-/// path. Every other `$`-prefixed key in that position is reserved, so a later
-/// combinator can land without reinterpreting a stored condition.
 const OR: &str = "$or";
 
-/// How deep `$or` may nest. A condition is caller-supplied data, so the depth
-/// is bounded at both ends: [`validate`] refuses a deeper one at the write
-/// surface, and [`evaluate`] answers false rather than recursing off the stack.
 const MAX_OR_DEPTH: usize = 8;
 
-/// Every operator, in the order the error message lists them.
 const OPERATORS: &[&str] = &[
     "$eq", "$ne", "$lt", "$lte", "$gt", "$gte", "$in", "$nin", "$regex",
 ];
 
-/// How deep [`same_leaf_paths`] descends, and how many nodes it may visit.
-/// A sample payload is a third party's data, so the search is bounded at both.
 const MAX_SUGGESTION_DEPTH: usize = 8;
 const MAX_SUGGESTION_NODES: usize = 2_000;
 
-/// How many paths [`same_leaf_paths`] offers.
 const MAX_SUGGESTIONS: usize = 3;
 
-/// What a field path resolves to when nothing is there.
-///
-/// A `static`, because the resolver hands out a `&'static Value` for the absent
-/// case and `Value` has drop glue, so a `const` would not promote.
 static ABSENT: Value = Value::Null;
 
-/// Evaluate a condition against an event payload.
-/// Returns true if the payload matches (or condition is None).
 pub fn evaluate(condition: Option<&Value>, payload: &Value) -> bool {
     match condition {
         None => true,
@@ -62,7 +30,7 @@ fn evaluate_condition(condition: &Value, payload: &Value, depth: usize) -> bool 
             if key == OR {
                 return evaluate_or(op, payload, depth);
             }
-            // Reserved, so it never names a payload field. Otherwise a payload
+            // INVARIANT: Reserved, so it never names a payload field. Otherwise a payload
             // carrying a literal `$and` key would satisfy a condition naming
             // it, and a later combinator would then change that stored
             // condition's verdict. [`validate`] refuses one at the write
@@ -75,8 +43,6 @@ fn evaluate_condition(condition: &Value, payload: &Value, depth: usize) -> bool 
     }
 }
 
-/// `$or`: any branch matching satisfies it, and it ANDs with its siblings
-/// because it is one key among the condition's others.
 fn evaluate_or(branches: &Value, payload: &Value, depth: usize) -> bool {
     if depth >= MAX_OR_DEPTH {
         return false;
@@ -89,7 +55,7 @@ fn evaluate_or(branches: &Value, payload: &Value, depth: usize) -> bool {
     }
 }
 
-/// Resolve a **field path** against the payload.
+/// INVARIANT: Resolve a **field path** against the payload.
 ///
 /// **The exact key wins at every level.** That first lookup is what the flat
 /// evaluator always did, so no stored condition can change verdict: traversal
@@ -122,23 +88,10 @@ pub fn resolve<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-/// **Does `payload` carry `path` at all?**
-///
-/// The question the write surface asks and the matcher cannot. [`evaluate`]
-/// reads an absent path as JSON null, so to it a stored `null` and a path that
-/// was never there are the same value. That is deliberate and stays
-/// (ADR 0119), which is why present-versus-absent needs its own function.
 pub fn resolves(payload: &Value, path: &str) -> bool {
     resolve(payload, path).is_some()
 }
 
-/// **Every field path a condition names**, `$or` branches included, without
-/// repeats. Key order is the JSON map's own, so it is stable but not the order
-/// the author typed.
-///
-/// A `$`-prefixed key in field position is a combinator or a reservation, never
-/// a path, so none appears here. The `$or` recursion carries the same depth cap
-/// [`evaluate`] does, so a hand-crafted condition cannot walk it off the stack.
 pub fn field_paths(condition: &Value) -> Vec<String> {
     let mut paths = Vec::new();
     collect_field_paths(condition, 0, &mut paths);
@@ -168,15 +121,6 @@ fn collect_field_paths(condition: &Value, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-/// **Where else in `payload` a path's last segment appears**, shortest first.
-///
-/// What to say to someone whose path resolved to nothing. `id` against a
-/// `PluginInstalled` payload answers `manifest.manifest.id`, which is the whole
-/// point: the mistake is almost always the right leaf at the wrong depth.
-///
-/// Breadth-first, so the shallowest match leads. Arrays are not descended,
-/// because a numeric segment is an ordinary object key and a path through an
-/// array can never resolve. `path` itself is never offered back.
 pub fn same_leaf_paths(payload: &Value, path: &str) -> Vec<String> {
     let leaf = path.rsplit_once('.').map_or(path, |(_, tail)| tail);
     let mut found = Vec::new();
@@ -222,13 +166,13 @@ fn evaluate_op(op: &Value, actual: &Value) -> bool {
                 "$gt" => compare(actual, expected, |a, b| a > b),
                 "$gte" => compare(actual, expected, |a, b| a >= b),
                 "$in" => in_list(expected, actual),
-                // A malformed list fails closed on both, rather than `$nin`
+                // INVARIANT: A malformed list fails closed on both, rather than `$nin`
                 // negating its way into matching everything.
                 "$nin" => expected.is_array() && !in_list(expected, actual),
                 "$regex" => matches_regex(expected, actual),
                 _ => false,
             }),
-        None => actual == op, // bare value = equality check
+        None => actual == op,
     }
 }
 
@@ -239,12 +183,6 @@ fn in_list(expected: &Value, actual: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// `$regex`: an unanchored search over a JSON string.
-///
-/// Only a string is text, so a number, an object, an array and an absent path
-/// are all misses. That groups the operator with `$in` rather than with `$ne`.
-/// A pattern that does not compile matches nothing here; [`validate`] refuses it
-/// at the write surface so it never gets that far.
 fn matches_regex(pattern: &Value, actual: &Value) -> bool {
     let (Some(pattern), Some(actual)) = (pattern.as_str(), actual.as_str()) else {
         return false;
@@ -261,7 +199,7 @@ fn compare(a: &Value, b: &Value, cmp: fn(f64, f64) -> bool) -> bool {
     }
 }
 
-/// **Refuse a condition that could never match**, at the write surface.
+/// INVARIANT: **Refuse a condition that could never match**, at the write surface.
 ///
 /// An unsupported operator evaluates to false and says nothing, so a
 /// subscription carrying one arms clean and waits forever. That is the failure
@@ -318,7 +256,7 @@ fn validate_or(branches: &Value, depth: usize) -> Result<(), String> {
 
 fn validate_op(field: &str, op: &Value) -> Result<(), String> {
     let Some(ops) = op.as_object() else {
-        return Ok(()); // a bare value is an equality check against anything
+        return Ok(());
     };
     for (operator, expected) in ops {
         if !operator.starts_with('$') {
@@ -460,28 +398,17 @@ mod tests {
         assert!(!evaluate(Some(&cond), &json!({"score": 40})));
     }
 
-    /// The example used to be `$regex`, which is now an operator. Adding one
-    /// revives any stored condition that named it, since such a condition was
-    /// inert; `validate` refuses a new one at the write surface.
     #[test]
     fn unknown_operator_returns_false() {
         let cond = json!({"score": {"$like": ".*"}});
         assert!(!evaluate(Some(&cond), &json!({"score": "hello"})));
     }
 
-    /// A `$`-prefixed key in FIELD position is reserved, so it is not resolved
-    /// against the payload.
-    ///
-    /// The second case is the one that matters, and it is why the reservation
-    /// has to be enforced in `evaluate` and not only in `validate`. A payload
-    /// that literally carries the key would otherwise satisfy the condition, so
-    /// promoting `$and` to a combinator later would change a stored verdict.
     #[test]
     fn a_reserved_field_key_never_matches() {
         let cond = json!({"$and": [{"a": 1}]});
         assert!(!evaluate(Some(&cond), &json!({"a": 1})));
         assert!(!evaluate(Some(&cond), &json!({"$and": [{"a": 1}]})));
-        // The same holds for the shape that used to match everything.
         assert!(!evaluate(Some(&json!({"$foo": null})), &json!({"a": 1})));
     }
 
@@ -490,8 +417,6 @@ mod tests {
         let cond = json!({"name": {"$lt": "foo"}});
         assert!(!evaluate(Some(&cond), &json!({"name": "bar"})));
     }
-
-    // ── Field paths ─────────────────────────────────────────────────
 
     #[test]
     fn nested_path_matches_one_level_down() {
@@ -513,8 +438,6 @@ mod tests {
         assert!(!evaluate(Some(&cond), &json!({"a": {"b": {"c": 2}}})));
     }
 
-    /// Decision 1. Exact-key-first is what makes back-compat structural: the
-    /// first lookup is the one the flat evaluator always did.
     #[test]
     fn literal_dotted_key_wins_over_the_path() {
         let cond = json!({"a.b": "literal"});
@@ -525,14 +448,12 @@ mod tests {
         assert!(!evaluate(Some(&cond), &json!({"a.b": "nested"})));
     }
 
-    /// The exact key wins at EVERY level, not just the top one.
     #[test]
     fn literal_dotted_key_wins_below_the_top_level() {
         let cond = json!({"a.b.c": 1});
         assert!(evaluate(Some(&cond), &json!({"a": {"b.c": 1}})));
     }
 
-    /// The split is at the FIRST dot, so a literal prefix is never a head.
     #[test]
     fn the_walk_splits_at_the_first_dot() {
         let cond = json!({"a.b.c": 1});
@@ -559,9 +480,6 @@ mod tests {
         }
     }
 
-    // ── A path that does not exist ──────────────────────────────────
-
-    /// Decision 2. A missing path is null, exactly like a missing top-level key.
     #[test]
     fn a_missing_path_is_null() {
         let cond = json!({"a.b": null});
@@ -582,7 +500,6 @@ mod tests {
         assert!(!evaluate(Some(&cond), &json!({"action": "completed"})));
     }
 
-    /// The corollary the docs lean on: this reads as "exists and is not null".
     #[test]
     fn ne_null_reads_as_exists() {
         let cond = json!({"usage.input_tokens": {"$ne": null}});
@@ -594,9 +511,6 @@ mod tests {
         assert!(!evaluate(Some(&cond), &json!({})));
     }
 
-    // ── Arrays ──────────────────────────────────────────────────────
-
-    /// Decision 3. A numeric segment is an ordinary object key, never an index.
     #[test]
     fn a_numeric_segment_is_an_object_key() {
         let cond = json!({"a.0": 1});
@@ -610,8 +524,6 @@ mod tests {
         assert!(evaluate(Some(&json!({"a.0": null})), &json!({"a": [1, 2]})));
     }
 
-    // ── $nin ────────────────────────────────────────────────────────
-
     #[test]
     fn nin_operator() {
         let cond = json!({"conclusion": {"$nin": ["success", "skipped"]}});
@@ -619,21 +531,17 @@ mod tests {
         assert!(!evaluate(Some(&cond), &json!({"conclusion": "success"})));
     }
 
-    /// Consistent with `$ne`: an absent path is null, and null is in no list.
     #[test]
     fn nin_matches_an_absent_path() {
         let cond = json!({"workflow_run.conclusion": {"$nin": ["success"]}});
         assert!(evaluate(Some(&cond), &json!({})));
     }
 
-    /// A malformed list fails closed, the same way `$in` does.
     #[test]
     fn nin_with_a_non_array_never_matches() {
         let cond = json!({"x": {"$nin": "success"}});
         assert!(!evaluate(Some(&cond), &json!({"x": "failure"})));
     }
-
-    // ── $regex ──────────────────────────────────────────────────────
 
     #[test]
     fn regex_is_a_substring_search() {
@@ -668,7 +576,6 @@ mod tests {
         ));
     }
 
-    /// Decision 5. Only a JSON string is text, so everything else is a miss.
     #[test]
     fn regex_never_matches_a_non_string() {
         let cond = json!({"x": {"$regex": "1"}});
@@ -678,14 +585,11 @@ mod tests {
         assert!(!evaluate(Some(&cond), &json!({})));
     }
 
-    /// Evaluation never panics on a bad pattern; the write surface refuses it.
     #[test]
     fn an_uncompilable_regex_never_matches() {
         let cond = json!({"x": {"$regex": "["}});
         assert!(!evaluate(Some(&cond), &json!({"x": "["})));
     }
-
-    // ── $or ─────────────────────────────────────────────────────────
 
     #[test]
     fn or_matches_any_branch() {
@@ -698,7 +602,6 @@ mod tests {
         ));
     }
 
-    /// The point of the operator: `A AND (X OR Y)` inside one entry.
     #[test]
     fn or_ands_with_its_siblings() {
         let cond = json!({
@@ -737,11 +640,6 @@ mod tests {
         assert!(!evaluate(Some(&json!({"$or": [1]})), &json!({"a": 1})));
     }
 
-    // ── The motivating case, end to end ─────────────────────────────
-
-    /// ADR 0119's worked example, on the payload shape that forced it. A GitHub
-    /// `workflow_run` delivery carries `action` at the top and the rest under
-    /// `workflow_run`, so this whole filter used to need a script.
     #[test]
     fn a_nested_webhook_filter_needs_no_script() {
         let cond = json!({
@@ -757,11 +655,8 @@ mod tests {
             ("completed", "schedule", "startup_failure", true),
             ("completed", "schedule", "success", false),
             ("completed", "schedule", "cancelled", false),
-            // A manual run, whatever it concluded. The `event` cut is the half
-            // the script used to own.
             ("completed", "workflow_dispatch", "failure", false),
             ("completed", "workflow_dispatch", "success", false),
-            // The two deliveries before the run ends.
             ("requested", "schedule", "failure", false),
             ("in_progress", "schedule", "failure", false),
         ] {
@@ -778,9 +673,6 @@ mod tests {
         assert!(validate(&cond).is_ok());
     }
 
-    /// A run still going carries a null `conclusion`, and `$nin` matches an
-    /// absent path. The `action` cut is what keeps that out, so the two clauses
-    /// are not redundant.
     #[test]
     fn the_action_cut_carries_the_unfinished_run() {
         let cond = json!({
@@ -793,8 +685,6 @@ mod tests {
         assert!(evaluate(Some(&cond), &finished));
     }
 
-    // ── Caller-supplied data cannot exhaust the stack ───────────────
-
     #[test]
     fn a_very_long_path_resolves_without_overflowing() {
         let key = vec!["a"; 100_000].join(".");
@@ -802,10 +692,6 @@ mod tests {
         assert!(evaluate(Some(&cond), &json!({"a": 1})));
     }
 
-    /// **The two depth checks have to agree.** They are separate `>=` tests in
-    /// separate functions. A validate that accepted one level deeper than
-    /// evaluate matches would hand back the silent dead subscription that the
-    /// write-time refusal exists to end.
     #[test]
     fn the_or_depth_boundary_is_the_same_on_both_sides() {
         let nest = |levels: usize| {
@@ -823,8 +709,6 @@ mod tests {
         assert!(validate(&too_deep).is_err());
         assert!(!evaluate(Some(&too_deep), &json!({"a": 1})));
     }
-
-    // ── validate ────────────────────────────────────────────────────
 
     #[test]
     fn validate_accepts_what_evaluate_supports() {
@@ -854,7 +738,6 @@ mod tests {
         assert!(err.contains("$regex"), "{err}");
     }
 
-    /// The mistake someone actually makes, so the message names the path.
     #[test]
     fn validate_points_a_nested_object_at_the_field_path() {
         let err = validate(&json!({"workflow_run": {"event": "schedule"}})).unwrap_err();
@@ -889,13 +772,6 @@ mod tests {
         assert!(validate(&json!({"$or": [{"x": {"$regex": "["}}]})).is_err());
     }
 
-    /// **`OPERATORS`, `evaluate_op` and `validate_op` are three hand-written
-    /// copies of one set.** Drift between the last two is the exact failure the
-    /// write-time refusal exists to end: an operator `validate` accepts and
-    /// `evaluate_op` does not implement arms clean and never matches.
-    ///
-    /// A new operator therefore has to add its row here, and the row fails
-    /// unless both sides carry it.
     #[test]
     fn every_operator_validates_and_matches() {
         let rows: &[(&str, Value, Value)] = &[
@@ -917,9 +793,6 @@ mod tests {
         }
     }
 
-    // ── What the write surface asks ─────────────────────────────────
-
-    /// The distinction `evaluate` cannot draw: it reads both as null.
     #[test]
     fn resolves_tells_an_absent_path_from_a_stored_null() {
         assert!(resolves(&json!({"a": null}), "a"));
@@ -937,8 +810,6 @@ mod tests {
         assert!(field_paths(&json!("not an object")).is_empty());
     }
 
-    /// A branch's keys are as much a claim about the payload as a sibling's,
-    /// and `$or` itself is a combinator rather than a field.
     #[test]
     fn field_paths_reaches_into_or_branches() {
         let cond = json!({
@@ -955,8 +826,6 @@ mod tests {
         );
     }
 
-    /// The same reservation `evaluate` enforces: a `$`-prefixed key in field
-    /// position never names a payload field, so it is never corroborated.
     #[test]
     fn field_paths_skips_a_reserved_key() {
         assert!(field_paths(&json!({"$and": [{"a": 1}]})).is_empty());
@@ -971,7 +840,6 @@ mod tests {
         assert!(field_paths(&cond).is_empty(), "the cap holds");
     }
 
-    /// The incident, as a unit test: the right leaf at the wrong depth.
     #[test]
     fn same_leaf_paths_finds_the_leaf_further_down() {
         let payload = json!({

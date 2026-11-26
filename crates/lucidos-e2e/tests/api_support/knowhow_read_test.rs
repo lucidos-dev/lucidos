@@ -1,21 +1,8 @@
-//! E2E coverage for the knowhow HTTP surface that the `lucidos knowhow` CLI
-//! subcommand wraps: `GET /api/v1/knowhow` (catalog) and
-//! `GET /api/v1/knowhow/read?id=<id>` (one doc's full content).
-//!
-//! This is the path an *app coding-agent thread* uses to pull app-building
-//! guidance — its sparse-checkout worktree can't see the engine's
-//! `system-knowhow/` on disk and it has no in-process `load_knowhow` tool, so
-//! the read endpoint is its only route to the docs. The engine under test
-//! ships `system-knowhow/` from the repo, so `system-knowhow/building-an-app`
-//! is guaranteed to resolve.
-
 use crate::support::{base_url, http_client};
 use serde_json::Value;
 
 const BUILDING_AN_APP_ID: &str = "system-knowhow/building-an-app";
 
-/// The catalog lists engine-shipped system-knowhow with the
-/// `system-knowhow/` id prefix already applied.
 #[tokio::test]
 async fn knowhow_list_includes_building_an_app() {
     let client = http_client();
@@ -42,8 +29,6 @@ async fn knowhow_list_includes_building_an_app() {
     );
 }
 
-/// Reading a known system-knowhow id returns the wrapped doc body — the same
-/// `[SYSTEM-KNOWHOW: …]` block the chat agent's `load_knowhow` tool produces.
 #[tokio::test]
 async fn knowhow_read_returns_building_an_app_body() {
     let client = http_client();
@@ -66,8 +51,6 @@ async fn knowhow_read_returns_building_an_app_body() {
     );
 }
 
-/// An unknown id is a 404 carrying the shared not-found sentinel — not a 200
-/// with empty content (which would read as "the doc is empty").
 #[tokio::test]
 async fn knowhow_read_unknown_id_is_404() {
     let client = http_client();
@@ -86,8 +69,6 @@ async fn knowhow_read_unknown_id_is_404() {
     );
 }
 
-/// A read records use evidence for the workspace prompt footprint, at most
-/// once per doc per day. A caller reading in a loop adds no rows.
 #[tokio::test]
 async fn knowhow_read_records_one_read_per_doc_per_day() {
     let client = http_client();

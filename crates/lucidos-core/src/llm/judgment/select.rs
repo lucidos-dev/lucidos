@@ -1,30 +1,3 @@
-//! Which backend answers one judgment site: its chat model, or a System One
-//! row the user picked for it.
-//!
-//! **Every doubt resolves to `chat`.** An unset preference, an unreadable one,
-//! a value nobody recognizes, a switched-off provider, a missing key, a client
-//! that will not build: all of them return `None`, and the site asks its chat
-//! model. So storing a credential changes no site on its own. That is the
-//! promise this module keeps (ADR 0363, I13 and I14 of
-//! `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md`).
-//!
-//! **One exception, the user's choice: the wake decision** (ADRs 0433, 0435,
-//! 0472). An unset wake decision runs on [`WAKE_DECISION_DEFAULT`] while the
-//! running chat provider serves it. [`system_one_or_default_for`] asks that,
-//! and an explicit `chat` still runs chat. The read decision runs on its chat
-//! model while unset.
-//!
-//! **Two switches, and both must say yes.** Each System One provider has a
-//! master switch on Settings → Providers. Under it sits one preference
-//! per site. Absent means on for the master and `chat` for a site.
-//!
-//! **The `judge` tool has one switch, not two, and that is deliberate.** A
-//! [`JudgmentSite`] is a decision the engine already makes on a chat model, so
-//! its preference chooses which backend answers. The tool replaces nothing: it
-//! is a capability that exists or does not, like `generate_image` behind a
-//! configured image provider. So [`judgment_available`] asks Jev's key and
-//! master switch, and there is no third preference to set.
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -35,33 +8,18 @@ use super::JudgmentProvider;
 use crate::core::prefs::{self, Optional, Pref, Text};
 use crate::llm::ProviderKind;
 
-/// The row an unset wake decision runs on (ADRs 0435, 0472).
 pub const WAKE_DECISION_DEFAULT: SystemOneEndpoint = SystemOneEndpoint::OpenAi;
 
-/// A call site that asks typed questions.
-///
-/// Each owns one preference, so moving one never moves another. That split is
-/// deliberate: the command guard is a safety gate and the user may well want
-/// it on a different footing from memory retrieval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JudgmentSite {
-    /// The command guard's judge over the ambiguous middle (ADR 0002).
     CommandGuard,
-    /// The three yes/no questions in front of memory retrieval.
     QueryClassification,
-    /// The Tree memory module's `find`, which walks a summary tree by asking
-    /// choice questions over its lines (ADR 0362). Nothing asks it yet.
     MemoryFind,
-    /// The turn end's read decision: should the user read this reply?
     ReadDecision,
-    /// The turn-end gate's *wake decision*: whether a child's report wakes its
+    /// INVARIANT: The turn-end gate's *wake decision*: whether a child's report wakes its
     /// parent. Every doubt wakes, so a missing answer is a wake.
     WakeDecision,
-    /// The turn end's *expected wake decision*: when a waiting thread wakes
-    /// next. A missing answer records no estimate.
     ExpectedWakeDecision,
-    /// Which option of an open *permission request* the owner's words choose
-    /// (ADR 0664). Every doubt grants nothing.
     PermissionAnswer,
 }
 
@@ -88,7 +46,7 @@ impl JudgmentSite {
         }
     }
 
-    /// The chat model the site runs on while no System One row answers it.
+    /// INVARIANT: The chat model the site runs on while no System One row answers it.
     pub const fn chat_model_key(self) -> &'static Pref<Text> {
         match self {
             Self::CommandGuard => &prefs::MODEL_COMMAND_JUDGE,
@@ -101,10 +59,6 @@ impl JudgmentSite {
         }
     }
 
-    /// The row an unset preference runs on, when its chat provider is served.
-    ///
-    /// Only the wake decision has one, because the user chose it (ADRs 0435,
-    /// 0472). Every other site waits for a pick.
     pub const fn default_endpoint(self) -> Option<SystemOneEndpoint> {
         match self {
             Self::WakeDecision => Some(WAKE_DECISION_DEFAULT),
@@ -117,7 +71,6 @@ impl JudgmentSite {
         }
     }
 
-    /// The name in a log line. Not user-facing.
     const fn label(self) -> &'static str {
         match self {
             Self::CommandGuard => "command guard",
@@ -130,7 +83,6 @@ impl JudgmentSite {
         }
     }
 
-    /// Whether a misconfiguration has already been logged for this site.
     fn warned(self) -> &'static AtomicBool {
         static COMMAND_GUARD: AtomicBool = AtomicBool::new(false);
         static QUERY_CLASSIFICATION: AtomicBool = AtomicBool::new(false);
@@ -151,12 +103,11 @@ impl JudgmentSite {
     }
 }
 
-/// The System One row a stored site preference picks, or `None` for chat.
 pub fn picked_endpoint(value: Option<&str>) -> Option<SystemOneEndpoint> {
     value.and_then(SystemOneEndpoint::from_id)
 }
 
-/// Whether `endpoint`'s master switch is on, or `None` when it could not be
+/// INVARIANT: Whether `endpoint`'s master switch is on, or `None` when it could not be
 /// read.
 ///
 /// **The unknown is returned rather than resolved here**, because the callers
@@ -176,10 +127,6 @@ async fn provider_switch(pool: &PgPool, endpoint: SystemOneEndpoint) -> Option<b
     }
 }
 
-/// The System One provider for `site`, or `None` to ask its chat model.
-///
-/// Boxed, because the rows speak two wires. [`super::for_site`] takes it as is.
-/// An unset preference is chat here, whatever the site's default.
 pub async fn system_one_for(
     pool: &PgPool,
     site: JudgmentSite,
@@ -188,7 +135,7 @@ pub async fn system_one_for(
     system_one_or_default_for(pool, site, timeout, &[]).await
 }
 
-/// [`system_one_for`], with an unset preference running on the site's
+/// INVARIANT: [`system_one_for`], with an unset preference running on the site's
 /// [`JudgmentSite::default_endpoint`] while `served`, the running chat
 /// provider's configured backends, holds that row's chat provider.
 ///
@@ -230,7 +177,7 @@ pub async fn system_one_or_default_for(
         }
     };
 
-    // Read second, so a workspace with every site on chat pays no extra query.
+    // INVARIANT: Read second, so a workspace with every site on chat pays no extra query.
     // An unknown reads as OFF: the fallback is a working chat model.
     if !provider_switch(pool, endpoint).await.unwrap_or(false) {
         return None;
@@ -255,8 +202,6 @@ pub async fn system_one_or_default_for(
     }
 }
 
-/// Whether no chat model is stored for `site`. An unknown reads as pinned, so
-/// a failed read keeps the site on chat.
 async fn chat_model_unpinned(pool: &PgPool, site: JudgmentSite) -> bool {
     match site.chat_model_key().try_stored(pool).await {
         Ok(stored) => stored.is_none_or(|model| model.trim().is_empty()),
@@ -272,7 +217,7 @@ async fn chat_model_unpinned(pool: &PgPool, site: JudgmentSite) -> bool {
     }
 }
 
-/// Whether the `judge` tool is offered to this workspace.
+/// INVARIANT: Whether the `judge` tool is offered to this workspace.
 ///
 /// Jev's master switch plus a resolvable key, and nothing else. Read once per
 /// turn by `read_turn_capabilities`, which is why it stops at a credential
@@ -294,7 +239,7 @@ pub async fn judgment_available(pool: &PgPool) -> bool {
             .unwrap_or(true)
 }
 
-/// The provider behind the `judge` tool, or the reason to tell the agent.
+/// INVARIANT: The provider behind the `judge` tool, or the reason to tell the agent.
 ///
 /// The reason is returned rather than logged, because this caller's reader is
 /// the model. A silent `None` would leave it retrying a tool that cannot work.
@@ -331,10 +276,6 @@ pub async fn jev_for_agent(
         })
 }
 
-/// Log a misconfiguration the first time this site hits it.
-///
-/// The command guard runs in front of every ambiguous command, so a line per
-/// call would bury the log in the one message worth reading.
 fn warn_once(site: JudgmentSite, message: String) {
     if !site.warned().swap(true, Ordering::Relaxed) {
         log_legacy!("{}", message);

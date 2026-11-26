@@ -87,26 +87,15 @@ pub mod workspace_fonts;
 
 use std::borrow::Cow;
 
-/// The database URL the engine booted with, or the local-dev default.
-///
-/// Read once, on the first call. Startup connects before
-/// `environment_variables::apply_to_process_env` copies the user's variables
-/// into the process env. A user variable named `DATABASE_URL` for a project
-/// script must not move later readers, such as `pg_dump`, to another database.
-///
-/// A gateway URL names a `passfile` rather than a password, since any
-/// same-user process reads another's environment on macOS (ADR 0645). This
-/// URL holds the password the file gives, so it stays in memory.
 pub fn database_url() -> String {
     boot_database().url.clone()
 }
 
-/// The password file the boot URL named, for a client tool the engine runs.
 pub fn database_passfile() -> Option<&'static std::path::Path> {
     boot_database().passfile.as_deref()
 }
 
-/// Point `url` at the boot password file when it signs in with the boot
+/// INVARIANT: Point `url` at the boot password file when it signs in with the boot
 /// password. A client tool then reads the file, and its environment holds no
 /// password.
 pub fn use_boot_passfile(url: &mut lucidos_pg_url::PgUrl) {
@@ -129,7 +118,6 @@ struct BootDatabase {
     managed: bool,
 }
 
-/// Gateway-only provenance, pinned with the database before user environment overlays.
 pub const MANAGED_DATABASE_ENV: &str = "LUCIDOS_MANAGED_DATABASE";
 
 pub fn database_is_gateway_managed() -> bool {
@@ -165,7 +153,7 @@ fn boot_database() -> &'static BootDatabase {
     &BOOT
 }
 
-/// Load project settings without letting dotenv grant gateway provenance.
+/// INVARIANT: Load project settings without letting dotenv grant gateway provenance.
 pub fn load_database_environment() {
     let managed = std::env::var_os(MANAGED_DATABASE_ENV);
     let _ = dotenvy::dotenv();
@@ -176,31 +164,21 @@ pub fn load_database_environment() {
     scrub_database_url_from_process_env();
 }
 
-/// Pin [`database_url`], then remove `DATABASE_URL` from the engine's own
-/// process env, so no subprocess inherits the engine's database (ADR 0481).
-///
-/// Call it at boot, before anything spawns and before
-/// `environment_variables::apply_to_process_env`. A user variable named
-/// `DATABASE_URL` applied after it still reaches children.
 pub fn scrub_database_url_from_process_env() {
     database_url();
     std::env::remove_var("DATABASE_URL");
     std::env::remove_var(MANAGED_DATABASE_ENV);
 }
 
-/// The engine-owned variable naming the workspace database, read-only by
-/// default. A name no libpq tool or ORM reads unasked (ADR 0481).
 pub const LUCIDOS_DATABASE_URL: &str = "LUCIDOS_DATABASE_URL";
 
-/// The agent role's read-only URL, set once at boot (ADR 0509).
 static AGENT_DATABASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Record the URL [`agent_role::provision`] returned, for every later spawn.
 pub fn set_agent_database_url(url: String) {
     let _ = AGENT_DATABASE_URL.set(url);
 }
 
-/// The `LUCIDOS_DATABASE_URL` pair for an agent-facing subprocess: coding-agent
+/// INVARIANT: The `LUCIDOS_DATABASE_URL` pair for an agent-facing subprocess: coding-agent
 /// sessions, chat `run_bash` / `run_python`, scripts, triggers and background
 /// tasks. Nothing else gets it.
 ///
@@ -213,7 +191,7 @@ pub fn lucidos_database_url_env() -> Option<(String, String)> {
         .map(|url| (LUCIDOS_DATABASE_URL.to_string(), url.clone()))
 }
 
-/// Convert a credential `service_name` or an OAuth provider name into the
+/// INVARIANT: Convert a credential `service_name` or an OAuth provider name into the
 /// `{NAME}` segment of an injected env var (`CRED_{NAME}`, `OAUTH_{NAME}_…`):
 /// uppercased, with every character outside `[A-Z0-9_]` replaced by `_`.
 ///
@@ -243,9 +221,6 @@ pub fn env_var_segment(name: &str) -> String {
 
 pub use lucidos_diagnostic_log::redaction::redact_postgres_secrets;
 
-/// Applies `mask` to every string in `value`, object keys included, so no
-/// JSON masker can miss a key. `mask` returns `None` for a string it leaves
-/// unchanged.
 pub(crate) fn mask_json_strings(
     value: &mut serde_json::Value,
     mask: &impl Fn(&str) -> Option<String>,
@@ -271,7 +246,7 @@ pub(crate) fn mask_json_strings(
     }
 }
 
-/// Renames each key of `map` that `mask` changes.
+/// INVARIANT: Renames each key of `map` that `mask` changes.
 ///
 /// Masked keys can collide with each other or with a plain key. A plain key
 /// keeps its name, and a masked one takes the first free `<masked> (n)`, so
@@ -289,8 +264,6 @@ fn mask_object_keys(
         .into_iter()
         .filter_map(|(key, masked)| Some((masked, map.remove(&key)?)))
         .collect();
-    // Each masked name resumes its count where the last collision stopped,
-    // so many keys that mask alike stay linear.
     let mut next_suffix: std::collections::HashMap<String, usize> = Default::default();
     for (masked, value) in moved {
         let key = if map.contains_key(&masked) {
@@ -309,7 +282,7 @@ fn mask_object_keys(
     }
 }
 
-/// Recursively apply `redact_postgres_secrets` to every string inside a
+/// INVARIANT: Recursively apply `redact_postgres_secrets` to every string inside a
 /// `serde_json::Value`, object keys included. Scrubs a tool call's `args`
 /// before they reach the event store or the SSE stream, since a Bash
 /// `command` can carry a hardcoded URL.
@@ -331,23 +304,15 @@ pub use lucidos_diagnostic_log::redaction::{
     redact_secret_bytes, redact_secret_values, MIN_REDACTABLE_SECRET_LEN, REDACTED_MARKER,
 };
 
-/// Directory structure within workspace/data/
 pub const DATA_DIR: &str = "data";
 pub const ARTIFACTS_DIR: &str = "data/artifacts";
 pub const APPS_DIR: &str = "data/apps";
 pub const KNOWHOW_DIR: &str = "data/knowhow";
 pub const TRIGGERS_DIR: &str = "data/triggers";
 
-/// Ephemeral scratch, workspace-root-relative and OUTSIDE `data/`: gitignored,
-/// not indexed, safe to delete. Several tools land files here and print this
-/// prefix back to the LLM. What the file tools resolve and what those tools
-/// advertise must be one string.
-///
-/// A `/`-joined relative path rather than a `PathBuf`, because it is matched
-/// against LLM-supplied path strings as often as it is joined onto a root.
 pub const TMP_DIR: &str = ".lucidos/tmp";
 
-/// Whether a normalized data path names a file inside [`TMP_DIR`]. Sibling of
+/// INVARIANT: Whether a normalized data path names a file inside [`TMP_DIR`]. Sibling of
 /// [`is_system_knowhow_path`]: the two together are the whole set of prefixes
 /// the file tools resolve outside `data/`, and both gate read-only enforcement.
 ///
@@ -363,8 +328,6 @@ pub fn is_tmp_path(data_path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Write `value` as pretty JSON through a temp file and a rename, creating the
-/// parent directory. A crash mid-write leaves the previous file whole.
 pub fn write_json_atomic(
     path: &std::path::Path,
     value: &impl serde::Serialize,
@@ -412,17 +375,10 @@ pub use subprocess_secrets::{
 pub use system_knowhow::{is_system_knowhow_path, resolve_system_knowhow_dir, SystemKnowhowStore};
 pub use system_widgets::{resolve_system_widgets_dir, BUILT_IN_WIDGET_PREFIX};
 
-/// Migrate legacy `prompts/` directories to `intents/` across the workspace.
-///
-/// Handles three levels:
-/// - `data/prompts/` → individual files become standalone triggers in `data/triggers/`
-/// - `data/apps/*/prompts/` → renamed to `data/apps/*/intents/`
-/// - `data/apps/*/triggers/` left as-is (already correct)
 pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
     log_legacy!("[Migration] Checking for legacy prompts/ directories...");
     let data_dir = workspace.join(DATA_DIR);
 
-    // Top-level prompts become standalone triggers (each .md gets its own dir)
     let top_prompts = data_dir.join("prompts");
     if top_prompts.is_dir() {
         let triggers_dir = data_dir.join("triggers");
@@ -482,7 +438,6 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
         }
     }
 
-    // App-level prompts/ → intents/ (simple rename)
     let apps_dir = data_dir.join("apps");
     if apps_dir.is_dir() {
         match std::fs::read_dir(&apps_dir) {
@@ -511,7 +466,7 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
     }
 }
 
-/// Engine-managed entries in every workspace's `.gitignore`. Workspaces
+/// INVARIANT: Engine-managed entries in every workspace's `.gitignore`. Workspaces
 /// auto-track their `data/` tree under git (artifacts), so anything the
 /// engine writes there that should NOT be versioned has to be listed here.
 ///
@@ -527,15 +482,9 @@ const WORKSPACE_GITIGNORE_ENTRIES: &[&str] = &[
     "data/postgres/",
     "data/blobs/",
     "data/.env",
-    // Installed *plugin media* (`plugin_media::INSTALLED_DIR`, ADR 0414).
     "data/plugin-media/",
 ];
 
-/// Ensure the workspace `.gitignore` exists and contains every
-/// engine-managed entry from `WORKSPACE_GITIGNORE_ENTRIES`. Idempotent:
-/// pre-existing entries are left untouched (line-equality), missing
-/// entries are appended. Returns `true` when the file was created or
-/// updated — callers may use that as a signal to commit the change.
 pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::io::Result<bool> {
     let path = workspace.join(".gitignore");
     let existing = match std::fs::read_to_string(&path) {
@@ -564,17 +513,6 @@ pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::i
     Ok(true)
 }
 
-/// Keep `<workspace>/.lucidos` out of Time Machine and every other file-level
-/// backup (ADR 0153). It can still hold a legacy `backup.key`, which decrypts
-/// every archive this workspace uploaded before the key store (ADR 0509).
-///
-/// The gateway marks the same directory when it spawns an engine, so this
-/// covers the launch that skips the gateway: e2e, a test harness, an engine
-/// started by hand. Creating the directory first keeps the call quiet on a
-/// workspace that has none yet.
-///
-/// Returns whether the exclusion was newly set, so the caller logs the change
-/// alone and stays silent on every later boot.
 pub fn ensure_state_dir_excluded_from_file_backup(
     workspace: &std::path::Path,
 ) -> std::io::Result<bool> {
@@ -595,23 +533,10 @@ pub use store::{
 pub use webhook_deliveries::DeliveryLedger;
 pub use webhooks::{Webhook, WebhookStore};
 
-/// The commit whose tree an index was built from, and so the only parent a
-/// commit of that index may take. `None` is an unborn HEAD.
-///
-/// [`commit_index`] takes it rather than re-reading HEAD. A HEAD that moved
-/// after the index was built would otherwise become the parent of a tree that
-/// lacks the mover's changes, silently reverting them.
 #[must_use = "pass it to `commit_index` so a moved HEAD is refused"]
 #[derive(Clone, Copy, Debug)]
 pub struct IndexBase(Option<git2::Oid>);
 
-/// Reset the index to match HEAD's tree before staging. Drops entries a
-/// previous `commit_*` staged without committing. Leaves the index alone on a
-/// fresh repo with no HEAD yet.
-///
-/// Returns the commit it read, which the commit of this index must sit on.
-/// This is the only way to obtain an [`IndexBase`], so every commit stages on
-/// a known tree.
 pub fn reset_index_to_head(
     repo: &git2::Repository,
     index: &mut git2::Index,
@@ -624,37 +549,6 @@ pub fn reset_index_to_head(
     Ok(base)
 }
 
-/// Did this git2 error mean "another writer of the same repo got there first",
-/// rather than "the operation itself is wrong"? The single place both contended
-/// shapes are classified and documented, and what
-/// [`retry_while_repo_contended`] retries on.
-///
-/// **`Locked`, lost a git lock file.** Every git lock is CROSS-PROCESS and
-/// non-blocking, so a writer inside another writer's window fails outright
-/// rather than waiting. `Locked` is libgit2's single answer for "a lock file
-/// blocked this", whatever the lock was.
-///
-/// Match on the CODE alone: the class only says where libgit2 noticed. It writes
-/// `Index` for `.git/index.lock`, and `Os` for every other lock. A held
-/// `refs/heads/main.lock` takes the second route, and both are locks an ordinary
-/// write meets:
-///
-/// ```text
-/// {"error":"failed to lock file '<ws>/.git/refs/heads/main.lock' for writing: ; class=Os (2); code=Locked (-14)"}
-/// ```
-///
-/// **`Modified`, HEAD moved under the commit.** `commit_index` names the
-/// [`IndexBase`] as the parent and asks libgit2 to move HEAD off exactly that
-/// commit. The competitor can be another git2 handle in THIS process or an
-/// out-of-process `git` CLI writer. libgit2 notices in one of two places:
-///
-/// - `Object`: HEAD had already moved when the commit started.
-/// - `Reference`: HEAD moved during the commit, and the swap failed.
-///
-/// ```text
-/// {"error":"failed to create commit: current tip is not the first parent; class=Object (3); code=Modified (-15)"}
-/// {"error":"old reference value does not match; class=Reference (4); code=Modified (-15)"}
-/// ```
 pub fn is_transient_repo_contention(e: &git2::Error) -> bool {
     use git2::{ErrorClass, ErrorCode};
     match e.code() {
@@ -664,7 +558,7 @@ pub fn is_transient_repo_contention(e: &git2::Error) -> bool {
     }
 }
 
-/// Run a git2 repository write, retrying briefly while another writer of the
+/// INVARIANT: Run a git2 repository write, retrying briefly while another writer of the
 /// same repo keeps winning the race. See [`is_transient_repo_contention`] for
 /// the two shapes that counts as, and for why each one happens.
 ///
@@ -702,18 +596,6 @@ pub fn retry_while_repo_contended<T>(
     }
 }
 
-/// Brand-new workspace: write `lucidos.toml` pinning the allocated vite port
-/// and commit it. `git status` is then clean from the first boot, and the port
-/// survives any later port-registry drift.
-///
-/// An existing `lucidos.toml` is left strictly untouched and reported as
-/// `false`, since the user may have hand-edited its pin. The caller gates this
-/// on having just git-init'd the workspace, so an existing one is never
-/// surprised by a freshly-pinned port.
-///
-/// Crash-safety: a failure in the commit phase removes the file again, so the
-/// working tree stays clean. The engine gate is one-shot and will not retry the
-/// pin, but the workspace is at least not left dirty with an untracked file.
 pub fn pin_workspace_vite_port(
     workspace: &std::path::Path,
     vite_port: u16,
@@ -734,7 +616,7 @@ pub fn pin_workspace_vite_port(
     }
 }
 
-/// Deliberately NOT routed through `retry_while_repo_contended`: this runs once
+/// INVARIANT: Deliberately NOT routed through `retry_while_repo_contended`: this runs once
 /// during engine startup on a workspace we just git-init'd, before any manager,
 /// timer or agent session exists to compete for HEAD. Its staging also happens
 /// outside any closure, so wrapping it would be unsafe without restructuring it
@@ -751,7 +633,7 @@ fn commit_new_lucidos_toml(
     Ok(())
 }
 
-/// Open the workspace repo at `workspace_path`, stage the given `data/`-relative
+/// INVARIANT: Open the workspace repo at `workspace_path`, stage the given `data/`-relative
 /// paths (additions/modifications), and commit them in one commit. Returns the
 /// commit sha.
 ///
@@ -770,7 +652,7 @@ pub fn commit_data_paths_added(
     commit_data_paths_with_overrides(workspace_path, data_relative_paths, &[], &[], message)
 }
 
-/// [`commit_data_paths_added`], but recording chosen paths from a buffer
+/// INVARIANT: [`commit_data_paths_added`], but recording chosen paths from a buffer
 /// instead of from the working tree.
 ///
 /// A plugin update that merges the user's local edits needs the two to differ.
@@ -798,8 +680,6 @@ pub fn commit_data_paths_with_overrides(
     removals: &[String],
     message: &str,
 ) -> Result<String, git2::Error> {
-    // Validate before the retry loop: a rejected path is the caller's answer,
-    // not contention, so re-checking it on every attempt buys nothing.
     for p in data_relative_paths.iter().chain(removals) {
         if is_path_traversal(p) {
             return Err(git2::Error::from_str(&format!(
@@ -834,13 +714,6 @@ pub fn commit_data_paths_with_overrides(
     })
 }
 
-/// A regular-file index entry for `repo_relative`, naming blob `id`.
-///
-/// Two callers with two needs. `Index::add_frombuffer` hashes the buffer and
-/// fills the id in itself, so it takes `Oid::zero()`. `merge_file_from_index`
-/// reads the id to find the blob, so it takes a real one. Neither consults the
-/// stat fields, which is why they stay zeroed. `mode` is `0o100644` or
-/// `0o100755`, the only two git records for a regular file.
 pub fn blob_index_entry(repo_relative: &str, id: git2::Oid, mode: u32) -> git2::IndexEntry {
     git2::IndexEntry {
         ctime: git2::IndexTime::new(0, 0),
@@ -858,13 +731,6 @@ pub fn blob_index_entry(repo_relative: &str, id: git2::Oid, mode: u32) -> git2::
     }
 }
 
-/// Open the workspace repo, stage the deletion of the given `data/`-relative
-/// paths (already removed from disk), and commit. Returns `Ok(None)` when none
-/// of the paths were tracked — nothing to commit (e.g. a legacy plugin whose
-/// files were never committed because of the install git-tracking bug this is
-/// the uninstall counterpart of). Paths not present in the index are skipped so
-/// a mix of tracked and never-committed files commits the tracked deletions
-/// without erroring on the rest.
 pub fn commit_data_paths_removed(
     workspace_path: &std::path::Path,
     data_relative_paths: &[String],
@@ -879,8 +745,6 @@ pub fn commit_data_paths_removed(
             if is_path_traversal(p) {
                 continue;
             }
-            // `remove_path` errors when the entry isn't in the index (untracked
-            // or never-committed file). Tolerate that and keep going.
             if index
                 .remove_path(std::path::Path::new(&format!("data/{}", p)))
                 .is_ok()
@@ -896,13 +760,6 @@ pub fn commit_data_paths_removed(
     })
 }
 
-/// Create a commit from the current index state, on top of `base`.
-///
-/// libgit2 refuses the commit unless HEAD is still `base`, and its HEAD update
-/// is a compare-and-swap against it. So this races any other writer of the
-/// repo, and a loser fails with `Modified`. Call it inside
-/// [`retry_while_repo_contended`], which turns that loss into a re-run onto the
-/// winner's head; see [`is_transient_repo_contention`].
 pub fn commit_index(
     repo: &git2::Repository,
     message: &str,
@@ -922,7 +779,7 @@ pub fn commit_index(
     Ok(commit_id.to_string())
 }
 
-/// [`commit_index`], except that an index already identical to HEAD's tree
+/// INVARIANT: [`commit_index`], except that an index already identical to HEAD's tree
 /// reports HEAD's own sha instead of recording an empty commit.
 ///
 /// This is what makes the DELETE helpers safe to retry. Each changes the
@@ -943,8 +800,6 @@ pub fn commit_index_unless_unchanged(
 ) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
     let tree_id = index.write_tree()?;
-    // `if let Ok` rather than `?`, matching `commit_all_dirty`: an unborn HEAD
-    // has no tree to compare against and must fall through to a root commit.
     if let Ok(head) = repo.head() {
         if let Ok(head_commit) = head.peel_to_commit() {
             if head_commit.tree()?.id() == tree_id {
@@ -955,7 +810,7 @@ pub fn commit_index_unless_unchanged(
     commit_index(repo, message, base)
 }
 
-/// Reject paths that would escape the directory they get joined onto: any `..`
+/// INVARIANT: Reject paths that would escape the directory they get joined onto: any `..`
 /// component, or an absolute path. A symlink escape needs
 /// [`contained_path::join_contained`] on top.
 ///
@@ -971,17 +826,11 @@ pub fn is_path_traversal(path: &str) -> bool {
     path.contains("..") || path.starts_with('/') || path.starts_with('\\')
 }
 
-/// The path under `data/artifacts/` that a tool's save-path argument names.
-///
-/// Agents pass the data path they paste into chat (`artifacts/x.png`) as often
-/// as the artifact-relative one (`x.png`), so both name `x.png`. Taken
-/// literally, the first lands in `data/artifacts/artifacts/`, where no link
-/// the agent writes afterwards points.
 pub fn artifact_relative_path(path: &str) -> &str {
     path.strip_prefix("artifacts/").unwrap_or(path)
 }
 
-/// Stage `repo_path` into `index`, unless git ignores it.
+/// INVARIANT: Stage `repo_path` into `index`, unless git ignores it.
 ///
 /// `index.add_path` does NOT consult `.gitignore`. It stages whatever path it
 /// is handed, so an ignored file enters a commit the moment a caller names it.
@@ -1013,7 +862,6 @@ pub(crate) fn add_path_unless_ignored(
     index.add_path(path)
 }
 
-/// Whether a file extension indicates a binary file.
 pub fn is_binary_extension(ext: &str) -> bool {
     matches!(
         ext,
@@ -1051,12 +899,6 @@ pub fn is_binary_extension(ext: &str) -> bool {
     )
 }
 
-/// Pull the `---\n...\n---\n` YAML header off a markdown file, returning the
-/// trimmed frontmatter block and the body.
-///
-/// The two field-specific parsers share this prefix, but each parses its own
-/// fields. Their downstream semantics diverge on the field type and on whether
-/// a missing value derives from the body.
 pub(crate) fn split_md_frontmatter(text: &str) -> Option<(&str, String)> {
     if !text.starts_with("---") {
         return None;
@@ -1071,7 +913,6 @@ pub(crate) fn split_md_frontmatter(text: &str) -> Option<(&str, String)> {
     ))
 }
 
-/// Parse `name:` and a configurable list field out of markdown frontmatter.
 pub(crate) fn parse_md_frontmatter(
     text: &str,
     list_field: &str,
@@ -1112,12 +953,10 @@ pub(crate) fn parse_md_frontmatter(
     Some((name, list_values, body))
 }
 
-/// Strip null bytes from a string. PostgreSQL JSONB rejects \u0000.
 pub fn sanitize_for_jsonb(s: &str) -> String {
     s.replace('\0', "")
 }
 
-/// Format a byte count as a human-readable size string (e.g. `1.5 KB`, `2.5 MB`).
 pub fn format_byte_size(bytes: usize) -> String {
     if bytes >= 1_048_576 {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
@@ -1132,7 +971,6 @@ pub fn format_byte_size(bytes: usize) -> String {
 mod database_url_tests {
     use super::{database_url, scrub_database_url_from_process_env};
 
-    /// Both tests set and restore `DATABASE_URL`, so they must not interleave.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -1219,16 +1057,11 @@ mod database_url_tests {
         }
     }
 
-    /// The reported case: a user stores `DATABASE_URL` for their own project,
-    /// and startup copies it into the process env after the engine connected.
-    /// Every later backup ran `pg_dump` against that project instead.
     #[test]
     fn a_later_database_url_variable_does_not_move_the_engine() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let booted = database_url();
         let prior = std::env::var_os("DATABASE_URL");
-        // Nothing else in this crate's tests reads DATABASE_URL, which is why
-        // this names a URL no test connects to.
         std::env::set_var(
             "DATABASE_URL",
             "postgres://user:pw@localhost:5432/someone_elses_app",
@@ -1248,9 +1081,6 @@ mod database_url_tests {
             .map(str::to_string)
     }
 
-    /// The incident: every engine child inherited the engine's own database
-    /// URL. A plain spawn, with no per-site env clearing, must not see it,
-    /// while a user variable applied later still reaches the child (ADR 0481).
     #[test]
     fn no_child_inherits_the_engines_database_url_but_a_user_one_reaches_it() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1285,9 +1115,6 @@ mod is_tmp_path_tests {
 
     #[test]
     fn is_anchored_on_the_separator_not_the_string() {
-        // The reason this is a named predicate rather than a bare
-        // starts_with: it guards a security boundary, so a sibling that
-        // merely shares the prefix must not slip through.
         assert!(!is_tmp_path(".lucidos/tmpfoo"));
         assert!(!is_tmp_path(".lucidos/tmp-old/x"));
         assert!(!is_tmp_path(".lucidos/tmp"));
@@ -1298,7 +1125,6 @@ mod is_tmp_path_tests {
         assert!(!is_tmp_path("artifacts/notes.md"));
         assert!(!is_tmp_path(".lucidos/worktrees/thread-x/src/main.rs"));
         assert!(!is_tmp_path(".lucidos/exhaust/run.log"));
-        // Not anchored at the start either: an artifact cannot spoof it.
         assert!(!is_tmp_path("artifacts/.lucidos/tmp/x.md"));
     }
 }
@@ -1319,7 +1145,7 @@ mod format_byte_size_tests {
     }
 }
 
-/// An *event wait* `reason` with a leading waiting phrase removed, for a label
+/// INVARIANT: An *event wait* `reason` with a leading waiting phrase removed, for a label
 /// that already said "wait".
 ///
 /// The engine-side twin of `awaitedSubject`
@@ -1332,7 +1158,7 @@ mod format_byte_size_tests {
 /// The TS twin also eats leading whitespace, which this does not need: the one
 /// caller trims the reason before asking.
 fn awaited_subject(reason: &str) -> &str {
-    // Matched as verb, gap, preposition rather than as six literal phrases.
+    // INVARIANT: Matched as verb, gap, preposition rather than as six literal phrases.
     // The TS twin's `\s+` accepts ANY run of whitespace, and the two must not
     // disagree: a single-space literal list left `waiting  for the lock`
     // stripped in the transcript and doubled here.
@@ -1344,14 +1170,13 @@ fn awaited_subject(reason: &str) -> &str {
             let Some(subject) = strip_word(rest, preposition) else {
                 continue;
             };
-            // A strip that emptied the reason would leave a dangling colon.
             return if subject.is_empty() { reason } else { subject };
         }
     }
     reason
 }
 
-/// `s` past a leading `word` and the whitespace after it, or `None` when `s`
+/// INVARIANT: `s` past a leading `word` and the whitespace after it, or `None` when `s`
 /// does not open on that whole word.
 ///
 /// The trailing whitespace is what makes it a WORD match: without it
@@ -1373,7 +1198,7 @@ fn strip_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
     Some(rest)
 }
 
-/// Head-truncate `s` to `max` bytes, appending `...` when it actually cuts.
+/// INVARIANT: Head-truncate `s` to `max` bytes, appending `...` when it actually cuts.
 /// Returns `s` unchanged when it already fits. UTF-8-safe.
 ///
 /// **The appended `...` is part of the return value**, so a caller must not
@@ -1386,21 +1211,16 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        // Find the last char boundary at or before `max` to avoid
-        // panicking on multi-byte UTF-8 characters (e.g. æ, ø, å).
         let end = s.floor_char_boundary(max);
         format!("{}...", &s[..end])
     }
 }
 
-/// Truncate `s` to roughly `max` bytes, joining the head and tail with `…`
-/// so that meaningful suffixes (filenames, file extensions, query tails)
-/// survive. Returns `s` unchanged when it already fits. UTF-8-safe.
 pub fn middle_truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    const ELLIPSIS: &str = "…"; // 3 bytes, 1 char
+    const ELLIPSIS: &str = "…";
     if max <= ELLIPSIS.len() {
         return ELLIPSIS.to_string();
     }
@@ -1410,18 +1230,11 @@ pub fn middle_truncate(s: &str, max: usize) -> String {
     let head_end = s.floor_char_boundary(head_bytes);
     let tail_start = s.ceil_char_boundary(s.len() - tail_bytes);
     if tail_start <= head_end {
-        // Boundary snapping collapsed the cuts (multi-byte char straddling both
-        // ends with a tiny budget). Return just the ellipsis rather than the
-        // original — the caller asked for shortening.
         return ELLIPSIS.to_string();
     }
     format!("{}{}{}", &s[..head_end], ELLIPSIS, &s[tail_start..])
 }
 
-/// First non-empty line of a command, trimmed. A step label is one line of
-/// HTML, and a newline collapses to a space there. A multi-line script must
-/// therefore condense to its opening line, rather than render as a garbled
-/// run-on. Shared by the engine and coding-agent description paths.
 fn first_command_line(cmd: &str) -> &str {
     cmd.lines()
         .find(|l| !l.trim().is_empty())
@@ -1429,7 +1242,7 @@ fn first_command_line(cmd: &str) -> &str {
         .unwrap_or(cmd)
 }
 
-/// Shell basenames that mark a `<shell> -c <script>` wrapper, for the step-row
+/// INVARIANT: Shell basenames that mark a `<shell> -c <script>` wrapper, for the step-row
 /// label ([`shell_script_body`]).
 ///
 /// A SUPERSET of `command_guard::GUARD_SHELLS`, which unwraps the same shapes to
@@ -1447,7 +1260,7 @@ fn first_command_line(cmd: &str) -> &str {
 ///   surface, which is a security change on its own terms.
 pub const WRAPPER_SHELLS: [&str; 7] = ["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"];
 
-/// The script inside a login-shell wrapper, or `cmd` unchanged when there is no
+/// INVARIANT: The script inside a login-shell wrapper, or `cmd` unchanged when there is no
 /// wrapper to see through.
 ///
 /// Codex reports a shell step as the whole invocation its harness built, where
@@ -1476,9 +1289,6 @@ fn shell_script_body(cmd: &str) -> Cow<'_, str> {
     let Some((flags, script)) = rest.trim_start().split_once(char::is_whitespace) else {
         return Cow::Borrowed(cmd);
     };
-    // `-c`, `-lc`, `-ic`: one cluster of letters including the flag that says
-    // "the next argument is the script". Anything else (`--norc`, a bare `-`, a
-    // flag that takes its own value) means this is not the shape we can read.
     let Some(letters) = flags.strip_prefix('-') else {
         return Cow::Borrowed(cmd);
     };
@@ -1490,11 +1300,8 @@ fn shell_script_body(cmd: &str) -> Cow<'_, str> {
     }
     let script = script.trim();
     match script.as_bytes().first() {
-        // A quoted script has to be exactly ONE quoted word. In
-        // `zsh -lc "a" && "b"` no part is "the command", so the label shows
-        // the invocation verbatim rather than a confident half of it.
         Some(b'\'' | b'"') => unquote_shell_word(script).unwrap_or(Cow::Borrowed(cmd)),
-        // An UNQUOTED suffix is the script only when it is a single word.
+        // INVARIANT: An UNQUOTED suffix is the script only when it is a single word.
         // POSIX `sh -c` reads ONE operand as the script and assigns the rest to
         // the positional parameters. So `zsh -lc git status` runs `git` with
         // `$0=status`, and reading it as `git status` would put a command in
@@ -1504,28 +1311,17 @@ fn shell_script_body(cmd: &str) -> Cow<'_, str> {
     }
 }
 
-/// The contents of `s` when it is exactly ONE quoted shell word, unescaped for
-/// that quoting style. `None` when `s` is unquoted, unterminated, or carries
-/// anything after its closing quote. `"a" && "b"` is two words and a pipeline
-/// rather than one script, and stripping its outer quotes would claim
-/// otherwise.
 fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
     let bytes = s.as_bytes();
     let quote = *bytes.first()?;
     if quote != b'\'' && quote != b'"' {
         return None;
     }
-    // Lazily allocated: a script with no escapes borrows straight out of `s`.
     let mut unescaped: Option<String> = None;
     let mut chunk_start = 1;
     let mut i = 1;
-    // Byte scanning is UTF-8-safe here: every byte compared against is ASCII
-    // and a continuation byte is always >= 0x80, so a cut only ever lands on a
-    // char boundary.
     while i < bytes.len() {
         if bytes[i] == quote {
-            // A single-quoted script cannot contain a quote, so the wrapper
-            // spells one as close, escape, reopen. That is not the terminator.
             if quote == b'\'' && s[i..].starts_with("'\\''") {
                 let buf = unescaped.get_or_insert_with(String::new);
                 buf.push_str(&s[chunk_start..i]);
@@ -1545,8 +1341,6 @@ fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
                 None => Cow::Borrowed(&s[1..i]),
             });
         }
-        // Inside double quotes a backslash escapes exactly four characters plus
-        // a line continuation. Before anything else it is a literal backslash.
         if quote == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             if matches!(next, b'"' | b'\\' | b'$' | b'`' | b'\n') {
@@ -1562,10 +1356,10 @@ fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
         }
         i += 1;
     }
-    None // unterminated
+    None
 }
 
-/// The bare tool name inside an `mcp__<server>__<tool>` identifier, or `None`
+/// INVARIANT: The bare tool name inside an `mcp__<server>__<tool>` identifier, or `None`
 /// when `name` is not shaped like one. Every surface uses that naming: the
 /// engine's own MCP client, Claude Code natively, and Codex, whose
 /// `mcp_tool_call` item is deliberately rebuilt into the same shape
@@ -1576,8 +1370,6 @@ fn mcp_tool_suffix(name: &str) -> Option<&str> {
     rest.find("__").map(|sep| &rest[sep + 2..])
 }
 
-/// Summarize a `glob_files` or `grep_files` JSON result as
-/// "N items[, truncated]".
 fn describe_search_result(result: &str, items_key: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(result).ok()?;
     let count = parsed.get(items_key)?.as_array()?.len();
@@ -1604,7 +1396,7 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
         "grep_files" => describe_search_result(result, "matches"),
         "search_artifacts" => Some(format!("{} results", result.lines().count())),
         "run_python" | "run_bash" => result.lines().next().map(|l| truncate(l, 100)),
-        "write_file" | "edit_file" | "create_app" | "execute_intent" => Some("Done".to_string()), // Includes the retired intent tool.
+        "write_file" | "edit_file" | "create_app" | "execute_intent" => Some("Done".to_string()),
         "git_commit" => result.lines().next().map(|l| truncate(l, 80)),
         "git_diff" | "git_log" => Some(format!("{} lines", result.lines().count())),
         "http_request" | "proxy_request" => result.lines().next().map(|l| truncate(l, 80)),
@@ -1618,25 +1410,10 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
     }
 }
 
-/// Human-friendly description of a tool call, used for progress steps in both
-/// live streaming (`engine/chat/process`) and session replay (`core/store`).
-///
-/// The `Executing <name>...` fallback exists only for genuinely unknowable
-/// names: a third-party MCP tool with no `mcp__` prefix, or a historical event
-/// replaying a retired tool. Everything the engine ships is labelled in
-/// [`tool_label`], and `every_known_tool_name_has_a_step_label` fails the build
-/// otherwise, so the fallback can never render a registered tool's raw name.
 pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
     tool_label(name, args).unwrap_or_else(|| format!("Executing {}...", name))
 }
 
-/// Step label for a search action: the verb plus the query it was given.
-///
-/// The query is quoted back because this label is the user's only view of what
-/// the agent went looking for. A bare "Searching memory" reads as rummaging.
-/// Bounded like every sibling that renders a model-supplied string: these
-/// schemas invite a full sentence, and an unbounded one becomes a step row as
-/// wide as the transcript.
 fn search_label(verb: &str, args: &serde_json::Value) -> String {
     match args["q"].as_str().map(str::trim).filter(|q| !q.is_empty()) {
         Some(q) => format!("{verb} for \"{}\"...", middle_truncate(q, 50)),
@@ -1644,7 +1421,6 @@ fn search_label(verb: &str, args: &serde_json::Value) -> String {
     }
 }
 
-/// A recall step's label, naming what it looks for.
 fn recall_label(verb: &str, what: Option<&str>) -> String {
     match what.map(str::trim).filter(|w| !w.is_empty()) {
         Some(w) => format!("{verb} \"{}\" in memory...", middle_truncate(w, 50)),
@@ -1652,8 +1428,6 @@ fn recall_label(verb: &str, what: Option<&str>) -> String {
     }
 }
 
-/// The step label for the `threads` tool's `drafts` action: one thread's draft
-/// when a `thread_id` is named, every draft otherwise.
 fn drafts_label(args: &serde_json::Value) -> String {
     match args["thread_id"].as_str().map(str::trim) {
         Some(id) if !id.is_empty() => "Reading a thread's draft...".to_string(),
@@ -1661,14 +1435,10 @@ fn drafts_label(args: &serde_json::Value) -> String {
     }
 }
 
-/// The step label of the `threads` tool's `context_ceiling` action and its
-/// flat alias.
 const CONTEXT_CEILING_LABEL: &str = "Setting a context ceiling...";
 
-/// The step label of the `threads` tool's `submit_draft` action and its alias.
 const SUBMIT_DRAFT_LABEL: &str = "Submitting the saved draft...";
 
-/// The step label for the per-thread cache keep-alive switch.
 fn keep_alive_switch_label(args: &serde_json::Value) -> String {
     match args["state"].as_str() {
         Some("on") => "Turning the cache keep-alive back on...".to_string(),
@@ -1676,10 +1446,6 @@ fn keep_alive_switch_label(args: &serde_json::Value) -> String {
     }
 }
 
-/// The known-tool half of [`describe_tool`]: `Some(label)` for a name we ship,
-/// `None` for anything else. Split out from the fallback so the exhaustiveness
-/// guard test can ask "is this name labelled?" and get an honest answer, which
-/// it cannot do through `describe_tool` (the fallback labels everything).
 pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String> {
     Some(match name {
         "list_files" => "Listing files in workspace...".to_string(),
@@ -1704,10 +1470,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             args["destination"].as_str().unwrap_or("file")
         ),
         "delete_file" => format!("Deleting {}...", args["path"].as_str().unwrap_or("file")),
-        // No `output_path` branch: that key belongs to `http_request`'s schema
-        // (see the arm below), never `run_python`'s, which declares only `code`,
-        // `packages` and `commit_message` (`llm/tools/exec.rs`). The lookup could
-        // not match, so the arrow form was unreachable.
         "run_python" => "Running Python code...".to_string(),
         "run_bash" => {
             let cmd = args["command"].as_str().unwrap_or("command");
@@ -1758,9 +1520,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         ),
         "pause_trigger" => "Pausing trigger...".to_string(),
         "resume_trigger" => "Resuming trigger...".to_string(),
-        // No name in the label: the `run` action declares only `trigger_id`
-        // (`capability_manifest`, TRIGGERS_OPS), which is a uuid the user has
-        // never seen. There is no `name` key on the payload to prefer over it.
         "run_trigger" => "Running trigger now...".to_string(),
         "list_trigger_groups" => "Listing trigger groups...".to_string(),
         "create_trigger_group" => format!(
@@ -1785,7 +1544,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Setting environment variable {}...",
             args["name"].as_str().unwrap_or("variable")
         ),
-        // The flat set_language / set_timezone / enable_push_notifications arms
+        // INVARIANT: The flat set_language / set_timezone / enable_push_notifications arms
         // are kept for replaying historical events; new writes go through
         // set_preference.
         "set_preference" => format!(
@@ -1854,7 +1613,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some(id) => format!("Unloading know-how '{id}'..."),
             None => "Unloading know-how...".to_string(),
         },
-        // Retired: the dispatch refuses it and names `load_knowhow` instead.
         "execute_intent" => "Refusing the retired intent tool...".to_string(),
         "refresh_app" => format!(
             "Refreshing {}...",
@@ -1937,7 +1695,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                         .and_then(|v| v.as_str())
                         .unwrap_or("app")
                 ),
-                // `file_path`, not `path`: that is what `get_navigate_ui_tool`
+                // INVARIANT: `file_path`, not `path`: that is what `get_navigate_ui_tool`
                 // declares (`llm/tools/misc.rs`) and what the frontend reads off
                 // the `NavigationRequested` payload. Reading `path` matched no
                 // key, so every file navigation rendered the bare "Opening
@@ -1966,10 +1724,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 format!("Asking {} questions...", questions.len())
             }
             Some(questions) if questions.len() == 1 => {
-                // Show the question itself (truncated) — far friendlier than the
-                // raw tool name. Fall back to the short `header` chip, then a
-                // generic label. No trailing "..." here: a short question ends
-                // in "?" naturally, and `truncate` appends "..." when it cuts.
                 let q = &questions[0];
                 let text = q
                     .get("question")
@@ -1981,12 +1735,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             }
             _ => "Asking a question...".to_string(),
         },
-        // The one step whose label outlives its turn: the thread parks here and
-        // this row is what the user reads while it sleeps. So it leads with the
-        // model's own `reason` rather than the event names, which are the
-        // engine's vocabulary and answer a question nobody asked. No trailing
-        // "..." for the same reason as `ask_user_question`: the reason is a
-        // sentence, and `truncate` adds its own when it cuts.
         "await_event" => {
             let reason = args
                 .get("reason")
@@ -1994,30 +1742,20 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             match reason {
-                // `awaited_subject`, because this label supplies the verb: a
-                // reason opening "waiting for" would read "Waiting: waiting
-                // for".
                 Some(reason) => format!("Waiting: {}", truncate(awaited_subject(reason), 60)),
                 None => "Waiting for an event...".to_string(),
             }
         }
         "list_event_waits" => "Checking what this thread is waiting for...".to_string(),
-        // Names WHAT is being stopped rather than an id. The row sits beside
-        // the step that armed the wait, and a uuid there is a string the user
-        // cannot resolve to anything.
         "cancel_event_wait" => match args.get("all").and_then(|v| v.as_bool()) {
             Some(true) => "Stopping every subscription on this thread...".to_string(),
             _ => "Stopping a subscription...".to_string(),
         },
-        // The read action writes nothing, so the row must not claim it did.
         "todo_write" if args["action"] == "read" => "Reading todo list...".to_string(),
         "todo_write" => match args["todos"].as_array() {
             Some(todos) if todos.is_empty() => "Clearing todo list...".to_string(),
             _ => "Updating todo list...".to_string(),
         },
-        // The count, because the whole shape of this tool is one call carrying
-        // many questions. A label naming the state instead would report a
-        // fifty-question batch the same way it reports one.
         "judge" => match args["questions"].as_object().map(|q| q.len()) {
             Some(1) => "Judging 1 question...".to_string(),
             Some(n) => format!("Judging {} questions...", n),
@@ -2027,9 +1765,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Saving image to {}...",
             args["path"].as_str().unwrap_or("artifacts")
         ),
-        // `image` is a thread reference like "thread:2", exactly how the
-        // conversation history labels it. So it reads as something the user can
-        // find, rather than an internal id.
         "view_image" => format!("Viewing {}...", args["image"].as_str().unwrap_or("image")),
         "generate_image" => format!(
             "Generating image: {}...",
@@ -2047,9 +1782,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Running thread: {}...",
             middle_truncate(args["prompt"].as_str().unwrap_or("task"), 50)
         ),
-        // The message, never the `thread_id`. A raw uuid resolves to no child
-        // the user recognises, and the message is the one part of the call that
-        // says what is happening.
         "follow_up_child_thread" => match args["message"].as_str() {
             Some(message) => format!(
                 "Following up with child thread: {}...",
@@ -2100,11 +1832,8 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "notifications" | "read_notifications" => match args["action"].as_str() {
             Some("mark_read") => "Marking notification read...".to_string(),
             Some("mark_all_read") => "Marking all notifications read...".to_string(),
-            // `list` and the legacy `read_notifications` alias (no action).
             _ => "Reading notifications...".to_string(),
         },
-        // Grouped manifest tools — the flat per-verb arms above stay for the
-        // back-compat aliases; these arms label the consolidated tool by action.
         "triggers" => match args["action"].as_str() {
             Some("create") => format!(
                 "Creating trigger '{}'...",
@@ -2137,8 +1866,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             ),
             _ => "Reading preferences...".to_string(),
         },
-        // The flat `set_environment_variable` alias is labelled by its own arm
-        // above (no `action`); these arms label the grouped `env_vars` tool.
         "env_vars" => match args["action"].as_str() {
             Some("set") => format!(
                 "Setting environment variable {}...",
@@ -2214,13 +1941,12 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 None => "Counting events...".to_string(),
             },
             Some("event_types") => "Listing event types...".to_string(),
-            // `query` (and any unrecognised action) → query label.
             _ => format!(
                 "Querying {} events...",
                 args["event_type"].as_str().unwrap_or("all")
             ),
         },
-        // An arm for every action that writes. The default here is the list
+        // INVARIANT: An arm for every action that writes. The default here is the list
         // label, so an action falling through narrates a write as a read. The
         // wording matches the flat aliases above, and a test holds them equal.
         "changes" => match args["action"].as_str() {
@@ -2232,8 +1958,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("bring_back") => "Bringing a change back...".to_string(),
             _ => "Listing changes...".to_string(),
         },
-        // Flat back-compat aliases for the two LLM-exposed `thread_queue`
-        // actions; same wording as the grouped arm below.
         "list_thread_queue" => "Listing Thread Queue...".to_string(),
         "update_thread_queue_policy" => "Updating Thread Queue policy...".to_string(),
         "thread_queue" => match args["action"].as_str() {
@@ -2242,7 +1966,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("drop") => "Dropping queued entry...".to_string(),
             _ => "Listing Thread Queue...".to_string(),
         },
-        // The GROUPED names are what the model actually emits, since the flat
+        // INVARIANT: The GROUPED names are what the model actually emits, since the flat
         // ones are back-compat aliases that are never offered. So a grouped arm
         // ignoring `action` mislabels every action but one, and rendering a
         // read as "Updating memory..." claims a write that never happened.
@@ -2354,16 +2078,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
     })
 }
 
-/// The step-row verb a Codex `file_change` kind implies.
-///
-/// The kind arrives as `{"type": "add"}` over the app-server protocol and as a
-/// bare `"add"` from older exec frames, so both resolve. An unrecognized one
-/// reads "Change", which is true of every kind and claims nothing extra.
-///
-/// The vocabulary is deliberately Claude Code's, rather than the sentence verbs
-/// `PermissionCard` uses. That card builds a sentence. This is a step label,
-/// and it has to read like the label on a Claude Code row carrying the same
-/// edit.
 fn change_kind_verb(kind: Option<&serde_json::Value>) -> &'static str {
     let name = match kind {
         Some(serde_json::Value::String(s)) => s.as_str(),
@@ -2378,7 +2092,6 @@ fn change_kind_verb(kind: Option<&serde_json::Value>) -> &'static str {
     }
 }
 
-/// Human-friendly description of a Claude Code tool call.
 pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
     fn basename(p: &str) -> &str {
         p.rsplit('/').next().unwrap_or(p)
@@ -2475,16 +2188,11 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
                 format!("Edit {}", basename(p))
             }
         }
-        // Same label as Codex's `todo_list` below. The two backends' plan steps
+        // INVARIANT: Same label as Codex's `todo_list` below. The two backends' plan steps
         // are one thing to the user and must read alike. The frontend already
         // assumes that, rendering both with one marker list.
         "TodoWrite" => "Update plan".into(),
         "ExitPlanMode" => "Present plan for approval".into(),
-        // Codex item types (see runtime/codex_parse.rs). Codex reports
-        // coarse-grained items, not named tools. Each arm lands on the SAME
-        // sentence its Claude Code counterpart produces: the two backends share
-        // every transcript component, so a row that reads differently is the
-        // only thing left that can tell them apart.
         "command_execution" => {
             let script = shell_script_body(str_arg("command"));
             let line = first_command_line(&script);
@@ -2500,9 +2208,6 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
                     .iter()
                     .map(|c| change_kind_verb(c.get("kind")))
                     .collect();
-                // One verb for the whole set only when they agree: a patch that
-                // both creates and deletes is a "change", same honesty rule
-                // `renderFileChangeQuestion` applies on the permission card.
                 let verb = if verbs.windows(2).all(|w| w[0] == w[1]) {
                     verbs[0]
                 } else {
@@ -2511,7 +2216,6 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
                 if changes.len() > 1 {
                     format!("{} {} files", verb, changes.len())
                 } else {
-                    // Indexing is safe: this arm is guarded on a non-empty array.
                     match changes[0]
                         .get("path")
                         .and_then(|p| p.as_str())
@@ -2533,16 +2237,9 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             }
         }
         "todo_list" => "Update plan".into(),
-        // An MCP tool reaches both backends under the same
-        // `mcp__<server>__<tool>` name, and the server prefix is noise in a
-        // step row.
         _ if name.starts_with("mcp__") => {
             format!("MCP: {}", mcp_tool_suffix(name).unwrap_or(name))
         }
-        // Unlike `tool_label`, this fallback stays reachable. Coding-agent tool
-        // names come from the model vendors, not a registry we own. A tool
-        // added upstream tomorrow can have no arm here before it ships, and
-        // showing its name beats showing nothing.
         _ => name.to_string(),
     }
 }

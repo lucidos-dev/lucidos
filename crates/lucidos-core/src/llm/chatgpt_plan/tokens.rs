@@ -1,6 +1,3 @@
-//! The stored sign-in as a [`ChatGptPlanTokens`]: it hands out the access
-//! token and refreshes it, one refresh at a time per engine.
-
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -15,15 +12,13 @@ const SIGN_IN_LOCATION: &str = providers_settings!();
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The lock every [`StoredChatGptPlanTokens`] of one engine shares.
 pub type RefreshLock = tokio::sync::Mutex<()>;
 
-/// The token source behind the plan provider.
 pub struct StoredChatGptPlanTokens {
     pool: PgPool,
     event_bus: EventBus,
     auth: AuthServer,
-    /// Serialises refreshes. OpenAI rotates the refresh token and refuses a
+    /// INVARIANT: Serialises refreshes. OpenAI rotates the refresh token and refuses a
     /// spent one as `refresh_token_reused`, which ends the sign-in. A provider
     /// rebuild makes a new source while turns on the old one still run, so
     /// every source shares this one.
@@ -52,7 +47,7 @@ impl StoredChatGptPlanTokens {
             .ok_or_else(not_signed_in)
     }
 
-    /// Spend the refresh token once. The caller holds the refresh lock.
+    /// INVARIANT: Spend the refresh token once. The caller holds the refresh lock.
     async fn refresh(&self, account: ChatGptPlanAccount) -> Result<String, BoxError> {
         let form = [
             ("grant_type", "refresh_token"),
@@ -68,7 +63,7 @@ impl StoredChatGptPlanTokens {
                 )
                 .await;
                 if !matches!(stored, Ok(true)) {
-                    // A sign-out or another sign-in won the race, or the write
+                    // INVARIANT: A sign-out or another sign-in won the race, or the write
                     // failed. The rotated grant must not stay live at OpenAI.
                     if let Some(rotated) = tokens.refresh_token {
                         tokio::spawn(revoke(self.auth.clone(), account.client_id, rotated));
@@ -118,7 +113,7 @@ impl ChatGptPlanTokens for StoredChatGptPlanTokens {
             return Ok(account.access_token);
         }
         let _refreshing = self.refresh_lock.lock().await;
-        // Another turn may have refreshed while this one waited.
+        // INVARIANT: Another turn may have refreshed while this one waited.
         let account = self.account().await?;
         if !account.refresh_due(chrono::Utc::now()) {
             return Ok(account.access_token);
@@ -129,7 +124,7 @@ impl ChatGptPlanTokens for StoredChatGptPlanTokens {
     async fn after_rejection(&self, rejected: &str) -> Result<String, BoxError> {
         let _refreshing = self.refresh_lock.lock().await;
         let account = self.account().await?;
-        // Another turn may have renewed it while this one waited.
+        // INVARIANT: Another turn may have renewed it while this one waited.
         if account.access_token != rejected {
             return Ok(account.access_token);
         }

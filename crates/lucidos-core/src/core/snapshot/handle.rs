@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// A validated directory name; callers cannot construct one from unchecked text.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Handle(String);

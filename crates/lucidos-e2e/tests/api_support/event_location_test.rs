@@ -1,19 +1,3 @@
-//! Verify `GET /api/v1/events/:eid/location`, the lookup behind the event-wait
-//! step's "show it".
-//!
-//! An `EventWaitDelivered` carries the matched event's id but not its thread,
-//! and a wait exists precisely because the thread is watching something
-//! happening SOMEWHERE ELSE, so resolving that thread is what makes the jump
-//! possible at all.
-//!
-//! Three answers, and the frontend words each one differently, so they must stay
-//! distinguishable on the wire:
-//!
-//! 1. A thread event returns its owning `thread_id`.
-//! 2. A workspace *domain event* returns `thread_id: null`. It belongs to no
-//!    conversation, which is a real answer rather than a missing one.
-//! 3. An unknown event id returns 404.
-
 use crate::support::{base_url, db_url, http_client, seed_chat_thread_summary, unique_marker};
 use serde_json::Value;
 use uuid::Uuid;
@@ -33,9 +17,6 @@ async fn location(event_id: Uuid) -> reqwest::Response {
         .expect("location request failed")
 }
 
-/// A step folded into a turn resolves to its thread. `CodingAgentIdled` is the
-/// event an event wait matches in practice, and it stamps no element of its own
-/// in the transcript, so the thread id is the whole answer the card gets.
 #[tokio::test]
 async fn location_returns_the_owning_thread_for_a_thread_event() {
     let pool = pool().await;
@@ -61,10 +42,6 @@ async fn location_returns_the_owning_thread_for_a_thread_event() {
     assert_eq!(body["thread_id"], Value::String(thread_id.to_string()));
 }
 
-/// A domain event has `aggregate = 'domain'`, so the insert leaves `thread_id`
-/// NULL and it renders in no transcript. The endpoint must say so explicitly
-/// rather than 404, which is how the card tells "nowhere to open it" apart from
-/// "that event is gone".
 #[tokio::test]
 async fn location_returns_null_thread_for_a_workspace_domain_event() {
     let pool = pool().await;

@@ -1,9 +1,3 @@
-//! The models the signed-in ChatGPT plan serves: its `GET /v1/models` slugs
-//! with `visibility == "list"`.
-//!
-//! The plan route sends only a listed slug. A model row the plan does not list
-//! is "not served" before any request spends the plan.
-
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -14,10 +8,8 @@ use crate::llm::ModelNotServed;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// How long one listing answers before OpenAI is asked again.
 const LISTING_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// The plan's listing, read on first use and kept for [`LISTING_TTL`].
 pub(crate) struct ServedModels {
     models_url: String,
     listing: tokio::sync::Mutex<Option<Listing>>,
@@ -28,7 +20,6 @@ struct Listing {
     read_at: Instant,
 }
 
-/// The plan's listing shape, which differs from the platform's `data` array.
 #[derive(Deserialize)]
 struct ModelsReply {
     models: Vec<ListedModel>,
@@ -41,10 +32,8 @@ struct ListedModel {
     visibility: Option<String>,
 }
 
-/// What one read of the listing found.
 enum Listed {
     Slugs(Vec<String>),
-    /// OpenAI answered `401`.
     Rejected,
 }
 
@@ -56,9 +45,6 @@ impl ServedModels {
         }
     }
 
-    /// Refuse `model` with [`ModelNotServed`] unless the plan lists it.
-    /// `bearer` is renewed once when the listing rejected it, so the request
-    /// that follows sends the renewed one.
     pub(crate) async fn check(
         &self,
         model: &str,
@@ -126,7 +112,7 @@ async fn read_listing(models_url: &str, bearer: &str) -> Result<Listed, BoxError
         return Ok(Listed::Rejected);
     }
     if !status.is_success() {
-        // A plan code (a usage limit, an ineligible plan) fails typed, so the
+        // INVARIANT: A plan code (a usage limit, an ineligible plan) fails typed, so the
         // caller can start the limit pause and say what to do.
         if let Some(plan_error) = ChatGptPlanError::from_http(status.as_u16(), &body, request_id) {
             return Err(Box::new(plan_error));

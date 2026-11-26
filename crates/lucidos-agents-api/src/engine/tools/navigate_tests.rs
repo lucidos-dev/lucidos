@@ -1,10 +1,3 @@
-//! Which device a `navigate_ui` call reaches, and what the agent is told.
-//!
-//! The incident behind these tests: a turn started on the phone, the user
-//! answered the agent's question from the laptop, and the navigate still went
-//! to the phone. The tool said "Navigated to file", so the agent told the user
-//! it had opened. Nothing opened where they were looking.
-
 use super::ToolOutcome;
 use super::{navigate_ui_impl, presence_note, BACKUP_SETTINGS_GUIDE};
 use crate::core::AppManager;
@@ -47,8 +40,6 @@ async fn setup() -> (EventBus, Receiver<EmittedEvent>, PgPool, String) {
     (bus, events, pool, db)
 }
 
-/// A user message from `from`, the way the chat route writes it. Returns its
-/// event id, which is the turn's anchor.
 async fn message_from(bus: &EventBus, thread_id: Uuid, from: &str) -> Uuid {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -75,7 +66,6 @@ async fn message_from(bus: &EventBus, thread_id: Uuid, from: &str) -> Uuid {
     .event_id
 }
 
-/// The agent asks a question card and the user answers it from `from`.
 async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
     let tool_use_id = format!("toolu-{}", Uuid::new_v4());
     bus.emit(BusEvent::Thread {
@@ -120,8 +110,6 @@ async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
     .expect("UserQuestionAnswered persisted");
 }
 
-/// The device actor on the next `NavigationRequested` for `thread_id`, or
-/// `None` when it carries no actor (unscoped).
 async fn next_navigation_actor(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid) -> Option<String> {
     loop {
         let ev = rx.recv().await.expect("broadcast channel should not close");
@@ -142,13 +130,11 @@ async fn next_navigation_actor(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid)
     }
 }
 
-/// A workspace with no apps installed, in a directory the test owns.
 fn empty_apps() -> (AppManager, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     (AppManager::new(dir.path()).expect("app manager"), dir)
 }
 
-/// `navigate_ui_impl` in a workspace with no apps.
 async fn navigate(
     bus: &EventBus,
     pool: &PgPool,
@@ -164,7 +150,6 @@ fn open_changelog() -> serde_json::Value {
     json!({"target": "file", "file_path": "artifacts/releases/changelog.md"})
 }
 
-/// The incident, replayed. Before the fix the target stayed on the phone.
 #[tokio::test]
 async fn a_question_answered_from_another_device_moves_the_target_there() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -198,8 +183,6 @@ async fn a_question_answered_from_another_device_moves_the_target_there() {
     teardown_test_db(&db).await;
 }
 
-/// Only the current turn counts. An answer from the laptop in an EARLIER turn
-/// says nothing about where the user is now.
 #[tokio::test]
 async fn an_answer_from_an_earlier_turn_does_not_move_the_target() {
     let (bus, _rx, pool, db) = setup().await;
@@ -215,9 +198,6 @@ async fn an_answer_from_an_earlier_turn_does_not_move_the_target() {
     teardown_test_db(&db).await;
 }
 
-/// The context block and `navigate_ui` must name the same device. An
-/// answer-driven resume carries no device of its own, and the block used to
-/// say "unavailable" while the navigate went to the answering device.
 #[tokio::test]
 async fn the_context_block_names_the_device_navigate_ui_targets() {
     let (bus, _rx, pool, db) = setup().await;
@@ -253,8 +233,6 @@ async fn the_context_block_names_the_device_navigate_ui_targets() {
     teardown_test_db(&db).await;
 }
 
-/// A window re-paired after the user's message. The turn recorded the old id,
-/// but the open page now sends the new one, so the navigation must go there.
 #[tokio::test]
 async fn a_replaced_id_resolves_to_the_id_the_device_answers_to_now() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -285,7 +263,6 @@ async fn a_replaced_id_resolves_to_the_id_the_device_answers_to_now() {
     teardown_test_db(&db).await;
 }
 
-/// With no anchor recorded, the resolver keeps the turn's own device.
 #[tokio::test]
 async fn without_an_anchor_the_turn_device_stands() {
     let (_bus, _rx, pool, db) = setup().await;
@@ -295,8 +272,6 @@ async fn without_an_anchor_the_turn_device_stands() {
     teardown_test_db(&db).await;
 }
 
-/// An explicit `device` wins over the last used device, and the result names
-/// it. This is "open it on my Mac" asked from the phone.
 #[tokio::test]
 async fn an_explicit_device_gets_the_navigation_and_no_other_does() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -318,8 +293,6 @@ async fn an_explicit_device_gets_the_navigation_and_no_other_does() {
     teardown_test_db(&db).await;
 }
 
-/// A device nobody has registered would swallow the navigate silently, so the
-/// call is refused before anything is emitted.
 #[tokio::test]
 async fn an_unknown_device_is_refused_and_nothing_is_sent() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -344,7 +317,6 @@ async fn an_unknown_device_is_refused_and_nothing_is_sent() {
     teardown_test_db(&db).await;
 }
 
-/// The `file_path` carried by the next `NavigationRequested` for `thread_id`.
 async fn next_navigation_file_path(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid) -> String {
     loop {
         let ev = rx.recv().await.expect("broadcast channel should not close");
@@ -367,7 +339,6 @@ async fn next_navigation_file_path(rx: &mut Receiver<EmittedEvent>, thread_id: U
     }
 }
 
-/// A registered repository named `example-repo`, returning its id.
 async fn register_example_repo(pool: &PgPool, bus: &EventBus) -> Uuid {
     crate::core::repositories::RepositoryStore::register(
         pool,
@@ -383,10 +354,6 @@ async fn register_example_repo(pool: &PgPool, bus: &EventBus) -> Uuid {
     .id
 }
 
-/// The incident: the agent named the repository, every other repo-scoped tool
-/// takes a name, and the page parses that segment as a uuid. The tool said it
-/// sent, and the user saw "UUID parsing failed". The locator now leaves with
-/// the uuid, ref and path intact.
 #[tokio::test]
 async fn a_repo_file_named_by_its_repository_name_is_sent_with_the_uuid() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -418,14 +385,10 @@ async fn a_repo_file_named_by_its_repository_name_is_sent_with_the_uuid() {
     teardown_test_db(&db).await;
 }
 
-/// A repository nobody registered would reach the page as the same raw parse
-/// error, after the agent was told it sent. It is refused first, with nothing
-/// emitted and a pointer to where the ids are listed.
 #[tokio::test]
 async fn an_unregistered_repository_is_refused_and_nothing_is_sent() {
     let (bus, _rx, pool, db) = setup().await;
     register_example_repo(&pool, &bus).await;
-    // Subscribed after the registration, so its own event is not in the way.
     let mut rx = bus.subscribe();
     let thread_id = Uuid::new_v4();
 
@@ -457,9 +420,6 @@ async fn an_unregistered_repository_is_refused_and_nothing_is_sent() {
     teardown_test_db(&db).await;
 }
 
-/// A `new-chat` navigate that names a folder nothing matches still goes out,
-/// since the page leaves the dropdown at its default. The agent is warned so it
-/// can correct itself, and a folder that does match adds no warning.
 #[tokio::test]
 async fn a_new_chat_folder_that_matches_nothing_warns_but_still_sends() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -500,7 +460,6 @@ async fn a_new_chat_folder_that_matches_nothing_warns_but_still_sends() {
     teardown_test_db(&db).await;
 }
 
-/// A blank `device` is the model filling an optional field, not a choice.
 #[tokio::test]
 async fn a_blank_device_reads_as_omitted() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -520,8 +479,6 @@ async fn a_blank_device_reads_as_omitted() {
     teardown_test_db(&db).await;
 }
 
-/// The result names the thread the event carries, not the alias the model
-/// wrote.
 #[tokio::test]
 async fn a_thread_navigate_names_the_resolved_thread() {
     let (bus, _rx, pool, db) = setup().await;
@@ -538,8 +495,6 @@ async fn a_thread_navigate_names_the_resolved_thread() {
     teardown_test_db(&db).await;
 }
 
-/// A trigger or scheduled turn has no device. The navigate stays unscoped, as
-/// before, and the result says who it went to.
 #[tokio::test]
 async fn a_turn_with_no_device_stays_unscoped_and_says_so() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -555,8 +510,6 @@ async fn a_turn_with_no_device_stays_unscoped_and_says_so() {
     teardown_test_db(&db).await;
 }
 
-/// The engine never learns whether a page acted, so no result may claim the
-/// target opened. The settings guides used to lead with exactly that claim.
 #[tokio::test]
 async fn no_result_claims_the_target_opened() {
     let (bus, _rx, pool, db) = setup().await;
@@ -582,8 +535,6 @@ async fn no_result_claims_the_target_opened() {
     teardown_test_db(&db).await;
 }
 
-/// The fragment is part of the destination, so the sent line names it. Two
-/// requests to one page then read differently.
 #[tokio::test]
 async fn a_settings_fragment_is_named_in_the_sent_line() {
     let (bus, _rx, pool, db) = setup().await;
@@ -605,9 +556,6 @@ async fn a_settings_fragment_is_named_in_the_sent_line() {
     teardown_test_db(&db).await;
 }
 
-/// A navigate is transient: a device with Lucidos closed or suspended never
-/// gets it. The result must say so, and name the notification as the way to
-/// reach that device later, rather than letting "sent" read as delivered.
 #[tokio::test]
 async fn a_device_not_seen_visible_is_told_as_such_with_a_notification_offer() {
     let (bus, _rx, pool, db) = setup().await;
@@ -627,8 +575,6 @@ async fn a_device_not_seen_visible_is_told_as_such_with_a_notification_offer() {
     teardown_test_db(&db).await;
 }
 
-/// A device with a fresh visible heartbeat most likely got the navigate, so
-/// the result carries no warning and no offer.
 #[tokio::test]
 async fn a_device_seen_visible_carries_no_warning() {
     let (bus, _rx, pool, db) = setup().await;
@@ -645,16 +591,11 @@ async fn a_device_seen_visible_carries_no_warning() {
     teardown_test_db(&db).await;
 }
 
-/// A presence lookup that failed says nothing either way.
 #[test]
 fn an_unknown_presence_adds_nothing() {
     assert_eq!(presence_note(None, &open_changelog()), "");
 }
 
-/// The blurb the agent gets after landing on Settings → System → Backup must
-/// name Settings → Accounts as where an account is connected. It must not
-/// re-acquire the two claims that rotted: an in-app backup LIST and an in-app
-/// RESTORE. Both moved to the workspace picker.
 #[test]
 fn backup_guide_names_the_accounts_page_and_not_a_restore_ui() {
     let s = BACKUP_SETTINGS_GUIDE;

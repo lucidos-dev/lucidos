@@ -202,8 +202,8 @@ pub struct MintedPairing {
 pub struct PairingIntent {
     pub label: Option<String>,
     pub user_id: Option<String>,
-    /// Gateway pairings only: start with the manage grant on (ADR 0656).
-    pub may_manage: bool,
+    /// Gateway pairings only: the hop grants it starts with (ADRs 0656, 0811).
+    pub grants: crate::gateway_protocol::HopGrants,
     pub minter: Minter,
 }
 

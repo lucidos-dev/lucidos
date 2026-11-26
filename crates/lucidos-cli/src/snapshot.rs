@@ -1,5 +1,3 @@
-//! Thin snapshot client. Jobs are durable; status can be polled again after
-//! a connection loss or an engine restart.
 use crate::{
     http,
     workspace::{self, BoxError, Workspace},

@@ -1,8 +1,3 @@
-//! `HmacSignedLayer` — HMAC-signed-query-string auth as an `AuthLayer`
-//! impl. Stateless (`retry_on_401 = Never`, no cache); on `apply` it looks
-//! up the key + secret credentials, signs the request's query string, and
-//! emits one header (key) plus two query params (timestamp + signature).
-
 use crate::api::proxy::{compute_hmac_hex, lookup_credential_value, HmacAlgorithm};
 use crate::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, ScopeBinding};
 use async_trait::async_trait;
@@ -21,8 +16,6 @@ pub struct HmacSignedLayer {
 }
 
 impl HmacSignedLayer {
-    // Plain field-by-field constructor; a builder would mirror the struct shape
-    // without simplifying anything at the proxy-pipeline construction site.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         namespace: String,
@@ -46,9 +39,6 @@ impl HmacSignedLayer {
         }
     }
 
-    /// Sign a query string using the held secret. Pulled out so tests can
-    /// drive deterministic timestamps without going through the credential
-    /// store.
     fn sign_with(&self, query: &str, secret: &[u8], now_ms: u64) -> (Option<u64>, String) {
         let mut to_sign = query.to_string();
         let ts = self.timestamp_param.as_deref().map(|_| now_ms);
@@ -80,7 +70,6 @@ impl AuthLayer for HmacSignedLayer {
         let key = lookup_credential_value(&self.pool, &self.key_credential).await?;
         let secret = lookup_credential_value(&self.pool, &self.secret_credential).await?;
 
-        // Existing query string from the request URL (without the leading `?`).
         let existing_query = input.url.split_once('?').map(|(_, q)| q).unwrap_or("");
         let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
         let (ts_opt, sig) = self.sign_with(existing_query, secret.as_bytes(), now_ms);
@@ -134,7 +123,6 @@ mod tests {
         let (ts, sig) =
             layer.sign_with("symbol=BTCUSDT&recvWindow=5000", secret, 1_700_000_000_000);
         assert_eq!(ts, Some(1_700_000_000_000));
-        // The signed payload includes the timestamp.
         let expected = compute_hmac_hex(
             HmacAlgorithm::Sha256,
             secret,

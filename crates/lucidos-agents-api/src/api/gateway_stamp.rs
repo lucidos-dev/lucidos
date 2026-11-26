@@ -1,14 +1,3 @@
-//! The engine's half of the gateway stamp (`lucidos-gateway-stamp`).
-//!
-//! A device id header is a claim any local process can type. The starter of
-//! this engine, normally the gateway, signs the device it authenticated with a
-//! per-engine stamp key it wrote to our stdin at spawn. [`device_is_stamped`]
-//! and [`workspace_call_verdict`] are the questions the rest of the engine
-//! asks. With no key, every claim is unattested: a keyless engine fails closed.
-//!
-//! The same key signs this engine's own cross-workspace calls for its gateway
-//! ([`sign_workspace_call`]), since the gateway holds its copy.
-
 use std::sync::OnceLock;
 
 use lucidos_gateway_stamp::remote_start::RemoteStart;
@@ -20,8 +9,6 @@ use uuid::Uuid;
 
 use crate::engine::thread_events::SpawnVerdict;
 
-/// The key and the workspace it signs for. Installed once at boot, never
-/// replaced: a new key means a new engine process.
 struct StampAuthority {
     key: StampKey,
     workspace_id: String,
@@ -30,23 +17,21 @@ struct StampAuthority {
 
 static AUTHORITY: OnceLock<StampAuthority> = OnceLock::new();
 
-/// Whether a gateway spawned this engine, read once at boot.
 static STARTED_BY_GATEWAY: OnceLock<bool> = OnceLock::new();
 
-/// Did a gateway spawn this engine? Reported in `/api/v1/health`, so a
+/// INVARIANT: Did a gateway spawn this engine? Reported in `/api/v1/health`, so a
 /// restarted gateway takes it back and re-keys it.
 pub(crate) fn started_by_gateway() -> bool {
     STARTED_BY_GATEWAY.get().copied().unwrap_or(false)
 }
 
-/// Read and remove [`ENV_STARTED_BY_GATEWAY`]. `true` only for exactly `1`.
 fn take_started_by_gateway() -> bool {
     let started = std::env::var(ENV_STARTED_BY_GATEWAY).is_ok_and(|v| v == "1");
     std::env::remove_var(ENV_STARTED_BY_GATEWAY);
     started
 }
 
-/// Take the stamp key the starter wrote to stdin, when the environment says it
+/// INVARIANT: Take the stamp key the starter wrote to stdin, when the environment says it
 /// did, and whether the starter was a gateway. Call once, from `main`, before
 /// any thread starts: it edits this process's environment.
 ///
@@ -83,9 +68,6 @@ pub fn take_stamp_key_from_starter() {
     }
 }
 
-/// The workspace a stamp names: the gateway's slug for this engine, else the
-/// workspace directory's name. A harness that starts its own engine has no
-/// slug, and signs with the directory's name (`scripts/lib/e2e_stamp.sh`).
 fn stamped_workspace_id(slug: Option<String>, workspace_dir: Option<String>) -> Option<String> {
     let non_blank = |s: String| Some(s.trim().to_string()).filter(|s| !s.is_empty());
     slug.and_then(non_blank).or_else(|| {
@@ -122,14 +104,12 @@ pub(crate) async fn note_arrival(
         .await
 }
 
-/// The time a stamp is checked at: the request's arrival, else now.
 fn checked_at() -> u64 {
     ARRIVED_AT
         .try_with(|at| *at)
         .unwrap_or_else(|_| lucidos_gateway_stamp::now_unix())
 }
 
-/// Did this engine's starter sign `device_id` on this request?
 pub(crate) fn device_is_stamped(headers: &axum::http::HeaderMap, device_id: &str) -> bool {
     stamped_by(AUTHORITY.get(), headers, device_id)
 }
@@ -142,9 +122,6 @@ fn stamped_by(
     authority.is_some_and(|authority| authority.device_is_stamped(headers, device_id, checked_at()))
 }
 
-/// The calling workspace's verdict on a cross-workspace call, when this
-/// engine's starter stamped it for `caller_workspace` and `caller_thread_id`.
-/// `None` for an unstamped, forged or mismatched call: an unattested caller.
 pub(crate) fn workspace_call_verdict(
     headers: &axum::http::HeaderMap,
     caller_workspace: &str,
@@ -158,7 +135,6 @@ pub(crate) fn workspace_call_verdict(
     )
 }
 
-/// Verify the receiver's own starter stamp before trusting delivery identity.
 pub(crate) fn diagnostic_delivery(
     headers: &axum::http::HeaderMap,
 ) -> Option<lucidos_gateway_stamp::DiagnosticDelivery> {
@@ -177,10 +153,7 @@ pub(crate) fn diagnostic_delivery(
         .then_some(delivery)
 }
 
-/// A cross-workspace call this engine signed for its gateway: the claim's
-/// headers, ready to send.
 pub(crate) struct SignedWorkspaceCall {
-    /// This workspace's own id, the name the gateway knows it by.
     pub(crate) caller_workspace: String,
     pub(crate) headers: Vec<(&'static str, String)>,
 }
@@ -207,13 +180,8 @@ pub(crate) fn sign_operation(
     Some(SignedOperation { envelope, stamp })
 }
 
-/// What a verified operation hands the existing handlers: the spawn identity
-/// headers, and for a spawn the remote start its gateway signed.
 pub(crate) type VerifiedOperation = (axum::http::HeaderMap, Option<RemoteStart>);
 
-/// Verify the complete operation before translating its spawn identity for
-/// the existing chat handler. A read cannot produce a legacy spawn stamp. A
-/// spawn needs a valid `remote_start` header value from the gateway.
 pub(crate) fn verify_operation(
     signed: &lucidos_gateway_stamp::workspace_operation::SignedOperation,
     remote_start: Option<&str>,
@@ -289,9 +257,6 @@ fn verify_operation_by(
     Some((headers, start))
 }
 
-/// Sign a call from `caller_thread_id` into `target_workspace`, carrying
-/// `verdict`. `None` on an engine with no stamp key: no gateway would accept
-/// its claim.
 pub(crate) fn sign_workspace_call(
     target_workspace: &str,
     caller_thread_id: Option<Uuid>,
@@ -372,10 +337,6 @@ impl StampAuthority {
     }
 }
 
-/// Stamped requests for tests, under one fixed test key.
-///
-/// The authority is process-global and first-writer-wins, so every test shares
-/// this one. A test of a keyless engine asks [`StampAuthority`] directly.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -394,7 +355,6 @@ pub(crate) mod test_support {
         })
     }
 
-    /// The stamp header value the gateway would send for `device_id`.
     pub(crate) fn stamp_for(device_id: &str) -> String {
         let authority = authority();
         authority.key.sign_now(Claim::Device {
@@ -426,7 +386,6 @@ pub(crate) mod test_support {
         headers
     }
 
-    /// Headers for a direct-port device session under the shared test authority.
     pub(crate) fn session_device_headers(device_id: &str) -> axum::http::HeaderMap {
         let authority = authority();
         let session = authority
@@ -450,7 +409,6 @@ pub(crate) mod test_support {
         headers
     }
 
-    /// Add `device_id` and its stamp, as the gateway forwards a paired device.
     pub(crate) fn insert_stamped_device(headers: &mut axum::http::HeaderMap, device_id: &str) {
         headers.insert(
             crate::core::subprocess_origin::HEADER_DEVICE_ID,
@@ -462,15 +420,12 @@ pub(crate) mod test_support {
         );
     }
 
-    /// Headers holding only a stamped device.
     pub(crate) fn stamped_device_headers(device_id: &str) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
         insert_stamped_device(&mut headers, device_id);
         headers
     }
 
-    /// The claim headers the gateway forwards for a call into this engine
-    /// from `caller_workspace`'s thread.
     pub(crate) fn stamped_workspace_call_headers(
         caller_workspace: &str,
         caller_thread_id: Option<Uuid>,
@@ -690,8 +645,6 @@ mod tests {
         assert!(!device_is_stamped(&headers_with_stamp(&old), "d1"));
     }
 
-    /// A slow upload ends past the window, yet the stamp was fresh when the
-    /// request arrived, so it still verifies.
     #[tokio::test]
     async fn a_stamp_is_judged_when_its_request_arrived() {
         let _ = stamp_for("d1");
@@ -745,8 +698,6 @@ mod tests {
         );
     }
 
-    /// Only an exact `1` counts, and the flag leaves the environment, so a
-    /// subprocess's own engine never claims a gateway started it.
     #[test]
     fn the_gateway_flag_is_read_once_and_leaves_the_environment() {
         std::env::set_var(ENV_STARTED_BY_GATEWAY, "1");
@@ -814,7 +765,6 @@ mod tests {
         assert_eq!(workspace_call_verdict(&headers, "dev", None), None);
     }
 
-    /// A caller cannot upgrade its verdict: the stamp signs the header.
     #[test]
     fn an_edited_verdict_is_unattested() {
         let mut headers = stamped_workspace_call_headers("dev", None, &refused());
@@ -845,8 +795,6 @@ mod tests {
         assert_eq!(workspace_call_verdict(&headers, "dev", None), None);
     }
 
-    /// What this engine signs for its gateway is what a gateway holding the
-    /// same key verifies.
     #[test]
     fn an_outbound_call_signs_its_own_workspace_as_the_caller() {
         let _ = stamp_for("d1");

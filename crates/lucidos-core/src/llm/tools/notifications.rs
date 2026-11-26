@@ -1,16 +1,7 @@
-//! LLM-facing schema for the `send_notification` tool. Its handler lives in
-//! `engine::tools` + the scheduler push path.
-//!
-//! This module owns the SEND schema only. Reading / clearing the inbox is the
-//! grouped `notifications` manifest tool, and enabling push is
-//! `set_preference` on [`crate::core::prefs::PUSH_NOTIFICATIONS`]. See the
-//! trailing comments below for both.
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// General-purpose notification tool, available in all contexts.
 pub fn get_notification_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SEND_NOTIFICATION.to_string(),
@@ -32,7 +23,7 @@ pub fn get_notification_tool() -> ToolDefinition {
                 },
                 "tap": {
                     "type": "object",
-                    // The thread id clause is terse because the always-loaded
+                    // INVARIANT: The thread id clause is terse because the always-loaded
                     // budget bills it on every request. It earns its 12 chars:
                     // a model that guesses `current` here writes a dead deep
                     // link to a phone. See
@@ -48,14 +39,3 @@ pub fn get_notification_tool() -> ToolDefinition {
         }),
     }
 }
-
-// Reading / clearing the inbox (list / mark_read / mark_all_read) is the grouped
-// `notifications` tool, built from the capability parity manifest
-// (`crate::capability_manifest::build_llm_tool`). The retired flat
-// `read_notifications` tool name still dispatches to that handler for back-compat
-// (see `Domain::llm_aliases`). Only the *send* tool remains hand-written here,
-// because its rich structured `tap` schema is a poor fit for the grouped union.
-
-// Push notifications are no longer a standalone tool. Enabling or declining them
-// is `set_preference` on `prefs::PUSH_NOTIFICATIONS` with `enabled` or
-// `declined`, which keeps the [PUSH_NOTIFICATION_REQUEST] handshake.

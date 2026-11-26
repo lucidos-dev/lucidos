@@ -1,22 +1,14 @@
-//! Tests for the shared git credential helper.
-//!
-//! Nothing here reaches past loopback. The store-backed tests use the disposable
-//! database `setup_test_db` provisions; everything else is pure.
-
 use super::*;
 use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
 
 const HTTPS: CredentialType = CredentialType::USER_PASS_PLAINTEXT;
 
-/// A store row, built by hand so a test can name one field at a time.
 fn credential(auth_type: AuthType, auth_value: &str) -> Credential {
     let mut credential = Credential::fixture("example-git", auth_type, auth_value);
     credential.base_urls = vec!["https://github.com".to_string()];
     credential
 }
 
-/// The one entry a single-scope fixture reduces to, or `None` when its type
-/// carries nothing a clone can present.
 fn only_entry(credential: Credential) -> Option<StoredGitCredential> {
     let value = credential.stored_value().to_string();
     let mut entries = StoredGitCredential::entries_from_credential(credential, &value);
@@ -33,8 +25,6 @@ fn stored(base_url: &str, username: Option<&str>, secret: &str) -> StoredGitCred
     }
 }
 
-/// Entries in the order [`GitCredentials::resolve_many`] leaves them: most
-/// specific `base_url` first.
 fn resolved(entries: Vec<StoredGitCredential>) -> GitCredentials {
     let mut entries = entries;
     entries.sort_by_key(|e| std::cmp::Reverse(e.base_url.len()));
@@ -53,9 +43,6 @@ fn username_round_is_answered_before_the_key_round() {
     assert_eq!(plan, vec![CredentialSource::Username]);
 }
 
-/// A bare token is offered in both forms, password first. GitHub reads it from
-/// the password field. A host that refuses one form usually accepts the other,
-/// so offering one alone can lose a working credential.
 #[test]
 fn a_stored_token_is_offered_in_both_forms_then_the_helper() {
     let plan = credential_plan(HTTPS, StoredKind::Token);
@@ -69,8 +56,6 @@ fn a_stored_token_is_offered_in_both_forms_then_the_helper() {
     );
 }
 
-/// A username and password pair only fits the password form. Sending the
-/// password as the username would drop the username the user stored.
 #[test]
 fn a_stored_pair_is_offered_only_as_a_password() {
     let plan = credential_plan(HTTPS, StoredKind::UserPass);
@@ -102,7 +87,6 @@ fn default_round_offers_anonymous_last() {
 
 #[test]
 fn a_source_the_remote_did_not_ask_for_is_never_offered() {
-    // An SSH-only round must not offer a stored secret, whatever is stored.
     let plan = credential_plan(CredentialType::SSH_KEY, StoredKind::Token);
     assert!(!plan.contains(&CredentialSource::StoredAsPassword));
     assert!(!plan.contains(&CredentialSource::StoredAsUsername));
@@ -118,8 +102,6 @@ fn every_source_is_offered_once_and_then_the_plan_is_spent() {
     assert_eq!(next_untried(&plan, &mut tried), None);
 }
 
-/// The retry guard proper: libgit2 re-invokes the callback on every rejection,
-/// so a consumer that refuses everything must still terminate.
 #[test]
 fn a_consumer_that_rejects_everything_terminates() {
     let plan = credential_plan(
@@ -128,7 +110,6 @@ fn a_consumer_that_rejects_everything_terminates() {
     );
     let mut tried = 0u8;
     let mut rounds = 0;
-    // Bounded so the test fails rather than hangs if the guard ever regresses.
     while rounds < 100 {
         match next_untried(&plan, &mut tried) {
             Some(_) => rounds += 1,
@@ -139,9 +120,6 @@ fn a_consumer_that_rejects_everything_terminates() {
     assert_eq!(next_untried(&plan, &mut tried), None, "and never again");
 }
 
-/// A source that cannot build a credential locally is skipped, not fatal.
-/// Without this, one missing ssh-agent or credential helper aborts a clone the
-/// next source could have finished.
 #[test]
 fn a_source_that_fails_locally_falls_through_to_the_next() {
     let plan = credential_plan(HTTPS, StoredKind::Token);
@@ -190,8 +168,6 @@ fn a_bearer_or_api_key_credential_is_a_bare_token() {
     }
 }
 
-/// A remote compares the secret byte for byte, so trimming one that really
-/// carries a boundary space turns a valid credential into a failed clone.
 #[test]
 fn a_stored_secret_keeps_the_whitespace_the_user_stored() {
     let entry =
@@ -213,8 +189,6 @@ fn a_basic_credential_splits_on_the_first_colon() {
     assert_eq!(entry.kind(), StoredKind::UserPass);
 }
 
-/// A `basic` value with no colon is a bare token someone picked the wrong type
-/// for. Reading it as a token still clones, where refusing it would not.
 #[test]
 fn a_basic_credential_without_a_colon_reads_as_a_token() {
     let entry = only_entry(credential(AuthType::Basic, "ghp-secret")).expect("a usable credential");
@@ -240,7 +214,6 @@ fn a_credential_carrying_nothing_a_clone_can_present_is_skipped() {
         (AuthType::OauthClient, r#"{"client_id":"x"}"#),
         (AuthType::EmailPassword, "alice@example.com:pw"),
         (AuthType::Unknown, "whatever"),
-        // Well-typed but empty, so there is no secret to send.
         (AuthType::Bearer, "   "),
         (AuthType::Basic, "alice:"),
         (AuthType::Password, "not json"),
@@ -254,8 +227,6 @@ fn a_credential_carrying_nothing_a_clone_can_present_is_skipped() {
     }
 }
 
-/// A scope is a set, so one credential is offered at every host it names and
-/// nowhere else. The set widens by named hosts, never by a shape.
 #[test]
 fn a_credential_declaring_two_hosts_is_offered_at_both_and_no_third() {
     let mut row = credential(AuthType::Bearer, "ghp-secret");
@@ -302,9 +273,6 @@ fn the_narrowest_scope_wins_when_two_credentials_match() {
     );
 }
 
-/// libgit2 passes the URL it is authenticating against, which a redirect can
-/// move to another host mid-clone. Re-matching per invocation is what stops the
-/// secret following it there.
 #[test]
 fn a_redirect_to_another_host_is_offered_no_stored_credential() {
     let credentials = resolved(vec![stored("https://github.com", None, "ghp-secret")]);
@@ -326,21 +294,15 @@ fn a_redirect_to_another_host_is_offered_no_stored_credential() {
     assert_eq!(plan, vec![CredentialSource::Helper]);
 }
 
-/// A stored secret must not reach a server the user never scoped it to. A
-/// hostile URL that challenges for basic auth would otherwise collect it, and
-/// `git_clone` takes its URL from the model.
 #[test]
 fn a_stored_credential_is_never_offered_to_another_host() {
     let credentials = resolved(vec![stored("https://github.com", None, "ghp-secret")]);
     for url in [
         "https://gitlab.com/example-org/example-repo.git",
         "https://bitbucket.org/example-org/example-repo.git",
-        // A hostname merely mentioning github is a different host.
         "https://example-github-mirror.example.com/example-org/example-repo.git",
         "https://notgithub.com/example-org/example-repo.git",
-        // Same host, wrong scheme: a plaintext hop must not carry it.
         "http://github.com/example-org/example-repo.git",
-        // An SSH clone presents a key, never a stored secret.
         "ssh://git@github.com/example-org/example-repo.git",
         "git@github.com:example-org/example-repo.git",
     ] {
@@ -368,7 +330,6 @@ fn the_base_url_hint_keeps_the_host_and_drops_the_rest() {
             Some("https://github.example.io:8443"),
         ),
         (
-            // An inline credential names no scope, so it is dropped too.
             "https://x-access-token:secret-value@github.com/example-org/repo.git",
             Some("https://github.com"),
         ),
@@ -415,8 +376,6 @@ fn a_rejected_credential_says_which_one_was_presented() {
     assert!(message.contains("rejected"), "{message}");
 }
 
-/// An SSH clone presents a key. Advice about a stored token would be a dead
-/// end, so the remedy follows the transport.
 #[test]
 fn an_ssh_failure_recommends_ssh_agent_and_no_credential() {
     for url in [
@@ -429,8 +388,6 @@ fn an_ssh_failure_recommends_ssh_agent_and_no_credential() {
     }
 }
 
-/// A URL may carry its own credential, and the failure message is shown in the
-/// Plugins panel and returned to the model. Neither may repeat the secret.
 #[test]
 fn an_inline_credential_is_stripped_from_the_failure() {
     let message = describe_clone_failure(
@@ -449,7 +406,6 @@ fn an_inline_credential_is_stripped_from_the_failure() {
 fn a_url_carrying_no_secret_is_left_alone() {
     for url in [
         "https://github.com/example-org/example-repo.git",
-        // An scp-style username is an SSH account, not a credential.
         "git@github.com:example-org/example-repo.git",
         "ssh://git@github.com/example-org/example-repo.git",
         "file:///tmp/example-repo",
@@ -458,15 +414,11 @@ fn a_url_carrying_no_secret_is_left_alone() {
     }
 }
 
-/// A stored secret reaches libgit2 and nothing else. This drives the real
-/// failure path rather than the mapper alone, so it catches a leak the
-/// signature does not rule out.
 #[test]
 fn a_clone_failure_never_echoes_a_stored_secret() {
     let scratch = tempfile::TempDir::new().unwrap();
     let url = format!("file://{}", scratch.path().join("no-such-repo").display());
     let credentials = resolved(vec![stored("file://", None, "secret-value")]);
-    // `Repository` has no `Debug`, so unwrap the error by hand.
     let Err(message) = shallow_clone(&url, None, &scratch.path().join("clone"), &credentials)
     else {
         panic!("cloning a path that does not exist must fail");
@@ -504,7 +456,6 @@ fn an_ssh_auth_failure_is_recognised_too() {
     assert!(message.contains("Authentication required"), "{message}");
 }
 
-/// A one-commit repository at `dir`, as a `file://` URL to clone.
 fn seeded_origin(dir: &Path) -> String {
     let repo = git2::Repository::init(dir).unwrap();
     std::fs::write(dir.join("README.md"), "hello").unwrap();
@@ -520,7 +471,6 @@ fn seeded_origin(dir: &Path) -> String {
     format!("file://{}", dir.display())
 }
 
-/// The names in `dir`, sorted, so a test can see a leftover staging directory.
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -530,8 +480,6 @@ fn entries(dir: &Path) -> Vec<String> {
     names
 }
 
-/// A local clone must stay deep. libgit2's local transport rejects a shallow
-/// fetch, so a `depth(1)` leaking onto this path fails the clone outright.
 #[test]
 fn a_local_clone_stays_deep_and_still_succeeds() {
     let scratch = tempfile::TempDir::new().unwrap();
@@ -543,8 +491,6 @@ fn a_local_clone_stays_deep_and_still_succeeds() {
     assert!(target.join("README.md").is_file());
 }
 
-/// A loopback "remote" that accepts every connection and never answers, the
-/// shape of a hung git host. No progress callback ever fires against it.
 fn silent_remote() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -557,10 +503,6 @@ fn silent_remote() -> String {
     format!("http://127.0.0.1:{port}/example-repo.git")
 }
 
-/// Regression: the `git_clone` tool ran the clone on its tokio worker with no
-/// bound, so a hung remote pinned that worker for good. Here a pinned worker
-/// starves the ticker and never returns. The watchdog then fails the test
-/// instead of hanging it.
 #[test]
 fn a_bounded_clone_of_a_silent_remote_times_out_without_pinning_the_runtime() {
     let url = silent_remote();
@@ -593,7 +535,6 @@ fn a_bounded_clone_of_a_silent_remote_times_out_without_pinning_the_runtime() {
             let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
             (result, ticks, started.elapsed())
         });
-        // The abandoned clone thread is still blocked on the silent socket.
         rt.shutdown_background();
         let _ = done.send(result);
     });
@@ -635,8 +576,6 @@ async fn a_failed_bounded_clone_leaves_nothing_behind() {
     );
 }
 
-/// A clone that outlives its caller must not delete what took its place, so the
-/// clone never writes `into` until it moves there whole.
 #[tokio::test]
 async fn a_bounded_clone_never_replaces_or_removes_an_existing_target() {
     let scratch = tempfile::TempDir::new().unwrap();
@@ -651,8 +590,6 @@ async fn a_bounded_clone_never_replaces_or_removes_an_existing_target() {
     assert_eq!(entries(scratch.path()), ["existing", "origin"]);
 }
 
-/// A cancelled tool call drops the future mid-clone. The clone must not land
-/// afterwards, with nobody left to use or remove it.
 #[test]
 fn a_cancelled_bounded_clone_never_lands() {
     let scratch = tempfile::TempDir::new().unwrap();
@@ -665,17 +602,13 @@ fn a_cancelled_bounded_clone_never_lands() {
     rt.block_on(async {
         let (credentials, limit) = (GitCredentials::none(), Duration::from_secs(30));
         let clone = shallow_clone_within(&url, None, &target, &credentials, limit);
-        // Polls once, which starts the clone, then drops it.
         let polled = tokio::time::timeout(Duration::ZERO, clone).await;
         assert!(polled.is_err(), "the clone cannot finish in one poll");
     });
-    // Dropping the runtime waits for the clone thread to finish.
     drop(rt);
     assert_eq!(entries(scratch.path()), ["origin"]);
 }
 
-/// A silent socket must end on its own, or the thread the caller abandoned at
-/// its deadline stays blocked on it for good.
 #[test]
 fn a_clone_bounds_how_long_a_socket_may_stay_silent() {
     let scratch = tempfile::TempDir::new().unwrap();
@@ -691,9 +624,6 @@ fn a_clone_bounds_how_long_a_socket_may_stay_silent() {
     assert_eq!(timeout, SERVER_IDLE_TIMEOUT_MS);
 }
 
-/// The credential store is the only home for a git secret. An env read here
-/// would reintroduce the path this module deliberately dropped: the
-/// environment-variable store broadcasts its values to every device.
 #[test]
 fn no_secret_is_read_from_the_process_environment() {
     let source = include_str!("git_auth.rs");
@@ -746,8 +676,6 @@ async fn a_url_no_credential_scopes_resolves_to_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// The marketplace scan resolves every registered clone URL in one pass, so two
-/// marketplaces on one host must not stack the same credential twice.
 #[tokio::test]
 async fn many_urls_resolve_once_per_credential() {
     let (pool, db) = setup_test_db().await;
@@ -794,9 +722,6 @@ async fn many_urls_resolve_once_per_credential() {
     teardown_test_db(&db).await;
 }
 
-/// An `oauth_client` row's `base_url` is the provider's API host, and its value
-/// is a client registration rather than a usable secret. The store excludes it
-/// from URL matching, so a clone never sees it.
 #[tokio::test]
 async fn an_oauth_client_credential_is_never_resolved_for_a_clone() {
     let (pool, db) = setup_test_db().await;

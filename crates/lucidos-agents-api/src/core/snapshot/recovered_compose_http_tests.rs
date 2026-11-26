@@ -1,5 +1,3 @@
-//! Production HTTP recovery after the full restored constructor, on an
-//! isolated child HOME and disposable database. No live workspace is touched.
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -10,7 +8,6 @@ use uuid::Uuid;
 pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation: Uuid) {
     let pool = engine.pool().clone();
     let device = "recovery-test-device";
-    // This device was paired after capture; never recreate it after restore.
     let mut headers = crate::api::gateway_stamp::test_support::stamped_device_headers(device);
     assert!(crate::api::actor::require_owner_device(
         &headers,
@@ -62,8 +59,6 @@ pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation
         .unwrap();
     });
     let client = reqwest::Client::new();
-    // Hold a real capture session while the HTTP writers and restore admission
-    // compete for the same workspace-wide archive slot.
     let database_url = crate::core::database_url();
     let capture = crate::core::snapshot::service::Session::open_for_database(
         &database_url,
@@ -93,7 +88,6 @@ pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation
     }
     crate::api::assert_restore_slot_busy(&database_url, &engine.archive_job_slot);
     drop(capture);
-    // A revoked archived device also fails the real mutating HTTP gate.
     let refused = client
         .post(&url)
         .header("x-lucidos-device-id", "revoked-snapshot-device")
@@ -120,8 +114,6 @@ pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation
             .header("x-lucidos-restore-generation", generation.to_string())
             .json(&body)
     };
-    // Race real HTTP requests through actor resolution, generation admission,
-    // and the event-store lock. Both must observe one atomic destination.
     let (first, concurrent) = tokio::join!(post().send(), post().send());
     let first = first.unwrap();
     let concurrent = concurrent.unwrap();
@@ -145,7 +137,6 @@ pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation
         row,
         ("Recovered text with its model picks".into(), selection)
     );
-    // Repeating the request must observe the same destination without a write.
     let repeat = post().send().await.unwrap();
     assert_eq!(repeat.status(), 200);
     assert_eq!(repeat.json::<Value>().await.unwrap(), first);

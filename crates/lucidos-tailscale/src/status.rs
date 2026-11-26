@@ -1,29 +1,16 @@
-//! Reading Tailscale's own status answer into a [`TailnetState`].
-//!
-//! The same JSON comes from the LocalAPI (`/localapi/v0/status`) and from
-//! `tailscale status --json`. Only four fields matter, so this reads a
-//! `serde_json::Value` rather than deriving a schema Tailscale never promised.
-
 use std::net::{IpAddr, Ipv4Addr};
 
 use serde_json::Value;
 
-/// What this machine is on its tailnet, as Tailscale itself reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailnetNode {
-    /// The first IPv4 in `Self.TailscaleIPs`. Never inferred from a range.
     pub ipv4: Ipv4Addr,
-    /// Every address in `Self.TailscaleIPs`, IPv4 and IPv6.
     pub addresses: Vec<IpAddr>,
-    /// `Self.DNSName` without its trailing dot, while MagicDNS is on.
     pub magic_dns_name: Option<String>,
-    /// Tailscale can issue a certificate for that name (it is in
-    /// `CertDomains`), so `tailscale serve` can give it https.
     pub can_serve_https: bool,
 }
 
 impl TailnetNode {
-    /// The MagicDNS name worth an `https://` probe, or `None`.
     pub fn https_name(&self) -> Option<&str> {
         self.magic_dns_name
             .as_deref()
@@ -31,23 +18,16 @@ impl TailnetNode {
     }
 }
 
-/// Where this machine stands with Tailscale. One answer for every surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TailnetState {
-    /// Running, with a tailnet IPv4.
     Joined(TailnetNode),
-    /// Tailscale answered with a backend state other than `Running`.
     NotJoined { backend_state: String },
-    /// Tailscale is installed, but its daemon did not answer.
     NotRunning,
-    /// Tailscale answered, and the answer could not be read.
     Unreadable { detail: String },
-    /// No sign of Tailscale on this machine.
     NotInstalled,
 }
 
 impl TailnetState {
-    /// The node, when joined.
     pub fn node(&self) -> Option<&TailnetNode> {
         match self {
             Self::Joined(node) => Some(node),
@@ -55,8 +35,6 @@ impl TailnetState {
         }
     }
 
-    /// One sentence for the user on why there is no tailnet address.
-    /// `None` when joined.
     pub fn reason(&self) -> Option<String> {
         let sentence = match self {
             Self::Joined(_) => return None,
@@ -79,8 +57,6 @@ impl TailnetState {
     }
 }
 
-/// Read a status body. `Err` carries what was wrong with it, for
-/// [`TailnetState::Unreadable`].
 pub(crate) fn parse_status(body: &str) -> Result<TailnetState, String> {
     let status: Value = serde_json::from_str(body).map_err(|e| format!("not JSON ({e})"))?;
     let backend_state = status
@@ -141,7 +117,6 @@ pub(crate) fn parse_status(body: &str) -> Result<TailnetState, String> {
 pub(crate) mod tests {
     use super::*;
 
-    /// A status body in the shape Tailscale sends, with invented values.
     pub(crate) fn status_json(
         backend: &str,
         ips: &[&str],
@@ -170,8 +145,6 @@ pub(crate) mod tests {
 
     #[test]
     fn the_address_is_the_one_tailscale_reported_beside_another_cgnat_vpn() {
-        // Appgate's 100.64.10.175 sits on another utun. Tailscale never lists
-        // it, so it can never be the answer, whatever the interface order.
         let body = status_json(
             "Running",
             &["100.70.0.1", "fd7a:115c:a1e0::1"],
@@ -196,7 +169,6 @@ pub(crate) mod tests {
         );
         let node = joined(&headscale);
         assert_eq!(node.ipv4, Ipv4Addr::new(100, 64, 0, 7));
-        // No suffix check: a Headscale base domain is a MagicDNS name too.
         assert_eq!(
             node.magic_dns_name.as_deref(),
             Some("mymac.example-tailnet.test")
@@ -237,7 +209,6 @@ pub(crate) mod tests {
         assert!(node.can_serve_https);
         assert_eq!(node.https_name(), Some("mymac.tailnet-name.ts.net"));
 
-        // Headscale sends null: no certificates, so no https candidate.
         let no_certs = status_json("Running", &["100.70.0.1"], NAME, true, None);
         assert_eq!(joined(&no_certs).https_name(), None);
         let other_name = status_json(
@@ -248,7 +219,6 @@ pub(crate) mod tests {
             Some(&["other.tailnet-name.ts.net"]),
         );
         assert_eq!(joined(&other_name).https_name(), None);
-        // A cert domain is useless without the name it would certify.
         let dns_off = status_json(
             "Running",
             &["100.70.0.1"],
@@ -283,7 +253,6 @@ pub(crate) mod tests {
 
     #[test]
     fn text_that_is_not_status_json_is_an_error() {
-        // What the macOS GUI shim prints, with exit 0, outside a GUI session.
         assert!(parse_status("The Tailscale GUI failed to start").is_err());
         assert!(parse_status("{}").is_err());
     }

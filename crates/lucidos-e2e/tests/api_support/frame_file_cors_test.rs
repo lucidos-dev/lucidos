@@ -1,11 +1,3 @@
-//! An app frame's own files grant a font load across origins, and a module
-//! script load only behind the gateway. Nothing else is granted.
-//!
-//! Unit tests in `api/frame_file_cors.rs` cover the middleware. Only a booted
-//! engine shows it is layered on BOTH trees, `/app` and `/data`, which sit
-//! outside `/api/v1` and are wired separately. A missing layer is silent in the
-//! browser: the app's font falls back and its module never runs.
-
 use crate::support::{base_url, http_client, unique_marker, workspace_path};
 
 fn write_data_file(rel: &str, body: &[u8]) -> std::path::PathBuf {
@@ -17,8 +9,6 @@ fn write_data_file(rel: &str, body: &[u8]) -> std::path::PathBuf {
     path
 }
 
-/// How the request reached the engine. The gateway stamps its prefix on every
-/// request it forwards, and a page cannot.
 #[derive(Clone, Copy, Debug)]
 enum Via {
     Gateway,
@@ -53,8 +43,6 @@ fn varies_on_destination(resp: &reqwest::Response) -> bool {
         .any(|v| v.trim().eq_ignore_ascii_case("sec-fetch-dest"))
 }
 
-/// One test, because it writes into the workspace tree and holds its lock for
-/// the whole sequence.
 #[tokio::test]
 async fn an_app_frames_own_files_grant_fonts_and_gated_scripts_only() {
     let _tree = crate::support::workspace_tree_lock().read().await;
@@ -102,9 +90,6 @@ async fn an_app_frames_own_files_grant_fonts_and_gated_scripts_only() {
         assert!(varies_on_destination(&resp), "{url}");
     }
 
-    // A module hands its caller its exports. Direct to the engine nothing gates
-    // `/data/`, so a script load there must not be granted to any web page.
-    // A `fetch()` is `empty`, the read the grant must never cover at all.
     let refused = [
         (&app_module, "script", Via::Direct),
         (&data_module, "script", Via::Direct),

@@ -1,11 +1,6 @@
 use super::msg_helpers::*;
 use super::*;
 
-// ---------------------------------------------------------------
-// Events (ResponseEvent) tests
-// ---------------------------------------------------------------
-
-/// Thinking event creates a ResponseEvent::Step with context metadata.
 #[test]
 fn events_include_thinking_step() {
     let events = vec![
@@ -30,7 +25,6 @@ fn events_include_thinking_step() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
     assert!(!assistant.events.is_empty());
-    // First event should be the Thinking step
     match &assistant.events[0] {
         ResponseEvent::Step {
             description,
@@ -48,9 +42,6 @@ fn events_include_thinking_step() {
     }
 }
 
-/// Build a one-turn session whose only pre-LLM step is a memory recall, under
-/// whichever raw `event_type` string the caller names. Shared by the canonical
-/// and legacy cases below so the two cannot drift apart.
 fn recall_turn_steps(event_type: &str, results: u64) -> Vec<(String, bool)> {
     let events = vec![
         make_event(
@@ -86,7 +77,6 @@ fn recall_turn_steps(event_type: &str, results: u64) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// MemoryRecalled event creates a ResponseEvent::Step, labelled with the count.
 #[test]
 fn events_include_memory_recalled_step() {
     let steps = recall_turn_steps("MemoryRecalled", 7);
@@ -99,10 +89,6 @@ fn events_include_memory_recalled_step() {
     assert_eq!(steps[1], ("Requesting".to_string(), true));
 }
 
-/// The label is verb-first and never says "search": the `memory` tool's own
-/// step reads "Searching memory for ...", and the two used to be one word
-/// apart. Zero and one are their own phrasings rather than "Recalled 0
-/// memories" / "Recalled 1 memories".
 #[test]
 fn memory_recalled_label_covers_zero_one_and_many() {
     assert_eq!(
@@ -128,9 +114,6 @@ fn memory_recalled_label_covers_zero_one_and_many() {
     }
 }
 
-/// Rows persisted under the pre-rename `MemorySearched` string must produce the
-/// identical step. The alias on the variant cannot cover this path: these
-/// builders match the raw `event_type` column, not a deserialized variant.
 #[test]
 fn legacy_memory_searched_rows_render_as_a_recall_step() {
     for results in [0, 1, 7] {
@@ -142,7 +125,6 @@ fn legacy_memory_searched_rows_render_as_a_recall_step() {
     }
 }
 
-/// ToolResult populates detail on the preceding Step event.
 #[test]
 fn events_step_has_detail_from_tool_result() {
     let text = pad("Let me read that file for you now", 100);
@@ -168,7 +150,6 @@ fn events_step_has_detail_from_tool_result() {
     ];
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
-    // Find the step event for read_file
     let step = assistant
         .events
         .iter()
@@ -179,11 +160,10 @@ fn events_step_has_detail_from_tool_result() {
     }) = step
     {
         assert!(*success);
-        assert_eq!(*detail, Some("12 chars".to_string())); // "fn main() {}" = 12 chars
+        assert_eq!(*detail, Some("12 chars".to_string()));
     }
 }
 
-/// ToolResult sets success=false when tool fails.
 #[test]
 fn events_step_success_updated_by_tool_result() {
     let events = vec![
@@ -225,7 +205,6 @@ fn events_step_success_updated_by_tool_result() {
     }
 }
 
-/// text -> tool -> text produces [Text, Step, Text] event ordering.
 #[test]
 fn events_ordering_text_step_text() {
     let c1 = pad("Analyzing the file structure", 100);
@@ -251,14 +230,12 @@ fn events_ordering_text_step_text() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
 
-    // Should be: Text, Step, Text
     assert_eq!(assistant.events.len(), 3, "events: {:?}", assistant.events);
     assert!(matches!(&assistant.events[0], ResponseEvent::Text { md } if md == &c1));
     assert!(matches!(&assistant.events[1], ResponseEvent::Step { .. }));
     assert!(matches!(&assistant.events[2], ResponseEvent::Text { md } if md == &c2));
 }
 
-/// tool -> text produces [Step, Text] (no empty text event before step).
 #[test]
 fn events_ordering_step_before_text() {
     let events = vec![
@@ -287,13 +264,11 @@ fn events_ordering_step_before_text() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
 
-    // Should be: Step, Text — no empty text before step
     let texts = text_events(&assistant.events);
     let steps = step_events(&assistant.events);
     assert_eq!(steps.len(), 1);
     assert_eq!(texts.len(), 1);
     assert_eq!(texts[0], "Found 2 matches in the search results.");
-    // Step should come before text in the array
     let step_idx = assistant
         .events
         .iter()
@@ -307,8 +282,6 @@ fn events_ordering_step_before_text() {
     assert!(step_idx < text_idx, "Step should come before Text");
 }
 
-/// text -> tool -> tool -> text (small deltas) produces properly interleaved
-/// [Text, Step, Text, Step, Text] — no merging, interleaving is preserved.
 #[test]
 fn events_ordering_multiple_steps_between_text() {
     let events = vec![
@@ -349,7 +322,6 @@ fn events_ordering_multiple_steps_between_text() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
 
-    // All text deltas create events regardless of size — interleaving matters
     let steps = step_events(&assistant.events);
     let texts = text_events(&assistant.events);
     assert_eq!(steps.len(), 2, "should have 2 step events");
@@ -362,7 +334,6 @@ fn events_ordering_multiple_steps_between_text() {
     assert_eq!(texts[1], " Checking.");
 }
 
-/// Claude Code exchanges use the CC text buffer for events.
 #[test]
 fn events_cc_exchange_uses_cc_buffer() {
     let c1 = pad("Analyzing the codebase structure and patterns", 100);
@@ -408,7 +379,6 @@ fn events_cc_exchange_uses_cc_buffer() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
 
-    // Should have Text, Step, Text events
     assert_eq!(
         assistant.events.len(),
         3,
@@ -422,7 +392,6 @@ fn events_cc_exchange_uses_cc_buffer() {
     assert!(matches!(&assistant.events[2], ResponseEvent::Text { md } if md == &c2));
 }
 
-/// Events on canceled exchange.
 #[test]
 fn events_on_canceled_exchange() {
     let c1 = pad("Working on the requested changes to the codebase", 100);
@@ -450,7 +419,6 @@ fn events_on_canceled_exchange() {
     assert_eq!(texts[1], c2);
 }
 
-/// Events on interrupted exchange.
 #[test]
 fn events_on_interrupted_exchange() {
     let c1 = pad("Starting the analysis of the requested files now", 100);
@@ -486,7 +454,6 @@ fn events_on_interrupted_exchange() {
     assert_eq!(texts[1], c2);
 }
 
-/// Events idempotent on replay.
 #[test]
 fn events_replay_idempotent() {
     let c1 = &pad("First text event content", 80);
@@ -511,7 +478,6 @@ fn events_replay_idempotent() {
     assert_eq!(e1, e2, "events replay must be idempotent");
 }
 
-/// No events for a simple response without tools or streaming.
 #[test]
 fn events_empty_for_no_streaming() {
     let events = vec![
@@ -523,7 +489,6 @@ fn events_empty_for_no_streaming() {
     assert!(assistant.events.is_empty(), "no streaming = no events");
 }
 
-/// Single text stream with no tools: events should have exactly 1 text event.
 #[test]
 fn events_single_text_no_tools() {
     let events = vec![
@@ -538,11 +503,6 @@ fn events_single_text_no_tools() {
     assert_eq!(texts[0], "Hi there!");
 }
 
-/// When a Thinking event exists but no TextStreamed events occur,
-/// the response text from ResponseGenerated must be added as a Text event.
-/// Without this, the frontend uses the events-based rendering path
-/// (because the Step event exists), but finds no Text events — so the
-/// response content is invisible ("Done" but no text shown).
 #[test]
 fn events_text_event_when_thinking_but_no_streaming() {
     let events = vec![
@@ -564,7 +524,6 @@ fn events_text_event_when_thinking_but_no_streaming() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
     assert_eq!(assistant.content, "You live in New York.");
-    // Must have a text event so the events-based rendering path can show it
     let texts = text_events(&assistant.events);
     assert_eq!(
         texts.len(),
@@ -575,7 +534,6 @@ fn events_text_event_when_thinking_but_no_streaming() {
     assert_eq!(texts[0], "You live in New York.");
 }
 
-/// Same as above but for Claude Code channel.
 #[test]
 fn events_text_event_when_thinking_but_no_streaming_cc() {
     let events = vec![
@@ -611,10 +569,6 @@ fn events_text_event_when_thinking_but_no_streaming_cc() {
     assert_eq!(texts[0], "Fixed.");
 }
 
-/// CC crash scenario: TextStreamed events with claude_code channel followed
-/// by ResponseAborted (emitted by safety net when CC exits without producing
-/// a Result event). Must produce an aborted assistant message, NOT a trailing
-/// buffer flush with completed=None that shows as "Working" on reload.
 #[test]
 fn cc_crash_with_response_aborted_shows_aborted() {
     let partial = "I'm looking at the files...";
@@ -629,7 +583,6 @@ fn cc_crash_with_response_aborted_shows_aborted() {
             json!({"text": partial, "channel": "claude_code"}),
             1,
         ),
-        // CC crashed — safety net emits ResponseAborted
         make_event(
             "ResponseAborted",
             json!({"text": partial, "channel": "claude_code"}),
@@ -649,8 +602,6 @@ fn cc_crash_with_response_aborted_shows_aborted() {
     assert_eq!(assistant.channel.as_deref(), Some("claude_code"));
 }
 
-/// CC cancel with empty buffer: user cancels before any text is produced.
-/// ResponseCanceled with empty content must still produce a canceled message.
 #[test]
 fn cc_cancel_empty_buffer_shows_canceled() {
     let events = vec![
@@ -673,9 +624,6 @@ fn cc_cancel_empty_buffer_shows_canceled() {
     assert_eq!(assistant.channel.as_deref(), Some("claude_code"));
 }
 
-/// When ResponseGenerated content extends beyond TextStreamed content,
-/// the extra text must appear as a final Text event so events-based
-/// rendering can show it (collapsed view uses events, not content).
 #[test]
 fn events_capture_result_text_remainder() {
     let streamed = "Let me check the code.";
@@ -703,7 +651,6 @@ fn events_capture_result_text_remainder() {
     let msgs = build_session_messages(&events);
     let assistant = &msgs[1];
     let texts = text_events(&assistant.events);
-    // Should have: streamed text before tool, plus the remainder from result_text
     assert!(
         texts.len() >= 2,
         "expected at least 2 text events, got {}: {:?}",
@@ -718,8 +665,6 @@ fn events_capture_result_text_remainder() {
     );
 }
 
-/// A parallel run answers in completion order. The failing call's step must
-/// show the failure even when its result lands last (ADR 0246).
 #[test]
 fn a_result_resolves_its_own_step_in_any_order() {
     let call_a = make_event(

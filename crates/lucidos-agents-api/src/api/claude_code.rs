@@ -5,12 +5,8 @@ use crate::engine::claude_code::spawn::ClaudeCodeSpawnExt;
 
 #[derive(Deserialize)]
 pub(super) struct StopQuery {
-    /// `apply=true` — user clicked Apply Now. The resulting change auto-applies
-    /// after CC terminates; no `ResponseCanceled` (ChangeApplied is the terminator).
     #[serde(default)]
     apply: bool,
-    /// `discard=true` — user clicked Discard. Change is dropped; no
-    /// `ResponseCanceled` (ChangeDiscarded is the terminator).
     #[serde(default)]
     discard: bool,
     thread_id: Option<String>,
@@ -27,9 +23,6 @@ impl StopQuery {
     }
 }
 
-/// Which clause-4 verb this route is, for the authority gate. One route, three
-/// verbs: the query params pick which button was pressed, and the caller reads
-/// a refusal naming the one it tried.
 fn stop_verb(reason: crate::engine::claude_code::StopReason) -> crate::engine::permission::Action {
     use crate::engine::claude_code::StopReason;
     use crate::engine::permission::Action;
@@ -40,29 +33,13 @@ fn stop_verb(reason: crate::engine::claude_code::StopReason) -> crate::engine::p
     }
 }
 
-/// `POST /api/v1/claude-code/stop` — stop a running Claude Code session.
-///
-/// Three modes via query params:
-///   - default (`UserStop`): real Cancel/Stop click. Routed through CC's native
-///     **interrupt (Esc)** via `interrupt_agent` — the turn is interrupted but
-///     the session stays resumable (the next message `--resume`s the same
-///     `cc_session_id` on the same branch). Emits `ResponseCanceled(UserStop)` +
-///     `CodingAgentIdled` if CC was working; a no-op (HTTP 200) if CC was
-///     already idle. NOT a hard kill — that lost all conversation context.
-///   - `apply=true`: Apply Now — `stop_agent` hard-stops, then the change
-///     auto-applies (`ChangeApplied` is the terminator).
-///   - `discard=true`: Discard — `stop_agent` hard-stops, change dropped
-///     (`ChangeDiscarded` is the terminator).
-///
-/// Archiving uses a different code path (`POST /api/v1/threads/archive` →
-/// `stop_agent(StopReason::Archive, ...)`) because it also emits `ThreadArchived`.
 pub(super) async fn claude_code_stop(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<StopQuery>,
 ) -> Result<Json<super::CancelResponse>, ApiError> {
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
-    // Before the question card is cancel-stamped and before any hard stop, so
+    // INVARIANT: Before the question card is cancel-stamped and before any hard stop, so
     // a refusal leaves the turn exactly as it found it. Apply and Discard reach
     // this route too, and each is gated as itself.
     super::thread_reach::refuse_without_authority(
@@ -72,15 +49,8 @@ pub(super) async fn claude_code_stop(
         stop_verb(query.reason()),
     )
     .await?;
-    // Stamp the user actor so any ChangeApplied / ChangeApplyFailed emitted by
-    // the stale-session fallback (stop?apply=true on a thread whose CC
-    // already exited) carries the device that clicked the button instead of
-    // collapsing to "Lucidos Engine" via the actor-missing fallback.
     let actor = super::actor::user_actor(&headers, None);
 
-    // Resolve any pending question card before CC ends — otherwise its answer
-    // buttons would dangle after the session goes away. A resolved card counts
-    // toward `canceled`: it IS a status-changing event the client will receive.
     let question_resolved = if let Some(tid) = thread_id {
         crate::engine::agent_question::resolve_pending_question_as_canceled(
             &state.engine,
@@ -92,7 +62,7 @@ pub(super) async fn claude_code_stop(
         false
     };
 
-    // Cancel (Stop) = Esc: route a real `UserStop` through CC's native interrupt
+    // INVARIANT: Cancel (Stop) = Esc: route a real `UserStop` through CC's native interrupt
     // so the turn is interrupted but the session stays resumable — the next
     // message `--resume`s the same `cc_session_id` on the same branch. Apply /
     // Discard keep `stop_agent`: each carries its own terminator
@@ -100,7 +70,7 @@ pub(super) async fn claude_code_stop(
     use crate::engine::claude_code::{SettleTerminal, StopReason, SESSION_ALREADY_WAITING};
     let reason = query.reason();
     match reason {
-        // `canceled = false` means nothing was interruptible — the client's
+        // INVARIANT: `canceled = false` means nothing was interruptible — the client's
         // optimistic "canceling" state is stale and it must re-sync.
         //
         // The settle fallback inside `interrupt_agent` fires when no agent is
@@ -124,9 +94,6 @@ pub(super) async fn claude_code_stop(
             Ok(interrupted) => Ok(Json(super::CancelResponse {
                 canceled: question_resolved || interrupted,
             })),
-            // Cancel click racing an already-finished turn — nothing to
-            // interrupt. Report `canceled` = whether the question card resolved
-            // (the only status-changing effect this click could have had).
             Err(e) if e.to_string() == SESSION_ALREADY_WAITING => Ok(Json(super::CancelResponse {
                 canceled: question_resolved,
             })),
@@ -135,8 +102,6 @@ pub(super) async fn claude_code_stop(
                 Err(StatusCode::NOT_FOUND.into())
             }
         },
-        // Apply / Discard: the terminator is `ChangeApplied` / `ChangeDiscarded`,
-        // and callers don't read `canceled` — report `true` on success.
         other => match state.engine.stop_agent(other, thread_id, actor).await {
             Ok(()) => Ok(Json(super::CancelResponse { canceled: true })),
             Err(e) => {
@@ -160,19 +125,11 @@ pub(super) struct ApplyNowQuery {
     thread_id: String,
 }
 
-/// The `409` for a refusal a change claim or a stopping session gave, carrying
-/// the engine's message and its `reason` slug. `None` for any other error.
 fn claim_refusal_error(msg: &str) -> Option<ApiError> {
     crate::engine::claude_code::claim_refusal_reason(msg)
         .map(|reason| ApiError::new(StatusCode::CONFLICT, msg).with_reason(reason))
 }
 
-/// Classify an `apply_now` error into its HTTP error.
-///
-/// Each refusal is a `409` with its message and a `reason` slug, so the toast
-/// can say which holder refused. Refusals are matched by identity against
-/// their consts. Any other error is a `500` carrying its own message, since
-/// the engine applies pending changes itself when no session is live.
 fn apply_now_error(msg: &str) -> ApiError {
     if let Some(refused) = claim_refusal_error(msg) {
         return refused;
@@ -195,7 +152,7 @@ pub(super) async fn claude_code_apply_now(
     Query(query): Query<ApplyNowQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let thread_id = uuid::Uuid::parse_str(&query.thread_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    // Apply by another route, so it takes the same gate. Before the merge, so a
+    // INVARIANT: Apply by another route, so it takes the same gate. Before the merge, so a
     // refusal lands nothing on main.
     super::thread_reach::refuse_without_authority(
         &state.engine.event_bus,
@@ -206,8 +163,6 @@ pub(super) async fn claude_code_apply_now(
     .await?;
     let actor = super::actor::user_actor(&headers, None);
     match state.engine.apply_now(thread_id, actor).await {
-        // The version lets the client hold its "requesting" state until the
-        // row carries the apply's own start (ADR 0437).
         Ok(summary_version) => Ok(Json(serde_json::json!({
             "status": "applying",
             "summary_version": summary_version,
@@ -232,8 +187,6 @@ mod apply_now_status_tests {
         (e.status, e.message, e.reason)
     }
 
-    /// The refusal added with the merge-ownership guard is a conflict with its
-    /// own slug, never a generic failure.
     #[test]
     fn a_resolver_owned_merge_is_a_conflict_not_a_missing_session() {
         let msg = crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE;
@@ -247,8 +200,6 @@ mod apply_now_status_tests {
         );
     }
 
-    /// A parked question, or a check for one that failed, refuses as 409 with
-    /// its own slug.
     #[test]
     fn a_parked_question_is_a_conflict_not_a_missing_session() {
         use crate::engine::claude_code::{QUESTION_OPEN_MESSAGE, QUESTION_UNKNOWN_MESSAGE};
@@ -264,8 +215,6 @@ mod apply_now_status_tests {
         }
     }
 
-    /// Each claim refusal answers 409 with its own message and slug, so the
-    /// toast can say which holder refused. A Discard never reads as an apply.
     #[test]
     fn a_claim_refusal_names_its_holder() {
         for (msg, slug) in [
@@ -282,8 +231,6 @@ mod apply_now_status_tests {
         assert!(!DISCARD_IN_PROGRESS_MESSAGE.contains("apply"));
     }
 
-    /// Anything else is a failure that names its cause, so the toast can say
-    /// why the apply did not start.
     #[test]
     fn an_unrecognised_failure_names_its_cause() {
         let (status, message, reason) = refusal("Session channel closed");
@@ -298,13 +245,8 @@ pub(super) struct ControlRequestBody {
     request: crate::engine::claude_code::RungPick,
 }
 
-/// The `reason` slug of a pick refused because a turn runs (ADR 0542).
 pub(crate) const TURN_RUNNING_REASON: &str = "turn-running";
 
-/// A picked effort names a tier the thread's backend offers for its model, as
-/// every other effort entry point requires. Otherwise the next spawn would
-/// read a string it cannot run at. A model pick's effort is checked against
-/// that model, a lone effort against the thread's current one.
 async fn refuse_unoffered_effort(
     engine: &SharedEngine,
     thread_id: uuid::Uuid,
@@ -328,9 +270,6 @@ async fn refuse_unoffered_effort(
     }
 }
 
-/// Record a model or effort pick on a started coding-agent thread. Its next
-/// turn runs on it. While a turn runs, the rung is locked and this refuses
-/// with 409 and [`TURN_RUNNING_REASON`].
 pub(super) async fn claude_code_control(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -338,7 +277,7 @@ pub(super) async fn claude_code_control(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let thread_id = uuid::Uuid::parse_str(&body.thread_id)
         .map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
-    // A thread-bound subprocess may drive only its own session or a
+    // INVARIANT: A thread-bound subprocess may drive only its own session or a
     // descendant's, never a sibling's. Runs before anything is recorded.
     super::thread_reach::refuse_without_authority(
         &state.engine.event_bus,
@@ -372,18 +311,10 @@ pub(super) async fn claude_code_control(
 #[derive(Deserialize)]
 pub(super) struct CommandsQuery {
     thread_id: Option<String>,
-    /// Compose-view repo selector. Empty string ("") = the workspace's default
-    /// "Lucidos" repo, mirroring the frontend's `selectedRepoId` convention.
-    /// Missing = same as empty string.
     repo_id: Option<String>,
-    /// Compose-view backend selector (`claude-code` | `codex`). Only
-    /// consulted when no `thread_id` is given — an existing thread's backend
-    /// comes from its `thread_summaries` row, not the client.
     coding_agent: Option<crate::runtime::CodingAgent>,
 }
 
-/// Return available coding-agent commands: control subtypes (always, per
-/// backend) + categorized slash commands (CC only, if a session is active).
 pub(super) async fn claude_code_commands(
     State(state): State<AppState>,
     Query(query): Query<CommandsQuery>,
@@ -395,12 +326,10 @@ pub(super) async fn claude_code_commands(
             .coding_agent
             .unwrap_or(crate::runtime::CodingAgent::ClaudeCode),
     };
-    // What a spawn with no pick runs on, for the picker's Default row.
     let default_implementer =
         crate::runtime::intelligence_ladder::default_implementer(&state.pool, coding_agent)
             .await
             .map(|d| serde_json::json!({"model": d.model, "effort": d.effort}));
-    // The rung control lists these and nothing else.
     let ladder_rungs = crate::runtime::intelligence_ladder::load(
         &state.pool,
         &state.engine.model_routes(),
@@ -409,9 +338,6 @@ pub(super) async fn claude_code_commands(
     .await
     .on_intelligence_rungs();
     if coding_agent == crate::runtime::CodingAgent::Codex {
-        // Codex has no slash commands / skills surface — only the control
-        // menu. Model/effort still come from the session settings events so
-        // the picker shows the thread's current selection.
         let (current_model, current_effort) = match tid {
             Some(tid) => state.engine.cc_thread_settings(tid).await,
             None => (None, None),
@@ -437,7 +363,7 @@ pub(super) async fn claude_code_commands(
     let res = if let Some(tid) = tid {
         state.engine.cc_categorized_commands(tid).await
     } else {
-        // Compose-view: resolve repo_id (possibly empty/missing) to a path
+        // INVARIANT: Compose-view: resolve repo_id (possibly empty/missing) to a path
         // and look up just that repo's cache. Never fall back to "first
         // cache entry" — that leaks skills from other repos into the menu.
         // For the default (no `repo_id`), use the engine's own repo_root —
@@ -475,7 +401,6 @@ pub(super) struct ThreadIdBody {
     thread_id: String,
 }
 
-/// POST /api/v1/claude-code/discard — discard CC changes without ending session
 pub(super) async fn claude_code_discard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -483,7 +408,7 @@ pub(super) async fn claude_code_discard(
 ) -> Result<StatusCode, ApiError> {
     let thread_uuid = uuid::Uuid::parse_str(&body.thread_id)
         .map_err(|e| ApiError::bad_request(format!("Invalid thread_id: {}", e)))?;
-    // Discard by another route, so it takes the same gate. Before the branch
+    // INVARIANT: Discard by another route, so it takes the same gate. Before the branch
     // and worktree go.
     super::thread_reach::refuse_without_authority(
         &state.engine.event_bus,
@@ -510,7 +435,6 @@ pub(super) async fn claude_code_interrupt(
     Query(query): Query<InterruptQuery>,
 ) -> Result<StatusCode, ApiError> {
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
-    // Cancel by another route, so it takes the same gate.
     super::thread_reach::refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -519,8 +443,6 @@ pub(super) async fn claude_code_interrupt(
     )
     .await?;
     let actor = super::actor::user_actor(&headers, None);
-    // No question card is cancel-stamped on this route, so a `running` row it
-    // settles is one this request did not write.
     match state
         .engine
         .interrupt_agent(
@@ -538,11 +460,6 @@ pub(super) async fn claude_code_interrupt(
     }
 }
 
-/// Response of `GET /api/v1/coding-agents/binaries` — effective CLI binary
-/// resolution per coding agent, plus each resolved binary's self-reported
-/// version, for the Settings → Coding Agents surface. Live detection (see
-/// `runtime::detect_agent_binary_with_version`); the override itself is the
-/// `coding_agent_*_path` preference written via `PUT /api/v1/preferences`.
 #[derive(Serialize)]
 pub(super) struct AgentBinariesResponse {
     claude_code: crate::runtime::AgentBinaryStatus,
@@ -566,8 +483,6 @@ pub(super) async fn coding_agent_binaries(
     };
     let claude_override = read_override(&prefs::CODING_AGENT_CLAUDE_PATH).await?;
     let codex_override = read_override(&prefs::CODING_AGENT_CODEX_PATH).await?;
-    // Concurrently: each agent's detection now runs `<binary> --version`, so
-    // sequencing them would make the section pay both probes back to back.
     let (claude_code, codex) = tokio::join!(
         crate::runtime::detect_agent_binary_with_version(
             crate::runtime::CodingAgent::ClaudeCode,
@@ -581,7 +496,6 @@ pub(super) async fn coding_agent_binaries(
     Ok(Json(AgentBinariesResponse { claude_code, codex }))
 }
 
-/// Routes for the `/claude-code/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/coding-agents/binaries", get(coding_agent_binaries))

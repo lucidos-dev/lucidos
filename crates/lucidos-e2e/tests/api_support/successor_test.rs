@@ -1,7 +1,3 @@
-//! API e2e for *successor sessions*: the context-size read, and the handoff to
-//! a fresh session in the same thread
-//! (`docs/plans/2026-10-23-successor-session-in-the-same-thread.md`).
-
 use crate::support::{
     base_url, count_events_of_type, db_url, git, git_in, http_client, insert_session_started,
     local_process_client, seed_cc_thread_summary, seed_chat_thread_summary, unique_marker,
@@ -14,14 +10,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// `cache_keep_alive_mode` is workspace-wide. Each test that depends on it
-/// holds this lock and sets the mode it needs. So a mode that a panicked test
-/// left behind cannot leak into the next one.
 static KEEP_ALIVE_MODE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Sets the keep-alive mode, or restores the default on `None`. The handler
-/// answers 200 on failure too, so the body's `success` is the result. A
-/// delete of an unset key reports "not found", which is already the default.
 async fn set_keep_alive_mode(client: &reqwest::Client, mode: Option<&str>) {
     let url = format!(
         "{}/api/v1/preferences?key={}",
@@ -50,7 +40,6 @@ async fn connect() -> sqlx::PgPool {
         .expect("Failed to connect to E2E workspace database")
 }
 
-/// Record a `ContextCaptured` on `thread_id` straight into the events table.
 async fn insert_capture(pool: &sqlx::PgPool, thread_id: Uuid, payload: serde_json::Value) {
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
@@ -99,7 +88,6 @@ async fn post_successor(
     (status, body)
 }
 
-/// The *Successor card*'s Continue.
 async fn post_continue(
     client: &reqwest::Client,
     thread_id: Uuid,
@@ -121,7 +109,6 @@ async fn post_continue(
     (status, body)
 }
 
-/// The payload of `thread_id`'s latest `SessionHandedOff`.
 async fn handoff_payload(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<serde_json::Value> {
     sqlx::query_scalar(
         "SELECT payload FROM events \
@@ -134,10 +121,6 @@ async fn handoff_payload(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<serde_j
     .expect("read the handoff")
 }
 
-/// The first input of the successor session the engine starts in
-/// `thread_id`, once it lands. The engine starts the session after the
-/// reply. The API suite has no coding agent to run it, so the input is the
-/// proof: it lands in the same thread, and its continuity has Rust tests.
 async fn successor_session_input(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -159,7 +142,6 @@ async fn successor_session_input(pool: &sqlx::PgPool, thread_id: Uuid) -> Option
     }
 }
 
-/// How many threads name `thread_id` as the thread they continue.
 async fn successor_threads_of(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM thread_summaries WHERE successor_of = $1")
         .bind(thread_id)
@@ -188,10 +170,6 @@ async fn delete_thread_rows(pool: &sqlx::PgPool, thread_id: Uuid) {
         .ok();
 }
 
-/// A top-level coding-agent thread whose last idle recorded a worktree of
-/// the workspace repo, holding one commit on its own branch. The worktree
-/// lives in a temp dir outside the workspace, so the workspace tree stays
-/// untouched.
 struct WorktreeThread {
     thread_id: Uuid,
     branch: String,
@@ -242,7 +220,6 @@ impl WorktreeThread {
     }
 }
 
-/// Removes the worktree and its branch even when an assertion fails.
 impl Drop for WorktreeThread {
     fn drop(&mut self) {
         let ws = workspace_path();
@@ -260,8 +237,6 @@ impl Drop for WorktreeThread {
     }
 }
 
-/// Record the model and effort a coding-agent session runs on, as a session
-/// start does.
 async fn insert_settings(pool: &sqlx::PgPool, thread_id: Uuid, model: &str, effort: &str) {
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
@@ -275,9 +250,6 @@ async fn insert_settings(pool: &sqlx::PgPool, thread_id: Uuid, model: &str, effo
     .expect("insert CodingAgentSettingsChanged failed");
 }
 
-/// The context size is the latest capture of the thread's own turn. A
-/// sub-agent's capture never counts, however large or recent it is. The
-/// reading also names the implementer the thread runs on.
 #[tokio::test]
 async fn context_reports_the_latest_main_session_capture() {
     let client = user_client().await;
@@ -336,8 +308,6 @@ async fn context_reports_the_latest_main_session_capture() {
     );
 }
 
-/// The implementer names the effort the thread's calls ran at. A later pick
-/// no call ran at yet does not change it.
 #[tokio::test]
 async fn context_names_the_effort_in_force_not_a_pick() {
     let client = user_client().await;
@@ -362,8 +332,6 @@ async fn context_names_the_effort_in_force_not_a_pick() {
     );
 }
 
-/// The switch estimate warns on a model change over a warm cache and stays
-/// silent for the pair the thread already runs.
 #[tokio::test]
 async fn switch_estimate_warns_only_when_the_switch_rewrites_a_warm_cache() {
     let client = user_client().await;
@@ -417,9 +385,6 @@ async fn switch_estimate_warns_only_when_the_switch_rewrites_a_warm_cache() {
     assert_eq!(unknown.status().as_u16(), 404);
 }
 
-/// The cache-warmth read counts down a fresh cache write, and names the TTL
-/// evidence. A thread with no main-session call is cold, and a write that
-/// reported no lifetime unknown.
 #[tokio::test]
 async fn cache_warmth_counts_down_a_fresh_cache_write() {
     let _mode = KEEP_ALIVE_MODE.lock().await;
@@ -518,10 +483,6 @@ async fn cache_warmth_counts_down_a_fresh_cache_write() {
     assert_eq!(unknown.status().as_u16(), 404);
 }
 
-/// The per-thread keep-alive switch (ADR 0554): an unidentified caller is
-/// refused, and a device's call records the event under that device and
-/// projects the column. "on" clears it. The keep-alive is off by default and
-/// records no status then, so the test turns it on first.
 #[tokio::test]
 async fn the_keep_alive_switch_is_recorded_under_the_device() {
     let _mode = KEEP_ALIVE_MODE.lock().await;
@@ -596,9 +557,6 @@ async fn the_keep_alive_switch_is_recorded_under_the_device() {
     assert_eq!(bad, 400);
 }
 
-/// A cold Continue starts a successor session in the same thread at once,
-/// from a handoff brief and the typed request. It creates no thread and moves
-/// no branch.
 #[tokio::test]
 async fn a_cold_continue_starts_a_successor_session_in_the_same_thread() {
     let client = user_client().await;
@@ -653,8 +611,6 @@ async fn a_cold_continue_starts_a_successor_session_in_the_same_thread() {
     );
 }
 
-/// The implementer a handoff names is the one the successor session runs on,
-/// not the previous session's.
 #[tokio::test]
 async fn successor_runs_on_the_implementer_it_was_handed() {
     let client = user_client().await;
@@ -678,7 +634,6 @@ async fn successor_runs_on_the_implementer_it_was_handed() {
         json!({"coding_agent": "claude-code", "model": "sonnet", "reasoning_effort": "medium"}),
         "the reply names what the successor runs on: {body}"
     );
-    // The handoff records the implementer its successor session starts on.
     let handoff = handoff_payload(&pool, old.thread_id).await;
     archive(&client, old.thread_id).await;
     let handoff = handoff.expect("the handoff is recorded before the reply");
@@ -687,8 +642,6 @@ async fn successor_runs_on_the_implementer_it_was_handed() {
     assert_eq!(handoff["reasoning_effort"], "medium", "{handoff}");
 }
 
-/// Naming the thread's model by its bare id keeps its `[1m]` variant. The
-/// successor session's first call can then read the prompt cache.
 #[tokio::test]
 async fn successor_keeps_the_context_variant_of_its_model() {
     let client = user_client().await;
@@ -719,8 +672,6 @@ async fn successor_keeps_the_context_variant_of_its_model() {
     assert_eq!(handoff_model.as_deref(), Some("claude-opus-5-5[1m]"));
 }
 
-/// A model the backend does not offer refuses the handoff before anything is
-/// recorded, and names the models it does offer.
 #[tokio::test]
 async fn successor_refuses_an_implementer_the_backend_lacks() {
     let client = user_client().await;
@@ -747,8 +698,6 @@ async fn successor_refuses_an_implementer_the_backend_lacks() {
     assert_eq!(handed_off, 0, "a refused handoff records nothing");
 }
 
-/// A warm Continue refuses an implementer the backend lacks before it asks
-/// the old agent for a narrative. It records no request and sends no message.
 #[tokio::test]
 async fn a_warm_continue_refuses_an_unoffered_implementer_before_the_narrative_turn() {
     let client = user_client().await;
@@ -788,8 +737,6 @@ async fn a_warm_continue_refuses_an_unoffered_implementer_before_the_narrative_t
     );
 }
 
-/// A warm Continue asks the old agent for its narrative as a coding-agent
-/// message. The thread lock must not read it as a switch to the Lucidos Agent.
 #[tokio::test]
 async fn a_warm_continue_asks_the_old_agent_for_its_narrative() {
     let client = user_client().await;
@@ -813,7 +760,6 @@ async fn a_warm_continue_asks_the_old_agent_for_its_narrative() {
     let (status, body) =
         post_continue(&client, old.thread_id, json!({"message": "carry on"})).await;
     let requested = count_events_of_type(&pool, old.thread_id, "SuccessorRequested").await;
-    // A coding-agent dispatch records its message after the reply.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let messages = loop {
         let messages = count_events_of_type(&pool, old.thread_id, "MessageReceived").await;
@@ -838,8 +784,6 @@ async fn a_warm_continue_asks_the_old_agent_for_its_narrative() {
     );
 }
 
-/// A provider block takes the brief path whatever the cache's warmth: the
-/// blocked session is never asked for a narrative, and the brief names the block.
 #[tokio::test]
 async fn a_blocked_thread_continues_from_a_brief_even_with_a_warm_cache() {
     let client = user_client().await;
@@ -868,8 +812,6 @@ async fn a_blocked_thread_continues_from_a_brief_even_with_a_warm_cache() {
         }),
     )
     .await;
-    // The projection leaves a failed turn's thread `failed`, and the card's
-    // Continue must still go through.
     sqlx::query("UPDATE thread_summaries SET status = 'failed' WHERE thread_id = $1")
         .bind(old.thread_id)
         .execute(&pool)
@@ -901,7 +843,6 @@ async fn a_blocked_thread_continues_from_a_brief_even_with_a_warm_cache() {
     );
 }
 
-/// Stay here is a recorded decision at the context size the thread holds.
 #[tokio::test]
 async fn stay_here_records_the_size_it_declined_at() {
     let client = user_client().await;
@@ -942,8 +883,6 @@ async fn stay_here_records_the_size_it_declined_at() {
     );
 }
 
-/// A Stay here that reaches a working thread records nothing. A stale tap
-/// then cannot hide the card at the size the new turn reached.
 #[tokio::test]
 async fn stay_here_on_a_working_thread_records_nothing() {
     let client = user_client().await;
@@ -1000,8 +939,6 @@ async fn post_withdraw(client: &reqwest::Client, thread_id: Uuid) -> (u16, Value
     (status, resp.json().await.unwrap_or(Value::Null))
 }
 
-/// *Return to the old session*: the context reading names the waiting ceiling
-/// handoff, and the withdraw raises the ceiling past the session, then ends it.
 #[tokio::test]
 async fn return_to_the_old_session_withdraws_the_ceiling_handoff() {
     let client = user_client().await;
@@ -1047,8 +984,6 @@ async fn return_to_the_old_session_withdraws_the_ceiling_handoff() {
     assert!(after.get("ceiling_handoff").is_none(), "{after}");
 }
 
-/// A thread with no ceiling handoff waiting refuses the return and records
-/// nothing.
 #[tokio::test]
 async fn return_to_the_old_session_needs_a_ceiling_handoff() {
     let client = user_client().await;
@@ -1065,8 +1000,6 @@ async fn return_to_the_old_session_needs_a_ceiling_handoff() {
     assert_eq!(recorded, 0);
 }
 
-/// Uncommitted work stays in the worktree, so it never blocks a handoff: the
-/// successor session finds it there.
 #[tokio::test]
 async fn a_dirty_worktree_hands_off_with_its_work() {
     let client = user_client().await;
@@ -1085,7 +1018,6 @@ async fn a_dirty_worktree_hands_off_with_its_work() {
     assert!(uncommitted.exists(), "the handoff keeps uncommitted work");
 }
 
-/// A stale composer tap cannot hand off a thread whose turn has started.
 #[tokio::test]
 async fn composer_successor_refuses_a_working_thread() {
     let client = user_client().await;
@@ -1103,8 +1035,6 @@ async fn composer_successor_refuses_a_working_thread() {
     assert_eq!(handed_off, 0, "a refused handoff records nothing");
 }
 
-/// The agent's handoff carries a narrative. A message is the card's, and
-/// the successor route ignores it.
 #[tokio::test]
 async fn successor_refuses_a_body_with_no_narrative() {
     let client = user_client().await;
@@ -1120,9 +1050,6 @@ async fn successor_refuses_a_body_with_no_narrative() {
     }
 }
 
-/// I3, I4: a request recorded at the card while the cache was warm reaches the
-/// successor session the agent's handoff starts, as its typist's own message.
-/// It carries the implementer the user picked, though the agent names none.
 #[tokio::test]
 async fn the_narrative_handoff_carries_the_request_recorded_at_the_card() {
     let client = user_client().await;
@@ -1164,9 +1091,6 @@ async fn the_narrative_handoff_carries_the_request_recorded_at_the_card() {
     assert_eq!(handoff["coding_agent_model"], "sonnet", "{handoff}");
 }
 
-/// The control route refuses an effort the thread's backend does not offer,
-/// before it records anything. A valid tier between turns is recorded at
-/// once, with the picking device as its actor (ADR 0542).
 #[tokio::test]
 async fn control_refuses_an_effort_the_backend_does_not_offer() {
     let client = user_client().await;
@@ -1216,7 +1140,6 @@ async fn control_refuses_an_effort_the_backend_does_not_offer() {
     .fetch_optional(&pool)
     .await
     .expect("read the recorded pick");
-    // The picker reads the pair back from the commands read.
     let commands: serde_json::Value = client
         .get(format!(
             "{}/api/v1/claude-code/commands?thread_id={thread_id}",
@@ -1239,8 +1162,6 @@ async fn control_refuses_an_effort_the_backend_does_not_offer() {
     assert_eq!(commands["current_model"], "claude-opus-5-5", "{commands}");
 }
 
-/// While a turn runs, the rung is locked: a pick is refused with a reason the
-/// client can tell apart, and nothing is recorded (ADR 0542).
 #[tokio::test]
 async fn control_refuses_a_pick_while_a_turn_runs() {
     let client = user_client().await;
@@ -1268,7 +1189,6 @@ async fn control_refuses_a_pick_while_a_turn_runs() {
     }
 }
 
-/// A narrative with the six sections the route requires.
 const NARRATIVE: &str = "# Outcomes\nPlan approved.\n# Decisions\nNone.\n# Gotchas\nNone.\n\
     # State\nPlan committed.\n# Next step\nSay exactly: \"successor-ok\"\n# Files\nNone.\n";
 
@@ -1281,9 +1201,6 @@ async fn archive(client: &reqwest::Client, thread_id: Uuid) {
         .ok();
 }
 
-/// A child's handoff keeps its place under the parent and asks nobody,
-/// whichever caller hands off. A second handoff before the successor session
-/// starts is refused.
 #[tokio::test]
 async fn a_child_handoff_keeps_its_parent_and_asks_nobody() {
     for client in [user_client().await, local_process_client()] {
@@ -1326,8 +1243,6 @@ async fn a_child_handoff_keeps_its_parent_and_asks_nobody() {
     }
 }
 
-/// I2: the checkpoint route records any well-formed name a flow passes,
-/// answers with the handoff estimate's verdict, and refuses a malformed name.
 #[tokio::test]
 async fn a_checkpoint_run_is_recorded_under_any_name() {
     let client = user_client().await;
@@ -1381,8 +1296,6 @@ async fn a_checkpoint_run_is_recorded_under_any_name() {
     );
 }
 
-/// A chat thread has no session, so the estimate reads its pair from its latest
-/// turn: a different model on a warm cache warns, the same pair stays silent.
 #[tokio::test]
 async fn switch_estimate_prices_a_chat_threads_model_change() {
     let client = user_client().await;

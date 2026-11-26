@@ -1,8 +1,3 @@
-//! `/api/v1/recall/*`: the Tree memory module's recall tools as routes (ADR
-//! 0362). The `recall` LLM tool and the generated `lucidos recall` commands
-//! reach the same engine methods. A route answers in any workspace, from
-//! whatever summary trees are built.
-
 use super::*;
 use crate::engine::tools::recall::RecallExt;
 
@@ -89,7 +84,6 @@ pub(super) async fn recall_find(
     Ok(Json(serde_json::json!({ "results": hits })))
 }
 
-/// Routes for the `/recall/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/recall/zoom", get(recall_zoom))

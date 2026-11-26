@@ -2,16 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The crate directory, read from the environment cargo sets when it RUNS this
-/// build script. Hand-synced with the engine and gateway build scripts.
-///
-/// Never `env!`, which bakes the value at compile time. Two checkouts of one
-/// package share a `-C metadata` hash, so a shared `CARGO_TARGET_DIR` hands
-/// this compiled binary to whichever checkout builds next. A baked path then
-/// names somebody else's tree, or a deleted one. Here that failure is SILENT:
-/// git cannot run in a missing directory, so the app ships stamped
-/// `0000.00.00.0`.
-/// See docs/plans/2026-08-14-build-script-paths-and-actionable-build-failure.md.
 fn manifest_dir() -> PathBuf {
     PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR")
@@ -19,9 +9,6 @@ fn manifest_dir() -> PathBuf {
     )
 }
 
-/// Auto-bump CalVer version (YYYY.MM.DD.patch) at build time for the Tauri app.
-/// Only bumps when the git HEAD has changed AND app source files differ
-/// since the last bump.
 fn main() {
     let manifest_dir = manifest_dir();
     let manifest_dir = manifest_dir.as_path();
@@ -29,21 +16,15 @@ fn main() {
     let version_file = manifest_dir.join("VERSION");
     let stamp_file = manifest_dir.join(".version_stamp");
 
-    // Tell cargo to re-run when app source files change
-    // (but NOT when VERSION changes — that would create a feedback loop).
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/main.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=tauri.conf.json");
-    // Rebuild when the umbrella Lucidos RELEASE bumps so the engine binary
-    // bundled with the app picks up the new release string.
     println!("cargo:rerun-if-changed=../../RELEASE");
 
-    // Get current git HEAD commit
     let current_head = match git_head(project_root) {
         Some(h) => h,
         None => {
-            // Embed current version even without git
             let version =
                 fs::read_to_string(&version_file).unwrap_or_else(|_| "0000.00.00.0".into());
             println!("cargo:rustc-env=LUCIDOS_APP_VERSION={}", version.trim());
@@ -52,13 +33,9 @@ fn main() {
         }
     };
 
-    // Read last-bumped commit hash
     let last_bumped = fs::read_to_string(&stamp_file).unwrap_or_default();
     let last_bumped = last_bumped.trim().to_string();
 
-    // VERSION is gitignored — it only exists in the main working directory,
-    // not in worktrees. Generate a real CalVer version so builds always
-    // have a meaningful version (not "0.0.0").
     if !version_file.exists() {
         let today = chrono_date_today();
         let new_version = format!("{}.0\n", today);
@@ -67,7 +44,6 @@ fn main() {
 
     if current_head != last_bumped {
         if last_bumped.is_empty() {
-            // First build — just record HEAD without bumping VERSION.
             fs::write(&stamp_file, &current_head).expect("Failed to write version stamp");
         } else if has_source_changes_between(&last_bumped, &current_head, project_root) {
             let current =
@@ -87,12 +63,10 @@ fn main() {
                 .expect("Failed to write VERSION");
             fs::write(&stamp_file, &current_head).expect("Failed to write version stamp");
         } else {
-            // Source unchanged — just update stamp so we don't re-check these commits
             fs::write(&stamp_file, &current_head).expect("Failed to write version stamp");
         }
     }
 
-    // Embed version AFTER bumping so the compiled binary gets the new version
     let version = fs::read_to_string(&version_file).unwrap_or_else(|_| "0000.00.00.0".into());
     println!("cargo:rustc-env=LUCIDOS_APP_VERSION={}", version.trim());
 
@@ -112,9 +86,6 @@ fn git_head(project_root: &Path) -> Option<String> {
     }
 }
 
-/// Check if Tauri app Rust/config files changed between two commits.
-/// Must match the rerun-if-changed directives above — only files that affect
-/// the compiled binary, not frontend TS/CSS (served as static files).
 fn has_source_changes_between(old_commit: &str, new_commit: &str, project_root: &Path) -> bool {
     let output = Command::new("git")
         .args([

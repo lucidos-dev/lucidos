@@ -1,11 +1,3 @@
-//! The thread users routes (ADR 0623): read who drives and watches a root
-//! thread, and Take, Release, Watch or Unwatch it as the calling device's
-//! user. Take over is Take on a root thread someone else drives.
-//!
-//! Any thread id names its root thread, through the family root. A role is
-//! never authority, so no route refuses a caller because of one. A repeat
-//! that changes nothing records nothing.
-
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -19,11 +11,9 @@ use super::AppState;
 use crate::engine::thread_events::ThreadEvent;
 use crate::engine::thread_users::{self, ThreadUsers};
 
-/// The 409 for a caller no user holds: a role belongs to a user.
 pub(super) const NO_USER: &str = "This device belongs to no user yet, and a role in a \
     thread belongs to a user. Add the device to a user in Settings, Users.";
 
-/// One role change a caller can make.
 #[derive(Debug, Clone, Copy)]
 enum RoleChange {
     Take,
@@ -50,7 +40,6 @@ fn roles_body(root: Uuid, roles: &ThreadUsers) -> Json<serde_json::Value> {
     }))
 }
 
-/// The root thread of a thread id, or a 404 for an unknown thread.
 async fn root_of(state: &AppState, raw: &str) -> Result<Uuid, ApiError> {
     let thread_id = Uuid::parse_str(raw)
         .map_err(|e| ApiError::bad_request(format!("Invalid thread_id: {e}")))?;
@@ -70,8 +59,6 @@ async fn root_of(state: &AppState, raw: &str) -> Result<Uuid, ApiError> {
         .map_err(ApiError::db)
 }
 
-/// GET /api/v1/threads/users: the open root threads, newest activity first, each
-/// marked `yours` when the caller's user drives or watches it.
 async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -88,7 +75,6 @@ async fn list(
     })))
 }
 
-/// GET /api/v1/threads/:thread_id/users: the root thread's driver and watchers.
 async fn read_roles(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -133,7 +119,6 @@ async fn change_role(
         .map_err(|e| ApiError::internal(e.to_string()))?;
     if let (RoleChange::Take, Some(from)) = (change, roles.driver.clone()) {
         let notice = thread_users::UserNotice::TakenOver(thread_users::Takeover { from, to: who });
-        // The take stands either way, so a failed notice only logs.
         if let Err(e) = thread_users::notify(&state.engine, root, notice, &snapshot).await {
             log_legacy!(
                 "[ThreadUsers] Could not tell the driver of {} it was taken over: {}",
@@ -148,8 +133,6 @@ async fn change_role(
     Ok(roles_body(root, &roles))
 }
 
-/// POST /api/v1/threads/:thread_id/users/take: the caller's user drives the
-/// root thread, from whoever drove it before.
 async fn take(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -158,8 +141,6 @@ async fn take(
     change_role(state, headers, thread_id, RoleChange::Take).await
 }
 
-/// POST /api/v1/threads/:thread_id/users/release: the caller's user stops
-/// driving. A caller who does not drive it changes nothing.
 async fn release(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -168,7 +149,6 @@ async fn release(
     change_role(state, headers, thread_id, RoleChange::Release).await
 }
 
-/// POST /api/v1/threads/:thread_id/users/watch: the caller's user watches.
 async fn watch(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -177,8 +157,6 @@ async fn watch(
     change_role(state, headers, thread_id, RoleChange::Watch).await
 }
 
-/// POST /api/v1/threads/:thread_id/users/unwatch: the caller's user stops
-/// watching, from any of their devices.
 async fn unwatch(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,

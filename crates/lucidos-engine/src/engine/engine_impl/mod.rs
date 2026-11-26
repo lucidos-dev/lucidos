@@ -15,7 +15,7 @@ mod scripts;
 mod shutdown;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use shutdown::emit_teardown_abort_unless_question_parked;
+pub use shutdown::{emit_teardown_abort_unless_question_parked, TeardownBoundary};
 mod threads;
 mod trigger_runs;
 

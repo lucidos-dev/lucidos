@@ -26,6 +26,7 @@ scan ready-signal "\"reveal\"[[:space:]]*:|lucidos\.ui\.ready\(" --include=manif
 scan app-icon "\"icon\"[[:space:]]*:" --include=manifest.json apps
 scan widget-tile "\"(sizes|transparent)\"[[:space:]]*:" --include=manifest.json apps
 scan touch-hover ":hover" $inc --include=*.css apps
+scan left-stripe "border-(left|inline-start)(-color|-width)?[[:space:]]*:|box-shadow[[:space:]]*:[^;]*inset" $inc --include=*.css apps
 scan state-as-action "classList[[:space:]]*\.[[:space:]]*(toggle|remove|replace)\([^)]*action-btn|action-btn-(secondary|confirm|danger)" $inc apps
 ```
 
@@ -119,7 +120,7 @@ Per `system-knowhow/js-sdk.md`:
     The remedy: keep the app's state in its fragment or query, written as above. Inbound deep links arrive on the fragment, so apply `location.hash` at boot and subscribe to `hashchange`. Reference: `system-knowhow/js-sdk/remote-workspace-client-contract.md` § Setup (what the frame is granted) and `system-knowhow/js-sdk/lucidos-ui-ui-control.md` § "fragment: opening at a place inside the app".
   - **A write to `/env-vars`**, through `lucidos.request` or the app's own `fetch`. The route opens `GET` only. A user env var reaches every command the agent runs, so a name the interpreter loads from would be host code execution. Severity: **broken**, since the call answers 403 and the app's settings never persist. § Remediation below carries the replacement.
   - **An app that tries to add trigger command grants.** Category grants have ended. An owner grants a program from a trigger grant review card or the blocked run's permission request. Flag app code that depends on minting either grant as **broken**. The same holds for app code that revokes a folder grant with `revoke_folder_grants`: the engine refuses an app frame, since only the owner revokes one.
-  - The generated preference catalog also includes device appearance settings such as `agent-brand-colours`. These are writable; do not flag them as human-only.
+  - The generated preference catalog also includes device appearance settings such as `agent-icon-colors`. These are writable; do not flag them as human-only.
   - A generated model fallback describes an unset preference, not a stored owner choice. An older stored model pin is not drift; see `preferences.md`.
   - **A write of a human-only preference**, through `lucidos.preferences.set` or a `PUT /preferences`. The route stays open, but two key classes are refused to an app. One the Lucidos Agent may not write either: `command_guard`, `coding_agent_auto_answer`, `max_tool_calls`, `network_bind`, `local_base_url`, the judge and permission-answer settings and the `provider_enabled_*` switches. One the agent may write but an app may not: the coding-agent paths and permission mode, and `opencode_free_enabled`. These would let an app run its own script as the user, read local-model chat, or send chat to an anonymous relay. Severity: **broken** (403); § Remediation below carries the answer.
   - **A read or write of engine bookkeeping**, such as the last backup's outcome in `backup_last_run`. A preference read leaves it out, and an app's `PUT /preferences` naming it is refused. Severity: **broken** (403 on write, a missing key on read); § Remediation below carries the answer.

@@ -152,7 +152,7 @@ $ lucidos hooks remove --slug require-a-plan
       "content_hash": "<64 hex characters>",
       "arm_state": "disarmed",
       "armed": null,
-      "arm_refusal": "Lucidos does not ask hooks about MessageReceived events yet, so this hook could never run.",
+      "arm_refusal": null,
       "remove_refusal": null
     }
   ]
@@ -160,8 +160,8 @@ $ lucidos hooks remove --slug require-a-plan
 ```
 
 A valid row carries `slug`, `event_kind` (`thread` or `system`), the
-`definition` as written, and `content_hash`: the digest of `hook.toml` and its
-script, read with the definition. An invalid row has `status: "invalid"` and lists
+`definition` as written, and `content_hash`: the digest of every file in the
+hook's folder, read with the definition. An invalid row has `status: "invalid"` and lists
 every `problems` entry at once. It carries the `definition` too when the file
 parsed. A file directly under `data/hooks/` lists as invalid, since a hook is
 a folder. Names starting with `.` are skipped.
@@ -170,7 +170,7 @@ Each row also carries its arming:
 
 | Field | Meaning |
 |---|---|
-| `arm_state` | `disarmed`, `armed`, or `changed`: armed, but the definition or script changed since, broke or left |
+| `arm_state` | `disarmed`, `armed`, or `changed`: armed, but a file in its folder changed since, or the hook broke or left |
 | `armed` | The arming: `event_type`, `content_hash`, `armed_at` and `actor`, or `null` |
 | `arm_refusal` | Why `arm` would be refused now, or `null` |
 | `remove_refusal` | Why `remove` would be refused now, or `null` |
@@ -180,8 +180,10 @@ disarms it, so an edit never switches a gate off. An armed hook whose folder
 is gone lists with `status: "missing"`. `remove` ends its arming.
 
 `arm` binds the hook's current content. It is refused for an invalid hook, an
-armed one, or one whose `event_type` no *asking site* asks about. No asking
-site exists yet, so every arm is refused for now. `disarm` keeps the folder.
+armed one, or one whose `event_type` Lucidos never asks hooks about. It asks
+about four: a thread's first `MessageReceived`, `TriggerStarted`,
+`ChangeProposed` and `ChangeApplyRequested` (`system-knowhow/event-hooks`).
+`disarm` keeps the folder.
 
 `remove` deletes `data/hooks/<slug>/`, commits that, and ends any arming. A
 link in the folder's place goes itself, never what it points at. An entry whose
@@ -211,6 +213,7 @@ A definition is invalid when:
 - `condition` could never match;
 - `script` leaves the folder, is not a `.py` or `.sh` file, is missing, or
   cannot be read;
+- the folder holds a link, or anything but plain files and folders;
 - `timeout_secs` is outside 1 to 60. Leave it out for 10.
 
 There is no chat tool for this. The Lucidos Agent runs the CLI from its shell

@@ -8,16 +8,6 @@ pub(crate) struct Workspace {
     pub(crate) root: PathBuf,
     pub(crate) api_port: u16,
     pub(crate) proto: String,
-    /// Explicit engine base URL handed down by the engine (`LUCIDOS_API_BASE_URL`),
-    /// used in preference to `proto`/`api_port` when present. Under the workspace
-    /// gateway (ADR 0014) the `.lucidos/ports` file holds the user-facing gateway
-    /// port — but the gateway routes the workspace under `/<slug>/`, so a bare
-    /// `https://localhost:<port>/api/v1/...` request never reaches this engine
-    /// (the gateway resolves the first path segment as a workspace slug). The
-    /// engine therefore exports the loopback HTTP URL it is actually reachable at;
-    /// we honour it so the CLI talks to the engine directly. `None` in legacy /
-    /// Tauri / terminal use → fall back to the ports file (which resolves the
-    /// engine correctly there).
     pub(crate) api_base_override: Option<String>,
 }
 
@@ -37,9 +27,6 @@ impl Workspace {
 pub(crate) fn resolve_from_env() -> Result<Workspace, BoxError> {
     let pwd = std::env::current_dir().map_err(|e| format!("Failed to read current dir: {}", e))?;
     let env_ws = std::env::var("LUCIDOS_WORKSPACE").ok().map(PathBuf::from);
-    // Read the engine-provided base URL here, not in the resolver, to keep the
-    // pure helpers free of env reads so tests can drive them deterministically
-    // (workspace gateway, ADR 0014 — see `Workspace::api_base_override`).
     let api_base_override = std::env::var("LUCIDOS_API_BASE_URL")
         .ok()
         .map(|s| s.trim().to_string())
@@ -47,24 +34,6 @@ pub(crate) fn resolve_from_env() -> Result<Workspace, BoxError> {
     resolve_with_override(&pwd, env_ws.as_deref(), api_base_override)
 }
 
-/// Env-free resolution that honours the engine-supplied `LUCIDOS_API_BASE_URL`
-/// override (workspace gateway, ADR 0014). Split from `resolve_from_env` so
-/// tests can drive it without racing the global env table.
-///
-/// When `api_base_override` is `Some`, that override IS the authoritative engine
-/// endpoint (`Workspace::base_url`), so the `.lucidos/ports` file is OPTIONAL.
-/// The packaged gateway spawns the engine on a random loopback port and never
-/// writes that file (only dev's `web-dev.sh` does), so requiring it here made
-/// every `lucidos` CLI call inside a packaged coding-agent thread fail at
-/// startup — the permission-prompt MCP server exited before advertising its
-/// tools, so Claude Code aborted every tool call with "Available MCP tools:
-/// none". We still best-effort read the ports file to fill `api_port`/`proto`,
-/// but they are unused while an override is present (`base_url` returns the
-/// override verbatim), so a missing or unreadable file is not an error.
-///
-/// When `api_base_override` is `None` (legacy / Tauri / terminal), this is
-/// identical to `resolve`: the ports file is required, same errors, same
-/// precedence — so dev behaviour is unchanged.
 pub(crate) fn resolve_with_override(
     start_dir: &Path,
     env_workspace: Option<&Path>,
@@ -73,16 +42,10 @@ pub(crate) fn resolve_with_override(
     let Some(base) = api_base_override else {
         return resolve(start_dir, env_workspace);
     };
-    // Root: prefer the engine-supplied workspace (always set alongside the
-    // override), else walk up for a ports file, else fall back to the start dir
-    // so `data_dir()` still resolves. Never an error on the override path.
     let root = env_workspace
         .map(Path::to_path_buf)
         .or_else(|| walk_up_for_ports(start_dir))
         .unwrap_or_else(|| start_dir.to_path_buf());
-    // Best-effort port/proto — unused while the override is present, so tolerate
-    // a missing/unreadable ports file. Derive the fallback proto from the
-    // override's scheme purely for internal consistency.
     let (api_port, proto) = read_ports(&root.join(".lucidos/ports"))
         .map(|(port, recorded)| (port, recorded.unwrap_or_else(|| DEFAULT_PROTO.to_string())))
         .unwrap_or_else(|_| {
@@ -101,17 +64,6 @@ pub(crate) fn resolve_with_override(
     })
 }
 
-/// Separated from env reads so tests can drive it without racing the global
-/// env table.
-///
-/// Precedence: `LUCIDOS_WORKSPACE` env var beats walking up from `start_dir`.
-/// The env var is set explicitly by the engine that spawned the subprocess
-/// (CC, scheduler, etc.) and is the authoritative source. Walk-up is the
-/// fallback path for terminal users who haven't set it. Doing it the other way
-/// — walk-up first — was the cause of a production bug: a rogue lucidos-engine
-/// started inside a CC worktree dropped its own `.lucidos/ports` file, so every
-/// `lucidos hardened mark` from CC POSTed to the wrong DB. The parent engine
-/// then saw Missing at apply time and triggered an unnecessary auto-/harden.
 pub(crate) fn resolve(
     start_dir: &Path,
     env_workspace: Option<&Path>,
@@ -159,17 +111,8 @@ fn walk_up_for_ports(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// What to speak when the ports file names no protocol.
-///
-/// Kept for the files written before the key existed, where it is what they
-/// silently meant. A launch records the real answer, so an absent line now says
-/// only "written by an older launcher".
 pub(crate) const DEFAULT_PROTO: &str = "https";
 
-/// The clause a failed request adds when the protocol was a guess.
-///
-/// A guess that lands wrong surfaces as a TLS handshake against a plain-http
-/// socket, and that error names neither the file nor the assumption.
 pub(crate) fn assumed_proto_note(ports_path: &Path) -> String {
     format!(
         " ({} has no PROTO= line, so {DEFAULT_PROTO} was assumed; relaunch that \
@@ -178,10 +121,6 @@ pub(crate) fn assumed_proto_note(ports_path: &Path) -> String {
     )
 }
 
-/// Read API_PORT and PROTO from the ports file.
-///
-/// `None` for the protocol means the file named none. Reported apart rather
-/// than defaulted here, so a caller can say the protocol was assumed.
 pub(crate) fn read_ports(path: &Path) -> Result<(u16, Option<String>), BoxError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
@@ -231,9 +170,6 @@ mod tests {
 
     #[test]
     fn a_ports_file_with_no_proto_line_resolves_and_says_it_guessed() {
-        // Every ports file written before the key existed looks like this, so
-        // refusing them would break more than it fixed. The guess is recorded
-        // instead, and a failed request names it.
         let tmp = tempdir().unwrap();
         write_ports(tmp.path(), 1234);
         let ports = tmp.path().join(".lucidos/ports");
@@ -249,8 +185,6 @@ mod tests {
 
     #[test]
     fn a_recorded_proto_is_taken_and_an_empty_one_is_not() {
-        // A truncating writer that got as far as the key is not a workspace
-        // that chose plain http.
         let tmp = tempdir().unwrap();
         let lucidos = tmp.path().join(".lucidos");
         fs::create_dir_all(&lucidos).unwrap();
@@ -371,11 +305,6 @@ mod tests {
 
     #[test]
     fn base_url_prefers_explicit_override() {
-        // Under the workspace gateway (ADR 0013) the engine hands the CLI an
-        // explicit loopback base URL via LUCIDOS_API_BASE_URL. It must win over
-        // the ports-file port, which under the gateway is the user-facing
-        // gateway port (a bare `/api/v1` request there returns the picker's
-        // SPA HTML, not JSON — the trigger-notification bug this fixes).
         let ws = Workspace {
             root: PathBuf::from("/tmp/test-ws"),
             api_port: 5173,
@@ -387,10 +316,7 @@ mod tests {
 
     #[test]
     fn override_makes_ports_file_optional() {
-        // The packaged gateway hands down LUCIDOS_API_BASE_URL but never writes
-        // .lucidos/ports. Resolution must succeed anyway and return the override
-        // as the base URL — the fix for the "Available MCP tools: none" abort.
-        let ws = tempdir().unwrap(); // no .lucidos/ports inside
+        let ws = tempdir().unwrap();
         let unrelated = tempdir().unwrap();
         let resolved = resolve_with_override(
             unrelated.path(),
@@ -404,7 +330,6 @@ mod tests {
 
     #[test]
     fn override_wins_even_when_ports_file_present() {
-        // With both a ports file and an override, the override is authoritative.
         let ws = tempdir().unwrap();
         write_ports(ws.path(), 5174);
         let resolved = resolve_with_override(
@@ -418,17 +343,13 @@ mod tests {
 
     #[test]
     fn override_absent_still_requires_ports_file() {
-        // No override → identical to `resolve`: the ports file is mandatory and a
-        // missing one is an error (dev / Tauri / terminal path unchanged).
-        let tmp = tempdir().unwrap(); // no ports file
+        let tmp = tempdir().unwrap();
         let err = resolve_with_override(tmp.path(), None, None).unwrap_err();
         assert!(err.to_string().contains("Could not locate"), "{err}");
     }
 
     #[test]
     fn override_root_falls_back_to_start_dir_without_env_workspace() {
-        // Override present but no LUCIDOS_WORKSPACE and no ports anywhere: root
-        // falls back to the start dir so data_dir() still resolves, no error.
         let start = tempdir().unwrap();
         let resolved =
             resolve_with_override(start.path(), None, Some("http://127.0.0.1:1".to_string()))
@@ -439,7 +360,6 @@ mod tests {
 
     #[test]
     fn base_url_falls_back_to_ports_file_without_override() {
-        // Legacy / Tauri / terminal: no override → ports-file proto + port.
         let ws = Workspace {
             root: PathBuf::from("/tmp/test-ws"),
             api_port: 5177,

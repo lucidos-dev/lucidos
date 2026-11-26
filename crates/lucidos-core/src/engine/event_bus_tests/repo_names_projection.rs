@@ -1,7 +1,6 @@
 use super::super::*;
 use super::*;
 
-/// Fetch the projected name for a repo id, or None if no row exists.
 async fn repo_name(pool: &PgPool, repo_id: Uuid) -> Option<String> {
     sqlx::query_scalar("SELECT name FROM repo_names WHERE id = $1")
         .bind(repo_id)
@@ -10,9 +9,6 @@ async fn repo_name(pool: &PgPool, repo_id: Uuid) -> Option<String> {
         .unwrap()
 }
 
-/// `RepositoryAdded` populates the durable `repo_names` projection, and
-/// `RepositoryRemoved` deliberately leaves it intact — so a removed repo's name
-/// survives for the filter / thread-row resolution path.
 #[tokio::test]
 async fn repository_added_populates_repo_names_and_removed_retains_it() {
     let (pool, db_name) = setup_test_db().await;
@@ -51,8 +47,6 @@ async fn repository_added_populates_repo_names_and_removed_retains_it() {
     teardown_test_db(&db_name).await;
 }
 
-/// A rename (re-add at the same path keeps the same UUID) upserts the projected
-/// name to the latest value.
 #[tokio::test]
 async fn repository_added_upserts_renamed_repo() {
     let (pool, db_name) = setup_test_db().await;

@@ -7,8 +7,6 @@ fn fixture(workspace: &Path, archive: &Path) -> Manifest {
     manifest.files.count = captured.count;
     manifest.files.bytes = captured.bytes;
     manifest.files.tree_sha256 = captured.tree_sha256;
-    // File staging verifies only the two file components. The restore runner
-    // independently checks the authenticated manifest and database dump.
     manifest
         .components
         .retain(|c| c.name != manifest::ComponentName::Database);
@@ -226,8 +224,6 @@ fn swap_preserves_current_exclusions_links_and_relocated_data() {
     assert!(!relocated.path().join("extra").exists());
     assert!(target.path().join("data").is_symlink());
     assert!(target.path().join("link").is_symlink());
-    // Verification uses the frozen policy even though the archived ignore file
-    // has now replaced the current one.
     std::fs::write(relocated.path().join("note"), "corrupt").unwrap();
     assert!(swap.verify().is_err());
 }

@@ -1,18 +1,3 @@
-//! Replay one thread round by round, out of the arm's own event log.
-//!
-//! The capture is `ContextCaptured` rows with whole bodies, which the arm's
-//! engine writes because the harness boots it with `LUCIDOS_EVAL_FULL_CAPTURE`.
-//! The event log is the source of truth. Completed runs preserve these rows in
-//! an immutable input snapshot, so replay survives removal of the arm. Older
-//! runs without a snapshot still read the ordinary workspace database.
-//!
-//! One round is one `ContextCaptured` row plus everything the thread did before
-//! the next one. That pairing is what makes it a replay rather than a dump: you
-//! see the request, then the call the model made against it.
-//!
-//! `--raw` prints the capture's payload JSON. Everything else is a rendering,
-//! and a rendering can be wrong where the bytes cannot.
-
 use lucidos_engine::core::prefs;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -20,18 +5,10 @@ use uuid::Uuid;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// How much of a body the rendering shows before it stops.
-///
-/// `--section` prints one in full, which is the way to read a message array.
 const PREVIEW_CHARS: usize = 200;
 
-/// What the thread did after a request, and nothing else.
-///
-/// A capture is the request. These are the model's answer to it, and the tool
-/// calls it made. Anything else on the thread is noise at this altitude.
 const AFTER_THE_REQUEST: [&str; 3] = ["ResponseGenerated", "ToolCalled", "ToolResult"];
 
-/// One captured round: the request, then what the model did with it.
 #[derive(Serialize, Deserialize)]
 pub struct Round {
     pub round: usize,
@@ -39,28 +16,19 @@ pub struct Round {
     pub after: Vec<Happened>,
 }
 
-/// One event the thread produced after a request.
 #[derive(Serialize, Deserialize)]
 pub struct Happened {
     pub event_type: String,
     pub payload: serde_json::Value,
 }
 
-/// One section of a captured request.
-///
-/// A replay asks how big a region was, so it reads `content_chars`. The
-/// budget delta answers a different question: what this section added on top
-/// of what other sections already count. On `Conversation` the two differ by
-/// the whole bundle, which is why sizing a region off the delta under-reads.
 #[derive(Deserialize)]
 struct Section {
     name: String,
     #[serde(default)]
     content: Option<String>,
-    /// `alias`: months of stored rows spell the delta `char_count`.
     #[serde(default, alias = "char_count")]
     budget_delta_chars: usize,
-    /// Absent on a row written before the region size was measured.
     #[serde(default)]
     content_chars: Option<usize>,
     #[serde(default)]
@@ -68,10 +36,6 @@ struct Section {
 }
 
 impl Section {
-    /// The size to report, and whether it is the real one.
-    ///
-    /// A pre-rename row measured no region, so the delta is all there is. It
-    /// under-reads, so the caller marks it rather than passing it off.
     fn size(&self) -> (usize, bool) {
         match self.content_chars {
             Some(chars) => (chars, true),
@@ -80,11 +44,6 @@ impl Section {
     }
 }
 
-/// Every round of one thread, oldest first.
-///
-/// `producer = main_llm` is load-bearing. An auxiliary call writes its own
-/// capture on the same thread for the classifier, the title and the
-/// summariser. Counted as rounds they would interleave calls nobody made.
 pub async fn rounds(pool: &PgPool, thread_id: Uuid) -> Fallible<Vec<Round>> {
     let captures = sqlx::query(
         "SELECT sequence, payload::text AS payload FROM events \
@@ -99,9 +58,6 @@ pub async fn rounds(pool: &PgPool, thread_id: Uuid) -> Fallible<Vec<Round>> {
     let mut rounds = Vec::new();
     for (index, row) in captures.iter().enumerate() {
         let sequence: i64 = row.try_get("sequence")?;
-        // Everything up to the next request, or to the end of the thread on the
-        // last round. A round's answer is what happened before the model was
-        // asked again.
         let until: Option<i64> = captures
             .get(index + 1)
             .map(|next| next.try_get("sequence"))
@@ -145,15 +101,12 @@ async fn happened_between(
         .collect()
 }
 
-/// What to print, and how much of it.
 pub struct Options<'a> {
     pub round: Option<usize>,
-    /// Print this section's whole body rather than a preview of every one.
     pub section: Option<&'a str>,
     pub raw: bool,
 }
 
-/// Walk the selected rounds of one thread.
 pub fn print_rounds(label: &str, rounds: &[Round], options: &Options) {
     if rounds.is_empty() {
         println!("{}", nothing_captured());
@@ -167,7 +120,6 @@ pub fn print_rounds(label: &str, rounds: &[Round], options: &Options) {
     }
 }
 
-/// Why a thread might hold no captured round at all.
 fn nothing_captured() -> String {
     format!(
         "no captured rounds. Either the thread never reached the model, or the arm ran without \
@@ -220,21 +172,14 @@ fn print_request(capture: &serde_json::Value, only: Option<&str>) {
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    // Largest first. What filled a request is the question, and the answer is
-    // almost never the section that happens to be assembled first.
     sections.sort_by_key(|section| std::cmp::Reverse(section.size().0));
     println!("  sections  {} largest first", sections.len());
     for section in &sections {
         print_section(section, only);
     }
-    // Said once rather than per section. A round of headers with no bodies is
-    // what a run before ADR 0110 looks like. Without the line it reads as a
-    // round that carried nothing.
     if !sections.is_empty() && sections.iter().all(|s| s.content.is_none()) {
         println!("      no bodies: this run captured names and sizes only");
     }
-    // Also said once. A starred row is a budget delta standing in for a
-    // region size, and on `Conversation` it under-reads by the whole bundle.
     if sections.iter().any(|s| !s.size().1) {
         println!("      * budget delta, not a region size: row predates the split");
     }
@@ -251,7 +196,6 @@ fn print_section(section: &Section, only: Option<&str>) {
         section.role.as_deref().unwrap_or("-"),
     );
     match (&section.content, wanted) {
-        // The whole body, which is the point of asking for one section.
         (Some(body), true) => println!("{body}"),
         (Some(body), false) if only.is_none() => println!("      {}", preview(body)),
         (None, true) => println!(
@@ -290,7 +234,6 @@ fn print_after(after: &[Happened]) {
     }
 }
 
-/// Which trim passes fired on this round, said in words.
 fn trims(data: &serde_json::Value) -> String {
     let passes: Vec<String> = data
         .get("trim_passes")
@@ -302,14 +245,11 @@ fn trims(data: &serde_json::Value) -> String {
         data.get("trimmed").and_then(|v| v.as_bool()),
     ) {
         (false, _) => passes.join(", "),
-        // A row from before `trim_passes` existed. It knew a round trimmed and
-        // not which pass, so saying "none" would be a claim it never made.
         (true, Some(true)) => "trimmed, and the row predates the per-pass record".to_string(),
         (true, _) => "none".to_string(),
     }
 }
 
-/// How often each trim pass fired across a thread's rounds.
 pub fn trim_passes(rounds: &[Round]) -> std::collections::BTreeMap<u64, usize> {
     let mut counts = std::collections::BTreeMap::new();
     for round in rounds {
@@ -345,7 +285,6 @@ fn number_at(value: &serde_json::Value, key: &str) -> String {
         .map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
-/// One line of a value, cut at [`PREVIEW_CHARS`] on a character boundary.
 fn preview(text: &str) -> String {
     let one_line: String = text
         .chars()
@@ -384,8 +323,6 @@ mod tests {
         assert_eq!(trims(&data), "pass 1, pass 5");
     }
 
-    /// A row from before the field knew a round trimmed and not which pass.
-    /// Reporting "none" would be a claim that row never made.
     #[test]
     fn an_older_row_says_it_does_not_know_which_pass() {
         let data = capture(None, true);
@@ -420,9 +357,6 @@ mod tests {
         assert_eq!(trim_passes(&rounds), [(1, 2), (5, 1)].into_iter().collect());
     }
 
-    /// The engine wraps a thread event as `{type, data}`, and a payload read
-    /// straight out of the row carries that. Reading through it either way is
-    /// what lets the same code render a raw row and a bare one.
     #[test]
     fn a_wrapped_payload_reads_the_same_as_a_bare_one() {
         let bare = capture(Some(serde_json::json!([2])), true);
@@ -449,8 +383,6 @@ mod tests {
         assert!(nothing_captured().contains(prefs::CAPTURE_CONTEXT.key()));
     }
 
-    /// Only the three that answer a request. A capture on the same thread is
-    /// the next round rather than part of this one.
     #[test]
     fn the_event_filter_is_the_models_own_output() {
         assert!(AFTER_THE_REQUEST.contains(&"ToolCalled"));

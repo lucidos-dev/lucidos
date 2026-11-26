@@ -17,22 +17,14 @@ pub struct McpServer {
     pub env: HashMap<String, McpEnvValue>,
     pub auto_approve: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// The tool manifest as last observed, verbatim. Only a running server
-    /// advertises tools, so this is what answers "what does this cost" for one
-    /// that is switched off.
     pub tools: Vec<crate::engine::thread_events::McpTool>,
-    /// When [`Self::tools`] was last read off a live server. `None` means never
+    /// INVARIANT: When [`Self::tools`] was last read off a live server. `None` means never
     /// observed, which is NOT the same as observed-and-empty: one is unknown
     /// and the other is genuinely free.
     pub tools_observed_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Tools the user switched off, by WIRE name. Filtered out of the
-    /// definitions every request carries.
     pub disabled_tools: Vec<String>,
 }
 
-/// One entry of an MCP server's environment: a value, or the name of a
-/// credential the server gets the value of at launch. On the wire a value is
-/// a string and a credential is `{"credential": "<name>"}`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpEnvValue {
@@ -40,7 +32,7 @@ pub enum McpEnvValue {
     Credential { credential: String },
 }
 
-// Manual `Debug`, so a plain value, often an API key, never reaches a log.
+// INVARIANT: Manual `Debug`, so a plain value, often an API key, never reaches a log.
 impl std::fmt::Debug for McpEnvValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -50,14 +42,13 @@ impl std::fmt::Debug for McpEnvValue {
     }
 }
 
-/// The columns every read selects, in the order [`row_to_server`] unpacks them.
+/// INVARIANT: The columns every read selects, in the order [`row_to_server`] unpacks them.
 /// A NULL `env_credentials` is a row whose values boot has not moved yet: it
 /// points at nothing so far.
 const SERVER_COLUMNS: &str = "id, name, command, args, env, \
                               COALESCE(env_credentials, '{}'::jsonb), auto_approve, \
                               created_at, tools, tools_observed_at, disabled_tools";
 
-/// Raw DB row from mcp_servers, in [`SERVER_COLUMNS`] order.
 type McpServerRow = (
     String,
     String,
@@ -72,13 +63,13 @@ type McpServerRow = (
     Vec<String>,
 );
 
-/// Longest server id that still leaves room for `mcp__<id>__<tool>` with one
+/// INVARIANT: Longest server id that still leaves room for `mcp__<id>__<tool>` with one
 /// character of tool name. Past it the wire name is truncated through the
 /// separator, and no tool call parses back to a server.
 pub const MAX_SERVER_ID_LEN: usize =
     crate::llm::validate::MAX_TOOL_NAME_LEN - "mcp__".len() - "__".len() - 1;
 
-/// Reject a server id the tool-name layer could not carry.
+/// INVARIANT: Reject a server id the tool-name layer could not carry.
 ///
 /// The id is half of every wire tool name (`mcp__<id>__<tool>`), so it has to
 /// survive that round trip untouched. `__` is the separator itself. Any other
@@ -89,7 +80,7 @@ pub fn validate_server_id(id: &str) -> Result<(), Box<dyn std::error::Error + Se
     if !crate::llm::validate::is_wire_safe_tool_name(id) {
         return Err(format!("MCP server id '{}' is not usable: {}", id, shape).into());
     }
-    // A trailing `_` joins the separator: `mcp__srv___run` parses back as
+    // INVARIANT: A trailing `_` joins the separator: `mcp__srv___run` parses back as
     // server `srv`, tool `_run`.
     if id.contains("__") || id.ends_with('_') {
         return Err(format!(
@@ -111,9 +102,6 @@ pub fn validate_server_id(id: &str) -> Result<(), Box<dyn std::error::Error + Se
     Ok(())
 }
 
-/// The stored form of a disabled-tool selection: sorted and deduped, so the
-/// column holds a set. A client resending the same names in another order is
-/// then not a change, and nothing re-announces.
 fn normalize_disabled_tools(names: &[String]) -> Vec<String> {
     let mut set: Vec<String> = names.to_vec();
     set.sort();
@@ -121,7 +109,7 @@ fn normalize_disabled_tools(names: &[String]) -> Vec<String> {
     set
 }
 
-/// The registry of external MCP servers whose tools the agent can call.
+/// INVARIANT: The registry of external MCP servers whose tools the agent can call.
 ///
 /// **No caller can skip the event.** [`Self::register`], [`Self::unregister`],
 /// [`Self::set_auto_approve`] and [`Self::set_tool_disabled`] are the reachable
@@ -177,24 +165,21 @@ fn row_to_server(row: McpServerRow) -> Result<McpServer, Box<dyn std::error::Err
     })
 }
 
-/// The credential name a server's env variable `var` moves into. Only a
-/// credential with this name is the server's own, to delete with it.
 fn owned_credential_name(server_id: &str, var: &str) -> String {
     format!("mcp-{server_id}-{var}")
 }
 
-/// A server's stored credential pointers, by env variable.
 fn pointers_of(
     env_credentials: serde_json::Value,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(serde_json::from_value(env_credentials)?)
 }
 
-/// Serializes every write to credential pointers with the credential cleanup
+/// INVARIANT: Serializes every write to credential pointers with the credential cleanup
 /// that reads them. Held from a register's pointer check through its cleanup.
 static POINTER_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Delete each credential in `dropped` that server `server_id` owns and no
+/// INVARIANT: Delete each credential in `dropped` that server `server_id` owns and no
 /// server's pointers still name. A credential with any other name stays.
 ///
 /// The caller holds [`POINTER_WRITES`], so no register can add a pointer
@@ -231,7 +216,6 @@ fn missing_credential(var: &str, name: &str) -> String {
     format!("{var} names credential '{name}', and no credential has that name")
 }
 
-/// The value credential `name` gives env variable `var`, or why it gives none.
 async fn credential_value(
     pool: &PgPool,
     var: &str,
@@ -250,7 +234,7 @@ async fn credential_value(
     Ok(credential.secret(pool).await?)
 }
 
-/// The environment `server` launches with: each credential it names,
+/// INVARIANT: The environment `server` launches with: each credential it names,
 /// resolved now, so a rotated key reaches the next start.
 pub async fn launch_env(
     pool: &PgPool,
@@ -269,8 +253,6 @@ pub async fn launch_env(
     Ok(env)
 }
 
-/// What an MCP server launch spawns: a command, its arguments and its
-/// environment. A setup request and a stored row each describe one.
 #[derive(Clone, Copy)]
 pub struct LaunchSpec<'a> {
     pub command: &'a str,
@@ -278,20 +260,16 @@ pub struct LaunchSpec<'a> {
     pub env: &'a HashMap<String, McpEnvValue>,
 }
 
-/// How a launch line shows a plain env value. A credential pointer always
-/// shows as `<credential NAME>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchLineMode {
-    /// The value verbatim. Only the fingerprint reads a stored row this way,
+    /// INVARIANT: The value verbatim. Only the fingerprint reads a stored row this way,
     /// since a stored plain value is sealed at rest.
     Real,
-    /// Each plain value as `<stored value>`, safe for a card, an event or
-    /// the model.
     Masked,
 }
 
 impl LaunchSpec<'_> {
-    /// The shell line this launch amounts to, for the command guard to read
+    /// INVARIANT: The shell line this launch amounts to, for the command guard to read
     /// as a `run_bash` command.
     ///
     /// The spawn runs the command with its arguments and environment, through
@@ -326,7 +304,7 @@ impl LaunchSpec<'_> {
         words.join(" ")
     }
 
-    /// The *launch fingerprint*: HMAC-SHA256 of the real line under the
+    /// INVARIANT: The *launch fingerprint*: HMAC-SHA256 of the real line under the
     /// secret store key, in hex. A changed command, argument, env value or
     /// spawn directory changes it.
     ///
@@ -357,15 +335,12 @@ impl McpServer {
     }
 }
 
-/// Whether two paths name one directory, symlinks resolved where they can be.
 fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
     let resolve =
         |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     resolve(a) == resolve(b)
 }
 
-/// `s` as one shell word: bare when every character is inert, otherwise
-/// single-quoted, with each `'` written as `'\''`.
 pub fn shell_word(s: &str) -> String {
     let inert = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
     if !s.is_empty() && s.chars().all(inert) {
@@ -376,15 +351,6 @@ pub fn shell_word(s: &str) -> String {
 }
 
 impl McpServerStore {
-    /// Move the env values of every server written before credential
-    /// pointers existed into `secret` credentials named `mcp-<id>-<VAR>`,
-    /// leaving a pointer to each. Returns how many values moved.
-    ///
-    /// A boot step (`secret_store::one_home`): it runs before the EventBus
-    /// exists, so it announces nothing. One transaction per server. A NULL
-    /// `env_credentials` marks a server not moved yet, and the move sets it,
-    /// so a value added after the move stays in `env`. A name another
-    /// credential already holds keeps its value in `env`.
     pub(crate) async fn move_env_into_credentials(
         pool: &PgPool,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -458,9 +424,6 @@ impl McpServerStore {
         row.map(row_to_server).transpose()
     }
 
-    /// Write (or rewrite) a server row. **Private on purpose**:
-    /// [`Self::register`] is the reachable mutator, and it emits. See the
-    /// type-level doc.
     async fn upsert_row(
         pool: &PgPool,
         id: &str,
@@ -482,7 +445,7 @@ impl McpServerStore {
         }
         let env_json = secret_store::seal_json_values(&McpServerEnv::SPEC, &plain)?;
 
-        // RETURNING the whole row, not just what was written: the ON CONFLICT
+        // INVARIANT: RETURNING the whole row, not just what was written: the ON CONFLICT
         // arm leaves auto_approve, the cached manifest and the disabled set
         // alone. A previously auto-approved server must still report `true`, or
         // the caller connects with a flag that disagrees with the DB row.
@@ -505,9 +468,6 @@ impl McpServerStore {
         row_to_server(row)
     }
 
-    /// Delete a server row, returning the `env_credentials` it held, or
-    /// `None` when no such server exists. **Private on purpose**:
-    /// [`Self::unregister`] emits.
     async fn delete_row(
         pool: &PgPool,
         id: &str,
@@ -523,7 +483,7 @@ impl McpServerStore {
         Ok(env_credentials)
     }
 
-    /// Flip auto-approve on a server row. **Private on purpose**:
+    /// INVARIANT: Flip auto-approve on a server row. **Private on purpose**:
     /// [`Self::set_auto_approve`] emits.
     ///
     /// Returns `None` when no such server exists, `Some(changed)` otherwise.
@@ -550,7 +510,7 @@ impl McpServerStore {
         Ok(changed)
     }
 
-    /// Cache the tool manifest a live server just advertised, stamping
+    /// INVARIANT: Cache the tool manifest a live server just advertised, stamping
     /// `tools_observed_at`. Deliberately silent, see the type-level doc.
     ///
     /// Returns whether the row existed. A server removed while its process was
@@ -572,18 +532,6 @@ impl McpServerStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Switch one of a server's tools off or back on, by wire name, and
-    /// announce it. Disabling a tool takes it out of every request, so it
-    /// changes the agent's own tool surface exactly as a registration does.
-    ///
-    /// The read and the write share one row lock, so two switches on the same
-    /// server, from two clients or two tabs, both land. Each call names only
-    /// its own tool, so writes commute (ADR 0437).
-    ///
-    /// Announces only when the set actually MOVED, the same rule
-    /// [`Self::set_auto_approve`] follows.
-    ///
-    /// Returns the stored set, or `None` when no such server exists.
     pub async fn set_tool_disabled(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -636,7 +584,7 @@ impl McpServerStore {
         Ok(Some(wanted))
     }
 
-    /// Register (or re-register) a server and announce it. The only way to add
+    /// INVARIANT: Register (or re-register) a server and announce it. The only way to add
     /// one.
     ///
     /// Announces unconditionally, including on a re-registration: the row is
@@ -645,7 +593,7 @@ impl McpServerStore {
     ///
     /// A pointer the new env drops takes its credential with it, when the
     /// server owns it and no server still names it.
-    #[allow(clippy::too_many_arguments)] // one arg per server column, plus the bus and actor
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -662,7 +610,7 @@ impl McpServerStore {
                 credential_value(pool, var, credential).await?;
             }
         }
-        // Resolving a value can wait on 1Password, so the lock comes after it.
+        // INVARIANT: Resolving a value can wait on 1Password, so the lock comes after it.
         // A cleanup may have deleted a credential since: check names again.
         let _pointers = POINTER_WRITES.lock().await;
         for (var, value) in env {
@@ -708,7 +656,7 @@ impl McpServerStore {
         Ok(server)
     }
 
-    /// Unregister a server and announce it. Announces only when a row was
+    /// INVARIANT: Unregister a server and announce it. Announces only when a row was
     /// actually removed.
     ///
     /// Deletes each credential the server owned (`mcp-<id>-<VAR>`) that no
@@ -744,7 +692,7 @@ impl McpServerStore {
         Ok(true)
     }
 
-    /// Set a server's auto-approve flag and announce it. This decides whether
+    /// INVARIANT: Set a server's auto-approve flag and announce it. This decides whether
     /// its tool calls prompt the user, so it is a permission change, not a
     /// preference.
     ///
@@ -776,9 +724,6 @@ impl McpServerStore {
         Ok(outcome.is_some())
     }
 
-    /// Record that `fingerprint` (see [`LaunchSpec::fingerprint`]) is an
-    /// approved launch line for `server_id`, and announce it. Announces only a
-    /// new approval: re-approving an approved line changes no permission.
     pub async fn approve_launch(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -810,7 +755,6 @@ impl McpServerStore {
         Ok(())
     }
 
-    /// Whether someone approved `fingerprint` as `server_id`'s launch line.
     pub async fn is_launch_approved(
         pool: &PgPool,
         server_id: &str,
@@ -826,7 +770,6 @@ impl McpServerStore {
         .await
     }
 
-    /// Every approved launch line, as `(server_id, fingerprint)` pairs.
     pub async fn launch_approvals(
         pool: &PgPool,
     ) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
@@ -843,9 +786,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// An id that cannot round-trip through `mcp__<id>__<tool>` is refused
-    /// where the cause is obvious. The alternative is a server whose tools the
-    /// agent can see but never call.
     #[test]
     fn server_id_must_survive_the_wire_tool_name() {
         for ok in ["backstage", "dev-docs", "roblox_studio", "bq2"] {
@@ -859,16 +799,12 @@ mod tests {
         }
     }
 
-    /// An id can be wire-safe on its own and still leave no room for the
-    /// separator plus a tool name. The composed name is then truncated through
-    /// the `__`, and every tool the server advertises fails to parse back.
     #[test]
     fn the_longest_accepted_server_id_still_leaves_room_for_a_tool() {
         let longest = "a".repeat(MAX_SERVER_ID_LEN);
         assert!(validate_server_id(&longest).is_ok());
         assert!(validate_server_id(&"a".repeat(MAX_SERVER_ID_LEN + 1)).is_err());
 
-        // The tightest wire name that id can produce still round-trips.
         let wire = crate::llm::validate::wire_safe_tool_name(&format!("mcp__{longest}__x"));
         assert!(crate::llm::validate::is_wire_safe_tool_name(&wire));
         assert_eq!(
@@ -914,7 +850,6 @@ mod tests {
         );
     }
 
-    /// Re-registering with any part changed needs a new approval.
     #[test]
     fn every_part_of_a_launch_moves_its_fingerprint() {
         let ws = tempfile::tempdir().unwrap();
@@ -959,8 +894,6 @@ mod tests {
         }
     }
 
-    /// A database reader sees the row and its fingerprint. Without the key,
-    /// hashing guessed lines must not reproduce the fingerprint.
     #[test]
     fn a_launch_fingerprint_is_keyed() {
         use sha2::{Digest, Sha256};
@@ -977,9 +910,6 @@ mod tests {
         assert_ne!(spec.fingerprint(ws.path(), ws.path()).unwrap(), unkeyed);
     }
 
-    /// An approval is a permission decision: it lands on the timeline with who
-    /// made it. Re-approving stays silent, and removing the server drops its
-    /// approvals, so a later server under the same id must ask again.
     #[tokio::test]
     async fn a_launch_approval_announces_with_its_actor() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1026,10 +956,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Registering an MCP server changes the agent's own tool surface, and
-    /// auto-approve decides whether those tools prompt. Both now reach the
-    /// timeline; before this they were written silently, so asking the agent in
-    /// chat to add a server left no trace anywhere.
     #[tokio::test]
     async fn every_registry_mutation_announces() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1048,8 +974,6 @@ mod tests {
             .unwrap();
         assert_eq!(emitted(&pool, "McpServerRegistered").await, 1);
 
-        // A re-registration rewrites command / args / env, so what the tools do
-        // changed even though the id did not.
         McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd2", &[], &env, None)
             .await
             .unwrap();
@@ -1062,10 +986,6 @@ mod tests {
         );
         assert_eq!(emitted(&pool, "McpServerUpdated").await, 1);
 
-        // Re-asserting the value the flag already holds still reports that the
-        // server exists, but must not announce: a Postgres UPDATE writes a new
-        // tuple version regardless of value equality, so rows_affected would
-        // say "changed" for a permission that did not change.
         assert!(
             McpServerStore::set_auto_approve(&pool, &bus, "srv", true, None)
                 .await
@@ -1113,8 +1033,6 @@ mod tests {
         }
     }
 
-    /// The manifest has to survive the process that reported it. Reading cost
-    /// back for a switched-off server is the whole reason the column exists.
     #[tokio::test]
     async fn the_tool_manifest_round_trips_and_never_observed_is_not_empty() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1125,8 +1043,6 @@ mod tests {
             .await
             .unwrap();
 
-        // A fresh row is "never observed", which is NOT an empty manifest: the
-        // engine does not know what this server offers.
         let fresh = McpServerStore::get(&pool, "srv").await.unwrap().unwrap();
         assert!(fresh.tools.is_empty());
         assert!(
@@ -1151,14 +1067,11 @@ mod tests {
         );
         assert!(cached.tools_observed_at.is_some());
 
-        // Observed-and-empty is a third state, distinct from never-observed:
-        // this server really does cost nothing.
         assert!(McpServerStore::set_tools(&pool, "srv", &[]).await.unwrap());
         let emptied = McpServerStore::get(&pool, "srv").await.unwrap().unwrap();
         assert!(emptied.tools.is_empty());
         assert!(emptied.tools_observed_at.is_some());
 
-        // A row that is gone writes nothing rather than resurrecting itself.
         assert!(!McpServerStore::set_tools(&pool, "missing", &observed)
             .await
             .unwrap());
@@ -1166,9 +1079,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Re-registering a server must not drop the manifest or the disabled set:
-    /// the ON CONFLICT arm leaves both alone, so the returned struct has to
-    /// report them rather than defaulting.
     #[tokio::test]
     async fn reregistering_keeps_the_manifest_and_the_disabled_set() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1195,10 +1105,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Two switches on one server both land, whatever their timing. The test
-    /// holds the row lock itself, starts a switch, and commits a change of its
-    /// own only once that switch waits on the lock. A switch that read the set
-    /// before locking would then write it back without that change.
     #[tokio::test]
     async fn two_switches_on_one_server_both_land() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1220,8 +1126,6 @@ mod tests {
                     .unwrap()
             }
         });
-        // The synchronization point: the switch is blocked on the row lock, or
-        // it finished without ever taking it.
         loop {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity \
@@ -1255,9 +1159,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Switching a tool off narrows the agent's own tool surface, so it goes on
-    /// the timeline. Caching a manifest does not: that is an observation, and
-    /// the only candidate event describes an auto-approve change.
     #[tokio::test]
     async fn disabling_a_tool_announces_but_caching_a_manifest_does_not() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1301,7 +1202,6 @@ mod tests {
         );
         assert_eq!(emitted(&pool, "McpServerDisabledToolsChanged").await, 2);
 
-        // Switching a tool off that is already off changes nothing.
         assert!(switch("mcp__srv__alpha", true).await.is_some());
         assert_eq!(
             emitted(&pool, "McpServerDisabledToolsChanged").await,
@@ -1309,7 +1209,6 @@ mod tests {
             "re-sending the current state changed nothing"
         );
 
-        // Switching it back on IS a change: the tool comes back.
         let stored = switch("mcp__srv__alpha", false)
             .await
             .expect("the server exists");
@@ -1331,8 +1230,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// A pointer must name a credential holding one value, and the launch
-    /// reads that value then, so a rotated key reaches the next start.
     #[tokio::test]
     async fn a_credential_pointer_is_checked_at_registration_and_read_at_launch() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1446,8 +1343,6 @@ mod tests {
         CredentialStore::get(pool, name).await.unwrap().is_some()
     }
 
-    /// Removing a server deletes the credential its value moved into, and
-    /// announces it, so the secret is no longer injectable.
     #[tokio::test]
     async fn removing_a_server_deletes_the_credential_it_owns() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1473,8 +1368,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// A cleanup that fails after the row is gone still announces the
-    /// removal, and its error says the server was removed.
     #[tokio::test]
     async fn a_failed_cleanup_still_announces_the_removal() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1505,8 +1398,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// A credential the user named is theirs, so removing a server that
-    /// points at it leaves it stored.
     #[tokio::test]
     async fn removing_a_server_keeps_a_credential_the_user_named() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1525,8 +1416,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// A credential another server still points at stays, or that server
-    /// fails to launch.
     #[tokio::test]
     async fn removing_a_server_keeps_a_credential_another_server_names() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1547,8 +1436,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// A re-register whose env drops a pointer deletes the credential the
-    /// server owned, and keeps the ones it still names.
     #[tokio::test]
     async fn reregistering_without_a_pointer_deletes_its_credential() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1577,7 +1464,6 @@ mod tests {
         let args = vec!["--flag".to_string()];
         let env = HashMap::new();
 
-        // A brand-new server defaults to auto_approve = false.
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         let created = McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &args, &env, None)
             .await
@@ -1587,17 +1473,12 @@ mod tests {
             "new server should default to auto_approve = false"
         );
 
-        // User opts the server into auto-approve.
         assert!(
             McpServerStore::set_auto_approve(&pool, &bus, "srv", true, None)
                 .await
                 .unwrap()
         );
 
-        // Re-registering the same id hits ON CONFLICT DO UPDATE, which does NOT
-        // touch auto_approve. The returned struct must reflect the real DB value
-        // (true), not a hardcoded false — this is the regression guard for the
-        // bug where a re-register silently disabled auto-approve in memory.
         let reinserted =
             McpServerStore::register(&pool, &bus, "srv", "Srv Renamed", "cmd2", &args, &env, None)
                 .await
@@ -1611,7 +1492,6 @@ mod tests {
             "ON CONFLICT should update the mutable fields"
         );
 
-        // The DB row agrees — no in-memory/DB divergence.
         let fetched = McpServerStore::get(&pool, "srv").await.unwrap().unwrap();
         assert!(fetched.auto_approve);
 

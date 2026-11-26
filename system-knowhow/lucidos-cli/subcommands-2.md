@@ -171,6 +171,7 @@ $ lucidos threads list --status running --limit 5 | jq '.[].title'
 - `--has-draft` keeps threads holding an unsent draft, and `--has-draft false` keeps the rest.
 - `--change-state <state>` keeps coding-agent threads in one *change state*: `none` (no work on the branch), `unproposed` (branch work that no pending change carries) or `proposed` (a pending change). Each row's `coding_agent_change_state` field says which, and for `unproposed` its `reason`. Any other value is an error.
 - A pending question and a failure are statuses: filter them with `--status waiting_for_user_answer` and `--status failed`.
+- `--status waiting_for_user_answer` lists exactly what the Blocked section shows as a question for the owner. A *held* thread keeps its open card and its row's `status`, but no filter value selects it as waiting, and `--active` leaves it out. Its `liveness.state` reads `held`. So never tell the owner to answer a thread from its `status` field: use this filter or `liveness.state`.
 
 ```bash
 # Which of my own children are still working, and what are they called?

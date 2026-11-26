@@ -11,8 +11,6 @@ use tower::ServiceExt as _;
 
 const DEVICE_CREDENTIAL: &str = "cred-abc";
 
-/// Gateway B over https with one workspace, and gateway A paired with it as
-/// `cloud`.
 struct Pair {
     a: GatewayState,
     b: GatewayState,
@@ -37,7 +35,11 @@ async fn pair() -> Pair {
     let b_address = format!("https://localhost:{port}");
     let code = b
         .paired_gateways()
-        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .mint_secret(
+            None,
+            Default::default(),
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
@@ -104,7 +106,6 @@ async fn send(state: &GatewayState, req: Request<Body>) -> (StatusCode, Value) {
     )
 }
 
-/// A paired device asking A for the remote workspaces.
 async fn listed_on_a(p: &Pair) -> (StatusCode, Value) {
     let cookie = format!("{}={DEVICE_CREDENTIAL}", p.a.device_cookie_name());
     let req = Request::builder()
@@ -171,7 +172,6 @@ async fn b_lists_its_workspaces_to_a_paired_gateway_without_ports() {
 #[tokio::test]
 async fn a_lists_each_remote_gateways_workspaces_and_names_the_one_it_cannot_reach() {
     let p = pair().await;
-    // A port nothing listens on: bind one, then let it go.
     let closed = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

@@ -1,10 +1,3 @@
-//! The hook runner: one script, one pending event, one answer.
-//!
-//! It runs the script as a trigger script runs, in the workspace under the
-//! agent sandbox, on the same shell and Python. It writes the input to stdin,
-//! waits at most the hook's timeout, and reads the answer from stdout. It
-//! fails closed: every way a run can go wrong is a refusal.
-
 use std::path::Path;
 use std::pin::pin;
 use std::process::Stdio;
@@ -12,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use lucidos_core::core::agent_sandbox::{Sandbox, SandboxedCommand};
-use lucidos_core::core::event_hooks::HookDefinition;
+use lucidos_core::core::event_hooks::{HookDefinition, Refusal, RefusalCause};
 use lucidos_core::core::shell::{command_shell, TaskOutcome};
 use lucidos_core::core::{
     apply_to_subprocess_env, inherited_secret_env, redact_subprocess_output, sanitize_for_jsonb,
@@ -23,31 +16,22 @@ use lucidos_engine::runtime::spawn_env::{kill_child_process_group_now, spawn_bel
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-use crate::answer::{parse, HookAnswer, Refusal, RefusalCause};
+use crate::answer::{masked_event, parse, HookAnswer};
 use crate::input::HookInput;
 use crate::{DEFAULT_TIMEOUT_SECS, TIMEOUT_CEILING_SECS};
 
-/// The most stdout an answer may take. An answer is one small JSON object.
 const ANSWER_BYTES_CAP: usize = 64 * 1024;
 
-/// The most stderr a failed run keeps, from its end.
 const DETAIL_BYTES_CAP: usize = 4 * 1024;
 
-/// How long the pipes may still deliver once the script has exited. What the
-/// script itself wrote is already buffered, so this only bounds the reads.
 const PIPE_GRACE_AFTER_EXIT: Duration = Duration::from_millis(500);
 
-/// What a hook script runs under. The caller resolves each part the way it
-/// does for a trigger script.
 pub struct Confinement<'a> {
     pub sandbox: &'a Sandbox,
     pub python: &'a PythonRuntime,
-    /// The engine's script environment. It must hold no credential, because
-    /// a hook never receives one.
     pub env: &'a [(String, String)],
 }
 
-/// The script reads this object on stdin.
 #[derive(Serialize)]
 struct Stdin<'a> {
     hook: &'a str,
@@ -55,8 +39,6 @@ struct Stdin<'a> {
     input: &'a HookInput,
 }
 
-/// How long a hook may run: its own timeout, held under the engine-wide
-/// ceiling even when the definition skipped validation.
 pub fn effective_timeout(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(
         timeout_secs
@@ -65,9 +47,9 @@ pub fn effective_timeout(timeout_secs: Option<u64>) -> Duration {
     )
 }
 
-/// Run the hook `slug` of `workspace` on `input`, and return its answer.
 pub async fn run_hook(
     workspace: &Path,
+    hook_dir: &Path,
     slug: &str,
     definition: &HookDefinition,
     input: &HookInput,
@@ -77,10 +59,8 @@ pub async fn run_hook(
         Ok(stdin) => stdin,
         Err(e) => return crashed(slug, format!("could not write its input: {e}")),
     };
-    // The timeout also bounds a first Python setup, since a person may be
-    // waiting on the answer.
     let run = async {
-        let child = spawn(workspace, slug, definition, confinement)
+        let child = spawn(workspace, hook_dir, definition, confinement)
             .await
             .map_err(|e| format!("could not start: {e}"))?;
         converse(child, stdin)
@@ -88,7 +68,6 @@ pub async fn run_hook(
             .map_err(|e| format!("could not be awaited: {e}"))
     };
     let timeout = effective_timeout(definition.timeout_secs);
-    // Dropping the run on expiry drops the child, and `kill_on_drop` kills it.
     let finished = match tokio::time::timeout(timeout, run).await {
         Ok(Ok(finished)) => finished,
         Ok(Err(what_went_wrong)) => return crashed(slug, what_went_wrong),
@@ -109,11 +88,11 @@ pub async fn run_hook(
 
 async fn spawn(
     workspace: &Path,
-    slug: &str,
+    hook_dir: &Path,
     definition: &HookDefinition,
     confinement: &Confinement<'_>,
 ) -> Result<tokio::process::Child, String> {
-    let script = crate::hook_script_path(workspace, slug, &definition.script)?;
+    let script = crate::check_script(hook_dir, &definition.script)?;
     let mut cmd = command(&script, confinement)
         .await
         .map_err(|e| e.to_string())?;
@@ -127,12 +106,9 @@ async fn spawn(
         confinement.env,
         InheritedSecrets::Strip(inherited_secret_env()),
     );
-    // The script leads its own process group, for `ProcessGroupGuard`.
     spawn_below_engine(&mut cmd).map_err(|e| e.to_string())
 }
 
-/// The interpreter for `script`, chosen by its extension as a trigger
-/// script's is.
 async fn command(
     script: &Path,
     confinement: &Confinement<'_>,
@@ -149,7 +125,6 @@ async fn command(
     }
 }
 
-/// What a script left behind when it exited.
 struct Finished {
     outcome: TaskOutcome,
     stdout: Vec<u8>,
@@ -157,10 +132,6 @@ struct Finished {
     stderr: Vec<u8>,
 }
 
-/// Kills the script's whole process group when a run is dropped before the
-/// script is reaped: on a timeout, or when the asker stops waiting.
-/// `kill_on_drop` reaches only the interpreter, never a child it started.
-/// Reaping disarms it, since the group id can then be recycled (ADR 0100).
 struct ProcessGroupGuard {
     leader: Option<u32>,
     armed: AtomicBool,
@@ -187,15 +158,11 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// Feed the script its input and read it until it exits.
 async fn converse(mut child: tokio::process::Child, input: Vec<u8>) -> std::io::Result<Finished> {
-    // Declared after `child`, so it drops first, while the script is unreaped.
     let group = ProcessGroupGuard::arm(child.id());
     let stdin = child.stdin.take();
     let write = async move {
         if let Some(mut stdin) = stdin {
-            // A hook may answer without reading its input, which closes the
-            // pipe under this write. The answer decides, so the error is moot.
             let _ = stdin.write_all(&input).await;
         }
     };
@@ -221,13 +188,10 @@ async fn converse(mut child: tokio::process::Child, input: Vec<u8>) -> std::io::
             status = &mut wait => status,
             _ = &mut drains => return wait.await,
         };
-        // A process the script left running may hold its pipes open. What it
-        // writes after the script exited is no part of the answer.
         let _ = tokio::time::timeout(PIPE_GRACE_AFTER_EXIT, drains).await;
         status
     };
     let ((), status) = tokio::join!(write, read);
-    // Closing a pipe still held would kill its holder with SIGPIPE.
     if let Some(pipe) = stdout_pipe {
         tokio::spawn(discard(pipe));
     }
@@ -267,8 +231,6 @@ impl Finished {
     }
 }
 
-/// `answer` with every secret the script could have echoed masked out. A
-/// masked event type would name another event, so it makes no answer.
 fn masked_answer(slug: &str, answer: HookAnswer, secrets: &[String]) -> HookAnswer {
     let mask = |text: &str| redact_subprocess_output(text, secrets);
     match answer {
@@ -282,7 +244,7 @@ fn masked_answer(slug: &str, answer: HookAnswer, secrets: &[String]) -> HookAnsw
             HookAnswer::Allow {
                 events: events
                     .into_iter()
-                    .map(|event| event.masked(secrets))
+                    .map(|event| masked_event(event, secrets))
                     .collect(),
             }
         }
@@ -331,8 +293,6 @@ enum Keep {
     Tail,
 }
 
-/// What a pipe carried: at most `cap` bytes from the end `keep` names, and
-/// whether it carried more.
 struct Capture {
     kept: Vec<u8>,
     overflowed: bool,
@@ -365,21 +325,17 @@ impl Capture {
     }
 }
 
-/// Read `pipe` into `capture` until it ends, then take the pipe. Dropping
-/// this future early leaves the pipe in place, since a read is cancel safe.
 async fn drain(pipe: &mut Option<impl AsyncRead + Unpin>, capture: &mut Capture) {
     let Some(reader) = pipe.as_mut() else {
         return;
     };
     let mut chunk = [0u8; 8192];
-    // A read error ends the stream like EOF does. What was kept still stands.
     while let Ok(n @ 1..) = reader.read(&mut chunk).await {
         capture.take_in(&chunk[..n]);
     }
     *pipe = None;
 }
 
-/// Read `pipe` to its end and throw the bytes away.
 async fn discard(mut pipe: impl AsyncRead + Unpin) {
     let mut chunk = [0u8; 8192];
     while let Ok(1..) = pipe.read(&mut chunk).await {}

@@ -1,6 +1,6 @@
 
 import { describe, it, expect } from 'vitest';
-import { actionBlocker, availableThreadActions, changeWork, displaySection, ownBlocker, OWN_BLOCKER_PRIORITY, THREAD_STATUSES } from '../generated/thread-lifecycle';
+import { actionBlocker, availableThreadActions, awaitsOwnerAnswer, changeWork, displaySection, ownBlocker, OWN_BLOCKER_PRIORITY, THREAD_STATUSES } from '../generated/thread-lifecycle';
 import type { ThreadType, ThreadStatus, ArchiveState, ThreadAction, ChangeStateKind, ChangeWork, DisplaySection, OwnBlocker } from '../generated/thread-lifecycle';
 import fixture from '../generated/cross-validation-fixture.json';
 
@@ -14,6 +14,12 @@ interface DisplaySectionCase {
   fn: 'displaySection';
   args: [string, string, boolean, boolean, boolean, boolean, boolean];
   expected: string;
+}
+
+interface AwaitsOwnerAnswerCase {
+  fn: 'awaitsOwnerAnswer';
+  args: [ThreadStatus, boolean];
+  expected: boolean;
 }
 
 interface ChangeWorkCase {
@@ -34,9 +40,9 @@ interface ActionBlockerCase {
   expected: string;
 }
 
-type TestCase = AvailableThreadActionsCase | DisplaySectionCase | ChangeWorkCase | OwnBlockerCase | ActionBlockerCase;
+type TestCase = AvailableThreadActionsCase | DisplaySectionCase | AwaitsOwnerAnswerCase | ChangeWorkCase | OwnBlockerCase | ActionBlockerCase;
 
-const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'changeWork', 'ownBlocker', 'actionBlocker']);
+const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'awaitsOwnerAnswer', 'changeWork', 'ownBlocker', 'actionBlocker']);
 
 const LEGAL_RETENTION_PAIRS = 3;
 
@@ -92,6 +98,21 @@ describe('Cross-validation: generated TS matches Rust', () => {
           held,
         );
         expect(result).toBe(tc.expected as DisplaySection);
+      });
+    }
+  });
+
+  describe('awaitsOwnerAnswer', () => {
+    const awaitCases = cases.filter((c): c is AwaitsOwnerAnswerCase => c.fn === 'awaitsOwnerAnswer');
+
+    it(`has exhaustive coverage (${awaitCases.length} cases)`, () => {
+      expect(awaitCases.length).toBe(THREAD_STATUSES.length * 2);
+    });
+
+    for (const tc of awaitCases) {
+      const [status, held] = tc.args;
+      it(`(status=${status}, held=${held}) → ${tc.expected}`, () => {
+        expect(awaitsOwnerAnswer(status, held)).toBe(tc.expected);
       });
     }
   });

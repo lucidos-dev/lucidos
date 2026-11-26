@@ -1,4 +1,3 @@
-//! Canonical exact mint targets and typed creator-bound scopes. No wildcard matching.
 use super::GrantBreadth;
 
 pub fn decode_target(target: &str) -> Option<(String, String, u64)> {

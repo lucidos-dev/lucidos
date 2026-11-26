@@ -1,55 +1,24 @@
-//! The capability parity manifest's data: which agent surfaces (LLM tools, the
-//! `lucidos` CLI, the JS SDK) expose each capability (ADR 0018).
-//!
-//! It lives in this leaf crate so the CLI's `build.rs` can render its command
-//! module from it without compiling the engine. The engine re-exports it from
-//! `capability_manifest` and builds the grouped LLM tools there. Why each
-//! domain is shaped as it is, and which capabilities are deliberately absent,
-//! is documented on that engine module.
-
 pub mod codegen;
 
-/// Why a tool family is, or is not, offered to a workspace.
-///
-/// Every row of the engine's tool registry carries one, so a new family cannot
-/// arrive resident by omission: the row does not compile without it.
-/// [`Gate::Ungated`] is how a family states that it has none. The engine
-/// decides whether a gate is open (`llm::tools::gate_is_open`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
-    /// No gate. Every workspace can act on this family.
     Ungated,
-    /// At least one configured email account.
     EmailAccount,
-    /// A configured image-generation provider.
     ImageProvider,
-    /// A configured judgment provider, switched on.
     JudgmentProvider,
-    /// The Tree memory module, with its summary trees ready.
     MemoryTree,
-    /// Every turn that is not on Tree. A Tree turn never reads Classic's
-    /// memory, so a tool acting on it would report work that changed nothing.
     MemoryClassic,
 }
 
-/// Wire type of a capability argument. Maps to the JSON-schema `type` the LLM
-/// tool advertises and to the CLI flag parser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgType {
     Str,
     Int,
     Bool,
-    /// A complex JSON value (object / array / union) that scalar `Str`/`Int`/
-    /// `Bool` can't express — e.g. a trigger's `run` object or `on` array. The
-    /// CLI takes it as a `--flag '<JSON-STRING>'`. The generated command parses
-    /// it and rides it on the request body. The SDK facade types it as the
-    /// author decides. The LLM grouped tool never derives its schema from a
-    /// `Json` arg — diverging domains supply a raw `llm_schema` instead.
     Json,
 }
 
 impl ArgType {
-    /// JSON-schema `type` keyword for the LLM tool parameter.
     pub fn json_type(self) -> &'static str {
         match self {
             ArgType::Str => "string",
@@ -60,43 +29,30 @@ impl ArgType {
     }
 }
 
-/// Where an argument rides on the HTTP request the surface ultimately calls.
-/// The CLI generator and the route-backed tool build the request from it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgIn {
-    /// `?name=value` query parameter.
     Query,
-    /// JSON body field.
     Body,
-    /// `:name` path segment substitution.
     Path,
-    /// A JSON body field every call sends with this literal value. No caller
-    /// supplies it: it is never a CLI flag and never in the LLM schema.
     FixedBody(&'static str),
 }
 
-/// One argument of one operation.
 #[derive(Clone, Copy)]
 pub struct Arg {
-    /// snake_case canonical name (LLM property name + CLI `--flag` + SDK param).
     pub name: &'static str,
     pub ty: ArgType,
-    /// Allowed values for an enum-typed string arg; empty = free-form.
     pub enum_values: &'static [&'static str],
     pub required: bool,
-    /// Where it rides on the underlying HTTP request.
     pub loc: ArgIn,
     pub description: &'static str,
 }
 
 impl Arg {
-    /// Whether a caller supplies this arg, as a CLI flag or an LLM property.
     pub fn from_caller(&self) -> bool {
         !matches!(self.loc, ArgIn::FixedBody(_))
     }
 }
 
-/// HTTP method the operation maps to (the substrate route).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Method {
     Get,
@@ -116,121 +72,54 @@ impl Method {
     }
 }
 
-/// One capability: a single verb within a domain (e.g. notifications →
-/// `mark_all_read`).
 #[derive(Clone, Copy)]
 pub struct Operation {
-    /// snake_case discriminator value the LLM passes as `action` and the handler
-    /// matches on (e.g. `mark_all_read`).
     pub action: &'static str,
-    /// One-line description, reused in the LLM op list, CLI help, and SDK doc.
     pub summary: &'static str,
     pub method: Method,
-    /// Path AFTER `/api/v1` (e.g. `/notifications/read-all`). `:name` segments
-    /// are filled from `ArgIn::Path` args. An LLM-only operation may have no
-    /// HTTP route of its own (trigger `pause` folds into a PUT). Its path is
-    /// then the route the verb maps to. The CLI/SDK generators never read it,
-    /// because the op is `cli`/`sdk` = false.
     pub path: &'static str,
-    /// Wire arguments that ride on the underlying HTTP request — the source of
-    /// truth for the CLI flags and SDK params. The grouped LLM tool's schema
-    /// comes from `llm_schema` (below) when the LLM shape diverges. Otherwise
-    /// it is derived from these args.
     pub args: &'static [Arg],
-    /// kebab-case CLI sub-subcommand (e.g. `read-all`).
     pub cli_name: &'static str,
-    /// camelCase SDK method name (e.g. `markAllRead`).
     pub sdk_name: &'static str,
-    /// Whether the operation mutates state (drives actor stamping + CLI hints).
     pub mutating: bool,
-    /// The retired flat LLM tool name this operation supersedes (e.g.
-    /// `create_trigger`). It has two roles:
-    ///
-    /// - The grouped tool's handler maps `action` to this legacy name and
-    ///   delegates to the existing per-verb handler, with no logic rewrite.
-    /// - The legacy name keeps resolving to this domain via [`domain_for_tool`],
-    ///   so cached prompts and threads still work.
-    ///
-    /// `None` for brand-new operations with no predecessor.
-    ///
-    /// It doubles as the **handler key** in every domain that dispatches by
-    /// flat name, which is most of them. `triggers`, `trigger_groups` and
-    /// `preferences` have bespoke handler arms (`engine/tools/mod.rs`). The
-    /// generic `grouped_legacy_name` path covers the rest (`mcp`, `plugins`,
-    /// `events`, `changes`, `threads`, `thread_queue`, `memory`). It also
-    /// resolves the action via [`Domain::legacy_tool_for_action`]. Either way, a
-    /// new operation in a grouped domain needs a name here, predecessor or not.
-    /// Without one the dispatch rejects it as an unknown action.
     pub llm_alias: Option<&'static str>,
-    /// Raw JSON *properties object* this operation contributes to the grouped
-    /// LLM tool schema, used verbatim when the LLM-facing shape diverges from
-    /// `args` — e.g. a trigger's `cron` (string|array shorthand) vs the HTTP
-    /// `cron_expressions` (array), or omitting a context-injected `device_id`.
-    /// `None` = derive the LLM properties from `args` (aligned ops like
-    /// notifications). Must be a JSON object (`{ "name": { …schema… }, … }`).
     pub llm_schema: Option<&'static str>,
-    /// Per-operation surface overrides. `None` inherits the [`Domain`] flag;
-    /// `Some(false)` removes this op from that surface even though the domain is
-    /// on it (e.g. trigger `pause`/`resume` are LLM-only conveniences with no
-    /// dedicated CLI/SDK route). `Some(true)` is rarely needed but symmetric.
     pub llm: Option<bool>,
     pub cli: Option<bool>,
     pub sdk: Option<bool>,
 }
 
 impl Operation {
-    /// The args a caller supplies, in declaration order.
     pub fn caller_args(&self) -> impl Iterator<Item = &Arg> {
         self.args.iter().filter(|a| a.from_caller())
     }
-    /// Whether this operation is exposed on the LLM grouped tool.
     pub fn on_llm(&self, domain: &Domain) -> bool {
         self.llm.unwrap_or(domain.llm)
     }
-    /// Whether this operation generates a CLI sub-subcommand.
     pub fn on_cli(&self, domain: &Domain) -> bool {
         self.cli.unwrap_or(domain.cli)
     }
-    /// Whether this operation appears in the SDK capability table.
     pub fn on_sdk(&self, domain: &Domain) -> bool {
         self.sdk.unwrap_or(domain.sdk)
     }
 }
 
-/// A domain groups its operations into one LLM tool, one CLI subcommand, and one
-/// SDK namespace.
 #[derive(Clone, Copy)]
 pub struct Domain {
-    /// Canonical domain name (e.g. `notifications`) — CLI top-level subcommand,
-    /// SDK namespace.
     pub name: &'static str,
-    /// Grouped LLM tool name (usually == `name`).
     pub tool_name: &'static str,
-    /// Top-level description of the grouped LLM tool.
     pub tool_summary: &'static str,
     pub llm: bool,
     pub cli: bool,
     pub sdk: bool,
     pub operations: &'static [Operation],
-    /// Retired flat LLM tool names that still dispatch to this domain (back-compat
-    /// aliases so existing prompts/threads keep working after consolidation).
     pub llm_aliases: &'static [&'static str],
-    /// Whether a workspace's chat turns are offered the grouped tool. A gated
-    /// domain still has its routes and CLI commands in every workspace.
     pub llm_gate: Gate,
-    /// How the grouped LLM tool runs an action (ADR 0751).
     pub llm_execution: LlmExecution,
 }
 
-/// How a domain's grouped LLM tool runs an action.
-///
-/// A manifest tool runs the same route its CLI calls, so a route's gate binds
-/// the tool and the CLI alike. No default: a new domain states its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmExecution {
-    /// A *route-backed tool*: the action becomes the request the generated CLI
-    /// sends, carrying the calling thread's origin token. The domain has no
-    /// hand-written handler. A domain with no LLM tool states this too.
     Route,
     /// A hand-written in-process handler. Only the legacy domains the engine's
     /// shrink-only list names may say this (`docs/temporary-measures.md`).
@@ -238,8 +127,6 @@ pub enum LlmExecution {
 }
 
 impl Domain {
-    /// The set of `action` discriminator values the grouped LLM tool accepts —
-    /// only operations exposed on the LLM surface.
     pub fn actions(&self) -> Vec<&'static str> {
         self.operations
             .iter()
@@ -248,9 +135,6 @@ impl Domain {
             .collect()
     }
 
-    /// Map a grouped-tool `action` to the legacy flat tool name its handler
-    /// delegates to (e.g. `create` → `create_trigger`). `None` when the action
-    /// is unknown or has no legacy predecessor.
     pub fn legacy_tool_for_action(&self, action: &str) -> Option<&'static str> {
         self.operations
             .iter()
@@ -258,9 +142,6 @@ impl Domain {
             .and_then(|o| o.llm_alias)
     }
 
-    /// Every legacy flat LLM tool name that resolves to this domain — the
-    /// per-operation `llm_alias` values for LLM-exposed ops, plus any
-    /// domain-level extras in `llm_aliases`.
     pub fn alias_names(&self) -> Vec<&'static str> {
         let mut names: Vec<&'static str> = self
             .operations
@@ -272,11 +153,6 @@ impl Domain {
         names
     }
 }
-
-// ---------------------------------------------------------------------------
-// The manifest. Add a capability here and the generated surfaces + the parity
-// tests follow. Keep entries grouped by domain.
-// ---------------------------------------------------------------------------
 
 const FILTER_ARG: Arg = Arg {
     name: "filter",
@@ -313,7 +189,6 @@ const NOTIFICATIONS_OPS: &[Operation] = &[
         cli_name: "list",
         sdk_name: "list",
         mutating: false,
-        // `read_notifications` was the pre-consolidation flat tool (list-only).
         llm_alias: Some("read_notifications"),
         llm_schema: None,
         llm: None,
@@ -351,13 +226,6 @@ const NOTIFICATIONS_OPS: &[Operation] = &[
         sdk: None,
     },
 ];
-
-// ---------------------------------------------------------------------------
-// preferences — get/set user settings. The LLM `get_preferences`/`set_preference`
-// tools omit `device_id`, which comes from the calling device's context. So
-// both ops supply a raw `llm_schema`, and the HTTP `args` carry `device_id` for
-// the CLI/SDK. See engine/tools/preferences.rs.
-// ---------------------------------------------------------------------------
 
 const PREF_GET_DEVICE_ID_ARG: Arg = Arg {
     name: "device_id",
@@ -403,7 +271,6 @@ const PREFERENCES_OPS: &[Operation] = &[
         sdk_name: "get",
         mutating: false,
         llm_alias: Some("get_preferences"),
-        // The LLM tool takes no args — the calling device is injected.
         llm_schema: Some("{}"),
         llm: None,
         cli: None,
@@ -419,8 +286,6 @@ const PREFERENCES_OPS: &[Operation] = &[
         sdk_name: "set",
         mutating: true,
         llm_alias: Some("set_preference"),
-        // Device-scoped keys auto-apply to the calling device — the LLM never
-        // passes a device id, so the grouped tool omits it (unlike CLI/SDK).
         llm_schema: Some(
             r#"{
               "key": {"type":"string","description":"e.g. 'theme-mode', 'language', 'timezone', 'chat_model'. The 'get' action lists every settable key."},
@@ -442,7 +307,6 @@ const PREFERENCES_OPS: &[Operation] = &[
         mutating: true,
         llm_alias: None,
         llm_schema: None,
-        // The CLI alone: the in-process tool and the SDK set a value instead.
         llm: Some(false),
         cli: None,
         sdk: Some(false),
@@ -461,16 +325,6 @@ const PREFERENCES_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// triggers — create/list/update/delete + pause/resume. The HTTP body shape
-// (cron_expressions array, on array-of-objects, slug, side_effect_grant) drives
-// the CLI/SDK. The grouped LLM tool keeps the chat agent's shorthand shape
-// (cron string|array, on shorthand, run object) via raw llm_schema. It
-// delegates each action to the existing execute_scheduler_tool handler.
-// pause/resume have no dedicated HTTP route (the engine folds them into a PUT),
-// so they're LLM-only (cli/sdk = false). See engine/tools/scheduler.rs.
-// ---------------------------------------------------------------------------
 
 const TRIGGER_ID_QUERY_ARG: Arg = Arg {
     name: "id",
@@ -671,9 +525,6 @@ const TRIGGER_SLUG_ARG: Arg = Arg {
         "Kebab-case slug, the directory segment for per-trigger knowhow. Derived from name.",
 };
 
-// The grouped LLM tool keeps the existing flat-tool shapes (shorthand cron/on,
-// run object) so execute_scheduler_tool reads the args unchanged. `cron`/`on`
-// allow null so the unioned property serves both create and update (clearing).
 pub const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "name": {"type":"string","description":"Short and descriptive."},
   "run": {"type":"object","description":"{ type: 'intent', intent: '…' } in the user's voice with the procedure left to knowhow, or { type: 'script', path: 'name/run.py' }."},
@@ -691,11 +542,6 @@ pub const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "reasoning_effort": {"anyOf":[{"type":"null"},{"type":"string","enum":["none","low","medium","high","xhigh","max"]}],"description":"Thinking budget for the intent. Null = account default (on update, clears a pin)."},
   "provider": {"anyOf":[{"type":"null"},{"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway","chatgpt-plan"]}],"description":"Backend for the pinned model, one of its routes; needs model. Null = its preferred provider. Set only if asked."}
 }"#;
-// `model` / `reasoning_effort` / `provider` are deliberately NOT repeated here.
-// Properties are unioned across a domain's operations first-wins (see
-// `build_llm_tool`). So a second copy under the same name is dropped before the
-// model sees it, and only the create schema's wording would ship. Update's
-// null-clears semantics is stated there instead.
 const TRIGGER_UPDATE_LLM_SCHEMA: &str = r#"{
   "trigger_id": {"type":"string","description":"UUID of the trigger to act on."},
   "paused": {"type":"boolean","description":"Pause/resume inside a multi-field update; prefer the standalone actions."}
@@ -814,8 +660,6 @@ const TRIGGERS_OPS: &[Operation] = &[
         mutating: true,
         llm_alias: Some("pause_trigger"),
         llm_schema: Some(r#"{"trigger_id":{"type":"string","description":"UUID of the trigger to pause."}}"#),
-        // LLM-only: no dedicated HTTP route (the engine folds pause into a PUT).
-        // CLI/SDK users pause via the `update` op's `paused` field.
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -844,8 +688,6 @@ const TRIGGERS_OPS: &[Operation] = &[
         cli_name: "run",
         sdk_name: "run",
         mutating: true,
-        // Not a retired flat tool: `run` is new, and the name is the handler key
-        // the `triggers` domain dispatches on (see `grouped_legacy_name`).
         llm_alias: Some("run_trigger"),
         llm_schema: Some(
             r#"{"trigger_id":{"type":"string","description":"UUID of the trigger to run now, off-schedule."}}"#,
@@ -868,13 +710,6 @@ const TRIGGERS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// trigger_groups — user-visible folders that organize triggers in the panel.
-// Pure organizational label; no firing. The HTTP `update` route covers both
-// rename and reorder; the LLM surface keeps them as distinct rename/reorder
-// actions (mapping to PUT and POST /reorder). No SDK consumer → sdk = false.
-// ---------------------------------------------------------------------------
 
 const TG_ID_QUERY_ARG: Arg = Arg {
     name: "id",
@@ -1009,28 +844,12 @@ const TRIGGER_GROUPS_DOMAIN: Domain = Domain {
     tool_summary: "User-visible folders organizing triggers in the panel. Purely a label: a group fires and schedules nothing. Assign a trigger to one with the triggers tool's group_id.",
     llm: true,
     cli: true,
-    // No app/SDK consumer manages trigger groups — declared N/A (parity is per
-    // surface, not blanket). LLM + CLI cover the agent + subprocess paths.
     sdk: false,
     operations: TRIGGER_GROUPS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// apps — list/get/update/delete app lifecycle + metadata. Asymmetric across
-// surfaces (declared parity, not blanket). App *creation* is the LLM-only
-// `create_app` tool: a file write with a large html_content arg, no HTTP route,
-// kept standalone per the hot-single-purpose-tool guardrail. Editing app
-// *source* is the app-coding-agent's worktree job. So this domain is `llm`-false
-// and carries no create/source ops.
-//
-// It closes the real gap: a subprocess/chat
-// agent can `lucidos apps list|get|update|delete` instead of reverse-engineering
-// curl. `list`/`get` are also in the SDK (facade already present); `update`/
-// `delete` are CLI-only. See api/apps.rs + engine/tools/apps.rs.
-// ---------------------------------------------------------------------------
 
 const APP_ID_QUERY_ARG: Arg = Arg {
     name: "id",
@@ -1101,7 +920,6 @@ const APPS_OPS: &[Operation] = &[
         llm_schema: None,
         llm: None,
         cli: None,
-        // No SDK consumer renames apps; CLI-only (parity is per surface).
         sdk: Some(false),
     },
     Operation {
@@ -1125,8 +943,6 @@ const APPS_DOMAIN: Domain = Domain {
     name: "apps",
     tool_name: "apps",
     tool_summary: "Manage apps. Creating one is the separate create_app tool, and app source is edited in the app's coding-agent worktree.",
-    // LLM keeps the standalone create_app + list_apps tools; nothing to group
-    // here (create has no HTTP peer). This domain enforces CLI + SDK parity.
     llm: false,
     cli: true,
     sdk: true,
@@ -1135,15 +951,6 @@ const APPS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::Route,
 };
-
-// ---------------------------------------------------------------------------
-// events — domain-event emit/query/count. Consolidates the three flat tools into
-// one grouped LLM tool; each action delegates to the existing
-// execute_emit_event/execute_query_events/execute_count_events via the flat
-// alias. LLM-only: the `lucidos events` CLI is a richer hand-written command
-// (pagination cursors) that the generator can't reproduce, so cli/sdk = false.
-// See engine/tools/mod.rs.
-// ---------------------------------------------------------------------------
 
 const EVENTS_EMIT_LLM_SCHEMA: &str = r#"{
   "event_type": {"type":"string","description":"PascalCase past tense, e.g. GoogleDocEdited."},
@@ -1233,8 +1040,6 @@ const EVENTS_DOMAIN: Domain = Domain {
     tool_name: "events",
     tool_summary: "The workspace's event store, domain and engine events alike in one table. On a busy workspace call 'count' first, then 'query' the narrowest types.",
     llm: true,
-    // The `lucidos events` CLI is a richer hand-written command (before/after
-    // cursors); not regenerated. No SDK consumer. Grouped LLM tool only.
     cli: false,
     sdk: false,
     operations: EVENTS_OPS,
@@ -1242,13 +1047,6 @@ const EVENTS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// changes — list/apply pending coding-agent changes. Consolidates the two flat
-// tools into one grouped LLM tool; delegates to execute_list_changes /
-// execute_apply_change via the flat alias. LLM-only: `lucidos changes` is a
-// hand-written CLI, so cli/sdk = false. See engine/tools/mod.rs.
-// ---------------------------------------------------------------------------
 
 const CHANGES_OPS: &[Operation] = &[
     Operation {
@@ -1363,8 +1161,6 @@ const CHANGES_DOMAIN: Domain = Domain {
     tool_name: "changes",
     tool_summary: "Changes: coding-agent branches awaiting Apply. 'list' finds ids; the rest ONLY when the user asked.",
     llm: true,
-    // `lucidos changes list|apply` is a hand-written CLI; not regenerated. No SDK
-    // consumer. Grouped LLM tool only.
     cli: false,
     sdk: false,
     operations: CHANGES_OPS,
@@ -1373,22 +1169,6 @@ const CHANGES_DOMAIN: Domain = Domain {
     llm_execution: LlmExecution::LegacyInProcess,
 };
 
-// ---------------------------------------------------------------------------
-// models — chat-model registry (Settings → Models). The grouped
-// `manage_models` LLM tool keeps its name, and its schema is built from the
-// manifest. The domain also generates a `lucidos models` CLI over the /models
-// CRUD. The tool is route-backed: each action runs the CLI's route.
-//
-// LLM actions (list/add/enable/disable/update/remove) and CLI ops
-// (list/add/update/delete) diverge: enable/disable are LLM-only PUTs with a
-// fixed `on_chat_ladder`. `id` is a Body arg for `add` and a Query arg for
-// update/delete (two Args, same name/type). `routes` is a Json arg, which the
-// LLM tool never derives, so `add` and `update` carry a raw `llm_schema`. See
-// api/settings.rs.
-// ---------------------------------------------------------------------------
-
-/// Every provider name, in `ProviderKind::ALL` order. A test holds the two in
-/// lockstep, and holds every raw `llm_schema` spelling of it to this list.
 pub const MODEL_PROVIDER_ENUM: &[&str] = &[
     "vertex",
     "anthropic",
@@ -1474,7 +1254,6 @@ const MODEL_OFF_CHAT_LADDER_ARG: Arg = Arg {
     loc: ArgIn::FixedBody("false"),
     ..MODEL_ON_CHAT_LADDER_ARG
 };
-/// Why an agent edits the Lucidos Agent's ladder. The owner's card quotes it.
 const MODEL_LADDER_REASON: &str = "Why you change the ladder. The owner reads it on the card.";
 const MODEL_REASON_BODY_ARG: Arg = Arg {
     name: "reason",
@@ -1505,11 +1284,6 @@ const MODEL_VISION_ARG: Arg = Arg {
     description: "Whether the model reads images. Image description offers and calls only such models. Omitted on add means false; on update, keeps the stored value.",
 };
 
-// `routes` is a Json arg, so the LLM shape of `add` is spelled out here. `id`
-// keeps the structure `args` would derive, since enable / disable / remove still
-// derive it and the union must agree. Only the top-level `provider` spells the
-// enum: the route's `validate_routes` refuses an unknown name in a route with
-// the list.
 pub const MODELS_ADD_LLM_SCHEMA: &str = r#"{
   "id": {"type":"string","description":"Model id, the API string unless a route overrides it. All but list need it."},
   "label": {"type":"string","description":"Display name; defaults to the id."},
@@ -1519,8 +1293,6 @@ pub const MODELS_ADD_LLM_SCHEMA: &str = r#"{
   "routes": {"type":"array","description":"Backends in priority order. Replaces the whole list.","items":{"type":"object","properties":{"provider":{"type":"string"},"id":{"type":"string","description":"This backend's id if different, e.g. 'anthropic/claude-opus-5-5'."},"context_window":{"type":"integer"}},"required":["provider"]}},
   "vision": {"type":"boolean","description":"Reads images; only such models describe images."}
 }"#;
-// The properties `add` already declares are not repeated: the union is
-// first-wins, so a second copy would be dropped unseen.
 const MODELS_UPDATE_LLM_SCHEMA: &str = r#"{
   "preferred_provider": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Backend to use when several routes are configured. Null clears."}
 }"#;
@@ -1579,8 +1351,6 @@ const MODELS_OPS: &[Operation] = &[
         mutating: true,
         llm_alias: None,
         llm_schema: None,
-        // An LLM-only shorthand for `update` with `on_chat_ladder` set, which
-        // is what the CLI runs instead.
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -1649,8 +1419,6 @@ const MODELS_OPS: &[Operation] = &[
 
 const MODELS_DOMAIN: Domain = Domain {
     name: "models",
-    // Keep the existing LLM tool name so cached prompts/threads don't churn; the
-    // schema is now built from this manifest entry (no more get_manage_models_tool).
     tool_name: "manage_models",
     tool_summary: "The chat-model registry the Lucidos Agent ladder picks from. A builtin can leave it but not be removed. Switch the ACTIVE model with set_preference(key='chat_model').",
     llm: true,
@@ -1661,25 +1429,6 @@ const MODELS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::Route,
 };
-
-// ---------------------------------------------------------------------------
-// repositories — registered external git repos for coding-agent sessions.
-// The grouped `manage_repositories` LLM tool builds its schema from here, and
-// execute_tool routes it to the unchanged execute_manage_repositories handler
-// (engine/tools/mod.rs).
-//
-// The CLI is READ-ONLY. `add` and `remove` carry `cli: Some(false)`, so only
-// `list` generates. That is a decision, not a limit: `POST /repositories`
-// takes exactly the body `add` declares. Registering a repo changes the
-// platform under the user, so a CLI write verb needs its own decision.
-//
-// `remove`'s path is the conceptual mapping, not an emittable route. The real
-// one is `DELETE /api/v1/repositories/:id`, keyed by a path segment rather
-// than the body `name` this tool takes. Nothing reads it while the op is off
-// both generators.
-//
-// No SDK: an app frame may not reach `/repositories` at all (ADR 0231).
-// ---------------------------------------------------------------------------
 
 pub const REPO_NAME_ARG: Arg = Arg {
     name: "name",
@@ -1719,7 +1468,6 @@ const REPOSITORIES_OPS: &[Operation] = &[
         llm_alias: None,
         llm_schema: None,
         llm: None,
-        // Read-only CLI: see the block comment above `REPO_NAME_ARG`.
         cli: Some(false),
         sdk: None,
     },
@@ -1750,7 +1498,6 @@ const REPOSITORIES_OPS: &[Operation] = &[
         llm_alias: None,
         llm_schema: None,
         llm: None,
-        // Read-only CLI, and the path here is not the real route either.
         cli: Some(false),
         sdk: None,
     },
@@ -1761,26 +1508,13 @@ const REPOSITORIES_DOMAIN: Domain = Domain {
     tool_name: "manage_repositories",
     tool_summary: "External git repositories registered for coding-agent sessions, so a coding agent can work on a local repo.",
     llm: true,
-    // `list` only. The two write ops opt out per operation, so a script can
-    // read the registry while registering a repo stays the LLM tool's job.
     cli: true,
-    // No app frame reaches `/repositories`, so there is nobody to serve.
     sdk: false,
     operations: REPOSITORIES_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// env_vars — user-managed non-secret environment variables. New generated CLI
-// (list / set / delete) closing a real subprocess-agent gap; routed through the
-// gateway-safe http client. `llm = false` — the standalone set_environment_variable
-// LLM tool stays as-is (the `apps` precedent: CLI parity without touching the LLM
-// surface). The CLI subcommand is `env-vars` (kebab, derived from the snake
-// domain name so the generated `dispatch_env_vars` ident is valid). The full
-// CRUD lives at /env-vars (GET/POST/DELETE). See api/settings.rs.
-// ---------------------------------------------------------------------------
 
 const ENV_NAME_BODY_ARG: Arg = Arg {
     name: "name",
@@ -1832,8 +1566,6 @@ const ENV_VARS_OPS: &[Operation] = &[
         cli_name: "set",
         sdk_name: "set",
         mutating: true,
-        // The retired standalone tool this `set` action supersedes — kept wired
-        // as a back-compat alias so cached prompts/in-flight threads still work.
         llm_alias: Some("set_environment_variable"),
         llm_schema: None,
         llm: None,
@@ -1861,9 +1593,6 @@ const ENV_VARS_DOMAIN: Domain = Domain {
     name: "env_vars",
     tool_name: "env_vars",
     tool_summary: "Non-secret environment variables. A subprocess Lucidos spawns sees a change on its next spawn, no restart. The engine's own env gets them only at startup, so an engine-read var needs an engine restart. They appear in logs and events, so use request_credential for an API key, token or password.",
-    // Full LLM/CLI parity (list/set/delete). The retired standalone
-    // set_environment_variable tool stays wired as a back-compat alias to the
-    // `set` action (see ENV_VARS_OPS). No SDK consumer (apps don't manage env vars).
     llm: true,
     cli: true,
     sdk: false,
@@ -1872,16 +1601,6 @@ const ENV_VARS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// widgets: reusable widgets, a thread's widget card sizes and the two
-// dashboards (ADRs 0402, 0415, 0496). A card size and the dashboard edits
-// name a widget instance: the widget and its params.
-// Every widget action the UI offers has an action here, for the agent and the
-// CLI. Open in Canvas is navigate_ui to the widget's id. `thread_id` is
-// optional so the CLI can default it to the session's own thread; the HTTP
-// route requires it.
-// ---------------------------------------------------------------------------
 
 const WIDGET_APP_ID_ARG: Arg = Arg {
     name: "app_id",
@@ -1915,7 +1634,6 @@ pub const WIDGET_SIZE_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "One the widget declares. Only a size the user named this turn.",
 };
-/// What a card size names: one widget instance in one thread, and its size.
 const WIDGET_CARD_SIZE_ARGS: &[Arg] = &[
     WIDGET_APP_ID_ARG,
     WIDGET_THREAD_BODY_ARG,
@@ -1942,12 +1660,10 @@ const DASHBOARD_LABEL_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "Tile label. Default: the name.",
 };
-/// A tile is a widget, or an app shown as an app shortcut.
 const DASHBOARD_APP_ID_ARG: Arg = Arg {
     description: "The widget's or app's id. An app joins as a shortcut and takes no params.",
     ..WIDGET_APP_ID_ARG
 };
-/// What an add names: one widget instance, or an app, on one dashboard.
 const DASHBOARD_ADD_ARGS: &[Arg] = &[
     DASHBOARD_APP_ID_ARG,
     DASHBOARD_BODY_ARG,
@@ -1969,8 +1685,6 @@ const DASHBOARD_TILES_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "Tiles in order: [{app_id, params?, size}].",
 };
-/// The arrange action's LLM shape: `tiles` is an array, which a `Json` arg
-/// cannot describe.
 pub const DASHBOARD_ARRANGE_LLM_SCHEMA: &str = r#"{"dashboard":{"type":"string","enum":["phone","desktop"]},"tiles":{"type":"array","description":"Tiles in order.","items":{"type":"object","properties":{"app_id":{"type":"string"},"params":{"type":"object"},"size":{"enum":["quarter","small","medium","large","xl"]}},"required":["app_id","size"]}}}"#;
 
 const fn widget_op(
@@ -2090,19 +1804,6 @@ const WIDGETS_DOMAIN: Domain = Domain {
     llm_execution: LlmExecution::LegacyInProcess,
 };
 
-// ---------------------------------------------------------------------------
-// threads — thread-summary introspection. Groups the two flat read tools
-// (list_threads / count_threads) into one grouped LLM tool, delegating to the
-// existing handlers via the flat alias. The spawn tools (run_thread /
-// run_coding_agent) stay STANDALONE per the hot-single-purpose guardrail — they
-// run through handle_special_tool, not execute_tool, and are not folded here.
-// LLM-only: the `lucidos threads list|count` CLI is hand-written, so cli/sdk =
-// false. See engine/tools/mod.rs + llm/tools/threads.rs.
-// ---------------------------------------------------------------------------
-
-// The `status` enum in both schemas below is spelled out rather than composed,
-// because `llm_schema` is a `const` JSON literal. It is pinned to
-// `ThreadStatus::ALL` by `threads_status_enum_matches_the_thread_status_enum`.
 pub const THREADS_LIST_LLM_SCHEMA: &str = r#"{
   "active": {"type":"boolean","description":"UNION of running and waiting_for_user_answer; false inverts. For 'is the workspace busy?' use status ['running']: a thread awaiting an answer is blocked on the human, not working."},
   "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Turn status. Idle means no open turn; waiting is legacy. Conflicts with active."},
@@ -2182,8 +1883,6 @@ const THREADS_OPS: &[Operation] = &[
         sdk_name: "drafts",
         mutating: false,
         llm_alias: Some("list_drafts"),
-        // `thread_id` and `limit` are already in the union, from `detach_child`
-        // and `list`. A schema here would only shadow or repeat them.
         llm_schema: None,
         llm: None,
         cli: Some(false),
@@ -2200,7 +1899,6 @@ const THREADS_OPS: &[Operation] = &[
         sdk_name: "submitDraft",
         mutating: true,
         llm_alias: Some("submit_saved_draft"),
-        // `thread_id` is already in the union, from `detach_child`.
         llm_schema: Some(
             r#"{
               "expected_revision": {"type":"integer","description":"submit_draft: snapshot.draft_revision from 'drafts'."},
@@ -2322,7 +2020,6 @@ const THREADS_OPS: &[Operation] = &[
         mutating: true,
         llm_alias: Some("triage_threads"),
         llm_schema: None,
-        // In-process, LLM-only: it records the proposal on the calling thread.
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -2352,8 +2049,6 @@ const THREADS_DOMAIN: Domain = Domain {
     tool_name: "threads",
     tool_summary: "Read threads and unsent drafts; each row has a link. Read what a thread is doing from liveness.state. A waiting thread wakes itself on the waits liveness names. Detach a child, archive one, or triage. Start via run_thread or run_coding_agent, redirect via follow_up_child_thread.",
     llm: true,
-    // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
-    // and no SDK consumer needs this. Grouped LLM tool only.
     cli: false,
     sdk: false,
     operations: THREADS_OPS,
@@ -2361,24 +2056,6 @@ const THREADS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// memory: long-term memory. Mixed surfaces (declared parity per op). The LLM
-// gets CORRECTION, run in-process. `correct` needs a model to judge matches,
-// so it has no HTTP route and is cli/sdk = false. `correct_by_id` also has a
-// route, for the CLI. The LLM gets two READS too, `search` and `source`. The
-// CLI gets every read.
-//
-// Memory is injected into context, and injection is the primary path. It cannot
-// recover from a bad guess, so the two LLM reads are the backstop for the misses
-// that `SUB_QUERY_PROMPT` leaves.
-//
-// `stats` and `entries` stay CLI-only, deliberately. Paging the whole index and
-// reading its statistics are operator reads that never answer a user. They are
-// exactly the browsing the summaries above warn off. Correction delegates to
-// execute_memory_tool / execute_correct_memory_by_id via the flat alias. See
-// engine/tools/memory.rs + api/memory.rs.
-// ---------------------------------------------------------------------------
 
 const MEM_LIMIT_ARG: Arg = Arg {
     name: "limit",
@@ -2513,7 +2190,6 @@ const MEMORY_OPS: &[Operation] = &[
               "correction": {"type":"string","description":"Optional corrected fact to store after deleting the wrong memories. Omit to just delete."}
             }"#,
         ),
-        // In-process correction (no HTTP route); LLM-only.
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -2547,8 +2223,6 @@ const MEMORY_OPS: &[Operation] = &[
         cli_name: "stats",
         sdk_name: "stats",
         mutating: false,
-        // CLI-only. A row count tells the agent nothing it can act on, unlike
-        // the `source` and `search` ops below, which ARE on the LLM surface.
         llm_alias: None,
         llm_schema: None,
         llm: Some(false),
@@ -2624,17 +2298,9 @@ const MEMORY_DOMAIN: Domain = Domain {
     sdk: false,
     operations: MEMORY_OPS,
     llm_aliases: &[],
-    // A Tree turn reads the summary trees and never this memory, so the tool
-    // goes and `recall` takes its slot. The CLI stays, for Classic's own data.
     llm_gate: Gate::MemoryClassic,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// recall: the Tree memory module's recall tools (ADR 0362). The LLM tool is
-// offered only once the workspace is on Tree with its trees ready. The routes
-// and CLI commands exist everywhere, and answer from whatever is built.
-// ---------------------------------------------------------------------------
 
 const RECALL_ID_ARG: Arg = Arg {
     name: "id",
@@ -2694,7 +2360,6 @@ const RECALL_LIMIT_ARG: Arg = Arg {
     description: "Max results (1-20, default 10).",
 };
 
-/// The LLM shapes leave out `thread`: a bare id names the calling thread.
 const RECALL_ZOOM_LLM_SCHEMA: &str = r#"{
   "id": {"type":"string","description":"A line's id, as the view or a result shows it. A bare start+span names this thread."},
   "n": {"type":"integer","description":"Levels to open, 1-6, default 1."}
@@ -2788,18 +2453,6 @@ const RECALL_DOMAIN: Domain = Domain {
     llm_execution: LlmExecution::LegacyInProcess,
 };
 
-// ---------------------------------------------------------------------------
-// thread_queue — the Thread Queue (background admission control). Grouped LLM
-// tool (list + update_policy, delegating to the existing flat handlers) PLUS a
-// generated CLI (list / run-now / drop). `update_policy` is LLM-only. Its
-// handler MERGES the patch with the live policy. The raw
-// PUT /thread-queue/policy replaces omitted fields with code defaults instead.
-// So a CLI `policy` command would silently reset caps, and none is generated.
-//
-// run-now/drop are CLI-only (no flat LLM predecessor). See engine/tools/mod.rs +
-// api/thread_queue.rs.
-// ---------------------------------------------------------------------------
-
 const TQ_ENTRY_ID_ARG: Arg = Arg {
     name: "entry_id",
     ty: ArgType::Str,
@@ -2809,13 +2462,6 @@ const TQ_ENTRY_ID_ARG: Arg = Arg {
     description: "UUID of the queued entry (from the 'list' action's entries[].id).",
 };
 
-// Mirrors the flat update_thread_queue_policy schema (cap_schema + overflow).
-// Every field optional — the handler merges the patch with the live policy.
-//
-// Descriptions stay at what the field NAME does not already say: this schema is
-// always-loaded context, billed on every request of every thread, and it sits
-// close to its per-tool ceiling. The full semantics of each cap live in
-// `system-knowhow/thread-queue.md` § Capacity policy.
 const TQ_POLICY_LLM_SCHEMA: &str = r#"{
   "max_concurrent_total": {"type":"integer","minimum":0,"description":"Background and user work alike."},
   "max_concurrent_event_trigger": {"type":"integer","minimum":0},
@@ -2858,8 +2504,6 @@ const THREAD_QUEUE_OPS: &[Operation] = &[
         llm_alias: Some("update_thread_queue_policy"),
         llm_schema: Some(TQ_POLICY_LLM_SCHEMA),
         llm: None,
-        // LLM-only: the merge-with-live semantics live in the in-process handler;
-        // the raw PUT replaces omitted fields with defaults (would reset caps).
         cli: Some(false),
         sdk: Some(false),
     },
@@ -2872,7 +2516,6 @@ const THREAD_QUEUE_OPS: &[Operation] = &[
         cli_name: "run-now",
         sdk_name: "runNow",
         mutating: true,
-        // CLI-only: panel/entry action with no flat LLM predecessor.
         llm_alias: None,
         llm_schema: None,
         llm: Some(false),
@@ -2909,17 +2552,6 @@ const THREAD_QUEUE_DOMAIN: Domain = Domain {
     llm_execution: LlmExecution::LegacyInProcess,
 };
 
-// ---------------------------------------------------------------------------
-// mcp — MCP (Model Context Protocol) server management. One grouped LLM tool;
-// each action delegates to execute_mcp_management_tool via its flat alias.
-// Every verb but setup has its own HTTP route and a generated CLI command;
-// setup runs purely in-process. enable/disable act on one thread's enabled
-// servers (ADR 0430): the LLM's thread is the caller, the CLI names one.
-// sdk = false, since no app manages servers. See engine/tools/mcp.rs and
-// api/mcp.rs.
-// ---------------------------------------------------------------------------
-
-/// The server id, as a path segment. Every per-server verb takes it.
 const MCP_ID_ARG: Arg = Arg {
     name: "id",
     ty: ArgType::Str,
@@ -2929,8 +2561,6 @@ const MCP_ID_ARG: Arg = Arg {
     description: "MCP server id, as shown by `list`.",
 };
 
-/// The thread whose enabled servers change. The LLM never passes it: its own
-/// thread is the one that enables.
 const MCP_THREAD_ID_ARG: Arg = Arg {
     name: "thread_id",
     ty: ArgType::Str,
@@ -2940,7 +2570,6 @@ const MCP_THREAD_ID_ARG: Arg = Arg {
     description: "Thread uuid whose enabled MCP servers change.",
 };
 
-/// `enable` and `disable` take the server id only. The thread is the caller.
 const MCP_THREAD_VERB_LLM_SCHEMA: &str =
     r#"{"id":{"type":"string","description":"Server id, as shown in [MCP SERVERS]"}}"#;
 
@@ -2965,10 +2594,6 @@ const MCP_OPS: &[Operation] = &[
         llm_alias: Some("setup_mcp_server"),
         llm_schema: Some(MCP_SETUP_LLM_SCHEMA),
         llm: None,
-        // The one verb with no CLI command. Registration runs in-process, so
-        // there is no HTTP route. Its shape also lives in `llm_schema` rather
-        // than `args`, so the generator would emit a flagless command posting
-        // an empty body. Declaring the args means building the route first.
         cli: Some(false),
         sdk: None,
     },
@@ -3069,25 +2694,13 @@ const MCP_DOMAIN: Domain = Domain {
     tool_name: "mcp",
     tool_summary: "Manage MCP (Model Context Protocol) servers. web_search first for the right package and command.",
     llm: true,
-    // Every verb but `setup` has its own HTTP route, so each generates a CLI
-    // command. `setup` is the exception and says why on the op.
     cli: true,
-    // No app manages MCP servers: an iframe has no business starting a process
-    // for the whole workspace. Declared N/A, which is parity per surface.
     sdk: false,
     operations: MCP_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::LegacyInProcess,
 };
-
-// ---------------------------------------------------------------------------
-// plugins — install/marketplace/update lifecycle. Consolidates the five flat
-// tools into one grouped LLM tool; each action delegates to the existing
-// execute_plugin_tool via the flat alias. LLM-only: install/uninstall stage a
-// confirm-panel handshake (UI plumbing, not a clean CLI), so cli/sdk = false.
-// See engine/tools/plugins.
-// ---------------------------------------------------------------------------
 
 const PLUGINS_OPS: &[Operation] = &[
     Operation {
@@ -3177,8 +2790,6 @@ const PLUGINS_DOMAIN: Domain = Domain {
     tool_name: "plugins",
     tool_summary: "Lucidos plugins: bundles of workspace content (apps, knowhow, triggers, scripts) another author shipped.",
     llm: true,
-    // install/uninstall are a UI confirm-panel handshake (not a clean CLI); no
-    // app/SDK consumer. Declared N/A — the grouped LLM tool is the agent surface.
     cli: false,
     sdk: false,
     operations: PLUGINS_OPS,
@@ -3187,18 +2798,6 @@ const PLUGINS_DOMAIN: Domain = Domain {
     llm_execution: LlmExecution::LegacyInProcess,
 };
 
-// ---------------------------------------------------------------------------
-// webhooks: inbound endpoints the user points a third party at. `llm: false` is
-// the load-bearing flag, and it follows the side-effect-grant precedent where
-// `create_trigger` deliberately cannot set the grant. An agent must not be able
-// to widen its own authority. A webhook opens a publicly reachable door that
-// emits a pinned event, so only the user creates one.
-//
-// `sdk: false` for the same reason, one layer out: an app iframe runs with the
-// user's authority, and this is not a capability an app should reach.
-// ---------------------------------------------------------------------------
-
-/// The webhook id, as a path segment.
 const WEBHOOK_ID_ARG: Arg = Arg {
     name: "id",
     ty: ArgType::Str,
@@ -3208,7 +2807,6 @@ const WEBHOOK_ID_ARG: Arg = Arg {
     description: "Webhook UUID, as shown by `list`.",
 };
 
-/// Deduping, off unless the hook asks for it.
 const WEBHOOK_DEDUPE_ARG: Arg = Arg {
     name: "dedupe",
     ty: ArgType::Json,
@@ -3218,10 +2816,6 @@ const WEBHOOK_DEDUPE_ARG: Arg = Arg {
     description: "Recognise a resend instead of emitting twice: {header?, window_secs?}. `header` names the header carrying the sender's delivery id (e.g. 'X-GitHub-Delivery'); with none, the key is a digest of the body. `window_secs` defaults to 3600, is capped at 604800, and 0 switches deduping off. Omit the whole block and every arrival emits, which is what keeps a sender's retries visible on the log.",
 };
 
-/// Where the signing secret comes from, when the request brings one.
-///
-/// Shared between create and update. On update it is a rotation, which the
-/// description says, because the two read the same JSON.
 const WEBHOOK_SIGNING_SECRET_ARG: Arg = Arg {
     name: "signing_secret",
     ty: ArgType::Json,
@@ -3231,7 +2825,6 @@ const WEBHOOK_SIGNING_SECRET_ARG: Arg = Arg {
     description: "Save the secret the `hmac` block names, instead of pointing at one you saved earlier. `{\"mode\":\"generate\"}` mints 32 bytes and prints them ONCE, which is right for GitHub, where you choose the secret. `{\"mode\":\"provided\",\"value\":\"...\"}` stores a secret the sender issued, which is the only option for Slack and Stripe. For Slack, create the hook first, then paste its URL into Event Subscriptions: Slack checks the URL at once, and a hook verifying `X-Slack-Signature` answers that `url_verification` challenge. The value is stored byte for byte, so a value with surrounding whitespace is refused rather than trimmed. On `create` it refuses to overwrite an existing credential; on `update` it replaces the value, which is how you rotate.",
 };
 
-/// Request headers copied into the event payload, under `headers`.
 const WEBHOOK_HEADERS_ARG: Arg = Arg {
     name: "headers",
     ty: ArgType::Json,
@@ -3374,7 +2967,6 @@ const WEBHOOKS_DOMAIN: Domain = Domain {
     tool_name: "webhooks",
     tool_summary:
         "Inbound webhooks: endpoints a third party posts to, each emitting one pinned domain event.",
-    // Deliberately not an agent capability. See the note above this block.
     llm: false,
     cli: true,
     sdk: false,
@@ -3383,13 +2975,6 @@ const WEBHOOKS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::Route,
 };
-
-// ---------------------------------------------------------------------------
-// workspace_prompt_footprint: what the workspace's own content adds to every
-// chat turn (ADR 0413). `llm: false` is the point: a tool schema would bill
-// every turn of every workspace to measure the prompt. The audit reaches it
-// through the CLI it already runs. No app needs it, so no SDK either.
-// ---------------------------------------------------------------------------
 
 const WORKSPACE_PROMPT_FOOTPRINT_OPS: &[Operation] = &[Operation {
     action: "show",
@@ -3420,13 +3005,6 @@ const WORKSPACE_PROMPT_FOOTPRINT_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::Route,
 };
-
-// ---------------------------------------------------------------------------
-// permissions: list and revoke what owners' answers granted, and raise a batch
-// for the owner to confirm (ADR 0664). No LLM
-// tool, since its schema would bill every chat turn; the Lucidos Agent reaches
-// the CLI through its shell tool. No app needs it, so no SDK either.
-// ---------------------------------------------------------------------------
 
 const PERMISSIONS_ALL_ARG: Arg = Arg {
     name: "all",
@@ -3514,12 +3092,6 @@ const PERMISSIONS_DOMAIN: Domain = Domain {
     llm_execution: LlmExecution::Route,
 };
 
-// ---------------------------------------------------------------------------
-// hooks: the workspace's *event hooks* (ADR 0746), on the CLI alone. Only the
-// owner arms, disarms or removes one: an agent gets `permission_required`.
-// ---------------------------------------------------------------------------
-
-/// The hook's folder name under data/hooks/, as a path segment.
 const HOOK_SLUG_ARG: Arg = Arg {
     name: "slug",
     ty: ArgType::Str,
@@ -3529,7 +3101,6 @@ const HOOK_SLUG_ARG: Arg = Arg {
     description: "The hook's folder name under data/hooks/, as `list` shows it.",
 };
 
-/// Why an agent asks. The owner reads it on the permission card.
 const HOOK_REASON_ARG: Arg = Arg {
     name: "reason",
     ty: ArgType::Str,
@@ -3615,11 +3186,6 @@ const HOOKS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
     llm_execution: LlmExecution::Route,
 };
-
-// ---------------------------------------------------------------------------
-// pinned_apps and browser: the CLI routes for two tables an agent once wrote
-// by SQL. Each runs the engine's own mutator, so a pin announces itself.
-// ---------------------------------------------------------------------------
 
 const PIN_DEVICE_QUERY_ARG: Arg = Arg {
     name: "device_id",
@@ -3783,13 +3349,10 @@ const DOMAINS: &[Domain] = &[
     BROWSER_DOMAIN,
 ];
 
-/// The full manifest.
 pub fn domains() -> &'static [Domain] {
     DOMAINS
 }
 
-/// Look up a domain by its grouped LLM tool name, including back-compat aliases
-/// (the per-operation `llm_alias` values and any domain-level `llm_aliases`).
 pub fn domain_for_tool(tool_name: &str) -> Option<&'static Domain> {
     DOMAINS
         .iter()

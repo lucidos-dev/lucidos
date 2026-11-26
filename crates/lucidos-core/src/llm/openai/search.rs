@@ -1,5 +1,3 @@
-//! Hosted web search on the ChatGPT plan's Responses endpoint.
-
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -16,7 +14,6 @@ use crate::llm::{ModelSelection, ProviderKind};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 impl OpenAiProvider {
-    /// Pure request construction using the chat path's Responses profile.
     pub(super) fn build_plan_search_body(&self, model: &str, query: &str) -> Value {
         let messages = [Message {
             role: "user".into(),
@@ -29,12 +26,10 @@ impl OpenAiProvider {
             Some(SEARCH_SYSTEM_PROMPT),
             &ModelSelection::default(),
         );
-        // Hosted tools are top-level, unlike namespaced function tools.
         body["tools"] = json!([{"type": "web_search"}]);
         body
     }
 
-    /// Search only through a plan endpoint, preserving its authentication and pause.
     pub(crate) async fn search_plan(
         &self,
         model: &str,
@@ -133,7 +128,7 @@ impl OpenAiProvider {
     }
 }
 
-/// Read the terminal response, which carries annotations absent from text deltas.
+/// INVARIANT: Read the terminal response, which carries annotations absent from text deltas.
 async fn read_search_stream<S, B>(mut stream: S) -> Result<Value, BoxError>
 where
     S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
@@ -159,7 +154,7 @@ where
                         let response = data
                             .get("response")
                             .ok_or("ChatGPT plan search omitted the response")?;
-                        // Refusals must never become a successful empty search.
+                        // INVARIANT: Refusals must never become a successful empty search.
                         for item in response["output"]
                             .as_array()
                             .map(Vec::as_slice)
@@ -234,7 +229,6 @@ mod tests {
              data: {{\"type\":\"response.output_text.delta\",\"delta\":\"News café\"}}\r\n\r\n\
              data: {terminal}\r\n\r\ndata: [DONE]\r\n\r\n"
         );
-        // Single-byte chunks split UTF-8, CRLF and JSON tokens.
         let stream = futures::stream::iter(wire.as_bytes().chunks(1).map(Ok::<_, reqwest::Error>));
         let response = read_search_stream(stream).await.unwrap();
         let text = crate::llm::web_search::openai::parse_response(&response, 2).unwrap();

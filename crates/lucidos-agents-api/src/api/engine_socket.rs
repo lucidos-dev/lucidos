@@ -1,20 +1,3 @@
-//! The engine socket: the Unix socket the gateway reaches this engine on.
-//!
-//! The gateway never dials the engine's TCP port, because a TCP port does not
-//! say who owns it (ADR 0445). It connects here instead, once the kernel names
-//! this process's uid as the listener's. This side checks the same thing in
-//! reverse, and drops any peer that is not this user.
-//!
-//! An agent's subprocess runs as this user too. So each request must also
-//! carry the socket credential, which the agent's sandbox cannot read (ADR
-//! 0645). A request without it is never routed: the connection closes with no
-//! answer.
-//!
-//! The socket serves the same router as the TCP listeners, so the gateway's
-//! requests meet the same door and the same routes. It also drains the way
-//! they do: on shutdown it stops accepting, and open connections get the same
-//! grace before they close.
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,9 +11,6 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tower::ServiceExt as _;
 
-/// Serve `app` on the engine socket at `socket`, to this user's processes
-/// holding its credential only, until `draining` turns true. Then stop
-/// accepting, and give open connections up to `drain_for` to finish.
 pub async fn serve(
     listener: UnixListener,
     socket: PathBuf,
@@ -49,7 +29,6 @@ pub async fn serve(
     .await;
 }
 
-/// [`serve`] with the peer check passed in, so a test can stage a stranger.
 async fn serve_checked(
     listener: UnixListener,
     socket: PathBuf,
@@ -67,9 +46,6 @@ async fn serve_checked(
         };
         let stream = match accepted {
             Ok((stream, _)) => stream,
-            // A connection that died before it was accepted is that client's
-            // problem. Anything else, such as `EMFILE`, would fail again at
-            // once, so pause the way axum's own serve loop does.
             Err(e) if is_connection_error(&e) => continue,
             Err(e) => {
                 crate::log_legacy!("[API] engine socket accept failed: {e}");
@@ -107,11 +83,6 @@ async fn serve_checked(
     }
 }
 
-/// One gateway connection, asked to finish its current exchange and close
-/// once the engine starts draining.
-///
-/// A request without `credential` fails the service, so hyper closes the
-/// connection without writing a byte.
 async fn serve_connection(
     stream: UnixStream,
     credential: String,
@@ -152,10 +123,9 @@ async fn serve_connection(
     }
 }
 
-/// Why a request was refused, as hyper logs it when the connection ends.
 const UNCREDENTIALED: &str = "a request without the engine socket credential was refused";
 
-/// `req` with its credential removed, or `None` when it presents none. The
+/// INVARIANT: `req` with its credential removed, or `None` when it presents none. The
 /// header never reaches the router, so no handler can log or forward it.
 fn admit(mut req: Request<Incoming>, credential: &str) -> Option<Request<Incoming>> {
     let presented = req
@@ -169,8 +139,6 @@ fn admit(mut req: Request<Incoming>, credential: &str) -> Option<Request<Incomin
     Some(req)
 }
 
-/// Resolves once the engine starts draining. A dropped sender counts too:
-/// the engine is leaving either way.
 async fn drain_begins(draining: &mut watch::Receiver<bool>) {
     if draining.wait_for(|d| *d).await.is_err() {
         crate::log_legacy!("[API] engine socket lost its drain signal; draining now");
@@ -197,8 +165,6 @@ mod tests {
             .expect("scratch dir")
     }
 
-    /// Answers every path, so the route scan sees no unmounted route here.
-    /// The body says whether the credential header reached the router.
     fn health_router() -> Router {
         Router::new().fallback(|headers: axum::http::HeaderMap| async move {
             if headers.contains_key(CREDENTIAL_HEADER) {
@@ -209,8 +175,6 @@ mod tests {
         })
     }
 
-    /// A health request carrying `credential`, if any. Without `keep_alive`
-    /// it asks the server to close after answering.
     fn health_request(credential: Option<&str>, keep_alive: bool) -> Vec<u8> {
         let mut head = String::from("GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:5173\r\n");
         if let Some(credential) = credential {
@@ -234,8 +198,6 @@ mod tests {
         answer
     }
 
-    /// Whatever a refused caller reads back. Linux resets a Unix stream closed
-    /// with unread bytes where macOS ends it, so a reset is also no answer.
     async fn answer_to(socket: &std::path::Path, credential: Option<&str>) -> Vec<u8> {
         use std::io::ErrorKind::{BrokenPipe, ConnectionReset};
         let mut stream = lucidos_engine_socket::connect(socket)
@@ -290,8 +252,6 @@ mod tests {
         );
     }
 
-    /// I3: a peer the check does not name as this user is dropped before a
-    /// request is read, so it gets no answer at all.
     #[tokio::test]
     async fn a_peer_that_is_not_this_user_gets_nothing() {
         let dir = scratch();
@@ -309,9 +269,6 @@ mod tests {
         assert_unanswered(&answer_to(&socket, Some(&credential)).await);
     }
 
-    /// The socket invariant (ADR 0645): this user's process without the
-    /// credential, such as an agent's subprocess, gets no answer, not even a
-    /// refusal status. A wrong credential fares the same.
     #[tokio::test]
     async fn a_request_without_the_credential_gets_nothing() {
         let dir = scratch();
@@ -331,8 +288,6 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     }
 
-    /// The drain mirrors the TCP listeners: an idle connection is closed, the
-    /// server returns well inside its grace, and nothing new is accepted.
     #[tokio::test]
     async fn draining_closes_idle_connections_and_ends_the_server() {
         let dir = scratch();
@@ -348,8 +303,6 @@ mod tests {
         let mut idle = lucidos_engine_socket::connect(&socket)
             .await
             .expect("an idle gateway connection");
-        // One answered exchange proves the server accepted the connection. A
-        // connection still in the backlog at the drain is reset, not closed.
         let request = health_request(Some(idle.credential()), true);
         idle.write_all(&request).await.expect("write");
         let mut answered = Vec::new();

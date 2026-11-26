@@ -350,6 +350,7 @@ const IMAGE_MODELS: &[&str] = &[
 /// The routing lives in `crates/lucidos-app/src/utils/openExternalUrl.ts`.
 const EXTERNAL_LINK_TARGETS: &[&str] = &["safari", "ask", "in-app"];
 const THEME_MODES: &[&str] = &["light", "dark", "system"];
+const AGENT_ICON_COLOR_LOOKS: &[&str] = &["brand", "theme", "muted"];
 const MOTION_PREFS: &[&str] = &["system", "reduce", "full"];
 const THEME_EFFECTS_PREFS: &[&str] = &["system", "reduce", "full"];
 /// The rule that reads it is `composerEnterSends` in
@@ -1438,14 +1439,14 @@ pub const LONG_PROMPT_SHARE: Pref<Optional> = Pref::optional(PrefSpec {
 });
 
 // ---- Appearance (device-scoped) ----
-pub const AGENT_BRAND_COLOURS: Pref<Flag> = Pref::flag(PrefSpec {
-    key: "agent-brand-colours",
-    label: "Agent brand colours",
+pub const AGENT_ICON_COLORS: Pref<Text> = Pref::text(PrefSpec {
+    key: "agent-icon-colors",
+    label: "Agent icon colors",
     access: PrefAccess::Agent,
     scope: PrefScope::Device,
-    value: PrefValue::Bool,
-    default: PrefDefault::Value("true"),
-    description: "Show agent brand colours in the thread drawer on THIS device. Off preserves the existing appearance, including the flat Lucidos mark. Other surfaces and status indicators are unchanged.",
+    value: PrefValue::Enum(AGENT_ICON_COLOR_LOOKS),
+    default: PrefDefault::Value("brand"),
+    description: "How the Claude, Codex and Lucidos icons are colored in the thread drawer, the thread pane and navigation history on THIS device. 'brand' draws each agent's brand colors. 'theme' draws every icon in the theme's accent color, and 'muted' in its muted text color; both use the flat Lucidos mark. Themes can tune all three looks. Status indicators are unchanged.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -2311,7 +2312,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &INTELLIGENCE_LADDER_CLAUDE_CODE.spec,
     &INTELLIGENCE_LADDER_CODEX.spec,
     &LONG_PROMPT_SHARE.spec,
-    &AGENT_BRAND_COLOURS.spec,
+    &AGENT_ICON_COLORS.spec,
     &THEME_MODE.spec,
     &FONT_FAMILY.spec,
     &UI_SCALE.spec,
@@ -3060,10 +3061,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_brand_colours_are_device_scoped_and_on_by_default() {
-        assert_eq!(AGENT_BRAND_COLOURS.spec.scope, PrefScope::Device);
-        assert!(AGENT_BRAND_COLOURS.default_flag());
-        assert!(validate(&AGENT_BRAND_COLOURS.spec, "false").is_ok());
+    fn agent_icon_colors_are_device_scoped_and_brand_by_default() {
+        assert_eq!(AGENT_ICON_COLORS.spec.scope, PrefScope::Device);
+        assert!(matches!(
+            AGENT_ICON_COLORS.spec.default,
+            PrefDefault::Value("brand")
+        ));
+        for look in ["brand", "theme", "muted"] {
+            assert!(validate(&AGENT_ICON_COLORS.spec, look).is_ok(), "{look}");
+        }
+        assert!(validate(&AGENT_ICON_COLORS.spec, "false").is_err());
     }
 
     #[test]

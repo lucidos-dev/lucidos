@@ -1,5 +1,3 @@
-//! The `axum_server` acceptor that decides each connection's scheme.
-
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -16,11 +14,8 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
 use super::{is_loopback, Connection, ListenerTls, ManagedCert, Peer};
 
-/// How long a client gets to send its first byte, and then to finish the TLS
-/// handshake. The same bound `axum_server`'s own rustls acceptor uses.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The first byte of every TLS record carrying a handshake.
 const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 
 #[derive(Clone)]
@@ -37,8 +32,6 @@ impl GatewayAcceptor {
         }
     }
 
-    /// The acceptor for the public listener: every request it accepts is
-    /// stamped public.
     pub fn public(tls: ListenerTls) -> Self {
         GatewayAcceptor {
             tls,
@@ -62,8 +55,6 @@ impl<S: Send + 'static> axum_server::accept::Accept<TcpStream, S> for GatewayAcc
     }
 }
 
-/// Accept `stream` as if it arrived on `local`. Split from [`GatewayAcceptor`]
-/// so a test can serve a loopback socket as a remote address.
 pub(super) async fn accept_at<S>(
     tls: ListenerTls,
     stream: TcpStream,
@@ -125,7 +116,6 @@ async fn negotiate(
     }
 }
 
-/// Peek, without consuming, whether the client opened with a TLS handshake.
 async fn opens_with_tls(stream: &TcpStream) -> io::Result<bool> {
     let mut first = [0u8; 1];
     let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first))
@@ -147,7 +137,6 @@ async fn handshake(
     Ok((MaybeTlsStream::Tls(Box::new(tls)), Connection::Tls))
 }
 
-/// Serve `managed` to a client asking for its name, and `operator` to the rest.
 async fn handshake_by_name(
     operator: Arc<rustls::ServerConfig>,
     managed: Arc<ManagedCert>,
@@ -172,8 +161,6 @@ async fn handshake_by_name(
     Ok((MaybeTlsStream::Tls(Box::new(tls)), Connection::Tls))
 }
 
-/// One accepted connection, TLS or not. One type, so one listener can serve
-/// both.
 pub enum MaybeTlsStream {
     Plain(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
@@ -237,8 +224,6 @@ impl AsyncWrite for MaybeTlsStream {
     }
 }
 
-/// The connection's service, stamping its [`Connection`] and [`Peer`] on
-/// every request.
 #[derive(Clone)]
 pub struct Tagged<S> {
     inner: S,

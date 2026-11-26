@@ -2,8 +2,6 @@ use super::*;
 use crate::engine::thread_events::ActorMode;
 use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 
-/// A thread the projection knows about. `pending` joins `thread_summaries`,
-/// and a form request creates no summary row of its own.
 async fn seed_thread(bus: &EventBus) -> Uuid {
     let thread_id = Uuid::new_v4();
     seed_thread_event(
@@ -74,7 +72,6 @@ fn plugin_install_request(plugin_id: &str) -> (Uuid, ThreadEvent) {
     )
 }
 
-/// Every resolution written for `request_id`, oldest first.
 async fn outcomes(pool: &PgPool, request_id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT payload->>'outcome' FROM events \
@@ -151,7 +148,6 @@ async fn resolving_an_id_no_request_carries_emits_nothing() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
-    // A Settings-initiated OAuth flow, or a plugin staged over HTTP.
     let unknown = Uuid::new_v4();
     assert!(
         !resolve(&pool, &bus, unknown, FormRequestOutcome::Completed, None)

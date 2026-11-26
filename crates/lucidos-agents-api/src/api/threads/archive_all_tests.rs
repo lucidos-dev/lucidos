@@ -1,6 +1,3 @@
-//! Unarchive, the half of Archive all that needs no engine: it moves exactly
-//! the archived ids back, and leaves every other row where it was.
-
 use super::*;
 use crate::engine::thread_events::{ActorMode, EventChannel};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -105,8 +102,6 @@ async fn unarchive_moves_exactly_the_archived_ids_back() {
     teardown_test_db(&db).await;
 }
 
-/// ADR 0312 keeps pinned and archived exclusive. An unarchived thread pins and
-/// unpins like any inbox thread, and the constraint never fires.
 #[tokio::test]
 async fn an_unarchived_thread_pins_and_unpins_cleanly() {
     let (pool, db) = setup_test_db().await;
@@ -130,8 +125,6 @@ async fn an_unarchived_thread_pins_and_unpins_cleanly() {
     teardown_test_db(&db).await;
 }
 
-/// Move to Current brings the sub-threads back with the thread, as Archive took
-/// them; Undo's exact scope leaves them where they are.
 #[tokio::test]
 async fn unarchive_with_sub_threads_restores_the_family() {
     let (pool, db) = setup_test_db().await;
@@ -166,8 +159,6 @@ async fn unarchive_with_sub_threads_restores_the_family() {
     teardown_test_db(&db).await;
 }
 
-/// Ids and row order both run against depth, so only the depth sort puts the
-/// parent first.
 #[tokio::test]
 async fn unarchive_emits_parents_first_whatever_the_ids_and_row_order() {
     let (pool, db) = setup_test_db().await;

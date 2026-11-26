@@ -64,7 +64,6 @@ fn engine_down_keeps_all_four_logs_and_lists_missing_parts() {
             )],
         );
     }
-    // Never discover files by scanning a directory, including historical raw logs.
     std::fs::write(
         sources.logs[1].1.as_ref().unwrap().join("client.log"),
         "RAW_MARKER",

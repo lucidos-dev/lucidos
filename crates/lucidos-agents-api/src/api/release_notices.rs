@@ -1,14 +1,3 @@
-//! HTTP for *release notices*: what this workspace still owes the reader, and
-//! the answer that settles one.
-//!
-//! Both surfaces read the same release groups and cursor.
-//!
-//! - `GET  /api/v1/release-notices`
-//! - `POST /api/v1/release-notices/resolve` with the last item id and the
-//!   ordered `shown_ids` snapshot. Older clients send only the first item id.
-//!
-//! The rules live in `engine::release_notices`. This module is the boundary.
-
 use axum::extract::State;
 use axum::{
     http::HeaderMap,
@@ -25,7 +14,7 @@ use crate::engine::event_bus::SystemEvent;
 use crate::engine::release_notices;
 use crate::engine::ContextPurpose;
 
-/// The release this engine reports, which decides what a caller may see or
+/// INVARIANT: The release this engine reports, which decides what a caller may see or
 /// answer.
 ///
 /// Read here rather than taken from the request. A client could otherwise name
@@ -36,9 +25,6 @@ fn running_release() -> Result<semver::Version, ApiError> {
     release_notices::running_release().map_err(ApiError::internal)
 }
 
-/// The workspace facts the notices read. The command guard's exposure needs
-/// the MCP manager and the judge's model selection, which only the running
-/// engine holds.
 async fn notice_facts(state: &AppState) -> release_notices::NoticeFacts {
     let unapproved_mcp_server = match state.engine.mcp_manager.list_servers().await {
         Ok(servers) => servers
@@ -49,7 +35,6 @@ async fn notice_facts(state: &AppState) -> release_notices::NoticeFacts {
             true
         }
     };
-    // A judge switched off needs no model, so nothing refuses a turn.
     let judge_on = match COMMAND_GUARD_JUDGE.try_read(&state.pool).await {
         Ok(on) => on,
         Err(e) => {
@@ -76,7 +61,6 @@ async fn notice_facts(state: &AppState) -> release_notices::NoticeFacts {
     .await
 }
 
-/// `GET /api/v1/release-notices`.
 async fn list(
     State(state): State<AppState>,
 ) -> Result<Json<release_notices::NoticeView>, ApiError> {
@@ -103,11 +87,6 @@ struct ResolveRequest {
     shown_ids: Option<Vec<String>>,
 }
 
-/// `POST /api/v1/release-notices/resolve`.
-///
-/// Answering a notice the workspace has already walked past is a no-op rather
-/// than an error. Two devices showing the same modal is ordinary, so the second
-/// answer changes nothing and announces nothing.
 async fn resolve(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -121,7 +100,6 @@ async fn resolve(
             body.id
         )));
     }
-    // Before the resolve, which walks the workspace past the notice.
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
     let facts = notice_facts(&state).await;
     let moved = release_notices::resolve(

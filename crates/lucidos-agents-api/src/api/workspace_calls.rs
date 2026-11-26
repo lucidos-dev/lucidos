@@ -1,15 +1,3 @@
-//! `POST /api/v1/workspace-calls/{target}/chat/stream`: a thread's own
-//! subprocess spawns into another workspace through this engine.
-//!
-//! The subprocess cannot prove its thread to the target, since its origin token
-//! verifies only here. So this engine verifies the token and asks its own spawn
-//! gate for a verdict on the calling thread. It signs both for its gateway
-//! (`engine::http::workspace_client`), which stamps the same claim for the
-//! target. The target honors the verdict.
-//!
-//! A caller with no origin token is refused: it has no thread to vouch for.
-//! It posts to the target directly instead, where it is unattested.
-
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -27,11 +15,8 @@ use crate::engine::http::workspace_client::{
 };
 use crate::engine::thread_events::ActorMode;
 
-/// The `reason` for a call that presented no origin token.
 const REASON_ORIGIN_TOKEN_REQUIRED: &str = "origin_token_required";
 
-/// The route, below `/api/v1`. It must match what
-/// `lucidos_gateway_stamp::workspace_call_path` builds, since the CLI posts there.
 const ROUTE: &str = "/workspace-calls/:target/chat/stream";
 
 pub(super) fn router() -> Router<AppState> {
@@ -56,8 +41,6 @@ async fn call_workspace(
     .await
 }
 
-/// The call itself, with the gateway port given, so a test never reaches the
-/// gateway this process inherited.
 async fn outbound_call(
     pool: &sqlx::PgPool,
     trigger_configs: &std::sync::RwLock<

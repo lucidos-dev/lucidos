@@ -261,6 +261,10 @@ export function displaySection(
   return 'current';
 }
 
+export function awaitsOwnerAnswer(status: ThreadStatus, isHeld: boolean): boolean {
+  return status === 'waiting_for_user_answer' && !isHeld;
+}
+
 export function isCcOnlyEvent(eventType: string): boolean {
   return CC_ONLY_EVENTS.has(eventType);
 }

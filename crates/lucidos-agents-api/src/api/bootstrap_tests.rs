@@ -1,6 +1,3 @@
-//! `GET /api/v1/bootstrap` against the engine's real `/api/v1` router: each
-//! slice beside the narrow route it stands for.
-
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,9 +15,6 @@ use crate::test_support::{boot_mock_engine, in_engine_child, setup_test_db, tear
 const PHONE: &str = "owner-phone";
 const LAPTOP: &str = "owner-laptop";
 
-/// The request each slice stands for, in the order the route serves them.
-/// This is the wire contract the client's `BootstrapSnapshot` was written
-/// against, so it is pinned here as literals. `{device}` is the caller.
 const SLICE_ROUTES: [(&str, &str); 25] = [
     ("preferences", "/preferences?device_id={device}"),
     (
@@ -52,7 +46,6 @@ const SLICE_ROUTES: [(&str, &str); 25] = [
     ("engine_version_status", "/engine/version-status"),
 ];
 
-/// The raw-size budget of one snapshot, on a fixture past every slice limit.
 const SNAPSHOT_BUDGET_BYTES: usize = 512 * 1024;
 
 struct Answer {
@@ -100,7 +93,6 @@ async fn post_as(state: &AppState, device: &str, uri: &str, body: Value) {
     assert_eq!(answer.status, StatusCode::OK, "{uri}: {}", answer.body);
 }
 
-/// The snapshot's slices as the bytes the route sent, in served order.
 fn slices_of(snapshot: &Answer) -> Vec<(String, String)> {
     assert_eq!(snapshot.status, StatusCode::OK, "{}", snapshot.body);
     let keys = served_keys(&snapshot.body);
@@ -113,7 +105,6 @@ fn slices_of(snapshot: &Answer) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The top-level keys in the order they appear on the wire.
 fn served_keys(body: &str) -> Vec<String> {
     struct Keys(Vec<String>);
     impl<'de> serde::Deserialize<'de> for Keys {
@@ -141,8 +132,6 @@ fn served_keys(body: &str) -> Vec<String> {
     serde_json::from_str::<Keys>(body).unwrap().0
 }
 
-/// The slice a route's own answer makes: its exact body, or its code and the
-/// message a client reads off its failure.
 fn slice_of_route(route: &Answer) -> String {
     if route.status.is_success() {
         return format!(r#"{{"data":{}}}"#, route.body);
@@ -159,8 +148,6 @@ fn slice_of_route(route: &Answer) -> String {
     )
 }
 
-/// Read the snapshot as `device`, and every narrow route beside it. Each
-/// slice must be the slice its route's answer makes, byte for byte.
 async fn assert_every_slice_is_its_route(state: &AppState, device: &str) -> Vec<(String, String)> {
     let slices = slices_of(&bootstrap_as(state, device).await);
     let served: Vec<&str> = slices.iter().map(|(key, _)| key.as_str()).collect();
@@ -186,12 +173,8 @@ fn failed_slices(slices: &[(String, String)]) -> Vec<&str> {
         .collect()
 }
 
-/// A test build carries no release version, so its release notices route
-/// answers 500. Every other slice of an untouched fixture is data.
 const FAILS_IN_A_TEST_BUILD: &str = "release_notices";
 
-/// A cold workspace starts its first catalog scan on the first read, and
-/// the catalog slice changes when that scan lands. Wait it out.
 async fn first_catalog_scan_lands(state: &AppState) {
     for _ in 0..200 {
         let catalog = get_as(state, "/plugins/catalog", HeaderMap::new()).await;
@@ -304,7 +287,6 @@ async fn a_failing_source_fails_only_its_own_slice() {
     let (_pool, db) = setup_test_db().await;
     let (engine, workspace) = boot_mock_engine(&db).await;
     let state = permission_test_state(engine, workspace.path().to_path_buf()).await;
-    // One source that answers a JSON error, and one that answers plain text.
     let registry = workspace
         .path()
         .join(crate::core::DATA_DIR)
@@ -417,7 +399,6 @@ async fn an_unchanged_workspace_answers_not_modified() {
     teardown_test_db(&db).await;
 }
 
-/// Which slice moved between two reads of an idle workspace.
 fn first_difference(first: &Answer, second: &Answer) -> String {
     slices_of(first)
         .into_iter()
@@ -435,7 +416,6 @@ async fn the_snapshot_stays_inside_its_size_budget() {
     let (_pool, db) = setup_test_db().await;
     let (engine, workspace) = boot_mock_engine(&db).await;
     let state = permission_test_state(engine, workspace.path().to_path_buf()).await;
-    // Rows past both limits a slice carries.
     let past_page = notifications::NOTIFICATIONS_PAGE_MAX + 20;
     for n in 0..past_page {
         notify(&state, &format!("Notification {n}")).await;
@@ -575,7 +555,6 @@ async fn a_reader_that_panics_fails_only_its_own_slice() {
 static READS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static MOST_READS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// A reader that records how many of its kind run at once.
 const COUNTING_READER: SliceReader = SliceReader {
     key: "counted",
     read: |_| {
@@ -604,7 +583,6 @@ async fn concurrent_snapshots_leave_the_pool_to_other_requests() {
     let (engine, workspace) = boot_mock_engine(&db).await;
     let state = permission_test_state(engine, workspace.path().to_path_buf()).await;
 
-    // One snapshot never runs more reads at once than the bound.
     static COUNTED: SliceReader = COUNTING_READER;
     let context = SliceContext {
         state: state.clone(),
@@ -617,8 +595,6 @@ async fn concurrent_snapshots_leave_the_pool_to_other_requests() {
         BOOTSTRAP_READ_CONCURRENCY
     );
 
-    // Several devices starting at once still leave a pool read an answer,
-    // and no slice fails waiting for a connection.
     let snapshots = futures::future::join_all((0..6).map(|_| bootstrap_as(&state, PHONE)));
     let pool_read = get_as(&state, "/devices", stamped_device_headers(PHONE));
     let (snapshots, pool_read) = tokio::time::timeout(

@@ -1,18 +1,3 @@
-//! PreToolUse hook for Claude Code's `Bash` tool. It blocks the kill patterns
-//! that have caught the engine's CC subprocesses by accident. It also sends
-//! back a `cd` plus output redirection, which CC would put to the user.
-//!
-//! Background: a CC subprocess's argv names tools like `cargo` and `rustc`
-//! (its `--allowedTools` list, for one). So a CC session running
-//! `ps aux | grep -E "rustc|cargo" | xargs kill` to clean up a stuck cargo
-//! build also matches other CC subprocesses. SIGTERM cascades and every
-//! concurrent CC dies. `pkill -f cargo` and `kill $(pgrep -f cargo)` match
-//! the same argv. This hook refuses the obvious patterns at the source.
-//!
-//! Wired into `<workspace>/.lucidos/cc-settings.json` via the engine's
-//! `cc_settings.rs`. A managed session also reads the workspace’s current
-//! standing denies before the command runs.
-
 use std::io::Read;
 
 use serde::Deserialize;
@@ -69,7 +54,6 @@ struct BashToolInput {
 }
 
 pub(crate) fn decide(command: &str) -> GuardDecision {
-    // Bash joins a backslash-newline into one line before it parses words.
     let command = &command.replace("\\\n", " ");
     if matches_ps_output_kill(command) {
         return GuardDecision::Block(MSG_PS_OUTPUT_KILL);
@@ -86,9 +70,6 @@ pub(crate) fn decide(command: &str) -> GuardDecision {
     GuardDecision::Allow
 }
 
-/// A `cd` in command position anywhere in the command, plus an unquoted
-/// output redirection or a `tee` anywhere in it. CC's check reads the whole
-/// compound command, so order and statement do not matter.
 fn matches_cd_with_redirect(cmd: &str) -> bool {
     runs_cd(cmd) && (has_output_redirect(cmd) || runs_tee(cmd))
 }
@@ -101,12 +82,10 @@ fn runs_tee(cmd: &str) -> bool {
     in_command_position(cmd, "tee")
 }
 
-/// Words after which the next word is still a command name.
 const COMMAND_PREFIXES: [&str; 11] = [
     "if", "elif", "while", "until", "do", "then", "else", "!", "time", "builtin", "command",
 ];
 
-/// True when `word` is a `NAME=value` assignment prefix.
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
         name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
@@ -114,9 +93,6 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
-/// True when `word` starts a command: at the start, after `;`, `&`, `|`, `(`,
-/// `{`, a backtick or a newline, or after a [`COMMAND_PREFIXES`] word or an
-/// assignment.
 fn in_command_position(cmd: &str, word: &str) -> bool {
     let mut offset = 0;
     while let Some(pos) = find_word(&cmd[offset..], word) {
@@ -135,10 +111,6 @@ fn in_command_position(cmd: &str, word: &str) -> bool {
     false
 }
 
-/// True when `cmd` holds a `>` outside quotes that writes a file: `>`, `>>`,
-/// `2>`, `&>`, `>|`, `>&file`. A descriptor copy (`2>&1`, `>&2`, `>&-`) and a
-/// process substitution (`>(…)`) write no file. A newline ends any quote, so
-/// a stray apostrophe in a comment or heredoc cannot hide a later redirect.
 fn has_output_redirect(cmd: &str) -> bool {
     let bytes = cmd.as_bytes();
     let mut quote = None;
@@ -173,22 +145,13 @@ fn has_output_redirect(cmd: &str) -> bool {
     false
 }
 
-/// Option letters that take a value in both procps and BSD `pkill`/`pgrep`.
-/// The rest of a short-flag cluster after one of them is that value.
 const VALUE_OPTIONS: &str = "dFGgPstUu";
 
-/// `pkill -f …` anywhere, or `pgrep -f …` in a command that also mentions the
-/// word `kill`. The whole command counts, not one statement, so a PID list
-/// carried through a variable or a `for` loop still trips it. Like the other
-/// rules it reads text, not parsed commands: a quoted mention trips it too.
 fn matches_full_cmdline_kill(cmd: &str) -> bool {
     passes_full_match(cmd, "pkill")
         || (passes_full_match(cmd, "pgrep") && contains_word(cmd, "kill"))
 }
 
-/// True when any mention of `tool` in `cmd` passes `-f` or `--full`, alone or
-/// inside a combined short flag such as `-9f`. Options may follow the pattern,
-/// because procps getopt permutes argv; `--` ends them.
 fn passes_full_match(cmd: &str, tool: &str) -> bool {
     let mut rest = cmd;
     while let Some(pos) = find_word(rest, tool) {
@@ -205,12 +168,6 @@ fn passes_full_match(cmd: &str, tool: &str) -> bool {
     false
 }
 
-/// Byte index of the first statement or pipe boundary in `args` outside
-/// quotes and escapes, so `'cargo|rustc'` or `cargo\|rustc` does not end it.
-/// The scan starts unquoted and ignores `)` and backticks, so
-/// `pkill -u $(id -u) -f` and `$(which pkill) -f` read through. Inside a
-/// `bash -c "…"` script a `\"` is a real quote, so both readings run and the
-/// longer one wins. Every guess makes the scan read further.
 fn unquoted_boundary(args: &str) -> usize {
     boundary_scan(args, true).max(boundary_scan(args, false))
 }
@@ -238,7 +195,6 @@ fn boundary_scan(args: &str, escapes_quotes: bool) -> usize {
 
 fn is_full_match_flag(arg: &str) -> bool {
     if let Some(long) = arg.strip_prefix("--") {
-        // getopt_long accepts any unambiguous prefix, such as `--fu`.
         return !long.is_empty() && "full".starts_with(long);
     }
     let Some(short) = arg.strip_prefix('-') else {
@@ -255,10 +211,6 @@ fn is_full_match_flag(arg: &str) -> bool {
     false
 }
 
-/// `ps` or `pgrep` output that can reach `kill`, as in
-/// `ps aux | grep cargo | xargs kill` or `kill $(ps aux | grep cargo)`.
-/// Extracting PIDs from argv-string matches is the failure mode that motivated
-/// this hook. A `ps -p $PID` check on a captured PID pipes nothing, so it passes.
 fn matches_ps_output_kill(cmd: &str) -> bool {
     contains_word(cmd, "kill")
         && ["ps", "pgrep"]
@@ -266,9 +218,6 @@ fn matches_ps_output_kill(cmd: &str) -> bool {
             .any(|producer| feeds_kill(cmd, producer))
 }
 
-/// True when a `producer` run pipes its output and `kill` follows, or runs
-/// inside a substitution that pipes it, or is a `<(…)` feed. A check after the
-/// kill, as in `kill $PID; ps aux | grep cargo`, does not count.
 fn feeds_kill(cmd: &str, producer: &str) -> bool {
     let mut offset = 0;
     while let Some(pos) = find_word(&cmd[offset..], producer) {
@@ -289,18 +238,14 @@ fn feeds_kill(cmd: &str, producer: &str) -> bool {
     false
 }
 
-/// True when `host` is a command whose `ps` subcommand lists containers.
 fn lists_containers(host: &str) -> bool {
     matches!(host, "docker" | "podman" | "container") || host.ends_with("compose")
 }
 
-/// True when `before` leaves a `(` or backtick open.
 fn inside_substitution(before: &str) -> bool {
     paren_depth(before) > 0 || before.matches('`').count() % 2 == 1
 }
 
-/// How many `(` stay open at the end of `text`. A `)` with nothing open, such
-/// as a `case` arm label, closes nothing.
 fn paren_depth(text: &str) -> usize {
     text.chars().fold(0, |depth, c| match c {
         '(' => depth + 1,
@@ -309,7 +254,6 @@ fn paren_depth(text: &str) -> usize {
     })
 }
 
-/// True when `s` holds a pipe `|` that is not half of a `||`.
 fn has_single_pipe(s: &str) -> bool {
     let bytes = s.as_bytes();
     (0..bytes.len()).any(|i| {
@@ -317,9 +261,6 @@ fn has_single_pipe(s: &str) -> bool {
     })
 }
 
-/// Catches `pkill <…> claude`, `killall <…> claude`, `pgrep <…> claude`,
-/// `kill $(pgrep <…> claude)`. Subshell substitution is covered because the
-/// inner `pgrep` is in the same statement string.
 fn matches_kill_claude(cmd: &str) -> bool {
     for stmt in split_statements(cmd) {
         for tool in &["pkill", "killall", "pgrep"] {
@@ -333,10 +274,6 @@ fn matches_kill_claude(cmd: &str) -> bool {
     false
 }
 
-/// Split on shell statement boundaries: `;`, newline, `&&`, `||`. Naive — does
-/// not respect quotes — which means `echo "pkill claude"` would be blocked.
-/// That false positive is acceptable; the literal almost never appears in real
-/// commands and erring toward block is the safer side.
 fn split_statements(cmd: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -391,19 +328,75 @@ fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn check_standing_deny(command: &str) -> Result<Option<String>, BoxError> {
-    let workspace = crate::workspace::resolve_from_env()?;
+fn check_standing_deny(command: &str) -> Result<Option<String>, String> {
+    use crate::http::ConnectRetry as _;
+    use std::time::{Duration, Instant};
+
+    const RESTART_HINT: &str =
+        "The engine may be restarting. Wait a few seconds and run the command again.";
+    let workspace = crate::workspace::resolve_from_env()
+        .map_err(|_| "could not resolve the engine address".to_string())?;
     let url = format!(
         "{}/api/v1/internal/command-deny-check",
         workspace.base_url()
     );
-    let client = crate::http::client_with_timeout(std::time::Duration::from_secs(5))?;
-    Ok(client
+    let response_timeout = Duration::from_secs(5);
+    let client = crate::http::client_with_timeout(response_timeout)
+        .map_err(|_| "could not initialize the HTTP client".to_string())?;
+    let start = Instant::now();
+    let response = client
         .post(url)
+        .timeout(response_timeout)
         .json(&serde_json::json!({ "command": command }))
-        .send()?
-        .error_for_status()?
-        .json()?)
+        .send_with_connect_retry_within(Duration::from_secs(3))
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!("the engine request timed out. {RESTART_HINT}")
+            } else if error.is_connect() {
+                let cause = crate::http::root_cause(&error.without_url());
+                let cause = if crate::http::contains_engine_token(&cause) {
+                    "connection failed"
+                } else {
+                    &cause
+                };
+                format!(
+                    "could not connect after {:.1}s ({cause}). {RESTART_HINT}",
+                    start.elapsed().as_secs_f64()
+                )
+            } else {
+                "the engine request failed".to_string()
+            }
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.json::<serde_json::Value>().ok();
+        let reason = body
+            .as_ref()
+            .and_then(|body| body.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| {
+                !reason.is_empty()
+                    && reason.len() <= 64
+                    && reason.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+                    })
+                    && !crate::http::contains_engine_token(reason)
+            });
+        return Err(match reason {
+            Some(reason) => format!("engine returned HTTP {status} ({reason})"),
+            None => format!("engine returned HTTP {status}"),
+        });
+    }
+
+    let body = response.bytes().map_err(|error| {
+        if error.is_timeout() {
+            format!("the engine response timed out. {RESTART_HINT}")
+        } else {
+            "could not read the engine response".to_string()
+        }
+    })?;
+    serde_json::from_slice(&body).map_err(|_| "could not parse the engine response".to_string())
 }
 
 pub(crate) fn run() -> Result<u8, BoxError> {
@@ -436,8 +429,10 @@ fn run_hook(claude_code: bool) -> Result<u8, BoxError> {
                 eprintln!("{reason}");
                 return Ok(2);
             }
-            Err(_) => {
-                eprintln!("Refused by the command guard: could not verify standing denies.");
+            Err(reason) => {
+                eprintln!(
+                    "Refused by the command guard: could not verify standing denies: {reason}"
+                );
                 return Ok(2);
             }
         }
@@ -477,9 +472,6 @@ mod tests {
 
     #[test]
     fn blocks_the_2026_05_10_incident_command() {
-        // The exact command from the post-mortem (thread 8548dbd2, 09:35:44 local).
-        // It killed every concurrent CC because `ps … | grep cargo` matches every
-        // claude subprocess's argv (its system prompt, then on argv, named `cargo`).
         let cmd = r#"ps aux | grep -E "rustc|cargo" | grep -v grep | awk '{print $2}' | xargs -r kill 2>&1 | head -5; sleep 2; ps aux | grep -E "rustc.*chromiumoxide" | grep -v grep | wc -l"#;
         assert_blocked(cmd);
     }
@@ -521,7 +513,6 @@ mod tests {
 
     #[test]
     fn blocks_inside_compound_statement() {
-        // Statement separator `;` must not hide the bad sub-command.
         assert_blocked("echo before; pkill claude; echo after");
     }
 
@@ -546,12 +537,9 @@ mod tests {
 
     #[test]
     fn blocks_pkill_full_after_the_pattern() {
-        // procps getopt permutes, so a trailing `-f` still applies.
         assert_blocked("pkill cargo -f");
-        // A separator inside the quoted pattern does not end the arguments.
         assert_blocked("pkill 'cargo|rustc' -f");
         assert_blocked(r"pkill cargo\|rustc -f");
-        // Inside `bash -c "…"` the escaped quotes are real ones.
         assert_blocked(r#"bash -c "pkill \"cargo|rustc\" -f""#);
         assert_blocked(r#"pkill "a\"b|c" -f"#);
         assert_blocked(r#"kill $(pgrep "a;b" -f)"#);
@@ -668,10 +656,7 @@ mod tests {
 
     #[test]
     fn blocks_a_quoted_mention_by_design() {
-        // The guard reads text and errs toward refusing; the message says so.
         assert_blocked(r#"git commit -m "fix: refuse pkill -f""#);
-        // Inside quotes the scan cannot tell where the script ends, so the
-        // later `tail -f` counts as a pkill flag.
         assert_blocked("ssh box 'pkill -x cargo'; tail -f /var/log/app.log");
         let GuardDecision::Block(msg) = decide(r#"rg -n "pkill -f" scripts/"#) else {
             panic!("expected block");
@@ -706,26 +691,22 @@ mod tests {
 
     #[test]
     fn allows_pgrep_full_without_kill() {
-        // Inspecting full command lines is harmless; feeding them to kill is not.
         assert_allowed("pgrep -f cargo");
         assert_allowed("pgrep -fl cargo | head");
     }
 
     #[test]
     fn allows_pkill_option_after_end_of_options() {
-        // After `--`, `-f` is the pattern, not the full-match flag.
         assert_allowed("pkill -x -- -f");
     }
 
     #[test]
     fn allows_pkill_exact_match() {
-        // The recommended replacement — exact name match cannot hit `claude`.
         assert_allowed("pkill -x cargo");
     }
 
     #[test]
     fn allows_pkill_default_name_match() {
-        // Without `-f`, pkill defaults to process-name match, which is safe.
         assert_allowed("pkill cargo");
     }
 
@@ -763,20 +744,16 @@ mod tests {
 
     #[test]
     fn word_boundary_does_not_match_substring() {
-        // `claude` must be a whole word, not part of `proclaude` or similar.
         assert_allowed("pkill myproclaudeapp");
     }
 
     #[test]
     fn word_boundary_ps_does_not_match_helper() {
-        // `helps` contains `ps` but is not the `ps` command.
         assert_allowed("./helps_kill_zombies.sh | xargs kill");
     }
 
     #[test]
     fn ignores_pkill_followed_by_other_target_in_same_statement() {
-        // `pkill foo` then a separate `pkill claude` in next statement is still blocked.
-        // But pkill foo on its own should be allowed.
         assert_allowed("pkill foo");
     }
 

@@ -444,4 +444,32 @@ describe('activating a row', () => {
     expect(handler(node, 'dev', 'onAuxClick')).toBeUndefined();
     expect(handler(node, 'broken', 'onAuxClick')).toBeUndefined();
   });
+
+  it('routes an unhealthy row to the picker, and never to the workspace itself', () => {
+    const data = [ws({ id: 'dev' }), ws({ id: 'broken', health: 'unhealthy', last_error: 'port in use' })];
+    const node = listVNode({ status: 'loaded', data }, { manageHref: MANAGE });
+    expect(rowNode(node, 'broken').props.href).toBe(MANAGE);
+    expect(vnodeToText(rowNode(node, 'broken'))).not.toContain('/broken/');
+  });
+});
+
+describe('the rows that cannot be opened carry a menu role', () => {
+  it('keeps the current and unhealthy rows as disabled menuitems, never role none', () => {
+    const data = [ws({ id: 'dev' }), ws({ id: 'broken', health: 'unhealthy', last_error: 'port in use' })];
+    const node = listVNode({ status: 'loaded', data }, { manageHref: null });
+    for (const id of ['dev', 'broken']) {
+      const props = rowNode(node, id).props;
+      expect(props.role, `row "${id}"`).toBe('menuitem');
+      expect(props['aria-disabled'], `row "${id}"`).toBe('true');
+    }
+  });
+});
+
+describe('an unhealthy row names its fault to assistive tech', () => {
+  it('puts the last error into the row label, not only into a hover tooltip', () => {
+    const data = [ws({ id: 'dev' }), ws({ id: 'broken', health: 'unhealthy', last_error: 'port in use' })];
+    const label = rowNode(listVNode({ status: 'loaded', data }, { manageHref: MANAGE }), 'broken').props['aria-label'] as string;
+    expect(label).toContain('port in use');
+    expect(label).toContain('broken');
+  });
 });

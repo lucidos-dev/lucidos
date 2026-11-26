@@ -4,7 +4,6 @@ use sqlx::{PgPool, Postgres};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Where a change stands, as the `changes.status` column and the wire spell it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChangeStatus {
     Pending,
@@ -12,7 +11,6 @@ pub enum ChangeStatus {
     Applied,
     Discarded,
     Reverted,
-    /// Back to unproposed work, its branch untouched (ADR 0400).
     Withdrawn,
 }
 
@@ -93,27 +91,18 @@ impl sqlx::Encode<'_, Postgres> for ChangeStatus {
     }
 }
 
-/// The temp worktree and branch a Tier-3 conflict resolution merges in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeWorktree {
     pub path: String,
     pub temp_branch: String,
 }
 
-/// The merge commit an apply landed, for revert and diff. Rows applied before
-/// the SHAs were recorded carry neither.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MergeShas {
-    /// `main` before the merge.
     pub pre: Option<String>,
-    /// The merge commit itself.
     pub post: Option<String>,
 }
 
-/// How far the originating thread has got with a pending change.
-///
-/// Not stored: `list_pending_for_readers` fills it from the thread's live
-/// status, and a direct DB load reads it as settled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PendingThreadState {
     unsettled: bool,
@@ -123,7 +112,7 @@ pub struct PendingThreadState {
 }
 
 impl PendingThreadState {
-    /// `conflict_pairing_open` counts only while the thread is unsettled or
+    /// INVARIANT: `conflict_pairing_open` counts only while the thread is unsettled or
     /// settling. A pairing a crash left open on a finished thread must keep
     /// the row's Discard.
     pub fn new(unsettled: bool, settling: bool, conflict_pairing_open: bool) -> Self {
@@ -135,7 +124,6 @@ impl PendingThreadState {
         }
     }
 
-    /// The thread is an app coding-agent thread, which owns its hardening.
     pub fn owning_hardening(self, owns_hardening: bool) -> Self {
         Self {
             owns_hardening,
@@ -143,49 +131,22 @@ impl PendingThreadState {
         }
     }
 
-    /// The thread has not finished with this change, so Apply is withheld.
-    /// Three ways to be unsettled, and applying under any races what the
-    /// session does next (real thread 76b4ee76):
-    ///
-    /// - **mid-turn**, `Running` or `WaitingForUserAnswer`;
-    /// - **parked**, holding a live event wait. It wakes on the delivery and
-    ///   commits on to the same branch (ADR 0106). An active sub-thread does
-    ///   not count: the child writes its own worktree (ADR 0249).
-    /// - **parked on a question**, whatever the status reads. Applying would
-    ///   prompt the agent over the question card (ADR 0293).
-    ///
-    /// The frontend disables Apply for these and the bulk paths filter them
-    /// out; the per-change Apply endpoint 409s via `guard_change_action`.
     pub fn unsettled(self) -> bool {
         self.unsettled
     }
 
-    /// The thread is *settling*: running, paused, or watching an event. A
-    /// *standing apply* then has a settle to wait for.
-    ///
-    /// The half of `unsettled` that can be waited through. A thread parked on
-    /// a question is unsettled too, and arming it drops on the first look
-    /// (`engine::standing_apply`). The panel needs the two apart, or it offers
-    /// a control that ends the moment it is pressed.
     pub fn settling(self) -> bool {
         self.settling
     }
 
-    /// An apply of this change is resolving merge conflicts: its conflict
-    /// pairing is open (`ChangesProjection::conflict_pairing_open`) and its
-    /// thread has not finished. The thread works only to finish this apply,
-    /// so the panel shows the apply in flight and offers no standing apply.
     pub fn resolving_conflict(self) -> bool {
         self.resolving_conflict
     }
 }
 
-/// Whether applying a pending change would hit a merge conflict with `main`
-/// as it stands, from `git merge-tree`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConflictPrediction {
-    /// git could not answer. Never read this as clean.
     #[default]
     Unknown,
     Clean,
@@ -202,32 +163,23 @@ impl From<&crate::core::git::MergeProbe> for ConflictPrediction {
     }
 }
 
-/// What an apply of a pending change faces: when its slow phase began, and
-/// whether it would conflict. Not stored: `list_pending_for_readers` fills it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PendingApplyOutlook {
-    /// When the phase in flight began: an open conflict pairing, or else an
-    /// open hardening. `None` when neither is running.
     pub phase_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub predicted_conflict: ConflictPrediction,
 }
 
-/// A change's status together with the data only that status has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeStatusData {
     Pending {
-        /// Set while a Tier-3 conflict resolution is in progress.
         merge: Option<MergeWorktree>,
         thread: PendingThreadState,
         apply: PendingApplyOutlook,
     },
-    /// Kept for later, out of Review and every bulk path. Apply refuses it
-    /// until it is brought back (ADR 0328).
     SetAside,
     Applied(MergeShas),
     Reverted(MergeShas),
     Discarded,
-    /// Back to unproposed work on its branch (ADR 0400).
     Withdrawn,
 }
 
@@ -244,7 +196,6 @@ impl ChangeStatusData {
     }
 }
 
-/// A change as returned by API queries.
 #[derive(Debug, Clone)]
 pub struct Change {
     pub id: Uuid,
@@ -262,13 +213,7 @@ pub struct Change {
     pub hardened: bool,
     pub thread_title: Option<String>,
     pub commits: Vec<String>,
-    /// The *change summary*, when a model has written one for the current
-    /// commit list. `None` for a single-commit change and until it lands.
     pub summary: Option<String>,
-    /// `true` when nobody saw the work finish: the archive net's set-aside
-    /// rows, set-aside integrated work whose last turn did not finish, and
-    /// rows from before ADR 0400. Bring back withdraws such a row instead of
-    /// making it pending.
     pub incomplete: bool,
 }
 
@@ -288,7 +233,6 @@ impl Change {
         }
     }
 
-    /// The merge commit of an applied or reverted change.
     pub fn merge_shas(&self) -> Option<&MergeShas> {
         match &self.state {
             ChangeStatusData::Applied(shas) | ChangeStatusData::Reverted(shas) => Some(shas),
@@ -303,16 +247,11 @@ impl Change {
         }
     }
 
-    /// Apply would have to harden this change before it merges. App threads
-    /// own their hardening, and a change of plan files alone has none.
     pub fn needs_hardening(&self) -> bool {
         let owns_hardening = self.thread_state().is_some_and(|t| t.owns_hardening);
         !owns_hardening && crate::core::git::needs_hardening(self.hardened, &self.files)
     }
 
-    /// *Apply-ready*: a pending change whose thread has finished and that
-    /// needs no hardening. Exactly the Changes panel's **Ready** section, and
-    /// what Apply All and Discard All act on.
     pub fn apply_ready(&self) -> bool {
         self.thread_state().is_some_and(|t| !t.unsettled()) && !self.needs_hardening()
     }
@@ -325,7 +264,6 @@ impl Change {
     }
 }
 
-/// One `changes` row as stored: every state's columns side by side.
 #[derive(sqlx::FromRow)]
 struct ChangeRow {
     id: Uuid,
@@ -412,8 +350,6 @@ impl<'r> sqlx::FromRow<'r, PgRow> for Change {
     }
 }
 
-/// The wire shape of [`Change`]: flat, with every state's fields present, so
-/// the HTTP API, SSE frames and the `changes` tool keep one byte-stable JSON.
 #[derive(Serialize)]
 struct ChangeWire<'a> {
     id: Uuid,
@@ -486,9 +422,6 @@ impl Serialize for Change {
     }
 }
 
-/// One thread's contribution to the current restart-required toast: the
-/// originating thread's title and the list of commit subjects that will land
-/// once the engine restarts.
 #[derive(Debug, Clone, Serialize)]
 pub struct RestartGroup {
     pub thread_id: Option<Uuid>,
@@ -496,10 +429,6 @@ pub struct RestartGroup {
     pub commits: Vec<String>,
 }
 
-/// Fill `thread_title` on each Change by looking up the originating thread's
-/// title in `thread_summaries`. The in-memory ChangesProjection doesn't track
-/// titles (separate aggregate), so callers that serialize `Change` to JSON
-/// for the UI call this once per response. Single batch query, no N+1.
 pub async fn enrich_thread_titles(
     pool: &PgPool,
     changes: &mut [Change],
@@ -513,30 +442,10 @@ pub async fn enrich_thread_titles(
     .await
 }
 
-/// The two thread statuses in which the coding agent is mid-turn, so Apply must
-/// be withheld (mirrors the `live` clause in `available_thread_actions`).
 const LIVE_THREAD_STATUSES: [&str; 2] = ["running", "waiting_for_user_answer"];
 
-/// The parked half of the same question, mirroring `has_live_event_waits` in
-/// `available_thread_actions`: a thread watching an event is `idle` but will
-/// wake and may commit again (ADR 0106). A running sub-thread does not park
-/// its parent's change (ADR 0249), so `active_children_count` is not read.
 const PARKED_THREAD_SQL: &str = "live_event_wait_count > 0";
 
-/// Of the given thread ids, return the subset that has not finished with its
-/// change: mid-turn, parked on an event wait, or parked on a question. One
-/// batch query. The bulk paths filter their batch with this, so they never
-/// resolve a change whose session is still going. That is the gate the
-/// per-change endpoint enforces via `guard_change_action`.
-///
-/// Its status clauses are the SQL mirror of `available_thread_actions`'s
-/// `live || has_live_event_waits`, and the two must agree. This one drives the
-/// bulk paths, the `thread_unsettled` flag the UI disables its buttons on, and
-/// the per-change guard. That one drives the per-thread actions.
-///
-/// The question clause has no counterpart there. It reads the events, because
-/// a row can read `idle` with its question still open (ADR 0293). Resolving
-/// its change starts a prompt that overtakes the question card.
 pub async fn unsettled_thread_ids(
     pool: &PgPool,
     thread_ids: impl Iterator<Item = Uuid>,
@@ -545,7 +454,7 @@ pub async fn unsettled_thread_ids(
     if ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    // `ts.` is load-bearing: `events` has a `thread_id` column too, so a bare
+    // INVARIANT: `ts.` is load-bearing: `events` has a `thread_id` column too, so a bare
     // name inside the question subquery would bind to the event row.
     let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
         "SELECT ts.thread_id FROM thread_summaries ts \
@@ -561,13 +470,6 @@ pub async fn unsettled_thread_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Every *sub-thread* of each root in `$1`, as `(root_id, thread_id)` rows.
-///
-/// **The one definition of "sub-thread" for changes.** The completion card,
-/// the threads-list count and the `changes` filter all read it, so the three
-/// cannot disagree on what sits below a thread. `UNION` ends the walk on a
-/// corrupt parent cycle, and a reader drops the `thread_id = root_id` row such
-/// a cycle yields.
 const SUB_THREADS_CTE: &str = "WITH RECURSIVE sub_threads(root_id, thread_id) AS ( \
          SELECT t.parent_thread_id, t.thread_id FROM thread_summaries t \
          WHERE t.parent_thread_id = ANY($1) \
@@ -576,7 +478,6 @@ const SUB_THREADS_CTE: &str = "WITH RECURSIVE sub_threads(root_id, thread_id) AS
          JOIN sub_threads s ON t.parent_thread_id = s.thread_id \
      )";
 
-/// Every sub-thread of `root`, at any depth.
 async fn sub_thread_ids(
     pool: &PgPool,
     root: Uuid,
@@ -590,8 +491,6 @@ async fn sub_thread_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// How many pending changes each root's sub-threads hold, at any depth. A
-/// root with none is absent from the map. One query for the whole list.
 pub async fn pending_sub_thread_change_counts(
     pool: &PgPool,
     roots: &[Uuid],
@@ -613,9 +512,6 @@ pub async fn pending_sub_thread_change_counts(
     Ok(rows.into_iter().collect())
 }
 
-/// The pending changes held by `root`'s sub-threads, at any depth, oldest
-/// first. The thread's own changes are not included: a completion card lists
-/// those apart, so the parent can tell whose change is whose.
 pub async fn sub_thread_pending_changes(
     pool: &PgPool,
     root: Uuid,
@@ -646,14 +542,13 @@ pub async fn sub_thread_pending_changes(
         .collect())
 }
 
-/// The statuses whose branch still holds work nobody has merged or thrown away.
 pub const UNRESOLVED_STATUSES: [ChangeStatus; 3] = [
     ChangeStatus::Pending,
     ChangeStatus::SetAside,
     ChangeStatus::Withdrawn,
 ];
 
-/// Every `(repo_root, branch_name)` an unresolved change lives on, once each.
+/// INVARIANT: Every `(repo_root, branch_name)` an unresolved change lives on, once each.
 /// A backup bundles these, so a restore brings the work back.
 pub async fn unresolved_change_branches(
     pool: &PgPool,
@@ -672,7 +567,6 @@ pub async fn unresolved_change_branches(
     .await
 }
 
-/// The status each of `ids` has now. An id with no row is absent. One query.
 pub async fn current_statuses(
     pool: &PgPool,
     ids: &[Uuid],
@@ -688,7 +582,7 @@ pub async fn current_statuses(
     Ok(rows.into_iter().collect())
 }
 
-/// Return the subset of `changes` Apply All and Discard All may act on: the
+/// INVARIANT: Return the subset of `changes` Apply All and Discard All may act on: the
 /// *apply-ready* ones, the Changes panel's Ready section. Acting on the rest in
 /// bulk would merge a branch the coding agent is still working on, or delete
 /// its worktree. A change that needs hardening would start a run nobody
@@ -721,7 +615,6 @@ pub async fn keep_apply_ready_changes(
     Ok(changes.into_iter().filter(Change::apply_ready).collect())
 }
 
-/// The app coding-agent threads among `thread_ids`. One batch query.
 async fn app_thread_ids(
     pool: &PgPool,
     thread_ids: impl Iterator<Item = Uuid>,
@@ -741,7 +634,7 @@ async fn app_thread_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// A pending change with nothing in it: its branch's commits cancelled out, so
+/// INVARIANT: A pending change with nothing in it: its branch's commits cancelled out, so
 /// `reconcile_emptied_pending_change` re-synced the row to zero files.
 ///
 /// Applying one can only push no-op commits onto `main` and — for an unhardened
@@ -757,7 +650,7 @@ pub fn is_empty_pending_change(change: &Change) -> bool {
     change.is_pending() && change.file_count == 0
 }
 
-/// Return the subset of `changes` that Apply All may act on — everything except
+/// INVARIANT: Return the subset of `changes` that Apply All may act on — everything except
 /// the empty pending ones. Discard All deliberately does NOT filter: discarding
 /// is exactly how an empty change is resolved.
 pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
@@ -767,9 +660,6 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Return the subset of `changes` not in `applying`: the ids the landing lane
-/// holds and the ids another apply has claimed. Apply All never re-submits
-/// them (ADR 0463).
 pub fn drop_applying_changes(
     changes: Vec<Change>,
     applying: &std::collections::HashSet<Uuid>,
@@ -780,16 +670,13 @@ pub fn drop_applying_changes(
         .collect()
 }
 
-/// Which pending changes a reader asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingScope {
     All,
-    /// Only changes held by this thread's *sub-threads*, at any depth. The
-    /// thread's own changes are left out, as on a completion card.
     SubThreadsOf(Uuid),
 }
 
-/// The pending changes as every reader must see them: titled, and with the
+/// INVARIANT: The pending changes as every reader must see them: titled, and with the
 /// thread-state flags filled from the thread's live status.
 ///
 /// **The only way a pending list leaves the engine.** The flags are not
@@ -811,8 +698,6 @@ pub async fn list_pending_for_readers(
     Ok(pending)
 }
 
-/// The set-aside changes as every reader sees them: titled, newest first, and
-/// scoped the same way as the pending list.
 pub async fn list_set_aside_for_readers(
     pool: &PgPool,
     proj: &crate::core::changes_projection::ChangesProjection,
@@ -827,7 +712,7 @@ pub async fn list_set_aside_for_readers(
     Ok(set_aside)
 }
 
-/// Fill the [`PendingThreadState`] and [`PendingApplyOutlook`] of each pending
+/// INVARIANT: Fill the [`PendingThreadState`] and [`PendingApplyOutlook`] of each pending
 /// Change. Five batch queries, no N+1, and one cached git probe per change.
 ///
 /// Every query always runs, because `settling` is NOT a subset of
@@ -868,8 +753,6 @@ async fn enrich_pending_state(pool: &PgPool, changes: &mut [Change]) -> Result<(
             conflicts.contains_key(&id),
         )
         .owning_hardening(apps.contains(&tid));
-        // The same rule the phase label follows, so a pairing a crash left open
-        // never lends its start time to a hardening.
         apply.phase_started_at = if thread.resolving_conflict() {
             conflicts.get(&id).copied()
         } else {
@@ -879,17 +762,10 @@ async fn enrich_pending_state(pool: &PgPool, changes: &mut [Change]) -> Result<(
     Ok(())
 }
 
-/// How many merge probes run at once. Each is a short git process.
 const CONFLICT_PROBE_CONCURRENCY: usize = 4;
 
-/// Predict, for each pending change, whether merging it into `main` would
-/// conflict. Probes are cached per pair of tips, so a repeat read runs only
-/// `rev-parse`.
 async fn predict_conflicts(changes: &[Change]) -> HashMap<Uuid, ConflictPrediction> {
     use futures::StreamExt;
-    // Owned values, not `&Change`: a closure over a borrow makes the stream's
-    // future `Send` only for one lifetime, and every awaiting caller then
-    // fails to spawn.
     let targets: Vec<(Uuid, String, String)> = changes
         .iter()
         .filter(|c| c.is_pending())
@@ -909,7 +785,6 @@ async fn predict_conflicts(changes: &[Change]) -> HashMap<Uuid, ConflictPredicti
         .await
 }
 
-/// Same as `enrich_thread_titles` but for `RestartGroup`.
 pub async fn enrich_restart_group_titles(
     pool: &PgPool,
     groups: &mut [RestartGroup],
@@ -962,15 +837,6 @@ async fn fetch_titles_for(
         .collect())
 }
 
-/// A *settling* `thread_summaries` row: one that will settle by itself.
-/// Running, paused, or watching an event without a question card open.
-///
-/// Exactly the thread states `standing_verdict` waits on. Every place that
-/// offers or arms a standing apply reads this. So an arm always has a settle
-/// to wait for, rather than dropping the moment it is set (ADR 0266).
-///
-/// Unqualified, like `LUCIDOS_APPLIES_SQL`, so `thread_summaries` must be the
-/// only source of these columns in the query using it.
 pub static SETTLING_THREAD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "(status IN ({running}, {paused}) \
@@ -983,12 +849,6 @@ pub static SETTLING_THREAD_SQL: std::sync::LazyLock<String> = std::sync::LazyLoc
     )
 });
 
-/// Of the given threads, the *settling* ones, so a standing apply on them has
-/// a settle to wait for.
-///
-/// `PendingThreadState::settling` is filled from this. It stops the Changes panel
-/// offering an arm on a thread parked on a question, which would drop the
-/// moment it was pressed.
 pub async fn settling_thread_ids(
     pool: &sqlx::PgPool,
     thread_ids: impl Iterator<Item = Uuid>,
@@ -1008,15 +868,10 @@ pub async fn settling_thread_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// The event that opens a hardening. It carries no change id, so a hardening
-/// is timed per thread.
 pub const HARDENING_START: &str = "MissingHardeningDetected";
-/// The events that end a hardening, the first counting as success.
 pub const HARDENING_ENDS: &str =
     "'ChangeHardened','ChangeApplied','ChangeApplyFailed','ChangeDiscarded','MissingHardeningDetected','MergeConflictDetected'";
 
-/// When each thread's open hardening began: its latest hardening-related
-/// event is the start, with no end after it. One batch query.
 pub async fn open_hardening_starts(
     pool: &PgPool,
     thread_ids: &[Uuid],
@@ -1088,8 +943,6 @@ mod tests {
         change.thread_state().is_some_and(|t| t.unsettled())
     }
 
-    /// *Apply-ready* is the Ready section: a settled thread and nothing to
-    /// harden. A plan has nothing to harden, and an app thread owns its own.
     #[test]
     fn apply_ready_needs_a_settled_thread_and_nothing_to_harden() {
         let with = |hardened: bool, files: &[&str], thread: PendingThreadState| Change {
@@ -1142,10 +995,6 @@ mod tests {
         .expect("insert thread_summary with status");
     }
 
-    /// `enrich_pending_state` flags a pending change whose thread is mid-turn
-    /// (`running` / `waiting_for_user_answer`), leaves idle-thread changes
-    /// false, and never flags an already-applied change (its thread state no
-    /// longer gates Apply).
     #[tokio::test]
     async fn enrich_pending_state_flags_only_live_pending() {
         let (pool, db) = setup_test_db().await;
@@ -1190,10 +1039,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A parked thread is `idle`. The status list alone would let its change
-    /// through Apply All, and leave the button live in the Changes view. A live
-    /// event wait counts (ADR 0106). An active sub-thread does not (ADR 0249),
-    /// matching `available_thread_actions`.
     #[tokio::test]
     async fn only_a_live_event_wait_parks_an_idle_threads_change() {
         let (pool, db) = setup_test_db().await;
@@ -1234,8 +1079,6 @@ mod tests {
             "a settled idle thread still allows apply"
         );
 
-        // The bulk paths read the same predicate, so Apply All drops the
-        // watching one and keeps the delegating parent and the settled one.
         let kept = keep_apply_ready_changes(&pool, changes)
             .await
             .expect("filter");
@@ -1245,10 +1088,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A `paused` coding-agent thread is settling but not unsettled, so
-    /// `settling` must be set even when nothing in the batch is
-    /// unsettled. Otherwise the Changes panel hides the standing-apply control
-    /// that `available_thread_actions` offers for the same thread.
     #[tokio::test]
     async fn a_paused_thread_is_settling_even_when_nothing_is_unsettled() {
         let (pool, db) = setup_test_db().await;
@@ -1274,8 +1113,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A coding-agent thread watching an event is both: Apply is withheld
-    /// (ADR 0106), and a standing apply waits the wait out (ADR 0266).
     #[tokio::test]
     async fn a_thread_watching_an_event_is_unsettled_and_settling() {
         let (pool, db) = setup_test_db().await;
@@ -1325,13 +1162,10 @@ mod tests {
         .expect("insert event");
     }
 
-    /// The row carries when its slow phase began, so a reloaded page keeps
-    /// the elapsed time. A repo git cannot read predicts nothing.
     #[tokio::test]
     async fn a_pending_change_reports_when_its_slow_phase_began() {
         let (pool, db) = setup_test_db().await;
         let (conflicting, hardening, idle) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        // A conflict resolution runs on a live thread; see the stale case below.
         insert_thread_summary_with_status(&pool, conflicting, "running").await;
         let mut changes = vec![
             make_change(Some(conflicting)),
@@ -1400,8 +1234,6 @@ mod tests {
             );
         }
 
-        // Once the thread has finished, the row no longer reads as resolving,
-        // so a pairing a crash left open lends it no start time.
         sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE thread_id = $1")
             .bind(conflicting)
             .execute(&pool)
@@ -1427,9 +1259,6 @@ mod tests {
             .expect("mark it a coding-agent thread");
     }
 
-    /// `enrich_thread_titles` populates `thread_title` from `thread_summaries`
-    /// in a single batch query, leaves `None` for changes whose thread has no
-    /// title (or no thread_id), and is a no-op when called with no changes.
     #[tokio::test]
     async fn enrich_thread_titles_populates_from_summaries() {
         let (pool, db) = setup_test_db().await;
@@ -1437,7 +1266,6 @@ mod tests {
         let with_title = Uuid::new_v4();
         let no_title = Uuid::new_v4();
         insert_thread_summary(&pool, with_title, "Refactor auth").await;
-        // no_title thread is intentionally never inserted
 
         let mut changes = vec![
             make_change(Some(with_title)),
@@ -1456,7 +1284,6 @@ mod tests {
         );
         assert_eq!(changes[2].thread_title, None, "no thread_id stays None");
 
-        // Empty input is a no-op (and doesn't issue any query)
         let mut empty: Vec<Change> = vec![];
         enrich_thread_titles(&pool, &mut empty)
             .await
@@ -1465,9 +1292,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Apply All must not do what the per-change Apply button refuses. A
-    /// pending change reconciled to zero files (its branch's commits cancelled
-    /// out) is dropped from the batch; everything else survives.
     #[test]
     fn drop_empty_changes_removes_only_empty_pending_rows() {
         let mut normal = make_change(None);
@@ -1476,8 +1300,6 @@ mod tests {
         let mut emptied = make_change(None);
         emptied.file_count = 0;
 
-        // An `applied` row legitimately reads zero files in old data, and
-        // re-applying it must stay the idempotent Noop rather than a refusal.
         let mut applied_zero = make_change(None);
         applied_zero.file_count = 0;
         applied_zero.state = ChangeStatusData::Applied(MergeShas::default());
@@ -1488,8 +1310,6 @@ mod tests {
         assert_eq!(kept_ids, vec![normal_id, applied_id]);
     }
 
-    /// Apply All never re-submits a change the lane holds or another apply
-    /// has claimed.
     #[test]
     fn drop_applying_changes_removes_only_the_named_ids() {
         let (a, b, c) = (make_change(None), make_change(None), make_change(None));
@@ -1575,7 +1395,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The column decodes into the enum and binds back as the same text.
     #[tokio::test]
     async fn every_change_status_round_trips_through_postgres() {
         let (pool, db) = setup_test_db().await;
@@ -1592,8 +1411,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A status the engine never writes fails the load, rather than reading
-    /// as some plausible default.
     #[tokio::test]
     async fn a_row_with_an_unknown_status_fails_to_load() {
         let (pool, db) = setup_test_db().await;
@@ -1607,8 +1424,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// `MergeWorktree` holds both columns or neither, so the row boundary
-    /// refuses a path without its temp branch.
     #[tokio::test]
     async fn half_a_merge_worktree_is_rejected_at_the_boundary() {
         let (pool, db) = setup_test_db().await;
@@ -1660,8 +1475,6 @@ mod tests {
     const IDS: &str = r#""id":"00000000-0000-0000-0000-000000000001","request_id":"00000000-0000-0000-0000-000000000002","thread_id":"00000000-0000-0000-0000-000000000003""#;
     const HEAD: &str = r#""branch_name":"b","repo_root":"/repo","description":"d","file_count":1,"files":["a.rs"],"requires_restart":false"#;
 
-    /// The wire keeps every state's fields, in the order the flat struct
-    /// had, so the API, SSE frames and the `changes` tool stay byte-stable.
     #[test]
     fn a_pending_change_serializes_to_the_flat_wire_shape() {
         let change = fixed_change(ChangeStatusData::Pending {

@@ -220,8 +220,8 @@ its manual retry's state.
 ## The client-update surface
 
 `syncClientUpdateFromBuild` compares the running bundle's `CLIENT_BUILD_ID`
-with the served `sw.js` `BUILD_ID`. The engine serves only a client compatible
-with itself, so a difference means a compatible newer client is served. The
+with the build ID stamped into the HTML shell for the current route. A
+difference means a reload can pick up a different client. The
 badge shows while stale. The toast shows when stale and not dismissed, and the
 two decouple only on dismiss. The doc comment on `syncClientUpdateFromBuild`
 holds the full rule.

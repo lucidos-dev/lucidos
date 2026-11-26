@@ -1,17 +1,5 @@
-//! Fixture-tree tests for the install scan.
-//!
-//! Every case builds a throwaway `$HOME` and points [`ScanRoots::under`] at it,
-//! so nothing here reads the machine it runs on. That matters twice over: the
-//! developer running these has a real `.app` in `/Applications` and a real dev
-//! gateway in `~/.lucidos`, and either would otherwise leak into a count.
-//!
-//! The load-bearing pair is `a_checkout_beside_the_app_is_not_a_conflict` and
-//! `an_instance_and_the_app_on_one_port_conflict`. Together they are the whole
-//! discriminator: coexistence stays silent, contention speaks.
-
 use super::*;
 
-/// A throwaway `$HOME`, removed when the test ends.
 struct Fixture {
     home: PathBuf,
     _tmp: tempfile::TempDir,
@@ -20,8 +8,6 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        // macOS puts the temp dir behind a symlink, so an un-canonicalised root
-        // makes every `starts_with` on a resolved exe path miss.
         let home = std::fs::canonicalize(tmp.path()).unwrap();
         Fixture { home, _tmp: tmp }
     }
@@ -43,7 +29,6 @@ impl Fixture {
         path
     }
 
-    /// A bundle in `~/Applications`, at `version` unless `version` is empty.
     fn bundle(&self, version: &str) -> PathBuf {
         let bundle = self.dir("Applications/Lucidos.app/Contents/Resources");
         if !version.is_empty() {
@@ -55,12 +40,10 @@ impl Fixture {
         bundle.parent().unwrap().parent().unwrap().to_path_buf()
     }
 
-    /// A registered installer instance on `port`.
     fn instance(&self, slug: &str, port: u16) {
         self.file(&format!(".lucidos/{slug}/port"), &format!("{port}\n"));
     }
 
-    /// The shared runtime, with `current` pointing at it.
     fn runtime(&self, stem: &str) -> PathBuf {
         let dir = self.dir(&format!(".lucidos/runtime/{stem}"));
         #[cfg(unix)]
@@ -68,12 +51,10 @@ impl Fixture {
         dir
     }
 
-    /// The dev gateway's machine-global data dir.
     fn dev_gateway(&self) {
         self.dir(".lucidos/private/gateway");
     }
 
-    /// A checkout, identified by the marker the whole tree resolves it from.
     fn checkout(&self, name: &str, release: &str) -> PathBuf {
         let repo = self.dir(&format!("code/{name}"));
         self.file(&format!("code/{name}/scripts/web-dev.sh"), "#!/bin/bash\n");
@@ -95,8 +76,6 @@ fn info_plist(version: &str) -> String {
 fn kinds(inv: &Inventory) -> Vec<InstallKind> {
     inv.installs.iter().map(|i| i.kind).collect()
 }
-
-// ── enumeration ─────────────────────────────────────────────────────────────
 
 #[test]
 fn a_lone_desktop_app_is_listed_with_its_version_and_no_conflict() {
@@ -133,8 +112,6 @@ fn all_three_vehicles_are_enumerated_together() {
             InstallKind::SourceCheckout,
         ]
     );
-    // The instance's version is the SHARED runtime's, which is the binary it
-    // actually runs. This is the number the incident's user never saw.
     let instance = &inv.installs[1];
     assert_eq!(instance.version.as_deref(), Some("0.26.2"));
     assert_eq!(instance.port, Some(5253));
@@ -143,7 +120,6 @@ fn all_three_vehicles_are_enumerated_together() {
 #[test]
 fn a_reserved_directory_is_never_read_as_an_instance() {
     let fx = Fixture::new();
-    // The dev gateway's own dir, and a stray marker inside the shared runtime.
     fx.file(".lucidos/private/gateway/port", "5251\n");
     fx.file(".lucidos/runtime/port", "5252\n");
     fx.file(".lucidos/logs/port", "5252\n");
@@ -181,8 +157,6 @@ fn an_instance_is_found_under_a_non_default_prefix_and_names_it() {
         found.removal
     );
 }
-
-// ── the discriminator ───────────────────────────────────────────────────────
 
 #[test]
 fn a_checkout_beside_the_app_is_not_a_conflict() {
@@ -226,8 +200,6 @@ fn a_conflict_fingerprint_ignores_everything_but_its_own_port() {
     fx.instance("default", DEFAULT_GATEWAY_PORT);
     let before = scan(&fx.roots(), &RunningProcess::default()).conflicts[0].fingerprint();
 
-    // A quiet third install arrives on its own port, and then a SECOND
-    // conflict on a port this one knows nothing about.
     fx.dev_gateway();
     fx.instance("alpha", 5300);
     fx.instance("beta", 5300);
@@ -251,8 +223,6 @@ fn a_conflict_fingerprint_ignores_everything_but_its_own_port() {
         "a different port is a different thing to say"
     );
 }
-
-// ── which one is running ────────────────────────────────────────────────────
 
 #[test]
 fn the_data_dir_separates_two_instances_off_one_runtime() {
@@ -309,8 +279,6 @@ fn a_checkout_nobody_runs_is_still_reported_without_its_path() {
     assert!(!checkout.running_here);
 }
 
-// ── readers ─────────────────────────────────────────────────────────────────
-
 #[test]
 fn a_bundle_with_no_readable_plist_reports_no_version() {
     let fx = Fixture::new();
@@ -359,7 +327,6 @@ fn runtime_stem_version_splits_at_the_first_dash_after_the_prefix() {
         runtime_stem_version("lucidos-0.26.2-x86_64-unknown-linux-gnu").as_deref(),
         Some("0.26.2")
     );
-    // Not a stem at all, or a stem with no triple, or a version that is not one.
     assert_eq!(runtime_stem_version("current"), None);
     assert_eq!(runtime_stem_version("lucidos-1.2.3"), None);
     assert_eq!(
@@ -421,8 +388,6 @@ fn an_unreadable_port_marker_leaves_the_port_unknown() {
     );
 }
 
-// ── launch agents ───────────────────────────────────────────────────────────
-
 #[test]
 fn every_job_that_can_start_an_install_is_named() {
     let fx = Fixture::new();
@@ -453,12 +418,8 @@ fn every_job_that_can_start_an_install_is_named() {
     assert_eq!(instance.agents[1].manager, AgentManager::Systemd);
 }
 
-// ── the report an uninstaller prints ────────────────────────────────────────
-
 #[test]
 fn a_second_bundle_the_uninstaller_does_not_trash_is_a_leftover() {
-    // The app's uninstall trashes the RUNNING bundle and nothing else, which is
-    // why the report takes a predicate rather than a kind.
     let fx = Fixture::new();
     let running = fx.bundle("1.2.3");
     let other = fx.dir("Applications2/Lucidos.app/Contents");
@@ -530,13 +491,6 @@ fn a_removal_command_quotes_a_slug_that_needs_it() {
     assert!(installer_removal(odd, "a b", default).contains("--prefix '/opt/lucidos prefix'"));
 }
 
-// ── the safety property ─────────────────────────────────────────────────────
-
-/// The scan must never run a discovered binary and never write.
-///
-/// This code runs at client startup against well-known paths, so executing what
-/// it finds would be a privilege hazard. A source scan is the right shape here:
-/// no runtime test can prove the absence of a call on an untaken branch.
 #[test]
 fn no_execute_and_no_write() {
     let source = include_str!("lib.rs");
@@ -559,15 +513,6 @@ fn no_execute_and_no_write() {
     }
 }
 
-// ── the diagnostic ──────────────────────────────────────────────────────────
-
-/// Print what THIS machine carries. Ignored by default, since the answer is a
-/// property of the machine rather than of the code.
-///
-/// Run it with `cargo test -p lucidos-installs -- --ignored --nocapture`. It
-/// is the first question a support conversation asks. Unlike the control-plane
-/// route it needs no running gateway, and the machines that hit this are
-/// exactly the ones whose gateway is ten releases old.
 #[test]
 #[ignore = "describes the machine it runs on, not the code"]
 fn describe_this_machine() {

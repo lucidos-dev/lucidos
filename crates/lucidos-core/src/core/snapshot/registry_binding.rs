@@ -1,4 +1,3 @@
-//! Read-only binding of offline restore to the gateway's authoritative registry.
 use super::{service::OfflineRestoreRequest, BoxError};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -18,7 +17,7 @@ struct Workspace {
     dir: PathBuf,
 }
 
-/// Read only the local gateway registry. Legacy database URLs are migration
+/// INVARIANT: Read only the local gateway registry. Legacy database URLs are migration
 /// sources, never the identity of a shared-cluster database.
 pub fn resolve(
     app_data: &Path,
@@ -39,8 +38,6 @@ fn resolve_inner(
     restore_id: Uuid,
 ) -> Result<OfflineRestoreRequest, BoxError> {
     let expected = lucidos_gateway_constants::workspace_database_name(gateway_slug)?;
-    // PostgreSQL truncates identifiers beyond this boundary. Never restore a
-    // legacy overlong slug into a database that might belong to another slug.
     if expected.len() > lucidos_pg_url::PG_MAX_IDENTIFIER_BYTES
         || crate::core::secret_store::boot::database_name(database_url)? != expected
     {
@@ -132,8 +129,6 @@ mod tests {
         let alias = app.join("alias");
         std::os::unix::fs::symlink(&workspace, &alias).unwrap();
         assert!(resolve(&alias, "postgres://localhost/lucidos_demo", "demo").is_ok());
-        // A formerly valid registry id may exceed PostgreSQL's identifier
-        // length. Even its exact URL cannot authorize a truncated database.
         let long_slug = "a".repeat(64);
         write(serde_json::json!([{
             "id": long_slug, "name": "Legacy", "dir": workspace

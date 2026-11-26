@@ -124,6 +124,15 @@ describe('a menu row that OPENS something is handed the trigger', () => {
   });
 });
 
+describe('a disabled menu row stays focusable, so arrow keys can reach it', () => {
+  it('marks it aria-disabled, never with the disabled attribute, and gives it no press', () => {
+    const row = propsOf(renderMenuAction(spec({ disabledTooltip: 'nope' }), ctx));
+    expect(row['aria-disabled']).toBe('true');
+    expect(row.disabled).toBeUndefined();
+    expect(row.onClick).toBeUndefined();
+  });
+});
+
 describe('a custom row rendering is handed the same attributes', () => {
   it('receives the cluster attrs and the data-role together', () => {
     let seen: Record<string, string> | null = null;

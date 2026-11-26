@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
-/// A resolver that answers from a script of outcomes and counts its calls.
 #[derive(Default)]
 pub struct ScriptedResolver {
     outcomes: Mutex<VecDeque<Result<String, ResolveFailure>>>,
@@ -148,8 +147,6 @@ async fn clearing_the_cache_asks_again() {
     assert_eq!(cache.resolve(&inner, &reference()).await.unwrap(), "v2");
 }
 
-/// A resolver that clears the cache while it reads, as a service account
-/// removed mid-resolve does.
 #[cfg(test)]
 struct ClearingResolver<'a> {
     cache: &'a ReferenceCache,

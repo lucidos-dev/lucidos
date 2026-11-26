@@ -38,3 +38,4 @@ crates/lucidos-core/src/llm/tool_names.rs	literal	pub const EXECUTE_INTENT: &str
 crates/lucidos-core/src/llm/tools/tests.rs	literal	contains\(&tn::EXECUTE_INTENT	The test asserts the retired tool is not offered.
 crates/lucidos-engine/src/engine/tool_arguments.rs	literal	tn::EXECUTE_INTENT => Err	The retired tool is refused by name (ADR 0534).
 crates/lucidos-engine/src/migration_tests.rs	literal	let old = "command_guard_coding_agents";	The migration test names the stored key it renames (ADR 0644).
+crates/lucidos-app/src/store/store.ts	literal	\['appearance:agent-brand-colours',	An old Settings deep link still reaches the renamed row through RETIRED_SETTINGS_ANCHORS.

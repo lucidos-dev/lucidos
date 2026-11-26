@@ -13,8 +13,6 @@ fn secondary_without_base() -> AppLintRule {
     }
 }
 
-// ── Which files the lint reads ────────────────────────────────────────────
-
 #[test]
 fn only_app_html_css_and_js_files_are_linted() {
     let ungated = "a:hover { color: red; }";
@@ -35,8 +33,6 @@ fn a_clean_file_and_a_non_app_path_get_no_note() {
         None
     );
 }
-
-// ── ungated-hover ─────────────────────────────────────────────────────────
 
 #[test]
 fn an_ungated_hover_is_found_on_its_line() {
@@ -112,8 +108,6 @@ fn a_style_block_inside_an_html_comment_is_ignored() {
     assert!(rules("apps/demo/index.html", html).is_empty());
 }
 
-// ── action-btn-as-state ───────────────────────────────────────────────────
-
 #[test]
 fn a_classlist_toggle_of_the_secondary_variant_is_found() {
     let js = "for (const b of buttons) {\n  b.classList.toggle('action-btn-secondary', b.dataset.sort !== sort);\n}\n";
@@ -187,8 +181,6 @@ fn a_swap_in_a_comment_is_ignored() {
     assert!(rules("apps/demo/app.js", js).is_empty());
 }
 
-// ── action-btn-variant-without-base ───────────────────────────────────────
-
 #[test]
 fn a_lone_variant_in_markup_is_found() {
     let html = "<div>\n  <button class=\"action-btn-secondary\">Cancel</button>\n  <button class='action-btn-danger'>Delete</button>\n</div>\n";
@@ -237,8 +229,6 @@ fn a_class_selector_in_css_is_not_a_class_list() {
     let css = ".action-btn-secondary { margin: 0; }\n";
     assert!(rules("apps/demo/a.css", css).is_empty());
 }
-
-// ── The note ──────────────────────────────────────────────────────────────
 
 #[test]
 fn the_note_names_the_path_each_line_and_its_fix() {

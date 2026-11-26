@@ -20,9 +20,12 @@ import {
   abandonTrashStaging,
   freezeEmptyTrash,
   confirmEmptyTrash,
+  finishTrashDelete,
 } from './control';
 import { slugifyWorkspaceName } from '../../utils/slug';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
+import { installXhrOverFetch, uninstallXhrOverFetch } from './__tests__/xhrOverFetch';
+import { fakeTusServer } from './__tests__/fakeTusServer';
 
 
 const originalFetch = globalThis.fetch;
@@ -33,7 +36,10 @@ function withFetch(impl: () => Promise<Response>): ReturnType<typeof vi.fn> {
   return mock;
 }
 
+beforeEach(() => installXhrOverFetch());
+
 afterEach(() => {
+  uninstallXhrOverFetch();
   globalThis.fetch = originalFetch;
   localStorage.removeItem(DEVICE_ID_KEY);
   vi.restoreAllMocks();
@@ -72,6 +78,32 @@ describe('control client', () => {
       expect(mock.mock.calls[i][1].method).toBe('POST');
       expect(headersOf(mock, i)['x-lucidos-device-id']).toBe('paired-device');
     }
+  });
+
+  it('re-sends a long cleanup action while the gateway answers pending', async () => {
+    const receipt = { results: [{ id: 'sample', status: 'deleted', detail: null }] };
+    const pending = () => Response.json({ pending: true }, { status: 202 });
+    const mock = withFetch(() => Promise.resolve(Response.json(receipt)));
+    mock.mockResolvedValueOnce(pending()).mockResolvedValueOnce(pending());
+    expect(await confirmCleanup('batch-test', 'Delete Sample')).toEqual(receipt);
+    expect(mock).toHaveBeenCalledTimes(3);
+    for (const call of mock.mock.calls) {
+      expect(call[0]).toBe('/~/api/v1/control/cleanup/batches/batch-test/confirm');
+      expect(JSON.parse(call[1].body)).toEqual({ confirm: 'Delete Sample' });
+    }
+  });
+
+  it('finishes an interrupted delete and names a refusal', async () => {
+    const mock = withFetch(() => Promise.resolve(Response.json({ pending: true }, { status: 202 })));
+    mock.mockResolvedValueOnce(Response.json({ pending: true }, { status: 202 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(Response.json({ error: 'nothing was dropped' }, { status: 409 }));
+    await finishTrashDelete('workspace-example');
+    expect(mock.mock.calls.map((call) => call[0])).toEqual([
+      '/~/api/v1/control/trash/workspace-example/finish-delete',
+      '/~/api/v1/control/trash/workspace-example/finish-delete',
+    ]);
+    await expect(finishTrashDelete('workspace-example')).rejects.toThrow('nothing was dropped');
   });
 
   it('uses paired-device POSTs for Trash actions and escapes resource identities', async () => {
@@ -132,15 +164,16 @@ describe('control client', () => {
     expect(ws.id).toBe('dev');
   });
 
-  it('restores via multipart POST to the sigil restore route', async () => {
-    const mock = withFetch(() =>
-      Promise.resolve(new Response('{"id":"myws","name":"myws"}', { status: 200 })),
-    );
-    const file = new File([new Uint8Array([1, 2, 3])], 'lucidos-backup-myws-20260601-040254.enc');
-    const started = await restoreBackup(file, 'a-key', 'myws');
-    expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces/restore');
-    expect(mock.mock.calls[0][1]?.method).toBe('POST');
-    expect(mock.mock.calls[0][1]?.body).toBeInstanceOf(FormData);
+  it('restores by uploading to the sigil upload route, then committing by session', async () => {
+    const server = fakeTusServer();
+    globalThis.fetch = server.fetch;
+    const file = new File([new Uint8Array([1, 2, 3])], 'lucidos-backup-myws-20260601-040254.age');
+    const started = await restoreBackup({ file, key: 'a-key', name: 'myws' });
+    expect(server.requests.map((r) => `${r.method} ${r.url.replace(/\/0+\d*$/, '/:id')}`)).toEqual([
+      'POST /~/api/v1/control/restore-uploads',
+      'PATCH /~/api/v1/control/restore-uploads/:id',
+      'POST /~/api/v1/control/workspaces/restore',
+    ]);
     expect(started.id).toBe('myws');
   });
 
@@ -206,15 +239,17 @@ describe('control client', () => {
   });
 
   it('surfaces a 409 collision as an Error carrying the server message', async () => {
-    withFetch(() =>
-      Promise.resolve(
-        new Response('{"error":"A workspace named \\"myws\\" already exists — choose a different name."}', {
+    const server = fakeTusServer();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/workspaces/restore')) {
+        return new Response('{"error":"A workspace named \\"myws\\" already exists — choose a different name."}', {
           status: 409,
-        }),
-      ),
-    );
-    const file = new File([new Uint8Array([1])], 'lucidos-backup-myws-20260601-040254.enc');
-    await expect(restoreBackup(file, 'a-key')).rejects.toThrow(/already exists/);
+        });
+      }
+      return server.fetch(input, init);
+    }) as typeof fetch;
+    const file = new File([new Uint8Array([1])], 'lucidos-backup-myws-20260601-040254.age');
+    await expect(restoreBackup({ file, key: 'a-key', name: '' })).rejects.toThrow(/already exists/);
   });
 });
 
@@ -231,6 +266,9 @@ describe('restore name helpers', () => {
   it('parseWorkspaceNameFromArchive extracts the name or returns null', () => {
     expect(parseWorkspaceNameFromArchive('lucidos-backup-myws-20260601-040254.enc')).toBe('myws');
     expect(parseWorkspaceNameFromArchive('lucidos-backup-e2e-test-20260601-040254.enc')).toBe('e2e-test');
+    expect(parseWorkspaceNameFromArchive('lucidos-backup-e2e-test-20260601-040254-o012345abcdef.age')).toBe('e2e-test');
+    expect(parseWorkspaceNameFromArchive('lucidos-backup-e2e-test-20260601-040254-o012345abcdef.enc')).toBe('e2e-test');
+    expect(parseWorkspaceNameFromArchive('lucidos-backup-e2e-test-20260601-040254-o012345ABCDEF.age')).toBeNull();
     expect(parseWorkspaceNameFromArchive('random.enc')).toBeNull();
     expect(parseWorkspaceNameFromArchive('lucidos-backup-myws.enc')).toBeNull();
     expect(parseWorkspaceNameFromArchive('lucidos-backup-myws-20260601.enc')).toBeNull();

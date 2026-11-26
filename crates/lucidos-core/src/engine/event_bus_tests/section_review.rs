@@ -9,7 +9,6 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Create parent as a Chat thread
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
@@ -43,7 +42,6 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
             .unwrap();
     assert_eq!(status, "inbox");
 
-    // Spawn child thread with parent_thread_id
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
@@ -69,7 +67,6 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
     .await
     .unwrap();
 
-    // Spawning a child is not a section-transitioning event; parent stays put.
     let status: String =
         sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
@@ -90,7 +87,6 @@ async fn test_section_inbox_on_child_complete() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    // Create parent as Chat thread
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
@@ -116,7 +112,6 @@ async fn test_section_inbox_on_child_complete() {
     .await
     .unwrap();
 
-    // Spawn non-CC child
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
@@ -142,8 +137,6 @@ async fn test_section_inbox_on_child_complete() {
     .await
     .unwrap();
 
-    // A running child bumps active_children_count but doesn't transition the
-    // parent's section; parent surfaces in Active via has_active_children.
     let status: String =
         sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
@@ -152,7 +145,6 @@ async fn test_section_inbox_on_child_complete() {
             .unwrap();
     assert_eq!(status, "inbox");
 
-    // Child completes — notify_parent_if_child marks parent as 'inbox'
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ResponseGenerated {
@@ -166,7 +158,6 @@ async fn test_section_inbox_on_child_complete() {
     .await
     .unwrap();
 
-    // Verify parent is now 'inbox' (child completion surfaces parent to inbox via callback)
     let status: String =
         sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(parent_id)
@@ -178,9 +169,6 @@ async fn test_section_inbox_on_child_complete() {
         "parent should be 'inbox' after child completes"
     );
 
-    // The child keeps the inbox state it ran with. Archiving it here would
-    // write a value no event produced, and the drawer would then dim the row
-    // as if the user had archived it.
     let child_status: String =
         sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(child_id)
@@ -192,8 +180,6 @@ async fn test_section_inbox_on_child_complete() {
         "a finished chat sub-thread must not be archived by the contract layer"
     );
 
-    // The projection has to be derivable from the events, so assert the
-    // absence directly: no archive event exists to justify an archived row.
     let archive_events: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE aggregate_id = $1::text AND event_type = 'ThreadArchived'",
     )
@@ -217,7 +203,6 @@ async fn test_section_marked_read() {
 
     let thread_id = Uuid::new_v4();
 
-    // Create a regular chat thread (not scheduled task)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -243,7 +228,6 @@ async fn test_section_marked_read() {
     .await
     .unwrap();
 
-    // Complete it — chat threads become 'inbox' on ResponseGenerated
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -265,7 +249,6 @@ async fn test_section_marked_read() {
             .unwrap();
     assert_eq!(status, "inbox", "thread should be 'inbox' after completion");
 
-    // Archive the thread
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadArchived,
@@ -296,7 +279,6 @@ async fn trigger_threads_skip_review() {
 
     let thread_id = Uuid::new_v4();
 
-    // Create thread on the trigger channel
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
@@ -320,7 +302,6 @@ async fn trigger_threads_skip_review() {
     .await
     .unwrap();
 
-    // Complete it — scheduled tasks should NOT go to 'inbox' (no user watching)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -351,9 +332,6 @@ async fn trigger_threads_skip_review() {
 
 #[tokio::test]
 async fn trigger_with_go_to_review_surfaces_first_response_in_review() {
-    // Triggers opted into REVIEW (e.g. daily summaries the user is meant to read)
-    // override the unattended-execution skip so even the first automated
-    // ResponseGenerated lands in REVIEW, not ARCHIVE.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -419,7 +397,6 @@ async fn trigger_followup_response_goes_to_review() {
 
     let thread_id = Uuid::new_v4();
 
-    // Step 1: Scheduled trigger creates the thread
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
@@ -443,7 +420,6 @@ async fn trigger_followup_response_goes_to_review() {
     .await
     .unwrap();
 
-    // Step 2: Scheduled task completes — stays in default (archive)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -468,7 +444,6 @@ async fn trigger_followup_response_goes_to_review() {
         "initial scheduled task response should stay in archive"
     );
 
-    // Step 3: User sends a followup message on this thread
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -491,7 +466,6 @@ async fn trigger_followup_response_goes_to_review() {
     .await
     .unwrap();
 
-    // Step 4: LLM responds to the followup — should go to review (inbox)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -522,14 +496,6 @@ async fn trigger_followup_response_goes_to_review() {
 
 #[tokio::test]
 async fn engine_message_received_does_not_promote_trigger_thread_to_review() {
-    // Regression: an event-fired trigger without `go_to_review: true` surfaced
-    // in REVIEW because the engine emitted a `MessageReceived` (mode=engine)
-    // carrying the triggering-event payload right after `TriggerStarted`. The
-    // section-routing check (`event_bus_projection.rs`) compared the latest
-    // start event without filtering by mode, so the engine-driven message
-    // counted as a user follow-up. Only `mode=human` MessageReceived events
-    // count as user follow-ups; engine/agent messages must not promote the
-    // thread out of ARCHIVE.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -617,9 +583,6 @@ async fn engine_message_received_does_not_promote_trigger_thread_to_review() {
 
 #[test]
 fn message_received_destructures_parent_thread_id() {
-    // Verify that MessageReceived with parent_thread_id is correctly
-    // destructured in the projection match arm (compile-time check)
-    // and that the field is accessible for SQL binding.
     let parent_id = Uuid::new_v4();
     let thread_id = Uuid::new_v4();
 
@@ -639,7 +602,6 @@ fn message_received_destructures_parent_thread_id() {
         origin: None,
     };
 
-    // Verify destructuring matches the projection handler pattern
     if let ThreadEvent::MessageReceived {
         text,
         parent_thread_id,
@@ -652,7 +614,6 @@ fn message_received_destructures_parent_thread_id() {
         panic!("Expected MessageReceived");
     }
 
-    // Verify SSE JSON includes parent_thread_id when present
     let emitted = EmittedEvent {
         event_id: Uuid::new_v4(),
         seq: Some(1),
@@ -672,7 +633,6 @@ fn message_received_destructures_parent_thread_id() {
         parent_id.to_string()
     );
 
-    // Verify None parent_thread_id doesn't appear in SSE JSON
     let event_no_parent = ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,

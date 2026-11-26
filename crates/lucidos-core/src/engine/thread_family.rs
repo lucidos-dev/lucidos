@@ -1,16 +1,8 @@
-//! A *thread family*: a thread, the thread it reports to or continues, and
-//! so on back to the first one, its *family root*.
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// How far [`family_root`] climbs. A real family is a handful of links deep;
-/// the cap only stops a corrupted cycle.
 const MAX_FAMILY_LINKS: i32 = 64;
 
-/// The first thread of `thread_id`'s family, following `parent_thread_id`
-/// and then `successor_of`. A child successor has both, and both lead to the
-/// same root. A thread with no summary row yet is its own root.
 pub async fn family_root(pool: &PgPool, thread_id: Uuid) -> Result<Uuid, sqlx::Error> {
     let root: Option<Uuid> = sqlx::query_scalar(
         "WITH RECURSIVE up(thread_id, next_id, links) AS ( \

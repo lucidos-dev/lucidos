@@ -1,4 +1,4 @@
-//! `navigate_ui`: which device a navigate reaches, and what the agent is told.
+//! INVARIANT: `navigate_ui`: which device a navigate reaches, and what the agent is told.
 //!
 //! `GET /api/v1/events` broadcasts `NavigationRequested` to every connected
 //! page, and a page drops one whose device actor is not its own
@@ -14,19 +14,13 @@ use crate::engine::thread_events::{device_actor, EventMeta, MessageOrigin, Threa
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// A device's name, the way Settings → Devices shows it.
 async fn device_label(pool: &PgPool, device_id: &str) -> String {
     crate::core::DeviceStore::friendly_name(pool, device_id).await
 }
 
-/// Which device a navigate or a capture goes to, and why there. The result
-/// text is built from this.
 pub(super) enum Recipient {
-    /// The agent named the device.
     Chosen { id: String, label: String },
-    /// The last used device, the default.
     LastUsed { id: String, label: String },
-    /// No device in this turn: every page showing the thread handles it.
     EveryDevice,
 }
 
@@ -38,12 +32,10 @@ impl Recipient {
         }
     }
 
-    /// The device as the event actor, which is what routes the request.
     pub(super) fn actor(&self) -> Option<MessageOrigin> {
         self.device_id().map(device_actor)
     }
 
-    /// The device's name and how it was picked, for the agent to relay.
     pub(super) fn described(&self) -> Option<String> {
         match self {
             Recipient::Chosen { label, .. } => Some(format!("\"{label}\", the device you named")),
@@ -55,18 +47,11 @@ impl Recipient {
     }
 }
 
-/// Settle the `device` argument of `navigate_ui` or `capture_app` into who
-/// receives the request.
-///
-/// An explicit id must be a registered device. An unknown one would be
-/// dropped by every page with nobody told, so it is refused here instead.
 pub(super) async fn recipient(
     pool: &PgPool,
     args: &serde_json::Value,
     last_used: Option<&str>,
 ) -> Result<Recipient, String> {
-    // A blank string is a model filling every optional field, so it reads as
-    // omitted rather than costing a retry.
     let chosen = match args.get("device") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(id)) => Some(id.trim()).filter(|id| !id.is_empty()),
@@ -96,7 +81,7 @@ pub(super) async fn recipient(
     })
 }
 
-/// Emit one `NavigationRequested` scoped to `actor`. The one emitter of that
+/// INVARIANT: Emit one `NavigationRequested` scoped to `actor`. The one emitter of that
 /// event from a tool call. The OAuth authorization page is a persisted
 /// `OAuthAuthorizationRequested` instead, since a flow waits on it.
 pub(crate) async fn emit_navigation(
@@ -117,7 +102,6 @@ pub(crate) async fn emit_navigation(
     .map_err(|e| format!("failed to emit NavigationRequested: {e}"))
 }
 
-/// The `navigate_ui` tool. `last_used` is the turn's last used device.
 pub(crate) async fn navigate_ui_impl(
     bus: &EventBus,
     pool: &PgPool,
@@ -139,9 +123,6 @@ pub(crate) async fn navigate_ui_impl(
     {
         return Err("Error: url is required when target is 'url'".to_string());
     }
-    // Same guard the notification tap takes, and for the same reason: the
-    // page dereferences this id with no way to ask what was meant. `current`
-    // resolves to the calling thread, and the resolved value rides the event.
     let mut payload = args.clone();
     crate::api::resolve_thread_id_in_nav_payload(&mut payload, Some(thread_id))
         .map_err(|e| format!("Error: {e}"))?;
@@ -176,9 +157,6 @@ pub(crate) async fn navigate_ui_impl(
     Ok(out)
 }
 
-/// A warning when a `new-chat` `folder` names no registered repository and no
-/// installed app. The navigate still goes out, and the page leaves that
-/// dropdown at its default. The agent learns here, so it can correct itself.
 async fn new_chat_folder_note(
     pool: &PgPool,
     apps: &AppManager,
@@ -220,9 +198,6 @@ async fn new_chat_folder_note(
     ))
 }
 
-/// The first line of every result: what was sent, to whom, and that sent is
-/// not opened. The agent relays this, so it must name a place the user can
-/// look, and must not promise the screen changed.
 fn sent_line(what: &str, who: &Recipient) -> String {
     let to = match who.described() {
         Some(device) => format!("to {device}"),
@@ -237,8 +212,6 @@ fn sent_line(what: &str, who: &Recipient) -> String {
     )
 }
 
-/// The target device as the Known devices list sees it. A failed lookup is
-/// unknown, so it yields `None` and the result says nothing about presence.
 pub(super) async fn device_presence(pool: &PgPool, device_id: &str) -> Option<SeenDevice> {
     match crate::core::DeviceStore::seen(pool, device_id).await {
         Ok(seen) => seen,
@@ -271,13 +244,10 @@ pub(super) fn presence_note(presence: Option<&SeenDevice>, payload: &serde_json:
     )
 }
 
-/// Where a URL lands is the client's decision (`openUrl`), so the agent must
-/// not name one surface. A browser can also refuse it as a blocked popup.
 const URL_NOTE: &str = " It opens wherever they configured links to open (the in-app \
      browser panel, their system browser, or a new tab), so call it their browser. A \
      browser can refuse it as a blocked popup, and then the client offers an Open button.";
 
-/// A short name for the destination, for the sent line.
 fn describe_target(target: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
     match target {
@@ -297,8 +267,6 @@ fn describe_target(target: &str, args: &serde_json::Value) -> String {
     }
 }
 
-/// What a page offers, for the few pages whose contents the agent keeps
-/// getting wrong. Appended after the sent line.
 fn page_guide(target: &str, args: &serde_json::Value) -> Option<&'static str> {
     if target != "settings" {
         return None;
@@ -329,10 +297,6 @@ const MODELS_SETTINGS_GUIDE: &str = "Settings → Models shows:\n\
      it for them instead, use set_preference(key='chat_model'); to add a model to the \
      picker, use manage_models.";
 
-/// A guide describing a screen is a promise about that screen. This one once
-/// advertised a cloud-backup list and an in-app Restore button (both gone) and
-/// implied the page connects the provider account. Settings → Accounts owns
-/// that. `backup_guide_names_the_accounts_page_and_not_a_restore_ui` pins it.
 pub(super) const BACKUP_SETTINGS_GUIDE: &str = "Settings → System → Backup shows:\n\
      - A health card: last run outcome, last cloud backup + age, staleness warning\n\
      - The provider dropdown (Google Drive / Dropbox), and a red line linking to \

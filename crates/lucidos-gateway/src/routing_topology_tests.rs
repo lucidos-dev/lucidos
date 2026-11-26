@@ -1,5 +1,3 @@
-//! Real engines and real CLI children in a private HOME and database. The
-//! production gateway spawn, stamp, socket and operation handlers do every hop.
 use super::*;
 use serde_json::{json, Value};
 use snapshot_roundtrip_tests::fixture_client_builder;
@@ -262,10 +260,6 @@ async fn decode(response: reqwest::Response) -> Result<Value, BoxError> {
     Ok(serde_json::from_str(&text)?)
 }
 
-/// The fake agent transports the CLI's JSON through JavaScript once. Preserve
-/// stable key/value while allowing a floating estimate's final binary digit to
-/// change in that extra JSON parse/stringify round trip. Liveness observation
-/// timestamps and ages advance between the two reads; their types remain checked.
 fn same_reply(actual: &Value, expected: &Value, path: &str) -> Result<(), BoxError> {
     match (actual, expected) {
         (Value::Object(a), Value::Object(b)) if a.len() == b.len() => {
@@ -321,7 +315,6 @@ async fn node(
     suffix: &str,
     token: &str,
 ) -> Result<Node, BoxError> {
-    // The CA must exist before the client below reads its public copy.
     let loopback = loopback_tls()?;
     let fixture = home.join(format!("gateway-{suffix}"));
     std::fs::create_dir_all(&fixture)?;
@@ -436,7 +429,7 @@ fn pair(a: &Node, b: &Node, name: &str) -> Result<crate::remote_gateways::Remote
     use crate::gateway_protocol::GatewayRedemption;
     let secret = b.state.paired_gateways().mint_secret(
         Some("Routing gateway".into()),
-        false,
+        Default::default(),
         crate::pairing::Minter::PairedDevice,
     )?;
     let GatewayRedemption::Paired {
@@ -450,8 +443,6 @@ fn pair(a: &Node, b: &Node, name: &str) -> Result<crate::remote_gateways::Remote
     else {
         return Err("fixture pairing refused".into());
     };
-    // A pairing starts at Deny. The topology exercises routed starts, so its
-    // owner allows them, as the setting's card would.
     b.state
         .paired_gateways()
         .set_remote_starts(
@@ -813,7 +804,6 @@ async fn restart_routing_process(
     thread: &str,
     source: &str,
 ) -> Result<(), BoxError> {
-    // Re-establish only this fixture's pairings after the revocation matrix.
     a.state.remote_gateways().remove("c")?;
     pair(a, c, "c")?;
     a.state.remote_gateways().remove("b")?;
@@ -874,7 +864,6 @@ async fn restart_routing_process(
         &c.get(&format!("/threads/{thread}/messages")).await?,
         "before routing restart",
     )?;
-    // Hold an otherwise-valid authoritative receipt across A's process change.
     a.stop().await?;
     let held = issue()?;
     a.handle.shutdown();

@@ -1,5 +1,3 @@
-//! Trusted pairing: A serves B's own client at A's origin, never a B worker,
-//! and falls back to A's shell with a notice when it cannot.
 use super::*;
 use lucidos_gateway_stamp::workspace_client::PEER_SERVED_CLIENT;
 
@@ -7,8 +5,6 @@ const B_SHELL: &str =
     "<!doctype html><html><head></head><body data-peer-client>B's own client</body></html>";
 const B_ASSET: &str = "/* B's own client code */";
 
-/// B's engine: its own shell, an asset that tries to set origin state, a
-/// worker script, a redirecting asset, and a miss for A's own bundle. `shell_fails` makes the shell a 500.
 fn peer_engine(
     shell_fails: bool,
 ) -> impl FnOnce(Seen, tokio::sync::oneshot::Receiver<()>) -> axum::Router {
@@ -137,7 +133,6 @@ async fn a_fallback_shell_loads_as_own_assets_that_b_lacks() {
     assert_eq!(body_bytes(response).await, b"/* A's build */");
 }
 
-/// Gateway B as a build from before `peer-served-client`.
 fn without_peer_served_client(router: axum::Router) -> axum::Router {
     router.layer(axum::middleware::from_fn(
         |req: Request, next: axum::middleware::Next| async move {
@@ -185,7 +180,6 @@ async fn trusted_pairing_falls_back_to_as_shell_when_b_lacks_the_capability() {
     );
 }
 
-/// The client reads these metas by name, in files the gateway cannot import.
 #[test]
 fn the_client_reads_the_metas_the_gateway_stamps() {
     let sdk = include_str!("../../../packages/lucidos-sdk/src/_peerScope.ts");

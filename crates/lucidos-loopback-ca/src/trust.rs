@@ -1,15 +1,3 @@
-//! Trusting the loopback CA in the user's own certificate store.
-//!
-//! - **macOS**: the login keychain, user trust domain, through `security`.
-//!   WKWebView, Safari and Chrome read it. Never the admin domain (`-d`) or
-//!   the System keychain.
-//! - **Linux**: the NSS user database (`~/.pki/nssdb`), which Chrome reads,
-//!   the snap Chromium's database and each Firefox profile, through
-//!   `certutil`. Never `/etc`.
-//!
-//! Status comes from the store's own tool, never from a guess. Each call runs
-//! once: nothing here loops or retries.
-
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,17 +7,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{CaDir, COMMON_NAME};
 
-/// Where the cure for a missing `certutil` points, per distribution family.
 pub const CERTUTIL_MISSING: &str = "certutil is not installed, so Lucidos cannot trust its local \
      certificate. Install it (Debian and Ubuntu: libnss3-tools; Fedora: nss-tools; Arch: nss), \
      then run `lucidos tls trust`.";
 
-/// The command that trusts the CA, named in every failure.
 const TRY_AGAIN: &str = "Run `lucidos tls trust` to try again.";
 
-/// Firefox profile roots under `$HOME`: the plain install (the classic path
-/// and the XDG one newer releases use), the snap and the flatpak. Each holds a
-/// `profiles.ini` naming its profiles.
 const FIREFOX_ROOTS: [&str; 4] = [
     ".mozilla/firefox",
     ".config/mozilla/firefox",
@@ -37,11 +20,8 @@ const FIREFOX_ROOTS: [&str; 4] = [
     ".var/app/org.mozilla.firefox/.mozilla/firefox",
 ];
 
-/// The NSS user database under `$HOME`.
 const NSS_USER_DB: &str = ".pki/nssdb";
 
-/// The snap Chromium's own NSS database under `$HOME`, which Ubuntu installs
-/// by default. The snap cannot read the user database.
 const SNAP_CHROMIUM_DB: &str = "snap/chromium/current/.pki/nssdb";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,17 +40,13 @@ impl Platform {
     }
 }
 
-/// Whether this user's browsers and webviews trust the loopback CA.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TrustStatus {
     Trusted,
-    /// Not trusted yet; says which store lacks it.
     Untrusted(String),
-    /// The store's tool could not answer; says how to fix that.
     Unavailable(String),
 }
 
-/// One command, as data, so a test can read every argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Argv {
     pub program: &'static str,
@@ -86,12 +62,10 @@ impl Argv {
     }
 }
 
-/// Runs an [`Argv`]. The seam a test replaces.
 pub trait Run {
     fn run(&self, argv: &Argv) -> io::Result<Output>;
 }
 
-/// Runs commands for real.
 pub struct System;
 
 impl Run for System {
@@ -102,14 +76,12 @@ impl Run for System {
     }
 }
 
-/// The stores to act on: the platform and the user's home.
 pub struct Stores {
     pub platform: Platform,
     pub home: PathBuf,
 }
 
 impl Stores {
-    /// This machine's platform and `$HOME`.
     pub fn current() -> io::Result<Stores> {
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
@@ -121,7 +93,6 @@ impl Stores {
     }
 }
 
-/// Whether the user's stores trust the CA in `ca`.
 pub fn status(ca: &CaDir) -> TrustStatus {
     match Stores::current() {
         Ok(stores) => status_with(&System, &stores, ca),
@@ -129,15 +100,10 @@ pub fn status(ca: &CaDir) -> TrustStatus {
     }
 }
 
-/// Trust the CA in `ca` in the user's stores. On macOS this shows the
-/// system's password prompt.
 pub fn trust(ca: &CaDir) -> io::Result<()> {
     trust_with(&System, &Stores::current()?, ca)
 }
 
-/// Trust the CA in `ca`. On macOS it skips a CA the keychain already trusts, so
-/// a re-run install shows no second password prompt. Linux always re-adds it:
-/// its status sees only that the CA is present, not its trust flags.
 pub fn ensure_trusted(ca: &CaDir) -> io::Result<()> {
     ensure_trusted_with(&System, &Stores::current()?, ca)
 }
@@ -150,16 +116,10 @@ pub fn ensure_trusted_with(run: &dyn Run, stores: &Stores, ca: &CaDir) -> io::Re
     trust_with(run, stores, ca)
 }
 
-/// Remove the CA in `ca` from the user's stores, for an uninstall.
 pub fn untrust(ca: &CaDir) -> io::Result<()> {
     untrust_with(&System, &Stores::current()?, ca)
 }
 
-/// Remove the CA's trust, then the CA and its public copy, for an uninstall.
-/// False when there was no CA to forget.
-///
-/// The CA is per user, so another install for this user loses it too. Its
-/// gateway mints a fresh one at its next start and asks for trust again.
 pub fn forget(ca: &CaDir) -> io::Result<bool> {
     forget_with(&System, &Stores::current()?, ca)
 }
@@ -237,8 +197,6 @@ pub fn trust_with(run: &dyn Run, stores: &Stores, ca: &CaDir) -> io::Result<()> 
                 succeed(run, &linux::create(&user_db), "certutil")?;
             }
             for db in linux::databases(&stores.home) {
-                // Replaces an older CA under the same nickname. Absent is the
-                // usual case, and the add below reports any real failure.
                 let _ = run.run(&linux::delete(&db));
                 succeed(run, &linux::add(&db, &ca.cert_path()), "certutil")?;
             }
@@ -247,19 +205,13 @@ pub fn trust_with(run: &dyn Run, stores: &Stores, ca: &CaDir) -> io::Result<()> 
     }
 }
 
-/// Removes only what is there, so a CA the user never trusted, or trusted in
-/// some stores only, still uninstalls cleanly.
 pub fn untrust_with(run: &dyn Run, stores: &Stores, ca: &CaDir) -> io::Result<()> {
     match stores.platform {
         Platform::MacOs => {
-            // The private certificate stands in when the public copy is gone,
-            // so an uninstall still finds what the keychain holds.
             let pem = ca
                 .read_certificate()
                 .or_else(|_| lucidos_local_token::loopback_cert::read_at(&ca.cert_path()))?;
             let keychain = macos::login_keychain(run)?;
-            // Removing a trust setting that never existed fails. Only a CA
-            // still trusted afterwards makes that failure real.
             if let Err(e) = succeed(run, &macos::remove_trust(&ca.cert_path()), "security") {
                 let still_trusted = run
                     .run(&macos::verify(&ca.cert_path()))
@@ -288,7 +240,6 @@ pub fn untrust_with(run: &dyn Run, stores: &Stores, ca: &CaDir) -> io::Result<()
     }
 }
 
-/// Run `argv`, failing only when `tool` itself cannot start.
 fn run_tool(run: &dyn Run, argv: &Argv, tool: &str) -> io::Result<Output> {
     run.run(argv).map_err(|e| {
         if tool == "certutil" && e.kind() == io::ErrorKind::NotFound {
@@ -299,7 +250,6 @@ fn run_tool(run: &dyn Run, argv: &Argv, tool: &str) -> io::Result<Output> {
     })
 }
 
-/// Run `argv` and fail, naming the tool and its own words, unless it succeeds.
 fn succeed(run: &dyn Run, argv: &Argv, tool: &str) -> io::Result<()> {
     let out = run_tool(run, argv, tool)?;
     if out.status.success() {
@@ -316,14 +266,11 @@ fn succeed(run: &dyn Run, argv: &Argv, tool: &str) -> io::Result<()> {
     )))
 }
 
-/// Whether a PEM listing holds the certificate `pem`, whatever its wrapping.
 fn holds(listing: &[u8], pem: &str) -> bool {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     squash(&String::from_utf8_lossy(listing)).contains(&squash(pem))
 }
 
-/// The SHA-256 fingerprint of the certificate `pem`, uppercase hex, as
-/// `security delete-certificate -Z` takes it.
 fn fingerprint(pem: &str) -> io::Result<String> {
     use rustls::pki_types::{pem::PemObject, CertificateDer};
     let der = CertificateDer::from_pem_slice(pem.as_bytes())
@@ -337,8 +284,6 @@ fn fingerprint(pem: &str) -> io::Result<String> {
 mod macos {
     use super::*;
 
-    /// Exit 0 when the keychain trusts the CA. `-l` because the leaf checked
-    /// is itself a CA, `-L` to stay offline.
     pub fn verify(ca: &Path) -> Argv {
         Argv::new(
             "security",
@@ -357,7 +302,6 @@ mod macos {
         Argv::new("security", ["login-keychain"])
     }
 
-    /// No `-d`: the user trust domain, set with the user's own password.
     pub fn add(ca: &Path, keychain: &Path) -> Argv {
         Argv::new(
             "security",
@@ -391,8 +335,6 @@ mod macos {
         )
     }
 
-    /// Lists every certificate under the CA's name in `keychain`, with its
-    /// SHA-256 hash. Exits non-zero when there is none.
     pub fn find(keychain: &Path) -> Argv {
         Argv::new(
             "security",
@@ -407,13 +349,11 @@ mod macos {
         )
     }
 
-    /// Whether `keychain` holds the certificate with SHA-256 `sha256`.
     pub fn holds(run: &dyn Run, keychain: &Path, sha256: &str) -> io::Result<bool> {
         let out = run_tool(run, &find(keychain), "security")?;
         Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(sha256))
     }
 
-    /// The login keychain, as `security` names it.
     pub fn login_keychain(run: &dyn Run) -> io::Result<PathBuf> {
         let argv = ask_login_keychain();
         let out = run
@@ -436,9 +376,6 @@ mod macos {
 mod linux {
     use super::*;
 
-    /// Every NSS database this user's browsers read that exists: the user
-    /// database, the snap Chromium's, then each Firefox profile
-    /// `profiles.ini` names.
     pub fn databases(home: &Path) -> Vec<PathBuf> {
         let mut dbs: Vec<PathBuf> = [home.join(NSS_USER_DB), home.join(SNAP_CHROMIUM_DB)]
             .into_iter()
@@ -453,7 +390,6 @@ mod linux {
         dbs
     }
 
-    /// The profile directories a Firefox `profiles.ini` under `root` names.
     pub fn firefox_profiles(root: &Path) -> Vec<PathBuf> {
         let Ok(ini) = std::fs::read_to_string(root.join("profiles.ini")) else {
             return Vec::new();
@@ -524,7 +460,6 @@ mod linux {
         )
     }
 
-    /// `C,,`: trusted to issue server certificates, nothing else.
     pub fn add(db: &Path, ca: &Path) -> Argv {
         Argv::new(
             "certutil",

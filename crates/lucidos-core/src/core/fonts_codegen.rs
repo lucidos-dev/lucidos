@@ -1,5 +1,3 @@
-//! The font catalog, rendered for the SDK and the shell's `@font-face` rules.
-
 use super::*;
 use crate::core::codegen::{quoted, REGENERATE};
 
@@ -19,8 +17,6 @@ fn group_name(group: FontGroup) -> &'static str {
     }
 }
 
-/// The SDK's view of the catalog. Only what a client needs: no bytes, no
-/// license, no face list.
 pub fn render_ts() -> String {
     let mut out = String::new();
     out.push_str("// AUTO-GENERATED. Do not edit by hand.\n");
@@ -104,7 +100,6 @@ pub fn render_ts() -> String {
     out
 }
 
-/// The host's `@font-face` rules. Vite hashes each file into `assets/`.
 pub fn render_css() -> String {
     let mut out = String::new();
     out.push_str("/* AUTO-GENERATED. Do not edit by hand.\n");

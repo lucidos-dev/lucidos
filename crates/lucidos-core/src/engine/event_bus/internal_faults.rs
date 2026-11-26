@@ -2,7 +2,7 @@ use super::*;
 use crate::internal_faults::FaultKind;
 
 impl EventBus {
-    /// Stable ids make an inbox replay after commit/exit harmless, including
+    /// INVARIANT: Stable ids make an inbox replay after commit/exit harmless, including
     /// when a report was sent between the commit and the acknowledgement.
     pub(crate) async fn emit_internal_fault(
         &self,
@@ -21,7 +21,7 @@ impl EventBus {
         trigger: Option<String>,
     ) -> Result<Option<EmitResult>, Box<dyn std::error::Error + Send + Sync>> {
         let mut append = self.begin_append().await?;
-        // All fault kinds and the report boundary share this transaction lock,
+        // INVARIANT: All fault kinds and the report boundary share this transaction lock,
         // across buses and process restarts. No in-memory counter is authority.
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(0x6469_6167_6661_756c_i64)

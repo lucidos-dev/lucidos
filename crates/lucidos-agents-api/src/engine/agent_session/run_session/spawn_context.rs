@@ -17,12 +17,6 @@ use crate::engine::LucidosEngine;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-/// Resolved worktree / branch / system-prompt context for a `run_direct_agent`
-/// spawn. Produced by [`LucidosEngine::resolve_run_worktree_context`], the
-/// "start" lifecycle stage extracted from the driver: it picks recovery vs
-/// conflict vs normal mode, creates/reuses the isolated worktree, links
-/// node_modules, writes the workspace marker, and builds the system prompt
-/// and the session context block (ADR 0491).
 pub(super) struct SpawnWorktreeContext {
     pub(super) cwd: PathBuf,
     pub(super) system_prompt: String,
@@ -30,12 +24,8 @@ pub(super) struct SpawnWorktreeContext {
     pub(super) branch_name: String,
     pub(super) worktree_path: Option<PathBuf>,
     pub(super) interactive_session: bool,
-    /// Tells the agent which branch its worktree is on, when that is not the
-    /// tracked one it expects.
     pub(super) branch_note: Option<String>,
     pub(super) resume_session_id: Option<String>,
-    /// True when the recorded branch was gone and no rename of it was proven,
-    /// which is why this session starts fresh.
     pub(super) branch_gone: bool,
     pub(super) worktree_created: bool,
     pub(super) branch_created: bool,
@@ -43,11 +33,6 @@ pub(super) struct SpawnWorktreeContext {
 
 #[easy_ext::ext(SpawnContextExt)]
 pub(crate) impl LucidosEngine {
-    /// Resolves which worktree + branch this spawn runs in, returning the
-    /// [`SpawnWorktreeContext`] whose `*_created` flags the failure-path cleanup
-    /// depends on. The parameter list mirrors the caller's already-destructured
-    /// spawn request one-to-one — bundling it into a struct here would only move
-    /// the same fields, so the arity lint is allowed rather than worked around.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_run_worktree_context(
         &self,
@@ -59,9 +44,6 @@ pub(crate) impl LucidosEngine {
         is_app_spawn: bool,
         is_external_repo: bool,
         external_repo_name: Option<String>,
-        // The registered repository's name, for the `repo-<name>` branch scope.
-        // `None` for an app spawn (apps aren't in the registry) and for an
-        // unregistered Lucidos source checkout.
         repo_name: Option<String>,
         workspace_name: &str,
         repo_root: &std::path::Path,
@@ -72,15 +54,10 @@ pub(crate) impl LucidosEngine {
         mut resume_session_id: Option<String>,
         thread_id: Uuid,
         cc_start: std::time::Instant,
-        // Backend already resolved by `run_direct_agent` (stored value beats
-        // the request) — threaded through so `append_backend_rules` can pick
-        // the Codex teaching section without re-querying thread_summaries.
         coding_agent: crate::runtime::CodingAgent,
     ) -> Result<SpawnWorktreeContext, Box<dyn std::error::Error + Send + Sync>> {
         let mut branch_note: Option<String> = None;
         let mut branch_gone = false;
-        // An external repo's base ref, for the session context. Known only
-        // when this spawn resolved where a new worktree branches from.
         let mut base_ref: Option<String> = None;
         let (
             cwd,
@@ -91,7 +68,6 @@ pub(crate) impl LucidosEngine {
             worktree_created,
             branch_created,
         ) = if let Some((wt_path, branch)) = recovery_worktree {
-            // Recovery mode: reuse an orphaned worktree from a previous session
             log_legacy!(
                 "[AgentSession] Starting recovery session on orphaned worktree: {} (branch {})",
                 wt_path.display(),
@@ -106,8 +82,6 @@ pub(crate) impl LucidosEngine {
             } else {
                 recovery_system_prompt(workspace_name)
             };
-            // Reused worktree + branch — nothing here is ours to delete on
-            // a failed spawn.
             (
                 wt_path.clone(),
                 system_prompt,
@@ -118,8 +92,6 @@ pub(crate) impl LucidosEngine {
                 false,
             )
         } else if let Some(duty) = lane_duty {
-            // Lane mode: the lane thread resolves its batch on the integration
-            // branch. The lane owns the worktree and its cleanup.
             duty.ensure_worktree(repo_root, self.workspace_path())
                 .await
                 .map_err(|e| format!("The lane worktree could not be prepared: {e}"))?;
@@ -134,13 +106,12 @@ pub(crate) impl LucidosEngine {
                 false,
             )
         } else if let Some(ref change) = conflict_change {
-            // Conflict mode: run in the merge worktree where the merge is in progress
             let merge = change
                 .merge_worktree()
                 .ok_or("Conflict change has no merge worktree. Was the merge started?")?;
             let cwd = PathBuf::from(&merge.path);
             let system_prompt = conflict_resolution_system_prompt().to_string();
-            // The merge worktree + temp branch belong to the in-progress
+            // INVARIANT: The merge worktree + temp branch belong to the in-progress
             // merge, not to this spawn — keep them on failure.
             (
                 cwd.clone(),
@@ -163,7 +134,7 @@ pub(crate) impl LucidosEngine {
                     repo_name.unwrap_or_else(|| BranchScope::LUCIDOS_REPO.to_string()),
                 ),
             };
-            // Kept alive past the resolution: the create below re-derives
+            // INVARIANT: Kept alive past the resolution: the create below re-derives
             // through it when a concurrent spawn takes the allocated name.
             let fresh = FreshBranch {
                 repo_root,
@@ -198,14 +169,6 @@ pub(crate) impl LucidosEngine {
                 );
             }
 
-            // Phase 6.1: Resolve a persistent per-thread worktree path via
-            // the central resolver, which checks (in order):
-            //   1. The most recent `CodingAgentIdled` event's payload
-            //   2. `git worktree list` filtered to the reused branch
-            //   3. New deterministic `thread-<short>` path
-            //
-            // The caller-supplied path (set on resume routes) overrides the
-            // resolver — its existence was already validated upstream.
             let resolved_path = if let Some(ref p) = caller_worktree {
                 p.clone()
             } else {
@@ -258,7 +221,7 @@ pub(crate) impl LucidosEngine {
                     {
                         Ok(()) => branch_name,
                         Err(mismatch) => {
-                            // A branch that provably continues the tracked one
+                            // INVARIANT: A branch that provably continues the tracked one
                             // (e.g. the agent's own `git checkout -b feature-1234`)
                             // keeps the session. An external repo adopts it, as a
                             // skill's ticket branch. An internal thread resumes on
@@ -332,10 +295,6 @@ pub(crate) impl LucidosEngine {
                         }
                     }
                 } else {
-                    // The recorded branch is gone. An external repo's own
-                    // workflow may have renamed it with `git branch -m`: a
-                    // proven rename keeps the session, as in the mismatch
-                    // arm above. A refusal starts fresh, never refuses.
                     let recovered = match gone {
                         Some(gone) if is_external_repo => {
                             recover_renamed_branch(repo_root, existing, gone, idle_anchor).await
@@ -382,24 +341,6 @@ pub(crate) impl LucidosEngine {
                 None => resolve_worktree_base(repo_root, is_external_repo).await,
             };
 
-            // Create worktree if we're not reusing an existing one. A *stranded*
-            // directory may still occupy the target path — present on disk but
-            // not a live linked worktree (`existing_worktree` is None above):
-            // e.g. a Tier-0 cleanup that raced this resume, or a half-finished
-            // prior `git worktree add`. `git worktree add` would then fail with
-            // "already exists", and worse, leaving it in place is what let a
-            // resumed session run against the enclosing data repo. Clear the
-            // dead residue first so the spawn self-heals. This is safe precisely
-            // because `is_live_worktree_at` proved there is no live git state to
-            // lose — a worktree with real uncommitted work resolves as live and
-            // is reused upstream, never reaching here. Confined to the workspace
-            // worktrees dir as a blast-radius guard. (The inverse residue — git
-            // has the path registered but the directory is GONE — is auto-healed
-            // inside `worktree_add` via `git worktree prune`.)
-            // Git-truth from the sparse app helper: did it `-b`-create the
-            // branch, or adopt an existing one? Feeds `branch_created` below
-            // so failure cleanup can never delete a branch this spawn merely
-            // reused. `None` = the app create path didn't run.
             let mut app_branch_created: Option<bool> = None;
             if existing_worktree.is_none() {
                 if wt_path.exists()
@@ -444,10 +385,6 @@ pub(crate) impl LucidosEngine {
                         }
                     }
                 } else {
-                    // Resuming gets one attempt: the branch is this thread's
-                    // own, so a failure is never a name race. A fresh branch
-                    // lets the create decide the name, retrying past a sibling
-                    // spawn that took the allocated one first.
                     let created = if reusing_branch {
                         match worktree_add(repo_root, &wt_path, &[branch_name.as_str()]).await {
                             Ok(o) if o.status.success() => Ok(branch_name.clone()),
@@ -493,7 +430,7 @@ pub(crate) impl LucidosEngine {
                             .into());
                         }
                     }
-                } // end non-app spawn branch
+                }
             }
 
             log_legacy!(
@@ -501,19 +438,6 @@ pub(crate) impl LucidosEngine {
                 cc_start.elapsed()
             );
 
-            // Belt-and-suspenders: the agent's cwd MUST exist before we spawn
-            // it. The branches above create a missing worktree
-            // (`existing_worktree` is None) or reuse a validated live one — but
-            // if the directory is STILL absent here (a reclaim or external
-            // removal that beat `is_live_worktree_at`, e.g. an auto-recovery
-            // resume firing right as the worktree was cleaned out from under a
-            // signal-killed session), spawning hands the agent a missing cwd
-            // and it dies with a cryptic `Path "<dir>" does not exist`
-            // ResponseFailed instead of recovering. Recreate from the branch
-            // one more time so the resume self-heals; only fail — with an
-            // actionable message — if even that cannot produce the directory.
-            // A stale git registration at that path is pruned by `worktree_add`
-            // itself, so there is nothing to clear first.
             if !wt_path.exists() {
                 log_legacy!(
                     "[AgentSession] worktree {} still missing after setup — recreating from branch {} before spawn",
@@ -553,8 +477,6 @@ pub(crate) impl LucidosEngine {
                 );
             }
 
-            // Apps don't share Lucidos's node_modules: they are standalone
-            // static folders.
             if !is_external_repo && !is_app_spawn {
                 provision_node_modules(repo_root, &wt_path).await;
 
@@ -576,22 +498,14 @@ pub(crate) impl LucidosEngine {
                 log_legacy!("[AgentSession] Failed to write workspace marker: {}", e);
             }
 
-            // Add engine-injected paths to the worktree's git exclude so external
-            // repos don't see them as untracked or accidentally commit them.
             add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
 
-            // App spawns run CC inside the app folder (per §1 decision:
-            // deep cwd). Other kinds run at the worktree root.
             let cwd = if let Some(ref app_id) = app_spawn_id {
                 wt_path.join("data").join("apps").join(app_id)
             } else {
                 wt_path.clone()
             };
             let system_prompt = if let Some(ref app_id) = app_spawn_id {
-                // Inline the manifest so CC has the app's display name +
-                // icon + intent without needing to Read first. Fall back
-                // to a placeholder when the manifest is missing on disk
-                // (fresh worktree race).
                 let manifest_path = wt_path
                     .join("data")
                     .join("apps")
@@ -615,7 +529,7 @@ pub(crate) impl LucidosEngine {
             } else {
                 worktree_system_prompt(workspace_name)
             };
-            // What did THIS call create? `existing_worktree.is_none()` means
+            // INVARIANT: What did THIS call create? `existing_worktree.is_none()` means
             // the create path ran (worktree_add / sparse app worktree);
             // `!reusing_branch` on top means the branch was born here too
             // (`-b`). The sparse app helper reports the split from git truth
@@ -669,19 +583,11 @@ pub(crate) impl LucidosEngine {
                 }
             }
         }
-        // Every flavor talks to the same user. Read at spawn, so a change
-        // reaches the next session rather than a running one.
         let literacy = crate::core::technical_literacy::coding_agent_section(
             crate::core::technical_literacy::read(&self.pool).await,
         );
-        // ADR 0362: on the Tree memory module the session starts from the
-        // workspace memory view. Only this appended prompt changes (I15).
         let memory = self.coding_agent_memory().await;
-        // The same widgets section the chat agent reads, so a coding agent
-        // embeds widgets in its options and replies the same way (ADR 0415).
         let widgets = self.coding_agent_widgets();
-        // A resume drops the session context, and Codex reports no lifetime,
-        // so neither pays for the read.
         let cache_ttl = match (coding_agent, &resume_session_id) {
             (crate::runtime::CodingAgent::ClaudeCode, None) => {
                 crate::engine::cache_ttl::repo_cache_ttl(&self.pool, repo_id.as_deref()).await
@@ -717,9 +623,6 @@ pub(crate) impl LucidosEngine {
 
 #[easy_ext::ext(AgentPromptDataExt)]
 pub(crate) impl LucidosEngine {
-    /// The widgets section for a coding agent's appended prompt: the embed
-    /// rule and every built-in and reusable widget. A failed read leaves the
-    /// section without its list rather than failing the spawn.
     fn coding_agent_widgets(&self) -> String {
         let widgets = self
             .app_manager
@@ -737,10 +640,6 @@ pub(crate) impl LucidosEngine {
         )
     }
 
-    /// The workspace memory view section for a coding agent's appended
-    /// prompt, or empty on Classic, or empty while
-    /// `workspace_view_bytes_coding_agent` stays at its default of 0 (ADR
-    /// 0362's amendment).
     async fn coding_agent_memory(&self) -> String {
         use crate::engine::summary_tree::module::{tree_ready, Surface, ViewBudgets};
         if !tree_ready(&self.pool).await {
@@ -856,8 +755,6 @@ mod tests {
         std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap()
     }
 
-    /// A fresh Lucidos-source spawn on a shared checkout parked on another
-    /// thread's branch.
     #[tokio::test]
     async fn a_fresh_lucidos_source_spawn_owns_a_main_based_branch_with_provisioned_files() {
         if !in_engine_child(&child_name(
@@ -924,7 +821,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// An external repo's marker carries the repo id on a second line.
     #[tokio::test]
     async fn an_external_repo_spawn_writes_its_repo_id_on_the_marker_second_line() {
         if !in_engine_child(&child_name(
@@ -960,7 +856,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A thread's live worktree on a legacy-named branch, with `main` moved on.
     async fn resumable_worktree(repo: &Path) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let wt = tmp.path().join("legacy-wt");
@@ -1058,8 +953,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A recorded resume path holding only a bare `.git` directory, inside the
-    /// repo, so git resolves it to the enclosing repo.
     #[tokio::test]
     async fn a_stranded_caller_worktree_path_is_not_reused() {
         if !in_engine_child(&child_name("a_stranded_caller_worktree_path_is_not_reused")).await {
@@ -1092,8 +985,6 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// The thread's own worktree path holds a bare `.git` directory, as a
-    /// cleanup that raced the resume leaves it.
     #[tokio::test]
     async fn a_stranded_thread_worktree_is_recreated_not_reused() {
         if !in_engine_child(&child_name(

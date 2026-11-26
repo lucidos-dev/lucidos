@@ -15,7 +15,6 @@ fn cc_meta() -> EventMeta {
     }
 }
 
-/// Emit a thread event and return the persisted event id.
 async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -28,9 +27,6 @@ async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
     .event_id
 }
 
-/// The real user-message event on a coding-agent thread (the engine emits
-/// `MessageReceived`, NOT `CodingAgentUserMessageSent`, for user turns). Returns
-/// the event id so a test can pass it as the current-turn origin.
 async fn emit_message_received(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     emit(
         bus,
@@ -58,7 +54,6 @@ async fn emit_engine_prompt(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid
     emit_delivery(bus, thread_id, text, None).await
 }
 
-/// The agent's report that it read the input `input_event_id` carried.
 async fn emit_read(bus: &EventBus, thread_id: Uuid, input_event_id: Uuid) {
     emit(
         bus,
@@ -72,8 +67,6 @@ async fn emit_read(bus: &EventBus, thread_id: Uuid, input_event_id: Uuid) {
     .await;
 }
 
-/// The `CodingAgentPromptSent` a live session writes as it forwards the input
-/// `input_event_id` carried.
 async fn emit_delivery(
     bus: &EventBus,
     thread_id: Uuid,
@@ -139,8 +132,6 @@ async fn emit_change_applied(
     .await;
 }
 
-/// Emit a `ChangeProposed` so the `changes` projection carries the branch and
-/// description the note looks up. Returns the change id.
 async fn emit_change_proposed(
     bus: &EventBus,
     thread_id: Uuid,
@@ -185,8 +176,6 @@ async fn emit_change_discarded(bus: &EventBus, thread_id: Uuid, change_id: &str)
     .await;
 }
 
-/// The common setup: a CC session on `branch` with a proposed change and a turn
-/// boundary before it. Returns the change id.
 async fn session_with_proposed_change(
     bus: &EventBus,
     thread_id: Uuid,
@@ -200,10 +189,6 @@ async fn session_with_proposed_change(
     change_id
 }
 
-// -------------------- Applied (carried over from applied_changes) --------------------
-
-/// 1. prev message, idled, ChangeApplied, current message: note is Some, names
-///    the commit subject, the short SHA, and uses the word "applied".
 #[tokio::test]
 async fn applied_change_after_last_prompt_produces_note() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -237,15 +222,11 @@ async fn applied_change_after_last_prompt_produces_note() {
         note.note
     );
     assert!(note.note.contains("78e105d2"), "short sha: {}", note.note);
-    // Shortened to 8 chars: the rest of the SHA must not leak.
     assert!(
         !note.note.contains("78e105d2e9ab"),
         "sha not shortened: {}",
         note.note
     );
-    // The three facts the pre-merge applied-change note carried in its header.
-    // Losing the "not pending" clause would undo the bug that note was written
-    // to fix, which is the agent saying the work is still awaiting Apply.
     assert!(
         note.note.contains("worktree as reset to match main"),
         "note must say the worktree was reset: {}",
@@ -265,7 +246,6 @@ async fn applied_change_after_last_prompt_produces_note() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 2. No covered event in the gap before the current turn produces no note.
 #[tokio::test]
 async fn no_gap_event_after_last_prompt_is_none() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -287,10 +267,6 @@ async fn no_gap_event_after_last_prompt_is_none() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 3. The note self-clears: it fires once on the turn after the apply, then NOT
-///    on the following turn, even though no engine-synthesized prompt was
-///    emitted in between (user CC turns are `MessageReceived`, not
-///    `CodingAgentUserMessageSent`).
 #[tokio::test]
 async fn note_self_clears_on_next_plain_turn() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -308,7 +284,6 @@ async fn note_self_clears_on_next_plain_turn() {
     )
     .await;
 
-    // Turn 2: the apply is newer than turn 1's boundary, so the note fires.
     let turn2 = emit_message_received(&bus, thread_id, "turn 2").await;
     assert!(
         compute_turn_gap_note(&pool, thread_id, turn2, Some(BRANCH))
@@ -317,8 +292,6 @@ async fn note_self_clears_on_next_plain_turn() {
         "note must fire on the first turn after the apply"
     );
 
-    // Turn 3, a plain turn with NO engine prompt in between: the apply now sits
-    // below turn 2's boundary, so the note self-clears.
     let turn3 = emit_message_received(&bus, thread_id, "turn 3").await;
     assert!(
         compute_turn_gap_note(&pool, thread_id, turn3, Some(BRANCH))
@@ -331,10 +304,6 @@ async fn note_self_clears_on_next_plain_turn() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 4. Live-apply ordering regression guard: ChangeApplied then a TRAILING
-///    CodingAgentIdled (the Tier-1 live-apply path emits an idle after the
-///    apply). Keyed off turn boundaries (not the last idle), so the note still
-///    fires.
 #[tokio::test]
 async fn trailing_idle_after_apply_still_produces_note() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -351,9 +320,6 @@ async fn trailing_idle_after_apply_still_produces_note() {
         Some("bbbbbbbb22"),
     )
     .await;
-    // Tier-1 live-apply emits a trailing idle AFTER ChangeApplied. Keying off
-    // the last idle would make the note miss the apply; keying off the turn
-    // boundary does not.
     emit_idled(&bus, thread_id).await;
     let current = emit_message_received(&bus, thread_id, "continue").await;
 
@@ -366,9 +332,6 @@ async fn trailing_idle_after_apply_still_produces_note() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 5. Multiple events in the gap are listed oldest-first and capped at
-///    MAX_LINES. Also exercises `CodingAgentPromptSent` as a valid boundary and
-///    mixed event kinds keeping event order.
 #[tokio::test]
 async fn multiple_events_listed_oldest_first_and_capped() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -376,7 +339,6 @@ async fn multiple_events_listed_oldest_first_and_capped() {
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, BRANCH, None).await;
 
-    // Engine-synthesized prompt (hardening) is also a valid turn boundary.
     emit_engine_prompt(&bus, thread_id, "/harden").await;
     emit_change_applied(&bus, thread_id, vec!["feat: alpha"], Some("11111111")).await;
     let stale = emit_change_proposed(&bus, thread_id, "claude-code/stale", "the stale one").await;
@@ -399,7 +361,6 @@ async fn multiple_events_listed_oldest_first_and_capped() {
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;
 
-    // Capping: a single apply with > MAX_LINES commits truncates.
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -430,9 +391,6 @@ async fn multiple_events_listed_oldest_first_and_capped() {
         .await
         .unwrap()
         .note;
-    // 60 commits against `MAX_LINES_PER_EVENT` = 20, so 40 truncated. The
-    // per-event cap binds before the overall `MAX_LINES` = 50, which is the
-    // point: one big Apply must leave room for whatever follows it.
     assert!(
         note.contains("and 40 more"),
         "expected truncation note: {note}"
@@ -447,7 +405,6 @@ async fn multiple_events_listed_oldest_first_and_capped() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 6. No-op apply (empty commits): graceful wording, no panic, no empty bullet.
 #[tokio::test]
 async fn noop_apply_renders_gracefully() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -468,20 +425,12 @@ async fn noop_apply_renders_gracefully() {
         note.contains("no commits") || note.contains("already merged"),
         "no-op wording missing: {note}"
     );
-    // No empty "- " bullet line.
     assert!(!note.contains("\n- \n"), "empty bullet rendered: {note}");
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- Boundary set --------------------
-
-/// 7. A turn woken by a finished child thread is a real turn boundary, so the
-///    note must self-clear across it. `ChildThreadCompleted` is a CC turn ORIGIN
-///    (`CC_ORIGINATING_EVENT_TYPES`) but was missing from the hand-listed
-///    boundary set, so the apply stayed above the threshold and the note fired
-///    a second time on the next plain turn.
 #[tokio::test]
 async fn child_completion_origin_advances_boundary() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -498,7 +447,6 @@ async fn child_completion_origin_advances_boundary() {
     )
     .await;
 
-    // Turn 2 is woken by a child thread finishing, not by a user message.
     let turn2 = emit(
         &bus,
         thread_id,
@@ -520,7 +468,6 @@ async fn child_completion_origin_advances_boundary() {
         "note must fire on the child-woken turn after the apply"
     );
 
-    // Turn 3: the apply now sits below turn 2's boundary, so it self-clears.
     let turn3 = emit_message_received(&bus, thread_id, "turn 3").await;
     assert!(
         compute_turn_gap_note(&pool, thread_id, turn3, Some(BRANCH))
@@ -533,9 +480,6 @@ async fn child_completion_origin_advances_boundary() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- Discarded --------------------
-
-/// 8. The gap this module exists to close: the user clicked Discard.
 #[tokio::test]
 async fn discard_produces_note() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -584,7 +528,6 @@ async fn discard_produces_note() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 9. A discard must self-clear exactly like an apply.
 #[tokio::test]
 async fn discard_note_self_clears() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -614,8 +557,6 @@ async fn discard_note_self_clears() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 10. The reconcile path (`discard_open_changes_for_thread_except`) discards STALE
-///     siblings on other branches. That must not read as "your work is gone".
 #[tokio::test]
 async fn other_branch_says_current_work_untouched() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -641,9 +582,6 @@ async fn other_branch_says_current_work_untouched() {
         "note must reassure about live work: {}",
         note.note
     );
-    // A discard elsewhere reset THAT branch, not this worktree. Claiming
-    // otherwise would silence the external-edit note about a HEAD move nothing
-    // in this gap explains.
     assert!(
         !note.explains_worktree_reset,
         "a discard on another branch did not move this worktree"
@@ -653,10 +591,6 @@ async fn other_branch_says_current_work_untouched() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 10b. Two messages racing one spawn: the run's origin is the FIRST message,
-///      and the second queues for the starting run, already persisted. Bounding the gap by the origin's id alone let `MAX(sequence)`
-///      pick that later message as the "previous" boundary and swallow the whole
-///      gap, so the user who typed twice after a Discard was told nothing.
 #[tokio::test]
 async fn later_boundary_after_the_origin_does_not_swallow_the_gap() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -666,9 +600,7 @@ async fn later_boundary_after_the_origin_does_not_swallow_the_gap() {
 
     emit_change_discarded(&bus, thread_id, &change_id).await;
 
-    // The turn the engine actually runs is anchored on the first message...
     let origin = emit_message_received(&bus, thread_id, "what happened?").await;
-    // ...but a second message lands before the spawn builds its prompt.
     emit_message_received(&bus, thread_id, "also, do X next").await;
 
     let note = compute_turn_gap_note(&pool, thread_id, origin, Some(BRANCH))
@@ -680,9 +612,6 @@ async fn later_boundary_after_the_origin_does_not_swallow_the_gap() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 10c. The flip side of 10b: an event that lands AFTER the current origin
-///      belongs to the next turn's gap, not this one, and must still be
-///      surfaced there rather than lost between the two.
 #[tokio::test]
 async fn event_after_the_origin_is_carried_to_the_next_turn() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -690,7 +619,6 @@ async fn event_after_the_origin_is_carried_to_the_next_turn() {
     let thread_id = Uuid::new_v4();
     let change_id = session_with_proposed_change(&bus, thread_id, BRANCH, "add the feature").await;
 
-    // The user sends a message, THEN clicks Discard while the spawn is starting.
     let origin = emit_message_received(&bus, thread_id, "status?").await;
     emit_change_discarded(&bus, thread_id, &change_id).await;
 
@@ -711,11 +639,6 @@ async fn event_after_the_origin_is_carried_to_the_next_turn() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- Reverted --------------------
-
-/// 11. A revert undoes work in `main`, which the applied note told the agent to
-///     build on. The note must correct that, and must NOT claim the worktree
-///     moved (revert runs in the main repo).
 #[tokio::test]
 async fn revert_produces_note() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -754,11 +677,6 @@ async fn revert_produces_note() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- ApplyFailed --------------------
-
-/// 12. A failed Apply leaves the change pending. The engine's error is
-///     user-facing toast copy, so it must be quoted and attributed, never
-///     rendered as an instruction to the agent.
 #[tokio::test]
 async fn apply_failed_quotes_engine_error() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -806,10 +724,6 @@ async fn apply_failed_quotes_engine_error() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- ChildThreadStopped --------------------
-
-/// ADR 0252: a stopped child wakes nothing, so a coding-agent parent hears
-/// about it only here. The line says the child is alive and moves no ref.
 #[tokio::test]
 async fn a_stopped_child_reaches_the_resumed_parent_as_alive() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -867,8 +781,6 @@ fn filed(child_thread_id: Uuid, summary: &str) -> ThreadEvent {
     }
 }
 
-/// I6: a coding-agent parent reads each report filed since its previous turn
-/// at the front of its next prompt, whole, and exactly once.
 #[tokio::test]
 async fn each_filed_report_reaches_the_next_turn_once() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -908,9 +820,6 @@ async fn each_filed_report_reaches_the_next_turn_once() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An event landing between a follow-up's origin and its delivery rides that
-/// follow-up. Bounded at the origin, it would sit above this note and below
-/// the next one, whose lower bound is the delivery's `CodingAgentPromptSent`.
 #[tokio::test]
 async fn an_event_landing_before_the_delivery_rides_that_follow_up_once() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -942,9 +851,6 @@ async fn an_event_landing_before_the_delivery_rides_that_follow_up_once() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A follow-up the user takes back before the agent reads it never delivers
-/// its note, and never gets a read. Its origin and its delivery therefore do
-/// not count as boundaries, so the next prompt carries the gap instead.
 #[tokio::test]
 async fn a_withdrawn_follow_up_leaves_its_gap_to_the_next_prompt() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -981,9 +887,6 @@ async fn a_withdrawn_follow_up_leaves_its_gap_to_the_next_prompt() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The failed-send case: the session wrote a follow-up's delivery, and the
-/// agent never read it, whether the send failed or the agent died first. No
-/// boundary counts until a read, so the next prompt and a respawn carry it.
 #[tokio::test]
 async fn a_delivery_the_agent_never_read_moves_no_bound() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1015,8 +918,6 @@ async fn a_delivery_the_agent_never_read_moves_no_bound() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The other half: once the agent read a follow-up, its delivery is the
-/// boundary, so the note it carried does not repeat.
 #[tokio::test]
 async fn a_delivery_the_agent_read_moves_the_bound() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1045,9 +946,6 @@ async fn a_delivery_the_agent_read_moves_the_bound() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An old row's read carrying `assumed`: a timer settled the input with no
-/// report from the agent. Nothing writes one now, but history keeps them, and
-/// such a read proves no delivery, so it moves no bound.
 #[tokio::test]
 async fn an_assumed_read_moves_no_bound() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1061,8 +959,6 @@ async fn an_assumed_read_moves_no_bound() {
 
     let settled = emit_message_received(&bus, thread_id, "settled unread").await;
     emit_delivery(&bus, thread_id, "settled unread", Some(settled)).await;
-    // Seeded raw: the event no longer has the field, and the bus writes only
-    // what it has. The old row must still decode.
     let old_read = serde_json::json!({ "input_event_id": settled, "assumed": true });
     assert!(matches!(
         ThreadEvent::from_stored("CodingAgentInputRead", old_read.clone()),
@@ -1090,9 +986,6 @@ async fn an_assumed_read_moves_no_bound() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A slash command goes to the agent verbatim, with no note in front. Its read
-/// proves no delivery, so the next prompt carries the gap from before the
-/// command as well as after it.
 #[tokio::test]
 async fn a_verbatim_read_moves_no_bound() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1135,9 +1028,6 @@ async fn a_verbatim_read_moves_no_bound() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A boundary older than the workspace's first read predates read reports
-/// (ADR 0268), so it counts unread. Otherwise a thread idle since then would
-/// get its whole history on its next note.
 #[tokio::test]
 async fn a_boundary_older_than_the_first_read_still_counts() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1149,7 +1039,6 @@ async fn a_boundary_older_than_the_first_read_still_counts() {
     emit(&bus, thread_id, filed(child_id, "Long since read.")).await;
     emit_message_received(&bus, thread_id, "turn 2").await;
 
-    // Reads start later, on another thread.
     let other = Uuid::new_v4();
     start_cc_session(&bus, other, "claude-code/other", None).await;
     let elsewhere = emit_message_received(&bus, other, "elsewhere").await;
@@ -1167,9 +1056,6 @@ async fn a_boundary_older_than_the_first_read_still_counts() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A follow-up queued behind another is persisted before the first one's
-/// delivery. The lower bound comes from the first one's origin, so the queued
-/// message cannot become its previous boundary and swallow the gap.
 #[tokio::test]
 async fn a_queued_follow_up_does_not_swallow_the_gap_of_the_one_before() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1193,9 +1079,6 @@ async fn a_queued_follow_up_does_not_swallow_the_gap_of_the_one_before() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An engine prompt with no origin, such as auto-harden, still writes a
-/// `CodingAgentPromptSent`, which the ledger names as its input. So it
-/// carries the gap itself, and its read makes it the next boundary.
 #[tokio::test]
 async fn an_origin_less_engine_prompt_carries_the_gap_once() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1227,8 +1110,6 @@ async fn an_origin_less_engine_prompt_carries_the_gap_once() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// ADR 0278: a child moved to top level wakes nothing either, so the resumed
-/// parent reads here that it must stop waiting for it.
 #[tokio::test]
 async fn a_moved_out_child_reaches_the_resumed_parent() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1237,7 +1118,6 @@ async fn a_moved_out_child_reaches_the_resumed_parent() {
     let child_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, BRANCH, None).await;
     emit_message_received(&bus, thread_id, "turn 1").await;
-    // The bus drops a move for a child with no row, so the child needs one.
     sqlx::query(
         "INSERT INTO thread_summaries (thread_id, parent_thread_id, depth) VALUES ($1, $2, 1)",
     )
@@ -1279,10 +1159,6 @@ async fn a_moved_out_child_reaches_the_resumed_parent() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- WorktreeCleaned --------------------
-
-/// 13. Tier 1 strips build artifacts from a worktree that can still resume. No
-///     ref moved, so it must not silence the external-edit note.
 #[tokio::test]
 async fn tier_1_clean_reports_artifacts_without_claiming_a_reset() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1334,8 +1210,6 @@ fn tier_0_clean_reports_full_removal() {
         .contains("removed your whole worktree"));
 }
 
-/// 14. Historical Tier 2 events can record a deleted branch and explain why
-///     the worktree was recreated at `main`.
 #[tokio::test]
 async fn tier_2_clean_explains_the_reset() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1380,11 +1254,6 @@ async fn tier_2_clean_explains_the_reset() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// -------------------- Degradation --------------------
-
-/// 15. A legacy payload with no `change_id` (the pre-`change_id` shape carried
-///     `path` only) has no `changes` row to resolve. The note must still render
-///     the event, with no panic and no empty bullet.
 #[tokio::test]
 async fn unknown_change_id_renders_gracefully() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1412,15 +1281,12 @@ async fn unknown_change_id_renders_gracefully() {
     assert!(note.contains("DISCARDED"), "{note}");
     assert!(note.contains("change ?"), "fallback label missing: {note}");
     assert!(!note.contains("\n- \n"), "empty bullet rendered: {note}");
-    // With no branch known, the note must not invent one.
     assert!(!note.contains("branch ``"), "empty branch rendered: {note}");
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 16. With no session branch in hand (a spawn that could not resolve one), a
-///     discard still renders and simply doesn't draw the comparison.
 #[tokio::test]
 async fn missing_session_branch_still_renders() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1446,16 +1312,6 @@ async fn missing_session_branch_still_renders() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 17. A background completion nobody delivered reaches the resumed agent,
-///     and the two endings read differently. Abandoned means the engine
-///     stopped and there is no verdict; ordinary means the task finished and
-///     only the wake went missing. Both leave the agent believing its build is
-///     still running if the note stays silent.
-///
-///     Nothing filters by kind here, because the boundary set does it: a wake
-///     the watcher DID deliver emits `CodingAgentPromptSent`, which is a
-///     boundary, so that completion falls outside the next gap. Test 18 pins
-///     that half.
 #[tokio::test]
 async fn a_background_completion_nobody_delivered_reaches_the_resumed_agent() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1493,8 +1349,6 @@ async fn a_background_completion_nobody_delivered_reaches_the_resumed_agent() {
         note.contains("exit code 0"),
         "the ordinary line reports the verdict: {note}"
     );
-    // The line tells the agent to drain, and every bash_output lookup is an
-    // exact match, so a shortened id comes back as `unknown task_id`.
     assert!(
         note.contains("task task-lost"),
         "the id must be usable: {note}"
@@ -1512,9 +1366,6 @@ async fn a_background_completion_nobody_delivered_reaches_the_resumed_agent() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A completion that landed while the agent's turn still ran reached it in
-/// that turn: a polled task's `background-task wait` read it. The next turn's
-/// note must not call it a lost wake. One landing after the idle still counts.
 #[tokio::test]
 async fn a_completion_read_inside_the_turn_is_not_repeated() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1549,16 +1400,6 @@ async fn a_completion_read_inside_the_turn_is_not_repeated() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 19. **A `ContinuationRequested` must NOT advance the boundary.** It is
-///     persisted when a resume is REQUESTED, and several ordinary paths never
-///     actuate it: a racing user message takes the session first, a later
-///     request supersedes it, two Continue clicks emit two. Counting it lost
-///     the note permanently in each of those, on the crash-restart path this
-///     coverage exists for.
-///
-///     The accepted residual is the opposite: a resume that DID deliver the
-///     note records nothing, so it repeats once on the next message. That
-///     costs a re-read; the other costs the agent believing its build runs.
 #[tokio::test]
 async fn a_continuation_request_that_never_ran_does_not_swallow_the_note() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1573,8 +1414,6 @@ async fn a_continuation_request_that_never_ran_does_not_swallow_the_note() {
         completion("task-lost", "./scripts/e2e.sh", None, true),
     )
     .await;
-    // Requested, and then never actuated: the user's own message won the
-    // session, so no turn ever built a note from this.
     emit(
         &bus,
         thread_id,
@@ -1595,9 +1434,6 @@ async fn a_continuation_request_that_never_ran_does_not_swallow_the_note() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 18. The other half: a completion an event wait delivered is not repeated.
-///     The delivery is the prompt the re-opened turn carries, and it lands
-///     before that turn's origin, so the query has to drop it by name.
 #[tokio::test]
 async fn a_background_completion_an_event_wait_delivered_is_not_repeated() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1637,11 +1473,6 @@ async fn a_background_completion_an_event_wait_delivered_is_not_repeated() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 19b. **A task the thread itself stopped is not news on the next turn
-///      either** (ADR 0369). Its reap lands seconds after the stop, usually
-///      once the turn has ended. Without this, the next turn read "the wake
-///      never reached you" about work the agent stopped on purpose. A killed
-///      task whose watch nobody stood down still gets its line.
 #[tokio::test]
 async fn a_task_the_thread_stopped_itself_gets_no_line() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1697,8 +1528,6 @@ async fn a_task_the_thread_stopped_itself_gets_no_line() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 19c. A stand-down long before the kill is a watch the agent dropped, not
-///      its own stop. A later kill by somebody else still gets its line.
 #[tokio::test]
 async fn an_old_stand_down_does_not_hide_a_later_kill() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1749,9 +1578,6 @@ async fn an_old_stand_down_does_not_hide_a_later_kill() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 20. The ordinary line names `timed_out` and `killed`, for the same reason
-///     the wake it replaces leads with them. Without it a deadline, a
-///     cancellation and a segfault all read as "killed by SIGKILL".
 #[tokio::test]
 async fn the_ordinary_line_names_how_the_task_ended() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1786,10 +1612,6 @@ async fn the_ordinary_line_names_how_the_task_ended() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 21. **A big Apply must not bury the lost-task line.** The note truncates its
-///     tail, an Apply renders a line per merged commit, and a completion
-///     always sorts after the Apply that preceded it. So the one channel an
-///     undelivered background completion has was the line that got dropped.
 #[tokio::test]
 async fn a_large_apply_does_not_bury_the_background_task_line() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1841,11 +1663,6 @@ async fn a_large_apply_does_not_bury_the_background_task_line() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 22. **The overall budget cannot bury it either.** A per-event cap alone
-///     still lost the line once enough events shared the gap, and the boot
-///     sweep makes that reachable: it settles every historical unsettled task
-///     on a thread at once. Background lines are rendered first for that
-///     reason, whatever their sequence.
 #[tokio::test]
 async fn a_gap_full_of_applies_does_not_bury_the_background_task_line() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1854,7 +1671,6 @@ async fn a_gap_full_of_applies_does_not_bury_the_background_task_line() {
     start_cc_session(&bus, thread_id, BRANCH, None).await;
 
     emit_message_received(&bus, thread_id, "land them all").await;
-    // Three applies at the per-event cap already exceed MAX_LINES on their own.
     for batch in 0..3 {
         emit(
             &bus,
@@ -1899,7 +1715,6 @@ async fn a_gap_full_of_applies_does_not_bury_the_background_task_line() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A background completion, ordinary or abandoned.
 fn completion(
     task_id: &str,
     command: &str,
@@ -1921,17 +1736,8 @@ fn completion(
     }
 }
 
-// -------------------- A restart cut off the last turn --------------------
-//
-// The engine stops a session at teardown. Claude Code then closes the running
-// tool call as "The user doesn't want to proceed with this tool use". Without
-// a note saying who really stopped it, the resumed agent reads that as the
-// user refusing, and stops retrying the work.
-
-/// The line the note carries when a restart cut the last turn off.
 const RESTART_LINE: &str = "ENGINE RESTART";
 
-/// Emit a coding-agent `ResponseAborted` with `cause`, on `channel`.
 async fn emit_abort(
     bus: &EventBus,
     thread_id: Uuid,
@@ -1969,8 +1775,6 @@ async fn emit_generated(bus: &EventBus, thread_id: Uuid) {
     .await;
 }
 
-/// The resume the recovery sweep requests after a user switch. It is the
-/// current turn's origin, exactly as the spawn consumer passes it.
 async fn emit_switch_continuation(bus: &EventBus, thread_id: Uuid) -> Uuid {
     emit(
         bus,
@@ -1982,9 +1786,6 @@ async fn emit_switch_continuation(bus: &EventBus, thread_id: Uuid) -> Uuid {
     .await
 }
 
-/// The reproduction. A restart landed mid-turn. The resume must say that the
-/// engine stopped the call, that the user refused nothing, and that the call
-/// can run again. Both restart causes: a switch, and a crash recovered at boot.
 #[tokio::test]
 async fn a_restart_that_cut_off_the_last_turn_is_named_on_resume() {
     use crate::engine::thread_events::AbortCause;
@@ -2026,8 +1827,6 @@ async fn a_restart_that_cut_off_the_last_turn_is_named_on_resume() {
     }
 }
 
-/// A second restart during the resumed turn is still one interruption of the
-/// work in hand, so the note says it once.
 #[tokio::test]
 async fn two_restarts_in_one_gap_are_one_line() {
     use crate::engine::thread_events::AbortCause;
@@ -2054,8 +1853,6 @@ async fn two_restarts_in_one_gap_are_one_line() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Once a resumed turn has finished, the restart is history. The user's next
-/// message must not be told the engine just restarted.
 #[tokio::test]
 async fn a_turn_that_finished_after_the_restart_carries_no_restart_line() {
     use crate::engine::thread_events::AbortCause;
@@ -2073,8 +1870,6 @@ async fn a_turn_that_finished_after_the_restart_carries_no_restart_line() {
         Some(EventChannel::ClaudeCode),
     )
     .await;
-    // `ContinuationRequested` is not a turn boundary, so the resumed turn's
-    // own terminal shares a gap with the abort before it.
     emit_switch_continuation(&bus, thread_id).await;
     emit_generated(&bus, thread_id).await;
     let current = emit_message_received(&bus, thread_id, "thanks, what next?").await;
@@ -2090,8 +1885,6 @@ async fn a_turn_that_finished_after_the_restart_carries_no_restart_line() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Only a restart is a restart. A crash of the subprocess, a user Stop, and a
-/// chat-agent abort on the same thread would each make the line a lie.
 #[tokio::test]
 async fn only_a_coding_agent_restart_abort_names_a_restart() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
@@ -2160,8 +1953,6 @@ fn user_only_message(text: &str, device_id: &str) -> ThreadEvent {
     }
 }
 
-/// Emit a user-only message with its device as the actor, as `chat_submit`
-/// records it.
 async fn emit_user_only_message(bus: &EventBus, thread_id: Uuid, text: &str, device_id: &str) {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -2175,8 +1966,6 @@ async fn emit_user_only_message(bus: &EventBus, thread_id: Uuid, text: &str, dev
     .expect("emit produced no EmitResult");
 }
 
-/// I8: user-only messages ride the next woken prompt in order, and the wake
-/// after it does not repeat them (ADR 0649).
 #[tokio::test]
 async fn user_only_messages_reach_the_next_woken_prompt_once() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -2209,8 +1998,6 @@ async fn user_only_messages_reach_the_next_woken_prompt_once() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// On a team gateway each line carries its sender's user name; a long
-/// paused conversation keeps only its newest messages.
 #[test]
 fn the_people_block_names_each_speaker_and_keeps_the_newest() {
     use crate::gateway_users::{User, UserSnapshot};

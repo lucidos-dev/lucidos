@@ -47,7 +47,7 @@ impl Phase {
         )
     }
 
-    /// The gateway must finish rollback before it may spawn the engine.
+    /// INVARIANT: The gateway must finish rollback before it may spawn the engine.
     pub fn blocks_engine(self) -> bool {
         matches!(
             self,
@@ -76,21 +76,20 @@ pub struct Journal {
     pub updated_at: DateTime<Utc>,
 }
 
-/// External restore state. The original policy is immutable through rollback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedFiles {
     pub policy: super::file_swap::FrozenPolicy,
     pub staging_roots: Vec<std::path::PathBuf>,
 }
 
-/// Frozen before the first completion append. Retrying after an interrupted
+/// INVARIANT: Frozen before the first completion append. Retrying after an interrupted
 /// append must use the same safe payload even if retained directories change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreAnnouncement {
     pub notification_id: Uuid,
     pub retained_worktrees: Vec<String>,
-    /// Absent in legacy evidence: preserve its original notification payload.
+    /// INVARIANT: Absent in legacy evidence: preserve its original notification payload.
     /// New evidence freezes the visible attribution before either append.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_label: Option<String>,

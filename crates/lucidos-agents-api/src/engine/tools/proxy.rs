@@ -1,4 +1,4 @@
-//! `proxy_request` + `reload_proxy_modules` LLM tools.
+//! INVARIANT: `proxy_request` + `reload_proxy_modules` LLM tools.
 //!
 //! `proxy_request` calls a backend through the engine proxy: an entry in
 //! `data/config/apis.json`, or a builtin provider proxy. It resolves names
@@ -18,7 +18,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 #[easy_ext::ext(ProxyExt)]
 pub(crate) impl LucidosEngine {
-    /// `thread_id` anchors the cost row of a model call the proxy forwards.
     async fn execute_proxy_tool(
         &self,
         args: &serde_json::Value,
@@ -125,9 +124,6 @@ pub(crate) impl LucidosEngine {
 
 #[cfg(test)]
 mod tests {
-    /// The tool resolves names through the same function as the HTTP route.
-    /// Calling `resolve_proxy_target` here again would read `apis.json` alone,
-    /// and every builtin provider proxy would answer "not configured".
     #[test]
     fn proxy_request_resolves_names_like_the_http_route() {
         let production = include_str!("proxy.rs")

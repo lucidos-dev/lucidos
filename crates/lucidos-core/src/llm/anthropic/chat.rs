@@ -1,6 +1,3 @@
-//! Anthropic `/v1/messages` dispatch: endpoint, auth headers, retry loop.
-//! The request body + SSE parse are shared with Vertex via `anthropic_wire`.
-
 use super::{AnthropicAuth, AnthropicProvider, Endpoint};
 use crate::llm::anthropic_wire::{build_claude_request, parse_claude_stream, WireTarget};
 use crate::llm::claude_prefill;
@@ -8,18 +5,8 @@ use crate::llm::prefill::{PrefillBody, TurnRoute};
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
 use crate::llm::ModelSelection;
 
-/// Body API version sent as an HTTP header on the direct API (Vertex sends its
-/// own value in the body instead). Shared with the `web_search` backend in
-/// `llm::web_search::anthropic`, which hits the same `/v1/messages` endpoint.
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// The (header name, header value) pair that authenticates the request.
-/// API keys go on `x-api-key`; OAuth subscription tokens go on
-/// `Authorization: Bearer`.
-///
-/// `pub(crate)` so the `web_search` backend authenticates identically — two
-/// copies of this mapping would silently diverge the moment a third auth kind
-/// is added.
 pub(crate) fn auth_header(auth: &AnthropicAuth) -> (&'static str, String) {
     match auth {
         AnthropicAuth::ApiKey(key) => ("x-api-key", key.clone()),
@@ -27,9 +14,6 @@ pub(crate) fn auth_header(auth: &AnthropicAuth) -> (&'static str, String) {
     }
 }
 
-/// Assemble the `anthropic-beta` header value: the OAuth flag (OAuth auth only)
-/// plus the betas the request body needs (`build_claude_request`). Returns
-/// `None` when neither applies, so the header is omitted entirely.
 fn anthropic_beta_header(auth: &AnthropicAuth, request_betas: &[&str]) -> Option<String> {
     let mut betas: Vec<&str> = Vec::new();
     if matches!(auth, AnthropicAuth::OAuthBearer(_)) {
@@ -43,7 +27,7 @@ fn anthropic_beta_header(auth: &AnthropicAuth, request_betas: &[&str]) -> Option
     }
 }
 
-/// The headers that authenticate one request on a Claude gateway: its bearer,
+/// INVARIANT: The headers that authenticate one request on a Claude gateway: its bearer,
 /// the request's own betas, and a `User-Agent` naming Lucidos. Never the
 /// subscription OAuth beta, which belongs to a Claude subscription token.
 fn gateway_headers(bearer: &str, request_betas: &[&str]) -> Vec<(&'static str, String)> {
@@ -57,7 +41,6 @@ fn gateway_headers(bearer: &str, request_betas: &[&str]) -> Vec<(&'static str, S
     headers
 }
 
-/// The headers that authenticate one request on the direct API.
 fn direct_headers(auth: &AnthropicAuth, request_betas: &[&str]) -> Vec<(&'static str, String)> {
     let mut headers = vec![auth_header(auth)];
     if let Some(beta) = anthropic_beta_header(auth, request_betas) {
@@ -66,8 +49,6 @@ fn direct_headers(auth: &AnthropicAuth, request_betas: &[&str]) -> Vec<(&'static
     headers
 }
 
-/// What one call presents: the fixed direct credential, or a gateway bearer
-/// fetched for this call.
 enum CallAuth<'a> {
     Direct(&'a AnthropicAuth),
     Gateway(String),
@@ -97,7 +78,6 @@ impl Endpoint {
         }
     }
 
-    /// The provider name in logs and errors.
     fn label(&self) -> &'static str {
         match self {
             Self::Direct(_) => "Anthropic",
@@ -105,9 +85,6 @@ impl Endpoint {
         }
     }
 
-    /// The auth one call presents, and the model id it sends. A gateway asks
-    /// its gateway access here, so each call presents a fresh bearer. It then
-    /// refuses a model the gateway does not serve, before anything is sent.
     async fn begin_call(
         &self,
         requested: &str,
@@ -124,8 +101,6 @@ impl Endpoint {
         }
     }
 
-    /// A renewed bearer after a `401`, for a gateway call. `None` for a direct
-    /// credential, which has no renewal.
     async fn renew_rejected(
         &self,
         auth: &CallAuth<'_>,
@@ -138,11 +113,8 @@ impl Endpoint {
         }
     }
 
-    /// The error for a `401`, which names the way to recover on this host.
     fn unauthorized(&self, error_body: &str) -> String {
         match self {
-            // There is no refresh path for a direct credential: surface a
-            // clear, actionable message rather than a generic auth error.
             Self::Direct(_) => format!(
                 concat!(
                     "Anthropic API 401 — check the Anthropic credential in ",
@@ -199,7 +171,7 @@ impl AnthropicProvider {
         let mut renewed = false;
         let display = request.thinking_display();
 
-        // Retry loop for connection errors, retryable HTTP status codes, and
+        // INVARIANT: Retry loop for connection errors, retryable HTTP status codes, and
         // mid-stream overload errors. Content is accumulated internally by
         // parse_claude_stream, so retrying the full request is safe.
         let mut attempt = 0u32;
@@ -244,8 +216,6 @@ impl AnthropicProvider {
                     return Err(cap.into());
                 }
 
-                // 401 means a bad or expired credential for this host. A
-                // gateway bearer renews once before the turn fails.
                 if status.as_u16() == 401 {
                     if !renewed {
                         if let Some(renewal) = self.endpoint.renew_rejected(&auth).await {
@@ -291,7 +261,6 @@ impl AnthropicProvider {
         }
     }
 
-    /// Send one prefill beat, with a fresh credential for a gateway.
     pub(super) async fn prefill_anthropic(
         &self,
         body: &PrefillBody,
@@ -369,8 +338,6 @@ mod tests {
         );
     }
 
-    /// A gateway request carries its bearer and a `User-Agent` naming Lucidos,
-    /// and never the subscription beta or an API key.
     #[test]
     fn gateway_headers_send_bearer_and_user_agent_never_the_oauth_beta() {
         let headers = gateway_headers("gw-token", &[]);
@@ -415,7 +382,6 @@ mod tests {
             "\n\n"
         );
 
-        /// A turn that streams one text delta.
         const TEXT_TURN: &str = concat!(
             r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
             "\n\n",
@@ -432,14 +398,11 @@ mod tests {
             "\n\n"
         );
 
-        /// The `request-id` header every mock response carries.
         const MOCK_REQUEST_ID: &str = "req_mock";
 
-        /// A bearer, and what renewing it after a `401` gives.
         struct FixedTokens(Result<String, String>, Result<String, String>);
 
         impl FixedTokens {
-            /// A source whose renewal hands back the same bearer.
             fn fixed(bearer: Result<String, String>) -> Self {
                 Self(bearer.clone(), bearer)
             }
@@ -466,7 +429,6 @@ mod tests {
             }
         }
 
-        /// [`FixedTokens`] under a gateway policy.
         struct UnderPolicy(FixedTokens, serde_json::Value);
 
         #[async_trait::async_trait]
@@ -490,20 +452,14 @@ mod tests {
             }
         }
 
-        /// What the mock gateway saw: each request's path and headers.
         type Seen = Arc<Mutex<Vec<(String, HeaderMap)>>>;
 
-        /// The one model the mock gateway lists.
         const LISTED: &str = "claude-test";
 
-        /// A gateway listing [`LISTED`] that answers every Messages request
-        /// with `status` and `body`.
         async fn serve(status: StatusCode, body: &'static str) -> (GatewayOrigin, Seen) {
             serve_with(move |_| (status, body)).await
         }
 
-        /// A gateway listing [`LISTED`] that answers each Messages request
-        /// with what `answer` gives for its headers.
         async fn serve_with(
             answer: impl Fn(&HeaderMap) -> (StatusCode, &'static str) + Clone + Send + Sync + 'static,
         ) -> (GatewayOrigin, Seen) {
@@ -550,7 +506,6 @@ mod tests {
             (origin, seen)
         }
 
-        /// The Messages requests the mock saw, with their headers.
         fn messages(seen: &Seen) -> Vec<HeaderMap> {
             seen.lock()
                 .unwrap()
@@ -592,8 +547,6 @@ mod tests {
                 .map_err(|e| e.to_string())
         }
 
-        /// The gateway provider sends to its own origin's Messages path, with
-        /// the gateway access bearer and no direct-API credential.
         #[tokio::test]
         async fn sends_its_bearer_to_its_own_origin() {
             let (origin, seen) = serve(StatusCode::OK, COMPLETED_TURN).await;
@@ -615,8 +568,6 @@ mod tests {
             assert!(headers.get("anthropic-beta").is_none());
         }
 
-        /// A model the gateway did not list is refused as not served, and the
-        /// Messages API never sees it.
         #[tokio::test]
         async fn an_unlisted_model_is_refused_before_any_request() {
             let (origin, seen) = serve(StatusCode::OK, COMPLETED_TURN).await;
@@ -631,9 +582,6 @@ mod tests {
             assert!(messages(&seen).is_empty());
         }
 
-        /// The policy's `availableModels` decides what the gateway serves, in
-        /// place of its listing. A model outside it is refused before any
-        /// request, and one inside it is sent as the entry names it.
         #[tokio::test]
         async fn the_policy_allowlist_decides_what_is_served() {
             let (origin, seen) = serve(StatusCode::OK, COMPLETED_TURN).await;
@@ -665,8 +613,6 @@ mod tests {
             assert_eq!(paths, vec!["/v1/messages"], "the listing is not read");
         }
 
-        /// A gateway refuses a model outside the account's access group with a
-        /// `400`. The gateway's own words reach the user, with the code.
         #[tokio::test]
         async fn a_400_reaches_the_user_with_the_gateways_words() {
             const REFUSAL: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"model not allowed for your group"}}"#;
@@ -680,8 +626,6 @@ mod tests {
             );
         }
 
-        /// A `401` that renewing does not cure tells the user to sign in to
-        /// the gateway again, after one renewed attempt.
         #[tokio::test]
         async fn a_401_says_sign_in_again() {
             let (origin, seen) = serve(StatusCode::UNAUTHORIZED, "{}").await;
@@ -692,8 +636,6 @@ mod tests {
             assert_eq!(messages(&seen).len(), 2);
         }
 
-        /// A gateway that ends a token early answers `401`. The renewed
-        /// bearer then completes the turn.
         #[tokio::test]
         async fn a_401_renews_the_bearer_once() {
             let (origin, seen) = serve_with(|headers| match headers["authorization"].to_str() {
@@ -712,7 +654,6 @@ mod tests {
             assert_eq!(sent, ["Bearer ended", "Bearer renewed"]);
         }
 
-        /// A renewal that fails fails the turn with its own message.
         #[tokio::test]
         async fn a_failed_renewal_fails_the_turn_with_its_message() {
             let (origin, seen) = serve(StatusCode::UNAUTHORIZED, "{}").await;
@@ -724,8 +665,6 @@ mod tests {
             assert_eq!(messages(&seen).len(), 1);
         }
 
-        /// A gateway access that cannot produce a bearer fails the call before
-        /// anything is sent, with its own message.
         #[tokio::test]
         async fn a_token_failure_sends_nothing() {
             let (origin, seen) = serve(StatusCode::OK, COMPLETED_TURN).await;
@@ -736,8 +675,6 @@ mod tests {
             assert!(seen.lock().unwrap().is_empty());
         }
 
-        /// The call trace names the answering response's `request-id` and the
-        /// stream's first delta, and no delta where the stream carried none.
         #[tokio::test]
         async fn a_turn_traces_its_request_id_and_first_delta() {
             let (origin, _) = serve(StatusCode::OK, TEXT_TURN).await;
@@ -763,8 +700,6 @@ mod tests {
             assert!(silent.first_delta.is_none(), "no delta, no first delta");
         }
 
-        /// A retry's trace describes the attempt that answered: the overloaded
-        /// first attempt counts, and its status does not survive.
         #[tokio::test]
         async fn a_retried_turn_traces_the_answering_attempt() {
             let calls = Arc::new(Mutex::new(0u32));
@@ -804,7 +739,6 @@ mod tests {
             assert_eq!(messages(&seen).len(), 1);
         }
 
-        /// A failed call's trace names the last status, which classifies it.
         #[tokio::test]
         async fn a_refused_turn_traces_its_http_status() {
             let (origin, _) = serve(StatusCode::BAD_REQUEST, "{}").await;
@@ -822,9 +756,6 @@ mod tests {
             );
         }
 
-        /// A gateway that streams a turn and a beat alike, and keeps each
-        /// Messages body it was sent. [`COMPLETED_TURN`] stands for the
-        /// stream a beat hangs up on.
         async fn serve_recording_bodies() -> (GatewayOrigin, Arc<Mutex<Vec<serde_json::Value>>>) {
             let bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
             let record = bodies.clone();
@@ -855,9 +786,6 @@ mod tests {
             )
         }
 
-        /// A turn hands back its prefill pair. Its whole body goes out as the
-        /// turn's bytes and parameters plus the beat prompt, and the usage of
-        /// the stream's `message_start` comes back.
         #[tokio::test]
         async fn a_turn_returns_a_pair_whose_beat_reads_the_turn() {
             let (origin, bodies) = serve_recording_bodies().await;

@@ -185,7 +185,7 @@ Both events are useful trigger sources. Examples worth considering:
 - **Building the archive with `tar`, `tar -czf`, or `gzip`.** A `.lucidos-plugin` is a renamed PKZip file. See "3. Local archive" and "Authoring loop" step 6.
 - **Calling the manifest `manifest.json`, `manifest.yaml`, or anything other than `manifest.toml`.** `validate_tree` looks for `manifest.toml` at the archive root and only parses TOML. Other names or formats reject the archive before any file is written. See the schema table above for the fields.
 - **Silently dropping or rewriting external references** (`<img src="../../artifacts/foo.png">`, `<script src="/data/scripts/bar.js">`). Ask the user about each one: see "Authoring loop" step 3.
-- **Putting a README at the plugin root.** Validation rejects any top-level entry that is not `manifest.toml` or one of the seven content directories. Put your README inside `apps/<id>/` if it is app-specific, or only in the source repo, which install never reads.
+- **Putting a README at the plugin root.** Validation rejects any top-level entry that is not `manifest.toml` or one of the eight content directories. Put your README inside `apps/<id>/` if it is app-specific, or only in the source repo, which install never reads.
 - **Committing `__pycache__/` or `*.pyc` files.** Install skips them (see "Plugin layout"), but they still bloat the repo and add noise to every PR. Give the plugin repo a `.gitignore` that lists `__pycache__/`, `*.pyc` and any other build output your scripts or apps create.
 - **Writing runtime state inside the plugin's own folders.** See "Where a plugin keeps its runtime state".
 - **Using underscores or capitals in `id`.** `browser_learning` and `Browser-Learning` both fail validation. Stick to `[a-z0-9-]+`.

@@ -89,6 +89,7 @@ Core terms (continued).
 - Secret reference
 - Backup recipient
 - Backup key
+- Backup origin
 - Cross-gateway link
 - Dashboard
 - Dashboard panel
@@ -207,6 +208,9 @@ Core terms (continued).
 - Gateway pairing
 - Gateway pairing secret
 - Manage grant
+- Control grant
+- Gateway switcher
+- Restore upload
 - Return access grant
 - Trusted pairing
 - Remote gateway
@@ -361,6 +365,8 @@ Core terms (continued).
 - Event hook
 - Hook definition
 - Hook answer
+- Software factory
+- Stage map
 - Typed answer
 - Unattested caller
 - Unsent message

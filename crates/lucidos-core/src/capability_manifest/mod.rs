@@ -1,92 +1,8 @@
-//! Capability parity manifest — the single source of truth for which agent
-//! surfaces (LLM tools, the `lucidos` CLI, the JS SDK) expose each capability.
-//!
-//! See `docs/adr/0018-capability-parity-manifest.md`. The problem this solves:
-//! the two agent-facing surfaces (LLM tools + CLI) silently drifted behind
-//! UI/SDK/HTTP — e.g. notifications had `list`/`mark_read`/`mark_all_read` in the
-//! UI/SDK/HTTP but no LLM tool and no CLI command, so the agent fell back to
-//! reverse-engineering `curl` against the gateway.
-//!
-//! ## How it enforces parity
-//!
-//! Each [`Domain`] declares its operations once, plus which surfaces it targets
-//! (`llm` / `cli` / `sdk`; `ui` / `http` are the substrate, not generated). From
-//! this one declaration:
-//!
-//! - the grouped LLM `ToolDefinition` is built in-crate ([`build_llm_tool`]),
-//!   so the tool schema can't drift from the manifest (guarded by a test);
-//! - the CLI command module is rendered at build time by
-//!   `crates/lucidos-cli/build.rs`, and the SDK capability table by
-//!   `scripts/codegen.sh` into `packages/lucidos-sdk/src/generated/`. Both come
-//!   from `lucidos_capabilities::codegen`, so neither can fall behind.
-//!
-//! The data itself lives in the `lucidos-capabilities` leaf crate, re-exported
-//! here, so the CLI can build from it without the engine. Adding an operation
-//! there forces the generated surfaces to follow.
-//!
-//! The grouped LLM tool runs the route its CLI calls, so the two share one
-//! behaviour as well as one schema (ADR 0751). Such a *route-backed tool* has
-//! no handler: `engine/tools/route_dispatch.rs` builds the CLI's request. A
-//! legacy domain on the shrink-only `LEGACY_IN_PROCESS` list keeps its
-//! handler, and a unit test checks that handler's actions against the manifest
-//! (see `engine/tools/notifications.rs`).
-//!
-//! ## Deliberate non-domain: the `event_wait` family
-//!
-//! `await_event`, `list_event_waits` and `cancel_event_wait`
-//! (`engine::event_wait`, ADR 0047) are standalone LLM tools and are
-//! deliberately NOT a domain here, so their absence is a decision rather than
-//! the drift this manifest exists to catch.
-//!
-//! **They already have CLI parity**, hand-wired as `lucidos await-event` and
-//! `lucidos event-waits list` / `cancel`. What they cannot have is *generated*
-//! parity, and the reason is structural: all three are scoped to the CALLING
-//! THREAD and take no thread argument at all, which is what stops one thread
-//! reading or ending another's subscriptions. The generators build an HTTP
-//! request out of declared `Arg`s, so a `:thread_id` path segment would have to
-//! be one, and then it would be a flag a caller could point anywhere. The CLI
-//! reads `$LUCIDOS_THREAD_ID` by hand instead
-//! (`crates/lucidos-cli/src/{await_event,event_waits}.rs`), which the manifest
-//! has no way to express.
-//!
-//! `request_read` (ADR 0409) is absent for the same reason. It acts on the
-//! calling thread and takes no argument, so its CLI verb, `lucidos
-//! request-read`, is hand-wired over `$LUCIDOS_THREAD_ID` too. So is `lucidos
-//! threads child-reports` (ADR 0566): only a coding agent takes its own
-//! thread's reports, so no LLM tool or SDK facade has one to take.
-//!
-//! No SDK either: an app iframe is not a thread and holds no subscriptions of
-//! its own. The capability an app or a script actually wants there is the
-//! `triggers` domain, which IS in the manifest: a standing rule that reacts to
-//! an event with no thread to resume.
-//!
-//! This note used to argue that parity was unreachable because `await_event`
-//! ended the turn and a CLI invocation had no turn to park. ADR 0049 retired
-//! that shape (a subscription holds nothing, and its delivery is an ordinary
-//! new turn), which is exactly what made the CLI verbs possible.
-//!
-//! **`lucidos build-slot` is absent for a different reason**, and it is also a
-//! decision rather than drift. A *build slot* is HOST state, not workspace
-//! state: the pool is a directory of file locks under `$HOME`, shared by every
-//! workspace on the machine (ADR 0070). The verb takes no domain argument and
-//! reaches no engine. It must work with no engine running at all, which is the
-//! case this manifest cannot express. Every domain here materialises as an
-//! HTTP call to one workspace, so generating this one would build exactly the
-//! dependency the design removes. No LLM tool and no SDK facade either: an app
-//! iframe runs no builds.
-
 pub use lucidos_capabilities::*;
 
 use crate::llm::provider::ToolDefinition;
 use serde_json::{Map, Value};
 
-// ---------------------------------------------------------------------------
-// LLM tool schema — built in-crate from the manifest so it can't drift.
-// ---------------------------------------------------------------------------
-
-/// Parse an operation's raw `llm_schema` (a JSON object of properties) into a
-/// map. Panics on malformed JSON — it's static manifest data covered by
-/// [`tests::every_llm_domain_builds`].
 fn parse_llm_schema(op: &Operation) -> Map<String, Value> {
     let raw = op
         .llm_schema
@@ -101,9 +17,6 @@ fn parse_llm_schema(op: &Operation) -> Map<String, Value> {
     }
 }
 
-/// The property name→schema pairs an operation contributes to the grouped LLM
-/// tool: the raw `llm_schema` verbatim when supplied, else scalar properties
-/// derived from `args`.
 fn op_llm_properties(op: &Operation) -> Vec<(String, Value)> {
     if op.llm_schema.is_some() {
         return parse_llm_schema(op).into_iter().collect();
@@ -124,7 +37,7 @@ fn op_llm_properties(op: &Operation) -> Vec<(String, Value)> {
         .collect()
 }
 
-/// Required-argument names for an operation's "(requires: …)" hint, derived from
+/// INVARIANT: Required-argument names for an operation's "(requires: …)" hint, derived from
 /// the required `args`. Skipped for ops with a raw `llm_schema`: their LLM shape
 /// can diverge from `args` (different names, e.g. `trigger_id` vs the HTTP query
 /// `id`), so the per-property descriptions in the schema carry requiredness
@@ -139,11 +52,6 @@ fn required_arg_names(op: &Operation) -> Vec<String> {
         .collect()
 }
 
-/// Build the grouped `ToolDefinition` for a domain from its manifest entry.
-/// Shape mirrors the existing grouped tools (`manage_models` / `manage_
-/// repositories`): an `action` enum plus the union of all operation args, with
-/// only `action` strictly required (per-action requirements are described in the
-/// text, since one params object spans every action).
 pub fn build_llm_tool(domain: &Domain) -> ToolDefinition {
     let llm_ops: Vec<&Operation> = domain
         .operations
@@ -154,12 +62,7 @@ pub fn build_llm_tool(domain: &Domain) -> ToolDefinition {
     let mut description = String::from(domain.tool_summary);
     description.push_str("\n\nActions:");
     for op in &llm_ops {
-        // Colon rather than an em dash: this string is LLM-facing prose the
-        // engine emits on every turn, so `.claude/rules/em-dashes.md`
-        // applies to it exactly as to a source line.
         description.push_str(&format!("\n• {}: {}", op.action, op.summary));
-        // Required-args hint: from the raw llm_schema when the op supplies one
-        // (its shape may differ from the HTTP args), else from `args`.
         let required = required_arg_names(op);
         if !required.is_empty() {
             description.push_str(&format!(" (requires: {})", required.join(", ")));
@@ -175,7 +78,7 @@ pub fn build_llm_tool(domain: &Domain) -> ToolDefinition {
             "description": "Which operation to perform.",
         }),
     );
-    // Union the per-operation properties. An operation whose LLM shape diverges
+    // INVARIANT: Union the per-operation properties. An operation whose LLM shape diverges
     // from its HTTP `args` supplies a raw `llm_schema` (used verbatim); the rest
     // derive scalar properties from `args`. A name shared across operations must
     // have a consistent shape (asserted by a manifest test), so first-wins.
@@ -196,14 +99,11 @@ pub fn build_llm_tool(domain: &Domain) -> ToolDefinition {
     }
 }
 
-/// The grouped LLM tools of a workspace with no capability configured: the
-/// ungated domains, plus Classic's `memory`, since a turn runs Classic until
-/// its Tree is ready.
 pub fn llm_tools() -> Vec<ToolDefinition> {
     llm_tools_for(&crate::llm::ToolCapabilities::default())
 }
 
-/// The grouped LLM tools one workspace is offered: every domain whose gate
+/// INVARIANT: The grouped LLM tools one workspace is offered: every domain whose gate
 /// `caps` opens, in manifest order. A shut gate removes its tool and moves
 /// nothing else. So the memory module swaps `memory` for `recall` in one
 /// slot, and the rest of the cached array stays as it was.
@@ -218,8 +118,6 @@ pub fn llm_tools_for(caps: &crate::llm::ToolCapabilities) -> Vec<ToolDefinition>
 #[cfg(test)]
 mod tests {
 
-    /// The arrange schema spells the size and dashboard enums out by hand,
-    /// since a `const` string cannot read them. This keeps it on the Rust lists.
     #[test]
     fn the_arrange_schema_offers_every_size_and_dashboard() {
         let schema: serde_json::Value = serde_json::from_str(DASHBOARD_ARRANGE_LLM_SCHEMA).unwrap();
@@ -260,11 +158,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// The schema enum is what the model picks values from, and the parser
-    /// validates against `ThreadStatus::ALL`. If they drift, the model is
-    /// offered a value the engine then refuses, or a real status becomes
-    /// unaskable. Both schemas are checked because the two are separate
-    /// literals.
     #[test]
     fn threads_status_enum_matches_the_thread_status_enum() {
         let values = crate::engine::thread_lifecycle::ThreadStatus::ALL
@@ -298,10 +191,6 @@ mod tests {
         );
     }
 
-    /// A caller reading only the tool schema has to be able to tell that
-    /// `active` is a union, and which half answers "is the workspace busy?".
-    /// Getting that wrong is what hid four pending changes for three hours on
-    /// 2026-08-07.
     #[test]
     fn threads_active_descriptions_state_the_union_and_point_at_running() {
         for (action, schema) in [
@@ -324,9 +213,6 @@ mod tests {
         }
     }
 
-    /// A fixed body value rides every call verbatim, so a typo would ship a
-    /// request the route refuses. It must parse as JSON of its arg's type, and
-    /// stay out of the schema a caller fills.
     #[test]
     fn every_fixed_body_value_is_json_of_its_type_and_hidden_from_callers() {
         for d in domains() {
@@ -373,12 +259,10 @@ mod tests {
     fn aliases_resolve_to_their_domain() {
         let d = domain_for_tool("read_notifications").expect("alias resolves");
         assert_eq!(d.name, "notifications");
-        // The canonical tool name resolves too.
         assert_eq!(
             domain_for_tool("notifications").unwrap().name,
             "notifications"
         );
-        // An unknown name does not.
         assert!(domain_for_tool("nope").is_none());
     }
 
@@ -389,7 +273,6 @@ mod tests {
         assert_eq!(tool.name, "notifications");
         let props = &tool.parameters["properties"];
         assert_eq!(props["action"]["enum"], serde_json::json!(d.actions()));
-        // Union of args across operations is present.
         for name in ["filter", "limit", "id"] {
             assert!(
                 props.get(name).is_some(),
@@ -399,8 +282,6 @@ mod tests {
         assert_eq!(tool.parameters["required"], serde_json::json!(["action"]));
     }
 
-    /// A shared arg name must have one consistent shape across operations, or the
-    /// first-wins union in `build_llm_tool` would silently hide a divergence.
     #[test]
     fn shared_arg_names_have_consistent_shape() {
         for d in domains() {
@@ -426,11 +307,6 @@ mod tests {
         }
     }
 
-    /// `build_llm_tool` unions per-operation properties first-wins; a property
-    /// defined by two operations with DIFFERENT structure (type / enum / oneOf /
-    /// anyOf) would be silently hidden. Descriptions may legitimately differ
-    /// (prose), so compare structure only. Guards the LLM-side union the same way
-    /// `shared_arg_names_have_consistent_shape` guards the CLI/SDK `args`.
     #[test]
     fn llm_union_properties_have_consistent_structure() {
         fn structural(v: &Value) -> Value {
@@ -464,9 +340,6 @@ mod tests {
         }
     }
 
-    /// Every LLM domain's grouped tool must build — exercises `build_llm_tool`
-    /// for all of them so a malformed `llm_schema` (the raw JSON contributed by
-    /// diverging ops) fails the suite rather than panicking at runtime.
     #[test]
     fn every_llm_domain_builds() {
         for d in domains().iter().filter(|d| d.llm) {
@@ -484,12 +357,6 @@ mod tests {
         }
     }
 
-    /// No agent surface reaches webhooks, in any shape.
-    ///
-    /// The side-effect-grant precedent: an agent must not widen its own
-    /// authority, and a webhook is a publicly reachable door emitting a pinned
-    /// event. The manifest is the single source for every generated surface, so
-    /// the flags here are what actually enforce it.
     #[test]
     fn no_agent_surface_can_create_a_webhook() {
         let webhooks = domains().iter().find(|d| d.name == "webhooks").unwrap();
@@ -522,9 +389,6 @@ mod tests {
         assert_eq!(cli_ops, vec!["list", "create", "update", "delete"]);
     }
 
-    /// Each operation's `llm_alias` (when present) must resolve back to its
-    /// domain via `domain_for_tool`, and map to the operation's action via
-    /// `legacy_tool_for_action` — the round-trip the grouped handlers rely on.
     #[test]
     fn llm_aliases_round_trip() {
         for d in domains() {
@@ -549,9 +413,6 @@ mod tests {
         }
     }
 
-    /// Any operation generated onto the CLI or SDK must have a real HTTP route
-    /// (the codegen builds a request from `method` + `path`). An LLM-only op
-    /// (e.g. trigger pause/resume) is exempt — it never reaches the generators.
     #[test]
     fn generated_ops_have_http_routes() {
         for d in domains() {
@@ -579,16 +440,12 @@ mod tests {
             triggers.actions(),
             vec!["create", "list", "update", "delete", "pause", "resume", "run"]
         );
-        // pause/resume are LLM-only (no dedicated HTTP route).
         let pause = triggers
             .operations
             .iter()
             .find(|o| o.action == "pause")
             .unwrap();
         assert!(pause.on_llm(triggers) && !pause.on_cli(triggers) && !pause.on_sdk(triggers));
-        // `run` DOES have its own route (POST /triggers/run), so unlike
-        // pause/resume it is on every surface. A regression that drops it from
-        // the CLI or SDK re-splits the parity the manifest exists to hold.
         let run = triggers
             .operations
             .iter()
@@ -608,11 +465,9 @@ mod tests {
         );
         assert!(groups.llm && groups.cli && !groups.sdk);
 
-        // apps is CLI+SDK only (LLM keeps standalone create_app/list_apps).
         let apps = domains().iter().find(|d| d.name == "apps").unwrap();
         assert!(!apps.llm && apps.cli && apps.sdk);
         assert!(apps.actions().is_empty(), "apps exposes no LLM actions");
-        // list/get are on the SDK; update/delete are CLI-only.
         let get = apps.operations.iter().find(|o| o.action == "get").unwrap();
         assert!(get.on_cli(apps) && get.on_sdk(apps));
         let delete = apps
@@ -625,8 +480,6 @@ mod tests {
 
     #[test]
     fn phase5a_domains_declared() {
-        // mcp: grouped LLM tool plus a CLI. No SDK, since no app manages
-        // servers.
         let mcp = domains().iter().find(|d| d.name == "mcp").unwrap();
         assert_eq!(
             mcp.actions(),
@@ -639,9 +492,6 @@ mod tests {
             Some("remove_mcp_server")
         );
 
-        // The routes each verb declares are the routes `api/mcp.rs` serves. A
-        // wrong path here is not cosmetic: the CLI generator builds its request
-        // out of it, so a stale one ships a command that 404s.
         let op = |action: &str| {
             mcp.operations
                 .iter()
@@ -662,8 +512,6 @@ mod tests {
             "/threads/:thread_id/mcp-servers/:id/disable"
         );
 
-        // Every path segment the generator substitutes needs an arg to
-        // substitute from, or the emitted `format!` loses the id.
         for action in ["enable", "disable", "start", "stop", "remove"] {
             let o = op(action);
             assert!(
@@ -685,12 +533,8 @@ mod tests {
             );
         }
 
-        // setup is the one verb off the CLI: no HTTP route, and its shape is an
-        // llm_schema rather than args, so a generated command would post
-        // nothing.
         assert!(!op("setup").on_cli(mcp));
 
-        // plugins — grouped LLM tool only (confirm-panel handshake; no CLI/SDK).
         let plugins = domains().iter().find(|d| d.name == "plugins").unwrap();
         assert_eq!(
             plugins.actions(),
@@ -712,7 +556,6 @@ mod tests {
 
     #[test]
     fn phase5b_domains_declared() {
-        // events — grouped LLM tool only (rich hand-written CLI stays).
         let events = domains().iter().find(|d| d.name == "events").unwrap();
         assert_eq!(
             events.actions(),
@@ -726,7 +569,6 @@ mod tests {
             Some("list_event_types")
         );
 
-        // changes — grouped LLM tool only (hand-written CLI stays).
         let changes = domains().iter().find(|d| d.name == "changes").unwrap();
         assert_eq!(
             changes.actions(),
@@ -748,9 +590,7 @@ mod tests {
     fn phase5c_thread_queue_declared() {
         let tq = domains().iter().find(|d| d.name == "thread_queue").unwrap();
         assert!(tq.llm && tq.cli && !tq.sdk);
-        // LLM exposes list + update_policy (run-now/drop are CLI-only).
         assert_eq!(tq.actions(), vec!["list", "update_policy"]);
-        // CLI exposes list + run-now + drop (update_policy is LLM-only).
         let cli_ops: Vec<&str> = tq
             .operations
             .iter()
@@ -772,18 +612,10 @@ mod tests {
     fn phase5d_memory_declared() {
         let mem = domains().iter().find(|d| d.name == "memory").unwrap();
         assert!(mem.llm && mem.cli && !mem.sdk);
-        // The LLM gets correction plus the two reads that help it ANSWER: an
-        // on-demand `search` for when the pre-turn injection missed, and
-        // `source` to walk one memory back to its conversation. `stats` and
-        // `entries` stay off it deliberately, being operator reads with no
-        // bearing on a user's question and exactly the browsing the tool
-        // summaries warn against.
         assert_eq!(
             mem.actions(),
             vec!["correct", "correct_by_id", "source", "search"]
         );
-        // The CLI keeps every read, including the two the LLM now shares, and
-        // the by-id correction a script used to make by SQL (ADR 0760).
         let cli_ops: Vec<&str> = mem
             .operations
             .iter()
@@ -804,15 +636,6 @@ mod tests {
     #[test]
     fn phase5e_threads_declared() {
         let threads = domains().iter().find(|d| d.name == "threads").unwrap();
-        // `search` answers "we talked about this", which `list` structurally
-        // cannot: it filters by status and channel and never by topic.
-        // `detach_child` stops waiting for a child (ADR 0278). `archive` closes
-        // the caller or one of its children (ADR 0310). `drafts` and
-        // `held_messages` say what a thread holds that nothing has sent, and
-        // `submit_draft` sends a saved draft on the owner's authority (ADR 0651).
-        // `cache_keep_alive` is the per-thread keep-alive switch (ADR 0554).
-        // `context_ceiling` sets a thread's context ceiling (ADR 0629).
-        // `triage` and `apply_triage` are thread triage (ADR 0349).
         assert_eq!(
             threads.actions(),
             vec![
@@ -836,13 +659,10 @@ mod tests {
             threads.legacy_tool_for_action("count"),
             Some("count_threads")
         );
-        // run_thread / run_coding_agent stay standalone — NOT folded here.
         assert!(domain_for_tool("run_thread").is_none());
         assert!(domain_for_tool("run_coding_agent").is_none());
     }
 
-    /// The two actions that read what a thread holds unsent are GETs, flagged
-    /// non-mutating. The one that sends a saved draft is a mutating POST.
     #[test]
     fn the_unsent_reads_are_read_only() {
         let threads = domains().iter().find(|d| d.name == "threads").unwrap();
@@ -872,14 +692,6 @@ mod tests {
         );
     }
 
-    /// The `threads` domain is READ-ONLY, and deleting is the reason to say so
-    /// out loud (ADR 0192). The assertion above pins the exact action list, so
-    /// it already fails if a `delete` lands; this one fails with the reason.
-    ///
-    /// Deleting a thread removes its rows, its sub-threads and what the
-    /// workspace learned from them, with no undo. It is offered to the owner in
-    /// the UI and nowhere else. So adding it to any generated surface is the
-    /// thing that must not happen quietly.
     #[test]
     fn the_threads_domain_exposes_no_delete() {
         let threads = domains().iter().find(|d| d.name == "threads").unwrap();
@@ -902,8 +714,6 @@ mod tests {
     #[test]
     fn phase5f_env_vars_declared() {
         let ev = domains().iter().find(|d| d.name == "env_vars").unwrap();
-        // Full LLM/CLI parity (no SDK). The retired set_environment_variable tool
-        // stays wired as a back-compat alias to the `set` action.
         assert!(ev.llm && ev.cli && !ev.sdk);
         assert_eq!(ev.actions(), vec!["list", "set", "delete"]);
         let cli_ops: Vec<&str> = ev
@@ -913,7 +723,6 @@ mod tests {
             .map(|o| o.cli_name)
             .collect();
         assert_eq!(cli_ops, vec!["list", "set", "delete"]);
-        // Back-compat alias resolves to the env_vars domain / `set` action.
         assert_eq!(
             domain_for_tool("set_environment_variable").unwrap().name,
             "env_vars"
@@ -922,16 +731,12 @@ mod tests {
             ev.legacy_tool_for_action("set"),
             Some("set_environment_variable")
         );
-        // list/delete are brand-new ops with no retired predecessor.
         assert_eq!(ev.legacy_tool_for_action("list"), None);
         assert_eq!(ev.legacy_tool_for_action("delete"), None);
     }
 
     #[test]
     fn phase5g_models_and_repositories_migrated() {
-        // models — LLM tool name stays `manage_models`; the built schema must
-        // reproduce the old hand-written tool (actions + properties), and the CLI
-        // gets list/add/update/delete.
         let models = domains().iter().find(|d| d.name == "models").unwrap();
         assert_eq!(models.tool_name, "manage_models");
         assert!(models.llm && models.cli && !models.sdk);
@@ -946,8 +751,6 @@ mod tests {
             .map(|o| o.cli_name)
             .collect();
         assert_eq!(cli_ops, vec!["list", "add", "update", "delete"]);
-        // The migrated LLM name resolves; the built schema has the same property
-        // set the old get_manage_models_tool exposed.
         let tool = build_llm_tool(models);
         assert_eq!(tool.name, "manage_models");
         let props = &tool.parameters["properties"];
@@ -978,9 +781,6 @@ mod tests {
         );
         assert_eq!(domain_for_tool("manage_models").unwrap().name, "models");
 
-        // repositories: all three verbs on the LLM tool, `list` alone on the
-        // CLI. A write verb appearing here means the read-only decision was
-        // reversed by accident. See the block comment above `REPO_NAME_ARG`.
         let repos = domains().iter().find(|d| d.name == "repositories").unwrap();
         assert_eq!(repos.tool_name, "manage_repositories");
         assert!(repos.llm && repos.cli && !repos.sdk);
@@ -1006,8 +806,6 @@ mod tests {
         );
     }
 
-    /// The CLI and SDK read `args`, so the route editing surface lives there:
-    /// `routes` on add and update, `preferred_provider` on update.
     #[test]
     fn model_route_args_reach_the_cli() {
         let models = domains().iter().find(|d| d.name == "models").unwrap();
@@ -1018,14 +816,11 @@ mod tests {
         assert!(args_of("add").contains(&"routes"));
         assert!(args_of("update").contains(&"routes"));
         assert!(args_of("update").contains(&"preferred_provider"));
-        // `routes` alone can add a model, so `provider` must not be required.
         let add = models.operations.iter().find(|o| o.action == "add");
         let provider = add.unwrap().args.iter().find(|a| a.name == "provider");
         assert!(!provider.unwrap().required);
     }
 
-    /// The trigger provider pin reaches every surface: CLI and SDK through
-    /// `args`, the LLM tool through the create schema.
     #[test]
     fn trigger_provider_pin_reaches_every_surface() {
         let triggers = domains().iter().find(|d| d.name == "triggers").unwrap();
@@ -1046,8 +841,6 @@ mod tests {
         );
     }
 
-    /// One provider list: the manifest's enum is `ProviderKind::ALL`, and every
-    /// raw schema that spells the list out spells exactly it.
     #[test]
     fn provider_enums_match_provider_kind() {
         let names: Vec<&str> = crate::llm::ProviderKind::ALL

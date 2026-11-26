@@ -181,6 +181,19 @@ describe('Disclosure', () => {
     expect(closing.keyframes.map(k => k.height)).toEqual(['120.4px', '0px']);
   });
 
+  it('discards a queued opening when the disclosure closes before measurement', async () => {
+    const view = (open: boolean) => (
+      <Disclosure open={open}><div class="row">a</div></Disclosure>
+    );
+    await act(() => { render(view(false), host); });
+    await act(() => {
+      render(view(true), host);
+      render(view(false), host);
+    });
+    const rolls = anims.filter(a => a.el.classList.contains('disclosure'));
+    expect(rolls.map(a => a.keyframes.map(k => k.height))).toEqual([['120px', '0px']]);
+  });
+
   it('runs the drawer curve and length, shared by height and roll', async () => {
     await show(false);
     await show(true);

@@ -9,7 +9,6 @@ fn hooks_root(workspace: &Path) -> PathBuf {
     workspace.join(DATA_DIR).join(HOOKS_DIR)
 }
 
-/// Write `data/hooks/<slug>/hook.toml`, plus each named file beside it.
 fn write_hook(workspace: &Path, slug: &str, toml: &str, files: &[&str]) {
     let dir = hooks_root(workspace).join(slug);
     std::fs::create_dir_all(&dir).unwrap();
@@ -36,8 +35,6 @@ fn only_problems(workspace: &Path) -> Vec<String> {
     }
 }
 
-/// A persisted system event that is not also a thread event, so the kind it
-/// lists under is unambiguous.
 fn system_only_event() -> &'static str {
     SystemEvent::PERSISTED_TYPE_NAMES
         .iter()
@@ -45,7 +42,6 @@ fn system_only_event() -> &'static str {
         .expect("a persisted system event that is not a thread event")
 }
 
-/// A system frame the engine broadcasts and never records.
 fn transient_event() -> &'static str {
     SystemEvent::RESERVED_TYPE_NAMES
         .iter()
@@ -147,7 +143,6 @@ fn a_transient_event_is_not_hookable() {
     );
 }
 
-/// No hook may stop the owner arming, disarming or removing a hook.
 #[test]
 fn an_arming_event_is_not_hookable() {
     for name in ARMING_EVENT_TYPES {
@@ -191,7 +186,6 @@ fn a_script_that_cannot_be_read_makes_the_hook_invalid() {
     );
     let script = hooks_root(ws.path()).join("gate/check.py");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o000)).unwrap();
-    // A process that may read any file, such as root, reads it anyway.
     if std::fs::read(&script).is_ok() {
         return;
     }
@@ -399,7 +393,6 @@ fn a_link_to_nothing_reports_why_it_cannot_be_read() {
     );
 }
 
-/// macOS refuses a file name that is not UTF-8, so only Linux can make one.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_name_that_is_not_utf8_says_so() {
@@ -445,4 +438,30 @@ fn a_hooks_tree_that_links_out_of_data_is_an_error() {
     std::fs::create_dir_all(ws.path().join(DATA_DIR)).unwrap();
     std::os::unix::fs::symlink(outside.path(), hooks_root(ws.path())).unwrap();
     assert!(WorkspaceHooks.list_definitions(ws.path()).is_err());
+}
+
+#[test]
+fn plugin_hooks_copy_a_shipped_script_into_the_hashed_folder() {
+    let plugin = tempfile::tempdir().unwrap();
+    let root = plugin.path();
+    let hook = root.join("hooks/gate");
+    std::fs::create_dir_all(&hook).unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    let definition = hook_toml("MessageReceived", "").replace("check.py", "scripts/check.py");
+    std::fs::write(hook.join("hook.toml"), &definition).unwrap();
+    std::fs::write(root.join("scripts/check.py"), "print('allow')").unwrap();
+
+    let mut planned = lucidos_core::core::plugins::plan_files(root);
+    WorkspaceHooks
+        .bundle_plugin_scripts(root, &mut planned)
+        .unwrap();
+    let listings = WorkspaceHooks.list_at(&root.join("hooks")).unwrap();
+    let hash = listings[0].content_hash().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(hook.join("scripts/check.py")).unwrap(),
+        "print('allow')"
+    );
+    std::fs::write(hook.join("scripts/check.py"), "print('refuse')").unwrap();
+    let changed = WorkspaceHooks.list_at(&root.join("hooks")).unwrap();
+    assert_ne!(changed[0].content_hash().unwrap(), hash);
 }

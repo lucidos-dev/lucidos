@@ -22,6 +22,7 @@ export type EventHook = {
   armed: EventHookArming | null;
   arm_refusal: string | null;
   remove_refusal: string | null;
+  plugin_id?: string;
 } & (
   | {
       status: 'valid';

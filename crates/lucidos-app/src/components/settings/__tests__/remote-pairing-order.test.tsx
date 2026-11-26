@@ -6,7 +6,7 @@ import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { RemoteGatewaysSection } from '../GatewayPairingSections';
 import { pickerFooter, type PickerFooterProps } from '../../picker/PickerFooter';
-import { EMPTY_RESTORE_DRAFT } from '../../picker/workspaceForms';
+import { EMPTY_RESTORE_DRAFT, IDLE_RESTORE_UPLOAD } from '../../picker/workspaceForms';
 import { HTTPS_ONLY_NOTE } from '../remoteGatewayForm';
 import * as control from '../../../api/client/control';
 import { openFold } from './openFold';
@@ -20,11 +20,11 @@ vi.mock('../../../api/client/control', async (importOriginal) => ({
 
 const noop = () => {};
 const pickerProps: PickerFooterProps = {
-  mode: 'remote', onMode: noop, busy: false, restoreRunning: false,
+  mode: 'remote', onMode: noop, busy: false, restoreRunning: false, target: null, targetBlocker: null,
   name: '', onName: noop, onCreate: noop, onCancelCreate: noop,
   suggestions: [], onSuggestion: noop, createNote: null,
   draft: EMPTY_RESTORE_DRAFT, onDraft: noop, onPickFile: noop,
-  onRestore: noop, onCancelRestore: noop, blocker: null, fileNote: null,
+  restoreUpload: IDLE_RESTORE_UPLOAD, onRestore: noop, onCancelRestore: noop, blocker: null, fileNote: null,
   onDeleteColliding: noop,
   remoteDraft: { name: 'cloud', code: 'lgp_secret', address: 'https://cloud.example.com' },
   onRemoteDraft: noop, onAddRemote: noop, onCancelRemote: noop,

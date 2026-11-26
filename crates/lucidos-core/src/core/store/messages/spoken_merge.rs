@@ -1,50 +1,13 @@
-//! When two spoken rows are one thing said, and how their words join.
-//!
-//! A voice provider ends a speaker's turn after a fraction of a second of
-//! silence, so it cuts a sentence wherever the speaker breathes. Every turn is
-//! written down as it finishes, which is what lets the transcript read by the
-//! clock alone (ADR 0201). Putting the pieces back together is a READING of
-//! those rows, done in two places: here for the doer's conversation history,
-//! and in `store/thread-events/spokenMerge.ts` for the transcript.
-//!
-//! **One rule, two languages, proven identical.** The cases below are
-//! generated into a fixture the TypeScript side replays (`./scripts/codegen.sh`),
-//! so the two cannot drift.
-
-/// How far apart two spoken rows may be and still be one thing said.
-///
-/// A reported call held gaps of 1.0s, 2.0s, 1.3s and 3.6s INSIDE single
-/// sentences, so anything under about four seconds is ordinary speech. Five
-/// clears that with margin.
-///
-/// A bound could not decide a turn's end, which is what ADR 0187 and ADR 0188
-/// each proved the hard way: that question is asked live, with no idea whether
-/// more words are coming. This one is asked afterwards, holding both
-/// timestamps, and it only decides how words are grouped on screen.
 pub(crate) const MERGE_GAP_SECS: f64 = 5.0;
 
-/// Characters that attach to the word before them, with no space.
-///
-/// The seam is where the transcriber cut, so the next piece often opens with
-/// the punctuation that ended the last one. `Status` and `, please` are one
-/// sentence, and a space between them would be wrong.
 const CLITIC_OPENERS: &[char] = &[
     '.', ',', '!', '?', ';', ':', '…', ')', ']', '}', '%', '\'', '\u{2019}', '"', '\u{201D}',
 ];
 
-/// Should these two rows read as one thing said?
-///
-/// Both halves are required. Adjacency is decided by the caller, which walks
-/// the rows in clock order: anything from another speaker between them means
-/// they are two things, however close the clock says they are.
 pub(crate) fn is_one_utterance(gap_secs: f64, same_speaker: bool) -> bool {
     same_speaker && (0.0..=MERGE_GAP_SECS).contains(&gap_secs)
 }
 
-/// Join one piece of speech onto another.
-///
-/// No space before a clitic, one space otherwise. Empty pieces contribute
-/// nothing, so a merge over a blank row reads as though it were not there.
 pub fn join_spoken(first: &str, second: &str) -> String {
     let first = first.trim();
     let second = second.trim();
@@ -65,7 +28,6 @@ pub fn join_spoken(first: &str, second: &str) -> String {
     }
 }
 
-/// One generated case: the inputs, and what both languages must answer.
 #[derive(serde::Serialize)]
 struct MergeCase {
     pub name: &'static str,
@@ -77,7 +39,6 @@ struct MergeCase {
     pub joined: String,
 }
 
-/// Every case the fixture pins.
 fn cases() -> Vec<MergeCase> {
     const INPUTS: &[(&str, &str, &str, f64, bool)] = &[
         ("a comma clause attaches", "Status", ", please", 0.4, true),
@@ -152,10 +113,6 @@ fn cases() -> Vec<MergeCase> {
         .collect()
 }
 
-/// The fixture the TypeScript side replays, as JSON.
-///
-/// Pretty-printed with a trailing newline, matching every other generated file
-/// in `crates/lucidos-app/src/generated/`.
 pub fn render_fixture() -> String {
     let mut json = serde_json::to_string_pretty(&serde_json::json!({
         "merge_gap_secs": MERGE_GAP_SECS,
@@ -203,9 +160,6 @@ mod tests {
         assert!(!is_one_utterance(0.1, false));
     }
 
-    /// A row that reads as written BEFORE the one in front of it is not a
-    /// neighbour, it is a clock nobody can trust. Merging there would glue
-    /// rows the reader sees in the other order.
     #[test]
     fn a_backwards_gap_never_merges() {
         assert!(!is_one_utterance(-0.5, true));

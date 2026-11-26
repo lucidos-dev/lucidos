@@ -1,7 +1,3 @@
-//! Free helper functions and small types extracted from the agentic-loop
-//! driver. Re-exported from `agentic_loop`'s mod.rs so existing
-//! `agentic_loop::X` and `super::X` paths keep resolving.
-
 use crate::core::store::with_event_address;
 use crate::engine::chat::process::ChatProcessExt;
 use crate::engine::tools::todo::TodoExt;
@@ -40,7 +36,7 @@ pub(crate) fn cancel_cause_for_turn(
         .unwrap_or(crate::engine::thread_events::CancelCause::UserStop)
 }
 
-/// Race a tool execution future against the per-thread cancel token. On
+/// INVARIANT: Race a tool execution future against the per-thread cancel token. On
 /// cancel, returns `Err("Error: canceled by user")` so the agent loop's
 /// `tool_use → tool_result` pairing invariant survives — every emitted
 /// `ToolCalled` gets a matching `ToolResult` (with `success: false`)
@@ -70,11 +66,6 @@ where
     }
 }
 
-/// Tools that may run at the same time as their neighbours in one batch.
-///
-/// Every entry is a pure read. None has a command guard lane, none routes
-/// through `handle_special_tool`, none emits a thread event while it runs, and
-/// none writes. Adding a tool here means checking all four (ADR 0246).
 pub(crate) const PARALLEL_SAFE_TOOLS: &[&str] = &[
     tn::READ_FILE,
     tn::LIST_FILES,
@@ -87,21 +78,13 @@ pub(crate) const PARALLEL_SAFE_TOOLS: &[&str] = &[
     tn::LIST_EVENT_TYPES,
 ];
 
-/// The most calls of one parallel run in flight at once. It bounds the
-/// pressure a batch of web searches puts on the search provider.
 pub(crate) const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 
-/// Whether this call may run beside its neighbours. It judges the name
-/// `execute_tool` will dispatch on, so a grouped tool counts only when its
-/// `action` resolves to an allowlisted flat name.
 pub(crate) fn is_parallel_safe(name: &str, args: &serde_json::Value) -> bool {
     crate::engine::tool_arguments::dispatch_name(name, args)
         .is_ok_and(|dispatched| PARALLEL_SAFE_TOOLS.contains(&dispatched))
 }
 
-/// The exclusive end of the parallel run that starts at `start`: the block of
-/// consecutive parallel-safe calls. A run never crosses another call, so a
-/// read that follows a write in the same batch still sees the write.
 pub(crate) fn parallel_run_end(calls: &[crate::llm::provider::ToolCall], start: usize) -> usize {
     start
         + calls[start..]
@@ -125,22 +108,15 @@ pub(crate) async fn run_concurrently<F: std::future::Future>(calls: Vec<F>) -> V
     finished.into_iter().map(|(_, output)| output).collect()
 }
 
-/// What one call of a parallel run leaves for the loop's bookkeeping. Its
-/// `ToolCalled` and `ToolResult` were emitted when it started and finished.
 pub(super) struct ParallelRead {
     pub(super) tool_called_event_id: Option<Uuid>,
-    /// The raw outcome text, as the ordinary path's `result`.
     pub(super) result: String,
-    /// What the model sees, as the ordinary path's `split.llm_text`.
     pub(super) llm_text: String,
     pub(super) is_error: bool,
 }
 
 #[easy_ext::ext(HelpersExt)]
 pub(super) impl LucidosEngine {
-    /// Persist and broadcast `ToolCalled` for one call, and log it as step
-    /// `step` of `max`. Returns the event id, which pairs the result and
-    /// becomes a spawned thread's `spawning_event_id`.
     async fn emit_tool_called(
         &self,
         thread_id: Uuid,
@@ -193,13 +169,6 @@ pub(super) impl LucidosEngine {
             .await;
     }
 
-    /// Run a block of parallel-safe calls at once, each reporting as it goes.
-    ///
-    /// Every call emits `ToolCalled` when it starts and `ToolResult` the moment
-    /// it finishes, so each step row shows what really happened (ADR 0246).
-    /// The cancel race wraps only the work, never the emits: a dropped future
-    /// must not leave a call without its result. Outputs come back in call
-    /// order, which is the order the model receives them in.
     #[allow(clippy::too_many_arguments)]
     async fn run_parallel_reads(
         &self,
@@ -250,7 +219,7 @@ pub(super) impl LucidosEngine {
     }
 }
 
-/// Race a **read-only** future against the per-thread cancel token, yielding
+/// INVARIANT: Race a **read-only** future against the per-thread cancel token, yielding
 /// `None` when the token wins. The turn's setup phase (history load, query
 /// classification, memory retrieval, system-prompt and context assembly) uses
 /// this so a user Stop ends the turn from wherever it is, instead of only at
@@ -283,18 +252,9 @@ where
 #[derive(Debug)]
 pub(crate) enum InjectedPromptGroup {
     UserText(Vec<InjectedPrompt>),
-    /// One engine re-entry, kept out of any batch. Named for the LAYOUT rather
-    /// than the source, because every engine re-entry gets the same one: its
-    /// exchange-starter is already on the wire, so the text is projected inline
-    /// and no `PromptInjected` is emitted. Which re-entry it is stays on
-    /// [`InjectedPromptKind`], which is what the log line reads.
     Standalone(Box<InjectedPrompt>),
 }
 
-/// Keep each engine re-entry as a standalone user-channel block, but batch
-/// contiguous user/agent/engine text prompts so one injection window becomes
-/// one LLM user message. Each original prompt still emits its own
-/// PromptInjected audit event at append time.
 pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<InjectedPromptGroup> {
     let mut groups = Vec::new();
     let mut user_batch = Vec::new();
@@ -325,10 +285,7 @@ pub(crate) fn injections_reopen_a_finished_answer(prompts: &[InjectedPrompt]) ->
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InjectionDelivery {
-    /// Appended to the message list of a turn that is still running.
     MidTurn,
-    /// Re-processed as a turn of its own because the previous turn ended
-    /// before draining it (`api::chat::process_orphan_chain`).
     NewTurn,
 }
 
@@ -370,10 +327,6 @@ pub(crate) fn prompts_have_images(prompts: &[InjectedPrompt]) -> bool {
         .any(|prompt| prompt.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
 }
 
-/// Build the one user message a mid-turn injection batch is appended to. The
-/// delivery is intrinsic to this builder — it exists only for the live-turn
-/// path; the orphan path uses [`coalesced_user_text_for_reprocess`].
-/// `workspace` is where the images' blobs live, which their handles need.
 pub(crate) fn coalesced_user_text_message(
     workspace: &std::path::Path,
     prompts: &[InjectedPrompt],
@@ -389,8 +342,6 @@ pub(crate) fn coalesced_user_text_message(
         let mut blocks = Vec::new();
         for prompt in prompts {
             let mut text = framed_injected_prompt(prompt, InjectionDelivery::MidTurn);
-            // Same label a turn-opening image gets, so the agent copies the
-            // handle instead of guessing a `thread:N`.
             if let Some(imgs) = prompt.images.as_deref().filter(|imgs| !imgs.is_empty()) {
                 let noun = if imgs.len() == 1 { "image" } else { "images" };
                 let handles: Vec<String> =
@@ -422,9 +373,6 @@ pub(crate) fn coalesced_user_text_message(
     }
 }
 
-/// Build the opening text of the turn that re-processes orphaned injections —
-/// messages the previous turn ended before draining. That turn is over, so
-/// these are framed as `NewTurn`, never with a resume directive.
 pub(crate) fn coalesced_user_text_for_reprocess(prompts: &[InjectedPrompt]) -> String {
     prompts
         .iter()
@@ -509,11 +457,8 @@ pub(crate) async fn filter_removed_queued_prompts(
     filtered
 }
 
-/// What [`append_injected_prompts_to_messages`] added to the message list.
 #[derive(Debug, Default)]
 pub(crate) struct AppendedInjections {
-    /// At least one message was appended, so the caller re-points
-    /// `user_message_idx` at the new last message.
     pub appended: bool,
     pub image_message_idxs: Vec<usize>,
 }
@@ -530,12 +475,6 @@ pub(crate) async fn append_injected_prompts_to_messages(
     for group in group_injected_prompts(prompts) {
         match group {
             InjectedPromptGroup::Standalone(prompt) => {
-                // An empty block is a provider 400 ("all messages must have
-                // non-empty content"), and it would carry nothing anyway. The
-                // callers are supposed to keep an empty re-entry off this path
-                // entirely (see `is_attached_event_wake` in `chat/process`);
-                // this is the backstop that turns a future slip into a dropped
-                // no-op rather than a failed turn.
                 if prompt.text.trim().is_empty() {
                     crate::log_legacy!(
                         "[Inject] Dropped an empty engine re-entry {:?} on thread {}",
@@ -550,7 +489,6 @@ pub(crate) async fn append_injected_prompts_to_messages(
                     prompt.spawning_event_id,
                     thread_id
                 );
-                // Engine re-entries are text-only, so there is nothing to pin.
                 messages.push(Message {
                     role: "user".to_string(),
                     content: MessageContent::Text(prompt.text),
@@ -585,57 +523,24 @@ pub(crate) async fn append_injected_prompts_to_messages(
     result
 }
 
-/// Cross-provider classification of a completion's finish reason. Providers
-/// report the raw reason verbatim and use *different vocabularies* — Anthropic
-/// lowercases (`end_turn`, `max_tokens`, `refusal`), Gemini uppercases (`STOP`,
-/// `MAX_TOKENS`, `SAFETY`, `RECITATION`), OpenAI mixes (`completed`, `stop`,
-/// `length`, `max_output_tokens`, `content_filter`). Classifying on a single
-/// provider's strings would silently mis-file every other provider's
-/// truncation / safety stop as a clean stop — the exact trap that made an empty
-/// Gemini `STOP` look the same as a Gemini `MAX_TOKENS` cutoff. Normalize once,
-/// here, so the empty-completion decision is provider-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FinishClass {
-    /// The model finished its turn on its own terms (`end_turn` / `STOP` /
-    /// `stop` / `completed`). An empty turn here is intentional silence, not a
-    /// failure.
     Clean,
-    /// Output was cut off by a length / token budget (`max_tokens` /
-    /// `MAX_TOKENS` / `length` / `max_output_tokens`). Content was lost.
     Truncated,
-    /// A provider safety / policy classifier withheld the content
-    /// (`refusal` / `SAFETY` / `RECITATION` / `content_filter` / …).
     Blocked,
-    /// Anything unrecognised — `null`/absent, `stop_sequence`, `other`,
-    /// `malformed_function_call`, a future reason we haven't mapped. Treated as
-    /// a failure (fail-safe): we don't know why the turn was empty, so surface
-    /// it rather than silently pass.
     Unknown,
 }
 
-/// Map a raw provider finish reason onto [`FinishClass`]. Case-insensitive so
-/// Gemini's uppercase enum collapses onto the same buckets as Anthropic's
-/// lowercase one.
 pub(crate) fn normalize_finish_reason(stop_reason: &str) -> FinishClass {
     match stop_reason.to_ascii_lowercase().as_str() {
-        // Model-decided end of turn across providers.
         "end_turn" | "stop" | "completed" | "end_of_turn" | "eos" => FinishClass::Clean,
-        // Length / token-budget cutoff across providers.
         "max_tokens" | "max_output_tokens" | "length" | "model_length" => FinishClass::Truncated,
-        // Safety / policy block or explicit refusal across providers.
         "refusal" | "safety" | "recitation" | "content_filter" | "blocklist"
         | "prohibited_content" | "spii" | "image_safety" => FinishClass::Blocked,
-        // null/absent ("unknown" sentinel), stop_sequence, other, etc.
         _ => FinishClass::Unknown,
     }
 }
 
-/// Why a final turn that DID produce text must still end as a failure, or
-/// `None` when its text is a finished answer.
-///
-/// A safety classifier can stop a response partway. The text before the cut
-/// has already streamed and stays on screen. It is not an answer, though, so
-/// the turn fails with this message rather than completing as if it were whole.
 pub(crate) fn declined_partway_error(stop_reason: Option<&str>) -> Option<&'static str> {
     (stop_reason.map(normalize_finish_reason) == Some(FinishClass::Blocked)).then_some(
         "The model stopped partway: the provider's safety classifier withheld the rest of the \
@@ -644,20 +549,12 @@ pub(crate) fn declined_partway_error(stop_reason: Option<&str>) -> Option<&'stat
     )
 }
 
-/// Verdict for a completion that returned no text and no tool calls.
 pub(crate) struct EmptyCompletionClass {
-    /// `true` → emit `ResponseFailed` (genuine failure: truncation, safety
-    /// block, dropped output, or an unrecognised stop). `false` → benign: the
-    /// model finished cleanly and just produced no text, so the thread
-    /// completes normally and the UI renders a neutral "empty response" note.
     pub is_error: bool,
-    /// Human-readable suffix. For the error case it's appended to the
-    /// `ResponseFailed` diagnostic; for the benign case it's logged so an
-    /// operator can still see *why* the turn was empty.
     pub hint: &'static str,
 }
 
-/// Decide whether an empty completion (no text, no tool calls) is a genuine
+/// INVARIANT: Decide whether an empty completion (no text, no tool calls) is a genuine
 /// failure or benign intentional silence — uniformly across providers and
 /// thread types. The classification keys off the *cause* of the emptiness, not
 /// what launched the thread:
@@ -691,14 +588,12 @@ pub(crate) fn classify_empty_completion(
     let class = normalize_finish_reason(stop_reason);
     match class {
         FinishClass::Truncated => return error(" — output truncated by token budget"),
-        // A safety / policy block withheld already-generated content, so
-        // output_tokens can be non-zero while nothing reaches the engine.
         FinishClass::Blocked => {
             return error(" — the model declined to respond (provider safety classifier withheld the output). Rephrase the request or start a new thread; retrying the same prompt will be refused again")
         }
         FinishClass::Clean | FinishClass::Unknown => {}
     }
-    // Dropped output: tokens billed but nothing surfaced. Either a known block
+    // INVARIANT: Dropped output: tokens billed but nothing surfaced. Either a known block
     // carried an unexpected payload shape (couldn't classify) or an unknown
     // SSE block was dropped (`unknown_sse_dropped`, incremented in
     // `vertex::process_sse_data`). Surfacing this prevents the misleading
@@ -712,12 +607,9 @@ pub(crate) fn classify_empty_completion(
     if unknown_sse_dropped > 0 {
         return error(" — engine dropped unknown SSE shapes; provider stream may have changed (see [Vertex] WARNING logs for the exact types)");
     }
-    // Unrecognised stop with nothing salvageable — we can't vouch that the
-    // turn ended cleanly, so surface it rather than silently passing.
     if class == FinishClass::Unknown {
         return error("");
     }
-    // Clean stop, nothing dropped: intentional silence. Not an error.
     let hint = if model_thought {
         " — model thought but produced no text or tool call"
     } else {
@@ -729,15 +621,6 @@ pub(crate) fn classify_empty_completion(
     }
 }
 
-/// Choose the assistant text to flush at the end of a turn.
-///
-/// Streamed providers (Claude) fill `raw` via the token callback as tokens
-/// arrive. A non-streaming provider (Gemini) emits its whole text through the
-/// callback once, which also lands in `raw`; `content` is the defensive
-/// fallback for a provider that left `raw` empty but carried prose in the
-/// response body. `cleaned` (inline-question-repair, tag-stripped) wins when
-/// present. This flushes the assistant's preamble on a tool-call turn too — the
-/// agent explains along the way, not just in its final answer.
 pub(crate) fn effective_flush_text<'a>(
     cleaned: Option<&'a str>,
     raw: &'a str,
@@ -752,30 +635,6 @@ pub(crate) fn effective_flush_text<'a>(
     content.unwrap_or("")
 }
 
-/// Derive the "target" key for the consecutive-tool-call circuit breaker.
-///
-/// Most tools have a meaningful target argument (`path`, `url`, `query`).
-/// `run_bash` is special: its argument is `command`, and bucketing by the
-/// bare tool name would mean three unrelated shell calls (e.g. `git status`
-/// → `git add` → `git commit`) trip the guard. Bucketing by the first
-/// whitespace-delimited token of `command` keeps the original "stop the LLM
-/// from spamming the exact same call" intent (same prefix still counts) while
-/// letting unrelated commands run in sequence.
-///
-/// `run_python` and `run_python_background` mirror that idea: bucket by the
-/// first non-blank, non-comment, non-import line of `code` (truncated to 80
-/// chars). Different scripts have different first actionable lines; identical
-/// retry-storms (most famously `time.sleep(N)` polling) share theirs, so the
-/// generic 3-strike guard fires. Falls back to the tool name when the code
-/// has no actionable line so the guard still fires on three pure-import or
-/// pure-comment calls in a row.
-///
-/// `read_file` is similarly special: its window args (`start_line`,
-/// `line_count`, `offset`) are how an LLM legitimately pages through one big
-/// file. Bucketing the page-1, page-2, page-3 reads under the same `path`
-/// key would trip the read_file breaker on the third page even though each
-/// call returns new content. When any window arg is present, suffix the key
-/// so each (path, window) combination is its own bucket.
 pub(crate) fn derive_call_key(tool_name: &str, args: &serde_json::Value) -> String {
     if tool_name == tn::RUN_BASH {
         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
@@ -821,18 +680,6 @@ pub(crate) fn derive_call_key(tool_name: &str, args: &serde_json::Value) -> Stri
     base.to_string()
 }
 
-/// First non-blank, non-comment, non-import line of a Python script —
-/// the bucket key the consecutive-call circuit breaker uses for
-/// `run_python` / `run_python_background`. Returns `None` when the code
-/// is empty / pure-import / pure-comment so the caller falls back to
-/// the bare tool name (three pure-import calls in a row still trip the
-/// guard under the tool name, which is fine — they're a retry storm).
-///
-/// Truncated to 80 chars for readability in logs / STOP messages, with
-/// an 8-hex-char hash suffix of the FULL line so two long scripts
-/// diverging past char 80 (e.g. `df = pd.read_csv('/long/path/.../foo_A.csv')`
-/// vs `..._B.csv`) bucket separately. Case-preserved because Python is
-/// case-sensitive (`time.sleep` vs `Time.sleep` mean different things).
 pub(crate) fn python_call_key(code: &str) -> Option<String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -842,9 +689,6 @@ pub(crate) fn python_call_key(code: &str) -> Option<String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Skip imports — different scripts share these but their
-        // actionable lines diverge. Catches `import x`, `from x import y`,
-        // and the rare `import x as y` form.
         if line.starts_with("import ") || line.starts_with("from ") {
             continue;
         }
@@ -854,12 +698,8 @@ pub(crate) fn python_call_key(code: &str) -> Option<String> {
             .map(|(i, _)| i)
             .unwrap_or(line.len());
         if take == line.len() {
-            // Line fits — no hash suffix needed.
             return Some(line.to_string());
         }
-        // Line longer than 80 chars — append a hash of the full line so
-        // two retries that share the same prefix but diverge past
-        // char 80 don't collide.
         let mut hasher = DefaultHasher::new();
         line.hash(&mut hasher);
         let h = hasher.finish();
@@ -872,20 +712,12 @@ pub(crate) fn python_call_key(code: &str) -> Option<String> {
     None
 }
 
-/// One sentinel-prefixed tool result, parsed: which *form request* to emit.
-///
-/// `redacted_text` replaces the LLM-visible tool result, so the model cannot
-/// read the raw JSON and act as if the call returned synchronously. `None`
-/// leaves the result alone: the EmailConfirm tool's description already
-/// explains the confirm flow, so its raw payload is harmless to the model.
 pub(crate) struct SentinelMatch {
     pub label: &'static str,
     pub event: super::super::thread_events::ThreadEvent,
     pub redacted_text: Option<String>,
 }
 
-/// The `request_id` a plugin preview already carries under `key`. The confirm
-/// and cancel routes take that id, so the form request reuses it.
 fn preview_id(payload: &str, key: &str) -> Option<uuid::Uuid> {
     serde_json::from_str::<serde_json::Value>(payload).ok()?[key]
         .as_str()?
@@ -978,17 +810,6 @@ pub(crate) fn match_sentinel(
         let payload = after[rel_start..].to_string();
         let event = ctor(payload.clone())?;
         let mut redacted_text = redacted.map(str::to_string);
-        // Name the credential the modal is collecting. The redaction hides the
-        // payload, so without this the model knows a modal opened but not what
-        // it stores, and has to guess: on 2026-08-05 `connect_oauth_account`
-        // reopened a modal because the client had been saved under `dropbox`
-        // instead of `oauth:dropbox`, and the agent narrated a theory rather
-        // than the fact. The service name is engine-authored (see
-        // `oauth::client_service_name`), not user text.
-        //
-        // A widening says so instead. The modal reopened a credential that
-        // already holds its secret. "It saves the credential as X" would send
-        // the agent off narrating a token the user does not have to type.
         if prefix == CREDENTIAL_REQUEST_PREFIX {
             let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
             if let Some(service) = parsed
@@ -1033,17 +854,13 @@ pub(crate) fn match_sentinel(
     None
 }
 
-/// Check if buffered text has reached a renderable boundary.
 pub(crate) fn should_flush(text: &str) -> bool {
-    // Paragraph break
     if text.ends_with("\n\n") {
         return true;
     }
-    // Code fence close
     if text.ends_with("```\n") {
         return true;
     }
-    // Heading completed (ends with newline after a heading line)
     if text.ends_with('\n') {
         if let Some(last_line) = text.lines().last() {
             if last_line.starts_with('#') {
@@ -1051,34 +868,18 @@ pub(crate) fn should_flush(text: &str) -> bool {
             }
         }
     }
-    // Horizontal rule
     if text.ends_with("\n---\n") || text.ends_with("\n***\n") {
         return true;
     }
     false
 }
 
-/// Parse a `[APP_CAPTURE:<screenshot_b64>]\n<dom>` sentinel produced by the SDK
-/// frontend `capture_app` tool. Returns `(screenshot_b64, dom_text)` if matched.
 pub(crate) fn parse_app_capture_marker(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix("[APP_CAPTURE:")?;
     let end_bracket = rest.find("]\n")?;
     Some((&rest[..end_bracket], &rest[end_bracket + 2..]))
 }
 
-/// Inverse of [`parse_app_capture_marker`]: format a tool-result string for
-/// the agentic loop to feed back to Claude.
-///
-/// When the SDK couldn't take a screenshot (the rasterizer failed, for one),
-/// it returns `screenshot = ""` and stuffs the failure into `dom`. Wrapping that in `[APP_CAPTURE:]`
-/// (empty marker) makes the parser hand the loop an empty base64, which
-/// becomes a `ContentBlock::Image { data: "" }` and gets a 400
-/// `image cannot be empty` from Anthropic. Drop the marker entirely in that
-/// case so the result falls through to the plain-text path; the LLM still
-/// reads the `dom` (which carries the error) and can decide how to proceed.
-///
-/// `lead` is a line the agent reads before the DOM, such as where the capture
-/// was saved. Empty adds nothing.
 pub(crate) fn format_capture_result(screenshot_b64: &str, lead: &str, dom: &str) -> String {
     if screenshot_b64.is_empty() {
         dom.to_string()
@@ -1092,17 +893,6 @@ pub(crate) fn format_capture_result(screenshot_b64: &str, lead: &str, dom: &str)
     }
 }
 
-/// If `s` is an `[APP_CAPTURE:<b64>]\n<dom>` sentinel, return a stub that names
-/// the screenshot's media type and approximate decoded size, followed by the
-/// DOM text unchanged. Returns `None` for non-matching input.
-///
-/// The mirror of [`crate::engine::tools::files::strip_image_content_marker`],
-/// and it exists for the same reason: the block builder lifts the screenshot
-/// into a proper image block before the model call, so persisting the base64
-/// too is dead weight. It is dead weight at a scale that matters, since a
-/// single retina capture reached 1.5 MB in one event row. The DOM survives
-/// because it is the part a human reading the step-detail modal wants, and it
-/// is already what the model gets as the tool-result body.
 pub(crate) fn strip_app_capture_marker(s: &str) -> Option<String> {
     let (screenshot_b64, dom) = parse_app_capture_marker(s)?;
     let approx_bytes = (screenshot_b64.len() * 3) / 4;
@@ -1114,11 +904,6 @@ pub(crate) fn strip_app_capture_marker(s: &str) -> Option<String> {
     ))
 }
 
-/// Sniff a recognized image mime from a base64-encoded image. Decodes only the
-/// leading bytes (enough for any magic header in `core::blobs::sniff_image_mime`)
-/// so the multi-MB capture body isn't decoded twice. Falls back to PNG when the
-/// header doesn't match the allowlist — keeps prior behaviour for unrecognised
-/// inputs; the Anthropic API rejects the message either way.
 pub(crate) fn sniff_image_media_type(b64: &str) -> &'static str {
     use base64::Engine;
     let prefix_len = 16.min(b64.len() & !3);
@@ -1130,29 +915,13 @@ pub(crate) fn sniff_image_media_type(b64: &str) -> &'static str {
         .unwrap_or("image/png")
 }
 
-/// One raw tool result, split into the two texts that want different things.
-///
-/// The model needs the raw sentinel, because [`build_tool_result_blocks`] is
-/// what lifts its base64 into a real `ContentBlock::Image`. The event wants a
-/// small stub, because a megabyte of base64 in the events table is dead weight
-/// the frontend never reads. Collapsing both onto one value is what broke both
-/// directions at once; see [`split_tool_result`].
 pub(crate) struct ToolResultSplit {
-    /// Text handed to the LLM message builder.
     pub llm_text: String,
-    /// The event's text when it must differ from `llm_text`, which is only ever
-    /// for the two image sentinels. `None` means the event records exactly what
-    /// the model saw, which is every other tool result. Modelling the override
-    /// rather than a second copy keeps the common path to a single allocation:
-    /// a `run_bash` result is routinely 150 kB and this runs per tool call.
     event_stub: Option<String>,
-    /// Base64 images persisted alongside the event, for the frontend to render.
     pub images: Vec<String>,
 }
 
 impl ToolResultSplit {
-    /// The model and the event see the same thing. The common case: any result
-    /// carrying no image sentinel at all.
     fn shared(text: String) -> Self {
         Self {
             llm_text: text,
@@ -1161,16 +930,10 @@ impl ToolResultSplit {
         }
     }
 
-    /// What gets persisted in the `ToolResult` event payload.
     pub(crate) fn event_text(&self) -> &str {
         self.event_stub.as_deref().unwrap_or(&self.llm_text)
     }
 
-    /// Apply a confirm-flow sentinel redaction to both sides. The redaction
-    /// exists so the model sees a one-line wait notice instead of parseable
-    /// JSON it would act on, and the event should record what the model saw.
-    /// Clearing the stub is what makes both sides agree: a redacted result is
-    /// one short sentence, so there is nothing left worth stubbing.
     pub(crate) fn redact(&mut self, redacted: String) {
         self.llm_text = redacted;
         self.event_stub = None;
@@ -1203,9 +966,6 @@ pub(crate) fn split_tool_result(result: &str) -> ToolResultSplit {
     ToolResultSplit::shared(result.to_string())
 }
 
-/// Take the answer-image marker off an `ask_user_question` result, returning
-/// the result and the blobs it names. Only that tool writes the marker. Any
-/// other tool may pass outside text through, so its result is left alone.
 pub(crate) fn take_answer_images(tool_name: &str, result: String) -> (String, Vec<String>) {
     if tool_name != crate::llm::tool_names::ASK_USER_QUESTION {
         return (result, Vec::new());
@@ -1216,11 +976,6 @@ pub(crate) fn take_answer_images(tool_name: &str, result: String) -> (String, Ve
     }
 }
 
-/// Load a result's attached blobs as images fit for the model.
-///
-/// The answer that named them was checked against the blob store moments
-/// ago, so a miss means the file was deleted in between. It is logged, and
-/// the model sees one image fewer than the result's text announced.
 pub(crate) fn load_attached_images(
     workspace: &std::path::Path,
     hashes: &[String],
@@ -1240,16 +995,10 @@ pub(crate) fn load_attached_images(
         .collect()
 }
 
-/// One finished tool call, as the wire-block builder needs it.
 pub(crate) struct ToolOutput {
-    /// The provider's own id for the call, which pairs result to `tool_use`.
-    /// Meaningful only inside this turn, and the reason `event_id` exists.
     pub tool_use_id: String,
-    /// What the model sees.
     pub text: String,
-    /// The originating `ToolCalled` event id, or `None` when its emit failed.
     pub event_id: Option<uuid::Uuid>,
-    /// Images shown to the model after every result, already fit for it.
     pub images: Vec<crate::engine::types::ChatImage>,
 }
 
@@ -1276,10 +1025,6 @@ pub(crate) fn build_tool_result_blocks(
                 tool_use_id: tool_use_id.clone(),
                 content: with_event_address(dom_text.to_string(), event_id.as_ref()),
             });
-            // Fit the screenshot to the model size target (compress only if
-            // over) so a large retina capture can't trip the provider's
-            // per-image limit. fit_for_llm is the single gate for every
-            // chat-to-model image.
             let fitted = crate::engine::types::ChatImage {
                 base64: screenshot_b64.to_string(),
                 mime_type: sniff_image_media_type(screenshot_b64).to_string(),
@@ -1314,7 +1059,6 @@ pub(crate) fn build_tool_result_blocks(
             content: with_event_address(result.clone(), event_id.as_ref()),
         });
     }
-    // Append images and instruction text AFTER all ToolResult blocks.
     result_blocks.append(&mut trailing_blocks);
     result_blocks.push(ContentBlock::Text {
         text: instruction.to_string(),
@@ -1322,9 +1066,6 @@ pub(crate) fn build_tool_result_blocks(
     result_blocks
 }
 
-/// Detect image descriptions that indicate the model couldn't see the image.
-/// These are error responses, not actual descriptions — using them would poison
-/// the LLM context with false information (e.g. "the image shows an error message").
 pub(crate) fn is_bad_image_description(desc: &str) -> bool {
     let lower = desc.to_lowercase();
     lower.contains("i do not see any image")
@@ -1337,38 +1078,16 @@ pub(crate) fn is_bad_image_description(desc: &str) -> bool {
         || lower.contains("no image provided")
 }
 
-/// How many times a single response may reject a prose answer and force the
-/// model to re-call `ask_user_question` after a failed ask. Bounds the re-ask
-/// guard so a persistently-broken question path (e.g. the DB is down and every
-/// `walk_question_batch` errors) or a model that refuses to comply can never
-/// trap the loop — after this many forces the turn finalizes normally with
-/// prose. Far below the default tool-call cap, which remains the outer
-/// backstop. (A user who configures a cap this low has deliberately chosen for
-/// the backstop to fire first; see [`crate::core::prefs::MAX_TOOL_CALLS`].)
 pub(crate) const MAX_QUESTION_REASK: usize = 2;
 
-/// Why the loop is pushing the model to re-ask. Each cause carries its own
-/// forcing instruction. Telling the model a call was rejected when it never
-/// made one sends it looking for a mistake that isn't there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuestionReaskCause {
-    /// The model called `ask_user_question`, the engine rejected the call, and
-    /// the model answered in prose instead of re-calling.
     CallRejected,
-    /// The model typed `<ask_user_question>` as text and its body was not a
-    /// dispatchable payload, so no call was ever made. Detected by
-    /// [`crate::engine::inline_question_repair`].
     LeakedAsText,
-    /// The model never reached for the tool at all: it just ended its reply on
-    /// a question. Detected by [`reply_ends_in_a_question`].
     AskedInProse,
 }
 
 impl QuestionReaskCause {
-    /// The forcing instruction appended as a user message. Pushes the model
-    /// back to the tool with the full question text: the interactive card is
-    /// the whole point of the call, and a prose fallback degrades it into a
-    /// typed-reply menu the user can't click.
     pub(crate) fn instruction(self) -> &'static str {
         match self {
             Self::CallRejected => {
@@ -1399,9 +1118,6 @@ impl QuestionReaskCause {
         }
     }
 
-    /// What the `LlmCallRetried` this force emits says it was for. Lives beside
-    /// the instruction so a new cause cannot ship observable in the transcript
-    /// but anonymous in the event log.
     pub(crate) fn retry_reason(self) -> &'static str {
         match self {
             Self::CallRejected => "ask_user_question had no question text, forcing re-ask",
@@ -1411,61 +1127,22 @@ impl QuestionReaskCause {
     }
 }
 
-/// How many times one turn may be sent back for ending on a question typed as
-/// prose. One, on its own counter rather than the budget above.
-///
-/// The bound matters more here than for [`MAX_QUESTION_REASK`], for the reason
-/// [`MAX_TODO_WAKE_NUDGE`] also caps at one. A model that reads this nudge and
-/// still wants prose has made a choice. Asking twice would only spend a round
-/// to hear it again.
 pub(crate) const MAX_PROSE_QUESTION_NUDGE: usize = 1;
 
-/// Whether a finished reply hands the turn back on a question.
-///
-/// The test is the trailing `?` alone. It mirrors `detect_plaintext_question`
-/// in `lucidos-cli`'s Claude Code Stop hook. That hook has redirected
-/// coding-agent sessions on this exact signal since long before the chat side
-/// had a gate.
-///
-/// Only the END of the reply counts. A question mid-paragraph is usually
-/// rhetorical or quoted, while a reply whose last character is `?` is asking
-/// the user something and then going silent.
 pub(crate) fn reply_ends_in_a_question(text: &str) -> bool {
     text.trim_end().ends_with('?')
 }
 
-/// Everything the re-ask decision reads. A struct rather than six positional
-/// arguments, four of them booleans: `(true, false, true, …)` at the call site
-/// says nothing about which is which.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuestionReaskInputs {
-    /// The previous iteration's `ask_user_question` call was rejected.
     pub(crate) ask_failed_last_iter: bool,
-    /// The model typed an `<ask_user_question>` tag as ordinary text.
     pub(crate) leaked_as_text: bool,
-    /// The prose the model just finished ends on a question.
     pub(crate) ends_in_a_question: bool,
-    /// Somebody is at the other end of this turn who could tap a card.
-    /// Resolved by the caller, never re-derived here: see the parameter of the
-    /// same name on `run_agentic_loop`.
     pub(crate) human_can_answer: bool,
-    /// Forces already spent this turn on a broken `ask_user_question` call.
     pub(crate) reask_forced: usize,
-    /// Nudges already spent this turn on a question typed as prose.
     pub(crate) prose_nudges_forced: usize,
 }
 
-/// Why the no-tool-calls termination branch must force a re-ask instead of
-/// finalizing the turn, or `None` to finalize normally.
-///
-/// The two broken-call causes share one `MAX_QUESTION_REASK` budget, so they
-/// cannot alternate past the cap. A rejected call wins when both hold: it is
-/// the more specific diagnosis, since the model did reach the tool. Pure, so
-/// every bound is unit-testable without driving the whole loop.
-///
-/// [`QuestionReaskCause::AskedInProse`] sits last and carries its own budget.
-/// It is the widest of the three, and the only one that fires when the model
-/// never reached the tool. Anything more specific outranks it.
 pub(crate) fn question_reask_cause(inputs: QuestionReaskInputs) -> Option<QuestionReaskCause> {
     if inputs.reask_forced < MAX_QUESTION_REASK {
         if inputs.ask_failed_last_iter {
@@ -1478,12 +1155,6 @@ pub(crate) fn question_reask_cause(inputs: QuestionReaskInputs) -> Option<Questi
     asked_in_prose(inputs).then_some(QuestionReaskCause::AskedInProse)
 }
 
-/// Whether to nudge a turn that ended on a question nobody can tap.
-///
-/// Three guards beyond the question itself. `reask_forced == 0` keeps it to
-/// one diagnosis per turn: a turn already corrected for a broken call is not
-/// also corrected for prose. `human_can_answer` spares the runs where a card
-/// is the wrong answer, and the caller decides which those are.
 fn asked_in_prose(inputs: QuestionReaskInputs) -> bool {
     inputs.ends_in_a_question
         && inputs.human_can_answer
@@ -1517,15 +1188,9 @@ pub(crate) fn instruction_after_round(
     )
 }
 
-/// How many times one turn may be sent back for leaving work open with nothing
-/// to re-open the thread. One, and the bound matters more here than for the
-/// re-ask above. A model that answers the nudge and still leaves the list open
-/// has made a choice. Asking twice would only spend a round to hear it again.
-/// After this the turn finalizes and `settle_open_todos` records the items as
-/// `Abandoned`, exactly as it did before this gate existed.
 pub(crate) const MAX_TODO_WAKE_NUDGE: usize = 1;
 
-/// The forcing instruction for a turn that would end with open todo work and no
+/// INVARIANT: The forcing instruction for a turn that would end with open todo work and no
 /// wake. `open_items` is stated because it is the fact the model is about to
 /// contradict, and a count is cheaper to act on than "some".
 ///
@@ -1570,21 +1235,16 @@ pub(crate) fn should_nudge_unwatched_turn(
     matches!(open_items, Some(n) if n > 0) && !covered && nudges_forced < MAX_TODO_WAKE_NUDGE
 }
 
-/// What decides whether a round's reply, beside its read decision, ends the
-/// turn without another round (ADR 0417).
 pub(crate) struct FinalAnswerBesideDecision<'a> {
     pub(crate) response: &'a crate::llm::provider::LlmResponse,
     pub(crate) had_errors: bool,
     pub(crate) thread_id: Uuid,
     pub(crate) injections_pending: bool,
     pub(crate) cancelled: bool,
-    /// The re-ask guard's inputs. `ends_in_a_question` is read off the reply.
     pub(crate) question: QuestionReaskInputs,
     pub(crate) wake_nudges_forced: usize,
 }
 
-/// Whether a round's calls are its turn-end decisions and nothing else: the
-/// the read decision, the wake decision and the expected wake, in any mix.
 pub(crate) fn calls_only_turn_end_decisions(calls: &[crate::llm::provider::ToolCall]) -> bool {
     !calls.is_empty()
         && calls.iter().all(|c| {
@@ -1594,17 +1254,10 @@ pub(crate) fn calls_only_turn_end_decisions(calls: &[crate::llm::provider::ToolC
 
 #[easy_ext::ext(FinalAnswerDecisionExt)]
 pub(crate) impl LucidosEngine {
-    /// The reply a decision-only round ends the turn on, or `None` when the
-    /// turn must take the ordinary path: a failed call, a pending follow-up, or
-    /// a Stop. So does text the user saw only as a note or never saw, and
-    /// anything the re-ask guard or the wake check would send back.
     async fn final_answer_beside_decision(
         &self,
         input: FinalAnswerBesideDecision<'_>,
     ) -> Option<String> {
-        // A progress note is a summary of text the user never saw in full, so
-        // it never stands in for the answer. Only `content` has been through
-        // the working-understanding splice.
         if input.had_errors
             || input.injections_pending
             || input.cancelled
@@ -1634,32 +1287,13 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// What the generic consecutive-call circuit breaker should do given the
-/// current consecutive-*failure* streak length for one `(tool, call_key)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BreakerAction {
-    /// Streak below threshold — execute the proposed call normally.
     None,
-    /// Identical attempts 3-4 after failed executions: feed a STOP message
-    /// to the model without executing the proposed call.
     Warn,
-    /// Identical attempt 5 or later: terminate the turn with a force-break.
     Break,
 }
 
-/// Update the consecutive-*failure* streak for the generic circuit breaker.
-///
-/// Unlike the raw repeat counter (`consecutive_same_call`, which the
-/// content-deterministic `read_file` / `list_files` breakers still use), this
-/// streak only grows when the model repeats the SAME `(tool, call_key)` AND the
-/// previous identical call actually FAILED. A successful call mid-streak, or a
-/// switch to a different call, resets the streak to 1 — because successful
-/// repetition is by definition not a stuck loop, and only a run of failures is
-/// the genuine "stuck" signal worth breaking.
-///
-/// `is_repeat` — the current call matches the previous `(tool, call_key)`.
-/// `prev_call_failed` — the previous identical call returned an error.
-/// `prev_streak` — the streak value carried from the last iteration.
 pub(crate) fn next_failure_streak(
     is_repeat: bool,
     prev_call_failed: bool,
@@ -1672,9 +1306,6 @@ pub(crate) fn next_failure_streak(
     }
 }
 
-/// Map the attempt streak to a breaker action before executing the call.
-/// Warn on attempts 3-4 after failures; break on attempt 5 or later.
-/// Warnings skip execution, so the streak can grow after two actual failures.
 pub(crate) fn generic_breaker_action(failure_streak: usize) -> BreakerAction {
     if failure_streak >= 5 {
         BreakerAction::Break
@@ -1685,18 +1316,6 @@ pub(crate) fn generic_breaker_action(failure_streak: usize) -> BreakerAction {
     }
 }
 
-/// Build the `ProcessResult` every terminal path in `run_agentic_loop`
-/// returns. All eight return sites — pre-iter cancel, iteration cap, mid-LLM
-/// cancel, success, empty completion, and the three circuit-breaker
-/// force-breaks — construct the same shape: only `response` and `images`
-/// vary, while `steps`, `auto_apply`, and `orphaned_injections` are always
-/// empty/`false` on a terminal turn. Centralising the construction keeps
-/// those constant fields from drifting across the return sites.
-///
-/// This is a pure value constructor with no side effects: each caller still
-/// sets `*terminator_settled = true` and settles the turn's ending its own way
-/// before returning, so the circuit-breaker branches keep their individual
-/// thresholds and messages — nothing is unified beyond the result literal.
 pub(crate) fn terminal_result(
     response: String,
     images: Vec<String>,
@@ -1721,7 +1340,7 @@ pub(crate) const NON_TOOL_ROUND_SLACK: usize = 100;
 pub(crate) const NOTED_CARRY_ON: &str =
     "Your working understanding is updated. Carry on with the work.";
 
-/// Whether a reply that made no tool call was bookkeeping rather than an
+/// INVARIANT: Whether a reply that made no tool call was bookkeeping rather than an
 /// answer.
 ///
 /// The model writes its document beside its next action, but the design record
@@ -1751,9 +1370,6 @@ pub(crate) fn round_backstop_message(rounds: usize) -> String {
     )
 }
 
-/// Without this emit the frontend would never see a terminator and the
-/// thread would show "running" forever after hitting a cap. Takes the built
-/// message so both backstops share one emit path.
 pub(crate) async fn emit_iteration_cap_response_generated(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
@@ -1821,8 +1437,6 @@ pub(crate) async fn emit_prompt_injected_event(
     }
 }
 
-/// Log how long a follow-up waited between its record and its delivery, so a
-/// stalled message names the window it stalled in.
 async fn log_record_to_inject(pool: &sqlx::PgPool, thread_id: Uuid, message: Uuid) {
     let waited: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
         "SELECT (EXTRACT(EPOCH FROM now() - created) * 1000)::bigint FROM events \
@@ -1839,25 +1453,8 @@ async fn log_record_to_inject(pool: &sqlx::PgPool, thread_id: Uuid, message: Uui
     }
 }
 
-/// How many tool-result images the model explicitly asked to see stay pinned in
-/// vision at once. Beyond this the oldest pin is released and that image reverts
-/// to the usual "strip once it is no longer last" rule; the model can call
-/// `view_image` again to bring it back.
-///
-/// A cap is needed because pinned images are exempt from trim pass 0 by
-/// construction and the model may issue as many image reads in a single turn as
-/// its tool-call cap allows. A "describe every photo in this folder" turn would otherwise
-/// accumulate hundreds of un-strippable images (~1600 tokens each, see
-/// `context::IMAGE_BUDGET_TOKEN_ESTIMATE`) and blow the context window.
-///
-/// Eight is chosen to cover the realistic reason to hold several at once —
-/// comparing a handful of images — at a worst case near 13k tokens, which is
-/// small against any supported context window and is honestly counted by
-/// `estimate_message_chars`, so the other trim passes compensate for it.
 pub(crate) const MAX_PINNED_EXPLICIT_IMAGES: usize = 8;
 
-/// Record `idx` as holding an explicitly-requested image, releasing the oldest
-/// pin once [`MAX_PINNED_EXPLICIT_IMAGES`] is exceeded.
 pub(crate) fn push_explicit_image_pin(pins: &mut Vec<usize>, idx: usize) {
     pins.push(idx);
     if pins.len() > MAX_PINNED_EXPLICIT_IMAGES {
@@ -1865,9 +1462,6 @@ pub(crate) fn push_explicit_image_pin(pins: &mut Vec<usize>, idx: usize) {
     }
 }
 
-/// Whether a round's outputs carry images the user attached to a question
-/// answer. Those are the user's own content, so their message pins with the
-/// turn's user messages and stays in vision for the rest of the turn.
 pub(crate) fn holds_answer_images(tool_outputs: &[ToolOutput]) -> bool {
     tool_outputs.iter().any(|output| !output.images.is_empty())
 }
@@ -1882,20 +1476,6 @@ pub(crate) fn holds_explicitly_requested_image(blocks: &[ContentBlock]) -> bool 
     })
 }
 
-/// Await a pending Flash image-description task and emit one `ImageDescribed`
-/// per hash attached to `origin_id`'s message.
-///
-/// A free function taking cloned handles rather than a `&LucidosEngine` method,
-/// because it has two callers with different lifetimes: the agentic loop awaits
-/// it inline after the first LLM call, while the chat injection fast-path — which
-/// returns to the HTTP caller immediately and never reaches the loop — spawns it
-/// as a detached task. Before that second caller existed, an image attached to a
-/// message that arrived mid-turn produced no `ImageDescribed` at all, so once its
-/// bytes aged out of context the thread held no record of what had been shown.
-///
-/// Hashes come from the persisted `MessageReceived` row so images whose decode
-/// failed at emit time are not re-included. Emitting nothing when the
-/// description is missing, empty, or judged bad is the intended no-op.
 pub(crate) async fn emit_image_descriptions(
     event_store: &crate::core::EventStore,
     bus: &crate::engine::event_bus::EventBus,
@@ -1904,10 +1484,6 @@ pub(crate) async fn emit_image_descriptions(
     channel: Option<crate::engine::thread_events::EventChannel>,
     handle: Option<tokio::task::JoinHandle<Option<(String, String)>>>,
 ) {
-    // Resolve the Flash description (should be done by now — Flash is much
-    // faster than the main model's first response). The handle yields
-    // `(description, model)` so we can stamp the producing model on the
-    // emitted `ImageDescribed` event.
     let Some((desc, model)) = (match handle {
         Some(h) => match h.await {
             Ok(opt) => opt.filter(|(d, _)| !is_bad_image_description(d)),
@@ -1956,9 +1532,6 @@ pub(crate) async fn emit_image_descriptions(
                     description: desc.clone(),
                     model: model.clone(),
                 },
-                // Engine-internal enrichment; inherit the turn's channel but
-                // drop request_event_id (this isn't a response to the user's
-                // request, it's a derived fact about the request itself).
                 meta: crate::engine::thread_events::EventMeta {
                     channel,
                     ..crate::engine::thread_events::EventMeta::NONE
@@ -1970,19 +1543,6 @@ pub(crate) async fn emit_image_descriptions(
     }
 }
 
-/// Defensive post-loop guard: emits `ResponseAborted` if no terminator
-/// landed for `request_event_id`. Catches future regressions in the
-/// loop's many return paths — every existing path emits explicitly, but
-/// the SQL check is the safety net. Scoped to `request_event_id` so a
-/// previous exchange's terminator doesn't mask a current zombie one.
-///
-/// Skip the SQL when callers can prove the turn's ending is already settled
-/// (the success path): `chat::process` does this via the `terminator_settled`
-/// flag threaded through `run_agentic_loop`. Without that fast path this
-/// query runs on every chat turn against a `payload->>'request_event_id'`
-/// expression that has no functional index, walking every event in the
-/// thread on long-lived conversations.
-///
 pub(crate) async fn ensure_terminator_emitted(
     bus: &crate::engine::event_bus::EventBus,
     pool: &sqlx::PgPool,
@@ -2017,20 +1577,12 @@ pub(crate) async fn ensure_terminator_emitted(
     .await;
 }
 
-/// Static parts of a ContextCaptured event built once by `chat::process`
-/// before the loop starts: section list (system + memory + history + …)
-/// and the model id. The loop appends a dynamic `Conversation` section per
-/// iteration sized from the current `messages`, and reads the tool array off
-/// [`TurnTools`], which can move mid-turn.
-///
-/// `sections` always carry their bodies. [`round_capture_sections`] decides
-/// per round whether a capture keeps them.
 pub(crate) struct ContextCaptureSeed<'a> {
     pub sections: &'a [crate::engine::ContextSection],
     pub model: &'a str,
 }
 
-/// The rows one round's `ContextCaptured` persists.
+/// INVARIANT: The rows one round's `ContextCaptured` persists.
 ///
 /// `capture_body` is the `capture_context` preference as read for THIS round,
 /// never for the turn: a question card can hold a turn open for hours.
@@ -2051,34 +1603,17 @@ pub(crate) fn round_capture_sections(
         .collect()
 }
 
-/// The tool array this turn sends, and what it costs.
-///
-/// Almost all of it is fixed for the turn: a family is offered on workspace
-/// capability, never on the thread (ADR 0088). The MCP slice is the exception.
-/// It is a function of the running servers and of the servers THIS thread
-/// enabled (ADR 0430), and both can move while the turn runs.
-///
-/// `mcp_generation` is what the loop compares against
-/// `McpManager::tool_surface_generation()` each round. A moved generation
-/// says some thread's slice may have moved, so the loop recomputes this
-/// one's. Only a changed slice rewrites the array.
 pub(crate) struct TurnTools {
     defs: Vec<ToolDefinition>,
     names: Vec<String>,
     defs_chars: usize,
     mcp_generation: u64,
-    /// The ceiling the MCP slice was fitted under. Fixed for the turn, so a
-    /// mid-turn refresh fits the same window the setup did.
     mcp_char_ceiling: usize,
-    /// What the MCP slice left out, as the line the model is told.
     mcp_dropped_notice: Option<String>,
-    /// The running servers this thread enabled, as of the last refresh.
     mcp_servers: std::collections::BTreeSet<String>,
 }
 
 impl TurnTools {
-    /// `engine_defs` are the engine-authored families, and `surface` is the MCP
-    /// slice fitted under `mcp_char_ceiling`. It lands at the tail.
     pub(crate) fn new(
         engine_defs: Vec<ToolDefinition>,
         surface: crate::mcp::McpToolSurface,
@@ -2098,42 +1633,30 @@ impl TurnTools {
         tools
     }
 
-    /// The schemas the next request carries.
     pub(crate) fn defs(&self) -> &[ToolDefinition] {
         &self.defs
     }
 
-    /// Their names, for the `ContextCaptured` row.
     pub(crate) fn names(&self) -> &[String] {
         &self.names
     }
 
-    /// Total chars of the schemas. Counted into the capture's
-    /// `estimated_total_tokens` and subtracted from the message budget,
-    /// because the schemas ride every request.
     pub(crate) fn defs_chars(&self) -> usize {
         self.defs_chars
     }
 
-    /// The MCP surface stamp this array was built against.
     pub(crate) fn mcp_generation(&self) -> u64 {
         self.mcp_generation
     }
 
-    /// The ceiling to fit the next MCP surface under.
     pub(crate) fn mcp_char_ceiling(&self) -> usize {
         self.mcp_char_ceiling
     }
 
-    /// The line telling the model which MCP tools were left out, if any were.
     pub(crate) fn mcp_dropped_notice(&self) -> Option<&str> {
         self.mcp_dropped_notice.as_deref()
     }
 
-    /// The running servers this thread enabled, as of the last refresh.
-    ///
-    /// Read either side of a refresh to see which servers this thread gained
-    /// and lost. Sorted, so the line built from it reads the same each time.
     pub(crate) fn mcp_server_ids(&self) -> &std::collections::BTreeSet<String> {
         &self.mcp_servers
     }
@@ -2161,14 +1684,6 @@ impl TurnTools {
     }
 }
 
-/// Which servers this thread gained or lost since the request was
-/// assembled. `None` when it offers the same servers.
-///
-/// `[MCP SERVERS]` is built once at turn setup and sits in the first message.
-/// That message is fixed for the turn, which is what keeps the prefix cache.
-/// The array moves per round (ADR 0195), so the two disagree the moment this
-/// thread enables or loses a server. The model would then read a server it
-/// just enabled as unavailable, and enable it again or tell the user so.
 pub(crate) fn mcp_surface_correction(
     before: &std::collections::BTreeSet<String>,
     after: &std::collections::BTreeSet<String>,
@@ -2197,11 +1712,6 @@ pub(crate) fn mcp_surface_correction(
     })
 }
 
-/// What the round owes the model when the set of MCP tools left out moved.
-/// `None` when it did not.
-///
-/// The turn's first message carries the setup's notice and is never
-/// rewritten, so a refresh that cuts different tools, or none, has to say so.
 pub(crate) fn mcp_dropped_correction(before: Option<&str>, after: Option<&str>) -> Option<String> {
     match (before, after) {
         (before, Some(after)) if before != Some(after) => Some(after.to_string()),
@@ -2213,23 +1723,8 @@ pub(crate) fn mcp_dropped_correction(before: Option<&str>, after: Option<&str>) 
     }
 }
 
-/// Cap on the `Conversation` body, matching what `chat::process` applies to
-/// every other section body. The eval lifts it (ADR 0110): this section IS the
-/// message array, the largest addressable region a context benchmark exists to
-/// look at, and 8 KB of it says nothing.
 const CONVERSATION_PERSIST_MAX: usize = 8_000;
 
-/// The `Conversation` capture row, and the one row where a section's two sizes
-/// disagree by construction.
-///
-/// `budget_delta_chars` is what the tool loop ADDED. Every static section is
-/// already concatenated into `messages[0]`, so counting the array whole would
-/// bill the bundle twice against `estimated_total_tokens`. `bundled_total` is
-/// what those sections already declare, and `context_chars` is what the budget
-/// measured over the trimmed array.
-///
-/// `content_chars` is the array's real size, which is the region an eval sizes.
-/// [`round_capture_sections`] may drop the body, never this size.
 pub(crate) fn conversation_section(
     messages: &[Message],
     bundled_total: usize,
@@ -2254,11 +1749,6 @@ pub(crate) fn conversation_section(
     }
 }
 
-/// Render the in-flight `messages` array as a compact text body for the
-/// `Conversation` section's persisted content. Each message is prefixed with
-/// its role; tool calls/results are summarized inline so the dump stays
-/// readable rather than dumping raw JSON. Caller truncates with
-/// `truncate_head_tail` when over the persistence cap.
 pub(crate) fn serialize_messages_for_capture(messages: &[Message]) -> String {
     let mut out = String::new();
     for msg in messages {
@@ -2300,12 +1790,6 @@ pub(crate) fn serialize_messages_for_capture(messages: &[Message]) -> String {
     out
 }
 
-/// Record a failed action so no round rule lets it go (ADR 0109).
-///
-/// Manus found that leaving mistakes in context is what stops a model repeating
-/// them. Three paths in the loop end a tool call as failed, and two of them
-/// `continue` before reaching the third. So the marking lives here rather than
-/// at whichever site happens to be biggest.
 pub(super) fn note_failure(
     failed: &mut std::collections::HashSet<String>,
     tool_called_event_id: Option<uuid::Uuid>,
@@ -2346,9 +1830,6 @@ pub(crate) async fn read_working_understanding(
         )
         .await;
     }
-    // The checklist is CONSUMED, never stored. It goes to the projection, and
-    // the render regenerates the section from there, so the two engine-written
-    // statuses reach the model.
     if let Some(items) = applied.todo.clone().filter(|items| items != live_todo) {
         live_todo.clone_from(&items);
         bus.emit_or_log(

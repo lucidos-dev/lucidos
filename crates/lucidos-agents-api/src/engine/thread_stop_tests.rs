@@ -144,8 +144,6 @@ async fn engine_reentries_never_start_a_turn_on_either_stopped_lane() {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        // These are the actual chat/start routing shapes of event waits,
-        // child reports, harden/plan/ceiling, expected wakes and keep-alive.
         for origin in [
             PreEmittedOrigin::WaitReentry(Uuid::new_v4()),
             PreEmittedOrigin::EngineReentry(Uuid::new_v4()),
@@ -169,8 +167,6 @@ async fn engine_reentries_never_start_a_turn_on_either_stopped_lane() {
         assert_eq!(starts, 0);
         assert!(thread_is_stopped(&pool, tid).await);
     }
-    // A parent's message still starts a chat turn; it does not authorize
-    // any following engine wake.
     let tid = seed_chat_thread(bus, "hello").await;
     stop(bus, tid).await;
     let mut message = crate::test_support::message_received("parent follow-up");
@@ -202,7 +198,6 @@ async fn engine_reentries_never_start_a_turn_on_either_stopped_lane() {
         thread_is_stopped(&pool, tid).await,
         "an agent message does not lift Stop"
     );
-    // A switch during an agent-started turn must not lift the earlier Stop.
     let mut message = crate::test_support::message_received("parent follow-up again");
     if let ThreadEvent::MessageReceived { mode, .. } = &mut message {
         *mode = ActorMode::Agent;
@@ -238,8 +233,6 @@ async fn engine_reentries_never_start_a_turn_on_either_stopped_lane() {
     .await
     .unwrap();
     assert_eq!(resumed, 0, "boot recovery cannot resume a stopped thread");
-    // A report queued before Stop stays event-backed, even if no process
-    // ever forwarded it. The resumed session puts it after the human input.
     let tid = seed_coding_thread(bus, None).await;
     let report = crate::test_support::seed_thread_event(
         bus,
@@ -389,8 +382,6 @@ async fn a_human_resume_carries_held_waits_after_its_words_once() {
                 .unwrap(),
             "next message"
         );
-        // A wait already handled inside an earlier turn is not held by a
-        // later Stop, even when that response names the turn's older starter.
         seed_thread_event(
             &bus,
             tid,
@@ -565,7 +556,6 @@ async fn repeated_stops_preserve_unread_waits_and_child_cards() {
     teardown_test_db(&db).await;
 }
 
-/// A human message from a device: what lifts a Stop.
 async fn human_message(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     let mut message = crate::test_support::message_received(text);
     if let ThreadEvent::MessageReceived { origin, .. } = &mut message {
@@ -576,7 +566,6 @@ async fn human_message(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     crate::test_support::seed_thread_event(bus, thread_id, message).await
 }
 
-/// An event-wait re-entry's anchor, as the dispatcher records it.
 async fn wake(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     use crate::engine::thread_events::{ActorMode, EngineReason, EventWaitOutcome};
     crate::test_support::seed_thread_event(
@@ -611,7 +600,6 @@ async fn a_wake_drained_live_is_never_attached_to_a_resume() {
             .unwrap(),
         "resume"
     );
-    // Delivered live into the resume's running turn, which has not replied.
     wake(&bus, tid, "Main check failed").await;
     let next = human_message(&bus, tid, "next").await;
     assert_eq!(
@@ -676,7 +664,6 @@ async fn a_wake_that_ran_its_own_turn_was_never_held() {
     teardown_test_db(&db).await;
 }
 
-/// A reply to `starter`, which receipts every wake recorded before it.
 async fn reply(bus: &EventBus, thread_id: Uuid, starter: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -695,8 +682,6 @@ async fn reply(bus: &EventBus, thread_id: Uuid, starter: Uuid) {
     .unwrap();
 }
 
-/// Invariant I4: the scan starts at the latest human reply before the Stop
-/// run. 200 wakes an older resume carried and answered never ride again.
 #[tokio::test]
 async fn the_stop_hold_scan_ignores_history_before_the_latest_stop_run() {
     let (pool, db) = setup_test_db().await;
@@ -739,8 +724,6 @@ async fn a_wake_recorded_just_before_a_stop_rides_on_the_resume() {
     let tid = seed_chat_thread(&bus, "hello").await;
     let first = human_message(&bus, tid, "first").await;
     reply(&bus, tid, first).await;
-    // The dispatcher records the anchor, then the Stop commits before its
-    // hold check, so the wake is held without a turn.
     wake(&bus, tid, "Raced the Stop").await;
     stop(&bus, tid).await;
     let resume = human_message(&bus, tid, "resume").await;
@@ -808,7 +791,6 @@ async fn a_carrier_stopped_before_its_reply_leaves_its_wakes_for_the_next_resume
         resume_text(&pool, tid, "next", Some(next)).await.unwrap(),
         "next\n\n---\n\nHeld build result"
     );
-    // Once a resume is answered, a later Stop run starts clean.
     reply(&bus, tid, next).await;
     stop(&bus, tid).await;
     let last = human_message(&bus, tid, "last").await;
@@ -829,7 +811,6 @@ async fn a_coding_agent_keeps_an_unread_delivery_across_a_second_stop_run() {
     stop(&bus, tid).await;
     let held = wake(&bus, tid, "Held build result").await;
     human_message(&bus, tid, "resume").await;
-    // The resumed session queued the delivery, then a Stop dropped it unread.
     start_cc_session(&bus, tid, "test-branch", None).await;
     stop(&bus, tid).await;
     human_message(&bus, tid, "resume again").await;

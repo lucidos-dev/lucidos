@@ -1,18 +1,9 @@
-//! The context mode's assembly half, on both arms.
-//!
-//! What these tests reach is what the turn builds: the mode read, the sweep,
-//! and the guidance the prompt carries. The end-to-end half belongs to
-//! the `lucidos-eval` binary's manipulation check, which reads the panel's section
-//! name off real `ContextCaptured` rows.
-
 use super::*;
 use crate::llm::{ContentBlock, Message, MessageContent};
 
 const ADDRESS_A: &str = "evt-0123456789abcdef0123456789abcdef";
 const ADDRESS_B: &str = "evt-fedcba9876543210fedcba9876543210";
 
-/// One round's pair, in the shape the loop appends it: an assistant message of
-/// tool calls, then a user message of results and the standing instruction.
 fn pair(id: &str, address: &str, body: &str, with_prose: bool) -> Vec<Message> {
     let mut assistant: Vec<ContentBlock> = Vec::new();
     if with_prose {
@@ -46,8 +37,6 @@ fn pair(id: &str, address: &str, body: &str, with_prose: bool) -> Vec<Message> {
     ]
 }
 
-/// Put an image where `build_tool_result_blocks` puts one: in the results
-/// message, after every result and before the standing instruction.
 fn push_image(messages: &mut [Message]) {
     let last = messages.last_mut().expect("a results message");
     let MessageContent::Blocks(blocks) = &mut last.content else {
@@ -89,14 +78,10 @@ fn seen(pairs: &[(&str, usize)]) -> std::collections::HashMap<String, usize> {
         .collect()
 }
 
-/// The default schedule's sweep round, so no test restates the catalog's
-/// interval.
 fn sweep_round() -> usize {
     SweepSchedule::default().sweep_every_rounds
 }
 
-/// The bytes a message puts on the wire. `Message` carries no `PartialEq`, and
-/// comparing the serialized form is the stricter check for a cache prefix.
 fn wire(messages: &[Message]) -> String {
     serde_json::to_string(messages).expect("messages serialize")
 }
@@ -135,16 +120,12 @@ fn tool_use_ids(messages: &[Message]) -> Vec<String> {
     ids
 }
 
-// ---- the mode read ----
-
 #[test]
 fn the_mode_reads_off_the_turns_capability_snapshot() {
     assert_eq!(
         ContextMode::from_capabilities(&ToolCapabilities::default()),
         ContextMode::Off
     );
-    // `all_open` is the WIDEST array, and the mode closes a family rather than
-    // opening one, so the mode is off there. It is turned on by hand.
     assert_eq!(
         ContextMode::from_capabilities(&ToolCapabilities::all_open()),
         ContextMode::Off
@@ -158,18 +139,12 @@ fn the_mode_reads_off_the_turns_capability_snapshot() {
     );
 }
 
-/// Invariant 1. The control arm adds no prompt section at all, which is what
-/// keeps its baseline the one a build without the mode would send.
 #[test]
 fn off_adds_no_system_prompt_section() {
     assert!(system_prompt_section(ContextMode::Off, SweepSchedule::default()).is_empty());
     assert!(!system_prompt_section(ContextMode::On, SweepSchedule::default()).is_empty());
 }
 
-// ---- the schedule ----
-
-/// Invariant 4. On the defaults an item lives one round past expiry at the
-/// least, and a whole interval past it at the most.
 #[test]
 fn an_item_lives_from_one_round_past_expiry_to_one_interval_past_it() {
     let schedule = SweepSchedule::default();
@@ -199,8 +174,6 @@ fn the_pass_runs_on_every_interval_round() {
     assert_eq!(schedule.rounds_to_next_sweep(every), every);
 }
 
-/// A zero interval would divide by zero on every round, so it is clamped rather
-/// than trusted.
 #[test]
 fn a_zero_interval_is_clamped_to_one() {
     let schedule = SweepSchedule::new(0, 0);
@@ -208,17 +181,12 @@ fn a_zero_interval_is_clamped_to_one() {
     assert!(schedule.is_sweep_round(1));
 }
 
-/// Invariant 7. Two items of different ages that share a sweep report the same
-/// remainder, because one pass takes them together.
 #[test]
 fn two_items_sharing_a_sweep_report_the_same_remainder() {
     let schedule = SweepSchedule::default();
     assert_eq!(schedule.leaves_in(1, 8), schedule.leaves_in(3, 8));
 }
 
-// ---- the sweep ----
-
-/// Invariant 2. Both blocks go, and nothing is written in their place.
 #[test]
 fn a_pair_leaves_whole_or_not_at_all() {
     let mut messages = vec![request()];
@@ -235,7 +203,6 @@ fn a_pair_leaves_whole_or_not_at_all() {
     assert_eq!(sweep.removed, vec![ADDRESS_A.to_string()]);
     assert!(!holds_address(&messages, ADDRESS_A));
     assert!(tool_use_ids(&messages).is_empty());
-    // The pair, plus the instruction block the results message carried for it.
     assert_eq!(block_count(&messages), before - 3, "the pair and its frame");
     let text: String = messages
         .iter()
@@ -254,8 +221,6 @@ fn a_pair_leaves_whole_or_not_at_all() {
     assert!(!text.contains("let go"), "no stub stands in its place");
 }
 
-/// Invariant 3. The API requires a `tool_use` to be answered in the same
-/// exchange, so age zero always survives.
 #[test]
 fn the_current_rounds_pair_always_stays() {
     let mut messages = vec![request()];
@@ -270,9 +235,6 @@ fn the_current_rounds_pair_always_stays() {
     assert!(holds_address(&messages, ADDRESS_A));
 }
 
-/// A screenshot is the single most expensive block a round can carry, and it
-/// holds no address. Left behind by its result it is unaddressable: the panel
-/// cannot list it, the model cannot keep it, and no later sweep reaches it.
 #[test]
 fn a_swept_result_takes_its_image_with_it() {
     let mut messages = vec![request()];
@@ -290,9 +252,6 @@ fn a_swept_result_takes_its_image_with_it() {
     assert!(!holds_image(&messages), "the image had no other owner");
 }
 
-/// The image is dropped by the message, not by one result, because nothing
-/// pairs an image to the call that produced it. So a message still holding a
-/// live result keeps its image.
 #[test]
 fn an_image_beside_a_surviving_result_stays() {
     let mut messages = vec![request()];
@@ -320,7 +279,6 @@ fn an_image_beside_a_surviving_result_stays() {
     assert!(holds_image(&messages), "a live result could still own it");
 }
 
-/// Invariant 5. Nothing moves between sweeps: that is what buys the cache back.
 #[test]
 fn nothing_leaves_on_a_round_that_is_not_a_sweep() {
     let mut messages = vec![request()];
@@ -337,13 +295,10 @@ fn nothing_leaves_on_a_round_that_is_not_a_sweep() {
     }
 }
 
-/// Invariant 4, at the boundary. Past expiry it goes on the sweep, and not
-/// before.
 #[test]
 fn an_item_leaves_at_the_first_sweep_past_expiry() {
     let schedule = SweepSchedule::default();
     let (round, expire) = (schedule.sweep_every_rounds, schedule.expire_after_rounds);
-    // At the sweep round its age is exactly the expiry age, which is not PAST it.
     let mut at_expiry = vec![request()];
     at_expiry.extend(pair("call-a", ADDRESS_A, "body", true));
     let arrived = round - expire;
@@ -355,7 +310,6 @@ fn an_item_leaves_at_the_first_sweep_past_expiry() {
     );
     assert!(sweep.removed.is_empty(), "the expiry age is not past it");
 
-    // One round older, so past expiry at the sweep round.
     let mut older = vec![request()];
     older.extend(pair("call-a", ADDRESS_A, "body", true));
     let arrived = round - expire - 1;
@@ -363,28 +317,21 @@ fn an_item_leaves_at_the_first_sweep_past_expiry() {
     assert_eq!(sweep.removed, vec![ADDRESS_A.to_string()]);
 }
 
-/// Invariant 6. Both numbers are read, not inlined: a swept arm must be able to
-/// move them without a rebuild.
 #[test]
 fn both_numbers_are_read_and_not_inlined() {
     let schedule = SweepSchedule::new(2, 4);
     let mut messages = vec![request()];
     messages.extend(pair("call-a", ADDRESS_A, "body", true));
 
-    // Round 4 is a sweep at this interval, and age three is past two.
     let sweep = sweep_expired_pairs(&mut messages, &seen(&[(ADDRESS_A, 1)]), 4, schedule);
     assert_eq!(sweep.removed, vec![ADDRESS_A.to_string()]);
 
-    // Round 10 is NOT a sweep at this interval, however old the item is.
     let mut other = vec![request()];
     other.extend(pair("call-b", ADDRESS_B, "body", true));
     let sweep = sweep_expired_pairs(&mut other, &seen(&[(ADDRESS_B, 1)]), 10, schedule);
     assert!(sweep.removed.is_empty());
 }
 
-/// Invariant 30. An assistant message of nothing but `tool_use` blocks is empty
-/// once the pair goes, and the provider rejects an empty message.
-/// `validate_tool_use_pairing` does not see it.
 #[test]
 fn a_sweep_never_leaves_an_empty_message() {
     let mut messages = vec![request()];
@@ -398,8 +345,6 @@ fn a_sweep_never_leaves_an_empty_message() {
         SweepSchedule::default(),
     );
 
-    // The text-free assistant message, and the results message the pair left
-    // holding nothing but the round's instruction.
     assert_eq!(sweep.messages_dropped, 2);
     assert_eq!(messages.len(), 1, "the request, and nothing of the pair");
     for message in &messages {
@@ -412,9 +357,6 @@ fn a_sweep_never_leaves_an_empty_message() {
     assert_eq!(messages.len(), 1, "pairing validation finds nothing to fix");
 }
 
-/// The results message carries the round's trailing instruction beside the
-/// bodies. Once the bodies go it says "Results above" above nothing, which is a
-/// placeholder in all but name.
 #[test]
 fn a_sweep_takes_the_instruction_the_results_leave_behind() {
     let mut messages = vec![request()];
@@ -445,16 +387,12 @@ fn a_sweep_takes_the_instruction_the_results_leave_behind() {
                 .any(|b| matches!(b, ContentBlock::Text { text } if text == "Results above."));
         assert!(!orphan, "an instruction survived its results");
     }
-    // The drop is a role decision, not a text-only one. The prose beside the
-    // swept call is the model's own, and it stays.
     assert!(
         wire(&messages).contains("Let me read that."),
         "the model's own words went with the engine's"
     );
 }
 
-/// An assistant message that also carried prose keeps the prose, so the model's
-/// own words do not vanish with the call.
 #[test]
 fn a_sweep_keeps_the_prose_beside_the_call() {
     let mut messages = vec![request()];
@@ -473,14 +411,11 @@ fn a_sweep_keeps_the_prose_beside_the_call() {
     ));
 }
 
-/// Invariant 29. The existing loop bookkeeping assumes contiguous removal from
-/// index 1, which a mid-array sweep is not.
 #[test]
 fn message_index_pins_survive_a_mid_array_removal() {
     let mut messages = vec![request()];
     messages.extend(pair("call-a", ADDRESS_A, "old", false));
     messages.extend(pair("call-b", ADDRESS_B, "new", false));
-    // 0 request, 1 assistant(a), 2 result(a), 3 assistant(b), 4 result(b)
     assert_eq!(messages.len(), 5);
 
     let sweep = sweep_expired_pairs(
@@ -498,14 +433,10 @@ fn message_index_pins_survive_a_mid_array_removal() {
     assert!(holds_address(&messages, ADDRESS_B));
 }
 
-// ---- the two text surfaces ----
-
 fn prompt() -> String {
     system_prompt_section(ContextMode::On, SweepSchedule::default())
 }
 
-/// Invariant 6. The prompt quotes the values in force, so a swept arm cannot
-/// say ten while the pass drops at four.
 #[test]
 fn the_prompt_quotes_the_values_in_force() {
     let interval = sweep_round() + 1;
@@ -519,8 +450,6 @@ fn the_prompt_quotes_the_values_in_force() {
     assert!(!swept.contains(&default_interval));
 }
 
-/// Invariant 43's mechanism. Two arms at different values render different
-/// text, so the eval's guidance hash can tell them apart.
 #[test]
 fn two_schedules_render_different_prompts() {
     assert_ne!(
@@ -533,15 +462,11 @@ fn two_schedules_render_different_prompts() {
     );
 }
 
-/// Invariant 19. It appeared five times per request plus once per placeholder,
-/// and the request was advertising its most expensive move on every line.
 #[test]
 fn the_recovery_command_appears_once() {
     assert_eq!(prompt().matches(RESULT_RECOVERY).count(), 1);
 }
 
-/// Invariant 23. The record's text says writing is free and never says how
-/// often, which leaves the old habit standing.
 #[test]
 fn the_guidance_states_the_write_rhythm() {
     let prompt = prompt();
@@ -550,8 +475,6 @@ fn the_guidance_states_the_write_rhythm() {
     assert!(prompt.contains("Rewrite it whole on the round the panel says the sweep is\nnext"));
 }
 
-/// Invariant 22. Five claims in the shipped text are false under the design,
-/// and the load-bearing one is that a note is cheaper than a keep.
 #[test]
 fn none_of_the_five_false_claims_survives() {
     let prompt = prompt().to_ascii_lowercase();
@@ -568,8 +491,6 @@ fn none_of_the_five_false_claims_survives() {
     }
 }
 
-/// The three markers, and the three headings, all spelled out where the model
-/// reads them.
 #[test]
 fn the_guidance_names_every_marker_it_asks_for() {
     let prompt = prompt();
@@ -585,8 +506,6 @@ fn the_guidance_names_every_marker_it_asks_for() {
     }
 }
 
-/// The keep is a line in the document, not a tool. A schema is prose billed on
-/// every request of every workspace.
 #[test]
 fn the_guidance_never_offers_a_keep_tool() {
     let prompt = prompt();
@@ -594,16 +513,11 @@ fn the_guidance_never_offers_a_keep_tool() {
     assert!(prompt.contains("[KEEP OPEN]"));
 }
 
-/// Invariant 17, on the prompt surface.
 #[test]
 fn no_prompt_surface_shows_a_shortened_address() {
     assert_no_short_addresses(&prompt());
 }
 
-/// The refusal sends the model somewhere the guidance already describes.
-///
-/// A refusal that only says no leaves it holding a list with nowhere to put
-/// it. That is how a withdrawn tool turns into a wasted round.
 #[test]
 fn the_todo_refusal_names_the_heading_the_guidance_names() {
     assert!(TODO_TOOL_REFUSAL.contains("[TODO]"));
@@ -611,11 +525,6 @@ fn the_todo_refusal_names_the_heading_the_guidance_names() {
     assert!(prompt().contains("[TODO]"));
 }
 
-/// The rebuild is what a follow-up turn does, and the prompt used to deny it.
-///
-/// `build_resume_tool_blocks_with_skip_ids` rebuilds the last few pairs with
-/// their addresses. A model told they were gone would price a read-back it did
-/// not need, and would not know its ages had reset.
 #[test]
 fn the_prompt_does_not_deny_the_resume_rebuild() {
     let prompt = prompt();

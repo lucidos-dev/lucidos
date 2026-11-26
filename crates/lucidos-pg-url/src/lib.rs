@@ -1,45 +1,11 @@
-//! One reading of a Postgres connection URL, for the engine and the gateway.
-//!
-//! Design: `docs/plans/2026-10-12-other-local-users-cannot-reach-postgres-or-devtools.md`.
-//!
-//! A URL names its server in one of two ways:
-//!
-//! - **TCP**: `postgres://user:pass@host:5432/db`.
-//! - **Unix socket**: a directory, either as a `host` query parameter
-//!   (`postgres:///db?host=/dir&user=u`) or percent-encoded in the authority
-//!   (`postgres://u@%2Fdir/db`). sqlx reads both.
-//!
-//! libpq takes either from `PGHOST`, so [`PgUrl::env`] serves both shapes. The
-//! password travels in `PGPASSWORD`, never in argv: a subprocess's argv is
-//! persisted in tool-call payloads and shown in the steps UI.
-//!
-//! A URL may name a password file instead (`passfile`, libpq's own parameter).
-//! The gateway hands its engines one, since any same-user process can read
-//! another's environment on macOS (ADR 0645). [`inline_passfile`] turns it
-//! into an in-memory password for sqlx, which reads no `passfile` parameter.
-//!
-//! [`PgUrl::read_only_url`] renders the URL the engine hands its agents as
-//! `LUCIDOS_DATABASE_URL` (ADR 0481), signed in as the database's
-//! [`agent_role`] (ADR 0509).
-
 use std::path::{Path, PathBuf};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The group every agent role belongs to. The packaged cluster's `pg_hba.conf`
-/// lets its members sign in with a password over the socket.
 pub const AGENT_ROLE_GROUP: &str = "lucidos_agents";
 
-/// The longest name Postgres keeps whole (`NAMEDATALEN - 1`). It cuts a
-/// longer one short, silently.
 pub const PG_MAX_IDENTIFIER_BYTES: usize = 63;
 
-/// The role agents, scripts and triggers use for `database`: it reads and
-/// writes everything but the secret columns (ADR 0509). The engine creates it
-/// at boot; the gateway drops it with the database.
-///
-/// A name too long for Postgres keeps a prefix of the database name and a
-/// hash of the whole. So two long names never share a role.
 pub fn agent_role(database: &str) -> String {
     const SUFFIX: &str = "_agent";
     let whole = format!("{database}{SUFFIX}");
@@ -52,44 +18,31 @@ pub fn agent_role(database: &str) -> String {
     format!("{prefix}{hash}{SUFFIX}")
 }
 
-/// 64-bit FNV-1a: stable across releases, which a role name must be.
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
-/// The port libpq assumes when a URL names none.
 pub const DEFAULT_PORT: u16 = 5432;
 
-/// Where a URL's server listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
     Tcp(String),
-    /// The directory holding `.s.PGSQL.<port>`.
     Socket(PathBuf),
 }
 
-/// A parsed Postgres connection URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgUrl {
     pub user: Option<String>,
-    /// `Some("")` for an explicit empty password (`user:@host`), which libpq
-    /// treats differently from no password at all.
     pub password: Option<String>,
     pub host: Host,
     pub port: u16,
     pub database: String,
-    /// Every other query parameter, such as `sslmode` or `options`, as written:
-    /// key and value still percent-encoded.
     pub params: Vec<(String, String)>,
 }
 
 impl PgUrl {
-    /// Parse `url`. A refusal quotes the URL redacted, so it is safe to show.
-    ///
-    /// Query parameters `host`, `port`, `user` and `password` override the
-    /// authority, as in libpq. Others, such as `sslmode`, land in `params`.
     pub fn parse(url: &str) -> Result<Self, BoxError> {
         let refuse = |why: &str| -> BoxError { format!("{why}: '{}'", redact(url)).into() };
         let rest = url
@@ -150,14 +103,6 @@ impl PgUrl {
         })
     }
 
-    /// The libpq environment for this URL: `PGUSER`, `PGPASSWORD`, `PGHOST`,
-    /// `PGPORT` and `PGDATABASE`, plus the variable for each parameter in
-    /// [`PARAM_ENV`], such as `sslmode` as `PGSSLMODE`. A missing user or
-    /// password is left out, so libpq applies its own default rather than an
-    /// empty value.
-    ///
-    /// A URL naming a `passfile` never puts its password in the environment:
-    /// the child reads the file through `PGPASSFILE` instead.
     pub fn env(&self) -> Vec<(&'static str, String)> {
         let mut vars = Vec::with_capacity(5);
         if let Some(user) = &self.user {
@@ -184,16 +129,6 @@ impl PgUrl {
         vars
     }
 
-    /// This URL with every transaction read-only unless it opts in with
-    /// `BEGIN READ WRITE`. libpq, sqlx, psycopg and node-postgres all read it.
-    ///
-    /// A socket URL puts everything in the query, the shape the gateway hands
-    /// a packaged engine: sqlx refuses an empty authority host. Every other
-    /// parameter, such as `sslmode`, carries over, and an existing `options`
-    /// gains the read-only flag at its end.
-    ///
-    /// A `passfile` does not carry over: the read-only URL signs in as a role
-    /// with its own password.
     pub fn read_only_url(&self) -> String {
         let enc = |text: &str| urlencoding::encode(text).into_owned();
         let database = enc(&self.database);
@@ -241,7 +176,6 @@ impl PgUrl {
 }
 
 impl PgUrl {
-    /// The password file this URL names, decoded.
     pub fn passfile(&self) -> Option<PathBuf> {
         self.params
             .iter()
@@ -251,15 +185,8 @@ impl PgUrl {
     }
 }
 
-/// libpq's parameter naming a password file.
 pub const PASSFILE_PARAM: &str = "passfile";
 
-/// `url` with its `passfile` parameter replaced by the password the file
-/// holds for the URL's user, and the file's path. A URL with no `passfile`
-/// comes back unchanged.
-///
-/// The result holds a password, so it belongs in memory only, never in an
-/// environment or an argv.
 pub fn inline_passfile(url: &str) -> Result<(String, Option<PathBuf>), BoxError> {
     let parsed = PgUrl::parse(url)?;
     let Some(passfile) = parsed.passfile() else {
@@ -279,8 +206,6 @@ pub fn inline_passfile(url: &str) -> Result<(String, Option<PathBuf>), BoxError>
     Ok((format!("{base}?{}", pairs.join("&")), Some(passfile)))
 }
 
-/// The line of a libpq password file that signs `user` in with `password` on
-/// any host, port and database.
 pub fn passfile_line(user: &str, password: &str) -> String {
     format!(
         "*:*:*:{}:{}\n",
@@ -289,9 +214,6 @@ pub fn passfile_line(user: &str, password: &str) -> String {
     )
 }
 
-/// The password `path` holds for `user`, read as libpq reads it: the first
-/// line whose user field matches. Host, port and database must be `*`, the
-/// only shape [`passfile_line`] writes.
 pub fn password_from_passfile(path: &Path, user: &str) -> std::io::Result<Option<String>> {
     let text = std::fs::read_to_string(path)?;
     Ok(text
@@ -308,7 +230,6 @@ fn pgpass_escape(field: &str) -> String {
     field.replace('\\', "\\\\").replace(':', "\\:")
 }
 
-/// Split a password file line at each unescaped `:`, dropping the escapes.
 fn pgpass_fields(line: &str) -> Vec<String> {
     let mut fields = vec![String::new()];
     let mut chars = line.chars();
@@ -322,9 +243,6 @@ fn pgpass_fields(line: &str) -> Vec<String> {
     fields
 }
 
-/// The URL parameters libpq also reads from the environment, and the variable
-/// for each. Dropping one would silently change the connection, such as
-/// `sslmode=require` falling back to libpq's default `prefer`.
 pub const PARAM_ENV: &[(&str, &str)] = &[
     ("sslmode", "PGSSLMODE"),
     ("sslrootcert", "PGSSLROOTCERT"),
@@ -338,15 +256,8 @@ pub const PARAM_ENV: &[(&str, &str)] = &[
     (PASSFILE_PARAM, "PGPASSFILE"),
 ];
 
-/// The `options` flag that opens every session read-only, percent-encoded.
-/// [`PgUrl::read_only_url`] always ends with it.
 pub const READ_ONLY_OPTION: &str = "-c%20default_transaction_read_only%3Don";
 
-/// `url` with its password hidden: the userinfo becomes `***@`, and a
-/// `password=` query parameter becomes `password=***`.
-///
-/// Works on any string, parseable or not, so an error about a malformed URL
-/// can still quote it. The userinfo is found as [`PgUrl::parse`] finds it.
 pub fn redact(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((scheme, rest)) => (format!("{scheme}://"), rest),
@@ -373,12 +284,6 @@ pub fn redact(url: &str) -> String {
     format!("{scheme}{authority}{tail}")
 }
 
-/// Split the URL after its scheme at the `@` that ends the userinfo.
-///
-/// That is the last `@` with a `/` after it, since the database path follows
-/// the host. So an unencoded `/`, `?` or `@` in a password stays in the
-/// userinfo. Neither the parser nor [`redact`] reads part of it as the host. A URL with no path falls back to the last `@` before any `/`, which
-/// still leaves an `@` in the query alone.
 fn split_userinfo(rest: &str) -> (Option<&str>, &str) {
     let ats = || rest.match_indices('@').map(|(i, _)| i);
     let first_slash = rest.find('/').unwrap_or(rest.len());
@@ -475,9 +380,6 @@ mod tests {
         assert_eq!(env.get("PGHOST").map(String::as_str), Some("localhost"));
     }
 
-    /// The socket form the gateway hands a packaged engine. The directory can
-    /// hold a space (`Application Support`) and an `@` (a home named after an
-    /// email address).
     #[test]
     fn a_socket_url_in_the_query_parses_to_its_directory() {
         let url = PgUrl::parse(
@@ -512,8 +414,6 @@ mod tests {
         assert_eq!(env.get("PGDATABASE").map(String::as_str), Some("db"));
     }
 
-    /// The rendered URL names the same server, user and database, with every
-    /// parameter kept and the read-only flag added.
     fn assert_round_trips(source: &str, rendered: &str) {
         let original = PgUrl::parse(source).unwrap();
         let mut expected = original.params.clone();
@@ -552,8 +452,6 @@ mod tests {
         assert_round_trips(source, &rendered);
     }
 
-    /// The packaged engine's socket URL, with a space and an `@` in the
-    /// directory.
     #[test]
     fn a_socket_url_renders_read_only_and_parses_back() {
         let source =
@@ -589,7 +487,6 @@ mod tests {
         );
     }
 
-    /// A backup of a server that insists on TLS must insist too.
     #[test]
     fn connection_parameters_reach_the_libpq_environment() {
         let env = env_map(
@@ -608,7 +505,6 @@ mod tests {
         assert_eq!(env.len(), 7, "an unknown parameter sets nothing: {env:?}");
     }
 
-    /// An unencoded `/` or `@` in a password must not be read as the host.
     #[test]
     fn a_raw_slash_or_at_in_a_password_stays_in_the_userinfo() {
         let url = PgUrl::parse("postgres://u:pa/ss@word@db:5432/x").unwrap();
@@ -654,13 +550,10 @@ mod tests {
         }
     }
 
-    /// Every message built from a database URL goes through the redactor, and
-    /// those messages reach the boot splash and the picker's tooltip.
     #[test]
     fn a_redacted_url_keeps_its_shape_and_drops_its_password() {
         let redacted = redact("postgres://lucidos:secret@127.0.0.1:5544/lucidos_dev");
         assert_eq!(redacted, "postgres://***@127.0.0.1:5544/lucidos_dev");
-        // A password containing an `@` is removed whole.
         assert_eq!(
             redact("postgres://u:p@ss@db.example:5432/x?sslmode=require"),
             "postgres://***@db.example:5432/x?sslmode=require"
@@ -669,7 +562,6 @@ mod tests {
             redact("postgres:///db?host=/run/pg&password=secret&user=u"),
             "postgres:///db?host=/run/pg&password=***&user=u"
         );
-        // Nothing to hide, and a malformed value, both pass through readable.
         assert_eq!(
             redact("postgres://127.0.0.1:5432/lucidos"),
             "postgres://127.0.0.1:5432/lucidos"
@@ -683,7 +575,6 @@ mod tests {
         file
     }
 
-    /// A child reads the file, so the password never enters its environment.
     #[test]
     fn a_passfile_reaches_a_child_as_a_path_never_as_a_password() {
         let url = "postgres:///db?host=/run/pg&user=lucidos&password=pw&passfile=%2Frun%2Fpg%2Fp";

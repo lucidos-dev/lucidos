@@ -1,13 +1,3 @@
-//! E2E coverage for the Claude gateway routes and the `claude_gateway_url`
-//! preference that names the gateway.
-//!
-//! No gateway runs here, so this pins what holds without one: the URL check,
-//! the status shape, and the answers when a sign-in cannot start. The device
-//! flow itself is covered against a mock gateway in the engine's own tests.
-//!
-//! One test, because the URL is a workspace-global preference and parallel
-//! cases would overwrite each other's value.
-
 use crate::support::{base_url, user_client};
 use lucidos_engine::core::prefs;
 use serde_json::json;
@@ -60,7 +50,6 @@ async fn the_claude_gateway_routes_answer_without_a_gateway() {
     let api = base_url();
     assert_eq!(put_url(&client, &api, "").await["success"], json!(true));
 
-    // A bearer credential follows this URL, so plain http is refused.
     let refused = put_url(&client, &api, "http://gateway.example").await;
     assert_eq!(refused["success"], json!(false), "{refused}");
     assert!(
@@ -77,21 +66,17 @@ async fn the_claude_gateway_routes_answer_without_a_gateway() {
         json!(false),
         "no sign-in, no telemetry: {idle}"
     );
-    // The machine's Claude Code managed settings decide this one, so only
-    // its shape is fixed: a URL string or nothing.
     assert!(
         idle["suggested_url"].is_null() || idle["suggested_url"].is_string(),
         "{idle}"
     );
     assert_eq!(idle["sign_in"], json!({ "state": "idle" }), "{idle}");
 
-    // No URL yet: the refusal says which preference to set.
     let resp = post(&client, &api, "sign-in", json!({})).await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
     assert!(body.contains(prefs::CLAUDE_GATEWAY_URL.key()), "{body}");
 
-    // A URL in the body passes the same check as a Settings save.
     let resp = post(
         &client,
         &api,
@@ -102,7 +87,6 @@ async fn the_claude_gateway_routes_answer_without_a_gateway() {
     assert_eq!(resp.status(), 400);
     assert_eq!(status(&client, &api).await["url"], json!(null));
 
-    // A URL where no gateway answers: stored, then the gateway is at fault.
     let unreachable = "http://127.0.0.1:9";
     let resp = post(&client, &api, "sign-in", json!({ "url": unreachable })).await;
     assert_eq!(resp.status(), 502);

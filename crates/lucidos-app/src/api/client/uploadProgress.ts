@@ -1,4 +1,4 @@
-import { requestGenerationGuard } from './_core';
+import { ApiError, isTransportError, requestGenerationGuard } from './_core';
 import { restoreAdmissionReady, waitForRestoreAdmission } from '../../utils/restoreAdmission';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { registrationToAwait } from '../../utils/deviceRegistration';
@@ -9,6 +9,39 @@ export const UPLOAD_RESPONSE_MS = 30_000;
 export const UPLOAD_STALLED_MESSAGE = 'The upload stopped making progress';
 export const UPLOAD_UNANSWERED_MESSAGE = 'Lucidos did not answer the upload in time';
 
+export const UPLOAD_TOO_LARGE_MESSAGE = 'The file is larger than this connection to Lucidos accepts (HTTP 413)';
+export const UPLOAD_UNREACHABLE_MESSAGE = 'Lucidos could not be reached';
+export const UPLOAD_INTERRUPTED_MESSAGE = 'The upload was interrupted';
+
+const PROXY_GAVE_UP = new Set([502, 504]);
+
+export function uploadErrorMessage(err: unknown): string {
+  const httpCode = httpCodeOf(err);
+  if (httpCode !== null && !hasLucidosSentence(err)) {
+    if (httpCode === 413) return UPLOAD_TOO_LARGE_MESSAGE;
+    if (PROXY_GAVE_UP.has(httpCode)) return `A proxy between you and Lucidos gave up on the upload (HTTP ${httpCode})`;
+  }
+  if (err instanceof ApiError) return err.reason;
+  if (isTransportError(err)) return UPLOAD_UNREACHABLE_MESSAGE;
+  if (err instanceof DOMException && err.name === 'TimeoutError') {
+    const ours = err.message === UPLOAD_STALLED_MESSAGE || err.message === UPLOAD_UNANSWERED_MESSAGE;
+    return ours ? err.message : 'Lucidos took too long to answer';
+  }
+  if (err instanceof DOMException && err.name === 'AbortError') return UPLOAD_INTERRUPTED_MESSAGE;
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function httpCodeOf(err: unknown): number | null {
+  const code = (err as { httpCode?: unknown } | null)?.httpCode;
+  return typeof code === 'number' ? code : null;
+}
+
+function hasLucidosSentence(err: unknown): boolean {
+  const body = err instanceof ApiError ? err.body as { error?: unknown } | undefined : undefined;
+  return typeof body?.error === 'string' && body.error !== '';
+}
+
 export interface UploadProgress {
   sentBytes: number;
   totalBytes: number;
@@ -18,6 +51,13 @@ export interface UploadObserver {
   onProgress?: (progress: UploadProgress) => void;
   onBodySent?: () => void;
   signal?: AbortSignal;
+}
+
+export interface UploadRequest {
+  method: 'POST' | 'PATCH';
+  url: string;
+  headers?: Record<string, string>;
+  body: XMLHttpRequestBodyInit;
 }
 
 export async function postWithUploadProgress(
@@ -31,9 +71,18 @@ export async function postWithUploadProgress(
   if (registration) await registration;
   if (!restoreAdmissionReady()) await waitForRestoreAdmission();
   checkGeneration();
-  observer.signal?.throwIfAborted();
+  const response = await sendWithUploadProgress(
+    { method: 'POST', url, body, headers: { ...deviceIdHeader(), ...checkGeneration.headers } },
+    observer,
+  );
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
+  return response;
+}
 
-  const response = await new Promise<Response>((resolve, reject) => {
+export async function sendWithUploadProgress(request: UploadRequest, observer: UploadObserver = {}): Promise<Response> {
+  observer.signal?.throwIfAborted();
+  return new Promise<Response>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
@@ -59,8 +108,8 @@ export async function postWithUploadProgress(
       xhr.abort();
     }
 
-    xhr.open('POST', url);
-    for (const [name, value] of Object.entries({ ...deviceIdHeader(), ...checkGeneration.headers })) xhr.setRequestHeader(name, value);
+    xhr.open(request.method, request.url);
+    for (const [name, value] of Object.entries(request.headers ?? {})) xhr.setRequestHeader(name, value);
     xhr.upload.onprogress = (e) => {
       armStall();
       if (e.lengthComputable) observer.onProgress?.({ sentBytes: e.loaded, totalBytes: e.total });
@@ -78,11 +127,8 @@ export async function postWithUploadProgress(
     observer.signal?.addEventListener('abort', onCallerAbort, { once: true });
 
     armStall();
-    xhr.send(body);
+    xhr.send(request.body);
   });
-  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
-  checkGeneration();
-  return response;
 }
 
 const NULL_BODY_STATUSES = new Set([204, 205, 304]);

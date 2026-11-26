@@ -1,7 +1,5 @@
 use super::*;
 
-/// The shape Claude Code 2.1.280 returned, trimmed to three rows, with a fake
-/// account where the real reply names the signed-in user.
 fn recorded_reply() -> serde_json::Value {
     serde_json::json!({
         "account": { "email": "someone@example.com", "organization": "Example Org" },
@@ -56,7 +54,6 @@ fn account(name: &str) -> AccountPin {
     }
 }
 
-/// What the engine's picker offers right now.
 fn picker_offers(state: &Discovery, value: &str) -> bool {
     state
         .options
@@ -64,9 +61,6 @@ fn picker_offers(state: &Discovery, value: &str) -> bool {
         .is_none_or(|options| options.iter().any(|o| o.value == value))
 }
 
-/// A session on a just-updated Claude Code refuses before the probe of that
-/// version lands. The refusal carries the session's version, so that probe
-/// keeps it, whatever version the cache it replaces came from.
 #[test]
 fn a_refusal_on_a_new_version_survives_that_versions_probe() {
     let live = account("a");
@@ -83,8 +77,6 @@ fn a_refusal_on_a_new_version_survives_that_versions_probe() {
     assert!(state.refusals.holds("claude-fable-5-2"));
 }
 
-/// A probe of another version drops the refusals, and so does one whose
-/// version is unknown: an update is when the account's list can move.
 #[test]
 fn a_probe_of_another_or_unknown_version_drops_the_refusals() {
     let live = account("a");
@@ -103,8 +95,6 @@ fn a_probe_of_another_or_unknown_version_drops_the_refusals() {
     assert!(!undated.hold_for(None));
 }
 
-/// The probe runs under the live account, so only a session on it learns. A
-/// session pinned to another account refuses for itself alone.
 #[test]
 fn only_a_session_on_the_live_account_learns() {
     let (live, other) = (account("a"), account("b"));
@@ -125,8 +115,6 @@ fn only_a_session_on_the_live_account_learns() {
     assert!(state.refusals.holds("claude-fable-5-2[1m]"));
 }
 
-/// A switch of the live account drops the old account's refusals, so the new
-/// account picks the models it may run.
 #[test]
 fn a_new_live_account_drops_the_refusals() {
     let (a, b) = (account("a"), account("b"));
@@ -138,8 +126,6 @@ fn a_new_live_account_drops_the_refusals() {
     assert!(!state.refusals.holds("claude-fable-5-2"));
 }
 
-/// A refusal from another version replaces the older ones rather than adding
-/// to them, and a known refusal records nothing new.
 #[test]
 fn a_refusal_from_another_version_starts_over() {
     let a = account("a");
@@ -151,9 +137,6 @@ fn a_refusal_from_another_version_starts_over() {
     assert_eq!(refusals.cc_version.as_deref(), Some("2.1.312"));
 }
 
-/// A swap never edits the picker: the owner decides whether the model leaves
-/// the ladder, and an outage can be temporary. That holds on the curated
-/// fallback and on a discovered list alike.
 #[test]
 fn a_refusal_keeps_the_model_offered() {
     let live = account("a");
@@ -173,8 +156,6 @@ fn a_refusal_keeps_the_model_offered() {
     assert!(picker_offers(&state, "claude-fable-5-2"));
 }
 
-/// A refused model that serves unswapped again loses its refusal. Only a
-/// session on the live account clears it, as only one there records it.
 #[test]
 fn a_clean_serve_on_the_live_account_clears_the_refusal() {
     let (live, other) = (account("a"), account("b"));
@@ -192,8 +173,6 @@ fn a_clean_serve_on_the_live_account_clears_the_refusal() {
     assert!(!state.serve("claude-fable-5-2", Some(&live), Some(&live)));
 }
 
-/// The refusals survive a restart through their file. An unreadable file
-/// reads as none.
 #[test]
 fn the_refusals_round_trip_through_their_file() {
     let refusals = refused_by(Some("2.1.311"), "claude-fable-5-2");
@@ -206,8 +185,6 @@ fn the_refusals_round_trip_through_their_file() {
     assert_eq!(load_refusals(dir.path()), CcModelRefusals::default());
 }
 
-/// The owner is asked about a refusal once, and the record of it survives a
-/// restart. A refusal that clears and comes back is asked about again.
 #[test]
 fn a_told_refusal_stays_told_until_it_clears() {
     let mut refusals = refused_by(Some("2.1.311"), "claude-fable-5-2");
@@ -227,10 +204,6 @@ fn a_told_refusal_stays_told_until_it_clears() {
     assert!(refusals.untold("claude-fable-5-2"));
 }
 
-/// The reply names the signed-in account. Nothing of it may reach the cache:
-/// its `account` field is the engine's own account pin, never the reply's.
-/// The timestamp is fixed: a live one carries random digits that can spell a
-/// probe string.
 #[test]
 fn only_the_model_list_reaches_the_cache() {
     let discovered_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
@@ -258,8 +231,6 @@ fn only_the_model_list_reaches_the_cache() {
     );
 }
 
-/// A reply with no usable list is an error, so a broken probe never empties
-/// the picker.
 #[test]
 fn a_reply_without_models_is_refused() {
     let missing = parse_initialize_models(&serde_json::json!({ "account": {} }));
@@ -270,8 +241,6 @@ fn a_reply_without_models_is_refused() {
     assert!(malformed.unwrap_err().contains("did not parse"));
 }
 
-/// The picker shows Claude Code's own labels, in its order, and a model that
-/// takes no effort offers no tiers.
 #[test]
 fn discovered_rows_keep_claude_codes_labels_order_and_tiers() {
     let options = menu_options(&parse_initialize_models(&recorded_reply()).unwrap());
@@ -313,8 +282,6 @@ fn a_cache_is_refreshed_when_missing_stale_or_from_another_version() {
     assert!(needs_refresh(Some(&stale), None, now, None, None));
 }
 
-/// A probe whose `--version` did not answer has nothing to compare, so every
-/// session start reporting a version must not re-probe.
 #[test]
 fn an_unversioned_cache_refreshes_on_age_only() {
     let now = Utc::now();
@@ -330,8 +297,6 @@ fn an_unversioned_cache_refreshes_on_age_only() {
     assert!(needs_refresh(Some(&old), None, now, Some("2.1.280"), None));
 }
 
-/// Another account offers other models, so a switch of account re-probes. A
-/// cache written before the engine recorded the account re-probes once.
 #[test]
 fn a_cache_from_another_account_is_refreshed() {
     let now = Utc::now();
@@ -360,8 +325,6 @@ fn a_cache_from_another_account_is_refreshed() {
     assert!(needs_refresh(Some(&unrecorded), None, now, None, live));
 }
 
-/// A failed probe holds off the next one, so a lasting failure costs one cold
-/// Claude Code an hour rather than one per session start.
 #[test]
 fn a_failed_probe_waits_before_the_next() {
     let now = Utc::now();
@@ -378,8 +341,6 @@ fn a_failed_probe_waits_before_the_next() {
     assert!(needs_refresh(None, failed_long_ago, now, None, None));
 }
 
-/// A model that supports effort but names no tiers falls back to the effort
-/// table, rather than offering none.
 #[test]
 fn effort_support_without_named_tiers_defers_to_the_table() {
     let unnamed = DiscoveredModel {
@@ -402,7 +363,6 @@ fn the_cache_round_trips_through_its_file() {
     assert_eq!(load_cache(dir.path()), Some(cache));
 }
 
-/// An unreadable file is treated as absent, so the next probe replaces it.
 #[test]
 fn an_unreadable_cache_reads_as_absent() {
     let dir = tempfile::tempdir().unwrap();

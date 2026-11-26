@@ -1,9 +1,5 @@
 use super::*;
 
-/// Every refusal the engine's ladder can produce must reach HTTP as the
-/// status the ladder itself declares. The route does not keep its own copy of
-/// the taxonomy, and this is what proves it: a new `ChildFollowUpError`
-/// variant fails to compile here until it is given a status.
 #[test]
 fn every_child_follow_up_error_maps_to_its_declared_status() {
     let id = Uuid::new_v4();
@@ -32,17 +28,10 @@ fn every_child_follow_up_error_maps_to_its_declared_status() {
     }
 }
 
-/// The request shape is the invariant: the route derives everything it can
-/// derive, so a caller has no field with which to state a mode, a parent, a
-/// coding agent, a repo, or its own identity. Rejecting them by not having
-/// them beats validating them away.
 #[test]
 fn follow_up_request_has_no_routing_fields() {
     let body = serde_json::json!({
         "message": "go the other way",
-        // Every one of these is a field the caller must NOT be able to set.
-        // serde ignores unknown fields, so the assertion is that the parsed
-        // struct exposes nowhere for them to land.
         "mode": "human",
         "parent_thread_id": Uuid::new_v4().to_string(),
         "use_coding_agent": true,
@@ -74,8 +63,6 @@ fn follow_up_request_has_no_routing_fields() {
         );
     }
 
-    // And none of them can stand in for the one field that IS required, so a
-    // caller cannot reach the handler by sending routing fields alone.
     let no_message = serde_json::json!({
         "mode": "agent",
         "parent_thread_id": Uuid::new_v4().to_string(),
@@ -87,8 +74,6 @@ fn follow_up_request_has_no_routing_fields() {
     );
 }
 
-/// A cross-workspace body is refused rather than ignored, so the caller gets
-/// D4's real reason instead of a confusing `NotYourChild`.
 #[test]
 fn a_cross_workspace_body_field_is_parsed_so_it_can_be_refused() {
     let body = serde_json::json!({ "message": "hi", "caller_workspace": "dev" });
@@ -102,8 +87,6 @@ fn a_cross_workspace_body_field_is_parsed_so_it_can_be_refused() {
     );
 }
 
-/// `delivered_to` is a public API parameter value, so it is kebab-case
-/// (`CLAUDE.md`), not the Rust variant name and not snake_case.
 #[test]
 fn delivered_to_is_kebab_case_on_the_wire() {
     assert_eq!(delivered_to_wire(FollowUpDelivery::Running), "running");
@@ -115,9 +98,6 @@ fn delivered_to_is_kebab_case_on_the_wire() {
     assert_eq!(delivered_to_wire(FollowUpDelivery::Revived), "revived");
 }
 
-/// The response names the child by TITLE. A uuid means nothing to a user (no
-/// screen in Lucidos is labelled with one), so every surface that renders an
-/// ack has the title to hand without a second lookup.
 #[test]
 fn the_response_carries_the_child_title_and_a_readable_delivery() {
     let child_thread_id = Uuid::new_v4();

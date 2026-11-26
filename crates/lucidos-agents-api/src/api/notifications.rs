@@ -6,11 +6,6 @@ use crate::scheduler::notifications::{
 };
 use crate::scheduler::{NotificationStore, PushSubscriptionStore};
 
-/// Body for `POST /api/v1/notifications` — used by the `lucidos notify` CLI
-/// (and any other engine subprocess) to send a push notification without
-/// going through an LLM thread / `send_notification` tool. Mirrors the LLM
-/// tool's shape: `title` and `message` required, `app_id` / `thread_id` /
-/// `tap` optional with the same deep-link semantics.
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateNotificationRequest {
     pub title: String,
@@ -19,25 +14,12 @@ pub(super) struct CreateNotificationRequest {
     pub app_id: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
-    /// Specific event UUID inside `thread_id` to deep-link to. When set the
-    /// inbox modal's "Open thread" button and a `Tap::Navigate { to.target =
-    /// Thread, to.event_id = .. }` tap scroll and briefly pulse this event on
-    /// land. Ignored without `thread_id`.
     #[serde(default)]
     pub event_id: Option<String>,
-    /// Structured tap behavior, see [`Tap`]. Absent or null takes
-    /// [`default_tap`]. The serde decode rejects the old string forms
-    /// ("modal" / "open_app" / "open_thread" / "none") so out-of-date scripts
-    /// fail loudly with a 400 instead of silently routing to the inbox.
     #[serde(default)]
     pub tap: Option<Tap>,
 }
 
-/// `POST /api/v1/notifications` — script-facing endpoint that produces the
-/// same notification a `send_notification` LLM tool call would: persisted
-/// to the inbox AND pushed to subscribed devices, with the same `app_id`
-/// deep-link semantics. Shares its body with `execute_send_notification`
-/// via `LucidosEngine::create_notification`.
 pub(super) async fn create_notification(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -62,11 +44,6 @@ pub(super) async fn create_notification(
     let link_event_id = super::parse_optional_uuid_trimmed(body.event_id.as_deref())
         .map_err(|raw| ApiError::bad_request(format!("invalid event_id: {raw}")))?;
 
-    // Structured tap. `to.target`-specific required fields (e.g. `app_id` for
-    // `target=app`) are enforced by the page-side router, not here. The serde
-    // decode above already rejected malformed shapes with 400. Omitting it
-    // takes the derived default: the source event when this notification names
-    // one, the card otherwise.
     let mut tap = body
         .tap
         .unwrap_or_else(|| default_tap(link_thread_id, link_event_id));
@@ -129,7 +106,6 @@ async fn native_push_receipt(
             "Notification not found",
         ));
     }
-    // Ordinary notifications also acknowledge; only durable dispatches need a receipt.
     let durable: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM user_only_message_dispatches WHERE notification_id = $1)",
     )
@@ -149,9 +125,6 @@ async fn native_push_receipt(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
-// ===== Notification Endpoints =====
-
-/// Whose read state a request reads: its device's user on a team gateway.
 fn reader_of(headers: &HeaderMap) -> Reader {
     Reader::of(
         crate::api::actor::user_actor(headers, None).as_ref(),
@@ -167,7 +140,6 @@ pub(super) async fn get_notifications(
     read_notifications(&state, &headers, &query).await.map(Json)
 }
 
-/// The most notifications one page of `GET /api/v1/notifications` holds.
 pub(super) const NOTIFICATIONS_PAGE_MAX: i64 = 100;
 
 pub(super) async fn read_notifications(
@@ -177,16 +149,10 @@ pub(super) async fn read_notifications(
 ) -> Result<NotificationsResponse, (StatusCode, String)> {
     let reader = reader_of(headers);
     let filter = query.filter.as_deref().unwrap_or("all");
-    // Clamp upper bound so a misconfigured client can't ask for an unbounded
-    // page; sibling list endpoints (changes, applied changes) cap at 100 too.
-    // Lower bound is 0 — a caller wanting only `unread_count` (a count-only
-    // probe) passes limit=0, so we honor it explicitly below instead of bumping
-    // it to 1 (which would waste one DB row per call the caller would discard).
     let limit = query.limit.clamp(0, NOTIFICATIONS_PAGE_MAX);
 
     let before_ts = query.before.map(super::parse_unix_ts);
 
-    // Always fetch the real unread count (uncapped)
     let unread_count = NotificationStore::count_unread(&state.pool, &reader)
         .await
         .map_err(|e| {
@@ -196,10 +162,6 @@ pub(super) async fn read_notifications(
             )
         })?;
 
-    // Short-circuit limit=0: skip the row fetch and return an empty list with
-    // has_more=false. Without this, the old code would `get_filtered(.., 1, ..)`
-    // then truncate(0), reporting `has_more=true` for a page the caller cannot
-    // reach.
     if limit == 0 {
         return Ok(NotificationsResponse {
             notifications: Vec::new(),
@@ -208,7 +170,6 @@ pub(super) async fn read_notifications(
         });
     }
 
-    // Fetch limit+1 to detect has_more
     let mut items =
         NotificationStore::get_filtered(&state.pool, &reader, filter, limit + 1, before_ts)
             .await
@@ -231,7 +192,6 @@ pub(super) async fn read_notifications(
     })
 }
 
-/// Get notifications at a specific point in time (for time travel)
 pub(super) async fn get_notifications_at_timestamp(
     State(state): State<AppState>,
     Query(query): Query<BeforeTimestampQuery>,
@@ -262,15 +222,12 @@ pub(super) async fn get_notifications_at_timestamp(
     }))
 }
 
-/// Mark a notification as read
 pub(super) async fn mark_notification_read(
     State(state): State<AppState>,
     Query(query): Query<NotificationQuery>,
     headers: HeaderMap,
 ) -> Result<Json<MarkReadResponse>, (StatusCode, String)> {
     let id = query.id;
-    // `mark_read` emits `NotificationRead` itself, and only when the row really
-    // moved from unread to read; resolve the device actor for it.
     let actor = crate::api::actor::user_actor(&headers, None);
     let reader = reader_of(&headers);
     let success =
@@ -284,12 +241,6 @@ pub(super) async fn mark_notification_read(
             })?;
 
     if success {
-        // Cross-device dismiss (macOS desktop only): tell any connected Tauri
-        // app to REMOVE the already-delivered native banner for this id. The
-        // open web can't silently remove a Web Push banner (Safari revokes a
-        // subscription after 3 silent pushes), so browser / PWA banners still
-        // persist until manually swiped; in-app unread state syncs via the
-        // `NotificationRead` SSE above. See system-knowhow/notifications/3-the-presencecheck-protocol.md §4.
         crate::scheduler::push::emit_native_push_dismiss_requested(
             &state.engine.event_bus,
             Some(id),
@@ -301,7 +252,6 @@ pub(super) async fn mark_notification_read(
     Ok(Json(MarkReadResponse { success }))
 }
 
-/// Mark all notifications as read
 pub(super) async fn mark_all_notifications_read(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -319,9 +269,6 @@ pub(super) async fn mark_all_notifications_read(
             })?;
 
     if count > 0 {
-        // Cross-device dismiss (macOS desktop only): `None` = remove ALL
-        // delivered native banners on connected Tauri apps. Web / PWA banners
-        // persist (no silent Web Push removal). See system-knowhow/notifications/3-the-presencecheck-protocol.md §4.
         crate::scheduler::push::emit_native_push_dismiss_requested(
             &state.engine.event_bus,
             None,
@@ -333,7 +280,6 @@ pub(super) async fn mark_all_notifications_read(
     Ok(Json(MarkReadResponse { success: count > 0 }))
 }
 
-/// Get a single notification by ID
 pub(super) async fn get_notification(
     State(state): State<AppState>,
     Query(query): Query<NotificationQuery>,
@@ -352,9 +298,6 @@ pub(super) async fn get_notification(
     Ok(Json(notification))
 }
 
-// ===== Push Notification Endpoints =====
-
-/// GET /api/v1/push/vapid-key — return the VAPID public key for browser subscription
 pub(super) async fn get_vapid_key(
     State(state): State<AppState>,
 ) -> Result<Json<VapidKeyResponse>, (StatusCode, String)> {
@@ -372,7 +315,6 @@ pub(super) async fn get_vapid_key(
     }))
 }
 
-/// POST /api/v1/push/subscribe — store a browser push subscription
 pub(super) async fn push_subscribe(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -395,11 +337,6 @@ pub(super) async fn push_subscribe(
     }
 }
 
-/// Why this subscribe request must not reach the store, or `None` when it may.
-///
-/// Two refusals: an endpoint the engine would not deliver to, and a body
-/// naming a device other than the caller. The second would let one paired
-/// device point another's notifications at an endpoint it controls.
 fn subscribe_refusal(headers: &HeaderMap, request: &PushSubscribeRequest) -> Option<String> {
     if !push_endpoint_is_deliverable(&request.endpoint) {
         return Some(
@@ -411,8 +348,6 @@ fn subscribe_refusal(headers: &HeaderMap, request: &PushSubscribeRequest) -> Opt
     match request.device_id.as_deref() {
         Some(device_id) => super::settings::claims_another_device(headers, device_id)
             .map(|reason| format!("{reason}, so no push subscription was stored.")),
-        // A row with no device reaches every notification and no device's
-        // toggle can turn it off. Only an unidentified loopback caller keeps it.
         None => super::settings::claims_another_device(headers, "").map(|_| {
             "A paired device must name itself in device_id, \
              so no push subscription was stored."
@@ -432,9 +367,6 @@ fn push_endpoint_is_deliverable(raw: &str) -> bool {
         return false;
     };
     let host = domain.trim_end_matches('.').to_ascii_lowercase();
-    // A name still has to look routable. A single label, `localhost`, and the
-    // reserved suffixes below all resolve inside the host's own network, which
-    // is the SSRF half of the same hole.
     host.contains('.')
         && host != "localhost"
         && !host.ends_with(".localhost")
@@ -473,7 +405,6 @@ fn sanitize_push_scope_url(raw: Option<String>, headers: &HeaderMap) -> Option<S
     Some(url.to_string())
 }
 
-/// POST /api/v1/push/unsubscribe — remove a browser push subscription
 pub(super) async fn push_unsubscribe(
     State(state): State<AppState>,
     Json(request): Json<PushUnsubscribeRequest>,
@@ -483,14 +414,6 @@ pub(super) async fn push_unsubscribe(
         Err(e) => ApiResult::err(format!("Failed to remove subscription: {}", e)),
     }
 }
-
-// ===== Test-only push log =====
-//
-// Backs the `expectPushSent` / `expectNoPushSent` helpers used by Playwright
-// e2e tests. The handler, the query/row types, and the route registration in
-// this module's `router()` are all gated on the `e2e-test-hooks` cargo
-// feature; the production binary never compiles them in. See
-// system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac-3.md §5.
 
 #[cfg(feature = "e2e-test-hooks")]
 #[derive(serde::Deserialize)]
@@ -509,26 +432,15 @@ pub(super) struct PushLogEntry {
     pub device_id: String,
     pub notification_id: uuid::Uuid,
     pub sent_at: chrono::DateTime<chrono::Utc>,
-    /// The push payload bytes the engine would have encrypted + sent. Let
-    /// e2e tests assert on the Declarative Web Push envelope shape rather
-    /// than just delivery. Nullable for rows that pre-date the migration —
-    /// always populated by the current write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
 }
 
-/// GET /api/v1/_test/push-log — return rows the push-transport stub appended
-/// (see crates/lucidos-engine/src/scheduler/push_test_log.rs). Optional
-/// `since`, `notification_id`, `device_id` filter the result; the response
-/// is sorted ascending by `sent_at` for deterministic test assertions.
 #[cfg(feature = "e2e-test-hooks")]
 pub(super) async fn get_push_log(
     State(state): State<AppState>,
     Query(q): Query<PushLogQuery>,
 ) -> Result<Json<Vec<PushLogEntry>>, (StatusCode, String)> {
-    // Build the query with positional binds. sqlx::query_as won't accept
-    // optional WHERE clauses dynamically, so use a fixed SELECT with
-    // COALESCE-style "match all when filter absent" expressions.
     let rows: Vec<PushLogEntry> = sqlx::query_as::<_, PushLogEntry>(
         "SELECT device_id, notification_id, sent_at, payload FROM push_log \
          WHERE ($1::timestamptz IS NULL OR sent_at >= $1) \
@@ -551,9 +463,6 @@ pub(super) async fn get_push_log(
     Ok(Json(rows))
 }
 
-/// Routes for the `/notifications*`, `/notification*`, and `/push/*`
-/// surfaces (push subscriptions are part of the notification fan-out and
-/// their handlers live here).
 pub(super) fn router() -> Router<AppState> {
     let router = Router::new()
         .route("/notifications", get(get_notifications))
@@ -563,14 +472,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/notification", get(get_notification))
         .route("/notification/read", post(mark_notification_read))
         .route("/notification/native-receipt", post(native_push_receipt))
-        // Push notification endpoints
         .route("/push/vapid-key", get(get_vapid_key))
         .route("/push/subscribe", post(push_subscribe))
         .route("/push/unsubscribe", post(push_unsubscribe));
 
-    // Test-only push assertion endpoint. Compiled in only with the
-    // `e2e-test-hooks` cargo feature so production binaries don't expose
-    // the push_log to the network at all.
     #[cfg(feature = "e2e-test-hooks")]
     let router = router.route("/_test/push-log", get(get_push_log));
 
@@ -656,30 +561,20 @@ mod tests {
         }
     }
 
-    /// The endpoint is where every notification for the device is POSTed, so a
-    /// caller-chosen one is both an exfiltration channel and an outbound-request
-    /// primitive. Storing it also DELETES the device's real subscription.
     #[test]
     fn push_endpoint_is_deliverable_refuses_a_redirected_or_internal_target() {
         for endpoint in [
-            // Plain http, so the payload is readable in transit too.
             "http://fcm.googleapis.com/fcm/send/abc",
-            // A bare IP reaches loopback, the private ranges and link-local.
             "https://127.0.0.1:8080/p",
             "https://169.254.169.254/latest/meta-data/",
             "https://[::1]/p",
-            // Names that resolve inside the host's own network.
             "https://localhost/p",
             "https://engine.local/p",
             "https://metadata.internal/p",
-            // The same names fully qualified. A root dot resolves identically,
-            // so a check that compares the raw host is bypassed by one keystroke.
             "https://localhost./p",
             "https://engine.local./p",
             "https://metadata.internal./p",
-            // A single-label name is not routable on the public internet.
             "https://intranet/p",
-            // Not a URL, and a scheme that is not a fetch at all.
             "file:///etc/passwd",
             "not a url",
             "",
@@ -706,8 +601,6 @@ mod tests {
         assert!(scope.is_none());
     }
 
-    /// A relayed page subscribes under gateway A's outside prefix. A's relay
-    /// vouches for the origin and consumes the header, so none arrives here.
     #[test]
     fn sanitize_push_scope_url_keeps_a_relayed_outside_prefix() {
         let scope = sanitize_push_scope_url(
@@ -765,19 +658,12 @@ mod tests {
     }
 
     mod guard_tests {
-        /// This file with its test module cut off. Uncut, the scan below matches
-        /// its own fixture strings and passes while the handler has lost the gate.
         fn production_src() -> String {
             crate::test_support::source_scan::read_production_source(
                 &crate::test_support::source_scan::engine_source("api/notifications.rs"),
             )
         }
 
-        /// The refusal runs BEFORE the store, because storing deletes first.
-        ///
-        /// `PushSubscriptionStore::subscribe` drops every row for the device id
-        /// and then inserts. Checking after the call would still silence the
-        /// phone, which is half the harm.
         #[test]
         fn push_subscribe_refuses_before_it_reaches_the_store() {
             let src = production_src();

@@ -1,15 +1,7 @@
-//! E2E coverage for the webhook delivery path: what a resend does, and what a
-//! delivery becomes.
-//!
-//! The unit tests cover the ledger and the payload as separate pieces. This is
-//! the wiring between them, over real HTTP. A ledger row written out of step,
-//! or a header dropped on the floor, shows up here and nowhere else.
-
 use crate::support::{base_url, db_url, unique_marker, user_client};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-/// Create a hook and return its id plus its one-time bearer token.
 async fn create_hook(
     client: &reqwest::Client,
     api: &str,
@@ -38,7 +30,6 @@ async fn create_hook(
     )
 }
 
-/// POST one delivery, exactly as the hook socket forwards it.
 async fn deliver(
     client: &reqwest::Client,
     api: &str,
@@ -69,7 +60,6 @@ async fn events_of_type(event_type: &str) -> i64 {
         .expect("count events")
 }
 
-/// The whole point: a sender resending one delivery fires the event once.
 #[tokio::test]
 async fn a_resend_inside_the_window_emits_nothing_and_reports_the_first_event() {
     let client = user_client().await;
@@ -112,7 +102,6 @@ async fn a_resend_inside_the_window_emits_nothing_and_reports_the_first_event() 
     );
 }
 
-/// A different delivery id is a different delivery, however alike the bodies.
 #[tokio::test]
 async fn a_new_delivery_id_still_emits_even_with_an_identical_body() {
     let client = user_client().await;
@@ -137,8 +126,6 @@ async fn a_new_delivery_id_still_emits_even_with_an_identical_body() {
     assert_eq!(events_of_type(event_type).await - before, 2);
 }
 
-/// The default. Nothing is deduped, so the log keeps every arrival, which is
-/// what makes a sender's retry rate answerable.
 #[tokio::test]
 async fn a_hook_without_dedupe_emits_on_every_arrival() {
     let client = user_client().await;
@@ -160,8 +147,6 @@ async fn a_hook_without_dedupe_emits_on_every_arrival() {
     assert_eq!(events_of_type(event_type).await - before, 2);
 }
 
-/// What the trigger author actually addresses: the sender's fields under
-/// `payload`, the allow-listed headers under `headers`, and no secret anywhere.
 #[tokio::test]
 async fn a_delivery_becomes_summary_headers_and_payload() {
     let client = user_client().await;
@@ -211,8 +196,6 @@ async fn a_delivery_becomes_summary_headers_and_payload() {
     assert!(payload["summary"].is_string());
 }
 
-/// Deduping runs after verification, never before. A caller that cannot
-/// authenticate learns nothing about which delivery ids this hook has seen.
 #[tokio::test]
 async fn an_unauthenticated_resend_is_refused_rather_than_called_a_duplicate() {
     let client = user_client().await;
@@ -240,8 +223,6 @@ async fn an_unauthenticated_resend_is_refused_rather_than_called_a_duplicate() {
     assert!(refused["duplicate"].is_null());
 }
 
-/// A config that cannot do what it says is refused at create, not discovered
-/// later from a sender's failed retries.
 #[tokio::test]
 async fn a_secret_bearing_header_is_refused_at_create() {
     let client = user_client().await;

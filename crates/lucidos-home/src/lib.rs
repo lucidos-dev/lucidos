@@ -1,18 +1,3 @@
-//! The Lucidos home and the storage-root rule.
-//!
-//! A *storage root* is a directory Lucidos stores data in and keeps at mode
-//! 0700. The kernel then refuses another local user traversal, so nothing
-//! inside is reachable whatever its own mode. Files inside keep the umask's
-//! modes on purpose: a process umask would leak into every child, and an agent
-//! would then write 0600 files into the user's own projects.
-//!
-//! The storage roots are the Lucidos home (`~/.lucidos`), its private subtree,
-//! the gateway data dir, every workspace root and the user cache root. Whoever
-//! opens one calls [`ensure_storage_root`] first, so an install created before
-//! the rule converges on its next start.
-//!
-//! Design: `docs/plans/2026-10-12-other-local-users-cannot-read-lucidos-storage.md`.
-
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -24,26 +9,18 @@ pub mod private;
 #[cfg(test)]
 mod disposable_tests;
 
-/// The Lucidos home's name under `$HOME`.
 pub const HOME_DIR_NAME: &str = ".lucidos";
 
-/// The mode of every storage root: owner read, write and traverse, nobody else.
 pub const STORAGE_ROOT_MODE: u32 = 0o700;
 
-/// The variable that relocates the gateway data dir.
 pub const GATEWAY_DATA_ENV: &str = "LUCIDOS_GATEWAY_DATA";
 
-/// The gateway data dir's name under the private subtree, when nothing
-/// relocates it.
 pub const GATEWAY_DIR_NAME: &str = "gateway";
 
-/// `$HOME/.lucidos`, without touching the disk. `None` when `HOME` is unset or
-/// empty, since an empty `HOME` would put the home in the working directory.
 pub fn path() -> Option<PathBuf> {
     path_from(std::env::var_os("HOME"))
 }
 
-/// The Lucidos home under an explicit home directory.
 pub fn path_in(home: &Path) -> PathBuf {
     home.join(HOME_DIR_NAME)
 }
@@ -53,10 +30,6 @@ fn path_from(home: Option<OsString>) -> Option<PathBuf> {
     Some(path_in(Path::new(&home)))
 }
 
-/// Where the private entry `name` lives, without writing the disk: inside a
-/// moved subtree ([`private::relocated`]) with no older path considered, else
-/// [`private::entry_in`]. `None` when the subtree did not move and `HOME` is
-/// unset or empty.
 pub fn private_entry(name: &str) -> Option<PathBuf> {
     match private::relocated() {
         Some(dir) => Some(dir.join(name)),
@@ -64,8 +37,6 @@ pub fn private_entry(name: &str) -> Option<PathBuf> {
     }
 }
 
-/// [`private_entry`], with the Lucidos home and the entry's parent made
-/// storage roots. For a caller about to create the entry.
 pub fn ensure_private_entry(name: &str) -> io::Result<PathBuf> {
     let entry = match private::relocated() {
         Some(dir) => dir.join(name),
@@ -77,9 +48,6 @@ pub fn ensure_private_entry(name: &str) -> io::Result<PathBuf> {
     Ok(entry)
 }
 
-/// The gateway data dir: `$LUCIDOS_GATEWAY_DATA`, else
-/// the private entry `gateway`. `None` only when neither
-/// `LUCIDOS_GATEWAY_DATA`, a moved subtree nor `HOME` is set.
 pub fn gateway_data_dir() -> Option<PathBuf> {
     match std::env::var_os(GATEWAY_DATA_ENV).filter(|dir| !dir.is_empty()) {
         Some(dir) => Some(PathBuf::from(dir)),
@@ -87,8 +55,6 @@ pub fn gateway_data_dir() -> Option<PathBuf> {
     }
 }
 
-/// [`gateway_data_dir`] with the Lucidos home given, so a caller that already
-/// holds it needs no `HOME`.
 pub fn gateway_data_dir_under(lucidos_home: &Path) -> PathBuf {
     gateway_data_dir_from(std::env::var_os(GATEWAY_DATA_ENV), Some(lucidos_home))
         .expect("a Lucidos home was given")
@@ -104,28 +70,16 @@ fn gateway_data_dir_from(
     }
 }
 
-/// Where the gateway data dir sits under `lucidos_home` when nothing
-/// relocates it: a private entry, so an older home keeps it in place. Pure in
-/// its argument: a caller naming a home, such as the installs scan, gets that
-/// home's dir even under a moved subtree.
 pub fn default_gateway_data_dir_in(lucidos_home: &Path) -> PathBuf {
     private::entry_in(lucidos_home, GATEWAY_DIR_NAME)
 }
 
-/// The Lucidos home, made a storage root. Call it before creating anything
-/// under the home.
 pub fn ensure() -> io::Result<PathBuf> {
     let home = path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
     ensure_storage_root(&home)?;
     Ok(home)
 }
 
-/// Make `dir` a storage root: create it and its missing parents at 0700, then
-/// set it to 0700.
-///
-/// The `chmod` runs every time, with no check first. A root created before
-/// the rule converges here, and no code path decides whether it needs to. A
-/// root another user owns fails the `chmod`, and the error names its owner.
 pub fn ensure_storage_root(dir: &Path) -> io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -136,14 +90,6 @@ pub fn ensure_storage_root(dir: &Path) -> io::Result<()> {
         .map_err(|e| refusal(e, dir))
 }
 
-/// Create `dir` as a new storage root, failing with `AlreadyExists` when
-/// something is already there. Its parent must exist.
-///
-/// For a caller that must not reuse a directory, such as a restore whose every
-/// failure deletes the tree it created.
-///
-/// A root it created but could not make owner-only is removed again, so the
-/// caller can retry once the cause is fixed.
 pub fn create_new_storage_root(dir: &Path) -> io::Result<()> {
     std::fs::DirBuilder::new()
         .mode(STORAGE_ROOT_MODE)
@@ -180,8 +126,6 @@ fn refusal(err: io::Error, dir: &Path) -> io::Error {
 mod tests {
     use super::*;
 
-    /// Set the process umask, returning the previous one. Nothing else in this
-    /// test binary reads the umask, and every other test sets explicit modes.
     fn umask(mask: libc::mode_t) -> libc::mode_t {
         // SAFETY: umask has no preconditions and cannot fail.
         unsafe { libc::umask(mask) }
@@ -209,7 +153,6 @@ mod tests {
     fn a_new_root_is_owner_only_at_every_level_whatever_the_umask() {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().join("a/b/root");
-        // The widest umask, so only the helper's own mode can make it 0700.
         let previous = umask(0);
         let result = ensure_storage_root(&root);
         umask(previous);
@@ -230,7 +173,6 @@ mod tests {
             gateway_data_dir_from(Some("/srv/gw".into()), None),
             Some(PathBuf::from("/srv/gw"))
         );
-        // Empty reads as unset, as the shell's `${VAR:-default}` does.
         assert_eq!(
             gateway_data_dir_from(Some(OsString::new()), Some(home)),
             Some(PathBuf::from("/home/u/.lucidos/private/gateway"))
@@ -269,11 +211,8 @@ mod tests {
             .unwrap()
             .uid();
         if own_uid == 0 {
-            return; // root may chmod anything, so there is nothing to refuse
+            return;
         }
-        // Root owns /tmp on a writable volume. `/` would not do: a sealed macOS
-        // system volume answers read-only before it checks the owner. A /tmp
-        // this user owns would be chmodded, so the test stands down there.
         if std::fs::metadata("/tmp").unwrap().uid() != 0 {
             return;
         }
@@ -298,13 +237,10 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
-    // ── The shell copies, which cannot import this crate ──────────────────
-
     const STORAGE_ROOT_SH: &str = include_str!("../../../scripts/lib/storage_root.sh");
     const INSTALL_SH: &str = include_str!("../../../install.sh");
     const SERVICE_SH: &str = include_str!("../../../scripts/lib/service.sh");
 
-    /// The body of the shell function `name` in `script`, braces excluded.
     fn shell_function_body<'a>(script: &'a str, name: &str) -> &'a str {
         let head = format!("\n{name}() {{\n");
         let start = script
@@ -343,8 +279,6 @@ mod tests {
         );
     }
 
-    /// Both shell resolvers are one copy of the Rust rule, over the same
-    /// closed list of names.
     #[test]
     fn the_shell_resolvers_match_the_rust_entry_rule() {
         let lib = shell_function_body(STORAGE_ROOT_SH, "lucidos_private_entry_in");
@@ -377,7 +311,6 @@ mod tests {
             lib.contains(&format!("chmod {STORAGE_ROOT_MODE:o} ")),
             "{lib}"
         );
-        // The umask makes every created parent owner-only too, as DirBuilder does.
         let umask = 0o777 & !STORAGE_ROOT_MODE;
         assert!(lib.contains(&format!("umask {umask:03o} ")), "{lib}");
     }

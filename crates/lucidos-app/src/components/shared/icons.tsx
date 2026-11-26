@@ -799,9 +799,16 @@ export function AppsIcon({ size = '1rem' }: { size?: string } = {}) {
   );
 }
 
-export function LucidosMarkIcon() {
+export function LucidosMarkIcon({ class: className, size }: { class?: string; size?: string } = {}) {
   return (
-    <svg class="lucidos-mark-icon" viewBox="0 0 100 100" fill="currentColor" stroke="none" aria-hidden="true">
+    <svg
+      class={'lucidos-mark-icon' + (className ? ` ${className}` : '')}
+      viewBox="0 0 100 100"
+      fill="currentColor"
+      stroke="none"
+      aria-hidden="true"
+      style={size ? { width: size, height: size } : undefined}
+    >
       <g transform="translate(13 13) scale(0.74)">
         <rect x="17" y="17" width="29" height="29" rx="7" />
         <rect x="17" y="54" width="29" height="29" rx="7" />

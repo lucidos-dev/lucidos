@@ -1,45 +1,18 @@
-//! The font catalog: every font Lucidos offers, one entry each.
-//!
-//! Every other font surface derives from this list:
-//!
-//! - the `font-family` preference values;
-//! - the SDK's generated `font-catalog.ts`, and through it the boot scripts
-//!   and the Settings options;
-//! - the host's generated `font-faces.css`;
-//! - the stylesheets and files `api/fonts.rs` serves to app frames;
-//! - `GET /api/v1/fonts`.
-//!
-//! Adding a font is one entry here plus its files, then `./scripts/codegen.sh`.
-//! Every font is vendored or already on the device, so none makes a third-party
-//! request and a theme may name any of them (ADR 0303).
-//!
-//! A workspace can add its own fonts beside these (`core::workspace_fonts`,
-//! ADR 0308). Only the `font-family` preference, themes and `GET /api/v1/fonts`
-//! see them. The generated files stay the catalog alone.
-
 use serde::{Deserialize, Serialize};
 
 use super::workspace_fonts::{WorkspaceFontFace, WorkspaceFonts};
 
-/// The `font-family` value that follows the active theme's suggestion.
 pub const FOLLOW_THEME: &str = "theme";
 
-/// The font a device paints when neither the user nor the theme names one. It
-/// is vendored, so it renders offline (ADR 0077).
 pub const FALLBACK_FONT: &str = "fira-code";
 
-/// Native monospace families, in platform fallback order.
 pub const NATIVE_MONO_STACK: &str = "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace";
 
-/// What a font is fit for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FontKind {
-    /// Proportional: fit for UI text, not for code.
     Ui,
-    /// Fit only for code.
     Mono,
-    /// Monospaced and fit for UI text too. Lucidos is mono-first.
     Both,
 }
 
@@ -53,8 +26,6 @@ impl FontKind {
     }
 }
 
-/// The generic family a font falls back to. Settings groups fonts by it, and a
-/// workspace font declares one in its `font.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FontGroup {
@@ -63,24 +34,17 @@ pub enum FontGroup {
     Mono,
 }
 
-/// One woff2 file of a vendored font.
 #[derive(Debug)]
 pub struct FontFace {
-    /// The file name under `crates/lucidos-app/src/assets/fonts/`.
     pub asset: &'static str,
-    /// The name `api/fonts.rs` serves it under. It carries the upstream
+    /// INVARIANT: The name `api/fonts.rs` serves it under. It carries the upstream
     /// version, so the bytes can be cached as immutable.
     pub served: &'static str,
     pub bytes: &'static [u8],
-    /// A `font-weight` descriptor: the range a variable file covers, or the one
-    /// weight of a static file.
     pub weight: &'static str,
     pub unicode_range: Option<&'static str>,
 }
 
-/// Size and vertical metric overrides for a face whose design sits off the
-/// rest of the catalog. Each value is an `@font-face` percentage, measured from
-/// the font file. The browser scales the three line metrics by `size_adjust`.
 #[derive(Debug)]
 pub struct FontMetrics {
     pub size_adjust: &'static str,
@@ -89,12 +53,8 @@ pub struct FontMetrics {
     pub line_gap_override: &'static str,
 }
 
-/// The lightest weight that counts as bold. Below it the browser draws a real
-/// face; at or above it, with no such face, it fakes one by smearing.
 const BOLD_WEIGHT: u16 = 600;
 
-/// Whether a face's `font-weight`, one value or a range, reaches bold at its
-/// heaviest end.
 pub fn weight_reaches_bold(weight: &str) -> bool {
     weight
         .split_whitespace()
@@ -103,37 +63,28 @@ pub fn weight_reaches_bold(weight: &str) -> bool {
         .is_some_and(|heaviest| heaviest >= BOLD_WEIGHT)
 }
 
-/// The weight range a font with no bold face declares its faces over. Bold text
-/// then paints with the real outlines instead of a smeared fake.
 const EVERY_WEIGHT: &str = "100 900";
 
-/// Where a font's glyphs come from.
 #[derive(Debug)]
 pub enum FontSource {
-    /// Served by the local engine and bundled into the host build.
     Vendored {
-        /// The family name the faces declare.
         family: &'static str,
         faces: &'static [FontFace],
     },
-    /// Fonts the device already has. Nothing loads.
     Device,
 }
 
 #[derive(Debug)]
 pub struct FontSpec {
-    /// The `font-family` preference value and the theme `fonts` value.
     pub id: &'static str,
     pub label: &'static str,
-    /// The CSS `font-family` value. It must pass the theme token value gate,
+    /// INVARIANT: The CSS `font-family` value. It must pass the theme token value gate,
     /// because a theme's `fonts.mono` lays it as a token. It ends in the generic
     /// family that decides the font's group.
     pub stack: &'static str,
     pub kind: FontKind,
     pub source: FontSource,
-    /// An SPDX license id, or `none` for the device's own fonts.
     pub license: &'static str,
-    /// Ships programming ligatures, which apply to code and never to prose.
     pub ligatures: bool,
     pub metrics: Option<FontMetrics>,
 }
@@ -146,8 +97,6 @@ impl FontSpec {
         }
     }
 
-    /// Read from the generic family that ends the stack, so the two cannot
-    /// disagree.
     pub fn group(&self) -> FontGroup {
         match self.stack.rsplit(',').next().map(str::trim) {
             Some("serif") => FontGroup::Serif,
@@ -163,8 +112,6 @@ impl FontSpec {
         }
     }
 
-    /// Whether any face reaches a bold weight. The device's own fonts are
-    /// assumed to have one.
     pub fn has_bold(&self) -> bool {
         match self.source {
             FontSource::Vendored { faces, .. } => {
@@ -174,8 +121,6 @@ impl FontSpec {
         }
     }
 
-    /// The `@font-face` rules of a vendored font, with `url_for` choosing each
-    /// face's URL. Empty for a device font.
     pub fn font_face_rules(&self, url_for: impl Fn(&FontFace) -> String) -> String {
         let FontSource::Vendored { family, faces } = &self.source else {
             return String::new();
@@ -217,8 +162,6 @@ impl FontSpec {
     }
 }
 
-/// The two subsets every Google-sourced vendored font ships. Other scripts
-/// fall back to the rest of the stack.
 const LATIN: &str = "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD";
 const LATIN_EXT: &str = "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF";
 
@@ -240,7 +183,6 @@ macro_rules! face {
     };
 }
 
-/// The latin and latin-ext faces of a variable font.
 macro_rules! latin_faces {
     ($stem:literal, $served:literal, $weight:literal) => {
         &[
@@ -260,8 +202,6 @@ macro_rules! latin_faces {
     };
 }
 
-/// The latin and latin-ext faces of a font with no variable version, one pair
-/// per static weight.
 macro_rules! static_latin_faces {
     ($stem:literal, $served:literal, [$($weight:literal),+]) => {
         &[$(
@@ -281,7 +221,6 @@ macro_rules! static_latin_faces {
     };
 }
 
-/// The catalog, grouped sans, serif, mono, in the order Settings lists it.
 pub const FONT_CATALOG: &[FontSpec] = &[
     FontSpec {
         id: "system",
@@ -417,7 +356,6 @@ pub const FONT_CATALOG: &[FontSpec] = &[
     FontSpec {
         id: "fira-code",
         label: "Fira Code",
-        // Keep the selected font readable before its web font decodes (ADR 0077).
         stack: "'Fira Code', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'JetBrains Mono', Monaco, Consolas, monospace",
         kind: FontKind::Both,
         source: FontSource::Vendored {
@@ -532,8 +470,6 @@ pub const FONT_CATALOG: &[FontSpec] = &[
         kind: FontKind::Both,
         source: FontSource::Vendored {
             family: "Cascadia Code",
-            // The release file, whole: its licence reserves the name, so a
-            // subset could not keep it (ADR 0303).
             faces: &[face!(
                 "CascadiaCode.woff2",
                 "cascadia-code-2407.24.woff2",
@@ -556,11 +492,6 @@ pub const FONT_CATALOG: &[FontSpec] = &[
         },
         license: "OFL-1.1",
         ligatures: false,
-        // Measured from the file: 1000 units per em, ascender 800, descender
-        // 200, x-height 400, and ink from 560 (caps and ascenders) down to
-        // -160. Fira Code's x-height is 0.5385 em, so 134.6% matches it. The
-        // line box keeps Fira's total height, 1.2308 em. It centres on the ink
-        // at 0.20 em, which puts the text caret level with the glyphs.
         metrics: Some(FontMetrics {
             size_adjust: "134.6%",
             ascent_override: "65.7%",
@@ -570,8 +501,6 @@ pub const FONT_CATALOG: &[FontSpec] = &[
     },
 ];
 
-/// Every value the `font-family` preference accepts: follow the theme, then
-/// each catalog id.
 pub const FONT_PREFERENCE_VALUES: [&str; FONT_CATALOG.len() + 1] = {
     let mut values = [FOLLOW_THEME; FONT_CATALOG.len() + 1];
     let mut i = 0;
@@ -586,7 +515,6 @@ pub fn find(id: &str) -> Option<&'static FontSpec> {
     FONT_CATALOG.iter().find(|font| font.id == id)
 }
 
-/// One font as `GET /api/v1/fonts` serves it.
 #[derive(Debug, Serialize)]
 struct FontView<'a> {
     id: &'a str,
@@ -596,19 +524,15 @@ struct FontView<'a> {
     group: FontGroup,
     source: &'static str,
     license: &'a str,
-    /// Always true now (ADR 0303). Apps filter on it, so it stays.
     theme_nameable: bool,
     ligatures: bool,
     bold: bool,
-    /// A workspace font's family and faces, which a client registers itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     family: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     faces: Option<&'a [WorkspaceFontFace]>,
 }
 
-/// The catalog, then the workspace fonts, as JSON for `GET /api/v1/fonts`.
-/// Workspace fonts that failed a check are listed apart, with the reason.
 pub fn catalog_json(workspace: &WorkspaceFonts) -> serde_json::Value {
     let catalog = FONT_CATALOG.iter().map(|font| FontView {
         id: font.id,

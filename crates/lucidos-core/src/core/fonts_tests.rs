@@ -24,9 +24,6 @@ fn the_preference_accepts_follow_theme_then_every_id() {
     assert_eq!(&FONT_PREFERENCE_VALUES[1..], ids.as_slice());
 }
 
-/// A theme's `fonts.mono` lays the stack as a `--font-mono` token, and every
-/// apply site re-checks tokens. A stack the gate refuses would save and then
-/// never paint.
 #[test]
 fn every_stack_passes_the_theme_token_gate() {
     for font in FONT_CATALOG {
@@ -38,7 +35,6 @@ fn every_stack_passes_the_theme_token_gate() {
     }
 }
 
-/// The fallback paints on every fresh device, so it must work offline.
 #[test]
 fn the_fallback_is_vendored_and_fits_ui_text() {
     let fallback = find(FALLBACK_FONT).expect("the fallback is in the catalog");
@@ -46,9 +42,6 @@ fn the_fallback_is_vendored_and_fits_ui_text() {
     assert!(fallback.kind.fits_ui());
 }
 
-/// An `include_bytes!` of a file lost in a rebase still compiles if the path
-/// resolves, and the failure downstream is silent: text renders in the stack's
-/// fallback.
 #[test]
 fn every_vendored_face_is_an_embedded_woff2() {
     let mut served = HashSet::new();
@@ -76,8 +69,6 @@ fn every_vendored_face_is_an_embedded_woff2() {
     }
 }
 
-/// ADR 0303: no catalog font makes a third-party request. A font is either
-/// the device's own or bundled with its files.
 #[test]
 fn every_font_is_bundled_or_on_the_device() {
     for font in FONT_CATALOG {
@@ -88,8 +79,6 @@ fn every_font_is_bundled_or_on_the_device() {
     }
 }
 
-/// A stored `font-family` value or a theme naming a removed id would silently
-/// fall back. Removing one is a decision, so it fails here first.
 #[test]
 fn the_catalog_holds_exactly_these_fonts_in_group_order() {
     let ids: Vec<&str> = FONT_CATALOG.iter().map(|f| f.id).collect();
@@ -124,8 +113,6 @@ fn the_catalog_holds_exactly_these_fonts_in_group_order() {
     assert_eq!(groups, sorted, "Settings lists the catalog grouped");
 }
 
-/// The group is read off the stack's last family, so every stack must end in
-/// one the reading knows.
 #[test]
 fn every_stack_ends_in_a_generic_family() {
     for font in FONT_CATALOG {
@@ -138,7 +125,6 @@ fn every_stack_ends_in_a_generic_family() {
     }
 }
 
-/// A monospaced font is valid as `fonts.mono`, and only a monospaced one is.
 #[test]
 fn the_mono_group_is_exactly_the_fonts_fit_for_code() {
     for font in FONT_CATALOG {
@@ -175,8 +161,6 @@ fn each_new_font_is_bundled_in_its_group() {
     }
 }
 
-/// Only fonts that ship programming ligatures turn them off in prose. One
-/// that ships them unflagged renders `=>` as an arrow in a sentence.
 #[test]
 fn the_fonts_with_programming_ligatures_are_flagged() {
     let flagged: Vec<&str> = FONT_CATALOG
@@ -187,8 +171,6 @@ fn the_fonts_with_programming_ligatures_are_flagged() {
     assert_eq!(flagged, ["fira-code", "jetbrains-mono", "cascadia-code"]);
 }
 
-/// Every surface tells a workspace font from a catalog one by the prefix. A
-/// catalog font taking it would shadow a user's font on upgrade.
 #[test]
 fn no_catalog_id_uses_the_workspace_font_prefix() {
     use crate::core::workspace_fonts::ID_PREFIX;
@@ -224,7 +206,6 @@ fn the_catalog_json_lists_workspace_fonts_after_the_catalog() {
     assert_eq!(brand["family"], "ws-brand");
     assert_eq!(brand["faces"][0]["path"], "fonts/brand/a.woff2");
     assert_eq!(brand["theme_nameable"], true);
-    // A catalog font carries neither, since its stylesheet declares its faces.
     assert!(fonts[0].get("faces").is_none() && fonts[0].get("family").is_none());
     assert_eq!(json["invalid"][0]["id"], "ws-broken");
 }
@@ -243,13 +224,9 @@ fn the_catalog_json_lists_every_font() {
     assert_eq!(inter["group"], "sans");
     let lora = fonts.iter().find(|f| f["id"] == "lora").unwrap();
     assert_eq!(lora["group"], "serif");
-    // Apps such as a theme editor filter on this, so it stays, true for all.
     assert!(fonts.iter().all(|f| f["theme_nameable"] == true));
 }
 
-/// VT323 is the one font whose metrics sit off the rest of the catalog, so it
-/// is the one that overrides them. The numbers are pinned where they are
-/// derived, in its catalog entry.
 #[test]
 fn only_vt323_overrides_its_metrics() {
     let overridden: Vec<&str> = FONT_CATALOG
@@ -286,9 +263,6 @@ fn every_vt323_face_carries_the_metric_overrides() {
     );
 }
 
-/// A font with no bold face would be smeared into a fake bold by the browser.
-/// Declaring its one face over every weight makes bold text paint with the
-/// real outlines instead.
 #[test]
 fn a_font_with_no_bold_face_declares_its_face_over_every_weight() {
     let without_bold: Vec<&str> = FONT_CATALOG
@@ -325,8 +299,6 @@ fn the_catalog_json_says_which_fonts_have_a_bold_face() {
     assert_eq!(bold("system"), true);
 }
 
-/// Catalog and workspace fonts share one line for bold, read at the heavy end
-/// of a weight range.
 #[test]
 fn a_face_reaches_bold_from_weight_600() {
     assert!(weight_reaches_bold("600"));
@@ -347,7 +319,6 @@ mod guard_tests {
             .to_path_buf()
     }
 
-    /// OFL permits redistribution with the license text beside the font.
     #[test]
     fn every_vendored_font_ships_its_license_text() {
         let dir = repo_root().join("crates/lucidos-app/src/assets/fonts");
@@ -367,8 +338,6 @@ mod guard_tests {
         }
     }
 
-    /// The knowhow the agent reads lists the values it may set. A new font it
-    /// cannot see is a font it will never suggest.
     #[test]
     fn the_knowhow_names_every_font_id() {
         for doc in ["system-knowhow/preferences.md", "system-knowhow/js-sdk.md"] {
@@ -382,8 +351,6 @@ mod guard_tests {
         }
     }
 
-    /// The themes knowhow lists the fonts a theme may name, which is every one. One
-    /// the agent cannot see is one it never suggests.
     #[test]
     fn the_themes_knowhow_names_every_font() {
         let text = crate::core::knowhow::doc_family_text(&repo_root(), "system-knowhow/themes.md");

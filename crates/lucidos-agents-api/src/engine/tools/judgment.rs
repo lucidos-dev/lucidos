@@ -8,10 +8,6 @@ use crate::engine::aux_purpose::budget_for;
 use crate::engine::{AuxCapture, ContextPurpose};
 use crate::llm::judgment::{jev_for_agent, JudgmentProvider, Question, JEV_DEFAULT_MODEL};
 
-/// Read the `questions` argument into the wire type.
-///
-/// The ids are the agent's and the order is whatever the parsed object gives,
-/// which is sorted: nothing downstream reads either as meaning anything.
 fn parse_questions(value: Option<&Value>) -> Result<Vec<(String, Question)>, String> {
     let Some(map) = value.and_then(Value::as_object) else {
         return Err("Error: 'questions' must be an object of question id to question".to_string());
@@ -59,9 +55,6 @@ pub(crate) async fn ask_and_render<J: JudgmentProvider + ?Sized>(
         judgment.usage.unwrap_or_default().output_tokens
     );
 
-    // The count travels beside the answers so the model can see that one was
-    // dropped. An unreadable answer is parsed out upstream, and a silently
-    // short object reads as a judgment nobody made.
     let body = json!({
         "answers": judgment.answers,
         "asked": asked,
@@ -78,8 +71,6 @@ pub(crate) impl LucidosEngine {
         };
         let questions = parse_questions(args.get("questions"))?;
 
-        // The budget is the purpose's, so the timeout a reader finds in
-        // `aux_purpose` is the timeout this call runs under.
         let budget = budget_for(ContextPurpose::JudgeTool);
         let provider = match jev_for_agent(&self.pool, budget.attempt_timeout).await {
             Ok(provider) => provider,

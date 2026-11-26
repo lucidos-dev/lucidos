@@ -1,6 +1,3 @@
-//! The opt-in gate. Every case that is not an explicit, configured System One
-//! pick runs `chat`.
-
 use super::*;
 use crate::core::AuthType;
 use crate::llm::judgment::endpoint::{
@@ -44,7 +41,6 @@ async fn seed_chat_provider_key(pool: &PgPool, endpoint: SystemOneEndpoint, scop
     .await;
 }
 
-/// Every credential a System One row can read, stored at once.
 async fn seed_every_key(pool: &PgPool) {
     seed_key(pool).await;
     seed_cloudflare_token(pool).await;
@@ -112,8 +108,6 @@ fn every_site_owns_a_different_key() {
     assert_eq!(keys.len(), JudgmentSite::ALL.len(), "{keys:?}");
 }
 
-/// I13 and I14: storing a credential changes no site by itself. Every key a
-/// System One row reads is present, and still every site runs on chat.
 #[tokio::test]
 async fn a_stored_key_alone_never_switches_a_site_over() {
     let (pool, db) = setup_test_db().await;
@@ -128,8 +122,6 @@ async fn a_stored_key_alone_never_switches_a_site_over() {
     teardown_test_db(&db).await;
 }
 
-/// I14 for the site that will send summary tree lines: an untouched workspace
-/// sends `find` to its chat model, never to a third party.
 #[tokio::test]
 async fn an_untouched_workspace_runs_memory_find_on_chat() {
     let (pool, db) = setup_test_db().await;
@@ -163,8 +155,6 @@ async fn a_site_picking_jev_with_a_key_gets_a_provider() {
     teardown_test_db(&db).await;
 }
 
-/// Each seeded row and the custom one resolve once their own provider is
-/// configured.
 #[tokio::test]
 async fn every_configured_row_resolves() {
     let (pool, db) = setup_test_db().await;
@@ -188,7 +178,6 @@ async fn every_configured_row_resolves() {
     teardown_test_db(&db).await;
 }
 
-/// A Clef pick needs a Cloudflare token. A TypeSafe key is not one.
 #[tokio::test]
 async fn picking_clef_without_a_cloudflare_token_runs_chat() {
     let (pool, db) = setup_test_db().await;
@@ -209,7 +198,6 @@ async fn picking_clef_without_a_cloudflare_token_runs_chat() {
     teardown_test_db(&db).await;
 }
 
-/// A custom row with no URL has nowhere to send the state.
 #[tokio::test]
 async fn picking_custom_without_a_url_runs_chat() {
     let (pool, db) = setup_test_db().await;
@@ -245,7 +233,6 @@ async fn an_unrecognized_preference_value_runs_chat() {
     teardown_test_db(&db).await;
 }
 
-/// A master switch is a veto over every site on its provider, and only those.
 #[tokio::test]
 async fn a_master_switch_stops_every_site_on_its_provider() {
     let (pool, db) = setup_test_db().await;
@@ -293,8 +280,6 @@ async fn a_master_switch_stops_every_site_on_its_provider() {
     teardown_test_db(&db).await;
 }
 
-/// Absent means on, so the switch shipping changes nothing for a workspace
-/// that already runs Jev. An explicit `true` is the same answer, written down.
 #[tokio::test]
 async fn an_unset_or_true_master_switch_leaves_a_site_on_jev() {
     let (pool, db) = setup_test_db().await;
@@ -323,12 +308,6 @@ async fn an_unset_or_true_master_switch_leaves_a_site_on_jev() {
     teardown_test_db(&db).await;
 }
 
-/// The `judge` tool needs no third preference. It replaces no existing path,
-/// so a configured provider is the whole condition, exactly as a configured
-/// image provider is the whole condition for `generate_image`.
-///
-/// Skipped when the launch environment supplies a key, since the no-key half
-/// cannot arise there.
 #[tokio::test]
 async fn the_judge_tool_rides_on_the_master_switch_and_a_key() {
     if std::env::var(TYPESAFE_API_KEY_ENV).is_ok() {
@@ -351,8 +330,6 @@ async fn the_judge_tool_rides_on_the_master_switch_and_a_key() {
         .await
         .expect("seed the master switch");
     assert!(!judgment_available(&pool).await, "the switch is a veto");
-    // `SystemOneProvider` has no `Debug`, because it holds the key. So the Ok
-    // side is matched out rather than unwrapped.
     let Err(refusal) = jev_for_agent(&pool, A_TIMEOUT).await else {
         panic!("a switched-off provider must refuse");
     };
@@ -360,9 +337,6 @@ async fn the_judge_tool_rides_on_the_master_switch_and_a_key() {
     teardown_test_db(&db).await;
 }
 
-/// The sites stay on their chat model while the tool is offered. That is the
-/// whole point of the split: a capability the agent can reach for is not a
-/// decision the engine has moved to a different backend.
 #[tokio::test]
 async fn offering_the_tool_moves_no_judgment_site() {
     let (pool, db) = setup_test_db().await;
@@ -378,9 +352,6 @@ async fn offering_the_tool_moves_no_judgment_site() {
     teardown_test_db(&db).await;
 }
 
-/// The switches reach the command guard's backend, and that key is already
-/// human-only. A settable master switch would be a back door around it. The
-/// custom URL receives every state a site sends, so the agent must not pick it.
 #[test]
 fn the_system_one_settings_are_not_agent_settable() {
     use crate::core::preference_catalog::{internal_hint, lookup};
@@ -408,9 +379,6 @@ fn the_system_one_settings_are_not_agent_settable() {
     }
 }
 
-/// Picking Jev without a key degrades to chat rather than failing. Skipped
-/// when the launch environment supplies a key, because then the case cannot
-/// arise here.
 #[tokio::test]
 async fn picking_jev_without_a_key_runs_chat() {
     if std::env::var(TYPESAFE_API_KEY_ENV).is_ok() {
@@ -433,8 +401,6 @@ async fn picking_jev_without_a_key_runs_chat() {
     teardown_test_db(&db).await;
 }
 
-/// The custom endpoint's key goes only where its credential scope covers the
-/// URL. A URL moved after the key was saved must not carry the key along.
 #[tokio::test]
 async fn the_custom_key_goes_only_inside_its_scope() {
     let (pool, db) = setup_test_db().await;
@@ -479,8 +445,6 @@ async fn the_custom_key_goes_only_inside_its_scope() {
     teardown_test_db(&db).await;
 }
 
-/// OpenRouter asks Jev until its model preference names another decision
-/// model, and always at OpenRouter's System One URL with the OpenRouter key.
 #[tokio::test]
 async fn openrouter_asks_jev_unless_its_model_preference_names_another() {
     let (pool, db) = setup_test_db().await;
@@ -512,8 +476,6 @@ async fn openrouter_asks_jev_unless_its_model_preference_names_another() {
     teardown_test_db(&db).await;
 }
 
-/// The chat provider's switch is a veto over its System One row too: an
-/// OpenAI switched off for chat is off for decisions.
 #[tokio::test]
 async fn a_switched_off_chat_provider_runs_its_sites_on_chat() {
     let (pool, db) = setup_test_db().await;
@@ -545,9 +507,6 @@ async fn a_switched_off_chat_provider_runs_its_sites_on_chat() {
     teardown_test_db(&db).await;
 }
 
-/// ADRs 0435 and 0472: an unset wake decision runs on OpenAI Decisions while
-/// the chat provider serves OpenAI. Nothing else moves, the read decision
-/// included, and an explicit `chat` stays.
 #[tokio::test]
 async fn an_unset_wake_decision_defaults_to_openai_decisions_while_openai_is_served() {
     let (pool, db) = setup_test_db().await;
@@ -635,8 +594,6 @@ async fn an_unset_wake_decision_defaults_to_openai_decisions_while_openai_is_ser
     teardown_test_db(&db).await;
 }
 
-/// Only the wake decision has a default, and it rides a chat provider. The
-/// read decision runs on its chat model while unset (ADR 0472).
 #[test]
 fn only_the_wake_decision_has_a_default() {
     assert!(WAKE_DECISION_DEFAULT.chat_provider().is_some());

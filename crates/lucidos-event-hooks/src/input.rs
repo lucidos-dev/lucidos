@@ -1,41 +1,8 @@
-//! What a hook reads: the pending event, as the event store would record it,
-//! with every stored secret masked.
-
-use lucidos_core::core::event_subscription::{matchable_system_payload, matchable_thread_payload};
+use lucidos_core::core::event_hooks::PendingEvent;
 use lucidos_core::core::redact_subprocess_output_in_json;
-use lucidos_core::engine::event_bus::BusEvent;
 use serde::Serialize;
 use serde_json::Value;
 
-/// An event about to be recorded, in the view a hook's `condition` matches:
-/// the stored payload plus the thread it belongs to.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PendingEvent {
-    pub event_type: String,
-    pub payload: Value,
-}
-
-impl PendingEvent {
-    pub fn of(event: &BusEvent) -> Self {
-        match event {
-            BusEvent::Thread {
-                thread_id,
-                event,
-                meta,
-            } => Self {
-                event_type: event.event_type().to_string(),
-                payload: matchable_thread_payload(event, meta, *thread_id),
-            },
-            BusEvent::System(event) => Self {
-                event_type: event.stored_event_type().to_string(),
-                payload: matchable_system_payload(event),
-            },
-        }
-    }
-}
-
-/// A [`PendingEvent`] fit to hand a hook script. Its fields are private, so
-/// the only way to build one masks the payload first.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HookInput {
     event_type: String,
@@ -43,8 +10,6 @@ pub struct HookInput {
 }
 
 impl HookInput {
-    /// Masks `pending` against every secret the workspace stores. An `Err`
-    /// means the secrets could not be read, so no input exists to hand on.
     pub async fn read(pool: &sqlx::PgPool, pending: &PendingEvent) -> Result<Self, String> {
         let secrets = lucidos_engine::engine::engine_impl::stored_secret_values(pool)
             .await
@@ -66,7 +31,7 @@ impl HookInput {
 mod tests {
     use super::*;
     use lucidos_core::core::{AuthType, CredentialStore, REDACTED_MARKER};
-    use lucidos_core::engine::event_bus::{EventBus, SystemEvent};
+    use lucidos_core::engine::event_bus::{BusEvent, EventBus, SystemEvent};
     use lucidos_core::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
     use serde_json::json;
 
@@ -144,8 +109,6 @@ mod tests {
         assert!(!input.payload.to_string().contains(other));
     }
 
-    /// The secrets come from the store, so a credential an event quotes never
-    /// reaches a hook.
     #[tokio::test]
     async fn the_input_masks_a_stored_credential_an_event_quotes() {
         lucidos_core::core::secret_store::key_store::install_test_key_store();

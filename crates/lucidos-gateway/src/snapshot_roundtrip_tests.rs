@@ -1,5 +1,3 @@
-//! Session-scoped gateway router and engines under a private HOME. Never boots
-//! the machine-global gateway or registers a real user's workspace.
 use super::*;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
@@ -31,7 +29,6 @@ async fn run_fixture(relocated: bool) -> Result<(), BoxError> {
     } else {
         lucidos_home::default_gateway_data_dir_in(&root)
     };
-    // A fresh home, so every private entry resolves into the subtree.
     let private = lucidos_home::private::path_in(&root);
     lucidos_home::ensure_storage_root(&private)?;
     let stem = format!("snapshot-e2e-{}", lucidos_local_token::mint_hex(12)?);
@@ -55,9 +52,6 @@ async fn run_fixture(relocated: bool) -> Result<(), BoxError> {
         .env("E2E_SNAPSHOT_CHILD", &stem)
         .env("LUCIDOS_SECRET_KEY_STORE", "file")
         .env("LUCIDOS_MODEL", "mock")
-        // The spawned engines judge free space on the real disk otherwise, and
-        // refuse a capture on a host with under 10% free. Wire name: the
-        // engine's `ROOMY_FIXTURE_ROOT_ENV`.
         .env("LUCIDOS_TEST_ROOMY_SNAPSHOT_ROOT", &root)
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -83,7 +77,6 @@ async fn run_fixture(relocated: bool) -> Result<(), BoxError> {
         command.env("LUCIDOS_GATEWAY_DATA", &app_data);
     }
     let result = tokio::time::timeout(Duration::from_secs(600), command.status()).await;
-    // Even a failed child cannot leave engines attached to a deleted fixture.
     for suffix in ["source", "target"] {
         let id = format!("{stem}-{suffix}");
         let workspace = app_data.join("workspaces").join(&id);
@@ -117,8 +110,6 @@ async fn run_fixture(relocated: bool) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// A private container with an anonymous volume, never the gateway's shared
-/// data volume. The password is passed only through the process environment.
 pub(super) struct FixturePostgres {
     name: Option<String>,
 }
@@ -161,8 +152,6 @@ impl FixturePostgres {
         let fixture = Self {
             name: Some(name.to_owned()),
         };
-        // Docker publishes its TCP proxy before initdb has finished. Wait for
-        // the final server's TCP listener, not the temporary init socket.
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let ready = tokio::process::Command::new("docker")
@@ -222,8 +211,6 @@ async fn child() -> Result<(), BoxError> {
         return Err("not a disposable snapshot fixture".into());
     }
     let token = lucidos_local_token::ensure()?;
-    // The production acceptor, so each request carries the peer address the
-    // agent restore-caller admission reads.
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let mut state =
@@ -264,8 +251,6 @@ async fn child() -> Result<(), BoxError> {
         .save(&state.inner.registry_path)?;
     drop(reservations);
     let serving = state.clone();
-    // Loopback serves only the loopback CA's leaf, and the built CLI trusts
-    // only the public copy this call writes under the fixture HOME.
     let server = tokio::spawn(serve_listener(
         listener,
         gateway_router(serving),
@@ -283,9 +268,6 @@ async fn child() -> Result<(), BoxError> {
     result
 }
 
-/// A client that trusts the loopback CA under the fixture HOME, the one the
-/// fixture gateway serves. The crate's `test-support` client trusts a test CA
-/// instead, which no built binary shares.
 pub(super) fn fixture_client_builder() -> Result<reqwest::ClientBuilder, BoxError> {
     let pem = lucidos_local_token::loopback_cert::read()?;
     Ok(reqwest::Client::builder()
@@ -328,8 +310,6 @@ async fn exercise_roundtrip(
     }
     let target = &workspaces[1];
     let source = &workspaces[0];
-    // The engines trust a device only under the gateway's stamp, so the owner
-    // reaches them through the gateway as a paired device.
     let source_api = format!("{origin}/{}/api/v1", source.id);
     let target_api = format!("{origin}/{}/api/v1", target.id);
     let device = "snapshot-roundtrip-owner";
@@ -341,7 +321,6 @@ async fn exercise_roundtrip(
         paired_at: "2020-01-01T00:00:00Z".into(),
         last_seen_at: None,
     })?;
-    // The fixture serves TLS, so the gateway reads the hardened cookie form.
     let cookie = crate::auth::CookieForm::Hardened.name(state.device_cookie_name());
     let owner = fixture_client_builder()?
         .timeout(Duration::from_secs(5))

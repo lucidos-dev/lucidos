@@ -113,8 +113,6 @@ async fn a_pick_waits_only_until_the_starting_turn_releases_its_gate() {
     teardown_test_db(&db_name).await;
 }
 
-/// Two quick picks on an idle thread both land. Neither reads the other
-/// as a starting turn.
 #[tokio::test]
 async fn concurrent_picks_on_an_idle_thread_are_both_recorded() {
     let (pool, db_name) = setup_test_db().await;
@@ -130,8 +128,6 @@ async fn concurrent_picks_on_an_idle_thread_are_both_recorded() {
     teardown_test_db(&db_name).await;
 }
 
-/// A turn that waits on the gate while a pick is recorded resolves after
-/// it, so it reads the pick.
 #[tokio::test]
 async fn a_turn_waiting_on_the_gate_starts_after_the_pick() {
     let (pool, db_name) = setup_test_db().await;
@@ -239,7 +235,6 @@ async fn queued_turn_case() {
                 )
                 .await
         });
-        // Poll the real process through admission, while its live holder remains.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!queued.is_finished());
         for effort in ["high", "medium"] {

@@ -57,17 +57,12 @@ mod derive_call_key_tests {
 
     #[test]
     fn read_file_no_window_args_keys_by_path() {
-        // No start_line / line_count / offset → bare path key, same as any
-        // other path-keyed tool.
         let key = derive_call_key(tn::READ_FILE, &json!({ "path": "src/main.rs" }));
         assert_eq!(key, "src/main.rs");
     }
 
     #[test]
     fn read_file_different_start_lines_bucket_separately() {
-        // Legitimate paging through one file: each page is its own bucket so
-        // three sequential paged reads don't trip the read_file circuit
-        // breaker (which fires at the third match on `last_tool_call`).
         let a = derive_call_key(
             tn::READ_FILE,
             &json!({ "path": "src/main.rs", "start_line": 1, "line_count": 100 }),
@@ -83,14 +78,11 @@ mod derive_call_key_tests {
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
-        // Same path is still mentioned so the bucket is grep-able from logs.
         assert!(a.starts_with("src/main.rs"));
     }
 
     #[test]
     fn read_file_same_args_share_bucket() {
-        // Two reads with identical args still bucket together — the breaker
-        // still catches the LLM looping on the exact same call.
         let a = derive_call_key(
             tn::READ_FILE,
             &json!({ "path": "src/main.rs", "start_line": 1, "line_count": 100 }),
@@ -117,8 +109,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn read_file_different_offset_buckets_separately() {
-        // Byte-offset paging (the older read_file pagination mode) is also
-        // legitimate progress — must bucket distinctly.
         let a = derive_call_key(
             tn::READ_FILE,
             &json!({ "path": "src/main.rs", "offset": 0 }),
@@ -138,8 +128,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn non_run_bash_with_command_arg_does_not_bucket_by_command() {
-        // Sanity: only run_bash is special-cased. A different tool that happens
-        // to carry a `command` arg falls through to the path/url/query lookup.
         let key = derive_call_key(tn::READ_FILE, &json!({ "command": "git status" }));
         assert_eq!(key, "");
     }
@@ -150,26 +138,8 @@ mod derive_call_key_tests {
         assert_eq!(key, "");
     }
 
-    // -----------------------------------------------------------------
-    // run_python / run_python_background bucket-key tests.
-    //
-    // Pin the rules that make the 3-strike guard useful for python:
-    // - Same retry-storm code shares a bucket (the time.sleep poll case).
-    // - Different scripts get different buckets (no false positives on
-    //   sequential data processing).
-    // - Pure-import / pure-comment / empty code falls back to the tool
-    //   name so three of THOSE in a row still trip.
-    // -----------------------------------------------------------------
-
     #[test]
     fn run_python_time_sleep_verbatim_retry_shares_bucket_escalating_does_not() {
-        // What the guard actually catches: verbatim retries (same code
-        // text, same args). What it does NOT catch: escalating-arg
-        // retries (sleep 120 → 180 → 240) — those each bucket
-        // separately because the integer is part of the first
-        // actionable line. The structural fix for both is the
-        // `bash_output(wait_secs)` server-side block; this guard is
-        // the last-line defense for the verbatim case.
         let a = derive_call_key(
             tn::RUN_PYTHON,
             &json!({ "code": "import time\ntime.sleep(120)\nprint('done')" }),
@@ -195,10 +165,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn run_python_different_actionable_lines_bucket_separately() {
-        // Two scripts that both start with the same imports but do
-        // genuinely different work must NOT share a bucket — otherwise
-        // the LLM's sequential data-processing workflow trips the
-        // generic 3-strike guard.
         let a = derive_call_key(
             tn::RUN_PYTHON,
             &json!({ "code": "import pandas as pd\ndf = pd.read_csv('a.csv')\nprint(df.head())" }),
@@ -212,9 +178,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn run_python_skips_imports_and_comments() {
-        // Leading imports + comments are stripped — the bucket key is
-        // the first ACTIONABLE line. Two scripts with the same
-        // boilerplate header but different bodies bucket separately.
         let a = derive_call_key(
             tn::RUN_PYTHON,
             &json!({
@@ -237,8 +200,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn run_python_pure_import_falls_back_to_tool_name() {
-        // Three pure-import calls in a row are themselves a retry
-        // storm — fall back to the tool name so the guard still fires.
         let key = derive_call_key(
             tn::RUN_PYTHON,
             &json!({ "code": "import os\nimport sys\nfrom pathlib import Path\n# nothing else" }),
@@ -260,8 +221,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn run_python_background_uses_same_key_logic_as_run_python() {
-        // Background and foreground share the bucket strategy — the
-        // sleep-poll antipattern fires for the background tool too.
         let code = "result = expensive_thing()\nprint(result)";
         let fg = derive_call_key(tn::RUN_PYTHON, &json!({ "code": code }));
         let bg = derive_call_key(tn::RUN_PYTHON_BACKGROUND, &json!({ "code": code }));
@@ -271,10 +230,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn run_python_key_truncates_at_80_chars_with_hash_suffix() {
-        // Long single-line bodies that exceed 80 chars get a `#<hash>`
-        // suffix so two retries with the same prefix but divergent
-        // tails bucket differently. Suffix is 8 hex chars + a '#' = 9
-        // chars, so total key ≤ 89 chars.
         let long = format!("x = {}", "a".repeat(200));
         let key = derive_call_key(tn::RUN_PYTHON, &json!({ "code": long }));
         assert!(key.starts_with("x = "));
@@ -291,11 +246,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn run_python_long_lines_diverging_past_80_chars_bucket_separately() {
-        // Without the hash suffix, two scripts differing only in a
-        // filename suffix past char 80 would collide and false-trip
-        // the 3-strike guard on legitimate sequential data work.
-        // Build paths long enough that the differing suffix is well
-        // past char 80.
         let a_code = format!(
             "df = pd.read_csv('/very/long/absolute/path/to/data/folder/{}/file_A.csv')",
             "deep/nested/dir".repeat(3)
@@ -304,7 +254,6 @@ mod derive_call_key_tests {
             "df = pd.read_csv('/very/long/absolute/path/to/data/folder/{}/file_B.csv')",
             "deep/nested/dir".repeat(3)
         );
-        // Sanity: the differing byte (A vs B) must actually be past 80.
         assert!(
             a_code.len() > 90,
             "test setup wrong, line too short: len={}",
@@ -312,8 +261,6 @@ mod derive_call_key_tests {
         );
         let a = derive_call_key(tn::RUN_PYTHON, &json!({ "code": a_code }));
         let b = derive_call_key(tn::RUN_PYTHON, &json!({ "code": b_code }));
-        // Both lines are > 80 chars; both should carry hash suffixes
-        // that differ since the inputs differ.
         assert!(a.contains('#'), "expected hash suffix on long line: {a:?}");
         assert!(b.contains('#'), "expected hash suffix on long line: {b:?}");
         assert_ne!(
@@ -324,8 +271,6 @@ mod derive_call_key_tests {
 
     #[test]
     fn run_python_key_under_80_chars_no_hash_suffix() {
-        // Lines under the cap don't need disambiguation — keep keys
-        // readable in logs / STOP messages.
         let key = derive_call_key(tn::RUN_PYTHON, &json!({ "code": "x = compute()" }));
         assert_eq!(key, "x = compute()");
         assert!(!key.contains('#'));

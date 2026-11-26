@@ -1,6 +1,6 @@
 use super::{AbortCause, CancelCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 
-/// Single grep target for "where can a response be canceled?". `meta.actor`
+/// INVARIANT: Single grep target for "where can a response be canceled?". `meta.actor`
 /// should be `Some(_)` whenever the cancel originated at the chat-cancel
 /// HTTP handler — the handler resolves the actor and stamps it on the
 /// per-thread `ThreadHandle.cancel_actor` slot, which the agentic loop's
@@ -78,7 +78,7 @@ pub async fn emit_response_canceled(
     .await;
 }
 
-/// True iff a terminator (`ResponseGenerated`/`ResponseCanceled`/
+/// INVARIANT: True iff a terminator (`ResponseGenerated`/`ResponseCanceled`/
 /// `ResponseAborted`/`ResponseFailed`) already exists in the events table
 /// for `(thread_id, request_event_id)`. Shared by `emit_response_canceled`
 /// (skip-emit gate) and `agentic_loop::ensure_terminator_emitted`
@@ -114,9 +114,6 @@ pub async fn has_terminator_for(
     })
 }
 
-/// Single grep target for "where can a response be aborted?". `meta.actor`
-/// covers both pure system kills (`None` or `Some(MessageOrigin::system())`)
-/// and engine-deliberate terminations carrying `Engine{reason}` for the chip.
 #[allow(clippy::too_many_arguments)]
 pub async fn emit_response_aborted(
     bus: &crate::engine::event_bus::EventBus,
@@ -146,7 +143,7 @@ pub async fn emit_response_aborted(
     .await;
 }
 
-/// Fire-and-forget `ContinuationRequested` emit with consistent meta shape.
+/// INVARIANT: Fire-and-forget `ContinuationRequested` emit with consistent meta shape.
 /// Its callers include `agent_question`'s answered-after-idle resume, the
 /// safety-net watchdog auto-recovery and the strip's **Harden**. The continue
 /// endpoint `/api/v1/threads/{id}/continue` emits inline, because it
@@ -196,7 +193,6 @@ pub async fn emit_continuation_requested_or_log(
     }
 }
 
-/// Record a concrete Apply request before the route merges or queues it.
 pub async fn emit_change_apply_requested(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: uuid::Uuid,
@@ -204,18 +200,16 @@ pub async fn emit_change_apply_requested(
     branch_name: &str,
     repo_root: &str,
     actor: Option<MessageOrigin>,
-) {
-    bus.emit_or_log(
-        crate::engine::event_bus::BusEvent::Thread {
-            thread_id,
-            event: ThreadEvent::ChangeApplyRequested {
-                change_id: change_id.to_string(),
-                branch_name: branch_name.into(),
-                repo_root: repo_root.into(),
-            },
-            meta: EventMeta::with_actor(actor),
-        },
-        "[Apply] ChangeApplyRequested",
-    )
-    .await;
+) -> Result<(), crate::engine::event_bus::HookRefusal> {
+    let event = ThreadEvent::ChangeApplyRequested {
+        change_id: change_id.to_string(),
+        branch_name: branch_name.into(),
+        repo_root: repo_root.into(),
+    };
+    let meta = EventMeta::with_actor(actor);
+    let asked = bus.ask_hooks(thread_id, &event, &meta).await?;
+    if let Err(e) = bus.emit_asked(asked, thread_id, event, meta).await {
+        crate::log_legacy!("[Apply] ChangeApplyRequested emit failed: {}", e);
+    }
+    Ok(())
 }

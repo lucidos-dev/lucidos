@@ -1,4 +1,3 @@
-//! Private engine-to-gateway snapshot. Render every record before exporting it.
 use crate::writer::Record;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

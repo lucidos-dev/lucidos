@@ -1,7 +1,3 @@
-//! Free helper functions used across the
-//! agent-recovery phases. Re-exported from mod.rs so existing
-//! `agent_recovery::X` paths keep resolving.
-
 use super::super::git_ops::{git_answer, git_cmd, GitAnswer};
 pub(crate) use crate::engine::coding_turn_end::{last_turn_end, last_turn_ended_cleanly, TurnEnd};
 pub use crate::engine::continuation_reason::*;
@@ -9,17 +5,6 @@ use crate::engine::thread_events::CodingAgentKind;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// User message the spawn consumer hands to `run_direct_agent` when actuating
-/// a `SpawnRequest::Continue`. **Must be non-empty.**
-///
-/// `claude --print --resume` waits on stdin for its first input before it emits
-/// `system/init`. It continues on its own only when Claude Code's internal
-/// `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` is set, which the engine does not do.
-/// So recovery sends this text as an ordinary user turn, and `run_direct_agent`
-/// refuses an empty one (ADR 0272). It resumes any transcript state: a cut tool
-/// call, a cut stream, or a completed API-error turn.
-///
-/// The wording matches Claude Code's own continuation prompt.
 pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off.";
 
 const ANSWER_OUT_OF_BAND_NOTE: &str =
@@ -30,9 +15,6 @@ const ANSWER_OUT_OF_BAND_NOTE: &str =
      teardown artifact and it is false: the user declined nothing. They did not approve \
      anything either. Their actual answer follows.]";
 
-/// Closes the [`ANSWERED_AFTER_IDLE_REASON`] resume message. Names the one
-/// inference that has to be blocked: "the card is closed and I was told to
-/// continue, so I may proceed with what I was about to do".
 const ANSWER_OUT_OF_BAND_TRAILER: &str =
     "Continue the turn from that answer, and from nothing else. Do not re-ask the same \
      question unless the answer left it open. Do not read the interrupted tool call as \
@@ -75,10 +57,6 @@ pub(crate) async fn continue_input_for_reason(
             format!("{ANSWER_OUT_OF_BAND_NOTE}\n\n{recap}\n{ANSWER_OUT_OF_BAND_TRAILER}")
         }
         None => {
-            // Nothing to recap on an answered-after-idle continuation means the
-            // answer we were spawned for is not readable back. Say so: the
-            // agent still resumes, but the silence lands in the log rather than
-            // only in the model's guesswork.
             crate::log_legacy!(
                 "[CCQuestion] answered_after_idle continuation for thread {} has no \
                  recoverable answer, resuming with the bare continue message",
@@ -127,24 +105,6 @@ pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {
     }
 }
 
-/// Resolve which thread an orphaned coding-agent worktree (found by the
-/// recovery scan) should be surfaced under as a resumable Claude Code session.
-/// Returns the thread that a recorded `SessionStarted` / pending change maps
-/// `branch_name` to, or `None` when no thread owns the branch.
-///
-/// `None` means **skip**. A worktree whose originating thread is gone (its
-/// events were pruned, leaving only the directory on disk) has no conversation
-/// to continue. Recovery used to fabricate a fresh `Uuid` here and emit
-/// `CodingAgentIdled` to it — but a thread with no projection row defaults to
-/// `Chat` / `Archived` in the lifecycle gate, which rejects `CodingAgentIdled`
-/// as CC-only. The emit failed on *every* engine restart (spamming the audit
-/// log with `Thread lifecycle violation: 'CodingAgentIdled' is not valid for
-/// Chat threads`) and never actually surfaced anything resumable. The orphaned
-/// worktree is left for the worktree-cleanup worker to reclaim on its own
-/// schedule instead.
-///
-/// Pure decision — exposed at module scope so the skip behaviour is unit-tested
-/// without a live engine + git worktree (mirrors `classify_archive_decision`).
 pub(crate) fn orphan_recovery_target(
     branch_to_thread: &std::collections::HashMap<String, Uuid>,
     branch_name: &str,
@@ -190,13 +150,9 @@ pub(crate) fn recovery_repo_roots(
     roots
 }
 
-/// How many git subprocesses one boot-time recovery sweep runs at once. Each
-/// sweep fans out per repo or per thread, and a serial fan-out made boot time
-/// grow with every registered repo. The cap keeps a large workspace from
-/// launching a burst big enough to push probes past `GIT_TIMEOUT`.
 pub(crate) const RECOVERY_GIT_CONCURRENCY: usize = 8;
 
-/// The first root, in `roots` order, whose refs hold `refs/heads/<branch>`.
+/// INVARIANT: The first root, in `roots` order, whose refs hold `refs/heads/<branch>`.
 /// Every root is asked at once, but the pick is the one a serial scan would
 /// make. That keeps the load-bearing order of [`recovery_repo_roots`].
 pub(crate) async fn first_root_holding_branch<'a>(
@@ -215,9 +171,6 @@ pub(crate) async fn first_root_holding_branch<'a>(
     first_confirmed(roots, &answers)
 }
 
-/// The first item whose answer is `Yes`. An `Unknown` never picks: an unanswered
-/// probe must not claim the branch lives in this repo, or recovery builds a
-/// worktree against the wrong root (`.claude/rules/rust.md`).
 fn first_confirmed<'a, T>(items: &'a [T], answers: &[GitAnswer]) -> Option<&'a T> {
     items
         .iter()
@@ -226,19 +179,6 @@ fn first_confirmed<'a, T>(items: &'a [T], answers: &[GitAnswer]) -> Option<&'a T
         .map(|(item, _)| item)
 }
 
-/// The app id an `App`-kind coding-agent thread edits, read from its newest
-/// `SessionStarted`. `None` for every other kind, so a caller branches on
-/// `Some` alone.
-///
-/// Recovery needs it to rebuild a lost worktree the way the spawn path built
-/// it: a sparse cone over `data/apps/<id>/`, never the whole workspace tree.
-/// The newest session decides, because that is the row naming the branch this
-/// sweep is recovering.
-///
-/// A query that could not run answers `None`, which routes to the ordinary
-/// `worktree_add`. That is the safe direction. An over-broad checkout only
-/// wastes disk, where a wrongly-sparse one hides the very files a non-app
-/// thread came to edit.
 pub(crate) async fn lookup_app_spawn_id(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT payload->>'coding_agent_kind', payload->>'app_id' FROM events \
@@ -292,19 +232,9 @@ pub(crate) fn recovery_branch_is_external_repo(
         && crate::engine::git_ops::is_external_repo_path(repo_root, workspace_root)
 }
 
-/// Which git repo holds an ended coding-agent session's branch.
-///
-/// [`stale_session_repo`] derives it from the kind the thread's own
-/// `SessionStarted` recorded, so the branch and the repo that owns it always
-/// come from one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StaleSessionRepo {
-    /// A repo the engine owns and may act in: the workspace git for an `app`
-    /// thread, the Lucidos source repo for a `lucidos` one.
     Owned(PathBuf),
-    /// A registered external repo. The engine owns no proposal and no branch
-    /// there, so the settle never looks the root up. A root nobody looked up
-    /// can authorize nothing.
     External,
 }
 
@@ -338,25 +268,6 @@ pub(crate) fn stale_discard_branch_delete_root<'a>(
     }
 }
 
-/// Last-resort recovery for an actively-running coding-agent branch whose ref
-/// vanished from every repo (`recover_orphaned_worktrees`'s "branch not found
-/// in any repo" arm) while its deterministic worktree directory survived on
-/// disk. Recreates the branch ref at the worktree's recorded `HEAD` so the
-/// session can be `--resume`d on the original branch instead of being torn down
-/// and restarted from a fresh branch (which drops the `cc_session_id` and the
-/// thread's conversation continuity — the thread-9e37697e failure mode).
-///
-/// Returns `Some((repo_root, worktree_path))` when the branch was recreated and
-/// the session can resume; `None` (caller falls back to ending the stuck
-/// session — the genuine last resort) when:
-///   - the worktree directory is absent (nothing recoverable),
-///   - its `HEAD` does not resolve to a real commit (a dangling symref left by
-///     out-of-band ref deletion — we never *guess* a SHA, which could mis-point
-///     a commit-bearing branch onto the wrong history), or
-///   - the repo root can't be resolved or the `git branch` create fails.
-///
-/// Pure git/filesystem — no engine/DB dependency — so it is unit-testable
-/// against a real worktree without instantiating a `LucidosEngine`.
 pub(crate) async fn recover_branch_ref_from_worktree(
     workspace_path: &Path,
     thread_id: Uuid,
@@ -366,7 +277,7 @@ pub(crate) async fn recover_branch_ref_from_worktree(
     if !matches!(tokio::fs::try_exists(&wt).await, Ok(true)) {
         return None;
     }
-    // Resolve the worktree's HEAD to a concrete commit. `--verify` makes git
+    // INVARIANT: Resolve the worktree's HEAD to a concrete commit. `--verify` makes git
     // fail (non-zero) rather than echo the literal "HEAD" when the symref
     // dangles, so a deleted-branch-but-symref-still-points-at-it worktree
     // (unrecoverable without fsck) falls through to the last-resort path
@@ -418,9 +329,6 @@ mod tests {
     use crate::engine::git_ops::{git_cmd, worktrees_dir};
     use std::collections::HashMap;
 
-    /// Build a fresh git repo at `workspace` with one commit on `main` and an
-    /// empty `.lucidos/worktrees/`. Returns nothing — the caller uses
-    /// `workspace` as both repo root and workspace root.
     async fn init_repo(workspace: &Path) {
         git_cmd(&["init", "--initial-branch=main"], workspace)
             .await
@@ -446,11 +354,6 @@ mod tests {
             .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
     }
 
-    /// Regression for the thread-9e37697e recovery half: when a resumable
-    /// coding-agent branch's ref has vanished but its deterministic worktree
-    /// directory survives with a resolvable HEAD, recovery recreates the branch
-    /// from that HEAD (so the session can `--resume`) instead of ending the
-    /// stuck session and dropping the session id.
     #[tokio::test]
     async fn recover_branch_ref_recreates_missing_branch_from_surviving_worktree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -477,10 +380,6 @@ mod tests {
             .await
             .expect("worktree HEAD resolves");
 
-        // Simulate the branch-ref loss while the worktree dir survives: detach
-        // the worktree's HEAD (so it still resolves to a commit), then delete
-        // the branch ref. This is exactly the "branch not found in any repo,
-        // worktree survives" state recovery's last-resort arm guards against.
         git_cmd(&["checkout", "--detach"], &wt).await.unwrap();
         git_cmd(&["branch", "-D", branch], &workspace)
             .await
@@ -496,8 +395,6 @@ mod tests {
         let (repo_root, wt_path) =
             recovered.expect("must recover the branch from the surviving worktree");
         assert_eq!(wt_path, wt, "returns the recovered worktree path");
-        // `resolve_repo_root_from_worktree` canonicalizes (macOS resolves
-        // `/var` → `/private/var`), so compare canonical forms.
         let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         assert_eq!(
             canon(&repo_root),
@@ -514,8 +411,6 @@ mod tests {
         );
     }
 
-    /// No worktree on disk → nothing to recover from → `None` so the caller
-    /// falls back to ending the stuck session (the genuine last resort).
     #[tokio::test]
     async fn recover_branch_ref_returns_none_when_worktree_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -532,9 +427,6 @@ mod tests {
         );
     }
 
-    /// A dangling HEAD symref (branch ref deleted out-of-band, worktree HEAD
-    /// still says `ref: refs/heads/<branch>`) is unrecoverable without fsck —
-    /// the helper must refuse rather than guess a SHA and mis-point the branch.
     #[tokio::test]
     async fn recover_branch_ref_returns_none_on_dangling_head() {
         let tmp = tempfile::tempdir().unwrap();
@@ -557,8 +449,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // Delete the branch ref directly, leaving the worktree HEAD as a
-        // dangling `ref: refs/heads/<branch>` symref — `rev-parse HEAD` fails.
         let ref_path = workspace
             .join(".git/refs/heads")
             .join(branch.strip_prefix("claude-code/").unwrap());
@@ -589,10 +479,6 @@ mod tests {
         roots.iter().map(|(p, _)| p.clone()).collect()
     }
 
-    /// The bug this fixes. An app coding-agent thread's worktree and branch
-    /// live in the workspace git, which no registry lists. A sweep over the
-    /// Lucidos repo plus the registered externals never saw one, so a user
-    /// switch fell through to `end_stuck_session` instead of auto-resuming.
     #[test]
     fn recovery_repo_roots_scans_the_workspace_repo() {
         let lucidos = PathBuf::from("/src/lucidos");
@@ -611,8 +497,6 @@ mod tests {
         );
     }
 
-    /// Order is load-bearing: the lost-branch fallback takes the first repo
-    /// whose refs hold the branch, so the two engine-owned roots come first.
     #[test]
     fn recovery_repo_roots_puts_registered_repos_last() {
         let tmp = tempfile::tempdir().unwrap();
@@ -647,8 +531,6 @@ mod tests {
         assert_eq!(first_confirmed(&roots, &answers), None);
     }
 
-    /// Asked concurrently against real repos, the pick is still the one a
-    /// serial scan makes: the first root holding the branch, never a later one.
     #[tokio::test]
     async fn first_root_holding_branch_matches_a_serial_scan() {
         let tmp = tempfile::tempdir().unwrap();
@@ -682,9 +564,6 @@ mod tests {
         );
     }
 
-    /// A workspace that IS the Lucidos checkout must not be scanned twice. A
-    /// duplicate root recovers one worktree under two entries, which trips the
-    /// duplicate-thread guard on every ordinary boot.
     #[test]
     fn recovery_repo_roots_dedupes_a_workspace_inside_the_lucidos_repo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -695,8 +574,6 @@ mod tests {
         assert_eq!(root_paths(&roots), vec![both]);
     }
 
-    /// Same dedupe from the other side: a user who also registered their
-    /// workspace as an external repo gets one entry, the workspace's.
     #[test]
     fn recovery_repo_roots_dedupes_a_workspace_registered_as_an_external_repo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -713,9 +590,6 @@ mod tests {
         );
     }
 
-    /// The dedupe case that predates the workspace entry: a Lucidos checkout
-    /// the user also registered as a repo. Scanning it twice would recover
-    /// every Lucidos-source worktree under two entries.
     #[test]
     fn recovery_repo_roots_dedupes_a_registered_lucidos_repo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -728,8 +602,6 @@ mod tests {
         assert_eq!(root_paths(&roots), vec![lucidos, workspace]);
     }
 
-    /// A registered repo the user has since deleted from disk is skipped. Its
-    /// `git worktree list` would only fail and log.
     #[test]
     fn recovery_repo_roots_skips_a_registered_repo_that_is_gone() {
         let lucidos = PathBuf::from("/src/lucidos");
@@ -744,10 +616,6 @@ mod tests {
         assert_eq!(root_paths(&roots), vec![lucidos, workspace]);
     }
 
-    /// The recovery `CodingAgentIdled` stamps
-    /// `thread_summaries.coding_agent_is_external_repo`, and an app thread that
-    /// wrongly reads external loses its Apply path. Only a registered repo is
-    /// external; neither engine-owned root is.
     #[test]
     fn recovery_branch_is_external_repo_excludes_both_engine_owned_roots() {
         let tmp = tempfile::tempdir().unwrap();
@@ -789,9 +657,6 @@ mod tests {
         )
     }
 
-    /// The bug this fixes. An app thread's branch lives in the workspace git.
-    /// A settle that asks the Lucidos repo finds nothing and proposes nothing,
-    /// leaving the user no Apply card for committed work.
     #[test]
     fn stale_session_repo_routes_an_app_thread_to_the_workspace_git() {
         assert_eq!(
@@ -800,9 +665,6 @@ mod tests {
         );
     }
 
-    /// A `lucidos` thread, an unrecognised kind and a legacy row carrying no
-    /// kind all take the Lucidos repo. The `app` and `external` kinds postdate
-    /// those rows, so a row with no kind really is Lucidos-source.
     #[test]
     fn stale_session_repo_routes_every_other_kind_to_the_lucidos_repo() {
         for kind in [Some("lucidos"), Some("something-new"), None] {
@@ -815,9 +677,6 @@ mod tests {
         }
     }
 
-    /// Either external signal alone is enough. The event kind covers a modern
-    /// thread; the projection flag covers a legacy one whose `SessionStarted`
-    /// predates the field.
     #[test]
     fn stale_session_repo_reads_external_from_either_signal() {
         assert_eq!(
@@ -827,17 +686,11 @@ mod tests {
         assert_eq!(repo_for(None, true), StaleSessionRepo::External);
     }
 
-    /// A disagreement between the two signals resolves to `External`, the only
-    /// answer that touches nothing. Routing a contradiction into an owned repo
-    /// would hand a `git branch -D` a root nobody can vouch for.
     #[test]
     fn stale_session_repo_resolves_a_contradiction_to_external() {
         assert_eq!(repo_for(Some("app"), true), StaleSessionRepo::External);
     }
 
-    /// `git branch -D` force-deletes unmerged commits, so it needs all three
-    /// facts. Dropping any one leaves the branch, which is recoverable. A wrong
-    /// delete is not.
     #[test]
     fn stale_discard_deletes_a_branch_only_on_all_three_facts() {
         let owned = StaleSessionRepo::Owned(workspace_root());
@@ -865,8 +718,6 @@ mod tests {
         );
     }
 
-    /// A duplicate worktree with an uncommitted edit, or one git cannot read, is
-    /// kept. A clean one is removed.
     #[tokio::test]
     async fn cleanup_stale_worktree_keeps_a_tree_with_uncommitted_edits() {
         let tmp = tempfile::tempdir().unwrap();
@@ -920,9 +771,6 @@ mod tests {
         assert!(!clean.exists(), "a clean duplicate worktree is removed");
     }
 
-    /// Build a workspace git holding one app, a sibling app, and an artifact,
-    /// with `branch` created and no worktree on it. That is the state the
-    /// lost-worktree recovery arm rebuilds from.
     async fn workspace_with_lost_app_branch(workspace: &Path, branch: &str) {
         init_repo(workspace).await;
         for dir in [
@@ -953,9 +801,6 @@ mod tests {
         git_cmd(&["branch", branch], workspace).await.unwrap();
     }
 
-    /// An app thread's worktree is a sparse cone over its own app folder. A
-    /// rebuild that materialised the whole workspace tree would show the
-    /// resumed agent every other app and every artifact.
     #[tokio::test]
     async fn recreate_lost_worktree_rebuilds_an_app_worktree_sparsely() {
         let tmp = tempfile::tempdir().unwrap();
@@ -982,8 +827,6 @@ mod tests {
         );
     }
 
-    /// Every other kind keeps the full checkout, so a Lucidos-source or
-    /// external-repo thread still finds the files it came to edit.
     #[tokio::test]
     async fn recreate_lost_worktree_rebuilds_a_non_app_worktree_in_full() {
         let tmp = tempfile::tempdir().unwrap();
@@ -996,8 +839,6 @@ mod tests {
             .await
             .expect("a non-app worktree must rebuild on its surviving branch");
 
-        // Git registering the worktree on our branch, unnarrowed, is the fact
-        // this arm owns.
         let head = git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], &wt)
             .await
             .unwrap();
@@ -1017,17 +858,11 @@ mod tests {
         let mut branch_to_thread = HashMap::new();
         branch_to_thread.insert("claude-code/known".to_string(), tid);
 
-        // A branch a SessionStarted maps to a thread surfaces under it.
         assert_eq!(
             orphan_recovery_target(&branch_to_thread, "claude-code/known"),
             Some(tid)
         );
 
-        // A branch with no originating thread (events pruned, worktree
-        // orphaned) MUST skip — never fabricate a phantom thread. Fabricating
-        // one made recovery emit `CodingAgentIdled` to a row-less thread, which
-        // the lifecycle gate rejects as CC-only (row-less threads default to
-        // Chat/Archived), failing on every engine restart.
         assert_eq!(
             orphan_recovery_target(&branch_to_thread, "claude-code/orphaned"),
             None

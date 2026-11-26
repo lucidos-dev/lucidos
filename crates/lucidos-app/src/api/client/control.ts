@@ -5,6 +5,9 @@ import { replaceDocument } from '../../utils/documentNavigation';
 import { landingHash, type WorkspaceLanding } from '../../utils/workspaceLanding';
 import { AWAITING_OWNER, isAwaitingOwner, type AwaitingOwner } from './awaitingOwner';
 import { gatewayErrorBody, gatewayErrorReason } from './gatewayError';
+import { fetchWithDeadline, throwIfNotOk } from './_core';
+import { discardResumableUpload, forgetResumableUpload, uploadResumable } from './resumableUpload';
+import { UPLOAD_RESPONSE_MS, type UploadProgress } from './uploadProgress';
 import type { AppUpdateProgress } from '../../utils/tauri';
 
 const CONTROL = '/~/api/v1/control';
@@ -20,6 +23,7 @@ export interface WorkspaceStatus {
   last_error?: string;
   unread_count?: number;
   last_successful_backup?: LastSuccessfulBackup;
+  delete_interrupted?: boolean;
 }
 
 export interface LastSuccessfulBackup {
@@ -115,6 +119,8 @@ export interface TrashEntry {
   name: string;
   status: string;
   restore_available: boolean;
+  finish_available: boolean;
+  database_backup: boolean;
   bytes: number | null;
   warning: string | null;
 }
@@ -126,24 +132,40 @@ export interface EmptyTrashBatch {
 }
 
 function cleanupPost<T>(path: string, body?: unknown): Promise<T> {
-  return controlJson<T>(path, {
+  return controlJson<T>(path, cleanupInit(body));
+}
+
+function cleanupInit(body?: unknown): RequestInit {
+  return {
     method: 'POST',
     headers: { ...deviceIdHeader(), 'Content-Type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
+  };
+}
+
+async function cleanupJob<T>(path: string, body?: unknown): Promise<T> {
+  for (;;) {
+    const res = await fetch(`${CONTROL}${path}`, cleanupInit(body));
+    if (res.status === 202) continue;
+    if (!res.ok) throw new Error(await gatewayErrorReason(res));
+    return res.status === 204 ? (undefined as T) : res.json();
+  }
 }
 
 export function freezeWorkspaceDeletion(workspaces: string[]): Promise<WorkspaceDeletionBatch> {
   return cleanupPost('/workspace-delete-batches', { workspaces });
 }
 export function confirmCleanup(id: string, confirm: string): Promise<{ results: CleanupResult[] }> {
-  return cleanupPost(`/cleanup/batches/${encodeURIComponent(id)}/confirm`, { confirm });
+  return cleanupJob(`/cleanup/batches/${encodeURIComponent(id)}/confirm`, { confirm });
 }
 export function listTrash(): Promise<TrashEntry[]> {
   return controlJson<TrashEntry[]>('/trash');
 }
 export function restoreTrash(id: string): Promise<void> {
-  return cleanupPost<void>(`/trash/${encodeURIComponent(id)}/restore`);
+  return cleanupJob<void>(`/trash/${encodeURIComponent(id)}/restore`);
+}
+export function finishTrashDelete(id: string): Promise<void> {
+  return cleanupJob<void>(`/trash/${encodeURIComponent(id)}/finish-delete`);
 }
 export function abandonTrashStaging(id: string): Promise<void> {
   return cleanupPost<void>(`/trash/${encodeURIComponent(id)}/abandon-staging`);
@@ -152,7 +174,7 @@ export function freezeEmptyTrash(): Promise<EmptyTrashBatch> {
   return cleanupPost<EmptyTrashBatch>('/trash/empty-batches');
 }
 export function confirmEmptyTrash(id: string, confirm: string): Promise<EmptyTrashBatch> {
-  return cleanupPost<EmptyTrashBatch>(`/trash/empty-batches/${encodeURIComponent(id)}/confirm`, { confirm });
+  return cleanupJob<EmptyTrashBatch>(`/trash/empty-batches/${encodeURIComponent(id)}/confirm`, { confirm });
 }
 
 export function openWorkspace(id: string, landing?: WorkspaceLanding): void {
@@ -403,28 +425,70 @@ export async function getGatewayTls(): Promise<GatewayTls> {
 export type GwRestoreStatus =
   | { status: 'idle' }
   | { status: 'running'; id: string; name: string; phase: string }
-  | { status: 'completed'; id: string; name: string; warnings: string[] }
-  | { status: 'failed'; name: string; error: string };
+  | { status: 'completed'; result_id?: string; id: string; name: string; warnings: string[] }
+  | { status: 'failed'; result_id?: string; name: string; error: string };
 
 export interface RestoreStarted {
   id: string;
   name: string;
 }
 
-export async function restoreBackup(file: File, key: string, name?: string): Promise<RestoreStarted> {
-  const form = new FormData();
-  form.append('file', file);
-  form.append('key', key);
-  if (name && name.trim()) form.append('name', name.trim());
-  return controlJson<RestoreStarted>('/workspaces/restore', { method: 'POST', body: form });
+export interface RestoreRequest {
+  file: File;
+  key: string;
+  name: string;
 }
 
-export async function getRestoreStatus(): Promise<GwRestoreStatus> {
-  return controlJson<GwRestoreStatus>('/restore-status');
+export interface RestoreObserver {
+  signal?: AbortSignal;
+  onProgress?: (progress: UploadProgress) => void;
+  onRetry?: (attempt: number, reason: unknown) => void;
+  onUploaded?: () => void;
 }
 
-export async function clearRestoreStatus(): Promise<void> {
-  await controlJson<void>('/restore-status', { method: 'DELETE' });
+export async function restoreBackup(
+  request: RestoreRequest,
+  observer: RestoreObserver = {},
+  controlBase = CONTROL,
+): Promise<RestoreStarted> {
+  const uploads = restoreUploadsBase(controlBase);
+  const upload = await uploadResumable({
+    base: uploads,
+    file: request.file,
+    signal: observer.signal,
+    onProgress: observer.onProgress,
+    onRetry: observer.onRetry,
+  });
+  observer.onUploaded?.();
+  const res = await fetchWithDeadline(`${controlBase}/workspaces/restore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upload, key: request.key, name: request.name.trim() || undefined }),
+    signal: observer.signal,
+  }, UPLOAD_RESPONSE_MS);
+  await throwIfNotOk(res);
+  forgetResumableUpload(uploads, request.file);
+  return res.json();
+}
+
+export function discardRestoreUpload(file: File, controlBase = CONTROL): Promise<void> {
+  return discardResumableUpload(restoreUploadsBase(controlBase), file);
+}
+
+function restoreUploadsBase(controlBase: string): string {
+  return `${controlBase}/restore-uploads`;
+}
+
+export function getRestoreStatus(controlBase = CONTROL): Promise<GwRestoreStatus> {
+  return gatewayJson<GwRestoreStatus>(`${controlBase}/restore-status`);
+}
+
+export async function clearRestoreStatus(
+  resultId: string | undefined,
+  controlBase = CONTROL,
+): Promise<void> {
+  const query = resultId === undefined ? '' : `?${new URLSearchParams({ result_id: resultId })}`;
+  await gatewayFetch(`${controlBase}/restore-status${query}`, { method: 'DELETE' });
 }
 
 
@@ -458,7 +522,7 @@ function authJson<T>(gateway: string | null, path: string, init?: RequestInit): 
   return gatewayJson<T>(`${authBase(gateway)}${path}`, init);
 }
 
-async function gatewayJson<T>(url: string, init?: RequestInit): Promise<T> {
+async function gatewayFetch(url: string, init?: RequestInit): Promise<Response> {
   let res: Response;
   try {
     res = await fetch(url, init);
@@ -469,6 +533,11 @@ async function gatewayJson<T>(url: string, init?: RequestInit): Promise<T> {
     const { reason, reasonKind } = await gatewayErrorBody(res);
     throw new GatewayError(reason, res.status, reasonKind);
   }
+  return res;
+}
+
+async function gatewayJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await gatewayFetch(url, init);
   return res.status === 204 ? (undefined as T) : res.json();
 }
 
@@ -568,6 +637,7 @@ export interface PairedGateway {
   paired_at: string;
   last_used_at?: string | null;
   may_manage: boolean;
+  may_control: boolean;
   remote_starts: RemoteStartSetting;
 }
 
@@ -602,11 +672,13 @@ export async function unpairGateway(id: string): Promise<void> {
   await authJson<void>(null, `/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-export function setPairedGatewayMayManage(id: string, mayManage: boolean): Promise<PairedGateway> {
-  return authJson<PairedGateway>(null, `/gateways/${encodeURIComponent(id)}/manage`, {
+export type HopGrant = 'manage' | 'control';
+
+export function setPairedGatewayGrant(id: string, grant: HopGrant, on: boolean): Promise<PairedGateway> {
+  return authJson<PairedGateway>(null, `/gateways/${encodeURIComponent(id)}/${grant}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ may_manage: mayManage }),
+    body: JSON.stringify({ [`may_${grant}`]: on }),
   });
 }
 
@@ -706,6 +778,34 @@ export function listRemoteWorkspaces(): Promise<RemoteGatewayListing[]> {
   return gatewayJson<RemoteGatewayListing[]>('/~/api/v1/remote-workspaces');
 }
 
+export function remoteControlBase(gateway: string): string {
+  return `${REMOTE_GATEWAYS}/${encodeURIComponent(gateway)}/control`;
+}
+
+export function listRemoteControlWorkspaces(gateway: string): Promise<ListedWorkspace[]> {
+  return gatewayJson<ListedWorkspace[]>(`${remoteControlBase(gateway)}/workspaces`);
+}
+
+export async function createRemoteWorkspace(gateway: string, name: string): Promise<ListedWorkspace> {
+  const body = await gatewayJson<{ workspace: ListedWorkspace }>(`${remoteControlBase(gateway)}/workspaces`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  return body.workspace;
+}
+
+export async function startRemoteWorkspace(gateway: string, id: string): Promise<void> {
+  await gatewayFetch(`${remoteControlBase(gateway)}/workspaces/${encodeURIComponent(id)}/start`, { method: 'POST' });
+}
+
+export async function stopRemoteWorkspace(gateway: string, id: string): Promise<void> {
+  await gatewayFetch(`${remoteControlBase(gateway)}/workspaces/${encodeURIComponent(id)}/stop`, {
+    method: 'POST',
+    headers: deviceIdHeader(),
+  });
+}
+
 export function removeRemoteGateway(name: string): Promise<RemovedRemoteGateway> {
   return gatewayJson<RemovedRemoteGateway>(`${REMOTE_GATEWAYS}/${encodeURIComponent(name)}`, {
     method: 'DELETE',
@@ -715,7 +815,7 @@ export function removeRemoteGateway(name: string): Promise<RemovedRemoteGateway>
 export const ARCHIVE_SUFFIXES = ['.age', '.enc'] as const;
 
 const ARCHIVE_NAME = new RegExp(
-  `^lucidos-backup-(.+)-\\d{8}-\\d{6}(?:${ARCHIVE_SUFFIXES.map((suffix) => `\\${suffix}`).join('|')})$`,
+  `^lucidos-backup-(.+)-\\d{8}-\\d{6}(?:-o[0-9a-f]{12})?(?:${ARCHIVE_SUFFIXES.map((suffix) => `\\${suffix}`).join('|')})$`,
 );
 
 export function parseWorkspaceNameFromArchive(filename: string): string | null {

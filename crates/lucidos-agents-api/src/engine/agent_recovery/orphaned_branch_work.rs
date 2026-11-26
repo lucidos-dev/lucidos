@@ -1,24 +1,3 @@
-//! Work on a coding-agent branch that no change carries (ADR 0328).
-//!
-//! Five moments can leave it:
-//! - A Stop with no live session to propose proposes the work as incomplete,
-//!   unless the proposal hold keeps it (ADR 0397, ADR 0416).
-//! - A canceled event wait that held the idle proposal (ADR 0395) proposes it
-//!   as the idle would have.
-//! - An archive, and anything an engine death cut short, set it aside, because
-//!   the user has already put the thread out of the way. So does the snapshot
-//!   the archived worktree removal commits before the tree goes.
-//! - A parent's landed change that did not carry an integrated sub-thread's
-//!   branch sets that work aside, since nothing else would ever propose it
-//!   (ADR 0465).
-//! - A successor's applied or discarded change sets aside what its old thread
-//!   committed after the handoff. Work a successor's branch carries is never
-//!   set aside: that branch's change owns it.
-//!
-//! The set-aside `ChangeProposed` is a first record, never a re-sync. Once a
-//! change row names the branch, no set-aside path emits for it again. So a
-//! trigger on `ChangeProposed` hears each branch once.
-
 use super::super::change_ops::{read_proposal_hold, ProposalHold, ProposeOutcome};
 use super::super::event_bus::{BusEvent, EmittedEvent, EventBus, LagReplay, ReplayScope};
 use super::super::git_ops::{
@@ -40,15 +19,12 @@ use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-/// A thread's branch, the repo that holds it, and its net files.
 pub(crate) struct BranchWork {
     pub branch_name: String,
     pub repo_root: PathBuf,
     pub files: Vec<String>,
 }
 
-/// What branch work is read from and recorded in: the store, and the two
-/// repos a coding-agent branch can live in. The engine builds one per call.
 pub(crate) struct BranchWorkScope<'a> {
     pub pool: &'a PgPool,
     pub event_bus: &'a EventBus,
@@ -57,9 +33,6 @@ pub(crate) struct BranchWorkScope<'a> {
 }
 
 impl BranchWorkScope<'_> {
-    /// The net work on the branch of the thread's latest session. `None` when
-    /// there is none, the repo is external, git could not answer, or the
-    /// branch is a lane batch's integration branch (ADR 0463).
     async fn thread_branch_work(&self, thread_id: Uuid) -> Option<BranchWork> {
         let session: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT payload->>'branch', payload->>'coding_agent_kind' FROM events \
@@ -106,11 +79,6 @@ impl BranchWorkScope<'_> {
         })
     }
 
-    /// The work a canceled event wait held back from the idle proposal, and
-    /// how its turn ended (ADR 0395). `None` unless the thread is an idle,
-    /// unarchived coding-agent thread with no wait left, whose last turn ended
-    /// in a way a sweep settles. A pending handoff also yields `None`: the
-    /// successor session carries the work.
     async fn work_a_canceled_wait_held(&self, thread_id: Uuid) -> Option<(BranchWork, TurnEnd)> {
         let released: Option<bool> = sqlx::query_scalar(&format!(
             "SELECT COALESCE(is_coding_agent AND archive_state <> 'archived' \
@@ -132,9 +100,6 @@ impl BranchWorkScope<'_> {
         Some((self.thread_branch_work(thread_id).await?, turn_end))
     }
 
-    /// Set aside the net work on an archived thread's branch. The archive net
-    /// cannot tell whether the last turn finished, so it files the work as
-    /// incomplete. Returns whether it recorded a change.
     async fn set_aside_archived_branch_work(
         &self,
         thread_id: Uuid,
@@ -153,11 +118,6 @@ impl BranchWorkScope<'_> {
             .await
     }
 
-    /// Set aside the work of `parent_thread_id`'s integrated sub-threads that
-    /// its landed change did not carry. A live child is skipped, and so is one
-    /// whose report the parent has not had yet: that report still asks the
-    /// parent's agent to merge the branch. A branch the parent merged is on
-    /// `main` by now, so it has no net work. Returns how many it set aside.
     async fn set_aside_unmerged_integrated_work(&self, parent_thread_id: Uuid) -> usize {
         let children: Vec<Uuid> = match sqlx::query_scalar(&format!(
             "SELECT thread_id FROM thread_summaries \
@@ -199,12 +159,6 @@ impl BranchWorkScope<'_> {
         set_aside
     }
 
-    /// Whether a successor carries `work`. It must have made a branch, which
-    /// started at the handoff. Then the work is its own while the head stands
-    /// at the handoff, whatever became of that branch: a Discard reset it,
-    /// and the user's decision covers the work. Past the handoff, the head must
-    /// be known to be in the successor's branch. Any unknown answer is no,
-    /// which sets the work aside and so keeps it.
     async fn carried_by_successor(&self, thread_id: Uuid, work: &BranchWork) -> bool {
         use crate::engine::successor::{handoff_base, successor_thread_of};
         let successor = match successor_thread_of(self.pool, thread_id).await {
@@ -240,10 +194,6 @@ impl BranchWorkScope<'_> {
         .or_unknown(false)
     }
 
-    /// Set aside what `successor_thread_id`'s old thread committed after the
-    /// handoff, now that the successor's change is applied or discarded.
-    /// Work still at the handoff, or carried since, is skipped by
-    /// [`Self::set_aside_branch_work`]. Returns whether it set any aside.
     async fn set_aside_successor_residue(&self, successor_thread_id: Uuid) -> bool {
         let old =
             match crate::engine::successor::predecessor_of(self.pool, successor_thread_id).await {
@@ -343,10 +293,6 @@ impl BranchWorkScope<'_> {
         Ok(true)
     }
 
-    /// The boot half of the archive net: archived threads whose branch still
-    /// holds work no change carries. Git runs only for a candidate whose branch
-    /// still exists, so the pass stays cheap on a long history. Returns how
-    /// many it set aside.
     async fn set_aside_archived_branch_work_on_startup(&self) -> usize {
         let candidates: Vec<(Uuid, String)> = match sqlx::query_as(
             "SELECT t.thread_id, s.branch FROM thread_summaries t \
@@ -416,9 +362,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Withhold what a user Stop left on the branch when no live session was
-    /// there to do it. A Stop cut the turn short, so it proposes nothing
-    /// (ADR 0400).
     async fn withhold_stopped_work(&self, thread_id: Uuid, actor: Option<MessageOrigin>) {
         let lucidos_repo_root = main_worktree().await;
         let Some(work) = self
@@ -476,7 +419,8 @@ pub(crate) impl LucidosEngine {
             Ok(
                 ProposeOutcome::Held(_)
                 | ProposeOutcome::Unfinished
-                | ProposeOutcome::AwaitingLanding(_),
+                | ProposeOutcome::AwaitingLanding(_)
+                | ProposeOutcome::Refused(_),
             ) => {}
             Err(e) => log_legacy!(
                 "[BranchWork] Failed to propose work on {}: {}",
@@ -486,9 +430,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Why nothing was proposed for the thread's branch work, when the
-    /// proposal hold is the reason. `None` when there is no work or nothing
-    /// holds it.
     async fn branch_work_hold(&self, thread_id: Uuid) -> Option<ProposalHold> {
         let lucidos_repo_root = main_worktree().await;
         let work = self
@@ -509,8 +450,6 @@ pub(crate) impl LucidosEngine {
         work_awaits_hardening_in(self.pool(), thread_id).await
     }
 
-    /// The archive half of the net, for one thread. See
-    /// [`BranchWorkScope::set_aside_archived_branch_work`].
     async fn set_aside_archived_branch_work(
         &self,
         thread_id: Uuid,
@@ -526,8 +465,6 @@ pub(crate) impl LucidosEngine {
         Ok(set_aside)
     }
 
-    /// The landing half of the net, for one parent. See
-    /// [`BranchWorkScope::set_aside_unmerged_integrated_work`].
     async fn set_aside_unmerged_integrated_work(&self, parent_thread_id: Uuid) {
         let lucidos_repo_root = main_worktree().await;
         let set_aside = self
@@ -539,8 +476,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// The successor half of the net. See
-    /// [`BranchWorkScope::set_aside_successor_residue`].
     async fn set_aside_successor_residue(&self, successor_thread_id: Uuid) {
         let lucidos_repo_root = main_worktree().await;
         if self
@@ -552,7 +487,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// The boot half of the net. One `ChangesUpdated` covers the whole pass.
     async fn set_aside_archived_branch_work_on_startup(&self) {
         let lucidos_repo_root = main_worktree().await;
         let set_aside = self
@@ -565,7 +499,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Whether the thread rests with work a turn end held for `hardening_missing`.
 async fn work_awaits_hardening_in(pool: &PgPool, thread_id: Uuid) -> bool {
     let held: Result<bool, sqlx::Error> = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1 \
@@ -592,8 +525,6 @@ async fn work_awaits_hardening_in(pool: &PgPool, thread_id: Uuid) -> bool {
     }
 }
 
-/// The repo's local branch names. An unanswered git call yields none, which
-/// only skips candidates: this pass never deletes anything.
 async fn local_branches(repo_root: &Path) -> HashSet<String> {
     match git_cmd(
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
@@ -609,20 +540,11 @@ async fn local_branches(repo_root: &Path) -> HashSet<String> {
     }
 }
 
-/// The bus moments after which a thread's branch work may need recording.
 #[derive(Debug, Clone, PartialEq)]
 enum BranchWorkMoment {
-    /// The thread was archived, or its whole worktree removed. The archived
-    /// removal may have committed the tree's dirt on the branch first.
     Archived,
-    /// Carries who canceled the wait.
     WaitCanceled(Option<MessageOrigin>),
-    /// The thread's change landed. Its integrated sub-threads' work is on
-    /// `main` now, or nothing will ever carry it there. The same goes for its
-    /// old thread's work, when it is a successor.
     ChangeApplied,
-    /// The thread's change was discarded. A successor's old thread may hold
-    /// work the change never carried.
     ChangeDiscarded,
 }
 
@@ -650,13 +572,6 @@ impl BranchWorkMoment {
     }
 }
 
-/// Run the branch-work net, outside the request that caused each moment so it
-/// stays fast. It sets aside unproposed work after every `ThreadArchived` and
-/// full worktree removal. It proposes held work after an `EventWaitCanceled`
-/// that left the thread open. After a `ChangeApplied`, it sets aside the
-/// thread's integrated sub-threads' work the change did not carry. After a
-/// `ChangeApplied` or `ChangeDiscarded` on a successor, it sets aside its old
-/// thread's work from after the handoff.
 pub fn spawn_branch_work_net(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
     let (mut rx, mut replay) = LagReplay::subscribe(
         &engine.event_bus,
@@ -673,7 +588,6 @@ pub fn spawn_branch_work_net(engine: Arc<LucidosEngine>) -> tokio::task::JoinHan
     })
 }
 
-/// The moments one read of the bus hands the net. `None` once the bus closes.
 async fn moments_after(
     received: Result<EmittedEvent, RecvError>,
     replay: &mut LagReplay,

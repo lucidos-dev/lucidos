@@ -1,6 +1,3 @@
-//! Synthetic DB fixtures for transactional acceptance and owner authority.
-//! Includes real mock-backed chat dispatch; transport authentication and
-//! ordinary composer serialization remain separate contracts.
 use super::*;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use serde_json::json;
@@ -15,8 +12,6 @@ async fn accepted_saved_chat_executes_with_original_identity_and_saved_provenanc
     use crate::test_support::test_db_url;
     use std::sync::Arc;
 
-    // Construction loads key material and starts runtime services. Isolate it
-    // in a child with a disposable home, as the providerless boot test does.
     const CHILD: &str = "LUCIDOS_TEST_SAVED_DRAFT_EXECUTOR_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let home = tempfile::tempdir().unwrap();
@@ -209,8 +204,6 @@ async fn accepted_saved_chat_executes_with_original_identity_and_saved_provenanc
             receipt
         );
     }
-    // An ordinary accepted envelope must retain the same contexts as direct
-    // submission. Round-trip the persisted request before the real executor.
     let context_thread = Uuid::new_v4();
     let request = json!({
         "type": "agent-chat", "message": "Use the selected context", "mode": "human",
@@ -250,8 +243,6 @@ async fn accepted_saved_chat_executes_with_original_identity_and_saved_provenanc
             "queued execution lost {name}: {captures:?}"
         );
     }
-    // A failed message append must escape the ordinary queue executor. A
-    // swallowed error would let its manager delete the only durable work.
     sqlx::raw_sql(
         "CREATE FUNCTION reject_queued_message_for_test() RETURNS trigger AS $$
          BEGIN IF NEW.event_type = 'MessageReceived' THEN
@@ -289,8 +280,6 @@ async fn accepted_saved_chat_executes_with_original_identity_and_saved_provenanc
     teardown_test_db(&db).await;
 }
 
-/// Exercise the production router and executor while capacity holds dispatch
-/// behind the acceptance acknowledgement. Runs inside the isolated mock HOME.
 async fn verify_ordinary_http_acceptance(engine: std::sync::Arc<crate::engine::LucidosEngine>) {
     use std::sync::Arc;
     let pool = engine.pool().clone();
@@ -301,8 +290,6 @@ async fn verify_ordinary_http_acceptance(engine: std::sync::Arc<crate::engine::L
         .await
         .unwrap();
     let mut policy = engine.thread_queue.policy().await;
-    // Standing-instruction fixtures leave their synthetic caller turns open.
-    // Leave exactly one slot above those existing occupants, then hold it.
     policy.max_concurrent_total = engine.thread_queue.user_entries().await.len() + 1;
     policy.reserved_background = 0;
     tokio::time::timeout(
@@ -354,7 +341,6 @@ async fn verify_ordinary_http_acceptance(engine: std::sync::Arc<crate::engine::L
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
-    // The real fit-report route must accept only the session's exact device.
     let fit_url = url.replace("/chat/stream", "/widgets/fit-report");
     let request_id = Uuid::new_v4().to_string();
     let answer = crate::engine::pending_answers::await_answer(
@@ -391,7 +377,6 @@ async fn verify_ordinary_http_acceptance(engine: std::sync::Arc<crate::engine::L
     assert_eq!(response.status().as_u16(), 200);
     assert!(answer.await.unwrap().is_empty());
 
-    // A people-only input must record while every agent slot is held.
     let people_thread = Uuid::new_v4();
     let people_id = Uuid::new_v4();
     let people_actor = MessageOrigin::Device {
@@ -871,8 +856,6 @@ async fn submission_service_resolves_registered_destinations_and_strict_backend_
         },
         configured: &[],
     };
-    // Defaults are read for each acceptance, while active bindings win over
-    // account defaults. Omitted model/effort remain omitted queue overrides.
     for (scope, stored, active, expected) in [
         (json!({"kind":"lucidos"}), "codex", false, "codex"),
         (
@@ -935,8 +918,6 @@ async fn submission_service_resolves_registered_destinations_and_strict_backend_
             }
         }
     }
-    // Source sessions persist their repository id, including before kind
-    // stamping existed. A legacy external binding stays external.
     for (kind, bound_repo, scope) in [
         (Some("lucidos"), source_repo.id, json!({"kind":"lucidos"})),
         (None, source_repo.id, json!({"kind":"lucidos"})),
@@ -966,8 +947,6 @@ async fn submission_service_resolves_registered_destinations_and_strict_backend_
             assert_eq!(queued["repo_id"], repo.id.to_string());
         }
     }
-    // A removed source checkout must not disable unrelated app/external
-    // targets in a packaged workspace with an old source registration.
     drop(source);
     crate::test_support::seed_preference(&pool, prefs::CODING_AGENT_DEFAULT.key(), "codex")
         .await
@@ -1027,7 +1006,6 @@ async fn receipt_lookup_needs_no_current_draft_or_live_queue() {
     }))
     .await
     .unwrap();
-    // The consumed slot is empty and cannot produce a SavedDraftSnapshot.
     let raw: SavedDraftRow = sqlx::query_as(&format!(
         "SELECT {SAVED_DRAFT_COLS} FROM thread_summaries WHERE thread_id=$1"
     ))
@@ -1697,8 +1675,6 @@ async fn projection_failure_rolls_back_receipt_event_and_compose() {
     let (pool, db) = setup_test_db().await;
     let prepared = fixture(&pool).await;
     let thread = prepared.request.thread_id;
-    // Fault injection in this disposable DB only: fail the last projection
-    // write, after the receipt and compose writes have happened.
     sqlx::query(
         "ALTER TABLE thread_queue ADD CONSTRAINT refuse_test_entry CHECK (summary <> 'saved text')",
     )
@@ -1762,8 +1738,6 @@ async fn deleting_acceptance_audit_cascades_its_receipt() {
         .accept_saved_draft(prepared)
         .await
         .unwrap();
-    // Exercise the FK using the thread-deletion event predicate. The route's
-    // own queue cleanup is covered by the family-deletion integration suite.
     sqlx::query(
         "DELETE FROM events WHERE thread_id=$1 OR (aggregate='thread' AND aggregate_id=$2)",
     )
@@ -1781,8 +1755,6 @@ async fn deleting_acceptance_audit_cascades_its_receipt() {
     teardown_test_db(&db).await;
 }
 
-/// An agent-worded card on the caller, answered Allow once from a device.
-/// `legacy` marks it a pre-permission approval for the draft's target.
 async fn agent_card(pool: &sqlx::PgPool, prepared: &mut PreparedDraftSubmission, legacy: bool) {
     use crate::engine::thread_events::{AnswerKind, OwnerApproval};
     let caller = prepared.actor.source_thread_id().unwrap();
@@ -1834,13 +1806,10 @@ async fn agent_card(pool: &sqlx::PgPool, prepared: &mut PreparedDraftSubmission,
     prepared.authority = DraftSubmissionAuthority::OwnerApproval { tool_use_id };
 }
 
-/// The owner grants the caller a once permission to send the draft, through
-/// the engine's own card, and the prepared send names it.
 async fn grant_send(pool: &sqlx::PgPool, prepared: &mut PreparedDraftSubmission) -> Uuid {
     use crate::api::permission_requests::{tests::grant, thread_ask};
     use crate::engine::permission::{menu::ALLOW_ONCE_LABEL, Action};
     let caller = prepared.actor.source_thread_id().unwrap();
-    // The agent's own turn ends the fixture's standing instruction.
     open_turn(pool, caller, prepared.actor.clone()).await;
     let target = Some(prepared.request.thread_id);
     let ask = thread_ask(pool, caller, Action::SubmitDraft, target, "Send it.")
@@ -1897,8 +1866,6 @@ async fn standing_instruction_must_name_the_callers_current_owner_turn() {
     teardown_test_db(&db).await;
 }
 
-/// Neither an agent-worded card nor a pre-permission approval card sends a
-/// draft: only a permission does.
 #[tokio::test]
 async fn a_regular_or_legacy_card_never_authorizes_acceptance() {
     let (pool, db) = setup_test_db().await;
@@ -1920,8 +1887,6 @@ async fn a_regular_or_legacy_card_never_authorizes_acceptance() {
     teardown_test_db(&db).await;
 }
 
-/// A send naming an unknown permission, or one granted to another caller for
-/// another draft, is refused and spends nothing.
 #[tokio::test]
 async fn a_forged_or_foreign_permission_never_authorizes_acceptance() {
     let (pool, db) = setup_test_db().await;
@@ -1971,8 +1936,6 @@ async fn saved_draft_content_does_not_grant_a_fresh_owner_instruction() {
     teardown_test_db(&db).await;
 }
 
-/// Invariant 3: the spend commits with the acceptance. A failed acceptance
-/// leaves the grant live, and a retry of the accepted send spends nothing more.
 #[tokio::test]
 async fn permission_spend_rolls_back_with_acceptance_and_retry_does_not_spend_again() {
     let (pool, db) = setup_test_db().await;
@@ -2005,8 +1968,6 @@ async fn permission_spend_rolls_back_with_acceptance_and_retry_does_not_spend_ag
     teardown_test_db(&db).await;
 }
 
-/// Invariant 3: a spent grant sends no second draft, even when the owner
-/// writes a new one on the same target.
 #[tokio::test]
 async fn a_spent_permission_sends_no_second_draft() {
     let (pool, db) = setup_test_db().await;
@@ -2035,7 +1996,6 @@ async fn a_spent_permission_sends_no_second_draft() {
     teardown_test_db(&db).await;
 }
 
-/// Invariant 2: two sends racing on one once grant spend it once.
 #[tokio::test]
 async fn sends_racing_one_permission_spend_it_once() {
     let (pool, db) = setup_test_db().await;

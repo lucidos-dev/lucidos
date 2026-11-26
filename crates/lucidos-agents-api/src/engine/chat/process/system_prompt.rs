@@ -1,9 +1,3 @@
-//! Chat-agent system-prompt assembly. Builds the full per-turn system prompt
-//! (identity, timezone, the large static base prompt, apps/intents/knowhow
-//! listings, images section, trigger framing) plus the mandatory-setup
-//! preference scan.
-//! Tool schemas live in `crates/lucidos-core/src/llm/tools/`.
-
 use crate::core::prefs::{self, Optional, Pref, PrefScope, PrefSpec, Text};
 use crate::engine::LucidosEngine;
 use std::path::Path;
@@ -13,9 +7,6 @@ use super::super::process_helpers::{
     ENGINE_RESTART_RULE, LOOK_BEFORE_ASSESSING_RULE, MEMORY_LOOKUP_CLASSIC, MEMORY_LOOKUP_TREE,
 };
 
-/// What this install lets a coding agent edit, when the engine WAS launched
-/// from a Lucidos source checkout. Paired with [`NO_LUCIDOS_SOURCE_SECTION`];
-/// exactly one of the two is in every prompt (see [`coding_surface_section`]).
 const LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS INSTALL:\n\
      This engine is running from a Lucidos SOURCE CHECKOUT, so you can edit the \
      Lucidos platform's own code: call `run_coding_agent` with `folder` omitted \
@@ -25,12 +16,6 @@ const LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS I
      (`folder=\"data/apps/<id>\"`) or a repository registered via \
      `manage_repositories`.";
 
-/// What this install lets a coding agent edit, when there is NO Lucidos source
-/// checkout (a packaged `.app` / headless install).
-///
-/// The engine refuses a no-`folder` spawn here, but the model must be TOLD as
-/// well as blocked. Otherwise it narrates the capability first and discovers
-/// the refusal after the user has already been misled.
 const NO_LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS INSTALL:\n\
      This engine was NOT launched from a Lucidos source checkout: this install \
      ships the binary only. So you CANNOT edit Lucidos itself, and a \
@@ -53,7 +38,7 @@ const NO_LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THI
      claude-code|codex --message '<task>' [--image <path>]`. Offer it when the user names such a workspace or you \
      know of one, never on a guess. Ask for its path if unknown.";
 
-/// Pick the coding-surface prompt section for this install. The single
+/// INVARIANT: Pick the coding-surface prompt section for this install. The single
 /// divergence point between the two system-prompt variants.
 ///
 /// The caller supplies [`crate::paths::has_lucidos_source`], the same signal
@@ -70,7 +55,7 @@ pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
     }
 }
 
-/// Nudges the Lucidos chat agent to use the `ask_user_question` tool for any
+/// INVARIANT: Nudges the Lucidos chat agent to use the `ask_user_question` tool for any
 /// choice-shaped question instead of writing the options as plaintext markdown.
 ///
 /// The DANGLING ITEM paragraph extends the QUESTION-SHAPE test above, which is
@@ -179,7 +164,6 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      user-perspective wake prompt (\"Show results\", \"Stop sweep\") and your \
      context in `question`.";
 
-/// The agent sandbox's limit on this platform alone (ADR 0645).
 #[cfg(target_os = "macos")]
 const AGENT_SANDBOX_PLATFORM_LIMIT: &str =
     " On macOS nothing in it can run `sandbox-exec`, so a nested seatbelt fails.";
@@ -189,7 +173,7 @@ const AGENT_SANDBOX_PLATFORM_LIMIT: &str =
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const AGENT_SANDBOX_PLATFORM_LIMIT: &str = "";
 
-/// Stops the chat agent from naming things to the user by their raw
+/// INVARIANT: Stops the chat agent from naming things to the user by their raw
 /// identifier. No Lucidos surface is labelled with a change id or a sha, so a
 /// question that quotes one is unanswerable.
 ///
@@ -269,20 +253,6 @@ const NO_IMPERSONATION_RULE: &str = "NEVER ACT AS THE USER, AND NEVER ROUTE \
      spawn-thread --to <ws> --message '<text>'` starts a thread there, plus \
      `--coding-agent claude-code|codex` for one. Never call it impossible.";
 
-/// Routes "tell me here when X happens" to `await_event` rather than a
-/// trigger, at the moment the mechanism is chosen.
-///
-/// The destination question is stated here, alongside the duration question
-/// rather than replacing it, because it is resident in every chat turn. Every
-/// other surface frames `await_event` as an anti-polling remedy. The one
-/// discriminator they all state, one-shot versus standing, picks a trigger for
-/// a request phrased as a standing rule. The knowhow carries the same fork,
-/// but knowhow has to be RETRIEVED, which is often too late.
-///
-/// Deliberately does not claim a trigger cannot reach the user at all: it can,
-/// as a notification from its own thread. What it cannot do is continue the
-/// conversation the user typed into. Pinned by
-/// `trigger_vs_event_wait_rule_routes_on_destination_without_overclaiming`.
 pub(crate) const TRIGGER_VS_EVENT_WAIT_RULE: &str =
     "\"TELL ME WHEN X HAPPENS\", TRIGGER OR `await_event`? ASK WHERE THE ANSWER \
      GOES, NOT JUST HOW OFTEN:\n\
@@ -299,28 +269,18 @@ pub(crate) const TRIGGER_VS_EVENT_WAIT_RULE: &str =
      told, and offer the other in the same breath. Never build a trigger just to \
      post back into a chat thread.";
 
-/// Routes the chat agent to the authoritative system-knowhow file before it
-/// touches a workspace asset.
-///
-/// Deliberately covers **operating on an existing trigger or plugin**, not
-/// just creating one. Narrowing the trigger row back to create/update leaves
-/// "run my digest trigger now" with no route. The agent then guesses and
-/// reaches for resume, which restores the schedule and runs nothing.
-/// Narrowing the plugin row back to packaging likewise leaves "publish this
-/// plugin" with no route.
-/// Pinned by `workspace_assets_rule_routes_existing_trigger_operations` and
-/// `workspace_assets_rule_routes_existing_plugin_operations`.
 pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
     "WORKING WITH WORKSPACE ASSETS, LOAD KNOWHOW FIRST:\n\
-     Before creating a trigger, app, knowhow file, or plugin, AND before \
-     acting on an EXISTING trigger or plugin, you MUST first call load_knowhow \
-     on the matching system-knowhow file:\n\
+     Before creating a trigger, app, knowhow file, plugin or event hook, AND \
+     before acting on an EXISTING trigger or plugin, you MUST first call \
+     load_knowhow on the matching system-knowhow file:\n\
      - triggers, ANY action (create, update, pause/resume, or run one now, \
      off-schedule) -> `system-knowhow/triggers`\n\
      - create_app, for an app or a widget -> `system-knowhow/building-an-app`\n\
      - a new file under knowhow/ -> `system-knowhow/building-knowhow`\n\
      - plugins, ANY action (package, publish, update) -> \
      `system-knowhow/plugins`\n\
+     - event hooks, ANY action -> `system-knowhow/event-hooks`\n\
      Fit caveats persist; fit-only renderers grant no Device/owner authority.\n\
      To run an existing trigger off-schedule, use triggers(action=\"run\"). Do \
      not improvise a substitute: resuming a paused trigger does not run it, \
@@ -330,23 +290,6 @@ pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
      rule below does NOT apply to workspace assets: load the knowhow, ask what \
      it says to ask, then act. Load once per thread.";
 
-/// Routes a plugin *setup thread* to the `plugin-setup` knowhow.
-///
-/// The engine seeds that thread itself, so the opening request has a KNOWN
-/// shape: `build_setup_thread_request` in `engine::tools::plugins` writes one
-/// line for a fresh install and another for an update. Both keep the verb "set
-/// up", and this route has to recognise both. Reword either side alone and the
-/// thread still starts, still looks right, and quietly gets a generic answer
-/// instead of the recipe. Pinned by
-/// `both_setup_seeds_route_to_the_plugin_setup_knowhow`.
-///
-/// Named rather than inline so that test can read it. The re-run clause reads
-/// as filler and is not: it is what stops an update re-asking everything the
-/// last run already settled.
-///
-/// It is also SHORTER than the install-only line it replaces, because this text
-/// is billed on every turn of every thread. Naming a second occasion bought the
-/// room by dropping the summary of steps the knowhow itself owns.
 pub(crate) const PLUGIN_SETUP_RULE: &str =
     "SETTING UP A NEW OR UPDATED PLUGIN, LOAD KNOWHOW FIRST:\n\
      When asked to set up a newly installed or updated plugin, FIRST \
@@ -354,22 +297,6 @@ pub(crate) const PLUGIN_SETUP_RULE: &str =
      an earlier run, the author's instructions, and doing the steps with the \
      user. Skip the load if you already loaded it in this thread.";
 
-/// Routes "set Lucidos up around my life" to the *setup interview* knowhow.
-///
-/// The first-run entry point sends a fixed sentence as an ordinary user
-/// message, so the opening request has a KNOWN shape. That earns a
-/// deterministic route rather than a bet on frontmatter `description` winning
-/// retrieval. The description covers the re-run phrasings a returning user
-/// types.
-///
-/// The ACTION FIRST carve-out is load-bearing, not boilerplate. That rule says
-/// "Don't ask clarifying questions" and excepts only workspace assets, while an
-/// interview is a clarification loop by construction. Without the carve-out the
-/// agent skips the questions and builds something generic on turn one. Pinned
-/// by `setup_interview_rule_carves_itself_out_of_action_first`.
-///
-/// The "not only about work" sentence is here rather than in the knowhow. This
-/// block is what the model reads BEFORE deciding to load anything.
 pub(crate) const SETUP_INTERVIEW_RULE: &str =
     "SETTING THE WORKSPACE UP AROUND THE USER, LOAD KNOWHOW FIRST:\n\
      When the user wants Lucidos set up around their own life rather than a \
@@ -388,19 +315,12 @@ pub(crate) const SETUP_INTERVIEW_RULE: &str =
      questions ARE the work there, so ask them rather than guessing a kit. Skip \
      the load if you already loaded it earlier in this thread.";
 
-/// The todo list where the `todo_write` tool exists, which is everywhere the
-/// *self-curated context mode* is off.
 const TODO_LIST_RULE: &str = "TODO LIST (todo_write, live progress in the prompt bar):\n\
      - Use it for a multi-step request (3+ steps) so the user watches the plan \
      tick along; skip it for trivial single-step work.\n\
      - Call once at the start with every item `pending`, then re-call flipping \
      one to `in_progress` before you start it and to `completed` when it's done.";
 
-/// The same list under the mode, which withdraws `todo_write` from the schema.
-///
-/// One list, one write surface. Ordering a call the array does not offer is
-/// what this replaces: the model met the instruction on every mode-on turn and
-/// had nothing to call.
 const TODO_LIST_RULE_CONTEXT_MODE: &str =
     "TODO LIST (a [TODO] heading in your working understanding, live progress \
      in the prompt bar):\n\
@@ -409,17 +329,6 @@ const TODO_LIST_RULE_CONTEXT_MODE: &str =
      - Write the whole list under the heading, and rewrite it as items move. \
      The mode's own section below owns the marks. There is no todo tool here.";
 
-/// The workspace-independent body of every chat system prompt. Rule consts sit
-/// in it as double-underscore-delimited placeholder tokens that
-/// [`static_prompt_body`] resolves.
-///
-/// Module-level rather than inline in [`LucidosEngine::build_chat_system_prompt`]
-/// so the budget test can measure the real text instead of a copy. Every
-/// placeholder here needs a matching `.replace(...)` in [`static_prompt_body`],
-/// which `every_prompt_placeholder_is_substituted` enforces by scanning this
-/// file's source. That scan is why no doc comment or test in this file may
-/// write a placeholder-shaped token in prose: it would look like an
-/// unsubstituted one.
 const SYSTEM_PROMPT_BASE: &str = r#"
 PERSONALITY:
 - Warm but concise: acknowledge what users say, ask relevant follow-ups
@@ -599,36 +508,12 @@ CRITICAL RULES:
 
 __REPEATED_ACTION_RULE__"#;
 
-/// The head of MEMORY CORRECTIONS on Classic: the `memory` tool.
 const MEMORY_CORRECTIONS_RULE_CLASSIC: &str = "MEMORY CORRECTIONS (the `memory` tool):
 - When the user says a memory is wrong (\"I don't work at Acme Corp\"), pass a broad search_query (\"Acme\") and a specific wrong_fact (\"User works at Acme Corp\"), plus an optional `correction` to replace it. A correction persists across memory rebuilds.";
 
-/// The head of MEMORY CORRECTIONS on Tree: the log is the memory, so there is
-/// no tool to call and nothing to edit (ADR 0362).
 const MEMORY_CORRECTIONS_RULE_TREE: &str = "MEMORY CORRECTIONS:
 - Your memory is the conversation log itself, so there is nothing to edit. When the user corrects something, their words become the newest entry, and the newest ruling holds over older lines.";
 
-/// Resolve every placeholder token in [`SYSTEM_PROMPT_BASE`] and append the
-/// coding-surface section, yielding the workspace-independent body of the chat
-/// system prompt.
-///
-/// `max_tool_calls` is this turn's resolved cap, passed in rather than read
-/// here so it is the SAME number `run_agentic_loop` enforces. A prompt naming a
-/// number the loop does not use is exactly the fabricated engine internal the
-/// ENGINE INTERNALS section warns against.
-///
-/// `max_live_children` is the capacity policy's child cap, passed in for the
-/// same reason: it is the number the recursion guard enforces.
-///
-/// `mode` is here for the same reason. The mode withdraws `todo_write`, so a
-/// body that cannot vary orders a call the tools array does not offer.
-/// `memory_tree` too: a Tree turn has `recall` where Classic has `memory`.
-///
-/// `response_style` is the rendered *response style* section, empty on
-/// Standard. It is a parameter rather than a read, so this stays pure and the
-/// budget meter can bill the widest shipped one. It sits INSIDE the cached
-/// system tier because it is a function of workspace preferences alone, which
-/// is what ADR 0084 admits there.
 fn static_prompt_body(
     has_lucidos_source: bool,
     max_tool_calls: usize,
@@ -692,8 +577,6 @@ fn static_prompt_body(
     )
 }
 
-/// A mandatory preference's handle. The two kinds read their stored row the
-/// same way, which is all the setup scan asks.
 #[derive(Clone, Copy)]
 enum MandatoryPref {
     Optional(&'static Pref<Optional>),
@@ -708,7 +591,6 @@ impl MandatoryPref {
         }
     }
 
-    /// The stored row, the device's own first for a device-scoped key.
     async fn try_stored(
         self,
         pool: &sqlx::PgPool,
@@ -724,10 +606,6 @@ impl MandatoryPref {
     }
 }
 
-/// The preferences a chat turn will not proceed without, as
-/// `(preference, instruction)`. Any missing key flips the turn into setup
-/// mode. Each instruction names a decline value, so a "no" is stored and never
-/// asked again.
 const MANDATORY_PREFS: &[(MandatoryPref, &str)] = &[
     (MandatoryPref::Optional(&prefs::TIMEZONE), "- TIMEZONE: Ask what timezone they are in and call preferences(action=\"set\", key=\"timezone\", value=\"…\") with an IANA name (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\")."),
     (MandatoryPref::Optional(&prefs::LANGUAGE), "- LANGUAGE: Ask what language they prefer, and mention that English is recommended for best results (the models are strongest in English). They can still write in any language; replies come back in whichever language they set here. Then call preferences(action=\"set\", key=\"language\", value=\"…\") to save it."),
@@ -735,17 +613,10 @@ const MANDATORY_PREFS: &[(MandatoryPref, &str)] = &[
     (MandatoryPref::Text(&prefs::TECHNICAL_LITERACY), "- TECHNICAL LITERACY: Ask \"How technical should I be with you?\" as a card with exactly these three options, label then description, word for word: \"Keep it plain\" / \"Everyday words, no jargon.\"; \"Technical\" / \"Technical terms are fine.\"; \"I write software\" / \"Talk to me like a developer.\". Store the pick with preferences(action=\"set\", key=\"technical_literacy\", value=…) as \"non-technical\", \"technical\" or \"developer\". If they decline, set value=\"not-set\" so you don't ask again. Word the rest of this reply at the level they picked."),
 ];
 
-/// The device of the person who can answer setup questions this turn, if any.
-///
-/// Setup mode tells the model not to proceed until the user answers. A trigger
-/// fire, a sub-thread and a cross-workspace task have nobody to answer, and
-/// none of them carries a sending device. So only a turn a person sent from a
-/// device enters setup mode: a missing preference must never stop automation.
 fn setup_device(is_trigger: bool, device_id: Option<&str>) -> Option<&str> {
     device_id.filter(|_| !is_trigger)
 }
 
-/// The prompt's setup-or-language block.
 fn setup_or_language_section(missing_instructions: &[&str], user_language: &str) -> String {
     if missing_instructions.is_empty() {
         return format!(
@@ -770,15 +641,8 @@ pub(crate) impl LucidosEngine {
         user_timezone: &str,
         user_language: &str,
         device_id: Option<&str>,
-        // `Some` on a trigger fire, which is the whole of what "is this a
-        // trigger" means to the caller too (`trigger.is_some()`).
         trigger: &Option<TriggerContext>,
-        // This turn's resolved tool-call cap. Passed in rather than read here
-        // so it is the SAME number `run_agentic_loop` enforces.
         max_tool_calls: usize,
-        // This workspace's tool gates and the intent snapshot behind one of
-        // them, read once per turn by the caller. Shared so the prompt and the
-        // tools array cannot disagree about what this workspace can do.
         capabilities: &crate::engine::tools::TurnCapabilities,
     ) -> (String, Vec<&'static str>) {
         let timezone_section = super::turn_clock::timezone_section(user_timezone);
@@ -819,16 +683,8 @@ pub(crate) impl LucidosEngine {
 
         let has_lucidos_source = crate::paths::has_lucidos_source();
 
-        // Read once and used twice, by the body and by the mode's own section
-        // below. Two reads of the same snapshot could not disagree, but one
-        // name says plainly that the two are the same mode.
         let context_mode = super::context_mode::ContextMode::from_capabilities(&capabilities.gates);
 
-        // Resolved here, ABOVE the trigger branch, so a trigger fire and a chat
-        // turn cannot take different arms: the workspace's chosen style is the
-        // workspace's chosen style either way. Empty on Standard with no
-        // technical literacy set, which leaves the body byte-identical to a
-        // build that never had this setting.
         let response_style = crate::core::response_style::resolve(&self.pool).await;
 
         let max_live_children = self
@@ -850,15 +706,6 @@ pub(crate) impl LucidosEngine {
             )
         );
 
-        // Whether the user has restarted onto the newest build is a FACT the
-        // engine holds. It is stated rather than left to be inferred from
-        // having applied a `requires_restart` change earlier in the thread. The
-        // prescribed probe (fetch a served asset) cannot answer for a
-        // backend-only change, which alters no served asset. Dev-only, on the
-        // same gate as the apply-verify addendum that reads it.
-        //
-        // Only the POINTER is here. The state itself is a per-turn value, so it
-        // rides in the message tail (`super::turn_tail`).
         let system_prompt = if has_lucidos_source {
             format!(
                 "{}{}",
@@ -869,9 +716,6 @@ pub(crate) impl LucidosEngine {
             system_prompt
         };
 
-        // Same split, same reason: the URL comes from the last observed request
-        // origin, so the cached tier gets the instruction and the tail gets the
-        // reading.
         let system_prompt = format!("{}{}", system_prompt, super::turn_tail::CLIENT_URL_POINTER);
         let system_prompt = format!(
             "{}{}",
@@ -879,10 +723,10 @@ pub(crate) impl LucidosEngine {
             super::child_status::CHILD_STATUS_POINTER
         );
 
-        // No auto-detected browser-login domain list here, deliberately:
+        // INVARIANT: No auto-detected browser-login domain list here, deliberately:
         // `docs/adr/0067-browser-login-domains-never-reach-the-prompt.md`.
 
-        // A read that FAILED is not a workspace with no apps, and the prompt
+        // INVARIANT: A read that FAILED is not a workspace with no apps, and the prompt
         // renders the two identically. So the agent tells the user they have
         // none, and nothing anywhere says the scan broke. Same treatment as the
         // preference read above: degrade the turn, but name what happened.
@@ -901,7 +745,6 @@ pub(crate) impl LucidosEngine {
             }
         };
 
-        // The turn's own capability snapshot, not a second scan of `data/`.
         let intents_section =
             super::workspace_prompt_footprint::build_intents_section(&capabilities.intents);
 
@@ -911,7 +754,6 @@ pub(crate) impl LucidosEngine {
             &app_knowhow_summaries,
         );
 
-        // Engine-shipped reference, never overrideable by a workspace file.
         let system_knowhow_section = build_system_knowhow_section(&self.system_knowhow_summaries());
 
         let system_prompt = format!(
@@ -945,9 +787,6 @@ pub(crate) impl LucidosEngine {
             section
         };
 
-        // ADR 0085 decision 8: the standing re-read rule belongs in the cached
-        // prefix, because it never changes. Empty when the mode is off, so the
-        // control arm's prompt is byte-identical to a build without the mode.
         let system_prompt = format!(
             "{}{}",
             system_prompt,
@@ -987,10 +826,6 @@ Do NOT refuse to discuss the user's own personal information from their own file
     )
 }
 
-/// The tools a chat turn offers under `gates`, in wire order, before the MCP
-/// slice: the flat schemas, the notification tool, the grouped manifest tools,
-/// then the chat tail. A sub-thread with no wake mode adds `wake_parent` after
-/// them (see `chat_turn_tools`), which no workspace-wide budget counts.
 pub(crate) fn chat_tools(
     gates: &crate::llm::ToolCapabilities,
 ) -> Vec<crate::llm::provider::ToolDefinition> {
@@ -1001,8 +836,6 @@ pub(crate) fn chat_tools(
     tools
 }
 
-/// The hand-written flat tool schemas in [`chat_tools`]: everything but the
-/// grouped manifest tools, which have their own owner and meter area.
 pub(crate) fn flat_chat_tools(
     gates: &crate::llm::ToolCapabilities,
 ) -> Vec<crate::llm::provider::ToolDefinition> {
@@ -1017,7 +850,6 @@ pub(crate) fn flat_chat_tools(
         .collect()
 }
 
-/// Characters a tool schema costs on the wire, as the provider sees it.
 pub(crate) fn wire_chars(tool: &crate::llm::provider::ToolDefinition) -> usize {
     serde_json::to_string(tool)
         .expect("a tool schema serializes")
@@ -1025,14 +857,6 @@ pub(crate) fn wire_chars(tool: &crate::llm::provider::ToolDefinition) -> usize {
         .count()
 }
 
-/// The *system prompt footprint*: the text Lucidos itself sends on every chat
-/// turn, area by area, so a report says WHICH one grew.
-///
-/// Only the tool schemas follow `gates`. Every other area is billed at its
-/// worst case, because it is engine text whose variant a workspace setting or
-/// build state picks. A user-written *response style* is workspace content, so
-/// the body bills the widest shipped style instead. The ratchet
-/// `always_loaded_context_stays_under_budget` calls this with its billed set.
 pub(crate) fn system_prompt_footprint(
     gates: &crate::llm::ToolCapabilities,
     system_knowhow: &[crate::core::KnowhowSummary],
@@ -1044,9 +868,6 @@ pub(crate) fn system_prompt_footprint(
         ENGINE_BUILD_POINTER,
     };
 
-    // Neither source variant nor memory module is uniformly larger, so all
-    // four bodies are measured. The context mode is billed OFF: its todo rule
-    // is 31 chars longer, against a `todo_write` schema it takes away.
     let widest_style = crate::core::response_style::widest_shipped_section();
     let child_cap = crate::engine::thread_queue::DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD;
     let body = [(true, false), (false, false), (true, true), (false, true)]
@@ -1073,19 +894,13 @@ pub(crate) fn system_prompt_footprint(
         .sum();
     let knowhow = build_system_knowhow_section(system_knowhow).chars().count();
 
-    // Both halves of each ADR 0084 split: the pointer in the cached system
-    // block and the reading in the message tail.
     let engine_build = ENGINE_BUILD_POINTER.chars().count()
         + build_statuses()
             .into_iter()
             .map(|status| engine_build_block(&status).chars().count())
             .max()
             .expect("build states");
-    // The URL itself is a runtime reading, so only the pointer and the
-    // block's delimiters are engine text.
     let client_url = CLIENT_URL_POINTER.chars().count() + client_url_block("").chars().count();
-    // The rows are per-thread readings. Only the pointer and the failed-read
-    // notice, the block's one fixed body, are engine text.
     let child_status = super::child_status::CHILD_STATUS_POINTER.chars().count()
         + super::child_status::render_child_status(Err(()))
             .chars()
@@ -1096,7 +911,6 @@ pub(crate) fn system_prompt_footprint(
             .chars()
             .count();
 
-    // Sent with or without a widget, at the wider `automatic_widgets` form.
     let widgets_rules = [true, false]
         .into_iter()
         .map(|automatic| {
@@ -1108,8 +922,6 @@ pub(crate) fn system_prompt_footprint(
         })
         .max()
         .expect("two forms");
-    // The built-in widgets ship with the engine, and every workspace lists
-    // them. So their lines and the list's header are engine text (ADR 0415).
     let built_in_widgets = crate::engine::widget_guidance::widgets_list(built_in_widgets)
         .chars()
         .count();
@@ -1786,29 +1598,14 @@ mod tests {
     /// Raised by 133 to a measured 136,865 for ahead-of-run trigger grants:
     /// `program_grants` and `folder_grants` let an agent ask for a trigger's
     /// grants when it creates the trigger, before any run fails.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 136_865;
+    ///
+    /// Raised by 503 to a measured 137,368 for event hooks (ADR 0746): the
+    /// `event-hooks` and `building-a-software-factory` routing lines, and the
+    /// workspace assets route to the first. A hook fails closed, so one an
+    /// agent improvises can stop a workspace's progress. Both descriptions were
+    /// cut to about 180 characters first.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 137_368;
 
-    /// The gate set the ratchet bills.
-    ///
-    /// Mirrors the tool splice in `chat::process::run`, minus the two parts
-    /// that are not engine-authored text: tools discovered from running MCP
-    /// servers, and `generate_image` (present only when an image provider is
-    /// configured).
-    ///
-    /// **Every capability gate is resolved OPEN here except two**, which is
-    /// the same set this measured before ADR 0088 gated anything. The meter is
-    /// the engine-authored surface, not one workspace's array, so a gate
-    /// closing somewhere reclaims nothing this ratchet may spend.
-    ///
-    /// The two are the image provider and the judgment provider. Both open on
-    /// a third-party credential almost no workspace holds, and neither was in
-    /// the measured set. Billing them would spend the ratchet on prose the
-    /// common workspace is never sent.
-    ///
-    /// The context mode is the exception, and it is that same rule applied.
-    /// The mode CLOSES a family rather than opening one: it takes `todo_write`
-    /// away. Billing it on would reclaim a schema almost every workspace pays
-    /// for, so the meter bills the mode OFF, which is the larger array.
     const BILLED: ToolCapabilities = ToolCapabilities {
         email_account: true,
         image_provider: false,
@@ -1817,13 +1614,10 @@ mod tests {
         memory_tree: false,
     };
 
-    /// The flat tool schemas the ratchet bills.
     fn flat_chat_tools() -> Vec<crate::llm::provider::ToolDefinition> {
         super::flat_chat_tools(&BILLED)
     }
 
-    /// The `n` costliest tool schemas, so a breach names the tool that grew
-    /// rather than only the area it sits in.
     fn largest_tool_schemas(n: usize) -> String {
         let mut tools = flat_chat_tools();
         tools.extend(crate::capability_manifest::llm_tools());
@@ -1840,9 +1634,6 @@ mod tests {
             .join("\n")
     }
 
-    /// Every tool in one area, costliest first, with its area total. The
-    /// per-tool ceiling test and the budget test both print a truncated
-    /// ranking; this is the whole thing, for a trim that has to see the tail.
     fn full_ranking(label: &str, tools: &[crate::llm::provider::ToolDefinition]) -> String {
         let mut rows: Vec<(usize, &str)> = tools
             .iter()
@@ -1858,36 +1649,8 @@ mod tests {
         format!("{label} ({} tools, {total} chars):\n{body}", rows.len())
     }
 
-    /// Ceiling on ONE tool schema's JSON wire form, flat or grouped.
-    ///
-    /// `ALWAYS_LOADED_BUDGET_CHARS` is a single total, which lets one runaway
-    /// schema hide behind twenty lean ones. Same reasoning as
-    /// `system_knowhow_descriptions_stay_routing_sized`, which caps each
-    /// frontmatter `description` rather than their sum.
-    ///
-    /// Most tools clear this by a wide margin. The few that do not are
-    /// enumerated in [`PER_TOOL_CEILING_EXCEPTIONS`] with a reason each, so one
-    /// more is a deliberate act rather than a drift.
-    ///
-    /// The number is chosen against the FROZEN CONTRACT rather than picked
-    /// round: strip every `description` from a schema (what
-    /// `print_frozen_tool_contract` dumps) and what remains is the part a trim
-    /// may not touch. For all but the exceptions that floor is a few hundred
-    /// characters, so 1,500 leaves room for prose without inviting any.
     const PER_TOOL_SCHEMA_CEILING_CHARS: usize = 1_500;
 
-    /// The tools allowed past [`PER_TOOL_SCHEMA_CEILING_CHARS`], each with the
-    /// reason its schema is structurally larger than the rest.
-    ///
-    /// Every value is a RATCHET set just above where the schema sits, so
-    /// growing one of these is as deliberate as adding a row. A reason that is
-    /// only "it is long" does not belong here: the test is what stops a schema
-    /// re-accumulating the prose the prompt and the knowhow already own.
-    ///
-    /// Each reason names the STRUCTURE that cannot shrink.
-    /// `print_frozen_tool_contract` dumps the floor behind it. Where a ceiling
-    /// sits far above that floor, the gap is prose that other tests pin phrase
-    /// by phrase, and the reason enumerates it.
     const PER_TOOL_CEILING_EXCEPTIONS: &[(&str, usize, &str)] = &[
         (
             "create_app",
@@ -2101,8 +1864,6 @@ mod tests {
         ),
     ];
 
-    /// Caps ONE tool schema, so a single runaway cannot hide inside a total
-    /// that still passes. See [`PER_TOOL_SCHEMA_CEILING_CHARS`].
     #[test]
     fn no_single_tool_schema_dominates_the_always_loaded_budget() {
         let mut tools = flat_chat_tools();
@@ -2130,9 +1891,6 @@ mod tests {
             }
         }
 
-        // An exception whose tool has since been renamed or deleted silently
-        // stops covering anything, and an exception the tool no longer needs
-        // is a licence nobody is using. Both are drift, so both fail here.
         for (name, ceiling, _) in PER_TOOL_CEILING_EXCEPTIONS {
             let Some(tool) = tools.iter().find(|t| t.name == *name) else {
                 panic!(
@@ -2164,16 +1922,6 @@ mod tests {
         );
     }
 
-    /// Diagnostic dump, not an assertion: what a workspace is actually SENT,
-    /// at each gate setting.
-    ///
-    /// The sibling ranking below measures the engine-authored surface, which
-    /// is deliberately gate-blind. This one answers the other question, the
-    /// one ADR 0088 priced: how many characters does THIS workspace pay for.
-    /// Note it sums the schema objects only, so the array's own brackets and
-    /// separators (73 characters at 72 tools) are not in the figure.
-    ///
-    ///   cargo test -p lucidos-engine --lib print_gated_array_sizes -- --ignored --nocapture
     #[test]
     #[ignore]
     fn print_gated_array_sizes() {
@@ -2209,15 +1957,6 @@ mod tests {
         }
     }
 
-    /// Diagnostic dump, not an assertion: every tool schema ranked by wire
-    /// cost, both areas, no truncation.
-    ///
-    /// `always_loaded_context_stays_under_budget` prints only the top ten,
-    /// which spots a regression but hides the tail: twenty 1,200-char schemas
-    /// are another 24k and none of them reaches that list. Run before and after
-    /// a trim to record per-tool deltas.
-    ///
-    ///   cargo test -p lucidos-engine --lib print_full_tool_schema_ranking -- --ignored --nocapture
     #[test]
     #[ignore]
     fn print_full_tool_schema_ranking() {
@@ -2231,22 +1970,9 @@ mod tests {
         );
     }
 
-    /// Diagnostic dump, not an assertion: every tool's name and `parameters`
-    /// JSON with all `description` keys stripped, recursively.
-    ///
-    /// What survives the strip IS the callable contract: property names, types,
-    /// enum values, `oneOf` / `anyOf` branches, `minItems` / `maxItems`, nesting
-    /// and `required` sets. A prose-only trim must leave this output
-    /// byte-identical, which makes "did I change what the model is allowed to
-    /// call?" a diff rather than a judgment. The tool `description` is excluded
-    /// for the same reason the per-property ones are: it is the prose under
-    /// trim.
-    ///
-    ///   cargo test -p lucidos-engine --lib print_frozen_tool_contract -- --ignored --nocapture
     #[test]
     #[ignore]
     fn print_frozen_tool_contract() {
-        /// Drop every `description` key, at every depth, in a stable order.
         fn strip(value: &serde_json::Value) -> serde_json::Value {
             match value {
                 serde_json::Value::Object(map) => serde_json::Value::Object(
@@ -2264,8 +1990,6 @@ mod tests {
 
         let mut tools = flat_chat_tools();
         tools.extend(crate::capability_manifest::llm_tools());
-        // Sorted so a splice-order change is visible as a reorder rather than
-        // as a whole-file diff.
         tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         for tool in &tools {
@@ -2277,9 +2001,6 @@ mod tests {
         }
     }
 
-    /// I12: the trigger rules stay system-tier, where an injected intent body
-    /// cannot outweigh them. They ride in the static body, which every chat and
-    /// trigger turn shares, so a fire's system block equals a chat turn's.
     #[test]
     fn the_trigger_rules_ride_in_the_static_body_of_every_turn() {
         for source in [true, false] {
@@ -2294,9 +2015,6 @@ mod tests {
         }
     }
 
-    /// The first chat turn asks for technical literacy. Every value the
-    /// instruction tells the model to store must be one the catalog accepts,
-    /// or the turn stays in setup mode for good.
     #[test]
     fn mandatory_setup_asks_for_technical_literacy_with_storable_values() {
         use crate::core::technical_literacy::SETTABLE_IDS;
@@ -2320,15 +2038,12 @@ mod tests {
             !instruction.contains("everyday"),
             "the merged level is never offered"
         );
-        // The card copy is pinned, so every first-run card reads the same.
         for level in crate::core::technical_literacy::TechnicalLiteracy::ALL {
             let option = format!("\"{}\" / \"{}\"", level.card_label(), level.card_line());
             assert!(instruction.contains(&option), "the card lacks {option}");
         }
     }
 
-    /// Only a person on a device can answer a setup question. A trigger fire,
-    /// or a sub-thread or task with no sending device, must never stop on one.
     #[test]
     fn only_a_turn_sent_from_a_device_enters_setup_mode() {
         assert_eq!(setup_device(false, Some("laptop")), Some("laptop"));
@@ -2346,8 +2061,6 @@ mod tests {
         assert!(configured.contains("Always respond in English."));
     }
 
-    /// The user's own style text is spliced last, so a placeholder it names
-    /// reaches the model as typed and is never expanded.
     #[test]
     fn a_style_naming_a_placeholder_reaches_the_body_verbatim() {
         let style = "\nRESPONSE STYLE: cite __MAX_TOOL_CALLS__ and \
@@ -2383,8 +2096,6 @@ mod tests {
         .unwrap()
     }
 
-    /// A failed preference read is not an unset preference. With the database
-    /// gone the turn must not flip into setup mode and refuse the request.
     #[tokio::test]
     async fn an_unreadable_preference_is_configured_not_setup_required() {
         use super::SystemPromptExt;
@@ -2431,8 +2142,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// The built prompt is a cached tier. It points at the clock, build state
-    /// and client URL, and carries none of their readings.
     #[tokio::test]
     async fn the_built_prompt_carries_no_per_turn_reading() {
         use super::SystemPromptExt;
@@ -2470,12 +2179,6 @@ mod tests {
         crate::test_support::teardown_test_db(&db).await;
     }
 
-    /// Standard costs the prompt nothing, to the character.
-    ///
-    /// This is the promise the whole setting rests on: a workspace that never
-    /// opens it reads exactly what it read before. So the placeholder sits at
-    /// the END of a line rather than on one of its own. Resolving it to `""`
-    /// then leaves no orphan newline behind.
     #[test]
     fn the_standard_body_is_byte_identical_to_a_build_with_no_style() {
         let standard = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
@@ -2487,8 +2190,6 @@ mod tests {
         ));
     }
 
-    /// A chosen style adds its section and NOTHING else. Equal lengths would
-    /// not prove that, so this pins where the text lands as well as its size.
     #[test]
     fn a_chosen_style_adds_exactly_its_own_section() {
         let section = crate::core::response_style::widest_shipped_section();
@@ -2497,15 +2198,11 @@ mod tests {
 
         assert_eq!(styled.len(), standard.len() + section.len());
         assert!(styled.contains("RESPONSE STYLE:"));
-        // Directly after the conversation-style bullets, which is the rule it
-        // overrides. Separated, and the two contradict each other in place.
         assert!(styled.contains(&format!(
             "- Create artifacts as the conversation progresses, not all at once.{section}"
         )));
     }
 
-    /// Whatever the user selects, the section is the one the library rendered.
-    /// Nothing here re-derives it, so a reworded style cannot land half-applied.
     #[test]
     fn each_shipped_style_splices_its_own_block_and_no_others() {
         use crate::core::response_style;
@@ -2537,11 +2234,6 @@ mod tests {
         }
     }
 
-    /// The prompt never orders a tool call the mode has withdrawn.
-    ///
-    /// `todo_write` is absent from the mode-on tools array, so the base body's
-    /// standing "call it at the start" instruction was unfollowable on every
-    /// mode-on turn. The list lives under a `[TODO]` heading instead.
     #[test]
     fn the_mode_on_body_points_at_the_todo_heading_rather_than_the_tool() {
         let off = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
@@ -2561,10 +2253,6 @@ mod tests {
         );
     }
 
-    /// The browser is the slowest and most fragile way to reach a service, yet
-    /// BROWSER TOOLS gave no order. So nothing kept the agent off a site that
-    /// a configured proxy or an MCP tool already served. The section must name
-    /// both before the browser, and make the fallback visible to the user.
     #[test]
     fn the_browser_section_prefers_a_proxy_or_mcp_tool_and_says_when_it_falls_back() {
         let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
@@ -2586,9 +2274,6 @@ mod tests {
         );
     }
 
-    /// On a Linux cloud instance the agent told the user "your Mac runs
-    /// Lucidos", because the only machine it was shown was the browser's.
-    /// The prompt must name the host the tools really run on.
     #[test]
     fn the_prompt_names_the_engine_host_and_parts_it_from_the_users_device() {
         let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
@@ -2609,10 +2294,6 @@ mod tests {
         );
     }
 
-    /// A nightly orchestrator armed `await_event` on its own child's
-    /// `CodingAgentIdled`, though the fan-in re-opens it anyway. The FAN-OUT
-    /// section named the callback only in passing, so the rule has to be
-    /// stated where the model spawns, with every finishing event named.
     #[test]
     fn the_fan_out_section_says_a_direct_child_reports_back_on_its_own() {
         let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
@@ -2630,14 +2311,11 @@ mod tests {
             "`CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`",
             "`interrupted`",
             "a grandchild reports to your child, not you",
-            // I12 of the wake-mode plan: the modes, the defaults, and when a
-            // failure wakes (ADR 0545).
             "'wake' re-opens it for any report",
             "The spawn's `wake_mode` decides",
             "'no-wake' FILES every report for your next turn",
             "Default: 'no-wake' from the home thread, 'wake' elsewhere",
             "The mode lasts the child's life",
-            // ADR 0473: work this thread will not act on is a top-thread.
             "WON'T ACT ON THE RESULT? relation='top'",
         ] {
             assert!(
@@ -2647,9 +2325,6 @@ mod tests {
         }
     }
 
-    /// The batch rule removes rounds only if the model reads it as general.
-    /// Its two carve-outs are what keep "batch" from reaching a question card
-    /// or a spawn that depends on the one before it.
     #[test]
     fn the_batch_rule_is_general_and_keeps_both_carve_outs() {
         let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
@@ -2672,10 +2347,6 @@ mod tests {
         );
     }
 
-    /// Scoped to "Before creating", the block leaves "run my digest trigger
-    /// now" with no route. The agent then guesses and resumes a paused trigger,
-    /// which only restores the schedule and runs nothing. Narrowing the trigger
-    /// row back to create/update reopens exactly that gap.
     #[test]
     fn workspace_assets_rule_routes_existing_trigger_operations() {
         let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
@@ -2692,14 +2363,10 @@ mod tests {
             rule.contains("ANY action"),
             "the trigger row must not narrow back to create/update:\n{rule}"
         );
-        // The action that does the job. Before it existed the rule said "there
-        // is NO run now action"; once that sentence is a lie the agent is back
-        // to improvising, so the route must name the real action.
         assert!(
             rule.contains("triggers(action=\"run\")"),
             "the rule must name the action that runs a trigger off-schedule:\n{rule}"
         );
-        // The specific wrong guess the incident produced.
         assert!(
             rule.contains("resuming a paused trigger does not run it"),
             "must pre-empt the resume-means-run guess:\n{rule}"
@@ -2710,8 +2377,6 @@ mod tests {
         );
     }
 
-    /// Scoped to "packaging", the plugin row leaves "publish this plugin" with
-    /// no route, and a model that reads the rule literally skips the knowhow.
     #[test]
     fn workspace_assets_rule_routes_existing_plugin_operations() {
         let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
@@ -2732,12 +2397,6 @@ mod tests {
         }
     }
 
-    /// The route has to survive the ACTION FIRST rule that follows it in the
-    /// prompt. That rule says "Don't ask clarifying questions" and excepts only
-    /// workspace assets, so without an explicit carve-out the agent reads the
-    /// interview request as a normal request, skips the ladder, and builds
-    /// something generic on turn one. The carve-out IS the feature here: the
-    /// questions are the work.
     #[test]
     fn setup_interview_rule_carves_itself_out_of_action_first() {
         assert!(
@@ -2747,9 +2406,6 @@ mod tests {
         );
     }
 
-    /// On an install with no source checkout the prompt must say so outright.
-    /// Otherwise the agent claims to have read the source, spawns a coding
-    /// agent, and tells the user to Apply and rebuild.
     #[test]
     fn no_source_variant_denies_editing_lucidos_and_names_what_works() {
         let section = coding_surface_section(false);
@@ -2767,8 +2423,6 @@ mod tests {
             "must warn that the no-`folder` spawn is refused, so the agent \
              doesn't narrate a session it can't start:\n{section}"
         );
-        // The two escalations that made this user-visible: inventing source
-        // knowledge, and prescribing an apply/rebuild that cannot happen.
         assert!(
             section.contains("NEVER say or imply you have read"),
             "must forbid claiming to have read the source:\n{section}"
@@ -2777,19 +2431,12 @@ mod tests {
             section.contains("NEVER tell the user to Apply, rebuild, or restart"),
             "must forbid the apply/rebuild instruction:\n{section}"
         );
-        // A denial with no alternative just invites a retry.
         assert!(
             section.contains("data/apps/<id>") && section.contains("manage_repositories"),
             "must name the app + external-repo routes that still work:\n{section}"
         );
     }
 
-    /// The denial is about THIS install, not about the agent. A workspace with
-    /// a source checkout is served by another install, which
-    /// `run_coding_agent(workspace=…)` cannot reach: it resolves a bare name
-    /// beside this install's own workspaces. The CLI's `--to <absolute path>`
-    /// is the route that works, and the prompt must name it before the agent
-    /// tries the tool.
     #[test]
     fn no_source_variant_routes_platform_work_to_another_install_via_the_cli() {
         let section = coding_surface_section(false);
@@ -2808,7 +2455,6 @@ mod tests {
             "must say the tool cannot cross installs, or the agent tries it \
              first:\n{section}"
         );
-        // The refusal has to be scoped, or the carve-out above contradicts it.
         assert!(
             section.contains("every workspace this install serves")
                 && section.contains("local coding agent"),
@@ -2817,7 +2463,6 @@ mod tests {
         );
     }
 
-    /// The dev variant keeps today's behaviour: platform source is editable.
     #[test]
     fn source_variant_says_the_platform_source_is_editable() {
         let section = coding_surface_section(true);
@@ -2836,8 +2481,6 @@ mod tests {
         );
     }
 
-    /// Exactly two variants, and they genuinely differ. A refactor that
-    /// collapsed them would silently restore the bug on packaged installs.
     #[test]
     fn the_two_variants_are_distinct() {
         assert_ne!(
@@ -2847,10 +2490,6 @@ mod tests {
         );
     }
 
-    /// The apply/verify split: `changes` guidance is install-independent (app
-    /// coding-agent threads still produce changes on a packaged install), while
-    /// the engine rebuild/restart choreography is dev-only, because a packaged
-    /// install never rebuilds from source.
     #[test]
     fn apply_verify_rule_keeps_changes_guidance_and_quarantines_the_rebuild_dance() {
         assert!(
@@ -2872,9 +2511,6 @@ mod tests {
         );
     }
 
-    /// A prompt that pre-writes a conclusion invites the model to reach for the
-    /// words rather than run the check. So no wording for an unverified outcome
-    /// may live here.
     #[test]
     fn the_addendum_supplies_no_sentence_for_an_unverified_outcome() {
         assert!(
@@ -2888,10 +2524,6 @@ mod tests {
         );
     }
 
-    /// The other half of that failure, and the reason pointing at the section
-    /// is not enough on its own: the prescribed probe cannot answer for a
-    /// backend-only change, because such a change alters no served asset. The
-    /// rule has to say so, or a diligent agent still has no method.
     #[test]
     fn the_addendum_scopes_the_probe_to_what_it_can_answer() {
         assert!(
@@ -2905,9 +2537,6 @@ mod tests {
         );
     }
 
-    /// The rule must state an ORDER. Phrased as a review step, it fires once
-    /// the model has decided what it thinks, which is precisely when it will
-    /// not go and check.
     #[test]
     fn the_look_rule_states_an_order_not_a_review() {
         assert!(
@@ -2920,8 +2549,6 @@ mod tests {
         );
     }
 
-    /// The specific claim that went wrong, banned by name. Asserting absence
-    /// from an absence of evidence is the one failure this rule exists for.
     #[test]
     fn the_look_rule_bans_asserting_a_negative_unchecked() {
         assert!(
@@ -2934,9 +2561,6 @@ mod tests {
         );
     }
 
-    /// A thread verdict needs a read in the same turn, in every reply. The Home
-    /// agent called a working thread stalled from its own earlier reply. Later
-    /// it said a child was "still waiting" from a report the child had outlived.
     #[test]
     fn the_look_rule_bans_a_thread_verdict_from_history() {
         let rule = LOOK_BEFORE_ASSESSING_RULE;
@@ -2958,8 +2582,6 @@ mod tests {
         );
     }
 
-    /// It has to name the two tools, or it is an instruction with no verb: the
-    /// agent is told to look and not told what to look with.
     #[test]
     fn the_look_rule_names_the_two_searches_and_bounds_them() {
         assert!(
@@ -2981,9 +2603,6 @@ mod tests {
         );
     }
 
-    /// A Tree turn is not offered the `memory` tool, so its body must never
-    /// send the agent there. Only the two memory sections may differ, so the
-    /// rest of the cached tier is the same bytes on either module.
     #[test]
     fn a_tree_body_names_recall_and_never_the_memory_tool() {
         let classic = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
@@ -3009,48 +2628,32 @@ mod tests {
         );
     }
 
-    /// The prompt's WORKSPACE line must never carry a `$HOME`-rooted absolute
-    /// path. Runs against the REAL `$HOME`, read-only, so it is safe under the
-    /// parallel test runner and fails on the very machine that would leak.
     #[test]
     fn workspace_line_abbreviates_home_and_leaks_no_absolute_home_path() {
         let home = std::env::var("HOME").expect("HOME must be set to run this test");
         let workspace = PathBuf::from(&home).join("workspaces/myws");
 
-        // The real timezone section, so the splice is checked against what
-        // ships rather than a stand-in.
         let timezone = super::super::turn_clock::timezone_section("Europe/Oslo");
         let section =
             workspace_identity_section("myws", &workspace, &timezone, "USER LANGUAGE: English");
 
-        // Still identified by name and by the shape of its path, so the agent
-        // loses no usable context.
         assert!(section.contains("WORKSPACE: myws (~/workspaces/myws)"));
-        // The home dir's own name never reaches the model provider.
         assert!(
             !section.contains(&home),
             "identity section still carries the home-rooted absolute path {home}:\n{section}"
         );
 
-        // The surrounding sections are still spliced in.
         assert!(section.contains("USER TIMEZONE: Europe/Oslo"));
         assert!(section.contains("TIMEZONE HANDLING:"));
         assert!(section.contains("USER LANGUAGE: English"));
         assert!(section.contains("PERSONAL DATA ACCESS:"));
 
-        // The reading itself moved to the message tail, and the identity
-        // section is the front of a cached tier: a clock here rewrites all of
-        // it every turn. `turn_clock` owns the rule.
         assert!(
             !section.contains("CURRENT TIME:"),
             "the cached identity section must carry no clock reading:\n{section}"
         );
     }
 
-    /// Nothing the user can see is labelled with a change id, so a question
-    /// that quotes one is unanswerable. The rule must ban raw ids in prose,
-    /// questions and option labels, say what to use instead, and keep ids legal
-    /// in tool arguments.
     #[test]
     fn names_not_ids_rule_bans_raw_ids_in_user_facing_text() {
         let rule = NAMES_NOT_IDS_RULE;
@@ -3065,39 +2668,25 @@ mod tests {
                 "rule must ban raw identifiers in user-facing text (`{needle}`):\n{rule}"
             );
         }
-        // A ban with no alternative just makes the agent vague.
         assert!(
             rule.contains("thread_title") && rule.contains("its subject line, never the sha"),
             "rule must name the human-readable substitute for each thing:\n{rule}"
         );
-        // Presentation-only: the model must keep passing `change_id` to the
-        // apply action. Over-correcting here breaks applying, not just wording.
         assert!(
             rule.contains("changes(action='apply', change_id="),
             "rule must keep ids legal in tool arguments:\n{rule}"
         );
-        // `run_thread` / `run_coding_agent` results tell the agent verbatim to
-        // reply with `[Open thread](thread:<ws>/<uuid>)`. Without this
-        // carve-out the rule reads as a ban on that link, and the user loses
-        // the only way to open the thread the agent just spawned.
         assert!(
             rule.contains("A MARKDOWN LINK TARGET IS NOT PROSE")
                 && rule.contains("[Open thread](thread:<ws>/<uuid>)"),
             "rule must exempt markdown link targets so spawned-thread links survive:\n{rule}"
         );
-        // A trigger link is the case the carve-out was reported missing on: the
-        // agent read the ban as covering the id in the target and linked the
-        // Triggers PANEL instead of the trigger. The exemption must name the
-        // form and say which half of the link the name goes in.
         assert!(
             rule.contains("(trigger:<id>)") && rule.contains("The NAME goes in the label"),
             "rule must exempt the trigger link form and place the name in the label:\n{rule}"
         );
     }
 
-    /// The rule has to carry two things: the prohibition, and what to do
-    /// instead. An agent that only knows it may not work around a tool still
-    /// has to be told that reporting the block IS the correct turn.
     #[test]
     fn no_impersonation_rule_bans_the_workaround_and_names_the_honest_move() {
         let rule = NO_IMPERSONATION_RULE;
@@ -3120,20 +2709,12 @@ mod tests {
             "rule must tell the agent to report the block AND offer an alternative, \
              or a refusal just becomes a dead end:\n{rule}"
         );
-        // The engine refuses these requests too, but a rule that leans on the
-        // block invites hunting for the gap. Say the block exists and then say
-        // not to probe it.
         assert!(
             rule.contains("do not go looking for the edge it misses"),
             "rule must not read as an invitation to find the engine's gap:\n{rule}"
         );
     }
 
-    /// The rule once offered "acting in another workspace" as an example of
-    /// something no tool covers. It is not: `lucidos spawn-thread --to` does
-    /// it, and a chat thread that believed the rule told the user the whole
-    /// capability was impossible. A refusal rule may only cite REAL refusals,
-    /// so this pins the example out and the correction in.
     #[test]
     fn no_impersonation_rule_does_not_call_cross_workspace_impossible() {
         let rule = NO_IMPERSONATION_RULE;
@@ -3148,9 +2729,6 @@ mod tests {
         );
     }
 
-    /// An answer written before the card may reach the user only as a summary,
-    /// so the chat rule routes it into the card's `message`. The coding-agent
-    /// half lives beside those rules in `agent_session::prompts`.
     #[test]
     fn the_chat_rule_routes_the_answer_into_the_card_message() {
         assert!(ASK_USER_QUESTION_RULE.contains("PUT THE ANSWER IN ITS `message`"));
@@ -3158,10 +2736,6 @@ mod tests {
         assert!(ASK_USER_QUESTION_RULE.contains("links, pictures and drafts"));
     }
 
-    /// Lucidos has no text-entry option, so tapping an "Other, I'll type it"
-    /// button returns that label as the user's answer. The rule must ban the
-    /// option, explain WHY, and name both real escapes. Otherwise the agent
-    /// keeps inventing the button to fill a gap that does not exist.
     #[test]
     fn ask_user_question_rule_bans_a_text_entry_escape_option() {
         let rule = ASK_USER_QUESTION_RULE;
@@ -3177,28 +2751,19 @@ mod tests {
                 "rule must ban the escape-hatch option and name the real escapes (`{needle}`):\n{rule}"
             );
         }
-        // The sentence that produced the button lived in the `ask_user_question`
-        // tool description (retired there, pinned by its own test). Guard
-        // against it migrating here, where it would contradict the ban above.
         assert!(
             !rule.contains("Always include an option that lets the user opt out"),
             "the retired opt-out instruction must not reappear in the chat rule:\n{rule}"
         );
-        // An option carrying a real decision is NOT what this bans. Without the
-        // carve-out the agent reads it as "never offer an out" and drops
-        // legitimate Cancel-style choices.
         assert!(
             rule.contains("None of these") && rule.contains("still welcome"),
             "rule must keep a meaningful opt-out option legal:\n{rule}"
         );
     }
 
-    /// Abbreviation is a `$HOME`-prefix collapse, not a blanket redaction: a
-    /// workspace mounted outside the home dir keeps its real path.
     #[test]
     fn workspace_outside_home_keeps_its_absolute_path() {
         let outside = Path::new("/srv/lucidos/ws");
-        // Guard the (absurd but cheap to rule out) case of $HOME being /srv.
         let home = std::env::var("HOME").expect("HOME must be set to run this test");
         assert!(!outside.starts_with(&home), "test fixture overlaps $HOME");
 
@@ -3206,7 +2771,6 @@ mod tests {
         assert!(section.contains("WORKSPACE: shared (/srv/lucidos/ws)"));
     }
 
-    /// A routine trigger run says no. The engine reviews a yes.
     #[test]
     fn the_trigger_rule_has_the_engine_review_a_yes() {
         let rule = SYSTEM_PROMPT_BASE
@@ -3230,16 +2794,10 @@ mod tests {
         );
     }
 
-    /// Three things have to hold together. The destination question must be
-    /// present, the duration question must SURVIVE beside it (a rule that only
-    /// says "in this thread means await_event" pushes a genuine standing rule
-    /// into a one-shot wait), and neither may overclaim: a trigger reaches the
-    /// user perfectly well, just not inside the conversation they typed into.
     #[test]
     fn trigger_vs_event_wait_rule_routes_on_destination_without_overclaiming() {
         let rule = TRIGGER_VS_EVENT_WAIT_RULE;
 
-        // Destination: the axis that was missing everywhere.
         assert!(
             rule.contains("WHERE"),
             "the destination question has to be asked explicitly:\n{rule}"
@@ -3255,30 +2813,23 @@ mod tests {
              pre-empt exactly that reading:\n{rule}"
         );
 
-        // Duration: the axis that already existed, which must not be lost.
         assert!(
             rule.contains("one-shot") && rule.contains("outlive this conversation"),
             "dropping the duration half routes standing rules into a wait that \
              stops after one match:\n{rule}"
         );
 
-        // Both mechanisms named, so neither half is a dead end.
         assert!(
             rule.contains("await_event") && rule.contains("trigger"),
             "a fork has to name both branches:\n{rule}"
         );
 
-        // No overclaim. A trigger notifying the user is its normal, correct
-        // behaviour; only in-conversation delivery is out of reach.
         assert!(
             rule.contains("reaches the user as a notification"),
             "must say what a trigger DOES do, or it reads as 'triggers cannot \
              tell me anything':\n{rule}"
         );
 
-        // The heading is a cross-reference anchor: the "WAITING FOR A STATE
-        // CHANGE IN LUCIDOS" section points the model back here by name, and
-        // that pointer is the only route from the duration half to this one.
         assert!(
             rule.starts_with("\"TELL ME WHEN X HAPPENS\""),
             "the state-change section names this block by its opening heading; \
@@ -3286,8 +2837,6 @@ mod tests {
         );
     }
 
-    /// The prompt states the child cap the guard enforces: the live policy
-    /// value. It says the limit is on children at the same time.
     #[test]
     fn the_body_states_the_child_cap_it_was_given() {
         let body = static_prompt_body(false, 500, 4, ContextMode::Off, false, "");
@@ -3312,8 +2861,6 @@ mod tests {
     mod guard_tests {
         use super::*;
 
-        /// The always-loaded areas, measured separately so a regression report
-        /// says WHICH one grew.
         fn always_loaded_areas() -> Vec<(&'static str, usize)> {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
             let ws = tempfile::tempdir().expect("temp workspace");
@@ -3329,12 +2876,6 @@ mod tests {
             )
         }
 
-        /// Makes a prompt-budget regression visible at `cargo test` rather than in
-        /// a token bill.
-        ///
-        /// Prints the per-area breakdown on failure AND on success under
-        /// `--nocapture`, so re-measuring after a deliberate addition costs one
-        /// command rather than a fresh harness.
         #[test]
         fn always_loaded_context_stays_under_budget() {
             let areas = always_loaded_areas();
@@ -3361,19 +2902,6 @@ mod tests {
             );
         }
 
-        /// Every `system-knowhow/<id>` the resident context routes to must resolve
-        /// to a real file. Otherwise `load_knowhow` answers with the not-found
-        /// sentinel, and the agent goes unguided on the request the pointer exists
-        /// to catch.
-        ///
-        /// The per-rule versions of this
-        /// (`workspace_assets_rule_names_only_live_knowhow_ids`,
-        /// `setup_interview_rule_routes_to_a_live_knowhow_id`) check a hand-listed
-        /// set. This one sweeps everything the model is handed: the whole assembled
-        /// prompt body AND every tool schema. A pointer added later is covered the
-        /// moment it is written. Schemas are in scope because they route too.
-        ///
-        /// Ids are filename-derived, so a knowhow rename is what breaks them.
         #[test]
         fn every_knowhow_id_the_resident_context_routes_to_resolves() {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
@@ -3420,20 +2948,6 @@ mod tests {
             );
         }
 
-        /// Every placeholder token in the prompt template must have a matching
-        /// `.replace(...)` in the substitution chain, or the raw token ships to the
-        /// model verbatim.
-        ///
-        /// Nothing else catches this. The tokens are plain text inside a raw string
-        /// literal. A dropped `.replace` compiles clean, passes clippy, and shows up
-        /// only as gibberish in the LLM's context.
-        ///
-        /// The substitution chain is also a standing merge-conflict site. Two
-        /// branches that each add a rule collide on the same line. Picking one side
-        /// drops the other's substitution and leaves its token in the template.
-        ///
-        /// Reads its own source rather than a hand-maintained token list. A new
-        /// rule is covered the moment it is added, with no second list to sync.
         #[test]
         fn every_prompt_placeholder_is_substituted() {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
@@ -3462,26 +2976,6 @@ mod tests {
             );
         }
 
-        /// A direct child's completion is the one state change nobody has to
-        /// subscribe to: the ADR 0011 fan-in re-opens the parent with the child's
-        /// result whether or not a wait exists. Subscribing to it anyway spends a
-        /// subscription and arms a timeout for a wake the thread gets regardless.
-        ///
-        /// **The carve-out is a redundancy, not a limit, and the section has to say
-        /// so in that order.** Worded as a bare "not for a thread you spawned" it
-        /// generalises into "cross-thread waits are unreliable", which is false:
-        /// matching is workspace-wide
-        /// (`a_wait_matches_a_child_completion_belonging_to_another_thread`).
-        ///
-        /// **The condition it names has to be one that exists.** `child_thread_id`
-        /// is a field on `ChildThreadCompleted`, which only the fan-in emits.
-        /// Scoping someone else's session with it matches nothing, and the wait
-        /// never fires. `thread_id` exists on every thread event, supplied by the
-        /// *matchable payload* (`a_wait_scopes_to_one_coding_agent_session_on_every_path`).
-        ///
-        /// Source-scanned like `every_prompt_placeholder_is_substituted`: the
-        /// section is plain text inside [`SYSTEM_PROMPT_BASE`]. Scoped to the
-        /// section, so this test's own prose cannot satisfy or break it.
         #[test]
         fn the_state_change_section_excludes_the_threads_own_child() {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
@@ -3495,8 +2989,6 @@ mod tests {
                 .find(heading)
                 .unwrap_or_else(|| panic!("the prompt no longer has a '{heading}' section"));
             let section = &src[from..];
-            // The section is one unbroken run of bullets, so the next blank line
-            // ends it.
             let section = &section[..section.find("\n\n").unwrap_or(section.len())];
 
             assert!(
@@ -3521,7 +3013,6 @@ mod tests {
              forbids:\n{section}"
             );
 
-            // The defect: a recipe naming a condition the event does not carry.
             assert!(
                 section.contains("thread_id"),
                 "the section must name the condition that scopes a wait to one \
@@ -3535,7 +3026,6 @@ mod tests {
              and the wait then never fires:\n{section}"
             );
 
-            // A set discovered at wait time, and the trap inside it.
             assert!(
                 section.contains("RE-CHECK ON EVERY WAKE"),
                 "one subscription is spent by one event, so waiting on everything \
@@ -3548,8 +3038,6 @@ mod tests {
              section must name the filter that lists it:\n{section}"
             );
 
-            // A condition read as a green light. "Release the patch when the coding
-            // agents are done, auto approved" was acted on immediately.
             assert!(
                 section.contains("PRECONDITION, NOT A GO-AHEAD"),
                 "a 'when X finishes' clause is something to wait for; a \
@@ -3558,15 +3046,6 @@ mod tests {
             );
         }
 
-        /// The FILE REFERENCES block, read out of this file's own source. Both
-        /// tests below assert on the same section, so they take it from here: a
-        /// second copy of the extraction can go stale against the first and report
-        /// green on a section that no longer parses.
-        ///
-        /// Source-scanned and scoped to the section, like
-        /// `the_state_change_section_excludes_the_threads_own_child`: this is plain
-        /// text inside [`SYSTEM_PROMPT_BASE`], and the scoping keeps a caller's own
-        /// prose from satisfying its assertions.
         fn file_references_section() -> String {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
             let path =
@@ -3574,7 +3053,6 @@ mod tests {
             let src = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-            // The heading, not the cross-reference to it in NAMES_NOT_IDS_RULE.
             let from = src
                 .find("FILE REFERENCES:\n")
                 .expect("the prompt no longer has a FILE REFERENCES section");
@@ -3582,10 +3060,6 @@ mod tests {
             section[..section.find("\n\n").unwrap_or(section.len())].to_string()
         }
 
-        /// A trigger was the one first-class thing the agent names in a reply with
-        /// no link form of its own. So it linked the Triggers PANEL, and when told
-        /// to link the trigger it invented `trigger:<id>`, which nothing claimed.
-        /// The section has to carry the form AND keep the two destinations apart.
         #[test]
         fn the_file_references_section_links_a_trigger_not_just_the_panel() {
             let section = file_references_section();
@@ -3606,51 +3080,29 @@ mod tests {
                 "both links exist and mean different things, so the section must \
              say which is which or the panel link keeps winning:\n{section}"
             );
-            // Says WHY the trigger link is worth writing: the row carries the
-            // actions. Drop this and the two links read as interchangeable.
             assert!(
                 section.contains("Run once"),
                 "the section must name what the trigger link lands on:\n{section}"
             );
         }
 
-        /// Asked to show an image, the agent read a PNG, saw it, and wrote the
-        /// bare path. The user got a link and asked "can you not inline it?". It
-        /// then spent eight tool calls grepping this repo and `renderMarkdown.ts`
-        /// to rediscover a capability it already had. That recovery only worked
-        /// because the machine happened to have the Lucidos source checked out.
-        ///
-        /// The section taught "a full path becomes a clickable link" and stopped,
-        /// so a link was the whole vocabulary. Mirrored for coding agents by
-        /// `agent_session::prompts::SHOWING_AN_IMAGE_RULE`, tuned there to
-        /// `lucidos data write` because a worktree cannot write `data/` directly.
-        /// Change both together.
         #[test]
         fn the_file_references_section_says_an_image_is_drawn_not_linked() {
             let section = file_references_section();
             let section = section.as_str();
 
-            // The syntax itself. Naming the concept without the leading `!` is
-            // what left the agent writing a path and calling it shown.
             assert!(
                 section.contains("![what it shows](artifacts/branding/card.png)"),
                 "the section must show the image form, not just name it:\n{section}"
             );
-            // Why a path is not enough. Without the contrast the link rule above
-            // it keeps reading as the complete answer.
             assert!(
                 section.contains("is a LINK"),
                 "the section must tell a link apart from a drawn image:\n{section}"
             );
-            // The half the transcript proves the agent does not know: looking at
-            // an image is not showing it.
             assert!(
                 section.contains("shows it to YOU"),
                 "the section must say a read reaches the agent, not the user:\n{section}"
             );
-            // A coding agent saved a mockup, wrote "I've drawn out the options",
-            // and drew nothing. Saving is not showing either, and a choice between
-            // pictures puts them on the card.
             assert!(
                 section.contains("Saving one shows nothing either"),
                 "the section must say a saved image reaches nobody:\n{section}"
@@ -3659,9 +3111,6 @@ mod tests {
                 section.contains("in an option's description"),
                 "the section must put pictures on the question card:\n{section}"
             );
-            // On Opus 5.5, text followed by any tool call may arrive only as a
-            // summary, which drops the `![...]` line. "Draw it in your reply" sent
-            // pictures there (docs/plans/2026-10-06-chat-pictures-go-in-the-card-message.md).
             assert!(
                 section.contains("text that ENDS your turn")
                     && section.contains("the card's `message`")
@@ -3672,63 +3121,48 @@ mod tests {
                 !section.contains("draw it in your reply"),
                 "a reply followed by a tool call loses the picture:\n{section}"
             );
-            // A coding agent drew colour options in ASCII, then put one sheet of
-            // all four on every option. Mirrors `SHOWING_AN_IMAGE_RULE`.
             assert!(
                 section.contains("never ASCII art")
                     && section.contains("its own picture of only that option"),
                 "the section must show a visual choice as one picture per option:\n{section}"
             );
-            // An option's picture belongs on its own option, never in `message`.
             assert!(
                 section.contains("only that option, in its description, not in `message`"),
                 "an option's picture must go on its own option:\n{section}"
             );
         }
 
-        /// An app link named the app and nothing inside it. So an agent writing a
-        /// per-item artifact into a shared app could only link the app and hope.
-        /// The reader then landed on whatever item they saw last.
-        ///
-        /// Same shape as the image line above, and the same reason it lives here
-        /// rather than in knowhow: writing the link IS the moment the choice is
-        /// made, and nothing prompts a lookup first. The *app fragment* entry in
-        /// `docs/glossary.md` carries the mechanism.
         #[test]
         fn the_file_references_section_links_inside_an_app_not_only_at_it() {
             let section = file_references_section();
             let section = section.as_str();
 
-            // The form itself. Naming the capability without the `#` leaves the
-            // agent nothing to write.
             assert!(
                 section.contains("(app:pr-understanding#pr-1645)"),
                 "the section must show the fragment form, not just name it:\n{section}"
             );
-            // Where it arrives. Without this the agent cannot tell whether an app
-            // it wrote itself would even see the target.
             assert!(
                 section.contains("location.hash"),
                 "the section must say how the fragment reaches the app:\n{section}"
             );
-            // The caveat. An app that reads no hash ignores one, so a fragment is
-            // worth writing only where the app answers it.
             assert!(
                 section.contains("when the app reads one"),
                 "the section must gate the fragment on the app reading it:\n{section}"
             );
         }
 
-        /// Every id in the routing block must be a real `system-knowhow/<id>`, or
-        /// `load_knowhow` answers with the not-found sentinel and the agent
-        /// proceeds unguided. The ids are filename-derived, so a knowhow rename
-        /// silently invalidates them.
         #[test]
         fn workspace_assets_rule_names_only_live_knowhow_ids() {
             let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
 
-            for id in ["triggers", "building-an-app", "building-knowhow", "plugins"] {
+            for id in [
+                "triggers",
+                "building-an-app",
+                "building-knowhow",
+                "plugins",
+                "event-hooks",
+            ] {
                 assert!(
                     rule.contains(&format!("`system-knowhow/{id}`")),
                     "routing block must still name system-knowhow/{id}:\n{rule}"
@@ -3749,12 +3183,6 @@ mod tests {
             }
         }
 
-        /// The setup interview's discovery route must name a knowhow id that
-        /// actually resolves. Same failure mode as
-        /// `workspace_assets_rule_names_only_live_knowhow_ids`: the id is
-        /// filename-derived. Renaming the file leaves the route pointing at
-        /// nothing, and `load_knowhow` answers with the not-found sentinel. The
-        /// button then fires and the agent improvises an interview.
         #[test]
         fn setup_interview_rule_routes_to_a_live_knowhow_id() {
             let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
@@ -3769,16 +3197,6 @@ mod tests {
             );
         }
 
-        /// Cross-layer pin for the entry point's discovery. The welcome CTA and the
-        /// header help button send a FIXED sentence as an ordinary user message:
-        /// `SETUP_INTERVIEW_PROMPT` in `store/actions/compose.ts`. The route only
-        /// fires if the prompt says something it recognises. Reading the real
-        /// sources makes this a check on the set, not three self-equal strings.
-        ///
-        /// The knowhow's frontmatter `description` is the third arm because it is
-        /// the SECOND discovery path: retrieval, for a user who types the request
-        /// rather than pressing the button. A description that no longer mentions
-        /// the sentence leaves the feature alive on the hardcoded route alone.
         #[test]
         fn setup_interview_route_matches_the_frontend_seeded_prompt() {
             const ANCHOR: &str = "help me get the most out of lucidos";

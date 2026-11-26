@@ -1,11 +1,3 @@
-//! `lucidos-engine preflight`: boot this binary against a throwaway copy of the
-//! workspace database, so a build that cannot boot is never published.
-//!
-//! The copy runs the two steps that fail a boot on user data: the embedded
-//! migrator, then the secret-store boot check with its sealing pass. The copy is
-//! dropped whatever happens. The source database and the key store are never
-//! written (plan `docs/plans/2026-10-18-boot-failure-guards.md`).
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -22,18 +14,12 @@ use lucidos_core::log_legacy;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Postgres cuts an identifier at this many bytes.
 const MAX_DATABASE_NAME_BYTES: usize = 63;
 
-/// Parallel jobs for the dump and the restore.
 const COPY_JOBS: &str = "4";
 
-/// A key store that reads the real one and keeps every write in memory. Boot
-/// mints a key for a database with nothing sealed, and a restore parks one.
-/// Both run here as in a boot, and the real store stays untouched.
 struct ScratchKeys<'a> {
     real: &'a dyn KeyStore,
-    /// `None` is a deleted key.
     changes: Mutex<HashMap<String, Option<SecretKey>>>,
 }
 
@@ -75,8 +61,6 @@ impl KeyStore for ScratchKeys<'_> {
     }
 }
 
-/// What every copy of `source` starts with: the source name, cut so the
-/// longest process id still fits, plus a marker.
 fn copy_prefix(source: &str) -> String {
     const MARKER: &str = "_preflight_";
     const PID_DIGITS: usize = 10;
@@ -88,7 +72,6 @@ fn copy_name(source: &str, pid: u32) -> String {
     format!("{}{pid}", copy_prefix(source))
 }
 
-/// `text` as a literal `LIKE` pattern.
 fn like_escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -99,11 +82,6 @@ fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Copy the database at `database_url`, boot the copy, and drop it.
-///
-/// `scratch_dir` holds the dump for the length of the copy. `Err` says why a
-/// boot of this binary on this data would fail. It carries the server's
-/// primary message only, never a `Debug` form that would quote a failing row.
 pub async fn run(
     database_url: &str,
     scratch_dir: &Path,
@@ -114,8 +92,6 @@ pub async fn run(
         .map_err(readable)
 }
 
-/// `e` as its `Display` text, which for a database error is the server's
-/// primary message.
 fn readable(e: BoxError) -> BoxError {
     e.to_string().into()
 }
@@ -144,8 +120,6 @@ async fn copy_and_boot(
     outcome
 }
 
-/// Drop the copies a killed preflight left behind. The build lock lets one
-/// preflight run per checkout, so every copy found is stale.
 async fn drop_leftover_copies(admin: &PgPool, source: &str) -> Result<(), BoxError> {
     let leftovers: Vec<String> =
         sqlx::query_scalar("SELECT datname::text FROM pg_database WHERE datname LIKE $1")
@@ -206,7 +180,6 @@ async fn boot_copy(
     outcome
 }
 
-/// The steps a boot runs on user data, in the order it runs them.
 async fn migrate_and_unseal(
     pool: &PgPool,
     source: &str,
@@ -222,9 +195,6 @@ async fn migrate_and_unseal(
     }
 }
 
-/// Run a Postgres client tool against `database_url`, or against `database`
-/// on the same server, and fail with the first line of its stderr. Later
-/// lines can quote a row.
 async fn run_pg_tool(
     name: &str,
     database_url: &str,

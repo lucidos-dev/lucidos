@@ -1,21 +1,12 @@
-//! HTTP surface for *form requests*: the open list the client offers from, and
-//! the Cancel a credential or email form sends. See `engine::form_requests`.
-
 use super::*;
 use crate::engine::form_requests;
 use crate::engine::thread_events::FormRequestOutcome;
 
-/// The kinds this route cancels. A plugin request cancels through its own
+/// INVARIANT: The kinds this route cancels. A plugin request cancels through its own
 /// route, which also drops the staged files. An authorization page closes when
 /// its OAuth flow ends.
 const CANCELABLE_HERE: &[&str] = &["CredentialRequested", "EmailConfirmRequested"];
 
-/// GET /api/v1/form-requests/pending: every open form request, oldest first.
-///
-/// The client calls this on every stream open, so a request whose frame it
-/// missed still reaches it. Stagings past their TTL are closed as expired
-/// here. A plugin request with no staging is left out, so it is never offered
-/// with a Confirm that would 404.
 async fn list_pending(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<form_requests::PendingFormRequest>>, ApiError> {
@@ -61,12 +52,9 @@ async fn list_pending(
 
 #[derive(Serialize)]
 struct CancelResponse {
-    /// False when another device or path answered it first. Not an error: the
-    /// request is closed either way, which is what the caller wanted.
     resolved: bool,
 }
 
-/// POST /api/v1/form-requests/{request_id}/cancel: the form's Cancel.
 async fn cancel(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -100,7 +88,7 @@ struct ResolvedQuery {
     request_ids: String,
 }
 
-/// Resolve only identities with event evidence, never absence from the pending list.
+/// INVARIANT: Resolve only identities with event evidence, never absence from the pending list.
 async fn list_resolved(
     State(state): State<AppState>,
     Query(query): Query<ResolvedQuery>,

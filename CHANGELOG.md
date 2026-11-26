@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.61.0 — 2026-11-26
+
+### Added
+
+- Event hooks run. An armed hook is asked before a thread starts, before a change is proposed and before Apply, and it can refuse. A refusal shows in the thread with the hook's reason.
+- Plugins can ship event hooks. Each hook installs and arms only after you confirm it on your device, and uninstall keeps the scope you reviewed.
+- The workspace picker manages a paired remote gateway. Switch to it, then create, start, stop and restore its workspaces from this device.
+- Restore uploads a backup in resumable chunks. It shows progress, names the failure, resumes after a dropped connection and can be cancelled.
+- Finish an interrupted workspace delete from Trash. The picker says when Finish delete keeps no database copy.
+- Agent icon colours under Settings: brand, theme or muted, set for each icon slot.
+
+### Changed
+
+- The workspace picker's Trash is a glass card, and selected workspaces show white checks and a glass selection bar.
+- Restore results are kept until you dismiss them, also across gateway switches, and the picker suggests a name for a restored backup.
+- Cloud backup retention and status count only the backups from this workspace's origin.
+- When app storage is full or a live update hits the storage quota, Lucidos tells you what happened and how to free space.
+- The device pairing screen accepts a pasted secret or link in one field.
+
+### Fixed
+
+- On a phone, the home screen app opens the workspace you last used. A browser tab no longer changes it.
+- The "Refresh" update prompt no longer comes back after you refresh.
+- The reply you are reading holds its place while the turn above it grows, also during momentum scrolling and when older turns load.
+- A restore carries current access settings, also on a database outside UTC.
+- Reconnect is described as a retry.
+- Coding agents no longer start before the engine is ready to serve them, and the command guard retries while the engine starts.
+- A child thread held on a question no longer marks its parent threads as waiting on you.
+- A read request from a turn you wrote into stays yours, and a sub-thread's later no replaces its earlier read request.
+- A cleanup or Trash action finishes even if the request drops, and a failed one can be retried at once.
+- Updated the zip library to close three security alerts.
 ## v0.60.0 — 2026-11-25
 
 ### Added

@@ -11,7 +11,6 @@ async fn setup_test_db() -> (PgPool, String) {
     lucidos_core::test_support::setup_test_db().await
 }
 
-/// Counts the writes that reach it, and reads like the shared test store.
 #[derive(Default)]
 struct RecordingKeys {
     writes: AtomicUsize,
@@ -37,7 +36,6 @@ impl KeyStore for RecordingKeys {
     }
 }
 
-/// A store holding no key, which makes boot mint one.
 struct EmptyKeys;
 
 impl KeyStore for EmptyKeys {
@@ -86,7 +84,6 @@ fn like_escape_matches_only_itself() {
     assert_eq!(like_escape("a_b%c\\d"), "a\\_b\\%c\\\\d");
 }
 
-/// One digest of the rows a preflight must leave alone.
 async fn fingerprint(pool: &PgPool) -> String {
     sqlx::query_scalar(
         "SELECT md5(\
@@ -114,9 +111,6 @@ fn version_of(description: &str) -> i64 {
         .version
 }
 
-/// Preflight fails where boot fails: here, on a missing successor row.
-/// It passes once boot would. It drops its copy either way, and writes
-/// nothing to the source database or the key store.
 #[tokio::test]
 async fn preflight_fails_like_boot_and_leaves_the_source_alone() {
     let (pool, db_name) = setup_test_db().await;
@@ -126,8 +120,6 @@ async fn preflight_fails_like_boot_and_leaves_the_source_alone() {
     let seed = version_of("seed the successors the retirement migration needs");
     let retire = version_of("retire superseded models and seed their successors");
 
-    // A workspace that applied the seed, lost a successor row, and has not yet
-    // applied the retirement: boot raises P0001.
     sqlx::query("DELETE FROM models WHERE id = 'claude-fable-5-1'")
         .execute(&pool)
         .await
@@ -149,7 +141,6 @@ async fn preflight_fails_like_boot_and_leaves_the_source_alone() {
     assert_eq!(fingerprint(&pool).await, before);
     assert!(copies_of(&pool, &db_name).await.is_empty());
 
-    // The same workspace with the seed unapplied: boot restores the row first.
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
         .bind(seed)
         .execute(&pool)
@@ -168,7 +159,6 @@ async fn preflight_fails_like_boot_and_leaves_the_source_alone() {
     teardown_test_db(&db_name).await;
 }
 
-/// A killed preflight leaves its copy behind. The next run drops it.
 #[tokio::test]
 async fn preflight_drops_the_copy_a_killed_run_left_behind() {
     let (pool, db_name) = setup_test_db().await;
@@ -190,8 +180,6 @@ async fn preflight_drops_the_copy_a_killed_run_left_behind() {
     teardown_test_db(&db_name).await;
 }
 
-/// A database with nothing sealed and no key makes boot mint one. Preflight
-/// does the same in memory, and never reaches the real store.
 #[tokio::test]
 async fn preflight_passes_where_boot_would_mint_a_key() {
     let (pool, db_name) = setup_test_db().await;
@@ -203,8 +191,6 @@ async fn preflight_passes_where_boot_would_mint_a_key() {
     teardown_test_db(&db_name).await;
 }
 
-/// A failing row's `detail` can hold an email address or a token. The error
-/// preflight returns names the constraint and nothing of the row.
 #[tokio::test]
 async fn a_preflight_error_carries_no_row_data() {
     let (pool, db_name) = setup_test_db().await;

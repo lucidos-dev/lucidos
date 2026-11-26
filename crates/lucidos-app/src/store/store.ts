@@ -57,7 +57,7 @@ import { changeReadyToReview, computeExchanges, isExcludedFromSections, plainEve
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { type PreferenceValues } from '@lucidos/preference-catalog';
-import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
+import { awaitsOwnerAnswer, displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import type { UnproposedReason } from '../generated/thread-event-wire';
 import { resetContentScroll } from './savedScroll';
@@ -253,6 +253,7 @@ const RETIRED_SETTINGS_ANCHORS = new Map<string, string>([
   ['models:region', 'providers:vertex-region'],
   ['command-safety:judge-model', 'models:command-judge'],
   ['command-safety:coding-agents', 'permissions:coding-agent-auto-answer'],
+  ['appearance:agent-brand-colours', 'appearance:agent-icon-colors'],
   ...[
     'anthropic', 'openai', 'openrouter', 'xai', 'opencode-free', 'local', 'claude-gateway',
     'typesafe', 'cloudflare-workers-ai', 'system-one-custom',
@@ -603,10 +604,15 @@ export function threadIsHeld(thread: ThreadState): boolean {
   return thread.meta.hold != null;
 }
 
+export function threadAwaitsOwnerAnswer(thread: ThreadState): boolean {
+  return !isExcludedFromSections(thread)
+    && awaitsOwnerAnswer(effectiveThreadStatus(thread), threadIsHeld(thread));
+}
+
 export function threadIsBlocked(thread: ThreadState): boolean {
+  if (threadAwaitsOwnerAnswer(thread)) return true;
   if (!listsInOngoing(thread)) return false;
-  const status = effectiveThreadStatus(thread);
-  return status === 'waiting_for_user_answer' || status === 'failed'
+  return effectiveThreadStatus(thread) === 'failed'
     || thread.meta.isStoppedChild === true
     || notReadyReason(thread) === 'hardening_missing';
 }

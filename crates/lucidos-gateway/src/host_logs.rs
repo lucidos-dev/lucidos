@@ -1,10 +1,3 @@
-//! Host-owned, bounded raw-log snapshots (ADR 0712). No contents cross this API.
-//!
-//! Before consent only metadata is inspected. Consent names each inode and
-//! its maximum prefix length, captured at execution time, not a content hash.
-//! An active capture may append; the approved prefix never grows. Replacement,
-//! truncation, hard links and directory indirection fail closed.
-
 use crate::registry::CreatedBy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -56,14 +49,10 @@ struct CallerBody {
 }
 
 fn safe_failure() -> crate::error::ApiError {
-    // Neither I/O nor serde errors may expose data from a corrupt private
-    // record. Transport errors will follow the same metadata-only contract.
     crate::error::ApiError::conflict("Host-log operation unavailable or refused. Check capture availability, source identity, limits and operation status; no automatic retry is safe.")
 }
 
 fn operation_failure(error: crate::BoxError) -> crate::error::ApiError {
-    // Only exact host-authored sentences cross this boundary. In particular,
-    // serde errors can include bytes from a damaged operation record.
     match error.to_string().as_str() {
         NO_CAPTURE => crate::error::ApiError::conflict(NO_CAPTURE),
         TOO_LARGE => crate::error::ApiError::conflict(TOO_LARGE),
@@ -123,16 +112,12 @@ async fn transfer_request(
         .map_err(operation_failure)
 }
 
-/// Runs file work and file locks off the async runtime, so a large capture
-/// never stalls the requests queued on a gateway worker.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     tokio::task::spawn_blocking(work).await?
 }
 
-/// The data directory is trusted, so its own path may cross symlinks (a
-/// symlinked home, say). Every path below it is opened without following one.
 fn installation_root(root: &Path) -> Result<PathBuf> {
     Ok(root.canonicalize()?)
 }
@@ -149,7 +134,6 @@ struct TransferBody {
 pub(crate) struct Recipient {
     pub user: String,
     pub host: String,
-    /// Relative to the SSH account's home; no shell expansion is needed.
     pub directory: String,
 }
 
@@ -189,7 +173,6 @@ pub(crate) enum Status {
     Prepared,
     Capturing,
     Snapshotted,
-    /// A restart in this state means uncertain remote outcome; never retry.
     Transferring,
     Verified,
     Uncertain,
@@ -218,8 +201,6 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Traverse every absolute directory component without following symlinks.
-/// Holding this descriptor also pins the parent against rename races.
 fn directory(path: &Path) -> Result<File> {
     if !path.is_absolute() {
         return Err("Host capture directory is not absolute".into());
@@ -287,8 +268,6 @@ fn recognized(name: &str) -> bool {
 
 fn scan(root: &Path) -> Result<Vec<Source>> {
     let pinned = directory(root)?;
-    // Bounded enumeration detects unsupported rotations instead of silently
-    // presenting a partial file set as complete. No file contents are read.
     for folder in [root.to_path_buf(), root.join("logs")] {
         match directory(&folder) {
             Ok(_) => {}
@@ -440,9 +419,6 @@ pub(crate) fn prepare(root: &Path, caller: CreatedBy, recipient: Recipient) -> R
     Ok(operation)
 }
 
-/// Removes every operation that can no longer act: past its expiry, with no
-/// transfer holding its active lock. Returns how many operations remain.
-/// Callers hold the store lock, so no snapshot can start meanwhile.
 fn prune(root: &Path, storage: &Path) -> Result<usize> {
     let mut remaining = 0;
     for (count, entry) in std::fs::read_dir(storage)?.enumerate() {
@@ -453,7 +429,6 @@ fn prune(root: &Path, storage: &Path) -> Result<usize> {
         let Some(id) = name.to_str().filter(|n| n.starts_with("transfer-")) else {
             continue;
         };
-        // A record this host cannot read is not its to judge; it stays.
         if !read(root, id).is_ok_and(|operation| now() > operation.expires_at) {
             remaining += 1;
             continue;
@@ -468,7 +443,6 @@ fn prune(root: &Path, storage: &Path) -> Result<usize> {
     Ok(remaining)
 }
 
-/// An operation record, bound to its id but to no caller.
 fn read(root: &Path, id: &str) -> Result<Operation> {
     let dir = directory(&operation_dir(root, id)?)?;
     let file = at(&dir, b"operation.json", libc::O_RDONLY)?;
@@ -498,8 +472,6 @@ pub(crate) fn load(root: &Path, id: &str, caller: &CreatedBy) -> Result<Operatio
     Ok(operation)
 }
 
-/// Called only by the local engine broker after it spends the exact once grant.
-/// Capturing is persisted before the first read; a crash is never replayable.
 pub(crate) fn snapshot(root: &Path, id: &str, caller: &CreatedBy) -> Result<Operation> {
     let _lock = lock(root)?;
     let mut operation = load(root, id, caller)?;
@@ -599,11 +571,9 @@ async fn transfer(
 ) -> Result<Operation> {
     let (root, active, mut operation) = blocking(move || {
         let root = installation_root(&root)?;
-        // Bind the caller before creating even an operation lock file.
         let prepared = load(&root, &id, &caller)?;
         let active = active_lock(&root, &id)?;
         fs2::FileExt::try_lock_exclusive(&active)?;
-        // The engine has already spent this exact digest's owner permission.
         if prepared.approval != approval {
             return Err("Manifest consent mismatch".into());
         }
@@ -625,9 +595,7 @@ async fn transfer(
         "SFTP was unavailable, refused, timed out or failed integrity verification. Remote files may be incomplete; do not retry this operation."
     }.into());
     blocking(move || {
-        // The active lock stays held until the verdict is saved.
         let _active = active;
-        // Remove only this operation's raw staging, retaining durable metadata.
         if cleanup_staging(&root, &operation.id).is_err() {
             operation.detail = Some("Private staging cleanup failed; owner cleanup is required. Check state for remote outcome.".into());
             save(&root, &operation)?;
@@ -665,8 +633,6 @@ fn cleanup_staging(root: &Path, id: &str) -> Result<()> {
 }
 fn recover_status(root: &Path, id: &str, caller: &CreatedBy) -> Result<Operation> {
     let read = load(root, id, caller)?;
-    // A prepared operation has nothing to recover. Its active lock belongs to
-    // a transfer that may start now, after the owner's grant is spent.
     if read.state == Status::Prepared {
         return Ok(read);
     }
@@ -674,8 +640,6 @@ fn recover_status(root: &Path, id: &str, caller: &CreatedBy) -> Result<Operation
     let mut operation;
     match fs2::FileExt::try_lock_exclusive(&active) {
         Ok(()) => {
-            // Reload under the lock: an active transfer may have finished
-            // since the caller-binding read. Never overwrite its verdict.
             operation = load(root, id, caller)?;
             if matches!(
                 operation.state,

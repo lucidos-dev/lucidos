@@ -1,5 +1,3 @@
-//! An unattested caller never passes an owner-only door alone (invariant 3).
-
 use super::*;
 use crate::api::actor::{owner_attestation, require_attested_owner, OwnerAttestation};
 use crate::api::gateway_stamp::test_support::stamped_device_headers;

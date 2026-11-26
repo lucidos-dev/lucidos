@@ -1,7 +1,5 @@
 use crate::support::{base_url, unique_marker, user_client, workspace_path};
 
-/// Write a file directly to the workspace data/artifacts/ directory (no git commit).
-/// This avoids git commit races with other test modules that also touch the repo.
 fn write_file_to_disk(path: &str, content: &str) {
     let full_path = workspace_path().join("data/artifacts").join(path);
     if let Some(parent) = full_path.parent() {
@@ -10,10 +8,6 @@ fn write_file_to_disk(path: &str, content: &str) {
     std::fs::write(&full_path, content).expect("Failed to write test file");
 }
 
-/// Removes a file this test wrote but no edit committed, when dropped. An
-/// untracked file left in the shared tree makes every later apply refuse with
-/// "the repository has uncommitted changes". Declare it after the tree guard,
-/// so it drops first and the file is gone before the guard releases.
 struct RemoveOnDrop(std::path::PathBuf);
 
 impl Drop for RemoveOnDrop {
@@ -22,7 +16,6 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// Read a file via GET /api/v1/data/artifacts/..., return body text
 async fn read_artifact(client: &reqwest::Client, path: &str) -> String {
     let url = format!("{}/api/v1/data/artifacts/{}", base_url(), path);
     client
@@ -35,7 +28,6 @@ async fn read_artifact(client: &reqwest::Client, path: &str) -> String {
         .expect("Failed to read body")
 }
 
-/// POST /api/v1/data/edit with a JSON body
 async fn post_file_edit(client: &reqwest::Client, body: serde_json::Value) -> reqwest::Response {
     let url = format!("{}/api/v1/data/edit", base_url());
     client
@@ -46,16 +38,11 @@ async fn post_file_edit(client: &reqwest::Client, body: serde_json::Value) -> re
         .expect("Edit request failed")
 }
 
-/// Test both JSON and text edit modes sequentially to avoid git commit races.
 #[tokio::test]
 async fn edit_json_and_text_modes() {
     let client = user_client().await;
-    // Creates and then edits files in the shared working tree, both of which
-    // show up in a command checkpoint's diff if they land mid-snapshot; see
-    // `workspace_tree_lock`. Held for the whole test, which is short.
     let _tree = crate::support::workspace_tree_lock().read().await;
 
-    // --- JSON mode ---
     let json_marker = unique_marker("edit-json");
     let json_path = format!("{}.json", json_marker);
 
@@ -78,7 +65,6 @@ async fn edit_json_and_text_modes() {
     let doc: serde_json::Value = serde_json::from_str(&content).expect("Not valid JSON");
     assert_eq!(doc["title"], "updated");
 
-    // --- Text mode ---
     let text_marker = unique_marker("edit-text");
     let text_path = format!("{}.md", text_marker);
 
@@ -161,7 +147,6 @@ async fn edit_old_string_not_found_returns_400() {
     let marker = unique_marker("edit-nomatch");
     let path = format!("{}.md", marker);
 
-    // A new file in the shared working tree; see `workspace_tree_lock`.
     let _tree = crate::support::workspace_tree_lock().read().await;
     write_file_to_disk(&path, "some content");
     let _uncommitted = RemoveOnDrop(workspace_path().join("data/artifacts").join(&path));
@@ -179,15 +164,12 @@ async fn edit_old_string_not_found_returns_400() {
     assert!(body["error"].as_str().unwrap().contains("not found"));
 }
 
-/// Concurrent edits to one file must all land, and none may drop another's
-/// change. This is the shape `lucidos.data.edit` teaches apps to use.
 #[tokio::test]
 async fn concurrent_json_edits_to_one_file_all_land() {
     let client = user_client().await;
     let _tree = crate::support::workspace_tree_lock().read().await;
     let marker = unique_marker("edit-concurrent");
     let path = format!("{}.json", marker);
-    // A JSON edit sets an existing key, so every key starts out null.
     let seed: serde_json::Map<String, serde_json::Value> = (0..8)
         .map(|i| (format!("key{i}"), serde_json::Value::Null))
         .collect();

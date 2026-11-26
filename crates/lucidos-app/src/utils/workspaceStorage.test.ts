@@ -7,6 +7,7 @@ import {
   migrateUnprefixedKeys,
   installWorkspaceStorage,
   rawStorageKey,
+  storageUsage,
 } from './workspaceStorage';
 
 function makeStorage(seed: Record<string, string> = {}): Storage {
@@ -39,6 +40,24 @@ function rawKeys(storage: Storage): string[] {
 }
 
 describe('pure helpers', () => {
+  it('counts raw entries across peers without returning keys or values', () => {
+    const appKey = 'peer:another:ws:alpha:appbridge:private-app:app:private-key';
+    const sdkKey = 'peer:current:ws:alpha:appbridge:private-app:sdk:private-key';
+    const shellKey = 'ws:beta:lucidos-focused-thread';
+    const storage = makeStorage({
+      [appKey]: 'private app contents',
+      [sdkKey]: 'private sdk contents',
+      [shellKey]: 'private thread',
+    });
+    installWorkspaceStorage(storage, 'alpha', 'current');
+    expect(storageUsage(storage)).toEqual({
+      app: { entries: 1, codeUnits: appKey.length + 'private app contents'.length },
+      sdk: { entries: 1, codeUnits: sdkKey.length + 'private sdk contents'.length },
+      shell: { entries: 1, codeUnits: shellKey.length + 'private thread'.length },
+      other: { entries: 1, codeUnits: 'peer:current:ws:alpha:__migrated'.length + 1 },
+    });
+  });
+
   it('namespacedKey shape', () => {
     expect(namespacedKey('lucidos-focused-thread', 'alpha')).toBe(
       'ws:alpha:lucidos-focused-thread',
@@ -193,6 +212,29 @@ describe('installWorkspaceStorage — null workspace passes through', () => {
 });
 
 describe('one-time migration (seed appearance, never adopt, fresh device id)', () => {
+  it.each([null, 'cloud'])('keeps storage scoped when the migration marker exceeds quota (peer %s)', (peer) => {
+    const marker = rawStorageKey('__migrated', 'alpha', peer);
+    const scoped = rawStorageKey('lucidos-focused-thread', 'alpha', peer);
+    const storage = makeStorage({
+      'lucidos-focused-thread': 'legacy',
+      [scoped]: 'alpha-thread',
+    });
+    const proto = Object.getPrototypeOf(storage) as Storage;
+    const rawSet = proto.setItem;
+    proto.setItem = function (this: Storage, key, value) {
+      if (key === marker) throw new DOMException('Storage is full.', 'QuotaExceededError');
+      rawSet.call(this, key, value);
+    };
+
+    installWorkspaceStorage(storage, 'alpha', peer);
+
+    expect(storage.getItem('lucidos-focused-thread')).toBe('alpha-thread');
+    storage.setItem('lucidos-nav-history', 'updated');
+    expect(rawKeys(storage)).toContain(rawStorageKey('lucidos-nav-history', 'alpha', peer));
+    expect(rawKeys(storage)).not.toContain('lucidos-nav-history');
+    expect(rawKeys(storage)).not.toContain(marker);
+  });
+
   it('seeds appearance keys from legacy raw values, leaving the raw original', () => {
     const storage = makeStorage({
       'lucidos-theme': 'light',

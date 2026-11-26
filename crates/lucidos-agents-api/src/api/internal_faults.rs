@@ -1,5 +1,3 @@
-//! Classify our own 500 responses without inspecting bodies or request values.
-//! 502/503/504 describe dependency/readiness failures, not an internal defect.
 use crate::internal_faults::FaultKind;
 use axum::{
     extract::{Request, State},
@@ -7,7 +5,7 @@ use axum::{
     response::Response,
 };
 
-/// In-process only: upstream headers cannot forge or remove this marker.
+/// INVARIANT: In-process only: upstream headers cannot forge or remove this marker.
 #[derive(Clone, Copy)]
 pub(crate) struct ExternalFailure;
 
@@ -28,7 +26,7 @@ pub(super) async fn observe(
 ) -> Response {
     let response = next.run(request).await;
     if is_own_fault(&response) {
-        // Durably queue first: a DB error may be what produced this response.
+        // INVARIANT: Durably queue first: a DB error may be what produced this response.
         if let Err(e) = inbox.record(FaultKind::Own5xx) {
             crate::log_legacy!("[InternalFault] could not queue own-5xx: {}", e);
         }

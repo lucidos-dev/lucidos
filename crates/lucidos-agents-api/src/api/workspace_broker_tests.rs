@@ -6,8 +6,6 @@ use crate::engine::workspace_classification::classification_drift;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use std::sync::{Arc, Mutex};
 
-/// A gateway listing `demo` (machine-made) and `home` (a user's), recording
-/// every POST path it receives.
 async fn stand_in_gateway() -> (u16, Arc<Mutex<Vec<String>>>) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let seen = calls.clone();
@@ -80,15 +78,11 @@ async fn requests_recorded(pool: &sqlx::PgPool) -> i64 {
         .unwrap()
 }
 
-/// Grant `label` on a request for `verb` at `target`, as the owner would.
 async fn allow(bus: &EventBus, caller: Uuid, verb: Action, target: &str, label: &str) {
     let ask = workspace_ask(verb, target, "I need it.").unwrap();
     grant(bus, caller, ask, label).await;
 }
 
-/// Invariants 1 and 2 end to end, on a user's workspace: with no permission
-/// the call is refused and the gateway is not called. Allow once acts once,
-/// then the call asks again.
 #[tokio::test]
 async fn a_stop_asks_first_then_acts_once_on_the_allow() {
     let (pool, db) = setup_test_db().await;
@@ -135,7 +129,6 @@ async fn a_stop_asks_first_then_acts_once_on_the_allow() {
     teardown_test_db(&db).await;
 }
 
-/// Invariant 2: two racing calls on one Allow once act once between them.
 #[tokio::test]
 async fn two_racing_stops_spend_one_allow_once_once() {
     let (pool, db) = setup_test_db().await;
@@ -164,8 +157,6 @@ async fn two_racing_stops_spend_one_allow_once_once() {
     teardown_test_db(&db).await;
 }
 
-/// Allow for this thread lets the asking thread act again and again on that
-/// workspace, and no other thread.
 #[tokio::test]
 async fn allow_for_this_thread_acts_again_on_its_own_thread_only() {
     let (pool, db) = setup_test_db().await;
@@ -212,8 +203,6 @@ async fn agents_acts_recorded(pool: &sqlx::PgPool) -> Vec<serde_json::Value> {
     .unwrap()
 }
 
-/// A machine-made workspace is the agent's: stop and start act with no card,
-/// and each records one `MachineMadeWorkspaceChanged`.
 #[tokio::test]
 async fn a_machine_made_workspace_stops_and_starts_with_no_card() {
     let (pool, db) = setup_test_db().await;
@@ -265,7 +254,6 @@ fn only_reversible_verbs_on_a_machine_made_workspace_skip_the_card() {
     }
 }
 
-/// I2: a user workspace's delete is refused before any card or gateway call.
 #[tokio::test]
 async fn a_user_workspace_delete_is_refused_before_a_card() {
     let (pool, db) = setup_test_db().await;
@@ -310,8 +298,6 @@ async fn a_user_workspace_delete_is_refused_before_a_card() {
     teardown_test_db(&db).await;
 }
 
-/// An agent never stops or deletes the engine it runs in: that would end its
-/// own turn mid-call.
 #[tokio::test]
 async fn an_agent_cannot_stop_or_delete_its_own_workspace() {
     let (pool, db) = setup_test_db().await;
@@ -328,8 +314,6 @@ async fn an_agent_cannot_stop_or_delete_its_own_workspace() {
     teardown_test_db(&db).await;
 }
 
-/// A rename to a name another workspace carries is refused before any card,
-/// matched the gateway's way: trimmed and case-insensitive.
 #[tokio::test]
 async fn a_rename_to_a_taken_name_is_refused_before_a_card() {
     let (pool, db) = setup_test_db().await;
@@ -393,7 +377,6 @@ fn a_create_name_matches_ignoring_case_and_spaces() {
     assert!(refuse_a_taken_name(&listing, "Demo Rig 2", None).is_ok());
 }
 
-/// D3: a caller with no thread-bound origin token is refused.
 #[tokio::test]
 async fn only_an_agent_thread_calls_the_broker() {
     let (pool, db) = setup_test_db().await;
@@ -410,7 +393,6 @@ async fn only_an_agent_thread_calls_the_broker() {
     teardown_test_db(&db).await;
 }
 
-/// I3: restart is refused, and names stop then start.
 #[tokio::test]
 async fn restart_is_refused_with_stop_then_start() {
     let refusal = restart().await;
@@ -434,7 +416,6 @@ fn a_trash_row_projects_only_its_named_fields() {
     );
 }
 
-/// I7: a classification skips once any named entry left `unknown` or is gone.
 #[test]
 fn a_classification_drifts_when_an_entry_is_classified_or_gone() {
     let listing: Vec<ListedWorkspace> = serde_json::from_value(serde_json::json!([

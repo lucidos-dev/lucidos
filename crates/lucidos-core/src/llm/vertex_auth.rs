@@ -1,18 +1,13 @@
-//! Shared Vertex token acquisition and caching.
-
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
-// Keep the ADC source path used by the provider error guard.
 #[path = "vertex/adc.rs"]
 pub mod adc;
 
-/// Shared access token cache for all VertexProvider instances in the same project.
-/// gcloud tokens are project-scoped, so one cache serves all models.
 pub type TokenCache = Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>;
 
-/// Get a cached Vertex access token, refreshing only when expired (50 min TTL).
+/// INVARIANT: Get a cached Vertex access token, refreshing only when expired (50 min TTL).
 /// Shared by VertexProvider and VertexImagenProvider, so every Vertex caller
 /// benefits from the same auth.
 ///
@@ -45,9 +40,6 @@ pub async fn get_cached_access_token(
     Ok(token)
 }
 
-/// Run a subprocess with a wall-clock ceiling, killing it on timeout so it
-/// cannot outlive this call. Extracted so the timeout itself is testable
-/// against a real wedged child, without waiting out the 60s production value.
 async fn run_with_timeout(
     mut cmd: Command,
     timeout: Duration,
@@ -60,13 +52,11 @@ async fn run_with_timeout(
     }
 }
 
-/// Acquire a fresh Vertex access token (uncached). ADC-direct first
-/// (packaged-friendly, no binary), then the `gcloud` subprocess fallback.
 async fn fetch_access_token() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(creds) = adc::load() {
         match adc::refresh_access_token(&creds).await {
             Ok(token) => return Ok(token),
-            // Don't fail outright — a stale/revoked ADC refresh should still try
+            // INVARIANT: Don't fail outright — a stale/revoked ADC refresh should still try
             // the gcloud path (which may re-prompt / use a different config).
             Err(e) => crate::log_legacy!(
                 "[Vertex] ADC token refresh failed, falling back to gcloud: {}",
@@ -75,10 +65,6 @@ async fn fetch_access_token() -> Result<String, Box<dyn std::error::Error + Send
         }
     }
 
-    // `gcloud` does its own network token exchange. A wedged one hangs the
-    // chat turn with no terminal event, the same hang class as the ADC
-    // client above. So it is bounded to the same `adc::TOKEN_REQUEST_TIMEOUT`
-    // (60s).
     let mut cmd = Command::new("gcloud");
     cmd.args(["auth", "application-default", "print-access-token"]);
     let output = run_with_timeout(cmd, adc::TOKEN_REQUEST_TIMEOUT, "gcloud").await?;
@@ -98,10 +84,6 @@ async fn fetch_access_token() -> Result<String, Box<dyn std::error::Error + Send
 mod tests {
     use super::*;
 
-    /// A wedged subprocess (a `gcloud` that hangs on its network exchange)
-    /// must be killed at the timeout rather than left running forever. Uses a
-    /// real `sleep` child and a millisecond-scale timeout so the test proves
-    /// the mechanism without waiting out the 60s production value.
     #[tokio::test]
     async fn a_wedged_command_is_killed_at_the_timeout() {
         let mut cmd = Command::new("sleep");
@@ -112,8 +94,6 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "got: {err}");
     }
 
-    /// A command that finishes well inside the timeout still returns its
-    /// output normally: the bound must not fire early on ordinary success.
     #[tokio::test]
     async fn a_fast_command_completes_normally() {
         let cmd = Command::new("true");

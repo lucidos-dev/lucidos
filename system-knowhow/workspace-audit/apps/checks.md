@@ -56,6 +56,14 @@ One part of the `system-knowhow/workspace-audit/apps` audit section. Load every 
   - **broken**: `.action-btn-secondary`, `-confirm` or `-danger` without the
     base `action-btn` class. It draws a plain browser button.
 
+- **A left-edge stripe.** The `left-stripe` scan finds left borders and inset
+  shadows. A pseudo-element bar spans several lines, so read each `::before`
+  and `::after` rule in the app's CSS by hand. Owns
+  the rule: `system-knowhow/building-an-app/visual-quality-bar-make-it-look-sleek-an.md`
+  § Smell test before finishing.
+  - **drift**: a coloured left border, a `::before` bar or an inset shadow on a
+    card, callout, banner or notice.
+
 - **The ready signal.** An app can hold the host's loading cover until its
   content is drawn: `"reveal": "on-ready"` in `manifest.json`, then a
   `lucidos.ui.ready()` call. The `ready-signal` scan lists both halves per
@@ -163,6 +171,9 @@ Hand a coding agent this table and the rules under it:
   is usually shared. Say which you chose in the report.
 - **No `window.localStorage` shim.** Rename the calls. Reference:
   `system-knowhow/js-sdk/lucidos-preferences-user-settings.md` § `lucidos.storage`.
+- **A storage toast is evidence of a failed app operation.** Trace the write
+  and check the limits and cleanup guidance in the same SDK section before
+  attributing the failure to that app's stored data.
 
 ### Opting an app into the ready signal
 
@@ -213,6 +224,7 @@ under it:
 | a widget's own choice buttons, ring gauge or bar series | `.choice-row` with a `<button class="choice">` per item, `.ring`, or `.bar-run` (`system-knowhow/js-sdk/setup-2.md` § Widget shapes), then delete the widget's own CSS for them | coding agent |
 | `.action-btn` variants swapped to mark the current choice | `.segmented-control` with `.active` on the current `.segmented-btn` for two or three options, else the `.pill-bar` rows above | coding agent |
 | a `:hover` rule outside any gate | the same rule inside `@media (hover: hover) { … }` | inline |
+| a left-edge stripe on a card, callout, banner or notice | bold text, a raised `--bg-tertiary` surface, spacing or an inline icon. Delete the stripe | inline |
 | a lone `.action-btn-X` variant | `class="action-btn action-btn-X"` | inline |
 | a text input or textarea the app draws itself | `<input class="text-input">` / `<textarea class="text-input">`, then delete the app's own border/background/focus CSS for it | coding agent |
 

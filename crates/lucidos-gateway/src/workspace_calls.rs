@@ -1,20 +1,3 @@
-//! `POST /~/api/v1/workspace-calls/{target}/chat/stream`: one engine's thread
-//! spawns into another workspace, on this gateway or on a paired one.
-//!
-//! The calling engine signs its claim with its own stamp key, which this
-//! gateway also holds: the caller workspace, its thread, and its spawn-gate
-//! verdict on that thread. The gateway verifies the claim, then the proxy
-//! stamps the same claim for the target under the target's key. The target
-//! honors the verdict, since only the caller can read the caller's provenance.
-//!
-//! A target this gateway does not serve may sit on a paired gateway (ADR
-//! 0590). This gateway asks each one, then relays the call to the one that
-//! takes it, signed with that pairing's credential. That gateway verifies the
-//! signature and stamps the call for its own engine. Both halves live here:
-//! [`forward`] is the caller's gateway, [`receive`] the target's.
-//!
-//! Plan: `docs/plans/2026-11-10-unattested-callers-and-gateway-stamps.md`.
-
 use std::time::Duration;
 
 use axum::extract::{Path, Request, State};
@@ -36,25 +19,16 @@ use crate::gateway_protocol::{
 use crate::remote_gateways::RemoteGateway;
 use crate::server::GatewayState;
 
-/// The header carrying the caller's gateway's signature over a call it relays
-/// to a paired gateway: `<issued unix seconds>.<hex HMAC>`, keyed by the
-/// pairing's credential. Gateway-owned, like the claim headers.
 pub(crate) const HEADER_RELAYED_CALL_SIGNATURE: &str = "x-lucidos-relayed-call-signature";
 
-/// The first field of a relayed call's signed text. A relay claim starts with
-/// its own version, so neither ever verifies as the other.
 const RELAYED_CALL_KIND: &str = "workspace-call/v1";
 
-/// How long a paired gateway may take to say whether it takes a call.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) fn router() -> Router<GatewayState> {
     Router::new().route("/:target/chat/stream", post(forward))
 }
 
-/// A workspace call this gateway verified, put on the request for the proxy
-/// to stamp for the target. An extension, like `auth::AuthenticatedDevice`,
-/// because a client can send a header and cannot send an extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttestedWorkspaceCall {
     pub(crate) caller_workspace: String,
@@ -63,9 +37,6 @@ pub(crate) struct AttestedWorkspaceCall {
 }
 
 impl AttestedWorkspaceCall {
-    /// The claim's headers and its stamp for the engine of `target_workspace`,
-    /// which holds `stamp_key`. With no key (an engine adopted keyless) the
-    /// stamp is left off, and the target reads an unattested caller.
     pub(crate) fn forwarded_headers(
         &self,
         target_workspace: &str,
@@ -81,8 +52,6 @@ impl AttestedWorkspaceCall {
         headers
     }
 
-    /// The claim's headers and their signature for a paired gateway, which
-    /// knows `credential` by its digest.
     pub(crate) fn relayed_headers(
         &self,
         target: &str,
@@ -115,7 +84,6 @@ impl AttestedWorkspaceCall {
         }
     }
 
-    /// Every field percent-encoded, so none can shift a `|` boundary.
     fn relayed_text(&self, target: &str, issued_at: i64) -> String {
         let issued_at = issued_at.to_string();
         [
@@ -131,7 +99,6 @@ impl AttestedWorkspaceCall {
     }
 }
 
-/// The call `headers` claim, before any check.
 fn claimed_call(headers: &HeaderMap) -> Option<AttestedWorkspaceCall> {
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
     Some(AttestedWorkspaceCall {
@@ -141,8 +108,6 @@ fn claimed_call(headers: &HeaderMap) -> Option<AttestedWorkspaceCall> {
     })
 }
 
-/// The call `headers` claim, when the engine of the calling workspace signed
-/// it for `target`. `caller_key` looks that engine's stamp key up by id.
 fn verified_call(
     target: &str,
     headers: &HeaderMap,
@@ -154,8 +119,6 @@ fn verified_call(
     key.verify_now(stamp, call.claim(target)).then_some(call)
 }
 
-/// The call `headers` claim, when the gateway holding `credential` signed it
-/// for `target` within the relay's clock skew of `now`.
 fn verified_relayed_call(
     target: &str,
     headers: &HeaderMap,
@@ -184,8 +147,6 @@ fn not_on_this_gateway(target: &str) -> Response {
         .into_response()
 }
 
-/// The target's engine hears the call as `/api/v1/chat/stream`, stamped by
-/// the proxy from `call`.
 async fn serve_call(
     state: &GatewayState,
     id: &str,
@@ -226,9 +187,6 @@ async fn forward(
     }
 }
 
-/// The one paired gateway that takes calls for `target`, all asked at once.
-/// Two that both do leave the call to the caller, as two directories
-/// carrying one name do on a single gateway.
 async fn paired_gateway_serving(state: &GatewayState, target: &str) -> Option<RemoteGateway> {
     if !lucidos_gateway_stamp::is_plain_target(target) {
         return None;
@@ -253,8 +211,6 @@ async fn paired_gateway_serving(state: &GatewayState, target: &str) -> Option<Re
     }
 }
 
-/// Relay `req` to `remote`, signed with its pairing's credential. The body and
-/// the answer stream through, as the relay's do.
 async fn relay_call(
     state: &GatewayState,
     remote: &RemoteGateway,
@@ -313,8 +269,6 @@ async fn relay_call(
     }
 }
 
-/// `GET /~/api/gateway/v1/workspace-calls/{target}`: does this gateway take
-/// calls for `target`? A paired gateway asks before it relays one.
 pub(crate) async fn takes_calls_for(
     State(state): State<GatewayState>,
     Path(target): Path<String>,
@@ -325,11 +279,6 @@ pub(crate) async fn takes_calls_for(
     }
 }
 
-/// `POST /~/api/gateway/v1/workspace-calls/{target}/chat/stream`: a call a
-/// paired gateway relayed, behind `require_gateway`.
-///
-/// The signature is checked against the credential the request presented,
-/// which `require_gateway` already matched to a current pairing.
 pub(crate) async fn receive(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,
@@ -360,8 +309,6 @@ pub(crate) async fn receive(
     serve_call(&state, &id, call, req).await
 }
 
-/// A relayed call starts a thread, so the pairing's remote start setting
-/// applies (ADR 0725). This route carries no card, so only Allow passes.
 fn remote_start_refusal(state: &GatewayState, gateway: &AuthenticatedGateway) -> Option<ApiError> {
     match gateway.remote_starts {
         RemoteStartSetting::Allow => None,

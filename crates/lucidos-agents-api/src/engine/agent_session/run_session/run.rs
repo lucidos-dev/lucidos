@@ -77,7 +77,7 @@ fn result_text_is_own_prose(text: &str, cc_error: Option<&str>) -> bool {
     !text.is_empty() && cc_error.map(str::trim) != Some(text)
 }
 
-/// Wait until the killed agent's process group is gone. The driver drops its
+/// INVARIANT: Wait until the killed agent's process group is gone. The driver drops its
 /// events sender only after the kill completes, so a closed channel is a
 /// precise signal. Bounded, so a stuck teardown cannot wedge the caller.
 async fn await_process_teardown(
@@ -88,7 +88,6 @@ async fn await_process_teardown(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         match tokio::time::timeout_at(deadline, events_rx.recv()).await {
-            // Trailing events from the dying process: drop them.
             Ok(Some(_)) => continue,
             Ok(None) => return,
             Err(_) => {
@@ -103,20 +102,15 @@ async fn await_process_teardown(
     }
 }
 
-/// How a driver that wound down before the first prompt could be sent ended.
 #[derive(Debug, Default)]
 struct StartupDeath {
-    /// The cause to show: the driver's own `Result` error, else the CLI's
-    /// stderr, else a note that a signal killed it.
     reason: Option<String>,
     exit: AgentExitFacts,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct InputGate {
-    /// The session handed off.
     handed_off: bool,
-    /// The provider blocked a turn: its history must not be replayed.
     provider_blocked: bool,
     ceiling_owed: bool,
 }
@@ -155,7 +149,6 @@ impl CeilingDelivery {
     }
 }
 
-/// Forward directly, preserving all of the running user's turn state.
 fn forward_ceiling_input(
     reentry: AgentUserInput,
     inputs: &mut InputLedger,
@@ -176,7 +169,7 @@ fn forward_ceiling_input(
     tx.send(input).is_ok()
 }
 
-/// The coding-agent driver dropped its input receiver before the engine could
+/// INVARIANT: The coding-agent driver dropped its input receiver before the engine could
 /// send the first prompt. That happens only when the driver task already wound
 /// down: the agent process failed to start, exited immediately, or its handshake
 /// failed. In every such path the driver flushes its REAL cause onto `events_rx`
@@ -193,8 +186,6 @@ fn drain_startup_death(
     let mut exit = AgentExitFacts::default();
     while let Ok(ev) = events_rx.try_recv() {
         match ev {
-            // Last non-empty error wins: the driver emits the specific cause
-            // before the terminal Exited.
             AgentEvent::Result { error: Some(e), .. } if !e.trim().is_empty() => {
                 error = Some(e);
             }
@@ -231,11 +222,6 @@ fn classify_startup_failure(resumed: bool, cause: Option<String>) -> StartupFail
     }
 }
 
-/// The error a start failure returns once the first prompt could not be sent.
-///
-/// A death that left facts becomes an [`AgentStartFailure`] carrying the CLI's
-/// own words, so the turn fails with its stage and exit code. One that left
-/// nothing (a driver that panicked) keeps the plain message.
 fn startup_failure_error(
     coding_agent: CodingAgent,
     death: StartupDeath,
@@ -267,7 +253,6 @@ fn unregistered_lucidos_root(
     Err(crate::engine::agent_session::err_no_lucidos_source())
 }
 
-/// The token counts of one `AgentEvent::Usage`, as the agent reported them.
 #[derive(Debug)]
 pub(crate) struct ReportedUsage {
     billing: BillingAttribution,
@@ -308,13 +293,10 @@ impl ReportedUsage {
     }
 }
 
-/// Bound the stop-time usage drain. Claude Code flushes ahead of group teardown;
+/// INVARIANT: Bound the stop-time usage drain. Claude Code flushes ahead of group teardown;
 /// Codex can still send a usage notification already being mapped at the stop.
 const USAGE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The `Usage` events a stopped driver sends, read up to its `OutputEnded`
-/// (or `Exited`, or a closed channel) and at most for `wait`. Every other
-/// event is dropped except billing observations, which scope the usage.
 async fn usage_flushed_at_stop(
     events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     wait: std::time::Duration,
@@ -375,12 +357,9 @@ async fn usage_flushed_at_stop(
     flushed
 }
 
-/// The two model ids one coding-agent call records on its `ContextCaptured`.
 #[derive(Debug, PartialEq)]
 pub(crate) struct CallModels {
     model: String,
-    /// The *served model*: the id the reply named, verbatim. It always reads
-    /// as served as sent beside `model`, since one reply names both.
     served_model: Option<String>,
 }
 
@@ -405,9 +384,6 @@ impl CallModels {
     }
 }
 
-/// The reasoning effort a coding-agent call ran at. `spawn_effort` is the one
-/// this subprocess was started with, and `reported_effort` the one the driver
-/// sent with the call's turn.
 fn effort_in_force(
     coding_agent: CodingAgent,
     spawn_effort: Option<&str>,
@@ -415,14 +391,10 @@ fn effort_in_force(
 ) -> Option<String> {
     match coding_agent {
         CodingAgent::ClaudeCode => spawn_effort.map(String::from),
-        // Codex reports the effort it validated for each turn.
         CodingAgent::Codex => reported_effort,
     }
 }
 
-/// The `ContextCaptured` that records one coding-agent API call. Sections
-/// stay empty, because the agent does not expose its system prompt or tool
-/// schemas.
 fn coding_agent_capture(
     coding_agent: CodingAgent,
     models: CallModels,
@@ -440,7 +412,6 @@ fn coding_agent_capture(
         output_tokens: reported.output_tokens,
         cache_read_tokens: reported.cache_read_tokens,
         cache_creation_tokens: reported.cache_creation_tokens,
-        // A coding agent reports one blended total per direction.
         modality: None,
         service_tier: None,
         cache_creation_1h_tokens: reported.cache_creation_1h_tokens,
@@ -457,7 +428,6 @@ fn coding_agent_capture(
         estimated_total_tokens,
         usage: Some(usage),
         trimmed: false,
-        // This path never runs the trimmer, so no pass can have fired.
         trim_passes: Vec::new(),
         purpose: crate::engine::ContextPurpose::Turn,
         reconstructed: false,
@@ -502,9 +472,6 @@ pub(crate) impl LucidosEngine {
             .await;
     }
 
-    /// Record one coding-agent API call as a `ContextCaptured` carrying its
-    /// usage and the effort it ran at. A main-session call also sets the
-    /// session's effort in force, which `token` names as this run's.
     #[allow(clippy::too_many_arguments)]
     async fn record_coding_agent_usage(
         &self,
@@ -584,10 +551,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Decide the idle exit again after the ledger changed outside an agent
-    /// event. A withdraw or a settled take can leave an idle session owing
-    /// nothing, and only an idle decides the exit. `true` when the session
-    /// should end.
     async fn idle_exit_ends_session(
         &self,
         thread_id: Uuid,
@@ -606,13 +569,6 @@ pub(crate) impl LucidosEngine {
         exited && action == IdleAction::EndSession
     }
 
-    /// At an idle, exit the subprocess unless a follow-up is on its way: one in
-    /// `msg_rx`, one of the `owed` inputs the agent has not read, or an armed
-    /// redirect. The next turn then resumes with `--resume`. Returns whether
-    /// it exited.
-    ///
-    /// Refreshes the gate's `handed_off` flag. A handoff that ended, for
-    /// example by a Stop, re-opens the input arm for what it left queued.
     async fn exit_idle_subprocess_unless_owed(
         &self,
         thread_id: Uuid,
@@ -625,9 +581,6 @@ pub(crate) impl LucidosEngine {
             crate::engine::pending_handoff::handoff_pending(self.pool(), thread_id).await;
         let leaves_queue_to_next_session = !input_gate.forwards();
         let mut sessions = self.agent_sessions.lock().await;
-        // Taken, not read: one idle of grace, so an arming caller that dies
-        // before routing costs one kept-alive idle rather than a pinned
-        // subprocess.
         let redirect_pending = sessions
             .get_mut(&thread_id)
             .map(|s| std::mem::take(&mut s.redirect_followup_pending))
@@ -703,11 +656,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// Flush any reasoning accumulated in `buf` past `last_len` as a
-    /// `CodingAgentThoughtStreamed`, advancing `last_len`. Idempotent: it emits
-    /// only the new tail. Coalesces per-token reasoning deltas into a handful of
-    /// rows per turn, mirroring the assistant-text flush path. The buffer is
-    /// sliced on a char boundary, so multi-byte reasoning never panics.
     async fn flush_coding_agent_thought(
         &self,
         thread_id: Uuid,
@@ -739,25 +687,17 @@ pub(crate) impl LucidosEngine {
         *last_len = buf.len();
     }
 
-    // Bridges every per-session input to the agent runtime; a builder would
-    // just shuffle the same fields.
     #[allow(clippy::too_many_arguments)]
     async fn run_direct_agent(
         &self,
-        // Borrowed, so a caller's stale-resume retry runs on the same claim
-        // and nothing can take the thread between the two runs.
         claim: &mut crate::engine::session_claim::SpawnClaim,
         request_id: Uuid,
         user_message: &str,
         user_images: Option<&[crate::engine::types::ChatImage]>,
         origin_id: Uuid,
-        // More events the first prompt carries beside its origin, such as the
-        // messages a resume delivers. Its read settles each one.
         carried_event_ids: &[Uuid],
         spawning_event_id: Option<Uuid>,
         cancel_token: &tokio_util::sync::CancellationToken,
-        // A conflict-resolution session holds the change's apply claim for
-        // its whole run, so no second apply starts beside it.
         conflict: Option<&crate::engine::change_ops::apply_claim::ApplyClaim>,
         recovery_worktree: Option<(PathBuf, String)>,
         repo_id: Option<String>,
@@ -765,15 +705,10 @@ pub(crate) impl LucidosEngine {
         resume_session_id: Option<String>,
         cc_model: Option<String>,
         cc_reasoning_effort: Option<String>,
-        // CWD for `--resume`. See the `UserQuestionAsked.worktree_path` doc.
         resume_worktree_path: Option<PathBuf>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         require_agent_input(user_message, user_images)?;
         let thread_id = claim.thread_id;
-        // A run on an open lane batch's lane thread resolves that batch,
-        // whoever started it: the lane, a follow-up, a Continue or a switch
-        // resume (ADR 0463). Closed lane threads refuse every route,
-        // including conflict recovery and hardening sessions (ADR 0662).
         let lane_duty = crate::engine::landing_lane::lane_duty_for_run(
             self.pool(),
             self.workspace_path(),
@@ -824,9 +759,6 @@ pub(crate) impl LucidosEngine {
         result
     }
 
-    // `run_direct_agent`'s inputs, its resolved lane duty and its
-    // `lane_answered` flag, passed on one-to-one. A struct would only rename
-    // the same fields.
     #[allow(clippy::too_many_arguments)]
     async fn run_agent_session(
         &self,
@@ -852,13 +784,9 @@ pub(crate) impl LucidosEngine {
         let cc_start = std::time::Instant::now();
         let thread_id = claim.thread_id;
         self.gate_coding_agent_spawn(thread_id, origin_id).await?;
-        // A retry's first run cancelled the token to kill its process.
         if claim.entry.agent_cancel.is_cancelled() {
             claim.entry.agent_cancel = tokio_util::sync::CancellationToken::new();
         }
-        // Resolved before the spawn so the process starts with them, and the
-        // shadowed `cc_model` tells the Init handler a model was picked. A
-        // pick between turns is in the thread's settings (ADR 0542).
         let (model, effort) = self
             .coding_agent_rung(
                 thread_id,
@@ -881,18 +809,9 @@ pub(crate) impl LucidosEngine {
             (model, effort)
         };
         let conflict_change_id = conflict.map(|c| c.change_id());
-        // Neither kind proposes its branch: a resolution lands through Apply
-        // or the lane, and ends its session at the first idle that owes no
-        // follow-up.
         let is_resolution_session = conflict_change_id.is_some() || lane_duty.is_some();
         let thread_id_str = thread_id.to_string();
         let coding_agent = claim.entry.coding_agent;
-        // Pre-spawn app-coding-agent-thread detection. `spawn_agent_thread`
-        // stashes the app id here when the LLM picks an app folder. Pop it once,
-        // so the worktree dispatcher routes to sparse-checkout and the
-        // system-prompt selector picks the app variant. Falls back to
-        // `thread_summaries` on resume, so a follow-up on an existing app thread
-        // still routes correctly.
         let app_spawn_id: Option<String> = {
             let mut guard = self
                 .pending_app_spawn
@@ -934,14 +853,9 @@ pub(crate) impl LucidosEngine {
             }
         };
         let is_app_spawn = app_spawn_id.is_some();
-        // The child's first message recorded the flag, before any run.
         let integrated =
             crate::engine::integrated::read_thread_is_integrated(&self.pool, thread_id).await?;
 
-        // Mutable so the interrupt arm can stamp `meta.actor` with the device
-        // that clicked Cancel. The terminal `ResponseCanceled` then carries it
-        // for the Initiator popover. Cleared at the next turn boundary, so a
-        // resumed session does not inherit a stale actor.
         let mut meta = crate::engine::thread_events::EventMeta {
             request_event_id: Some(origin_id),
             channel: Some(EventChannel::ClaudeCode),
@@ -981,7 +895,6 @@ pub(crate) impl LucidosEngine {
             branch: resume_branch,
         } = run_resume;
 
-        // Conflict resolution mode: run in the merge worktree (not repo root)
         let conflict_change = if let Some(cid) = conflict_change_id {
             Some(
                 self.changes()
@@ -998,8 +911,6 @@ pub(crate) impl LucidosEngine {
             cc_start.elapsed()
         );
 
-        // If no repo_id was provided (e.g. follow-up message), look up the thread's
-        // stored repo from thread_summaries so we stay bound to the original repo.
         let repo_id = if repo_id.is_none() {
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT cc_repo_id FROM thread_summaries WHERE thread_id = $1",
@@ -1012,12 +923,8 @@ pub(crate) impl LucidosEngine {
             repo_id
         };
 
-        // Coding-agent sessions must branch from main, not from a stale worktree branch.
         let dev_root = main_worktree().await;
 
-        // Explicit repo_id wins; otherwise fall back to the workspace's registered
-        // Lucidos repo so SessionStarted always names a real repository. Without
-        // this, the route panel rendered the workspace name as if it were the repo.
         let repo = if let Some(ref rid) = repo_id {
             let repo_uuid = Uuid::parse_str(rid)?;
             Some(
@@ -1035,8 +942,6 @@ pub(crate) impl LucidosEngine {
 
         let (repo_id, repo_root, is_external_repo, external_repo_name, repo_name) = if is_app_spawn
         {
-            // App coding-agent thread: the worktree's git root is the workspace
-            // itself, and apps are not in the repo registry.
             (None, self.workspace_path.clone(), false, None, None)
         } else if let Some(repo) = repo {
             let path = PathBuf::from(&repo.path);
@@ -1054,8 +959,6 @@ pub(crate) impl LucidosEngine {
                 Some(repo_name),
             )
         } else {
-            // No repo resolved and not an app spawn, so this is "edit Lucidos
-            // itself". Only legitimate when a source checkout exists.
             (
                 None,
                 unregistered_lucidos_root(dev_root, crate::paths::has_lucidos_source())?,
@@ -1073,9 +976,6 @@ pub(crate) impl LucidosEngine {
         };
 
         let workspace_name = self.workspace_name();
-        // The tri-state matters only to spawn-time branch adoption, which reads
-        // "no idle recorded one" and "could not ask" differently. Everything
-        // else below wants the sha or nothing.
         let idle_anchor = crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
             self.pool(),
             thread_id,
@@ -1125,8 +1025,6 @@ pub(crate) impl LucidosEngine {
             None => last_idle_sha.clone(),
         };
 
-        // A resolution session works for the batch or the change, never as the
-        // integrated thread itself.
         if integrated && !is_resolution_session {
             session_context.push(
                 &crate::engine::agent_session::prompts::integrated_section(self.pool(), thread_id)
@@ -1134,12 +1032,6 @@ pub(crate) impl LucidosEngine {
             );
         }
 
-        // Asked before the process starts, so a failed lookup costs no work.
-        // This session's `SessionStarted` closes the window, so it must not be
-        // recorded over a lookup that failed. A lookup that fails after its
-        // retries fails the turn: starting anyway would lose the message for
-        // good, while a failed turn is retried by the next send (ADR 0574).
-        // A keep-alive must not act.
         let first_prompt_events: Vec<Uuid> = std::iter::once(origin_id)
             .chain(carried_event_ids.iter().copied())
             .collect();
@@ -1157,14 +1049,8 @@ pub(crate) impl LucidosEngine {
                 format!("Could not check for messages the previous session never read: {e}")
             })?
         };
-        // A new session in an existing thread sees what was discussed and done
-        // before this message, and the images no agent has seen yet. A stranded
-        // follow-up is redelivered with its own images, so it brings none here.
-        // A successor session starts clean: its opening carries the context.
         if pending_handoff.is_none() {
             let thread_messages = self.event_store.get_thread_messages(&thread_id_str).await?;
-            // The first prompt's turn-gap note carries the user-only messages
-            // since the previous turn, so the history leaves them out.
             let in_first_prompt: Vec<String> =
                 crate::engine::agent_session::turn_gap::compute_turn_gap_note(
                     &self.pool, thread_id, origin_id, None,
@@ -1205,8 +1091,6 @@ pub(crate) impl LucidosEngine {
             session_context.push(&thread_history_block(&prior, &attached));
             session_context.attach_images(images);
         }
-        // A successor session, or one after a provider block, reads its opening
-        // first, whatever input started it.
         let opened_message = match (&pending_handoff, blocking_policy) {
             (Some(handoff), _) => Some(handoff.first_message(user_message)),
             (None, Some(policy)) => Some(crate::engine::successor::provider_blocked_input(
@@ -1244,7 +1128,6 @@ pub(crate) impl LucidosEngine {
             crate::engine::main_check::repair_build_class(self.pool(), thread_id)
                 .await
                 .map_err(|error| format!("Could not read repair build class: {error}"))?;
-        // Masked out of every tool result this session stores.
         let tool_result_secrets =
             crate::runtime::spawn_env::session_secret_values(thread_id, &user_env_vars);
         let injected_pin = recorded_pin
@@ -1255,10 +1138,6 @@ pub(crate) impl LucidosEngine {
             default_claude_config_dir(),
         );
         let effective_pin = injected_pin.clone().or_else(|| live_account.clone());
-        // CC's defaults, resolved as the spawned CC will resolve them. The
-        // settings files are a CC-only fallback, reached only for a model the
-        // registry has no default effort for: their effort vocabulary must not
-        // leak into other backends.
         let cc_defaults = (coding_agent == CodingAgent::ClaudeCode).then(|| {
             crate::runtime::claude_code::CcSettingsScope {
                 env: &user_env_vars,
@@ -1272,10 +1151,6 @@ pub(crate) impl LucidosEngine {
         let cc_reasoning_effort =
             pinned_effort.or_else(|| cc_defaults.as_ref().and_then(|s| s.default_effort()));
         let cc_default_model = cc_defaults.as_ref().and_then(|s| s.default_model());
-        // User-configured agent binary path. Resolved here, where the spawn
-        // orchestration has the pool, and validated inside the runtime's spawn.
-        // An unresolvable path fails loud and names the setting, rather than
-        // falling back to probing.
         let binary_override_pref = match coding_agent {
             crate::runtime::CodingAgent::ClaudeCode => {
                 &crate::core::prefs::CODING_AGENT_CLAUDE_PATH
@@ -1283,10 +1158,6 @@ pub(crate) impl LucidosEngine {
             crate::runtime::CodingAgent::Codex => &crate::core::prefs::CODING_AGENT_CODEX_PATH,
         };
         let binary_override = binary_override_pref.read(self.pool()).await;
-        // Whether the text the model writes before a tool call reaches the
-        // user, as far as the spawn knows. Claude Code starts hidden and the
-        // stream promotes it (`claude_code_notes`). Codex streams its own
-        // summary.
         let notes = match coding_agent {
             crate::runtime::CodingAgent::ClaudeCode => {
                 crate::runtime::claude_code_notes::notes_visibility(cc_model.as_deref())
@@ -1297,10 +1168,6 @@ pub(crate) impl LucidosEngine {
         };
         let system_prompt =
             crate::engine::agent_session::prompts::with_notes_visibility(system_prompt, notes);
-        // Which of Claude Code's permission modes this session runs in. Read
-        // only for Claude Code: Codex has no equivalent and ignores the field.
-        // An unreadable preference means the default, so a DB hiccup costs the
-        // user their opt-in for one spawn and never the spawn itself.
         let permission_mode = match coding_agent {
             crate::runtime::CodingAgent::ClaudeCode => {
                 crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE
@@ -1326,8 +1193,6 @@ pub(crate) impl LucidosEngine {
             }
             crate::runtime::CodingAgent::Codex => Vec::new(),
         };
-        // A Stop during the semaphore wait, or the reads since, costs nothing
-        // yet: no process exists.
         let Some(startup_permit) = startup_permit.filter(|_| !startup_cancel.is_cancelled()) else {
             crate::engine::git_ops::cleanup_failed_spawn(
                 &repo_root,
@@ -1391,10 +1256,6 @@ pub(crate) impl LucidosEngine {
         let (runtime, resume_attempt) = match spawned {
             Ok(r) => r,
             Err(e) => {
-                // Remove ONLY what this attempt created. Running both git calls
-                // unconditionally lets a failed RESUME force-remove the
-                // pre-existing worktree and delete the branch holding the
-                // thread's committed work.
                 crate::engine::git_ops::cleanup_failed_spawn(
                     &repo_root,
                     worktree_path.as_deref(),
@@ -1418,26 +1279,11 @@ pub(crate) impl LucidosEngine {
             control_tx: agent_control_tx,
             withdraw_tx: agent_withdraw_tx,
             kind: _,
-            // In-band approval requests (Codex app-server). `None` for CC and
-            // the Codex exec escape hatch, where the matching select arm below
-            // pends forever. Mutable so a closed channel can disable the arm.
             permission_rx: mut agent_permission_rx,
         } = runtime;
 
         let images = user_images.map(|imgs| imgs.to_vec()).unwrap_or_default();
 
-        // Phase 8.2: detect external user edits made between turns and prepend
-        // a short note so CC reacts instead of being surprised. Only fires when:
-        //   - this thread has at least one prior `CodingAgentIdled` event with a
-        //     recorded `worktree_head_sha` (skips truly-first spawns, where
-        //     there's no SHA to compare against)
-        //   - the worktree has actually changed since the recorded SHA (no
-        //     diff → no note, see helper)
-        //
-        // The note is prepended to the text only. Images are forwarded as-is.
-        // Failures inside the helper degrade silently to "no note", matching
-        // the rest of the resume code's tolerance for best-effort git
-        // introspection.
         let first = first_prompt_for_agent(
             &self.pool,
             &self.event_store,
@@ -1464,18 +1310,13 @@ pub(crate) impl LucidosEngine {
             images,
             uuid: Uuid::new_v4(),
         };
-        // Inputs carrying the device block, until the agent reads them.
         let mut blocks_in_flight: HashMap<Uuid, ContextFingerprint> = HashMap::new();
         if let Some(fingerprint) = first.device_block {
             blocks_in_flight.insert(first_input.uuid, fingerprint);
         }
-        // The first prompt is the first owed input.
         let mut inputs = InputLedger::new();
         inputs.forwarded(first_prompt_events, &first_input, None);
         if agent_input_tx.send(first_input).is_err() {
-            // Same contract as the spawn_or_resume failure arm above: remove
-            // ONLY what this attempt created: a resumed worktree/branch holds
-            // the thread's committed work.
             crate::engine::git_ops::cleanup_failed_spawn(
                 &repo_root,
                 worktree_path.as_deref(),
@@ -1484,9 +1325,6 @@ pub(crate) impl LucidosEngine {
                 branch_created,
             )
             .await;
-            // The driver already wound down, so recover the real cause it
-            // flushed onto `events_rx`. A bare "channel closed" hides what
-            // actually failed.
             let death = drain_startup_death(&mut events_rx);
             return Err(
                 match classify_startup_failure(resume_session_id.is_some(), death.reason.clone()) {
@@ -1499,10 +1337,6 @@ pub(crate) impl LucidosEngine {
                             thread_id,
                             resume_session_id.as_deref().unwrap_or("")
                         );
-                        // Same contract as the run loop's stale-resume arm:
-                        // shadow the dead id so the retry cannot pick it
-                        // again. The driver already exited, so there is no
-                        // process group to wait for.
                         self.event_bus
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
@@ -1525,7 +1359,6 @@ pub(crate) impl LucidosEngine {
         let mut startup_permit = Some(startup_permit);
 
         let mut pending_withdraws = PendingWithdraws::new();
-        // Withdraws for follow-ups still in `msg_rx`, answered once forwarded.
         let mut withdraws_awaiting_forward: Vec<WithdrawInputRequest> = Vec::new();
         let stop = claim.entry.stop.clone();
         let interrupt = claim.entry.interrupt.clone();
@@ -1534,10 +1367,7 @@ pub(crate) impl LucidosEngine {
         let external_terminal_emitted = claim.entry.external_terminal_emitted.clone();
         let external_continuation_requested = claim.entry.external_continuation_requested.clone();
         let mut normalized_model = cc_model.clone();
-        // The effort each Init records as the thread's rung. A model swap
-        // replaces it for the rest of this process.
         let mut rung_effort = cc_reasoning_effort.clone();
-        // A swap this process saw, until a clean idle sends its re-entry.
         let mut pending_model_swap: Option<crate::engine::model_swap::ModelSwap> = None;
         let tools_in_flight_shared = claim.entry.tools_in_flight.clone();
         let question_flushes = LoopEndsFlushes(claim.entry.question_flushes.clone());
@@ -1557,10 +1387,6 @@ pub(crate) impl LucidosEngine {
                 session.phase = crate::engine::SessionPhase::Running {
                     control_tx: agent_control_tx.clone(),
                 };
-                // Names this session as the resolver for the merge-ownership
-                // guard (ADR 0060). Tier-2 / Tier-3 merge spawns reach here
-                // with `conflict_change_id` set, and a lane thread with its
-                // batch. Every other session is None.
                 session.conflict = conflict_change_id
                     .map(|change_id| crate::engine::types::ConflictBinding::Detached { change_id })
                     .or_else(|| {
@@ -1588,7 +1414,6 @@ pub(crate) impl LucidosEngine {
             await_process_teardown(&mut events_rx, thread_id, "a Stop during startup").await;
             return Ok(self.settle_canceled_startup(claim, request_id, &meta).await);
         }
-        // A dropped run future now leaves a turn that nobody will end.
         claim.entry_guard.settle_if_dropped();
         if let Some(apply_claim) = conflict {
             apply_claim.carried_by_session(external_continuation_requested.clone());
@@ -1615,7 +1440,7 @@ pub(crate) impl LucidosEngine {
         let chat_cancel = cancel_token.clone();
         let images: Vec<String> = Vec::new();
 
-        // Emit SessionStarted immediately so the branch→thread mapping exists
+        // INVARIANT: Emit SessionStarted immediately so the branch→thread mapping exists
         // before CC produces any output. Without this, an engine crash during CC
         // initialization leaves no mapping and recovery creates orphan threads.
         // The cc_session_id is not yet known (comes from CC's Init event), but
@@ -1628,12 +1453,9 @@ pub(crate) impl LucidosEngine {
                 .to_string_lossy()
                 .to_string()
         } else {
-            // Lucidos / External: folder = repo_root. Workspace-local repos
-            // (lucidos source under a non-default install root) reuse the
-            // same path their SessionStarted event has always carried.
             repo_root.to_string_lossy().to_string()
         };
-        // Read before the emit below, which would count as an earlier session.
+        // INVARIANT: Read before the emit below, which would count as an earlier session.
         let continuity = if records_continuity || resume_attempt == ResumeAttempt::Resumed {
             resolve_session_continuity(
                 self.pool(),
@@ -1680,18 +1502,6 @@ pub(crate) impl LucidosEngine {
             }
         };
 
-        // Seed the branch work from the actual worktree state. The
-        // projection's per-event handlers keep it live, but cannot fill
-        // the gap between session start and the first new commit. A thread
-        // resumed after an engine restart would show no Diff button until its
-        // next commit, even with commits already on the branch.
-        //
-        // Outside the projection transaction by design: `git diff` inside a
-        // Postgres transaction is the wrong shape. The helper logs and continues
-        // on failure, because bootstrap must not block on git. It writes the
-        // same git truth the Diff button computes, so the button's visibility
-        // and its rendered diff stay in lockstep. Both the initial start and the
-        // resume path land here.
         crate::engine::session_seed::seed_branch_work(
             self.pool(),
             thread_id,
@@ -1700,9 +1510,6 @@ pub(crate) impl LucidosEngine {
         )
         .await;
 
-        // Persist initial model/effort so cc_thread_settings() can restore them
-        // after the session exits. Without this, the frontend loses the model
-        // selection when viewing idle threads (no live session to query).
         if records_rung && (normalized_model.is_some() || cc_reasoning_effort.is_some()) {
             if let Err(e) = self
                 .event_bus
@@ -1712,9 +1519,6 @@ pub(crate) impl LucidosEngine {
                         model: normalized_model.clone(),
                         reasoning_effort: cc_reasoning_effort.clone(),
                         coding_agent,
-                        // Fires before CC's Init, so the session id is not known
-                        // yet. The Init handler emits a second SettingsChanged
-                        // carrying it and the config dir.
                         cc_session_id: None,
                         claude_config_dir: None,
                         claude_config_dir_explicit: None,
@@ -1732,11 +1536,6 @@ pub(crate) impl LucidosEngine {
         }
 
         let mut result_texts: Vec<String> = Vec::new();
-        // Count tool calls seen before the first `Result`. Feeds
-        // `is_stale_resume_signal`: a resumed turn that made ANY tool call is
-        // alive and working, even with no assistant text from a terse model. The
-        // stale check only fires on the first Result, so a session-scoped
-        // counter is exactly "tool calls before the first Result".
         let mut tool_calls_seen: u32 = 0;
         let mut api_calls_seen: u32 = 0;
         let mut init_session_id: Option<String> = None;
@@ -1751,70 +1550,41 @@ pub(crate) impl LucidosEngine {
         )
         .await;
         let mut claude_text_buf = CodingAgentTextBuffer::default();
-        // Reasoning stream buffer, coalesced like the text buffer above. Deltas
-        // arrive per-token, so flush on a paragraph boundary or once
-        // `THOUGHT_FLUSH_THRESHOLD` chars accumulate. The threshold bounds
-        // latency, so a long unbroken paragraph still streams live.
         let mut claude_thought_buf = String::new();
         let mut last_thought_persisted_len: usize = 0;
         const THOUGHT_FLUSH_THRESHOLD: usize = 240;
         let mut is_waiting = false;
         let mut input_gate = InputGate::default();
         let mut proposed_change = false;
-        // What each turn-end re-entry last went out for.
         let mut reentry_ledger = crate::engine::turn_end::ReentryLedger::default();
-        // Forwarding holds later input; only the read classifies its turn.
         let mut ceiling_reentry_forwarded = false;
         let mut ceiling_delivery = CeilingDelivery::default();
         let mut approved_ceiling_reentry = None;
         let mut held_ceiling_inputs = Vec::new();
-        let mut emitted_terminal_event = false; // Track whether ResponseGenerated/ResponseCanceled was emitted
-                                                // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
-                                                // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
+        let mut emitted_terminal_event = false;
         let mut user_hit_stop = false;
-        // redirect_cause: set alongside user_hit_stop when a redirect (a
-        // follow-up) sent the interrupt. The Result then
-        // renders neutrally, not as a user Stop. Cleared at the turn boundary
-        // in lockstep with user_hit_stop.
         let mut redirect_cause = None;
-        // last_emitted_idle: true iff the most recent in-loop event was
-        // CodingAgentIdled. The post-loop relies on this flag to decide whether to
-        // synthesize an idle event before SessionEnded.
         let mut last_emitted_idle = false;
         let tools_in_flight = tools_in_flight_shared;
         let mut tool_names = super::super::tool_output::ToolNamesById::default();
-        // last_terminal_kind: terminal emitted by the most recently completed
-        // turn. Drives `should_auto_commit_on_cleanup`, so the cleanup commits
-        // only when the last turn ended Generated. Every other terminal leaves
-        // this None or non-Generated, which means no auto-commit and no spurious
-        // Apply card. Reset per turn alongside `emitted_terminal_event`.
         let mut last_terminal_kind: Option<TerminalKind> = None;
         let mut withheld_api_error: Option<String> = None;
         let mut watchdog_fired = false;
-        // How the agent's process ended, from its `Exited`. The safety net
-        // classifies it: a stray signal kill auto-resumes, a failed exit fails
-        // the turn with the agent's own words.
         let mut exit_facts = AgentExitFacts::default();
         let mut interrupt_escalate_at: Option<tokio::time::Instant> = None;
         const INTERRUPT_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
 
         'event_loop: loop {
-            // Snapshot the (Copy) deadline so the escalation arm below polls a
-            // value, not a borrow of `interrupt_escalate_at` that other arms mutate.
             let escalate_deadline = interrupt_escalate_at;
             tokio::select! {
                 event_opt = events_rx.recv() => {
                     let Some(ev) = event_opt else {
-                        // Driver task exited without sending Exited (defensive).
                         log_legacy!(
                             "[AgentSession] events_rx closed without AgentEvent::Exited for thread {}",
                             thread_id
                         );
                         break;
                     };
-                    // Not agent activity: it must not start a turn. Only a
-                    // stopped session acts on it, through
-                    // `record_usage_flushed_at_stop`.
                     if matches!(ev, AgentEvent::OutputEnded) {
                         continue;
                     }
@@ -1834,7 +1604,6 @@ pub(crate) impl LucidosEngine {
                         continue;
                     }
                     if let AgentEvent::UsageUnscoped { snapshot } = ev {
-                        // Uncertain identity cannot prove that no model call happened.
                         api_calls_seen = api_calls_seen.saturating_add(1);
                         self.record_coding_agent_usage(
                             thread_id, &external_terminal_emitted, &meta, coding_agent,
@@ -1866,8 +1635,6 @@ pub(crate) impl LucidosEngine {
                     child_reports.publish(inputs.owed_child_reports());
                     if let AgentEvent::Exited { exit } = ev {
                         exit_facts = exit;
-                        // Final flush of any pending reasoning: surface what the
-                        // process reasoned before it died.
                         self.flush_coding_agent_thought(
                             thread_id,
                             &claude_thought_buf,
@@ -1878,7 +1645,7 @@ pub(crate) impl LucidosEngine {
                         .await;
                         claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (final flush on exit)").await;
                         if is_waiting {
-                            // The process exited after producing a Result, so the
+                            // INVARIANT: The process exited after producing a Result, so the
                             // session is idle. Do not hold the ThreadGuard for
                             // follow-ups: auto-commit, drop the sessions entry
                             // and return. The worktree and branch persist on
@@ -1908,8 +1675,6 @@ pub(crate) impl LucidosEngine {
                                 break;
                             };
                             log_legacy!("[AgentSession] CC process exited while idle, releasing thread {}", thread_id);
-                            // Save slash commands to cache now the session is gone.
-                            // Model/effort are persisted via CodingAgentSettingsChanged events.
                             let cache_snapshot = entry.and_then(|s| {
                                 s.repo_root.as_ref().map(|r| {
                                     (r.to_string_lossy().to_string(), s.to_commands_info())
@@ -1919,9 +1684,6 @@ pub(crate) impl LucidosEngine {
                                 self.upsert_cc_commands_cache(repo_key, info).await;
                             }
 
-                            // Drain follow-ups that arrived between CodingAgentIdled
-                            // and process exit. Convert to orphaned injections so the
-                            // caller re-processes them instead of showing "interrupted".
                             for held in held_ceiling_inputs.drain(..).rev() {
                                 requeue_at_head(&msg_tx, msg_rx, held);
                             }
@@ -1932,7 +1694,6 @@ pub(crate) impl LucidosEngine {
                                 &meta,
                                 withheld_api_error.take(),
                                 !orphans.is_empty(),
-                                // `idle_exit` released the entry: no stop was pending.
                                 false,
                             )
                             .await;
@@ -1955,20 +1716,6 @@ pub(crate) impl LucidosEngine {
                         );
                         break;
                     }
-                    // Stamp liveness for apply_now's timeout. Also drain the
-                    // question-answer resume signal in the SAME lock. Two turns
-                    // start without the run loop forwarding anything at that
-                    // moment, so neither reaches the `msg_rx` arm's
-                    // `reset_per_turn_flags`:
-                    //
-                    // - A live subprocess woken by an answered question resumes
-                    //   through the PreToolUse hook.
-                    // - An input forwarded during the previous turn, read only
-                    //   after that turn's `Result` (ADR 0268).
-                    //
-                    // On a terminal-armed turn, re-arm emission below, so the new
-                    // turn's events are processed rather than dropped as
-                    // stragglers.
                     let new_turn_after_terminal = {
                         let mut guard = self.agent_sessions.lock().await;
                         if let Some(s) = guard.get_mut(&thread_id) {
@@ -1980,7 +1727,6 @@ pub(crate) impl LucidosEngine {
                                 emitted_terminal_event,
                             );
                             if reset {
-                                // Mirror the msg_rx arm's session-side clear.
                                 s.is_waiting = false;
                             }
                             reset
@@ -2022,16 +1768,11 @@ pub(crate) impl LucidosEngine {
                             log_legacy!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
                             let first_init = init_session_id.replace(cc_sid.clone()).is_none();
                             let requested_model = cc_model.as_deref().or(cc_default_model.as_deref());
-                            // Claude Code repeats Init on every turn of one
-                            // process, so only the first one reports.
                             let substitution = init_model
                                 .as_deref()
                                 .filter(|_| first_init && coding_agent == CodingAgent::ClaudeCode)
                                 .and_then(|m| crate::runtime::claude_code::substituted_cc_model(requested_model, m))
                                 .zip(requested_model.map(String::from));
-                            // The process keeps the pick's effort, but the rung
-                            // the next process starts on is the served model at
-                            // its own configured effort.
                             let mut model_swap = None;
                             if let Some((served, requested)) = &substitution {
                                 let served = crate::runtime::claude_code::reconcile_cc_model(
@@ -2052,7 +1793,6 @@ pub(crate) impl LucidosEngine {
                                     served_effort: rung_effort.clone(),
                                 });
                             }
-                            // Enable --resume for follow-ups and engine restart
                             let cache_update = {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) {
@@ -2061,9 +1801,6 @@ pub(crate) impl LucidosEngine {
                                     if substitution.is_some() {
                                         s.current_reasoning_effort = rung_effort.clone();
                                     }
-                                    // Always update from Init: CC reports the full
-                                    // model id, which is authoritative over any
-                                    // alias the user selected.
                                     if let Some(ref m) = init_model {
                                         let norm = crate::runtime::claude_code::reconcile_cc_model(
                                             requested_model,
@@ -2109,9 +1846,6 @@ pub(crate) impl LucidosEngine {
                             }).await {
                                 log_legacy!("[AgentSession] Failed to persist Init CodingAgentSettingsChanged for {}: {}", thread_id, e);
                             }
-                            // A respawn asks for the served model, so this
-                            // fires once per refused pick, not once per turn.
-                            // A pick served as asked ends any refusal of it.
                             let served_as_asked = first_init
                                 && coding_agent == CodingAgent::ClaudeCode
                                 && init_model.is_some();
@@ -2123,8 +1857,6 @@ pub(crate) impl LucidosEngine {
                                 );
                             }
                             if let Some((served, requested)) = substitution {
-                                // The owner hears of a refusal once, not once per
-                                // thread that runs into it.
                                 if self.record_cc_model_refusal(
                                     &requested,
                                     agent_version.as_deref(),
@@ -2143,7 +1875,6 @@ pub(crate) impl LucidosEngine {
                                     meta: meta.clone(),
                                 }, "[AgentSession] CodingAgentModelSubstituted").await;
                             }
-                            // The process is initialized and mostly idle now.
                             if let Some(permit) = startup_permit.take() {
                                 drop(permit);
                                 log_legacy!("[AgentSession] [TIMING] Startup semaphore released: {:?}", cc_start.elapsed());
@@ -2164,8 +1895,6 @@ pub(crate) impl LucidosEngine {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
-                            // Reasoning precedes the answer, so flush any pending
-                            // thought and let the "Thinking" step resolve first.
                             self.flush_coding_agent_thought(
                                 thread_id,
                                 &claude_thought_buf,
@@ -2178,7 +1907,6 @@ pub(crate) impl LucidosEngine {
                                 claude_text_buf.break_paragraph();
                             }
                             claude_text_buf.push(&text);
-                            // Persist + broadcast at natural boundaries
                             if should_flush(claude_text_buf.as_str()) {
                                 claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (Message flush)").await;
                             }
@@ -2202,9 +1930,6 @@ pub(crate) impl LucidosEngine {
                                 .await;
                         }
                         AgentEvent::SubAgentMessage { .. } if turn_ended => {}
-                        // A sub-agent's prose is recorded whole, tagged with its
-                        // `Agent` call, and kept out of the session's text buffer:
-                        // that buffer is the session's own reply.
                         AgentEvent::SubAgentMessage { text, parent_tool_use_id } => {
                             let text = text.trim();
                             if !text.is_empty() {
@@ -2222,17 +1947,12 @@ pub(crate) impl LucidosEngine {
                         }
                         AgentEvent::Thought { .. } if turn_ended => {}
                         AgentEvent::Thought { text } => {
-                            // A thought is the first sign of life on a resumed
-                            // turn, so clear the waiting state.
                             if is_waiting {
                                 is_waiting = false;
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
                             claude_thought_buf.push_str(&text);
-                            // Flush on a paragraph boundary or once enough has
-                            // piled up, so a long unbroken paragraph still
-                            // streams live instead of landing at turn end.
                             if should_flush(&claude_thought_buf)
                                 || claude_thought_buf.len() - last_thought_persisted_len
                                     >= THOUGHT_FLUSH_THRESHOLD
@@ -2248,8 +1968,6 @@ pub(crate) impl LucidosEngine {
                             }
                         }
                         AgentEvent::ToolUse { name, id, input, .. } if turn_ended => {
-                            // No text is left to persist, so a waiting card
-                            // may take its second look.
                             if crate::runtime::is_user_question_tool(&name) {
                                 question_flushes.0.flushed(&id, &name, &input);
                             }
@@ -2264,8 +1982,6 @@ pub(crate) impl LucidosEngine {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
-                            // Interleaved-thinking turns reason right up to a tool
-                            // call, so flush before the tool step.
                             self.flush_coding_agent_thought(
                                 thread_id,
                                 &claude_thought_buf,
@@ -2277,23 +1993,10 @@ pub(crate) impl LucidosEngine {
                             claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (pre-ToolUse flush)").await;
                             claude_text_buf.break_paragraph();
                             tools_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            // A tool call this turn proves the session is alive,
-                            // even for a terse model that emits no text. Gates
-                            // the stale-resume heuristic below.
                             tool_calls_seen = tool_calls_seen.saturating_add(1);
                             tool_names.record(&id, &name);
                             if crate::runtime::is_user_question_tool(&name) {
-                                // The text before the card is persisted above,
-                                // so its gate may take its second look.
                                 question_flushes.0.flushed(&id, &name, &input);
-                                // Question flow: the subprocess blocks until the
-                                // user answers, and the engine renders the card
-                                // from the `UserQuestionAsked` the internal
-                                // endpoint emits. Every route into that endpoint
-                                // is named by `runtime::is_user_question_tool`.
-                                // `run_session` has nothing to do here: no emit,
-                                // which would double-surface the question, no
-                                // kill, and no session removal.
                             } else {
                                 let mut input = input;
                                 crate::core::redact_subprocess_output_in_json(&mut input, &tool_result_secrets);
@@ -2322,9 +2025,6 @@ pub(crate) impl LucidosEngine {
                             );
                         }
                         AgentEvent::ToolResult { output, status: _, id, parent_tool_use_id } => {
-                            // Re-arm the watchdog if this was the last in-flight
-                            // tool. Floored at 0 so an unpaired ToolResult cannot
-                            // underflow (see `release_tool_slot`).
                             release_tool_slot(&tools_in_flight);
                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
@@ -2422,16 +2122,7 @@ pub(crate) impl LucidosEngine {
                             }, "[AgentSession] CodingAgentCompacted").await;
                         }
                         AgentEvent::OutputEnded => unreachable!("OutputEnded skipped above"),
-                        // Liveness-only ping from a streaming delta. The
-                        // top-of-loop heartbeat bump already recorded that the
-                        // subprocess is alive. That is what stops the watchdog
-                        // from killing a long single step that streams past
-                        // `WATCHDOG_INACTIVITY_LIMIT_MS` without finishing.
-                        // Nothing to persist: the complete text or tool call
-                        // arrives separately.
                         AgentEvent::StreamActivity => {}
-                        // The ledger accounted for both at the top of this arm.
-                        // A block counts as sent once the agent has read it.
                         AgentEvent::InputRead { input } => {
                             let block = blocks_in_flight.remove(&input);
                             if let (true, Some(fingerprint), Some(conversation)) =
@@ -2450,9 +2141,6 @@ pub(crate) impl LucidosEngine {
                                         if provider_error.as_ref().is_some_and(|e| e.is_policy_block()) {
                                             input_gate.provider_blocked = true;
                                         }
-                                        // Final flush of any pending reasoning: a
-                                        // turn that reasoned then ended without
-                                        // text, or the tail below the threshold.
                                         self.flush_coding_agent_thought(
                                             thread_id,
                                             &claude_thought_buf,
@@ -2463,14 +2151,7 @@ pub(crate) impl LucidosEngine {
                                         .await;
                                         let result_text_is_live = !external_terminal_emitted
                                             .load(std::sync::atomic::Ordering::Acquire);
-                                        // Final flush of any pending text
                                         if !claude_text_buf.is_empty() {
-                                            // `Result.text` may carry text beyond
-                                            // what the Message events streamed.
-                                            // Append the extra, so the frontend
-                                            // sees the complete text before the
-                                            // session goes to waiting. Mirrors
-                                            // `build_session_messages_with`.
                                             let result_trimmed = text.trim();
                                             let extra = result_trimmed
                                                 .strip_prefix(claude_text_buf.as_str().trim())
@@ -2484,28 +2165,16 @@ pub(crate) impl LucidosEngine {
                                         } else if result_text_is_live
                                             && result_text_is_own_prose(&text, cc_error.as_deref())
                                         {
-                                            // A slash command produces a Result
-                                            // with no preceding Message events,
-                                            // so emit its text for the frontend.
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
                                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent, parent_tool_use_id: None, progress_note: false },
                                                 meta: meta.clone(),
                                             }, "[AgentSession] CodingAgentTextStreamed (slash command result)").await;
                                         }
-                                        // Both buffers must be checked: the slash-command path emits
-                                        // Result.text without buffering it, so `claude_text_buf` alone
-                                        // would mis-flag /model output as empty.
                                         let result_text_empty = text.trim().is_empty();
                                         let buffered_text_empty = claude_text_buf.as_str().trim().is_empty();
                                         let explicit_session_not_found = resume_session_id.is_some()
                                             && is_definitive_session_not_found(cc_error.as_deref());
-                                        // Did the backend attach to the
-                                        // conversation we asked for? Its Init
-                                        // echoes the id it actually opened, and a
-                                        // FAILED resume yields a different one.
-                                        // So a match is structural proof of life
-                                        // and vetoes the output-shape heuristic.
                                         let stale_inputs = StaleResumeInputs {
                                             has_resume_session: resume_session_id.is_some(),
                                             resume_attach_confirmed: resume_session_id.is_some()
@@ -2523,21 +2192,9 @@ pub(crate) impl LucidosEngine {
                                                 thread_id,
                                                 resume_session_id.as_deref().unwrap_or("")
                                             );
-                                            // Record it so the skip cannot repeat:
-                                            // `no_prior_results_this_turn` goes false, so
-                                            // any further Result classifies normally.
                                             result_texts.push(text.clone());
                                             continue 'event_loop;
                                         }
-                                        // Same empty shape and same confirmed
-                                        // attach, but the backend DID call the
-                                        // model, so what came back answers our
-                                        // prompt however empty. It classifies
-                                        // below. Logged because a wrong skip here
-                                        // strands the turn at `running`. This
-                                        // line says the settle skip considered
-                                        // the turn, and the API call ruled it
-                                        // out.
                                         if api_calls_seen > 0
                                             && is_resume_settle_result(stale_inputs, true)
                                         {
@@ -2566,9 +2223,6 @@ pub(crate) impl LucidosEngine {
                                                 }
                                             }
                                             claim.entry_guard.reap_only();
-                                            // Shadow the stale `CodingAgentIdled`,
-                                            // so `resolve_resume_context` cannot
-                                            // reuse the dead id on the retry.
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
                                                 event: crate::engine::thread_events::ThreadEvent::SessionEnded {
@@ -2577,18 +2231,6 @@ pub(crate) impl LucidosEngine {
                                                 meta: meta.clone(),
                                             }, "[AgentSession] SessionEnded (stale resume)").await;
                                             await_process_teardown(&mut events_rx, thread_id, "a stale resume").await;
-                                            // NEVER DELETE A POSSIBLY-USEFUL
-                                            // WORKTREE. The deterministic
-                                            // `thread-<id>` worktree is SHARED
-                                            // per thread and holds the user's
-                                            // warm working copy. The retry reuses
-                                            // it: `spawn_context` runs
-                                            // `worktree_add` only when the dir is
-                                            // absent. The branch is the thread's
-                                            // durable anchor and is kept
-                                            // regardless, and the cleanup worker
-                                            // is the sole deleter of a valid
-                                            // worktree (ADR 0035).
                                             return Err(STALE_RESUME_ERROR.into());
                                         }
 
@@ -2597,11 +2239,6 @@ pub(crate) impl LucidosEngine {
                                             shutting_down
                                                 .load(std::sync::atomic::Ordering::Relaxed),
                                         );
-                                        // A quiet pick ends the turn with no
-                                        // reply by design, so its empty Result
-                                        // is not the killed-tool failure. The
-                                        // option's quiet reply, when it has
-                                        // one, is the turn's reply.
                                         let quiet_pick = self
                                             .agent_sessions
                                             .lock()
@@ -2621,16 +2258,7 @@ pub(crate) impl LucidosEngine {
                                             &text,
                                             matches!(terminal_kind, TerminalKind::Generated),
                                         );
-                                        // Capture before the terminal emit below moves
-                                        // it out. The idle gate and the post-loop
-                                        // cleanup both read it to refuse partial
-                                        // work.
                                         last_terminal_kind = Some(terminal_kind.clone());
-                                        // Decide the auto-resume BEFORE emitting:
-                                        // the emit is what tells the parent, and
-                                        // the exit that resumes runs long after.
-                                        // Released below, once both emits are
-                                        // out. See ADR 0199.
                                         self.hold_completion_if_api_error_resume(
                                             thread_id,
                                             &last_terminal_kind,
@@ -2669,36 +2297,17 @@ pub(crate) impl LucidosEngine {
                                             meta.actor = None;
                                         }
                                         emitted_terminal_event = true;
-                                        // A Result landed, so CC honored the
-                                        // interrupt. Disarm the bounded Esc
-                                        // fallback before it escalates.
                                         interrupt_escalate_at = None;
                                         claude_text_buf.clear();
                                         claude_thought_buf.clear();
                                         last_thought_persisted_len = 0;
-                                        // Auto-commit dirty files before checking
-                                        // for changes, unless a restart ended the
-                                        // turn. See `result_auto_commits`.
-                                        // A keep-alive turn changes nothing: no
-                                        // commit, proposal, read decision or nudge.
                                         let keep_alive_turn = self.event_bus.in_keep_alive_turn(thread_id);
                                         let commits = !keep_alive_turn && last_terminal_kind.as_ref().is_some_and(result_auto_commits);
                                         if let Some(wt) = worktree_path.as_ref().filter(|_| commits) {
                                             auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Coding agent changes (auto-committed)").await;
                                         }
-                                        // Resolve the branch and probe the diff
-                                        // ONCE, together, in
-                                        // `idle_change_state`. The spawn-time
-                                        // `branch_name` goes stale as soon as a
-                                        // repo skill renames the branch. A
-                                        // repeated probe also lets one git
-                                        // failure reach several consumers as
-                                        // "there is no diff". This site WRITES
-                                        // its answer somewhere durable, so it
-                                        // gets git truth or an explicit unknown,
-                                        // never a silent no.
                                         let (wt_has_changes, wt_requires_restart, changed_files) = if is_resolution_session {
-                                            (true, false, None) // A resolution session always has work
+                                            (true, false, None)
                                         } else {
                                             let state = resolve_idle_change_state(IdleChangeStateInput {
                                                 pool: self.pool(),
@@ -2710,9 +2319,6 @@ pub(crate) impl LucidosEngine {
                                                 anchor_sha: adoption_anchor_sha.as_deref(),
                                             })
                                             .await;
-                                            // One name per session from here on: the propose, the
-                                            // session-state write-back below, and the post-loop cleanup
-                                            // all follow the adoption.
                                             branch_name = state.branch_name;
                                             (state.has_changes, state.requires_restart, state.changed_files)
                                         };
@@ -2723,26 +2329,15 @@ pub(crate) impl LucidosEngine {
                                             if let Some(s) = sessions.get_mut(&thread_id) {
                                                 crate::engine::agent_session::lifecycle::mark_turn_boundary(s);
                                                 s.branch_name = Some(branch_name.clone());
-                                                // The follow-up redirect waits for this
-                                                // boundary.
                                                 s.idle_notify.notify_waiters();
                                             }
                                         }
-                                        // A prompt waiting on its own turn is
-                                        // answered here, and only by the turn
-                                        // that read it.
                                         inputs.turn_ended();
                                         let mut held_proposal = None;
-                                        // An idle agent polls nothing, so a clean turn end
-                                        // covers its running tasks, polled ones included.
-                                        // Before `holds_live_wait`: the wait holds the
-                                        // proposal, and keeps a child holding it unfinished.
-                                        // Pinned by `the_idle_arm_covers_polled_tasks_before_it_idles`.
                                         let ceiling_read = ceiling_delivery.turn_ended();
                                         let ceiling_turn = ceiling_read == Some(true);
                                         let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn || ceiling_turn);
                                         let ceiling_end = ceiling_turn_end(last_terminal_kind.as_ref(), is_shutdown);
-                                        // Stop and failure settle the debt without an agent turn.
                                         if !is_shutdown && (ceiling_read.is_some() || ceiling_end == CeilingTurnEnd::Brief) {
                                             self.settle_owed_ceiling_handoff(thread_id).await;
                                         }
@@ -2761,7 +2356,6 @@ pub(crate) impl LucidosEngine {
                                             &last_terminal_kind,
                                         )
                                         .filter(|_| !keep_alive_turn);
-                                        // Proposal and gate share the same HEAD and ledger allowance.
                                         let reentry_head = if idle_write == Some(IdleChangeWrite::Complete) {
                                             branch_head_sha(&repo_root, &branch_name).await
                                         } else {
@@ -2799,9 +2393,6 @@ pub(crate) impl LucidosEngine {
                                                     );
                                                 }
                                                 Some(changed_files) => {
-                                                    // Only the propose path needs the marker: the
-                                                    // reconcile above re-reads it itself, and only if
-                                                    // it actually has a row to correct.
                                                     let hardened = has_full_harden_marker(&self.pool, &repo_root, &branch_name).await;
                                                     let requires_restart = files_require_restart(changed_files);
                                                     let fallback = change_description_fallback(self.pool(), thread_id, &branch_name).await;
@@ -2818,24 +2409,15 @@ pub(crate) impl LucidosEngine {
                                                         requires_restart,
                                                         channel: EventChannel::ClaudeCode,
                                                         hardened,
-                                                        // Live agent proposal: origin is
-                                                        // carried by the surrounding
-                                                        // MessageReceived. Engine-internal
-                                                        // recovery paths stamp Engine origin
-                                                        // via propose_branch_changes.
                                                         origin: None,
                                                     }, write.finished(), proposal_reentry).await {
                                                         Ok(ProposeOutcome::Proposed(_)) => {
-                                                            // Track for the ProcessResult returned via the
-                                                            // Exited arm. Every idle exits the subprocess,
-                                                            // so the post-loop cleanup that used to set
-                                                            // this is skipped now.
                                                             proposed_change = true;
                                                         }
                                                         Ok(ProposeOutcome::Held(hold)) => {
                                                             held_proposal = Some(hold);
                                                         }
-                                                        Ok(ProposeOutcome::Unfinished | ProposeOutcome::AwaitingLanding(_)) => {}
+                                                        Ok(ProposeOutcome::Unfinished | ProposeOutcome::AwaitingLanding(_) | ProposeOutcome::Refused(_)) => {}
                                                         Err(e) => {
                                                             log_legacy!("[AgentSession] Failed to propose change at idle: {}", e);
                                                         }
@@ -2845,13 +2427,6 @@ pub(crate) impl LucidosEngine {
                                             }
                                         }
 
-                                        // Recorded on the `CodingAgentIdled` payload for
-                                        // the event history. It gates nothing: after a clean
-                                        // turn end, the wait armed above re-opens the thread
-                                        // when a running task finishes. A Stop arms nothing
-                                        // at this turn end, but a wait armed earlier still
-                                        // stands. A task the thread already stopped re-opens
-                                        // nothing, so it does not count.
                                         let bg_bash_running = self
                                             .bash_background
                                             .running_for_thread(thread_id)
@@ -2859,7 +2434,7 @@ pub(crate) impl LucidosEngine {
                                             .iter()
                                             .any(|task| !task.stop_requested);
 
-                                        // Read before this turn's idle is written: the
+                                        // INVARIANT: Read before this turn's idle is written: the
                                         // query counts approvals since the latest idle.
                                         // Complete already rules out a Stop, a failure, a
                                         // live event wait and a pending handoff.
@@ -2871,10 +2446,6 @@ pub(crate) impl LucidosEngine {
                                             && crate::engine::approved_plan::approved_this_turn_and_idle(self.pool(), thread_id).await;
 
                                         if emit_idle {
-                                            // The turn-end gate's forced decisions, before
-                                            // the idle records the turn's end (ADR 0417). An
-                                            // engine-run merge resolution is not the user's
-                                            // turn, and an unfinished turn decides nothing.
                                             if ended_cleanly {
                                                 self.gate_coding_agent_turn_end(thread_id, wt_has_changes, session_start).await;
                                             }
@@ -2919,10 +2490,6 @@ pub(crate) impl LucidosEngine {
                                                 },
                                                 ceiling,
                                             );
-                                            // A Stop, a hold or an open card withholds it.
-                                            // Read at the idle, so a hold placed during the
-                                            // turn counts here. A withheld re-entry was not
-                                            // sent, so the ledger forgets it.
                                             crate::engine::context_ceiling::recheck_ceiling_approval(&self.event_bus, thread_id, &mut approved_ceiling_reentry).await;
                                             let due = match reentry_ledger.take_due(&gate) {
                                                 Some(due) if approved_ceiling_reentry.is_none() && !crate::engine::thread_hold::may_start_turn(self.pool(), thread_id).await => {
@@ -2934,8 +2501,6 @@ pub(crate) impl LucidosEngine {
                                             reentry_due = due.is_some();
                                             match due {
                                                 Some(crate::engine::turn_end::DueReentry::Ceiling(crossing)) => {
-                                                    // Before input held for the successor. The
-                                                    // read will open the engine's own turn.
                                                     let reentry = match approved_ceiling_reentry.take() {
                                                         Some(input) => Ok(input),
                                                         None => crate::engine::context_ceiling::record_ceiling_reentry(&self.event_bus, thread_id, crossing).await,
@@ -2970,10 +2535,6 @@ pub(crate) impl LucidosEngine {
                                             }
                                         }
 
-                                        // One re-entry per idle: a swap waits behind any
-                                        // other, and a held thread keeps it for later.
-                                        // A swap this session never delivers stays owed in
-                                        // the refusal store, so the next swap raises it.
                                         if model_swap_reentry_due(ModelSwapIdle {
                                             pending: pending_model_swap.is_some(),
                                             other_reentry: reentry_due,
@@ -2995,7 +2556,6 @@ pub(crate) impl LucidosEngine {
                                             }
                                         }
 
-                                        // A pause or failed send leaves the owner with the hold.
                                         if let Some(hold) = held_proposal.filter(|hold| proposal_reentry.contains(*hold) && !hold_reentry_sent) {
                                             crate::engine::change_ops::emit_proposal_withheld(
                                                 &self.event_bus, thread_id, &branch_name,
@@ -3006,8 +2566,6 @@ pub(crate) impl LucidosEngine {
 
                                         match idle_action(is_resolution_session, is_shutdown) {
                                             IdleAction::EndSession => {
-                                                // The rule an ordinary session exits by: a
-                                                // follow-up on its way gets its turn first.
                                                 if self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel, &mut input_gate).await {
                                                     log_legacy!("[AgentSession] Resolution session idle for thread {}: ending loop", thread_id);
                                                     break 'event_loop;
@@ -3025,8 +2583,6 @@ pub(crate) impl LucidosEngine {
                 perm_req = async {
                     match agent_permission_rx.as_mut() {
                         Some(rx) => rx.recv().await,
-                        // No in-band permission channel, so pend forever and
-                        // let the arm never fire.
                         None => std::future::pending().await,
                     }
                 } => {
@@ -3037,12 +2593,6 @@ pub(crate) impl LucidosEngine {
                             let pending = self.pending_cc_permission.clone();
                             let workspace_path = self.workspace_path.clone();
                             let session_worktree = worktree_path.clone();
-                            // The command gate's LLM half runs off the
-                            // engine, inside the spawned task below. Taken as an Arc for the
-                            // same reason the title task does, and the select
-                            // arm stays free of the classification. `try_` so a
-                            // bare test engine gets the static half rather than
-                            // a panic.
                             let engine = self.try_clone_arc();
                             let tools = tools_in_flight.clone();
                             tokio::spawn(async move {
@@ -3063,18 +2613,8 @@ pub(crate) impl LucidosEngine {
                                             input: req.input,
                                         },
                                     ) => {
-                                        // Send failure = driver died between answer
-                                        // and delivery; nothing to deliver to.
                                         let _ = respond.send(outcome.allowed);
                                     }
-                                    // The driver died while the card was pending.
-                                    // Its JoinSet aborts the waiter task, which
-                                    // drops the oneshot receiver and fires this
-                                    // arm. Abandoning the wait drops our
-                                    // broadcast receiver, so the next prompt's
-                                    // sweep evicts the entry. The persisted card
-                                    // resolves through the same recovery paths
-                                    // Claude Code uses.
                                     _ = respond.closed() => {
                                         log_legacy!(
                                             "[AgentSession] agent died with permission card pending for thread {} — abandoning waiter",
@@ -3086,17 +2626,12 @@ pub(crate) impl LucidosEngine {
                             });
                         }
                         None => {
-                            // The driver dropped its sender, so disable the arm.
-                            // A closed channel would re-resolve every tick.
                             agent_permission_rx = None;
                         }
                     }
                 }
 
                 Some(mut user_input) = msg_rx.recv(), if input_gate.receives() && !ceiling_reentry_forwarded => {
-                    // After a handoff or a provider block, and through the
-                    // ceiling re-entry turn, input waits in the channel for the
-                    // next session. The idle exit drains it there.
                     if crate::engine::pending_handoff::handoff_pending(self.pool(), thread_id).await {
                         input_gate.handed_off = true;
                         let _sessions = self.agent_sessions.lock().await;
@@ -3105,9 +2640,6 @@ pub(crate) impl LucidosEngine {
                     }
                     if crate::engine::thread_stop::is_automatic_input(user_input.kind)
                         && !crate::engine::thread_hold::may_start_turn(self.pool(), thread_id).await {
-                        // The event-backed input stays unread for the resume or
-                        // the card's close. A turn-end nudge is recomputed at
-                        // the next idle.
                         if let Some(id) = user_input.origin_event_id {
                             if let Some(session) = self.agent_sessions.lock().await.get_mut(&thread_id) {
                                 session.unforwarded_inputs.remove(&id);
@@ -3151,7 +2683,7 @@ pub(crate) impl LucidosEngine {
                             Err(e) => log_legacy!("[AgentSession] Held deliveries of {thread_id} unreadable: {e}"),
                         }
                     }
-                    // The input just left the channel and is about to reach the
+                    // INVARIANT: The input just left the channel and is about to reach the
                     // driver. It therefore moves from the "sent, not yet
                     // forwarded" window into the "forwarded, not yet read" one.
                     // Recording in this arm rather than at each `msg_tx.send`
@@ -3179,8 +2711,6 @@ pub(crate) impl LucidosEngine {
                             }
                         }
                     }
-                    // Flush any pending reasoning before the new user input opens a
-                    // fresh turn, then reset so the next turn's thinking starts clean.
                     self.flush_coding_agent_thought(
                         thread_id,
                         &claude_thought_buf,
@@ -3210,8 +2740,6 @@ pub(crate) impl LucidosEngine {
                                     input_event_id: user_input.origin_event_id,
                                     text: user_input.text.clone(),
                                     coding_agent,
-                                    // The MessageReceived the API boundary
-                                    // emitted carries the origin.
                                     origin: None,
                                 },
                                 meta: meta.clone(),
@@ -3321,15 +2849,6 @@ pub(crate) impl LucidosEngine {
                 }
 
                 _ = interrupt.notified() => {
-                    // Cancel button = Esc in Claude Code CLI.
-                    // Sends control_request:interrupt → CC stops current work, emits
-                    // a Result, and goes idle. We set user_hit_stop so the Result
-                    // handler emits ResponseCanceled (→ exchange "Canceled") instead
-                    // of ResponseGenerated. CodingAgentIdled still follows, keeping
-                    // the thread in "Waiting" state (CC is alive).
-                    // During shutdown, the post-loop cleanup bails out early
-                    // (no worktree removal, no SessionEnded). The session resumes
-                    // after restart via recover_orphaned_worktrees.
                     let interruption_cause = self.take_session_redirect_cause(thread_id).await;
                     let shutdown_interrupt = self.session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     if interruption_cause.is_none() && !shutdown_interrupt {
@@ -3350,11 +2869,6 @@ pub(crate) impl LucidosEngine {
                     }
                     if !is_waiting {
                         user_hit_stop = true;
-                        // Distinguish a redirect (a follow-up, an effort
-                        // restart) from a real Stop click: the former carries
-                        // its own neutral cause, the latter is UserStop
-                        // ("Canceled ✕"). Drained on read; cleared at the Result
-                        // turn boundary below alongside user_hit_stop.
                         redirect_cause = interruption_cause;
                         if let Some(cancel_actor) = self.take_session_cancel_actor(thread_id).await {
                             meta.actor = Some(cancel_actor);
@@ -3369,12 +2883,9 @@ pub(crate) impl LucidosEngine {
                         interrupt_escalate_at =
                             Some(tokio::time::Instant::now() + INTERRUPT_ESCALATE_AFTER);
                     }
-                    // Don't break — let the loop continue to read the Result event
                 }
 
                 _ = stop.notified() => {
-                    // Apply, Discard and Archive emit their own lifecycle
-                    // terminator.
                     let is_shutdown = self
                         .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     let pending_stop = self.pending_stop_reason(thread_id).await;
@@ -3388,7 +2899,7 @@ pub(crate) impl LucidosEngine {
                         is_waiting,
                         is_shutdown,
                         suppress_user_terminal,
-                        None, // a stop is never a redirect
+                        None,
                         &agent_cancel,
                         &mut claude_text_buf,
                         &meta,
@@ -3424,8 +2935,8 @@ pub(crate) impl LucidosEngine {
                         thread_id,
                         is_waiting,
                         is_shutdown,
-                        false, // suppress: a real Cancel — not Apply/Discard/Archive
-                        redirect_cause, // a redirect keeps its own cause
+                        false,
+                        redirect_cause,
                         &agent_cancel,
                         &mut claude_text_buf,
                         &meta,
@@ -3440,8 +2951,6 @@ pub(crate) impl LucidosEngine {
                 }
 
                 _ = chat_cancel.cancelled() => {
-                    // Upstream chat handler cancelled (engine shutdown / request abort).
-                    // No user-action context here — suppress flag is always false.
                     let is_shutdown = self
                         .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     self.emit_stop_terminal(
@@ -3450,7 +2959,7 @@ pub(crate) impl LucidosEngine {
                         is_waiting,
                         is_shutdown,
                         false,
-                        None, // chat_cancel is engine shutdown / request abort, not a redirect
+                        None,
                         &agent_cancel,
                         &mut claude_text_buf,
                         &meta,
@@ -3465,7 +2974,7 @@ pub(crate) impl LucidosEngine {
                 }
 
                 _ = tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_TICK_INTERVAL_SECS)) => {
-                    // Hung-subprocess watchdog. Any incoming event re-arms the
+                    // INVARIANT: Hung-subprocess watchdog. Any incoming event re-arms the
                     // sleep through the surrounding `select!`, so only a fully
                     // silent loop reaches here. On fire, the safety net reads
                     // `watchdog_fired` and emits a `ContinuationRequested`
@@ -3494,11 +3003,6 @@ pub(crate) impl LucidosEngine {
                         WATCHDOG_HUNG_TOOL_CEILING_MS,
                         tools_in_flight_snapshot,
                     );
-                    // last_ms <= 0 routes to SkipBadHeartbeat (no fire) and
-                    // would print epoch millis as elapsed — skip the diag.
-                    // The Fire branch below is reachable only when last_ms > 0
-                    // (the gate's heartbeat check enforces this), so logging
-                    // the elapsed there is always meaningful.
                     if last_ms > 0 {
                         let elapsed_ms = now_ms.saturating_sub(last_ms);
                         if elapsed_ms >= WATCHDOG_DIAG_LOG_THRESHOLD_MS
@@ -3585,20 +3089,10 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// What the spawn knows about the worktree it is resuming into. Grouped rather
-/// than passed as four more parameters: they all come from the same
-/// `SpawnWorktreeContext` resolution and are only ever read together.
 pub(super) struct ResumeSpawnContext<'a> {
-    /// The session's worktree on disk, when it has one.
     pub worktree_path: Option<&'a Path>,
-    /// `worktree_head_sha` from the last `CodingAgentIdled`, the baseline the
-    /// external-edit detector diffs against. `None` on a first turn.
     pub last_idle_sha: Option<&'a str>,
-    /// Pre-built note when the worktree is on a branch holding this agent's
-    /// work: an adopted one, or an internal thread's side branch.
     pub branch_note: Option<&'a str>,
-    /// The branch this session resumes on, so a discard elsewhere can be told
-    /// apart from a discard of the agent's own work.
     pub session_branch: Option<&'a str>,
 }
 
@@ -3607,15 +3101,11 @@ pub(super) const RESUME_NOTE_REFERENT_GUARD: &str =
      Resolve its pronouns against the conversation you have already had, not against \
      anything named above.]";
 
-/// What a first prompt carries.
 pub(super) enum PromptFor<'a> {
-    /// A real turn's message, behind its resume notes.
     Turn(&'a str),
-    /// A cache keep-alive's nudge, which goes verbatim.
     KeepAlive(&'a str),
 }
 
-/// Text for the agent's input channel.
 pub(super) struct AgentPrompt {
     pub(super) text: String,
     pub(super) device_block: Option<ContextFingerprint>,
@@ -3629,7 +3119,6 @@ impl AgentPrompt {
         }
     }
 
-    /// `text` goes first, then the block when the conversation lacks it.
     fn with_block(text: String, block: Option<DeviceBlock>) -> Self {
         match block {
             Some(block) => Self {
@@ -3641,15 +3130,10 @@ impl AgentPrompt {
     }
 }
 
-/// What the conversation a prompt goes to already holds of the device block.
 #[derive(Clone, Copy)]
 pub(super) struct HeldBlocks<'a> {
     pub(super) sent: &'a SentDeviceContexts,
-    /// The backend session id the agent reported at `Init`, or the one a resume
-    /// reattaches. A spawn has none, so its first prompt always carries the
-    /// block.
     pub(super) conversation: Option<&'a str>,
-    /// Blocks queued to the agent and not yet read.
     pub(super) unread: &'a [ContextFingerprint],
 }
 
@@ -3669,7 +3153,6 @@ impl<'a> HeldBlocks<'a> {
 }
 
 impl HeldBlocks<'_> {
-    /// The device block, unless the conversation holds an equal one already.
     async fn block_for_origin(
         self,
         pool: &sqlx::PgPool,
@@ -3690,9 +3173,6 @@ impl HeldBlocks<'_> {
     }
 }
 
-/// The first prompt a spawn or resume sends: the resume notes, then the device
-/// block unless the resumed conversation holds it already. A slash command goes
-/// verbatim ([`forwards_verbatim`]), and so does a keep-alive's nudge.
 pub(super) async fn first_prompt_for_agent(
     pool: &sqlx::PgPool,
     event_store: &crate::core::EventStore,
@@ -3785,9 +3265,6 @@ pub(super) async fn build_resume_prompt_text(
         session_branch,
     } = spawn;
 
-    // What the user and the engine did to this agent's work in the gap before
-    // this turn. `current_origin_id` bounds the lookup to the previous turn
-    // boundary: stateless and self-clearing, see `compute_turn_gap_note`.
     let gap_note = crate::engine::agent_session::turn_gap::compute_turn_gap_note(
         pool,
         thread_id,
@@ -3808,9 +3285,6 @@ pub(super) async fn build_resume_prompt_text(
         _ => None,
     };
 
-    // Fold the resume-time notes into one prepended block, cause before
-    // observation: the gap note explains a reset the edit note can only see the
-    // effects of.
     let combined: Vec<&str> = [
         turn_note(standing_note),
         branch_note,
@@ -3823,28 +3297,16 @@ pub(super) async fn build_resume_prompt_text(
     prepend_resume_notes(thread_id, &combined, user_message)
 }
 
-/// A per-turn section as a note, or `None` when it is empty.
 fn turn_note(section: &str) -> Option<&str> {
     Some(section.trim()).filter(|note| !note.is_empty())
 }
 
-/// The notes a follow-up carries besides the turn-gap note.
 #[derive(Clone, Copy, Default)]
 pub(super) struct FollowUpNotes<'a> {
-    /// The message is a redelivery a dead process never read.
     pub late: Option<&'a str>,
-    /// [`standing_instruction_section`].
     pub standing: &'a str,
 }
 
-/// The text a follow-up to a live session carries: the message, behind its
-/// `notes` and the turn-gap note when there are any. A kept-alive session
-/// spawns nothing, so without this an event from its previous turn reaches no
-/// prompt.
-///
-/// `prompt_sent` is the `CodingAgentPromptSent` this forward wrote before it
-/// computed the note. Only a user-kind input writes one. See
-/// [`followup_gap_bounds`].
 pub(super) async fn build_followup_prompt_text(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -3878,10 +3340,6 @@ pub(super) async fn build_followup_prompt_text(
     prepend_resume_notes(thread_id, &notes, message)
 }
 
-/// The events a forwarded input owes its read to. A child wake owes its
-/// `ChildThreadCompleted`, so its read can say it started a turn. An engine
-/// prompt with no starter event (auto-harden) owes its `CodingAgentPromptSent`,
-/// so its read confirms that turn-gap boundary.
 pub(super) fn owed_input_event_ids(origin: Option<Uuid>, prompt_sent: Option<Uuid>) -> Vec<Uuid> {
     origin.or(prompt_sent).into_iter().collect()
 }
@@ -3897,8 +3355,6 @@ pub(super) fn followup_gap_bounds(
     }
 }
 
-/// `message` behind the resume-time `notes`, closed by
-/// [`RESUME_NOTE_REFERENT_GUARD`]. No notes leaves it untouched.
 fn prepend_resume_notes(thread_id: Uuid, notes: &[&str], message: &str) -> String {
     if notes.is_empty() {
         return message.to_string();
@@ -3912,19 +3368,12 @@ fn prepend_resume_notes(thread_id: Uuid, notes: &[&str], message: &str) -> Strin
     format!("{block}\n{RESUME_NOTE_REFERENT_GUARD}\n\n{message}")
 }
 
-/// Longest a message may run inside the thread-history block.
 const HISTORY_MESSAGE_MAX_BYTES: usize = 2000;
 
-/// Budget for the whole thread-history block. History only grows, and an
-/// uncapped block would grow every fresh session's first message with it.
 const HISTORY_BLOCK_MAX_BYTES: usize = 48 * 1024;
 
-/// Most images of unanswered messages a fresh session's first message
-/// carries. The newest are kept, so a run of stopped turns cannot push the
-/// request past a provider's image or size limit.
 const UNANSWERED_IMAGES_MAX: usize = 8;
 
-/// One thread message as the thread-history block reads it.
 #[derive(Debug, Clone, PartialEq)]
 struct HistoryLine<'a> {
     role: &'a str,
@@ -3932,8 +3381,6 @@ struct HistoryLine<'a> {
     content: &'a str,
     image_hashes: &'a [String],
     event_id: Option<&'a str>,
-    /// Who typed a user message: the user's name on a team gateway,
-    /// else "User". The same name chat history gives it.
     speaker: String,
 }
 
@@ -3952,8 +3399,6 @@ impl<'a> HistoryLine<'a> {
         }
     }
 
-    /// A coding agent wrote it. An `[ERROR]` line or an `[Asked for you]`
-    /// note carries no channel: no agent read the message before it.
     fn is_reply(&self) -> bool {
         self.role == "assistant"
             && self.channel == Some("claude_code")
@@ -3961,9 +3406,6 @@ impl<'a> HistoryLine<'a> {
     }
 }
 
-/// `messages` without the one being sent, and where it stood: the last user
-/// message reading `current`, else the end. That message follows the session
-/// context, so the history must not repeat it.
 fn before_current_message<'a>(
     mut messages: Vec<HistoryLine<'a>>,
     current: &str,
@@ -3983,9 +3425,6 @@ fn before_current_message<'a>(
     }
 }
 
-/// Where the messages no agent answered begin: just after the last reply.
-/// A message stopped before any session started has no reply, so a fresh
-/// session is the first agent to read it.
 fn first_unanswered(messages: &[HistoryLine<'_>]) -> usize {
     messages
         .iter()
@@ -3993,9 +3432,6 @@ fn first_unanswered(messages: &[HistoryLine<'_>]) -> usize {
         .map_or(0, |at| at + 1)
 }
 
-/// The newest [`UNANSWERED_IMAGES_MAX`] images on the messages no agent
-/// answered, oldest first. `redelivered` names messages that reach the
-/// session again with their own images, so they bring none here.
 fn unanswered_image_hashes<'a>(
     messages: &[HistoryLine<'a>],
     redelivered: &[String],
@@ -4013,10 +3449,6 @@ fn unanswered_image_hashes<'a>(
     hashes
 }
 
-/// The thread history a new coding-agent session sees. Each message's
-/// images are counted as `attached` to the first message or not shown. The
-/// newest messages are kept when the whole thread exceeds
-/// [`HISTORY_BLOCK_MAX_BYTES`]. Empty when no message has content.
 fn thread_history_block(messages: &[HistoryLine<'_>], attached: &[&str]) -> String {
     let entries: Vec<String> = messages
         .iter()
@@ -4112,8 +3544,6 @@ mod thread_history_block_tests {
         }
     }
 
-    /// A long thread's history stays under budget and keeps the newest
-    /// messages.
     #[test]
     fn a_long_thread_keeps_the_newest_messages_within_budget() {
         let contents: Vec<String> = (0..400)
@@ -4152,7 +3582,6 @@ mod thread_history_block_tests {
         assert_eq!(thread_history_block(&[line("user", None, "  ")], &[]), "");
     }
 
-    /// On a team gateway each person's message reads under their name.
     #[test]
     fn a_team_message_reads_under_its_speaker() {
         let kim = HistoryLine {
@@ -4163,8 +3592,6 @@ mod thread_history_block_tests {
         assert!(block.contains("**Kim:** try the staging build"), "{block}");
     }
 
-    /// The message being sent follows the session context, so the history
-    /// holds only what came before it.
     #[test]
     fn the_history_leaves_out_the_message_being_sent() {
         let lines = vec![
@@ -4186,8 +3613,6 @@ mod thread_history_block_tests {
         assert_eq!(block.matches("fix the drawer").count(), 1, "{block}");
     }
 
-    /// A turn no user message opened (a child's report, an engine prompt)
-    /// leaves the history whole.
     #[test]
     fn a_turn_without_a_matching_message_keeps_the_whole_history() {
         let lines = vec![line("user", None, "hello"), line("assistant", None, "hi")];
@@ -4197,8 +3622,6 @@ mod thread_history_block_tests {
         );
     }
 
-    /// A fresh session gets the images of messages no agent answered, not
-    /// only their text. An error line is no answer.
     #[test]
     fn a_fresh_session_gets_the_images_no_agent_answered() {
         let answered = ["old".to_string()];
@@ -4226,8 +3649,6 @@ mod thread_history_block_tests {
         );
     }
 
-    /// A stranded follow-up and a message after the current one each reach
-    /// the session with their own images. Neither brings them into the block.
     #[test]
     fn redelivered_and_later_messages_bring_no_images() {
         let stranded = ["stranded".to_string()];
@@ -4244,8 +3665,6 @@ mod thread_history_block_tests {
         assert!(unanswered_image_hashes(&prior[..at], &["evt-stranded".to_string()]).is_empty());
     }
 
-    /// Only the newest images ride along, so a run of stopped turns stays
-    /// within a provider's limits.
     #[test]
     fn the_newest_unanswered_images_are_kept() {
         let hashes: Vec<String> = (0..UNANSWERED_IMAGES_MAX + 3)
@@ -4258,7 +3677,6 @@ mod thread_history_block_tests {
         assert_eq!(kept.last(), Some(&hashes.last().unwrap().as_str()));
     }
 
-    /// An image that could not be read is not called attached.
     #[test]
     fn an_image_that_failed_to_load_reads_as_not_shown() {
         let hashes = ["here".to_string(), "gone".to_string()];
@@ -4274,7 +3692,6 @@ mod thread_history_block_tests {
         );
     }
 
-    /// A message of only images still shows in the history.
     #[test]
     fn an_image_only_message_is_kept() {
         let hashes = ["shot".to_string()];
@@ -4291,9 +3708,6 @@ mod thread_history_block_tests {
 mod unregistered_lucidos_root_tests {
     use super::*;
 
-    /// The regression. On a packaged install `main_worktree()` resolves to the
-    /// WORKSPACE dir; handing that back would branch the user's workspace git
-    /// and call it Lucidos platform source. Refuse instead.
     #[test]
     fn refuses_when_there_is_no_source_checkout() {
         let workspace_dir = PathBuf::from("/Users/me/Library/Application Support/lucidos/ws");
@@ -4310,8 +3724,6 @@ mod unregistered_lucidos_root_tests {
         );
     }
 
-    /// The fallback's legitimate case survives untouched: a dev build whose
-    /// `Lucidos` registry row hasn't been written yet (very early startup).
     #[test]
     fn keeps_the_early_startup_fallback_on_a_dev_build() {
         let dev_root = PathBuf::from("/Users/me/src/lucidos");
@@ -4339,7 +3751,7 @@ https://claude-gateway.example.com. Check your network connection, or sign in ag
         for ev in events {
             tx.send(ev).unwrap();
         }
-        drop(tx); // driver wound down
+        drop(tx);
         drain_startup_death(&mut rx)
     }
 
@@ -4386,7 +3798,6 @@ https://claude-gateway.example.com. Check your network connection, or sign in ag
 
     #[test]
     fn none_when_no_failure_signal() {
-        // Clean exit, no error, no signal — caller uses its generic message.
         let death = drained(vec![exited(AgentExitFacts::default())]);
         assert_eq!(death.reason, None);
     }
@@ -4479,23 +3890,15 @@ https://claude-gateway.example.com. Check your network connection, or sign in ag
     }
 }
 
-/// A turn that streamed no assistant text states its failure ONCE: in the
-/// failure card, never also as a paragraph of the response.
 #[cfg(test)]
 mod result_text_prose_tests {
     use super::result_text_is_own_prose;
 
-    /// The case the branch exists for: `/model` answers through `result.result`
-    /// with no preceding Message, and no failure to collide with.
     #[test]
     fn a_slash_command_answer_is_prose() {
         assert!(result_text_is_own_prose("Set model to claude-opus-5", None));
     }
 
-    /// The duplicate. CC's own banner is no longer buffered as text. A turn
-    /// whose only output was that banner reaches this branch with the failure
-    /// reason in `result.result`. Emitting it puts the card's sentence back in
-    /// the response body.
     #[test]
     fn the_turns_failure_reason_is_not_prose() {
         let err = "API Error: Stream idle timeout - no chunks received";
@@ -4506,9 +3909,6 @@ mod result_text_prose_tests {
         );
     }
 
-    /// Equality, not an `API Error` prefix test. A failure whose reason came
-    /// from elsewhere leaves the text alone rather than guessing, and the
-    /// frontend's echo drop is the backstop.
     #[test]
     fn text_the_card_will_not_show_verbatim_stays() {
         assert!(result_text_is_own_prose(
@@ -4524,8 +3924,6 @@ mod result_text_prose_tests {
     }
 }
 
-/// A hard stop leaves the event loop at once, so the usage Claude Code's
-/// driver flushes for a cut-off call is read by `usage_flushed_at_stop`.
 #[cfg(test)]
 mod usage_flushed_at_stop_tests {
     use super::{usage_flushed_at_stop, AgentEvent};
@@ -4620,7 +4018,6 @@ mod usage_flushed_at_stop_tests {
         assert_eq!(billing, super::BillingAttribution::default());
     }
 
-    /// Every `Usage` up to `OutputEnded` is kept, and nothing after it is read.
     #[tokio::test]
     async fn it_keeps_each_usage_up_to_output_ended() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4650,8 +4047,6 @@ mod usage_flushed_at_stop_tests {
         );
     }
 
-    /// A sub-agent's flushed call keeps its parent, so its capture still binds
-    /// to that sub-agent's steps.
     #[tokio::test]
     async fn a_flushed_sub_agent_call_keeps_its_parent() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4683,7 +4078,6 @@ mod usage_flushed_at_stop_tests {
         );
     }
 
-    /// A closed channel ends the read too, with whatever arrived first.
     #[tokio::test]
     async fn a_closed_channel_ends_the_read() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4700,7 +4094,6 @@ mod usage_flushed_at_stop_tests {
         assert_eq!(flushed.len(), 1);
     }
 
-    /// `Exited` ends the read too: usage the driver sends after it is not read.
     #[tokio::test]
     async fn the_read_stops_at_exited_and_keeps_the_usage_before_it() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4729,7 +4122,6 @@ mod usage_flushed_at_stop_tests {
         );
     }
 
-    /// A driver that never says it is done cannot hold the stop past `wait`.
     #[tokio::test(start_paused = true)]
     async fn a_silent_driver_cannot_hold_the_stop() {
         let (_tx, mut rx) = mpsc::unbounded_channel();
@@ -4745,16 +4137,11 @@ mod usage_flushed_at_stop_tests {
     }
 }
 
-/// Each coding-agent call records the model the reply named, never a picker
-/// alias, so Token Cost can price it.
 #[cfg(test)]
 mod call_models_tests {
     use super::CallModels;
     use crate::llm::served_model::served_as_sent;
 
-    /// The unpriced calls: a sub-agent set to `model: haiku` on an Opus
-    /// session recorded `haiku`. It records the id that answered, and reads
-    /// as served as sent, so no reader takes it for a reroute.
     #[test]
     fn an_alias_sub_agent_call_records_the_model_that_answered() {
         let models = CallModels::of(
@@ -4771,8 +4158,6 @@ mod call_models_tests {
         );
     }
 
-    /// A session started on an alias with `[1m]` keeps the marker on the full
-    /// id, so the long context window still reaches a reader.
     #[test]
     fn an_alias_session_with_1m_keeps_the_marker_on_the_full_id() {
         let models = CallModels::of(Some("opus[1m]"), Some("claude-opus-4-6"));
@@ -4781,8 +4166,6 @@ mod call_models_tests {
         assert!(served_as_sent(&models.model, "claude-opus-4-6"));
     }
 
-    /// A sub-agent on another full id keeps that id in both fields, not the
-    /// session's.
     #[test]
     fn a_full_id_call_records_its_own_id_twice() {
         let models = CallModels::of(Some("claude-opus-5-5[1m]"), Some("claude-sonnet-5"));
@@ -4796,8 +4179,6 @@ mod call_models_tests {
         );
     }
 
-    /// The session's own call keeps its `[1m]` in `model`, and reads as
-    /// served as sent.
     #[test]
     fn a_main_session_call_is_served_as_sent() {
         let models = CallModels::of(Some("claude-opus-5-5[1m]"), Some("claude-opus-5-5"));
@@ -4807,8 +4188,6 @@ mod call_models_tests {
         assert!(served_as_sent(&models.model, "claude-opus-5-5"));
     }
 
-    /// Codex echoes no model per call. The session's model stands in for
-    /// `model`, and no reply named a served one.
     #[test]
     fn a_call_with_no_echoed_model_records_no_served_model() {
         for reported in [None, Some("")] {
@@ -4823,8 +4202,6 @@ mod call_models_tests {
     }
 }
 
-/// A coding-agent `ContextCaptured` names the effort the call ran at, under
-/// the field the main-LLM rows use, so one rollup groups every producer.
 #[cfg(test)]
 mod coding_agent_capture_tests {
     use super::{
@@ -5094,7 +4471,6 @@ mod coding_agent_capture_tests {
                 launch,
             ),
             async move {
-                // The driver can finish mapping a line after cancellation.
                 tokio::task::yield_now().await;
                 use crate::runtime::agent_runtime::AgentEvent;
                 for _ in 0..2 {
@@ -5334,7 +4710,6 @@ mod coding_agent_capture_tests {
         assert_eq!(payload["reasoning_effort"], "high");
     }
 
-    /// An unknown effort is left out, never guessed.
     #[test]
     fn an_unknown_effort_is_omitted() {
         let payload = captured_payload(None);
@@ -5342,8 +4717,6 @@ mod coding_agent_capture_tests {
         assert!(payload.get("reasoning_effort").is_none(), "{payload}");
     }
 
-    /// Claude Code takes effort only at spawn, so every call runs at the
-    /// spawn effort.
     #[test]
     fn claude_code_runs_at_its_spawn_effort() {
         assert_eq!(
@@ -5352,9 +4725,6 @@ mod coding_agent_capture_tests {
         );
     }
 
-    /// Codex applies an effort change at its next turn, so the effort its
-    /// driver sent with the call's turn is the one in force. A turn sent
-    /// with none ran at an effort the driver cannot name.
     #[test]
     fn codex_runs_at_the_effort_its_driver_sent() {
         assert_eq!(

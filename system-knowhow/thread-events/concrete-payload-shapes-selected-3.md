@@ -38,7 +38,9 @@ To fetch the dropped args, call `GET /api/v1/events/:event_id/tool-args`. It ret
 ### Plan and implementation stages
 
 A factory can use `ChangeApplyRequested` to timestamp the start of Landing.
-Today Apply records the request and continues through its normal landing route.
+Apply asks event hooks before recording the request. A refusal stops Apply and
+records `EventHookRefused`. If recording the request fails after the hook
+check, the engine logs the error and continues Apply.
 `PlanApproved.branch_name` identifies the approved branch. Fix marker kinds
 show that editing could start without a human approval.
 
@@ -114,6 +116,7 @@ UnproposedReason wire values:
 - `awaiting_landing`
 - `integrated_into_parent`
 - `carried_by_successor`
+- `hook_refused`
 <!-- generated:end -->
 
 `plan_changed` means the committed plan changed after approval. Restoring the approved text reuses the approval.
@@ -127,6 +130,8 @@ The agent must remove those code changes or obtain implementation approval.
 The child's work is never proposed on its own.
 `carried_by_successor` marks the thread that handed off to a *legacy successor thread*, whose change carries the work.
 `awaiting_landing` means the thread's change waits in the landing lane.
+`hook_refused` means an *event hook* refused the proposal, and `EventHookRefused` records why.
+An open change the branch moved past is withdrawn. The next turn end asks the hook again.
 
 ```json
 {

@@ -1,9 +1,7 @@
-//! Gemini request defaults shared by the Vertex client and the SDK.
-
 use crate::llm::model_registry::ProviderKind;
 use serde::Serialize;
 
-/// Build the `generationConfig.thinkingConfig` for a Gemini call. Gemini 3.x and 4
+/// INVARIANT: Build the `generationConfig.thinkingConfig` for a Gemini call. Gemini 3.x and 4
 /// models get a thinking config; everything else returns `None` (unchanged).
 ///
 /// Gemini 3.x and 4 expect `thinkingLevel`. The deprecated `thinkingBudget`
@@ -36,18 +34,9 @@ pub fn sdk_request_defaults(model: &str, effort: Option<&str>) -> serde_json::Va
     serde_json::json!({ "body": body, "headers": {} })
 }
 
-/// Map the unified `reasoning_effort` to a Gemini `thinkingLevel`, clamped to
-/// the levels the specific model accepts: Gemini 3 Flash supports
-/// `minimal`/`low`/`medium`/`high`; Gemini 3 Pro supports only `low`/`high`
-/// (sending Pro `minimal` or `medium` 400s). Gemini 3 can't fully disable
-/// thinking, so `none` maps to the model's floor: `minimal` on Flash, `low` on
-/// Pro and on a model that always reasons (Gemini 3.8 Flash answers `minimal`
-/// with a 400). Neon supports `xhigh` and maps `max` to it. Other Gemini
-/// models cap at `high`. Lowercase per Google's REST docs.
 pub(super) fn gemini_thinking_level(model: &str, effort: &str) -> &'static str {
     let flash = model.contains("flash");
     match effort {
-        // Gemini 3 can't be fully disabled; use the model's floor.
         "none" => {
             if flash && !crate::llm::reasoning::always_reasons(model) {
                 "minimal"
@@ -56,7 +45,6 @@ pub(super) fn gemini_thinking_level(model: &str, effort: &str) -> &'static str {
             }
         }
         "low" => "low",
-        // Gemini 4 and Flash accept medium; Gemini 3 Pro rounds up.
         "medium" => {
             if flash || crate::llm::model_registry::unified_output_limit(model).is_some() {
                 "medium"
@@ -85,12 +73,9 @@ pub(super) struct VertexGenerationConfig {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VertexThinkingConfig {
-    /// Accepted levels depend on the model. See `gemini_thinking_level`.
-    /// Gemini 3.x can reject a budget or return worse results. Flash can go
-    /// as low as `minimal`. With `None`, the model uses its default level.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_level: Option<&'static str>,
-    /// When true, Gemini returns its deliberation as `thought:true` parts that
+    /// INVARIANT: When true, Gemini returns its deliberation as `thought:true` parts that
     /// `build_gemini_llm_response` strips — otherwise Flash narrates its
     /// reasoning in the ordinary answer text.
     include_thoughts: bool,

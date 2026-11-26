@@ -395,14 +395,15 @@ pub trait AgentHost: Send + Sync {
     >;
 }
 
-/// Host for lower-layer tests that do not execute agent operations.
-#[cfg(test)]
+/// Host for lower-layer tests that do not execute agent operations, here and
+/// in the crates below the agent crate.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct NoAgentHost {
     pub held_message_release_thread: Option<Uuid>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 impl AgentHost for NoAgentHost {
     fn spawn_hardening(

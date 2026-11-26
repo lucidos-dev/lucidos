@@ -73,12 +73,8 @@ removes them. Nobody checked it line by line against the code.
 - Restore does not use `~/workspaces/{name}`. The directory may live under the
   gateway app-data dir.
 - Restoring a legacy archive silently discards its `user_dir/` content.
-- Archive filenames follow `{ARCHIVE_PREFIX}{name}-{timestamp}{suffix}`. The
-  suffix is `.age` for an archive sealed to the backup recipient and `.enc` for
-  a legacy one.
-- The gateway's `registry::parse_workspace_name_from_archive` spells the same
-  filename shape and cannot import these constants. The two must be kept in
-  step by hand.
+- [0815](0815-backup-retention-by-origin.md) defines the archive filename
+  format and its shared parser.
 
 ## Alternatives considered
 

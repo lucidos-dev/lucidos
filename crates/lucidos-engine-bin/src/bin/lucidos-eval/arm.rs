@@ -1,47 +1,21 @@
-//! Which arm a workspace is, and the preference rows that make it so.
-//!
-//! An arm has two dimensions: ADR 0085's context mode and ADR 0362's memory
-//! module. This module is the whole seam between the harness and both.
-//! Everything else asks it two questions: what preference rows does this arm
-//! seed, and does the engine under test know those keys. Nothing else in the
-//! crate names the preferences.
-//!
-//! **The engine may not carry a flag.** [`FlagAvailability`] makes that gap a
-//! refusal with the key's name in it, rather than a null result that reads as a
-//! pass. See `manipulation::preflight`.
-
 use std::fmt;
 
 use lucidos_engine::core::prefs::{self, PrefValue};
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The workspace preference that turns the self-curated context mode on.
-///
-/// The seeding digest excludes the [`ARM_PREFERENCE_KEYS`] and nothing else.
-/// The arms can then be proved byte-identical everywhere they are not (I1).
 pub const CONTEXT_MODE_PREFERENCE_KEY: &str = prefs::SELF_CURATED_CONTEXT_MODE.key();
 
-/// The workspace preference that picks the memory module (ADR 0362).
 pub const MEMORY_MODULE_PREFERENCE_KEY: &str = prefs::MEMORY_MODULE.key();
 
-/// How old a result gets before a sweep may take it.
 pub const EXPIRE_AFTER_ROUNDS_KEY: &str = prefs::SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS.key();
 
-/// How often the sweep runs.
 pub const SWEEP_EVERY_ROUNDS_KEY: &str = prefs::SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS.key();
 
-/// The variable that pins how old a result may get before a sweep takes it.
 pub const EXPIRE_AFTER_ROUNDS_VAR: &str = "LUCIDOS_EVAL_EXPIRE_AFTER_ROUNDS";
 
-/// The variable that pins how often the sweep runs.
 pub const SWEEP_EVERY_ROUNDS_VAR: &str = "LUCIDOS_EVAL_SWEEP_EVERY_ROUNDS";
 
-/// Every key an arm may differ on, and nothing else.
-///
-/// The seeding digest excludes exactly these. Excluding fewer than an arm
-/// writes fails I1 before the first prompt, naming a mismatch the harness
-/// itself created.
 pub const ARM_PREFERENCE_KEYS: [&str; 4] = [
     CONTEXT_MODE_PREFERENCE_KEY,
     EXPIRE_AFTER_ROUNDS_KEY,
@@ -49,11 +23,6 @@ pub const ARM_PREFERENCE_KEYS: [&str; 4] = [
     MEMORY_MODULE_PREFERENCE_KEY,
 ];
 
-/// The schedule a lean arm runs at.
-///
-/// Both numbers are provisional, so they live beside the mode's own key rather
-/// than in the binary. Two arms swept at different values are two different
-/// designs, which is why `guidance_hash` covers the rendered prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SweepPins {
     pub expire_after_rounds: usize,
@@ -61,8 +30,6 @@ pub struct SweepPins {
 }
 
 impl Default for SweepPins {
-    /// The engine's own defaults, read from its preference catalog. A pair
-    /// copied here would keep reporting the shipped default long after it moved.
     fn default() -> Self {
         Self {
             expire_after_rounds: prefs::SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS.default_number()
@@ -74,14 +41,6 @@ impl Default for SweepPins {
 }
 
 impl SweepPins {
-    /// The schedule this run measures, from the environment or the defaults.
-    ///
-    /// Same knob shape as every other pin in this harness: a sweep is started
-    /// by setting a variable, never by editing a constant.
-    ///
-    /// Fallible, because a pin the engine will not take is not a pin. It falls
-    /// back. The arm then sweeps at the engine's own schedule, while every row
-    /// of the run carries the number the operator wrote.
     pub fn from_env() -> Fallible<SweepPins> {
         let default = Self::default();
         Ok(SweepPins {
@@ -101,11 +60,6 @@ impl SweepPins {
     }
 }
 
-/// One schedule pin, as the engine would have to accept it.
-///
-/// `raw` is what the operator wrote, or `None` for an unset variable. Unset is
-/// the engine's own default, which is in range by construction. Anything else
-/// has to be a whole number of rounds inside the catalog's range.
 fn checked(
     env_var: &str,
     catalog_key: &str,
@@ -115,8 +69,6 @@ fn checked(
     let Some(raw) = raw else {
         return Ok(fallback);
     };
-    // A build missing the key states no range, so a round count's widest.
-    // `FlagAvailability` refuses such a build by name, before the first prompt.
     let (min, max) = catalog_range(catalog_key).unwrap_or((1, usize::MAX));
     match raw.parse::<usize>() {
         Ok(rounds) if (min..=max).contains(&rounds) => Ok(rounds),
@@ -124,10 +76,6 @@ fn checked(
     }
 }
 
-/// The range the engine's own catalog accepts for a schedule key.
-///
-/// Read rather than restated, so a widened bound reaches the harness with the
-/// engine that widened it.
 fn catalog_range(catalog_key: &str) -> Option<(usize, usize)> {
     match prefs::lookup(catalog_key)?.value {
         PrefValue::Number { min, max } if min >= 0.0 && max >= min => {
@@ -137,7 +85,6 @@ fn catalog_range(catalog_key: &str) -> Option<(usize, usize)> {
     }
 }
 
-/// Why a schedule pin was refused, naming the variable and the range.
 fn bad_pin(
     env_var: &str,
     raw: &str,
@@ -154,10 +101,6 @@ fn bad_pin(
     .into()
 }
 
-/// What an operator actually wrote, treating unset and blank alike.
-///
-/// `env::var` answers `Ok("")` for an exported-but-empty variable, and a bare
-/// `LUCIDOS_EVAL_SWEEP_EVERY_ROUNDS=` means "I set no schedule".
 fn written(env_var: &str) -> Option<String> {
     std::env::var(env_var)
         .ok()
@@ -165,27 +108,19 @@ fn written(env_var: &str) -> Option<String> {
         .filter(|raw| !raw.is_empty())
 }
 
-/// ADR 0085's context mode, one dimension of an arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ContextMode {
-    /// Post-ADR-0086 behaviour with nothing removed.
     Control,
-    /// Context mode on: memory recall and the conversation history go from
-    /// round 2.
     Lean,
 }
 
-/// ADR 0362's memory module, the other dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemoryModule {
-    /// The history summariser, memory recall and memory search.
     Classic,
-    /// Summary trees and memory views in place of history and recall.
     Tree,
 }
 
 impl MemoryModule {
-    /// The `memory_module` value the engine reads.
     pub fn as_pref(self) -> &'static str {
         match self {
             MemoryModule::Classic => "classic",
@@ -194,12 +129,6 @@ impl MemoryModule {
     }
 }
 
-/// One arm: a context mode and a memory module.
-///
-/// Its name is its identity in every result row, workspace and database. A
-/// Classic arm keeps the name it had before the memory module became a
-/// dimension, so its result rows and database keep their names (ADR 0362 I2).
-/// A Tree arm adds `-tree`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -234,17 +163,6 @@ impl Arm {
         Arm::ALL.into_iter().find(|arm| arm.as_str() == wanted)
     }
 
-    /// The preference rows this arm seeds, in order.
-    ///
-    /// A control arm writes no mode row rather than writing `false`, and an
-    /// arm on the module an unset preference runs writes no module row. An
-    /// absent key and that module mean the same thing to the engine. An
-    /// absent one keeps the digest exclusion honest: each row of difference
-    /// between two arms exists in one arm only.
-    ///
-    /// Plural, because the schedule rides beside the mode. An arm that carries
-    /// the flag and not the two numbers would run at the engine's defaults
-    /// while the run believed it was sweeping.
     pub fn preference_rows(self, sweep: SweepPins) -> Vec<(&'static str, String)> {
         let mut rows = match self.context {
             ContextMode::Control => Vec::new(),
@@ -264,19 +182,10 @@ impl Arm {
         rows
     }
 
-    /// Whether every round must carry a context panel.
-    ///
-    /// What the manipulation check asserts, per ADR 0087 decision 10. ADR 0109
-    /// retires the ledger the check used to read, and the panel is a stricter
-    /// oracle: a lean round renders one even with nothing addressable in it,
-    /// because it always states the budget. So there is no round the flag can
-    /// be silently inert on.
     pub fn expects_a_context_panel(self) -> bool {
         self.context == ContextMode::Lean
     }
 
-    /// Whether every turn must take the Tree path. The engine runs Classic
-    /// until its ready flag sets, so a Tree arm checks readiness itself.
     pub fn expects_tree_memory(self) -> bool {
         self.memory == MemoryModule::Tree
     }
@@ -302,26 +211,13 @@ impl fmt::Display for Arm {
     }
 }
 
-/// What the engine under test knows about [`ARM_PREFERENCE_KEYS`].
-///
-/// Resolved by reading the engine's own preference catalog, so the answer
-/// comes from the build being measured rather than from this crate's opinion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagAvailability {
-    /// The catalog carries every key. Every arm can be exercised.
     Present,
-    /// A key is missing, so an arm seeding it would measure something other
-    /// than what it reports. See [`missing_flag_message`].
     Missing,
 }
 
 impl FlagAvailability {
-    /// Every key an arm writes must exist, not just the mode's own.
-    ///
-    /// A build carrying the mode but not the two schedule keys seeds two rows
-    /// the engine ignores. It sweeps at the engine's defaults, while the run
-    /// stamps every result with the schedule it believed it pinned. That is
-    /// the null-that-reads-as-a-pass this check exists to refuse.
     pub fn from_catalog_keys<S: AsRef<str>>(keys: &[S]) -> Self {
         if Self::missing_keys(keys).is_empty() {
             FlagAvailability::Present
@@ -330,7 +226,6 @@ impl FlagAvailability {
         }
     }
 
-    /// The arm keys this catalog does not carry, in declaration order.
     pub fn missing_keys<S: AsRef<str>>(keys: &[S]) -> Vec<&'static str> {
         ARM_PREFERENCE_KEYS
             .into_iter()
@@ -339,10 +234,6 @@ impl FlagAvailability {
     }
 }
 
-/// The refusal text every caller prints when a key is absent.
-///
-/// One string, so the sentence is the same whichever command reached it, and so
-/// the key is never spelled by hand a second time.
 pub fn missing_flag_message() -> String {
     format!(
         "arm_flag_missing: the engine's preference catalog is missing at least \
@@ -374,8 +265,6 @@ mod tests {
         ]
     }
 
-    /// The module an arm's rows give the engine: its own row, or the one an
-    /// unset preference runs when it writes none.
     fn seeded_module(arm: Arm) -> String {
         arm.preference_rows(SweepPins::default())
             .into_iter()
@@ -386,7 +275,6 @@ mod tests {
             )
     }
 
-    /// Each arm runs the module its name says, whichever one runs while unset.
     #[test]
     fn every_arm_seeds_the_module_it_names() {
         for arm in Arm::ALL {
@@ -394,8 +282,6 @@ mod tests {
         }
     }
 
-    /// Twins differ by the module row and nothing else, and the lean arms add
-    /// the same mode rows to it.
     #[test]
     fn twin_arms_differ_by_the_module_row_alone() {
         let without_module = |arm: Arm| -> Vec<(&'static str, String)> {
@@ -421,8 +307,6 @@ mod tests {
         }
     }
 
-    /// Both values an arm may seed are ones the engine's catalog accepts, read
-    /// from the catalog rather than restated.
     #[test]
     fn both_module_values_are_ones_the_catalog_accepts() {
         let spec = prefs::lookup(MEMORY_MODULE_PREFERENCE_KEY)
@@ -439,8 +323,6 @@ mod tests {
         }
     }
 
-    /// Every key an arm writes must be excluded from the digest, or the run
-    /// dies on a difference the harness put there itself.
     #[test]
     fn every_seeded_key_is_one_the_digest_excludes() {
         for arm in Arm::ALL {
@@ -453,8 +335,6 @@ mod tests {
         }
     }
 
-    /// I2: a Classic arm's name is its name from before, in every row and
-    /// database that carries it.
     #[test]
     fn the_classic_arms_keep_their_wire_names() {
         assert_eq!(serde_json::to_string(&Arm::CONTROL).unwrap(), "\"control\"");
@@ -501,9 +381,6 @@ mod tests {
         );
     }
 
-    /// The mode's own key alone is not enough. Seeding a schedule the engine
-    /// has no key for runs the arm at the engine's defaults, and the run would
-    /// report the numbers it seeded.
     #[test]
     fn the_mode_key_alone_reports_missing() {
         let catalog = [prefs::TIMEZONE.key(), CONTEXT_MODE_PREFERENCE_KEY];
@@ -529,8 +406,6 @@ mod tests {
         }
     }
 
-    /// The catalog is where the accepted range comes from, so a spec that
-    /// stopped being a number would leave the parser guessing.
     #[test]
     fn the_catalog_states_a_range_for_both_schedule_keys() {
         for key in [EXPIRE_AFTER_ROUNDS_KEY, SWEEP_EVERY_ROUNDS_KEY] {
@@ -564,8 +439,6 @@ mod tests {
         assert_eq!(resolved.unwrap(), 7);
     }
 
-    /// The defect this replaces: every one of these read as the default, and
-    /// the run then reported a schedule nothing had swept at.
     #[test]
     fn a_pin_the_engine_would_reject_fails_the_run() {
         for raw in ["0", "1001", "five", "-1", "3.5", "10rounds"] {
@@ -579,8 +452,6 @@ mod tests {
         }
     }
 
-    /// An operator reading the refusal has to be able to fix it without
-    /// opening the engine's catalog.
     #[test]
     fn the_refusal_names_the_variable_and_the_range() {
         let message = checked(
@@ -608,7 +479,6 @@ mod tests {
         assert_eq!(Arm::parse("nolean"), None);
     }
 
-    /// The panel follows the context mode alone, and Tree the module alone.
     #[test]
     fn each_gate_reads_its_own_dimension() {
         for arm in Arm::ALL {

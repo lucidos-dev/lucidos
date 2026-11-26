@@ -1,14 +1,8 @@
-//! `lucidos claude-gateway`, the Claude gateway sign-in from a terminal.
-//!
-//! The same routes Settings uses, so a sign-in started here shows there too.
-//! The engine holds the tokens. This command only ever sees the user code.
-
 use std::time::Duration;
 
 use crate::http::{client, send_expect_json};
 use crate::workspace::{BoxError, Workspace};
 
-/// How often `sign-in` asks whether the user has approved yet.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 fn status_url(ws: &Workspace) -> String {
@@ -24,8 +18,6 @@ fn text<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value[key].as_str()
 }
 
-/// `lucidos claude-gateway status`: the URL, who is signed in, and any sign-in
-/// in progress.
 pub(crate) fn cmd_status(ws: &Workspace, json: bool) -> Result<(), BoxError> {
     let status = fetch_status(ws)?;
     if json {
@@ -81,9 +73,6 @@ fn print_code(pending: &serde_json::Value) {
     );
 }
 
-/// `lucidos claude-gateway sign-in`: start a device sign-in, storing `url` as
-/// the gateway URL first when given. Shows the code, then waits until the
-/// user approves or the sign-in ends.
 pub(crate) fn cmd_sign_in(ws: &Workspace, url: Option<&str>) -> Result<(), BoxError> {
     let start_url = format!("{}/sign-in", status_url(ws));
     let req = client()?
@@ -117,8 +106,6 @@ pub(crate) fn cmd_sign_in(ws: &Workspace, url: Option<&str>) -> Result<(), BoxEr
     }
 }
 
-/// `lucidos claude-gateway sign-out`: forget the sign-in, and stop one in
-/// progress.
 pub(crate) fn cmd_sign_out(ws: &Workspace) -> Result<(), BoxError> {
     let url = format!("{}/sign-out", status_url(ws));
     let parsed = send_expect_json("POST", &url, client()?.post(&url))?;

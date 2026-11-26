@@ -1,5 +1,3 @@
-//! Resolve notification recipients from durable thread roles and gates.
-
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::Serialize;
@@ -10,7 +8,6 @@ use crate::engine::thread_events::notification::{NavigateTarget, Tap};
 use crate::engine::thread_events::MessageOrigin;
 use crate::gateway_users::{UserRef, UserSnapshot};
 
-/// The event types the fold reads, in the order they were recorded.
 const ROLE_EVENT_TYPES: &[&str] = &[
     "RootThreadDriverTaken",
     "WorkItemDriverTaken",
@@ -22,24 +19,19 @@ const ROLE_EVENT_TYPES: &[&str] = &[
     "WorkItemUnwatched",
 ];
 
-/// Who steers a root thread right now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ThreadUsers {
     pub driver: Option<UserRef>,
     pub watchers: Vec<UserRef>,
 }
 
-/// Who a push about a root thread reaches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Audience {
-    /// Every device, as a push reaches today.
     Team,
-    /// These devices only: the driver's and the watchers'.
     Devices(BTreeSet<String>),
 }
 
 impl Audience {
-    /// The device ids a client checks itself against. `None` means everyone.
     pub fn device_ids(&self) -> Option<Vec<String>> {
         match self {
             Self::Team => None,
@@ -47,7 +39,6 @@ impl Audience {
         }
     }
 
-    /// The audience a notification row recorded. `None` is the whole team.
     pub fn from_device_ids(ids: Option<Vec<String>>) -> Self {
         match ids {
             None => Self::Team,
@@ -55,8 +46,6 @@ impl Audience {
         }
     }
 
-    /// Whether a push may reach this device. A subscription with no device id
-    /// is reachable only by the team.
     pub fn reaches(&self, device_id: Option<&str>) -> bool {
         match self {
             Self::Team => true,
@@ -65,19 +54,13 @@ impl Audience {
     }
 }
 
-/// One recorded role event, as the fold reads it.
 #[derive(Debug, Clone)]
 pub struct RoleEvent {
     pub event_type: String,
     pub actor: Option<MessageOrigin>,
-    /// The user a mention made a watcher. `None` means the actor's user.
     pub user_id: Option<String>,
 }
 
-/// The roles a requester and a run of role events give. A user-started
-/// root thread starts with its requester as driver; any other origin starts
-/// with none. An event names its user, else its actor's user. One that
-/// names nobody changes nothing.
 pub fn fold(
     requester: Option<&MessageOrigin>,
     events: &[RoleEvent],
@@ -102,7 +85,6 @@ pub fn fold(
         };
         match event.event_type.as_str() {
             "RootThreadDriverTaken" | "WorkItemDriverTaken" => roles.driver = Some(who),
-            // A release gives up only what its actor holds.
             "RootThreadDriverReleased" | "WorkItemDriverReleased" => {
                 if roles.driver.as_ref().is_some_and(|d| d.id == who.id) {
                     roles.driver = None;
@@ -122,10 +104,6 @@ pub fn fold(
     roles
 }
 
-/// The audience of a root thread's push. It is the whole team in four cases:
-/// the gateway knows fewer than two users, the root thread has no driver, a
-/// gate escalated, or nobody it names holds a device. So a gate always
-/// reaches someone, and a personal workspace pushes as it always did.
 pub fn audience(roles: &ThreadUsers, escalated: bool, snapshot: &UserSnapshot) -> Audience {
     if snapshot.user_count() < 2 {
         return Audience::Team;
@@ -145,7 +123,6 @@ pub fn audience(roles: &ThreadUsers, escalated: bool, snapshot: &UserSnapshot) -
     }
 }
 
-/// The users of the root thread `root`.
 pub async fn roles(
     pool: &PgPool,
     root: Uuid,
@@ -157,9 +134,6 @@ pub async fn roles(
         .unwrap_or_default())
 }
 
-/// The users of each root thread in `roots`, in two queries. The requester
-/// is who sent the root's first message, to its agent or to users, or the
-/// origin of its `TriggerStarted`: a trigger-born thread has no message of its own.
 pub async fn roles_of_many(
     pool: &PgPool,
     roots: &[Uuid],
@@ -204,14 +178,12 @@ pub async fn roles_of_many(
         .collect())
 }
 
-/// Whether a gate under the root thread `root` escalated and is still open.
 async fn has_open_escalated_gate(pool: &PgPool, root: Uuid) -> Result<bool, sqlx::Error> {
     Ok(!roots_with_open_escalated_gate(pool, &[root])
         .await?
         .is_empty())
 }
 
-/// The root threads among `roots` with a gate that escalated and is still open.
 pub async fn roots_with_open_escalated_gate(
     pool: &PgPool,
     roots: &[Uuid],
@@ -231,7 +203,6 @@ pub async fn roots_with_open_escalated_gate(
     Ok(escalated.into_iter().collect())
 }
 
-/// Who a push about `thread_id`, or any thread in its family, reaches.
 pub async fn audience_of_thread(
     pool: &PgPool,
     thread_id: Uuid,
@@ -243,10 +214,6 @@ pub async fn audience_of_thread(
     Ok(audience(&roles, escalated, snapshot))
 }
 
-/// Who a notification reaches, from the thread it opens: its tap's thread
-/// target, else the thread of the event it links. One that opens no thread
-/// reaches the whole team, and so does every notification on a gateway with
-/// fewer than two users, at no cost.
 pub async fn audience_of_notification(
     pool: &PgPool,
     tap: &Tap,

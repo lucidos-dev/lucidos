@@ -1,21 +1,3 @@
-//! In-memory cache of `script_handshake` auth headers + expiry, with a
-//! singleflight gate so concurrent first-time requests for the same proxy
-//! don't all spawn the script. The gate also handles the failure path
-//! correctly: if the leader's script call fails, the FIRST waiting
-//! follower becomes the next leader and the rest park on its attempt.
-//! K consecutive script failures with N concurrent waiters yield exactly
-//! K+1 script invocations, not K*N+1.
-//!
-//! Cancellation safety: the leader's slot is owned by a `LeaderGuard`
-//! whose `Drop` calls `finish(succeeded=false)` if the future is cancelled
-//! before the leader explicitly completes. Without this, an axum handler
-//! dropped mid-`refresh` (HTTP client disconnected on its own timeout)
-//! would leave the slot in the inflight map with `done=false` and
-//! `needs_leader=false` — wedging every subsequent caller as a Follower
-//! on a watch channel that never fires. The `inflight` map uses
-//! `std::sync::Mutex` (not `tokio::sync::Mutex`) so the guard's Drop
-//! can release the slot synchronously from any context.
-
 use axum::http::{HeaderName, HeaderValue};
 use std::collections::HashMap;
 use std::future::Future;
@@ -24,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, RwLock};
 
-/// The longest a cached token is trusted. A handshake script may report
+/// INVARIANT: The longest a cached token is trusted. A handshake script may report
 /// `expires_in` as a "never" sentinel such as Python's `sys.maxsize`, and
 /// `Instant + Duration` panics past the clock's range.
 const MAX_TOKEN_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -38,7 +20,7 @@ pub struct CachedToken {
 #[derive(Default)]
 pub struct ProxyTokenCache {
     entries: RwLock<HashMap<String, CachedToken>>,
-    /// `std::sync::Mutex` (not tokio's) so `LeaderGuard::drop` can release
+    /// INVARIANT: `std::sync::Mutex` (not tokio's) so `LeaderGuard::drop` can release
     /// a cancelled leader's slot synchronously without needing an async
     /// context. Critical sections are tiny — hash-map ops + atomics + a
     /// sync `watch::Sender::send_replace` — so blocking the executor
@@ -46,7 +28,7 @@ pub struct ProxyTokenCache {
     inflight: StdMutex<HashMap<String, Arc<InflightSlot>>>,
 }
 
-/// One round of leadership. The slot stays in the inflight map across
+/// INVARIANT: One round of leadership. The slot stays in the inflight map across
 /// the leader's whole work AND across the leader→next-leader handoff on
 /// failure: on Err the leader sets `needs_leader=true` instead of
 /// removing the slot, so late-arriving followers always see an existing
@@ -79,7 +61,6 @@ impl ProxyTokenCache {
         Self::default()
     }
 
-    /// Returns the cached entry IF it exists and hasn't expired.
     pub async fn get(&self, name: &str) -> Option<CachedToken> {
         let entries = self.entries.read().await;
         let entry = entries.get(name)?;
@@ -89,8 +70,6 @@ impl ProxyTokenCache {
         Some(entry.clone())
     }
 
-    /// Returns the inserted `CachedToken` so callers don't need a
-    /// follow-up `get` (and so avoid racing with `invalidate`).
     pub async fn insert(
         &self,
         name: &str,
@@ -112,24 +91,6 @@ impl ProxyTokenCache {
         self.entries.write().await.remove(name);
     }
 
-    /// Singleflight: returns the cached token (if fresh) or runs `refresh`
-    /// to mint one. Concurrent callers for the same `name` collapse into
-    /// a single `refresh` per attempt. The returned `bool` is `true` iff
-    /// the value came from a pre-existing cache entry on entry to this
-    /// call (no `refresh` was triggered for this caller).
-    ///
-    /// Failure semantics: the leader of each attempt returns its `Err` to
-    /// its own caller. Followers wake, observe the failure (cache miss),
-    /// and the FIRST one to re-enter `enter` claims the next attempt
-    /// (becomes the new leader); the rest park on the new attempt.
-    /// K consecutive failures → exactly K+1 calls to `refresh`,
-    /// regardless of the number of concurrent followers.
-    ///
-    /// Cancellation safety: every leader path holds a `LeaderGuard`. If
-    /// the future is dropped between acquiring leadership and explicit
-    /// completion (axum cancels the handler when the HTTP client gives
-    /// up), the guard's Drop calls `finish(succeeded=false)` synchronously
-    /// so the slot doesn't strand followers forever.
     pub async fn get_or_refresh<F, Fut, E>(
         &self,
         name: &str,
@@ -146,7 +107,7 @@ impl ProxyTokenCache {
             match self.enter(name) {
                 Outcome::Leader(slot) => {
                     let guard = LeaderGuard::new(self, name, slot);
-                    // Re-check cache: a different leader may have
+                    // INVARIANT: Re-check cache: a different leader may have
                     // succeeded between our initial miss and acquiring
                     // leadership. Without this, a tail-end follower can
                     // become a redundant leader after a fast successor
@@ -169,31 +130,19 @@ impl ProxyTokenCache {
                     }
                 }
                 Outcome::Follower(mut rx) => {
-                    // Subscribed under the inflight Mutex in `enter`, so
-                    // we cannot miss the leader's `done=true` even if it
-                    // fires immediately.
                     let _ = rx.wait_for(|done| *done).await;
                     if let Some(token) = self.get(name).await {
                         return Ok((token, false));
                     }
-                    // Cache miss → leader failed (or was cancelled).
-                    // Loop; first caller in `enter` claims the next round.
                     continue;
                 }
             }
         }
     }
 
-    /// Subscribe-or-claim is atomic against `finish` — both run under
-    /// the inflight Mutex. Sync because the critical section is tiny
-    /// and `LeaderGuard::drop` (also synchronous) shares this path.
     fn enter(&self, name: &str) -> Outcome {
         let mut inflight = self.inflight.lock().expect("inflight mutex poisoned");
         if let Some(existing) = inflight.get(name).cloned() {
-            // Previous round failed (or was cancelled); first swap-winner
-            // claims the next round. Replace with a fresh slot so new
-            // followers subscribe to a Pending channel, not the
-            // already-fired one.
             if existing.needs_leader.swap(false, Ordering::SeqCst) {
                 let new_slot = InflightSlot::new();
                 inflight.insert(name.to_string(), new_slot.clone());
@@ -218,21 +167,12 @@ impl ProxyTokenCache {
                 }
             }
         }
-        // Always wake THIS slot's subscribers — they may have subscribed
+        // INVARIANT: Always wake THIS slot's subscribers — they may have subscribed
         // before a successor replaced us in inflight.
         let _ = slot.done.send_replace(true);
     }
 }
 
-/// RAII handle for the leader's hold on an `InflightSlot`. The leader
-/// must call `complete(succeeded)` on the happy path; if the future is
-/// cancelled (axum drops the handler when the HTTP client disconnects),
-/// `Drop` calls `finish` with `succeeded=false` so the slot doesn't
-/// leak. Without this, a cancelled leader leaves the slot in the map
-/// with `done=false` and `needs_leader=false`, and every later caller
-/// subscribes as a Follower to a watch channel that will never fire —
-/// observed in production as the "comfort-cloud hung for 21 hours"
-/// regression after a transient network failure.
 struct LeaderGuard<'a> {
     cache: &'a ProxyTokenCache,
     name: String,
@@ -259,8 +199,6 @@ impl<'a> LeaderGuard<'a> {
 impl<'a> Drop for LeaderGuard<'a> {
     fn drop(&mut self) {
         if !self.completed {
-            // Cancelled before explicit completion → treat as a failure
-            // round so the next caller can swap in as the new leader.
             self.cache.finish(&self.name, &self.slot, false);
         }
     }
@@ -312,8 +250,6 @@ mod tests {
         assert!(c.get("x").await.is_none());
     }
 
-    /// Regression: `expires_in = sys.maxsize` from a handshake script panicked
-    /// the request with "overflow when adding duration to instant".
     #[tokio::test]
     async fn a_never_expiring_ttl_is_capped_instead_of_panicking() {
         let c = ProxyTokenCache::new();
@@ -380,7 +316,6 @@ mod tests {
         assert!(!was_hit, "minted token should report was_hit=false");
         assert_eq!(token.headers[0].1, "Bearer ok");
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
-        // Inflight slot should be removed after success.
         assert!(c.inflight.lock().unwrap().get("x").is_none());
     }
 
@@ -391,11 +326,6 @@ mod tests {
         assert_eq!(result.unwrap_err(), "boom");
     }
 
-    /// Spawn `n` followers all calling `get_or_refresh(name)`; the mock
-    /// upstream fails the first `k` times then succeeds. With
-    /// `extra_await=true` the script yields once before deciding,
-    /// exposing the failure→handoff window. Returns the count of
-    /// upstream invocations and the per-follower results.
     async fn run_stampede_scenario(
         name: &'static str,
         n: usize,
@@ -446,10 +376,6 @@ mod tests {
         (upstream_calls.load(AtomicOrdering::SeqCst), results)
     }
 
-    /// Core property: K leader failures × N concurrent followers ⇒
-    /// exactly K+1 upstream calls — one per round, not K*N+1. Worst
-    /// case is multi-threaded + instant-failing script: under the prior
-    /// Notify singleflight this produced 5–6 calls instead of 4.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn k_failures_with_n_followers_yield_k_plus_1_upstream_calls() {
         let (n, k) = (64usize, 3usize);
@@ -471,7 +397,6 @@ mod tests {
         assert_eq!(oks, n - k);
     }
 
-    /// Many failure rounds across many trials — flakes show up here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn no_stampede_under_repeated_failure_rounds() {
         let k = 5usize;
@@ -486,11 +411,6 @@ mod tests {
         }
     }
 
-    /// Followers subscribed to a slot that fails AND gets replaced by a
-    /// successor must still wake (the orphaned slot's `done=true` must
-    /// reach them so they re-enter and subscribe to the new round).
-    /// Regression guard for `finish` skipping the wake when the slot is
-    /// no longer current.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn followers_subscribed_to_orphaned_slot_still_wake() {
         let k = 2usize;
@@ -498,22 +418,12 @@ mod tests {
         assert_eq!(calls, k + 1);
     }
 
-    /// Regression test for the "comfort-cloud hangs for 21 hours after a
-    /// transient network failure" bug. A leader whose `get_or_refresh`
-    /// future is cancelled mid-`refresh` (axum drops the handler when the
-    /// HTTP client disconnects) MUST release its inflight slot so the next
-    /// caller can mint a new token. Before the Drop-guard fix, the slot
-    /// stayed in the inflight map with `done=false` and `needs_leader=false`,
-    /// so every subsequent caller subscribed as a Follower to a watch
-    /// channel that would never fire — wedging the proxy until restart.
     #[tokio::test]
     async fn cancelled_leader_does_not_strand_followers() {
         use tokio::sync::Notify;
 
         let cache = Arc::new(ProxyTokenCache::new());
 
-        // Block the first refresh on a Notify so we can guarantee the
-        // leader is inside `refresh()` when we cancel it.
         let leader_inside_refresh = Arc::new(Notify::new());
         let leader_inside_refresh_in = leader_inside_refresh.clone();
 
@@ -524,11 +434,6 @@ mod tests {
                     let leader_inside_refresh = leader_inside_refresh_in.clone();
                     async move {
                         leader_inside_refresh.notify_one();
-                        // Hang forever — simulates a handshake script
-                        // that's stuck on a broken DNS lookup. Real
-                        // production code has a 30s timeout in the script
-                        // runner; here we don't need one because the test
-                        // aborts the join handle.
                         std::future::pending::<()>().await;
                         unreachable!()
                     }
@@ -536,18 +441,11 @@ mod tests {
                 .await
         });
 
-        // Wait until the leader is inside refresh() — so cancellation
-        // hits the mid-`refresh` await, which is the bug's window.
         leader_inside_refresh.notified().await;
 
-        // Cancel the leader — same effect as axum dropping the handler
-        // when the HTTP client disconnects after its 30s timeout.
         leader.abort();
         let _ = leader.await;
 
-        // Now a fresh caller comes in. Under the bug it sees the leaked
-        // slot, subscribes as a Follower, and waits forever. The test's
-        // 2-second timeout catches that.
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             cache.get_or_refresh::<_, _, &'static str>("x", || async {
@@ -568,11 +466,6 @@ mod tests {
         assert_eq!(token.headers[0].1, "Bearer ok");
     }
 
-    /// Concurrent followers must ALSO recover when the leader is cancelled
-    /// mid-refresh — not just a single fresh caller that arrives after the
-    /// abort. Followers that subscribed to the doomed slot need to either
-    /// (a) be woken when the leader's Drop fires `done=true`, or (b) time
-    /// out reasonably so they re-enter and take a new leader slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_leader_wakes_subscribed_followers() {
         use tokio::sync::{Barrier, Notify};
@@ -596,7 +489,6 @@ mod tests {
         });
         leader_inside_refresh.notified().await;
 
-        // Spin up N followers that all park on the leader's slot.
         let n = 8usize;
         let followers_started = Arc::new(Barrier::new(n + 1));
         let mut followers = Vec::with_capacity(n);
@@ -613,15 +505,11 @@ mod tests {
             }));
         }
         followers_started.wait().await;
-        // Give followers a moment to subscribe as Followers under the
-        // doomed slot (rather than racing with the abort).
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Cancel the leader.
         leader.abort();
         let _ = leader.await;
 
-        // All followers must finish within a bounded window.
         for f in followers {
             let result = tokio::time::timeout(Duration::from_secs(2), f).await;
             let (token, _) = result
@@ -632,9 +520,6 @@ mod tests {
         }
     }
 
-    /// Two distinct names share a single cache without blocking each
-    /// other — refresh of one must not stall callers waiting on the
-    /// other.
     #[tokio::test]
     async fn different_names_do_not_block_each_other() {
         use tokio::sync::Notify;
@@ -656,7 +541,6 @@ mod tests {
                 .await
         });
 
-        // Sibling key 'b' must complete without waiting for 'a'.
         let (token_b, _) = cache
             .get_or_refresh::<_, _, ()>("b", || async {
                 Ok((ok_headers(), Duration::from_secs(60)))

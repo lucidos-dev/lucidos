@@ -39,7 +39,8 @@ export type UnproposedReason =
   | 'turn_incomplete'
   | 'awaiting_landing'
   | 'integrated_into_parent'
-  | 'carried_by_successor';
+  | 'carried_by_successor'
+  | 'hook_refused';
 
 export type CodingAgentChangeState =
   | { kind: 'none' }

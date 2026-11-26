@@ -1,17 +1,6 @@
-//! The home thread, end to end (ADR 0362, ADR 0411).
-//!
-//! Every workspace has one from boot. These tests check the wiring the unit
-//! tests cannot. The thread list carries it from the first request, and the
-//! archive and delete routes refuse it. Only a rename by hand names it, and
-//! the retired switch cannot be written back.
-//!
-//! The home thread is workspace-wide state, so one test walks the whole
-//! sequence in order rather than several tests racing on it.
-
 use crate::support::{base_url, db_url, user_client};
 use serde_json::json;
 
-/// The key ADR 0411 retired, as clients used to send it: a wire contract.
 const RETIRED_SWITCH: &str = "home_thread_enabled";
 
 async fn thread_list(client: &reqwest::Client) -> serde_json::Value {
@@ -39,7 +28,6 @@ async fn the_home_thread_exists_from_boot_and_cannot_be_switched_off() {
         .await
         .expect("Failed to connect to E2E workspace database");
 
-    // Boot made it before the router served, so the list carries it.
     let homes = home_rows(&pool).await;
     assert_eq!(homes.len(), 1, "{homes:?}");
     let home = homes[0].to_string();
@@ -48,7 +36,6 @@ async fn the_home_thread_exists_from_boot_and_cannot_be_switched_off() {
     assert_eq!(body["home_thread"]["home"], true);
     assert_eq!(body["home_thread"]["channel"], "chat");
 
-    // The welcome is drawn by the client, so Home holds no message of its own.
     let messages: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE thread_id = $1 \
          AND event_type IN ('MessageReceived', 'TextStreamed', 'ResponseGenerated')",
@@ -59,7 +46,6 @@ async fn the_home_thread_exists_from_boot_and_cannot_be_switched_off() {
     .unwrap();
     assert_eq!(messages, 0, "Home holds no message nobody wrote");
 
-    // Archive and delete refuse it.
     for route in ["archive", "delete"] {
         let resp = client
             .post(format!("{}/api/v1/threads/{route}", base_url()))
@@ -73,7 +59,6 @@ async fn the_home_thread_exists_from_boot_and_cannot_be_switched_off() {
         assert_eq!(body["reason"], "home_thread", "{route}: {body:?}");
     }
 
-    // The retired switch is refused, so an old client cannot hide Home.
     let resp = client
         .put(format!(
             "{}/api/v1/preferences?key={RETIRED_SWITCH}",
@@ -97,8 +82,6 @@ async fn the_home_thread_exists_from_boot_and_cannot_be_switched_off() {
     assert_eq!(stored, 0);
     assert_eq!(thread_list(&client).await["home_thread"]["thread_id"], home);
 
-    // Only the user names it: a rename lands, a suggestion is refused before
-    // and after it, and the rename survives.
     assert_eq!(suggest_title(&client, &home).await, 409);
     rename(&client, &home, "Kitchen table").await;
     assert_eq!(
@@ -110,7 +93,6 @@ async fn the_home_thread_exists_from_boot_and_cannot_be_switched_off() {
         thread_list(&client).await["home_thread"]["title"],
         "Kitchen table"
     );
-    // Later suites expect the name it was born with.
     rename(&client, &home, "Home").await;
 }
 
@@ -124,7 +106,6 @@ async fn rename(client: &reqwest::Client, thread_id: &str, title: &str) {
     assert_eq!(resp.status(), 200, "a rename by hand must land on Home");
 }
 
-/// The suggest-title status. Its refusal names the home thread.
 async fn suggest_title(client: &reqwest::Client, thread_id: &str) -> u16 {
     let resp = client
         .post(format!("{}/api/v1/threads/suggest-title", base_url()))

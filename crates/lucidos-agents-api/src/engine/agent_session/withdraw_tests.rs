@@ -13,7 +13,6 @@ fn sent(text: &str) -> AgentInput {
     }
 }
 
-/// A driver the withdraw never reaches: the store answers first.
 fn unused_driver() -> mpsc::UnboundedSender<WithdrawRequest> {
     mpsc::unbounded_channel().0
 }
@@ -29,7 +28,6 @@ fn request(input_event_id: Uuid) -> (WithdrawInputRequest, oneshot::Receiver<Inp
     (request, answer)
 }
 
-/// A pool for a test the store never answers, so it never connects.
 fn unused_pool() -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://unused@127.0.0.1:1/unused")
@@ -58,8 +56,6 @@ async fn tombstones(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
     .unwrap()
 }
 
-/// A message this session's agent already read is not taken back, and the
-/// store is never asked.
 #[tokio::test]
 async fn an_input_this_session_read_is_already_read() {
     let id = Uuid::new_v4();
@@ -83,9 +79,6 @@ async fn an_input_this_session_read_is_already_read() {
     assert!(pending.is_empty());
 }
 
-/// The reported bug: the previous process took the follow-up into its queue
-/// and died. This session never forwarded it, so no live process holds it,
-/// and the remove records the tombstone. It records no read.
 #[tokio::test]
 async fn an_unread_input_this_session_never_forwarded_is_withdrawn() {
     let (pool, db_name) = setup_test_db().await;
@@ -110,7 +103,6 @@ async fn an_unread_input_this_session_never_forwarded_is_withdrawn() {
     teardown_test_db(&db_name).await;
 }
 
-/// A message an earlier session's agent read stays read.
 #[tokio::test]
 async fn an_input_an_earlier_session_read_is_already_read() {
     let (pool, db_name) = setup_test_db().await;
@@ -154,7 +146,6 @@ async fn read_in_the_store(bus: &EventBus, thread_id: Uuid, id: Uuid) {
     .unwrap();
 }
 
-/// A session forwarded `id`'s message to its agent.
 async fn forwarded_in_the_store(bus: &EventBus, thread_id: Uuid, id: Uuid) {
     crate::test_support::start_cc_session(bus, thread_id, "work", None).await;
     bus.emit(BusEvent::Thread {
@@ -171,7 +162,6 @@ async fn forwarded_in_the_store(bus: &EventBus, thread_id: Uuid, id: Uuid) {
     .unwrap();
 }
 
-/// A driver that is gone before it answers leaves the message where it was.
 #[tokio::test]
 async fn a_driver_that_ended_refuses() {
     let id = Uuid::new_v4();
@@ -196,8 +186,6 @@ async fn a_driver_that_ended_refuses() {
     );
 }
 
-/// The whole path: Claude Code is asked by the input's own uuid, and its
-/// `cancelled: true` takes the input off the ledger and records the tombstone.
 #[tokio::test]
 async fn a_withdrawn_input_leaves_the_ledger_and_records_its_tombstone() {
     let (pool, db_name) = setup_test_db().await;
@@ -225,7 +213,6 @@ async fn a_withdrawn_input_leaves_the_ledger_and_records_its_tombstone() {
     teardown_test_db(&db_name).await;
 }
 
-/// Any answer but `cancelled: true` leaves the message owed and unhidden.
 #[tokio::test]
 async fn a_refused_withdraw_records_nothing() {
     let (pool, db_name) = setup_test_db().await;
@@ -260,7 +247,6 @@ fn sessions_with(session: AgentSession, thread_id: Uuid) -> Mutex<HashMap<Uuid, 
 
 const QUICK: Duration = Duration::from_secs(5);
 
-/// No run loop takes the request, so the caller falls back to the claim.
 #[tokio::test]
 async fn a_thread_without_a_live_session_has_no_run_loop_to_ask() {
     let outcome = withdraw_from_session(
@@ -274,8 +260,6 @@ async fn a_thread_without_a_live_session_has_no_run_loop_to_ask() {
     assert_eq!(outcome, None);
 }
 
-/// The request reaches the session's run loop, and the loop's answer is the
-/// caller's answer, for either coding agent.
 #[tokio::test]
 async fn a_session_answers_through_its_run_loop() {
     for coding_agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
@@ -307,8 +291,6 @@ async fn a_session_answers_through_its_run_loop() {
     }
 }
 
-/// A run loop that ends with the request unanswered does not hang. Its process
-/// is gone, so the caller falls back to the claim.
 #[tokio::test]
 async fn a_run_loop_that_ends_first_leaves_it_to_the_claim() {
     let thread_id = Uuid::new_v4();
@@ -328,7 +310,6 @@ async fn a_run_loop_that_ends_first_leaves_it_to_the_claim() {
     run_loop.await.unwrap();
 }
 
-/// Claim `thread_id` the way the engine does, from `sessions`.
 fn claim(
     sessions: &mut HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
@@ -342,8 +323,6 @@ fn claim(
     std::future::ready(Ok(claimed.ok()))
 }
 
-/// An idle thread has no process to ask. The remove claims the thread, finds no
-/// read, and records the tombstone. It records no read.
 #[tokio::test]
 async fn an_idle_thread_records_the_tombstone_under_the_claim() {
     let (pool, db_name) = setup_test_db().await;
@@ -379,8 +358,6 @@ async fn an_idle_thread_keeps_a_message_its_agent_read() {
     teardown_test_db(&db_name).await;
 }
 
-/// A message no session ever forwarded may be waiting on a spawn's claim. The
-/// remove writes nothing, or that spawn would deliver it over its tombstone.
 #[tokio::test]
 async fn a_message_no_session_forwarded_is_not_taken_back() {
     let (pool, db_name) = setup_test_db().await;
@@ -400,8 +377,6 @@ async fn a_message_no_session_forwarded_is_not_taken_back() {
     teardown_test_db(&db_name).await;
 }
 
-/// A run that holds the thread could forward the message at any moment. So
-/// the remove writes nothing and leaves the answer to that run's loop.
 #[tokio::test]
 async fn a_held_claim_leaves_the_remove_to_the_run_loop() {
     let (pool, db_name) = setup_test_db().await;
@@ -422,8 +397,6 @@ async fn a_held_claim_leaves_the_remove_to_the_run_loop() {
     teardown_test_db(&db_name).await;
 }
 
-/// A withdrawal whose tombstone failed to record is retried from the ledger,
-/// without asking Claude Code again: it already dropped the message.
 #[tokio::test]
 async fn a_withdrawal_whose_tombstone_failed_records_it_on_retry() {
     let (pool, db_name) = setup_test_db().await;
@@ -451,9 +424,6 @@ async fn a_withdrawal_whose_tombstone_failed_records_it_on_retry() {
     teardown_test_db(&db_name).await;
 }
 
-/// The read-ordering race: Claude Code drops A, then reads B. A's answer lands
-/// before B's replay reaches the run loop. So settling answered withdraws first
-/// leaves B's read for B, never for A.
 #[tokio::test]
 async fn a_read_after_a_drop_settles_the_input_it_names() {
     let (pool, db_name) = setup_test_db().await;
@@ -470,12 +440,10 @@ async fn a_read_after_a_drop_settles_the_input_it_names() {
     let mut pending = PendingWithdraws::new();
     let (withdraw, _answer) = request(a);
     begin_withdraw(&inputs, &driver, &pool, thread_id, withdraw, &mut pending);
-    // Polled once, as the select arm does, so it waits on the answer.
     assert!(pending.next().now_or_never().is_none());
     let asked: WithdrawRequest = driver_rx.recv().await.unwrap();
     asked.reply.send(InputWithdrawal::Withdrawn).unwrap();
 
-    // B's replay arrives next. The run loop settles answers before it.
     settle_answered_withdraws(&bus, thread_id, &mut inputs, &mut pending).await;
     let replay = crate::runtime::AgentEvent::InputRead { input: b_uuid };
     assert_eq!(
@@ -491,9 +459,6 @@ async fn a_read_after_a_drop_settles_the_input_it_names() {
     teardown_test_db(&db_name).await;
 }
 
-/// The run loop has one place that replays agent events into the ledger. The
-/// answered withdraws settle before it, or a read that follows a drop would
-/// settle the dropped input.
 #[test]
 fn the_run_loop_settles_answered_withdraws_before_it_observes_an_agent_event() {
     const RUN_SRC: &str = include_str!("run_session/run.rs");

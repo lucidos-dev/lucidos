@@ -1,24 +1,3 @@
-//! The **event subscription** primitive: one `{event_type, condition}` shape and
-//! one matcher, shared by every consumer that watches the EventBus.
-//!
-//! Two consumers today, and the point of this module is that they cannot drift:
-//!
-//! * a **trigger**'s `on:` list ([`crate::triggers::find_matching_event_triggers`]),
-//!   which spawns a new thread when an event matches;
-//! * a thread's **event wait**, which resumes an existing parked thread.
-//!
-//! Both call [`EventSubscription::matches`], so a `condition` that fires for one
-//! fires for the other. This lived in `triggers/config.rs` while a trigger was
-//! the only subscriber; it moved here when a thread became one too, because the
-//! name has to describe what the thing is now.
-//!
-//! The other half of the shared contract is the **subscribability gate**, one
-//! function per carrier: [`is_subscribable`] drops the per-token streaming
-//! firehose before either matcher sees a thread event, and
-//! [`is_subscribable_system_event`] decides which system frames reach them at
-//! all. The third is [`matchable_payload`], which decides what a `condition` is
-//! evaluated against.
-
 pub mod condition;
 pub mod frames;
 pub mod known_names;
@@ -33,12 +12,6 @@ use uuid::Uuid;
 
 use crate::engine::thread_events::ThreadEvent;
 
-/// One event a subscriber listens for, with an optional payload filter scoped
-/// to that event. A subscriber may carry several entries: it matches when an
-/// incoming event matches *any* entry's `event_type` AND that entry's
-/// condition (if set) evaluates true against the payload. Conditions are
-/// per-entry so a single subscriber can watch events with different payload
-/// shapes without one filter constraining the other.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventSubscription {
     pub event_type: String,
@@ -47,7 +20,6 @@ pub struct EventSubscription {
 }
 
 impl EventSubscription {
-    /// Include the other spelling of a renamed root-thread event on replay.
     pub fn event_type_candidates(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.event_type.as_str()).chain(root_thread_alias(&self.event_type))
     }
@@ -56,7 +28,7 @@ impl EventSubscription {
         self.event_type_candidates().any(|name| name == event_type)
     }
 
-    /// Whether this subscription matches an incoming event.
+    /// INVARIANT: Whether this subscription matches an incoming event.
     ///
     /// **The single predicate both dispatch paths run.** The trigger matcher and
     /// the event-wait dispatcher must agree on every (subscription, event) pair,
@@ -69,15 +41,10 @@ impl EventSubscription {
         self.matches_type(event_type) && condition::evaluate(self.condition.as_ref(), payload)
     }
 
-    /// Whether any subscription in `subs` matches. The per-entry OR semantics of
-    /// a subscriber's `on:` list, in one place.
     pub fn any_matches(subs: &[EventSubscription], event_type: &str, payload: &Value) -> bool {
         subs.iter().any(|sub| sub.matches(event_type, payload))
     }
 
-    /// Trim `event_type` on every entry and drop ones that become empty.
-    /// Used by both create and update endpoints (HTTP + LLM tool) so the
-    /// blank-event-type drop rule lives in one place.
     pub fn normalize_list(
         subs: impl IntoIterator<Item = EventSubscription>,
     ) -> Vec<EventSubscription> {
@@ -96,9 +63,6 @@ impl EventSubscription {
             .collect()
     }
 
-    /// Build a subscription from a JSON object entry (`{event_type, condition?}`).
-    /// Returns `None` when `event_type` is missing or blank. The caller decides
-    /// whether to treat that as silent-skip (stored events) or an error (LLM tool).
     pub fn from_object_entry(obj: &serde_json::Map<String, Value>) -> Option<Self> {
         let event_type = obj.get("event_type")?.as_str()?.trim();
         if event_type.is_empty() {
@@ -112,7 +76,6 @@ impl EventSubscription {
     }
 }
 
-/// Match the former role event names to their current names by suffix.
 pub static ROOT_THREAD_ROLE_ALIASES: LazyLock<Vec<(&str, &str)>> = LazyLock::new(|| {
     ThreadEvent::LEGACY_TYPE_NAME_ALIASES
         .iter()
@@ -137,40 +100,8 @@ fn root_thread_alias(event_type: &str) -> Option<&'static str> {
         })
 }
 
-// ── The matchable payload ───────────────────────────────────────────
-
-/// The key [`matchable_payload`] injects. The same spelling the `threads` list
-/// returns, so a subscriber scopes a wait with a value it already holds.
 pub const THREAD_ID_KEY: &str = "thread_id";
 
-/// The **matchable payload**: what a `condition` is evaluated against.
-///
-/// An event's own serialized fields, plus the id of the thread it belongs to.
-/// Every consumer that offers a payload to [`EventSubscription::matches`] builds
-/// its view here, so the live dispatcher, the catch-up scan, the arming lookback
-/// and trigger dispatch cannot disagree about what a condition can name.
-///
-/// **Why the thread id is not a field on the events themselves.** It already has
-/// two canonical homes and neither is the payload: the carrier
-/// (`BusEvent::Thread { thread_id, event }`, so every thread event has exactly
-/// one by construction) and the `events.thread_id` column, which
-/// `20260314120000_strip_thread_id_from_payloads.sql` deliberately made the
-/// source of truth by removing the key from stored payloads. Persisting it per
-/// event would duplicate that column into every row forever and would still
-/// leave the next event type unscopable. Injecting it here costs nothing on
-/// disk, and makes every thread event scopable at once.
-///
-/// `thread_id` is `None` for a row that belongs to no thread (a system frame, a
-/// workspace domain event), and such an event is deliberately NOT thread-
-/// scopable: the live bus could sometimes supply an originating thread where the
-/// stored row has a NULL column, and a condition that matched live but not on
-/// replay is the exact asymmetry this function exists to prevent.
-///
-/// Insert-if-absent, never overwrite: an event that declares its own
-/// `thread_id` keeps its value, and so does a user-authored domain payload.
-///
-/// `event_type` is taken so the adjacent-tag envelope a `SystemEvent` stores can
-/// be unwrapped here; see [`unwrap_adjacent_tag`].
 pub fn matchable_payload(event_type: &str, payload: Value, thread_id: Option<Uuid>) -> Value {
     let mut payload = unwrap_adjacent_tag(event_type, payload);
     let Some(thread_id) = thread_id else {
@@ -183,28 +114,6 @@ pub fn matchable_payload(event_type: &str, payload: Value, thread_id: Option<Uui
     payload
 }
 
-/// Flatten the `{"type": …, "data": {…}}` envelope a `SystemEvent` serializes
-/// into, so a `condition` names the event's own fields.
-///
-/// `SystemEvent` is `#[serde(tag = "type", content = "data")]`, so the row a
-/// backup completion writes is `{"type": "BackupCompleted", "data": {…}}`.
-/// Without this, `{"filename": …}` would name nothing. It is also what the agent
-/// reads back, since `delivery_reentry_text` prints this same value.
-///
-/// **A field path does not make this optional.** A condition could now reach the
-/// same value as `data.filename`. But every stored condition on a system event
-/// names the field directly, so dropping the flattening breaks all of them.
-///
-/// The gate is the name, then the shape. Only a persisted `SystemEvent` name
-/// writes this envelope, and a workspace cannot emit one: `is_reserved_type_name`
-/// refuses the whole reserved set at the emit endpoint. The shape alone is
-/// ambiguous. A domain event a workspace authored as
-/// `{"type": "ReleasePublished", "data": {…}}` would lose its own payload to
-/// `data`.
-///
-/// Live and replay pass the same stored name, so both flatten identically. A
-/// thread event and a workspace domain event pass through untouched: their
-/// payloads are already the fields themselves.
 fn unwrap_adjacent_tag(event_type: &str, payload: Value) -> Value {
     if !crate::engine::event_bus::SystemEvent::is_persisted_type_name(event_type) {
         return payload;
@@ -220,15 +129,12 @@ fn unwrap_adjacent_tag(event_type: &str, payload: Value) -> Value {
     }
     match obj.get("data") {
         Some(Value::Object(data)) => Value::Object(data.clone()),
-        // A unit-like variant serializes to `{"type": …}` with no content.
         None => Value::Object(serde_json::Map::new()),
-        // A non-object content cannot carry named fields, so flattening it
-        // would lose the value entirely. Leave the envelope for that case.
         Some(_) => payload,
     }
 }
 
-/// [`matchable_payload`] for a live `BusEvent::Thread`, which is the form both
+/// INVARIANT: [`matchable_payload`] for a live `BusEvent::Thread`, which is the form both
 /// live consumers need: the event-wait dispatcher and the trigger matcher.
 ///
 /// They call this rather than composing the two steps themselves, so the view
@@ -247,7 +153,7 @@ pub fn matchable_thread_payload(
     matchable_payload(event.event_type(), event.to_payload(meta), Some(thread_id))
 }
 
-/// [`matchable_payload`] for a live `BusEvent::System`, the other half of the
+/// INVARIANT: [`matchable_payload`] for a live `BusEvent::System`, the other half of the
 /// pair above.
 ///
 /// Built from `to_payload`, the same function the persisted row is written
@@ -262,14 +168,6 @@ pub fn matchable_system_payload(event: &crate::engine::event_bus::SystemEvent) -
     matchable_payload(event.stored_event_type(), event.to_payload(), None)
 }
 
-// ── The shared subscribability gate ─────────────────────────────────
-
-/// Names of the per-token streaming variants, mirroring
-/// [`ThreadEvent::is_per_token_streaming`] for the cases where only the *name*
-/// is in hand (validating an LLM tool argument, seeding the `on_event:`
-/// dropdown) rather than a constructed event.
-///
-/// `per_token_streaming_names_match_the_predicate` pins the two together.
 pub const PER_TOKEN_STREAMING_EVENT_TYPES: &[&str] = &[
     "TextStreamed",
     "ThoughtStreamed",
@@ -277,15 +175,6 @@ pub const PER_TOKEN_STREAMING_EVENT_TYPES: &[&str] = &[
     "CodingAgentThoughtStreamed",
 ];
 
-/// The `EventWait*` family. **Triggerable but never awaitable.**
-///
-/// A wait on `EventWaitStarted` self-satisfies on the next registration
-/// anywhere in the workspace; a wait on `EventWaitDelivered` self-satisfies the
-/// instant any wait delivers. They stay triggerable, because a trigger that
-/// notifies "a thread's wait timed out" is a reasonable thing to want.
-///
-/// This is the ONE name family the two subscription surfaces disagree about,
-/// which is why [`SubscriptionSurface`] exists at all.
 pub const EVENT_WAIT_EVENT_TYPES: &[&str] = &[
     "EventWaitStarted",
     "EventWaitTimingUpdated",
@@ -294,54 +183,18 @@ pub const EVENT_WAIT_EVENT_TYPES: &[&str] = &[
     "EventWaitCanceled",
 ];
 
-/// Which of the two subscription surfaces a name is being validated for.
-///
-/// The accepted sets are nested rather than merely similar: `Trigger` accepts
-/// everything `Wait` does, plus [`EVENT_WAIT_EVENT_TYPES`]. So a suggestion
-/// drawn from the wait corpus is always usable at either surface, which is what
-/// lets the near-match heuristic stay surface-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionSurface {
-    /// A thread's `await_event`, which parks the calling thread.
     Wait,
-    /// A trigger's `on:` list, which spawns a new thread.
     Trigger,
 }
 
-/// **The shared subscribability gate.** An event reaches the trigger matcher and
-/// the event-wait dispatcher iff this returns true.
-///
-/// Blocklist semantics on purpose: any persisted `ThreadEvent` is subscribable
-/// by default, so a new lifecycle or per-action variant becomes watchable
-/// without touching this function. Subscribers scope high-cardinality
-/// per-action variants (`ToolCalled`, and friends) with a `condition:` instead.
-///
-/// Three kinds are dropped. The per-token firehose, because running the
-/// matcher per token would be pure waste. The side-question events, because no
-/// agent may ever see one (ADR 0320). An engine turn's idle, a *cache
-/// keep-alive* or a *ceiling re-entry*, because the agent finished nothing the
-/// user asked for.
 pub fn is_subscribable(event: &ThreadEvent) -> bool {
     !event.is_per_token_streaming()
         && !event.is_side_question_event()
         && !event.is_engine_turn_idle()
 }
 
-/// **The system-side gate.** A live `SystemEvent` reaches the trigger matcher
-/// and the event-wait dispatcher iff this returns true.
-///
-/// An allowlist, where [`is_subscribable`] is a blocklist. Two kinds qualify:
-///
-/// * a workspace's own domain event, transient or not, because `emit_event`
-///   chose the name and the caller is the subscriber;
-/// * any persisted frame, because persisted means subscribable (ADR 0113). A
-///   `BackupCompleted` has no thread event and no domain event beside it, so
-///   this is the only path to it.
-///
-/// Everything else is transient engine chatter, refused at registration by
-/// [`validate_subscribable_event_type`] too. Both fan-outs call this one
-/// function rather than each testing the pair, which is what makes I8
-/// structural.
 pub fn is_subscribable_system_event(event: &crate::engine::event_bus::SystemEvent) -> bool {
     matches!(
         event,
@@ -349,45 +202,15 @@ pub fn is_subscribable_system_event(event: &crate::engine::event_bus::SystemEven
     ) || event.is_persisted()
 }
 
-/// The two reserved names that are wire wrappers, not events. A row is always
-/// filed under the inner name, so neither is ever an `event_type` a
-/// subscription can match. They need their own refusal, because calling either
-/// one transient would be a lie.
 const TRANSPORT_TYPE_NAMES: &[&str] = &["DomainEvent", "ThreadEvent"];
 
-/// What [`validate_subscribable_event_type`] concluded about a name it accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionVerdict {
-    /// A known `ThreadEvent` name that survives the gate. The dispatcher will
-    /// see it if it is ever emitted.
     KnownThreadEvent,
-    /// A `SystemEvent` name the engine writes an `events` row for. Persisted
-    /// means subscribable (ADR 0113): the row is a durable fact, so both the
-    /// wait matcher and the trigger matcher are offered the frame.
     KnownSystemEvent,
-    /// Not a `ThreadEvent` name. Accepted, because it may be a *domain* event
-    /// (`emit_event`) that nobody has emitted yet, and refusing those would
-    /// make the tool useless for exactly the workspace-defined events it is
-    /// most useful for.
-    ///
-    /// The caller is expected to layer one corroborating check on top: a name
-    /// the workspace has never emitted gets a *note* in the tool result. That
-    /// one is not decidable here, because it is a question about this
-    /// workspace's event store rather than about the name.
     UnknownName,
 }
 
-/// Validate a name supplied to a subscription, structurally.
-///
-/// **A refused subscription is an error at the tool boundary, not a silent
-/// no-op.** A trigger that subscribes to `TextStreamed` validates, persists and
-/// then never fires: a documented footgun the user discovers days later. Both
-/// write surfaces are synchronous. Each hands the caller an error naming the
-/// blocked variant, so it can pick another event in the same turn.
-///
-/// The messages are surface-neutral, because every case but one is shared.
-/// Writing "a wait would never resolve" into a trigger's refusal would describe
-/// machinery the caller is not using.
 pub fn validate_subscribable_event_type(
     event_type: &str,
     surface: SubscriptionSurface,
@@ -412,7 +235,7 @@ pub fn validate_subscribable_event_type(
              subscription on it can never match."
         ));
     }
-    // The one case the two surfaces disagree about. A trigger falls through to
+    // INVARIANT: The one case the two surfaces disagree about. A trigger falls through to
     // `classify_event` below and resolves as an ordinary thread event.
     if surface == SubscriptionSurface::Wait && EVENT_WAIT_EVENT_TYPES.contains(&name) {
         return Err(format!(
@@ -422,7 +245,7 @@ pub fn validate_subscribable_event_type(
              about instead. A trigger may watch it."
         ));
     }
-    // A ThreadEvent wins over the two system checks below, because several
+    // INVARIANT: A ThreadEvent wins over the two system checks below, because several
     // names are BOTH (`ChangeDiscarded` is a `SystemEvent` variant and a
     // `ThreadEvent` variant). The thread-scoped one is the one a subscription
     // sees. It is also the only one of the pair a `condition` can scope to a
@@ -462,7 +285,7 @@ pub fn validate_subscribable_event_type(
     Ok(SubscriptionVerdict::UnknownName)
 }
 
-/// Refuse a name that is a misspelling of an engine event.
+/// INVARIANT: Refuse a name that is a misspelling of an engine event.
 ///
 /// **Split from [`validate_subscribable_event_type`] because it is not decidable
 /// from the name alone.** A workspace that has emitted `CredentialStored` as
@@ -481,10 +304,6 @@ pub fn refuse_near_miss(event_type: &str) -> Result<(), String> {
     ))
 }
 
-/// The note on a name that validates but which nobody here has ever emitted.
-///
-/// Not an error. A domain event is legitimate before its first emit. That is
-/// the ordinary order of work: make X emit an event, then subscribe to it.
 pub fn never_emitted_warning(event_type: &str) -> String {
     format!(
         "'{event_type}' has never been emitted in this workspace. That is fine \
@@ -494,17 +313,11 @@ pub fn never_emitted_warning(event_type: &str) -> String {
     )
 }
 
-/// How many recent rows [`uncorroborated_path_warnings`] reads per event type.
-///
-/// Enough that an optional field present most of the time still shows up. Small
-/// enough that the probe is one indexed page inside a synchronous tool call.
 const FIELD_PATH_SAMPLE_ROWS: i64 = 20;
 
-/// How many unresolved paths get a warning of their own. Any beyond this are
-/// counted in one more line, never dropped in silence.
 const MAX_PATH_WARNINGS: usize = 3;
 
-/// The most recent stored payloads for `event_type`, **as the matcher will see
+/// INVARIANT: The most recent stored payloads for `event_type`, **as the matcher will see
 /// them**.
 ///
 /// Built through [`matchable_payload`], so the envelope is unwrapped and
@@ -541,21 +354,6 @@ async fn recent_matchable_payloads(pool: &sqlx::PgPool, event_type: &str) -> Vec
         .collect()
 }
 
-/// **Does the payload actually carry what this condition names?**
-///
-/// The second half of the silent-failure class [`check_subscriptions`] exists
-/// to end. A misspelled event type is refused by name. A field path naming
-/// something no payload of that type carries arms just as clean and matches
-/// just as little, and nothing said so. `{"id": …}` on `PluginInstalled` is the
-/// case that cost a day: the plugin id sits at `manifest.manifest.id`.
-///
-/// **A warning, never a refusal.** The sample is evidence, not a schema. An
-/// optional field is legitimately missing from twenty rows, and
-/// `{"conclusion": {"$ne": "success"}}` deliberately matches an event carrying
-/// no `conclusion` at all. Refusing either would block correct work.
-///
-/// The suggestion is what makes it actionable: the sample is in hand, so the
-/// same leaf found deeper down is named outright.
 pub async fn uncorroborated_path_warnings(
     pool: &sqlx::PgPool,
     event_type: &str,
@@ -577,16 +375,11 @@ pub async fn uncorroborated_path_warnings(
         .filter(|path| !samples.iter().any(|s| condition::resolves(s, path)))
         .collect();
 
-    // The rows actually read, never the cap: a type with two rows would
-    // otherwise claim twenty, overstating the evidence tenfold on exactly the
-    // young event type whose sample is weakest.
     let inspected = samples.len();
     let mut warnings: Vec<String> = unresolved
         .iter()
         .take(MAX_PATH_WARNINGS)
         .map(|path| {
-            // Every sample, not just the newest: one row of a shape that
-            // happens to lack the leaf would otherwise cost the suggestion.
             let elsewhere = samples
                 .iter()
                 .map(|s| condition::same_leaf_paths(s, path))
@@ -617,7 +410,7 @@ pub async fn uncorroborated_path_warnings(
     warnings
 }
 
-/// Has this workspace ever emitted an event by this name?
+/// INVARIANT: Has this workspace ever emitted an event by this name?
 ///
 /// **An unreadable store answers "seen".** Every caller uses the answer to
 /// decide whether to warn or to refuse, and both are worse when wrong. A false
@@ -631,27 +424,6 @@ pub async fn event_type_ever_emitted(pool: &sqlx::PgPool, event_type: &str) -> b
         .unwrap_or(true)
 }
 
-/// **The one check every subscription site runs**, over every entry in the list.
-///
-/// `await_event`, the trigger HTTP API and the trigger LLM tool all call this,
-/// so a subscription refused by one is refused by all three. Returns the
-/// warnings to show beside the success, or the first hard error.
-///
-/// Both halves of an entry are checked, the `event_type` and the `condition`,
-/// because both fail the same silent way. A misspelled name arms clean and
-/// never matches, and so does an unsupported operator. Only a synchronous
-/// refusal turns that into something the caller can fix in the same turn.
-/// [`condition::validate`] owns the second half's rules.
-///
-/// The condition gets a third check, and it is the only one that cannot be
-/// decided from the subscription alone. A syntactically perfect field path may
-/// still name something no payload of that type carries, so
-/// [`uncorroborated_path_warnings`] asks the event store. That one warns rather
-/// than refuses, for the reason stated there.
-///
-/// The first failure refuses the whole call. A partly armed subscription reads
-/// as a success while watching for less than the caller asked. That is the
-/// failure this module exists to end.
 pub async fn check_subscriptions(
     pool: &sqlx::PgPool,
     subs: &[EventSubscription],
@@ -664,15 +436,13 @@ pub async fn check_subscriptions(
         if let Some(cond) = &sub.condition {
             condition::validate(cond).map_err(|e| format!("condition for '{name}': {e}"))?;
         }
-        // The store is the escape hatch, so it is consulted BEFORE the
+        // INVARIANT: The store is the escape hatch, so it is consulted BEFORE the
         // heuristic. A name this workspace has emitted is real by proof, and no
         // edit-distance rule may take it away.
         if verdict == SubscriptionVerdict::UnknownName && !event_type_ever_emitted(pool, name).await
         {
             refuse_near_miss(name)?;
             warnings.push(never_emitted_warning(name));
-            // Nothing stored to corroborate a path against, and the warning
-            // above already says the harder thing.
             continue;
         }
         warnings.extend(uncorroborated_path_warnings(pool, name, sub.condition.as_ref()).await);
@@ -680,28 +450,11 @@ pub async fn check_subscriptions(
     Ok(warnings)
 }
 
-/// The two halves of "what can I subscribe to here?", kept apart because they
-/// carry different guarantees.
 pub struct EventTypeCatalog {
-    /// What the engine emits, derived from its own enumerations. A closed set:
-    /// a name that merely looks like one of these is refused.
     pub engine: Vec<&'static str>,
-    /// The workspace's own domain events: what this store has seen and the
-    /// engine does not emit. An open set, so a name outside it is only warned
-    /// about.
     pub workspace: Vec<String>,
 }
 
-/// **The answer to "which event types exist here?"**, for the tool action the
-/// error messages point callers at.
-///
-/// The engine half is the same list [`check_subscriptions`]
-/// validates against, so a name read off this catalog always validates. That is
-/// the whole point of the action: an agent that guessed wrong needs somewhere
-/// to look the real name up.
-///
-/// The store half lists validated names unique to the workspace. The catalog
-/// hides legacy aliases even when existing subscriptions still accept them.
 pub async fn event_type_catalog(
     store: &crate::core::store::EventStore,
     surface: SubscriptionSurface,
@@ -719,11 +472,6 @@ pub async fn event_type_catalog(
     Ok(EventTypeCatalog { engine, workspace })
 }
 
-/// The persisted event that ends the run a transient progress frame reports on.
-///
-/// Advice only, so a frame with no terminal twin simply gets a shorter message.
-/// `MemoryRebuildProgress` and `RecoveryProgress` are the current such cases:
-/// neither run writes a terminal row today.
 fn transient_terminal_hint(name: &str) -> Option<&'static str> {
     match name {
         "SnapshotProgress" => Some("SnapshotCreated, SnapshotCaptureFailed or SnapshotChecked"),
@@ -736,7 +484,7 @@ fn transient_terminal_hint(name: &str) -> Option<&'static str> {
     }
 }
 
-/// **The gate on every domain-event emit**, wherever it comes from.
+/// INVARIANT: **The gate on every domain-event emit**, wherever it comes from.
 ///
 /// Called from inside `LucidosEngine::emit_domain_event_inner`, so no caller
 /// can skip it. The HTTP handlers call it too, so an app gets a 400 rather
@@ -785,11 +533,10 @@ pub fn validate_emittable_event_type(event_type: &str) -> Result<(), String> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-/// I8: the trigger matcher and event-wait dispatcher must agree.
+/// INVARIANT: I8: the trigger matcher and event-wait dispatcher must agree.
 /// Both use `EventSubscription::matches`. The trigger tests run this table
 /// through `find_matching_event_triggers` to verify that it shares the predicate.
 pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
-    // (sub event_type, sub condition JSON, event type, event payload JSON, expected)
     ("ChangeProposed", None, "ChangeProposed", r#"{}"#, true),
     ("ChangeProposed", None, "ChangeApplied", r#"{}"#, false),
     (
@@ -820,7 +567,6 @@ pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
         r#"{"model": "c"}"#,
         false,
     ),
-    // A missing field never matches, rather than matching vacuously.
     (
         "ToolCalled",
         Some(r#"{"name": "run_bash"}"#),
@@ -835,8 +581,6 @@ pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
         r#"{"name": "run_bash"}"#,
         true,
     ),
-    // A persisted system event (ADR 0113). Both matchers see it, and both see
-    // the flattened view, so `error` is a field a condition can name.
     (
         "BackupFailed",
         None,
@@ -858,8 +602,6 @@ pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
         r#"{"error": "disk full"}"#,
         true,
     ),
-    // The same event, un-flattened. Both matchers must be equally blind to a
-    // field buried under `data`, which is why the view flattens upstream.
     (
         "BackupFailed",
         Some(r#"{"error": "disk full"}"#),
@@ -867,7 +609,6 @@ pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
         r#"{"type": "BackupFailed", "data": {"error": "disk full"}}"#,
         false,
     ),
-    // A field path. The live case: `action` is top level, the rest is nested.
     (
         "GithubWorkflowRunStateChanged",
         Some(r#"{"action": "completed", "workflow_run.event": "schedule"}"#),
@@ -882,7 +623,6 @@ pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
         r#"{"action": "completed", "workflow_run": {"event": "workflow_dispatch"}}"#,
         false,
     ),
-    // A path that resolves to nothing is null, at any depth.
     (
         "GithubWorkflowRunStateChanged",
         Some(r#"{"workflow_run.event": "schedule"}"#),
@@ -890,8 +630,6 @@ pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
         r#"{"action": "completed"}"#,
         false,
     ),
-    // A literal dotted key beats the path, which is what keeps every stored
-    // condition's verdict intact.
     (
         "ToolCalled",
         Some(r#"{"a.b": "literal"}"#),
@@ -927,7 +665,6 @@ pub const PARITY_CASES: &[(&str, Option<&str>, &str, &str, bool)] = &[
         r#"{"name": "run_bash", "args": {"command": "cd r && cargo test --lib"}}"#,
         false,
     ),
-    // `$or` ORs whole conditions and ANDs with its siblings.
     (
         "ChangeProposed",
         Some(r#"{"repo": "r", "$or": [{"file_count": {"$gt": 9}}, {"risk": "high"}]}"#),

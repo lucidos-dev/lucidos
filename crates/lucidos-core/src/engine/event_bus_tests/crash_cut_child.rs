@@ -1,11 +1,7 @@
-//! A child a restart cut, and the parent that must hear about it truthfully.
-//! Plan: `docs/plans/2026-10-03-crash-cut-child-reports-truthfully.md`.
-
 use super::super::*;
 use super::*;
 use crate::engine::thread_events::AbortCause;
 
-/// Give `child_id` a finished turn whose text a later card must NOT reuse.
 async fn emit_prior_response(bus: &EventBus, child_id: Uuid, text: &str) {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
@@ -40,9 +36,6 @@ async fn emit_abort(bus: &EventBus, thread_id: Uuid, cause: AbortCause, actor: M
     .unwrap();
 }
 
-/// The boot race: recovery's crash idle on a child must not wake the parent
-/// while the recovery sweeps still run. The boot refire then re-reads the
-/// same card, and the two still come to one wake.
 #[tokio::test]
 async fn a_wake_recovery_causes_waits_for_the_release_and_runs_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -78,8 +71,6 @@ async fn a_wake_recovery_causes_waits_for_the_release_and_runs_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// A coding-agent child a crash cut has not finished. The card says
-/// `interrupted`, and never passes the previous turn's text off as a result.
 #[tokio::test]
 async fn a_crash_cut_coding_agent_child_reports_interrupted() {
     let (pool, db_name) = setup_test_db().await;
@@ -112,8 +103,6 @@ async fn a_crash_cut_coding_agent_child_reports_interrupted() {
     teardown_test_db(&db_name).await;
 }
 
-/// A chat child a crash cut used to send nothing at all, and its parent
-/// waited forever: nothing auto-resumes after a crash.
 #[tokio::test]
 async fn a_crash_cut_chat_child_reports_interrupted() {
     let (pool, db_name) = setup_test_db().await;
@@ -138,7 +127,6 @@ async fn a_crash_cut_chat_child_reports_interrupted() {
     teardown_test_db(&db_name).await;
 }
 
-/// A teardown nobody asked for (`stop.sh`, ctrl-c) resumes nothing either.
 #[tokio::test]
 async fn a_chat_child_cut_by_an_unrequested_shutdown_reports_interrupted() {
     let (pool, db_name) = setup_test_db().await;
@@ -160,8 +148,6 @@ async fn a_chat_child_cut_by_an_unrequested_shutdown_reports_interrupted() {
     teardown_test_db(&db_name).await;
 }
 
-/// The user's own switch promises a resume, so the child is still working
-/// and the parent hears nothing until the resumed turn ends.
 #[tokio::test]
 async fn a_chat_child_paused_by_a_user_switch_sends_no_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -186,7 +172,6 @@ async fn a_chat_child_paused_by_a_user_switch_sends_no_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// After an interrupted card, a continued turn reports again on its own.
 #[tokio::test]
 async fn a_chat_child_continued_after_a_crash_reports_its_new_turn() {
     let (pool, db_name) = setup_test_db().await;
@@ -211,8 +196,6 @@ async fn a_chat_child_continued_after_a_crash_reports_its_new_turn() {
     teardown_test_db(&db_name).await;
 }
 
-/// The running settle aborts a coding-agent child whose worktree recovery
-/// never picked up, and no recovery idle follows. The abort alone reports.
 #[tokio::test]
 async fn a_coding_agent_child_cut_with_no_recovery_idle_still_reports() {
     let (pool, db_name) = setup_test_db().await;

@@ -36,7 +36,11 @@ function tsFiles(dir: string): string[] {
 const STORAGE_API = /\b(localStorage|sessionStorage)\.(getItem|setItem|removeItem|clear|key|length)\b/;
 const STORAGE_API_G = new RegExp(STORAGE_API, 'g');
 
-const BOOT_TAB_KEYS: ReadonlySet<string> = new Set(['lucidos-splash-mark-formed']);
+const BOOT_TAB_KEYS: ReadonlySet<string> = new Set([
+  'lucidos-splash-mark-formed',
+  'lucidos-pwa-workspace-session',
+]);
+const PWA_RESUME_KEY = 'lucidos-pwa-workspace';
 
 describe('no raw browser storage outside the sanctioned wrappers', () => {
   it('SDK source touches storage ONLY through _storage.ts (separate realm)', () => {
@@ -74,9 +78,12 @@ describe('no raw browser storage outside the sanctioned wrappers', () => {
       const after = html.slice(m.index! + m[0].length);
       const arg = after.replace(/^\s*\(\s*/, '');
       if (arg.startsWith('wsKey(')) continue;
+      if (m[0] === 'localStorage.setItem' &&
+          arg.startsWith(`.bind(localStorage, '${PWA_RESUME_KEY}')`)) continue;
       const lit = arg.replace(/^peerKey\(\s*/, '').match(/^['"]([^'"]+)['"]/);
       if (lit && GLOBAL_KEYS.has(lit[1])) continue;
-      if (lit && BOOT_TAB_KEYS.has(lit[1])) continue;
+      if (lit && m[1] === 'sessionStorage' && BOOT_TAB_KEYS.has(lit[1])) continue;
+      if (lit?.[1] === PWA_RESUME_KEY && m[0] === 'localStorage.getItem') continue;
       bad.push(lit ? lit[1] : m[0]);
     }
     expect(

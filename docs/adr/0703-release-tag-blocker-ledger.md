@@ -1,6 +1,6 @@
 # 0703: A release tag needs a clean blocker ledger, read from the repo
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0809](0809-release-blockers-live-in-the-software-factory-app.md)
 - **Date**: 2026-11-15
 
 ## Context

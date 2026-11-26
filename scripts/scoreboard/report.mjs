@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { APP_RESULT, BUILD_RESULT, SAMPLE_COUNT } from './lab.mjs';
 import { perfSamplesSection } from './perf-samples.mjs';
 import { buildScoreboard, crateGraph, SCOREBOARD_EVIDENCE, suiteTimings, summarize } from './unit-costs.mjs';
 
@@ -85,6 +86,18 @@ function psqlJson(sql, env) {
 
 function windowSql(observedMs, days) {
   return `to_timestamp(${observedMs / 1000}) - make_interval(days => ${days})`;
+}
+
+function labRunsSql(since) {
+  return `select coalesce(json_agg(r order by r.at desc), '[]') from (
+    select created at,
+           case event_type when '${BUILD_RESULT}' then 'build' else 'app' end kind,
+           payload->'run' run, payload->'status' status, payload->'host' host,
+           payload->'measurements' measurements, payload->'next_step' next_step,
+           payload->'packages' packages, payload->'browser' browser,
+           payload->'browser_version' browser_version, payload->'seed_events' seed_events
+    from events where event_type in ('${BUILD_RESULT}', '${APP_RESULT}') and created > ${since}
+  ) r`;
 }
 
 function mainCheckSql(since) {
@@ -182,6 +195,7 @@ function main() {
     lane_batches: laneBatches(psqlJson(laneBatchSql(since), env)),
     github_build_seconds: githubSection(args.timingsLog, { observedMs, days: args.days }),
     perf_samples: perfSamplesSection({ days: args.days, observedMs }),
+    lab_runs: psqlJson(labRunsSql(since), env),
   };
   console.log(args.json ? JSON.stringify(report, null, 2) : formatText(report));
 }
@@ -304,6 +318,23 @@ export function formatText(r) {
   if (p.unavailable) out.push(`unavailable: ${p.unavailable}`);
   else if (p.rollup.length) out.push(table(['kind', 'device', 'samples'], p.rollup.map((s) => [s.kind, s.device, cell(s, whole)])));
   for (const note of p.notes) out.push(`note: ${note}`);
+  section('Lab runs on each host');
+  const labRows = (r.lab_runs ?? []).flatMap(run => {
+    const h = run.host;
+    if (!h || typeof h.fingerprint !== 'string') return [];
+    const host = `${h.fingerprint.slice(0, 12)} ${h.os} ${h.architecture}, ${h.cores} cores, ${(h.memory_bytes / 1024 ** 3).toFixed(0)} GiB, ${h.toolchain}`;
+    const scenario = run.browser ? `${run.browser} ${run.browser_version}, ${run.seed_events} events` : run.packages ?? run.kind;
+    const prefix = [run.at.slice(0, 10), host, scenario];
+    if (run.status === 'deferred') return [[...prefix, run.next_step, 'deferred', '-']];
+    return Object.entries(run.measurements ?? {}).flatMap(([name, measurement]) => (
+      Array.isArray(measurement?.samples) && measurement.samples.length >= SAMPLE_COUNT && Number.isFinite(measurement.median)
+        ? [[...prefix, name, `${measurement.median} ${measurement.unit}`, measurement.samples.length]]
+        : []
+    ));
+  });
+  if (labRows.length) out.push(table(['date', 'host', 'scenario', 'step', 'median', 'samples'], labRows));
+  else out.push('no lab runs in the window');
+
   return out.join('\n').trimStart();
 }
 

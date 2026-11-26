@@ -81,7 +81,6 @@ async fn saved_draft_feeding_an_owner_thread_keeps_the_submitting_trigger_grant_
     teardown_test_db(&db).await;
 }
 
-/// A thread started by `first`, then fed a saved draft its submitter wrote.
 async fn fed_by_submitter(
     pool: &sqlx::PgPool,
     first: &MessageOrigin,
@@ -138,8 +137,6 @@ async fn saved_draft_from_a_refused_workspace_call_stays_refused() {
     teardown_test_db(&db).await;
 }
 
-/// The root holds one cause, so the trigger's grant check moves to the fired
-/// list rather than being lost.
 #[tokio::test]
 async fn saved_draft_from_an_unattested_submitter_keeps_the_trigger_root_gated() {
     let (pool, db) = setup_test_db().await;
@@ -229,7 +226,6 @@ async fn spawn_root(pool: &sqlx::PgPool, thread_id: Uuid) -> SpawnRoot {
     spawn_provenance(pool, thread_id).await.root
 }
 
-/// A raw event row carrying `origin`, and `parent_thread_id` when given.
 async fn insert_origin(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -278,7 +274,6 @@ fn device() -> MessageOrigin {
     }
 }
 
-/// A `Workspace` row from before gateway stamps, which keeps its old reading.
 fn cli_caller(thread_id: Option<Uuid>) -> MessageOrigin {
     MessageOrigin::Workspace {
         workspace: "myws".into(),
@@ -293,7 +288,6 @@ fn cli_caller(thread_id: Option<Uuid>) -> MessageOrigin {
     }
 }
 
-/// A stamped call from another workspace's thread, carrying `verdict`.
 fn stamped_caller(verdict: SpawnVerdict) -> MessageOrigin {
     MessageOrigin::Workspace {
         workspace: "myws".into(),
@@ -315,7 +309,6 @@ fn trigger_root() -> SpawnRoot {
     }
 }
 
-/// A trigger thread fired by the scheduler.
 async fn seed_trigger_run(pool: &sqlx::PgPool) -> Uuid {
     let root = Uuid::new_v4();
     insert_origin(pool, root, "TriggerStarted", &scheduler(TRIGGER), None).await;
@@ -345,7 +338,6 @@ async fn the_root_is_the_cause_of_the_work() {
         Some(child),
     )
     .await;
-    // A top spawn names its cause without the callback linkage.
     let top_spawn = Uuid::new_v4();
     insert_origin(
         &pool,
@@ -355,7 +347,6 @@ async fn the_root_is_the_cause_of_the_work() {
         None,
     )
     .await;
-    // `lucidos spawn-thread --relation top` from the trigger's own thread.
     let cli_spawn = Uuid::new_v4();
     insert_origin(
         &pool,
@@ -365,7 +356,6 @@ async fn the_root_is_the_cause_of_the_work() {
         None,
     )
     .await;
-    // A subprocess of the trigger's run, calling the API with its token.
     let api_spawn = Uuid::new_v4();
     let api_agent = MessageOrigin::Api {
         user_agent: None,
@@ -384,7 +374,6 @@ async fn the_root_is_the_cause_of_the_work() {
     ] {
         assert_eq!(spawn_root(&pool, thread).await, trigger_root(), "{thread}");
     }
-    // A scheduled script has no thread. Its verified token names the trigger.
     let script_spawn = Uuid::new_v4();
     let script = MessageOrigin::Api {
         user_agent: None,
@@ -415,7 +404,6 @@ async fn the_root_is_the_cause_of_the_work() {
     let main_check = Uuid::new_v4();
     let main_check_red = MessageOrigin::engine(EngineReason::MainCheckRed);
     insert_origin(&pool, main_check, "MessageReceived", &main_check_red, None).await;
-    // Another workspace's thread has no origin here.
     let from_elsewhere = Uuid::new_v4();
     let elsewhere = cli_caller(Some(Uuid::new_v4()));
     insert_origin(&pool, from_elsewhere, "MessageReceived", &elsewhere, None).await;
@@ -486,8 +474,6 @@ async fn webhook_system_and_untraced_agent_roots_are_refused() {
     teardown_test_db(&db_name).await;
 }
 
-/// A resume, a person's follow-up and an answered card all add events after
-/// the spawn. Only the earliest origin counts, so none of them moves the root.
 #[tokio::test]
 async fn later_human_acts_never_change_the_root() {
     let (pool, db_name) = setup_test_db().await;
@@ -512,8 +498,6 @@ async fn later_human_acts_never_change_the_root() {
     teardown_test_db(&db_name).await;
 }
 
-/// A read that fails, or an origin that does not parse, proves nothing
-/// about the cause, so it never reads as the owner's.
 #[tokio::test]
 async fn an_unreadable_provenance_is_refused() {
     let (pool, db_name) = setup_test_db().await;
@@ -558,8 +542,6 @@ fn registry(grant: Option<bool>) -> RwLock<HashMap<String, TriggerConfig>> {
     RwLock::new(HashMap::from([(TRIGGER.to_string(), config)]))
 }
 
-/// A coding-agent thread opened by `origin`, through the bus, so its turn is
-/// open for a terminal. Returns the thread and its origin event.
 async fn seed_coding_turn(bus: &EventBus, origin: MessageOrigin) -> (Uuid, Uuid) {
     let thread_id = Uuid::new_v4();
     let mut event = message_received("work");
@@ -607,8 +589,6 @@ async fn notifications(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<serde_json::
     .unwrap()
 }
 
-/// Invariants 1 and 7: an ungranted trigger's run is refused, and the refusal
-/// ends the turn and notifies, naming the trigger and the missing grant.
 #[tokio::test]
 async fn an_ungranted_trigger_run_fails_loudly() {
     let (pool, db_name) = setup_test_db().await;
@@ -676,8 +656,6 @@ async fn a_granted_trigger_and_an_owner_run_start() {
     teardown_test_db(&db_name).await;
 }
 
-/// A continue key can let another trigger's fire into a granted trigger's
-/// thread. That input steers the thread's agents, so it needs its own grant.
 #[tokio::test]
 async fn a_trigger_that_fed_the_thread_needs_its_grant_too() {
     let (pool, db_name) = setup_test_db().await;
@@ -745,7 +723,6 @@ fn typed_device_caller() -> MessageOrigin {
     }
 }
 
-/// An unattested caller's provenance survives a child hop.
 #[tokio::test]
 async fn unattested_roots_stay_unattested() {
     let (pool, db_name) = setup_test_db().await;
@@ -780,7 +757,6 @@ async fn start_cards(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
     .unwrap()
 }
 
-/// Every terminator on the thread, as (type, cause, request_event_id).
 async fn terminators(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -821,7 +797,6 @@ async fn an_unattested_run_fails_without_a_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// A run from a verified caller passes the gate with no card and no failure.
 #[tokio::test]
 async fn a_verified_start_passes_with_no_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -841,8 +816,6 @@ async fn a_verified_start_passes_with_no_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// A trigger that fed an unattested thread still needs its own grant, and its
-/// refusal takes precedence.
 #[tokio::test]
 async fn an_ungranted_trigger_refusal_takes_precedence() {
     let (pool, db_name) = setup_test_db().await;
@@ -870,8 +843,6 @@ async fn an_ungranted_trigger_refusal_takes_precedence() {
     teardown_test_db(&db_name).await;
 }
 
-/// Every run, a resume included, passes `run_agent_session`. The gate is its
-/// first await, so nothing starts for a refused run.
 #[test]
 fn every_run_passes_the_gate_before_it_starts() {
     let source = include_str!("run_session/run.rs");
@@ -896,8 +867,6 @@ fn every_run_passes_the_gate_before_it_starts() {
     );
 }
 
-/// Invariant 6: the receiving workspace honors the caller's verdict and never
-/// upgrades it. Only `allowed` roots at the owner.
 #[tokio::test]
 async fn a_stamped_call_roots_at_the_callers_verdict() {
     let (pool, db_name) = setup_test_db().await;
@@ -925,8 +894,6 @@ async fn a_stamped_call_roots_at_the_callers_verdict() {
     teardown_test_db(&db_name).await;
 }
 
-/// A refused call ends the turn naming the calling workspace and its reason,
-/// and raises no owner card: no Allow here can override the caller's gate.
 #[tokio::test]
 async fn a_refused_call_fails_naming_the_caller_and_its_reason() {
     let (pool, db_name) = setup_test_db().await;
@@ -962,8 +929,6 @@ async fn a_refused_call_fails_naming_the_caller_and_its_reason() {
     teardown_test_db(&db_name).await;
 }
 
-/// The calling side: the verdict a thread's call carries is exactly what its
-/// own gate would say about a local run.
 #[tokio::test]
 async fn a_threads_verdict_is_what_its_own_gate_says() {
     let (pool, db_name) = setup_test_db().await;
@@ -1006,7 +971,6 @@ async fn a_threads_verdict_is_what_its_own_gate_says() {
         spawn_verdict(&pool, &granted, subprocess_of(unattested)).await,
         SpawnVerdict::Unattested
     );
-    // A scheduled script names its trigger and no thread.
     let script = MessageOrigin::Api {
         user_agent: None,
         mode: ActorMode::Agent,

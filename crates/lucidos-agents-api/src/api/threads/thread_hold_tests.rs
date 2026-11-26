@@ -11,17 +11,12 @@ use axum::{body::Body, http::Request};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Who calls: an agent on a thread, or the owner at a device.
 #[derive(Clone, Copy, Debug)]
 enum Caller {
     Agent(Option<Uuid>),
     Owner,
 }
 
-/// Hold reach, and who may resume: the owner, and the held thread's own
-/// agent only inside a turn the owner's device message started. Home, a
-/// parent and an unrelated agent may not. A reached sub-thread resumes from
-/// its root.
 #[tokio::test]
 async fn hold_reach_and_resume_authority_through_the_router() {
     if !in_engine_child(

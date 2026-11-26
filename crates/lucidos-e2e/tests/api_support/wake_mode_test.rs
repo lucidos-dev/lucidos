@@ -1,24 +1,9 @@
-//! E2E for the *wake mode* a spawn declares (ADR 0451), against a real engine:
-//!
-//! * a `run_thread` child stores the mode it declared, and a plain chat
-//!   parent's default, `wake`, when it declares none
-//! * `POST /api/v1/chat/stream` refuses a wake mode with no parent, and a name
-//!   that is not a mode
-//!
-//! The spawn runs through the mock provider's `MOCK_TOOL_CALL:` sentinel, so no
-//! LLM round-trip is needed.
-
 use crate::support::{
     base_url, capacity_policy, capacity_policy_lock, db_url, poll_thread_summary_by_marker,
     unique_marker, user_client, with_pool_room, with_pool_room_held,
 };
 use serde_json::json;
 
-/// Have a fresh human thread call `run_thread` with `args`, and return the
-/// stored wake mode of the child it spawned.
-///
-/// Both threads need a free slot in the shared capacity pool. The rest of the
-/// suite pins it at its ceiling, so the whole spawn runs under `with_pool_room`.
 async fn spawned_wake_mode(pool: &sqlx::PgPool, args: serde_json::Value) -> Option<String> {
     let client = user_client().await;
     let pool = pool.clone();
@@ -121,7 +106,6 @@ async fn chat_stream_refuses_a_wake_mode_it_cannot_honour() {
     assert_eq!(unknown, 400, "`file` is not a wake mode");
 }
 
-/// The queue endpoint's `max_concurrent_total`, as the engine reports it now.
 async fn pool_ceiling(client: &reqwest::Client) -> u64 {
     capacity_policy(client).await["max_concurrent_total"]
         .as_u64()
@@ -130,7 +114,6 @@ async fn pool_ceiling(client: &reqwest::Client) -> u64 {
 
 #[tokio::test]
 async fn the_pool_room_helper_widens_the_pool_and_restores_it_after_a_panic() {
-    // Held throughout, so no other test widens the pool between these reads.
     let _cap = capacity_policy_lock().lock().await;
     let client = user_client().await;
     let before = pool_ceiling(&client).await;

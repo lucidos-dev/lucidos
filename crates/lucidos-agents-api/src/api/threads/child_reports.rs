@@ -1,10 +1,3 @@
-//! `/api/v1/threads/:thread_id/child-reports/take`, where a coding agent takes
-//! its children's reports mid-turn (`lucidos threads child-reports`). See
-//! `engine::agent_session::child_reports`.
-//!
-//! Every other response to that agent carries [`HEADER_CHILD_REPORTS_WAITING`]
-//! while a report waits, and the CLI turns it into a one-line note.
-
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -15,17 +8,11 @@ use super::background_tasks::{child_reports_json, require_own_thread_agent};
 use super::parse_thread_id;
 use crate::api::AppState;
 
-/// How many child reports wait unread for the calling agent's own thread. Set
-/// only when one does. The CLI mirrors the name.
 pub(crate) const HEADER_CHILD_REPORTS_WAITING: &str = "lucidos-child-reports-waiting";
 
-/// Marks a response that already carries the caller's child reports, so the
-/// note does not announce them again.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::api) struct ChildReportsCarried;
 
-/// Stamp [`HEADER_CHILD_REPORTS_WAITING`] on a response to a thread's own
-/// agent while a child report waits for it.
 pub(in crate::api) async fn note_waiting_child_reports(
     State(state): State<AppState>,
     request: Request,
@@ -57,10 +44,6 @@ pub(in crate::api) async fn note_waiting_child_reports(
     response
 }
 
-/// POST /api/v1/threads/:thread_id/child-reports/take
-///
-/// Hands the thread's own agent every child report it has not read yet, and
-/// withdraws each queued copy so the report arrives once.
 pub(in crate::api) async fn take_child_reports(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,

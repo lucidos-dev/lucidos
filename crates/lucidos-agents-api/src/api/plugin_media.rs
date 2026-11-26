@@ -1,9 +1,3 @@
-//! The *plugin media* route (ADR 0414). It serves only what a media copy's
-//! index lists (invariant I13), and never as a document: every response carries
-//! `nosniff` and a sandbox CSP, so opening an SVG directly cannot run script on
-//! the engine origin (invariant I6). The Lucidos shell alone reaches it
-//! (`app_reach`, invariant I17).
-
 use std::path::Path;
 
 use axum::extract::{Path as UrlPath, State};
@@ -29,8 +23,6 @@ pub(super) fn router() -> Router<AppState> {
         )
 }
 
-/// `GET /api/v1/plugins/media/installed/:plugin_id/*path`: an installed
-/// plugin's media, which outlives its marketplace.
 async fn installed_media(
     State(state): State<AppState>,
     UrlPath((plugin_id, path)): UrlPath<(String, String)>,
@@ -43,8 +35,6 @@ async fn installed_media(
     media_response(&copy, &path, &headers).await
 }
 
-/// `GET /api/v1/plugins/media/catalog/:marketplace_id/:plugin_id/:version/*path`:
-/// the media a scan cached for one catalog row.
 async fn catalog_media(
     State(state): State<AppState>,
     UrlPath((marketplace_id, plugin_id, version, path)): UrlPath<(String, String, String, String)>,
@@ -61,7 +51,6 @@ async fn catalog_media(
     media_response(&copy, &path, &headers).await
 }
 
-/// Serve `path` from the media copy at `copy`, when its index lists it.
 pub(super) async fn media_response(copy: &Path, path: &str, headers: &HeaderMap) -> Response {
     let Some(file) = plugin_media::listed_file(copy, path) else {
         return media_headers(not_found());
@@ -124,7 +113,6 @@ mod tests {
         assert_eq!(h.get(header::CONTENT_SECURITY_POLICY).unwrap(), MEDIA_CSP);
     }
 
-    /// Invariant I6: every media response, found or not, carries both headers.
     #[tokio::test]
     async fn every_media_response_carries_the_sandbox_headers() {
         let (_ws, copy) = copy_with(
@@ -144,7 +132,6 @@ mod tests {
         assert_media_headers(&missing);
     }
 
-    /// Invariant I13: a file in the copy that the index does not list is a 404.
     #[tokio::test]
     async fn an_unlisted_file_is_not_served() {
         let (_ws, copy) = copy_with(
@@ -166,7 +153,6 @@ mod tests {
         assert!(!MEDIA_CSP.contains("allow-"), "{MEDIA_CSP}");
     }
 
-    /// A video seeks, which Safari needs before it plays at all.
     #[tokio::test]
     async fn a_video_answers_a_range() {
         let (_ws, copy) = copy_with(
@@ -180,8 +166,6 @@ mod tests {
         assert_media_headers(&response);
     }
 
-    /// The reach table lists every route the router serves, so a media row
-    /// there under each mount means the catalog URLs reach a handler.
     #[test]
     fn the_routes_mount_where_the_catalog_urls_point() {
         for mount in [plugin_media::INSTALLED_ROUTE, plugin_media::CATALOG_ROUTE] {

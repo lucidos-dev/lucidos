@@ -57,83 +57,22 @@ describe('the restore reports its outcome', () => {
     expect(outcomes()).toEqual([['scroll', 'restore', { outcome: 'gave-up', form: 'row' }]]);
   });
 
-  it.each([0, 3500, 4100, 10_000, 20_000])('corrects growth at %d ms before reporting settled drift', delay => {
-    let now = 0;
-    vi.spyOn(performance, 'now').mockImplementation(() => now);
+  it.each([0, 3500, 4100, 10_000, 20_000, 60_000])('holds the restored line when content grows after %d ms', delay => {
+    vi.useFakeTimers();
     localStorage.setItem('k', 'anchor:-520:t2');
     const el = mockTranscript({ ids: ['t0', 't1', 't2', 't3'], turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
-    const { onResize } = makeScrollObservers(el);
+    const { onResize, detachGestures } = makeScrollObservers(el);
     const detach = attachScrollMemory(el, 'k', transcript);
 
     const restoredTop = el.scrollTop;
-    now = delay;
+    vi.advanceTimersByTime(delay);
     el.setBlockHeight('t2', 0, 300);
     onResize();
+
     expect(el.scrollTop).toBe(restoredTop + 280);
-    now = 60_000;
-    onResize();
+    expect(outcomes()).toEqual([['scroll', 'restore', { outcome: 'landed', form: 'anchor' }]]);
     detach();
-
-    expect(outcomes()).toContainEqual(['scroll', 'restore', { outcome: 'settled', form: 'anchor', drift: 0 }]);
-  });
-
-  it.each([20_001, 25_000, 60_000])('releases without writing on a first growth round after the ceiling: %d ms', delay => {
-    let now = 0;
-    vi.spyOn(performance, 'now').mockImplementation(() => now);
-    localStorage.setItem('k', 'anchor:-520:t2');
-    const el = mockTranscript({ ids: ['t0', 't1', 't2', 't3'], turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
-    const { onResize } = makeScrollObservers(el);
-    const detach = attachScrollMemory(el, 'k', transcript);
-    const restoredTop = el.scrollTop;
-
-    now = delay;
-    el.setBlockHeight('t2', 0, 300);
-    onResize();
-    expect(el.scrollTop).toBe(restoredTop);
-    expect(outcomes()).toContainEqual(['scroll', 'restore', { outcome: 'settled', form: 'anchor', drift: 280 }]);
-    detach();
-  });
-
-  it('releases after the final ceiling correction, even if content keeps growing', () => {
-    let now = 0;
-    vi.spyOn(performance, 'now').mockImplementation(() => now);
-    localStorage.setItem('k', 'anchor:-520:t2');
-    const el = mockTranscript({ ids: ['t0', 't1', 't2', 't3'], turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
-    const { onResize } = makeScrollObservers(el);
-    const detach = attachScrollMemory(el, 'k', transcript);
-    const restoredTop = el.scrollTop;
-
-    now = 20_000;
-    el.setBlockHeight('t2', 0, 300);
-    onResize();
-    expect(el.scrollTop).toBe(restoredTop + 280);
-    expect(outcomes()).toContainEqual(['scroll', 'restore', { outcome: 'settled', form: 'anchor', drift: 0 }]);
-
-    now += 100;
-    el.setBlockHeight('t2', 0, 600);
-    onResize();
-    expect(el.scrollTop).toBe(restoredTop + 280);
-    expect(outcomes().filter(([, , data]) => data.outcome === 'settled')).toHaveLength(1);
-    detach();
-  });
-
-  it('does not correct late growth once the reader takes over', () => {
-    let now = 0;
-    vi.spyOn(performance, 'now').mockImplementation(() => now);
-    localStorage.setItem('k', 'anchor:-520:t2');
-    const el = mockTranscript({ ids: ['t0', 't1', 't2', 't3'], turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
-    const { onScroll, onResize } = makeScrollObservers(el);
-    const detach = attachScrollMemory(el, 'k', transcript);
-
-    now = 4100;
-    readerGestureForTest(el);
-    el.scrollTop = 1000;
-    onScroll();
-    el.setBlockHeight('t2', 0, 300);
-    onResize();
-    expect(el.scrollTop).toBe(1000);
-    expect(outcomes().some(([, , data]) => data.outcome === 'settled')).toBe(false);
-    detach();
+    detachGestures();
   });
 
   it('the content pane and the drawer report nothing', () => {

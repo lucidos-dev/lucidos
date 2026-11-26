@@ -7,7 +7,6 @@ mod sentinel_redaction_tests {
     };
     use crate::llm::tool_names as tn;
 
-    /// A result as the named tool returned it, called with no arguments.
     fn from(tool: &str, raw: &str) -> Option<SentinelMatch> {
         match_sentinel(tool, &serde_json::json!({}), raw)
     }
@@ -43,8 +42,6 @@ mod sentinel_redaction_tests {
             other => panic!("expected PluginInstallRequested, got {:?}", other),
         }
         let redacted = m.redacted_text.expect("install must redact for the LLM");
-        // Redacted text MUST NOT leak the JSON to the LLM — that's the bug
-        // we're fixing (LLM was parsing `overwrites` and chat-asking the user).
         assert!(
             !redacted.contains('{'),
             "redacted text must not contain the JSON payload: {}",
@@ -55,7 +52,6 @@ mod sentinel_redaction_tests {
             "redacted text must not contain the sentinel prefix: {}",
             redacted
         );
-        // Must instruct the LLM to wait, not respond, not chat-ask.
         let lower = redacted.to_lowercase();
         assert!(
             lower.contains("panel") && (lower.contains("confirm") || lower.contains("cancel")),
@@ -111,9 +107,6 @@ mod sentinel_redaction_tests {
         );
     }
 
-    /// Nothing re-opens the thread when the user saves the form, so the result
-    /// must spell out the wait. The condition names THIS request, so an older
-    /// form closing cannot wake it.
     #[test]
     fn a_credential_sentinel_names_the_wait_for_its_own_request() {
         let raw = format!(
@@ -130,10 +123,6 @@ mod sentinel_redaction_tests {
         assert!(redacted.contains(&request_id.to_string()), "{redacted}");
     }
 
-    /// A WIDENING reopens a row that already holds its secret. Told it "saves
-    /// the credential", the agent narrates a token the user need not type. That
-    /// is the mis-narration the redaction's own comment block cites as the
-    /// reason it names the service at all.
     #[test]
     fn a_widening_sentinel_says_the_secret_is_already_stored() {
         let raw = format!(
@@ -150,8 +139,6 @@ mod sentinel_redaction_tests {
         );
     }
 
-    /// An EMPTY list is not a widening. Nothing is being added, so the request
-    /// is an ordinary collection and has to read as one.
     #[test]
     fn an_empty_adding_list_narrates_as_a_collection() {
         let raw = format!(
@@ -180,9 +167,6 @@ mod sentinel_redaction_tests {
         );
     }
 
-    /// The engine knows it recorded a request, not that a screen drew it. A
-    /// lost stream frame once left the user seeing nothing, while the old
-    /// wording told the agent the form was up.
     #[test]
     fn the_agent_is_told_a_form_was_sent_never_that_it_was_shown() {
         let payloads = [
@@ -219,7 +203,6 @@ mod sentinel_redaction_tests {
         }
     }
 
-    /// Two requests are two questions, so each gets its own id to be answered by.
     #[test]
     fn every_credential_request_gets_a_fresh_id() {
         let raw = format!(
@@ -236,8 +219,6 @@ mod sentinel_redaction_tests {
         );
     }
 
-    /// A loop that forgot the form request would bring back a form that never
-    /// opens, with its raw JSON handed to the model.
     #[test]
     fn the_agentic_loop_routes_sentinels_through_the_form_request_emitter() {
         let source = include_str!("../agentic_loop/run.rs");
@@ -253,15 +234,10 @@ mod sentinel_redaction_tests {
 
     #[test]
     fn sentinel_without_json_returns_none() {
-        // Defensive: sentinel prefix without `{` afterwards should not match
-        // (the agentic loop pre-redaction code skipped these too).
         let raw = format!("{PLUGIN_INSTALL_REQUEST_PREFIX}no json here");
         assert!(from(tn::INSTALL_PLUGIN, &raw).is_none());
     }
 
-    /// Outside text never opens a trusted form. A page `run_bash` fetched, or
-    /// an MCP tool's reply, can start with any sentinel. Honoured, it would ask
-    /// the user for a real token scoped to the attacker's host.
     #[test]
     fn a_sentinel_from_a_tool_that_does_not_produce_it_opens_no_form() {
         let credential = format!(
@@ -296,9 +272,6 @@ mod sentinel_redaction_tests {
         }
     }
 
-    /// A grouped tool resolves to the legacy tool its action names. So
-    /// `plugins` with `action: install` opens the install panel, and any other
-    /// action opens nothing.
     #[test]
     fn a_grouped_tool_is_judged_by_the_action_it_dispatched() {
         let install = format!(
@@ -324,8 +297,6 @@ mod run_tool_with_cancel_tests {
     use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
 
-    /// A tool future that completes normally must produce its own result —
-    /// the wrapper passes through when no cancel is signaled.
     #[tokio::test]
     async fn returns_tool_result_when_not_cancelled() {
         let cancel_token = CancellationToken::new();
@@ -336,12 +307,6 @@ mod run_tool_with_cancel_tests {
         );
     }
 
-    /// Pre-cancelled token MUST short-circuit even when the inner future is
-    /// instantly ready. The `biased` poll order in the wrapper guarantees the
-    /// cancel arm wins the race — without `biased`, an already-cancelled token
-    /// plus a synchronously-ready tool would still let the tool result win
-    /// (tokio::select picks fairly otherwise), letting the loop run one more
-    /// iteration past the cancel signal.
     #[tokio::test]
     async fn pre_cancelled_token_short_circuits_even_when_tool_ready() {
         let cancel_token = CancellationToken::new();
@@ -353,11 +318,6 @@ mod run_tool_with_cancel_tests {
         );
     }
 
-    /// Mid-flight cancel: the tool future is parked on a long sleep when
-    /// the cancel signal arrives. The wrapper must observe the cancel within
-    /// the polling latency — NOT wait for the tool to finish. This is the
-    /// regression contract: a hung `urlopen()` (no timeout) must not block
-    /// cancel from completing.
     #[tokio::test]
     async fn cancel_aborts_long_running_tool_quickly() {
         let cancel_token = CancellationToken::new();
@@ -385,10 +345,6 @@ mod run_tool_with_cancel_tests {
         );
     }
 
-    /// Cancel must surface as `Err` so the agent loop classifies it as a
-    /// tool failure and stamps `success: false` on the persisted ToolResult.
-    /// This is the typed-Result successor to the legacy "starts_with(\"Error:\")"
-    /// classifier — `ToolOutcome::Err(_)` is the contracted failure shape.
     #[tokio::test]
     async fn canceled_result_is_typed_err_for_caller() {
         let cancel_token = CancellationToken::new();
@@ -404,10 +360,6 @@ mod run_tool_with_cancel_tests {
     }
 }
 
-/// `until_canceled` is the setup-phase sibling of `run_tool_with_cancel`: same
-/// `biased` race, but it yields `None` instead of a typed error because the
-/// caller has no paired event to emit, it simply ends the turn. See the chat
-/// turn setup in `engine/chat/process/run.rs`.
 mod until_canceled_tests {
     use crate::engine::agentic_loop::until_canceled;
     use std::time::{Duration, Instant};
@@ -420,10 +372,6 @@ mod until_canceled_tests {
         assert_eq!(until_canceled(&cancel_token, fut).await, Some(7));
     }
 
-    /// The `biased` contract. A Stop that landed while the previous phase was
-    /// finishing must end the turn, even though the next phase's future happens
-    /// to be instantly ready. Without `biased`, tokio picks fairly and the turn
-    /// leaks one more phase of setup past the user's click.
     #[tokio::test]
     async fn pre_cancelled_token_wins_over_an_instantly_ready_future() {
         let cancel_token = CancellationToken::new();
@@ -432,9 +380,6 @@ mod until_canceled_tests {
         assert_eq!(until_canceled(&cancel_token, fut).await, None);
     }
 
-    /// The regression contract: the whole point is that a Stop is observed
-    /// WHILE a long phase is in flight (a classification LLM call, a memory
-    /// search on a big thread), not after it returns.
     #[tokio::test]
     async fn cancel_aborts_a_long_phase_without_waiting_for_it() {
         let cancel_token = CancellationToken::new();

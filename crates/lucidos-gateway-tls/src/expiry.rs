@@ -1,7 +1,3 @@
-//! When a certificate stops being valid: its `notAfter`, read straight from the
-//! DER. The walk reads only the fields in front of `validity`, which RFC 5280
-//! fixes in order, so it needs no X.509 crate.
-
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
@@ -11,7 +7,6 @@ const VERSION: u8 = 0xa0;
 const UTC_TIME: u8 = 0x17;
 const GENERALIZED_TIME: u8 = 0x18;
 
-/// The `notAfter` of the first certificate in `pem`, the leaf.
 pub fn not_after(pem: &[u8]) -> Option<DateTime<Utc>> {
     let leaf = CertificateDer::pem_slice_iter(pem).next()?.ok()?;
     leaf_not_after(&leaf)
@@ -24,7 +19,6 @@ fn leaf_not_after(der: &[u8]) -> Option<DateTime<Utc>> {
     if rest.first() == Some(&VERSION) {
         rest = tlv(rest)?.2;
     }
-    // serialNumber, signature, issuer.
     for _ in 0..3 {
         rest = tlv(rest)?.2;
     }
@@ -33,7 +27,6 @@ fn leaf_not_after(der: &[u8]) -> Option<DateTime<Utc>> {
     let (tag, time, _) = tlv(after_not_before)?;
     let time = std::str::from_utf8(time).ok()?;
     let full = match tag {
-        // Two-digit years: 50 to 99 are the 1900s (RFC 5280 §4.1.2.5.1).
         UTC_TIME if time.get(..2)? >= "50" => format!("19{time}"),
         UTC_TIME => format!("20{time}"),
         GENERALIZED_TIME => time.to_string(),
@@ -49,7 +42,6 @@ fn expect(der: &[u8], want: u8) -> Option<(&[u8], &[u8])> {
     (tag == want).then_some((content, rest))
 }
 
-/// One tag-length-value: the tag, the content, and what follows it.
 fn tlv(der: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let (&tag, der) = der.split_first()?;
     let (&first, der) = der.split_first()?;
@@ -91,7 +83,6 @@ mod tests {
 
     #[test]
     fn a_generalized_time_expiry_is_read() {
-        // RFC 5280 switches to GeneralizedTime from 2050 on.
         assert_eq!(
             not_after(&minted_until(2051, 1, 2)),
             Some(Utc.with_ymd_and_hms(2051, 1, 2, 0, 0, 0).unwrap())

@@ -41,8 +41,6 @@ pub fn verify_components(directory: &Path, manifest: &Manifest) -> Result<(), Bo
     verify_index(directory, manifest)
 }
 
-/// Read both streams together. Every archive entry must have exactly one index
-/// record, in sorted order, with the same path, mode, length and content hash.
 pub fn verify_index(directory: &Path, manifest: &Manifest) -> Result<(), BoxError> {
     let mut index = BufReader::new(zstd::Decoder::new(File::open(
         directory.join("files.index.jsonl.zst"),
@@ -119,7 +117,6 @@ pub fn check(
 }
 
 pub fn verify_dump(path: &Path, database_url: &str) -> Result<(), BoxError> {
-    // --list parses only the local dump; it never connects to a database.
     let output = crate::core::backup::pg_tool_command("pg_restore", database_url)?
         .arg("--list")
         .arg(path)

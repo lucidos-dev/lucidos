@@ -1,11 +1,5 @@
-//! A walk over every string a JSON value carries, object keys included, so
-//! NUL stripping cannot miss a key. Masking uses the shared masker instead.
-
 use serde_json::{Map, Value};
 
-/// `value` with `f` applied to every string in it, object keys included.
-/// `Err` names a key two keys of one object both became, since keeping
-/// either would silently drop the other's value.
 pub(crate) fn map_strings(value: Value, f: &impl Fn(&str) -> String) -> Result<Value, String> {
     Ok(match value {
         Value::String(text) => Value::String(f(&text)),
@@ -20,7 +14,6 @@ pub(crate) fn map_strings(value: Value, f: &impl Fn(&str) -> String) -> Result<V
     })
 }
 
-/// `map` with `f` applied to every key and every string below it.
 pub(crate) fn map_object_strings(
     map: Map<String, Value>,
     f: &impl Fn(&str) -> String,

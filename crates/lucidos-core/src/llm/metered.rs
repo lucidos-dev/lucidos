@@ -1,13 +1,3 @@
-//! The metered call path: the only way to call a billable provider.
-//!
-//! Each billable provider method takes a [`CallToken`], and only this module
-//! can make one. Every function here makes one call and hands what it cost to
-//! a [`CostSink`] before returning the answer. So a model call whose cost goes
-//! nowhere does not compile, wherever it is written.
-//!
-//! The engine's sinks live in `engine::model_call`, the *model call service*,
-//! which turns each cost into a `ContextCaptured` row.
-
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -24,10 +14,6 @@ use crate::llm::web_search::{WebSearchChain, WebSearchProvider, WebSearchResult}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Permission to make one billable provider call.
-///
-/// A wrapper provider forwards the token it was handed to the provider it
-/// wraps. Nothing outside this module can make one.
 #[derive(Clone, Copy, Debug)]
 pub struct CallToken {
     _sealed: (),
@@ -38,13 +24,12 @@ impl CallToken {
         Self { _sealed: () }
     }
 
-    /// A token for a test that drives a provider directly.
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test() -> Self {
         Self::mint()
     }
 
-    /// A token for `lucidos-eval`, which scores models outside any workspace
+    /// INVARIANT: A token for `lucidos-eval`, which scores models outside any workspace
     /// and has no event bus to record on. No engine source may call this:
     /// `no_engine_source_mints_the_eval_token` holds that.
     #[doc(hidden)]
@@ -53,7 +38,6 @@ impl CallToken {
     }
 }
 
-/// What a provider reported for one call, in the shape it reported it.
 pub enum Reported<'a> {
     Chat(&'a LlmResponse),
     Judgment(&'a Judgment),
@@ -65,8 +49,6 @@ pub enum Reported<'a> {
 }
 
 impl Reported<'_> {
-    /// The *served model* a chat reply or a chat judgment named. Every other
-    /// shape already reports the serving model as the call's `model`.
     pub(crate) fn served_model(&self) -> Option<&str> {
         match self {
             Self::Chat(response) => response.served_model.as_deref(),
@@ -75,7 +57,6 @@ impl Reported<'_> {
         }
     }
 
-    /// The serving backend proved by a chat route or search result.
     pub(crate) fn provider(&self) -> Option<&'static str> {
         match self {
             Self::Chat(response) => response.provider.map(|kind| kind.as_str()),
@@ -85,45 +66,32 @@ impl Reported<'_> {
     }
 }
 
-/// What one call cost.
 pub struct CallCost<'a> {
-    /// The model the call asked for. A chat reply names the one that served
-    /// it in [`Reported::served_model`].
     pub model: &'a str,
-    /// The size of what was sent. A chat call is sized by
+    /// INVARIANT: The size of what was sent. A chat call is sized by
     /// `engine::context::request_chars`, the same count a turn's budget uses.
     pub request_chars: usize,
     pub reported: Reported<'a>,
-    /// The reasoning tier the call ran at, when the caller chose one.
     pub(crate) reasoning_effort: Option<&'a str>,
-    /// How long the call took, wall clock.
     pub(crate) duration_ms: Option<u64>,
-    /// Time to the first content delta of the stream that answered, from the
-    /// same start as `duration_ms`. `None` when no delta was seen.
     pub(crate) ttft_ms: Option<u64>,
-    /// The request id header of the response that answered, when it had one.
     pub(crate) request_id: Option<&'a str>,
-    /// The backend the router sent the call to, when one chose. A chat reply
-    /// names its own in [`Reported::provider`].
     pub(crate) provider: Option<crate::llm::ProviderKind>,
 }
 
-/// How a metered chat call failed, as facts. Never the error message: a
+/// INVARIANT: How a metered chat call failed, as facts. Never the error message: a
 /// provider's error body can echo request content.
 pub struct CallFailed<'a> {
     pub model: &'a str,
     pub reasoning_effort: Option<&'a str>,
-    /// How long the call ran before it failed, wall clock.
     pub duration_ms: u64,
     pub attempts: u32,
     pub failure: CallFailure,
     pub status_code: Option<u16>,
     pub request_id: Option<&'a str>,
-    /// The backend the router sent the call to, when one chose.
     pub provider: Option<crate::llm::ProviderKind>,
 }
 
-/// Where a call's cost goes. Every metered function takes one.
 #[async_trait]
 pub trait CostSink: Send + Sync {
     fn spend_cap_policy(&self) -> Option<(Arc<dyn SpendCapPolicy>, bool)> {
@@ -131,11 +99,9 @@ pub trait CostSink: Send + Sync {
     }
     async fn record(&self, cost: CallCost<'_>);
 
-    /// Note a chat call that failed. It spent nothing a rollup should bill, so
-    /// a sink that keeps no failures leaves this as is.
     async fn record_failure(&self, _failure: CallFailed<'_>) {}
 
-    /// When the provider must have answered. It bounds the provider call
+    /// INVARIANT: When the provider must have answered. It bounds the provider call
     /// alone, so a call that answered in time is never lost to its record.
     fn deadline(&self) -> Option<tokio::time::Instant> {
         None
@@ -146,7 +112,7 @@ tokio::task_local! {
     static SPEND_POLICY: (Arc<dyn SpendCapPolicy>, bool, std::sync::Mutex<Option<crate::llm::ProviderKind>>);
 }
 
-/// Every actual route checks here, including a fallback inside one call.
+/// INVARIANT: Every actual route checks here, including a fallback inside one call.
 pub(crate) async fn check_provider(provider: crate::llm::ProviderKind) -> Result<(), BoxError> {
     if let Ok((policy, interactive)) =
         SPEND_POLICY.try_with(|(policy, interactive, _)| (policy.clone(), *interactive))
@@ -157,7 +123,7 @@ pub(crate) async fn check_provider(provider: crate::llm::ProviderKind) -> Result
     Ok(())
 }
 
-/// Observe a refusal before a search or routing fallback can consume it.
+/// INVARIANT: Observe a refusal before a search or routing fallback can consume it.
 pub(crate) async fn http_spend_cap(
     provider: crate::llm::ProviderKind,
     status: u16,
@@ -171,8 +137,6 @@ pub(crate) async fn http_spend_cap(
     Some(cap)
 }
 
-/// Run one provider call under the sink's deadline. A call that runs out
-/// returns a boxed [`tokio::time::error::Elapsed`] and reported nothing.
 async fn within<T>(
     sink: &dyn CostSink,
     call: impl std::future::Future<Output = Result<T, BoxError>>,
@@ -207,7 +171,7 @@ async fn within<T>(
         .await
 }
 
-/// Make one chat call and record what it cost.
+/// INVARIANT: Make one chat call and record what it cost.
 ///
 /// The cost names the model the selection pins, else the provider's default,
 /// and the tier the call went out at and the time it took. Both are read after
@@ -225,7 +189,7 @@ pub async fn chat<P: LlmProvider + ?Sized>(
     system_prompt: Option<&str>,
     on_token: Option<TokenCallback>,
 ) -> Result<LlmResponse, BoxError> {
-    // Route failures must pass through the call's normal failure recording.
+    // INVARIANT: Route failures must pass through the call's normal failure recording.
     let resolved = if sink.spend_cap_policy().is_some() {
         provider.resolved_provider_kind(&selection).unwrap_or(None)
     } else {
@@ -291,9 +255,6 @@ pub async fn chat<P: LlmProvider + ?Sized>(
     Ok(response)
 }
 
-/// Send one *prefill beat* and record what it cost, under the model and
-/// effort its turn went out at. A failed beat records a failure, as a chat
-/// call does.
 pub async fn prefill<P: LlmProvider + ?Sized>(
     sink: &dyn CostSink,
     provider: &P,
@@ -344,8 +305,6 @@ pub async fn prefill<P: LlmProvider + ?Sized>(
     Ok(response)
 }
 
-/// Ask one typed judgment and record what it cost. The provider names the
-/// model and sizes the request.
 pub async fn judge<J: JudgmentProvider + ?Sized>(
     sink: &dyn CostSink,
     judge: &J,
@@ -370,8 +329,6 @@ pub async fn judge<J: JudgmentProvider + ?Sized>(
     Ok(judgment)
 }
 
-/// Generate one image and record what it cost, sized by the prompt and the
-/// input images.
 pub async fn generate<I: ImageProvider + ?Sized>(
     sink: &dyn CostSink,
     provider: &I,
@@ -404,7 +361,6 @@ pub async fn generate<I: ImageProvider + ?Sized>(
     Ok(result)
 }
 
-/// Run one web search and record the backend that answered.
 pub async fn search(
     sink: &dyn CostSink,
     chain: &WebSearchChain,

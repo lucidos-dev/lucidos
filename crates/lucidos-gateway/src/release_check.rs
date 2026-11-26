@@ -1,22 +1,3 @@
-//! The gateway's release check: one poll per install, announced not installed.
-//!
-//! ADR 0108. The check lives here because the gateway is per-machine and
-//! supervises every workspace. A webview timer polled once per open window, and
-//! a headless install polled not at all.
-//!
-//! Two gates stand in front of the request, and both must pass. The deployment
-//! must be installed rather than a source checkout, and the machine-global
-//! `~/.lucidos/updates.toml` must have the check enabled. The first is fail
-//! closed: it refuses whenever it cannot prove the opposite. The second defaults
-//! on, because the check is functional rather than telemetry (ADR 0139).
-//!
-//! The request carries platform, arch and version. It also carries the caller's
-//! IP, as any HTTP request does, and `PRIVACY.md` says so.
-//!
-//! The selected update channel resolves to a feed (ADR 0715). Stable keeps the
-//! ADR 0108 request. Other channels read platform feeds without query parameters.
-//! A refused channel or unreadable feed reports an error and offers nothing.
-
 use futures::StreamExt;
 use lucidos_update_channel::{is_upgrade, Channel, UpdateAddress};
 use serde::Deserialize;
@@ -27,38 +8,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-/// Where the check asks. The route is published from the maintainer's workspace
-/// and its contract is fixed in ADR 0108.
 pub const UPDATE_CHECK_ORIGIN: &str = "https://lucidos.dev/api/update-check";
 
-/// How stale the answer may get before a refresh re-polls, and how often the
-/// backstop timer fires for a gateway nobody is looking at.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Floor between two forced checks, so the Settings button cannot be mashed
-/// into a burst of outbound requests.
 pub const FORCED_POLL_FLOOR: Duration = Duration::from_secs(60);
 
-/// The product name and the running version, and nothing about the user.
-///
-/// This adds NO information to the request. The version is already a query
-/// parameter, and this repeats it where the origin's zone logs can group by it:
-/// the plan denies the query dimension and allows the user agent. An absent user
-/// agent invites a bot challenge, which is why the gateway sends one at all.
-///
-/// Nothing else may join it. ADR 0108 requires aggregate counts with no
-/// per-request identity, and rejected an anonymous install id outright.
 fn user_agent(version: &str) -> String {
     format!("lucidos-gateway/{version}")
 }
 
-/// Cap on the response body. The contract answers one small JSON object, so
-/// anything larger is a wrong origin rather than a big answer.
 pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
-
-// ---------------------------------------------------------------------------
-// The preference file
-// ---------------------------------------------------------------------------
 
 pub use crate::update_channels::{
     parse_updates_toml, render_updates_toml, CustomSlot, UpdatesToml,
@@ -80,8 +40,6 @@ pub fn read_updates_toml(path: Option<&Path>) -> UpdatesToml {
     }
 }
 
-/// Write the preference atomically (temp plus rename). Its directory is the
-/// Lucidos home, so it is asserted as a storage root first.
 pub fn write_updates_toml(path: Option<&Path>, cfg: &UpdatesToml) -> std::io::Result<()> {
     let path =
         path.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
@@ -93,16 +51,6 @@ pub fn write_updates_toml(path: Option<&Path>, cfg: &UpdatesToml) -> std::io::Re
     std::fs::rename(&tmp, path)
 }
 
-// ---------------------------------------------------------------------------
-// The fail-closed gate
-// ---------------------------------------------------------------------------
-
-/// Is this an installed deployment, so polling is allowed at all?
-///
-/// Both halves are required. `LUCIDOS_PACKAGED=1` is set by each shipped
-/// launcher and by nothing in dev, and the checkout test catches an operator who
-/// exported it by hand. An unresolvable executable path is a refusal, because
-/// the second half cannot then be answered.
 pub fn deployment_is_installed(packaged: bool, exe: Option<&Path>) -> bool {
     match (packaged, exe) {
         (true, Some(p)) => crate::build_id::repo_root_above(p).is_none(),
@@ -112,12 +60,6 @@ pub fn deployment_is_installed(packaged: bool, exe: Option<&Path>) -> bool {
 
 pub use lucidos_update_channel::InstallShape;
 
-/// Which install shape this executable belongs to, read from its path.
-///
-/// `packaged` alone cannot tell the two apart, and they take different updates.
-/// A bundle puts the gateway under `Lucidos.app/Contents/Resources/`, and the
-/// installer puts it under `<prefix>/runtime/<stem>/`. Anything else is
-/// unrecognised, and the caller then offers a version with no action.
 pub fn install_shape(exe: &Path) -> Option<InstallShape> {
     if exe
         .ancestors()
@@ -129,14 +71,6 @@ pub fn install_shape(exe: &Path) -> Option<InstallShape> {
     (runtime_dir.file_name()? == "runtime").then_some(InstallShape::InstallerRerun)
 }
 
-/// The `install.sh` re-run this instance needs, ready to copy.
-///
-/// The gateway never runs it. On macOS `launchctl bootout` tears down the job's
-/// whole process group, so a spawned installer would kill itself mid-replace
-/// (ADR 0108).
-///
-/// `app_data` is `<prefix>/<slug>`, so both come from the running instance.
-/// `--prefix` is omitted when it is already the default.
 pub fn installer_command(app_data: &Path, default_prefix: Option<&Path>) -> Option<String> {
     let slug = app_data.file_name()?.to_str()?;
     let prefix = app_data.parent()?;
@@ -153,7 +87,6 @@ pub fn installer_command(app_data: &Path, default_prefix: Option<&Path>) -> Opti
     Some(cmd)
 }
 
-/// Quote a value for a shell command line, leaving the ordinary case bare.
 fn shell_quote(value: &str) -> String {
     let safe = !value.is_empty()
         && value
@@ -166,12 +99,6 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The request and its answer
-// ---------------------------------------------------------------------------
-
-/// The `platform` value for a `std::env::consts::OS`, or `None` when Lucidos
-/// publishes nothing for it. An unpublished target polls nothing.
 pub fn platform_key(os: &str) -> Option<&'static str> {
     match os {
         "macos" => Some("macos"),
@@ -180,8 +107,6 @@ pub fn platform_key(os: &str) -> Option<&'static str> {
     }
 }
 
-/// The `arch` value for a `std::env::consts::ARCH`, or `None` when Lucidos
-/// publishes nothing for it.
 pub fn arch_key(arch: &str) -> Option<&'static str> {
     match arch {
         "aarch64" => Some("aarch64"),
@@ -190,7 +115,6 @@ pub fn arch_key(arch: &str) -> Option<&'static str> {
     }
 }
 
-/// The full request URL. Exactly three parameters, and no others ever.
 pub fn check_url(origin: &str, platform: &str, arch: &str, version: &str) -> String {
     format!("{origin}?platform={platform}&arch={arch}&version={version}")
 }
@@ -203,21 +127,12 @@ struct CheckResponse {
     notes: Option<String>,
 }
 
-/// What the origin published for this target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedRelease {
     pub version: String,
-    /// The release notes, when the origin carries them. Optional in the
-    /// contract, and absent means the offer shows no "What's new" link.
     pub notes: Option<String>,
 }
 
-/// Read the origin's answer. `Ok(None)` means the origin publishes nothing for
-/// this target, which is a valid answer rather than a failure.
-///
-/// A body that is not JSON is an error, never "up to date". Cloudflare Pages
-/// answers an unknown path with landing-page HTML at status 200. That already
-/// broke the front door once, and `install.sh` sniffs for it.
 pub fn parse_response(body: &str) -> Result<Option<PublishedRelease>, String> {
     let trimmed = body.trim_start();
     if trimmed.starts_with('<') {
@@ -241,15 +156,6 @@ pub fn parse_response(body: &str) -> Result<Option<PublishedRelease>, String> {
     }))
 }
 
-/// The outbound client. Deliberately NOT `proxy::build_client`, which accepts
-/// invalid certificates for the loopback hop.
-///
-/// It follows no redirect, so the answer comes from the origin we asked. It
-/// carries no cookie store, because the `cookies` feature is off. A system proxy
-/// is honoured, since a corporate network may require one.
-///
-/// `version` is the one the request also carries in its query string. The caller
-/// passes the same value to both, so the user agent cannot drift from it.
 fn build_client(version: &str) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -260,26 +166,15 @@ fn build_client(version: &str) -> reqwest::Client {
         .expect("release-check client builds from static settings")
 }
 
-// ---------------------------------------------------------------------------
-// The check itself
-// ---------------------------------------------------------------------------
-
-/// What the gateway knows about its deployment, resolved once at boot.
 pub struct Deployment {
-    /// `LUCIDOS_PACKAGED` was truthy.
     pub packaged: bool,
-    /// This process's executable, from `current_exe`.
     pub exe: Option<PathBuf>,
-    /// `<prefix>/<slug>` for an installer instance, used to compose its command.
     pub app_data: PathBuf,
-    /// `~/.lucidos`, so a non-default prefix is spelled out in the command.
     pub default_prefix: Option<PathBuf>,
-    /// Where the preference lives. `None` means `HOME` is unset.
     pub config_path: Option<PathBuf>,
 }
 
 impl Deployment {
-    /// Resolve from the environment at gateway startup.
     pub fn from_env(packaged: bool, exe: Option<PathBuf>, app_data: PathBuf) -> Self {
         Deployment {
             packaged,
@@ -293,63 +188,42 @@ impl Deployment {
 
 #[derive(Default)]
 struct ReleaseState {
-    /// When a poll was last attempted, successful or not. Drives the staleness
-    /// gate, so a failing origin is not hammered.
     last_attempt: Option<Instant>,
-    /// When an answer last arrived.
     checked_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The newest published release, when it is later than ours.
     latest: Option<PublishedRelease>,
-    /// Why the last poll failed, cleared by the next success.
-    ///
-    /// Reported on the wire because a failed check must never read as "you are
-    /// up to date". Without it the caller sees the unchanged snapshot and
-    /// cannot tell a working check that found nothing from one that never ran.
     last_error: Option<String>,
     channel_version: Option<String>,
-    /// The channel and slots used by the last attempt. A changed selection
-    /// invalidates its answer and makes the next poll due immediately.
     polled_address: String,
 }
 
-/// Why a preference write was refused.
 #[derive(Debug)]
 pub enum ConfigWriteError {
-    /// The update address breaks the shared rule. Nothing was written.
     InvalidAddress(String),
     Io(std::io::Error),
 }
 
-/// The gateway's one release check. Held on `GatewayInner` and shared by the
-/// backstop timer and the control endpoints.
 pub struct ReleaseCheck {
     origin: String,
     local_origin: OnceLock<String>,
     config_lock: Mutex<()>,
     interval: Duration,
-    /// True when the deployment may poll: installed, on a published target.
     supported: bool,
     shape: Option<InstallShape>,
-    /// Re-read the machine inventory for writes to the shared preference.
     desktop_app_present: fn() -> bool,
     command: Option<String>,
     target: Option<(&'static str, &'static str)>,
     config_path: Option<PathBuf>,
     current_version: &'static str,
     client: reqwest::Client,
-    /// Shared with the task that runs a poll, which outlives its caller.
     state: Arc<Mutex<ReleaseState>>,
-    /// Held across a poll so concurrent refreshes coalesce into one request.
     poll_lock: Arc<AsyncMutex<()>>,
 }
 
 impl ReleaseCheck {
-    /// The production check, against the real origin on the real interval.
     pub fn new(dep: &Deployment) -> Self {
         Self::with_origin(dep, UPDATE_CHECK_ORIGIN, POLL_INTERVAL)
     }
 
-    /// The check pointed at an arbitrary origin, for tests.
     pub fn with_origin(dep: &Deployment, origin: &str, interval: Duration) -> Self {
         let installed = deployment_is_installed(dep.packaged, dep.exe.as_deref());
         let target = platform_key(std::env::consts::OS).zip(arch_key(std::env::consts::ARCH));
@@ -360,8 +234,6 @@ impl ReleaseCheck {
             }
             _ => None,
         };
-        // Bound once, so the query parameter and the user agent read the same
-        // value by construction rather than by two lookups agreeing.
         let current_version = crate::LUCIDOS_RELEASE;
         ReleaseCheck {
             origin: origin.to_string(),
@@ -386,8 +258,6 @@ impl ReleaseCheck {
         }
     }
 
-    /// The newest published version, when the last answer named one later
-    /// than ours.
     pub fn latest_version(&self) -> Option<String> {
         let cfg = self.config();
         let st = self.state.lock().unwrap();
@@ -398,24 +268,10 @@ impl ReleaseCheck {
             .map(|release| release.version.clone())
     }
 
-    /// The current preference, re-read from disk on every call.
-    ///
-    /// Re-read rather than cached so turning the check off in Settings takes
-    /// effect on the next tick, with no gateway restart.
     pub fn config(&self) -> UpdatesToml {
         read_updates_toml(self.config_path.as_deref())
     }
 
-    /// Apply a partial change, re-reading the file immediately first.
-    ///
-    /// The partial shape is ADR 0132's: this file is machine-global and every
-    /// gateway on the machine writes it, unlike the paired-device store beside
-    /// it. `None` carries the stored value through instead of erroring, so a
-    /// body that names no field settles rather than failing. It still rewrites
-    /// the file, and it still creates one that was never written.
-    ///
-    /// An address is checked before anything is written, and stored in its
-    /// normalised form. `Some("")` resets it to the default.
     pub fn update_config(
         &self,
         enabled: Option<bool>,
@@ -444,10 +300,8 @@ impl ReleaseCheck {
         upsert: Option<&CustomSlot>,
         remove: Option<&str>,
     ) -> Result<(), ConfigWriteError> {
-        // Serialize the read/merge/rename within this gateway.
         let _guard = self.config_lock.lock().unwrap();
         let invalid = ConfigWriteError::InvalidAddress;
-        // The preference is machine-global: another gateway can write it too.
         let path = self.config_path.as_ref().ok_or_else(|| {
             ConfigWriteError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -487,13 +341,10 @@ impl ReleaseCheck {
         }
         if channel.is_some() || upsert.is_some() || remove.is_some() {
             let selected = Channel::parse(&cfg.channel).map_err(invalid)?;
-            // The machine-global pick may be consumed by a peer desktop app.
-            // Keep this gateway's polling and serving checks local to its shape.
             if matches!(selected, Channel::Beta | Channel::Local)
                 && !selected.serves(self.shape)
                 && (self.desktop_app_present)()
             {
-                // Local resolves against the consuming gateway's origin.
                 if selected != Channel::Local {
                     cfg.address().map_err(invalid)?;
                 }
@@ -561,13 +412,6 @@ impl ReleaseCheck {
         }
     }
 
-    /// May a request go out right now? Both gates, in one place.
-    ///
-    /// The deployment gate is absolute: a dev build never polls, whatever is
-    /// asked of it. The preference covers the AUTOMATIC check only, and `force`
-    /// is the Settings button, where the click is itself the request. Being
-    /// able to ask by hand is what makes turning the check off safe, and
-    /// Settings says so.
     fn may_poll(&self, force: bool) -> bool {
         if !self.supported {
             return false;
@@ -575,8 +419,6 @@ impl ReleaseCheck {
         force || self.config().enabled
     }
 
-    /// Has enough time passed since the last attempt? A changed address is
-    /// due at once, since the stored answer came from somewhere else.
     fn poll_is_due(&self, force: bool) -> bool {
         let floor = if force {
             FORCED_POLL_FLOOR
@@ -594,10 +436,6 @@ impl ReleaseCheck {
         }
     }
 
-    /// Poll if the answer is stale, then report what we know.
-    ///
-    /// Concurrent callers serialize on `poll_lock` and re-test staleness inside
-    /// it, so N windows asking at once produce one outbound request.
     pub async fn refresh(&self, force: bool) -> Value {
         if self.may_poll(force) && self.poll_is_due(force) {
             let guard = Arc::clone(&self.poll_lock).lock_owned().await;
@@ -608,24 +446,6 @@ impl ReleaseCheck {
         self.snapshot()
     }
 
-    /// One request, and what it did to the stored answer.
-    ///
-    /// A failure logs and clears the previous offer. It still moves
-    /// `last_attempt`, so a broken origin is asked once an interval rather than
-    /// on every refresh.
-    ///
-    /// `last_attempt` moves when the request FINISHES, not when it starts. That
-    /// is what makes a concurrent caller wait for the answer instead of reading
-    /// an empty one: a poll in flight still reads as due, so the caller queues
-    /// on `poll_lock` rather than returning past it.
-    ///
-    /// The request runs in its own task, which holds `guard` until the answer
-    /// is stored. A caller can stop listening at any await, such as a window
-    /// that hides mid-fetch, and must never cancel a request already sent.
-    /// That would leave `last_attempt` unmoved, and the next caller would send
-    /// another.
-    ///
-    /// A refused update address sends nothing. `snapshot` reports the refusal.
     async fn poll_once(&self, guard: OwnedMutexGuard<()>) {
         let Some((platform, arch)) = self.target else {
             return;
@@ -659,18 +479,9 @@ impl ReleaseCheck {
             record(&state, &url, cfg.key(), current_version, outcome);
             drop(guard);
         });
-        // A panic in the task already dropped the guard. The next due refresh
-        // asks again, and there is no answer here to wait for.
         let _ = poll.await;
     }
 
-    /// The `release_check` object on `GET /~/api/v1/control/gateway/status`.
-    ///
-    /// An older gateway omits the whole field, and the frontend reads that as
-    /// "no offer", which is the ADR 0105 degradation.
-    ///
-    /// `update_address` is the resolved app endpoint, or null for Stable.
-    /// A refusal populates `channel_error` and the older error fields too.
     pub fn snapshot(&self) -> Value {
         let cfg = self.config();
         let st = self.state.lock().unwrap();
@@ -732,7 +543,6 @@ impl ReleaseCheck {
     }
 }
 
-/// Fetch and read one answer, with the body size capped.
 async fn fetch(
     client: &reqwest::Client,
     url: &str,
@@ -758,7 +568,6 @@ async fn fetch(
     }
 }
 
-/// Store what one request to `update_address` came back with.
 fn record(
     state: &Mutex<ReleaseState>,
     url: &str,
@@ -769,8 +578,6 @@ fn record(
     let mut st = state.lock().unwrap();
     st.last_attempt = Some(Instant::now());
     if st.polled_address != update_address {
-        // The stored answer came from the other address. A failure here
-        // must not let it pass as this address's offer.
         st.latest = None;
         st.checked_at = None;
         st.polled_address = update_address;
@@ -792,13 +599,10 @@ fn record(
     }
 }
 
-/// Whether the stored answer belongs to the address in use. An answer from
-/// another address, or any answer under a refused one, offers nothing.
 fn answer_is_current(cfg: &UpdatesToml, address_ok: bool, st: &ReleaseState) -> bool {
     address_ok && st.polled_address == cfg.key()
 }
 
-/// A channel feed must describe a bundle for this target, under the shared transport rule.
 pub(crate) fn parse_feed(
     body: &str,
     platform: &str,

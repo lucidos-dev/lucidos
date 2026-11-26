@@ -60,8 +60,7 @@ ask the engine first, are refused while its question is open.
 ### Hidden: `lucidos cc-bash-guard`
 
 The PreToolUse hook Claude Code runs before every `Bash` call in a Lucidos
-session. It refuses two kinds of command, and the refusal tells the agent what
-to run instead:
+session. It checks standing denies with the engine before applying two local rules:
 
 - **Broad kills.** `ps` or `pgrep` output fed to `kill`, `pkill -f`, and any
   kill aimed at `claude`. A Claude Code process's argv names tools like
@@ -71,8 +70,11 @@ to run instead:
   whatever the allow rules say. The agent rewrites it with absolute paths, so
   the user never sees that permission card.
 
-It reads the command as text, so a quoted mention can trip it. It lets a call
-through when it cannot parse the payload. Do not call it directly.
+The local rules read the command as text, so a quoted mention can trip them.
+Inside Lucidos, an unreadable payload or an unverified standing deny decision
+refuses the call. Both hooks retry connection refusals for up to three seconds.
+If the refusal says the engine may be restarting, wait a few seconds and run
+the command again. The hook runs automatically.
 
 ### `lucidos data path <relative> [--mkdir]`
 

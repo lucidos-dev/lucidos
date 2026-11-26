@@ -66,6 +66,7 @@ Friction signals to pull:
 | Trigger failures | `TriggerCompleted` payloads whose `result_summary` carries an error. The engine never leaves `result_summary` empty. A run with no output falls back to `"<name> completed (no output)"` or `"<name> completed (exit <code>, no output)"`. Those lines are an **expected** idle-detector outcome (broad subscription + cheap internal gate), **not** friction. Never flag them as "produced no useful output". |
 | Interrupted runs | `TriggerRunInterrupted`: group by trigger and `retry` decision, linking the cut thread and any retry. Count once alongside its `ResponseAborted`. |
 | Dead triggers | `TriggerCreated` with zero matching `TriggerCompleted` since creation |
+| Event hook refusals | `EventHookRefused`: group by `slug`, then `cause`. A `refused` cause is the hook doing its job; the others mean the hook itself is broken. See `system-knowhow/event-hooks.md`. |
 | App errors | App emits its own error events, or `ToolResult` errors in app-spawned threads |
 | User corrections in chats | `MessageReceived` immediately following a `ResponseGenerated` / `ResponseAborted` / `ToolResult` whose text reads like a correction ("no", "don't", "stop", "actually", "that's wrong", "instead", "you misunderstood") |
 | Coding-agent sessions ending without a useful change | `CodingAgentIdled` followed by `ChangeDiscarded`, or no `ChangeProposed` at all when one was clearly expected |
@@ -149,6 +150,13 @@ The same correction shape recurs across threads ("the report is too long", "stop
 - SDK/CLI *shape drift* → `[engine]`. The real surface diverged from `system-knowhow/js-sdk.md` or `system-knowhow/lucidos-cli.md`, so the apps are right and the docs or engine are wrong.
 
 The tell: does updating the app fix it, or does the app need a surface that doesn't exist yet?
+
+#### 9. Event hook refusals clustered on one hook: `[workspace]`
+
+`EventHookRefused` rows clustered on one `slug`. Split by `cause`:
+
+- `crashed`, `timed-out`, `invalid-answer` or `changed`: the hook is broken, edited since its arming, or too slow. Read `detail` for the script's stderr. A `changed` hook refuses everything until the owner arms it again.
+- `refused`, repeated for the same actor: the agent or person keeps missing the rule. The fix is a refusal `reason` that says what to do, or a knowhow that teaches the rule before the attempt.
 
 ## Output
 

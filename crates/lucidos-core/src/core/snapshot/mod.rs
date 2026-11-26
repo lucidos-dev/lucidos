@@ -1,5 +1,3 @@
-//! Local workspace snapshots. The registry and restore journal live outside
-//! the workspace database and file tree.
 pub mod boot_guard;
 pub mod boundary;
 pub mod capacity;
@@ -29,7 +27,6 @@ use std::sync::{
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// One workspace-wide slot shared by backup, capture, check and restore.
 #[derive(Clone, Default)]
 pub struct ArchiveJobSlot(Arc<SlotState>);
 
@@ -57,9 +54,6 @@ impl ArchiveJobSlot {
             .map(|_| ArchiveJobGuard(self.0.clone()))
     }
 
-    /// Take the slot for a backup, waiting up to `limit` while a snapshot job
-    /// holds it. A running backup already serves the caller, so that returns
-    /// `Err(Busy::Backup)` at once.
     pub async fn acquire_for_backup(
         &self,
         limit: std::time::Duration,
@@ -88,7 +82,6 @@ impl ArchiveJobSlot {
     }
 }
 
-/// Who held the slot when a backup could not take it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Busy {
     Backup,
@@ -128,7 +121,6 @@ mod tests {
         assert!(!slot.is_busy());
     }
 
-    /// A scheduled backup must not vanish because a snapshot job held the slot.
     #[tokio::test]
     async fn a_backup_waits_out_a_snapshot_job_but_not_another_backup() {
         let slot = ArchiveJobSlot::default();

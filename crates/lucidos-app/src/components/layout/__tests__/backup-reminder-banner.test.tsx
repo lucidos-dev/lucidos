@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createRef } from 'preact';
 import { backupReminderBody, shouldRenderBanner } from '../BackupReminderBanner';
 import { bannerHeightValue } from '../appBanner';
 import { findByClass, textOf } from './vnodeWalk';
@@ -62,6 +63,17 @@ describe('backupReminderBody renders the bar', () => {
   it('carries no left-accent stripe hook', () => {
     const classes = findByClass(setup(), 'backup-reminder')[0].props.class as string;
     expect(classes).toBe('backup-reminder');
+  });
+
+  it('lands its measuring ref on the bar itself, not a wrapper', () => {
+    const ref = createRef<HTMLDivElement>();
+    const bar = backupReminderBody({
+      layout: 'desktop',
+      reminder: { state: 'setup', onSetUp: NOOP },
+      onDismiss: NOOP,
+      elRef: ref,
+    });
+    expect(findByClass(bar, 'backup-reminder')[0].ref).toBe(ref);
   });
 });
 

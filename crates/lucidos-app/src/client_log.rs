@@ -1,5 +1,3 @@
-//! Sanitized, classified diagnostics for the packaged desktop shell.
-//! Raw host output stays with the launching process; it is never a bundle source.
 use std::path::{Path, PathBuf};
 
 use lucidos_diagnostic_log as shared;
@@ -75,8 +73,6 @@ pub(crate) fn dir_for(app_data: &Path) -> PathBuf {
     app_data.join(shared::CLIENT_LOG_DIR)
 }
 
-/// Source development keeps its terminal and never writes the packaged app's
-/// data directory. The service owns a separate log and starts before this path.
 pub(crate) fn install() {
     if tauri::is_dev() || crate::launch_role(std::env::args_os()) == crate::LaunchRole::Service {
         return;
@@ -107,9 +103,6 @@ fn start(app_data: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A detached relaunch watcher must not depend on the dying client's pipe
-/// reader. Its small headless helper owns a separate rotating sink, avoiding
-/// concurrent writers to the client's segments.
 pub fn capture_relaunch() {
     register_environment_secrets();
     let mut input = std::io::stdin().lock();
@@ -121,15 +114,12 @@ pub fn capture_relaunch() {
         .and_then(|root| capture_relaunch_at(&root, &mut input));
     if let Err(error) = result {
         shared::stderr::host_error(&format!("[client] no relaunch diagnostic log ({error})"));
-        // Still drain: a logging failure must never SIGPIPE the relaunch watcher.
         let _ = std::io::copy(&mut input, &mut std::io::sink());
     }
 }
 
 fn capture_relaunch_at(root: &Path, input: impl std::io::Read) -> std::io::Result<()> {
     lucidos_home::ensure_storage_root(root)?;
-    // Rapid successive relaunches may overlap helpers. Serialize their writers,
-    // retaining the fixed two-segment cap rather than creating per-run files.
     let _owner =
         lucidos_owner_lock::OwnerLock::acquire(&root.join("client-relaunch-diagnostic-log.lock"))?;
     shared::start(&root.join(shared::CLIENT_RELAUNCH_LOG_DIR))?;
@@ -149,8 +139,6 @@ fn register_environment_secrets() {
     }
 }
 
-/// Spawn capture before the watcher, so the watcher always has a reader after
-/// this client exits. The helper never initializes Tauri or takes a client lock.
 #[cfg(target_os = "macos")]
 pub(crate) fn relaunch_output(exe: &Path) -> std::io::Result<std::process::Stdio> {
     use std::process::{Command, Stdio};
@@ -268,8 +256,6 @@ mod tests {
                 register_environment_secrets();
                 capture_relaunch_at(Path::new(&root), std::io::stdin().lock()).unwrap();
             } else {
-                // This child must outlive the simulated GUI process. Waiting
-                // here would deadlock: the test releases it after this exits.
                 #[allow(clippy::zombie_processes)]
                 let mut helper = Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -288,7 +274,6 @@ mod tests {
                     "PRIVATE_RELAUNCH_MARKER opaque-client-credential"
                 )
                 .unwrap();
-                // The process exits without waiting for capture, as the GUI does.
             }
             return;
         }

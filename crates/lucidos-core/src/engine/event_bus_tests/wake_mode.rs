@@ -1,6 +1,3 @@
-//! A child's *wake mode* at the fan-in: I1, I2, I3 and I6 of
-//! `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`.
-
 use super::super::parent_callback::Delivery;
 use super::*;
 use crate::engine::thread_events::{AbortCause, ChildCompletionStatus};
@@ -24,7 +21,6 @@ fn reply(text: &str) -> ThreadEvent {
     }
 }
 
-/// Spawn one more chat child of `parent_id` under `wake_mode`.
 async fn spawn_child(bus: &EventBus, parent_id: Uuid, wake_mode: WakeMode) -> Uuid {
     let child_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
@@ -74,9 +70,6 @@ async fn parent_row(pool: &PgPool, thread_id: Uuid) -> (String, String) {
         .unwrap()
 }
 
-/// I2 and I3 as a table. `no-wake` files every report, whatever its status
-/// and whatever the engine recorded. The other modes decide only a clean
-/// finish, and a recorded yes wakes under them.
 #[test]
 fn no_wake_files_everything_and_the_other_modes_decide_a_clean_finish() {
     use ChildCompletionStatus::*;
@@ -108,8 +101,6 @@ fn no_wake_files_everything_and_the_other_modes_decide_a_clean_finish() {
     }
 }
 
-/// I1: a no-wake child's clean report is filed, starts no parent turn, and
-/// leaves the parent's row alone, with no decision recorded at all.
 #[tokio::test]
 async fn a_no_wake_report_is_filed_without_a_decision() {
     let (pool, db_name) = setup_test_db().await;
@@ -130,7 +121,6 @@ async fn a_no_wake_report_is_filed_without_a_decision() {
     teardown_test_db(&db_name).await;
 }
 
-/// The newest `ChildReportFiled` on `parent_id`: its status.
 async fn newest_filed_status(pool: &PgPool, parent_id: Uuid) -> String {
     sqlx::query_scalar(
         "SELECT payload->>'status' FROM events \
@@ -143,8 +133,6 @@ async fn newest_filed_status(pool: &PgPool, parent_id: Uuid) -> String {
     .unwrap()
 }
 
-/// I1: a no-wake child that fails files its report. The user reads the
-/// failure in the child, so the parent's row stays as it was.
 #[tokio::test]
 async fn a_failed_no_wake_child_files_its_report() {
     let (pool, db_name) = setup_test_db().await;
@@ -175,7 +163,6 @@ async fn a_failed_no_wake_child_files_its_report() {
     teardown_test_db(&db_name).await;
 }
 
-/// I1: the engine's own yes (a cut-short turn) files under no-wake too.
 #[tokio::test]
 async fn an_engine_recorded_wake_still_files_under_no_wake() {
     let (pool, db_name) = setup_test_db().await;
@@ -194,10 +181,6 @@ async fn an_engine_recorded_wake_still_files_under_no_wake() {
     teardown_test_db(&db_name).await;
 }
 
-/// I2, the reported regression. A retired build chain's planner handed off and idled.
-/// A restart then cut its `no-wake` chain member mid-turn. The planner was not
-/// running, so the cut must not start a planner turn: the `interrupted`
-/// report is filed once, and a second boot re-fires nothing.
 #[tokio::test]
 async fn a_restart_cut_chain_member_does_not_start_its_handed_off_planner() {
     let (pool, db_name) = setup_test_db().await;
@@ -241,7 +224,6 @@ async fn a_restart_cut_chain_member_does_not_start_its_handed_off_planner() {
     teardown_test_db(&db_name).await;
 }
 
-/// I3: an orchestrator that declared `wake` still hears of a restart cut.
 #[tokio::test]
 async fn a_restart_cut_wake_child_still_wakes_its_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -263,8 +245,6 @@ async fn a_restart_cut_wake_child_still_wakes_its_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// A `ChildThreadCompleted` written for `child_id` before this rule, left as
-/// `parent_id`'s last word: the shape the boot sweep reads.
 async fn emit_legacy_card(bus: &EventBus, parent_id: Uuid, child_id: Uuid) {
     emit(
         bus,
@@ -282,8 +262,6 @@ async fn emit_legacy_card(bus: &EventBus, parent_id: Uuid, child_id: Uuid) {
     .await;
 }
 
-/// I5: the boot sweep re-fires no card a `no-wake` child left under the old
-/// rule, on any boot. A card from any other child still re-fires.
 #[tokio::test]
 async fn the_boot_sweep_skips_a_legacy_no_wake_card() {
     let (pool, db_name) = setup_test_db().await;
@@ -312,7 +290,6 @@ async fn the_boot_sweep_skips_a_legacy_no_wake_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// I6: the batch files each report while a sibling works, and the last wakes.
 #[tokio::test]
 async fn the_last_child_of_a_batch_wakes_its_parent() {
     let (pool, db_name) = setup_test_db().await;
@@ -338,8 +315,6 @@ async fn the_last_child_of_a_batch_wakes_its_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// I6: two batch terminals that both commit before either fan-in runs both
-/// wake. The second child's committed terminal is modelled by its idle row.
 #[tokio::test]
 async fn two_batch_children_finishing_together_both_wake() {
     let (pool, db_name) = setup_test_db().await;
@@ -365,8 +340,6 @@ async fn two_batch_children_finishing_together_both_wake() {
     teardown_test_db(&db_name).await;
 }
 
-/// I6: a sibling outside the batch does not hold it, and a batch sibling
-/// holding a live event wait does.
 #[tokio::test]
 async fn only_working_batch_siblings_hold_the_batch() {
     let (pool, db_name) = setup_test_db().await;
@@ -406,9 +379,6 @@ async fn only_working_batch_siblings_hold_the_batch() {
     teardown_test_db(&db_name).await;
 }
 
-/// A batch sibling that handed off holds the batch until its successor's row
-/// exists, since the Thread Queue may hold the spawn. Then the successor
-/// counts as the sibling, so its idle releases the batch.
 #[tokio::test]
 async fn a_handed_off_sibling_holds_the_batch_until_its_successor_lands() {
     let (pool, db_name) = setup_test_db().await;
@@ -450,8 +420,6 @@ async fn a_handed_off_sibling_holds_the_batch_until_its_successor_lands() {
     teardown_test_db(&db_name).await;
 }
 
-/// I6: the last batch child can end in an abort that sends no card of its own.
-/// It then sends a failure card, so the filed reports reach a woken parent.
 #[tokio::test]
 async fn a_card_less_abort_ending_a_batch_still_wakes() {
     let (pool, db_name) = setup_test_db().await;

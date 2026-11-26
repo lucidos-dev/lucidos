@@ -1,5 +1,3 @@
-//! Cached fragments contain serialized wire values, never handwritten prose.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -48,7 +46,7 @@ pub(super) fn render(root: &Path) -> String {
     block!(CancelCause; UserStop, UserAction, SupersededByFollowup, EffortRestart, Refused, Hold, Unknown);
     block!(AbortCause; EngineShutdown, SafetyNet, RecoveryAfterRestart, ProcessKilled, StaleSettle, SessionDropped, SnapshotRestored, Unknown);
     block!(UnproposedReason; PlanMissing, PlanChanged, PlanUnreadable, PlanAwaitingApproval, PlanOnlyCode, OutsideBound, HardeningMissing,
-        TurnIncomplete, AwaitingLanding, IntegratedIntoParent, CarriedBySuccessor);
+        TurnIncomplete, AwaitingLanding, IntegratedIntoParent, CarriedBySuccessor, HookRefused);
     block!(EngineReason;
         ContinuationStarted, OrphanRecovery,
         Scheduler { trigger_id: String::new(), trigger_name: None, actor_email: None },
@@ -184,7 +182,6 @@ mod tests {
                     ("Unknown", Renamed::Unknown),
                 ],
             );
-            // Pin the fixture's explicit serde rename, not a production spelling.
             assert!(fragment.contains("`fixture-stop`"));
             let manifest: serde_json::Value = serde_json::from_str(&render(&root)).unwrap();
             assert_ne!(

@@ -1,7 +1,3 @@
-//! Verification is the whole security surface of a public endpoint. It is
-//! tested here as pure functions, against the three real senders it claims to
-//! cover.
-
 use super::*;
 use crate::core::webhook_refusal::RefusalCause;
 
@@ -69,8 +65,6 @@ fn stripe_config() -> HmacConfig {
     }
 }
 
-// ── The bearer token ─────────────────────────────────────────────────────
-
 #[test]
 fn a_bearer_token_is_read_out_of_the_authorization_header() {
     assert_eq!(presented_bearer(Some("Bearer abc123")), Some("abc123"));
@@ -116,8 +110,6 @@ fn the_stored_token_is_a_digest_and_never_the_token() {
     assert_eq!(stored.len(), 64);
     assert_eq!(stored, digest("s3cret"));
 }
-
-// ── The three senders the config claims to cover ─────────────────────────
 
 #[test]
 fn a_github_delivery_verifies() {
@@ -175,14 +167,6 @@ fn a_stripe_delivery_reads_both_fields_out_of_one_header() {
     assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
 }
 
-// ── The digests the senders themselves publish ───────────────────────────
-//
-// The three tests above round-trip: they build the expected signature with our
-// own `sign`, so they prove the pieces agree with each other and nothing more.
-// A pinned digest is the other half. It fails if `sign`, `canonical_string` or
-// either extractor changes what it computes, however self-consistently.
-
-/// GitHub's own documented example, secret and payload both.
 #[test]
 fn the_github_vector_from_their_docs_verifies() {
     let cfg = github_config();
@@ -203,8 +187,6 @@ fn the_github_vector_from_their_docs_verifies() {
     assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
 }
 
-/// Slack's own documented example. The timestamp is signed with the body, so
-/// this pins the template as well as the digest.
 #[test]
 fn the_slack_vector_from_their_docs_verifies() {
     let cfg = slack_config();
@@ -233,14 +215,11 @@ fn the_slack_vector_from_their_docs_verifies() {
         signature_header: Some(&header),
         timestamp_header: Some("1531420618"),
         body,
-        // Slack's example is from 2018, so a real clock would replay-refuse it.
         now_unix: signed_at,
     };
     assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
 }
 
-/// Stripe publishes no vector, so this one is frozen rather than quoted. It
-/// still fails on a change to what the engine computes, which is the point.
 #[test]
 fn the_frozen_stripe_vector_verifies() {
     let cfg = stripe_config();
@@ -262,8 +241,6 @@ fn the_frozen_stripe_vector_verifies() {
     assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
 }
 
-// ── What must be refused ─────────────────────────────────────────────────
-
 #[test]
 fn a_wrong_signature_is_refused() {
     let hook = hook_with(None, Some(github_config()));
@@ -282,8 +259,6 @@ fn a_wrong_signature_is_refused() {
 
 #[test]
 fn a_body_edited_after_signing_is_refused() {
-    // The reason the body reaches the engine byte-for-byte. One character of
-    // whitespace changes the digest.
     let cfg = github_config();
     let secret = "secret";
     let expected = sign(&cfg, secret, r#"{"a":1}"#);
@@ -320,8 +295,6 @@ fn a_missing_signature_header_is_refused() {
 
 #[test]
 fn a_bare_digest_does_not_satisfy_a_prefixed_scheme() {
-    // Stripping a prefix that is not there would accept a digest computed for
-    // some other scheme entirely.
     let cfg = github_config();
     let secret = "secret";
     let body = "{}";
@@ -354,7 +327,6 @@ fn a_replayed_delivery_is_refused_once_it_is_stale() {
         signature_header: Some(&header),
         timestamp_header: Some("1700000000"),
         body,
-        // Half an hour later, well past the five-minute tolerance.
         now_unix: signed_at + 1800,
     };
     assert_eq!(
@@ -431,9 +403,6 @@ fn a_tolerance_with_no_timestamp_refuses_rather_than_skipping_the_check() {
 
 #[test]
 fn an_extreme_timestamp_is_refused_rather_than_overflowing() {
-    // The header is written by a public caller. A plain `(now - parsed).abs()`
-    // panics on these in a debug build and wraps in a release one, so the
-    // caller would be choosing which. Both ends refuse instead.
     let now = 1_700_000_000;
     for extreme in [i64::MIN, i64::MIN + 1, i64::MAX, -1, 0] {
         assert!(
@@ -441,10 +410,8 @@ fn an_extreme_timestamp_is_refused_rather_than_overflowing() {
             "timestamp {extreme} must be refused"
         );
     }
-    // The same arithmetic from the other side, with `now` itself extreme.
     assert!(!timestamp_within_tolerance(Some(300), Some("0"), i64::MAX));
     assert!(!timestamp_within_tolerance(Some(300), Some("0"), i64::MIN));
-    // A nonsensical tolerance admits nothing rather than wrapping.
     assert!(!timestamp_within_tolerance(
         Some(-1),
         Some("1700000000"),
@@ -505,15 +472,12 @@ fn both_verifiers_must_pass_when_both_are_configured() {
     );
 }
 
-// ── Field extraction ─────────────────────────────────────────────────────
-
 #[test]
 fn a_key_is_matched_whole_inside_a_pair_list() {
     let cfg = stripe_config();
     let header = "t=1700000000,v1=abc,v10=wrong";
     assert_eq!(extract_signature(&cfg, header), Some("abc"));
     assert_eq!(extract_timestamp(&cfg, header, None), Some("1700000000"));
-    // A key that is merely a suffix of another must not resolve.
     assert_eq!(extract_signature(&cfg, "xv1=abc"), None);
 }
 
@@ -549,8 +513,6 @@ fn a_constant_time_compare_still_compares() {
     assert!(!ct_eq("abc", "abcd"));
     assert!(ct_eq("", ""));
 }
-
-// ── Slack's URL check ────────────────────────────────────────────────────
 
 const SLACK_CHALLENGE: &str = r#"{"token":"t","challenge":"3eZbrw1aB","type":"url_verification"}"#;
 
@@ -594,8 +556,6 @@ fn only_a_url_check_on_a_slack_hook_echoes() {
     }
 }
 
-// ── The store, against a real database ───────────────────────────────────
-
 #[tokio::test]
 async fn every_mutation_announces_and_the_row_holds_no_token() {
     let (pool, db) = crate::test_support::setup_test_db().await;
@@ -622,8 +582,6 @@ async fn every_mutation_announces_and_the_row_holds_no_token() {
     let token = token.expect("an unsigned hook authenticates by token, so it gets one");
     assert_eq!(token.len(), 64);
 
-    // The token is unrecoverable: only its digest was written, and the whole
-    // row read back as text does not contain it.
     let row: String = sqlx::query_scalar("SELECT webhooks::text FROM webhooks WHERE id = $1")
         .bind(hook.id)
         .fetch_one(&pool)
@@ -632,7 +590,6 @@ async fn every_mutation_announces_and_the_row_holds_no_token() {
     assert!(!row.contains(&token), "the row leaked the token");
     assert!(row.contains(&digest(&token)));
 
-    // A delivery presenting that token verifies against what was stored.
     let stored = WebhookStore::get(&pool, hook.id).await.unwrap().unwrap();
     let authorization = format!("Bearer {token}");
     let presented = PresentedDelivery {
@@ -670,7 +627,6 @@ async fn every_mutation_announces_and_the_row_holds_no_token() {
             .enabled
     );
 
-    // An update that matched no row announces nothing.
     assert!(WebhookStore::update(
         &pool,
         &bus,
@@ -704,10 +660,6 @@ async fn every_mutation_announces_and_the_row_holds_no_token() {
 
 #[tokio::test]
 async fn a_signed_hook_gets_no_token_so_a_real_sender_can_reach_it() {
-    // The bug this pins: `create` used to mint a token unconditionally, and
-    // `verify` requires every verifier the row carries. A GitHub hook was
-    // therefore born refusing every delivery GitHub could send, since GitHub
-    // attaches no bearer token.
     let (pool, db) = crate::test_support::setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -734,7 +686,6 @@ async fn a_signed_hook_gets_no_token_so_a_real_sender_can_reach_it() {
     let stored = WebhookStore::get(&pool, hook.id).await.unwrap().unwrap();
     assert!(stored.token_hash.is_none());
 
-    // Exactly what GitHub sends: a signature, and no Authorization header.
     let header = format!("sha256={expected}");
     let delivery = PresentedDelivery {
         authorization: None,
@@ -748,12 +699,6 @@ async fn a_signed_hook_gets_no_token_so_a_real_sender_can_reach_it() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// The whole reason `hmac` became editable: a hook keeps its delivery URL
-/// across a change of verifier, so the sender it was given to keeps working.
-///
-/// Each transition also moves the OTHER verifier, because `verify` requires
-/// every one a row carries. A hook holding both would refuse every real signed
-/// delivery, and a hook holding neither cannot be stored at all.
 #[tokio::test]
 async fn changing_the_verifier_swaps_it_whole_and_keeps_the_url() {
     let (pool, db) = crate::test_support::setup_test_db().await;
@@ -773,7 +718,6 @@ async fn changing_the_verifier_swaps_it_whole_and_keeps_the_url() {
     .unwrap();
     assert!(token.is_some(), "an unsigned hook authenticates by token");
 
-    // Unsigned to signed. The token has to go, or GitHub could never reach it.
     let (signed, minted) = WebhookStore::update(
         &pool,
         &bus,
@@ -800,7 +744,6 @@ async fn changing_the_verifier_swaps_it_whole_and_keeps_the_url() {
     };
     assert_eq!(verify(&signed, &delivery, Some(secret)), Ok(()));
 
-    // A rotation: same hook, same URL, a different credential named.
     let mut rotated_cfg = github_config();
     rotated_cfg.credential = "example-repo-webhook-2026".into();
     let (rotated, _) = WebhookStore::update(
@@ -822,8 +765,6 @@ async fn changing_the_verifier_swaps_it_whole_and_keeps_the_url() {
         "example-repo-webhook-2026"
     );
 
-    // Signed back to unsigned. A token is minted, or the row would carry no
-    // verifier and the table's CHECK would refuse it.
     let (unsigned, fresh) = WebhookStore::update(
         &pool,
         &bus,
@@ -851,7 +792,6 @@ async fn changing_the_verifier_swaps_it_whole_and_keeps_the_url() {
         Some(digest(&fresh).as_str())
     );
 
-    // The row still holds no readable secret, after all of that.
     let stored: String = sqlx::query_scalar("SELECT webhooks::text FROM webhooks WHERE id = $1")
         .bind(hook.id)
         .fetch_one(&pool)
@@ -865,9 +805,6 @@ async fn changing_the_verifier_swaps_it_whole_and_keeps_the_url() {
 
 #[tokio::test]
 async fn a_webhook_with_no_verifier_at_all_cannot_be_stored() {
-    // The floor under "a webhook needs at least one verifier". The HTTP layer
-    // refuses it first. This is the row that must be impossible anyway, since
-    // it would be reachable from the public internet with nothing to check.
     let (pool, db) = crate::test_support::setup_test_db().await;
     let result = sqlx::query(
         "INSERT INTO webhooks (id, name, event_type, token_hash, hmac) \
@@ -881,11 +818,6 @@ async fn a_webhook_with_no_verifier_at_all_cannot_be_stored() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// Every arm carries both its words and its key, and the two never swap.
-///
-/// The key is stored JSON and reaches the wire, so it is frozen. The reason is
-/// prose on a page and may be reworded. A test that let them share one string
-/// would make the next rewording a silent schema change.
 #[test]
 fn every_refusal_has_a_stable_key_and_its_own_words() {
     let mut keys = std::collections::HashSet::new();
@@ -904,8 +836,6 @@ fn every_refusal_has_a_stable_key_and_its_own_words() {
         );
     }
 
-    // Exactly one arm examined nothing, and that is what earns it its own
-    // words in `core::webhook_refusal`.
     let unexamined: Vec<&str> = DeliveryRefusal::ALL
         .into_iter()
         .filter(|r| !r.examined_the_delivery())
@@ -914,11 +844,6 @@ fn every_refusal_has_a_stable_key_and_its_own_words() {
     assert_eq!(unexamined, vec!["disabled"]);
 }
 
-/// The evidence a real outage leaves must survive a diagnostic probe.
-///
-/// `last_refusal_reason` holds only the last one, so a hand-run `curl` while
-/// investigating overwrites exactly the field you came to read. The run is
-/// what makes that harmless.
 #[tokio::test]
 async fn a_refusal_run_accumulates_and_one_probe_cannot_erase_it() {
     let (pool, db) = crate::test_support::setup_test_db().await;
@@ -958,8 +883,6 @@ async fn a_refusal_run_accumulates_and_one_probe_cannot_erase_it() {
         "the database measures the age, so it is never absent on a live run"
     );
 
-    // The investigator's own unsigned probe, against the same live hook. It
-    // lands as its own reason, and the forty behind it are untouched.
     WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::SignatureMissing)
         .await
         .unwrap();
@@ -981,9 +904,6 @@ async fn a_refusal_run_accumulates_and_one_probe_cannot_erase_it() {
         "the old column still names the last one, which is what it is for"
     );
 
-    // A refusal of the OTHER cause restarts the run, so the count and the
-    // tally never describe two faults at once. Reachable only by the user
-    // switching the hook off, since a live hook cannot answer `disabled`.
     WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::Disabled)
         .await
         .unwrap();
@@ -997,8 +917,6 @@ async fn a_refusal_run_accumulates_and_one_probe_cannot_erase_it() {
     );
     assert_ne!(switched.refusal_run.since, Some(started));
 
-    // One delivery that verified ends the run whole. That is the positive
-    // evidence a recovery rests on.
     WebhookStore::record_accepted(&pool, hook.id).await.unwrap();
     let accepted = read(&pool, hook.id).await;
     assert!(!accepted.refusal_run.is_running());
@@ -1015,12 +933,6 @@ async fn a_refusal_run_accumulates_and_one_probe_cannot_erase_it() {
     crate::test_support::teardown_test_db(&db).await;
 }
 
-/// Moving the enabled flag ends the run, because the flag IS one of the causes.
-///
-/// A run left standing across a switch describes a fault that is over. Its
-/// count and tally then get re-reported under the other cause's words. That is
-/// how a hook switched off after an hour of signature failures comes to read
-/// "every one was refused before it was read".
 #[tokio::test]
 async fn moving_the_enabled_flag_ends_the_refusal_run() {
     let (pool, db) = crate::test_support::setup_test_db().await;
@@ -1054,8 +966,6 @@ async fn moving_the_enabled_flag_ends_the_refusal_run() {
     }
     assert_eq!(read(&pool, hook.id).await.refusal_run.refusals, 42);
 
-    // A PUT that touches something else leaves the run alone. So does one
-    // resending the flag the row already carries.
     WebhookStore::update(&pool, &bus, hook.id, patch(None), None)
         .await
         .unwrap();
@@ -1069,7 +979,6 @@ async fn moving_the_enabled_flag_ends_the_refusal_run() {
     );
     assert_eq!(untouched.cause, Some(RefusalCause::Verification));
 
-    // Switching it off ends the run whole, exactly as an acceptance does.
     WebhookStore::update(&pool, &bus, hook.id, patch(Some(false)), None)
         .await
         .unwrap();
@@ -1085,7 +994,6 @@ async fn moving_the_enabled_flag_ends_the_refusal_run() {
         "the stamps are a history, so ending the run does not erase them"
     );
 
-    // The next delivery starts an honest one, in the words the flag earns.
     WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::Disabled)
         .await
         .unwrap();

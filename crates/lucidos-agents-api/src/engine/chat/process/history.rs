@@ -1,12 +1,3 @@
-//! Conversation-history + resume-context loading for a chat turn. Derives the
-//! stringified `[CONVERSATION HISTORY]` block, the verbatim resume tool
-//! blocks, and the per-thread loaded-knowhow set from a single events fetch.
-//! Split out of `process_message_with_steps_internal`.
-//!
-//! **Every message here belongs to this thread** (ADR 0124). The one fetch is
-//! `get_thread_events`, so a turn cannot read another conversation. Cross-thread
-//! continuity is long-term memory's job.
-
 use std::collections::HashMap;
 
 use crate::core::events::{image_handle, thread_image_refs_of};
@@ -30,18 +21,6 @@ use super::super::images::{
 use super::super::process_helpers::summarize_or_none;
 use super::context_build::summarize_user_topics;
 
-/// The speaker name a `[CONVERSATION HISTORY]` line is printed under.
-///
-/// A second agent on the thread speaks under its own name (ADR 0150). Print a
-/// guest as `Assistant` and the doer reads its turn as its own prior turn,
-/// so two models echo each other into agreement. Print it as `User` and the
-/// doer obeys an instruction nobody gave.
-///
-/// On a team gateway a typed message reads under its user's
-/// name from `users`, so the agent can tell Sam from Alex (ADR 0649).
-///
-/// A free function rather than a line inside the formatter, so the rule has one
-/// definition that a test can reach.
 pub(super) fn speaker_label<'a>(
     m: &'a crate::core::store::SessionMessage,
     users: &crate::gateway_users::UserSnapshot,
@@ -114,8 +93,6 @@ pub(super) fn bodies_of_loaded_knowhow(docs: &[LoadedKnowhow]) -> Vec<&str> {
     docs.iter().map(|d| d.body.as_str()).collect()
 }
 
-/// The current turn appends its own prompt. Older callers without a request
-/// id can only recognize a trailing match by text.
 pub(super) fn remove_current_prompt(
     messages: &mut Vec<crate::core::store::SessionMessage>,
     request_id: Option<Uuid>,
@@ -141,30 +118,16 @@ pub(super) fn remove_current_prompt(
     }
 }
 
-/// Result of [`LucidosEngine::load_chat_history`]: everything derived from the
-/// single per-thread events fetch that the rest of the turn consumes.
 pub(super) struct ChatHistoryLoad {
-    /// Verbatim `(ToolUse, ToolResult)` Message pairs for the most recent N
-    /// tool calls, prepended to the LLM messages vec. A knowhow body in one
-    /// is stubbed.
     pub resume_tool_blocks: Vec<Message>,
-    /// The thread's loaded knowhow this turn (ADR 0425), consumed by the
-    /// resume-block stub, history body-strip, `[LOADED KNOWHOW]` block, and
-    /// capture sections.
     pub loaded_knowhow_docs: Vec<LoadedKnowhow>,
-    /// Stringified `[CONVERSATION HISTORY]` block (may be trimmed by budget).
     pub history_context: String,
-    /// 500-char extraction summary fed to memory classification/extraction.
     pub conversation_summary: String,
-    /// Per-message image hashes carried into the LLM content builder.
     pub history_image_hashes: Vec<Vec<String>>,
 }
 
 #[easy_ext::ext(HistoryExt)]
 pub(crate) impl LucidosEngine {
-    /// Load conversation history + resume tool blocks + loaded knowhow for a
-    /// chat turn. Verbatim extraction of the inline block from
-    /// `process_message_with_steps_internal`.
     async fn load_chat_history(
         &self,
         skip_history: bool,
@@ -172,21 +135,9 @@ pub(crate) impl LucidosEngine {
         thread_id: Uuid,
         user_message: &str,
         turn_started_at: chrono::DateTime<Utc>,
-        // The turn's gates. Two shape the history:
-        // - ADR 0109: the conversation summariser is off under the context
-        //   mode, whose notes already compress the older region.
-        // - ADR 0362: under the Tree memory module the thread memory view
-        //   carries this thread's past, so neither history nor summariser runs.
         gates: &crate::llm::ToolCapabilities,
     ) -> ChatHistoryLoad {
         let context_mode = super::context_mode::ContextMode::from_capabilities(gates);
-        // Two turn shapes carry no conversation history, and both render the
-        // same empty load (ADR 0124). A trigger has no conversation. A send
-        // with no thread id has no history of its own, and it must not borrow
-        // anyone else's: it used to seed itself from the 32 most recently
-        // active threads, which is what put other conversations in this one's
-        // prompt. Memory recall runs on this turn like any other, so what
-        // carries across threads still reaches it.
         if skip_history {
             return ChatHistoryLoad {
                 resume_tool_blocks: Vec::new(),
@@ -216,26 +167,12 @@ pub(crate) impl LucidosEngine {
             };
         }
 
-        // Resume tool blocks: full ToolUse + ToolResult Message pairs for the
-        // most recent N tool calls (Phase 3), with no knowhow body in them
-        // (`build_resume_tool_blocks_with_skip_ids`).
         let mut resume_tool_blocks: Vec<Message> = Vec::new();
         let mut resume_skip_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // The thread's loaded knowhow, folded from the same events below
-        // (ADR 0425). Consumed by (a) the resume-block body stub (by id), (b)
-        // `format_history_content`'s body-strip (by exact body substring),
-        // (c) the `[LOADED KNOWHOW]` user-message block, and (d)
-        // `build_capture_sections`.
         let mut loaded_knowhow_docs: Vec<crate::engine::loaded_knowhow::LoadedKnowhow> = Vec::new();
-        // The thread's cached conversation summary, from the same events walk.
-        // `None` before its first successful summarisation (ADR 0102).
         let mut cached_summary: Option<crate::core::store::CachedSummary> = None;
 
-        // One fetch of this thread's events, several consumers, each borrowing
-        // from it rather than cloning anew. It yields the SessionMessage
-        // history, the resume tool blocks, the loaded knowhow and the cached
-        // summary. Fetching per consumer ran the same SQL repeatedly.
         let (history_context, conversation_summary, history_image_hashes) = {
             let messages_result = match self
                 .event_store
@@ -289,18 +226,12 @@ pub(crate) impl LucidosEngine {
 
             match messages_result {
                 Ok((messages, image_walk, held_request)) => {
-                    // All messages except the one that woke this turn. It is
-                    // the newest message the agent reads, though user-only
-                    // messages posted since may follow it.
                     let mut all_prior = messages;
                     remove_current_prompt(&mut all_prior, held_request, user_message);
 
                     let prior_image_hashes: Vec<Vec<String>> =
                         filter_recent_history_image_hashes(&all_prior, MAX_HISTORY_IMAGE_MESSAGES);
 
-                    // Per-message flag: is this message's image data included in the
-                    // LLM context? Used by format_history_msg to annotate dropped
-                    // images with "image not included, may be outdated".
                     let image_data_included: Vec<bool> = {
                         let cutoff = image_recency_cutoff(&all_prior, MAX_HISTORY_IMAGE_MESSAGES);
                         let mut user_idx = 0usize;
@@ -319,19 +250,11 @@ pub(crate) impl LucidosEngine {
                             .collect()
                     };
 
-                    // Where each message's images sit in the resolver's own
-                    // walk, so the history's thread:N is the one the tools
-                    // resolve (e.g. "[attached image (thread:3, img-…)]").
                     let image_starts = locate_message_images(&all_prior, &image_walk);
 
                     let loaded_knowhow_bodies = bodies_of_loaded_knowhow(&loaded_knowhow_docs);
                     let users = crate::gateway_users::current();
 
-                    // Format a message for history context with tiered truncation.
-                    // - Last HISTORY_VERBATIM_TAIL messages: fully verbatim (only 15K safety net)
-                    // - Earlier messages: user messages verbatim, assistant messages compacted to ~1500 chars
-                    // `msg_idx` indexes into `all_prior`, `image_starts` and
-                    // `image_data_included`.
                     let format_history_msg = |m: &crate::core::store::SessionMessage,
                                               is_verbatim: bool,
                                               msg_idx: usize|
@@ -344,7 +267,6 @@ pub(crate) impl LucidosEngine {
                             &loaded_knowhow_bodies,
                         );
                         let n = m.image_handles.len();
-                        // User-attached (with staleness tracking) or generated
                         let (label, stale_note) = if m.role == "user" {
                             let included =
                                 image_data_included.get(msg_idx).copied().unwrap_or(false);
@@ -358,7 +280,6 @@ pub(crate) impl LucidosEngine {
                             ("generated", "")
                         };
                         let image_note = if n == 0 {
-                            // No image data, but if a description survived, show it as text context
                             m.image_description
                                 .as_ref()
                                 .map(|d| format!(" [image description: {}]", d))
@@ -381,11 +302,6 @@ pub(crate) impl LucidosEngine {
                                 count_prefix, range, age, stale_note, desc_suffix
                             )
                         };
-                        // Assistant turns may have only tool calls; m.content covers prose only.
-                        // Tools whose `tool_called_event_id` is in `resume_skip_ids`
-                        // are already represented as full Message::Blocks(...) pairs
-                        // prepended to the LLM messages vec — suppress the
-                        // duplicate `[tools: ...]` summary for them.
                         let steps_summary = if m.role == "assistant" {
                             format_history_steps(&m.steps, &resume_skip_ids).unwrap_or_default()
                         } else {
@@ -394,8 +310,6 @@ pub(crate) impl LucidosEngine {
                         format!("{}: {}{}{}", role, content, steps_summary, image_note)
                     };
 
-                    // Format messages with tiered truncation based on position.
-                    // `idx_offset` is where `msgs` starts in `all_prior`.
                     let format_tiered = |msgs: &[crate::core::store::SessionMessage],
                                          idx_offset: usize|
                      -> Vec<String> {
@@ -409,7 +323,6 @@ pub(crate) impl LucidosEngine {
                     if all_prior.is_empty() {
                         (String::new(), user_message.to_string(), prior_image_hashes)
                     } else if all_prior.len() <= HISTORY_COMPRESS_THRESHOLD {
-                        // Short conversation — include all messages with tiered truncation
                         let turns = format_tiered(&all_prior, 0);
                         let history = format!(
                             "[CONVERSATION HISTORY (recent)]\n{}\n[END HISTORY]",
@@ -418,18 +331,12 @@ pub(crate) impl LucidosEngine {
                         let summary = summarize_user_topics(&all_prior, user_message);
                         (history, summary, prior_image_hashes)
                     } else {
-                        // Long conversation. The older region keeps every user
-                        // turn verbatim and compresses only the assistant side
-                        // (ADR 0102).
                         let split_point = all_prior.len().saturating_sub(HISTORY_RECENT_MESSAGES);
                         let older = &all_prior[..split_point];
                         let recent = &all_prior[split_point..];
 
                         let plan = SummaryPlan::for_region(older, cached_summary.as_ref());
 
-                        // Detached, so `plan` is what this turn renders either
-                        // way. A fresh paragraph reaches the NEXT turn through
-                        // the cache.
                         if let Some(boundary) = plan.refresh_boundary(older, context_mode) {
                             self.spawn_conversation_summary_refresh(
                                 thread_id,
@@ -450,7 +357,6 @@ pub(crate) impl LucidosEngine {
                             older_region,
                             recent_turns.join("\n")
                         );
-                        // Build extraction context from recent messages only
                         let summary = summarize_user_topics(recent, user_message);
                         (history, summary, prior_image_hashes)
                     }
@@ -475,7 +381,6 @@ pub(super) struct SummaryInFlight {
 }
 
 impl SummaryInFlight {
-    /// Claim `thread_id`, or `None` when a refresh is already running for it.
     pub(super) fn claim(
         threads: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
         thread_id: Uuid,
@@ -502,15 +407,6 @@ impl Drop for SummaryInFlight {
 
 #[easy_ext::ext(ConversationSummaryExt)]
 pub(crate) impl LucidosEngine {
-    /// Start a refresh of this thread's older assistant turns, and return.
-    ///
-    /// **The paragraph is for the NEXT turn, never this one.** This turn has
-    /// already decided what it renders, from the cache as it stood. So the
-    /// model call is detached, and the user waits for none of it.
-    ///
-    /// Nothing is emitted unless the call returns a usable paragraph, which is
-    /// ADR 0102's ratchet: one success holds until a later success replaces it.
-    /// User turns are deliberately not in the input.
     async fn spawn_conversation_summary_refresh<F>(
         &self,
         thread_id: Uuid,
@@ -524,8 +420,6 @@ pub(crate) impl LucidosEngine {
             return;
         };
 
-        // Formatting is pure and stays here, so the closure's borrows never
-        // have to outlive the turn. The task owns plain strings.
         let turns: Vec<String> = older
             .iter()
             .enumerate()
@@ -544,7 +438,6 @@ pub(crate) impl LucidosEngine {
         let deadline = call.deadline();
 
         tokio::spawn(async move {
-            // `in_flight` rides into the task and releases when it ends.
             let _in_flight = in_flight;
             let summarized = crate::memory::summarize_conversation(
                 provider.as_ref(),
@@ -562,8 +455,6 @@ pub(crate) impl LucidosEngine {
                         summary: text,
                         covers_through_event_id: boundary,
                         covered_count: covered_count as u32,
-                        // The model that answered, which a retired default
-                        // moved off (ADR 0403).
                         model: provider.default_model().to_string(),
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
@@ -575,67 +466,31 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The covered assistant turns, exactly as the history block prints them.
-///
-/// The "resolved" claim rides here and nowhere else. It is true of work a
-/// paragraph actually describes. ADR 0102 records what it cost when the same
-/// wording introduced an empty fallback instead.
 const EARLIER_SUMMARISED: &str =
     "[Earlier assistant work (resolved: do NOT re-attempt fixes described here): {}]";
 
-/// Assistant turns past `HISTORY_OLDER_UNCOVERED_TURNS` that no summary covers.
-///
-/// It claims nothing about them, and names the way back (ADR 0102). The route
-/// is the grouped `events` tool, matching `context_mode`'s recovery table: the
-/// flat `query_events` still resolves as an alias, and two names for one
-/// capability is the drift `.claude/rules/glossary.md` bans.
-///
-/// Naming ONE event type is right here, unlike the whole-history row in that
-/// table. What left is one side of the conversation, so one type reaches all
-/// of it.
 const EARLIER_ASSISTANT_ELIDED: &str = "[Earlier: {} assistant turns before this are not shown. \
      Read them with events(action=\"query\", thread_id=\"current\", \
      event_type=\"ResponseGenerated\").]";
 
-/// User turns past `HISTORY_OLDER_USER_BUDGET`.
-///
-/// Only a thread of very large pasted messages reaches this line. A user turn
-/// is otherwise verbatim for the life of the thread.
 const EARLIER_USER_ELIDED: &str = "[Earlier: {} of the user's own messages before this are not \
      shown. Read them with events(action=\"query\", thread_id=\"current\", \
      event_type=\"MessageReceived\").]";
 
-/// A summary and the newest turn it accounts for, which travel together.
-///
-/// One value rather than two options, so the region cannot render a boundary
-/// with no paragraph behind it.
 #[derive(Clone, Copy)]
 pub(super) struct CoveredSummary<'a> {
     pub text: &'a str,
-    /// Index into the older slice of the newest turn the text covers.
     pub boundary: usize,
 }
 
-/// What this turn does about the older region's summary (ADR 0102).
-///
-/// Holds the paragraph in play and how far it reaches. A refresh replaces
-/// both, and a FAILED refresh replaces neither, which is what makes one
-/// success stick for the rest of the thread.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct SummaryPlan {
     text: Option<String>,
-    /// Index into the older slice of the newest turn `text` covers.
     boundary: Option<usize>,
-    /// Assistant turns past that boundary, or all of them with no summary.
     uncovered: usize,
 }
 
 impl SummaryPlan {
-    /// Read the thread's cached summary against the region it has to cover.
-    ///
-    /// A cached paragraph whose boundary turn has left the region is
-    /// unusable: nothing says how far it reaches any more, so it is dropped
-    /// rather than trusted at the wrong width.
     pub(super) fn for_region(
         older: &[crate::core::store::SessionMessage],
         cached: Option<&crate::core::store::CachedSummary>,
@@ -658,24 +513,6 @@ impl SummaryPlan {
         }
     }
 
-    /// The turn a fresh paragraph would be cached against, or `None` to skip.
-    ///
-    /// Pure, so the whole spend decision is testable without a model. Three
-    /// gates, all required:
-    ///
-    /// - The uncovered turns must have piled up past
-    ///   [`HISTORY_SUMMARY_REFRESH_AFTER`]. Below it they render compacted,
-    ///   which costs a few hundred chars against an auxiliary model call.
-    /// - The context mode must be off. Under it the model writes the notes
-    ///   itself, so a second pass over the same region is a worse summary at a
-    ///   fee (ADR 0109).
-    /// - The newest assistant turn must have a parseable event id. The cache
-    ///   is keyed on that address, so without one the next turn could not tell
-    ///   how far the paragraph reaches.
-    ///
-    /// The third gate is here rather than after the call because the answer
-    /// does not depend on the answer. Read late, it let a turn buy a paragraph
-    /// and then log that it had nowhere to put it.
     pub(super) fn refresh_boundary(
         &self,
         older: &[crate::core::store::SessionMessage],
@@ -691,7 +528,6 @@ impl SummaryPlan {
             .and_then(|id| Uuid::parse_str(id).ok())
     }
 
-    /// The paragraph and its boundary, when both are present.
     pub(super) fn covered(&self) -> Option<CoveredSummary<'_>> {
         self.text
             .as_deref()
@@ -700,18 +536,6 @@ impl SummaryPlan {
     }
 }
 
-/// The older region of `[CONVERSATION HISTORY]`, in chronological order.
-///
-/// Three kinds of line come out (ADR 0102). A user turn is verbatim. The
-/// assistant turns a summary covers become one paragraph, printed where the
-/// oldest of them sat. An uncovered assistant turn renders compacted, so the
-/// gap between refreshes drops nothing.
-///
-/// Two caps bound the region, both counted newest-first, each replaced by one
-/// count line naming the way back. `HISTORY_OLDER_USER_BUDGET` bounds the
-/// verbatim user side. `HISTORY_OLDER_UNCOVERED_TURNS` bounds the compacted
-/// assistant side, which is what a thread gets when the summariser keeps
-/// failing.
 pub(super) fn render_older_region<F>(
     older: &[crate::core::store::SessionMessage],
     covered: Option<CoveredSummary<'_>>,
@@ -733,14 +557,9 @@ where
         .and_then(|_| (0..older.len()).find(|&i| keep_assistant[i]));
 
     let mut lines: Vec<String> = Vec::new();
-    // Elided user turns ARE the oldest thing in the region, so their count
-    // opens it.
     if dropped_users > 0 {
         lines.push(EARLIER_USER_ELIDED.replace("{}", &dropped_users.to_string()));
     }
-    // Nothing uncovered survived the cap, so there is no turn for the count to
-    // sit above. Unreachable while the cap is above zero, and cheaper to hold
-    // than to reason about again.
     if let (Some(note), None) = (&elided_note, elided_anchor) {
         lines.push(note.clone());
     }
@@ -753,8 +572,6 @@ where
         let keep = if msg.role == "user" {
             keep_user[i]
         } else if is_covered(i) {
-            // The paragraph stands in for the whole covered run, printed
-            // once where the run begins.
             if Some(i) == first_covered {
                 if let Some(c) = covered {
                     lines.push(EARLIER_SUMMARISED.replace("{}", c.text));
@@ -789,8 +606,6 @@ fn user_turns_within_budget(older: &[crate::core::store::SessionMessage]) -> (Ve
     (keep, 0)
 }
 
-/// Which uncovered assistant turns fit `HISTORY_OLDER_UNCOVERED_TURNS`, and
-/// how many do not. Newest-first, same contiguous-run rule as above.
 fn uncovered_turns_within_cap<C>(
     older: &[crate::core::store::SessionMessage],
     is_covered: &C,

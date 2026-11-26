@@ -1,6 +1,3 @@
-//! A message the user took back ends its run quietly on every path: it never
-//! records, never anchors a turn, never answers a card, and shows no failure.
-
 use super::PreEmittedOrigin;
 use crate::engine::chat::process::ChatProcessExt;
 use crate::engine::event_bus::BusEvent;
@@ -28,7 +25,6 @@ async fn remove(engine: &LucidosEngine, thread_id: Uuid, message: Uuid) {
         .unwrap();
 }
 
-/// Run `message` the way the chat route does, under its own event id.
 async fn submit(
     engine: &LucidosEngine,
     thread_id: Uuid,
@@ -69,8 +65,6 @@ async fn submit(
         .expect("a message the user took back ends its run without an error");
 }
 
-/// Rows of `event_type` on `thread_id` that name `message` as their id, their
-/// anchor, or their injected message, plus every row when `message` is None.
 async fn count(
     engine: &LucidosEngine,
     thread_id: Uuid,
@@ -317,7 +311,6 @@ fn a_follow_up_taken_back_during_a_live_turn_keeps_it_running() {
 async fn live_turn_case() {
     let (_pool, db) = setup_test_db().await;
     let (engine, _workspace) = boot_mock_engine(&db).await;
-    // The seeded message's turn has not ended.
     let thread_id = seed_chat_thread(&engine.event_bus, "hello").await;
     let message = record_follow_up(&engine, thread_id).await;
 

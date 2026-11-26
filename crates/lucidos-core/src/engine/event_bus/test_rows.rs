@@ -1,11 +1,8 @@
-//! Rows and frames the event-bus tests share.
-
 use chrono::Utc;
 use uuid::Uuid;
 
 use super::{BusEvent, EmittedEvent, EventBus, SystemEvent};
 
-/// A workspace domain event, as a build check might emit it.
 pub(super) fn build_observed() -> SystemEvent {
     SystemEvent::DomainEvent {
         event_type: "BuildObserved".into(),
@@ -16,7 +13,6 @@ pub(super) fn build_observed() -> SystemEvent {
     }
 }
 
-/// Emit [`build_observed`] and return the sequence its row drew.
 pub(super) async fn emit_row(bus: &EventBus) -> i64 {
     bus.emit(BusEvent::System(build_observed()))
         .await
@@ -25,7 +21,6 @@ pub(super) async fn emit_row(bus: &EventBus) -> i64 {
         .seq
 }
 
-/// A frame carrying the row at `seq`.
 pub(super) fn row_frame(seq: i64) -> EmittedEvent {
     EmittedEvent {
         event_id: Uuid::new_v4(),

@@ -194,6 +194,16 @@ describe('ArrivalList', () => {
     const landed = () => DISCLOSURE_MAX_MS + ARRIVAL_CHECK_SLACK_MS;
     const hold = () => NAV_FOCUS_RAMP_MS + NAV_FOCUS_HOLD_MS;
 
+    it('waits past the longest disclosure roll before checking visibility', async () => {
+      onScreen = false;
+      await show(['a']);
+      await show(['a', 'b']);
+      await act(() => { vi.advanceTimersByTime(DISCLOSURE_MAX_MS); });
+      expect(marked('b')).toBe(true);
+      await act(() => { vi.advanceTimersByTime(ARRIVAL_CHECK_SLACK_MS); });
+      expect(marked('b')).toBe(false);
+    });
+
     it('goes out unseen when the row lands off screen', async () => {
       onScreen = false;
       await show(['a']);

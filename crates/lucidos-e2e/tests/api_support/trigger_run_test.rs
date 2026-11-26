@@ -1,44 +1,15 @@
-//! E2E coverage for `POST /api/v1/triggers/run`, the **off-schedule run**.
-//!
-//! Unit tests in `engine_impl::trigger_runs` pin the pure precondition checker;
-//! this pins the wiring end to end over real HTTP, because the operation exists
-//! precisely to replace a workaround that *looked* like it worked. The three
-//! things worth proving at this seam:
-//!
-//! 1. A cron trigger actually fires and records `last_run`, so the run is real
-//!    rather than an admission that goes nowhere.
-//! 2. A paused trigger is refused up front. Submitting blind would be dropped
-//!    by the queue executor with only a log line, and the caller would be told
-//!    a run started, which is the exact class of lie this replaces (an agent
-//!    once "started" a nightly job by resuming a paused trigger).
-//! 3. An event-only trigger is refused and pointed at emitting its event. A
-//!    payload-less fire is a shape it has never had.
-
 use crate::support::{
     base_url, remove_data_fixtures, unique_marker, user_client, write_data_fixture,
 };
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-/// A script trigger, so a fire needs no LLM provider to complete. The script
-/// writes nothing and exits 0; `last_run` is what we assert on.
 const PROBE_SCRIPT: &str = r#"#!/usr/bin/env python3
 print("ok")
 "#;
 
-/// Cron pinned to a moment that never arrives inside a test run (03:00 on the
-/// 1st of January). The point is that the trigger HAS a schedule, not that the
-/// schedule fires: an off-schedule run must be the only thing that runs it, so
-/// a passing assertion can't be a scheduled fire in disguise.
 const NEVER_SOON_CRON: &str = "0 0 3 1 1 *";
 
-/// Create a trigger and return its id.
-///
-/// **`run` is an intent unless the test actually fires the trigger.** A script
-/// trigger needs a `.py` fixture under `data/triggers/<slug>/`, which the test
-/// must write and later remove. The refusal tests below never reach execution,
-/// so they carry an intent they will never run and own no files at all. The
-/// engine's own `trigger.toml` is gitignored, so it never dirties the tree.
 pub(crate) async fn create_trigger(
     client: &reqwest::Client,
     name: &str,
@@ -70,8 +41,6 @@ pub(crate) async fn create_trigger(
         .to_string()
 }
 
-/// A never-executed `run` for the refusal tests. Naming it makes the "this
-/// trigger is not meant to fire" contract explicit at each call site.
 fn unreachable_intent() -> serde_json::Value {
     json!({ "type": "intent", "intent": "never executed: this trigger's run is always refused" })
 }
@@ -96,14 +65,6 @@ async fn run_trigger(client: &reqwest::Client, id: &str) -> serde_json::Value {
     try_run_trigger(client, id).await.expect("run_trigger")
 }
 
-/// `run_trigger` that hands back a transport / parse failure instead of
-/// panicking on it.
-///
-/// The capacity-policy caller below has to put the engine's original policy
-/// back on EVERY path out. A panic between the two PUTs would skip the restore
-/// and leave the shared engine on this test's widened limits for the rest of
-/// the parallel suite, so that caller needs the failure as a value it can hold
-/// until after it has restored.
 async fn try_run_trigger(client: &reqwest::Client, id: &str) -> Result<serde_json::Value, String> {
     let resp = client
         .post(format!("{}/api/v1/triggers/run?id={}", base_url(), id))
@@ -115,8 +76,6 @@ async fn try_run_trigger(client: &reqwest::Client, id: &str) -> Result<serde_jso
         .map_err(|e| format!("invalid JSON from /triggers/run: {e}"))
 }
 
-/// Delete a trigger. Best-effort: a failed cleanup must not fail the assertion
-/// the test exists for.
 pub(crate) async fn delete_trigger(client: &reqwest::Client, id: &str) {
     let _ = client
         .delete(format!("{}/api/v1/triggers?id={}", base_url(), id))
@@ -124,21 +83,8 @@ pub(crate) async fn delete_trigger(client: &reqwest::Client, id: &str) {
         .await;
 }
 
-/// The thread a trigger's most recent fire ran on, plus every terminator on it
-/// paired with the turn each is anchored to.
 type TurnTerminators = (Option<uuid::Uuid>, Vec<(String, Option<String>)>);
 
-/// Read a fired trigger's turn out of the event log: its thread, and every
-/// terminator on that thread with its `request_event_id`.
-///
-/// One function over one connection, returning a `Result` rather than
-/// unwrapping: the caller still owns a trigger definition in the shared working
-/// tree at this point, so a database hiccup must come back as a value it can
-/// carry past its cleanup instead of a panic that strands the definition.
-///
-/// `origin.reason` is where the scheduler records which trigger fired, and a
-/// null `request_event_id` is meaningful (it is what an unanchored terminator
-/// looks like), so it is read as an `Option` rather than filtered out.
 async fn read_turn_terminators(trigger_id: &str) -> Result<TurnTerminators, String> {
     let pool = sqlx::PgPool::connect(&crate::support::db_url())
         .await
@@ -175,12 +121,6 @@ async fn read_turn_terminators(trigger_id: &str) -> Result<TurnTerminators, Stri
     result
 }
 
-/// Fire a trigger off-schedule with an admission slot guaranteed.
-///
-/// A free pool slot is the PREMISE of every test that fires, not part of what
-/// any of them proves: `crate::support::with_pool_room` explains why, and holds
-/// the widened policy for the one request. The run's failure is carried out as
-/// a value, and the caller unwraps it after its own cleanup.
 pub(crate) async fn run_trigger_with_a_free_slot(
     client: &reqwest::Client,
     id: &str,
@@ -215,13 +155,8 @@ async fn run_fires_a_cron_trigger_and_records_last_run() {
     let client = user_client().await;
     let slug = unique_marker("run-probe");
     let name = format!("Run probe {}", slug);
-    // A test that fires needs a real script on disk (a script run needs no LLM
-    // provider). It lands committed, and so does its removal.
     let script = format!("triggers/{}/scripts/run.py", slug);
     {
-        // The moment this file appears in the shared working tree is one the
-        // command-checkpoint test must not be mid-snapshot for; see
-        // `workspace_tree_lock`.
         let _tree = crate::support::workspace_tree_lock().read().await;
         write_data_fixture(&client, &script, PROBE_SCRIPT)
             .await
@@ -242,18 +177,12 @@ async fn run_fires_a_cron_trigger_and_records_last_run() {
         "fresh trigger must not have run yet: {before}"
     );
 
-    // The assertions below are just as strong with an admission slot guaranteed:
-    // a coalesced run, a refused run, or one that never records `last_run` still
-    // fails. See `run_trigger_with_a_free_slot` for why the slot is established
-    // rather than hoped for, and why the failure comes back as a value.
     let run = run_trigger_with_a_free_slot(&client, &id).await;
 
     let last_run = wait_for_last_run(&client, &name, Duration::from_secs(45)).await;
     delete_trigger(&client, &id).await;
     remove_data_fixtures(&client, &format!("triggers/{slug}"), &[script]).await;
 
-    // Unwrapped only after cleanup: a panic before it strands a live trigger
-    // and its probe script in the shared workspace.
     let resp = run.expect("off-schedule run request");
     assert_eq!(resp["success"], true, "run refused: {resp}");
     assert_eq!(
@@ -266,37 +195,11 @@ async fn run_fires_a_cron_trigger_and_records_last_run() {
     );
 }
 
-/// One turn, one terminator, asserted over a real trigger fire in the event log.
-///
-/// The scheduler used to broadcast its own empty `ResponseGenerated` after
-/// every successful `process_trigger`, on top of the one the agentic loop had
-/// already emitted for the turn. On a clean run the duplicate was invisible: the
-/// real terminator carried the text, and the frontend's empty-completion note is
-/// suppressed when the exchange has any. The turn it broke was the one the user
-/// stopped. `ResponseCanceled` landed, the phantom landed ~10ms later carrying no
-/// `request_event_id`, and the timeline read "Response canceled" followed by a
-/// "Done ✓ / The model returned an empty response" panel for a turn that had been
-/// canceled, not answered (2026-08-07, the nightly release-prep trigger).
-///
-/// This asserts on the ordinary clean fire rather than reproducing the cancel,
-/// because the duplicate is present on BOTH and the clean path has no race to
-/// win: the assertion is a count, not a timing. A cancel repro would have to land
-/// its Stop inside the mock's streaming window to prove the same thing.
-///
-/// It also pins the anchor. A terminator with no `request_event_id` belongs to no
-/// turn, which is exactly what let this one fold into a boundary it had nothing
-/// to do with, so a replacement phantom that happened to be the only terminator
-/// would still fail here.
 #[tokio::test]
 async fn a_fired_trigger_turn_emits_exactly_one_terminator() {
     let client = user_client().await;
     let slug = unique_marker("run-terminator");
     let name = format!("Run terminator {}", slug);
-    // An intent trigger, so the fire goes through the agentic loop (the path
-    // that owns the turn's terminator) rather than a script. Under the e2e
-    // default `LUCIDOS_MODEL=mock` the reply is fixed text and no tool runs; the
-    // wording keeps a real provider to one turn too, if someone runs the suite
-    // against one.
     let id = create_trigger(
         &client,
         &name,
@@ -311,18 +214,11 @@ async fn a_fired_trigger_turn_emits_exactly_one_terminator() {
 
     let run = run_trigger_with_a_free_slot(&client, &id).await;
 
-    // `last_run` is recorded by `record_trigger_completed`, which the scheduler
-    // calls AFTER `process_trigger` has returned, i.e. after the loop's
-    // terminator and after the phantom this test forbids. So waiting on it is an
-    // upper bound on both being visible, and the count below races nothing.
     let last_run = wait_for_last_run(&client, &name, Duration::from_secs(90)).await;
     let probe = read_turn_terminators(&id).await;
 
     delete_trigger(&client, &id).await;
 
-    // Everything above hands its failure back as a value, and every unwrap waits
-    // until here: a panic before the delete strands a live cron trigger in the
-    // shared workspace.
     let run = run.expect("off-schedule run request");
     let (thread_id, terminators) = probe.expect("read the fired turn's terminators");
 

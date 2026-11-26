@@ -25,7 +25,7 @@ import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
 import { watchTitlebarBand } from '../../store/actions/trafficLights';
 import { applyAppBadge } from '../../store/actions/app-badge';
-import { WORKSPACE_ID, parseWorkspaceRoute } from '../../utils/basePath';
+import { WORKSPACE_ID, parseWorkspaceRoute, workspaceRouteSegment } from '../../utils/basePath';
 import {
   alternateOpenMode,
   defaultOpenMode,
@@ -54,17 +54,24 @@ import {
   stopWorkspace,
   setAutostart,
   openWorkspace,
-  restoreBackup,
   getRestoreStatus,
   clearRestoreStatus,
   getGatewayStatus,
   reloadGateway,
   getGatewayNetworkConfig,
   setGatewayNetworkConfig,
+  createRemoteWorkspace,
+  remoteControlBase,
+  startRemoteWorkspace,
+  stopRemoteWorkspace,
+  type ListedWorkspace,
   type WorkspaceStatus,
   type GwRestoreStatus,
   type GatewayStatus,
 } from '../../api/client/control';
+import { restoreTargetFor, uploadRestore } from './restoreUpload';
+import { remoteControlBlocker, remoteControlReason } from './remoteControl';
+import { GatewaySwitcher } from './GatewaySwitcher';
 import {
   toBindValue,
   isValidBindSelection,
@@ -85,7 +92,9 @@ import {
   showsAddress,
   workspaceAddress,
   EMPTY_RESTORE_DRAFT,
+  IDLE_RESTORE_UPLOAD,
   type RestoreDraft,
+  type RestoreUpload,
 } from './workspaceForms';
 import { pickerFooter, type FooterMode } from './PickerFooter';
 import { restoreBanner, restoreNeedsReading } from './RestoreBanner';
@@ -102,6 +111,7 @@ import {
   recallRemoteListings,
   rememberRemoteListings,
   remoteWorkspaceOpenable,
+  shownRemoteView,
   type RemoteGatewayView,
 } from './remoteWorkspaces';
 import { keepUndrawnKeys, moveOrderKey, orderWorkspaces, stepOrderKey, type OrderedWorkspace } from '../../utils/workspaceOrder';
@@ -109,6 +119,9 @@ import { makeOrderSaver } from './orderSave';
 import { singleFlight } from './singleFlight';
 
 const REMOTE_POLL_EVERY_TICKS = 8;
+
+const controlBaseFor = (gateway: string | null): string | undefined =>
+  gateway === null ? undefined : remoteControlBase(gateway);
 
 const pickerCanDragStart = (target: HTMLElement): boolean =>
   !isInteractiveTarget(target) && !target.closest('[data-overlay-panel]');
@@ -299,7 +312,9 @@ export function WorkspacePicker() {
   const deleting = useSignal(false);
   const trashRevision = useSignal(0);
   const restoreDraft = useSignal<RestoreDraft>(EMPTY_RESTORE_DRAFT);
-  const restoreStatus = useSignal<GwRestoreStatus | null>(null);
+  const restoreUpload = useSignal<RestoreUpload>(IDLE_RESTORE_UPLOAD);
+  const restoreAbort = useRef<AbortController | null>(null);
+  const restoreStatus = useSignal<{ gateway: string | null; status: GwRestoreStatus } | null>(null);
   const gatewayStatus = useSignal<GatewayStatus | null>(null);
   const reloading = useSignal(false);
   const reloadConfirmOpen = useSignal(false);
@@ -313,6 +328,8 @@ export function WorkspacePicker() {
   const menuAnchor = useSignal<HTMLElement | null>(null);
   const selection = useSignal<ReadonlySet<string> | null>(null);
   const stopConfirmId = useSignal<string | null>(null);
+  const scope = useSignal<string | null>(null);
+  const remoteBlocker = useSignal<string | null>(null);
   const stopAnchor = useSignal<HTMLElement | null>(null);
   const autoOpening = useSignal(
     typeof window !== 'undefined' &&
@@ -355,8 +372,19 @@ export function WorkspacePicker() {
     }
   }
 
+  function shownGateway(): string | null {
+    return shownRemoteView(scope.value, remoteWorkspaces.value)?.gateway ?? null;
+  }
+
   async function fetchRestoreStatus(): Promise<void> {
-    restoreStatus.value = await getRestoreStatus();
+    const gateway = shownGateway();
+    const status = await getRestoreStatus(controlBaseFor(gateway));
+    if (shownGateway() === gateway) restoreStatus.value = { gateway, status };
+  }
+
+  async function checkRemoteControl(gateway: string): Promise<void> {
+    const blocker = await remoteControlBlocker(gateway);
+    if (scope.value === gateway) remoteBlocker.value = blocker;
   }
 
   async function fetchGatewayStatus(): Promise<void> {
@@ -386,11 +414,14 @@ export function WorkspacePicker() {
       } catch (e) {
         console.warn('[picker] remote workspace poll failed; keeping last-good rows', e);
       }
+      if (scope.value !== null) await checkRemoteControl(scope.value);
     }
-    try {
-      await fetchRestoreStatus();
-    } catch (e) {
-      console.warn('[picker] restore-status poll failed; keeping last-good', e);
+    if (scope.value === null || remoteBlocker.value === null) {
+      try {
+        await fetchRestoreStatus();
+      } catch (e) {
+        console.warn('[picker] restore-status poll failed; keeping last-good', e);
+      }
     }
     try {
       await fetchGatewayStatus();
@@ -510,18 +541,33 @@ export function WorkspacePicker() {
     }
   }, [workspaces.value]);
 
+  async function dismissRestore(
+    result: Extract<GwRestoreStatus, { status: 'completed' | 'failed' }>,
+    gateway: string | null,
+  ): Promise<void> {
+    await clearRestoreStatus(result.result_id, controlBaseFor(gateway));
+    const snapshot = restoreStatus.value;
+    if (!snapshot || snapshot.gateway !== gateway || shownGateway() !== gateway) return;
+    const current = snapshot.status;
+    if (current === result || (
+      result.result_id !== undefined &&
+      (current.status === 'completed' || current.status === 'failed') &&
+      current.result_id === result.result_id
+    )) {
+      restoreStatus.value = { gateway, status: { status: 'idle' } };
+    }
+  }
+
   const clearRetry = useSignal(0);
-  const completedRestoreId =
-    restoreStatus.value?.status === 'completed' && !restoreNeedsReading(restoreStatus.value)
-      ? restoreStatus.value.id
-      : null;
+  const restoreGateway = shownGateway();
+  const restoreSnapshot = restoreStatus.value;
+  const restore = restoreSnapshot?.gateway === restoreGateway ? restoreSnapshot.status : null;
+  const completedRestore = restore?.status === 'completed' && !restoreNeedsReading(restore) ? restore : null;
+  const completedRestoreId = completedRestore?.result_id ?? completedRestore?.id;
   useEffect(() => {
-    if (!completedRestoreId) return;
+    if (!completedRestore) return;
     const timer = setTimeout(() => {
-      void clearRestoreStatus()
-        .then(() => {
-          if (restoreStatus.value?.status === 'completed') restoreStatus.value = { status: 'idle' };
-        })
+      void dismissRestore(completedRestore, restoreGateway)
         .catch((e) => {
           // BEST-EFFORT: self-recovering, per frontend.md's telemetry
           // carve-out. Nothing the user asked for failed (they pressed nothing),
@@ -532,7 +578,7 @@ export function WorkspacePicker() {
         });
     }, RESTORE_DONE_LINGER_MS);
     return () => clearTimeout(timer);
-  }, [completedRestoreId, clearRetry.value]);
+  }, [completedRestoreId, restoreGateway, clearRetry.value]);
 
   const nameInputRef = useRef<HTMLInputElement>(null);
   function pickSuggestion(name: string) {
@@ -570,13 +616,50 @@ export function WorkspacePicker() {
     }
   }
 
+  function withRemote(gateway: string, fn: () => Promise<void>): Promise<void> {
+    return withBusy(async () => {
+      try {
+        await fn();
+      } catch (e) {
+        throw new Error(remoteControlReason(e, gateway));
+      }
+    });
+  }
+
+  function selectScope(gateway: string | null) {
+    if (scope.value === gateway) return;
+    scope.value = gateway;
+    remoteBlocker.value = null;
+    restoreStatus.value = null;
+    footerMode.value = 'none';
+    selection.value = null;
+    error.value = null;
+    if (gateway !== null) void checkRemoteControl(gateway);
+    void fetchRestoreStatus().catch((e) => {
+      console.warn('[picker] restore-status read failed; the next poll retries', e);
+    });
+  }
+
   function onCreate() {
     const name = newName.value.trim();
     if (!name) return;
-    void withBusy(async () => {
-      const ws = await createWorkspace(name);
+    const gateway = shownGateway();
+    const done = () => {
       footerMode.value = 'none';
       newName.value = '';
+    };
+    if (gateway !== null) {
+      void withRemote(gateway, async () => {
+        const ws = await createRemoteWorkspace(gateway, name);
+        done();
+        await refreshRemoteWorkspaces();
+        openWorkspace(workspaceRouteSegment({ slug: ws.id, gateway }));
+      });
+      return;
+    }
+    void withBusy(async () => {
+      const ws = await createWorkspace(name);
+      done();
       await refresh();
       openWorkspace(ws.id);
     });
@@ -635,17 +718,40 @@ export function WorkspacePicker() {
   function onRestore() {
     const { file, key, name } = restoreDraft.value;
     if (!file || !key.trim() || !name.trim()) return;
+    const gateway = shownGateway();
+    const controller = new AbortController();
+    restoreAbort.current = controller;
     void withBusy(async () => {
-      const started = await restoreBackup(file, key.trim(), name.trim());
-      restoreStatus.value = { status: 'running', id: started.id, name: started.name, phase: 'starting' };
-      closeRestore();
+      try {
+        const started = await uploadRestore(
+          { file, key: key.trim(), name: name.trim() },
+          controller.signal,
+          (upload) => { restoreUpload.value = upload; },
+          restoreTargetFor(gateway),
+        );
+        if (!started) return;
+        if (shownGateway() === gateway) {
+          restoreStatus.value = {
+            gateway,
+            status: { status: 'running', id: started.id, name: started.name, phase: 'starting' },
+          };
+        }
+        closeRestore();
+      } finally {
+        restoreAbort.current = null;
+      }
     });
   }
 
-  function onDismissRestore() {
+  function onCancelRestore() {
+    if (restoreAbort.current) restoreAbort.current.abort();
+    else closeRestore();
+  }
+
+  function onDismissRestore(result: GwRestoreStatus | null, gateway: string | null) {
+    if (result?.status !== 'completed' && result?.status !== 'failed') return;
     void withBusy(async () => {
-      await clearRestoreStatus();
-      restoreStatus.value = { status: 'idle' };
+      await dismissRestore(result, gateway);
     });
   }
 
@@ -681,9 +787,20 @@ export function WorkspacePicker() {
 
   const v = workspaces.value;
   const remoteViews = remoteWorkspaces.value.status === 'loaded' ? remoteWorkspaces.value.data : NO_REMOTE_VIEWS;
+  const scopedView = shownRemoteView(scope.value, remoteWorkspaces.value);
+  const scopedGateway = shownGateway();
+  const targetBlocker = scopedView === null
+    ? null
+    : scopedView.unreachable !== null ? `${scopedView.gateway} is not reachable right now.` : remoteBlocker.value;
   if (!drag) {
-    drawnEntries.current = v.status === 'loaded' ? orderWorkspaces(v.data, remoteViews, order.value) : [];
+    drawnEntries.current = v.status !== 'loaded'
+      ? []
+      : scopedView ? orderWorkspaces([], [scopedView], order.value) : orderWorkspaces(v.data, remoteViews, order.value);
   }
+  const scopeGone = scope.value !== null && remoteWorkspaces.value.status === 'loaded' && scopedView === null;
+  useEffect(() => {
+    if (scopeGone) selectScope(null);
+  }, [scopeGone]);
   const entries = drawnEntries.current;
   const selected = selection.value;
   const selectedIds = v.status === 'loaded' && selected
@@ -770,7 +887,7 @@ export function WorkspacePicker() {
     const { onClick: dragClickGuard, ...holdProps } = rowProps;
     return (
       <li
-        class={`ws-picker-row${unreachable ? ' ws-picker-row-unreachable' : ''}${lift !== undefined ? ' ws-picker-row-lifted' : ''}${dropAt ? ` ws-picker-row-drop-${dropAt}` : ''}`}
+        class={`ws-picker-row${workspace && selected?.has(workspace.id) ? ' ws-picker-row-selected' : ''}${unreachable ? ' ws-picker-row-unreachable' : ''}${lift !== undefined ? ' ws-picker-row-lifted' : ''}${dropAt ? ` ws-picker-row-drop-${dropAt}` : ''}`}
         key={entry.key}
         data-row-index={index}
         style={lift !== undefined ? { '--ws-picker-drag-dy': `${lift}px` } : undefined}
@@ -797,11 +914,99 @@ export function WorkspacePicker() {
     );
   }
 
+  function stopControl(key: string, name: string, disabled: boolean, onStop: () => void) {
+    return (
+      <div class="ws-picker-stop-wrap">
+        <button
+          class="ws-picker-icon ws-picker-icon-play ws-picker-icon-stop"
+          disabled={disabled}
+          data-tooltip="Stop"
+          aria-label={`Stop ${name}`}
+          aria-haspopup="dialog"
+          aria-expanded={stopConfirmId.value === key}
+          onClick={(e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget as HTMLElement;
+            if (stopConfirmId.value === key) {
+              stopConfirmId.value = null;
+            } else {
+              stopAnchor.value = btn;
+              stopConfirmId.value = key;
+            }
+          }}
+        ><StopIcon /></button>
+        <Overlay
+          open={stopConfirmId.value === key}
+          onClose={() => {
+            stopConfirmId.value = null;
+          }}
+          anchor={stopAnchor.value}
+          backdrop={false}
+          panelClass="ws-picker-confirm ws-picker-confirm-stop"
+        >
+          <p class="ws-picker-confirm-text">
+            Stop “{name}”? It shuts down and becomes unreachable
+            until you start it again.
+          </p>
+          <div class="ws-picker-confirm-actions">
+            <button
+              class="ws-picker-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                stopConfirmId.value = null;
+              }}
+            >Cancel</button>
+            <button
+              class="ws-picker-btn ws-picker-btn-danger"
+              disabled={disabled}
+              onClick={(e) => {
+                e.stopPropagation();
+                stopConfirmId.value = null;
+                onStop();
+              }}
+            >Stop</button>
+          </div>
+        </Overlay>
+      </div>
+    );
+  }
+
+  function remoteControls(view: RemoteGatewayView, w: ListedWorkspace) {
+    const gateway = view.gateway;
+    const disabled = busy.value || targetBlocker !== null || w.health === 'restoring';
+    if (remoteWorkspaceOpenable(view, w)) {
+      return stopControl(`${w.id}@${gateway}`, w.name, disabled, () => {
+        void withRemote(gateway, () => stopRemoteWorkspace(gateway, w.id).then(() => fetchRemoteWorkspaces(true)));
+      });
+    }
+    return (
+      <button
+        class="ws-picker-icon ws-picker-icon-play"
+        disabled={disabled}
+        data-tooltip={targetBlocker ?? 'Start'}
+        aria-label={`Start ${w.name} on ${gateway}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          void withRemote(gateway, () => startRemoteWorkspace(gateway, w.id).then(() => fetchRemoteWorkspaces(true)));
+        }}
+      ><PlayIcon /></button>
+    );
+  }
+
   function remoteRow(entry: RemotePickerEntry, index: number) {
     const { view, workspace: w, key } = entry;
     const alternateMode = remoteWorkspaceOpenable(view, w) ? alternateOpenMode(workspaceState(w), WORKSPACE_ID, key) : null;
+    const scoped = scopedGateway === view.gateway;
+    const startsFirst = scoped && targetBlocker === null && !remoteWorkspaceOpenable(view, w) && w.health !== 'restoring';
     const openRemote = (mode: WorkspaceOpenMode) => {
-      void withBusy(async () => {
+      if (!startsFirst) {
+        void withBusy(async () => {
+          await openWorkspaceIn(mode, key);
+        });
+        return;
+      }
+      void withRemote(view.gateway, async () => {
+        await startRemoteWorkspace(view.gateway, w.id);
         await openWorkspaceIn(mode, key);
       });
     };
@@ -809,9 +1014,13 @@ export function WorkspacePicker() {
       <RemoteWorkspaceRowBody
         view={view}
         workspace={w}
+        startsFirst={startsFirst}
         onOpen={(_route, mode) => openRemote(mode)}
         onContextMenu={(e) => openRowMenu(e, key)}
-        actions={rowMenu(key, `More actions for ${w.name} on ${view.gateway}`, busy.value, (
+        actions={(
+          <>
+          {scoped && remoteControls(view, w)}
+          {rowMenu(key, `More actions for ${w.name} on ${view.gateway}`, busy.value, (
           <>
             {alternateMode !== null && (
               <button
@@ -830,7 +1039,9 @@ export function WorkspacePicker() {
             )}
             {moveItems(key)}
           </>
-        ))}
+          ))}
+          </>
+        )}
       />
     ));
   }
@@ -844,14 +1055,14 @@ export function WorkspacePicker() {
   }
   const skeletonRows = skeletonRowsRef.current;
   const known = v.status === 'loaded' ? v.data : [];
-  const blocker = restoreBlocker(restoreDraft.value, known);
+  const targetKnown = scopedView?.workspaces ?? known;
+  const blocker = restoreBlocker(restoreDraft.value, targetKnown);
   const fileNote = restoreFileNote(restoreDraft.value.file);
-  const createNote = buildCreateNote(newName.value, known);
+  const createNote = buildCreateNote(newName.value, targetKnown);
   const renameTaken = renamingId.value
     ? nameTakenBy(renameValue.value, known, renamingId.value)
     : null;
   const canRename = !busy.value && renameValue.value.trim() !== '' && renameTaken === null;
-  const restore = restoreStatus.value;
   const restoreRunning = restore?.status === 'running';
 
   const [pickerEl, setPickerEl] = useState<HTMLElement | null>(null);
@@ -958,6 +1169,15 @@ export function WorkspacePicker() {
           </div>
         </header>
 
+        <Disclosure open={remoteViews.length > 0}>
+          <GatewaySwitcher
+            views={remoteViews}
+            selected={scopedGateway}
+            disabled={busy.value}
+            onSelect={selectScope}
+          />
+        </Disclosure>
+
         {error.value && <div class="ws-picker-error">{error.value}</div>}
 
         {v.status === 'failed' && (
@@ -967,30 +1187,33 @@ export function WorkspacePicker() {
         <LoadingFade showSkeleton={listLoading && showSkeletons} skeleton={<PickerSkeleton rows={skeletonRows} />}>
         {v.status === 'loaded' && (
           <>
-          <Disclosure open={v.data.length > 0} bodyClass="ws-picker-select-bar">
+          <Disclosure open={scopedView === null && v.data.length > 0} bodyClass="ws-picker-select-bar">
             <div class={selected ? 'ws-picker-select-actions is-selecting' : 'ws-picker-select-actions'}>
+              {selected && <span class="ws-picker-select-count" aria-live="polite">{selectedIds.length} selected</span>}
               <button
                 type="button"
-                class="ws-picker-btn"
+                class={selected ? 'ws-picker-btn ws-picker-btn-quiet' : 'ws-picker-btn'}
                 aria-pressed={selected !== null}
+                aria-label={selected ? 'Cancel selection' : undefined}
                 disabled={busy.value || deleting.value || Boolean(drag)}
                 onClick={() => {
                   menuOpenId.value = null;
                   renamingId.value = null;
                   selection.value = selected ? null : new Set();
                 }}
-              >{selected ? 'Cancel selection' : 'Select'}</button>
+              >{selected ? 'Cancel' : 'Select'}</button>
               {selected && (
                 <button
                   type="button"
                   class="ws-picker-btn ws-picker-btn-danger"
+                  aria-label={`Delete ${selectedIds.length} ${selectedIds.length === 1 ? 'workspace' : 'workspaces'}`}
                   disabled={busy.value || deleting.value || selectedIds.length === 0}
                   onClick={() => void onDelete(selectedIds, true)}
-                >Delete {selectedIds.length} {selectedIds.length === 1 ? 'workspace' : 'workspaces'}</button>
+                >Delete</button>
               )}
             </div>
           </Disclosure>
-          <ul class="ws-picker-list" ref={listRef}>
+          <ul class={selected ? 'ws-picker-list is-selecting' : 'ws-picker-list'} ref={listRef}>
             {entries.map((entry, index) => {
               if (entry.kind === 'remote') return remoteRow(entry, index);
               const w = entry.workspace;
@@ -1087,58 +1310,9 @@ export function WorkspacePicker() {
                           onAuxClick={(e) => e.stopPropagation()}
                         >
                           {running ? (
-                            <div class="ws-picker-stop-wrap">
-                              <button
-                                class="ws-picker-icon ws-picker-icon-play ws-picker-icon-stop"
-                                disabled={busy.value || w.health === 'restoring'}
-                                data-tooltip="Stop"
-                                aria-label={`Stop ${w.name}`}
-                                aria-haspopup="dialog"
-                                aria-expanded={stopConfirmId.value === w.id}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const btn = e.currentTarget as HTMLElement;
-                                  if (stopConfirmId.value === w.id) {
-                                    stopConfirmId.value = null;
-                                  } else {
-                                    stopAnchor.value = btn;
-                                    stopConfirmId.value = w.id;
-                                  }
-                                }}
-                              ><StopIcon /></button>
-                              <Overlay
-                                open={stopConfirmId.value === w.id}
-                                onClose={() => {
-                                  stopConfirmId.value = null;
-                                }}
-                                anchor={stopAnchor.value}
-                                backdrop={false}
-                                panelClass="ws-picker-confirm ws-picker-confirm-stop"
-                              >
-                                <p class="ws-picker-confirm-text">
-                                  Stop “{w.name}”? It shuts down and becomes unreachable
-                                  until you start it again.
-                                </p>
-                                <div class="ws-picker-confirm-actions">
-                                  <button
-                                    class="ws-picker-btn"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      stopConfirmId.value = null;
-                                    }}
-                                  >Cancel</button>
-                                  <button
-                                    class="ws-picker-btn ws-picker-btn-danger"
-                                    disabled={busy.value || w.health === 'restoring'}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      stopConfirmId.value = null;
-                                      void withBusy(() => stopWorkspace(w.id).then(refresh));
-                                    }}
-                                  >Stop</button>
-                                </div>
-                              </Overlay>
-                            </div>
+                            stopControl(w.id, w.name, busy.value || w.health === 'restoring', () => {
+                              void withBusy(() => stopWorkspace(w.id).then(refresh));
+                            })
                           ) : (
                             <button
                               class="ws-picker-icon ws-picker-icon-play"
@@ -1214,7 +1388,7 @@ export function WorkspacePicker() {
                           ))}
                         </div>
                       </div>
-                      {fault && <p class="ws-picker-row-note">{fault}</p>}
+                      {fault && <p class={w.delete_interrupted ? 'ws-picker-row-note ws-picker-row-note-soft' : 'ws-picker-row-note'}>{fault}</p>}
                     </div>
                   ));
             })}
@@ -1230,15 +1404,23 @@ export function WorkspacePicker() {
         )}
         <UnreachableGatewayNotes views={remoteViews} />
 
-        {restoreBanner({ status: restore, busy: busy.value, onDismiss: onDismissRestore })}
+        {restoreBanner({
+          status: restore,
+          busy: busy.value,
+          onDismiss: () => onDismissRestore(restore, restoreGateway),
+        })}
 
-        <TrashSection inventory={trashInventory} showSkeleton={trashLoading && showSkeletons} onChanged={refresh} />
+        <Disclosure open={scopedView === null}>
+          <TrashSection inventory={trashInventory} showSkeleton={trashLoading && showSkeletons} onChanged={refresh} />
+        </Disclosure>
 
         {pickerFooter({
           mode: footerMode.value,
           onMode: (m) => (footerMode.value = footerMode.value === m ? 'none' : m),
           busy: busy.value,
           restoreRunning,
+          target: scopedGateway,
+          targetBlocker,
           name: newName.value,
           onName: (n) => (newName.value = n),
           onCreate,
@@ -1250,11 +1432,12 @@ export function WorkspacePicker() {
           draft: restoreDraft.value,
           onDraft: patchRestore,
           onPickFile: pickRestoreFile,
+          restoreUpload: restoreUpload.value,
           onRestore,
-          onCancelRestore: closeRestore,
+          onCancelRestore,
           blocker,
           fileNote,
-          onDeleteColliding: (id) => { void onDelete([id]); },
+          onDeleteColliding: scopedView === null ? (id) => { void onDelete([id]); } : null,
           remoteDraft: remoteDraft.value,
           onRemoteDraft: patchRemote,
           onAddRemote,

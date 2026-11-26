@@ -34,7 +34,6 @@ fn caller(
     })
 }
 
-/// The headers the gateway forwards for an allowed call from `name`'s thread.
 fn allowed_call(name: &str, thread_id: Option<Uuid>) -> axum::http::HeaderMap {
     stamped_workspace_call_headers(name, thread_id, &SpawnVerdict::Allowed)
 }
@@ -105,8 +104,6 @@ fn build_origin_user_with_device_id_yields_the_device_id_only() {
     }
 }
 
-/// Invariant 1 of the unattested-callers plan: a typed device id is a claim.
-/// With no stamp it builds `UnattestedCaller`, carrying the id as a hint.
 #[test]
 fn a_typed_device_id_with_no_stamp_is_an_unattested_caller() {
     let h = headers_with(&[("user-agent", "curl/8")]);
@@ -122,7 +119,6 @@ fn a_typed_device_id_with_no_stamp_is_an_unattested_caller() {
     );
 }
 
-/// A stamp vouches for one device. Naming another beside it proves nothing.
 #[test]
 fn a_stamp_for_another_device_is_an_unattested_caller() {
     let h = stamped_device_headers("dev-1");
@@ -136,7 +132,6 @@ fn a_stamp_for_another_device_is_an_unattested_caller() {
     );
 }
 
-/// A stamp this engine's key did not sign is no stamp at all.
 #[test]
 fn a_forged_stamp_is_an_unattested_caller() {
     let forged = format!(
@@ -152,9 +147,6 @@ fn a_forged_stamp_is_an_unattested_caller() {
     );
 }
 
-/// A bare curl is nobody, not the owner. Stamping it human is the inversion
-/// ADR 0169 removes: dropping a credential used to buy more than presenting
-/// one, because a tokened caller was stamped `Agent`.
 #[test]
 fn a_caller_with_no_credential_yields_no_actor_at_all() {
     let h = headers_with(&[("user-agent", "curl/8")]);
@@ -165,10 +157,6 @@ fn a_caller_with_no_credential_yields_no_actor_at_all() {
     );
 }
 
-/// Invariant 1 of the unattested-callers plan. The build-watch holds the
-/// machine-local token and no origin token, and so does any subprocess that
-/// reads the file. So the token alone is an unattested caller, in the
-/// `Engine` mode ADR 0169 gave it.
 #[test]
 fn the_machine_local_token_alone_is_an_unattested_caller() {
     let token = crate::api::local_auth::publish_test_local_token();
@@ -190,8 +178,6 @@ fn the_machine_local_token_alone_is_an_unattested_caller() {
     );
 }
 
-/// A device names a person and the local token names a machine, so the person
-/// wins. Nothing sends both today, and the order says which would.
 #[test]
 fn a_device_outranks_the_machine_local_token() {
     let token = crate::api::local_auth::publish_test_local_token();
@@ -204,8 +190,6 @@ fn a_device_outranks_the_machine_local_token() {
     }
 }
 
-/// The local token does not lend a typed device id the stamp it lacks. The
-/// pair is an unattested caller, never the owner's device.
 #[test]
 fn the_machine_local_token_does_not_attest_a_typed_device() {
     let token = crate::api::local_auth::publish_test_local_token();
@@ -226,9 +210,6 @@ fn the_machine_local_token_does_not_attest_a_typed_device() {
     );
 }
 
-/// The thread-bound origin token still wins. An agent holding the machine
-/// token too stays traceable to its own thread, rather than collapsing into
-/// one machine identity.
 #[test]
 fn a_thread_bound_token_outranks_the_machine_local_token() {
     let thread = Uuid::new_v4();
@@ -280,8 +261,6 @@ fn build_origin_human_mode_with_caller_yields_workspace_human_mode() {
 
 #[test]
 fn build_origin_agent_mode_with_caller_yields_workspace_agent_mode() {
-    // CallerOrigin carries the upstream mode — the calling workspace's
-    // actor (Agent here) flows straight into the Workspace branch.
     let h = allowed_call("dev", None);
     let origin = build_message_origin(
         &h,
@@ -316,8 +295,6 @@ fn build_origin_engine_mode_with_caller_yields_workspace_engine_mode() {
     }
 }
 
-/// Invariant 1: a `caller_workspace` with no stamp is a claim, so it builds
-/// an unattested caller carrying the name, never `Workspace`.
 #[test]
 fn an_unstamped_caller_workspace_is_an_unattested_caller() {
     let thread_id = Uuid::new_v4();
@@ -343,8 +320,6 @@ fn an_unstamped_caller_workspace_is_an_unattested_caller() {
     );
 }
 
-/// Every claim stacked, as a forged `curl` would send them, builds one
-/// unattested caller that keeps each claim as a hint.
 #[test]
 fn stacked_claims_beside_a_caller_workspace_keep_every_hint() {
     let token = crate::api::local_auth::publish_test_local_token();
@@ -371,7 +346,6 @@ fn stacked_claims_beside_a_caller_workspace_keep_every_hint() {
     );
 }
 
-/// A stamp for another caller or thread vouches for nothing here.
 #[test]
 fn a_stamp_for_another_caller_workspace_is_unattested() {
     let thread = Uuid::new_v4();
@@ -400,7 +374,6 @@ fn a_stamp_for_another_caller_workspace_is_unattested() {
     }
 }
 
-/// B honors A's verdict as signed: a refused call stays refused.
 #[test]
 fn a_stamped_refusal_rides_the_workspace_origin() {
     let refused = SpawnVerdict::Refused {
@@ -450,8 +423,6 @@ fn build_origin_agent_mode_with_parent_thread_yields_thread_link_parent_agent_mo
 
 #[test]
 fn build_origin_engine_mode_with_no_parent_yields_none() {
-    // Engine-initiated work without a parent thread context returns None;
-    // callers must construct MessageOrigin::Engine { reason } directly.
     let origin = build_message_origin(
         &headers_with(&[]),
         ActorMode::Engine,
@@ -529,12 +500,6 @@ fn user_actor_explicit_id_takes_precedence_over_header() {
     }
 }
 
-/// The pair a mutating handler chooses between. The `Option` form answers
-/// honestly, and the `require` form turns that answer into the refusal.
-///
-/// 401 rather than 403, and the message names all four credentials. A caller
-/// does not know which class the engine put it in. Naming only the one this
-/// route wanted would send it to the wrong door.
 #[tokio::test]
 async fn an_unidentified_caller_resolves_to_nobody_and_is_refused() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -571,7 +536,7 @@ async fn unknown_and_previous_boot_origin_tokens_get_the_restart_diagnostic() {
 
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     install_test_secret();
-    let prefix = format!("{}@0@-", Uuid::new_v4());
+    let prefix = format!("{}@0@-@-", Uuid::new_v4());
     let mut old_mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"previous-boot-secret").unwrap();
     old_mac.update(prefix.as_bytes());
     let previous_boot = format!(
@@ -623,8 +588,6 @@ async fn a_current_origin_token_still_passes_the_actor_gate() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A registered device is identity, so the same call succeeds. Guards against
-/// a refusal that fires on every caller, which the test above cannot see.
 #[tokio::test]
 async fn a_registered_device_passes_the_same_gate() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -639,8 +602,6 @@ async fn a_registered_device_passes_the_same_gate() {
         .expect("a registered device identifies itself");
     assert!(matches!(actor, MessageOrigin::Device { .. }));
 
-    // Typed with no stamp, the same registered id is identity but not the
-    // owner's device.
     let typed = headers_with(&[(HEADER_DEVICE_ID, "gate-device")]);
     let actor = require_user_actor(&typed, &pool, None)
         .await
@@ -653,8 +614,6 @@ async fn a_registered_device_passes_the_same_gate() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A stamp is evidence on its own: a paired device the engine has not yet
-/// registered is still that device.
 #[tokio::test]
 async fn a_stamped_device_needs_no_registration() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -666,16 +625,11 @@ async fn a_stamped_device_needs_no_registration() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The gate's whole point. Attribution records any non-empty id, so a bare
-/// curl could otherwise type one header and be identified. An unstamped id
-/// must at least name a row.
 #[tokio::test]
 async fn an_unregistered_device_id_is_not_evidence() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let h = headers_with(&[(HEADER_DEVICE_ID, "never-registered")]);
 
-    // Attribution still records the claim, as an unattested caller. The gate
-    // must not inherit even that.
     assert!(matches!(
         user_actor(&h, None),
         Some(MessageOrigin::UnattestedCaller { .. })
@@ -689,8 +643,6 @@ async fn an_unregistered_device_id_is_not_evidence() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A closed pool makes the registration probe error. The user's own action
-/// path then keeps identifying the typed id instead of refusing real work.
 #[tokio::test]
 async fn a_database_error_on_the_device_probe_still_identifies_a_typed_id() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -708,9 +660,6 @@ async fn a_database_error_on_the_device_probe_still_identifies_a_typed_id() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An unregistered id is suppressed, not fatal. The caller falls through to
-/// whatever else it holds. So a script sending a stale device id and the
-/// machine token reads as the token alone.
 #[tokio::test]
 async fn an_unregistered_device_id_falls_through_to_the_machine_token() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -732,8 +681,6 @@ async fn an_unregistered_device_id_falls_through_to_the_machine_token() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A blank source is filtered before the fallback, never after it. Filtering
-/// the winner instead would let a blank body field swallow a real header.
 #[tokio::test]
 async fn a_blank_override_does_not_swallow_a_real_device_header() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -761,42 +708,14 @@ async fn a_blank_override_does_not_swallow_a_real_device_header() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-// ── subprocess_origin / agent origin token ──────────────────────────────
-//
-// These tests cover the engine's defense against the incident where an
-// LLM agent ran `curl -X POST /api/v1/changes/<id>/apply` from inside its
-// `run_bash` shell and the resulting `ChangeApplied` event was stamped
-// `actor: { kind: api, mode: human, user_agent: "curl/8.7.1" }` — which
-// the chat-thread UI rendered as a "You" card in the receiving thread.
-// The fix: a Lucidos-spawned subprocess gets `LUCIDOS_AGENT_ORIGIN_TOKEN`
-// in its env. The `lucidos` CLI (and the engine when it shells out for
-// subprocess tools) forwards that value as the
-// `x-lucidos-agent-origin-token` header. The engine recognises the token
-// and stamps `MessageOrigin::Api { mode: Agent, source_thread_id }` so
-// the timeline says "Lucidos Agent" (not "You") and the popover links
-// back to the spawning thread.
-//
-// The token is now **thread-bound**: it is minted per spawn and its own
-// prefix names the thread, so `source_thread_id` is authenticated rather
-// than claimed. Everything below the first four tests exists because that
-// binding has to be unforgeable, not merely present.
-
-/// Helper: install a known secret for the duration of the test.
-/// `init_agent_origin_secret` is idempotent (`OnceLock::set`), so the
-/// first test to run wins for the whole process. That is also why there is no
-/// test for the no-secret-installed path: the suite shares one process, so
-/// whether the secret is set by the time such a test ran would depend on test
-/// ordering. Every test here installs it first.
 fn install_test_secret() {
     init_agent_origin_secret("subprocess-test-secret".to_string());
 }
 
-/// A token minted for `thread_id`, exactly as a spawn would hand it out.
 fn token_for(thread_id: Option<Uuid>) -> String {
     token_for_fire(thread_id, None)
 }
 
-/// A token minted for a spawn that IS `emitting_trigger_id`'s fire.
 fn token_for_fire(thread_id: Option<Uuid>, emitting_trigger_id: Option<&str>) -> String {
     install_test_secret();
     mint_agent_origin_token(thread_id, 0, emitting_trigger_id).expect("secret installed")
@@ -826,6 +745,7 @@ fn subprocess_origin_subprocess_with_matching_token_no_thread() {
             source_thread_id: None,
             chain_depth: 0,
             emitting_trigger_id: None,
+            event_hook: None,
         }
     );
 }
@@ -841,26 +761,19 @@ fn subprocess_origin_subprocess_with_matching_token_and_thread_id() {
             source_thread_id: Some(source),
             chain_depth: 0,
             emitting_trigger_id: None,
+            event_hook: None,
         },
         "the token's own prefix is the source thread; no other input names it"
     );
 }
 
-/// The whole point of the binding. Take a token that verifies, swap its
-/// thread prefix for another thread's id, and the MAC no longer covers
-/// what it claims, so the request is not a subprocess at all.
-///
-/// Before the binding this was the hole: the thread id rode on its own
-/// unverified header, so any subprocess could name any thread and every
-/// gate reading `source_thread_id` was decorative.
 #[test]
 fn a_tampered_thread_prefix_is_not_a_subprocess() {
     let mine = Uuid::new_v4();
     let theirs = Uuid::new_v4();
     let token = token_for(Some(mine));
     let mac = token.rsplit_once('.').expect("minted token has a mac").1;
-    // Every other field left as minted, so only the thread swap is on trial.
-    let forged = format!("{theirs}@0@-.{mac}");
+    let forged = format!("{theirs}@0@-@-.{mac}");
 
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &forged)]);
     assert_eq!(
@@ -870,10 +783,6 @@ fn a_tampered_thread_prefix_is_not_a_subprocess() {
     );
 }
 
-/// Two threads spawned by the same engine get different tokens, and
-/// neither authenticates as the other. (Distinct from the test above: that
-/// one splices a MAC onto a foreign prefix, this one presents a whole,
-/// internally consistent token minted for a different thread.)
 #[test]
 fn a_token_minted_for_one_thread_does_not_authenticate_another() {
     let a = Uuid::new_v4();
@@ -892,25 +801,20 @@ fn a_token_minted_for_one_thread_does_not_authenticate_another() {
             source_thread_id: Some(a),
             chain_depth: 0,
             emitting_trigger_id: None,
+            event_hook: None,
         },
         "a token authenticates as exactly the thread it was minted for"
     );
 }
 
-/// A thread-bound token cannot be edited down to the thread-less sentinel
-/// to shed its identity, because the sentinel is signed like any other
-/// prefix.
 #[test]
 fn a_thread_bound_token_cannot_be_downgraded_to_the_sentinel() {
     let token = token_for(Some(Uuid::new_v4()));
     let mac = token.rsplit_once('.').expect("minted token has a mac").1;
-    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-@0@-.{mac}"))]);
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-@0@-@-.{mac}"))]);
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
 }
 
-/// Every malformed shape is refused rather than partially trusted. A
-/// missing separator, an empty MAC, a non-hex MAC and a truncated MAC each
-/// reach a different early return.
 #[test]
 fn a_malformed_token_is_not_a_subprocess() {
     let source = Uuid::new_v4();
@@ -952,8 +856,6 @@ fn subprocess_origin_env_vars_binds_the_token_to_the_thread() {
         &mint_agent_origin_token(Some(tid), 0, None).expect("secret installed"),
         "the spawn env's token must be the one minted for this thread"
     );
-    // And it round-trips through the wire: what the spawn hands out is what
-    // the engine reads back.
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, token)]);
     assert_eq!(
         subprocess_origin(&h),
@@ -961,10 +863,9 @@ fn subprocess_origin_env_vars_binds_the_token_to_the_thread() {
             source_thread_id: Some(tid),
             chain_depth: 0,
             emitting_trigger_id: None,
+            event_hook: None,
         }
     );
-    // `LUCIDOS_THREAD_ID` still ships, for the subprocess-side consumers
-    // that read it directly. The engine no longer reads it back.
     assert_eq!(
         map.get(ENV_SOURCE_THREAD_ID).map(String::as_str),
         Some(tid.to_string().as_str())
@@ -988,17 +889,12 @@ fn subprocess_origin_env_vars_without_a_thread_binds_the_sentinel() {
             source_thread_id: None,
             chain_depth: 0,
             emitting_trigger_id: None,
+            event_hook: None,
         },
         "a scheduled script authenticates as a subprocess with no thread"
     );
 }
 
-// The trigger claim. A trigger's script runs in its own process, where the
-// `ACTIVE_TRIGGER_ID` task-local cannot reach, so the claim rides the signed
-// prefix instead. See ADR 0137 and the module docs.
-
-/// A trigger's script carries its trigger and no thread. That is the shape
-/// `execute_script` mints for a scheduled fire.
 #[test]
 fn a_scheduled_script_token_carries_the_trigger_that_ran_it() {
     let trigger = Uuid::new_v4().to_string();
@@ -1010,13 +906,12 @@ fn a_scheduled_script_token_carries_the_trigger_that_ran_it() {
             source_thread_id: None,
             chain_depth: 0,
             emitting_trigger_id: Some(trigger),
+            event_hook: None,
         },
         "the script IS the fire, so its emits must not wake the trigger"
     );
 }
 
-/// A bash or python tool inside a fire carries both. It runs on the fire's own
-/// task and starts no thread, so the marker travels with it.
 #[test]
 fn a_tool_token_carries_both_the_thread_and_the_trigger() {
     let tid = Uuid::new_v4();
@@ -1029,13 +924,11 @@ fn a_tool_token_carries_both_the_thread_and_the_trigger() {
             source_thread_id: Some(tid),
             chain_depth: 0,
             emitting_trigger_id: Some(trigger),
+            event_hook: None,
         }
     );
 }
 
-/// The MAC comes off the last dot, and the trigger is the last field. So a
-/// trigger id holding a separator of its own still parses. Trigger ids are
-/// uuids today, and this keeps a future id shape from breaking the claim.
 #[test]
 fn a_trigger_id_holding_a_separator_still_round_trips() {
     for id in ["scan.inbox.v2", "scan@inbox", "scan@v2.1"] {
@@ -1047,15 +940,13 @@ fn a_trigger_id_holding_a_separator_still_round_trips() {
                 source_thread_id: None,
                 chain_depth: 0,
                 emitting_trigger_id: Some(id.to_string()),
+                event_hook: None,
             },
             "'{id}' must round-trip intact"
         );
     }
 }
 
-/// A segment that would not survive an HTTP header drops the claim rather
-/// than the token. Fail-open: an unmarked emit wakes everybody, which is
-/// recoverable, and a spawn that cannot authenticate at all is not.
 #[test]
 fn a_trigger_id_that_is_not_header_safe_drops_only_the_claim() {
     let token = token_for_fire(None, Some("with a space"));
@@ -1066,13 +957,11 @@ fn a_trigger_id_that_is_not_header_safe_drops_only_the_claim() {
             source_thread_id: None,
             chain_depth: 0,
             emitting_trigger_id: None,
+            event_hook: None,
         }
     );
 }
 
-/// The denial-of-wake attempt, and the reason the claim is not a plain header.
-/// Every way of editing a trigger into or out of a verifying token fails,
-/// because the MAC covers the whole prefix.
 #[test]
 fn a_trigger_claim_can_be_neither_forged_nor_stripped() {
     let tid = Uuid::new_v4();
@@ -1084,9 +973,9 @@ fn a_trigger_claim_can_be_neither_forged_nor_stripped() {
     let claimed_mac = claimed.rsplit_once('.').expect("minted token has a mac").1;
 
     for (label, candidate) in [
-        ("forged claim", format!("{tid}@0@{victim}.{plain_mac}")),
-        ("stripped claim", format!("{tid}@0@-.{claimed_mac}")),
-        ("swapped claim", format!("{tid}@0@{other}.{claimed_mac}")),
+        ("forged claim", format!("{tid}@0@-@{victim}.{plain_mac}")),
+        ("stripped claim", format!("{tid}@0@-@-.{claimed_mac}")),
+        ("swapped claim", format!("{tid}@0@-@{other}.{claimed_mac}")),
         ("dropped field", format!("{tid}@0.{claimed_mac}")),
     ] {
         let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &candidate)]);
@@ -1098,9 +987,6 @@ fn a_trigger_claim_can_be_neither_forged_nor_stripped() {
     }
 }
 
-/// What an app through the SDK presents: no token at all. So it can express no
-/// claim, and cannot mute a trigger by naming it. The contrast is the point.
-/// A trigger id reaches the engine only inside a token that was minted for it.
 #[test]
 fn a_caller_with_no_token_claims_no_trigger() {
     let trigger = Uuid::new_v4().to_string();
@@ -1112,6 +998,7 @@ fn a_caller_with_no_token_claims_no_trigger() {
             source_thread_id: None,
             chain_depth: 0,
             emitting_trigger_id: Some(trigger.clone()),
+            event_hook: None,
         },
         "a minted token carries the fire it was minted for"
     );
@@ -1134,9 +1021,6 @@ fn a_caller_with_no_token_claims_no_trigger() {
     }
 }
 
-// Shared serialization for tests that mutate process-wide LUCIDOS_API_PORT.
-// Per-function `static` items have unique addresses, so each test would
-// otherwise get its own mutex and they would race each other.
 static API_PORT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn host_pid_var<'a>(vars: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
@@ -1156,8 +1040,6 @@ fn host_protection_env_vars_always_sets_host_pid() {
     );
 }
 
-/// The build-watch pid counts only while its owner lock is held. So a pidfile
-/// naming a reused pid never makes a session protect an unrelated process.
 #[test]
 fn the_build_watch_pid_is_read_only_while_its_lock_is_held() {
     use lucidos_owner_lock::{build_watch, OwnerLock};
@@ -1181,8 +1063,6 @@ fn the_build_watch_pid_is_read_only_while_its_lock_is_held() {
 
 #[test]
 fn host_protection_env_vars_includes_api_port_when_engine_has_one() {
-    // The pre-kill Bash hook uses LUCIDOS_API_PORT to block patterns like
-    // `lsof -ti :<port> | xargs kill` that target the engine port.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     // SAFETY: process-wide env mutation gated by API_PORT_ENV_LOCK.
     unsafe {
@@ -1210,13 +1090,6 @@ fn host_protection_env_vars_omits_api_port_when_engine_has_none() {
 
 #[test]
 fn host_protection_env_vars_adds_loopback_base_url_under_gateway() {
-    // Under the workspace gateway (ADR 0013) the engine binds a LOOPBACK port
-    // and serves plain HTTP — the gateway terminates TLS and routes the
-    // workspace under `/ws/<id>/`. A subprocess that builds its URL from
-    // `.lucidos/ports` (the gateway port, no `/ws/<id>/` prefix) gets the
-    // picker's SPA HTML back instead of JSON. The engine hands same-host
-    // subprocesses the exact loopback base URL so the `lucidos` CLI and scripts
-    // reach the engine directly.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     // SAFETY: process-wide env mutation gated by API_PORT_ENV_LOCK.
     unsafe {
@@ -1228,11 +1101,6 @@ fn host_protection_env_vars_adds_loopback_base_url_under_gateway() {
         std::env::remove_var("LUCIDOS_API_PORT");
         std::env::remove_var("LUCIDOS_BIND_LOOPBACK");
     }
-    // The scheme comes from `net_config::tls_scheme()` (what THIS process
-    // serves), which reads ambient `LUCIDOS_TLS_*` — a dev-spawned test shell
-    // carries them, a fronted engine has them stripped. Assert through the same
-    // resolver so the test is env-agnostic; the scheme decision itself is
-    // covered by net_config's own tests.
     let expected = format!("{}://127.0.0.1:62072", crate::net_config::tls_scheme());
     assert_eq!(
         host_pid_var(&vars, "LUCIDOS_API_BASE_URL"),
@@ -1243,9 +1111,6 @@ fn host_protection_env_vars_adds_loopback_base_url_under_gateway() {
 
 #[test]
 fn host_protection_env_vars_omits_base_url_without_gateway() {
-    // Legacy / Tauri / production: the engine listens on the user-facing port
-    // and the `.lucidos/ports` file resolves it correctly, so no override is
-    // handed down. `LUCIDOS_BIND_LOOPBACK` is set ONLY by the gateway.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     unsafe {
         std::env::set_var("LUCIDOS_API_PORT", "5173");
@@ -1263,11 +1128,6 @@ fn host_protection_env_vars_omits_base_url_without_gateway() {
 
 #[test]
 fn build_origin_subprocess_overrides_human_to_agent_api() {
-    // The actual incident: agent shells out `curl -X POST /api/v1/changes/X/apply`.
-    // No body, no `mode` field — handler defaults to ActorMode::Human.
-    // With the subprocess token in headers, the resulting actor MUST
-    // be stamped as Api { mode: Agent, source_thread_id } instead of
-    // bleeding through as Api { mode: Human } (which the UI renders as "You").
     let source = Uuid::new_v4();
     let token = token_for(Some(source));
     let h = headers_with(&[
@@ -1304,9 +1164,6 @@ fn build_origin_subprocess_overrides_human_to_agent_api() {
 
 #[test]
 fn build_origin_subprocess_overrides_device_id_too() {
-    // A subprocess could also send the device-id header (the run_bash
-    // shell inherits engine env; the agent could read it). Subprocess
-    // origin still wins — agent actions never appear as "You".
     let token = token_for(Some(Uuid::new_v4()));
     let h = headers_with(&[
         ("user-agent", "curl/8.7.1"),
@@ -1335,10 +1192,6 @@ fn build_origin_subprocess_overrides_device_id_too() {
     );
 }
 
-/// Only this engine's subprocesses hold a token it verifies, so a
-/// `caller_workspace` beside one names this workspace. Its caller thread is a
-/// claim the agent wrote: the token replaces it, trigger included, so a
-/// scheduled script cannot spawn as the owner (the spawn gate reads this).
 #[test]
 fn build_origin_a_verified_token_outranks_the_caller_claim() {
     let token = token_for_fire(None, Some("trig-script"));
@@ -1366,11 +1219,6 @@ fn build_origin_a_verified_token_outranks_the_caller_claim() {
 
 #[tokio::test]
 async fn user_actor_subprocess_token_overrides_the_device() {
-    // Regression: even when the request has a device-id header that
-    // resolves cleanly to a real row in the devices table, a valid
-    // subprocess token MUST take precedence and produce an Api{Agent}
-    // actor. The whole point is "agent actions are never 'You', no
-    // matter what other identity the request carries".
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     crate::test_support::seed_device(&pool, "real-device", Some("Mozilla"), Some("My MacBook"))
         .await;
@@ -1398,10 +1246,6 @@ async fn user_actor_subprocess_token_overrides_the_device() {
     }
     crate::test_support::teardown_test_db(&db_name).await;
 }
-
-// ── require_owner_device ───────────────────────────────────────────────
-//
-// Owner-device gate coverage, including deletion (ADR 0192).
 
 #[tokio::test]
 async fn owner_gate_refusals_name_the_act_and_the_next_step() {
@@ -1458,7 +1302,6 @@ async fn owner_gate_refusals_name_the_act_and_the_next_step() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The gate requires both a gateway stamp and a registered device row.
 #[tokio::test]
 async fn the_owners_registered_device_may_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1473,7 +1316,6 @@ async fn the_owners_registered_device_may_delete() {
         .expect("the owner's own device is exactly who this is for");
     assert!(matches!(actor, MessageOrigin::Device { .. }));
 
-    // The same registered id, typed with no stamp, is an unattested caller.
     let typed = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
     let refusal = require_owner_device(&typed, &pool, &bus, None, "delete a thread")
         .await
@@ -1483,9 +1325,6 @@ async fn the_owners_registered_device_may_delete() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The case the whole gate exists for. A Lucidos-spawned subprocess holds a
-/// verified thread-bound origin token, which the thread-reach ladder would weigh
-/// against a standing instruction. Here it is simply refused.
 #[tokio::test]
 async fn a_verified_agent_origin_token_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1495,7 +1334,6 @@ async fn a_verified_agent_origin_token_may_not_delete() {
         .expect("the secret is installed, so a token mints");
 
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
-    // It really is a verified subprocess, not a token the engine ignored.
     assert!(matches!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess { .. }
@@ -1510,9 +1348,6 @@ async fn a_verified_agent_origin_token_may_not_delete() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A subprocess that also presents a device header is still a subprocess:
-/// `build_message_origin` puts the origin token first. So the obvious way round
-/// the gate does not work.
 #[tokio::test]
 async fn an_agent_token_beside_a_real_device_header_is_still_refused() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1542,8 +1377,6 @@ async fn an_agent_token_beside_a_real_device_header_is_still_refused() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The engine's own machinery, which the build-watch and the release scripts
-/// hold. It is a real credential and it is not a person.
 #[tokio::test]
 async fn the_machine_local_token_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1559,8 +1392,6 @@ async fn the_machine_local_token_may_not_delete() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An unattributed API caller, which is what an external client that forgot its
-/// credential looks like. 401 rather than 403: it may retry with one.
 #[tokio::test]
 async fn an_unattributed_caller_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1575,8 +1406,6 @@ async fn an_unattributed_caller_may_not_delete() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A device id that names no row is a header somebody typed. Attribution
-/// accepts it and this gate must not, or the evidence would be one header.
 #[tokio::test]
 async fn an_unregistered_device_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1597,20 +1426,12 @@ async fn an_unregistered_device_may_not_delete() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The `device_is_evidence` fail-open is right where it was made, on the user's
-/// own send path. Here it is not: a pool timeout would promote an invented id
-/// to a `Device` actor and take the thread family with it.
-///
-/// Driven by closing the pool, which is the shape a saturated or dropped pool
-/// produces: the probe errors rather than answering false.
 #[tokio::test]
 async fn a_database_blip_cannot_promote_an_invented_device() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
     let h = stamped_device_headers("invented");
 
-    // `require_user_actor` admits the stamped id, which is exactly what this
-    // gate must not inherit while the device row cannot be read.
     pool.close().await;
     assert!(matches!(
         require_user_actor(&h, &pool, None).await,
@@ -1626,9 +1447,6 @@ async fn a_database_blip_cannot_promote_an_invented_device() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// A re-paired window holds a stamped id the engine has no row for yet. The
-/// gateway's stamp is the proof, so the gate registers the device and admits it,
-/// announcing `DeviceRegistered` once.
 #[tokio::test]
 async fn a_stamped_device_without_a_row_is_registered_and_admitted() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1659,7 +1477,6 @@ async fn a_stamped_device_without_a_row_is_registered_and_admitted() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The old row of a re-paired window merges into the row the gate created.
 #[tokio::test]
 async fn a_hand_over_after_the_gate_registered_merges_the_old_row() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1689,8 +1506,6 @@ async fn a_hand_over_after_the_gate_registered_merges_the_old_row() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// An app iframe runs on the engine's own origin and reaches the shell's
-/// `localStorage`, so its `fetch` can name the owner's device (ADR 0117, ADR 0144).
 #[tokio::test]
 async fn an_app_document_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1716,7 +1531,6 @@ async fn an_app_document_may_not_delete() {
         .expect_err("an app must not press the owner's button with the owner's id");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
 
-    // A stamped id with no row is refused the same way, and gains no row.
     let mut unregistered = headers_with(&[
         ("sec-fetch-site", "same-origin"),
         ("referer", "https://localhost:5173/app/habit-tracker/"),
@@ -1731,8 +1545,6 @@ async fn an_app_document_may_not_delete() {
             .unwrap()
     );
 
-    // The same device from the shell itself is fine, so the refusal is about the
-    // document rather than about browsers.
     let mut shell = headers_with(&[
         ("sec-fetch-site", "same-origin"),
         ("referer", "https://localhost:5173/"),
@@ -1747,8 +1559,6 @@ async fn an_app_document_may_not_delete() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The gateway forwards the pairing label percent-encoded, beside the id of the
-/// device it authenticated.
 #[test]
 fn pairing_label_for_decodes_the_label_of_the_named_device() {
     let h = headers_with(&[
@@ -1761,8 +1571,6 @@ fn pairing_label_for_decodes_the_label_of_the_named_device() {
     );
 }
 
-/// A client moving off its old id registers that id while the gateway names the
-/// new one. The old row must not take the new device's name.
 #[test]
 fn pairing_label_for_refuses_a_device_the_header_does_not_name() {
     let h = headers_with(&[
@@ -1775,12 +1583,6 @@ fn pairing_label_for_refuses_a_device_the_header_does_not_name() {
     assert_eq!(pairing_label_for(&blank, "phone-1"), None);
 }
 
-// ── require_attested_owner ────────────────────────────────────────────────
-
-/// Regression: a human-only route asked only whether the caller was
-/// identified, and a verified origin token is an identity. So an agent could
-/// confirm its own email draft or read a credential through the same route the
-/// Settings page uses.
 #[test]
 fn a_verified_origin_token_is_refused_as_an_agent() {
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token_for(Some(Uuid::new_v4())))]);
@@ -1789,8 +1591,6 @@ fn a_verified_origin_token_is_refused_as_an_agent() {
     assert_eq!(refusal.message, "only the owner sends this");
 }
 
-/// The device the gateway stamped passes, with the local token beside it as
-/// every proxied request carries.
 #[test]
 fn a_stamped_device_is_the_attested_owner() {
     let local = crate::api::local_auth::publish_test_local_token();
@@ -1800,10 +1600,6 @@ fn a_stamped_device_is_the_attested_owner() {
     assert!(require_attested_owner(&stamped_device_headers("device-abc"), "refused",).is_ok());
 }
 
-/// Invariant 1 of the unattested-callers plan, at the human-only routes. A
-/// typed device id, the machine-local token alone, a token that does not
-/// verify and no credential are claims, not the owner. They hear what to do
-/// instead.
 #[test]
 fn an_unattested_caller_is_refused_as_not_the_owner() {
     let local = crate::api::local_auth::publish_test_local_token();

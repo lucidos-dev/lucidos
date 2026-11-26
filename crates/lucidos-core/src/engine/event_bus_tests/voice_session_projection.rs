@@ -1,9 +1,6 @@
-//! A call makes the thread real, and moves nothing a turn owns (ADR 0167).
-
 use super::super::*;
 use super::*;
 
-/// A draft carrying a stored compose text, so the clear has something to clear.
 async fn a_draft(bus: &EventBus, pool: &sqlx::PgPool) -> Uuid {
     let thread_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
@@ -80,8 +77,6 @@ async fn the_talker_says(bus: &EventBus, thread_id: Uuid, text: &str) {
     .unwrap();
 }
 
-/// The reported bug. The talker answered every utterance itself, so nothing
-/// emitted a `MessageReceived` and the whole call stayed inside a draft.
 #[tokio::test]
 async fn a_spoken_word_promotes_the_draft_the_call_was_placed_from() {
     let (pool, db_name) = setup_test_db().await;
@@ -106,8 +101,6 @@ async fn a_spoken_word_promotes_the_draft_the_call_was_placed_from() {
     teardown_test_db(&db_name).await;
 }
 
-/// The talker greets before the caller says anything, so its own row is
-/// usually the first. Either can be, and either promotes.
 #[tokio::test]
 async fn a_greeting_promotes_it_too_when_it_lands_first() {
     let (pool, db_name) = setup_test_db().await;
@@ -129,9 +122,6 @@ async fn a_greeting_promotes_it_too_when_it_lands_first() {
     teardown_test_db(&db_name).await;
 }
 
-/// Connecting is not a conversation. Hang up before a word is said and the
-/// draft stays a draft, which the reader can still see and discard. Promoting
-/// there would leave a row nothing lists and nobody can reach.
 #[tokio::test]
 async fn a_call_nobody_spoke_on_leaves_the_draft_a_draft() {
     let (pool, db_name) = setup_test_db().await;
@@ -154,8 +144,6 @@ async fn a_call_nobody_spoke_on_leaves_the_draft_a_draft() {
     teardown_test_db(&db_name).await;
 }
 
-/// A call is not a turn (ADR 0149), so the promotion touches no column a turn
-/// owns. A thread reading `running` with nothing running is the failure.
 #[tokio::test]
 async fn the_promotion_moves_no_column_a_turn_owns() {
     let (pool, db_name) = setup_test_db().await;
@@ -180,8 +168,6 @@ async fn the_promotion_moves_no_column_a_turn_owns() {
     teardown_test_db(&db_name).await;
 }
 
-/// The epoch is how a device learns its draft is gone. Broadcast rather than
-/// left for the next reload, because the draft is on screen right now.
 #[tokio::test]
 async fn the_promotion_tells_every_device_the_draft_is_gone() {
     let (pool, db_name) = setup_test_db().await;
@@ -222,9 +208,6 @@ async fn the_promotion_tells_every_device_the_draft_is_gone() {
     teardown_test_db(&db_name).await;
 }
 
-/// A second call on a thread that is already real changes nothing about it
-/// being real. The gate is what keeps the epoch still, so a reply draft
-/// typed between the two calls survives the second one.
 #[tokio::test]
 async fn a_call_on_a_live_thread_leaves_its_reply_draft_alone() {
     let (pool, db_name) = setup_test_db().await;
@@ -256,9 +239,6 @@ async fn a_call_on_a_live_thread_leaves_its_reply_draft_alone() {
     teardown_test_db(&db_name).await;
 }
 
-/// What the caller said first is what the drawer row reads, because
-/// `format_display_title` falls back to it. A later utterance must not rewrite
-/// the title out from under the reader.
 #[tokio::test]
 async fn the_callers_first_words_title_a_call_nobody_delegated_from() {
     let (pool, db_name) = setup_test_db().await;
@@ -281,12 +261,6 @@ async fn the_callers_first_words_title_a_call_nobody_delegated_from() {
     teardown_test_db(&db_name).await;
 }
 
-/// The point of the whole change, asked of the query the drawer actually runs.
-///
-/// Promotion alone is not enough and looked like it was: `get_recent_threads`
-/// filters on `has_response`, so a promoted call with that column false is
-/// neither a draft nor a listed thread. Every column assertion above passed
-/// while the thread was unreachable, which is why this test asks the query.
 #[tokio::test]
 async fn a_finished_call_reaches_the_drawer() {
     let (pool, db_name) = setup_test_db().await;
@@ -310,11 +284,6 @@ async fn a_finished_call_reaches_the_drawer() {
     teardown_test_db(&db_name).await;
 }
 
-/// The one-shot rescue for drafts the old projection already stranded.
-///
-/// The migration is applied before any test writes a row, so it cannot see one.
-/// Run its own text against the shape it exists for, twice, since a backfill
-/// that is not idempotent is one that cannot be replayed.
 #[tokio::test]
 async fn the_migration_rescues_a_call_the_old_projection_stranded() {
     const MIGRATION: &str =
@@ -325,9 +294,6 @@ async fn the_migration_rescues_a_call_the_old_projection_stranded() {
     let stranded = a_draft(&bus, &pool).await;
     let untouched = a_draft(&bus, &pool).await;
 
-    // The pre-fix shape: the events landed, and no column moved. Put every
-    // column the new arms write back where the old one left it, or the test
-    // measures the arms rather than the migration.
     a_call_opens(&bus, stranded).await;
     the_caller_says(&bus, stranded, "what happened overnight").await;
     sqlx::query(
@@ -373,8 +339,6 @@ async fn the_migration_rescues_a_call_the_old_projection_stranded() {
     teardown_test_db(&db_name).await;
 }
 
-/// A whole call has to move the drawer. Otherwise a talker-only conversation
-/// leaves the thread sorted where it was before anybody spoke.
 #[tokio::test]
 async fn a_spoken_turn_keeps_the_threads_recency_current() {
     let (pool, db_name) = setup_test_db().await;

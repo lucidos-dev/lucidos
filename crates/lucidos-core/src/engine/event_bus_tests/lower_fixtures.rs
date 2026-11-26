@@ -9,7 +9,6 @@ async fn assert_active_children(pool: &PgPool, parent_id: Uuid, expected: i32, m
     assert_eq!(count, expected, "{}", msg);
 }
 
-/// Count the persisted `ChildThreadCompleted` cards sitting on `parent_id`.
 async fn count_completion_cards(pool: &PgPool, parent_id: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM events \
@@ -21,7 +20,6 @@ async fn count_completion_cards(pool: &PgPool, parent_id: Uuid) -> i64 {
     .unwrap()
 }
 
-/// Emit a `ResponseCanceled` with an explicit cause on `thread_id`.
 async fn emit_response_canceled_with_cause(
     bus: &EventBus,
     thread_id: Uuid,
@@ -42,7 +40,6 @@ async fn emit_response_canceled_with_cause(
     .unwrap();
 }
 
-/// How many parent wakes are queued on `rx`, draining them.
 fn drain_callbacks(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ParentCallback>) -> usize {
     let mut n = 0;
     while rx.try_recv().is_ok() {
@@ -51,7 +48,6 @@ fn drain_callbacks(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ParentCallback>
     n
 }
 
-/// `(status, summary)` of the newest `ChildThreadCompleted` on `parent_id`.
 async fn newest_completion_card(pool: &PgPool, parent_id: Uuid) -> (String, String) {
     sqlx::query_as(
         "SELECT payload->>'status', payload->>'summary' FROM events \
@@ -64,9 +60,6 @@ async fn newest_completion_card(pool: &PgPool, parent_id: Uuid) -> (String, Stri
     .unwrap()
 }
 
-/// Emit a legacy per-commit `ChangeProposed` (empty change_id, commit_sha set).
-/// The new projection treats these as inert in `thread_summaries`; they only
-/// flow through `write_proposed_per_commit` (UPDATE-only on `changes`).
 async fn emit_change_proposed_per_commit(
     bus: &EventBus,
     thread_id: Uuid,
@@ -101,9 +94,6 @@ async fn emit_change_proposed_per_commit(
     .unwrap();
 }
 
-/// Record that `thread_id`'s branch holds work, through the same SET fragment
-/// every branch-fact writer uses. In production `session_seed` writes it from
-/// on-disk git; tests that need it as a precondition write it directly.
 async fn force_branch_work(pool: &sqlx::PgPool, thread_id: Uuid) {
     sqlx::query(&format!(
         "UPDATE thread_summaries SET {} WHERE thread_id = $1",
@@ -115,9 +105,6 @@ async fn force_branch_work(pool: &sqlx::PgPool, thread_id: Uuid) {
     .unwrap();
 }
 
-/// Read the attention counter. Tests use it to verify that a parent enters
-/// Review when a descendant needs attention, even when another descendant is
-/// still running.
 async fn read_attention_descendant_count(pool: &PgPool, thread_id: Uuid) -> i32 {
     sqlx::query_scalar(
         "SELECT attention_descendant_count FROM thread_summaries WHERE thread_id = $1",
@@ -128,9 +115,6 @@ async fn read_attention_descendant_count(pool: &PgPool, thread_id: Uuid) -> i32 
     .unwrap()
 }
 
-/// Spawn parent + CC child, bring the child to Idle (post-session, no pending
-/// changes). Returns (parent_id, child_id); parent's blocking_descendant_count
-/// is 0 at return — the test starts from a clean baseline.
 async fn spawn_parent_with_idle_cc_child(bus: &EventBus, pool: &PgPool) -> (Uuid, Uuid) {
     let (parent_id, child_id) = spawn_parent_child(bus, EventChannel::ClaudeCode).await;
     emit_cc_session_started(bus, child_id).await;

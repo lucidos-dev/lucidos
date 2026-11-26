@@ -100,7 +100,6 @@ fn preferences_changed_is_persisted_with_key_value() {
     assert_eq!(set.aggregate(), "preference");
     assert_eq!(set.event_type(), "PreferencesChanged");
 
-    // to_payload() wraps in serde's tag/content envelope: { "type": "...", "data": { ... } }
     let json = set.to_payload();
     assert_eq!(json["data"]["key"], crate::core::prefs::LANGUAGE.key());
     assert_eq!(json["data"]["value"], "nb");
@@ -117,7 +116,6 @@ fn preferences_changed_delete_has_null_value() {
 
     let json = del.to_payload();
     assert_eq!(json["data"]["key"], "old_setting");
-    // value is None → skipped by skip_serializing_if
     assert!(
         json["data"].get("value").is_none(),
         "None value should be skipped"
@@ -218,7 +216,7 @@ fn artifact_created_serializes_and_persists() {
         commit: "abc1234".to_string(),
         source: Some("run_python".to_string()),
         writer_thread_id: Some(uuid::Uuid::nil()),
-        writer: None, // Legacy event fixture.
+        writer: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ArtifactCreated");
@@ -241,7 +239,7 @@ fn artifact_updated_skips_none_source() {
         commit: "def5678".to_string(),
         source: None,
         writer_thread_id: None,
-        writer: None, // Legacy event fixture.
+        writer: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ArtifactUpdated");
@@ -362,12 +360,10 @@ fn email_sent_persists_envelope_metadata_without_body() {
     assert_eq!(json["data"]["cc"][0], "carol@example.com");
     assert_eq!(json["data"]["subject"], "Q3 numbers");
     assert_eq!(json["data"]["attachment_count"], 2);
-    // Body is intentionally NOT broadcast — it's user data.
     assert!(
         json["data"].get("body").is_none(),
         "EmailSent must never carry the message body"
     );
-    // Empty bcc is skipped to keep the wire shape tight.
     assert!(
         json["data"].get("bcc").is_none(),
         "Empty bcc Vec should be omitted from the payload"
@@ -407,14 +403,11 @@ fn proxy_modules_reloaded_persists_with_names_list() {
     assert_eq!(json["data"]["names"][1], "test-echo");
     assert!(event.is_persisted());
     assert_eq!(event.aggregate(), "proxy_modules");
-    // No per-row identity — there's one auth-modules map globally.
     assert_eq!(event.aggregate_id(), "global");
 }
 
 #[test]
 fn proxy_modules_reloaded_handles_empty_reload() {
-    // The auth-modules directory may legitimately be empty; the audit
-    // row should still write so the timeline records the swap.
     let event = SystemEvent::ProxyModulesReloaded {
         count: 0,
         names: vec![],
@@ -438,15 +431,11 @@ fn domain_event_is_persisted_with_inner_payload() {
     assert!(event.is_persisted());
     assert_eq!(event.aggregate(), "domain");
     assert_eq!(event.aggregate_id(), "SlideTextEdited");
-    // Must not double-wrap — DB and SSE consumers expect the raw inner payload
     let payload = event.to_payload();
     assert_eq!(payload["slide_id"], 1);
     assert_eq!(payload["summary"], "Updated title");
 }
 
-/// Transient domain events (e.g. SlidePresenterState heartbeats every 3s)
-/// must be broadcast on SSE but skip the events table — otherwise we'd
-/// write ~1,200 rows/hour for a single Super Slides session.
 #[test]
 fn transient_domain_event_is_not_persisted() {
     let event = SystemEvent::DomainEvent {
@@ -462,8 +451,6 @@ fn transient_domain_event_is_not_persisted() {
     );
 }
 
-/// Transient flag is internal control state — must not appear on the SSE
-/// wire format (frontend listeners shouldn't have to know about it).
 #[test]
 fn transient_domain_event_sse_json_uses_inner_event_type() {
     let emitted = EmittedEvent {
@@ -494,18 +481,11 @@ fn transient_domain_event_sse_json_uses_inner_event_type() {
     );
 }
 
-/// Phase 4: per-turn idle is signaled by `CodingAgentIdled`, NOT
-/// `SessionEnded`. ChangeProposed must appear before the idle marker so the
-/// frontend can render "Done · 1 change" the moment idle fires. SessionEnded
-/// is now reserved for terminal events (Shutdown / Panic / Closed) and never
-/// appears in the normal turn sequence.
 #[test]
 fn coding_agent_idled_is_last_event_after_change_proposed() {
     let (tx, mut rx) = broadcast::channel::<EmittedEvent>(16);
     let tid = Uuid::new_v4();
 
-    // Correct event ordering for a CC turn that proposes a change:
-    // ResponseGenerated → ChangeProposed → CodingAgentIdled
     let events = vec![
         ThreadEvent::ResponseGenerated {
             text: "Done.".into(),
@@ -546,7 +526,7 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
     for event in &events {
         let _ = tx.send(EmittedEvent {
             event_id: Uuid::new_v4(),
-            seq: Some(0), // seq doesn't matter for ordering test
+            seq: Some(0),
             created: Utc::now(),
             typed: BusEvent::Thread {
                 thread_id: tid,
@@ -578,25 +558,12 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
     );
 }
 
-/// The persistence half of the HTML-entity bug hunt
-/// (`docs/plans/2026-08-09-tool-arg-html-entity-repair.md`): a tool argument
-/// holding `& < > " '` must reach the `events` row byte-identical, and come
-/// back out the same way.
-///
-/// The reported corruption was visible in persisted `ToolCalled` args, so
-/// Postgres and the jsonb round-trip were suspects alongside the provider
-/// stream. Neither escapes: this pins that, so a future regression in the
-/// write path cannot hide behind `engine::tool_arg_entity_repair` fixing the
-/// label arguments while silently mangling the rest.
 #[tokio::test]
 async fn tool_called_args_persist_special_characters_verbatim() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    // A plain-text label alongside markup the model wrote on purpose: after
-    // the repair the first is literal and the second keeps its escaping, and
-    // persistence must not touch either.
     let name = "Machine & Tooling <Health> \"q\" 'a'";
     let html = "<p>Tools &amp; Toys</p>";
 

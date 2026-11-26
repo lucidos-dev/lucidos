@@ -156,8 +156,6 @@ pub(super) async fn restore(
         };
         match delivered {
             Ok(()) => {}
-            // The gateway never took the restore, so the journal must not keep
-            // the workspace in maintenance behind a running engine.
             Err(Undelivered::Refused) => {
                 let refuser = session.clone();
                 let id = target.restore_id;
@@ -181,12 +179,10 @@ pub(super) async fn restore(
     .map_err(|_| ApiError::internal("snapshot_worker_failed"))?
 }
 
-/// Why an admitted restore did not reach the gateway.
+// INVARIANT: The admission-order test ends here: /// Why an admitted restore
 #[derive(Debug, PartialEq, Eq)]
 enum Undelivered {
-    /// The gateway provably did not start it: nothing was sent, or it answered.
     Refused,
-    /// The POST left and no answer came back. The restore may be running.
     Unknown,
 }
 
@@ -224,7 +220,7 @@ async fn deliver_restore(
     }
 }
 
-/// Read only external state; never expose PreparedFiles or its host paths.
+/// INVARIANT: Read only external state; never expose PreparedFiles or its host paths.
 pub(super) async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -260,8 +256,6 @@ pub(super) async fn status(
 mod tests {
     use super::*;
 
-    /// Only a POST that left without an answer stays ambiguous. Every other
-    /// failure proves the gateway took nothing, so the caller can settle it.
     #[tokio::test]
     async fn delivery_is_refused_unless_the_post_left_unanswered() {
         use axum::routing::{get, post};

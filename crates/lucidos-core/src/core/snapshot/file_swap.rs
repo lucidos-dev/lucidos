@@ -1,4 +1,4 @@
-//! Preservation-aware offline file installation. The caller holds the archive
+//! INVARIANT: Preservation-aware offline file installation. The caller holds the archive
 //! locks and has durably journaled recovery before `apply`. Staging and trash
 //! intentionally survive errors/crashes; recovery is the authoritative rollback.
 use super::{check, manifest::Manifest, restore_files, BoxError};
@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Stored externally before mutation; rollback never reads the restored policy.
+/// INVARIANT: Stored externally before mutation; rollback never reads the restored policy.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenPolicy {
@@ -63,7 +63,6 @@ fn data_binding(workspace: &Path) -> Result<Option<PathBuf>, BoxError> {
     }
 }
 
-/// Names the staging tree a swap creates beside each live root.
 pub(super) const SWAP_STAGING_PREFIX: &str = ".lucidos-snapshot-swap-";
 
 pub struct FileSwap {
@@ -72,7 +71,6 @@ pub struct FileSwap {
     links: BTreeSet<PathBuf>,
     expected: BTreeMap<PathBuf, FileIndexEntry>,
     operations: Vec<Operation>,
-    /// Retained for diagnosis, never automatically removed on drop.
     pub staging_roots: Vec<PathBuf>,
 }
 
@@ -83,7 +81,6 @@ struct Operation {
 }
 
 impl FileSwap {
-    /// [`Self::prepare_with_policy`] under the workspace's current policy.
     #[cfg(test)]
     pub fn prepare(
         archive: &Path,
@@ -95,7 +92,7 @@ impl FileSwap {
         Self::prepare_with_policy(archive, manifest, staged, workspace, &policy)
     }
 
-    /// Authenticate/check the archive before calling this method. No live file
+    /// INVARIANT: Authenticate/check the archive before calling this method. No live file
     /// is changed here. Every replacement is copied, checked and fsynced on its
     /// destination device before the first live rename is permitted.
     pub fn prepare_with_policy(
@@ -131,8 +128,6 @@ impl FileSwap {
                 expected.insert(record.path.clone(), record);
             }
         }
-        // Current links win, including a link that blocks an archived parent.
-        // Refuse an incompatible shape rather than removing preserved content.
         for path in expected.keys() {
             if links.iter().any(|link| link.starts_with(path)) {
                 return Err("snapshot file conflicts with a preserved symbolic link".into());
@@ -205,11 +200,11 @@ impl FileSwap {
         })
     }
 
-    /// Call only after persisting FileSwap in the external restore journal.
+    /// INVARIANT: Call only after persisting FileSwap in the external restore journal.
     /// A failure (including interruption) requires recovery-snapshot rollback;
     /// this operation is deliberately not advertised as retryable.
     pub fn apply(&self) -> Result<(), BoxError> {
-        // Remove leaves first, allowing directory/file shape changes without
+        // INVARIANT: Remove leaves first, allowing directory/file shape changes without
         // replacing a directory containing excluded descendants.
         for operation in &self.operations {
             match std::fs::symlink_metadata(&operation.target) {
@@ -242,7 +237,7 @@ impl FileSwap {
         self.verify()
     }
 
-    /// Compare eligible live files against the archive using the *original*
+    /// INVARIANT: Compare eligible live files against the archive using the *original*
     /// ignore policy, even after data/.backupignore itself has been restored.
     pub fn verify(&self) -> Result<(), BoxError> {
         let (actual, links) = inventory(&self.workspace, &self.ignore)?;
@@ -283,9 +278,6 @@ fn inventory(
                     }
                 }
             } else if kind.is_dir() {
-                // Use capture's shared predicate at each leaf. It owns both
-                // prefix and glob ancestor semantics, including exclusions
-                // nested inside otherwise restorable directories.
                 visit(root, &path, ignore, files, links)?;
             } else if !is_excluded_workspace_path(relative, ignore) {
                 if !kind.is_file() {

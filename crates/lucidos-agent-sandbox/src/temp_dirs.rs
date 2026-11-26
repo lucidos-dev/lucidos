@@ -1,10 +1,6 @@
-//! Scratch roots shared by command scope and process write confinement.
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// True when an inherited temp setting may serve as a scratch root. The home
-/// directory, and any folder that holds it, never may: a misset `TMPDIR`
-/// would turn the user's own files into scratch.
 fn inherited_is_usable(path: &Path, home: Option<&Path>) -> bool {
     let holds_home = |dir: &Path| home.is_some_and(|home| home.starts_with(dir));
     path.is_absolute()
@@ -18,7 +14,6 @@ fn inherited_tmpdir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// True when the inherited `TMPDIR` is unset or is one of [`roots`].
 pub fn inherited_tmpdir_is_scratch() -> bool {
     inherited_tmpdir().is_none_or(|dir| roots().contains(&dir))
 }
@@ -36,7 +31,6 @@ pub fn roots() -> &'static [PathBuf] {
             paths.push(path);
         }
         paths.retain(|path| path.is_absolute() && path.parent().is_some());
-        // Include canonical aliases, e.g. macOS /private/var/tmp.
         let aliases: Vec<_> = paths.iter().filter_map(|p| p.canonicalize().ok()).collect();
         paths.extend(aliases);
         paths.sort();

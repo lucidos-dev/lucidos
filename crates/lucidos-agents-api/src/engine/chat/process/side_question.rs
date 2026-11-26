@@ -1,10 +1,3 @@
-//! A Lucidos Agent *side question*: one model call beside the thread.
-//!
-//! It sends a turn's own prefix, the system prompt and the tools, so the prompt
-//! cache serves it. Then come the thread's history and the question. It is
-//! never a turn: the only thing it records here is its cost. A tool call in the
-//! reply is refused and never run, as a Claude Code side question's hook does.
-
 use crate::engine::chat::process::history::HistoryExt;
 use crate::engine::chat::process::memory_views::MemoryViewsExt;
 use crate::engine::chat::process::run::ProcessRunExt;
@@ -23,14 +16,10 @@ use crate::engine::side_question_policy::{
     SIDE_QUESTION_MAX_TURNS, SIDE_QUESTION_TOOL_REFUSAL,
 };
 
-/// How the asker reads this agent in a failure.
 const AGENT: &str = "The Lucidos Agent";
 
 #[easy_ext::ext(ProcessSideQuestionExt)]
 pub(crate) impl LucidosEngine {
-    /// Answer a side question in a Lucidos Agent thread, from the thread's
-    /// history and the agent's own model. `deadline` bounds each model call,
-    /// never the capture that records what it cost.
     async fn answer_lucidos_side_question(
         &self,
         thread_id: Uuid,
@@ -65,7 +54,6 @@ pub(crate) impl LucidosEngine {
             )
             .await;
 
-        // Mid-turn it shares the running turn's cache, never a pending pick.
         let overrides = self
             .running_turn_overrides(thread_id)
             .await
@@ -85,8 +73,6 @@ pub(crate) impl LucidosEngine {
             .model
             .clone()
             .unwrap_or_else(|| provider.default_model().to_string());
-        // A Tree workspace's history is its memory views, read as a turn here
-        // would read them.
         let context_window = self.context_window_for(&model, resolved.as_selection().provider);
         let budget_model = self.request_budget_model_for(&model, resolved.as_selection().provider);
         let views = if capabilities.gates.memory_tree {
@@ -126,8 +112,6 @@ pub(crate) impl LucidosEngine {
                     &self.workspace_path,
                     &history.history_image_hashes,
                     Some(images),
-                    // `SideQuestionAsked` is not walked for thread images, so a
-                    // handle printed here would resolve to nothing.
                     &[],
                 ),
             ),
@@ -178,8 +162,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Append the reply's tool calls and a refusal for each, so the next round
-/// answers instead. Nothing runs.
 fn refuse_tool_calls(messages: &mut Vec<Message>, response: &crate::llm::provider::LlmResponse) {
     let mut asked: Vec<ContentBlock> = response
         .history_text()

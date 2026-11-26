@@ -2,6 +2,7 @@
 import type { ListedWorkspace, RemoteGatewayListing } from '../api/client/control';
 import { workspaceState } from './workspaceState';
 import { parseWorkspaceRoute, isWorkspaceSlug, workspaceRouteSegment } from './basePath';
+import type { Loadable } from '../store/types';
 
 export interface RemoteGatewayView {
   gateway: string;
@@ -11,6 +12,14 @@ export interface RemoteGatewayView {
   reasonKind?: string | null;
   workspaces: ListedWorkspace[];
   unreachable: string | null;
+}
+
+export function shownRemoteView(
+  scope: string | null,
+  remotes: Loadable<readonly RemoteGatewayView[]>,
+): RemoteGatewayView | null {
+  if (scope === null || remotes.status !== 'loaded') return null;
+  return remotes.data.find((view) => view.gateway === scope) ?? null;
 }
 
 export function mergeRemoteListings(

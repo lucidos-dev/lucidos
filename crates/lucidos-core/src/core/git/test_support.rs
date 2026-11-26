@@ -1,7 +1,5 @@
 use super::git_cmd;
 
-/// Helper: create a temp git repo with an initial commit on main.
-/// Returns (tempdir_guard, repo_path).
 pub async fn make_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();

@@ -1,4 +1,3 @@
-/// One parsed question from CC's `AskUserQuestion` tool input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedQuestion {
     pub question: String,
@@ -6,12 +5,6 @@ pub struct ParsedQuestion {
     pub multi_select: bool,
 }
 
-/// Extract every question from CC's `AskUserQuestion` tool input. The schema
-/// allows 1–4 questions per call; Lucidos renders them sequentially (one card
-/// at a time on screen) and returns a combined answers map back to CC. Option
-/// ids are synthesized from the array index because CC doesn't supply stable
-/// ids; they stay stable across reloads because the `UserQuestionAsked` event
-/// is persisted intact.
 pub fn parse_ask_user_question_inputs(input: &serde_json::Value) -> Vec<ParsedQuestion> {
     let Some(arr) = input.get("questions").and_then(|q| q.as_array()) else {
         return Vec::new();
@@ -19,7 +12,7 @@ pub fn parse_ask_user_question_inputs(input: &serde_json::Value) -> Vec<ParsedQu
     arr.iter().map(parse_one_question).collect()
 }
 
-/// The question text for one entry, trimmed. Reads ONLY the `question` field —
+/// INVARIANT: The question text for one entry, trimmed. Reads ONLY the `question` field —
 /// the `header` chip-label is supplementary, never a substitute. Returns
 /// `None` when `question` is absent or whitespace-only, so
 /// `walk_question_batch` rejects the batch up front and bounces it back to the
@@ -78,7 +71,7 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
     }
 }
 
-/// The label prefix that marks a *quiet option* on Claude Code. Its native
+/// INVARIANT: The label prefix that marks a *quiet option* on Claude Code. Its native
 /// `AskUserQuestion` refuses any option field beyond label, description and
 /// preview, so the mark rides in the label: `[quiet]`, or `[quiet: <reply>]`
 /// to add a *quiet reply*. The Lucidos Agent and Codex tools take `quiet` and
@@ -87,15 +80,12 @@ pub const QUIET_LABEL_PREFIX: &str = "[quiet]";
 
 const QUIET_REPLY_PREFIX: &str = "[quiet:";
 
-/// A label split from its quiet mark.
 pub struct QuietLabel {
     pub label: String,
     pub quiet: bool,
     pub reply: Option<String>,
 }
 
-/// The label with any quiet prefix removed, whether it had one, and its reply.
-/// The reply ends at the first `]`. A `[quiet:` with no closing `]` is no mark.
 pub fn strip_quiet_label_prefix(label: &str) -> QuietLabel {
     let trimmed = label.trim_start();
     let marked = |rest: &str, reply: Option<&str>| QuietLabel {
@@ -122,10 +112,6 @@ pub fn strip_quiet_label_prefix(label: &str) -> QuietLabel {
     }
 }
 
-/// Lift an option's one *widget embed* out of its description or preview into
-/// its typed `widget` (ADR 0415). Two embeds, or a broken one, are left in
-/// the text untouched: `option_embed_problem` names them, and the walk refuses
-/// the card.
 fn lift_widget_embed(
     mut option: crate::engine::thread_events::QuestionOption,
 ) -> crate::engine::thread_events::QuestionOption {
@@ -147,8 +133,6 @@ fn lift_widget_embed(
     option
 }
 
-/// Why an option's embeds cannot become its widget, if they cannot: more than
-/// one, or one whose syntax is broken.
 pub fn option_embed_problem(
     option: &crate::engine::thread_events::QuestionOption,
 ) -> Option<String> {
@@ -264,8 +248,6 @@ mod tests {
         assert!(!q.multi_select, "absence of multiSelect defaults to false");
     }
 
-    /// The incident's shape: Claude Code put each picture in `preview`, and
-    /// the card showed none of them.
     #[test]
     fn parse_keeps_an_option_preview_and_drops_a_blank_one() {
         let input = serde_json::json!({
@@ -314,11 +296,6 @@ mod tests {
 
     #[test]
     fn parse_yields_empty_question_when_question_absent_even_with_header() {
-        // Strict contract: `header` is NOT a substitute for `question`.
-        // Observed LLM slip (dev event 2026-05-31T04:57) — the model sets a
-        // per-question `header` and drops `question`. The parser leaves the
-        // text empty so `walk_question_batch` rejects the batch and the model
-        // re-asks, instead of the card showing a terse header.
         let input = serde_json::json!({
             "questions": [{
                 "header": "Esc-during-confirm",
@@ -351,9 +328,6 @@ mod tests {
 
     #[test]
     fn parse_yields_empty_question_when_question_absent() {
-        // Malformed — no `question`. The parser leaves the question empty;
-        // `walk_question_batch` rejects the batch up front so no blank card
-        // is ever emitted.
         let input = serde_json::json!({"questions": [{"options": []}]});
         let parsed = parse_ask_user_question_inputs(&input);
         assert_eq!(parsed, vec![placeholder()]);
@@ -405,9 +379,6 @@ mod tests {
 
     #[test]
     fn parse_extracts_all_questions_in_order() {
-        // The whole point of this refactor: every question in the array must
-        // come through, in order, with its own per-question multiSelect flag
-        // and option list. Index-based opt-N ids are independent per question.
         let input = serde_json::json!({
             "questions": [
                 {
@@ -446,8 +417,6 @@ mod tests {
             "second question's multiSelect must be honored independently"
         );
         assert_eq!(parsed[1].options.len(), 2);
-        // Per-question option ids restart at opt-0 — the answer-resolution
-        // layer keys on (question_index, option_id), so this is correct.
         assert_eq!(parsed[1].options[0].id, "opt-0");
         assert_eq!(parsed[1].options[1].id, "opt-1");
 

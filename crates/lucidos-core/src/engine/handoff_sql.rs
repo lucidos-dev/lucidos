@@ -1,6 +1,3 @@
-/// A SQL predicate: `thread` has a `SessionHandedOff` that nothing has ended.
-/// `thread` is a SQL expression, such as `$1` or `c.thread_id`, and may name
-/// any outer alias: the subqueries use their own.
 pub fn pending_handoff_sql(thread: &str) -> String {
     format!(
         concat!(
@@ -19,7 +16,7 @@ pub fn pending_handoff_sql(thread: &str) -> String {
     )
 }
 
-/// `SessionHandedOff` and every type `ends_handoff_sql` matches. The partial
+/// INVARIANT: `SessionHandedOff` and every type `ends_handoff_sql` matches. The partial
 /// index `idx_events_handoff_lifecycle` lists the same types, so the planner
 /// can answer `pending_handoff_threads_sql` from it.
 pub const HANDOFF_LIFECYCLE_EVENT_TYPES: [&str; 5] = [
@@ -30,7 +27,7 @@ pub const HANDOFF_LIFECYCLE_EVENT_TYPES: [&str; 5] = [
     "SessionHandoffWithdrawn",
 ];
 
-/// A SQL query: the `thread_id` of every thread with a pending handoff, the
+/// INVARIANT: A SQL query: the `thread_id` of every thread with a pending handoff, the
 /// set `pending_handoff_sql` tests one thread against. It costs one index
 /// probe per `SessionHandedOff`, whatever the thread count. The `LIMIT 1`
 /// keeps the planner from turning the end probe into a scan of every end event.
@@ -39,9 +36,6 @@ pub fn pending_handoff_threads_sql() -> String {
     pending_handoff_rows_sql("pending_handoff.thread_id")
 }
 
-/// The same set as [`pending_handoff_threads_sql`], selecting `columns` of
-/// each pending `SessionHandedOff` row, aliased `pending_handoff`. A thread
-/// with two pending handoffs yields two rows.
 pub fn pending_handoff_rows_sql(columns: &str) -> String {
     let lifecycle = HANDOFF_LIFECYCLE_EVENT_TYPES
         .iter()
@@ -68,15 +62,6 @@ pub fn pending_handoff_rows_sql(columns: &str) -> String {
     )
 }
 
-/// A SQL predicate: the `events` row `alias` ends the handoff recorded by the
-/// `SessionHandedOff` row `handoff`, on the same thread. Four things end one:
-///
-/// - its successor session's `SessionStarted`, whose `continuity` is
-///   `handoff`. A recovery or conflict-resolution session records none, and
-///   a lane run records it only when it consumes the handoff (ADR 0675);
-/// - a user's Stop, or an Apply, Discard or Archive that stopped a turn;
-/// - a failed turn that began after it: the successor session never started;
-/// - a person's *Return to the old session*, `SessionHandoffWithdrawn`.
 pub fn ends_handoff_sql(alias: &str, handoff: &str) -> String {
     format!(
         "{alias}.sequence > {handoff}.sequence AND ( \

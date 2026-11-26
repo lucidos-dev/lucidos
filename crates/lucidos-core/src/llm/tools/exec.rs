@@ -1,7 +1,7 @@
-//! LLM-facing schemas for the code/command execution tools
+//! INVARIANT: LLM-facing schemas for the code/command execution tools
 //! (run_python / run_bash family). Handlers live in `engine::tools::{python,bash}`.
 
-/// Maximum `wait_secs` honored by `bash_output(wait_secs=…)`. Keeps a
+/// INVARIANT: Maximum `wait_secs` honored by `bash_output(wait_secs=…)`. Keeps a
 /// poorly-prompted agent from pinning a model turn for half an hour on
 /// what is conceptually a non-blocking drain. 120 s is long enough for a
 /// short-running bg task to finish during the wait without the LLM-side
@@ -13,9 +13,6 @@ use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// The `description` a background tool takes. The engine names the task by it
-/// on the thread's waiting row, so it has to read well after "Set up an event
-/// wait:".
 const BG_DESCRIPTION_PARAM: &str =
     "The work in the user's words, shown as \"<this> to finish\": \"the nightly e2e sweep\".";
 

@@ -10,24 +10,18 @@ use uuid::Uuid;
 
 pub(crate) const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where a capture is saved, and the format its extension names.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SaveTarget {
-    /// Under `data/artifacts/`, where the store writes it.
     artifact_path: String,
     format: CaptureFormat,
 }
 
 impl SaveTarget {
-    /// The path every message names: the data path the agent links in chat.
     fn data_path(&self) -> String {
         format!("artifacts/{}", self.artifact_path)
     }
 }
 
-/// Read `save_as_artifact`, refusing a path that leaves `data/artifacts/` or
-/// whose extension names no format a frame can encode. A leading `artifacts/`
-/// is the data path, so it is not nested a second time.
 pub(crate) fn parse_save_target(args: &serde_json::Value) -> Result<Option<SaveTarget>, String> {
     let Some(path) = args.get("save_as_artifact").and_then(|v| v.as_str()) else {
         return Ok(None);
@@ -54,9 +48,6 @@ pub(crate) fn parse_save_target(args: &serde_json::Value) -> Result<Option<SaveT
     }))
 }
 
-/// Write a capture's picture to its target, after checking that the device
-/// encoded the format the extension names. Returns the line the agent reads,
-/// or the error to report after `Error: `.
 async fn save_capture(
     artifacts: &ArtifactManager,
     bus: &EventBus,
@@ -110,9 +101,6 @@ async fn save_capture(
     ))
 }
 
-/// The `capture_app` and `refresh_app` tools. `last_used` is the turn's last
-/// used device, the target when `args` names no `device`.
-// One argument per collaborator; a bundle struct would only rename them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn app_ui_tool_impl(
     bus: &EventBus,
@@ -223,9 +211,6 @@ pub(crate) async fn app_ui_tool_impl(
     }
 }
 
-/// An error the target device sent back, prefixed with that device's name, so
-/// the agent knows which screen it is about. A DOM-only capture is not an
-/// error and passes through unchanged.
 fn answered_error(device: &str, dom: String) -> String {
     match dom.strip_prefix("Error: ") {
         Some(reason) => format!("Error from {device}: {reason}"),
@@ -233,7 +218,6 @@ fn answered_error(device: &str, dom: String) -> String {
     }
 }
 
-/// Nobody answered. Name who was asked, and whether Lucidos looks open there.
 async fn timed_out(pool: &PgPool, who: &Recipient, timeout: Duration) -> String {
     let secs = timeout.as_secs();
     let (Some(device), Some(described)) = (who.device_id(), who.described()) else {

@@ -5,8 +5,6 @@ fn unavailable() -> Machine {
     Machine::Unavailable("no Landlock in this kernel".to_string())
 }
 
-/// The sandbox an agent of `workspace` gets, enforced for real. Panics when
-/// this host cannot apply it, so a confinement test never passes unconfined.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn enforced_for(workspace: &Path) -> Sandbox {
     if let lucidos_agent_sandbox::Availability::Unavailable(why) = lucidos_agent_sandbox::probe() {
@@ -43,8 +41,6 @@ fn the_owner_preference_wins_over_the_probe() {
     }
 }
 
-/// A seatbelt refuses to nest. Under the marker, a failed probe means an
-/// outer Lucidos sandbox already holds this engine, not a broken machine.
 #[test]
 fn a_failed_probe_under_the_marker_is_an_inherited_sandbox() {
     let failed = || Availability::Unavailable("sandbox_apply: Operation not permitted".into());
@@ -59,8 +55,6 @@ fn a_failed_probe_under_the_marker_is_an_inherited_sandbox() {
     );
 }
 
-/// A home shaped like an upgraded one: a private subtree, an older entry left
-/// in place, and a gateway data dir holding one workspace.
 #[test]
 fn the_policy_hides_secrets_and_protects_every_workspace() {
     let scratch = tempfile::tempdir().unwrap();
@@ -84,8 +78,6 @@ fn the_policy_hides_secrets_and_protects_every_workspace() {
         assert!(policy.hidden.contains(&hidden), "{hidden:?}: {policy:?}");
     }
     assert_eq!(policy.open_within_hidden, vec![data.join("workspaces")]);
-    // An agent that could edit the registry or the Trash could mark a user's
-    // workspace machine-made, and the broker would skip the user's card.
     let registry = data.join("config/workspaces.json");
     let trash = data.join("deleted");
     std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
@@ -188,8 +180,6 @@ async fn an_enforced_spawn_cannot_create_a_legacy_grant_file() {
     assert!(!grants.exists());
 }
 
-/// A nested engine's children run bare, inside the sandbox it inherited, and
-/// pass the marker on so their own engines know too.
 #[tokio::test]
 async fn an_inherited_sandbox_spawns_bare_and_passes_the_marker_on() {
     let (pool, db) = setup_test_db().await;
@@ -225,8 +215,6 @@ fn permission(action: &str, ended: bool) -> PermissionRow {
     }
 }
 
-/// Only a live `run-confinement-tests` permission builds the bare mode. Its
-/// child claims no sandbox, so the confinement tests apply their own.
 #[test]
 fn only_a_live_confinement_permission_runs_bare() {
     let sandbox = Sandbox::outside_for_confinement(&permission("run-confinement-tests", false))
@@ -240,7 +228,6 @@ fn only_a_live_confinement_permission_runs_bare() {
     assert!(Sandbox::outside_for_confinement(&permission("run-command", false)).is_none());
 }
 
-/// Codex's invariant: writes land in its roots and nowhere else.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
@@ -264,7 +251,6 @@ async fn a_confined_spawn_writes_only_under_its_roots() {
     assert!(!outside.path().join("f").exists());
 }
 
-// Only macOS writes a shim at all.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_ps_shim_is_an_executable_the_engine_rewrites_when_the_cli_moves() {
@@ -307,8 +293,6 @@ fn no_cli_or_no_sandbox_leaves_no_ps_shim() {
     assert!(!workspace.path().join(PS_SHIM_SUBPATH).exists());
 }
 
-/// The shim is what the agent's `ps` runs. If the agent could write the dir,
-/// it could replace the shim.
 #[test]
 fn the_ps_shim_dir_is_read_only_to_agents() {
     let ws = PathBuf::from("/w/dev");
@@ -435,7 +419,6 @@ async fn psql_reaches_the_hidden_socket_as_the_read_only_agent() {
                 ),
             };
             tokio::spawn(async move {
-                // psql may close either side after an error; the pump owns only test sockets.
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
             });
         }
@@ -748,8 +731,6 @@ async fn a_successful_command_never_reports_a_write_refusal() {
     );
 }
 
-/// The unified log, not a fixture, decides here: a real refused write must
-/// come back through the parser.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
@@ -776,7 +757,6 @@ async fn a_failed_trigger_command_finds_its_seatbelt_denial_in_the_log() {
     let output = child.wait_with_output().await.unwrap();
     let outcome = crate::core::shell::TaskOutcome::from_status(output.status);
     assert!(!outcome.is_success());
-    // The log store can lag the denial by a moment.
     let mut denial = None;
     for _ in 0..10 {
         denial = sandbox.seatbelt_write_refusal(pid, started, &outcome).await;

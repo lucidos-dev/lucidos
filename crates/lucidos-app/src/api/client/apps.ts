@@ -55,6 +55,7 @@ export interface PluginLocalChangesResult {
 
 export interface PluginConfirmInstallResponse {
   summary: string;
+  hooks_needing_review?: string[];
   installed_files: string[];
   removed_files?: string[];
   setup_thread_id?: string;
@@ -65,10 +66,11 @@ export interface PluginConfirmInstallResponse {
 export async function confirmPluginInstall(
   installId: string,
   keepLocalChanges = true,
+  confirmHooks = false,
 ): Promise<PluginConfirmInstallResponse> {
   const res = await mutatingFetch(
     `${API}/plugins/install/${encodeURIComponent(installId)}/confirm`
-      + `?keep_local_changes=${keepLocalChanges}`,
+      + `?keep_local_changes=${keepLocalChanges}&confirm_hooks=${confirmHooks}`,
     { method: 'POST' },
   );
   await throwIfNotOk(res);

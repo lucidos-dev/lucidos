@@ -1,9 +1,6 @@
 use super::test_helpers::*;
 use super::*;
 
-/// `list_historical_triggers` returns one entry per distinct trigger_id with
-/// the most-recent thread's snapshot name and last_activity (covers the
-/// trigger-rename case and powers the dropdown's `(until <date>)` suffix).
 #[tokio::test]
 async fn list_historical_triggers_dedupes_and_takes_most_recent_name() {
     let (pool, db) = setup_test_db().await;
@@ -51,7 +48,6 @@ async fn list_historical_triggers_dedupes_and_takes_most_recent_name() {
     teardown_test_db(&db).await;
 }
 
-/// When `trigger_ids` is provided, `get_older_threads` returns only matching threads.
 #[tokio::test]
 async fn get_older_threads_filters_by_trigger_ids() {
     let (pool, db) = setup_test_db().await;
@@ -76,9 +72,6 @@ async fn get_older_threads_filters_by_trigger_ids() {
     teardown_test_db(&db).await;
 }
 
-/// Trigger-id filter returns matches regardless of `has_response`. The
-/// dropdown advertises every trigger that ever stamped a row, with no
-/// `has_response` gate; the filter must honor the same contract.
 #[tokio::test]
 async fn get_older_threads_returns_trigger_threads_with_no_response() {
     let (pool, db) = setup_test_db().await;
@@ -118,8 +111,6 @@ async fn get_older_threads_returns_trigger_threads_with_no_response() {
     teardown_test_db(&db).await;
 }
 
-/// `repo_ids` narrows `get_older_threads` to CC threads bound to those
-/// repos and projects `cc_repo_name` from the `repositories` registry.
 #[tokio::test]
 async fn get_older_threads_filters_by_repo_ids() {
     let (pool, db) = setup_test_db().await;
@@ -152,11 +143,6 @@ async fn get_older_threads_filters_by_repo_ids() {
     teardown_test_db(&db).await;
 }
 
-/// When a repo's name was never recorded anywhere — not in the live
-/// `repositories` registry and not in the durable `repo_names` projection —
-/// `cc_repo_name` resolves to NULL. The frontend's deleted-vs-live decision is
-/// keyed off the live registry, not this absence, so a NULL name just means
-/// "truly unknown" (an orphan UUID with no provenance).
 #[tokio::test]
 async fn get_older_threads_returns_null_repo_name_for_unknown_repo() {
     let (pool, db) = setup_test_db().await;
@@ -191,10 +177,6 @@ async fn get_older_threads_returns_null_repo_name_for_unknown_repo() {
     teardown_test_db(&db).await;
 }
 
-/// The bug fix: a repo that WAS registered (so its name lives in the durable
-/// `repo_names` projection) and is later removed from the live `repositories`
-/// registry still resolves its historical `cc_repo_name` — the filter and
-/// thread rows show "Apple", not the raw UUID.
 #[tokio::test]
 async fn get_older_threads_resolves_deleted_repo_name_from_projection() {
     let (pool, db) = setup_test_db().await;
@@ -202,9 +184,9 @@ async fn get_older_threads_resolves_deleted_repo_name_from_projection() {
 
     let repo = Uuid::new_v4();
     insert_repository(&pool, repo, "Apple", "/tmp/apple").await;
-    insert_repo_name(&pool, repo, "Apple").await; // what RepositoryAdded persists
+    insert_repo_name(&pool, repo, "Apple").await;
     insert_cc_repo_thread(&pool, &repo.to_string(), 60).await;
-    delete_repository(&pool, repo).await; // RepositoryRemoved — projection retained
+    delete_repository(&pool, repo).await;
 
     let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
     let hits = store
@@ -222,8 +204,6 @@ async fn get_older_threads_resolves_deleted_repo_name_from_projection() {
     teardown_test_db(&db).await;
 }
 
-/// `trigger_ids` and `repo_ids` compose with OR — a user with both
-/// filters expanded sees the union.
 #[tokio::test]
 async fn get_older_threads_combines_trigger_and_repo_ids_with_or() {
     let (pool, db) = setup_test_db().await;
@@ -260,14 +240,6 @@ async fn get_older_threads_combines_trigger_and_repo_ids_with_or() {
     teardown_test_db(&db).await;
 }
 
-/// Pagination companion to `count_archived_threads_channels_plus_facet_counts_union`:
-/// the rows `get_older_threads` returns must be the SAME union the badge counts.
-/// With whole channels active (`sources = None`) plus one trigger sub-selected,
-/// the pre-fix facet branch ignored the channel selection and returned ONLY the
-/// trigger's threads — so the (fixed) badge total and the scrolled rows would
-/// disagree, and the user could never scroll to the chat / claude_code archive.
-/// The unified predicate mirrors `threadPassesChannelFilter`: chat + claude_code
-/// + the selected trigger, minus the unselected trigger.
 #[tokio::test]
 async fn get_older_threads_channels_plus_facet_returns_union() {
     let (pool, db) = setup_test_db().await;
@@ -316,9 +288,6 @@ async fn get_older_threads_channels_plus_facet_returns_union() {
     teardown_test_db(&db).await;
 }
 
-/// `app_ids` narrows `get_older_threads` to app coding-agent threads whose
-/// `data/apps/<id>` folder matches — including archived ones (archived threads
-/// are real sessions; the filter must fetch them, not hide them).
 #[tokio::test]
 async fn get_older_threads_filters_by_app_ids() {
     let (pool, db) = setup_test_db().await;
@@ -350,8 +319,6 @@ async fn get_older_threads_filters_by_app_ids() {
     teardown_test_db(&db).await;
 }
 
-/// The app-id predicate must not prefix-match: selecting "habit" must NOT
-/// pull in "habit-tracker".
 #[tokio::test]
 async fn get_older_threads_app_ids_exact_segment_match() {
     let (pool, db) = setup_test_db().await;
@@ -370,9 +337,6 @@ async fn get_older_threads_app_ids_exact_segment_match() {
     teardown_test_db(&db).await;
 }
 
-/// `get_filter_facets` returns the distinct set of triggers / repos / apps that
-/// have any thread — including archived-only apps — so the dropdown lists the
-/// complete option set.
 #[tokio::test]
 async fn get_filter_facets_returns_distinct_sessions() {
     let (pool, db) = setup_test_db().await;
@@ -381,9 +345,9 @@ async fn get_filter_facets_returns_distinct_sessions() {
     let repo_a = Uuid::new_v4();
     insert_repository(&pool, repo_a, "Apple", "/tmp/apple").await;
     insert_cc_repo_thread(&pool, &repo_a.to_string(), 60).await;
-    insert_cc_repo_thread(&pool, &repo_a.to_string(), 30).await; // same repo twice → one facet
+    insert_cc_repo_thread(&pool, &repo_a.to_string(), 30).await;
     insert_trigger_thread(&pool, "trig-a", "Trig A", 60).await;
-    insert_app_thread(&pool, "habit", 90, true).await; // archived-only → still a facet
+    insert_app_thread(&pool, "habit", 90, true).await;
     insert_app_thread(&pool, "habit-tracker", 30, false).await;
 
     let ws = tempfile::tempdir().unwrap();
@@ -419,10 +383,6 @@ async fn get_filter_facets_returns_distinct_sessions() {
     teardown_test_db(&db).await;
 }
 
-/// The repos facet resolves a `name`: the live registry for a registered repo,
-/// the durable `repo_names` projection for a removed one — so the dropdown lists
-/// a deleted repo under its historical name instead of its UUID. Trigger
-/// facets carry NULL names (resolved client-side).
 #[tokio::test]
 async fn get_filter_facets_resolves_repo_names_including_deleted() {
     let (pool, db) = setup_test_db().await;
@@ -434,7 +394,7 @@ async fn get_filter_facets_resolves_repo_names_including_deleted() {
     insert_cc_repo_thread(&pool, &live_repo.to_string(), 30).await;
 
     let dead_repo = Uuid::new_v4();
-    insert_repo_name(&pool, dead_repo, "Dead Repo").await; // registered then removed
+    insert_repo_name(&pool, dead_repo, "Dead Repo").await;
     insert_cc_repo_thread(&pool, &dead_repo.to_string(), 60).await;
 
     let ws = tempfile::tempdir().unwrap();
@@ -463,12 +423,6 @@ async fn get_filter_facets_resolves_repo_names_including_deleted() {
     teardown_test_db(&db).await;
 }
 
-// ---------------------------------------------------------------------------
-// Status filter. `active` groups `running` with `waiting_for_user_answer`,
-// which are opposite answers to "is the workspace busy?": one is working, the
-// other is stopped and waiting on a person. These cover the precise form.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn parse_status_filter_accepts_the_values_rows_actually_carry() {
     let parsed = parse_status_filter_csv("running, waiting_for_user_answer ")
@@ -479,9 +433,6 @@ fn parse_status_filter_accepts_the_values_rows_actually_carry() {
     );
 }
 
-/// The repo spells public parameter values in kebab-case, while the `status`
-/// field on every returned row is snake_case. Accepting both means a caller
-/// following either convention is right.
 #[test]
 fn parse_status_filter_accepts_the_kebab_spelling_too() {
     assert_eq!(
@@ -494,9 +445,6 @@ fn parse_status_filter_accepts_the_kebab_spelling_too() {
     );
 }
 
-/// Three shapes that must be errors rather than a quietly different answer: a
-/// typo would select nothing, an empty filter would select everything, and a
-/// stray comma hides either.
 #[test]
 fn parse_status_filter_refuses_what_it_cannot_honour() {
     for raw in ["runnign", "", "  ", "running,", "running,,failed"] {
@@ -542,6 +490,18 @@ async fn insert_thread_with_status(pool: &PgPool, title: &str, status: ThreadSta
     id
 }
 
+async fn place_hold(pool: &PgPool, thread_id: Uuid) {
+    sqlx::query(
+        "UPDATE thread_summaries SET hold = jsonb_build_object( \
+            'reason', 'Taken over', 'root_thread_id', $1::text, 'placed_at', NOW()) \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("place hold");
+}
+
 fn filters(status: StatusFilter<'_>) -> ThreadSummaryFilters<'_> {
     ThreadSummaryFilters {
         status,
@@ -553,10 +513,6 @@ fn filters(status: StatusFilter<'_>) -> ThreadSummaryFilters<'_> {
     }
 }
 
-/// The whole change, at the layer that decides it. A caller asking "is
-/// anything busy?" must not be handed the thread parked on a question: that
-/// thread is blocked on a human, and it is the state most likely to coincide
-/// with work piling up unannounced.
 #[tokio::test]
 async fn running_and_awaiting_a_user_are_selectable_apart_and_together() {
     let (pool, db) = setup_test_db().await;
@@ -637,8 +593,78 @@ async fn running_and_awaiting_a_user_are_selectable_apart_and_together() {
     teardown_test_db(&db).await;
 }
 
-/// A count is what an idle detector calls, and it cannot be corrected
-/// client-side, so it has to agree with the list for every filter shape.
+#[tokio::test]
+async fn a_held_thread_never_reads_as_waiting_on_the_owner() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let running = insert_thread_with_status(&pool, "Working", ThreadStatus::Running).await;
+    let parked =
+        insert_thread_with_status(&pool, "Parked", ThreadStatus::WaitingForUserAnswer).await;
+    let held = insert_thread_with_status(&pool, "Held", ThreadStatus::WaitingForUserAnswer).await;
+    place_hold(&pool, held).await;
+
+    let ids = |summaries: Vec<ThreadSummary>| -> Vec<String> {
+        let mut out: Vec<String> = summaries.into_iter().map(|s| s.thread_id).collect();
+        out.sort();
+        out
+    };
+    let sorted = |v: Vec<Uuid>| -> Vec<String> {
+        let mut out: Vec<String> = v.into_iter().map(|id| id.to_string()).collect();
+        out.sort();
+        out
+    };
+    let list = |status| store.list_thread_summaries(filters(status));
+
+    let awaiting = list(StatusFilter::OneOf(&[ThreadStatus::WaitingForUserAnswer]))
+        .await
+        .expect("list awaiting");
+    assert_eq!(ids(awaiting), sorted(vec![parked]));
+
+    let active = list(StatusFilter::Active(true)).await.expect("list active");
+    assert_eq!(ids(active), sorted(vec![running, parked]));
+
+    let inactive = list(StatusFilter::Active(false))
+        .await
+        .expect("list inactive");
+    assert_eq!(ids(inactive), sorted(vec![held]));
+
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn the_waiting_filter_selects_exactly_what_awaits_owner_answer_says() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let mut want = Vec::new();
+    for status in ThreadStatus::ALL {
+        for held in [false, true] {
+            let id = insert_thread_with_status(&pool, status.as_str(), status).await;
+            if held {
+                place_hold(&pool, id).await;
+            }
+            if crate::engine::thread_lifecycle::awaits_owner_answer(status, held) {
+                want.push(id.to_string());
+            }
+        }
+    }
+    let mut got: Vec<String> = store
+        .list_thread_summaries(filters(StatusFilter::OneOf(&[
+            ThreadStatus::WaitingForUserAnswer,
+        ])))
+        .await
+        .expect("list awaiting")
+        .into_iter()
+        .map(|s| s.thread_id)
+        .collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+
+    teardown_test_db(&db).await;
+}
+
 #[tokio::test]
 async fn count_agrees_with_list_for_every_status_filter_shape() {
     let (pool, db) = setup_test_db().await;
@@ -646,6 +672,8 @@ async fn count_agrees_with_list_for_every_status_filter_shape() {
 
     insert_thread_with_status(&pool, "Working", ThreadStatus::Running).await;
     insert_thread_with_status(&pool, "Parked", ThreadStatus::WaitingForUserAnswer).await;
+    let held = insert_thread_with_status(&pool, "Held", ThreadStatus::WaitingForUserAnswer).await;
+    place_hold(&pool, held).await;
     insert_thread_with_status(&pool, "Done", ThreadStatus::Idle).await;
 
     for status in [
@@ -674,9 +702,6 @@ async fn count_agrees_with_list_for_every_status_filter_shape() {
     teardown_test_db(&db).await;
 }
 
-/// App facets carry the engine's label. A live app or widget answers from its
-/// manifest. A removed one keeps the kind its `AppDeleted` recorded, through
-/// either delete path (ADR 0404). Only a missing folder is deleted.
 #[tokio::test]
 async fn get_filter_facets_labels_apps_and_widgets_including_removed_ones() {
     use crate::core::{AppKind, NewAppKind};

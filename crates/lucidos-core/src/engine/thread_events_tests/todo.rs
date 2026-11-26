@@ -16,9 +16,6 @@ fn todo_status_serializes_as_snake_case() {
         serde_json::to_value(TodoStatus::Completed).unwrap(),
         json!("completed")
     );
-    // The two engine-only statuses. `waiting` is the wire word the panel
-    // branches on for a thread parked on an *event wait*, so it is pinned here
-    // beside the rest rather than only being asserted through the settle path.
     assert_eq!(
         serde_json::to_value(TodoStatus::Waiting).unwrap(),
         json!("waiting")
@@ -29,10 +26,6 @@ fn todo_status_serializes_as_snake_case() {
     );
 }
 
-/// The word `todo_write` reads back to the agent is the word the agent writes.
-///
-/// A drift here would answer `in progress` for a status the schema accepts
-/// only as `in_progress`. The agent would then copy back a refused value.
 #[test]
 fn status_word_matches_the_wire_spelling() {
     use crate::engine::thread_events::TodoStatus;
@@ -52,9 +45,6 @@ fn status_word_matches_the_wire_spelling() {
     }
 }
 
-/// `Completed` and `Abandoned` are terminal; everything else a response
-/// terminator may still rewrite. `Waiting` being OPEN is what stops a parked
-/// list reading as parked forever once its wait resolves.
 #[test]
 fn only_completed_and_abandoned_are_terminal() {
     use crate::engine::thread_events::TodoStatus;
@@ -91,12 +81,6 @@ fn todo_list_written_serializes_with_type_tag_and_items() {
     assert_eq!(serialized["items"][1]["status"], "pending");
 }
 
-/// ADR 0085's *todo notes*, and the two shapes they must serialize into.
-///
-/// Present, the field is on the wire. Absent, the key is not there at all. A
-/// payload written before the field existed and one written with the mode off
-/// are then byte-identical. Every stored row replays through this enum, so a
-/// required field would break every list ever written.
 #[test]
 fn todo_list_written_carries_notes_only_when_there_are_notes() {
     let with = ThreadEvent::TodoListWritten {
@@ -120,7 +104,6 @@ fn todo_list_written_carries_notes_only_when_there_are_notes() {
         "an unnoted list must not carry the key at all: {json}"
     );
 
-    // A row from before the field existed reads back as unnoted.
     let legacy: ThreadEvent =
         serde_json::from_value(serde_json::json!({"type": "TodoListWritten", "items": []}))
             .expect("a pre-notes payload still parses");
@@ -191,9 +174,6 @@ fn todo_list_written_event_type_is_todo_list_written() {
     assert_eq!(event.event_type(), "TodoListWritten");
 }
 
-/// Persisted so the sticky panel restores after engine restart by replaying
-/// the events table — without persistence the panel would be empty until
-/// the next `todo_write` call.
 #[test]
 fn todo_list_written_is_persisted() {
     let event = ThreadEvent::TodoListWritten {
@@ -203,8 +183,6 @@ fn todo_list_written_is_persisted() {
     assert!(event.is_persisted());
 }
 
-/// NOT per-token streaming — a single full-list payload per call, not a
-/// firehose. Triggers may legitimately subscribe via `on_event:`.
 #[test]
 fn todo_list_written_is_not_per_token_streaming() {
     let event = ThreadEvent::TodoListWritten {

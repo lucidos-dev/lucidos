@@ -1,36 +1,3 @@
-//! Whether an app frame may reach a route, declared route by route.
-//!
-//! An app frame runs at an opaque origin (ADR 0227), so the host bridge is its
-//! only way to the engine. `lucidos.request` carries anything the SDK does not
-//! name, and that hatch needs an answer per route (ADR 0231).
-//!
-//! **Absence is denial.** A route missing from
-//! [`ROUTE_REACH`](crate::app_reach_policy::ROUTE_REACH) is refused, and the
-//! completeness test below fails the build. So the question is answered when
-//! the route is written, rather than when a workspace finds out.
-
-//! | Reach | Means | Example |
-//! |---|---|---|
-//! | `App` | an app frame may call the listed methods | `/data/*path` |
-//! | `Asset` | the app document loads it as a tag, never through the bridge | `/sdk.js` |
-//! | `Host` | the Lucidos shell only | `/credential-value` |
-//! | `Agent` | a coding-agent subprocess only | the `/internal/` tree |
-//!
-//! Three of the four refuse the hatch. They are separate words because they
-//! refuse for different reasons, and whoever classifies a new route should pick
-//! one on purpose. An `Asset` is reachable by the frame, as a subresource on
-//! its own document, so calling it host-only would misinform the next reader.
-
-//! # Where this is enforced
-//!
-//! The host bridge is the chokepoint, and it reads the generated copy of the
-//! `App` rows. The engine applies the same table to any request carrying the
-//! app stamp, which is defence in depth rather than the boundary.
-//!
-//! A standalone app tab is a same-origin top-level document, so no
-//! classification binds it. ADR 0231 states that limit rather than implying a
-//! wall.
-
 use axum::extract::{MatchedPath, Request};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -40,7 +7,7 @@ use super::error::ApiError;
 use crate::app_reach_policy::app_may_call;
 pub(crate) use crate::app_reach_policy::APP_ID_HEADER;
 
-/// Refuse a stamped request to a route apps may not reach.
+/// INVARIANT: Refuse a stamped request to a route apps may not reach.
 ///
 /// The bridge already refused it, which is the boundary. This is the second
 /// answer, for a host path that forgets to ask and for a future app host that
@@ -57,8 +24,6 @@ pub(crate) async fn enforce_app_reach(request: Request, next: Next) -> Response 
     else {
         return next.run(request).await;
     };
-    // No matched path is the router's fallback, which is a 404. Answering with
-    // a refusal would point the caller at the wrong problem.
     let Some(route) = request
         .extensions()
         .get::<MatchedPath>()
@@ -124,16 +89,6 @@ fn human_only_preference(
         })
 }
 
-/// Preferences the agent may write but an app may not.
-///
-/// The coding-agent keys choose what a session spawns and what it may do
-/// unasked. An app writes files under its own folder, which is the app
-/// thread's working directory. So a path pointed at `/bin/sh` runs the app's
-/// own script as the user when the next session starts.
-///
-/// The OpenCode Free switch sends chat anonymously to a third-party relay whose
-/// free models may train on it. ADR 0104 makes that the human's informed
-/// opt-in, so no app may turn it on unasked.
 const APP_REFUSED_PREFERENCES: &[&str] = &[
     crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
     crate::core::prefs::CODING_AGENT_CODEX_PATH.key(),
@@ -141,7 +96,7 @@ const APP_REFUSED_PREFERENCES: &[&str] = &[
     crate::core::prefs::OPENCODE_FREE_ENABLED.key(),
 ];
 
-/// Decode one `application/x-www-form-urlencoded` component, as axum's `Query`
+/// INVARIANT: Decode one `application/x-www-form-urlencoded` component, as axum's `Query`
 /// does. An undecodable one stays raw, and `Query` refuses that request anyway.
 fn form_decode(component: &str) -> String {
     let spaced = component.replace('+', " ");

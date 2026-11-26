@@ -1,25 +1,3 @@
-//! Integration tests for the wasmtime-`Engine`-creating cases in
-//! `api::proxy_*`. These were lifted out of the lib's `#[cfg(test)] mod
-//! tests` blocks because of a macOS-specific abort:
-//!
-//!   `mach_msg failed with 268451845` (`MACH_RCV_INTERRUPTED`, SIGABRT)
-//!
-//! Each `wasmtime::Engine::new()` allocates a JIT memory pool via
-//! `MAP_JIT` `mmap`, which exchanges Mach messages with the kernel.
-//! Many concurrent allocations from many `#[tokio::test]` runtimes
-//! (the parallel `cargo test -p lucidos-agents-api --lib` schedule)
-//! crossed a per-process Mach IPC threshold and crashed libdispatch.
-//! Splitting the wasmtime-Engine cases into their own `[[test]]`
-//! binary gives them a separate process — separate per-process
-//! budget — and the abort is gone. The bisection details and
-//! everything-we-tried list live atop `engine::change_ops::tests`.
-//!
-//! Run with:
-//!   cargo test -p lucidos-agents-api --test proxy_wasm_engine
-//!
-//! Sync `#[test]`s in the same files (no wasmtime allocation) stay in
-//! the lib's `mod tests` blocks — only the Engine-creating cases moved.
-
 use lucidos_agents_api::api::wasm_test_internals::*;
 use lucidos_engine::__wasm_test_internals::*;
 use sqlx::postgres::PgPoolOptions;
@@ -30,8 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wasmtime::{Engine, Module};
-
-// ── proxy_pipeline_builder helpers ──────────────────────────────────────
 
 fn lazy_pool() -> PgPool {
     PgPoolOptions::new()
@@ -78,8 +54,6 @@ fn ctx<'a>(
         wasm_engine: Arc::new(engine.clone()),
     }
 }
-
-// ── proxy_pipeline_builder::tests::* (Engine-creating) ──────────────────
 
 #[tokio::test]
 async fn build_rejects_wasm_signer_when_module_not_loaded() {
@@ -143,8 +117,6 @@ async fn build_rejects_query_param_without_param_name() {
     );
 }
 
-// ── proxy_wasm_host::tests (Engine-creating only) ──────────────────────
-
 #[test]
 fn register_host_imports_succeeds() {
     let engine = build_wasmtime_engine().unwrap();
@@ -152,8 +124,6 @@ fn register_host_imports_succeeds() {
     register_host_imports(&mut linker).unwrap();
 }
 
-/// A signer calling `log` in a tight loop with a line as big as its whole
-/// memory. The host must stop reading and printing once the budget is spent.
 #[test]
 fn a_signer_logging_in_a_tight_loop_is_held_to_the_log_budget() {
     const LOOPING_LOG_WAT: &str = r#"
@@ -195,8 +165,6 @@ fn a_signer_logging_in_a_tight_loop_is_held_to_the_log_budget() {
     );
 }
 
-// ── proxy::tests::reload_picks_up_freshly_added_wasm_files ─────────────
-
 #[tokio::test]
 async fn reload_picks_up_freshly_added_wasm_files() {
     let engine = build_wasmtime_engine().unwrap();
@@ -216,8 +184,6 @@ async fn reload_picks_up_freshly_added_wasm_files() {
     *registry.write().await = new_modules;
     assert!(registry.read().await.contains_key("freshly-added"));
 }
-
-// ── proxy_wasm_signer::tests::loader_* (Engine-creating) ────────────────
 
 #[test]
 fn loader_returns_empty_for_missing_dir() {
@@ -285,8 +251,6 @@ fn loader_rejects_invalid_wasm() {
     }
 }
 
-// ── proxy_wasm_signer::tests::wasm_signer_layer_* helpers ──────────────
-
 fn compile_wat(name: &str, wat_src: &str, engine: &Engine) -> Arc<CompiledModule> {
     let bytes = wat::parse_str(wat_src).unwrap();
     let module = Module::new(engine, &bytes).unwrap();
@@ -334,8 +298,6 @@ const REPLACE_BODY_WAT: &str = r#"
       (i64.const 24))))
 "#;
 
-/// A deliberately non-terminating signer: `sign` enters an unconditional loop
-/// and never returns. The execution budget (epoch interruption) must kill it.
 const LOOP_FOREVER_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -344,9 +306,6 @@ const LOOP_FOREVER_WAT: &str = r#"
     (i64.const 0)))
 "#;
 
-/// Declares far more initial linear memory than the sandbox allows: 1000 pages
-/// is ~64 MiB against a 16 MiB ceiling. Instantiation must refuse it, so the
-/// host never reserves the memory in the first place.
 const OVERSIZED_MEMORY_WAT: &str = r#"
 (module
   (memory (export "memory") 1000)
@@ -354,9 +313,6 @@ const OVERSIZED_MEMORY_WAT: &str = r#"
     (i64.const 0)))
 "#;
 
-/// Grows linear memory in a loop, 1 MiB at a time. The execution budget cannot
-/// stop this before the host is out of memory, because epoch interruption caps
-/// CPU rather than resident memory. Only the store's memory ceiling can.
 const MEMORY_BOMB_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -367,9 +323,6 @@ const MEMORY_BOMB_WAT: &str = r#"
     (i64.const 0)))
 "#;
 
-/// Declares two tables against a per-store ceiling of one. The element ceiling
-/// is per table, so a module that multiplies tables multiplies the ceiling.
-/// wasmtime refuses this itself, which is the object-count half of the sandbox.
 const TWO_TABLES_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -379,11 +332,6 @@ const TWO_TABLES_WAT: &str = r#"
     (i64.const 0)))
 "#;
 
-/// Returns an out-of-bounds `SignOutput` slice: the packed result decodes to
-/// `out_ptr = 0`, `out_len = 0xFFFF_FFFF`. This is exactly what a signer that
-/// signals an error the C way (`return -1`) produces, and it names ~4 GiB of a
-/// 16 MiB memory. The host must reject the slice before allocating. Otherwise it
-/// zeroes a 4 GiB buffer and OOM-aborts the whole engine from inside the sandbox.
 const OOB_OUTPUT_SLICE_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -391,13 +339,6 @@ const OOB_OUTPUT_SLICE_WAT: &str = r#"
     (i64.const 4294967295)))
 "#;
 
-/// Scans its own input for a `~` (byte 0x7E) and reports whether it found one,
-/// via `x-saw: yes` or `x-saw: no`.
-///
-/// This is how a test asks the SANDBOX what it received, instead of asking the
-/// host what it meant to send. In the `SignInput` these tests build, `~` occurs
-/// in exactly one place: the upstream header value a signer may read only with
-/// the `read_prior_headers` grant.
 const TILDE_SCAN_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -431,8 +372,6 @@ fn signer_layer(name: &str, wat_src: &str, engine: &Arc<Engine>) -> WasmSignerLa
     )
 }
 
-/// The sandbox kill left the process healthy: a good signer on the SAME engine
-/// still signs. An abort or an OOM would have taken this down with it.
 async fn assert_engine_still_serves(engine: &Arc<Engine>) {
     let layer = signer_layer("echo", ECHO_WAT, engine);
     let body = bytes::Bytes::new();
@@ -444,10 +383,6 @@ async fn assert_engine_still_serves(engine: &Arc<Engine>) {
         .expect("the engine must still serve a healthy signer after a sandbox kill");
     assert_eq!(m.add_headers[0].1, "ok");
 }
-
-// ── proxy_wasm_signer::tests::wasm_signer_layer_* (Engine-creating) ────
-// Real-artifact variants moved to crates/lucidos-e2e/tests/wasm_signers.rs
-// (run via ./scripts/e2e-wasm.sh).
 
 #[tokio::test]
 async fn wasm_signer_layer_runs_echo_signer_end_to_end() {
@@ -465,26 +400,15 @@ async fn wasm_signer_layer_runs_echo_signer_end_to_end() {
     assert!(m.replace_body.is_none());
 }
 
-/// How often the freeze meter's thread wakes.
 const METER_TICK: Duration = Duration::from_millis(5);
 
-/// The shortest gap the meter calls a freeze. Ten ticks, so ordinary CPU
-/// contention stays charged to the code under test.
 const FREEZE_AT_LEAST: Duration = Duration::from_millis(50);
 
-/// What the meter's thread has seen: each freeze, and how far it has looked.
 struct FreezeLog {
     freezes: Vec<(Instant, Instant)>,
     seen_until: Instant,
 }
 
-/// Records when the host stalled this test process, so a timing bound charges
-/// the code only for time it could run in.
-///
-/// It measures one thing: gaps in its own OS thread, which wakes every
-/// [`METER_TICK`]. A process freeze shows as such a gap. So does a long
-/// scheduling delay of that thread alone, which the bound then also forgives.
-/// The signer under test cannot delay that thread, so a late signer still fails.
 struct FreezeMeter {
     log: Arc<Mutex<FreezeLog>>,
     stop: Arc<AtomicBool>,
@@ -514,8 +438,6 @@ impl FreezeMeter {
         Self { log, stop }
     }
 
-    /// The time from `started` to `finished` that the process was not frozen.
-    /// Waits until the meter has looked past `finished`, so no freeze is missed.
     fn active(&self, started: Instant, finished: Instant) -> Duration {
         loop {
             let log = self.log.lock().unwrap();
@@ -534,7 +456,6 @@ impl Drop for FreezeMeter {
     }
 }
 
-/// `finished - started`, less the part of each freeze that falls inside it.
 fn active_between(freezes: &[(Instant, Instant)], started: Instant, finished: Instant) -> Duration {
     let frozen: Duration = freezes
         .iter()
@@ -588,7 +509,6 @@ fn a_window_with_no_freeze_is_charged_in_full() {
 fn the_meter_records_a_freeze_of_its_thread() {
     let meter = FreezeMeter::start();
     let started = Instant::now();
-    // Hold the log, so the meter's thread blocks as a frozen process would.
     let held = meter.log.lock().unwrap();
     std::thread::sleep(Duration::from_millis(400));
     drop(held);
@@ -600,12 +520,6 @@ fn the_meter_records_a_freeze_of_its_thread() {
     );
 }
 
-/// A non-terminating signer is killed by the execution budget rather than
-/// pinning the request-execution task forever. The outer `timeout` is a test
-/// safety net — if the budget mechanism regressed, the test fails (does not
-/// hang). Multi-thread runtime so the epoch ticker thread can advance the epoch
-/// while the runaway call occupies a worker. (This is the core fix for the
-/// "WASM signer has no execution budget" finding.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
     let meter = FreezeMeter::start();
@@ -635,15 +549,10 @@ async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
     );
 }
 
-/// How long an unrelated task may wait for a thread while signers loop.
-/// Five epoch ticks, far under the loopers' budget.
 const RESPONSIVE_WITHIN: Duration = Duration::from_millis(500);
 
-/// When a timed piece of work started, and when it finished.
 type Span = (Instant, Instant);
 
-/// Spawn a 10 ms sleep that reports when it was spawned and when it woke.
-/// Spawn it BEFORE the loopers, so it competes with them for a thread.
 fn spawn_probe() -> tokio::task::JoinHandle<Span> {
     let spawned = Instant::now();
     tokio::spawn(async move {
@@ -660,10 +569,8 @@ async fn probe_latency(meter: &FreezeMeter, probe: tokio::task::JoinHandle<Span>
     meter.active(spawned, woke)
 }
 
-/// What one `apply` returned, and when it ran.
 type TimedApply = (Result<AuthMutation, (axum::http::StatusCode, String)>, Span);
 
-/// Run `apply` for `layer` on its own task, reporting the result and its span.
 fn spawn_apply(layer: Arc<WasmSignerLayer>) -> tokio::task::JoinHandle<TimedApply> {
     tokio::spawn(async move {
         let body = bytes::Bytes::new();
@@ -674,16 +581,11 @@ fn spawn_apply(layer: Arc<WasmSignerLayer>) -> tokio::task::JoinHandle<TimedAppl
     })
 }
 
-/// A looping signer gives its thread back while it runs. On a runtime with
-/// ONE thread, an unrelated task still runs, and a caller's own timeout still
-/// fires, long before the signer's budget.
 #[tokio::test(flavor = "current_thread")]
 async fn a_looping_signer_yields_its_thread() {
     let meter = FreezeMeter::start();
     let engine = Arc::new(build_wasmtime_engine().unwrap());
     let budget = Duration::from_secs(3);
-    // One slot for the looper and one for the timed call. The timeout then
-    // cuts the wasm itself, and no parallel test waits on the global cap.
     let slots = Arc::new(tokio::sync::Semaphore::new(2));
     let layer = Arc::new(
         signer_layer("runaway", LOOP_FOREVER_WAT, &engine)
@@ -729,9 +631,6 @@ async fn a_looping_signer_yields_its_thread() {
     );
 }
 
-/// More looping signers than worker threads leave the runtime responsive. The
-/// cap lets one run, and the rest are refused with a fixed 503 long before the
-/// budget. One slot is what production sizing gives two workers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn looping_signers_cannot_take_every_worker() {
     let meter = FreezeMeter::start();
@@ -788,8 +687,6 @@ async fn looping_signers_cannot_take_every_worker() {
     assert_eq!((terminated, refused), (1, 5));
 }
 
-/// A module declaring an oversized initial memory is refused at instantiation.
-/// The 502 names the signer and the limit, and the engine keeps working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_rejects_a_module_declaring_oversized_memory() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
@@ -813,9 +710,6 @@ async fn wasm_signer_layer_rejects_a_module_declaring_oversized_memory() {
     assert_engine_still_serves(&engine).await;
 }
 
-/// A `memory.grow` loop is killed by the memory ceiling, not by the CPU budget.
-/// It must die well inside the default budget, and say memory rather than
-/// budget, so the two sandbox failure modes stay distinguishable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_kills_a_memory_growing_signer() {
     let meter = FreezeMeter::start();
@@ -851,9 +745,6 @@ async fn wasm_signer_layer_kills_a_memory_growing_signer() {
     assert_engine_still_serves(&engine).await;
 }
 
-/// An object-count cap reads like every other sandbox refusal: a 502 naming the
-/// signer, and an engine that keeps serving. wasmtime states this limit in its
-/// own words, which go to the engine log, so the body names only the stage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_rejects_a_module_declaring_two_tables() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
@@ -877,16 +768,6 @@ async fn wasm_signer_layer_rejects_a_module_declaring_two_tables() {
     assert_engine_still_serves(&engine).await;
 }
 
-/// A signer that returns an out-of-bounds `SignOutput` slice (the C-style
-/// `return -1`, packing `out_len = 0xFFFF_FFFF`) must be refused with a 502 that
-/// names the out-of-bounds slice. The engine must keep serving. The failure this
-/// guards is a ~4 GiB host allocation, driven from inside the sandbox: an OOM
-/// abort of the whole engine, which is what the sandbox exists to prevent.
-///
-/// The proof is the assertion on that specific 502: only the bounds-check branch
-/// produces it. A regressed check would allocate synchronously inside one poll
-/// and OOM-abort the process, so the outer `timeout` guards only a hang, not
-/// that abort.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_rejects_an_out_of_bounds_output_slice() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
@@ -906,8 +787,6 @@ async fn wasm_signer_layer_rejects_an_out_of_bounds_output_slice() {
         "error must name the signer and the out-of-bounds slice; got: {}",
         err.1
     );
-    // The module chose the packed (ptr, len). Quoting it would hand the app
-    // 8 bytes of whatever the module holds, per request.
     let body = response_body(err).await;
     assert!(
         !body.contains("4294967295"),
@@ -917,7 +796,6 @@ async fn wasm_signer_layer_rejects_an_out_of_bounds_output_slice() {
     assert_engine_still_serves(&engine).await;
 }
 
-/// A signer whose `sign` returns `output_json` verbatim from its data segment.
 fn returning_output_wat(output_json: &str) -> String {
     format!(
         r#"(module
@@ -930,7 +808,6 @@ fn returning_output_wat(output_json: &str) -> String {
     )
 }
 
-/// The body the calling app reads: `proxy.rs` renders a layer error as-is.
 async fn response_body(err: (axum::http::StatusCode, String)) -> String {
     use axum::response::IntoResponse as _;
     let resp = err.into_response();
@@ -940,7 +817,6 @@ async fn response_body(err: (axum::http::StatusCode, String)) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-/// Run a signer that returns `output_json` and return its 502 body.
 async fn rejected_output_body(name: &str, output_json: &str) -> String {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
     let layer = signer_layer(name, &returning_output_wat(output_json), &engine);
@@ -955,7 +831,6 @@ async fn rejected_output_body(name: &str, output_json: &str) -> String {
     response_body(err).await
 }
 
-/// Stands in for a handshake token or a signature the module holds.
 const MODULE_HELD_SECRET: &str = "tok-module-held-s3cret";
 
 #[tokio::test]
@@ -980,8 +855,6 @@ async fn an_unparseable_sign_output_never_reaches_the_502_body() {
     );
 }
 
-/// A valid name paired with an unsendable value. The proxy's own value check
-/// quotes the header name, so the signer layer must refuse the pair first.
 #[tokio::test]
 async fn a_header_name_with_an_unsendable_value_never_reaches_the_502_body() {
     let output = format!(r#"{{"add_headers":[["x-{MODULE_HELD_SECRET}","a\u0001b"]]}}"#);
@@ -993,8 +866,6 @@ async fn a_header_name_with_an_unsendable_value_never_reaches_the_502_body() {
     );
 }
 
-/// Traps inside a function the module named itself. A trap's backtrace carries
-/// that name and the code offset, and the module picks which site traps.
 const NAMED_TRAP_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -1068,8 +939,6 @@ async fn wasm_signer_layer_rejects_raw_body_request_when_body_exceeds_1mb() {
     assert!(err.1.contains("requires raw body"));
 }
 
-// ── prior_layer_outputs least privilege ─────────────────────────────────
-
 fn signer_layer_with_caps(
     name: &str,
     wat_src: &str,
@@ -1098,8 +967,6 @@ fn signer_layer_with_caps(
     )
 }
 
-/// An upstream `script_handshake` output whose token carries the `~` the scan
-/// module looks for.
 fn prior_with_upstream_token() -> HashMap<String, serde_json::Value> {
     let mut prior = HashMap::new();
     prior.insert(
@@ -1109,7 +976,6 @@ fn prior_with_upstream_token() -> HashMap<String, serde_json::Value> {
     prior
 }
 
-/// Run the scan module against that upstream token and return what it saw.
 async fn what_the_sandbox_saw(layer: &WasmSignerLayer) -> String {
     let body = bytes::Bytes::new();
     let prior = prior_with_upstream_token();
@@ -1134,8 +1000,6 @@ async fn a_signer_without_the_grant_never_receives_an_upstream_header_value() {
 
 #[tokio::test]
 async fn a_signer_with_both_halves_of_the_grant_receives_the_value() {
-    // The control for the test above: it proves the scan module can find the
-    // needle at all, so a "no" there is withholding rather than a dead scanner.
     let engine = Arc::new(build_wasmtime_engine().unwrap());
     let cap = vec![CAP_READ_PRIOR_HEADERS.to_string()];
     let layer = signer_layer_with_caps("scan", TILDE_SCAN_WAT, &engine, cap.clone(), cap);

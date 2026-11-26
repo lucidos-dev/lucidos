@@ -1,9 +1,3 @@
-//! `/api/v1/threads/:thread_id/background-tasks`, a coding agent's *background
-//! tasks* (`lucidos background-task run | wait | output | stop`).
-//!
-//! The engine runs the job and arms the event wait that re-opens the thread;
-//! see `engine::agent_session::background_task`.
-
 use crate::engine::agent_session::background_task::BackgroundTaskExt;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -49,15 +43,12 @@ pub(super) fn require_own_thread_agent(
 #[derive(Deserialize)]
 pub(in crate::api) struct StartRequest {
     command: String,
-    /// What the task is, in the user's words. The thread's waiting row shows it.
     description: Option<String>,
     timeout_secs: Option<u64>,
-    /// Arm no event wait: the agent polls with `lucidos background-task wait`.
     #[serde(default)]
     poll: bool,
 }
 
-/// POST /api/v1/threads/:thread_id/background-tasks
 pub(in crate::api) async fn start_background_task(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -84,8 +75,6 @@ pub(in crate::api) async fn start_background_task(
     Ok(Json(start_response(started)))
 }
 
-/// What the CLI prints. The `message` is written for the agent reading it, and
-/// says what to do next, because the right next move differs per outcome.
 fn start_response(started: BackgroundTaskStart) -> serde_json::Value {
     match started {
         BackgroundTaskStart::Watched {
@@ -142,13 +131,10 @@ fn start_response(started: BackgroundTaskStart) -> serde_json::Value {
     }
 }
 
-/// The engine hands output back as the JSON text the chat tool returns.
-/// Embed it as a value, so the response is not JSON inside a string.
 fn output_json(output: &str) -> serde_json::Value {
     serde_json::from_str(output).unwrap_or_else(|_| serde_json::Value::String(output.to_string()))
 }
 
-/// GET /api/v1/threads/:thread_id/background-tasks/:task_id
 pub(in crate::api) async fn background_task_output(
     State(state): State<AppState>,
     Path((thread_id, task_id)): Path<(String, String)>,
@@ -169,10 +155,6 @@ pub(in crate::api) struct WaitQuery {
     max_secs: Option<u64>,
 }
 
-/// GET /api/v1/threads/:thread_id/background-tasks/:task_id/wait
-///
-/// Blocks until the task finishes or the capped wait runs out, then answers
-/// what `output` answers. A still-running answer also says to wait again.
 pub(in crate::api) async fn wait_for_background_task(
     State(state): State<AppState>,
     Path((thread_id, task_id)): Path<(String, String)>,
@@ -203,9 +185,6 @@ pub(in crate::api) async fn wait_for_background_task(
     Ok(response)
 }
 
-/// A finished task's record passes through as `output` prints it. A running
-/// one gains the next step, since the agent must call again. Child reports the
-/// wait took ride along, and the message says so.
 fn wait_response(
     task_id: &str,
     mut output: serde_json::Value,
@@ -234,7 +213,6 @@ fn wait_response(
     output
 }
 
-/// The reports as the agent reads them, oldest first.
 pub(super) fn child_reports_json(child_reports: &[ChildReport]) -> serde_json::Value {
     child_reports
         .iter()
@@ -247,7 +225,6 @@ pub(super) fn child_reports_json(child_reports: &[ChildReport]) -> serde_json::V
         .collect()
 }
 
-/// POST /api/v1/threads/:thread_id/background-tasks/:task_id/stop
 pub(in crate::api) async fn stop_background_task(
     State(state): State<AppState>,
     Path((thread_id, task_id)): Path<(String, String)>,

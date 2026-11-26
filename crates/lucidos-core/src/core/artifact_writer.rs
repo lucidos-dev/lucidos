@@ -1,12 +1,10 @@
-//! Resolve artifact provenance once, before announcing a write.
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::engine::event_bus::ArtifactWriter;
 use crate::engine::thread_events::MessageOrigin;
 
-/// The first human message that makes a trigger thread attended. Both the
+/// INVARIANT: The first human message that makes a trigger thread attended. Both the
 /// write-time resolver and workspace turn projection use this predicate.
 /// `thread` is an engine-owned SQL expression, never request input.
 pub fn first_human_message_sql(thread: &str) -> String {
@@ -17,8 +15,6 @@ pub fn first_human_message_sql(thread: &str) -> String {
     )
 }
 
-/// Write-path input. Unlike the persisted writer, this may still need to
-/// resolve whether the owner has joined a trigger thread.
 #[derive(Clone, Debug)]
 pub enum ArtifactWriterOrigin {
     Known(ArtifactWriter),
@@ -26,7 +22,7 @@ pub enum ArtifactWriterOrigin {
 }
 
 impl ArtifactWriterOrigin {
-    /// A verified subprocess origin outranks app attribution: a scheduled
+    /// INVARIANT: A verified subprocess origin outranks app attribution: a scheduled
     /// script may be calling on behalf of an app, but remains unattended.
     pub fn from_actor(actor: &MessageOrigin, app_id: Option<&str>) -> Self {
         if let Some(thread_id) = actor.source_thread_id() {
@@ -100,8 +96,6 @@ mod tests {
             .unwrap();
         };
         emit(serde_json::json!({ "type": "TriggerStarted", "trigger_id": "scheduled-report", "trigger_name": "Report", "prompt": "Prepare report" })).await;
-        // An incomplete projection must fail closed rather than silently
-        // attribute an unattended write to a normal thread.
         sqlx::query("UPDATE thread_summaries SET trigger_id = NULL WHERE thread_id = $1")
             .bind(thread_id)
             .execute(&pool)
@@ -112,7 +106,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(missing_id, sqlx::Error::Protocol(_)));
-        // A failed provenance lookup must refuse before touching the artifact.
         let dir = tempfile::tempdir().unwrap();
         let manager = crate::core::ArtifactManager::new(dir.path().to_path_buf()).unwrap();
         let error = manager
@@ -172,7 +165,6 @@ mod tests {
                 .unwrap(),
             ArtifactWriter::Thread
         );
-        // The already resolved value does not acquire attended status later.
         assert!(!before.is_workspace_leaf());
         assert_eq!(
             ArtifactWriterOrigin::Thread(Uuid::new_v4())

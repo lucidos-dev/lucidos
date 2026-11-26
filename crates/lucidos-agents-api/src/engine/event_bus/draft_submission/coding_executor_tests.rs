@@ -1,4 +1,3 @@
-//! Real coding queue execution over isolated, deterministic CLI children.
 use super::*;
 use std::sync::Arc;
 
@@ -30,15 +29,10 @@ async fn new_coding_test_engine(
     engine
 }
 
-/// The `lucidos` CLI a coding session requires. A runner builds only the engine
-/// crate, so no real one sits beside the test binary or on PATH.
 fn stub_cli_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".local/bin/lucidos")
 }
 
-/// Where the fake agents record the image bytes they receive. The agent runs
-/// in the OS sandbox, which refuses a new file directly in `$HOME` on Linux
-/// but allows one inside `~/.cache`.
 fn capture_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache")
 }
@@ -60,9 +54,6 @@ mod guard_tests {
                     .args(["--exact", "engine::event_bus::draft_submission::tests::coding_executor_tests::guard_tests::both_coding_backends_record_the_accepted_saved_input", "--nocapture"])
                     .env(CHILD, "1")
                     .env("HOME", home.path())
-                    // The home sits in the OS temp dir, so Landlock grants that
-                    // dir list-only. A fake agent reads the engine's image files
-                    // from a folder that already existed at its spawn.
                     .env("TMPDIR", &scratch)
                     .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
                     .env("CODEX_HOME", home.path().join(".codex"))
@@ -215,8 +206,6 @@ mod guard_tests {
                     "SELECT payload->>'sandbox' FROM events WHERE aggregate_id=$1 AND event_type='SessionStarted' ORDER BY sequence DESC LIMIT 1"
                 ).bind(receipt.thread_id.to_string()).fetch_one(&pool).await.unwrap();
                 assert_eq!(recorded, expected_sandbox);
-                // These are events persisted by the real runtime/session loop,
-                // not just parser or capture-builder fixtures.
                 let expected_provider = if backend == "codex" {
                     "chatgpt-plan"
                 } else {
@@ -628,9 +617,6 @@ mod guard_tests {
             }
             assert_eq!(recorded.1["text"], text);
             assert_eq!(recorded.1["origin"]["kind"], "saved_draft");
-            // A running coding session deliberately shares its original response
-            // anchor across inputs. Input identities and sequence order distinguish
-            // these turns; do not impose a different terminal-anchor contract.
             let replies: Vec<(i64, String)> = sqlx::query_as("SELECT sequence,payload->>'text' FROM events WHERE aggregate_id=$1 AND event_type='ResponseGenerated' ORDER BY sequence")
                 .bind(next.thread_id.to_string()).fetch_all(&pool).await.unwrap();
             let expected = if backend == "claude-code" {

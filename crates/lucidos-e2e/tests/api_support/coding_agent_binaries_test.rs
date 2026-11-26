@@ -1,22 +1,6 @@
-//! E2E coverage for `GET /api/v1/coding-agents/binaries` (Settings, Coding
-//! Agents, Binaries).
-//!
-//! The endpoint EXECUTES each resolved binary with `--version`, so the point of
-//! this test is that a real host cannot break it: whatever `claude` / `codex`
-//! are (installed, missing, wedged, printing something we don't recognize), the
-//! response must still be a 200 carrying both agents' resolution.
-//!
-//! Everything asserted here is host-independent on purpose. Whether a version
-//! comes back depends on what is installed on the machine running the suite, so
-//! the test pins the CONTRACT (`version` is absent or a clean single-line
-//! token, never null, never empty) rather than a value.
-
 use crate::support::{base_url, http_client};
 use serde_json::Value;
 
-/// The engine omits `version` when it doesn't know one, so a present field is
-/// always a real, renderable token. The frontend prefixes it with `v` and shows
-/// it verbatim, so a newline or empty string would land in the settings row.
 fn assert_version_contract(agent: &str, status: &Value) {
     let Some(version) = status.get("version") else {
         return;
@@ -64,15 +48,12 @@ async fn coding_agent_binaries_reports_both_agents_with_a_sane_version() {
             status.get("valid").and_then(Value::as_bool).is_some(),
             "{agent}: valid missing from {status}"
         );
-        // A resolution that found nothing has no path; anything else does.
         assert_eq!(
             status.get("path").is_some_and(|p| p.is_string()),
             source != "not-found",
             "{agent}: path presence must follow the source ({source})"
         );
         assert_version_contract(agent, status);
-        // Nothing may be executed for a resolution that isn't valid, so such a
-        // status can never carry a version.
         if status.get("valid").and_then(Value::as_bool) == Some(false) {
             assert!(
                 status.get("version").is_none(),

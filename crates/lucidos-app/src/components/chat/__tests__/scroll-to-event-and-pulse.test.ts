@@ -2,8 +2,6 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vite
 
 const { postClientLog } = vi.hoisted(() => ({ postClientLog: vi.fn() }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
-const { isImageRetryPending } = vi.hoisted(() => ({ isImageRetryPending: vi.fn(() => false) }));
-vi.mock('../../../utils/markdownImageRetry', () => ({ isImageRetryPending }));
 
 import { awayFromBottom, showScrollToBottom, scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, honourAnchoredMutation, markAnchorScroll, clearPendingEventScroll, followingLiveEdge, classifyScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
 import { navFocusElement, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
@@ -121,7 +119,6 @@ beforeEach(() => {
   roCallback = null;
   roDisconnects = 0;
   postClientLog.mockClear();
-  isImageRetryPending.mockReturnValue(false);
   clearPendingEventScroll();
 });
 
@@ -527,159 +524,19 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(4200);
   });
 
-  it('lets go of a landed question once nothing has moved it for the quiet window', () => {
-    const { el, at } = makeMovableEl(3000);
-    restore = installFakeDom({ dataEventMatches: [el] });
-    const { onResize } = makeScrollObservers(container);
-
-    scrollToEventAndPulse('e-7');
-    vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
-    onResize();
-
-    at.top = 4200;
-    onResize();
-
-    expect(container.scrollTop).toBe(3000);
-  });
-
-  it.each([4100, 10_000])('corrects a landed question on its first growth round at %d ms', delay => {
+  it.each([4100, 10_000, 60_000])('holds the landed line when growth first arrives after %d ms', delay => {
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
     const { onResize } = makeScrollObservers(container);
 
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500 + delay);
-    at.top = 4200;
-    onResize();
-
-    expect(container.scrollTop).toBe(4200);
-  });
-
-  it('lets go of a landed question at the cap, even while growth keeps arriving', () => {
-    const { el, at } = makeMovableEl(3000);
-    restore = installFakeDom({ dataEventMatches: [el] });
-    const { onResize } = makeScrollObservers(container);
-
-    scrollToEventAndPulse('e-7');
-    let top = 3000;
-    for (let t = 0; t < EVENT_RESOLVE_MAX_WAIT_MS; t += 2000) {
-      vi.advanceTimersByTime(2000);
-      top += 100;
-      at.top = top;
-      onResize();
-    }
-    const heldAt = container.scrollTop;
-
-    vi.advanceTimersByTime(2000);
-    at.top = top + 500;
-    onResize();
-
-    expect(container.scrollTop).toBe(heldAt);
-  });
-
-  function imageAbove(loading: 'auto' | 'lazy' = 'auto') {
-    const DOCUMENT_POSITION_FOLLOWING = 4;
-    const img = { complete: false, loading, DOCUMENT_POSITION_FOLLOWING, compareDocumentPosition: () => DOCUMENT_POSITION_FOLLOWING };
-    container.querySelectorAll = (sel: string) => (sel === 'img' ? [img] : []);
-    return img;
-  }
-
-  it('keeps holding past the quiet window while an image above the question loads', () => {
-    const img = imageAbove();
-    const { el, at } = makeMovableEl(3000);
-    restore = installFakeDom({ dataEventMatches: [el] });
-    const { onResize } = makeScrollObservers(container);
-
-    scrollToEventAndPulse('e-7');
-    vi.advanceTimersByTime(1500 + 8000);
-
-    img.complete = true;
-    at.top = 4200;
-    onResize();
-
-    expect(container.scrollTop).toBe(4200);
-
-    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS);
-    onResize();
-    at.top = 4600;
-    onResize();
-
-    expect(container.scrollTop).toBe(4200);
-  });
-
-  it('keeps holding while an image above the question waits to retry', () => {
-    const img = imageAbove();
-    img.complete = true;
-    isImageRetryPending.mockReturnValue(true);
-    const { el, at } = makeMovableEl(3000);
-    restore = installFakeDom({ dataEventMatches: [el] });
-    const { onResize } = makeScrollObservers(container);
-
-    scrollToEventAndPulse('e-7');
-    vi.advanceTimersByTime(1500 + 8000);
-
-    isImageRetryPending.mockReturnValue(false);
-    at.top = 4200;
-    onResize();
-
-    expect(container.scrollTop).toBe(4200);
-  });
-
-  it('waits for an image inserted above the question after the last reading', () => {
-    container.querySelectorAll = () => [];
-    const { el, at } = makeMovableEl(3000);
-    restore = installFakeDom({ dataEventMatches: [el] });
-    const { onResize } = makeScrollObservers(container);
-
-    scrollToEventAndPulse('e-7');
-    vi.advanceTimersByTime(1500 + 8000);
-
-    imageAbove();
-    at.top = 3100;
-    onResize();
-
-    expect(container.scrollTop).toBe(3100);
-  });
-
-  it('does not wait for a lazy image, which may never load', () => {
-    imageAbove('lazy');
-    const { el, at } = makeMovableEl(3000);
-    restore = installFakeDom({ dataEventMatches: [el] });
-    const { onResize } = makeScrollObservers(container);
-
-    scrollToEventAndPulse('e-7');
-    vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
     onResize();
 
     at.top = 4200;
     onResize();
 
-    expect(container.scrollTop).toBe(3000);
-  });
-
-  it('lets the quiet window run out when the browser clamps every correction', () => {
-    let top = 0;
-    Object.defineProperty(container, 'scrollTop', {
-      configurable: true,
-      get: () => top,
-      set: (v: number) => { top = Math.min(Math.max(0, v), container.scrollHeight - container.clientHeight); },
-    });
-    const { el, at } = makeMovableEl(9800);
-    restore = installFakeDom({ dataEventMatches: [el] });
-    const { onResize } = makeScrollObservers(container);
-
-    scrollToEventAndPulse('e-7');
-    vi.advanceTimersByTime(1500);
-    at.top = 9900;
-    for (let i = 0; i < 4; i++) {
-      vi.advanceTimersByTime(1500);
-      onResize();
-    }
-    container.scrollHeight = 10400;
-    at.top = 10300;
-    onResize();
-
-    expect(container.scrollTop).toBe(9200);
+    expect(container.scrollTop).toBe(4200);
   });
 
   function listenOn(c: any): Record<string, (e: unknown) => void> {
@@ -688,7 +545,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     return listeners;
   }
 
-  it('lets go of a landed question once focus moves to a control outside it', () => {
+  it('keeps the landed line when focus changes without scrolling', () => {
     const listeners = listenOn(container);
     const { el, at } = makeMovableEl(3000);
     el.contains = () => false;
@@ -702,7 +559,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     at.top = 4200;
     onResize();
 
-    expect(container.scrollTop).toBe(3000);
+    expect(container.scrollTop).toBe(4200);
   });
 
   it('keeps holding when focus lands inside the question or on the transcript itself', () => {

@@ -1,12 +1,3 @@
-//! The wake decision check. Each candidate decides the labelled child turns in
-//! `eval/wake-decision/turns.toml`, through the turn-end gate's own state,
-//! question and threshold. A candidate is a chat model, or a System One row.
-//!
-//! The number that decides first is a missed must-wake: a parent that waits
-//! for a wake that never comes. Noise woken, a wake for a report the parent
-//! could read on its next turn, decides second. Plan:
-//! `docs/plans/2026-10-12-wake-decision-eval.md`.
-
 use std::path::Path;
 
 use lucidos_agents_api::engine::turn_end::{ParentView, TurnRead};
@@ -25,33 +16,21 @@ pub(crate) const CHECK: Check = Check {
     noise: "Noise woken",
 };
 
-/// What the parent should do with the child's report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum Label {
-    /// The parent must act now, so the report has to wake it.
     MustWake,
-    /// The parent can read the report on its next turn.
     File,
 }
 
-/// One labelled child turn.
 #[derive(Debug, Deserialize)]
 struct LabelledReport {
-    /// The shape of the case, for the per-kind breakdown.
     kind: String,
-    /// What opened the child's turn. Absent means `agent`: the parent's spawn
-    /// message or follow-up.
     source: Option<String>,
-    /// The message that opened the child's turn.
     message: String,
-    /// The parent's latest reply.
     parent_reply: String,
-    /// The child's reply.
     reply: String,
-    /// `success` or `no-changes`, the two finishes the gate judges.
     status: String,
-    /// The parent's other children still working.
     #[serde(default)]
     siblings_running: i64,
     label: Label,
@@ -62,8 +41,6 @@ struct LabelledSet {
     report: Vec<LabelledReport>,
 }
 
-/// The finish a set names. Any other finish wakes without a call, so the eval
-/// has nothing to score for it.
 fn judged_status(status: &str) -> Fallible<ChildCompletionStatus> {
     match status {
         "success" => Ok(ChildCompletionStatus::Success),
@@ -128,8 +105,6 @@ impl Labelled for LabelledReport {
     }
 }
 
-/// Run every candidate over the set, append each decision to `out` as JSON
-/// lines, and print the table.
 pub async fn run(set: &Path, backend: &str, models: &[String], out: &Path) -> Fallible<()> {
     let set: LabelledSet = toml::from_str(&std::fs::read_to_string(set)?)?;
     crate::decision_check::run(&CHECK, &set.report, backend, models, out).await
@@ -139,8 +114,6 @@ pub async fn run(set: &Path, backend: &str, models: &[String], out: &Path) -> Fa
 mod tests {
     use super::*;
 
-    /// The shipped set parses into reports the gate judges, and holds both
-    /// labels.
     #[test]
     fn the_labelled_set_is_well_formed() {
         let set: LabelledSet =
@@ -152,7 +125,6 @@ mod tests {
         assert!(set.report.iter().any(|r| r.label == Label::File));
     }
 
-    /// A finish the gate never judges is refused, rather than scored.
     #[test]
     fn a_finish_the_gate_never_judges_is_refused() {
         assert!(judged_status("failure").is_err());

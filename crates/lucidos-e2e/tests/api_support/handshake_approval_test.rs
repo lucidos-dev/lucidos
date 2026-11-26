@@ -1,15 +1,5 @@
-//! The write-then-execute chain ADR 0144 closes, walked end to end over real
-//! HTTP against a running workspace.
-//!
-//! Every step here is what an app UI can do from inside its iframe, using
-//! nothing but documented routes. The point of the test is that the last step
-//! refuses, and that nothing ran.
-
 use crate::support::{base_url, http_client, user_client, workspace_path};
 
-/// A file the script would create if it ever executed. Its absence is the
-/// assertion that matters: a 502 with the script having already run would be
-/// the same status code and a completely different outcome.
 fn marker_path(name: &str) -> std::path::PathBuf {
     workspace_path().join(".lucidos/tmp").join(name)
 }
@@ -25,9 +15,6 @@ fn planted_script(marker: &std::path::Path) -> String {
     )
 }
 
-/// A data write is a mutation, so it needs a caller the engine can name
-/// (ADR 0169). The bare client is kept below for the proxy call, which is what
-/// this file is actually about refusing.
 async fn put_data(path: &str, body: String) -> u16 {
     let url = format!("{}/api/v1/data/{}", base_url(), path);
     user_client()
@@ -47,11 +34,6 @@ async fn delete_data(path: &str) {
     let _ = user_client().await.delete(&url).send().await;
 }
 
-/// The chain, and the edit that must not re-bless a script, in one test.
-///
-/// Both halves write `data/config/apis.json`, which is one file per workspace.
-/// As separate `#[tokio::test]`s they ran concurrently and deleted each other's
-/// provider entry, so they are one sequence with one config write.
 #[tokio::test]
 async fn the_write_then_execute_chain_is_refused() {
     let planted = "e2e-handshake-guard";
@@ -62,15 +44,9 @@ async fn the_write_then_execute_chain_is_refused() {
     let edited_rel = format!("scripts/auth/{}.py", edited);
     let benign = "import json\nprint(json.dumps({\"headers\": {}, \"expires_in\": 60}))\n";
 
-    // This test creates and DELETES non-ignored files under the workspace
-    // (`data/scripts/auth/*.py`, `data/config/apis.json`). A file disappearing
-    // mid-scan makes the command-checkpoint test's whole-tree `git add -A` fail,
-    // so hold the tree read guard for the whole test; see `workspace_tree_lock`.
     let _tree = crate::support::workspace_tree_lock().read().await;
     let _apis = crate::support::apis_json_lock().lock().await;
 
-    // Step 1: land the Python files. Allowed, deliberately: ADR 0144 guards
-    // what runs, not what is written.
     assert_eq!(
         put_data(&planted_rel, planted_script(&marker)).await,
         200,
@@ -78,7 +54,6 @@ async fn the_write_then_execute_chain_is_refused() {
     );
     assert_eq!(put_data(&edited_rel, benign.to_string()).await, 200);
 
-    // Step 2: point providers at them. Also allowed.
     let config = format!(
         r#"{{
           "{planted}": {{"base_url": "https://upstream.invalid", "auth": {{"pipeline": [
@@ -95,7 +70,6 @@ async fn the_write_then_execute_chain_is_refused() {
         "writing config/ must keep working"
     );
 
-    // Step 3: the call that used to run the file as the engine user.
     let url = format!("{}/api/v1/proxy/{}/anything", base_url(), planted);
     let resp = http_client().get(&url).send().await.expect("proxy call");
     let status = resp.status().as_u16();
@@ -116,13 +90,6 @@ async fn the_write_then_execute_chain_is_refused() {
         marker.display()
     );
 
-    // Now the trap that would have voided the whole guard.
-    // `POST /api/v1/data/edit` runs the same `edit_file_at_path` the agent's
-    // own `edit_file` tool runs. Had recording hung off that shared function,
-    // an app editing a script over HTTP would have approved its own change.
-    //
-    // The e2e client is not a browser, so it may approve. That is the CLI's
-    // path, standing in for the user having blessed this script.
     let approve = format!("{}/api/v1/handshake-scripts/approve", base_url());
     let resp = user_client()
         .await
@@ -156,16 +123,12 @@ async fn the_write_then_execute_chain_is_refused() {
         "an API edit must not carry the old approval"
     );
 
-    // Leave the workspace as we found it, so a rerun starts clean and no
-    // later test inherits a provider pointing at an invalid host.
     delete_data("config/apis.json").await;
     delete_data(&planted_rel).await;
     delete_data(&edited_rel).await;
     let _ = std::fs::remove_file(&marker);
 }
 
-/// Whether the state route reports this script as approved, or `None` when it
-/// does not list it at all.
 async fn approved_state(script_rel: &str) -> Option<bool> {
     let url = format!("{}/api/v1/handshake-scripts", base_url());
     let body: serde_json::Value = http_client()
@@ -183,8 +146,6 @@ async fn approved_state(script_rel: &str) -> Option<bool> {
         .and_then(|r| r["approved"].as_bool())
 }
 
-/// The read side of the approval record is open to any caller, including a
-/// browser: the Files panel needs it to warn at edit time.
 #[tokio::test]
 async fn handshake_script_state_is_readable() {
     let url = format!("{}/api/v1/handshake-scripts", base_url());
@@ -197,14 +158,9 @@ async fn handshake_script_state_is_readable() {
     );
 }
 
-/// Approving is the act that lets a file run, so a browser-shaped caller is
-/// refused. An app UI cannot suppress `Sec-Fetch-*`, so it cannot get past it.
 #[tokio::test]
 async fn approving_is_refused_to_a_browser() {
     let url = format!("{}/api/v1/handshake-scripts/approve", base_url());
-    // A registered device, because a real browser carries one and the identity
-    // gate answers before this route does. Without it the 403 under test is
-    // never reached: the reply is a 401 about the missing credential.
     let resp = user_client()
         .await
         .post(&url)

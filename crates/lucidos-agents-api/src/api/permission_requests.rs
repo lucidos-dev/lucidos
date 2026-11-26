@@ -1,12 +1,3 @@
-//! `POST /api/v1/permission-requests`: an agent prepares a *permission
-//! request* for an act outside its own authority (ADR 0664).
-//!
-//! The engine words the card. The agent supplies a reason, which the card
-//! quotes as the agent's, and writes no part of what the owner taps. The
-//! request lands on the thread the caller's *thread-bound origin token* names.
-//! The agent then asks its question tool with the id this route returns, and
-//! `engine::permission::prepare` swaps in the card.
-
 use crate::engine::trigger_writes::RequestedTriggerGrants;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -26,14 +17,10 @@ use crate::engine::permission::{
 };
 use crate::engine::thread_events::MessageOrigin;
 
-/// The longest reason the card quotes, in characters. The card is one screen.
 const REASON_MAX_CHARS: usize = 600;
 
-/// A permission request's card header.
 const HEADER: &str = "Permission";
 
-/// What one gate asks the owner for: the action, its exact target and the
-/// card's question.
 pub(crate) struct Ask {
     pub(crate) action: Action,
     pub(crate) breadth: String,
@@ -106,20 +93,15 @@ pub(in crate::api) async fn answering_actor(
     .await
     .map(Some)
     .map_err(|mut refusal| {
-        // Permission answers have always returned 403 for unidentified callers.
         refusal.status = StatusCode::FORBIDDEN;
         refusal
     })
 }
 
-/// The breadth a snapshot restore names: one snapshot in one workspace.
 pub(crate) fn snapshot_breadth(workspace: &str, handle: &str) -> String {
     format!("{workspace}/{handle}")
 }
 
-/// Spend `user`'s live permission for `action` at `breadth`. `true` means the
-/// act may run: a lasting grant covers it, or a once grant's spend landed.
-/// An unreadable store, a lost race or a failed write is `false`.
 pub(crate) async fn spend_live(
     bus: &EventBus,
     user: &PermissionUser,
@@ -129,8 +111,6 @@ pub(crate) async fn spend_live(
     spend_covering(bus, user, action, breadth).await.is_some()
 }
 
-/// [`spend_live`], naming a spent once grant so a refused act can give it
-/// back with [`restore_spent`]. `None` means no live permission covered it.
 pub(crate) async fn spend_live_once(
     bus: &EventBus,
     user: &PermissionUser,
@@ -142,7 +122,7 @@ pub(crate) async fn spend_live_once(
     Some(once.then_some(permission.permission_id))
 }
 
-/// Give `thread` back the once grant `spent`, because the act it paid for
+/// INVARIANT: Give `thread` back the once grant `spent`, because the act it paid for
 /// was refused and changed nothing.
 pub(crate) async fn restore_spent(
     bus: &EventBus,
@@ -168,7 +148,6 @@ pub(crate) async fn restore_spent(
     })
 }
 
-/// The row whose spend succeeded, including a lasting permission's no-op spend.
 async fn spend_covering(
     bus: &EventBus,
     user: &PermissionUser,
@@ -188,18 +167,14 @@ async fn spend_covering(
     }
 }
 
-/// What a gate holds once it asked for its permission.
+/// INVARIANT: What a gate holds once it asked for its permission.
 pub(crate) enum Spent {
-    /// A live permission covered the act. Carries its id only for a spent once grant.
     Allowed(Option<Uuid>),
-    /// None was live. The request is prepared and the agent asks with this id.
     Requested(String),
-    /// A creator-bound lasting grant covered the mint; the gateway must recheck it.
+    /// INVARIANT: A creator-bound lasting grant covered the mint; the gateway must recheck it.
     DeviceSessionScope,
 }
 
-/// Spend the caller's live permission for `ask`, or prepare a request for
-/// one. Never both, and never an act without a spend.
 pub(crate) async fn spend_or_prepare(
     bus: &EventBus,
     caller: Uuid,
@@ -223,7 +198,6 @@ pub(crate) async fn spend_or_prepare(
     Ok(Spent::Requested(prepare(bus, caller, ask).await?))
 }
 
-/// Prepare `ask` on `caller`, and return the request id the agent asks with.
 pub(crate) async fn prepare(bus: &EventBus, caller: Uuid, ask: Ask) -> Result<String, ApiError> {
     prepare_request(bus, caller, ask.card(caller))
         .await
@@ -269,8 +243,6 @@ pub(crate) fn host_log_ask(digest: &str, manifest: &str, reason: &str) -> Result
     })
 }
 
-/// A workspace broker verb's request. It names the verb and one target: a
-/// workspace slug, or a Trash entry for a restore.
 pub(crate) fn workspace_ask(action: Action, target: &str, reason: &str) -> Result<Ask, ApiError> {
     if !action.is_workspace_verb() || !valid_workspace_target(action, target) {
         return Err(ApiError::bad_request(format!(
@@ -315,7 +287,7 @@ pub(crate) fn workspace_ask(action: Action, target: &str, reason: &str) -> Resul
     })
 }
 
-/// Only the broker calls this after the gateway reports matching creation provenance.
+/// INVARIANT: Only the broker calls this after the gateway reports matching creation provenance.
 pub(crate) fn device_session_ask(
     target: &str,
     reason: &str,
@@ -329,7 +301,6 @@ pub(crate) fn device_session_ask(
     Ok(ask)
 }
 
-/// A session request binds all mint parameters in one canonical breadth.
 pub(super) fn device_session_target(
     workspace: &str,
     device: &str,
@@ -345,9 +316,6 @@ pub(crate) fn decode_device_session_target(target: &str) -> Option<(String, Stri
     crate::engine::permission::device_session::decode_target(target)
 }
 
-/// A workspace verb names a workspace slug. A Trash restore names the Trash
-/// entry instead, in the gateway's `workspace-` entry id form. A device
-/// session names its canonical mint parameters.
 fn valid_workspace_target(action: Action, target: &str) -> bool {
     if action == Action::GrantDeviceSession {
         decode_device_session_target(target).is_some()
@@ -362,7 +330,6 @@ fn valid_workspace_target(action: Action, target: &str) -> bool {
     }
 }
 
-/// A snapshot restore's request: one snapshot, in one other workspace.
 pub(crate) fn snapshot_ask(
     source: &str,
     target: &str,
@@ -401,8 +368,6 @@ pub(crate) fn snapshot_ask(
     })
 }
 
-/// An event hook verb's request: one verb, on one hook, at `breadth`.
-/// `effect` says what the act does, in the engine's words.
 pub(crate) fn hook_ask(
     action: Action,
     breadth: String,
@@ -427,11 +392,8 @@ pub(crate) fn hook_ask(
     })
 }
 
-/// The breadth a ladder edit names. One target covers every surface, so a
-/// grant for this thread covers every ladder edit it makes.
 pub(crate) const LADDER_BREADTH: &str = "intelligence-ladder";
 
-/// A ladder edit's request: any edit to any surface's intelligence ladder.
 pub(crate) fn ladder_ask(reason: &str) -> Result<Ask, ApiError> {
     Ok(Ask {
         device_scope: None,
@@ -447,7 +409,6 @@ pub(crate) fn ladder_ask(reason: &str) -> Result<Ask, ApiError> {
     })
 }
 
-/// A thread verb's request: one verb, at one thread.
 pub(crate) async fn thread_ask(
     pool: &sqlx::PgPool,
     caller: Uuid,
@@ -526,7 +487,6 @@ pub(in crate::api) struct PreparePermissionRequestBody {
     target_workspace_id: Option<String>,
     #[serde(default)]
     snapshot_handle: Option<String>,
-    /// The trigger a trigger grant names, by id.
     #[serde(default)]
     target_trigger_id: Option<String>,
     #[serde(default)]
@@ -536,7 +496,6 @@ pub(in crate::api) struct PreparePermissionRequestBody {
     reason: String,
 }
 
-/// Prepare a grant change stamped with the facts and definition the owner sees.
 async fn prepare_trigger_grant(
     state: &AppState,
     caller: Uuid,
@@ -629,11 +588,6 @@ async fn prepare_trigger_grant(
     })
 }
 
-/// POST /api/v1/permission-requests: prepare a permission request on the
-/// calling thread, and return the id the agent asks its question tool with.
-///
-/// Only an agent inside its own thread may call it. A caller already holding a
-/// live permission for the act is told so, with 409, and acts with no card.
 pub(in crate::api) async fn prepare_permission_request(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -724,10 +678,8 @@ pub(in crate::api) async fn prepare_permission_request(
     Ok(Json(serde_json::json!({ "request_id": request_id })))
 }
 
-/// The reason slug a client reads to ask the owner, then call again.
 pub(crate) const PERMISSION_REQUIRED: &str = "permission_required";
 
-/// 403 `permission_required`, with the id the agent asks the owner with.
 pub(crate) fn permission_required(request_id: &str) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     (
@@ -742,8 +694,6 @@ pub(crate) fn permission_required(request_id: &str) -> axum::response::Response 
         .into_response()
 }
 
-/// The calling agent's own thread, as its origin token's MAC proves it. Any
-/// other caller is refused: the card must land on the thread that asks.
 pub(super) fn calling_agent_thread(headers: &HeaderMap) -> Result<Uuid, ApiError> {
     match crate::core::subprocess_origin::subprocess_origin(headers) {
         SubprocessOrigin::Subprocess {
@@ -758,7 +708,6 @@ pub(super) fn calling_agent_thread(headers: &HeaderMap) -> Result<Uuid, ApiError
     }
 }
 
-/// The reason, trimmed and capped. An empty one is refused: the owner reads it.
 fn checked_reason(reason: &str) -> Result<&str, ApiError> {
     let reason = reason.trim();
     if reason.is_empty() {
@@ -772,8 +721,6 @@ fn checked_reason(reason: &str) -> Result<&str, ApiError> {
     })
 }
 
-/// The target's title, or a 404 naming the id when no such thread exists. An
-/// untitled thread reads as one, never as its id: the card shows no raw id.
 async fn thread_title(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<String, ApiError> {
     let row: Option<Option<String>> =
         sqlx::query_scalar("SELECT title FROM thread_summaries WHERE thread_id = $1")

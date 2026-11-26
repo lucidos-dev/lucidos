@@ -1,14 +1,9 @@
-//! `op` resolver tests. A fake `op` script stands in for the real tool, so no
-//! test needs a 1Password account.
-
 use super::*;
 use crate::core::AuthType;
 use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
 
-/// An obviously fake token, shaped like a real one so the masking applies.
 const TOKEN: &str = "ops_FAKETOKENFORTESTSONLY0123456789";
 
-/// A fake `op` in its own temporary folder running `body` as `/bin/sh`.
 pub(crate) fn fake_op(body: &str) -> (tempfile::TempDir, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
@@ -46,7 +41,6 @@ async fn op_reads_the_reference_and_its_child_holds_only_the_token_path_and_home
     let names: Vec<&str> = env
         .lines()
         .filter_map(|line| line.split_once('=').map(|(name, _)| name))
-        // The shell adds these itself; none came from the engine.
         .filter(|name| !matches!(*name, "PWD" | "SHLVL" | "_" | "OLDPWD"))
         .collect();
     assert!(
@@ -203,8 +197,6 @@ async fn a_refused_vault_check_is_definitive_and_never_holds_the_token() {
     assert!(!reason.contains(TOKEN), "{reason}");
 }
 
-/// Every way `op` words a missing item, vault or field drops the cached value,
-/// and a network failure does not.
 #[test]
 fn a_missing_field_in_any_wording_is_definitive() {
     for said in [

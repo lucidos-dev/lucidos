@@ -13,11 +13,10 @@ use crate::core::events::{walk_thread_images, walk_thread_images_meta};
 #[derive(Serialize)]
 pub struct ThreadImageInfo {
     pub index: usize,
-    pub source: &'static str, // "user" or "generated"
+    pub source: &'static str,
     pub mime_type: String,
 }
 
-/// GET /api/v1/threads/:thread_id/images — list all images in a thread
 pub(super) async fn list_thread_images(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
@@ -33,8 +32,6 @@ pub(super) async fn list_thread_images(
             )
         })?;
 
-    // Listing is metadata-only — skip the per-blob read+encode that the
-    // bytes-loading walker would do.
     let images = walk_thread_images_meta(state.engine.workspace_path(), &events)
         .into_iter()
         .map(|img| ThreadImageInfo {
@@ -47,7 +44,6 @@ pub(super) async fn list_thread_images(
     Ok(Json(images))
 }
 
-/// GET /api/v1/threads/:thread_id/images/:index — serve a single image as raw bytes
 pub(super) async fn get_thread_image(
     State(state): State<AppState>,
     Path((thread_id, target_index)): Path<(Uuid, usize)>,
@@ -86,7 +82,7 @@ pub(super) async fn get_thread_image(
             )
         })?;
 
-    // Empty base64 means walk_thread_images couldn't read the blob
+    // INVARIANT: Empty base64 means walk_thread_images couldn't read the blob
     // (typically a partial backup-restore). The numbering slot exists so
     // thread:N stays stable, but there are no bytes to serve.
     if img.base64.is_empty() {

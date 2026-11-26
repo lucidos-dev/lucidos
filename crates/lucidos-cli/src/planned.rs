@@ -1,22 +1,7 @@
-//! `lucidos planned` — record/query the durable Planned marker that enforces
-//! the `implementation-plan` skill. Mirrors `hardened.rs` (same `git_context`
-//! and HTTP-to-parent-engine pattern). The marker is set by the skill
-//! (`mark --plan <docs/plans/file>` → records the awaiting-approval `proposed`
-//! state), approved by the agent after the user's chat approval
-//! (`approve` → flips `proposed` to gate-satisfying `planned`), set directly
-//! for a local fix (`mark --simple "<reason>"` → `acknowledged_simple`, no
-//! approval needed), or claimed by an unattended run for a scoped security fix
-//! (`mark --security-fix "<reason>" --files <csv>` → `bounded_security_fix`).
-//! Those last three satisfy every gate; `proposed` and the absence of a marker
-//! both block.
-
 use crate::hardened::{git_context, run_git};
 use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
-/// What picking an `Implement in a fresh session` option does at an offered
-/// checkpoint run named by `flags`. Printed only when the card may offer one.
-/// The flow's own decision comes first, since only the flow knows what it is.
 fn fresh_session_handoff(flags: &str) -> String {
     format!(
         "Picking an `Implement in a fresh session` option is the user's decision here. First do \
@@ -54,13 +39,10 @@ const INTELLIGENCE_FIT: &str = "Choose the successor's implementer by your judge
     costs on every turn. Say why in one line of your message. Name a rung by its picker label \
     and effort, as the ladder prints them. Name the backend only when it is not this thread's.";
 
-/// At plan approval a fresh session that does not pay leaves staying here as
-/// the recommendation, so `Approve here` carries the label and leads.
 fn approve_here_recommended(plan: bool, paying: bool) -> bool {
     plan && !paying
 }
 
-/// Allocate scarce card slots, then display the recommended option first.
 fn card_slots(
     plan: bool,
     other: bool,
@@ -240,20 +222,13 @@ pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str)
     out
 }
 
-/// Which kind of planning decision is being recorded.
 #[derive(Debug, Clone)]
 pub(crate) enum MarkKind<'a> {
-    /// A real plan was written to `docs/plans/`; carries the relative path.
     Plan(&'a str),
-    /// The agent declared a local fix; carries the one-line reason.
     Simple(&'a str),
-    /// An unattended run is committing a security fix confined to `files`.
-    /// Carries the one-line reason and the repo-relative paths it is bounded
-    /// to. The engine caps the list and the Apply floor enforces it.
     SecurityFix { reason: &'a str, files: Vec<String> },
 }
 
-/// Planned-marker gate state from the engine. Only `Satisfied` permits edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlannedState {
     Satisfied,
@@ -270,7 +245,6 @@ impl PlannedState {
             "PROPOSED" => PlannedState::Proposed,
             "CHANGED" => PlannedState::Changed,
             "UNREADABLE" => PlannedState::Unreadable,
-            // Unknown state labels also block edits.
             _ => PlannedState::Missing,
         }
     }
@@ -286,7 +260,6 @@ impl PlannedState {
     }
 }
 
-/// Record the beginning of planning on the signed calling thread.
 pub(crate) fn cmd_start(ws: &Workspace, kind: &str) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/internal/start-plan", ws.base_url());
     let resp = http_client()?
@@ -317,7 +290,6 @@ fn check_plan_prose(cwd: &std::path::Path, head: &str, plan: &str) -> Result<(),
             Err(error) => return Err(format!("Could not inspect {script}: {error}").into()),
         }
         if !checked_revision {
-            // The gates scan the worktree. The marker records the committed plan.
             let status = Command::new("git")
                 .current_dir(worktree)
                 .args(["--literal-pathspecs", "diff", "--quiet", head, "--", plan])
@@ -364,7 +336,6 @@ pub(crate) fn cmd_mark(
     let (repo_root, branch, head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/v1/internal/mark-planned", ws.base_url());
     let (state, plan_path, reason, files) = match &kind {
-        // The engine decides whether the committed plan already has approval.
         MarkKind::Plan(p) => {
             check_plan_prose(&cwd, &head_sha, p)?;
             ("proposed", Some(*p), None, Vec::new())
@@ -402,23 +373,11 @@ pub(crate) fn cmd_mark(
         MarkKind::Plan(p) if status == reqwest::StatusCode::OK => {
             println!("Plan approval carried forward: {} ({}). Continue implementation.", branch, p);
         }
-        // Naming the question tool here matters: this line is what the agent
-        // reads at the exact moment it turns to present the plan. Told only to
-        // "present it", it writes prose and the thread sits idle until the user
-        // types "approve" by hand (2026-08-02). Both tool names are spelled out
-        // because the CLI serves both backends and cannot tell them apart:
-        // Claude Code has `AskUserQuestion`, Codex has `ask_user_question` on
-        // the Lucidos MCP server, and sending either after the other's tool
-        // would strand a proposed plan with no way to get it approved.
         MarkKind::Plan(p) => println!(
             "Plan recorded (awaiting approval): {} ({}). Run the approval checkpoint in the `implementation-plan` skill (§ Asking for approval) and offer the options it prints. Ask with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex), not in prose. Put the plan summary on the card's question itself, with the ask on its last line: the user never sees a message that also calls a tool. On a re-ask, carry what changed. Run `lucidos planned approve` only after the user taps an approving option or types a plain approval. A typed question or suggestion is a request for changes: revise the plan, run `lucidos planned mark --plan` again, and ask again.",
             branch, p
         ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),
-        // The reminder is the only enforcement of the lane's other two
-        // preconditions. Apply checks the file bound. The unattended run and
-        // the regression test are claims the agent makes, so state them where
-        // the agent reads the result.
         MarkKind::SecurityFix { reason, files } => println!(
             "Bounded security fix recorded: {} ({}). Confined to {} file(s): {}. Apply refuses this branch if it touches anything else, so re-run this command with the full list if the fix has to grow. The lane is for an UNATTENDED run only, and it requires a regression test that fails without your fix: if either is untrue, write a plan instead and get it approved.",
             branch,
@@ -430,8 +389,6 @@ pub(crate) fn cmd_mark(
     Ok(())
 }
 
-/// What a full approval tells the agent to do next. A fresh-session pick also
-/// approves the full scope, so the text names both paths.
 fn implementation_approved_text(branch: &str) -> String {
     format!(
         "Plan approved: {branch}. Implementation is unblocked. \
@@ -441,7 +398,6 @@ fn implementation_approved_text(branch: &str) -> String {
     )
 }
 
-/// Approve the recorded plan for the scope the user chose.
 pub(crate) fn cmd_approve(ws: &Workspace, plan_only: bool) -> Result<(), BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, _head_sha) = git_context(&cwd)?;
@@ -478,8 +434,6 @@ pub(crate) fn cmd_approve(ws: &Workspace, plan_only: bool) -> Result<(), BoxErro
             println!("{}", implementation_approved_text(&branch));
         }
         if let Some(plan_path) = body.get("plan_path").and_then(|v| v.as_str()) {
-            // The marker is already approved. A failed file edit must not
-            // read as a failed approval, so it only warns.
             match mark_plan_file_approved(&cwd, plan_path) {
                 Ok(true) => println!("Marked {} as approved and committed it.", plan_path),
                 Ok(false) => {}
@@ -491,8 +445,6 @@ pub(crate) fn cmd_approve(ws: &Workspace, plan_only: bool) -> Result<(), BoxErro
             }
         }
     } else {
-        // Nothing to flip — no proposed plan (already approved, a --simple ack,
-        // or no marker at all). Surface it so the agent doesn't assume success.
         println!(
             "No proposed plan to approve on {} (already approved, a simple-fix ack, or no marker). \
              Run `lucidos planned state` to check.",
@@ -502,10 +454,6 @@ pub(crate) fn cmd_approve(ws: &Workspace, plan_only: bool) -> Result<(), BoxErro
     Ok(())
 }
 
-/// The engine's own words when it refuses a marker write the agent can fix:
-/// an approval the user has not given, a batch approval of plan text that has
-/// changed since, or a branch the thread's Apply never lands. The agent then reads what to do, not an HTTP status. `None` for any
-/// other error body.
 fn marker_refusal(body: &str) -> Option<String> {
     let body: serde_json::Value = serde_json::from_str(body).ok()?;
     let reason = body.get("reason")?.as_str()?;
@@ -522,8 +470,6 @@ fn marker_refusal(body: &str) -> Option<String> {
 mod plan_status;
 use plan_status::{approved_plan_text, APPROVED_STATUS};
 
-/// Flip the plan file's status line and commit it, so the file on main says
-/// what the marker says. Returns whether it committed anything.
 fn mark_plan_file_approved(cwd: &std::path::Path, plan_path: &str) -> Result<bool, BoxError> {
     let toplevel = run_git(cwd, &["rev-parse", "--show-toplevel"])?;
     let file = std::path::Path::new(&toplevel).join(plan_path);
@@ -540,8 +486,6 @@ fn mark_plan_file_approved(cwd: &std::path::Path, plan_path: &str) -> Result<boo
     Ok(true)
 }
 
-/// GET the Planned-marker state of the current branch from the parent engine.
-/// Used by `cmd_state` (printing) and `cc_plan_gate` (deciding).
 pub(crate) fn query_state(ws: &Workspace) -> Result<PlannedState, BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, _head_sha) = git_context(&cwd)?;
@@ -571,7 +515,6 @@ pub(crate) fn query_state(ws: &Workspace) -> Result<PlannedState, BoxError> {
     Ok(PlannedState::parse(state))
 }
 
-/// Print the current branch’s plan marker state to stdout.
 pub(crate) fn cmd_state(ws: &Workspace) -> Result<(), BoxError> {
     let state = query_state(ws)?;
     println!("{}", state.as_str());
@@ -659,7 +602,6 @@ mod tests {
 
     const FLAGS: &str = "--at plan-approval --progress 0/4";
 
-    /// A three-rung ladder with the thread on `current`.
     fn ladder(current: Option<usize>) -> Ladder {
         let step = |model: &str, effort: &str| IntelligenceRung {
             model: model.into(),
@@ -939,7 +881,6 @@ mod tests {
                 }
             }
         }
-        // The rendered ladder and implementer may name efforts; the static principle cannot.
         for guidance in [
             IMPLEMENTER_CHOICE,
             PLAN_IMPLEMENTER_CHOICE,
@@ -1005,9 +946,6 @@ mod tests {
 
     #[test]
     fn parse_falls_back_to_missing_for_unknown_or_empty() {
-        // Empty body / unreachable engine must not silently mask an unplanned
-        // branch — treat as Missing so the gate still fires. A drifted/unknown
-        // value must NOT be read as the satisfying state.
         assert_eq!(PlannedState::parse(""), PlannedState::Missing);
         assert_eq!(PlannedState::parse("???"), PlannedState::Missing);
         assert_eq!(PlannedState::parse("PRESENT"), PlannedState::Missing);

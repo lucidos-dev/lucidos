@@ -1,9 +1,3 @@
-//! The *wake decision* route.
-//!
-//! A coding-agent child decides through `lucidos wake-parent yes|no`, which
-//! posts here. A chat child decides through the `wake_parent` tool, in process,
-//! and both record the same events.
-
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
     http::{HeaderMap, StatusCode},
@@ -18,24 +12,15 @@ use crate::llm::tools::WAKE_ARG;
 use super::actions::refuse_an_agent_from_another_thread;
 use super::parse_thread_id;
 
-/// The 403 for an agent naming another thread's id.
 pub(super) const WAKE_DECISION_IS_THE_CALLERS: &str = "A thread can only decide whether its \
     own report wakes its parent, and the id in the path is not the calling thread. Drop the \
     id: `lucidos wake-parent` already acts on the thread you are running in.";
 
-/// The body of a wake decision. `wake` is required: there is no default.
 #[derive(serde::Deserialize)]
 pub(in crate::api) struct WakeDecisionBody {
     wake: bool,
 }
 
-/// POST /api/v1/threads/:thread_id/wake-decision: the calling thread's agent
-/// records whether this turn's report wakes its parent, `{"wake": true|false}`.
-///
-/// Acts on the calling thread only, as the tool does by taking no thread id.
-/// A thread with no parent has no report to decide, so it gets a 409. A child
-/// whose spawn declared a wake mode records nothing, and reads status
-/// `declared` (ADR 0451).
 pub(in crate::api) async fn record_thread_wake_decision(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,

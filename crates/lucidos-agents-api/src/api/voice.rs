@@ -1,33 +1,3 @@
-//! `GET /api/v1/voice?thread_id=<uuid>`: the socket a *voice session* runs on.
-//!
-//! Authenticated like every other `/api/v1` route, and proxied by the gateway
-//! as an upgrade (ADR 0151). `/api/v1/ws-echo` is the diagnostic that tells a
-//! broken hop apart from a broken call.
-//!
-//! **The client stays dumb.** Binary frames are audio and text frames are the
-//! small control vocabulary in `voice::wire`. Nothing here names a provider.
-//!
-//! **A call is a write behind a GET.** It records what the caller says as the
-//! owner's own words, starts turns, and answers cards. So the upgrade presents
-//! a *call ticket* the owner's device minted (`api::voice_ticket`), and
-//! [`admit`] redeems it.
-//!
-//! Seven refusals happen before the upgrade, because each is a thing the caller
-//! asked for and can stop asking for. The mint makes all but the first, so a
-//! person reads the reason there:
-//!
-//! - no live ticket for this thread;
-//! - a caller that is not a person's device;
-//! - voice switched off;
-//! - a coding-agent thread;
-//! - an unknown thread;
-//! - a thread that is not the home thread (or no home thread at all);
-//! - a thread already on a call.
-//!
-//! A thread the engine cannot read answers 500 there too, which is nobody's
-//! fault. A failure to reach the talker happens after, as an `error` frame,
-//! because the caller cannot have known and a person has to read it.
-
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
@@ -44,7 +14,7 @@ use crate::voice::wire::{ClientControl, ServerFrame};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The largest frame the socket accepts.
+/// INVARIANT: The largest frame the socket accepts.
 ///
 /// Caller audio arrives in chunks of a few kilobytes. The cap is generous
 /// against that, and it stops an authenticated caller sizing the engine's read
@@ -57,7 +27,6 @@ struct VoiceQuery {
     thread_id: Uuid,
 }
 
-/// What an upgrade with no live ticket for its thread is told.
 const NO_LIVE_TICKET: &str = "A call needs a live ticket for this thread. Mint one at \
      POST /api/v1/voice/ticket and dial before it expires.";
 
@@ -89,7 +58,7 @@ async fn voice(
     Ok(upgrade
         .max_message_size(MAX_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
-            // Held for the whole call, and freed on drop even if this task
+            // INVARIANT: Held for the whole call, and freed on drop even if this task
             // panics, so a crash cannot leave a thread permanently busy.
             let _slot = slot;
             let mut transport = SocketTransport { socket };
@@ -128,19 +97,12 @@ async fn voice(
         }))
 }
 
-/// A call [`admit`] let through: its id, the thread's slot, and who is calling.
 struct Admitted {
     session_id: Uuid,
     slot: crate::voice::registry::VoiceSessionSlot,
     actor: crate::engine::thread_events::MessageOrigin,
 }
 
-/// Redeem the upgrade's call ticket, re-check, and claim the thread's slot.
-///
-/// Separate from the handler because axum runs `WebSocketUpgrade` before the
-/// handler body: a plain GET is refused with a 400 by the extractor, so
-/// neither refusal here is reachable from an ordinary HTTP request. Testing
-/// them means testing this.
 async fn admit(
     pool: &sqlx::PgPool,
     event_bus: &crate::engine::event_bus::EventBus,
@@ -196,7 +158,7 @@ fn thread_busy() -> ApiError {
     )
 }
 
-/// Refuse a call on `thread_id` for anything about the thread or the
+/// INVARIANT: Refuse a call on `thread_id` for anything about the thread or the
 /// workspace. The caller is already known to be the owner's device.
 ///
 /// Both the ticket mint and the upgrade ask. Only the mint's answer reaches a
@@ -214,9 +176,6 @@ pub(super) async fn refuse_call_on(
         ));
     }
 
-    // Who holds this thread decides whether there is a call to place at all.
-    // A call reaches the Lucidos Agent and nothing else (ADR 0165). The doer
-    // asks the same question again, and is the floor under this one.
     match crate::voice::doer::doer_for(pool, thread_id).await {
         crate::voice::doer::ThreadDoer::LucidosAgent => {}
         crate::voice::doer::ThreadDoer::CodingAgent => {
@@ -238,8 +197,6 @@ pub(super) async fn refuse_call_on(
         }
     }
 
-    // Voice sessions live in the home thread alone (ADR 0362). The control is
-    // drawn there and nowhere else, so this is the floor under it.
     match crate::engine::home_thread::is_home_thread(pool, thread_id).await {
         Ok(true) => {}
         Ok(false) => {
@@ -266,7 +223,6 @@ pub(super) async fn refuse_call_on(
     Ok(())
 }
 
-/// The caller's end of a call, over a WebSocket.
 struct SocketTransport {
     socket: WebSocket,
 }
@@ -282,7 +238,6 @@ impl CallTransport for SocketTransport {
                     Ok(control) => CallerFrame::Control(control),
                     Err(_) => CallerFrame::Undecodable,
                 },
-                // axum answers a ping itself, and a pong is nothing to act on.
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                 Some(Ok(Message::Close(_))) | None => CallerFrame::Closed,
                 Some(Err(e)) => {

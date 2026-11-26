@@ -1,12 +1,9 @@
-//! Structured billing refusals, distinct from rate limits and capacity errors.
-
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use std::sync::OnceLock;
 
 use super::ProviderKind;
 
-/// The call owner's hold policy, independent of provider transport code.
 #[async_trait::async_trait]
 pub trait SpendCapPolicy: Send + Sync {
     async fn check(
@@ -18,7 +15,6 @@ pub trait SpendCapPolicy: Send + Sync {
     async fn succeeded(&self, provider: Option<ProviderKind>);
 }
 
-/// Callers stop retries and hold background work on this refusal.
 #[derive(Clone, Debug)]
 pub struct SpendCapReached {
     pub provider: ProviderKind,
@@ -40,7 +36,7 @@ impl std::fmt::Display for SpendCapReached {
 impl std::error::Error for SpendCapReached {}
 
 impl SpendCapReached {
-    /// Read the provider's error structure, before any retry or auth decision.
+    /// INVARIANT: Read the provider's error structure, before any retry or auth decision.
     pub fn from_http(
         provider: ProviderKind,
         status: u16,
@@ -96,7 +92,7 @@ pub fn is_spend_cap_http(status: u16, body: &str) -> bool {
             .is_ok_and(|value| billing_error(&value["error"]))
 }
 
-/// A failed-turn notice; coding-agent notices never start engine holds.
+/// INVARIANT: A failed-turn notice; coding-agent notices never start engine holds.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpendCapNotice {
     pub provider: String,
@@ -151,7 +147,7 @@ fn reset_clause(message: &str) -> Option<DateTime<Utc>> {
         .map(|date| date.and_utc())
 }
 
-/// String-only consumers also see formatted HTTP errors from coding agents.
+/// INVARIANT: String-only consumers also see formatted HTTP errors from coding agents.
 /// The structured HTTP path above remains the authority for engine calls.
 pub fn is_spend_cap_text(message: &str) -> bool {
     let lower = message.to_lowercase();
@@ -236,7 +232,6 @@ mod tests {
     }
 }
 
-/// Fallback only when the provider did not name a reset time.
 pub const SPEND_CAP_HOLD_DEFAULT: chrono::Duration = chrono::Duration::hours(1);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -281,7 +276,7 @@ impl HeldSpendCap {
     }
 }
 
-/// One engine's provider holds. The owner serializes transitions with their
+/// INVARIANT: One engine's provider holds. The owner serializes transitions with their
 /// announcements so a success cannot announce an end before the start.
 #[derive(Debug, Default)]
 pub struct SpendCapHolds {
@@ -299,7 +294,7 @@ impl SpendCapHolds {
         holds
     }
 
-    /// Called before a gate and status read. Expiry announces exactly once.
+    /// INVARIANT: Called before a gate and status read. Expiry announces exactly once.
     pub fn expire(&mut self, now: DateTime<Utc>) -> Vec<SpendCapHoldChange> {
         let expired: Vec<_> = self
             .held

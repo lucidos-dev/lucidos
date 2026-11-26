@@ -60,6 +60,12 @@ backup is an age file (`.age`), so the `age` command line tool opens it too.
 Backups made before age (`.enc`) need the older base64 key, which Settings
 showed before the switch.
 
+### Backup origin
+The 12-character token after `-o` in a cloud backup filename. It identifies
+the workspace copy that wrote the backup. Automatic retention uses it to
+keep each copy's backups separate. A workspace restored from an archive gets
+its own origin when it first backs up.
+
 ### Cross-gateway link
 A link to a *thread* in a *workspace* your OTHER Lucidos install serves. Most machines run one install, where no link is cross-gateway. A machine running the packaged app beside a dev checkout runs two, each with its own workspaces.
 

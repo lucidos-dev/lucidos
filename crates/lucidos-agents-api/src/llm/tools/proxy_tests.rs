@@ -1,8 +1,6 @@
 use super::*;
 use crate::llm::tool_names as tn;
 
-/// The description names every builtin, so a row added to the catalog
-/// cannot stay invisible to the agent.
 #[test]
 fn proxy_request_names_every_builtin_provider_proxy() {
     let tools = proxy_tools();

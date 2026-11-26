@@ -1,4 +1,6 @@
+// @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
+import { createRef, render } from 'preact';
 import type { SlownessEpisode } from '../../../store/actions/slowness';
 import { slownessBannerBody, shouldRenderSlownessBanner } from '../SlownessBanner';
 import { findByClass, textOf } from './vnodeWalk';
@@ -38,6 +40,18 @@ const fullDisk: SlownessEpisode = {
   reason: 'disk',
   free_bytes: 4e8,
 };
+
+describe('slownessBannerBody hands its ref to the bar itself', () => {
+  it('points the ref at the rendered bar, the box the shell lays out and measures', () => {
+    const ref = createRef<HTMLDivElement>();
+    const container = document.createElement('div');
+    render(slownessBannerBody({
+      layout: 'desktop', episode, packaged: false, onDismiss: () => {}, elRef: ref,
+    }), container);
+    expect(ref.current).not.toBeNull();
+    expect(ref.current).toBe(container.querySelector('.slowness-banner'));
+  });
+});
 
 describe('shouldRenderSlownessBanner renders exactly one instance per layout', () => {
   it('renders only the desktop instance on a desktop viewport', () => {

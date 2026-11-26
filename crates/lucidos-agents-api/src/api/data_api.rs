@@ -54,9 +54,6 @@ fn validate_data_path_mutate(path: &str) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
-/// Refuse a read whose real file, once symlinks resolve, is not one this API
-/// serves by name. Run after [`validate_data_path_read`], which reads only the
-/// string.
 fn validate_resolved_read(
     data_dir: &std::path::Path,
     path: &str,
@@ -86,23 +83,11 @@ fn validate_resolved_mutation(
     Ok(())
 }
 
-/// A built-in widget is read-only from the data API too, and no new app may
-/// take its reserved prefix (ADR 0415).
 fn built_in_widget_refusal(state: &AppState, path: &str) -> Option<Response> {
     let reason = state.app_manager.app_path_write_refusal(path)?;
     Some(ApiError::with_code(403, format!("Cannot change '{path}': {reason}")).into_response())
 }
 
-/// The workspace-relative file this `/data` mount request names, or `None` when
-/// the mount must not serve it.
-///
-/// `uri_path` is the nest-stripped path, so `/data/artifacts/a.md` arrives as
-/// `/artifacts/a.md`. Percent-decoded first: the allowlist reads a filesystem
-/// path, and `%2e%2e` is `..` by the time anything opens a file.
-///
-/// A trailing slash is trimmed rather than refused. `/data/apps/todo/` is how a
-/// directory link reaches the mount, and `ServeDir` answers it with that
-/// directory's `index.html`.
 fn data_mount_target(uri_path: &str) -> Option<String> {
     let decoded = urlencoding::decode(uri_path).ok()?;
     let rel = decoded.trim_start_matches('/').trim_end_matches('/');
@@ -128,8 +113,6 @@ async fn serve_workspace_data(
         join_data_contained(&data_dir, &file).is_some()
     });
     let Some(rel) = served else {
-        // Logged because `request_logger` skips `/data`, so a refusal is
-        // otherwise invisible to whoever has to explain the 404.
         log_legacy!("[data] refused {} on the /data mount", req.uri().path());
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -148,7 +131,6 @@ async fn serve_workspace_data(
     }
     match ServeDir::new(&data_dir).oneshot(req).await {
         Ok(resp) => {
-            // A directory request is answered with its `index.html`.
             let path_type = if is_directory {
                 "text/html"
             } else {
@@ -177,7 +159,6 @@ fn make_artifact_manager(
     })
 }
 
-/// GET /api/v1/data?pattern=... — list files under data/
 #[derive(Deserialize)]
 pub(super) struct DataListQuery {
     pub pattern: Option<String>,
@@ -213,10 +194,6 @@ pub(super) async fn list_data(
     }
 }
 
-/// Walk every workspace-mutable prefix under `data_dir`. With `pattern` set,
-/// only paths the pattern matches are returned; with `None`, all walked paths
-/// are returned. Intentionally excludes engine-shipped read-only trees
-/// (system-knowhow) — those shouldn't surface in the workspace Files panel.
 fn list_data_inner(data_dir: &std::path::Path, pattern: Option<&glob::Pattern>) -> Vec<String> {
     let mut files = Vec::new();
     for prefix in MUTABLE_PREFIXES {
@@ -266,10 +243,6 @@ fn walkdir(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<String>,
     Ok(result)
 }
 
-/// GET /api/v1/data/*path — read a data file
-///
-/// The response shape (validators, ranges, streaming, the document sandbox)
-/// belongs to [`super::file_response`]; this handler owns only path resolution.
 pub(super) async fn read_data(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -286,7 +259,7 @@ pub(super) async fn read_data(
             };
             crate::core::contained_path::join_contained(dir, rel)
         } else {
-            // A link out of its tree reads as missing, as on the `/data` mount.
+            // INVARIANT: A link out of its tree reads as missing, as on the `/data` mount.
             let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
             let contained = join_data_contained(&data_dir, &path);
             if contained.is_some() {
@@ -308,7 +281,6 @@ pub(super) async fn read_data(
     )
 }
 
-/// The lowercase extension of a data path, or `""`.
 fn extension_of(path: &str) -> String {
     std::path::Path::new(path)
         .extension()
@@ -317,15 +289,6 @@ fn extension_of(path: &str) -> String {
         .to_lowercase()
 }
 
-/// The `artifacts/` arm of [`write_data`]: store the file, commit it, announce
-/// the entity event, and refresh the engine's user-profile read-cache.
-///
-/// The cache refresh belongs here rather than in the store: `ArtifactManager`
-/// is the shared write sink, but it is built from a workspace path alone and
-/// has no route back to the engine that serves the profile to every chat turn,
-/// so only a caller holding both can keep the two coherent. Taking the cache as
-/// a parameter is also what makes the refresh testable: an `AppState` needs a
-/// booted engine, this needs a tempdir.
 async fn write_artifact_data(
     held: &crate::engine::git_ops::WorkspaceRepoLock,
     am: &ArtifactManager,
@@ -368,7 +331,6 @@ async fn delete_artifact_data(
     Ok(commit)
 }
 
-/// PUT /api/v1/data/*path — write a data file (body is raw content)
 pub(super) async fn write_data(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -389,7 +351,7 @@ pub(super) async fn write_data(
         return ApiError::with_code(422, msg).into_response();
     }
 
-    // Before the write, not before the emit. A refusal after the bytes reach
+    // INVARIANT: Before the write, not before the emit. A refusal after the bytes reach
     // disk would be a mutation nobody is recorded as making.
     let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
         Ok(a) => a,
@@ -463,7 +425,7 @@ pub(super) async fn write_data(
                 with_knowhow_size_warning(&mut reply, &path, body.len() as u64);
                 (Some(commit), Json(reply).into_response())
             }
-            // The file is on disk but the git commit failed — that's a genuine
+            // INVARIANT: The file is on disk but the git commit failed — that's a genuine
             // failure, not a no-op: `commit_index` creates an (even empty)
             // commit rather than erroring when there's nothing to commit, so an
             // `Err` here always means git itself failed. Surface it instead of
@@ -500,7 +462,6 @@ pub(super) async fn write_data(
     response
 }
 
-/// DELETE /api/v1/data/*path — delete a data file
 pub(super) async fn delete_data(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -512,7 +473,7 @@ pub(super) async fn delete_data(
     if let Some(resp) = built_in_widget_refusal(&state, &path) {
         return resp;
     }
-    // The directory only: removing a symlink itself removes the link, never
+    // INVARIANT: The directory only: removing a symlink itself removes the link, never
     // what it points at.
     let parent = path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
@@ -520,7 +481,6 @@ pub(super) async fn delete_data(
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
-    // Before the delete, for the reason `write_data` gives above.
     let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -598,7 +558,6 @@ pub(super) async fn delete_data(
     response
 }
 
-/// POST /api/v1/data/edit — edit a data file (JSON path or text find-replace)
 #[derive(Deserialize)]
 pub(super) struct DataEditRequest {
     pub path: String,
@@ -628,8 +587,6 @@ pub(super) async fn edit_data(
     if let Err((code, msg)) = validate_resolved_mutation(&data_dir, &body.path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
-    // A theme is validated whole, which an operation-by-operation edit cannot
-    // honour, so a theme is saved with `PUT` instead.
     if crate::core::themes::is_theme_path(&body.path) {
         return ApiError::bad_request(
             "a theme is written whole: PUT /api/v1/data/themes/<id>.json with the full theme",
@@ -653,7 +610,6 @@ pub(super) async fn edit_data(
             .into_response();
     }
 
-    // Before the first operation is applied, for the reason `write_data` gives.
     let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -676,7 +632,7 @@ pub(super) async fn edit_data(
         }
     }
 
-    // Emit `DataFileEdited` with the count of operations actually applied —
+    // INVARIANT: Emit `DataFileEdited` with the count of operations actually applied —
     // even on partial failure, the file has been mutated by ops 0..completed
     // and the audit log must reflect that. The error response still
     // surfaces the failed op to the caller.
@@ -687,12 +643,7 @@ pub(super) async fn edit_data(
             .engine
             .edit_file_at_path(crate::engine::tools::files::EditFileArgs {
                 raw_path: &body.path,
-                // An HTTP caller, so a `scripts/` edit here never makes the
-                // file runnable: an app UI reaching this route is
-                // indistinguishable from the Files panel (ADR 0144).
                 authorship: crate::engine::tools::files::WriteAuthorship::ApiCaller,
-                // The HTTP data surface is `data/`-only, so it never names a
-                // repo and always takes the committing default.
                 repo: None,
                 json_path: op.json_path.as_deref(),
                 new_value: op.json_value.clone(),
@@ -750,15 +701,12 @@ pub(super) async fn edit_data(
     Json(reply).into_response()
 }
 
-/// Adds `warning` to a write's reply when it left a knowhow file over the cap.
-/// The write has landed either way.
 fn with_knowhow_size_warning(reply: &mut serde_json::Value, data_path: &str, bytes: u64) {
     if let Some(warning) = crate::core::knowhow::knowhow_size_warning(data_path, bytes) {
         reply["warning"] = serde_json::Value::String(warning);
     }
 }
 
-/// POST /api/v1/data/upload — upload a file into data/artifacts/imported/
 pub(super) async fn upload_data(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -767,7 +715,7 @@ pub(super) async fn upload_data(
     super::artifacts::upload_file(State(state), headers, multipart).await
 }
 
-/// Routes for the `/data*` surface. The wildcard `/data/*path` write route
+/// INVARIANT: Routes for the `/data*` surface. The wildcard `/data/*path` write route
 /// relies on the 100 MiB `DefaultBodyLimit` that `create_router` layers over
 /// the merged API router — larger binary writes (PNG, PDF) would otherwise
 /// be rejected by axum's 2 MiB default with "Failed to buffer the request
@@ -798,9 +746,6 @@ mod tests {
         std::fs::write(p, "x").unwrap();
     }
 
-    /// A workspace whose `data/artifacts/` holds a real file and four links:
-    /// one to that file, one to `data/.env`, one to a file outside the
-    /// workspace and one to a directory outside it. Returns the `data/` dir.
     fn data_dir_with_links(ws: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::symlink;
         let data = ws.join("data");
@@ -817,8 +762,6 @@ mod tests {
         data
     }
 
-    /// Regression: a symlink under a readable prefix must not carry a read
-    /// past the allowlist. The string check alone served the link's target.
     #[test]
     fn a_read_through_a_symlink_must_land_on_a_readable_file() {
         let ws = tempfile::tempdir().unwrap();
@@ -841,9 +784,6 @@ mod tests {
         }
     }
 
-    /// Regression: `PUT`, `DELETE` and `POST /data/edit` must not write
-    /// through a symlink. One out of the tree reaches host files, and one
-    /// inside it is a second spelling of a file.
     #[test]
     fn a_mutation_must_name_the_file_itself() {
         let ws = tempfile::tempdir().unwrap();
@@ -869,9 +809,6 @@ mod tests {
         );
     }
 
-    /// On a case-insensitive volume, the macOS default, another letter case
-    /// is a second spelling of a stored file. The refusal names the stored
-    /// path and blames no symlink.
     #[test]
     fn a_mutation_in_another_letter_case_names_the_stored_path() {
         let ws = tempfile::tempdir().unwrap();
@@ -889,8 +826,6 @@ mod tests {
         }
     }
 
-    /// Regression: the listing followed symlinks. A link to a directory
-    /// outside leaked its file names, and a loop emptied the whole listing.
     #[test]
     fn list_data_inner_skips_symlinks() {
         let ws = tempfile::tempdir().unwrap();
@@ -906,8 +841,6 @@ mod tests {
         );
     }
 
-    /// Regression: the `/data` mount runs the same symlink check, for a file
-    /// and for the `index.html` a directory request is answered with.
     #[tokio::test]
     async fn the_mount_does_not_serve_through_a_symlink_out_of_the_tree() {
         use tower::ServiceExt;
@@ -943,12 +876,6 @@ mod tests {
         }
     }
 
-    /// Regression: the `/data` static mount is gated by the same allowlist the
-    /// API route runs.
-    ///
-    /// It had none. `GET /data/postgres/postgresql.conf` and every blob under
-    /// `data/blobs/` were served verbatim to anything that could name the path,
-    /// while the sibling `GET /api/v1/data/*path` refused both.
     #[test]
     fn the_data_mount_serves_only_the_read_allowlist() {
         for allowed in [
@@ -982,8 +909,6 @@ mod tests {
         }
     }
 
-    /// A percent-encoded `..` is `..` by the time a file is opened, so the
-    /// allowlist has to see the decoded path.
     #[test]
     fn the_data_mount_decodes_before_it_validates() {
         assert!(data_mount_target("/artifacts/%2e%2e/postgres/x.conf").is_none());
@@ -993,9 +918,6 @@ mod tests {
         );
     }
 
-    /// The predicate above decides; this proves it is wired in front of
-    /// `ServeDir`. A file that exists on disk under a refused prefix must not
-    /// come back, which is the whole defect.
     #[tokio::test]
     async fn the_mount_gates_serve_dir_and_not_just_the_predicate() {
         use tower::ServiceExt;
@@ -1028,8 +950,6 @@ mod tests {
         );
     }
 
-    /// The allowlist reads the path string, so a symlink under an allowed
-    /// prefix reached any host file, and `data/.env`, through the mount.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_mount_never_follows_a_symlink_out_of_its_tree() {
@@ -1080,8 +1000,6 @@ mod tests {
         }
     }
 
-    /// `ServeDir` picks the type from the extension, so this proves the
-    /// sandbox reads the type the mount actually answered with.
     #[tokio::test]
     async fn the_mount_serves_an_html_file_sandboxed_and_a_note_untouched() {
         use tower::ServiceExt;
@@ -1118,9 +1036,6 @@ mod tests {
         assert_eq!(csp_of("/data/artifacts/note.md").await, None);
     }
 
-    /// A browser revalidating a page it cached before the sandbox existed gets a
-    /// 304 with no type. It merges the 304's headers into its copy, so the 304
-    /// is what has to carry the sandbox.
     #[tokio::test]
     async fn a_not_modified_page_on_the_mount_is_sandboxed() {
         use tower::ServiceExt;
@@ -1216,7 +1131,7 @@ mod tests {
         touch(data, "config/apis.json");
         touch(data, "auth-modules/binance-hmac.wasm");
         touch(data, "scripts/foo.py");
-        touch(data, "postgres/internal.bin"); // Disallowed prefix — must be skipped.
+        touch(data, "postgres/internal.bin");
 
         let result = list_data_inner(data, None);
         assert_eq!(
@@ -1231,9 +1146,6 @@ mod tests {
         );
     }
 
-    /// system-knowhow files are engine-shipped reference docs and must NOT
-    /// surface in the workspace Files panel even if a workspace happens to
-    /// contain a `data/system-knowhow/` directory.
     #[test]
     fn list_data_inner_excludes_system_knowhow() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1253,12 +1165,6 @@ mod tests {
         assert!(validate_data_path_mutate("/etc/passwd").is_err());
     }
 
-    /// A second spelling of a path is not a traversal, so the traversal guard
-    /// waves it through: no `..`, no leading slash. It still has to be rejected,
-    /// because the file it reaches and the string every consumer keys on stop
-    /// agreeing. `artifacts/./user_profile.md` would rewrite the profile while
-    /// the engine's cache, the artifact event, and the memory index all recorded
-    /// a different artifact, which is the stale-profile bug by another door.
     #[test]
     fn validate_rejects_a_second_spelling_of_the_same_file() {
         for p in [
@@ -1340,9 +1246,6 @@ mod tests {
         assert_eq!(req.operations[0].json_path.as_deref(), Some("title"));
     }
 
-    /// A workspace to write through, plus the profile cache the running engine
-    /// would be serving from: the same pair `write_data` holds when it reaches
-    /// the artifacts arm.
     fn write_fixture(
         seeded_profile: Option<&str>,
     ) -> (tempfile::TempDir, ArtifactManager, UserProfileCache) {
@@ -1353,8 +1256,6 @@ mod tests {
             std::fs::write(artifacts.join("user_profile.md"), content).unwrap();
         }
         let am = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
-        // Loaded from disk the way engine startup does, so the test starts from
-        // the state a running engine is actually in.
         let cache = UserProfileCache::load_from_workspace(dir.path());
         (dir, am, cache)
     }
@@ -1368,9 +1269,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The bug this guards: a profile written through the data API landed on
-    /// disk while the engine kept serving the copy it loaded at startup, so
-    /// every chat turn rendered a stale (usually empty) profile until a restart.
     #[tokio::test]
     async fn writing_the_profile_through_the_data_api_refreshes_the_engine_cache() {
         let (dir, am, cache) = write_fixture(None);
@@ -1399,8 +1297,6 @@ mod tests {
         assert_eq!(profile_on_disk(&dir), "# Profile\n\nDrinks tea.\n");
     }
 
-    /// The match is on the whole artifact path, so an imported profile or a
-    /// same-suffix sibling is a different artifact and leaves the cache alone.
     #[tokio::test]
     async fn writing_another_artifact_through_the_data_api_leaves_the_profile_cache_alone() {
         let (_dir, am, cache) = write_fixture(Some("mine"));
@@ -1432,8 +1328,6 @@ mod tests {
         }
     }
 
-    /// Deleting the profile has to clear the cache too: otherwise the deleted
-    /// profile keeps being rendered into every chat turn, forever.
     #[tokio::test]
     async fn deleting_the_profile_through_the_data_api_clears_the_engine_cache() {
         let (_dir, am, cache) = write_fixture(Some("mine"));
@@ -1473,15 +1367,11 @@ mod tests {
         assert_eq!(cache.snapshot().await, "mine");
     }
 
-    /// A write that never reached disk must not be published to the cache: the
-    /// engine would then serve a profile no restart could reproduce.
     #[tokio::test]
     async fn a_failed_profile_write_leaves_the_cache_at_what_landed() {
         let (dir, am, cache) = write_fixture(Some("mine"));
         let bus = crate::test_support::offline_event_bus();
 
-        // Make the write fail at the filesystem: a directory where the file
-        // should go is the cheapest reachable failure.
         let path = dir
             .path()
             .join(crate::core::ARTIFACTS_DIR)

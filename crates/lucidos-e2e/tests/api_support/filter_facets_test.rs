@@ -1,19 +1,8 @@
-//! Coverage for the drawer "Show" filter's backend surface:
-//! `GET /api/v1/threads/filter-facets` (complete option lists) and the
-//! `app_ids` narrowing param on `GET /api/v1/threads/older`.
-//!
-//! Strategy mirrors `threads_list_test.rs`: seed `thread_summaries` rows
-//! directly with unique markers, then assert the endpoints surface them. App
-//! threads are identified by `coding_agent_kind='app'` + a
-//! `<ws>/data/apps/<id>` folder; the app id is the last path segment.
-
 use crate::support::{
     base_url, db_url, http_client, unique_marker, user_client, workspace_tree_lock,
     write_data_fixture,
 };
 
-/// Seed an app coding-agent thread on `data/apps/<app_id>` with the given
-/// archive state and an age offset (older = larger `minutes_ago`).
 async fn seed_app_thread(
     pool: &sqlx::PgPool,
     title: &str,
@@ -48,8 +37,6 @@ async fn filter_facets_lists_app_with_only_archived_thread() {
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
     let marker = unique_marker("facets-app").replace('-', "");
 
-    // App whose ONLY thread is archived must still appear as a facet — the
-    // dropdown lists every app that has a session, archived or not.
     seed_app_thread(&pool, &format!("{marker}-arch"), &marker, 90, true).await;
 
     let url = format!("{}/api/v1/threads/filter-facets", base_url());
@@ -72,7 +59,6 @@ async fn filter_facets_lists_app_with_only_archived_thread() {
     );
 }
 
-/// The app facet with `id`, from a fresh `GET /threads/filter-facets`.
 async fn app_facet(client: &reqwest::Client, id: &str) -> serde_json::Value {
     let url = format!("{}/api/v1/threads/filter-facets", base_url());
     let body: serde_json::Value = client
@@ -92,8 +78,6 @@ async fn app_facet(client: &reqwest::Client, id: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no app facet `{id}` in {body}"))
 }
 
-/// A widget never reaches the apps list (ADR 0402), so the engine labels it.
-/// Once deleted it keeps its kind, which `AppDeleted` recorded (ADR 0404).
 #[tokio::test]
 async fn filter_facets_label_a_widget_live_and_deleted() {
     let client = user_client().await;
@@ -142,13 +126,12 @@ async fn older_app_ids_fetches_archived_and_excludes_prefix_matches() {
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
     let base = unique_marker("facets-older").replace('-', "");
     let app = base.clone();
-    let app_prefix = format!("{base}extra"); // e.g. "<id>" vs "<id>extra"
+    let app_prefix = format!("{base}extra");
 
     let active = seed_app_thread(&pool, &format!("{base}-active"), &app, 30, false).await;
     let archived = seed_app_thread(&pool, &format!("{base}-arch"), &app, 90, true).await;
     let _other = seed_app_thread(&pool, &format!("{base}-other"), &app_prefix, 20, false).await;
 
-    // `before` in the future so all three are "older" than the cursor.
     let before = "2099-01-01T00:00:00Z";
     let url = format!(
         "{}/api/v1/threads/older?before={before}&limit=50&app_ids={app}",

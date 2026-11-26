@@ -17,13 +17,18 @@ interface RemoteWorkspaceRowBodyProps {
   onOpen: (route: string, mode: WorkspaceOpenMode) => void;
   onContextMenu?: (e: MouseEvent) => void;
   actions: ComponentChildren;
+  startsFirst?: boolean;
 }
 
-export function RemoteWorkspaceRowBody({ view, workspace: w, onOpen, onContextMenu, actions }: RemoteWorkspaceRowBodyProps) {
+export function RemoteWorkspaceRowBody({ view, workspace: w, onOpen, onContextMenu, actions, startsFirst = false }: RemoteWorkspaceRowBodyProps) {
   const route = remoteWorkspaceRoute(view, w);
   const state = workspaceState(w);
   const fault = workspaceFaultNote(w);
-  const openable = remoteWorkspaceOpenable(view, w);
+  const runs = remoteWorkspaceOpenable(view, w);
+  const openable = runs || (startsFirst && view.unreachable === null);
+  const label = openable && !runs
+    ? `Start and open ${w.name} on ${view.gateway}${fault ? ` · ${fault}` : ''}`
+    : fault ? `${w.name} on ${view.gateway} · ${fault}` : `Open ${w.name} on ${view.gateway}`;
   const open = (mode: WorkspaceOpenMode | null) => {
     if (openable && mode !== null) onOpen(route, mode);
   };
@@ -33,7 +38,7 @@ export function RemoteWorkspaceRowBody({ view, workspace: w, onOpen, onContextMe
       role={openable ? 'button' : undefined}
       tabIndex={openable ? 0 : undefined}
       aria-disabled={openable ? undefined : 'true'}
-      aria-label={fault ? `${w.name} on ${view.gateway} · ${fault}` : `Open ${w.name} on ${view.gateway}`}
+      aria-label={label}
       onClick={(e) => open(openModeForClick(e))}
       onAuxClick={openable && middleClickActivates(state) ? middleClickHandler((e) => open(openModeForClick(e))) : undefined}
       onContextMenu={onContextMenu}

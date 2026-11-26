@@ -1,13 +1,3 @@
-//! The sentinel-to-vision chain, end to end.
-//!
-//! Every test here covers wiring that used to be inline in `run_agentic_loop`'s
-//! body and therefore unreachable from any test. That gap is not incidental: it
-//! is how `read_file` on an image and `view_image` came to send the model a
-//! stub reading "omitted, not embedded in event" instead of the picture, and
-//! stayed that way from 2026-04-26 to 2026-07-30 with a fully green suite. The
-//! unit tests that existed asserted on hand-built blocks and never once ran the
-//! path that builds them.
-
 mod tool_result_split_tests {
     use super::super::{
         build_tool_result_blocks, holds_answer_images, holds_explicitly_requested_image,
@@ -18,18 +8,12 @@ mod tool_result_split_tests {
     use crate::engine::tools::files::{parse_image_content_marker, EXPLICIT_IMAGE_RESULT_TEXT};
     use crate::llm::ContentBlock;
 
-    /// A 1x1 transparent PNG. Small enough that `fit_for_llm` passes it through
-    /// untouched, real enough that the mime sniffer recognises it.
     const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-    /// Fixed `ToolCalled` event id, so a test can assert on the exact address
-    /// the model is handed.
     fn event_id() -> uuid::Uuid {
         uuid::Uuid::parse_str("090b688b-f0dd-4fed-9047-0ad54d76b2a4").unwrap()
     }
 
-    /// One tool output with its `ToolCalled` address, the shape every live call
-    /// has. Tests use it so the whole suite runs the marker path.
     fn out(tool_use_id: &str, text: String) -> ToolOutput {
         ToolOutput {
             tool_use_id: tool_use_id.to_string(),
@@ -64,15 +48,6 @@ mod tool_result_split_tests {
             .count()
     }
 
-    // -----------------------------------------------------------------------
-    // The split itself
-    // -----------------------------------------------------------------------
-
-    /// THE regression. The persistence stub must not reach the model: the raw
-    /// sentinel has to survive `split_tool_result` intact, because the block
-    /// builder is what turns it into vision. Stripping it first is a silent
-    /// blinding, since the stub is valid prose the model reads as a statement
-    /// that the image was withheld.
     #[test]
     fn explicit_image_sentinel_survives_to_the_model() {
         let split = split_tool_result(&image_content_sentinel());
@@ -88,9 +63,6 @@ mod tool_result_split_tests {
         assert_eq!(b64, PNG_1X1, "the bytes must reach the model unmodified");
     }
 
-    /// The other half of the same split: the event keeps a stub, never the
-    /// base64. One thread accumulated 262 inlined images and reached 46 MB,
-    /// which froze iOS PWAs re-fetching the snapshot.
     #[test]
     fn explicit_image_bytes_never_reach_the_event() {
         let split = split_tool_result(&image_content_sentinel());
@@ -110,9 +82,6 @@ mod tool_result_split_tests {
         assert!(split.images.is_empty());
     }
 
-    /// Same two properties for the ambient capture sentinel, which had the
-    /// mirror-image defect: it reached the model correctly but persisted its
-    /// full screenshot, producing 1.53 MB event rows.
     #[test]
     fn app_capture_reaches_the_model_but_its_bytes_do_not_reach_the_event() {
         let split = split_tool_result(&app_capture_sentinel());
@@ -136,9 +105,6 @@ mod tool_result_split_tests {
         );
     }
 
-    /// `strip_app_capture_marker` names the media type and size, mirroring the
-    /// image stub, so a human reading the step-detail modal can tell what was
-    /// dropped rather than seeing an unexplained gap.
     #[test]
     fn app_capture_stub_names_the_media_type_and_size() {
         let stub = strip_app_capture_marker(&app_capture_sentinel()).expect("must match");
@@ -162,9 +128,6 @@ mod tool_result_split_tests {
         assert!(strip_app_capture_marker("[APP_CAPTURE:abc no bracket").is_none());
     }
 
-    /// A generated image keeps its existing shape: the bytes go to the event's
-    /// `images` array for the frontend to render, and the model is not shown
-    /// its own synthesised output back. Deliberately unchanged by this fix.
     #[test]
     fn generated_image_moves_its_bytes_into_the_event_images_array() {
         let split = split_tool_result(&format!("[GENERATED_IMAGE:{}]\nDone.", PNG_1X1));
@@ -174,8 +137,6 @@ mod tool_result_split_tests {
         assert_eq!(split.event_text(), "Done.");
     }
 
-    /// A malformed generated-image marker (no closing bracket) falls through
-    /// verbatim rather than being silently truncated.
     #[test]
     fn malformed_generated_image_marker_passes_through() {
         let raw = "[GENERATED_IMAGE:abc no terminator";
@@ -186,7 +147,6 @@ mod tool_result_split_tests {
         assert!(split.images.is_empty());
     }
 
-    /// The overwhelmingly common case: no sentinel, both sides identical.
     #[test]
     fn plain_result_passes_through_on_both_sides() {
         let split = split_tool_result("total 4\ndrwxr-xr-x  2 u  staff");
@@ -196,9 +156,6 @@ mod tool_result_split_tests {
         assert!(split.images.is_empty());
     }
 
-    /// A question answer's images are named by hash. The marker comes off the
-    /// question tool's result, and the answer text is what the model and the
-    /// event both keep: the answer card already draws the thumbnails.
     #[test]
     fn the_question_tool_s_answer_images_come_off_its_result() {
         let raw = format!(
@@ -212,8 +169,6 @@ mod tool_result_split_tests {
         assert_eq!(text, "{\"Q\":\"A\"}");
     }
 
-    /// Only the question tool writes the marker. Any other tool may pass
-    /// outside text through verbatim, so a lookalike there is left alone.
     #[test]
     fn another_tool_s_lookalike_marker_is_left_alone() {
         let raw = format!("[ANSWER_IMAGES:{}]\noutput", "a".repeat(64));
@@ -222,8 +177,6 @@ mod tool_result_split_tests {
         assert_eq!(text, raw);
     }
 
-    /// A tool output's images follow every tool_result block, so the API
-    /// still sees the results first.
     #[test]
     fn tool_output_images_follow_the_results() {
         let with_image = ToolOutput {
@@ -253,9 +206,6 @@ mod tool_result_split_tests {
         );
     }
 
-    /// An answer's images pin their message for the rest of the turn. Unpinned,
-    /// trim pass 0 stripped them on the next model call. The agent then told
-    /// the user it could not load the screenshot it had just been shown.
     #[test]
     fn an_answer_s_images_pin_their_message() {
         let with_image = ToolOutput {
@@ -273,9 +223,6 @@ mod tool_result_split_tests {
         assert!(!holds_answer_images(&[out("call_2", "plain".to_string())]));
     }
 
-    /// The confirm-flow redaction has to land on BOTH sides. It exists so the
-    /// model sees a one-line wait notice instead of parseable JSON it would act
-    /// on, and the event should record the same thing the model saw.
     #[test]
     fn redaction_reaches_both_the_model_and_the_event() {
         let mut split = split_tool_result("[PLUGIN_INSTALL_CONFIRM]{\"overwrites\":[]}");
@@ -285,13 +232,6 @@ mod tool_result_split_tests {
         assert_eq!(split.event_text(), "Waiting for the user to confirm.");
     }
 
-    // -----------------------------------------------------------------------
-    // The split feeding the block builder
-    // -----------------------------------------------------------------------
-
-    /// The whole chain for an explicitly requested image: sentinel to split to
-    /// blocks. The model must end up with a real `ContentBlock::Image`, not
-    /// prose about one.
     #[test]
     fn explicit_image_output_builds_a_vision_block() {
         let split = split_tool_result(&image_content_sentinel());
@@ -310,9 +250,6 @@ mod tool_result_split_tests {
         )));
     }
 
-    /// And the pin fires, so trim pass 0 keeps the bytes for the rest of the
-    /// turn. Without this the model's very next tool call blinds it again,
-    /// which is what made `view_image` unable to do its one job.
     #[test]
     fn explicit_image_output_is_pinned() {
         let split = split_tool_result(&image_content_sentinel());
@@ -324,9 +261,6 @@ mod tool_result_split_tests {
         );
     }
 
-    /// An ambient capture also reaches vision, but must NOT pin: it snapshots
-    /// state that changes under the model, so a stale screenshot surviving the
-    /// whole turn would mislead it about current state.
     #[test]
     fn app_capture_output_reaches_vision_but_is_not_pinned() {
         let split = split_tool_result(&app_capture_sentinel());
@@ -343,10 +277,6 @@ mod tool_result_split_tests {
         );
     }
 
-    /// A capture whose screenshot failed carries no marker at all, so it must
-    /// fall through to plain text. Wrapping an empty screenshot would build a
-    /// `ContentBlock::Image { data: "" }` and earn a 400 `image cannot be
-    /// empty` from the provider.
     #[test]
     fn failed_screenshot_capture_produces_no_image_block() {
         let raw = super::super::format_capture_result("", "", "rasterize failed: image decode");
@@ -364,11 +294,6 @@ mod tool_result_split_tests {
         )));
     }
 
-    /// Every `ToolResult` block must precede every `Image` block. The Claude
-    /// API validates that tool_result blocks immediately follow the assistant's
-    /// tool_use blocks, so interleaving produces `tool_use ids were found
-    /// without tool_result blocks` 400s. A mixed batch is where that ordering
-    /// is easiest to break.
     #[test]
     fn tool_result_blocks_precede_every_image_block() {
         let explicit = split_tool_result(&image_content_sentinel()).llm_text;
@@ -403,7 +328,6 @@ mod tool_result_split_tests {
         );
     }
 
-    /// The instruction is always appended, even when nothing was produced.
     #[test]
     fn empty_batch_still_carries_the_instruction() {
         let blocks = build_tool_result_blocks(&[], "Results.");
@@ -412,13 +336,6 @@ mod tool_result_split_tests {
         assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Results."));
     }
 
-    // -----------------------------------------------------------------------
-    // The event address (ADR 0085 Decision 9)
-    // -----------------------------------------------------------------------
-
-    /// A live result states its own `ToolCalled` event id, so the model can
-    /// note the address of something the turn boundary is about to drop. The
-    /// provider's `tool_use_id` cannot serve: it means nothing after the turn.
     #[test]
     fn a_live_tool_result_states_its_own_event_id() {
         let blocks = build_tool_result_blocks(&[out("call_1", "done".to_string())], "Results.");
@@ -429,9 +346,6 @@ mod tool_result_split_tests {
         );
     }
 
-    /// The address is rendered by the SAME function the resume path uses for
-    /// its synthetic `tool_use_id`. Two renderers would drift, and the model
-    /// would then hold two spellings of one id with no way to tell them apart.
     #[test]
     fn the_address_is_the_form_every_reader_already_accepts() {
         let blocks = build_tool_result_blocks(&[out("call_1", "done".to_string())], "Results.");
@@ -442,15 +356,10 @@ mod tool_result_split_tests {
             content.ends_with(&format!("\n[{rendered}]")),
             "got: {content}"
         );
-        // The bracketed body must parse back to the originating event id, which
-        // is what makes it a pointer rather than a decoration.
         let inner = rendered.strip_prefix("evt-").expect("evt- prefix");
         assert_eq!(uuid::Uuid::parse_str(inner).unwrap(), event_id());
     }
 
-    /// Nothing is retained. The address is appended when the wire blocks are
-    /// built, downstream of the `ToolResult` emit. So the event payload holds
-    /// what it always held, and the pair still vanishes at the boundary.
     #[test]
     fn the_address_never_reaches_the_persisted_event() {
         let split = split_tool_result("total 4\ndrwxr-xr-x  2 u  staff");
@@ -462,9 +371,6 @@ mod tool_result_split_tests {
         );
     }
 
-    /// A `ToolCalled` whose emit failed has no address to state. The result
-    /// goes out unmarked, rather than carrying a placeholder the model would
-    /// dereference into a "not found".
     #[test]
     fn a_result_with_no_event_id_is_left_unmarked() {
         let blocks = build_tool_result_blocks(
@@ -480,9 +386,6 @@ mod tool_result_split_tests {
         assert_eq!(tool_result_contents(&blocks), vec!["done"]);
     }
 
-    /// Every branch of the builder states the address, not just the plain one.
-    /// The two sentinel branches replace the content wholesale, so each needed
-    /// the append wiring separately.
     #[test]
     fn both_image_branches_state_the_address_too() {
         let explicit = split_tool_result(&image_content_sentinel()).llm_text;
@@ -498,10 +401,6 @@ mod tool_result_split_tests {
         }
     }
 
-    /// The pin survives the append. `holds_explicitly_requested_image` matched
-    /// `EXPLICIT_IMAGE_RESULT_TEXT` for equality. Appending the address would
-    /// then have unpinned every explicitly viewed image, blinding the model on
-    /// its very next tool call.
     #[test]
     fn an_explicitly_viewed_image_still_pins_once_the_address_is_appended() {
         let split = split_tool_result(&image_content_sentinel());

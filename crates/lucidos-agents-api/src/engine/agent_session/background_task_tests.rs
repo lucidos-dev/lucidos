@@ -1,17 +1,9 @@
-//! The start decision for a coding agent's background task.
-//!
-//! One completion must reach the thread exactly once. A task a wait covers is
-//! delivered by the wait, so its result must not also come back inline. A task
-//! that finished before any wait existed has nobody else to report it.
-
 use super::*;
 
 fn ids(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 
-/// Covered wins even when the task has already finished: the wait holds the
-/// completion, and an inline result as well would be the second delivery.
 #[test]
 fn a_covered_task_is_watched_whether_or_not_it_is_still_running() {
     let covered = ids(&["other", "mine"]);
@@ -19,8 +11,6 @@ fn a_covered_task_is_watched_whether_or_not_it_is_still_running() {
     assert_eq!(settle_start("mine", &covered, false), Settled::Watched);
 }
 
-/// Running with no wait is the cap refusal. The agent must be told, because
-/// ending its turn now would leave nothing to wake it.
 #[test]
 fn a_running_task_no_wait_covers_is_unwatched() {
     assert_eq!(
@@ -29,22 +19,16 @@ fn a_running_task_no_wait_covers_is_unwatched() {
     );
 }
 
-/// A quick task can finish before the arming reads the registry. Then no wait
-/// exists, and the result has to come back in the response.
 #[test]
 fn a_task_that_finished_before_any_wait_comes_back_inline() {
     assert_eq!(settle_start("mine", &[], false), Settled::AlreadyFinished);
 }
 
-/// One `wait` must return inside the prompt cache's 5-minute life, whatever
-/// the caller asks. A shorter ask is honoured.
 #[test]
 fn a_wait_is_capped_whatever_the_caller_asks() {
     assert_eq!(agent_wait_secs(None), AGENT_WAIT_MAX_SECS);
     assert_eq!(agent_wait_secs(Some(100_000)), AGENT_WAIT_MAX_SECS);
     assert_eq!(agent_wait_secs(Some(5)), 5);
-    // A pin on the cache arithmetic, not a restated value: 300 s minus the
-    // next request's own generation time.
     const { assert!(AGENT_WAIT_MAX_SECS <= 230) };
 }
 
@@ -58,8 +42,6 @@ fn an_unproven_floor_match_points_the_agent_at_the_foreground() {
     assert!(unproven.contains("allow it once"));
 }
 
-/// A filmed take runs past the hour, so an agent may ask for up to the
-/// ceiling. A run that names no timeout still dies at the default.
 #[test]
 fn a_task_runs_up_to_the_agent_ceiling_and_defaults_to_the_hour() {
     assert_eq!(agent_task_timeout_secs(None), AGENT_BG_DEFAULT_TIMEOUT_SECS);
@@ -70,12 +52,9 @@ fn a_task_runs_up_to_the_agent_ceiling_and_defaults_to_the_hour() {
     assert_eq!(agent_task_timeout_secs(Some(2 * 3_600)), 2 * 3_600);
     assert_eq!(agent_task_timeout_secs(Some(0)), 1);
     const { assert!(AGENT_BG_DEFAULT_TIMEOUT_SECS < AGENT_BG_MAX_TIMEOUT_SECS) };
-    // The chat agent's background tools keep their own, shorter ceiling.
     const { assert!(crate::llm::tools::BG_MAX_TIMEOUT_SECS < AGENT_BG_MAX_TIMEOUT_SECS) };
 }
 
-/// The engine owns a background task, so nothing else reaps it when its thread
-/// is thrown away. Apply and Cancel keep the work, so they leave it running.
 #[test]
 fn discard_and_archive_abandon_background_tasks_and_nothing_else_does() {
     use crate::engine::types::StopReason;
@@ -85,8 +64,6 @@ fn discard_and_archive_abandon_background_tasks_and_nothing_else_does() {
     assert!(!StopReason::UserStop.abandons_background_tasks());
 }
 
-/// An archive lost to a broadcast lag must still kill the thread's task, or it
-/// runs on to its own watchdog.
 #[tokio::test]
 async fn an_archive_lost_to_a_lag_still_kills_the_threads_task() {
     use crate::engine::event_bus::EventBus;
@@ -132,8 +109,6 @@ async fn an_archive_lost_to_a_lag_still_kills_the_threads_task() {
     flood_past_bus_capacity(&bus);
 
     assert!(reap_ended_work(rx.recv().await, &mut replay, &registry, &pool).await);
-    // A second kill finds nothing left to signal only if the reaper sent the
-    // stop. Otherwise it stops the task here, so the test leaves no process.
     assert_eq!(
         registry.kill_for_thread(thread_id).await,
         0,
@@ -144,9 +119,6 @@ async fn an_archive_lost_to_a_lag_still_kills_the_threads_task() {
     teardown_test_db(&db).await;
 }
 
-/// An unattended trigger thread is archived by its terminator, with no
-/// `ThreadArchived`, while its background task may still run. The live path
-/// leaves that task alone, so a lag must too.
 #[tokio::test]
 async fn a_lag_leaves_a_task_running_on_a_thread_archived_without_an_archive_event() {
     use crate::engine::event_bus::EventBus;
@@ -192,8 +164,6 @@ async fn a_lag_leaves_a_task_running_on_a_thread_archived_without_an_archive_eve
     teardown_test_db(&db).await;
 }
 
-/// The replay list gates live frames too, so an event the reaper acts on but
-/// the list omits would never reach it.
 #[test]
 fn the_reaper_replays_every_event_that_ends_a_threads_work() {
     use crate::engine::thread_events::ThreadEvent;
@@ -208,8 +178,6 @@ fn the_reaper_replays_every_event_that_ends_a_threads_work() {
     assert_eq!(WORK_ENDING_EVENT_TYPES.len(), ending.len());
 }
 
-/// The agent's own permission check saw only `lucidos background-task run`,
-/// so the engine is the one place that reads the real command.
 #[tokio::test]
 async fn a_catastrophic_or_secret_reading_command_is_refused_before_it_starts() {
     use crate::test_support::{setup_test_db, teardown_test_db, test_db_url};
@@ -276,8 +244,6 @@ mod guard_tests {
         crate::core::knowhow::doc_family_text(&repo, "system-knowhow/lucidos-cli.md")
     }
 
-    /// The CLI help and the knowhow state the ceiling and the default, and
-    /// neither can import them.
     #[test]
     fn every_copy_of_the_task_timeout_states_the_engine_constants() {
         let (default, max) = (AGENT_BG_DEFAULT_TIMEOUT_SECS, AGENT_BG_MAX_TIMEOUT_SECS);
@@ -297,9 +263,6 @@ mod guard_tests {
         }
     }
 
-    /// The CLI help, the CLI's own response deadline and the knowhow all state
-    /// the cap, and none can import it. A pin, so a changed cap fails here rather
-    /// than leaving them telling agents the old number.
     #[test]
     fn every_copy_of_the_wait_cap_states_the_engine_constant() {
         let cap = AGENT_WAIT_MAX_SECS;
@@ -338,9 +301,6 @@ mod guard_tests {
         );
     }
 
-    /// A coding agent's shell holds none of the workspace's secrets. A task it
-    /// starts through the engine must not either, or the route hands them over:
-    /// the chat tool's env carries each `CRED_*` and `OAUTH_*` value its text names.
     #[test]
     fn a_coding_agents_background_task_never_gets_the_workspace_secrets() {
         use crate::test_support::source_scan::{engine_source, read_production_source};
@@ -366,10 +326,6 @@ mod guard_tests {
         }
     }
 
-    /// The rule above only helps if `stop_agent` acts on it on both branches: a
-    /// Discard on a thread whose agent process already went idle takes the
-    /// no-session branch, while its task keeps running. The kill follows the
-    /// refusal check, so a refused stop kills nothing.
     #[test]
     fn stop_agent_kills_the_threads_tasks_whether_or_not_a_session_is_live() {
         let src = crate::test_support::source_scan::read_production_source(
@@ -393,9 +349,6 @@ mod guard_tests {
         );
     }
 
-    /// An archive usually finds no live session, so `stop_agent` never runs for
-    /// it. The bus subscriber is what reaches those threads, on exactly the two
-    /// events that end a thread's work.
     #[test]
     fn the_reaper_fires_on_an_archived_or_discarded_thread_only() {
         use crate::engine::thread_events::ThreadEvent;
@@ -416,9 +369,6 @@ mod guard_tests {
         );
     }
 
-    /// Every user discard resets the worktree a task may still be running in.
-    /// The change card, the bulk discard and `/claude-code/discard` all reach one
-    /// of these two, and the thread-level one covers a thread with no change yet.
     #[test]
     fn every_user_discard_kills_the_threads_background_tasks() {
         let src = crate::test_support::source_scan::read_production_source(

@@ -91,6 +91,7 @@ data/
       scripts/              ← Domain-specific scripts
       intents/              ← Domain-specific intents
 
+  hooks/                    ← Event hooks, one folder per slug
   triggers/                 ← Standalone scheduled triggers (not app-specific)
     <name>/                 ← Each trigger gets its own directory
       <descriptive>.md      ← Trigger intent definition
@@ -246,3 +247,12 @@ Knowhow file first, trigger second, as in the worked example above. That works f
 ## Thread Vocabulary
 
 Thread terms (*spawning thread*, *child thread*, *sub-thread*, *top-thread*, *parent thread*) are defined in [`system-knowhow/glossary.md`](../system-knowhow/glossary.md). Choose between *child thread* and *top-thread* via the `relation` argument on `run_thread` / `run_claude` (default `"child"`; `"sub"` is a back-compat alias) or the `--relation child|top` flag on `lucidos spawn-thread` (CLI default `top`; `sub` is a back-compat alias). Database columns (`parent_thread_id`, `child_thread_id`) keep their names — child threads still have parents.
+
+
+## Plugins
+
+A plugin can ship event hooks at `hooks/<slug>/hook.toml`. The workspace
+installs them under `data/hooks/`. The install panel shows which events the
+hooks can stop. The owner's confirmation arms shipped content and stamps the
+plugin's id in the install record. Uninstall removes the plugin's hook files
+and ends their armings.

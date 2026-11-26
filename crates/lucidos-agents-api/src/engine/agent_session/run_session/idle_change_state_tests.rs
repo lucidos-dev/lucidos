@@ -6,9 +6,6 @@ use crate::test_support::{setup_test_db, teardown_test_db};
 
 const TRACKED: &str = "lucidos-claude-code-repo-example-repo-implement-the-ticket";
 
-/// A temp git repo with one commit on `main`, standing in for both the
-/// external repository and the session's worktree (the resolver only ever
-/// reads, so one directory serves as both).
 async fn make_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
@@ -27,8 +24,6 @@ async fn head_sha(repo: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Put the repo on the engine-named branch and commit a `.rs` file, the way a
-/// coding-agent turn would. Returns the anchor SHA the session started from.
 async fn run_a_turn_on_the_tracked_branch(repo: &std::path::Path) -> String {
     let anchor = head_sha(repo).await;
     let _ = git_cmd(&["checkout", "-b", TRACKED], repo).await;
@@ -40,8 +35,6 @@ async fn run_a_turn_on_the_tracked_branch(repo: &std::path::Path) -> String {
     anchor
 }
 
-/// Create the thread's `thread_summaries` row through the normal projection
-/// path, so the test reads the same column production writes.
 async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -69,8 +62,6 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
     .unwrap();
 }
 
-/// What the worktree's post-commit hook does mid-turn: record branch work
-/// from the branch the worktree is really on.
 async fn hook_recorded_a_diff(pool: &sqlx::PgPool, thread_id: Uuid) {
     sqlx::query(&format!(
         "UPDATE thread_summaries SET {} WHERE thread_id = $1",
@@ -99,9 +90,6 @@ fn input<'a>(
     }
 }
 
-/// The reported bug, end to end: a repo skill renames the branch mid-session,
-/// so the tracked ref is gone by the time the turn idles. The idle must still
-/// report the diff, or the Diff button never lights.
 #[tokio::test]
 async fn renamed_branch_idle_still_reports_the_diff() {
     let (pool, db_name) = setup_test_db().await;
@@ -138,9 +126,6 @@ async fn renamed_branch_idle_still_reports_the_diff() {
     teardown_test_db(&db_name).await;
 }
 
-/// The second defect on its own: git cannot answer at all (here, the whole
-/// repo is gone). That is UNKNOWN, and must not walk a thread the post-commit
-/// hook already marked as having a diff back to "no changes".
 #[tokio::test]
 async fn unanswerable_probe_does_not_downgrade_a_thread_with_a_diff() {
     let (pool, db_name) = setup_test_db().await;
@@ -174,9 +159,6 @@ async fn unanswerable_probe_does_not_downgrade_a_thread_with_a_diff() {
     teardown_test_db(&db_name).await;
 }
 
-/// An ANSWERED probe that finds nothing still clears the flag: a commit and a
-/// revert genuinely leave no diff, and carrying `true` forward there is the
-/// phantom-Apply card.
 #[tokio::test]
 async fn answered_empty_probe_clears_a_previously_recorded_diff() {
     let (pool, db_name) = setup_test_db().await;
@@ -201,8 +183,6 @@ async fn answered_empty_probe_clears_a_previously_recorded_diff() {
     teardown_test_db(&db_name).await;
 }
 
-/// A Lucidos-source thread keeps its engine-named branch even when the
-/// worktree wandered: Apply depends on that name.
 #[tokio::test]
 async fn lucidos_source_thread_never_adopts() {
     let (pool, db_name) = setup_test_db().await;

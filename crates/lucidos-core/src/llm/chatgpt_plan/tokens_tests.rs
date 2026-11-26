@@ -10,7 +10,6 @@ use crate::llm::chatgpt_plan::mock_auth::MockAuth;
 use crate::llm::chatgpt_plan::token_endpoint::GrantedTokens;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// Tokens due a refresh `due_in` seconds from now.
 fn granted(access: &str, refresh: &str, due_in: i64) -> GrantedTokens {
     GrantedTokens {
         access_token: access.into(),
@@ -122,8 +121,6 @@ async fn no_sign_in_says_where_to_sign_in() {
     f.done().await;
 }
 
-/// A token past `earliest_refresh_at` refreshes once, silently, and the
-/// rotated refresh token is stored with its access token.
 #[tokio::test]
 async fn a_due_token_refreshes_and_stores_the_rotated_refresh_token() {
     let f = Fixture::new().await;
@@ -149,8 +146,6 @@ async fn a_due_token_refreshes_and_stores_the_rotated_refresh_token() {
     f.done().await;
 }
 
-/// Many calls at a due token, on two sources, spend the refresh token once.
-/// The mock refuses a reused refresh token as OpenAI does.
 #[tokio::test]
 async fn concurrent_calls_refresh_exactly_once() {
     let f = Fixture::new().await;
@@ -170,8 +165,6 @@ async fn concurrent_calls_refresh_exactly_once() {
     f.done().await;
 }
 
-/// A token OpenAI rejected refreshes once, and a second caller holding the
-/// same rejected token takes the renewed one.
 #[tokio::test]
 async fn a_rejected_token_renews_once() {
     let f = Fixture::new().await;
@@ -185,8 +178,6 @@ async fn a_rejected_token_renews_once() {
     f.done().await;
 }
 
-/// Every refresh code OpenAI documents as terminal clears the tokens, keeps
-/// the registration, and says to sign in again.
 #[tokio::test]
 async fn a_terminal_refresh_error_clears_the_tokens_and_keeps_the_registration() {
     for code in [
@@ -230,8 +221,6 @@ async fn a_terminal_refresh_error_clears_the_tokens_and_keeps_the_registration()
     }
 }
 
-/// A refusal OpenAI does not document as terminal, a server error with no
-/// code, and an unreachable host all keep the tokens.
 #[tokio::test]
 async fn a_temporary_refresh_failure_keeps_the_tokens() {
     let replies = [
@@ -267,7 +256,6 @@ async fn a_temporary_refresh_failure_keeps_the_tokens() {
     f.done().await;
 }
 
-/// A refusal of an old refresh token leaves a sign-in made since.
 #[tokio::test]
 async fn forgetting_a_rejected_token_keeps_a_newer_sign_in() {
     let f = Fixture::new().await;
@@ -282,8 +270,6 @@ async fn forgetting_a_rejected_token_keeps_a_newer_sign_in() {
     f.done().await;
 }
 
-/// A refresh that spent an old refresh token stores nothing over a newer
-/// sign-in.
 #[tokio::test]
 async fn a_refresh_never_overwrites_a_newer_sign_in() {
     let f = Fixture::new().await;
@@ -300,8 +286,6 @@ async fn a_refresh_never_overwrites_a_newer_sign_in() {
     f.done().await;
 }
 
-/// A refresh that loses the race to a sign-out revokes the token OpenAI just
-/// rotated to. No grant stays live for a forgotten sign-in.
 #[tokio::test]
 async fn a_refresh_that_loses_to_a_sign_out_revokes_its_rotated_token() {
     let f = Fixture::new().await;
@@ -330,7 +314,6 @@ async fn a_refresh_that_loses_to_a_sign_out_revokes_its_rotated_token() {
     f.done().await;
 }
 
-/// All three tokens are sealed at rest, after a sign-in and after a refresh.
 #[tokio::test]
 async fn the_stored_tokens_are_sealed() {
     let f = Fixture::new().await;
@@ -354,8 +337,6 @@ async fn the_stored_tokens_are_sealed() {
     f.done().await;
 }
 
-/// A sign-out clears the tokens, keeps the registration, announces once with
-/// no token, and revokes the refresh token at OpenAI.
 #[tokio::test]
 async fn a_sign_out_announces_without_tokens_and_revokes() {
     let f = Fixture::new().await;
@@ -404,8 +385,6 @@ async fn a_sign_out_announces_without_tokens_and_revokes() {
     f.done().await;
 }
 
-/// The plan tokens live apart from `oauth_accounts`, so no reader of that
-/// table can hand them out.
 #[tokio::test]
 async fn no_generic_oauth_reader_sees_the_plan_token() {
     let f = Fixture::new().await;

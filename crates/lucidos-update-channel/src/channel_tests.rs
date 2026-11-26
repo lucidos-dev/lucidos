@@ -103,8 +103,6 @@ fn metadata_is_not_an_upgrade_and_invalid_versions_fail_closed() {
     }
 }
 
-/// Release consumers delegate ordering here. In particular, Tauri must not
-/// silently use its default comparator against the crate or CalVer build ID.
 #[test]
 fn release_consumers_do_not_reintroduce_independent_comparators() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

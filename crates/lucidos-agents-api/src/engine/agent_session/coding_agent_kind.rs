@@ -1,30 +1,5 @@
-//! `CodingAgentKind` — the thread-flavor discriminator for coding-agent threads.
-//!
-//! Every coding-agent thread lives in a worktree, but the *enclosing git*
-//! differs by kind:
-//!
-//! - `Lucidos` — full worktree of the Lucidos source repo. Apply ff-merges to
-//!   main; `/harden` gate; engine restart per `files_require_restart`.
-//! - `App` — sparse-checkout worktree of the user's workspace git, narrowed
-//!   to `data/apps/<id>/`. Apply ff-merges to workspace main; no `/harden`;
-//!   no engine restart; emits `AppUiRefreshRequested` when iframe-bundled
-//!   files change.
-//! - `External` — full worktree of a user-registered external git repository.
-//!   No Apply gate (PR-based workflow).
-//!
-//! Distinct from `crate::runtime::CodingAgent`, which discriminates the
-//! backend (today only `ClaudeCode`). A `CodingAgent::ClaudeCode` session can
-//! be of any `CodingAgentKind`.
-
 use std::path::{Path, PathBuf};
 
-/// Shorthand for the boxed-trait error this module surfaces. Per
-/// `.claude/rules/rust.md`, custom error enums need structural justification
-/// (callers must pattern-match on variants); resolve/classify errors here
-/// are only ever string-formatted by `agentic_loop_special_tool`, so the
-/// canonical boxed form keeps us out of bespoke-error-type land. Helper
-/// constructors below produce the same teaching strings the old enum's
-/// `Display` impl rendered.
 pub type FolderResolutionError = Box<dyn std::error::Error + Send + Sync>;
 
 fn err_not_found(path: &str) -> FolderResolutionError {
@@ -86,19 +61,6 @@ fn err_repo_lookup(msg: String) -> FolderResolutionError {
     format!("Repository lookup failed: {msg}").into()
 }
 
-/// Refusal for a Lucidos-**source** coding-agent spawn on an install that was
-/// not launched from a source checkout (see
-/// [`crate::paths::has_lucidos_source`]).
-///
-/// Two call sites share this one string so the model gets identical, actionable
-/// wording wherever it asks: the synchronous `run_coding_agent` refusal in
-/// `agentic_loop_special_tool` (which returns it as the tool result, in-turn),
-/// and the `run_session` guard that backstops every other caller.
-///
-/// Actionable matters here. The failure this replaces was the agent *inventing*
-/// a capability, narrating edits to `crates/lucidos-engine/…`, and telling the
-/// user to Apply and restart — so the message must both deny the request and
-/// name the routes that DO work, or the model will simply retry the same spawn.
 pub fn err_no_lucidos_source() -> FolderResolutionError {
     "This Lucidos install has no source checkout — the engine was not launched \
      from a Lucidos source tree, so there is no platform source here to edit and \
@@ -115,14 +77,10 @@ pub fn err_no_lucidos_source() -> FolderResolutionError {
         .into()
 }
 
-/// Forbidden system roots. Lookups are anchored at start so a `/etcetera`
-/// folder isn't accidentally captured.
 const FORBIDDEN_SYSTEM_ROOTS: &[&str] = &[
     "/etc", "/System", "/usr", "/bin", "/sbin", "/var", "/private", "/dev", "/Library",
 ];
 
-/// True if `path_under_data` matches `apps/<id>/` exactly (no subpath after).
-/// Returns the app id when matched.
 fn match_app_id(path_under_data: &Path) -> Option<String> {
     let mut comps = path_under_data.components();
     let first = comps.next()?.as_os_str().to_str()?;
@@ -133,7 +91,6 @@ fn match_app_id(path_under_data: &Path) -> Option<String> {
     if id.is_empty() || id == "." || id == ".." {
         return None;
     }
-    // Refuse deeper paths inside the app — scope unit is the whole app folder.
     if comps.next().is_some() {
         return None;
     }
@@ -142,15 +99,6 @@ fn match_app_id(path_under_data: &Path) -> Option<String> {
 
 use crate::core::apps::is_valid_app_id;
 
-/// Resolve a user/LLM-supplied `folder` input string to a canonical absolute
-/// path, applying every refusal rule in §3.2 of the design plan.
-///
-/// `folder_in` is the raw `folder` parameter (or its `repo` alias) from
-/// `run_coding_agent`. `workspace_root` is the target workspace's root directory.
-/// `lookup_repo_path` resolves a registered repo name or UUID to its path
-/// (typically wraps `RepositoryStore::get` + `get_by_name`).
-///
-/// Returns the canonicalized absolute path on success.
 pub fn resolve_folder_input<F>(
     folder_in: &str,
     workspace_root: &Path,
@@ -163,11 +111,6 @@ where
     if trimmed.is_empty() {
         return Err(err_not_found(trimmed));
     }
-    // `~/…` → absolute, before anything classifies it. LLM-visible listings
-    // (`manage_repositories` action=list) render repo paths abbreviated so the
-    // home dir's name never reaches the model provider, so the model naturally
-    // echoes the `~` form back here. `looks_like_repo_name` already rejects
-    // `~`, and expansion is a no-op for every other shape.
     let expanded = crate::core::home_path::expand(trimmed);
     let trimmed = expanded.as_str();
     let candidate: PathBuf = if trimmed.starts_with('/') {
@@ -190,16 +133,10 @@ where
     Ok(canonical)
 }
 
-/// Heuristic: does `s` look like a registered repo name/UUID rather than a
-/// filesystem path? Rejects anything containing `/`, `\`, `~`, or `.` — those
-/// are clearly path-shaped. Also rejects strings starting with `data/` for
-/// safety (workspace-relative paths often start with `data/`).
 fn looks_like_repo_name(s: &str) -> bool {
     !s.contains('/') && !s.contains('\\') && !s.contains('~') && !s.contains('.') && !s.is_empty()
 }
 
-/// Outcome of [`classify_resolved_folder`]: which `CodingAgentKind` the path
-/// maps to, plus the deduced app id when applicable.
 pub enum FolderClassification {
     Lucidos {
         repo_root: PathBuf,
@@ -213,17 +150,6 @@ pub enum FolderClassification {
     },
 }
 
-/// Apply the kind-selection + refusal rules to an already-canonicalized
-/// `folder_abs` path. Mirrors §3.2 step 3 of the design plan.
-///
-/// `lucidos_repo_root` is the resolved path of the Lucidos source repo
-/// (from `RepositoryStore::get_by_name("Lucidos")`), or `None` when there is no
-/// source checkout — a packaged build, where "Lucidos source" is not a thing.
-/// `None` means the Lucidos-source branch simply never matches (a would-be
-/// source path falls through to `UnrecognisedPath`); App + External still
-/// classify. `workspace_root` is the target workspace's root.
-/// `external_repo_match` returns the canonical registered-external-repo root if
-/// `folder_abs` equals one of them.
 pub fn classify_resolved_folder<F>(
     folder_abs: &Path,
     workspace_root: &Path,
@@ -237,18 +163,7 @@ where
     if folder_abs.starts_with(&ws_lucidos_state) {
         return Err(err_inside_lucidos_state(folder_abs));
     }
-    // External-repo registry trumps the system-root check — a user who
-    // explicitly registered `/var/code/myproj` or `/usr/local/src/proj` (or
-    // any canonicalized path under `/private/var/folders/...` on macOS)
-    // chose to make it a CC target. Skip the system-root refusal when the
-    // registry already vouches for the path. Done up front so the External
-    // branch below can simply re-call the closure without worrying about
-    // having been pre-empted by ForbiddenSystemPath.
     let external_repo_root_for_path = external_repo_match(folder_abs);
-    // System-root refusal only applies to paths outside the workspace and
-    // outside the Lucidos source repo. Workspaces are user-positioned
-    // and can legitimately live under `/var/folders/T/...` on macOS or
-    // any other system-shaped path the user picked.
     if external_repo_root_for_path.is_none()
         && !folder_abs.starts_with(workspace_root)
         && !lucidos_repo_root.is_some_and(|root| folder_abs.starts_with(root))
@@ -273,13 +188,9 @@ where
                 app_id,
             });
         }
-        // Under data/ — non-apps subtree or bare `data/`. All refused.
         return Err(err_non_app_data_path(folder_abs, workspace_root));
     }
 
-    // Lucidos source repo: exact-match or descendant. Skipped entirely when no
-    // source checkout exists (packaged) — the branch can't match, so a would-be
-    // source path falls through to the UnrecognisedPath refusal below.
     if let Some(lucidos_repo_root) = lucidos_repo_root {
         if folder_abs == lucidos_repo_root || folder_abs.starts_with(lucidos_repo_root) {
             return Ok(FolderClassification::Lucidos {
@@ -288,11 +199,6 @@ where
         }
     }
 
-    // External repo registry: only exact-match counts (registered roots are
-    // the unit of registration; subpaths into them are out of scope). We
-    // already consulted the registry above to decide whether to skip the
-    // system-root refusal — reuse that result rather than calling the
-    // FnOnce closure twice.
     if let Some(ext_root) = external_repo_root_for_path {
         return Ok(FolderClassification::External {
             repo_root: ext_root,
@@ -302,8 +208,6 @@ where
     Err(err_unrecognised_path(folder_abs, workspace_root))
 }
 
-// Small helper so the FolderClassification debug-prints land in test panics
-// without needing to derive Debug on the public enum.
 impl std::fmt::Debug for FolderClassification {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -332,11 +236,6 @@ mod tests {
     use super::*;
     use crate::engine::thread_events::CodingAgentKind;
 
-    /// `manage_repositories` action=`list` renders repo paths as `~/…` so the
-    /// home dir's name (on an MDM fleet: `<username>@<employer-domain>`) never
-    /// reaches the model provider. That only works if the abbreviated form the
-    /// model echoes back as `folder` still resolves — otherwise the privacy fix
-    /// would break `run_coding_agent` against every registered repo.
     #[test]
     fn resolve_folder_input_expands_a_tilde_path() {
         let home = std::env::var("HOME").expect("HOME must be set to run this test");
@@ -347,8 +246,6 @@ mod tests {
             .expect("`~` must resolve to the home dir");
         assert_eq!(resolved, expected);
 
-        // Trailing-segment form goes through the same expansion — `~/.` is the
-        // home dir again, and is guaranteed to exist on any machine.
         let resolved = resolve_folder_input("~/.", workspace_root, |_| Ok(None))
             .expect("`~/.` must resolve to the home dir");
         assert_eq!(resolved, expected);
@@ -356,8 +253,6 @@ mod tests {
 
     #[test]
     fn resolve_folder_input_still_rejects_a_missing_tilde_path() {
-        // Expansion must not turn a bogus path into a silent workspace-relative
-        // join — a `~/…` that doesn't exist is still "not found".
         let err = resolve_folder_input(
             "~/definitely-not-a-real-directory-9f3a2b",
             Path::new("/nonexistent-workspace-root"),
@@ -422,7 +317,6 @@ mod tests {
             match_app_id(Path::new("apps/habit-tracker")),
             Some("habit-tracker".to_string())
         );
-        // Trailing slash gets normalized away by Path components.
         assert_eq!(
             match_app_id(Path::new("apps/habit-tracker/")),
             Some("habit-tracker".to_string())
@@ -611,12 +505,8 @@ mod tests {
         );
     }
 
-    // --- Packaged build: no Lucidos source repo registered (lucidos_repo_root = None) ---
-
     #[test]
     fn classify_app_without_lucidos_source() {
-        // Packaged: no source checkout, yet an app folder must still classify so
-        // app coding-agent spawns work (the regression this fix targets).
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().to_path_buf();
         let target = ws.join("data/apps/habit-tracker");
@@ -639,7 +529,6 @@ mod tests {
 
     #[test]
     fn classify_external_without_lucidos_source() {
-        // Packaged: a registered external repo must still classify with no source.
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().to_path_buf();
         let ext = ws.join("acme");
@@ -663,8 +552,6 @@ mod tests {
 
     #[test]
     fn classify_would_be_source_falls_through_without_lucidos_source() {
-        // Packaged: a path that WOULD be the Lucidos source on a dev build must
-        // NOT be silently classified — with no source it's UnrecognisedPath.
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().to_path_buf();
         let would_be_source = ws.join("lucidos");
@@ -679,11 +566,6 @@ mod tests {
         );
     }
 
-    /// The refusal both spawn sites share must be ACTIONABLE, not just a denial.
-    /// The observed failure was the agent narrating edits to
-    /// `crates/lucidos-engine/…` and telling the user to Apply + restart on a
-    /// packaged install; a bare "no" invites the model to retry the same spawn,
-    /// so the message has to name the routes that actually work.
     #[test]
     fn no_lucidos_source_refusal_names_the_working_alternatives() {
         let msg = err_no_lucidos_source().to_string();
@@ -703,9 +585,6 @@ mod tests {
             msg.contains("Apply"),
             "must warn off the apply/restart narration that made this a user-visible lie: {msg}"
         );
-        // Scoped to this install, so it must not read as "no coding agent can
-        // ever do platform work". A source checkout lives on another install,
-        // which only the CLI's absolute `--to` reaches.
         assert!(
             msg.contains("ON THIS INSTALL")
                 && msg.contains("lucidos spawn-thread --to <absolute workspace path>"),

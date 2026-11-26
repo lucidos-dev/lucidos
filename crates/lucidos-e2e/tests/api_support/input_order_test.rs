@@ -1,14 +1,3 @@
-//! A page's inputs to a thread are ordered by the engine (ADR 0449).
-//!
-//! Each send carries the page's `input_chain` and an `input_seq`. The engine
-//! admits it under the thread append lock before the ack. It refuses one that
-//! a later send from the same chain overtook, and records every input in the
-//! order it admitted them.
-//!
-//! The two race tests use the thread append lock itself as their sync point.
-//! The test takes it from its own connection, then waits until `pg_locks` shows
-//! the engine waiting on it. No test here sleeps to make a race happen.
-
 use crate::support::{base_url, db_url, user_client};
 use lucidos_engine::engine::event_bus::THREAD_APPEND_LOCK_CLASS;
 use uuid::Uuid;
@@ -23,7 +12,6 @@ async fn pool() -> sqlx::PgPool {
         .expect("Failed to connect to E2E workspace database")
 }
 
-/// One input on `chain`, as the frontend sends it.
 fn input(
     thread_id: Uuid,
     chain: Uuid,
@@ -46,7 +34,6 @@ fn input(
     body
 }
 
-/// The event sequence of the `MessageReceived` this event id became, if any.
 async fn recorded_sequence(pool: &sqlx::PgPool, event_id: Uuid) -> Option<i64> {
     sqlx::query_scalar(
         "SELECT sequence FROM events WHERE id = $1 AND event_type = 'MessageReceived'",
@@ -57,8 +44,6 @@ async fn recorded_sequence(pool: &sqlx::PgPool, event_id: Uuid) -> Option<i64> {
     .expect("events query failed")
 }
 
-/// Wait for the engine's own turn to record `event_id`. The input was already
-/// acked, so this waits on a detached task, not on a race.
 pub(crate) async fn wait_until_recorded(pool: &sqlx::PgPool, event_id: Uuid) -> i64 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -73,10 +58,6 @@ pub(crate) async fn wait_until_recorded(pool: &sqlx::PgPool, event_id: Uuid) -> 
     }
 }
 
-/// Wait for the turn that `request` started to end. Its closing events take the
-/// thread append lock, so a test that holds the lock must wait for this first.
-/// Otherwise the turn is the waiter the test's sync point sees, not the request
-/// under test.
 async fn wait_until_turn_ended(pool: &sqlx::PgPool, thread_id: Uuid, request: Uuid) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
@@ -102,8 +83,6 @@ async fn wait_until_turn_ended(pool: &sqlx::PgPool, thread_id: Uuid, request: Uu
     }
 }
 
-/// Open a thread with one input on `chain` at sequence 1, and wait for it and
-/// for its turn to end.
 async fn open_thread(client: &reqwest::Client, pool: &sqlx::PgPool, chain: Uuid) -> Uuid {
     let thread_id = Uuid::new_v4();
     let opening = Uuid::new_v4();
@@ -127,7 +106,6 @@ async fn open_thread(client: &reqwest::Client, pool: &sqlx::PgPool, chain: Uuid)
     thread_id
 }
 
-/// Hold `thread_id`'s append lock until the returned transaction ends.
 async fn hold_thread_append_lock(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -142,7 +120,6 @@ async fn hold_thread_append_lock(
     tx
 }
 
-/// Is any session waiting on `thread_id`'s append lock?
 async fn lock_has_a_waiter(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_locks \
@@ -157,7 +134,6 @@ async fn lock_has_a_waiter(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     .expect("pg_locks query failed")
 }
 
-/// The sync point: wait until the engine is blocked on the held lock.
 async fn wait_for_a_lock_waiter(pool: &sqlx::PgPool, thread_id: Uuid) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while !lock_has_a_waiter(pool, thread_id).await {
@@ -169,8 +145,6 @@ async fn wait_for_a_lock_waiter(pool: &sqlx::PgPool, thread_id: Uuid) {
     }
 }
 
-/// A send the client gave up on can still reach the engine after a later one.
-/// It must be refused then, and never recorded after the later one.
 #[tokio::test]
 async fn an_overtaken_input_is_refused_and_never_recorded() {
     let client = user_client().await;
@@ -226,8 +200,6 @@ async fn an_overtaken_input_is_refused_and_never_recorded() {
     );
 }
 
-/// A repeat of the same input, same sequence and same event id, is the quiet
-/// retry of a send that lost its reply. It is acked, and runs once.
 #[tokio::test]
 async fn a_repeat_of_the_tail_is_acked_not_refused() {
     let client = user_client().await;
@@ -259,8 +231,6 @@ async fn a_repeat_of_the_tail_is_acked_not_refused() {
     wait_until_recorded(&pool, follow_up).await;
 }
 
-/// An input that sends no chain (agent mode, the CLI, a stale client) is
-/// never refused, wherever the chains on that thread stand.
 #[tokio::test]
 async fn an_input_without_a_chain_is_never_refused() {
     let client = user_client().await;
@@ -285,9 +255,6 @@ async fn an_input_without_a_chain_is_never_refused() {
     wait_until_recorded(&pool, chainless).await;
 }
 
-/// A dropped request must not split an admitted input from the work that
-/// records it. Otherwise the message is lost, and every retry is acked as a
-/// duplicate of a message that does not exist.
 #[tokio::test]
 async fn an_admitted_input_is_recorded_even_when_its_request_is_dropped() {
     let client = user_client().await;
@@ -309,9 +276,7 @@ async fn an_admitted_input_is_recorded_even_when_its_request_is_dropped() {
         let client = client.clone();
         tokio::spawn(async move { client.post(chat_url()).json(&body).send().await })
     };
-    // The engine has the request and is blocked on the lock.
     wait_for_a_lock_waiter(&pool, thread_id).await;
-    // The client gives up: its connection, and its request, are dropped.
     request.abort();
     let _ = request.await;
     lock.rollback().await.expect("releasing the lock failed");
@@ -325,9 +290,6 @@ async fn an_admitted_input_is_recorded_even_when_its_request_is_dropped() {
     assert_eq!(count, 1, "the dropped follow-up is recorded exactly once");
 }
 
-/// The client sends a thread's second message once the first is acked. If the
-/// first is not yet recorded, the second must wait behind it rather than be
-/// refused as addressing an unknown thread.
 #[tokio::test]
 async fn a_second_send_to_a_new_thread_orders_behind_the_first() {
     let client = user_client().await;
@@ -335,8 +297,6 @@ async fn a_second_send_to_a_new_thread_orders_behind_the_first() {
     let chain = Uuid::new_v4();
     let thread_id = Uuid::new_v4();
 
-    // Held from before the first send, so the engine must admit it under the
-    // lock before it can ack.
     let lock = hold_thread_append_lock(&pool, thread_id).await;
     let first = Uuid::new_v4();
     let first_request = {
@@ -353,8 +313,6 @@ async fn a_second_send_to_a_new_thread_orders_behind_the_first() {
         .status();
     assert_eq!(first_status, 200, "the first message should be accepted");
 
-    // Only now, as the client does. A send before the ack races the admission's
-    // commit, which the engine does not promise to order.
     let second = Uuid::new_v4();
     let second_status = client
         .post(chat_url())

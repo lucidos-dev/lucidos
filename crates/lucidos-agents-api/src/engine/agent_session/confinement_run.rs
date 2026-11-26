@@ -1,12 +1,3 @@
-//! A *confinement run*: the confinement tests, run outside the session
-//! sandbox under the owner's `run-confinement-tests` permission.
-//!
-//! The confinement tests apply their own sandbox to prove what it denies. A
-//! macOS seatbelt never nests, so inside a sandboxed session they cannot run.
-//! The agent asks through `lucidos confinement-tests run`, and the engine runs
-//! one fixed script in the thread's worktree with no sandbox. See
-//! `docs/plans/2026-11-14-confinement-tests-outside-the-agent-sandbox.md`.
-
 use crate::engine::agent_session::background_task::BackgroundTaskExt;
 use crate::engine::tools::bash::BashExt;
 use std::path::Path;
@@ -29,7 +20,6 @@ use crate::runtime::agent_sandbox::{Machine, Sandbox};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// What a granted run executes. The caller supplies no command.
 pub(crate) const CONFINEMENT_COMMAND: &str = "./scripts/confinement-tests.sh --here";
 
 fn confinement_command(tree: &TreeState) -> String {
@@ -39,46 +29,30 @@ fn confinement_command(tree: &TreeState) -> String {
     }
 }
 
-/// What the gate decided for one call.
 #[derive(Debug)]
 pub(crate) enum ConfinementGate {
-    /// An earlier run of this thread passed on the commit the worktree is at,
-    /// so the caller has nothing left to run.
     Passed(CertifiedRun),
-    /// A live permission covers the run, and a once one is spent.
     Permitted(Box<PermissionRow>),
-    /// The owner has a card to answer.
     Asked { card_id: String },
-    /// The card the caller waited on closed without a grant.
     Closed { card_id: String },
-    /// No permission, and the caller asked that no card be raised.
     Unpermitted,
-    /// This engine runs inside a sandbox it inherited, so nothing it spawns
-    /// can leave it.
     Inherited,
 }
 
-/// An engine-started confinement run that passed on a clean commit.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CertifiedRun {
     pub(crate) task_id: String,
     pub(crate) revision: String,
 }
 
-/// Whom a call without a permission asks.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Asking<'a> {
-    /// Raise a card, or join the one the owner can still tap.
     Owner,
-    /// Raise nothing. A caller that cannot keep a card from being overtaken,
-    /// such as a background suite, asks this way. It is also the one caller
-    /// that an earlier passing run answers (see `certified_run`).
     Nobody,
-    /// Keep waiting on the card an earlier call answered with.
     Waiting { card_id: &'a str },
 }
 
-/// One gate at a time, so two calls together raise one card and never spend
+/// INVARIANT: One gate at a time, so two calls together raise one card and never spend
 /// one once grant twice.
 static GATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -140,14 +114,10 @@ async fn decide(
     })
 }
 
-/// Whether a run in the worktree can certify a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TreeState {
-    /// At `head`, with nothing uncommitted and no path hidden from status.
     Clean { head: String },
-    /// An uncommitted change, an untracked file, or a path git skips.
     Dirty,
-    /// git could not answer, so the tree may be either.
     Unknown,
 }
 
@@ -160,7 +130,7 @@ impl TreeState {
     }
 }
 
-/// The worktree's state, read with flags that override the user's git
+/// INVARIANT: The worktree's state, read with flags that override the user's git
 /// config, so a setting cannot hide an untracked file or a submodule edit.
 async fn tree_state(worktree: &Path) -> TreeState {
     let status = git_cmd(
@@ -186,7 +156,6 @@ async fn tree_state(worktree: &Path) -> TreeState {
     if !status.stdout.is_empty() || hides_paths(&listing.stdout) {
         return TreeState::Dirty;
     }
-    // A sha is hex, and the run's command line carries it.
     match current_head_sha(worktree).await {
         Some(head) if !head.is_empty() && head.bytes().all(|b| b.is_ascii_hexdigit()) => {
             TreeState::Clean { head }
@@ -195,8 +164,6 @@ async fn tree_state(worktree: &Path) -> TreeState {
     }
 }
 
-/// Whether `git ls-files -v -z` marks a path assume-unchanged (a lowercase
-/// tag) or skip-worktree (`S`). `git status` cannot vouch for such a path.
 fn hides_paths(listing: &[u8]) -> bool {
     listing
         .split(|byte| *byte == 0)
@@ -204,7 +171,6 @@ fn hides_paths(listing: &[u8]) -> bool {
         .any(|tag| tag.is_ascii_lowercase() || *tag == b'S')
 }
 
-/// What `BackgroundBashCompleted` records of a task's end.
 #[derive(serde::Deserialize)]
 struct TaskEnd {
     exit_code: Option<i32>,
@@ -261,7 +227,6 @@ async fn certified_run(
     Ok(passed.then_some(CertifiedRun { task_id, revision }))
 }
 
-/// A live permission for a confinement run, spent when it is a once one.
 async fn spendable(
     bus: &EventBus,
     user: &PermissionUser,
@@ -275,16 +240,12 @@ async fn spendable(
     )
 }
 
-/// Where the grant of a card's granting answer stands.
 #[derive(Debug, PartialEq, Eq)]
 enum GrantState {
-    /// The answer landed, and its grant has not yet.
     Landing,
     Landed,
 }
 
-/// The grant `card_id`'s answer makes, or `None` when the card has no answer
-/// or its answer picked no granting option.
 async fn granting_answer(
     bus: &EventBus,
     thread_id: Uuid,
@@ -327,8 +288,6 @@ async fn granting_answer(
     }))
 }
 
-/// The engine's words for the request. The owner asked that they name the
-/// risk: branch code with no sandbox, and a standing grant's reach.
 pub(crate) fn confinement_card(thread_id: Uuid) -> RequestCard {
     RequestCard {
         question: PermissionCardText::new("Run the confinement tests outside the sandbox?")
@@ -365,18 +324,14 @@ pub(crate) fn confinement_card(thread_id: Uuid) -> RequestCard {
     }
 }
 
-/// What a confinement run call did.
 #[derive(Debug)]
 pub(crate) enum ConfinementRun {
-    /// Running as a polled background task.
+    /// INVARIANT: Running as a polled background task.
     Started {
         task_id: String,
         timeout_secs: u64,
-        /// Where the run started. Only a clean tree's run can certify its
-        /// commit for a harden retry.
         tree: TreeState,
     },
-    /// An earlier run passed on this commit, so nothing started.
     Passed(CertifiedRun),
     Asked {
         card_id: String,
@@ -385,8 +340,6 @@ pub(crate) enum ConfinementRun {
         card_id: String,
     },
     Unpermitted,
-    /// The run can never start from this thread or engine, so no card is
-    /// raised and no grant is spent.
     Refused {
         reason: String,
     },
@@ -394,8 +347,6 @@ pub(crate) enum ConfinementRun {
 
 #[easy_ext::ext(ConfinementRunExt)]
 pub(crate) impl LucidosEngine {
-    /// Run the confinement tests for `thread_id`'s agent, outside its sandbox,
-    /// once the owner's permission covers it.
     async fn run_confinement_tests_for_agent(
         &self,
         thread_id: Uuid,
@@ -407,7 +358,7 @@ pub(crate) impl LucidosEngine {
             });
         };
         let machine = crate::runtime::agent_sandbox::machine().await;
-        // Held until the run is on record, so no call reads the evidence
+        // INVARIANT: Held until the run is on record, so no call reads the evidence
         // while a run it should see is still starting.
         let _gating = GATING.lock().await;
         let permission = match decide(&self.event_bus, &machine, thread_id, &cwd, asking, &_gating)
@@ -452,7 +403,7 @@ pub(crate) impl LucidosEngine {
             permission_id: permission.permission_id,
             revision: tree.head().map(str::to_string),
         };
-        // A run off the record could fail unseen while an older pass at the
+        // INVARIANT: A run off the record could fail unseen while an older pass at the
         // same commit still certifies it, so it does not go on.
         if let Err(e) = self
             .event_bus
@@ -476,12 +427,10 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// Why a thread with no live session worktree has nowhere to run the tests.
 pub(crate) const NO_WORKTREE_REFUSAL: &str =
     "This thread has no live coding-agent session with a worktree, so the confinement tests \
      have nowhere to run. Run them from the coding-agent thread whose branch they test.";
 
-/// Why an engine inside an inherited sandbox runs nothing outside it.
 pub(crate) const INHERITED_REFUSAL: &str =
     "This engine runs inside another Lucidos sandbox, so nothing it starts can leave that \
      sandbox. Run the confinement tests from an engine that runs bare.";

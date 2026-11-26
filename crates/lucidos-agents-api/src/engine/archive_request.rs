@@ -1,20 +1,3 @@
-//! The *archive request*: a thread's own agent asked to be archived once its
-//! turn ends (ADR 0310).
-//!
-//! The agent is mid-turn when it asks, so archiving on the spot cannot work.
-//! The cascade gate refuses a running thread, and the turn's own end would move
-//! it back to the inbox. So the call records `ThreadArchiveRequested`, and this
-//! resolver runs the Archive button's cascade once the thread has settled.
-//!
-//! **The request lives in the event log.** A request is open while its thread
-//! holds no newer `ThreadArchived` or `MessageReceived`. So a restart keeps it,
-//! and a follow-up message closes it with nothing else to update.
-//!
-//! **It only ever waits or archives.** A thread that has not settled, or that
-//! the cascade gate would refuse, keeps its request, and the next event on it
-//! re-takes the verdict. Nothing here ends a request except the two events
-//! above.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,47 +15,27 @@ use crate::engine::LucidosEngine;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The events that close an open request: the archive itself, and a message
-/// asking the thread for more.
 const CLOSING_EVENTS_SQL: &str = "('ThreadArchived', 'MessageReceived')";
 
 const CLAIM_RETRY: Duration = Duration::from_secs(2);
 
-/// What the verdict reads. One struct, so the decision is testable without a
-/// database.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestFacts {
-    /// The newest `ThreadArchiveRequested` is newer than every closing event.
-    /// Read only for an idle thread: any other one waits whatever it says.
     pub open: bool,
     pub archived: bool,
-    /// `thread_summaries.status`.
     pub status: ThreadStatus,
-    /// A row can read `idle` with its question card still open (ADR 0293).
     pub parked_on_question: bool,
     pub live_event_waits: bool,
     pub turn_settle: TurnSettle,
-    /// A pending change the Archive button's gate refuses. An external-repo
-    /// change does not count: the cascade clears it, as the gate lets it.
     pub pending_change: bool,
-    /// A branch diff no change carries yet and no turn end withheld. After a
-    /// canceled wait the branch-work net proposes it, so the request waits for
-    /// that, as the standing apply does (ADR 0395). Withheld work waits on the
-    /// owner instead, and Archive sets it aside (ADR 0400).
     pub unproposed_work: bool,
     pub blocking_descendants: bool,
-    /// The user pinned the thread after its agent asked. An agent never
-    /// archives a pinned thread (ADR 0312), so the request waits for an unpin.
     pub pinned: bool,
 }
 
-/// What the resolver does with a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestVerdict {
-    /// No open request, or the thread is already archived.
     Closed,
-    /// Not settled yet, or the cascade gate would refuse. The next event
-    /// re-takes the verdict.
     Wait,
     Archive,
 }
@@ -97,8 +60,6 @@ pub(crate) fn request_verdict(facts: &RequestFacts) -> RequestVerdict {
     }
 }
 
-/// Is the thread's newest request still open? A restore expires archived
-/// requests even when a later settlement would otherwise make them runnable.
 async fn request_is_open(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(&format!(
         concat!(
@@ -119,7 +80,6 @@ async fn request_is_open(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, s
     .await
 }
 
-/// Every thread holding an open request.
 async fn threads_with_open_requests(pool: &sqlx::PgPool) -> Result<HashSet<Uuid>, sqlx::Error> {
     let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
         concat!(
@@ -139,7 +99,6 @@ async fn threads_with_open_requests(pool: &sqlx::PgPool) -> Result<HashSet<Uuid>
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// The summary columns the verdict reads.
 type SummaryRow = (
     String,
     String,
@@ -152,11 +111,6 @@ type SummaryRow = (
     bool,
 );
 
-/// Read the facts. `Ok(None)` = the thread is gone. A probe that could not run
-/// is an `Err`, and the request keeps its place.
-///
-/// Takes the pool and the session map rather than the engine, so the whole
-/// read is testable without standing one up.
 pub(crate) async fn read_request_facts(
     pool: &sqlx::PgPool,
     sessions: &AgentSessions,
@@ -187,8 +141,6 @@ pub(crate) async fn read_request_facts(
         return Ok(None);
     };
     let status = ThreadStatus::parse(&status);
-    // The caller streams its whole turn after asking, so a running thread
-    // skips every event scan. It waits whatever they would say.
     let (open, parked_on_question, turn_settle) = if status == ThreadStatus::Idle {
         let open = request_is_open(pool, thread_id).await?;
         let parked =
@@ -220,7 +172,6 @@ pub(crate) async fn read_request_facts(
     }))
 }
 
-/// Where one resolution left a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestState {
     Closed,
@@ -234,7 +185,6 @@ pub fn start_archive_request_resolver(engine: &std::sync::Arc<LucidosEngine>) {
 
 #[easy_ext::ext(ArchiveRequestExt)]
 impl LucidosEngine {
-    /// Take one request's verdict and act on it.
     async fn resolve_archive_request(self: &Arc<Self>, thread_id: Uuid) -> RequestState {
         let facts = match read_request_facts(self.pool(), &self.agent_sessions, thread_id).await {
             Ok(Some(facts)) => facts,
@@ -282,8 +232,6 @@ impl LucidosEngine {
         }
     }
 
-    /// Resolve one thread and record where its request stands: watched while
-    /// open, and retried after [`CLAIM_RETRY`] while a claim holds it.
     async fn track_archive_request(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -308,8 +256,6 @@ impl LucidosEngine {
         }
     }
 
-    /// Rebuild the watched set from the event log, then re-take every verdict.
-    /// On boot this catches a thread that settled while the engine was down.
     async fn recover_archive_requests(
         self: &Arc<Self>,
         watched: &mut HashSet<Uuid>,
@@ -324,12 +270,6 @@ impl LucidosEngine {
         }
     }
 
-    /// Start the bus subscriber that archives a thread once its request can
-    /// land.
-    ///
-    /// The watched set is the cheap filter: an engine with no open request
-    /// runs no query per event. The event log is the authority, so the set is
-    /// rebuilt from it at start and whenever the subscriber lags.
     fn start_archive_request_resolver(self: &Arc<Self>) {
         let mut rx = self.event_bus.subscribe();
         let engine = self.clone();
@@ -364,7 +304,7 @@ impl LucidosEngine {
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            // The skipped batch may hold a request or the settle
+                            // INVARIANT: The skipped batch may hold a request or the settle
                             // it waits for, so rebuild from the log.
                             log_legacy!(
                                 "[ArchiveRequest] subscriber lagged by {} events, re-resolving",

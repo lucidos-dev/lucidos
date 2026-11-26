@@ -1,21 +1,10 @@
-//! The routes a gateway posts to its engines. Each is one signal:
-//! - ask `origin` now (ADR 0589);
-//! - the users changed (ADR 0623);
-//! - a pairing waits for a paired device's Allow, or was answered.
-
 use super::*;
 
-/// POST /api/v1/follow-main/nudge: a paired gateway landed on `origin`, so the
-/// follow task asks at once. Its own gateway sends it. The nudge moves nothing
-/// itself: the next round fetches, fast-forwards and builds as usual.
 pub(super) async fn nudge(State(state): State<AppState>) -> StatusCode {
     state.engine.nudge_follow_main();
     StatusCode::ACCEPTED
 }
 
-/// POST /api/v1/users/changed: the gateway recorded an identity change,
-/// or its legacy alias: read the users again (ADR 0623). Pages
-/// hear `UsersChanged` once the new list differs.
 pub(super) async fn users_changed(State(state): State<AppState>) -> StatusCode {
     tokio::spawn(async move {
         announce_users_if_changed(&state.engine.event_bus, crate::gateway_users::refresh()).await;
@@ -23,7 +12,7 @@ pub(super) async fn users_changed(State(state): State<AppState>) -> StatusCode {
     StatusCode::ACCEPTED
 }
 
-/// Announce `UsersChanged` once `changed` says a read brought a different
+/// INVARIANT: Announce `UsersChanged` once `changed` says a read brought a different
 /// list. Every reader that resolved a device against the earlier list hears
 /// it: a page, and a gateway's row stream.
 ///
@@ -45,7 +34,6 @@ pub async fn announce_users_if_changed(
     }
 }
 
-/// What redeemed a pairing that now waits for a paired device's Allow.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum PairingRequestKind {
@@ -53,23 +41,20 @@ pub(super) enum PairingRequestKind {
     Gateway,
 }
 
-/// A pairing that just started waiting, as the gateway names it.
 #[derive(Debug, Deserialize)]
 pub(super) struct RaisedPairingRequest {
     kind: PairingRequestKind,
-    /// The redeemer's own name for itself. Its claim, so a hint only.
+    /// INVARIANT: The redeemer's own name for itself. Its claim, so a hint only.
     label: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct PairingRequestsChangedBody {
-    /// Set when a pairing started waiting, so the owner's devices hear it.
-    /// Absent when one was answered or expired.
     #[serde(default)]
     raised: Option<RaisedPairingRequest>,
 }
 
-/// The notification a waiting pairing raises, title then body.
+/// INVARIANT: The notification a waiting pairing raises, title then body.
 ///
 /// It grants nothing: Allow lives on the gateway, which only a paired device
 /// reaches. A forged signal leads to an empty list.
@@ -87,9 +72,6 @@ pub(super) fn pairing_request_notice(raised: &RaisedPairingRequest) -> (String, 
     (title.to_string(), message)
 }
 
-/// POST /api/v1/pairing-requests/changed: a pairing started or stopped waiting
-/// for a paired device's Allow. Its own gateway sends it. A new wait notifies
-/// the owner's devices, and every change tells Settings, Access to re-read.
 pub(super) async fn pairing_requests_changed(
     State(state): State<AppState>,
     Json(body): Json<PairingRequestsChangedBody>,
@@ -157,8 +139,6 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    /// A read that changed the list announces it, on the bus every stream
-    /// reads. A read that changed nothing announces nothing.
     #[tokio::test]
     async fn a_changed_user_list_is_announced_and_an_unchanged_one_is_not() {
         use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
@@ -193,8 +173,6 @@ mod tests {
         assert!(message.contains("Don't allow"), "{message}");
     }
 
-    /// The redeemer names itself, so its label must not rewrite the notice
-    /// the owner reads before tapping Allow.
     #[test]
     fn a_label_cannot_add_markdown_to_the_notice() {
         let raised: RaisedPairingRequest = serde_json::from_value(serde_json::json!({

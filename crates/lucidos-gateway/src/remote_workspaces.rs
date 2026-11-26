@@ -1,10 +1,3 @@
-//! Remote workspaces: the Workspaces list's half from gateway A's side.
-//!
-//! A asks every remote gateway for its workspaces over the gateway protocol,
-//! all at once. A gateway that does not answer stays in the list with the
-//! reason, so the picker greys it out rather than drops it. B's half is
-//! `gateway_protocol::list_workspaces`.
-
 use std::time::Duration;
 
 use axum::extract::State;
@@ -17,15 +10,10 @@ use crate::gateway_protocol::{ListedWorkspace, GATEWAY_API_PREFIX, WORKSPACES_PA
 use crate::remote_gateways::RemoteGateway;
 use crate::server::GatewayState;
 
-/// How long A waits for one remote gateway's list. The picker shows the local
-/// workspaces meanwhile, so a dead gateway costs this much and no more.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One remote gateway's workspaces, or why A could not list them.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct RemoteGatewayListing {
-    /// The short name A's user gave the gateway, the `<name>` in
-    /// `/<slug>@<name>/`.
     pub gateway: String,
     pub host: String,
     pub pairing_id: String,
@@ -68,8 +56,6 @@ pub fn transport_reason(error: &reqwest::Error) -> ReasonKind {
     }
 }
 
-/// A's routes, nested at `/~/api/v1/remote-workspaces`, device-gated by
-/// `auth_api::enforce` and closed to app documents.
 pub fn router() -> Router<GatewayState> {
     Router::new()
         .route("/", get(list))
@@ -90,8 +76,6 @@ async fn list(
             let deadline = tokio::time::Instant::now() + LIST_TIMEOUT;
             let listing = match fetch(&client, &gateway).await {
                 Ok(mut workspaces) => {
-                    // The remote protocol's cached counts describe the team.
-                    // Ask each inbox as the caller instead, without caching it.
                     futures::future::join_all(workspaces.iter_mut().map(|workspace| {
                         let device = device.as_ref();
                         let client = &client;
@@ -146,7 +130,6 @@ async fn list(
     Json(futures::future::join_all(listings).await)
 }
 
-/// `gateway`'s workspaces, or a sentence saying why not.
 async fn fetch(
     client: &crate::peer_connection::PeerConnection,
     gateway: &RemoteGateway,
@@ -202,8 +185,6 @@ async fn fetch(
     }
 }
 
-/// Read the inbox through the same signed relay as opening the workspace.
-/// Failure means unknown, never a fallback to the advertised shared count.
 async fn inbox_count(
     state: &GatewayState,
     client: &crate::peer_connection::PeerConnection,

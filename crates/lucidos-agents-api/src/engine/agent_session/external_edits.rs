@@ -1,47 +1,12 @@
-//! External-edit detection (Phase 8.2 + 8.3).
-//!
-//! Between CC turns, the engine's per-thread worktree lives on disk and the
-//! user is free to open the worktree in their own editor. When CC resumes,
-//! it has no idea anything changed — `--resume` replays the prior session
-//! state, not the worktree's current state. The helpers in this module
-//! reconcile the two:
-//!
-//! - [`compute_external_edit_note`] — diff the worktree's current HEAD +
-//!   `git status` against the SHA recorded on the previous
-//!   `CodingAgentIdled`. If anything moved, build a short note that the
-//!   spawn dispatcher prepends to the user's next prompt so CC can react
-//!   to the changes ("the user committed X, modified Y") instead of being
-//!   surprised by them later.
-//!
-//! - [`verify_branch`] — refuse to spawn if the user `git checkout`-ed
-//!   another branch in the worktree between turns. Continuing on the wrong
-//!   branch would silently commit CC's work to the user's feature branch
-//!   (or worse, main). Better to surface the mismatch loudly than to
-//!   pretend everything is fine.
-//!
-//! Both helpers are deliberately I/O-only and stateless — they can be unit
-//! tested with a real git in a tempdir without any engine context.
-
 use std::path::Path;
 
 use crate::engine::agent_session::resume::IdleAnchor;
 use crate::engine::git_ops::{git_answer, git_answer_with, git_cmd, worktree_current_branch};
 
-/// Why [`verify_branch`] would not let the spawn proceed.
-///
-/// Custom error type (exception to the `Box<dyn Error>` convention in
-/// CLAUDE.md) because the spawn-context path branches on the case, not only on
-/// the wording: only a NAMED branch may go on to renegade-branch adoption, so
-/// `Unanswered` has to stay distinguishable from the other two. The tests
-/// assert the case for the same reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BranchMismatch {
-    /// git named a branch, and it is not the one the engine expected.
     OnOtherBranch { expected: String, found: String },
-    /// git ran and reported a detached HEAD.
     Detached { expected: String },
-    /// git could not be asked: it failed to spawn, timed out, or exited
-    /// non-zero. Nothing is known about the checked-out branch.
     Unanswered { expected: String },
 }
 
@@ -72,9 +37,6 @@ impl std::fmt::Display for BranchMismatch {
 
 impl std::error::Error for BranchMismatch {}
 
-/// Run `git rev-parse HEAD` in `worktree_path` and return the SHA on success.
-/// Returns `None` for any failure (missing dir, branch with zero commits,
-/// detached HEAD points to a missing object). Never panics.
 pub(crate) async fn git_head_sha(worktree_path: &Path) -> Option<String> {
     match git_cmd(&["rev-parse", "HEAD"], worktree_path).await {
         Ok(o) if o.status.success() => {
@@ -89,7 +51,6 @@ pub(crate) async fn git_head_sha(worktree_path: &Path) -> Option<String> {
     }
 }
 
-/// Run `git status --porcelain` and return the raw lines.
 async fn git_status_lines(worktree_path: &Path) -> Vec<String> {
     match git_cmd(&["status", "--porcelain"], worktree_path).await {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
@@ -101,8 +62,6 @@ async fn git_status_lines(worktree_path: &Path) -> Vec<String> {
     }
 }
 
-/// Return a one-line-per-commit summary of `<last_sha>..HEAD`. Empty string
-/// if the range is empty or the command fails.
 async fn git_log_oneline(worktree_path: &Path, last_sha: &str) -> String {
     let range = format!("{}..HEAD", last_sha);
     match git_cmd(
@@ -131,9 +90,6 @@ pub(crate) async fn compute_external_edit_note(
 
     let head_moved = match current_sha.as_deref() {
         Some(cur) => cur != last_sha,
-        // Couldn't read HEAD — treat as unchanged so we don't spam CC with
-        // a confusing note for a transient git failure. A real branch
-        // mismatch is caught by `verify_branch` on the same code path.
         None => false,
     };
 
@@ -141,9 +97,6 @@ pub(crate) async fn compute_external_edit_note(
         return None;
     }
 
-    // Build the sections first: with the HEAD-move line suppressed and a clean
-    // tree there is nothing left to say, and the note must not render as a bare
-    // header.
     let mut sections = String::new();
 
     if head_moved {
@@ -162,8 +115,6 @@ pub(crate) async fn compute_external_edit_note(
 
     if !dirty.is_empty() {
         sections.push_str("\nUncommitted changes:\n");
-        // `git status --porcelain` lines are already short and one-per-file.
-        // Cap at 50 to keep the prompt bounded for huge edits.
         const MAX_LINES: usize = 50;
         let total = dirty.len();
         for line in dirty.iter().take(MAX_LINES) {
@@ -173,7 +124,6 @@ pub(crate) async fn compute_external_edit_note(
         if total > MAX_LINES {
             sections.push_str(&format!("… and {} more file(s)\n", total - MAX_LINES));
         }
-        // Trim trailing newline before the closing bracket for tidiness.
         if sections.ends_with('\n') {
             sections.pop();
         }
@@ -236,7 +186,6 @@ pub(crate) async fn verify_branch(
     }
 }
 
-/// True iff `ancestor_sha` is reachable from `descendant_ref`.
 pub(crate) async fn is_ancestor(
     worktree_path: &Path,
     ancestor_sha: &str,
@@ -262,30 +211,19 @@ pub(crate) async fn try_adopt_renegade_branch(
     Some((current, note))
 }
 
-/// The worktree's current branch, when it provably continues `tracked_branch`
-/// under the proofs [`try_adopt_renegade_branch`] documents. `None` when the
-/// worktree is still on `tracked_branch`, or no proof holds.
-///
-/// Its other use is an internal thread's *side branch*. The agent ran
-/// `git switch -c` off its tracked branch, so the worktree is still the thread's
-/// own. The thread keeps tracking the engine-named branch, because Apply lands
-/// that one. See [`side_branch_note`].
 pub(crate) async fn branch_continuing_tracked(
     repo_root: &Path,
     worktree_path: &Path,
     tracked_branch: &str,
     anchor: &IdleAnchor,
 ) -> Option<String> {
-    // Read the branch ONCE and gate that value. A re-read can approve one
+    // INVARIANT: Read the branch ONCE and gate that value. A re-read can approve one
     // branch and hand the caller another, as `try_adopt_branch_at_idle` says.
     let current = worktree_current_branch(worktree_path).await?;
     if current == tracked_branch {
         return None;
     }
     let proved = match anchor {
-        // Refuse before probing anything. The weaker proof must not stand in
-        // for an anchor that may exist and may disagree. A provenance probe
-        // here would also log a refusal reason that is not the operative one.
         IdleAnchor::Unknown => false,
         IdleAnchor::Found(sha) => {
             is_ancestor(worktree_path, sha, "HEAD").await
@@ -302,13 +240,6 @@ pub(crate) async fn branch_continuing_tracked(
     proved.then_some(current)
 }
 
-/// Whether the live worktree at `worktree_path` still belongs to the thread
-/// tracking `tracked_branch`: it is on that branch, or on a side branch that
-/// [`branch_continuing_tracked`] proves the agent cut from it.
-///
-/// Boot recovery asks this before it reuses the thread's worktree. Reading only
-/// the checked-out name skipped a thread whose agent had run `git switch -c`,
-/// so a user switch never resumed it.
 pub(crate) async fn worktree_serves_branch(
     repo_root: &Path,
     worktree_path: &Path,
@@ -327,7 +258,7 @@ pub(crate) async fn try_adopt_branch_at_idle(
     tracked_branch: &str,
     anchor_sha: Option<&str>,
 ) -> Option<(String, String)> {
-    // Read the branch ONCE and gate that value. Delegating the adoption back to
+    // INVARIANT: Read the branch ONCE and gate that value. Delegating the adoption back to
     // `try_adopt_renegade_branch` would re-read it, so the name checked and the
     // name adopted could differ; the gates below are worth nothing if they
     // approve one branch and the caller is handed another.
@@ -349,17 +280,12 @@ pub(crate) async fn try_adopt_branch_at_idle(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchProvenance {
-    /// This worktree's HEAD moved onto the branch in the same git operation
-    /// that created it: `git checkout -b`, or `git switch -c`.
     CreatedHere,
-    /// git's reflog records `git branch -m` from the tracked branch.
     RenamedFromTracked,
-    /// Neither holds, or git could not be asked.
     Unproven,
 }
 
 impl BranchProvenance {
-    /// True when git accounts for how the branch became this thread's.
     fn is_proven(self) -> bool {
         !matches!(self, BranchProvenance::Unproven)
     }
@@ -376,10 +302,6 @@ async fn branch_provenance(
     } else if branch_reflog_records_rename_from(repo_root, current_branch, tracked_branch).await {
         BranchProvenance::RenamedFromTracked
     } else {
-        // The only place a provenance refusal is visible. Both boundaries are
-        // otherwise silent about it, and this rules out more than the ancestry
-        // check it replaced: reflogs off, and a branch created before the
-        // checkout that moved onto it.
         log_legacy!(
             "[AgentSession] No reflog shows how branch '{}' came from '{}', refusing adoption",
             current_branch,
@@ -404,10 +326,6 @@ async fn tracked_branch_continues_into_head(
     }
 }
 
-/// Does `current_branch`'s reflog record that it was renamed from
-/// `tracked_branch`? The message is written by git itself (`builtin/branch.c`),
-/// so this is git's own account of the rename rather than an inference from
-/// what is missing.
 async fn branch_reflog_records_rename_from(
     repo_root: &Path,
     current_branch: &str,
@@ -427,7 +345,7 @@ async fn branch_reflog_records_rename_from(
     .or_unknown(false)
 }
 
-/// Did THIS worktree create `branch`, in the git operation that moved its HEAD
+/// INVARIANT: Did THIS worktree create `branch`, in the git operation that moved its HEAD
 /// onto it? `git checkout -b` and `git switch -c` do exactly that. It is the
 /// only thing separating an agent's own ticket branch from a pre-existing
 /// sibling while the tracked ref sits at the base. The two leave the same
@@ -469,21 +387,12 @@ async fn worktree_created_the_branch(worktree_path: &Path, branch: &str) -> bool
     })
 }
 
-/// One line of the reflog, as [`reflog_entries`] formats it.
 struct ReflogEntry {
-    /// What the ref pointed at after this entry.
     new_sha: String,
-    /// When it was written, in unix seconds. Only ever compared, so it stays
-    /// the string git printed.
     at: String,
-    /// git's own description, e.g. `checkout: moving from a to b`.
     subject: String,
 }
 
-/// Every reflog entry for `reference`, newest first. `None` when git could not
-/// be asked, or the ref has no reflog. Both callers read that as "no proof",
-/// which refuses adoption, so the unanswered side keeps the user's work
-/// (`.claude/rules/rust.md`).
 async fn reflog_entries(dir: &Path, reference: &str) -> Option<Vec<ReflogEntry>> {
     let args = [
         "reflog",
@@ -503,9 +412,6 @@ async fn reflog_entries(dir: &Path, reference: &str) -> Option<Vec<ReflogEntry>>
     }
 }
 
-/// Split `<sha> <ref>@{<unix seconds>} <subject>`. Splitting on spaces is safe
-/// because git forbids a space in a ref name. Reading the timestamp after the
-/// LAST `@{` is safe because it forbids that sequence too.
 fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
     let mut fields = line.splitn(3, ' ');
     let new_sha = fields.next()?.to_string();
@@ -528,8 +434,6 @@ pub(crate) fn build_adoption_note(new_branch: &str) -> String {
     )
 }
 
-/// The note for an internal thread resumed on a side branch. The thread keeps
-/// `tracked`, so the agent must bring what it wants applied back onto it.
 pub(crate) fn side_branch_note(side_branch: &str, tracked: &str) -> String {
     format!(
         "[Note from engine: your worktree is on branch '{side_branch}', which you created from \

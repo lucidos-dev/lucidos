@@ -45,7 +45,6 @@ pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
     if answer.starts_with("none") || answer.is_empty() {
         return Some(vec![]);
     }
-    // Comma-separated and 1-indexed, as the prompt asked for.
     Some(
         answer
             .split(|c: char| c == ',' || c.is_whitespace())
@@ -58,8 +57,6 @@ pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
 
 #[easy_ext::ext(MemoryExt)]
 pub(crate) impl LucidosEngine {
-    /// `thread_id` anchors the capture for the verdict call this makes. The
-    /// tool dispatcher holds it, so the spend is never filed against nothing.
     async fn execute_memory_tool(
         &self,
         args: &serde_json::Value,
@@ -83,7 +80,6 @@ pub(crate) impl LucidosEngine {
             return Ok("Error: memory system not available".to_string());
         };
 
-        // Search for candidate memories by keyword
         let results = index
             .search_by_keyword(search_query, 0.0, 100)
             .await
@@ -93,7 +89,6 @@ pub(crate) impl LucidosEngine {
             return Ok(format!("No memories found matching '{}'", search_query));
         }
 
-        // Embed the wrong_fact and all candidates for similarity filtering
         let wrong_embedding = self
             .embedder
             .embed(wrong_fact)
@@ -112,7 +107,6 @@ pub(crate) impl LucidosEngine {
             .await
             .map_err(|e| format!("Failed to embed candidates: {}", e))?;
 
-        // Collect candidates that pass the similarity threshold
         let mut candidates: Vec<(usize, f32)> = Vec::new();
         let mut kept_count: usize = 0;
 
@@ -141,7 +135,6 @@ pub(crate) impl LucidosEngine {
             ));
         }
 
-        // Safety cap
         const MAX_DELETIONS: usize = 10;
         if candidates.len() > MAX_DELETIONS {
             log_legacy!(@Memory, "[correct_memory] BLOCKED: {} matches exceeds safety cap of {}", candidates.len(), MAX_DELETIONS);
@@ -151,10 +144,8 @@ pub(crate) impl LucidosEngine {
             ));
         }
 
-        // Sort by similarity descending
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Build numbered list for batch LLM verification
         let mut verify_list = String::new();
         for (list_idx, &(entry_idx, _)) in candidates.iter().enumerate() {
             verify_list.push_str(&format!(
@@ -225,7 +216,6 @@ If NONE should be deleted, reply with "none"."#,
             Err(e) => return Ok(unrecorded_correction(e)),
         };
 
-        // Delete one at a time — only the LLM-verified entries
         let mut deleted_summaries: Vec<String> = Vec::new();
         let mut skipped_summaries: Vec<String> = Vec::new();
         let mut failed_summaries: Vec<String> = Vec::new();
@@ -300,10 +290,6 @@ If NONE should be deleted, reply with "none"."#,
         Ok(response)
     }
 
-    /// Delete (and optionally replace) one memory entry by its exact id — the
-    /// precise lane the `[Long-term Memory]` block's `[id: <uuid>]` enables. The
-    /// fuzzy keyword+semantic path (`correct_memory` → `execute_memory_tool`)
-    /// is deliberately left untouched.
     async fn execute_correct_memory_by_id(
         &self,
         args: &serde_json::Value,
@@ -311,8 +297,6 @@ If NONE should be deleted, reply with "none"."#,
         Ok(self.correct_memory_by_id(args, None).await?.text)
     }
 
-    /// [`Self::execute_correct_memory_by_id`] with the refusal kept apart from
-    /// its sentence, for a caller that answers with a status.
     async fn correct_memory_by_id(
         &self,
         args: &serde_json::Value,
@@ -327,7 +311,7 @@ If NONE should be deleted, reply with "none"."#,
         correct_memory_by_id_impl(index, self.embedder.as_ref(), &self.event_bus, args, actor).await
     }
 
-    /// `memory` action `search`: the agent's own query against long-term
+    /// INVARIANT: `memory` action `search`: the agent's own query against long-term
     /// memory, for when the pre-turn injection missed something it needs.
     ///
     /// Ranked by the SAME formula as that injection
@@ -348,8 +332,6 @@ If NONE should be deleted, reply with "none"."#,
         Ok(serde_json::to_string(&found)?)
     }
 
-    /// `memory` action `source`: walk one memory back to the event it came
-    /// from, which carries the thread that produced it.
     async fn execute_memory_source(
         &self,
         args: &serde_json::Value,
@@ -365,19 +347,10 @@ If NONE should be deleted, reply with "none"."#,
         };
         match self.memory_source(uuid).await {
             Ok(found) => Ok(serde_json::to_string(&found)?),
-            // Surfaced rather than returned as an Err so the agent reads the
-            // instruction and re-asks, instead of the loop reporting a failure
-            // it cannot act on. The artifact case is the one that matters: it
-            // is not a missing memory, it is a memory with no conversation.
             Err(e) => Ok(format!("Error: {e}")),
         }
     }
 
-    /// `threads` action `search`: find past threads by what was said in them.
-    ///
-    /// The capability the UI's search box already had and the agent did not,
-    /// which is why "we talked about this" was unanswerable: `list` filters by
-    /// status and channel and can never find a topic.
     async fn execute_search_threads(
         &self,
         args: &serde_json::Value,
@@ -393,12 +366,10 @@ If NONE should be deleted, reply with "none"."#,
             .clamp(1, 50);
         let mut found =
             crate::engine::thread_search::combined_thread_search(self, q, limit).await?;
-        // The schema states 1-50, and the merge bounds each ARM rather than
-        // the total, so the promise is kept here.
         found.truncate(limit.max(0) as usize);
         crate::engine::thread_liveness::attach(&self.pool, found.iter_mut().map(|r| &mut r.info))
             .await;
-        // PROJECTED, never the raw `ThreadSearchResult`. That flattens ~30
+        // INVARIANT: PROJECTED, never the raw `ThreadSearchResult`. That flattens ~30
         // bookkeeping fields the model has no use for. It also carries the
         // whole draft, and search may match a thread on its draft alone. So a
         // row says only whether the thread holds one; the `drafts` action
@@ -409,8 +380,6 @@ If NONE should be deleted, reply with "none"."#,
             .iter()
             .map(|r| {
                 serde_json::json!({
-                    // The id the model passes on: to the `events` tool's
-                    // 'query' to read the thread, or to 'drafts' for its draft.
                     "thread_id": r.info.thread_id,
                     "title": r.info.title,
                     "liveness": r.info.liveness,
@@ -436,7 +405,6 @@ fn unrecorded_correction(e: Box<dyn std::error::Error + Send + Sync>) -> String 
     )
 }
 
-/// Why a by-id correction changed nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CorrectionRefusal {
     InvalidArgs,
@@ -444,8 +412,6 @@ pub(crate) enum CorrectionRefusal {
     NotRecorded,
 }
 
-/// What a by-id correction answers. The tool hands `text` to the model. The
-/// route reads `refusal`, so a script sees a failure as a failed command.
 #[derive(Debug)]
 pub(crate) struct CorrectionReply {
     pub(crate) text: String,
@@ -468,10 +434,6 @@ impl CorrectionReply {
     }
 }
 
-/// Parse the `id` arg for `correct_memory_by_id`. Accepts a bare UUID
-/// (hyphenated or simple) and defensively tolerates a `mem-` prefix and
-/// surrounding whitespace. Returns the tool-facing error string on failure so
-/// the caller can hand it straight back to the model.
 pub(crate) fn parse_memory_entry_id(args: &serde_json::Value) -> Result<uuid::Uuid, String> {
     let raw =
         match args.get("id").and_then(|v| v.as_str()) {
@@ -487,11 +449,6 @@ pub(crate) fn parse_memory_entry_id(args: &serde_json::Value) -> Result<uuid::Uu
     })
 }
 
-/// Core of `correct_memory_by_id`, factored out of the `LucidosEngine` impl so
-/// tests can exercise the delete / not-found / delete-plus-correction branches
-/// against a real Postgres pool with a mock embedder — no full engine, and no
-/// LLM provider (the id lane skips the semantic verification `correct_memory`
-/// needs).
 pub(crate) async fn correct_memory_by_id_impl(
     index: &crate::memory::PgVectorIndex,
     embedder: &dyn EmbeddingProvider,
@@ -509,8 +466,6 @@ pub(crate) async fn correct_memory_by_id_impl(
         }
     };
 
-    // Confirm the target exists first: lets us echo what was removed and tell a
-    // real delete apart from a no-op on a stale / hallucinated id.
     let Some(entry) = index
         .get_by_id(id)
         .await
@@ -524,7 +479,6 @@ pub(crate) async fn correct_memory_by_id_impl(
         ));
     };
 
-    // A replacement that is not text must not pass as "delete only".
     let correction = match args.get("correction") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(text.trim()).filter(|s| !s.is_empty()),
@@ -536,7 +490,6 @@ pub(crate) async fn correct_memory_by_id_impl(
         }
     };
 
-    // The entry's own summary is the wrong fact: the user pointed at it.
     let removed = vec![CorrectedMemory::from(&entry)];
     let event_id = match record_correction(
         bus,
@@ -561,7 +514,7 @@ pub(crate) async fn correct_memory_by_id_impl(
         .delete(id)
         .await
         .map_err(|e| format!("Delete failed: {}", e))?;
-    // Recorded either way, so the correction below still lands.
+    // INVARIANT: Recorded either way, so the correction below still lands.
     let mut response = if deleted {
         log_legacy!(@Memory, "[correct_memory_by_id] DELETED id={} topic={:?}", id, entry.topic);
         format!("Deleted memory entry {}:\n  - {}", id, entry.summary)
@@ -615,8 +568,6 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    /// The verdict call decides which memories get deleted, and it spent real
-    /// tokens doing it on the agent's own chat model.
     #[tokio::test]
     async fn the_correction_verdict_records_what_it_cost() {
         let (pool, db_name) = setup_test_db().await;
@@ -648,8 +599,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A verdict of "none" still cost what it cost. Only a call that never
-    /// reached the provider leaves no row.
     #[tokio::test]
     async fn a_verdict_of_none_is_still_recorded() {
         let (pool, db_name) = setup_test_db().await;
@@ -677,8 +626,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A verdict that failed is not "none match" and not "all match". The
-    /// correction aborts, so nothing is deleted on a guess.
     #[tokio::test]
     async fn a_failed_verdict_call_aborts_instead_of_matching_anything() {
         let (pool, db_name) = setup_test_db().await;
@@ -697,8 +644,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// With the correction event unwritable, the entry must survive, or a
-    /// rebuild brings back a fact the user was told was gone.
     #[tokio::test]
     async fn a_correction_that_cannot_be_recorded_deletes_nothing() {
         let (pool, db_name) = setup_test_db().await;
@@ -732,8 +677,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    // --- parse_memory_entry_id (pure) ---
-
     #[test]
     fn parse_accepts_hyphenated_uuid() {
         let id = Uuid::new_v4();
@@ -766,8 +709,6 @@ mod tests {
         let err = parse_memory_entry_id(&json!({ "id": "not-a-uuid" })).unwrap_err();
         assert!(err.contains("must be a memory entry UUID"), "{err}");
     }
-
-    // --- correct_memory_by_id_impl (real PG + mock embedder) ---
 
     #[tokio::test]
     async fn a_correction_records_who_asked() {
@@ -826,9 +767,6 @@ mod tests {
         }
     }
 
-    /// The delete and the recorded correction have landed by the time the
-    /// corrected fact is indexed. A failure there must not read as a failed
-    /// correction, or the retry finds no entry and answers "not found".
     #[tokio::test]
     async fn a_failed_index_of_the_corrected_fact_still_reports_the_correction() {
         let (pool, db_name) = setup_test_db().await;
@@ -1021,7 +959,6 @@ mod tests {
             "old entry should be gone"
         );
 
-        // The replacement is stored under the Memory Correction topic.
         let stored: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM memory_entries WHERE topic = 'Memory Correction' AND summary = $1",
         )
@@ -1034,9 +971,6 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A full rebuild clears memory and re-extracts from the same source
-    /// events, so the extractor finds the wrong fact again. The correction must
-    /// be replayed over it, or every fix the user made silently comes back.
     #[tokio::test]
     async fn a_rebuild_does_not_resurrect_a_corrected_fact() {
         let (pool, db_name) = setup_test_db().await;
@@ -1064,8 +998,6 @@ mod tests {
         assert_eq!(corrections.len(), 1, "the correction must be recorded");
         let corrected_at = corrections[0].created;
 
-        // The forced rebuild: clear, then the extractor returns the wrong fact
-        // from its original source event, which predates the correction.
         index.clear().await.unwrap();
         insert_at(
             &index,

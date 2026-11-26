@@ -45,13 +45,8 @@ fn no_app_frame_may_reach_the_route() {
     }
 }
 
-/// The real router, inside the isolated engine child of
-/// `accepted_saved_chat_executes_with_original_identity_and_saved_provenance`.
-/// Covers both transports, retry, stale and every refused caller.
 pub(crate) async fn verify_submit_draft_transports(engine: Arc<crate::engine::LucidosEngine>) {
     let pool = engine.pool().clone();
-    // The engine's own registry decides the chat model, so it must serve the
-    // mock provider's default.
     engine.model_registry().write().unwrap().insert(
         "mock".into(),
         crate::llm::model_registry::ModelRouting::single(crate::llm::ProviderKind::OpenAi, "mock"),
@@ -120,8 +115,6 @@ pub(crate) async fn verify_submit_draft_transports(engine: Arc<crate::engine::Lu
         }
     };
 
-    // I3: nobody but an agent inside a thread. An app frame is refused by
-    // reach before the handler, even holding a token.
     let mut frame = agent.clone();
     frame.insert(APP_ID_HEADER, "habit-tracker".parse().unwrap());
     for (headers, status) in [
@@ -135,7 +128,6 @@ pub(crate) async fn verify_submit_draft_transports(engine: Arc<crate::engine::Lu
     ] {
         assert_eq!(post(headers, body.clone()).await.0, status);
     }
-    // I1: the body names a revision, never content.
     let mut smuggled = body.clone();
     smuggled["text"] = json!("something else");
     assert_eq!(post(agent.clone(), smuggled).await.0, 400);
@@ -161,11 +153,9 @@ pub(crate) async fn verify_submit_draft_transports(engine: Arc<crate::engine::Lu
     assert_eq!(actor["source_thread_id"], json!(caller));
     assert_ne!(actor["kind"], "device");
 
-    // I4: the minted key comes back, and reusing it replays the receipt.
     let mut retry = body.clone();
     retry["retry_key"] = receipt["retry_key"].clone();
     assert_eq!(post(agent.clone(), retry).await, (202, receipt.clone()));
-    // I5: a fresh key on the consumed revision is stale, with the next step.
     let (status, stale) = post(agent.clone(), body.clone()).await;
     assert_eq!(status, 409, "{stale}");
     assert_eq!(stale["reason"], "draft_snapshot_stale");
@@ -175,8 +165,6 @@ pub(crate) async fn verify_submit_draft_transports(engine: Arc<crate::engine::Lu
         .contains("lucidos threads drafts --thread"));
     assert_eq!(counts(&pool, &[draft.0]).await, 1);
 
-    // An unauthorized refusal names a next step the caller's kind of thread
-    // has: only a coding agent is pointed at `ask-permission`.
     let unasked = seed_draft(&pool, "nobody authorized this", &[]).await;
     let unasked_url = format!("{base}/{}/submit-draft", unasked.0);
     let unasked_body = json!({"expected_revision": unasked.1, "expected_epoch": unasked.2});
@@ -205,7 +193,6 @@ pub(crate) async fn verify_submit_draft_transports(engine: Arc<crate::engine::Lu
     }
     assert_eq!(counts(&pool, &[unasked.0]).await, 0);
 
-    // The tool reaches the same service, as the same kind of submitter.
     let second = seed_draft(&pool, "the tool's draft", &[]).await;
     let answer = engine
         .execute_tool(
@@ -237,8 +224,6 @@ pub(crate) async fn verify_submit_draft_transports(engine: Arc<crate::engine::Lu
     server.abort();
 }
 
-/// A saved chat draft. Returns its thread, draft revision and epoch, read
-/// back from the stored row.
 async fn seed_draft(pool: &sqlx::PgPool, text: &str, images: &[String]) -> (Uuid, i64, i64) {
     let thread = Uuid::new_v4();
     sqlx::query(
@@ -296,7 +281,6 @@ async fn open_owner_turn(engine: &crate::engine::LucidosEngine, caller: Uuid) {
         .unwrap();
 }
 
-/// Receipts recorded for these drafts.
 async fn counts(pool: &sqlx::PgPool, threads: &[Uuid]) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM draft_submissions WHERE thread_id = ANY($1)")
         .bind(threads)

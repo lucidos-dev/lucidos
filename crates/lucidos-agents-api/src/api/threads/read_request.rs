@@ -1,10 +1,3 @@
-//! The *read decision* and *read request* routes (ADR 0409, ADR 0417).
-//!
-//! A coding agent decides through `lucidos request-read yes|no`, which posts
-//! to `.../read-request`. The chat agent decides through the `request_read`
-//! tool, in process, and both record the same events. The drawer posts to
-//! `.../read-request/seen` once the user has seen the reply.
-
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
     http::{HeaderMap, StatusCode},
@@ -16,26 +9,26 @@ use crate::api::AppState;
 use crate::engine::read_request::{
     record_read_decision, record_reply_seen, ReadDecision, ReplySeen, READ_ARG,
 };
+use crate::engine::turn_end::read_decision::{
+    coding_agent_reply_is_the_users, parent_carries_read,
+};
 
 use super::actions::refuse_an_agent_from_another_thread;
 use super::parse_thread_id;
 
-/// The 403 for an agent naming another thread's id on the request route.
 pub(super) const READ_REQUEST_IS_THE_CALLERS: &str = "A thread can only decide whether its \
     own reply is read, and the id in the path is not the calling thread. Drop the id: \
     `lucidos request-read` already acts on the thread you are running in.";
 
-/// The 403 for an agent calling the seen route.
 pub(super) const SEEN_IS_THE_USERS: &str = "Only the user can mark a reply as read, by \
     looking at it. An agent cannot clear a read request.";
 
-/// The body of a read decision. `read` is required: there is no default.
 #[derive(serde::Deserialize)]
 pub(in crate::api) struct ReadDecisionBody {
     read: bool,
 }
 
-/// POST /api/v1/threads/:thread_id/read-request: the calling thread's agent
+/// INVARIANT: POST /api/v1/threads/:thread_id/read-request: the calling thread's agent
 /// records its read decision on its latest reply, `{"read": true|false}`.
 ///
 /// Acts on the calling thread only, as the tool does by taking no thread id.
@@ -75,9 +68,22 @@ pub(in crate::api) async fn request_thread_read(
         ));
     }
     let decision = ReadDecision::from_read(body.read);
-    record_read_decision(&state.engine.event_bus, thread_uuid, decision, Some(actor))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let parent_carries = parent_carries_read(
+        &state.pool,
+        thread_uuid,
+        decision,
+        coding_agent_reply_is_the_users(&state.pool, thread_uuid),
+    )
+    .await;
+    record_read_decision(
+        &state.engine.event_bus,
+        thread_uuid,
+        decision,
+        Some(actor),
+        parent_carries,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({
         "status": match decision {
             ReadDecision::Requested => "requested",
@@ -87,7 +93,6 @@ pub(in crate::api) async fn request_thread_read(
     })))
 }
 
-/// The body of a sighting: the thread's `summary_version` the client saw.
 #[derive(serde::Deserialize)]
 pub(in crate::api) struct ReplySeenBody {
     summary_version: i64,

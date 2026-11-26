@@ -1,6 +1,3 @@
-//! `GET /api/v1/search/text`: Search Everywhere's Text category, end to end
-//! through the router, against a file written by the normal data-write path.
-
 use serde_json::Value;
 
 use crate::support::{

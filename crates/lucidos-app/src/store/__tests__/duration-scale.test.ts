@@ -131,7 +131,7 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: 'asks whether an arrived row is on screen once its roll has landed',
   },
   {
-    file: '../../components/chat/CreateThreadView.tsx',
+    file: '../../components/chat/scrollHold.ts',
     expr: /scaledDurationMs\(DISCLOSURE_MAX_MS\) \+ ROLL_SETTLE_SLACK_MS/,
     what: 'holds the pressed turn control still until the rows its toggle rolled have landed',
   },

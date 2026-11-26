@@ -1,11 +1,6 @@
-//! A child report the parent's agent took mid-turn is handled, so the boot
-//! sweep does not wake the parent for it again.
-
 use super::super::*;
 use super::*;
 
-/// A coding-agent parent whose child just finished. Returns the parent and
-/// its completion card.
 async fn parent_with_a_finished_child(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -27,7 +22,6 @@ async fn parent_with_a_finished_child(
     (parent_id, card_id)
 }
 
-/// The control: the same card with no take is re-fired.
 #[tokio::test]
 async fn an_untaken_report_is_refired_after_a_restart() {
     let (pool, db_name) = setup_test_db().await;
@@ -43,7 +37,6 @@ async fn an_untaken_report_is_refired_after_a_restart() {
     teardown_test_db(&db_name).await;
 }
 
-/// The card followed by its `ChildReportTaken`: the sweep selects nothing.
 #[tokio::test]
 async fn a_taken_report_is_not_refired_after_a_restart() {
     let (pool, db_name) = setup_test_db().await;

@@ -6,6 +6,7 @@ if (typeof (globalThis as any).HTMLElement === 'undefined') {
 
 import {
   followingLiveEdge,
+  holdAcrossRelayout,
   isScrollHeld,
   makeScrollObservers,
   onScrollHoldReleased,
@@ -531,16 +532,74 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       expect(isScrollHeld(el)).toBe(false);
     });
 
-    it('lets go at the cap, whatever keeps scrolling after the lift', () => {
+    it('holds a fling beyond four seconds until scroll events go quiet', () => {
       const { el } = riding();
       el.fire('touchmove');
       lift();
-      for (let t = 0; t < TOUCH_COAST_MAX_MS; t += 50) {
+      for (let t = 0; t <= TOUCH_COAST_MAX_MS; t += 50) {
         el.fire('scroll');
         vi.advanceTimersByTime(50);
       }
+      expect(isScrollHeld(el)).toBe(true);
+      expect(released).toEqual([]);
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS);
       expect(isScrollHeld(el)).toBe(false);
       expect(released).toEqual([el]);
+    });
+
+    it('holds a shifted reading line only after a long fling goes quiet', () => {
+      const el = makeContainer();
+      let blockTop = 100;
+      el.children = [{
+        getBoundingClientRect: () => ({ top: blockTop - el.scrollTop, height: 1500 }),
+      }];
+      el.scrollTop = 500;
+      const { onResize, onScroll, detachGestures } = makeScrollObservers(el);
+      onScroll();
+
+      el.fire('touchmove');
+      blockTop += 100;
+      onResize();
+      expect(el.scrollTop).toBe(500);
+
+      lift();
+      for (let elapsed = 0; elapsed <= TOUCH_COAST_MAX_MS; elapsed += 50) {
+        el.scrollTop += 1;
+        el.fire('scroll');
+        onScroll();
+        vi.advanceTimersByTime(50);
+      }
+
+      const flungTo = el.scrollTop;
+      blockTop += 100;
+      onResize();
+      expect(el.scrollTop).toBe(flungTo);
+
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS);
+      onResize();
+      expect(el.scrollTop).toBe(flungTo + 100);
+      detachGestures();
+    });
+
+    it('carries a history correction to the spot where the fling ends', () => {
+      const el = makeContainer();
+      el.scrollTop = 500;
+      const { onScroll, detachGestures } = makeScrollObservers(el);
+      onScroll();
+
+      el.fire('touchmove');
+      el.scrollHeight += 250;
+      holdAcrossRelayout(el, el.scrollTop + 250);
+      expect(el.scrollTop).toBe(500);
+
+      lift();
+      el.scrollTop = 700;
+      el.fire('scroll');
+      onScroll();
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS);
+
+      expect(el.scrollTop).toBe(950);
+      detachGestures();
     });
 
     it('lets go at the cap when the lift never reaches the window', () => {

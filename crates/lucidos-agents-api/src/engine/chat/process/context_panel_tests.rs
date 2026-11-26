@@ -1,6 +1,3 @@
-//! The panel rides at the tail, its figures match the request, and nothing an
-//! earlier block holds is touched to render it.
-
 use super::*;
 use crate::llm::{ContentBlock, Message, MessageContent};
 
@@ -20,8 +17,6 @@ fn item(byte: u8, chars: usize, age: usize) -> PanelItem {
     }
 }
 
-/// A panel long enough that the collapse marker is genuinely shorter, which is
-/// the only case the never-grow guard allows.
 fn panel_of(body: &str) -> String {
     format!(
         "[CONTEXT PANEL]\n{body}\n{}\n[END CONTEXT PANEL]",
@@ -63,9 +58,6 @@ fn assistant(text: &str) -> Message {
     }
 }
 
-/// The bytes a message puts on the wire, which is what "byte-identical" means
-/// for a cache prefix. `Message` carries no `PartialEq`, and comparing the
-/// serialized form is the stricter check anyway.
 fn wire(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
@@ -94,7 +86,6 @@ fn tool_pair(id: &str, name: &str, result: String) -> Vec<Message> {
     ]
 }
 
-/// One request with one addressable result in it.
 fn one_result() -> Vec<Message> {
     let mut messages = vec![user("the request")];
     messages.extend(tool_pair(
@@ -105,7 +96,6 @@ fn one_result() -> Vec<Message> {
     messages
 }
 
-/// The ordinary view: the defaults, on round 1, with nothing held open.
 fn view<'a>(items: &'a [PanelItem], held_open: &'a HashSet<String>) -> PanelView<'a> {
     PanelView {
         items,
@@ -121,8 +111,6 @@ fn panel(items: &[PanelItem], other: usize) -> String {
     view(items, &NOTHING_HELD).render(other)
 }
 
-/// The total the panel states is the request it is part of, not the request
-/// minus itself. Two passes make that exact rather than close.
 #[test]
 fn the_stated_total_counts_the_panel_itself() {
     let items = vec![item(1, 4_000, 0)];
@@ -136,8 +124,6 @@ fn the_stated_total_counts_the_panel_itself() {
     );
 }
 
-/// The two passes have to be the same length, or the second one's total is
-/// wrong by however much the first one's digits moved.
 #[test]
 fn both_render_passes_are_the_same_length() {
     let mut stubbed = item(2, 700, 12);
@@ -149,7 +135,6 @@ fn both_render_passes_are_the_same_length() {
     assert_eq!(empty.chars().count(), full.chars().count());
 }
 
-/// A row's size is the item's size, and its two clock columns are its own.
 #[test]
 fn every_row_states_its_own_size_age_and_remainder() {
     let items = vec![item(1, 40_000, 0), item(2, 2_500, 7)];
@@ -165,8 +150,6 @@ fn every_row_states_its_own_size_age_and_remainder() {
     assert!(rendered.contains("    7 "), "age 7 missing:\n{rendered}");
 }
 
-/// Invariant 7. The countdown to the next sweep is the one fact a per-item age
-/// cannot carry, so it is stated once and nowhere else.
 #[test]
 fn the_panel_states_the_sweep_countdown_once() {
     let rendered = panel(&[item(1, 4_000, 0)], 1_000);
@@ -178,8 +161,6 @@ fn the_panel_states_the_sweep_countdown_once() {
     assert!(rendered.contains("more than 5 rounds old"), "{rendered}");
 }
 
-/// Invariant 7's other half. Two items of different ages that share a sweep
-/// report the same remainder, because one pass takes them together.
 #[test]
 fn rows_sharing_a_sweep_report_the_same_remainder() {
     let schedule = SweepSchedule::default();
@@ -197,8 +178,6 @@ fn rows_sharing_a_sweep_report_the_same_remainder() {
     assert_eq!(items[0].leaves_in, items[1].leaves_in);
 }
 
-/// Invariant 39. The sweep runs at the top of a round, so a warning on the
-/// sweep round itself arrives after the pages are gone.
 #[test]
 fn the_round_before_a_sweep_names_what_goes() {
     let mut leaving = item(1, 4_000, 8);
@@ -222,15 +201,12 @@ fn the_round_before_a_sweep_names_what_goes() {
     );
 }
 
-/// No warning on an ordinary round, or the line stops meaning anything.
 #[test]
 fn an_ordinary_round_carries_no_sweep_warning() {
     let rendered = panel(&[item(1, 4_000, 0)], 1_000);
     assert!(!rendered.contains("NEXT ROUND IS A SWEEP"), "{rendered}");
 }
 
-/// Invariant 38. No cap on what is held, so the panel states the bill instead:
-/// the count, the tokens, and the share of the room.
 #[test]
 fn the_panel_states_what_is_held_open() {
     let held: HashSet<String> = [address(1)].into_iter().collect();
@@ -245,16 +221,12 @@ fn the_panel_states_what_is_held_open() {
     assert_eq!(rendered.matches("Held open:").count(), 1);
 }
 
-/// Nothing held, no line. A zero row every round is noise the model learns to
-/// skip past.
 #[test]
 fn nothing_held_open_states_nothing() {
     let rendered = panel(&[item(1, 40_000, 3)], 1_000);
     assert!(!rendered.contains("Held open:"), "{rendered}");
 }
 
-/// The panel is the only place the model learns how full it is. So the percent
-/// is the real char ratio, never a rounded token one.
 #[test]
 fn the_percent_is_the_char_ratio() {
     let rendered = panel(&[], 249_000);
@@ -262,12 +234,10 @@ fn the_percent_is_the_char_ratio() {
         .lines()
         .find(|line| line.contains("%)"))
         .unwrap_or_else(|| panic!("no budget line:\n{rendered}"));
-    // The panel counts itself, so the ratio is over 249,000 plus its own size.
     let expected = (249_000 + rendered.chars().count()) * 100 / 500_000;
     assert!(line.contains(&format!("{expected}%)")), "{line}");
 }
 
-/// Appending the panel leaves every earlier block byte-identical.
 #[test]
 fn appending_the_panel_touches_no_earlier_block() {
     let mut messages = vec![user("the request")];
@@ -286,8 +256,6 @@ fn appending_the_panel_touches_no_earlier_block() {
     assert_eq!(after[..after.len() - 1], before[..before.len() - 1]);
 }
 
-/// Across two rounds. A second panel is a second block, and the first one is
-/// left exactly where it was.
 #[test]
 fn a_second_panel_does_not_disturb_the_first() {
     let mut messages = vec![user("the request")];
@@ -302,8 +270,6 @@ fn a_second_panel_does_not_disturb_the_first() {
     assert_eq!(wire(&messages)[0], after_first[0]);
 }
 
-/// A text-only message becomes two blocks rather than one concatenation, so
-/// the panel stays a block the next round can reason about separately.
 #[test]
 fn a_text_message_gains_a_block_rather_than_a_suffix() {
     let mut messages = vec![user("the request")];
@@ -314,8 +280,6 @@ fn a_text_message_gains_a_block_rather_than_a_suffix() {
     assert_eq!(blocks.len(), 2);
 }
 
-/// An item cannot be acted on unless the model was shown it, so every
-/// addressable tool result gets a row or a count.
 #[test]
 fn every_addressable_tool_result_becomes_an_item() {
     let mut messages = vec![user("the request")];
@@ -335,8 +299,6 @@ fn every_addressable_tool_result_becomes_an_item() {
     assert_eq!(items[1].label, "tool: bash");
 }
 
-/// A result with no address is not addressable, so it gets no row. Offering a
-/// row the model cannot act on is the ledger's failure in a new costume.
 #[test]
 fn a_result_with_no_address_is_not_an_item() {
     let mut messages = vec![user("the request")];
@@ -344,8 +306,6 @@ fn a_result_with_no_address_is_not_an_item() {
     assert!(tool_result_items(&messages, &HashMap::new(), 1, SweepSchedule::default()).is_empty());
 }
 
-/// A budget pass leaves a stub, and the panel reports it as already let go so
-/// the model stops reasoning from bytes it cannot inspect.
 #[test]
 fn a_budget_cut_result_reads_as_already_let_go() {
     let mut messages = vec![user("the request")];
@@ -363,8 +323,6 @@ fn a_budget_cut_result_reads_as_already_let_go() {
     assert!(rendered.contains("Already let go:"), "{rendered}");
 }
 
-/// Age is rounds since the item arrived. It is how the model tells a fresh
-/// result from one it has been carrying for twenty rounds.
 #[test]
 fn age_counts_rounds_since_the_item_arrived() {
     let mut messages = vec![user("the request")];
@@ -381,8 +339,6 @@ fn age_counts_rounds_since_the_item_arrived() {
     assert_eq!(round_five[0].age_rounds, 4);
 }
 
-/// The first sighting wins. A re-render must not reset an item's age, or every
-/// row reads as new and the column teaches the model nothing.
 #[test]
 fn a_later_round_does_not_reset_a_known_age() {
     let messages = one_result();
@@ -392,8 +348,6 @@ fn a_later_round_does_not_reset_a_known_age() {
     assert_eq!(first_seen.get(&address(1)), Some(&2));
 }
 
-/// Only an addressable tool result gets an entry, so a round with nothing to
-/// age leaves the map alone.
 #[test]
 fn a_result_with_no_address_gets_no_entry() {
     let mut messages = vec![user("the request")];
@@ -403,9 +357,6 @@ fn a_result_with_no_address_gets_no_entry() {
     assert!(first_seen.is_empty());
 }
 
-/// Invariant 26. A keep OVERWRITES, and `note_first_seen` deliberately never
-/// does. Reusing that one here would be a keep that reads perfectly and changes
-/// nothing at all.
 #[test]
 fn a_keep_overwrites_the_first_seen_round() {
     let mut first_seen = HashMap::new();
@@ -414,8 +365,6 @@ fn a_keep_overwrites_the_first_seen_round() {
     assert_eq!(first_seen.get(&address(1)), Some(&9));
 }
 
-/// No silent caps. A small item is not worth a row, and the panel says how
-/// many it left out and what they weigh.
 #[test]
 fn elided_rows_are_counted_out_loud() {
     let items: Vec<PanelItem> = (0..30).map(|i| item(i as u8, 100, 0)).collect();
@@ -426,7 +375,6 @@ fn elided_rows_are_counted_out_loud() {
     );
 }
 
-/// Largest first, because those are the only ones where letting go pays.
 #[test]
 fn the_biggest_items_get_the_rows() {
     let mut items: Vec<PanelItem> = (0..MAX_ROWS + 5)
@@ -445,8 +393,6 @@ fn the_biggest_items_get_the_rows() {
     );
 }
 
-/// The static half is 47.6% of the bill and no keep reaches it. Leaving it out
-/// would let the model read the addressable total as the whole request.
 #[test]
 fn the_panel_names_the_half_no_keep_reaches() {
     let rendered = panel(&[], 1_000);
@@ -454,8 +400,6 @@ fn the_panel_names_the_half_no_keep_reaches() {
     assert!(rendered.contains("tool definitions"), "{rendered}");
 }
 
-/// An empty panel is still a panel. A round with nothing addressable still has
-/// to tell the model how full it is.
 #[test]
 fn an_empty_panel_still_states_the_budget() {
     let rendered = panel(&[], 1_000);
@@ -463,8 +407,6 @@ fn an_empty_panel_still_states_the_budget() {
     assert!(rendered.contains("You are holding"));
 }
 
-/// The capture row's size is the panel's size, so the Context Viewer's budget
-/// bar and the eval's census both read the truth.
 #[test]
 fn the_capture_row_reports_the_panel_size() {
     let rendered = panel(&[item(1, 4_000, 0)], 1_000);
@@ -486,8 +428,6 @@ fn thousands_are_grouped_from_the_right() {
     assert_eq!(grouped(1_234_567), "1,234,567");
 }
 
-/// Invariant 19, on this surface. The recovery command is stated once per
-/// request, in the standing instructions, and the panel never repeats it.
 #[test]
 fn the_panel_never_repeats_the_recovery_command() {
     let rendered = panel(&[item(1, 4_000, 0)], 1_000);
@@ -497,8 +437,6 @@ fn the_panel_never_repeats_the_recovery_command() {
     );
 }
 
-/// Invariant 6, on this surface. The panel quotes the values in force, or a
-/// swept arm reads a schedule the pass does not run.
 #[test]
 fn the_panel_quotes_both_numbers() {
     let rendered = PanelView {
@@ -510,9 +448,6 @@ fn the_panel_quotes_both_numbers() {
     assert!(rendered.contains("One runs every 7 rounds"), "{rendered}");
 }
 
-/// The footer is three lines and names the affordance. Every word here rides in
-/// front of the cache mark, so it is re-sent at write price every round: the
-/// standing instructions carry the rule, and this carries the pointer.
 #[test]
 fn the_footer_names_the_keep_and_nothing_more() {
     let rendered = panel(&[], 1_000);
@@ -524,7 +459,6 @@ fn the_footer_names_the_keep_and_nothing_more() {
     );
 }
 
-/// Invariant 17, on this surface.
 #[test]
 fn no_panel_surface_shows_a_shortened_address() {
     crate::engine::chat::process::context_mode::assert_no_short_addresses(&panel(
@@ -533,11 +467,6 @@ fn no_panel_surface_shows_a_shortened_address() {
     ));
 }
 
-// ---- the collapse ----
-
-/// A panel and a document are rewritten every round, and no trim pass reaches
-/// a `Text` block in a user message. Without a collapse they are the only thing
-/// in the prompt that only ever grows, and the model cannot address either.
 #[test]
 fn the_round_collapses_what_it_is_about_to_replace() {
     let mut messages = vec![user("the request")];
@@ -565,8 +494,6 @@ fn the_round_collapses_what_it_is_about_to_replace() {
     assert!(rendered.contains("an earlier rendering of your working understanding"));
 }
 
-/// Exactly one of each survives a run of rounds, so the two blocks stop being
-/// the fastest-growing thing in the prompt.
 #[test]
 fn ten_rounds_leave_one_live_panel_and_one_live_document() {
     let mut messages = vec![user("the request")];
@@ -591,11 +518,6 @@ fn ten_rounds_leave_one_live_panel_and_one_live_document() {
     assert!(rendered.contains("panel 9") && rendered.contains("notes 9"));
 }
 
-/// The fold asks the block type, never the text.
-///
-/// A user quoting a panel back at the engine writes an ordinary text block that
-/// opens with the panel's heading. Matching that prefix collapsed the message
-/// to the superseded-panel note, and the request lost what the user asked.
 #[test]
 fn a_user_message_opening_with_the_panel_heading_survives() {
     let mut messages = vec![user(&panel_of("what does this row mean?"))];
@@ -609,7 +531,6 @@ fn a_user_message_opening_with_the_panel_heading_survives() {
     assert_eq!(wire(&messages), before);
 }
 
-/// Collapsing is idempotent, so a round that appended nothing changes nothing.
 #[test]
 fn collapsing_twice_changes_nothing_the_second_time() {
     let mut messages = vec![user("the request")];
@@ -618,8 +539,6 @@ fn collapsing_twice_changes_nothing_the_second_time() {
     assert_eq!(collapse_tail_blocks(&mut messages, false), 0);
 }
 
-/// Invariant 40. The penultimate cache breakpoint sits on last round's
-/// assistant message, so folding it every round destroys the anchor.
 #[test]
 fn assistant_spans_fold_only_on_a_sweep_round() {
     let reply = format!(
@@ -641,8 +560,6 @@ fn assistant_spans_fold_only_on_a_sweep_round() {
     assert!(folded.contains("Back shortly."));
 }
 
-/// Invariant 13. An engine block is overwritten whole. The model's reply is
-/// spliced instead, so its prose and its next action survive.
 #[test]
 fn an_engine_block_is_overwritten_and_a_reply_is_spliced() {
     let span = format!(
@@ -663,9 +580,6 @@ fn an_engine_block_is_overwritten_and_a_reply_is_spliced() {
     assert!(!rendered.contains("engine rendering"));
 }
 
-/// The row cap and the size floor mean opposite things. An item too big for
-/// the table is where letting go pays MOST. Calling it "under 500 chars" sends
-/// the model away from its biggest win.
 #[test]
 fn a_row_capped_item_is_not_called_too_small() {
     let items: Vec<PanelItem> = (0..MAX_ROWS + 6).map(|i| item(i as u8, 5_000, 0)).collect();
@@ -680,7 +594,6 @@ fn a_row_capped_item_is_not_called_too_small() {
     );
 }
 
-/// The two reasons are reported apart when both apply.
 #[test]
 fn the_two_elision_reasons_are_counted_separately() {
     let mut items: Vec<PanelItem> = (0..MAX_ROWS + 3).map(|i| item(i as u8, 5_000, 0)).collect();

@@ -6,8 +6,6 @@ use crate::support::{
 use serde_json::json;
 use uuid::Uuid;
 
-// Test helper mirrors the full `seed-change-for-test` endpoint payload one-to-one;
-// a struct wrapper would just duplicate the JSON shape with no readability gain.
 #[allow(clippy::too_many_arguments)]
 async fn seed_change_for_test(
     client: &reqwest::Client,
@@ -44,10 +42,6 @@ async fn seed_change_for_test(
     );
 }
 
-/// Regression: the frontend had `MissingHardeningDetected` wired as an
-/// exchange-start event but the engine never emitted it, so hardening
-/// collapsed into the prior CC response. Applying an unhardened change
-/// must emit it before any further work, ahead of `ChangeApplyFailed`.
 #[tokio::test]
 async fn apply_unhardened_change_emits_missing_hardening_detected() {
     let client = user_client().await;
@@ -124,7 +118,6 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
     assert_eq!(requested["branch_name"], branch);
     assert_eq!(requested["repo_root"], repo_root);
 
-    // Cleanup
     let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")
         .bind(thread_id)
         .execute(&pool)
@@ -141,10 +134,6 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
     pool.close().await;
 }
 
-/// The implementation-plan floor: a Lucidos-source change with NO Planned
-/// marker must be refused at Apply (hard block, no auto-recovery), even when it
-/// IS hardened. Mirrors `apply_unhardened_change_emits_missing_hardening_detected`
-/// but opts out of the seed's default marker via `planned: false`.
 #[tokio::test]
 async fn apply_unplanned_change_is_blocked() {
     let client = user_client().await;
@@ -162,7 +151,6 @@ async fn apply_unplanned_change_is_blocked() {
 
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
 
-    // Seed a hardened change but explicitly WITHOUT a plan marker.
     let seed_url = format!("{}/api/v1/internal/seed-change-for-test", base_url());
     let seed = client
         .post(&seed_url)
@@ -204,7 +192,6 @@ async fn apply_unplanned_change_is_blocked() {
         body
     );
 
-    // ChangeApplyFailed must be recorded for the timeline.
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE aggregate_id = $1::text AND event_type = 'ChangeApplyFailed'",
     )
@@ -214,7 +201,6 @@ async fn apply_unplanned_change_is_blocked() {
     .expect("count query failed");
     assert_eq!(n, 1, "a refused apply announces itself once, found {n}");
 
-    // Cleanup
     let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")
         .bind(thread_id)
         .execute(&pool)
@@ -230,12 +216,6 @@ async fn apply_unplanned_change_is_blocked() {
     pool.close().await;
 }
 
-/// One refused apply draws ONE "Change failed" card, on the Apply Now route.
-///
-/// Apply Now with no live session applies the thread's pending changes through
-/// `apply_change`, which announces its own refusal. It then emitted a second
-/// `ChangeApplyFailed` of its own, so the thread showed the same failure twice.
-/// The plan floor is the refusal used here because it needs no git state.
 #[tokio::test]
 async fn apply_now_announces_a_refused_apply_once() {
     let client = user_client().await;
@@ -272,9 +252,6 @@ async fn apply_now_announces_a_refused_apply_once() {
         .expect("seed request failed");
     assert!(seed.status().is_success(), "seed failed: {}", seed.status());
 
-    // No live session for this thread, so this takes the fast path: apply the
-    // pending change directly. It awaits the apply, so both emits of the bug
-    // had landed by the time the response came back.
     let url = format!(
         "{}/api/v1/claude-code/apply-now?thread_id={}",
         base_url(),
@@ -300,7 +277,6 @@ async fn apply_now_announces_a_refused_apply_once() {
         "Apply Now must announce a refused apply once, found {n} ChangeApplyFailed events"
     );
 
-    // Cleanup
     let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")
         .bind(thread_id)
         .execute(&pool)
@@ -316,10 +292,6 @@ async fn apply_now_announces_a_refused_apply_once() {
     pool.close().await;
 }
 
-/// The plan-approval round-trip over the internal HTTP surface: recording a
-/// plan lands the awaiting-approval `proposed` state (gate NOT satisfied), and
-/// only `approve-plan` flips it to `SATISFIED`. Exercises the three-way
-/// `planned-state` wire contract the cc-plan-gate hook depends on.
 #[tokio::test]
 async fn plan_marker_proposed_then_approved_round_trip() {
     let client = local_process_client();
@@ -349,10 +321,8 @@ async fn plan_marker_proposed_then_approved_round_trip() {
         }
     };
 
-    // No marker yet.
     assert_eq!(read_state(branch.clone()).await, "MISSING");
 
-    // The skill records `proposed` — present but NOT gate-satisfying.
     let mark = client
         .post(format!("{}/api/v1/internal/mark-planned", base_url()))
         .json(&json!({
@@ -368,7 +338,6 @@ async fn plan_marker_proposed_then_approved_round_trip() {
     assert_eq!(mark.status(), 204, "mark-planned must return 204");
     assert_eq!(read_state(branch.clone()).await, "PROPOSED");
 
-    // Approve flips proposed -> planned (SATISFIED).
     let approve = client
         .post(format!("{}/api/v1/internal/approve-plan", base_url()))
         .json(&json!({ "repo_root": repo_root, "branch_name": branch }))
@@ -378,14 +347,12 @@ async fn plan_marker_proposed_then_approved_round_trip() {
     assert!(approve.status().is_success());
     let approve_body: serde_json::Value = approve.json().await.expect("approve-plan non-JSON");
     assert_eq!(approve_body["approved"], json!(true));
-    // Wire contract: `lucidos planned approve` marks this file Approved.
     assert_eq!(
         approve_body["plan_path"],
         json!("docs/plans/2026-06-19-e2e.md")
     );
     assert_eq!(read_state(branch.clone()).await, "SATISFIED");
 
-    // Re-approving an already-planned branch is a no-op (approved: false).
     let reapprove = client
         .post(format!("{}/api/v1/internal/approve-plan", base_url()))
         .json(&json!({ "repo_root": repo_root, "branch_name": branch }))
@@ -395,7 +362,6 @@ async fn plan_marker_proposed_then_approved_round_trip() {
     let reapprove_body: serde_json::Value = reapprove.json().await.expect("non-JSON");
     assert_eq!(reapprove_body["approved"], json!(false));
 
-    // Cleanup the marker row (keyed on canonical repo_root).
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -410,13 +376,6 @@ async fn plan_marker_proposed_then_approved_round_trip() {
     pool.close().await;
 }
 
-/// The bounded security-fix lane over the internal HTTP surface. It satisfies
-/// the gate with no approval step, which is the whole point, and the engine
-/// refuses a mark whose bound could not be enforced.
-///
-/// The refusal must be a 400 carrying the reason. The caller is an unattended
-/// agent that can correct the call, and a 500 reads as an engine fault it would
-/// retry unchanged.
 #[tokio::test]
 async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bound() {
     let client = local_process_client();
@@ -450,7 +409,6 @@ async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bo
         }
     };
 
-    // A bounded fix with no bound is refused, and leaves no marker behind.
     let no_bound = client
         .post(&mark_url)
         .json(&json!({
@@ -475,8 +433,6 @@ async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bo
     );
     assert_eq!(read_state(branch.clone()).await.0, "MISSING");
 
-    // With a bound it satisfies the gate immediately: no approval step, which
-    // is the deadlock this lane exists to break.
     let marked = client
         .post(&mark_url)
         .json(&json!({
@@ -498,7 +454,6 @@ async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bo
          can tell it from an approved plan",
     );
 
-    // Cleanup the marker row (keyed on canonical repo_root).
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -513,11 +468,6 @@ async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bo
     pool.close().await;
 }
 
-/// The Harden and Apply gates read these markers. So a caller that merely
-/// reaches the engine port must not write them. A device id is no credential
-/// here: any loopback caller can register one, as `user_client` does. Nor is
-/// the gateway's proxied shape, which carries the machine-local token and a
-/// forwarded prefix.
 #[tokio::test]
 async fn a_plain_loopback_caller_cannot_write_a_marker() {
     let device_only = user_client().await;
@@ -584,10 +534,6 @@ async fn a_plain_loopback_caller_cannot_write_a_marker() {
     );
 }
 
-/// Sequential apply of two changes must both succeed.
-/// Regression test: after applying the first change, the working tree was left
-/// dirty (detached HEAD caused `reset --hard HEAD` to target the wrong commit),
-/// causing the second apply to fail with "uncommitted changes".
 #[tokio::test]
 async fn sequential_apply_two_changes_succeeds() {
     let client = user_client().await;
@@ -606,7 +552,6 @@ async fn sequential_apply_two_changes_succeeds() {
     let wt_tmp = tempfile::tempdir().unwrap();
     let wt_dir = wt_tmp.path();
 
-    // Use a worktree to create branches without touching the main working tree
     git(&[
         "worktree",
         "add",
@@ -619,13 +564,11 @@ async fn sequential_apply_two_changes_succeeds() {
     git_in(wt_dir, &["add", &file1]);
     git_in(wt_dir, &["commit", "-m", "e2e test change 1"]);
 
-    // Create branch2 from branch1 with another file (so it's ff-able after branch1)
     git_in(wt_dir, &["checkout", "-b", &branch2]);
     std::fs::write(wt_dir.join(&file2), "change 2").unwrap();
     git_in(wt_dir, &["add", &file2]);
     git_in(wt_dir, &["commit", "-m", "e2e test change 2"]);
 
-    // Remove the worktree (branches are kept)
     let _ = std::process::Command::new("git")
         .args(["worktree", "remove", "--force", wt_dir.to_str().unwrap()])
         .current_dir(&ws)
@@ -633,15 +576,6 @@ async fn sequential_apply_two_changes_succeeds() {
 
     let change1_id = Uuid::new_v4();
     let change2_id = Uuid::new_v4();
-    // One pending change per thread is the production invariant: a CC thread
-    // owns exactly one branch, and `propose_change` reuses the existing
-    // pending change for that branch rather than stacking a second. The
-    // single-change apply endpoint is gated by `available_thread_actions_for`,
-    // which derives Apply from the thread's per-thread change state, and
-    // applying change 1 takes its thread off `proposed`. So each change
-    // must live on its own synthetic thread, exactly as two real CC threads
-    // would. (This test still exercises the regression it was written for:
-    // two sequential applies must leave the working tree clean.)
     let thread1_id = Uuid::new_v4();
     let thread2_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread1_id, "idle").await;
@@ -672,16 +606,9 @@ async fn sequential_apply_two_changes_succeeds() {
     )
     .await;
 
-    // Both applies below put files into the shared workspace working tree,
-    // which the command-checkpoint test snapshots whole; see
-    // `workspace_tree_lock`. A WRITE guard, held across the pair. The point
-    // here is that the SECOND apply follows the first on a clean tree. A read
-    // guard leaves other writers free to dirty it under both.
     let _tree = crate::support::workspace_tree_lock().write().await;
 
-    // Apply change 1
     let url1 = format!("{}/api/v1/changes/{}/apply", base_url(), change1_id);
-    // Sign after the shared tree lock: the setup/wait may outlive a stamp.
     let resp1 = as_stamped_device(client.post(&url1), E2E_DEVICE_ID)
         .send()
         .await
@@ -699,7 +626,6 @@ async fn sequential_apply_two_changes_succeeds() {
         "First apply should not have error: {:?}",
         body1
     );
-    // The response must make verification self-contained — no thread-state poll needed.
     assert_eq!(
         body1["status"], "applied",
         "first apply should report status=applied: {:?}",
@@ -736,7 +662,6 @@ async fn sequential_apply_two_changes_succeeds() {
         body1
     );
 
-    // Apply change 2 — this was the failing case before the fix
     let url2 = format!("{}/api/v1/changes/{}/apply", base_url(), change2_id);
     let resp2 = as_stamped_device(client.post(&url2), E2E_DEVICE_ID)
         .send()
@@ -768,7 +693,6 @@ async fn sequential_apply_two_changes_succeeds() {
         body2
     );
 
-    // Idempotent re-apply — must report status=noop, not silently 200 with empty body.
     let resp_repeat = as_stamped_device(client.post(&url1), E2E_DEVICE_ID)
         .send()
         .await
@@ -789,7 +713,6 @@ async fn sequential_apply_two_changes_succeeds() {
         body_repeat
     );
 
-    // Verify git status is clean
     let status_out = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(&ws)
@@ -806,11 +729,9 @@ async fn sequential_apply_two_changes_succeeds() {
         dirty
     );
 
-    // Verify both test files exist (merged to main)
     assert!(ws.join(&file1).exists(), "file from change 1 should exist");
     assert!(ws.join(&file2).exists(), "file from change 2 should exist");
 
-    // Clean up: remove test files, branches, and DB records
     std::fs::remove_file(ws.join(&file1)).unwrap();
     std::fs::remove_file(ws.join(&file2)).unwrap();
     git(&["add", &file1, &file2]);
@@ -820,7 +741,6 @@ async fn sequential_apply_two_changes_succeeds() {
         &format!("chore: clean up e2e test files ({})", suffix),
     ]);
 
-    // Delete merged branches (apply already deletes them, but be safe)
     let _ = std::process::Command::new("git")
         .args(["branch", "-D", &branch1])
         .current_dir(&ws)
@@ -830,7 +750,6 @@ async fn sequential_apply_two_changes_succeeds() {
         .current_dir(&ws)
         .output();
 
-    // Clean up DB records
     if let Err(e) = sqlx::query("DELETE FROM changes WHERE id = ANY($1)")
         .bind(&[change1_id, change2_id][..])
         .execute(&pool)
@@ -849,7 +768,6 @@ async fn sequential_apply_two_changes_succeeds() {
     pool.close().await;
 }
 
-/// Read a branch's plan or harden marker state over the internal HTTP surface.
 async fn marker_state(
     client: &reqwest::Client,
     route: &str,
@@ -866,7 +784,6 @@ async fn marker_state(
     body["state"].as_str().unwrap_or_default().to_string()
 }
 
-/// POST one change's Apply and return the JSON body, asserting a 200.
 async fn apply_ok(client: &reqwest::Client, change_id: Uuid) -> serde_json::Value {
     let resp = as_stamped_device(
         client.post(format!("{}/api/v1/changes/{}/apply", base_url(), change_id)),
@@ -885,16 +802,6 @@ async fn apply_ok(client: &reqwest::Client, change_id: Uuid) -> serde_json::Valu
     body
 }
 
-/// **The case ADR 0106 feared, end to end (ADR 0249).** A delegating parent,
-/// idle apart from a running child, has its change applied. It then commits
-/// again on the same branch, as it would after the child's completion wakes
-/// it.
-///
-/// That later work must come back as a NEW pending change that applies on its
-/// own: not lost, not folded into the applied one, and not refused as already
-/// merged. The worktree is kept, so the apply takes Tier 2, the path an idle
-/// thread's apply takes. The apply must also clear the branch's plan and
-/// harden markers, so the next change has to earn both gates again.
 #[tokio::test]
 async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
     let client = user_client().await;
@@ -919,7 +826,6 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
     git_in(wt_dir, &["add", &file1]);
     git_in(wt_dir, &["commit", "-m", "e2e parent: first round"]);
 
-    // A delegating parent: idle, with a sub-thread still running.
     let parent = Uuid::new_v4();
     seed_cc_thread_summary(&pool, parent, "idle").await;
     sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
@@ -961,7 +867,6 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
         marker_state(&client, "hardened-state", repo_root, &branch).await,
         "MISSING"
     );
-    // `lucidos hardened sha` prints this field for `/harden`'s merge-only mode.
     let hardened: serde_json::Value = client
         .get(format!("{}/api/v1/internal/hardened-state", base_url()))
         .query(&[("repo_root", repo_root), ("branch_name", branch.as_str())])
@@ -973,7 +878,6 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
         .expect("hardened-state non-JSON");
     assert_eq!(hardened["head_sha"].as_str(), Some(head.trim()));
 
-    // The running child does not withhold the parent's Apply.
     apply_ok(&client, first).await;
 
     assert_eq!(
@@ -987,15 +891,10 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
         "an apply must clear the branch's harden marker"
     );
 
-    // The parent wakes and commits again on the same branch, in the same
-    // worktree the apply kept and reset to main.
     std::fs::write(wt_dir.join(&file2), "second round").unwrap();
     git_in(wt_dir, &["add", &file2]);
     git_in(wt_dir, &["commit", "-m", "e2e parent: second round"]);
 
-    // The proposal path mints a new id, because no pending change is left on
-    // the branch. The one-pending-per-branch index must not trip on the
-    // applied row.
     let second = Uuid::new_v4();
     seed_change_for_test(
         &client,
@@ -1012,8 +911,6 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
 
     let body2 = apply_ok(&client, second).await;
     assert_eq!(body2["files_changed"], 1, "second apply: {body2:?}");
-    // What the second apply landed on main. A catchup merge from a concurrent
-    // test can add a merge commit here, so read subjects, not a count.
     let range = format!(
         "{}..{}",
         body2["previous_commit"].as_str().expect("previous_commit"),
@@ -1045,7 +942,6 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
         "two changes, each applied on its own"
     );
 
-    // Clean up: files, worktree, branch, rows, markers.
     std::fs::remove_file(ws.join(&file1)).unwrap();
     std::fs::remove_file(ws.join(&file2)).unwrap();
     git(&["add", &file1, &file2]);
@@ -1079,12 +975,6 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
     pool.close().await;
 }
 
-/// An in-workspace CC thread with a pending change is NOT archivable — the
-/// archive endpoint returns 409 `parent_has_pending_changes` and emits
-/// nothing. The user must Apply or Discard the change first. Without this
-/// gate, the change row is left pending in the `changes` table while the
-/// thread sits in Archive. Aligns with `resolve_actions`, which already returns [Discard, Apply]
-/// (never Archive) in this state.
 #[tokio::test]
 async fn archive_with_pending_change_is_rejected_409() {
     let client = user_client().await;
@@ -1167,8 +1057,6 @@ async fn archive_with_pending_change_is_rejected_409() {
     pool.close().await;
 }
 
-/// Canceling Apply All with no batch running is a clean 400 (nothing to cancel),
-/// not a 500 or a silent success — the endpoint reports there's nothing running.
 #[tokio::test]
 async fn cancel_apply_all_with_no_batch_returns_bad_request() {
     let client = user_client().await;
@@ -1193,13 +1081,6 @@ async fn cancel_apply_all_with_no_batch_returns_bad_request() {
     );
 }
 
-/// A pending change whose branch diff has gone empty (its commits cancelled
-/// out, so `reconcile_emptied_pending_change` re-synced the row to zero files)
-/// cannot be applied: merging it only pushes no-op commits onto main, and for
-/// an unhardened Lucidos-source change it would spend a whole harden-at-apply
-/// session on an empty diff. `Discard` is the resolution, so the row must
-/// survive the refusal untouched — the engine never resolves a change on the
-/// user's behalf.
 #[tokio::test]
 async fn apply_change_with_no_files_is_rejected_409() {
     let client = user_client().await;
@@ -1261,7 +1142,6 @@ async fn apply_change_with_no_files_is_rejected_409() {
         "the refused change must stay pending for the user to discard"
     );
 
-    // Discard is still available — it is how an empty change is resolved.
     let discard_url = format!("{}/api/v1/changes/{}/discard", base_url(), change_id);
     let discard = client
         .post(&discard_url)
@@ -1281,8 +1161,6 @@ async fn apply_change_with_no_files_is_rejected_409() {
     pool.close().await;
 }
 
-/// Poll a change row's status until it reads `want`, or fail after 10s. The
-/// archive net runs off the request, so its row lands a moment later.
 async fn await_change_status_for_branch(
     pool: &sqlx::PgPool,
     branch: &str,
@@ -1343,9 +1221,6 @@ async fn listed_change_ids(client: &reqwest::Client, list: &str) -> Vec<String> 
         .collect()
 }
 
-/// A set-aside change leaves Review and does not block Archive. Apply refuses
-/// it until it is brought back, and then it merges what was proposed, though
-/// its worktree is long gone (ADR 0328).
 #[tokio::test]
 async fn a_set_aside_change_waits_out_of_the_way_until_brought_back() {
     let client = user_client().await;
@@ -1454,9 +1329,6 @@ async fn a_set_aside_change_waits_out_of_the_way_until_brought_back() {
     pool.close().await;
 }
 
-/// Archiving a thread whose branch holds unproposed work sets that work aside
-/// instead of losing it. A branch the user already decided on is left alone,
-/// so a discarded change never comes back (ADR 0328).
 #[tokio::test]
 async fn archive_sets_aside_unproposed_branch_work_but_never_a_decided_one() {
     let client = user_client().await;
@@ -1499,8 +1371,6 @@ async fn archive_sets_aside_unproposed_branch_work_but_never_a_decided_one() {
     .await
     .expect("seed the discarded change");
 
-    // The decided thread goes first, so its net has run by the time the
-    // orphan's row appears.
     for thread_id in [decided_thread, orphan_thread] {
         let resp = client
             .post(format!("{}/api/v1/threads/archive", base_url()))
@@ -1558,10 +1428,6 @@ async fn archive_sets_aside_unproposed_branch_work_but_never_a_decided_one() {
     pool.close().await;
 }
 
-/// A branch that lands only an implementation plan applies once the plan is
-/// approved, with no hardening: plans have no tests, and hardening runs on the
-/// branch that implements the plan. While the plan awaits approval, Apply
-/// refuses it (ADR 0604).
 #[tokio::test]
 async fn a_plan_only_change_applies_only_once_its_plan_is_approved() {
     let client = user_client().await;
@@ -1646,8 +1512,6 @@ async fn a_plan_only_change_applies_only_once_its_plan_is_approved() {
     pool.close().await;
 }
 
-/// Harden starts a turn. So it refuses a thread whose work does not wait on
-/// hardening, rather than start a turn the Not ready strip never offered.
 #[tokio::test]
 async fn harden_refuses_a_thread_with_no_work_held_for_hardening() {
     let client = user_client().await;
@@ -1671,7 +1535,6 @@ async fn harden_refuses_a_thread_with_no_work_held_for_hardening() {
     pool.close().await;
 }
 
-/// A design marker retains plan-only scope through the approval API.
 #[tokio::test]
 async fn design_plan_approval_never_opens_the_source_edit_gate() {
     let client = local_process_client();
@@ -1725,8 +1588,6 @@ async fn design_plan_approval_never_opens_the_source_edit_gate() {
     pool.close().await;
 }
 
-/// Planning stages belong to the signed subprocess thread, never a device's
-/// claimed thread id or a machine-local shell with no thread attribution.
 #[tokio::test]
 async fn planning_start_requires_process_authority_and_a_calling_thread() {
     let url = format!("{}/api/v1/internal/start-plan", base_url());

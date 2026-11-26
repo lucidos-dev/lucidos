@@ -1,4 +1,4 @@
-//! OpenAI's Decisions API, which answers the typed questions in [`super`] on
+//! INVARIANT: OpenAI's Decisions API, which answers the typed questions in [`super`] on
 //! its own wire.
 //!
 //! One `POST /v1/decisions` carries the model, the state as `input` text, and
@@ -25,19 +25,16 @@ use serde_json::{json, Value};
 use super::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentProvider, NoulAnswer, Question};
 use crate::llm::OPENAI_DEFAULT_BASE_URL;
 
-/// The model the Decisions API answers on.
 pub const OPENAI_DECISIONS_MODEL: &str = "gpt-6-luna";
 
-/// The full Decisions request URL.
 pub(crate) fn decisions_url() -> String {
     format!("{OPENAI_DEFAULT_BASE_URL}/decisions")
 }
 
-/// A judgment provider backed by OpenAI's Decisions API.
 pub struct OpenAiDecisionsProvider {
     url: String,
     model: String,
-    /// Never logged and never formatted into an error. It reaches exactly one
+    /// INVARIANT: Never logged and never formatted into an error. It reaches exactly one
     /// place, the `Authorization` header.
     api_key: String,
     client: reqwest::Client,
@@ -58,8 +55,6 @@ impl OpenAiDecisionsProvider {
     }
 }
 
-/// A Noul's instructions with what yes and no mean appended, since a
-/// `predicate` has no field for them.
 fn predicate_instructions(question: &Question) -> String {
     match question {
         Question::Noul {
@@ -75,10 +70,6 @@ fn predicate_instructions(question: &Question) -> String {
     }
 }
 
-/// Build the request body for one call.
-///
-/// The state goes as text, because `input` takes a string or a message array
-/// and never an object.
 pub(crate) fn build_request_body(
     model: &str,
     state: &Value,
@@ -119,14 +110,12 @@ pub(crate) fn build_request_body(
     })
 }
 
-/// A probability, or `None` for anything outside 0 to 1.
 fn probability(value: Option<&Value>) -> Option<f64> {
     value
         .and_then(Value::as_f64)
         .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
 }
 
-/// One answer read from the array, or `None` when it does not read cleanly.
 fn read_answer(answer: &Value) -> Option<Answer> {
     match answer.get("type").and_then(Value::as_str)? {
         "predicate" => {
@@ -148,11 +137,6 @@ fn read_answer(answer: &Value) -> Option<Answer> {
     }
 }
 
-/// Parse one response body into the answers, what they cost, and what answered.
-///
-/// An answer is kept only when its name is one of the ids asked and it reads
-/// cleanly. A refusal, an unknown type or a malformed number is dropped with a
-/// log line, so it reads as a missing answer.
 pub(crate) fn parse_response(
     body: &str,
     questions: &[(String, Question)],
@@ -224,7 +208,7 @@ impl JudgmentProvider for OpenAiDecisionsProvider {
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {
-            // The body names the offending parameter and never the key, which
+            // INVARIANT: The body names the offending parameter and never the key, which
             // rides in the header.
             return Err(
                 crate::llm::ProviderError::from_http("OpenAI", status.as_u16(), &text).into(),

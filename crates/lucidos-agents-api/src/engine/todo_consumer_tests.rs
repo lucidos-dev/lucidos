@@ -16,15 +16,10 @@ async fn setup() -> (EventBus, Receiver<EmittedEvent>, sqlx::PgPool, String) {
     (bus, rx, pool, db)
 }
 
-/// Drain everything currently buffered in `rx` so a subsequent
-/// assertion sees a clean channel.
 fn drain(rx: &mut Receiver<EmittedEvent>) {
     while rx.try_recv().is_ok() {}
 }
 
-/// Pull the next persisted terminator broadcast out of the channel and
-/// run it through the handler. Keep the match list in sync with
-/// `handle_event` (all four terminators).
 async fn dispatch_next_terminator(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -55,8 +50,6 @@ async fn dispatch_next_terminator_with_background(
     handle_event(bus, pool, &ev, holds_background_work).await;
 }
 
-/// The thread's next persisted event that `pick` accepts. Everything before
-/// it is skipped unhandled.
 async fn next_matching(
     rx: &mut Receiver<EmittedEvent>,
     thread_id: Uuid,
@@ -77,8 +70,6 @@ async fn next_matching(
     }
 }
 
-/// Wait for the thread's next settle and panic on timeout. A missing settle
-/// must fail the test without hanging the suite.
 async fn next_todo_items(
     rx: &mut Receiver<EmittedEvent>,
     thread_id: Uuid,
@@ -145,8 +136,6 @@ async fn emit_response_canceled(bus: &EventBus, pool: &sqlx::PgPool, thread_id: 
     .await;
 }
 
-/// The one subscription shape every wait helper below uses. The wait's
-/// content is irrelevant to the settle; only whether it is live is.
 fn watching() -> Vec<EventSubscription> {
     vec![EventSubscription {
         event_type: "ChangeProposed".into(),
@@ -188,11 +177,6 @@ async fn emit_wait_canceled(bus: &EventBus, thread_id: Uuid, wait_id: Uuid) {
     .expect("emit EventWaitCanceled");
 }
 
-/// Pull the next `EventWaitCanceled` for the thread out of the channel and
-/// run it through the handler.
-///
-/// Pass `holds_background_work: true` to prove the cancel path ignores the
-/// terminator's input. A task without a subscription cannot reopen the thread.
 async fn dispatch_next_cancel(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -206,9 +190,6 @@ async fn dispatch_next_cancel(
     handle_event(bus, pool, &ev, true).await;
 }
 
-/// Feed every event for a short window through the handler and fail if any
-/// of them settles the thread's list. Covers both "this event type is not a
-/// trigger" and "this trigger declined to write".
 async fn assert_nothing_settles(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -241,9 +222,6 @@ async fn assert_nothing_settles(
     }
 }
 
-/// Park the thread the way the reported bug did: an in-progress list, one
-/// live wait, and a terminator that settles the open item to `Waiting`.
-/// Returns with the channel drained past that settle.
 async fn park_on_a_wait(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -370,10 +348,6 @@ async fn handle_event_marks_abandoned_on_response_aborted() {
 
 #[tokio::test]
 async fn handle_event_marks_abandoned_on_response_failed() {
-    // ResponseFailed is in TERMINATOR_EVENT_TYPES — chat turns that die
-    // from upstream LLM errors, OOM-killed bash, or empty assistant text
-    // must also trigger the cleanup. Without this, the most common
-    // failure path leaves stale in_progress items forever.
     let (bus, mut rx, pool, db) = setup().await;
     let thread_id = Uuid::new_v4();
 
@@ -407,17 +381,12 @@ async fn handle_event_marks_abandoned_on_response_failed() {
     teardown_test_db(&db).await;
 }
 
-/// The chat turn tail arms its subscription after emitting the terminator. The
-/// sequence-scoped query cannot see that subscription. The registry keeps the
-/// list Waiting while the build runs.
 #[tokio::test]
 async fn handle_event_settles_to_waiting_when_the_thread_holds_background_work() {
     let (bus, mut rx, pool, db) = setup().await;
     let thread_id = Uuid::new_v4();
 
     seed_in_progress_list(&bus, &pool, thread_id).await;
-    // No EventWaitStarted at all: the wait does not exist yet at terminator
-    // time, which is precisely the window this covers.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseGenerated {
@@ -447,10 +416,6 @@ async fn handle_event_settles_to_waiting_when_the_thread_holds_background_work()
 
 #[tokio::test]
 async fn handle_event_settles_to_waiting_when_the_thread_holds_a_live_event_wait() {
-    // The end-to-end shape of the reported bug, driven through the consumer
-    // rather than the helper: the agent registered a subscription, said so,
-    // and ended its turn. The terminator that means "walked away" for every
-    // other turn means "parked" for this one.
     let (bus, mut rx, pool, db) = setup().await;
     let thread_id = Uuid::new_v4();
 
@@ -482,7 +447,6 @@ async fn handle_event_ignores_unrelated_events() {
     seed_in_progress_list(&bus, &pool, thread_id).await;
     drain(&mut rx);
 
-    // Emit a MessageReceived — not a terminator, must not trigger cleanup.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -505,16 +469,12 @@ async fn handle_event_ignores_unrelated_events() {
     .await
     .expect("emit message");
 
-    // Drain just the MessageReceived; if a TodoListWritten cleanup
-    // followed, we'd see it here and panic.
     assert_nothing_settles(&bus, &pool, &mut rx, thread_id).await;
 
     pool.close().await;
     teardown_test_db(&db).await;
 }
 
-/// Stopping the last subscription unparks the thread without another turn. This
-/// cancellation must settle the list because no later terminator can do it.
 #[tokio::test]
 async fn a_canceled_last_subscription_settles_the_list_to_abandoned() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -539,13 +499,6 @@ async fn a_canceled_last_subscription_settles_the_list_to_abandoned() {
     teardown_test_db(&db).await;
 }
 
-/// Canceling a wait leaves the list Waiting while another wait remains.
-/// Archiving a thread with several subscriptions should settle its list only
-/// once.
-///
-/// Both fall out of the sequence-scoped anti-join plus `settle_to`'s
-/// already-settled short-circuit, with no counting anywhere: at cancel k the
-/// waits above it are still unresolved, so the target is `Waiting` again.
 #[tokio::test]
 async fn a_cascade_of_cancels_settles_once_when_the_last_wait_goes() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -575,10 +528,6 @@ async fn a_cascade_of_cancels_settles_once_when_the_last_wait_goes() {
     teardown_test_db(&db).await;
 }
 
-/// A turn that is live or promised still owns the list, and `Abandoned` is
-/// terminal: settling under it writes a verdict the turn's own terminator
-/// can no longer correct, because by then no item is open. The live case is
-/// `AgentStandDown`, where the agent retires its own watch mid-turn.
 async fn assert_a_turn_owning_the_list_blocks_the_settle(status: &str) {
     let (bus, mut rx, pool, db) = setup().await;
     let thread_id = Uuid::new_v4();
@@ -610,10 +559,6 @@ async fn a_cancel_settles_nothing_while_the_thread_is_paused() {
     assert_a_turn_owning_the_list_blocks_the_settle("paused").await;
 }
 
-/// A delivery and an expiry each write a `PromptInjected` re-entry anchor,
-/// so the re-entered turn's own terminator settles the list. Handling them
-/// here would race it and could stamp terminal `Abandoned` over a list the
-/// agent is in the middle of picking back up.
 #[tokio::test]
 async fn a_delivered_or_expired_wait_is_left_to_the_turn_it_wakes() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -650,10 +595,6 @@ async fn a_delivered_or_expired_wait_is_left_to_the_turn_it_wakes() {
     teardown_test_db(&db).await;
 }
 
-/// A probe that could not run settles nothing, the same rule
-/// `settle_open_todos` already applies to its own two queries. Guessing is
-/// not available here: `Abandoned` is terminal, so a wrong guess cannot be
-/// walked back, and the thread's next terminator asks again.
 #[tokio::test]
 async fn a_failed_turn_state_probe_settles_nothing() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -663,9 +604,6 @@ async fn a_failed_turn_state_probe_settles_nothing() {
     park_on_a_wait(&bus, &pool, &mut rx, thread_id, &[wait_id]).await;
     emit_wait_canceled(&bus, thread_id, wait_id).await;
 
-    // Capture the cancel before the pool goes, so the handler runs against a
-    // real event and a dead pool: the shape of a connection lost between the
-    // broadcast and this async consumer's first query.
     let cancel = next_matching(&mut rx, thread_id, |e| {
         matches!(e, ThreadEvent::EventWaitCanceled { .. })
     })
@@ -678,8 +616,6 @@ async fn a_failed_turn_state_probe_settles_nothing() {
     teardown_test_db(&db).await;
 }
 
-/// A terminator lost to a broadcast lag must still settle the list.
-/// Otherwise its open items read as in progress for good.
 #[tokio::test]
 async fn a_terminator_lost_to_a_lag_still_settles_the_list() {
     use crate::engine::event_bus::{LagReplay, ReplayScope};
@@ -712,8 +648,6 @@ async fn a_terminator_lost_to_a_lag_still_settles_the_list() {
     teardown_test_db(&db).await;
 }
 
-/// The replay list gates live frames too, so the canceled subscription
-/// `handle_event` settles on must be in it.
 #[test]
 fn the_settle_list_names_the_canceled_subscription() {
     let cancel = ThreadEvent::EventWaitCanceled {
@@ -725,9 +659,6 @@ fn the_settle_list_names_the_canceled_subscription() {
     assert!(settle_event_types().contains(&cancel.event_type()));
 }
 
-/// Spawn `child` as a direct child of `parent`, the way the spawn path
-/// does: the child's first `MessageReceived` names the parent, and the
-/// projection opens its row as running.
 async fn spawn_child(bus: &EventBus, parent: Uuid, child: Uuid, wake_mode: Option<WakeMode>) {
     bus.emit(BusEvent::Thread {
         thread_id: child,
@@ -752,8 +683,6 @@ async fn spawn_child(bus: &EventBus, parent: Uuid, child: Uuid, wake_mode: Optio
     .expect("emit the child's MessageReceived");
 }
 
-/// The child's turn ended. Its card on the parent is emitted separately,
-/// so each test picks which card it is.
 async fn finish_child(pool: &sqlx::PgPool, child: Uuid) {
     seed_thread_status(pool, child, "idle").await;
 }
@@ -825,7 +754,6 @@ async fn dispatch_next_child_unpark(
     handle_event(bus, pool, &ev, false).await;
 }
 
-/// Settle `parent`'s in-progress list at a terminator and return its status.
 async fn settle_at_terminator(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -837,8 +765,6 @@ async fn settle_at_terminator(
     next_todo_items(rx, parent).await[0].status
 }
 
-/// The reported shape: an orchestrator spawned children, armed no wait on
-/// purpose, and ended its turn. Returns with the list parked.
 async fn park_on_children(
     bus: &EventBus,
     pool: &sqlx::PgPool,
@@ -867,8 +793,6 @@ async fn a_live_child_at_the_terminator_parks_the_list() {
     teardown_test_db(&db).await;
 }
 
-/// A `no-wake` child still files its report for the parent's next turn, so
-/// the parent is still owed something.
 #[tokio::test]
 async fn a_live_no_wake_child_parks_the_list_too() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -885,8 +809,6 @@ async fn a_live_no_wake_child_parks_the_list_too() {
     teardown_test_db(&db).await;
 }
 
-/// The Thread Queue holds a spawn with no `thread_summaries` row until it
-/// starts, and that spawn will report to the parent all the same.
 #[tokio::test]
 async fn a_queued_spawn_with_no_row_parks_the_list() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -913,8 +835,6 @@ async fn a_queued_spawn_with_no_row_parks_the_list() {
     teardown_test_db(&db).await;
 }
 
-/// A detached child's queue entry still names the old parent in its
-/// request, but the child reports to nobody.
 #[tokio::test]
 async fn a_queued_child_moved_to_top_level_does_not_park_the_list() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -945,8 +865,6 @@ async fn a_queued_child_moved_to_top_level_does_not_park_the_list() {
     teardown_test_db(&db).await;
 }
 
-/// A child that reported before the terminator owes the parent nothing, so
-/// the parent walked away.
 #[tokio::test]
 async fn a_child_that_finished_before_the_terminator_does_not_park_the_list() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -966,8 +884,6 @@ async fn a_child_that_finished_before_the_terminator_does_not_park_the_list() {
     teardown_test_db(&db).await;
 }
 
-/// The consumer is async. A child live at the terminator that reports
-/// before the consumer runs was still live when the response ended.
 #[tokio::test]
 async fn a_child_resolving_after_the_terminator_still_parks_the_list() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -991,8 +907,6 @@ async fn a_child_resolving_after_the_terminator_still_parks_the_list() {
     teardown_test_db(&db).await;
 }
 
-/// The last live child resolving with no turn behind it settles the
-/// parked list, since nothing is owed to the parent any more.
 async fn assert_the_last_child_unpark_abandons(
     resolve: impl FnOnce(Uuid) -> ThreadEvent,
     child_idles: bool,
@@ -1026,8 +940,6 @@ async fn the_last_child_stopping_abandons_the_list() {
     assert_the_last_child_unpark_abandons(child_stopped, true).await;
 }
 
-/// A detached child keeps running, but its result never reaches the
-/// former parent.
 #[tokio::test]
 async fn the_last_child_detached_abandons_the_list() {
     assert_the_last_child_unpark_abandons(child_detached, false).await;
@@ -1058,8 +970,6 @@ async fn one_of_two_children_filing_changes_nothing_and_the_last_settles_once() 
     teardown_test_db(&db).await;
 }
 
-/// A completion wakes the parent, and the woken turn's terminator settles
-/// the list. Settling here would race that turn.
 #[tokio::test]
 async fn a_completed_child_is_left_to_the_turn_it_wakes() {
     let (bus, mut rx, pool, db) = setup().await;
@@ -1106,8 +1016,6 @@ async fn a_child_unpark_settles_nothing_while_the_parent_is_paused() {
     assert_a_turn_owning_the_list_blocks_a_child_unpark("paused").await;
 }
 
-/// The replay list gates live frames too, so every child unpark must be in
-/// it, and the completion must not.
 #[test]
 fn the_settle_list_names_the_child_unparks_and_not_the_completion() {
     let child = Uuid::new_v4();

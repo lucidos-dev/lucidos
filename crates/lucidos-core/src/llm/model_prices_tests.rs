@@ -10,7 +10,6 @@ fn shipped_price(model: &str) -> ModelPrice {
         .unwrap_or_else(|| panic!("{model} is not priced"))
 }
 
-/// A model priced twice is the failure the table exists to prevent.
 #[test]
 fn no_shipped_id_finds_two_rows() {
     let table = shipped_table();
@@ -24,8 +23,6 @@ fn no_shipped_id_finds_two_rows() {
     }
 }
 
-/// `[1m]`, `vendor/` and snapshot ids price as their base model, and a
-/// later minor version does not price as its neighbour.
 #[test]
 fn recorded_model_ids_find_their_row() {
     let table = shipped_table();
@@ -57,9 +54,6 @@ fn an_unknown_model_pays_the_unpriced_shares() {
     );
 }
 
-/// The fallback is the shortest budget, so no Claude row may undercut its
-/// write-to-read ratio at either TTL. Other providers' caches write at other
-/// ratios, and the keep-alive never prices them.
 #[test]
 fn no_claude_row_undercuts_the_fallback() {
     let table = shipped_table();
@@ -71,7 +65,6 @@ fn no_claude_row_undercuts_the_fallback() {
     }
 }
 
-/// The pricing page's ratios, which the keep-alive budget follows.
 #[test]
 fn claude_ratios_match_the_pricing_page() {
     for (id, (five, hour)) in [
@@ -97,8 +90,6 @@ fn every_shipped_card_names_its_source() {
     }
 }
 
-/// A card applies from its `from` day, so a dated price change waits for its
-/// day and history keeps the price it had.
 #[test]
 fn a_dated_card_applies_from_its_day() {
     let table = shipped_table();
@@ -136,8 +127,6 @@ fn with_no_override_the_shipped_cards_stand() {
         .all(|c| c.origin == CardOrigin::Shipped));
 }
 
-/// A newer override card starts on its day. The days before it keep the
-/// shipped price.
 #[test]
 fn a_newer_override_card_leaves_the_past_alone() {
     let before = input_on(&shipped_table(), "claude-opus-5-5", "2026-10-01");
@@ -156,8 +145,6 @@ fn a_newer_override_card_leaves_the_past_alone() {
     assert_eq!(origins, [CardOrigin::Shipped, CardOrigin::Override]);
 }
 
-/// The table reads checked on the newer of the shipped day and the
-/// override's.
 #[test]
 fn the_table_reads_checked_on_the_newest_day() {
     let shipped = shipped_table().checked;
@@ -169,8 +156,6 @@ fn the_table_reads_checked_on_the_newest_day() {
     assert_eq!(with_checked(newer), newer);
 }
 
-/// An override card from the same day as a shipped one replaces it, so it
-/// reprices that card's whole span.
 #[test]
 fn an_override_card_from_the_same_day_replaces_the_shipped_one() {
     let table = shipped_with(
@@ -184,7 +169,6 @@ fn an_override_card_from_the_same_day_replaces_the_shipped_one() {
     assert_eq!(input_on(&table, "claude-opus-5-5", "2026-01-01"), Some(4.5));
 }
 
-/// An override card dated between two shipped cards joins between them.
 #[test]
 fn an_override_card_between_shipped_cards_joins_in_order() {
     let table = shipped_with(
@@ -210,7 +194,6 @@ fn an_override_adds_a_model_the_shipped_table_lacks() {
     assert_eq!(price.cache, table.unpriced_cache_shares, "a free model");
 }
 
-/// A bad override is ignored whole, and says why, rather than half-applied.
 #[test]
 fn an_invalid_override_is_ignored_with_its_reason() {
     for (overlay, reason) in [
@@ -235,8 +218,6 @@ fn an_invalid_override_is_ignored_with_its_reason() {
     }
 }
 
-/// The override file is re-read when it changes, and its removal restores
-/// the shipped cards.
 #[test]
 fn the_override_file_is_reread_on_change() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -260,8 +241,6 @@ fn the_override_file_is_reread_on_change() {
     assert_eq!(opus(&price_table_for(workspace.path())), shipped);
 }
 
-/// The API serves the merged table with each card's origin and the
-/// override's state, in Token Cost's card field names.
 #[test]
 fn the_table_serializes_with_provenance() {
     let table = shipped_with(

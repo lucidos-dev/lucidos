@@ -1,13 +1,3 @@
-//! Anthropic Messages API provider, on one of two hosts: `api.anthropic.com`
-//! directly, or a Claude gateway (`llm::claude_gateway`).
-//!
-//! Shares the entire wire format (request building, cache-control, SSE parsing)
-//! with the Vertex Claude path via [`crate::llm::anthropic_wire`]; this module
-//! only owns the transport: the endpoint, the auth headers, and the retry
-//! loop. Wired into [`crate::llm::routing::RoutingProvider`] for any model the
-//! [`crate::llm::model_registry`] maps to `ProviderKind::Anthropic` or
-//! `ProviderKind::ClaudeGateway`.
-
 pub use super::provider_credentials::{resolve_anthropic_auth, AnthropicAuth, AnthropicAuthSource};
 use crate::llm::claude_gateway::served_models::ServedModels;
 use crate::llm::claude_gateway::{GatewayAccess, GatewayOrigin};
@@ -18,24 +8,12 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// `pub(crate)` so `llm::web_search::anthropic` can share this module's auth
-/// header and API-version constants instead of restating them.
 pub(crate) mod chat;
 
-/// Beta flag that authorizes a Claude subscription OAuth bearer token to call
-/// the Messages API. Required alongside `Authorization: Bearer` for OAuth auth —
-/// shared by the direct provider (`chat.rs`) and the builtin `anthropic` proxy
-/// (`api::proxy_builtin`), so an OAuth credential works through either path.
 pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
-/// The Messages host a provider reaches, with the only credential it may
-/// present there. Host and credential travel together, so neither credential
-/// can reach the other host.
 pub(crate) enum Endpoint {
-    /// `api.anthropic.com`, with a fixed API key or subscription token.
     Direct(AnthropicAuth),
-    /// A Claude gateway, with a bearer its gateway access keeps fresh. It sends
-    /// only a model the gateway serves this account.
     ClaudeGateway {
         origin: GatewayOrigin,
         access: Arc<dyn GatewayAccess>,
@@ -46,14 +24,12 @@ pub(crate) enum Endpoint {
 pub struct AnthropicProvider {
     endpoint: Endpoint,
     model: String,
-    /// Client without a per-request timeout — streaming applies per-chunk
+    /// INVARIANT: Client without a per-request timeout — streaming applies per-chunk
     /// timeouts inside `parse_claude_stream` instead.
     streaming_client: reqwest::Client,
 }
 
 impl AnthropicProvider {
-    /// Build the direct provider; returns `Err` if the reqwest builder rejects
-    /// the configuration so the engine can fail at startup with a logged reason.
     pub fn new(
         auth: AnthropicAuth,
         model: String,
@@ -61,7 +37,7 @@ impl AnthropicProvider {
         Self::with_endpoint(Endpoint::Direct(auth), model)
     }
 
-    /// Build the provider for a Claude gateway. Every request asks `access`
+    /// INVARIANT: Build the provider for a Claude gateway. Every request asks `access`
     /// for its bearer, so a refreshed token takes effect on the next call. The
     /// gateway's model listing is read on first use.
     pub fn claude_gateway(

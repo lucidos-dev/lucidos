@@ -1,20 +1,11 @@
-//! The `threads` tool's actions for what a thread holds unsent: its *draft*
-//! (`drafts`, `submit_draft`) and its *held messages* (`held_messages`). An
-//! agent reads both. It sends a saved draft exactly as saved, and only with
-//! the owner's authority (ADR 0651). Held messages stay read-only.
-
 use super::ToolOutcome;
 use crate::engine::chat::held_messages::HeldMessagesExt;
 use crate::engine::draft_submission::DraftSubmissionExt;
 use crate::engine::LucidosEngine;
 
-/// The `list` row fields the reader fields replace for the model. The full
-/// draft stays one `drafts` call away, by thread id.
 const COMPOSE_FIELDS_THE_MODEL_READS_AS_A_PREVIEW: [&str; 3] =
     ["compose_text", "compose_images", "compose_selection"];
 
-/// Serialise `list` rows for the model with draft preview and canonical wait
-/// evidence. Keep the projected waits as a fallback when liveness is unavailable.
 pub(super) fn list_rows_for_the_model(
     summaries: &[crate::core::store::ThreadSummary],
 ) -> Result<String, String> {
@@ -34,15 +25,11 @@ pub(super) fn list_rows_for_the_model(
             }
         }
     }
-    // Compact JSON, like every tool that returns a JSON array.
     Ok(rows.to_string())
 }
 
 #[easy_ext::ext(UnsentExt)]
 pub(crate) impl LucidosEngine {
-    /// `threads` action `drafts`: every thread holding an unsent draft, or one
-    /// thread's draft with its whole text. Mirrors `GET /api/v1/threads/drafts`
-    /// and `lucidos threads drafts`.
     async fn execute_list_drafts(&self, args: &serde_json::Value) -> ToolOutcome {
         let workspace = self.workspace_name();
         let store = self.event_store();
@@ -83,9 +70,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// `threads` action `submit_draft`: send a saved draft by revision and
-    /// epoch. Mirrors `POST /api/v1/threads/:thread_id/submit-draft` and
-    /// `lucidos threads submit-draft`.
     async fn execute_submit_draft(
         &self,
         args: &serde_json::Value,
@@ -137,9 +121,6 @@ pub(crate) impl LucidosEngine {
         }
     }
 
-    /// `threads` action `held_messages`: every held message still waiting
-    /// behind a human. Mirrors `GET /api/v1/threads/held-messages` and
-    /// `lucidos threads held-messages`.
     async fn execute_list_held_messages(&self, args: &serde_json::Value) -> ToolOutcome {
         let limit = args
             .get("limit")

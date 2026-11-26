@@ -141,14 +141,18 @@ pub fn build_message_origin(
     if let SubprocessOrigin::Subprocess {
         source_thread_id,
         emitting_trigger_id,
+        event_hook,
         ..
     } = subprocess_origin(headers)
     {
-        return Some(MessageOrigin::Api {
-            user_agent,
-            mode: ActorMode::Agent,
-            source_thread_id,
-            emitting_trigger_id,
+        return Some(match event_hook {
+            Some(slug) => MessageOrigin::EventHook { slug },
+            None => MessageOrigin::Api {
+                user_agent,
+                mode: ActorMode::Agent,
+                source_thread_id,
+                emitting_trigger_id,
+            },
         });
     }
     let local_token = super::local_auth::is_local_process(headers);
@@ -492,8 +496,8 @@ pub(crate) enum OwnerAttestation {
     /// A device the gateway stamped, the machine-local token while
     /// `local_auth` says it proves the owner.
     Owner,
-    /// A Lucidos-spawned subprocess: an agent, a script, or the `lucidos` CLI
-    /// one of them runs.
+    /// A Lucidos-spawned subprocess: an agent, a script, an event hook's
+    /// script, or the `lucidos` CLI one of them runs.
     Agent,
     /// Every other caller, the *unattested caller*.
     Unattested,
@@ -512,7 +516,8 @@ pub(crate) fn owner_attestation(headers: &axum::http::HeaderMap) -> OwnerAttesta
         Some(MessageOrigin::Api {
             mode: ActorMode::Agent,
             ..
-        }) => OwnerAttestation::Agent,
+        })
+        | Some(MessageOrigin::EventHook { .. }) => OwnerAttestation::Agent,
         _ => OwnerAttestation::Unattested,
     }
 }

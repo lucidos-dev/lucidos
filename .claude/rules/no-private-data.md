@@ -7,7 +7,7 @@
 ## The public-release boundary
 
 Lucidos publishes to the public mirror `github.com/lucidos-dev/lucidos`.
-The release drops `docs/plans/**`, release machinery and `release-blockers.tsv`,
+The release drops `docs/plans/**` and release machinery,
 and replaces `WORKSPACES.md` with a generic stub.
 `RELEASE_TREE_EXCLUDE_PATHS` is the authoritative exclusion list.
 Everything else ships verbatim, including test fixtures, comments and knowhow.

@@ -1,15 +1,24 @@
 #!/bin/bash
-# A portable release gate. The private TSV is read from main, never the worktree.
-# Columns: id, state, ref, work_item, title, reason. No embedded tabs or newlines.
+# A portable release gate. The Software Factory app keeps the blocker ledger in
+# the workspace event store, keyed by the repository's root commit.
+# release_blockers_ledger.py reads it, and this file judges each row against git.
 # Return 0 for pass, 10 for blocked, 1 for invalid or unreadable input.
+# Sourcing runs no python3 and no CLI, so the public CI job can verify a trailer.
+
+RELEASE_BLOCKERS_LEDGER_PY="${BASH_SOURCE[0]%/*}"
+[ "$RELEASE_BLOCKERS_LEDGER_PY" != "${BASH_SOURCE[0]}" ] || RELEASE_BLOCKERS_LEDGER_PY=.
+RELEASE_BLOCKERS_LEDGER_PY="$RELEASE_BLOCKERS_LEDGER_PY/release_blockers_ledger.py"
 
 release_blockers_check() {
-    local repo="$1" cut="$2" version="$3" ledger_ref="${4:-main}" ledger rows line
+    local repo="$1" cut="$2" version="$3" rows line out snapshot root
+    local -a roots=()
     RELEASE_GATE_VERDICT=error
     RELEASE_GATE_OPEN=0
     RELEASE_GATE_WAIVED=0
-    RELEASE_GATE_LEDGER_COMMIT=""
+    RELEASE_GATE_LEDGER=""
+    RELEASE_GATE_SEQUENCE=""
     RELEASE_GATE_DIGEST=""
+    RELEASE_GATE_SNAPSHOT=""
     RELEASE_GATE_REPORT="RELEASE GATE"
     RELEASE_GATE_WAIVERS=""
     RELEASE_GATE_TRAILER=""
@@ -19,46 +28,39 @@ release_blockers_check() {
 ERROR: invalid version or release commit"
         return 1
     fi
-    RELEASE_GATE_LEDGER_COMMIT="$(git -C "$repo" rev-parse --verify "$ledger_ref^{commit}")" || return 1
-    ledger="$(git -C "$repo" show "$RELEASE_GATE_LEDGER_COMMIT:release-blockers.tsv")" || {
+    for root in $(git -C "$repo" rev-list --max-parents=0 "$cut"); do roots+=(--root "$root"); done
+    snapshot="$(mktemp)" || return 1
+    if ! out="$(python3 "$RELEASE_BLOCKERS_LEDGER_PY" --snapshot "$snapshot" "${roots[@]}" 2>&1)"; then
+        rm -f "$snapshot"
         RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
-ERROR: missing blocker ledger"
-        return 1
-    }
-    local blob normalized
-    blob="$(git -C "$repo" rev-parse "$RELEASE_GATE_LEDGER_COMMIT:release-blockers.tsv")" || return 1
-    normalized="$(printf '%s\n' "$ledger" | git -C "$repo" hash-object --stdin)" || return 1
-    if [ "$blob" != "$normalized" ]; then
-        RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
-ERROR: ledger must contain text rows ending in one newline"
+${out:-ERROR: the blocker ledger reader failed}"
         return 1
     fi
-    RELEASE_GATE_DIGEST="${blob:0:12}"
-    if ! rows="$(printf '%s\n' "$ledger" | LC_ALL=C awk -F '\t' '
-        NR == 1 { if ($0 != "id\tstate\tref\twork_item\ttitle\treason") exit 1; next }
-        {
-            if (NF != 6 || $1 !~ /^[a-z0-9]+(-[a-z0-9]+)*$/ || seen[$1]++ ||
-                $4 == "" || $5 == "" || $0 ~ /[\r\001-\010\013\014\016-\037\177]/) exit 1
-            if ($2 == "open") { if ($3 != "-" || $6 != "-") exit 1 }
-            else if ($2 == "fixed") { if ($3 !~ /^[0-9a-f]+$/ || length($3) < 7 || $6 != "-") exit 1 }
-            else if ($2 == "withdrawn") { if ($3 != "-" || $6 == "" || $6 == "-") exit 1 }
-            else if ($2 == "waived") { if ($3 !~ /^[0-9]+\.[0-9]+\.[0-9]+$/ || $6 == "" || $6 == "-") exit 1 }
-            else exit 1
-            print
-        }
-        END { if (NR == 0) exit 1 }
-    ')"; then
+    line="${out%%$'\n'*}"
+    if ! [[ "$line" =~ ^ledger\ ([0-9a-f]{40})\ sequence\ ([0-9]+)$ ]]; then
+        rm -f "$snapshot"
         RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
-ERROR: malformed blocker ledger"
+ERROR: unreadable blocker ledger report"
         return 1
     fi
+    RELEASE_GATE_LEDGER="${BASH_REMATCH[1]}"
+    RELEASE_GATE_SEQUENCE="${BASH_REMATCH[2]}"
+    RELEASE_GATE_DIGEST="$(git -C "$repo" hash-object "$snapshot")" || { rm -f "$snapshot"; return 1; }
+    RELEASE_GATE_DIGEST="${RELEASE_GATE_DIGEST:0:12}"
+    RELEASE_GATE_SNAPSHOT="$(cat "$snapshot")"
+    rows="$(tail -n +2 "$snapshot")"
+    rm -f "$snapshot"
+    RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
+Ledger ${RELEASE_GATE_LEDGER:0:12} at sequence $RELEASE_GATE_SEQUENCE, digest $RELEASE_GATE_DIGEST"
+    [ "$out" = "$line" ] || RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
+${out#*$'\n'}"
     local id state ref work_item title reason status
     while IFS=$'\t' read -r id state ref work_item title reason; do
         [ -n "$id" ] || continue
         status="$state"
         case "$state" in
             fixed)
-                if ! git -C "$repo" rev-parse --verify "$ref^{commit}" >/dev/null 2>&1; then
+                if ! git -C "$repo" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1; then
                     RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
 ERROR: $id has an unresolved fix"
                     return 1
@@ -70,6 +72,7 @@ ERROR: $id has an unresolved fix"
                     RELEASE_GATE_OPEN=$((RELEASE_GATE_OPEN + 1))
                 fi ;;
             open) RELEASE_GATE_OPEN=$((RELEASE_GATE_OPEN + 1)) ;;
+            withdrawn) ;;
             waived)
                 if [ "$ref" = "$version" ]; then
                     RELEASE_GATE_WAIVED=$((RELEASE_GATE_WAIVED + 1))
@@ -80,7 +83,12 @@ ERROR: $id has an unresolved fix"
                     status="waiver is only for $ref"
                     RELEASE_GATE_OPEN=$((RELEASE_GATE_OPEN + 1))
                 fi ;;
+            *)
+                RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
+ERROR: $id is in state $state"
+                return 1 ;;
         esac
+        [ "$reason" != - ] || reason=""
         RELEASE_GATE_REPORT="$RELEASE_GATE_REPORT
 $id: $status: $title [$work_item]${reason:+ ($reason)}"
     done <<ROWS
@@ -108,6 +116,8 @@ release_gate_verify_trailer() {
         || [[ "$trailer" =~ ^Release-Gate:\ waived\ open=0\ waived=[1-9][0-9]*\ ledger=[0-9a-f]{12}$ ]]
 }
 
+# The tag keeps the whole snapshot, so each release's ledger survives on origin.
 release_gate_tag_message() {
     printf 'Release v%s\n\n%s\n' "$1" "$RELEASE_GATE_REPORT"
+    [ -z "${RELEASE_GATE_SNAPSHOT:-}" ] || printf '\nLedger snapshot:\n%s\n' "$RELEASE_GATE_SNAPSHOT"
 }

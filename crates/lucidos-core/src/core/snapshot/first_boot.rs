@@ -1,12 +1,9 @@
-//! Restricted restore boot: no Engine, HTTP, scheduler, recovery or dispatch.
+//! INVARIANT: Restricted restore boot: no Engine, HTTP, scheduler, recovery or dispatch.
 //! Forward verification deliberately does not unblock normal boot: Phase 6
 //! must durably settle the restored log and install the restore generation first.
 use super::{restore_database, BoxError};
 use crate::core::secret_store::{boot, key_store::KeyStore};
 
-/// Restricted first-boot capability. The borrow prevents releasing workspace
-/// ownership while verification or restored-log settlement still holds the
-/// archive lock. Dropping this capability never completes the journal.
 pub struct RestoreBoot<'owner> {
     store: super::store::Store,
     _archive_lock: super::store::StoreLock,
@@ -15,8 +12,6 @@ pub struct RestoreBoot<'owner> {
     database: String,
 }
 
-/// Verified capability retained through construction and restored settlement.
-/// Its private fields prevent a caller from bypassing restricted verification.
 pub struct VerifiedRestoreBoot<'owner> {
     guard: RestoreBoot<'owner>,
     boundary: super::boundary::Boundary,
@@ -42,8 +37,6 @@ impl VerifiedRestoreBoot<'_> {
         Ok(())
     }
 
-    /// Called only after restored-log settlement, while dispatch is closed.
-    /// This deliberately does not complete the journal or release dispatch.
     pub async fn announce_restored(
         &self,
         bus: &crate::engine::event_bus::EventBus,
@@ -128,7 +121,7 @@ impl VerifiedRestoreBoot<'_> {
         Ok(())
     }
 
-    /// Consume restricted ownership only after both announcements are durable.
+    /// INVARIANT: Consume restricted ownership only after both announcements are durable.
     /// A crash between the external save and marker removal retries Completed
     /// without repeating events. Returning releases the archive lock before
     /// normal archive-job recovery attempts to acquire it.
@@ -152,7 +145,7 @@ impl VerifiedRestoreBoot<'_> {
     }
 }
 
-/// Only the two independently authenticated restore origins may announce a
+/// INVARIANT: Only the two independently authenticated restore origins may announce a
 /// restore. Freeze display metadata in external evidence, never re-resolve it
 /// after a lost append (the restored database may contain a different name).
 async fn restore_actor_label(
@@ -173,8 +166,6 @@ async fn restore_actor_label(
 }
 
 impl<'owner> RestoreBoot<'owner> {
-    /// The gateway registry binds all three identities before a database is
-    /// opened. A bare engine cannot use a restored marker as authority.
     pub fn acquire(
         owner: &'owner lucidos_owner_lock::OwnerLock,
         workspace: &std::path::Path,
@@ -224,8 +215,6 @@ impl<'owner> RestoreBoot<'owner> {
         })
     }
 
-    /// Migrations, current access and key verification precede the durable
-    /// generation. This is still no permission to start a driver or HTTP.
     pub async fn verify(self, pool: sqlx::PgPool) -> Result<VerifiedRestoreBoot<'owner>, BoxError> {
         verify_owned(pool.clone(), self.database.clone()).await?;
         let boundary = self.install_boundary(&pool).await?;
@@ -243,7 +232,6 @@ impl<'owner> RestoreBoot<'owner> {
     }
 }
 
-/// Durable handoff to restored-log settlement, never permission to boot normally.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Marker {
@@ -252,8 +240,6 @@ pub struct Marker {
     pub restored_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Read the handoff without following redirected paths or allocating from an
-/// unbounded file. Absence is distinct from an unreadable or malformed marker.
 pub fn read_marker(workspace: &std::path::Path) -> Result<Option<Marker>, BoxError> {
     use std::io::Read;
     let runtime = workspace.join(".lucidos");
@@ -283,7 +269,7 @@ pub fn read_marker(workspace: &std::path::Path) -> Result<Option<Marker>, BoxErr
         .map_err(|_| "snapshot_marker_invalid".into())
 }
 
-/// Bind a first-boot handoff to the external journal. This is deliberately not
+/// INVARIANT: Bind a first-boot handoff to the external journal. This is deliberately not
 /// a boot permit: the caller still has to settle restored work durably before
 /// changing the journal to Completed. Call under the workspace owner lock and
 /// archive lock so the offline worker cannot change the handoff concurrently.
@@ -356,7 +342,6 @@ pub fn remove_marker(workspace: &std::path::Path) -> Result<(), BoxError> {
     }
 }
 
-/// Run SQLx's migration future locally while the caller retains its owner lock.
 pub async fn verify_owned(pool: sqlx::PgPool, database: String) -> Result<(), BoxError> {
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -479,8 +464,6 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        // Changes to external exemptions after a lost append cannot change
-        // the payload associated with this restore's stable event identity.
         std::fs::create_dir_all(trees.join("later-thread")).unwrap();
         worktree_exemptions::preserve(verified.guard.store.root(), &workspace).unwrap();
         sqlx::query("DROP TRIGGER refuse_event ON events")
@@ -571,7 +554,6 @@ mod tests {
         let workspace = tree.path().join("workspace");
         let store = Store::at(tree.path().join("store"), "demo").unwrap();
         let mut journal = pending_fixture(&workspace, &store);
-        // Decode the exact evidence shape written before visible attribution.
         let notification_id = uuid::Uuid::new_v4();
         journal.announcement = Some(
             serde_json::from_value::<RestoreAnnouncement>(
@@ -628,8 +610,6 @@ mod tests {
         let competitor = Store::existing_at(store_root, "demo".into()).unwrap();
         assert!(competitor.try_lock().is_err());
         assert!(boundary::read(&pool).await.unwrap().is_none());
-        // Exercise the same verification and boundary order with disposable
-        // keys. No host keystore or live workspace is involved.
         verify(&pool, &database, &TestKeyStore).await.unwrap();
         let first = guard.install_boundary(&pool).await.unwrap();
         assert_eq!(first.restore_id, journal.restore_id);
@@ -757,7 +737,6 @@ mod tests {
         let (marker, found) = pending_restore(&workspace, &store).unwrap().unwrap();
         assert_eq!(found.restore_id, journal.restore_id);
         assert_eq!(marker.snapshot, journal.snapshot);
-        // Completing the journal before removing the marker is crash-safe.
         journal.advance(Phase::Completed).unwrap();
         store.save_journal(&journal).unwrap();
         assert!(pending_restore(&workspace, &store).unwrap().is_some());
@@ -868,7 +847,6 @@ mod tests {
             "snapshot_first_boot_failed"
         );
         verify(&pool, &database, &TestKeyStore).await.unwrap();
-        // Repeating after access staging was consumed is safe.
         verify(&pool, &database, &TestKeyStore).await.unwrap();
         pool.close().await;
         teardown_test_db(&database).await;

@@ -20,18 +20,12 @@ use uuid::Uuid;
 
 const ENV_VAR: &str = "LUCIDOS_CACHE_PROBE";
 
-/// Correlation for one LLM call, carried on the task rather than through
-/// `LlmProvider::chat`. The trait is provider-agnostic and a diagnostic must
-/// not widen it. Scoped by the agentic loop, so the request line and the
-/// response line join on `(thread_id, turn_id, round)`.
 #[derive(Clone, Copy)]
 pub struct ProbeCall {
     pub thread_id: Uuid,
-    /// The turn's `request_event_id`, which is what `ContextCaptured` rows
+    /// INVARIANT: The turn's `request_event_id`, which is what `ContextCaptured` rows
     /// carry, so the probe log joins straight onto the events table.
     pub turn_id: Uuid,
-    /// Rounds elapsed this turn, 1-based. Round 1 is the first-of-turn call
-    /// whose cache reads are the thing under investigation.
     pub round: usize,
 }
 
@@ -39,9 +33,6 @@ tokio::task_local! {
     static PROBE_CALL: ProbeCall;
 }
 
-/// Run `fut` with `call` visible to the probe. Always wraps, probe on or off:
-/// the adapter is a pass-through poll, and branching on the env var would need
-/// two future types for no measurable gain.
 pub fn scope<F>(call: ProbeCall, fut: F) -> impl std::future::Future<Output = F::Output>
 where
     F: std::future::Future,
@@ -53,7 +44,7 @@ fn current() -> Option<ProbeCall> {
     PROBE_CALL.try_with(|call| *call).ok()
 }
 
-/// Read once: the var cannot change under a running engine, and the emit sites
+/// INVARIANT: Read once: the var cannot change under a running engine, and the emit sites
 /// are on the hot path of every Claude call.
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -64,7 +55,6 @@ fn probe_enabled_value(value: Option<&str>) -> bool {
     value.is_some_and(crate::core::prefs::env_switch_is_on)
 }
 
-/// Emit the request line. Returns before any work when the probe is off.
 pub(crate) fn log_request(
     request: &ClaudeRequest,
     model: &str,
@@ -80,15 +70,12 @@ pub(crate) fn log_request(
     );
 }
 
-/// Emit the response line. Returns before any work when the probe is off.
 pub(crate) fn log_response(meta: &TurnMeta, provider_tag: &str) {
     if !enabled() {
         return;
     }
     crate::log_legacy!("{}", response_line(meta, provider_tag, current()));
 }
-
-// ===== Line builders (pure, so the tests can call them with the probe off) =====
 
 fn request_line(
     request: &ClaudeRequest,
@@ -100,7 +87,7 @@ fn request_line(
     let markers = census(request);
     let tools = request.tools.as_deref().unwrap_or(&[]);
 
-    // Slice to the marker, since only the prefix up to a breakpoint is what
+    // INVARIANT: Slice to the marker, since only the prefix up to a breakpoint is what
     // Anthropic looks up. With no marker there is no cached prefix at all, so
     // the segment is empty and every field describes that same empty prefix.
     // The `_prefix=-` field is what tells the reader the breakpoint went
@@ -149,9 +136,6 @@ fn request_line(
 }
 
 fn response_line(meta: &TurnMeta, provider_tag: &str, call: Option<ProbeCall>) -> String {
-    // `input_tokens` is the witness that `message_start` arrived: the parser
-    // sets it whenever the three usage counts sum above zero. See
-    // `cache_tokens` for why the cache fields need one.
     let saw_usage = meta.input_tokens.is_some();
     format!(
         "[CacheProbe] resp {} provider={} cache_read={} cache_creation={} input={} output={}",
@@ -164,7 +148,7 @@ fn response_line(meta: &TurnMeta, provider_tag: &str, call: Option<ProbeCall>) -
     )
 }
 
-/// Render a cache count, separating a real zero from missing usage.
+/// INVARIANT: Render a cache count, separating a real zero from missing usage.
 ///
 /// The parser records a cache field ONLY when it is non-zero, so a zero read
 /// arrives here as `None`. That is the exact outcome the probe exists to
@@ -188,32 +172,18 @@ fn correlation(call: Option<ProbeCall>) -> String {
             call.round,
             call.round == 1
         ),
-        // A Claude call outside the agentic loop (memory extraction) has no
-        // turn to correlate to. It says so, rather than
-        // borrowing whatever context happens to sit on the task.
         None => "thread=- turn=- round=- first_of_turn=-".to_string(),
     }
 }
 
-// ===== Segment hashing =====
-
-/// Hash and byte length of one cache-prefix segment, computed on the
-/// serialized JSON rather than the struct. A field reorder or a whitespace
-/// change is invisible to the struct and fatal to the cache, so the bytes are
-/// the only honest input.
 fn segment<T: Serialize + ?Sized>(value: &T) -> (String, usize) {
     match serde_json::to_vec(value) {
         Ok(bytes) => (super::stable_prefix::short_hash(&bytes), bytes.len()),
-        // A sentinel rather than the error text, because every field on this
-        // line has to stay whitespace-free for a mechanical diff. The same
-        // failure hits the real request moments later, with a full message.
         Err(_) => ("unserializable".to_string(), 0),
     }
 }
 
-// ===== Marker census =====
-
-/// Every `cache_control` marker in the body, by position, plus where the tools
+/// INVARIANT: Every `cache_control` marker in the body, by position, plus where the tools
 /// and messages prefixes end.
 ///
 /// Deliberately scans ALL messages rather than trusting the placement code to
@@ -260,8 +230,6 @@ fn census(request: &ClaudeRequest) -> Census {
     }
 }
 
-/// The content blocks of a `system` or message `content` value. A bare string
-/// carries no blocks, which is correct: the string form cannot hold a marker.
 fn blocks_of(value: Option<&serde_json::Value>) -> &[serde_json::Value] {
     value
         .and_then(|v| v.as_array())
@@ -271,8 +239,6 @@ fn blocks_of(value: Option<&serde_json::Value>) -> &[serde_json::Value] {
 fn has_marker(block: &serde_json::Value) -> bool {
     block.get("cache_control").is_some()
 }
-
-// ===== Field formatting =====
 
 fn optional(value: Option<&str>) -> &str {
     value.unwrap_or("-")
@@ -294,9 +260,6 @@ fn list(values: &[String]) -> String {
     }
 }
 
-/// Host of `url`, or the whole string when it does not look like a URL. The
-/// Vertex region host is a suspect in its own right: `vertex_region = eu`
-/// resolves to the `aiplatform.eu.rep.googleapis.com` multi-region.
 fn host_of(url: &str) -> &str {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     after_scheme.split('/').next().unwrap_or(after_scheme)

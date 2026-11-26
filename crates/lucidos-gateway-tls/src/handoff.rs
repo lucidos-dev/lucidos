@@ -1,34 +1,16 @@
-//! What a direct client gets over plain HTTP on loopback (ADR 0745).
-//!
-//! Only three answers, and none reads a cookie or calls an API:
-//!
-//! - a navigation gets the hand-off page, which carries this origin's unsent
-//!   work to the https origin (`public/outbox-handoff.js`);
-//! - a same-origin `POST` to [`CLEAR_PATH`] gets `Clear-Site-Data`, for this
-//!   http origin alone;
-//! - everything else gets a `301` to `https://localhost:<port><path>`.
-//!
-//! Only plain loopback serves the clear endpoint. On an https origin it would
-//! let any page wipe the outbox.
-
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::Peer;
 
-/// The clear endpoint. Equal to `names.clearPath` in `outbox-handoff.js`.
 pub(crate) const CLEAR_PATH: &str = "/~/outbox-handoff/clear";
 
-/// The export script, embedded so the page needs no static directory.
 const OUTBOX_HANDOFF_JS: &str = include_str!("../../lucidos-app/public/outbox-handoff.js");
 
-/// The page loads nothing: its script and style are inline, and its one
-/// request is the same-origin clear.
 const PAGE_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; \
                            style-src 'unsafe-inline'; connect-src 'self'";
 
-/// Scheme and host of the origin every answer points to.
 const HTTPS_LOOPBACK: &str = "https://localhost";
 
 pub(crate) fn respond(req: &Request) -> Response {
@@ -79,16 +61,12 @@ pub(crate) fn respond(req: &Request) -> Response {
     }
 }
 
-/// A browser marks a same-origin fetch with `Sec-Fetch-Site`. A request
-/// without it (an old browser, or not a browser) clears nothing.
 fn same_origin(headers: &HeaderMap) -> bool {
     headers
         .get("sec-fetch-site")
         .is_some_and(|site| site == "same-origin")
 }
 
-/// A top-level page load: `Sec-Fetch-Dest: document`, or an `Accept` asking
-/// for HTML from a browser too old to send it.
 fn is_navigation(method: &Method, headers: &HeaderMap) -> bool {
     if method != Method::GET && method != Method::HEAD {
         return false;

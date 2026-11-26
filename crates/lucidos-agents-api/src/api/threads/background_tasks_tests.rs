@@ -1,13 +1,8 @@
-//! Who may reach a thread's background tasks, and what the start response
-//! tells the agent to do next.
-
 use super::*;
 use crate::core::subprocess_origin::{
     init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
 };
 
-/// Headers as a Lucidos-spawned subprocess sends them. The secret is installed
-/// first, or minting returns `None` and every caller reads as untokened.
 fn agent_headers(thread_id: Option<Uuid>) -> HeaderMap {
     init_agent_origin_secret("harden-test-secret".to_string());
     let mut h = HeaderMap::new();
@@ -17,9 +12,6 @@ fn agent_headers(thread_id: Option<Uuid>) -> HeaderMap {
     h
 }
 
-/// The route runs a shell command, so it serves exactly one caller: the
-/// thread's own agent. Another thread's agent, a thread-less subprocess and a
-/// caller with no token are all refused.
 #[test]
 fn only_the_threads_own_agent_may_reach_its_background_tasks() {
     let mine = Uuid::new_v4();
@@ -37,8 +29,6 @@ fn only_the_threads_own_agent_may_reach_its_background_tasks() {
     }
 }
 
-/// Each outcome has a different right next move, and the message is the only
-/// thing the agent reads. Watched: end the turn. Unwatched: do not.
 #[test]
 fn the_start_response_tells_the_agent_what_to_do_next() {
     let watched = start_response(BackgroundTaskStart::Watched {
@@ -83,8 +73,6 @@ fn the_start_response_tells_the_agent_what_to_do_next() {
     );
 }
 
-/// A running task's answer says to wait again. A finished one is the record
-/// `output` prints, untouched.
 #[test]
 fn the_wait_response_adds_the_next_step_only_while_running() {
     let running = wait_response(
@@ -100,8 +88,6 @@ fn the_wait_response_adds_the_next_step_only_while_running() {
     assert_eq!(wait_response("t5", record.clone(), &[]), record);
 }
 
-/// A wait that took a child report carries it, and says to read it. A running
-/// task still says to wait again.
 #[test]
 fn the_wait_response_carries_the_reports_it_took() {
     let report = ChildReport {

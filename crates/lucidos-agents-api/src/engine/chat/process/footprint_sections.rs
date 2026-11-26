@@ -1,9 +1,3 @@
-//! The section registry of the *workspace prompt footprint* (ADR 0413).
-//!
-//! One entry per workspace-grown section of a chat turn. Each one calls the
-//! builder the turn calls, on data from the turn's own loaders. So the report
-//! can never disagree with what a turn sends.
-
 use crate::engine::chat::process::context_sections::ContextSectionInputsExt;
 use crate::engine::tools::capabilities::CapabilitiesExt;
 use std::path::{Path, PathBuf};
@@ -23,12 +17,9 @@ use super::workspace_prompt_footprint as footprint;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Everything the sections are built from, loaded the way a turn loads it.
 #[derive(Default)]
 pub(crate) struct FootprintInputs {
     pub apps: Vec<App>,
-    /// The workspace's own reusable widgets. The built-in ones are system
-    /// prompt footprint, so they ride `built_in_widgets` instead.
     pub reusable_widgets: Vec<App>,
     pub built_in_widgets: Vec<App>,
     pub knowhow: Vec<KnowhowSummary>,
@@ -41,20 +32,13 @@ pub(crate) struct FootprintInputs {
     pub stored_credentials: Vec<CredentialInfo>,
     pub builtin_proxies: String,
     pub files: Vec<String>,
-    /// Each app's own knowhow docs, by app id.
     pub open_app_knowhow: Vec<(String, Vec<KnowhowSummary>)>,
-    /// `[MCP SERVERS]` as a thread with nothing enabled reads it, which is
-    /// what nearly every turn carries.
     pub mcp_server_lines: Vec<String>,
-    /// What each server's tools cost a thread that enables it.
     pub mcp_schemas: Vec<McpSchemaCost>,
-    /// What a thread that enables every server carries, once the MCP ceiling
-    /// applies: the worst case, never every turn.
     pub mcp_worst_case_chars: usize,
     pub mcp_dropped_notice: Option<String>,
 }
 
-/// One MCP server's schemas, as the footprint reports them (ADR 0430).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct McpSchemaCost {
     pub server_id: String,
@@ -63,10 +47,7 @@ pub(crate) struct McpSchemaCost {
     pub threads: McpThreadUse,
 }
 
-/// One section as built: the text the turn would carry, and its items.
 pub(crate) struct BuiltSection {
-    /// `None` for the MCP tool schemas, which ride the tools array and are
-    /// costed by `measured_chars` instead.
     pub text: Option<String>,
     measured_chars: usize,
     pub items: Vec<FootprintItem>,
@@ -81,7 +62,6 @@ impl BuiltSection {
         }
     }
 
-    /// What the section costs the turn.
     pub fn chars(&self) -> usize {
         match &self.text {
             Some(text) => text.chars().count(),
@@ -90,7 +70,6 @@ impl BuiltSection {
     }
 }
 
-/// One registry entry.
 pub(crate) struct SectionSpec {
     pub id: &'static str,
     pub title: &'static str,
@@ -98,9 +77,6 @@ pub(crate) struct SectionSpec {
     pub build: fn(&FootprintInputs) -> BuiltSection,
 }
 
-/// Every workspace-grown section of a chat turn, in prompt order.
-/// `[USER DEVICE & PREFERENCES]` is absent: it is sent whatever the workspace
-/// holds, so it is system prompt footprint.
 pub(crate) const SECTIONS: &[SectionSpec] = &[
     SectionSpec {
         id: "available-apps",
@@ -201,7 +177,6 @@ fn item(kind: ItemKind, id: &str, name: &str, line: &str, clipped_chars: usize) 
     }
 }
 
-/// How much of `written` the shown form leaves out, its ellipsis aside.
 fn clipped(written: &str, shown: &str) -> usize {
     if written == shown {
         return 0;
@@ -233,8 +208,6 @@ fn available_apps(inputs: &FootprintInputs) -> BuiltSection {
     )
 }
 
-/// The lines the workspace's own widgets add to the widgets list. The list's
-/// header rides with the built-in widgets every workspace is sent.
 fn reusable_widgets(inputs: &FootprintInputs) -> BuiltSection {
     let lines: Vec<(&App, String)> = inputs
         .reusable_widgets
@@ -304,8 +277,6 @@ fn knowhow_routing(inputs: &FootprintInputs) -> BuiltSection {
     )
 }
 
-/// Only the user's own instruction: the wrapper, the literacy rules and the
-/// floor are engine text.
 fn response_style(inputs: &FootprintInputs) -> BuiltSection {
     match &inputs.response_style {
         Some(style) => BuiltSection::text(
@@ -407,8 +378,6 @@ fn current_files(inputs: &FootprintInputs) -> BuiltSection {
     )
 }
 
-/// The worst turn: the listing of whichever app has the largest. Each app
-/// with docs is an item, so the report names the one to trim.
 fn open_app_knowhow(inputs: &FootprintInputs) -> BuiltSection {
     let listings: Vec<(&str, String)> = inputs
         .open_app_knowhow
@@ -452,7 +421,7 @@ fn mcp_servers(inputs: &FootprintInputs) -> BuiltSection {
     )
 }
 
-/// What each server's tools cost a thread that enables it, in the unit the
+/// INVARIANT: What each server's tools cost a thread that enables it, in the unit the
 /// request packer and the MCP page count. The section's own figure is the
 /// worst case, every server enabled in one thread, after the MCP ceiling.
 fn mcp_tool_schemas(inputs: &FootprintInputs) -> BuiltSection {
@@ -484,7 +453,6 @@ fn mcp_tools_not_sent(inputs: &FootprintInputs) -> BuiltSection {
     )
 }
 
-/// Build every registry section from `inputs`, with no use evidence yet.
 pub(crate) fn build_sections(
     inputs: &FootprintInputs,
 ) -> Vec<(&'static SectionSpec, BuiltSection)> {
@@ -494,7 +462,6 @@ pub(crate) fn build_sections(
         .collect()
 }
 
-/// The evidence the unused window is judged against, per item kind.
 struct Evidence<'a> {
     apps: UseEvidence,
     widgets: UseEvidence,
@@ -503,12 +470,9 @@ struct Evidence<'a> {
     knowhow_dirs: KnowhowDirs,
     data_dir: PathBuf,
     unused_days: u32,
-    /// Docs an intent loads without a `load_knowhow` call: its `knowhow:`
-    /// ids, and every doc of an app whose intent runs. They count as used.
     intent_knowhow: IntentKnowhow,
 }
 
-/// What `load_knowhow` on an intent id loads with it, for the unused check.
 #[derive(Default)]
 struct IntentKnowhow {
     ids: std::collections::HashSet<String>,
@@ -539,8 +503,6 @@ impl IntentKnowhow {
 }
 
 impl Evidence<'_> {
-    /// Judge an app, reusable widget or knowhow item, and give a knowhow doc
-    /// the path the user edits it at.
     fn judge(&self, item: &mut FootprintItem) {
         let (evidence, path) = match item.kind {
             ItemKind::App => (&self.apps, Some(self.app_manager.manifest_path(&item.id))),
@@ -581,8 +543,6 @@ impl Evidence<'_> {
     }
 }
 
-/// The file a routing-list knowhow id names, in the order `load_knowhow`
-/// resolves it: the workspace's own, the shared folder, then an app's.
 fn knowhow_doc_path(dirs: &KnowhowDirs, id: &str) -> Option<PathBuf> {
     if crate::core::is_path_traversal(id) {
         return None;
@@ -606,8 +566,6 @@ fn knowhow_doc_path(dirs: &KnowhowDirs, id: &str) -> Option<PathBuf> {
 
 #[easy_ext::ext(FootprintSectionsExt)]
 pub(crate) impl LucidosEngine {
-    /// Load what a chat turn's workspace-grown sections are built from, with
-    /// the loaders the turn itself calls.
     async fn footprint_inputs(
         &self,
         intents: Vec<Intent>,
@@ -677,8 +635,6 @@ pub(crate) impl LucidosEngine {
         })
     }
 
-    /// The *workspace prompt footprint* report, beside the system prompt
-    /// footprint for scale.
     async fn workspace_prompt_footprint(&self) -> Result<WorkspacePromptFootprint, BoxError> {
         let limits = FootprintLimits::read(&self.pool).await;
         let capabilities = self.read_turn_capabilities().await;
@@ -714,7 +670,6 @@ pub(crate) impl LucidosEngine {
     }
 }
 
-/// The report from built sections: ceilings applied, items judged.
 fn assemble(
     built: Vec<(&'static SectionSpec, BuiltSection)>,
     limits: &FootprintLimits,

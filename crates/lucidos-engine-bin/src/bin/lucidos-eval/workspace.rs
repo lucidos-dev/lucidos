@@ -1,11 +1,3 @@
-//! Create, seed, digest, boot, stop and tear down one arm's workspace.
-//!
-//! Two guarantees live here and both fail closed. I5: nothing outside a
-//! directory named `eval-…` is ever written to. Seeding exclusively creates
-//! resources; a name collision never authorizes resetting existing data. I1:
-//! the two arms are proved byte-identical, in the three seeded tables and in
-//! the whole data tree, before the first prompt is sent.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,20 +9,10 @@ use crate::arm::Arm;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Every eval workspace directory name starts with this. The harness refuses
-/// anything else. Seeding additionally requires a new directory and database.
 pub const EVAL_WORKSPACE_PREFIX: &str = "eval-";
 
-/// Tables the seed writes and the digest covers. Nothing else is seeded, so
-/// anything else differing between the arms came from the run itself.
 pub const SEEDED_TABLES: [&str; 3] = ["preferences", "memory_entries", "models"];
 
-/// Reject any workspace path the harness is not allowed to touch (I5).
-///
-/// Two things are checked. The final path component is the workspace name the
-/// operator chose, and it must carry the prefix. The path itself must not be a
-/// symlink: a name check alone passes `eval-lean-1` pointing at a live
-/// workspace, and fixture writes would follow it.
 pub fn checked_eval_workspace(path: &Path) -> Fallible<PathBuf> {
     let name = path
         .file_name()
@@ -48,8 +30,6 @@ pub fn checked_eval_workspace(path: &Path) -> Fallible<PathBuf> {
     if !path.is_absolute() {
         return Err(refusal(path, "it is not an absolute path"));
     }
-    // `symlink_metadata` does not follow the link, which is the whole point.
-    // An absent path is fine: the first seed creates it.
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
             return Err(refusal(path, "it is a symlink, and writes would follow"));
@@ -61,8 +41,6 @@ pub fn checked_eval_workspace(path: &Path) -> Fallible<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-/// Claim the directory with an exclusive create. Prefixes and old owner files
-/// never authorize replacing pre-existing data, even when a run label repeats.
 pub fn create_seed_workspace(path: &Path) -> Fallible<()> {
     checked_eval_workspace(path)?;
     let parent = path.parent().ok_or("workspace has no parent")?;
@@ -80,57 +58,22 @@ fn refusal(path: &Path, why: &str) -> Box<dyn std::error::Error + Send + Sync> {
     .into()
 }
 
-/// Longest a run label may be, in bytes.
-///
-/// A Postgres identifier holds 63 bytes. The longest name built here spends 32
-/// of them on `lucidos_`, `eval-`, the separators, `control-tree` and a
-/// five-digit repeat. That leaves 31. The guard is
-/// `the_longest_possible_name_fits_a_postgres_identifier`, which computes the
-/// fixed part rather than trusting this line.
 const MAX_LABEL_BYTES: usize = 31;
 
-/// The highest repeat a run may name.
-///
-/// Five digits, so the longest arm name fits beside the longest label.
 pub const MAX_REPEAT: u32 = 99_999;
 
-/// Hex digits of the digest every derived label ends in.
 const LABEL_DIGEST_HEX: usize = 6;
 
-/// Longest the readable part of a label may be, before its digest.
 const MAX_LABEL_STEM_BYTES: usize = MAX_LABEL_BYTES - LABEL_DIGEST_HEX - 1;
 
-/// What separates one run's arm workspaces from another's.
-///
-/// An **arm** is a context mode and a memory module. The model is a separate
-/// axis. Without it in the name, two runs against different providers
-/// both want `eval-lean-1` and both try to create `lucidos_eval-lean-1`. The
-/// second corrupts or fails against the first.
-///
-/// Sanitised on construction, so every name built from it is already legal as
-/// both a directory basename and a Postgres identifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLabel(String);
 
 impl RunLabel {
-    /// Derive a label from a model id, or from whatever an operator set.
-    ///
-    /// Two parts, always both: a readable stem and a digest of the WHOLE
-    /// source. `claude-opus-5@default` becomes `claude-opus-5-default-` plus
-    /// six hex digits, which is still what an operator recognises when opening
-    /// the database by hand.
-    ///
-    /// **The digest is not only for length.** Sanitising is lossy, so it merges
-    /// ids as readily as truncating does: `gpt-5.6` and `gpt-5-6` reduce to one
-    /// stem, and so does any pair differing only in case or punctuation. Two
-    /// such runs would share a database, which is the isolation this type
-    /// exists to provide. Deriving the digest from the untouched source is what
-    /// makes the label injective, whatever the stem did.
     pub fn derive(source: &str) -> RunLabel {
         let stem = sanitise(source);
         let digest = hex(Sha256::digest(source.as_bytes()).as_slice());
         let digest = &digest[..LABEL_DIGEST_HEX];
-        // Sanitising leaves pure ASCII, so a byte index is a char boundary.
         let stem = match stem.len() > MAX_LABEL_STEM_BYTES {
             true => stem[..MAX_LABEL_STEM_BYTES].trim_end_matches('-'),
             false => &stem,
@@ -141,19 +84,6 @@ impl RunLabel {
         }
     }
 
-    /// The label a results file recorded, for a command that reads one back.
-    ///
-    /// A post-run command must resolve the arm's database from the file rather
-    /// than from its own environment. Otherwise `score` in a shell pinned to
-    /// one model reads the other model's arms.
-    ///
-    /// This is a name read back, never a source to derive from: re-deriving
-    /// would digest the digest and name a database nothing created. Sanitising
-    /// is kept, because it is a no-op on anything [`RunLabel::derive`] wrote
-    /// and it contains a hand-edited results file.
-    ///
-    /// Empty for a run recorded before the label existed. Those workspaces
-    /// carry no label segment at all, so the name comes back out as it went in.
     pub fn recorded(label: &str) -> RunLabel {
         RunLabel(sanitise(label))
     }
@@ -173,10 +103,6 @@ impl std::fmt::Display for RunLabel {
     }
 }
 
-/// Reduce a string to `[a-z0-9-]`, collapsed and trimmed.
-///
-/// Lossy on purpose, so the result reads like the id it came from. What makes a
-/// label unique is the digest beside it, never this.
 fn sanitise(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for ch in source.chars().flat_map(char::to_lowercase) {
@@ -192,17 +118,6 @@ fn sanitise(source: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Directory name for this run's arm and repeat, also its workspace address.
-///
-/// The gateway derives a workspace's slug from its directory basename and its
-/// database from that slug, so this one string decides all three. Every other
-/// name here is built from it rather than spelled again.
-///
-/// The label leads so one run's workspaces sort together, in the picker and in
-/// `ls`. Arm and repeat stay where the eye already reads them.
-///
-/// An empty label drops its segment, which is the name a run recorded before
-/// the label existed used. Scoring or replaying one still has to find it.
 pub fn arm_workspace_name(label: &RunLabel, arm: Arm, repeat: u32) -> String {
     match label.is_empty() {
         true => format!("{EVAL_WORKSPACE_PREFIX}{arm}-{repeat}"),
@@ -210,26 +125,14 @@ pub fn arm_workspace_name(label: &RunLabel, arm: Arm, repeat: u32) -> String {
     }
 }
 
-/// Directory this arm and repeat run in, under the eval root.
 pub fn arm_workspace_path(eval_root: &Path, label: &RunLabel, arm: Arm, repeat: u32) -> PathBuf {
     eval_root.join(arm_workspace_name(label, arm, repeat))
 }
 
-/// Database name for this arm and repeat.
-///
-/// It must be what the gateway derives from the same workspace, or a browsed
-/// arm opens an empty one. See `lucidos_gateway::postgres::database_name`, the
-/// other side of the contract, which this crate cannot call: ADR 0014 §1 keeps
-/// the gateway free of engine and harness dependencies alike.
 pub fn arm_database_name(label: &RunLabel, arm: Arm, repeat: u32) -> String {
     format!("lucidos_{}", arm_workspace_name(label, arm, repeat))
 }
 
-/// Compose the arm's connection string from the base ADR 0087 pins.
-///
-/// The base carries host, port and credentials and never a database name, so
-/// one setting serves every arm and repeat. A trailing slash on the base is
-/// tolerated because an operator will paste one.
 pub fn arm_database_url(pg_base: &str, label: &RunLabel, arm: Arm, repeat: u32) -> String {
     format!(
         "{}/{}",
@@ -238,10 +141,6 @@ pub fn arm_database_url(pg_base: &str, label: &RunLabel, arm: Arm, repeat: u32) 
     )
 }
 
-/// One seeded row, flattened to the pair the digest hashes.
-///
-/// `key` is whatever identifies the row inside its table, and `value` is its
-/// remaining columns rendered in a fixed order. Both are opaque to the digest.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeedRow {
     pub table: String,
@@ -259,10 +158,6 @@ impl SeedRow {
     }
 }
 
-/// Hash the seeded rows into one hex digest.
-///
-/// Sorted first, so the answer does not depend on the order Postgres chose. The
-/// separators are control characters, so no value can forge a row boundary.
 pub fn digest_rows(rows: &[SeedRow]) -> String {
     let mut sorted: Vec<&SeedRow> = rows.iter().collect();
     sorted.sort();
@@ -278,11 +173,6 @@ pub fn digest_rows(rows: &[SeedRow]) -> String {
     hex(hasher.finalize().as_slice())
 }
 
-/// Read the three seeded tables, excluding the permitted differences.
-///
-/// The excluded keys are the rows an arm may differ on, and there are four:
-/// the mode's own flag, the two numbers beside it, and the memory module. They
-/// are filtered in SQL, not by a text scan of a dump.
 pub async fn read_seed_rows(pool: &PgPool) -> Fallible<Vec<SeedRow>> {
     let mut rows = Vec::new();
 
@@ -353,10 +243,6 @@ pub async fn read_seed_rows(pool: &PgPool) -> Fallible<Vec<SeedRow>> {
     Ok(rows)
 }
 
-/// Hash every file under a workspace's `data/` tree, path and content both.
-///
-/// Paths are relative to `data/` and sorted, so two trees agree only when they
-/// hold the same files with the same bytes.
 pub fn fs_digest(workspace: &Path) -> Fallible<String> {
     let root = workspace.join("data");
     let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -393,17 +279,12 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> F
     Ok(())
 }
 
-/// The pair of digests describing one seeded arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedDigest {
     pub db: String,
     pub fs: String,
 }
 
-/// Fail the run when the arms were not seeded identically (I1).
-///
-/// Called before the first prompt of a repeat. A difference here is an
-/// uncontrolled variable, so it aborts rather than being recorded.
 pub fn compare_digests(control: &SeedDigest, lean: &SeedDigest) -> Fallible<()> {
     let mut differences = Vec::new();
     if control.db != lean.db {
@@ -433,7 +314,6 @@ pub fn compare_digests(control: &SeedDigest, lean: &SeedDigest) -> Fallible<()> 
     .into())
 }
 
-/// Install fixtures only into a new data directory. Never clear existing data.
 pub fn install_fixture_tree(workspace: &Path, fixture_root: &Path) -> Fallible<()> {
     checked_eval_workspace(workspace)?;
     let data = workspace.join("data");
@@ -455,54 +335,29 @@ fn copy_tree(from: &Path, to: &Path) -> Fallible<()> {
     Ok(())
 }
 
-/// A booted engine and the port it answers on.
-///
-/// Dropping this does not stop the process. Call [`stop_engine`], so a failure
-/// path can decide whether to leave the engine up for inspection.
 pub struct BootedEngine {
     pub child: std::process::Child,
     pub base_url: String,
 }
 
-/// Create the database exclusively. PostgreSQL refuses a collision atomically;
-/// directory ownership never proves ownership of a same-named database.
 pub fn create_database(pg_base: &str, database: &str) -> Fallible<()> {
     let admin = format!("{}/postgres", pg_base.trim_end_matches('/'));
     psql(&admin, &["-c", &create_database_statement(database)])
 }
 
-/// Slugs contain hyphens, so database identifiers must be quoted.
 fn create_database_statement(database: &str) -> String {
     format!("CREATE DATABASE {}", quote_ident(database))
 }
 
-/// Quote a Postgres identifier, doubling any embedded quote.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Bring the schema up by booting the engine once and stopping it again.
-///
-/// The specification's `--migrate-and-exit` does not exist, and adding it would
-/// be an engine change the plan lists as a non-goal. Boot is the only thing
-/// that runs the migration chain, so boot is what the seed uses.
-///
-/// On a throwaway port, deliberately. This boot exists to run migrations and
-/// dies seconds later, so it must not sit on the port the gateway routes to.
 pub fn migrate_by_booting(engine_bin: &Path, workspace: &Path, database_url: &str) -> Fallible<()> {
-    // No capture: this boot exists to run migrations and never calls a model.
     let engine = boot_engine(engine_bin, workspace, database_url, free_port()?, false)?;
     stop_engine(engine)
 }
 
-/// Start an engine for one arm on `port` and wait until it answers.
-///
-/// `port` is the one the gateway registry holds for this arm. The gateway then
-/// adopts this engine on the first proxy hit, rather than spawning a second one
-/// against the same database. See [`crate::gateway::registered_port`].
-///
-/// The engine publishes its own pidfile once it owns the workspace, which is
-/// what the picker's Stop and the gateway's reclaim read (ADR 0438).
 pub fn boot_engine(
     engine_bin: &Path,
     workspace: &Path,
@@ -518,8 +373,6 @@ pub fn boot_engine(
     let base_url = format!("http://127.0.0.1:{port}");
     let mut child = child;
     if let Err(error) = wait_for_health(&mut child, &base_url, Duration::from_secs(120)) {
-        // Kill it here or it outlives the failed seed, holding a port and a
-        // database connection the next attempt needs.
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
@@ -527,11 +380,6 @@ pub fn boot_engine(
     Ok(BootedEngine { child, base_url })
 }
 
-/// Everything one arm's engine is launched with.
-///
-/// Split out of [`boot_engine`] so a test can read the set without spawning a
-/// process. Both arms boot through that one function, so a pair added here
-/// reaches control and lean alike.
 fn arm_engine_env(
     workspace: &Path,
     database_url: &str,
@@ -547,9 +395,6 @@ fn arm_engine_env(
             OsString::from(FORCE_QUERY_CLASSIFICATION_VALUE),
         ),
         (BIND_LOOPBACK_ENV, OsString::from("1")),
-        // A directly launched engine serves plain http on loopback (decision
-        // 13, `docs/plans/2026-11-19-desktop-window-https.md`). Empty clears a
-        // pair a shell exported.
         ("LUCIDOS_TLS_CERT", OsString::new()),
         ("LUCIDOS_TLS_KEY", OsString::new()),
     ];
@@ -559,62 +404,20 @@ fn arm_engine_env(
     env
 }
 
-/// Makes the arm's engine persist whole `ContextCaptured` bodies.
-///
-/// A capture normally truncates every section head and tail at 8,000 chars, so
-/// its `content_chars` is honest and its body is not. That is fine for the
-/// Context Viewer and useless for replaying a 137,000-char message array, which
-/// is the region a context benchmark is about.
-///
-/// The engine spells the same name in `engine::eval_capture::FULL_CAPTURE_ENV`,
-/// and the name IS the contract. Set on the arms alone, which the classifier
-/// pin below no longer is: the e2e harness sets that one too
-/// (`scripts/lib/e2e.sh`). See ADR 0110 decision 12.
 pub const FULL_CAPTURE_ENV: &str = "LUCIDOS_EVAL_FULL_CAPTURE";
 
-/// Pins the arm's engine to loopback, whatever the machine's bind settings say.
-///
-/// An arm otherwise inherits the gateway bind from `network.toml`, such as a
-/// tailnet address. An engine facing a network refuses every caller without a
-/// credential, and the harness registers its device with none. So the first
-/// request of the run fails with a 401. The harness only ever calls
-/// 127.0.0.1, and a gateway proxies to loopback, so nothing needs the wider
-/// bind. The engine reads the same name in `resolve_bind_choice`.
 const BIND_LOOPBACK_ENV: &str = "LUCIDOS_BIND_LOOPBACK";
 
-/// Pins what the engine's query classifier answers, instead of asking an LLM.
-///
-/// The classifier decides `needs_memory` through a Flash call, so the two arms
-/// disagree from one run to the next. A disagreement voids the whole task pair
-/// ([`crate::analyse::retrieval_disagreed`]), because such a pair measures the
-/// classifier rather than the flag. It cost the last run its two most valuable
-/// tasks. Pinning both arms removes the confound.
 const FORCE_QUERY_CLASSIFICATION_ENV: &str = "LUCIDOS_FORCE_QUERY_CLASSIFICATION";
 
-/// `all`, deliberately, and never `none`.
-///
-/// Long-term memory is one of the three sections the curated context mode can
-/// drop (`MEMORY_SECTION`). Retrieving it on every turn is what gives the mode
-/// something to drop, so `all` exercises the thing under test. `none` would
-/// hide it, and the run would measure a turn the mode barely touches.
 const FORCE_QUERY_CLASSIFICATION_VALUE: &str = "all";
 
-/// Stop an engine and wait for it to go.
 pub fn stop_engine(mut engine: BootedEngine) -> Fallible<()> {
     engine.child.kill()?;
     engine.child.wait()?;
     Ok(())
 }
 
-/// Poll `base_url`, the arm's plain-http loopback origin, until OUR engine
-/// answers, or the deadline passes.
-///
-/// **A healthy port is not proof, so `child` is checked too.** The arm now
-/// boots on the port the gateway routes to, and the gateway may already have
-/// lazy-started an engine of its own there. Ours would then fail to bind and
-/// exit, while the probe passes against the gateway's. The harness would drive
-/// a thread against an engine it does not own, and `stop_engine` would kill an
-/// already-dead child and leave that one running.
 fn wait_for_health(
     child: &mut std::process::Child,
     base_url: &str,
@@ -623,8 +426,6 @@ fn wait_for_health(
     let deadline = std::time::Instant::now() + timeout;
     let url = format!("{base_url}/api/v1/health");
     loop {
-        // Before the probe, so an engine that exited is reported as that rather
-        // than as somebody else's healthy port.
         if let Some(status) = child.try_wait()? {
             return Err(format!(
                 "engine_exited_during_boot: the engine left with {status} before answering \
@@ -652,21 +453,11 @@ fn wait_for_health(
     }
 }
 
-/// A port nothing is listening on right now.
 pub fn free_port() -> Fallible<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
 }
 
-/// Wait until `port` accepts a bind, answering whether it came free in time.
-///
-/// The gateway's stop signals its engine and reaps it on another thread. The
-/// call therefore returns while the port is still held, and a graceful drain
-/// can take seconds. Binding straight away would fail, and the arm would then
-/// boot on no port at all.
-///
-/// A held port fails a bind even with `SO_REUSEADDR`, which is what makes this
-/// probe honest: only `TIME_WAIT` is excused, never a live listener.
 pub fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -680,28 +471,15 @@ pub fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
     }
 }
 
-/// The pins `seed.sql` needs as psql variables.
 pub struct SeedPins<'a> {
     pub model: &'a str,
     pub model_label: &'a str,
     pub model_provider: &'a str,
     pub reasoning_effort: &'a str,
-    /// The model the seed pins the memory tasks to.
     pub background_model: &'a str,
-    /// The context window to declare on the seeded model row, or `None` to let
-    /// the engine infer it from the model id.
-    ///
-    /// This is the budget-pressure knob (ADR 0110 decision 9). The engine
-    /// derives its char budget from the registry row, so declaring a smaller
-    /// window here makes it trim earlier and changes no engine code.
     pub context_window: Option<i64>,
 }
 
-/// Apply `seed.sql` to a freshly migrated database.
-///
-/// `context_window` is passed as the literal `NULL` when unset, so the route
-/// declares no window and `context_window_for` falls back to the prefix map.
-/// Quoting it as an empty string would insert one instead.
 pub fn apply_seed_sql(database_url: &str, seed_sql: &Path, pins: &SeedPins) -> Fallible<()> {
     let window = match pins.context_window {
         Some(window) => window.to_string(),
@@ -730,7 +508,6 @@ pub fn apply_seed_sql(database_url: &str, seed_sql: &Path, pins: &SeedPins) -> F
     )
 }
 
-/// Write the preference rows that make this workspace an arm.
 pub async fn write_arm_preference(
     pool: &PgPool,
     arm: Arm,
@@ -749,8 +526,6 @@ pub async fn write_arm_preference(
     Ok(())
 }
 
-/// The URL reaches psql as libpq's `PG*` env, so its password stays out of
-/// argv, where `ps` shows it to every local user.
 fn psql(database_url: &str, args: &[&str]) -> Fallible<()> {
     let url = lucidos_pg_url::PgUrl::parse(database_url)?;
     let output = std::process::Command::new("psql")
@@ -816,7 +591,6 @@ mod tests {
         assert!(create_seed_workspace(&path).is_err());
     }
 
-    /// I5.
     #[test]
     fn a_workspace_without_the_eval_prefix_is_refused() {
         let err = checked_eval_workspace(Path::new("/tmp/workspaces/dev")).unwrap_err();
@@ -835,8 +609,6 @@ mod tests {
         assert_eq!(checked_eval_workspace(path).unwrap(), path);
     }
 
-    /// I5's other half. A correctly named symlink aimed at a live workspace
-    /// would pass a name check, and fixture writes would follow it.
     #[test]
     fn a_correctly_named_symlink_is_refused() {
         let root = tempfile::tempdir().unwrap();
@@ -878,8 +650,6 @@ mod tests {
         );
     }
 
-    /// The whole point of the label: two providers, one arm, one repeat, and
-    /// nothing shared. Without it both runs create `lucidos_eval-lean-1`.
     #[test]
     fn two_models_never_share_a_workspace_or_a_database() {
         let anthropic = RunLabel::derive("claude-opus-5@default");
@@ -894,9 +664,6 @@ mod tests {
         );
     }
 
-    /// A model id is not a slug, so every separator it carries has to come
-    /// out. The stem still has to read like the id it came from: an operator
-    /// reads it off a run log to open the database by hand.
     #[test]
     fn a_model_id_keeps_a_recognisable_stem() {
         for (id, stem) in [
@@ -920,12 +687,6 @@ mod tests {
         }
     }
 
-    /// Sanitising is lossy, so it merges ids exactly as truncating does.
-    ///
-    /// These pairs differ only in punctuation or case, so every one of them
-    /// reduces to a single stem. Two such runs sharing a database is the
-    /// failure the label exists to prevent, so the digest covers the untouched
-    /// source rather than the stem.
     #[test]
     fn two_ids_that_sanitise_alike_still_get_different_labels() {
         for (left, right) in [
@@ -944,8 +705,6 @@ mod tests {
         }
     }
 
-    /// I5 refuses any workspace that does not carry the prefix, and it is what
-    /// gates dropping a database and clearing a data tree.
     #[test]
     fn a_labelled_workspace_still_carries_the_eval_prefix() {
         let name = arm_workspace_name(&opus(), Arm::CONTROL, 7);
@@ -953,9 +712,6 @@ mod tests {
         assert!(name.ends_with("-control-7"), "{name}");
     }
 
-    /// A Postgres identifier holds 63 bytes, and this one already needs
-    /// quoting for its hyphens. The fixed part is computed rather than assumed,
-    /// so `MAX_LABEL_BYTES` cannot drift away from the real ceiling.
     #[test]
     fn the_longest_possible_name_fits_a_postgres_identifier() {
         let longest_arm = Arm::ALL
@@ -966,8 +722,6 @@ mod tests {
         let name = arm_database_name(&longest_label, longest_arm, MAX_REPEAT);
         assert!(name.len() <= 63, "{} bytes: {name}", name.len());
 
-        // And the label really is the largest piece that can grow, so one more
-        // byte would have spent the last of the headroom.
         let over = RunLabel("z".repeat(MAX_LABEL_BYTES + 1));
         assert_eq!(
             arm_database_name(&over, longest_arm, MAX_REPEAT).len(),
@@ -976,10 +730,6 @@ mod tests {
         );
     }
 
-    /// The same guarantee where TRUNCATION is what would have merged them.
-    ///
-    /// These two ids agree far past the stem cap, so the readable halves come
-    /// out identical and only the digest separates them.
     #[test]
     fn two_long_model_ids_sharing_a_prefix_get_different_labels() {
         let first = RunLabel::derive("some-very-long-provider/experimental-model-alpha-2026");
@@ -993,17 +743,12 @@ mod tests {
         );
     }
 
-    /// Deriving twice gives the same label, or a resume looks for databases
-    /// that were never created.
     #[test]
     fn a_derived_label_is_stable_across_calls() {
         let id = "some-very-long-provider/experimental-model-alpha-2026";
         assert_eq!(RunLabel::derive(id), RunLabel::derive(id));
     }
 
-    /// A recorded label is read back as itself, so a post-run command opens the
-    /// database the run actually wrote. Re-deriving would digest the digest and
-    /// name a database nothing ever created.
     #[test]
     fn a_recorded_label_reads_back_as_the_label_that_was_written() {
         for id in [
@@ -1016,9 +761,6 @@ mod tests {
         }
     }
 
-    /// Scoring a Sol run from a shell pinned to Opus must not open the Opus
-    /// arms. That is what reading the label off the file rather than off the
-    /// environment buys, so the two resolutions have to stay distinguishable.
     #[test]
     fn a_recorded_label_beats_whatever_the_shell_is_pinned_to() {
         let recorded = RunLabel::recorded("gpt-5-6-sol");
@@ -1033,8 +775,6 @@ mod tests {
         );
     }
 
-    /// A run recorded before the label existed named its workspaces without
-    /// one. Scoring or replaying it has to find those names, not new ones.
     #[test]
     fn an_unlabelled_run_keeps_the_name_it_was_created_with() {
         let none = RunLabel::recorded("");
@@ -1043,12 +783,9 @@ mod tests {
             arm_database_name(&none, Arm::LEAN, 1),
             "lucidos_eval-lean-1"
         );
-        // And it still satisfies I5, which is what allows the harness to touch
-        // the directory at all.
         assert!(arm_workspace_name(&none, Arm::CONTROL, 2).starts_with(EVAL_WORKSPACE_PREFIX));
     }
 
-    /// An id with nothing alphanumeric in it still has to name a database.
     #[test]
     fn an_id_that_sanitises_to_nothing_still_yields_a_label() {
         let label = RunLabel::derive("///");
@@ -1056,32 +793,17 @@ mod tests {
         assert!(arm_database_name(&label, Arm::LEAN, 1).len() <= 63);
     }
 
-    /// The contract with the gateway, spelled out because it cannot be called.
-    ///
-    /// `lucidos_gateway::postgres::database_name` returns `lucidos_<slug>`, and
-    /// the slug is `registry::slugify` of the directory basename. This crate
-    /// must not depend on that one (ADR 0014 §1), so the agreement is a literal
-    /// on each side. The gateway's half is
-    /// `database_name_preserves_slug_shape_under_lucidos_prefix`.
-    ///
-    /// Get this wrong and nothing fails loudly. The harness seeds one database
-    /// and the gateway boots the arm against another, empty one.
     #[test]
     fn the_database_name_is_what_the_gateway_derives_from_the_slug() {
-        // A recorded label, so the literals below stay readable. A derived one
-        // ends in a digest, which this test is not about.
         let label = RunLabel::recorded("m");
         assert_eq!(arm_workspace_name(&label, Arm::LEAN, 1), "eval-m-lean-1");
         assert_eq!(
             arm_database_name(&label, Arm::LEAN, 1),
             "lucidos_eval-m-lean-1"
         );
-        // Underscores were the old shape, and the gateway can never produce
-        // one: a slug is `[a-z0-9-]`. Only the `lucidos_` prefix carries one.
         assert!(!arm_workspace_name(&label, Arm::LEAN, 1).contains('_'));
     }
 
-    /// The hyphens the gateway's shape forces have to survive into SQL.
     #[test]
     fn the_hyphenated_database_name_is_quoted_in_every_statement() {
         let name = arm_database_name(&RunLabel::recorded("m"), Arm::LEAN, 1);
@@ -1091,8 +813,6 @@ mod tests {
         );
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
-
-    // ── The classifier pin both arms boot with ───────────────────────────────
 
     fn arm_env() -> Vec<(&'static str, OsString)> {
         arm_engine_env(
@@ -1107,8 +827,6 @@ mod tests {
         env.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
 
-    /// The whole point of the pin: neither arm asks the LLM, so neither can
-    /// answer differently and void the pair.
     #[test]
     fn every_arm_boots_with_the_classifier_pinned_to_all() {
         let env = arm_env();
@@ -1119,8 +837,6 @@ mod tests {
         );
     }
 
-    /// A machine whose gateway binds a tailnet address must not hand that bind
-    /// to an arm, or the arm refuses the harness's first request.
     #[test]
     fn every_arm_boots_pinned_to_loopback() {
         let env = arm_env();
@@ -1130,14 +846,11 @@ mod tests {
         );
     }
 
-    /// `none` would drop the memory section the curated mode is measured on.
     #[test]
     fn the_pin_is_all_and_not_none() {
         assert_eq!(FORCE_QUERY_CLASSIFICATION_VALUE, "all");
     }
 
-    /// The pin is added to the existing set, not in place of it. A boot that
-    /// lost `DATABASE_URL` would come up against the wrong database.
     #[test]
     fn the_pin_did_not_displace_what_the_engine_already_needed() {
         let env = arm_env();
@@ -1155,8 +868,6 @@ mod tests {
         );
     }
 
-    /// A shell that exported the mkcert pair does not leak into an arm: the
-    /// engine's own pair is cleared, so it serves plain http on loopback.
     #[test]
     fn every_arm_serves_plain_http() {
         let env = arm_env();
@@ -1164,13 +875,6 @@ mod tests {
         assert_eq!(value_of(&env, "LUCIDOS_TLS_KEY"), Some(&OsString::new()));
     }
 
-    /// A parallel OpenAI and Vertex run needs both keys live at once.
-    ///
-    /// Each arm's database is created empty, so its `credentials` table has no
-    /// row and every provider falls back to its environment variable. This set
-    /// is passed to `Command::envs`, which ADDS to the inherited environment,
-    /// so both keys reach both arms. Naming one here would be the mistake: the
-    /// harness would then decide which provider an arm can reach.
     #[test]
     fn the_arm_environment_names_no_provider_credential() {
         let env = arm_env();
@@ -1188,8 +892,6 @@ mod tests {
                  cannot reach its own credential"
             );
         }
-        // And the seed writes no credential row either, which is what makes the
-        // env fallback the only route.
         assert!(!SEEDED_TABLES.contains(&"credentials"));
     }
 
@@ -1201,7 +903,6 @@ mod tests {
         assert_eq!(digest_rows(&forward), digest_rows(&backward));
     }
 
-    /// I1: mutating one seeded row makes the comparison fail.
     #[test]
     fn mutating_one_seeded_row_fails_the_digest_comparison() {
         let control = SeedDigest {
@@ -1220,8 +921,6 @@ mod tests {
         assert!(err.contains("the seeded tables"));
     }
 
-    /// I1, the other half: identical seeding passes, and the arm's own
-    /// preference row is not part of what is compared.
     #[test]
     fn identical_seeding_passes_and_the_arm_row_is_excluded() {
         let digest = SeedDigest {

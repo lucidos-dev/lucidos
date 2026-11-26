@@ -1,27 +1,15 @@
-//! The *in-flight append lock*, and the *committed horizon* it makes readable
-//! (ADR 0364).
-//!
-//! An append draws its `sequence` at the INSERT and becomes visible at commit,
-//! so a higher sequence can commit first. `MAX(sequence)` therefore promises
-//! nothing about the rows below it. A reader keeping one global mark needs a
-//! sequence at or below which nothing is still in flight.
-
 use std::time::{Duration, Instant};
 
 use sqlx::{PgPool, Postgres, Transaction};
 
 use super::{AppendTicket, EventBus};
 
-/// Advisory-lock class of the in-flight append lock. The two-key form keeps it
-/// apart from the one-key locks elsewhere in the engine.
 const APPEND_IN_FLIGHT_CLASS: i32 = 0x696e_666c;
 
-/// How long a horizon read waits, in total, for the appends in flight when it
-/// began. Each takes milliseconds, so running out means one of them is stuck.
 const HORIZON_WAIT_TIMEOUT_MS: u64 = 10_000;
 
 impl EventBus {
-    /// Begin a transaction that appends an events row, holding its in-flight
+    /// INVARIANT: Begin a transaction that appends an events row, holding its in-flight
     /// append lock until the transaction ends.
     ///
     /// **The lock must be the transaction's first lock.** A waiter then holds
@@ -46,8 +34,6 @@ impl EventBus {
 
 #[cfg(test)]
 impl EventBus {
-    /// An append transaction for a test to hold open, as a slow append holds
-    /// its sequence before it commits.
     pub(crate) async fn begin_append_for_test(
         &self,
     ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
@@ -55,13 +41,12 @@ impl EventBus {
     }
 }
 
-/// An append's transaction and its ticket, from [`EventBus::begin_append`].
 pub(super) struct Append {
     pub(super) tx: Transaction<'static, Postgres>,
     pub(super) ticket: AppendTicket,
 }
 
-/// The event store's **committed horizon**: a sequence at or below which every
+/// INVARIANT: The event store's **committed horizon**: a sequence at or below which every
 /// events row has committed, or never will. An event-wait watermark is one.
 ///
 /// It reads `MAX(sequence)`, then waits out every append in flight at that
@@ -75,18 +60,14 @@ pub async fn committed_event_horizon(pool: &PgPool) -> Result<i64, sqlx::Error> 
     committed_event_horizon_within(pool, HORIZON_WAIT_TIMEOUT_MS).await
 }
 
-/// [`committed_event_horizon`] with the wait bounded by `timeout_ms`. Running
-/// out is an error, never a guess at a horizon.
 pub(super) async fn committed_event_horizon_within(
     pool: &PgPool,
     timeout_ms: u64,
 ) -> Result<i64, sqlx::Error> {
-    // Outside the waiting transaction, so that transaction holds no lock while
-    // it waits.
     let horizon: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM events")
         .fetch_one(pool)
         .await?;
-    // After the maximum, never before: an append holding its lock at that
+    // INVARIANT: After the maximum, never before: an append holding its lock at that
     // read must be in this list.
     let in_flight: Vec<i32> = sqlx::query_scalar(
         "SELECT objid::integer FROM pg_locks \
@@ -101,7 +82,7 @@ pub(super) async fn committed_event_horizon_within(
         return Ok(horizon);
     }
 
-    // `lock_timeout` bounds one statement, so each key gets only what is left
+    // INVARIANT: `lock_timeout` bounds one statement, so each key gets only what is left
     // of one deadline. At least 1 ms, because zero would disable the timeout.
     // The checkout shares that deadline too. Dropping a checkout is safe,
     // where dropping a lock statement could strand its session lock.
@@ -119,7 +100,7 @@ pub(super) async fn committed_event_horizon_within(
             .bind(format!("{left_ms}ms"))
             .execute(&mut *tx)
             .await?;
-        // Released the moment it is granted, so the read never holds one key
+        // INVARIANT: Released the moment it is granted, so the read never holds one key
         // while waiting on another. A held key would stall that backend's next
         // append, and a cycle through application code could then form.
         sqlx::query("SELECT pg_advisory_lock_shared($1, $2), pg_advisory_unlock_shared($1, $2)")

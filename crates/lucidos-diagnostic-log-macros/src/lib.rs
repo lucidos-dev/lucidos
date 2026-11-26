@@ -1,5 +1,3 @@
-//! Compile-time classification of diagnostic log values.
-
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::{format_ident, quote};
@@ -112,8 +110,6 @@ fn expand(input: Input) -> syn::Result<proc_macro2::TokenStream> {
                 selector.to_string()
             };
             let value = resolve(&selector, &slots)?;
-            // Width and precision arguments carry values too, even if no text
-            // placeholder names them directly.
             let mut rewritten = String::new();
             let mut word = String::new();
             for c in spec.chars() {

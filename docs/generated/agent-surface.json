@@ -4133,6 +4133,7 @@
         "aliases": [],
         "commands": [],
         "flags": [
+          "control",
           "gateway",
           "help",
           "host",
@@ -6508,6 +6509,7 @@
       "EventHookArmed",
       "EventHookDisarmed",
       "EventHookRemoved",
+      "EventHookRefused",
       "AppCreated",
       "AppUpdated",
       "AppDeleted",

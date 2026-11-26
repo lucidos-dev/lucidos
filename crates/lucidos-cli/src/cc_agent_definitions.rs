@@ -1,24 +1,13 @@
-//! Resolves an `Agent` call's `subagent_type` to the definition Claude Code
-//! would launch, for `cc_agent_guard`. It follows Claude Code 2.1.280: the
-//! same directories, the same precedence and the same name matching.
-//!
-//! Every read or parse error skips that file or directory, so a definition
-//! the guard cannot read lets the call through.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
-/// What the guard needs to know about one agent definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentDefinition {
     pub(crate) agent_type: String,
-    /// `background: true`: Claude Code runs it in the background whatever the
-    /// call says, unless background tasks are disabled.
     pub(crate) background: bool,
-    /// `isolation: remote`, which applies when the call sets no isolation.
     pub(crate) remote_isolation: bool,
 }
 
@@ -32,9 +21,6 @@ impl AgentDefinition {
     }
 }
 
-/// Claude Code's built-in agents, none of which sets `background`. A custom
-/// agent of the same name replaces one. Listing them also stops a request for
-/// a built-in from loosely matching a custom agent.
 const BUILT_IN_AGENT_TYPES: [&str; 7] = [
     "general-purpose",
     "Explore",
@@ -45,24 +31,15 @@ const BUILT_IN_AGENT_TYPES: [&str; 7] = [
     "web-fetch",
 ];
 
-/// The type Claude Code launches when the call names none.
 pub(crate) const DEFAULT_AGENT_TYPE: &str = "general-purpose";
 
-/// The session's `--add-dir` list, a JSON array the engine exports
-/// (`runtime::claude_code::CC_ADDITIONAL_DIRECTORIES_ENV`).
 const ADDITIONAL_DIRECTORIES_ENV: &str = "LUCIDOS_CC_ADDITIONAL_DIRECTORIES";
 
-/// The places Claude Code reads agent definitions from.
 pub(crate) struct AgentSources {
-    /// The session's working directory, from the hook payload.
     pub(crate) cwd: PathBuf,
-    /// The project walk stops below it.
     pub(crate) home: Option<PathBuf>,
-    /// `$CLAUDE_CONFIG_DIR`, or `~/.claude`.
     pub(crate) config_dir: Option<PathBuf>,
-    /// The managed-policy directory.
     pub(crate) managed_dir: PathBuf,
-    /// The session's `--add-dir` directories, in order.
     pub(crate) additional_dirs: Vec<PathBuf>,
 }
 
@@ -84,8 +61,6 @@ impl AgentSources {
         }
     }
 
-    /// Only plugin agent types contain `:`, and Claude Code refuses a `:` in
-    /// any other agent's name. So one source set can answer each request.
     fn candidates(&self, subagent_type: &str) -> Vec<AgentDefinition> {
         if subagent_type.contains(':') {
             self.plugin_agents()
@@ -94,8 +69,6 @@ impl AgentSources {
         }
     }
 
-    /// Lowest precedence first: built-in, user, additional directories,
-    /// project, managed policy.
     fn non_plugin_agents(&self) -> Vec<AgentDefinition> {
         let mut agents: Vec<_> = BUILT_IN_AGENT_TYPES
             .iter()
@@ -114,9 +87,6 @@ impl AgentSources {
         agents
     }
 
-    /// `.claude/agents` in the working directory and each parent, up to the
-    /// git root and never including home. A deeper directory wins. A linked
-    /// worktree with no agents directory of its own reads its main checkout's.
     fn project_agent_dirs(&self) -> Vec<PathBuf> {
         let git_root = git_root(&self.cwd);
         let mut dirs = Vec::new();
@@ -156,14 +126,10 @@ impl AgentSources {
             .collect()
     }
 
-    /// Where the session started. The payload's `cwd` follows the shell into a
-    /// subdirectory, while Lucidos always starts Claude Code at the git root.
     fn project_root(&self) -> &Path {
         git_root(&self.cwd).unwrap_or(&self.cwd)
     }
 
-    /// `enabledPlugins` merged over the settings files, a later file
-    /// overriding an earlier one.
     fn enabled_plugin_ids(&self) -> Vec<String> {
         let mut settings_files = Vec::new();
         if let Some(config_dir) = &self.config_dir {
@@ -193,7 +159,6 @@ impl AgentSources {
     }
 }
 
-/// The directories in the engine's JSON array. Anything else yields none.
 fn parse_additional_dirs(value: Option<&str>) -> Vec<PathBuf> {
     value
         .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
@@ -203,14 +168,11 @@ fn parse_additional_dirs(value: Option<&str>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The definition Claude Code launches for `subagent_type`, or `None` when it
-/// names no agent the guard can find.
 pub(crate) fn resolve(subagent_type: &str, sources: &AgentSources) -> Option<AgentDefinition> {
     let active = active_agents(sources.candidates(subagent_type));
     if let Some(exact) = active.iter().find(|a| a.agent_type == subagent_type) {
         return Some(exact.clone());
     }
-    // Claude Code launches a loose match only when exactly one agent has it.
     let wanted = loose_name(subagent_type);
     let mut loose = active
         .iter()
@@ -221,7 +183,6 @@ pub(crate) fn resolve(subagent_type: &str, sources: &AgentSources) -> Option<Age
     }
 }
 
-/// One definition per type: a later definition replaces an earlier one.
 fn active_agents(agents: Vec<AgentDefinition>) -> Vec<AgentDefinition> {
     let mut by_type: HashMap<String, AgentDefinition> = HashMap::new();
     for agent in agents {
@@ -230,8 +191,6 @@ fn active_agents(agents: Vec<AgentDefinition>) -> Vec<AgentDefinition> {
     by_type.into_values().collect()
 }
 
-/// Claude Code's loose form of an agent name: NFKC, lowercase, and without
-/// whitespace, underscores or dash punctuation.
 fn loose_name(name: &str) -> String {
     name.nfkc()
         .filter(|&c| !(c.is_whitespace() || c == '_' || is_dash_punctuation(c)))
@@ -239,7 +198,6 @@ fn loose_name(name: &str) -> String {
         .collect()
 }
 
-/// The Unicode `Pd` category, which Claude Code strips as `\p{Pd}`.
 fn is_dash_punctuation(c: char) -> bool {
     matches!(
         c,
@@ -263,13 +221,10 @@ fn is_dash_punctuation(c: char) -> bool {
     )
 }
 
-/// The nearest directory at or above `cwd` that holds a `.git` entry.
 fn git_root(cwd: &Path) -> Option<&Path> {
     cwd.ancestors().find(|dir| dir.join(".git").exists())
 }
 
-/// The main checkout of a linked worktree, whose `.git` is a file pointing at
-/// `<main>/.git/worktrees/<name>`.
 fn main_checkout(worktree_root: &Path) -> Option<PathBuf> {
     let dot_git = std::fs::read_to_string(worktree_root.join(".git")).ok()?;
     let git_dir = worktree_root.join(dot_git.trim().strip_prefix("gitdir:")?.trim());
@@ -283,8 +238,6 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// A plugin's install directory, from `installed_plugins.json`. A project or
-/// local install counts only for its own project.
 fn install_path(installed: &Value, id: &str, cwd: &Path) -> Option<PathBuf> {
     installed
         .get("plugins")?
@@ -302,8 +255,6 @@ fn install_path(installed: &Value, id: &str, cwd: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The plugin's `agents/` directory plus every path its manifest's `agents`
-/// field names. Types read `<plugin>:<subdirectories>:<name>`.
 fn plugin_agents_at(install_path: &Path, fallback_name: &str) -> Vec<AgentDefinition> {
     let manifest = read_json(&install_path.join(".claude-plugin/plugin.json"));
     let manifest = manifest.as_ref();
@@ -346,13 +297,10 @@ fn plugin_agent(plugin: &str, file: &MarkdownFile) -> Option<AgentDefinition> {
     Some(AgentDefinition {
         agent_type: segments.join(":"),
         background: frontmatter.get("background").is_some_and(Scalar::is_true),
-        // Claude Code honours only `isolation: worktree` from a plugin agent.
         remote_isolation: false,
     })
 }
 
-/// Agents from a user, project or managed-policy directory. Claude Code skips
-/// a file whose frontmatter lacks a usable `name` or a `description`.
 fn directory_agents(dir: &Path) -> Vec<AgentDefinition> {
     markdown_files(dir)
         .iter()
@@ -378,14 +326,11 @@ fn directory_agents(dir: &Path) -> Vec<AgentDefinition> {
 
 struct MarkdownFile {
     path: PathBuf,
-    /// The subdirectories between the scanned root and the file.
     namespace: Vec<String>,
 }
 
-/// Bounds the walk, which follows symlinks, so a symlink loop terminates.
 const MAX_DIRECTORY_DEPTH: usize = 8;
 
-/// Every `.md` file under `root`, in name order. A missing root has none.
 fn markdown_files(root: &Path) -> Vec<MarkdownFile> {
     let mut files = Vec::new();
     collect_markdown_files(root, &mut Vec::new(), &mut files);
@@ -418,8 +363,6 @@ fn collect_markdown_files(dir: &Path, namespace: &mut Vec<String>, files: &mut V
     }
 }
 
-/// A top-level frontmatter value. YAML reads a quoted value as a string and
-/// a plain `true` as a boolean, and Claude Code's `background` accepts both.
 #[derive(Debug, PartialEq, Eq)]
 enum Scalar {
     Quoted(String),
@@ -445,10 +388,6 @@ fn read_frontmatter(path: &Path) -> Option<HashMap<String, Scalar>> {
     parse_frontmatter(&std::fs::read_to_string(path).ok()?)
 }
 
-/// The top-level `key: value` pairs between the opening and closing `---`.
-/// An empty value continued on an indented line takes that line's text, as
-/// YAML does. Nested structure is otherwise skipped: the guard needs only
-/// `name`, `description`, `background` and `isolation`.
 fn parse_frontmatter(content: &str) -> Option<HashMap<String, Scalar>> {
     let mut lines = content.trim_start_matches('\u{FEFF}').lines();
     if lines.next()?.trim_end() != "---" {
@@ -502,8 +441,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// A home with a git repo at `home/repo` and the session in its `app`
-    /// subdirectory, plus separate config and managed-policy directories.
     struct Fixture {
         _tmp: tempfile::TempDir,
         root: PathBuf,
@@ -552,7 +489,6 @@ mod tests {
             self.resolve(subagent_type).is_some_and(|a| a.background)
         }
 
-        /// Installs and enables a plugin in the user scope.
         fn plugin(&self, id: &str, manifest: &str) -> PathBuf {
             let install = self.root.join("plugins").join(id);
             self.write(
@@ -737,7 +673,6 @@ mod tests {
         }
     }
 
-    /// An exact match on the built-in wins over a loose one on a custom agent.
     #[test]
     fn a_built_in_name_does_not_loosely_match_a_custom_agent() {
         let f = Fixture::new();
@@ -770,7 +705,6 @@ mod tests {
         );
     }
 
-    /// Claude Code refuses an ambiguous loose match, so nothing launches.
     #[test]
     fn an_ambiguous_loose_name_resolves_to_nothing() {
         let f = Fixture::new();
@@ -779,7 +713,6 @@ mod tests {
         assert_eq!(f.resolve("CodeReviewer"), None);
     }
 
-    /// YAML reads a plain value continued on the next, indented line.
     #[test]
     fn a_description_on_the_next_line_counts() {
         let f = Fixture::new();
@@ -958,8 +891,6 @@ mod tests {
         );
     }
 
-    /// The session `cwd` is a subdirectory of the project, so the install's
-    /// project is matched at the git root.
     #[test]
     fn a_project_install_counts_only_in_its_project() {
         let f = Fixture::new();

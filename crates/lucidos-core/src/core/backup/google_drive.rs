@@ -15,58 +15,35 @@ use tokio::sync::Mutex;
 const FOLDER_NAME: &str = "Lucidos Backups";
 const DRIVE_FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
 const DRIVE_UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files";
-/// `about` endpoint — `?fields=storageQuota` reports the account's limit/usage.
 const DRIVE_ABOUT_URL: &str = "https://www.googleapis.com/drive/v3/about";
-/// Token introspection — reports the scopes actually granted on the token.
 const GOOGLE_TOKENINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/tokeninfo";
 
-/// Bytes per GB for the user-facing free-space message. Google reports its
-/// quota in binary GB (a "100 GB" plan = 100 GiB) and labels it "GB", so divide
-/// by 1024³ to match the number the user sees in Google's own UI.
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// Chunk size for resumable uploads. Must be a multiple of 256 KiB per Drive's spec.
+/// INVARIANT: Chunk size for resumable uploads. Must be a multiple of 256 KiB per Drive's spec.
 /// 8 MiB balances request count against the cost of re-uploading a failed chunk.
 const RESUMABLE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
-/// Per-chunk retry budget for transient failures (network, 5xx, 408, 429).
 const MAX_RETRIES_PER_CHUNK: u32 = 6;
 
-/// Per-request timeout for chunk PUTs and progress queries. Keeps a hung TCP
-/// connection from blocking the whole backup — with 8 MiB chunks this allows
-/// down to ~70 KB/s before triggering a retry.
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// User-facing message for Drive auth failures. Shared between the metadata-call
-/// path (`check_drive_status`) and the resumable-upload path (`classify_chunk_response`)
-/// so the wording stays in sync.
 const DRIVE_AUTH_401_MSG: &str = "Google Drive authentication failed (401). Go to Settings → System → Backup and click 'Grant access' to re-authorize.";
 const DRIVE_AUTH_403_MSG: &str = "Google Drive access denied (403). Go to Settings → System → Backup and click 'Grant access' to authorize Drive permissions.";
 
-/// Shown when a 403 carries a storage-quota reason — an over-quota failure, NOT
+/// INVARIANT: Shown when a 403 carries a storage-quota reason — an over-quota failure, NOT
 /// an access problem. Must NOT mention "Grant access": the old code mapped EVERY
 /// 403 to `DRIVE_AUTH_403_MSG`, so an over-quota Drive sent the user re-granting
 /// access repeatedly while the real fix was to free space.
 const DRIVE_QUOTA_MSG: &str =
     "Google Drive is full — delete old backups or free space; this is NOT an access problem.";
 
-/// The scope substring a Drive backup needs, matched against the granted-scope
-/// string (the fragment matches the full `.../auth/drive.file` URL). This IS the
-/// provider registry's `required_scopes` entry, so the readiness verdict the
-/// Settings page renders and the preflight below check one list.
 pub const BACKUP_SCOPES: &[&str] = &["drive"];
 
-/// The scope a user actually grants, as opposed to the matcher above. Naming
-/// the matcher to a human would be naming a "drive permission" that appears in
-/// no Google console; this is the string the authorization request carries and
-/// the console lists. See [`super::name_missing_scopes`].
 pub const GRANT_SCOPES: &[&str] = &["https://www.googleapis.com/auth/drive.file"];
 
-/// Shown by preflight when the granted token is missing the required Drive
-/// scope — the ONLY preflight case that should tell the user to re-grant access.
 const DRIVE_SCOPE_MISSING_MSG: &str = "Google Drive backup is missing the required Drive permission. Go to Settings → System → Backup and click 'Grant access' to re-authorize.";
 
-/// Drive-specific resumable-upload headers (reqwest has no constants for these).
 const X_UPLOAD_CONTENT_TYPE: &str = "X-Upload-Content-Type";
 const X_UPLOAD_CONTENT_LENGTH: &str = "X-Upload-Content-Length";
 
@@ -74,8 +51,6 @@ pub struct GoogleDriveBackupProvider {
     pool: PgPool,
     client: reqwest::Client,
     folder_id_cache: Arc<Mutex<Option<String>>>,
-    /// Scopes the token must carry, threaded from the provider registry's
-    /// `required_scopes` so there's a single source of truth for them.
     required_scopes: &'static [&'static str],
 }
 
@@ -96,42 +71,32 @@ struct DriveFileList {
 #[derive(Deserialize)]
 struct DriveCreateResponse {
     id: String,
-    /// Present only when the caller asked for it: the resumable upload does,
+    /// INVARIANT: Present only when the caller asked for it: the resumable upload does,
     /// folder creation doesn't. Held untyped on purpose. Drive documents it as
     /// a decimal string. A typed field would turn any other shape into a parse
     /// error, failing an upload Drive had already finished.
     size: Option<serde_json::Value>,
 }
 
-/// A file Drive says it finished storing.
 struct UploadedFile {
     id: String,
-    /// Bytes Drive reports it holds, when it reported any.
     stored_size: Option<u64>,
 }
 
-/// Outcome of a single chunk PUT or a progress query.
 enum ChunkOutcome {
-    /// Upload finished, and Drive returned the file metadata.
     Done(UploadedFile),
-    /// Resume Incomplete, carrying the high-water mark Drive reported. `None`
+    /// INVARIANT: Resume Incomplete, carrying the high-water mark Drive reported. `None`
     /// means Drive reported nothing, which is unknown progress and never zero
     /// progress: reading it as zero is what skipped a whole chunk.
     Continue(Option<u64>),
 }
 
-/// Where the chunk loop goes after Drive answers 308.
 #[derive(Debug, PartialEq, Eq)]
 enum Resume {
-    /// Carry on from this byte.
     At(u64),
-    /// Drive gained no ground on the chunk we just sent. Send it again.
     Retry,
 }
 
-/// Tunables for the chunk loop. Production takes the defaults. Tests shrink the
-/// chunk and drop the backoff, so a stalled session is exercised in
-/// milliseconds instead of a minute of real sleeping.
 struct ChunkLoopConfig {
     chunk_size: u64,
     backoff: fn(u32) -> Duration,
@@ -146,11 +111,8 @@ impl Default for ChunkLoopConfig {
     }
 }
 
-/// Classification of a chunk-level failure for the retry loop.
 enum ChunkError {
-    /// Network-layer error or 5xx/408/429 — safe to retry after backoff.
     Transient(String),
-    /// 4xx (other than 408/429), parse errors, etc. — give up.
     Fatal(BoxError),
 }
 
@@ -163,10 +125,6 @@ impl std::fmt::Display for ChunkError {
     }
 }
 
-/// Check a Google Drive API response, returning actionable errors for auth failures
-/// and the generic reqwest error for everything else. A 403 is classified by its
-/// error body so an over-quota failure isn't mislabeled as an access problem
-/// (see `classify_403_body`) — async because that classification reads the body.
 async fn check_drive_status(resp: reqwest::Response) -> Result<reqwest::Response, BoxError> {
     match resp.status() {
         s if s.is_success() => Ok(resp),
@@ -179,11 +137,6 @@ async fn check_drive_status(resp: reqwest::Response) -> Result<reqwest::Response
     }
 }
 
-/// True when a Drive 403 body indicates an over-quota failure rather than an
-/// access denial. Parses Google's error JSON for a `storageQuotaExceeded`
-/// reason in either the v3 (`error.errors[].reason`) or legacy (`errors[].reason`)
-/// shape, and falls back to a substring check for "quota" so a shape change or a
-/// non-JSON body still classifies correctly.
 fn drive_403_is_quota(body: &str) -> bool {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         let reasons = v["error"]["errors"]
@@ -202,9 +155,6 @@ fn drive_403_is_quota(body: &str) -> bool {
     body.to_lowercase().contains("quota")
 }
 
-/// Pick the right user-facing message for a Drive 403 body: the over-quota
-/// message when it's a storage-quota failure (NOT an access problem), otherwise
-/// the genuine access-denied "Grant access" message.
 fn classify_403_body(body: &str) -> &'static str {
     if drive_403_is_quota(body) {
         DRIVE_QUOTA_MSG
@@ -213,10 +163,6 @@ fn classify_403_body(body: &str) -> &'static str {
     }
 }
 
-/// Decide whether the estimated upload fits in the free space (with 10%
-/// headroom), returning the over-quota message when it doesn't. `limit == None`
-/// means an unlimited quota (some Workspace accounts) and always fits. Pure so
-/// the arithmetic is unit-testable without a live `about` response.
 fn quota_check(limit: Option<u64>, usage: u64, estimated_upload_bytes: u64) -> Result<(), String> {
     let Some(limit) = limit else {
         return Ok(());
@@ -234,13 +180,8 @@ fn quota_check(limit: Option<u64>, usage: u64, estimated_upload_bytes: u64) -> R
     }
 }
 
-/// Parse Drive's `Range:` response header (`bytes=0-262143`) and return the
-/// next byte to upload (one past the last received byte). A malformed header
-/// yields `None`, which means unknown progress. It never means zero progress:
-/// see [`resume_from`].
 fn parse_range_next(header: &str) -> Option<u64> {
     let s = header.trim();
-    // Drive returns "bytes=0-N" but be lenient about leading "bytes "/"bytes=".
     let s = s
         .strip_prefix("bytes=")
         .or_else(|| s.strip_prefix("bytes "))
@@ -250,25 +191,21 @@ fn parse_range_next(header: &str) -> Option<u64> {
     last.checked_add(1)
 }
 
-/// Backoff in seconds for the Nth retry: 1, 2, 4, 8, 16, 32, 32, ...
 fn backoff_secs(retry: u32) -> u64 {
     let base: u64 = 1u64 << retry.min(5);
     base.min(32)
 }
 
-/// Compute the inclusive end byte of the chunk that starts at `start`.
 fn chunk_end(start: u64, total: u64, chunk_size: u64) -> u64 {
     let exclusive_end = start.saturating_add(chunk_size).min(total);
     exclusive_end.saturating_sub(1)
 }
 
-/// Read the high-water mark out of a 308 response's `Range` header. A missing
-/// or malformed header is unknown progress, so it stays `None`.
 fn continue_from_range(header: Option<&str>) -> ChunkOutcome {
     ChunkOutcome::Continue(header.and_then(parse_range_next))
 }
 
-/// Decide where the cursor goes after Drive answered 308 for the chunk
+/// INVARIANT: Decide where the cursor goes after Drive answered 308 for the chunk
 /// `start..=end`.
 ///
 /// The Range header is the whole point of a 308: it says how much Drive
@@ -288,7 +225,6 @@ fn resume_from(start: u64, end: u64, next: Option<u64>) -> Resume {
     }
 }
 
-/// Why a chunk has to go again after a 308 that gained no ground.
 fn no_progress_reason(next: Option<u64>) -> String {
     match next {
         Some(n) => format!("Drive is still at byte {}, so it stored nothing new", n),
@@ -296,10 +232,6 @@ fn no_progress_reason(next: Option<u64>) -> String {
     }
 }
 
-/// Read the byte count out of Drive's `size` field. Absent, null, or a shape
-/// we cannot read all mean unknown, which [`verify_stored_size`] lets through.
-/// A number is accepted beside the documented decimal string, so a wider API
-/// never fails a finished upload.
 fn parse_stored_size(size: Option<&serde_json::Value>) -> Option<u64> {
     match size? {
         serde_json::Value::String(s) => s.parse().ok(),
@@ -307,7 +239,7 @@ fn parse_stored_size(size: Option<&serde_json::Value>) -> Option<u64> {
     }
 }
 
-/// Compare the size Drive reports against the archive we uploaded. A short
+/// INVARIANT: Compare the size Drive reports against the archive we uploaded. A short
 /// store is silent data loss: the backup reads as fine until someone restores
 /// it, so it fails here instead.
 ///
@@ -332,8 +264,6 @@ fn verify_stored_size(stored: Option<u64>, expected: u64) -> Result<(), String> 
     }
 }
 
-/// Finish an upload Drive reported as done: verify it holds the whole archive,
-/// then hand back the file id.
 fn finish_upload(
     uploaded: UploadedFile,
     total_size: u64,
@@ -363,7 +293,7 @@ impl GoogleDriveBackupProvider {
         super::get_oauth_token(&self.pool, "google").await
     }
 
-    /// Verify the access token actually carries the required Drive scope, via
+    /// INVARIANT: Verify the access token actually carries the required Drive scope, via
     /// Google's tokeninfo endpoint. A confirmed-missing scope is the ONLY
     /// preflight failure that tells the user to re-grant access; a tokeninfo
     /// HTTP failure is surfaced as a generic error rather than misattributed to
@@ -373,7 +303,7 @@ impl GoogleDriveBackupProvider {
         struct TokenInfo {
             scope: Option<String>,
         }
-        // `without_url` is load-bearing, not tidiness. Tokeninfo takes the
+        // INVARIANT: `without_url` is load-bearing, not tidiness. Tokeninfo takes the
         // access token as a QUERY PARAMETER, and reqwest's error `Display`
         // appends " for url (...)" with that parameter still in it.
         //
@@ -397,7 +327,7 @@ impl GoogleDriveBackupProvider {
             )
             .into());
         }
-        // Same reasoning: a decode error carries the response's url, and the
+        // INVARIANT: Same reasoning: a decode error carries the response's url, and the
         // token is in it.
         let info: TokenInfo = resp.json().await.map_err(reqwest::Error::without_url)?;
         let granted = info.scope.unwrap_or_default();
@@ -408,10 +338,6 @@ impl GoogleDriveBackupProvider {
         }
     }
 
-    /// Verify the Drive has room for the estimated upload, via the `about`
-    /// endpoint's `storageQuota`. Fails BEFORE encrypting with an actionable
-    /// over-quota message (never a grant-access message). An absent limit means
-    /// an unlimited quota and passes.
     async fn check_free_space(
         &self,
         token: &str,
@@ -437,12 +363,8 @@ impl GoogleDriveBackupProvider {
         let resp = check_drive_status(resp).await?;
         let about: AboutResponse = resp.json().await?;
         let Some(quota) = about.storage_quota else {
-            // No quota info reported — don't block the backup on its absence.
             return Ok(());
         };
-        // Drive reports limit/usage as stringified bytes; an absent limit means
-        // unlimited. Like the None cases above, only block on clear evidence of
-        // insufficient space — an unparseable usage defaults to 0 (don't block).
         let limit = quota.limit.as_deref().and_then(|s| s.parse::<u64>().ok());
         let usage = quota
             .usage
@@ -452,10 +374,6 @@ impl GoogleDriveBackupProvider {
         quota_check(limit, usage, estimated_upload_bytes).map_err(BoxError::from)
     }
 
-    /// Look up the existing backups folder id WITHOUT creating it. Checks the
-    /// in-memory cache first, then searches Drive by folder name. Returns `None`
-    /// when no such folder exists yet (e.g. before the first backup). Used by the
-    /// Settings page to deep-link the folder, and by `get_or_create_folder`.
     async fn find_folder(&self, token: &str) -> Result<Option<String>, BoxError> {
         {
             let cache = self.folder_id_cache.lock().await;
@@ -491,7 +409,6 @@ impl GoogleDriveBackupProvider {
             return Ok(id);
         }
 
-        // Create the folder
         let metadata = serde_json::json!({
             "name": FOLDER_NAME,
             "mimeType": "application/vnd.google-apps.folder",
@@ -508,7 +425,6 @@ impl GoogleDriveBackupProvider {
         let created: DriveCreateResponse = resp.json().await?;
         let folder_id = created.id;
 
-        // Cache the newly-created folder ID
         {
             let mut cache = self.folder_id_cache.lock().await;
             *cache = Some(folder_id.clone());
@@ -517,8 +433,6 @@ impl GoogleDriveBackupProvider {
         Ok(folder_id)
     }
 
-    /// Drive's resumable upload protocol: open a session, then feed the file to
-    /// [`upload_chunks`].
     async fn resumable_upload(
         &self,
         file_path: &Path,
@@ -531,7 +445,7 @@ impl GoogleDriveBackupProvider {
             return Err("Refusing to upload empty backup file".into());
         }
 
-        // `size` rides along with `id` so the completed upload can be checked
+        // INVARIANT: `size` rides along with `id` so the completed upload can be checked
         // against the local archive (see `verify_stored_size`).
         let url = format!("{}?uploadType=resumable&fields=id,size", DRIVE_UPLOAD_URL);
         let cfg = ChunkLoopConfig::default();
@@ -556,15 +470,13 @@ impl GoogleDriveBackupProvider {
     }
 }
 
-/// What step 1 of a resumable upload sends: the file's metadata, to the
-/// endpoint that answers with the session URI.
 struct SessionRequest<'a> {
     url: &'a str,
     metadata: &'a serde_json::Value,
     total_size: u64,
 }
 
-/// Step 1 of a resumable upload: POST the metadata and read the session URI
+/// INVARIANT: Step 1 of a resumable upload: POST the metadata and read the session URI
 /// from the `Location` header.
 ///
 /// Retried like a chunk, on the same budget and backoff. Nothing is stored yet,
@@ -653,10 +565,6 @@ async fn send_session_open(
     Ok(location.to_string())
 }
 
-/// Send one PUT to the resumable session URI: either a chunk (with body) or a
-/// progress query (empty body, `Content-Range: bytes */<total>`). Network
-/// errors become `ChunkError::Transient`; the response is then classified by
-/// `classify_chunk_response`.
 async fn send_resumable_put(
     client: &reqwest::Client,
     session_uri: &str,
@@ -670,8 +578,6 @@ async fn send_resumable_put(
 
     req = match body {
         Some(b) => req.body(b),
-        // reqwest sets Content-Length automatically for `Body`s but not for an
-        // empty PUT, so be explicit and keep the request well-formed.
         None => req.header(reqwest::header::CONTENT_LENGTH, "0"),
     };
 
@@ -710,7 +616,7 @@ async fn query_progress(
     send_resumable_put(client, session_uri, format!("bytes */{}", total), None).await
 }
 
-/// Feed the file to an open resumable session, chunk by chunk.
+/// INVARIANT: Feed the file to an open resumable session, chunk by chunk.
 ///
 /// The cursor only ever moves to a byte Drive confirmed holding, so a chunk
 /// Drive stored in part goes again for its gap. Anything that gains no ground
@@ -738,13 +644,10 @@ async fn upload_chunks(
         file.seek(SeekFrom::Start(start)).await?;
         let mut buf = vec![0u8; len];
         file.read_exact(&mut buf).await?;
-        // Bytes::clone is an O(1) refcount bump, so each retry is free
-        // (vs. the 8 MiB heap copy a Vec<u8>::clone would cost).
         let body = Bytes::from(buf);
 
         let mut retry: u32 = 0;
         loop {
-            // Why this chunk has to go again, once we know it does.
             let stalled: String =
                 match put_chunk(client, session_uri, start, end, total_size, body.clone()).await {
                     Ok(ChunkOutcome::Done(uploaded)) => {
@@ -786,9 +689,6 @@ async fn upload_chunks(
             tokio::time::sleep(backoff).await;
             retry += 1;
 
-            // Ask the server where it is. If it is ahead of us, jump forward
-            // and read the next chunk. If the query itself fails, fall through
-            // and retry the PUT.
             match query_progress(client, session_uri, total_size).await {
                 Ok(ChunkOutcome::Done(uploaded)) => {
                     return finish_upload(uploaded, total_size, progress)
@@ -803,7 +703,6 @@ async fn upload_chunks(
                         );
                         break;
                     }
-                    // Server is no further along than we are: send it again.
                 }
                 Err(qe) => {
                     crate::log_legacy!("[Backup] Progress query failed (will retry chunk): {}", qe);
@@ -812,15 +711,12 @@ async fn upload_chunks(
         }
     }
 
-    // Reached the end of the file without seeing a 200/201, so Drive returned
-    // 308 on the final chunk. Ask once for the final state.
     match query_progress(client, session_uri, total_size).await {
         Ok(ChunkOutcome::Done(uploaded)) => finish_upload(uploaded, total_size, progress),
         _ => Err("Resumable upload finished without success response".into()),
     }
 }
 
-/// Map a Drive resumable-upload response into the loop's outcome / error type.
 async fn classify_chunk_response(resp: reqwest::Response) -> Result<ChunkOutcome, ChunkError> {
     let status = resp.status();
 
@@ -835,7 +731,7 @@ async fn classify_chunk_response(resp: reqwest::Response) -> Result<ChunkOutcome
     }
 
     if status == StatusCode::PERMANENT_REDIRECT {
-        // Resume Incomplete. The Range header carries the high-water mark, and
+        // INVARIANT: Resume Incomplete. The Range header carries the high-water mark, and
         // its absence is unknown progress rather than none.
         let header = resp
             .headers()
@@ -847,21 +743,16 @@ async fn classify_chunk_response(resp: reqwest::Response) -> Result<ChunkOutcome
     Err(classify_failed_status(resp).await)
 }
 
-/// Classify a failed resumable-upload response, for the session open and for
-/// a chunk alike.
 async fn classify_failed_status(resp: reqwest::Response) -> ChunkError {
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED {
         return ChunkError::Fatal(DRIVE_AUTH_401_MSG.into());
     }
     if status == StatusCode::FORBIDDEN {
-        // Classify by the error body so an over-quota 403 (the production
-        // failure) isn't mislabeled as an access problem during the upload.
         let body = resp.text().await.unwrap_or_default();
         return ChunkError::Fatal(classify_403_body(&body).into());
     }
 
-    // 5xx / 408 / 429 are transient per Drive's resumable-upload guidance.
     if status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
@@ -871,7 +762,6 @@ async fn classify_failed_status(resp: reqwest::Response) -> ChunkError {
         return ChunkError::Transient(format!("HTTP {}: {}", code, body));
     }
 
-    // Anything else (4xx) — give up.
     let code = status.as_u16();
     let body = resp.text().await.unwrap_or_default();
     ChunkError::Fatal(format!("Drive upload failed with HTTP {}: {}", code, body).into())
@@ -892,9 +782,6 @@ impl BackupProvider for GoogleDriveBackupProvider {
     }
 
     async fn folder_url(&self) -> Option<String> {
-        // Resolve the real folder id live — no persisted, workspace-global state.
-        // Best-effort: with no token or no folder yet (before the first backup),
-        // omit the link rather than point at a search the user didn't ask for.
         let token = self.get_token().await.ok()?;
         let folder_id = self.find_folder(&token).await.ok()??;
         Some(format!(
@@ -903,16 +790,13 @@ impl BackupProvider for GoogleDriveBackupProvider {
     }
 
     async fn preflight(&self, estimated_upload_bytes: u64) -> Result<(), BoxError> {
-        // Cheap, ordered checks — fail before any expensive work, and keep the
+        // INVARIANT: Cheap, ordered checks — fail before any expensive work, and keep the
         // grant-access guidance reserved for an actual permission problem.
         // 1. Token: connect / refresh (get_token surfaces the connect/grant guidance).
         let token = self.get_token().await?;
-        // 2. Required scope: the ONLY case that tells the user to Grant access.
         self.verify_scope(&token).await?;
-        // 3. Free space: fail before pg_dump/compress/encrypt if it won't fit.
         self.check_free_space(&token, estimated_upload_bytes)
             .await?;
-        // 4. Folder: verifies write access and warms the id cache for the upload.
         self.get_or_create_folder(&token).await?;
         Ok(())
     }
@@ -1037,17 +921,6 @@ impl BackupProvider for GoogleDriveBackupProvider {
 mod tests {
     use super::*;
 
-    /// `verify_scope` puts the access token in the query string, because that
-    /// is the interface tokeninfo offers. Its error must not carry it.
-    ///
-    /// Every error out of the backup path is persisted: a `BackupFailed` event,
-    /// a preference, an SSE frame, and the status endpoint. The events table is
-    /// append only, so a token written there stays there.
-    ///
-    /// Port 1 on loopback refuses instantly, so this needs no network and no
-    /// clock. The first assertion is the one that matters: it pins that reqwest
-    /// really does embed the url, so this test cannot quietly pass by testing
-    /// nothing if that behaviour ever changes.
     #[tokio::test]
     async fn a_send_failure_carries_no_access_token() {
         let token = "ya29.a0-super-secret-access-token";
@@ -1078,7 +951,6 @@ mod tests {
 
     #[test]
     fn parse_range_next_handles_drive_format() {
-        // Drive's documented format: "bytes=0-262143" → next byte is 262144.
         assert_eq!(parse_range_next("bytes=0-262143"), Some(262_144));
         assert_eq!(parse_range_next("bytes=0-0"), Some(1));
     }
@@ -1086,11 +958,7 @@ mod tests {
     #[test]
     fn parse_range_next_lenient_with_whitespace_and_alt_form() {
         assert_eq!(parse_range_next("  bytes=0-99  "), Some(100));
-        // Some clients use the bare "0-N" form; accept it.
         assert_eq!(parse_range_next("0-99"), Some(100));
-        // RFC 7233 uses `bytes 0-99/total`; the spec for Drive omits the slash
-        // in the range header but we should be defensive against "bytes "
-        // (space) too.
         assert_eq!(parse_range_next("bytes 0-99"), Some(100));
     }
 
@@ -1103,7 +971,6 @@ mod tests {
 
     #[test]
     fn backoff_progression_matches_documented_policy() {
-        // 1, 2, 4, 8, 16, 32, capped at 32 thereafter.
         assert_eq!(backoff_secs(0), 1);
         assert_eq!(backoff_secs(1), 2);
         assert_eq!(backoff_secs(2), 4);
@@ -1116,7 +983,6 @@ mod tests {
 
     #[test]
     fn chunk_end_full_chunk() {
-        // 8 MiB chunk starting at 0 of a 100 MiB file → end at 8 MiB - 1.
         let chunk = 8 * 1024 * 1024;
         let total = 100 * 1024 * 1024;
         assert_eq!(chunk_end(0, total, chunk), chunk - 1);
@@ -1125,27 +991,20 @@ mod tests {
 
     #[test]
     fn chunk_end_final_partial_chunk() {
-        // A 442 MB file's last chunk: 442 * 1024 * 1024 bytes, 8 MiB chunks.
-        // 442 / 8 = 55.25 → 55 full chunks + one 0.25-chunk tail.
         let chunk: u64 = 8 * 1024 * 1024;
         let total: u64 = 442 * 1024 * 1024;
         let last_chunk_start = 55 * chunk;
         let end = chunk_end(last_chunk_start, total, chunk);
-        // End is inclusive, so end = total - 1.
         assert_eq!(end, total - 1);
-        // And the chunk length is the partial remainder.
         assert_eq!(end - last_chunk_start + 1, total - last_chunk_start);
     }
 
     #[test]
     fn chunk_end_handles_total_smaller_than_chunk_size() {
-        // 1 MiB file, 8 MiB nominal chunk → single chunk covering the whole file.
         let chunk: u64 = 8 * 1024 * 1024;
         let total: u64 = 1024 * 1024;
         assert_eq!(chunk_end(0, total, chunk), total - 1);
     }
-
-    // --- cursor arithmetic (the truncated-archive bug) -------------------
 
     fn continued_at(header: Option<&str>) -> Option<u64> {
         match continue_from_range(header) {
@@ -1154,37 +1013,28 @@ mod tests {
         }
     }
 
-    /// The bug: Drive stored 40 of the 100 bytes we sent, and the old
-    /// `next.max(end + 1)` jumped to 100. The 60-byte gap was never re-sent.
     #[test]
     fn resume_from_honours_a_partly_stored_chunk() {
         assert_eq!(resume_from(0, 99, Some(40)), Resume::At(40));
         assert_eq!(resume_from(500, 599, Some(512)), Resume::At(512));
     }
 
-    /// A full store is the ordinary case, and the cursor lands past the chunk.
     #[test]
     fn resume_from_advances_on_a_full_store() {
         assert_eq!(resume_from(0, 99, Some(100)), Resume::At(100));
     }
 
-    /// A mark past the chunk claims bytes we never sent, so it clamps.
     #[test]
     fn resume_from_clamps_a_mark_beyond_the_chunk() {
         assert_eq!(resume_from(0, 99, Some(5_000)), Resume::At(100));
     }
 
-    /// No Range header means unknown progress, never zero progress. The old
-    /// `.unwrap_or(0)` read it as zero, which then forced the cursor forward
-    /// past the whole chunk.
     #[test]
     fn resume_from_treats_a_missing_mark_as_no_progress() {
         assert_eq!(resume_from(0, 99, None), Resume::Retry);
         assert_eq!(resume_from(500, 599, None), Resume::Retry);
     }
 
-    /// The behavior `.max(end + 1)` was protecting: a stale mark below `start`
-    /// must not move the cursor backwards. It is not progress either.
     #[test]
     fn resume_from_ignores_a_stale_mark() {
         assert_eq!(resume_from(500, 599, Some(20)), Resume::Retry);
@@ -1204,9 +1054,6 @@ mod tests {
         assert!(no_progress_reason(None).contains("no Range header"));
     }
 
-    // --- stored-size check ------------------------------------------------
-
-    /// A short store is the silent loss this check exists to catch.
     #[test]
     fn verify_stored_size_rejects_a_short_upload() {
         let err = verify_stored_size(Some(900), 1000).unwrap_err();
@@ -1220,21 +1067,16 @@ mod tests {
         assert!(verify_stored_size(Some(1000), 1000).is_ok());
     }
 
-    /// A size Drive reports that is too LARGE is just as wrong as a short one.
     #[test]
     fn verify_stored_size_rejects_a_long_upload() {
         assert!(verify_stored_size(Some(1200), 1000).is_err());
     }
 
-    /// An absent size passes. Absence means Drive changed its API, since we ask
-    /// for the field by name. Failing every backup on that would leave the user
-    /// with none at all.
     #[test]
     fn verify_stored_size_passes_when_drive_reports_nothing() {
         assert!(verify_stored_size(None, 1000).is_ok());
     }
 
-    /// The documented shape: an int64 as a decimal string.
     #[test]
     fn stored_size_reads_drives_decimal_string() {
         let created: DriveCreateResponse =
@@ -1242,9 +1084,6 @@ mod tests {
         assert_eq!(parse_stored_size(created.size.as_ref()), Some(4096));
     }
 
-    /// A number instead of a string must not fail the response. It used to:
-    /// the field was typed `Option<String>`, so serde rejected the whole body
-    /// and a finished upload came back as a parse error.
     #[test]
     fn stored_size_survives_a_number_from_a_wider_api() {
         let created: DriveCreateResponse =
@@ -1252,7 +1091,6 @@ mod tests {
         assert_eq!(parse_stored_size(created.size.as_ref()), Some(4096));
     }
 
-    /// Absent, null, and unreadable all mean unknown, never zero.
     #[test]
     fn stored_size_reads_every_other_shape_as_unknown() {
         for body in [
@@ -1266,11 +1104,6 @@ mod tests {
         }
     }
 
-    // --- 403 classification (the mislabeling bug) ------------------------
-
-    /// An over-quota 403 (Drive's v3 `error.errors[].reason == storageQuotaExceeded`)
-    /// must map to the quota message — NOT the access-denied "Grant access" one
-    /// that previously sent the user re-granting access while the Drive was full.
     #[test]
     fn classify_403_quota_body_returns_quota_message() {
         let body = r#"{"error":{"errors":[{"domain":"usageLimits","reason":"storageQuotaExceeded","message":"The user's Drive storage quota has been exceeded."}],"code":403,"message":"The user's Drive storage quota has been exceeded."}}"#;
@@ -1281,8 +1114,6 @@ mod tests {
         );
     }
 
-    /// A genuine auth-denied 403 (`insufficientPermissions`) keeps the existing
-    /// grant-access message.
     #[test]
     fn classify_403_insufficient_permissions_returns_grant_message() {
         let body = r#"{"error":{"errors":[{"domain":"global","reason":"insufficientPermissions","message":"Insufficient Permission"}],"code":403,"message":"Insufficient Permission"}}"#;
@@ -1290,8 +1121,6 @@ mod tests {
         assert!(classify_403_body(body).contains("Grant access"));
     }
 
-    /// The legacy top-level `errors[]` shape and a plain-text "quota" body both
-    /// classify as quota; an empty / hint-less body is a genuine access denial.
     #[test]
     fn classify_403_legacy_shape_and_text_fallback() {
         let legacy = r#"{"errors":[{"reason":"storageQuotaExceeded"}]}"#;
@@ -1301,25 +1130,18 @@ mod tests {
             DRIVE_QUOTA_MSG
         );
         assert_eq!(classify_403_body(""), DRIVE_AUTH_403_MSG);
-        // A non-quota reason embedded in otherwise-noisy JSON stays a grant case.
         assert_eq!(
             classify_403_body(r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#),
             DRIVE_AUTH_403_MSG
         );
     }
 
-    // --- preflight quota / scope decision core --------------------------
-
-    /// Preflight passes when the Drive has room for the estimated upload.
     #[test]
     fn quota_check_passes_with_room() {
         let gib = 1024 * 1024 * 1024;
         assert!(quota_check(Some(100 * gib), 50 * gib, gib).is_ok());
     }
 
-    /// The production case: 100 GiB limit, ~96.5 GiB used (~3.5 GiB free) and a
-    /// 5 GiB upload → preflight fails with the over-quota message and never the
-    /// grant-access one.
     #[test]
     fn quota_check_fails_when_free_below_estimate_with_quota_message() {
         let gib = 1024 * 1024 * 1024;
@@ -1333,22 +1155,16 @@ mod tests {
         );
     }
 
-    /// The 10% headroom rejects an upload that would *just barely* fit raw, so
-    /// estimate error can't push a real backup over the edge at upload time.
     #[test]
     fn quota_check_headroom_rejects_a_near_exact_fit() {
-        // free = 1_000_000, estimate = 950_000 → needed = 1_045_000 > free.
         assert!(quota_check(Some(1_000_000), 0, 950_000).is_err());
     }
 
-    /// An absent limit (some Workspace accounts report no quota) is unlimited.
     #[test]
     fn quota_check_unlimited_limit_always_passes() {
         assert!(quota_check(None, u64::MAX, u64::MAX / 2).is_ok());
     }
 
-    /// The registry entry Drive's preflight verifies against. A backup writes
-    /// with `drive.file`, which the fragment matches.
     #[test]
     fn backup_scopes_match_the_drive_file_grant() {
         let granted = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
@@ -1363,7 +1179,7 @@ mod tests {
     }
 }
 
-/// End-to-end tests for [`upload_chunks`] against a mock Drive on loopback.
+/// INVARIANT: End-to-end tests for [`upload_chunks`] against a mock Drive on loopback.
 ///
 /// The mock is strict where the real thing is strict: a chunk whose start runs
 /// past what it holds is a 400, because those bytes are gone. That is what
@@ -1377,33 +1193,22 @@ mod chunk_loop_tests {
 
     const FILE_ID: &str = "mock-file-id";
 
-    /// What the mock does with one chunk PUT.
     #[derive(Clone, Copy)]
     enum Reply {
-        /// Store the whole chunk and report it honestly.
         Store,
-        /// Store the first `n` bytes only, and report that honestly. This is
-        /// the case the 308 Range header exists to signal.
         Partial(usize),
-        /// Store nothing, and send no Range header at all.
         Dropped,
-        /// Store the whole chunk, but report a stale mark at byte `n`.
         Stale(u64),
-        /// Store nothing, and report the mark it already had.
         NoProgress,
     }
 
     struct MockDrive {
         stored: Vec<u8>,
         total: u64,
-        /// Scripted replies, consumed in order. `fallback` covers the rest.
         script: Vec<Reply>,
         fallback: Reply,
-        /// Start offset of every chunk PUT, in order.
         offsets: Vec<u64>,
-        /// Size the completion response reports, when it should lie.
         size_override: Option<u64>,
-        /// Set when the client asked the mock to store bytes it never received.
         gap: Option<String>,
     }
 
@@ -1464,8 +1269,6 @@ mod chunk_loop_tests {
         }
     }
 
-    /// A 308, carrying the next byte Drive wants. Real Drive sends no Range
-    /// header when it holds nothing, so neither does this.
     fn incomplete(next: Option<u64>) -> Response {
         let mut builder = Response::builder().status(308);
         if let Some(n) = next.filter(|n| *n > 0) {
@@ -1481,7 +1284,6 @@ mod chunk_loop_tests {
             .unwrap()
     }
 
-    /// Split `bytes <start>-<end>/<total>` into its start and end.
     fn parse_content_range(header: &str) -> Option<(u64, u64)> {
         let (range, _) = header.strip_prefix("bytes ")?.split_once('/')?;
         let (start, end) = range.split_once('-')?;
@@ -1508,7 +1310,6 @@ mod chunk_loop_tests {
             .unwrap_or_default()
             .to_string();
 
-        // `bytes */<total>` is a progress query, not a chunk.
         if header.starts_with("bytes */") {
             return if drive.complete() {
                 drive.done()
@@ -1552,7 +1353,6 @@ mod chunk_loop_tests {
         }
     }
 
-    /// Boot the mock on a loopback port and hand back its session URI.
     async fn spawn_mock(drive: Arc<Mutex<MockDrive>>) -> String {
         let app = axum::Router::new()
             .route("/session", axum::routing::put(drive_handler))
@@ -1565,13 +1365,10 @@ mod chunk_loop_tests {
         format!("http://{}/session", addr)
     }
 
-    /// A byte pattern with a prime period, so a misplaced chunk cannot happen
-    /// to match the bytes it displaced.
     fn source_bytes(total: usize) -> Vec<u8> {
         (0..total).map(|i| (i % 251) as u8).collect()
     }
 
-    /// Small chunks and no backoff, so a stalled session runs in milliseconds.
     fn test_cfg(chunk_size: u64) -> ChunkLoopConfig {
         ChunkLoopConfig {
             chunk_size,
@@ -1619,7 +1416,6 @@ mod chunk_loop_tests {
             .await
         }
 
-        /// Every byte arrived, in order, and the mock was never asked to skip.
         async fn assert_intact(&self) {
             let drive = self.drive.lock().await;
             assert_eq!(drive.gap, None, "the loop skipped bytes");
@@ -1634,7 +1430,6 @@ mod chunk_loop_tests {
         }
     }
 
-    /// The baseline: nothing goes wrong, and the whole archive lands.
     #[tokio::test]
     async fn a_clean_run_uploads_every_byte() {
         let f = fixture(MockDrive::new(TOTAL as u64)).await;
@@ -1642,8 +1437,6 @@ mod chunk_loop_tests {
         f.assert_intact().await;
     }
 
-    /// Case 1: Drive stored 40 of the 100 bytes we sent. The old cursor jumped
-    /// to 100 and left a 60-byte hole in the archive.
     #[tokio::test]
     async fn a_partly_stored_chunk_re_sends_its_gap() {
         let f = fixture(MockDrive::new(TOTAL as u64).script(vec![Reply::Partial(40)])).await;
@@ -1651,8 +1444,6 @@ mod chunk_loop_tests {
         f.assert_intact().await;
     }
 
-    /// Case 2: Drive reports no Range header at all. The old `.unwrap_or(0)`
-    /// read that as byte 0, which then forced the cursor past the whole chunk.
     #[tokio::test]
     async fn a_missing_range_header_re_sends_the_chunk() {
         let f = fixture(MockDrive::new(TOTAL as u64).script(vec![Reply::Dropped])).await;
@@ -1660,9 +1451,6 @@ mod chunk_loop_tests {
         f.assert_intact().await;
     }
 
-    /// Case 3: a stale mark below `start`. This is the case the old
-    /// `.max(end + 1)` was protecting, and it must keep working: the cursor
-    /// never follows a mark backwards.
     #[tokio::test]
     async fn a_stale_range_never_moves_the_cursor_back() {
         let f = fixture(MockDrive::new(TOTAL as u64).script(vec![Reply::Store, Reply::Stale(10)]))
@@ -1671,8 +1459,6 @@ mod chunk_loop_tests {
         f.assert_intact().await;
     }
 
-    /// Re-sending a chunk spends retry budget, so a session that never gains
-    /// ground fails loudly instead of looping.
     #[tokio::test]
     async fn a_session_that_never_advances_gives_up() {
         let f = fixture(MockDrive::new(TOTAL as u64).fallback(Reply::NoProgress)).await;
@@ -1681,8 +1467,6 @@ mod chunk_loop_tests {
         assert!(err.contains("byte 0"), "got: {err}");
     }
 
-    /// The last line of defence: Drive says it finished, but holds less than
-    /// the archive. That is never recorded as a successful backup.
     #[tokio::test]
     async fn a_short_stored_size_fails_the_upload() {
         let f = fixture(MockDrive::new(TOTAL as u64).reports_size(299)).await;
@@ -1692,9 +1476,6 @@ mod chunk_loop_tests {
     }
 }
 
-/// Step 1 of the upload, the POST that opens the session. A computer that
-/// slept with it in flight saw it fail on wake. With no retry, the whole backup
-/// failed before a single chunk was sent.
 #[cfg(test)]
 mod session_open_tests {
     use super::*;
@@ -1703,10 +1484,8 @@ mod session_open_tests {
 
     const SESSION_URI: &str = "https://upload.example/session?upload_id=abc";
 
-    /// The statuses still to send, and the bearer token of each POST.
     type MockState = (Arc<Mutex<Vec<u16>>>, Arc<Mutex<Vec<String>>>);
 
-    /// Replies to the POST in order, then 200 with a Location for the rest.
     async fn spawn_mock(script: Vec<u16>) -> (String, Arc<Mutex<Vec<String>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let state: MockState = (Arc::new(Mutex::new(script)), calls.clone());
@@ -1743,7 +1522,6 @@ mod session_open_tests {
         (format!("http://{}/upload", addr), calls)
     }
 
-    /// Opens a session with token `first`, refreshing to `fresh` per retry.
     async fn open(url: &str) -> Result<String, BoxError> {
         let metadata = serde_json::json!({ "name": "archive.enc" });
         let session = SessionRequest {
@@ -1766,8 +1544,6 @@ mod session_open_tests {
         assert_eq!(calls.lock().await.len(), 3);
     }
 
-    /// A retry after a long sleep must not send the token it had before: it
-    /// may have expired, and the 401 would blame the grant.
     #[tokio::test]
     async fn each_retry_sends_a_refreshed_token() {
         let (url, calls) = spawn_mock(vec![503]).await;
@@ -1783,8 +1559,6 @@ mod session_open_tests {
         assert_eq!(calls.lock().await.len(), 1);
     }
 
-    /// The reported failure, with nothing listening: every attempt loses the
-    /// connection. The error names the step and its cause, never the URL.
     #[tokio::test]
     async fn a_lost_connection_exhausts_the_budget_and_says_what_happened() {
         let err = open("http://127.0.0.1:1/upload?uploadType=resumable")

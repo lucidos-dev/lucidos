@@ -1,13 +1,3 @@
-//! The read decision check. Each candidate decides the labelled turns in
-//! `eval/read-decision/turns.toml`, through the turn-end gate's own state,
-//! question and threshold. A candidate is a chat model, or a System One row.
-//!
-//! The number that decides first is a missed must-read: a reply the user
-//! needed that Review would never list. Noise passed, a yes on a reply that
-//! needed no reading, decides second. Plan:
-//! `docs/plans/2026-10-11-read-decision-sees-the-answer-and-a-measured-model.md`,
-//! invariant I7.
-
 use std::path::Path;
 
 use lucidos_agents_api::engine::turn_end::{
@@ -27,10 +17,8 @@ pub(crate) const CHECK: Check = Check {
     noise: "Noise passed",
 };
 
-/// One labelled turn.
 #[derive(Debug, Deserialize)]
 struct LabelledTurn {
-    /// What opened the turn: `user`, `child-report`, `trigger` or `agent`.
     source: String,
     message: String,
     question: Option<String>,
@@ -40,15 +28,11 @@ struct LabelledTurn {
     sub_threads: i64,
     #[serde(default)]
     event_waits: i64,
-    /// Whether the turn's report wakes the parent agent, which acts on it.
     #[serde(default)]
     report_wakes_parent: bool,
-    /// The notifications the turn sent before its reply.
     #[serde(default)]
     pushed: Vec<PushedNotification>,
-    /// Whether the user should read the reply.
     read: bool,
-    /// The shape of the turn, for the per-kind breakdown.
     kind: String,
 }
 
@@ -113,8 +97,6 @@ impl Labelled for LabelledTurn {
     }
 }
 
-/// Run every candidate over the set, append each decision to `out` as JSON
-/// lines, and print the table.
 pub async fn run(set: &Path, backend: &str, models: &[String], out: &Path) -> Fallible<()> {
     let set: LabelledSet = toml::from_str(&std::fs::read_to_string(set)?)?;
     crate::decision_check::run(&CHECK, &set.turn, backend, models, out).await
@@ -128,8 +110,6 @@ mod tests {
         toml::from_str(&std::fs::read_to_string(CHECK.shipped_set()).unwrap()).unwrap()
     }
 
-    /// The shipped set parses into turns the gate can read, and holds both
-    /// labels.
     #[test]
     fn the_labelled_set_is_well_formed() {
         let set = shipped_set();
@@ -140,8 +120,6 @@ mod tests {
         assert!(set.turn.iter().any(|t| !t.read));
     }
 
-    /// Every trigger-run shape the plan measures is in the shipped set, and a
-    /// push reaches the gate's turn.
     #[test]
     fn the_shipped_set_holds_every_trigger_shape() {
         let set = shipped_set();

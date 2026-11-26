@@ -273,6 +273,9 @@ fn withheld(reason: UnproposedReason) -> &'static str {
             "The work never becomes a change here: the thread continued in a legacy successor thread, \
              whose change carries it."
         }
+        UnproposedReason::HookRefused => {
+            "The work is not ready: an event hook refused its proposal."
+        }
     }
 }
 

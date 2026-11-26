@@ -1,4 +1,3 @@
-//! Frozen, device-confirmed permanent removal of completed Trash entries.
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -91,8 +90,6 @@ fn observe_with_shared_files(
         }
         Err(e) => return Err(e.into()),
     };
-    // Include every inode and its change timestamps, without following links.
-    // A changed recovery copy invalidates the device's frozen confirmation.
     fn walk(
         path: &Path,
         rows: &mut Vec<serde_json::Value>,
@@ -104,9 +101,6 @@ fn observe_with_shared_files(
         if discover && m.is_file() && m.nlink() > 1 {
             shared.insert(identity);
         }
-        // Unlinking a confirmed peer changes ctime, even when bytes and all
-        // remaining names are unchanged. Freeze content for these inodes so
-        // our own deletion cannot invalidate the next member's confirmation.
         let content = if m.is_file() && shared.contains(&identity) {
             use sha2::{Digest, Sha256};
             use std::os::unix::fs::OpenOptionsExt;
@@ -243,7 +237,6 @@ impl GatewayState {
         let failure = |e: BoxError| ApiError::conflict(e.to_string());
         let _review = self.cleanup_review_mutation();
         let _batch = self.workspace_operation(&format!("empty-trash:{id}")).await;
-        // Serialize different frozen batches, including legacy entries without a workspace id.
         let _trash = self.workspace_operation("empty-trash").await;
         let root = batch_root(self.app_data(), id).map_err(failure)?;
         let mut batch: EmptyBatch = (|| -> Result<_, BoxError> {
@@ -360,7 +353,6 @@ mod tests {
                 })
                 .unwrap();
             let expected = std::fs::read(&completion).unwrap();
-            // Simulate failure between terminal journal sync and event publication.
             std::fs::remove_file(&completion).unwrap();
             let id = root.file_name().unwrap().to_str().unwrap();
             observe(home, id).unwrap();

@@ -1,7 +1,3 @@
-//! Writes every generated file under `--out <dir>`, reading the engine source
-//! under `--repo-root <dir>`. `scripts/codegen.sh` runs it, and nothing ships
-//! it. `cargo build -p lucidos-engine-bin` builds it beside the engine.
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 

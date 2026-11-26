@@ -73,8 +73,9 @@ silently.
   own `tool_choice` form. It serves engine calls only. A Claude model that
   always thinks refuses any forced tool, so the provider refuses it before
   sending, and the gate records a read request.
-- A no never clears an earlier unseen request, and never marks a thread as
-  needing attention. A trigger run that decides no stays archived.
+- A no never marks a thread as needing attention, and a trigger run that
+  decides no stays archived. It clears an earlier unseen request only in a
+  sub-thread whose parent acts (see the amendment below).
 - The Stop hook keeps its plaintext question redirect. Apply's synchronous
   hardening stays as the floor.
 - The chat loop's question re-ask and wake check stay in the loop, outside
@@ -87,6 +88,25 @@ one more session re-entry: the *approved-plan re-entry*. It sends once per
 session, after the ceiling and before the proposal hold. An automation pause
 asks the owner with the `build-approved-plan` step. Evidence and invariants:
 `docs/plans/2026-11-16-codex-early-turn-ends.md`.
+
+### Amendment: a sub-thread's later no supersedes
+
+A sub-thread spawned `wake` or `wake-when-all-done` reports to a parent agent
+that acts on every report. There, a later no clears an earlier unseen read
+request: the parent already has the earlier report, and the latest turn knows
+whether it still matters. Without this, a forced yes during an outage kept
+an orchestrator's track unread for hours after it recovered.
+
+A yes from a turn the user opened, resumed with an answer, or wrote into
+stays: that reply was the user's, not a report the parent carries. The yes
+records `parent_report` from the wake duty, the turn's opener (as the
+read judge reads it) and any human input since. A later no records `supersedes_request` when the unseen request
+was a `parent_report`. The projection only follows the flag.
+
+A yes over an unseen user yes is no `parent_report` either, so a later no
+still leaves the user's reply. Top-level, `no-wake` and undeclared children keep the original
+rule. Evidence and invariants:
+`docs/plans/2026-11-25-sub-thread-no-supersedes-read-request.md`.
 
 ## Alternatives considered
 

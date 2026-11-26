@@ -1,4 +1,3 @@
-//! Folder grants name the directory the owner saw, not a movable symlink.
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -75,8 +74,6 @@ mod tests {
         sandbox: crate::core::agent_sandbox::Sandbox,
     }
 
-    /// A workspace and a folder beside it, under a trigger scope that names
-    /// only the workspace.
     fn outside() -> Outside {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -118,8 +115,6 @@ mod tests {
         assert_eq!(refused(&outside, &outside.workspace.join("new")), None);
     }
 
-    /// Unix permissions, not the sandbox, refused these, so a grant would
-    /// change nothing.
     #[cfg(unix)]
     #[test]
     fn refusals_the_engine_shares_get_no_card() {
@@ -192,9 +187,6 @@ pub fn folder_refusal(
     TriggerFolderGrant::inspect(folder, workspace)
 }
 
-/// Whether the engine itself may open and change `path`. Only then did the
-/// sandbox cause a child's refusal. Read, privacy and Unix permission refusals
-/// all fail here, so they never offer a write grant.
 fn engine_can_write(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -221,8 +213,6 @@ fn engine_can_write(path: &Path) -> bool {
     }
 }
 
-/// A script refused a write the owner can grant. Its output stays in the
-/// failure, so the owner sees what the script printed.
 #[derive(Debug)]
 pub struct ScriptFolderRefusal {
     pub grant: TriggerFolderGrant,
@@ -240,8 +230,6 @@ impl std::fmt::Display for ScriptFolderRefusal {
     }
 }
 
-/// A failed script's error: a [`ScriptFolderRefusal`] when the sandbox
-/// refused a write the owner can grant, else the output itself.
 pub fn script_failure(
     sandbox: &super::agent_sandbox::Sandbox,
     workspace: &Path,
@@ -253,7 +241,6 @@ pub fn script_failure(
     }
 }
 
-/// The one sentence a folder card leads with.
 pub fn folder_refusal_reason(grant: &TriggerFolderGrant) -> String {
     format!(
         "The trigger was refused a write in {}.",
@@ -263,8 +250,6 @@ pub fn folder_refusal_reason(grant: &TriggerFolderGrant) -> String {
 
 impl std::error::Error for ScriptFolderRefusal {}
 
-/// The events of a failed script run's thread, so its folder card has a
-/// thread to sit in: the trigger message, the title and the failure.
 pub fn script_refusal_thread_events(
     message: String,
     title: String,

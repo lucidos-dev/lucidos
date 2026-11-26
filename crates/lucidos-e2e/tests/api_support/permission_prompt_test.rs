@@ -1,14 +1,3 @@
-//! E2E for POST /api/v1/internal/permission-prompt — the endpoint invoked by
-//! lucidos-cli's MCP permission server when CC asks for a tool-call decision.
-//!
-//! Drives the endpoint with HTTP only — no MCP subprocess required. The
-//! handler:
-//!   1. Registers a deduped entry in `Engine.pending_cc_permission` keyed by
-//!      request_id (and `(thread, tool, input)` for dedup).
-//!   2. Emits `CodingAgentPermissionRequest` (persisted) with that request_id.
-//!   3. Blocks until POST /api/v1/mcp/consent resolves the entry, then emits
-//!      `CodingAgentPermissionResolved` and returns `{ allowed, reason? }`.
-
 use crate::support::{
     as_stamped_device, base_url, db_url, register_device, seed_cc_thread_summary, user_client,
 };
@@ -18,24 +7,12 @@ use std::sync::LazyLock;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
-/// Serialize tests that snapshot/modify this workspace's `cc-allowed-tools`
-/// settings. Cargo runs integration tests in parallel within a binary, so without
-/// this lock concurrent snapshot+restore cycles would race and clobber each
-/// other's restore. Acquire at the top of any test that calls
-/// `read_cc_allowed_tools` / `restore_cc_allowed_tools`; hold for the full
-/// snapshot → mutate → assert → restore cycle.
 static CC_ALLOWED_TOOLS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 async fn lock_cc_allowed_tools() -> MutexGuard<'static, ()> {
     CC_ALLOWED_TOOLS_LOCK.lock().await
 }
 
-/// Restores this workspace's `cc-allowed-tools` when it goes out of scope, on
-/// the panicking path as well as the clean one.
-///
-/// Any test that empties the list needs this, or it takes the workspace's real
-/// grants away. It restores through the settings endpoint. Drop cannot await,
-/// so the PUT runs on a thread with its own runtime.
 struct CcAllowlistRestore {
     snapshot: String,
 }
@@ -60,13 +37,6 @@ impl Drop for CcAllowlistRestore {
     }
 }
 
-/// Empty the workspace's allowlist for the duration of one test, and restore it
-/// afterwards whatever happens.
-///
-/// A card only renders for a request the allowlist does not already cover, and
-/// this workspace may already hold grants (bare `Bash`, `Skill`, …). A test
-/// about what a CLICK persists must therefore start from nothing granted. Its
-/// prompt would otherwise be auto-allowed before any card exists.
 async fn empty_cc_allowed_tools(client: &reqwest::Client) -> CcAllowlistRestore {
     let snapshot = read_cc_allowed_tools(client).await;
     restore_cc_allowed_tools(client, "").await;
@@ -100,8 +70,6 @@ async fn permission_prompt_resolves_when_consent_posted() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "running").await;
 
-    // Issue the prompt request — it blocks on the oneshot. Spawn so we can
-    // poll for the persisted request event in parallel.
     let prompt_task = {
         let client = client.clone();
         tokio::spawn(async move {
@@ -151,17 +119,6 @@ async fn permission_prompt_resolves_when_consent_posted() {
     );
 }
 
-/// Concurrent identical permission requests must surface as a single card to
-/// the user. CC can fire several `tools/call` for the same logical action in
-/// one assistant turn (parallel tool_use blocks, or sequential retries after
-/// a denial). Without dedup, each one renders its own `PermissionCard` — the
-/// "infinite loop of file-access prompts" the user reported.
-///
-/// Verifies:
-///   - exactly ONE `CodingAgentPermissionRequest` is persisted across N
-///     concurrent identical requests
-///   - a single consent answers ALL of them
-///   - exactly ONE `CodingAgentPermissionResolved` is persisted
 #[tokio::test]
 async fn permission_prompt_deduplicates_concurrent_identical_requests() {
     let client = user_client().await;
@@ -172,9 +129,6 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "running").await;
 
-    // Fire 3 concurrent identical permission_prompt requests. Each gets its
-    // own tool_use_id (CC mints those per call) but the (thread_id, tool_name,
-    // input) triple is identical — the engine must dedup.
     let body = json!({
         "thread_id": thread_id.to_string(),
         "tool_use_id": "tu_dup_1",
@@ -199,8 +153,6 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
         }));
     }
 
-    // Wait for the canonical request event to appear, then briefly let the
-    // other two duplicates settle so any erroneous extra events would persist.
     let request_id =
         wait_for_permission_request(&pool, thread_id, std::time::Duration::from_secs(10)).await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -260,13 +212,6 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
         .ok();
 }
 
-/// `persist_scope: "narrow"` on a Skill prompt → engine appends
-/// `Skill(<plugin>:*)` to the workspace's cc-allowed-tools, and no later skill
-/// from that plugin raises a card.
-///
-/// The second half used to click a second time and assert the line was not
-/// doubled. It cannot: the grant now answers that prompt before a card exists,
-/// which is the point. `core::grants` unit-tests the append's idempotence.
 #[tokio::test]
 async fn permission_prompt_persists_narrow_skill_pattern() {
     let _lock = lock_cc_allowed_tools().await;
@@ -276,7 +221,6 @@ async fn permission_prompt_persists_narrow_skill_pattern() {
         .expect("Failed to connect to E2E workspace database");
     let _restore = empty_cc_allowed_tools(&client).await;
 
-    // Unique plugin name per run so concurrent / repeat runs never collide.
     let plugin = format!("test-{}", Uuid::new_v4().simple());
     let pattern = format!("Skill({}:*)", plugin);
 
@@ -304,7 +248,6 @@ async fn permission_prompt_persists_narrow_skill_pattern() {
         "one click stores one pattern; Settings:\n{after_first}"
     );
 
-    // A DIFFERENT skill from the granted plugin: covered, so no card at all.
     let thread_id2 = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id2, "running").await;
     let second = prompt_once(
@@ -325,7 +268,6 @@ async fn permission_prompt_persists_narrow_skill_pattern() {
     );
 }
 
-/// `persist_scope: "broad"` on a Bash prompt → engine appends bare `Bash`.
 #[tokio::test]
 async fn permission_prompt_persists_broad_bash_pattern() {
     let _lock = lock_cc_allowed_tools().await;
@@ -336,8 +278,6 @@ async fn permission_prompt_persists_broad_bash_pattern() {
 
     let _restore = empty_cc_allowed_tools(&client).await;
 
-    // Use a unique sentinel inside the input so we never accidentally match
-    // a pre-existing canonical request from the e2e workspace.
     let sentinel = format!("echo {}", Uuid::new_v4().simple());
 
     let thread_id = Uuid::new_v4();
@@ -360,13 +300,6 @@ async fn permission_prompt_persists_broad_bash_pattern() {
     );
 }
 
-/// The reported bug: an "Always allow" click bound the NEXT coding-agent
-/// session, not the one it was clicked in, so the same tool carded again
-/// seconds later. The grant reaches Claude Code as `--allowedTools`, frozen at
-/// spawn, and the engine's own gate previously ignored the updated list.
-///
-/// Clicks narrow on one command, then raises a SECOND prompt for a DIFFERENT
-/// command with the same head. It must answer allowed with no new card.
 #[tokio::test]
 async fn permission_prompt_narrow_grant_binds_the_same_session() {
     let _lock = lock_cc_allowed_tools().await;
@@ -377,8 +310,6 @@ async fn permission_prompt_narrow_grant_binds_the_same_session() {
 
     let _restore = empty_cc_allowed_tools(&client).await;
 
-    // A head nothing else can grant, so the second prompt is answered by the
-    // grant this test just made and by nothing else.
     let head = format!("zzgrant{}", Uuid::new_v4().simple());
 
     let thread_id = Uuid::new_v4();
@@ -417,7 +348,6 @@ async fn permission_prompt_narrow_grant_binds_the_same_session() {
         "only the first prompt may render a card; the granted one is silent"
     );
 
-    // The grant names a HEAD, so it does not carry an unrelated command.
     let ungranted = Uuid::new_v4();
     seed_cc_thread_summary(&pool, ungranted, "running").await;
     let waiter = {
@@ -446,10 +376,6 @@ async fn permission_prompt_narrow_grant_binds_the_same_session() {
     let _ = waiter.await.expect("waiter task panicked");
 }
 
-/// The consent endpoint stores exactly the pattern the card stamped on its
-/// request event, for both persisted scopes. The card renders the same
-/// stamped pattern, so the button and the stored line cannot disagree
-/// (ADR 0571).
 #[tokio::test]
 async fn permission_prompt_stores_exactly_the_stamped_pattern() {
     let _lock = lock_cc_allowed_tools().await;
@@ -500,8 +426,6 @@ async fn permission_prompt_stores_exactly_the_stamped_pattern() {
     }
 }
 
-/// Claude Code ignores a bare `Edit` in `--allowedTools` for out-of-cwd
-/// paths. A broad approval therefore leaves the standing grants alone.
 #[tokio::test]
 async fn permission_prompt_broad_persist_for_edit_keeps_standing_grants() {
     let _lock = lock_cc_allowed_tools().await;
@@ -529,14 +453,12 @@ async fn permission_prompt_broad_persist_for_edit_keeps_standing_grants() {
     .await;
 
     let after = read_cc_allowed_tools(&client).await;
-    // Compare the full list because an earlier Settings edit may include Edit.
     assert_eq!(
         snapshot, after,
         "broad persist on Edit must NOT modify cc-allowed-tools — bare entry is a no-op for acceptEdits-routed tools"
     );
 }
 
-/// Allow once leaves standing grants alone.
 #[tokio::test]
 async fn permission_prompt_without_persist_scope_keeps_standing_grants() {
     let _lock = lock_cc_allowed_tools().await;
@@ -554,7 +476,6 @@ async fn permission_prompt_without_persist_scope_keeps_standing_grants() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "running").await;
 
-    // Drive the prompt → consent flow without persist_scope.
     let prompt_task = {
         let client = client.clone();
         let plugin = plugin.clone();
@@ -599,12 +520,6 @@ async fn permission_prompt_without_persist_scope_keeps_standing_grants() {
     );
 }
 
-/// Raise one permission prompt and return the handler's JSON, for a request the
-/// caller expects to be answered WITHOUT a card.
-///
-/// Timed, because that expectation is the assertion: a request that still needs
-/// a human blocks here forever, and nothing in the test answers it. The timeout
-/// turns that into a failure instead of a hung suite.
 async fn prompt_once(
     client: &reqwest::Client,
     thread_id: Uuid,
@@ -631,7 +546,6 @@ async fn prompt_once(
     .expect("invalid JSON body")
 }
 
-/// How many permission cards this thread has persisted.
 async fn card_count(pool: &PgPool, thread_id: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM events \
@@ -643,7 +557,6 @@ async fn card_count(pool: &PgPool, thread_id: Uuid) -> i64 {
     .expect("count permission cards")
 }
 
-/// Read the workspace's current cc-allowed-tools via the settings endpoint.
 async fn read_cc_allowed_tools(client: &reqwest::Client) -> String {
     let resp = client
         .get(format!("{}/api/v1/cc-allowed-tools", base_url()))
@@ -655,7 +568,6 @@ async fn read_cc_allowed_tools(client: &reqwest::Client) -> String {
     body["contents"].as_str().unwrap_or("").to_string()
 }
 
-/// Restore the standing grants from a Settings snapshot.
 async fn restore_cc_allowed_tools(client: &reqwest::Client, contents: &str) {
     let resp = client
         .put(format!("{}/api/v1/cc-allowed-tools", base_url()))
@@ -669,13 +581,9 @@ async fn restore_cc_allowed_tools(client: &reqwest::Client, contents: &str) {
     );
 }
 
-/// GET/PUT round-trip of the workspace's `agent-allowed-commands` via the settings
-/// endpoints that back the Settings → Permissions → Lucidos Agent permissions
-/// list editor. Mirrors the `cc-allowed-tools` settings API.
 #[tokio::test]
 async fn agent_allowed_commands_settings_roundtrip() {
     let client = user_client().await;
-    // Snapshot, write a known body with a unique sentinel, read it back, restore.
     let snapshot = read_agent_allowed_commands(&client).await;
     let sentinel = format!("Bash(e2e-{}:*)", Uuid::new_v4().simple());
     let body =
@@ -689,8 +597,6 @@ async fn agent_allowed_commands_settings_roundtrip() {
         .expect("PUT agent-allowed-commands failed");
     assert!(put.status().is_success(), "PUT must succeed");
 
-    // GET returns the PUT's stored grant lines
-    // under the engine's own header. A comment the PUT carried is not a grant.
     let after = read_agent_allowed_commands(&client).await;
     assert_eq!(
         grant_lines(&after),
@@ -698,7 +604,6 @@ async fn agent_allowed_commands_settings_roundtrip() {
         "GET must return exactly the lines that were PUT; got:\n{after}"
     );
 
-    // Restore so the e2e workspace's allowlist is left as we found it.
     let restore = client
         .put(format!("{}/api/v1/agent-allowed-commands", base_url()))
         .json(&json!({ "contents": snapshot }))
@@ -708,7 +613,6 @@ async fn agent_allowed_commands_settings_roundtrip() {
     assert!(restore.status().is_success(), "restore PUT must succeed");
 }
 
-/// Read the workspace's agent-allowed-commands via the settings endpoint.
 async fn read_agent_allowed_commands(client: &reqwest::Client) -> String {
     let resp = client
         .get(format!("{}/api/v1/agent-allowed-commands", base_url()))
@@ -735,7 +639,6 @@ fn count_line(contents: &str, pattern: &str) -> usize {
         .count()
 }
 
-/// Stored patterns without editor comments and blank lines.
 fn grant_lines(contents: &str) -> Vec<&str> {
     contents
         .lines()
@@ -744,8 +647,6 @@ fn grant_lines(contents: &str) -> Vec<&str> {
         .collect()
 }
 
-/// End-to-end: open a permission_prompt, wait for the canonical request event,
-/// then resolve via /api/v1/mcp/consent with the given persist_scope.
 async fn persist_via_consent(
     client: &reqwest::Client,
     pool: &PgPool,
@@ -799,8 +700,6 @@ async fn persist_via_consent(
     assert_eq!(body["allowed"], true);
 }
 
-/// Poll the events table until a `CodingAgentPermissionRequest` for `thread_id`
-/// appears, returning the typed `request_id`. Panics on timeout.
 async fn wait_for_permission_request(
     pool: &PgPool,
     thread_id: Uuid,
@@ -827,15 +726,6 @@ async fn wait_for_permission_request(
     }
 }
 
-/// Regression: each allowlist editor records WHAT the permission became.
-///
-/// All three were a bare write plus rename, emitting nothing and resolving no
-/// actor, while every other mutation in the same router stamped both. A
-/// `PUT /api/v1/cc-allowed-tools` with `{"contents":"Bash(*)"}` left no row at
-/// all, so a widened grant could not be audited after the fact.
-///
-/// One test over all three lanes. Two of them were fixed once and the third was
-/// missed, which is the failure this covers.
 #[tokio::test]
 async fn every_allowlist_put_records_the_resulting_grants() {
     let client = user_client().await;
@@ -843,9 +733,6 @@ async fn every_allowlist_put_records_the_resulting_grants() {
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to database");
-    // A unique device per run, so concurrent runs cannot read each other's row.
-    // It has to be REGISTERED: widening a grant is gated, and an id naming no
-    // device is a header rather than identity (ADR 0169).
     let device = format!("e2e-grants-{}", Uuid::new_v4().simple());
     register_device(&device).await;
 
@@ -914,22 +801,9 @@ async fn every_allowlist_put_records_the_resulting_grants() {
     pool.close().await;
 }
 
-/// Regression: the auto-approve toggle names the device that flipped it.
-///
-/// It already emitted `McpServerUpdated` carrying the resulting value. What it
-/// did not do was resolve an actor: `McpManager::set_auto_approve` passed a
-/// hardcoded `None`, so every row was unattributed.
-///
-/// Runs against a server id that does not exist. The handler resolves the actor
-/// before the store looks the row up. No row means no event, so this pins the
-/// one thing a missing server still proves: the call is well-formed, and it
-/// answers rather than 500ing.
 #[tokio::test]
 async fn auto_approve_on_an_unknown_server_still_answers() {
     let client = user_client().await;
-    // The per-request header wins over the client's default, and the default's
-    // stamp names another device. So this id needs registering and stamping in
-    // its own right, or the gate refuses before the toggle runs.
     register_device("e2e-auto-approve").await;
     let resp = as_stamped_device(
         client.put(format!("{}/api/v1/mcp/auto-approve", base_url())),

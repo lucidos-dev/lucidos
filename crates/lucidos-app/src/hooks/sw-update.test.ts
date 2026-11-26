@@ -304,56 +304,81 @@ describe('refreshClient', () => {
 });
 
 describe('getServedBuildId', () => {
-  const originalNavigator = globalThis.navigator;
-  const originalFetch = globalThis.fetch;
+  const meta = (id: string) => '<meta name="lucidos-build-id" content="' + id + '">';
 
-  function stubNavigator(hasServiceWorker: boolean): void {
-    Object.defineProperty(globalThis, 'navigator', {
-      value: hasServiceWorker ? { serviceWorker: {} } : {},
-      configurable: true,
+  function stubResponse(response: Response): void {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('reads a meta tag split across chunks and cancels the remaining shell', async () => {
+    const encoder = new TextEncoder();
+    const cancel = vi.fn();
+    const shell = meta('63624440fc8f');
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(shell.slice(0, 20)));
+        controller.enqueue(encoder.encode(shell.slice(20)));
+      },
+      cancel,
     });
-  }
-  function stubFetchSwBody(body: string, ok = true): void {
-    globalThis.fetch = vi.fn(() => Promise.resolve({
-      ok,
-      text: () => Promise.resolve(body),
-    })) as unknown as typeof fetch;
-  }
-
-  beforeEach(() => stubNavigator(true));
-  afterEach(() => {
-    Object.defineProperty(globalThis, 'navigator', { value: originalNavigator, configurable: true });
-    globalThis.fetch = originalFetch;
+    stubResponse(new Response(stream));
+    expect(await getServedBuildId()).toBe('63624440fc8f');
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
-  it('returns null when service workers are unavailable', async () => {
-    stubNavigator(false);
-    stubFetchSwBody("const BUILD_ID = 'server999';");
+  it('stops at the byte cap', async () => {
+    stubResponse(new Response('é'.repeat(4096) + meta('63624440fc8f')));
     expect(await getServedBuildId()).toBe(null);
   });
 
-  it('returns the served build id when present', async () => {
-    stubFetchSwBody("const BUILD_ID = '63624440fc8f';");
+  it('falls back to text when there is no stream', async () => {
+    const response = new Response();
+    vi.spyOn(response, 'text').mockResolvedValue(meta('63624440fc8f'));
+    stubResponse(response);
     expect(await getServedBuildId()).toBe('63624440fc8f');
   });
 
-  it('returns null for the un-stamped placeholder (dev server)', async () => {
-    stubFetchSwBody("const BUILD_ID = '__LUCIDOS_BUILD_ID__';");
+  it('returns null for the unstamped placeholder (dev server)', async () => {
+    stubResponse(new Response(meta('__LUCIDOS_BUILD_ID__')));
     expect(await getServedBuildId()).toBe(null);
   });
 
-  it('returns null when sw.js has no BUILD_ID line', async () => {
-    stubFetchSwBody('// some unrelated worker without the marker');
+  it('returns null when the shell has no build id', async () => {
+    stubResponse(new Response('<html><head></head></html>'));
+    expect(await getServedBuildId()).toBe(null);
+  });
+
+  it('ignores a fallback shell while the trusted peer client is running', async () => {
+    vi.stubGlobal('document', {
+      querySelector: (selector: string) => selector === 'meta[name="lucidos-peer-client"]'
+        ? { getAttribute: () => 'peer' }
+        : null,
+    });
+    const fallback = '<meta name="lucidos-peer-client-unavailable" content="peer">';
+    stubResponse(new Response(fallback + meta('63624440fc8f')));
+    expect(await getServedBuildId()).toBe(null);
+  });
+
+  it('still checks for installed client updates while the fallback client is running', async () => {
+    const fallback = '<meta name="lucidos-peer-client-unavailable" content="peer">';
+    stubResponse(new Response(fallback + meta('63624440fc8f')));
+    expect(await getServedBuildId()).toBe('63624440fc8f');
+  });
+
+  it('returns null for a pairing shell', async () => {
+    stubResponse(new Response(meta('63624440fc8f'), { headers: { 'x-lucidos-pairing': '1' } }));
     expect(await getServedBuildId()).toBe(null);
   });
 
   it('returns null on a non-ok response', async () => {
-    stubFetchSwBody("const BUILD_ID = '63624440fc8f';", false);
+    stubResponse(new Response(meta('63624440fc8f'), { status: 503 }));
     expect(await getServedBuildId()).toBe(null);
   });
 
-  it('returns null (best-effort) when the fetch rejects', async () => {
-    globalThis.fetch = vi.fn(() => Promise.reject(new Error('offline'))) as unknown as typeof fetch;
+  it('returns null when the fetch rejects', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
     expect(await getServedBuildId()).toBe(null);
   });
 });

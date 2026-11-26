@@ -1,28 +1,15 @@
-//! LLM-facing schemas for image tools (save_thread_image, generate_image,
-//! view_image).
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
-/// The two that read an image the thread already has. Ungated: neither needs
-/// an image-generation provider.
 pub(super) fn thread_image_tools() -> Vec<ToolDefinition> {
     vec![get_save_thread_image_tool(), get_view_image_tool()]
 }
 
-/// The one that synthesizes an image, offered only where a provider is
-/// configured to do it (ADR 0088).
 pub(super) fn generation_tools() -> Vec<ToolDefinition> {
     vec![get_image_generation_tool()]
 }
 
-/// Tool for pulling an image posted earlier in the thread back into vision.
-///
-/// Recently-posted images are already in the model's vision; older ones age out
-/// of the auto-included window and only survive in the history as a text note +
-/// description. This tool re-loads any thread image's actual pixels on demand so
-/// the model can look at it again ("the image I posted earlier").
 pub fn get_view_image_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::VIEW_IMAGE.to_string(),
@@ -40,7 +27,6 @@ pub fn get_view_image_tool() -> ToolDefinition {
     }
 }
 
-/// Tool for saving a thread image to an artifact path.
 pub fn get_save_thread_image_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SAVE_THREAD_IMAGE.to_string(),
@@ -62,7 +48,6 @@ pub fn get_save_thread_image_tool() -> ToolDefinition {
     }
 }
 
-/// Tool for generating or editing images.
 pub fn get_image_generation_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::GENERATE_IMAGE.to_string(),

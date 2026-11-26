@@ -1,6 +1,3 @@
-//! `/api/v1/release-notices`: what this workspace still owes the reader, and
-//! the answer that settles one.
-
 use crate::support::{base_url, http_client, user_client};
 use serde_json::Value;
 
@@ -19,7 +16,6 @@ async fn fetch_list() -> Value {
         .expect("Invalid JSON")
 }
 
-/// Grouped and older desktop clients read the same item and answer state.
 #[tokio::test]
 async fn the_list_serves_both_surfaces_from_one_shape() {
     let resp = http_client()
@@ -76,7 +72,6 @@ async fn the_list_serves_both_surfaces_from_one_shape() {
             notice["resolved"].is_boolean(),
             "the panel reads `resolved` per notice: {notice}"
         );
-        // The parser pairs each button with exactly one action.
         assert_eq!(
             notice["action_label"].is_string(),
             notice["action_prompt"].is_string(),
@@ -85,8 +80,6 @@ async fn the_list_serves_both_surfaces_from_one_shape() {
     }
 }
 
-/// A resolve names a notice, so an id this build does not carry is a 404 rather
-/// than a silent no-op. The cursor must never move to a name nothing defines.
 #[tokio::test]
 async fn resolving_an_unknown_notice_is_refused() {
     let resp = user_client()
@@ -99,11 +92,6 @@ async fn resolving_an_unknown_notice_is_refused() {
     assert_eq!(resp.status(), 404);
 }
 
-/// Answering the same notice twice changes nothing and is not an error.
-///
-/// Two devices showing one modal is the ordinary case, so the second answer has
-/// to be a quiet no-op. This runs against whichever notice the e2e workspace has
-/// already settled, and skips only a build that ships none at all.
 #[tokio::test]
 async fn answering_a_settled_notice_changes_nothing() {
     let before = fetch_list().await;
@@ -117,8 +105,6 @@ async fn answering_a_settled_notice_changes_nothing() {
         return;
     };
 
-    // Resolving walks the workspace past the notice, so the caller has to be
-    // one the engine can name (ADR 0169). Reading the list needs nobody.
     let resp = user_client()
         .await
         .post(format!("{}/resolve", list_url()))
@@ -128,9 +114,6 @@ async fn answering_a_settled_notice_changes_nothing() {
         .expect("resolve request failed");
     assert_eq!(resp.status(), 200);
 
-    // Asserted per notice rather than as whole-list equality: these tests share
-    // one workspace, and a sibling answering the owed notice concurrently would
-    // legitimately change the list around this one.
     let after: Value = resp.json().await.expect("Invalid JSON");
     let row = after["notices"]
         .as_array()
@@ -146,9 +129,6 @@ async fn answering_a_settled_notice_changes_nothing() {
     );
 }
 
-/// Answering settles the notice and hands back the same list shape, so the
-/// caller needs no second request to know what is left. Skipped when this build
-/// ships no outstanding notice, which is the ordinary state of most releases.
 #[tokio::test]
 async fn answering_the_owed_notice_settles_it() {
     let before = fetch_list().await;

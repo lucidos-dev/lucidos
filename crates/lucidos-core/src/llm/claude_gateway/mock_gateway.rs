@@ -1,8 +1,3 @@
-//! A Claude gateway on loopback, for tests: discovery, device authorization, a
-//! token endpoint answering from a script, revocation, managed settings, an
-//! OTLP logs receiver, and a paged model listing.
-
-// Some inspection helpers are only used by this crate's own tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{HashMap, VecDeque};
@@ -17,7 +12,6 @@ use axum::Json;
 use super::discovery::document;
 use super::GatewayOrigin;
 
-/// One request the mock saw.
 #[derive(Debug, Clone)]
 pub(crate) struct Seen {
     pub path: String,
@@ -27,8 +21,6 @@ pub(crate) struct Seen {
     pub if_none_match: Option<String>,
 }
 
-/// What `GET /managed/settings` answers: a status, a body, and an `ETag`. A
-/// request whose `If-None-Match` names the `ETag` gets `304`.
 #[derive(Clone)]
 struct ManagedSettingsReply {
     status: StatusCode,
@@ -38,7 +30,6 @@ struct ManagedSettingsReply {
 
 type Replies = Arc<Mutex<VecDeque<(StatusCode, serde_json::Value)>>>;
 
-/// One OTLP export the mock received at `POST /v1/logs`.
 #[derive(Debug, Clone)]
 pub(crate) struct LogsRequest {
     pub body: Vec<u8>,
@@ -51,11 +42,9 @@ impl LogsRequest {
     }
 }
 
-/// The model listing: every id, and how many one page holds.
 struct Listing {
     ids: Vec<String>,
     page_size: usize,
-    /// A bearer the listing answers `401` to.
     rejected_bearer: Option<String>,
 }
 
@@ -235,18 +224,14 @@ impl MockGateway {
         }
     }
 
-    /// The OTLP exports received, oldest first.
     pub(crate) fn logs_requests(&self) -> Vec<LogsRequest> {
         self.logs.lock().unwrap().clone()
     }
 
-    /// Queue the status of the next OTLP export. Unqueued, an export gets `200`.
     pub(crate) fn reply_to_logs(&self, status: StatusCode) {
         self.logs_replies.lock().unwrap().push_back(status);
     }
 
-    /// Answer `GET /managed/settings` with `status` and `body`, tagged `etag`.
-    /// Until called, the gateway has no policy (`404`).
     pub(crate) fn serve_managed_settings(
         &self,
         status: StatusCode,
@@ -260,24 +245,20 @@ impl MockGateway {
         };
     }
 
-    /// Serve `ids` from `GET /v1/models`, `page_size` to a page.
     pub(crate) fn list_models(&self, ids: &[&str], page_size: usize) {
         let mut listing = self.listing.lock().unwrap();
         listing.ids = ids.iter().map(|id| id.to_string()).collect();
         listing.page_size = page_size;
     }
 
-    /// Answer `401` to a listing read with `bearer`.
     pub(crate) fn reject_listing_for(&self, bearer: &str) {
         self.listing.lock().unwrap().rejected_bearer = Some(bearer.to_string());
     }
 
-    /// Queue the token endpoint's next answer.
     pub fn reply_to_token(&self, status: StatusCode, body: serde_json::Value) {
         self.token_replies.lock().unwrap().push_back((status, body));
     }
 
-    /// Queue an OAuth error answer, such as `authorization_pending`.
     pub fn refuse_token(&self, error: &str) {
         self.reply_to_token(
             StatusCode::BAD_REQUEST,
@@ -285,7 +266,6 @@ impl MockGateway {
         );
     }
 
-    /// Change one field of the device authorization answer.
     pub fn set_device_field(&self, field: &str, value: serde_json::Value) {
         self.device_reply.lock().unwrap()[field] = value;
     }
@@ -298,7 +278,6 @@ impl MockGateway {
         self.seen().into_iter().map(|s| s.path).collect()
     }
 
-    /// The forms posted to the token endpoint, oldest first.
     pub fn token_forms(&self) -> Vec<HashMap<String, String>> {
         self.seen()
             .into_iter()

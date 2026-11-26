@@ -1,15 +1,3 @@
-//! Direct-Anthropic backend for `web_search` — the `web_search` **server tool**
-//! on `/v1/messages`.
-//!
-//! Anthropic runs the search itself and returns the results inline, so this is a
-//! single round trip with no client-side execution loop and no extra credential:
-//! it reuses the Anthropic key the user already configured for chat.
-//!
-//! Deliberately a small one-shot call rather than a reuse of
-//! [`crate::llm::anthropic::AnthropicProvider`] — that path is built for
-//! streaming chat with a tool loop, none of which applies here. It does share
-//! that module's auth-header and API-version constants so the two can't drift.
-
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -20,22 +8,16 @@ use crate::llm::anthropic_wire::{thinking_mode, ThinkingMode};
 use crate::llm::metered::CallToken;
 use crate::llm::ANTHROPIC_API_BASE_URL;
 
-/// Output ceiling for the summary Claude writes over the search results. Small
-/// on purpose: it bounds the cost of a search whatever model tier the caller
-/// picks, so reusing the user's own Anthropic chat model (see
-/// `provider_build::search_model_for`) can't turn one search into a large bill.
 const MAX_TOKENS: u32 = 2048;
 
-/// The ceiling for a model that thinks unless told otherwise. Thinking counts
+/// INVARIANT: The ceiling for a model that thinks unless told otherwise. Thinking counts
 /// toward `max_tokens`, so 2048 could run out before the summary began. Such a
 /// request also sends effort `low`, which keeps the thinking itself small.
 const THINKING_MAX_TOKENS: u32 = 8192;
 
-/// Whole-request timeout. A grounded search that hasn't answered by now is not
-/// going to; failing lets the chain try the next backend.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How many searches Claude may run to answer one `web_search` tool call.
+/// INVARIANT: How many searches Claude may run to answer one `web_search` tool call.
 ///
 /// Deliberately NOT tied to `max_results`, which is a *display* cap on how many
 /// sources to list. They measure different things, and conflating them turns a
@@ -45,7 +27,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// single tool call into a research session.
 const MAX_SEARCHES: u32 = 3;
 
-/// Pick the server-tool version the model will accept.
+/// INVARIANT: Pick the server-tool version the model will accept.
 ///
 /// The `_20260209` variant (dynamic filtering) is rejected with a 400 on models
 /// that predate it, so this pairing is load-bearing rather than cosmetic. The
@@ -75,8 +57,6 @@ fn search_tool_type_for(model: &str) -> &'static str {
     }
 }
 
-/// Build the `/v1/messages` body. Pure, so the shape is unit-testable without
-/// a network call.
 fn build_request(model: &str, query: &str) -> serde_json::Value {
     let thinks_by_default = matches!(
         thinking_mode(model),
@@ -99,15 +79,6 @@ fn build_request(model: &str, query: &str) -> serde_json::Value {
     body
 }
 
-/// Flatten the response into the same shape every other backend returns: answer
-/// text, then a numbered `Sources:` list.
-///
-/// Two response shapes need care:
-/// - A `web_search_tool_result` block's `content` is a **list** on success but
-///   an **object** carrying `error_code` on failure. Indexing it blindly would
-///   silently yield zero sources for a failed search that still returned 200.
-/// - `stop_reason: "refusal"` is a 200 with no usable content, so it must be
-///   reported as an error rather than as an empty answer.
 fn parse_response(
     body: &serde_json::Value,
     max_results: usize,
@@ -130,7 +101,6 @@ fn parse_response(
             }
             Some("web_search_tool_result") => {
                 let content = &block["content"];
-                // Error shape: an object with `error_code`, not a result list.
                 if let Some(code) = content["error_code"].as_str() {
                     return Err(format!("Anthropic web search failed: {code}").into());
                 }
@@ -150,7 +120,7 @@ fn parse_response(
         }
     }
 
-    // Truncation that produced nothing usable is a FAILURE, not an empty
+    // INVARIANT: Truncation that produced nothing usable is a FAILURE, not an empty
     // search. Returning the "no results" line here would be `Ok`, which the
     // chain treats as terminal — so a search that was merely cut short would
     // stop the chain and report "nothing found" to the user. Same class of bug
@@ -165,7 +135,7 @@ fn parse_response(
         );
     }
 
-    // A genuinely empty result renders as the "no results" line and stays `Ok`,
+    // INVARIANT: A genuinely empty result renders as the "no results" line and stays `Ok`,
     // so the chain treats it as terminal instead of re-billing the query.
     Ok(format_search_result(&answer, &sources))
 }
@@ -185,7 +155,7 @@ impl AnthropicServerToolSearch {
         }
     }
 
-    /// `model` MUST be a model **Anthropic** serves — the caller resolves it via
+    /// INVARIANT: `model` MUST be a model **Anthropic** serves — the caller resolves it via
     /// `provider_build::search_model_for`, which uses the user's chat model only
     /// when that model routes to Anthropic and a known Anthropic id otherwise.
     /// Passing the raw chat model would break the headline case: a user on
@@ -222,8 +192,6 @@ impl WebSearchProvider for AnthropicServerToolSearch {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Content-Type", "application/json")
             .header(auth_name, auth_value);
-        // A subscription OAuth token is only accepted on the Messages API with
-        // this beta flag; an API key must not send it.
         if matches!(self.auth, AnthropicAuth::OAuthBearer(_)) {
             request = request.header("anthropic-beta", ANTHROPIC_OAUTH_BETA);
         }
@@ -288,7 +256,6 @@ mod tests {
         }
     }
 
-    /// The tool version must match the model family or the API 400s.
     #[test]
     fn tool_version_pairs_with_the_model_family() {
         for model in [
@@ -320,8 +287,6 @@ mod tests {
         }
     }
 
-    /// An unrecognized model must fall to the basic variant — accepted
-    /// everywhere — rather than the newer one, which would 400.
     #[test]
     fn unknown_model_falls_back_to_the_basic_tool() {
         assert_eq!(
@@ -330,11 +295,6 @@ mod tests {
         );
     }
 
-    /// `max_uses` is clamped so one `web_search` call can't fan out into an
-    /// unbounded number of billed searches.
-    /// `max_uses` bounds SEARCHES and must not track `max_results`, which is a
-    /// display cap on sources. Tying them together made a caller asking for more
-    /// sources silently pay for more searches.
     #[test]
     fn max_uses_is_independent_of_max_results() {
         for query in ["a", "b"] {
@@ -343,9 +303,6 @@ mod tests {
                 MAX_SEARCHES
             );
         }
-        // A const block, so a MAX_SEARCHES of 0 fails to COMPILE rather than
-        // failing this one test — the bound is a property of the constant, not
-        // of any particular run.
         const { assert!(MAX_SEARCHES >= 1, "at least one search must be permitted") };
     }
 
@@ -357,8 +314,6 @@ mod tests {
         assert_eq!(req["tools"][0]["name"], "web_search");
     }
 
-    /// A model that thinks unless told otherwise spends part of `max_tokens`
-    /// on thinking, so 2048 could end the search with no summary at all.
     #[test]
     fn a_model_that_thinks_by_default_searches_at_low_effort_with_room() {
         for model in [
@@ -418,9 +373,6 @@ mod tests {
         assert!(!out.contains("3. C"), "must truncate to max_results: {out}");
     }
 
-    /// A failed search returns HTTP 200 with an `error_code` OBJECT where the
-    /// result list would be. Treating that as "zero sources" would report a
-    /// broken search as an empty one and stop the chain from falling through.
     #[test]
     fn tool_result_error_object_is_an_error_not_an_empty_result() {
         let body = serde_json::json!({
@@ -433,8 +385,6 @@ mod tests {
         assert!(err.to_string().contains("max_uses_exceeded"), "{err}");
     }
 
-    /// A refusal is a 200 with no usable content — must surface as an error, so
-    /// the chain can try another backend rather than returning nothing.
     #[test]
     fn refusal_is_an_error() {
         let body = serde_json::json!({"stop_reason": "refusal", "content": []});
@@ -442,9 +392,6 @@ mod tests {
         assert!(err.to_string().contains("refusal"), "{err}");
     }
 
-    /// Truncated-to-nothing must be an ERROR so the chain falls through. As
-    /// `Ok`, it would render "no results found" and stop the chain — reporting
-    /// a cut-short search as a genuinely empty one.
     #[test]
     fn truncated_to_nothing_is_an_error_not_an_empty_result() {
         let body = serde_json::json!({"stop_reason": "max_tokens", "content": []});
@@ -452,8 +399,6 @@ mod tests {
         assert!(err.to_string().contains("output cap"), "{err}");
     }
 
-    /// …but a truncated response that still carried sources keeps them: partial
-    /// is useful, and erroring would discard a real answer.
     #[test]
     fn truncated_with_sources_still_returns_them() {
         let body = serde_json::json!({
@@ -466,8 +411,6 @@ mod tests {
         assert!(out.contains("1. A"), "{out}");
     }
 
-    /// A genuinely empty search is `Ok` — the chain must treat it as terminal
-    /// rather than re-running the query against every other backend.
     #[test]
     fn genuinely_empty_result_is_ok_not_an_error() {
         let body = serde_json::json!({"stop_reason": "end_turn", "content": []});

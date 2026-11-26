@@ -8,7 +8,6 @@ use crate::auth;
 use crate::engine_hop::test_engine;
 use crate::server::GatewayState;
 
-/// An engine whose shared unread count differs from each authenticated inbox.
 pub(crate) async fn install_inbox(state: &GatewayState, first_device: String) -> tempfile::TempDir {
     let dir = test_engine::scratch();
     let key = lucidos_gateway_stamp::StampKey::generate().unwrap();
@@ -159,15 +158,12 @@ async fn background_totals_select_only_known_recipients_and_keep_desktop_aggrega
         ("?recipient-device-id=second", json!(3)),
         ("?recipient-device-id=revoked", Value::Null),
         ("?recipient-device-id=", Value::Null),
-        // The desktop sum is the shared count the stack holds. It asks no engine.
         ("", json!(12)),
     ] {
         let (status, body) = total(&state, query, None, true).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["total"], expected, "{query}");
     }
-    // A push total asks the engine each time. A held count that a frame has
-    // not yet dropped, and a stopped subscription, both leave it right.
     let stack = state.stack_for_test("dev").await;
     {
         let mut s = stack.lock().await;
@@ -178,7 +174,6 @@ async fn background_totals_select_only_known_recipients_and_keep_desktop_aggrega
     assert_eq!(total(&state, second, None, true).await.1["total"], 3);
     stack.lock().await.stop_row_subscription();
     assert_eq!(total(&state, second, None, true).await.1["total"], 3);
-    // A failed personal read is still unknown, never a partial sum.
     let dead = test_engine::scratch();
     state.set_route_for_test("dev", test_engine::unreachable(&dead));
     assert_eq!(

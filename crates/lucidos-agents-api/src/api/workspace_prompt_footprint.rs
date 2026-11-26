@@ -1,8 +1,3 @@
-//! `GET /api/v1/workspace-prompt-footprint`: what each workspace-grown section
-//! of a chat turn costs, against the user's ceilings, with the items unused
-//! for the window (ADR 0413). The Settings page, the `lucidos` CLI and the
-//! workspace audit all read this one report.
-
 use crate::engine::chat::process::footprint_sections::FootprintSectionsExt;
 use axum::{extract::State, routing::get, Json, Router};
 

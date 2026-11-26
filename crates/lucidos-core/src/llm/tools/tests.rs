@@ -1,9 +1,6 @@
 use super::*;
 use crate::llm::tool_names as tn;
 
-/// `todo_write` is registered on the chat-agent tool list (Lucidos Agent's
-/// runtime todo list — chat + trigger surfaces). NOT registered on the CC
-/// tool list, which has its own native `TodoWrite`.
 #[test]
 fn todo_write_is_in_chat_agent_default_tools() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -23,9 +20,6 @@ fn todo_write_is_in_chat_agent_default_tools() {
         Some("array"),
         "todos must be an array",
     );
-    // `todos` is NOT schema-required, because the read action takes no list and
-    // JSON Schema cannot make one field depend on another. The handler is the
-    // gate instead, and `todo_write_rejects_missing_todos_field` pins it.
     let required = tool
         .parameters
         .get("required")
@@ -45,10 +39,6 @@ fn todo_write_is_in_chat_agent_default_tools() {
     assert_eq!(actions, &serde_json::json!(["write", "read"]));
 }
 
-/// Plugin management is the grouped `plugins` manifest tool (it consolidated the
-/// five flat plugin tools). It's spliced from `capability_manifest::llm_tools()`,
-/// not `get_default_tools()` — assert the grouped tool exposes the
-/// register_marketplace action and its `source` property.
 #[test]
 fn plugins_grouped_tool_exposes_register_marketplace() {
     let tools = crate::capability_manifest::llm_tools();
@@ -76,17 +66,11 @@ fn plugins_grouped_tool_exposes_register_marketplace() {
         "plugins tool must accept a `source` property"
     );
 
-    // The retired flat name still resolves to the plugins domain (back-compat).
     let domain = crate::capability_manifest::domain_for_tool("register_plugin_marketplace")
         .expect("register_plugin_marketplace alias must resolve");
     assert_eq!(domain.name, "plugins");
 }
 
-/// The chat agent's `ask_user_question` MUST expose the same schema CC's
-/// `AskUserQuestion` does, because the same engine-side parser
-/// (`parse_ask_user_question_inputs`) consumes both. Drift here would make
-/// the chat tool either parse-fail or render question cards without
-/// buttons.
 #[test]
 fn ask_user_question_tool_is_in_default_set() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -95,7 +79,6 @@ fn ask_user_question_tool_is_in_default_set() {
         .find(|t| t.name == tn::ASK_USER_QUESTION)
         .expect("ask_user_question must be in the default chat tool set");
 
-    // Top-level shape: an array of `questions`.
     let props = tool
         .parameters
         .get("properties")
@@ -121,23 +104,13 @@ fn ask_user_question_tool_is_in_default_set() {
         required_names
     );
 
-    // The chat card's own field, outside the shape CC shares: optional, and a
-    // string the engine shows verbatim above the first card.
     let message = props.get("message").expect("schema must expose `message`");
     assert_eq!(message.get("type").and_then(|v| v.as_str()), Some("string"));
     assert!(!required_names.contains(&"message"));
-    // A mockup is what the field most often has to carry, and the one thing
-    // the summary of a pre-card reply always drops.
     let description = message["description"].as_str().unwrap_or_default();
     assert!(description.contains("pictures"), "{description}");
 }
 
-/// Regression guard for the reported card: a timezone question whose fourth
-/// option was "Other, I'll type it". There is no text-entry option kind, so
-/// `answer_kind_to_hook_value` resolves that pick to its LABEL and the model gets
-/// "Other, I'll type it" as the user's decision. The description used to say
-/// "Always include an option that lets the user opt out", which is what
-/// produced the button, so the ban has to replace it rather than sit beside it.
 #[test]
 fn ask_user_question_description_bans_a_text_entry_escape_option() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -163,18 +136,12 @@ fn ask_user_question_description_bans_a_text_entry_escape_option() {
         !desc.contains("Always include an option that lets the user opt out"),
         "the opt-out instruction must be gone, it is what produced the button:\n{desc}"
     );
-    // The ban is about TEXT-ENTRY escapes only. An option carrying a decision
-    // the agent can act on stays legal, or the agent drops real Cancel choices.
     assert!(
         desc.contains("None of these") && desc.contains("still welcome"),
         "description must keep a meaningful opt-out option legal:\n{desc}"
     );
 }
 
-/// Each question carries `question` text, an `options` array of
-/// `{label, description?}`, and an optional `multiSelect` flag. CC's
-/// `header` chip is deliberately absent: Lucidos never renders it, and
-/// models filled it instead of the required `question`.
 #[test]
 fn ask_user_question_per_question_schema() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -203,7 +170,6 @@ fn ask_user_question_per_question_schema() {
          and models sent it in place of `question`"
     );
 
-    // Per-question required: at minimum `question` and `options`.
     let item_required = item_schema
         .get("required")
         .and_then(|v| v.as_array())
@@ -218,8 +184,6 @@ fn ask_user_question_per_question_schema() {
         );
     }
 
-    // Each option carries `label` and optional `description` — the shape
-    // QuestionCard renders verbatim.
     let option_schema = item_props
         .get("options")
         .and_then(|o| o.get("items"))
@@ -247,12 +211,6 @@ fn ask_user_question_per_question_schema() {
     );
 }
 
-/// `run_python` was for a long time the only one of the four exec tools whose
-/// description named no limit, while its three siblings all pointed at
-/// "run_python's 300s sync ceiling" that the python path did not actually
-/// enforce. The mechanism exists now (`runtime::python`), so the tool that
-/// owns it has to say so: an agent that only learns about the ceiling by
-/// being killed at it has already burned the turn.
 #[test]
 fn run_python_states_its_hard_ceiling_and_the_escape_hatch() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -270,8 +228,6 @@ fn run_python_states_its_hard_ceiling_and_the_escape_hatch() {
         desc.contains("run_python_background"),
         "the description must name the tool to use for longer work: {desc:?}"
     );
-    // `timeout_secs` is deliberately NOT on this tool: the ceiling is fixed,
-    // and advertising a knob the handler ignores is worse than silence.
     let props = tool
         .parameters
         .get("properties")
@@ -282,9 +238,6 @@ fn run_python_states_its_hard_ceiling_and_the_escape_hatch() {
     );
 }
 
-/// The thread's waiting row names a background task by its `description`, so
-/// both background tools ask for one. Optional, a model would skip it and the
-/// row would fall back to a raw command.
 #[test]
 fn both_background_tools_require_a_description() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -307,12 +260,6 @@ fn both_background_tools_require_a_description() {
     }
 }
 
-/// `run_python_background` mirrors `run_bash_background`'s task_id /
-/// drain / kill contract, but lifts the venv + `packages` auto-install
-/// from `run_python`. Pin its registration + schema shape so a refactor
-/// that drops the tool, renames its args, or makes `code` optional trips
-/// this test instead of leaving the LLM unable to spawn long-running
-/// scientific-python workloads.
 #[test]
 fn run_python_background_is_in_chat_agent_default_tools() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -321,9 +268,6 @@ fn run_python_background_is_in_chat_agent_default_tools() {
         .find(|t| t.name == tn::RUN_PYTHON_BACKGROUND)
         .expect("run_python_background must be in get_default_tools()");
 
-    // `code` must be a required string — without it the tool has nothing
-    // to spawn. `packages` and `timeout_secs` are optional (zero-package
-    // scripts are valid; default timeout is BG_DEFAULT_TIMEOUT_SECS).
     let props = tool
         .parameters
         .get("properties")
@@ -357,11 +301,6 @@ fn run_python_background_is_in_chat_agent_default_tools() {
         required_names
     );
 
-    // The description must steer the LLM toward this tool for the gap
-    // that motivated it: scientific-python tasks that may exceed
-    // run_python's 300s sync ceiling. Without these triggers in the
-    // text, the LLM will keep reaching for run_python and getting
-    // killed mid-stream.
     let desc = tool.description.as_str();
     assert!(
         desc.contains("background"),
@@ -377,12 +316,6 @@ fn run_python_background_is_in_chat_agent_default_tools() {
     );
 }
 
-/// `bash_output(wait_secs)` is the server-side block that replaces the
-/// chat-agent sleep-poll antipattern (spawn `run_python_background`,
-/// then issue a fresh `run_python` with `time.sleep(N)` — two wasted
-/// tool calls per wait). Pin the schema + description steer so a
-/// refactor that drops the param or weakens the wording fails here
-/// instead of silently re-enabling the antipattern.
 #[test]
 fn bash_output_schema_advertises_wait_secs_and_steers_away_from_sleep_poll() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -404,8 +337,6 @@ fn bash_output_schema_advertises_wait_secs_and_steers_away_from_sleep_poll() {
         "wait_secs must be an integer (clamped at the dispatcher)"
     );
 
-    // wait_secs is optional — the legacy non-blocking drain still
-    // works without it.
     let required = tool
         .parameters
         .get("required")
@@ -432,12 +363,6 @@ fn bash_output_schema_advertises_wait_secs_and_steers_away_from_sleep_poll() {
         "description must name run_python as the wrong place to poll: {desc:?}"
     );
 
-    // The terminal contract, which is what the drain-at-completion fix makes
-    // honest. A drain landing at the instant a task finished used to return
-    // `unknown task_id`, so the agent lost successful work; the registry now
-    // retains the completion. Both halves of the promise have to survive a
-    // reword: the shape the agent looks for, and the instruction to stop once
-    // it sees it.
     assert!(
         desc.contains("finished=true"),
         "description must name the finished=true terminal shape: {desc:?}"
@@ -448,9 +373,6 @@ fn bash_output_schema_advertises_wait_secs_and_steers_away_from_sleep_poll() {
     );
 }
 
-/// The chat tool's declared schema must round-trip through the same parser
-/// CC's hook uses — guarantees zero drift in what the engine actually
-/// understands.
 #[test]
 fn ask_user_question_schema_parses_with_cc_parser() {
     use crate::engine::question_parsing::parse_ask_user_question_inputs;
@@ -482,8 +404,6 @@ fn ask_user_question_schema_parses_with_cc_parser() {
     assert!(!parsed[0].multi_select);
 }
 
-/// The chat tool has no `preview`, so an option's picture goes in its
-/// description, which the card renders as inline markdown.
 #[test]
 fn ask_user_question_schema_puts_an_option_picture_on_its_option() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -507,13 +427,6 @@ fn ask_user_question_schema_puts_an_option_picture_on_its_option() {
     );
 }
 
-/// The `tap` param in the `send_notification` tool schema is a structured
-/// `{kind, to?}` object (not an enum-of-strings) — see the locked plan-mode
-/// design. Verify the schema's `tap` property advertises type=object and the
-/// two supported `kind` values in its description so the LLM emits valid taps.
-/// (The passive `none` kind was retired —
-/// docs/plans/2026-07-02-remove-notification-tap-none.md — so the schema must
-/// NOT advertise it.)
 #[test]
 fn send_notification_schema_tap_documents_object_shape() {
     let tool = get_notification_tool();
@@ -545,8 +458,6 @@ fn send_notification_schema_tap_documents_object_shape() {
     );
 }
 
-/// Explain delivery outcomes without promising an OS push to an active user.
-/// Toasts, auto-read and silencing suppress push; fullscreen can leave it allowed.
 #[test]
 fn send_notification_description_explains_active_device_gets_toast_not_push() {
     let desc = get_notification_tool().description;
@@ -577,9 +488,6 @@ fn tap_modal_round_trips_as_kind_object() {
 
 #[test]
 fn tap_legacy_none_coerces_to_modal() {
-    // `Tap::None` was retired (docs/plans/2026-07-02-remove-notification-tap-none.md).
-    // Historical `{"kind":"none"}` event/row payloads must still deserialize — as
-    // Modal — so a projection rebuild never fails or re-emits a `none` row.
     use crate::engine::thread_events::notification::Tap;
 
     let parsed: Tap = serde_json::from_value(serde_json::json!({"kind": "none"})).expect("parse");
@@ -590,10 +498,6 @@ fn tap_legacy_none_coerces_to_modal() {
     );
 }
 
-/// `list_changes` / `apply_change` consolidated into the grouped `changes`
-/// manifest tool (action enum list/apply, exposing `change_id` for apply). It's
-/// spliced from `capability_manifest::llm_tools()`. Pin the grouped tool's shape
-/// and that the flat names still resolve as back-compat aliases.
 #[test]
 fn changes_grouped_tool_exposes_list_and_apply() {
     let tools = crate::capability_manifest::llm_tools();
@@ -635,7 +539,6 @@ fn changes_grouped_tool_exposes_list_and_apply() {
         "change_id must be a string"
     );
 
-    // Flat aliases still resolve to the changes domain (back-compat).
     for alias in [
         tn::LIST_CHANGES,
         tn::APPLY_CHANGE,
@@ -649,13 +552,6 @@ fn changes_grouped_tool_exposes_list_and_apply() {
     }
 }
 
-/// Active-consolidation guard: the flat per-verb tools that were folded into
-/// grouped manifest tools must NOT reappear in `get_default_tools()` — otherwise
-/// the model would see both the flat tool AND the grouped tool, growing the
-/// selection surface the consolidation exists to shrink. The flat names stay
-/// wired as dispatch aliases (resolved via the manifest), but are no longer
-/// advertised. Each consolidated capability is instead offered as exactly one
-/// grouped tool from `capability_manifest::llm_tools()`.
 #[test]
 fn consolidated_flat_tools_are_not_advertised() {
     let default_tools = get_default_tools(&ToolCapabilities::all_open());
@@ -665,7 +561,6 @@ fn consolidated_flat_tools_are_not_advertised() {
         .map(|t| t.name.clone())
         .collect();
 
-    // Folded flat tools must be absent from the advertised default set.
     for flat in [
         tn::EMIT_EVENT,
         tn::QUERY_EVENTS,
@@ -686,7 +581,6 @@ fn consolidated_flat_tools_are_not_advertised() {
         );
     }
 
-    // Each grouped tool is contributed exactly once by the manifest.
     for grouped in [
         tn::EVENTS,
         tn::CHANGES,
@@ -707,7 +601,6 @@ fn consolidated_flat_tools_are_not_advertised() {
         );
     }
 
-    // The hot single-purpose tools the guardrail protects stay standalone.
     for standalone in [
         tn::READ_FILE,
         tn::WRITE_FILE,
@@ -726,11 +619,6 @@ fn consolidated_flat_tools_are_not_advertised() {
     }
 }
 
-/// The grouped `events` tool consolidated emit, query, count and event_types.
-/// Pin its action enum and that the flat names still resolve as aliases.
-///
-/// `event_types` is load-bearing for a subscription: a name outside the engine's
-/// set is refused, and this action is where the caller reads the real names.
 #[test]
 fn events_grouped_tool_exposes_every_action() {
     let tools = crate::capability_manifest::llm_tools();
@@ -761,11 +649,6 @@ fn events_grouped_tool_exposes_every_action() {
     }
 }
 
-/// Thread Queue read/tune is the grouped `thread_queue` manifest tool (list +
-/// update_policy; run-now/drop are CLI-only). Without this surface, the LLM
-/// falls back to `curl` against local engine ports. Pin the grouped tool's
-/// action enum, every policy field on the update_policy union, and that the flat
-/// names still resolve as aliases.
 #[test]
 fn thread_queue_grouped_tool_exposes_list_and_update_policy() {
     let tools = crate::capability_manifest::llm_tools();
@@ -786,10 +669,8 @@ fn thread_queue_grouped_tool_exposes_list_and_update_policy() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    // run-now/drop are CLI-only, so the LLM action enum is list + update_policy.
     assert_eq!(action_names, vec!["list", "update_policy"]);
 
-    // The update_policy union contributes every capacity-policy field.
     for field in [
         "max_concurrent_total",
         "max_concurrent_event_trigger",
@@ -816,10 +697,6 @@ fn thread_queue_grouped_tool_exposes_list_and_update_policy() {
     }
 }
 
-/// env-var management consolidated into the grouped `env_vars` manifest tool
-/// (action enum list/set/delete, exposing name+value for set). It's spliced from
-/// `capability_manifest::llm_tools()`. Pin the grouped tool's shape and that the
-/// retired `set_environment_variable` name still resolves as a back-compat alias.
 #[test]
 fn env_vars_grouped_tool_exposes_list_set_delete() {
     let tools = crate::capability_manifest::llm_tools();
@@ -842,7 +719,6 @@ fn env_vars_grouped_tool_exposes_list_set_delete() {
         .collect();
     assert_eq!(action_names, vec!["list", "set", "delete"]);
 
-    // `set` contributes name + value; `delete` contributes name.
     for field in ["name", "value"] {
         assert!(
             props.get(field).is_some(),
@@ -850,7 +726,6 @@ fn env_vars_grouped_tool_exposes_list_set_delete() {
         );
     }
 
-    // The retired flat tool still resolves to this domain.
     let domain = crate::capability_manifest::domain_for_tool(tn::SET_ENVIRONMENT_VARIABLE)
         .expect("set_environment_variable alias must resolve");
     assert_eq!(domain.name, "env_vars");
@@ -884,19 +759,6 @@ fn send_notification_schema_exposes_optional_app_id() {
     );
 }
 
-/// A delivery spends the subscription, and the description used to say only the
-/// opposite case: "the subscription STAYS LIVE, so do not register it again",
-/// which is true of a user message and the exact reverse of what a delivery
-/// needs. That was the nearest matching instruction a model read at delivery
-/// time, and on 2026-08-06 a live thread duly narrated a re-arm it never
-/// performed.
-///
-/// The two-delivery fork this used to pin is gone with the attached shape (a
-/// user message no longer re-opens anything, it just runs a turn), but the
-/// hazard is not: a bare "do not register it again" anywhere near the delivery
-/// case re-creates it. So the assertion is that the spent-and-resubscribe
-/// statement is present AND that the do-not-register clause carries its own
-/// scope.
 #[test]
 fn await_event_description_says_a_delivery_spends_the_subscription() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -925,18 +787,6 @@ fn await_event_description_says_a_delivery_spends_the_subscription() {
     );
 }
 
-/// The arming lookback is only useful if the model knows to read it. It is a
-/// REPORT, not a delivery: the subscription watches forward, so a match named in
-/// the result will never arrive as a turn, and a model that skims to
-/// "Subscribed" ends the turn with the thing unhandled. That is precisely the
-/// 2026-08-06 failure, one layer up.
-///
-/// **The scope of the promise is load-bearing and is asserted here.** The
-/// lookback covers a few minutes, so telling the model it need not check at all
-/// would be a bigger bug than the one being fixed: it would arm a forward-only
-/// wait for something that happened an hour ago, which can never fire and idles
-/// to the timeout. The text must close the check-to-arm RACE without excusing
-/// the check.
 #[test]
 fn await_event_description_says_an_already_happened_match_is_reported_not_delivered() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -968,9 +818,6 @@ fn await_event_description_says_an_already_happened_match_is_reported_not_delive
     );
 }
 
-/// The description promises a bound because there is one. A model that offers
-/// to watch "forever" in a chat thread is wrong twice: the cap refuses the next
-/// call, and an unbounded standing rule is a trigger's job.
 #[test]
 fn await_event_description_names_the_real_subscription_cap() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -991,22 +838,6 @@ fn await_event_description_names_the_real_subscription_cap() {
     );
 }
 
-/// A direct child already re-opens its parent when it finishes (ADR 0011), so a
-/// wait on its `ChildThreadCompleted` is redundant: the engine stands the fan-in
-/// callback down when a live wait covers the card, and what is left is a spent
-/// subscription slot plus a timeout that can fire while the child still works.
-/// The use-list used to say "a thread finishing" with no carve-out, which is the
-/// nearest matching instruction for exactly this case, and on 2026-08-06 a live
-/// thread duly subscribed to its own coding-agent child.
-///
-/// **The exclusion's REASON is load-bearing and has to read as redundancy.**
-/// Matching is workspace-wide, so any thread's completion is a wait that
-/// genuinely fires; the matcher side of that is pinned by
-/// `a_wait_matches_a_child_completion_belonging_to_another_thread`. Worded as a
-/// bare prohibition, the carve-out was read as impossibility instead: a live
-/// thread armed a cross-thread `child_thread_id` wait and then told the user,
-/// unprompted, that it "may never fire". So the first assertion is the positive
-/// claim, and the exclusion is only allowed after it.
 #[test]
 fn await_event_description_carves_out_the_threads_own_child() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -1043,9 +874,6 @@ fn await_event_description_carves_out_the_threads_own_child() {
     );
 }
 
-/// Every built-in name must satisfy the Messages API pattern. One violation
-/// rejects the whole request, so this cannot be caught in review or at
-/// runtime: it has to fail here, before the name ever ships.
 #[test]
 fn every_built_in_tool_name_is_wire_safe() {
     let offenders: Vec<String> = get_default_tools(&ToolCapabilities::all_open())
@@ -1062,9 +890,6 @@ fn every_built_in_tool_name_is_wire_safe() {
     );
 }
 
-// ===== Capability gates (ADR 0088) =====
-
-/// The names a workspace is offered, from both registry tables, in wire order.
 fn offered_names(caps: &ToolCapabilities) -> Vec<String> {
     get_default_tools(caps)
         .into_iter()
@@ -1073,7 +898,6 @@ fn offered_names(caps: &ToolCapabilities) -> Vec<String> {
         .collect()
 }
 
-/// The four schemas that resolve an account before they do anything.
 const MAILBOX_TOOLS: [&str; 4] = [
     tn::SEND_EMAIL,
     tn::READ_EMAILS,
@@ -1081,9 +905,6 @@ const MAILBOX_TOOLS: [&str; 4] = [
     tn::SAVE_EMAIL_ATTACHMENT,
 ];
 
-/// A workspace with no email account is offered no mailbox schema. That is
-/// 2,664 wire characters it pays for on every request of every thread and can
-/// never act on.
 #[test]
 fn a_workspace_with_no_email_account_is_offered_no_mailbox_tool() {
     let names = offered_names(&ToolCapabilities::default());
@@ -1096,10 +917,6 @@ fn a_workspace_with_no_email_account_is_offered_no_mailbox_tool() {
     }
 }
 
-/// `configure_email` is the exception, and it is load-bearing. It is the only
-/// writer of the first `email_accounts` row: the settings UI reaches
-/// `EmailStore::upsert` only when editing an existing credential. Gate it and
-/// a fresh workspace can never set email up at all.
 #[test]
 fn configure_email_survives_the_gate_so_email_can_be_set_up_at_all() {
     let names = offered_names(&ToolCapabilities::default());
@@ -1109,7 +926,6 @@ fn configure_email_survives_the_gate_so_email_can_be_set_up_at_all() {
     );
 }
 
-/// One account opens all five.
 #[test]
 fn one_email_account_opens_the_whole_family() {
     let caps = ToolCapabilities {
@@ -1125,20 +941,16 @@ fn one_email_account_opens_the_whole_family() {
     }
 }
 
-/// `execute_intent` is retired. Running an intent is `load_knowhow` on its id,
-/// so no array may offer the old tool, under any gates.
 #[test]
 fn no_tool_array_offers_execute_intent() {
     for caps in [ToolCapabilities::default(), ToolCapabilities::all_open()] {
         assert!(
-            !chat_wire_order(&caps).contains(&tn::EXECUTE_INTENT.to_string()), // Retired compatibility.
+            !chat_wire_order(&caps).contains(&tn::EXECUTE_INTENT.to_string()),
             "execute_intent is retired, yet {caps:?} offers it"
         );
     }
 }
 
-/// The gate ADR 0088 extends, asserted through the same table as the two it
-/// adds rather than through the `if` it used to be.
 #[test]
 fn generate_image_is_offered_exactly_when_a_provider_is_configured() {
     assert!(
@@ -1152,8 +964,6 @@ fn generate_image_is_offered_exactly_when_a_provider_is_configured() {
     };
     let names = offered_names(&caps);
     assert!(names.contains(&tn::GENERATE_IMAGE.to_string()));
-    // Reading an image the thread already has needs no generation provider,
-    // so those two must not have been swept up by the same gate.
     for always in [tn::VIEW_IMAGE, tn::SAVE_THREAD_IMAGE] {
         assert!(
             offered_names(&ToolCapabilities::default()).contains(&always.to_string()),
@@ -1162,9 +972,6 @@ fn generate_image_is_offered_exactly_when_a_provider_is_configured() {
     }
 }
 
-/// The gate that costs a workspace nothing until it configures a judgment
-/// provider. Most workspaces have none, and every schema is billed on every
-/// request, so an ungated `judge` would be prose nobody can call.
 #[test]
 fn judge_is_offered_exactly_when_a_judgment_provider_is_configured() {
     assert!(
@@ -1179,9 +986,6 @@ fn judge_is_offered_exactly_when_a_judgment_provider_is_configured() {
     assert!(offered_names(&caps).contains(&tn::JUDGE.to_string()));
 }
 
-/// The one instruction the schema cannot do without. The engine runs a round's
-/// tool calls one after another, so fifty questions split across fifty calls
-/// cost fifty round trips. Upstream answers them in parallel in one.
 #[test]
 fn the_judge_schema_tells_the_agent_to_batch() {
     let caps = ToolCapabilities {
@@ -1203,18 +1007,8 @@ fn the_judge_schema_tells_the_agent_to_batch() {
     );
 }
 
-/// Invariant 20. The mode ADDS no tool, and takes one away: the checklist
-/// moved into the working understanding, so `todo_write` is shaped out.
-///
-/// Off, `todo_write` is byte-for-byte the schema every workspace had before the
-/// mode landed, and so is every other schema in the array. That is what makes
-/// the eval's control arm a real baseline rather than this build wearing a
-/// label. Off is also the overwhelmingly common case, and their prose is billed
-/// on every request of every thread that sees them.
 #[test]
 fn the_mode_on_array_is_a_strict_subset_of_the_mode_off_one() {
-    // `all_open` is the widest array, which is the mode OFF: the mode closes a
-    // family rather than opening one.
     let control = ToolCapabilities::all_open();
     let lean = ToolCapabilities {
         context_mode: true,
@@ -1239,9 +1033,6 @@ fn the_mode_on_array_is_a_strict_subset_of_the_mode_off_one() {
         );
     }
 
-    // And nothing ELSE moves with the flag. The array is the first cache
-    // segment. A schema shifting on it would cost every lean workspace a tier
-    // rewrite it was never told about.
     let others = |caps: &ToolCapabilities| {
         serde_json::to_string(
             &get_default_tools(caps)
@@ -1255,16 +1046,6 @@ fn the_mode_on_array_is_a_strict_subset_of_the_mode_off_one() {
     assert_eq!(others(&control), others(&lean));
 }
 
-/// **The array is a pure function of workspace configuration.** Two callers in
-/// one workspace, however they differ, resolve the same capabilities and so
-/// must serialize to the same bytes. Anthropic keys the first cache segment on
-/// exactly those bytes, and the measured cross-thread warmth depends on it
-/// (ADR 0088 decision 2).
-///
-/// The type carries most of the guarantee: `get_default_tools` takes only
-/// `&ToolCapabilities`, which holds nothing thread-shaped. This pins the
-/// serialization too, since a builder reading a clock or a thread id would
-/// pass the type check and fail here.
 #[test]
 fn two_callers_in_one_workspace_get_a_byte_identical_array() {
     let wire = |caps: &ToolCapabilities| {
@@ -1296,9 +1077,6 @@ fn two_callers_in_one_workspace_get_a_byte_identical_array() {
     }
 }
 
-/// Closing a gate must only REMOVE schemas, never move the survivors. The
-/// order is the cache prefix, so a reorder costs every workspace a rewrite of
-/// the whole tools tier.
 #[test]
 fn a_closed_gate_removes_schemas_without_reordering_the_survivors() {
     let all = offered_names(&ToolCapabilities::all_open());
@@ -1313,10 +1091,6 @@ fn a_closed_gate_removes_schemas_without_reordering_the_survivors() {
     );
 }
 
-/// Every schema the chat agent is offered comes from a table row. A family
-/// added without a gate therefore does not reach the model at all. That is
-/// ADR 0088's "state its gate, or state that it has none" made structural
-/// rather than left to review.
 #[test]
 fn every_offered_schema_comes_from_a_gated_registry_row() {
     let from_rows: Vec<String> = FAMILIES
@@ -1333,26 +1107,6 @@ fn every_offered_schema_comes_from_a_gated_registry_row() {
     );
 }
 
-/// The wire order of the array, frozen.
-///
-/// The order IS the prefix Anthropic keys its first cache segment on. Moving
-/// a schema therefore rewrites the whole 27,000-token tier, for every
-/// workspace on the build. Nothing else notices: the budget meter sums, the
-/// gate tests check membership, and a reorder changes neither.
-///
-/// This list is a RATCHET, like the schema-size ceilings. Appending a tool is
-/// a one-line diff here and a deliberate cache event; a reorder is a large
-/// diff, which is the point.
-///
-/// `keep_in_context` and `scratchpad` left the list when the self-curated
-/// context mode stopped adding tools: the keep became a `[KEEP OPEN]` line in
-/// the working understanding, and the document became ordinary text. Both were
-/// gated on the mode, so a control array is untouched by their going. A lean
-/// array pays a rewrite on this build regardless, since the whole mode prompt
-/// changed.
-///
-/// `unload_knowhow` sits beside `load_knowhow`, where a model looks for it
-/// (ADR 0425). Like any new tool, it rewrites the segment after it once.
 const FROZEN_WIRE_ORDER: &[&str] = &[
     "read_file",
     "write_file",
@@ -1405,11 +1159,7 @@ const FROZEN_WIRE_ORDER: &[&str] = &[
     "await_event",
     "list_event_waits",
     "cancel_event_wait",
-    // The mode adds no tool now, so nothing sits here but `todo_write`, which
-    // the mode takes AWAY. `dismiss_from_context`, `keep_in_context` and
-    // `scratchpad` all left, each in its own change.
     "todo_write",
-    // Appended last in FAMILIES, so opening its gate moves no family above it.
     "judge",
     "send_notification",
     "notifications",
@@ -1435,9 +1185,6 @@ const FROZEN_WIRE_ORDER: &[&str] = &[
     "expect_wake",
 ];
 
-/// The whole engine-authored array, in the order `chat::process::run` splices
-/// it. MCP tools are excluded: they are discovered from running servers, so
-/// they are the workspace's own ordering rather than the engine's.
 fn chat_wire_order(caps: &ToolCapabilities) -> Vec<String> {
     get_default_tools(caps)
         .into_iter()
@@ -1448,9 +1195,6 @@ fn chat_wire_order(caps: &ToolCapabilities) -> Vec<String> {
         .collect()
 }
 
-/// A Tree turn never reads Classic's memory, so it is not offered the tool
-/// that edits it. The module swaps `memory` for `recall` in one slot, which
-/// moves no other grouped tool and so keeps the cached array's order.
 #[test]
 fn the_memory_module_swaps_memory_for_recall_in_one_slot() {
     let names = |caps: &ToolCapabilities| -> Vec<String> {
@@ -1491,13 +1235,6 @@ fn the_wire_order_is_frozen() {
     );
 }
 
-/// Exactly which tools may address a *registered repository*, checked as a
-/// schema fact rather than as a policy nobody re-reads.
-///
-/// The three reads plus `edit_file` are the whole surface. `write_file`,
-/// `delete_file` and `copy_file` are excluded on purpose: creating and deleting
-/// repo files is structural work belonging to `run_coding_agent`, which lands
-/// it as a reviewable change (ADR 0093).
 #[test]
 fn only_the_reads_and_edit_file_accept_a_repo_argument() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -1523,9 +1260,6 @@ fn only_the_reads_and_edit_file_accept_a_repo_argument() {
     }
 }
 
-/// `commit` belongs to `edit_file` alone, and its description has to state the
-/// consequence. The agent is about to modify a checkout the user has open, and
-/// the only record is the working tree.
 #[test]
 fn edit_file_commit_flag_states_that_nothing_is_committed() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
@@ -1557,8 +1291,6 @@ fn edit_file_commit_flag_states_that_nothing_is_committed() {
     }
 }
 
-/// The `repo` argument is spelled once (`repo_arg`) so four schemas cannot
-/// drift. This pins that they really are identical.
 #[test]
 fn every_repo_argument_is_the_same_schema() {
     let tools = get_default_tools(&ToolCapabilities::all_open());

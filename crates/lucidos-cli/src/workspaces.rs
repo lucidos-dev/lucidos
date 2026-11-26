@@ -1,11 +1,3 @@
-//! Workspace listings, and the *workspace broker*'s verbs, for agents and
-//! terminal users.
-//!
-//! Every verb asks this workspace's engine, which holds the local token and
-//! asks the gateway (ADR 0671). Each mutating call needs the owner's
-//! permission: without one the engine records a request and answers 403, and
-//! this module prints how to ask the owner with it.
-
 use crate::gateway;
 use crate::http::{
     client, client_with_timeout, format_request_error, send_and_print, send_expect_json,
@@ -20,16 +12,8 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// How long a broker call may take. It outlasts the engine's minute for the
-/// gateway call. Otherwise a slow create reads as failed while it completes.
 const BROKER_CALL_DEADLINE: Duration = Duration::from_secs(120);
 
-/// One row of `GET /api/v1/workspaces`, the engine's projection of its
-/// gateway's listing. Asking the engine, not the gateway, is what lets a
-/// sandboxed agent list workspaces with no local token (ADR 0645).
-///
-/// An engine older than this CLI sends no autostart, origin or machine-made
-/// flag, so each reads as its safe default rather than failing the parse.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub(crate) struct ListedWorkspace {
     pub(crate) id: String,
@@ -65,14 +49,12 @@ fn parse_listing(body: serde_json::Value) -> Result<Vec<ListedWorkspace>, BoxErr
     Ok(listing.workspaces)
 }
 
-/// The row a `--to <name>` names: the display name first, then the slug.
 pub(crate) fn find<'a>(rows: &'a [ListedWorkspace], name: &str) -> Option<&'a ListedWorkspace> {
     rows.iter()
         .find(|w| w.name == name)
         .or_else(|| rows.iter().find(|w| w.id == name))
 }
 
-/// `lucidos workspaces list`: one workspace per line, or the rows as JSON.
 pub(crate) fn list(ws: &Workspace, as_json: bool) -> Result<(), BoxError> {
     let rows = fetch(ws)?;
     if as_json {
@@ -85,16 +67,19 @@ pub(crate) fn list(ws: &Workspace, as_json: bool) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Slug, name, port, health, autostart and origin, tab-separated.
 fn list_line(row: &ListedWorkspace) -> String {
     let autostart = if row.autostart { "on" } else { "off" };
     format!(
-        "{}\t{}\t{}\t{}\t{autostart}\t{}",
-        row.id, row.name, row.port, row.health, row.origin
+        "{}\t{}\t{}\t{}\t{autostart}\t{}\t{}",
+        row.id,
+        row.name,
+        row.port,
+        row.health,
+        row.origin,
+        row.path.display()
     )
 }
 
-/// One broker verb: the route under `/api/v1` it POSTs to, and its JSON body.
 pub(crate) struct BrokerCall {
     path: String,
     body: serde_json::Value,
@@ -108,7 +93,6 @@ impl BrokerCall {
         )
     }
 
-    /// `stop`, `start` or `delete` on a workspace slug.
     pub(crate) fn verb(slug: &str, verb: &str, reason: &str) -> Self {
         Self::post(
             format!("/workspaces/{}/{verb}", segment(slug)),
@@ -142,8 +126,6 @@ impl BrokerCall {
     }
 }
 
-/// A slug or Trash id as one path segment. The engine validates the value, so
-/// this only keeps a stray `/` or `?` from naming another route.
 pub(crate) fn segment(raw: &str) -> String {
     raw.bytes()
         .map(|b| match b {
@@ -153,8 +135,6 @@ pub(crate) fn segment(raw: &str) -> String {
         .collect()
 }
 
-/// Run one broker verb. Prints the engine's answer, or how to ask the owner,
-/// and returns the exit code.
 pub(crate) fn run(ws: &Workspace, call: BrokerCall) -> Result<u8, BoxError> {
     let url = format!("{}/api/v1{}", ws.base_url(), call.path);
     send_act(
@@ -165,7 +145,6 @@ pub(crate) fn run(ws: &Workspace, call: BrokerCall) -> Result<u8, BoxError> {
     )
 }
 
-/// Mint a device session without ever printing the gateway's success body.
 pub(crate) fn device_session(
     ws: &Workspace,
     slug: &str,
@@ -227,8 +206,6 @@ fn save_device_session(body: &str, out: &std::path::Path) -> Result<String, BoxE
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    // NamedTempFile starts mode 0600. Rename replaces the destination atomically,
-    // including any old permissive file or symlink, without following it.
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(session.as_bytes())?;
     file.as_file().sync_all()?;
@@ -238,14 +215,11 @@ fn save_device_session(body: &str, out: &std::path::Path) -> Result<String, BoxE
     ))
 }
 
-/// `lucidos workspaces trash`: the Trash, as the engine projects it.
 pub(crate) fn trash(ws: &Workspace) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/workspaces/trash", ws.base_url());
     send_and_print("GET", &url, client()?.get(&url))
 }
 
-/// `lucidos workspaces classify`: a batch with one `workspace_classification`
-/// item. The owner confirms it on the batch card.
 pub(crate) fn classify(
     ws: &Workspace,
     slugs: &[String],
@@ -263,7 +237,6 @@ pub(crate) fn classify(
     )
 }
 
-/// `lucidos workspaces delete`: prepare one confirmed machine-made delete batch.
 pub(crate) fn delete(ws: &Workspace, slugs: &[String]) -> Result<(), BoxError> {
     crate::permission_request::cmd_batch(
         ws,
@@ -329,13 +302,22 @@ mod tests {
     }
 
     #[test]
-    fn a_list_line_is_slug_name_port_health_autostart_origin() {
+    fn a_list_line_appends_the_gateway_reported_directory() {
         let rows = rows();
         assert_eq!(
             list_line(&rows[0]),
-            "dev\tdevelopment\t5173\thealthy\ton\tuser"
+            "dev\tdevelopment\t5173\thealthy\ton\tuser\t/home/user/workspaces/dev"
         );
-        assert_eq!(list_line(&rows[1]), "myws\tdev\t5174\tunhealthy\toff\tdemo");
+        assert_eq!(
+            list_line(&rows[1]),
+            "myws\tdev\t5174\tunhealthy\toff\tdemo\t/home/user/elsewhere/myws"
+        );
+    }
+
+    #[test]
+    fn json_listing_keeps_the_gateway_reported_path() {
+        let json = serde_json::to_value(rows()).unwrap();
+        assert_eq!(json[1]["path"], "/home/user/elsewhere/myws");
     }
 
     #[test]

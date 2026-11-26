@@ -1,11 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// The structured error code a provider attached to a failed turn, carried on
-/// `ResponseFailed` so the card can say why. The provider's own words travel in
-/// `error`, and its extra explanation, when it sends one, in `detail`.
-///
-/// `code` is the open wire string, in snake_case. A code Lucidos does not know
-/// still reaches the user. [`ProviderError::kind`] is the typed view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderError {
     pub code: String,
@@ -13,9 +7,6 @@ pub struct ProviderError {
     pub detail: Option<String>,
 }
 
-/// What a [`ProviderError`] code means to Lucidos. Only the three policy codes
-/// change behaviour: the session is never resumed. Every other code resumes as
-/// before, and `Other` carries a code Lucidos has no name for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderErrorCode {
     MisalignmentPolicyViolation,
@@ -52,8 +43,6 @@ impl ProviderErrorCode {
         self.policy_name().is_some()
     }
 
-    /// The reason a policy block gives, in the words a reader sees: OpenAI's
-    /// own wording for the misalignment check. `None` for every other code.
     pub fn policy_name(&self) -> Option<&'static str> {
         match self {
             Self::MisalignmentPolicyViolation => Some("potentially unintended activity"),
@@ -69,21 +58,14 @@ impl ProviderError {
         ProviderErrorCode::from_wire(&self.code)
     }
 
-    /// The provider's classifier refused the turn, and the session that
-    /// carries it will refuse again.
     pub fn is_policy_block(&self) -> bool {
         self.kind().is_policy_block()
     }
 
-    /// See [`ProviderErrorCode::policy_name`].
     pub fn policy_name(&self) -> Option<&'static str> {
         self.kind().policy_name()
     }
 
-    /// Read Codex's `codexErrorInfo` (app-server wire, camelCase) or
-    /// `codex_error_info` (rollout and exec, snake_case) off a turn's `error`
-    /// object. The value is a string, or a single-key object such as
-    /// `{"httpConnectionFailed": {...}}`. `None` when the build sent no code.
     pub fn from_codex_error(error: &serde_json::Value) -> Option<Self> {
         let info = error
             .get("codexErrorInfo")
@@ -104,8 +86,6 @@ impl ProviderError {
     }
 }
 
-/// Codex's `MisalignmentErrorDetails.detailedExplanation`, which sits under
-/// `additionalDetails` on the error.
 fn codex_detail(error: &serde_json::Value) -> Option<String> {
     let details = error
         .get("additionalDetails")

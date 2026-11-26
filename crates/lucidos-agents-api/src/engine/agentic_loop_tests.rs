@@ -1,11 +1,3 @@
-//! Regression tests for the agentic loop's terminator-emission and
-//! injection-event-id contracts. Both bugs surfaced together when a
-//! long-running thread silently went zombie after hitting the
-//! per-turn iteration cap (no terminator → UI stuck on "running"),
-//! and every follow-up the user typed collided with the original
-//! `MessageReceived` row on `events_pkey` because the optimistic
-//! client UUID was reused as the persisted `PromptInjected` id.
-
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::thread_events::{ActorMode, EventMeta, ThreadEvent};
 use super::super::{InjectedPrompt, InjectedPromptKind};
@@ -19,9 +11,6 @@ use crate::llm::{Message, MessageContent};
 use crate::test_support::{message_received, setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
-/// Persist a MessageReceived row with the given client-provided event_id and
-/// return the canonical EventMeta used by all events that belong to that
-/// request (matches what `run_agentic_loop` builds from `origin_id`).
 async fn anchor_request(
     bus: &EventBus,
     thread_id: Uuid,
@@ -44,15 +33,6 @@ async fn anchor_request(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Iteration-cap terminator
-// ---------------------------------------------------------------------------
-
-/// Regression: hitting the per-turn iteration cap used to `return Ok(...)`
-/// silently — no `ResponseGenerated`/`ResponseFailed`/`ResponseAborted` ever
-/// hit the events table, so the frontend treated the thread as still
-/// running. This test asserts the cap path emits a `ResponseGenerated`
-/// terminator carrying the engine-limit sentinel string.
 #[tokio::test]
 async fn iteration_cap_emits_response_generated_terminator() {
     let (pool, db_name) = setup_test_db().await;
@@ -62,9 +42,6 @@ async fn iteration_cap_emits_response_generated_terminator() {
     let origin_id = Uuid::new_v4();
     let meta = anchor_request(&bus, thread_id, origin_id, "long task").await;
 
-    // A non-default cap on purpose: the message must name the cap that actually
-    // fired, not the catalog default. Passing the default here would let a
-    // regression that reverted to it pass unnoticed.
     let default_cap = crate::core::prefs::MAX_TOOL_CALLS.default_number() as usize;
     let configured_cap = 42;
     assert_ne!(configured_cap, default_cap);
@@ -94,10 +71,6 @@ async fn iteration_cap_emits_response_generated_terminator() {
         "the message must not name the default when a different cap fired: {}",
         msg
     );
-    // Hitting the cap is the one moment the user has a reason to raise it, and a
-    // packaged user has no constant to edit. The pointer is the whole mechanism
-    // by which they learn the setting exists, so pin both halves: the clickable
-    // panel link and the row's name.
     assert!(
         msg.contains("[Settings](settings)"),
         "the message must carry a clickable Settings link, got: {}",
@@ -132,11 +105,6 @@ async fn iteration_cap_emits_response_generated_terminator() {
     teardown_test_db(&db_name).await;
 }
 
-/// The two backstops must not borrow each other's wording. The round backstop
-/// fires when the loop span without a tool call, so claiming the user hit their
-/// tool-call limit would be false, and it would carry the one prefix the system
-/// prompt tells the model to trust. Raising the setting would not help there
-/// either, so only the real cap message points at Settings.
 #[test]
 fn the_two_engine_limit_messages_say_different_things() {
     let cap = tool_call_cap_message(42);
@@ -168,18 +136,6 @@ fn the_two_engine_limit_messages_say_different_things() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// PromptInjected event_id collision
-// ---------------------------------------------------------------------------
-
-/// Regression: the inject path used to write `inject_meta.event_id =
-/// prompt.event_id`, reusing the client-provided UUID that
-/// `chat::process` had already persisted as `MessageReceived.id`. The
-/// emit silently failed under `emit_or_log`, the loop kept going, the UI
-/// never got the SSE — and worse, the event was lost forever. This test
-/// drives the inject helper directly and asserts the persisted PromptInjected row
-/// gets a fresh id (different from the prompt's optimistic id) and the
-/// emit succeeds.
 #[tokio::test]
 async fn prompt_injected_does_not_collide_with_optimistic_id() {
     let (pool, db_name) = setup_test_db().await;
@@ -191,8 +147,6 @@ async fn prompt_injected_does_not_collide_with_optimistic_id() {
 
     let prompt = InjectedPrompt {
         text: "actually do it differently".to_string(),
-        // Identical to the MessageReceived row's id — exactly the production
-        // shape that triggered the duplicate-key crash.
         event_id: Some(client_event_id),
         mode: ActorMode::Human,
         spawning_event_id: None,
@@ -229,9 +183,6 @@ async fn prompt_injected_does_not_collide_with_optimistic_id() {
         "request_event_id must still link PromptInjected back to the originating request"
     );
 
-    // injected_message_id carries the MessageReceived id forward so the
-    // renderer can collapse the duplicate "Auto-prompt sent" panel into the
-    // existing user message.
     let injected_link: Option<String> =
         sqlx::query_scalar("SELECT payload->>'injected_message_id' FROM events WHERE id = $1")
             .bind(prompt_injected_id)
@@ -323,15 +274,6 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression for the reported bug's first half: the user attached a screenshot
-/// to a message that arrived while the thread was already working, so it was
-/// queued and later injected mid-turn. The loop advanced `user_message_idx` on
-/// injection but nothing recorded that the appended message carried image bytes
-/// — trim pass 0 keeps images on the last message plus the pinned ones only, so
-/// the model's very next tool call stripped it and the agent went blind to a
-/// picture the user had just sent.
-///
-/// The helper must report the appended message's index so the loop can pin it.
 #[tokio::test]
 async fn append_injected_prompts_reports_image_bearing_message_for_pinning() {
     let (pool, db_name) = setup_test_db().await;
@@ -347,7 +289,6 @@ async fn append_injected_prompts_reports_image_bearing_message_for_pinning() {
         mode: ActorMode::Human,
         spawning_event_id: None,
         images: Some(vec![crate::engine::types::ChatImage {
-            // 1x1 transparent PNG.
             base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==".to_string(),
             mime_type: "image/png".to_string(),
         }]),
@@ -387,16 +328,6 @@ async fn append_injected_prompts_reports_image_bearing_message_for_pinning() {
     teardown_test_db(&db_name).await;
 }
 
-// ---------------------------------------------------------------------------
-// Defensive post-loop guard
-// ---------------------------------------------------------------------------
-
-/// If a future bug causes the loop to return without emitting a terminator
-/// (the iteration-cap path was the most recent example, but any new branch
-/// could regress), the post-loop guard must catch it and emit
-/// `ResponseAborted` so the UI doesn't get stuck. This test sets up a
-/// request with activity but no terminator, calls the guard, and asserts
-/// `ResponseAborted` lands.
 #[tokio::test]
 async fn ensure_terminator_emitted_recovers_silent_exit() {
     let (pool, db_name) = setup_test_db().await;
@@ -445,9 +376,6 @@ async fn ensure_terminator_emitted_recovers_silent_exit() {
     teardown_test_db(&db_name).await;
 }
 
-/// Inverse: if a terminator already exists for the request, the guard must
-/// NOT double-emit. A spurious second terminator would create phantom
-/// "Aborted" exchanges in the UI on every successful loop completion.
 #[tokio::test]
 async fn ensure_terminator_emitted_is_idempotent_when_terminator_exists() {
     let (pool, db_name) = setup_test_db().await;
@@ -488,11 +416,6 @@ async fn ensure_terminator_emitted_is_idempotent_when_terminator_exists() {
     teardown_test_db(&db_name).await;
 }
 
-/// The guard's terminator-detection key is `request_event_id`, not just
-/// "any terminator on the thread". A previous exchange's
-/// `ResponseGenerated` must not satisfy the check for a later exchange
-/// that died silently — otherwise the guard would never fire on
-/// long-running threads (which is exactly the long-lived-thread shape).
 #[tokio::test]
 async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
     let (pool, db_name) = setup_test_db().await;
@@ -500,7 +423,6 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
 
     let thread_id = Uuid::new_v4();
 
-    // Earlier exchange — completed cleanly.
     let earlier_origin = Uuid::new_v4();
     let earlier_meta = anchor_request(&bus, thread_id, earlier_origin, "first turn").await;
     bus.emit(BusEvent::Thread {
@@ -516,7 +438,6 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
     .await
     .expect("earlier terminator");
 
-    // Current exchange — silently exited.
     let current_origin = Uuid::new_v4();
     let current_meta = anchor_request(&bus, thread_id, current_origin, "second turn").await;
     bus.emit(BusEvent::Thread {
@@ -552,11 +473,6 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
     teardown_test_db(&db_name).await;
 }
 
-// ---------------------------------------------------------------------------
-// Failure terminator: one per exchange
-// ---------------------------------------------------------------------------
-
-/// Count every `ResponseFailed` row on a thread.
 async fn failed_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM events \
@@ -568,9 +484,6 @@ async fn failed_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
     .expect("query")
 }
 
-/// Count the `ResponseFailed` rows anchored to one exchange. Counting by
-/// anchor is the whole point: an unanchored row belongs to no exchange, and
-/// that is what the gate could not see.
 async fn failed_count_for(pool: &sqlx::PgPool, thread_id: Uuid, anchor: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM events \
@@ -584,9 +497,6 @@ async fn failed_count_for(pool: &sqlx::PgPool, thread_id: Uuid, anchor: Uuid) ->
     .expect("query")
 }
 
-/// A turn that dies BEFORE the agentic loop leaves the exchange open, and
-/// the UI stuck on "running". The engine settles it, anchored, so the
-/// callers no longer need a terminator of their own.
 #[tokio::test]
 async fn a_pre_loop_failure_is_settled_with_an_anchored_terminator() {
     let (pool, db_name) = setup_test_db().await;
@@ -623,10 +533,6 @@ async fn a_pre_loop_failure_is_settled_with_an_anchored_terminator() {
     teardown_test_db(&db_name).await;
 }
 
-/// The reported bug. A stream error inside the loop emits an ANCHORED
-/// `ResponseFailed`, and the caller used to stack an unanchored copy on
-/// top milliseconds later. Two rows meant every subscribed trigger fired
-/// twice. One exchange gets one terminator.
 #[tokio::test]
 async fn an_in_loop_failure_is_not_terminated_twice() {
     let (pool, db_name) = setup_test_db().await;
@@ -636,7 +542,6 @@ async fn an_in_loop_failure_is_not_terminated_twice() {
     let origin_id = Uuid::new_v4();
     let meta = anchor_request(&bus, thread_id, origin_id, "do work").await;
 
-    // What the agentic loop emits when the provider stream errors.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseFailed {
@@ -669,9 +574,6 @@ async fn an_in_loop_failure_is_not_terminated_twice() {
     teardown_test_db(&db_name).await;
 }
 
-/// The gate keys on `request_event_id`, so an earlier exchange's failure
-/// must not swallow this one. Otherwise a thread that failed once would
-/// never settle again, and every later turn would hang on "running".
 #[tokio::test]
 async fn an_earlier_failure_does_not_settle_the_current_exchange() {
     let (pool, db_name) = setup_test_db().await;
@@ -720,14 +622,6 @@ async fn an_earlier_failure_does_not_settle_the_current_exchange() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: `/api/v1/restart` pre-emits `ResponseAborted{actor: device}` for
-/// the in-flight chat thread, then `force_evict_chat_thread` cancels its
-/// token. The agentic loop's cancel branches fire moments later. Without
-/// the dedup gate inside `emit_response_canceled`, the loop's emit lands
-/// on top of the pre-emitted abort and the timeline shows both
-/// "Paused by restart" AND "Response canceled" boundaries stacked together.
-/// The gate must read the request_event_id off `meta`, find the prior
-/// terminator, and skip its own emit.
 #[tokio::test]
 async fn emit_response_canceled_is_idempotent_when_terminator_exists_for_request() {
     use crate::engine::thread_events::{emit_response_canceled, AbortCause, CancelCause};
@@ -739,7 +633,6 @@ async fn emit_response_canceled_is_idempotent_when_terminator_exists_for_request
     let origin_id = Uuid::new_v4();
     let meta = anchor_request(&bus, thread_id, origin_id, "fix the bug").await;
 
-    // Pre-emit the boundary abort (mirroring `/api/v1/restart`).
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseAborted {
@@ -754,7 +647,6 @@ async fn emit_response_canceled_is_idempotent_when_terminator_exists_for_request
     .await
     .expect("pre-emit ResponseAborted");
 
-    // Loop's cancel branch fires after the token is cancelled.
     emit_response_canceled(
         &bus,
         &pool,
@@ -785,9 +677,6 @@ async fn emit_response_canceled_is_idempotent_when_terminator_exists_for_request
     teardown_test_db(&db_name).await;
 }
 
-/// Counterpart: with no prior terminator, the cancel emit must land. Guards
-/// against a future refactor that hard-codes the skip and silently breaks
-/// the user-clicks-Stop flow.
 #[tokio::test]
 async fn emit_response_canceled_lands_when_no_prior_terminator() {
     use crate::engine::thread_events::{emit_response_canceled, CancelCause};
@@ -881,15 +770,6 @@ async fn filter_removed_queued_prompts_binds_thread_aggregate_id_as_text() {
     teardown_test_db(&db_name).await;
 }
 
-// ---------------------------------------------------------------------------
-// The working understanding survives a cancelled round
-// ---------------------------------------------------------------------------
-
-/// A stopped round used to lose the document and flush the raw markup instead.
-/// The cancel arm returned before the parse block that persists and splices.
-/// Twenty rounds of notes went with one Stop, and the user read the machinery.
-///
-/// This drives the helper both terminal paths share.
 #[tokio::test]
 async fn a_cancelled_round_persists_the_document_it_wrote() {
     use super::super::chat::process::working_understanding as wu;
@@ -939,8 +819,6 @@ async fn a_cancelled_round_persists_the_document_it_wrote() {
     teardown_test_db(&db_name).await;
 }
 
-/// The checklist rides along, so a cancel does not strand the prompt bar on a
-/// list the model had already moved past.
 #[tokio::test]
 async fn a_cancelled_round_persists_the_checklist_it_wrote() {
     use super::super::chat::process::working_understanding as wu;
@@ -978,12 +856,6 @@ async fn a_cancelled_round_persists_the_checklist_it_wrote() {
     teardown_test_db(&db_name).await;
 }
 
-/// A Stop landing mid-block keeps the document that was already there.
-///
-/// The parse takes an unclosed block to the end of the text, so the fragment
-/// would arrive as a whole-document REPLACE and overwrite everything. The Stop
-/// is what cut it, not the model, so the block is dropped and the old notes
-/// stand. The user still reads prose: the markup goes with it.
 #[tokio::test]
 async fn a_stop_inside_the_block_leaves_the_old_document_standing() {
     use super::super::chat::process::working_understanding as wu;
@@ -1028,8 +900,6 @@ async fn a_stop_inside_the_block_leaves_the_old_document_standing() {
     teardown_test_db(&db_name).await;
 }
 
-/// The same reply, ended by the model rather than by a Stop, still lands. An
-/// opening it never closed is its own mistake, and the fault says so.
 #[tokio::test]
 async fn a_model_that_forgot_the_closing_marker_still_writes_its_document() {
     use super::super::chat::process::working_understanding as wu;
@@ -1062,8 +932,6 @@ async fn a_model_that_forgot_the_closing_marker_still_writes_its_document() {
     teardown_test_db(&db_name).await;
 }
 
-/// A round that wrote nothing emits nothing. Otherwise every cancel would
-/// append an identical document row, and the mode's own history would be noise.
 #[tokio::test]
 async fn a_cancelled_round_that_wrote_nothing_emits_nothing() {
     use super::super::chat::process::working_understanding as wu;
@@ -1103,10 +971,6 @@ async fn a_cancelled_round_that_wrote_nothing_emits_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-// ---------------------------------------------------------------------------
-// Rules the helpers keep for their callers
-// ---------------------------------------------------------------------------
-
 async fn mock_engine(db: &str, workspace: &std::path::Path) -> crate::engine::LucidosEngine {
     crate::engine::LucidosEngine::new(
         workspace.to_path_buf(),
@@ -1134,8 +998,6 @@ fn device(id: &str) -> crate::engine::thread_events::MessageOrigin {
     }
 }
 
-/// The Stop click's device lands on the cancel meta once, and never replaces an
-/// author the request meta already carries.
 #[tokio::test]
 async fn the_cancel_actor_is_drained_and_never_overwrites_an_author() {
     let (pool, db) = setup_test_db().await;
@@ -1172,8 +1034,6 @@ async fn the_cancel_actor_is_drained_and_never_overwrites_an_author() {
     teardown_test_db(&db).await;
 }
 
-/// A follow-up redirect reads as superseded exactly once. The next turn on the
-/// thread, and a plain Stop, read as a user Stop.
 #[tokio::test]
 async fn the_cancel_cause_names_a_redirect_once_and_a_stop_otherwise() {
     use crate::engine::thread_events::CancelCause;
@@ -1208,8 +1068,6 @@ async fn the_cancel_cause_names_a_redirect_once_and_a_stop_otherwise() {
     teardown_test_db(&db).await;
 }
 
-/// The step row shows the description as well as the args. Every copy must
-/// come from the redacted args.
 #[tokio::test]
 async fn a_tool_called_row_never_carries_a_hardcoded_postgres_password() {
     use super::helpers::HelpersExt;
@@ -1252,8 +1110,6 @@ async fn a_tool_called_row_never_carries_a_hardcoded_postgres_password() {
     teardown_test_db(&db).await;
 }
 
-/// A parallel run answers in completion order, so the result row has to name
-/// the call it answers.
 #[tokio::test]
 async fn a_tool_result_row_names_the_call_it_answers() {
     use super::helpers::HelpersExt;
@@ -1291,8 +1147,6 @@ async fn a_tool_result_row_names_the_call_it_answers() {
     teardown_test_db(&db).await;
 }
 
-/// An empty image list is not an image. The message shape and the trim pin read
-/// one predicate, so neither may treat the empty list as carrying bytes.
 #[tokio::test]
 async fn an_empty_image_list_is_neither_image_shaped_nor_pinned() {
     let (pool, db_name) = setup_test_db().await;
@@ -1328,8 +1182,6 @@ async fn an_empty_image_list_is_neither_image_shaped_nor_pinned() {
     teardown_test_db(&db_name).await;
 }
 
-/// A cancelled round hands its keeps back and records none. The eval counts
-/// `ContextKeptOpen` rows as held, and a cancelled round never carried the keep.
 #[tokio::test]
 async fn a_keep_in_a_cancelled_round_is_returned_but_never_recorded() {
     use super::super::chat::process::working_understanding as wu;
@@ -1366,8 +1218,6 @@ async fn a_keep_in_a_cancelled_round_is_returned_but_never_recorded() {
     teardown_test_db(&db_name).await;
 }
 
-/// The re-emitted checklist keeps the notes the agent wrote before the mode was
-/// turned on, as the settle path does.
 #[tokio::test]
 async fn a_re_emitted_checklist_carries_the_notes_through() {
     use super::super::chat::process::working_understanding as wu;
@@ -1404,8 +1254,6 @@ async fn a_re_emitted_checklist_carries_the_notes_through() {
     teardown_test_db(&db_name).await;
 }
 
-/// The chat system prompt tells the model to trust the prefix both messages
-/// carry, so a message that drops it reads as a hallucination.
 #[test]
 fn the_system_prompt_quotes_the_prefix_both_engine_limit_messages_carry() {
     let prompt = include_str!("chat/process/system_prompt.rs");
