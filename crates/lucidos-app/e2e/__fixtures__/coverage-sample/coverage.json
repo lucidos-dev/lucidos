@@ -1,0 +1,64 @@
+[
+  {
+    "url": "http://sample.test/assets/main.js",
+    "scriptId": "4",
+    "source": "\"use strict\";\n(() => {\n  // e2e/__fixtures__/coverage-sample/src/greet.ts\n  function greet(name) {\n    return `hello ${name}`;\n  }\n\n  // e2e/__fixtures__/coverage-sample/src/unused.ts\n  function neverCalled() {\n    return 42;\n  }\n\n  // e2e/__fixtures__/coverage-sample/src/main.ts\n  function start() {\n    document.title = greet(\"coverage\");\n  }\n  window.later = neverCalled;\n  start();\n})();\n",
+    "functions": [
+      {
+        "functionName": "",
+        "isBlockCoverage": true,
+        "ranges": [
+          {
+            "startOffset": 0,
+            "endOffset": 393,
+            "count": 1
+          }
+        ]
+      },
+      {
+        "functionName": "",
+        "isBlockCoverage": true,
+        "ranges": [
+          {
+            "startOffset": 15,
+            "endOffset": 388,
+            "count": 1
+          }
+        ]
+      },
+      {
+        "functionName": "greet",
+        "isBlockCoverage": true,
+        "ranges": [
+          {
+            "startOffset": 76,
+            "endOffset": 130,
+            "count": 1
+          }
+        ]
+      },
+      {
+        "functionName": "neverCalled",
+        "isBlockCoverage": false,
+        "ranges": [
+          {
+            "startOffset": 186,
+            "endOffset": 229,
+            "count": 0
+          }
+        ]
+      },
+      {
+        "functionName": "start",
+        "isBlockCoverage": true,
+        "ranges": [
+          {
+            "startOffset": 283,
+            "endOffset": 345,
+            "count": 1
+          }
+        ]
+      }
+    ]
+  }
+]

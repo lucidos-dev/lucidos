@@ -1,0 +1,3 @@
+name = "Software Factory plan rule for apply"
+event_type = "ChangeApplyChecked"
+script = "scripts/plan_rule.py"

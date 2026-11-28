@@ -1,0 +1,165 @@
+[
+  {
+    "input": [
+      {
+        "content": [
+          {
+            "prompt_cache_breakpoint": {
+              "mode": "explicit"
+            },
+            "text": "[THREAD MEMORY VIEW]\n[0+8] old\n",
+            "type": "input_text"
+          },
+          {
+            "text": "look at this",
+            "type": "input_text"
+          },
+          {
+            "detail": "auto",
+            "image_url": "data:image/png;base64,AAAA",
+            "type": "input_image"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": "checking",
+        "role": "assistant"
+      },
+      {
+        "arguments": "{\"path\":\"artifacts\"}",
+        "call_id": "call_1",
+        "id": "fc_call_1",
+        "name": "list_files",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call_1",
+        "output": "a.md",
+        "type": "function_call_output"
+      }
+    ],
+    "instructions": "system",
+    "max_output_tokens": 16384,
+    "model": "gpt-6.1-sol",
+    "reasoning": {
+      "effort": "high"
+    },
+    "service_tier": "flex",
+    "store": false,
+    "stream": true,
+    "tool_choice": {
+      "name": "request_read",
+      "type": "function"
+    },
+    "tools": [
+      {
+        "description": "list_files does a thing",
+        "name": "list_files",
+        "parameters": {
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      },
+      {
+        "description": "request_read does a thing",
+        "name": "request_read",
+        "parameters": {
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      }
+    ]
+  },
+  {
+    "input": [
+      {
+        "content": [
+          {
+            "prompt_cache_breakpoint": {
+              "mode": "explicit"
+            },
+            "text": "[THREAD MEMORY VIEW]\n[0+8] old\n",
+            "type": "input_text"
+          },
+          {
+            "text": "look at this",
+            "type": "input_text"
+          },
+          {
+            "detail": "auto",
+            "image_url": "data:image/png;base64,AAAA",
+            "type": "input_image"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": "checking",
+        "role": "assistant"
+      },
+      {
+        "arguments": "{\"path\":\"artifacts\"}",
+        "call_id": "call_1",
+        "id": "fc_call_1",
+        "name": "list_files",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call_1",
+        "output": "a.md",
+        "type": "function_call_output"
+      }
+    ],
+    "instructions": "system",
+    "max_output_tokens": 16384,
+    "model": "gpt-6.1-sol",
+    "prompt_cache_options": {
+      "mode": "explicit"
+    },
+    "store": false,
+    "stream": true,
+    "tools": [
+      {
+        "description": "list_files does a thing",
+        "name": "list_files",
+        "parameters": {
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      },
+      {
+        "description": "request_read does a thing",
+        "name": "request_read",
+        "parameters": {
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      }
+    ]
+  }
+]

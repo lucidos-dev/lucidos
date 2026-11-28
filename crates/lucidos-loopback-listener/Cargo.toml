@@ -1,0 +1,12 @@
+[package]
+name = "lucidos-loopback-listener"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Binds a server's listeners so it holds both halves of loopback: 127.0.0.1
+# and [::1] on one port. The engine and the gateway share this policy, and
+# neither may depend on the other (ADR 0014 §1), hence a crate of its own.
+
+[dependencies]
+libc = "0.2"

@@ -1,0 +1,358 @@
+@import '../generated/font-faces.css';
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html {
+    font-size: var(--user-ui-scale, 100%);
+    -webkit-text-size-adjust: 100%;
+    background: var(--bg-primary);
+    color-scheme: dark;
+    -webkit-tap-highlight-color: transparent;
+}
+
+@media (--desktop-layout) {
+    html {
+        overflow: hidden;
+        overscroll-behavior: none;
+    }
+}
+
+:root {
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
+    --font-ui: var(--font-mono);
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+    --z-float: 20;
+    --z-dropdown: 100;
+    --z-sticky: 200;
+    --z-drawer: 300;
+    --z-control-panel: 2200;
+    --z-popover: 2220;
+    --z-app-fullscreen: 2250;
+    --z-modal: 2300;
+    --z-toast: 2400;
+    --z-tooltip: 10000;
+
+    --radius-control: 0.5rem;
+    --radius-surface: 0.75rem;
+    --radius-round: 999px;
+    --surface-bg: var(--bg-secondary);
+    --scrim: rgba(0, 0, 0, 0.5);
+    --shadow-up: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+
+    --duration-scale: 1;
+    --duration-fast: calc(0.15s * var(--duration-scale));
+    --duration-normal: calc(0.2s * var(--duration-scale));
+    --duration-slow: calc(0.3s * var(--duration-scale));
+    --duration-emphasis: calc(0.5s * var(--duration-scale));
+
+    --divider-width: 0.1875rem;
+    --content-max-width: 50rem;
+    --thread-pane-gutter: calc(var(--space-md) + var(--phone-side-inset));
+    --phone-side-inset: 0px;
+    --scrollbar-gutter-width: 0px;
+    /* The safe-area insets. Read these, never env() directly: an iOS home-screen
+       app can lose its env() insets mid-session, and utils/safeAreaFloor.ts
+       restores them through the --safe-area-floor-* vars. That floor arm is a
+       temporary measure (docs/temporary-measures.md, "Safe-area floor"). */
+    --safe-area-top: max(env(safe-area-inset-top, 0px), var(--safe-area-floor-top, 0px));
+    --safe-area-right: max(env(safe-area-inset-right, 0px), var(--safe-area-floor-right, 0px));
+    --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-floor-bottom, 0px));
+    --safe-area-left: max(env(safe-area-inset-left, 0px), var(--safe-area-floor-left, 0px));
+    --status-bar-blur-clearance: 0px;
+    --header-controls-top: calc(var(--safe-area-top) + var(--status-bar-blur-clearance));
+    --app-header-height: calc(2.5rem + 0.25rem + var(--safe-area-top));
+    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px) + var(--app-ingress-banner-height, 0px) + var(--app-refusal-banner-height, 0px) + var(--app-slowness-banner-height, 0px) + var(--app-sandbox-banner-height, 0px) + var(--app-peer-client-banner-height, 0px));
+    --header-surface-gap: 0.5rem;
+    --header-surface-width: min(22rem, calc(100vw - 2 * var(--space-lg)));
+    --app-banner-height: 0px;
+    --app-conn-banner-height: 0px;
+    --app-ingress-banner-height: 0px;
+    --app-refusal-banner-height: 0px;
+    --app-slowness-banner-height: 0px;
+    --app-sandbox-banner-height: 0px;
+    --app-peer-client-banner-height: 0px;
+    --banner-tint-strength: 10%;
+    --banner-line-height: 1.4;
+    --banner-button-height: 1.75rem;
+    --connection-banner-dot: 0.5rem;
+    --connection-banner-button-height: var(--banner-button-height);
+    --connection-banner-button-inset: 0.75rem;
+    --thread-top-fade: 1.5rem;
+    --mobile-title-fade: 0.75rem;
+    --disclosure-fade: var(--thread-top-fade);
+    --mobile-header-fade: 0.5rem;
+    --nav-focus-reach: 0.375rem;
+    --scroll-chevron-size: 1.5rem;
+    --scroll-chevron-glyph: var(--icon-size-md);
+    --scroll-chevron-top: 0.75rem;
+    --scroll-chevron-inset: 0.75rem;
+    --scroll-chevron-stack-gap: 0.5rem;
+    --prompt-fade: 1rem;
+    --transcript-end-reserve: calc(
+        max(var(--prompt-fade), var(--scroll-chevron-inset) + var(--scroll-chevron-size))
+        + var(--nav-focus-reach)
+    );
+    --turn-body-inset: 0.4rem;
+    --turn-surface-inset: calc(0.875rem + 1px);
+    --prompt-box-border-width: 2px;
+    --turn-feed-pad-y: 0.85rem;
+    --turn-header-line: 1.2rem;
+
+    --icon-size-sm: 0.875rem;
+    --icon-size-md: 1rem;
+    --icon-size-lg: 1.25rem;
+    --icon-tap-target: 2.25rem;
+
+    --font-size-3xs: 0.5625rem;
+    --font-size-2xs: 0.625rem;
+    --font-size-xs: 0.6875rem;
+    --font-size-sm: 0.75rem;
+    --font-size-md: 0.8125rem;
+    --font-size-lg: 0.875rem;
+    --font-size-xl: 1rem;
+    --font-size-2xl: 1.125rem;
+    --font-size-3xl: 1.25rem;
+    --font-size-display: 2.25rem;
+
+    --space-xs: 0.25rem;
+    --space-sm: 0.5rem;
+    --space-md: 0.75rem;
+    --space-lg: 1rem;
+    --space-xl: 1.5rem;
+
+    --dot-gap: 0.35rem;
+
+    --brand-blue: #1a6fd0;
+    --brand-blue-deep: #0a4ea8;
+
+    --focus-ring-width: 0.1875rem;
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
+    --tap-reach-inline: 0.25rem;
+}
+
+@media (pointer: coarse) {
+    :root {
+        --scroll-chevron-size: var(--mobile-header-icon-box);
+        --scroll-chevron-reach: 0.75rem;
+        --scroll-chevron-pair-far-reach: calc(
+            1.5 * var(--scroll-chevron-reach) - var(--scroll-chevron-stack-gap) / 2);
+    }
+}
+
+html, html[data-theme-mode="dark"] {
+    --bg-primary: #07172e;
+    --bg-secondary: #0d2244;
+    --bg-tertiary: #163052;
+    --bg-quaternary: #21406c;
+    --border-color: #2c456a;
+    --bg-hover: #122a4a;
+    --bg-selected: #163356;
+    --picked-surface: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --text-on-accent: #fff;
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, white);
+    --text-glow: none;
+    --accent: #58a6ff;
+    --accent-light: #7ab8ff;
+    --accent-action: color-mix(in srgb, var(--brand-blue) 82%, var(--accent));
+    --accent-green: #3fb950;
+    --accent-green-soft: color-mix(in srgb, var(--accent-green) 60%, var(--text-secondary));
+    --accent-yellow: #d9c48f;
+    --accent-red: #f85149;
+    --accent-orange: #D97757;
+    --accent-notable: #9db4d0;
+    --nav-focus-glow: #ffffff;
+    --nav-focus-border-alpha: 0%;
+    --initiator-coding-agent: #fb923c;
+    --lucidos-mark-bg-top: #2d83e0;
+    --lucidos-mark-bg-bottom: #0a4ea8;
+    --lucidos-mark-fg: #ffffff;
+    --claude-mark: var(--initiator-coding-agent);
+    --codex-mark: var(--text-primary);
+    --agent-icon-theme: var(--accent);
+    --agent-icon-muted: var(--text-muted);
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+    --syntax-key: #9cdcfe;
+    --syntax-string: #ce9178;
+    --syntax-number: #b5cea8;
+    --syntax-keyword: #569cd6;
+    --syntax-comment: #6a9955;
+    --syntax-control: #c586c0;
+    --syntax-type: #4ec9b0;
+    --syntax-function: #dcdcaa;
+    --header-bar-top: #15549e;
+    --header-bar-bottom: #0b3868;
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
+    --focus-pill-bg: rgba(169, 197, 232, 0.87);
+    --focus-pill-glow: 0 0 0.25rem rgba(178, 206, 240, 0.42),
+                       0 0 0.625rem rgba(158, 190, 232, 0.28);
+    --focus-header-tint: rgba(169, 197, 232, 0.12);
+    --focus-header-underline: transparent;
+    --focus-header-underline-width: 2px;
+    --titlebar-strip-bg: var(--header-bar-top);
+    --titlebar-strip-continues: 0;
+    --header-fg: #ffffff;
+    --header-fg-muted-alpha: 0.72;
+    --header-fg-muted: color-mix(in srgb, var(--header-fg) calc(var(--header-fg-muted-alpha) * 100%), transparent);
+    --header-control-veil-hover: 12%;
+    --header-control-veil-active: 22%;
+    --header-control-veil-active-hover: 30%;
+    --header-divider: var(--border-color);
+    --header-badge-bg: #ffffff;
+    --header-badge-fg: var(--brand-blue-deep);
+
+    --protected-bg: #07172e;
+    --protected-surface: #0d2244;
+    --protected-inset: #0d2244;
+    --protected-raised: #163052;
+    --protected-picked: #1e3e67;
+    --protected-text: #e6edf3;
+    --protected-text-muted: #a0aab4;
+    --protected-accent: #62abff;
+    --protected-caution: #d9c48f;
+    --protected-confirm-text: #45be55;
+    --protected-danger-text: #ff8579;
+    --protected-confirm: #008a28;
+    --protected-on-confirm: #ffffff;
+    --protected-danger: #dd3532;
+    --protected-on-danger: #ffffff;
+    --protected-action: #2176d5;
+    --protected-on-action: #ffffff;
+    --protected-scrim: rgba(0, 0, 0, 0.5);
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
+}
+
+html.ios-pwa[data-theme-mode="dark"] {
+    --header-bar-top: #15579c;
+    --header-bar-bottom: #0b3a66;
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
+    --titlebar-strip-bg: var(--header-bar-top);
+}
+
+html[data-theme-swap] *,
+html[data-theme-swap] *::before,
+html[data-theme-swap] *::after {
+    transition: none !important;
+}
+
+html[data-theme-mode="light"] {
+    color-scheme: light;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f6f8fa;
+    --bg-tertiary: #e1e4e8;
+    --bg-quaternary: #d0d7de;
+    --border-color: #d0d7de;
+    --bg-hover: #eaeef2;
+    --bg-selected: #eff2f5;
+    --surface-bg: var(--bg-primary);
+    --picked-surface: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
+    --text-primary: #1f2328;
+    --text-secondary: #656d76;
+    --text-muted: #8b949e;
+    --text-on-accent: #fff;
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, black);
+    --accent: #0969da;
+    --accent-light: #218bff;
+    --accent-action: var(--brand-blue);
+    --accent-green: #1a7f37;
+    --accent-yellow: #8a6d2f;
+    --accent-red: #cf222e;
+    --accent-orange: #c26a4a;
+    --accent-notable: #5a7492;
+    --nav-focus-glow: #a8a8a8;
+    --nav-focus-border-alpha: 60%;
+    --initiator-coding-agent: #cb621a;
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
+    --syntax-key: #0550ae;
+    --syntax-string: #0a3069;
+    --syntax-number: #0550ae;
+    --syntax-keyword: #cf222e;
+    --syntax-comment: #6e7781;
+    --syntax-control: #8250df;
+    --syntax-type: #953800;
+    --syntax-function: #8250df;
+    --header-bar-top: var(--brand-blue);
+    --header-bar-bottom: var(--brand-blue-deep);
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
+    --focus-pill-bg: rgba(191, 213, 243, 0.93);
+    --focus-pill-glow: 0 0 0.25rem rgba(198, 220, 248, 0.5),
+                       0 0 0.625rem rgba(186, 212, 244, 0.34);
+    --focus-header-tint: rgba(191, 213, 243, 0.16);
+    --titlebar-strip-bg: var(--header-bar-top);
+    --titlebar-strip-continues: 0;
+
+    --protected-bg: #ffffff;
+    --protected-surface: #ffffff;
+    --protected-inset: #f6f8fa;
+    --protected-raised: #e1e4e8;
+    --protected-picked: #c7d5e6;
+    --protected-text: #1f2328;
+    --protected-text-muted: #545c65;
+    --protected-accent: #0058bd;
+    --protected-caution: #745716;
+    --protected-confirm-text: #006927;
+    --protected-danger-text: #ba001f;
+    --protected-confirm: #1a7f37;
+    --protected-on-confirm: #ffffff;
+    --protected-danger: #cf222e;
+    --protected-on-danger: #ffffff;
+    --protected-action: #1a6fd0;
+    --protected-on-action: #ffffff;
+    --protected-scrim: rgba(0, 0, 0, 0.5);
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
+}
+
+button,
+[role="button"],
+label {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+html,
+input,
+textarea,
+select,
+button {
+    font-feature-settings: var(--font-features-text, normal);
+}
+
+input,
+textarea,
+select,
+button {
+    font-family: inherit;
+    font-size: inherit;
+}
+
+code,
+pre,
+kbd,
+samp,
+.diff-line-content {
+    font-feature-settings: var(--font-features-code, normal);
+}
+
+
+body {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    background: var(--bg-primary);
+    min-height: 100vh;
+    color: var(--text-primary);
+}

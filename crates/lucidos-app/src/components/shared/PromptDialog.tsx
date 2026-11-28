@@ -1,0 +1,144 @@
+import { useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { promptState, settlePrompt, showToast } from '../../store/store';
+import { errorDetail } from '../../utils/errorDetail';
+import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
+import { DialogMessage } from './DialogMessage';
+import { Overlay } from './Overlay';
+import { SurfaceHead } from './Surface';
+import { dialogOwnsKey } from './dialogKeyScope';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { isImeComposingKey } from '../../utils/ime';
+
+export function promptEnterSubmits(
+  e: Pick<KeyboardEvent, 'key' | 'isComposing' | 'keyCode'>,
+  targetTag: string | undefined,
+  multiline: boolean | undefined,
+): boolean {
+  if (e.key !== 'Enter' || isImeComposingKey(e)) return false;
+  if (targetTag === 'BUTTON') return false;
+  return !(multiline && targetTag === 'TEXTAREA');
+}
+
+function close(value: string | null) {
+  settlePrompt(value);
+}
+
+function keepFieldFocused(e: MouseEvent) {
+  e.preventDefault();
+}
+
+export function PromptDialog() {
+  const state = promptState.value;
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const [suggesting, setSuggesting] = useState(false);
+
+  useHidePanelWebviewWhile(state.visible);
+
+  useLayoutEffect(() => {
+    setSuggesting(false);
+    if (!state.visible) return;
+
+    const input = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
+    if (input) {
+      input.value = state.defaultValue ?? '';
+      input.focus();
+      input.select();
+    }
+
+    function handleKey(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      if (!dialogOwnsKey(target, dialogRef.current)) return;
+      if (e.key === 'Enter') {
+        if (!promptEnterSubmits(e, target?.tagName, state.multiline)) return;
+        e.preventDefault();
+        const el = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
+        if (el?.readOnly) return;
+        close(el?.value ?? '');
+      }
+    }
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [state.resolve]);
+
+  if (!state.visible) return null;
+
+  const okLabel = state.okLabel || 'OK';
+  const cancelLabel = state.cancelLabel || 'Cancel';
+
+  function submit() {
+    if (suggesting) return;
+    const el = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
+    close(el?.value ?? '');
+  }
+
+  async function suggest(run: () => Promise<string | null>) {
+    const resolve = state.resolve;
+    const isCurrent = () => promptState.peek().resolve === resolve;
+    setSuggesting(true);
+    try {
+      const value = await run();
+      if (value === null || !isCurrent()) return;
+      const el = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
+      if (!el) return;
+      el.value = value;
+      el.focus();
+      el.select();
+    } catch (err) {
+      showToast(`Could not suggest an answer: ${errorDetail(err)}`, 'error');
+    } finally {
+      if (isCurrent()) setSuggesting(false);
+    }
+  }
+
+  const runSuggest = state.suggest;
+
+  return (
+    <Overlay
+      open
+      onClose={() => close(null)}
+      overlayClass="protected-surface prompt-dialog-overlay"
+      panelClass="surface surface-raised confirm-dialog protected-surface"
+      panelRole="dialog"
+      ariaModal
+      panelRef={dialogRef}
+    >
+      {state.title && <SurfaceHead title={state.title} />}
+      <div class="surface-body dialog-body" tabIndex={-1}>
+        {runSuggest ? (
+          <div class="prompt-message-row">
+            <div class="prompt-message"><DialogMessage message={state.message} /></div>
+            <SuggestLink suggesting={suggesting} onClick={() => { void suggest(runSuggest); }} />
+          </div>
+        ) : (
+          <DialogMessage message={state.message} />
+        )}
+        {state.multiline ? (
+          <textarea class="prompt-input prompt-textarea" placeholder={state.placeholder} rows={4} readOnly={suggesting} aria-busy={suggesting} {...PROSE_TEXT_ATTRS} />
+        ) : (
+          <input type="text" class="prompt-input" placeholder={state.placeholder} readOnly={suggesting} aria-busy={suggesting} {...PROSE_TEXT_ATTRS} />
+        )}
+      </div>
+      <div class="surface-foot" onMouseDown={keepFieldFocused}>
+        <button class="action-btn action-btn-secondary" data-role="prompt-cancel" onClick={() => close(null)}>
+          {cancelLabel}
+        </button>
+        <button class="action-btn" data-role="prompt-ok" disabled={suggesting} onClick={submit}>
+          {okLabel}
+        </button>
+      </div>
+    </Overlay>
+  );
+}
+
+function SuggestLink({ suggesting, onClick }: { suggesting: boolean; onClick: () => void }) {
+  return (
+    <button type="button" class="accent-link prompt-suggest" data-role="prompt-suggest"
+      aria-disabled={suggesting} aria-busy={suggesting} onMouseDown={keepFieldFocused}
+      onClick={() => { if (!suggesting) onClick(); }}>
+      {suggesting && <span class="mini-spinner" aria-hidden="true" />}
+      Suggest
+    </button>
+  );
+}

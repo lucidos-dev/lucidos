@@ -1,0 +1,9 @@
+[package]
+name = "lucidos-capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The capability parity manifest's data (ADR 0018), and the CLI module and SDK
+# table rendered from it. A leaf crate so the CLI's build.rs can render its
+# commands without compiling the engine. No dependencies, and it stays that way.

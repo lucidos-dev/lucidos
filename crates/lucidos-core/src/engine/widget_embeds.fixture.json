@@ -1,0 +1,178 @@
+[
+  {
+    "markdown": "![Marin](app:lucidos-sound-player?params={\"clip\":\"artifacts/voices/marin.mp3\"})",
+    "embeds": [
+      {
+        "app_id": "lucidos-sound-player",
+        "label": "Marin",
+        "params": {
+          "clip": "artifacts/voices/marin.mp3"
+        }
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "Warm and low. ![Cedar (warm)](app:lucidos-sound-player?params={\"clip\": \"voices/a (1).mp3\"})",
+    "embeds": [
+      {
+        "app_id": "lucidos-sound-player",
+        "label": "Cedar (warm)",
+        "params": {
+          "clip": "voices/a (1).mp3"
+        }
+      }
+    ],
+    "without_embeds": "Warm and low."
+  },
+  {
+    "markdown": "![Chart](app:run-chart?params=%7B%22days%22%3A7%2C%22unit%22%3A%22km%22%7D)",
+    "embeds": [
+      {
+        "app_id": "run-chart",
+        "label": "Chart",
+        "params": {
+          "days": 7,
+          "unit": "km"
+        }
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "![](app:fare-grid)",
+    "embeds": [
+      {
+        "app_id": "fare-grid",
+        "label": null,
+        "params": null
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "![Grid](app:fare-grid?params={})",
+    "embeds": [
+      {
+        "app_id": "fare-grid",
+        "label": "Grid",
+        "params": null
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "![Nested](app:chart?params={\"series\":[{\"x\":1,\"label\":\"a}b\"}],\"on\":true})",
+    "embeds": [
+      {
+        "app_id": "chart",
+        "label": "Nested",
+        "params": {
+          "series": [
+            {
+              "x": 1,
+              "label": "a}b"
+            }
+          ],
+          "on": true
+        }
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "![A](app:player?params={\"clip\":\"a.mp3\"}) or ![B](app:player?params={\"clip\":\"b.mp3\"})",
+    "embeds": [
+      {
+        "app_id": "player",
+        "label": "A",
+        "params": {
+          "clip": "a.mp3"
+        }
+      },
+      {
+        "app_id": "player",
+        "label": "B",
+        "params": {
+          "clip": "b.mp3"
+        }
+      }
+    ],
+    "without_embeds": "or"
+  },
+  {
+    "markdown": "![chart](artifacts/chart.png) and [a link](app:player)",
+    "embeds": [],
+    "without_embeds": "![chart](artifacts/chart.png) and [a link](app:player)"
+  },
+  {
+    "markdown": "![x](app:player?params=[1])",
+    "embeds": [
+      {
+        "error": true
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "Pick one ![x](app:player?params={\"clip\":\"a.mp3\")",
+    "embeds": [
+      {
+        "error": true
+      }
+    ],
+    "without_embeds": "Pick one"
+  },
+  {
+    "markdown": "![x](app:..evil)",
+    "embeds": [
+      {
+        "error": true
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "![x](app:player?params={\"clip\":})",
+    "embeds": [
+      {
+        "error": true
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "![x](app:player?clip=a.mp3)",
+    "embeds": [
+      {
+        "error": true
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "![x](app:player?params=%ZZ)",
+    "embeds": [
+      {
+        "error": true
+      }
+    ],
+    "without_embeds": null
+  },
+  {
+    "markdown": "Write `![x](app:player?params={\"clip\":\"a\"})` to embed one.",
+    "embeds": [],
+    "without_embeds": "Write `![x](app:player?params={\"clip\":\"a\"})` to embed one."
+  },
+  {
+    "markdown": "```\n![x](app:player)\n```\n![Real](app:fare-grid)",
+    "embeds": [
+      {
+        "app_id": "fare-grid",
+        "label": "Real",
+        "params": null
+      }
+    ],
+    "without_embeds": "```\n![x](app:player)\n```"
+  }
+]

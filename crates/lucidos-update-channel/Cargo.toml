@@ -1,0 +1,13 @@
+[package]
+name = "lucidos-update-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Update channels and version order, shared by the engine, gateway, app and CLI.
+# ADR 0014 §1 keeps the gateway off the engine,
+# so the rule lives in its own crate.
+
+[dependencies]
+semver = "1"
+url = "2.5"

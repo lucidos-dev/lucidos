@@ -1,0 +1,31 @@
+<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-__MERMAID_NONCE__'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><style>body{margin:0;padding:12px;box-sizing:border-box}svg{display:block;max-width:100%;height:auto}#chart{overflow:auto}html[data-motion="reduce"] *{animation:none!important;transition:none!important}</style></head><body><div id="chart"></div><script nonce="__MERMAID_NONCE__">__MERMAID_LIBRARY__</script><script nonce="__MERMAID_NONCE__">
+const channel = "__MERMAID_NONCE__";
+const chart = document.getElementById('chart');
+const send = (status) => parent.postMessage({channel, status, height: chart.getBoundingClientRect().height + 24}, '*');
+let generation = 0;
+addEventListener('message', async (event) => {
+  if (event.source !== parent || event.data?.channel !== channel) return;
+  const {source, theme, motion} = event.data;
+  document.documentElement.setAttribute('data-motion', motion || 'reduce');
+  const current = ++generation;
+  try {
+    mermaid.initialize({startOnLoad: false, securityLevel: 'strict', htmlLabels: false,
+      suppressErrorRendering: true, maxTextSize: 50000, maxEdges: 500,
+      secure: ['secure', 'securityLevel', 'startOnLoad', 'htmlLabels', 'suppressErrorRendering', 'maxTextSize', 'maxEdges', 'theme', 'themeVariables', 'themeCSS'],
+      theme: 'base', themeVariables: theme});
+    document.body.style.background = theme.background;
+    document.body.style.color = theme.textColor;
+    const result = await mermaid.render('diagram-' + current, source);
+    if (current !== generation) return;
+    chart.innerHTML = result.svg;
+    // No bindFunctions: authored interactions are never installed.
+    send('rendered');
+  } catch {
+    if (current !== generation) return;
+    chart.textContent = '';
+    send('error');
+  }
+});
+new ResizeObserver(() => send('resize')).observe(chart);
+send('ready');
+</script></body></html>

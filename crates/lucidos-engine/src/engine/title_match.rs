@@ -1,0 +1,80 @@
+use std::cmp::Ordering;
+
+/// INVARIANT: Declared weakest first, so the derived `Ord` ranks an exact title above
+/// everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TitleMatch {
+    None,
+    Phrase,
+    WordStart,
+    Exact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TitleRank {
+    pub(crate) level: TitleMatch,
+    pub(crate) coverage: f64,
+}
+
+impl TitleRank {
+    pub fn best_first(a: &Self, b: &Self) -> Ordering {
+        b.level
+            .cmp(&a.level)
+            .then_with(|| b.coverage.total_cmp(&a.coverage))
+    }
+}
+
+fn normalize(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// INVARIANT: A word starts at the title's start or after a character that is not a
+/// letter or a digit. camelCase is deliberately not a word boundary.
+fn starts_a_word(title: &str, at: usize) -> bool {
+    title[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_alphanumeric())
+}
+
+fn level(title: &str, query: &str) -> TitleMatch {
+    if query.is_empty() {
+        return TitleMatch::None;
+    }
+    if title == query {
+        return TitleMatch::Exact;
+    }
+    let mut found = TitleMatch::None;
+    for (at, _) in title.match_indices(query) {
+        if starts_a_word(title, at) {
+            return TitleMatch::WordStart;
+        }
+        found = TitleMatch::Phrase;
+    }
+    found
+}
+
+pub(crate) fn title_match(title: &str, query: &str) -> TitleMatch {
+    level(&normalize(title), &normalize(query))
+}
+
+pub fn title_rank(title: &str, query: &str) -> TitleRank {
+    let (title, query) = (normalize(title), normalize(query));
+    let level = level(&title, &query);
+    let coverage = match level {
+        TitleMatch::None => 0.0,
+        _ => query.chars().count() as f64 / title.chars().count() as f64,
+    };
+    TitleRank { level, coverage }
+}
+
+#[path = "title_match_codegen.rs"]
+pub(crate) mod codegen;
+
+#[cfg(test)]
+#[path = "title_match_tests.rs"]
+mod tests;

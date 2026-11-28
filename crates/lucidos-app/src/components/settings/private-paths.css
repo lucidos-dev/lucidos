@@ -1,0 +1,16 @@
+.private-paths-action {
+    flex: 0 0 5.5rem;
+    inline-size: 5.5rem;
+}
+
+.private-paths-status {
+    align-items: baseline;
+}
+
+.private-paths-section .allowlist-actions {
+    margin-block: 0.375rem 0.625rem;
+}
+
+.private-paths-value {
+    overflow-wrap: anywhere;
+}

@@ -1,0 +1,65 @@
+# Lucidos
+
+> Lucidos is an open-source (MIT) workspace that runs on your own machine. You use it from the desktop or from your phone. It builds and runs the apps and automations you describe. They run together with the assistant in one workspace, and share the same data, memory and connected accounts. You describe an app in chat and it is running seconds later, next to the chat. You can change it while it keeps running.
+
+## What it is
+
+- One local workspace per project or person. Everything in it shares one event store (Postgres with pgvector) and one tree of git-tracked files.
+- Chat and apps form a dual interface. The chat sits beside your apps on desktop and one swipe away on the phone. The assistant and your apps reach the same data, the same accounts and the same workspace features.
+- Lucidos builds the apps you describe, and it also hosts and runs them. Apps are HTML with no build step. You set up no repo, no server and no deploy.
+- Models are yours to choose: Anthropic, OpenAI, OpenRouter, Google Vertex, or a local model. You can swap them at any time.
+
+## What runs, and what starts it
+
+- The unit of work is a thread. Chat, triggers and coding-agent runs are all threads in the same workspace.
+- A trigger fires on a schedule (cron) or on an event: an event from the workspace, from an app, or from an outside service through a webhook.
+- A trigger can run a script directly, or start an assistant thread that does the job with every tool the assistant has. That thread can start more threads, including a coding agent.
+- After you create a trigger, it runs unattended. Lucidos ships no triggers of its own: every trigger exists because you asked for it.
+- The assistant can split work across parallel sub-threads and collect the results.
+- Code work goes to a coding agent (Claude Code or Codex) in a separate git worktree. You review the diff and click Apply. From a source checkout, this is how Lucidos changes its own code.
+
+## Memory and learning
+
+- Long-term memory carries across conversations.
+- Knowhow files hold how to do things: API details, quirks, procedures. The assistant writes and updates them as it learns, and loads them when a request matches. This is the Lucidos form of an agent "skill".
+
+## Integrations
+
+- You connect a service once (API key, OAuth, or a custom handshake or signer). The assistant, apps, scripts and triggers all call it through the Lucidos proxy. The engine adds the key to each request, so an app never sees it.
+- MCP servers, email (IMAP/SMTP) and a browser tool are available to the assistant.
+
+## Sharing
+
+- A plugin bundles apps, triggers, knowhow and scripts. You install plugins from any git repo: a public GitHub repo for everyone, or a company repo for your coworkers.
+
+## What it does not do, on purpose
+
+- It does not move your workspace to a hosted service. There is no account, no cloud sync and no telemetry. An LLM call sends its prompt to the provider you picked.
+- It does not put the assistant inside Telegram, Slack or WhatsApp as a chat surface. You use Lucidos in its own app. Apps and triggers can still call those services' APIs.
+
+## Status
+
+- Pre-1.0 and actively developed. The public GitHub repo (github.com/lucidos-dev/lucidos) is a release mirror, so its commit count does not show how old the project is.
+- Install: a signed macOS app (Apple Silicon), or `curl -fsSL https://lucidos.dev/install.sh | sh` on macOS and Linux.
+
+## Docs
+
+- [Home](https://docs.lucidos.dev/): what Lucidos is, in one page.
+- [Quickstart](https://docs.lucidos.dev/quickstart/): install Lucidos and pick an LLM provider.
+- [Concepts](https://docs.lucidos.dev/concepts/): events, artifacts, intents, knowhow, apps, triggers, threads, proxies and plugins.
+- [Threads](https://docs.lucidos.dev/concepts/#threads): chat, trigger and coding-agent runs, and sub-threads.
+- [Apps and triggers](https://docs.lucidos.dev/concepts/#apps-and-triggers): what starts a run, and what it can do.
+- [Proxies](https://docs.lucidos.dev/concepts/#proxies): connect a service once, and keep the key out of your apps.
+- [Plugins](https://docs.lucidos.dev/concepts/#plugins): bundles you install from any git repo.
+- [Architecture](https://docs.lucidos.dev/architecture/): one machine, the event bus, and how a turn runs.
+- [Privacy](https://docs.lucidos.dev/privacy/): what stays on your machine and what leaves it.
+- [Philosophy](https://docs.lucidos.dev/philosophy/): why Lucidos works the way it does.
+- [Build an app](https://docs.lucidos.dev/tutorials/build-an-app/): the first tutorial.
+- [Automate with a trigger](https://docs.lucidos.dev/tutorials/automate-with-a-trigger/): the second tutorial.
+- [Develop Lucidos](https://docs.lucidos.dev/develop/): run from a source checkout and let Lucidos work on its own code.
+
+## Optional
+
+- [Source](https://github.com/lucidos-dev/lucidos)
+- [Website](https://lucidos.dev)
+- [Blog](https://blog.lucidos.dev)

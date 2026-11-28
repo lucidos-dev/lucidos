@@ -1,0 +1,14 @@
+{
+  "id": "N4",
+  "fix": "8543245af57bf8bdae60bc0e2b9bc4ca699109b7",
+  "title": "fix(agent-session): run Claude Code with its background tasks switched off",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/runtime/claude_code_tests/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/runtime/claude_code_tests/build_command.rs"
+  },
+  "needs_db": false,
+  "comment": "constraint",
+  "why": "build_command_with_settings already sets one engine-owned env var, and its comment says engine-owned values go after apply_lucidos_env, so a workspace value cannot override them. Setting the new variable before that call passes the first test and fails the second. BACKGROUND_PROCESS_RULE's doc explains why it names run_in_background, which the fix must now retract.",
+  "adaptation": "The fix's two build_command tests, unchanged apart from the comment. This is the weakest task: the bug report names the variable, so the withheld test checks only where it is set. The prompt rule rewrite is in the bug report and the reference diff but not in the withheld test."
+}

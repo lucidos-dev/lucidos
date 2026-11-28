@@ -1,0 +1,1506 @@
+use super::{
+    count_events_impl, merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid,
+    parse_send_notification_args, parse_source_arg, parse_status_arg, pending_scope_arg,
+    query_events_impl, status_filter_arg,
+};
+use crate::core::store::StatusFilter;
+use crate::engine::thread_lifecycle::ThreadStatus;
+use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
+use crate::test_support::{setup_test_db, teardown_test_db};
+use serde_json::json;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[test]
+fn parse_source_arg_normalizes_coding_agent_alias() {
+    let parsed = parse_source_arg(Some(&json!("chat, coding-agent, claude_code, trigger")))
+        .expect("source filter");
+    assert_eq!(
+        parsed,
+        vec!["chat", "claude_code", "claude_code", "trigger"]
+    );
+
+    let parsed =
+        parse_source_arg(Some(&json!(["coding-agent", "trigger", " "]))).expect("source filter");
+    assert_eq!(parsed, vec!["claude_code", "trigger"]);
+}
+
+#[test]
+fn parse_source_arg_collapses_blank_inputs() {
+    assert_eq!(parse_source_arg(Some(&json!(" , , "))), None);
+    assert_eq!(parse_source_arg(Some(&json!(["", "  "]))), None);
+    assert_eq!(parse_source_arg(Some(&json!(42))), None);
+}
+
+#[test]
+fn parse_status_arg_takes_an_array_or_a_comma_separated_string() {
+    let from_array = parse_status_arg(&json!({"status": ["running", "failed"]}))
+        .expect("the advertised array shape");
+    let from_string =
+        parse_status_arg(&json!({"status": "running, failed"})).expect("the string shape");
+    assert_eq!(from_array, from_string);
+    assert_eq!(from_array, [ThreadStatus::Running, ThreadStatus::Failed]);
+}
+
+#[test]
+fn parse_status_arg_is_absent_when_the_model_omits_it() {
+    assert!(parse_status_arg(&json!({}))
+        .expect("no status is valid")
+        .is_empty());
+    assert!(parse_status_arg(&json!({"status": null}))
+        .expect("an explicit null is the same as omitting it")
+        .is_empty());
+}
+
+#[test]
+fn parse_status_arg_refuses_a_value_the_model_invented() {
+    let err =
+        parse_status_arg(&json!({"status": ["busy"]})).expect_err("'busy' is not a thread status");
+    assert!(
+        err.starts_with("Error: "),
+        "tool errors are prefixed: {err}"
+    );
+    assert!(err.contains("busy"), "must echo the bad value: {err}");
+    assert!(
+        err.contains("running") && err.contains("waiting_for_user_answer"),
+        "must list what it could have meant: {err}"
+    );
+
+    for empty in [json!({"status": []}), json!({"status": ""})] {
+        let err = parse_status_arg(&empty).expect_err("an empty status must not mean 'no filter'");
+        assert!(err.contains("status"), "{err}");
+    }
+}
+
+#[test]
+fn parse_status_arg_refuses_status_alongside_active() {
+    let err = parse_status_arg(&json!({"active": true, "status": ["running"]}))
+        .expect_err("both filters at once must be refused");
+    assert!(err.contains("not both"), "{err}");
+    assert!(
+        err.contains("waiting_for_user_answer"),
+        "the refusal is also where the model learns what the union is: {err}"
+    );
+}
+
+#[test]
+fn status_filter_arg_prefers_explicit_statuses_and_falls_back_to_active() {
+    let statuses = [ThreadStatus::Running];
+    assert!(matches!(
+        status_filter_arg(&json!({"status": ["running"]}), &statuses),
+        StatusFilter::OneOf(_)
+    ));
+    assert!(matches!(
+        status_filter_arg(&json!({"active": true}), &[]),
+        StatusFilter::Active(true)
+    ));
+    assert!(matches!(
+        status_filter_arg(&json!({"active": false}), &[]),
+        StatusFilter::Active(false)
+    ));
+    assert!(matches!(
+        status_filter_arg(&json!({}), &[]),
+        StatusFilter::Any
+    ));
+}
+
+async fn insert_thread_event(
+    pool: &PgPool,
+    event_id: Uuid,
+    thread_id: Uuid,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2, $3, $4, NOW(), $2::uuid)",
+    )
+    .bind(event_id)
+    .bind(thread_id.to_string())
+    .bind(event_type)
+    .bind(payload)
+    .execute(pool)
+    .await
+    .expect("insert thread event");
+}
+
+fn some_caller() -> Uuid {
+    Uuid::new_v4()
+}
+
+#[tokio::test]
+async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
+    let (pool, db) = setup_test_db().await;
+
+    let thread_id = Uuid::new_v4();
+    let wanted = Uuid::new_v4();
+    insert_thread_event(&pool, wanted, thread_id, "ToolResult", json!({"r": "hit"})).await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"r": "decoy"}),
+    )
+    .await;
+
+    for spelling in [
+        format!("evt-{}", wanted.simple()),
+        wanted.to_string(),
+        wanted.simple().to_string(),
+    ] {
+        let out = query_events_impl(&pool, &json!({"event_id": spelling.clone()}), some_caller())
+            .await
+            .unwrap_or_else(|e| panic!("{spelling} must resolve, got: {e}"));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+        assert_eq!(parsed["returned"], 1, "{spelling} must return one row");
+        assert_eq!(parsed["events"][0]["id"], wanted.to_string());
+        assert_eq!(parsed["events"][0]["payload"]["r"], "hit");
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn query_events_masks_a_stored_credential_in_any_payload() {
+    let (pool, db) = setup_test_db().await;
+    let secret = "opaque-stored-credential-value";
+    crate::test_support::seed_credential(
+        &pool,
+        "example-api",
+        "https://api.example.com",
+        crate::core::AuthType::ApiKey,
+        secret,
+    )
+    .await;
+    let thread_id = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "BackgroundBashCompleted",
+        json!({"task_id": "task-old", "stdout": format!("CRED_EXAMPLE_API={secret}"), "stderr": ""}),
+    )
+    .await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "TriggerCompleted",
+        json!({"trigger_id": "sync", "result_summary": format!("synced with key {secret}")}),
+    )
+    .await;
+
+    let out = query_events_impl(
+        &pool,
+        &json!({"thread_id": thread_id.to_string()}),
+        some_caller(),
+    )
+    .await
+    .expect("the query runs");
+
+    assert!(!out.contains(secret), "credential replayed: {out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 2);
+    assert!(out.contains("synced with key"));
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn dereferencing_a_tool_call_brings_back_its_result() {
+    let (pool, db) = setup_test_db().await;
+
+    let thread_id = Uuid::new_v4();
+    let call = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        call,
+        thread_id,
+        "ToolCalled",
+        json!({"name": "run_bash", "args": {"command": "ls"}}),
+    )
+    .await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"name": "run_bash", "result": "total 4", "tool_called_event_id": call}),
+    )
+    .await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"name": "read_file", "result": "other", "tool_called_event_id": Uuid::new_v4()}),
+    )
+    .await;
+
+    let out = query_events_impl(
+        &pool,
+        &json!({"event_id": format!("evt-{}", call.simple())}),
+        some_caller(),
+    )
+    .await
+    .expect("the call resolves");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 2, "the pair, not just the call");
+    assert_eq!(parsed["events"][0]["event_type"], "ToolCalled");
+    assert_eq!(parsed["events"][1]["event_type"], "ToolResult");
+    assert_eq!(parsed["events"][1]["payload"]["result"], "total 4");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn dereferencing_an_orphan_call_returns_the_call_alone() {
+    let (pool, db) = setup_test_db().await;
+
+    let thread_id = Uuid::new_v4();
+    let call = Uuid::new_v4();
+    insert_thread_event(&pool, call, thread_id, "ToolCalled", json!({"name": "x"})).await;
+
+    let out = query_events_impl(&pool, &json!({"event_id": call.to_string()}), some_caller())
+        .await
+        .expect("an orphan call still resolves");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 1);
+    assert_eq!(parsed["events"][0]["event_type"], "ToolCalled");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_windowed_query_never_pulls_in_paired_results() {
+    let (pool, db) = setup_test_db().await;
+
+    let thread_id = Uuid::new_v4();
+    let call = Uuid::new_v4();
+    insert_thread_event(&pool, call, thread_id, "ToolCalled", json!({"name": "x"})).await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"name": "x", "result": "r", "tool_called_event_id": call}),
+    )
+    .await;
+
+    let out = query_events_impl(&pool, &json!({"event_type": "ToolCalled"}), some_caller())
+        .await
+        .expect("plain query");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 1, "only the matched row");
+    assert_eq!(parsed["events"][0]["event_type"], "ToolCalled");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn query_events_errors_when_an_address_resolves_to_nothing() {
+    let (pool, db) = setup_test_db().await;
+
+    let missing = Uuid::new_v4();
+    let out = query_events_impl(
+        &pool,
+        &json!({"event_id": format!("evt-{}", missing.simple())}),
+        some_caller(),
+    )
+    .await;
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("no event has id") && msg.contains(&missing.to_string())),
+        "a dangling pointer must name the id it could not resolve, got: {:?}",
+        out
+    );
+
+    let present = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    insert_thread_event(&pool, present, thread_id, "ToolResult", json!({})).await;
+    let out = query_events_impl(
+        &pool,
+        &json!({"event_id": present.to_string(), "event_type": "MessageReceived"}),
+        some_caller(),
+    )
+    .await;
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("drop any other filter")),
+        "a contradicting filter must be named as a possible cause, got: {:?}",
+        out
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn query_events_refuses_a_malformed_address_rather_than_widening() {
+    let (pool, db) = setup_test_db().await;
+
+    for bad in [json!("evt-not-a-uuid"), json!("nonsense"), json!("")] {
+        let out = query_events_impl(&pool, &json!({"event_id": bad}), some_caller()).await;
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("is not an event address")),
+            "{bad} must be refused, got: {:?}",
+            out
+        );
+    }
+    let out = query_events_impl(&pool, &json!({"event_id": ["deadbeef"]}), some_caller()).await;
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("is not an event address")),
+        "an array must be refused, got: {:?}",
+        out
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn query_events_by_id_still_honours_the_byte_limit() {
+    let (pool, db) = setup_test_db().await;
+
+    let thread_id = Uuid::new_v4();
+    let big = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        big,
+        thread_id,
+        "ToolResult",
+        json!({"result": "x".repeat(8000)}),
+    )
+    .await;
+
+    let out = query_events_impl(
+        &pool,
+        &json!({"event_id": big.to_string(), "byte_limit": 1024}),
+        some_caller(),
+    )
+    .await
+    .expect("a truncated response is still a response");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["truncated"], true);
+    assert_eq!(parsed["returned"], 0);
+    assert_eq!(
+        parsed["total_matching"], 1,
+        "the row matched, it just did not fit"
+    );
+    assert!(parsed["hint"].is_string(), "truncation must carry its hint");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn query_events_masks_a_stored_secret_used_as_a_key() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let secret = "stored-row-secret-value";
+    crate::core::EnvironmentVariableStore::upsert(&pool, &bus, "GITHUB_TOKEN", secret, None)
+        .await
+        .expect("store the secret");
+
+    let thread_id = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ReportFiled",
+        json!({ secret: 1, "nested": [{ secret: true }] }),
+    )
+    .await;
+
+    let out = query_events_impl(
+        &pool,
+        &json!({"thread_id": thread_id.to_string()}),
+        some_caller(),
+    )
+    .await
+    .expect("masked rows");
+    assert!(!out.contains(secret), "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    let payload = &parsed["events"][0]["payload"];
+    assert_eq!(payload["[REDACTED]"], 1, "{out}");
+    assert_eq!(payload["nested"][0]["[REDACTED]"], true, "{out}");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn query_events_without_an_address_is_unchanged() {
+    let (pool, db) = setup_test_db().await;
+
+    let thread_id = Uuid::new_v4();
+    for i in 0..3 {
+        insert_thread_event(
+            &pool,
+            Uuid::new_v4(),
+            thread_id,
+            "ToolResult",
+            json!({"i": i}),
+        )
+        .await;
+    }
+
+    let out = query_events_impl(&pool, &json!({"event_type": "ToolResult"}), some_caller())
+        .await
+        .expect("plain query");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 3);
+    assert_eq!(parsed["truncated"], false);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn thread_id_current_reads_the_calling_thread() {
+    let (pool, db) = setup_test_db().await;
+
+    let caller = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        caller,
+        "ToolResult",
+        json!({"r": "mine"}),
+    )
+    .await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        other,
+        "ToolResult",
+        json!({"r": "theirs"}),
+    )
+    .await;
+
+    for alias in ["current", "this", "  Current  ", "THIS"] {
+        let out = query_events_impl(&pool, &json!({"thread_id": alias}), caller)
+            .await
+            .unwrap_or_else(|e| panic!("{alias} must resolve, got: {e}"));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+        assert_eq!(
+            parsed["returned"], 1,
+            "{alias} must return the caller's row"
+        );
+        assert_eq!(parsed["events"][0]["payload"]["r"], "mine");
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
+    let (pool, db) = setup_test_db().await;
+
+    let caller = Uuid::new_v4();
+    insert_thread_event(&pool, Uuid::new_v4(), caller, "ToolResult", json!({})).await;
+
+    for bad in [json!("currently"), json!("the one we discussed"), json!("")] {
+        let out = query_events_impl(&pool, &json!({"thread_id": bad}), caller).await;
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("is not a uuid") && msg.contains("'current'")),
+            "{bad} must be refused and point at the alias, got: {:?}",
+            out
+        );
+    }
+
+    for bad in [
+        json!([caller.to_string()]),
+        json!({"id": "current"}),
+        json!(7),
+    ] {
+        let out = query_events_impl(&pool, &json!({"thread_id": bad}), caller).await;
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("must be a uuid string or 'current'")),
+            "{bad} must be refused rather than widening, got: {:?}",
+            out
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+fn tap_thread_id(args: &serde_json::Value, caller: Uuid) -> Option<String> {
+    let parsed = parse_send_notification_args(args, caller).expect("args must parse");
+    match parsed.tap {
+        crate::scheduler::notifications::Tap::Navigate { to } => to.id,
+        crate::scheduler::notifications::Tap::Modal
+        | crate::scheduler::notifications::Tap::RestoreSnapshot { .. }
+        | crate::scheduler::notifications::Tap::UndoConfigChange { .. } => None,
+    }
+}
+
+fn notify_args(tap_id: &str) -> serde_json::Value {
+    json!({
+        "title": "Nightly release prep: skipped",
+        "message": "Pre-flight stopped on deletion drift.",
+        "tap": {"kind": "navigate", "to": {"target": "thread", "id": tap_id}}
+    })
+}
+
+#[test]
+fn a_tap_naming_the_current_thread_stores_its_uuid() {
+    let caller = Uuid::new_v4();
+    for alias in ["current", "this", "  Current  "] {
+        assert_eq!(
+            tap_thread_id(&notify_args(alias), caller),
+            Some(caller.to_string()),
+            "{alias} must resolve to the calling thread"
+        );
+    }
+}
+
+#[test]
+fn the_resolved_tap_matches_the_notification_s_own_thread() {
+    let caller = Uuid::new_v4();
+    let parsed = parse_send_notification_args(&notify_args("current"), caller).expect("parses");
+    assert_eq!(parsed.link_thread, caller);
+    assert_eq!(
+        tap_thread_id(&notify_args("current"), caller),
+        Some(parsed.link_thread.to_string())
+    );
+}
+
+#[test]
+fn a_tap_thread_id_that_names_nothing_is_refused() {
+    let caller = Uuid::new_v4();
+    for bad in ["t-9", "the release thread", "currently", ""] {
+        let out = parse_send_notification_args(&notify_args(bad), caller);
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("is not a uuid") && msg.contains("'current'")),
+            "{bad} must be refused and point at the alias"
+        );
+    }
+}
+
+#[test]
+fn the_derived_tap_still_passes_the_guard() {
+    let caller = Uuid::new_v4();
+    let event = Uuid::new_v4();
+    let args = json!({
+        "title": "Lucidos is asking",
+        "message": "Permission needed.",
+        "event_id": event.to_string()
+    });
+    assert_eq!(tap_thread_id(&args, caller), Some(caller.to_string()));
+
+    let bare = json!({"title": "Daily summary", "message": "Here it is."});
+    assert_eq!(
+        tap_thread_id(&bare, caller),
+        None,
+        "no event means the card"
+    );
+}
+
+#[test]
+fn a_restore_snapshot_tap_is_refused() {
+    let args = json!({
+        "title": "Undo the restore",
+        "message": "Tap to undo.",
+        "tap": {"kind": "restore-snapshot", "workspace_id": "example",
+                "handle": "snap_00000000000000000000000000"}
+    });
+    let out = parse_send_notification_args(&args, Uuid::new_v4());
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("restore-snapshot")),
+        "{:?}",
+        out.err()
+    );
+}
+
+mod build_query_events_response_tests {
+    use crate::core::EventRow;
+    use crate::engine::tools::build_query_events_response;
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn row(event_type: &str, payload_chars: usize) -> EventRow {
+        EventRow {
+            id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            payload: json!({ "summary": "x".repeat(payload_chars) }),
+            created: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            thread_id: None,
+            sequence: None,
+        }
+    }
+
+    #[test]
+    fn returns_full_set_when_under_budget() {
+        let events = vec![row("Small", 10), row("Small", 10), row("Small", 10)];
+        let out = build_query_events_response(&events, 100_000, None);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 3);
+        assert_eq!(parsed["returned"], 3);
+        assert_eq!(parsed["truncated"], false);
+        assert!(parsed.get("hint").is_none(), "no hint when not truncated");
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn stops_mid_list_when_byte_limit_hit() {
+        let events = vec![
+            row("Tiny", 10),
+            row("Tiny", 10),
+            row("Huge", 50_000),
+            row("Tiny", 10),
+        ];
+        let out = build_query_events_response(&events, 1_000, None);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 4);
+        assert_eq!(parsed["returned"], 2);
+        assert_eq!(parsed["truncated"], true);
+        assert!(parsed["hint"].as_str().unwrap().contains("narrow"));
+    }
+
+    #[test]
+    fn empty_events_when_first_alone_exceeds_budget() {
+        let events = vec![row("Huge", 50_000)];
+        let out = build_query_events_response(&events, 1_000, None);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 1);
+        assert_eq!(parsed["returned"], 0);
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["byte_size"], 0);
+        assert!(parsed["hint"].is_string());
+    }
+
+    #[test]
+    fn truncation_hint_names_only_real_query_arguments() {
+        let events_domain = crate::capability_manifest::domain_for_tool("events")
+            .expect("events domain is in the capability manifest");
+        let query_op = events_domain
+            .operations
+            .iter()
+            .find(|op| op.action == "query")
+            .expect("events domain has a `query` operation");
+        let schema: serde_json::Value = serde_json::from_str(
+            query_op
+                .llm_schema
+                .expect("the query operation declares an explicit LLM schema"),
+        )
+        .expect("the LLM schema is a JSON object");
+        let properties = schema.as_object().expect("schema is a JSON object");
+
+        for filter in crate::engine::tools::QUERY_EVENTS_HINT_FILTERS {
+            assert!(
+                properties.contains_key(*filter),
+                "the truncation hint tells the model to narrow with `{filter}`, \
+                 which is not a property of the events `query` LLM schema \
+                 (it accepts: {:?}). Naming a filter the tool ignores makes the \
+                 model retry into the identical truncated result.",
+                properties.keys().collect::<Vec<_>>(),
+            );
+            assert!(
+                crate::engine::tools::QUERY_EVENTS_TRUNCATION_HINT.contains(*filter),
+                "`{filter}` is listed in QUERY_EVENTS_HINT_FILTERS but the hint \
+                 text never mentions it, so the check above guards nothing.",
+            );
+        }
+
+        for column in ["aggregate", "aggregate_id", "thread_id", "sequence"] {
+            assert!(
+                !crate::engine::tools::QUERY_EVENTS_TRUNCATION_HINT.contains(column),
+                "the truncation hint mentions `{column}`, an events-table column \
+                 that `query_events` cannot filter on.",
+            );
+        }
+    }
+
+    fn widest_liveness() -> crate::engine::thread_liveness::ThreadLiveness {
+        use crate::engine::thread_liveness::*;
+        ThreadLiveness {
+            state: LivenessState::WaitingForUserAnswer,
+            status: crate::engine::thread_lifecycle::ThreadStatus::WaitingForUserAnswer,
+            last_activity_age_secs: Some(i64::MAX),
+            session: Some(LivenessSession {
+                ordinal: u32::MAX,
+                continuity: SessionOpening::Handoff,
+                age_secs: i64::MAX,
+            }),
+            handoff: Some(LivenessHandoff::Pending),
+            live_event_waits: vec![],
+            awaited_children: vec![],
+            expected_wake: None,
+            hold: None,
+            as_of: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn the_liveness_header_leads_is_small_and_costs_no_events() {
+        let liveness = widest_liveness();
+        let header = serde_json::to_string(&liveness).unwrap();
+        assert!(header.len() <= 256, "{} bytes: {header}", header.len());
+
+        let events: Vec<EventRow> = (0..20).map(|_| row("Tiny", 40)).collect();
+        let bare = build_query_events_response(&events, 1_024, None);
+        let out = build_query_events_response(&events, 1_024, Some(&liveness));
+        let header_at = out.find("\"liveness\"").expect("a header");
+        let events_at = out.find("\"events\"").expect("the events");
+        assert!(header_at < events_at, "{out}");
+        let returned =
+            |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["returned"].clone();
+        assert_eq!(
+            returned(&out),
+            returned(&bare),
+            "the same event window fills"
+        );
+        assert!(
+            returned(&out).as_u64().unwrap() < 20,
+            "the budget still binds"
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&bare)
+            .unwrap()
+            .get("liveness")
+            .is_none());
+    }
+
+    #[test]
+    fn empty_input_yields_empty_array_no_hint() {
+        let out = build_query_events_response(&[], 100_000, None);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
+        assert_eq!(parsed["total_matching"], 0);
+        assert_eq!(parsed["returned"], 0);
+        assert_eq!(parsed["truncated"], false);
+        assert_eq!(parsed["byte_size"], 0);
+        assert!(parsed.get("hint").is_none());
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn output_is_compact_json_not_pretty_printed() {
+        let events = vec![row("Tiny", 10)];
+        let out = build_query_events_response(&events, 100_000, None);
+        assert!(
+            !out.contains("\n  "),
+            "result must be compact JSON (no indentation): {}",
+            out
+        );
+    }
+
+    #[test]
+    fn query_events_caps_match_workspace_learning_recipe() {
+        use crate::engine::tools::{QUERY_EVENTS_BYTE_BUDGET, QUERY_EVENTS_LIMIT};
+        assert_eq!(QUERY_EVENTS_LIMIT.default, 50);
+        assert_eq!(QUERY_EVENTS_LIMIT.max, 200);
+        assert_eq!(QUERY_EVENTS_BYTE_BUDGET.default, 128 * 1024);
+        assert_eq!(QUERY_EVENTS_BYTE_BUDGET.max, 512 * 1024);
+    }
+}
+
+#[test]
+fn apply_change_rejects_missing_change_id() {
+    for bad in [
+        json!({}),
+        json!({"change_id": null}),
+        json!({"change_id": ""}),
+        json!({"change_id": "   "}),
+    ] {
+        let out = parse_required_uuid(&bad, "change_id");
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("change_id is required")),
+            "{bad:?} should error as required, got: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn apply_change_rejects_malformed_change_id() {
+    let out = parse_required_uuid(&json!({"change_id": "not-a-uuid"}), "change_id");
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("not a valid UUID")),
+        "malformed change_id should error, got: {out:?}"
+    );
+}
+
+#[test]
+fn apply_change_accepts_valid_uuid_trimming_whitespace() {
+    let id = Uuid::new_v4();
+    let out = parse_required_uuid(&json!({"change_id": format!("  {id}  ")}), "change_id");
+    assert_eq!(out.expect("valid padded UUID must parse"), id);
+}
+
+#[test]
+fn a_refusal_for_a_settling_thread_names_apply_when_settled() {
+    use crate::api::changes::ChangeActionRefusal;
+    use crate::engine::tools::apply_refusal_message;
+
+    let msg = apply_refusal_message(ChangeActionRefusal::ThreadSettling);
+    assert!(msg.starts_with("Error:"), "{msg}");
+    assert!(
+        msg.contains("apply_when_settled"),
+        "the refusal must name the way forward: {msg}"
+    );
+}
+
+#[test]
+fn a_refusal_that_waiting_cannot_fix_does_not_name_apply_when_settled() {
+    use crate::api::changes::ChangeActionRefusal;
+    use crate::engine::tools::apply_refusal_message;
+
+    for refusal in [
+        ChangeActionRefusal::NoFilesLeft,
+        ChangeActionRefusal::ThreadParked,
+        ChangeActionRefusal::ActionUnavailable,
+    ] {
+        let msg = apply_refusal_message(refusal);
+        assert!(msg.starts_with("Error:"), "{msg}");
+        assert!(
+            !msg.contains("apply_when_settled"),
+            "{refusal:?} cannot be waited out, so the message must not suggest it: {msg}"
+        );
+    }
+}
+
+#[test]
+fn thread_queue_policy_patch_merges_with_current_policy() {
+    let current = CapacityPolicy {
+        max_concurrent_total: 16,
+        max_concurrent_event_trigger: 6,
+        max_concurrent_cron: 6,
+        max_concurrent_sub_thread: 8,
+        max_concurrent_coding_agent: 12,
+        max_concurrent_per_trigger: 1,
+        max_queued_per_trigger: 25,
+        reserved_background: 4,
+        overflow: OverflowPolicy::DropOldest,
+        max_event_trigger_depth: 5,
+        max_concurrent_children_per_thread: 10,
+    };
+
+    let out = merge_thread_queue_policy_patch(
+        current.clone(),
+        &json!({
+            "max_concurrent_coding_agent": 14,
+            "max_concurrent_children_per_thread": 4,
+            "overflow": "pause-trigger"
+        }),
+    )
+    .expect("valid patch should merge");
+
+    assert_eq!(out.max_concurrent_total, current.max_concurrent_total);
+    assert_eq!(
+        out.max_concurrent_event_trigger,
+        current.max_concurrent_event_trigger
+    );
+    assert_eq!(out.max_concurrent_coding_agent, 14);
+    assert_eq!(out.max_concurrent_children_per_thread, 4);
+    assert_eq!(out.overflow, OverflowPolicy::PauseTrigger);
+}
+
+#[test]
+fn thread_queue_policy_patch_rejects_empty_or_bad_fields() {
+    let current = CapacityPolicy::default();
+    let out = merge_thread_queue_policy_patch(current.clone(), &json!({}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("at least one")),
+        "empty patch should error, got: {out:?}"
+    );
+
+    let out =
+        merge_thread_queue_policy_patch(current.clone(), &json!({"max_concurrent_total": "12"}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("max_concurrent_total")),
+        "string cap should error, got: {out:?}"
+    );
+
+    let out =
+        merge_thread_queue_policy_patch(current.clone(), &json!({"max_queued_per_trigger": 0}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("at least 1")),
+        "zero queue cap should error, got: {out:?}"
+    );
+
+    let out = merge_thread_queue_policy_patch(
+        current.clone(),
+        &json!({"max_concurrent_children_per_thread": 0}),
+    );
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("max_concurrent_children_per_thread must be at least 1")),
+        "zero child cap should error, got: {out:?}"
+    );
+
+    let out = merge_thread_queue_policy_patch(current, &json!({"overflow": "delete-all"}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("overflow")),
+        "unknown overflow should error, got: {out:?}"
+    );
+}
+
+#[test]
+fn thread_queue_policy_patch_rejects_unknown_fields() {
+    let out = merge_thread_queue_policy_patch(CapacityPolicy::default(), &json!({"max_total": 12}));
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("unknown Thread Queue policy field")),
+        "unknown field should error, got: {out:?}"
+    );
+}
+
+#[test]
+fn my_children_resolves_to_the_ambient_caller_thread() {
+    let caller = Uuid::new_v4();
+
+    assert_eq!(
+        parent_filter_arg(&json!({"my_children": true}), caller),
+        Some(caller),
+        "my_children: true scopes the listing to the caller's own children"
+    );
+    assert_eq!(
+        parent_filter_arg(&json!({"my_children": false}), caller),
+        None,
+        "my_children: false is no filter, not an empty one"
+    );
+    assert_eq!(
+        parent_filter_arg(&json!({}), caller),
+        None,
+        "omitted is no filter"
+    );
+
+    let someone_else = Uuid::new_v4();
+    assert_eq!(
+        parent_filter_arg(&json!({"parent": someone_else.to_string()}), caller),
+        None,
+        "the LLM surface exposes no parent argument, so an invented one is inert"
+    );
+    assert_eq!(
+        parent_filter_arg(
+            &json!({"my_children": true, "parent": someone_else.to_string()}),
+            caller
+        ),
+        Some(caller),
+        "and an invented one alongside my_children still resolves to the caller"
+    );
+}
+
+#[test]
+fn sub_threads_of_resolves_current_and_refuses_the_rest() {
+    use crate::core::changes::PendingScope;
+    let caller = Uuid::new_v4();
+    assert_eq!(pending_scope_arg(&json!({}), caller), Ok(PendingScope::All));
+    assert_eq!(
+        pending_scope_arg(&json!({"sub_threads_of": "current"}), caller),
+        Ok(PendingScope::SubThreadsOf(caller))
+    );
+    let other = Uuid::new_v4();
+    assert_eq!(
+        pending_scope_arg(&json!({"sub_threads_of": other.to_string()}), caller),
+        Ok(PendingScope::SubThreadsOf(other))
+    );
+    for bad in [
+        json!({"sub_threads_of": "nope"}),
+        json!({"sub_threads_of": 7}),
+    ] {
+        assert!(
+            pending_scope_arg(&bad, caller).is_err(),
+            "{bad} must be refused"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::field_reassign_with_default,
+    reason = "the engine owns the archive summary versions"
+)]
+fn an_agent_archive_names_what_it_left_open() {
+    use crate::engine::archive_family::{ArchiveOutcome, THREAD_PINNED};
+    use crate::engine::tools::describe_agent_archive;
+    let (target, child, pinned) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let pinned_skip = serde_json::json!({
+        "thread_id": pinned, "reason": THREAD_PINNED, "message": "pinned"
+    });
+
+    let mut outcome = ArchiveOutcome::default();
+    outcome.archived = vec![target, child];
+    outcome.skipped = vec![pinned_skip.clone()];
+    let archived = describe_agent_archive(target, outcome).expect("the target was archived");
+    assert!(archived.starts_with(&format!(
+        "Archived thread {target} and 1 of its sub-threads."
+    )));
+    assert!(archived.contains(THREAD_PINNED), "{archived}");
+
+    let mut outcome = ArchiveOutcome::default();
+    outcome.skipped = vec![pinned_skip];
+    let already = describe_agent_archive(target, outcome)
+        .expect("an already archived target is not an error");
+    assert!(already.starts_with(&format!("Thread {target} was already archived.")));
+    assert!(already.contains(THREAD_PINNED), "{already}");
+
+    let mut outcome = ArchiveOutcome::default();
+    outcome.skipped = vec![serde_json::json!({
+        "thread_id": target, "reason": "not_archivable", "message": "changed"
+    })];
+    let left_open =
+        describe_agent_archive(target, outcome).expect_err("a target left open is an error");
+    assert!(left_open.contains("was left open"), "{left_open}");
+}
+
+#[test]
+fn the_change_state_filter_refuses_has_diff_and_unknown_kinds() {
+    use crate::engine::thread_lifecycle::ChangeStateKind;
+    let arg = |v: serde_json::Value| super::change_state_arg(&v);
+    assert_eq!(arg(serde_json::json!({})), Ok(None));
+    assert_eq!(
+        arg(serde_json::json!({ "change_state": "unproposed" })),
+        Ok(Some(ChangeStateKind::Unproposed))
+    );
+    let retired = arg(serde_json::json!({ "has_diff": true })).expect_err("has_diff is retired");
+    assert!(retired.contains("change_state"), "{retired}");
+    let unknown =
+        arg(serde_json::json!({ "change_state": "held" })).expect_err("not a change state");
+    assert!(unknown.contains("none, unproposed, proposed"), "{unknown}");
+}
+
+#[test]
+fn a_boolean_filter_arg_refuses_what_is_not_a_boolean() {
+    let args = serde_json::json!({
+        "a": true,
+        "b": "false",
+        "c": null,
+        "d": "yes",
+        "e": 1,
+    });
+    assert_eq!(super::bool_arg(&args, "a"), Ok(Some(true)));
+    assert_eq!(super::bool_arg(&args, "b"), Ok(Some(false)));
+    assert_eq!(super::bool_arg(&args, "c"), Ok(None));
+    assert_eq!(super::bool_arg(&args, "missing"), Ok(None));
+    for name in ["d", "e"] {
+        let err = super::bool_arg(&args, name).expect_err("not a boolean");
+        assert!(err.contains("true or false"), "{err}");
+    }
+}
+
+#[test]
+fn a_date_only_time_bound_is_refused_not_dropped() {
+    let args = serde_json::json!({ "since": "2026-07-01", "until": "2026-07-02T00:00:00Z" });
+    let err = super::parse_time_filter(&args, "since").expect_err("a bare date is not RFC3339");
+    assert!(err.contains("since"), "{err}");
+    assert!(super::parse_time_filter(&args, "until")
+        .expect("an RFC3339 bound parses")
+        .is_some());
+    for bound in [
+        serde_json::json!(1719792000),
+        serde_json::json!(["2026-07-01T00:00:00Z"]),
+    ] {
+        let args = serde_json::json!({ "since": bound });
+        let err = super::parse_time_filter(&args, "since").expect_err("a non-string bound");
+        assert!(err.contains("since"), "{err}");
+    }
+    assert!(
+        super::parse_time_filter(&serde_json::json!({ "since": null }), "since")
+            .expect("null is no bound")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_call_to_execute_intent_is_refused_with_its_replacement() {
+    use crate::llm::tool_names as tn;
+    for args in [
+        serde_json::json!({ "intent_id": "habit-tracker/daily" }),
+        serde_json::json!({ "prompt_id": "habit-tracker/daily" }),
+    ] {
+        let refusal = super::dispatch_name(tn::EXECUTE_INTENT, &args).expect_err("retired");
+        assert!(
+            refusal.contains(r#"load_knowhow(id: "habit-tracker/daily")"#),
+            "{refusal}"
+        );
+        assert!(
+            refusal.starts_with("Error: execute_intent is retired"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("Unknown tool"), "{refusal}");
+    }
+}
+
+async fn count_with(args: serde_json::Value, caller: Uuid, mine: Uuid) -> Result<String, String> {
+    let (pool, db) = setup_test_db().await;
+    let other = Uuid::new_v4();
+    for _ in 0..2 {
+        insert_thread_event(&pool, Uuid::new_v4(), mine, "Counted", json!({})).await;
+    }
+    insert_thread_event(&pool, Uuid::new_v4(), other, "Counted", json!({})).await;
+    insert_thread_event(&pool, Uuid::new_v4(), other, "OnlyOther", json!({})).await;
+
+    let out = count_events_impl(&pool, &args, caller).await;
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+    out
+}
+
+#[tokio::test]
+async fn a_thread_scoped_read_leads_with_the_threads_liveness() {
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = crate::test_support::seed_coding_thread(&bus, None).await;
+    let error: ThreadEvent = serde_json::from_value(json!({
+        "type": "CodingAgentToolResult",
+        "name": "Bash",
+        "result": "Error: Could not read the handoff narrative",
+    }))
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id: thread,
+        event: error,
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let scoped = json!({"thread_id": thread.to_string(), "limit": 6});
+    let out = query_events_impl(&pool, &scoped, some_caller())
+        .await
+        .unwrap();
+    assert!(out.starts_with("{\"liveness\":"), "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["liveness"]["state"], "working");
+    assert_eq!(parsed["liveness"]["status"], "running");
+    assert_eq!(parsed["events"][0]["event_type"], "CodingAgentToolResult");
+
+    let counted = count_events_impl(
+        &pool,
+        &json!({"thread_id": thread.to_string()}),
+        some_caller(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        counted.starts_with("{\"liveness\":{\"state\":\"working\""),
+        "{counted}"
+    );
+
+    let everywhere = query_events_impl(&pool, &json!({"limit": 6}), some_caller())
+        .await
+        .unwrap();
+    assert!(!everywhere.contains("\"liveness\""), "{everywhere}");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn thread_search_and_list_show_wait_evidence_in_liveness() {
+    use super::ToolDispatchExt;
+    use crate::engine::thread_events::ThreadEvent;
+    use crate::test_support::{
+        boot_mock_engine, event_wait_started, in_engine_child, seed_coding_thread,
+        seed_thread_event,
+    };
+
+    if !in_engine_child(
+        "engine::tools::tests::thread_search_and_list_show_wait_evidence_in_liveness",
+    )
+    .await
+    {
+        return;
+    }
+    let (pool, db) = setup_test_db().await;
+    let (engine, _workspace) = boot_mock_engine(&db).await;
+    let thread = seed_coding_thread(&engine.event_bus, None).await;
+    seed_thread_event(
+        &engine.event_bus,
+        thread,
+        event_wait_started(Uuid::new_v4()),
+    )
+    .await;
+    let idled: ThreadEvent = serde_json::from_value(json!({"type": "CodingAgentIdled"})).unwrap();
+    seed_thread_event(&engine.event_bus, thread, idled).await;
+    sqlx::query(
+        "UPDATE thread_summaries SET title = 'Wait evidence fixture', \
+         coding_agent_change_state = 'proposed', \
+         compose_text = 'a private draft line' WHERE thread_id = $1",
+    )
+    .bind(thread)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for args in [
+        json!({"action": "search", "q": "Wait evidence fixture"}),
+        json!({"action": "list", "status": ["idle"]}),
+    ] {
+        let reply = engine
+            .execute_tool("threads", &args, "", Uuid::new_v4(), None, Uuid::new_v4())
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&reply).unwrap();
+        assert!(!rows.is_empty(), "{args}: {reply}");
+        assert!(
+            rows.iter().all(|row| row["liveness"].is_object()),
+            "{reply}"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row["thread_id"] == json!(thread))
+            .expect("the waiting thread");
+        let live = &row["liveness"];
+        assert_eq!(live["state"], "waiting");
+        assert_eq!(live["status"], "idle");
+        let waits = live["live_event_waits"].as_array().expect("wait evidence");
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0]["reason"], "the e2e suite to finish");
+        assert_eq!(waits[0]["on"][0]["event_type"], "BackgroundBashCompleted");
+        assert!(waits[0]["expires_in_secs"].as_i64().unwrap() > 0);
+        assert_eq!(row["coding_agent_change_state"]["kind"], "proposed");
+        assert!(row.get("live_event_waits").is_none());
+        assert!(row.get("live_event_wait_count").is_none());
+        if args["action"] == "list" {
+            assert_eq!(row["status"], "idle");
+        } else {
+            assert!(row.get("status").is_none());
+            assert!(
+                !reply.contains("a private draft line") && row.get("compose_text").is_none(),
+                "search rows never carry the draft: {reply}"
+            );
+            assert_eq!(row["has_draft"], true);
+        }
+    }
+
+    let summaries = engine
+        .event_store()
+        .list_thread_summaries(crate::core::store::ThreadSummaryFilters {
+            status: StatusFilter::OneOf(&[ThreadStatus::Idle]),
+            sources: None,
+            parent: None,
+            has_draft: None,
+            change_state: None,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let reply = super::unsent::list_rows_for_the_model(&summaries).unwrap();
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&reply).unwrap();
+    assert_eq!(rows[0]["thread_id"], json!(thread));
+    assert_eq!(rows[0]["live_event_wait_count"], 1);
+    assert_eq!(
+        rows[0]["live_event_waits"][0]["reason"],
+        "the e2e suite to finish"
+    );
+
+    engine.pool().close().await;
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn count_events_scopes_the_single_type_shape_to_a_thread() {
+    let mine = Uuid::new_v4();
+    let out = count_with(
+        json!({"event_type": "Counted", "thread_id": mine.to_string()}),
+        some_caller(),
+        mine,
+    )
+    .await
+    .expect("scoped count");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(
+        parsed["count"], 2,
+        "this thread's rows, not the workspace's 3"
+    );
+}
+
+#[tokio::test]
+async fn count_events_scopes_the_per_type_shape_to_a_thread() {
+    let mine = Uuid::new_v4();
+    let out = count_with(json!({"thread_id": mine.to_string()}), some_caller(), mine)
+        .await
+        .expect("scoped breakdown");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["total_count"], 2);
+    assert_eq!(parsed["by_type"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn count_events_resolves_the_current_alias_to_the_caller() {
+    let mine = Uuid::new_v4();
+    let out = count_with(json!({"thread_id": "current"}), mine, mine)
+        .await
+        .expect("alias resolves");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["total_count"], 2);
+}
+
+#[tokio::test]
+async fn count_events_without_a_thread_counts_every_thread() {
+    let out = count_with(
+        json!({"event_type": "Counted"}),
+        some_caller(),
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("unscoped count");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["count"], 3);
+}
+
+#[tokio::test]
+async fn count_events_refuses_a_malformed_thread_id() {
+    for bad in [json!("not-a-uuid"), json!(["x"]), json!(7)] {
+        let out = count_with(
+            json!({"thread_id": bad.clone()}),
+            some_caller(),
+            Uuid::new_v4(),
+        )
+        .await;
+        assert!(out.is_err(), "{bad} must be refused, got {out:?}");
+    }
+}
+
+async fn insert_change(pool: &PgPool, thread: Option<Uuid>) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO changes (id, request_id, branch_name, repo_root, thread_id, status, resolved_at) \
+         VALUES ($1, $2, 'b', '/tmp', $3, 'applied', now())",
+    )
+    .bind(id)
+    .bind(Uuid::new_v4())
+    .bind(thread)
+    .execute(pool)
+    .await
+    .expect("insert change");
+    id
+}
+
+#[tokio::test]
+async fn the_change_gate_skips_an_unknown_id_and_aims_a_threadless_change_at_the_workspace() {
+    let (pool, db) = setup_test_db().await;
+    let thread = Uuid::new_v4();
+    let proposed = insert_change(&pool, Some(thread)).await;
+    let threadless = insert_change(&pool, None).await;
+
+    assert_eq!(super::change_gate_target(&pool, Uuid::new_v4()).await, None);
+    assert_eq!(
+        super::change_gate_target(&pool, proposed).await,
+        Some(Some(thread))
+    );
+    assert_eq!(
+        super::change_gate_target(&pool, threadless).await,
+        Some(None)
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn the_change_gate_aims_at_the_workspace_when_the_probe_cannot_run() {
+    let (pool, db) = setup_test_db().await;
+    let change = insert_change(&pool, Some(Uuid::new_v4())).await;
+    let (other, other_db) = setup_test_db().await;
+    other.close().await;
+    teardown_test_db(&other_db).await;
+
+    assert_eq!(super::change_gate_target(&other, change).await, Some(None));
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn the_flat_back_compat_tool_names_still_dispatch() {
+    use super::ToolDispatchExt;
+    use crate::llm::tool_names as tn;
+    use crate::test_support::{boot_mock_engine, in_engine_child};
+
+    if !in_engine_child("engine::tools::tests::the_flat_back_compat_tool_names_still_dispatch")
+        .await
+    {
+        return;
+    }
+    let (pool, db) = setup_test_db().await;
+    let (engine, _workspace) = boot_mock_engine(&db).await;
+
+    for name in [
+        tn::CREATE_TRIGGER,
+        tn::LIST_TRIGGERS,
+        tn::UPDATE_TRIGGER,
+        tn::DELETE_TRIGGER,
+        tn::PAUSE_TRIGGER,
+        tn::RESUME_TRIGGER,
+        tn::RUN_TRIGGER,
+        tn::LIST_TRIGGER_GROUPS,
+        tn::CREATE_TRIGGER_GROUP,
+        tn::RENAME_TRIGGER_GROUP,
+        tn::REORDER_TRIGGER_GROUPS,
+        tn::DELETE_TRIGGER_GROUP,
+        tn::SET_PREFERENCE,
+        tn::GET_PREFERENCES,
+    ] {
+        let reply = engine
+            .execute_tool(name, &json!({}), "", Uuid::new_v4(), None, Uuid::new_v4())
+            .await;
+        let text = match reply {
+            Ok(text) | Err(text) => text,
+        };
+        assert!(!text.contains("Unknown tool"), "{name}: {text}");
+    }
+
+    engine.pool().close().await;
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn the_event_tools_resolve_current_from_the_dispatching_thread() {
+    use super::ToolDispatchExt;
+    use crate::llm::tool_names as tn;
+    use crate::test_support::{boot_mock_engine, in_engine_child};
+
+    if !in_engine_child(
+        "engine::tools::tests::the_event_tools_resolve_current_from_the_dispatching_thread",
+    )
+    .await
+    {
+        return;
+    }
+    let (pool, db) = setup_test_db().await;
+    let (engine, _workspace) = boot_mock_engine(&db).await;
+    let mine = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for _ in 0..2 {
+        insert_thread_event(&pool, Uuid::new_v4(), mine, "Counted", json!({})).await;
+    }
+    insert_thread_event(&pool, Uuid::new_v4(), other, "Counted", json!({})).await;
+    let args = json!({
+        "thread_id": "current",
+        "caller_thread_id": other.to_string(),
+    });
+
+    let counted = engine
+        .execute_tool(tn::COUNT_EVENTS, &args, "", Uuid::new_v4(), None, mine)
+        .await
+        .expect("count resolves current");
+    let counted: serde_json::Value = serde_json::from_str(&counted).unwrap();
+    assert_eq!(counted["total_count"], 2);
+
+    let queried = engine
+        .execute_tool(tn::QUERY_EVENTS, &args, "", Uuid::new_v4(), None, mine)
+        .await
+        .expect("query resolves current");
+    let queried: serde_json::Value = serde_json::from_str(&queried).unwrap();
+    assert_eq!(queried["returned"], 2);
+
+    engine.pool().close().await;
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

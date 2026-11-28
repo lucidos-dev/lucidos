@@ -1,0 +1,767 @@
+use super::app_ui::{
+    ensure_app_favicon, rescope_app_html, rewrite_for_thread_id, stamp_frame_capability,
+    stamp_prefs_device,
+};
+use super::frame_capability;
+use super::*;
+use crate::engine::event_bus::{BusEvent, SystemEvent};
+
+use crate::core::contained_path::join_contained;
+use std::path::PathBuf;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AppQuery {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AppUiPreviewQuery {
+    pub thread_id: Option<String>,
+    pub device: Option<String>,
+    pub download: Option<u8>,
+}
+
+async fn resolve_preview_root(
+    state: &AppState,
+    thread_id: &str,
+    expected_app_id: &str,
+) -> Option<PathBuf> {
+    let tid = uuid::Uuid::parse_str(thread_id).ok()?;
+    let row: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT coding_agent_kind, coding_agent_folder \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(tid)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()?;
+    let (kind, folder) = (row.0?, row.1?);
+    if kind != "app" {
+        return None;
+    }
+    // INVARIANT: folder is `<workspace>/data/apps/<id>/` — make sure the app id matches
+    // what the caller is requesting; without this, a thread spawned for
+    // `demo-director` could be used to preview `habit-tracker`'s URL.
+    let folder_path = std::path::Path::new(&folder);
+    let recorded_app_id = folder_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if recorded_app_id != expected_app_id {
+        return None;
+    }
+    let wt = state.engine.resolve_thread_app_worktree(tid).await?;
+    let data = crate::core::contained_path::join_contained(&wt, crate::core::DATA_DIR)?;
+    let app_root = crate::core::contained_path::join_data_contained(
+        &data,
+        &format!("apps/{expected_app_id}"),
+    )?;
+    if !app_root.exists() {
+        return None;
+    }
+    Some(app_root)
+}
+
+async fn app_file(
+    state: &AppState,
+    app_id: &str,
+    preview_thread_id: Option<&str>,
+    file: &str,
+) -> Result<PathBuf, Response> {
+    let root = match preview_thread_id {
+        Some(thread_id) => resolve_preview_root(state, thread_id, app_id)
+            .await
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "App preview unavailable for this thread (not an app coding-agent thread, app id mismatch, or worktree no longer exists).",
+                )
+                    .into_response()
+            })?,
+        None => state
+            .app_manager
+            .contained_app_dir(app_id)
+            .ok_or_else(|| refused_outside(file, std::path::Path::new("apps/")))?,
+    };
+    join_contained(&root, file).ok_or_else(|| refused_outside(file, &root))
+}
+
+fn refused_outside(file: &str, root: &std::path::Path) -> Response {
+    log_legacy!(
+        "[apps] refused {file:?}: it resolves outside {} through a symlink",
+        root.display()
+    );
+    (StatusCode::NOT_FOUND, "File not found").into_response()
+}
+
+fn is_valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains("..")
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.starts_with('.')
+}
+
+pub(super) async fn list_apps(State(state): State<AppState>) -> Response {
+    read_apps(&state).map(Json).into_response()
+}
+
+pub(super) fn read_apps(
+    state: &AppState,
+) -> Result<impl Serialize, (StatusCode, Json<serde_json::Value>)> {
+    state.app_manager.list_apps().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })
+}
+
+pub(super) async fn get_app(
+    State(state): State<AppState>,
+    Query(query): Query<AppQuery>,
+) -> Response {
+    if !is_valid_id(&query.id) {
+        return (StatusCode::BAD_REQUEST, "Invalid app ID").into_response();
+    }
+
+    match state.app_manager.get_app(&query.id) {
+        Ok(app) => Json(app).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn delete_app(
+    State(state): State<AppState>,
+    Query(query): Query<AppQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_valid_id(&query.id) {
+        return (StatusCode::BAD_REQUEST, "Invalid app ID").into_response();
+    }
+
+    // INVARIANT: Plugin-installed apps are removed through the plugin uninstall confirm
+    // panel (the single removal authority — it also tears down the plugin's
+    // triggers/knowhow/scripts and emits PluginUninstalled), never by raw
+    // `rm -rf` of the app dir, which would orphan the PluginInstalled record.
+    // The app-level mirror of the `delete_file` guard. 409 carries the owning
+    // plugin id/name so the frontend can stage + open the uninstall panel.
+    match crate::engine::tools::plugins::find_plugin_owning_app(&state.pool, &query.id).await {
+        Ok(Some(owner)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "App \"{}\" was installed by plugin \"{}\" — uninstall the plugin to remove it.",
+                        query.id, owner.plugin_name
+                    ),
+                    "plugin_id": owner.plugin_id,
+                    "plugin_name": owner.plugin_name,
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to check plugin ownership: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match state
+        .app_manager
+        .delete_app(&state.engine.event_bus, &query.id, actor)
+        .await
+    {
+        Ok(commit) => Json(serde_json::json!({ "commit": commit })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn record_app_opened(
+    State(state): State<AppState>,
+    Query(query): Query<AppQuery>,
+    headers: HeaderMap,
+) -> Result<StatusCode, super::error::ApiError> {
+    let actor = super::actor::require_user_actor(&headers, &state.pool, None).await?;
+    if !is_valid_id(&query.id) {
+        return Err(super::error::ApiError::bad_request("Invalid app ID"));
+    }
+    match state.app_manager.app_kind(&query.id) {
+        Some(crate::core::AppKind::App) => {}
+        Some(crate::core::AppKind::Widget) => {
+            return Err(super::error::ApiError::bad_request(
+                "A widget is shown in a thread, not opened as an app",
+            ))
+        }
+        None => {
+            return Err(super::error::ApiError::not_found(format!(
+                "No app \"{}\"",
+                query.id
+            )))
+        }
+    }
+    state
+        .engine
+        .event_bus
+        .emit_or_log(
+            BusEvent::System(SystemEvent::AppOpened {
+                app_id: query.id,
+                actor: Some(actor),
+            }),
+            "[Apps] AppOpened",
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn update_app(
+    State(state): State<AppState>,
+    Query(query): Query<AppQuery>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !is_valid_id(&query.id) {
+        return (StatusCode::BAD_REQUEST, "Invalid app ID").into_response();
+    }
+
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return (StatusCode::BAD_REQUEST, "name is required").into_response(),
+    };
+    // INVARIANT: An ABSENT `description` key means "leave it as it is", never "clear it".
+    // `update_app_metadata` rewrites the whole `manifest.json` from the two
+    // values it is handed, and the generated CLI omits the key entirely when
+    // `--description` isn't passed (`lucidos apps update --id X --name Y`), so
+    // defaulting to "" silently erased the stored description and committed the
+    // erasure. A key that IS present still sets the value, including to "".
+    let description = match body.get("description").and_then(|v| v.as_str()) {
+        Some(d) => d.to_string(),
+        None => match state.app_manager.get_app(&query.id) {
+            Ok(app) => app.description,
+            Err(e) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match state
+        .app_manager
+        .update_app_metadata(
+            &state.engine.event_bus,
+            &query.id,
+            name,
+            &description,
+            actor,
+        )
+        .await
+    {
+        Ok(commit) => Json(serde_json::json!({ "commit": commit })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn read_app_source(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> Response {
+    if !is_valid_id(&app_id) {
+        return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
+    }
+
+    match state.app_manager.read_app_source(&app_id) {
+        Ok(files) => {
+            let entries: Vec<serde_json::Value> = files
+                .into_iter()
+                .map(|(name, content)| serde_json::json!({ "name": name, "content": content }))
+                .collect();
+            Json(serde_json::json!({ "files": entries })).into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn write_app_source(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !is_valid_id(&app_id) {
+        return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
+    }
+
+    let files_val = match body.get("files").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return (StatusCode::BAD_REQUEST, "files array is required").into_response(),
+    };
+
+    let mut files = Vec::new();
+    for entry in files_val {
+        let name = match entry.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => return (StatusCode::BAD_REQUEST, "each file needs a name").into_response(),
+        };
+        let content = match entry.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => return (StatusCode::BAD_REQUEST, "each file needs content").into_response(),
+        };
+        files.push((name, content));
+    }
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match state
+        .app_manager
+        .write_app_source(&state.engine.event_bus, &app_id, &files, actor)
+        .await
+    {
+        Ok(commit) => Json(serde_json::json!({ "commit": commit })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn serve_app_ui(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(app_id): Path<String>,
+    Query(query): Query<AppUiPreviewQuery>,
+) -> Response {
+    if !is_valid_id(&app_id) {
+        return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
+    }
+
+    let prefix = crate::core::base_path::forwarded_prefix(&headers);
+
+    let preview_thread_id = query.thread_id.as_deref();
+    let ui_path = match app_file(&state, &app_id, preview_thread_id, "index.html").await {
+        Ok(path) => path,
+        Err(refused) => return refused,
+    };
+
+    if !ui_path.exists() {
+        return (StatusCode::NOT_FOUND, "App UI not found").into_response();
+    }
+
+    match std::fs::read_to_string(&ui_path) {
+        Ok(content) => {
+            let html = match preview_thread_id {
+                Some(tid) => rewrite_for_thread_id(&content, tid),
+                None => content,
+            };
+            let html = ensure_app_favicon(&html);
+            // INVARIANT: Behind a gateway this frame sends no device credential with its
+            // own subresources, so it carries a pass in the URL instead (ADR
+            // 0238). The rescope threads it onto root-absolute workspace refs,
+            // and the base carries every relative one.
+            let capability = frame_capability::mint_for_document(&headers, &app_id);
+            let html = rescope_app_html(&html, &prefix, capability.as_deref());
+            let html = match capability.as_deref() {
+                Some(pass) => stamp_frame_capability(&html, &prefix, pass, &app_id),
+                None => html,
+            };
+            // INVARIANT: After the re-scope, which rewrites the same `src`. Both edit one
+            // engine route's address and nothing else the app wrote.
+            let html = match query.device.as_deref() {
+                Some(device) => stamp_prefs_device(&html, device),
+                None => html,
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, "text/html"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                html,
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub(super) async fn serve_app_file(
+    State(state): State<AppState>,
+    Path((app_id, file_path)): Path<(String, String)>,
+    Query(query): Query<AppUiPreviewQuery>,
+    request_headers: HeaderMap,
+) -> Response {
+    if !is_valid_id(&app_id) {
+        return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
+    }
+
+    if is_path_traversal(&file_path) {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
+    let full_path = match app_file(&state, &app_id, query.thread_id.as_deref(), &file_path).await {
+        Ok(path) => path,
+        Err(refused) => return refused,
+    };
+
+    app_file_response(&full_path, &file_path, query.download, &request_headers).await
+}
+
+async fn app_file_response(
+    full_path: &std::path::Path,
+    file_path: &str,
+    download: Option<u8>,
+    request_headers: &HeaderMap,
+) -> Response {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mut response =
+        super::file_response::serve_file(full_path, content_type_for_ext(ext), request_headers)
+            .await;
+    if let Some(value) =
+        attachment_disposition(download, file_path).and_then(|d| HeaderValue::from_str(&d).ok())
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+fn attachment_disposition(download: Option<u8>, file_path: &str) -> Option<String> {
+    if download != Some(1) {
+        return None;
+    }
+    let name = std::path::Path::new(file_path).file_name()?.to_str()?;
+    if name.is_empty() || name.contains(['"', '\\', '\r', '\n']) {
+        return None;
+    }
+    Some(format!("attachment; filename=\"{name}\""))
+}
+
+pub(super) async fn serve_app_artifact(
+    State(state): State<AppState>,
+    Path((_app_id, artifact_path)): Path<(String, String)>,
+) -> Response {
+    if is_path_traversal(&artifact_path) {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
+    let artifacts_root = state.workspace_path.join(crate::core::ARTIFACTS_DIR);
+    let Some(full_path) = join_contained(&artifacts_root, &artifact_path) else {
+        return refused_outside(&artifact_path, &artifacts_root);
+    };
+
+    let ext = std::path::Path::new(&artifact_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let content_type = content_type_for_ext(ext);
+
+    match std::fs::read(&full_path) {
+        Ok(content) => super::file_response::sandbox_documents(
+            (
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                content,
+            )
+                .into_response(),
+            content_type,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "File not found").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn git_log_for_path(
+    workspace: &std::path::Path,
+    path: &str,
+    limit: usize,
+    skip: usize,
+    include_paths: bool,
+) -> Result<(Vec<GitVersion>, bool), Box<dyn std::error::Error + Send + Sync>> {
+    let fetch_count = limit + 1;
+
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.current_dir(workspace)
+        .arg("log")
+        .arg(format!("--max-count={}", fetch_count))
+        .arg(format!("--skip={}", skip))
+        .arg("--format=%H%x00%s%x00%at%x00%an");
+
+    if include_paths {
+        cmd.arg("--name-only");
+    }
+
+    cmd.arg("--").arg(path);
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git log failed: {}", stderr).into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut versions = Vec::new();
+
+    if include_paths {
+        for block in stdout.split("\n\n") {
+            let block = block.trim();
+            if block.is_empty() {
+                continue;
+            }
+            let mut lines = block.lines();
+            if let Some(header) = lines.next() {
+                if let Some(version) = parse_git_log_line(header) {
+                    let paths: Vec<String> = lines
+                        .filter(|l| !l.is_empty())
+                        .map(|l| l.to_string())
+                        .collect();
+                    versions.push(GitVersion {
+                        paths: if paths.is_empty() { None } else { Some(paths) },
+                        ..version
+                    });
+                }
+            }
+        }
+    } else {
+        for line in stdout.lines() {
+            if let Some(version) = parse_git_log_line(line) {
+                versions.push(version);
+            }
+        }
+    }
+
+    let has_more = versions.len() > limit;
+    if has_more {
+        versions.pop();
+    }
+
+    Ok((versions, has_more))
+}
+
+fn parse_git_log_line(line: &str) -> Option<GitVersion> {
+    let parts: Vec<&str> = line.splitn(4, '\0').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    Some(GitVersion {
+        commit: parts[0].to_string(),
+        message: parts[1].to_string(),
+        timestamp: parts[2].parse().unwrap_or(0),
+        author: parts[3].to_string(),
+        paths: None,
+    })
+}
+
+pub(super) async fn get_git_history_with_paths(
+    workspace: &std::path::Path,
+    prefix: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<GitVersion>, bool), Box<dyn std::error::Error + Send + Sync>> {
+    git_log_for_path(workspace, prefix, limit, offset, true).await
+}
+
+/// INVARIANT: A page answers a capture request. Only the device the request names may
+/// answer it; any other is refused and the request stays open for that one.
+pub(super) async fn submit_app_capture(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AppCaptureRequest>,
+) -> Result<StatusCode, super::error::ApiError> {
+    use crate::engine::pending_answers::{resolve_answer, AnswerRefusal};
+    let claimed = body.device_id.as_deref();
+    let answering = match super::actor::require_user_actor(&headers, &state.pool, claimed).await? {
+        crate::engine::thread_events::MessageOrigin::Device { device_id } => Some(device_id),
+        _ => None,
+    };
+    let result = CaptureResult {
+        screenshot: body.screenshot,
+        dom: body.dom,
+    };
+    match resolve_answer(
+        &state.engine.pending_captures,
+        &body.request_id,
+        answering.as_deref(),
+        result,
+    ) {
+        Ok(()) => Ok(StatusCode::OK),
+        Err(AnswerRefusal::Unknown) => Err(super::error::ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("No capture is waiting under request {}", body.request_id),
+        )),
+        Err(AnswerRefusal::OtherDevice) => Err(super::error::ApiError::new(
+            StatusCode::CONFLICT,
+            format!("Capture request {} is for another device", body.request_id),
+        )
+        .with_reason("capture-for-another-device")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct FrameCapabilityQuery {
+    app_id: String,
+}
+
+#[derive(Serialize)]
+struct FrameCapabilityBody {
+    capability: Option<String>,
+    renew_after_secs: i64,
+}
+
+async fn mint_frame_capability(
+    headers: HeaderMap,
+    Query(query): Query<FrameCapabilityQuery>,
+) -> Json<FrameCapabilityBody> {
+    let prefix = crate::core::base_path::forwarded_prefix(&headers);
+    Json(FrameCapabilityBody {
+        capability: frame_capability::mint(&prefix, &query.app_id),
+        renew_after_secs: lucidos_frame_capability::RENEW_AFTER_SECS,
+    })
+}
+
+async fn mint_artifact_preview_capability(headers: HeaderMap) -> Json<FrameCapabilityBody> {
+    let prefix = crate::core::base_path::forwarded_prefix(&headers);
+    Json(FrameCapabilityBody {
+        capability: frame_capability::mint(
+            &prefix,
+            lucidos_frame_capability::ARTIFACT_PREVIEW_SUBJECT,
+        ),
+        renew_after_secs: lucidos_frame_capability::RENEW_AFTER_SECS,
+    })
+}
+
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/apps", get(list_apps))
+        .route("/app", get(get_app).put(update_app).delete(delete_app))
+        .route("/app/opened", post(record_app_opened))
+        .route(
+            "/app/:app_id/source",
+            get(read_app_source).put(write_app_source),
+        )
+        .route("/app-capture", post(submit_app_capture))
+        .route("/app-frame-capability", get(mint_frame_capability))
+        .route(
+            "/artifact-preview-capability",
+            get(mint_artifact_preview_capability),
+        )
+}
+
+/// INVARIANT: App UI routes nested at top-level `/app/*` (NOT under `/api/v1/`) — file
+/// serving must be path-shaped, because relative URLs in app HTML resolve
+/// against the document path.
+pub(super) fn ui_router() -> Router<AppState> {
+    Router::new()
+        .route("/:app_id/", get(serve_app_ui))
+        .route("/:app_id/artifacts/*path", get(serve_app_artifact))
+        .route("/:app_id/*path", get(serve_app_file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_app_can_hold_the_artifact_preview_subject() {
+        assert!(!is_valid_id(
+            lucidos_frame_capability::ARTIFACT_PREVIEW_SUBJECT
+        ));
+    }
+
+    #[test]
+    fn the_frame_capability_routes_are_host_only() {
+        use crate::app_reach_policy::{entry_for, Reach};
+        for route in ["/app-frame-capability", "/artifact-preview-capability"] {
+            assert!(
+                matches!(entry_for(route), Some((Reach::Host, _))),
+                "{route} must be classified Host"
+            );
+            assert!(!crate::app_reach_policy::app_may_call(route, "GET"));
+        }
+    }
+
+    #[test]
+    fn a_plain_app_file_is_not_an_attachment() {
+        assert_eq!(attachment_disposition(None, "payload.txt"), None);
+        assert_eq!(attachment_disposition(Some(0), "payload.txt"), None);
+    }
+
+    #[test]
+    fn asking_to_download_names_the_file_from_its_path() {
+        assert_eq!(
+            attachment_disposition(Some(1), "reports/payload.txt").as_deref(),
+            Some("attachment; filename=\"payload.txt\"")
+        );
+    }
+
+    #[test]
+    fn a_name_that_could_forge_a_header_parameter_is_refused() {
+        assert_eq!(attachment_disposition(Some(1), "a\"b.txt"), None);
+        assert_eq!(attachment_disposition(Some(1), "a\r\nX-Evil: 1"), None);
+        assert_eq!(attachment_disposition(Some(1), ""), None);
+    }
+
+    #[tokio::test]
+    async fn an_app_file_revalidates_rather_than_downloading_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.svg");
+        std::fs::write(&path, "<svg/>").unwrap();
+
+        let first = app_file_response(&path, "icon.svg", None, &HeaderMap::new()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers().get(header::CACHE_CONTROL), None);
+        let etag = first.headers().get(header::ETAG).expect("etag").clone();
+
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag);
+        let again = app_file_response(&path, "icon.svg", None, &conditional).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn a_download_of_an_app_file_still_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        let response = app_file_response(&path, "payload.txt", Some(1), &HeaderMap::new()).await;
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION),
+            Some(&HeaderValue::from_static(
+                "attachment; filename=\"payload.txt\""
+            ))
+        );
+    }
+}

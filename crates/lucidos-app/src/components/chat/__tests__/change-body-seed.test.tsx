@@ -1,0 +1,121 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import type { ComponentChildren, VNode } from 'preact';
+import { renderExchanges } from '../CreateThreadView';
+import { cancelingThreadIds, removingQueuedMessageIds, threadMap } from '../../../store/store';
+import type { Exchange, ThreadState } from '../../../store/thread-events';
+
+
+const TS = '2026-06-17T12:00:00Z';
+
+function makeThread(id: string): ThreadState {
+  return {
+    meta: {
+      id,
+      title: 'Change seed test',
+      channel: 'claude_code',
+      initiator: 'user',
+      saved: false,
+      createdAt: TS,
+      updatedAt: TS,
+      status: 'idle',
+      summaryVersion: 0,
+      messageCount: 0,
+      section: 'inbox',
+      activeChildrenCount: 0,
+      totalChildrenCount: 0,
+      blockingDescendantCount: 0,
+      attentionDescendantCount: 0,
+      archivableSubThreadCount: 0,
+      codingAgentChangeState: { kind: 'none' },
+      codingAgentIsExternalRepo: false,
+      lastRevivedAt: '',
+      state: 'active',
+      latestTodoList: null,
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
+    },
+    events: new Map(),
+    streamingBuffer: '',
+    eventsLoaded: true,
+    eventsLoadFailed: false,
+    lastDbSeq: 0,
+    pendingUserMessages: [],
+  };
+}
+
+function ccTurn(seq: number, step: Record<string, unknown>): Exchange {
+  return {
+    userEvent: { type: 'MessageReceived', text: 'do it', created: TS, channel: 'claude_code', _eventId: `u-${seq}` } as any,
+    userSeq: seq,
+    steps: [{ seq: seq + 0.5, event: { type: 'ChangeProposed', created: TS, ...step } as any }],
+  };
+}
+
+function changeApplied(seq: number, changeId: string): Exchange {
+  return {
+    userEvent: { type: 'ChangeApplied', change_id: changeId, created: TS, _eventId: `a-${seq}` } as any,
+    userSeq: seq,
+    steps: [],
+  };
+}
+
+function exchangeNodes(node: ComponentChildren): VNode<Record<string, unknown>>[] {
+  if (node === null || node === undefined || typeof node === 'boolean') return [];
+  if (typeof node === 'string' || typeof node === 'number') return [];
+  if (Array.isArray(node)) return node.flatMap(exchangeNodes);
+  const vnode = node as VNode<Record<string, unknown>>;
+  const matched = ('exchange' in vnode.props && 'isLast' in vnode.props) ? [vnode] : [];
+  return matched.concat(exchangeNodes(vnode.props.children as ComponentChildren));
+}
+
+function appliedNode(nodes: VNode[], changeId: string): VNode<Record<string, unknown>> | undefined {
+  return exchangeNodes(nodes).find(n => {
+    const ev = (n.props.exchange as Exchange).userEvent as { type: string; change_id?: string };
+    return ev.type === 'ChangeApplied' && ev.change_id === changeId;
+  });
+}
+
+beforeEach(() => {
+  threadMap.value = new Map();
+  cancelingThreadIds.value = new Set();
+  removingQueuedMessageIds.value = new Set();
+});
+
+describe('change-applied body seeding (open-jump fix)', () => {
+  it('seeds the applied card with the in-thread ChangeProposed description + file count', () => {
+    threadMap.value = new Map([['t1', makeThread('t1')]]);
+    const nodes = renderExchanges([
+      ccTurn(1, { change_id: 'c1', description: 'Fix the bug\nbody line', files: ['a.ts', 'b.ts', 'c.ts'] }),
+      changeApplied(2, 'c1'),
+    ], 't1', '');
+
+    const applied = appliedNode(nodes, 'c1');
+    expect(applied?.props.proposedChangeDesc).toBe('Fix the bug\nbody line');
+    expect(applied?.props.proposedChangeFileCount).toBe(3);
+  });
+
+  it('leaves the seed undefined when no matching ChangeProposed rode the thread', () => {
+    threadMap.value = new Map([['t1', makeThread('t1')]]);
+    const nodes = renderExchanges([
+      ccTurn(1, { change_id: 'c1', description: 'unrelated', files: ['x.ts'] }),
+      changeApplied(2, 'c2'),
+    ], 't1', '');
+
+    const applied = appliedNode(nodes, 'c2');
+    expect(applied?.props.proposedChangeDesc).toBeUndefined();
+    expect(applied?.props.proposedChangeFileCount).toBeUndefined();
+  });
+
+  it('ignores per-commit ChangeProposed emits with an empty change_id', () => {
+    threadMap.value = new Map([['t1', makeThread('t1')]]);
+    const nodes = renderExchanges([
+      ccTurn(1, { change_id: '', description: 'per-commit noise', files: ['noise.ts'] }),
+      ccTurn(3, { change_id: 'c1', description: 'real summary', files: ['a.ts', 'b.ts'] }),
+      changeApplied(4, 'c1'),
+    ], 't1', '');
+
+    const applied = appliedNode(nodes, 'c1');
+    expect(applied?.props.proposedChangeDesc).toBe('real summary');
+    expect(applied?.props.proposedChangeFileCount).toBe(2);
+  });
+});

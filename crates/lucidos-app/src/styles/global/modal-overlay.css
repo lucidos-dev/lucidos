@@ -1,0 +1,114 @@
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    bottom: auto;
+    height: var(--app-height, 100dvh);
+    background: var(--scrim);
+    z-index: var(--z-modal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: modal-in var(--duration-fast) ease;
+}
+
+.modal-overlay.modal-overlay-leaving {
+    animation: modal-out var(--duration-fast) ease forwards;
+    pointer-events: none;
+}
+.modal-overlay.modal-overlay-leaving * {
+    animation: none;
+    transition: none;
+}
+
+.ui-blocking-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-modal) + 50);
+    background: var(--scrim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: not-allowed;
+    -webkit-user-select: none;
+    user-select: none;
+    animation: modal-in var(--duration-normal) ease-out;
+}
+
+
+:root[data-ui-blocked] #tooltip {
+    display: none !important;
+}
+
+:root[data-overlay-open] .app-shell > * {
+    pointer-events: none;
+}
+:root[data-overlay-open] [data-overlay-panel],
+:root[data-overlay-open] [data-overlay-anchor],
+:root[data-overlay-open] [data-overlay-layer] {
+    pointer-events: auto;
+}
+
+.overlay-layer,
+.overlay-layer-home,
+.app-overlay-layer {
+    display: contents;
+}
+
+@keyframes running-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+.running-shimmer {
+    background: linear-gradient(
+        90deg,
+        var(--text-muted) 0%,
+        var(--text-muted) 35%,
+        var(--text-primary) 50%,
+        var(--text-muted) 65%,
+        var(--text-muted) 100%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: var(--text-secondary);
+    display: inline-block;
+    will-change: transform;
+    animation: running-shimmer 2.6s linear infinite;
+}
+
+.running-shimmer-invert {
+    background-image: linear-gradient(
+        90deg,
+        var(--text-primary) 0%,
+        var(--text-primary) 35%,
+        var(--text-muted) 50%,
+        var(--text-primary) 65%,
+        var(--text-primary) 100%
+    );
+    color: var(--text-primary);
+}
+
+:root[data-motion="reduce"] .list-row,
+:root[data-motion="reduce"] .list-row-add-card,
+:root[data-motion="reduce"] .action-btn,
+:root[data-motion="reduce"] .dropdown-trigger,
+:root[data-motion="reduce"] .dropdown-option,
+:root[data-motion="reduce"] .icon-btn {
+    transition: none;
+}
+
+:root[data-motion="reduce"] .progress-bar-fill {
+    transition: none;
+}
+
+:root[data-motion="reduce"] .running-shimmer {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--text-secondary);
+}
+
+:root[data-motion="reduce"] .running-shimmer-invert {
+    color: var(--text-primary);
+}

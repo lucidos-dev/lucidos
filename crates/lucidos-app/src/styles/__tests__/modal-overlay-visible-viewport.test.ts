@@ -1,0 +1,52 @@
+import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+
+import { block, decl, rulesTargeting, styleSheetPaths } from './css-rule-helpers';
+
+const here: string = dirname(fileURLToPath(import.meta.url));
+const base: string = readFileSync(resolve(here, '../global/modal-overlay.css'), 'utf-8');
+const everySheet: string[] = styleSheetPaths(resolve(here, '../..'))
+  .map((p: string) => readFileSync(p, 'utf-8'));
+
+function rulesSetting(className: string, props: string[]) {
+  return everySheet
+    .flatMap((sheet: string) => rulesTargeting(sheet, className))
+    .filter((rule) => props.some((p) => rule.props.has(p)));
+}
+
+describe('the modal backdrop', () => {
+  it('is bounded by the visible viewport', () => {
+    const overlay = block(base, '.modal-overlay {');
+    expect(decl(overlay, 'height')).toBe('var(--app-height, 100dvh)');
+    expect(decl(overlay, 'bottom'), 'a bottom edge would stretch it back to the layout viewport')
+      .toBe('auto');
+  });
+
+  it('is not re-bounded by one modal alone', () => {
+    const copies = rulesSetting('modal-overlay', ['height', 'bottom'])
+      .filter((rule) => rule.selector !== '.modal-overlay');
+    expect(copies.map((r) => r.selector)).toEqual([]);
+  });
+
+  it('lets a phone prompt reach the layout viewport only to sit on the keyboard band', () => {
+    const rebounds = rulesSetting('prompt-dialog-overlay', ['height', 'bottom', 'padding-bottom']);
+    expect(rebounds.map((r) => [r.selector, r.atRules]))
+      .toEqual([['.prompt-dialog-overlay', '@media (--phone-layout)']]);
+    const [prompt] = rebounds;
+    expect(prompt.props.get('bottom')).toBe('0');
+    expect(prompt.props.get('align-items'), 'centred, it jumps high once iOS reports the keys')
+      .toBe('flex-end');
+    expect(prompt.props.get('padding-bottom'), 'the band is set on focus, before iOS reports the keys')
+      .toContain('var(--keyboard-band');
+  });
+
+  it('keeps its top edge where file search clears the mobile header', () => {
+    expect(rulesSetting('file-search-overlay', ['top', 'inset']).map((r) => r.selector))
+      .toEqual([]);
+  });
+});

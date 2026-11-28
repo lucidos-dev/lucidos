@@ -1,0 +1,565 @@
+use crate::http::{client as http_client, ConnectRetry};
+use crate::workspace::{BoxError, Workspace};
+use serde_json::Value;
+
+pub(crate) const OFF_LADDER_REASON: &str = "off-intelligence-ladder";
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IntelligenceRung {
+    pub(crate) model: String,
+    pub(crate) effort: String,
+    pub(crate) label: String,
+    pub(crate) intelligence: Option<String>,
+    pub(crate) cost: Option<String>,
+    pub(crate) time: Option<String>,
+    pub(crate) is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Ladder {
+    pub(crate) surface: String,
+    pub(crate) intelligence_rungs: Vec<IntelligenceRung>,
+    pub(crate) current: Option<usize>,
+    pub(crate) current_pair: Option<String>,
+    pub(crate) reference: Option<String>,
+    pub(crate) other_backend_ladders: Vec<Ladder>,
+}
+
+impl Ladder {
+    pub(crate) fn parse(body: &serde_json::Value) -> Option<Self> {
+        let served = body["rungs"].as_array()?;
+        let current_served = body["current"]["position"]
+            .as_u64()
+            .and_then(|p| usize::try_from(p).ok());
+        let mut intelligence_rungs = Vec::new();
+        let mut current = None;
+        for (i, r) in served.iter().enumerate() {
+            if r["on"] != true {
+                continue;
+            }
+            if current_served == Some(i) {
+                current = Some(intelligence_rungs.len());
+            }
+            let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
+            intelligence_rungs.push(IntelligenceRung {
+                model: text(&r["model"])?,
+                effort: text(&r["effort"])?,
+                label: text(&r["label"])?,
+                intelligence: text(&r["intelligence"]["label"]),
+                cost: text(&r["cost"]["label"]),
+                time: text(&r["time"]["label"]),
+                is_default: r["is_default"] == true,
+            });
+        }
+        Some(Self {
+            other_backend_ladders: body["other_backend_ladders"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Self::parse)
+                .collect(),
+            surface: body["surface"].as_str()?.to_string(),
+            intelligence_rungs,
+            current,
+            current_pair: body["current"]["model"]
+                .as_str()
+                .zip(body["current"]["effort"].as_str())
+                .map(|(model, effort)| format!("{model} at {effort}")),
+            reference: body["reference"]["model"]
+                .as_str()
+                .zip(body["reference"]["effort"].as_str())
+                .map(|(model, effort)| format!("{model} at {effort}")),
+        })
+    }
+
+    pub(crate) fn has_higher_intelligence_rung(&self) -> bool {
+        self.current
+            .is_some_and(|p| p + 2 < self.intelligence_rungs.len())
+    }
+
+    fn surface_name(&self) -> &str {
+        if self.surface == CHAT_SURFACE {
+            "Lucidos Agent"
+        } else {
+            &self.surface
+        }
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let mut out = self.render_own();
+        for other in &self.other_backend_ladders {
+            let comparison = if self.reference.is_some() && self.reference == other.reference {
+                "Their multiples compare: both ladders use the same reference."
+            } else {
+                "Their multiples do not compare: their references are missing or different."
+            };
+            out.push_str(&format!("\n\n{}\n{comparison}", other.render()));
+        }
+        out
+    }
+
+    fn render_own(&self) -> String {
+        let mut out = if self.intelligence_rungs.is_empty() {
+            format!(
+                "The {} intelligence ladder has no rung.",
+                self.surface_name()
+            )
+        } else {
+            let compared = match &self.reference {
+                Some(reference) => {
+                    format!("Intelligence, cost and time per task are rough multiples of {reference}.")
+                }
+                None => {
+                    "No reference rung has an estimate, so intelligence, cost and time are not compared.".to_string()
+                }
+            };
+            format!(
+                "The {} intelligence ladder, least to most intelligent. {compared}",
+                self.surface_name()
+            )
+        };
+        if self.current.is_none() {
+            if let Some(pair) = &self.current_pair {
+                out.push_str(&format!("\nThis thread runs on {pair} (off-ladder)."));
+            }
+        }
+        for (i, step) in self.intelligence_rungs.iter().enumerate() {
+            let mut marks = Vec::new();
+            if step.is_default {
+                marks.push("default");
+            }
+            if self.current == Some(i) {
+                marks.push("this thread");
+            }
+            let marks = if marks.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", marks.join(", "))
+            };
+            out.push_str(&format!(
+                "\n{}. {}, {} (`{}`): intelligence {}, cost {}, time {}{marks}",
+                i + 1,
+                step.label,
+                step.effort,
+                self.pick_hint(step),
+                band(step.intelligence.as_deref()),
+                band(step.cost.as_deref()),
+                band(step.time.as_deref()),
+            ));
+        }
+
+        out
+    }
+
+    fn pick_hint(&self, step: &IntelligenceRung) -> String {
+        if self.surface == CHAT_SURFACE {
+            format!("{}={}", step.model, step.effort)
+        } else {
+            format!(
+                "--coding-agent {} --coding-agent-model {} --reasoning-effort {}",
+                self.surface, step.model, step.effort
+            )
+        }
+    }
+}
+
+const CHAT_SURFACE: &str = "chat";
+
+fn band(label: Option<&str>) -> &str {
+    label.unwrap_or("not estimated")
+}
+
+fn fetch(
+    base_url: &str,
+    query: &[(&str, &str)],
+    target_workspace: Option<&str>,
+) -> Result<serde_json::Value, BoxError> {
+    let url = format!("{base_url}/api/v1/intelligence-ladder");
+    let mut request = http_client()?.get(&url).query(query);
+    if let Some(target) = target_workspace {
+        request = request.header(crate::http::HEADER_TARGET_WORKSPACE, target);
+    }
+    let resp = request
+        .send_with_connect_retry()
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().unwrap_or_default();
+        return Err(format!("GET {url} returned {status}: {text}").into());
+    }
+    resp.json()
+        .map_err(|e| format!("GET {url} returned a non-JSON body: {e}").into())
+}
+
+pub(crate) fn read_own(ws: &Workspace) -> Option<Ladder> {
+    let thread_id = std::env::var("LUCIDOS_THREAD_ID").ok()?;
+    fetch(&ws.base_url(), &[("thread_id", &thread_id)], None)
+        .ok()
+        .as_ref()
+        .and_then(Ladder::parse)
+}
+
+pub(crate) fn render_for_refusal(
+    base_url: &str,
+    target_workspace: Option<&str>,
+    surface: Option<&str>,
+) -> Option<String> {
+    let query: Vec<(&str, &str)> = surface
+        .map(|surface| vec![("surface", surface)])
+        .unwrap_or_default();
+    fetch(base_url, &query, target_workspace)
+        .ok()
+        .as_ref()
+        .and_then(Ladder::parse)
+        .map(|ladder| ladder.render())
+}
+
+pub(crate) fn cmd(
+    ws: &Workspace,
+    surface: Option<crate::CliLadderSurface>,
+    json: bool,
+) -> Result<(), BoxError> {
+    let thread_id = std::env::var("LUCIDOS_THREAD_ID").ok();
+    let query: Vec<(&str, &str)> = match (surface, thread_id.as_deref()) {
+        (Some(surface), _) => vec![("surface", surface.as_wire())],
+        (None, Some(thread)) => vec![("thread_id", thread)],
+        (None, None) => Vec::new(),
+    };
+    let body = fetch(&ws.base_url(), &query, None)?;
+    print_body(body, json)
+}
+
+pub(crate) fn print_body(body: Value, json: bool) -> Result<(), BoxError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let ladder = Ladder::parse(&body)
+        .ok_or_else(|| format!("the engine served a ladder this CLI cannot read: {body}"))?;
+    println!("{}", ladder.render());
+    if let (Some(source), Some(estimated)) = (body["source"].as_str(), body["estimated"].as_str()) {
+        let customised = if body["customised"] == true {
+            "The owner's own list orders it. "
+        } else {
+            ""
+        };
+        println!("{customised}Bands: {source} Estimated {estimated}.");
+    }
+    Ok(())
+}
+
+/// One edit to an intelligence ladder. The owner edits freely. An agent
+/// needs the owner's `edit-intelligence-ladder` permission: without one, the
+/// command prints a request id to ask with, and runs again once allowed.
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum EditCmd {
+    /// Turn on exactly these rungs, least to most intelligent. The default
+    /// rung must stay on.
+    #[command(name = "set-rungs")]
+    SetIntelligenceRungs {
+        #[command(flatten)]
+        edit: EditArgs,
+        /// Each rung as `model=effort`, for example `claude-opus-5-5=medium`.
+        #[arg(required = true, value_name = "RUNGS", value_parser = parse_intelligence_rung)]
+        intelligence_rungs: Vec<(String, String)>,
+    },
+    /// Turn off every rung that runs this model. Refused for the default
+    /// rung's model: set another default first.
+    #[command(name = "remove-model")]
+    RemoveModel {
+        #[command(flatten)]
+        edit: EditArgs,
+        model: String,
+    },
+    /// Sort the rungs that are on, least to most intelligent.
+    Sort {
+        #[command(flatten)]
+        edit: EditArgs,
+    },
+    /// Make this rung, `model=effort`, the default. It turns on if it was off.
+    #[command(name = "set-default")]
+    SetDefault {
+        #[command(flatten)]
+        edit: EditArgs,
+        #[arg(value_name = "RUNG", value_parser = parse_intelligence_rung)]
+        intelligence_rung: (String, String),
+    },
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct EditArgs {
+    /// The ladder to edit: chat, claude-code or codex.
+    #[arg(long, value_enum)]
+    surface: crate::CliLadderSurface,
+    /// Why you edit it. An agent's permission card quotes it to the owner.
+    #[arg(long, default_value = "")]
+    reason: String,
+}
+
+fn parse_intelligence_rung(text: &str) -> Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((model, effort)) if !model.is_empty() && !effort.is_empty() => {
+            Ok((model.to_owned(), effort.to_owned()))
+        }
+        _ => Err(format!("'{text}' is not a rung: write it as model=effort.")),
+    }
+}
+
+fn edit_request(edit: &EditCmd) -> (&'static str, Value) {
+    let intelligence_rung_json = |(model, effort): &(String, String)| serde_json::json!({ "model": model, "effort": effort });
+    let (path, args, mut body) = match edit {
+        EditCmd::SetIntelligenceRungs {
+            edit,
+            intelligence_rungs,
+        } => (
+            "rungs",
+            edit,
+            serde_json::json!({
+                "rungs": intelligence_rungs.iter().map(intelligence_rung_json).collect::<Vec<_>>()
+            }),
+        ),
+        EditCmd::RemoveModel { edit, model } => {
+            ("remove-model", edit, serde_json::json!({ "model": model }))
+        }
+        EditCmd::Sort { edit } => ("sort", edit, serde_json::json!({})),
+        EditCmd::SetDefault {
+            edit,
+            intelligence_rung,
+        } => ("default", edit, intelligence_rung_json(intelligence_rung)),
+    };
+    body["surface"] = args.surface.as_wire().into();
+    body["reason"] = args.reason.clone().into();
+    (path, body)
+}
+
+pub(crate) fn cmd_edit(ws: &Workspace, edit: &EditCmd) -> Result<u8, BoxError> {
+    let (path, body) = edit_request(edit);
+    let url = format!("{}/api/v1/intelligence-ladder/{path}", ws.base_url());
+    crate::permission_request::send_act(http_client()?, reqwest::Method::POST, &url, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_edit_posts_its_route_with_the_surface_and_reason() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(subcommand)]
+            edit: EditCmd,
+        }
+        let parse = |argv: &[&str]| Wrap::try_parse_from(argv).map(|w| edit_request(&w.edit));
+        let (path, body) = parse(&[
+            "x",
+            "set-rungs",
+            "--surface",
+            "claude-code",
+            "--reason",
+            "why",
+            "a=low",
+            "b=high",
+        ])
+        .unwrap();
+        assert_eq!(path, "rungs");
+        assert_eq!(body["surface"], "claude-code");
+        assert_eq!(body["reason"], "why");
+        assert_eq!(
+            body["rungs"][1],
+            serde_json::json!({"model": "b", "effort": "high"})
+        );
+        let (path, body) = parse(&["x", "remove-model", "--surface", "chat", "m"]).unwrap();
+        assert_eq!((path, &body["model"]), ("remove-model", &"m".into()));
+        let (path, body) = parse(&["x", "set-default", "--surface", "codex", "m=low"]).unwrap();
+        assert_eq!((path, &body["effort"]), ("default", &"low".into()));
+        assert_eq!(
+            parse(&["x", "sort", "--surface", "codex"]).unwrap().0,
+            "sort"
+        );
+        assert!(parse(&["x", "set-rungs", "--surface", "codex", "noeffort"]).is_err());
+        assert!(parse(&["x", "sort"]).is_err(), "--surface is required");
+    }
+
+    fn sample() -> serde_json::Value {
+        serde_json::json!({
+            "surface": "claude-code",
+            "coding_agent": "claude-code",
+            "rungs": [
+                {"model": "claude-haiku-5-5", "effort": "low", "label": "Haiku 5.5", "on": true,
+                 "intelligence": {"multiple": 0.6, "label": "0.6×"},
+                 "cost": {"multiple": 0.0197, "label": "0.02×"},
+                 "time": {"multiple": 0.397, "label": "0.4×"}, "is_default": false},
+                {"model": "claude-sonnet-5-5", "effort": "low", "label": "Sonnet 5.5", "on": false,
+                 "intelligence": {"multiple": 0.8, "label": "0.8×"},
+                 "cost": {"multiple": 0.315, "label": "0.31×"},
+                 "time": {"multiple": 0.5, "label": "0.5×"}, "is_default": false},
+                {"model": "claude-opus-5-5", "effort": "medium", "label": "Opus 5.5", "on": true,
+                 "intelligence": {"multiple": 1.0, "label": "1.0×"},
+                 "cost": {"multiple": 1.0, "label": "1.0×"}, "time": null, "is_default": true},
+            ],
+            "current": {"model": "claude-opus-5-5", "effort": "medium", "position": 2},
+            "reference": {"model": "claude-opus-5-5", "effort": "medium"},
+        })
+    }
+
+    #[test]
+    fn the_render_marks_the_default_and_the_threads_intelligence_rung() {
+        let ladder = Ladder::parse(&sample()).expect("parses");
+        let text = ladder.render();
+        assert!(text.contains("1. Haiku 5.5, low (`--coding-agent claude-code --coding-agent-model claude-haiku-5-5 --reasoning-effort low`): intelligence 0.6×, cost 0.02×, time 0.4×"), "{text}");
+        assert!(
+            !text.contains("Sonnet"),
+            "a rung that is off stays out: {text}"
+        );
+        assert!(text.contains("2. Opus 5.5, medium"), "{text}");
+        assert!(
+            text.contains(
+                "intelligence 1.0×, cost 1.0×, time not estimated [default, this thread]"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("rough multiples of claude-opus-5-5 at medium."),
+            "{text}"
+        );
+        assert!(
+            !ladder.has_higher_intelligence_rung(),
+            "the thread is on the top rung"
+        );
+    }
+
+    #[test]
+    fn off_ladder_current_is_reported_without_becoming_a_choice() {
+        for surface in ["chat", "claude-code", "codex"] {
+            for (model, effort, position) in [
+                ("custom-model", "high", serde_json::Value::Null),
+                ("claude-sonnet-5-5", "low", serde_json::json!(1)),
+            ] {
+                let mut body = sample();
+                body["surface"] = surface.into();
+                body["current"] = serde_json::json!({
+                    "model": model, "effort": effort, "position": position,
+                });
+                let ladder = Ladder::parse(&body).unwrap();
+                let text = ladder.render();
+                assert!(
+                    text.contains(&format!(
+                        "This thread runs on {model} at {effort} (off-ladder)."
+                    )),
+                    "{text}"
+                );
+                assert_eq!(ladder.intelligence_rungs.len(), 2);
+                assert!(text.contains("1. Haiku"), "{text}");
+                assert!(text.contains("2. Opus"), "{text}");
+                assert!(!text.contains("3. "), "{text}");
+                assert!(!text.contains("[default, this thread]"), "{text}");
+                assert!(
+                    !text.contains(&format!("--coding-agent-model {model}")),
+                    "{text}"
+                );
+                assert!(!text.contains(&format!("`{model}={effort}`")), "{text}");
+                assert!(!ladder.has_higher_intelligence_rung());
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_enabled_ladder_still_reports_the_current_pair() {
+        let mut body = sample();
+        for intelligence_rung in body["rungs"].as_array_mut().unwrap() {
+            intelligence_rung["on"] = false.into();
+        }
+        let ladder = Ladder::parse(&body).unwrap();
+        let text = ladder.render();
+        assert!(text.contains("intelligence ladder has no rung."), "{text}");
+        assert!(
+            text.contains("This thread runs on claude-opus-5-5 at medium (off-ladder)."),
+            "{text}"
+        );
+        assert!(!ladder.has_higher_intelligence_rung());
+    }
+
+    #[test]
+    fn an_unavailable_current_pair_is_not_reported_as_off_ladder() {
+        let mut body = sample();
+        for current in [
+            serde_json::Value::Null,
+            serde_json::json!({"position": null}),
+        ] {
+            body["current"] = current;
+            let ladder = Ladder::parse(&body).unwrap();
+            assert!(!ladder.render().contains("off-ladder"));
+            assert!(!ladder.has_higher_intelligence_rung());
+        }
+    }
+
+    #[test]
+    fn a_thread_off_the_ladder_has_no_known_higher_intelligence_rung() {
+        let mut body = sample();
+        body["current"] = serde_json::json!({"model": "x", "effort": "low", "position": null});
+        let ladder = Ladder::parse(&body).expect("parses");
+        assert_eq!(ladder.current, None);
+        assert!(!ladder.has_higher_intelligence_rung());
+        body["current"]["position"] = 1.into();
+        assert_eq!(
+            Ladder::parse(&body).expect("parses").current,
+            None,
+            "a thread on a rung that is off is off the ladder"
+        );
+        body["current"]["position"] = 0.into();
+        assert!(
+            !Ladder::parse(&body)
+                .expect("parses")
+                .has_higher_intelligence_rung(),
+            "the only rung above is the top, which a builder never takes"
+        );
+    }
+
+    #[test]
+    fn a_chat_intelligence_rung_reads_as_its_pair_on_the_lucidos_agent_ladder() {
+        let mut body = sample();
+        body["surface"] = "chat".into();
+        let text = Ladder::parse(&body).expect("parses").render();
+        assert!(
+            text.starts_with("The Lucidos Agent intelligence ladder"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1. Haiku 5.5, low (`claude-haiku-5-5=low`)"),
+            "{text}"
+        );
+    }
+    #[test]
+    fn other_ladders_use_full_flags_and_require_equal_present_references() {
+        let mut body = sample();
+        let mut other = sample();
+        other["surface"] = "codex".into();
+        body["other_backend_ladders"] = serde_json::json!([other]);
+        let text = Ladder::parse(&body).unwrap().render();
+        assert!(text.contains("The codex intelligence ladder"));
+        assert!(text.contains("--coding-agent codex --coding-agent-model"));
+        assert!(text.contains("Their multiples compare"));
+        let mut empty_own = body.clone();
+        empty_own["rungs"] = serde_json::json!([]);
+        assert!(Ladder::parse(&empty_own)
+            .unwrap()
+            .render()
+            .contains("The codex intelligence ladder"));
+        body["other_backend_ladders"][0]["reference"] = serde_json::Value::Null;
+        let text = Ladder::parse(&body).unwrap().render();
+        assert!(text.contains("Their multiples do not compare"));
+        body["other_backend_ladders"][0]["reference"] =
+            serde_json::json!({"model":"different", "effort":"low"});
+        assert!(Ladder::parse(&body)
+            .unwrap()
+            .render()
+            .contains("Their multiples do not compare"));
+        body["reference"] = serde_json::Value::Null;
+        body["other_backend_ladders"][0]["reference"] = serde_json::Value::Null;
+        assert!(Ladder::parse(&body)
+            .unwrap()
+            .render()
+            .contains("Their multiples do not compare"));
+    }
+}

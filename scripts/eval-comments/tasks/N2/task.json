@@ -1,0 +1,14 @@
+{
+  "id": "N2",
+  "fix": "b5979f2aa9882dfc3cf05410f088435a9d7cac83",
+  "title": "fix(projection): a late tool result of an earlier call keeps a thread waiting for its answer",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/engine/event_bus_tests/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/engine/event_bus_tests/mod.rs"
+  },
+  "needs_db": true,
+  "comment": "constraint",
+  "why": "Inside the changed activity arm of the thread projection, a block says last_revived_at tracks the status bump, so it must skip exactly the rows the bump skips, or the IN PROGRESS sort order reshuffles. The fix adds a new case the bump skips, so it had to keep the two in step.",
+  "adaptation": "None. The fix's test file whole: it emits thread events through the bus and reads thread_summaries.status and the watchdog's running probe."
+}

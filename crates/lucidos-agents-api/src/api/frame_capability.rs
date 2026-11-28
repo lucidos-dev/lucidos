@@ -1,0 +1,149 @@
+use axum::http::HeaderMap;
+use lucidos_frame_capability as capability;
+
+use super::local_auth;
+use crate::core::base_path;
+
+/// INVARIANT: The signing key, derived from the machine-local token.
+///
+/// Derived per call rather than cached. It is one HMAC of a short constant, and
+/// only an app-document serve or a renewal pays it. Caching would mean deciding
+/// what happens when the first caller runs before the token is published, which
+/// is a race worth not having.
+///
+/// `None` on a machine with no token on disk, which is a machine with no
+/// gateway. There is nothing to prove to there.
+fn key() -> Option<capability::Key> {
+    local_auth::machine_local_token().map(capability::derive_key)
+}
+
+fn scope_from_prefix(prefix: &str) -> Option<(&str, bool)> {
+    let segment = prefix.strip_prefix('/')?.strip_suffix('/')?;
+    let (slug, remote) = match segment.split_once(lucidos_gateway_constants::REMOTE_ROUTE_SEPARATOR)
+    {
+        Some((slug, gateway)) if capability::is_url_safe_segment(gateway) => (slug, true),
+        Some(_) => return None,
+        None => (segment, false),
+    };
+    capability::is_url_safe_segment(slug).then_some((slug, remote))
+}
+
+pub(super) fn mint(prefix: &str, app_id: &str) -> Option<String> {
+    let (slug, _) = scope_from_prefix(prefix)?;
+    capability::mint(
+        &key()?,
+        slug,
+        app_id,
+        chrono::Utc::now().timestamp(),
+        capability::TTL_SECS,
+    )
+}
+
+/// INVARIANT: Mint for a frame or an opaque remote app tab.
+///
+/// The framed test is `Sec-Fetch-Dest`, which a browser sets and page script
+/// cannot forge. A client sending no fetch metadata gets nothing, and loads
+/// exactly as it does today.
+pub(super) fn mint_for_document(headers: &HeaderMap, app_id: &str) -> Option<String> {
+    let dest = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok());
+    let prefix = base_path::forwarded_prefix(headers);
+    let (_, remote) = scope_from_prefix(&prefix)?;
+    if !(capability::is_nested_frame_dest(dest) || remote && dest == Some("document")) {
+        return None;
+    }
+    mint(&prefix, app_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framed(prefix: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-dest", "iframe".parse().unwrap());
+        headers.insert("x-forwarded-prefix", prefix.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn a_framed_document_behind_a_gateway_gets_a_pass() {
+        let token = local_auth::publish_test_local_token();
+        let minted = mint_for_document(&framed("/dev/"), "site-publisher")
+            .expect("a framed document behind a gateway mints");
+        let key = capability::derive_key(token);
+        assert_eq!(
+            capability::verify(&key, &minted, "dev", chrono::Utc::now().timestamp()).as_deref(),
+            Some("site-publisher"),
+            "the gateway must read back what we minted"
+        );
+    }
+
+    #[test]
+    fn remote_documents_mint_for_the_workspace_at_the_verifying_gateway() {
+        let token = local_auth::publish_test_local_token();
+        let key = capability::derive_key(token);
+        for dest in ["iframe", "document"] {
+            let mut headers = framed("/dev@cloud/");
+            headers.insert("sec-fetch-dest", dest.parse().unwrap());
+            let minted = mint_for_document(&headers, "site-publisher")
+                .expect("remote documents are opaque even in a standalone tab");
+            assert_eq!(
+                capability::verify(&key, &minted, "dev", chrono::Utc::now().timestamp()).as_deref(),
+                Some("site-publisher")
+            );
+            assert!(
+                capability::verify(&key, &minted, "other", chrono::Utc::now().timestamp())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_minted_where_nothing_needs_proving() {
+        local_auth::publish_test_local_token();
+
+        let mut direct = framed("/dev/");
+        direct.remove("x-forwarded-prefix");
+        assert_eq!(mint_for_document(&direct, "site-publisher"), None);
+
+        let mut tab = framed("/dev/");
+        tab.insert("sec-fetch-dest", "document".parse().unwrap());
+        assert_eq!(mint_for_document(&tab, "site-publisher"), None);
+
+        let mut bare = framed("/dev/");
+        bare.remove("sec-fetch-dest");
+        assert_eq!(mint_for_document(&bare, "site-publisher"), None);
+    }
+
+    #[test]
+    fn a_crafted_forwarded_prefix_mints_nothing() {
+        local_auth::publish_test_local_token();
+        for prefix in [
+            "/",
+            "//",
+            "//evil.com/",
+            "///evil.com/",
+            "/a\"onload=x/",
+            "/deep/nested/",
+            "/with space/",
+            "/../",
+            "/dev@/",
+            "/@cloud/",
+            "/dev@cloud@other/",
+            "/dev@../",
+        ] {
+            assert_eq!(
+                mint_for_document(&framed(prefix), "site-publisher"),
+                None,
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_app_id_that_is_not_a_slug_mints_nothing() {
+        local_auth::publish_test_local_token();
+        assert_eq!(mint_for_document(&framed("/dev/"), "a b"), None);
+        assert_eq!(mint_for_document(&framed("/dev/"), ""), None);
+    }
+}

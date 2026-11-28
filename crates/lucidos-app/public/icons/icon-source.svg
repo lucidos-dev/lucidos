@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <radialGradient id="lucidosBrand" gradientUnits="userSpaceOnUse" cx="30" cy="22" r="125">
+      <stop offset="0" stop-color="#2d83e0"/>
+      <stop offset="1" stop-color="#0a4ea8"/>
+    </radialGradient>
+  </defs>
+  <rect x="0" y="0" width="100" height="100" fill="url(#lucidosBrand)"/>
+  <g transform="translate(13 13) scale(0.74)" fill="#ffffff">
+    <rect x="17" y="17" width="29" height="29" rx="7"/><rect x="17" y="54" width="29" height="29" rx="7"/><rect x="54" y="54" width="29" height="29" rx="7"/>
+    <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z"/>
+  </g>
+</svg>

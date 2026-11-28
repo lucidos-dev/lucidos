@@ -1,0 +1,41 @@
+import { describeFormRequest, openFormRequest } from '../../store/actions/form-requests';
+import type { FormRequestOutcome } from '../../store/thread-events/thread-event-types';
+import type { ResponseEvent } from '../../store/types';
+import { AgentSignInRequest } from './AgentSignInRow';
+import { eventRowBody } from './EventRow';
+import type { EventRowTone } from './EventRow';
+
+type FormRequestRowEvent = Extract<ResponseEvent, { type: 'form_request' }>;
+
+const FORM_REQUEST_STATE: Record<FormRequestOutcome | 'open', { label: string; tone: EventRowTone }> = {
+  open: { label: 'Waiting for you', tone: 'live' },
+  completed: { label: 'Done', tone: 'good' },
+  canceled: { label: 'Canceled', tone: 'halted' },
+  superseded: { label: 'Replaced', tone: 'lapsed' },
+  expired: { label: 'Expired', tone: 'lapsed' },
+  failed: { label: 'Failed', tone: 'bad' },
+  unknown: { label: 'Closed', tone: 'none' },
+};
+
+export function FormRequestRow({ row, threadId }: { row: FormRequestRowEvent; threadId: string }) {
+  const state = FORM_REQUEST_STATE[row.resolution ?? 'open'];
+  if (row.request.type === 'AgentSignInRequested') {
+    return <AgentSignInRequest request={row.request} outcome={row.resolution} state={state} />;
+  }
+  const described = describeFormRequest(row.request);
+  return eventRowBody({
+    kind: 'form',
+    state: row.resolution ?? 'open',
+    role: 'form-request-row',
+    subject: described.charAt(0).toUpperCase() + described.slice(1),
+    stateLabel: state.label,
+    tone: state.tone,
+    actions: row.resolution
+      ? undefined
+      : (
+        <button type="button" class="action-btn" onClick={() => openFormRequest(threadId, row.request, { byUser: true })}>
+          {'Open'}
+        </button>
+      ),
+  });
+}

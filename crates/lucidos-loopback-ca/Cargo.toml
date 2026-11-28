@@ -1,0 +1,30 @@
+[package]
+name = "lucidos-loopback-ca"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The loopback CA: the per-user certificate authority that signs what every
+# Lucidos loopback listener serves (ADR 0745).
+#
+# The gateway mints and serves its leaf, and the app trusts it. Neither may
+# depend on the engine (ADR 0014 §1), hence a crate of its own. A client of a
+# loopback listener needs none of this crate: its builder and the public
+# certificate path live in `lucidos-local-token`.
+
+[dependencies]
+lucidos-home = { path = "../lucidos-home" }
+lucidos-local-token = { path = "../lucidos-local-token" }
+libc = "0.2"
+# The same `aws_lc_rs` backend the gateway's rustls uses: one crypto stack.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+sha2 = "0.10"
+time = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
+# A real handshake against the resolver's config, as a loopback client makes it.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false }

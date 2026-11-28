@@ -1,0 +1,204 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  bootSplashShouldRelease,
+  isWorkspaceReady,
+  delayedBootStatus,
+  remainingRevealMs,
+  startDelayedBootStatus,
+  workspaceIsUnreachable,
+  BOOT_SPLASH_MIN_REVEAL_MS,
+  STATUS_DELAY_MS,
+} from './useBootSplashReady';
+import { connectionStatus } from '../store/store';
+import { revealBootEscape, setBootStatus } from '../utils/bootSplash';
+
+vi.mock('../utils/bootSplash', () => ({
+  setBootStatus: vi.fn(),
+  bootSplashPresent: vi.fn(() => true),
+  bootSplashPlaysNoReveal: vi.fn(() => false),
+  dismissBootSplash: vi.fn(),
+  revealBootEscape: vi.fn(() => true),
+}));
+
+describe('isWorkspaceReady', () => {
+  it('is ready only when connected AND threads are loaded', () => {
+    expect(isWorkspaceReady('connected', true)).toBe(true);
+  });
+
+  it('is not ready while still connecting, even once threads loaded', () => {
+    expect(isWorkspaceReady('connecting', true)).toBe(false);
+  });
+
+  it('is not ready while disconnected', () => {
+    expect(isWorkspaceReady('disconnected', true)).toBe(false);
+  });
+
+  it('is not ready when connected but threads have not loaded yet', () => {
+    expect(isWorkspaceReady('connected', false)).toBe(false);
+  });
+});
+
+describe('bootSplashShouldRelease', () => {
+  it('releases a landed notification deep link without waiting for the list', () => {
+    expect(bootSplashShouldRelease('connected', false, true, true)).toBe(true);
+    expect(bootSplashShouldRelease('connecting', false, true, true)).toBe(false);
+    expect(bootSplashShouldRelease('connected', true, true, false)).toBe(true);
+  });
+
+  it('releases on the ordinary ready path', () => {
+    expect(bootSplashShouldRelease('connected', true, true)).toBe(true);
+  });
+
+  it('holds while the load is still in progress', () => {
+    expect(bootSplashShouldRelease('connected', false, true)).toBe(false);
+  });
+
+  it('releases when a connected engine reports its database unreachable', () => {
+    expect(bootSplashShouldRelease('connected', false, false)).toBe(true);
+  });
+
+  it('does not release on absence of evidence while the first probe is in flight', () => {
+    expect(bootSplashShouldRelease('connecting', false, true)).toBe(false);
+    expect(bootSplashShouldRelease('connecting', false, false)).toBe(false);
+  });
+
+  it('does not release for an unreachable ENGINE, which has its own escape', () => {
+    expect(bootSplashShouldRelease('disconnected', false, false)).toBe(false);
+  });
+});
+
+describe('delayedBootStatus', () => {
+  it('shows "Loading…" once connected, regardless of context', () => {
+    expect(delayedBootStatus('connected', false)).toBe('Loading…');
+    expect(delayedBootStatus('connected', true)).toBe('Loading…');
+  });
+
+  it('never accuses a workspace of being down while the first probe is still in flight', () => {
+    expect(delayedBootStatus('connecting', true)).toBe('Connecting…');
+    expect(delayedBootStatus('connecting', false)).toBe('Connecting…');
+  });
+
+  it('shows "Workspace not started" on a DIRECT engine port once a probe has actually failed', () => {
+    expect(delayedBootStatus('disconnected', true)).toBe('Workspace not started');
+  });
+
+  it('keeps "Connecting…" behind the gateway (which lazy-starts the engine)', () => {
+    expect(delayedBootStatus('disconnected', false)).toBe('Connecting…');
+  });
+});
+
+describe('workspaceIsUnreachable', () => {
+  it('is true only for a direct port whose probe actually failed', () => {
+    expect(workspaceIsUnreachable('disconnected', true)).toBe(true);
+  });
+
+  it('is false behind the gateway, which lazy-starts the engine itself', () => {
+    expect(workspaceIsUnreachable('disconnected', false)).toBe(false);
+  });
+
+  it('is false while the first probe is still in flight, and once connected', () => {
+    expect(workspaceIsUnreachable('connecting', true)).toBe(false);
+    expect(workspaceIsUnreachable('connected', true)).toBe(false);
+  });
+
+  it('matches the state the status line names a cause for', () => {
+    for (const connection of ['connected', 'connecting', 'disconnected'] as const) {
+      for (const isDirect of [true, false]) {
+        expect(delayedBootStatus(connection, isDirect) === 'Workspace not started').toBe(
+          workspaceIsUnreachable(connection, isDirect),
+        );
+      }
+    }
+  });
+});
+
+describe('remainingRevealMs', () => {
+  it('holds the splash for the rest of the reveal when it is still playing', () => {
+    expect(remainingRevealMs(200, false)).toBe(BOOT_SPLASH_MIN_REVEAL_MS - 200);
+  });
+
+  it('holds nothing once the reveal has already had its time', () => {
+    expect(remainingRevealMs(BOOT_SPLASH_MIN_REVEAL_MS + 500, false)).toBe(0);
+  });
+
+  it('holds nothing when this document plays no reveal, however early it is ready', () => {
+    for (const elapsed of [0, 100, BOOT_SPLASH_MIN_REVEAL_MS - 1]) {
+      expect(remainingRevealMs(elapsed, true)).toBe(0);
+    }
+  });
+});
+
+describe('startDelayedBootStatus', () => {
+  const written = vi.mocked(setBootStatus);
+  let teardown: (() => void) | null = null;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    written.mockClear();
+    connectionStatus.value = 'connecting';
+  });
+
+  afterEach(() => {
+    teardown?.();
+    teardown = null;
+    vi.useRealTimers();
+    connectionStatus.value = 'connecting';
+  });
+
+  it('writes nothing before the delay — a normal launch never swaps the baked text', () => {
+    teardown = startDelayedBootStatus(true);
+    vi.advanceTimersByTime(STATUS_DELAY_MS - 1);
+    expect(written).not.toHaveBeenCalled();
+  });
+
+  it('says "Connecting…" on a direct port while the first probe is still in flight', () => {
+    teardown = startDelayedBootStatus(true);
+    vi.advanceTimersByTime(STATUS_DELAY_MS);
+    expect(written).toHaveBeenLastCalledWith('Connecting…');
+  });
+
+  it('retracts the line when the connection lands after the delay', () => {
+    teardown = startDelayedBootStatus(true);
+    vi.advanceTimersByTime(STATUS_DELAY_MS);
+    connectionStatus.value = 'disconnected';
+    expect(written).toHaveBeenLastCalledWith('Workspace not started');
+    connectionStatus.value = 'connected';
+    expect(written).toHaveBeenLastCalledWith('Loading…');
+  });
+
+  it('offers the gateway escape exactly when the workspace is unreachable', () => {
+    const revealed = vi.mocked(revealBootEscape);
+    revealed.mockClear();
+    teardown = startDelayedBootStatus(true);
+    vi.advanceTimersByTime(STATUS_DELAY_MS);
+    expect(revealed).not.toHaveBeenCalled();
+    connectionStatus.value = 'disconnected';
+    expect(revealed).toHaveBeenCalled();
+  });
+
+  it('never offers the escape behind the gateway, which starts the engine itself', () => {
+    const revealed = vi.mocked(revealBootEscape);
+    revealed.mockClear();
+    teardown = startDelayedBootStatus(false);
+    vi.advanceTimersByTime(STATUS_DELAY_MS);
+    connectionStatus.value = 'disconnected';
+    expect(revealed).not.toHaveBeenCalled();
+  });
+
+  it('teardown stops the subscription — before the delay it never fires at all', () => {
+    startDelayedBootStatus(true)();
+    vi.advanceTimersByTime(STATUS_DELAY_MS * 2);
+    connectionStatus.value = 'connected';
+    expect(written).not.toHaveBeenCalled();
+  });
+
+  it('teardown after the delay stops further updates, and is idempotent', () => {
+    const stop = startDelayedBootStatus(true);
+    vi.advanceTimersByTime(STATUS_DELAY_MS);
+    written.mockClear();
+    stop();
+    stop();
+    connectionStatus.value = 'connected';
+    expect(written).not.toHaveBeenCalled();
+  });
+});

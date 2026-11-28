@@ -1,0 +1,237 @@
+
+:root {
+    --section-inset-left: var(--space-lg);
+    --section-inset-right: var(--space-lg);
+    --section-header-pad: var(--space-lg);
+}
+
+:is(.thread-drawer .list-section-title, .list-section-title-collapsible) {
+    background: none;
+    padding: var(--section-header-pad) var(--section-inset-right) var(--section-header-pad) var(--section-inset-left);
+    color: var(--text-primary);
+    font-weight: 700;
+    font-size: var(--font-size-md);
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.list-section-title-collapsible:has(> .list-section-toggle) {
+    padding-top: 0;
+    padding-bottom: 0;
+    padding-left: 0;
+}
+
+.list-section-toggle {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: var(--section-header-pad) 0 var(--section-header-pad) var(--section-inset-left);
+    border: none;
+    background: none;
+    color: inherit;
+    font-weight: inherit;
+    line-height: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.list-section-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.25rem;
+    flex-shrink: 0;
+    box-sizing: content-box;
+    height: 1lh;
+    padding: var(--section-header-pad) 0;
+    text-transform: none;
+    letter-spacing: normal;
+}
+
+.list-section-title-collapsible {
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.section-count-badge {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    line-height: 1rem;
+    --badge-height: 1lh;
+    min-width: var(--badge-box, var(--badge-height));
+    padding: 0 0.3125rem;
+    text-align: center;
+    color: var(--text-secondary);
+    --section-count-fill: color-mix(in srgb, var(--accent) 15%, transparent);
+    background: var(--section-count-fill);
+    font-variant-numeric: tabular-nums;
+}
+
+html[data-theme-mode="dark"] .section-count-badge {
+    --section-count-fill: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.list-section-title:has(.section-count) {
+    line-height: 1rem;
+}
+
+.list-section-title .section-count {
+    position: relative;
+    display: inline-flex;
+    top: -0.0625rem;
+    margin-left: 0.25rem;
+    --section-count-open-scale: 1.2;
+}
+
+.list-section-title .section-count-badge {
+    position: relative;
+    isolation: isolate;
+    background: none;
+    visibility: hidden;
+    scale: var(--section-count-open-scale);
+    transition: scale var(--duration-slow) ease-out;
+}
+
+.list-section-title-collapsible.collapsed .section-count-badge {
+    visibility: visible;
+    scale: none;
+    transition: scale var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.list-section-title .section-count-badge::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--section-count-fill);
+    visibility: visible;
+    opacity: 0;
+    transform: scale(0.5);
+    transition:
+        opacity var(--duration-normal) ease-out,
+        transform var(--duration-normal) ease-in;
+}
+
+.list-section-title-collapsible.collapsed .section-count-badge::before {
+    opacity: 1;
+    transform: scale(1);
+    transition:
+        opacity var(--duration-normal) ease-out,
+        transform var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.section-count-open {
+    position: absolute;
+    inset: 0;
+    align-content: center;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1rem;
+    letter-spacing: normal;
+    white-space: nowrap;
+    text-align: center;
+    color: var(--text-secondary);
+    transition: scale var(--duration-slow) ease-out;
+}
+
+.list-section-title-collapsible.collapsed .section-count-open {
+    visibility: hidden;
+    scale: calc(1 / var(--section-count-open-scale));
+    transition: none;
+}
+
+@supports (text-box-trim: trim-both) {
+    .section-label {
+        min-height: 1lh;
+        align-content: center;
+        text-box-trim: trim-both;
+        text-box-edge: cap alphabetic;
+    }
+
+    .list-section-title .section-count {
+        top: 0;
+    }
+
+    .list-section-title .section-count-badge {
+        transform-origin: 50% calc(100% - var(--badge-baseline-inset));
+    }
+
+    .section-count-open {
+        top: auto;
+        bottom: round(50% - 0.5 * 1cap, 1px);
+        align-content: normal;
+        text-box-trim: trim-end;
+        text-box-edge: cap alphabetic;
+        transform-origin: 50% 100%;
+    }
+}
+
+.section-chevron {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    margin-left: -0.125rem;
+    margin-right: 0.125rem;
+    color: var(--text-secondary);
+}
+
+.section-chevron svg {
+    transform: rotate(0deg);
+    will-change: transform;
+    transition: transform var(--duration-normal) cubic-bezier(0.22, 0, 0, 1);
+}
+
+[aria-expanded="true"] > .section-chevron svg {
+    transform: rotate(90deg);
+}
+
+.section-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
+    flex: none;
+    margin-right: 0.25rem;
+}
+
+.section-icon-pin {
+    transform: translateY(0.0625rem);
+}
+
+@media (hover: hover) {
+    .list-section-title-collapsible:hover {
+        color: var(--text-primary);
+    }
+}
+
+
+.list-rows-divided .list-row,
+.list-rows-divided .changes-bulk-actions,
+.list-section-title-collapsible {
+    position: relative;
+}
+
+.list-rows-divided .list-row::after,
+.list-rows-divided .changes-bulk-actions::after,
+.thread-drawer .thread-row::after,
+.list-section-title-collapsible.collapsed::after {
+    content: '';
+    position: absolute;
+    left: var(--row-hairline-left, var(--section-inset-left));
+    right: var(--row-hairline-right, var(--section-inset-right));
+    bottom: 0;
+    border-bottom: 1px solid var(--border-color);
+    pointer-events: none;
+}
+
+.list-rows-divided .list-row {
+    padding-top: var(--space-md);
+    padding-bottom: var(--space-md);
+}

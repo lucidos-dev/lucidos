@@ -1,0 +1,224 @@
+#!/usr/bin/env -S python3 -I
+"""A stand-in for macOS `ps`, for scripts inside an agent's sandbox.
+
+macOS refuses to exec a setuid binary from a seatbelt sandbox, and /bin/ps is
+setuid root. This reads the same kernel facts through libproc and sysctl, which
+need no privilege for this user's processes. `ps_tools_env` in
+scripts/lib/ps_tools.sh puts it first on PATH only when /bin/ps cannot run.
+
+It implements only the options the scripts use (docs/plans/2026-11-11-
+sandboxed-local-e2e.md, Amendment). Anything else exits 2. A process guard
+reads its answer, so a fact it cannot read is never guessed: a row carries
+what the kernel returned, and argv it cannot read prints as `(comm)`, as
+/bin/ps prints it.
+"""
+
+import ctypes
+import ctypes.util
+import locale
+import struct
+import sys
+import time
+
+FIELDS = ("pid", "ppid", "pgid", "uid", "lstart", "rss", "stat", "comm", "command", "args")
+NUMERIC_WIDTH = {"pid": 5, "ppid": 5, "pgid": 5, "uid": 5, "rss": 6}
+STATUS_LETTER = {1: "I", 4: "T", 5: "Z"}
+SRUN, SSLEEP = 2, 3
+
+CTL_KERN, KERN_ARGMAX, KERN_PROCARGS2 = 1, 8, 49
+PROC_PIDTASKINFO, PROC_PIDTBSDINFO = 4, 3
+
+libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+
+
+class BsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+        ("xstatus", ctypes.c_uint32), ("pid", ctypes.c_uint32),
+        ("ppid", ctypes.c_uint32), ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32), ("ruid", ctypes.c_uint32),
+        ("rgid", ctypes.c_uint32), ("svuid", ctypes.c_uint32),
+        ("svgid", ctypes.c_uint32), ("rfu", ctypes.c_uint32),
+        ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+        ("nfiles", ctypes.c_uint32), ("pgid", ctypes.c_uint32),
+        ("pjobc", ctypes.c_uint32), ("tdev", ctypes.c_uint32),
+        ("tpgid", ctypes.c_uint32), ("nice", ctypes.c_int32),
+        ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64),
+    ]
+
+
+class TaskInfo(ctypes.Structure):
+    # struct proc_taskinfo: six 64-bit counters, then twelve 32-bit ones.
+    _fields_ = [("virtual_size", ctypes.c_uint64), ("resident_size", ctypes.c_uint64)] + [
+        (f"time{i}", ctypes.c_uint64) for i in range(4)
+    ] + [(f"count{i}", ctypes.c_int32) for i in range(10)] + [
+        ("numrunning", ctypes.c_int32), ("priority", ctypes.c_int32),
+    ]
+
+
+class Usage(Exception):
+    pass
+
+
+def bsd_info(pid):
+    info = BsdInfo()
+    got = libproc.proc_pidinfo(pid, PROC_PIDTBSDINFO, ctypes.c_uint64(0),
+                               ctypes.byref(info), ctypes.sizeof(info))
+    return info if got == ctypes.sizeof(info) else None
+
+
+def task_info(pid):
+    info = TaskInfo()
+    got = libproc.proc_pidinfo(pid, PROC_PIDTASKINFO, ctypes.c_uint64(0),
+                               ctypes.byref(info), ctypes.sizeof(info))
+    return info if got == ctypes.sizeof(info) else None
+
+
+def resident_kb(pid):
+    info = task_info(pid)
+    return info.resident_size // 1024 if info else 0
+
+
+def state_letter(pid, status):
+    """/bin/ps's first stat letter. A live process reads SRUN whatever its
+    threads do, so R or S comes from its running-thread count. U and I need
+    each thread's state, which takes a task port, so they print as S."""
+    if status not in (SRUN, SSLEEP):
+        return STATUS_LETTER.get(status, "?")
+    info = task_info(pid)
+    if info is None:
+        return "?"
+    return "R" if info.numrunning > 0 else "S"
+
+
+def proc_args(pid):
+    """(argv, environment) from KERN_PROCARGS2, or None."""
+    argmax = ctypes.c_int()
+    size = ctypes.c_size_t(ctypes.sizeof(argmax))
+    mib = (ctypes.c_int * 2)(CTL_KERN, KERN_ARGMAX)
+    if libc.sysctl(mib, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
+        return None
+    buf = ctypes.create_string_buffer(argmax.value)
+    size = ctypes.c_size_t(argmax.value)
+    mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+        return None
+    raw = buf.raw[: size.value]
+    argc = struct.unpack("i", raw[:4])[0]
+    _exec_path, _, rest = raw[4:].partition(b"\0")
+    strings = rest.lstrip(b"\0").split(b"\0")
+    if argc < 0 or len(strings) < argc:
+        return None
+    decode = lambda b: b.decode("utf-8", "replace")
+    env = []
+    for item in strings[argc:]:
+        if not item:
+            break
+        env.append(decode(item))
+    return [decode(a) for a in strings[:argc]], env
+
+
+def all_pids():
+    count = libproc.proc_listallpids(None, 0)
+    if count <= 0:
+        return []
+    pids = (ctypes.c_int * (count * 2))()
+    got = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+    return sorted(p for p in pids[: max(got, 0)] if p > 0)
+
+
+def parse(argv):
+    """(pid list or None for every process, field list, header wanted, with env)."""
+    pids, fields, headers, with_env, every = [], [], [], False, False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg.startswith("-") or arg == "-":
+            raise Usage(f"unexpected argument {arg!r}")
+        flags = arg[1:]
+        for j, flag in enumerate(flags):
+            if flag in "Aax":
+                every = every or flag in "Ax"
+            elif flag == "w":
+                pass
+            elif flag == "E":
+                with_env = True
+            elif flag in "op":
+                value = flags[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(argv):
+                        raise Usage(f"-{flag} needs a value")
+                    value = argv[i]
+                if flag == "p":
+                    for part in value.replace(",", " ").split():
+                        if not part.isdigit():
+                            raise Usage(f"bad pid {part!r}")
+                        pids.append(int(part))
+                else:
+                    for spec in value.split(","):
+                        name, eq, header = spec.partition("=")
+                        if name not in FIELDS:
+                            raise Usage(f"unsupported field {name!r}")
+                        fields.append(name)
+                        headers.append(header if eq else name.upper())
+                break
+            else:
+                raise Usage(f"unsupported option -{flag}")
+        i += 1
+    if not fields:
+        raise Usage("an -o field list is required")
+    if every and pids:
+        raise Usage("-A and -p together are not supported")
+    if not every and not pids:
+        raise Usage("name the processes with -p, or every process with -A")
+    return (None if every else pids), fields, headers, with_env
+
+
+def cell(field, pid, info, args, with_env):
+    if field in NUMERIC_WIDTH:
+        value = {"pid": pid, "ppid": info.ppid, "pgid": info.pgid,
+                 "uid": info.uid, "rss": resident_kb(pid) if field == "rss" else 0}[field]
+        return str(value).rjust(NUMERIC_WIDTH[field])
+    if field == "lstart":
+        return time.strftime("%c", time.localtime(info.start_sec))
+    if field == "stat":
+        return state_letter(pid, info.status)
+    comm = info.comm.decode("utf-8", "replace")
+    if field == "comm":
+        return args[0][0] if args and args[0] else comm
+    if args is None or not args[0]:
+        return f"({comm})"
+    words = args[0] + (args[1] if with_env else [])
+    # One process per line: a control character prints as `?`, as /bin/ps prints it.
+    return "".join("?" if ord(c) < 32 or ord(c) == 127 else c for c in " ".join(words))
+
+
+def main(argv):
+    # /bin/ps formats lstart in the user's locale, and so must its stand-in.
+    try:
+        locale.setlocale(locale.LC_TIME, "")
+    except locale.Error:
+        pass
+    try:
+        wanted, fields, headers, with_env = parse(argv)
+    except Usage as error:
+        print(f"ps (Lucidos stand-in): {error}", file=sys.stderr)
+        return 2
+    rows = []
+    for pid in all_pids() if wanted is None else wanted:
+        info = bsd_info(pid)
+        if info is None:
+            continue
+        args = proc_args(pid)
+        rows.append(" ".join(cell(f, pid, info, args, with_env) for f in fields))
+    if any(headers):
+        print(" ".join(headers))
+    for row in rows:
+        print(row)
+    return 0 if rows else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

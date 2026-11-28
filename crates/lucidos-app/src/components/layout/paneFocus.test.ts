@@ -1,0 +1,469 @@
+// @vitest-environment jsdom
+import { describe, it, expect, afterEach } from 'vitest';
+import { focusedPane } from '../../store/store';
+import {
+  trapTargetIndex, paneTabTarget,
+  shouldReconcilePaneFocus, PANE_FOCUS_REGION,
+  isContentPaneIframeFocus, navigationFocusTarget,
+  visibleFocusables, focusIntoPane, tabTargetWithin,
+  installPaneFocusTracking, handlePaneTab, focusPaneMainControl,
+} from './paneFocus';
+
+function stubVisible(el: HTMLElement): void {
+  el.getClientRects = () => [{}] as unknown as DOMRectList;
+}
+
+describe('isContentPaneIframeFocus', () => {
+  const fake = (tagName: string, inContentPane: boolean): Element =>
+    ({ tagName, closest: (sel: string) => (sel === '.pane-content' && inContentPane ? {} : null) } as unknown as Element);
+
+  it('is true for an iframe inside the content pane', () => {
+    expect(isContentPaneIframeFocus(fake('IFRAME', true))).toBe(true);
+  });
+
+  it('is false for a non-iframe element (a normal pane control keeps host focus)', () => {
+    expect(isContentPaneIframeFocus(fake('BUTTON', true))).toBe(false);
+  });
+
+  it('is false for an iframe outside the content pane (e.g. an app frame elsewhere)', () => {
+    expect(isContentPaneIframeFocus(fake('IFRAME', false))).toBe(false);
+  });
+
+  it('is false for null activeElement', () => {
+    expect(isContentPaneIframeFocus(null)).toBe(false);
+  });
+});
+
+describe('trapTargetIndex', () => {
+  it('returns null when the pane has no tabbable elements', () => {
+    expect(trapTargetIndex(0, -1, false)).toBeNull();
+    expect(trapTargetIndex(0, 0, true)).toBeNull();
+  });
+
+  it('returns null for an active element not in the set (index -1)', () => {
+    expect(trapTargetIndex(3, -1, false)).toBeNull();
+    expect(trapTargetIndex(3, -1, true)).toBeNull();
+  });
+
+  it('wraps forward Tab off the last element to the first', () => {
+    expect(trapTargetIndex(3, 2, false)).toBe(0);
+  });
+
+  it('wraps Shift+Tab off the first element to the last', () => {
+    expect(trapTargetIndex(3, 0, true)).toBe(2);
+  });
+
+  it('does not wrap in-between (browser default keeps focus in the subtree)', () => {
+    expect(trapTargetIndex(3, 1, false)).toBeNull();
+    expect(trapTargetIndex(3, 1, true)).toBeNull();
+    expect(trapTargetIndex(3, 0, false)).toBeNull();
+    expect(trapTargetIndex(3, 2, true)).toBeNull();
+  });
+
+  it('a single tabbable element wraps to itself in both directions', () => {
+    expect(trapTargetIndex(1, 0, false)).toBe(0);
+    expect(trapTargetIndex(1, 0, true)).toBe(0);
+  });
+});
+
+describe('paneTabTarget', () => {
+  it('falls through (null) when the focused pane has no tabbable elements', () => {
+    expect(paneTabTarget(0, -1, false, false)).toBeNull();
+    expect(paneTabTarget(0, 0, true, true)).toBeNull();
+  });
+
+  it('moves focus INTO the pane when DOM focus is outside it', () => {
+    expect(paneTabTarget(3, -1, false, false)).toBe(0);
+    expect(paneTabTarget(3, -1, true, false)).toBe(2);
+  });
+
+  it('wraps at the boundaries when focus is already inside the pane', () => {
+    expect(paneTabTarget(3, 2, false, true)).toBe(0);
+    expect(paneTabTarget(3, 0, true, true)).toBe(2);
+  });
+
+  it('falls through (null) for in-between steps inside the pane', () => {
+    expect(paneTabTarget(3, 1, false, true)).toBeNull();
+    expect(paneTabTarget(3, 1, true, true)).toBeNull();
+    expect(paneTabTarget(3, 0, false, true)).toBeNull();
+    expect(paneTabTarget(3, 2, true, true)).toBeNull();
+  });
+
+  it('a single tabbable element: enter it from outside, then wrap to itself', () => {
+    expect(paneTabTarget(1, -1, false, false)).toBe(0);
+    expect(paneTabTarget(1, -1, true, false)).toBe(0);
+    expect(paneTabTarget(1, 0, false, true)).toBe(0);
+    expect(paneTabTarget(1, 0, true, true)).toBe(0);
+  });
+});
+
+describe('tabTargetWithin', () => {
+  function pane(): { container: HTMLElement; list: HTMLElement[]; mid: HTMLElement } {
+    const container = document.createElement('div');
+    container.tabIndex = -1;
+    container.innerHTML = '<button>A</button><div tabindex="-1" data-id="mid">prose</div><button>B</button>';
+    document.body.appendChild(container);
+    const list = [...container.querySelectorAll<HTMLElement>('button')];
+    return { container, list, mid: container.querySelector<HTMLElement>('[data-id="mid"]')! };
+  }
+
+  afterEach(() => { document.body.innerHTML = ''; });
+
+  it('steps from the focused container itself to its first or last control', () => {
+    const { container, list } = pane();
+    expect(tabTargetWithin(container, list, container, false)).toBe(0);
+    expect(tabTargetWithin(container, list, container, true)).toBe(1);
+  });
+
+  it('steps from an unlisted element to its neighbour in document order', () => {
+    const { container, list, mid } = pane();
+    expect(tabTargetWithin(container, list, mid, false)).toBe(1);
+    expect(tabTargetWithin(container, list, mid, true)).toBe(0);
+  });
+
+  it('leaves in-between steps between listed controls native', () => {
+    const { container, list } = pane();
+    expect(tabTargetWithin(container, list, list[0], false)).toBeNull();
+  });
+});
+
+describe('shouldReconcilePaneFocus', () => {
+  it('pulls focus in when desktop, no overlay, and focus is outside the pane', () => {
+    expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: false, focusInsidePane: false })).toBe(true);
+  });
+
+  it('never steals a click\'s own focus — no-op when focus is already inside the pane', () => {
+    expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: false, focusInsidePane: true })).toBe(false);
+  });
+
+  it('no-op on mobile (panes are navigated, not focused)', () => {
+    expect(shouldReconcilePaneFocus({ mobile: true, overlayOpen: false, focusInsidePane: false })).toBe(false);
+  });
+
+  it('no-op while an overlay owns focus (overlayStack manages its own focus)', () => {
+    expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: true, focusInsidePane: false })).toBe(false);
+  });
+
+  it('any single blocking condition suppresses the pull-in', () => {
+    const combos = [
+      { mobile: true, overlayOpen: true, focusInsidePane: true },
+      { mobile: true, overlayOpen: false, focusInsidePane: false },
+      { mobile: false, overlayOpen: true, focusInsidePane: false },
+      { mobile: false, overlayOpen: false, focusInsidePane: true },
+    ];
+    for (const c of combos) expect(shouldReconcilePaneFocus(c)).toBe(false);
+  });
+});
+
+describe('navigationFocusTarget', () => {
+  const fake = (cls: string) => ({ cls, classList: { contains: (c: string) => c === cls } });
+
+  it('skips the explainer icon and lands on the row control behind it', () => {
+    const [icon, control] = [fake('explainer-btn'), fake('settings-option')];
+    expect(navigationFocusTarget([icon, control])).toBe(control);
+  });
+
+  it('takes the first control when the row has no explainer', () => {
+    const [first, second] = [fake('settings-option'), fake('action-btn')];
+    expect(navigationFocusTarget([first, second])).toBe(first);
+  });
+
+  it('falls back to the explainer when it is the only focusable', () => {
+    const icon = fake('explainer-btn');
+    expect(navigationFocusTarget([icon])).toBe(icon);
+  });
+
+  it('is undefined for a container with nothing focusable', () => {
+    expect(navigationFocusTarget([])).toBeUndefined();
+  });
+});
+
+describe('PANE_FOCUS_REGION', () => {
+  it('maps each pane to its scroll/keyboard-nav surface', () => {
+    expect(PANE_FOCUS_REGION.thread).toBe('.thread-view .thread-content');
+    expect(PANE_FOCUS_REGION.content).toBe('.content-pane-body');
+    expect(PANE_FOCUS_REGION.drawer).toBe('.thread-drawer-list > .thread-drawer-tree');
+  });
+});
+
+describe('focusIntoPane', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+    focusedPane.value = 'thread';
+  });
+
+  function threadPaneButton(): HTMLButtonElement {
+    document.body.innerHTML = `
+      <div class="thread-drawer"><button>See all</button></div>
+      <div class="pane-thread"><button data-id="thread">Option</button></div>`;
+    return document.querySelector('[data-id="thread"]')!;
+  }
+
+  it('moves the marker onto the pane that now holds focus', () => {
+    const button = threadPaneButton();
+    focusedPane.value = 'drawer';
+    focusIntoPane(button);
+    expect(document.activeElement).toBe(button);
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  it('leaves the marker alone when the element is outside every pane', () => {
+    threadPaneButton();
+    const loose = document.createElement('button');
+    document.body.appendChild(loose);
+    focusedPane.value = 'drawer';
+    focusIntoPane(loose);
+    expect(document.activeElement).toBe(loose);
+    expect(focusedPane.value).toBe('drawer');
+  });
+
+  it('leaves the marker alone when the element refuses focus', () => {
+    const button = threadPaneButton();
+    button.disabled = true;
+    focusedPane.value = 'drawer';
+    focusIntoPane(button);
+    expect(focusedPane.value).toBe('drawer');
+  });
+
+  it('is a no-op for a null target', () => {
+    focusedPane.value = 'drawer';
+    focusIntoPane(null);
+    expect(focusedPane.value).toBe('drawer');
+  });
+});
+
+describe('installPaneFocusTracking', () => {
+  let stop: (() => void) | null = null;
+
+  afterEach(() => {
+    stop?.();
+    stop = null;
+    document.body.innerHTML = '';
+    focusedPane.value = 'thread';
+  });
+
+  function panes(): { pin: HTMLButtonElement; menu: HTMLButtonElement } {
+    document.body.innerHTML = `
+      <div class="pane-thread"><button>Follow</button><textarea></textarea></div>
+      <div class="pane-content"><button data-id="pin">Pin</button><button data-id="menu">Actions</button></div>`;
+    for (const el of document.querySelectorAll<HTMLElement>('button, textarea')) stubVisible(el);
+    return {
+      pin: document.querySelector('[data-id="pin"]')!,
+      menu: document.querySelector('[data-id="menu"]')!,
+    };
+  }
+
+  it('moves the marker onto the pane that focus enters', () => {
+    const { pin } = panes();
+    stop = installPaneFocusTracking();
+    pin.focus();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('keeps a Tab from that focus inside its own pane', () => {
+    const { pin, menu } = panes();
+    stop = installPaneFocusTracking();
+    pin.focus();
+    expect(handlePaneTab(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(false);
+    expect(document.activeElement).toBe(pin);
+    menu.focus();
+    expect(handlePaneTab(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(true);
+    expect(document.activeElement).toBe(pin);
+  });
+
+  it('leaves the marker alone for focus outside every pane', () => {
+    panes();
+    stop = installPaneFocusTracking();
+    focusedPane.value = 'content';
+    const loose = document.createElement('button');
+    document.body.appendChild(loose);
+    loose.focus();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('ignores the refocus a returning window gives the retained element', () => {
+    const { pin, menu } = panes();
+    stop = installPaneFocusTracking();
+    pin.focus();
+    focusedPane.value = 'thread';
+    window.dispatchEvent(new FocusEvent('blur'));
+    pin.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    expect(focusedPane.value).toBe('thread');
+    menu.focus();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('stops tracking after cleanup', () => {
+    const { pin } = panes();
+    installPaneFocusTracking()();
+    pin.focus();
+    expect(focusedPane.value).toBe('thread');
+  });
+});
+
+describe('visibleFocusables', () => {
+  it('excludes a button inside an inert wrapper', () => {
+    const container = document.createElement('div');
+    const cover = document.createElement('div');
+    cover.setAttribute('inert', '');
+    const hidden = document.createElement('button');
+    stubVisible(hidden);
+    cover.appendChild(hidden);
+    container.appendChild(cover);
+
+    expect(visibleFocusables(container)).toEqual([]);
+  });
+
+  it('excludes an inert element itself, not just its descendants', () => {
+    const container = document.createElement('div');
+    const el = document.createElement('button');
+    el.setAttribute('inert', '');
+    stubVisible(el);
+    container.appendChild(el);
+
+    expect(visibleFocusables(container)).toEqual([]);
+  });
+
+  it('still includes an ordinary tabbable button', () => {
+    const container = document.createElement('div');
+    const button = document.createElement('button');
+    stubVisible(button);
+    container.appendChild(button);
+
+    expect(visibleFocusables(container)).toEqual([button]);
+  });
+
+  it('counts the container itself when it is a tab stop', () => {
+    const stop = document.createElement('div');
+    stop.tabIndex = 0;
+    stubVisible(stop);
+    const link = document.createElement('button');
+    stubVisible(link);
+    stop.appendChild(link);
+
+    expect(visibleFocusables(stop)).toEqual([stop, link]);
+  });
+
+  it('skips a container removed from the tab order', () => {
+    const pane = document.createElement('div');
+    pane.tabIndex = -1;
+    stubVisible(pane);
+    expect(visibleFocusables(pane)).toEqual([]);
+  });
+
+  it('excludes a laid-out control under visibility: hidden', () => {
+    const container = document.createElement('div');
+    container.style.visibility = 'hidden';
+    const button = document.createElement('button');
+    stubVisible(button);
+    container.appendChild(button);
+    document.body.appendChild(container);
+
+    expect(visibleFocusables(container)).toEqual([]);
+    container.remove();
+  });
+
+  it('includes summary, media controls and contenteditable', () => {
+    const container = document.createElement('div');
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    details.appendChild(summary);
+    const video = document.createElement('video');
+    video.controls = true;
+    const editable = document.createElement('div');
+    editable.setAttribute('contenteditable', 'true');
+    for (const el of [summary, video, editable]) stubVisible(el);
+    container.append(details, video, editable);
+
+    expect(visibleFocusables(container)).toEqual([summary, video, editable]);
+  });
+
+  it('a real control stays reachable beside an inert closed panel', () => {
+    const container = document.createElement('div');
+    const live = document.createElement('button');
+    stubVisible(live);
+    container.appendChild(live);
+
+    const cover = document.createElement('div');
+    cover.setAttribute('inert', '');
+    for (let i = 0; i < 3; i++) {
+      const radio = document.createElement('button');
+      stubVisible(radio);
+      cover.appendChild(radio);
+    }
+    container.appendChild(cover);
+
+    expect(visibleFocusables(container)).toEqual([live]);
+  });
+});
+
+const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+
+describe('focusPaneMainControl', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+    document.documentElement.removeAttribute('data-overlay-open');
+    focusedPane.value = 'thread';
+  });
+
+  it('moves the focus marker onto the pane it forces focus into, at once', () => {
+    document.body.innerHTML = '<div class="thread-drawer"><button>See all</button></div>';
+    stubVisible(document.querySelector<HTMLElement>('button')!);
+    focusedPane.value = 'content';
+    focusPaneMainControl('drawer');
+    expect(focusedPane.value).toBe('drawer');
+  });
+
+  it('lands in its pane even while an overlay still marks the page open', async () => {
+    document.body.innerHTML = '<div class="pane-content"><button data-id="pin">Pin</button></div>';
+    stubVisible(document.querySelector<HTMLElement>('button')!);
+    document.documentElement.setAttribute('data-overlay-open', '');
+    focusPaneMainControl('content');
+    await nextFrame();
+    expect(document.activeElement).toBe(document.querySelector('[data-id="pin"]'));
+  });
+
+  it('does not fall back to the prompt while a real thread transcript cannot take focus', async () => {
+    document.body.innerHTML = `
+      <div class="pane-thread"><div class="thread-view">
+        <div class="thread-content"></div>
+        <textarea data-role="prompt-input"></textarea>
+      </div></div>`;
+    for (const el of document.querySelectorAll<HTMLElement>('.thread-content, textarea')) stubVisible(el);
+    focusPaneMainControl('thread');
+    for (let i = 0; i < 40; i++) await nextFrame();
+    expect(document.activeElement).not.toBe(document.querySelector('[data-role="prompt-input"]'));
+  });
+});
+
+describe('handlePaneTab after a pane click', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+    focusedPane.value = 'thread';
+  });
+
+  it('cycles the focused pane, not the pane DOM focus is still in', () => {
+    document.body.innerHTML = `
+      <div class="pane-thread"><button data-id="thread">Option</button></div>
+      <div class="pane-content"><button data-id="pin">Pin</button><button data-id="menu">Actions</button></div>`;
+    for (const el of document.querySelectorAll<HTMLElement>('button')) stubVisible(el);
+    document.querySelector<HTMLElement>('[data-id="menu"]')!.focus();
+    focusedPane.value = 'thread';
+    expect(handlePaneTab(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(true);
+    expect(document.activeElement).toBe(document.querySelector('[data-id="thread"]'));
+  });
+});
+
+describe('PANE_FOCUS_REGION thread surface', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('matches a real thread transcript and never the compose view transcript', () => {
+    document.body.innerHTML = `
+      <div class="pane-thread"><div class="thread-content" data-id="compose"></div></div>
+      <div class="pane-thread"><div class="thread-view"><div class="thread-content" data-id="thread"></div></div></div>`;
+    expect(document.querySelector(PANE_FOCUS_REGION.thread))
+      .toBe(document.querySelector('[data-id="thread"]'));
+  });
+});

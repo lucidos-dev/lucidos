@@ -1,0 +1,424 @@
+
+import { describe, it, expect, vi } from 'vitest';
+import type { ComponentChildren, VNode } from 'preact';
+import { pickerFooter, type FooterMode, type PickerFooterProps } from '../PickerFooter';
+import type { WorkspaceStatus } from '../../../api/client/control';
+import { restoreBlocker, EMPTY_RESTORE_DRAFT, IDLE_RESTORE_UPLOAD, type RestoreDraft } from '../workspaceForms';
+import { EMPTY_REMOTE_GATEWAY_DRAFT, TRUST_NOTE } from '../../settings/remoteGatewayForm';
+
+function isClosedDisclosure(v: VNode<Record<string, unknown>>): boolean {
+  return typeof v.type === 'function' && v.type.name === 'Disclosure' && !v.props?.open;
+}
+
+function vnodeToText(node: ComponentChildren): string {
+  if (node === null || node === undefined || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(vnodeToText).join('');
+  const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
+  const tag =
+    typeof v.type === 'string' ? v.type : typeof v.type === 'function' ? v.type.name : '';
+  if (isClosedDisclosure(v)) return '';
+  const attrs = ['class', 'data-picked', 'aria-expanded', 'accept', 'disabled']
+    .filter((k) => v.props?.[k] !== undefined && v.props?.[k] !== false)
+    .map((k) => ` ${k}="${String(v.props[k])}"`)
+    .join('');
+  const inner = vnodeToText(v.props?.children);
+  return tag ? `<${tag}${attrs}>${inner}</${tag}>` : inner;
+}
+
+const NOOP = () => {};
+
+const REMOTE_DEFAULTS = {
+  remoteDraft: EMPTY_REMOTE_GATEWAY_DRAFT,
+  onRemoteDraft: NOOP,
+  onAddRemote: NOOP,
+  onCancelRemote: NOOP,
+  pairedRemote: null,
+  remoteAwaitingOwner: false,
+};
+
+function ws(id: string, name = id): WorkspaceStatus {
+  return { id, name, port: 5000, health: 'healthy', autostart: true };
+}
+
+function footer(over: Partial<PickerFooterProps> = {}): VNode {
+  const draft = over.draft ?? EMPTY_RESTORE_DRAFT;
+  return pickerFooter({
+      mode: 'none',
+      onMode: NOOP,
+      busy: false,
+      restoreRunning: false,
+      target: null,
+      targetBlocker: null,
+      name: '',
+      onName: NOOP,
+      onCreate: NOOP,
+      onCancelCreate: NOOP,
+      suggestions: ['personal', 'work'],
+      onSuggestion: NOOP,
+      createNote: null,
+      draft,
+      onDraft: NOOP,
+      onPickFile: NOOP,
+      restoreUpload: IDLE_RESTORE_UPLOAD,
+      onRestore: NOOP,
+      onCancelRestore: NOOP,
+      blocker: restoreBlocker(draft, []),
+      fileNote: null,
+      onDeleteColliding: NOOP,
+      ...REMOTE_DEFAULTS,
+      ...over,
+    });
+}
+
+function render(over: Partial<PickerFooterProps> = {}): string {
+  return vnodeToText(footer(over));
+}
+
+const MODES: FooterMode[] = ['none', 'create', 'restore', 'remote'];
+
+describe('both entry points are always on screen', () => {
+  it('renders New workspace AND Restore from backup in every mode', () => {
+    for (const mode of MODES) {
+      const text = render({ mode });
+      expect(text, `mode=${mode}`).toContain('+ New workspace');
+      expect(text, `mode=${mode}`).toContain('Restore from backup');
+      expect(text, `mode=${mode}`).toContain('Add a remote gateway');
+    }
+  });
+
+  it('marks the open one expanded and nothing else', () => {
+    expect(render({ mode: 'none' })).not.toContain('aria-expanded="true"');
+    expect(render({ mode: 'create' }).match(/aria-expanded="true"/g)).toHaveLength(1);
+    expect(render({ mode: 'restore' }).match(/aria-expanded="true"/g)).toHaveLength(1);
+  });
+
+  it('opens exactly one form at a time', () => {
+    expect(render({ mode: 'none' })).not.toContain('ws-picker-create');
+    expect(render({ mode: 'none' })).not.toContain('ws-picker-restore-form');
+    expect(render({ mode: 'create' })).not.toContain('ws-picker-restore-form');
+    expect(render({ mode: 'restore' })).not.toContain('<div class="ws-picker-create">');
+  });
+
+  it('disables the restore entry point while one is already running', () => {
+    expect(render({ mode: 'none', restoreRunning: true })).toContain('disabled="true"');
+  });
+});
+
+describe('the quick-fill chips', () => {
+  it('offers them while the name field is empty', () => {
+    const text = render({ mode: 'create' });
+    expect(text).toContain('ws-picker-suggestions-label');
+    expect(text).toContain('personal');
+  });
+
+  it('drops the whole row, label included, when there are none', () => {
+    const text = render({ mode: 'create', suggestions: [] });
+    expect(text).not.toContain('ws-picker-suggestions');
+    expect(text).toContain('ws-picker-input');
+  });
+
+  it('hides them once the user types a name', () => {
+    expect(render({ mode: 'create', name: 'fresh' })).not.toContain('ws-picker-suggestions');
+  });
+});
+
+describe('the restore form explains itself', () => {
+  const ready: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'fresh' };
+
+  it('says what is missing whenever Restore is disabled', () => {
+    const text = render({ mode: 'restore' });
+    expect(text).toContain('Choose the .age or .enc backup file to restore.');
+  });
+
+  it('drops the hint and enables Restore once the draft is complete', () => {
+    const text = render({ mode: 'restore', draft: ready });
+    expect(text).not.toContain('ws-picker-note');
+    expect(text).not.toContain('<button class="ws-picker-btn ws-picker-btn-confirm" disabled="true">');
+  });
+
+  it('labels its fields instead of relying on placeholders alone', () => {
+    const text = render({ mode: 'restore' });
+    for (const label of ['Backup file', 'Backup key', 'Workspace name']) {
+      expect(text).toContain(label);
+    }
+  });
+
+  it('never constrains the file input by extension', () => {
+    expect(render({ mode: 'restore' })).not.toContain('accept=');
+  });
+
+  it('picks the file through the shared off-screen input, not a display:none one', () => {
+    const text = render({ mode: 'restore' });
+    expect(text).toContain('<HiddenFileInput>');
+    expect(text).toMatch(/<label class="ws-picker-restore-drop[^"]*"[^>]*><HiddenFileInput>/);
+  });
+
+  it('marks a chosen file as chosen', () => {
+    expect(render({ mode: 'restore' })).toContain('data-picked="false"');
+    const picked = render({ mode: 'restore', draft: ready });
+    expect(picked).toContain('data-picked="true"');
+    expect(picked).toContain('b.enc');
+  });
+});
+
+describe('the restore button follows the upload, not the promise', () => {
+  const draft: RestoreDraft = { file: new File([], 'b.age'), key: 'k', name: 'myws' };
+
+  it('idle shows Restore and Cancel, with no progress bar', () => {
+    const text = render({ mode: 'restore', draft });
+    expect(text).toContain('>Restore</button>');
+    expect(text).toContain('>Cancel</button>');
+    expect(text).not.toContain('ProgressBar');
+  });
+
+  it('uploading shows the percentage, a progress bar and Cancel upload', () => {
+    const text = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'uploading', sentBytes: 1, totalBytes: 4 } });
+    expect(text).toContain('Uploading 25%');
+    expect(text).toContain('<ProgressBar>');
+    expect(text).toContain('>Cancel upload</button>');
+  });
+
+  it('a sent body shows Starting until the gateway answers', () => {
+    const text = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'starting' } });
+    expect(text).toContain('Starting…');
+    expect(text).not.toContain('<ProgressBar>');
+  });
+
+  it('a sent commit can no longer be cancelled', () => {
+    const starting = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'starting' } });
+    expect(starting).toMatch(/<button[^>]*disabled[^>]*>Cancel upload<\/button>/);
+    const uploading = render({ mode: 'restore', draft, busy: true, restoreUpload: { kind: 'uploading', sentBytes: 1, totalBytes: 4 } });
+    expect(uploading).not.toMatch(/<button[^>]*disabled[^>]*>Cancel upload<\/button>/);
+  });
+});
+
+describe('a collision offers the workspace holding the address', () => {
+  const renamed = [ws('personal', 'personaal')];
+  const colliding: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'personal' };
+
+  it('names the visible workspace and offers to delete THAT one', () => {
+    const text = render({
+      mode: 'restore',
+      draft: colliding,
+      blocker: restoreBlocker(colliding, renamed),
+    });
+    expect(text).toContain('/personal/');
+    expect(text).toContain('Delete “personaal”…');
+    expect(text).not.toContain('“personal” already exists');
+  });
+
+  it('hands the delete back by id, for the row confirm to take over', () => {
+    const onDeleteColliding = vi.fn();
+    const node = pickerFooter({
+      mode: 'restore',
+      onMode: NOOP,
+      busy: false,
+      restoreRunning: false,
+      target: null,
+      targetBlocker: null,
+      name: '',
+      onName: NOOP,
+      onCreate: NOOP,
+      onCancelCreate: NOOP,
+      suggestions: [],
+      onSuggestion: NOOP,
+      createNote: null,
+      draft: colliding,
+      onDraft: NOOP,
+      onPickFile: NOOP,
+      restoreUpload: IDLE_RESTORE_UPLOAD,
+      onRestore: NOOP,
+      onCancelRestore: NOOP,
+      blocker: restoreBlocker(colliding, renamed),
+      fileNote: null,
+      onDeleteColliding,
+      ...REMOTE_DEFAULTS,
+    });
+    const button = findButton(node, 'Delete');
+    (button?.props as { onClick?: () => void }).onClick?.();
+    expect(onDeleteColliding).toHaveBeenCalledWith('personal');
+    expect(onDeleteColliding).toHaveBeenCalledTimes(1);
+  });
+});
+
+function findSubmittingInput(node: ComponentChildren): VNode<Record<string, unknown>> | null {
+  if (node === null || node === undefined || typeof node !== 'object') return null;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findSubmittingInput(child);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
+  if (isClosedDisclosure(v)) return null;
+  if (v.type === 'input' && typeof v.props?.onKeyDown === 'function') return v;
+  return findSubmittingInput(v.props?.children);
+}
+
+function findButton(node: ComponentChildren, label: string): VNode<Record<string, unknown>> | null {
+  if (node === null || node === undefined || typeof node !== 'object') return null;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findButton(child, label);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
+  if (isClosedDisclosure(v)) return null;
+  if (v.type === 'button' && vnodeToText(v.props?.children).trim().startsWith(label)) return v;
+  return findButton(v.props?.children, label);
+}
+
+describe('a remote gateway picked in the switcher', () => {
+  it('names the gateway the footer acts on', () => {
+    const text = render({ target: 'lab' });
+    expect(text).toContain('+ New workspace on lab');
+    expect(text).toContain('Restore onto lab');
+    expect(text).toContain('Add a remote gateway');
+  });
+
+  it('disables New and Restore and says why when the gateway cannot act', () => {
+    const node = footer({ target: 'lab', targetBlocker: 'lab needs an update.' });
+    expect(findButton(node, '+ New workspace on lab')?.props.disabled).toBe(true);
+    expect(findButton(node, 'Restore onto lab')?.props.disabled).toBe(true);
+    expect(findButton(node, 'Add a remote gateway')?.props.disabled).toBeFalsy();
+    expect(render({ target: 'lab', targetBlocker: 'lab needs an update.' })).toContain('lab needs an update.');
+  });
+
+  it('offers no delete for a name taken on the remote gateway', () => {
+    const taken = [ws('personal', 'personaal')];
+    const colliding: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'personal' };
+    const text = render({
+      mode: 'restore',
+      target: 'lab',
+      draft: colliding,
+      blocker: restoreBlocker(colliding, taken),
+      onDeleteColliding: null,
+    });
+    expect(text).toContain('/personal/');
+    expect(text).not.toContain('Delete “personaal”…');
+  });
+});
+
+describe('Enter cannot do what the button refuses', () => {
+  function pressEnter(over: Partial<PickerFooterProps>, onSubmit: () => void): boolean {
+    let fired = false;
+    const node = pickerFooter({
+      mode: 'none',
+      onMode: NOOP,
+      busy: false,
+      restoreRunning: false,
+      target: null,
+      targetBlocker: null,
+      name: '',
+      onName: NOOP,
+      onCreate: () => { fired = true; onSubmit(); },
+      onCancelCreate: NOOP,
+      suggestions: [],
+      onSuggestion: NOOP,
+      createNote: null,
+      draft: EMPTY_RESTORE_DRAFT,
+      onDraft: NOOP,
+      onPickFile: NOOP,
+      restoreUpload: IDLE_RESTORE_UPLOAD,
+      onRestore: () => { fired = true; onSubmit(); },
+      onCancelRestore: NOOP,
+      blocker: null,
+      fileNote: null,
+      onDeleteColliding: NOOP,
+      ...REMOTE_DEFAULTS,
+      ...over,
+    });
+    const input = findSubmittingInput(node);
+    (input?.props as { onKeyDown?: (e: unknown) => void }).onKeyDown?.({ key: 'Enter' });
+    return fired;
+  }
+
+  it('does not create a workspace whose name is already taken', () => {
+    const blocked = { message: 'You already have a workspace called “work”.', blocking: true };
+    expect(pressEnter({ mode: 'create', name: 'work', createNote: blocked }, NOOP)).toBe(false);
+    expect(pressEnter({ mode: 'create', name: '  ' }, NOOP)).toBe(false);
+    expect(pressEnter({ mode: 'create', name: 'fresh', busy: true }, NOOP)).toBe(false);
+    expect(pressEnter({ mode: 'create', name: 'fresh' }, NOOP)).toBe(true);
+  });
+
+  it('does not start a restore that is still blocked', () => {
+    const ready: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'fresh' };
+    const blocker = restoreBlocker(EMPTY_RESTORE_DRAFT, []);
+    expect(pressEnter({ mode: 'restore', draft: EMPTY_RESTORE_DRAFT, blocker }, NOOP)).toBe(false);
+    expect(pressEnter({ mode: 'restore', draft: ready, blocker: null }, NOOP)).toBe(true);
+  });
+});
+
+describe('the remote gateway form', () => {
+  const ready = { address: 'https://cloud.example.com', code: '12345678', name: 'cloud' };
+
+  it('holds Pair until every field is filled', () => {
+    const empty = render({ mode: 'remote' });
+    expect(empty).toMatch(/<button class="ws-picker-btn ws-picker-btn-confirm" disabled="true">Pair/);
+    const full = render({ mode: 'remote', remoteDraft: ready });
+    expect(full).toMatch(/<button class="ws-picker-btn ws-picker-btn-confirm">Pair/);
+  });
+
+  it('says early that plain http will not pair', () => {
+    const text = render({ mode: 'remote', remoteDraft: { ...ready, address: 'http://cloud.example.com' } });
+    expect(text).toContain('https only');
+    expect(text).toMatch(/ws-picker-btn-confirm" disabled="true">Pair/);
+  });
+
+  it('warns to add only a gateway you run', () => {
+    expect(render({ mode: 'remote' })).toContain(TRUST_NOTE);
+  });
+
+  it('names the gateway it just paired with', () => {
+    expect(render({ mode: 'remote', pairedRemote: 'cloud' })).toContain('Paired with cloud.');
+  });
+
+  it('does not send on Enter while a field is empty', () => {
+    let sent = 0;
+    const press = (remoteDraft: typeof ready) => {
+      const node = pickerFooter({
+        ...propsFor('remote'),
+        remoteDraft,
+        onAddRemote: () => { sent += 1; },
+      });
+      const input = findSubmittingInput(node);
+      (input?.props as { onKeyDown?: (e: unknown) => void }).onKeyDown?.({ key: 'Enter' });
+    };
+    press({ ...ready, code: '' });
+    expect(sent).toBe(0);
+    press(ready);
+    expect(sent).toBe(1);
+  });
+});
+
+function propsFor(mode: FooterMode): PickerFooterProps {
+  return {
+    mode,
+    onMode: NOOP,
+    busy: false,
+    restoreRunning: false,
+    target: null,
+    targetBlocker: null,
+    name: '',
+    onName: NOOP,
+    onCreate: NOOP,
+    onCancelCreate: NOOP,
+    suggestions: [],
+    onSuggestion: NOOP,
+    createNote: null,
+    draft: EMPTY_RESTORE_DRAFT,
+    onDraft: NOOP,
+    onPickFile: NOOP,
+    restoreUpload: IDLE_RESTORE_UPLOAD,
+    onRestore: NOOP,
+    onCancelRestore: NOOP,
+    blocker: null,
+    fileNote: null,
+    onDeleteColliding: NOOP,
+    ...REMOTE_DEFAULTS,
+  };
+}

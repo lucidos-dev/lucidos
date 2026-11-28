@@ -1,0 +1,217 @@
+
+:root {
+    --system-status-dot: 0.5rem;
+    --system-status-gap: 0.5rem;
+    --system-status-pad-bottom: 0.625rem;
+}
+
+.system-status-row {
+    display: flex;
+    align-items: center;
+    gap: var(--system-status-gap);
+    padding: 0.25rem 0 var(--system-status-pad-bottom);
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.system-status-row.has-note {
+    padding-bottom: 0;
+}
+
+.system-status-row .status-dot {
+    width: var(--system-status-dot);
+    height: var(--system-status-dot);
+}
+
+@keyframes status-dot-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+.system-status-row .status-dot.disconnected {
+    animation: status-dot-blink 0.6s ease-in-out infinite;
+}
+
+:root[data-motion="reduce"] .system-status-row .status-dot.disconnected {
+    animation: none;
+}
+
+.system-status-note {
+    margin: 0;
+    padding: 0 0 var(--system-status-pad-bottom) calc(var(--system-status-dot) + var(--system-status-gap));
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+    color: var(--text-secondary);
+}
+
+.system-info-list {
+    display: grid;
+    grid-template-columns: 9rem minmax(0, 1fr);
+    align-items: baseline;
+    row-gap: var(--space-xs);
+    column-gap: var(--space-lg);
+    padding: var(--space-sm) var(--space-md);
+}
+
+@media (--phone-layout) {
+    .system-info-list {
+        grid-template-columns: max-content minmax(0, 1fr);
+    }
+}
+
+.system-info-row {
+    display: contents;
+}
+
+.system-info-label {
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+}
+
+.system-info-value {
+    min-width: 0;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    overflow-wrap: anywhere;
+}
+
+.system-info-long {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.system-api-url {
+    background: none;
+    border: none;
+    padding: 0;
+    justify-self: start;
+    text-align: left;
+}
+
+.system-update {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.system-footnote {
+    margin-top: 0.5rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+}
+
+.system-notice {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    font-weight: 600;
+    padding: 0.5rem 0.625rem;
+    margin-bottom: 0.625rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) / 3);
+    line-height: 1.4;
+}
+
+.system-guidance {
+    background: none;
+    font-weight: 400;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    padding: 0 0.625rem;
+}
+
+.system-update-progress {
+    margin-top: 0.5rem;
+}
+
+.install-live {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.system-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.system-page .system-actions {
+    padding-top: var(--space-sm);
+}
+
+.coding-agent-row-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.coding-agent-row-controls .device-name-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.coding-agent-row-controls .list-row-actions {
+    flex-shrink: 0;
+    flex-wrap: nowrap;
+}
+
+.update-address-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-xs);
+}
+
+.update-address-row > .settings-row-label {
+    padding-top: 0;
+    flex: none;
+}
+
+.update-address-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.update-address-input {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-mono);
+}
+
+.update-channel-segment {
+    display: inline-flex;
+    align-items: center;
+    padding-right: 0.5rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+}
+.update-channel-segment.active {
+    background: var(--bg-secondary);
+}
+.update-channel-segment .segmented-btn {
+    padding-right: 0;
+}
+.update-channel-fold {
+    display: flex;
+    align-items: center;
+    margin-top: var(--space-sm);
+}
+.update-channel-fold .settings-disclosure-toggle {
+    margin-top: 0;
+}
+.update-channel-fields {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    width: 100%;
+}
+.update-channel-fields input {
+    flex: 1 1 12rem;
+    min-width: 0;
+}
+.update-channel-url {
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+}

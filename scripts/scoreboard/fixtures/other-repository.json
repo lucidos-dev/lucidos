@@ -1,0 +1,15 @@
+{
+  "description": "Another repository's factory. Its map adds a Review stage, entered by its own ReviewStarted domain event. It has no Hardening. Its change refreshes the frontend, so Live is the served frontend's commit.",
+  "observed_at": "2026-11-02T12:00:00Z",
+  "events": [
+    {"seq": 0, "at": "2026-11-02T08:59:00Z", "type": "ServedFrontendCommitChanged", "thread": null, "data": {"source_commit": "0000000000"}},
+    {"seq": 1, "at": "2026-11-02T09:00:00Z", "type": "PlanStarted", "thread": "thread-a", "data": {"kind": "implementation"}},
+    {"seq": 2, "at": "2026-11-02T09:05:00Z", "type": "PlanProposed", "thread": "thread-a", "data": {"kind": "implementation"}},
+    {"seq": 3, "at": "2026-11-02T09:15:00Z", "type": "PlanApproved", "thread": "thread-a", "data": {"kind": "implementation", "scope": "implement", "branch_name": "feature"}},
+    {"seq": 4, "at": "2026-11-02T10:00:00Z", "type": "ReviewStarted", "thread": "thread-a", "data": {"reviewer": "example-bot"}},
+    {"seq": 5, "at": "2026-11-02T10:20:00Z", "type": "ChangeProposed", "thread": "thread-a", "data": {"change_id": "change-a", "content": "code", "requires_restart": false}},
+    {"seq": 6, "at": "2026-11-02T10:50:00Z", "type": "ChangeApplyRequested", "thread": "thread-a", "data": {"change_id": "change-a", "branch_name": "feature", "repo_root": "/example/repository"}},
+    {"seq": 7, "at": "2026-11-02T10:52:00Z", "type": "ChangeApplied", "thread": "thread-a", "data": {"change_id": "change-a", "content": "code", "requires_restart": false, "client_update": true, "post_merge_sha": "1111111111111111111111111111111111111111", "landing_merge_sha": "1111111111111111111111111111111111111111"}},
+    {"seq": 8, "at": "2026-11-02T10:54:00Z", "type": "ServedFrontendCommitChanged", "thread": null, "data": {"source_commit": "1111111111111111111111111111111111111111"}}
+  ]
+}

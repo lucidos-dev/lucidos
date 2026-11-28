@@ -1,0 +1,137 @@
+.backup-health-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.625rem;
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-surface) * 0.5);
+    background: var(--bg-primary);
+    font-size: var(--font-size-sm);
+}
+
+.backup-health-line {
+    color: var(--text-primary);
+}
+
+.backup-health-ok {
+    color: var(--text-muted);
+}
+
+.backup-health-success {
+    color: var(--accent-green);
+}
+
+.backup-health-error {
+    color: var(--accent-red);
+}
+
+.backup-health-muted {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+
+.backup-health-card[data-state="stale"] {
+    background: color-mix(in srgb, var(--accent-yellow) 8%, var(--bg-primary));
+}
+
+.backup-health-card[data-state="error"] {
+    background: color-mix(in srgb, var(--accent-red) 8%, var(--bg-primary));
+}
+
+.backup-health-warn {
+    color: var(--accent-yellow);
+    font-weight: 600;
+}
+
+.backup-folder-link-row {
+    margin-bottom: 0.75rem;
+    font-size: var(--font-size-xs);
+}
+
+.backup-blocked-state {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-sm);
+    font-size: var(--font-size-sm);
+    color: var(--accent-red);
+}
+
+.backup-actions-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: var(--space-xs);
+}
+
+.backup-key {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin-top: var(--space-lg);
+}
+
+.backup-key-status {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+.backup-key-status[data-state="warn"] {
+    color: var(--accent-yellow);
+}
+
+.backup-key-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+    flex-wrap: wrap;
+}
+
+.backup-key-step {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.backup-key-note {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.backup-key-input {
+    min-width: 0;
+    width: 100%;
+    font-family: var(--font-mono);
+}
+
+.backup-key-reveal {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-sm) var(--space-sm) var(--space-md);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
+    background: var(--bg-secondary);
+}
+
+.backup-key-copy {
+    margin-left: auto;
+}
+
+.backup-key-value {
+    font-size: var(--font-size-xs);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    user-select: all;
+    overflow-wrap: anywhere;
+}
+
+.backup-key-warning {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    color: var(--accent-red);
+}

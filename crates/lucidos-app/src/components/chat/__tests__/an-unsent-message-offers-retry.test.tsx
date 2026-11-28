@@ -1,0 +1,137 @@
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { render } from 'preact';
+import { act } from 'preact/test-utils';
+import { ChatExchange } from '../ChatExchange';
+import type { StoredEvent } from '../../../store/thread-events';
+import { makeExchange } from '../../../store/__tests__/fixtures';
+import { unsentMessages } from '../../../store/unsentMessages';
+
+const TS = '2026-01-01T12:00:00Z';
+let host: HTMLDivElement;
+
+beforeEach(() => {
+  host = document.createElement('div');
+  document.body.appendChild(host);
+  unsentMessages.value = new Map();
+});
+
+afterEach(() => {
+  act(() => { render(null, host); });
+  host.remove();
+  unsentMessages.value = new Map();
+});
+
+function mountFailed(userSeq: number, unsent = userSeq < 0): HTMLElement | null {
+  const exchange = {
+    ...makeExchange(
+      { type: 'MessageReceived', text: 'hello', mode: 'human', created: TS, _eventId: 'e-1', _unsent: unsent || undefined } as StoredEvent,
+      [{ seq: userSeq + 1, event: { type: 'ResponseFailed', error: 'no answer', created: TS, _unsent: unsent || undefined } as StoredEvent }],
+    ),
+    userSeq,
+  };
+  act(() => {
+    render(
+      <ChatExchange
+        exchange={exchange}
+        revision={0}
+        streamingBuffer=""
+        isLast={true}
+        threadId="tid"
+        threadIsCC={false}
+        sessionCodingAgent="claude-code"
+        threadIdle={true}
+        threadAwaitingAnswer={false}
+        threadCanceling={false}
+      />,
+      host,
+    );
+  });
+  return host.querySelector('.exchange-error');
+}
+
+describe('the failure card', () => {
+  it('reads Not sent and offers Retry for an unsent message', () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+    }]]);
+    const card = mountFailed(-2);
+    expect(card?.querySelector('strong')?.textContent).toBe('Not sent');
+    expect(card?.querySelector('button.exchange-error-retry')?.textContent?.trim()).toBe('Retry');
+    expect(card?.querySelector('button.exchange-error-discard')?.textContent?.trim()).toBe('Discard');
+  });
+
+  it('shows the input picker on a restored unsent message', async () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' },
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+      refusal: {
+        reason: 'hook_needs_input',
+        message: 'Choose a ticket',
+        input: {
+          hook: 'gate', argument: 'ticket', label: 'Ticket',
+          creation: { label: 'Ticket title', key: 'new:gate:ticket', max_bytes: 256 },
+          choices_timeout_secs: 15, choices: [],
+        },
+      },
+    }]]);
+    const card = mountFailed(-2);
+    expect(card?.querySelector('strong')?.textContent).toBe('Choose a value to send');
+    await vi.waitFor(() => expect(card?.querySelector('[aria-label="Ticket"]')).toBeTruthy());
+    expect(card?.querySelector('[aria-label="Ticket title"]')).toBeTruthy();
+    expect(card?.querySelector('button.exchange-error-retry')).toBeNull();
+  });
+
+  it('offers to return an overtaken hook input to the composer', async () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' },
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+      refusal: { reason: 'hook_input_overtaken', message: 'Another message started this thread.' },
+    }]]);
+    const card = mountFailed(-2);
+    await vi.waitFor(() => expect(card?.textContent).toContain('Return to composer'));
+    expect(card?.textContent).toContain('Another message started this thread.');
+    expect(card?.querySelector('button.exchange-error-retry')).toBeNull();
+  });
+
+  it('quotes the message it would retry, since live output can push the card far below its bubble', () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'Connection not good?', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+    }]]);
+    const card = mountFailed(-2);
+    expect(card?.querySelector('.exchange-error-quote')?.textContent).toBe('Connection not good?');
+  });
+
+  it('puts Retry, the primary action, last in the row', () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+    }]]);
+    const buttons = [...(mountFailed(-2)?.querySelectorAll('.exchange-error-actions button') ?? [])];
+    expect(buttons.map((b) => b.textContent?.trim())).toEqual(['Discard', 'Retry']);
+  });
+
+  it('keeps the failed-reply card for a turn the engine recorded', () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+    }]]);
+    const card = mountFailed(10);
+    expect(card?.querySelector('strong')?.textContent).toBe('The reply failed');
+    expect(card?.querySelector('button')).toBeNull();
+  });
+});

@@ -1,0 +1,824 @@
+use axum::{
+    extract::{Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::diff::{parse_diff_output, DiffFile, RepoDiff};
+use super::{ApiError, AppState};
+use crate::core::changes::ChangeStatusData;
+use crate::core::repositories::{Repository, RepositoryStore};
+
+pub async fn list_repositories(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Repository>>, (StatusCode, String)> {
+    read_repositories(&state).await.map(Json)
+}
+
+pub(super) async fn read_repositories(
+    state: &AppState,
+) -> Result<Vec<Repository>, (StatusCode, String)> {
+    RepositoryStore::list(&state.pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list repositories: {}", e),
+        )
+    })
+}
+
+#[derive(Deserialize)]
+pub struct AddRepositoryRequest {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+pub async fn add_repository(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AddRepositoryRequest>,
+) -> Result<(StatusCode, Json<Repository>), (StatusCode, String)> {
+    let expanded_path = crate::core::home_path::expand(&req.path);
+
+    let path = std::path::Path::new(&expanded_path);
+    require_public_repo(&state.workspace_path, path).map_err(|e| (e.status, e.message))?;
+    if !path.exists() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Path does not exist: {}", expanded_path),
+        ));
+    }
+
+    let git_check = tokio::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(path)
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to check git repo: {}", e),
+            )
+        })?;
+
+    if !git_check.status.success() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Not a git repository: {}", expanded_path),
+        ));
+    }
+
+    let root_commit_sha = crate::engine::git_ops::root_commit_sha(path).await;
+
+    let actor = Some(
+        crate::api::actor::require_user_actor(&headers, &state.pool, None)
+            .await
+            .map_err(|e| (e.status, e.message))?,
+    );
+    let repo = RepositoryStore::register(
+        &state.pool,
+        &state.engine.event_bus,
+        &req.name,
+        &expanded_path,
+        req.description.as_deref(),
+        root_commit_sha.as_deref(),
+        actor,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            format!("Failed to add repository: {}", e),
+        )
+    })?;
+
+    Ok((StatusCode::CREATED, Json(repo)))
+}
+
+pub async fn remove_repository(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None)
+        .await
+        .map_err(|e| (e.status, e.message))?;
+    match RepositoryStore::unregister(&state.pool, &state.engine.event_bus, id, Some(actor)).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "Repository not found".to_string())),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to remove repository: {}", e),
+        )),
+    }
+}
+
+fn require_public_repo(
+    workspace: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<(), ApiError> {
+    use lucidos_home::private;
+    let effective =
+        private::effective_paths(workspace).map_err(|e| ApiError::internal(e.to_string()))?;
+    if effective
+        .configured
+        .iter()
+        .any(|path| private::overlaps(path, root))
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "This repository overlaps a private path.",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct RepoFilesQuery {
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+}
+
+pub async fn list_repo_files(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Query(query): Query<RepoFilesQuery>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let repo = RepositoryStore::get(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "Repository not found".into()))?;
+
+    require_public_repo(&state.workspace_path, std::path::Path::new(&repo.path))
+        .map_err(|e| (e.status, e.message))?;
+    let git_ref = query.git_ref.as_deref().unwrap_or("HEAD");
+
+    if super::is_dangerous_git_ref(git_ref) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid ref".into()));
+    }
+
+    let output = crate::engine::git_ops::git_cmd(
+        &["ls-tree", "-r", "--name-only", git_ref],
+        std::path::Path::new(&repo.path),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("git ls-tree failed: {stderr}"),
+        ));
+    }
+
+    let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+
+    Ok(Json(files))
+}
+
+#[derive(Deserialize)]
+pub struct RepoFileQuery {
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    pub path: String,
+}
+
+pub async fn get_repo_file(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Query(query): Query<RepoFileQuery>,
+) -> Response {
+    let repo = match RepositoryStore::get(&state.pool, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Repository not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
+        }
+    };
+
+    if let Err(error) = require_public_repo(&state.workspace_path, std::path::Path::new(&repo.path))
+    {
+        return error.into_response();
+    }
+    git_show_file(
+        std::path::Path::new(&repo.path),
+        query.git_ref.as_deref().unwrap_or("HEAD"),
+        &query.path,
+    )
+    .await
+}
+
+const REPO_DOCUMENT_CSP: &str = "sandbox";
+
+async fn git_show_file(repo_root: &std::path::Path, git_ref: &str, path: &str) -> Response {
+    if crate::core::is_path_traversal(path) {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+    if super::is_dangerous_git_ref(git_ref) {
+        return (StatusCode::BAD_REQUEST, "Invalid ref").into_response();
+    }
+
+    let object = format!("{git_ref}:{path}");
+    let output = match crate::engine::git_ops::git_cmd(&["show", &object], repo_root).await {
+        Ok(o) => o,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    if !output.status.success() {
+        return (StatusCode::NOT_FOUND, "File not found at ref").into_response();
+    }
+
+    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    let content_type = super::content_type_for_ext(&ext);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if super::file_response::is_active_document(content_type) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(REPO_DOCUMENT_CSP),
+        );
+    }
+    (headers, output.stdout).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RepoDiffQuery {
+    pub branch: String,
+}
+
+pub async fn get_repo_diff(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Query(query): Query<RepoDiffQuery>,
+) -> Result<Json<RepoDiff>, (StatusCode, String)> {
+    let repo = RepositoryStore::get(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "Repository not found".into()))?;
+
+    require_public_repo(&state.workspace_path, std::path::Path::new(&repo.path))
+        .map_err(|e| (e.status, e.message))?;
+    if super::is_dangerous_git_ref(&query.branch) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
+    }
+
+    let base = crate::engine::git_ops::default_diff_base(std::path::Path::new(&repo.path)).await;
+    let range = format!("{}...{}", base, query.branch);
+    let output = crate::engine::git_ops::git_cmd(
+        &["diff", &range, "--no-color"],
+        std::path::Path::new(&repo.path),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("git diff failed: {stderr}"),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files = parse_diff_output(&stdout);
+
+    Ok(Json(RepoDiff { files }))
+}
+
+fn discarded_change_has_no_diff(id: Uuid) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("Change {id} was discarded, so it has no merge to show"),
+    )
+}
+
+pub async fn get_change_diff(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<RepoDiff>, (StatusCode, String)> {
+    let change = state
+        .engine
+        .changes()
+        .get_by_id(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "Change not found".into()))?;
+
+    let repo_root = std::path::Path::new(&change.repo_root);
+    require_public_repo(&state.workspace_path, repo_root).map_err(|e| (e.status, e.message))?;
+    let range = match &change.state {
+        ChangeStatusData::Pending { .. }
+        | ChangeStatusData::SetAside
+        | ChangeStatusData::Withdrawn => {
+            if super::is_dangerous_git_ref(&change.branch_name) {
+                return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
+            }
+            let base = crate::engine::git_ops::default_diff_base(repo_root).await;
+            format!("{}...{}", base, change.branch_name)
+        }
+        ChangeStatusData::Applied(shas) | ChangeStatusData::Reverted(shas) => {
+            let pre_sha = shas.pre.as_deref().ok_or((
+                StatusCode::BAD_REQUEST,
+                "No merge SHA recorded for this change: it was applied before SHA tracking was added"
+                    .into(),
+            ))?;
+            let post_sha = shas
+                .post
+                .as_deref()
+                .ok_or((StatusCode::BAD_REQUEST, "No post-merge SHA recorded".into()))?;
+            format!("{}..{}", pre_sha, post_sha)
+        }
+        ChangeStatusData::Discarded => return Err(discarded_change_has_no_diff(id)),
+    };
+
+    let pathspec = match change.thread_id {
+        Some(thread_id) => lookup_app_pathspec(&state.pool, thread_id).await?,
+        None => None,
+    };
+    let files = run_git_diff(repo_root, &range, pathspec.as_deref()).await?;
+    Ok(Json(RepoDiff { files }))
+}
+
+#[derive(Serialize)]
+pub struct ThreadCcDiff {
+    pub files: Vec<DiffFile>,
+    pub repo_root: String,
+    pub branch_name: String,
+    pub base_ref: String,
+}
+
+pub async fn get_thread_cc_diff(
+    State(state): State<AppState>,
+    axum::extract::Path(thread_id): axum::extract::Path<Uuid>,
+) -> Result<Json<ThreadCcDiff>, (StatusCode, String)> {
+    let app_pathspec = lookup_app_pathspec(&state.pool, thread_id).await?;
+    let live_worktree = {
+        let sessions = state.engine.agent_sessions.lock().await;
+        live_thread_worktree(sessions.get(&thread_id))
+    };
+    if let Some(worktree_path) = resolve_diff_worktree(
+        &state.pool,
+        thread_id,
+        live_worktree,
+        state.engine.workspace_path(),
+    )
+    .await
+    {
+        return diff_via_worktree(
+            &state.workspace_path,
+            &worktree_path,
+            app_pathspec.as_deref(),
+        )
+        .await
+        .map(Json);
+    }
+    diff_via_branch_ref(&state, thread_id, app_pathspec.as_deref())
+        .await
+        .map(Json)
+}
+
+pub(in crate::api) fn live_thread_worktree(
+    session: Option<&crate::engine::types::AgentSession>,
+) -> Option<std::path::PathBuf> {
+    use crate::engine::types::ConflictBinding;
+    session
+        .filter(|s| !matches!(s.conflict, Some(ConflictBinding::Detached { .. })))
+        .and_then(|s| s.worktree_path.clone())
+}
+
+pub(in crate::api) async fn resolve_diff_worktree(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    live_session: Option<std::path::PathBuf>,
+    workspace_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = live_session.filter(|p| p.exists()) {
+        return Some(path);
+    }
+    if let Some(path) = crate::engine::session_queries::lookup_latest_worktree_path(pool, thread_id)
+        .await
+        .filter(|p| p.exists())
+    {
+        return Some(path);
+    }
+    if !thread_owns_a_coding_agent_worktree(pool, thread_id).await {
+        return None;
+    }
+    let deterministic =
+        crate::engine::session_queries::deterministic_worktree_path(workspace_path, thread_id);
+    deterministic.exists().then_some(deterministic)
+}
+
+async fn thread_owns_a_coding_agent_worktree(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        crate::log_legacy!(
+            "[Repositories] Failed to check thread {} is a coding-agent thread: {}",
+            thread_id,
+            e
+        );
+        e
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+async fn lookup_app_pathspec(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT coding_agent_kind, coding_agent_folder FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        crate::log_legacy!(
+            "[Repositories] Failed to look up the app folder for thread {}: {}",
+            thread_id,
+            e
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to look up this thread's app folder: {e}"),
+        )
+    })?;
+    let Some((kind, folder)) = row else {
+        return Ok(None);
+    };
+    if kind.as_deref() != Some("app") {
+        return Ok(None);
+    }
+    let Some(app_id) = folder.as_deref().and_then(extract_app_id) else {
+        return Ok(None);
+    };
+    Ok(Some(format!("data/apps/{app_id}")))
+}
+
+fn extract_app_id(folder: &str) -> Option<String> {
+    let segments: Vec<&str> = folder.split('/').filter(|s| !s.is_empty()).collect();
+    let apps_idx = segments.iter().rposition(|s| *s == "apps")?;
+    if apps_idx == segments.len() - 1 {
+        return None;
+    }
+    if apps_idx == 0 || segments[apps_idx - 1] != "data" {
+        return None;
+    }
+    let id = segments[apps_idx + 1];
+    if id.is_empty() || id == "." || id == ".." {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+async fn diff_via_worktree(
+    workspace: &std::path::Path,
+    worktree_path: &std::path::Path,
+    pathspec: Option<&str>,
+) -> Result<ThreadCcDiff, (StatusCode, String)> {
+    let (branch_opt, base_ref, repo_root_res) = tokio::join!(
+        crate::engine::git_ops::worktree_current_branch(worktree_path),
+        crate::engine::git_ops::default_diff_base(worktree_path),
+        resolve_worktree_repo_root(worktree_path),
+    );
+    let branch_name = branch_opt.ok_or((
+        StatusCode::BAD_REQUEST,
+        "Worktree has detached HEAD — cannot diff".into(),
+    ))?;
+    let repo_root = repo_root_res
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "git worktree list returned no main worktree entry".into(),
+        ))?;
+
+    require_public_repo(workspace, std::path::Path::new(&repo_root))
+        .map_err(|e| (e.status, e.message))?;
+    require_public_repo(workspace, worktree_path).map_err(|e| (e.status, e.message))?;
+    let files = run_git_diff(worktree_path, &format!("{}...HEAD", base_ref), pathspec).await?;
+    Ok(ThreadCcDiff {
+        files,
+        repo_root,
+        branch_name,
+        base_ref,
+    })
+}
+
+async fn diff_via_branch_ref(
+    state: &AppState,
+    thread_id: Uuid,
+    pathspec: Option<&str>,
+) -> Result<ThreadCcDiff, (StatusCode, String)> {
+    let pool = &state.pool;
+    let (repo_id_str, branch_name) =
+        crate::engine::agent_session::resume::lookup_latest_session_repo_and_branch(
+            pool, thread_id,
+        )
+        .await
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "No worktree on disk for this thread, and its session recorded no \
+             repository to diff against instead"
+                .into(),
+        ))?;
+    if super::is_dangerous_git_ref(&branch_name) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
+    }
+    let repo_id = Uuid::parse_str(&repo_id_str).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SessionStarted.repo_id is not a UUID".into(),
+        )
+    })?;
+    let repo = RepositoryStore::get(pool, repo_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to look up repository: {e}"),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Worktree gone and recorded repository no longer registered".into(),
+        ))?;
+
+    let repo_root = std::path::PathBuf::from(&repo.path);
+    require_public_repo(&state.workspace_path, &repo_root).map_err(|e| (e.status, e.message))?;
+    let base_ref = crate::engine::git_ops::default_diff_base(&repo_root).await;
+    let branch_name =
+        resolve_recorded_branch(pool, thread_id, &repo_root, branch_name, &base_ref).await?;
+    let files = run_git_diff(
+        &repo_root,
+        &format!("{}...{}", base_ref, branch_name),
+        pathspec,
+    )
+    .await?;
+    Ok(ThreadCcDiff {
+        files,
+        repo_root: repo.path,
+        branch_name,
+        base_ref,
+    })
+}
+
+async fn resolve_recorded_branch(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    repo_root: &std::path::Path,
+    recorded: String,
+    base_ref: &str,
+) -> Result<String, (StatusCode, String)> {
+    if crate::engine::git_ops::local_branch_exists(repo_root, &recorded)
+        .await
+        .or_unknown(true)
+    {
+        return Ok(recorded);
+    }
+    let head_sha = match crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
+        pool, thread_id,
+    )
+    .await
+    {
+        crate::engine::agent_session::resume::IdleAnchor::Found(sha) => sha,
+        crate::engine::agent_session::resume::IdleAnchor::Absent => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Branch '{recorded}' no longer exists in this repository, and the thread \
+                     recorded no commit to locate its work by."
+                ),
+            ))
+        }
+        crate::engine::agent_session::resume::IdleAnchor::Unknown => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Branch '{recorded}' no longer exists in this repository, and the commit \
+                     that would locate its work could not be looked up. Try again."
+                ),
+            ))
+        }
+    };
+    let local_default = crate::engine::git_ops::default_local_branch(repo_root).await;
+    match crate::engine::git_ops::sole_branch_containing(
+        repo_root,
+        &head_sha,
+        &[base_ref, &local_default],
+    )
+    .await
+    {
+        Some(found) => {
+            crate::log_legacy!(
+                "[Repositories] Thread {} recorded branch '{}' is gone; diffing '{}', which contains its last commit",
+                thread_id,
+                recorded,
+                found
+            );
+            Ok(found)
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "Branch '{recorded}' no longer exists in this repository, and no single branch \
+                 contains this thread's last commit ({}). It was renamed and deleted, or its \
+                 work was never committed.",
+                &head_sha[..head_sha.floor_char_boundary(9)]
+            ),
+        )),
+    }
+}
+
+async fn run_git_diff(
+    cwd: &std::path::Path,
+    range: &str,
+    pathspec: Option<&str>,
+) -> Result<Vec<DiffFile>, (StatusCode, String)> {
+    let mut args: Vec<&str> = vec!["diff", range, "--no-color"];
+    if let Some(p) = pathspec {
+        args.push("--");
+        args.push(p);
+    }
+    let output = crate::engine::git_ops::git_cmd(&args, cwd)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !output.status.success() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    Ok(parse_diff_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+async fn resolve_worktree_repo_root(
+    worktree_path: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let output =
+        crate::engine::git_ops::git_cmd(&["worktree", "list", "--porcelain"], worktree_path)
+            .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree ").map(str::to_owned)))
+}
+
+#[derive(Deserialize)]
+pub struct ChangeFileQuery {
+    pub path: String,
+}
+
+pub async fn get_change_file(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Query(query): Query<ChangeFileQuery>,
+) -> Response {
+    let change = match state.engine.changes().get_by_id(id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Change not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
+        }
+    };
+
+    let repo_root = std::path::Path::new(&change.repo_root);
+    if let Err(error) = require_public_repo(&state.workspace_path, repo_root) {
+        return error.into_response();
+    }
+    let git_ref = match &change.state {
+        ChangeStatusData::Pending { .. }
+        | ChangeStatusData::SetAside
+        | ChangeStatusData::Withdrawn => change.branch_name.clone(),
+        ChangeStatusData::Applied(shas) | ChangeStatusData::Reverted(shas) => match shas
+            .post
+            .as_deref()
+        {
+            Some(sha) => sha.to_string(),
+            None => return (StatusCode::BAD_REQUEST, "No post-merge SHA recorded").into_response(),
+        },
+        ChangeStatusData::Discarded => return discarded_change_has_no_diff(id).into_response(),
+    };
+
+    git_show_file(repo_root, &git_ref, &query.path).await
+}
+
+#[derive(Deserialize)]
+pub struct BrowseQuery {
+    pub path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BrowseResult {
+    pub path: String,
+    pub directories: Vec<String>,
+    pub is_git_repo: bool,
+}
+
+fn is_dangerous_browse_path(path: &str) -> bool {
+    path.is_empty() || path.contains("..")
+}
+
+pub async fn browse_directories(
+    Query(query): Query<BrowseQuery>,
+) -> Result<Json<BrowseResult>, (StatusCode, String)> {
+    let raw_path = query.path.unwrap_or_else(|| "~".to_string());
+    let expanded = crate::core::home_path::expand(&raw_path);
+
+    if is_dangerous_browse_path(&expanded) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid path".into()));
+    }
+
+    let dir = std::path::Path::new(&expanded);
+    if !dir.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Not a directory: {}", expanded),
+        ));
+    }
+
+    let canonical = dir.canonicalize().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Cannot resolve path: {}", e),
+        )
+    })?;
+
+    let mut directories = Vec::new();
+    match std::fs::read_dir(&canonical) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if !name.starts_with('.') {
+                                directories.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Cannot read directory: {}", e),
+            ));
+        }
+    }
+
+    directories.sort_by_key(|a| a.to_lowercase());
+
+    let git_dir = canonical.join(".git");
+    let is_git_repo = git_dir.exists();
+
+    Ok(Json(BrowseResult {
+        path: canonical.to_string_lossy().to_string(),
+        directories,
+        is_git_repo,
+    }))
+}
+
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/repositories", get(list_repositories).post(add_repository))
+        .route("/browse-directories", get(browse_directories))
+        .route(
+            "/repositories/:id",
+            axum::routing::delete(remove_repository),
+        )
+        .route("/repositories/:id/files", get(list_repo_files))
+        .route("/repositories/:id/file", get(get_repo_file))
+        .route("/repositories/:id/diff", get(get_repo_diff))
+}
+
+#[cfg(test)]
+#[path = "repositories_tests.rs"]
+mod tests;

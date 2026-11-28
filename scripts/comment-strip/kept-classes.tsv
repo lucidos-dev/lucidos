@@ -1,0 +1,43 @@
+# The kept comment classes: every comment the strip leaves in place.
+# This file is their one definition. The stripper and both verifiers read it.
+#
+# Columns, tab-separated: class, kind, languages, pattern, why.
+#
+# kind:
+#   directive    a tool reads the comment. Only the matching comment stays.
+#   tool-block   a tool, or a rule that names the marker, reads the whole
+#                block. Every comment in it stays.
+#   prose        a reader must not break it. The whole block stays.
+#   clap-derive  the pattern names derive macros. A doc comment on an item
+#                that derives one is the item's --help text, and stays.
+#   macro-doc    a doc comment inside a macro's input stays, since the macro
+#                can read it. The pattern names the macros that only forward one.
+#   unsupported  a form no proof covers. A file that holds one is refused.
+#   typed-jsdoc  the pattern names a directive. In a file that holds it, every
+#                `/**` comment stays: the compiler reads it as a type.
+#
+# languages: a comma list of rust, ts and css. `ts` covers JavaScript too.
+#
+# pattern: matched against one comment, from its first character. A directive
+# or unsupported pattern sees each run of whitespace as one space. Keep it
+# valid for both Python `re` and `grep -E`: no backslash-letter escapes.
+# A clap-derive or macro-doc pattern must read `^(A|B)$`.
+ts-directive	directive	ts	^(//+|/[*]+) *@ts-(expect-error|ignore|nocheck|check)	tsc changes what it accepts
+vitest-environment	directive	ts	@vitest-environment	Vitest picks the test DOM from it
+jsx-pragma	directive	ts	^/[*]+ *@jsx	tsc picks the JSX factory or import source from it
+bundler-annotation	directive	ts	@vite-ignore|[@#]__PURE__|__NO_SIDE_EFFECTS__|[@#] ?sourceMappingURL|webpack[A-Z]|^/[*]!|@license|@preserve	a bundler or minifier reads it
+source-pragma	directive	ts,css	^(//|/[*])[#@] ?[A-Za-z]+=	a debugger or devtools reads it
+deprecation-tag	directive	ts	^/[*][*] *@deprecated	the TypeScript language service marks the symbol deprecated
+checked-js-types	typed-jsdoc	ts	^(//+|/[*]+) *@ts-check	tsc reads JSDoc as types in a file it checks
+doctest	tool-block	rust	^//[/!] *```(rust|compile_fail|should_panic|no_run)	rustdoc compiles the example as a test
+eslint-unread-form	unsupported	ts	^/[*]+ ?(eslint|globals?|exported) 	an ESLint block directive that no kept class or proof covers
+eslint-directive	directive	ts	^(//|/[*]+) *eslint-(disable|enable|env)	lint directive
+triple-slash-reference	directive	ts	^/// *<reference	type resolution
+prettier-ignore	directive	ts,css	^(//|/[*]+) *prettier-ignore	formatter directive
+coverage-ignore	directive	ts	^(//|/[*]+) *(v8|c8|istanbul) ignore	coverage directive
+clap-help	clap-derive	rust	^(Parser|Subcommand|Args|ValueEnum)$	clap prints the doc comment as --help text
+macro-input-doc	macro-doc	rust	^(thread_local|task_local|macro_rules)$	a macro can read a doc comment in its input
+safety-note	prose	rust	SAFETY:	states why an unsafe block is sound
+registry-pointer	prose	rust,ts,css	docs/temporary-measures[.]md	the route from a temporary measure to its registry row
+site-invariant	prose	rust,ts,css	^(//[/!]?|/[*][*!]?) *INVARIANT:	states what a reader must not break here
+best-effort-reason	tool-block	rust,ts,css	^(//[/!]?|/[*][*!]?) *BEST-EFFORT:	states why a failed best-effort write needs no toast and how the user still finds out

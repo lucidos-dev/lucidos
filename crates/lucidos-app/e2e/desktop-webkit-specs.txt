@@ -1,0 +1,20 @@
+# The specs the desktop-webkit project runs, one file name per line.
+# These are the transcript position specs that mean something without touch.
+# Desktop WebKit is the engine of the macOS app's WKWebView.
+# e2e/projectRules.ts and scripts/lib/e2e_projects.sh both read this file.
+deep-link-chevron-clearance-desktop.spec.ts
+deep-link-question-long-thread-all.spec.ts
+follow-disarms-while-streaming-desktop.spec.ts
+follow-toggle-floats-with-the-chevron-all.spec.ts
+keyboard-scroll-desktop.spec.ts
+scroll-memory-all.spec.ts
+scroll-return-holds-the-line-all.spec.ts
+steps-toggle-holds-the-reader-all.spec.ts
+thread-scroll-belongs-to-the-reader.spec.ts
+transcript-ends-where-its-content-ends-all.spec.ts
+transcript-native-scrollbar-holds-the-content-desktop.spec.ts
+transcript-reopens-on-the-same-row-all.spec.ts
+transcript-reopens-on-the-same-turn-all.spec.ts
+transcript-window-fills-the-pane-all.spec.ts
+turn-control-holds-the-reader-still-all.spec.ts
+turn-control-holds-what-you-pressed-all.spec.ts

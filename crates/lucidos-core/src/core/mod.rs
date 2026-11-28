@@ -1,0 +1,2252 @@
+pub mod agent_role;
+pub mod agent_sandbox;
+pub mod announced_surfaces;
+pub mod apps;
+pub mod artifact_writer;
+pub mod artifacts;
+pub mod aux_context_backfill;
+pub mod backup;
+pub mod base_path;
+pub mod blobs;
+pub mod changes;
+pub mod changes_projection;
+pub mod codegen;
+pub mod coding_agent;
+pub mod contained_path;
+pub mod credentials;
+pub mod data_prefixes;
+pub mod db_retry;
+pub mod device_presence;
+pub mod devices;
+pub mod draft_submission;
+pub mod email;
+pub mod environment_variables;
+pub mod event_hooks;
+pub mod event_subscription;
+pub mod events;
+pub mod fonts;
+pub mod git;
+pub mod git_auth;
+pub mod grants;
+pub mod handshake_approvals;
+pub mod hex;
+pub mod home_path;
+pub mod host_sleep;
+pub mod image_described_backfill;
+pub mod image_migration;
+pub mod intents;
+pub mod keep_awake;
+pub mod knowhow;
+pub mod mcp_servers;
+pub mod migration_marker;
+pub mod model_types;
+pub mod models;
+pub mod oauth;
+pub mod oauth_callback;
+pub mod oauth_registry;
+pub mod pinned_apps;
+pub mod plan_status;
+pub mod plugin_catalog_cache;
+pub mod plugin_marketplaces;
+pub mod plugin_media;
+pub mod plugins;
+pub mod preference_catalog;
+pub mod proxy_timeout_bounds;
+pub mod subprocess_origin;
+pub use preference_catalog as prefs;
+pub mod preferences;
+pub mod repositories;
+pub mod repository_lock;
+pub mod response_style;
+pub mod script_output;
+pub mod secret_reference;
+pub mod secret_store;
+pub mod shell;
+pub mod shipped_dir;
+pub mod slug;
+pub mod snapshot;
+pub mod store;
+pub mod subprocess_secrets;
+pub mod sweep_schedule;
+pub mod system_knowhow;
+pub mod system_widgets;
+pub mod technical_literacy;
+pub use lucidos_agent_sandbox::temp_dirs;
+pub mod themes;
+pub mod thread_folders;
+pub mod trigger_folder_grant;
+pub mod url_scope;
+pub mod user_dir;
+pub mod user_path;
+pub mod webhook_deliveries;
+pub mod webhook_ingress;
+pub mod webhook_probe_token;
+pub mod webhook_refusal;
+pub mod webhooks;
+pub mod workspace_fonts;
+
+use std::borrow::Cow;
+
+pub fn database_url() -> String {
+    boot_database().url.clone()
+}
+
+pub fn database_passfile() -> Option<&'static std::path::Path> {
+    boot_database().passfile.as_deref()
+}
+
+/// INVARIANT: Point `url` at the boot password file when it signs in with the boot
+/// password. A client tool then reads the file, and its environment holds no
+/// password.
+pub fn use_boot_passfile(url: &mut lucidos_pg_url::PgUrl) {
+    let Some(passfile) = database_passfile() else {
+        return;
+    };
+    let boot_password = lucidos_pg_url::PgUrl::parse(&database_url())
+        .ok()
+        .and_then(|boot| boot.password);
+    if url.password.is_some() && url.password == boot_password && url.passfile().is_none() {
+        let path = urlencoding::encode(&passfile.to_string_lossy()).into_owned();
+        url.params
+            .push((lucidos_pg_url::PASSFILE_PARAM.to_string(), path));
+    }
+}
+
+struct BootDatabase {
+    url: String,
+    passfile: Option<std::path::PathBuf>,
+    managed: bool,
+}
+
+pub const MANAGED_DATABASE_ENV: &str = "LUCIDOS_MANAGED_DATABASE";
+
+pub fn database_is_gateway_managed() -> bool {
+    boot_database().managed
+}
+
+impl BootDatabase {
+    fn from_env() -> Self {
+        let managed = std::env::var(MANAGED_DATABASE_ENV).as_deref() == Ok("1");
+        let raw = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://lucidos@localhost:5432/lucidos".to_string());
+        match lucidos_pg_url::inline_passfile(&raw) {
+            Ok((url, passfile)) => Self {
+                url,
+                passfile,
+                managed,
+            },
+            Err(e) => {
+                crate::log_legacy!("[Startup] DATABASE_URL names no usable password: {e}");
+                Self {
+                    url: raw,
+                    passfile: None,
+                    managed: false,
+                }
+            }
+        }
+    }
+}
+
+fn boot_database() -> &'static BootDatabase {
+    static BOOT: std::sync::LazyLock<BootDatabase> =
+        std::sync::LazyLock::new(BootDatabase::from_env);
+    &BOOT
+}
+
+/// INVARIANT: Load project settings without letting dotenv grant gateway provenance.
+pub fn load_database_environment() {
+    let managed = std::env::var_os(MANAGED_DATABASE_ENV);
+    let _ = dotenvy::dotenv();
+    match managed {
+        Some(value) => std::env::set_var(MANAGED_DATABASE_ENV, value),
+        None => std::env::remove_var(MANAGED_DATABASE_ENV),
+    }
+    scrub_database_url_from_process_env();
+}
+
+pub fn scrub_database_url_from_process_env() {
+    database_url();
+    std::env::remove_var("DATABASE_URL");
+    std::env::remove_var(MANAGED_DATABASE_ENV);
+}
+
+pub const LUCIDOS_DATABASE_URL: &str = "LUCIDOS_DATABASE_URL";
+
+static AGENT_DATABASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_agent_database_url(url: String) {
+    let _ = AGENT_DATABASE_URL.set(url);
+}
+
+/// INVARIANT: The `LUCIDOS_DATABASE_URL` pair for an agent-facing subprocess: coding-agent
+/// sessions, chat `run_bash` / `run_python`, scripts, triggers and background
+/// tasks. Nothing else gets it.
+///
+/// The command then names the variable, so the password never enters a
+/// persisted tool-call argv. `None` until boot set up the agent role: a
+/// subprocess never gets the engine's own role instead.
+pub fn lucidos_database_url_env() -> Option<(String, String)> {
+    AGENT_DATABASE_URL
+        .get()
+        .map(|url| (LUCIDOS_DATABASE_URL.to_string(), url.clone()))
+}
+
+/// INVARIANT: Convert a credential `service_name` or an OAuth provider name into the
+/// `{NAME}` segment of an injected env var (`CRED_{NAME}`, `OAUTH_{NAME}_…`):
+/// uppercased, with every character outside `[A-Z0-9_]` replaced by `_`.
+///
+/// Sanitizes by character CLASS, never a fixed list. A name like
+/// `CRED_OAUTH:GOOGLE` is a legal `environ` entry and an illegal shell
+/// identifier. Bash reads it as `$CRED_OAUTH` then a literal `:GOOGLE`, while
+/// Python still reaches it through `os.environ`. That silent asymmetry between
+/// two script runtimes is worse than either outcome alone.
+///
+/// No leading-digit guard: every caller prefixes `CRED_` or `OAUTH_`, so the
+/// full variable name always starts with a letter.
+///
+/// Non-ASCII collapses to `_` per `char`, so the result is always ASCII and
+/// the function never slices a multi-byte boundary.
+pub fn env_var_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let upper = c.to_ascii_uppercase();
+            if upper.is_ascii_alphanumeric() || upper == '_' {
+                upper
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub use lucidos_diagnostic_log::redaction::redact_postgres_secrets;
+
+pub(crate) fn mask_json_strings(
+    value: &mut serde_json::Value,
+    mask: &impl Fn(&str) -> Option<String>,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(masked) = mask(s) {
+                *s = masked;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                mask_json_strings(item, mask);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            mask_object_keys(map, mask);
+            for item in map.values_mut() {
+                mask_json_strings(item, mask);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// INVARIANT: Renames each key of `map` that `mask` changes.
+///
+/// Masked keys can collide with each other or with a plain key. A plain key
+/// keeps its name, and a masked one takes the first free `<masked> (n)`, so
+/// no value is dropped. Every masked entry leaves before any returns, so a
+/// new name never overwrites an entry still waiting to move.
+fn mask_object_keys(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    mask: &impl Fn(&str) -> Option<String>,
+) {
+    let renamed: Vec<(String, String)> = map
+        .keys()
+        .filter_map(|key| mask(key).map(|masked| (key.clone(), masked)))
+        .collect();
+    let moved: Vec<(String, serde_json::Value)> = renamed
+        .into_iter()
+        .filter_map(|(key, masked)| Some((masked, map.remove(&key)?)))
+        .collect();
+    let mut next_suffix: std::collections::HashMap<String, usize> = Default::default();
+    for (masked, value) in moved {
+        let key = if map.contains_key(&masked) {
+            let n = next_suffix.entry(masked.clone()).or_insert(2);
+            loop {
+                let candidate = format!("{masked} ({n})");
+                *n += 1;
+                if !map.contains_key(&candidate) {
+                    break candidate;
+                }
+            }
+        } else {
+            masked
+        };
+        map.insert(key, value);
+    }
+}
+
+/// INVARIANT: Recursively apply `redact_postgres_secrets` to every string inside a
+/// `serde_json::Value`, object keys included. Scrubs a tool call's `args`
+/// before they reach the event store or the SSE stream, since a Bash
+/// `command` can carry a hardcoded URL.
+///
+/// Hot path: every tool-call event walks every string. The `contains` guard
+/// short-circuits the regex and the allocation for any string that never
+/// mentions "postgres".
+pub fn redact_postgres_secrets_in_json(value: &mut serde_json::Value) {
+    mask_json_strings(value, &|s| {
+        if !s.contains("postgres") {
+            return None;
+        }
+        let redacted = redact_postgres_secrets(s);
+        (redacted != s).then_some(redacted)
+    });
+}
+
+pub use lucidos_diagnostic_log::redaction::{
+    redact_secret_bytes, redact_secret_values, MIN_REDACTABLE_SECRET_LEN, REDACTED_MARKER,
+};
+
+pub const DATA_DIR: &str = "data";
+pub const ARTIFACTS_DIR: &str = "data/artifacts";
+pub const APPS_DIR: &str = "data/apps";
+pub const KNOWHOW_DIR: &str = "data/knowhow";
+pub const TRIGGERS_DIR: &str = "data/triggers";
+
+pub const TMP_DIR: &str = ".lucidos/tmp";
+
+/// INVARIANT: Whether a normalized data path names a file inside [`TMP_DIR`]. Sibling of
+/// [`is_system_knowhow_path`]: the two together are the whole set of prefixes
+/// the file tools resolve outside `data/`, and both gate read-only enforcement.
+///
+/// Anchored on the path separator, so it answers `false` for the bare directory
+/// (`.lucidos/tmp`) and for a sibling that merely shares the prefix
+/// (`.lucidos/tmpfoo`). That matters because this predicate guards a security
+/// boundary: a plain `starts_with(TMP_DIR)` would be correct only as long as
+/// every caller normalized first, which is an invariant a future caller can
+/// silently break.
+pub fn is_tmp_path(data_path: &str) -> bool {
+    data_path
+        .strip_prefix(TMP_DIR)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+pub fn write_json_atomic(
+    path: &std::path::Path,
+    value: &impl serde::Serialize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("no parent directory for {}", path.display()))?;
+    std::fs::create_dir_all(dir)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer_pretty(&mut temp, value)?;
+    temp.write_all(b"\n")?;
+    temp.flush()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+pub use apps::{App, AppFiles, AppKind, AppManager, AppReveal, NewAppKind};
+pub use artifacts::{
+    is_build_output_file, is_build_output_path, is_vendored_path, list_searchable_data_files,
+    list_user_data_files, ArtifactManager, WriteAnnouncement, VENDORED_DIR_NAMES,
+};
+pub use credentials::{
+    credential_scope_covers, normalized_base_urls, AuthType, Credential, CredentialInfo,
+    CredentialStore,
+};
+pub use data_prefixes::{is_known_data_prefix, known_data_prefixes_text};
+pub use devices::DeviceStore;
+pub use email::{EmailAccount, EmailAccountInfo, EmailStore, MailPassword};
+pub use environment_variables::{
+    apply_to_subprocess_env, inherited_env_var, EnvironmentVariable, EnvironmentVariableStore,
+};
+pub use grants::{grants_dir, GrantFile};
+pub use intents::{Intent, IntentStore};
+pub use knowhow::{Knowhow, KnowhowDirs, KnowhowListDepth, KnowhowStore, KnowhowSummary};
+pub use oauth::{OAuthAccount, OAuthAccountInfo, OAuthStore};
+pub use oauth_registry::OAuthProviderRow;
+pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
+pub use shell::{command_shell, TaskOutcome};
+pub use subprocess_secrets::{
+    argv_secret_values, inherited_secret_env, is_secret_env_name, redact_argv,
+    redact_subprocess_output, redact_subprocess_output_in_json, subprocess_secret_values,
+    InheritedSecretEnv, InheritedSecrets,
+};
+pub use system_knowhow::{is_system_knowhow_path, resolve_system_knowhow_dir, SystemKnowhowStore};
+pub use system_widgets::{resolve_system_widgets_dir, BUILT_IN_WIDGET_PREFIX};
+
+pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
+    log_legacy!("[Migration] Checking for legacy prompts/ directories...");
+    let data_dir = workspace.join(DATA_DIR);
+
+    let top_prompts = data_dir.join("prompts");
+    if top_prompts.is_dir() {
+        let triggers_dir = data_dir.join("triggers");
+        match std::fs::read_dir(&top_prompts) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                        continue;
+                    }
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let dest_dir = triggers_dir.join(stem);
+                        if dest_dir.exists() {
+                            continue;
+                        }
+                        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+                            log_legacy!(
+                                "[Migration] Failed to create {}: {}",
+                                dest_dir.display(),
+                                e
+                            );
+                            continue;
+                        }
+                        let dest = dest_dir.join(entry.file_name());
+                        if let Err(e) = std::fs::rename(&path, &dest) {
+                            log_legacy!(
+                                "[Migration] Failed to move {} → {}: {}",
+                                path.display(),
+                                dest.display(),
+                                e
+                            );
+                        } else {
+                            log_legacy!(
+                                "[Migration] Moved prompt {} → {}",
+                                path.display(),
+                                dest.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => log_legacy!(
+                "[Migration] Failed to read {}: {}",
+                top_prompts.display(),
+                e
+            ),
+        }
+        if std::fs::read_dir(&top_prompts)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false)
+        {
+            if let Err(e) = std::fs::remove_dir(&top_prompts) {
+                log_legacy!("[Migration] Failed to remove empty data/prompts/: {}", e);
+            } else {
+                log_legacy!("[Migration] Removed empty data/prompts/");
+            }
+        }
+    }
+
+    let apps_dir = data_dir.join("apps");
+    if apps_dir.is_dir() {
+        match std::fs::read_dir(&apps_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let app_prompts = entry.path().join("prompts");
+                    let app_intents = entry.path().join("intents");
+                    if app_prompts.is_dir() && !app_intents.exists() {
+                        if let Err(e) = std::fs::rename(&app_prompts, &app_intents) {
+                            log_legacy!(
+                                "[Migration] Failed to rename {}/prompts → intents: {}",
+                                entry.file_name().to_string_lossy(),
+                                e
+                            );
+                        } else {
+                            log_legacy!(
+                                "[Migration] Renamed {}/prompts → intents",
+                                entry.file_name().to_string_lossy()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => log_legacy!("[Migration] Failed to read {}: {}", apps_dir.display(), e),
+        }
+    }
+}
+
+/// INVARIANT: Engine-managed entries in every workspace's `.gitignore`. Workspaces
+/// auto-track their `data/` tree under git (artifacts), so anything the
+/// engine writes there that should NOT be versioned has to be listed here.
+///
+/// Order matters for diff stability: kept in the same order as historical
+/// values so existing files don't get rewritten on startup — new entries are
+/// appended at the end. `data/.env` is a legacy per-workspace env file: its
+/// contents are migrated into the `environment_variables` table at startup and
+/// the file is removed (see `environment_variables::migrate_env_file_to_db`).
+/// The gitignore entry stays as a safety backstop so any stray `.env` a user
+/// drops can never land in the workspace's git-tracked artifacts repo.
+const WORKSPACE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".lucidos/",
+    "data/postgres/",
+    "data/blobs/",
+    "data/.env",
+    "data/plugin-media/",
+];
+
+pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::io::Result<bool> {
+    let path = workspace.join(".gitignore");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let already: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = WORKSPACE_GITIGNORE_ENTRIES
+        .iter()
+        .copied()
+        .filter(|entry| !already.contains(entry))
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    let mut next = existing.clone();
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    for entry in missing {
+        next.push_str(entry);
+        next.push('\n');
+    }
+    std::fs::write(&path, next)?;
+    Ok(true)
+}
+
+pub fn ensure_state_dir_excluded_from_file_backup(
+    workspace: &std::path::Path,
+) -> std::io::Result<bool> {
+    let state_dir = workspace.join(".lucidos");
+    std::fs::create_dir_all(&state_dir)?;
+    Ok(lucidos_file_backup_exclusion::ensure_excluded(&state_dir)?.changed())
+}
+
+pub use device_presence::DevicePresenceStore;
+pub use events::EventRow;
+pub use mcp_servers::{LaunchLineMode, LaunchSpec, McpEnvValue, McpServer, McpServerStore};
+pub use models::{validate_routes, Model, ModelFields, ModelStore, Route};
+pub use preferences::{ModelDefaults, PairStamp, PreferenceStore, ResolvedModelSelection};
+pub use store::{
+    ConversationMessage, ConversationSnapshot, EventStore, SessionMessage, Step, ThreadEventRow,
+    ThreadSummary,
+};
+pub use webhook_deliveries::DeliveryLedger;
+pub use webhooks::{Webhook, WebhookStore};
+
+#[must_use = "pass it to `commit_index` so a moved HEAD is refused"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexBase(Option<git2::Oid>);
+
+pub fn reset_index_to_head(
+    repo: &git2::Repository,
+    index: &mut git2::Index,
+) -> Result<IndexBase, git2::Error> {
+    let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let base = IndexBase(head.map(|c| c.id()));
+    if let Some(id) = base.0 {
+        index.read_tree(&repo.find_commit(id)?.tree()?)?;
+    }
+    Ok(base)
+}
+
+pub fn is_transient_repo_contention(e: &git2::Error) -> bool {
+    use git2::{ErrorClass, ErrorCode};
+    match e.code() {
+        ErrorCode::Locked => true,
+        ErrorCode::Modified => matches!(e.class(), ErrorClass::Object | ErrorClass::Reference),
+        _ => false,
+    }
+}
+
+/// INVARIANT: Run a git2 repository write, retrying briefly while another writer of the
+/// same repo keeps winning the race. See [`is_transient_repo_contention`] for
+/// the two shapes that counts as, and for why each one happens.
+///
+/// Both windows are milliseconds, so waiting them out is the only sane
+/// response. Two things bind on callers:
+///
+/// - **`op` re-runs from the start every attempt, so it must be idempotent.**
+///   Stage INSIDE it, never before: every `commit_*` routed through this opens
+///   with `reset_index_to_head`, which makes a repeat safe. That reset also
+///   makes the retry CORRECT for the HEAD race. It re-reads the tree from the
+///   NEW head and returns the [`IndexBase`] the commit is pinned to. So the
+///   attempt lands on top of the commit that beat it. A caller
+///   that deletes first must remove OUTSIDE the closure, stage tolerantly, and
+///   finish through [`commit_index_unless_unchanged`].
+/// - **It sleeps the calling thread.** Prefer a blocking context. A caller
+///   whose `Repository` guard is not `Send` runs inline, and only sleeps when
+///   contended.
+///
+/// The budget is sized for the LOCK case. Any other error returns at once, and
+/// the final contended error is returned once the budget is spent.
+pub fn retry_while_repo_contended<T>(
+    mut op: impl FnMut() -> Result<T, git2::Error>,
+) -> Result<T, git2::Error> {
+    const ATTEMPTS: u32 = 25;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Err(e) if attempt < ATTEMPTS && is_transient_repo_contention(&e) => {
+                std::thread::sleep(BACKOFF);
+                attempt += 1;
+            }
+            settled => return settled,
+        }
+    }
+}
+
+pub use lucidos_gateway_constants::DEV_ENGINE_PORT_BASE;
+
+pub fn pin_workspace_vite_port(
+    workspace: &std::path::Path,
+    vite_port: u16,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let path = workspace.join("lucidos.toml");
+    if path.exists() {
+        return Ok(false);
+    }
+    let body = format!("[ports]\nvite = {}\n", vite_port);
+    std::fs::write(&path, body)?;
+
+    match commit_new_lucidos_toml(workspace) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
+
+/// INVARIANT: Deliberately NOT routed through `retry_while_repo_contended`: this runs once
+/// during engine startup on a workspace we just git-init'd, before any manager,
+/// timer or agent session exists to compete for HEAD. Its staging also happens
+/// outside any closure, so wrapping it would be unsafe without restructuring it
+/// for a re-run it cannot need.
+fn commit_new_lucidos_toml(
+    workspace: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let repo = git2::Repository::open(workspace)?;
+    let mut index = repo.index()?;
+    let base = reset_index_to_head(&repo, &mut index)?;
+    index.add_path(std::path::Path::new("lucidos.toml"))?;
+    index.write()?;
+    commit_index(&repo, "chore: pin workspace vite port", base)?;
+    Ok(())
+}
+
+/// INVARIANT: Open the workspace repo at `workspace_path`, stage the given `data/`-relative
+/// paths (additions/modifications), and commit them in one commit. Returns the
+/// commit sha.
+///
+/// This is the workspace-repo, fresh-handle sibling of
+/// [`crate::core::ArtifactManager::commit_data_paths`] (which commits through the
+/// engine's shared `Arc<Mutex<Repository>>`). Plugin install uses this so the
+/// files it writes into `data/` are version-controlled exactly like
+/// write_file/edit_file commits. Callers that may run concurrently with other
+/// workspace-repo mutations MUST hold `lock_workspace_repo` (the install/uninstall
+/// confirm flows do).
+pub fn commit_data_paths_added(
+    workspace_path: &std::path::Path,
+    data_relative_paths: &[String],
+    message: &str,
+) -> Result<String, git2::Error> {
+    commit_data_paths_with_overrides(workspace_path, data_relative_paths, &[], &[], message)
+}
+
+/// INVARIANT: [`commit_data_paths_added`], but recording chosen paths from a buffer
+/// instead of from the working tree.
+///
+/// A plugin update that merges the user's local edits needs the two to differ.
+/// The working tree gets the merge, and the commit records upstream's bytes, so
+/// the recorded commit stays a byte-exact copy of what the plugin shipped. That
+/// is the baseline the NEXT update diffs against. Commit the merge into it and
+/// the following update reads the patch as upstream's own content, sees no
+/// local modification, and silently discards it.
+///
+/// Each override carries its git file mode, because `add_frombuffer` records
+/// exactly what it is handed. Only the buffer path needs telling, since
+/// `add_path` reads the mode off disk. An executable file must not be recorded
+/// as `100644` just because its bytes arrived from memory.
+///
+/// An override for a path not listed in `data_relative_paths` is ignored: the
+/// list decides what the commit covers.
+///
+/// `removals` are paths already deleted from disk, staged as deletions in the
+/// same commit. A plugin update drops files this way. One that was never
+/// committed has no entry to remove and is skipped.
+pub fn commit_data_paths_with_overrides(
+    workspace_path: &std::path::Path,
+    data_relative_paths: &[String],
+    overrides: &[(String, Vec<u8>, u32)],
+    removals: &[String],
+    message: &str,
+) -> Result<String, git2::Error> {
+    for p in data_relative_paths.iter().chain(removals) {
+        if is_path_traversal(p) {
+            return Err(git2::Error::from_str(&format!(
+                "Path traversal not allowed: {}",
+                p
+            )));
+        }
+    }
+    let repo = git2::Repository::open(workspace_path)?;
+    retry_while_repo_contended(|| {
+        let mut index = repo.index()?;
+        let base = reset_index_to_head(&repo, &mut index)?;
+        for p in data_relative_paths {
+            let repo_relative = format!("data/{}", p);
+            match overrides.iter().find(|(path, _, _)| path == p) {
+                Some((_, bytes, mode)) => index.add_frombuffer(
+                    &blob_index_entry(&repo_relative, git2::Oid::zero(), *mode),
+                    bytes,
+                )?,
+                None => add_path_unless_ignored(&repo, &mut index, &repo_relative)?,
+            }
+        }
+        for p in removals {
+            let repo_relative = format!("data/{}", p);
+            let path = std::path::Path::new(&repo_relative);
+            if index.get_path(path, 0).is_some() {
+                index.remove_path(path)?;
+            }
+        }
+        index.write()?;
+        commit_index(&repo, message, base)
+    })
+}
+
+pub fn blob_index_entry(repo_relative: &str, id: git2::Oid, mode: u32) -> git2::IndexEntry {
+    git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags: 0,
+        flags_extended: 0,
+        path: repo_relative.as_bytes().to_vec(),
+    }
+}
+
+pub fn commit_data_paths_removed(
+    workspace_path: &std::path::Path,
+    data_relative_paths: &[String],
+    message: &str,
+) -> Result<Option<String>, git2::Error> {
+    let repo = git2::Repository::open(workspace_path)?;
+    retry_while_repo_contended(|| {
+        let mut index = repo.index()?;
+        let base = reset_index_to_head(&repo, &mut index)?;
+        let mut staged_any = false;
+        for p in data_relative_paths {
+            if is_path_traversal(p) {
+                continue;
+            }
+            if index
+                .remove_path(std::path::Path::new(&format!("data/{}", p)))
+                .is_ok()
+            {
+                staged_any = true;
+            }
+        }
+        if !staged_any {
+            return Ok(None);
+        }
+        index.write()?;
+        commit_index(&repo, message, base).map(Some)
+    })
+}
+
+pub fn commit_index(
+    repo: &git2::Repository,
+    message: &str,
+    base: IndexBase,
+) -> Result<String, git2::Error> {
+    let mut index = repo.index()?;
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+
+    let sig = git2::Signature::now("Lucidos", "lucidos@local")?;
+
+    let parent = base.0.map(|id| repo.find_commit(id)).transpose()?;
+    let parents: Vec<&git2::Commit> = parent.iter().collect();
+
+    let commit_id = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;
+
+    Ok(commit_id.to_string())
+}
+
+/// INVARIANT: [`commit_index`], except that an index already identical to HEAD's tree
+/// reports HEAD's own sha instead of recording an empty commit.
+///
+/// This is what makes the DELETE helpers safe to retry. Each changes the
+/// working tree BEFORE the retry closure and stages the change inside it. A
+/// competing writer can therefore commit the same deletion in between. The
+/// retried attempt then resets onto that head, finds the path already
+/// untracked, and has nothing left to stage. Reporting an error there would
+/// deny a deletion that demonstrably happened, so this reports the head
+/// recording it instead. A path that was never tracked takes the same route.
+///
+/// Callers therefore stage the removal TOLERANTLY and let this decide, rather
+/// than propagating the staging error. `git2`'s `remove_path` errors on an
+/// entry that is not in the index.
+pub fn commit_index_unless_unchanged(
+    repo: &git2::Repository,
+    message: &str,
+    base: IndexBase,
+) -> Result<String, git2::Error> {
+    let mut index = repo.index()?;
+    let tree_id = index.write_tree()?;
+    if let Ok(head) = repo.head() {
+        if let Ok(head_commit) = head.peel_to_commit() {
+            if head_commit.tree()?.id() == tree_id {
+                return Ok(head_commit.id().to_string());
+            }
+        }
+    }
+    commit_index(repo, message, base)
+}
+
+/// INVARIANT: Reject paths that would escape the directory they get joined onto: any `..`
+/// component, or an absolute path. A symlink escape needs
+/// [`contained_path::join_contained`] on top.
+///
+/// The single canonical traversal guard for the whole engine. HTTP handlers,
+/// LLM file tools, the proxy script runner and script triggers all funnel
+/// through it, so the rule cannot drift between call sites.
+///
+/// Deliberately conservative: it matches `..` anywhere in the string (so even a
+/// filename like `a..b` is rejected) and does not normalize or percent-decode
+/// first. Both choices fail closed — a false positive costs a rejected request,
+/// a false negative costs a path escape.
+pub fn is_path_traversal(path: &str) -> bool {
+    path.contains("..") || path.starts_with('/') || path.starts_with('\\')
+}
+
+pub fn artifact_relative_path(path: &str) -> &str {
+    path.strip_prefix("artifacts/").unwrap_or(path)
+}
+
+/// INVARIANT: Stage `repo_path` into `index`, unless git ignores it.
+///
+/// `index.add_path` does NOT consult `.gitignore`. It stages whatever path it
+/// is handed, so an ignored file enters a commit the moment a caller names it.
+/// The workspace ignores exactly what must never reach history: `data/.env`,
+/// `data/postgres/`, `data/blobs/`.
+///
+/// Every explicit `add_path` on a caller-supplied path goes through here, so
+/// the guard cannot be bypassed one module over. A whole-tree
+/// `add_all(.., IndexAddOption::DEFAULT, ..)` already honours ignores.
+///
+/// Skipping beats refusing: the file is on disk by then, and refusing would
+/// fail a script whose real output committed fine. The skip is logged.
+///
+/// **Ignored is not enough on its own: the path must also be untracked.**
+/// `is_path_ignored` answers the ignore RULES, blind to the index. So a rule
+/// added later would silently stop committing UPDATES to a file history
+/// already carries. `git add` keeps staging it, and so does `commit_all_dirty`
+/// through its `add_all`, which would leave the two disagreeing about one file.
+pub(crate) fn add_path_unless_ignored(
+    repo: &git2::Repository,
+    index: &mut git2::Index,
+    repo_path: &str,
+) -> Result<(), git2::Error> {
+    let path = std::path::Path::new(repo_path);
+    if repo.is_path_ignored(path)? && index.get_path(path, 0).is_none() {
+        crate::log_legacy!("[Git] not committing {repo_path}: git ignores it and it is untracked");
+        return Ok(());
+    }
+    index.add_path(path)
+}
+
+pub fn is_binary_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "pdf"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "rar"
+            | "7z"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "mp3"
+            | "mp4"
+            | "wav"
+            | "avi"
+            | "mov"
+            | "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "eot"
+    )
+}
+
+pub(crate) fn split_md_frontmatter(text: &str) -> Option<(&str, String)> {
+    if !text.starts_with("---") {
+        return None;
+    }
+    let parts: Vec<&str> = text.splitn(3, "---").collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    Some((
+        parts[1].trim(),
+        parts[2].trim_start_matches('\n').to_string(),
+    ))
+}
+
+pub(crate) fn parse_md_frontmatter(
+    text: &str,
+    list_field: &str,
+) -> Option<(String, Vec<String>, String)> {
+    let (frontmatter, body) = split_md_frontmatter(text)?;
+
+    let mut name = None;
+    let mut list_values = Vec::new();
+    let mut in_list = false;
+    let list_prefix = format!("{}:", list_field);
+
+    for line in frontmatter.lines() {
+        if let Some(value) = line.strip_prefix("name:") {
+            in_list = false;
+            let v = value.trim().trim_matches('"');
+            if !v.is_empty() {
+                name = Some(v.to_string());
+            }
+        } else if let Some(value) = line.strip_prefix(&list_prefix) {
+            let v = value.trim().trim_matches('"');
+            if !v.is_empty() {
+                list_values.push(v.to_string());
+                in_list = false;
+            } else {
+                in_list = true;
+            }
+        } else if in_list {
+            let trimmed = line.trim();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                list_values.push(item.trim().trim_matches('"').to_string());
+            } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                in_list = false;
+            }
+        }
+    }
+
+    let name = name?;
+    Some((name, list_values, body))
+}
+
+pub fn sanitize_for_jsonb(s: &str) -> String {
+    s.replace('\0', "")
+}
+
+pub fn format_byte_size(bytes: usize) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+#[cfg(test)]
+mod database_url_tests {
+    use super::{database_url, scrub_database_url_from_process_env};
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn dotenv_cannot_grant_managed_database_provenance() {
+        const CHILD: &str = "LUCIDOS_TEST_DOTENV_PROVENANCE";
+        if let Ok(expected) = std::env::var(CHILD) {
+            super::load_database_environment();
+            assert_eq!(super::database_is_gateway_managed(), expected == "1");
+            assert!(database_url().contains("dotenv_fixture"));
+            assert!(std::env::var_os(super::MANAGED_DATABASE_ENV).is_none());
+            return;
+        }
+        for managed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                root.path().join(".env"),
+                "DATABASE_URL=postgres:///dotenv_fixture?host=/tmp/fixture&user=admin\nLUCIDOS_MANAGED_DATABASE=1\n",
+            )
+            .unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "core::database_url_tests::dotenv_cannot_grant_managed_database_provenance",
+                    "--nocapture",
+                ])
+                .current_dir(root.path())
+                .env(CHILD, if managed { "1" } else { "0" })
+                .env_remove("DATABASE_URL")
+                .env_remove(super::MANAGED_DATABASE_ENV);
+            if managed {
+                command.env(super::MANAGED_DATABASE_ENV, "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provenance_is_bound_at_boot_and_never_inherited_by_children() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        database_url();
+        let prior = std::env::var_os("DATABASE_URL");
+        let prior_marker = std::env::var_os(super::MANAGED_DATABASE_ENV);
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres:///boot?host=/tmp/fixture&user=admin",
+        );
+        std::env::remove_var(super::MANAGED_DATABASE_ENV);
+        let external = super::BootDatabase::from_env();
+        std::env::set_var(super::MANAGED_DATABASE_ENV, "1");
+        let managed = super::BootDatabase::from_env();
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres:///external?host=/tmp/other&user=admin",
+        );
+        assert!(!external.managed, "a later overlay cannot grant provenance");
+        assert!(managed.managed);
+        assert_eq!(
+            managed.url, external.url,
+            "the guarantee belongs to the boot database"
+        );
+        scrub_database_url_from_process_env();
+        let child = std::process::Command::new("/usr/bin/env").output().unwrap();
+        assert!(!String::from_utf8(child.stdout)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("LUCIDOS_MANAGED_DATABASE=")));
+        restore_database_url(prior);
+        if let Some(value) = prior_marker {
+            std::env::set_var(super::MANAGED_DATABASE_ENV, value);
+        }
+    }
+
+    fn restore_database_url(prior: Option<std::ffi::OsString>) {
+        match prior {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+    }
+
+    #[test]
+    fn a_later_database_url_variable_does_not_move_the_engine() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let booted = database_url();
+        let prior = std::env::var_os("DATABASE_URL");
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://user:pw@localhost:5432/someone_elses_app",
+        );
+        let after = database_url();
+        restore_database_url(prior);
+        assert_eq!(after, booted);
+    }
+
+    fn child_database_url() -> Option<String> {
+        let output = std::process::Command::new("env")
+            .output()
+            .expect("spawn env");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("DATABASE_URL="))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn no_child_inherits_the_engines_database_url_but_a_user_one_reaches_it() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let booted = database_url();
+        let prior = std::env::var_os("DATABASE_URL");
+        std::env::set_var("DATABASE_URL", &booted);
+
+        scrub_database_url_from_process_env();
+        let after_scrub = child_database_url();
+        let user_url = "postgres://user:pw@localhost:5432/someone_elses_app";
+        std::env::set_var("DATABASE_URL", user_url);
+        let after_user_var = child_database_url();
+        let engine_url = database_url();
+        restore_database_url(prior);
+
+        assert_eq!(after_scrub, None, "the engine's URL reached a child");
+        assert_eq!(after_user_var.as_deref(), Some(user_url));
+        assert_eq!(engine_url, booted, "the engine itself still knows its URL");
+    }
+}
+
+#[cfg(test)]
+mod is_tmp_path_tests {
+    use super::is_tmp_path;
+
+    #[test]
+    fn matches_files_inside_the_scratch_tree() {
+        assert!(is_tmp_path(".lucidos/tmp/notes.json"));
+        assert!(is_tmp_path(".lucidos/tmp/some-repo/README.md"));
+        assert!(is_tmp_path(".lucidos/tmp/"));
+    }
+
+    #[test]
+    fn is_anchored_on_the_separator_not_the_string() {
+        assert!(!is_tmp_path(".lucidos/tmpfoo"));
+        assert!(!is_tmp_path(".lucidos/tmp-old/x"));
+        assert!(!is_tmp_path(".lucidos/tmp"));
+    }
+
+    #[test]
+    fn rejects_paths_outside_the_scratch_tree() {
+        assert!(!is_tmp_path("artifacts/notes.md"));
+        assert!(!is_tmp_path(".lucidos/worktrees/thread-x/src/main.rs"));
+        assert!(!is_tmp_path(".lucidos/exhaust/run.log"));
+        assert!(!is_tmp_path("artifacts/.lucidos/tmp/x.md"));
+    }
+}
+
+#[cfg(test)]
+mod format_byte_size_tests {
+    use super::format_byte_size;
+
+    #[test]
+    fn formats_byte_sizes_across_thresholds() {
+        assert_eq!(format_byte_size(0), "0 bytes");
+        assert_eq!(format_byte_size(500), "500 bytes");
+        assert_eq!(format_byte_size(1023), "1023 bytes");
+        assert_eq!(format_byte_size(1024), "1.0 KB");
+        assert_eq!(format_byte_size(1536), "1.5 KB");
+        assert_eq!(format_byte_size(1_048_576), "1.0 MB");
+        assert_eq!(format_byte_size(2_621_440), "2.5 MB");
+    }
+}
+
+/// INVARIANT: An *event wait* `reason` with a leading waiting phrase removed, for a label
+/// that already said "wait".
+///
+/// The engine-side twin of `awaitedSubject`
+/// (`store/thread-events/thread-event-types.ts`), which does this for the
+/// transcript's two labels. Two implementations because two layers compose the
+/// text: the pending step's here, the row's there. The three judgments behind
+/// the rule live in
+/// `docs/plans/2026-08-14-a-wait-label-does-not-say-waiting-twice.md`.
+///
+/// The TS twin also eats leading whitespace, which this does not need: the one
+/// caller trims the reason before asking.
+fn awaited_subject(reason: &str) -> &str {
+    // INVARIANT: Matched as verb, gap, preposition rather than as six literal phrases.
+    // The TS twin's `\s+` accepts ANY run of whitespace, and the two must not
+    // disagree: a single-space literal list left `waiting  for the lock`
+    // stripped in the transcript and doubled here.
+    for verb in ["waiting", "wait"] {
+        let Some(rest) = strip_word(reason, verb) else {
+            continue;
+        };
+        for preposition in ["for", "on", "until"] {
+            let Some(subject) = strip_word(rest, preposition) else {
+                continue;
+            };
+            return if subject.is_empty() { reason } else { subject };
+        }
+    }
+    reason
+}
+
+/// INVARIANT: `s` past a leading `word` and the whitespace after it, or `None` when `s`
+/// does not open on that whole word.
+///
+/// The trailing whitespace is what makes it a WORD match: without it
+/// `waiting form the lock` would strip on `for`. A word ending the string is
+/// still a match, so the caller can tell an empty subject from no match.
+///
+/// `split_at_checked` is the UTF-8 guard. It refuses an index that is not a
+/// char boundary, so a reason opening with a multi-byte character falls
+/// through instead of panicking.
+fn strip_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+    let (head, tail) = s.split_at_checked(word.len())?;
+    if !head.eq_ignore_ascii_case(word) {
+        return None;
+    }
+    let rest = tail.trim_start();
+    if !tail.is_empty() && rest.len() == tail.len() {
+        return None;
+    }
+    Some(rest)
+}
+
+/// INVARIANT: Head-truncate `s` to `max` bytes, appending `...` when it actually cuts.
+/// Returns `s` unchanged when it already fits. UTF-8-safe.
+///
+/// **The appended `...` is part of the return value**, so a caller must not
+/// also wrap the result in a `"{}..."` format string: a truncated value then
+/// renders as six dots, which the frontend accents as two separate markers
+/// (`highlightEllipsis` marks only the trailing three). A `describe_tool` arm
+/// that wants the trailing in-progress `...` should elide with
+/// `middle_truncate`, which marks its cut with `…` and appends nothing.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let end = s.floor_char_boundary(max);
+        format!("{}...", &s[..end])
+    }
+}
+
+pub fn middle_truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    if max <= ELLIPSIS.len() {
+        return ELLIPSIS.to_string();
+    }
+    let budget = max - ELLIPSIS.len();
+    let head_bytes = budget.div_ceil(2);
+    let tail_bytes = budget / 2;
+    let head_end = s.floor_char_boundary(head_bytes);
+    let tail_start = s.ceil_char_boundary(s.len() - tail_bytes);
+    if tail_start <= head_end {
+        return ELLIPSIS.to_string();
+    }
+    format!("{}{}{}", &s[..head_end], ELLIPSIS, &s[tail_start..])
+}
+
+fn first_command_line(cmd: &str) -> &str {
+    cmd.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim())
+        .unwrap_or(cmd)
+}
+
+/// INVARIANT: Shell basenames that mark a `<shell> -c <script>` wrapper, for the step-row
+/// label ([`shell_script_body`]).
+///
+/// A SUPERSET of `command_guard::GUARD_SHELLS`, which unwraps the same shapes to
+/// decide what the permission guard classifies. The containment is asserted, and
+/// it holds in one direction on purpose:
+///
+/// * A shell the GUARD knows must be one the label knows, or a payload would be
+///   scanned and then displayed still wrapped.
+/// * The reverse is allowed, and `fish` is the whole difference.
+///   Over-recognizing costs a label nothing. The guard, though, discards
+///   operands after the script as positional parameters, and fish does not
+///   follow that POSIX rule: it evaluates EVERY `-c` in turn, so
+///   `fish -c 'ls' -c 'rm -rf /'` would hand the classifier `ls` alone.
+///   Teaching the guard fish means handling its whole script-carrying flag
+///   surface, which is a security change on its own terms.
+pub const WRAPPER_SHELLS: [&str; 7] = ["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"];
+
+/// INVARIANT: The script inside a login-shell wrapper, or `cmd` unchanged when there is no
+/// wrapper to see through.
+///
+/// Codex reports a shell step as the whole invocation its harness built, where
+/// Claude Code's `Bash` reports the script alone. Only Codex's
+/// `command_execution` goes through here: a Claude Code session that literally
+/// invokes `bash -lc "..."` chose to, and its row must show it.
+///
+/// Conservative by construction. Anything not recognizably
+/// `<shell> -<letters including c> <one quoted-or-bare script>` comes back
+/// untouched, and the result is always a suffix of `cmd`.
+///
+/// # Why this is not `command_guard::unwrap_shell_command`
+///
+/// Both unwrap the same shapes and share [`WRAPPER_SHELLS`], but their errors
+/// have opposite costs. On an UNQUOTED operand (`zsh -lc git status`) the
+/// guard returns `git status`, since reading too much only ever scans more.
+/// POSIX `sh -c` really runs `git` with `$0=status`, so a step row must
+/// decline instead of naming a command that never ran. Do not collapse them.
+fn shell_script_body(cmd: &str) -> Cow<'_, str> {
+    let Some((shell, rest)) = cmd.trim_start().split_once(char::is_whitespace) else {
+        return Cow::Borrowed(cmd);
+    };
+    if !WRAPPER_SHELLS.contains(&shell.rsplit('/').next().unwrap_or(shell)) {
+        return Cow::Borrowed(cmd);
+    }
+    let Some((flags, script)) = rest.trim_start().split_once(char::is_whitespace) else {
+        return Cow::Borrowed(cmd);
+    };
+    let Some(letters) = flags.strip_prefix('-') else {
+        return Cow::Borrowed(cmd);
+    };
+    if letters.is_empty() || !letters.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Cow::Borrowed(cmd);
+    }
+    if !letters.contains('c') {
+        return Cow::Borrowed(cmd);
+    }
+    let script = script.trim();
+    match script.as_bytes().first() {
+        Some(b'\'' | b'"') => unquote_shell_word(script).unwrap_or(Cow::Borrowed(cmd)),
+        // INVARIANT: An UNQUOTED suffix is the script only when it is a single word.
+        // POSIX `sh -c` reads ONE operand as the script and assigns the rest to
+        // the positional parameters. So `zsh -lc git status` runs `git` with
+        // `$0=status`, and reading it as `git status` would put a command in
+        // the row that never ran.
+        Some(_) if !script.contains(char::is_whitespace) => Cow::Borrowed(script),
+        _ => Cow::Borrowed(cmd),
+    }
+}
+
+fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
+    let bytes = s.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let mut unescaped: Option<String> = None;
+    let mut chunk_start = 1;
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            if quote == b'\'' && s[i..].starts_with("'\\''") {
+                let buf = unescaped.get_or_insert_with(String::new);
+                buf.push_str(&s[chunk_start..i]);
+                buf.push('\'');
+                i += 4;
+                chunk_start = i;
+                continue;
+            }
+            if i + 1 != bytes.len() {
+                return None;
+            }
+            return Some(match unescaped {
+                Some(mut buf) => {
+                    buf.push_str(&s[chunk_start..i]);
+                    Cow::Owned(buf)
+                }
+                None => Cow::Borrowed(&s[1..i]),
+            });
+        }
+        if quote == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if matches!(next, b'"' | b'\\' | b'$' | b'`' | b'\n') {
+                let buf = unescaped.get_or_insert_with(String::new);
+                buf.push_str(&s[chunk_start..i]);
+                if next != b'\n' {
+                    buf.push(next as char);
+                }
+                i += 2;
+                chunk_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// INVARIANT: The bare tool name inside an `mcp__<server>__<tool>` identifier, or `None`
+/// when `name` is not shaped like one. Every surface uses that naming: the
+/// engine's own MCP client, Claude Code natively, and Codex, whose
+/// `mcp_tool_call` item is deliberately rebuilt into the same shape
+/// (`runtime/codex_parse.rs`). Both description paths split it here so the two
+/// can't drift.
+fn mcp_tool_suffix(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("mcp__")?;
+    rest.find("__").map(|sep| &rest[sep + 2..])
+}
+
+fn describe_search_result(result: &str, items_key: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(result).ok()?;
+    let count = parsed.get(items_key)?.as_array()?.len();
+    let truncated = parsed
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(if truncated {
+        format!("{} {}, truncated", count, items_key)
+    } else {
+        format!("{} {}", count, items_key)
+    })
+}
+
+pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Option<String> {
+    if !success {
+        let msg = result.lines().next().unwrap_or(result);
+        return Some(truncate(msg, 120));
+    }
+    match tool_name {
+        "read_file" => Some(format!("{} chars", result.len())),
+        "list_files" => Some(format!("{} items", result.lines().count())),
+        "glob_files" => describe_search_result(result, "paths"),
+        "grep_files" => describe_search_result(result, "matches"),
+        "search_artifacts" => Some(format!("{} results", result.lines().count())),
+        "run_python" | "run_bash" => result.lines().next().map(|l| truncate(l, 100)),
+        "write_file" | "edit_file" | "create_app" | "execute_intent" => Some("Done".to_string()),
+        "git_commit" => result.lines().next().map(|l| truncate(l, 80)),
+        "git_diff" | "git_log" => Some(format!("{} lines", result.lines().count())),
+        "http_request" | "proxy_request" => result.lines().next().map(|l| truncate(l, 80)),
+        _ => {
+            if result.len() <= 80 {
+                Some(result.to_string())
+            } else {
+                Some(format!("{} chars", result.len()))
+            }
+        }
+    }
+}
+
+pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
+    tool_label(name, args).unwrap_or_else(|| format!("Executing {}...", name))
+}
+
+fn search_label(verb: &str, args: &serde_json::Value) -> String {
+    match args["q"].as_str().map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => format!("{verb} for \"{}\"...", middle_truncate(q, 50)),
+        None => format!("{verb}..."),
+    }
+}
+
+fn recall_label(verb: &str, what: Option<&str>) -> String {
+    match what.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => format!("{verb} \"{}\" in memory...", middle_truncate(w, 50)),
+        None => format!("{verb} in memory..."),
+    }
+}
+
+fn drafts_label(args: &serde_json::Value) -> String {
+    match args["thread_id"].as_str().map(str::trim) {
+        Some(id) if !id.is_empty() => "Reading a thread's draft...".to_string(),
+        _ => "Listing unsent drafts...".to_string(),
+    }
+}
+
+const CONTEXT_CEILING_LABEL: &str = "Setting a context ceiling...";
+
+const SUBMIT_DRAFT_LABEL: &str = "Submitting the saved draft...";
+
+fn keep_alive_switch_label(args: &serde_json::Value) -> String {
+    match args["state"].as_str() {
+        Some("on") => "Turning the cache keep-alive back on...".to_string(),
+        _ => "Turning the cache keep-alive off for a thread...".to_string(),
+    }
+}
+
+pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String> {
+    Some(match name {
+        "list_files" => "Listing files in workspace...".to_string(),
+        "glob_files" => format!(
+            "Globbing {}...",
+            args["pattern"].as_str().unwrap_or("pattern")
+        ),
+        "grep_files" => {
+            let pat = args["pattern"].as_str().unwrap_or("pattern");
+            if let Some(path_glob) = args.get("path_glob").and_then(|v| v.as_str()) {
+                format!("Grepping {} in {}...", pat, path_glob)
+            } else {
+                format!("Grepping {}...", pat)
+            }
+        }
+        "read_file" => format!("Reading {}...", args["path"].as_str().unwrap_or("file")),
+        "write_file" => format!("Writing {}...", args["path"].as_str().unwrap_or("file")),
+        "edit_file" => format!("Editing {}...", args["path"].as_str().unwrap_or("file")),
+        "copy_file" => format!(
+            "Copying {} → {}...",
+            args["source"].as_str().unwrap_or("file"),
+            args["destination"].as_str().unwrap_or("file")
+        ),
+        "delete_file" => format!("Deleting {}...", args["path"].as_str().unwrap_or("file")),
+        "run_python" => "Running Python code...".to_string(),
+        "run_bash" => {
+            let cmd = args["command"].as_str().unwrap_or("command");
+            format!(
+                "Running: {}...",
+                middle_truncate(first_command_line(cmd), 60)
+            )
+        }
+        "run_python_background" => "Running Python in background...".to_string(),
+        "run_bash_background" => {
+            let cmd = args["command"].as_str().unwrap_or("command");
+            format!(
+                "Running in background: {}...",
+                middle_truncate(first_command_line(cmd), 60)
+            )
+        }
+        "bash_output" => "Checking background task output...".to_string(),
+        "bash_kill" => "Stopping background task...".to_string(),
+        "http_request" => {
+            let url = args["url"].as_str().unwrap_or("URL");
+            if let Some(path) = args["temp_path"].as_str() {
+                format!("Fetching {} → .lucidos/tmp/{}...", url, path)
+            } else if let Some(path) = args["output_path"].as_str() {
+                format!("Fetching {} → artifacts/{}...", url, path)
+            } else {
+                format!("Fetching {}...", url)
+            }
+        }
+        "proxy_request" => {
+            let name = args["name"].as_str().unwrap_or("proxy");
+            let method = args["method"].as_str().unwrap_or("GET");
+            let path = args["path"].as_str().unwrap_or("");
+            format!("{} via {} proxy: {}...", method, name, path)
+        }
+        "reload_proxy_modules" => "Reloading WASM auth modules...".to_string(),
+        "import_file" => format!(
+            "Importing {}...",
+            args["source_path"].as_str().unwrap_or("file")
+        ),
+        "create_trigger" => format!(
+            "Creating trigger '{}'...",
+            args["name"].as_str().unwrap_or("trigger")
+        ),
+        "list_triggers" => "Listing triggers...".to_string(),
+        "delete_trigger" => format!(
+            "Deleting trigger {}...",
+            args["trigger_id"].as_str().unwrap_or("trigger")
+        ),
+        "pause_trigger" => "Pausing trigger...".to_string(),
+        "resume_trigger" => "Resuming trigger...".to_string(),
+        "run_trigger" => "Running trigger now...".to_string(),
+        "list_trigger_groups" => "Listing trigger groups...".to_string(),
+        "create_trigger_group" => format!(
+            "Creating trigger group '{}'...",
+            args["name"].as_str().unwrap_or("group")
+        ),
+        "rename_trigger_group" => format!(
+            "Renaming trigger group to '{}'...",
+            args["name"].as_str().unwrap_or("group")
+        ),
+        "reorder_trigger_groups" => "Reordering trigger groups...".to_string(),
+        "delete_trigger_group" => "Deleting trigger group...".to_string(),
+        "set_language" => format!(
+            "Setting language to {}...",
+            args["language"].as_str().unwrap_or("language")
+        ),
+        "set_timezone" => format!(
+            "Setting timezone to {}...",
+            args["timezone"].as_str().unwrap_or("timezone")
+        ),
+        "set_environment_variable" => format!(
+            "Setting environment variable {}...",
+            args["name"].as_str().unwrap_or("variable")
+        ),
+        // INVARIANT: The flat set_language / set_timezone / enable_push_notifications arms
+        // are kept for replaying historical events; new writes go through
+        // set_preference.
+        "set_preference" => format!(
+            "Updating {} setting...",
+            args["key"].as_str().unwrap_or("preference")
+        ),
+        "get_preferences" => "Reading preferences...".to_string(),
+        "get_backup_status" => "Checking backup status...".to_string(),
+        "fetch_news" => format!(
+            "Fetching news about '{}'...",
+            args["topic"].as_str().unwrap_or("topic")
+        ),
+        "browser_open" => format!("Opening {}...", args["url"].as_str().unwrap_or("URL")),
+        "browser_extract" => format!(
+            "Extracting {} from {}...",
+            args["format"].as_str().unwrap_or("content"),
+            args["selector"].as_str().unwrap_or("elements")
+        ),
+        "browser_click" => format!(
+            "Clicking {}...",
+            args["selector"].as_str().unwrap_or("element")
+        ),
+        "browser_type" => format!(
+            "Typing into {}...",
+            args["selector"].as_str().unwrap_or("input")
+        ),
+        "browser_eval" => "Executing JavaScript...".to_string(),
+        "browser_screenshot" => {
+            let path = args["path"].as_str().unwrap_or("screenshot.png");
+            if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
+                format!("Taking screenshot of {}...", url)
+            } else {
+                format!("Taking screenshot {}...", path)
+            }
+        }
+        "browser_close" => "Closing browser...".to_string(),
+        "web_search" => format!(
+            "Searching for {}...",
+            args["query"].as_str().unwrap_or("web")
+        ),
+        "request_credential" => format!(
+            "Requesting {} credentials...",
+            args["service_name"].as_str().unwrap_or("API")
+        ),
+        "connect_oauth_account" => format!(
+            "Connecting {} account...",
+            args["provider"].as_str().unwrap_or("OAuth")
+        ),
+        "create_app" => format!(
+            "Creating {} '{}'...",
+            if args["kind"] == "widget" {
+                "widget"
+            } else {
+                "app"
+            },
+            args["name"].as_str().unwrap_or("app")
+        ),
+        "list_apps" => "Listing apps...".to_string(),
+        "list_intents" => "Listing intents...".to_string(),
+        "list_knowhow" => "Listing know-how...".to_string(),
+        "load_knowhow" => match args["id"].as_str() {
+            Some(id) => format!("Loading know-how '{id}'..."),
+            None => "Loading know-how...".to_string(),
+        },
+        "unload_knowhow" => match args["id"].as_str() {
+            Some(id) => format!("Unloading know-how '{id}'..."),
+            None => "Unloading know-how...".to_string(),
+        },
+        "execute_intent" => "Refusing the retired intent tool...".to_string(),
+        "refresh_app" => format!(
+            "Refreshing {}...",
+            args.get("app_name")
+                .or(args.get("app_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("app")
+        ),
+        "capture_app" => format!(
+            "Capturing {}...",
+            args.get("app_name")
+                .or(args.get("app_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("app")
+        ),
+        "run_coding_agent" | "run_claude" => {
+            match args.get("coding_agent").and_then(|v| v.as_str()) {
+                Some("codex") => "Executing Codex...".to_string(),
+                _ => "Executing Claude Code...".to_string(),
+            }
+        }
+        "configure_email" => format!(
+            "Configuring email account '{}'...",
+            args["name"].as_str().unwrap_or("email")
+        ),
+        "send_email" => format!(
+            "Sending email to {}...",
+            args["to"]
+                .as_array()
+                .map(|a| a
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default()
+        ),
+        "read_emails" => format!(
+            "Reading emails from {}...",
+            args.get("folder")
+                .and_then(|v| v.as_str())
+                .unwrap_or("INBOX")
+        ),
+        "read_email" => format!("Reading email #{}...", args["uid"].as_u64().unwrap_or(0)),
+        "emit_event" => format!(
+            "Emitting {} event...",
+            args["event_type"].as_str().unwrap_or("event")
+        ),
+        "setup_mcp_server" => format!(
+            "Setting up MCP server '{}'...",
+            args["name"].as_str().unwrap_or("server")
+        ),
+        "list_mcp_servers" => "Listing MCP servers...".to_string(),
+        "start_mcp_server" => format!(
+            "Starting MCP server '{}'...",
+            args["id"].as_str().unwrap_or("server")
+        ),
+        "stop_mcp_server" => format!(
+            "Stopping MCP server '{}'...",
+            args["id"].as_str().unwrap_or("server")
+        ),
+        "enable_mcp_server" => format!(
+            "Enabling MCP server '{}' in this thread...",
+            args["id"].as_str().unwrap_or("server")
+        ),
+        "disable_mcp_server" => format!(
+            "Disabling MCP server '{}' in this thread...",
+            args["id"].as_str().unwrap_or("server")
+        ),
+        "remove_mcp_server" => format!(
+            "Removing MCP server '{}'...",
+            args["id"].as_str().unwrap_or("server")
+        ),
+        "navigate_ui" => {
+            let target = args["target"].as_str().unwrap_or("panel");
+            match target {
+                "app" | "app-ui" => format!(
+                    "Opening {}...",
+                    args.get("app_name")
+                        .or(args.get("app_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("app")
+                ),
+                // INVARIANT: `file_path`, not `path`: that is what `get_navigate_ui_tool`
+                // declares (`llm/tools/misc.rs`) and what the frontend reads off
+                // the `NavigationRequested` payload. Reading `path` matched no
+                // key, so every file navigation rendered the bare "Opening
+                // file..." instead of naming the file.
+                "file" => format!(
+                    "Opening {}...",
+                    args["file_path"].as_str().unwrap_or("file")
+                ),
+                "url" => format!("Opening {}...", args["url"].as_str().unwrap_or("URL")),
+                _ => format!("Opening {}...", target),
+            }
+        }
+        "update_trigger" => format!(
+            "Updating trigger {}...",
+            args["name"]
+                .as_str()
+                .or(args["trigger_id"].as_str())
+                .unwrap_or("trigger")
+        ),
+        "send_notification" => format!(
+            "Sending notification '{}'...",
+            args["title"].as_str().unwrap_or("notification")
+        ),
+        "ask_user_question" => match args["questions"].as_array() {
+            Some(questions) if questions.len() > 1 => {
+                format!("Asking {} questions...", questions.len())
+            }
+            Some(questions) if questions.len() == 1 => {
+                let q = &questions[0];
+                let text = q
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| q.get("header").and_then(|v| v.as_str()))
+                    .unwrap_or("a question");
+                format!("Asking: {}", truncate(text, 60))
+            }
+            _ => "Asking a question...".to_string(),
+        },
+        "await_event" => {
+            let reason = args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match reason {
+                Some(reason) => format!("Waiting: {}", truncate(awaited_subject(reason), 60)),
+                None => "Waiting for an event...".to_string(),
+            }
+        }
+        "list_event_waits" => "Checking what this thread is waiting for...".to_string(),
+        "cancel_event_wait" => match args.get("all").and_then(|v| v.as_bool()) {
+            Some(true) => "Stopping every subscription on this thread...".to_string(),
+            _ => "Stopping a subscription...".to_string(),
+        },
+        "todo_write" if args["action"] == "read" => "Reading todo list...".to_string(),
+        "todo_write" => match args["todos"].as_array() {
+            Some(todos) if todos.is_empty() => "Clearing todo list...".to_string(),
+            _ => "Updating todo list...".to_string(),
+        },
+        "judge" => match args["questions"].as_object().map(|q| q.len()) {
+            Some(1) => "Judging 1 question...".to_string(),
+            Some(n) => format!("Judging {} questions...", n),
+            None => "Judging...".to_string(),
+        },
+        "save_thread_image" => format!(
+            "Saving image to {}...",
+            args["path"].as_str().unwrap_or("artifacts")
+        ),
+        "view_image" => format!("Viewing {}...", args["image"].as_str().unwrap_or("image")),
+        "generate_image" => format!(
+            "Generating image: {}...",
+            middle_truncate(args["prompt"].as_str().unwrap_or("image"), 50)
+        ),
+        "git_clone" => format!(
+            "Cloning {}...",
+            args["url"].as_str().unwrap_or("repository")
+        ),
+        "save_email_attachment" => format!(
+            "Saving email attachment #{}...",
+            args["attachment_index"].as_u64().unwrap_or(0)
+        ),
+        "run_thread" => format!(
+            "Running thread: {}...",
+            middle_truncate(args["prompt"].as_str().unwrap_or("task"), 50)
+        ),
+        "follow_up_child_thread" => match args["message"].as_str() {
+            Some(message) => format!(
+                "Following up with child thread: {}...",
+                middle_truncate(message, 50)
+            ),
+            None => "Following up with child thread...".to_string(),
+        },
+        "list_threads" => "Listing threads...".to_string(),
+        "count_threads" => "Counting threads...".to_string(),
+        "search_threads" => search_label("Searching past conversations", args),
+        "list_drafts" => drafts_label(args),
+        "submit_saved_draft" => SUBMIT_DRAFT_LABEL.to_string(),
+        "list_held_messages" => "Listing held messages...".to_string(),
+        "detach_child_thread" => "Moving a child thread to top level...".to_string(),
+        "archive_thread" => "Archiving a thread...".to_string(),
+        "switch_cache_keep_alive" => keep_alive_switch_label(args),
+        "set_context_ceiling" => CONTEXT_CEILING_LABEL.to_string(),
+        "request_read" => match args[crate::llm::tools::READ_ARG].as_bool() {
+            Some(false) => "No read needed".to_string(),
+            _ => "Asking you to read this reply...".to_string(),
+        },
+        "expect_wake" => "Noting when this thread expects to wake".to_string(),
+        "wake_parent" => match args[crate::llm::tools::WAKE_ARG].as_bool() {
+            Some(false) => "Filing the report for the parent thread".to_string(),
+            _ => "Waking the parent thread...".to_string(),
+        },
+        "triage_threads" => "Triaging threads...".to_string(),
+        "apply_thread_triage" => "Applying the approved triage...".to_string(),
+        "list_changes" => "Listing changes...".to_string(),
+        "apply_change" => "Applying change...".to_string(),
+        "apply_when_settled" => "Arming a standing apply...".to_string(),
+        "apply_as_they_settle" => "Applying, and arming the rest...".to_string(),
+        "cancel_standing_apply" => "Canceling a standing apply...".to_string(),
+        "set_aside_change" => "Setting a change aside...".to_string(),
+        "bring_back_change" => "Bringing a change back...".to_string(),
+        "correct_memory" | "correct_memory_by_id" => "Updating memory...".to_string(),
+        "search_memory" => search_label("Searching memory", args),
+        "memory_source" => "Tracing a memory to its conversation...".to_string(),
+        "query_events" => format!(
+            "Querying {} events...",
+            args["event_type"].as_str().unwrap_or("all")
+        ),
+        "count_events" => match args["event_type"].as_str() {
+            Some(event_type) => format!("Counting {} events...", event_type),
+            None => "Counting events...".to_string(),
+        },
+        "list_event_types" => "Listing event types...".to_string(),
+        "terminal_suggestions" => "Suggesting a terminal command...".to_string(),
+        "notifications" | "read_notifications" => match args["action"].as_str() {
+            Some("mark_read") => "Marking notification read...".to_string(),
+            Some("mark_all_read") => "Marking all notifications read...".to_string(),
+            _ => "Reading notifications...".to_string(),
+        },
+        "triggers" => match args["action"].as_str() {
+            Some("create") => format!(
+                "Creating trigger '{}'...",
+                args["name"].as_str().unwrap_or("trigger")
+            ),
+            Some("update") => "Updating trigger...".to_string(),
+            Some("delete") => "Deleting trigger...".to_string(),
+            Some("pause") => "Pausing trigger...".to_string(),
+            Some("resume") => "Resuming trigger...".to_string(),
+            Some("run") => "Running trigger now...".to_string(),
+            _ => "Listing triggers...".to_string(),
+        },
+        "trigger_groups" => match args["action"].as_str() {
+            Some("create") => format!(
+                "Creating trigger group '{}'...",
+                args["name"].as_str().unwrap_or("group")
+            ),
+            Some("rename") => format!(
+                "Renaming trigger group to '{}'...",
+                args["name"].as_str().unwrap_or("group")
+            ),
+            Some("reorder") => "Reordering trigger groups...".to_string(),
+            Some("delete") => "Deleting trigger group...".to_string(),
+            _ => "Listing trigger groups...".to_string(),
+        },
+        "preferences" => match args["action"].as_str() {
+            Some("set") => format!(
+                "Updating {} setting...",
+                args["key"].as_str().unwrap_or("preference")
+            ),
+            _ => "Reading preferences...".to_string(),
+        },
+        "env_vars" => match args["action"].as_str() {
+            Some("set") => format!(
+                "Setting environment variable {}...",
+                args["name"].as_str().unwrap_or("variable")
+            ),
+            Some("delete") => format!(
+                "Deleting environment variable {}...",
+                args["name"].as_str().unwrap_or("variable")
+            ),
+            _ => "Listing environment variables...".to_string(),
+        },
+        "widgets" => {
+            let widget = args["app_id"].as_str().unwrap_or("widget");
+            match args["action"].as_str() {
+                Some("size") => format!("Resizing widget '{}'...", widget),
+                Some("fit") => format!("Checking that widget '{}' fits its boxes...", widget),
+                Some("make_reusable") => format!("Making widget '{}' reusable...", widget),
+                Some("stop_reusing") => format!("Stopping reuse of widget '{}'...", widget),
+                Some("dashboard") => "Reading the dashboard...".to_string(),
+                Some("add_to_dashboard") => {
+                    format!("Adding widget '{}' to the dashboard...", widget)
+                }
+                Some("remove_from_dashboard") => {
+                    format!("Removing widget '{}' from the dashboard...", widget)
+                }
+                Some("arrange") => "Arranging the dashboard...".to_string(),
+                _ => "Listing reusable widgets...".to_string(),
+            }
+        }
+        "manage_repositories" => match args["action"].as_str() {
+            Some("add") => format!(
+                "Adding repository '{}'...",
+                args["name"].as_str().unwrap_or("repo")
+            ),
+            Some("remove") => format!(
+                "Removing repository '{}'...",
+                args["name"].as_str().unwrap_or("repo")
+            ),
+            Some("list") => "Listing repositories...".to_string(),
+            _ => "Managing repositories...".to_string(),
+        },
+        "manage_models" => match args["action"].as_str() {
+            Some("add") => format!(
+                "Adding model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("remove") => format!(
+                "Removing model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("enable") => format!(
+                "Enabling model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("disable") => format!(
+                "Disabling model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("update") => format!(
+                "Updating model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("list") => "Listing models...".to_string(),
+            _ => "Managing models...".to_string(),
+        },
+        "events" => match args["action"].as_str() {
+            Some("emit") => format!(
+                "Emitting {} event...",
+                args["event_type"].as_str().unwrap_or("event")
+            ),
+            Some("count") => match args["event_type"].as_str() {
+                Some(event_type) => format!("Counting {} events...", event_type),
+                None => "Counting events...".to_string(),
+            },
+            Some("event_types") => "Listing event types...".to_string(),
+            _ => format!(
+                "Querying {} events...",
+                args["event_type"].as_str().unwrap_or("all")
+            ),
+        },
+        // INVARIANT: An arm for every action that writes. The default here is the list
+        // label, so an action falling through narrates a write as a read. The
+        // wording matches the flat aliases above, and a test holds them equal.
+        "changes" => match args["action"].as_str() {
+            Some("apply") => "Applying change...".to_string(),
+            Some("apply_when_settled") => "Arming a standing apply...".to_string(),
+            Some("apply_as_they_settle") => "Applying, and arming the rest...".to_string(),
+            Some("cancel_standing_apply") => "Canceling a standing apply...".to_string(),
+            Some("set_aside") => "Setting a change aside...".to_string(),
+            Some("bring_back") => "Bringing a change back...".to_string(),
+            _ => "Listing changes...".to_string(),
+        },
+        "list_thread_queue" => "Listing Thread Queue...".to_string(),
+        "update_thread_queue_policy" => "Updating Thread Queue policy...".to_string(),
+        "thread_queue" => match args["action"].as_str() {
+            Some("update_policy") => "Updating Thread Queue policy...".to_string(),
+            Some("run_now") => "Running queued entry now...".to_string(),
+            Some("drop") => "Dropping queued entry...".to_string(),
+            _ => "Listing Thread Queue...".to_string(),
+        },
+        // INVARIANT: The GROUPED names are what the model actually emits, since the flat
+        // ones are back-compat aliases that are never offered. So a grouped arm
+        // ignoring `action` mislabels every action but one, and rendering a
+        // read as "Updating memory..." claims a write that never happened.
+        "memory" => match args["action"].as_str() {
+            Some("search") => search_label("Searching memory", args),
+            Some("source") => "Tracing a memory to its conversation...".to_string(),
+            _ => "Updating memory...".to_string(),
+        },
+        "recall" => match args["action"].as_str() {
+            Some("find") => recall_label("Finding", args["query"].as_str()),
+            Some("search") => recall_label("Searching messages", args["text"].as_str()),
+            Some("date") => "Dating a memory line...".to_string(),
+            _ => "Opening a memory line...".to_string(),
+        },
+        "recall_zoom" => "Opening a memory line...".to_string(),
+        "recall_find" => recall_label("Finding", args["query"].as_str()),
+        "recall_search" => recall_label("Searching messages", args["text"].as_str()),
+        "recall_date" => "Dating a memory line...".to_string(),
+        "threads" => match args["action"].as_str() {
+            Some("count") => "Counting threads...".to_string(),
+            Some("search") => search_label("Searching past conversations", args),
+            Some("drafts") => drafts_label(args),
+            Some("submit_draft") => SUBMIT_DRAFT_LABEL.to_string(),
+            Some("held_messages") => "Listing held messages...".to_string(),
+            Some("detach_child") => "Moving a child thread to top level...".to_string(),
+            Some("archive") => "Archiving a thread...".to_string(),
+            Some("cache_keep_alive") => keep_alive_switch_label(args),
+            Some("context_ceiling") => CONTEXT_CEILING_LABEL.to_string(),
+            Some("triage") => "Triaging threads...".to_string(),
+            Some("apply_triage") => "Applying the approved triage...".to_string(),
+            _ => "Listing threads...".to_string(),
+        },
+        "mcp" => match args["action"].as_str() {
+            Some("setup") => format!(
+                "Setting up MCP server '{}'...",
+                args["name"].as_str().unwrap_or("server")
+            ),
+            Some("start") => format!(
+                "Starting MCP server '{}'...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("stop") => format!(
+                "Stopping MCP server '{}'...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("enable") => format!(
+                "Enabling MCP server '{}' in this thread...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("disable") => format!(
+                "Disabling MCP server '{}' in this thread...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("remove") => format!(
+                "Removing MCP server '{}'...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            _ => "Listing MCP servers...".to_string(),
+        },
+        "plugins" => match args["action"].as_str() {
+            Some("install") => format!(
+                "Installing plugin from {}...",
+                args["source"].as_str().unwrap_or("source")
+            ),
+            Some("register_marketplace") => format!(
+                "Registering marketplace {}...",
+                args["source"].as_str().unwrap_or("source")
+            ),
+            Some("update") => format!(
+                "Updating plugin '{}'...",
+                args["id"].as_str().unwrap_or("plugin")
+            ),
+            Some("uninstall") => format!(
+                "Uninstalling plugin '{}'...",
+                args["id"].as_str().unwrap_or("plugin")
+            ),
+            _ => "Checking plugins for updates...".to_string(),
+        },
+        "browser_forget_login" => format!(
+            "Forgetting login for {}...",
+            args["domain"].as_str().unwrap_or("site")
+        ),
+        "browser_clear_data" => "Clearing browser data...".to_string(),
+        "install_plugin" => format!(
+            "Installing plugin from {}...",
+            args["source"].as_str().unwrap_or("source")
+        ),
+        "register_plugin_marketplace" => format!(
+            "Registering marketplace {}...",
+            args["source"].as_str().unwrap_or("source")
+        ),
+        "check_plugin_updates" => match args.get("id").and_then(|v| v.as_str()) {
+            Some(id) => format!("Checking plugin '{}' for updates...", id),
+            None => "Checking installed plugins for updates...".to_string(),
+        },
+        "update_plugin" => format!(
+            "Updating plugin '{}'...",
+            args["id"].as_str().unwrap_or("plugin")
+        ),
+        "uninstall_plugin" => format!(
+            "Uninstalling plugin '{}'...",
+            args["id"].as_str().unwrap_or("plugin")
+        ),
+        "enable_push_notifications" => "Enabling push notifications...".to_string(),
+        _ if name.starts_with("mcp__") => {
+            format!("MCP: {}...", mcp_tool_suffix(name).unwrap_or(name))
+        }
+        _ => return None,
+    })
+}
+
+fn change_kind_verb(kind: Option<&serde_json::Value>) -> &'static str {
+    let name = match kind {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(v) => v.get("type").and_then(|t| t.as_str()).unwrap_or(""),
+        None => "",
+    };
+    match name {
+        "add" => "Write",
+        "update" => "Edit",
+        "delete" => "Delete",
+        _ => "Change",
+    }
+}
+
+pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
+    fn basename(p: &str) -> &str {
+        p.rsplit('/').next().unwrap_or(p)
+    }
+    let str_arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+
+    match name {
+        "Read" => {
+            let p = str_arg("file_path");
+            if p.is_empty() {
+                "Read file".into()
+            } else {
+                format!("Read {}", basename(p))
+            }
+        }
+        "Edit" | "MultiEdit" => {
+            let p = str_arg("file_path");
+            if p.is_empty() {
+                "Edit file".into()
+            } else {
+                format!("Edit {}", basename(p))
+            }
+        }
+        "Write" => {
+            let p = str_arg("file_path");
+            if p.is_empty() {
+                "Write file".into()
+            } else {
+                format!("Write {}", basename(p))
+            }
+        }
+        "Glob" => {
+            let pat = str_arg("pattern");
+            if pat.is_empty() {
+                "Find files".into()
+            } else {
+                format!("Find {}", middle_truncate(pat, 60))
+            }
+        }
+        "Grep" => {
+            let pat = str_arg("pattern");
+            if pat.is_empty() {
+                "Search code".into()
+            } else {
+                format!("Search '{}'", middle_truncate(pat, 60))
+            }
+        }
+        "Bash" => {
+            let cmd = str_arg("command");
+            if cmd.is_empty() {
+                "Run command".into()
+            } else {
+                format!("Run {}", middle_truncate(first_command_line(cmd), 60))
+            }
+        }
+        "WebFetch" => {
+            let url = str_arg("url");
+            if url.is_empty() {
+                "Fetch URL".into()
+            } else {
+                let origin: String = url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
+                format!("Fetch {}", origin)
+            }
+        }
+        "WebSearch" => {
+            let q = str_arg("query");
+            if q.is_empty() {
+                "Web search".into()
+            } else {
+                format!("Search '{}'", middle_truncate(q, 60))
+            }
+        }
+        "Agent" => {
+            let desc = str_arg("description");
+            if desc.is_empty() {
+                "Run agent".into()
+            } else {
+                desc.to_string()
+            }
+        }
+        "Skill" => {
+            let s = str_arg("skill");
+            if s.is_empty() {
+                "Run skill".into()
+            } else {
+                format!("Run skill: {}", s)
+            }
+        }
+        "NotebookEdit" => {
+            let p = str_arg("file_path");
+            if p.is_empty() {
+                "Edit notebook".into()
+            } else {
+                format!("Edit {}", basename(p))
+            }
+        }
+        // INVARIANT: Same label as Codex's `todo_list` below. The two backends' plan steps
+        // are one thing to the user and must read alike. The frontend already
+        // assumes that, rendering both with one marker list.
+        "TodoWrite" => "Update plan".into(),
+        "ExitPlanMode" => "Present plan for approval".into(),
+        "command_execution" => {
+            let script = shell_script_body(str_arg("command"));
+            let line = first_command_line(&script);
+            if line.is_empty() {
+                "Run command".into()
+            } else {
+                format!("Run {}", middle_truncate(line, 60))
+            }
+        }
+        "file_change" => match args.get("changes").and_then(|c| c.as_array()) {
+            Some(changes) if !changes.is_empty() => {
+                let verbs: Vec<&str> = changes
+                    .iter()
+                    .map(|c| change_kind_verb(c.get("kind")))
+                    .collect();
+                let verb = if verbs.windows(2).all(|w| w[0] == w[1]) {
+                    verbs[0]
+                } else {
+                    "Change"
+                };
+                if changes.len() > 1 {
+                    format!("{} {} files", verb, changes.len())
+                } else {
+                    match changes[0]
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .filter(|p| !p.is_empty())
+                    {
+                        Some(p) => format!("{} {}", verb, basename(p)),
+                        None => format!("{} 1 file", verb),
+                    }
+                }
+            }
+            _ => "Apply file changes".into(),
+        },
+        "web_search" => {
+            let q = str_arg("query");
+            if q.is_empty() {
+                "Web search".into()
+            } else {
+                format!("Search '{}'", middle_truncate(q, 60))
+            }
+        }
+        "todo_list" => "Update plan".into(),
+        _ if name.starts_with("mcp__") => {
+            format!("MCP: {}", mcp_tool_suffix(name).unwrap_or(name))
+        }
+        _ => name.to_string(),
+    }
+}
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

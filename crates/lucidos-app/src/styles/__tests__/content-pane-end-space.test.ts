@@ -1,0 +1,78 @@
+import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, relative, resolve } from 'node:path';
+
+import { COLUMN_VIEW_ROOTS, CONTENT_VIEW_ROOTS, clientSourcePaths, cssRules, selectorList, styleSheetPaths } from './css-rule-helpers';
+
+const here: string = dirname(fileURLToPath(import.meta.url));
+const stylesRoot: string = resolve(here, '..');
+const srcRoot: string = resolve(here, '../..');
+const sheet = (rel: string) => cssRules(readFileSync(resolve(stylesRoot, rel), 'utf8'));
+const ALL_RULES = styleSheetPaths(stylesRoot).flatMap((path: string) =>
+  cssRules(readFileSync(path, 'utf8')).map(rule => ({ ...rule, path })));
+
+const SPACER = '.content-pane-body > :not(.content-view-full-bleed)::after';
+
+const VIEW_ROOT = new RegExp(`\\.(${CONTENT_VIEW_ROOTS.join('|')})(?![\\w-])`);
+const COLUMN_ROOT = new RegExp(`\\.(${COLUMN_VIEW_ROOTS.join('|')})(?![\\w-])`);
+
+function subject(selector: string): string {
+  let flat = selector;
+  while (/\([^()]*\)/.test(flat)) flat = flat.replace(/\([^()]*\)/g, '');
+  return flat.trim().split(/[\s>+~]+/).pop() ?? '';
+}
+
+const FULL_BLEED: Record<string, string> = {
+  'components/files/FilesView.tsx': 'the whole pane is the import drop zone',
+  'components/apps/AppUiInline.tsx': 'the app iframe fills the pane',
+  'components/files/UrlPreviewInline.tsx': 'the page iframe fills the pane',
+  'components/layout/ContentPane.tsx': 'a file preview scrolls inside itself (a phone opts it back in)',
+  'components/terminal/TerminalView.tsx': 'the shell fills the pane',
+};
+
+describe('the content pane end space', () => {
+  it('is one default-deny spacer after every view', () => {
+    const rule = sheet('panels/content.css').find(r => r.selector === SPACER);
+    expect(rule, `no rule "${SPACER}"`).toBeDefined();
+    expect(rule!.props.get('content')).toBe("''");
+    expect(rule!.props.get('display')).toBe('block');
+    expect(rule!.props.get('height')).toBe('var(--pane-end-space)');
+  });
+
+  it('clears the home indicator on a phone', () => {
+    const pane = sheet('panels/shell.css').find(r => r.selector === '.content-pane-body');
+    expect(pane?.props.get('--pane-end-space')).toContain('var(--safe-area-bottom)');
+  });
+
+  it('follows content: no sheet pins a column view to a fixed height', () => {
+    const pinned = ALL_RULES.filter(rule =>
+      rule.props.has('height') &&
+      selectorList(rule.selector).some(s =>
+        COLUMN_ROOT.test(subject(s)) && !s.includes('full-bleed')));
+    expect(pinned.map(r => `${relative(stylesRoot, r.path)}: ${r.selector}`)).toEqual([]);
+  });
+
+  it('is styled in one place plus the phone opt-in, so no view can cancel it', () => {
+    const touching = ALL_RULES.filter(rule => selectorList(rule.selector).some(s =>
+      s.endsWith('::after') && (/\.content-pane-body\s*>/.test(s) || VIEW_ROOT.test(subject(s)))));
+    const optIn = touching.filter(r => r.selector.includes('.file-preview-frame:has('));
+    expect(optIn.length, 'the phone opt-in rule is gone').toBe(1);
+    expect(optIn[0].atRules).toContain('@media (--phone-layout)');
+    expect(optIn[0].props.get('height')).toBe('var(--pane-end-space)');
+    const others = touching.filter(r => r.selector !== SPACER && r !== optIn[0]);
+    expect(others.map(r => `${relative(stylesRoot, r.path)}: ${r.selector}`)).toEqual([]);
+  });
+
+  it('opts a view out only through a reviewed full-bleed mark', () => {
+    const marked = clientSourcePaths(srcRoot)
+      .filter((path: string) => readFileSync(path, 'utf8').includes('content-view-full-bleed'))
+      .map((path: string) => relative(srcRoot, path))
+      .sort();
+    expect(marked, 'a new full-bleed view drops the end space and the content column; add it to FULL_BLEED with why')
+      .toEqual(Object.keys(FULL_BLEED).sort());
+  });
+});

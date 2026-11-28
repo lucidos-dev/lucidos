@@ -1,0 +1,114 @@
+
+.badge,
+.section-count-badge,
+.drawer-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.app-store-status,
+.app-store-modified-chip,
+.theme-card-badge {
+    letter-spacing: normal;
+}
+
+.badge-ink {
+    position: relative;
+    left: var(--badge-ink-shift, 0em);
+}
+
+.badge:not(:where(.brand-badge-dot, .system-attention-badge-corner, .badge-icon)),
+.section-count-badge,
+.drawer-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.app-store-status,
+.app-store-modified-chip,
+.theme-card-badge {
+    will-change: transform;
+}
+
+@supports (width: calc-size(fit-content, size)) {
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner, .badge-icon)),
+    .section-count-badge,
+    .drawer-badge,
+    .brand-menu-ws-badge,
+    .ws-picker-badge,
+    .thread-status-question-badge,
+    .app-store-status,
+    .app-store-modified-chip,
+    .theme-card-badge {
+        width: calc-size(fit-content, round(up, size, 1px));
+    }
+}
+
+.badge.badge-icon {
+    --badge-icon-box: var(--badge-height);
+    --badge-icon-inset-share: 0.2;
+    --badge-icon-inset: calc(var(--badge-icon-box) * var(--badge-icon-inset-share));
+    display: grid;
+    place-items: center;
+    width: var(--badge-icon-box);
+    height: var(--badge-icon-box);
+    min-width: 0;
+    min-height: 0;
+    padding: var(--badge-icon-inset);
+    line-height: 0;
+    will-change: transform;
+}
+
+@supports (width: round(down, 1rem, 1px)) {
+    .badge.badge-icon {
+        --badge-icon-box: round(down, var(--badge-height), 1px);
+        --badge-icon-inset: round(down, var(--badge-icon-box) * var(--badge-icon-inset-share), 1px);
+    }
+}
+
+.badge-icon > .brand-badge-queued,
+.badge-icon svg {
+    width: 100%;
+    height: 100%;
+}
+
+.badge-icon > .mini-spinner {
+    --spinner-color: currentColor;
+    --spinner-size: calc(var(--badge-icon-box) - 2 * var(--badge-icon-inset));
+}
+
+
+@supports (text-box-trim: trim-both) {
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner, .badge-icon)),
+    .section-count-badge,
+    .drawer-badge,
+    .brand-menu-ws-badge,
+    .ws-picker-badge,
+    .thread-status-question-badge,
+    .app-store-status,
+    .app-store-modified-chip,
+    .theme-card-badge {
+        display: inline-block;
+        text-align: center;
+        align-content: end;
+        text-box-trim: trim-both;
+        text-box-edge: cap alphabetic;
+        --badge-floor: round(down, var(--badge-height), 1px);
+        --badge-box: clamp(var(--badge-floor) - 1px,
+            round(1cap + 2 * round((var(--badge-floor) - 0.5px - 1cap) / 2, 1px), 1px),
+            var(--badge-floor));
+        height: var(--badge-box);
+        min-height: 0;
+        --badge-baseline-inset: round((var(--badge-box) - 1cap) / 2, 1px);
+        padding-block: 0 var(--badge-baseline-inset);
+    }
+}
+
+.badge,
+.drawer-badge,
+.section-count-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.system-attention-badge,
+.brand-menu-refresh-badge {
+    border-radius: 999px;
+}

@@ -1,0 +1,1609 @@
+use std::sync::Weak;
+
+use async_trait::async_trait;
+use uuid::Uuid;
+
+use super::ThreadQueueRequest;
+use crate::engine::thread_events::{
+    ActorMode, EventChannel, EventMeta, MessageOrigin, TriggerInvocation,
+};
+use crate::engine::LucidosEngine;
+use crate::scheduler::user_tasks;
+
+enum PermissionInput {
+    Removed,
+    Ready(Option<crate::engine::PreEmittedOrigin>),
+}
+
+async fn await_card_close(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::event_bus::BusEvent;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut subscription = bus.subscribe();
+    while crate::engine::question_park_sql::open_card(&mut *bus.pool().acquire().await?, thread_id)
+        .await?
+        .is_some()
+    {
+        loop {
+            match subscription.recv().await {
+                Ok(emitted)
+                    if emitted.seq.is_some()
+                        && matches!(
+                            emitted.typed, BusEvent::Thread { thread_id: owner, ref event, .. }
+                            if owner == thread_id && super::saved_drafts::may_release_permission_input(event)
+                        ) =>
+                {
+                    break
+                }
+                Err(RecvError::Lagged(_)) => break,
+                Err(RecvError::Closed) => {
+                    return Err("event bus closed while the message waited for a card".into())
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// INVARIANT: A card can open after admission. Subscribe before checking so neither
+/// resolution nor take-back can fall between the read and the wait.
+async fn await_permission_for_accepted_message(
+    bus: &crate::engine::event_bus::EventBus,
+    request: &ThreadQueueRequest,
+) -> Result<PermissionInput, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::event_bus::BusEvent;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let ThreadQueueRequest::AgentChat {
+        thread_id,
+        event_id: Some(id),
+        mode: ActorMode::Human,
+        ..
+    } = request
+    else {
+        return Ok(PermissionInput::Ready(None));
+    };
+    let id = Uuid::parse_str(id)?;
+    let mut subscription = bus.subscribe();
+    loop {
+        if crate::engine::consumption_claim::was_removed(bus.pool(), *thread_id, id).await? {
+            return Ok(PermissionInput::Removed);
+        }
+        if !super::saved_drafts::permission_blocks_input(bus, request).await? {
+            break;
+        }
+        loop {
+            match subscription.recv().await {
+                Ok(emitted)
+                    if emitted.seq.is_some()
+                        && matches!(
+                            emitted.typed, BusEvent::Thread { thread_id: owner, ref event, .. }
+                            if owner == *thread_id && super::saved_drafts::may_release_permission_input(event)
+                        ) =>
+                {
+                    break
+                }
+                Err(RecvError::Lagged(_)) => break,
+                Err(RecvError::Closed) => {
+                    return Err(
+                        "event bus closed while the message waited for a permission card".into(),
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
+    let recorded = super::saved_drafts::permission_held_message_exists(bus.pool(), id).await?;
+    Ok(PermissionInput::Ready(
+        recorded.then_some(crate::engine::PreEmittedOrigin::Message(id)),
+    ))
+}
+
+impl super::ThreadQueue {
+    /// INVARIANT: The deadline rides with the durable request. Check the database clock
+    /// immediately before dispatch, including for a request reloaded at boot.
+    pub(crate) async fn drop_retry_if_expired(
+        &self,
+        entry_id: Uuid,
+        request: &ThreadQueueRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let (trigger_id, retry) = match request {
+            ThreadQueueRequest::Cron {
+                trigger_id,
+                retry_of: Some(retry),
+            }
+            | ThreadQueueRequest::EventTrigger {
+                trigger_id,
+                retry_of: Some(retry),
+                ..
+            } => (trigger_id, retry),
+            _ => return Ok(false),
+        };
+        let expired: bool = sqlx::query_scalar("SELECT now() >= $1::timestamptz")
+            .bind(retry.deadline)
+            .fetch_one(&self.pool)
+            .await?;
+        if expired {
+            self.drop_interrupted_entry(
+                entry_id,
+                trigger_id,
+                Some(retry.thread_id),
+                "retry-deadline-passed",
+                "The retry of an interrupted run was too old to start. Open the run to see how far it got.",
+            )
+            .await?;
+        }
+        Ok(expired)
+    }
+}
+
+/// INVARIANT: Boot reports interrupted intent fires at their start, before cron catch-up.
+/// Scripts and ordinary failures retain their completion-time stamps. A run
+/// parked on the owner's card records its fire now, as failed, so cron
+/// catch-up never fires that slot again. A resumed run records its outcome.
+fn should_record_trigger_execution(
+    run: &crate::triggers::TriggerRun,
+    shutting_down: bool,
+    result: &Result<(), Box<dyn std::error::Error + Send + Sync>>,
+) -> bool {
+    !(matches!(run, crate::triggers::TriggerRun::Intent { .. })
+        && result.as_ref().err().is_some_and(|error| {
+            user_tasks::is_shutdown_interruption(shutting_down, error.as_ref())
+        }))
+}
+
+pub struct ExecutableEntry {
+    pub id: Uuid,
+    pub request: ThreadQueueRequest,
+}
+
+#[async_trait]
+pub trait ThreadQueueExecutor: Send + Sync {
+    /// INVARIANT: Admission-time hook, awaited inline before `ThreadQueueAdmitted` is
+    /// emitted and before [`Self::execute`] is spawned. Used by the
+    /// sub-thread kind to emit its eager `MessageReceived` so the parent's
+    /// `active_children_count` increments before the spawning tool call
+    /// returns — same ordering the pre-queue `run_thread` path guaranteed.
+    async fn prepare(&self, _request: &mut ThreadQueueRequest) {}
+
+    async fn execute(
+        &self,
+        entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+pub(crate) struct EngineThreadQueueExecutor {
+    engine: Weak<LucidosEngine>,
+}
+
+impl EngineThreadQueueExecutor {
+    pub(crate) fn new(engine: Weak<LucidosEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+pub(crate) fn eager_sub_thread_message(
+    workspace: &std::path::Path,
+    request: &ThreadQueueRequest,
+) -> Option<crate::engine::thread_events::ThreadEvent> {
+    let ThreadQueueRequest::SubThread {
+        prompt,
+        parent_thread_id,
+        spawning_event_id,
+        wake_mode,
+        model,
+        reasoning_effort,
+        provider,
+        origin,
+        ..
+    } = request
+    else {
+        return None;
+    };
+    Some(crate::engine::message_events::make_message_received(
+        workspace,
+        prompt,
+        None,
+        None,
+        *parent_thread_id,
+        *spawning_event_id,
+        *wake_mode,
+        MessageOrigin::mode_or(origin.as_ref(), ActorMode::Agent),
+        model.as_deref(),
+        reasoning_effort.as_deref(),
+        provider.as_deref(),
+        origin.clone(),
+        None,
+    ))
+}
+
+pub(crate) fn coding_agent_spawn_params(
+    request: ThreadQueueRequest,
+    resolve_images: impl FnOnce(&[String]) -> Option<Vec<crate::engine::types::ChatImage>>,
+) -> Option<(Uuid, crate::engine::types::SpawnAgentThreadParams)> {
+    let ThreadQueueRequest::CodingAgent {
+        hook_args,
+        depth: _,
+        prompt,
+        cc_thread_id,
+        image_hashes,
+        device_id,
+        parent_thread_id,
+        spawning_event_id,
+        wake_mode,
+        repo_id,
+        title,
+        app_id,
+        coding_agent,
+        model,
+        reasoning_effort,
+        origin,
+    } = request
+    else {
+        return None;
+    };
+    Some((
+        cc_thread_id,
+        crate::engine::types::SpawnAgentThreadParams {
+            hook_args,
+            prompt,
+            user_images: resolve_images(&image_hashes),
+            device_id,
+            parent_thread_id,
+            spawning_event_id,
+            wake_mode,
+            repo_id,
+            caller_title: title,
+            app_id,
+            coding_agent,
+            model,
+            reasoning_effort,
+            origin,
+        },
+    ))
+}
+
+#[async_trait]
+impl ThreadQueueExecutor for EngineThreadQueueExecutor {
+    async fn prepare(&self, request: &mut ThreadQueueRequest) {
+        let ThreadQueueRequest::SubThread {
+            child_thread_id,
+            parent_thread_id,
+            pre_emitted_origin,
+            ..
+        } = &*request
+        else {
+            return;
+        };
+        if pre_emitted_origin.is_some() {
+            return;
+        }
+        let child_thread_id = *child_thread_id;
+        let parent_thread_id = *parent_thread_id;
+        let Some(engine) = self.engine.upgrade() else {
+            return;
+        };
+        let first_message = crate::core::event_hooks::FIRST_MESSAGE_EVENT_TYPE;
+        if !matches!(
+            engine.event_bus.hooks_armed_on(first_message).await,
+            Ok(false)
+        ) {
+            return;
+        }
+        let Some(event) = eager_sub_thread_message(engine.workspace_path(), request) else {
+            return;
+        };
+        // INVARIANT: Eager MessageReceived — a Child-relation child's
+        // active_children_count must increment before the parent can finish
+        // its turn, otherwise ResponseGenerated wins the race and the parent
+        // flips to "review" before the child is on the projection. On emit
+        // failure the spawn path emits its own MessageReceived instead
+        // (pre_emitted_origin stays None).
+        //
+        // `None` is the child's own provenance, not the submitter's. This runs
+        // inline on whichever task submitted. A trigger fire spawning a
+        // sub-thread would otherwise stamp its own marker here, and never wake
+        // on the child it asked for. See `EventBus::emit_as_trigger`.
+        let result = engine
+            .event_bus
+            .emit_as_trigger(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id: child_thread_id,
+                    event,
+                    meta: EventMeta {
+                        channel: Some(EventChannel::Chat),
+                        ..EventMeta::NONE
+                    },
+                },
+                None,
+            )
+            .await;
+        let ThreadQueueRequest::SubThread {
+            pre_emitted_origin, ..
+        } = request
+        else {
+            return;
+        };
+        match result {
+            Ok(Some(emit)) => {
+                *pre_emitted_origin = Some(emit.event_id);
+                if let Some(parent) = parent_thread_id {
+                    engine
+                        .mcp_manager
+                        .inherit_enabled(parent, child_thread_id)
+                        .await;
+                }
+            }
+            Ok(None) => {
+                log_legacy!("[ThreadQueue] sub-thread MessageReceived emit returned no result")
+            }
+            Err(e) => log_legacy!(
+                "[ThreadQueue] sub-thread MessageReceived emit failed: {}",
+                e
+            ),
+        }
+    }
+
+    async fn execute(
+        &self,
+        entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(engine) = self.engine.upgrade() else {
+            log_legacy!(
+                "[ThreadQueue] Engine gone — entry {} not executed",
+                entry.id
+            );
+            return Err("thread_queue_engine_unavailable".into());
+        };
+        engine.execute_thread_queue_entry(entry).await
+    }
+}
+
+impl LucidosEngine {
+    fn queued_trigger_config(&self, trigger_id: &str) -> Option<crate::triggers::TriggerConfig> {
+        match self.trigger_configs.read() {
+            Ok(configs) => {
+                let config = configs.get(trigger_id).cloned();
+                if config.is_none() {
+                    log_legacy!(
+                        "[ThreadQueue] Trigger {} no longer exists, skipping its queued fire",
+                        trigger_id
+                    );
+                }
+                config
+            }
+            Err(e) => {
+                log_legacy!(
+                    "[ThreadQueue] Trigger registry unreadable ({}), skipping {}'s queued fire",
+                    e,
+                    trigger_id
+                );
+                None
+            }
+        }
+    }
+
+    pub async fn execute_thread_queue_entry(
+        self: std::sync::Arc<Self>,
+        entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::Ordering;
+
+        let mut input_turn = self.event_bus.take_accepted_input_turn(entry.id);
+        if let Some(turn) = input_turn.as_mut() {
+            turn.wait_for_predecessor().await;
+        }
+
+        if let ThreadQueueRequest::AgentChat {
+            thread_id,
+            mode: ActorMode::Agent | ActorMode::Engine,
+            ..
+        } = &entry.request
+        {
+            await_card_close(&self.event_bus, *thread_id).await?;
+        }
+
+        let mut pre_emitted_origin = None;
+        if matches!(
+            &entry.request,
+            ThreadQueueRequest::AgentChat {
+                user_addressing: None,
+                ..
+            }
+        ) {
+            match await_permission_for_accepted_message(&self.event_bus, &entry.request).await? {
+                PermissionInput::Removed => return Ok(()),
+                PermissionInput::Ready(origin) => pre_emitted_origin = origin,
+            }
+        }
+
+        let routed_audience = if let ThreadQueueRequest::AgentChat {
+            thread_id,
+            user_addressing: Some(addressing),
+            mode: ActorMode::Human,
+            origin,
+            ..
+        } = &entry.request
+        {
+            let audience = crate::engine::thread_users::route_user_only_message(
+                self.pool(),
+                &self.event_bus,
+                *thread_id,
+                addressing,
+                origin.clone(),
+            )
+            .await?;
+            if audience == crate::engine::agent_pause::MessageAudience::Agent {
+                match await_permission_for_accepted_message(&self.event_bus, &entry.request).await?
+                {
+                    PermissionInput::Removed => return Ok(()),
+                    PermissionInput::Ready(origin) => pre_emitted_origin = origin,
+                }
+            }
+            Some(audience)
+        } else {
+            None
+        };
+
+        // INVARIANT: Resolve once before dispatch and keep these exact bytes through the
+        // spawn. A second disk read would reintroduce the disappearance race.
+        let mut images =
+            match &entry.request {
+                ThreadQueueRequest::CodingAgent { image_hashes, .. }
+                | ThreadQueueRequest::AgentChat { image_hashes, .. } => {
+                    match self.resolve_message_image_hashes(image_hashes) {
+                        Ok(images) => images,
+                        Err(error) => {
+                            if matches!(
+                                &entry.request,
+                                ThreadQueueRequest::AgentChat {
+                                    mode: ActorMode::Human,
+                                    origin: Some(_),
+                                    ..
+                                }
+                            ) {
+                                let events = super::saved_drafts::image_failure_events(
+                                    &entry.request,
+                                    error.to_string(),
+                                )?;
+                                let events = if pre_emitted_origin.is_some() {
+                                    events.into_iter().skip(1).collect()
+                                } else {
+                                    events
+                                };
+                                self.event_bus
+                                    .emit_atomically_as_trigger(
+                                        entry
+                                            .request
+                                            .thread_id()
+                                            .ok_or("saved_draft_thread_missing")?,
+                                        events,
+                                        None,
+                                    )
+                                    .await?
+                                    .ok_or("saved_draft_failure_not_recorded")?;
+                                return Ok(());
+                            }
+                            let (thread_id, request_event_id, channel) = match &entry.request {
+                                ThreadQueueRequest::CodingAgent { cc_thread_id, .. } => {
+                                    (*cc_thread_id, None, EventChannel::ClaudeCode)
+                                }
+                                ThreadQueueRequest::AgentChat {
+                                    thread_id,
+                                    event_id,
+                                    ..
+                                } => (
+                                    *thread_id,
+                                    event_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
+                                    EventChannel::Chat,
+                                ),
+                                _ => unreachable!(),
+                            };
+                            self
+                            .event_bus
+                            .emit_as_trigger(crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                    error: error.to_string(),
+                                    agent_exit: None,
+                                    provider_error: None,
+                                    spend_cap: None,
+                                },
+                                meta: EventMeta {
+                                    request_event_id,
+                                    channel: Some(channel),
+                                    ..EventMeta::NONE
+                                },
+                            }, None)
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => None,
+            };
+        if let Some(command) = entry.request.coding_agent_command() {
+            use crate::engine::agent_pause::MessageAudience;
+            if routed_audience != Some(MessageAudience::UserOnly) {
+                return self.run_coding_agent_command(&entry.request, command).await;
+            }
+        }
+
+        match entry.request {
+            ThreadQueueRequest::EventTrigger {
+                trigger_id,
+                event_type,
+                event_payload,
+                depth,
+                origin_thread_id,
+                source_event_id,
+                retry_of,
+            } => {
+                let Some(config) = self.queued_trigger_config(&trigger_id) else {
+                    return Ok(());
+                };
+                log_legacy!(
+                    "[Scheduler] Firing event trigger '{}' for event '{}'",
+                    config.name,
+                    event_type
+                );
+                let invocation = TriggerInvocation::Event {
+                    event_type,
+                    event_id: source_event_id,
+                    thread_id: origin_thread_id,
+                };
+                crate::scheduler::ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
+                debug_assert_eq!(
+                    user_tasks::current_event_trigger_depth(),
+                    depth,
+                    "the queue scopes the whole execution at the request's depth"
+                );
+                // INVARIANT: The run AND the `TriggerExecuted` that closes it are both
+                // links in this fire's chain, so both run inside the scope
+                // the queue established at the request's depth. Recording
+                // outside it stamped depth 0, and a trigger subscribed to
+                // `TriggerExecuted` re-fired unbounded.
+                //
+                // `ACTIVE_TRIGGER_ID` wraps the same pair, for the same reason:
+                // every event either half emits is this trigger's own, so the
+                // matcher must be able to see whose fire it was. It stays
+                // here rather than moving to the queue beside the depth. It
+                // must NOT reach the work a fire hands off
+                // (`docs/adr/0137-a-trigger-never-wakes-itself.md`), and the
+                // depth must.
+                let inner = user_tasks::ACTIVE_TRIGGER_ID.scope(config.id.clone(), async {
+                    let result = user_tasks::execute_user_task(
+                        self.clone(),
+                        self.pool(),
+                        &config,
+                        invocation,
+                        Some(&event_payload),
+                        entry.id,
+                        retry_of,
+                    )
+                    .await;
+                    if should_record_trigger_execution(
+                        &config.run,
+                        self.is_shutting_down(),
+                        &result,
+                    ) {
+                        self.record_trigger_executed(
+                            &config.id,
+                            crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                        )
+                        .await;
+                    }
+                    result
+                });
+                let result = match origin_thread_id {
+                    Some(tid) => user_tasks::ORIGIN_THREAD_ID.scope(tid, inner).await,
+                    None => inner.await,
+                };
+                crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
+                if let Some(e) = result
+                    .as_ref()
+                    .err()
+                    .filter(|e| !user_tasks::run_awaits_owner(e.as_ref()))
+                {
+                    log_legacy!("[Scheduler] Event trigger '{}' failed: {}", config.name, e);
+                }
+            }
+            ThreadQueueRequest::Cron {
+                trigger_id,
+                retry_of,
+            } => {
+                let Some(config) = self.queued_trigger_config(&trigger_id) else {
+                    return Ok(());
+                };
+                if config.paused {
+                    log_legacy!(
+                        "[ThreadQueue] Trigger '{}' paused — skipping queued scheduled fire",
+                        config.name
+                    );
+                    return Ok(());
+                }
+                let active =
+                    crate::scheduler::ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if active > 1 {
+                    log_legacy!(
+                        "[Scheduler] Concurrent execution: {} tasks now active (starting '{}')",
+                        active,
+                        config.name
+                    );
+                }
+                // INVARIANT: A cron fire has no chain depth to carry, but it owns every
+                // event it emits just as an event fire does. The scope covers
+                // the run AND the `TriggerExecuted` that closes it.
+                let result = user_tasks::ACTIVE_TRIGGER_ID
+                    .scope(config.id.clone(), async {
+                        let result = user_tasks::execute_user_task(
+                            self.clone(),
+                            self.pool(),
+                            &config,
+                            TriggerInvocation::Schedule,
+                            None,
+                            entry.id,
+                            retry_of,
+                        )
+                        .await;
+                        crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        if should_record_trigger_execution(
+                            &config.run,
+                            self.is_shutting_down(),
+                            &result,
+                        ) {
+                            self.record_trigger_executed(
+                                &config.id,
+                                crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                            )
+                            .await;
+                        }
+                        result
+                    })
+                    .await;
+                if let Some(e) = result
+                    .as_ref()
+                    .err()
+                    .filter(|e| !user_tasks::run_awaits_owner(e.as_ref()))
+                {
+                    log_legacy!("[Scheduler] Task '{}' execution failed: {}", config.name, e);
+                }
+            }
+            ThreadQueueRequest::SubThread {
+                depth: _,
+                hook_args,
+                prompt,
+                child_thread_id,
+                parent_thread_id,
+                spawning_event_id,
+                wake_mode,
+                title,
+                model,
+                reasoning_effort,
+                provider,
+                pre_emitted_origin,
+                origin,
+            } => {
+                match self.agent_host().spawn_thread(
+                    &self,
+                    &prompt,
+                    parent_thread_id,
+                    spawning_event_id,
+                    wake_mode,
+                    child_thread_id,
+                    pre_emitted_origin,
+                    title.as_deref(),
+                    crate::core::ResolvedModelSelection {
+                        model,
+                        reasoning_effort,
+                        provider,
+                    },
+                    origin,
+                    hook_args,
+                ) {
+                    Ok((_, handle)) => {
+                        // INVARIANT: The processing task is the work — awaiting it is what
+                        // holds this entry's capacity slot until the sub-thread
+                        // finishes its turn.
+                        if let Err(e) = handle.await {
+                            log_legacy!(
+                                "[ThreadQueue] Sub-thread {} task join failed: {:?}",
+                                child_thread_id,
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log_legacy!(
+                            "[ThreadQueue] Sub-thread {} spawn failed: {}",
+                            child_thread_id,
+                            e
+                        );
+                    }
+                }
+            }
+            request @ ThreadQueueRequest::CodingAgent { .. } => {
+                let Some((cc_thread_id, params)) =
+                    coding_agent_spawn_params(request, |_| images.take())
+                else {
+                    return Ok(());
+                };
+                // INVARIANT: Inner spawn + watcher: monitor_cc_task owns the panic
+                // cleanup (ResponseFailed + SessionEnded + session removal);
+                // awaiting the watcher holds the capacity slot until both the
+                // session AND any panic cleanup finish.
+                let engine = self.clone();
+                let inner = tokio::spawn(async move {
+                    engine
+                        .agent_host()
+                        .run_agent_thread_spawn(&engine, params, cc_thread_id)
+                        .await;
+                });
+                let watcher = Self::monitor_cc_task(self.clone(), cc_thread_id, inner);
+                if let Err(e) = watcher.await {
+                    log_legacy!(
+                        "[ThreadQueue] Coding-agent {} watcher join failed: {:?}",
+                        cc_thread_id,
+                        e
+                    );
+                }
+            }
+            ThreadQueueRequest::AgentChat {
+                depth: _,
+                hook_args,
+                message,
+                user_addressing,
+                thread_id,
+                event_id,
+                image_hashes,
+                device_id,
+                app_context,
+                file_context,
+                url_context,
+                conflict_change_id,
+                model,
+                reasoning_effort,
+                provider,
+                use_coding_agent,
+                repo_id,
+                cc_model,
+                coding_agent,
+                title,
+                mode,
+                origin,
+                parent_thread_id,
+                spawning_event_id,
+                wake_mode,
+                app_id,
+                integrated: _,
+                spawning_trigger_id: _,
+            } => {
+                let mut routed_user_slot = None;
+                if mode == ActorMode::Human {
+                    let id = Uuid::parse_str(
+                        event_id
+                            .as_deref()
+                            .ok_or("accepted_input_identity_missing")?,
+                    )?;
+                    crate::engine::thread_users::clear_unrecorded_user_notice(self.pool(), id)
+                        .await?;
+                    if let Some(addressing) = &user_addressing {
+                        use crate::engine::agent_pause::MessageAudience;
+                        use crate::engine::thread_users::{
+                            post_user_only_message, queue_user_notice, UserOnlyMessage,
+                        };
+                        let user_only = routed_audience == Some(MessageAudience::UserOnly);
+                        if user_only || !addressing.mentions.is_empty() {
+                            queue_user_notice(
+                                &self, thread_id, id, &message, addressing, user_only, &origin,
+                            )
+                            .await?;
+                        }
+                        if user_only {
+                            post_user_only_message(
+                                &self.event_bus,
+                                thread_id,
+                                UserOnlyMessage {
+                                    text: message,
+                                    image_hashes,
+                                    device_id,
+                                    mentions: addressing.mentions.clone(),
+                                    event_id: Some(id),
+                                },
+                                origin,
+                            )
+                            .await?;
+                            drop(input_turn.take());
+                            return Ok(());
+                        }
+                        routed_user_slot = Some(
+                            self.thread_queue
+                                .acquire_user_slot_for_entry(
+                                    entry.id,
+                                    thread_id,
+                                    super::truncate_summary(message.trim()),
+                                )
+                                .await,
+                        );
+                    }
+                }
+                if let Some(app) = app_id {
+                    match self.pending_app_spawn.lock() {
+                        Ok(mut guard) => {
+                            guard.insert(thread_id, app);
+                        }
+                        Err(e) => {
+                            log_legacy!("[ThreadQueue] pending_app_spawn poisoned: {}", e);
+                        }
+                    }
+                }
+                let auto_apply_actor = if mode == ActorMode::Human
+                    && !matches!(origin, Some(MessageOrigin::SavedDraft { .. }))
+                {
+                    origin.clone()
+                } else {
+                    None
+                };
+                let result = self
+                    .agent_host()
+                    .process_message_with_steps(
+                        &self,
+                        &message,
+                        model.as_deref(),
+                        app_context,
+                        file_context,
+                        reasoning_effort.as_deref(),
+                        provider.as_deref(),
+                        images.as_deref(),
+                        device_id.as_deref(),
+                        use_coding_agent,
+                        event_id.as_deref(),
+                        Some(thread_id),
+                        conflict_change_id,
+                        repo_id.as_deref(),
+                        url_context.map(|context| *context),
+                        parent_thread_id,
+                        spawning_event_id,
+                        wake_mode,
+                        mode,
+                        cc_model.as_deref(),
+                        coding_agent,
+                        pre_emitted_origin,
+                        title.as_deref(),
+                        origin,
+                        None,
+                        crate::engine::FollowUpUrgency::Normal,
+                        input_turn.take(),
+                        Some(&hook_args),
+                    )
+                    .await;
+                match result {
+                    Ok(res) => {
+                        if res.proposed_change {
+                            if res.auto_apply {
+                                self.agent_host()
+                                    .auto_apply_proposed_change(
+                                        &self,
+                                        res.request_id,
+                                        auto_apply_actor,
+                                    )
+                                    .await;
+                            }
+                            self.broadcast_changes_updated().await;
+                        }
+                        if !res.orphaned_injections.is_empty() {
+                            self.agent_host()
+                                .process_orphan_chain(&self, res.thread_id, res.orphaned_injections)
+                                .await;
+                        }
+                    }
+                    // INVARIANT: No terminator here: the turn settles its own exchange,
+                    // anchored. An unanchored copy is what the idempotency
+                    // gate cannot match, so it double-fired.
+                    // Failure may precede message recording or come from the
+                    // terminal write itself. Keep durable membership; recovery
+                    // checks this input's identity before handing off work.
+                    Err(e) => return Err(e),
+                }
+                drop(routed_user_slot);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn queued_image_hashes(
+        &self,
+        images: Option<&[crate::engine::types::ChatImage]>,
+    ) -> Vec<String> {
+        crate::engine::message_events::images_to_hashes(self.workspace_path(), images)
+    }
+
+    /// INVARIANT: Resolve every image or refuse execution; an accepted attachment must
+    /// never silently disappear from a queued or recovered turn.
+    pub fn resolve_message_image_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<
+        Option<Vec<crate::engine::types::ChatImage>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        resolve_message_images(self.workspace_path(), hashes)
+    }
+
+    async fn run_coding_agent_command(
+        self: &std::sync::Arc<Self>,
+        request: &ThreadQueueRequest,
+        command: crate::engine::thread_events::CodingAgentCommand,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::thread_events::ThreadEvent;
+        use crate::runtime::CodingAgent;
+
+        let ThreadQueueRequest::AgentChat {
+            thread_id,
+            event_id: Some(id),
+            coding_agent,
+            repo_id,
+            app_id,
+            message,
+            image_hashes,
+            origin,
+            user_addressing,
+            ..
+        } = request
+        else {
+            return Err("coding agent command missing its accepted input".into());
+        };
+        let id = Uuid::parse_str(id)?;
+        if super::saved_drafts::accepted_input_recorded(self.pool(), id).await? {
+            return Ok(());
+        }
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT coding_agent FROM thread_summaries WHERE thread_id=$1 AND state <> 'composing'",
+        )
+        .bind(thread_id)
+        .fetch_optional(self.pool())
+        .await?
+        .flatten();
+        let agent = recorded
+            .as_deref()
+            .map(CodingAgent::parse)
+            .or(*coding_agent)
+            .unwrap_or(CodingAgent::ClaudeCode);
+        let origin_recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE id=$1 AND event_type='CodingAgentCommandReceived')",
+        )
+        .bind(id)
+        .fetch_one(self.pool())
+        .await?;
+        if !origin_recorded {
+            use crate::engine::thread_users::{clear_unrecorded_user_notice, queue_user_notice};
+            clear_unrecorded_user_notice(self.pool(), id).await?;
+            if let Some(addressing) = user_addressing
+                .as_deref()
+                .filter(|a| !a.mentions.is_empty())
+            {
+                queue_user_notice(self, *thread_id, id, message, addressing, false, origin).await?;
+            }
+            let result = self
+                .event_bus
+                .emit_as_trigger(
+                    BusEvent::Thread {
+                        thread_id: *thread_id,
+                        event: ThreadEvent::CodingAgentCommandReceived {
+                            text: message.clone(),
+                            agent,
+                            repo_id: repo_id.clone(),
+                            app_folder: app_id.as_ref().map(|app| {
+                                self.workspace_path()
+                                    .join("data/apps")
+                                    .join(app)
+                                    .to_string_lossy()
+                                    .into_owned()
+                            }),
+                            user_image_hashes: image_hashes.clone(),
+                        },
+                        meta: EventMeta {
+                            event_id: Some(id),
+                            actor: origin.clone(),
+                            channel: Some(EventChannel::ClaudeCode),
+                            ..EventMeta::NONE
+                        },
+                    },
+                    None,
+                )
+                .await;
+            match result {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(error) if crate::engine::consumption_claim::is_removed_refusal(&*error) => {
+                    return Ok(())
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.agent_host()
+            .answer_coding_agent_command(self, *thread_id, id, command, agent)
+            .await
+    }
+}
+
+fn resolve_message_images(
+    workspace: &std::path::Path,
+    hashes: &[String],
+) -> Result<Option<Vec<crate::engine::types::ChatImage>>, Box<dyn std::error::Error + Send + Sync>>
+{
+    use crate::core::blobs::{compute_hash, resolve_blob, sniff_image_mime};
+    use base64::Engine as _;
+    if hashes.is_empty() {
+        return Ok(None);
+    }
+    let images = hashes
+        .iter()
+        .map(|hash| {
+            let blob = resolve_blob(workspace, hash)
+                .ok_or_else(|| format!("Image {hash} is missing; the message was not sent."))?;
+            let bytes = std::fs::read(&blob.path)?;
+            if compute_hash(&bytes) != *hash || sniff_image_mime(&bytes) != Some(blob.mime.as_str())
+            {
+                return Err(format!("Image {hash} is invalid; the message was not sent.").into());
+            }
+            Ok(crate::engine::types::ChatImage {
+                base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                mime_type: blob.mime,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+    Ok(Some(images))
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn an_agent_message_waits_for_the_open_card() {
+        use crate::engine::event_bus::{BusEvent, EventBus};
+        use crate::engine::permission::{
+            raise_request, Action, PermissionChoice, RequestCard, RequestOption,
+        };
+        use crate::engine::thread_events::{AnswerKind, EventChannel, EventMeta, ThreadEvent};
+        use crate::test_support::{seed_idle_coding_thread, setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let bus = std::sync::Arc::new(bus);
+        let thread = seed_idle_coding_thread(&bus, None).await;
+        let card = raise_request(
+            &bus,
+            thread,
+            RequestCard {
+                question: "Create the workspace?".into(),
+                header: "Permission",
+                action: Action::CreateWorkspace,
+                breadth: None,
+                options: vec![RequestOption {
+                    label: "Don't allow".into(),
+                    description: String::new(),
+                    choice: PermissionChoice::Refuse,
+                }],
+                batch: None,
+            },
+            EventChannel::ClaudeCode,
+        )
+        .await
+        .unwrap();
+        let waiter = {
+            let bus = bus.clone();
+            tokio::spawn(async move { super::await_card_close(&bus, thread).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished(), "the message waits behind the card");
+        bus.emit_or_log(
+            BusEvent::Thread {
+                thread_id: thread,
+                event: ThreadEvent::UserQuestionAnswered {
+                    compose: None,
+                    tool_use_id: card,
+                    answer: AnswerKind::Superseded,
+                    quiet: true,
+                },
+                meta: EventMeta::NONE,
+            },
+            "[test] answer",
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the close releases the message")
+            .unwrap()
+            .unwrap();
+        teardown_test_db(&db).await;
+    }
+
+    #[test]
+    fn queued_images_are_all_or_nothing_and_keep_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = crate::core::blobs::write_blob(workspace.path(), b"GIF89a-first").unwrap();
+        let second = crate::core::blobs::write_blob(workspace.path(), b"GIF89a-second").unwrap();
+        let hashes = vec![second.hash.clone(), first.hash.clone(), second.hash.clone()];
+        let images = resolve_message_images(workspace.path(), &hashes)
+            .unwrap()
+            .unwrap();
+        use base64::Engine;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&images[0].base64)
+                .unwrap(),
+            b"GIF89a-second"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&images[1].base64)
+                .unwrap(),
+            b"GIF89a-first"
+        );
+        assert_eq!(images.len(), 3);
+        std::fs::remove_file(&first.path).unwrap();
+        assert!(resolve_message_images(workspace.path(), &hashes).is_err());
+        assert!(resolve_message_images(workspace.path(), &[])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn queued_images_refuse_corrupted_blob_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let blob = crate::core::blobs::write_blob(workspace.path(), b"GIF89a-original").unwrap();
+        std::fs::write(&blob.path, b"GIF89a-replacement").unwrap();
+        assert!(resolve_message_images(workspace.path(), &[blob.hash]).is_err());
+    }
+
+    #[test]
+    fn shutdown_intent_interruption_is_the_only_suppressed_stamp() {
+        use crate::triggers::TriggerRun;
+        let intent = TriggerRun::Intent {
+            intent: "Prepare report".into(),
+        };
+        let script = TriggerRun::Script {
+            path: "report.sh".into(),
+        };
+        let interrupted = Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "cut").into(),
+        );
+        let failed = Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+            std::io::Error::other("failed").into(),
+        );
+        assert!(!super::should_record_trigger_execution(
+            &intent,
+            true,
+            &interrupted
+        ));
+        assert!(super::should_record_trigger_execution(
+            &intent,
+            false,
+            &interrupted
+        ));
+        assert!(super::should_record_trigger_execution(
+            &script,
+            true,
+            &interrupted
+        ));
+        assert!(super::should_record_trigger_execution(
+            &intent, true, &failed
+        ));
+        assert!(super::should_record_trigger_execution(
+            &intent,
+            true,
+            &Ok(())
+        ));
+        let parked = Err::<(), Box<dyn std::error::Error + Send + Sync>>(Box::new(
+            user_tasks::TriggerRunAwaitsOwner,
+        ));
+        assert!(
+            super::should_record_trigger_execution(&intent, false, &parked),
+            "a parked run records its fire, so catch-up never fires that slot again"
+        );
+    }
+
+    #[test]
+    fn both_trigger_arms_guard_the_completion_stamp() {
+        let scopes = trigger_id_scope_bodies(include_str!("executor.rs"));
+        assert_eq!(scopes.len(), 2);
+        for scope in scopes {
+            let guard = scope.find("if should_record_trigger_execution(").unwrap();
+            let stamp = scope.find("self.record_trigger_executed(").unwrap();
+            assert!(guard < stamp, "both trigger kinds leave cut fires for boot");
+        }
+    }
+
+    use super::*;
+    use crate::engine::thread_events::{MessageOrigin, ThreadDirection, ThreadEvent};
+
+    fn spawning_thread_link(spawning_thread: Uuid) -> Option<MessageOrigin> {
+        Some(MessageOrigin::ThreadLink {
+            thread_id: spawning_thread,
+            title: None,
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            direction: ThreadDirection::Parent,
+        })
+    }
+
+    #[test]
+    fn eager_sub_thread_message_keeps_attribution_without_linkage() {
+        let spawning_thread = Uuid::new_v4();
+        let request = ThreadQueueRequest::SubThread {
+            hook_args: Default::default(),
+            depth: 0,
+            prompt: "independent work".into(),
+            child_thread_id: Uuid::new_v4(),
+            parent_thread_id: None,
+            spawning_event_id: None,
+            wake_mode: None,
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            pre_emitted_origin: None,
+            origin: spawning_thread_link(spawning_thread),
+        };
+        let event =
+            eager_sub_thread_message(std::path::Path::new("/tmp/lucidos-test-ws"), &request)
+                .expect("SubThread produces an event");
+        let ThreadEvent::MessageReceived {
+            origin,
+            parent_thread_id,
+            spawning_event_id,
+            ..
+        } = event
+        else {
+            panic!("expected MessageReceived");
+        };
+        assert_eq!(origin, spawning_thread_link(spawning_thread));
+        assert_eq!(parent_thread_id, None);
+        assert_eq!(spawning_event_id, None);
+    }
+
+    #[test]
+    fn eager_sub_thread_message_stamps_the_mode_its_origin_implies() {
+        use crate::engine::thread_events::{EngineReason, PluginSetupOccasion};
+
+        let origin = Some(MessageOrigin::engine(EngineReason::PluginSetup {
+            plugin_id: "habit-tracker".into(),
+            plugin_name: "Habit Tracker".into(),
+            version: "0.2.0".into(),
+            occasion: PluginSetupOccasion::FreshInstall,
+            confirmed_on_device_id: None,
+        }));
+        let request = ThreadQueueRequest::SubThread {
+            hook_args: Default::default(),
+            depth: 0,
+            prompt: "Set up the newly installed Habit Tracker plugin.".into(),
+            child_thread_id: Uuid::new_v4(),
+            parent_thread_id: None,
+            spawning_event_id: None,
+            wake_mode: None,
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            pre_emitted_origin: None,
+            origin: origin.clone(),
+        };
+        let event =
+            eager_sub_thread_message(std::path::Path::new("/tmp/lucidos-test-ws"), &request)
+                .expect("SubThread produces an event");
+        let ThreadEvent::MessageReceived {
+            origin: stamped,
+            mode,
+            ..
+        } = event
+        else {
+            panic!("expected MessageReceived");
+        };
+        assert_eq!(stamped, origin);
+        assert_eq!(mode, ActorMode::Engine);
+    }
+
+    #[test]
+    fn eager_sub_thread_message_is_only_for_sub_threads() {
+        let request = ThreadQueueRequest::Cron {
+            retry_of: None,
+            trigger_id: "t".into(),
+        };
+        assert!(
+            eager_sub_thread_message(std::path::Path::new("/tmp/lucidos-test-ws"), &request)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn coding_agent_spawn_params_keep_attribution_without_linkage() {
+        let spawning_thread = Uuid::new_v4();
+        let cc_thread_id = Uuid::new_v4();
+        let request = ThreadQueueRequest::CodingAgent {
+            hook_args: Default::default(),
+            depth: 0,
+            prompt: "independent work".into(),
+            cc_thread_id,
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            wake_mode: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
+            origin: spawning_thread_link(spawning_thread),
+        };
+        let (id, params) =
+            coding_agent_spawn_params(request, |_| None).expect("CodingAgent produces params");
+        assert_eq!(id, cc_thread_id);
+        assert_eq!(params.origin, spawning_thread_link(spawning_thread));
+        assert_eq!(params.parent_thread_id, None);
+        assert_eq!(params.spawning_event_id, None);
+    }
+
+    #[test]
+    fn coding_agent_spawn_params_keep_a_child_spawn_intact() {
+        let spawning_thread = Uuid::new_v4();
+        let tool_call = Uuid::new_v4();
+        let request = ThreadQueueRequest::CodingAgent {
+            hook_args: Default::default(),
+            depth: 0,
+            prompt: "delegated work".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: Some(spawning_thread),
+            spawning_event_id: Some(tool_call),
+            wake_mode: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
+            origin: spawning_thread_link(spawning_thread),
+        };
+        let (_, params) =
+            coding_agent_spawn_params(request, |_| None).expect("CodingAgent produces params");
+        assert_eq!(params.parent_thread_id, Some(spawning_thread));
+        assert_eq!(params.spawning_event_id, Some(tool_call));
+        assert_eq!(params.origin, spawning_thread_link(spawning_thread));
+    }
+
+    #[test]
+    fn coding_agent_spawn_params_carry_the_model_and_effort_pins() {
+        let request = ThreadQueueRequest::CodingAgent {
+            hook_args: Default::default(),
+            depth: 0,
+            prompt: "a single-file shell edit".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            wake_mode: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: Some("claude-sonnet-5".into()),
+            reasoning_effort: Some("low".into()),
+            origin: None,
+        };
+        let (_, params) =
+            coding_agent_spawn_params(request, |_| None).expect("CodingAgent produces params");
+        assert_eq!(params.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn an_unpinned_spawn_reaches_the_backend_with_no_model() {
+        let request = ThreadQueueRequest::CodingAgent {
+            hook_args: Default::default(),
+            depth: 0,
+            prompt: "unpinned".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            wake_mode: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        };
+        let (_, params) =
+            coding_agent_spawn_params(request, |_| None).expect("CodingAgent produces params");
+        assert_eq!(params.model, None);
+        assert_eq!(params.reasoning_effort, None);
+    }
+
+    #[test]
+    fn both_trigger_arms_pass_their_own_entry_id_to_the_fire() {
+        const SRC: &str = include_str!("executor.rs");
+        let needle = concat!("user_tasks::", "execute_user_task(");
+        let calls: Vec<&str> = SRC
+            .match_indices(needle)
+            .map(|(i, _)| {
+                let after = &SRC[i..];
+                &after[..after.find(")\n").expect("the call closes")]
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "one call per trigger kind");
+        for call in calls {
+            assert!(
+                call.contains("entry.id"),
+                "a trigger fire must carry its own entry id: {call}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_event_arm_records_its_completion_inside_the_fires_own_future() {
+        const SRC: &str = include_str!("executor.rs");
+        let anchor = concat!("let inner = user_tasks::", "ACTIVE_TRIGGER_ID.scope(");
+        let arm = SRC
+            .split_once(anchor)
+            .expect("the event arm builds the fire's future")
+            .1;
+        let scoped = arm
+            .split_once("let result = match origin_thread_id")
+            .expect("the future ends where the origin-thread wrapper begins")
+            .0;
+        assert!(
+            scoped.contains("record_trigger_executed"),
+            "the completion must be recorded inside the fire's own future"
+        );
+    }
+
+    #[test]
+    fn the_executor_does_not_scope_the_depth_itself() {
+        const SRC: &str = include_str!("executor.rs");
+        let needle = concat!("EVENT_TRIGGER_DEPTH", ".scope(");
+        assert!(
+            !SRC.contains(needle),
+            "the Thread Queue scopes execution; see ThreadQueue::spawn_execution"
+        );
+    }
+
+    fn trigger_id_scope_bodies(src: &str) -> Vec<&str> {
+        let needle = concat!("user_tasks::", "ACTIVE_TRIGGER_ID");
+        src.match_indices(needle)
+            .map(|(i, _)| {
+                let after = &src[i..];
+                let open =
+                    after.find(".scope(").expect("the marker opens a scope") + ".scope(".len();
+                let bytes = after.as_bytes();
+                let (mut depth, mut in_str, mut escaped) = (1usize, false, false);
+                let mut end = None;
+                for (j, &c) in bytes.iter().enumerate().skip(open) {
+                    match (in_str, escaped, c) {
+                        (true, true, _) => escaped = false,
+                        (true, false, b'\\') => escaped = true,
+                        (true, false, b'"') => in_str = false,
+                        (false, _, b'"') => in_str = true,
+                        (false, _, b'(') => depth += 1,
+                        (false, _, b')') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                &after[open..end.expect("the scope closes")]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_trigger_arms_run_the_whole_fire_under_the_trigger_id_scope() {
+        let scopes = trigger_id_scope_bodies(include_str!("executor.rs"));
+        assert_eq!(scopes.len(), 2, "one scope per trigger kind");
+        for scope in scopes {
+            assert!(
+                scope.contains("execute_user_task"),
+                "the fire itself must run inside the scope: {scope}"
+            );
+            assert!(
+                scope.contains("record_trigger_executed"),
+                "the closing completion must be inside the scope too: {scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_executor_never_emits_on_the_ambient_marker() {
+        let needle = concat!(".emit", "(");
+        assert!(
+            !include_str!("executor.rs").contains(needle),
+            "state the provenance: call EventBus::emit_as_trigger instead"
+        );
+    }
+
+    #[test]
+    fn the_scope_balancer_stops_at_the_matching_paren() {
+        let src = format!(
+            "{}.scope(id, f(x, \") not this one\"))\nafter",
+            concat!("user_tasks::", "ACTIVE_TRIGGER_ID")
+        );
+        assert_eq!(
+            trigger_id_scope_bodies(&src),
+            vec!["id, f(x, \") not this one\")"]
+        );
+    }
+
+    async fn prepared_origin(engine: &std::sync::Arc<LucidosEngine>, child: Uuid) -> Option<Uuid> {
+        let mut request = ThreadQueueRequest::SubThread {
+            hook_args: Default::default(),
+            depth: 0,
+            prompt: "gated work".into(),
+            child_thread_id: child,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            wake_mode: None,
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            pre_emitted_origin: None,
+            origin: spawning_thread_link(Uuid::new_v4()),
+        };
+        EngineThreadQueueExecutor::new(std::sync::Arc::downgrade(engine))
+            .prepare(&mut request)
+            .await;
+        let ThreadQueueRequest::SubThread {
+            pre_emitted_origin, ..
+        } = request
+        else {
+            unreachable!("prepare keeps the request kind");
+        };
+        pre_emitted_origin
+    }
+
+    #[tokio::test]
+    async fn an_armed_first_message_hook_leaves_the_sub_thread_message_to_its_turn() {
+        use crate::core::event_hooks::HookVerdict;
+        use crate::test_support::{arm_hook, setup_test_db, teardown_test_db, FakeHookAsker};
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = crate::engine_test_support::boot_mock_engine(&db).await;
+        let unhooked = Uuid::new_v4();
+        assert!(prepared_origin(&engine, unhooked).await.is_some());
+
+        let asker = FakeHookAsker::new(HookVerdict::Allowed(Vec::new()));
+        engine
+            .event_bus
+            .install_event_hook_asker(asker.clone())
+            .await
+            .unwrap();
+        arm_hook(&engine.event_bus, "gate", "MessageReceived").await;
+        let hooked = Uuid::new_v4();
+
+        assert_eq!(prepared_origin(&engine, hooked).await, None);
+        assert!(asker.asked().is_empty());
+        let recorded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'MessageReceived'",
+        )
+        .bind(hooked)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, 0);
+        engine.pool().close().await;
+        teardown_test_db(&db).await;
+    }
+}

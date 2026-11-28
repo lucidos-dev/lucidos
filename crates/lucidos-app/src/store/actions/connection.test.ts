@@ -1,0 +1,365 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { panelOverlay, activeInlineForm, connectionStatus, engineRestarting, focusedThreadId, threadMap, threadsLoaded, toasts, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
+import type { CredentialRequest, EmailConfirmRequest } from '../types';
+import { makeThreadState } from './threads-test-helpers';
+import { ApiError } from '../../api/client';
+import { gapRefreshedVersion } from '../eventGap';
+
+vi.mock('../../api/client', async (importActual) => ({
+  ...(await importActual<typeof import('../../api/client')>()),
+  checkHealth: vi.fn().mockResolvedValue({
+    status: 'loaded',
+    data: { workspace: 'test', workspace_path: '/tmp/test' },
+  }),
+  API_BASE: 'http://localhost:3000',
+}));
+vi.mock('./compose', async (importActual) => ({
+  ...(await importActual<typeof import('./compose')>()),
+  flushUndeliveredComposeDrafts: vi.fn(),
+}));
+vi.mock('./thread-stream', () => ({
+  connectThreadEvents: vi.fn(),
+  reviveThreadEvents: vi.fn(),
+}));
+vi.mock('./thread-loading', () => ({
+  loadAllThreads: vi.fn().mockResolvedValue(undefined),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
+  retryStaleOpenThreadEvents: vi.fn().mockReturnValue(false),
+  loadThreadEvents: vi.fn().mockResolvedValue(undefined),
+  clearThreadFetchGuards: vi.fn(),
+  markLoadedThreadsStale: vi.fn(),
+}));
+vi.mock('./chat-changes', () => ({
+  refreshChangesState: vi.fn(),
+  clearRestartInFlight: vi.fn(),
+  RESTART_LS_KEY: 'restart-required',
+}));
+vi.mock('./notifications', () => ({
+  loadUnreadNotifications: vi.fn(),
+}));
+vi.mock('./preferences', () => ({
+  loadPreferences: vi.fn(),
+}));
+vi.mock('./releaseNotices', () => ({
+  loadReleaseNotices: vi.fn(),
+}));
+vi.mock('./whatsNew', () => ({
+  reloadChangelogIfRead: vi.fn(),
+}));
+
+const { handleResume, handleRestartTimeout, checkConnection } = await import('./connection');
+const { checkHealth } = await import('../../api/client');
+const { flushUndeliveredComposeDrafts } = await import('./compose');
+const { reviveThreadEvents } = await import('./thread-stream');
+const { loadPreferences } = await import('./preferences');
+const { loadReleaseNotices } = await import('./releaseNotices');
+const { reloadChangelogIfRead } = await import('./whatsNew');
+
+const emailConfirmForm = {
+  type: 'email-confirm' as const,
+  request: {
+    to: ['test@example.com'],
+    subject: 'Test',
+    body: 'Hello',
+    account: 'work',
+    from: 'me@example.com',
+  } as EmailConfirmRequest,
+};
+
+beforeEach(() => {
+  panelOverlay.value = null;
+  connectionStatus.value = 'connected';
+});
+
+describe('handleResume preserves email-confirm form', () => {
+  it('should NOT clear email-confirm form on resume/focus', async () => {
+    panelOverlay.value = { type: 'form', form: emailConfirmForm };
+
+    await handleResume();
+
+    expect(activeInlineForm.value).not.toBeNull();
+    expect(activeInlineForm.value?.type).toBe('email-confirm');
+  });
+
+  it('should preserve the full email draft data on resume', async () => {
+    panelOverlay.value = { type: 'form', form: emailConfirmForm };
+
+    await handleResume();
+
+    const form = activeInlineForm.value;
+    expect(form?.type).toBe('email-confirm');
+    if (form?.type === 'email-confirm') {
+      expect(form.request.to).toEqual(['test@example.com']);
+      expect(form.request.subject).toBe('Test');
+    }
+  });
+});
+
+const credentialRequestForm = {
+  type: 'credential' as const,
+  request: {
+    service: 'helius',
+    base_urls: ['https://api.helius.xyz'],
+    auth_type: 'api_key' as const,
+    prompt: 'Paste your Helius API key.\n1. Go to https://dev.helius.xyz/dashboard\n2. Copy API Key',
+  } as CredentialRequest,
+};
+
+describe('handleResume preserves credential request form', () => {
+  it('should NOT clear credential request form on resume/focus', async () => {
+    panelOverlay.value = { type: 'form', form: credentialRequestForm };
+
+    await handleResume();
+
+    expect(activeInlineForm.value).not.toBeNull();
+    expect(activeInlineForm.value?.type).toBe('credential');
+  });
+
+  it('should preserve the full credential request prompt and instructions on resume', async () => {
+    panelOverlay.value = { type: 'form', form: credentialRequestForm };
+
+    await handleResume();
+
+    const form = activeInlineForm.value;
+    expect(form?.type).toBe('credential');
+    if (form?.type === 'credential') {
+      expect(form.request?.service).toBe('helius');
+      expect(form.request?.prompt).toContain('1. Go to https://dev.helius.xyz/dashboard');
+      expect(form.request?.prompt).toContain('2. Copy API Key');
+    }
+  });
+});
+
+describe('handleResume reloads preferences', () => {
+  it('calls loadPreferences on every resume', async () => {
+    await handleResume();
+
+    expect(loadPreferences).toHaveBeenCalled();
+  });
+});
+
+describe('handleResume keeps the event stream', () => {
+  it('revives the stream instead of tearing it down', async () => {
+    vi.mocked(reviveThreadEvents).mockClear();
+
+    await handleResume();
+
+    expect(reviveThreadEvents).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('handleResume repairs the state a gap leaves behind', () => {
+  it('bumps every registered version counter once', async () => {
+    const version = gapRefreshedVersion();
+    const before = version.value;
+
+    await handleResume();
+
+    expect(version.value).toBe(before + 1);
+  });
+});
+
+describe('handleResume re-reads the release notices', () => {
+  it('asks the engine again, because a restart can have brought a new notice', async () => {
+    await handleResume();
+
+    expect(loadReleaseNotices).toHaveBeenCalled();
+  });
+});
+
+describe('handleResume re-reads the changelog', () => {
+  it('asks the engine again, because a restart can have failed or outdated it', async () => {
+    await handleResume();
+
+    expect(reloadChangelogIfRead).toHaveBeenCalled();
+  });
+});
+
+describe('handleResume thread-events refresh', () => {
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+  });
+
+  function loadedThreads(ids: string[]): void {
+    threadMap.value = new Map(ids.map(id => [id, makeThreadState(id, { eventsLoaded: true })]));
+  }
+
+  it('refreshes the focused thread and marks the rest instead of fetching them', async () => {
+    loadedThreads(['bg-1', 'bg-2', 'focused', 'bg-3']);
+    focusedThreadId.value = 'focused';
+    const { refreshThreadEvents, markLoadedThreadsStale } = await import('./thread-loading');
+    const refresh = refreshThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    const mark = markLoadedThreadsStale as unknown as ReturnType<typeof vi.fn>;
+    refresh.mockClear();
+    mark.mockClear();
+
+    await handleResume();
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    expect(new Set(refresh.mock.calls.map(c => c[0]))).toEqual(new Set(['focused']));
+    expect(mark).toHaveBeenCalled();
+  });
+
+  it('marks the loaded threads stale before the focused refresh starts', async () => {
+    loadedThreads(['focused', 'bg-1']);
+    focusedThreadId.value = 'focused';
+    const { refreshThreadEvents, markLoadedThreadsStale } = await import('./thread-loading');
+    const refresh = refreshThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    const mark = markLoadedThreadsStale as unknown as ReturnType<typeof vi.fn>;
+    refresh.mockClear();
+    mark.mockClear();
+    const marksAtRefresh: number[] = [];
+    refresh.mockImplementation(async () => {
+      marksAtRefresh.push(mark.mock.calls.length);
+      return true;
+    });
+
+    await handleResume();
+    refresh.mockResolvedValue(true);
+
+    expect(marksAtRefresh[marksAtRefresh.length - 1]).toBe(1);
+  });
+
+  it('issues no request at all when the user is on the compose view', async () => {
+    loadedThreads(Array.from({ length: 20 }, (_, i) => `t${i}`));
+    const { refreshThreadEvents, markLoadedThreadsStale } = await import('./thread-loading');
+    const refresh = refreshThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    const mark = markLoadedThreadsStale as unknown as ReturnType<typeof vi.fn>;
+    refresh.mockClear();
+    mark.mockClear();
+
+    await handleResume();
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(mark).toHaveBeenCalled();
+  });
+
+  it('still bounds the failed-load retry, which stays eager', async () => {
+    threadMap.value = new Map(
+      Array.from({ length: 20 }, (_, i) => [`t${i}`, makeThreadState(`t${i}`, { eventsLoadFailed: true })]),
+    );
+    const { loadThreadEvents } = await import('./thread-loading');
+    const load = loadThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    load.mockClear();
+
+    let inFlight = 0;
+    let peak = 0;
+    load.mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await Promise.resolve();
+      inFlight--;
+    });
+
+    await handleResume();
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+
+    expect(load).toHaveBeenCalledTimes(20);
+    expect(peak).toBeLessThanOrEqual(THREAD_EVENTS_FETCH_CONCURRENCY);
+    load.mockReset();
+    load.mockResolvedValue(undefined);
+  });
+});
+
+describe('handleResume thread-list refresh', () => {
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    toasts.value = [];
+    connectionStatus.value = 'connected';
+    threadsLoaded.value = true;
+  });
+
+  async function resumeWithFailingThreadList(err: unknown): Promise<void> {
+    const { loadAllThreads } = await import('./thread-loading');
+    const load = loadAllThreads as unknown as ReturnType<typeof vi.fn>;
+    load.mockRejectedValueOnce(err);
+    await handleResume();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    load.mockResolvedValue(undefined);
+  }
+
+  it('raises no card when the refresh times out', async () => {
+    await resumeWithFailingThreadList(new DOMException('Request timed out after 10000ms', 'TimeoutError'));
+    expect(toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY)).toBeUndefined();
+  });
+
+  it('still raises one card when the engine answers and refuses', async () => {
+    await resumeWithFailingThreadList(new ApiError(500, 'Failed to get saved threads'));
+    const card = toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY);
+    expect(card).toBeDefined();
+    expect(card!.message).toContain('Failed to get saved threads');
+  });
+});
+
+describe('handleResume resets the per-thread fetch guards', () => {
+  it('clears the retry caps so a long-lived iOS page can retry a stuck thread', async () => {
+    const { clearThreadFetchGuards } = await import('./thread-loading');
+    const clear = clearThreadFetchGuards as unknown as ReturnType<typeof vi.fn>;
+    clear.mockClear();
+
+    await handleResume();
+
+    expect(clear).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('overlapping handleResume calls run one resume sync', () => {
+  it('runs the sync once for a burst of resumes', async () => {
+    vi.mocked(loadPreferences).mockClear();
+
+    await Promise.all([handleResume(), handleResume(), handleResume()]);
+
+    expect(loadPreferences).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('handleResume flushes undelivered compose drafts', () => {
+  it('re-sends any draft the engine never received on a reconnect', async () => {
+    vi.mocked(flushUndeliveredComposeDrafts).mockClear();
+
+    await handleResume();
+
+    expect(flushUndeliveredComposeDrafts).toHaveBeenCalled();
+  });
+});
+
+describe('a restart timeout keeps the restart flag up while it probes', () => {
+  it('still reads the restart as in progress when the health probe runs', async () => {
+    engineRestarting.value = true;
+    let flagDuringProbe: boolean | null = null;
+    vi.mocked(checkHealth).mockImplementationOnce(async () => {
+      flagDuringProbe = engineRestarting.value;
+      return { status: 'failed', error: 'unreachable' } as never;
+    });
+
+    await handleRestartTimeout();
+
+    expect(flagDuringProbe).toBe(true);
+    expect(engineRestarting.value).toBe(false);
+  });
+});
+
+describe('the poll does not raise the thread-list card on a failed load', () => {
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    toasts.value = [];
+    connectionStatus.value = 'connected';
+    threadsLoaded.value = false;
+    engineRestarting.value = false;
+  });
+
+  it('stays silent when the thread list load rejects on a poll tick', async () => {
+    const { loadAllThreads } = await import('./thread-loading');
+    const load = loadAllThreads as unknown as ReturnType<typeof vi.fn>;
+    load.mockRejectedValueOnce(new ApiError(500, 'Failed to get saved threads'));
+
+    await checkConnection();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    expect(toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY)).toBeUndefined();
+  });
+});

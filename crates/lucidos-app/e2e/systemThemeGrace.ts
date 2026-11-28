@@ -1,0 +1,9 @@
+import {
+  SYSTEM_THEME_MODE_CONFIRM_MS,
+  SYSTEM_THEME_MODE_SETTLE_MS,
+} from '../../../packages/lucidos-sdk/src/appearance';
+
+const REPAINT_SLACK_MS = 1_700;
+
+export const SYSTEM_THEME_GRACE_MS =
+  SYSTEM_THEME_MODE_SETTLE_MS + SYSTEM_THEME_MODE_CONFIRM_MS + REPAINT_SLACK_MS;

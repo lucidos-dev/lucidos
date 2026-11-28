@@ -1,0 +1,159 @@
+.protected-surface {
+    isolation: isolate;
+
+    --bg-primary: var(--protected-bg);
+    --bg-secondary: var(--protected-inset);
+    --bg-tertiary: var(--protected-raised);
+    --bg-quaternary: var(--protected-raised);
+    --bg-hover: var(--protected-raised);
+    --bg-selected: var(--protected-raised);
+    --picked-surface: var(--protected-picked);
+    --border-color: color-mix(in srgb, var(--protected-text) 22%, var(--protected-surface));
+    --surface-bg: var(--protected-surface);
+    --scrim: var(--protected-scrim);
+
+    --text-primary: var(--protected-text);
+    --text-secondary: var(--protected-text-muted);
+    --text-muted: var(--protected-text-muted);
+    --text-on-accent: var(--protected-on-action);
+    --text-strong: var(--protected-text);
+
+    --accent: var(--protected-accent);
+    --accent-light: var(--protected-accent);
+    --accent-action: var(--protected-action);
+    --brand-blue: var(--protected-action);
+    --brand-blue-deep: var(--protected-action);
+    --initiator-coding-agent: var(--protected-caution);
+
+    --accent-green: var(--protected-confirm-text);
+    --accent-green-soft: var(--protected-confirm-text);
+    --accent-yellow: var(--protected-caution);
+    --accent-red: var(--protected-danger-text);
+    --accent-orange: var(--protected-caution);
+    --accent-notable: var(--protected-accent);
+
+    --header-bar-top: var(--protected-surface);
+    --header-bar-bottom: var(--protected-surface);
+    --header-gradient: var(--protected-surface);
+    --titlebar-strip-bg: var(--protected-surface);
+    --titlebar-strip-continues: 0;
+    --header-fg: var(--protected-text);
+    --header-fg-muted-alpha: 0.72;
+    --header-fg-muted: var(--protected-text-muted);
+    --header-control-veil-hover: 12%;
+    --header-control-veil-active: 22%;
+    --header-control-veil-active-hover: 30%;
+    --header-divider: transparent;
+    --header-badge-bg: var(--protected-action);
+    --header-badge-fg: var(--protected-on-action);
+
+    --focus-header-tint: transparent;
+    --focus-header-underline: transparent;
+    --focus-pill-bg: var(--protected-accent);
+    --focus-pill-glow: none;
+    --nav-focus-glow: var(--protected-text-muted);
+    --nav-focus-border-alpha: 60%;
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--protected-accent) 55%, transparent);
+
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+    --shadow-up: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+
+    --text-glow: none;
+    --lucidos-mark-bg-top: #2d83e0;
+    --lucidos-mark-bg-bottom: #0a4ea8;
+    --lucidos-mark-fg: #ffffff;
+    --claude-mark: var(--protected-caution);
+    --codex-mark: var(--protected-accent);
+    --agent-icon-theme: var(--protected-accent);
+    --agent-icon-muted: var(--protected-text-muted);
+
+    --syntax-key: var(--protected-accent);
+    --syntax-string: var(--protected-text);
+    --syntax-number: var(--protected-text);
+    --syntax-keyword: var(--protected-accent);
+    --syntax-comment: var(--protected-text-muted);
+    --syntax-control: var(--protected-accent);
+    --syntax-type: var(--protected-text);
+    --syntax-function: var(--protected-text);
+
+    --font-mono: var(--protected-font-mono);
+
+    --font-size-3xs: 0.5625rem;
+    --font-size-2xs: 0.625rem;
+    --font-size-xs: 0.6875rem;
+    --font-size-sm: 0.75rem;
+    --font-size-md: 0.8125rem;
+    --font-size-lg: 0.875rem;
+    --font-size-xl: 1rem;
+    --font-size-2xl: 1.125rem;
+    --font-size-3xl: 1.25rem;
+    --font-size-display: 2.25rem;
+    --space-xs: 0.25rem;
+    --space-sm: 0.5rem;
+    --space-md: 0.75rem;
+    --space-lg: 1rem;
+    --space-xl: 1.5rem;
+}
+
+:where(.protected-surface:not(.modal-overlay)) {
+    position: relative;
+    z-index: 1;
+}
+
+html[data-theme-mode="light"] .protected-surface {
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
+}
+
+:where(.protected-surface) {
+    background-color: var(--bg-primary);
+}
+
+.thread-overflow-item:where(.protected-surface) {
+    background-color: var(--protected-surface);
+}
+
+@media (hover: hover) {
+    .thread-overflow-item.protected-surface[aria-disabled="true"]:hover {
+        background-color: var(--protected-surface);
+    }
+}
+
+.split-button-menu.protected-surface,
+.split-button.open::before {
+    background: var(--protected-inset);
+    border-color: color-mix(in srgb, var(--protected-text) 22%, var(--protected-surface));
+}
+
+.protected-surface .action-btn.action-btn-confirm,
+.action-btn.action-btn-confirm.protected-surface {
+    --confirm-bg: var(--protected-confirm);
+    color: var(--protected-on-confirm);
+}
+
+.protected-surface .action-btn.action-btn-danger,
+.action-btn.action-btn-danger.protected-surface {
+    background-color: var(--protected-danger);
+    color: var(--protected-on-danger);
+}
+
+@media (hover: hover) {
+    .protected-surface .action-btn:not(.action-btn-secondary):hover,
+    .action-btn.protected-surface:not(.action-btn-secondary):hover,
+    .protected-surface .form-actions .btn-save:hover {
+        background-color: var(--protected-action);
+    }
+
+    .protected-surface .action-btn.action-btn-confirm:hover,
+    .action-btn.action-btn-confirm.protected-surface:hover {
+        background-color: var(--protected-confirm);
+    }
+
+    .protected-surface .action-btn.action-btn-danger:hover,
+    .action-btn.action-btn-danger.protected-surface:hover {
+        background-color: var(--protected-danger);
+    }
+}

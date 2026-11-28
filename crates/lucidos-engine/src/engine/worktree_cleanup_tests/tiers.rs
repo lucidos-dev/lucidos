@@ -1,0 +1,1020 @@
+use super::common::*;
+use crate::engine::event_bus::EventBus;
+use crate::engine::git_ops::{git_cmd, worktrees_dir};
+use crate::test_support::{setup_test_db, teardown_test_db};
+use std::sync::Arc;
+use std::time::Duration;
+use uuid::Uuid;
+
+#[tokio::test]
+async fn tier_1_strips_build_artifacts_after_24h_idle() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, true).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_1_AGE).await;
+
+    assert!(worktree.join("target").exists());
+    assert!(worktree.join("node_modules").exists());
+    assert!(worktree.join(".lucidos/cache").exists());
+
+    let rx = bus.subscribe();
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(cleaned.len(), 1, "exactly one Tier 1 event");
+    let (_, tier, freed, branch_deleted) = cleaned[0];
+    assert_eq!(tier, 1);
+    assert!(freed > 0, "expected non-zero freed bytes, got {}", freed);
+    assert!(!branch_deleted, "Tier 1 must not delete branches");
+
+    assert!(worktree.exists(), "worktree dir must remain after Tier 1");
+    assert!(!worktree.join("target").exists(), "target/ should be gone");
+    assert!(
+        !worktree.join("node_modules").exists(),
+        "node_modules/ should be gone"
+    );
+    assert!(
+        !worktree.join(".lucidos/cache").exists(),
+        ".lucidos/cache should be gone"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tier_2_removes_worktree_after_30_days_clean_unsaved() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(cleaned.len(), 1, "exactly one Tier 2 event");
+    let (_, tier, _, _) = cleaned[0];
+    assert_eq!(tier, 2);
+    assert!(!worktree.exists(), "Tier 2 must remove worktree dir");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn saved_threads_are_exempt_from_tier_2() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, true).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert!(
+        cleaned.iter().all(|(_, tier, _, _)| *tier != 2),
+        "no Tier 2 event for a saved thread, got: {:?}",
+        cleaned
+    );
+    assert!(worktree.exists(), "saved worktree must remain on disk");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn dirty_threads_are_exempt_from_tier_2_auto() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    tokio::fs::write(worktree.join("uncommitted.txt"), b"hello")
+        .await
+        .unwrap();
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert!(
+        cleaned.iter().all(|(_, tier, _, _)| *tier != 2),
+        "no Tier 2 event for a dirty thread, got: {:?}",
+        cleaned
+    );
+    assert!(worktree.exists(), "dirty worktree must remain on disk");
+    assert!(
+        worktree.join("uncommitted.txt").exists(),
+        "uncommitted file must be preserved"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn hard_pressure_strips_the_target_of_a_thread_idle_minutes() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, true).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, 5 * 60).await;
+
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
+
+    let rx = bus.subscribe();
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(cleaned.len(), 1, "Tier 1 fires under hard pressure");
+    assert_eq!(cleaned[0].1, 1, "must be Tier 1, not a removal tier");
+    assert!(!worktree.join("target").exists(), "target/ is stripped");
+    assert!(worktree.exists(), "the worktree itself stays");
+    let short = &thread_id.simple().to_string()[..8];
+    assert!(
+        branch_exists(&root, &format!("test/{short}")).await,
+        "the branch stays"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn hard_pressure_keeps_the_tree_of_a_live_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    tokio::fs::create_dir_all(worktree.join("target"))
+        .await
+        .unwrap();
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, 0).await;
+
+    let mut worker = make_worker_with_active(
+        pool.clone(),
+        bus.clone(),
+        root.clone(),
+        active_threads(&[thread_id]),
+    );
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
+
+    let rx = bus.subscribe();
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert!(
+        cleaned.is_empty(),
+        "a live thread is untouched: {cleaned:?}"
+    );
+    assert!(worktree.join("target").exists(), "target/ survives");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tier_0_keeps_branch_if_fully_merged() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    let short = &thread_id.simple().to_string()[..8];
+    let branch = format!("test/{}", short);
+
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(
+        cleaned.len(),
+        1,
+        "Tier 0 should fire on fully-merged worktree"
+    );
+    let (_, tier, _, branch_deleted) = cleaned[0];
+    assert_eq!(tier, 0, "should be reclaimed by Tier 0, not Tier 2");
+    assert!(!branch_deleted);
+    assert!(branch_exists(&root, &branch).await);
+    assert!(!worktree.exists());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tier_2_preserves_branch_if_unmerged_commits_exist() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    let short = &thread_id.simple().to_string()[..8];
+    let branch = format!("test/{}", short);
+
+    tokio::fs::write(worktree.join("feature.txt"), b"feat")
+        .await
+        .unwrap();
+    git_cmd(&["add", "."], &worktree).await.unwrap();
+    git_cmd(&["commit", "-m", "feature"], &worktree)
+        .await
+        .unwrap();
+
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(cleaned.len(), 1, "Tier 2 should fire");
+    let (_, _, _, branch_deleted) = cleaned[0];
+    assert!(
+        !branch_deleted,
+        "branch with unmerged commits must NOT be deleted"
+    );
+
+    let res = git_cmd(&["rev-parse", "--verify", &branch], &root).await;
+    let exists = matches!(res, Ok(o) if o.status.success());
+    assert!(
+        exists,
+        "branch {} must still exist for data preservation",
+        branch
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_tier_2_only_reclaim_under_hard_pressure_is_announced() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
+
+    let rx = bus.subscribe();
+    worker.run_once().await;
+
+    assert!(
+        !worktree.exists(),
+        "precondition: Tier 2 is the arm that ran, and it removed the worktree"
+    );
+    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
+    let alerts: Vec<_> = notifications
+        .into_iter()
+        .filter(|n| n.title == "Lucidos reclaimed disk space")
+        .collect();
+    assert_eq!(
+        alerts.len(),
+        1,
+        "the engine deleted a worktree under hard pressure and must say so. \
+         Tier 2's bytes were dropped from the freed total, which is what the \
+         notification is gated on. Got: {:?}",
+        alerts
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn legacy_random_suffix_worktrees_are_skipped() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let legacy = worktrees_dir(&root).join("cc-random-suffix-12345");
+    tokio::fs::create_dir_all(&legacy).await.unwrap();
+    tokio::fs::write(legacy.join("file.txt"), b"legacy")
+        .await
+        .unwrap();
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    assert!(
+        events.is_empty(),
+        "legacy worktrees must not produce WorktreeCleaned events: {:?}",
+        events
+    );
+    assert!(legacy.exists(), "legacy worktree dir must remain untouched");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn recent_threads_are_exempt() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, true).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, 5).await;
+
+    let rx = bus.subscribe();
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert!(
+        cleaned.is_empty(),
+        "no cleanup should happen for a recently-active thread, got: {:?}",
+        cleaned
+    );
+    assert!(worktree.join("target").exists(), "target/ must survive");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn ample_disk_keeps_non_archived_merged_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    let short = &thread_id.simple().to_string()[..8];
+    let branch = format!("test/{}", short);
+
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert!(
+        cleaned.is_empty(),
+        "non-archived worktree must be kept while disk is comfortable, got: {:?}",
+        cleaned
+    );
+    assert!(worktree.exists(), "worktree dir must remain on disk");
+    let res = git_cmd(&["rev-parse", "--verify", &branch], &root).await;
+    assert!(
+        matches!(res, Ok(o) if o.status.success()),
+        "branch {} must be preserved",
+        branch
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn archived_thread_worktree_reclaimed_with_ample_disk() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+
+    insert_thread_summary_with_archive(&pool, thread_id, false, "archived").await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(
+        cleaned.len(),
+        1,
+        "an archived thread's worktree must be reclaimed even with ample disk"
+    );
+    assert_eq!(
+        cleaned[0].1, 2,
+        "the archived removal reports a full removal"
+    );
+    assert!(!cleaned[0].3, "archived removal keeps the branch");
+    assert!(!worktree.exists(), "archived worktree dir must be removed");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn fan_in_unprocessed_completion_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    insert_child_completed_event(&pool, parent_id, child_id, TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == parent_id)
+        .collect();
+    assert!(
+        cleaned.is_empty(),
+        "parent with an unprocessed child completion must keep its worktree, got: {:?}",
+        cleaned
+    );
+    assert!(
+        worktree.exists(),
+        "worktree must remain — the parent still owes a fan-in resume"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn fan_in_active_children_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    set_active_children_count(&pool, parent_id, 1).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == parent_id)
+        .collect();
+    assert!(
+        cleaned.is_empty(),
+        "parent with a running child must keep its worktree, got: {:?}",
+        cleaned
+    );
+    assert!(
+        worktree.exists(),
+        "worktree must remain while a child is running"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn fan_in_stopped_child_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    insert_stopped_child(&pool, parent_id, Uuid::new_v4()).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    assert!(
+        !events.iter().any(|(t, ..)| *t == parent_id),
+        "a parent with a stopped child must keep its worktree"
+    );
+    assert!(worktree.exists());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn fan_in_card_behind_a_stopped_note_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    insert_child_completed_event(&pool, parent_id, Uuid::new_v4(), TIER_2_AGE).await;
+    insert_child_stopped_event(&pool, parent_id, Uuid::new_v4(), TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    assert!(
+        !events.iter().any(|(t, ..)| *t == parent_id),
+        "an unprocessed card must keep guarding the worktree past a later note"
+    );
+    assert!(worktree.exists());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn fan_in_card_behind_a_side_question_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    insert_child_completed_event(&pool, parent_id, Uuid::new_v4(), TIER_2_AGE).await;
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'SideQuestionAsked', '{}'::jsonb, \
+                 NOW() - make_interval(secs => $3), $2::uuid)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(parent_id)
+    .bind(TIER_2_AGE as f64)
+    .execute(&pool)
+    .await
+    .expect("insert SideQuestionAsked event");
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    assert!(
+        !events.iter().any(|(t, ..)| *t == parent_id),
+        "a side question hid an unprocessed card from the cleanup guard"
+    );
+    assert!(worktree.exists());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn ample_disk_keeps_artifacts_of_a_thread_with_a_pending_change() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, true).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_pending_change_for_thread(&pool, thread_id, &root).await;
+    insert_old_event(&pool, thread_id, TIER_1_AGE).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert!(
+        cleaned.is_empty(),
+        "no stripping while disk is comfortable + thread non-archived, got: {:?}",
+        cleaned
+    );
+    assert!(
+        worktree.join("target").exists(),
+        "target/ must be kept warm"
+    );
+    assert!(
+        worktree.join("node_modules").exists(),
+        "node_modules/ must be kept warm"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn keep_preserves_a_fully_merged_branch() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    let branch = format!("test/{}", &thread_id.simple().to_string()[..8]);
+
+    let outcome =
+        remove_worktree_and_optionally_delete_branch(&worktree, None, BranchDisposal::Keep)
+            .await
+            .expect("the worktree is removed");
+
+    assert!(!worktree.exists());
+    assert!(!outcome.branch_deleted);
+    assert!(branch_exists(&root, &branch).await);
+}
+
+#[test]
+fn thread_reclamation_uses_keep() {
+    let worker = include_str!("../worktree_cleanup.rs");
+    let recommended = include_str!("../worktree_cleanup_recommended.rs");
+
+    for (source, caller) in [
+        (worker, "try_archived_removal"),
+        (worker, "try_tier_0"),
+        (worker, "try_tier_2"),
+        (recommended, "run_recommended_cleanup"),
+    ] {
+        let (_, body) = source
+            .split_once(&format!("async fn {caller}("))
+            .unwrap_or_else(|| panic!("missing {caller}"));
+        let body = body.split("async fn ").next().unwrap();
+        let (_, call) = body
+            .split_once("remove_worktree_and_optionally_delete_branch(")
+            .unwrap_or_else(|| panic!("{caller} must remove the worktree"));
+        let args = call.split(".await").next().unwrap();
+        assert!(
+            args.contains("BranchDisposal::Keep"),
+            "{caller} must keep the branch"
+        );
+    }
+}
+
+#[tokio::test]
+async fn when_merged_keeps_a_branch_that_holds_commits() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    let branch = format!("test/{}", &thread_id.simple().to_string()[..8]);
+
+    let outcome =
+        remove_worktree_and_optionally_delete_branch(&worktree, None, BranchDisposal::WhenMerged)
+            .await
+            .expect("the repo root resolves");
+
+    assert!(!worktree.exists(), "the tree is always reclaimed");
+    assert!(
+        !outcome.branch_deleted,
+        "reclamation must not take work nothing merged"
+    );
+    assert!(
+        branch_exists(&root, &branch).await,
+        "and the branch must still be there to find it by"
+    );
+}
+
+#[tokio::test]
+async fn always_deletes_the_branch_even_holding_commits() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    let branch = format!("test/{}", &thread_id.simple().to_string()[..8]);
+    assert!(branch_exists(&root, &branch).await, "precondition");
+
+    let outcome =
+        remove_worktree_and_optionally_delete_branch(&worktree, None, BranchDisposal::Always)
+            .await
+            .expect("the repo root resolves");
+
+    assert!(!worktree.exists(), "the worktree directory is gone");
+    assert!(outcome.branch_deleted, "and so is the branch");
+    assert!(
+        !branch_exists(&root, &branch).await,
+        "confirmed against git rather than against our own bookkeeping"
+    );
+    assert_eq!(
+        outcome.branch.as_deref(),
+        Some(branch.as_str()),
+        "the outcome names the branch, so the caller can sweep the rows keyed on it"
+    );
+    assert_eq!(
+        outcome.repo_root.canonicalize().ok(),
+        root.canonicalize().ok(),
+        "and the repo it belonged to, the other half of that key"
+    );
+}
+
+#[tokio::test]
+async fn the_default_branch_is_never_deleted() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
+
+    for disposal in [BranchDisposal::WhenMerged, BranchDisposal::Always] {
+        let (_tmp, root) = fresh_workspace().await;
+        git_cmd(&["checkout", "-b", "dev"], &root)
+            .await
+            .expect("move the root off main");
+        let worktree = worktrees_dir(&root).join("thread-on-main");
+        let added = git_cmd(
+            &["worktree", "add", &worktree.to_string_lossy(), "main"],
+            &root,
+        )
+        .await
+        .expect("git worktree add");
+        assert!(added.status.success(), "precondition: worktree on main");
+
+        let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None, disposal)
+            .await
+            .expect("the repo root resolves");
+
+        assert!(!worktree.exists(), "the tree is still reclaimed");
+        assert!(!outcome.branch_deleted, "{disposal:?} must keep main");
+        assert!(
+            branch_exists(&root, "main").await,
+            "{disposal:?}: main survives"
+        );
+    }
+}
+
+async fn branch_exists(repo_root: &std::path::Path, branch: &str) -> bool {
+    git_cmd(
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        repo_root,
+    )
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+struct DiskRecoversDuringLookup {
+    reading: Arc<std::sync::Mutex<Option<u64>>>,
+    recovered: Option<u64>,
+}
+
+#[async_trait::async_trait]
+impl super::ActiveThreads for DiskRecoversDuringLookup {
+    async fn is_active(&self, _thread_id: Uuid) -> bool {
+        if self.recovered.is_some() {
+            *self.reading.lock().unwrap() = self.recovered;
+        }
+        false
+    }
+}
+
+async fn tier_0_worktree_survives(
+    probe: super::FreeDiskProbe,
+    active: Arc<dyn super::ActiveThreads>,
+) -> bool {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
+
+    let mut worker = make_worker_with_active(pool.clone(), bus, root.clone(), active);
+    worker.free_disk = probe;
+    worker.soft_cap_bytes = super::FREE_DISK_SOFT_BYTES;
+    worker.hard_cap_bytes = super::FREE_DISK_HARD_BYTES;
+    worker.run_once().await;
+
+    let survived = worktree.exists();
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+    survived
+}
+
+async fn tier_0_survives_recovery_during_lookup(recovered: Option<u64>) -> bool {
+    let (probe, reading) = settable_probe(Some(12 * GB));
+    let active = Arc::new(DiskRecoversDuringLookup { reading, recovered });
+    tier_0_worktree_survives(probe, active).await
+}
+
+#[tokio::test]
+async fn disk_that_recovers_while_the_cycle_waits_keeps_the_retention_gate_closed() {
+    assert!(
+        tier_0_survives_recovery_during_lookup(Some(232 * GB)).await,
+        "a non-archived worktree must stay warm once free disk is back above soft"
+    );
+}
+
+#[tokio::test]
+async fn disk_still_low_at_the_decision_opens_the_retention_gate() {
+    assert!(
+        !tier_0_survives_recovery_during_lookup(None).await,
+        "12 GB is below soft, so the gate opens and Tier 0 reclaims"
+    );
+}
+
+#[tokio::test]
+async fn disk_that_recovers_during_tier_0_checks_keeps_the_worktree() {
+    let probe = scripted_probe(&[12 * GB, 12 * GB, 232 * GB]);
+    assert!(
+        tier_0_worktree_survives(probe, no_active_threads()).await,
+        "the removal must re-check the gate after Tier 0's own checks"
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_starts_during_tier_0_checks_keeps_the_worktree() {
+    let (probe, _reading) = settable_probe(Some(12 * GB));
+    assert!(
+        tier_0_worktree_survives(probe, live_after_first_check()).await,
+        "Tier 0 must re-check liveness right before the removal"
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_starts_during_tier_2_checks_keeps_the_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let mut worker = make_worker_with_active(
+        pool.clone(),
+        Arc::new(bus),
+        root.clone(),
+        live_after_first_check(),
+    );
+    worker.soft_cap_bytes = u64::MAX;
+    worker.run_once().await;
+
+    assert!(
+        worktree.exists(),
+        "Tier 2 must re-check liveness right before the removal"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+static WALK_RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+static WALK_FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn walk_waiting_for_another_task(_: &std::path::Path) -> u64 {
+    let release = WALK_RELEASE
+        .lock()
+        .unwrap()
+        .take()
+        .expect("one walk per test run");
+    release
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a task spawned beside the walk never ran: the walk blocked the runtime");
+    WALK_FINISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    7
+}
+
+#[tokio::test]
+async fn the_cycle_size_walk_leaves_the_runtime_free_for_other_tasks() {
+    let (bus, _rx) = EventBus::new(unresponsive_pool().await);
+    let (_tmp, root) = fresh_workspace().await;
+    std::fs::create_dir_all(worktrees_dir(&root).join("not-a-thread")).unwrap();
+    let (release, waits) = std::sync::mpsc::channel();
+    *WALK_RELEASE.lock().unwrap() = Some(waits);
+    let mut worker = make_worker(unresponsive_pool().await, Arc::new(bus), root);
+    worker.size_walk = walk_waiting_for_another_task;
+
+    let other_task = tokio::spawn(async move { release.send(()).unwrap() });
+    worker.run_once().await;
+    other_task.await.unwrap();
+    assert!(
+        WALK_FINISHED.load(std::sync::atomic::Ordering::SeqCst),
+        "the cycle ran the walk to its end"
+    );
+}

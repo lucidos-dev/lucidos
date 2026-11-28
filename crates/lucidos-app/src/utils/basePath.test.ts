@@ -1,0 +1,135 @@
+import { describe, it, expect } from 'vitest';
+import {
+  normalizeBasePath,
+  baseContextValidFor,
+  computeGatewayPickerHref,
+  parseWorkspaceRoute,
+  workspaceRouteUrlSegment,
+} from './basePath';
+
+
+describe('normalizeBasePath', () => {
+  it('returns the /<slug> prefix for a workspace base href', () => {
+    expect(normalizeBasePath('/dev/')).toBe('/dev');
+    expect(normalizeBasePath('/work-2/')).toBe('/work-2');
+    expect(normalizeBasePath('/a1b2/')).toBe('/a1b2');
+  });
+
+  it('returns /~ for the picker context', () => {
+    expect(normalizeBasePath('/~/')).toBe('/~');
+  });
+
+  it('returns empty at a legacy root', () => {
+    expect(normalizeBasePath('/')).toBe('');
+  });
+
+  it('strips an absolute-URL base href down to its pathname', () => {
+    expect(normalizeBasePath('https://host.ts.net/dev/')).toBe('/dev');
+  });
+
+  it('tolerates a missing leading slash and extra trailing slashes', () => {
+    expect(normalizeBasePath('dev/')).toBe('/dev');
+    expect(normalizeBasePath('/dev///')).toBe('/dev');
+  });
+});
+
+describe('baseContextValidFor', () => {
+  it('treats the picker and legacy-root contexts (null slug) as valid', () => {
+    expect(baseContextValidFor(null)).toBe(true);
+  });
+
+  it('accepts a well-formed workspace slug', () => {
+    expect(baseContextValidFor('dev')).toBe(true);
+    expect(baseContextValidFor('work-2')).toBe(true);
+    expect(baseContextValidFor('a1b2')).toBe(true);
+  });
+
+  it('accepts a workspace on a remote gateway, routed as <slug>@<name>', () => {
+    expect(baseContextValidFor('dev@cloud')).toBe(true);
+    expect(baseContextValidFor('work-2@box-1')).toBe(true);
+  });
+
+  it('rejects a remote route missing a half, or holding a second @', () => {
+    for (const bad of ['dev@', '@cloud', '@', 'Dev@cloud', 'dev@Cloud', 'dev@cl@oud', 'dev@-x']) {
+      expect(baseContextValidFor(bad), bad).toBe(false);
+    }
+  });
+
+  it('rejects a malformed slug the gateway would never mint', () => {
+    expect(baseContextValidFor('My Workspace')).toBe(false);
+    expect(baseContextValidFor('-bad')).toBe(false);
+    expect(baseContextValidFor('weird~slug')).toBe(false);
+    expect(baseContextValidFor('a/b')).toBe(false);
+  });
+});
+
+describe('parseWorkspaceRoute', () => {
+  it('reads a local slug and a remote route apart', () => {
+    expect(parseWorkspaceRoute('dev')).toEqual({ slug: 'dev', gateway: null });
+    expect(parseWorkspaceRoute('dev@cloud')).toEqual({ slug: 'dev', gateway: 'cloud' });
+  });
+
+  it('keeps @ literal in a URL segment, since the gateway reads the raw path', () => {
+    expect(workspaceRouteUrlSegment('dev@cloud')).toBe('dev@cloud');
+    expect(workspaceRouteUrlSegment('a b')).toBe('a%20b');
+  });
+
+  it('caps a gateway name at the 32 characters the gateway allows', () => {
+    expect(parseWorkspaceRoute(`dev@${'a'.repeat(32)}`)).not.toBeNull();
+    expect(parseWorkspaceRoute(`dev@${'a'.repeat(33)}`)).toBeNull();
+  });
+});
+
+describe('computeGatewayPickerHref', () => {
+  it('uses the relative picker route behind the gateway (same origin)', () => {
+    expect(
+      computeGatewayPickerHref({
+        behindGateway: true,
+        gatewayPort: 5251,
+        protocol: 'https:',
+        hostname: 'localhost',
+      }),
+    ).toBe('/~/?pick');
+    expect(
+      computeGatewayPickerHref({
+        behindGateway: true,
+        gatewayPort: null,
+        protocol: 'https:',
+        hostname: 'localhost',
+      }),
+    ).toBe('/~/?pick');
+  });
+
+  it('builds an absolute URL to the gateway on a direct engine-port page', () => {
+    expect(
+      computeGatewayPickerHref({
+        behindGateway: false,
+        gatewayPort: 5251,
+        protocol: 'https:',
+        hostname: 'localhost',
+      }),
+    ).toBe('https://localhost:5251/~/?pick');
+  });
+
+  it('targets the host the user is already on (Tailscale, http)', () => {
+    expect(
+      computeGatewayPickerHref({
+        behindGateway: false,
+        gatewayPort: 5251,
+        protocol: 'http:',
+        hostname: 'my-box.tail-scale.ts.net',
+      }),
+    ).toBe('http://my-box.tail-scale.ts.net:5251/~/?pick');
+  });
+
+  it('returns null on a direct page with no gateway (legacy no-gateway engine)', () => {
+    expect(
+      computeGatewayPickerHref({
+        behindGateway: false,
+        gatewayPort: null,
+        protocol: 'https:',
+        hostname: 'localhost',
+      }),
+    ).toBeNull();
+  });
+});

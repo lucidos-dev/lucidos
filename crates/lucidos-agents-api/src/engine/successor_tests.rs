@@ -1,0 +1,1756 @@
+use super::*;
+use crate::engine::handoff_sql::HANDOFF_LIFECYCLE_EVENT_TYPES;
+use crate::engine::pending_handoff::PendingHandoff;
+use crate::runtime::CodingAgent;
+
+#[test]
+fn the_decisions_flip_strictly_above_each_threshold() {
+    let at = ThreadContext::of_tokens;
+    assert_eq!(
+        at(None),
+        ThreadContext {
+            input_tokens: None,
+            can_hand_off: true,
+            offer: false,
+            applied: false,
+        }
+    );
+    let offer_edge = at(Some(HANDOFF_OFFER_TOKENS));
+    assert!(!offer_edge.offer);
+    assert!(at(Some(HANDOFF_OFFER_TOKENS + 1)).offer);
+}
+
+fn implementer(agent: CodingAgent, model: Option<&str>, effort: Option<&str>) -> Implementer {
+    Implementer {
+        coding_agent: agent,
+        model: model.map(str::to_string),
+        reasoning_effort: effort.map(str::to_string),
+    }
+}
+
+fn asking(
+    agent: Option<CodingAgent>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> ImplementerRequest {
+    ImplementerRequest {
+        coding_agent: agent,
+        coding_agent_model: model.map(str::to_string),
+        reasoning_effort: effort.map(str::to_string),
+    }
+}
+
+#[test]
+fn a_handoff_naming_no_implementer_carries_the_old_one() {
+    let old = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5"),
+        Some("max"),
+    );
+    assert_eq!(
+        resolve_implementer(&old, &ImplementerRequest::default()),
+        Ok(old)
+    );
+}
+
+#[test]
+fn the_named_implementer_reaches_the_successor() {
+    let old = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5"),
+        Some("high"),
+    );
+    assert_eq!(
+        resolve_implementer(&old, &asking(None, Some("sonnet"), Some("medium"))),
+        Ok(implementer(
+            CodingAgent::ClaudeCode,
+            Some("sonnet"),
+            Some("medium")
+        ))
+    );
+    assert_eq!(
+        resolve_implementer(
+            &old,
+            &asking(Some(CodingAgent::Codex), Some("gpt-5.6-sol"), Some("max"))
+        ),
+        Ok(implementer(
+            CodingAgent::Codex,
+            Some("gpt-5.6-sol"),
+            Some("max")
+        ))
+    );
+}
+
+#[test]
+fn a_new_backend_carries_neither_model_nor_effort() {
+    let old = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5"),
+        Some("high"),
+    );
+    assert_eq!(
+        resolve_implementer(&old, &asking(Some(CodingAgent::Codex), None, None)),
+        Ok(implementer(CodingAgent::Codex, None, None))
+    );
+}
+
+#[test]
+fn an_implementer_the_backend_lacks_is_refused() {
+    let old = implementer(CodingAgent::ClaudeCode, None, None);
+    for (request, needle) in [
+        (asking(None, Some("no-such-model"), None), "no-such-model"),
+        (
+            asking(Some(CodingAgent::Codex), Some("sonnet"), None),
+            "not offered by codex",
+        ),
+        (
+            asking(Some(CodingAgent::Codex), Some("gpt-5.4"), Some("max")),
+            "runs only on",
+        ),
+    ] {
+        let refusal = resolve_implementer(&old, &request).unwrap_err();
+        assert!(refusal.contains(needle), "{request:?}: {refusal}");
+    }
+}
+
+#[test]
+fn a_carried_effort_never_outlives_its_model() {
+    let old = implementer(CodingAgent::Codex, Some("gpt-5.6-sol"), Some("max"));
+    assert_eq!(
+        resolve_implementer(&old, &asking(None, Some("gpt-5.4"), None)),
+        Ok(implementer(CodingAgent::Codex, Some("gpt-5.4"), None))
+    );
+    assert_eq!(
+        resolve_implementer(&old, &asking(None, Some("gpt-5.6-terra"), None)),
+        Ok(implementer(
+            CodingAgent::Codex,
+            Some("gpt-5.6-terra"),
+            Some("max")
+        ))
+    );
+}
+
+#[test]
+fn a_pick_of_the_same_model_keeps_its_context_variant() {
+    for (old_model, pick) in [
+        ("claude-opus-5-5[1m]", "claude-opus-5-5"),
+        ("claude-sonnet-5-5[1m]", "claude-sonnet-5-5"),
+    ] {
+        let old = implementer(CodingAgent::ClaudeCode, Some(old_model), Some("high"));
+        assert_eq!(
+            resolve_implementer(&old, &asking(None, Some(pick), Some("medium"))),
+            Ok(implementer(
+                CodingAgent::ClaudeCode,
+                Some(old_model),
+                Some("medium")
+            )),
+            "{pick} from {old_model}"
+        );
+        assert_eq!(
+            resolve_implementer(&old, &asking(None, Some(pick), None)),
+            Ok(old),
+            "a model-only pick of {old_model} carries its effort too"
+        );
+    }
+}
+
+#[test]
+fn an_unoffered_spelling_of_the_same_model_is_still_refused() {
+    let old = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5[1m]"),
+        Some("high"),
+    );
+    let refusal = resolve_implementer(&old, &asking(None, Some("claude-opus-5-5@default"), None))
+        .unwrap_err();
+    assert!(refusal.contains("not offered"), "{refusal}");
+}
+
+#[test]
+fn a_pick_naming_a_variant_or_another_model_runs_as_written() {
+    let bare = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5"),
+        Some("high"),
+    );
+    assert_eq!(
+        resolve_implementer(&bare, &asking(None, Some("claude-opus-5-5[1m]"), None)),
+        Ok(implementer(
+            CodingAgent::ClaudeCode,
+            Some("claude-opus-5-5[1m]"),
+            Some("high")
+        ))
+    );
+    let wide = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5[1m]"),
+        Some("high"),
+    );
+    assert_eq!(
+        resolve_implementer(&wide, &asking(None, Some("claude-sonnet-5-5"), None)),
+        Ok(implementer(
+            CodingAgent::ClaudeCode,
+            Some("claude-sonnet-5-5"),
+            Some("high")
+        ))
+    );
+}
+
+const FULL_NARRATIVE: &str = "\
+# Handoff
+
+## Outcomes so far
+- Phase 2 shipped.
+
+## Decisions (beyond the plan)
+- None.
+
+## Gotchas
+- None.
+
+## State
+- Committed.
+
+## Next step
+Phase 3.
+
+## Files
+- docs/plans/x.md
+";
+
+#[test]
+fn a_full_narrative_lacks_nothing() {
+    assert!(missing_narrative_sections(FULL_NARRATIVE).is_empty());
+}
+
+#[test]
+fn each_missing_section_is_named() {
+    for section in NARRATIVE_SECTIONS {
+        let without: String = FULL_NARRATIVE
+            .lines()
+            .filter(|line| {
+                !line
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_lowercase()
+                    .starts_with(&section.to_lowercase())
+                    || !line.starts_with('#')
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            missing_narrative_sections(&without),
+            vec![section],
+            "{section}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_one_liner_lacks_every_section() {
+    assert_eq!(
+        missing_narrative_sections("Carry on with Phase 3."),
+        NARRATIVE_SECTIONS.to_vec()
+    );
+}
+
+#[test]
+fn the_provider_blocked_brief_names_the_block_and_asks_for_the_cause() {
+    let thread = Uuid::nil();
+    let brief = handoff_brief(
+        thread,
+        BriefCause::ProviderBlocked {
+            policy: "potentially unintended activity",
+        },
+        true,
+        None,
+    );
+    assert!(brief.contains("OpenAI's safety systems blocked"), "{brief}");
+    assert!(brief.contains("potentially unintended activity"), "{brief}");
+    assert!(brief.contains("so it was not resumed"), "{brief}");
+    assert!(
+        brief.contains(&format!("--thread-id {thread}")),
+        "it points at the event log: {brief}"
+    );
+    assert!(
+        brief.contains("its last instruction and its tool"),
+        "{brief}"
+    );
+    assert!(brief.contains("Never repeat such an action"), "{brief}");
+    assert!(brief.contains("ask the user first"), "{brief}");
+    let other = handoff_brief(thread, BriefCause::ResumeFailed, true, None);
+    assert!(!other.contains("Never repeat such an action"), "{other}");
+}
+
+#[test]
+fn the_provider_blocked_input_ends_on_the_message() {
+    let input = provider_blocked_input(Uuid::nil(), "cybersecurity policy", "Carry on.");
+    assert!(input.contains("cybersecurity policy"), "{input}");
+    assert!(input.ends_with("Carry on."), "{input}");
+}
+
+mod db {
+    use super::super::*;
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::pending_handoff::pending_handoff;
+    use crate::engine::thread_events::{EventChannel, EventMeta, HandoffRequest, ThreadEvent};
+    use crate::runtime::CodingAgent;
+    use crate::test_support::{
+        message_received, seed_chat_thread, seed_coding_thread, seed_handoff, setup_test_db,
+        start_cc_session, teardown_test_db,
+    };
+
+    fn cc_meta() -> EventMeta {
+        EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        }
+    }
+
+    async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: cc_meta(),
+        })
+        .await
+        .expect("emit");
+    }
+
+    async fn coding_thread(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
+        seed_coding_thread(bus, parent).await
+    }
+
+    async fn hand_off(bus: &EventBus, old: Uuid, parent: Option<Uuid>) -> Uuid {
+        seed_handoff(bus, old, parent).await
+    }
+
+    #[tokio::test]
+    async fn an_integrated_sub_thread_can_hand_off() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let parent = coding_thread(&bus, None).await;
+        let child = coding_thread(&bus, Some(parent)).await;
+        sqlx::query(
+            "UPDATE thread_summaries SET coding_agent_integrated = true WHERE thread_id = $1",
+        )
+        .bind(child)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(handoff_block(&pool, child).await.unwrap(), None);
+        assert!(thread_context(&pool, child).await.unwrap().can_hand_off);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_successor_links_both_ways_and_shares_the_family_root() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let parent = seed_chat_thread(&bus, "parent").await;
+        let child = coding_thread(&bus, Some(parent)).await;
+        let child_successor = hand_off(&bus, child, Some(parent)).await;
+        let top = coding_thread(&bus, None).await;
+        let top_successor = hand_off(&bus, top, None).await;
+
+        assert_eq!(
+            successor_thread_of(&pool, child).await.unwrap(),
+            Some(child_successor)
+        );
+        assert_eq!(
+            predecessor_of(&pool, child_successor).await.unwrap(),
+            Some(child)
+        );
+        assert_eq!(
+            carried_base(&pool, child_successor)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0123abc")
+        );
+        assert!(handed_off(&pool, child).await);
+        assert!(!handed_off(&pool, child_successor).await);
+        let root = crate::engine::thread_family::family_root;
+        assert_eq!(root(&pool, child_successor).await.unwrap(), parent);
+        assert_eq!(root(&pool, top_successor).await.unwrap(), top);
+        assert_eq!(carried_base(&pool, top).await.unwrap(), None);
+        start_cc_session(&bus, child_successor, "claude-code/successor", None).await;
+        assert_eq!(
+            carried_base(&pool, child_successor).await.unwrap(),
+            None,
+            "only the first branch starts at the handoff, so a discarded handoff stays gone"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_child_that_handed_off_owes_its_parent_no_report() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let parent = seed_chat_thread(&bus, "parent").await;
+        let child = coding_thread(&bus, Some(parent)).await;
+        let successor = hand_off(&bus, child, Some(parent)).await;
+        let pending = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert!(!pending(child).await);
+        assert!(pending(successor).await, "the successor reports instead");
+        emit(&bus, child, message_received("one more thing")).await;
+        assert!(
+            !pending(child).await,
+            "new work on the old thread re-arms nothing"
+        );
+        assert_eq!(
+            crate::engine::turn_end::wake_decision::WakeDuty::of_thread(&pool, child).await,
+            crate::engine::turn_end::wake_decision::WakeDuty::NoParent
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_old_threads_work_is_held_as_carried() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = coding_thread(&bus, None).await;
+        hand_off(&bus, old, None).await;
+        let hold = crate::engine::change_ops::read_proposal_hold(
+            &pool,
+            &bus,
+            old,
+            std::path::Path::new("/nonexistent"),
+            "claude-code/x",
+            &["src/main.rs".to_string()],
+        )
+        .await;
+        assert_eq!(
+            hold,
+            Some(crate::engine::change_ops::ProposalHold::CarriedBySuccessor)
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    async fn capture(pool: &sqlx::PgPool, thread_id: Uuid, payload: serde_json::Value) {
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES (gen_random_uuid(), 'ContextCaptured', $1, $2, 'thread', $2::text)",
+        )
+        .bind(payload)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_context_size_is_the_latest_turn_capture() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        assert_eq!(
+            thread_context(&pool, thread).await.unwrap(),
+            ThreadContext::of_tokens(None)
+        );
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 200_000, "output_tokens": 1}}),
+        )
+        .await;
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 900_000}, "parent_tool_use_id": "toolu_1"}),
+        )
+        .await;
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 950_000}, "purpose": "title"}),
+        )
+        .await;
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"output_tokens": 5}}),
+        )
+        .await;
+        let context = thread_context(&pool, thread).await.unwrap();
+        assert_eq!(
+            context.input_tokens,
+            Some(200_000),
+            "a capture with no input count leaves the last size"
+        );
+        assert!(context.offer);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_reading_offers_nothing_after_a_handoff_and_reports_an_apply() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = coding_thread(&bus, None).await;
+        let large = HANDOFF_OFFER_TOKENS + 1;
+        capture(
+            &pool,
+            old,
+            serde_json::json!({"usage": {"input_tokens": large}}),
+        )
+        .await;
+        let before = thread_context(&pool, old).await.unwrap();
+        assert!(before.can_hand_off && before.offer && !before.applied);
+        sqlx::query(
+            "INSERT INTO changes (request_id, thread_id, branch_name, repo_root, status) \
+             VALUES (gen_random_uuid(), $1, 'claude-code/x', '/repo', 'applied')",
+        )
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(thread_context(&pool, old).await.unwrap().applied);
+        hand_off(&bus, old, None).await;
+        let after = thread_context(&pool, old).await.unwrap();
+        assert_eq!(after.input_tokens, Some(large));
+        assert!(!after.can_hand_off && !after.offer);
+
+        teardown_test_db(&db).await;
+    }
+
+    fn session_handed_off(checkpoint: Option<&str>) -> ThreadEvent {
+        ThreadEvent::SessionHandedOff {
+            plan_path: None,
+            cause: None,
+            starts: crate::engine::thread_events::SessionStart::Now,
+            crossing: None,
+            opening: crate::engine::thread_events::HandoffOpening::Narrative,
+            message: "A fresh session starts here.".into(),
+            checkpoint: checkpoint.map(str::to_string),
+            progress: checkpoint.map(|_| "2/5".to_string()),
+            coding_agent: CodingAgent::Codex,
+            coding_agent_model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: None,
+            request: None,
+        }
+    }
+
+    fn session_started(
+        thread: Uuid,
+        coding_agent: CodingAgent,
+        continuity: Option<crate::engine::thread_events::SessionContinuity>,
+    ) -> ThreadEvent {
+        ThreadEvent::SessionStarted {
+            sandbox: None,
+            coding_agent,
+            session_id: "test-session".into(),
+            branch: format!("claude-code/{thread}"),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
+            continuity,
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_plan_path_is_scoped_to_the_latest_repository_and_branch() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        let mut started = session_started(thread, CodingAgent::Codex, None);
+        if let ThreadEvent::SessionStarted {
+            coding_agent_folder,
+            ..
+        } = &mut started
+        {
+            *coding_agent_folder = "/test-repository".into();
+        }
+        emit(&bus, thread, started).await;
+        for (repo, path) in [
+            ("/test-repository", "docs/plans/right.md"),
+            ("/different-repository", "docs/plans/wrong.md"),
+        ] {
+            sqlx::query("INSERT INTO planned_branches (repo_root, branch_name, state, plan_path, head_sha, planned_at) VALUES ($1, $2, 'planned', $3, 'head', NOW())")
+                .bind(crate::engine::git_ops::canonical_repo_root(std::path::Path::new(repo)))
+                .bind(format!("claude-code/{thread}"))
+                .bind(path).execute(&pool).await.unwrap();
+        }
+        assert_eq!(
+            handoff_plan_path(&pool, thread).await.unwrap().as_deref(),
+            Some("docs/plans/right.md")
+        );
+        let handoff = NewHandoff {
+            opening: crate::engine::thread_events::HandoffOpening::Narrative,
+            message: "Continue the plan".into(),
+            checkpoint: None,
+            progress: None,
+            implementer: super::implementer(CodingAgent::Codex, None, None),
+            request: None,
+            cause: crate::engine::thread_events::HandoffCause::User,
+            starts: crate::engine::thread_events::SessionStart::AfterThisTurn,
+            crossing: None,
+        };
+        assert_eq!(
+            record_handoff(&bus, thread, handoff.clone(), EventMeta::NONE)
+                .await
+                .unwrap(),
+            HandoffRecord::Recorded
+        );
+        assert_eq!(
+            record_handoff(&bus, thread, handoff, EventMeta::NONE)
+                .await
+                .unwrap(),
+            HandoffRecord::Pending
+        );
+        let paths: Vec<String> = sqlx::query_scalar("SELECT payload->>'plan_path' FROM events WHERE thread_id = $1 AND event_type = 'SessionHandedOff'")
+            .bind(thread).fetch_all(&pool).await.unwrap();
+        assert_eq!(paths, ["docs/plans/right.md"]);
+        sqlx::query("DELETE FROM planned_branches WHERE repo_root = $1")
+            .bind(crate::engine::git_ops::canonical_repo_root(
+                std::path::Path::new("/test-repository"),
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(handoff_plan_path(&pool, thread).await.unwrap(), None);
+        teardown_test_db(&db).await;
+    }
+
+    async fn start_successor(bus: &EventBus, pool: &sqlx::PgPool, thread: Uuid) {
+        let handoff = pending_handoff(pool, thread)
+            .await
+            .unwrap()
+            .expect("a pending handoff");
+        let event = session_started(thread, handoff.coding_agent, Some(handoff.continuity()));
+        emit(bus, thread, event).await;
+    }
+
+    #[tokio::test]
+    async fn a_handoff_is_pending_until_the_next_session_starts() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        let rows = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM thread_summaries")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let before = rows().await;
+        assert_eq!(pending_handoff(&pool, thread).await.unwrap(), None);
+
+        emit(&bus, thread, session_handed_off(Some("phase-commit"))).await;
+        let pending = pending_handoff(&pool, thread)
+            .await
+            .unwrap()
+            .expect("a pending handoff");
+        assert_eq!(
+            pending.continuity(),
+            crate::engine::thread_events::SessionContinuity::Handoff {
+                checkpoint: Some("phase-commit".into()),
+                progress: Some("2/5".into()),
+                crossing: None,
+                opening: crate::engine::thread_events::HandoffOpening::Narrative,
+                message: "A fresh session starts here.".into(),
+            }
+        );
+        assert_eq!(pending.implementer().coding_agent, CodingAgent::Codex);
+        assert_eq!(rows().await, before, "a handoff creates no thread");
+        assert_eq!(successor_thread_of(&pool, thread).await.unwrap(), None);
+        let context = thread_context(&pool, thread).await.unwrap();
+        assert!(!context.can_hand_off && !context.offer);
+
+        start_cc_session(&bus, thread, &format!("claude-code/{thread}"), None).await;
+        assert!(
+            pending_handoff(&pool, thread).await.unwrap().is_some(),
+            "a recovery or resolution session records no continuity, and starts no successor"
+        );
+
+        start_successor(&bus, &pool, thread).await;
+        assert_eq!(pending_handoff(&pool, thread).await.unwrap(), None);
+        assert!(thread_context(&pool, thread).await.unwrap().can_hand_off);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_pause_holds_a_successor_the_owner_did_not_drive() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let paused = || ThreadEvent::AutomationPaused {
+            reason: "wait for main repair".into(),
+        };
+        let message = |mode: &str| -> ThreadEvent {
+            serde_json::from_value(serde_json::json!({
+                "type": "MessageReceived", "text": "carry on", "mode": mode,
+            }))
+            .expect("a thread event")
+        };
+        let handoff = || session_handed_off(Some("harden-iteration"));
+
+        let owner_drove = coding_thread(&bus, None).await;
+        emit(&bus, owner_drove, paused()).await;
+        emit(&bus, owner_drove, message("human")).await;
+        emit(&bus, owner_drove, handoff()).await;
+        assert!(
+            successor_to_start(&pool, owner_drove)
+                .await
+                .unwrap()
+                .is_some(),
+            "a turn the owner started after the pause starts its successor"
+        );
+
+        let turn_ran_through_pause = coding_thread(&bus, None).await;
+        emit(&bus, turn_ran_through_pause, paused()).await;
+        emit(&bus, turn_ran_through_pause, message("engine")).await;
+        emit(&bus, turn_ran_through_pause, handoff()).await;
+        assert_eq!(
+            successor_to_start(&pool, turn_ran_through_pause)
+                .await
+                .unwrap(),
+            None,
+            "a handoff with no owner message since the pause stays held"
+        );
+
+        let paused_after_handoff = coding_thread(&bus, None).await;
+        emit(&bus, paused_after_handoff, message("human")).await;
+        emit(&bus, paused_after_handoff, handoff()).await;
+        emit(&bus, paused_after_handoff, paused()).await;
+        assert_eq!(
+            successor_to_start(&pool, paused_after_handoff)
+                .await
+                .unwrap(),
+            None,
+            "a pause placed after the handoff holds its successor"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_holds_a_successor_until_the_owner_resumes() {
+        use crate::engine::thread_events::{emit_response_canceled, CancelCause, MessageOrigin};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let stop = |thread: Uuid| {
+            let (bus, pool) = (&bus, &pool);
+            async move {
+                emit_response_canceled(
+                    bus,
+                    pool,
+                    thread,
+                    CancelCause::UserStop,
+                    String::new(),
+                    vec![],
+                    None,
+                    None,
+                    EventMeta::with_actor(Some(MessageOrigin::Device {
+                        device_id: "test-device".into(),
+                    })),
+                    "[SuccessorTest] ResponseCanceled",
+                )
+                .await;
+            }
+        };
+        let message = |origin: serde_json::Value, mode: &str| -> ThreadEvent {
+            serde_json::from_value(serde_json::json!({
+                "type": "MessageReceived", "text": "carry on", "mode": mode, "origin": origin,
+            }))
+            .expect("a thread event")
+        };
+        let parent_relay = || {
+            message(
+                serde_json::json!({"kind": "thread_link", "mode": "agent", "title": "Home",
+                    "direction": "parent", "thread_id": Uuid::new_v4()}),
+                "agent",
+            )
+        };
+        let status = |thread: Uuid| {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(thread)
+            .fetch_one(&pool)
+        };
+
+        let relayed_after_stop = coding_thread(&bus, None).await;
+        stop(relayed_after_stop).await;
+        emit(&bus, relayed_after_stop, parent_relay()).await;
+        emit(
+            &bus,
+            relayed_after_stop,
+            session_handed_off(Some("pre-harden")),
+        )
+        .await;
+        emit(
+            &bus,
+            relayed_after_stop,
+            ThreadEvent::ResponseGenerated {
+                text: "Handed off.".into(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            successor_to_start(&pool, relayed_after_stop).await.unwrap(),
+            None,
+            "an agent's message does not lift the owner's Stop, so its successor stays held"
+        );
+        assert_ne!(
+            status(relayed_after_stop).await.unwrap(),
+            "running",
+            "a held successor does not read as running"
+        );
+        assert!(
+            pending_handoff(&pool, relayed_after_stop)
+                .await
+                .unwrap()
+                .is_some(),
+            "the handoff stays pending for the owner's next message"
+        );
+        let live = crate::engine::thread_liveness::liveness_for_thread(&pool, relayed_after_stop)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.state,
+            crate::engine::thread_liveness::LivenessState::Held
+        );
+        assert_eq!(
+            live.hold,
+            Some(crate::engine::thread_liveness::LivenessHold::Stop)
+        );
+        emit(
+            &bus,
+            relayed_after_stop,
+            crate::test_support::event_wait_started(Uuid::new_v4()),
+        )
+        .await;
+        let applied: ThreadEvent = serde_json::from_value(serde_json::json!({
+            "type": "ChangeApplied",
+            "actor": {"kind": "device", "device_id": "test-device"},
+        }))
+        .expect("a thread event");
+        emit(&bus, relayed_after_stop, applied).await;
+        assert_eq!(
+            successor_to_start(&pool, relayed_after_stop).await.unwrap(),
+            None,
+            "a resume that runs no turn leaves the held successor for the next input"
+        );
+        assert_ne!(status(relayed_after_stop).await.unwrap(), "running");
+        let live = crate::engine::thread_liveness::liveness_for_thread(&pool, relayed_after_stop)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.state,
+            crate::engine::thread_liveness::LivenessState::Waiting
+        );
+        assert_eq!(live.live_event_waits.len(), 1);
+        assert_eq!(live.hold, None);
+        assert_eq!(
+            live.handoff,
+            Some(crate::engine::thread_liveness::LivenessHandoff::Pending)
+        );
+
+        let requested_after_stop = coding_thread(&bus, None).await;
+        stop(requested_after_stop).await;
+        let mut requested = session_handed_off(Some("pre-harden"));
+        if let ThreadEvent::SessionHandedOff { request, .. } = &mut requested {
+            *request = Some(HandoffRequest {
+                message: "Add a toggle".into(),
+                by: MessageOrigin::Device {
+                    device_id: "test-device".into(),
+                },
+            });
+        }
+        emit(&bus, requested_after_stop, requested).await;
+        assert!(
+            successor_to_start(&pool, requested_after_stop)
+                .await
+                .unwrap()
+                .is_some(),
+            "a user's request starts as their own turn, which a Stop never holds"
+        );
+
+        let owner_resumed = coding_thread(&bus, None).await;
+        stop(owner_resumed).await;
+        emit(
+            &bus,
+            owner_resumed,
+            message(
+                serde_json::json!({"kind": "device", "device_id": "test-device"}),
+                "human",
+            ),
+        )
+        .await;
+        emit(&bus, owner_resumed, session_handed_off(Some("pre-harden"))).await;
+        assert!(
+            successor_to_start(&pool, owner_resumed)
+                .await
+                .unwrap()
+                .is_some(),
+            "the owner's own message lifts the Stop"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn another_threads_session_never_ends_a_pending_handoff() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        let other = coding_thread(&bus, None).await;
+        emit(&bus, other, session_handed_off(None)).await;
+        emit(&bus, thread, session_handed_off(None)).await;
+        start_successor(&bus, &pool, other).await;
+
+        let pending: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT s.thread_id FROM thread_summaries s WHERE {}",
+            pending_handoff_sql("s.thread_id")
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, vec![thread]);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn restore_floor_excludes_archived_handoffs_from_lookup_and_boot_scan() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = coding_thread(&bus, None).await;
+        emit(&bus, old, session_handed_off(None)).await;
+        assert!(pending_handoff(&pool, old).await.unwrap().is_some());
+        sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+            .bind(Uuid::new_v4())
+            .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+            .execute(&pool).await.unwrap();
+        let new = coding_thread(&bus, None).await;
+        emit(&bus, new, session_handed_off(None)).await;
+        for _ in 0..2 {
+            assert!(pending_handoff(&pool, old).await.unwrap().is_none());
+            assert!(pending_handoff(&pool, new).await.unwrap().is_some());
+            let pending: Vec<Uuid> = sqlx::query_scalar(&format!(
+                "SELECT s.thread_id FROM thread_summaries s WHERE {}",
+                pending_handoff_sql("s.thread_id")
+            ))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pending, vec![new]);
+            let from_set: Vec<Uuid> =
+                sqlx::query_scalar(&crate::engine::handoff_sql::pending_handoff_threads_sql())
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(from_set, vec![new], "the set query keeps the same floor");
+        }
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_or_a_failed_successor_turn_ends_a_pending_handoff() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let event = |value: serde_json::Value| -> ThreadEvent {
+            serde_json::from_value(value).expect("a thread event")
+        };
+        let cancel =
+            |cause: &str| event(serde_json::json!({"type": "ResponseCanceled", "cause": cause}));
+        let failure =
+            || event(serde_json::json!({"type": "ResponseFailed", "error": "spawn failed"}));
+        let message =
+            || event(serde_json::json!({"type": "MessageReceived", "text": "the opening"}));
+
+        let stopped = coding_thread(&bus, None).await;
+        emit(&bus, stopped, session_handed_off(None)).await;
+        emit(&bus, stopped, cancel("superseded_by_followup")).await;
+        emit(&bus, stopped, failure()).await;
+        assert!(
+            pending_handoff(&pool, stopped).await.unwrap().is_some(),
+            "a redirect, or the handing-off turn's own failure, keeps it"
+        );
+        emit(&bus, stopped, cancel("user_stop")).await;
+        assert_eq!(pending_handoff(&pool, stopped).await.unwrap(), None);
+
+        let failed = coding_thread(&bus, None).await;
+        emit(&bus, failed, session_handed_off(None)).await;
+        emit(&bus, failed, message()).await;
+        emit(&bus, failed, failure()).await;
+        assert_eq!(pending_handoff(&pool, failed).await.unwrap(), None);
+        assert!(thread_context(&pool, failed).await.unwrap().can_hand_off);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn pending_handoff_ignores_a_withdrawn_one() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        emit(&bus, thread, session_handed_off(None)).await;
+        emit(&bus, thread, ThreadEvent::SessionHandoffWithdrawn).await;
+        assert_eq!(pending_handoff(&pool, thread).await.unwrap(), None);
+        assert!(!crate::engine::pending_handoff::handoff_pending(&pool, thread).await);
+
+        emit(&bus, thread, session_handed_off(Some("phase-commit"))).await;
+        let again = pending_handoff(&pool, thread).await.unwrap();
+        assert_eq!(
+            again.and_then(|h| h.checkpoint).as_deref(),
+            Some("phase-commit")
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_pending_set_matches_the_per_thread_predicate() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let event = |value: serde_json::Value| -> ThreadEvent {
+            serde_json::from_value(value).expect("a thread event")
+        };
+        let cancel =
+            |cause: &str| event(serde_json::json!({"type": "ResponseCanceled", "cause": cause}));
+        let failure =
+            || event(serde_json::json!({"type": "ResponseFailed", "error": "spawn failed"}));
+        let message =
+            || event(serde_json::json!({"type": "MessageReceived", "text": "the opening"}));
+
+        let pending = coding_thread(&bus, None).await;
+        emit(&bus, pending, session_handed_off(None)).await;
+        let redirected = coding_thread(&bus, None).await;
+        emit(&bus, redirected, session_handed_off(None)).await;
+        emit(&bus, redirected, cancel("superseded_by_followup")).await;
+        emit(&bus, redirected, failure()).await;
+        let started = coding_thread(&bus, None).await;
+        emit(&bus, started, session_handed_off(None)).await;
+        start_successor(&bus, &pool, started).await;
+        let stopped = coding_thread(&bus, None).await;
+        emit(&bus, stopped, session_handed_off(None)).await;
+        emit(&bus, stopped, cancel("user_stop")).await;
+        let failed = coding_thread(&bus, None).await;
+        emit(&bus, failed, session_handed_off(None)).await;
+        emit(&bus, failed, message()).await;
+        emit(&bus, failed, failure()).await;
+        let withdrawn = coding_thread(&bus, None).await;
+        emit(&bus, withdrawn, session_handed_off(None)).await;
+        emit(&bus, withdrawn, ThreadEvent::SessionHandoffWithdrawn).await;
+        coding_thread(&bus, None).await;
+
+        let mut from_set: Vec<Uuid> =
+            sqlx::query_scalar(&crate::engine::handoff_sql::pending_handoff_threads_sql())
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let mut from_predicate: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT s.thread_id FROM thread_summaries s WHERE {}",
+            pending_handoff_sql("s.thread_id")
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        from_set.sort();
+        from_predicate.sort();
+        let mut expected = vec![pending, redirected];
+        expected.sort();
+        assert_eq!(from_predicate, expected);
+        assert_eq!(from_set, expected);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_child_keeps_its_parents_wait_across_a_handoff() {
+        use crate::engine::turn_end::wake_decision::WakeDuty;
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let parent = seed_chat_thread(&bus, "parent").await;
+        let child = coding_thread(&bus, Some(parent)).await;
+        let report_armed = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1",
+                )
+                .bind(child)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(WakeDuty::of_thread(&pool, child).await, WakeDuty::Decide);
+
+        emit(&bus, child, session_handed_off(None)).await;
+        assert_eq!(WakeDuty::of_thread(&pool, child).await, WakeDuty::NoParent);
+        emit(
+            &bus,
+            child,
+            serde_json::from_value(serde_json::json!({"type": "CodingAgentIdled"}))
+                .expect("an idle with every field defaulted"),
+        )
+        .await;
+        assert!(
+            report_armed().await,
+            "the old session's turn end reports nothing, so the report stays armed"
+        );
+
+        start_successor(&bus, &pool, child).await;
+        assert_eq!(WakeDuty::of_thread(&pool, child).await, WakeDuty::Decide);
+        assert!(report_armed().await);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_handoff_is_the_only_place_the_backend_changes() {
+        use crate::engine::session_claim::resolve_thread_coding_agent as backend;
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        assert_eq!(
+            backend(&pool, thread, Some(CodingAgent::Codex))
+                .await
+                .unwrap(),
+            CodingAgent::ClaudeCode,
+            "no switch without a fresh session"
+        );
+
+        emit(&bus, thread, session_handed_off(Some("phase-commit"))).await;
+        assert_eq!(
+            backend(&pool, thread, None).await.unwrap(),
+            CodingAgent::Codex
+        );
+
+        start_successor(&bus, &pool, thread).await;
+        assert_eq!(
+            backend(&pool, thread, Some(CodingAgent::ClaudeCode))
+                .await
+                .unwrap(),
+            CodingAgent::Codex,
+            "the successor session's backend is the thread's now"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[test]
+    fn the_cli_help_names_every_narrative_section() {
+        let help = include_str!("../../../lucidos-cli/src/successor.rs");
+        for section in NARRATIVE_SECTIONS {
+            assert!(
+                help.contains(section),
+                "`lucidos successor --help` lacks {section}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_plan_marker_carries_to_the_successor_branch() {
+        let (pool, db) = setup_test_db().await;
+        let repo = std::path::Path::new("/repo");
+        let marker = |branch: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM planned_branches WHERE branch_name = $1",
+                )
+                .bind(branch)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        sqlx::query(
+            "INSERT INTO planned_branches (repo_root, branch_name, state, plan_path, head_sha, planned_at) \
+             VALUES ($1, 'claude-code/old', 'planned', 'docs/plans/p.md', 'abc', NOW()), \
+                    ($1, 'claude-code/kept', 'acknowledged_simple', NULL, 'abc', NOW())",
+        )
+        .bind(crate::engine::git_ops::canonical_repo_root(repo))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let carry = crate::engine::git_ops::carry_planned;
+        carry(&pool, repo, "claude-code/old", "claude-code/new")
+            .await
+            .unwrap();
+        carry(&pool, repo, "claude-code/old", "claude-code/kept")
+            .await
+            .unwrap();
+        assert_eq!(marker("claude-code/new").await.as_deref(), Some("planned"));
+        assert_eq!(
+            marker("claude-code/kept").await.as_deref(),
+            Some("acknowledged_simple")
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_later_compaction_replaces_the_size() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let compacted = |payload: serde_json::Value| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+                     VALUES (gen_random_uuid(), 'CodingAgentCompacted', $1, $2, 'thread', $2::text)",
+                )
+                .bind(payload)
+                .bind(thread)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let large = HANDOFF_OFFER_TOKENS + 1;
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": large}}),
+        )
+        .await;
+        compacted(serde_json::json!({"trigger": "auto", "post_tokens": 40_000})).await;
+        let after = thread_context(&pool, thread).await.unwrap();
+        assert_eq!(after.input_tokens, Some(40_000));
+        assert!(!after.offer);
+        compacted(serde_json::json!({"trigger": "manual"})).await;
+        assert_eq!(
+            thread_context(&pool, thread).await.unwrap().input_tokens,
+            None
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    async fn compacted(pool: &sqlx::PgPool, thread_id: Uuid, payload: serde_json::Value) {
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES (gen_random_uuid(), 'CodingAgentCompacted', $1, $2, 'thread', $2::text)",
+        )
+        .bind(payload)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_reading_after_compaction_keeps_the_window() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        assert_eq!(
+            session_reading(&pool, thread).await.unwrap(),
+            SessionReading::default()
+        );
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 400_000}, "context_window": 1_000_000}),
+        )
+        .await;
+        compacted(
+            &pool,
+            thread,
+            serde_json::json!({"trigger": "auto", "post_tokens": 50_000}),
+        )
+        .await;
+        assert_eq!(
+            session_reading(&pool, thread).await.unwrap(),
+            SessionReading {
+                tokens: Some(50_000),
+                window: Some(1_000_000),
+            }
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn session_reading_unknown_post_tokens_then_a_capture_after_compaction() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 400_000}, "context_window": 200_000}),
+        )
+        .await;
+        compacted(&pool, thread, serde_json::json!({"trigger": "manual"})).await;
+        assert_eq!(session_reading(&pool, thread).await.unwrap().tokens, None);
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 70_000}, "context_window": 0}),
+        )
+        .await;
+        assert_eq!(
+            session_reading(&pool, thread).await.unwrap(),
+            SessionReading {
+                tokens: Some(70_000),
+                window: Some(200_000),
+            },
+            "a capture with no window keeps the newest recorded one"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_handoff_is_refused_and_leaves_no_trace() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = coding_thread(&bus, None).await;
+        let first = hand_off(&bus, old, None).await;
+        let second = bus
+            .emit(BusEvent::Thread {
+                thread_id: old,
+                event: ThreadEvent::SuccessorThreadSpawned {
+                    successor_thread_id: Uuid::new_v4(),
+                    base_sha: "0123abc".into(),
+                    starts_build_chain: false,
+                    handoff_consent: None,
+                },
+                meta: cc_meta(),
+            })
+            .await;
+        let Err(refusal) = second else {
+            panic!("a second handoff must be refused");
+        };
+        assert!(refusal.to_string().contains(ALREADY_HANDED_OFF));
+        assert_eq!(successor_thread_of(&pool, old).await.unwrap(), Some(first));
+        let spawned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'SuccessorThreadSpawned'",
+        )
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(spawned, 1);
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_request_is_pending_until_the_turn_ends() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = coding_thread(&bus, None).await;
+        assert_eq!(pending_successor_request(&pool, old).await.unwrap(), None);
+
+        let insert = |event_type: &'static str, payload: serde_json::Value| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+                     VALUES (gen_random_uuid(), $1, $2, $3, 'thread', $3::text)",
+                )
+                .bind(event_type)
+                .bind(payload)
+                .bind(old)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        insert(
+            "SuccessorRequested",
+            serde_json::json!({
+                "message": "Add a toggle",
+                "coding_agent_model": "claude-sonnet-5-5",
+                "actor": { "kind": "device", "device_id": "test-device" },
+            }),
+        )
+        .await;
+        assert_eq!(
+            pending_successor_request(&pool, old).await.unwrap(),
+            Some(PendingRequest {
+                request: Some(HandoffRequest {
+                    message: "Add a toggle".into(),
+                    by: crate::engine::thread_events::MessageOrigin::Device {
+                        device_id: "test-device".into(),
+                    },
+                }),
+                implementer: ImplementerRequest {
+                    coding_agent: None,
+                    coding_agent_model: Some("claude-sonnet-5-5".into()),
+                    reasoning_effort: None,
+                },
+            })
+        );
+
+        insert("CodingAgentIdled", serde_json::json!({})).await;
+        assert_eq!(
+            pending_successor_request(&pool, old).await.unwrap(),
+            None,
+            "the turn ended, so the request is closed"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    mod lane_thread {
+        use super::*;
+        use crate::engine::event_bus::SystemEvent;
+
+        async fn lane_thread(bus: &EventBus) -> (Uuid, Uuid) {
+            let thread = coding_thread(bus, None).await;
+            let batch_id = Uuid::new_v4();
+            bus.emit(BusEvent::System(SystemEvent::LaneBatchStarted {
+                batch_id,
+                members: vec![],
+                base_sha: "base".into(),
+                lane_thread_id: thread,
+            }))
+            .await
+            .expect("batch started");
+            (thread, batch_id)
+        }
+
+        async fn land(bus: &EventBus, batch_id: Uuid) {
+            bus.emit(BusEvent::System(SystemEvent::LaneBatchLanded {
+                batch_id,
+                pre_sha: "base".into(),
+                post_sha: "landed".into(),
+            }))
+            .await
+            .expect("batch landed");
+        }
+
+        fn requested(by_user: bool) -> ThreadEvent {
+            let ThreadEvent::SessionHandedOff {
+                plan_path,
+                cause,
+                starts,
+                crossing,
+                opening,
+                message,
+                checkpoint,
+                progress,
+                coding_agent,
+                coding_agent_model,
+                reasoning_effort,
+                ..
+            } = session_handed_off(Some("pre-harden"))
+            else {
+                unreachable!("session_handed_off builds a SessionHandedOff");
+            };
+            let request = by_user.then(|| HandoffRequest {
+                message: "Carry on".into(),
+                by: crate::engine::thread_events::MessageOrigin::Device {
+                    device_id: "test-device".into(),
+                },
+            });
+            ThreadEvent::SessionHandedOff {
+                plan_path,
+                cause,
+                starts,
+                crossing,
+                opening,
+                message,
+                checkpoint,
+                progress,
+                coding_agent,
+                coding_agent_model,
+                reasoning_effort,
+                request,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_closed_lane_thread_starts_no_engine_handoff() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let (thread, batch_id) = lane_thread(&bus).await;
+            emit(&bus, thread, requested(false)).await;
+            emit(
+                &bus,
+                thread,
+                message_received("A fresh session starts here."),
+            )
+            .await;
+            let resumed = Some(crate::engine::thread_events::SessionContinuity::Resumed);
+            emit(
+                &bus,
+                thread,
+                session_started(thread, CodingAgent::ClaudeCode, resumed),
+            )
+            .await;
+            assert!(
+                successor_to_start(&pool, thread).await.unwrap().is_some(),
+                "an open batch still starts its successor session"
+            );
+
+            land(&bus, batch_id).await;
+            assert!(pending_handoff(&pool, thread).await.unwrap().is_some());
+            assert_eq!(successor_to_start(&pool, thread).await.unwrap(), None);
+
+            emit(
+                &bus,
+                thread,
+                serde_json::from_value(serde_json::json!({"type": "CodingAgentIdled"})).unwrap(),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE events SET created = created - interval '5 minutes' WHERE thread_id = $1",
+            )
+            .bind(thread)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let live = crate::engine::thread_liveness::liveness_for_thread(&pool, thread)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                live.state,
+                crate::engine::thread_liveness::LivenessState::Idle
+            );
+            assert!(
+                live.handoff.is_some(),
+                "the skipped handoff remains recorded"
+            );
+
+            teardown_test_db(&db).await;
+        }
+
+        #[tokio::test]
+        async fn a_closed_lane_thread_still_starts_the_users_request() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let (thread, batch_id) = lane_thread(&bus).await;
+            emit(&bus, thread, requested(true)).await;
+            land(&bus, batch_id).await;
+            let handoff = successor_to_start(&pool, thread).await.unwrap();
+            assert!(handoff.is_some_and(|handoff| handoff.request.is_some()));
+
+            teardown_test_db(&db).await;
+        }
+
+        #[tokio::test]
+        async fn a_closed_lane_thread_cannot_hand_off() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let (thread, batch_id) = lane_thread(&bus).await;
+            assert_eq!(handoff_block(&pool, thread).await.unwrap(), None);
+            land(&bus, batch_id).await;
+            assert_eq!(
+                handoff_block(&pool, thread).await.unwrap(),
+                Some(HandoffBlock::LaneEnded)
+            );
+
+            teardown_test_db(&db).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_successor_session_waits_for_the_old_run_to_let_go() {
+    use crate::engine::types::AgentSession;
+    let thread = Uuid::new_v4();
+    let (session, old_run) = AgentSession::for_test();
+    let sessions = tokio::sync::Mutex::new(std::collections::HashMap::from([(thread, session)]));
+    let wait = wait_until_thread_released(&sessions, thread);
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait)
+            .await
+            .is_err(),
+        "the old run still holds the thread"
+    );
+    drop(old_run);
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("the successor session starts once the old run let go");
+    wait_until_thread_released(&sessions, Uuid::new_v4()).await;
+}
+
+#[test]
+fn the_brief_says_why_and_how_to_rebuild() {
+    let id = Uuid::new_v4();
+    let cold = handoff_brief(id, BriefCause::CacheCold, false, Some("Fixed the drawer"));
+    assert!(
+        cold.contains("handed off with no handoff narrative"),
+        "{cold}"
+    );
+    assert!(cold.contains(&format!("lucidos events query --thread-id {id}")));
+    assert!(cold.contains("git status"));
+    assert!(cold.contains("git log"));
+    assert!(cold.contains("docs/plans/"));
+    assert!(cold.contains("The change this thread applied last: Fixed the drawer"));
+    let failed = handoff_brief(id, BriefCause::ResumeFailed, false, None);
+    assert!(failed.contains("could not resume"), "{failed}");
+}
+
+#[test]
+fn the_brief_asks_for_a_request_only_when_none_follows() {
+    let id = Uuid::new_v4();
+    let with = handoff_brief(id, BriefCause::CacheCold, true, None);
+    assert!(with.ends_with("that the branch touched."), "{with}");
+    let without = handoff_brief(id, BriefCause::CacheCold, false, None);
+    assert!(without.contains("end your first turn on an AskUserQuestion card"));
+}
+
+#[test]
+fn a_checkpoint_handoff_is_told_to_skip_that_checkpoint() {
+    let opening = narrative_opening(Some("pre-harden"), "Next: review.");
+    assert!(
+        opening.contains("`pre-harden` checkpoint, so skip that checkpoint"),
+        "{opening}"
+    );
+    assert!(opening.ends_with("Next: review."), "{opening}");
+    let plain = narrative_opening(None, "Next: review.");
+    assert!(!plain.contains("skip"), "{plain}");
+}
+
+#[test]
+fn the_first_message_reads_the_opening_then_the_request_once() {
+    let opening = "A fresh session starts here.\n\n# Next step\nReview.";
+    let request = "Add a dark-mode toggle";
+    let framed = "The user's request for you:\n\nAdd a dark-mode toggle";
+
+    assert_eq!(successor_first_message(opening, None, opening), opening);
+
+    let from_request = successor_first_message(opening, Some(request), request);
+    assert!(from_request.starts_with(opening), "{from_request}");
+    assert!(from_request.ends_with(framed), "{from_request}");
+    assert_eq!(from_request.matches(request).count(), 1, "{from_request}");
+
+    let started_by_user = successor_first_message(opening, None, "Also fix the drawer");
+    assert!(started_by_user.starts_with(opening), "{started_by_user}");
+    assert!(
+        started_by_user.ends_with("The message that started this session:\n\nAlso fix the drawer"),
+        "{started_by_user}"
+    );
+
+    let both = successor_first_message(opening, Some(request), "Also fix the drawer");
+    assert!(both.contains(framed), "{both}");
+    assert!(both.ends_with("Also fix the drawer"), "{both}");
+}
+
+#[test]
+fn the_handoff_lifecycle_index_lists_every_probed_event_type() {
+    const MIGRATION: &str = include_str!(
+        "../../../lucidos-core/migrations/20261108155953_index_events_handoff_lifecycle_withdrawn.sql"
+    );
+    for event_type in HANDOFF_LIFECYCLE_EVENT_TYPES {
+        assert!(
+            MIGRATION.contains(&format!("'{event_type}'")),
+            "the index predicate lacks {event_type}"
+        );
+    }
+}
+
+#[test]
+fn every_handoff_ending_event_type_is_a_lifecycle_type() {
+    let ends = crate::engine::handoff_sql::ends_handoff_sql("end_row", "handoff");
+    let probed: Vec<&str> = ends
+        .split("end_row.event_type = '")
+        .skip(1)
+        .filter_map(|rest| rest.split('\'').next())
+        .collect();
+    assert!(!probed.is_empty(), "{ends}");
+    for event_type in probed {
+        assert!(
+            HANDOFF_LIFECYCLE_EVENT_TYPES.contains(&event_type),
+            "HANDOFF_LIFECYCLE_EVENT_TYPES lacks {event_type}"
+        );
+    }
+}
+
+#[test]
+fn opening_lists_running_work() {
+    let opening = narrative_opening(None, "# Outcomes");
+    assert_eq!(StillRunning::default().after(opening.clone()), opening);
+    let running = StillRunning {
+        tasks: vec!["the full e2e suite (`task-7`)".to_string()],
+        waits: vec!["the deploy (on DeployFinished)".to_string()],
+        children: vec!["Fix the parser".to_string()],
+    };
+    let listed = running.after(opening.clone());
+    assert!(listed.starts_with(&opening));
+    for line in [
+        "## Still running",
+        "- Background task: the full e2e suite (`task-7`)",
+        "- Event wait: the deploy (on DeployFinished)",
+        "- Child thread: Fix the parser",
+        "do not start them again",
+    ] {
+        assert!(listed.contains(line), "{line}");
+    }
+}
+
+#[test]
+fn a_ceiling_handoff_starts_on_the_next_input() {
+    use crate::engine::thread_events::{HandoffCause as C, SessionStart as S};
+    assert_eq!(
+        cause_and_start(true, false, false, true, true),
+        (C::ContextCeiling, S::AfterThisTurn)
+    );
+    assert_eq!(
+        cause_and_start(true, false, false, false, true),
+        (C::ContextCeiling, S::OnNextInput)
+    );
+    assert_eq!(
+        cause_and_start(true, true, false, true, false),
+        (C::ContextCeiling, S::OnNextInput)
+    );
+    assert_eq!(
+        cause_and_start(true, false, true, false, false),
+        (C::ContextCeiling, S::Now)
+    );
+    assert_eq!(
+        cause_and_start(false, true, false, true, false),
+        (C::Checkpoint, S::AfterThisTurn)
+    );
+    assert_eq!(
+        cause_and_start(false, false, false, false, false),
+        (C::User, S::Now)
+    );
+}
+
+#[test]
+fn boot_does_not_start_an_on_next_input_handoff() {
+    let row = |extra: serde_json::Value| -> PendingHandoff {
+        let mut payload = serde_json::json!({
+            "opening": "narrative", "message": "m", "coding_agent": "claude-code",
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(payload).unwrap()
+    };
+    let old = row(serde_json::json!({}));
+    assert_eq!(old.starts, crate::engine::thread_events::SessionStart::Now);
+    assert_eq!(old.cause, None);
+    assert!(old.starts_unprompted());
+    assert!(row(serde_json::json!({"starts": "after-this-turn"})).starts_unprompted());
+    assert!(!row(serde_json::json!({"starts": "on-next-input"})).starts_unprompted());
+}

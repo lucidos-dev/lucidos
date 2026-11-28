@@ -1,0 +1,121 @@
+use crate::support::{base_url, browser_handshake, home_thread_id, user_client};
+use lucidos_engine::core::prefs;
+use reqwest::StatusCode;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+async fn dial(client: &reqwest::Client, thread_id: Uuid, ticket: Option<&str>) -> StatusCode {
+    let mut path = format!("/api/v1/voice?thread_id={thread_id}");
+    if let Some(ticket) = ticket {
+        path.push_str(&format!("&ticket={ticket}"));
+    }
+    browser_handshake(client, &path, &base_url())
+        .send()
+        .await
+        .expect("upgrade request failed")
+        .status()
+}
+
+async fn mint(
+    client: &reqwest::Client,
+    thread_id: Uuid,
+    referer: Option<&str>,
+) -> reqwest::Response {
+    let mut request = client
+        .post(format!("{}/api/v1/voice/ticket", base_url()))
+        .header("sec-fetch-site", "same-origin")
+        .json(&json!({ "thread_id": thread_id }));
+    if let Some(referer) = referer {
+        request = request.header("referer", referer);
+    }
+    request.send().await.expect("mint request failed")
+}
+
+async fn set_voice_enabled(client: &reqwest::Client, on: Option<bool>) {
+    let url = format!(
+        "{}/api/v1/preferences?key={}",
+        base_url(),
+        prefs::VOICE_ENABLED.key()
+    );
+    let body: Value = match on {
+        Some(on) => client
+            .put(url)
+            .json(&json!({ "value": on.to_string() }))
+            .send(),
+        None => client.delete(url).send(),
+    }
+    .await
+    .expect("voice switch write failed")
+    .json()
+    .await
+    .expect("voice switch reply is not JSON");
+    let unset = on.is_none()
+        && body["error"]
+            .as_str()
+            .is_some_and(|e| e.ends_with("not found"));
+    assert!(body["success"] == true || unset, "{body}");
+}
+
+#[tokio::test]
+async fn an_upgrade_without_a_ticket_is_refused() {
+    let client = user_client().await;
+    assert_eq!(
+        dial(&client, home_thread_id().await, None).await,
+        StatusCode::CONFLICT,
+        "the owner's device header alone must not open a call"
+    );
+}
+
+#[tokio::test]
+async fn an_app_document_cannot_mint_a_ticket() {
+    let client = user_client().await;
+    let home = home_thread_id().await;
+    let app_referer = format!("{}/app/habit-tracker/", base_url());
+    assert_eq!(
+        mint(&client, home, Some(&app_referer)).await.status(),
+        StatusCode::FORBIDDEN,
+        "a mint from an app document must be refused"
+    );
+    assert_eq!(
+        mint(&client, home, None).await.status(),
+        StatusCode::FORBIDDEN,
+        "a browser-shaped mint that names no page must be refused"
+    );
+}
+
+#[tokio::test]
+async fn a_ticket_spent_on_another_thread_cannot_then_open_home() {
+    let client = user_client().await;
+    let home = home_thread_id().await;
+
+    set_voice_enabled(&client, Some(true)).await;
+    let steps = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let minted = mint(&client, home, Some(&format!("{}/", base_url()))).await;
+            let mint_status = minted.status();
+            let body: Value = minted.json().await.unwrap_or_default();
+            let ticket = body["ticket"].as_str().unwrap_or_default().to_string();
+            let elsewhere = dial(&client, Uuid::new_v4(), Some(&ticket)).await;
+            let replay = dial(&client, home, Some(&ticket)).await;
+            (mint_status, body, ticket, elsewhere, replay)
+        }
+    })
+    .await;
+    set_voice_enabled(&client, None).await;
+    let (mint_status, body, ticket, elsewhere, replay) = steps.expect("the call steps panicked");
+
+    assert_eq!(mint_status, StatusCode::OK, "the shell's mint: {body}");
+    assert!(!ticket.is_empty(), "the mint answers a ticket: {body}");
+    assert_eq!(body["expires_in_secs"], 30, "{body}");
+    assert_eq!(
+        elsewhere,
+        StatusCode::FORBIDDEN,
+        "a ticket opens its own thread only"
+    );
+    assert_eq!(
+        replay,
+        StatusCode::CONFLICT,
+        "the wrong-thread try spent the ticket, so it no longer proves the live generation"
+    );
+}

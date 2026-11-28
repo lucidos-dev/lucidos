@@ -1,0 +1,323 @@
+//! INVARIANT: `navigate_ui`: which device a navigate reaches, and what the agent is told.
+//!
+//! `GET /api/v1/events` broadcasts `NavigationRequested` to every connected
+//! page, and a page drops one whose device actor is not its own
+//! (`thread-sync.ts`). So the actor stamped here IS the routing decision. The
+//! engine never learns whether a page acted, which is why every result says
+//! "sent" and names the device, never "opened".
+
+use super::ToolOutcome;
+use crate::core::devices::SeenDevice;
+use crate::core::AppManager;
+use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::{device_actor, EventMeta, MessageOrigin, ThreadEvent};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+async fn device_label(pool: &PgPool, device_id: &str) -> String {
+    crate::core::DeviceStore::friendly_name(pool, device_id).await
+}
+
+pub(super) enum Recipient {
+    Chosen { id: String, label: String },
+    LastUsed { id: String, label: String },
+    EveryDevice,
+}
+
+impl Recipient {
+    pub(super) fn device_id(&self) -> Option<&str> {
+        match self {
+            Recipient::Chosen { id, .. } | Recipient::LastUsed { id, .. } => Some(id),
+            Recipient::EveryDevice => None,
+        }
+    }
+
+    pub(super) fn actor(&self) -> Option<MessageOrigin> {
+        self.device_id().map(device_actor)
+    }
+
+    pub(super) fn described(&self) -> Option<String> {
+        match self {
+            Recipient::Chosen { label, .. } => Some(format!("\"{label}\", the device you named")),
+            Recipient::LastUsed { label, .. } => Some(format!(
+                "\"{label}\", the user's last used device in this turn"
+            )),
+            Recipient::EveryDevice => None,
+        }
+    }
+}
+
+pub(super) async fn recipient(
+    pool: &PgPool,
+    args: &serde_json::Value,
+    last_used: Option<&str>,
+) -> Result<Recipient, String> {
+    let chosen = match args.get("device") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(id)) => Some(id.trim()).filter(|id| !id.is_empty()),
+        Some(other) => return Err(format!("Error: device must be a device id, got {other}")),
+    };
+    if let Some(id) = chosen {
+        match crate::core::DeviceStore::is_registered(pool, id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "Error: device '{id}' is not a known device. Pass an id from the \
+                     Known devices list, or omit device to use the last used device."
+                ))
+            }
+            Err(e) => return Err(format!("Error: could not look up device '{id}': {e}")),
+        }
+    }
+    let Some(id) = chosen.or(last_used) else {
+        return Ok(Recipient::EveryDevice);
+    };
+    let label = device_label(pool, id).await;
+    let id = id.to_string();
+    Ok(if chosen.is_some() {
+        Recipient::Chosen { id, label }
+    } else {
+        Recipient::LastUsed { id, label }
+    })
+}
+
+/// INVARIANT: Emit one `NavigationRequested` scoped to `actor`. The one emitter of that
+/// event from a tool call. The OAuth authorization page is a persisted
+/// `OAuthAuthorizationRequested` instead, since a flow waits on it.
+pub(crate) async fn emit_navigation(
+    bus: &EventBus,
+    payload: &serde_json::Value,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> Result<(), String> {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::NavigationRequested {
+            payload: payload.to_string(),
+        },
+        meta: EventMeta::with_actor(actor),
+    })
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("failed to emit NavigationRequested: {e}"))
+}
+
+pub(crate) async fn navigate_ui_impl(
+    bus: &EventBus,
+    pool: &PgPool,
+    apps: &AppManager,
+    args: &serde_json::Value,
+    thread_id: Uuid,
+    last_used: Option<&str>,
+) -> ToolOutcome {
+    let target = match args.get("target").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err("Error: target is required".to_string()),
+    };
+    if target == "url"
+        && args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+    {
+        return Err("Error: url is required when target is 'url'".to_string());
+    }
+    let mut payload = args.clone();
+    crate::api::resolve_thread_id_in_nav_payload(&mut payload, Some(thread_id))
+        .map_err(|e| format!("Error: {e}"))?;
+    crate::api::resolve_repo_in_nav_payload(pool, &mut payload)
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+
+    let who = recipient(pool, args, last_used).await?;
+    let device_id = who.device_id();
+    log_legacy!("[Navigate] navigate_ui thread={thread_id} target={target} device={device_id:?}");
+    emit_navigation(bus, &payload, thread_id, who.actor())
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+
+    let mut out = sent_line(&describe_target(target, &payload), &who);
+    if let Some(id) = device_id {
+        out.push_str(&presence_note(
+            device_presence(pool, id).await.as_ref(),
+            &payload,
+        ));
+    }
+    if target == "url" {
+        out.push_str(URL_NOTE);
+    }
+    if let Some(note) = new_chat_folder_note(pool, apps, &payload).await {
+        out.push_str(&note);
+    }
+    if let Some(guide) = page_guide(target, args) {
+        out.push_str("\n\n");
+        out.push_str(guide);
+    }
+    Ok(out)
+}
+
+async fn new_chat_folder_note(
+    pool: &PgPool,
+    apps: &AppManager,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    if payload.get("target").and_then(|v| v.as_str()) != Some("new-chat") {
+        return None;
+    }
+    let folder = payload.get("folder")?.as_str()?;
+    if folder.is_empty() {
+        return None;
+    }
+    let reason = match folder
+        .strip_prefix("data/apps/")
+        .map(|id| id.trim_end_matches('/'))
+    {
+        Some(app_id) if apps.app_exists(app_id) => return None,
+        Some(app_id) => format!("no installed app has the id '{app_id}'"),
+        None => {
+            let repos = match crate::core::repositories::RepositoryStore::list(pool).await {
+                Ok(repos) => repos,
+                Err(e) => {
+                    log_legacy!(
+                        "[Navigate] could not list repositories for folder '{folder}': {e}"
+                    );
+                    return None;
+                }
+            };
+            match crate::api::match_repository(&repos, folder) {
+                Ok(_) => return None,
+                Err(reason) => reason,
+            }
+        }
+    };
+    Some(format!(
+        "\n\nWarning: folder '{folder}' was not preselected: {reason}. The new chat still \
+         opens with the folder dropdown at its default. manage_repositories 'list' shows \
+         each repository's name and id."
+    ))
+}
+
+fn sent_line(what: &str, who: &Recipient) -> String {
+    let to = match who.described() {
+        Some(device) => format!("to {device}"),
+        None => "to every device showing this thread. This turn has no last used device, so \
+                 no single device was chosen"
+            .to_string(),
+    };
+    format!(
+        "Sent a request to open {what} {to}. Sent is not opened: no page confirms it acted. \
+         A device showing this thread opens it; any other shows a toast the user taps to open it. \
+         Tell the user which device you sent it to, never that it is already on their screen."
+    )
+}
+
+pub(super) async fn device_presence(pool: &PgPool, device_id: &str) -> Option<SeenDevice> {
+    match crate::core::DeviceStore::seen(pool, device_id).await {
+        Ok(seen) => seen,
+        Err(e) => {
+            log_legacy!("[Navigate] presence lookup failed for device {device_id}: {e}");
+            None
+        }
+    }
+}
+
+pub(super) fn presence_note(presence: Option<&SeenDevice>, payload: &serde_json::Value) -> String {
+    let Some(seen) = presence else {
+        return String::new();
+    };
+    if seen.visible_now {
+        return " Lucidos was visible on it within the last 2 minutes.".to_string();
+    }
+    let mut to = payload.clone();
+    if let Some(args) = to.as_object_mut() {
+        args.remove("device");
+    }
+    let tap = serde_json::json!({"kind": "navigate", "to": to});
+    format!(
+        " Lucidos is not seen visible on it now (last seen {}). \
+         A navigate is not stored or retried: if Lucidos is closed or suspended there, \
+         it never arrives. Tell the user so. To reach that device later, offer \
+         send_notification with tap {tap}. A notification stays in the inbox on every \
+         device, is pushed when no device is active, and opens this target when tapped.",
+        crate::engine::agent_context::format_age(seen.seen_secs_ago)
+    )
+}
+
+const URL_NOTE: &str = " It opens wherever they configured links to open (the in-app \
+     browser panel, their system browser, or a new tab), so call it their browser. A \
+     browser can refuse it as a blocked popup, and then the client offers an Open button.";
+
+fn describe_target(target: &str, args: &serde_json::Value) -> String {
+    let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    match target {
+        "file" => format!("the file {}", arg("file_path")),
+        "app" => format!("the app {}", arg("app_id")),
+        "thread" => format!("thread {}", arg("id")),
+        "trigger" => format!("trigger {}", arg("id")),
+        "url" => arg("url").to_string(),
+        "settings" if !arg("settings_view").is_empty() => {
+            let view = arg("settings_view");
+            match arg("fragment") {
+                "" => format!("Settings → {view}"),
+                row => format!("Settings → {view}, the {row} row"),
+            }
+        }
+        other => format!("the {other} view"),
+    }
+}
+
+fn page_guide(target: &str, args: &serde_json::Value) -> Option<&'static str> {
+    if target != "settings" {
+        return None;
+    }
+    match args.get("settings_view").and_then(|v| v.as_str()) {
+        Some("providers") => Some(PROVIDERS_SETTINGS_GUIDE),
+        Some("models") => Some(MODELS_SETTINGS_GUIDE),
+        Some("backup") => Some(BACKUP_SETTINGS_GUIDE),
+        Some("environment-variables") => Some(ENV_VARS_SETTINGS_GUIDE),
+        _ => None,
+    }
+}
+
+const PROVIDERS_SETTINGS_GUIDE: &str = "Settings → Providers shows:\n\
+     - One block per model provider (Vertex AI, Anthropic, OpenAI, OpenRouter, xAI, \
+       OpenCode Free, local, Claude gateway): its key or sign-in and its switch\n\
+     - A System One section: TypeSafe, Cloudflare Workers AI and custom providers\n\
+     Pass fragment with a provider's id ('xai', 'openai', 'vertex', 'anthropic') to \
+     land on its block. A model needs one of its providers set up here before it \
+     can be chosen.";
+
+const MODELS_SETTINGS_GUIDE: &str = "Settings → Models shows:\n\
+     - The active Chat & triggers model (the model picker) and reasoning effort\n\
+     - Image generation and background-task models (title, image description, memory)\n\
+     - A link to Settings → Providers, and the model registry (models no provider \
+       serves sit in a closed 'Needs a provider' group)\n\
+     Tell the user they can change the active model from the picker here. To switch \
+     it for them instead, use set_preference(key='chat_model'); to add a model to the \
+     picker, use manage_models.";
+
+pub(super) const BACKUP_SETTINGS_GUIDE: &str = "Settings → System → Backup shows:\n\
+     - A health card: last run outcome, last cloud backup + age, staleness warning\n\
+     - The provider dropdown (Google Drive / Dropbox), and a red line linking to \
+       Settings → Accounts when the selected provider has no connected account\n\
+     - 'Back up now', the schedule dropdown, and the retention dropdown\n\
+     - Show/generate the encryption key (required to restore, cannot be recovered)\n\
+     This page does NOT connect the provider account, and has no account UI at all: \
+     that is Settings → Accounts, and it is the only place to do it. Do not tell the \
+     user to connect an account here. Restore is not in the app either, it happens \
+     from the workspace picker.";
+
+const ENV_VARS_SETTINGS_GUIDE: &str = "Settings → System → Environment variables shows:\n\
+     - The user's environment variables as NAME = value rows\n\
+     - Buttons to add, edit, or delete a variable\n\
+     These are non-secret values injected into every subprocess Lucidos spawns \
+     (run_bash, run_python, scheduled scripts, coding agents), which pick a change up \
+     on the next spawn with no restart. The engine loads the same store into its own \
+     process environment once at startup, so a variable the engine itself reads \
+     changes only after an engine restart. For secrets like API keys, the user should \
+     use credentials instead.";
+
+#[cfg(test)]
+#[path = "navigate_tests.rs"]
+mod tests;

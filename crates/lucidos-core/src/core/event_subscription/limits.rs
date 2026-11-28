@@ -1,0 +1,5 @@
+pub const MAX_TIMEOUT_SECS: i64 = 24 * 60 * 60;
+
+pub const MAX_RECENT_SUBSCRIPTIONS: i64 = 20;
+
+pub const RECENT_SUBSCRIPTION_WINDOW_SECS: i64 = 60 * 60;

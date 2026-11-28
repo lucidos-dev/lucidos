@@ -1,0 +1,44 @@
+
+.webhook-delivery-url {
+    overflow-wrap: anywhere;
+}
+
+.webhook-ingress-warning {
+    color: var(--accent-red);
+}
+
+.webhook-refusal-warning {
+    color: var(--accent-red);
+}
+
+.webhook-credential-missing {
+    color: var(--accent-red);
+}
+
+.webhook-signature-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    width: 100%;
+}
+
+.webhook-signature-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.webhook-signature-row > label {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.webhook-signature-fields .settings-section-desc {
+    margin: 0;
+}
+
+.webhook-signature-pair {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+}

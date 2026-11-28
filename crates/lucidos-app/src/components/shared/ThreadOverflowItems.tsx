@@ -1,0 +1,232 @@
+import { useState } from 'preact/hooks';
+import { archivingCompleted, handleArchiveCompleted } from '../../store/actions/archive-completed';
+import { Disclosure } from './Disclosure';
+import type { ComponentChildren } from 'preact';
+import type { OverflowMenuContext } from './OverflowMenu';
+import { FolderPinItems } from './FolderPinItems';
+import { ChevronRightIcon, FolderIcon, CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, CurrentIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, HoldIcon, StandingApplyIcon, TerminalIcon, TrashIcon } from './icons';
+import { openThreadTerminal } from '../../store/actions/terminal';
+import { canRenameThread, promptRenameThread } from '../../store/actions/threadRename';
+import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
+import { exportThread } from '../../utils/exportThread';
+import { resolveChangeMenuActions, threadIsPinnable } from '../../store/actions/threadActions';
+import type { ThreadAction } from '../../generated/thread-lifecycle';
+import { focusThread, handleArchiveThread, handleSaveThread, handleUnarchiveThread, handleUnsaveThread } from '../../store/actions/threads';
+import { handleDeleteThread } from '../../store/actions/threads-delete';
+import { canMoveToTopLevel, handleDetachThread } from '../../store/actions/threads-detach';
+import { exitItems } from '../../store/actions/threadBlockers';
+import { canHoldThread, HOLD_TOOLTIP, promptAndHoldThread } from '../../store/actions/threadHold';
+import { SUB_THREAD_STATE, moreSubThreads } from '../../store/actions/blockerCopy';
+import { threadMap, standingApplyThreadIds } from '../../store/store';
+import { isFamilyRoot } from '../drawer/family-graph';
+import { threadDisplayTitle } from '../../utils/threadTitle';
+
+export const LISTED_SUB_THREADS = 3;
+
+const CHANGE_ACTION_ICON: Partial<Record<ThreadAction, (armed: boolean) => ComponentChildren>> = {
+  apply: () => <CheckIcon />,
+  apply_when_settled: (armed) => <StandingApplyIcon armed={armed} />,
+  hold: () => <HoldIcon />,
+  discard: () => <TrashIcon />,
+};
+
+export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onFindInThread }: {
+  threadId: string;
+  title: string;
+  run: OverflowMenuContext['run'];
+  onShowInFolders?: () => void;
+  onFindInThread?: () => void;
+}) {
+  const liveThread = threadMap.value.get(threadId);
+  const saved = liveThread?.meta.saved ?? false;
+  const pinnable = !!liveThread && threadIsPinnable(liveThread.meta);
+  const renamable = canRenameThread(liveThread);
+  const changeActions = resolveChangeMenuActions(threadId);
+  const holdAlone = canHoldThread(liveThread) && !changeActions.some((a) => a.kind === 'hold');
+  const standingApplyArmed = standingApplyThreadIds.value.has(threadId);
+  const movable = canMoveToTopLevel(threadId);
+  const exits = exitItems(threadId);
+  return (
+    <div data-surface-step="thread-menu">
+      {(onShowInFolders || onFindInThread) && (
+        <>
+          {onShowInFolders && (
+            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(onShowInFolders)}>
+              <LocateIcon />
+              Show in Folders
+            </button>
+          )}
+          {onFindInThread && (
+            <button type="button" class="thread-overflow-item find-in-thread" role="menuitem" onClick={run(onFindInThread)}>
+              <SearchIcon />
+              Find in thread
+            </button>
+          )}
+          <div class="thread-overflow-divider" role="separator" />
+        </>
+      )}
+      {pinnable && (
+        <>
+          <button type="button" class="thread-overflow-item" role="menuitem"
+            onClick={run(() => { if (saved) void handleUnsaveThread(threadId); else void handleSaveThread(threadId); })}>
+            <PinIcon filled={saved} />
+            {saved ? 'Unpin thread' : 'Pin thread'}
+          </button>
+          {liveThread && isFamilyRoot(liveThread, threadMap.value) && (
+            <PinToFolderItem threadId={threadId} saved={saved} run={run} />
+          )}
+          <div class="thread-overflow-divider" role="separator" />
+        </>
+      )}
+      {renamable && (
+        <>
+          <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void promptRenameThread(threadId); })}>
+            <EditIcon />
+            Rename…
+          </button>
+          <div class="thread-overflow-divider" role="separator" />
+        </>
+      )}
+      <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => copyThreadRef(threadId, title))}>
+        <CopyIcon />
+        Copy thread reference
+      </button>
+      <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => copyThreadTitle(title))}>
+        <CopyIcon />
+        Copy thread title
+      </button>
+      <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void exportThread(threadId, title); })}>
+        <DownloadIcon />
+        Download thread
+      </button>
+      <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => openThreadTerminal(threadId))}>
+        <TerminalIcon />
+        Open terminal
+      </button>
+      {holdAlone && (
+        <>
+          <div class="thread-overflow-divider" role="separator" />
+          <button type="button" class="thread-overflow-item" role="menuitem" data-tooltip={HOLD_TOOLTIP}
+            onClick={run(() => { void promptAndHoldThread(threadId); })}>
+            <HoldIcon />
+            Hold…
+          </button>
+        </>
+      )}
+      {changeActions.length > 0 && <div class="thread-overflow-divider" role="separator" />}
+      {changeActions.map((action) => {
+        const toggle = action.kind === 'apply_when_settled';
+        return (
+          <button key={action.kind} type="button"
+            role={toggle ? 'menuitemcheckbox' : 'menuitem'}
+            aria-checked={toggle ? standingApplyArmed : undefined}
+            class={action.kind === 'discard' ? 'thread-overflow-item thread-overflow-item-danger' : 'thread-overflow-item'}
+            data-tooltip={action.tooltip}
+            onClick={run(() => { void action.invoke(); })}>
+            {CHANGE_ACTION_ICON[action.kind]?.(standingApplyArmed)}
+            {action.label}
+            {toggle && standingApplyArmed && (
+              <span class="thread-overflow-check thread-overflow-check-end" aria-hidden="true">✓</span>
+            )}
+          </button>
+        );
+      })}
+      {(movable || exits.archive || exits.unarchive || exits.delete) && <div class="thread-overflow-divider" role="separator" />}
+      {movable && (
+        <button type="button" class="thread-overflow-item" role="menuitem"
+          onClick={run(() => { void handleDetachThread(threadId); })}>
+          <MoveToTopIcon />
+          Move to top level
+        </button>
+      )}
+      <ArchiveCompletedItem threadId={threadId} count={liveThread?.meta.archivableSubThreadCount ?? 0} run={run} />
+      {exits.archive === 'enabled' && (
+        <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleArchiveThread(threadId); })}>
+          <ArchiveIcon />
+          Archive
+        </button>
+      )}
+      {exits.archive === 'blocked' && <BlockedExit icon={<ArchiveIcon />} label="Archive" reason={exits.reason} />}
+      {exits.unarchive && (
+        <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleUnarchiveThread(threadId); })}>
+          <CurrentIcon />
+          Move to Current
+        </button>
+      )}
+      {exits.delete === 'enabled' && (
+        <button type="button" class="thread-overflow-item thread-overflow-item-danger" role="menuitem"
+          onClick={run(() => { void handleDeleteThread(threadId); })}>
+          <TrashIcon />
+          Delete thread
+        </button>
+      )}
+      {exits.delete === 'blocked' && <BlockedExit icon={<TrashIcon />} label="Delete thread" danger reason={exits.reason} />}
+      {exits.reason && <div class="thread-overflow-note" aria-hidden="true">{exits.reason}</div>}
+      {exits.subThreads.slice(0, LISTED_SUB_THREADS).map(({ thread: subThread, blocker }) => (
+        <button key={subThread.meta.id} type="button" class="thread-overflow-item" role="menuitem"
+          onClick={run(() => { focusThread(subThread.meta.id); })}>
+          <LocateIcon />
+          <span class="thread-overflow-sub-thread">
+            <span class="thread-overflow-sub-thread-title">{threadDisplayTitle(subThread)}</span>
+            <span class="thread-overflow-sub-thread-state">{SUB_THREAD_STATE[blocker]}</span>
+          </span>
+        </button>
+      ))}
+      {exits.subThreads.length > LISTED_SUB_THREADS && (
+        <div class="thread-overflow-note">{moreSubThreads(exits.subThreads.length - LISTED_SUB_THREADS)}</div>
+      )}
+    </div>
+  );
+}
+
+function PinToFolderItem({ threadId, saved, run }: {
+  threadId: string;
+  saved: boolean;
+  run: OverflowMenuContext['run'];
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button type="button" class="thread-overflow-item" role="menuitem" aria-expanded={open}
+        onClick={() => setOpen(o => !o)}>
+        <FolderIcon />
+        {saved ? 'Move to folder' : 'Pin to folder'}
+        <span class={`thread-overflow-chevron${open ? ' open' : ''}`} aria-hidden="true"><ChevronRightIcon size="1em" /></span>
+      </button>
+      <Disclosure open={open} bodyClass="thread-overflow-submenu">
+        <FolderPinItems threadId={threadId} run={run} includePinned={saved} />
+      </Disclosure>
+    </>
+  );
+}
+
+function BlockedExit({ icon, label, reason, danger }: {
+  icon: ComponentChildren;
+  label: string;
+  reason: string | null;
+  danger?: boolean;
+}) {
+  return (
+    <button type="button" role="menuitem" aria-disabled="true"
+      class={danger ? 'thread-overflow-item thread-overflow-item-blocked thread-overflow-item-danger' : 'thread-overflow-item thread-overflow-item-blocked'}>
+      {icon}
+      {label}
+      {reason && <span class="visually-hidden">{` ${reason}`}</span>}
+    </button>
+  );
+}
+
+function ArchiveCompletedItem({ threadId, count, run }: {
+  threadId: string;
+  count: number;
+  run: OverflowMenuContext['run'];
+}) {
+  const busy = archivingCompleted.value.has(threadId);
+  return <Disclosure open={count > 0}>
+    <button type="button" class="thread-overflow-item" role="menuitem" disabled={busy}
+      onClick={run(() => { void handleArchiveCompleted(threadId); })}>
+      <ArchiveIcon />
+      Archive {count} completed sub-threads
+    </button>
+  </Disclosure>;
+}

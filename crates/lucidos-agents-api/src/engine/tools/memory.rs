@@ -1,0 +1,1021 @@
+use super::super::LucidosEngine;
+use crate::engine::event_bus::EventBus;
+use crate::engine::memory::correction::{index_correction, record_correction};
+use crate::engine::memory::MEMORY_CORRECTION_THRESHOLD;
+use crate::engine::thread_events::MessageOrigin;
+use crate::engine::AuxCapture;
+use crate::llm::provider::LlmProvider;
+use crate::llm::{Message, MessageContent};
+use crate::memory::{cosine_similarity, CorrectedMemory, EmbeddingProvider};
+
+pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
+    provider: &P,
+    prompt: String,
+    candidates: usize,
+    capture: &AuxCapture,
+) -> Option<Vec<usize>> {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: MessageContent::Text(prompt),
+    }];
+    let response = match capture
+        .chat(
+            provider,
+            messages,
+            vec![],
+            crate::llm::ModelSelection::default(),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            log_legacy!(@Memory, "[correct_memory] LLM batch verification failed: {}. Aborting to be safe", e);
+            return None;
+        }
+    };
+    let answer = response
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    log_legacy!(@Memory, "[correct_memory] LLM batch verdict: '{}'", &answer[..answer.floor_char_boundary(100)]);
+    if answer.starts_with("none") || answer.is_empty() {
+        return Some(vec![]);
+    }
+    Some(
+        answer
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1 && n <= candidates)
+            .map(|n| n - 1)
+            .collect(),
+    )
+}
+
+#[easy_ext::ext(MemoryExt)]
+pub(crate) impl LucidosEngine {
+    async fn execute_memory_tool(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let search_query = args["search_query"].as_str().unwrap_or("");
+        let wrong_fact = args
+            .get("wrong_fact")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if search_query.is_empty() {
+            return Ok("Error: search_query is required".to_string());
+        }
+        if wrong_fact.is_empty() {
+            return Ok(
+                "Error: wrong_fact is required — describe the specific wrong claim".to_string(),
+            );
+        }
+
+        let Some(ref index) = self.memory_index else {
+            return Ok("Error: memory system not available".to_string());
+        };
+
+        let results = index
+            .search_by_keyword(search_query, 0.0, 100)
+            .await
+            .map_err(|e| format!("Search failed: {}", e))?;
+
+        if results.entries.is_empty() {
+            return Ok(format!("No memories found matching '{}'", search_query));
+        }
+
+        let wrong_embedding = self
+            .embedder
+            .embed(wrong_fact)
+            .await
+            .map_err(|e| format!("Failed to embed wrong_fact: {}", e))?;
+
+        let candidate_embeddings = self
+            .embedder
+            .embed_batch(
+                &results
+                    .entries
+                    .iter()
+                    .map(|e| e.summary.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .map_err(|e| format!("Failed to embed candidates: {}", e))?;
+
+        let mut candidates: Vec<(usize, f32)> = Vec::new();
+        let mut kept_count: usize = 0;
+
+        log_legacy!(@Memory, "[correct_memory] Found {} keyword candidates for '{}'", results.entries.len(), search_query);
+
+        for (i, entry) in results.entries.iter().enumerate() {
+            if i < candidate_embeddings.len() {
+                let similarity = cosine_similarity(&wrong_embedding, &candidate_embeddings[i]);
+                let truncated = &entry.summary[..entry.summary.floor_char_boundary(80)];
+                log_legacy!(@Memory, "[correct_memory]   score={:.3} '{}'", similarity, truncated);
+                if similarity >= MEMORY_CORRECTION_THRESHOLD {
+                    candidates.push((i, similarity));
+                } else {
+                    kept_count += 1;
+                }
+            }
+        }
+
+        log_legacy!(@Memory, "[correct_memory] {} of {} candidates passed similarity filter (threshold={})",
+            candidates.len(), results.entries.len(), MEMORY_CORRECTION_THRESHOLD);
+
+        if candidates.is_empty() {
+            return Ok(format!(
+                "Found {} memories matching '{}', but none are semantically similar to the wrong fact '{}'. No changes made.",
+                results.entries.len(), search_query, wrong_fact
+            ));
+        }
+
+        const MAX_DELETIONS: usize = 10;
+        if candidates.len() > MAX_DELETIONS {
+            log_legacy!(@Memory, "[correct_memory] BLOCKED: {} matches exceeds safety cap of {}", candidates.len(), MAX_DELETIONS);
+            return Ok(format!(
+                "Too many matches ({} entries). The wrong_fact may be too broad. Please be more specific.",
+                candidates.len()
+            ));
+        }
+
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut verify_list = String::new();
+        for (list_idx, &(entry_idx, _)) in candidates.iter().enumerate() {
+            verify_list.push_str(&format!(
+                "{}. {}\n",
+                list_idx + 1,
+                results.entries[entry_idx].summary
+            ));
+        }
+
+        let verify_prompt = format!(
+            r#"The user says this fact is WRONG and should be removed from memory:
+"{wrong_fact}"
+
+Below are memory entries that might contain this wrong fact. For each entry, answer "yes" if it contains or directly expresses the specific wrong claim, or "no" if it merely mentions the same person/place but is about something else (contact info, finances, other dates, etc.).
+
+{verify_list}
+Reply with ONLY the numbers of entries that should be deleted, comma-separated. Example: "1, 3, 5"
+If NONE should be deleted, reply with "none"."#,
+            wrong_fact = wrong_fact,
+            verify_list = verify_list,
+        );
+
+        let capture = crate::engine::AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::MemoryCorrection,
+        );
+        let Some(verified_indices) = verify_entries(
+            self.current_provider().as_ref(),
+            verify_prompt,
+            candidates.len(),
+            &capture,
+        )
+        .await
+        else {
+            return Ok("Memory correction aborted: could not verify which entries to delete. Please try again.".to_string());
+        };
+
+        if verified_indices.is_empty() {
+            return Ok(format!(
+                "Found {} candidate memories matching '{}', but LLM verification determined none actually express the wrong fact '{}'. No changes made.",
+                candidates.len(), search_query, wrong_fact
+            ));
+        }
+
+        let correction = args
+            .get("correction")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        let removed: Vec<CorrectedMemory> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(list_idx, _)| verified_indices.contains(list_idx))
+            .map(|(_, &(entry_idx, _))| CorrectedMemory::from(&results.entries[entry_idx]))
+            .collect();
+        let event_id = match record_correction(
+            &self.event_bus,
+            search_query,
+            wrong_fact,
+            removed,
+            correction,
+            None,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => return Ok(unrecorded_correction(e)),
+        };
+
+        let mut deleted_summaries: Vec<String> = Vec::new();
+        let mut skipped_summaries: Vec<String> = Vec::new();
+        let mut failed_summaries: Vec<String> = Vec::new();
+
+        for (list_idx, &(entry_idx, _)) in candidates.iter().enumerate() {
+            let entry = &results.entries[entry_idx];
+            if verified_indices.contains(&list_idx) {
+                match index.delete(entry.id).await {
+                    Ok(true) => {
+                        deleted_summaries.push(entry.summary.clone());
+                        log_legacy!(@Memory, "[correct_memory]   DELETED id={}", entry.id);
+                    }
+                    Ok(false) => {
+                        log_legacy!(@Memory, "[correct_memory]   Entry {} already gone", entry.id);
+                    }
+                    Err(e) => {
+                        log_legacy!(@Memory, "[correct_memory]   Failed to delete {}: {}", entry.id, e);
+                        failed_summaries.push(format!("{} ({})", entry.summary, e));
+                    }
+                }
+            } else {
+                skipped_summaries.push(entry.summary.clone());
+            }
+        }
+
+        let added = match correction {
+            Some(text) => {
+                Some(added_fact_note(index, self.embedder.as_ref(), event_id, text).await)
+            }
+            None => None,
+        };
+
+        let total = deleted_summaries.len() + skipped_summaries.len() + kept_count;
+        let mut response = format!(
+            "Deleted {} of {} memories matching '{}' (verified by LLM against '{}'):\n",
+            deleted_summaries.len(),
+            total,
+            search_query,
+            wrong_fact
+        );
+        for summary in &deleted_summaries {
+            response.push_str(&format!("  - {}\n", summary));
+        }
+        if !skipped_summaries.is_empty() {
+            response.push_str(&format!(
+                "\nSkipped {} entries (LLM determined they don't express the wrong fact):\n",
+                skipped_summaries.len()
+            ));
+            for summary in &skipped_summaries {
+                response.push_str(&format!("  - {}\n", summary));
+            }
+        }
+        if !failed_summaries.is_empty() {
+            response.push_str(&format!(
+                "\nFailed to delete {} entries:\n",
+                failed_summaries.len()
+            ));
+            for summary in &failed_summaries {
+                response.push_str(&format!("  - {}\n", summary));
+            }
+        }
+        if kept_count > 0 {
+            response.push_str(&format!(
+                "\nKept {} unrelated memories (below similarity threshold).\n",
+                kept_count
+            ));
+        }
+        if let Some(note) = added {
+            response.push_str(&format!("\n{note}"));
+        }
+
+        Ok(response)
+    }
+
+    async fn execute_correct_memory_by_id(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.correct_memory_by_id(args, None).await?.text)
+    }
+
+    async fn correct_memory_by_id(
+        &self,
+        args: &serde_json::Value,
+        actor: Option<MessageOrigin>,
+    ) -> Result<CorrectionReply, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(ref index) = self.memory_index else {
+            return Ok(CorrectionReply::refused(
+                CorrectionRefusal::NotRecorded,
+                "Error: memory system not available",
+            ));
+        };
+        correct_memory_by_id_impl(index, self.embedder.as_ref(), &self.event_bus, args, actor).await
+    }
+
+    /// INVARIANT: `memory` action `search`: the agent's own query against long-term
+    /// memory, for when the pre-turn injection missed something it needs.
+    ///
+    /// Ranked by the SAME formula as that injection
+    /// (`engine::memory::relevance_score`), so a search cannot come back in a
+    /// different order from the facts already in context. Two orderings over
+    /// one corpus is a contradiction the agent would have to resolve with
+    /// nothing to resolve it by.
+    async fn execute_search_memory(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let q = args.get("q").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if q.is_empty() {
+            return Ok("Error: q is required. Ask what you want to know.".to_string());
+        }
+        let limit = args.get("limit").and_then(|v| v.as_i64());
+        let found = self.search_memory_ranked(q, limit).await?;
+        Ok(serde_json::to_string(&found)?)
+    }
+
+    async fn execute_memory_source(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if id.is_empty() {
+            return Ok(
+                "Error: id is required. Copy the `[id: <uuid>]` from the memory.".to_string(),
+            );
+        }
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Ok(format!("Error: '{id}' is not a uuid."));
+        };
+        match self.memory_source(uuid).await {
+            Ok(found) => Ok(serde_json::to_string(&found)?),
+            Err(e) => Ok(format!("Error: {e}")),
+        }
+    }
+
+    async fn execute_search_threads(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let q = args.get("q").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if q.is_empty() {
+            return Ok("Error: q is required. Say what was discussed.".to_string());
+        }
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(20)
+            .clamp(1, 50);
+        let mut found =
+            crate::engine::thread_search::combined_thread_search(self, q, limit).await?;
+        found.truncate(limit.max(0) as usize);
+        crate::engine::thread_liveness::attach(&self.pool, found.iter_mut().map(|r| &mut r.info))
+            .await;
+        // INVARIANT: PROJECTED, never the raw `ThreadSearchResult`. That flattens ~30
+        // bookkeeping fields the model has no use for. It also carries the
+        // whole draft, and search may match a thread on its draft alone. So a
+        // row says only whether the thread holds one; the `drafts` action
+        // reads it. Each row carries its thread link, so the model can point
+        // the user at a hit.
+        let workspace = self.workspace_name();
+        let projected: Vec<serde_json::Value> = found
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "thread_id": r.info.thread_id,
+                    "title": r.info.title,
+                    "liveness": r.info.liveness,
+                    "coding_agent_change_state": r.info.coding_agent_change_state,
+                    "last_activity": r.info.last_activity,
+                    "message_count": r.info.message_count,
+                    "channel": r.info.channel,
+                    "has_draft": crate::core::store::has_draft(
+                        &r.info.compose_text,
+                        &r.info.compose_images,
+                    ),
+                    "link": crate::core::store::thread_link(&workspace, &r.info.thread_id),
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&projected)?)
+    }
+}
+
+fn unrecorded_correction(e: Box<dyn std::error::Error + Send + Sync>) -> String {
+    format!(
+        "Memory correction aborted: could not record it ({e}). No changes made. Please try again."
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorrectionRefusal {
+    InvalidArgs,
+    NoSuchEntry,
+    NotRecorded,
+}
+
+#[derive(Debug)]
+pub(crate) struct CorrectionReply {
+    pub(crate) text: String,
+    pub(crate) refusal: Option<CorrectionRefusal>,
+}
+
+impl CorrectionReply {
+    fn done(text: String) -> Self {
+        Self {
+            text,
+            refusal: None,
+        }
+    }
+
+    fn refused(refusal: CorrectionRefusal, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            refusal: Some(refusal),
+        }
+    }
+}
+
+pub(crate) fn parse_memory_entry_id(args: &serde_json::Value) -> Result<uuid::Uuid, String> {
+    let raw =
+        match args.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => return Err(
+                "Error: id is required. Copy it from the `[id: <uuid>]` shown on the memory bullet"
+                    .to_string(),
+            ),
+        };
+    let stripped = raw.strip_prefix("mem-").unwrap_or(raw);
+    uuid::Uuid::parse_str(stripped).map_err(|_| {
+        format!("Error: id must be a memory entry UUID as shown in `[id: <uuid>]` (got '{raw}')")
+    })
+}
+
+pub(crate) async fn correct_memory_by_id_impl(
+    index: &crate::memory::PgVectorIndex,
+    embedder: &dyn EmbeddingProvider,
+    bus: &EventBus,
+    args: &serde_json::Value,
+    actor: Option<MessageOrigin>,
+) -> Result<CorrectionReply, Box<dyn std::error::Error + Send + Sync>> {
+    let id = match parse_memory_entry_id(args) {
+        Ok(id) => id,
+        Err(msg) => {
+            return Ok(CorrectionReply::refused(
+                CorrectionRefusal::InvalidArgs,
+                msg,
+            ))
+        }
+    };
+
+    let Some(entry) = index
+        .get_by_id(id)
+        .await
+        .map_err(|e| format!("Lookup failed: {}", e))?
+    else {
+        return Ok(CorrectionReply::refused(
+            CorrectionRefusal::NoSuchEntry,
+            format!(
+                "No memory entry with id {id}. It may already be gone. Use correct_memory to search by keyword if you're unsure."
+            ),
+        ));
+    };
+
+    let correction = match args.get("correction") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text.trim()).filter(|s| !s.is_empty()),
+        Some(_) => {
+            return Ok(CorrectionReply::refused(
+                CorrectionRefusal::InvalidArgs,
+                "Error: correction must be text",
+            ))
+        }
+    };
+
+    let removed = vec![CorrectedMemory::from(&entry)];
+    let event_id = match record_correction(
+        bus,
+        &entry.summary,
+        &entry.summary,
+        removed,
+        correction,
+        actor,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(CorrectionReply::refused(
+                CorrectionRefusal::NotRecorded,
+                unrecorded_correction(e),
+            ))
+        }
+    };
+
+    let deleted = index
+        .delete(id)
+        .await
+        .map_err(|e| format!("Delete failed: {}", e))?;
+    // INVARIANT: Recorded either way, so the correction below still lands.
+    let mut response = if deleted {
+        log_legacy!(@Memory, "[correct_memory_by_id] DELETED id={} topic={:?}", id, entry.topic);
+        format!("Deleted memory entry {}:\n  - {}", id, entry.summary)
+    } else {
+        format!("Memory entry {} was already gone.", id)
+    };
+
+    if let Some(correction_text) = correction {
+        let note = added_fact_note(index, embedder, event_id, correction_text).await;
+        response.push_str(&format!("\n\n{note}"));
+    }
+
+    Ok(CorrectionReply::done(response))
+}
+
+async fn added_fact_note(
+    index: &crate::memory::PgVectorIndex,
+    embedder: &dyn EmbeddingProvider,
+    event_id: uuid::Uuid,
+    correction_text: &str,
+) -> String {
+    match index_correction(
+        index,
+        embedder,
+        event_id,
+        correction_text,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(()) => format!("Added corrected fact: {correction_text}"),
+        Err(e) => {
+            log_legacy!(@Memory, "[correct_memory] indexing the corrected fact failed: {}", e);
+            format!(
+                "The corrected fact is recorded but not searchable yet, because indexing it \
+                 failed ({e}). Do not retry: a memory rebuild adds it once indexing works. The fact: \
+                 {correction_text}"
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use crate::memory::{MemorySource, PgVectorIndex};
+    use crate::test_support::{
+        aux_captures, setup_test_db, teardown_test_db, Fixed384Embedder, ScriptedProvider,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn the_correction_verdict_records_what_it_cost() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(
+            &bus,
+            thread_id,
+            crate::engine::ContextPurpose::MemoryCorrection,
+        );
+
+        let provider = ScriptedProvider::new("claude-opus-4-5", vec!["1, 3"]);
+        let verified = verify_entries(&provider, "which of these?".to_string(), 3, &capture)
+            .await
+            .expect("the scripted reply parses");
+        assert_eq!(
+            verified,
+            vec![0, 2],
+            "the numbers are 1-indexed on the wire"
+        );
+
+        let captures = aux_captures(&pool, thread_id, "memory_correction").await;
+        assert_eq!(captures.len(), 1, "one call, one row: {captures:?}");
+        assert_eq!(captures[0]["producer"], "auxiliary");
+        assert_eq!(captures[0]["model"], "claude-opus-4-5");
+        assert_eq!(captures[0]["usage"]["input_tokens"], 210);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_verdict_of_none_is_still_recorded() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(
+            &bus,
+            thread_id,
+            crate::engine::ContextPurpose::MemoryCorrection,
+        );
+
+        let provider = ScriptedProvider::new("claude-opus-4-5", vec!["none"]);
+        let verified = verify_entries(&provider, "which of these?".to_string(), 3, &capture)
+            .await
+            .expect("the scripted reply parses");
+        assert!(verified.is_empty());
+        assert_eq!(
+            aux_captures(&pool, thread_id, "memory_correction")
+                .await
+                .len(),
+            1
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_verdict_call_aborts_instead_of_matching_anything() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let capture = AuxCapture::new(
+            &bus,
+            Uuid::new_v4(),
+            crate::engine::ContextPurpose::MemoryCorrection,
+        );
+
+        let provider = ScriptedProvider::new("claude-opus-4-5", vec![]);
+        let verified = verify_entries(&provider, "which of these?".to_string(), 3, &capture).await;
+        assert_eq!(verified, None);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_correction_that_cannot_be_recorded_deletes_nothing() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let target = insert(&index, "Config dir is at gws-personal").await;
+        sqlx::query("ALTER TABLE events RENAME TO events_gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({ "id": target.to_string() }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out.refusal,
+            Some(CorrectionRefusal::NotRecorded),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("No changes made"), "{}", out.text);
+        assert!(index.get_by_id(target).await.unwrap().is_some());
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[test]
+    fn parse_accepts_hyphenated_uuid() {
+        let id = Uuid::new_v4();
+        let args = json!({ "id": id.to_string() });
+        assert_eq!(parse_memory_entry_id(&args).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_accepts_simple_uuid() {
+        let id = Uuid::new_v4();
+        let args = json!({ "id": id.simple().to_string() });
+        assert_eq!(parse_memory_entry_id(&args).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_tolerates_mem_prefix_and_whitespace() {
+        let id = Uuid::new_v4();
+        let args = json!({ "id": format!("  mem-{}  ", id) });
+        assert_eq!(parse_memory_entry_id(&args).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_rejects_missing_id() {
+        let err = parse_memory_entry_id(&json!({})).unwrap_err();
+        assert!(err.contains("id is required"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_garbage() {
+        let err = parse_memory_entry_id(&json!({ "id": "not-a-uuid" })).unwrap_err();
+        assert!(err.contains("must be a memory entry UUID"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_correction_records_who_asked() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let target = insert(&index, "Config dir is at gws-personal").await;
+        let caller = MessageOrigin::Device {
+            device_id: "test-device".into(),
+        };
+
+        correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({ "id": target.to_string() }),
+            Some(caller.clone()),
+        )
+        .await
+        .unwrap();
+
+        let corrections = crate::core::EventStore::new(pool.clone())
+            .events_of_type_chronological(crate::engine::memory::correction::MEMORY_CORRECTED)
+            .await
+            .unwrap();
+        let payload = &corrections[0].payload;
+        let data = payload.get("data").unwrap_or(payload);
+        let recorded: MessageOrigin =
+            serde_json::from_value(data["actor"].clone()).expect("the correction names its caller");
+        assert_eq!(recorded, caller);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    struct FailingEmbedder;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FailingEmbedder {
+        async fn embed(
+            &self,
+            _text: &str,
+        ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+            Err("the embedder is down".into())
+        }
+        async fn embed_batch(
+            &self,
+            _texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+            Err("the embedder is down".into())
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "failing"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_index_of_the_corrected_fact_still_reports_the_correction() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let target = insert(&index, "Config dir is at gws-personal").await;
+
+        let out = correct_memory_by_id_impl(
+            &index,
+            &FailingEmbedder,
+            &bus,
+            &json!({ "id": target.to_string(), "correction": "Config dir is at gws-work" }),
+            None,
+        )
+        .await;
+
+        let recorded = crate::core::EventStore::new(pool.clone())
+            .events_of_type_chronological(crate::engine::memory::correction::MEMORY_CORRECTED)
+            .await
+            .unwrap()
+            .len();
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+        let out = out.expect("a recorded correction is not an error");
+        assert_eq!(out.refusal, None, "{}", out.text);
+        assert!(
+            out.text.contains("recorded but not searchable"),
+            "{}",
+            out.text
+        );
+        assert_eq!(recorded, 1);
+    }
+
+    #[tokio::test]
+    async fn a_correction_that_is_not_text_deletes_nothing() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let target = insert(&index, "Config dir is at gws-personal").await;
+
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({ "id": target.to_string(), "correction": 7 }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.refusal, Some(CorrectionRefusal::InvalidArgs));
+        assert!(index.get_by_id(target).await.unwrap().is_some());
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    async fn insert(index: &PgVectorIndex, summary: &str) -> Uuid {
+        let source = MemorySource::Event { id: Uuid::new_v4() };
+        insert_at(index, summary, &source, chrono::Utc::now()).await
+    }
+
+    async fn insert_at(
+        index: &PgVectorIndex,
+        summary: &str,
+        source: &MemorySource,
+        src_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        index
+            .index_entry(
+                id,
+                source,
+                "Config",
+                summary,
+                0.8,
+                &[],
+                &vec![0.1f32; 384],
+                "test-fixed-384",
+                src_created_at,
+                crate::memory::EXTRACTOR_VERSION,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn summaries(index: &PgVectorIndex, keyword: &str) -> Vec<String> {
+        let mut found: Vec<String> = index
+            .search_by_keyword(keyword, 0.0, 100)
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.summary)
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[tokio::test]
+    async fn delete_by_id_removes_only_the_target() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let target = insert(&index, "Config dir is at gws-personal").await;
+        let bystander = insert(&index, "User prefers dark theme").await;
+
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({ "id": target.to_string() }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.refusal, None);
+        let out = out.text;
+        assert!(out.contains("Deleted memory entry"), "{out}");
+        assert!(
+            out.contains("gws-personal"),
+            "echoes the deleted summary: {out}"
+        );
+
+        assert!(
+            index.get_by_id(target).await.unwrap().is_none(),
+            "target should be deleted"
+        );
+        assert!(
+            index.get_by_id(bystander).await.unwrap().is_some(),
+            "bystander must be untouched"
+        );
+
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_id_is_a_safe_no_op() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let survivor = insert(&index, "User prefers dark theme").await;
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({ "id": Uuid::new_v4().to_string() }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.refusal, Some(CorrectionRefusal::NoSuchEntry));
+        let out = out.text;
+        assert!(out.contains("No memory entry with id"), "{out}");
+        assert!(
+            index.get_by_id(survivor).await.unwrap().is_some(),
+            "nothing should be deleted"
+        );
+        assert_eq!(index.len().await.unwrap(), 1);
+
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn delete_with_correction_replaces_the_fact() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let target = insert(&index, "Config dir is at gws-personal").await;
+        let out = correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({
+                "id": target.to_string(),
+                "correction": "The gws-personal config dir was deleted",
+            }),
+            None,
+        )
+        .await
+        .unwrap()
+        .text;
+        assert!(out.contains("Added corrected fact"), "{out}");
+
+        assert!(
+            index.get_by_id(target).await.unwrap().is_none(),
+            "old entry should be gone"
+        );
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_entries WHERE topic = 'Memory Correction' AND summary = $1",
+        )
+        .bind("The gws-personal config dir was deleted")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 1, "correction fact should be stored");
+
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_does_not_resurrect_a_corrected_fact() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let wrong = "User works at Acme Corp";
+        let right = "User works at Globex";
+
+        let target = insert(&index, wrong).await;
+        let source = index.get_by_id(target).await.unwrap().unwrap().source;
+        correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({ "id": target.to_string(), "correction": right }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let corrections = crate::core::EventStore::new(pool.clone())
+            .events_of_type_chronological(crate::engine::memory::correction::MEMORY_CORRECTED)
+            .await
+            .unwrap();
+        assert_eq!(corrections.len(), 1, "the correction must be recorded");
+        let corrected_at = corrections[0].created;
+
+        index.clear().await.unwrap();
+        insert_at(
+            &index,
+            wrong,
+            &source,
+            corrected_at - chrono::Duration::hours(1),
+        )
+        .await;
+        crate::engine::memory::correction::replay_corrections(
+            &index,
+            &Fixed384Embedder,
+            &corrections,
+        )
+        .await;
+
+        assert_eq!(summaries(&index, "Acme").await, Vec::<String>::new());
+        assert_eq!(summaries(&index, "Globex").await, vec![right.to_string()]);
+
+        teardown_test_db(&db_name).await;
+    }
+}

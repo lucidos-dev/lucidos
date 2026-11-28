@@ -1,0 +1,80 @@
+import type { App } from '../../store/types';
+import { isAppPinned, togglePinApp } from '../../store/actions/pinnedApps';
+import { EditIcon, TrashIcon } from '../shared/icons';
+import { AppIcon } from '../shared/AppIcon';
+import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
+import { PinButton } from '../shared/PinButton';
+import { useRowActionsGesture } from '../shared/useRowActionsGesture';
+import { useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { DashboardItem } from '../widgets/DashboardItem';
+
+interface AppRowProps {
+  app: App;
+  onOpen: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}
+
+export function AppRow({ app, onOpen, onEdit, onDelete }: Partial<AppRowProps>) {
+  const sk = useSkeleton();
+  const gesture = useRowActionsGesture({ onTap: onOpen, enabled: !sk });
+  const pinned = !!app && isAppPinned(app.id);
+  return (
+    <div class={`list-row app-row${sk ? '' : ' clickable'}`} {...gesture.handlers}>
+      <div class="app-row-icon">
+        <SkBlock w="var(--app-icon-size)" h="var(--app-icon-size)">
+          {app && <AppIcon appId={app.id} name={app.name} icon={app.icon} />}
+        </SkBlock>
+      </div>
+      <div class="list-row-info">
+        <div class="app-row-title-line">
+          <SkText class="title list-row-name" w="9rem">{app?.name}</SkText>
+        </div>
+        {(sk || app?.description) && (
+          <SkText class="app-row-description" as="div" w="16rem">{app?.description}</SkText>
+        )}
+      </div>
+      <div class="list-row-actions">
+        <SkBlock w="2.25rem" h="2.25rem" round>
+          {app && (
+            <PinButton
+              pinned={pinned}
+              label={`${pinned ? 'Unpin' : 'Pin'} ${app.name}`}
+              tooltip={pinned ? 'Pinned to the menu. Click to unpin' : 'Pin to the menu'}
+              onToggle={() => togglePinApp(app.id)}
+              stopPropagation
+            />
+          )}
+        </SkBlock>
+        {app && (
+          <OverflowMenu
+            ariaLabel={`Actions for ${app.name}`}
+            stopPropagation
+            hostOpener={gesture.hostOpener}
+            items={(ctx) => appMenuItems(ctx, { app, onEdit, onDelete })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function appMenuItems(
+  { run }: OverflowMenuContext,
+  { app, onEdit, onDelete }: Pick<Partial<AppRowProps>, 'onEdit' | 'onDelete'> & { app: App },
+) {
+  return (
+    <>
+      <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => onEdit?.())}>
+        <EditIcon />
+        Edit
+      </button>
+      <DashboardItem tile={{ appId: app.id, name: app.name }} noun="app" run={run} />
+      <div class="thread-overflow-divider" role="separator" />
+      <button type="button" class="thread-overflow-item thread-overflow-item-danger" role="menuitem" onClick={run(() => onDelete?.())}>
+        <TrashIcon />
+        Delete
+      </button>
+    </>
+  );
+}

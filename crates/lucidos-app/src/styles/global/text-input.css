@@ -1,0 +1,65 @@
+.text-input,
+.settings-text-input,
+.form-group input:where(:not([type="checkbox"], .dropdown-input)),
+.form-group textarea:where(:not(.prompt-textarea)),
+.repo-add-input,
+.oauth-provider-input,
+.allowlist-row-input,
+.device-name-input,
+.style-editor-instruction,
+.app-store-marketplace-name-input,
+.trigger-group-name-input,
+.dir-picker-path-input,
+.panel-url-input,
+.prompt-input,
+.file-editor-textarea,
+.pairing-input {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
+    color: var(--text-primary);
+    outline: none;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+.text-input::placeholder,
+.settings-text-input::placeholder,
+.form-group input::placeholder,
+.form-group textarea::placeholder,
+.repo-add-input::placeholder,
+.oauth-provider-input::placeholder,
+.allowlist-row-input::placeholder,
+.device-name-input::placeholder,
+.style-editor-instruction::placeholder,
+.app-store-marketplace-name-input::placeholder,
+.trigger-group-name-input::placeholder,
+.dir-picker-path-input::placeholder,
+.panel-url-input::placeholder,
+.prompt-input::placeholder,
+.file-editor-textarea::placeholder,
+.pairing-input::placeholder {
+    color: var(--text-muted);
+}
+
+.text-input:focus,
+.settings-text-input:focus,
+.form-group input:where(:not([type="checkbox"], .dropdown-input)):focus,
+.form-group textarea:where(:not(.prompt-textarea)):focus,
+.repo-add-input:focus,
+.oauth-provider-input:focus,
+.allowlist-row-input:focus,
+.device-name-input:focus,
+.style-editor-instruction:focus,
+.app-store-marketplace-name-input:focus,
+.trigger-group-name-input:focus,
+.dir-picker-path-input:focus,
+.panel-url-input:focus,
+.prompt-input:focus,
+.file-editor-textarea:focus,
+.pairing-input:focus,
+.input-with-action:focus-within,
+.dropdown-input-wrap:focus-within {
+    border-color: transparent;
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}

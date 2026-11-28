@@ -1,0 +1,19 @@
+{
+  "description": "One thread proposes two changes. Each is its own unit with its own plan facts, and a later revert of the first joins the first.",
+  "observed_at": "2026-11-02T15:00:00Z",
+  "events": [
+    {"seq": 1, "at": "2026-11-02T09:00:00Z", "type": "PlanStarted", "thread": "thread-a", "data": {"kind": "implementation"}},
+    {"seq": 2, "at": "2026-11-02T09:10:00Z", "type": "PlanApproved", "thread": "thread-a", "data": {"kind": "implementation", "scope": "implement"}},
+    {"seq": 3, "at": "2026-11-02T09:40:00Z", "type": "HardeningStarted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "full"}},
+    {"seq": 4, "at": "2026-11-02T10:00:00Z", "type": "HardenRunCompleted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "full", "verdict": "pass"}},
+    {"seq": 5, "at": "2026-11-02T10:00:00Z", "type": "ChangeProposed", "thread": "thread-a", "data": {"change_id": "change-1", "content": "code", "requires_restart": false, "hardened": true}},
+    {"seq": 6, "at": "2026-11-02T10:10:00Z", "type": "ChangeApplied", "thread": "thread-a", "data": {"change_id": "change-1", "content": "code", "requires_restart": false, "client_update": false, "post_merge_sha": "1111111111111111111111111111111111111111", "landing_merge_sha": "1111111111111111111111111111111111111111"}},
+    {"seq": 7, "at": "2026-11-02T11:00:00Z", "type": "PlanStarted", "thread": "thread-a", "data": {"kind": "implementation"}},
+    {"seq": 8, "at": "2026-11-02T11:20:00Z", "type": "PlanApproved", "thread": "thread-a", "data": {"kind": "implementation", "scope": "implement"}},
+    {"seq": 9, "at": "2026-11-02T11:50:00Z", "type": "HardeningStarted", "thread": "thread-a", "data": {"head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "iteration": 1, "tier": "full"}},
+    {"seq": 10, "at": "2026-11-02T12:00:00Z", "type": "ChangeReverted", "thread": "thread-a", "data": {"change_id": "change-1"}},
+    {"seq": 11, "at": "2026-11-02T12:10:00Z", "type": "HardenRunCompleted", "thread": "thread-a", "data": {"head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "iteration": 1, "tier": "full", "verdict": "pass"}},
+    {"seq": 12, "at": "2026-11-02T12:10:00Z", "type": "ChangeProposed", "thread": "thread-a", "data": {"change_id": "change-2", "content": "code", "requires_restart": false, "hardened": true}},
+    {"seq": 13, "at": "2026-11-02T12:30:00Z", "type": "ChangeApplied", "thread": "thread-a", "data": {"change_id": "change-2", "content": "code", "requires_restart": false, "client_update": false, "post_merge_sha": "2222222222222222222222222222222222222222", "landing_merge_sha": "2222222222222222222222222222222222222222"}}
+  ]
+}

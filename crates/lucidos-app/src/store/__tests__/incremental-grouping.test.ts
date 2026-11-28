@@ -1,0 +1,420 @@
+
+import { describe, it, expect } from 'vitest';
+import { makeThreadState } from './thread-events-helpers';
+import {
+  computeExchanges,
+  groupIntoExchanges,
+  handleEvent,
+  type ThreadEvent,
+  type ThreadState,
+} from '../thread-events';
+
+const at = (n: number) =>
+  new Date(Date.UTC(2026, 5, 1, 0, 0, 0, 0) + n * 1000).toISOString();
+
+function expectMatchesFull(thread: ThreadState): void {
+  const incremental = computeExchanges(thread).map(({ revision: _r, ...rest }) => rest);
+  const reference = groupIntoExchanges(new Map(thread.events)).map(
+    ({ revision: _r, ...rest }) => rest,
+  );
+  expect(incremental).toEqual(reference);
+}
+
+function expectMatchesAugmented(thread: ThreadState): void {
+  const augmented = new Map(thread.events);
+  const isCC = thread.meta.channel === 'claude_code';
+  const n = thread.pendingUserMessages.length;
+  for (let i = 0; i < n; i++) {
+    const p = thread.pendingUserMessages[i];
+    augmented.set(Number.MAX_SAFE_INTEGER - n + i, {
+      type: 'MessageReceived',
+      text: p.text,
+      _eventId: p.eventId,
+      channel: thread.meta.channel,
+      ...(isCC ? { created: p.created } : { _displayCreated: p.created }),
+      ...(p.image_hashes?.length ? { user_image_hashes: p.image_hashes } : {}),
+    } as never);
+  }
+  const incremental = computeExchanges(thread).map(({ revision: _r, ...rest }) => rest);
+  const reference = groupIntoExchanges(augmented).map(({ revision: _r, ...rest }) => rest);
+  expect(incremental).toEqual(reference);
+}
+
+function replay(
+  events: Array<{ seq: number; event: ThreadEvent }>,
+  channel: 'chat' | 'claude_code' = 'chat',
+): ThreadState {
+  const thread = makeThreadState();
+  thread.meta.channel = channel;
+  const map = new Map([['thread-1', thread]]);
+  events.forEach(({ seq, event }, i) => {
+    handleEvent(map, 'thread-1', seq, event, at(i + 1), `evt-${seq}`);
+    expectMatchesFull(thread);
+  });
+  return thread;
+}
+
+describe('incremental grouping ≡ full grouping', () => {
+  const answers: Extract<ThreadEvent, { type: 'UserQuestionAnswered' }>['answer'][] = [
+    { kind: 'Selected', option_id: 'yes' },
+    { kind: 'MultiSelected', option_ids: ['yes'] },
+    { kind: 'FreeText', text: 'yes' },
+  ];
+  it.each(answers)('keeps a queued wake reply below a $kind answer', (answer) => {
+    const thread = makeThreadState();
+    const threads = new Map([['thread-1', thread]]);
+    const events: ThreadEvent[] = [
+      { type: 'MessageReceived', text: 'Start', channel: 'chat' },
+      { type: 'TextStreamed', text: 'Before the question', request_event_id: 'evt-1' },
+      { type: 'UserQuestionAsked', tool_use_id: 'ask', cc_session_id: '', channel: 'chat',
+        question: 'Ready?', options: [{ id: 'yes', label: 'Yes' }] },
+      { type: 'PromptInjected', mode: 'agent', text: 'The event arrived',
+        origin: { kind: 'engine', reason: { kind: 'event_wait', outcome: 'delivered', watched: ['JobCompleted'], wait_reason: 'the job to finish' } } },
+      { type: 'UserQuestionAnswered', tool_use_id: 'ask', channel: 'chat', answer },
+      { type: 'ResponseGenerated', text: 'Before the question', request_event_id: 'evt-1' },
+      { type: 'TextStreamed', text: 'After the answer', request_event_id: 'evt-4' },
+      { type: 'ResponseGenerated', text: 'After the answer', request_event_id: 'evt-4' },
+    ];
+    events.forEach((event, i) => {
+      const seq = i + 1;
+      handleEvent(threads, 'thread-1', seq, event, at(seq), `evt-${seq}`);
+      expectMatchesFull(thread);
+      if (seq < 7) return;
+      const rows = computeExchanges(thread);
+      const card = rows.findIndex(row => row.userEvent.type === 'UserQuestionAsked');
+      const reply = rows.findIndex(row => row.steps.some(step => step.seq === 7));
+      expect(rows[card]?.steps).toContainEqual(expect.objectContaining({
+        event: expect.objectContaining({ type: 'UserQuestionAnswered', answer }),
+      }));
+      expect(reply).toBeGreaterThan(card);
+    });
+  });
+
+  it('basic chat turn with streaming tokens and a tool call', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'hi' } as ThreadEvent },
+      { seq: 2, event: { type: 'TextStreamed', text: 'thinking ' } as ThreadEvent },
+      { seq: 3, event: { type: 'ToolCalled', name: 'load_knowhow', args: {} } as ThreadEvent },
+      { seq: 4, event: { type: 'ToolResult', name: 'load_knowhow', result: 'ok' } as ThreadEvent },
+      { seq: 5, event: { type: 'TextStreamed', text: 'answer' } as ThreadEvent },
+      { seq: 6, event: { type: 'ResponseGenerated', text: 'answer' } as ThreadEvent },
+    ]);
+  });
+
+  it('multi-turn chat with follow-ups', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'first' } as ThreadEvent },
+      { seq: 2, event: { type: 'TextStreamed', text: 'r1' } as ThreadEvent },
+      { seq: 3, event: { type: 'ResponseGenerated', text: 'r1' } as ThreadEvent },
+      { seq: 4, event: { type: 'MessageReceived', text: 'second' } as ThreadEvent },
+      { seq: 5, event: { type: 'TextStreamed', text: 'r2' } as ThreadEvent },
+      { seq: 6, event: { type: 'ResponseGenerated', text: 'r2' } as ThreadEvent },
+      { seq: 7, event: { type: 'MessageReceived', text: 'third' } as ThreadEvent },
+      { seq: 8, event: { type: 'ResponseGenerated', text: 'r3' } as ThreadEvent },
+    ]);
+  });
+
+  it('CC turn with permission divider and tool-result re-routing', () => {
+    replay(
+      [
+        { seq: 1, event: { type: 'MessageReceived', text: 'fix it' } as ThreadEvent },
+        { seq: 2, event: { type: 'CodingAgentTextStreamed', text: 'on it', coding_agent: 'claude-code' } as ThreadEvent },
+        { seq: 3, event: { type: 'CodingAgentToolCalled', name: 'Bash', args: {}, tool_use_id: 'tu-1', coding_agent: 'claude-code' } as ThreadEvent },
+        { seq: 4, event: { type: 'CodingAgentPermissionRequest', request_id: 'pr-1', tool_use_id: 'tu-perm', tool_name: 'Bash', input: {}, summary: 'run a command' } as ThreadEvent },
+        { seq: 5, event: { type: 'CodingAgentPermissionResolved', request_id: 'pr-1', allowed: true, coding_agent: 'claude-code' } as ThreadEvent },
+        { seq: 6, event: { type: 'CodingAgentToolResult', name: 'Bash', result: 'ok', tool_use_id: 'tu-1', coding_agent: 'claude-code' } as ThreadEvent },
+        { seq: 7, event: { type: 'CodingAgentTextStreamed', text: 'done', coding_agent: 'claude-code' } as ThreadEvent },
+        { seq: 8, event: { type: 'CodingAgentIdled', has_changes: false, coding_agent: 'claude-code' } as ThreadEvent },
+      ],
+      'claude_code',
+    );
+  });
+
+  it('question divider: overtaken flag and answer re-routing', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'ask me' } as ThreadEvent },
+      { seq: 2, event: { type: 'ToolCalled', name: 'ask_user_question', args: {} } as ThreadEvent },
+      { seq: 3, event: { type: 'UserQuestionAsked', tool_use_id: 'q-1', cc_session_id: 's-1', question: 'pick one', options: [] } as ThreadEvent },
+      { seq: 4, event: { type: 'TextStreamed', text: 'continuing anyway' } as ThreadEvent },
+      { seq: 5, event: { type: 'UserQuestionAnswered', tool_use_id: 'q-1', answer: { kind: 'Selected', option_id: 'a' } } as ThreadEvent },
+      { seq: 6, event: { type: 'ResponseGenerated', text: 'done' } as ThreadEvent },
+    ]);
+  });
+
+  it('question divider re-anchored below a ChildThreadCompleted that landed while it waited', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'do the release' } as ThreadEvent },
+      { seq: 2, event: { type: 'ToolCalled', name: 'ask_user_question', args: {}, request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 3, event: { type: 'UserQuestionAsked', tool_use_id: 'q-1', cc_session_id: '', question: 'pick', options: [] } as ThreadEvent },
+      { seq: 4, event: { type: 'ChildThreadCompleted', child_thread_id: 'c-1', status: 'success', summary: 'done' } as ThreadEvent },
+      { seq: 5, event: { type: 'UserQuestionAnswered', tool_use_id: 'q-1', answer: { kind: 'Selected', option_id: 'a' } } as ThreadEvent },
+      { seq: 6, event: { type: 'TextStreamed', text: 'resuming', request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 7, event: { type: 'ResponseGenerated', text: 'resuming', request_event_id: 'evt-1' } as ThreadEvent },
+    ]);
+  });
+
+  it('child completion mid-thought hands the turn over (continuationMoved)', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'do the release' } as ThreadEvent },
+      { seq: 2, event: { type: 'ThoughtStreamed', text: 'planning', request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 3, event: { type: 'ChildThreadCompleted', child_thread_id: 'c-1', status: 'canceled', summary: 'canceled' } as ThreadEvent },
+      { seq: 4, event: { type: 'ToolCalled', name: 'run_bash', args: {}, request_event_id: 'evt-1' } as ThreadEvent },
+      { seq: 5, event: { type: 'ThoughtStreamed', text: 'still going', request_event_id: 'evt-1' } as ThreadEvent },
+    ]);
+  });
+
+  it('abort opens a boundary exchange', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'go' } as ThreadEvent },
+      { seq: 2, event: { type: 'TextStreamed', text: 'partial' } as ThreadEvent },
+      { seq: 3, event: { type: 'ResponseAborted', cause: 'safety_net' } as ThreadEvent },
+      { seq: 4, event: { type: 'MessageReceived', text: 'again' } as ThreadEvent },
+      { seq: 5, event: { type: 'ResponseGenerated', text: 'ok' } as ThreadEvent },
+    ]);
+  });
+
+  it('legacy rerun-in-place: terminal AFTER abort forces a coherent rebuild', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'go' } as ThreadEvent },
+      { seq: 2, event: { type: 'ResponseAborted', cause: 'engine_shutdown', request_event_id: 'req-1' } as unknown as ThreadEvent },
+      { seq: 3, event: { type: 'TextStreamed', text: 'rerun output', request_event_id: 'req-1' } as unknown as ThreadEvent },
+      { seq: 4, event: { type: 'ResponseGenerated', text: 'rerun output', request_event_id: 'req-1' } as unknown as ThreadEvent },
+      { seq: 5, event: { type: 'MessageReceived', text: 'next' } as ThreadEvent },
+    ]);
+  });
+
+  it('abort AFTER matching terminal is superseded at fold time', () => {
+    replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'go' } as ThreadEvent },
+      { seq: 2, event: { type: 'ResponseGenerated', text: 'ok', request_event_id: 'req-9' } as unknown as ThreadEvent },
+      { seq: 3, event: { type: 'ResponseAborted', cause: 'unknown', request_event_id: 'req-9' } as unknown as ThreadEvent },
+      { seq: 4, event: { type: 'MessageReceived', text: 'next' } as ThreadEvent },
+    ]);
+  });
+
+  it('a coding-agent follow-up abort keeps its boundary despite the shared req id', () => {
+    const cc = { channel: 'claude_code', request_event_id: 'req-1' };
+    const thread = replay(
+      [
+        { seq: 1, event: { type: 'MessageReceived', text: 'one' } as ThreadEvent },
+        { seq: 2, event: { type: 'ResponseGenerated', text: 'done', ...cc } as unknown as ThreadEvent },
+        { seq: 3, event: { type: 'MessageReceived', text: 'two' } as ThreadEvent },
+        { seq: 4, event: { type: 'ResponseAborted', cause: 'recovery_after_restart', ...cc } as unknown as ThreadEvent },
+      ],
+      'claude_code',
+    );
+    const exchanges = computeExchanges(thread);
+    expect(exchanges[exchanges.length - 1].userEvent.type).toBe('ResponseAborted');
+  });
+
+  it('out-of-order created timestamp forces a rebuild and stays equivalent', () => {
+    const thread = makeThreadState();
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'a' } as ThreadEvent, at(10), 'evt-1');
+    expectMatchesFull(thread);
+    handleEvent(map, 'thread-1', 2, { type: 'ResponseGenerated', text: 'r' } as ThreadEvent, at(20), 'evt-2');
+    expectMatchesFull(thread);
+    handleEvent(map, 'thread-1', 3, { type: 'MessageReceived', text: 'missed' } as ThreadEvent, at(15), 'evt-3');
+    expectMatchesFull(thread);
+    handleEvent(map, 'thread-1', 4, { type: 'MessageReceived', text: 'after' } as ThreadEvent, at(30), 'evt-4');
+    expectMatchesFull(thread);
+  });
+
+  it('events without created timestamps stay equivalent (legacy rows)', () => {
+    const thread = makeThreadState();
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'old row' } as ThreadEvent, undefined as unknown as string, 'evt-1');
+    expectMatchesFull(thread);
+    handleEvent(map, 'thread-1', 2, { type: 'TextStreamed', text: 'x' } as ThreadEvent, undefined as unknown as string, 'evt-2');
+    expectMatchesFull(thread);
+    handleEvent(map, 'thread-1', 3, { type: 'ResponseGenerated', text: 'x' } as ThreadEvent, at(3), 'evt-3');
+    expectMatchesFull(thread);
+  });
+
+  it('keeps exchange object identity stable across appends (memo-friendly)', () => {
+    const thread = replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'hi' } as ThreadEvent },
+      { seq: 2, event: { type: 'TextStreamed', text: 'a' } as ThreadEvent },
+    ]);
+    const before = computeExchanges(thread);
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 3, { type: 'TextStreamed', text: 'b' } as ThreadEvent, at(99), 'evt-3');
+    const after = computeExchanges(thread);
+    expectMatchesFull(thread);
+    expect(after).not.toBe(before);
+    expect(after[0]).toBe(before[0]);
+  });
+
+  it('returns equal content on repeated calls with no new events', () => {
+    const thread = replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'hi' } as ThreadEvent },
+      { seq: 2, event: { type: 'ResponseGenerated', text: 'r' } as ThreadEvent },
+    ]);
+    const a = computeExchanges(thread);
+    const b = computeExchanges(thread);
+    expect(a).toEqual(b);
+    expect(a[0]).toBe(b[0]);
+  });
+
+  it('pending user messages bypass the cache and stay equivalent on clear', () => {
+    const thread = replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'hi' } as ThreadEvent },
+      { seq: 2, event: { type: 'ResponseGenerated', text: 'r' } as ThreadEvent },
+    ]);
+    thread.pendingUserMessages.push({
+      eventId: 'pending-1',
+      text: 'queued follow-up',
+      created: at(50),
+    });
+    const withPending = computeExchanges(thread);
+    expect(withPending[withPending.length - 1].userEvent.type).toBe('MessageReceived');
+    expect((withPending[withPending.length - 1].userEvent as { text?: string }).text).toBe('queued follow-up');
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 3, { type: 'MessageReceived', text: 'queued follow-up' } as ThreadEvent, at(51), 'pending-1');
+    expect(thread.pendingUserMessages).toHaveLength(0);
+    expectMatchesFull(thread);
+  });
+
+  it('CC pending message (fast append-trailing path) ≡ augmented full fold', () => {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'first' } as ThreadEvent, at(10), 'evt-1');
+    handleEvent(map, 'thread-1', 2, { type: 'CodingAgentIdled', has_changes: false, coding_agent: 'claude-code' } as ThreadEvent, at(20), 'evt-2');
+    expectMatchesFull(thread);
+    thread.pendingUserMessages.push({ eventId: 'pending-1', text: 'follow up', created: at(30) });
+    expectMatchesAugmented(thread);
+    const ex = computeExchanges(thread);
+    expect(ex[ex.length - 1].userEvent.type).toBe('MessageReceived');
+    expect((ex[ex.length - 1].userEvent as { text?: string }).text).toBe('follow up');
+    expect(ex[ex.length - 1].steps).toHaveLength(0);
+  });
+
+  it('CC pending older than a not-yet-echoed real event falls back, stays equivalent', () => {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'first' } as ThreadEvent, at(10), 'evt-1');
+    expectMatchesFull(thread);
+    thread.pendingUserMessages.push({ eventId: 'pending-1', text: 'follow up', created: at(15) });
+    handleEvent(map, 'thread-1', 2, { type: 'CodingAgentTextStreamed', text: 'late', coding_agent: 'claude-code' } as ThreadEvent, at(20), 'evt-2');
+    expect(thread.pendingUserMessages).toHaveLength(1);
+    expectMatchesAugmented(thread);
+  });
+
+  it('abort and matching terminal arriving in ONE batch stay equivalent', () => {
+    const thread = makeThreadState();
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, at(1), 'evt-1');
+    expectMatchesFull(thread);
+    handleEvent(map, 'thread-1', 2, { type: 'ResponseAborted', cause: 'engine_shutdown', request_event_id: 'req-b' } as unknown as ThreadEvent, at(2), 'evt-2');
+    handleEvent(map, 'thread-1', 3, { type: 'ResponseGenerated', text: 'rerun', request_event_id: 'req-b' } as unknown as ThreadEvent, at(3), 'evt-3');
+    expectMatchesFull(thread);
+  });
+
+  it('bumps revision on touched exchanges so memoized renderers repaint', () => {
+    const thread = replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'hi' } as ThreadEvent },
+      { seq: 2, event: { type: 'TextStreamed', text: 'a' } as ThreadEvent },
+    ]);
+    const before = computeExchanges(thread)[0];
+    const beforeRevision = before.revision ?? 0;
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 3, { type: 'TextStreamed', text: 'b' } as ThreadEvent, at(99), 'evt-3');
+    const after = computeExchanges(thread)[0];
+    expect(after).toBe(before);
+    expect(after.revision ?? 0).toBeGreaterThan(beforeRevision);
+  });
+
+  it('a held message\'s delivered copy repaints the turn that held it', () => {
+    const origin = { kind: 'thread_link', thread_id: 'parent-1', title: 'Parent' } as const;
+    const thread = replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'start' } as ThreadEvent },
+      { seq: 2, event: { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'Go?', options: [] } as ThreadEvent },
+      { seq: 3, event: { type: 'MessageHeld', text: 'stop now', origin } as ThreadEvent },
+      { seq: 4, event: { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Selected', option_id: 'a' } } as ThreadEvent },
+      { seq: 5, event: { type: 'HeldMessageReleased', held_message_id: 'evt-3' } as ThreadEvent },
+    ], 'claude_code');
+    const holder = computeExchanges(thread)[1];
+    const beforeRevision = holder.revision ?? 0;
+
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 6, { type: 'MessageReceived', text: 'stop now', mode: 'agent', origin } as ThreadEvent, at(99), 'evt-6');
+    expectMatchesFull(thread);
+
+    const after = computeExchanges(thread)[1];
+    expect(after).toBe(holder);
+    expect(after.deliveredHeldIds?.has('evt-3')).toBe(true);
+    expect(after.revision ?? 0).toBeGreaterThan(beforeRevision);
+  });
+
+  it('a call stays equivalent through every spoken turn', () => {
+    replay([
+      { seq: 1, event: { type: 'VoiceSessionStarted', session_id: 's1' } as ThreadEvent },
+      { seq: 2, event: { type: 'SpokenReplyGenerated', session_id: 's1', text: 'Hi there.', interrupted: false } as ThreadEvent },
+      { seq: 3, event: { type: 'WorkDelegated', session_id: 's1', reason: 'Check it.' } as ThreadEvent },
+      { seq: 4, event: { type: 'MessageReceived', text: 'how long?', voice_session_id: 's1' } as ThreadEvent },
+      { seq: 5, event: { type: 'ToolCalled', name: 'run_bash', args: {} } as ThreadEvent },
+      { seq: 6, event: { type: 'SpokenMessageReceived', session_id: 's1', text: 'Still there?' } as ThreadEvent },
+      { seq: 7, event: { type: 'SpokenReplyGenerated', session_id: 's1', text: 'Working on it.', interrupted: false } as ThreadEvent },
+      { seq: 8, event: { type: 'TodoListWritten', items: [] } as ThreadEvent },
+      { seq: 9, event: { type: 'SpokenMessageReceived', session_id: 's1', text: 'Any idea?' } as ThreadEvent },
+      { seq: 10, event: { type: 'ResponseGenerated', text: 'ten minutes' } as ThreadEvent },
+      { seq: 11, event: { type: 'SpokenReplyGenerated', session_id: 's1', text: 'Ten minutes.', interrupted: false } as ThreadEvent },
+      { seq: 12, event: { type: 'VoiceSessionEnded', session_id: 's1', reason: 'hangup', duration_secs: 30 } as ThreadEvent },
+    ]);
+  });
+
+  it('a long streaming turn stays equivalent at every token', () => {
+    const events: Array<{ seq: number; event: ThreadEvent }> = [
+      { seq: 1, event: { type: 'MessageReceived', text: 'stream a lot' } as ThreadEvent },
+    ];
+    for (let i = 0; i < 120; i++) {
+      events.push({ seq: i + 2, event: { type: 'TextStreamed', text: `tok${i} ` } as ThreadEvent });
+    }
+    events.push({ seq: 200, event: { type: 'ResponseGenerated', text: 'done' } as ThreadEvent });
+    replay(events);
+  });
+});
+
+describe('incremental grouping over a paged thread', () => {
+  function expectMatchesPagedFull(thread: ThreadState): void {
+    const incremental = computeExchanges(thread).map(({ revision: _r, ...rest }) => rest);
+    const reference = groupIntoExchanges(new Map(thread.events), true)
+      .map(({ revision: _r, ...rest }) => rest);
+    expect(incremental).toEqual(reference);
+  }
+
+  function pagedThread(): { thread: ThreadState; map: Map<string, ThreadState> } {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    thread.hasOlderEvents = true;
+    return { thread, map: new Map([['thread-1', thread]]) };
+  }
+
+  it('grows the fragment on every streamed step', () => {
+    const { thread, map } = pagedThread();
+    for (let i = 0; i < 8; i++) {
+      handleEvent(map, 'thread-1', i + 1, {
+        type: 'CodingAgentTextStreamed', text: `tok${i} `, coding_agent: 'claude-code',
+      } as ThreadEvent, at(i + 1), `evt-${i + 1}`);
+      expectMatchesPagedFull(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0].continuationFragment).toBe(true);
+    expect(exchanges[0].steps).toHaveLength(8);
+  });
+
+  it('rebuilds when the thread stops being paged', () => {
+    const { thread, map } = pagedThread();
+    handleEvent(map, 'thread-1', 1, {
+      type: 'CodingAgentTextStreamed', text: 'orphan', coding_agent: 'claude-code',
+    } as ThreadEvent, at(1), 'evt-1');
+    expect(computeExchanges(thread)[0].continuationFragment).toBe(true);
+
+    thread.hasOlderEvents = false;
+
+    expect(computeExchanges(thread)).toHaveLength(0);
+  });
+});

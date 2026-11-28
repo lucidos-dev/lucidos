@@ -1,0 +1,99 @@
+
+import type { ComponentChildren } from 'preact';
+import type { ListedWorkspace } from '../../api/client/control';
+import {
+  defaultOpenMode,
+  middleClickActivates,
+  middleClickHandler,
+  openModeForClick,
+  type WorkspaceOpenMode,
+} from '../../utils/workspaceWindow';
+import { workspaceFaultNote, workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
+import { remoteWorkspaceOpenable, remoteWorkspaceRoute, type RemoteGatewayView } from './remoteWorkspaces';
+
+interface RemoteWorkspaceRowBodyProps {
+  view: RemoteGatewayView;
+  workspace: ListedWorkspace;
+  onOpen: (route: string, mode: WorkspaceOpenMode) => void;
+  onContextMenu?: (e: MouseEvent) => void;
+  actions: ComponentChildren;
+  startsFirst?: boolean;
+  opening?: boolean;
+}
+
+export function RemoteWorkspaceRowBody({ view, workspace: w, onOpen, onContextMenu, actions, startsFirst = false, opening = false }: RemoteWorkspaceRowBodyProps) {
+  const route = remoteWorkspaceRoute(view, w);
+  const state = workspaceState(w);
+  const fault = workspaceFaultNote(w);
+  const runs = remoteWorkspaceOpenable(view, w);
+  const openable = runs || (startsFirst && view.unreachable === null);
+  const label = openable && !runs
+    ? `Start and open ${w.name} on ${view.gateway}${fault ? ` · ${fault}` : ''}`
+    : fault ? `${w.name} on ${view.gateway} · ${fault}` : `Open ${w.name} on ${view.gateway}`;
+  const open = (mode: WorkspaceOpenMode | null) => {
+    if (openable && !opening && mode !== null) onOpen(route, mode);
+  };
+  return (
+    <div
+      class="ws-picker-open"
+      role={openable ? 'button' : undefined}
+      tabIndex={openable ? 0 : undefined}
+      aria-disabled={openable && !opening ? undefined : 'true'}
+      aria-busy={opening || undefined}
+      aria-label={label}
+      onClick={(e) => open(openModeForClick(e))}
+      onAuxClick={openable && middleClickActivates(state) ? middleClickHandler((e) => open(openModeForClick(e))) : undefined}
+      onContextMenu={onContextMenu}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          open(defaultOpenMode());
+        }
+      }}
+    >
+      <div class="ws-picker-line">
+        <span
+          class={`ws-picker-dot ws-picker-dot-${state}`}
+          data-tooltip={workspaceStateLabel(w)}
+          aria-hidden="true"
+        />
+        <div class="ws-picker-id">
+          <span class="ws-picker-name">
+            {w.name} <span class="ws-picker-gateway-tag">@{view.gateway}</span>
+          </span>
+          {opening ? <span class="ws-picker-address" role="status">Opening…</span>
+            : view.host ? <span class="ws-picker-address ws-picker-host">On {view.host}</span>
+            : <span class="ws-picker-address">{route}</span>}
+        </div>
+        <div class="ws-picker-actions" onClick={(e) => e.stopPropagation()} onAuxClick={(e) => e.stopPropagation()}>
+          {opening ? <span class="mini-spinner ws-picker-opening-spinner" aria-hidden="true" /> : actions}
+        </div>
+      </div>
+      {fault && <p class="ws-picker-row-note">{fault}</p>}
+    </div>
+  );
+}
+
+export function UnreachableGatewayNotes({ views }: { views: readonly RemoteGatewayView[] }) {
+  const silent = views.filter((view) => view.unreachable !== null);
+  if (silent.length === 0) return null;
+  return (
+    <ul class="ws-picker-list ws-picker-remote-list" aria-label="Remote gateways not reachable">
+      {silent.map((view) => (
+        <li class="ws-picker-row ws-picker-row-unreachable" key={`gateway:${view.gateway}`}>
+          <div class="ws-picker-open" aria-disabled="true">
+            <div class="ws-picker-line">
+              <span class="ws-picker-dot ws-picker-dot-unhealthy" aria-hidden="true" />
+              <div class="ws-picker-id">
+                <span class="ws-picker-name">{view.gateway}</span>
+                <span class="ws-picker-address">Remote gateway, not reachable</span>
+              </div>
+            </div>
+            <p class="ws-picker-row-note">{view.unreachable}</p>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}

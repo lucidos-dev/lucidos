@@ -1,0 +1,14 @@
+{
+  "id": "N3",
+  "fix": "074ba04a12e15987d4c97b808486040bfe7463f4",
+  "title": "fix(proxy): close the sibling-import bypass and serialize the approval record",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/api/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/api/proxy_script_runner.rs"
+  },
+  "needs_db": false,
+  "comment": "constraint",
+  "why": "The trampoline's doc says the source arrives on stdin because running the file would open it a second time, after the approval check, and a caller could swap it in between. The obvious fix (run the file with -I or -P) breaks that rule. The same doc also defends the sibling import as a feature, so it argues both ways.",
+  "adaptation": "The fix's three runner tests, with write_script inlined, since the tests module's helpers are private. The sibling test accepts any refusal in which the sibling never ran, not only a ModuleNotFoundError. The approval-record race is in the bug report and the reference diff but not in the withheld test."
+}

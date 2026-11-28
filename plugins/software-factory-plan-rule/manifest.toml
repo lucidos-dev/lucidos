@@ -1,0 +1,4 @@
+id = "software-factory-plan-rule"
+version = "0.1.0"
+name = "Software Factory Plan Rule"
+description = "Checks the Lucidos plan marker before proposing or applying changes to Lucidos source."

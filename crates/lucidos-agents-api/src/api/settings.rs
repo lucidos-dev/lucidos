@@ -1,0 +1,2665 @@
+use super::*;
+
+use crate::core::environment_variables::{validate_agent_name, validate_name, NameRejection};
+use crate::core::grants::{self, GrantFile, GrantSource};
+use crate::core::{
+    validate_routes, AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore,
+    ModelFields, ModelStore, OAuthStore, PinnedAppStore, PreferenceStore,
+};
+use crate::engine::permission::tool_grants::{self, ChangedBy, StandingChange};
+use crate::llm::{supported_efforts, ProviderKind};
+use std::ops::ControlFlow;
+
+#[derive(Serialize)]
+pub(super) struct AllowlistResponse {
+    pub(super) contents: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AllowlistRequest {
+    pub(super) contents: String,
+}
+
+pub(super) async fn get_cc_allowed_tools(
+    State(state): State<AppState>,
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
+    read_grant_lane(&state, GrantFile::CodingAgentTools).await
+}
+
+pub(super) async fn read_grant_lane(
+    state: &AppState,
+    file: GrantFile,
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
+    lane_editor(file, tool_grants::standing_lines(&state.pool, file).await)
+}
+
+fn lane_editor<E: std::fmt::Display>(
+    file: GrantFile,
+    standing: Result<Vec<String>, E>,
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
+    let standing = standing.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read {}: {}", file.file_name(), e),
+        )
+    })?;
+    Ok(Json(AllowlistResponse {
+        contents: file.editor_body(&standing),
+    }))
+}
+
+pub(super) async fn write_grant_lane(
+    state: &AppState,
+    headers: &HeaderMap,
+    file: GrantFile,
+    contents: &str,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = crate::api::actor::require_user_actor(headers, &state.pool, None)
+        .await
+        .map_err(|e| (e.status, e.message))?;
+    if file.denies() {
+        super::thread_reach::require_owner_for_standing_deny(headers)
+    } else {
+        super::thread_reach::require_owner_for_permission_grant(headers)
+    }
+    .map_err(|e| (e.status, e.message))?;
+    let patterns = grants::parse_patterns(contents);
+    if file.denies() && patterns.iter().any(|line| !file.recognizes(line)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid standing deny. Use Bash, Bash(program:*), or Python.".into(),
+        ));
+    }
+    let by = ChangedBy {
+        source: GrantSource::Settings,
+        thread_id: None,
+        actor: Some(actor),
+    };
+    tool_grants::change_standing(
+        &state.engine.event_bus,
+        file,
+        StandingChange::Replace(&patterns),
+        by,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save {}: {}", file.file_name(), e),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn put_cc_allowed_tools(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AllowlistRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    write_grant_lane(
+        &state,
+        &headers,
+        GrantFile::CodingAgentTools,
+        &body.contents,
+    )
+    .await
+}
+
+pub(super) async fn get_agent_allowed_commands(
+    State(state): State<AppState>,
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
+    read_grant_lane(&state, GrantFile::AgentCommands).await
+}
+
+pub(super) async fn put_agent_allowed_commands(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AllowlistRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    write_grant_lane(&state, &headers, GrantFile::AgentCommands, &body.contents).await
+}
+
+pub(super) async fn get_agent_denied_commands(
+    State(state): State<AppState>,
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
+    read_grant_lane(&state, GrantFile::AgentDeniedCommands).await
+}
+
+pub(super) async fn put_agent_denied_commands(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AllowlistRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    write_grant_lane(
+        &state,
+        &headers,
+        GrantFile::AgentDeniedCommands,
+        &body.contents,
+    )
+    .await
+}
+
+pub(super) async fn list_credentials(
+    State(state): State<AppState>,
+) -> Result<Json<CredentialsListResponse>, (StatusCode, String)> {
+    let credentials = CredentialStore::list(&state.pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list credentials: {}", e),
+        )
+    })?;
+
+    Ok(Json(CredentialsListResponse { credentials }))
+}
+
+const SERVICE_ACCOUNT_IS_SETTINGS_ONLY: &str =
+    "The 1Password service account is managed in Settings, Accounts, 1Password";
+
+fn credential_service_name(auth_type: AuthType, service_name: &str) -> String {
+    if auth_type == AuthType::OauthClient {
+        crate::core::oauth::client_provider_name(service_name)
+    } else {
+        service_name.to_string()
+    }
+}
+
+pub(super) async fn create_credential(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCredentialRequest>,
+) -> Json<ApiResult> {
+    let auth_type = AuthType::parse(&request.auth_type);
+    if auth_type == AuthType::OnepasswordServiceAccount {
+        return ApiResult::err(SERVICE_ACCOUNT_IS_SETTINGS_ONLY.to_string());
+    }
+    let service_name = credential_service_name(auth_type, &request.service_name);
+    let env_var_name = request
+        .env_var_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = env_var_name {
+        if let Err(rejection) = validate_env_name_for(&headers, name) {
+            return ApiResult::err(rejection.message(name));
+        }
+    }
+    let Some(declared) = request.scope.declared() else {
+        return ApiResult::err(
+            "base_urls is required. Pass the API's base URL, or [] for a \
+             credential that is signed with rather than sent"
+                .to_string(),
+        );
+    };
+    let base_urls = match crate::core::normalized_base_urls(declared) {
+        Ok(urls) => urls,
+        Err(reason) => return ApiResult::err(reason),
+    };
+    if let Err(reason) = crate::core::credentials::check_secret_references(
+        &state.pool,
+        auth_type,
+        &request.auth_value,
+    )
+    .await
+    {
+        return ApiResult::err(reason);
+    }
+    if auth_type == AuthType::OauthClient {
+        if let Err(reason) =
+            crate::core::oauth::check_client_endpoints(&service_name, &request.auth_value)
+        {
+            return ApiResult::err(reason);
+        }
+    }
+    let actor = match crate::api::actor::require_user_actor(&headers, &state.pool, None).await {
+        Ok(a) => Some(a),
+        Err(e) => return ApiResult::err(e.message),
+    };
+    match CredentialStore::upsert(
+        &state.pool,
+        &state.engine.event_bus,
+        &service_name,
+        &base_urls,
+        auth_type,
+        &request.auth_value,
+        request.auth_header.as_deref(),
+        env_var_name,
+        actor.clone(),
+    )
+    .await
+    {
+        Ok(_) => {
+            complete_credential_requests(&state, request.form_request_id, &service_name, actor)
+                .await;
+            ApiResult::ok()
+        }
+        Err(e) => ApiResult::err(format!("Failed to save credential: {}", e)),
+    }
+}
+
+async fn complete_credential_requests(
+    state: &AppState,
+    form_request_id: Option<uuid::Uuid>,
+    service_name: &str,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) {
+    use crate::engine::form_requests;
+    let (pool, bus) = (&state.pool, &state.engine.event_bus);
+    if let Some(id) = form_request_id {
+        form_requests::complete_named_request(pool, bus, id, "CredentialRequested", actor.clone())
+            .await;
+    }
+    form_requests::complete_credential_requests_for(pool, bus, service_name, actor).await;
+}
+
+fn replacement_secret(auth_value: Option<&str>) -> Option<&str> {
+    auth_value.filter(|s| !s.is_empty())
+}
+
+fn updated_scope(
+    auth_type: AuthType,
+    email: Option<&EmailAccountSettings>,
+    scope: &RequestedScope,
+) -> Option<Vec<String>> {
+    match (auth_type, email) {
+        (AuthType::EmailPassword, Some(email)) => Some(vec![format!("smtp://{}", email.smtp_host)]),
+        _ => scope.declared(),
+    }
+}
+
+fn touches_service_account(auth_type: AuthType, stored: Option<AuthType>) -> bool {
+    auth_type == AuthType::OnepasswordServiceAccount
+        || stored == Some(AuthType::OnepasswordServiceAccount)
+}
+
+pub(super) async fn update_credential(
+    State(state): State<AppState>,
+    Query(query): Query<CredentialIdQuery>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateCredentialRequest>,
+) -> Json<ApiResult> {
+    use crate::core::EmailStore;
+
+    let id = query.id;
+    let auth_type = AuthType::parse(&request.auth_type);
+
+    let new_secret = replacement_secret(request.auth_value.as_deref());
+
+    let declared = updated_scope(auth_type, request.email.as_ref(), &request.scope);
+    let base_urls = match declared.map(crate::core::normalized_base_urls).transpose() {
+        Ok(urls) => urls,
+        Err(reason) => return ApiResult::err(reason),
+    };
+
+    let env_var_name = request
+        .env_var_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = env_var_name {
+        if let Err(rejection) = validate_env_name_for(&headers, name) {
+            return ApiResult::err(rejection.message(name));
+        }
+    }
+
+    let stored = match CredentialStore::get_by_id(&state.pool, id).await {
+        Ok(stored) => stored,
+        Err(e) => return ApiResult::err(format!("Failed to update credential: {}", e)),
+    };
+    if touches_service_account(auth_type, stored.as_ref().map(|stored| stored.auth_type)) {
+        return ApiResult::err(SERVICE_ACCOUNT_IS_SETTINGS_ONLY.to_string());
+    }
+    if let (AuthType::EmailPassword, Some(email), Some(stored)) =
+        (auth_type, &request.email, &stored)
+    {
+        let account_name = EmailStore::account_name_for_credential(&stored.service_name);
+        let stored_flag = EmailStore::get(&state.pool, account_name)
+            .await
+            .map(|account| account.map(|a| a.require_send_confirmation));
+        if lowers_send_confirmation(email.require_send_confirmation, stored_flag) {
+            if let Err(refusal) = crate::api::actor::require_attested_owner(
+                &headers,
+                "An agent cannot turn off email send confirmation. Only the user \
+                 turns it off, in the account's settings.",
+            ) {
+                return ApiResult::err(refusal.message);
+            }
+        }
+    }
+    if let Some(secret) = new_secret {
+        if let Err(reason) =
+            crate::core::credentials::check_secret_references(&state.pool, auth_type, secret).await
+        {
+            return ApiResult::err(reason);
+        }
+        if let (AuthType::OauthClient, Some(stored)) = (auth_type, &stored) {
+            if let Err(reason) =
+                crate::core::oauth::check_client_endpoints(&stored.service_name, secret)
+            {
+                return ApiResult::err(reason);
+            }
+        }
+    }
+
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match CredentialStore::update(
+        &state.pool,
+        &state.engine.event_bus,
+        id,
+        base_urls.as_deref(),
+        auth_type,
+        request.auth_header.as_deref(),
+        new_secret,
+        env_var_name,
+        actor.clone(),
+    )
+    .await
+    {
+        Ok(Some(service_name)) => {
+            if auth_type == AuthType::EmailPassword {
+                let account_name = EmailStore::account_name_for_credential(&service_name);
+                if let Some(email) = &request.email {
+                    if let Err(e) = EmailStore::upsert(
+                        &state.pool,
+                        account_name,
+                        &email.email_address,
+                        &email.imap_host,
+                        email.imap_port,
+                        &email.smtp_host,
+                        email.smtp_port,
+                        &email.username,
+                        email.use_tls,
+                        email.require_send_confirmation,
+                    )
+                    .await
+                    {
+                        return ApiResult::err(format!("Failed to update email account: {}", e));
+                    }
+                }
+            }
+            complete_credential_requests(&state, request.form_request_id, &service_name, actor)
+                .await;
+            ApiResult::ok()
+        }
+        Ok(None) => ApiResult::err("Credential not found".to_string()),
+        Err(e) => ApiResult::err(format!("Failed to update credential: {}", e)),
+    }
+}
+
+pub(in crate::api) fn lowers_send_confirmation(
+    requested: bool,
+    stored: Result<Option<bool>, sqlx::Error>,
+) -> bool {
+    !requested && !matches!(stored, Ok(Some(false)))
+}
+
+pub(super) async fn set_credential_base_urls(
+    State(state): State<AppState>,
+    Query(query): Query<CredentialIdQuery>,
+    headers: HeaderMap,
+    Json(request): Json<SetCredentialBaseUrlsRequest>,
+) -> Json<ApiResult> {
+    let base_urls = match crate::core::normalized_base_urls(request.base_urls) {
+        Ok(urls) => urls,
+        Err(reason) => return ApiResult::err(reason),
+    };
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match CredentialStore::set_base_urls(
+        &state.pool,
+        &state.engine.event_bus,
+        query.id,
+        &base_urls,
+        actor,
+    )
+    .await
+    {
+        Ok(Some(_)) => ApiResult::ok(),
+        Ok(None) => ApiResult::err("Credential not found".to_string()),
+        Err(e) => ApiResult::err(format!("Failed to set credential base URLs: {}", e)),
+    }
+}
+
+pub(super) async fn get_email_account(
+    State(state): State<AppState>,
+    Query(query): Query<NameQuery>,
+) -> Result<Json<crate::core::EmailAccountInfo>, (StatusCode, String)> {
+    match crate::core::EmailStore::get_info(&state.pool, &query.name).await {
+        Ok(Some(info)) => Ok(Json(info)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            format!("Email account '{}' not found", query.name),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get email account: {}", e),
+        )),
+    }
+}
+
+pub(super) async fn delete_credential(
+    State(state): State<AppState>,
+    Query(query): Query<CredentialIdQuery>,
+    headers: HeaderMap,
+) -> Json<ApiResult> {
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match CredentialStore::delete(&state.pool, &state.engine.event_bus, query.id, actor).await {
+        Ok(true) => ApiResult::ok(),
+        Ok(false) => ApiResult::err("Credential not found".to_string()),
+        Err(e) => ApiResult::err(format!("Failed to delete credential: {}", e)),
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct EnvVarsListResponse {
+    env_vars: Vec<EnvironmentVariable>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreateEnvVarRequest {
+    name: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct UpdateEnvVarRequest {
+    value: String,
+}
+
+fn validate_env_name_for(headers: &HeaderMap, name: &str) -> Result<(), NameRejection> {
+    match crate::core::subprocess_origin::subprocess_origin(headers) {
+        crate::core::subprocess_origin::SubprocessOrigin::Subprocess { .. } => {
+            validate_agent_name(name)
+        }
+        crate::core::subprocess_origin::SubprocessOrigin::NotSubprocess => validate_name(name),
+    }
+}
+
+fn env_name_refusal(rejection: &NameRejection, name: &str) -> (StatusCode, String) {
+    let status = match rejection {
+        NameRejection::CodeInjecting => StatusCode::FORBIDDEN,
+        NameRejection::Invalid | NameRejection::Reserved => StatusCode::BAD_REQUEST,
+    };
+    (status, rejection.message(name))
+}
+
+pub(super) async fn list_env_vars(
+    State(state): State<AppState>,
+) -> Result<Json<EnvVarsListResponse>, (StatusCode, String)> {
+    let env_vars = EnvironmentVariableStore::list(&state.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to list environment variables: {}", e),
+            )
+        })?;
+    Ok(Json(EnvVarsListResponse { env_vars }))
+}
+
+pub(super) async fn create_env_var(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateEnvVarRequest>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    validate_env_name_for(&headers, &request.name)
+        .map_err(|rejection| env_name_refusal(&rejection, &request.name))?;
+    let actor = crate::api::actor::user_actor(&headers, None);
+    if let Err(e) = EnvironmentVariableStore::upsert(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.name,
+        &request.value,
+        actor,
+    )
+    .await
+    {
+        return Ok(ApiResult::err(format!(
+            "Failed to save environment variable: {}",
+            e
+        )));
+    }
+    Ok(ApiResult::ok())
+}
+
+pub(super) async fn update_env_var(
+    State(state): State<AppState>,
+    Query(query): Query<NameQuery>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateEnvVarRequest>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    validate_env_name_for(&headers, &query.name)
+        .map_err(|rejection| env_name_refusal(&rejection, &query.name))?;
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match EnvironmentVariableStore::update(
+        &state.pool,
+        &state.engine.event_bus,
+        &query.name,
+        &request.value,
+        actor,
+    )
+    .await
+    {
+        Ok(true) => Ok(ApiResult::ok()),
+        Ok(false) => Ok(ApiResult::err(format!(
+            "Environment variable '{}' not found",
+            query.name
+        ))),
+        Err(e) => Ok(ApiResult::err(format!(
+            "Failed to update environment variable: {}",
+            e
+        ))),
+    }
+}
+
+pub(super) async fn delete_env_var(
+    State(state): State<AppState>,
+    Query(query): Query<NameQuery>,
+    headers: HeaderMap,
+) -> Json<ApiResult> {
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match EnvironmentVariableStore::delete(&state.pool, &state.engine.event_bus, &query.name, actor)
+        .await
+    {
+        Ok(true) => ApiResult::ok(),
+        Ok(false) => ApiResult::err(format!("Environment variable '{}' not found", query.name)),
+        Err(e) => ApiResult::err(format!("Failed to delete environment variable: {}", e)),
+    }
+}
+
+fn preferred_provider_error(preferred: Option<&str>, routes: &[Route]) -> Option<String> {
+    let pick = preferred?;
+    routes
+        .iter()
+        .all(|r| r.provider != pick)
+        .then(|| format!("Model has no '{pick}' route to prefer"))
+}
+
+fn routes_for_create(
+    routes: Option<Vec<Route>>,
+    provider: Option<String>,
+    context_window: Option<i32>,
+) -> Result<Vec<Route>, String> {
+    let routes = match (routes, provider) {
+        (Some(routes), _) => routes,
+        (None, Some(provider)) => vec![Route {
+            provider,
+            id: None,
+            context_window,
+        }],
+        (None, None) => return Err("A model needs a provider or routes".to_string()),
+    };
+    validate_routes(&routes)?;
+    Ok(routes)
+}
+
+fn apply_model_update(
+    existing: &crate::core::Model,
+    request: UpdateModelRequest,
+) -> Result<ModelFields, String> {
+    let builtin = existing.is_builtin();
+    let mut routes = request.routes.unwrap_or_else(|| existing.routes.clone());
+    if request.provider.is_some() || request.context_window.is_some() {
+        let Some(first) = routes.first_mut() else {
+            return Err("A model needs at least one route".to_string());
+        };
+        if let Some(provider) = request.provider {
+            first.provider = provider;
+        }
+        if let Some(window) = request.context_window {
+            first.context_window = window;
+        }
+    }
+    validate_routes(&routes)?;
+    let preferred_provider = match request.preferred_provider {
+        Some(pick) => pick,
+        None => existing
+            .preferred_provider
+            .clone()
+            .filter(|p| routes.iter().any(|r| &r.provider == p)),
+    };
+    if let Some(err) = preferred_provider_error(preferred_provider.as_deref(), &routes) {
+        return Err(err);
+    }
+    let label = match builtin {
+        true => existing.label.clone(),
+        false => request.label.unwrap_or_else(|| existing.label.clone()),
+    };
+    let sort_order = match builtin {
+        true => existing.sort_order,
+        false => request.sort_order.unwrap_or(existing.sort_order),
+    };
+    Ok(ModelFields {
+        label,
+        routes,
+        preferred_provider,
+        vision: request.vision.unwrap_or(existing.vision),
+        sort_order,
+    })
+}
+
+pub(super) async fn list_models(
+    State(state): State<AppState>,
+) -> Result<Json<ModelsListResponse>, (StatusCode, String)> {
+    read_models(&state).await.map(Json)
+}
+
+pub(super) async fn read_models(
+    state: &AppState,
+) -> Result<ModelsListResponse, (StatusCode, String)> {
+    let models = ModelStore::list(&state.pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list models: {}", e),
+        )
+    })?;
+    let chat_ladder = crate::runtime::intelligence_ladder::load(
+        &state.pool,
+        &state.engine.model_routes(),
+        crate::runtime::intelligence_ladder::LadderSurface::Chat,
+    )
+    .await;
+    let configured = state.engine.configured_providers();
+    let models = models
+        .into_iter()
+        .map(|model| {
+            let on_chat_ladder = chat_ladder.lists_model(&model.id);
+            model_info(model, on_chat_ladder, configured.as_deref())
+        })
+        .collect();
+    Ok(ModelsListResponse { models })
+}
+
+fn model_info(
+    model: crate::core::Model,
+    on_chat_ladder: bool,
+    configured: Option<&[String]>,
+) -> ModelInfo {
+    let routes = model
+        .routes
+        .iter()
+        .map(|r| {
+            let wire_id = r.wire_id(&model.id);
+            route_info(&r.provider, wire_id, r.context_window, configured)
+        })
+        .collect();
+    ModelInfo {
+        id: model.id,
+        label: model.label,
+        routes,
+        preferred_provider: model.preferred_provider,
+        vision: model.vision,
+        default_effort: model.default_effort,
+        successor: model.successor,
+        sort_order: model.sort_order,
+        source: model.source,
+        on_chat_ladder,
+        created_at: model.created_at,
+    }
+}
+
+fn route_info(
+    provider: &str,
+    wire_id: &str,
+    context_window: Option<i32>,
+    configured: Option<&[String]>,
+) -> RouteInfo {
+    RouteInfo {
+        provider: provider.to_string(),
+        id: wire_id.to_string(),
+        context_window,
+        reasoning_efforts: supported_efforts(ProviderKind::parse(provider), wire_id),
+        configured: configured.map(|providers| providers.iter().any(|p| p == provider)),
+        proxy: super::proxy_builtin::model_proxy_info(provider, wire_id),
+    }
+}
+
+pub(super) async fn list_response_styles(
+    State(state): State<AppState>,
+) -> Json<ResponseStylesListResponse> {
+    Json(ResponseStylesListResponse {
+        styles: crate::core::response_style::library(&state.pool).await,
+    })
+}
+
+pub(super) async fn create_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateModelRequest>,
+) -> Json<ApiResult> {
+    let id = request.id.trim().to_string();
+    if id.is_empty() {
+        return ApiResult::err("Model id cannot be empty");
+    }
+    let label = match request.label.trim() {
+        l if !l.is_empty() => l.to_string(),
+        _ => id.clone(),
+    };
+    let routes = match routes_for_create(request.routes, request.provider, request.context_window) {
+        Ok(routes) => routes,
+        Err(err) => return ApiResult::err(err),
+    };
+    let sort_order = request.sort_order.unwrap_or(1000);
+    let fields = ModelFields {
+        label,
+        routes,
+        preferred_provider: None,
+        vision: request.vision,
+        sort_order,
+    };
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match ModelStore::create(&state.pool, &state.engine.event_bus, &id, &fields, actor).await {
+        Ok(_) => ApiResult::ok(),
+        Err(e) => ApiResult::err(format!(
+            "Failed to create model (id may already exist): {}",
+            e
+        )),
+    }
+}
+
+pub(super) async fn update_model(
+    State(state): State<AppState>,
+    Query(query): Query<ModelIdQuery>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateModelRequest>,
+) -> Result<Response, ApiError> {
+    let on_chat_ladder = request.on_chat_ladder;
+    let spent = match on_chat_ladder {
+        None => None,
+        Some(_) => match chat_ladder_edit_gate(&state, &headers, &request.reason).await? {
+            ControlFlow::Continue(spent) => spent,
+            ControlFlow::Break(ask) => return Ok(ask),
+        },
+    };
+    let (answer, ladder_changed) =
+        update_model_fields(&state, &query.id, &headers, request, on_chat_ladder).await;
+    if let Some(spent) = spent.filter(|_| !answer.success && !ladder_changed) {
+        spent.restore(&state).await?;
+    }
+    Ok(answer.into_response())
+}
+
+async fn chat_ladder_edit_gate(
+    state: &AppState,
+    headers: &HeaderMap,
+    reason: &str,
+) -> Result<ControlFlow<Response, Option<super::intelligence_ladder::SpentOnce>>, ApiError> {
+    use super::intelligence_ladder::{ask_to_edit_ladder, ladder_edit_gate, LadderEditGate};
+    Ok(match ladder_edit_gate(state, headers).await? {
+        LadderEditGate::Act { spent, .. } => ControlFlow::Continue(spent),
+        LadderEditGate::NeedsPermission(caller) => {
+            ControlFlow::Break(ask_to_edit_ladder(state, caller, reason).await?)
+        }
+    })
+}
+
+async fn update_model_fields(
+    state: &AppState,
+    id: &str,
+    headers: &HeaderMap,
+    request: UpdateModelRequest,
+    on_chat_ladder: Option<bool>,
+) -> (Json<ApiResult>, bool) {
+    let existing = match ModelStore::get(&state.pool, id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return (ApiResult::err(format!("Model '{id}' not found")), false),
+        Err(e) => {
+            return (
+                ApiResult::err(format!("Failed to load model: {}", e)),
+                false,
+            )
+        }
+    };
+    let fields = match apply_model_update(&existing, request) {
+        Ok(fields) => fields,
+        Err(err) => return (ApiResult::err(err), false),
+    };
+    let actor = crate::api::actor::user_actor(headers, None);
+    if on_chat_ladder == Some(false) {
+        if let Err(err) = set_on_chat_ladder(state, &existing.id, false, actor.clone()).await {
+            return (ApiResult::err(err), false);
+        }
+    }
+    let ladder_changed = on_chat_ladder == Some(false);
+    if let Err(e) = ModelStore::update(
+        &state.pool,
+        &state.engine.event_bus,
+        &existing.id,
+        &fields,
+        actor.clone(),
+    )
+    .await
+    {
+        return (
+            ApiResult::err(format!("Failed to update model: {}", e)),
+            ladder_changed,
+        );
+    }
+    if on_chat_ladder == Some(true) {
+        if let Err(err) = set_on_chat_ladder(state, &existing.id, true, actor).await {
+            return (ApiResult::err(format!("Model updated, but {err}")), false);
+        }
+    }
+    (ApiResult::ok(), on_chat_ladder.is_some())
+}
+
+async fn set_on_chat_ladder(
+    state: &AppState,
+    model: &str,
+    on: bool,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> Result<crate::runtime::chat_ladder::ChatLadderChange, String> {
+    crate::runtime::chat_ladder::set_model_on_chat_ladder(
+        &state.pool,
+        &state.engine.event_bus,
+        &state.engine.model_routes(),
+        model,
+        on,
+        actor,
+    )
+    .await
+}
+
+pub(super) async fn delete_model(
+    State(state): State<AppState>,
+    Query(query): Query<DeleteModelQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let existing = match ModelStore::get(&state.pool, &query.id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Ok(ApiResult::err(format!("Model '{}' not found", query.id)).into_response())
+        }
+        Err(e) => return Ok(ApiResult::err(format!("Failed to load model: {}", e)).into_response()),
+    };
+    if existing.is_builtin() {
+        return Ok(
+            ApiResult::err("Builtin models cannot be deleted — disable it instead").into_response(),
+        );
+    }
+    let spent = match on_chat_ladder(&state, &existing.id).await {
+        true => match chat_ladder_edit_gate(&state, &headers, &query.reason).await? {
+            ControlFlow::Continue(spent) => spent,
+            ControlFlow::Break(ask) => return Ok(ask),
+        },
+        false => None,
+    };
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match crate::runtime::chat_ladder::delete_user_model(
+        &state.pool,
+        &state.engine.event_bus,
+        &state.engine.model_routes(),
+        &existing.id,
+        actor,
+    )
+    .await
+    {
+        Ok(_) => Ok(ApiResult::ok().into_response()),
+        Err(err) => {
+            if let Some(spent) = spent {
+                if on_chat_ladder(&state, &existing.id).await {
+                    spent.restore(&state).await?;
+                }
+            }
+            Ok(ApiResult::err(err).into_response())
+        }
+    }
+}
+
+async fn on_chat_ladder(state: &AppState, model: &str) -> bool {
+    crate::runtime::intelligence_ladder::load(
+        &state.pool,
+        &state.engine.model_routes(),
+        crate::runtime::intelligence_ladder::LadderSurface::Chat,
+    )
+    .await
+    .lists_model(model)
+}
+
+pub(super) async fn list_oauth_accounts(
+    State(state): State<AppState>,
+) -> Result<Json<OAuthAccountsListResponse>, (StatusCode, String)> {
+    let accounts = OAuthStore::list(&state.pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list OAuth accounts: {}", e),
+        )
+    })?;
+    Ok(Json(OAuthAccountsListResponse { accounts }))
+}
+
+pub(super) async fn delete_oauth_account(
+    State(state): State<AppState>,
+    Query(query): Query<OAuthAccountQuery>,
+    headers: HeaderMap,
+) -> Json<ApiResult> {
+    let id: Uuid = match query.id.parse() {
+        Ok(id) => id,
+        Err(_) => return ApiResult::err("Invalid account ID"),
+    };
+
+    let actor = crate::api::actor::user_actor(&headers, None);
+    match OAuthStore::delete(&state.pool, &state.engine.event_bus, id, actor).await {
+        Ok(true) => ApiResult::ok(),
+        Ok(false) => ApiResult::err("OAuth account not found"),
+        Err(e) => ApiResult::err(format!("Failed to delete OAuth account: {}", e)),
+    }
+}
+
+/// INVARIANT: The *OAuth provider registry*: every provider whose endpoints Lucidos knows.
+///
+/// Drives two things on Settings > Accounts that were hardcoded or absent
+/// before: the quick-provider buttons (previously a literal three-name array in
+/// the frontend, which is why Dropbox had no button despite being fully
+/// supported), and the Connect form's autofill. Nothing here is a secret, so the
+/// rows are served verbatim; an unavailable registry answers an empty list and
+/// the page falls back to its manual path.
+pub(super) async fn list_known_oauth_providers(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let providers = crate::core::oauth_registry::load_providers(state.engine.system_knowhow_dir());
+    Json(serde_json::json!({
+        "providers": providers,
+        "default_redirect_uri": crate::core::oauth::default_redirect_uri(),
+    }))
+}
+
+pub(super) async fn reauthorize_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Json<ApiResult> {
+    let provider = match body["provider"].as_str() {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return ApiResult::err("provider is required"),
+    };
+    let requested_scopes = body["scopes"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let sign_in = body["sign_in"].as_bool().unwrap_or(false);
+    if requested_scopes.is_empty() && !sign_in {
+        return ApiResult::err("scopes is required");
+    }
+
+    let cred_service = crate::core::oauth::client_provider_name(&provider);
+    let registry_row = crate::core::oauth_registry::find_provider(
+        state.engine.system_knowhow_dir(),
+        &cred_service,
+    );
+    let overrides = registry_row
+        .as_ref()
+        .map(crate::core::oauth::OAuthClientOverrides::from_registry)
+        .unwrap_or_default();
+    let scopes = match CredentialStore::get_oauth_client(&state.pool, &cred_service).await {
+        Ok(None) => return ApiResult::needs_credentials(&provider, &overrides),
+        Err(e) => return ApiResult::err(format!("Failed to check credentials: {}", e)),
+        Ok(Some(cred)) => {
+            let missing = crate::core::oauth::missing_flow_fields(cred.stored_value());
+            if !missing.is_empty() {
+                let client_id = serde_json::from_str::<serde_json::Value>(cred.stored_value())
+                    .ok()
+                    .and_then(|v| v["client_id"].as_str().map(str::to_string));
+                return ApiResult::needs_credential_repair(
+                    &provider,
+                    crate::core::oauth::oauth_client_repair_request(
+                        &provider,
+                        &overrides,
+                        cred.id,
+                        client_id.as_deref(),
+                        &missing,
+                    ),
+                );
+            }
+            let config = match cred.secret(&state.pool).await {
+                Ok(secret) => serde_json::from_str::<serde_json::Value>(&secret)
+                    .unwrap_or(serde_json::Value::Null),
+                Err(e) => return ApiResult::err(format!("Failed to read credentials: {}", e)),
+            };
+            if crate::core::oauth::client_secret_repeats_client_id(&config) {
+                return ApiResult::needs_credential_repair(
+                    &provider,
+                    crate::core::oauth::oauth_client_secret_repair_request(
+                        &provider,
+                        &overrides,
+                        cred.id,
+                        config["client_id"].as_str(),
+                    ),
+                );
+            }
+            if sign_in {
+                let rows =
+                    crate::core::oauth_registry::load_providers(state.engine.system_knowhow_dir());
+                crate::core::oauth::merge_scopes(
+                    &crate::core::oauth::sign_in_scopes_for(
+                        registry_row.as_ref(),
+                        cred.stored_value(),
+                        &rows,
+                    ),
+                    &requested_scopes,
+                )
+            } else {
+                requested_scopes
+            }
+        }
+    };
+
+    let initiator = crate::api::actor::user_actor(&headers, None);
+    let route = crate::core::oauth::CallbackRoute::for_browser(
+        crate::core::oauth_callback::BrowserContext::from_headers(&headers),
+    );
+    match crate::core::oauth::prepare_oauth_flow(
+        &state.pool,
+        &state.engine.event_bus,
+        &provider,
+        &scopes,
+        initiator,
+        route,
+    )
+    .await
+    {
+        Ok(prepared) => {
+            let auth_url = prepared.auth_url.clone();
+            state
+                .pending_oauth_flows
+                .lock()
+                .unwrap()
+                .insert(provider, prepared.result_rx);
+            ApiResult::with_auth_url(auth_url)
+        }
+        Err(e) => ApiResult::err(format!("OAuth flow failed: {}", e)),
+    }
+}
+
+pub(super) async fn complete_oauth(
+    State(state): State<AppState>,
+    Query(query): Query<ProviderQuery>,
+) -> Json<ApiResult> {
+    let provider = query.provider;
+
+    let rx = state.pending_oauth_flows.lock().unwrap().remove(&provider);
+    let rx = match rx {
+        Some(rx) => rx,
+        None => return ApiResult::err(format!("No pending OAuth flow for {}", provider)),
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+        Ok(Ok(Ok(_))) => ApiResult::ok(),
+        Ok(Ok(Err(e))) => ApiResult::err(format!("OAuth flow failed: {}", e)),
+        Ok(Err(_)) => ApiResult::err(crate::core::oauth::FLOW_SUPERSEDED_MSG),
+        Err(_) => ApiResult::err("OAuth flow timed out after 120 seconds"),
+    }
+}
+
+pub(super) async fn get_preferences(
+    State(state): State<AppState>,
+    Query(query): Query<PreferencesQuery>,
+) -> Result<Json<PreferencesResponse>, (StatusCode, String)> {
+    read_preferences(&state, query.device_id.as_deref())
+        .await
+        .map(Json)
+}
+
+pub(super) async fn read_preferences(
+    state: &AppState,
+    device_id: Option<&str>,
+) -> Result<PreferencesResponse, (StatusCode, String)> {
+    let preferences = if let Some(device_id) = device_id {
+        PreferenceStore::get_all_for_device(&state.pool, device_id).await
+    } else {
+        PreferenceStore::get_all(&state.pool).await
+    }
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load preferences: {}", e),
+        )
+    })?;
+
+    Ok(PreferencesResponse {
+        preferences: settings_only(preferences),
+    })
+}
+
+fn settings_only(
+    mut preferences: std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    preferences.retain(|key, _| !crate::core::prefs::is_silent_key(key));
+    preferences.into_iter().collect()
+}
+
+pub(super) async fn set_preference(
+    State(state): State<AppState>,
+    Query(query): Query<KeyQuery>,
+    headers: HeaderMap,
+    Json(request): Json<SetPreferenceRequest>,
+) -> Result<Json<ApiResult>, ApiError> {
+    require_owner_for_human_only_preference(&headers, &query.key)?;
+    require_app_document_to_enable_terminal(&headers, &query.key, &request.value)?;
+    let actor = preference_write_actor(
+        &headers,
+        &state.pool,
+        &state.engine.event_bus,
+        &query.key,
+        request.device_id.as_deref(),
+    )
+    .await?;
+    Ok(
+        match state
+            .engine
+            .apply_preference_write(
+                &query.key,
+                &request.value,
+                request.device_id.as_deref(),
+                actor,
+            )
+            .await
+        {
+            Ok(_) => ApiResult::ok(),
+            Err(e) => ApiResult::err(format!("Failed to set preference: {}", e)),
+        },
+    )
+}
+
+pub(super) async fn delete_preference(
+    State(state): State<AppState>,
+    Query(query): Query<KeyQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResult>, ApiError> {
+    let key = query.key;
+    require_owner_for_human_only_preference(&headers, &key)?;
+    let actor =
+        preference_write_actor(&headers, &state.pool, &state.engine.event_bus, &key, None).await?;
+    Ok(
+        match state.engine.apply_preference_reset(&key, actor).await {
+            Ok(true) => ApiResult::ok(),
+            Ok(false) => ApiResult::err(format!("Preference '{}' not found", key)),
+            Err(e) => ApiResult::err(e),
+        },
+    )
+}
+
+pub(in crate::api) async fn preference_write_actor(
+    headers: &HeaderMap,
+    pool: &sqlx::PgPool,
+    event_bus: &crate::engine::event_bus::EventBus,
+    key: &str,
+    device: Option<&str>,
+) -> Result<Option<crate::engine::thread_events::MessageOrigin>, ApiError> {
+    if key == crate::core::prefs::SNAPSHOT_RESTORE_BY_AGENTS.key() {
+        Ok(Some(
+            super::actor::require_owner_device(
+                headers,
+                pool,
+                event_bus,
+                device,
+                "change who can restore snapshots",
+            )
+            .await?,
+        ))
+    } else {
+        Ok(super::actor::user_actor(headers, device))
+    }
+}
+
+fn require_app_document_to_enable_terminal(
+    headers: &HeaderMap,
+    key: &str,
+    value: &str,
+) -> Result<(), ApiError> {
+    let terminal = &crate::core::prefs::TERMINAL_ENABLED;
+    if key != terminal.key()
+        || !terminal.resolve(Some(value))
+        || super::secret_reveal::reveal_request_allowed(
+            headers,
+            super::secret_reveal::RefererRule::Required,
+        )
+    {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "Turn the terminal on from Settings in the Lucidos app.",
+    ))
+}
+
+pub(in crate::api) fn require_owner_for_human_only_preference(
+    headers: &HeaderMap,
+    key: &str,
+) -> Result<(), ApiError> {
+    match crate::core::prefs::internal_hint(key) {
+        Some(hint) => super::actor::require_attested_owner(
+            headers,
+            format!("An agent cannot write the preference '{key}': {hint}."),
+        ),
+        None => Ok(()),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct PinnedAppsQuery {
+    device_id: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct PinnedAppsResponse {
+    entries: Vec<crate::core::PinnedAppUi>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct PinAppRequest {
+    app_id: String,
+    device_id: String,
+}
+
+pub(super) async fn get_pinned_apps(
+    State(state): State<AppState>,
+    Query(query): Query<PinnedAppsQuery>,
+) -> Result<Json<PinnedAppsResponse>, (StatusCode, String)> {
+    read_pinned_apps(&state, &query).await.map(Json)
+}
+
+pub(super) fn pinned_apps_query(
+    device_id: Option<&str>,
+) -> Result<PinnedAppsQuery, axum::extract::rejection::QueryRejection> {
+    match device_id {
+        Some(device_id) => Ok(PinnedAppsQuery {
+            device_id: device_id.to_owned(),
+        }),
+        None => Query::try_from_uri(&axum::http::Uri::from_static("/pinned-apps"))
+            .map(|Query(query)| query),
+    }
+}
+
+pub(super) async fn read_pinned_apps(
+    state: &AppState,
+    query: &PinnedAppsQuery,
+) -> Result<PinnedAppsResponse, (StatusCode, String)> {
+    let entries = PinnedAppStore::list_for_device(&state.pool, &query.device_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load pinned apps: {}", e),
+            )
+        })?;
+    Ok(PinnedAppsResponse { entries })
+}
+
+pub(super) async fn pin_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PinAppRequest>,
+) -> Json<ApiResult> {
+    let actor = super::actor::user_actor(&headers, Some(&request.device_id));
+    match PinnedAppStore::pin(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.app_id,
+        "main",
+        &request.device_id,
+        actor,
+    )
+    .await
+    {
+        Ok(_) => ApiResult::ok(),
+        Err(e) => ApiResult::err(format!("Failed to pin app: {}", e)),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ForgetBrowserLoginRequest {
+    domain: String,
+}
+
+pub(super) async fn forget_browser_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ForgetBrowserLoginRequest>,
+) -> Result<Json<ApiResult>, ApiError> {
+    let actor = super::actor::user_actor(&headers, None);
+    let domain = request.domain.trim();
+    if domain.is_empty() {
+        return Err(ApiError::bad_request("domain is required"));
+    }
+    crate::runtime::BrowserLogins::remove(&state.pool, domain)
+        .await
+        .map_err(ApiError::db)?;
+    let caller = format!("{actor:?}");
+    log!(
+        "[Browser] Login for {} forgotten by {}",
+        lucidos_diagnostic_log::private(&domain),
+        lucidos_diagnostic_log::private(&caller)
+    );
+    Ok(ApiResult::ok())
+}
+
+pub(super) async fn unpin_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PinAppRequest>,
+) -> Json<ApiResult> {
+    let actor = super::actor::user_actor(&headers, Some(&request.device_id));
+    match PinnedAppStore::unpin(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.app_id,
+        "main",
+        &request.device_id,
+        actor,
+    )
+    .await
+    {
+        Ok(_) => ApiResult::ok(),
+        Err(e) => ApiResult::err(format!("Failed to unpin app: {}", e)),
+    }
+}
+
+pub(super) async fn register_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceRegisterRequest>,
+) -> Json<serde_json::Value> {
+    let actor = super::actor::user_actor(&headers, Some(&request.device_id));
+    match crate::core::DeviceStore::register(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.device_id,
+        request.user_agent.as_deref(),
+        actor,
+    )
+    .await
+    {
+        Ok((device, _inserted)) => Json(serde_json::json!({ "success": true, "device": device })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+fn asserted_device_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(crate::core::subprocess_origin::HEADER_DEVICE_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+pub(super) async fn caller_device(headers: HeaderMap) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "device_id": asserted_device_id(&headers) }))
+}
+
+pub(super) fn claims_another_device(headers: &HeaderMap, target: &str) -> Option<String> {
+    let asserted = asserted_device_id(headers)?;
+    if asserted == target {
+        return None;
+    }
+    Some(format!(
+        "this caller is device {asserted} and cannot act for device {target}"
+    ))
+}
+
+pub(super) async fn hand_over_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceHandOverRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(reason) = claims_another_device(&headers, &request.device_id) {
+        return Err(ApiError::bad_request(reason));
+    }
+    let actor = super::actor::user_actor(&headers, Some(&request.device_id));
+    let outcome = crate::core::DeviceStore::hand_over(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.old_device_id,
+        &request.device_id,
+        actor,
+    )
+    .await
+    .map_err(|e| {
+        log_legacy!("[Settings] Device hand-over failed: {}", e);
+        ApiError::internal(format!(
+            "could not hand device {} over to {}: {e}",
+            request.old_device_id, request.device_id
+        ))
+    })?;
+    Ok(Json(
+        serde_json::json!({ "success": true, "outcome": outcome }),
+    ))
+}
+
+pub(super) async fn list_devices(
+    State(state): State<AppState>,
+) -> Result<Json<DevicesListResponse>, (StatusCode, Json<serde_json::Value>)> {
+    read_devices(&state).await.map(Json)
+}
+
+pub(super) async fn read_devices(
+    state: &AppState,
+) -> Result<DevicesListResponse, (StatusCode, Json<serde_json::Value>)> {
+    match crate::core::DeviceStore::list(&state.pool).await {
+        Ok(devices) => Ok(DevicesListResponse { devices }),
+        Err(e) => {
+            log_legacy!("[Settings] Failed to list devices: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ))
+        }
+    }
+}
+
+pub(super) async fn rename_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceRenameRequest>,
+) -> Json<serde_json::Value> {
+    let actor = super::actor::user_actor(&headers, Some(&device_id));
+    match crate::core::DeviceStore::rename(
+        &state.pool,
+        &state.engine.event_bus,
+        &device_id,
+        request.name.as_deref(),
+        actor,
+    )
+    .await
+    {
+        Ok(true) => Json(serde_json::json!({ "success": true })),
+        Ok(false) => Json(serde_json::json!({ "success": false, "error": "Device not found" })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+pub(super) async fn set_device_push(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DevicePushRequest>,
+) -> Json<serde_json::Value> {
+    let actor = super::actor::user_actor(&headers, Some(&device_id));
+    match crate::core::DeviceStore::set_push_enabled(
+        &state.pool,
+        &state.engine.event_bus,
+        &device_id,
+        request.push_enabled,
+        actor,
+    )
+    .await
+    {
+        Ok(true) => Json(serde_json::json!({ "success": true })),
+        Ok(false) => Json(serde_json::json!({ "success": false, "error": "Device not found" })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+pub(super) async fn delete_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = super::actor::user_actor(&headers, Some(&device_id));
+    match crate::core::DeviceStore::delete(&state.pool, &state.engine.event_bus, &device_id, actor)
+        .await
+    {
+        Ok(true) => Ok(Json(serde_json::json!({ "success": true }))),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "Device not found".to_string())),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete device: {}", e),
+        )),
+    }
+}
+
+pub(super) async fn send_email_confirmed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::api::actor::require_attested_owner(
+        &headers,
+        "An agent cannot confirm an email send. The user confirms the draft on the \
+         form `send_email` opened, and only that sends it.",
+    )?;
+    Ok(send_confirmed_draft(&state, &headers, &body).await)
+}
+
+async fn send_confirmed_draft(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &serde_json::Value,
+) -> Json<serde_json::Value> {
+    use crate::core::email::{EmailClient, EmailStore};
+
+    let actor = match crate::api::actor::require_user_actor(headers, &state.pool, None).await {
+        Ok(a) => a,
+        Err(e) => {
+            return Json(serde_json::json!({ "success": false, "error": e.message }));
+        }
+    };
+
+    let to: Vec<String> = body["to"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if to.is_empty() {
+        return Json(
+            serde_json::json!({ "success": false, "error": "`to` is required and must be a non-empty array" }),
+        );
+    }
+    let subject = match body["subject"].as_str() {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({ "success": false, "error": "`subject` is required" }))
+        }
+    };
+    let body_text = match body["body"].as_str() {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({ "success": false, "error": "`body` is required" }))
+        }
+    };
+    let cc: Vec<String> = body
+        .get("cc")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let bcc: Vec<String> = body
+        .get("bcc")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let reply_to = body.get("reply_to_message_id").and_then(|v| v.as_str());
+    let account_name = match body["account"].as_str() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return Json(serde_json::json!({ "success": false, "error": "`account` is required" }))
+        }
+    };
+
+    let account = match EmailStore::get(&state.pool, account_name).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return Json(serde_json::json!({ "success": false, "error": "Account not found" }))
+        }
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": format!("{}", e) })),
+    };
+
+    let oauth_token =
+        match crate::core::oauth::linked_account_token(&state.pool, account.oauth_account_id).await
+        {
+            Ok(token) => token,
+            Err(error) => return Json(serde_json::json!({ "success": false, "error": error })),
+        };
+
+    let to_str = to.join(", ");
+    let cc_str = if cc.is_empty() {
+        None
+    } else {
+        Some(cc.join(", "))
+    };
+    let bcc_str = if bcc.is_empty() {
+        None
+    } else {
+        Some(bcc.join(", "))
+    };
+
+    let attachment_paths: Vec<String> = body
+        .get("attachments")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let attachments = match crate::core::email::EmailAttachment::read_from_workspace(
+        &state.workspace_path,
+        &attachment_paths,
+    ) {
+        Ok(a) => a,
+        Err(e) => return Json(serde_json::json!({ "success": false, "error": e })),
+    };
+
+    match EmailClient::send_email(
+        &account,
+        &to_str,
+        subject,
+        body_text,
+        cc_str.as_deref(),
+        bcc_str.as_deref(),
+        reply_to,
+        oauth_token.as_deref(),
+        &attachments,
+    )
+    .await
+    {
+        Ok(_) => {
+            let attachment_count = attachments.len();
+            state
+                .engine
+                .event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::System(
+                        crate::engine::event_bus::SystemEvent::EmailSent {
+                            account: account.name.clone(),
+                            to: to.clone(),
+                            cc: cc.clone(),
+                            bcc: bcc.clone(),
+                            subject: subject.to_string(),
+                            attachment_count,
+                            actor: Some(actor.clone()),
+                        },
+                    ),
+                    "[Email] EmailSent",
+                )
+                .await;
+            if let Some(id) = body["form_request_id"]
+                .as_str()
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+            {
+                crate::engine::form_requests::complete_named_request(
+                    &state.pool,
+                    &state.engine.event_bus,
+                    id,
+                    "EmailConfirmRequested",
+                    Some(actor),
+                )
+                .await;
+            }
+            Json(serde_json::json!({ "success": true }))
+        }
+        Err(e) => {
+            log_legacy!("[Email] Failed to send email to {}: {}", to.join(", "), e);
+            Json(serde_json::json!({ "success": false, "error": format!("{}", e) }))
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct OAuthAccessTokenResponse {
+    pub access_token: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub(super) async fn fetch_oauth_access_token(
+    pool: &PgPool,
+    provider: &str,
+) -> Result<OAuthAccessTokenResponse, (StatusCode, String)> {
+    use crate::core::oauth::{get_account_with_fresh_token, AccountLookupError};
+    let account = get_account_with_fresh_token(pool, provider)
+        .await
+        .map_err(|e| match e {
+            AccountLookupError::NotConnected => (
+                StatusCode::NOT_FOUND,
+                format!("Provider '{}' not connected", provider),
+            ),
+            AccountLookupError::DbError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load OAuth account for '{}': {}", provider, err),
+            ),
+            AccountLookupError::RefreshFailed(msg) => (StatusCode::BAD_GATEWAY, msg),
+        })?;
+    Ok(OAuthAccessTokenResponse {
+        access_token: account.access_token,
+        expires_at: account.token_expiry,
+    })
+}
+
+pub(super) async fn get_oauth_access_token(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+) -> Result<Json<OAuthAccessTokenResponse>, (StatusCode, String)> {
+    fetch_oauth_access_token(&state.pool, &provider)
+        .await
+        .map(Json)
+}
+
+#[derive(Serialize)]
+struct PrivatePathSettings {
+    machine: Vec<PathBuf>,
+    workspace: Vec<PathBuf>,
+    enforcement: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PrivatePathScope {
+    Machine,
+    Workspace,
+}
+
+#[derive(Deserialize)]
+struct PrivatePathUpdate {
+    scope: PrivatePathScope,
+    paths: Vec<String>,
+    previous: Vec<String>,
+}
+
+async fn private_path_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PrivatePathSettings>, error::ApiError> {
+    require_private_path_device(&state.pool, &headers).await?;
+    read_private_path_settings(&state).await
+}
+
+async fn require_private_path_device(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+) -> Result<(), error::ApiError> {
+    let actor = actor::require_user_actor(headers, pool, None).await?;
+    if super::secret_reveal::reveal_request_allowed(
+        headers,
+        super::secret_reveal::RefererRule::Required,
+    ) && matches!(
+        actor,
+        crate::engine::thread_events::MessageOrigin::Device { .. }
+    ) {
+        Ok(())
+    } else {
+        Err(error::ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Private path settings are available from a Lucidos device.",
+        ))
+    }
+}
+
+async fn read_private_path_settings(
+    state: &AppState,
+) -> Result<Json<PrivatePathSettings>, error::ApiError> {
+    use crate::runtime::agent_sandbox::{self, SandboxStatus};
+    use lucidos_home::private;
+
+    let enforcement = match agent_sandbox::status(&state.pool).await {
+        SandboxStatus::Enforced if agent_sandbox::truncation_unguarded().await => "read-only",
+        SandboxStatus::Enforced => "full",
+        SandboxStatus::Unavailable { .. } => "unavailable",
+        SandboxStatus::Inherited | SandboxStatus::OwnerOptedOut => "not-enforced",
+    };
+    let read = |path: &std::path::Path| {
+        private::read_paths(path).map_err(|e| error::ApiError::internal(e.to_string()))
+    };
+    Ok(Json(PrivatePathSettings {
+        machine: match private::machine_paths_file() {
+            Some(file) => read(&file)?,
+            None => Vec::new(),
+        },
+        workspace: read(&private::workspace_paths_file(&state.workspace_path))?,
+        enforcement,
+    }))
+}
+
+fn add_data_dir_roots(published: &mut Vec<PathBuf>) {
+    let data_roots: Vec<_> = published
+        .iter()
+        .map(|root| root.join(crate::core::DATA_DIR))
+        .collect();
+    published.extend(data_roots);
+}
+
+async fn update_private_paths(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(update): Json<PrivatePathUpdate>,
+) -> Result<Json<PrivatePathSettings>, error::ApiError> {
+    use lucidos_home::private;
+
+    require_private_path_device(&state.pool, &headers).await?;
+    let paths = private::validate_paths(update.paths)
+        .map_err(|e| error::ApiError::bad_request(e.to_string()))?;
+    let previous = private::validate_paths(update.previous)
+        .map_err(|e| error::ApiError::bad_request(e.to_string()))?;
+    let data_dirs = crate::paths::gateway_data_dirs();
+    let mut published = crate::paths::registered_workspace_dirs(&data_dirs);
+    published.extend(data_dirs.iter().map(|dir| dir.join("workspaces")));
+    published.push(state.workspace_path.clone());
+    add_data_dir_roots(&mut published);
+    published.extend(
+        state
+            .engine
+            .system_knowhow_dir()
+            .map(std::path::Path::to_path_buf),
+    );
+    published.extend(
+        crate::core::repositories::RepositoryStore::list(&state.pool)
+            .await
+            .map_err(error::ApiError::db)?
+            .into_iter()
+            .map(|repo| PathBuf::from(repo.path)),
+    );
+    if paths
+        .iter()
+        .filter(|path| !previous.contains(path))
+        .any(|path| published.iter().any(|root| private::overlaps(path, root)))
+    {
+        return Err(error::ApiError::bad_request(
+            "Private paths must be outside workspaces and registered repositories.",
+        ));
+    }
+    if cfg!(target_os = "linux")
+        && paths
+            .iter()
+            .filter(|path| !previous.contains(path))
+            .any(|path| {
+                crate::core::temp_dirs::roots()
+                    .iter()
+                    .any(|root| private::overlaps(path, root))
+            })
+    {
+        return Err(error::ApiError::bad_request(
+            "On Linux, choose a private path outside system temporary folders so agents can still create scratch files.",
+        ));
+    }
+    let file = match update.scope {
+        PrivatePathScope::Machine => private::machine_paths_file()
+            .ok_or_else(|| error::ApiError::internal("Lucidos home is unavailable."))?,
+        PrivatePathScope::Workspace => private::workspace_paths_file(&state.workspace_path),
+    };
+    let replaced =
+        tokio::task::spawn_blocking(move || private::replace_paths(&file, &previous, &paths))
+            .await
+            .map_err(|e| error::ApiError::internal(e.to_string()))?
+            .map_err(|e| error::ApiError::internal(e.to_string()))?;
+    if !replaced {
+        return Err(error::ApiError::new(
+            StatusCode::CONFLICT,
+            "The private path list changed. Reload it and try again.",
+        ));
+    }
+    read_private_path_settings(&state).await
+}
+
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/private-paths",
+            get(private_path_settings).put(update_private_paths),
+        )
+        .route(
+            "/credentials",
+            get(list_credentials)
+                .post(create_credential)
+                .put(update_credential)
+                .delete(delete_credential),
+        )
+        .route("/credential-base-urls", put(set_credential_base_urls))
+        .route("/email-account", get(get_email_account))
+        .route(
+            "/env-vars",
+            get(list_env_vars)
+                .post(create_env_var)
+                .put(update_env_var)
+                .delete(delete_env_var),
+        )
+        .route(
+            "/models",
+            get(list_models)
+                .post(create_model)
+                .put(update_model)
+                .delete(delete_model),
+        )
+        .route("/response-styles", get(list_response_styles))
+        .route(
+            "/oauth/accounts",
+            get(list_oauth_accounts).delete(delete_oauth_account),
+        )
+        .route("/oauth/known-providers", get(list_known_oauth_providers))
+        .route("/oauth/reauthorize", post(reauthorize_oauth))
+        .route("/oauth/complete", post(complete_oauth))
+        .route("/oauth/:provider/access-token", get(get_oauth_access_token))
+        .route(
+            "/preferences",
+            get(get_preferences)
+                .put(set_preference)
+                .delete(delete_preference),
+        )
+        .route(
+            "/cc-allowed-tools",
+            get(get_cc_allowed_tools).put(put_cc_allowed_tools),
+        )
+        .route(
+            "/agent-allowed-commands",
+            get(get_agent_allowed_commands).put(put_agent_allowed_commands),
+        )
+        .route(
+            "/agent-denied-commands",
+            get(get_agent_denied_commands).put(put_agent_denied_commands),
+        )
+        .route("/devices/register", post(register_device))
+        .route("/devices/hand-over", post(hand_over_device))
+        .route("/devices/caller", get(caller_device))
+        .route("/devices", get(list_devices))
+        .route("/devices/:device_id/name", put(rename_device))
+        .route("/devices/:device_id/push", put(set_device_push))
+        .route("/devices/:device_id", axum::routing::delete(delete_device))
+        .route(
+            "/pinned-apps",
+            get(get_pinned_apps).post(pin_app).delete(unpin_app),
+        )
+        .route("/browser/forget-login", post(forget_browser_login))
+        .route("/email/send", post(send_email_confirmed))
+}
+
+#[cfg(test)]
+mod model_picker_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn availability_preserves_unknown_and_proxy_capability_is_independent() {
+        let route = |provider: &str, configured: Option<&[String]>| {
+            route_info(provider, "wire-model", None, configured)
+        };
+        let unknown = route("openai", None);
+        assert_eq!(unknown.configured, None);
+        assert!(unknown.proxy.is_some());
+        let none: &[String] = &[];
+        assert_eq!(route("openai", Some(none)).configured, Some(false));
+        let configured = vec!["opencode-free".to_string()];
+        let unsupported = route("opencode-free", Some(&configured));
+        assert_eq!(unsupported.configured, Some(true));
+        assert!(unsupported.proxy.is_none());
+        assert!(route("custom-provider", None).proxy.is_none());
+        let json = serde_json::to_value(unknown).unwrap();
+        assert_eq!(json["configured"], serde_json::Value::Null);
+        assert_eq!(json["id"], "wire-model");
+        assert_eq!(json["proxy"]["name"], "openai");
+        assert_eq!(json["proxy"]["protocol"], "openai-chat-completions");
+        let fields = json.as_object().unwrap();
+        assert_eq!(fields.len(), 5);
+        for key in ["configured", "id", "provider", "proxy", "reasoning_efforts"] {
+            assert!(fields.contains_key(key), "missing public field {key}");
+        }
+        assert_eq!(json["proxy"].as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn request_defaults_use_transport_effort_authorities() {
+        let anthropic = route_info("anthropic", "claude-haiku-4-5", None, None);
+        let json = serde_json::to_value(anthropic).unwrap();
+        let high = &json["proxy"]["request_defaults"]["high"]["body"];
+        assert_eq!(
+            high["thinking"]["budget_tokens"],
+            crate::llm::thinking_budget_for_effort("high")
+        );
+        assert!(json["proxy"]["request_defaults"][""]["body"]["thinking"].is_null());
+        let vertex =
+            serde_json::to_value(route_info("vertex", "gemini-3-pro", None, None)).unwrap();
+        assert_eq!(
+            vertex["proxy"]["request_defaults"]["medium"]["body"]["generationConfig"]
+                ["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn openai_protocol_uses_wire_id_and_compatible_backends_keep_chat() {
+        for (provider, wire_id, expected) in [
+            ("openai", "gpt-5.5", "openai-responses"),
+            ("openai", "gpt-4o", "openai-chat-completions"),
+            ("openrouter", "openai/gpt-5.5", "openai-chat-completions"),
+            ("local", "gpt-5.5", "openai-chat-completions"),
+            ("xai", "grok-example", "openai-chat-completions"),
+            ("anthropic", "claude-example", "anthropic-messages"),
+        ] {
+            let route = route_info(provider, wire_id, None, Some(&[provider.to_string()]));
+            assert_eq!(route.configured, Some(true));
+            let json = serde_json::to_value(route).unwrap();
+            assert_eq!(json["proxy"]["protocol"], expected, "{provider}/{wire_id}");
+        }
+    }
+
+    #[test]
+    fn vertex_protocol_follows_the_transport_model_split() {
+        let claude = route_info("vertex", "claude-example@default", None, None);
+        let gemini = route_info("vertex", "gemini-example", None, None);
+        assert_eq!(
+            serde_json::to_value(claude).unwrap()["proxy"]["protocol"],
+            "vertex-anthropic"
+        );
+        assert_eq!(
+            serde_json::to_value(gemini).unwrap()["proxy"]["protocol"],
+            "vertex-google"
+        );
+    }
+
+    #[test]
+    fn registry_alias_is_resolved_before_capabilities_are_derived() {
+        let model = crate::core::Model {
+            id: "my-model".into(),
+            label: "My model".into(),
+            routes: vec![crate::core::Route {
+                provider: "openai".into(),
+                id: Some("gpt-5.5".into()),
+                context_window: Some(200_000),
+            }],
+            preferred_provider: None,
+            vision: false,
+            default_effort: None,
+            successor: None,
+            sort_order: 0,
+            source: "user".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let info = model_info(model, true, Some(&["openai".into()]));
+        assert!(info.on_chat_ladder);
+        let route = &info.routes[0];
+        assert_eq!(route.id, "gpt-5.5");
+        assert_eq!(route.context_window, Some(200_000));
+        assert_eq!(
+            route.reasoning_efforts,
+            supported_efforts(ProviderKind::OpenAi, "gpt-5.5")
+        );
+        assert_eq!(
+            route.proxy.as_ref().unwrap().protocol,
+            ModelProxyProtocol::OpenaiResponses
+        );
+    }
+}
+
+#[cfg(test)]
+mod oauth_access_token_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    #[tokio::test]
+    async fn returns_404_when_provider_not_connected() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+        let result = fetch_oauth_access_token(&pool, "spotify").await;
+
+        match result {
+            Err((status, msg)) => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert!(
+                    msg.contains("spotify"),
+                    "error should name the provider, got: {}",
+                    msg
+                );
+            }
+            Ok(_) => panic!("expected 404, got OK"),
+        }
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn returns_access_token_and_expires_at_when_connected() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let expiry = Utc::now() + Duration::seconds(3600);
+        crate::test_support::seed_oauth_account(
+            &pool,
+            "spotify",
+            Some("user@example.com"),
+            None,
+            "BQAlive-access-token",
+            Some("AQrefresh-token"),
+            Some(expiry),
+            "user-read-playback-state user-modify-playback-state",
+        )
+        .await
+        .unwrap();
+
+        let resp = fetch_oauth_access_token(&pool, "spotify")
+            .await
+            .expect("should return a token");
+
+        assert_eq!(resp.access_token, "BQAlive-access-token");
+        let returned_expiry = resp.expires_at.expect("expires_at must be set");
+        assert!(
+            (returned_expiry - expiry).num_seconds().abs() < 2,
+            "expires_at should match the stored expiry"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn response_serialization_omits_refresh_token() {
+        let resp = OAuthAccessTokenResponse {
+            access_token: "tok".into(),
+            expires_at: Some(Utc::now()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("access_token").is_some());
+        assert!(json.get("expires_at").is_some());
+        assert!(
+            json.get("refresh_token").is_none(),
+            "refresh_token must never be serialized: {:?}",
+            json
+        );
+    }
+
+    #[tokio::test]
+    async fn attempts_refresh_when_stored_token_is_expired() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let past = Utc::now() - Duration::seconds(120);
+        crate::test_support::seed_oauth_account(
+            &pool,
+            "spotify",
+            Some("user@example.com"),
+            None,
+            "stale-token",
+            Some("AQrefresh-token"),
+            Some(past),
+            "user-read-playback-state",
+        )
+        .await
+        .unwrap();
+
+        let result = fetch_oauth_access_token(&pool, "spotify").await;
+
+        match result {
+            Err((status, _msg)) => {
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_GATEWAY,
+                    "expired token + missing client creds must surface as 502, not return the stale token"
+                );
+            }
+            Ok(resp) => panic!(
+                "expected refresh to be attempted, got stale token back: {:?}",
+                resp.access_token
+            ),
+        }
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod hand_over_guard_tests {
+    use super::*;
+
+    fn headers_with(device_id: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(id) = device_id {
+            h.insert(
+                crate::core::subprocess_origin::HEADER_DEVICE_ID,
+                id.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn a_caller_may_move_its_own_row() {
+        assert_eq!(
+            claims_another_device(&headers_with(Some("dev-a")), "dev-a"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_caller_may_not_move_someone_elses_row() {
+        let reason = claims_another_device(&headers_with(Some("dev-a")), "dev-b")
+            .expect("a caller that is not the target must be refused");
+        assert!(reason.contains("dev-a"), "{reason}");
+        assert!(reason.contains("dev-b"), "{reason}");
+    }
+
+    #[test]
+    fn the_client_asserting_the_id_it_adopts_is_the_case_that_must_pass() {
+        assert_eq!(
+            claims_another_device(&headers_with(Some("paired-device")), "paired-device"),
+            None
+        );
+        assert!(
+            claims_another_device(&headers_with(Some("minted-locally")), "paired-device").is_some()
+        );
+    }
+
+    #[test]
+    fn no_header_is_the_loopback_case_and_is_allowed() {
+        assert_eq!(claims_another_device(&headers_with(None), "dev-a"), None);
+    }
+
+    #[test]
+    fn a_blank_header_asserts_nothing_and_is_allowed() {
+        assert_eq!(
+            claims_another_device(&headers_with(Some("   ")), "dev-a"),
+            None
+        );
+    }
+
+    async fn caller_id(device_id: Option<&str>) -> serde_json::Value {
+        caller_device(headers_with(device_id)).await.0["device_id"].clone()
+    }
+
+    #[tokio::test]
+    async fn the_caller_read_returns_the_asserted_namespaced_id() {
+        assert_eq!(
+            caller_id(Some(" pairing-1:dev-a ")).await,
+            serde_json::json!("pairing-1:dev-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_caller_read_is_null_without_an_asserted_id() {
+        assert_eq!(caller_id(None).await, serde_json::Value::Null);
+        assert_eq!(caller_id(Some("   ")).await, serde_json::Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod preferences_read_tests {
+    use super::*;
+
+    #[test]
+    fn the_preference_read_leaves_out_engine_bookkeeping() {
+        use crate::core::prefs;
+        let theme_mode = prefs::THEME_MODE.key();
+        let backfill = prefs::BACKFILL_REPO_NAMES_FROM_CHANGES_DONE.key();
+        let stored: std::collections::HashMap<String, String> =
+            [(theme_mode, "dark"), (backfill, "true")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+
+        let served = settings_only(stored);
+
+        assert_eq!(served.get(theme_mode).map(String::as_str), Some("dark"));
+        assert!(!served.contains_key(backfill));
+    }
+}
+
+#[cfg(test)]
+mod model_update_tests {
+    use super::*;
+
+    fn stored(source: &str, vision: bool) -> crate::core::Model {
+        crate::core::Model {
+            id: "some-model".to_string(),
+            label: "Some model".to_string(),
+            routes: vec![Route::bare("vertex")],
+            preferred_provider: None,
+            vision,
+            default_effort: None,
+            successor: None,
+            sort_order: 5,
+            source: source.to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn edit(body: serde_json::Value) -> UpdateModelRequest {
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn an_edit_without_the_vision_flag_keeps_it() {
+        let fields = apply_model_update(
+            &stored("user", true),
+            edit(serde_json::json!({"label": "New"})),
+        )
+        .unwrap();
+        assert!(fields.vision);
+    }
+
+    #[test]
+    fn a_builtin_accepts_the_vision_flag() {
+        let fields = apply_model_update(
+            &stored("builtin", false),
+            edit(serde_json::json!({"vision": true})),
+        )
+        .unwrap();
+        assert!(fields.vision);
+        let fields = apply_model_update(
+            &stored("builtin", true),
+            edit(serde_json::json!({"vision": false})),
+        )
+        .unwrap();
+        assert!(!fields.vision);
+    }
+}
+
+#[cfg(test)]
+mod env_name_tests {
+    use super::*;
+    use crate::core::subprocess_origin::{
+        init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+    };
+
+    fn agent_headers() -> HeaderMap {
+        init_agent_origin_secret("env-name-test-secret".to_string());
+        let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None)
+            .expect("the secret is installed above");
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn an_agent_caller_cannot_store_a_code_injecting_name() {
+        let agent = agent_headers();
+        for name in ["BASH_ENV", "LD_PRELOAD", "NODE_OPTIONS", "GIT_SSH_COMMAND"] {
+            let rejection = validate_env_name_for(&agent, name).unwrap_err();
+            assert_eq!(rejection, NameRejection::CodeInjecting, "{name}");
+            assert_eq!(env_name_refusal(&rejection, name).0, StatusCode::FORBIDDEN);
+        }
+        assert!(validate_env_name_for(&agent, "MY_FLAG").is_ok());
+    }
+
+    #[test]
+    fn the_user_can_still_store_a_code_injecting_name() {
+        let user = HeaderMap::new();
+        assert!(validate_env_name_for(&user, "GIT_SSH_COMMAND").is_ok());
+        assert_eq!(
+            validate_env_name_for(&user, "PATH").unwrap_err(),
+            NameRejection::Reserved
+        );
+    }
+}
+
+#[cfg(test)]
+mod private_path_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn private_paths_refuse_an_agent_even_with_a_stamped_device() {
+        use crate::core::subprocess_origin::{
+            init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+        };
+        let (pool, name) = crate::test_support::setup_test_db().await;
+        init_agent_origin_secret("private-paths-actor-test".into());
+        let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None).unwrap();
+        let mut headers =
+            crate::api::gateway_stamp::test_support::stamped_device_headers("test-device");
+        assert!(require_private_path_device(&pool, &headers).await.is_ok());
+        let mut app_headers = headers.clone();
+        app_headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        app_headers.insert(
+            "referer",
+            "https://example.com/app/example/".parse().unwrap(),
+        );
+        assert_eq!(
+            require_private_path_device(&pool, &app_headers)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN,
+        );
+        headers.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+        let error = require_private_path_device(&pool, &headers)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        crate::test_support::teardown_test_db(&name).await;
+    }
+}
+
+#[cfg(test)]
+mod credential_and_grant_rule_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_lane_is_an_error_not_an_empty_editor() {
+        let failed = lane_editor(
+            GrantFile::CodingAgentTools,
+            Err::<Vec<String>, String>("db down".into()),
+        );
+        let (status, _) = match failed {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("a store failure must fail"),
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let read = lane_editor(
+            GrantFile::CodingAgentTools,
+            Ok::<_, String>(vec!["Bash(ls:*)".to_string()]),
+        )
+        .map_err(|(_, message)| message)
+        .unwrap();
+        assert!(read.0.contents.contains("Bash(ls:*)"));
+    }
+
+    #[test]
+    fn an_empty_secret_keeps_the_stored_one() {
+        assert_eq!(replacement_secret(None), None);
+        assert_eq!(replacement_secret(Some("")), None);
+        assert_eq!(replacement_secret(Some("new")), Some("new"));
+    }
+
+    #[test]
+    fn an_email_edit_scopes_the_credential_to_its_smtp_host() {
+        let email: EmailAccountSettings = serde_json::from_value(serde_json::json!({
+            "email_address": "me@example.com",
+            "imap_host": "imap.example.com",
+            "imap_port": 993,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "username": "me",
+            "use_tls": true,
+            "require_send_confirmation": true,
+        }))
+        .unwrap();
+        let none = RequestedScope::default();
+        assert_eq!(
+            updated_scope(AuthType::EmailPassword, Some(&email), &none),
+            Some(vec!["smtp://smtp.example.com".to_string()])
+        );
+        assert_eq!(updated_scope(AuthType::EmailPassword, None, &none), None);
+        assert_eq!(
+            updated_scope(AuthType::OauthClient, Some(&email), &none),
+            None
+        );
+    }
+
+    #[test]
+    fn a_credential_edit_never_touches_the_service_account_on_either_side() {
+        let service = AuthType::OnepasswordServiceAccount;
+        assert!(touches_service_account(service, None));
+        assert!(touches_service_account(
+            AuthType::OauthClient,
+            Some(service)
+        ));
+        assert!(!touches_service_account(
+            AuthType::OauthClient,
+            Some(AuthType::EmailPassword)
+        ));
+        assert!(!touches_service_account(AuthType::OauthClient, None));
+    }
+
+    #[test]
+    fn an_oauth_client_name_is_normalized_and_others_are_kept() {
+        assert_eq!(
+            credential_service_name(AuthType::OauthClient, "oauth:google"),
+            "google"
+        );
+        assert_eq!(
+            credential_service_name(AuthType::EmailPassword, "oauth:google"),
+            "oauth:google"
+        );
+    }
+
+    #[test]
+    fn private_path_roots_include_each_workspace_data_dir() {
+        let mut roots = vec![PathBuf::from("/ws")];
+        add_data_dir_roots(&mut roots);
+        assert!(roots.contains(&PathBuf::from("/ws")));
+        assert!(roots.contains(&PathBuf::from("/ws").join(crate::core::DATA_DIR)));
+    }
+
+    const SOURCE: &str = include_str!("settings.rs");
+
+    fn body_of(signature: &str) -> &'static str {
+        let start = SOURCE.find(signature).expect(signature);
+        let end = start + SOURCE[start..].find("\n}\n").expect("fn end");
+        &SOURCE[start..end]
+    }
+
+    fn before(body: &str, first: &str, second: &str) {
+        let a = body
+            .find(first)
+            .unwrap_or_else(|| panic!("missing {first}"));
+        let b = body
+            .find(second)
+            .unwrap_or_else(|| panic!("missing {second}"));
+        assert!(a < b, "{first} must come before {second}");
+    }
+
+    #[test]
+    fn the_grant_lane_reads_through_the_error_mapping_and_identifies_before_writing() {
+        let read = body_of("pub(super) async fn read_grant_lane(");
+        assert!(read.contains("lane_editor("));
+        assert!(!read.contains("unwrap_or"));
+        before(
+            body_of("pub(super) async fn write_grant_lane("),
+            "require_user_actor(",
+            "tool_grants::change_standing(",
+        );
+    }
+
+    #[test]
+    fn credential_saves_refuse_the_service_account_and_answer_forms_only_after_the_store() {
+        let create = body_of("pub(super) async fn create_credential(");
+        before(
+            create,
+            "SERVICE_ACCOUNT_IS_SETTINGS_ONLY",
+            "CredentialStore::upsert(",
+        );
+        before(
+            create,
+            "credential_service_name(",
+            "CredentialStore::upsert(",
+        );
+        before(
+            create,
+            "CredentialStore::upsert(",
+            "complete_credential_requests(",
+        );
+        assert_eq!(create.matches("request.service_name").count(), 1);
+        let update = body_of("pub(super) async fn update_credential(");
+        before(
+            update,
+            "touches_service_account(",
+            "CredentialStore::update(",
+        );
+        before(
+            update,
+            "CredentialStore::update(",
+            "complete_credential_requests(",
+        );
+    }
+
+    #[test]
+    fn a_confirmed_send_identifies_its_caller_before_the_mail_leaves() {
+        before(
+            body_of("async fn send_confirmed_draft("),
+            "require_user_actor(",
+            "EmailClient::send_email(",
+        );
+    }
+
+    #[test]
+    fn a_model_edit_turns_the_ladder_off_first_and_on_last_and_delete_is_gated() {
+        let edit = body_of("async fn update_model_fields(");
+        before(
+            edit,
+            "set_on_chat_ladder(state, &existing.id, false",
+            "ModelStore::update(",
+        );
+        before(
+            edit,
+            "ModelStore::update(",
+            "set_on_chat_ladder(state, &existing.id, true",
+        );
+        let delete = body_of("pub(super) async fn delete_model(");
+        before(
+            delete,
+            "existing.is_builtin()",
+            "chat_ladder::delete_user_model(",
+        );
+        before(
+            delete,
+            "chat_ladder_edit_gate(",
+            "chat_ladder::delete_user_model(",
+        );
+    }
+
+    #[test]
+    fn oauth_reauthorize_judges_the_resolved_secret() {
+        let body = body_of("pub(super) async fn reauthorize_oauth(");
+        before(
+            body,
+            "cred.secret(&state.pool)",
+            "client_secret_repeats_client_id(&config)",
+        );
+    }
+
+    #[test]
+    fn a_failed_device_hand_over_is_an_error_status() {
+        let body = body_of("pub(super) async fn hand_over_device(");
+        assert!(body.contains("ApiError::internal("));
+        assert!(!body.contains("\"success\": false"));
+    }
+
+    #[test]
+    fn private_path_update_adds_data_dir_roots_and_the_response_styles_route_is_read_only() {
+        assert!(body_of("async fn update_private_paths(").contains("add_data_dir_roots("));
+        let router = body_of("pub(super) fn router()");
+        let styles = router
+            .lines()
+            .find(|line| line.contains("\"/response-styles\""))
+            .expect("the response styles route is mounted");
+        assert!(styles.contains("get(list_response_styles))"), "{styles}");
+        for verb in [".put(", ".post(", ".patch(", ".delete("] {
+            assert!(!styles.contains(verb), "{styles}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_switch_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    }
+
+    fn allowed(pairs: &[(&'static str, &str)], key: &str, value: &str) -> bool {
+        require_app_document_to_enable_terminal(&headers(pairs), key, value).is_ok()
+    }
+
+    #[test]
+    fn only_the_app_shell_turns_the_terminal_on() {
+        let key = crate::core::prefs::TERMINAL_ENABLED.key();
+        let app = [
+            ("sec-fetch-site", "same-origin"),
+            ("referer", "https://localhost/app/habit-tracker/"),
+        ];
+        let unnamed = [("sec-fetch-site", "same-origin")];
+        let shell = [
+            ("sec-fetch-site", "same-origin"),
+            ("referer", "https://localhost/"),
+        ];
+        assert!(!allowed(&app, key, "true"), "an app document");
+        assert!(
+            !allowed(&unnamed, key, "1"),
+            "a browser page that names no referer"
+        );
+        assert!(allowed(&shell, key, "true"), "the shell");
+        assert!(
+            allowed(&[], key, "true"),
+            "a non-browser caller, as the CLI"
+        );
+        assert!(
+            allowed(&app, key, "false"),
+            "turning it off is never refused"
+        );
+        assert!(allowed(&app, "theme", "dark"), "other keys are untouched");
+    }
+}

@@ -1,0 +1,33 @@
+import { describe, it, expect } from 'vitest';
+import { CAPABILITIES } from './generated/capabilities';
+import { notifications } from './notifications';
+import { preferences } from './preferences';
+import { triggers } from './triggers';
+import { apps } from './apps';
+
+const FACADES: Record<string, Record<string, unknown>> = {
+  notifications: notifications as unknown as Record<string, unknown>,
+  preferences: preferences as unknown as Record<string, unknown>,
+  triggers: triggers as unknown as Record<string, unknown>,
+  apps: apps as unknown as Record<string, unknown>,
+};
+
+describe('SDK parity with the capability manifest', () => {
+  for (const domain of CAPABILITIES) {
+    it(`${domain.name} facade exposes every manifest operation`, () => {
+      const facade = FACADES[domain.name];
+      expect(
+        facade,
+        `No SDK facade registered for manifest domain '${domain.name}'. ` +
+          `Add it to FACADES in capabilities.test.ts (and implement the methods).`,
+      ).toBeDefined();
+      for (const op of domain.ops) {
+        expect(
+          typeof facade[op.sdkName],
+          `lucidos.${domain.name}.${op.sdkName}() is in the manifest but missing ` +
+            `from the SDK facade (action '${op.action}').`,
+        ).toBe('function');
+      }
+    });
+  }
+});

@@ -1,0 +1,20 @@
+[package]
+name = "lucidos-home"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Lucidos home (`~/.lucidos`) and the storage-root rule: every directory
+# Lucidos stores data in is mode 0700, so another local user cannot traverse
+# into it. The engine, the gateway, the app, the CLI and the small crates all
+# resolve the home and assert the mode here. None of them may depend on the
+# engine (ADR 0014 §1), hence a crate of its own.
+#
+# **It has no dependencies and must keep none**, like `lucidos-local-token`,
+# which takes it.
+
+[dependencies]
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"

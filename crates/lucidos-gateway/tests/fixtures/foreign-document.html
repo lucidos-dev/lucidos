@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><title>foreign-document</title></head><body>
+<script>
+// This is hostile B code, deliberately reaching outside its workspace prefix.
+window.attack = (async () => {
+  const result = {storage: false, privateRead: false, cache: false, worker: false,
+    returnGrant: false, sourceOperation: false, returnOperation: false};
+  try { result.storage = localStorage.getItem('gateway-a-secret') === 'private'; } catch {}
+  try {
+    const response = await fetch('/~/api/v1/control/workspaces');
+    result.privateRead = response.ok && (await response.text()).includes('workspaces');
+  } catch {}
+  for (const [key, path, method, body] of [
+    ['returnGrant', '/~/api/v1/remote-gateways/cloud/return-access', 'PUT', {enabled: true}],
+    ['sourceOperation', '/~/api/v1/workspace-operations', 'POST', {envelope: {}}],
+    ['returnOperation', '/~/api/gateway/v1/return-operation', 'POST', {pairing_id: 'forged', grant_id: 'forged', receipt: 'forged'}],
+  ]) {
+    try {
+      const response = await fetch(path, {method, credentials: 'include',
+        headers: {'content-type': 'application/json'}, body: JSON.stringify(body)});
+      result[key] = response.ok;
+    } catch {}
+  }
+  try {
+    const cache = await caches.open('foreign-executable-cache');
+    await cache.put('/dev@cloud/', new Response('<title>foreign cached shell</title>'));
+    result.cache = !!(await cache.match('/dev@cloud/'));
+  } catch {}
+  try {
+    const registration = await navigator.serviceWorker.register('/dev@cloud/sw.js', {scope: '/dev@cloud/'});
+    result.worker = !!registration;
+  } catch {}
+  window.attackResult = result;
+  return result;
+})();
+</script>
+</body></html>

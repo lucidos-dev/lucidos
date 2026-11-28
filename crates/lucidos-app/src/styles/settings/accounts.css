@@ -1,0 +1,101 @@
+
+.accounts-section .list-rows {
+    margin-inline: calc(-1 * var(--space-lg));
+}
+
+.credential-row .list-row-name,
+.oauth-account-row .list-row-name {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+}
+
+.credential-row .list-row-info {
+    flex: 1 1 18rem;
+}
+
+@media (max-width: 600px) {
+    .credential-row .list-row-info {
+        flex-basis: auto;
+    }
+}
+
+.credential-row .list-row-actions,
+.oauth-account-row .list-row-actions {
+    align-self: flex-end;
+}
+
+.oauth-connect-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.oauth-quick-providers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+
+.oauth-quick-btn {
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+    padding: 0.1875rem 0.625rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .oauth-quick-btn:hover {
+        color: var(--accent);
+        border-color: var(--accent);
+    }
+}
+
+.oauth-quick-btn.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.oauth-connect-controls {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.oauth-provider-input {
+    flex: 1;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    padding: 0.25rem 0.5rem;
+}
+
+.oauth-account-shortfall {
+    margin-top: 0.25rem;
+    color: var(--accent-yellow);
+    font-size: var(--font-size-xs);
+}
+
+.oauth-connect-hint {
+    margin: 0;
+}
+
+.oauth-permissions-hint {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-xs);
+    margin-top: var(--space-xs);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.oauth-permissions-hint p {
+    margin: 0;
+}

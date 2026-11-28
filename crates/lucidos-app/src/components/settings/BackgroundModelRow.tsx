@@ -1,0 +1,52 @@
+import { LUCIDOS_TIER_VOCABULARY, PROVIDER_DEFAULT_EFFORT_LABEL } from '../../store/actions/models';
+import {
+  saveModelSelection,
+  storedBackgroundSelection,
+  type BackgroundModelKey,
+  type BackgroundReasoningKey,
+} from '../../store/actions/preferences';
+import { ModelSelectionRow } from './ModelSelectionRow';
+import { backgroundModelChoices, backgroundRowCaveat } from './backgroundModels';
+import type { BackgroundRows } from './useBackgroundModels';
+
+export function BackgroundModelRow({
+  label,
+  fieldLabel,
+  anchor,
+  nested,
+  modelKey,
+  reasoningKey,
+  background,
+}: {
+  label: string;
+  fieldLabel?: string;
+  anchor?: string;
+  nested?: boolean;
+  modelKey: BackgroundModelKey;
+  reasoningKey: BackgroundReasoningKey;
+  background: BackgroundRows;
+}) {
+  const resolved = background.row(modelKey);
+  const stored = storedBackgroundSelection(modelKey, reasoningKey);
+  const model = stored.model ?? resolved?.model ?? '';
+  const caveat = backgroundRowCaveat(resolved, stored.model ? null : background.error);
+  return (
+    <ModelSelectionRow
+      label={label}
+      fieldLabel={fieldLabel}
+      anchor={anchor}
+      nested={nested}
+      detail={caveat && <span class="error-text">{caveat}</span>}
+      models={backgroundModelChoices(
+        resolved?.recommended ?? [],
+        model,
+        resolved?.needs_vision ?? false,
+      )}
+      vocabulary={LUCIDOS_TIER_VOCABULARY}
+      model={model}
+      effort={stored.effort ?? resolved?.effort ?? null}
+      unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
+      onChange={(p) => void saveModelSelection(modelKey, reasoningKey, p)}
+    />
+  );
+}

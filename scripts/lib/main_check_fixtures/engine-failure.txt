@@ -1,0 +1,25 @@
+test voice::tests::the_talker_is_told_how_technical_to_be ... ok
+test voice::tests::the_talker_is_told_it_can_neither_act_nor_invent ... ok
+test voice::tests::the_talker_is_told_the_caller_can_settle_things_out_loud ... ok
+test voice::tests::the_talker_is_told_which_language_to_speak ... ok
+test voice::tests::the_talker_may_say_how_it_works ... ok
+test voice::tests::two_calls_on_one_workspace_open_with_the_same_prefix ... ok
+test voice::wire::tests::client_frames_name_nothing ... ok
+test voice::wire::tests::the_audio_spec_names_only_the_pcm ... ok
+test voice::wire::tests::the_client_can_only_say_three_things ... ok
+test voice::sections::tests::a_running_thread_reaches_the_block ... ok
+test voice::sections::tests::the_calls_own_thread_is_marked_and_a_nameless_one_still_has_a_name ... ok
+test voice::tests::nothing_shipping_calls_the_doer_by_its_old_name ... ok
+
+failures:
+
+---- engine::git_ops::answer_tests::unmeetable_timeout_errors_and_classifies_unknown stdout ----
+
+thread 'engine::git_ops::answer_tests::unmeetable_timeout_errors_and_classifies_unknown' (22886) panicked at crates/lucidos-engine/src/engine/git_ops/../git_ops_tests/answer.rs:148:22:
+a 1ns ceiling cannot be met by a process spawn: Output { status: ExitStatus(unix_wait_status(0)), stdout: "fb9f1faf422ee80aa785a932db6899b98acec485\n", stderr: "" }
+
+
+failures:
+    engine::git_ops::answer_tests::unmeetable_timeout_errors_and_classifies_unknown
+
+test result: FAILED. 11174 passed; 1 failed; 8 ignored; 0 measured; 0 filtered out; finished in 1020.95s

@@ -1,0 +1,694 @@
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
+
+/// INVARIANT: The gateway route every engine reads, under its auth mount.
+const USERS_PATH: &str = "/~/api/v1/auth/users";
+// An older gateway serves this name. See "User rename wire aliases" in
+// docs/temporary-measures.md.
+const LEGACY_USERS_PATH: &str = "/~/api/v1/auth/operators";
+
+const GATEWAY_TIMEOUT: Duration = Duration::from_secs(5);
+
+static GATEWAY_PORT: OnceLock<String> = OnceLock::new();
+
+static FIRST_ANSWER: FirstAnswer = FirstAnswer::new();
+
+struct FirstAnswer {
+    answered: AtomicBool,
+    changed: AtomicBool,
+    arrived: tokio::sync::Notify,
+}
+
+impl FirstAnswer {
+    const fn new() -> Self {
+        Self {
+            answered: AtomicBool::new(false),
+            changed: AtomicBool::new(false),
+            arrived: tokio::sync::Notify::const_new(),
+        }
+    }
+
+    fn has_arrived(&self) -> bool {
+        self.answered.load(Ordering::SeqCst)
+    }
+
+    fn record(&self, changed: bool) {
+        self.changed.store(changed, Ordering::SeqCst);
+        self.answered.store(true, Ordering::SeqCst);
+        self.arrived.notify_waiters();
+    }
+
+    async fn changed(&self) -> bool {
+        loop {
+            let arrived = self.arrived.notified();
+            if self.has_arrived() {
+                return self.changed.load(Ordering::SeqCst);
+            }
+            arrived.await;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub emails: Vec<String>,
+    #[serde(default)]
+    pub device_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayedUser {
+    pub device_id: String,
+    #[serde(alias = "operator_id")]
+    pub user_id: String,
+    pub name: String,
+    pub via: String,
+    #[serde(default)]
+    pub emails: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UserRef {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UserListing {
+    pub id: String,
+    pub name: String,
+    pub has_device: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSnapshot {
+    #[serde(default, alias = "operators")]
+    pub users: Vec<User>,
+    #[serde(default)]
+    pub relayed: Vec<RelayedUser>,
+}
+
+impl UserSnapshot {
+    pub fn user_of_device(&self, device_id: &str) -> Option<UserRef> {
+        if let Some(user) = self
+            .users
+            .iter()
+            .find(|o| o.device_ids.iter().any(|d| d == device_id))
+        {
+            return Some(UserRef {
+                id: user.id.clone(),
+                name: user.name.clone(),
+            });
+        }
+        let relayed = self.relayed.iter().find(|r| r.device_id == device_id)?;
+        Some(UserRef {
+            id: self.relayed_user_id(relayed).to_string(),
+            name: self.relayed_display_name(relayed),
+        })
+    }
+
+    /// INVARIANT: How a relayed user reads: the local name once merged by email, else
+    /// their own name. The gateway label joins it, "Sam (A)", only when
+    /// another distinct user holds the same name (trimmed, any case).
+    /// `gateway_user_names.json` pins this rule for the frontend copy.
+    fn relayed_display_name(&self, relayed: &RelayedUser) -> String {
+        if let Some(local) = self.local_of_relayed(relayed) {
+            return local.name.clone();
+        }
+        let key = |name: &str| name.trim().to_lowercase();
+        let own = key(&relayed.name);
+        let name = relayed.name.trim();
+        let shared = self.users.iter().any(|o| key(&o.name) == own)
+            || self.relayed.iter().any(|r| {
+                r.user_id != relayed.user_id
+                    && self.local_of_relayed(r).is_none()
+                    && key(&r.name) == own
+            });
+        if shared {
+            format!("{name} ({})", relayed.via)
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn local_of_relayed(&self, relayed: &RelayedUser) -> Option<&User> {
+        let emails: std::collections::BTreeSet<String> = self
+            .relayed
+            .iter()
+            .filter(|r| r.user_id == relayed.user_id)
+            .flat_map(|r| r.emails.iter().map(|e| e.trim().to_lowercase()))
+            .collect();
+        self.users
+            .iter()
+            .find(|o| o.emails.iter().any(|e| emails.contains(&e.to_lowercase())))
+    }
+
+    fn relayed_user_id<'a>(&'a self, relayed: &'a RelayedUser) -> &'a str {
+        self.local_of_relayed(relayed)
+            .map_or(relayed.user_id.as_str(), |o| o.id.as_str())
+    }
+
+    pub fn user_ids(&self) -> std::collections::BTreeSet<&str> {
+        self.users
+            .iter()
+            .map(|o| o.id.as_str())
+            .chain(self.relayed.iter().map(|r| self.relayed_user_id(r)))
+            .collect()
+    }
+
+    pub fn user_of_email(&self, email: &str) -> Option<UserRef> {
+        let email = email.trim().to_lowercase();
+        self.users
+            .iter()
+            .find(|o| o.emails.iter().any(|e| e.to_lowercase() == email))
+            .map(|o| UserRef {
+                id: o.id.clone(),
+                name: o.name.clone(),
+            })
+    }
+
+    pub fn user_of_id(&self, user_id: &str) -> Option<UserRef> {
+        if let Some(user) = self.users.iter().find(|o| o.id == user_id) {
+            return Some(UserRef {
+                id: user.id.clone(),
+                name: user.name.clone(),
+            });
+        }
+        let relayed = self
+            .relayed
+            .iter()
+            .find(|r| self.relayed_user_id(r) == user_id)?;
+        self.user_of_device(&relayed.device_id)
+    }
+
+    pub fn user_of_origin(
+        &self,
+        origin: &crate::engine::thread_events::MessageOrigin,
+    ) -> Option<UserRef> {
+        use crate::engine::thread_events::{EngineReason, MessageOrigin};
+        match origin {
+            MessageOrigin::Device { device_id } => self.user_of_device(device_id),
+            MessageOrigin::Engine {
+                reason:
+                    EngineReason::Scheduler {
+                        actor_email: Some(email),
+                        ..
+                    },
+            } => self.user_of_email(email),
+            _ => None,
+        }
+    }
+
+    pub fn user_count(&self) -> usize {
+        self.user_ids().len()
+    }
+
+    pub fn speaker_of_device(&self, device_id: Option<&str>) -> String {
+        device_id
+            .filter(|_| self.user_count() >= 2)
+            .and_then(|id| self.user_of_device(id))
+            .map_or_else(|| "User".to_string(), |o| o.name)
+    }
+
+    pub fn listings(&self) -> Vec<UserListing> {
+        self.user_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let who = self.user_of_id(id)?;
+                Some(UserListing {
+                    has_device: !self.devices_of(id).is_empty(),
+                    id: who.id,
+                    name: who.name,
+                })
+            })
+            .collect()
+    }
+
+    pub fn devices_of(&self, user_id: &str) -> Vec<&str> {
+        let local = self
+            .users
+            .iter()
+            .filter(|o| o.id == user_id)
+            .flat_map(|o| o.device_ids.iter().map(String::as_str));
+        let relayed = self
+            .relayed
+            .iter()
+            .filter(|r| self.relayed_user_id(r) == user_id)
+            .map(|r| r.device_id.as_str());
+        local.chain(relayed).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reader {
+    Team,
+    User {
+        device_id: String,
+        devices: Vec<String>,
+    },
+}
+
+impl Reader {
+    pub fn of(
+        actor: Option<&crate::engine::thread_events::MessageOrigin>,
+        snapshot: &UserSnapshot,
+    ) -> Self {
+        use crate::engine::thread_events::MessageOrigin;
+        let Some(MessageOrigin::Device { device_id }) = actor else {
+            return Self::Team;
+        };
+        if snapshot.user_count() < 2 {
+            return Self::Team;
+        }
+        match snapshot.user_of_device(device_id) {
+            Some(user) => Self::User {
+                device_id: device_id.clone(),
+                devices: snapshot
+                    .devices_of(&user.id)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+            None => Self::Team,
+        }
+    }
+
+    pub fn devices(&self) -> Option<&[String]> {
+        match self {
+            Self::Team => None,
+            Self::User { devices, .. } => Some(devices),
+        }
+    }
+}
+
+fn snapshot_slot() -> &'static RwLock<Arc<UserSnapshot>> {
+    static SLOT: OnceLock<RwLock<Arc<UserSnapshot>>> = OnceLock::new();
+    SLOT.get_or_init(RwLock::default)
+}
+
+pub fn current() -> Arc<UserSnapshot> {
+    snapshot_slot()
+        .read()
+        .map(|s| Arc::clone(&s))
+        .unwrap_or_default()
+}
+
+/// INVARIANT: The user list, or `None` while the gateway has not answered yet. Until
+/// then a team reads as one user, so a decision that differs between the
+/// two must wait. An engine with no gateway knows its list: it is empty.
+pub fn known() -> Option<Arc<UserSnapshot>> {
+    let waiting = GATEWAY_PORT.get().is_some() && !FIRST_ANSWER.has_arrived();
+    (!waiting).then(current)
+}
+
+fn install(snapshot: UserSnapshot) {
+    if let Ok(mut slot) = snapshot_slot().write() {
+        *slot = Arc::new(snapshot);
+    }
+}
+
+pub fn enable() {
+    let Ok(port) = std::env::var("LUCIDOS_GATEWAY_PORT") else {
+        return;
+    };
+    let _ = GATEWAY_PORT.set(port.clone());
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        FIRST_ANSWER.record(read_until_answered(&port).await);
+    });
+}
+
+async fn read_until_answered(port: &str) -> bool {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match read_and_install(port).await {
+            Ok(changed) => return changed,
+            Err(e) => log_legacy!(
+                "[Users] could not read users from the gateway, retrying in {}s: {}",
+                wait.as_secs(),
+                e
+            ),
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(MAX_RETRY_WAIT);
+    }
+}
+
+/// INVARIANT: Wait for the gateway's first answer, at most one gateway timeout, so the
+/// engine does not serve a team as one user while it boots. Returns at once
+/// without a gateway. Past the timeout the retry goes on in the background.
+///
+/// Returns whether the engine may serve with nothing owed. `false` means it
+/// serves before the answer, so the caller owes [`late_first_answer`].
+pub async fn await_first_answer() -> bool {
+    if GATEWAY_PORT.get().is_none() {
+        return true;
+    }
+    let in_time = tokio::time::timeout(GATEWAY_TIMEOUT, FIRST_ANSWER.changed())
+        .await
+        .is_ok();
+    if !in_time {
+        log_legacy!("[Users] serving before the gateway named its users");
+    }
+    in_time
+}
+
+/// INVARIANT: The first answer of a gateway that was late with it. Returns whether it
+/// changed the user list. The engine served the earlier list meanwhile, so a
+/// change is one every reader must hear.
+pub async fn late_first_answer() -> bool {
+    FIRST_ANSWER.changed().await
+}
+
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+
+async fn read_and_install(port: &str) -> Result<bool, String> {
+    let snapshot = fetch(port).await?;
+    let changed = *current() != snapshot;
+    install(snapshot);
+    Ok(changed)
+}
+
+pub async fn refresh() -> bool {
+    match GATEWAY_PORT.get() {
+        Some(port) => read_until_answered(port).await,
+        None => false,
+    }
+}
+
+async fn fetch(port: &str) -> Result<UserSnapshot, String> {
+    let client = crate::gateway_auth::client_builder()
+        .timeout(GATEWAY_TIMEOUT)
+        .build()
+        .map_err(|e| format!("could not build a gateway client: {e}"))?;
+    let origin = lucidos_local_token::client::origin(port);
+    for path in [USERS_PATH, LEGACY_USERS_PATH] {
+        let response = client
+            .get(format!("{origin}{path}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        match response.status() {
+            reqwest::StatusCode::NOT_FOUND if path == USERS_PATH => continue,
+            reqwest::StatusCode::NOT_FOUND => return Ok(UserSnapshot::default()),
+            status if status.is_success() => {
+                return response.json().await.map_err(|e| e.to_string());
+            }
+            status => return Err(format!("HTTP {status}")),
+        }
+    }
+    Err("the gateway answered neither users route".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_late_first_answer_reports_whether_the_list_changed() {
+        let late = std::sync::Arc::new(FirstAnswer::new());
+        let waiter = tokio::spawn({
+            let late = late.clone();
+            async move { late.changed().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "nothing has answered yet");
+        late.record(true);
+        assert!(waiter.await.unwrap());
+        assert!(
+            late.changed().await,
+            "a waiter after the answer hears it too"
+        );
+
+        let unchanged = FirstAnswer::new();
+        unchanged.record(false);
+        assert!(!unchanged.changed().await);
+    }
+
+    fn snapshot() -> UserSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "users": [
+                { "id": "op-1", "name": "Sam", "emails": ["sam@example.com"], "device_ids": ["d1", "d2"] },
+                { "id": "op-2", "name": "Alex", "emails": [], "device_ids": [] }
+            ],
+            "relayed": [
+                { "device_id": "pair:d9", "user_id": "pair:op-7", "name": "Robin", "via": "laptop" }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_device_resolves_to_its_user_local_or_relayed() {
+        let snapshot = snapshot();
+        assert_eq!(snapshot.user_of_device("d2").unwrap().name, "Sam");
+        assert_eq!(snapshot.user_of_device("pair:d9").unwrap().name, "Robin");
+        assert_eq!(snapshot.user_of_device("nobody"), None);
+    }
+
+    #[test]
+    fn an_user_id_names_its_user_local_relayed_or_nobody() {
+        let snapshot = snapshot();
+        assert_eq!(snapshot.user_of_id("op-2").unwrap().name, "Alex");
+        assert_eq!(snapshot.user_of_id("pair:op-7").unwrap().name, "Robin");
+        assert_eq!(snapshot.user_of_id("op-removed"), None);
+    }
+
+    #[test]
+    fn an_email_matches_its_user_whatever_the_case() {
+        let snapshot = snapshot();
+        assert_eq!(
+            snapshot.user_of_email(" SAM@Example.com").unwrap().id,
+            "op-1"
+        );
+        assert_eq!(snapshot.user_of_email("stranger@example.com"), None);
+    }
+
+    #[test]
+    fn an_origin_resolves_through_its_device_or_its_actor_email() {
+        use crate::engine::thread_events::{EngineReason, MessageOrigin};
+        let snapshot = snapshot();
+        let fire = |actor_email: Option<&str>| {
+            MessageOrigin::engine(EngineReason::Scheduler {
+                trigger_id: "t-1".into(),
+                trigger_name: None,
+                actor_email: actor_email.map(str::to_string),
+            })
+        };
+        let device = MessageOrigin::Device {
+            device_id: "d1".into(),
+        };
+        assert_eq!(snapshot.user_of_origin(&device).unwrap().id, "op-1");
+        assert_eq!(
+            snapshot
+                .user_of_origin(&fire(Some("sam@example.com")))
+                .unwrap()
+                .id,
+            "op-1"
+        );
+        assert_eq!(
+            snapshot.user_of_origin(&fire(Some("stranger@example.com"))),
+            None
+        );
+        assert_eq!(snapshot.user_of_origin(&fire(None)), None);
+        assert_eq!(snapshot.user_of_origin(&MessageOrigin::System), None);
+    }
+
+    #[test]
+    fn a_user_with_no_devices_holds_none() {
+        let snapshot = snapshot();
+        assert!(snapshot.devices_of("op-2").is_empty());
+        assert!(snapshot.devices_of("unknown").is_empty());
+        assert_eq!(snapshot.devices_of("op-1").len(), 2);
+    }
+
+    #[test]
+    fn the_users_list_names_everyone_once_and_marks_who_has_no_device() {
+        let user = |id: &str, name: &str, has_device: bool| UserListing {
+            id: id.into(),
+            name: name.into(),
+            has_device,
+        };
+        assert_eq!(
+            snapshot().listings(),
+            vec![
+                user("op-1", "Sam", true),
+                user("op-2", "Alex", false),
+                user("pair:op-7", "Robin", true),
+            ]
+        );
+
+        let mut solo = snapshot();
+        solo.users.truncate(1);
+        solo.relayed[0].emails = vec!["sam@example.com".into()];
+        assert_eq!(solo.listings(), vec![user("op-1", "Sam", true)]);
+    }
+
+    #[test]
+    fn a_reader_is_a_user_only_on_a_team_gateway() {
+        use crate::engine::thread_events::MessageOrigin;
+        let device = |id: &str| MessageOrigin::Device {
+            device_id: id.into(),
+        };
+        let team = snapshot();
+        assert_eq!(
+            Reader::of(Some(&device("d2")), &team),
+            Reader::User {
+                device_id: "d2".into(),
+                devices: vec!["d1".into(), "d2".into()],
+            }
+        );
+        assert_eq!(Reader::of(Some(&device("stray")), &team), Reader::Team);
+        assert_eq!(
+            Reader::of(Some(&MessageOrigin::System), &team),
+            Reader::Team
+        );
+        assert_eq!(Reader::of(None, &team), Reader::Team);
+
+        let mut alone = team.clone();
+        alone.users.truncate(1);
+        alone.relayed.clear();
+        assert_eq!(Reader::of(Some(&device("d1")), &alone), Reader::Team);
+    }
+
+    #[test]
+    fn a_relayed_user_with_a_local_email_is_that_user() {
+        use crate::engine::thread_events::MessageOrigin;
+        let mut solo = snapshot();
+        solo.users.truncate(1);
+        solo.relayed[0].emails = vec!["SAM@example.com".into()];
+        assert_eq!(solo.user_count(), 1, "one human counts once");
+        let relayed = solo.user_of_device("pair:d9").unwrap();
+        assert_eq!(
+            (relayed.id.as_str(), relayed.name.as_str()),
+            ("op-1", "Sam"),
+            "a merged device shows the local name"
+        );
+        assert_eq!(solo.devices_of("op-1"), vec!["d1", "d2", "pair:d9"]);
+
+        let mut phone = solo.relayed[0].clone();
+        phone.device_id = "pair:d8".into();
+        phone.emails.clear();
+        solo.relayed.push(phone);
+        assert_eq!(solo.user_count(), 1);
+        assert_eq!(solo.user_of_device("pair:d8").unwrap().id, "op-1");
+        let laptop = MessageOrigin::Device {
+            device_id: "pair:d9".into(),
+        };
+        assert_eq!(Reader::of(Some(&laptop), &solo), Reader::Team);
+
+        solo.relayed.truncate(1);
+        solo.relayed[0].emails = vec!["robin@example.com".into()];
+        assert_eq!(solo.user_count(), 2, "someone else's email is someone else");
+    }
+
+    #[test]
+    fn relayed_names_follow_the_shared_fixture() {
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("gateway_user_names.json")).unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let snapshot: UserSnapshot = serde_json::from_value(case["snapshot"].clone()).unwrap();
+            for (device_id, expected) in case["names"].as_object().unwrap() {
+                assert_eq!(
+                    snapshot.user_of_device(device_id).unwrap().name,
+                    expected.as_str().unwrap(),
+                    "{}: {device_id}",
+                    case["case"]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_gateway_keeps_local_and_relayed_users() {
+        let (port, server) = legacy_gateway(
+            axum::http::StatusCode::NOT_FOUND,
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let result = fetch(&port).await;
+        server.abort();
+        let snapshot = result.unwrap();
+        assert_eq!(snapshot.user_count(), 2);
+        assert_eq!(snapshot.user_of_device("sam-phone").unwrap().name, "Sam");
+        assert_eq!(
+            snapshot.user_of_device("pair:kim-phone").unwrap().name,
+            "Kim"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_two_missing_user_routes_mean_a_gateway_has_no_users() {
+        for status in [
+            axum::http::StatusCode::NOT_FOUND,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let (port, server) = legacy_gateway(axum::http::StatusCode::NOT_FOUND, status).await;
+            let result = fetch(&port).await;
+            server.abort();
+            if status == axum::http::StatusCode::NOT_FOUND {
+                assert_eq!(result.unwrap(), UserSnapshot::default());
+            } else {
+                assert!(result.is_err(), "a failed legacy read must retry");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_current_route_never_falls_back_to_legacy_users() {
+        let (port, server) = legacy_gateway(
+            axum::http::StatusCode::FORBIDDEN,
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let result = fetch(&port).await;
+        server.abort();
+        assert!(result.is_err());
+    }
+
+    async fn legacy_gateway(
+        current_status: axum::http::StatusCode,
+        status: axum::http::StatusCode,
+    ) -> (String, lucidos_local_token::test_support::StandIn) {
+        let router = axum::Router::new()
+            .route(
+                USERS_PATH,
+                axum::routing::get(move || async move { current_status }),
+            )
+            .route(
+                "/~/api/v1/auth/operators",
+                axum::routing::get(move || async move {
+                    (
+                        status,
+                        axum::Json(serde_json::json!({
+                            "operators": [{
+                                "id": "sam", "name": "Sam", "device_ids": ["sam-phone"]
+                            }],
+                            "relayed": [{
+                                "device_id": "pair:kim-phone", "operator_id": "pair:kim",
+                                "name": "Kim", "via": "Remote"
+                            }]
+                        })),
+                    )
+                }),
+            );
+        let server = lucidos_local_token::test_support::serve_https(router);
+        (server.port().to_string(), server)
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_does_not_answer_is_an_error_not_an_empty_list() {
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = unused.local_addr().unwrap().port().to_string();
+        drop(unused);
+        assert!(fetch(&port).await.is_err());
+    }
+}

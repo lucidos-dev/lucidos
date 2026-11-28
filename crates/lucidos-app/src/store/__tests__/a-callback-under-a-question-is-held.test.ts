@@ -1,0 +1,110 @@
+import { describe, it, expect } from 'vitest';
+import {
+  exchangeStatus,
+  groupIntoExchanges,
+  type Exchange,
+  type StoredEvent,
+  type ThreadEvent,
+} from '../thread-events';
+import { statusLabel } from '../exchange-status';
+
+function ev(seq: number, e: ThreadEvent, id?: string): readonly [number, StoredEvent] {
+  const created = `2026-09-24T18:49:${String(seq).padStart(2, '0')}Z`;
+  return [seq, { ...e, created, ...(id ? { _eventId: id } : {}) } as StoredEvent] as const;
+}
+
+const QUESTION: ThreadEvent = {
+  type: 'UserQuestionAsked',
+  tool_use_id: 'tu1',
+  cc_session_id: '',
+  question: 'How should I handle the proxy timeout session?',
+  options: [{ id: 'opt-0', label: 'Build move-to-top-level' }],
+};
+
+const CHILD_RETURNED = {
+  type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done',
+} as ThreadEvent;
+
+const DELIVERY_ANCHOR = {
+  type: 'PromptInjected', text: 'An event you subscribed to has arrived', mode: 'agent',
+} as ThreadEvent;
+
+function parkedStatus(exchanges: Exchange[], index: number, threadIsCC = false) {
+  const isLast = index === exchanges.length - 1;
+  return exchangeStatus(exchanges[index], '', isLast, false, threadIsCC, true, true);
+}
+
+describe('a callback under an open question', () => {
+  const exchanges = groupIntoExchanges(new Map([
+    ev(1, { type: 'MessageReceived', text: 'run the loop' }),
+    ev(2, QUESTION),
+    ev(3, CHILD_RETURNED),
+    ev(4, DELIVERY_ANCHOR, 'anchor-1'),
+  ]));
+  const last = exchanges.length - 1;
+
+  it('is held, never "Requesting"', () => {
+    expect(exchanges[last].userEvent.type).toBe('PromptInjected');
+    expect(parkedStatus(exchanges, last)).toBe('held');
+    expect(statusLabel('held', false).label).toBe('Not read yet');
+  });
+
+  it('leaves the question itself asking for the answer', () => {
+    const divider = exchanges.findIndex(e => e.userEvent.type === 'UserQuestionAsked');
+    expect(parkedStatus(exchanges, divider)).toBe('awaiting-answer');
+  });
+
+  it('holds a returned child the same way when it is the newest card', () => {
+    const childLast = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'run the loop' }),
+      ev(2, QUESTION),
+      ev(3, CHILD_RETURNED),
+    ]));
+    expect(parkedStatus(childLast, childLast.length - 1)).toBe('held');
+  });
+
+  it('holds an older callback behind the card, not only the newest', () => {
+    const older = exchanges.findIndex(e => e.userEvent.type === 'ChildThreadCompleted');
+    expect(older).toBeLessThan(last);
+    const behind = exchangeStatus(exchanges[older], '', false, false, false, true, true, true);
+    expect(behind).toBe('held');
+    expect(exchangeStatus(exchanges[older], '', false, false, false, true, true, false)).not.toBe('held');
+  });
+
+  it.each([
+    { callbacks: [] },
+    { callbacks: [CHILD_RETURNED] },
+  ])('keeps a stopped child note visible while parked with callbacks $callbacks', ({ callbacks }) => {
+    const stopped = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'run the loop' }),
+      ev(2, QUESTION),
+      ...callbacks.map((callback, i) => ev(3 + i, callback)),
+      ev(4, { type: 'ChildThreadStopped', child_thread_id: 'c2' }),
+    ]));
+    const i = stopped.length - 1;
+    expect(stopped[i].userEvent.type).toBe('ChildThreadStopped');
+    expect(exchangeStatus(stopped[i], '', true, false, false, true, true, true)).toBe('done');
+  });
+
+  it('never holds a change record, which the agent does not read', () => {
+    const applied = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'run the loop' }),
+      ev(2, QUESTION),
+      ev(3, { type: 'ChangeApplied', change_id: 'ch1' } as ThreadEvent),
+    ]));
+    const i = applied.length - 1;
+    expect(applied[i].userEvent.type).toBe('ChangeApplied');
+    expect(exchangeStatus(applied[i], '', true, false, true, true, true, true)).not.toBe('held');
+  });
+
+  it('holds on a coding-agent thread too', () => {
+    expect(parkedStatus(exchanges, last,  true)).toBe('held');
+  });
+
+  it('reads "Requesting" as soon as the user answers', () => {
+    const answered = exchangeStatus(exchanges[last], '', true, false, false, false, true);
+    expect(answered).toBe('pending');
+    const resumed = exchangeStatus(exchanges[last], '', true, false, false, false, false);
+    expect(resumed).toBe('pending');
+  });
+});

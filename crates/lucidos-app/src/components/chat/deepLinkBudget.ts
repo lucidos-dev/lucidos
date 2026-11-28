@@ -1,0 +1,2 @@
+export const EVENT_RESOLVE_DEADLINE_MS = 4000;
+export const EVENT_RESOLVE_MAX_WAIT_MS = 20000;

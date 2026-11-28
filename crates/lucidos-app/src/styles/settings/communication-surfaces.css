@@ -1,0 +1,32 @@
+
+.surfaces-sample-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    justify-content: flex-end;
+}
+
+.surfaces-banner-preview {
+    margin-top: var(--space-sm);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-surface) * 0.5);
+    overflow: clip;
+}
+
+.surfaces-banner-preview > * {
+    border-bottom: none;
+}
+
+.surfaces-popover-previews {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-md);
+    margin-top: var(--space-sm);
+}
+
+.surfaces-popover-preview {
+    flex: 1 1 18rem;
+    max-width: 24rem;
+    overflow: hidden;
+}

@@ -1,0 +1,3449 @@
+use super::*;
+
+fn default_authorize_params() -> AuthorizeParams {
+    AuthorizeParams::parse(None).expect("the default parses")
+}
+
+#[test]
+fn merge_scopes_adds_new_without_duplicates() {
+    let existing = "openid email https://www.googleapis.com/auth/gmail.readonly";
+    let requested = "https://www.googleapis.com/auth/calendar.readonly";
+    let merged = merge_scopes(existing, requested);
+    assert_eq!(
+        merged,
+        "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly"
+    );
+}
+
+#[test]
+fn merge_scopes_deduplicates() {
+    let existing = "openid email";
+    let requested = "email https://www.googleapis.com/auth/calendar.readonly";
+    let merged = merge_scopes(existing, requested);
+    assert_eq!(
+        merged,
+        "openid email https://www.googleapis.com/auth/calendar.readonly"
+    );
+}
+
+#[test]
+fn merge_scopes_empty_existing() {
+    let merged = merge_scopes("", "openid email");
+    assert_eq!(merged, "openid email");
+}
+
+#[test]
+fn merge_scopes_empty_requested() {
+    let merged = merge_scopes("openid email", "");
+    assert_eq!(merged, "openid email");
+}
+
+#[test]
+fn merge_scopes_all_duplicates() {
+    let merged = merge_scopes("openid email", "openid email");
+    assert_eq!(merged, "openid email");
+}
+
+fn make_account(
+    provider: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    token_expiry: Option<DateTime<Utc>>,
+) -> OAuthAccount {
+    OAuthAccount {
+        id: Uuid::new_v4(),
+        provider: provider.to_string(),
+        email: Some("test@example.com".to_string()),
+        display_name: None,
+        desired_scopes: None,
+        access_token: access_token.to_string(),
+        refresh_token: refresh_token.map(|s| s.to_string()),
+        token_expiry,
+        scopes: "openid email".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn token_needs_refresh_when_expired() {
+    let expired = Utc::now() - chrono::Duration::seconds(300);
+    let account = make_account("google", "old-token", Some("refresh-tok"), Some(expired));
+    assert!(
+        token_needs_refresh(&account),
+        "expired token should need refresh"
+    );
+}
+
+#[test]
+fn token_needs_refresh_when_expiring_within_60s() {
+    let soon = Utc::now() + chrono::Duration::seconds(30);
+    let account = make_account("google", "token", Some("refresh-tok"), Some(soon));
+    assert!(
+        token_needs_refresh(&account),
+        "token expiring in 30s should need refresh"
+    );
+}
+
+#[test]
+fn token_does_not_need_refresh_when_valid() {
+    let future = Utc::now() + chrono::Duration::seconds(3600);
+    let account = make_account("google", "token", Some("refresh-tok"), Some(future));
+    assert!(
+        !token_needs_refresh(&account),
+        "token valid for 1h should not need refresh"
+    );
+}
+
+#[test]
+fn token_needs_refresh_when_expiry_null_with_refresh_token() {
+    let account = make_account("google", "token", Some("refresh-tok"), None);
+    assert!(
+        token_needs_refresh(&account),
+        "null expiry with refresh token should need refresh"
+    );
+}
+
+#[test]
+fn token_does_not_need_refresh_when_expiry_null_without_refresh_token() {
+    let account = make_account("github", "ghp_token", None, None);
+    assert!(
+        !token_needs_refresh(&account),
+        "null expiry without refresh token should not refresh"
+    );
+}
+
+#[test]
+fn token_does_not_need_refresh_well_beyond_boundary() {
+    let expiry = Utc::now() + chrono::Duration::seconds(61);
+    let account = make_account("google", "token", Some("refresh-tok"), Some(expiry));
+    assert!(
+        !token_needs_refresh(&account),
+        "token expiring in 61s should not need refresh"
+    );
+}
+
+#[test]
+fn token_needs_refresh_at_59s() {
+    let expiry = Utc::now() + chrono::Duration::seconds(59);
+    let account = make_account("google", "token", Some("refresh-tok"), Some(expiry));
+    assert!(
+        token_needs_refresh(&account),
+        "token expiring in 59s should need refresh"
+    );
+}
+
+fn make_env_account(provider: &str, email: Option<&str>, token: &str) -> OAuthAccount {
+    OAuthAccount {
+        id: Uuid::new_v4(),
+        provider: provider.to_string(),
+        email: email.map(String::from),
+        display_name: None,
+        access_token: token.to_string(),
+        refresh_token: None,
+        token_expiry: None,
+        scopes: String::new(),
+        desired_scopes: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn account_env_vars_injects_access_token_and_email() {
+    let accounts = vec![make_env_account(
+        "google",
+        Some("user@gmail.com"),
+        "ya29.test-token",
+    )];
+    let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+    assert_eq!(
+        map.get("OAUTH_GOOGLE_ACCESS_TOKEN").unwrap(),
+        "ya29.test-token"
+    );
+    assert_eq!(map.get("OAUTH_GOOGLE_EMAIL").unwrap(), "user@gmail.com");
+}
+
+#[test]
+fn account_env_vars_skips_email_when_none() {
+    let accounts = vec![make_env_account("github", None, "ghp_test123")];
+    let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+    assert_eq!(map.get("OAUTH_GITHUB_ACCESS_TOKEN").unwrap(), "ghp_test123");
+    assert!(!map.contains_key("OAUTH_GITHUB_EMAIL"));
+}
+
+#[test]
+fn account_env_vars_normalizes_provider_name() {
+    let accounts = vec![make_env_account("my-provider", None, "tok")];
+    let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+    assert_eq!(map.get("OAUTH_MY_PROVIDER_ACCESS_TOKEN").unwrap(), "tok");
+}
+
+#[test]
+fn account_env_vars_replaces_every_non_identifier_character() {
+    let accounts = vec![make_env_account("acme:cloud+eu", None, "tok")];
+    let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+    assert_eq!(map.get("OAUTH_ACME_CLOUD_EU_ACCESS_TOKEN").unwrap(), "tok");
+}
+
+#[test]
+fn provider_not_connected_msg_names_provider_and_recovery() {
+    let msg = provider_not_connected_msg("google");
+    assert!(msg.contains("google"));
+    assert!(msg.contains("connect_oauth_account"));
+}
+
+#[test]
+fn oauth_client_request_attaches_supplied_endpoints_as_defaults() {
+    let overrides = OAuthClientOverrides {
+        base_url: Some("https://healthcare.googleapis.com".to_string()),
+        auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth".to_string()),
+        token_url: Some("https://oauth2.googleapis.com/token".to_string()),
+        userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".to_string()),
+        userinfo_method: None,
+        authorize_params: None,
+        redirect_uri: Some("http://localhost:14981/oauth/callback".to_string()),
+    };
+    let req = oauth_client_request("ghealth", &overrides);
+    assert_eq!(req["service"], "ghealth");
+    assert_eq!(req["auth_type"], "oauth_client");
+    assert_eq!(
+        req["base_urls"],
+        serde_json::json!(["https://healthcare.googleapis.com"])
+    );
+    assert_eq!(
+        req["defaults"]["auth_url"],
+        "https://accounts.google.com/o/oauth2/v2/auth"
+    );
+    assert_eq!(
+        req["defaults"]["token_url"],
+        "https://oauth2.googleapis.com/token"
+    );
+    assert_eq!(
+        req["defaults"]["userinfo_url"],
+        "https://openidconnect.googleapis.com/v1/userinfo"
+    );
+    assert!(
+        req["defaults"].get("scopes").is_none(),
+        "scopes must never pre-fill a client credential: {req}"
+    );
+    assert_eq!(
+        req["defaults"]["redirect_uri"],
+        "http://localhost:14981/oauth/callback"
+    );
+}
+
+#[test]
+fn oauth_client_request_without_overrides_has_no_defaults_and_falls_back_base_url() {
+    let req = oauth_client_request("acme", &OAuthClientOverrides::default());
+    assert_eq!(req["service"], "acme");
+    assert_eq!(req["base_urls"], serde_json::json!(["https://acme.com"]));
+    assert!(
+        req.get("defaults").is_none(),
+        "no defaults block expected when nothing was supplied: {req}"
+    );
+}
+
+#[test]
+fn oauth_client_request_partial_overrides_only_include_supplied_keys() {
+    let overrides = OAuthClientOverrides {
+        auth_url: Some("https://login.example.com/authorize".to_string()),
+        token_url: Some("https://login.example.com/token".to_string()),
+        ..OAuthClientOverrides::default()
+    };
+    let req = oauth_client_request("example", &overrides);
+    assert_eq!(req["base_urls"], serde_json::json!(["https://example.com"]));
+    assert_eq!(
+        req["defaults"]["auth_url"],
+        "https://login.example.com/authorize"
+    );
+    assert_eq!(
+        req["defaults"]["token_url"],
+        "https://login.example.com/token"
+    );
+    let defaults = req["defaults"].as_object().expect("defaults is an object");
+    assert!(
+        !defaults.contains_key("userinfo_url"),
+        "userinfo_url should be absent: {req}"
+    );
+    assert!(
+        !defaults.contains_key("redirect_uri"),
+        "redirect_uri should be absent: {req}"
+    );
+}
+
+#[test]
+fn debug_redacts_oauth_account_tokens() {
+    let mut account =
+        make_env_account("google", Some("user@gmail.com"), "ya29.super-secret-access");
+    account.refresh_token = Some("1//super-secret-refresh".to_string());
+    let dbg = format!("{:?}", account);
+    assert!(
+        !dbg.contains("ya29.super-secret-access"),
+        "access token leaked: {dbg}"
+    );
+    assert!(
+        !dbg.contains("1//super-secret-refresh"),
+        "refresh token leaked: {dbg}"
+    );
+    assert!(
+        dbg.contains("<redacted>"),
+        "expected redaction marker: {dbg}"
+    );
+    assert!(dbg.contains("google"));
+    assert!(dbg.contains("user@gmail.com"));
+    assert!(
+        dbg.contains("Some(\"<redacted>\")"),
+        "refresh-token presence should still show: {dbg}"
+    );
+}
+
+#[test]
+fn debug_shows_refresh_token_none_when_absent() {
+    let account = make_env_account("github", None, "gho_secret_value");
+    let dbg = format!("{:?}", account);
+    assert!(
+        !dbg.contains("gho_secret_value"),
+        "access token leaked: {dbg}"
+    );
+    assert!(
+        dbg.contains("refresh_token: None"),
+        "absent refresh token should render as None: {dbg}"
+    );
+}
+
+#[tokio::test]
+async fn connect_announces_and_a_token_refresh_does_not() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    async fn emitted(pool: &sqlx::PgPool, event_type: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    let id = OAuthStore::connect(
+        &pool,
+        &bus,
+        "google",
+        Some("user@example.com"),
+        Some("User"),
+        "access",
+        Some("refresh"),
+        None,
+        "openid email",
+        "openid email",
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    assert_eq!(emitted(&pool, "OAuthAccountConnected").await, 1);
+
+    OAuthStore::connect(
+        &pool,
+        &bus,
+        "google",
+        Some("user@example.com"),
+        Some("User"),
+        "access2",
+        Some("refresh"),
+        None,
+        "openid email https://www.googleapis.com/auth/drive",
+        "openid email https://www.googleapis.com/auth/drive",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(emitted(&pool, "OAuthAccountConnected").await, 2);
+
+    OAuthStore::update_tokens(&pool, id, "rotated", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        emitted(&pool, "OAuthAccountConnected").await,
+        2,
+        "a token rotation changes nothing the user can see"
+    );
+
+    assert!(OAuthStore::delete(&pool, &bus, id, None).await.unwrap());
+    assert_eq!(emitted(&pool, "OAuthAccountDeleted").await, 1);
+    assert!(!OAuthStore::delete(&pool, &bus, id, None).await.unwrap());
+    assert_eq!(
+        emitted(&pool, "OAuthAccountDeleted").await,
+        1,
+        "second delete removes nothing and therefore announces nothing"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn get_by_provider_returns_most_recently_connected() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    let old_id = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        None,
+        None,
+        "old-narrow-access",
+        Some("old-refresh"),
+        None,
+        "https://www.googleapis.com/auth/drive.file",
+    )
+    .await
+    .unwrap();
+
+    let new_id = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        Some("User"),
+        "new-broad-access",
+        Some("new-refresh"),
+        None,
+        "openid email https://www.googleapis.com/auth/drive",
+    )
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE oauth_accounts SET created_at = NOW() - INTERVAL '1 day' WHERE id = $1")
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE oauth_accounts SET created_at = NOW() WHERE id = $1")
+        .bind(new_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let resolved = OAuthStore::get_by_provider(&pool, "google")
+        .await
+        .unwrap()
+        .expect("an account should resolve for google");
+    assert_eq!(
+        resolved.id, new_id,
+        "resolver must return the newest connection, not the stale narrow-scope shadow"
+    );
+    assert_eq!(resolved.access_token, "new-broad-access");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn insert_upserts_same_provider_email_in_place() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    let first = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "access-1",
+        Some("refresh-1"),
+        None,
+        "openid email",
+    )
+    .await
+    .unwrap();
+
+    let second = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "access-2",
+        None,
+        None,
+        "openid email https://www.googleapis.com/auth/drive",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first, second,
+        "re-connecting the same provider+email must update in place, not insert a shadow row"
+    );
+    let all = OAuthStore::list(&pool).await.unwrap();
+    assert_eq!(all.len(), 1, "same provider+email must collapse to one row");
+
+    let acct = OAuthStore::get_by_id(&pool, first).await.unwrap().unwrap();
+    assert_eq!(acct.access_token, "access-2");
+    assert_eq!(
+        acct.refresh_token.as_deref(),
+        Some("refresh-1"),
+        "a None refresh token on re-connect must preserve the stored one"
+    );
+    assert!(acct.scopes.contains("drive"), "scopes should be broadened");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_reconnect_that_returns_no_refresh_token_still_holds_one() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+
+    async fn connect(
+        pool: &sqlx::PgPool,
+        bus: &crate::engine::event_bus::EventBus,
+        access_token: &str,
+        refresh_token: Option<&str>,
+    ) -> ConnectedAccount {
+        OAuthStore::connect(
+            pool,
+            bus,
+            "google",
+            Some("user@example.com"),
+            None,
+            access_token,
+            refresh_token,
+            None,
+            "openid email",
+            "openid email offline_access",
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    let first = connect(&pool, &bus, "access-1", Some("refresh-1")).await;
+    assert!(first.has_refresh_token, "the first consent issued one");
+
+    let second = connect(&pool, &bus, "access-2", None).await;
+    assert_eq!(first.id, second.id, "the same row was updated in place");
+    assert!(
+        second.has_refresh_token,
+        "the stored token survives a re-consent that returns none"
+    );
+
+    assert!(
+        OAuthStore::list(&pool).await.unwrap()[0].has_refresh_token,
+        "and the Accounts card reads the same row"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn an_empty_refresh_token_is_no_refresh_token() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+
+    let stored = OAuthStore::connect(
+        &pool,
+        &bus,
+        "acme",
+        None,
+        None,
+        "access",
+        Some(""),
+        None,
+        "read",
+        "read offline_access",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(!stored.has_refresh_token);
+    assert!(!OAuthStore::list(&pool).await.unwrap()[0].has_refresh_token);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn an_empty_refresh_token_keeps_the_stored_one() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+
+    async fn connect(
+        pool: &sqlx::PgPool,
+        bus: &crate::engine::event_bus::EventBus,
+        refresh_token: Option<&str>,
+    ) -> ConnectedAccount {
+        OAuthStore::connect(
+            pool,
+            bus,
+            "acme",
+            Some("user@example.com"),
+            None,
+            "access",
+            refresh_token,
+            None,
+            "read",
+            "read offline_access",
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    let first = connect(&pool, &bus, Some("refresh-1")).await;
+    let second = connect(&pool, &bus, Some("")).await;
+    assert!(
+        second.has_refresh_token,
+        "a reconnect answering \"\" keeps it"
+    );
+
+    OAuthStore::update_tokens(&pool, first.id, "rotated", None, Some(""))
+        .await
+        .unwrap();
+    let stored = OAuthStore::get_by_id(&pool, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-1"));
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+fn token_response(expires_in: Option<u64>) -> TokenResponse {
+    TokenResponse {
+        access_token: "access".to_string(),
+        refresh_token: None,
+        expires_in,
+        token_type: None,
+        scope: None,
+    }
+}
+
+#[test]
+fn expiry_counts_the_lifetime_from_now() {
+    let now = Utc::now();
+    assert_eq!(
+        token_response(Some(3600)).expiry_from(now),
+        Some(now + chrono::Duration::seconds(3600))
+    );
+    assert_eq!(token_response(None).expiry_from(now), None);
+}
+
+#[test]
+fn an_out_of_range_lifetime_is_clamped_not_a_panic() {
+    let now = Utc::now();
+    let cap = Some(now + chrono::Duration::seconds(MAX_TOKEN_LIFETIME_SECS));
+    for huge in [u64::MAX, i64::MAX as u64, 9_999_999_999_999] {
+        assert_eq!(token_response(Some(huge)).expiry_from(now), cap);
+    }
+}
+
+#[tokio::test]
+async fn insert_upserts_no_email_account_in_place() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    let first = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        None,
+        None,
+        "access-1",
+        Some("refresh-1"),
+        None,
+        "https://www.googleapis.com/auth/drive.file",
+    )
+    .await
+    .unwrap();
+
+    let second = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        None,
+        None,
+        "access-2",
+        None,
+        None,
+        "https://www.googleapis.com/auth/drive.file",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first, second,
+        "re-connecting a no-email provider must update the single (provider, NULL) row"
+    );
+    let all = OAuthStore::list(&pool).await.unwrap();
+    assert_eq!(all.len(), 1, "no-email provider must collapse to one row");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn insert_keeps_distinct_emails_as_separate_rows() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+
+    crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("a@example.com"),
+        None,
+        "access-a",
+        None,
+        None,
+        "openid email",
+    )
+    .await
+    .unwrap();
+    crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("b@example.com"),
+        None,
+        "access-b",
+        None,
+        None,
+        "openid email",
+    )
+    .await
+    .unwrap();
+
+    let all = OAuthStore::list(&pool).await.unwrap();
+    assert_eq!(
+        all.len(),
+        2,
+        "distinct emails for one provider must remain separate rows"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn debug_redacts_token_response() {
+    let resp = TokenResponse {
+        access_token: "access-secret-xyz".to_string(),
+        refresh_token: Some("refresh-secret-abc".to_string()),
+        expires_in: Some(3600),
+        token_type: Some("Bearer".to_string()),
+        scope: Some("email".to_string()),
+    };
+    let dbg = format!("{:?}", resp);
+    assert!(
+        !dbg.contains("access-secret-xyz"),
+        "access token leaked: {dbg}"
+    );
+    assert!(
+        !dbg.contains("refresh-secret-abc"),
+        "refresh token leaked: {dbg}"
+    );
+    assert!(
+        dbg.contains("<redacted>"),
+        "expected redaction marker: {dbg}"
+    );
+    assert!(dbg.contains("3600"));
+    assert!(dbg.contains("Bearer"));
+}
+
+fn authorize_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    let raw = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))?;
+    Some(
+        urlencoding::decode(raw)
+            .expect("valid percent-encoding")
+            .into_owned(),
+    )
+}
+
+fn form_value<'a>(form: &'a [(&'static str, &'a str)], key: &str) -> Option<&'a str> {
+    form.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+fn config_with(redirect_uri: Option<&str>, client_secret: Option<&str>) -> serde_json::Value {
+    let mut config = serde_json::json!({ "client_id": "cid-123" });
+    if let Some(uri) = redirect_uri {
+        config["redirect_uri"] = serde_json::Value::String(uri.to_string());
+    }
+    if let Some(secret) = client_secret {
+        config["client_secret"] = serde_json::Value::String(secret.to_string());
+    }
+    config
+}
+
+#[test]
+fn resolve_redirect_uri_defaults_to_the_loopback_ip() {
+    for stored in [None, Some(""), Some("   ")] {
+        let resolved = resolve_redirect_uri(&config_with(stored, Some("s"))).unwrap();
+        assert_eq!(
+            resolved, "http://127.0.0.1:14981/oauth/callback",
+            "stored redirect_uri {stored:?} must resolve to the default"
+        );
+    }
+    assert_eq!(
+        default_redirect_uri(),
+        "http://127.0.0.1:14981/oauth/callback"
+    );
+}
+
+#[test]
+fn resolve_redirect_uri_accepts_every_host_form_the_listener_serves() {
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        let uri = format!("http://{host}:14981/oauth/callback");
+        let resolved = resolve_redirect_uri(&config_with(Some(&uri), Some("s"))).unwrap();
+        assert_eq!(resolved, uri, "{uri} must be accepted verbatim");
+    }
+}
+
+#[test]
+fn resolve_redirect_uri_rejects_a_uri_the_listener_cannot_receive() {
+    let bad = [
+        "http://127.0.0.1:3000/oauth/callback",
+        "http://127.0.0.1:14981/callback",
+        "http://example.com:14981/oauth/callback",
+        "https://127.0.0.1:14981/oauth/callback",
+        "http://127.0.0.1:14981/oauth/callback/",
+    ];
+    for uri in bad {
+        let err = resolve_redirect_uri(&config_with(Some(uri), Some("s")))
+            .expect_err("{uri} must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(uri),
+            "error should name the offending value: {msg}"
+        );
+        assert!(
+            msg.contains("http://127.0.0.1:14981/oauth/callback"),
+            "error should list the accepted forms: {msg}"
+        );
+    }
+}
+
+#[test]
+fn authorize_url_and_token_exchange_send_an_identical_redirect_uri() {
+    for stored in [None, Some("http://localhost:14981/oauth/callback")] {
+        for secret in [Some("client-secret"), None] {
+            let config = config_with(stored, secret);
+            let redirect_uri = resolve_redirect_uri(&config).unwrap();
+            let auth = ClientAuth::from_secret(config["client_secret"].as_str());
+
+            let url = build_authorize_url(
+                "https://login.example.com/authorize",
+                "cid-123",
+                &redirect_uri,
+                "openid email",
+                "the-state",
+                &auth,
+                &default_authorize_params(),
+            );
+            let form = exchange_form("the-code", "cid-123", &redirect_uri, &auth);
+
+            let sent_on_authorize =
+                authorize_param(&url, "redirect_uri").expect("authorize URL carries redirect_uri");
+            let sent_on_exchange =
+                form_value(&form, "redirect_uri").expect("exchange carries redirect_uri");
+
+            assert_eq!(
+                sent_on_authorize,
+                sent_on_exchange,
+                "legs diverged for stored={stored:?} secret={:?}",
+                secret.is_some()
+            );
+            assert_eq!(sent_on_authorize, redirect_uri);
+        }
+    }
+}
+
+const WEB_URI: &str = "https://host.example/~/oauth/callback";
+
+fn gateway_route(local: bool, origin: Option<&str>) -> CallbackRoute {
+    CallbackRoute::Gateway(crate::core::oauth_callback::BrowserContext {
+        prefix: "/dev/".into(),
+        local,
+        origin: origin.map(Into::into),
+    })
+}
+
+fn web_config(listed: &[&str], secret: Option<&str>) -> serde_json::Value {
+    let mut config = config_with(None, secret);
+    config["web_redirect_uris"] = serde_json::json!(listed);
+    config
+}
+
+#[test]
+fn a_local_browser_or_no_gateway_keeps_the_loopback_redirect() {
+    let config = web_config(&[WEB_URI], Some("s"));
+    for route in [
+        CallbackRoute::OwnListener,
+        gateway_route(true, Some("https://host.example")),
+    ] {
+        assert_eq!(
+            redirect_uri_for("acme", &route, &config).unwrap(),
+            default_redirect_uri()
+        );
+    }
+}
+
+#[test]
+fn a_remote_browser_gets_its_listed_web_redirect_uri() {
+    let route = gateway_route(false, Some("https://host.example"));
+    let config = web_config(
+        &[" https://other.example/~/oauth/callback ", WEB_URI],
+        Some("s"),
+    );
+    assert_eq!(redirect_uri_for("acme", &route, &config).unwrap(), WEB_URI);
+}
+
+#[test]
+fn a_remote_browser_never_gets_a_loopback_redirect() {
+    let refusal = |route: CallbackRoute, config: serde_json::Value| {
+        redirect_uri_for("acme", &route, &config)
+            .expect_err("a remote browser cannot follow a loopback redirect")
+            .to_string()
+    };
+    let unlisted = refusal(
+        gateway_route(false, Some("https://host.example")),
+        web_config(&[], Some("s")),
+    );
+    assert!(
+        unlisted.contains(WEB_URI),
+        "names the URI to register: {unlisted}"
+    );
+    assert!(unlisted.contains("Web redirect URIs"), "{unlisted}");
+
+    let plain = refusal(
+        gateway_route(false, Some("http://192.168.1.20:8080")),
+        web_config(&["http://192.168.1.20:8080/~/oauth/callback"], Some("s")),
+    );
+    assert!(plain.contains("https"), "{plain}");
+    for refusal in [&unlisted, &plain] {
+        let toast = format!("OAuth flow failed: {refusal}");
+        assert!(toast.len() <= 200, "fits an error toast: {toast}");
+    }
+
+    let no_origin = refusal(
+        gateway_route(false, None),
+        web_config(&[WEB_URI], Some("s")),
+    );
+    assert!(no_origin.contains("computer running"), "{no_origin}");
+
+    let public = refusal(
+        gateway_route(false, Some("https://host.example")),
+        web_config(&[WEB_URI], None),
+    );
+    assert!(public.contains("client secret"), "{public}");
+}
+
+#[test]
+fn a_web_redirect_uri_is_byte_identical_on_both_legs() {
+    let route = gateway_route(false, Some("https://host.example"));
+    let config = web_config(&[WEB_URI], Some("client-secret"));
+    let redirect_uri = redirect_uri_for("acme", &route, &config).unwrap();
+    let auth = ClientAuth::from_secret(config["client_secret"].as_str());
+    let url = build_authorize_url(
+        "https://login.example.com/authorize",
+        "cid-123",
+        &redirect_uri,
+        "openid email",
+        "the-state",
+        &auth,
+        &default_authorize_params(),
+    );
+    let form = exchange_form("the-code", "cid-123", &redirect_uri, &auth);
+    assert_eq!(
+        authorize_param(&url, "redirect_uri").as_deref(),
+        Some(WEB_URI)
+    );
+    assert_eq!(form_value(&form, "redirect_uri"), Some(WEB_URI));
+}
+
+#[test]
+fn a_credential_with_a_secret_is_a_confidential_client() {
+    let auth = ClientAuth::from_secret(Some("client-secret"));
+    assert_eq!(auth.client_secret(), Some("client-secret"));
+    assert_eq!(auth.code_challenge(), None);
+    assert_eq!(auth.code_verifier(), None);
+
+    let url = build_authorize_url(
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "cid-123",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid email",
+        "the-state",
+        &auth,
+        &default_authorize_params(),
+    );
+    assert_eq!(
+        url,
+        "https://accounts.google.com/o/oauth2/v2/auth\
+         ?client_id=cid-123\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A14981%2Foauth%2Fcallback\
+         &response_type=code\
+         &scope=openid%20email\
+         &state=the-state\
+         &access_type=offline&prompt=consent",
+        "the confidential authorize URL must be exactly what it has always been, \
+         plus the per-flow state"
+    );
+
+    let form = exchange_form(
+        "the-code",
+        "cid-123",
+        "http://127.0.0.1:14981/oauth/callback",
+        &auth,
+    );
+    assert_eq!(
+        form,
+        vec![
+            ("grant_type", "authorization_code"),
+            ("code", "the-code"),
+            ("client_id", "cid-123"),
+            ("client_secret", "client-secret"),
+            ("redirect_uri", "http://127.0.0.1:14981/oauth/callback"),
+        ],
+        "the confidential exchange body must be unchanged, including field order"
+    );
+}
+
+#[test]
+fn a_credential_without_a_secret_is_a_public_client_using_pkce() {
+    for stored in [None, Some(""), Some("  ")] {
+        let auth = ClientAuth::from_secret(stored);
+        assert_eq!(
+            auth.client_secret(),
+            None,
+            "no secret may be sent for {stored:?}"
+        );
+        let challenge = auth
+            .code_challenge()
+            .expect("public client sends a challenge");
+        let verifier = auth
+            .code_verifier()
+            .expect("public client keeps a verifier");
+
+        let url = build_authorize_url(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            "cid-123",
+            "http://127.0.0.1:14981/oauth/callback",
+            "offline_access User.Read",
+            "the-state",
+            &auth,
+            &default_authorize_params(),
+        );
+        assert_eq!(
+            authorize_param(&url, "code_challenge").as_deref(),
+            Some(challenge)
+        );
+        assert_eq!(
+            authorize_param(&url, "code_challenge_method").as_deref(),
+            Some("S256")
+        );
+
+        let form = exchange_form(
+            "the-code",
+            "cid-123",
+            "http://127.0.0.1:14981/oauth/callback",
+            &auth,
+        );
+        assert_eq!(
+            form_value(&form, "client_secret"),
+            None,
+            "a public client must send no secret"
+        );
+        assert_eq!(form_value(&form, "code_verifier"), Some(verifier));
+
+        assert_eq!(
+            Pkce::challenge_for(verifier),
+            challenge,
+            "the redeemed verifier must hash to the advertised challenge"
+        );
+    }
+}
+
+#[test]
+fn pkce_verifier_matches_rfc7636_shape() {
+    let pkce = Pkce::generate();
+    let len = pkce.verifier.len();
+    assert!(
+        (43..=128).contains(&len),
+        "verifier length {len} outside RFC 7636's 43..=128"
+    );
+    assert!(
+        pkce.verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')),
+        "verifier must use only the unreserved set: {}",
+        pkce.verifier
+    );
+    assert_ne!(
+        Pkce::generate().verifier,
+        pkce.verifier,
+        "each flow must get a fresh verifier"
+    );
+}
+
+#[test]
+fn pkce_challenge_matches_the_rfc7636_test_vector() {
+    assert_eq!(
+        Pkce::challenge_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    );
+}
+
+#[test]
+fn debug_redacts_the_pkce_verifier_and_client_secret() {
+    let pkce = Pkce::generate();
+    let verifier = pkce.verifier.clone();
+    let dbg = format!("{:?}", ClientAuth::Public(pkce));
+    assert!(!dbg.contains(&verifier), "PKCE verifier leaked: {dbg}");
+    assert!(
+        dbg.contains("<redacted>"),
+        "expected redaction marker: {dbg}"
+    );
+
+    let dbg = format!("{:?}", ClientAuth::from_secret(Some("super-secret-value")));
+    assert!(
+        !dbg.contains("super-secret-value"),
+        "client secret leaked: {dbg}"
+    );
+}
+
+#[test]
+fn refresh_omits_the_client_secret_for_a_public_client() {
+    let confidential = refresh_form("rt", "cid-123", Some("client-secret"));
+    assert_eq!(
+        confidential,
+        vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "rt"),
+            ("client_id", "cid-123"),
+            ("client_secret", "client-secret"),
+        ],
+        "the confidential refresh body must be unchanged"
+    );
+
+    let public = refresh_form("rt", "cid-123", None);
+    assert_eq!(form_value(&public, "client_secret"), None);
+    assert_eq!(form_value(&public, "refresh_token"), Some("rt"));
+}
+
+#[test]
+fn token_error_surfaces_the_providers_own_words() {
+    let body = r#"{"error":"invalid_request","error_description":"AADSTS90023: The provided value for the input parameter 'redirect_uri' is not valid.","error_codes":[90023],"trace_id":"t","correlation_id":"c"}"#;
+    let msg = describe_token_error(
+        "Token exchange",
+        reqwest::StatusCode::BAD_REQUEST,
+        body,
+        None,
+    );
+    assert!(msg.contains("400 Bad Request"), "{msg}");
+    assert!(msg.contains("invalid_request"), "{msg}");
+    assert!(msg.contains("AADSTS90023"), "{msg}");
+    assert!(msg.contains("error_codes: [90023]"), "{msg}");
+    assert_eq!(
+        msg.matches("Token exchange failed").count(),
+        1,
+        "the leg must be named exactly once, not double-wrapped: {msg}"
+    );
+}
+
+#[test]
+fn token_error_falls_back_to_the_raw_body_when_it_is_not_an_oauth_error() {
+    let msg = describe_token_error(
+        "Token refresh",
+        reqwest::StatusCode::BAD_GATEWAY,
+        "<html><body>Bad gateway</body></html>",
+        None,
+    );
+    assert!(msg.contains("502 Bad Gateway"), "{msg}");
+    assert!(msg.contains("Bad gateway"), "{msg}");
+
+    let empty = describe_token_error(
+        "Token exchange",
+        reqwest::StatusCode::FORBIDDEN,
+        "   ",
+        None,
+    );
+    assert!(empty.contains("empty response body"), "{empty}");
+}
+
+#[test]
+fn token_error_truncates_a_huge_body_on_a_char_boundary() {
+    let body = "é".repeat(5000);
+    let msg = describe_token_error(
+        "Token exchange",
+        reqwest::StatusCode::BAD_REQUEST,
+        &body,
+        None,
+    );
+    assert!(
+        msg.len() < body.len(),
+        "an oversized body must be truncated"
+    );
+}
+
+const INVALID_CLIENT_BODY: &str =
+    r#"{"error":"invalid_client","error_description":"Invalid client_id or client_secret"}"#;
+
+#[test]
+fn an_invalid_client_error_gains_the_hint_and_other_errors_do_not() {
+    let status = reqwest::StatusCode::BAD_REQUEST;
+    let hinted = describe_token_error("Token exchange", status, INVALID_CLIENT_BODY, Some("HINT"));
+    assert_eq!(
+        hinted,
+        "Token exchange failed (400 Bad Request): invalid_client — HINT — \
+         Invalid client_id or client_secret"
+    );
+
+    let other = describe_token_error(
+        "Token exchange",
+        status,
+        r#"{"error":"invalid_grant"}"#,
+        Some("HINT"),
+    );
+    assert!(!other.contains("HINT"), "{other}");
+}
+
+#[test]
+fn the_invalid_client_hint_states_the_client_type_redirect_and_shape_counts() {
+    let secret = ClientAuth::from_secret(Some("a-real-looking-secret"));
+    let hint = invalid_client_hint(
+        "app\u{200b}key",
+        &secret,
+        "http://127.0.0.1:1/oauth/callback",
+    );
+    assert!(
+        hint.starts_with("Re-enter the client secret"),
+        "the fix leads the hint: {hint}"
+    );
+    assert!(hint.contains("http://127.0.0.1:1/oauth/callback"), "{hint}");
+    assert!(
+        hint.contains("1 character outside visible ASCII in the client ID"),
+        "{hint}"
+    );
+    assert!(hint.contains("0 in the client secret"), "{hint}");
+    assert!(
+        !hint.contains("a-real-looking-secret") && !hint.contains("appkey"),
+        "the hint must carry counts, never the values: {hint}"
+    );
+
+    let public = invalid_client_hint("appkey", &ClientAuth::from_secret(None), "http://x/cb");
+    assert!(public.contains("PKCE"), "{public}");
+    assert!(
+        public.contains("add it")
+            && !public.contains("clear it")
+            && !public.contains("in the client secret"),
+        "a public client sent no secret, so the fix is adding one: {public}"
+    );
+}
+
+#[test]
+fn a_client_secret_equal_to_the_client_id_is_detected_after_trimming() {
+    let repeats = |id: &str, secret: Option<&str>| {
+        let mut config = serde_json::json!({ "client_id": id });
+        if let Some(secret) = secret {
+            config["client_secret"] = serde_json::json!(secret);
+        }
+        client_secret_repeats_client_id(&config)
+    };
+    assert!(repeats("abc123", Some("abc123")));
+    assert!(repeats(" abc123", Some("abc123\n")));
+    assert!(!repeats("abc123", Some("different")));
+    assert!(!repeats("abc123", Some("")));
+    assert!(!repeats("abc123", None));
+    assert!(!repeats("", Some("")));
+}
+
+#[tokio::test]
+async fn connecting_with_the_client_id_stored_as_the_secret_is_refused_before_the_browser_opens() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "same-value",
+            "client_secret": "same-value",
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": "https://oauth.example.com/token",
+        })
+        .to_string(),
+    )
+    .await;
+
+    let opened = std::sync::atomic::AtomicBool::new(false);
+    let open_auth_url = async |_: &str, _: uuid::Uuid| -> Result<(), BoxError> {
+        opened.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    };
+    let Err(error) = run_oauth_flow(
+        &pool,
+        &bus,
+        "acme",
+        "read",
+        None,
+        CallbackRoute::OwnListener,
+        open_auth_url,
+    )
+    .await
+    else {
+        panic!("a secret equal to the client ID must refuse the flow");
+    };
+    let error = error.to_string();
+    assert!(error.contains("client secret"), "{error}");
+    assert!(
+        !error.contains("same-value"),
+        "never echo the value: {error}"
+    );
+    assert!(!opened.load(std::sync::atomic::Ordering::SeqCst));
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn callback_query_extracts_the_code_without_mangling_it() {
+    assert_eq!(
+        parse_callback_query("code=abc123&session_state=xyz")
+            .unwrap()
+            .code,
+        "abc123"
+    );
+    assert_eq!(
+        parse_callback_query("code=a%2Fb%2Bc&state=s").unwrap().code,
+        "a/b+c"
+    );
+    assert_eq!(
+        parse_callback_query("state=s&code=trailing").unwrap().code,
+        "trailing"
+    );
+    assert_eq!(
+        parse_callback_query("code_verifier=v&code=real")
+            .unwrap()
+            .code,
+        "real"
+    );
+}
+
+#[test]
+fn callback_query_carries_an_issued_client_id_beside_the_code() {
+    let grant = parse_callback_query("code=c&client_id=app_1%2Bx&state=s").unwrap();
+    assert_eq!(
+        grant,
+        AuthorizationGrant {
+            code: "c".into(),
+            client_id: Some("app_1+x".into()),
+        }
+    );
+    assert_eq!(parse_callback_query("code=c").unwrap().client_id, None);
+    assert_eq!(
+        parse_callback_query("code=c&client_id=").unwrap().client_id,
+        None,
+        "an empty client id is no client id"
+    );
+}
+
+#[test]
+fn callback_query_reports_a_denial_with_the_providers_reason() {
+    let err = parse_callback_query("error=access_denied&error_description=The+user+denied+consent")
+        .expect_err("a denial must be an error");
+    let msg = err.to_string();
+    assert!(msg.contains("access_denied"), "{msg}");
+    assert!(
+        msg.contains("The user denied consent"),
+        "+ must decode to a space here: {msg}"
+    );
+
+    let bare = parse_callback_query("error=server_error").expect_err("still an error");
+    assert!(bare.to_string().contains("server_error"));
+}
+
+#[test]
+fn callback_query_without_code_or_error_is_still_reported() {
+    let err = parse_callback_query("state=only").expect_err("nothing usable");
+    assert!(err.to_string().contains("No authorization code"));
+}
+
+const TEST_STATE: &str = "test-flow-state";
+
+async fn send_callback_request(addr: std::net::SocketAddr, head: String, tail: Option<String>) {
+    use tokio::io::AsyncWriteExt;
+    tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        if let Some(tail) = tail {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            stream.write_all(tail.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    });
+}
+
+#[tokio::test]
+async fn callback_recovers_a_long_code_split_across_reads() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let addr = listener.local_addrs()[0];
+
+    let code = "M.C123_BAY.2.U.".repeat(400);
+    let (head, tail) = code.split_at(code.len() / 2);
+    let head = format!("GET /oauth/callback?code={head}");
+    let tail =
+        format!("{tail}&session_state=abc&state={TEST_STATE} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+
+    send_callback_request(addr, head, Some(tail)).await;
+
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap()
+        .grant
+        .code;
+    assert_eq!(
+        got, code,
+        "the full authorization code must survive a split read"
+    );
+}
+
+#[tokio::test]
+async fn callback_surfaces_a_provider_denial() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let addr = listener.local_addrs()[0];
+
+    send_callback_request(
+        addr,
+        format!(
+            "GET /oauth/callback?error=access_denied&error_description=The+user+denied+consent\
+             &state={TEST_STATE} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ),
+        None,
+    )
+    .await;
+
+    let err = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .expect_err("a denial callback must be an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("access_denied"),
+        "provider error code missing: {msg}"
+    );
+    assert!(
+        msg.contains("denied consent"),
+        "provider description missing: {msg}"
+    );
+}
+
+fn browser_at_callback(
+    addr: std::net::SocketAddr,
+    query: String,
+) -> tokio::task::JoinHandle<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET /oauth/callback?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    })
+}
+
+#[tokio::test]
+async fn the_browser_hears_connected_only_after_the_flow_settles() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let browser = browser_at_callback(
+        listener.local_addrs()[0],
+        format!("code=c&state={TEST_STATE}"),
+    );
+
+    let received = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!browser.is_finished(), "the page waits for the outcome");
+
+    received.reply.settle(true);
+    let response = browser.await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("<h1>Connected</h1>"), "{response}");
+}
+
+#[tokio::test]
+async fn the_browser_hears_a_failed_exchange_as_a_failure() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let browser = browser_at_callback(
+        listener.local_addrs()[0],
+        format!("code=c&state={TEST_STATE}"),
+    );
+
+    let received = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
+    received.reply.settle(false);
+    let response = browser.await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("<h1>Connection failed</h1>"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn the_browser_hears_a_provider_denial_at_once() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let browser = browser_at_callback(
+        listener.local_addrs()[0],
+        format!("error=access_denied&state={TEST_STATE}"),
+    );
+
+    assert!(wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .is_err());
+    let response = browser.await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("<h1>Authorization failed</h1>"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn callback_listener_binds_both_loopback_families_on_one_port() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let addrs = listener.local_addrs();
+    assert!(!addrs.is_empty(), "at least the IPv4 loopback must bind");
+    let port = addrs[0].port();
+    assert!(
+        addrs.iter().all(|addr| addr.port() == port),
+        "every family must share one port: {addrs:?}"
+    );
+    assert!(
+        addrs.iter().any(|addr| addr.is_ipv4()),
+        "IPv4 loopback is required: {addrs:?}"
+    );
+}
+
+#[tokio::test]
+async fn callback_is_received_on_every_bound_loopback_family() {
+    let family_count = CallbackListener::bind(0).await.unwrap().local_addrs().len();
+
+    for index in 0..family_count {
+        let listener = CallbackListener::bind(0).await.unwrap();
+        let addr = listener.local_addrs()[index];
+        send_callback_request(
+            addr,
+            format!(
+                "GET /oauth/callback?code=family-code&state={TEST_STATE} \
+                 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            ),
+            None,
+        )
+        .await;
+        let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+            .await
+            .unwrap()
+            .grant
+            .code;
+        assert_eq!(got, "family-code", "callback over {addr} must be received");
+    }
+}
+
+#[tokio::test]
+async fn callback_ignores_browser_noise_before_the_real_redirect() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let addr = listener.local_addrs()[0];
+
+    send_callback_request(
+        addr,
+        "GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_string(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    send_callback_request(
+        addr,
+        format!(
+            "GET /oauth/callback?code=the-real-code&state={TEST_STATE} \
+             HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ),
+        None,
+    )
+    .await;
+
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap()
+        .grant
+        .code;
+    assert_eq!(got, "the-real-code");
+}
+
+#[test]
+fn authorize_url_appends_to_an_endpoint_that_already_has_a_query() {
+    let auth = ClientAuth::from_secret(Some("s"));
+    let url = build_authorize_url(
+        "https://example.b2clogin.com/example.onmicrosoft.com/oauth2/v2.0/authorize?p=B2C_1_signin",
+        "cid-123",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        "the-state",
+        &auth,
+        &default_authorize_params(),
+    );
+    assert_eq!(
+        url.matches('?').count(),
+        1,
+        "exactly one query separator: {url}"
+    );
+    assert!(url.contains("?p=B2C_1_signin&client_id=cid-123"), "{url}");
+    assert_eq!(
+        authorize_param(&url, "client_id").as_deref(),
+        Some("cid-123")
+    );
+}
+
+#[tokio::test]
+async fn callback_survives_a_connection_that_closes_without_sending() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let addr = listener.local_addrs()[0];
+
+    tokio::spawn(async move {
+        drop(tokio::net::TcpStream::connect(addr).await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let mut real = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        real.write_all(
+            format!(
+                "GET /oauth/callback?code=survived&state={TEST_STATE} \
+                 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        real.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    });
+
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap()
+        .grant
+        .code;
+    assert_eq!(got, "survived");
+}
+
+fn active_flow(task: tokio::task::JoinHandle<()>, holds_port: bool) -> Option<ActiveCallbackFlow> {
+    Some(ActiveCallbackFlow {
+        task,
+        request_id: uuid::Uuid::nil(),
+        holds_port: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(holds_port)),
+    })
+}
+
+struct ListenerCloseProbe {
+    listener: Option<CallbackListener>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ListenerCloseProbe {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tokio::test]
+async fn releasing_the_callback_port_closes_it_before_returning() {
+    let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = ListenerCloseProbe {
+        listener: Some(CallbackListener::bind(0).await.unwrap()),
+        closed: closed.clone(),
+    };
+
+    let mut slot = active_flow(
+        tokio::spawn(async move {
+            let _held = probe;
+            std::future::pending::<()>().await;
+        }),
+        true,
+    );
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        release_callback_port(&mut slot).await,
+        Some(uuid::Uuid::nil()),
+        "a flow that was still waiting is superseded, and names its form request"
+    );
+    assert!(slot.is_none(), "the slot is emptied, not left dangling");
+    assert!(
+        closed.load(std::sync::atomic::Ordering::Acquire),
+        "the port must be free the moment the release returns"
+    );
+}
+
+#[tokio::test]
+async fn a_flow_that_already_released_the_port_is_detached_not_aborted() {
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut slot = active_flow(
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = finished_tx.send(());
+        }),
+        false,
+    );
+
+    assert!(
+        release_callback_port(&mut slot).await.is_none(),
+        "a flow that no longer holds the port supersedes nothing"
+    );
+    assert!(slot.is_none());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), finished_rx)
+        .await
+        .expect("the detached flow must not be cancelled")
+        .expect("the detached flow must run to completion");
+}
+
+#[test]
+fn every_end_of_the_callback_wait_answers_the_authorization_page() {
+    use crate::engine::thread_events::FormRequestOutcome;
+    let timed_out: Result<Result<(), String>, ()> = Err(());
+    let provider_error: Result<Result<(), String>, ()> = Ok(Err("access_denied".into()));
+    let callback: Result<Result<(), String>, ()> = Ok(Ok(()));
+    assert_eq!(
+        authorization_outcome(&timed_out),
+        FormRequestOutcome::Expired
+    );
+    assert_eq!(
+        authorization_outcome(&provider_error),
+        FormRequestOutcome::Canceled
+    );
+    assert_eq!(
+        authorization_outcome(&callback),
+        FormRequestOutcome::Completed
+    );
+}
+
+#[test]
+fn the_stored_authorization_url_carries_no_secret() {
+    let confidential = ClientAuth::from_secret(Some("s3cr3t-value"));
+    let url = build_authorize_url(
+        "https://auth.example.com/authorize",
+        "client-1",
+        "http://localhost:8765/callback",
+        "read",
+        "state-1",
+        &confidential,
+        &AuthorizeParams::parse(None).unwrap(),
+    );
+    assert!(!url.contains("s3cr3t-value"), "{url}");
+
+    let public = ClientAuth::from_secret(None);
+    let url = build_authorize_url(
+        "https://auth.example.com/authorize",
+        "client-1",
+        "http://localhost:8765/callback",
+        "read",
+        "state-1",
+        &public,
+        &AuthorizeParams::parse(None).unwrap(),
+    );
+    let verifier = public
+        .code_verifier()
+        .expect("a public client has a verifier");
+    assert!(!url.contains(verifier), "{url}");
+    assert!(
+        url.contains("code_challenge="),
+        "the challenge is what it sends"
+    );
+}
+
+#[test]
+fn the_timeout_does_not_claim_the_page_opened() {
+    assert!(OAUTH_TIMEOUT_MSG.contains("may not have opened"));
+    assert!(OAUTH_TIMEOUT_MSG.contains("Start the connection again"));
+}
+
+#[tokio::test]
+async fn releasing_an_empty_slot_supersedes_nothing() {
+    let mut empty: Option<ActiveCallbackFlow> = None;
+    assert!(release_callback_port(&mut empty).await.is_none());
+}
+
+#[test]
+fn a_port_clash_explains_itself_and_every_other_error_keeps_its_words() {
+    let msg = callback_bind_error(
+        CALLBACK_PORT,
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "Address already in use"),
+    )
+    .to_string();
+    assert!(
+        msg.contains(&CALLBACK_PORT.to_string()),
+        "the port must be named: {msg}"
+    );
+    assert!(
+        msg.contains("another Lucidos workspace"),
+        "the likely cause must be named: {msg}"
+    );
+    assert!(
+        msg.contains("try again"),
+        "the message must say what to do: {msg}"
+    );
+
+    let other = callback_bind_error(
+        14981,
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+    )
+    .to_string();
+    assert_eq!(other, "permission denied");
+}
+
+#[test]
+fn each_flow_gets_its_own_unguessable_state() {
+    let a = generate_oauth_state();
+    let b = generate_oauth_state();
+    assert_ne!(a, b, "two flows must not share a state");
+    assert_eq!(a.len(), 43, "unexpected length: {a}");
+    assert!(
+        a.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "state must be URL-safe without escaping: {a}"
+    );
+}
+
+#[test]
+fn a_callback_matches_only_on_this_flows_exact_state() {
+    assert!(callback_state_matches("code=x&state=abc", "abc"));
+    assert!(callback_state_matches("state=abc&code=x", "abc"));
+    assert!(!callback_state_matches("code=x&state=other", "abc"));
+    assert!(!callback_state_matches("code=x", "abc"));
+    assert!(!callback_state_matches("code=x&state=", "abc"));
+    assert!(!callback_state_matches("code=x&session_state=abc", "abc"));
+    assert!(callback_state_matches("state=a%2Fb", "a/b"));
+    assert!(callback_state_matches("state=a+b", "a+b"));
+}
+
+#[tokio::test]
+async fn a_callback_from_another_flow_is_ignored_and_the_real_one_still_lands() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let addr = listener.local_addrs()[0];
+
+    send_callback_request(
+        addr,
+        "GET /oauth/callback?code=someone-elses-code&state=a-superseded-flow \
+         HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            .to_string(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    send_callback_request(
+        addr,
+        "GET /oauth/callback?code=forged HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_string(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    send_callback_request(
+        addr,
+        format!(
+            "GET /oauth/callback?code=our-code&state={TEST_STATE} \
+             HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ),
+        None,
+    )
+    .await;
+
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap()
+        .grant
+        .code;
+    assert_eq!(
+        got, "our-code",
+        "only the callback carrying this flow's state may be redeemed"
+    );
+}
+
+#[test]
+fn the_authorize_url_carries_this_flows_state() {
+    let state = generate_oauth_state();
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        &state,
+        &ClientAuth::from_secret(Some("s")),
+        &default_authorize_params(),
+    );
+    assert_eq!(authorize_param(&url, "state").as_deref(), Some(&*state));
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        "a b&c=d",
+        &ClientAuth::from_secret(Some("s")),
+        &default_authorize_params(),
+    );
+    assert_eq!(authorize_param(&url, "state").as_deref(), Some("a b&c=d"));
+}
+
+#[test]
+fn client_provider_name_leaves_a_bare_provider_alone() {
+    assert_eq!(client_provider_name("dropbox"), "dropbox");
+    assert_eq!(client_provider_name("google"), "google");
+}
+
+#[test]
+fn client_provider_name_strips_a_legacy_prefix() {
+    assert_eq!(client_provider_name("oauth:google"), "google");
+    assert_eq!(client_provider_name("OAuth:Google"), "google");
+    assert_eq!(
+        client_provider_name(&client_provider_name("oauth:dropbox")),
+        "dropbox"
+    );
+}
+
+#[test]
+fn client_provider_name_normalizes_case_and_whitespace() {
+    assert_eq!(client_provider_name("Dropbox"), "dropbox");
+    assert_eq!(client_provider_name("  Dropbox  "), "dropbox");
+}
+
+#[test]
+fn client_provider_name_keeps_derived_provider_names_distinct() {
+    assert_eq!(client_provider_name("ghealth"), "ghealth");
+    assert_ne!(
+        client_provider_name("ghealth"),
+        client_provider_name("google")
+    );
+}
+
+async fn serve_one_token_grant(access_token: &'static str) -> String {
+    let grant =
+        serde_json::json!({"access_token": access_token, "token_type": "bearer"}).to_string();
+    serve_one_response(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{grant}",
+        grant.len()
+    ))
+    .await
+}
+
+async fn serve_one_response(response: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/token", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&request);
+            let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if body.len() >= length {
+                break;
+            }
+        }
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+    url
+}
+
+#[tokio::test]
+async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
+    use crate::core::oauth_callback::{deliver_callback, CallbackDelivery};
+    const ACCESS_TOKEN: &str = "granted-token";
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let token_url = serve_one_token_grant(ACCESS_TOKEN).await;
+    crate::test_support::seed_credential(
+        &pool,
+        "dropbox",
+        "https://api.dropboxapi.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": "secret",
+            "auth_url": "https://www.dropbox.com/oauth2/authorize",
+            "token_url": token_url,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let open_auth_url = async |auth_url: &str, _request_id: uuid::Uuid| -> Result<(), BoxError> {
+        let state = authorize_param(auth_url, "state").expect("the URL carries a state");
+        let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
+        assert!(matches!(
+            deliver_callback(&query).await,
+            CallbackDelivery::Accepted {
+                state: CallbackPageState::Connected,
+                ..
+            }
+        ));
+        Ok(())
+    };
+    run_oauth_flow(
+        &pool,
+        &bus,
+        "oauth:Dropbox",
+        "files.content.read",
+        None,
+        gateway_route(true, None),
+        open_auth_url,
+    )
+    .await
+    .expect("the flow completes");
+
+    let account = OAuthStore::get_by_provider(&pool, "dropbox")
+        .await
+        .unwrap()
+        .expect("the account is stored under the canonical provider name");
+    assert_eq!(account.access_token, ACCESS_TOKEN);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_accounts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "no second row under the prefixed spelling");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_gateway_flow_completes_by_delivery_without_binding_the_port() {
+    use crate::core::oauth_callback::{deliver_callback, BrowserContext, CallbackDelivery};
+    const ACCESS_TOKEN: &str = "delivered-token";
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let token_url = serve_one_token_grant(ACCESS_TOKEN).await;
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": "secret",
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": token_url,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let route = CallbackRoute::Gateway(BrowserContext {
+        prefix: "/dev@cloud/".into(),
+        local: true,
+        origin: None,
+    });
+    let open_auth_url = async |auth_url: &str, request_id: uuid::Uuid| -> Result<(), BoxError> {
+        let state = authorize_param(auth_url, "state").expect("the URL carries a state");
+        assert!(state.starts_with("/dev@cloud/~"), "{state}");
+        assert_eq!(
+            authorize_param(auth_url, "redirect_uri").as_deref(),
+            Some(default_redirect_uri().as_str()),
+            "a local browser keeps the loopback redirect"
+        );
+        let slot = ACTIVE_CALLBACK_FLOW.lock().await;
+        assert!(
+            slot.as_ref()
+                .is_none_or(|flow| flow.request_id != request_id),
+            "a gateway flow never takes the listener slot"
+        );
+        drop(slot);
+        let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
+        assert!(matches!(
+            deliver_callback(&query).await,
+            CallbackDelivery::Accepted {
+                state: CallbackPageState::Connected,
+                ..
+            }
+        ));
+        Ok(())
+    };
+    run_oauth_flow(&pool, &bus, "acme", "read", None, route, open_auth_url)
+        .await
+        .expect("the delivered flow completes");
+
+    let account = OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .expect("the account is stored");
+    assert_eq!(account.access_token, ACCESS_TOKEN);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_gateway_flow_whose_exchange_is_refused_shows_the_failure_page() {
+    use crate::core::oauth_callback::{deliver_callback, BrowserContext, CallbackDelivery};
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let refusal = serde_json::json!({"error": "invalid_client"}).to_string();
+    let token_url = serve_one_response(format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
+        refusal.len()
+    ))
+    .await;
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": "secret",
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": token_url,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let route = CallbackRoute::Gateway(BrowserContext {
+        prefix: "/dev@cloud/".into(),
+        local: true,
+        origin: None,
+    });
+    let open_auth_url = async |auth_url: &str, _request_id: uuid::Uuid| -> Result<(), BoxError> {
+        let state = authorize_param(auth_url, "state").expect("the URL carries a state");
+        let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
+        let CallbackDelivery::Accepted { state, page } = deliver_callback(&query).await else {
+            panic!("the open flow owns its state");
+        };
+        assert_eq!(state, CallbackPageState::Failed);
+        assert!(page.contains("<h1>Connection failed</h1>"), "{page}");
+        Ok(())
+    };
+    let Err(error) = run_oauth_flow(&pool, &bus, "acme", "read", None, route, open_auth_url).await
+    else {
+        panic!("a refused exchange fails the flow");
+    };
+    assert!(error.to_string().contains("invalid_client"), "{error}");
+    assert!(OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .is_none());
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn callback_connected_page_names_the_provider_and_says_it_is_done() {
+    let page = callback_page("dropbox", CallbackPageState::Connected);
+    assert!(page.contains("dropbox"), "{page}");
+    assert!(page.contains("<h1>Connected</h1>"), "{page}");
+    assert!(page.contains("close this tab"), "{page}");
+    assert!(
+        !page.contains("Authorization successful!"),
+        "the bare debug-looking heading is gone: {page}"
+    );
+}
+
+#[test]
+fn callback_failed_page_points_back_at_lucidos() {
+    let page = callback_page("dropbox", CallbackPageState::Failed);
+    assert!(page.contains("<h1>Connection failed</h1>"), "{page}");
+    assert!(page.contains("Nothing was connected"), "{page}");
+    assert!(page.contains("Return to Lucidos"), "{page}");
+}
+
+#[test]
+fn callback_pending_page_claims_neither_outcome() {
+    let page = callback_page("dropbox", CallbackPageState::Pending);
+    assert!(page.contains("<h1>Authorization received</h1>"), "{page}");
+    assert!(page.contains("Return to Lucidos for the result"), "{page}");
+    assert!(!page.contains("Connected"), "{page}");
+    assert!(!page.contains("failed"), "{page}");
+}
+
+#[test]
+fn callback_refused_page_says_authorization_failed() {
+    let page = callback_page("dropbox", CallbackPageState::Refused);
+    assert!(page.contains("<h1>Authorization failed</h1>"), "{page}");
+    assert!(page.contains("Nothing was connected"), "{page}");
+}
+
+const ALL_PAGE_STATES: [CallbackPageState; 4] = [
+    CallbackPageState::Connected,
+    CallbackPageState::Pending,
+    CallbackPageState::Failed,
+    CallbackPageState::Refused,
+];
+
+#[test]
+fn callback_page_renders_no_provider_supplied_text() {
+    let hostile = "err=<script>alert(1)</script>&error_description=<img onerror=x>";
+    for state in ALL_PAGE_STATES {
+        let page = callback_page("dropbox", state);
+        assert!(!page.contains("<script>"), "{page}");
+        assert!(!page.contains(&hostile[..10]), "{page}");
+    }
+    let page = callback_page("<script>alert(1)</script>", CallbackPageState::Connected);
+    assert!(!page.contains("<script>"), "{page}");
+    assert!(page.contains("&lt;script&gt;"), "{page}");
+}
+
+#[test]
+fn callback_page_fetches_nothing() {
+    const SVG_NS: &str = "xmlns=\"http://www.w3.org/2000/svg\"";
+    for state in ALL_PAGE_STATES {
+        let page = callback_page("dropbox", state);
+        for needle in ["<link", "<script", "src=", "@import", "url(http"] {
+            assert!(
+                !page.contains(needle),
+                "the callback page must be self-contained, found {needle}: {page}"
+            );
+        }
+        let rest = page.replace(SVG_NS, "");
+        for needle in ["http://", "https://"] {
+            assert!(
+                !rest.contains(needle),
+                "the only URL-shaped text allowed is the SVG namespace, found {needle}: {page}"
+            );
+        }
+    }
+}
+
+#[test]
+fn callback_page_wears_the_brand_surface() {
+    let page = callback_page("dropbox", CallbackPageState::Connected);
+    assert!(page.contains("#4a97ee"), "{page}");
+    assert!(page.contains("#0c52ad"), "{page}");
+    assert!(page.contains("<svg"), "the mark is rendered: {page}");
+    assert!(page.contains("lucidosBrand"), "{page}");
+    assert!(!page.contains("#16181d"), "{page}");
+}
+
+#[test]
+fn callback_page_tolerates_a_blank_provider() {
+    let page = callback_page("", CallbackPageState::Connected);
+    assert!(page.contains("<title>Lucidos</title>"), "{page}");
+    assert!(page.contains("<h1>Connected</h1>"), "{page}");
+    assert!(!page.contains("<dl>"), "no value, no row: {page}");
+    assert!(!page.contains("Connected to"), "{page}");
+}
+
+#[test]
+fn callback_page_labels_the_provider_it_names() {
+    let ok = callback_page("dropbox", CallbackPageState::Connected);
+    assert!(ok.contains("<dt>Connected to</dt><dd>dropbox</dd>"), "{ok}");
+    let failed = callback_page("dropbox", CallbackPageState::Failed);
+    assert!(
+        failed.contains("<dt>Tried to connect</dt><dd>dropbox</dd>"),
+        "{failed}"
+    );
+    let hostile = callback_page("<script>alert(1)</script>", CallbackPageState::Connected);
+    assert!(
+        hostile.contains("<dd>&lt;script&gt;alert(1)&lt;/script&gt;</dd>"),
+        "{hostile}"
+    );
+}
+
+#[test]
+fn callback_page_shell_is_top_anchored_and_left_aligned() {
+    let page = callback_page("dropbox", CallbackPageState::Connected);
+    let body = css_rule(&page, "body{");
+    assert!(body.contains("align-items:flex-start"), "{body}");
+    assert!(!body.contains("align-items:center"), "{body}");
+    assert!(body.contains("padding:4rem"), "{body}");
+    let main = css_rule(&page, "main{");
+    assert!(!main.contains("text-align:center"), "{main}");
+    assert!(page.contains("<div class=\"brand\">"), "{page}");
+    assert!(page.contains("<span>Lucidos</span>"), "{page}");
+}
+
+fn css_rule<'a>(page: &'a str, selector: &str) -> &'a str {
+    let start = page
+        .find(selector)
+        .unwrap_or_else(|| panic!("no `{selector}` rule in the page: {page}"));
+    let open = start + selector.len();
+    let close = page[open..]
+        .find('}')
+        .unwrap_or_else(|| panic!("unterminated `{selector}` rule: {page}"))
+        + open;
+    &page[open..close]
+}
+
+#[test]
+fn userinfo_method_defaults_to_get() {
+    assert_eq!(UserinfoMethod::parse(None), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("")), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("   ")), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("GET")), UserinfoMethod::Get);
+}
+
+#[test]
+fn userinfo_method_reads_post_in_any_case() {
+    assert_eq!(UserinfoMethod::parse(Some("POST")), UserinfoMethod::Post);
+    assert_eq!(UserinfoMethod::parse(Some("post")), UserinfoMethod::Post);
+    assert_eq!(UserinfoMethod::parse(Some(" Post ")), UserinfoMethod::Post);
+}
+
+#[test]
+fn userinfo_method_degrades_an_unknown_value_to_get() {
+    assert_eq!(UserinfoMethod::parse(Some("PATCH")), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("nonsense")), UserinfoMethod::Get);
+}
+
+#[test]
+fn display_name_reads_the_flat_oidc_shape() {
+    let body = serde_json::json!({ "email": "me@example.com", "name": "Jane Doe" });
+    assert_eq!(userinfo_display_name(&body).as_deref(), Some("Jane Doe"));
+}
+
+#[test]
+fn display_name_reads_the_nested_dropbox_shape() {
+    let body = serde_json::json!({
+        "email": "me@example.com",
+        "name": { "given_name": "Jane", "display_name": "Jane Doe" },
+    });
+    assert_eq!(userinfo_display_name(&body).as_deref(), Some("Jane Doe"));
+}
+
+#[test]
+fn display_name_is_none_when_absent_or_unrecognized() {
+    assert_eq!(userinfo_display_name(&serde_json::json!({})), None);
+    assert_eq!(
+        userinfo_display_name(&serde_json::json!({ "name": { "given_name": "Jane" } })),
+        None
+    );
+    assert_eq!(
+        userinfo_display_name(&serde_json::json!({ "name": 42 })),
+        None
+    );
+}
+
+#[test]
+fn oauth_client_request_carries_the_userinfo_method() {
+    let overrides = OAuthClientOverrides {
+        userinfo_url: Some("https://api.dropboxapi.com/2/users/get_current_account".to_string()),
+        userinfo_method: Some("POST".to_string()),
+        ..Default::default()
+    };
+    let req = oauth_client_request("dropbox", &overrides);
+    assert_eq!(req["defaults"]["userinfo_method"], "POST");
+}
+
+#[test]
+fn a_provider_can_ask_for_offline_access_in_its_own_spelling() {
+    let url = build_authorize_url(
+        "https://www.dropbox.com/oauth2/authorize",
+        "cid-123",
+        "http://127.0.0.1:14981/oauth/callback",
+        "files.content.write",
+        "the-state",
+        &ClientAuth::from_secret(Some("s")),
+        &AuthorizeParams::parse(Some("token_access_type=offline")).unwrap(),
+    );
+    assert_eq!(
+        authorize_param(&url, "token_access_type").as_deref(),
+        Some("offline")
+    );
+    assert_eq!(authorize_param(&url, "access_type"), None);
+    assert_eq!(authorize_param(&url, "prompt"), None);
+}
+
+#[test]
+fn an_absent_value_sends_exactly_what_it_always_sent() {
+    assert_eq!(
+        AuthorizeParams::parse(None).unwrap(),
+        AuthorizeParams::parse(Some(DEFAULT_AUTHORIZE_PARAMS)).unwrap()
+    );
+    assert_eq!(
+        AuthorizeParams::parse(Some("   ")).unwrap(),
+        AuthorizeParams::parse(None).unwrap()
+    );
+}
+
+#[test]
+fn none_sends_nothing_extra() {
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid-123",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        "the-state",
+        &ClientAuth::from_secret(Some("s")),
+        &AuthorizeParams::parse(Some("NONE")).unwrap(),
+    );
+    assert_eq!(
+        url,
+        "https://accounts.example.com/authorize\
+         ?client_id=cid-123\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A14981%2Foauth%2Fcallback\
+         &response_type=code\
+         &scope=openid\
+         &state=the-state"
+    );
+}
+
+#[test]
+fn the_flows_own_parameters_are_refused() {
+    for key in [
+        "client_id",
+        "redirect_uri",
+        "response_type",
+        "scope",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+    ] {
+        let err = AuthorizeParams::parse(Some(&format!("{key}=evil")))
+            .expect_err("{key} must be refused");
+        assert!(err.contains(key), "the error names the key: {err}");
+    }
+    assert!(AuthorizeParams::parse(Some("Redirect_URI=evil")).is_err());
+    assert!(AuthorizeParams::parse(Some("state=pinned")).is_err());
+    assert!(AuthorizeParams::parse(Some("token_access_type=offline&scope=evil")).is_err());
+}
+
+#[test]
+fn a_value_with_separators_in_it_round_trips_as_one_value() {
+    let params = AuthorizeParams::parse(Some("claims=a%26b%3Dc%20d")).unwrap();
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        "the-state",
+        &ClientAuth::from_secret(Some("s")),
+        &params,
+    );
+    assert_eq!(authorize_param(&url, "claims").as_deref(), Some("a&b=c d"));
+    assert_eq!(url.matches('&').count(), 5, "{url}");
+}
+
+#[test]
+fn a_malformed_entry_is_an_error_not_a_silent_drop() {
+    assert!(AuthorizeParams::parse(Some("just_a_key")).is_err());
+    assert!(AuthorizeParams::parse(Some("=novalue")).is_err());
+    assert_eq!(
+        AuthorizeParams::parse(Some("token_access_type=offline&")).unwrap(),
+        AuthorizeParams::parse(Some("token_access_type=offline")).unwrap()
+    );
+    assert!(AuthorizeParams::parse(Some("consent=")).is_ok());
+}
+
+#[test]
+fn pkce_still_lands_last_for_a_public_client() {
+    let auth = ClientAuth::from_secret(None);
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        "the-state",
+        &auth,
+        &AuthorizeParams::parse(Some("token_access_type=offline")).unwrap(),
+    );
+    assert!(
+        url.contains("&token_access_type=offline&code_challenge="),
+        "{url}"
+    );
+    assert_eq!(
+        authorize_param(&url, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+}
+
+#[test]
+fn oauth_client_request_carries_the_authorize_params() {
+    let overrides = OAuthClientOverrides {
+        authorize_params: Some("token_access_type=offline".to_string()),
+        ..Default::default()
+    };
+    let req = oauth_client_request("dropbox", &overrides);
+    assert_eq!(
+        req["defaults"]["authorize_params"],
+        "token_access_type=offline"
+    );
+}
+
+#[test]
+fn client_provider_name_does_not_strip_a_prefix_with_nothing_after_it() {
+    assert_eq!(client_provider_name("oauth:"), "oauth:");
+    assert_eq!(client_provider_name("  OAuth:  "), "oauth:");
+}
+
+use crate::core::oauth_registry::OAuthProviderRow;
+
+fn row(userinfo_method: Option<&str>) -> OAuthProviderRow {
+    OAuthProviderRow {
+        id: "acme".to_string(),
+        label: "Acme".to_string(),
+        base_url: "https://api.acme.test".to_string(),
+        auth_url: "https://acme.test/authorize".to_string(),
+        token_url: "https://api.acme.test/token".to_string(),
+        userinfo_url: Some("https://api.acme.test/me".to_string()),
+        userinfo_method: userinfo_method.map(str::to_string),
+        authorize_params: None,
+        redirect_uri: None,
+        client_type: Some("public".to_string()),
+        console_label: None,
+        console_url: None,
+        setup_hint: None,
+        permissions_hint: None,
+        sign_in_scopes: None,
+    }
+}
+
+#[test]
+fn from_registry_carries_every_endpoint() {
+    let overrides = OAuthClientOverrides::from_registry(&row(Some("POST")));
+    assert_eq!(
+        overrides.auth_url.as_deref(),
+        Some("https://acme.test/authorize")
+    );
+    assert_eq!(
+        overrides.token_url.as_deref(),
+        Some("https://api.acme.test/token")
+    );
+    assert_eq!(
+        overrides.userinfo_url.as_deref(),
+        Some("https://api.acme.test/me")
+    );
+    assert_eq!(overrides.userinfo_method.as_deref(), Some("POST"));
+    assert_eq!(overrides.base_url.as_deref(), Some("https://api.acme.test"));
+}
+
+#[test]
+fn a_registry_prefilled_request_asks_only_for_the_client_id() {
+    let req = oauth_client_request("acme", &OAuthClientOverrides::from_registry(&row(None)));
+    assert_eq!(
+        req["base_urls"],
+        serde_json::json!(["https://api.acme.test"])
+    );
+    assert_eq!(req["defaults"]["auth_url"], "https://acme.test/authorize");
+    assert_eq!(req["defaults"]["token_url"], "https://api.acme.test/token");
+    assert!(
+        req["defaults"].get("userinfo_method").is_none(),
+        "an unset userinfo_method must not reach the modal: {req}"
+    );
+}
+
+#[test]
+fn a_complete_client_is_missing_nothing() {
+    let complete =
+        r#"{"client_id":"abc","auth_url":"https://a.test/x","token_url":"https://a.test/t"}"#;
+    assert!(missing_flow_fields(complete).is_empty());
+}
+
+#[test]
+fn the_endpointless_client_reports_both_urls() {
+    assert_eq!(
+        missing_flow_fields(r#"{"client_id":"abc"}"#),
+        vec!["auth_url", "token_url"]
+    );
+}
+
+#[test]
+fn a_blank_or_whitespace_value_counts_as_missing() {
+    assert_eq!(
+        missing_flow_fields(
+            r#"{"client_id":"  ","auth_url":"https://a.test/x","token_url":"https://a.test/t"}"#
+        ),
+        vec!["client_id"]
+    );
+}
+
+#[test]
+fn an_unparseable_secret_counts_as_missing_everything() {
+    assert_eq!(
+        missing_flow_fields("not json at all"),
+        vec!["client_id", "auth_url", "token_url"]
+    );
+}
+
+#[test]
+fn a_repair_request_targets_the_existing_row_and_keeps_the_client_id() {
+    let id = uuid::Uuid::new_v4();
+    let req = oauth_client_repair_request(
+        "acme",
+        &OAuthClientOverrides::from_registry(&row(None)),
+        id,
+        Some("abc"),
+        &["auth_url", "token_url"],
+    );
+    assert_eq!(req["existing_credential_id"], id.to_string());
+    assert_eq!(req["defaults"]["client_id"], "abc");
+    assert_eq!(req["defaults"]["auth_url"], "https://acme.test/authorize");
+    assert_eq!(req["missing"][0], "auth_url");
+    assert_eq!(req["missing"][1], "token_url");
+}
+
+#[test]
+fn a_repair_prompt_names_what_is_missing() {
+    let req = oauth_client_repair_request(
+        "acme",
+        &OAuthClientOverrides::default(),
+        uuid::Uuid::new_v4(),
+        None,
+        &["auth_url", "token_url"],
+    );
+    let prompt = req["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("auth_url and token_url"),
+        "the prompt must name the fields, got: {prompt}"
+    );
+}
+
+#[test]
+fn a_repair_request_with_no_registry_row_still_carries_its_target() {
+    let id = uuid::Uuid::new_v4();
+    let req = oauth_client_repair_request(
+        "unknown-thing",
+        &OAuthClientOverrides::default(),
+        id,
+        Some("abc"),
+        &["auth_url"],
+    );
+    assert_eq!(req["existing_credential_id"], id.to_string());
+    assert_eq!(req["defaults"]["client_id"], "abc");
+}
+
+#[test]
+fn a_repair_request_declares_no_scope_so_the_stored_one_wins() {
+    for overrides in [
+        OAuthClientOverrides::from_registry(&row(None)),
+        OAuthClientOverrides::default(),
+    ] {
+        let req = oauth_client_repair_request(
+            "acme",
+            &overrides,
+            uuid::Uuid::new_v4(),
+            Some("abc"),
+            &["auth_url"],
+        );
+        assert!(
+            req.get("base_urls").is_none(),
+            "a repair must carry no scope at all: {req}"
+        );
+    }
+
+    let fresh = oauth_client_request("acme", &OAuthClientOverrides::from_registry(&row(None)));
+    assert_eq!(
+        fresh["base_urls"],
+        serde_json::json!(["https://api.acme.test"])
+    );
+}
+
+#[tokio::test]
+async fn connect_records_what_was_asked_for_beside_what_was_granted() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    crate::test_support::seed_oauth_account_with_desired(
+        &pool,
+        "acme",
+        Some("user@example.com"),
+        None,
+        "access",
+        None,
+        None,
+        "read",
+        "read write",
+    )
+    .await
+    .unwrap();
+
+    let account = OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .expect("seeded account");
+    assert_eq!(account.scopes, "read");
+    assert_eq!(account.desired_scopes.as_deref(), Some("read write"));
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+#[test]
+fn a_refused_scope_survives_into_the_next_request() {
+    let granted = "read";
+    let desired = "read write";
+    let held = merge_scopes(granted, desired);
+    assert_eq!(merge_scopes(&held, desired), "read write");
+}
+
+#[test]
+fn accumulating_never_drops_a_scope_the_caller_did_not_mention() {
+    let held = merge_scopes("read", "read write");
+    assert_eq!(merge_scopes(&held, "admin"), "read write admin");
+}
+
+#[tokio::test]
+async fn a_legacy_account_with_no_desired_set_is_never_narrowed() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    crate::test_support::seed_oauth_account(
+        &pool,
+        "acme",
+        Some("user@example.com"),
+        None,
+        "access",
+        None,
+        None,
+        "read write",
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE oauth_accounts SET desired_scopes = NULL WHERE provider = 'acme'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let account = OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .expect("seeded account");
+    assert_eq!(account.desired_scopes, None);
+    let held = merge_scopes(
+        &account.scopes,
+        account.desired_scopes.as_deref().unwrap_or(""),
+    );
+    assert_eq!(held, "read write");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+const WITH_REFRESH: GrantEvidence = GrantEvidence {
+    refresh_token: true,
+};
+const NO_REFRESH: GrantEvidence = GrantEvidence {
+    refresh_token: false,
+};
+
+const OUTLOOK_GRANTED: &str = "https://outlook.office.com/SMTP.Send \
+                               https://outlook.office.com/IMAP.AccessAsUser.All \
+                               https://outlook.office.com/Mail.Read";
+
+#[test]
+fn a_full_grant_is_short_of_nothing() {
+    assert!(missing_requested_scopes("read write", "read write", NO_REFRESH).is_empty());
+}
+
+#[test]
+fn a_partial_grant_names_every_refused_scope_in_request_order() {
+    assert_eq!(
+        missing_requested_scopes(
+            "files.content.write files.content.read files.metadata.read account_info.read",
+            "account_info.read",
+            NO_REFRESH,
+        ),
+        vec![
+            "files.content.write".to_string(),
+            "files.content.read".to_string(),
+            "files.metadata.read".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn a_provider_that_reports_no_scope_string_is_not_reported_short() {
+    let requested = "read write";
+    let granted = requested;
+    assert!(missing_requested_scopes(requested, granted, NO_REFRESH).is_empty());
+}
+
+#[test]
+fn an_unrecorded_request_reports_no_shortfall_rather_than_a_false_one() {
+    assert!(missing_requested_scopes("", "read write", NO_REFRESH).is_empty());
+    assert!(missing_requested_scopes("", "", NO_REFRESH).is_empty());
+}
+
+#[test]
+fn everything_is_missing_when_the_provider_granted_nothing() {
+    assert_eq!(
+        missing_requested_scopes("read write", "", NO_REFRESH),
+        vec!["read".to_string(), "write".to_string()],
+    );
+}
+
+#[test]
+fn the_granted_side_is_a_set_so_order_and_spacing_do_not_matter() {
+    assert!(missing_requested_scopes("read write", "write   read", NO_REFRESH).is_empty());
+    assert!(missing_requested_scopes("read", "read read", NO_REFRESH).is_empty());
+    assert!(missing_requested_scopes("read write", "read\twrite\n", NO_REFRESH).is_empty());
+}
+
+#[test]
+fn containment_never_stands_in_for_a_granted_scope() {
+    assert_eq!(
+        missing_requested_scopes("files.content.write", "files.content", NO_REFRESH),
+        vec!["files.content.write".to_string()],
+    );
+}
+
+#[test]
+fn a_refresh_token_is_what_grants_offline_access() {
+    let requested = format!("{OUTLOOK_GRANTED} offline_access");
+    assert!(missing_requested_scopes(&requested, OUTLOOK_GRANTED, WITH_REFRESH).is_empty());
+}
+
+#[test]
+fn no_refresh_token_is_what_refuses_offline_access() {
+    let requested = format!("{OUTLOOK_GRANTED} offline_access");
+    assert_eq!(
+        missing_requested_scopes(&requested, OUTLOOK_GRANTED, NO_REFRESH),
+        vec!["offline_access".to_string()],
+    );
+}
+
+#[test]
+fn an_echoed_offline_access_does_not_stand_in_for_the_token() {
+    assert_eq!(
+        missing_requested_scopes("read offline_access", "read offline_access", NO_REFRESH),
+        vec!["offline_access".to_string()],
+    );
+}
+
+#[test]
+fn the_sign_in_scopes_are_never_reported_from_the_echo() {
+    assert!(missing_requested_scopes("openid email profile repo", "repo", NO_REFRESH).is_empty());
+}
+
+#[test]
+fn a_refused_resource_scope_is_still_named_beside_a_quiet_meta_scope() {
+    let requested = format!("{OUTLOOK_GRANTED} offline_access openid");
+    assert_eq!(
+        missing_requested_scopes(
+            &requested,
+            "https://outlook.office.com/Mail.Read",
+            WITH_REFRESH,
+        ),
+        vec![
+            "https://outlook.office.com/SMTP.Send".to_string(),
+            "https://outlook.office.com/IMAP.AccessAsUser.All".to_string(),
+        ],
+    );
+}
+
+fn legitimate_hosts() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("google", "https://www.googleapis.com/drive/v3/files"),
+        ("google", "https://oauth2.googleapis.com/token"),
+        (
+            "google",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        ),
+        ("google", "https://accounts.google.com/o/oauth2/v2/auth"),
+        ("microsoft", "https://graph.microsoft.com/v1.0/me"),
+        (
+            "microsoft",
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        ),
+        ("github", "https://api.github.com/user/repos"),
+        (
+            "dropbox",
+            "https://api.dropboxapi.com/2/users/get_space_usage",
+        ),
+        ("dropbox", "https://content.dropboxapi.com/2/files/download"),
+        ("dropbox", "https://www.dropbox.com/oauth2/authorize"),
+        ("spotify", "https://api.spotify.com/v1/me/player"),
+        ("spotify", "https://accounts.spotify.com/api/token"),
+    ]
+}
+
+#[test]
+fn every_legitimate_provider_host_still_classifies() {
+    for (provider, url) in legitimate_hosts() {
+        assert_eq!(
+            provider_for_url(url),
+            Some(provider),
+            "legitimate host stopped classifying: {url}"
+        );
+    }
+}
+
+#[test]
+fn an_attacker_suffix_host_never_classifies() {
+    for url in [
+        "https://api.github.com.attacker.example/",
+        "https://www.googleapis.com.attacker.example/drive/v3/files",
+        "https://accounts.google.com.attacker.example/",
+        "https://graph.microsoft.com.attacker.example/v1.0/me",
+        "https://login.microsoftonline.com.attacker.example/token",
+        "https://api.dropboxapi.com.attacker.example/2/users",
+        "https://www.dropbox.com.attacker.example/oauth2/authorize",
+        "https://api.spotify.com.attacker.example/v1/me",
+        "https://accounts.spotify.com.attacker.example/api/token",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "attacker suffix classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn a_lookalike_registrable_domain_never_classifies() {
+    for url in [
+        "https://notgithub.com/user/repos",
+        "https://myapi.github.com.evil.test/",
+        "https://evil-googleapis.com/drive/v3/files",
+        "https://notgoogle.com/",
+        "https://fakedropbox.com/oauth2/authorize",
+        "https://xdropboxapi.com/2/users",
+        "https://notapi.spotify.com.evil.test/",
+        "https://evilgraph.microsoft.com.evil.test/",
+    ] {
+        assert_eq!(provider_for_url(url), None, "lookalike classified: {url}");
+    }
+}
+
+#[test]
+fn the_provider_name_in_a_path_or_query_never_classifies() {
+    for url in [
+        "https://evil.example/?next=google.com/",
+        "https://evil.example/google.com/oauth",
+        "https://evil.example/?next=https://www.googleapis.com/drive",
+        "https://evil.example/api.github.com/user",
+        "https://evil.example/?r=api.github.com",
+        "https://evil.example/dropbox.com/files",
+        "https://evil.example/?to=api.dropboxapi.com",
+        "https://evil.example/graph.microsoft.com/v1.0/me",
+        "https://evil.example/?u=api.spotify.com",
+        "https://evil.example/#accounts.spotify.com",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "path or query bait classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn a_plaintext_http_url_injects_nothing() {
+    for (_, https) in legitimate_hosts() {
+        let http = https.replacen("https://", "http://", 1);
+        assert_eq!(
+            provider_for_url(&http),
+            None,
+            "cleartext URL classified: {http}"
+        );
+    }
+}
+
+#[test]
+fn a_non_https_scheme_injects_nothing() {
+    for url in [
+        "ftp://api.github.com/",
+        "file:///api.github.com/",
+        "ws://api.spotify.com/",
+        "HTTP://api.github.com/",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "non-https scheme classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn classification_fails_closed_when_the_host_is_unknown() {
+    for url in [
+        "",
+        "   ",
+        "not a url",
+        "//api.github.com/",
+        "https:///x",
+        "https://",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "unparseable URL classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn userinfo_cannot_smuggle_a_provider_host() {
+    for url in [
+        "https://api.github.com@evil.example/",
+        "https://www.googleapis.com@evil.example/drive",
+        "https://user:api.spotify.com@evil.example/",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "userinfo bait classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn a_unicode_lookalike_host_never_classifies() {
+    assert_eq!(provider_for_url("https://\u{0430}pi.github.com/"), None);
+    assert_eq!(provider_for_url("https://api.g\u{043e}ogle.com/"), None);
+}
+
+#[test]
+fn host_matching_is_case_insensitive() {
+    assert_eq!(
+        provider_for_url("https://API.GitHub.COM/user"),
+        Some("github")
+    );
+    assert_eq!(
+        provider_for_url("https://WWW.GoogleAPIs.com/drive"),
+        Some("google")
+    );
+}
+
+#[test]
+fn host_is_anchors_on_a_label_boundary() {
+    assert!(host_is("api.github.com", "api.github.com"));
+    assert!(host_is("sub.api.github.com", "api.github.com"));
+    assert!(!host_is("notgithub.com", "github.com"));
+    assert!(!host_is(
+        "api.github.com.attacker.example",
+        "api.github.com"
+    ));
+    assert!(!host_is("github.com.evil", "github.com"));
+    assert!(!host_is("xgithub.com", "github.com"));
+}
+
+#[tokio::test]
+async fn an_unlinked_account_needs_no_token() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    assert_eq!(linked_account_token(&pool, None).await, Ok(None));
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_failed_lookup_refuses_the_send() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let linked = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "live-token",
+        Some("refresh-token"),
+        Some(Utc::now() + chrono::Duration::seconds(3600)),
+        "https://mail.google.com/",
+    )
+    .await
+    .unwrap();
+
+    pool.close().await;
+    let error = linked_account_token(&pool, Some(linked))
+        .await
+        .expect_err("a read the engine could not make is not an answer");
+    assert!(
+        error.contains("Could not read the linked OAuth account"),
+        "the refusal has to name the failure: {error}"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_link_to_a_missing_account_refuses_the_send() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let error = linked_account_token(&pool, Some(Uuid::new_v4()))
+        .await
+        .expect_err("a dangling link is not a send");
+    assert!(error.contains("no longer exists"), "{error}");
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_token_that_cannot_be_refreshed_refuses_the_send() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let linked = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "stale-token",
+        None,
+        Some(Utc::now() - chrono::Duration::seconds(120)),
+        "https://mail.google.com/",
+    )
+    .await
+    .unwrap();
+
+    let error = linked_account_token(&pool, Some(linked))
+        .await
+        .expect_err("a token known to be dead is not a token");
+    assert!(
+        error.contains("could not be refreshed"),
+        "the refusal has to name the failure: {error}"
+    );
+    assert!(
+        error.contains("user@example.com") && error.contains("reconnect"),
+        "the refusal has to name the account and the fix: {error}"
+    );
+    assert!(
+        !error.contains("stale-token"),
+        "a refusal never carries token material: {error}"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+const CLEARTEXT_TOKEN_URL: &str = "http://192.0.2.1/oauth/token";
+const CLIENT_SECRET: &str = "client-secret-value";
+const REFRESH_TOKEN: &str = "refresh-token-value";
+
+fn assert_cleartext_refusal(error: &str, credential: &str, field: &str) {
+    assert!(error.contains(credential), "names the credential: {error}");
+    assert!(error.contains(field), "names the field: {error}");
+    assert!(
+        error.contains("must use https"),
+        "says what to fix: {error}"
+    );
+    for secret in [CLIENT_SECRET, REFRESH_TOKEN] {
+        assert!(!error.contains(secret), "carries no secret: {error}");
+    }
+}
+
+#[test]
+fn a_secret_bearing_endpoint_accepts_https() {
+    for url in [
+        "https://oauth.example.com/token",
+        "https://oauth.example.com:8443/token?tenant=common",
+        "  https://oauth.example.com/token  ",
+    ] {
+        assert_eq!(
+            require_secure_endpoint("acme", "token_url", url),
+            Ok(()),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn a_secret_bearing_endpoint_accepts_http_on_loopback() {
+    for url in [
+        "http://127.0.0.1:8080/token",
+        "http://127.0.0.2/token",
+        "http://localhost:8080/token",
+        "http://LOCALHOST/token",
+        "http://[::1]:8080/token",
+    ] {
+        assert_eq!(
+            require_secure_endpoint("acme", "token_url", url),
+            Ok(()),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn a_secret_bearing_endpoint_refuses_cleartext_to_a_remote_host() {
+    for url in [
+        CLEARTEXT_TOKEN_URL,
+        "http://oauth.example.com/token",
+        "http://localhost.attacker.example/token",
+        "http://127.0.0.1.attacker.example/token",
+        "http://10.0.0.5/token",
+        "ftp://oauth.example.com/token",
+        "ws://localhost/token",
+    ] {
+        let error = require_secure_endpoint("acme", "token_url", url).unwrap_err();
+        assert_cleartext_refusal(&error, "acme", "token_url");
+    }
+}
+
+#[test]
+fn a_secret_bearing_endpoint_refuses_an_unparseable_url() {
+    let error =
+        require_secure_endpoint("acme", "token_url", "oauth.example.com/token").unwrap_err();
+    assert!(
+        error.contains("acme") && error.contains("token_url"),
+        "{error}"
+    );
+}
+
+#[test]
+fn saving_a_client_refuses_any_cleartext_secret_bearing_endpoint() {
+    let secure = serde_json::json!({
+        "client_id": "cid",
+        "client_secret": CLIENT_SECRET,
+        "auth_url": "https://oauth.example.com/authorize",
+        "token_url": "https://oauth.example.com/token",
+        "userinfo_url": "https://oauth.example.com/userinfo",
+    });
+    assert_eq!(check_client_endpoints("acme", &secure.to_string()), Ok(()));
+    for field in SECRET_BEARING_ENDPOINTS {
+        let mut config = secure.clone();
+        config[field] = serde_json::json!("http://oauth.example.com/endpoint");
+        let error = check_client_endpoints("acme", &config.to_string()).unwrap_err();
+        assert_cleartext_refusal(&error, "acme", field);
+    }
+}
+
+#[test]
+fn saving_a_client_leaves_absent_endpoints_to_the_repair_form() {
+    assert_eq!(
+        check_client_endpoints("acme", r#"{"client_id":"cid"}"#),
+        Ok(())
+    );
+    assert_eq!(
+        check_client_endpoints("acme", r#"{"client_id":"cid","userinfo_url":"  "}"#),
+        Ok(())
+    );
+    assert_eq!(check_client_endpoints("acme", "not json"), Ok(()));
+}
+
+#[tokio::test]
+async fn a_token_request_to_a_cleartext_remote_endpoint_is_refused_before_sending() {
+    let quick = std::time::Duration::from_secs(2);
+    let refresh = tokio::time::timeout(
+        quick,
+        refresh_access_token(
+            "acme",
+            CLEARTEXT_TOKEN_URL,
+            "cid",
+            Some(CLIENT_SECRET),
+            REFRESH_TOKEN,
+        ),
+    )
+    .await
+    .expect("refused without touching the network")
+    .unwrap_err();
+    assert_cleartext_refusal(&refresh.to_string(), "acme", "token_url");
+
+    let auth = ClientAuth::from_secret(Some(CLIENT_SECRET));
+    let exchange = tokio::time::timeout(
+        quick,
+        exchange_code(
+            "acme",
+            CLEARTEXT_TOKEN_URL,
+            "cid",
+            &auth,
+            "auth-code",
+            &default_redirect_uri(),
+        ),
+    )
+    .await
+    .expect("refused without touching the network")
+    .unwrap_err();
+    assert_cleartext_refusal(&exchange.to_string(), "acme", "token_url");
+}
+
+#[tokio::test]
+async fn a_token_request_to_a_loopback_http_endpoint_is_sent() {
+    let token_url = serve_one_token_grant("loopback-token").await;
+    let token = refresh_access_token(
+        "acme",
+        &token_url,
+        "cid",
+        Some(CLIENT_SECRET),
+        REFRESH_TOKEN,
+    )
+    .await
+    .expect("loopback http is allowed");
+    assert_eq!(token.access_token, "loopback-token");
+}
+
+#[tokio::test]
+async fn a_token_endpoint_redirect_to_cleartext_is_not_followed() {
+    let token_url = serve_one_response(format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {CLEARTEXT_TOKEN_URL}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    ))
+    .await;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        refresh_access_token(
+            "acme",
+            &token_url,
+            "cid",
+            Some(CLIENT_SECRET),
+            REFRESH_TOKEN,
+        ),
+    )
+    .await
+    .expect("refused without following to the remote host")
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("cleartext"), "says why: {error}");
+    for secret in [CLIENT_SECRET, REFRESH_TOKEN] {
+        assert!(!error.contains(secret), "carries no secret: {error}");
+    }
+}
+
+#[tokio::test]
+async fn refreshing_with_a_stored_cleartext_token_url_is_refused() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": CLIENT_SECRET,
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": CLEARTEXT_TOKEN_URL,
+        })
+        .to_string(),
+    )
+    .await;
+    let expired = Utc::now() - chrono::Duration::seconds(300);
+    let mut account = make_account("acme", "old-token", Some(REFRESH_TOKEN), Some(expired));
+
+    let error = refresh_oauth_if_needed(&pool, &mut account)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_cleartext_refusal(&error, "acme", "token_url");
+    assert_eq!(account.access_token, "old-token", "nothing was refreshed");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn connecting_with_a_stored_cleartext_token_url_is_refused_before_the_browser_opens() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": CLIENT_SECRET,
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": CLEARTEXT_TOKEN_URL,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let opened = std::sync::atomic::AtomicBool::new(false);
+    let open_auth_url = async |_: &str, _: uuid::Uuid| -> Result<(), BoxError> {
+        opened.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    };
+    let Err(error) = run_oauth_flow(
+        &pool,
+        &bus,
+        "acme",
+        "read",
+        None,
+        CallbackRoute::OwnListener,
+        open_auth_url,
+    )
+    .await
+    else {
+        panic!("a cleartext token_url must refuse the flow");
+    };
+    let error = error.to_string();
+    assert_cleartext_refusal(&error, "acme", "token_url");
+    assert!(
+        !opened.load(std::sync::atomic::Ordering::SeqCst),
+        "the browser never opened"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+fn credential_on(auth_url: &str) -> String {
+    serde_json::json!({ "client_id": "id", "auth_url": auth_url, "token_url": "https://t.test/token" })
+        .to_string()
+}
+
+#[test]
+fn a_purpose_that_names_a_sign_in_scope_is_not_requested_twice() {
+    assert_eq!(
+        merge_scopes("account_info.read", "files.content.write account_info.read"),
+        "account_info.read files.content.write"
+    );
+}
+
+mod guard_tests {
+    use super::*;
+
+    fn shipped_registry_rows() -> Vec<crate::core::oauth_registry::OAuthProviderRow> {
+        let dir = crate::paths::repo_root()
+            .expect("repo root resolves under cargo test")
+            .join("system-knowhow");
+        crate::core::oauth_registry::load_providers(Some(dir.as_path()))
+    }
+
+    #[test]
+    fn every_shipped_row_without_sign_in_scopes_keeps_the_generic_set() {
+        let rows = shipped_registry_rows();
+        assert!(!rows.is_empty());
+        for row in rows.iter().filter(|r| r.sign_in_scopes.is_none()) {
+            assert_eq!(
+                sign_in_scopes_for(None, &credential_on(&row.auth_url), &rows),
+                "openid email profile",
+                "{} changed its sign-in scopes",
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_with_sign_in_scopes_decides_for_a_credential_on_its_endpoint() {
+        let rows = shipped_registry_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.sign_in_scopes.is_some())
+            .expect("a shipped row declares sign_in_scopes");
+        let expected = row.sign_in_scopes.clone().unwrap();
+        assert_eq!(
+            sign_in_scopes_for(None, &credential_on(&row.auth_url), &rows),
+            expected
+        );
+        assert!(
+            !expected.contains("openid"),
+            "the override exists to drop openid"
+        );
+    }
+
+    #[test]
+    fn an_unknown_endpoint_or_unparseable_credential_gets_the_generic_set() {
+        let rows = shipped_registry_rows();
+        assert_eq!(
+            sign_in_scopes_for(None, &credential_on("https://idp.example/authorize"), &rows),
+            "openid email profile"
+        );
+        assert_eq!(
+            sign_in_scopes_for(None, "not json", &rows),
+            "openid email profile"
+        );
+    }
+
+    #[test]
+    fn the_named_row_decides_when_a_hand_typed_auth_url_matches_no_host() {
+        let rows = shipped_registry_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.sign_in_scopes.is_some())
+            .expect("a shipped row declares sign_in_scopes");
+        assert_eq!(
+            sign_in_scopes_for(
+                Some(row),
+                &credential_on("https://idp.example/authorize"),
+                &rows
+            ),
+            row.sign_in_scopes.clone().unwrap()
+        );
+    }
+}

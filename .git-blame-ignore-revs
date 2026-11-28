@@ -1,0 +1,46 @@
+# Comment-strip commits: comments only, proven by two parsers. See docs/glossary.md, pre-comment-strip.
+79e0df937ea74c349784c65283ac03f13a6e2c77 # refactor(comment-strip): strip comments from src/components
+6fcabea5ffbb7e6d45f12c10c592dde057db5973 # refactor(comment-strip): strip comments from src/store
+61f205ac1411dcacc94be26b63b76b35ef1aa26a # refactor(comment-strip): strip comments from the rest of the app's src
+53fe400f1cef13d3dd87bfb90ff3ad1bd60d8e9b # refactor(comment-strip): strip comments from the app's e2e, vite and config files
+ed57a95f271e30f61195fe3b8636768bbdb44606 # refactor(comment-strip): strip comments from the SDK package
+5702b46934e101fc4c59f7e9f24c7a4788092c5b # refactor(comment-strip): strip comments from the remaining JavaScript and CSS
+eea0c41a514ae59e43123e80c8fbf6ce3123c4f3 # refactor(comment-strip): strip comments from lucidos-build-slot
+3898d0397e67ddfc5f1a463695792dd1c2cbcc1c # refactor(comment-strip): strip comments from lucidos-agent-sandbox
+b7d6818eee5fe9646b2614565b028395e9cf542e # refactor(comment-strip): strip comments from lucidos-capabilities
+4ecf3840c9771e2c592c04f6162e81f33753054c # refactor(comment-strip): strip comments from lucidos-claude-code-managed
+1481117864abfbec25bc912d4a998788761db87c # refactor(comment-strip): strip comments from lucidos-cli
+b679769e19b24630c036835a864cb71082d75637 # refactor(comment-strip): strip comments from lucidos-diagnostic-log
+3cdc12297f22abe1532d5d7e7e7fa974106e875d # refactor(comment-strip): strip comments from lucidos-diagnostic-log-macros
+992abbba806762fbd22b9dcb44dde33ca4750400 # refactor(comment-strip): strip comments from lucidos-e2e
+81fee296f8ab8e5dcf88e8620f92585378a9f7af # refactor(comment-strip): strip comments from lucidos-engine-bin
+29682e0e71a8c3b0806d9ac8f3e715f79f24a187 # refactor(comment-strip): strip comments from lucidos-engine-boot
+bdb1a8dbbaf849ae53fd1e643aa9a4aa541a5325 # refactor(comment-strip): strip comments from lucidos-event-hooks
+a1a738ff83e04ac8ab86cf9aa1eb1eb45344a28c # refactor(comment-strip): strip comments from lucidos-file-backup-exclusion
+4475831dfa47d006848d6a6ddba84723e5abf1ad # refactor(comment-strip): strip comments from lucidos-frame-capability
+d25d1dcf8011138c24e977e701f9618d628dc1be # refactor(comment-strip): strip comments from lucidos-gateway-constants
+75ecb4e32369e278a68f6313a964ce97bde7f1ed # refactor(comment-strip): strip comments from lucidos-gateway-stamp
+2ecdf33578942806fc97ef860220ce7bc8566019 # refactor(comment-strip): strip comments from lucidos-gateway-tls
+6765712d1d2e1fbbdd018e2e07413c0e6aae67d1 # refactor(comment-strip): strip comments from lucidos-home
+35b6181be43beb75ae0d70c0898f30e9ce748713 # refactor(comment-strip): strip comments from lucidos-installs
+5274c397cf7306f2312308667f3df34520fc9551 # refactor(comment-strip): strip comments from lucidos-local-token
+bea0f241e8d5f2ac98bc5d5cb701a9731975de83 # refactor(comment-strip): strip comments from lucidos-loopback-ca
+156209e66fff5547708da9770968f81fad036e86 # refactor(comment-strip): strip comments from lucidos-owner-lock
+11020aa51e77e3831548474ad936fe007263c4e1 # refactor(comment-strip): strip comments from lucidos-pg-url
+94f3752a80d897ab148044b89d33cdbe663372c1 # refactor(comment-strip): strip comments from lucidos-secret-store
+73d688d63a2363b3f050da577de2f601890c52bb # refactor(comment-strip): strip comments from lucidos-shell-env
+fd635e3620401b6bf00a1b4b29a60a730e679147 # refactor(comment-strip): strip comments from lucidos-tailscale
+dcb44a96c91be0734930e701aff6de72ce781a7d # refactor(comment-strip): strip comments from lucidos-update-channel
+424643314f847418038727bbb4403eb2f540821e # refactor(comment-strip): strip comments from lucidos-wire-codegen
+1af82c42c80ad68be40c865fb87577c2e675dc9f # refactor(comment-strip): strip comments from lucidos-eval
+0a554aef23438a8c9bcf0ec6ce68db05ac36c7d9 # refactor(comment-strip): strip comments main added to R1 files
+f00b283aab1244028233175be54905240dd7149b # refactor(comment-strip): strip comments from lucidos-gateway
+9dbd0050e8605273234d6eb5f43fd159186802f1 # refactor(comment-strip): strip comments from lucidos-app Rust sources
+239d839c7e56da13e2255363b5816548af05753a # refactor(comment-strip): strip comments from lucidos-core
+b63ffc6c75c6b439f683bd4b9d58a35c8ce94d0e # refactor(comment-strip): apply main kept list to lucidos-core
+4ea94ec72adf22657f424985a10388ca336873c9 # refactor(comment-strip): re-strip merged lucidos-core sources
+ca8ad68b8d725d6fc19dd7c0aef45bc0446d8cc6 # refactor(comment-strip): re-strip core after held-thread merge
+4fda123d5225862d62cd4b941122f36bc3f0592f # refactor(comment-strip): re-strip event hooks after merging main
+b26061d1b4bed3ab74c5fda3b6bd5cf750a0cb4a # refactor(comment-strip): strip comments from lucidos-agents-api
+5df6a1723c965710a398da8b942ce5e0185556fe # fix(comment-strip): preserve snapshot admission test boundary
+2f74de80e2406960b74f0ae17036600d71675c91 # refactor(comment-strip): strip comments from lucidos-engine

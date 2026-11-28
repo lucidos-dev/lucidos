@@ -1,0 +1,375 @@
+use super::*;
+use snapshot::{
+    journal::Journal, service::OfflineRestoreRequest, source_authority::VerifiedSource,
+};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Restore {
+    expected_workspace_id: String,
+    #[serde(default)]
+    confirmed: bool,
+    source_workspace: Option<String>,
+    reason: Option<String>,
+}
+
+fn check_target(request: &Restore, target: &OfflineRestoreRequest) -> Result<(), ApiError> {
+    if request.expected_workspace_id != target.gateway_slug {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "snapshot_restore_binding_mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn forces_source_verification(headers: &HeaderMap, request: &Restore) -> bool {
+    headers.contains_key(crate::core::subprocess_origin::HEADER_AGENT_ORIGIN_TOKEN)
+        || request.source_workspace.is_some()
+}
+
+pub(super) async fn restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<Handle>,
+    Json(request): Json<Restore>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    tokio::spawn(async move {
+        let slug = crate::core::base_path::workspace_id().ok_or_else(|| {
+            ApiError::new(StatusCode::FORBIDDEN, "snapshot_restore_gateway_required")
+        })?;
+        let port: u16 = crate::core::base_path::gateway_port()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| {
+                ApiError::new(StatusCode::FORBIDDEN, "snapshot_restore_gateway_required")
+            })?;
+        let workspace = state.workspace_path.clone();
+        let database_url = crate::core::database_url();
+        let binding_url = database_url.clone();
+        let target = worker(move || {
+            let app_data =
+                lucidos_home::gateway_data_dir().ok_or("snapshot_restore_binding_mismatch")?;
+            snapshot::registry_binding::resolve(
+                &app_data,
+                &workspace,
+                &binding_url,
+                &slug,
+                uuid::Uuid::new_v4(),
+            )
+        })
+        .await?;
+        check_target(&request, &target)?;
+        let source = if forces_source_verification(&headers, &request) {
+            let token = headers
+                .get(crate::core::subprocess_origin::HEADER_AGENT_ORIGIN_TOKEN)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::FORBIDDEN, "snapshot_restore_caller_unverified")
+                })?;
+            let hint = request
+                .source_workspace
+                .as_deref()
+                .unwrap_or(&target.gateway_slug);
+            Some(
+                VerifiedSource::verify(port, hint, token, &target)
+                    .await
+                    .map_err(failure)?,
+            )
+        } else {
+            None
+        };
+        let actor = if let Some(source) = &source {
+            crate::engine::thread_events::MessageOrigin::Workspace {
+                workspace: source.workspace().into(),
+                caller_gateway: None,
+                routing_gateway: None,
+                thread_id: Some(source.thread()),
+                event_id: None,
+                user_agent: None,
+                mode: crate::engine::thread_events::ActorMode::Agent,
+                remote_start: None,
+                verdict: None,
+            }
+        } else {
+            let actor = super::super::actor::require_owner_device(
+                &headers,
+                &state.pool,
+                &state.engine.event_bus,
+                None,
+                "restore a snapshot of this workspace",
+            )
+            .await?;
+            if !request.confirmed {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "snapshot_restore_confirmation_required",
+                ));
+            }
+            actor
+        };
+        let session = open(&state, ArchiveJobKind::SnapshotRestore).await?;
+        let reader = session.clone();
+        let snapshot = handle.clone();
+        let url = database_url.clone();
+        let workspace = state.workspace_path.clone();
+        worker(move || reader.preflight_restore(&snapshot, &url, &workspace)).await?;
+        if let Some(source) = &source {
+            let policy = prefs::SNAPSHOT_RESTORE_BY_AGENTS
+                .try_read(&state.pool)
+                .await
+                .map_err(|_| ApiError::internal("snapshot_preferences_unavailable"))?;
+            match policy.as_str() {
+                "allow" => {}
+                "ask" => source.spend(&target, &handle).await.map_err(failure)?,
+                _ => {
+                    return Err(ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "snapshot_restore_policy_unavailable",
+                    ))
+                }
+            }
+        }
+        let mut journal = Journal::new(
+            &target.gateway_slug,
+            handle.clone(),
+            actor.clone(),
+            request.reason,
+        );
+        journal.restore_id = target.restore_id;
+        let writer = session.clone();
+        worker(move || writer.admit_restore(&journal)).await?;
+        let requested = state
+            .engine
+            .event_bus
+            .emit(crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::SnapshotRestoreRequested {
+                    workspace_id: target.gateway_slug.clone(),
+                    handle,
+                    restore_id: target.restore_id,
+                    actor,
+                },
+            ))
+            .await;
+        let delivered = match requested {
+            Ok(_) => deliver_restore(port, &target.gateway_slug, target.restore_id).await,
+            Err(_) => Err(Undelivered::Refused),
+        };
+        match delivered {
+            Ok(()) => {}
+            Err(Undelivered::Refused) => {
+                let refuser = session.clone();
+                let id = target.restore_id;
+                worker(move || refuser.refuse_restore(id)).await?;
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "snapshot_restore_not_delivered",
+                ));
+            }
+            Err(Undelivered::Unknown) => {
+                return Err(ApiError::internal("snapshot_restore_delivery_unknown"))
+            }
+        }
+        drop(session);
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"restore_id":target.restore_id})),
+        ))
+    })
+    .await
+    .map_err(|_| ApiError::internal("snapshot_worker_failed"))?
+}
+
+// INVARIANT: The admission-order test ends here: /// Why an admitted restore
+#[derive(Debug, PartialEq, Eq)]
+enum Undelivered {
+    Refused,
+    Unknown,
+}
+
+async fn deliver_restore(
+    port: u16,
+    workspace: &str,
+    restore_id: uuid::Uuid,
+) -> Result<(), Undelivered> {
+    let client = crate::gateway_auth::client_builder()
+        .retry(reqwest::retry::never())
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .map_err(|_| Undelivered::Refused)?;
+    let control = format!(
+        "{}/~/api/v1/control/workspaces/{workspace}",
+        lucidos_local_token::client::origin(port)
+    );
+    let probe = client
+        .get(format!("{control}/snapshot-restore-status"))
+        .send()
+        .await;
+    if !probe.is_ok_and(|response| response.status().is_success()) {
+        return Err(Undelivered::Refused);
+    }
+    let response = client
+        .post(format!("{control}/snapshot-restore"))
+        .json(&serde_json::json!({ "restore_id": restore_id }))
+        .send()
+        .await
+        .map_err(|_| Undelivered::Unknown)?;
+    if response.status() == reqwest::StatusCode::ACCEPTED {
+        Ok(())
+    } else {
+        Err(Undelivered::Refused)
+    }
+}
+
+/// INVARIANT: Read only external state; never expose PreparedFiles or its host paths.
+pub(super) async fn status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    super::super::actor::require_user_actor(&headers, &state.pool, None).await?;
+    worker(move || {
+        let database = crate::core::secret_store::boot::database_name(&crate::core::database_url())
+            .map_err(|_| "snapshot_restore_unavailable")?;
+        let identity = snapshot::identity::workspace_id(
+            crate::core::base_path::workspace_id().as_deref(),
+            &database,
+        )
+        .map_err(|_| "snapshot_restore_unavailable")?;
+        let store = snapshot::store::Store::existing_for_database(&database, identity)
+            .map_err(|_| "snapshot_restore_unavailable")?;
+        let journal = store
+            .journals()?
+            .into_iter()
+            .find(|journal| journal.restore_id == id)
+            .ok_or("snapshot_restore_unavailable")?;
+        Ok(serde_json::json!({
+            "restore_id":journal.restore_id, "workspace_id":journal.workspace_id,
+            "handle":journal.snapshot, "recovery":journal.recovery, "phase":journal.phase(),
+            "actor":journal.actor, "updated_at":journal.updated_at,
+        }))
+    })
+    .await
+    .map(Json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delivery_is_refused_unless_the_post_left_unanswered() {
+        use axum::routing::{get, post};
+        use lucidos_local_token::test_support::serve_https;
+        let status = "/~/api/v1/control/workspaces/target/snapshot-restore-status";
+        let restore = "/~/api/v1/control/workspaces/target/snapshot-restore";
+        for (answer, expected) in [
+            (StatusCode::ACCEPTED, Ok(())),
+            (StatusCode::CONFLICT, Err(Undelivered::Refused)),
+            (StatusCode::NOT_FOUND, Err(Undelivered::Refused)),
+        ] {
+            let router = Router::new()
+                .route(status, get(|| async { StatusCode::OK }))
+                .route(restore, post(move || async move { answer }));
+            let server = serve_https(router);
+            let id = uuid::Uuid::new_v4();
+            assert_eq!(deliver_restore(server.port(), "target", id).await, expected);
+            server.abort();
+        }
+
+        for probe in [StatusCode::MOVED_PERMANENTLY, StatusCode::FORBIDDEN] {
+            let router = Router::new()
+                .route(status, get(move || async move { probe }))
+                .route(restore, post(|| async { StatusCode::ACCEPTED }));
+            let server = serve_https(router);
+            let id = uuid::Uuid::new_v4();
+            assert_eq!(
+                deliver_restore(server.port(), "target", id).await,
+                Err(Undelivered::Refused),
+                "a refused probe sends no restore"
+            );
+            server.abort();
+        }
+
+        let server = serve_https(
+            Router::new()
+                .route(status, get(|| async { StatusCode::OK }))
+                .route(
+                    restore,
+                    post(|| async {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        StatusCode::ACCEPTED
+                    }),
+                ),
+        );
+        let port = server.port();
+        let pending = tokio::spawn(deliver_restore(port, "target", uuid::Uuid::new_v4()));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        server.abort();
+        assert_eq!(pending.await.unwrap(), Err(Undelivered::Unknown));
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        assert_eq!(
+            deliver_restore(port, "target", uuid::Uuid::new_v4()).await,
+            Err(Undelivered::Refused)
+        );
+    }
+
+    #[test]
+    fn restore_body_cannot_supply_authority_or_paths() {
+        for field in [
+            "actor",
+            "origin_token",
+            "database_url",
+            "workspace_path",
+            "restore_id",
+            "approval",
+        ] {
+            let mut body = serde_json::json!({"expected_workspace_id":"target"});
+            body[field] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<Restore>(body).is_err());
+        }
+        let request: Restore =
+            serde_json::from_value(serde_json::json!({"expected_workspace_id":"other"})).unwrap();
+        assert!(!request.confirmed);
+        let target = OfflineRestoreRequest {
+            restore_id: uuid::Uuid::new_v4(),
+            gateway_slug: "target".into(),
+            workspace_name: "Target".into(),
+        };
+        assert!(check_target(&request, &target).is_err());
+    }
+
+    #[test]
+    fn any_origin_credential_forces_source_verification() {
+        let request = |source: Option<&str>| Restore {
+            expected_workspace_id: "target".into(),
+            confirmed: true,
+            source_workspace: source.map(str::to_owned),
+            reason: None,
+        };
+        let mut headers = HeaderMap::new();
+        assert!(!forces_source_verification(&headers, &request(None)));
+        assert!(forces_source_verification(&headers, &request(Some("src"))));
+        headers.insert(
+            crate::core::subprocess_origin::HEADER_AGENT_ORIGIN_TOKEN,
+            "unverifiable".parse().unwrap(),
+        );
+        assert!(forces_source_verification(&headers, &request(None)));
+    }
+
+    #[test]
+    fn admission_runs_inside_a_spawned_task_and_the_post_is_sent_once() {
+        const SOURCE: &str = include_str!("snapshots_restore.rs");
+        let start = SOURCE.find("pub(super) async fn restore(").unwrap();
+        let end = start + SOURCE[start..].find("/// Why an admitted restore").unwrap();
+        let handler = &SOURCE[start..end];
+        assert!(handler.find("tokio::spawn(").unwrap() < handler.find("admit_restore(").unwrap());
+        let start = SOURCE.find("async fn deliver_restore(").unwrap();
+        let end = start + SOURCE[start..].find("pub(super) async fn status(").unwrap();
+        let deliver = &SOURCE[start..end];
+        assert_eq!(deliver.matches(".post(").count(), 1);
+        assert!(deliver.contains("retry::never()"));
+    }
+}

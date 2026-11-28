@@ -1,0 +1,202 @@
+use base64::Engine as _;
+
+use crate::core::blobs::resolve_blob;
+use crate::core::events::{image_handle, ImageRef};
+use crate::llm::{ContentBlock, MessageContent};
+
+const MAX_TOTAL_IMAGE_BASE64: usize = 10_000_000;
+
+pub(super) const MAX_HISTORY_IMAGE_MESSAGES: usize = 3;
+
+pub(super) fn image_recency_cutoff(
+    all_prior: &[crate::core::store::SessionMessage],
+    max_messages: usize,
+) -> usize {
+    let user_count = all_prior.iter().filter(|m| m.role == "user").count();
+    user_count.saturating_sub(max_messages)
+}
+
+pub(super) fn filter_recent_history_image_hashes(
+    all_prior: &[crate::core::store::SessionMessage],
+    max_messages: usize,
+) -> Vec<Vec<String>> {
+    let cutoff = image_recency_cutoff(all_prior, max_messages);
+    all_prior
+        .iter()
+        .filter(|m| m.role == "user")
+        .skip(cutoff)
+        .filter(|m| !m.user_image_hashes.is_empty())
+        .map(|m| m.user_image_hashes.clone())
+        .collect()
+}
+
+pub(super) fn image_content_block(img: crate::engine::types::ChatImage) -> ContentBlock {
+    ContentBlock::Image {
+        source_type: "base64".to_string(),
+        media_type: img.mime_type,
+        data: img.base64,
+    }
+}
+
+pub(crate) fn current_image_handles(
+    workspace: &std::path::Path,
+    images: &[crate::engine::types::ChatImage],
+) -> Vec<Option<String>> {
+    images
+        .iter()
+        .map(|img| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&img.base64)
+                .ok()?;
+            let hash = crate::core::blobs::compute_hash(&bytes);
+            resolve_blob(workspace, &hash)?;
+            Some(image_handle(ImageRef::BlobHash(&hash)))
+        })
+        .collect()
+}
+
+pub(crate) fn handles_note(handles: &[String]) -> String {
+    if handles.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", handles.join(" "))
+    }
+}
+
+pub(super) fn build_user_content_with_images(
+    user_message_text: String,
+    workspace: &std::path::Path,
+    history_image_hashes: &[Vec<String>],
+    current_images: Option<&[crate::engine::types::ChatImage]>,
+    current_handles: &[Option<String>],
+) -> MessageContent {
+    let mut history_blocks: Vec<ContentBlock> = Vec::new();
+    let mut current_blocks: Vec<ContentBlock> = Vec::new();
+    let mut sent_handles: Vec<String> = Vec::new();
+    let mut total_image_bytes: usize = 0;
+
+    for hashes in history_image_hashes.iter() {
+        for hash in hashes.iter() {
+            let Some(blob) = resolve_blob(workspace, hash) else {
+                log_legacy!(
+                    "[Chat] History image {} has no blob on disk, so the model sees the text without it",
+                    hash
+                );
+                continue;
+            };
+            let bytes = match std::fs::read(&blob.path) {
+                Ok(b) => b,
+                Err(e) => {
+                    log_legacy!(
+                        "[Chat] Cannot read history image blob {}: {}. The model sees the text without it",
+                        blob.path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let fitted = crate::engine::types::ChatImage {
+                base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                mime_type: blob.mime,
+            }
+            .fit_for_llm();
+            if total_image_bytes + fitted.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
+                continue;
+            }
+            total_image_bytes += fitted.base64.len();
+            history_blocks.push(image_content_block(fitted));
+        }
+    }
+
+    if let Some(imgs) = current_images {
+        for (i, img) in imgs.iter().enumerate() {
+            let fitted = img.clone().fit_for_llm();
+            if total_image_bytes + fitted.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
+                continue;
+            }
+            total_image_bytes += fitted.base64.len();
+            current_blocks.push(image_content_block(fitted));
+            sent_handles.extend(current_handles.get(i).cloned().flatten());
+        }
+    }
+
+    let history_count = history_blocks.len();
+    let current_count = current_blocks.len();
+    let total = history_count + current_count;
+
+    if total == 0 {
+        return MessageContent::Text(user_message_text);
+    }
+
+    let read_instruction = "Read all text and content from every image. Do NOT ask the user to provide details visible in the images.";
+    let read_instruction_single = "Read all text and content from the image. Do NOT ask the user to provide details visible in the image.";
+
+    let stale_warning = "IMPORTANT: These images may not reflect current state — code, UI, or configuration may have changed since they were sent. Do NOT assume they show current state.";
+
+    let handles_note = handles_note(&sent_handles);
+
+    let hint = if history_count > 0 && current_count > 0 {
+        format!(
+            "\n\n[{} images total: {} from earlier in the conversation, {} attached to current message{}. {} {}]",
+            total,
+            history_count,
+            current_count,
+            handles_note,
+            read_instruction,
+            stale_warning,
+        )
+    } else if current_count > 0 {
+        if current_count == 1 {
+            format!(
+                "\n\n[1 image attached to this message{}. {}]",
+                handles_note, read_instruction_single
+            )
+        } else {
+            format!(
+                "\n\n[{} images attached to this message{}. {}]",
+                current_count, handles_note, read_instruction
+            )
+        }
+    } else {
+        if history_count == 1 {
+            format!(
+                "\n\n[1 image from earlier in the conversation. {} {}]",
+                read_instruction_single, stale_warning
+            )
+        } else {
+            format!(
+                "\n\n[{} images from earlier in the conversation. {} {}]",
+                history_count, read_instruction, stale_warning
+            )
+        }
+    };
+
+    let mut blocks = vec![ContentBlock::Text {
+        text: format!("{}{}", user_message_text, hint),
+    }];
+
+    if history_count > 0 && current_count > 0 {
+        blocks.extend(history_blocks);
+        blocks.push(ContentBlock::Text {
+            text: format!(
+                "[Below: {} attached to current message{}]",
+                if current_count == 1 {
+                    "image"
+                } else {
+                    "images"
+                },
+                handles_note,
+            ),
+        });
+        blocks.extend(current_blocks);
+    } else {
+        blocks.extend(history_blocks);
+        blocks.extend(current_blocks);
+    }
+
+    MessageContent::Blocks(blocks)
+}
+
+#[cfg(test)]
+#[path = "images_tests.rs"]
+mod tests;

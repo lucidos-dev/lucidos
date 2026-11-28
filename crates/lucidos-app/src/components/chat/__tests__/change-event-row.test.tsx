@@ -1,0 +1,154 @@
+import { describe, it, expect } from 'vitest';
+import type { ComponentChildren, VNode } from 'preact';
+import { appliedBuildWaitLabel, changeEventRowBody, changeWaitsForBuild } from '../chat-exchange-parts';
+import { CommitList } from '../../shared/CommitList';
+import { EventRowFoldView } from '../EventRow';
+
+interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
+
+function text(n: ComponentChildren): string {
+  if (n === null || n === undefined || typeof n === 'boolean') return '';
+  if (typeof n === 'string' || typeof n === 'number') return String(n);
+  if (Array.isArray(n)) return n.map(text).join('');
+  return text((n as AnyVNode).props.children);
+}
+
+function byClass(node: ComponentChildren, cls: string): AnyVNode | null {
+  if (node === null || node === undefined || typeof node === 'boolean') return null;
+  if (typeof node === 'string' || typeof node === 'number') return null;
+  if (Array.isArray(node)) {
+    for (const c of node) {
+      const m = byClass(c, cls);
+      if (m) return m;
+    }
+    return null;
+  }
+  const v = node as AnyVNode;
+  const klass = v.props?.class;
+  if (typeof klass === 'string' && klass.split(/\s+/).includes(cls)) return v;
+  return byClass(v.props?.children, cls);
+}
+
+function byType(node: ComponentChildren, type: unknown): AnyVNode | null {
+  if (node === null || node === undefined || typeof node === 'boolean') return null;
+  if (typeof node === 'string' || typeof node === 'number') return null;
+  if (Array.isArray(node)) {
+    for (const c of node) {
+      const m = byType(c, type);
+      if (m) return m;
+    }
+    return null;
+  }
+  const v = node as AnyVNode;
+  if (v.type === type) return v;
+  return byType(v.props?.children, type);
+}
+
+const base = {
+  type: 'ChangeApplied' as const,
+  headline: 'Fix the bug',
+  stateLabel: 'Applied',
+  tone: 'good' as const,
+};
+
+describe('change event row', () => {
+  it('is an event row: chip, state word, headline, file count', () => {
+    const row = changeEventRowBody({ ...base, fileCount: 3 }) as AnyVNode;
+    expect(row.props.class).toBe('event-row');
+    expect(row.props['data-kind']).toBe('change');
+    expect(row.props['data-state']).toBe('ChangeApplied');
+    const subject = byClass(row, 'event-row-subject')!;
+    expect(byClass(subject, 'event-name')).not.toBeNull();
+    expect(text(subject)).toBe('Change');
+    expect(text(byClass(row, 'event-row-detail'))).toBe('Fix the bug');
+    const state = byClass(row, 'event-row-state')!;
+    expect(text(state)).toBe('Applied');
+    expect(state.props['data-tone']).toBe('good');
+    expect(text(byClass(row, 'event-row-meta'))).toBe('3 files');
+  });
+
+  it('puts Diff and Revert inside the card', () => {
+    const row = changeEventRowBody({ ...base, actions: <button class="action-btn">Revert</button> });
+    expect(text(byClass(row, 'event-row-actions'))).toBe('Revert');
+  });
+
+  it.each([
+    ['good', true],
+    ['bad', true],
+    ['none', false],
+    ['halted', false],
+  ] as const)('draws a glyph before the %s state word: %s', (tone, glyph) => {
+    const row = changeEventRowBody({ ...base, tone });
+    const state = byClass(row, 'event-row-state')!;
+    expect(byClass(state, 'event-row-state-glyph') !== null).toBe(glyph);
+    expect(text(state)).toBe('Applied');
+  });
+
+  it('shows a failed apply\'s error unfolded', () => {
+    const row = changeEventRowBody({
+      ...base,
+      type: 'ChangeApplyFailed',
+      headline: undefined,
+      stateLabel: 'Failed',
+      tone: 'bad',
+      error: 'merge conflict in a.ts',
+    });
+    const fold = byType(row, EventRowFoldView)!;
+    expect(fold.props.open).toBe(true);
+    expect(text(fold.props.body as ComponentChildren)).toContain('merge conflict in a.ts');
+  });
+
+  it('folds a change of several commits into a closed commit list', () => {
+    const row = changeEventRowBody({ ...base, commits: ['feat: first', 'fix: second'] });
+    const fold = byType(row, EventRowFoldView)!;
+    expect(fold.props.label).toBe('2 commits');
+    expect(fold.props.open).toBeFalsy();
+    const list = byType(fold.props.body as ComponentChildren, CommitList)!;
+    expect(list.props.commits).toEqual(['feat: first', 'fix: second']);
+  });
+
+  it('draws no fold for one commit, which the headline already is', () => {
+    const row = changeEventRowBody({ ...base, commits: ['feat: only'] });
+    expect(byType(row, EventRowFoldView)).toBeNull();
+  });
+
+  it('gives the fold to a failed apply\'s error over the commit list', () => {
+    const row = changeEventRowBody({
+      ...base,
+      type: 'ChangeApplyFailed',
+      stateLabel: 'Failed',
+      tone: 'bad',
+      commits: ['a', 'b'],
+      error: 'merge conflict',
+    });
+    expect(byType(row, EventRowFoldView)!.props.label).toBe('Error');
+  });
+
+  it('holds the headline line while the headline loads', () => {
+    const row = changeEventRowBody({ ...base, headline: undefined, headlinePending: true });
+    expect(text(byClass(row, 'event-row-detail'))).toBe('\u00a0');
+  });
+
+  it('states no fact it does not have', () => {
+    const row = changeEventRowBody({ ...base, headline: undefined });
+    expect(byClass(row, 'event-row-detail')).toBeNull();
+    expect(byClass(row, 'event-row-meta')).toBeNull();
+    expect(byType(row, EventRowFoldView)).toBeNull();
+    expect(byClass(row, 'event-row-actions')).toBeNull();
+  });
+});
+
+
+it('an applied row explains a held version with the right thread count', () => {
+  expect(appliedBuildWaitLabel(2)).toBe('Applied. New version waits for 2 coding threads.');
+  expect(appliedBuildWaitLabel(1)).toBe('Applied. New version waits for 1 coding thread.');
+});
+
+
+it('only attributes a global hold to the latest known unbuilt applied commit', () => {
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: 'pending' }, 'pending')).toBe(true);
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: 'historical' }, 'pending')).toBe(false);
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: 'pending' }, null)).toBe(false);
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: null }, null)).toBe(false);
+  expect(changeWaitsForBuild({ requires_restart: false, post_merge_sha: 'pending' }, 'pending')).toBe(false);
+});

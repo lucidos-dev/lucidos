@@ -1,0 +1,848 @@
+use super::super::LucidosEngine;
+use crate::core::events::{walk_thread_images, HasEventPayload};
+use crate::core::WriteAnnouncement;
+use crate::engine::types::ChatImage;
+use crate::llm::ImageSize;
+use base64::Engine as _;
+use std::path::Path;
+
+fn looks_like_description_prompt(prompt: &str) -> bool {
+    const PREFIXES: &[&[u8]] = &[
+        b"describe ",
+        b"analyse ",
+        b"analyze ",
+        b"summarize ",
+        b"summarise ",
+        b"transcribe ",
+        b"explain ",
+        b"identify ",
+        b"read the ",
+        b"what is in ",
+        b"what's in ",
+        b"what does this ",
+        b"what do you see ",
+        b"tell me about this image",
+        b"tell me what ",
+    ];
+    let trimmed = prompt.trim_start().as_bytes();
+    PREFIXES.iter().any(|needle| {
+        trimmed.len() >= needle.len() && trimmed[..needle.len()].eq_ignore_ascii_case(needle)
+    })
+}
+
+const IMAGE_HANDLE_PREFIX: &str = "img-";
+
+fn is_image_handle(reference: &str) -> bool {
+    reference
+        .strip_prefix(IMAGE_HANDLE_PREFIX)
+        .is_some_and(|hex| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+pub(crate) fn is_thread_image_ref(reference: &str) -> bool {
+    reference.starts_with("thread:") || is_image_handle(reference)
+}
+
+fn find_thread_image<'a>(
+    images: &'a [crate::core::events::ThreadImage],
+    reference: &str,
+) -> Result<&'a crate::core::events::ThreadImage, String> {
+    let total = images.len();
+    if is_image_handle(reference) {
+        return images
+            .iter()
+            .find(|i| i.handle.eq_ignore_ascii_case(reference))
+            .ok_or_else(|| {
+                format!(
+                    "Image handle '{reference}' not found. Thread contains \
+                     {total} images total."
+                )
+            });
+    }
+    let index_str = reference.strip_prefix("thread:").ok_or_else(|| {
+        format!(
+            "Invalid image reference '{}': expected 'thread:N' or an \
+             'img-<hex>' handle",
+            reference
+        )
+    })?;
+    let index: usize = index_str
+        .parse()
+        .map_err(|_| format!("Invalid thread image index in '{}'", reference))?;
+    if index == 0 {
+        return Err(format!(
+            "Thread image index must be 1 or greater (got '{}')",
+            reference
+        ));
+    }
+    images.iter().find(|i| i.index == index).ok_or_else(|| {
+        format!(
+            "Thread image '{}' not found. Thread contains {} images total.",
+            reference, total
+        )
+    })
+}
+
+pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
+    workspace: &Path,
+    events: &[E],
+    refs: &[String],
+) -> Result<Vec<ChatImage>, Box<dyn std::error::Error + Send + Sync>> {
+    let images = walk_thread_images(workspace, events);
+
+    let mut result = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let img = find_thread_image(&images, reference)?;
+        if img.base64.is_empty() {
+            return Err(format!(
+                "Thread image '{}' is referenced but its blob is missing on disk.",
+                reference
+            )
+            .into());
+        }
+        result.push(ChatImage {
+            base64: img.base64.clone(),
+            mime_type: img.mime_type.clone(),
+        });
+    }
+    Ok(result)
+}
+
+#[easy_ext::ext(ImageExt)]
+pub(crate) impl LucidosEngine {
+    async fn current_image_provider(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::llm::ImageProvider>> {
+        self.workspace_providers
+            .build_image(
+                &self.pool,
+                self.openai_api_key.as_deref(),
+                &self.vertex_project_id,
+                &self.vertex_location,
+                &self.vertex_token_cache,
+            )
+            .await
+    }
+
+    async fn execute_generate_image(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let provider = self.current_image_provider().await.ok_or(concat!(
+            "No image provider configured. Add an OpenAI key under ",
+            providers_settings!(),
+            " (or set OPENAI_API_KEY), or configure Google Cloud (set \
+                 VERTEX_PROJECT_ID or run `gcloud auth application-default login`).",
+        ))?;
+
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or("prompt is required")?;
+
+        // Guard against tool misuse: the model sometimes calls generate_image
+        // with prompts like "describe this image in detail" expecting back a
+        // text description. The provider would then synthesise a derivative
+        // image of nothing useful. Block these prompts with a pointer at the
+        // model's native vision instead.
+        // TEMPORARY MEASURE — model-tolerance (removable; see
+        // docs/temporary-measures.md § "generate_image vision-misuse guard",
+        // governed by .claude/rules/temporary-measures.md). Drop once the model
+        // reliably stops mistaking generate_image for a vision tool.
+        if looks_like_description_prompt(prompt) {
+            return Err(
+                "this prompt looks like a request to describe/analyse an image, but \
+                 `generate_image` SYNTHESISES new images and returns image bytes — not \
+                 text descriptions. To describe or analyse an image, just describe it \
+                 directly in your reply: you have native vision over recent images in the \
+                 conversation. If the image was posted earlier and you can no longer see \
+                 it, call view_image with its 'img-<hex>' handle first to bring it back \
+                 into view, then describe it."
+                    .into(),
+            );
+        }
+
+        let size = args
+            .get("size")
+            .and_then(|v| v.as_str())
+            .map(ImageSize::parse_size)
+            .unwrap_or(ImageSize::Auto);
+
+        let raw_save_path = args.get("save_as_artifact").and_then(|v| v.as_str());
+        // INVARIANT: Refused before the provider call, which the user pays for. Refused
+        // after it, the image is generated, billed and then thrown away.
+        if let Some(path) = raw_save_path {
+            if crate::core::is_path_traversal(path) {
+                return Err(format!(
+                    "Invalid save_as_artifact path (must not contain '..' or start with '/' or '\\'): {}",
+                    path
+                )
+                .into());
+            }
+        }
+        let save_as_artifact = raw_save_path.map(crate::core::artifact_relative_path);
+
+        let input_refs: Vec<String> = args
+            .get("input_images")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if input_refs.len() > 1 && !provider.supports_multi_image() {
+            return Err(format!(
+                "the current image provider ({}) only supports one input image for editing. \
+                 You provided {} images. Please ask the user which image they'd like to use, \
+                 or switch to a provider that supports multiple images.",
+                provider.name(),
+                input_refs.len()
+            )
+            .into());
+        }
+
+        let mut input_images: Vec<Vec<u8>> = Vec::new();
+        for reference in &input_refs {
+            match self.resolve_image_reference(reference, thread_id).await {
+                Ok(bytes) => input_images.push(bytes),
+                Err(e) => return Err(format!("resolving image '{}': {}", reference, e).into()),
+            }
+        }
+
+        crate::log_legacy!(
+            "[Image] Generating with {} (prompt: {}, inputs: {}, size: {:?})",
+            provider.name(),
+            &prompt[..prompt.floor_char_boundary(50)],
+            input_images.len(),
+            size
+        );
+
+        let result = crate::engine::AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::ImageGen,
+        )
+        .generate(provider.as_ref(), prompt, input_images, size)
+        .await?;
+
+        let compressed = ChatImage {
+            base64: base64::engine::general_purpose::STANDARD.encode(&result.bytes),
+            mime_type: result.mime_type,
+        }
+        .compress();
+
+        if let Some(artifact_path) = save_as_artifact {
+            let raw_bytes = base64::engine::general_purpose::STANDARD.decode(&compressed.base64)?;
+            self.artifact_manager
+                .write_and_commit(
+                    &self.lock_workspace_repo().await,
+                    &self.event_bus,
+                    artifact_path,
+                    &raw_bytes,
+                    &format!("feat: generated image {}", artifact_path),
+                    WriteAnnouncement::Entity {
+                        writer: crate::core::artifact_writer::ArtifactWriterOrigin::Thread(
+                            thread_id,
+                        ),
+                        source: Some("generate_image".to_string()),
+                        writer_thread_id: Some(thread_id),
+                    },
+                )
+                .await?;
+            crate::log_legacy!("[Image] Saved to artifact: {}", artifact_path);
+        }
+
+        let result_text = if let Some(path) = save_as_artifact {
+            format!("Image generated and saved to artifacts/{}.", path)
+        } else {
+            "Image generated successfully.".to_string()
+        };
+
+        Ok(generated_image_result(&compressed.base64, &result_text))
+    }
+
+    async fn execute_save_thread_image(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let reference = args
+            .get("image")
+            .and_then(|v| v.as_str())
+            .ok_or("image is required (an 'img-<hex>' handle, or 'thread:1')")?;
+
+        if !is_thread_image_ref(reference) {
+            return Err(
+                "image must name an image already in this thread: its 'img-<hex>' \
+                 handle, or 'thread:1'"
+                    .into(),
+            );
+        }
+
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("path is required, under artifacts/ (e.g. 'artifacts/reports/photo.jpg')")?;
+
+        if crate::core::is_path_traversal(path) {
+            return Err("Invalid path (must not contain '..' or start with '/' or '\\')".into());
+        }
+        let artifact_path = crate::core::artifact_relative_path(path);
+
+        let raw_bytes = self.resolve_image_reference(reference, thread_id).await?;
+
+        self.artifact_manager
+            .write_and_commit(
+                &self.lock_workspace_repo().await,
+                &self.event_bus,
+                artifact_path,
+                &raw_bytes,
+                &format!("feat: save thread image to {}", artifact_path),
+                WriteAnnouncement::Entity {
+                    writer: crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id),
+                    source: Some("save_thread_image".to_string()),
+                    writer_thread_id: Some(thread_id),
+                },
+            )
+            .await?;
+
+        crate::log_legacy!("[Image] Saved thread image to artifact: {}", artifact_path);
+
+        Ok(format!("Image saved to artifacts/{}.", artifact_path))
+    }
+
+    /// INVARIANT: Re-load an image posted earlier in the thread back into the model's
+    /// vision. Takes an `img-<hex>` handle or a `thread:N` reference, and
+    /// returns the `[IMAGE_CONTENT:<type>]\n<base64>` sentinel. The agentic
+    /// loop (`parse_image_content_marker`) lifts that into a real
+    /// `ContentBlock::Image`, the same path `read_file` uses for image files.
+    /// This is the only way the model can see an image that has aged out of
+    /// the auto-included window.
+    async fn execute_view_image(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let reference = args
+            .get("image")
+            .and_then(|v| v.as_str())
+            .ok_or("image is required (an 'img-<hex>' handle, or 'thread:1')")?;
+
+        if !is_thread_image_ref(reference) {
+            return Err(
+                "image must name an image already in this thread: its 'img-<hex>' \
+                 handle, or 'thread:1'. To view an image file saved under \
+                 data/artifacts/, use read_file instead."
+                    .into(),
+            );
+        }
+
+        let img = self.resolve_thread_image(reference, thread_id).await?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&img.base64)?;
+
+        crate::log_legacy!("[Image] view_image loaded {} into vision", reference);
+        Ok(crate::engine::tools::files::encode_image_for_read(
+            bytes,
+            &img.mime_type,
+        ))
+    }
+
+    async fn resolve_thread_image(
+        &self,
+        reference: &str,
+        thread_id: uuid::Uuid,
+    ) -> Result<ChatImage, Box<dyn std::error::Error + Send + Sync>> {
+        let events = self
+            .event_store
+            .get_thread_events(&thread_id.to_string())
+            .await?;
+        resolve_thread_image_refs(&self.workspace_path, &events, &[reference.to_string()])?
+            .pop()
+            .ok_or_else(|| "internal: resolve_thread_image_refs returned no image".into())
+    }
+
+    async fn resolve_image_reference(
+        &self,
+        reference: &str,
+        thread_id: uuid::Uuid,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        if is_thread_image_ref(reference) {
+            let img = self.resolve_thread_image(reference, thread_id).await?;
+            Ok(base64::engine::general_purpose::STANDARD.decode(&img.base64)?)
+        } else {
+            let (_, full_path) = self.resolve_data_path(reference)?;
+            if !full_path.exists() {
+                return Err(format!("Image file not found: {}", reference).into());
+            }
+            Ok(std::fs::read(&full_path)?)
+        }
+    }
+}
+
+fn generated_image_result(base64: &str, text: &str) -> String {
+    format!("[GENERATED_IMAGE:{base64}]\n{text}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::blobs::write_blob;
+    use crate::core::events::EventRow;
+    use crate::llm::tool_names as tn;
+    use crate::llm::tools::{
+        get_default_tools, get_save_thread_image_tool, get_view_image_tool, ToolCapabilities,
+    };
+    use std::path::Path;
+
+    fn png_with_marker(marker: u8) -> Vec<u8> {
+        vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            marker,
+        ]
+    }
+
+    fn message_event_with_blobs(workspace: &Path, n: u8) -> (Vec<String>, EventRow) {
+        let markers: Vec<u8> = (0..n).collect();
+        message_event_from_markers(workspace, &markers)
+    }
+
+    fn message_event_from_markers(workspace: &Path, markers: &[u8]) -> (Vec<String>, EventRow) {
+        let hashes: Vec<String> = markers
+            .iter()
+            .map(|m| write_blob(workspace, &png_with_marker(*m)).unwrap().hash)
+            .collect();
+        let event = EventRow::new(
+            "MessageReceived",
+            serde_json::json!({
+                "text": "hi",
+                "user_image_hashes": hashes,
+            }),
+        );
+        (hashes, event)
+    }
+
+    #[test]
+    fn resolve_thread_image_refs_returns_only_requested_indices() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 3);
+        let events = vec![event];
+
+        let resolved = resolve_thread_image_refs(
+            tmp.path(),
+            &events,
+            &["thread:1".to_string(), "thread:3".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].mime_type, "image/png");
+        assert_eq!(resolved[1].mime_type, "image/png");
+        assert_ne!(resolved[0].base64, resolved[1].base64);
+    }
+
+    #[test]
+    fn resolve_thread_image_refs_empty_input_returns_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let resolved = resolve_thread_image_refs(tmp.path(), &events, &[]).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_thread_image_refs_invalid_index_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let err = resolve_thread_image_refs(tmp.path(), &events, &["thread:5".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("thread:5") || err.contains("not found"),
+            "error should mention missing index, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_thread_image_refs_rejects_zero_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let err = resolve_thread_image_refs(tmp.path(), &events, &["thread:0".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("1 or greater") || err.contains("thread:0"),
+            "error should reject zero, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_thread_image_refs_rejects_unknown_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
+        let events = vec![event];
+        let err =
+            resolve_thread_image_refs(tmp.path(), &events, &["artifacts/foo.png".to_string()])
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("thread:") && err.contains("img-"),
+            "error should name both accepted forms, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_handle_and_its_thread_index_name_the_same_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 3);
+        let events = vec![event];
+
+        let walked = crate::core::events::walk_thread_images(tmp.path(), &events);
+        let second = &walked[1];
+        assert!(second.handle.starts_with("img-"), "{}", second.handle);
+
+        let by_handle =
+            resolve_thread_image_refs(tmp.path(), &events, std::slice::from_ref(&second.handle))
+                .unwrap();
+        let by_index =
+            resolve_thread_image_refs(tmp.path(), &events, &["thread:2".to_string()]).unwrap();
+        assert_eq!(by_handle[0].base64, by_index[0].base64);
+    }
+
+    #[test]
+    fn a_handle_survives_the_renumbering_that_breaks_thread_n() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let target = crate::core::events::walk_thread_images(tmp.path(), &events)[0]
+            .handle
+            .clone();
+        let before =
+            resolve_thread_image_refs(tmp.path(), &events, std::slice::from_ref(&target)).unwrap();
+        let before_by_index =
+            resolve_thread_image_refs(tmp.path(), &events, &["thread:1".to_string()]).unwrap();
+        assert_eq!(before[0].base64, before_by_index[0].base64);
+
+        let (_older_hashes, older) = message_event_from_markers(tmp.path(), &[40, 41]);
+        let shifted = vec![older, events.into_iter().next().unwrap()];
+
+        let after = resolve_thread_image_refs(tmp.path(), &shifted, &[target]).unwrap();
+        assert_eq!(
+            after[0].base64, before[0].base64,
+            "the handle must still name its own image"
+        );
+        let now_at_index_1 =
+            resolve_thread_image_refs(tmp.path(), &shifted, &["thread:1".to_string()]).unwrap();
+        assert_ne!(
+            now_at_index_1[0].base64, before[0].base64,
+            "this test is only meaningful if thread:1 really did move"
+        );
+    }
+
+    #[test]
+    fn a_user_images_handle_comes_from_the_hash_the_payload_already_carries() {
+        use crate::core::events::{image_handle, ImageRef};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let walked = crate::core::events::walk_thread_images(tmp.path(), &events);
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(walked[i].handle, image_handle(ImageRef::BlobHash(hash)));
+        }
+        let meta = crate::core::events::walk_thread_images_meta(tmp.path(), &events);
+        assert_eq!(meta[0].handle, walked[0].handle);
+        assert_eq!(meta[1].handle, walked[1].handle);
+    }
+
+    #[test]
+    fn an_unknown_handle_is_refused_rather_than_falling_back_to_a_position() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let err =
+            resolve_thread_image_refs(tmp.path(), &events, &["img-0000000000000000".to_string()])
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("not found"), "got: {}", err);
+        assert!(err.contains("2 images total"), "got: {}", err);
+    }
+
+    #[test]
+    fn an_artifact_path_that_merely_starts_with_img_is_not_a_handle() {
+        assert!(!is_thread_image_ref("img-cat.png"));
+        assert!(!is_thread_image_ref("img-notes/screenshot.png"));
+        assert!(!is_thread_image_ref("img-"));
+        assert!(is_thread_image_ref("img-abc"));
+        assert!(is_thread_image_ref("img-0123456789abcdef"));
+        assert!(is_thread_image_ref("thread:2"));
+    }
+
+    #[test]
+    fn a_handle_resolves_whatever_case_the_model_writes_it_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let handle = crate::core::events::walk_thread_images(tmp.path(), &events)[1]
+            .handle
+            .clone();
+        let hex = handle.strip_prefix("img-").expect("handle is prefixed");
+        let shouted = format!("img-{}", hex.to_uppercase());
+        assert_ne!(shouted, handle, "the fixture must have hex letters in it");
+
+        let lower =
+            resolve_thread_image_refs(tmp.path(), &events, std::slice::from_ref(&handle)).unwrap();
+        let upper = resolve_thread_image_refs(tmp.path(), &events, &[shouted]).unwrap();
+        assert_eq!(lower[0].base64, upper[0].base64);
+    }
+
+    #[test]
+    fn a_truncated_handle_does_not_resolve() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let full = crate::core::events::walk_thread_images(tmp.path(), &events)[0]
+            .handle
+            .clone();
+        let truncated: String = full.chars().take(full.chars().count() - 4).collect();
+        assert!(
+            resolve_thread_image_refs(tmp.path(), &events, &[truncated]).is_err(),
+            "a prefix of a handle is not a handle"
+        );
+    }
+
+    #[test]
+    fn view_image_tool_advertises_the_handle_and_still_accepts_thread_n() {
+        let tool = get_view_image_tool();
+        let desc = tool.parameters["properties"]["image"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("img-"), "must advertise the handle: {desc}");
+        assert!(desc.contains("thread:"), "must keep thread:N: {desc}");
+    }
+
+    #[test]
+    fn view_image_tool_definition() {
+        let tool = get_view_image_tool();
+        assert_eq!(tool.name, tn::VIEW_IMAGE);
+        let props = tool.parameters.get("properties").unwrap();
+        assert!(props.get("image").is_some(), "must declare an `image` arg");
+        let required = tool.parameters.get("required").unwrap().as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert!(required.iter().any(|v| v.as_str() == Some("image")));
+        let lower = tool.description.to_lowercase();
+        assert!(
+            lower.contains("view") || lower.contains("see"),
+            "description should explain it brings an image back into view: {}",
+            tool.description
+        );
+    }
+
+    #[test]
+    fn view_image_pipeline_produces_a_vision_sentinel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let img = resolve_thread_image_refs(tmp.path(), &events, &["thread:2".to_string()])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&img.base64)
+            .unwrap();
+        let sentinel = crate::engine::tools::files::encode_image_for_read(bytes, &img.mime_type);
+
+        let parsed = crate::engine::tools::files::parse_image_content_marker(&sentinel);
+        assert!(
+            parsed.is_some(),
+            "view_image output must be a vision sentinel the loop lifts into an image block, got: {}",
+            &sentinel[..sentinel.len().min(60)]
+        );
+        let (media_type, b64) = parsed.unwrap();
+        assert!(
+            media_type.starts_with("image/"),
+            "media type: {}",
+            media_type
+        );
+        assert!(!b64.is_empty(), "sentinel must carry base64 image data");
+    }
+
+    #[test]
+    fn run_coding_agent_tool_has_optional_images_parameter() {
+        let tools = get_default_tools(&ToolCapabilities::all_open());
+        let tool = tools
+            .iter()
+            .find(|t| t.name == tn::RUN_CODING_AGENT)
+            .expect("run_coding_agent tool must be registered");
+
+        let props = tool.parameters.get("properties").unwrap();
+        let images = props
+            .get("images")
+            .expect("run_coding_agent must declare an `images` parameter");
+
+        assert_eq!(
+            images.get("type").and_then(|v| v.as_str()),
+            Some("array"),
+            "images must be an array"
+        );
+
+        let items = images.get("items").expect("images must declare items");
+        assert_eq!(
+            items.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "image refs must be strings"
+        );
+
+        let required = tool.parameters.get("required").unwrap().as_array().unwrap();
+        assert!(
+            !required.iter().any(|v| v.as_str() == Some("images")),
+            "images must be optional"
+        );
+    }
+
+    #[test]
+    fn generated_image_marker_format() {
+        let b64 = "dGVzdA==";
+        let output = generated_image_result(b64, "Image generated.");
+        let split = crate::engine::agentic_loop::split_tool_result(&output);
+        assert_eq!(split.images, vec![b64.to_string()]);
+        assert_eq!(split.llm_text, "Image generated.");
+    }
+
+    #[tokio::test]
+    async fn an_image_reference_never_reads_the_loose_data_root() {
+        use crate::test_support::{
+            boot_mock_engine, in_engine_child, setup_test_db, teardown_test_db,
+        };
+
+        if !in_engine_child(
+            "engine::tools::image::tests::an_image_reference_never_reads_the_loose_data_root",
+        )
+        .await
+        {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        let data = engine.workspace_path.join(crate::core::DATA_DIR);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join(".env"), "SECRET=1").unwrap();
+
+        let read = engine
+            .resolve_image_reference(".env", uuid::Uuid::new_v4())
+            .await;
+        assert!(read.is_err(), "a bare name must not read data/.env");
+
+        engine.pool().close().await;
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[test]
+    fn save_thread_image_tool_definition() {
+        let tool = get_save_thread_image_tool();
+        assert_eq!(tool.name, "save_thread_image");
+        let props = tool.parameters.get("properties").unwrap();
+        assert!(props.get("image").is_some());
+        assert!(props.get("path").is_some());
+        let required = tool.parameters.get("required").unwrap().as_array().unwrap();
+        assert_eq!(required.len(), 2);
+        assert!(required.iter().any(|v| v.as_str() == Some("image")));
+        assert!(required.iter().any(|v| v.as_str() == Some("path")));
+    }
+
+    #[test]
+    fn save_path_examples_are_data_paths() {
+        let save_thread_image = get_save_thread_image_tool();
+        let generate_image = crate::llm::tools::get_image_generation_tool();
+        for desc in [
+            &save_thread_image.parameters["properties"]["path"]["description"],
+            &generate_image.parameters["properties"]["save_as_artifact"]["description"],
+        ] {
+            let desc = desc.as_str().unwrap();
+            assert!(desc.contains("(e.g. 'artifacts/"), "{desc}");
+        }
+    }
+
+    #[test]
+    fn looks_like_description_prompt_blocks_describe_variants() {
+        let blocked = [
+            "describe this image in detail",
+            "Describe the screenshot",
+            "describe this image in detail, focus on any UI elements",
+            "  Analyse what's shown here",
+            "ANALYZE the chart",
+            "summarize the contents of this picture",
+            "transcribe the text in this image",
+            "what is in this image?",
+            "what's in this picture",
+            "what does this screenshot show",
+            "what do you see here",
+            "tell me about this image",
+            "tell me what the diagram represents",
+            "identify the objects in this photo",
+            "explain this UI",
+            "read the labels in the picture",
+        ];
+        for prompt in blocked {
+            assert!(
+                looks_like_description_prompt(prompt),
+                "expected to block describe-like prompt: {:?}",
+                prompt
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_description_prompt_allows_real_generation_prompts() {
+        let allowed = [
+            "a robot describing a painting in a museum",
+            "a chart that summarizes Q3 revenue",
+            "an isometric illustration of a UI dashboard",
+            "edit this photo to make the sky purple",
+            "transcript-style title card for a podcast",
+            "a sunset over mountains, painterly",
+            "logo for an analyser product",
+        ];
+        for prompt in allowed {
+            assert!(
+                !looks_like_description_prompt(prompt),
+                "should not block generation prompt: {:?}",
+                prompt
+            );
+        }
+    }
+
+    #[test]
+    fn generate_image_tool_description_warns_against_vision_misuse() {
+        use crate::llm::tools::get_image_generation_tool;
+        let tool = get_image_generation_tool();
+        let lower = tool.description.to_lowercase();
+        const REQUIRED: &[&str] = &["not a vision", "not for"];
+        assert!(
+            REQUIRED.iter().any(|m| lower.contains(m)),
+            "tool description must contain one of {:?} so the LLM is told it is \
+             not a vision/analysis tool. Got: {}",
+            REQUIRED,
+            tool.description
+        );
+        assert!(
+            lower.contains("describe") && lower.contains("directly"),
+            "tool description must instruct the model to describe images \
+             directly with native vision. Got: {}",
+            tool.description
+        );
+    }
+}

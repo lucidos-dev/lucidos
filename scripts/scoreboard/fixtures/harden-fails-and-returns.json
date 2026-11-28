@@ -1,0 +1,12 @@
+{
+  "description": "A hardening round fails and the change returns to Implementing, then a second round passes. The change waits on Apply at observation time.",
+  "observed_at": "2026-11-02T11:30:00Z",
+  "events": [
+    {"seq": 1, "at": "2026-11-02T09:00:00Z", "type": "PlanApproved", "thread": "thread-a", "data": {"kind": "implementation", "scope": "implement"}},
+    {"seq": 2, "at": "2026-11-02T10:00:00Z", "type": "HardeningStarted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "full"}},
+    {"seq": 3, "at": "2026-11-02T10:20:00Z", "type": "HardenRunCompleted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "full", "verdict": "fail", "failed_phase": "4.5 prose"}},
+    {"seq": 4, "at": "2026-11-02T10:30:00Z", "type": "HardeningStarted", "thread": "thread-a", "data": {"head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "iteration": 2, "tier": "full"}},
+    {"seq": 5, "at": "2026-11-02T10:50:00Z", "type": "HardenRunCompleted", "thread": "thread-a", "data": {"head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "iteration": 2, "tier": "full", "verdict": "pass"}},
+    {"seq": 6, "at": "2026-11-02T10:55:00Z", "type": "ChangeProposed", "thread": "thread-a", "data": {"change_id": "change-a", "content": "code", "requires_restart": false, "hardened": true}}
+  ]
+}

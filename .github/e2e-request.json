@@ -1,0 +1,24 @@
+{
+  "run_id": "20261128-073128-b664",
+  "coverage": false,
+  "suites": [
+    "browser"
+  ],
+  "api_args": [],
+  "browser": {
+    "projects": [
+      "chromium",
+      "mobile",
+      "desktop-webkit",
+      "mobile-webkit"
+    ],
+    "specs": [
+      "an-answer-shows-the-agent-line-all.spec.ts"
+    ],
+    "pw_args": [
+      "--grep",
+      "queued wake reply",
+      "--retries=0"
+    ]
+  }
+}

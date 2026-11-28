@@ -1,0 +1,1 @@
+export const OPEN_REPAINT_BURST_DELAYS_MS = [0, 100, 300, 600, 1000];

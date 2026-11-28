@@ -1,0 +1,36 @@
+# Workspace package, dependency tier, optional engine or leaf role
+# Shared support crates sit below the numbered engine tiers.
+lucidos-agent-sandbox	-3
+lucidos-agents-api	6	engine
+lucidos-app	4
+lucidos-build-slot	-2
+lucidos-capabilities	-3
+lucidos-claude-code-managed	-3
+lucidos-cli	4
+lucidos-core	2	engine
+lucidos-diagnostic-log	-2
+lucidos-diagnostic-log-macros	-3
+lucidos-e2e	8
+lucidos-engine	4	engine
+lucidos-engine-bin	8	engine
+lucidos-engine-boot	7	leaf
+lucidos-engine-socket	-1
+lucidos-event-hooks	7	leaf
+lucidos-file-backup-exclusion	-3
+lucidos-frame-capability	-1
+lucidos-gateway	4
+lucidos-gateway-constants	-3
+lucidos-gateway-stamp	-1
+lucidos-gateway-tls	-1
+lucidos-home	-3
+lucidos-installs	-2
+lucidos-local-token	-2
+lucidos-loopback-ca	-1
+lucidos-loopback-listener	-3
+lucidos-owner-lock	-3
+lucidos-pg-url	-3
+lucidos-secret-store	-2
+lucidos-shell-env	-3
+lucidos-tailscale	-3
+lucidos-update-channel	-3
+lucidos-wire-codegen	-3
